@@ -1,0 +1,39 @@
+[workspace]
+members = [".", "uniffi-bindgen", "tsshd"]
+resolver = "2"
+
+[package]
+name = "tssh-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tssh_core"
+crate-type = ["cdylib", "staticlib"]
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[dependencies]
+uniffi = { version = "0.31", features = ["tokio"] }
+timed-fsm = { path = "../../rust-nicola/crates/timed-fsm" }
+russh = "0.48"
+russh-keys = "0.48"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+android_logger = "0.15"
+parking_lot = "0.12"
+smol_str = "0.2"
+thiserror = "2.0.18"
+async-trait = "0.1.89"
+vte = "0.13"
+unicode-width = "0.1"
+base64 = "0.22"
+flate2 = "1"
+md5 = "0.8"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+[profile.release]
+panic = "abort"
+
