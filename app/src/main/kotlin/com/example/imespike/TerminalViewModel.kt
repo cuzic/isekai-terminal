@@ -112,8 +112,15 @@ class TerminalViewModel(
         }
         override fun onLost(network: Network) {
             if (uiState.value.connected) {
-                RemoteLogger.w("TsshSSH", "network lost while connected")
-                session.disconnect()
+                if (session.isQuicSession) {
+                    // QUIC はトランスポート層がネットワーク変化を検知して idle timeout (300s) で
+                    // 自然切断するため、ここで強制切断しない。
+                    // WiFi→モバイルデータの瞬断でセッションが生き残る可能性がある。
+                    RemoteLogger.i("TsshSSH", "network lost — QUIC session, letting transport handle it")
+                } else {
+                    RemoteLogger.w("TsshSSH", "network lost while connected — disconnecting TCP session")
+                    session.disconnect()
+                }
             }
         }
     }

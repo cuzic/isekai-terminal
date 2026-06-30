@@ -51,6 +51,8 @@ class TerminalSession(
     val pendingDownloadFile: StateFlow<Pair<String, ByteArray>?> = _pendingDownloadFile.asStateFlow()
 
     @Volatile private var activeSession: TsshSession? = null
+    @Volatile private var _isQuicSession = false
+    val isQuicSession: Boolean get() = _isQuicSession
 
     init {
         scope.launch {
@@ -69,6 +71,7 @@ class TerminalSession(
 
     fun connect(config: SshConfig) {
         if (_state.value.connected) return
+        _isQuicSession = false
         _state.update { TerminalReducer.connecting(it) }
 
         val s = gateway.create(config)
@@ -83,6 +86,7 @@ class TerminalSession(
 
     fun connectQuic(config: QuicConfig) {
         if (_state.value.connected) return
+        _isQuicSession = true
         _state.update { TerminalReducer.connecting(it) }
 
         val s = gateway.createQuic(config)
@@ -104,6 +108,7 @@ class TerminalSession(
     fun resize(cols: UInt, rows: UInt) { activeSession?.resize(cols, rows) }
 
     fun disconnect() {
+        _isQuicSession = false
         activeSession?.disconnect()
         activeSession = null
         _state.update { it.copy(connected = false, statusMsg = "切断済み", currentHost = null) }
