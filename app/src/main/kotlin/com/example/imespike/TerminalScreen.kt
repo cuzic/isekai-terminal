@@ -318,7 +318,6 @@ fun TerminalScreen(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                 ) {
                     CtrlBtn("↵") { inputView?.commitComposing(); vm.send(byteArrayOf(0x0D)) }
-                    CtrlBtn("trz!") { vm.send("trz\r".toByteArray()) }
                     CtrlBtn("Tab") { vm.send(byteArrayOf(0x09)) }
                     CtrlBtn("Esc") { vm.send(byteArrayOf(0x1B)) }
                     CtrlBtn("^C") { vm.send(byteArrayOf(0x03)) }

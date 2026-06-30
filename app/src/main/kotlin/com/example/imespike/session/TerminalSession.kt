@@ -46,7 +46,7 @@ class TerminalSession(
     private val _log = MutableStateFlow("")
     val log: StateFlow<String> = _log.asStateFlow()
 
-    private val downloadChunks = mutableListOf<ByteArray>()
+    private var downloadBuffer: java.io.ByteArrayOutputStream? = null
     private val _pendingDownloadFile = MutableStateFlow<Pair<String, ByteArray>?>(null)
     val pendingDownloadFile: StateFlow<Pair<String, ByteArray>?> = _pendingDownloadFile.asStateFlow()
 
@@ -149,10 +149,14 @@ class TerminalSession(
     }
 
     private fun accumulateDownloadChunk(event: SessionEvent.TrzszDownloadChunk) {
-        downloadChunks.add(event.data)
+        val buf = downloadBuffer ?: run {
+            val size = (_state.value.trzszState as? TrzszUiState.InProgress)?.total?.toInt()?.coerceAtLeast(4096) ?: 65536
+            java.io.ByteArrayOutputStream(size).also { downloadBuffer = it }
+        }
+        buf.write(event.data)
         if (event.isLast) {
-            val all = downloadChunks.flatMap { it.toList() }.toByteArray()
-            downloadChunks.clear()
+            val all = buf.toByteArray()
+            downloadBuffer = null
             val fname = (_state.value.trzszState as? TrzszUiState.InProgress)?.fileName ?: "download"
             _pendingDownloadFile.value = Pair(fname, all)
         }

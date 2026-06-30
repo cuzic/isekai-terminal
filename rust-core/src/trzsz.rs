@@ -206,8 +206,6 @@ impl TrzszTransferFsm {
 
     /// Normal 状態でバイト列を処理して actions を返す
     fn process_normal_bytes(&mut self, bytes: &[u8]) -> Vec<TrzszEffect> {
-        let hex: String = bytes.iter().take(48).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
-        log::debug!("trzsz: normal {} bytes: {}", bytes.len(), hex);
         self.tail_buf.extend_from_slice(bytes);
         let mut actions = Vec::new();
 
@@ -258,8 +256,6 @@ impl TrzszTransferFsm {
 
     /// Transferring 状態でサーバーからの stdout を解析し、プロトコルを進める
     fn on_transferring_bytes(&mut self, bytes: &[u8]) -> Response<TrzszEffect, TrzszTimer> {
-        let hex: String = bytes.iter().take(64).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
-        log::debug!("trzsz: transfer bytes {} len={}", hex, bytes.len());
         let mut effects: Vec<TrzszEffect> = Vec::new();
         // None = 継続, Some(true) = 成功完了→Normal, Some(false) = 失敗→Recovering
         let mut terminal: Option<bool> = None;
@@ -276,12 +272,8 @@ impl TrzszTransferFsm {
                 if line.last() == Some(&b'\r') {
                     line = &line[..line.len() - 1];
                 }
-                log::debug!("trzsz: transfer line: {}", String::from_utf8_lossy(line).chars().take(80).collect::<String>());
-                let Some((typ, payload)) = parse_line(line) else {
-                    log::debug!("trzsz: transfer parse_line failed for line len={}", line.len());
-                    continue;
-                };
-                log::info!("trzsz: transfer server typ={} payload_len={}", typ, payload.len());
+                let Some((typ, payload)) = parse_line(line) else { continue; };
+                log::debug!("trzsz: transfer server typ={} payload_len={}", typ, payload.len());
                 activity = true;
 
                 if typ == "FAIL" || typ == "fail" {
