@@ -21,6 +21,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -61,6 +62,8 @@ fun ProfileEditScreen(
     var authType by remember { mutableStateOf(profile?.authType ?: "password") }
     var keyId by remember { mutableStateOf(profile?.keyId) }
     var keyMenuExpanded by remember { mutableStateOf(false) }
+    var useTsshd by remember { mutableStateOf(profile?.useTsshd ?: false) }
+    var tsshdPort by remember { mutableStateOf((profile?.tsshdPort ?: 2222).toString()) }
 
     LaunchedEffect(Unit) {
         val list = withContext(Dispatchers.IO) { Repositories.keys.getAll() }
@@ -171,6 +174,27 @@ fun ProfileEditScreen(
             }
         }
 
+        Spacer(Modifier.height(4.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text("tsshd QUIC 接続", modifier = androidx.compose.ui.Modifier.align(androidx.compose.ui.Alignment.CenterVertically))
+            Switch(checked = useTsshd, onCheckedChange = { useTsshd = it })
+        }
+
+        if (useTsshd) {
+            OutlinedTextField(
+                value = tsshdPort,
+                onValueChange = { new -> tsshdPort = new.filter { it.isDigit() }.take(5) },
+                label = { Text("tsshd ポート") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+
         Spacer(Modifier.height(8.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -186,6 +210,8 @@ fun ProfileEditScreen(
                         keyId = if (authType == "key") keyId else null,
                         useMosh = profile?.useMosh ?: false,
                         sortOrder = profile?.sortOrder ?: 0,
+                        useTsshd = useTsshd,
+                        tsshdPort = tsshdPort.toIntOrNull() ?: 2222,
                     )
                     scope.launch {
                         RemoteLogger.i("TsshProfile", "saving profile: label='${saved.label}' host=${saved.host}:${saved.port} user=${saved.username} authType=${saved.authType} keyId=${saved.keyId} id=${if (saved.id == 0L) "new" else "${saved.id}"}")

@@ -17,9 +17,9 @@ import kotlinx.coroutines.launch
 import uniffi.tssh_core.CellData
 import uniffi.tssh_core.ScreenUpdate
 import uniffi.tssh_core.SessionCallback
+import uniffi.tssh_core.QuicConfig
 import uniffi.tssh_core.SshConfig
 import uniffi.tssh_core.SshException
-import uniffi.tssh_core.SshSessionInterface
 
 /**
  * SSH セッションのドメインオブジェクト。Android 依存なし。
@@ -50,7 +50,7 @@ class TerminalSession(
     private val _pendingDownloadFile = MutableStateFlow<Pair<String, ByteArray>?>(null)
     val pendingDownloadFile: StateFlow<Pair<String, ByteArray>?> = _pendingDownloadFile.asStateFlow()
 
-    @Volatile private var activeSession: SshSessionInterface? = null
+    @Volatile private var activeSession: TsshSession? = null
 
     init {
         scope.launch {
@@ -74,7 +74,21 @@ class TerminalSession(
         val s = gateway.create(config)
         activeSession = s
         try {
-            s.connect(buildCallback(config, s))
+            s.connect(buildCallback(config.host, config.port.toInt(), s))
+        } catch (e: SshException) {
+            activeSession = null
+            _events.tryEmit(SessionEvent.Error(e.message ?: "不明なエラー"))
+        }
+    }
+
+    fun connectQuic(config: QuicConfig) {
+        if (_state.value.connected) return
+        _state.update { TerminalReducer.connecting(it) }
+
+        val s = gateway.createQuic(config)
+        activeSession = s
+        try {
+            s.connect(buildCallback(config.sshHost, config.sshPort.toInt(), s))
         } catch (e: SshException) {
             activeSession = null
             _events.tryEmit(SessionEvent.Error(e.message ?: "不明なエラー"))
@@ -162,10 +176,10 @@ class TerminalSession(
         }
     }
 
-    private fun buildCallback(config: SshConfig, s: SshSessionInterface) = object : SessionCallback {
+    private fun buildCallback(host: String, port: Int, s: TsshSession) = object : SessionCallback {
         override fun onConnected() {
-            RemoteLogger.i("TsshSSH", "✓ connected: ${config.username}@${config.host}:${config.port}")
-            _events.tryEmit(SessionEvent.Connected(config.host))
+            RemoteLogger.i("TsshSSH", "✓ connected: $host:$port")
+            _events.tryEmit(SessionEvent.Connected(host))
         }
 
         override fun onDisconnected(reason: String?) {
@@ -187,18 +201,18 @@ class TerminalSession(
         override fun onHostKey(fingerprint: String): Boolean {
             RemoteLogger.i("TsshSSH", "host key fingerprint: $fingerprint")
             return try {
-                when (val decision = hostKeyChecker.check(config.host, config.port.toInt(), fingerprint)) {
+                when (val decision = hostKeyChecker.check(host, port, fingerprint)) {
                     is HostKeyDecision.Trust -> {
                         if (decision.isNew) {
-                            RemoteLogger.i("TsshSSH", "TOFU: trusted ${config.host}")
+                            RemoteLogger.i("TsshSSH", "TOFU: trusted $host")
                             _events.tryEmit(SessionEvent.HostKeyTrusted(fingerprint))
                         } else {
-                            RemoteLogger.i("TsshSSH", "host key OK: ${config.host}")
+                            RemoteLogger.i("TsshSSH", "host key OK: $host")
                         }
                         true
                     }
                     is HostKeyDecision.Changed -> {
-                        RemoteLogger.w("TsshSSH", "⚠ HOST KEY CHANGED: ${config.host}")
+                        RemoteLogger.w("TsshSSH", "⚠ HOST KEY CHANGED: $host")
                         _events.tryEmit(SessionEvent.HostKeyChanged(decision.warning, fingerprint))
                         false
                     }

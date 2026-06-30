@@ -25,7 +25,10 @@ import com.example.imespike.session.RealHostKeyChecker
 import com.example.imespike.session.TerminalSession
 import com.example.imespike.spike.KeystoreKek
 import com.example.imespike.util.RemoteLogger
-import uniffi.tssh_core.*
+import uniffi.tssh_core.QuicConfig
+import uniffi.tssh_core.ScreenUpdate
+import uniffi.tssh_core.SshAuth
+import uniffi.tssh_core.SshConfig
 import java.io.File
 
 data class TerminalUiState(
@@ -158,19 +161,45 @@ class TerminalViewModel(
 
     fun connectProfile(profile: ConnectionProfile, password: String? = null) {
         if (uiState.value.connected) return
-        RemoteLogger.i("TsshSSH", "connectProfile: '${profile.label}' ${profile.username}@${profile.host}:${profile.port}")
+        RemoteLogger.i("TsshSSH", "connectProfile: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} quic=${profile.useTsshd}")
         viewModelScope.launch(Dispatchers.IO) {
             val auth = resolveAuth(profile, password) ?: return@launch
-            val config = SshConfig(
-                host = profile.host,
-                port = profile.port.toUShort(),
-                username = profile.username,
-                auth = auth,
-                cols = 80u,
-                rows = 24u,
-            )
-            connect(config)
+            if (profile.useTsshd) {
+                val config = QuicConfig(
+                    tsshdHost = profile.host,
+                    tsshdPort = profile.tsshdPort.toUShort(),
+                    sshHost = profile.host,
+                    sshPort = profile.port.toUShort(),
+                    username = profile.username,
+                    auth = auth,
+                    cols = 80u,
+                    rows = 24u,
+                    skipCertVerify = true,
+                )
+                connectQuic(config)
+            } else {
+                val config = SshConfig(
+                    host = profile.host,
+                    port = profile.port.toUShort(),
+                    username = profile.username,
+                    auth = auth,
+                    cols = 80u,
+                    rows = 24u,
+                )
+                connect(config)
+            }
         }
+    }
+
+    private fun connectQuic(config: QuicConfig) {
+        val a = getApplication<Application>()
+        a.startService(Intent(a, TerminalSessionService::class.java))
+        if (!isServiceBound) {
+            isServiceBound = a.bindService(
+                Intent(a, TerminalSessionService::class.java), serviceConnection, Context.BIND_AUTO_CREATE
+            )
+        }
+        session.connectQuic(config)
     }
 
     private suspend fun resolveAuth(profile: ConnectionProfile, password: String?): SshAuth? {

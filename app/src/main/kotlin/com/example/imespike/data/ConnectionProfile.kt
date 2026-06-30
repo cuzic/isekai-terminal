@@ -16,6 +16,8 @@ data class ConnectionProfile(
     val keyId: Long? = null,
     val useMosh: Boolean = false,
     @ColumnInfo(name = "sort_order") val sortOrder: Int = 0,
+    @ColumnInfo(name = "use_tsshd") val useTsshd: Boolean = false,
+    @ColumnInfo(name = "tsshd_port") val tsshdPort: Int = 2222,
 ) : Parcelable
 
 @Dao
