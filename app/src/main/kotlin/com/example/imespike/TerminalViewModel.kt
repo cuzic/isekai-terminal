@@ -153,9 +153,7 @@ class TerminalViewModel(
 
     // ── 接続 ─────────────────────────────────────────────────────
 
-    fun connect(config: SshConfig) {
-        if (uiState.value.connected) return
-        RemoteLogger.i("TsshSSH", "connect: ${config.username}@${config.host}:${config.port}")
+    private fun ensureServiceStarted() {
         val a = getApplication<Application>()
         a.startService(Intent(a, TerminalSessionService::class.java))
         if (!isServiceBound) {
@@ -163,6 +161,12 @@ class TerminalViewModel(
                 Intent(a, TerminalSessionService::class.java), serviceConnection, Context.BIND_AUTO_CREATE
             )
         }
+    }
+
+    fun connect(config: SshConfig) {
+        if (uiState.value.connected) return
+        RemoteLogger.i("TsshSSH", "connect: ${config.username}@${config.host}:${config.port}")
+        ensureServiceStarted()
         session.connect(config)
     }
 
@@ -199,13 +203,7 @@ class TerminalViewModel(
     }
 
     private fun connectQuic(config: QuicConfig) {
-        val a = getApplication<Application>()
-        a.startService(Intent(a, TerminalSessionService::class.java))
-        if (!isServiceBound) {
-            isServiceBound = a.bindService(
-                Intent(a, TerminalSessionService::class.java), serviceConnection, Context.BIND_AUTO_CREATE
-            )
-        }
+        ensureServiceStarted()
         session.connectQuic(config)
     }
 

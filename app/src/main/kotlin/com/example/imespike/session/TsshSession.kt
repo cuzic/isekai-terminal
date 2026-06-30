@@ -10,6 +10,7 @@ import uniffi.tssh_core.SshSessionInterface
  * UniFFI が生成する各 *Interface は個別型なので、このアダプター層で吸収する。
  */
 interface TsshSession {
+    val isQuic: Boolean
     fun connect(callback: SessionCallback)
     fun disconnect()
     fun resize(cols: UInt, rows: UInt)
@@ -23,6 +24,7 @@ interface TsshSession {
 }
 
 fun SshSessionInterface.asTsshSession(): TsshSession = object : TsshSession {
+    override val isQuic = false
     override fun connect(callback: SessionCallback) = this@asTsshSession.connect(callback)
     override fun disconnect() = this@asTsshSession.disconnect()
     override fun resize(cols: UInt, rows: UInt) = this@asTsshSession.resize(cols, rows)
@@ -36,6 +38,7 @@ fun SshSessionInterface.asTsshSession(): TsshSession = object : TsshSession {
 }
 
 fun QuicSessionInterface.asTsshSession(): TsshSession = object : TsshSession {
+    override val isQuic = true
     override fun connect(callback: SessionCallback) = this@asTsshSession.connect(callback)
     override fun disconnect() = this@asTsshSession.disconnect()
     override fun resize(cols: UInt, rows: UInt) = this@asTsshSession.resize(cols, rows)

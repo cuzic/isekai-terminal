@@ -21,6 +21,7 @@ class FakeSshGateway(val session: FakeSshSession = FakeSshSession()) : SshGatewa
  * テストコードから simulateXxx() を呼ぶことでコールバックを任意に発火できる。
  */
 class FakeSshSession : TsshSession {
+    override val isQuic = false
     private var callback: SessionCallback? = null
 
     val sentBytes = mutableListOf<ByteArray>()
