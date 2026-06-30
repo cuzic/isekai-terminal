@@ -83,8 +83,14 @@ async fn main() -> Result<()> {
         .with_single_cert(cert_chain, key)?;
     server_crypto.alpn_protocols = vec![b"tsshd".to_vec()];
 
-    let server_config =
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_secs(300).try_into().unwrap()
+    ));
+
+    let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
+    server_config.transport_config(Arc::new(transport));
 
     let addr: SocketAddr = format!("0.0.0.0:{}", args.port).parse()?;
     let endpoint = quinn::Endpoint::server(server_config, addr)?;

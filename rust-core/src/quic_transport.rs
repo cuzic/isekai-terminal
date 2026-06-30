@@ -156,7 +156,18 @@ fn build_client_config(skip_cert_verify: bool) -> Result<quinn::ClientConfig, Ss
 
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|_| SshError::ConnectionFailed)?;
-    Ok(quinn::ClientConfig::new(Arc::new(quic_crypto)))
+
+    let mut transport = quinn::TransportConfig::default();
+    // NAT の UDP マッピング (通常 30 秒) を維持するため 20 秒ごとに QUIC PING を送る
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(20)));
+    // アイドルタイムアウトを 5 分に延長
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_secs(300).try_into().unwrap()
+    ));
+
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    client_config.transport_config(Arc::new(transport));
+    Ok(client_config)
 }
 
 /// tsshd への QUIC bi-stream を確立し、`OK\n` ハンドシェイク完了後に
