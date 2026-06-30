@@ -1,0 +1,18 @@
+# Android build
+/build/
+/app/build/
+/.gradle/
+/.kotlin/
+*.apk
+*.aab
+
+# Rust build
+/rust-core/target/
+
+# IDE
+/.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
