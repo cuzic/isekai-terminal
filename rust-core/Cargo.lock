@@ -2623,6 +2623,8 @@ dependencies = [
  "russh",
  "russh-keys",
  "rustls",
+ "serde",
+ "serde_json",
  "smol_str",
  "thiserror 2.0.18",
  "timed-fsm",

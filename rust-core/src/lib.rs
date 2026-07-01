@@ -7,6 +7,7 @@ pub(crate) mod transport;
 pub(crate) mod session_state;
 pub(crate) mod session;
 pub mod orchestrator;
+pub(crate) mod helper_bootstrap;
 
 pub use quic_transport::{create_quic_session, QuicConfig, QuicSession};
 pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};
