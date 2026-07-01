@@ -62,6 +62,18 @@ jobs:
           echo "--- extracted sudo: setup script ---"
           cat /tmp/fdroid-sudo-setup.sh
 
+      - name: Remove the runner's preinstalled Rust toolchain
+        # GitHub's hosted runner image ships rustup at ~/.cargo for CI
+        # convenience, ahead of /usr/local/bin on PATH. F-Droid's actual
+        # buildserver has no Rust preinstalled, so leaving this in place would
+        # let the recipe's sudo: install (which lands in /usr/local/bin) get
+        # silently shadowed, masking whether the recipe's own install even
+        # works — see the run this fixed for exactly that failure.
+        run: |
+          rm -rf "$HOME/.cargo" "$HOME/.rustup"
+          sudo rm -rf /usr/local/cargo /usr/local/rustup
+          hash -r
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
