@@ -6,55 +6,78 @@ use crate::{
     SessionCallback, SshConfig, SshError, TrzszPublicState,
 };
 use crate::quic_transport::{QuicConfig, QuicSession};
+use crate::helper_quic_transport::{HelperQuicConfig, HelperQuicSession};
 
 // ── Active session ────────────────────────────────────────
 
 enum ActiveSession {
     Ssh(Arc<crate::SshSession>),
     Quic(Arc<QuicSession>),
+    HelperQuic(Arc<HelperQuicSession>),
 }
 
 impl ActiveSession {
     fn send(&self, data: Vec<u8>) {
-        match self { Self::Ssh(s) => s.send(data), Self::Quic(s) => s.send(data) }
+        match self {
+            Self::Ssh(s) => s.send(data),
+            Self::Quic(s) => s.send(data),
+            Self::HelperQuic(s) => s.send(data),
+        }
     }
     fn resize(&self, cols: u32, rows: u32) {
-        match self { Self::Ssh(s) => s.resize(cols, rows), Self::Quic(s) => s.resize(cols, rows) }
+        match self {
+            Self::Ssh(s) => s.resize(cols, rows),
+            Self::Quic(s) => s.resize(cols, rows),
+            Self::HelperQuic(s) => s.resize(cols, rows),
+        }
     }
     fn disconnect(&self) {
-        match self { Self::Ssh(s) => s.disconnect(), Self::Quic(s) => s.disconnect() }
+        match self {
+            Self::Ssh(s) => s.disconnect(),
+            Self::Quic(s) => s.disconnect(),
+            Self::HelperQuic(s) => s.disconnect(),
+        }
     }
     fn scrollback_len(&self) -> u32 {
-        match self { Self::Ssh(s) => s.scrollback_len(), Self::Quic(s) => s.scrollback_len() }
+        match self {
+            Self::Ssh(s) => s.scrollback_len(),
+            Self::Quic(s) => s.scrollback_len(),
+            Self::HelperQuic(s) => s.scrollback_len(),
+        }
     }
     fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         match self {
             Self::Ssh(s) => s.scrollback_cells(offset, rows),
             Self::Quic(s) => s.scrollback_cells(offset, rows),
+            Self::HelperQuic(s) => s.scrollback_cells(offset, rows),
         }
     }
     fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
         match self {
             Self::Ssh(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
             Self::Quic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
+            Self::HelperQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
         }
     }
     fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
         match self {
             Self::Ssh(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
             Self::Quic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
+            Self::HelperQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
         }
     }
     fn trzsz_accept_download(&self, transfer_id: String) {
         match self {
             Self::Ssh(s) => s.trzsz_accept_download(transfer_id),
             Self::Quic(s) => s.trzsz_accept_download(transfer_id),
+            Self::HelperQuic(s) => s.trzsz_accept_download(transfer_id),
         }
     }
     fn trzsz_cancel(&self, transfer_id: String) {
         match self {
             Self::Ssh(s) => s.trzsz_cancel(transfer_id),
             Self::Quic(s) => s.trzsz_cancel(transfer_id),
+            Self::HelperQuic(s) => s.trzsz_cancel(transfer_id),
         }
     }
 }
@@ -216,6 +239,40 @@ impl SessionOrchestrator {
         let session = crate::quic_transport::create_quic_session(config);
         session.connect(Box::new(adapter))?;
         *self.shared.session.lock() = Some(ActiveSession::Quic(session));
+        Ok(())
+    }
+
+    /// Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
+    /// （`TransportPreference::IsekaiHelperQuic` 相当、明示選択時に使う）。
+    pub fn connect_helper_quic(&self, config: HelperQuicConfig) -> Result<(), SshError> {
+        {
+            let mut s = self.shared.state.lock();
+            s.current_host = Some(config.ssh_host.clone());
+            s.current_port = config.ssh_port;
+            s.is_quic = true;
+        }
+        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
+        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let session = crate::helper_quic_transport::create_helper_quic_session(config);
+        session.connect(Box::new(adapter))?;
+        *self.shared.session.lock() = Some(ActiveSession::HelperQuic(session));
+        Ok(())
+    }
+
+    /// Phase 7: `TransportPreference::Auto` 相当。自作ヘルパー経由 QUIC のブートストラップ/
+    /// 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
+    pub fn connect_helper_quic_auto(&self, config: HelperQuicConfig) -> Result<(), SshError> {
+        {
+            let mut s = self.shared.state.lock();
+            s.current_host = Some(config.ssh_host.clone());
+            s.current_port = config.ssh_port;
+            s.is_quic = true;
+        }
+        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
+        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let session = crate::helper_quic_transport::create_helper_quic_session(config);
+        session.connect_auto(Box::new(adapter))?;
+        *self.shared.session.lock() = Some(ActiveSession::HelperQuic(session));
         Ok(())
     }
 

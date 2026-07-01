@@ -8,6 +8,7 @@ pub(crate) mod session_state;
 pub(crate) mod session;
 pub mod orchestrator;
 pub(crate) mod helper_bootstrap;
+pub mod helper_quic_transport;
 
 pub use quic_transport::{create_quic_session, QuicConfig, QuicSession};
 pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};
@@ -95,6 +96,25 @@ pub struct ScreenUpdate {
 }
 
 // ── New orchestrator public types ────────────────────────
+
+/// Phase 7-4: プロファイルが選択するトランスポート戦略。実際のディスパッチは
+/// Kotlin 側でこの値に応じて `SessionOrchestrator::connect` /
+/// `connect_quic`（tsshd） / `connect_helper_quic` / `connect_helper_quic_auto`
+/// のいずれかを呼び分ける（設定の意図を表す列挙型であり、単一の万能 connect API
+/// を意図したものではない。既存の transport ごとに別メソッドを持つ設計を踏襲する）。
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum TransportPreference {
+    /// 通常の TCP SSH（Phase 1-4）。
+    PlainSsh,
+    /// tsshd 互換 QUIC（Phase 5、サーバー側に事前インストールされた tsshd/isekai-helper
+    /// 前身を前提とする旧経路）。
+    TsshdQuic,
+    /// 自作ヘルパー経由 QUIC、フォールバック無し（Phase 7、明示選択時）。
+    IsekaiHelperQuic,
+    /// 自作ヘルパー経由 QUIC を試し、失敗したら通常の TCP SSH にフォールバックする
+    /// （Phase 7、既定推奨）。
+    Auto,
+}
 
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum ConnectionPublicState {
@@ -210,7 +230,7 @@ impl SshSession {
 
 // ── TCP transport task ───────────────────────────────────
 
-async fn run_russh_transport(
+pub(crate) async fn run_russh_transport(
     config: SshConfig,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
