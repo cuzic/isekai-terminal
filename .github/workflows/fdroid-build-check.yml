@@ -1,0 +1,106 @@
+name: F-Droid build check
+
+# Simulates what an F-Droid buildserver would do when it processes
+# fdroid/tools.isekai.terminal.yml: install the pinned NDK, run the recipe's
+# `sudo:` setup commands (as root, like F-Droid does), then build with a
+# plain non-root `gradle:` step. This exists to catch drift between the
+# recipe and the actual build *before* submitting to fdroiddata, since none
+# of this has been verified against a real F-Droid buildserver yet.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "fdroid/tools.isekai.terminal.yml"
+      - "app/**"
+      - "rust-core/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle/**"
+      - ".github/workflows/fdroid-build-check.yml"
+  pull_request:
+    paths:
+      - "fdroid/tools.isekai.terminal.yml"
+      - "app/**"
+      - "rust-core/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - "gradle/**"
+      - ".github/workflows/fdroid-build-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulate-fdroid-build:
+    runs-on: ubuntu-latest
+    env:
+      RECIPE: fdroid/tools.isekai.terminal.yml
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read recipe fields (ndk / sudo / gradle) with PyYAML
+        id: recipe
+        run: |
+          pip install --quiet --user pyyaml
+          python3 - "$RECIPE" <<'PY'
+          import sys, yaml, json, os
+          d = yaml.safe_load(open(sys.argv[1]))
+          build = d["Builds"][0]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"ndk={build['ndk']}\n")
+              out.write(f"commit={build['commit']}\n")
+          with open("/tmp/fdroid-sudo-setup.sh", "w") as f:
+              f.write("#!/usr/bin/env bash\nset -euo pipefail\n")
+              for line in build.get("sudo", []):
+                  f.write(line + "\n")
+          print("--- recipe Builds[0] ---")
+          print(json.dumps(build, indent=2))
+          PY
+          chmod +x /tmp/fdroid-sudo-setup.sh
+          echo "--- extracted sudo: setup script ---"
+          cat /tmp/fdroid-sudo-setup.sh
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install the NDK version pinned by the recipe
+        run: |
+          NDK_VERSION="${{ steps.recipe.outputs.ndk }}"
+          echo "Installing NDK $NDK_VERSION (as declared in $RECIPE)"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: "Run the recipe's sudo: block (root, like F-Droid's buildserver)"
+        run: sudo bash -x /tmp/fdroid-sudo-setup.sh
+
+      - name: Confirm cargo/rustc are reachable without sudo
+        run: |
+          # This is the exact failure mode the recipe's comments call out:
+          # a naive rustup install lands in /root and is invisible here.
+          which cargo
+          which rustc
+          cargo --version
+          rustup target list --installed | grep -q aarch64-linux-android
+
+      - name: Cache Gradle and Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.cargo/registry
+            rust-core/target
+          key: fdroid-build-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml', 'rust-core/Cargo.lock') }}
+
+      - name: "Build (matches the recipe's gradle: yes)"
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Verify an APK was produced
+        run: |
+          find app/build/outputs/apk -name "*.apk" -print -exec ls -la {} \;
+          test -n "$(find app/build/outputs/apk -name '*.apk')"
