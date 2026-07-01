@@ -1,3 +1,12 @@
 [target.aarch64-linux-android]
-linker = "/home/cuzic/android-sdk/ndk/27.1.12297006/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang"
-ar = "/home/cuzic/android-sdk/ndk/27.1.12297006/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+# Relative paths in cargo config resolve against the parent of this .cargo directory (rust-core/).
+# See rust-core/scripts/ndk-common.sh for how the NDK toolchain is located (no hardcoded machine path).
+linker = "scripts/android-arm64-clang.sh"
+ar = "scripts/android-arm64-ar.sh"
+
+[env]
+# cc-rs (used by ring, etc. for their C/asm build scripts) resolves the compiler via these
+# CC_/AR_/CXX_ vars, independent of the [target.*] linker/ar above.
+CC_aarch64_linux_android = { value = "scripts/android-arm64-clang.sh", relative = true }
+CXX_aarch64_linux_android = { value = "scripts/android-arm64-clang.sh", relative = true }
+AR_aarch64_linux_android = { value = "scripts/android-arm64-ar.sh", relative = true }

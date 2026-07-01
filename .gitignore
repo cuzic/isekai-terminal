@@ -8,6 +8,8 @@
 
 # Rust build
 /rust-core/target/
+# cargoBuildRustCore Gradle task regenerates this; do not commit prebuilt binaries.
+/app/src/main/jniLibs/
 
 # IDE
 /.idea/

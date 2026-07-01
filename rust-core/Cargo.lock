@@ -2457,6 +2457,8 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 [[package]]
 name = "timed-fsm"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7a9de966e72053d2509930097cab36075c7f436ad48372fdb34276682a107ee"
 
 [[package]]
 name = "tinyvec"

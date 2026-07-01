@@ -1,0 +1,104 @@
+package tools.isekai.terminal
+
+import android.app.Application
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.hasSetTextAction
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextInput
+import androidx.test.core.app.ApplicationProvider
+import tools.isekai.terminal.data.Repositories
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [33])
+class ProfileEditScreenTest {
+    @get:Rule val composeTestRule = createComposeRule()
+
+    @Before fun setup() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        Repositories.init(ctx)
+        runBlocking {
+            Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) }
+            Repositories.keys.getAll().forEach { Repositories.keys.delete(it) }
+        }
+    }
+
+    private fun sampleProfile() = tools.isekai.terminal.data.ConnectionProfile(
+        label = "Prod", host = "prod.example.com", port = 2222,
+        username = "deploy", authType = "password",
+    )
+
+    @Test fun newProfile_showsAddTitle() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("プロファイル追加").assertExists()
+    }
+
+    @Test fun editProfile_showsEditTitle() {
+        composeTestRule.setContent { ProfileEditScreen(profile = sampleProfile(), onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("プロファイル編集").assertExists()
+    }
+
+    @Test fun editProfile_prefillsFields() {
+        composeTestRule.setContent { ProfileEditScreen(profile = sampleProfile(), onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("Prod").assertExists()
+        composeTestRule.onNodeWithText("prod.example.com").assertExists()
+        composeTestRule.onNodeWithText("deploy").assertExists()
+    }
+
+    @Test fun saveButton_disabledInitially() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("保存").performScrollTo().assertIsNotEnabled()
+    }
+
+    @Test fun saveButton_enabledAfterFilling() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("My Server")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("保存").performScrollTo().assertIsEnabled()
+    }
+
+    @Test fun cancelButton_callsOnCancel() {
+        var cancelled = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = {}, onCancel = { cancelled = true })
+        }
+        composeTestRule.onNodeWithText("キャンセル").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        assertTrue(cancelled)
+    }
+
+    @Test fun authChip_key_showsKeyDropdown() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("鍵認証").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("鍵を選択").assertExists()
+    }
+
+    @Test fun saveNewProfile_callsOnSave() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("Bastion")
+        fields[1].performTextInput("bastion.example.com")
+        fields[3].performTextInput("admin")
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) { saved }
+        assertTrue(saved)
+        runBlocking { assertTrue(Repositories.profiles.getAll().any { it.label == "Bastion" }) }
+    }
+}

@@ -1,0 +1,302 @@
+use std::sync::Arc;
+use parking_lot::Mutex;
+
+use crate::{
+    CellData, ConnectionPublicState, OrchestratorCallback, ScreenUpdate,
+    SessionCallback, SshConfig, SshError, TrzszPublicState,
+};
+use crate::quic_transport::{QuicConfig, QuicSession};
+
+// ── Active session ────────────────────────────────────────
+
+enum ActiveSession {
+    Ssh(Arc<crate::SshSession>),
+    Quic(Arc<QuicSession>),
+}
+
+impl ActiveSession {
+    fn send(&self, data: Vec<u8>) {
+        match self { Self::Ssh(s) => s.send(data), Self::Quic(s) => s.send(data) }
+    }
+    fn resize(&self, cols: u32, rows: u32) {
+        match self { Self::Ssh(s) => s.resize(cols, rows), Self::Quic(s) => s.resize(cols, rows) }
+    }
+    fn disconnect(&self) {
+        match self { Self::Ssh(s) => s.disconnect(), Self::Quic(s) => s.disconnect() }
+    }
+    fn scrollback_len(&self) -> u32 {
+        match self { Self::Ssh(s) => s.scrollback_len(), Self::Quic(s) => s.scrollback_len() }
+    }
+    fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
+        match self {
+            Self::Ssh(s) => s.scrollback_cells(offset, rows),
+            Self::Quic(s) => s.scrollback_cells(offset, rows),
+        }
+    }
+    fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
+        match self {
+            Self::Ssh(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
+            Self::Quic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
+        }
+    }
+    fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
+        match self {
+            Self::Ssh(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
+            Self::Quic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
+        }
+    }
+    fn trzsz_accept_download(&self, transfer_id: String) {
+        match self {
+            Self::Ssh(s) => s.trzsz_accept_download(transfer_id),
+            Self::Quic(s) => s.trzsz_accept_download(transfer_id),
+        }
+    }
+    fn trzsz_cancel(&self, transfer_id: String) {
+        match self {
+            Self::Ssh(s) => s.trzsz_cancel(transfer_id),
+            Self::Quic(s) => s.trzsz_cancel(transfer_id),
+        }
+    }
+}
+
+// ── Shared internal state ─────────────────────────────────
+
+struct OrchestratorState {
+    current_host: Option<String>,
+    current_port: u16,
+    is_quic: bool,
+    /// Active transfer ID set by on_trzsz_request; used to route trzsz commands without exposing ID to Kotlin
+    current_transfer_id: Option<String>,
+    /// "upload" / "download" set on on_trzsz_request; used to detect download accumulation
+    trzsz_mode: Option<String>,
+    /// Accumulates bytes from on_trzsz_download_chunk; drained on on_trzsz_finished
+    download_buf: Vec<u8>,
+}
+
+pub(crate) struct OrchestratorShared {
+    state: Mutex<OrchestratorState>,
+    callback: Arc<dyn OrchestratorCallback>,
+    session: Mutex<Option<ActiveSession>>,
+}
+
+// ── OrchestratorAdapter ───────────────────────────────────
+// Translates old SessionCallback events → structured OrchestratorCallback
+
+pub(crate) struct OrchestratorAdapter {
+    pub(crate) shared: Arc<OrchestratorShared>,
+}
+
+impl SessionCallback for OrchestratorAdapter {
+    fn on_data(&self, data: Vec<u8>) {
+        self.shared.callback.on_data(data);
+    }
+
+    fn on_host_key(&self, fingerprint: String) -> bool {
+        let (host, port) = {
+            let s = self.shared.state.lock();
+            (s.current_host.clone().unwrap_or_default(), s.current_port)
+        };
+        self.shared.callback.on_host_key(host, port, fingerprint)
+    }
+
+    fn on_connected(&self) {
+        let host = self.shared.state.lock().current_host.clone().unwrap_or_default();
+        self.shared.callback.on_connection_state_changed(
+            ConnectionPublicState::Connected { host }
+        );
+    }
+
+    fn on_disconnected(&self, reason: Option<String>) {
+        self.shared.callback.on_connection_state_changed(
+            ConnectionPublicState::Disconnected { reason }
+        );
+    }
+
+    fn on_screen_update(&self, update: ScreenUpdate) {
+        self.shared.callback.on_screen_update(update);
+    }
+
+    fn on_trzsz_request(
+        &self, transfer_id: String, mode: String,
+        suggested_name: Option<String>, expected_size: Option<u64>,
+    ) {
+        {
+            let mut s = self.shared.state.lock();
+            s.current_transfer_id = Some(transfer_id.clone());
+            s.trzsz_mode = Some(mode.clone());
+            s.download_buf.clear();
+        }
+        self.shared.callback.on_trzsz_state_changed(
+            TrzszPublicState::WaitingUser { transfer_id, mode, suggested_name, expected_size }
+        );
+    }
+
+    fn on_trzsz_download_chunk(&self, _transfer_id: String, data: Vec<u8>, _is_last: bool) {
+        self.shared.state.lock().download_buf.extend_from_slice(&data);
+    }
+
+    fn on_trzsz_progress(&self, transfer_id: String, transferred: u64, total: Option<u64>) {
+        let mode = self.shared.state.lock()
+            .trzsz_mode.clone()
+            .unwrap_or_else(|| "download".to_string());
+        self.shared.callback.on_trzsz_state_changed(
+            TrzszPublicState::InProgress {
+                transfer_id, mode, file_name: None, transferred, total
+            }
+        );
+    }
+
+    fn on_trzsz_finished(&self, transfer_id: String, success: bool, message: Option<String>) {
+        let (data, is_download) = {
+            let mut s = self.shared.state.lock();
+            s.current_transfer_id = None;
+            (std::mem::take(&mut s.download_buf),
+             s.trzsz_mode.as_deref() == Some("download"))
+        };
+        if success && is_download && !data.is_empty() {
+            self.shared.callback.on_download_complete(None, data);
+        }
+        self.shared.callback.on_trzsz_state_changed(
+            TrzszPublicState::Done { transfer_id, success, message }
+        );
+    }
+}
+
+// ── SessionOrchestrator ───────────────────────────────────
+
+#[derive(uniffi::Object)]
+pub struct SessionOrchestrator {
+    shared: Arc<OrchestratorShared>,
+}
+
+#[uniffi::export]
+pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> Arc<SessionOrchestrator> {
+    crate::init_logger();
+    let shared = Arc::new(OrchestratorShared {
+        state: Mutex::new(OrchestratorState {
+            current_host: None,
+            current_port: 22,
+            is_quic: false,
+            current_transfer_id: None,
+            trzsz_mode: None,
+            download_buf: Vec::new(),
+        }),
+        callback: Arc::from(callback),
+        session: Mutex::new(None),
+    });
+    Arc::new(SessionOrchestrator { shared })
+}
+
+#[uniffi::export]
+impl SessionOrchestrator {
+    pub fn connect(&self, config: SshConfig) -> Result<(), SshError> {
+        {
+            let mut s = self.shared.state.lock();
+            s.current_host = Some(config.host.clone());
+            s.current_port = config.port;
+            s.is_quic = false;
+        }
+        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
+        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let session = crate::create_ssh_session(config);
+        session.connect(Box::new(adapter))?;
+        *self.shared.session.lock() = Some(ActiveSession::Ssh(session));
+        Ok(())
+    }
+
+    pub fn connect_quic(&self, config: QuicConfig) -> Result<(), SshError> {
+        {
+            let mut s = self.shared.state.lock();
+            s.current_host = Some(config.ssh_host.clone());
+            s.current_port = config.ssh_port;
+            s.is_quic = true;
+        }
+        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
+        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let session = crate::quic_transport::create_quic_session(config);
+        session.connect(Box::new(adapter))?;
+        *self.shared.session.lock() = Some(ActiveSession::Quic(session));
+        Ok(())
+    }
+
+    pub fn disconnect(&self) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.disconnect();
+        }
+    }
+
+    pub fn send(&self, data: Vec<u8>) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.send(data);
+        }
+    }
+
+    pub fn resize(&self, cols: u32, rows: u32) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.resize(cols, rows);
+        }
+    }
+
+    pub fn scrollback_len(&self) -> u32 {
+        self.shared.session.lock().as_ref().map_or(0, |s| s.scrollback_len())
+    }
+
+    pub fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
+        self.shared.session.lock().as_ref()
+            .map_or_else(Vec::new, |s| s.scrollback_cells(offset, rows))
+    }
+
+    pub fn trzsz_accept_download(&self) {
+        let tid = self.shared.state.lock().current_transfer_id.clone();
+        if let Some(tid) = tid {
+            if let Some(s) = self.shared.session.lock().as_ref() {
+                s.trzsz_accept_download(tid);
+            }
+        }
+    }
+
+    pub fn trzsz_accept_upload(&self, file_name: String, file_size: u64, mode: u32) {
+        let tid = self.shared.state.lock().current_transfer_id.clone();
+        if let Some(tid) = tid {
+            if let Some(s) = self.shared.session.lock().as_ref() {
+                s.trzsz_accept_upload(tid, file_name, file_size, mode);
+            }
+        }
+    }
+
+    pub fn trzsz_send_chunk(&self, data: Vec<u8>, is_last: bool) {
+        let tid = self.shared.state.lock().current_transfer_id.clone();
+        if let Some(tid) = tid {
+            if let Some(s) = self.shared.session.lock().as_ref() {
+                s.trzsz_send_chunk(tid, data, is_last);
+            }
+        }
+    }
+
+    pub fn trzsz_cancel(&self) {
+        let tid = self.shared.state.lock().current_transfer_id.take();
+        if let Some(tid) = tid {
+            if let Some(s) = self.shared.session.lock().as_ref() {
+                s.trzsz_cancel(tid);
+            }
+        }
+    }
+
+    pub fn trzsz_dismiss(&self) {
+        let mut s = self.shared.state.lock();
+        s.trzsz_mode = None;
+        s.current_transfer_id = None;
+        drop(s);
+        self.shared.callback.on_trzsz_state_changed(TrzszPublicState::Idle);
+    }
+
+    pub fn is_quic(&self) -> bool {
+        self.shared.state.lock().is_quic
+    }
+
+    pub fn notify_error(&self, message: String) {
+        self.shared.callback.on_connection_state_changed(
+            ConnectionPublicState::Error { message }
+        );
+    }
+}

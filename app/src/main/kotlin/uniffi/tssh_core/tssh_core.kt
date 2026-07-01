@@ -613,6 +613,59 @@ internal open class UniffiForeignFutureResultVoid(
 internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
     fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultVoid.UniffiByValue,)
 }
+// ── OrchestratorCallback JNA method interfaces ───────────────────────────────
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod0 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod1 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`update`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod2 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`host`: RustBuffer.ByValue,`port`: Short,`fingerprint`: RustBuffer.ByValue,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod3 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`data`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod4 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod5 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`fileName`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete")
+internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
+    @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+    @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
+    @JvmField internal var `onConnectionStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod0? = null,
+    @JvmField internal var `onScreenUpdate`: UniffiCallbackInterfaceOrchestratorCallbackMethod1? = null,
+    @JvmField internal var `onHostKey`: UniffiCallbackInterfaceOrchestratorCallbackMethod2? = null,
+    @JvmField internal var `onData`: UniffiCallbackInterfaceOrchestratorCallbackMethod3? = null,
+    @JvmField internal var `onTrzszStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod4? = null,
+    @JvmField internal var `onDownloadComplete`: UniffiCallbackInterfaceOrchestratorCallbackMethod5? = null,
+) : Structure() {
+    class UniffiByValue(
+        `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+        `uniffiClone`: UniffiCallbackInterfaceClone? = null,
+        `onConnectionStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod0? = null,
+        `onScreenUpdate`: UniffiCallbackInterfaceOrchestratorCallbackMethod1? = null,
+        `onHostKey`: UniffiCallbackInterfaceOrchestratorCallbackMethod2? = null,
+        `onData`: UniffiCallbackInterfaceOrchestratorCallbackMethod3? = null,
+        `onTrzszStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod4? = null,
+        `onDownloadComplete`: UniffiCallbackInterfaceOrchestratorCallbackMethod5? = null,
+    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,), Structure.ByValue
+
+    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceOrchestratorCallback) {
+        `uniffiFree` = other.`uniffiFree`
+        `uniffiClone` = other.`uniffiClone`
+        `onConnectionStateChanged` = other.`onConnectionStateChanged`
+        `onScreenUpdate` = other.`onScreenUpdate`
+        `onHostKey` = other.`onHostKey`
+        `onData` = other.`onData`
+        `onTrzszStateChanged` = other.`onTrzszStateChanged`
+        `onDownloadComplete` = other.`onDownloadComplete`
+    }
+}
+// ── SessionCallback JNA method interfaces ────────────────────────────────────
 internal interface UniffiCallbackInterfaceSessionCallbackMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`data`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
@@ -768,6 +821,48 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_finished(
     ): Int
+    external fun uniffi_tssh_core_checksum_func_create_session_orchestrator(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_quic(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_disconnect(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_notify_error(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_resize(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_scrollback_cells(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_scrollback_len(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_send(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_download(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_upload(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_cancel(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_dismiss(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_send_chunk(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_is_quic(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_connection_state_changed(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_screen_update(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_host_key(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_data(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_trzsz_state_changed(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_download_complete(
+    ): Int
     external fun ffi_tssh_core_uniffi_contract_version(
     ): Int
 
@@ -785,7 +880,8 @@ internal object UniffiLib {
     init {
         Native.register(UniffiLib::class.java, findLibraryName(componentName = "tssh_core"))
         uniffiCallbackInterfaceSessionCallback.register(this)
-        
+        uniffiCallbackInterfaceOrchestratorCallback.register(this)
+
     }
     external fun uniffi_tssh_core_fn_clone_sshsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
@@ -837,7 +933,45 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_tssh_core_fn_init_callback_vtable_sessioncallback(`vtable`: UniffiVTableCallbackInterfaceSessionCallback,
     ): Unit
-    external fun uniffi_tssh_core_fn_func_create_ssh_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    // ── OrchestratorCallback vtable ──────────────────────────────────────────────
+    external fun uniffi_tssh_core_fn_init_callback_vtable_orchestratorcallback(`vtable`: UniffiVTableCallbackInterfaceOrchestratorCallback,
+    ): Unit
+    // ── SessionOrchestrator ──────────────────────────────────────────────────────
+    external fun uniffi_tssh_core_fn_func_create_session_orchestrator(`callback`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_tssh_core_fn_clone_sessionorchestrator(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+    external fun uniffi_tssh_core_fn_free_sessionorchestrator(`handle`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_accept_download(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_accept_upload(`ptr`: Long,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_send_chunk(`ptr`: Long,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_cancel(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_dismiss(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_is_quic(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+    external fun uniffi_tssh_core_fn_method_sessionorchestrator_notify_error(`ptr`: Long,`message`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+    external fun uniffi_tssh_core_fn_func_create_ssh_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Long
     external fun uniffi_tssh_core_fn_func_create_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
@@ -1051,6 +1185,69 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_finished() != 46114) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_func_create_session_orchestrator() != 25564) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect() != 59422) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect_quic() != 17166) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_disconnect() != 7875) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_notify_error() != 15428) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_resize() != 60330) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_scrollback_cells() != 44304) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_scrollback_len() != 60098) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_send() != 49699) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_download() != 63735) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_upload() != 12551) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_cancel() != 9112) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_dismiss() != 6589) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_send_chunk() != 13645) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_is_quic() != 61715) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_connection_state_changed() != 63751) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_screen_update() != 30781) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_host_key() != 12009) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_data() != 51069) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_trzsz_state_changed() != 55321) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_download_complete() != 2381) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -2916,11 +3113,390 @@ public object FfiConverterSequenceTypeCellData: FfiConverterRustBuffer<List<Cell
             return FfiConverterTypeQuicSession.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_tssh_core_fn_func_create_quic_session(
-    
+
         FfiConverterTypeQuicConfig.lower(`config`),_status)
 }
     )
     }
-    
 
 
+// ════════════════════════════════════════════════════════════════════════════
+// ── OrchestratorCallback ─────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+
+public interface OrchestratorCallback {
+    fun `onConnectionStateChanged`(`state`: ConnectionPublicState)
+    fun `onScreenUpdate`(`update`: ScreenUpdate)
+    fun `onHostKey`(`host`: kotlin.String, `port`: kotlin.UShort, `fingerprint`: kotlin.String): kotlin.Boolean
+    fun `onData`(`data`: kotlin.ByteArray)
+    fun `onTrzszStateChanged`(`state`: TrzszPublicState)
+    fun `onDownloadComplete`(`fileName`: kotlin.String?, `data`: kotlin.ByteArray)
+    companion object
+}
+
+internal object uniffiCallbackInterfaceOrchestratorCallback {
+    internal object `onConnectionStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod0 {
+        override fun callback(`uniffiHandle`: Long,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onConnectionStateChanged`(FfiConverterTypeConnectionPublicState.lift(`state`))
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onScreenUpdate`: UniffiCallbackInterfaceOrchestratorCallbackMethod1 {
+        override fun callback(`uniffiHandle`: Long,`update`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onScreenUpdate`(FfiConverterTypeScreenUpdate.lift(`update`))
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onHostKey`: UniffiCallbackInterfaceOrchestratorCallbackMethod2 {
+        override fun callback(`uniffiHandle`: Long,`host`: RustBuffer.ByValue,`port`: Short,`fingerprint`: RustBuffer.ByValue,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onHostKey`(
+                    FfiConverterString.lift(`host`),
+                    FfiConverterUShort.lift(`port`),
+                    FfiConverterString.lift(`fingerprint`),
+                )
+            }
+            val writeReturn = { value: kotlin.Boolean -> uniffiOutReturn.setValue(FfiConverterBoolean.lower(value)) }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onData`: UniffiCallbackInterfaceOrchestratorCallbackMethod3 {
+        override fun callback(`uniffiHandle`: Long,`data`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onData`(FfiConverterByteArray.lift(`data`))
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onTrzszStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod4 {
+        override fun callback(`uniffiHandle`: Long,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onTrzszStateChanged`(FfiConverterTypeTrzszPublicState.lift(`state`))
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onDownloadComplete`: UniffiCallbackInterfaceOrchestratorCallbackMethod5 {
+        override fun callback(`uniffiHandle`: Long,`fileName`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onDownloadComplete`(
+                    FfiConverterOptionalString.lift(`fileName`),
+                    FfiConverterByteArray.lift(`data`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
+        override fun callback(handle: Long) {
+            FfiConverterTypeOrchestratorCallback.handleMap.remove(handle)
+        }
+    }
+    internal object uniffiClone: UniffiCallbackInterfaceClone {
+        override fun callback(handle: Long): Long {
+            return FfiConverterTypeOrchestratorCallback.handleMap.clone(handle)
+        }
+    }
+
+    internal var vtable = UniffiVTableCallbackInterfaceOrchestratorCallback.UniffiByValue(
+        uniffiFree, uniffiClone,
+        `onConnectionStateChanged`,
+        `onScreenUpdate`,
+        `onHostKey`,
+        `onData`,
+        `onTrzszStateChanged`,
+        `onDownloadComplete`,
+    )
+
+    internal fun register(lib: UniffiLib) {
+        lib.uniffi_tssh_core_fn_init_callback_vtable_orchestratorcallback(vtable)
+    }
+}
+
+public object FfiConverterTypeOrchestratorCallback: FfiConverterCallbackInterface<OrchestratorCallback>()
+
+// ════════════════════════════════════════════════════════════════════════════
+// ── ConnectionPublicState ────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+
+sealed class ConnectionPublicState {
+    data class Disconnected(val `reason`: kotlin.String?) : ConnectionPublicState()
+    object Connecting : ConnectionPublicState()
+    data class Connected(val `host`: kotlin.String) : ConnectionPublicState()
+    data class Error(val `message`: kotlin.String) : ConnectionPublicState()
+    companion object
+}
+
+public object FfiConverterTypeConnectionPublicState : FfiConverterRustBuffer<ConnectionPublicState> {
+    override fun read(buf: ByteBuffer): ConnectionPublicState = when (buf.getInt()) {
+        1 -> ConnectionPublicState.Disconnected(FfiConverterOptionalString.read(buf))
+        2 -> ConnectionPublicState.Connecting
+        3 -> ConnectionPublicState.Connected(FfiConverterString.read(buf))
+        4 -> ConnectionPublicState.Error(FfiConverterString.read(buf))
+        else -> throw RuntimeException("invalid ConnectionPublicState discriminant")
+    }
+    override fun allocationSize(value: ConnectionPublicState): ULong = throw NotImplementedError("ConnectionPublicState is Rust→Kotlin only")
+    override fun write(value: ConnectionPublicState, buf: ByteBuffer) = throw NotImplementedError("ConnectionPublicState is Rust→Kotlin only")
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ── TrzszPublicState ─────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+
+sealed class TrzszPublicState {
+    object Idle : TrzszPublicState()
+    data class WaitingUser(
+        val `transferId`: kotlin.String,
+        val `mode`: kotlin.String,
+        val `suggestedName`: kotlin.String?,
+        val `expectedSize`: kotlin.ULong?,
+    ) : TrzszPublicState()
+    data class InProgress(
+        val `transferId`: kotlin.String,
+        val `mode`: kotlin.String,
+        val `fileName`: kotlin.String?,
+        val `transferred`: kotlin.ULong,
+        val `total`: kotlin.ULong?,
+    ) : TrzszPublicState()
+    data class Done(
+        val `transferId`: kotlin.String,
+        val `success`: kotlin.Boolean,
+        val `message`: kotlin.String?,
+    ) : TrzszPublicState()
+    companion object
+}
+
+public object FfiConverterTypeTrzszPublicState : FfiConverterRustBuffer<TrzszPublicState> {
+    override fun read(buf: ByteBuffer): TrzszPublicState = when (buf.getInt()) {
+        1 -> TrzszPublicState.Idle
+        2 -> TrzszPublicState.WaitingUser(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalULong.read(buf),
+        )
+        3 -> TrzszPublicState.InProgress(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterOptionalULong.read(buf),
+        )
+        4 -> TrzszPublicState.Done(
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+        else -> throw RuntimeException("invalid TrzszPublicState discriminant")
+    }
+    override fun allocationSize(value: TrzszPublicState): ULong = throw NotImplementedError("TrzszPublicState is Rust→Kotlin only")
+    override fun write(value: TrzszPublicState, buf: ByteBuffer) = throw NotImplementedError("TrzszPublicState is Rust→Kotlin only")
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ── SessionOrchestrator ──────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+
+public interface SessionOrchestratorInterface {
+    @Throws(SshException::class) fun `connect`(`config`: SshConfig)
+    @Throws(SshException::class) fun `connectQuic`(`config`: QuicConfig)
+    fun `disconnect`()
+    fun `send`(`data`: kotlin.ByteArray)
+    fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
+    fun `scrollbackLen`(): kotlin.UInt
+    fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData>
+    fun `trzszAcceptDownload`()
+    fun `trzszAcceptUpload`(`fileName`: kotlin.String, `fileSize`: kotlin.ULong, `mode`: kotlin.UInt)
+    fun `trzszSendChunk`(`data`: kotlin.ByteArray, `isLast`: kotlin.Boolean)
+    fun `trzszCancel`()
+    fun `trzszDismiss`()
+    fun `isQuic`(): kotlin.Boolean
+    fun `notifyError`(`message`: kotlin.String)
+    companion object
+}
+
+open class SessionOrchestrator : Disposable, AutoCloseable, SessionOrchestratorInterface {
+
+    @Suppress("UNUSED_PARAMETER")
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() { this.destroy() }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            if (c == Long.MAX_VALUE) throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+        } while (!this.callCounter.compareAndSet(c, c + 1L))
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            if (this.callCounter.decrementAndGet() == 0L) cleanable?.clean()
+        }
+    }
+
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) return
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_tssh_core_fn_free_sessionorchestrator(handle, status)
+            }
+        }
+    }
+
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) throw InternalException("uniffiCloneHandle() called on NoHandle object")
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_tssh_core_fn_clone_sessionorchestrator(handle, status)
+        }
+    }
+
+    @Throws(SshException::class) override fun `connect`(`config`: SshConfig) = callWithHandle {
+        uniffiRustCallWithError(SshException) { _status ->
+            UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_connect(it, FfiConverterTypeSshConfig.lower(`config`), _status)
+        }
+    }
+
+    @Throws(SshException::class) override fun `connectQuic`(`config`: QuicConfig) = callWithHandle {
+        uniffiRustCallWithError(SshException) { _status ->
+            UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_connect_quic(it, FfiConverterTypeQuicConfig.lower(`config`), _status)
+        }
+    }
+
+    override fun `disconnect`() = callWithHandle {
+        uniffiRustCall() { _status ->
+            UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_disconnect(it, _status)
+        }
+    }
+
+    override fun `send`(`data`: kotlin.ByteArray) = callWithHandle {
+        uniffiRustCall() { _status ->
+            UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_send(it, FfiConverterByteArray.lower(`data`), _status)
+        }
+    }
+
+    override fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt) = callWithHandle {
+        uniffiRustCall() { _status ->
+            UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_resize(it, FfiConverterUInt.lower(`cols`), FfiConverterUInt.lower(`rows`), _status)
+        }
+    }
+
+    override fun `scrollbackLen`(): kotlin.UInt {
+        return FfiConverterUInt.lift(callWithHandle {
+            uniffiRustCall() { _status ->
+                UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_len(it, _status)
+            }
+        })
+    }
+
+    override fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData> {
+        return FfiConverterSequenceTypeCellData.lift(callWithHandle {
+            uniffiRustCall() { _status ->
+                UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_cells(it, FfiConverterUInt.lower(`offset`), FfiConverterUInt.lower(`rows`), _status)
+            }
+        })
+    }
+
+    override fun `trzszAcceptDownload`() = callWithHandle {
+        uniffiRustCall() { _status ->
+            UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_accept_download(it, _status)
+        }
+    }
+
+    override fun `trzszAcceptUpload`(`fileName`: kotlin.String, `fileSize`: kotlin.ULong, `mode`: kotlin.UInt) = callWithHandle {
+        uniffiRustCall() { _status ->
+            UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_accept_upload(it, FfiConverterString.lower(`fileName`), FfiConverterULong.lower(`fileSize`), FfiConverterUInt.lower(`mode`), _status)
+        }
+    }
+
+    override fun `trzszSendChunk`(`data`: kotlin.ByteArray, `isLast`: kotlin.Boolean) = callWithHandle {
+        uniffiRustCall() { _status ->
+            UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_send_chunk(it, FfiConverterByteArray.lower(`data`), FfiConverterBoolean.lower(`isLast`), _status)
+        }
+    }
+
+    override fun `trzszCancel`() = callWithHandle {
+        uniffiRustCall() { _status ->
+            UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_cancel(it, _status)
+        }
+    }
+
+    override fun `trzszDismiss`() = callWithHandle {
+        uniffiRustCall() { _status ->
+            UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_dismiss(it, _status)
+        }
+    }
+
+    override fun `isQuic`(): kotlin.Boolean {
+        return FfiConverterBoolean.lift(callWithHandle {
+            uniffiRustCall() { _status ->
+                UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_is_quic(it, _status)
+            }
+        })
+    }
+
+    override fun `notifyError`(`message`: kotlin.String) = callWithHandle {
+        uniffiRustCall() { _status ->
+            UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_notify_error(it, FfiConverterString.lower(`message`), _status)
+        }
+    }
+
+    companion object
+}
+
+public object FfiConverterTypeSessionOrchestrator : FfiConverter<SessionOrchestrator, Long> {
+    override fun lower(value: SessionOrchestrator): Long = value.uniffiCloneHandle()
+    override fun lift(value: Long): SessionOrchestrator = SessionOrchestrator(UniffiWithHandle, value)
+    override fun read(buf: ByteBuffer): SessionOrchestrator = lift(buf.getLong())
+    override fun allocationSize(value: SessionOrchestrator) = 8UL
+    override fun write(value: SessionOrchestrator, buf: ByteBuffer) { buf.putLong(lower(value)) }
+}
+
+fun `createSessionOrchestrator`(`callback`: OrchestratorCallback): SessionOrchestrator {
+    return FfiConverterTypeSessionOrchestrator.lift(
+        uniffiRustCall() { _status ->
+            UniffiLib.uniffi_tssh_core_fn_func_create_session_orchestrator(
+                FfiConverterTypeOrchestratorCallback.lower(`callback`), _status)
+        }
+    )
+}

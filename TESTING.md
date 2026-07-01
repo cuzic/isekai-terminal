@@ -210,7 +210,7 @@ TsshNav: → KeyImport
 TsshKey: file selected via SAF: id_ed25519.pem uri=content://...
 TsshKey: import start: label='mykey' file='id_ed25519.pem'
 TsshKey: read PEM: <N> bytes
-TsshKey: encrypted key saved → /data/data/com.example.imespike/files/keys/<UUID>.enc
+TsshKey: encrypted key saved → /data/data/tools.isekai.terminal/files/keys/<UUID>.enc
 TsshKey: key saved to DB: id=1 label='mykey'
 TsshNav: → KeyList
 TsshKey: loaded 1 key(s): ['mykey']

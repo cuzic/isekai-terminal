@@ -410,6 +410,179 @@ tsshd-compatible client transport
 
 ---
 
+## Phase 6: SSH3 / Remote Terminal over HTTP/3 — 検討の末に断念（記録として残す）
+
+2026-07-01 に検討したが、以下の理由で採用を見送った。詳細な調査記録は `SSH3_PROTOCOL_NOTES.md`（冒頭に
+ABANDONED 表記あり）に残してある。
+
+- IETF draft（`draft-michel-remote-terminal-http3`）は個人提案のまま expired。QUIC WG / HTTPBIS WG の
+  採用なし、SSHM WG チャーターはスコープ外と明記。標準化トラジェクトリが無い。
+- 実装には `hyperium/h3` の `Protocol` enum への独自パッチが必要、TLS Exporter 要件から quiche は不採用
+  （quinn を要採用）など、SSH3 互換だけのために背負う実装コストが大きい。
+- 代替候補として調べた `draft-bider-ssh-quic` も、仕様はあるが実装が存在しない（2020年で凍結、唯一の
+  プロトタイプ `denisbider/QuiSSH` も初日で放棄）ため採用に値しない。
+- 代替候補として調べた `oowl/quicssh-rs` も、SSH プロトコルに関与しない汎用 QUIC↔TCP トンネルで
+  ライブラリ組み込み不可・ローミング未解決バグありのため、そのまま採用する価値は無いと判断。
+  ただし「QUIC トンネル + 素の sshd へ中継」という発想自体は Phase 5 の再設計（下記）に活かす。
+
+**→ Phase 6 は実施しない。SSH3 対応は行わない。**
+
+---
+
+## Phase 7: 自作ヘルパー方式による QUIC 接続耐性（tsshd 非依存、実験的・Phase 5 と共存）
+
+### 位置づけ
+
+Phase 5（tsshd/QUIC）は、サーバー側に **tsshd（trzsz-ssh daemon）が事前インストールされていること**を前提とし、
+その Go 実装のワイヤープロトコルに完全追従する設計だった（互換性ドリフトが恒常的なリスクとして残る）。
+
+Phase 7 は、tsshd への依存を断ち切り、**自分たちで書いた最小限の Rust ヘルパーバイナリ**をサーバー側に配置して
+同様のローミング耐性を得る方式。ワイヤープロトコルは自分たちで定義するため、外部実装との互換性ドリフトの
+心配が無くなる。**Phase 5 を置き換えるのではなく、選択肢として共存させる**（自作ヘルパーが使えない環境
+— 例えば `noexec` マウントやセキュリティポリシーが厳しいサーバー — では Phase 5 / 通常 TCP SSH にフォールバック
+できる方が堅牢なため）。
+
+### ヘルパーの役割（スコープを小さく保つ）
+
+自作ヘルパーは **賢いことをしない**。QUIC で受けたバイトを `127.0.0.1:22`（素の、素のままの `sshd`）へ
+TCP で中継するだけの薄いプロキシに徹する。SSH の認証・チャネル・PTY 制御は今まで通り russh がクライアント側で
+処理する（`run_ssh_channel_loop<T: AsyncRead + AsyncWrite>` は既にトランスポート非依存な設計になっているため、
+「TCP の代わりに QUIC 経由でこのヘルパーに繋ぐ」という差し替えだけで済む）。
+
+これにより、tsshd のような「SSH channel 多重化・独自暗号ヘッダ」を自作する必要が無くなり、実装量を最小限に
+抑えられる（quicssh-rs が実際にやっていることとほぼ同じだが、ライブラリとして自分たちの Rust コアに直接組み込む）。
+
+### QUIC コネクション維持（ローミング対応）— この設計の核心
+
+**このヘルパーが解決すべき本質的な課題は「クライアントの IP/ポートが変わっても QUIC コネクションを
+維持し続けること」であり、tsshd 互換にこだわらなかった最大の理由もここにある。**
+
+- 一次的な機構は **QUIC 自体が持つ Connection Migration（RFC 9000 §9）** に任せる。QUIC は
+  「4-tuple（送信元IP・ポート・宛先IP・ポート）」ではなく **Connection ID** でセッションを識別するため、
+  Wi-Fi⇔5G 切替でクライアントの IP/ポートが変わっても、**同一の QUIC コネクションのまま**新しい経路
+  （path）に自動追従できる。これは tsshd の Go 実装が採用した「独自の Client Proxy 再接続プロトコル
+  （nonce/AAD/seq_no を手動管理）」より遥かにシンプルで、しかも QUIC 標準機能なので外部実装への
+  追従リスクが無い。
+- **クライアント側の要件**: Android の `ConnectivityManager` がネットワーク切替を通知した際、
+  `Network.bindSocket(FileDescriptor)` で新しいアクティブネットワークに束縛した UDP ソケットを用意し、
+  `quinn::Endpoint::rebind()` を呼ぶ（Phase 5A-2a/2b/2c で既にスパイク済みの手法をそのまま転用できる）。
+- **サーバー側（ヘルパー）の要件**: quinn のサーバーエンドポイントが、既に検証済みの Connection ID からの
+  path migration（新しい 4-tuple での `PATH_CHALLENGE`/`PATH_RESPONSE`）を正しく受理できることを
+  Phase 7-0 のスパイクで確認する（quinn はデフォルトで RFC 9000 準拠の migration をサポートするはずだが、
+  明示的な受け入れ確認をテスト項目に含める）。
+- **決定的な利点**: ヘルパーが `127.0.0.1:22` の `sshd` と結ぶ TCP コネクションは、クライアントの実ネットワーク
+  経路とは完全に切り離された別物であり、クライアントがどれだけ IP/ポートを変えても **一度も再確立されない**。
+  つまり `sshd` から見れば、SSH セッションは何の乱れも無く継続し続ける（TCP 接続そのものがローミングを
+  意識する必要が無い）。
+- **フォールバック（QUIC コネクション自体が失われた場合）**: アイドルタイムアウト超過や migration の
+  path validation 失敗など、QUIC connection migration だけでは救えないケース（回線が長時間完全に
+  切断された場合など）に備え、直前に発行された認証トークンを使って**新しい QUIC コネクションから
+  同じヘルパーセッションに再接続できる**軽量な再接続手順を用意する（SSH 再接続からやり直すより高速）。
+
+### 配置場所（`/tmp` は不採用）
+
+`/tmp` は以下の理由で避ける:
+- `noexec` でマウントされているサーバーがあり、実行できないケースがある
+- 世界書き込み可能な共有ディレクトリで、多人数利用サーバーでは事故・監査ログ上の見た目が悪い
+- 再起動や tmpfs クリアで消える前提を明示的に設計に組み込む必要がある
+
+**→ `~/.local/bin/isekai-helper`（XDG Base Directory 準拠、ユーザーのホーム配下）を既定の設置場所とする。**
+ホームディレクトリはほぼ確実に `noexec` ではなく、ユーザーごとに独立し、既存の `$PATH` 慣習（`~/.local/bin` を
+`$PATH` に含める設定は一般的）とも整合する。
+
+### 配布方法（複数を用意し、上から順に試す）
+
+```
+1. 既存インストール確認: `command -v isekai-helper` または `~/.local/bin/isekai-helper` の存在確認
+   → 見つかればそれを使う（バージョン確認して不一致なら再配布を検討）
+2. Linuxbrew（linuxbrew/homebrew-core 相当の自前 tap）: `brew install isekai-terminal/tap/isekai-helper`
+   → ユーザーが既に linuxbrew を使っている環境では最も摩擦が少ない
+3. ブートストラップ自動配布（SSH 経由）:
+   a. `uname -m` でアーキテクチャ検出（x86_64 / aarch64 を優先対応）
+   b. APK に同梱した対応バイナリ（static musl build）を SSH exec チャネル経由で転送
+      （russh の SFTP subsystem が使えるならそちら、無ければ base64 + exec 'cat > file' でも可）
+   c. `~/.local/bin/` を作成（無ければ）→ 書き込み → `chmod +x`
+   d. 起動し、標準出力から一時ポート番号 + 認証トークンを受け取る
+4. 上記すべて失敗した場合: ユーザーに「手動インストールが必要」であることを明示するエラーメッセージを出し、
+   手動インストール手順（バイナリ配布ページ）を案内する。通常 SSH（Phase 1-4）へは自動フォールバックする。
+```
+
+### セキュリティ
+
+自作ヘルパーの脅威モデルは「個人が自分のサーバーに繋ぐ」スコープに限定し、エンタープライズ的な
+ゼロトラストポリシー（GeoIP/ASN ベースの再認証、複雑なローミング状態機械など）は過剰と判断し導入しない。
+一方で、以下は実際に効く対策として採用する。
+
+- **証明書ピン留めは SSH 経由で行う**: ヘルパーの自己署名証明書の fingerprint は、QUIC 接続時の
+  素の TOFU ではなく、**既に認証済みの SSH チャネル経由**でクライアントに渡す。SSH 接続自体が
+  MITM されていない前提が既に成立しているため、通常の「初回接続のみを信頼する」TOFU より強い
+  信頼の起点になる（`KnownHost` の仕組みを拡張して転用）。
+- **トークンは「送る」のではなく「証明する」**: SSH stdout 経由でクライアントに渡すのは生の
+  トークンではなく `session_secret`（ヘルパー起動ごとにランダム生成）。QUIC 接続確立後、
+  クライアントは `proof = HMAC(session_secret, quic接続のexport_keying_material)` を送り、
+  ヘルパー側で同じ計算をして一致を確認してから初めて TCP 中継を開始する。
+  - この設計により、経路上の盗聴者が `proof` を観測できても、それは **その1つの QUIC コネクションにしか
+    有効でない**ため、別コネクションへのリプレイができない（SSH3 の JWT `jti` を TLS Exporter に
+    束縛する発想と同じ。Phase 6 の調査で確認済みの quinn `export_keying_material()` をそのまま使う）。
+  - `session_secret` 自体は物理的な経路（SSH チャネル）を一度も QUIC 上に流さないため、QUIC 側の
+    盗聴だけでは `session_secret` を割り出せない。
+- **0-RTT 禁止**: `proof` を含む最初のメッセージは 0-RTT（early data）では送らない。1-RTT
+  ハンドシェイク完了後にのみ送信・検証する（0-RTT のリプレイ耐性の弱さを回避）。
+- **同時アクティブ接続は1本まで**: 同じ `session_secret` に由来する有効な `proof` を持つ新しい
+  QUIC 接続が来ても、既存の接続がまだ生きていれば **新規接続を拒否**する（デフォルトは「奪取」ではなく
+  「拒否」。正規ユーザーが誤って蹴られる事故より、疑わしい二重接続を弾く方を優先する）。
+- **QUIC の path validation は必須のまま**（既存リスク表参照）。ローミング自体への追加の再認証は
+  行わない（脅威モデル上、そこまでのリスクは想定しない）。
+  - ただし **RFC 9000 §9.3.2（On-Path Address Spoofing）が明記する通り、path validation は
+    on-path（既に経路上にいる）攻撃者には効かない**。path validation が証明するのは「その IP に
+    パケットが届くこと」だけで、「その経路が信頼できること」ではない。上記の `proof = HMAC(session_secret,
+    export_keying_material)` による認証は path validation とは独立した防御であり、on-path 攻撃者が
+    正規パケットを忠実に中継して path validation を通過させたとしても、`session_secret` を知らない限り
+    有効な `proof` を計算できないため、乗っ取りを防げる。この二層構造（QUIC 標準の path validation ＝
+    可用性・整合性、`proof` ＝ アプリ層認可）を明示しておく。
+  - サーバー側の `preferred_address`（RFC 9000 §9.6）は**使用しない**。preferred_address を悪用した
+    データ持ち出し攻撃（QUIC-Exfil、arXiv:2505.05292、ACM ASIA CCS '25）が実際に報告されており、
+    論文自身が「preferred_address の無効化」を対策として挙げている。ヘルパーの quinn サーバー設定で
+    明示的に無効化し、意図的な設計判断として記録しておく。
+  - PATH_CHALLENGE / NEW_CONNECTION_ID フラッディングによる off-path DoS（メモリ枯渇）が quinn の
+    実装依存で起こり得ることが知られている（Marten Seemann の実地報告、2023/2024）。quic-go は
+    RFC を意図的に逸脱してキューに上限を設けることで対処した実績がある。Phase 7-0 で quinn の
+    デフォルト挙動を確認し、上限が無い場合は自前でレート制限を追加する。
+- **セッション終了時の無効化**: ヘルパープロセス終了・SSH 再ブートストラップのたびに `session_secret`
+  は使い捨てにし、古いものは再利用不可にする。
+- APK に同梱するヘルパーバイナリはビルド時にチェックサムを記録し、供給チェーンの整合性を確認できるようにする。
+
+### フェーズ分割
+
+| # | 内容 | 成果物 |
+|---|------|--------|
+| 7-0 | ヘルパーバイナリの最小実装（quinn サーバー + `127.0.0.1:22` への TCP 中継、トークン認証）+ QUIC connection migration（path validation の受理）の動作確認 | `isekai-helper` バイナリ（デスクトップ Linux で動作確認、クライアント側 IP/ポート変更後も同一コネクションが継続することを確認） |
+| 7-1 | x86_64 / aarch64 musl クロスビルド確認（cargo-ndk 相当の cross ビルド設定） | 静的バイナリ2種 |
+| 7-2 | SSH 経由のブートストラップ配布ロジック（アーキテクチャ検出→転送→起動→トークン受信） | Rust コアから自動配布できる |
+| 7-3 | Linuxbrew tap 作成（`isekai-terminal/homebrew-tap`） | `brew install` で導入可能 |
+| 7-4 | `ActiveSession` への統合（Phase 5 の `QuicSession` を tsshd 専用から一般化、または並列の `HelperQuicSession` を追加） | プロファイルから「自作ヘルパー」を選択できる |
+| 7-5 | 実機ローミング耐性検証（Wi-Fi⇔5G、ヘルパープロセスが再起動で消えた場合のフォールバック確認） | 実機回帰チェックリスト |
+
+対象外: マルチユーザーサーバーでの他ユーザーとの共存考慮の深掘り、Windows/macOS サーバー対応（Linux 前提）、
+自動アップデート機構。
+
+### リスク
+
+| リスク | 対策 |
+|--------|------|
+| `~/.local/bin` が `$PATH` に無いサーバーがある | ヘルパー起動はフルパス指定で行うため `$PATH` 依存にしない。`command -v` チェックもフルパス優先 |
+| サーバーの CPU アーキテクチャが x86_64/aarch64 以外 | 検出できないアーキテクチャの場合は Phase 5 / 通常 SSH にフォールバック |
+| ヘルパープロセスがサーバー再起動・OOM killで消える | 接続の都度「起動確認」を行うロジックを必須にする（tsshd の `ensureServiceStarted()` と同じパターンを踏襲） |
+| 任意バイナリの自動転送・実行に対するユーザーの心理的抵抗・セキュリティ方針違反 | ブートストラップは opt-in（プロファイル設定で明示的に有効化）とし、既定は無効。Linuxbrew/手動インストールを優先案内する選択肢も残す |
+| バイナリ供給チェーンの改ざんリスク | ビルド時チェックサムを記録し、将来的に署名検証を追加検討 |
+| キャリア/企業 NAT・ファイアウォールが QUIC の path migration を弾く（新しい 4-tuple からのパケットを別コネクション扱いする等） | Phase 7-0 で実機の Wi-Fi⇔5G 切替時に実際に migration が成立するか検証。失敗する場合はトークンベースの再接続（フォールバック）に切り替える |
+| QUIC アイドルタイムアウト超過で完全にコネクションが失われる（migration では救えない） | 認証トークンを使った軽量な再接続手順を用意し、SSH からのフルリブートストラップより高速な復帰経路を確保する |
+| on-path 攻撃者は path validation を通過できてしまう（RFC 9000 §9.3.2、path validation は経路の到達性を証明するだけで信頼性は証明しない） | `proof = HMAC(session_secret, export_keying_material)` によるアプリ層認証を path validation とは独立した防御として設計済み（session_secret を知らない攻撃者は正規パケット中継だけでは乗っ取れない） |
+| サーバー側 preferred_address を悪用したデータ持ち出し（QUIC-Exfil、arXiv:2505.05292） | ヘルパーの quinn サーバー設定で preferred_address を明示的に無効化する（そもそも使わない設計） |
+| PATH_CHALLENGE / NEW_CONNECTION_ID フラッディングによる off-path DoS（quinn の実装依存、quic-go は RFC 逸脱でキュー上限を設けて対処した前例あり） | Phase 7-0 で quinn のデフォルト挙動を確認し、上限が無ければ自前でレート制限を追加する |
+
+---
+
 ## 実装順序
 
 ```
@@ -433,6 +606,15 @@ Phase 4D: 実機回帰
 
 Phase 5A: Spike
 Phase 5B: tsshd MVP
+
+[Phase 6: SSH3 / Remote Terminal over HTTP/3 は検討の末に不採用（詳細は上記 Phase 6 節）]
+
+Phase 7-0: 自作ヘルパーバイナリ最小実装（quinn サーバー + 127.0.0.1:22 中継、トークン認証）
+Phase 7-1: x86_64/aarch64 musl クロスビルド
+Phase 7-2: SSH 経由ブートストラップ配布ロジック
+Phase 7-3: Linuxbrew tap 作成
+Phase 7-4: ActiveSession 統合（プロファイルから選択可能に）
+Phase 7-5: 実機ローミング耐性検証
 ```
 
 ---
@@ -460,3 +642,8 @@ Phase 5B: tsshd MVP
   - detector: `trzsz/comm.go` の `LastIndex(output, "::TRZSZ:TRANSFER:")`
 - quinn: https://github.com/quinn-rs/quinn
 - Android Network.bindSocket: API 22+（FileDescriptor: 23+）
+- SSH3_PROTOCOL_NOTES.md: SSH3 / Remote Terminal over HTTP/3 の調査記録（ABANDONED、Phase 6 不採用の経緯）
+- oowl/quicssh-rs（参考、不採用）: https://github.com/oowl/quicssh-rs（QUIC↔TCP汎用トンネル。「素の sshd へ中継」という発想のみ Phase 7 に活用）
+- russh-sftp: crates.io の `russh-sftp`（2.3.0、SFTP subsystem for russh）— Phase 7-2 のブートストラップ転送で使用検討
+- Homebrew Formula Cookbook: https://docs.brew.sh/Formula-Cookbook（Phase 7-3 の linuxbrew tap 作成時に参照）
+- XDG Base Directory Specification: https://specifications.freedesktop.org/basedir-spec/latest/（`~/.local/bin` 配置の根拠）

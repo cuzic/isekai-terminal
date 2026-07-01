@@ -6,6 +6,7 @@ resolver = "2"
 name = "tssh-core"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 
 [lib]
 name = "tssh_core"
@@ -16,7 +17,7 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 
 [dependencies]
 uniffi = { version = "0.31", features = ["tokio"] }
-timed-fsm = { path = "../../rust-nicola/crates/timed-fsm" }
+timed-fsm = "0.3.0"
 russh = "0.48"
 russh-keys = "0.48"
 tokio = { version = "1", features = ["full"] }

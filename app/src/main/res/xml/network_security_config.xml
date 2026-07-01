@@ -1,8 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- adb reverse トンネル経由でログを送るための localhost cleartext 許可 -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">localhost</domain>
-        <domain includeSubdomains="false">127.0.0.1</domain>
-    </domain-config>
+    <!-- No cleartext traffic permitted in release builds -->
 </network-security-config>

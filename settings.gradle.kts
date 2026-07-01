@@ -13,5 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ime-spike"
+rootProject.name = "isekai-terminal"
 include(":app")

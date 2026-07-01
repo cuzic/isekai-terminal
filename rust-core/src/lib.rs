@@ -6,8 +6,10 @@ pub(crate) mod terminal;
 pub(crate) mod transport;
 pub(crate) mod session_state;
 pub(crate) mod session;
+pub mod orchestrator;
 
 pub use quic_transport::{create_quic_session, QuicConfig, QuicSession};
+pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -90,6 +92,51 @@ pub struct ScreenUpdate {
     pub application_cursor_mode: bool,
     pub bracketed_paste_mode: bool,
 }
+
+// ── New orchestrator public types ────────────────────────
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum ConnectionPublicState {
+    Disconnected { reason: Option<String> },
+    Connecting,
+    Connected { host: String },
+    Error { message: String },
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum TrzszPublicState {
+    Idle,
+    WaitingUser {
+        transfer_id: String,
+        mode: String,
+        suggested_name: Option<String>,
+        expected_size: Option<u64>,
+    },
+    InProgress {
+        transfer_id: String,
+        mode: String,
+        file_name: Option<String>,
+        transferred: u64,
+        total: Option<u64>,
+    },
+    Done {
+        transfer_id: String,
+        success: bool,
+        message: Option<String>,
+    },
+}
+
+#[uniffi::export(callback_interface)]
+pub trait OrchestratorCallback: Send + Sync {
+    fn on_connection_state_changed(&self, state: ConnectionPublicState);
+    fn on_screen_update(&self, update: ScreenUpdate);
+    fn on_host_key(&self, host: String, port: u16, fingerprint: String) -> bool;
+    fn on_data(&self, data: Vec<u8>);
+    fn on_trzsz_state_changed(&self, state: TrzszPublicState);
+    fn on_download_complete(&self, file_name: Option<String>, data: Vec<u8>);
+}
+
+// ── Old callback interface (kept for binary compatibility) ──
 
 #[uniffi::export(callback_interface)]
 pub trait SessionCallback: Send + Sync {
