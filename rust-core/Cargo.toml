@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "uniffi-bindgen", "tsshd"]
+members = [".", "uniffi-bindgen", "isekai-helper"]
 resolver = "2"
 
 [package]

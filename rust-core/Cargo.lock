@@ -1096,6 +1096,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "isekai-helper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "env_logger",
+ "hmac",
+ "log",
+ "quinn",
+ "rand 0.8.6",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tokio",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2610,21 +2630,6 @@ dependencies = [
  "unicode-width",
  "uniffi",
  "vte",
-]
-
-[[package]]
-name = "tsshd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "env_logger",
- "log",
- "quinn",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
