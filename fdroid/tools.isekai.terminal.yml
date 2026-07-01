@@ -58,12 +58,24 @@ Builds:
     # wrapper scripts expect (see rust-core/scripts/ndk-common.sh). The `ndk:`
     # field accepts either this numeric form or an `rNNx` alias.
     ndk: 27.1.12297006
+    # NOTE: `/opt/cargo/bin/cargo` (CARGO_HOME's bin dir) is rustup's proxy
+    # shim, not the real compiler - it re-resolves RUSTUP_HOME/CARGO_HOME on
+    # every invocation to pick a toolchain, and errors with "no default is
+    # configured" if a later step's environment doesn't carry those vars
+    # (verified against an actual CI run of this recipe's install sequence).
+    # So the symlinks below point straight at the real toolchain binaries
+    # under RUSTUP_HOME's toolchains/ dir instead of the shim, which need no
+    # env vars at all to run.
     sudo:
-      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo sh -s -- -y --profile minimal --default-toolchain stable
-      - /opt/cargo/bin/rustup target add aarch64-linux-android --toolchain stable
-      - ln -sf /opt/cargo/bin/cargo /usr/local/bin/cargo
-      - ln -sf /opt/cargo/bin/rustc /usr/local/bin/rustc
-      - ln -sf /opt/cargo/bin/rustup /usr/local/bin/rustup
+      - |
+        export RUSTUP_HOME=/opt/rustup
+        export CARGO_HOME=/opt/cargo
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+        export PATH="/opt/cargo/bin:$PATH"
+        rustup target add aarch64-linux-android --toolchain stable
+        TOOLCHAIN_DIR="$(rustup toolchain list | head -n1 | awk '{print $1}')"
+        ln -sf "/opt/rustup/toolchains/$TOOLCHAIN_DIR/bin/cargo" /usr/local/bin/cargo
+        ln -sf "/opt/rustup/toolchains/$TOOLCHAIN_DIR/bin/rustc" /usr/local/bin/rustc
     gradle:
       - yes
 

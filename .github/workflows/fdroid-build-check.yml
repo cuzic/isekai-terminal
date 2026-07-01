@@ -92,12 +92,16 @@ jobs:
 
       - name: Confirm cargo/rustc are reachable without sudo
         run: |
-          # This is the exact failure mode the recipe's comments call out:
-          # a naive rustup install lands in /root and is invisible here.
+          # This step exists because the recipe's symlinks bypass rustup's
+          # proxy shim entirely (see the comment in the recipe for why) - so
+          # cargo/rustc must work here with zero rustup-specific env vars set.
+          # Whether the aarch64-linux-android target is actually installed is
+          # left to the real `cargo build --target aarch64-linux-android`
+          # step below to prove; a wrong/missing target fails loudly there.
           which cargo
           which rustc
           cargo --version
-          rustup target list --installed | grep -q aarch64-linux-android
+          rustc --version
 
       - name: Cache Gradle and Cargo
         uses: actions/cache@v4
