@@ -1,0 +1,73 @@
+# Draft F-Droid build metadata recipe for ISEKAI Terminal (異世界ターミナル).
+#
+# This is NOT consumed by this repo's own build — it's the file that would be
+# copied to metadata/tools.isekai.terminal.yml in a fork of
+# https://gitlab.com/fdroid/fdroiddata and submitted as a merge request.
+#
+# Before submitting:
+#   - create and push a `v1.0` git tag matching the `commit:` below
+#   - re-check the `sudo:` block below against a real F-Droid buildserver run.
+#     Per https://f-droid.org/docs/Build_Metadata_Reference/ (fetched while
+#     drafting this): `sudo:` runs as root and its state resets after each
+#     build, so a plain `rustup.rs` install would land in /root and be
+#     invisible to the non-root user that runs `gradle:` afterwards. This
+#     recipe installs to /opt/rustup + /opt/cargo and symlinks the binaries
+#     into /usr/local/bin so they're on PATH regardless of which user runs
+#     the build — but that hasn't been verified against an actual F-Droid
+#     build server, only against the docs. There is no dedicated Rust/cargo
+#     install field (confirmed against the same doc page), so `sudo:` is the
+#     intended hook for this.
+
+Categories:
+  - Internet
+  - System
+# The repo is dual-licensed MIT OR Apache-2.0 (see LICENSE-MIT / LICENSE-APACHE),
+# but F-Droid's License: field takes a single SPDX identifier, not an
+# expression (confirmed against the Build Metadata Reference). MIT is the
+# less restrictive of the two, so it's the one declared here.
+License: MIT
+SourceCode: https://github.com/cuzic/isekai-terminal
+IssueTracker: https://github.com/cuzic/isekai-terminal/issues
+
+AutoName: ISEKAI Terminal
+Summary: SSH terminal client with trzsz file transfer
+Description: |-
+  ISEKAI Terminal (異世界ターミナル) is a native Android SSH client built on a
+  Rust core (via UniFFI) with a Kotlin/Jetpack Compose UI.
+
+  Features:
+
+  * SSH login with password or ed25519 key authentication, including key
+    generation and import
+  * A VT100/VTE terminal emulator with 256-color/TrueColor and alternate
+    screen support (tmux/htop tested)
+  * trzsz (trz/tsz) file transfer integrated directly into the terminal
+  * TOFU host key verification
+  * A foreground service that keeps the SSH session alive in the background
+    and survives screen rotation
+  * Scrollback history
+
+RepoType: git
+Repo: https://github.com/cuzic/isekai-terminal.git
+
+Builds:
+  - versionName: "1.0"
+    versionCode: 1
+    commit: v1.0
+    # Numeric NDK version, matching what rust-core/.cargo/config.toml's linker
+    # wrapper scripts expect (see rust-core/scripts/ndk-common.sh). The `ndk:`
+    # field accepts either this numeric form or an `rNNx` alias.
+    ndk: 27.1.12297006
+    sudo:
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo sh -s -- -y --profile minimal --default-toolchain stable
+      - /opt/cargo/bin/rustup target add aarch64-linux-android --toolchain stable
+      - ln -sf /opt/cargo/bin/cargo /usr/local/bin/cargo
+      - ln -sf /opt/cargo/bin/rustc /usr/local/bin/rustc
+      - ln -sf /opt/cargo/bin/rustup /usr/local/bin/rustup
+    gradle:
+      - yes
+
+AutoUpdateMode: None
+UpdateCheckMode: Tags
+CurrentVersion: "1.0"
+CurrentVersionCode: 1
