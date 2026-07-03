@@ -15,7 +15,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use log::{info, warn};
-use quinn::crypto::rustls::QuicClientConfig;
+use noq::crypto::rustls::QuicClientConfig;
 use russh::client;
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use sha2::{Digest, Sha256};
@@ -283,7 +283,7 @@ pub(crate) async fn bootstrap_helper_via_ssh(
 
 /// `cert_sha256_hex` にピン留めした QUIC connection を確立する。初回接続・
 /// reattach（`RESUME`）のどちらからも呼ばれる共通処理。
-async fn establish_quic_connection(remote: SocketAddr, cert_sha256_hex: &str) -> Result<quinn::Connection, String> {
+async fn establish_quic_connection(remote: SocketAddr, cert_sha256_hex: &str) -> Result<noq::Connection, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -296,20 +296,20 @@ async fn establish_quic_connection(remote: SocketAddr, cert_sha256_hex: &str) ->
         .with_no_client_auth();
     crypto.alpn_protocols = vec![ALPN.to_vec()];
     // 0-RTT はクライアント側でも使わない（HELPER_PROTOCOL.md「0-RTT はクライアント・
-    // サーバー双方で完全に無効化する」契約）。quinn::Connecting::into_0rtt() を呼ばず
+    // サーバー双方で完全に無効化する」契約）。noq::Connecting::into_0rtt() を呼ばず
     // 通常のハンドシェイク完了を待つのがクライアント側の対応。
 
     let quic_crypto = QuicClientConfig::try_from(crypto).map_err(|_| "QUIC crypto config failed".to_string())?;
 
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
-    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    let mut transport = noq::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(noq::VarInt::from_u32(1));
+    transport.max_concurrent_uni_streams(noq::VarInt::from_u32(0));
     transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(CLIENT_MAX_IDLE_TIMEOUT).expect("valid idle timeout"),
+        noq::IdleTimeout::try_from(CLIENT_MAX_IDLE_TIMEOUT).expect("valid idle timeout"),
     ));
     transport.keep_alive_interval(Some(CLIENT_KEEP_ALIVE_INTERVAL));
 
-    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    let mut client_config = noq::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(transport));
 
     // 実機検証 (Phase 7-5) 用: `debug_fault` 経由で有効化されない限り
@@ -319,11 +319,11 @@ async fn establish_quic_connection(remote: SocketAddr, cert_sha256_hex: &str) ->
         crate::debug_fault::shared_injector(),
     )
     .map_err(|e| format!("endpoint bind failed: {e}"))?;
-    let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
+    let endpoint = noq::Endpoint::new_with_abstract_socket(
+        noq::EndpointConfig::default(),
         None,
-        socket,
-        Arc::new(quinn::TokioRuntime),
+        Box::new(socket),
+        Arc::new(noq::TokioRuntime),
     )
     .map_err(|e| format!("endpoint bind failed: {e}"))?;
     endpoint.set_default_client_config(client_config);
@@ -334,13 +334,13 @@ async fn establish_quic_connection(remote: SocketAddr, cert_sha256_hex: &str) ->
         .map_err(|e| format!("connect setup failed: {e}"))?
         .await
         .map_err(|e| format!("QUIC handshake failed: {e}"))?;
-    info!("helper_quic: QUIC handshake ok rtt={:?}", conn.rtt());
+    info!("helper_quic: QUIC handshake ok rtt={:?}", conn.rtt(noq::PathId::ZERO));
     Ok(conn)
 }
 
 /// `session_secret` と QUIC connection の exporter から proof を計算する
 /// （HELLO と RESUME で共通のロジック。RESUME は `extra` に session_id を渡す）。
-fn compute_proof(conn: &quinn::Connection, session_secret: &[u8], extra: &[u8]) -> Result<[u8; 32], String> {
+fn compute_proof(conn: &noq::Connection, session_secret: &[u8], extra: &[u8]) -> Result<[u8; 32], String> {
     let mut exporter = [0u8; 32];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|e| format!("export_keying_material failed: {e:?}"))?;
@@ -395,7 +395,7 @@ async fn connect_helper_quic_stream(
     )));
 
     // control stream の確立を待たずに即座に SSH セッションへ渡す。
-    // quinn の open_bi() は相手の stream credit が尽きていると（旧 helper 等）
+    // noq の open_bi() は相手の stream credit が尽きていると（旧 helper 等）
     // 即座にエラーを返さず MAX_STREAMS を待って内部でブロックし得るため、
     // ここで await してしまうと旧 helper 相手に毎回 CONTROL_STREAM_TIMEOUT 分
     // シェル開始が遅延する（isekai-helper 側の e2e テストで実際に踏んだ
@@ -462,9 +462,9 @@ async fn connect_helper_quic_stream(
 /// data stream の HELLO と同じ `proof` を再利用する（同一 QUIC connection の
 /// exporter から計算されるため同じ値になる、HELPER_PROTOCOL.md §7.3）。
 async fn open_control_stream(
-    conn: &quinn::Connection,
+    conn: &noq::Connection,
     proof: &[u8],
-) -> Result<(quinn::SendStream, quinn::RecvStream, resume_client::SessionId), String> {
+) -> Result<(noq::SendStream, noq::RecvStream, resume_client::SessionId), String> {
     let (mut csend, mut crecv) = conn.open_bi().await.map_err(|e| format!("open_bi (control) failed: {e}"))?;
     let mut hello = Vec::with_capacity(33);
     hello.push(resume_client::CONTROL_HELLO);
@@ -491,8 +491,8 @@ async fn open_control_stream(
 /// これらのタスクは自然に終了しない（control stream 側の read/write が
 /// エラーになった時点でループを抜ける、ベストエフォート設計）。
 fn spawn_app_ack_tasks(
-    mut csend: quinn::SendStream,
-    mut crecv: quinn::RecvStream,
+    mut csend: noq::SendStream,
+    mut crecv: noq::RecvStream,
     state: Arc<std::sync::Mutex<ClientResumeState>>,
 ) {
     // APP_ACK 受信: helper からの helper_committed_offset を受け取り、

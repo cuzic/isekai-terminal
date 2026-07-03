@@ -2,8 +2,8 @@
 //! 設計の背景・スコープは `/home/cuzic/.claude/plans/typed-dancing-codd.md` および
 //! `PLAN.md` の「Phase 9」節を参照。
 //!
-//! `helper_quic_transport.rs`（Phase 7/8、`quinn`ベース、単一パス + 完全喪失後の
-//! 明示的な`RESUME`再接続）とは別の新規トランスポート。こちらは`noq`のQUIC
+//! `helper_quic_transport.rs`（Phase 7/8、単一パス + 完全喪失後の明示的な`RESUME`
+//! 再接続。後にquinnからnoqへ移行）とは別の新規トランスポート。こちらは`noq`のQUIC
 //! multipathを使い、同一QUICコネクションの中にpath0（`ssh_host`、通常は
 //! Tailscale経由アドレス）とpath1（`direct_host`、直接到達可能なアドレス）を
 //! 同時に張っておく。少なくとも一方のpathが生きている限りコネクション自体が
