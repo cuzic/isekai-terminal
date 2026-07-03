@@ -8,7 +8,12 @@ import android.graphics.Typeface
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+// detectTransformGestures は awaitEachGesture ベースの手動実装に置き換えたため未使用
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -16,6 +21,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.input.pointer.pointerInput
@@ -28,9 +34,13 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.input.TerminalInputView
+import tools.isekai.terminal.input.TerminalKeyEncoder
 import tools.isekai.terminal.ui.AppColors
 import tools.isekai.terminal.ui.HostKeyChangedDialog
+import tools.isekai.terminal.ui.SelectionRange
 import tools.isekai.terminal.ui.SshTerminalCanvas
+import tools.isekai.terminal.ui.offsetToCellPos
+import tools.isekai.terminal.ui.reconstructSelectionText
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.tssh_core.*
 
@@ -47,9 +57,14 @@ fun TerminalScreen(
     val statusMsg = uiState.statusMsg
     val screenUpdate = uiState.screenUpdate
     val scrollbackLen = uiState.scrollbackLen
-    // スクロール位置は Compose local state — ViewModel を経由しない
+    // スクロール位置・選択範囲は Compose local state — ViewModel を経由しない
+    // (.claude/rules/rust-ssot.md の「UI 表示だけに閉じた状態」の例外)
     var scrollOffset by remember { mutableIntStateOf(0) }
     var showDisconnectDialog by remember { mutableStateOf(false) }
+    var selection by remember { mutableStateOf<SelectionRange?>(null) }
+    // Canvas のタップジェスチャーから IME フォーカスを要求するために、
+    // 入力用 AndroidView への参照をここで保持する（入力欄自体は下部に描画）。
+    var inputView by remember { mutableStateOf<tools.isekai.terminal.input.TerminalInputView?>(null) }
 
     BackHandler(enabled = connected) { showDisconnectDialog = true }
 
@@ -206,28 +221,107 @@ fun TerminalScreen(
 
                 var panAccumY by remember { mutableStateOf(0f) }
 
+                // IME フォーカス要求（単純タップ用）。AndroidView 生成前は no-op。
+                val requestImeFocus: () -> Unit = {
+                    inputView?.let { view ->
+                        view.post {
+                            view.requestFocus()
+                            view.context.getSystemService(InputMethodManager::class.java)
+                                ?.showSoftInput(view, 0)
+                        }
+                    }
+                }
+
                 Box(modifier = Modifier.fillMaxSize()) {
                     SshTerminalCanvas(
                         update = displayUpdate,
+                        selection = selection,
                         modifier = Modifier
                             .fillMaxSize()
-                            .pointerInput(cellDims) {
-                                detectTransformGestures { _, pan, zoom, _ ->
-                                    val newScale = (fontScale * zoom).coerceIn(0.5f, 3.0f)
-                                    if (newScale != fontScale) { fontScale = newScale; saveFontScale(newScale) }
-                                    panAccumY += pan.y
-                                    val cellH = cellDims.second
-                                    while (panAccumY < -cellH) {
-                                        scrollOffset = (scrollOffset + 1).coerceIn(0, scrollbackLen)
-                                        panAccumY += cellH
-                                    }
-                                    while (panAccumY > cellH) {
-                                        scrollOffset = (scrollOffset - 1).coerceIn(0, scrollbackLen)
-                                        panAccumY -= cellH
+                            .pointerInput(cellDims, cols, rows) {
+                                val cellW = cellDims.first
+                                val cellH = cellDims.second
+                                awaitEachGesture {
+                                    val down = awaitFirstDown(requireUnconsumed = false)
+                                    val longPress = awaitLongPressOrCancellation(down.id)
+                                    if (longPress != null) {
+                                        // (1) 長押し成立 → 選択モード。選択中はスクロールに触れない
+                                        // (= スクロール位置ロック)。以降のドラッグで head を更新する。
+                                        val startCell = offsetToCellPos(
+                                            longPress.position.x, longPress.position.y,
+                                            cellW, cellH, cols, rows,
+                                        )
+                                        selection = SelectionRange(startCell, startCell)
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                            if (!change.pressed) {
+                                                change.consume()
+                                                break
+                                            }
+                                            change.consume()
+                                            val cell = offsetToCellPos(
+                                                change.position.x, change.position.y,
+                                                cellW, cellH, cols, rows,
+                                            )
+                                            selection = selection?.copy(head = cell)
+                                        }
+                                    } else {
+                                        val stillDown = currentEvent.changes.firstOrNull { it.id == down.id }
+                                        if (stillDown == null || !stillDown.pressed) {
+                                            // (3) 単純タップ（長押し不成立かつ移動なしで指が離れた）→ IME フォーカス
+                                            requestImeFocus()
+                                        } else {
+                                            // (2) 長押し不成立で移動 → 従来のピンチ拡縮+縦パンスクロール相当
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                val zoom = event.calculateZoom()
+                                                val pan = event.calculatePan()
+                                                if (zoom != 1f || pan != Offset.Zero) {
+                                                    val newScale = (fontScale * zoom).coerceIn(0.5f, 3.0f)
+                                                    if (newScale != fontScale) { fontScale = newScale; saveFontScale(newScale) }
+                                                    panAccumY += pan.y
+                                                    while (panAccumY < -cellH) {
+                                                        scrollOffset = (scrollOffset + 1).coerceIn(0, scrollbackLen)
+                                                        panAccumY += cellH
+                                                    }
+                                                    while (panAccumY > cellH) {
+                                                        scrollOffset = (scrollOffset - 1).coerceIn(0, scrollbackLen)
+                                                        panAccumY -= cellH
+                                                    }
+                                                    event.changes.forEach { it.consume() }
+                                                }
+                                                if (event.changes.all { !it.pressed }) break
+                                            }
+                                        }
                                     }
                                 }
                             },
                     )
+
+                    // 選択中のフローティングツールバー（コピー／キャンセル）
+                    selection?.let { sel ->
+                        Row(
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .padding(top = 8.dp)
+                                .background(Color(0xCC1A1A2E), shape = MaterialTheme.shapes.small)
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            TextButton(onClick = {
+                                val text = reconstructSelectionText(displayUpdate, sel)
+                                if (text.isNotEmpty()) {
+                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    cm.setPrimaryClip(ClipData.newPlainText("tssh selection", text))
+                                }
+                                selection = null
+                            }) { Text("コピー", color = Color.Cyan, fontSize = 12.sp) }
+                            TextButton(onClick = { selection = null }) {
+                                Text("キャンセル", color = Color.Gray, fontSize = 12.sp)
+                            }
+                        }
+                    }
 
                     // "Back to live" indicator when scrolled up
                     if (scrollOffset > 0) {
@@ -276,8 +370,8 @@ fun TerminalScreen(
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 // InputConnection ベースの入力経路（state は Row より前に宣言）
+                // inputView 自体は Canvas のタップジェスチャーからも参照するため画面トップレベルで保持している。
                 var composingText by remember { mutableStateOf("") }
-                var inputView by remember { mutableStateOf<tools.isekai.terminal.input.TerminalInputView?>(null) }
                 // トグル式 Ctrl キーの武装状態。UI 表示に閉じたローカル状態（rust-ssot.md の例外）。
                 var ctrlArmed by remember { mutableStateOf(false) }
 
@@ -297,6 +391,14 @@ fun TerminalScreen(
                     CtrlBtn("↓") { vm.send(byteArrayOf(0x1B, 0x5B, 0x42)) }
                     CtrlBtn("←") { vm.send(byteArrayOf(0x1B, 0x5B, 0x44)) }
                     CtrlBtn("→") { vm.send(byteArrayOf(0x1B, 0x5B, 0x43)) }
+                    CtrlBtn("貼付") {
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        val text = cm.primaryClip?.takeIf { it.itemCount > 0 }
+                            ?.getItemAt(0)?.coerceToText(context)?.toString()
+                        if (!text.isNullOrEmpty()) {
+                            vm.send(TerminalKeyEncoder.commitTextBytes(text, screenUpdate?.bracketedPasteMode ?: false))
+                        }
+                    }
                 }
 
                 if (composingText.isNotEmpty()) {
