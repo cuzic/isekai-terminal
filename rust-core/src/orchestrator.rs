@@ -78,16 +78,27 @@ impl ActiveSession {
             Self::Ssh(s) => s.trzsz_cancel(transfer_id),
             Self::Quic(s) => s.trzsz_cancel(transfer_id),
             Self::HelperQuic(s) => s.trzsz_cancel(transfer_id),
+            Self::MultipathHelperQuic(s) => s.trzsz_cancel(transfer_id),
         }
     }
 }
 
 // ── Shared internal state ─────────────────────────────────
 
+/// 接続状態の SSOT。`ConnectionPublicState` の Connecting/Connected の別を
+/// Rust 側でも保持し、`notify_network_lost` がミラー無しで判断できるようにする。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnPhase {
+    Idle,
+    Connecting,
+    Connected,
+}
+
 struct OrchestratorState {
     current_host: Option<String>,
     current_port: u16,
     is_quic: bool,
+    phase: ConnPhase,
     /// Active transfer ID set by on_trzsz_request; used to route trzsz commands without exposing ID to Kotlin
     current_transfer_id: Option<String>,
     /// "upload" / "download" set on on_trzsz_request; used to detect download accumulation
@@ -123,13 +134,18 @@ impl SessionCallback for OrchestratorAdapter {
     }
 
     fn on_connected(&self) {
-        let host = self.shared.state.lock().current_host.clone().unwrap_or_default();
+        let host = {
+            let mut s = self.shared.state.lock();
+            s.phase = ConnPhase::Connected;
+            s.current_host.clone().unwrap_or_default()
+        };
         self.shared.callback.on_connection_state_changed(
             ConnectionPublicState::Connected { host }
         );
     }
 
     fn on_disconnected(&self, reason: Option<String>) {
+        self.shared.state.lock().phase = ConnPhase::Idle;
         self.shared.callback.on_connection_state_changed(
             ConnectionPublicState::Disconnected { reason }
         );
@@ -200,6 +216,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
             current_host: None,
             current_port: 22,
             is_quic: false,
+            phase: ConnPhase::Idle,
             current_transfer_id: None,
             trzsz_mode: None,
             download_buf: Vec::new(),
@@ -218,6 +235,7 @@ impl SessionOrchestrator {
             s.current_host = Some(config.host.clone());
             s.current_port = config.port;
             s.is_quic = false;
+            s.phase = ConnPhase::Connecting;
         }
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
         let adapter = OrchestratorAdapter { shared: self.shared.clone() };
@@ -233,6 +251,7 @@ impl SessionOrchestrator {
             s.current_host = Some(config.ssh_host.clone());
             s.current_port = config.ssh_port;
             s.is_quic = true;
+            s.phase = ConnPhase::Connecting;
         }
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
         let adapter = OrchestratorAdapter { shared: self.shared.clone() };
@@ -250,6 +269,7 @@ impl SessionOrchestrator {
             s.current_host = Some(config.ssh_host.clone());
             s.current_port = config.ssh_port;
             s.is_quic = true;
+            s.phase = ConnPhase::Connecting;
         }
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
         let adapter = OrchestratorAdapter { shared: self.shared.clone() };
@@ -267,6 +287,7 @@ impl SessionOrchestrator {
             s.current_host = Some(config.ssh_host.clone());
             s.current_port = config.ssh_port;
             s.is_quic = true;
+            s.phase = ConnPhase::Connecting;
         }
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
         let adapter = OrchestratorAdapter { shared: self.shared.clone() };
@@ -349,6 +370,39 @@ impl SessionOrchestrator {
 
     pub fn is_quic(&self) -> bool {
         self.shared.state.lock().is_quic
+    }
+
+    /// OS からネットワーク断（Wi-Fi/セルラー消失等）を通知された時の対応を決める。
+    /// QUIC 接続はパス変更に自前で耐えられるため無視し、ハンドシェイク中や
+    /// プレーン TCP SSH 接続中は切断扱いにする（判断は Rust 側の SSOT で行う。
+    /// Kotlin 側はイベントをそのまま転送するだけ）。
+    pub fn notify_network_lost(&self) {
+        let (phase, is_quic) = {
+            let s = self.shared.state.lock();
+            (s.phase, s.is_quic)
+        };
+        match phase {
+            ConnPhase::Idle => {}
+            ConnPhase::Connecting => {
+                log::warn!("orchestrator: network lost during handshake — aborting");
+                self.disconnect();
+                self.shared.state.lock().phase = ConnPhase::Idle;
+                self.shared.callback.on_connection_state_changed(
+                    ConnectionPublicState::Disconnected { reason: Some("network lost".to_string()) }
+                );
+            }
+            ConnPhase::Connected if !is_quic => {
+                log::warn!("orchestrator: network lost while connected — disconnecting TCP session");
+                self.disconnect();
+                self.shared.state.lock().phase = ConnPhase::Idle;
+                self.shared.callback.on_connection_state_changed(
+                    ConnectionPublicState::Disconnected { reason: Some("network lost".to_string()) }
+                );
+            }
+            ConnPhase::Connected => {
+                log::info!("orchestrator: network lost — QUIC session, letting transport handle it");
+            }
+        }
     }
 
     pub fn notify_error(&self, message: String) {
