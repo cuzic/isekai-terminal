@@ -637,6 +637,9 @@ internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod6 : com.sun.
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod7 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`id`: RustBuffer.ByValue,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod8 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`keyFingerprint`: RustBuffer.ByValue,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,)
+}
 internal interface UniffiCallbackInterfaceSessionCallbackMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`data`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
@@ -670,7 +673,10 @@ internal interface UniffiCallbackInterfaceSessionCallbackMethod9 : com.sun.jna.C
 internal interface UniffiCallbackInterfaceSessionCallbackMethod10 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`id`: RustBuffer.ByValue,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged")
+internal interface UniffiCallbackInterfaceSessionCallbackMethod11 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`keyFingerprint`: RustBuffer.ByValue,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,)
+}
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest")
 internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -682,6 +688,7 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `onDownloadComplete`: UniffiCallbackInterfaceOrchestratorCallbackMethod5? = null,
     @JvmField internal var `onNoViablePath`: UniffiCallbackInterfaceOrchestratorCallbackMethod6? = null,
     @JvmField internal var `onForwardStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod7? = null,
+    @JvmField internal var `onAgentSignRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod8? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -694,7 +701,8 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onDownloadComplete`: UniffiCallbackInterfaceOrchestratorCallbackMethod5? = null,
         `onNoViablePath`: UniffiCallbackInterfaceOrchestratorCallbackMethod6? = null,
         `onForwardStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod7? = null,
-    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,), Structure.ByValue
+        `onAgentSignRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod8? = null,
+    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceOrchestratorCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -707,10 +715,11 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onDownloadComplete` = other.`onDownloadComplete`
         `onNoViablePath` = other.`onNoViablePath`
         `onForwardStateChanged` = other.`onForwardStateChanged`
+        `onAgentSignRequest` = other.`onAgentSignRequest`
     }
 
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onData", "onHostKey", "onConnected", "onDisconnected", "onScreenUpdate", "onTrzszRequest", "onTrzszDownloadChunk", "onTrzszProgress", "onTrzszFinished", "onNoViablePath", "onForwardStateChanged")
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onData", "onHostKey", "onConnected", "onDisconnected", "onScreenUpdate", "onTrzszRequest", "onTrzszDownloadChunk", "onTrzszProgress", "onTrzszFinished", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest")
 internal open class UniffiVTableCallbackInterfaceSessionCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -725,6 +734,7 @@ internal open class UniffiVTableCallbackInterfaceSessionCallback(
     @JvmField internal var `onTrzszFinished`: UniffiCallbackInterfaceSessionCallbackMethod8? = null,
     @JvmField internal var `onNoViablePath`: UniffiCallbackInterfaceSessionCallbackMethod9? = null,
     @JvmField internal var `onForwardStateChanged`: UniffiCallbackInterfaceSessionCallbackMethod10? = null,
+    @JvmField internal var `onAgentSignRequest`: UniffiCallbackInterfaceSessionCallbackMethod11? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -740,7 +750,8 @@ internal open class UniffiVTableCallbackInterfaceSessionCallback(
         `onTrzszFinished`: UniffiCallbackInterfaceSessionCallbackMethod8? = null,
         `onNoViablePath`: UniffiCallbackInterfaceSessionCallbackMethod9? = null,
         `onForwardStateChanged`: UniffiCallbackInterfaceSessionCallbackMethod10? = null,
-    ): UniffiVTableCallbackInterfaceSessionCallback(`uniffiFree`,`uniffiClone`,`onData`,`onHostKey`,`onConnected`,`onDisconnected`,`onScreenUpdate`,`onTrzszRequest`,`onTrzszDownloadChunk`,`onTrzszProgress`,`onTrzszFinished`,`onNoViablePath`,`onForwardStateChanged`,), Structure.ByValue
+        `onAgentSignRequest`: UniffiCallbackInterfaceSessionCallbackMethod11? = null,
+    ): UniffiVTableCallbackInterfaceSessionCallback(`uniffiFree`,`uniffiClone`,`onData`,`onHostKey`,`onConnected`,`onDisconnected`,`onScreenUpdate`,`onTrzszRequest`,`onTrzszDownloadChunk`,`onTrzszProgress`,`onTrzszFinished`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceSessionCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -756,6 +767,7 @@ internal open class UniffiVTableCallbackInterfaceSessionCallback(
         `onTrzszFinished` = other.`onTrzszFinished`
         `onNoViablePath` = other.`onNoViablePath`
         `onForwardStateChanged` = other.`onForwardStateChanged`
+        `onAgentSignRequest` = other.`onAgentSignRequest`
     }
 
 }
@@ -946,6 +958,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_forward_state_changed(
     ): Int
+    external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_agent_sign_request(
+    ): Int
     external fun uniffi_tssh_core_checksum_method_sessioncallback_on_data(
     ): Int
     external fun uniffi_tssh_core_checksum_method_sessioncallback_on_host_key(
@@ -967,6 +981,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_tssh_core_checksum_method_sessioncallback_on_no_viable_path(
     ): Int
     external fun uniffi_tssh_core_checksum_method_sessioncallback_on_forward_state_changed(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessioncallback_on_agent_sign_request(
     ): Int
     external fun ffi_tssh_core_uniffi_contract_version(
     ): Int
@@ -1525,6 +1541,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_forward_state_changed() != 107) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_agent_sign_request() != 57032) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_data() != 27387) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1556,6 +1575,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_forward_state_changed() != 26529) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_agent_sign_request() != 60049) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -4560,6 +4582,14 @@ data class SshConfig (
      * ローカルポートフォワード(-L)の一覧。接続確立後に自動で待受を開始する。
      */
     var `forwards`: List<PortForward>
+    , 
+    /**
+     * SSH agent forwarding。既定 OFF・プロファイル単位 opt-in。
+     * 有効でも公開鍵認証以外（パスワード認証）の場合は転送しない。
+     * 有効な場合、サーバー側からの署名要求は毎回ユーザー確認を必須とする
+     * （`OrchestratorCallback::on_agent_sign_request` / `SessionCallback::on_agent_sign_request`）。
+     */
+    var `agentForward`: kotlin.Boolean
     
 ){
     
@@ -4583,6 +4613,7 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterSequenceTypePortForward.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -4593,7 +4624,8 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterTypeSshAuth.allocationSize(value.`auth`) +
             FfiConverterUInt.allocationSize(value.`cols`) +
             FfiConverterUInt.allocationSize(value.`rows`) +
-            FfiConverterSequenceTypePortForward.allocationSize(value.`forwards`)
+            FfiConverterSequenceTypePortForward.allocationSize(value.`forwards`) +
+            FfiConverterBoolean.allocationSize(value.`agentForward`)
     )
 
     override fun write(value: SshConfig, buf: ByteBuffer) {
@@ -4604,6 +4636,7 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
             FfiConverterSequenceTypePortForward.write(value.`forwards`, buf)
+            FfiConverterBoolean.write(value.`agentForward`, buf)
     }
 }
 
@@ -5302,6 +5335,15 @@ public interface OrchestratorCallback {
     
     fun `onForwardStateChanged`(`id`: kotlin.String, `state`: ForwardState)
     
+    /**
+     * SSH agent forwarding: 転送された鍵での署名要求を、要求ごとにユーザーへ確認する。
+     * `true` を返すと署名を実行し、`false` なら拒否する。呼び出し元は host key 確認と
+     * 同じ同期ブロッキング方式（Rust 側の `spawn_blocking` から呼ばれる）を使うため、
+     * この実装は呼び出し元スレッドをブロックしてユーザー操作を待ってよい
+     * （実装例は `TerminalSession.kt` の `onAgentSignRequest` を参照）。
+     */
+    fun `onAgentSignRequest`(`keyFingerprint`: kotlin.String): kotlin.Boolean
+    
     companion object
 }
 
@@ -5408,6 +5450,18 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+    internal object `onAgentSignRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod8 {
+        override fun callback(`uniffiHandle`: Long,`keyFingerprint`: RustBuffer.ByValue,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onAgentSignRequest`(
+                    FfiConverterString.lift(`keyFingerprint`),
+                )
+            }
+            val writeReturn = { value: kotlin.Boolean -> uniffiOutReturn.setValue(FfiConverterBoolean.lower(value)) }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
 
     internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
@@ -5432,6 +5486,7 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
         `onDownloadComplete`,
         `onNoViablePath`,
         `onForwardStateChanged`,
+        `onAgentSignRequest`,
     )
 
     // Registers the foreign callback with the Rust side.
@@ -5475,6 +5530,8 @@ public interface SessionCallback {
     fun `onNoViablePath`()
     
     fun `onForwardStateChanged`(`id`: kotlin.String, `state`: ForwardState)
+    
+    fun `onAgentSignRequest`(`keyFingerprint`: kotlin.String): kotlin.Boolean
     
     companion object
 }
@@ -5623,6 +5680,18 @@ internal object uniffiCallbackInterfaceSessionCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+    internal object `onAgentSignRequest`: UniffiCallbackInterfaceSessionCallbackMethod11 {
+        override fun callback(`uniffiHandle`: Long,`keyFingerprint`: RustBuffer.ByValue,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeSessionCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onAgentSignRequest`(
+                    FfiConverterString.lift(`keyFingerprint`),
+                )
+            }
+            val writeReturn = { value: kotlin.Boolean -> uniffiOutReturn.setValue(FfiConverterBoolean.lower(value)) }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
 
     internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
@@ -5650,6 +5719,7 @@ internal object uniffiCallbackInterfaceSessionCallback {
         `onTrzszFinished`,
         `onNoViablePath`,
         `onForwardStateChanged`,
+        `onAgentSignRequest`,
     )
 
     // Registers the foreign callback with the Rust side.
