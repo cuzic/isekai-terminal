@@ -74,19 +74,23 @@ object TerminalKeyEncoder {
     }
 
     /**
-     * IME 確定テキスト→バイト列。
+     * IME 確定テキスト／クリップボードペーストのテキスト→バイト列。
      * 複数コードポイントかつ bracketedPasteMode が有効な場合のみブラケットペーストで囲む。
      * サロゲートペア（絵文字等）を正しく 1 コードポイントとして扱うため codePointCount を使用。
+     *
+     * 改行正規化（"\r\n" / "\n" → "\r"）はここに集約する。IME 経路(commitText)と
+     * クリップボードペースト経路の両方がこの関数を通るため、二重に正規化されることはない。
      */
     fun commitTextBytes(text: String, bracketedPasteMode: Boolean = false): ByteArray {
         if (text.isEmpty()) return ByteArray(0)
-        val codePoints = text.codePointCount(0, text.length)
+        val normalized = text.replace("\r\n", "\r").replace("\n", "\r")
+        val codePoints = normalized.codePointCount(0, normalized.length)
         return if (codePoints > 1 && bracketedPasteMode) {
             byteArrayOf(0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E) +  // ESC[200~
-            text.toByteArray(Charsets.UTF_8) +
+            normalized.toByteArray(Charsets.UTF_8) +
             byteArrayOf(0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E)    // ESC[201~
         } else {
-            text.toByteArray(Charsets.UTF_8)
+            normalized.toByteArray(Charsets.UTF_8)
         }
     }
 }

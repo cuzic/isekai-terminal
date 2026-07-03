@@ -206,4 +206,40 @@ class TerminalKeyEncoderTest {
     fun `japanese char returns null`() {
         assertNull(TerminalKeyEncoder.ctrlByte('あ'.code))
     }
+
+    // ── commitTextBytes 改行正規化（クリップボードペースト経路）─────
+
+    @Test
+    fun `bare LF is normalized to CR`() {
+        val bytes = TerminalKeyEncoder.commitTextBytes("a\nb")
+        assertArrayEquals("a\rb".toByteArray(Charsets.UTF_8), bytes)
+    }
+
+    @Test
+    fun `CRLF is normalized to single CR not CRCR`() {
+        val bytes = TerminalKeyEncoder.commitTextBytes("a\r\nb")
+        assertArrayEquals("a\rb".toByteArray(Charsets.UTF_8), bytes)
+    }
+
+    @Test
+    fun `multiple lines are all normalized`() {
+        val bytes = TerminalKeyEncoder.commitTextBytes("line1\r\nline2\nline3")
+        assertArrayEquals("line1\rline2\rline3".toByteArray(Charsets.UTF_8), bytes)
+    }
+
+    @Test
+    fun `newline normalization happens before bracketed paste wrapping`() {
+        val bytes = TerminalKeyEncoder.commitTextBytes("a\r\nb", bracketedPasteMode = true)
+        val text = bytes.toString(Charsets.UTF_8)
+        // ペイロード部分は正規化済み（CR 1個）であり、生の CRLF を含まない
+        assertTrue(text.contains("a\rb"))
+        assertTrue(!text.contains("\r\n"))
+        assertEquals(0x1B.toByte(), bytes[0])
+        assertEquals(0x7E.toByte(), bytes.last())
+    }
+
+    @Test
+    fun `single line paste without bracketedPasteMode is unaffected by normalization`() {
+        assertArrayEquals("no-newline-here".toByteArray(), TerminalKeyEncoder.commitTextBytes("no-newline-here"))
+    }
 }
