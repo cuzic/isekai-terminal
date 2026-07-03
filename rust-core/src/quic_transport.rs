@@ -156,7 +156,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-fn build_client_config(skip_cert_verify: bool) -> Result<quinn::ClientConfig, SshError> {
+fn build_client_config(skip_cert_verify: bool) -> Result<noq::ClientConfig, SshError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
     let mut crypto = if skip_cert_verify {
@@ -175,10 +175,10 @@ fn build_client_config(skip_cert_verify: bool) -> Result<quinn::ClientConfig, Ss
     };
     crypto.alpn_protocols = vec![b"tsshd".to_vec()];
 
-    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+    let quic_crypto = noq::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|_| SshError::ConnectionFailed)?;
 
-    let mut transport = quinn::TransportConfig::default();
+    let mut transport = noq::TransportConfig::default();
     // NAT の UDP マッピング (通常 30 秒) を維持するため 20 秒ごとに QUIC PING を送る
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(20)));
     // アイドルタイムアウトを 5 分に延長
@@ -186,7 +186,7 @@ fn build_client_config(skip_cert_verify: bool) -> Result<quinn::ClientConfig, Ss
         std::time::Duration::from_secs(300).try_into().unwrap()
     ));
 
-    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    let mut client_config = noq::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
 }
@@ -195,7 +195,7 @@ fn build_client_config(skip_cert_verify: bool) -> Result<quinn::ClientConfig, Ss
 /// `recv`/`send` を結合した stream を返す。
 async fn open_proxy_stream(
     config: &QuicConfig,
-) -> Result<tokio::io::Join<quinn::RecvStream, quinn::SendStream>, String> {
+) -> Result<tokio::io::Join<noq::RecvStream, noq::SendStream>, String> {
     info!("quic: DNS lookup {}:{}", config.tsshd_host, config.tsshd_port);
     let remote = tokio::net::lookup_host((config.tsshd_host.as_str(), config.tsshd_port))
         .await
@@ -211,8 +211,8 @@ async fn open_proxy_stream(
     };
     debug!("quic: binding UDP {}", bind_addr);
 
-    let mut endpoint =
-        quinn::Endpoint::client(bind_addr).map_err(|e| format!("endpoint bind failed: {e}"))?;
+    let endpoint =
+        noq::Endpoint::client(bind_addr).map_err(|e| format!("endpoint bind failed: {e}"))?;
     endpoint.set_default_client_config(
         build_client_config(config.skip_cert_verify).map_err(|_| "TLS config failed".to_string())?,
     );
@@ -226,7 +226,7 @@ async fn open_proxy_stream(
             warn!("quic: QUIC handshake failed: {}", e);
             format!("QUIC handshake failed: {e}")
         })?;
-    info!("quic: QUIC handshake ok rtt={:?}", conn.rtt());
+    info!("quic: QUIC handshake ok rtt={:?}", conn.rtt(noq::PathId::ZERO));
 
     let (mut send, mut recv) = conn
         .open_bi()

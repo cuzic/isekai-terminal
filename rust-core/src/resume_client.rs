@@ -175,14 +175,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ResumeAwareStream<S> {
 
 /// reattach（新しい QUIC connection への `RESUME` 送信）が成功した結果。
 pub(crate) struct ReattachResult {
-    pub(crate) send: quinn::SendStream,
-    pub(crate) recv: quinn::RecvStream,
+    pub(crate) send: noq::SendStream,
+    pub(crate) recv: noq::RecvStream,
     /// helper が確認した C→S オフセット。これより前の replay_buffer は破棄してよい。
     pub(crate) helper_committed_offset: u64,
 }
 
 /// 1回の reattach 試行を行う関数の型。呼び出し元（`helper_quic_transport.rs`）が
-/// quinn/rustls の具体的な接続手順を実装し、`ReattachableStream` はこれを
+/// noq/rustls の具体的な接続手順を実装し、`ReattachableStream` はこれを
 /// 抽象的に呼び出すだけにする（層を分離する）。
 pub(crate) type ReattachFn = Arc<
     dyn Fn(SessionId, u64, u64) -> Pin<Box<dyn Future<Output = Result<ReattachResult, String>> + Send>>
@@ -191,7 +191,7 @@ pub(crate) type ReattachFn = Arc<
 >;
 
 enum StreamSlot {
-    Connected(quinn::RecvStream, quinn::SendStream),
+    Connected(noq::RecvStream, noq::SendStream),
     /// 背後で reattach 試行中。完了したら `Connected` か `Failed` に遷移する。
     Reattaching,
     /// リトライ上限に達し、諦めた。以降の poll は実際の I/O エラーを返す
@@ -255,8 +255,8 @@ impl ReattachableStream {
     }
 
     pub(crate) fn new(
-        send: quinn::SendStream,
-        recv: quinn::RecvStream,
+        send: noq::SendStream,
+        recv: noq::RecvStream,
         resume_state: Arc<Mutex<ClientResumeState>>,
         reattach_fn: ReattachFn,
     ) -> Self {
