@@ -968,7 +968,8 @@ async fn run_over_stream(
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let handler = crate::transport::RusshEventHandler { event_tx: event_tx.clone() };
+    let handler = crate::transport::RusshEventHandler::new(event_tx.clone());
+    let agent_key = handler.agent_key.clone();
 
     // path0/path1 の内訳はアプリ層から見えない単一の双方向バイトストリーム
     // （noqが内部でpathを選ぶ）。resume/reattach層は無いので、Phase 7の
@@ -985,8 +986,10 @@ async fn run_over_stream(
         }
     };
 
+    // MultipathHelperQuicConfig は agent forwarding 未対応（HelperQuicConfig と同様）。
     run_ssh_channel_loop(
         &config.username, &config.auth, config.cols, config.rows,
+        false, agent_key,
         session, cmd_rx, event_tx,
     ).await;
 }

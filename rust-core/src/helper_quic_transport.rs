@@ -246,7 +246,7 @@ pub(crate) async fn bootstrap_helper_via_ssh(
     });
 
     let russh_config = Arc::new(client::Config::default());
-    let handler = RusshEventHandler { event_tx };
+    let handler = RusshEventHandler::new(event_tx);
     let mut session = client::connect(russh_config, (ssh_host, ssh_port), handler)
         .await
         .map_err(|e| format!("bootstrap SSH connect failed: {e}"))?;
@@ -551,7 +551,8 @@ async fn run_over_stream(
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let handler = RusshEventHandler { event_tx: event_tx.clone() };
+    let handler = RusshEventHandler::new(event_tx.clone());
+    let agent_key = handler.agent_key.clone();
 
     let session = match client::connect_stream(russh_config, stream, handler).await {
         Ok(s) => s,
@@ -561,8 +562,11 @@ async fn run_over_stream(
         }
     };
 
+    // HelperQuicConfig は agent forwarding 未対応（プロファイルの `SshConfig.agent_forward`
+    // 相当のフィールドをまだ持たない）。
     run_ssh_channel_loop(
         &config.username, &config.auth, config.cols, config.rows,
+        false, agent_key,
         session, cmd_rx, event_tx,
     ).await;
 }
@@ -586,9 +590,10 @@ async fn run_helper_quic_transport_auto(
                 auth: config.auth,
                 cols: config.cols,
                 rows: config.rows,
-                // HelperQuicConfig にはポートフォワード設定が無いため、フォールバック時は
-                // フォワード無しのプレーン SSH として接続する。
+                // HelperQuicConfig にはポートフォワード設定・agent forwarding 設定が無いため、
+                // フォールバック時はどちらも無効なプレーン SSH として接続する。
                 forwards: Vec::new(),
+                agent_forward: false,
             };
             crate::run_russh_transport(ssh_config, cmd_rx, event_tx).await;
         }
@@ -626,6 +631,7 @@ mod tests {
         fn on_trzsz_finished(&self, _t: String, _s: bool, _m: Option<String>) {}
         fn on_no_viable_path(&self) {}
         fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
     }
 
     #[tokio::test]

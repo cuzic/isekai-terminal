@@ -271,7 +271,7 @@ mod tests {
         });
 
         let config = Arc::new(client::Config::default());
-        let handler = RusshEventHandler { event_tx };
+        let handler = RusshEventHandler::new(event_tx);
         let mut session = client::connect(config, ("127.0.0.1", 22), handler)
             .await
             .expect("failed to connect to local sshd on 127.0.0.1:22");
