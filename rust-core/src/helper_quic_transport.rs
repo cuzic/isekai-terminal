@@ -21,30 +21,50 @@ use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use sha2::{Digest, Sha256};
 
 use crate::helper_bootstrap::{self, BootstrapError, HelperBinaries, HelperHandshake};
+use crate::resume_client::{self, ClientResumeState};
 use crate::transport::{run_ssh_channel_loop, RusshEventHandler, TransportCommand, TransportEvent};
 use crate::{init_logger, CellData, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const EXPORTER_LABEL: &[u8] = b"isekai-helper-auth-v1";
-const ALPN: &[u8] = b"isekai-helper/1";
-const FRAME_HELLO: u8 = 0x01;
-const FRAME_ACK: u8 = 0x02;
-const FRAME_REJECT_TARGET: u8 = 0xFC;
-const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
-const FRAME_REJECT_DUPLICATE: u8 = 0xFE;
-const FRAME_REJECT_AUTH: u8 = 0xFF;
+/// C→S input replay buffer の既定上限（helper 側 `DEFAULT_RESUME_BUFFER_SIZE` と揃える）。
+const DEFAULT_RESUME_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+/// control stream を開く/CONTROL_ACK を待つタイムアウト（helper 側 `HELLO_TIMEOUT` と揃える）。
+const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// QUIC connection が本当に死んだことを検知するまでの時間。実機検証（Phase 8-4b）で、
+/// この値が未設定（quinn のデフォルト任せ）だと検知に 40 秒以上かかり、helper 側の
+/// park セッション破棄（`isekai-helper::DEFAULT_PARKED_SESSION_TTL`）より遅くなって
+/// reattach が必ず `REJECT_UNKNOWN_SESSION` になる、という致命的なタイミング不整合が
+/// 見つかった。検知を速くしつつ、NAT の UDP マッピング（通常 30 秒）が切れて偽陽性の
+/// タイムアウトが起きないよう `CLIENT_KEEP_ALIVE_INTERVAL` で PING を送り続ける。
+const CLIENT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// NAT マッピング維持のための PING 間隔。`CLIENT_MAX_IDLE_TIMEOUT` の 1/3 以下にして、
+/// 数回分の PING ロスを許容できるようにする。
+const CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+// Phase 9-2 (multipath_transport.rs) もこのワイヤー契約・埋め込みバイナリを共有する
+// ため pub(crate) にしてある（HELPER_PROTOCOL.md の契約は接続経路が単一パスか
+// multipath かによらず同一）。
+pub(crate) const EXPORTER_LABEL: &[u8] = b"isekai-helper-auth-v1";
+pub(crate) const ALPN: &[u8] = b"isekai-helper/1";
+pub(crate) const FRAME_HELLO: u8 = 0x01;
+pub(crate) const FRAME_ACK: u8 = 0x02;
+pub(crate) const FRAME_REJECT_TARGET: u8 = 0xFC;
+pub(crate) const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
+pub(crate) const FRAME_REJECT_DUPLICATE: u8 = 0xFE;
+pub(crate) const FRAME_REJECT_AUTH: u8 = 0xFF;
 
 /// isekai-helper/Cargo.toml の version と一致させる。バージョン不一致時は
 /// helper_bootstrap::ensure_helper_running が再配布する。
-const HELPER_VERSION: &str = "0.1.0";
+pub(crate) const HELPER_VERSION: &str = "0.3.2";
 
-const HELPER_BIN_X86_64: &[u8] = include_bytes!(concat!(
+pub(crate) const HELPER_BIN_X86_64: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/target/x86_64-unknown-linux-musl/release/isekai-helper"
 ));
-const HELPER_BIN_AARCH64: &[u8] = include_bytes!(concat!(
+pub(crate) const HELPER_BIN_AARCH64: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/target/aarch64-unknown-linux-musl/release/isekai-helper"
 ));
@@ -137,9 +157,9 @@ impl HelperQuicSession {
 // とだけ照合する。通常の CA チェーン検証は行わない（自己署名 ephemeral cert のため）。
 
 #[derive(Debug)]
-struct PinnedCertVerifier {
-    expected_sha256_hex: String,
-    provider: Arc<rustls::crypto::CryptoProvider>,
+pub(crate) struct PinnedCertVerifier {
+    pub(crate) expected_sha256_hex: String,
+    pub(crate) provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
 impl ServerCertVerifier for PinnedCertVerifier {
@@ -194,6 +214,25 @@ impl ServerCertVerifier for PinnedCertVerifier {
 // ── ブートストラップ（Phase 7-3 呼び出し） ───────────────
 
 async fn bootstrap_via_ssh(config: &HelperQuicConfig) -> Result<HelperHandshake, String> {
+    bootstrap_helper_via_ssh(&config.ssh_host, config.ssh_port, &config.username, &config.auth, None).await
+}
+
+/// SSH でログインし、isekai-helper をブートストラップして起動ハンドシェイクを得る。
+/// `HelperQuicConfig`（Phase 7/8、フォールバック無し/Auto）と `MultipathHelperQuicConfig`
+/// （Phase 9-2、パス冗長化）は候補アドレスの持ち方が異なるだけで、SSH ブートストラップ自体は
+/// 共通なのでここに切り出してある。
+///
+/// `bind_port`: `None` なら isekai-helper は既定通りエフェメラルポートで待ち受ける
+/// （Tailscale経由のpath0はこれで十分、`ts-input`チェーンが素通しなため）。
+/// `Some(port)` を渡すと、direct_host（外部到達アドレス）向けにファイアウォールで
+/// 個別に許可した固定ポートで待ち受けさせる（Phase 9-4、`multipath_transport.rs`から使用）。
+pub(crate) async fn bootstrap_helper_via_ssh(
+    ssh_host: &str,
+    ssh_port: u16,
+    username: &str,
+    auth: &SshAuth,
+    bind_port: Option<u16>,
+) -> Result<HelperHandshake, String> {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
     // NOTE: このブートストラップ用 SSH 接続のホスト鍵は、本セッションと同じサーバー・
     // 同じ known_hosts エントリを検証すべきだが、Phase 7-4 のスコープでは簡略化し
@@ -208,19 +247,19 @@ async fn bootstrap_via_ssh(config: &HelperQuicConfig) -> Result<HelperHandshake,
 
     let russh_config = Arc::new(client::Config::default());
     let handler = RusshEventHandler { event_tx };
-    let mut session = client::connect(russh_config, (config.ssh_host.as_str(), config.ssh_port), handler)
+    let mut session = client::connect(russh_config, (ssh_host, ssh_port), handler)
         .await
         .map_err(|e| format!("bootstrap SSH connect failed: {e}"))?;
 
-    let authenticated = match &config.auth {
+    let authenticated = match auth {
         SshAuth::Password { password } => session
-            .authenticate_password(&config.username, password)
+            .authenticate_password(username, password)
             .await
             .ok()
             .unwrap_or(false),
         SshAuth::PublicKey { private_key_pem } => match russh_keys::PrivateKey::from_openssh(private_key_pem) {
             Ok(key) => session
-                .authenticate_publickey(&config.username, Arc::new(key))
+                .authenticate_publickey(username, Arc::new(key))
                 .await
                 .ok()
                 .unwrap_or(false),
@@ -235,24 +274,23 @@ async fn bootstrap_via_ssh(config: &HelperQuicConfig) -> Result<HelperHandshake,
     }
 
     let binaries = HelperBinaries { x86_64: HELPER_BIN_X86_64, aarch64: HELPER_BIN_AARCH64 };
-    helper_bootstrap::ensure_helper_running(&mut session, &binaries, HELPER_VERSION, "127.0.0.1:22")
+    helper_bootstrap::ensure_helper_running(&mut session, &binaries, HELPER_VERSION, "127.0.0.1:22", bind_port)
         .await
         .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))
 }
 
 // ── QUIC 接続（HELLO/ACK ハンドシェイク） ───────────────
 
-async fn connect_helper_quic_stream(
-    ssh_host: &str,
-    handshake: &HelperHandshake,
-) -> Result<tokio::io::Join<quinn::RecvStream, quinn::SendStream>, String> {
+/// `cert_sha256_hex` にピン留めした QUIC connection を確立する。初回接続・
+/// reattach（`RESUME`）のどちらからも呼ばれる共通処理。
+async fn establish_quic_connection(remote: SocketAddr, cert_sha256_hex: &str) -> Result<quinn::Connection, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|_| "TLS config failed".to_string())?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier {
-            expected_sha256_hex: handshake.cert_sha256.clone(),
+            expected_sha256_hex: cert_sha256_hex.to_string(),
             provider,
         }))
         .with_no_client_auth();
@@ -266,18 +304,28 @@ async fn connect_helper_quic_stream(
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(CLIENT_MAX_IDLE_TIMEOUT).expect("valid idle timeout"),
+    ));
+    transport.keep_alive_interval(Some(CLIENT_KEEP_ALIVE_INTERVAL));
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(transport));
 
-    let remote: SocketAddr = tokio::net::lookup_host((ssh_host, handshake.listen_port))
-        .await
-        .map_err(|e| format!("DNS lookup failed: {e}"))?
-        .next()
-        .ok_or_else(|| "no address resolved for isekai-helper host".to_string())?;
-
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
-        .map_err(|e| format!("endpoint bind failed: {e}"))?;
+    // 実機検証 (Phase 7-5) 用: `debug_fault` 経由で有効化されない限り
+    // `FaultyUdpSocket` は素通しで、通常利用時の挙動には影響しない。
+    let socket = crate::faulty_udp_socket::bind_faulty_udp_socket(
+        "0.0.0.0:0".parse().unwrap(),
+        crate::debug_fault::shared_injector(),
+    )
+    .map_err(|e| format!("endpoint bind failed: {e}"))?;
+    let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .map_err(|e| format!("endpoint bind failed: {e}"))?;
     endpoint.set_default_client_config(client_config);
 
     info!("helper_quic: connecting to {remote}");
@@ -287,17 +335,40 @@ async fn connect_helper_quic_stream(
         .await
         .map_err(|e| format!("QUIC handshake failed: {e}"))?;
     info!("helper_quic: QUIC handshake ok rtt={:?}", conn.rtt());
+    Ok(conn)
+}
 
+/// `session_secret` と QUIC connection の exporter から proof を計算する
+/// （HELLO と RESUME で共通のロジック。RESUME は `extra` に session_id を渡す）。
+fn compute_proof(conn: &quinn::Connection, session_secret: &[u8], extra: &[u8]) -> Result<[u8; 32], String> {
+    let mut exporter = [0u8; 32];
+    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
+        .map_err(|e| format!("export_keying_material failed: {e:?}"))?;
+    let mut mac = HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
+    mac.update(&exporter);
+    if !extra.is_empty() {
+        mac.update(extra);
+    }
+    Ok(mac.finalize().into_bytes().into())
+}
+
+async fn connect_helper_quic_stream(
+    ssh_host: &str,
+    handshake: &HelperHandshake,
+) -> Result<resume_client::ReattachableStream, String> {
+    let remote: SocketAddr = tokio::net::lookup_host((ssh_host, handshake.listen_port))
+        .await
+        .map_err(|e| format!("DNS lookup failed: {e}"))?
+        .next()
+        .ok_or_else(|| "no address resolved for isekai-helper host".to_string())?;
+    let cert_sha256_hex = handshake.cert_sha256.clone();
     let session_secret = base64::engine::general_purpose::STANDARD
         .decode(&handshake.session_secret)
         .map_err(|e| format!("invalid session_secret encoding: {e}"))?;
 
-    let mut exporter = [0u8; 32];
-    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
-        .map_err(|e| format!("export_keying_material failed: {e:?}"))?;
-    let mut mac = HmacSha256::new_from_slice(&session_secret).expect("HMAC accepts any key length");
-    mac.update(&exporter);
-    let proof = mac.finalize().into_bytes();
+    let conn = establish_quic_connection(remote, &cert_sha256_hex).await?;
+
+    let proof = compute_proof(&conn, &session_secret, b"")?;
 
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi failed: {e}"))?;
     let mut hello = Vec::with_capacity(33);
@@ -319,19 +390,159 @@ async fn connect_helper_quic_stream(
     }
     info!("helper_quic: HELLO/ACK ok — handing off to SSH");
 
-    Ok(tokio::io::join(recv, send))
+    let resume_state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(
+        DEFAULT_RESUME_BUFFER_SIZE,
+    )));
+
+    // control stream の確立を待たずに即座に SSH セッションへ渡す。
+    // quinn の open_bi() は相手の stream credit が尽きていると（旧 helper 等）
+    // 即座にエラーを返さず MAX_STREAMS を待って内部でブロックし得るため、
+    // ここで await してしまうと旧 helper 相手に毎回 CONTROL_STREAM_TIMEOUT 分
+    // シェル開始が遅延する（isekai-helper 側の e2e テストで実際に踏んだ
+    // リグレッションと同種の問題）。control stream の確立は背後タスクとして
+    // 並行に進める。
+    {
+        let conn = conn.clone();
+        let proof = proof.to_vec();
+        let resume_state = resume_state.clone();
+        RUNTIME.spawn(async move {
+            match tokio::time::timeout(CONTROL_STREAM_TIMEOUT, open_control_stream(&conn, &proof)).await {
+                Ok(Ok((csend, crecv, session_id))) => {
+                    info!(
+                        "helper_quic: control stream established (resume support enabled), session_id={}",
+                        session_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    );
+                    resume_state.lock().unwrap().session_id = Some(session_id);
+                    spawn_app_ack_tasks(csend, crecv, resume_state);
+                }
+                Ok(Err(e)) => {
+                    info!("helper_quic: control stream handshake failed ({e}), continuing without resume support");
+                }
+                Err(_) => {
+                    info!("helper_quic: control stream not accepted within timeout, continuing without resume support");
+                }
+            }
+        });
+    }
+
+    // Phase 8-3: QUIC connection が失われても RESUME で reattach する
+    // クロージャ。`remote`/`cert_sha256_hex`/`session_secret` を捕捉する。
+    let reattach_fn: resume_client::ReattachFn = Arc::new(move |session_id, client_sent_offset, client_delivered_offset| {
+        let cert_sha256_hex = cert_sha256_hex.clone();
+        let session_secret = session_secret.clone();
+        Box::pin(async move {
+            let conn = establish_quic_connection(remote, &cert_sha256_hex).await?;
+            let resume_proof = compute_proof(&conn, &session_secret, &session_id)?;
+
+            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi (resume) failed: {e}"))?;
+            let mut frame = vec![resume_client::RESUME];
+            frame.extend_from_slice(&session_id);
+            frame.extend_from_slice(&resume_proof);
+            frame.extend_from_slice(&client_sent_offset.to_be_bytes());
+            frame.extend_from_slice(&client_delivered_offset.to_be_bytes());
+            send.write_all(&frame).await.map_err(|e| format!("RESUME write failed: {e}"))?;
+
+            let mut resp = [0u8; 1];
+            recv.read_exact(&mut resp).await.map_err(|e| format!("RESUME_ACK read failed: {e}"))?;
+            if resp[0] != resume_client::RESUME_ACK {
+                return Err(format!("isekai-helper rejected resume: {:#x}", resp[0]));
+            }
+            let mut rest = [0u8; 16];
+            recv.read_exact(&mut rest).await.map_err(|e| format!("RESUME_ACK body read failed: {e}"))?;
+            let helper_committed_offset = u64::from_be_bytes(rest[0..8].try_into().unwrap());
+            info!("helper_quic: resume succeeded, helper_committed_offset={helper_committed_offset}");
+            Ok(resume_client::ReattachResult { send, recv, helper_committed_offset })
+        })
+    });
+
+    Ok(resume_client::ReattachableStream::new(send, recv, resume_state, reattach_fn))
+}
+
+/// control stream を開き、`CONTROL_HELLO` を送って `CONTROL_ACK` を待つ。
+/// data stream の HELLO と同じ `proof` を再利用する（同一 QUIC connection の
+/// exporter から計算されるため同じ値になる、HELPER_PROTOCOL.md §7.3）。
+async fn open_control_stream(
+    conn: &quinn::Connection,
+    proof: &[u8],
+) -> Result<(quinn::SendStream, quinn::RecvStream, resume_client::SessionId), String> {
+    let (mut csend, mut crecv) = conn.open_bi().await.map_err(|e| format!("open_bi (control) failed: {e}"))?;
+    let mut hello = Vec::with_capacity(33);
+    hello.push(resume_client::CONTROL_HELLO);
+    hello.extend_from_slice(proof);
+    csend
+        .write_all(&hello)
+        .await
+        .map_err(|e| format!("CONTROL_HELLO write failed: {e}"))?;
+
+    let mut ack = [0u8; 17];
+    crecv
+        .read_exact(&mut ack)
+        .await
+        .map_err(|e| format!("CONTROL_ACK read failed: {e}"))?;
+    if ack[0] != resume_client::CONTROL_ACK {
+        return Err(format!("unexpected control response byte {:#x}", ack[0]));
+    }
+    let mut session_id = [0u8; 16];
+    session_id.copy_from_slice(&ack[1..17]);
+    Ok((csend, crecv, session_id))
+}
+
+/// APP_ACK の送受信を行う背後タスクを spawn する。data stream が閉じた後も
+/// これらのタスクは自然に終了しない（control stream 側の read/write が
+/// エラーになった時点でループを抜ける、ベストエフォート設計）。
+fn spawn_app_ack_tasks(
+    mut csend: quinn::SendStream,
+    mut crecv: quinn::RecvStream,
+    state: Arc<std::sync::Mutex<ClientResumeState>>,
+) {
+    // APP_ACK 受信: helper からの helper_committed_offset を受け取り、
+    // input replay buffer の破棄範囲を進める。
+    {
+        let state = state.clone();
+        RUNTIME.spawn(async move {
+            loop {
+                let mut frame = [0u8; 9];
+                match crecv.read_exact(&mut frame).await {
+                    Ok(()) if frame[0] == resume_client::APP_ACK => {
+                        let offset = u64::from_be_bytes(frame[1..9].try_into().unwrap());
+                        state.lock().unwrap().replay_buffer.advance_start(offset);
+                    }
+                    _ => break,
+                }
+            }
+        });
+    }
+
+    // APP_ACK 送信: client_delivered_offset（S→C の受信確認）を 200ms ごとに送る。
+    RUNTIME.spawn(async move {
+        let mut last_sent = 0u64;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let current = state.lock().unwrap().client_delivered_offset;
+            if current == last_sent {
+                continue;
+            }
+            let mut frame = Vec::with_capacity(9);
+            frame.push(resume_client::APP_ACK);
+            frame.extend_from_slice(&current.to_be_bytes());
+            if csend.write_all(&frame).await.is_err() {
+                break;
+            }
+            last_sent = current;
+        }
+    });
 }
 
 async fn try_connect_helper_quic(
     config: &HelperQuicConfig,
-) -> Result<tokio::io::Join<quinn::RecvStream, quinn::SendStream>, String> {
+) -> Result<resume_client::ReattachableStream, String> {
     let handshake = bootstrap_via_ssh(config).await?;
     connect_helper_quic_stream(&config.ssh_host, &handshake).await
 }
 
 async fn run_over_stream(
     config: HelperQuicConfig,
-    stream: tokio::io::Join<quinn::RecvStream, quinn::SendStream>,
+    stream: resume_client::ReattachableStream,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
 ) {
@@ -410,6 +621,7 @@ mod tests {
         fn on_trzsz_download_chunk(&self, _t: String, _d: Vec<u8>, _l: bool) {}
         fn on_trzsz_progress(&self, _t: String, _tr: u64, _to: Option<u64>) {}
         fn on_trzsz_finished(&self, _t: String, _s: bool, _m: Option<String>) {}
+        fn on_no_viable_path(&self) {}
     }
 
     #[tokio::test]
@@ -459,5 +671,87 @@ mod tests {
         }
 
         session.disconnect();
+    }
+
+    /// Phase 8-3: 実際に QUIC connection を切断してから復旧させ、
+    /// `ReattachableStream` が russh にエラーを見せずに同じ SSH セッションを
+    /// 継続させることを検証する。`debug_fault::shared_injector()` はプロセス
+    /// グローバルな状態なので、**このテストは他のテストと同時実行しないこと**
+    /// （`cargo test --lib helper_quic_transport::tests::resume_survives_connection_cut`
+    /// のように単独実行する）。
+    #[tokio::test]
+    async fn resume_survives_connection_cut() {
+        let Ok(key_path) = std::env::var("HELPER_BOOTSTRAP_TEST_KEY") else {
+            eprintln!("skipping: HELPER_BOOTSTRAP_TEST_KEY not set");
+            return;
+        };
+        let key_pem = std::fs::read_to_string(&key_path).unwrap();
+        let config = HelperQuicConfig {
+            ssh_host: "127.0.0.1".to_string(),
+            ssh_port: 22,
+            username: std::env::var("USER").unwrap_or_else(|_| "root".to_string()),
+            auth: SshAuth::PublicKey { private_key_pem: key_pem.into_bytes() },
+            cols: 80,
+            rows: 24,
+        };
+
+        crate::debug_fault::shared_injector().restore();
+        crate::debug_fault::shared_injector().set_latency(Duration::ZERO);
+        crate::debug_fault::shared_injector().set_loss_rate(0.0);
+
+        let session = create_helper_quic_session(config);
+        let buf = Arc::new(StdMutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let callback = TestCallback { buf: buf.clone(), notify: notify.clone() };
+        session.connect(Box::new(callback)).expect("connect() call failed");
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        session.send(b"echo before-cut\n".to_vec());
+        wait_for_output(&buf, &notify, "before-cut", Duration::from_secs(10)).await;
+
+        // control stream が確立し session_id が発行されるまで少し待ってから切断する
+        // （control stream 未確立のまま切ると resume できず Failed になるのは仕様通り）。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        eprintln!("test: cutting connection");
+        crate::debug_fault::shared_injector().cut();
+        // ReattachableStream が失敗を検知し、reattach タスクが 1 回目の
+        // リトライを試みる程度の時間だけ切断したままにする。
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        eprintln!("test: restoring connection");
+        crate::debug_fault::shared_injector().restore();
+
+        // reattach が完了して同じセッションで応答が返ってくることを確認する。
+        session.send(b"echo after-resume\n".to_vec());
+        wait_for_output(&buf, &notify, "after-resume", Duration::from_secs(20)).await;
+
+        session.disconnect();
+        crate::debug_fault::shared_injector().restore();
+    }
+
+    async fn wait_for_output(
+        buf: &Arc<StdMutex<Vec<u8>>>,
+        notify: &Arc<Notify>,
+        needle: &str,
+        timeout: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let b = buf.lock().unwrap();
+                if String::from_utf8_lossy(&b).contains(needle) {
+                    return;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {needle:?}; got so far: {:?}",
+                    String::from_utf8_lossy(&buf.lock().unwrap())
+                );
+            }
+            tokio::time::timeout(Duration::from_millis(200), notify.notified())
+                .await
+                .ok();
+        }
     }
 }
