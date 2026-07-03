@@ -34,10 +34,11 @@ unicode-width = "0.1"
 base64 = "0.22"
 flate2 = "1"
 md5 = "0.8"
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
-# Phase 9-2: multipath_transport.rs（Tailscale⇔直接アドレスの受動フェイルオーバー）専用。
-# 既存の helper_quic_transport.rs（Phase 7/8）は quinn のまま無変更
-# （Phase 9-0/9-1 でquinnクライアント⇔noqサーバーの後方互換を実証済み）。
+# QUIC実装は noq（quinnのマルチパスフォーク）に一本化している。
+# helper_quic_transport.rs（Phase 7/8、単一パス）・quic_transport.rs（Phase 5B）・
+# resume_client.rs も含め、quinn は使っていない
+# （Phase 9-0/9-1 でquinnクライアント⇔noqサーバーの後方互換を実証済みなので、
+# noqは単一パス用途でも quinn と相互接続可能）。
 noq = { version = "1.0.1", features = ["rustls", "ring"] }
 tokio-stream = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
