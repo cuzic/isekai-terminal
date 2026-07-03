@@ -7,6 +7,7 @@ use crate::{
 };
 use crate::quic_transport::{QuicConfig, QuicSession};
 use crate::helper_quic_transport::{HelperQuicConfig, HelperQuicSession};
+use crate::multipath_transport::{MultipathHelperQuicConfig, MultipathHelperQuicSession};
 
 // ── Active session ────────────────────────────────────────
 
@@ -14,6 +15,7 @@ enum ActiveSession {
     Ssh(Arc<crate::SshSession>),
     Quic(Arc<QuicSession>),
     HelperQuic(Arc<HelperQuicSession>),
+    MultipathHelperQuic(Arc<MultipathHelperQuicSession>),
 }
 
 impl ActiveSession {
@@ -22,6 +24,7 @@ impl ActiveSession {
             Self::Ssh(s) => s.send(data),
             Self::Quic(s) => s.send(data),
             Self::HelperQuic(s) => s.send(data),
+            Self::MultipathHelperQuic(s) => s.send(data),
         }
     }
     fn resize(&self, cols: u32, rows: u32) {
@@ -29,6 +32,7 @@ impl ActiveSession {
             Self::Ssh(s) => s.resize(cols, rows),
             Self::Quic(s) => s.resize(cols, rows),
             Self::HelperQuic(s) => s.resize(cols, rows),
+            Self::MultipathHelperQuic(s) => s.resize(cols, rows),
         }
     }
     fn disconnect(&self) {
@@ -36,6 +40,15 @@ impl ActiveSession {
             Self::Ssh(s) => s.disconnect(),
             Self::Quic(s) => s.disconnect(),
             Self::HelperQuic(s) => s.disconnect(),
+            Self::MultipathHelperQuic(s) => s.disconnect(),
+        }
+    }
+    /// マルチパス以外のセッションでは意味を持たないため何もしない
+    /// （呼び出し側は「そのとき使っているtransportがマルチパスかどうか」を
+    /// 意識せず日和見的に呼べばよい）。
+    fn rebind_to_fd(&self, fd: i32, local_ip: String) {
+        if let Self::MultipathHelperQuic(s) = self {
+            s.rebind_to_fd(fd, local_ip);
         }
     }
     fn scrollback_len(&self) -> u32 {
@@ -43,6 +56,7 @@ impl ActiveSession {
             Self::Ssh(s) => s.scrollback_len(),
             Self::Quic(s) => s.scrollback_len(),
             Self::HelperQuic(s) => s.scrollback_len(),
+            Self::MultipathHelperQuic(s) => s.scrollback_len(),
         }
     }
     fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
@@ -50,6 +64,7 @@ impl ActiveSession {
             Self::Ssh(s) => s.scrollback_cells(offset, rows),
             Self::Quic(s) => s.scrollback_cells(offset, rows),
             Self::HelperQuic(s) => s.scrollback_cells(offset, rows),
+            Self::MultipathHelperQuic(s) => s.scrollback_cells(offset, rows),
         }
     }
     fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
@@ -57,6 +72,7 @@ impl ActiveSession {
             Self::Ssh(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
             Self::Quic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
             Self::HelperQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
+            Self::MultipathHelperQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
         }
     }
     fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
@@ -64,6 +80,7 @@ impl ActiveSession {
             Self::Ssh(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
             Self::Quic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
             Self::HelperQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
+            Self::MultipathHelperQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
         }
     }
     fn trzsz_accept_download(&self, transfer_id: String) {
@@ -71,6 +88,7 @@ impl ActiveSession {
             Self::Ssh(s) => s.trzsz_accept_download(transfer_id),
             Self::Quic(s) => s.trzsz_accept_download(transfer_id),
             Self::HelperQuic(s) => s.trzsz_accept_download(transfer_id),
+            Self::MultipathHelperQuic(s) => s.trzsz_accept_download(transfer_id),
         }
     }
     fn trzsz_cancel(&self, transfer_id: String) {
@@ -199,6 +217,10 @@ impl SessionCallback for OrchestratorAdapter {
             TrzszPublicState::Done { transfer_id, success, message }
         );
     }
+
+    fn on_no_viable_path(&self) {
+        self.shared.callback.on_no_viable_path();
+    }
 }
 
 // ── SessionOrchestrator ───────────────────────────────────
@@ -297,9 +319,37 @@ impl SessionOrchestrator {
         Ok(())
     }
 
+    /// Phase 9: `TransportPreference::IsekaiHelperQuicMultipath` 相当。フォールバック無し。
+    /// `config.direct_host` が設定されていれば path0（`ssh_host`）+ path1（`direct_host`）の
+    /// 受動的マルチパスで接続する。
+    pub fn connect_multipath_helper_quic(&self, config: MultipathHelperQuicConfig) -> Result<(), SshError> {
+        {
+            let mut s = self.shared.state.lock();
+            s.current_host = Some(config.ssh_host.clone());
+            s.current_port = config.ssh_port;
+            s.is_quic = true;
+            s.phase = ConnPhase::Connecting;
+        }
+        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
+        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let session = crate::multipath_transport::create_multipath_helper_quic_session(config);
+        session.connect(Box::new(adapter))?;
+        *self.shared.session.lock() = Some(ActiveSession::MultipathHelperQuic(session));
+        Ok(())
+    }
+
     pub fn disconnect(&self) {
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.disconnect();
+        }
+    }
+
+    /// 「WiFiは繋がっているがupstreamが死んでいる」等をKotlin側で検知した際に呼ぶ。
+    /// `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
+    /// （所有権はこちらに移る）。マルチパス以外のtransportや未接続時は何もしない。
+    pub fn rebind_to_fd(&self, fd: i32, local_ip: String) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.rebind_to_fd(fd, local_ip);
         }
     }
 

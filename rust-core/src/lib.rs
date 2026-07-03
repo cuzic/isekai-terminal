@@ -9,6 +9,12 @@ pub(crate) mod session;
 pub mod orchestrator;
 pub(crate) mod helper_bootstrap;
 pub mod helper_quic_transport;
+pub mod multipath_transport;
+#[cfg(test)]
+pub(crate) mod faulty_stream;
+pub(crate) mod faulty_udp_socket;
+pub mod debug_fault;
+pub(crate) mod resume_client;
 
 pub use quic_transport::{create_quic_session, QuicConfig, QuicSession};
 pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};
@@ -114,6 +120,10 @@ pub enum TransportPreference {
     /// 自作ヘルパー経由 QUIC を試し、失敗したら通常の TCP SSH にフォールバックする
     /// （Phase 7、既定推奨）。
     Auto,
+    /// 自作ヘルパー経由 QUIC + Tailscale⇔直接アドレスの受動的マルチパスフェイルオーバー
+    /// （Phase 9、オプトイン。フォールバック無し）。`direct_host` 未設定なら
+    /// `IsekaiHelperQuic` と同等（path0 のみ）。
+    IsekaiHelperQuicMultipath,
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -155,6 +165,12 @@ pub trait OrchestratorCallback: Send + Sync {
     fn on_data(&self, data: Vec<u8>);
     fn on_trzsz_state_changed(&self, state: TrzszPublicState);
     fn on_download_complete(&self, file_name: Option<String>, data: Vec<u8>);
+    /// マルチパスtransportで、現在Validatedなpathが1本も無くなった（＝手元のQUIC
+    /// コネクション視点で「応答が一切返ってこない」）ことを検知した際に呼ばれる。
+    /// キャプティブポータル等はQUICから見ればこれと区別が付かない（100%ロス）ため、
+    /// Android OSのキャプティブポータル検知APIより先にこちらで直接検知できる。
+    /// マルチパス以外のtransportでは呼ばれない。
+    fn on_no_viable_path(&self);
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -171,6 +187,7 @@ pub trait SessionCallback: Send + Sync {
     fn on_trzsz_download_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool);
     fn on_trzsz_progress(&self, transfer_id: String, transferred: u64, total: Option<u64>);
     fn on_trzsz_finished(&self, transfer_id: String, success: bool, message: Option<String>);
+    fn on_no_viable_path(&self);
 }
 
 // ── SshSession ──────────────────────────────────────────

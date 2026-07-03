@@ -22,6 +22,8 @@ pub(crate) enum TransportEvent {
     Stdout(Vec<u8>),
     Resized { cols: u32, rows: u32 },
     Disconnected { reason: Option<String> },
+    /// マルチパスtransport専用（`multipath_transport.rs`の`PathBroker`から発火）。
+    NoViablePath,
 }
 
 /// Kotlin → session_event_loop: trzsz 操作（transport を経由しない）

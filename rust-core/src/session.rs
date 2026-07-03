@@ -231,6 +231,10 @@ pub(crate) async fn session_event_loop(
                     info!("session: disconnected reason={:?}", reason);
                     callback.on_disconnected(reason); break 'outer;
                 }
+                Some(TransportEvent::NoViablePath) => {
+                    info!("session: no viable path (all paths unhealthy)");
+                    callback.on_no_viable_path(); None
+                }
                 None => {
                     info!("session: event channel closed");
                     callback.on_disconnected(None); break 'outer;

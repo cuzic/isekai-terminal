@@ -165,6 +165,7 @@ async fn upload_binary(
 async fn launch_and_capture_handshake(
     session: &mut client::Handle<RusshEventHandler>,
     ssh_relay_target: &str,
+    bind_port: Option<u16>,
 ) -> Result<HelperHandshake, BootstrapError> {
     // ファイル権限は 0700(dir)/0600(handshake ファイル) を umask で保証する
     // （HELPER_PROTOCOL.md「Bootstrap file permissions」契約）。
@@ -175,10 +176,23 @@ async fn launch_and_capture_handshake(
     // デーモン）の終了を待ち続けてしまうことを確認した。`( ... & )` のようにサブシェルで
     // 一段包んでバックグラウンド化すると、外側シェルの直接の子はサブシェル（即座に終了）
     // だけになり、isekai-helper は孫プロセスとして完全に独立するため、この問題が起きない。
+    //
+    // `bind_port`: Tailscale経由（path0のみ）は`ts-input`チェーンが素通しなので既定の
+    // エフェメラルポート（`0.0.0.0:0`）のままでよいが、direct_host（外部到達アドレス、
+    // Wi-Fi/セルラー物理pathも同じ宛先ポートを使う）はホストのiptables許可リストに
+    // 載った固定ポートでないと外形疎通できない（実機検証で確認、Phase 9-4）。
+    // `[::]:port`（IPv6ワイルドカード）でbindすると、noqの`Endpoint::server()`が
+    // 内部で`set_only_v6(false)`する（IPv6アドレスでbindした場合のみの挙動）ため、
+    // 同一ソケットがIPv4/IPv6両方のパケットを受け付けるdual-stackになる（実機で
+    // 確認済み、Phase 9-4追加調査）。`0.0.0.0`（IPv4のみ）ではこの恩恵が無い。
+    let bind_arg = match bind_port {
+        Some(port) => format!("--bind [::]:{port} "),
+        None => String::new(),
+    };
     let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
     let launch_cmd = format!(
         "umask 077 && mkdir -p {HANDSHAKE_DIR} && \
-         ( setsid {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} --target {ssh_relay_target} \
+         ( setsid {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} {bind_arg}--target {ssh_relay_target} \
          </dev/null >{HANDSHAKE_FILE} 2>{HANDSHAKE_LOG} & ); \
          for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
            [ -s {HANDSHAKE_FILE} ] && break; \
@@ -204,6 +218,7 @@ pub async fn ensure_helper_running(
     binaries: &HelperBinaries<'_>,
     expected_version: &str,
     ssh_relay_target: &str,
+    bind_port: Option<u16>,
 ) -> Result<HelperHandshake, BootstrapError> {
     if !check_existing_version(session, expected_version).await {
         info!("isekai-helper: no matching existing install, detecting remote arch");
@@ -218,7 +233,7 @@ pub async fn ensure_helper_running(
 
     match tokio::time::timeout(
         Duration::from_secs(10),
-        launch_and_capture_handshake(session, ssh_relay_target),
+        launch_and_capture_handshake(session, ssh_relay_target, bind_port),
     )
     .await
     {
@@ -307,7 +322,7 @@ mod tests {
             aarch64: &aarch64_bin,
         };
 
-        let handshake = ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22")
+        let handshake = ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None)
             .await
             .expect("bootstrap failed");
         assert_eq!(handshake.v, 1);
@@ -316,7 +331,7 @@ mod tests {
 
         // 2回目呼び出し: バイナリは既にインストール済みのはずなので、
         // アップロードをスキップしても正常にハンドシェイクを取得できることを確認する。
-        let handshake2 = ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22")
+        let handshake2 = ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None)
             .await
             .expect("second bootstrap call failed");
         assert_eq!(handshake2.v, 1);
