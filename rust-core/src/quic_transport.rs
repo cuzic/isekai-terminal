@@ -89,6 +89,27 @@ impl QuicSession {
     }
 }
 
+impl QuicSession {
+    pub(crate) fn add_local_forward(
+        &self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16,
+    ) {
+        if let Some(tx) = self.core.command_sender() {
+            let cmd = TransportCommand::AddLocalForward { id, bind_addr: bind_address, bind_port, remote_host, remote_port };
+            if tx.try_send(cmd).is_err() {
+                warn!("quic: add_local_forward command dropped (channel full)");
+            }
+        }
+    }
+
+    pub(crate) fn remove_forward(&self, id: String) {
+        if let Some(tx) = self.core.command_sender() {
+            if tx.try_send(TransportCommand::RemoveForward { id }).is_err() {
+                warn!("quic: remove_forward command dropped (channel full)");
+            }
+        }
+    }
+}
+
 // ── 証明書検証スキップ (スパイク用) ──────────────────────
 
 #[derive(Debug)]

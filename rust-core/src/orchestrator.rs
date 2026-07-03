@@ -2,7 +2,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::{
-    CellData, ConnectionPublicState, OrchestratorCallback, ScreenUpdate,
+    CellData, ConnectionPublicState, ForwardState, OrchestratorCallback, ScreenUpdate,
     SessionCallback, SshConfig, SshError, TrzszPublicState,
 };
 use crate::quic_transport::{QuicConfig, QuicSession};
@@ -97,6 +97,18 @@ impl ActiveSession {
             Self::Quic(s) => s.trzsz_cancel(transfer_id),
             Self::HelperQuic(s) => s.trzsz_cancel(transfer_id),
             Self::MultipathHelperQuic(s) => s.trzsz_cancel(transfer_id),
+        }
+    }
+    fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
+        match self {
+            Self::Ssh(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
+            Self::Quic(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
+        }
+    }
+    fn remove_forward(&self, id: String) {
+        match self {
+            Self::Ssh(s) => s.remove_forward(id),
+            Self::Quic(s) => s.remove_forward(id),
         }
     }
 }
@@ -220,6 +232,10 @@ impl SessionCallback for OrchestratorAdapter {
 
     fn on_no_viable_path(&self) {
         self.shared.callback.on_no_viable_path();
+    }
+
+    fn on_forward_state_changed(&self, id: String, state: ForwardState) {
+        self.shared.callback.on_forward_state_changed(id, state);
     }
 }
 
@@ -452,6 +468,21 @@ impl SessionOrchestrator {
             ConnPhase::Connected => {
                 log::info!("orchestrator: network lost — QUIC session, letting transport handle it");
             }
+        }
+    }
+
+    /// 接続中にローカルポートフォワード(-L)を動的に追加する。
+    /// MVP の UI は接続前に `SshConfig.forwards` へまとめて設定するだけなので現状未使用だが、
+    /// 将来「接続したまま転送を足す」UI を追加する際の入り口として用意している。
+    pub fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port);
+        }
+    }
+
+    pub fn remove_forward(&self, id: String) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.remove_forward(id);
         }
     }
 

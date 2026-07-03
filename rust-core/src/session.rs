@@ -112,6 +112,12 @@ impl SessionCore {
         (cmd_rx, event_tx)
     }
 
+    /// transport コマンド送信端を複製して返す。connect() 直後に
+    /// 初期ポートフォワード(config.forwards)を投入するために使う。
+    pub(crate) fn command_sender(&self) -> Option<tokio::sync::mpsc::Sender<TransportCommand>> {
+        self.handle_tx.lock().clone()
+    }
+
     pub(crate) fn scrollback_len(&self) -> u32 {
         self.scrollback.lock().len() as u32
     }
@@ -227,6 +233,9 @@ pub(crate) async fn session_event_loop(
                     state.reset_for_resize(cols as usize, rows as usize);
                     scrollback.lock().clear();
                     None
+                }
+                Some(TransportEvent::ForwardStateChanged { id, state }) => {
+                    callback.on_forward_state_changed(id, state); None
                 }
                 Some(TransportEvent::Disconnected { reason }) => {
                     info!("session: disconnected reason={:?}", reason);

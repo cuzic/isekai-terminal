@@ -75,6 +75,35 @@ pub struct SshConfig {
     pub auth: SshAuth,
     pub cols: u32,
     pub rows: u32,
+    /// ローカルポートフォワード(-L)の一覧。接続確立後に自動で待受を開始する。
+    pub forwards: Vec<PortForward>,
+}
+
+// ── ポートフォワード(-L のみ、MVP) ───────────────────────
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum ForwardType {
+    /// `ssh -L bind:remote_host:remote_port` 相当。Dynamic/Remote は将来拡張。
+    Local,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PortForward {
+    pub forward_type: ForwardType,
+    /// 待受アドレス。既定は "127.0.0.1"("0.0.0.0" 等にすると同一 LAN 上の
+    /// 第三者からアクセスされ得るため UI 側で警告する)。
+    pub bind_address: String,
+    pub bind_port: u16,
+    pub remote_host: String,
+    pub remote_port: u16,
+}
+
+/// ポートフォワード待受の状態。`OrchestratorCallback::on_forward_state_changed` で通知される。
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum ForwardState {
+    Listening,
+    Failed { reason: String },
+    Stopped,
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -187,6 +216,7 @@ pub trait OrchestratorCallback: Send + Sync {
     /// Android OSのキャプティブポータル検知APIより先にこちらで直接検知できる。
     /// マルチパス以外のtransportでは呼ばれない。
     fn on_no_viable_path(&self);
+    fn on_forward_state_changed(&self, id: String, state: ForwardState);
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -204,6 +234,7 @@ pub trait SessionCallback: Send + Sync {
     fn on_trzsz_progress(&self, transfer_id: String, transferred: u64, total: Option<u64>);
     fn on_trzsz_finished(&self, transfer_id: String, success: bool, message: Option<String>);
     fn on_no_viable_path(&self);
+    fn on_forward_state_changed(&self, id: String, state: ForwardState);
 }
 
 // ── SshSession ──────────────────────────────────────────
@@ -225,6 +256,23 @@ impl SshSession {
     pub fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
+        // config.forwards はコマンドチャネル経由で "AddLocalForward" として投入する。
+        // run_ssh_channel_loop がシェル起動後に select ループへ入った時点で消費され、
+        // 待受タスクが起動する(Kotlin から動的に追加/削除する将来の拡張と同じ経路)。
+        if let Some(tx) = self.core.command_sender() {
+            for (i, pf) in config.forwards.iter().enumerate() {
+                let cmd = TransportCommand::AddLocalForward {
+                    id: format!("lf-{i}"),
+                    bind_addr: pf.bind_address.clone(),
+                    bind_port: pf.bind_port,
+                    remote_host: pf.remote_host.clone(),
+                    remote_port: pf.remote_port,
+                };
+                if tx.try_send(cmd).is_err() {
+                    log::warn!("ssh: failed to queue initial forward #{i} (channel full?)");
+                }
+            }
+        }
         RUNTIME.spawn(async move {
             run_russh_transport(config, cmd_rx, event_tx).await;
         });
@@ -258,6 +306,31 @@ impl SshSession {
 
     pub fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
+    }
+}
+
+// ── ポートフォワードの動的追加/削除 ───────────────────────
+// SessionOrchestrator からのみ呼ばれる内部 API(uniffi には直接は出さない)。
+// MVP の ProfileEditScreen は接続時に forwards をまとめて適用するだけだが、
+// 将来 Kotlin から接続中に動的に追加/削除する UI を足すときはここを export すればよい。
+impl SshSession {
+    pub(crate) fn add_local_forward(
+        &self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16,
+    ) {
+        if let Some(tx) = self.core.command_sender() {
+            let cmd = TransportCommand::AddLocalForward { id, bind_addr: bind_address, bind_port, remote_host, remote_port };
+            if tx.try_send(cmd).is_err() {
+                log::warn!("ssh: add_local_forward command dropped (channel full)");
+            }
+        }
+    }
+
+    pub(crate) fn remove_forward(&self, id: String) {
+        if let Some(tx) = self.core.command_sender() {
+            if tx.try_send(TransportCommand::RemoveForward { id }).is_err() {
+                log::warn!("ssh: remove_forward command dropped (channel full)");
+            }
+        }
     }
 }
 
