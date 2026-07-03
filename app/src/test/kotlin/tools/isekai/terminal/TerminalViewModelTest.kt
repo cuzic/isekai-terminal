@@ -23,6 +23,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import uniffi.tssh_core.SshAuth
+import uniffi.tssh_core.TransportPreference
 import uniffi.tssh_core.SshConfig
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -169,6 +170,53 @@ class TerminalViewModelTest {
         assertNull(state.screenUpdate)
     }
 
+    // ── Phase 9-4: 物理マルチパス（実験的機能） ─────────────────────
+
+    @Test
+    fun connectProfile_multipathTransport_physicalMultipathEnabled_acquiresPhysicalFds() = runBlocking {
+        executor.physicalMultipathFds = tools.isekai.terminal.session.PhysicalMultipathFds(
+            wifiFd = 42, wifiLocalIp = "192.168.1.5",
+        )
+        val profile = ConnectionProfile(
+            label = "test", host = "100.64.0.1", username = "user", authType = "password",
+            transportPreferenceName = TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH.name,
+            enablePhysicalMultipath = true,
+        )
+        vm.connectProfile(profile, "pass")
+
+        withTimeout(3000) { while (!fakeOrchestrator.connectMultipathHelperQuicCalled) delay(10) }
+
+        assertEquals(1, executor.acquirePhysicalMultipathFdsCallCount)
+    }
+
+    @Test
+    fun connectProfile_multipathTransport_physicalMultipathDisabled_doesNotAcquirePhysicalFds() = runBlocking {
+        val profile = ConnectionProfile(
+            label = "test", host = "100.64.0.1", username = "user", authType = "password",
+            transportPreferenceName = TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH.name,
+            enablePhysicalMultipath = false,
+        )
+        vm.connectProfile(profile, "pass")
+
+        withTimeout(3000) { while (!fakeOrchestrator.connectMultipathHelperQuicCalled) delay(10) }
+
+        assertEquals(0, executor.acquirePhysicalMultipathFdsCallCount)
+    }
+
+    @Test
+    fun disconnect_afterConnected_releasesPhysicalMultipathFds() = runBlocking {
+        val profile = ConnectionProfile(label = "test", host = "192.168.1.1", username = "user", authType = "password")
+        vm.connectProfile(profile, "pass")
+        withTimeout(3000) { while (!fakeOrchestrator.connectCalled) kotlinx.coroutines.delay(10) }
+        fakeOrchestrator.simulateConnected("192.168.1.1")
+        awaitState { it.connected }
+
+        fakeOrchestrator.simulateDisconnected("bye")
+        awaitState { !it.connected }
+
+        assertTrue(executor.releasePhysicalMultipathFdsCalled)
+    }
+
     @Test
     fun send_afterConnected_delegatesToOrchestrator() = runBlocking {
         val profile = ConnectionProfile(label = "test", host = "192.168.1.1", username = "user", authType = "password")
@@ -219,6 +267,7 @@ class TerminalViewModelTest {
         val profile = ConnectionProfile(
             label = "quic", host = "192.168.1.1", port = 22, tsshdPort = 2222,
             username = "user", authType = "password", useTsshd = true,
+            transportPreferenceName = TransportPreference.TSSHD_QUIC.name,
         )
         vm.connectProfile(profile, "pass")
         withTimeout(3000) { while (!fakeOrchestrator.connectQuicCalled) kotlinx.coroutines.delay(10) }

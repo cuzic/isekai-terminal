@@ -80,6 +80,26 @@ class ConnectionProfileRepositoryTest {
     @Test fun getAll_emptyDb_returnsEmpty() = runBlocking {
         assertTrue(repo.getAll().isEmpty())
     }
+
+    @Test fun save_and_findById_roundtripsDirectAddress() = runBlocking {
+        val id = repo.save(profile("web").copy(directAddress = "203.0.113.5"))
+        assertEquals("203.0.113.5", repo.findById(id)?.directAddress)
+    }
+
+    @Test fun directAddress_defaultsToNull() = runBlocking {
+        val id = repo.save(profile("web"))
+        assertNull(repo.findById(id)?.directAddress)
+    }
+
+    @Test fun enablePhysicalMultipath_defaultsToFalse() = runBlocking {
+        val id = repo.save(profile("web"))
+        assertEquals(false, repo.findById(id)?.enablePhysicalMultipath)
+    }
+
+    @Test fun save_and_findById_roundtripsEnablePhysicalMultipath() = runBlocking {
+        val id = repo.save(profile("web").copy(enablePhysicalMultipath = true))
+        assertEquals(true, repo.findById(id)?.enablePhysicalMultipath)
+    }
 }
 
 @RunWith(RobolectricTestRunner::class)

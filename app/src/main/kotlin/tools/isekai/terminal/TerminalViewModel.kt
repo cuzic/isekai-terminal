@@ -14,18 +14,24 @@ import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
+import tools.isekai.terminal.data.toHelperQuicConfig
+import tools.isekai.terminal.data.toMultipathHelperQuicConfig
 import tools.isekai.terminal.data.toQuicConfig
 import tools.isekai.terminal.data.toSshConfig
 import tools.isekai.terminal.session.AndroidAppExecutor
 import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.AuthValidation
 import tools.isekai.terminal.session.AuthValidator
+import tools.isekai.terminal.session.PhysicalMultipathFds
 import tools.isekai.terminal.session.RealHostKeyChecker
 import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.util.RemoteLogger
+import uniffi.tssh_core.HelperQuicConfig
+import uniffi.tssh_core.MultipathHelperQuicConfig
 import uniffi.tssh_core.QuicConfig
 import uniffi.tssh_core.SshAuth
 import uniffi.tssh_core.SshConfig
+import uniffi.tssh_core.TransportPreference
 
 
 /**
@@ -58,6 +64,11 @@ class TerminalViewModel(
     // Rust コールバック由来ではない Kotlin ローカルのエラーを session.state に混入させないための分離。
     private val _preConnectError = MutableStateFlow<String?>(null)
 
+    // 「WiFiのupstream断検知→セルラーへrebind」機能が今のセッションで有効かどうか。
+    // connectProfile 時点のプロファイル設定を接続完了まで覚えておくためのフィールド。
+    private var upstreamFailoverEnabledForCurrentSession = false
+    private val rebindInFlight = AtomicBoolean(false)
+
     val uiState: StateFlow<TerminalUiState> = session.state
         .combine(_preConnectError) { sessionState, errorMsg ->
             if (errorMsg != null) sessionState.copy(statusMsg = errorMsg) else sessionState
@@ -81,6 +92,16 @@ class TerminalViewModel(
             }
         }
 
+        // Rust側（PathBroker）がQUIC自身の視点で「どのpathからも応答が無い」ことを
+        // 検知した際の通知。Android OSのNET_CAPABILITY_VALIDATEDより先に、かつ
+        // キャプティブポータルに限らずどんな理由の無応答でも検知できる
+        // （実機に依存せずdebug_faultのCUTだけでも再現・検証済み）。
+        viewModelScope.launch {
+            session.noViablePathEvent.collect {
+                if (upstreamFailoverEnabledForCurrentSession) onWifiUpstreamBroken()
+            }
+        }
+
         // 接続状態の変化をシステムサービス通知に反映
         viewModelScope.launch {
             var prevConnected = false
@@ -88,8 +109,17 @@ class TerminalViewModel(
                 val connected = state.connected
                 if (connected && !prevConnected) {
                     executor.notifyConnected(state.currentHost ?: "")
+                    if (upstreamFailoverEnabledForCurrentSession) {
+                        executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken() }
+                    }
                 } else if (!connected && prevConnected) {
                     executor.notifyDisconnected()
+                    // Phase 9-4: 物理Wi-Fi/セルラーのネットワークリクエストを解放する
+                    // （そもそも取得していなければ no-op）。無線を握りっぱなしにして
+                    // バッテリーを消費しないようにする。
+                    executor.releasePhysicalMultipathFds()
+                    executor.unregisterUpstreamFailoverMonitor()
+                    upstreamFailoverEnabledForCurrentSession = false
                 }
                 prevConnected = connected
             }
@@ -97,6 +127,30 @@ class TerminalViewModel(
     }
 
     // ── ネットワーク ─────────────────────────────────────────────
+
+    /**
+     * 「WiFiは繋がっているがupstreamが死んでいる」を検知した際の処理。
+     * セルラーへの bindSocket 済み fd を取得できたら `rebindToFd` でendpointの
+     * ソケットを丸ごと差し替える。取得できなければ何もしない（日和見的ポリシー）。
+     * [rebindInFlight] で多重発火（capabilities変化の連続通知等）を防ぐ。
+     */
+    private fun onWifiUpstreamBroken() {
+        if (!rebindInFlight.compareAndSet(false, true)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val cellular = executor.acquireCellularFd()
+                if (cellular == null) {
+                    RemoteLogger.w("TsshSSH", "upstream failover: cellular fd not available, staying on current path")
+                    return@launch
+                }
+                val (fd, localIp) = cellular
+                RemoteLogger.i("TsshSSH", "upstream failover: rebinding to cellular (localIp=$localIp)")
+                session.rebindToFd(fd, localIp)
+            } finally {
+                rebindInFlight.set(false)
+            }
+        }
+    }
 
     /**
      * ネットワーク切断時の処理。Session 内部の domainState (TCP/QUIC) で判断する。
@@ -117,13 +171,27 @@ class TerminalViewModel(
     fun connectProfile(profile: ConnectionProfile, password: String? = null) {
         if (uiState.value.connected || uiState.value.isConnecting) return
         _preConnectError.value = null
-        RemoteLogger.i("TsshSSH", "connectProfile: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} quic=${profile.useTsshd}")
+        RemoteLogger.i("TsshSSH", "connectProfile: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} " +
+            "transport=${profile.transportPreference}")
         viewModelScope.launch(Dispatchers.IO) {
             val auth = resolveAuth(profile, password) ?: return@launch
-            if (profile.useTsshd) {
-                connectQuic(profile.toQuicConfig(auth))
-            } else {
-                connect(profile.toSshConfig(auth))
+            when (profile.transportPreference) {
+                TransportPreference.PLAIN_SSH -> connect(profile.toSshConfig(auth))
+                TransportPreference.TSSHD_QUIC -> connectQuic(profile.toQuicConfig(auth))
+                TransportPreference.ISEKAI_HELPER_QUIC -> connectHelperQuic(profile.toHelperQuicConfig(auth))
+                TransportPreference.AUTO -> connectHelperQuicAuto(profile.toHelperQuicConfig(auth))
+                TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH -> {
+                    // Phase 9-4（実験的機能）: 有効化されていれば物理Wi-Fi/セルラーの
+                    // fdも取得してから接続する。取得に失敗/未取得でも例外にはせず、
+                    // path0/path1のみのマルチパスにフォールバックする（日和見的ポリシー）。
+                    val physicalFds = if (profile.enablePhysicalMultipath) {
+                        executor.acquirePhysicalMultipathFds()
+                    } else {
+                        PhysicalMultipathFds()
+                    }
+                    upstreamFailoverEnabledForCurrentSession = profile.enableUpstreamFailover
+                    connectMultipathHelperQuic(profile.toMultipathHelperQuicConfig(auth, physicalFds))
+                }
             }
         }
     }
@@ -131,6 +199,21 @@ class TerminalViewModel(
     private fun connectQuic(config: QuicConfig) {
         executor.ensureServiceRunning()
         session.connectQuic(config)
+    }
+
+    private fun connectHelperQuic(config: HelperQuicConfig) {
+        executor.ensureServiceRunning()
+        session.connectHelperQuic(config)
+    }
+
+    private fun connectHelperQuicAuto(config: HelperQuicConfig) {
+        executor.ensureServiceRunning()
+        session.connectHelperQuicAuto(config)
+    }
+
+    private fun connectMultipathHelperQuic(config: MultipathHelperQuicConfig) {
+        executor.ensureServiceRunning()
+        session.connectMultipathHelperQuic(config)
     }
 
     private suspend fun resolveAuth(profile: ConnectionProfile, password: String?): SshAuth? {

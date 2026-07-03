@@ -97,7 +97,10 @@ class ProfileEditScreenTest {
         fields[1].performTextInput("bastion.example.com")
         fields[3].performTextInput("admin")
         composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
-        composeTestRule.waitUntil(5000) { saved }
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
         assertTrue(saved)
         runBlocking { assertTrue(Repositories.profiles.getAll().any { it.label == "Bastion" }) }
     }

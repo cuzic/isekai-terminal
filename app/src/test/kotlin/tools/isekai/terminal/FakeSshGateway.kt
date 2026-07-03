@@ -13,8 +13,16 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     var connectCalled = false
     var connectQuicCalled = false
+    var connectHelperQuicCalled = false
+    var connectHelperQuicAutoCalled = false
+    var connectMultipathHelperQuicCalled = false
     var disconnectCalled = false
     private var quic = false
+
+    // 実 Rust 側の ConnPhase を模した最小限の状態。notifyNetworkLost() の
+    // 判断（切断する/無視する）を Rust 側の実装に合わせてここで再現する。
+    private enum class Phase { IDLE, CONNECTING, CONNECTED }
+    private var phase = Phase.IDLE
     val sentBytes = mutableListOf<ByteArray>()
     var lastResizeCols: UInt? = null
     var lastResizeRows: UInt? = null
@@ -22,10 +30,12 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     var trzszAcceptUploadCount = 0
     var trzszCancelCount = 0
     var trzszDismissCalled = false
+    var rebindToFdCalls = mutableListOf<Pair<Int, String>>()
 
     @Throws(SshException::class)
     override fun connect(config: SshConfig) {
         connectCalled = true
+        phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
 
@@ -33,6 +43,31 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun connectQuic(config: QuicConfig) {
         connectQuicCalled = true
         quic = true
+        phase = Phase.CONNECTING
+        callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
+    }
+
+    @Throws(SshException::class)
+    override fun connectHelperQuic(config: HelperQuicConfig) {
+        connectHelperQuicCalled = true
+        quic = true
+        phase = Phase.CONNECTING
+        callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
+    }
+
+    @Throws(SshException::class)
+    override fun connectHelperQuicAuto(config: HelperQuicConfig) {
+        connectHelperQuicAutoCalled = true
+        quic = true
+        phase = Phase.CONNECTING
+        callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
+    }
+
+    @Throws(SshException::class)
+    override fun connectMultipathHelperQuic(config: MultipathHelperQuicConfig) {
+        connectMultipathHelperQuicCalled = true
+        quic = true
+        phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
 
@@ -46,8 +81,22 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun trzszSendChunk(data: ByteArray, isLast: Boolean) {}
     override fun trzszCancel() { trzszCancelCount++ }
     override fun notifyError(message: String) {}
+    override fun rebindToFd(fd: Int, localIp: String) { rebindToFdCalls.add(fd to localIp) }
 
     override fun isQuic(): Boolean = quic
+
+    // 実 Rust 側 (SessionOrchestrator::notify_network_lost) の判断を再現する:
+    // ハンドシェイク中/プレーン TCP 接続中は切断、QUIC 接続中は無視。
+    override fun notifyNetworkLost() {
+        when {
+            phase == Phase.CONNECTING || (phase == Phase.CONNECTED && !quic) -> {
+                disconnectCalled = true
+                phase = Phase.IDLE
+                callback!!.onConnectionStateChanged(ConnectionPublicState.Disconnected("network lost"))
+            }
+            else -> {}
+        }
+    }
 
     // trzszDismiss() fires Idle synchronously, matching real Rust behavior
     override fun trzszDismiss() {
@@ -57,11 +106,15 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     // ── Simulation helpers ───────────────────────────────────────────
 
-    fun simulateConnected(host: String = "test.host") =
+    fun simulateConnected(host: String = "test.host"): Unit {
+        phase = Phase.CONNECTED
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connected(host))
+    }
 
-    fun simulateDisconnected(reason: String? = null) =
+    fun simulateDisconnected(reason: String? = null): Unit {
+        phase = Phase.IDLE
         callback!!.onConnectionStateChanged(ConnectionPublicState.Disconnected(reason))
+    }
 
     fun simulateError(message: String) =
         callback!!.onConnectionStateChanged(ConnectionPublicState.Error(message))

@@ -9,8 +9,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -36,6 +39,11 @@ class TerminalSession(
 
     private val _pendingDownloadFile = MutableStateFlow<Pair<String, ByteArray>?>(null)
     val pendingDownloadFile: StateFlow<Pair<String, ByteArray>?> = _pendingDownloadFile.asStateFlow()
+
+    // 「WiFiはあるがupstreamが死んでいる」等、マルチパスtransportがQUIC自身の視点で
+    // 「応答が一切返ってこない」ことを検知した際に発火する（Rust側`PathBroker`起点）。
+    private val _noViablePathEvent = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val noViablePathEvent: SharedFlow<Unit> = _noViablePathEvent.asSharedFlow()
 
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val screenUpdateChannel = Channel<ScreenUpdate>(Channel.CONFLATED)
@@ -125,6 +133,11 @@ class TerminalSession(
         override fun onDownloadComplete(fileName: String?, data: ByteArray) {
             _pendingDownloadFile.value = Pair(fileName ?: "download", data)
         }
+
+        override fun onNoViablePath() {
+            RemoteLogger.w("TsshSSH", "no viable path (QUIC sees no response on any path)")
+            _noViablePathEvent.tryEmit(Unit)
+        }
     }
 
     private val orchestrator: SessionOrchestratorInterface = orchestratorFactory(callback)
@@ -159,6 +172,36 @@ class TerminalSession(
         }
     }
 
+    /** Phase 7: 自作ヘルパー経由 QUIC。フォールバック無し（明示選択時）。 */
+    fun connectHelperQuic(config: HelperQuicConfig) {
+        if (_state.value.let { it.connected || it.isConnecting }) return
+        try {
+            orchestrator.connectHelperQuic(config)
+        } catch (e: SshException) {
+            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
+        }
+    }
+
+    /** Phase 7: 自作ヘルパー経由 QUIC を試し、失敗したら通常の TCP SSH にフォールバックする。 */
+    fun connectHelperQuicAuto(config: HelperQuicConfig) {
+        if (_state.value.let { it.connected || it.isConnecting }) return
+        try {
+            orchestrator.connectHelperQuicAuto(config)
+        } catch (e: SshException) {
+            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
+        }
+    }
+
+    /** Phase 9: 自作ヘルパー経由 QUIC + Tailscale⇔直接アドレスの受動的マルチパス。フォールバック無し。 */
+    fun connectMultipathHelperQuic(config: MultipathHelperQuicConfig) {
+        if (_state.value.let { it.connected || it.isConnecting }) return
+        try {
+            orchestrator.connectMultipathHelperQuic(config)
+        } catch (e: SshException) {
+            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
+        }
+    }
+
     fun send(bytes: ByteArray) = orchestrator.send(bytes)
     fun resize(cols: UInt, rows: UInt) = orchestrator.resize(cols, rows)
 
@@ -172,23 +215,15 @@ class TerminalSession(
 
     // ── Network ───────────────────────────────────────────────────────
 
-    fun notifyNetworkLost() {
-        val s = _state.value
-        when {
-            s.isConnecting -> {
-                RemoteLogger.w("TsshSSH", "network lost during handshake — aborting")
-                _state.update { it.copy(connected = false, isConnecting = false, statusMsg = "切断済み") }
-                orchestrator.disconnect()
-            }
-            s.connected && !orchestrator.isQuic() -> {
-                RemoteLogger.w("TsshSSH", "network lost while connected — disconnecting TCP session")
-                _state.update { it.copy(connected = false, isConnecting = false, statusMsg = "切断済み") }
-                orchestrator.disconnect()
-            }
-            s.connected && orchestrator.isQuic() ->
-                RemoteLogger.i("TsshSSH", "network lost — QUIC session, letting transport handle it")
-        }
-    }
+    /** ネットワーク断イベントをそのまま Rust 側に転送する。
+     *  切断するかどうか（ハンドシェイク中/TCP接続中は切断、QUIC接続中は無視）の
+     *  判断はセッション状態の SSOT を持つ Rust 側（`SessionOrchestrator::notify_network_lost`）が行う。
+     *  結果は通常の `onConnectionStateChanged` コールバック経由で [_state] に反映される。 */
+    fun notifyNetworkLost() = orchestrator.notifyNetworkLost()
+
+    /** 「WiFiは繋がっているがupstreamが死んでいる」等を検知した際に呼ぶ。
+     *  マルチパス以外のtransportや未接続時は Rust 側で無視される（日和見的に呼べばよい）。 */
+    fun rebindToFd(fd: Int, localIp: String) = orchestrator.rebindToFd(fd, localIp)
 
     // ── Host key ──────────────────────────────────────────────────────
 

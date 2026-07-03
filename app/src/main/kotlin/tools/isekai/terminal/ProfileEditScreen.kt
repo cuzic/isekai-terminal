@@ -10,9 +10,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.Alignment
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -22,7 +25,6 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -39,6 +41,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.util.RemoteLogger
+import uniffi.tssh_core.TransportPreference
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -58,8 +61,12 @@ fun ProfileEditScreen(
     var authType by remember { mutableStateOf(profile?.authType ?: "password") }
     var keyId by remember { mutableStateOf(profile?.keyId) }
     var keyMenuExpanded by remember { mutableStateOf(false) }
-    var useTsshd by remember { mutableStateOf(profile?.useTsshd ?: false) }
-    var tsshdPort by remember { mutableStateOf((profile?.tsshdPort ?: 2222).toString()) }
+    var transportPreference by remember { mutableStateOf(profile?.transportPreference ?: TransportPreference.PLAIN_SSH) }
+    var tsshdPort by remember { mutableStateOf((profile?.tsshdPort ?: ConnectionProfile.DEFAULT_TSSHD_PORT).toString()) }
+    var directAddress by remember { mutableStateOf(profile?.directAddress ?: "") }
+    var enablePhysicalMultipath by remember { mutableStateOf(profile?.enablePhysicalMultipath ?: false) }
+    var cellularRemoteAddress by remember { mutableStateOf(profile?.cellularRemoteAddress ?: "") }
+    var enableUpstreamFailover by remember { mutableStateOf(profile?.enableUpstreamFailover ?: false) }
 
     val selectedKeyLabel = keys.firstOrNull { it.id == keyId }?.label ?: "鍵を選択"
     val canSave = label.isNotBlank() && host.isNotBlank() && username.isNotBlank() &&
@@ -166,15 +173,116 @@ fun ProfileEditScreen(
 
         Spacer(Modifier.height(4.dp))
 
+        Text("接続方式")
         Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
         ) {
-            Text("tsshd QUIC 接続", modifier = androidx.compose.ui.Modifier.align(androidx.compose.ui.Alignment.CenterVertically))
-            Switch(checked = useTsshd, onCheckedChange = { useTsshd = it })
+            FilterChip(
+                selected = transportPreference == TransportPreference.PLAIN_SSH,
+                onClick = { transportPreference = TransportPreference.PLAIN_SSH },
+                label = { Text("通常 SSH") },
+            )
+            FilterChip(
+                selected = transportPreference == TransportPreference.TSSHD_QUIC,
+                onClick = { transportPreference = TransportPreference.TSSHD_QUIC },
+                label = { Text("tsshd QUIC") },
+            )
+            FilterChip(
+                selected = transportPreference == TransportPreference.ISEKAI_HELPER_QUIC,
+                onClick = { transportPreference = TransportPreference.ISEKAI_HELPER_QUIC },
+                label = { Text("自作ヘルパー QUIC") },
+            )
+            FilterChip(
+                selected = transportPreference == TransportPreference.AUTO,
+                onClick = { transportPreference = TransportPreference.AUTO },
+                label = { Text("Auto（推奨）") },
+            )
+            FilterChip(
+                selected = transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH,
+                onClick = { transportPreference = TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH },
+                label = { Text("自作ヘルパー QUIC（マルチパス）") },
+            )
         }
 
-        if (useTsshd) {
+        if (transportPreference == TransportPreference.ISEKAI_HELPER_QUIC ||
+            transportPreference == TransportPreference.AUTO ||
+            transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH
+        ) {
+            Text(
+                text = "初回接続時に SSH 経由で自作ヘルパー（isekai-helper）を自動配布・起動します" +
+                    "（対応 OS: Linux x86_64 / aarch64）。",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        if (transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH) {
+            OutlinedTextField(
+                value = directAddress,
+                onValueChange = { directAddress = it },
+                label = { Text("直接到達アドレス（path1、任意）") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                text = "上の「ホスト」欄（通常 Tailscale 経由アドレス）と、こちらの直接到達可能な" +
+                    "アドレスの両方を同時に維持し、片方が不安定でも即座にもう片方へ切り替えます。" +
+                    "未入力なら通常の自作ヘルパー QUIC と同じ動作になります。",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(
+                    checked = enablePhysicalMultipath,
+                    onCheckedChange = { enablePhysicalMultipath = it },
+                )
+                Text("Wi-Fi/セルラー物理無線も同時に使う（実験的）")
+            }
+            Text(
+                text = "Wi-Fiとセルラーの両方の無線を同時に使い、片方が不安定でも即座に" +
+                    "もう片方へ切り替えます。Tailscale使用中はこの機能は効果がありません" +
+                    "（OSの制約でTailscale稼働中は物理無線への明示的なバインドができないため、" +
+                    "自動的に上の直接到達アドレスのみのマルチパスにフォールバックします）。",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            if (enablePhysicalMultipath) {
+                OutlinedTextField(
+                    value = cellularRemoteAddress,
+                    onValueChange = { cellularRemoteAddress = it },
+                    label = { Text("セルラー用の別リモートアドレス（任意、実験的）") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    text = "同一サーバーの別アドレス（例: IPv6）をセルラー経路専用に指定できます。" +
+                        "未入力なら上の直接到達アドレスと同じものを使います。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(
+                    checked = enableUpstreamFailover,
+                    onCheckedChange = { enableUpstreamFailover = it },
+                )
+                Text("WiFiのupstream断を検知したらセルラーへ切り替える（実験的）")
+            }
+            Text(
+                text = "WiFiは繋がっているが実際にはインターネットに到達できない状態" +
+                    "（カフェ等のキャプティブポータル、ルーター障害）を検知して、" +
+                    "セルラーに明示的にバインドしたソケットへ通信を丸ごと切り替えます。" +
+                    "Tailscale使用中はこの機能は効果がありません。",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        if (transportPreference == TransportPreference.TSSHD_QUIC) {
             OutlinedTextField(
                 value = tsshdPort,
                 onValueChange = { new -> tsshdPort = new.filter { it.isDigit() }.take(5) },
@@ -199,8 +307,13 @@ fun ProfileEditScreen(
                         authType = authType,
                         keyId = if (authType == "key") keyId else null,
                         sortOrder = profile?.sortOrder ?: 0,
-                        useTsshd = useTsshd,
-                        tsshdPort = tsshdPort.toIntOrNull() ?: 2222,
+                        useTsshd = transportPreference == TransportPreference.TSSHD_QUIC,
+                        tsshdPort = tsshdPort.toIntOrNull() ?: ConnectionProfile.DEFAULT_TSSHD_PORT,
+                        transportPreferenceName = transportPreference.name,
+                        directAddress = directAddress.trim().takeIf { it.isNotBlank() },
+                        enablePhysicalMultipath = enablePhysicalMultipath,
+                        cellularRemoteAddress = cellularRemoteAddress.trim().takeIf { it.isNotBlank() },
+                        enableUpstreamFailover = enableUpstreamFailover,
                     )
                     vm.save(saved) { onSave() }
                 },

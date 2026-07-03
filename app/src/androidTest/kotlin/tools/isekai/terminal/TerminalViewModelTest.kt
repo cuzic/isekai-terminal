@@ -18,6 +18,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import uniffi.tssh_core.SshConfig
 import uniffi.tssh_core.SshAuth
+import uniffi.tssh_core.TransportPreference
 
 @RunWith(AndroidJUnit4::class)
 class TerminalViewModelTest {
@@ -212,6 +213,7 @@ class TerminalViewModelTest {
         val profile = ConnectionProfile(
             label = "quic", host = "192.168.1.1", port = 22, tsshdPort = 2222,
             username = "user", authType = "password", useTsshd = true,
+            transportPreferenceName = TransportPreference.TSSHD_QUIC.name,
         )
         vm.connectProfile(profile, "pass")
         withTimeout(3000) { while (!fakeOrchestrator.connectQuicCalled) kotlinx.coroutines.delay(10) }

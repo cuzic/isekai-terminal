@@ -26,6 +26,27 @@ interface AppExecutor {
     fun release()
     /** ダウンロードファイルを端末のDownloadsフォルダに保存する。 */
     suspend fun saveDownloadFile(fileName: String, data: ByteArray)
+    /**
+     * Phase 9-4（実験的機能）: Wi-Fi/セルラー物理無線にそれぞれ明示的にバインドした
+     * ソケットの fd を取得する。両方/片方が取得できないことは正常系（Tailscale稼働中
+     * 等）なので、呼び出し側は結果の null を許容すること。
+     */
+    suspend fun acquirePhysicalMultipathFds(): PhysicalMultipathFds
+    /** [acquirePhysicalMultipathFds] で保持したネットワークリクエストを解除する。 */
+    fun releasePhysicalMultipathFds()
+    /**
+     * 「WiFiは繋がっているがupstreamが死んでいる」検知の監視を開始する。
+     * [onWifiUpstreamBroken] は検証失敗を検知した瞬間に呼ばれる（edge-triggered）。
+     */
+    fun registerUpstreamFailoverMonitor(onWifiUpstreamBroken: () -> Unit)
+    /** [registerUpstreamFailoverMonitor] の監視を解除する。 */
+    fun unregisterUpstreamFailoverMonitor()
+    /**
+     * セルラーに明示的にバインドしたソケットの生fdとローカルIPを取得する
+     * （[acquirePhysicalMultipathFds] のセルラー単体版）。取得できなければnull
+     * （Tailscale稼働中でbindSocketが失敗する等、正常系として許容する）。
+     */
+    suspend fun acquireCellularFd(): Pair<Int, String>?
 }
 
 data class UploadFile(val name: String, val size: Long, val stream: InputStream)

@@ -2,6 +2,7 @@ package tools.isekai.terminal
 
 import android.net.Uri
 import tools.isekai.terminal.session.AppExecutor
+import tools.isekai.terminal.session.PhysicalMultipathFds
 import tools.isekai.terminal.session.UploadFile
 import java.io.ByteArrayInputStream
 
@@ -46,8 +47,37 @@ class DumbAppExecutor : AppExecutor {
     override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {}
     override fun release() { released = true }
 
+    /** acquirePhysicalMultipathFds() が返す値。テストで上書きして使う。既定は全滅（未取得）。 */
+    var physicalMultipathFds: PhysicalMultipathFds = PhysicalMultipathFds()
+    var acquirePhysicalMultipathFdsCallCount = 0
+    var releasePhysicalMultipathFdsCalled = false
+
+    override suspend fun acquirePhysicalMultipathFds(): PhysicalMultipathFds {
+        acquirePhysicalMultipathFdsCallCount++
+        return physicalMultipathFds
+    }
+    override fun releasePhysicalMultipathFds() { releasePhysicalMultipathFdsCalled = true }
+
+    /** acquireCellularFd() が返す値。テストで上書きして使う。既定はnull（未取得）。 */
+    var cellularFdForUpstreamFailover: Pair<Int, String>? = null
+    var registerUpstreamFailoverMonitorCallCount = 0
+    var unregisterUpstreamFailoverMonitorCalled = false
+    private var _onWifiUpstreamBroken: (() -> Unit)? = null
+
+    override fun registerUpstreamFailoverMonitor(onWifiUpstreamBroken: () -> Unit) {
+        registerUpstreamFailoverMonitorCallCount++
+        _onWifiUpstreamBroken = onWifiUpstreamBroken
+    }
+    override fun unregisterUpstreamFailoverMonitor() {
+        unregisterUpstreamFailoverMonitorCalled = true
+        _onWifiUpstreamBroken = null
+    }
+    override suspend fun acquireCellularFd(): Pair<Int, String>? = cellularFdForUpstreamFailover
+
     /** ネットワーク切断をシミュレートする。 */
     fun simulateNetworkLost() = _onLost?.invoke()
     /** ネットワーク復帰をシミュレートする。 */
     fun simulateNetworkAvailable() = _onAvailable?.invoke()
+    /** WiFi upstream断をシミュレートする。 */
+    fun simulateWifiUpstreamBroken() = _onWifiUpstreamBroken?.invoke()
 }

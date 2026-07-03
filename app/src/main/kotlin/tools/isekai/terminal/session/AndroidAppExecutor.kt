@@ -6,9 +6,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.net.ConnectivityManager
-import android.net.Network
-import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.os.IBinder
 import tools.isekai.terminal.TerminalSessionService
 import tools.isekai.terminal.data.Repositories
@@ -29,7 +26,10 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
 
     @Volatile private var isServiceBound = false
     @Volatile private var terminalService: TerminalSessionService? = null
-    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var pathMonitor: NetworkPathMonitor? = null
+    private var physicalPathProvider: PhysicalPathProvider? = null
+    private var upstreamHealthMonitor: UpstreamHealthMonitor? = null
+    private var upstreamFailoverPathProvider: PhysicalPathProvider? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -70,26 +70,54 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
     }
 
     override fun registerNetworkCallbacks(onAvailable: () -> Unit, onLost: () -> Unit) {
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = onAvailable()
-            override fun onLost(network: Network) = onLost()
+        // 単一の "internet capability があるか" ではなく、direct/Tailscale を別々に追跡し、
+        // どちらか一方でも使える経路がある間は onLost を鳴らさない（PLAN.md Phase 7-7 参照）。
+        val monitor = NetworkPathMonitor(app.getSystemService(ConnectivityManager::class.java))
+        pathMonitor = monitor
+        var wasAnyPathAvailable = false
+        monitor.start { anyPathAvailable ->
+            if (anyPathAvailable && !wasAnyPathAvailable) onAvailable()
+            if (!anyPathAvailable && wasAnyPathAvailable) onLost()
+            wasAnyPathAvailable = anyPathAvailable
         }
-        networkCallback = cb
-        app.getSystemService(ConnectivityManager::class.java).registerNetworkCallback(
-            NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build(),
-            cb,
-        )
     }
 
     override fun unregisterNetworkCallbacks() {
-        networkCallback?.let {
-            try {
-                app.getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it)
-            } catch (_: Exception) {}
-            networkCallback = null
-        }
+        pathMonitor?.stop()
+        pathMonitor = null
+    }
+
+    override suspend fun acquirePhysicalMultipathFds(): PhysicalMultipathFds {
+        val provider = PhysicalPathProvider(app)
+        physicalPathProvider = provider
+        return provider.acquire()
+    }
+
+    override fun releasePhysicalMultipathFds() {
+        physicalPathProvider?.release()
+        physicalPathProvider = null
+    }
+
+    override fun registerUpstreamFailoverMonitor(onWifiUpstreamBroken: () -> Unit) {
+        val monitor = UpstreamHealthMonitor(app.getSystemService(ConnectivityManager::class.java))
+        upstreamHealthMonitor = monitor
+        monitor.start(
+            onWifiUpstreamBroken = onWifiUpstreamBroken,
+            onWifiUpstreamRecovered = {},
+        )
+    }
+
+    override fun unregisterUpstreamFailoverMonitor() {
+        upstreamHealthMonitor?.stop()
+        upstreamHealthMonitor = null
+        upstreamFailoverPathProvider?.release()
+        upstreamFailoverPathProvider = null
+    }
+
+    override suspend fun acquireCellularFd(): Pair<Int, String>? {
+        val provider = PhysicalPathProvider(app)
+        upstreamFailoverPathProvider = provider
+        return provider.acquireCellularOnly()
     }
 
     override suspend fun loadKeyPem(keyId: Long): ByteArray {
