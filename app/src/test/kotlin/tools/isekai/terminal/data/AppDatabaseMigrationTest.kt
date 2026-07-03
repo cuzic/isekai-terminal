@@ -39,7 +39,7 @@ class AppDatabaseMigrationTest {
     }
 
     @Test
-    fun migrate8To9_addsPostConnectCommandsColumn_andSnippetsTable_preservesExistingData() = runBlocking {
+    fun migrate8To9_addsPostConnectCommandsColumn_andSnippetsTable_preservesExistingData(): Unit = runBlocking {
         val dbName = "migration-test-8-9.db"
         ctx.deleteDatabase(dbName)
 
@@ -118,7 +118,7 @@ class AppDatabaseMigrationTest {
 
         // Act: Room を通じて実際の MIGRATION_8_9 を適用する
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_8_9)
+            .addMigrations(AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10)
             .build()
 
         // Assert: 既存の行は保持され、新カラムは null
