@@ -4,7 +4,9 @@ import android.app.Application
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -17,7 +19,10 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import tools.isekai.terminal.data.ConnectionProfile
+import tools.isekai.terminal.data.Repositories
+import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.session.TerminalSession
+import uniffi.tssh_core.TransportPreference
 
 /**
  * 複数タブ (複数 SSH セッション) を横断する [TerminalTabsViewModel] のテスト。
@@ -34,10 +39,22 @@ class TerminalTabsViewModelTest {
     // tabId ごとの FakeOrchestrator を、生成順に記録する。
     private val orchestrators = mutableListOf<FakeOrchestrator>()
 
+    // viewModelScope (Dispatchers.Main.immediate) 上の delay() (接続後自動実行コマンドの
+    // デバウンス) を進めるための仮想クロック。UnconfinedTestDispatcher() を素の runBlocking
+    // から使うだけでは delay() が誰にも進めてもらえず永遠に止まるため、scheduler を明示的に
+    // 保持し advanceUntilIdle() で駆動する。
+    private lateinit var testScheduler: TestCoroutineScheduler
+
     @Before
     fun setup() {
-        Dispatchers.setMain(UnconfinedTestDispatcher())
+        testScheduler = TestCoroutineScheduler()
+        Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
         val app = ApplicationProvider.getApplicationContext<Application>()
+        Repositories.init(app)
+        runBlocking {
+            Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) }
+            Repositories.snippets.getAll().forEach { Repositories.snippets.delete(it) }
+        }
         executor = DumbAppExecutor()
         val sessionFactory: () -> TerminalSession = {
             val fake = FakeOrchestrator()
@@ -58,6 +75,8 @@ class TerminalTabsViewModelTest {
 
     private suspend fun awaitConnectCalled(o: FakeOrchestrator) =
         withTimeout(3000) { while (!o.connectCalled) kotlinx.coroutines.delay(10) }
+
+    private fun tab(tabId: String) = vm.tabs.value.first { it.tabId == tabId }
 
     // ── タブ追加/削除でセッション生成・close が呼ばれる ────────────────────
 
@@ -211,5 +230,169 @@ class TerminalTabsViewModelTest {
         assertTrue(orchestrators[0].disconnectCalled)
         assertTrue(orchestrators[1].disconnectCalled)
         assertTrue(executor.released)
+    }
+
+    // ── Phase 9-4: 物理マルチパス（実験的機能）─────────────────────────
+
+    @Test
+    fun connectTab_multipathTransport_physicalMultipathEnabled_acquiresPhysicalFds() = runBlocking {
+        executor.physicalMultipathFds = tools.isekai.terminal.session.PhysicalMultipathFds(
+            wifiFd = 42, wifiLocalIp = "192.168.1.5",
+        )
+        val p = profile("a").copy(
+            transportPreferenceName = TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH.name,
+            enablePhysicalMultipath = true,
+        )
+        vm.openTab(p, "pass")
+
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathHelperQuicCalled) delay(10) }
+
+        assertEquals(1, executor.acquirePhysicalMultipathFdsCallCount)
+    }
+
+    @Test
+    fun connectTab_multipathTransport_physicalMultipathDisabled_doesNotAcquirePhysicalFds() = runBlocking {
+        val p = profile("a").copy(
+            transportPreferenceName = TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH.name,
+            enablePhysicalMultipath = false,
+        )
+        vm.openTab(p, "pass")
+
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathHelperQuicCalled) delay(10) }
+
+        assertEquals(0, executor.acquirePhysicalMultipathFdsCallCount)
+    }
+
+    @Test
+    fun disconnect_afterConnected_releasesPhysicalMultipathFds() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+
+        orchestrators[0].simulateDisconnected("bye")
+        withTimeout(3000) { while (tab(id).session.state.value.connected) delay(10) }
+
+        assertTrue(executor.releasePhysicalMultipathFdsCalled)
+    }
+
+    // ── 定型コマンド（スニペット）─────────────────────────────────
+
+    @Test
+    fun sendSnippet_appendNewlineTrue_sendsCommandFollowedByCr() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+
+        vm.sendSnippet(id, Snippet(label = "list", command = "ls -la", appendNewline = true))
+
+        assertTrue(orchestrators[0].sentBytes.any { it.toString(Charsets.UTF_8) == "ls -la\r" })
+    }
+
+    @Test
+    fun sendSnippet_appendNewlineFalse_sendsCommandWithoutTrailingCr() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+
+        vm.sendSnippet(id, Snippet(label = "partial", command = "echo hi", appendNewline = false))
+
+        assertTrue(orchestrators[0].sentBytes.any { it.toString(Charsets.UTF_8) == "echo hi" })
+    }
+
+    @Test
+    fun connectTab_loadsSnippetsForThatProfile() = runBlocking {
+        val profileId = Repositories.profiles.save(profile("web"))
+        Repositories.snippets.save(Snippet(label = "web-only", command = "tail -f log", profileId = profileId))
+        val savedProfile = Repositories.profiles.findById(profileId)!!
+
+        val id = vm.openTab(savedProfile, "pass")
+
+        withTimeout(3000) { while (tab(id).snippets.value.isEmpty()) delay(10) }
+        assertEquals(listOf("web-only"), tab(id).snippets.value.map { it.label })
+    }
+
+    // ── 接続後自動実行コマンド ────────────────────────────────────
+
+    @Test
+    fun connectTab_withPostConnectCommands_sendsThemOnceConnected() = runBlocking {
+        val p = profile("a").copy(postConnectCommands = "echo hello\nls -la")
+        val id = vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        testScheduler.advanceUntilIdle()
+
+        withTimeout(3000) {
+            while (orchestrators[0].sentBytes.none { it.toString(Charsets.UTF_8) == "echo hello\rls -la\r" }) {
+                delay(20)
+            }
+        }
+    }
+
+    @Test
+    fun connectTab_withoutPostConnectCommands_sendsNothingAutomatically() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+
+        delay(700) // 十分にデバウンス時間を超えて待つ
+        assertTrue(orchestrators[0].sentBytes.isEmpty())
+    }
+
+    @Test
+    fun postConnectCommands_internalResumeWithoutNewOpenTabCall_doesNotResend() = runBlocking {
+        // セッション単位で1回だけ実行するフラグの検証:
+        // Kotlin 側から openTab()/reconnect() を呼び直さずに Rust 側が内部的に
+        // 切断→再接続（resume）した場合、post_connect_commands は再送されないべき。
+        val p = profile("a").copy(postConnectCommands = "echo once")
+        val id = vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        testScheduler.advanceUntilIdle()
+        withTimeout(3000) {
+            while (orchestrators[0].sentBytes.none { it.toString(Charsets.UTF_8) == "echo once\r" }) delay(20)
+        }
+
+        orchestrators[0].simulateDisconnected("network blip")
+        withTimeout(3000) { while (tab(id).session.state.value.connected) delay(10) }
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        testScheduler.advanceUntilIdle()
+        delay(700)
+
+        val matching = orchestrators[0].sentBytes.count { it.toString(Charsets.UTF_8) == "echo once\r" }
+        assertEquals(1, matching)
+    }
+
+    @Test
+    fun reconnect_calledAgainAfterDisconnect_resendsPostConnectCommandsForNewSession() = runBlocking {
+        // 明示的な再接続（新しい reconnect() 呼び出し）は新セッション扱いなので、
+        // 各セッションごとに1回ずつ実行されてよい。
+        val p = profile("a").copy(postConnectCommands = "echo hi")
+        val id = vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        testScheduler.advanceUntilIdle()
+        withTimeout(3000) {
+            while (orchestrators[0].sentBytes.none { it.toString(Charsets.UTF_8) == "echo hi\r" }) delay(20)
+        }
+
+        vm.disconnect(id)
+        withTimeout(3000) { while (tab(id).session.state.value.connected) delay(10) }
+
+        vm.reconnect(id, "pass")
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        testScheduler.advanceUntilIdle()
+        delay(700)
+
+        val matching = orchestrators[0].sentBytes.count { it.toString(Charsets.UTF_8) == "echo hi\r" }
+        assertEquals(2, matching)
     }
 }
