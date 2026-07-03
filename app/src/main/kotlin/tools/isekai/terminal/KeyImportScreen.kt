@@ -13,6 +13,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import tools.isekai.terminal.ui.AppColors
 import tools.isekai.terminal.util.RemoteLogger
 
 @Composable
@@ -40,7 +41,7 @@ fun KeyImportScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF101018))
+            .background(AppColors.ScreenBackground)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -60,11 +61,11 @@ fun KeyImportScreen(
         ) { Text("PEM ファイルを選択") }
 
         selectedFileName?.let {
-            Text("選択中: $it", color = Color(0xFFAAAAAA), fontSize = 12.sp)
+            Text("選択中: $it", color = AppColors.SecondaryText, fontSize = 12.sp)
         }
 
         errorMsg?.let {
-            Text(it, color = Color(0xFFFF6666), fontSize = 12.sp)
+            Text(it, color = AppColors.Error, fontSize = 12.sp)
         }
 
         Spacer(Modifier.weight(1f))

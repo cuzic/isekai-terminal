@@ -4,7 +4,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -55,7 +54,7 @@ fun HostKeyChangedDialog(
 ) {
     AlertDialog(
         onDismissRequest = {},  // force explicit choice
-        title = { Text("⚠ ホスト鍵が変わりました", color = Color(0xFFFF6666)) },
+        title = { Text("⚠ ホスト鍵が変わりました", color = AppColors.Error) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
@@ -65,20 +64,20 @@ fun HostKeyChangedDialog(
                 Text(
                     "保存済み: ${warning.oldFingerprint.take(20)}…",
                     fontSize = 11.sp,
-                    color = Color(0xFFAAAAAA),
+                    color = AppColors.SecondaryText,
                 )
                 Text(
                     "今回:     ${warning.newFingerprint.take(20)}…",
                     fontSize = 11.sp,
-                    color = Color(0xFFFF9944),
+                    color = AppColors.Warning,
                 )
             }
         },
         confirmButton = {
-            TextButton(onClick = onAccept) { Text("更新して接続", color = Color(0xFFFF9944)) }
+            TextButton(onClick = onAccept) { Text("更新して接続", color = AppColors.Warning) }
         },
         dismissButton = {
-            TextButton(onClick = onReject) { Text("切断", color = Color(0xFFFF6666)) }
+            TextButton(onClick = onReject) { Text("切断", color = AppColors.Error) }
         },
     )
 }

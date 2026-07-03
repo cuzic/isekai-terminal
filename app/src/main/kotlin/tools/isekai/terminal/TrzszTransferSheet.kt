@@ -8,9 +8,9 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import tools.isekai.terminal.ui.AppColors
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -36,10 +36,10 @@ fun TrzszTransferSheet(
                     } else {
                         Text("ファイルを受信", style = MaterialTheme.typography.titleMedium)
                         state.suggestedName?.let {
-                            Text("ファイル名: $it", color = Color(0xFFAAAAAA), fontSize = 13.sp)
+                            Text("ファイル名: $it", color = AppColors.SecondaryText, fontSize = 13.sp)
                         }
                         state.expectedSize?.let {
-                            Text("サイズ: ${formatBytes(it.toLong())}", color = Color(0xFFAAAAAA), fontSize = 13.sp)
+                            Text("サイズ: ${formatBytes(it.toLong())}", color = AppColors.SecondaryText, fontSize = 13.sp)
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = onStartDownload, modifier = Modifier.weight(1f)) {
@@ -55,7 +55,7 @@ fun TrzszTransferSheet(
                     val title = if (state.mode == "upload") "アップロード中" else "ダウンロード中"
                     Text(title, style = MaterialTheme.typography.titleMedium)
                     state.fileName?.let {
-                        Text(it, color = Color(0xFFAAAAAA), fontSize = 13.sp)
+                        Text(it, color = AppColors.SecondaryText, fontSize = 13.sp)
                     }
                     val progress = state.total?.let { total ->
                         if (total > 0u) state.transferred.toFloat() / total.toFloat() else 0f
@@ -64,11 +64,11 @@ fun TrzszTransferSheet(
                         LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
                         Text(
                             "${formatBytes(state.transferred.toLong())} / ${formatBytes(state.total.toLong())}",
-                            fontSize = 11.sp, color = Color(0xFFAAAAAA),
+                            fontSize = 11.sp, color = AppColors.SecondaryText,
                         )
                     } else {
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                        Text(formatBytes(state.transferred.toLong()), fontSize = 11.sp, color = Color(0xFFAAAAAA))
+                        Text(formatBytes(state.transferred.toLong()), fontSize = 11.sp, color = AppColors.SecondaryText)
                     }
                     OutlinedButton(onClick = onCancel, modifier = Modifier.align(Alignment.End)) {
                         Text("キャンセル")
@@ -76,12 +76,12 @@ fun TrzszTransferSheet(
                 }
                 is TrzszUiState.Done -> {
                     val (label, color) = if (state.success)
-                        "転送完了" to Color(0xFF55FF55)
+                        "転送完了" to AppColors.Success
                     else
                         "転送失敗" to MaterialTheme.colorScheme.error
                     Text(label, color = color, style = MaterialTheme.typography.titleMedium)
                     state.message?.let {
-                        Text(it, fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                        Text(it, fontSize = 13.sp, color = AppColors.SecondaryText)
                     }
                     Button(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) {
                         Text("閉じる")

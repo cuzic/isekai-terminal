@@ -33,9 +33,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
+import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.util.RemoteLogger
 
 @Composable
@@ -49,6 +51,13 @@ fun ProfileListScreen(
     val profiles by vm.profiles.collectAsStateWithLifecycle()
     val passwordTarget by vm.passwordTarget.collectAsStateWithLifecycle()
     val deleteTarget by vm.deleteTarget.collectAsStateWithLifecycle()
+
+    // プロファイル編集画面から戻ってきたときに一覧を最新化する
+    // (ProfileListViewModel は NavHost 上で使い回されるため init だけでは再取得されない)
+    LifecycleResumeEffect(Unit) {
+        vm.loadProfiles()
+        onPauseOrDispose {}
+    }
 
     Scaffold(
         topBar = {
@@ -119,16 +128,11 @@ fun ProfileListScreen(
     }
 
     deleteTarget?.let { target ->
-        AlertDialog(
-            onDismissRequest = { vm.dismissDelete() },
-            title = { Text("削除確認") },
-            text = { Text("「${target.label}」を削除しますか？") },
-            confirmButton = {
-                TextButton(onClick = { vm.confirmDelete(target) }) { Text("削除") }
-            },
-            dismissButton = {
-                TextButton(onClick = { vm.dismissDelete() }) { Text("キャンセル") }
-            },
+        DeleteConfirmDialog(
+            title = "削除確認",
+            message = "「${target.label}」を削除しますか？",
+            onConfirm = { vm.confirmDelete(target) },
+            onDismiss = { vm.dismissDelete() },
         )
     }
 }

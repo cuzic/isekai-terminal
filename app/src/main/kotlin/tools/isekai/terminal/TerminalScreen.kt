@@ -28,6 +28,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.input.TerminalInputView
+import tools.isekai.terminal.ui.AppColors
 import tools.isekai.terminal.ui.HostKeyChangedDialog
 import tools.isekai.terminal.ui.SshTerminalCanvas
 import tools.isekai.terminal.util.RemoteLogger
@@ -107,13 +108,13 @@ fun TerminalScreen(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Color(0xFF1A1A2E))
+                .background(AppColors.CardBackground)
                 .padding(horizontal = 8.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text(
                 statusMsg,
-                color = if (connected) Color(0xFF55FF55) else Color.Yellow,
+                color = if (connected) AppColors.Success else Color.Yellow,
                 fontSize = 11.sp,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -138,7 +139,7 @@ fun TerminalScreen(
                             cm.setPrimaryClip(ClipData.newPlainText("tssh log", log))
                         },
                         contentPadding = PaddingValues(0.dp),
-                    ) { Text("ログ", color = Color(0xFFAAAAAA), fontSize = 11.sp) }
+                    ) { Text("ログ", color = AppColors.SecondaryText, fontSize = 11.sp) }
                 }
                 TextButton(
                     onClick = { vm.disconnect(); onBack() },
@@ -340,6 +341,6 @@ private fun CtrlBtn(label: String, onClick: () -> Unit) {
         contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
         modifier = Modifier.background(Color(0xFF2A2A2A), shape = MaterialTheme.shapes.small),
     ) {
-        Text(label, color = Color(0xFFCCCCCC), fontSize = 11.sp)
+        Text(label, color = AppColors.MutedText, fontSize = 11.sp)
     }
 }

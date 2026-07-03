@@ -18,6 +18,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.KeyEntry
+import tools.isekai.terminal.ui.AppColors
+import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.util.RemoteLogger
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -44,18 +46,12 @@ fun KeyListScreen(
 
     // Delete confirmation dialog
     pendingDelete?.let { key ->
-        AlertDialog(
-            onDismissRequest = { vm.dismissDelete() },
-            title = { Text("鍵を削除") },
-            text = { Text("「${key.label}」を削除しますか？この操作は元に戻せません。") },
-            confirmButton = {
-                TextButton(onClick = { vm.confirmDelete(key) }) {
-                    Text("削除", color = Color(0xFFFF6666))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { vm.dismissDelete() }) { Text("キャンセル") }
-            },
+        DeleteConfirmDialog(
+            title = "鍵を削除",
+            message = "「${key.label}」を削除しますか？この操作は元に戻せません。",
+            onConfirm = { vm.confirmDelete(key) },
+            onDismiss = { vm.dismissDelete() },
+            confirmColor = AppColors.Error,
         )
     }
 
@@ -73,7 +69,7 @@ fun KeyListScreen(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
-                    genError?.let { Text(it, color = Color(0xFFFF6666), fontSize = 12.sp) }
+                    genError?.let { Text(it, color = AppColors.Error, fontSize = 12.sp) }
                 }
             },
             confirmButton = {
@@ -106,7 +102,7 @@ fun KeyListScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("以下の公開鍵をサーバーの ~/.ssh/authorized_keys に追加してください。",
-                        fontSize = 12.sp, color = Color(0xFFCCCCCC))
+                        fontSize = 12.sp, color = AppColors.MutedText)
                     Text(
                         pubKey,
                         fontSize = 10.sp,
@@ -145,7 +141,7 @@ fun KeyListScreen(
                 }
             }
         },
-        containerColor = Color(0xFF101018),
+        containerColor = AppColors.ScreenBackground,
     ) { padding ->
         Column(
             modifier = Modifier
@@ -160,7 +156,7 @@ fun KeyListScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text("鍵一覧", color = Color.White, fontSize = 18.sp)
-                TextButton(onClick = onBack) { Text("戻る", color = Color(0xFFAAAAAA)) }
+                TextButton(onClick = onBack) { Text("戻る", color = AppColors.SecondaryText) }
             }
 
             if (keys.isEmpty()) {
@@ -208,7 +204,7 @@ private fun KeyCard(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Color(0xFF1A1A2E), shape = MaterialTheme.shapes.medium)
+            .background(AppColors.CardBackground, shape = MaterialTheme.shapes.medium)
             .padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
@@ -216,12 +212,12 @@ private fun KeyCard(
         Text(createdAtText, color = Color(0xFF888888), fontSize = 11.sp)
         Text(
             key.publicKey,
-            color = Color(0xFFCCCCCC),
+            color = AppColors.MutedText,
             fontSize = 11.sp,
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             TextButton(onClick = onCopy) { Text("コピー", color = Color.Cyan, fontSize = 12.sp) }
-            TextButton(onClick = onDelete) { Text("削除", color = Color(0xFFFF6666), fontSize = 12.sp) }
+            TextButton(onClick = onDelete) { Text("削除", color = AppColors.Error, fontSize = 12.sp) }
         }
     }
 }
