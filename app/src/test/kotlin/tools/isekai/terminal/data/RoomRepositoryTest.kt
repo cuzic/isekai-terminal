@@ -358,22 +358,22 @@ class AppDatabaseMigration3To4Test {
     }
 
     /**
-     * v3 時点のデータベースを再現する。`known_hosts` / `key_entries` は v1 から形が
-     * 変わっていないため、まず Room 自身に現行（v4）スキーマ一式を作らせてそのまま使い
-     * （手書き DDL の食い違いリスクを避ける）、`connection_profiles` テーブルだけを
-     * v3 の形（`enable_agent_forward` 列が無い状態、`MIGRATION_2_3` が作る形と同じ）に
-     * 手動で作り直したうえで `user_version` を 3 に戻す。
+     * v10 時点(migration 1→10 適用後の最終形、`enable_agent_forward` 列追加前)の
+     * データベースを再現する。`known_hosts` / `key_entries` / `snippets` は Room 自身に
+     * 現行（v11）スキーマ一式を作らせてそのまま使い（手書き DDL の食い違いリスクを避ける）、
+     * `connection_profiles` テーブルだけを v10 の形に手動で作り直したうえで
+     * `user_version` を 10 に戻す。
      */
-    private fun createV3Database() {
+    private fun createV10Database() {
         Room.databaseBuilder(ctx, AppDatabase::class.java, dbName).build().apply {
-            openHelper.writableDatabase // force file creation at v4
+            openHelper.writableDatabase // force file creation at v11
             close()
         }
 
         val helper = FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(ctx)
                 .name(dbName)
-                .callback(object : SupportSQLiteOpenHelper.Callback(4) {
+                .callback(object : SupportSQLiteOpenHelper.Callback(11) {
                     override fun onCreate(db: SupportSQLiteDatabase) {}
                     override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
                 })
@@ -393,7 +393,14 @@ class AppDatabaseMigration3To4Test {
                     keyId INTEGER,
                     sort_order INTEGER NOT NULL DEFAULT 0,
                     use_tsshd INTEGER NOT NULL DEFAULT 0,
-                    tsshd_port INTEGER NOT NULL DEFAULT 2222
+                    tsshd_port INTEGER NOT NULL DEFAULT 2222,
+                    transport_preference TEXT NOT NULL DEFAULT 'PLAIN_SSH',
+                    direct_address TEXT,
+                    enable_physical_multipath INTEGER NOT NULL DEFAULT 0,
+                    cellular_remote_address TEXT,
+                    enable_upstream_failover INTEGER NOT NULL DEFAULT 0,
+                    post_connect_commands TEXT,
+                    forwards TEXT NOT NULL DEFAULT '[]'
                 )
                 """.trimIndent()
             )
@@ -401,17 +408,17 @@ class AppDatabaseMigration3To4Test {
                 "INSERT INTO connection_profiles (label, host, username, authType) " +
                     "VALUES ('web', 'example.com', 'user', 'password')"
             )
-            execSQL("PRAGMA user_version = 3")
+            execSQL("PRAGMA user_version = 10")
             close()
         }
     }
 
     @Test
-    fun migrate3To4_addsColumn_existingRowDefaultsToDisabled() {
-        createV3Database()
+    fun migrate10To11_addsColumn_existingRowDefaultsToDisabled() {
+        createV10Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_3_4)
+            .addMigrations(AppDatabase.MIGRATION_10_11)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -424,11 +431,11 @@ class AppDatabaseMigration3To4Test {
     }
 
     @Test
-    fun migrate3To4_thenSavingWithAgentForwardEnabled_persists() {
-        createV3Database()
+    fun migrate10To11_thenSavingWithAgentForwardEnabled_persists() {
+        createV10Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_3_4)
+            .addMigrations(AppDatabase.MIGRATION_10_11)
             .build()
         try {
             val dao = db.connectionProfileDao()

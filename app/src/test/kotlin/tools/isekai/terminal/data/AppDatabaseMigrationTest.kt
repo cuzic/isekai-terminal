@@ -118,7 +118,7 @@ class AppDatabaseMigrationTest {
 
         // Act: Room を通じて実際の MIGRATION_8_9 を適用する
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10)
+            .addMigrations(AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11)
             .build()
 
         // Assert: 既存の行は保持され、新カラムは null
@@ -229,7 +229,7 @@ class AppDatabaseMigrationTest {
 
         // Room 経由で開くと MIGRATION_9_10 が適用されるはず。
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_9_10)
+            .addMigrations(AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }

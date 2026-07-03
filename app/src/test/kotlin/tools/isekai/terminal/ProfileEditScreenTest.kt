@@ -138,7 +138,10 @@ class ProfileEditScreenTest {
         fields[3].performTextInput("admin")
         composeTestRule.onNodeWithTag("agentForwardSwitch").performScrollTo().performClick()
         composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
-        composeTestRule.waitUntil(5000) { saved }
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
         runBlocking {
             val stored = Repositories.profiles.getAll().first { it.label == "Bastion2" }
             assertTrue(stored.enableAgentForward)
