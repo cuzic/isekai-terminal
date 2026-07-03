@@ -1,16 +1,45 @@
 package tools.isekai.terminal.data
 
+import android.os.Parcel
 import android.os.Parcelable
 import androidx.room.*
+import kotlinx.parcelize.Parceler
 import kotlinx.parcelize.Parcelize
+import kotlinx.parcelize.TypeParceler
+import org.json.JSONArray
+import org.json.JSONObject
 import tools.isekai.terminal.session.PhysicalMultipathFds
+import uniffi.tssh_core.ForwardType
 import uniffi.tssh_core.HelperQuicConfig
 import uniffi.tssh_core.MultipathHelperQuicConfig
+import uniffi.tssh_core.PortForward
 import uniffi.tssh_core.QuicConfig
 import uniffi.tssh_core.SshAuth
 import uniffi.tssh_core.SshConfig
 import uniffi.tssh_core.TransportPreference
 
+/**
+ * [PortForward] は uniffi 生成の素の data class で Parcelable ではないため、
+ * `@Parcelize` に読み書き方法を教える(MVP では forwardType は LOCAL 固定なので保存しない)。
+ */
+private object PortForwardParceler : Parceler<PortForward> {
+    override fun create(parcel: Parcel): PortForward = PortForward(
+        forwardType = ForwardType.LOCAL,
+        bindAddress = parcel.readString() ?: "127.0.0.1",
+        bindPort = parcel.readInt().toUShort(),
+        remoteHost = parcel.readString() ?: "",
+        remotePort = parcel.readInt().toUShort(),
+    )
+
+    override fun PortForward.write(parcel: Parcel, flags: Int) {
+        parcel.writeString(bindAddress)
+        parcel.writeInt(bindPort.toInt())
+        parcel.writeString(remoteHost)
+        parcel.writeInt(remotePort.toInt())
+    }
+}
+
+@TypeParceler<PortForward, PortForwardParceler>()
 @Parcelize
 @Entity(tableName = "connection_profiles")
 data class ConnectionProfile(
@@ -42,6 +71,8 @@ data class ConnectionProfile(
     @ColumnInfo(name = "enable_upstream_failover") val enableUpstreamFailover: Boolean = false,
     // 接続確立後に自動実行するコマンド列（改行区切り、複数可）。null/空なら何もしない。
     @ColumnInfo(name = "post_connect_commands") val postConnectCommands: String? = null,
+    /** ローカルポートフォワード(-L)一覧。Room には TEXT(JSON) 列として保存する。 */
+    @ColumnInfo(name = "forwards", defaultValue = "[]") val forwards: List<PortForward> = emptyList(),
 ) : Parcelable {
     val transportPreference: TransportPreference
         get() = try {
@@ -54,6 +85,46 @@ data class ConnectionProfile(
         /** tsshd のデフォルト待受ポート。変更する場合も過去の Room migration 内の
          *  リテラル値（そのマイグレーションを書いた時点のデフォルト、という歴史的記録）は書き換えないこと。 */
         const val DEFAULT_TSSHD_PORT = 2222
+    }
+}
+
+/**
+ * [PortForward] のリストを Room の TEXT 列に保存するための TypeConverter。
+ * 外部の JSON ライブラリを追加せず、Android 標準の `org.json` だけで完結させている
+ * (MVP のポートフォワード機能のためだけに kotlinx.serialization 等を新規導入しない判断)。
+ */
+object PortForwardListConverter {
+    @TypeConverter
+    @JvmStatic
+    fun fromForwards(forwards: List<PortForward>): String {
+        val arr = JSONArray()
+        for (f in forwards) {
+            val o = JSONObject()
+            o.put("type", "LOCAL")
+            o.put("bindAddress", f.bindAddress)
+            o.put("bindPort", f.bindPort.toInt())
+            o.put("remoteHost", f.remoteHost)
+            o.put("remotePort", f.remotePort.toInt())
+            arr.put(o)
+        }
+        return arr.toString()
+    }
+
+    @TypeConverter
+    @JvmStatic
+    fun toForwards(json: String): List<PortForward> {
+        if (json.isBlank()) return emptyList()
+        val arr = JSONArray(json)
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            PortForward(
+                forwardType = ForwardType.LOCAL,
+                bindAddress = o.getString("bindAddress"),
+                bindPort = o.getInt("bindPort").toUShort(),
+                remoteHost = o.getString("remoteHost"),
+                remotePort = o.getInt("remotePort").toUShort(),
+            )
+        }
     }
 }
 
@@ -80,6 +151,7 @@ fun ConnectionProfile.toSshConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt = 
         auth = auth,
         cols = cols,
         rows = rows,
+        forwards = forwards,
     )
 
 fun ConnectionProfile.toQuicConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt = 24u): QuicConfig =

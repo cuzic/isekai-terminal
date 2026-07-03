@@ -18,30 +18,31 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 /**
- * MIGRATION_8_9 の実機検証。exportSchema=false のため room-testing の
- * MigrationTestHelper（スキーマ JSON 前提）は使わず、v8 時点の生スキーマを手動構築してから
- * 実際の Migration を適用し、Room が結果スキーマを正しいと認識する（＝以後のクエリが通る）
- * ことと、既存データが保持されることを確認する。
+ * MIGRATION_8_9(スニペット)・MIGRATION_9_10(ポートフォワード)の実機検証。
+ * exportSchema=false のため room-testing の MigrationTestHelper（スキーマ JSON 前提）は
+ * 使わず、各バージョン時点の生スキーマを手動構築してから実際の Migration を適用し、
+ * Room が結果スキーマを正しいと認識する（＝以後のクエリが通る）ことと、
+ * 既存データが保持されることを確認する。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
 class AppDatabaseMigrationTest {
-    private val dbName = "migration-test-8-9.db"
     private lateinit var ctx: Application
 
     @Before
     fun setup() {
         ctx = ApplicationProvider.getApplicationContext()
-        ctx.deleteDatabase(dbName)
     }
 
     @After
     fun teardown() {
-        ctx.deleteDatabase(dbName)
     }
 
     @Test
     fun migrate8To9_addsPostConnectCommandsColumn_andSnippetsTable_preservesExistingData() = runBlocking {
+        val dbName = "migration-test-8-9.db"
+        ctx.deleteDatabase(dbName)
+
         // Arrange: v8 スキーマ(migration 1→8 適用後の最終形)の生データベースを作り、
         // 既存プロファイルを1件入れておく。
         val v8Helper = FrameworkSQLiteOpenHelperFactory().create(
@@ -134,5 +135,110 @@ class AppDatabaseMigrationTest {
         assertTrue(saved.appendNewline)
 
         db.close()
+        ctx.deleteDatabase(dbName)
+    }
+
+    @Test
+    fun migrate9To10_addsForwardsColumn_existingRowsDefaultToEmptyList() {
+        val dbName = "migration-test-9-10.db"
+        ctx.deleteDatabase(dbName)
+
+        // バージョン 9 の connection_profiles テーブル(migration 1→9 適用後の最終形)を
+        // 手で作り、1 行 insert しておく。
+        val factory = FrameworkSQLiteOpenHelperFactory()
+        val config = SupportSQLiteOpenHelper.Configuration.builder(ctx)
+            .name(dbName)
+            .callback(object : SupportSQLiteOpenHelper.Callback(9) {
+                override fun onCreate(db: SupportSQLiteDatabase) {
+                    // AppDatabase の全エンティティ分作らないと、Room の起動時バリデーションが
+                    // (今回のマイグレーションと無関係な)known_hosts / key_entries / snippets でも失敗する。
+                    db.execSQL(
+                        """
+                        CREATE TABLE connection_profiles (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            host TEXT NOT NULL,
+                            port INTEGER NOT NULL DEFAULT 22,
+                            username TEXT NOT NULL,
+                            authType TEXT NOT NULL,
+                            keyId INTEGER,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            use_tsshd INTEGER NOT NULL DEFAULT 0,
+                            tsshd_port INTEGER NOT NULL DEFAULT 2222,
+                            transport_preference TEXT NOT NULL DEFAULT 'PLAIN_SSH',
+                            direct_address TEXT,
+                            enable_physical_multipath INTEGER NOT NULL DEFAULT 0,
+                            cellular_remote_address TEXT,
+                            enable_upstream_failover INTEGER NOT NULL DEFAULT 0,
+                            post_connect_commands TEXT
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE known_hosts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            host TEXT NOT NULL,
+                            port INTEGER NOT NULL,
+                            keyType TEXT NOT NULL,
+                            fingerprintSha256 TEXT NOT NULL,
+                            firstSeenAt INTEGER NOT NULL,
+                            lastSeenAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        "CREATE UNIQUE INDEX index_known_hosts_host_port ON known_hosts (host, port)"
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE key_entries (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            publicKey TEXT NOT NULL,
+                            encryptedPrivateKeyPath TEXT NOT NULL,
+                            kekAlias TEXT NOT NULL,
+                            createdAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE snippets (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            command TEXT NOT NULL,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            profile_id INTEGER,
+                            append_newline INTEGER NOT NULL DEFAULT 1
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        "INSERT INTO connection_profiles (label, host, username, authType) " +
+                            "VALUES ('web', 'example.com', 'user', 'password')"
+                    )
+                }
+
+                override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+            })
+            .build()
+        val rawHelper = factory.create(config)
+        rawHelper.writableDatabase // force onCreate
+        rawHelper.close()
+
+        // Room 経由で開くと MIGRATION_9_10 が適用されるはず。
+        val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_9_10)
+            .build()
+        try {
+            val profiles = runBlocking { db.connectionProfileDao().getAll() }
+            assertEquals(1, profiles.size)
+            assertEquals("web", profiles[0].label)
+            assertTrue("既存行の forwards は空リストであるべき", profiles[0].forwards.isEmpty())
+        } finally {
+            db.close()
+            ctx.deleteDatabase(dbName)
+        }
     }
 }
