@@ -1,0 +1,43 @@
+[package]
+name = "noq-multipath-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "noq-spike-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "noq-spike-client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "dual-fd-loopback-test"
+path = "src/bin/dual_fd_loopback_test.rs"
+
+[[bin]]
+name = "compat-check"
+path = "src/bin/compat_check.rs"
+
+[dependencies]
+noq = { version = "1.0.1", features = ["rustls", "ring"] }
+# Phase 9-0 only: proves an unmodified quinn client can still talk to a noq
+# server (see compat_check.rs). Not a dependency of the noq client/server
+# paths themselves -- kept isolated here, same as `noq` is kept out of
+# tssh-core/isekai-helper for now.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net"] }
+tokio-stream = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rcgen = "0.14"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+jni = "0.21"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
