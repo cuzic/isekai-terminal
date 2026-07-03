@@ -5,12 +5,14 @@ import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
+import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.session.TerminalSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -35,14 +37,22 @@ class TerminalViewModelTest {
     private lateinit var fakeHostKeyChecker: FakeHostKeyChecker
     private lateinit var executor: DumbAppExecutor
 
+    // viewModelScope (Dispatchers.Main.immediate) 上の delay() (接続後自動実行コマンドの
+    // デバウンス) を進めるための仮想クロック。UnconfinedTestDispatcher() を素の runBlocking
+    // から使うだけでは delay() が誰にも進めてもらえず永遠に止まるため、scheduler を明示的に
+    // 保持し advanceUntilIdle() で駆動する。
+    private lateinit var testScheduler: TestCoroutineScheduler
+
     @Before
     fun setup() {
-        Dispatchers.setMain(UnconfinedTestDispatcher())
+        testScheduler = TestCoroutineScheduler()
+        Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
         val app = ApplicationProvider.getApplicationContext<Application>()
         Repositories.init(app)
         runBlocking {
             Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) }
             Repositories.keys.getAll().forEach { Repositories.keys.delete(it) }
+            Repositories.snippets.getAll().forEach { Repositories.snippets.delete(it) }
         }
         fakeOrchestrator = FakeOrchestrator()
         fakeHostKeyChecker = FakeHostKeyChecker()
@@ -411,5 +421,167 @@ class TerminalViewModelTest {
     @Test
     fun clearSessionLog_doesNotThrow() {
         vm.clearSessionLog()
+    }
+
+    // ── 定型コマンド（スニペット）─────────────────────────────────
+
+    @Test
+    fun sendSnippet_appendNewlineTrue_sendsCommandFollowedByCr() = runBlocking {
+        val profile = ConnectionProfile(label = "test", host = "192.168.1.1", username = "user", authType = "password")
+        vm.connectProfile(profile, "pass")
+        withTimeout(3000) { while (!fakeOrchestrator.connectCalled) delay(10) }
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+
+        vm.sendSnippet(Snippet(label = "list", command = "ls -la", appendNewline = true))
+
+        assertTrue(fakeOrchestrator.sentBytes.any { it.toString(Charsets.UTF_8) == "ls -la\r" })
+    }
+
+    @Test
+    fun sendSnippet_appendNewlineFalse_sendsCommandWithoutTrailingCr() = runBlocking {
+        val profile = ConnectionProfile(label = "test", host = "192.168.1.1", username = "user", authType = "password")
+        vm.connectProfile(profile, "pass")
+        withTimeout(3000) { while (!fakeOrchestrator.connectCalled) delay(10) }
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+
+        vm.sendSnippet(Snippet(label = "partial", command = "echo hi", appendNewline = false))
+
+        assertTrue(fakeOrchestrator.sentBytes.any { it.toString(Charsets.UTF_8) == "echo hi" })
+    }
+
+    @Test
+    fun loadSnippets_nullProfileId_loadsOnlyCommonSnippets() = runBlocking {
+        Repositories.snippets.save(Snippet(label = "common", command = "uptime", profileId = null))
+        val profileId = Repositories.profiles.save(
+            ConnectionProfile(label = "web", host = "h", username = "u", authType = "password")
+        )
+        Repositories.snippets.save(Snippet(label = "web-only", command = "tail -f log", profileId = profileId))
+
+        vm.loadSnippets(null)
+        withTimeout(3000) { while (vm.snippets.value.isEmpty()) delay(10) }
+
+        assertEquals(listOf("common"), vm.snippets.value.map { it.label })
+    }
+
+    @Test
+    fun loadSnippets_withProfileId_mergesCommonAndProfileSpecific() = runBlocking {
+        val profileId = Repositories.profiles.save(
+            ConnectionProfile(label = "web", host = "h", username = "u", authType = "password")
+        )
+        Repositories.snippets.save(Snippet(label = "common", command = "uptime", profileId = null))
+        Repositories.snippets.save(Snippet(label = "web-only", command = "tail -f log", profileId = profileId))
+
+        vm.loadSnippets(profileId)
+        withTimeout(3000) { while (vm.snippets.value.size < 2) delay(10) }
+
+        assertEquals(setOf("common", "web-only"), vm.snippets.value.map { it.label }.toSet())
+    }
+
+    @Test
+    fun connectProfile_loadsSnippetsForThatProfile() = runBlocking {
+        val profileId = Repositories.profiles.save(
+            ConnectionProfile(label = "web", host = "192.168.1.1", username = "user", authType = "password")
+        )
+        Repositories.snippets.save(Snippet(label = "web-only", command = "tail -f log", profileId = profileId))
+        val profile = Repositories.profiles.findById(profileId)!!
+
+        vm.connectProfile(profile, "pass")
+
+        withTimeout(3000) { while (vm.snippets.value.isEmpty()) delay(10) }
+        assertEquals(listOf("web-only"), vm.snippets.value.map { it.label })
+    }
+
+    // ── 接続後自動実行コマンド ────────────────────────────────────
+
+    @Test
+    fun connectProfile_withPostConnectCommands_sendsThemOnceConnected() = runBlocking {
+        val profile = ConnectionProfile(
+            label = "test", host = "192.168.1.1", username = "user", authType = "password",
+            postConnectCommands = "echo hello\nls -la",
+        )
+        vm.connectProfile(profile, "pass")
+        withTimeout(3000) { while (!fakeOrchestrator.connectCalled) delay(10) }
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+        testScheduler.advanceUntilIdle()
+
+        withTimeout(3000) {
+            while (fakeOrchestrator.sentBytes.none { it.toString(Charsets.UTF_8) == "echo hello\rls -la\r" }) {
+                delay(20)
+            }
+        }
+    }
+
+    @Test
+    fun connectProfile_withoutPostConnectCommands_sendsNothingAutomatically() = runBlocking {
+        val profile = ConnectionProfile(label = "test", host = "192.168.1.1", username = "user", authType = "password")
+        vm.connectProfile(profile, "pass")
+        withTimeout(3000) { while (!fakeOrchestrator.connectCalled) delay(10) }
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+
+        delay(700) // 十分にデバウンス時間を超えて待つ
+        assertTrue(fakeOrchestrator.sentBytes.isEmpty())
+    }
+
+    @Test
+    fun postConnectCommands_internalResumeWithoutNewConnectProfileCall_doesNotResend() = runBlocking {
+        // セッション単位で1回だけ実行するフラグの検証:
+        // Kotlin 側から connectProfile() を呼び直さずに Rust 側が内部的に
+        // 切断→再接続（resume）した場合、post_connect_commands は再送されないべき。
+        val profile = ConnectionProfile(
+            label = "test", host = "192.168.1.1", username = "user", authType = "password",
+            postConnectCommands = "echo once",
+        )
+        vm.connectProfile(profile, "pass")
+        withTimeout(3000) { while (!fakeOrchestrator.connectCalled) delay(10) }
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+        testScheduler.advanceUntilIdle()
+        withTimeout(3000) {
+            while (fakeOrchestrator.sentBytes.none { it.toString(Charsets.UTF_8) == "echo once\r" }) delay(20)
+        }
+
+        fakeOrchestrator.simulateDisconnected("network blip")
+        awaitState { !it.connected }
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+        testScheduler.advanceUntilIdle()
+        delay(700)
+
+        val matching = fakeOrchestrator.sentBytes.count { it.toString(Charsets.UTF_8) == "echo once\r" }
+        assertEquals(1, matching)
+    }
+
+    @Test
+    fun connectProfile_calledAgainAfterDisconnect_resendsPostConnectCommandsForNewSession() = runBlocking {
+        // 明示的な再接続（新しい connectProfile() 呼び出し）は新セッション扱いなので、
+        // 各セッションごとに1回ずつ実行されてよい。
+        val profile = ConnectionProfile(
+            label = "test", host = "192.168.1.1", username = "user", authType = "password",
+            postConnectCommands = "echo hi",
+        )
+        vm.connectProfile(profile, "pass")
+        withTimeout(3000) { while (!fakeOrchestrator.connectCalled) delay(10) }
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+        testScheduler.advanceUntilIdle()
+        withTimeout(3000) {
+            while (fakeOrchestrator.sentBytes.none { it.toString(Charsets.UTF_8) == "echo hi\r" }) delay(20)
+        }
+
+        vm.disconnect()
+        awaitState { !it.connected }
+
+        vm.connectProfile(profile, "pass")
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+        testScheduler.advanceUntilIdle()
+        delay(700)
+
+        val matching = fakeOrchestrator.sentBytes.count { it.toString(Charsets.UTF_8) == "echo hi\r" }
+        assertEquals(2, matching)
     }
 }

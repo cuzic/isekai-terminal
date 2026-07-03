@@ -8,6 +8,7 @@ import android.graphics.Typeface
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
@@ -17,6 +18,7 @@ import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,6 +35,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
+import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.input.TerminalInputView
 import tools.isekai.terminal.input.TerminalKeyEncoder
 import tools.isekai.terminal.ui.AppColors
@@ -58,14 +61,21 @@ fun TerminalScreen(
     val statusMsg = uiState.statusMsg
     val screenUpdate = uiState.screenUpdate
     val scrollbackLen = uiState.scrollbackLen
+    val snippets by vm.snippets.collectAsStateWithLifecycle()
     // スクロール位置・選択範囲は Compose local state — ViewModel を経由しない
     // (.claude/rules/rust-ssot.md の「UI 表示だけに閉じた状態」の例外)
     var scrollOffset by remember { mutableIntStateOf(0) }
     var showDisconnectDialog by remember { mutableStateOf(false) }
     var selection by remember { mutableStateOf<SelectionRange?>(null) }
+    var showSnippetSheet by remember { mutableStateOf(false) }
     // Canvas のタップジェスチャーから IME フォーカスを要求するために、
     // 入力用 AndroidView への参照をここで保持する（入力欄自体は下部に描画）。
     var inputView by remember { mutableStateOf<tools.isekai.terminal.input.TerminalInputView?>(null) }
+
+    // プロファイルが変わるたび（画面遷移・再接続含む）にそのプロファイル向けスニペットを読み込む
+    LaunchedEffect(profile?.id) {
+        vm.loadSnippets(profile?.id)
+    }
 
     BackHandler(enabled = connected) { showDisconnectDialog = true }
 
@@ -103,6 +113,18 @@ fun TerminalScreen(
             onStartDownload = { vm.trzszStartDownload() },
             onCancel = { vm.trzszCancel() },
             onDismiss = { vm.trzszDismiss() },
+        )
+    }
+
+    // 定型コマンド（スニペット）一覧
+    if (showSnippetSheet) {
+        SnippetPickerSheet(
+            snippets = snippets,
+            onPick = { snippet ->
+                vm.sendSnippet(snippet)
+                showSnippetSheet = false
+            },
+            onDismiss = { showSnippetSheet = false },
         )
     }
 
@@ -406,6 +428,7 @@ fun TerminalScreen(
                             vm.send(TerminalKeyEncoder.commitTextBytes(text, screenUpdate?.bracketedPasteMode ?: false))
                         }
                     }
+                    CtrlBtn("定型") { showSnippetSheet = true }
                 }
 
                 if (composingText.isNotEmpty()) {
@@ -459,5 +482,61 @@ private fun CtrlBtn(label: String, active: Boolean = false, onClick: () -> Unit)
         ),
     ) {
         Text(label, color = if (active) Color.White else AppColors.MutedText, fontSize = 11.sp)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SnippetPickerSheet(
+    snippets: List<Snippet>,
+    onPick: (Snippet) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .navigationBarsPadding(),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text("定型コマンド", style = MaterialTheme.typography.titleMedium)
+            if (snippets.isEmpty()) {
+                Text(
+                    "登録された定型コマンドがありません。プロファイル一覧の「定型」から追加できます。",
+                    color = Color(0xFFAAAAAA),
+                    fontSize = 13.sp,
+                    modifier = Modifier.padding(vertical = 12.dp),
+                )
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 360.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    snippets.forEach { snippet ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onPick(snippet) }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(snippet.label, color = Color.White, fontSize = 15.sp)
+                                Text(
+                                    snippet.command.lineSequence().firstOrNull() ?: "",
+                                    color = Color(0xFF888888),
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

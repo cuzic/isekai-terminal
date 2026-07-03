@@ -67,6 +67,7 @@ fun ProfileEditScreen(
     var enablePhysicalMultipath by remember { mutableStateOf(profile?.enablePhysicalMultipath ?: false) }
     var cellularRemoteAddress by remember { mutableStateOf(profile?.cellularRemoteAddress ?: "") }
     var enableUpstreamFailover by remember { mutableStateOf(profile?.enableUpstreamFailover ?: false) }
+    var postConnectCommands by remember { mutableStateOf(profile?.postConnectCommands ?: "") }
 
     val selectedKeyLabel = keys.firstOrNull { it.id == keyId }?.label ?: "鍵を選択"
     val canSave = label.isNotBlank() && host.isNotBlank() && username.isNotBlank() &&
@@ -293,6 +294,22 @@ fun ProfileEditScreen(
             )
         }
 
+        Spacer(Modifier.height(4.dp))
+
+        OutlinedTextField(
+            value = postConnectCommands,
+            onValueChange = { postConnectCommands = it },
+            label = { Text("接続後に自動実行するコマンド（改行区切りで複数可）") },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(120.dp),
+        )
+        Text(
+            "注意: パスワードなどの機密情報をここに平文で書くと、保護されずデータベースに残ります。",
+            color = MaterialTheme.colorScheme.error,
+            fontSize = 12.sp,
+        )
+
         Spacer(Modifier.height(8.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -314,6 +331,7 @@ fun ProfileEditScreen(
                         enablePhysicalMultipath = enablePhysicalMultipath,
                         cellularRemoteAddress = cellularRemoteAddress.trim().takeIf { it.isNotBlank() },
                         enableUpstreamFailover = enableUpstreamFailover,
+                        postConnectCommands = postConnectCommands.trim().takeIf { it.isNotEmpty() },
                     )
                     vm.save(saved) { onSave() }
                 },

@@ -5,15 +5,18 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
+import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.data.toHelperQuicConfig
 import tools.isekai.terminal.data.toMultipathHelperQuicConfig
 import tools.isekai.terminal.data.toQuicConfig
@@ -58,6 +61,9 @@ class TerminalViewModel(
         private fun createSession(app: Application): TerminalSession {
             return TerminalSession(RealHostKeyChecker(Repositories.knownHosts))
         }
+
+        // Connected 直後は取りこぼし防止のため少し待ってから自動実行コマンドを送る。
+        private const val POST_CONNECT_DEBOUNCE_MS = 400L
     }
 
     // 接続前のバリデーションエラーメッセージ。接続試行開始時にクリアされる。
@@ -75,6 +81,16 @@ class TerminalViewModel(
         }
         .stateIn(viewModelScope, SharingStarted.Eagerly, TerminalUiState())
     val pendingDownloadFile: StateFlow<Pair<String, ByteArray>?> = session.pendingDownloadFile
+
+    // ── 定型コマンド（スニペット）─────────────────────────────────
+    private val _snippets = MutableStateFlow<List<Snippet>>(emptyList())
+    val snippets: StateFlow<List<Snippet>> = _snippets.asStateFlow()
+
+    // ── 接続後自動実行コマンド ────────────────────────────────────
+    // セッション（＝1回の connectProfile 呼び出し）単位で1回だけ送るためのバイト列とフラグ。
+    // 再接続のたびに connectProfile() 内でリセットされる。
+    private var pendingPostConnectBytes: ByteArray? = null
+    private val postConnectSent = AtomicBoolean(true)
 
     init {
         RemoteLogger.i("TsshVM", "TerminalViewModel created")
@@ -112,6 +128,7 @@ class TerminalViewModel(
                     if (upstreamFailoverEnabledForCurrentSession) {
                         executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken() }
                     }
+                    maybeSendPostConnectCommands()
                 } else if (!connected && prevConnected) {
                     executor.notifyDisconnected()
                     // Phase 9-4: 物理Wi-Fi/セルラーのネットワークリクエストを解放する
@@ -171,6 +188,8 @@ class TerminalViewModel(
     fun connectProfile(profile: ConnectionProfile, password: String? = null) {
         if (uiState.value.connected || uiState.value.isConnecting) return
         _preConnectError.value = null
+        armPostConnectCommands(profile)
+        loadSnippets(profile.id)
         RemoteLogger.i("TsshSSH", "connectProfile: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} " +
             "transport=${profile.transportPreference}")
         viewModelScope.launch(Dispatchers.IO) {
@@ -193,6 +212,40 @@ class TerminalViewModel(
                     connectMultipathHelperQuic(profile.toMultipathHelperQuicConfig(auth, physicalFds))
                 }
             }
+        }
+    }
+
+    // ── 定型コマンド（スニペット）─────────────────────────────────
+
+    /** [profileId] が null なら全プロファイル共通のスニペットのみ、非nullなら共通＋専用をマージして読み込む。 */
+    fun loadSnippets(profileId: Long?) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _snippets.value = Repositories.snippets.getForProfile(profileId)
+        }
+    }
+
+    fun sendSnippet(snippet: Snippet) {
+        RemoteLogger.i("TsshSnippet", "send snippet '${snippet.label}' id=${snippet.id}")
+        send(SnippetCommands.toBytes(snippet))
+    }
+
+    // ── 接続後自動実行コマンド ────────────────────────────────────
+
+    /** 新しい接続試行のたびに呼び、この接続で送るべきコマンド（あれば）とフラグをリセットする。 */
+    private fun armPostConnectCommands(profile: ConnectionProfile) {
+        val commands = profile.postConnectCommands?.takeIf { it.isNotBlank() }
+        pendingPostConnectBytes = commands?.let { SnippetCommands.toBytes(it, appendNewline = true) }
+        postConnectSent.set(pendingPostConnectBytes == null)
+    }
+
+    /** Connected 立ち上がりで1回だけ呼ばれる。CAS でセッション単位の二重発火を防ぐ。 */
+    private fun maybeSendPostConnectCommands() {
+        if (!postConnectSent.compareAndSet(false, true)) return
+        val bytes = pendingPostConnectBytes ?: return
+        viewModelScope.launch {
+            delay(POST_CONNECT_DEBOUNCE_MS)
+            RemoteLogger.i("TsshSSH", "sending post-connect commands (${bytes.size} bytes)")
+            send(bytes)
         }
     }
 
