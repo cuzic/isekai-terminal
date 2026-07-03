@@ -2,6 +2,8 @@ package tools.isekai.terminal
 
 import tools.isekai.terminal.session.HostKeyDecision
 import tools.isekai.terminal.session.TerminalSession
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -45,6 +47,7 @@ class TerminalSessionTest {
         cols = 80u,
         rows = 24u,
         forwards = emptyList(),
+        agentForward = false,
     )
 
     private suspend fun awaitState(condition: (TerminalUiState) -> Boolean): TerminalUiState =
@@ -263,6 +266,45 @@ class TerminalSessionTest {
         assertNotNull(state.hostKeyChangedWarning)
         assertEquals("old-fp", state.hostKeyChangedWarning!!.oldFingerprint)
         s.close()
+    }
+
+    // ── SSH agent forwarding ─────────────────────────────────────
+
+    // onAgentSignRequest() は respondAgentSignRequest() が呼ばれるまで呼び出し元スレッドを
+    // ブロックする設計（本番では Rust の spawn_blocking スレッド）。テストでは別コルーチンで
+    // 呼び出し、state に fingerprint が反映されるのを待ってから応答する。
+    @Test
+    fun onAgentSignRequest_approved_returnsTrueAndClearsState() = runBlocking {
+        session.connect(testConfig())
+        val resultDeferred = async(Dispatchers.IO) {
+            fakeOrchestrator.simulateAgentSignRequest("SHA256:approve-me")
+        }
+        withTimeout(3000) { session.state.first { it.agentSignRequestFingerprint == "SHA256:approve-me" } }
+
+        session.respondAgentSignRequest(true)
+
+        assertTrue(withTimeout(3000) { resultDeferred.await() })
+        assertNull(session.state.value.agentSignRequestFingerprint)
+    }
+
+    @Test
+    fun onAgentSignRequest_rejected_returnsFalse() = runBlocking {
+        session.connect(testConfig())
+        val resultDeferred = async(Dispatchers.IO) {
+            fakeOrchestrator.simulateAgentSignRequest("SHA256:reject-me")
+        }
+        withTimeout(3000) { session.state.first { it.agentSignRequestFingerprint == "SHA256:reject-me" } }
+
+        session.respondAgentSignRequest(false)
+
+        assertFalse(withTimeout(3000) { resultDeferred.await() })
+    }
+
+    @Test
+    fun respondAgentSignRequest_withoutPendingRequest_isNoop() {
+        // 保留中の要求が無い状態で呼んでも何も起きない（二重応答やタイミングずれのガード）。
+        session.respondAgentSignRequest(true)
+        assertNull(session.state.value.agentSignRequestFingerprint)
     }
 
     // ── 画面更新 ─────────────────────────────────────────────────

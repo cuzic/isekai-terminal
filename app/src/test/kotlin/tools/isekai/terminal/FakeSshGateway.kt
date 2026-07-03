@@ -147,6 +147,9 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     fun simulateDownloadComplete(fileName: String?, data: ByteArray) =
         callback!!.onDownloadComplete(fileName, data)
+
+    fun simulateAgentSignRequest(fingerprint: String = "SHA256:test-fingerprint"): Boolean =
+        callback!!.onAgentSignRequest(fingerprint)
 }
 
 /** テスト用フェイク HostKeyChecker。デフォルトは常に信頼。 */

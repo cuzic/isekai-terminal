@@ -2,10 +2,14 @@ package tools.isekai.terminal.data
 
 import android.app.Application
 import androidx.room.Room
+import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.sqlite.db.SupportSQLiteOpenHelper
+import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -330,5 +334,111 @@ class KnownHostRepositoryTest {
         val second = db.knownHostDao().findByHostPort("example.com", 22)!!
         assertEquals(first.firstSeenAt, second.firstSeenAt)
         assertTrue(second.lastSeenAt >= first.lastSeenAt)
+    }
+}
+
+/**
+ * SSH agent forwarding 追加に伴う Room マイグレーション (v3 → v4) のテスト。
+ * `exportSchema = false` のためスキーマ json 資産が無く `MigrationTestHelper` を使えないので、
+ * v3 時点のテーブルを手動で構築 → `AppDatabase.MIGRATION_3_4` 込みで開き直す形で検証する。
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
+class AppDatabaseMigration3To4Test {
+    private lateinit var ctx: Application
+    private val dbName = "migration-test-3-4.db"
+
+    @Before fun setup() {
+        ctx = ApplicationProvider.getApplicationContext()
+        ctx.deleteDatabase(dbName)
+    }
+
+    @After fun teardown() {
+        ctx.deleteDatabase(dbName)
+    }
+
+    /**
+     * v3 時点のデータベースを再現する。`known_hosts` / `key_entries` は v1 から形が
+     * 変わっていないため、まず Room 自身に現行（v4）スキーマ一式を作らせてそのまま使い
+     * （手書き DDL の食い違いリスクを避ける）、`connection_profiles` テーブルだけを
+     * v3 の形（`enable_agent_forward` 列が無い状態、`MIGRATION_2_3` が作る形と同じ）に
+     * 手動で作り直したうえで `user_version` を 3 に戻す。
+     */
+    private fun createV3Database() {
+        Room.databaseBuilder(ctx, AppDatabase::class.java, dbName).build().apply {
+            openHelper.writableDatabase // force file creation at v4
+            close()
+        }
+
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(ctx)
+                .name(dbName)
+                .callback(object : SupportSQLiteOpenHelper.Callback(4) {
+                    override fun onCreate(db: SupportSQLiteDatabase) {}
+                    override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+                })
+                .build()
+        )
+        helper.writableDatabase.apply {
+            execSQL("DROP TABLE connection_profiles")
+            execSQL(
+                """
+                CREATE TABLE connection_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    label TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL DEFAULT 22,
+                    username TEXT NOT NULL,
+                    authType TEXT NOT NULL,
+                    keyId INTEGER,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    use_tsshd INTEGER NOT NULL DEFAULT 0,
+                    tsshd_port INTEGER NOT NULL DEFAULT 2222
+                )
+                """.trimIndent()
+            )
+            execSQL(
+                "INSERT INTO connection_profiles (label, host, username, authType) " +
+                    "VALUES ('web', 'example.com', 'user', 'password')"
+            )
+            execSQL("PRAGMA user_version = 3")
+            close()
+        }
+    }
+
+    @Test
+    fun migrate3To4_addsColumn_existingRowDefaultsToDisabled() {
+        createV3Database()
+
+        val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_3_4)
+            .build()
+        try {
+            val profiles = runBlocking { db.connectionProfileDao().getAll() }
+            assertEquals(1, profiles.size)
+            assertEquals("web", profiles[0].label)
+            assertFalse(profiles[0].enableAgentForward)
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun migrate3To4_thenSavingWithAgentForwardEnabled_persists() {
+        createV3Database()
+
+        val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_3_4)
+            .build()
+        try {
+            val dao = db.connectionProfileDao()
+            val existing = runBlocking { dao.getAll() }.single()
+            runBlocking { dao.upsert(existing.copy(enableAgentForward = true)) }
+
+            val updated = runBlocking { dao.findById(existing.id) }
+            assertTrue(updated!!.enableAgentForward)
+        } finally {
+            db.close()
+        }
     }
 }

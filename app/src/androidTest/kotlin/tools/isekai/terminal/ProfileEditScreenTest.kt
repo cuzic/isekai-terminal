@@ -4,6 +4,7 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
@@ -113,6 +114,42 @@ class ProfileEditScreenTest {
         assertTrue(saved)
         runBlocking {
             assertTrue(Repositories.profiles.getAll().any { it.label == "Bastion" })
+        }
+    }
+
+    // ── SSH agent forwarding トグル ─────────────────────────────────────
+
+    @Test fun agentForwardToggle_hiddenWarning_untilEnabled() {
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = {}, onCancel = {})
+        }
+        composeTestRule.onNodeWithText("SSH agent forwarding").assertExists()
+        composeTestRule.onNodeWithText("信頼できるホストのみで有効にしてください", substring = true).assertDoesNotExist()
+    }
+
+    @Test fun agentForwardToggle_enabling_showsWarning() {
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = {}, onCancel = {})
+        }
+        composeTestRule.onNodeWithTag("agentForwardSwitch").performClick()
+        composeTestRule.onNodeWithText("信頼できるホストのみで有効にしてください", substring = true).assertExists()
+    }
+
+    @Test fun saveNewProfile_withAgentForwardEnabled_persistsFlag() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("Bastion2")
+        fields[1].performTextInput("bastion2.example.com")
+        fields[3].performTextInput("admin")
+        composeTestRule.onNodeWithTag("agentForwardSwitch").performClick()
+        composeTestRule.onNodeWithText("保存").performClick()
+        composeTestRule.waitUntil(timeoutMillis = 5000) { saved }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "Bastion2" }
+            assertTrue(stored.enableAgentForward)
         }
     }
 }
