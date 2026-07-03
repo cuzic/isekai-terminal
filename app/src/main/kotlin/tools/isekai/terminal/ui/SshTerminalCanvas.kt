@@ -7,13 +7,17 @@ import androidx.compose.foundation.background
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import uniffi.tssh_core.ScreenUpdate
 
 @Composable
-fun SshTerminalCanvas(update: ScreenUpdate, selection: SelectionRange? = null, modifier: Modifier = Modifier) {
+fun SshTerminalCanvas(
+    update: ScreenUpdate,
+    selection: SelectionRange? = null,
+    theme: TerminalTheme = TerminalThemes.DEFAULT_DARK,
+    modifier: Modifier = Modifier,
+) {
     val textPaint = remember {
         Paint().apply {
             isAntiAlias = true
@@ -25,7 +29,7 @@ fun SshTerminalCanvas(update: ScreenUpdate, selection: SelectionRange? = null, m
         Paint().apply { color = android.graphics.Color.argb(120, 255, 255, 255) }
     }
 
-    Canvas(modifier = modifier.background(Color.Black)) {
+    Canvas(modifier = modifier.background(theme.background)) {
         val cols = update.cols.toInt()
         val rows = update.rows.toInt()
 
@@ -45,6 +49,9 @@ fun SshTerminalCanvas(update: ScreenUpdate, selection: SelectionRange? = null, m
         val baseline = -fm.top
 
         val nCanvas = drawContext.canvas.nativeCanvas
+        // セルの背景がテーマの既定背景と同じ場合は Canvas 自体の背景（上の
+        // `.background(theme.background)`）で既に塗られているので描画を省略する。
+        val themeBgArgb = theme.background.toArgb()
 
         // 選択範囲のハイライト（行単位。文字描画より前に半透明の反転色で塗る）
         selection?.let { sel ->
@@ -66,8 +73,8 @@ fun SshTerminalCanvas(update: ScreenUpdate, selection: SelectionRange? = null, m
                 val bg = cell.bg.toInt()
                 val fg = cell.fg.toInt()
 
-                // 背景（デフォルト黒以外のみ描画）
-                if (bg != android.graphics.Color.BLACK) {
+                // 背景（テーマの既定背景以外のみ描画）
+                if (bg != themeBgArgb) {
                     bgPaint.color = bg
                     nCanvas.drawRect(x, y, x + cellW, y + cellH, bgPaint)
                 }
@@ -85,7 +92,7 @@ fun SshTerminalCanvas(update: ScreenUpdate, selection: SelectionRange? = null, m
         val cx = update.cursorCol.toInt() * cellW
         val cy = update.cursorRow.toInt() * cellH
         if (cx < size.width && cy < size.height) {
-            bgPaint.color = Color.White.copy(alpha = 0.7f).toArgb()
+            bgPaint.color = theme.cursor.copy(alpha = 0.7f).toArgb()
             nCanvas.drawRect(cx, cy, cx + cellW, cy + cellH, bgPaint)
         }
     }

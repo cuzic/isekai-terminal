@@ -18,6 +18,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -28,6 +29,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -38,7 +40,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.ui.DeleteConfirmDialog
+import tools.isekai.terminal.ui.TerminalTheme
+import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.util.RemoteLogger
+import uniffi.tssh_core.setTerminalTheme
 
 @Composable
 fun ProfileListScreen(
@@ -46,6 +51,10 @@ fun ProfileListScreen(
     onAddProfile: () -> Unit,
     onEditProfile: (ConnectionProfile) -> Unit,
     onManageKeys: () -> Unit = {},
+    // Rust 側への実際の反映は差し替え可能にしておく（テストでは native 呼び出しを避けるため no-op を注入する）
+    applyTerminalTheme: (TerminalTheme) -> Unit = { theme ->
+        setTerminalTheme(theme.ansi16Argb(), theme.foregroundArgb(), theme.backgroundArgb())
+    },
 ) {
     val vm: ProfileListViewModel = viewModel()
     val profiles by vm.profiles.collectAsStateWithLifecycle()
@@ -59,6 +68,14 @@ fun ProfileListScreen(
         onPauseOrDispose {}
     }
 
+    // 配色テーマはプロファイル毎ではなくグローバル設定として永続化する
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("tssh_ui", android.content.Context.MODE_PRIVATE) }
+    var currentThemeName by remember {
+        mutableStateOf(prefs.getString(TerminalThemes.PREF_KEY, null) ?: TerminalThemes.DEFAULT_DARK.name)
+    }
+    var showThemeDialog by remember { mutableStateOf(false) }
+
     Scaffold(
         topBar = {
             Row(
@@ -68,6 +85,7 @@ fun ProfileListScreen(
                     .padding(horizontal = 8.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.End,
             ) {
+                TextButton(onClick = { showThemeDialog = true }) { Text("配色") }
                 TextButton(onClick = onManageKeys) { Text("鍵管理") }
             }
         },
@@ -135,6 +153,53 @@ fun ProfileListScreen(
             onDismiss = { vm.dismissDelete() },
         )
     }
+
+    if (showThemeDialog) {
+        TerminalThemeDialog(
+            current = currentThemeName,
+            onSelect = { theme ->
+                currentThemeName = theme.name
+                prefs.edit().putString(TerminalThemes.PREF_KEY, theme.name).apply()
+                applyTerminalTheme(theme)
+            },
+            onDismiss = { showThemeDialog = false },
+        )
+    }
+}
+
+@Composable
+private fun TerminalThemeDialog(
+    current: String,
+    onSelect: (TerminalTheme) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("配色テーマ") },
+        text = {
+            Column {
+                TerminalThemes.ALL.forEach { theme ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onSelect(theme); onDismiss() }
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(
+                            selected = theme.name == current,
+                            onClick = { onSelect(theme); onDismiss() },
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(theme.name)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("閉じる") }
+        },
+    )
 }
 
 @Composable

@@ -39,6 +39,7 @@ import tools.isekai.terminal.ui.AppColors
 import tools.isekai.terminal.ui.HostKeyChangedDialog
 import tools.isekai.terminal.ui.SelectionRange
 import tools.isekai.terminal.ui.SshTerminalCanvas
+import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.offsetToCellPos
 import tools.isekai.terminal.ui.reconstructSelectionText
 import tools.isekai.terminal.util.RemoteLogger
@@ -163,11 +164,16 @@ fun TerminalScreen(
             }
         }
 
-        // ターミナルキャンバス — font scale persisted via SharedPreferences
+        // ターミナルキャンバス — font scale / 配色テーマは SharedPreferences 経由で永続化
         val prefs = remember { context.getSharedPreferences("tssh_ui", android.content.Context.MODE_PRIVATE) }
         var fontScale by remember { mutableStateOf(prefs.getFloat("font_scale", 1f)) }
         val saveFontScale: (Float) -> Unit = remember {
             { scale -> prefs.edit().putFloat("font_scale", scale).apply() }
+        }
+        // 配色テーマの選択自体は ProfileListScreen 側で行う（グローバル設定）。
+        // ここでは画面表示のたびに最新の永続化値を読み直すだけでよい。
+        val terminalTheme = remember {
+            TerminalThemes.byName(prefs.getString(TerminalThemes.PREF_KEY, null))
         }
 
         val update = screenUpdate
@@ -236,6 +242,7 @@ fun TerminalScreen(
                     SshTerminalCanvas(
                         update = displayUpdate,
                         selection = selection,
+                        theme = terminalTheme,
                         modifier = Modifier
                             .fillMaxSize()
                             .pointerInput(cellDims, cols, rows) {
@@ -348,7 +355,7 @@ fun TerminalScreen(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .background(Color.Black),
+                    .background(terminalTheme.background),
             ) {
                 Text(
                     statusMsg,

@@ -13,12 +13,15 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.util.RemoteLogger
+import uniffi.tssh_core.setTerminalTheme
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         RemoteLogger.i("MainActivity", "app started")
+        restorePersistedTerminalTheme()
         enableEdgeToEdge()
         setContent {
             MaterialTheme {
@@ -30,6 +33,18 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * 前回選択した配色テーマ（グローバル設定、プロファイル毎ではない）を
+     * Rust 側のテーマテーブル（`rust-core/src/theme.rs`、案C）へ復元する。
+     * パレット自体は Rust 側のプロセス全体で共有されるグローバル状態のため、
+     * アプリ起動直後に一度反映しておけば、以降に生成される全セッションに引き継がれる。
+     */
+    private fun restorePersistedTerminalTheme() {
+        val prefs = getSharedPreferences("tssh_ui", MODE_PRIVATE)
+        val theme = TerminalThemes.byName(prefs.getString(TerminalThemes.PREF_KEY, null))
+        setTerminalTheme(theme.ansi16Argb(), theme.foregroundArgb(), theme.backgroundArgb())
     }
 }
 
