@@ -25,6 +25,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -33,6 +34,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.foundation.text.KeyboardOptions
@@ -104,6 +106,7 @@ fun ProfileEditScreen(
     var cellularRemoteAddress by remember { mutableStateOf(profile?.cellularRemoteAddress ?: "") }
     var enableUpstreamFailover by remember { mutableStateOf(profile?.enableUpstreamFailover ?: false) }
     var postConnectCommands by remember { mutableStateOf(profile?.postConnectCommands ?: "") }
+    var enableAgentForward by remember { mutableStateOf(profile?.enableAgentForward ?: false) }
     val forwardDrafts = remember {
         mutableStateListOf<ForwardDraft>().apply {
             profile?.forwards?.forEach { add(it.toDraft()) }
@@ -421,6 +424,30 @@ fun ProfileEditScreen(
             Text("+ ポートフォワードを追加")
         }
 
+        Spacer(Modifier.height(4.dp))
+
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("SSH agent forwarding", modifier = Modifier.align(Alignment.CenterVertically))
+                Switch(
+                    checked = enableAgentForward,
+                    onCheckedChange = { enableAgentForward = it },
+                    modifier = Modifier.testTag("agentForwardSwitch"),
+                )
+            }
+            if (enableAgentForward) {
+                Text(
+                    "有効にすると接続先サーバーの管理者や同居プロセスがあなたの秘密鍵での署名を要求できます。" +
+                        "信頼できるホストのみで有効にしてください。署名要求ごとに確認ダイアログが表示されます。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+
         Spacer(Modifier.height(8.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -444,6 +471,7 @@ fun ProfileEditScreen(
                         enableUpstreamFailover = enableUpstreamFailover,
                         postConnectCommands = postConnectCommands.trim().takeIf { it.isNotEmpty() },
                         forwards = forwardDrafts.mapNotNull { it.toPortForwardOrNull() },
+                        enableAgentForward = enableAgentForward,
                     )
                     vm.save(saved) { onSave() }
                 },
