@@ -4,7 +4,7 @@ import android.net.Uri
 import java.io.InputStream
 
 /**
- * TerminalViewModel が必要とする Android 側の副作用をすべて集約したインターフェース。
+ * TerminalTabsViewModel が必要とする Android 側の副作用をすべて集約したインターフェース。
  * テストでは DumbAppExecutor に差し替えることで実機・Android フレームワーク不要になる。
  */
 interface AppExecutor {

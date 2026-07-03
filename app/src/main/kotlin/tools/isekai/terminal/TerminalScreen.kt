@@ -33,9 +33,6 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
-import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.input.TerminalInputView
 import tools.isekai.terminal.input.TerminalKeyEncoder
@@ -74,55 +71,8 @@ data class TerminalScreenActions(
     val onRespondAgentSignRequest: (Boolean) -> Unit,
 )
 
-@Composable
-fun TerminalScreen(
-    profile: ConnectionProfile? = null,
-    password: String? = null,
-    onBack: () -> Unit,
-    vm: TerminalViewModel = viewModel(),
-) {
-    val uiState by vm.uiState.collectAsStateWithLifecycle()
-    val snippets by vm.snippets.collectAsStateWithLifecycle()
-
-    // プロファイルが変わるたび（画面遷移・再接続含む）にそのプロファイル向けスニペットを読み込む
-    LaunchedEffect(profile?.id) {
-        vm.loadSnippets(profile?.id)
-    }
-
-    LaunchedEffect(Unit) {
-        if (!uiState.connected && profile != null) {
-            RemoteLogger.i("TsshSSH", "TerminalScreen: launch connectProfile '${profile.label}' ${profile.username}@${profile.host}:${profile.port}")
-            vm.connectProfile(profile, password)
-        }
-    }
-
-    TerminalScreenBody(
-        uiState = uiState,
-        canReconnect = profile != null,
-        snippets = snippets,
-        actions = TerminalScreenActions(
-            onConnect = { if (profile != null) vm.connectProfile(profile, password) },
-            onDisconnect = { vm.disconnect() },
-            onBack = { vm.disconnect(); onBack() },
-            onSend = vm::send,
-            onResize = vm::resize,
-            onScrollbackCells = vm::scrollbackCells,
-            onTrustUpdatedHostKey = vm::trustUpdatedHostKey,
-            onDismissHostKeyWarning = vm::dismissHostKeyWarning,
-            onTrzszStartUpload = vm::trzszStartUpload,
-            onTrzszStartDownload = vm::trzszStartDownload,
-            onTrzszCancel = vm::trzszCancel,
-            onTrzszDismiss = vm::trzszDismiss,
-            onGetSessionLog = vm::getSessionLog,
-            onSendSnippet = vm::sendSnippet,
-            onRespondAgentSignRequest = vm::respondAgentSignRequest,
-        ),
-    )
-}
-
 /**
- * ターミナル画面の本体。[TerminalScreen](単一セッション、後方互換)と、複数タブ UI の
- * `TerminalTabScreen` の両方から共有される。
+ * ターミナル画面の本体。複数タブ UI の `TerminalTabScreen` から共有される。
  *
  * [isActive] が false の間は Canvas 描画・IME 入力欄を止める（Rust セッション自体は
  * 生きたまま）。スクロール位置・フォントスケール等のローカル状態は呼び出し側で
