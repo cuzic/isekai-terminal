@@ -53,6 +53,10 @@ data class ConnectionProfile(
     @ColumnInfo(name = "sort_order") val sortOrder: Int = 0,
     @ColumnInfo(name = "use_tsshd") val useTsshd: Boolean = false,
     @ColumnInfo(name = "tsshd_port") val tsshdPort: Int = DEFAULT_TSSHD_PORT,
+    // SSH agent forwarding。既定 OFF・プロファイル単位 opt-in（DESIGN.md では当初対象外
+    // だったが方針転換して追加）。有効にすると接続先サーバーが、転送された鍵での
+    // 署名をこのアプリに要求できるようになる（署名要求ごとにユーザー確認が必須）。
+    @ColumnInfo(name = "enable_agent_forward") val enableAgentForward: Boolean = false,
     // Phase 7: トランスポート戦略。DB には TransportPreference の name() を文字列で保存する。
     @ColumnInfo(name = "transport_preference") val transportPreferenceName: String = TransportPreference.PLAIN_SSH.name,
     // Phase 9: マルチパス(path1)用の直接到達アドレス。IsekaiHelperQuicMultipath 選択時のみ使う。
@@ -152,6 +156,7 @@ fun ConnectionProfile.toSshConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt = 
         cols = cols,
         rows = rows,
         forwards = forwards,
+        agentForward = enableAgentForward,
     )
 
 fun ConnectionProfile.toQuicConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt = 24u): QuicConfig =
