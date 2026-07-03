@@ -38,6 +38,7 @@ import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.input.TerminalInputView
 import tools.isekai.terminal.input.TerminalKeyEncoder
+import tools.isekai.terminal.ui.AgentSignConfirmDialog
 import tools.isekai.terminal.ui.AppColors
 import tools.isekai.terminal.ui.HostKeyChangedDialog
 import tools.isekai.terminal.ui.SelectionRange
@@ -100,6 +101,15 @@ fun TerminalScreen(
             warning = w,
             onAccept = { vm.trustUpdatedHostKey() },
             onReject = { vm.dismissHostKeyWarning() },
+        )
+    }
+
+    // SSH agent forwarding: 署名要求ごとの確認ダイアログ
+    uiState.agentSignRequestFingerprint?.let { fingerprint ->
+        AgentSignConfirmDialog(
+            fingerprint = fingerprint,
+            onApprove = { vm.respondAgentSignRequest(true) },
+            onReject = { vm.respondAgentSignRequest(false) },
         )
     }
 

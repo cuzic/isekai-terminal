@@ -311,6 +311,7 @@ class TerminalViewModel(
 
     fun trustUpdatedHostKey() = session.trustUpdatedHostKey()
     fun dismissHostKeyWarning() = session.dismissHostKeyWarning()
+    fun respondAgentSignRequest(approved: Boolean) = session.respondAgentSignRequest(approved)
     fun consumeDownloadFile() = session.consumeDownloadFile()
 
     fun getSessionLog(): String = session.log.value

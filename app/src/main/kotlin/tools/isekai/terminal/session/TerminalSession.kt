@@ -4,9 +4,11 @@ import tools.isekai.terminal.HostKeyChangedWarning
 import tools.isekai.terminal.TerminalUiState
 import tools.isekai.terminal.TrzszUiState
 import tools.isekai.terminal.util.RemoteLogger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -17,8 +19,11 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import uniffi.tssh_core.*
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * SSH セッションのドメインオブジェクト。
@@ -30,6 +35,12 @@ class TerminalSession(
     private val hostKeyChecker: HostKeyChecker,
     orchestratorFactory: (OrchestratorCallback) -> SessionOrchestratorInterface = { createSessionOrchestrator(it) },
 ) : AutoCloseable {
+
+    companion object {
+        // Rust 側（agent_forward.rs の SIGN_CONFIRM_TIMEOUT）の 30 秒より短くして、
+        // 先に Kotlin 側が拒否応答を確定できるようにする。
+        private const val AGENT_SIGN_CONFIRM_TIMEOUT_MS = 25_000L
+    }
 
     private val _state = MutableStateFlow(TerminalUiState())
     val state: StateFlow<TerminalUiState> = _state.asStateFlow()
@@ -49,6 +60,12 @@ class TerminalSession(
     private val screenUpdateChannel = Channel<ScreenUpdate>(Channel.CONFLATED)
 
     private val transferAccepted = AtomicBoolean(false)
+
+    // SSH agent forwarding: 署名要求ごとにユーザー確認を待つための橋渡し。
+    // Rust 側の spawn_blocking スレッドから onAgentSignRequest() が同期呼び出しされるため、
+    // ここで CompletableDeferred + runBlocking を使い、UI（respondAgentSignRequest 経由）から
+    // 応答が来るまでそのスレッドをブロックする（RealHostKeyChecker.check() と同じ設計）。
+    private val pendingAgentSignRequest = AtomicReference<CompletableDeferred<Boolean>?>(null)
 
     private val callback = object : OrchestratorCallback {
         override fun onConnectionStateChanged(state: ConnectionPublicState) {
@@ -147,6 +164,29 @@ class TerminalSession(
                     RemoteLogger.w("TsshSSH", "port forward '$id': failed: ${state.reason}")
                 is ForwardState.Stopped ->
                     RemoteLogger.i("TsshSSH", "port forward '$id': stopped")
+            }
+        }
+
+        // SSH agent forwarding: Rust 側の spawn_blocking スレッドから同期呼び出しされる。
+        // ユーザーが respondAgentSignRequest() を呼ぶまでこのスレッドをブロックして待つ。
+        // タイムアウト（Rust 側の 30 秒より短い 25 秒）した場合も拒否扱いにする。
+        override fun onAgentSignRequest(keyFingerprint: String): Boolean {
+            RemoteLogger.i("TsshSSH", "agent sign request: $keyFingerprint")
+            val deferred = CompletableDeferred<Boolean>()
+            pendingAgentSignRequest.set(deferred)
+            _state.update { it.copy(agentSignRequestFingerprint = keyFingerprint) }
+            return try {
+                runBlocking {
+                    try {
+                        withTimeout(AGENT_SIGN_CONFIRM_TIMEOUT_MS) { deferred.await() }
+                    } catch (e: TimeoutCancellationException) {
+                        RemoteLogger.w("TsshSSH", "agent sign request timed out — denying")
+                        false
+                    }
+                }
+            } finally {
+                pendingAgentSignRequest.set(null)
+                _state.update { it.copy(agentSignRequestFingerprint = null) }
             }
         }
     }
@@ -249,6 +289,15 @@ class TerminalSession(
     fun dismissHostKeyWarning() {
         _state.update { it.copy(hostKeyChangedWarning = null) }
         disconnect()
+    }
+
+    // ── SSH agent forwarding ──────────────────────────────────────────
+
+    /** ユーザーが署名確認ダイアログで承認/拒否を選んだ時に呼ぶ。応答が無ければ拒否扱い。 */
+    fun respondAgentSignRequest(approved: Boolean) {
+        val deferred = pendingAgentSignRequest.getAndSet(null) ?: return
+        _state.update { it.copy(agentSignRequestFingerprint = null) }
+        deferred.complete(approved)
     }
 
     // ── trzsz ─────────────────────────────────────────────────────────
