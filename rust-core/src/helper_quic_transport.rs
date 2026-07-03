@@ -586,6 +586,9 @@ async fn run_helper_quic_transport_auto(
                 auth: config.auth,
                 cols: config.cols,
                 rows: config.rows,
+                // HelperQuicConfig にはポートフォワード設定が無いため、フォールバック時は
+                // フォワード無しのプレーン SSH として接続する。
+                forwards: Vec::new(),
             };
             crate::run_russh_transport(ssh_config, cmd_rx, event_tx).await;
         }
@@ -622,6 +625,7 @@ mod tests {
         fn on_trzsz_progress(&self, _t: String, _tr: u64, _to: Option<u64>) {}
         fn on_trzsz_finished(&self, _t: String, _s: bool, _m: Option<String>) {}
         fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
     }
 
     #[tokio::test]

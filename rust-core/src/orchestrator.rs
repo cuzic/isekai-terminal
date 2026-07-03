@@ -103,12 +103,20 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
             Self::Quic(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
+            // ポートフォワードは MVP スコープ上プレーン SSH / tsshd QUIC のみ対応。
+            // isekai-helper 経由の QUIC 系トランスポートは未対応（対象外）。
+            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) => {
+                log::warn!("add_local_forward: not supported over helper-QUIC transports");
+            }
         }
     }
     fn remove_forward(&self, id: String) {
         match self {
             Self::Ssh(s) => s.remove_forward(id),
             Self::Quic(s) => s.remove_forward(id),
+            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) => {
+                log::warn!("remove_forward: not supported over helper-QUIC transports");
+            }
         }
     }
 }

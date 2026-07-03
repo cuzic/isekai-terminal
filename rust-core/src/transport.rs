@@ -323,6 +323,7 @@ mod local_forward_e2e_tests {
         fn on_data(&self, _data: Vec<u8>) {}
         fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
         fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
+        fn on_no_viable_path(&self) {}
         fn on_forward_state_changed(&self, id: String, state: ForwardState) {
             let _ = self.tx.send(TestEvent::Forward(id, state));
         }
