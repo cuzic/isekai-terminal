@@ -22,6 +22,15 @@ class TerminalInputView @JvmOverloads constructor(
     var applicationCursorMode: Boolean = false
     var bracketedPasteMode: Boolean = false
 
+    /**
+     * トグル式 Ctrl キーの武装状態。true の間に次に入力された 1 文字を
+     * Ctrl+<key> の制御コードに変換して送信する（表示専用の UI ローカル状態）。
+     */
+    var ctrlArmed: Boolean = false
+
+    /** Ctrl トグルが 1 文字を消費した（変換の成否に関わらず）ときに呼ばれる。UI 側で OFF 表示に戻す用。 */
+    var onCtrlConsumed: (() -> Unit)? = null
+
     init {
         isFocusable = true
         isFocusableInTouchMode = true

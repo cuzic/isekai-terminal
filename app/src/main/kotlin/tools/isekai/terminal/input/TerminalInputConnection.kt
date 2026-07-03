@@ -10,6 +10,20 @@ class TerminalInputConnection(
 
     override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
         val str = text?.toString() ?: return true
+        if (view.ctrlArmed) {
+            val codePoints = if (str.isEmpty()) 0 else str.codePointCount(0, str.length)
+            val ctrlBytes = if (codePoints == 1) TerminalKeyEncoder.ctrlByte(str.codePointAt(0)) else null
+            // 変換の成否に関わらずここで武装状態を消費する（押しっぱなし化防止）。
+            // Compose 側の状態も onCtrlConsumed() 経由で必ず OFF に戻す。
+            view.ctrlArmed = false
+            view.onCtrlConsumed?.invoke()
+            if (ctrlBytes != null) {
+                view.onComposingText?.invoke("")
+                view.onSendBytes?.invoke(ctrlBytes)
+                return true
+            }
+            // 変換不可（日本語確定等）: 通常のコミット処理にフォールスルーする
+        }
         view.onComposingText?.invoke("")
         if (str.isNotEmpty()) {
             val codePoints = str.codePointCount(0, str.length)
@@ -53,6 +67,17 @@ class TerminalInputConnection(
             TerminalKeyEncoder.specialKeyBytes(event.keyCode, view.applicationCursorMode)?.let {
                 view.onSendBytes?.invoke(it)
                 return true
+            }
+            // 物理 Ctrl 併用時はトグルを消費せず素通し（二重変換防止）
+            if (view.ctrlArmed && !event.isCtrlPressed) {
+                val ctrlBytes = TerminalKeyEncoder.ctrlByte(event.getUnicodeChar(0))
+                view.ctrlArmed = false
+                view.onCtrlConsumed?.invoke()
+                if (ctrlBytes != null) {
+                    view.onSendBytes?.invoke(ctrlBytes)
+                    return true
+                }
+                // 変換不可: 通常のキー処理にフォールスルーする
             }
             TerminalKeyEncoder.unicodeCharBytes(event.getUnicodeChar(event.metaState))?.let {
                 view.onSendBytes?.invoke(it)

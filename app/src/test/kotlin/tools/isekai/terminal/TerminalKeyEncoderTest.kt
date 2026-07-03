@@ -159,4 +159,51 @@ class TerminalKeyEncoderTest {
         val bytes = TerminalKeyEncoder.commitTextBytes(emoji, bracketedPasteMode = true)
         assertArrayEquals(emoji.toByteArray(Charsets.UTF_8), bytes)
     }
+
+    // ── ctrlByte（トグル式 Ctrl キー） ────────────────────────────
+
+    @Test
+    fun `lowercase a maps to 0x01`() {
+        assertArrayEquals(byteArrayOf(0x01), TerminalKeyEncoder.ctrlByte('a'.code))
+    }
+
+    @Test
+    fun `uppercase A maps to 0x01`() {
+        assertArrayEquals(byteArrayOf(0x01), TerminalKeyEncoder.ctrlByte('A'.code))
+    }
+
+    @Test
+    fun `lowercase z maps to 0x1A`() {
+        assertArrayEquals(byteArrayOf(0x1A), TerminalKeyEncoder.ctrlByte('z'.code))
+    }
+
+    @Test
+    fun `at sign maps to 0x00`() {
+        assertArrayEquals(byteArrayOf(0x00), TerminalKeyEncoder.ctrlByte('@'.code))
+    }
+
+    @Test
+    fun `open bracket maps to ESC 0x1B`() {
+        assertArrayEquals(byteArrayOf(0x1B), TerminalKeyEncoder.ctrlByte('['.code))
+    }
+
+    @Test
+    fun `question mark maps to DEL 0x7F`() {
+        assertArrayEquals(byteArrayOf(0x7F), TerminalKeyEncoder.ctrlByte('?'.code))
+    }
+
+    @Test
+    fun `space maps to NUL 0x00`() {
+        assertArrayEquals(byteArrayOf(0x00), TerminalKeyEncoder.ctrlByte(' '.code))
+    }
+
+    @Test
+    fun `digit returns null`() {
+        assertNull(TerminalKeyEncoder.ctrlByte('1'.code))
+    }
+
+    @Test
+    fun `japanese char returns null`() {
+        assertNull(TerminalKeyEncoder.ctrlByte('あ'.code))
+    }
 }

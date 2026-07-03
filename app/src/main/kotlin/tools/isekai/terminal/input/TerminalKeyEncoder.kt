@@ -51,6 +51,29 @@ object TerminalKeyEncoder {
     }
 
     /**
+     * トグル式 Ctrl キー用: 1 コードポイント→Ctrl+<key> の制御コード。
+     * 変換できない入力（数字・日本語・複数コードポイント等）は null を返し、
+     * 呼び出し側は変換せず元の入力をそのまま送信する。
+     *
+     * - a-z / A-Z → 0x01-0x1A (Ctrl+A=0x01 ... Ctrl+Z=0x1A)
+     * - @ [ \ ] ^ _ (0x40-0x5F) → その 5 bit 下位（Ctrl+@=0x00, Ctrl+[=ESC=0x1B 等）
+     * - ? (0x3F) → 0x7F (DEL)
+     * - スペース (0x20) → 0x00 (NUL)
+     * - 上記以外は null
+     */
+    fun ctrlByte(codePoint: Int): ByteArray? {
+        if (codePoint !in 0x20..0x7F) return null
+        val ch = codePoint.toChar()
+        return when {
+            ch in 'a'..'z' || ch in 'A'..'Z' -> byteArrayOf((ch.uppercaseChar().code and 0x1F).toByte())
+            codePoint in 0x40..0x5F -> byteArrayOf((codePoint and 0x1F).toByte())
+            ch == '?' -> byteArrayOf(0x7F.toByte())
+            ch == ' ' -> byteArrayOf(0x00)
+            else -> null
+        }
+    }
+
+    /**
      * IME 確定テキスト→バイト列。
      * 複数コードポイントかつ bracketedPasteMode が有効な場合のみブラケットペーストで囲む。
      * サロゲートペア（絵文字等）を正しく 1 コードポイントとして扱うため codePointCount を使用。

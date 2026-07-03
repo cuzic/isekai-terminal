@@ -240,4 +240,62 @@ class TerminalInputConnectionTest {
         connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
         assertTrue(sentBytes.isEmpty())
     }
+
+    // --- ctrlArmed (トグル式 Ctrl キー) ---
+
+    @Test
+    fun commitText_ctrlArmed_lowerA_sendsCtrlA_andDisarms() {
+        view.ctrlArmed = true
+        var consumed = false
+        view.onCtrlConsumed = { consumed = true }
+        connection.commitText("a", 1)
+        assertEquals(1, sentBytes.size)
+        assertArrayEquals(byteArrayOf(0x01), sentBytes[0])
+        assertTrue(consumed)
+        assertEquals(false, view.ctrlArmed)
+    }
+
+    @Test
+    fun commitText_ctrlArmed_japanese_fallsThroughRaw_andDisarms() {
+        view.ctrlArmed = true
+        var consumed = false
+        view.onCtrlConsumed = { consumed = true }
+        connection.commitText("あ", 1)
+        assertEquals(1, sentBytes.size)
+        assertArrayEquals("あ".toByteArray(Charsets.UTF_8), sentBytes[0])
+        assertTrue(consumed)
+        assertEquals(false, view.ctrlArmed)
+    }
+
+    @Test
+    fun commitText_ctrlNotArmed_plainCharSentRaw() {
+        connection.commitText("a", 1)
+        assertEquals(1, sentBytes.size)
+        assertArrayEquals("a".toByteArray(Charsets.UTF_8), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_ctrlArmed_physicalCtrlPressed_notConsumed() {
+        view.ctrlArmed = true
+        var consumed = false
+        view.onCtrlConsumed = { consumed = true }
+        val event = KeyEvent(
+            0L, 0L, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_A, 0, KeyEvent.META_CTRL_ON,
+        )
+        connection.sendKeyEvent(event)
+        // 物理 Ctrl 併用時はトグルを消費せず素通し（二重変換防止）
+        assertEquals(true, view.ctrlArmed)
+        assertEquals(false, consumed)
+    }
+
+    @Test
+    fun sendKeyEvent_ctrlArmed_plainKey_sendsCtrlByte_andDisarms() {
+        view.ctrlArmed = true
+        var consumed = false
+        view.onCtrlConsumed = { consumed = true }
+        keyDown(KeyEvent.KEYCODE_A)
+        assertArrayEquals(byteArrayOf(0x01), sentBytes[0])
+        assertTrue(consumed)
+        assertEquals(false, view.ctrlArmed)
+    }
 }

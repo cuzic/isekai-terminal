@@ -278,12 +278,15 @@ fun TerminalScreen(
                 // InputConnection ベースの入力経路（state は Row より前に宣言）
                 var composingText by remember { mutableStateOf("") }
                 var inputView by remember { mutableStateOf<tools.isekai.terminal.input.TerminalInputView?>(null) }
+                // トグル式 Ctrl キーの武装状態。UI 表示に閉じたローカル状態（rust-ssot.md の例外）。
+                var ctrlArmed by remember { mutableStateOf(false) }
 
                 // Ctrl キー行
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                 ) {
+                    CtrlBtn("Ctrl", active = ctrlArmed) { ctrlArmed = !ctrlArmed }
                     CtrlBtn("↵") { inputView?.commitComposing(); vm.send(byteArrayOf(0x0D)) }
                     CtrlBtn("Tab") { vm.send(byteArrayOf(0x09)) }
                     CtrlBtn("Esc") { vm.send(byteArrayOf(0x1B)) }
@@ -317,6 +320,8 @@ fun TerminalScreen(
                     update = { view ->
                         view.applicationCursorMode = screenUpdate?.applicationCursorMode ?: false
                         view.bracketedPasteMode = screenUpdate?.bracketedPasteMode ?: false
+                        view.ctrlArmed = ctrlArmed
+                        view.onCtrlConsumed = { ctrlArmed = false }
                         if (connected) {
                             view.post {
                                 view.requestFocus()
@@ -335,12 +340,15 @@ fun TerminalScreen(
 }
 
 @Composable
-private fun CtrlBtn(label: String, onClick: () -> Unit) {
+private fun CtrlBtn(label: String, active: Boolean = false, onClick: () -> Unit) {
     TextButton(
         onClick = onClick,
         contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
-        modifier = Modifier.background(Color(0xFF2A2A2A), shape = MaterialTheme.shapes.small),
+        modifier = Modifier.background(
+            if (active) Color(0xFF4A6A4A) else Color(0xFF2A2A2A),
+            shape = MaterialTheme.shapes.small,
+        ),
     ) {
-        Text(label, color = AppColors.MutedText, fontSize = 11.sp)
+        Text(label, color = if (active) Color.White else AppColors.MutedText, fontSize = 11.sp)
     }
 }
