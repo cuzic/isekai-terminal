@@ -3,6 +3,7 @@ uniffi::setup_scaffolding!("tssh_core");
 pub mod trzsz;
 pub mod quic_transport;
 pub(crate) mod terminal;
+pub(crate) mod theme;
 pub(crate) mod transport;
 pub(crate) mod session_state;
 pub(crate) mod session;
@@ -44,10 +45,25 @@ pub(crate) fn init_logger() {
 #[cfg(not(target_os = "android"))]
 pub(crate) fn init_logger() {}
 
-// ── 定数 ────────────────────────────────────────────────
+// ── ターミナル配色テーマ ──────────────────────────────────
+// 配色パレット自体（ANSI 16色・デフォルト fg/bg）は `theme` モジュールが
+// プロセス全体で共有するグローバル状態として保持する（`theme::Theme` 参照）。
+// ここではその差し替え用の UniFFI エントリポイントのみを公開する。
 
-pub(crate) const DEFAULT_FG: u32 = 0xFFCCCCCC;
-pub(crate) const DEFAULT_BG: u32 = 0xFF000000;
+/// ターミナルの配色テーマを差し替える（プロファイル毎ではなくグローバル設定）。
+///
+/// `ansi16` は SGR が参照する 16 色を ARGB（`0xAARRGGBB`）で `[normal 8色, bright 8色]`
+/// の順に渡す。16 個に満たない場合は残りを既定テーマの値で埋め、16 個を超える分は無視する。
+/// 呼び出し以降にパースされる SGR にのみ反映され、既に scrollback に積まれた行は
+/// 遡って再着色されない（既知の制約）。
+#[uniffi::export]
+pub fn set_terminal_theme(ansi16: Vec<u32>, default_fg: u32, default_bg: u32) {
+    let mut table = theme::Theme::default().ansi16;
+    for (slot, v) in table.iter_mut().zip(ansi16.into_iter()) {
+        *slot = v;
+    }
+    theme::set(theme::Theme { ansi16: table, default_fg, default_bg });
+}
 
 // ── 公開型 ──────────────────────────────────────────────
 

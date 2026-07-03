@@ -1,19 +1,11 @@
 use vte::Perform;
-use crate::{DEFAULT_FG, DEFAULT_BG};
+use crate::theme::{self, Theme};
 
-const ANSI_COLORS: [u32; 8] = [
-    0xFF000000, 0xFFAA0000, 0xFF00AA00, 0xFFAAAA00,
-    0xFF0000AA, 0xFFAA00AA, 0xFF00AAAA, 0xFFAAAAAA,
-];
-const ANSI_BRIGHT: [u32; 8] = [
-    0xFF555555, 0xFFFF5555, 0xFF55FF55, 0xFFFFFF55,
-    0xFF5555FF, 0xFFFF55FF, 0xFF55FFFF, 0xFFFFFFFF,
-];
-
-fn ansi256_to_argb(n: u8) -> u32 {
+/// `38;5;n` / `48;5;n`（indexed color）を ARGB へ解決する。
+/// `0..=15` は現在のテーマの ANSI 16色テーブルを参照する（それ以外は固定の 216色/グレースケール）。
+fn ansi256_to_argb(theme: &Theme, n: u8) -> u32 {
     match n {
-        0..=7   => ANSI_COLORS[n as usize],
-        8..=15  => ANSI_BRIGHT[(n - 8) as usize],
+        0..=15  => theme.ansi16[n as usize],
         16..=231 => {
             let n = n as u32 - 16;
             let r = (n / 36) * 51;
@@ -62,7 +54,8 @@ pub(crate) struct Terminal {
 
 impl Terminal {
     pub(crate) fn new(cols: usize, rows: usize) -> Self {
-        let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: DEFAULT_FG, bg: DEFAULT_BG, bold: false };
+        let theme = theme::current();
+        let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: theme.default_fg, bg: theme.default_bg, bold: false };
         let cells = vec![blank.clone(); cols * rows];
         Terminal {
             cols, rows,
@@ -72,7 +65,7 @@ impl Terminal {
             saved_cursor_main: None,
             saved_cursor_alt: None,
             cursor_row: 0, cursor_col: 0,
-            cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG, cur_bold: false,
+            cur_fg: theme.default_fg, cur_bg: theme.default_bg, cur_bold: false,
             scroll_top: 0, scroll_bottom: rows - 1,
             title: None,
             pending_scrollback: Vec::new(),
@@ -96,7 +89,8 @@ impl Terminal {
     pub(crate) fn screen_cells(&self) -> &[TermCell] { self.cells() }
 
     fn reset_all(&mut self) {
-        let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: DEFAULT_FG, bg: DEFAULT_BG, bold: false };
+        let theme = theme::current();
+        let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: theme.default_fg, bg: theme.default_bg, bold: false };
         let cells = vec![blank; self.cols * self.rows];
         self.main_cells = cells.clone();
         self.alt_cells = cells;
@@ -104,7 +98,7 @@ impl Terminal {
         self.saved_cursor_main = None;
         self.saved_cursor_alt = None;
         self.cursor_row = 0; self.cursor_col = 0;
-        self.cur_fg = DEFAULT_FG; self.cur_bg = DEFAULT_BG; self.cur_bold = false;
+        self.cur_fg = theme.default_fg; self.cur_bg = theme.default_bg; self.cur_bold = false;
         self.scroll_top = 0; self.scroll_bottom = self.rows - 1;
         self.title = None;
         self.application_cursor_mode = false;
@@ -135,15 +129,16 @@ impl Terminal {
                 self.cur_fg, self.cur_bg, self.cur_bold,
             ));
         }
+        let theme = theme::current();
         self.main_cells = self.cells().clone();
-        let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: DEFAULT_FG, bg: DEFAULT_BG, bold: false };
+        let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: theme.default_fg, bg: theme.default_bg, bold: false };
         self.alt_cells = vec![blank; self.cols * self.rows];
         self.alt_active = true;
         if save_cursor {
             self.cursor_row = 0;
             self.cursor_col = 0;
-            self.cur_fg = DEFAULT_FG;
-            self.cur_bg = DEFAULT_BG;
+            self.cur_fg = theme.default_fg;
+            self.cur_bg = theme.default_bg;
             self.cur_bold = false;
         }
         self.scroll_top = 0;
@@ -209,42 +204,45 @@ impl Terminal {
     }
 
     fn handle_sgr(&mut self, ps: &[u16]) {
+        // SGR 解決に使うテーブルはこの呼び出し時点のグローバルテーマから取得する
+        // （`set_terminal_theme` で差し替え可能。以前に解決済みのセルは遡って再着色されない）。
+        let theme = theme::current();
         if ps.is_empty() {
-            self.cur_fg = DEFAULT_FG;
-            self.cur_bg = DEFAULT_BG;
+            self.cur_fg = theme.default_fg;
+            self.cur_bg = theme.default_bg;
             self.cur_bold = false;
             return;
         }
         let mut i = 0;
         while i < ps.len() {
             match ps[i] {
-                0  => { self.cur_fg = DEFAULT_FG; self.cur_bg = DEFAULT_BG; self.cur_bold = false; }
+                0  => { self.cur_fg = theme.default_fg; self.cur_bg = theme.default_bg; self.cur_bold = false; }
                 1  => { self.cur_bold = true; }
                 22 => { self.cur_bold = false; }
-                30..=37 => { self.cur_fg = ANSI_COLORS[(ps[i] - 30) as usize]; }
+                30..=37 => { self.cur_fg = theme.ansi16[(ps[i] - 30) as usize]; }
                 38 => {
                     if ps.get(i + 1) == Some(&5) {
-                        if let Some(&n) = ps.get(i + 2) { self.cur_fg = ansi256_to_argb(n as u8); i += 2; }
+                        if let Some(&n) = ps.get(i + 2) { self.cur_fg = ansi256_to_argb(&theme, n as u8); i += 2; }
                     } else if ps.get(i + 1) == Some(&2) && i + 4 < ps.len() {
                         let (r, g, b) = (ps[i+2] as u32, ps[i+3] as u32, ps[i+4] as u32);
                         self.cur_fg = 0xFF000000 | (r << 16) | (g << 8) | b;
                         i += 4;
                     }
                 }
-                39 => { self.cur_fg = DEFAULT_FG; }
-                40..=47 => { self.cur_bg = ANSI_COLORS[(ps[i] - 40) as usize]; }
+                39 => { self.cur_fg = theme.default_fg; }
+                40..=47 => { self.cur_bg = theme.ansi16[(ps[i] - 40) as usize]; }
                 48 => {
                     if ps.get(i + 1) == Some(&5) {
-                        if let Some(&n) = ps.get(i + 2) { self.cur_bg = ansi256_to_argb(n as u8); i += 2; }
+                        if let Some(&n) = ps.get(i + 2) { self.cur_bg = ansi256_to_argb(&theme, n as u8); i += 2; }
                     } else if ps.get(i + 1) == Some(&2) && i + 4 < ps.len() {
                         let (r, g, b) = (ps[i+2] as u32, ps[i+3] as u32, ps[i+4] as u32);
                         self.cur_bg = 0xFF000000 | (r << 16) | (g << 8) | b;
                         i += 4;
                     }
                 }
-                49  => { self.cur_bg = DEFAULT_BG; }
-                90..=97  => { self.cur_fg = ANSI_BRIGHT[(ps[i] - 90) as usize]; }
-                100..=107 => { self.cur_bg = ANSI_BRIGHT[(ps[i] - 100) as usize]; }
+                49  => { self.cur_bg = theme.default_bg; }
+                90..=97  => { self.cur_fg = theme.ansi16[8 + (ps[i] - 90) as usize]; }
+                100..=107 => { self.cur_bg = theme.ansi16[8 + (ps[i] - 100) as usize]; }
                 _ => {}
             }
             i += 1;
@@ -403,6 +401,12 @@ mod tests {
     use vte::Parser;
     use proptest::prelude::*;
 
+    /// `theme::THEME` はプロセス全体で共有されるグローバル static であり、
+    /// `cargo test` はデフォルトでテストを複数スレッドで並行実行するため、
+    /// テーマの値そのものを検証するテスト同士が競合しないようこのロックで直列化する。
+    /// （テーマを直接読み書きしない大半のテストは対象外でよい）
+    static TEST_THEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn feed(t: &mut Terminal, bytes: &[u8]) {
         let mut p = Parser::new();
         for &b in bytes { p.advance(t, b); }
@@ -461,18 +465,50 @@ mod tests {
 
     #[test]
     fn test_sgr_ansi_color() {
+        let _guard = TEST_THEME_LOCK.lock().unwrap();
         let mut t = Terminal::new(80, 24);
         feed(&mut t, b"\x1b[31mA");  // red fg
         let c = &t.screen_cells()[0];
         assert_eq!(c.ch.as_str(), "A");
-        assert_eq!(c.fg, ANSI_COLORS[1]);  // ANSI red
+        assert_eq!(c.fg, Theme::default().ansi16[1]);  // ANSI red
     }
 
     #[test]
     fn test_sgr_reset() {
+        let _guard = TEST_THEME_LOCK.lock().unwrap();
         let mut t = Terminal::new(80, 24);
         feed(&mut t, b"\x1b[31m\x1b[0mB");
-        assert_eq!(t.screen_cells()[0].fg, DEFAULT_FG);
+        assert_eq!(t.screen_cells()[0].fg, Theme::default().default_fg);
+    }
+
+    #[test]
+    fn test_theme_switch_changes_sgr_resolution() {
+        // 案C: パレットは Rust 側のグローバルテーマとして差し替え可能。
+        // `theme::set()` 以降にパースされる SGR の色解決結果が変わることを検証する。
+        let _guard = TEST_THEME_LOCK.lock().unwrap();
+        let original = theme::current();
+
+        let mut custom = Theme::default();
+        custom.ansi16[1] = 0xFF123456;   // 赤(index 1)を差し替え
+        custom.default_fg = 0xFF111111;
+        custom.default_bg = 0xFF222222;
+        theme::set(custom);
+
+        // 差し替え後に作成した Terminal は新しいデフォルト色で初期化される
+        let mut t = Terminal::new(80, 24);
+        assert_eq!(t.screen_cells()[0].fg, 0xFF111111);
+        assert_eq!(t.screen_cells()[0].bg, 0xFF222222);
+
+        // 差し替え後にパースした SGR も新しいテーブルで解決される
+        feed(&mut t, b"\x1b[31mA");
+        assert_eq!(t.screen_cells()[0].fg, 0xFF123456);
+
+        // 256色パレットの 0..=15 部分も新テーブルを参照する
+        feed(&mut t, b"\r\x1b[38;5;1mB");
+        assert_eq!(t.screen_cells()[0].fg, 0xFF123456);
+
+        // 元に戻す（他のテストに影響を残さない）
+        theme::set(original);
     }
 
     #[test]

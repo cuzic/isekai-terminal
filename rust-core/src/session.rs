@@ -6,7 +6,7 @@ use log::{debug, info};
 use parking_lot::Mutex;
 use timed_fsm::TimerCommand;
 
-use crate::{CellData, ScreenUpdate, SessionCallback, DEFAULT_BG, DEFAULT_FG, RUNTIME};
+use crate::{CellData, ScreenUpdate, SessionCallback, RUNTIME};
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
 use crate::terminal::{TermCell, Terminal};
 use crate::transport::{SessionCmd, TransportCommand, TransportEvent};
@@ -117,9 +117,10 @@ impl SessionCore {
     }
 
     pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
+        let theme = crate::theme::current();
         let cols = *self.screen_cols.lock() as usize;
         let sb = self.scrollback.lock();
-        let blank = CellData { ch: " ".into(), fg: DEFAULT_FG, bg: DEFAULT_BG, bold: false };
+        let blank = CellData { ch: " ".into(), fg: theme.default_fg, bg: theme.default_bg, bold: false };
         let mut result = vec![blank; rows as usize * cols];
         for r in 0..rows as usize {
             let sb_idx = offset as usize + (rows as usize - 1 - r);
