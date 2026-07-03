@@ -28,6 +28,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -35,13 +36,48 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.util.RemoteLogger
+import uniffi.tssh_core.ForwardType
+import uniffi.tssh_core.PortForward
 import uniffi.tssh_core.TransportPreference
+
+/**
+ * ポートフォワード編集欄用の入力中ドラフト([PortForward] は bindPort/remotePort が
+ * UShort で空文字を表現できないため、テキスト入力中は String で持つ)。
+ */
+private data class ForwardDraft(
+    val bindAddress: String = "127.0.0.1",
+    val bindPort: String = "",
+    val remoteHost: String = "",
+    val remotePort: String = "",
+)
+
+private fun PortForward.toDraft() = ForwardDraft(
+    bindAddress = bindAddress,
+    bindPort = bindPort.toString(),
+    remoteHost = remoteHost,
+    remotePort = remotePort.toString(),
+)
+
+/** remoteHost 未入力や不正なポート番号の行は保存対象から除外する。 */
+private fun ForwardDraft.toPortForwardOrNull(): PortForward? {
+    val bp = bindPort.toIntOrNull() ?: return null
+    val rp = remotePort.toIntOrNull() ?: return null
+    if (remoteHost.isBlank() || bp !in 1..65535 || rp !in 1..65535) return null
+    return PortForward(
+        forwardType = ForwardType.LOCAL,
+        bindAddress = bindAddress.ifBlank { "127.0.0.1" },
+        bindPort = bp.toUShort(),
+        remoteHost = remoteHost,
+        remotePort = rp.toUShort(),
+    )
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,6 +104,11 @@ fun ProfileEditScreen(
     var cellularRemoteAddress by remember { mutableStateOf(profile?.cellularRemoteAddress ?: "") }
     var enableUpstreamFailover by remember { mutableStateOf(profile?.enableUpstreamFailover ?: false) }
     var postConnectCommands by remember { mutableStateOf(profile?.postConnectCommands ?: "") }
+    val forwardDrafts = remember {
+        mutableStateListOf<ForwardDraft>().apply {
+            profile?.forwards?.forEach { add(it.toDraft()) }
+        }
+    }
 
     val selectedKeyLabel = keys.firstOrNull { it.id == keyId }?.label ?: "鍵を選択"
     val canSave = label.isNotBlank() && host.isNotBlank() && username.isNotBlank() &&
@@ -310,6 +351,76 @@ fun ProfileEditScreen(
             fontSize = 12.sp,
         )
 
+        Spacer(Modifier.height(4.dp))
+
+        Text("ポートフォワード", fontWeight = FontWeight.Bold)
+        Text(
+            "接続確立後、指定したローカルポートへの接続をリモートホストへ中継します(現状は -L のみ対応)。",
+            fontSize = 12.sp,
+        )
+
+        forwardDrafts.forEachIndexed { index, draft ->
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text("ローカルフォワード #${index + 1}(種別: ローカル -L)")
+                    OutlinedButton(onClick = { forwardDrafts.removeAt(index) }) { Text("削除") }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = draft.bindAddress,
+                        onValueChange = { new -> forwardDrafts[index] = draft.copy(bindAddress = new) },
+                        label = { Text("待受アドレス") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    OutlinedTextField(
+                        value = draft.bindPort,
+                        onValueChange = { new -> forwardDrafts[index] = draft.copy(bindPort = new.filter { it.isDigit() }.take(5)) },
+                        label = { Text("待受ポート") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                if (draft.bindAddress.isNotBlank() &&
+                    draft.bindAddress != "127.0.0.1" && draft.bindAddress != "localhost"
+                ) {
+                    Text(
+                        "⚠ 同一 Wi-Fi/LAN 上の第三者からアクセスされうる待受アドレスです。",
+                        color = Color(0xFFB00020),
+                        fontSize = 12.sp,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = draft.remoteHost,
+                        onValueChange = { new -> forwardDrafts[index] = draft.copy(remoteHost = new) },
+                        label = { Text("転送先ホスト") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    OutlinedTextField(
+                        value = draft.remotePort,
+                        onValueChange = { new -> forwardDrafts[index] = draft.copy(remotePort = new.filter { it.isDigit() }.take(5)) },
+                        label = { Text("転送先ポート") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        }
+
+        OutlinedButton(onClick = { forwardDrafts.add(ForwardDraft()) }) {
+            Text("+ ポートフォワードを追加")
+        }
+
         Spacer(Modifier.height(8.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -332,6 +443,7 @@ fun ProfileEditScreen(
                         cellularRemoteAddress = cellularRemoteAddress.trim().takeIf { it.isNotBlank() },
                         enableUpstreamFailover = enableUpstreamFailover,
                         postConnectCommands = postConnectCommands.trim().takeIf { it.isNotEmpty() },
+                        forwards = forwardDrafts.mapNotNull { it.toPortForwardOrNull() },
                     )
                     vm.save(saved) { onSave() }
                 },

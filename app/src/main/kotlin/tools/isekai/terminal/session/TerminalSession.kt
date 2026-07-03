@@ -138,6 +138,17 @@ class TerminalSession(
             RemoteLogger.w("TsshSSH", "no viable path (QUIC sees no response on any path)")
             _noViablePathEvent.tryEmit(Unit)
         }
+
+        override fun onForwardStateChanged(id: String, state: ForwardState) {
+            when (state) {
+                is ForwardState.Listening ->
+                    RemoteLogger.i("TsshSSH", "port forward '$id': listening")
+                is ForwardState.Failed ->
+                    RemoteLogger.w("TsshSSH", "port forward '$id': failed: ${state.reason}")
+                is ForwardState.Stopped ->
+                    RemoteLogger.i("TsshSSH", "port forward '$id': stopped")
+            }
+        }
     }
 
     private val orchestrator: SessionOrchestratorInterface = orchestratorFactory(callback)
