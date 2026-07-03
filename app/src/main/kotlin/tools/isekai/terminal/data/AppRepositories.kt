@@ -49,6 +49,19 @@ class KeyEntryRepository(private val dao: KeyEntryDao) {
     suspend fun findById(id: Long): KeyEntry? = dao.findById(id)
 }
 
+class SnippetRepository(private val dao: SnippetDao) {
+    suspend fun getAll(): List<Snippet> = dao.getAll()
+
+    // profileId が null の場合は特定プロファイルに紐付けようがないので、全共通スニペットのみ返す。
+    suspend fun getForProfile(profileId: Long?): List<Snippet> =
+        if (profileId == null || profileId == 0L) dao.getAll().filter { it.profileId == null }
+        else dao.getForProfile(profileId)
+
+    suspend fun save(snippet: Snippet): Long = dao.upsert(snippet)
+    suspend fun delete(snippet: Snippet) = dao.delete(snippet)
+    suspend fun findById(id: Long): Snippet? = dao.findById(id)
+}
+
 object Repositories {
     private var _db: AppDatabase? = null
 
@@ -60,4 +73,5 @@ object Repositories {
     val knownHosts get() = KnownHostRepository(db.knownHostDao())
     val profiles get() = ConnectionProfileRepository(db.connectionProfileDao())
     val keys get() = KeyEntryRepository(db.keyEntryDao())
+    val snippets get() = SnippetRepository(db.snippetDao())
 }
