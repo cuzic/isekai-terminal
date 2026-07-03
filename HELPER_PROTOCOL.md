@@ -231,3 +231,163 @@ Phase 8（opaque SSH byte-stream resume proxy）は、この契約の `0x03 RESU
 `session_id` の概念を新設して拡張する形になる見込み。Phase 7 の helper は `0x03` を安全に拒否
 （`0xFD`）するため、Phase 8 未対応の helper に Phase 8 対応クライアントが誤って resume を試みても、
 クラッシュやハングではなく明確な拒否応答が返る。
+
+---
+
+## 7. Phase 8: resume プロトコル契約（Phase 8-0 成果物）
+
+PLAN.md の「Phase 8: Opaque SSH byte-stream resume proxy」で定義した設計を、実装可能なワイヤー
+フォーマットまで落とし込む。位置づけ・成立条件・非ゴールは PLAN.md 側の記述が正なので、ここでは
+**ワイヤー上の契約**（フレーム形式・オフセット定義・ハンドシェイク手順）のみを定義する。
+
+### 7.1 2ストリーム構成への変更
+
+Phase 7 は「1 QUIC connection につき data stream 1本のみ」（§4）だったが、Phase 8 ではこれを
+**2 stream 構成**に変更する:
+
+| stream | 用途 | フレーミング |
+|---|---|---|
+| data stream | SSH の opaque バイト列を中継する（Phase 7 の HELLO/ACK 後と同じ、生の双方向パイプ） | フレーム無し（raw） |
+| control stream | `APP_ACK` / `RESUME` / `RESUME_ACK` の交換専用 | 固定長フレーム（後述） |
+
+data stream を raw pipe のまま維持するのは、ACK 用のフレーミングをホットパス（SSH の実データ）に
+混ぜるとレイテンシ・実装複雑度の両面で不利なため。control stream は帯域を必要としない小さい
+固定長フレームのみを扱うため、独立させても実装が単純になる。
+
+`max_concurrent_bidi_streams` は Phase 7 の `1` から `2` に変更する（`max_concurrent_uni_streams`
+は `0` のまま）。3本目以降の stream は Phase 7 と同様 reset する。
+
+**接続確立順序**:
+1. data stream を open し、Phase 7 §4 の HELLO/ACK を行う（既存のまま、無変更）。
+2. ACK 受信後、client は control stream を新規に open し、`CONTROL_HELLO` フレームを送る
+   （後述）。helper が `session_id` を発行して `CONTROL_ACK` を返す。
+3. 以降、data stream は raw pipe、control stream は `APP_ACK` の定期交換に使う。
+
+初回接続（resume ではない、新規セッション）でも control stream は必ず開く。session_id は
+resume 時だけでなく、通常運用中もログ・診断のために存在する。
+
+### 7.2 session_id とオフセットの定義
+
+`session_id`: helper が `CONTROL_HELLO` 受信時に生成する 16 byte のランダム値。同一 helper
+プロセス内でアクティブな resume 可能セッションを一意に識別する（`session_secret` とは別物 —
+`session_secret` は起動ごとに 1 つだが `session_id` は接続ごとに発行する）。
+
+4 つのオフセット（すべて起点 0、単位はバイト、`u64`、data stream 上での論理位置）:
+
+| オフセット | 管理主体 | 意味 |
+|---|---|---|
+| `client_sent_offset` | client | data stream へ実際に書き込んだ（QUIC に渡した）累計バイト数 |
+| `helper_committed_offset` | helper | data stream から読み、`--target` の TCP socket へ **書き込み成功した**累計バイト数（C→S） |
+| `helper_sent_offset` | helper | data stream へ実際に書き込んだ累計バイト数 |
+| `client_delivered_offset` | client | data stream から読み、russh（の下位 transport）へ **引き渡し成功した**累計バイト数（S→C） |
+
+`committed`/`delivered` は「QUIC が ACK した」ではなく「アプリ層が実際に処理した」ことを意味する
+（PLAN.md §実装上の難所の区別をそのまま踏襲）。QUIC 自体の ACK は quinn 内部で完結しており
+アプリケーションはこれを意識しない。
+
+### 7.3 control stream フレーム形式
+
+すべて固定長。マルチバイト整数は big-endian。
+
+**`CONTROL_HELLO`**（client → helper、control stream 先頭）:
+```
+byte 0:      0x10 (CONTROL_HELLO)
+byte 1..33:  proof（Phase 7 §4 と同じ HELLO の proof を再利用。同一 QUIC connection の
+             exporter から計算するため、data stream の HELLO と同じ値になる）
+```
+data stream の HELLO で既に認証済みの QUIC connection 上の control stream なので、
+再認証というより「この control stream が正しい connection に属することの確認」目的。
+
+**`CONTROL_ACK`**（helper → client、応答）:
+```
+byte 0:      0x11 (CONTROL_ACK)
+byte 1..17:  session_id（16 byte）
+```
+
+**`APP_ACK`**（双方向、いつでも送信可）:
+```
+byte 0:      0x12 (APP_ACK)
+byte 1..9:   自分が確認した相手方向のオフセット（u64）
+             client → helper の場合: client_delivered_offset（S→C の受信確認）
+             helper → client の場合: helper_committed_offset（C→S の受信確認）
+```
+送信タイミングは実装判断（例: 64KiB 受信ごと、または 200ms ごとのどちらか早い方）。
+`APP_ACK` はベストエフォートであり、紛失しても次の `APP_ACK` が新しい（より進んだ）オフセットを
+運ぶため実害はない（累積値であり差分ではないため）。
+
+**`RESUME`**（client → helper、新しい QUIC connection の control stream 先頭）:
+```
+byte 0:      0x03 (RESUME)  ※ HELPER_PROTOCOL.md §4 で Phase 8 用に予約済みの値
+byte 1..17:  session_id（16 byte、resume 対象）
+byte 17..49: resume_proof（32 byte）
+byte 49..57: client_sent_offset（u64）
+byte 57..65: client_delivered_offset（u64）
+```
+`resume_proof = HMAC-SHA256(session_secret, exporter || session_id)`
+（`exporter` は **新しい** QUIC connection の `export_keying_material(label = b"isekai-helper-resume-v1", context = "", length = 32)`。
+`session_id` を HMAC 対象に含めることで、同じ `session_secret` を使い回す複数セッションが
+互いの resume トークンを流用できないようにする）
+
+**`RESUME_ACK`**（helper → client、応答）:
+```
+byte 0:      0x13 (RESUME_ACK)
+byte 1..9:   helper_committed_offset（u64） — client はこれ以降を input replay buffer から再送する
+byte 9..17:  helper_sent_offset（u64） — 参考値（client 側の整合性チェック用）
+```
+この直後、helper は `[client_delivered_offset, helper_sent_offset)` の範囲を output buffer から
+data stream に再送する。client は `RESUME_ACK` 受信後、`[helper_committed_offset, client_sent_offset)`
+の範囲を input replay buffer から data stream に再送する。両者は独立して並行に進めてよい
+（どちらかの再送が先に終わるのを待つ必要はない）。
+
+**`RESUME` の拒否応答**（helper → client、`RESUME` に対して。既存の `0xFC`/`0xFD`/`0xFF` を再利用し、
+Phase 8 固有の意味を追加する）:
+
+| 値 | 意味 |
+|---|---|
+| `0xFF` (REJECT_AUTH) | `resume_proof` が不正 |
+| `0xF9` (REJECT_UNKNOWN_SESSION) | `session_id` が存在しない（helper 再起動・タイムアウト等で
+  セッション情報が失われた）。client は Phase 7 の通常ブートストラップからやり直す以外に手段がない |
+| `0xF8` (REJECT_OFFSET_GONE) | 要求された offset がすでに helper 側バッファの範囲外（バッファ
+  上限超過で古いデータを破棄済み）。`REJECT_UNKNOWN_SESSION` と同様、再送不能なので resume を諦める |
+
+### 7.4 バッファ契約（Phase 8-1 / 8-2 の前提）
+
+- helper 側 output buffer（S→C 再送用）: 上限サイズを設ける（既定案 4MiB、`--resume-buffer-size`
+  で変更可能とする）。上限到達時は `--target` からの読み込みを止める（TCP backpressure、PLAN.md
+  「実装上の難所」通り）。バッファから追い出した範囲を resume 要求された場合は `REJECT_OFFSET_GONE`。
+- client 側 input replay buffer（C→S 再送用）: 同様に上限を設ける。russh が生成する送信バイトは
+  ほぼ全てユーザー入力起因で小さいため、helper 側ほど肥大化しにくいが、trzsz アップロード中は
+  大きくなり得るため上限は必須。
+- 両バッファとも `helper_committed_offset` / `client_delivered_offset` より前のデータは
+  安全に破棄してよい（相手が受け取り確認済みのため）。`APP_ACK` を受信するたびに破棄範囲を進める。
+
+### 7.5 session_id のライフサイクル
+
+- helper プロセスが再起動すれば全 `session_id` は失われる（`REJECT_UNKNOWN_SESSION` で表現）。
+- helper 側は `session_id` ごとに「data stream が閉じてから resume 待ちを続ける時間」の上限を
+  `--resume-window`（既定120秒）で持つ。この時間を過ぎたら output buffer を破棄し
+  `session_id` を無効化する。
+- 1 つの `session_id` に対して同時に有効な data stream は 1 本のみ（Phase 7 の active slot 概念を
+  session 単位に引き継ぐ）。
+- **`--idle-timeout`（QUIC transport の生存確認）と `--resume-window`（park セッションの保持時間）は
+  意図的に別の値にしてある**（Phase 8-4b、実機検証で発見）。当初はこの2つを同じ値で共用していたが、
+  client が QUIC connection の喪失を検知するまでの時間（`--idle-timeout` 待ち + PTO 再送、実測で
+  40秒前後かかることを確認）が、helper 側の park 保持時間（当時30秒）を上回ってしまい、
+  「client が reattach を試みる頃には既に helper が session を破棄済み」という理由で
+  **reattach が必ず `REJECT_UNKNOWN_SESSION` になる**致命的なタイミング不整合が起きていた。
+  client 側（`helper_quic_transport.rs`）にも `keep_alive_interval`（NAT UDP マッピング維持、
+  5秒間隔）と短い `max_idle_timeout`（15秒）を設定し検知を高速化した上で、`--resume-window`
+  を検知時間 + reattach のリトライ予算より十分長い既定値にしてこの2つを分離した。
+  なお実機での追加検証（大量出力中の切断）で、reattach が失敗する各試行自体も
+  `--idle-timeout` と同じ長さ（quinn が handshake タイムアウトとして内部的に流用する
+  ため）だけブロックすることが判明し、5回全滅する最悪ケースの合計時間は
+  「指数バックオフの15秒」ではなく実測で約90秒（15秒×4回失敗 + バックオフ計15秒）
+  かかることを確認した。ちょうど90秒だとマージンが薄いため、`--resume-window` の
+  既定値は120秒にしてある。
+
+### 7.6 Phase 7 との互換性
+
+Phase 7 のみ対応の helper（`0x03` を `0xFD` で拒否する版）に対して Phase 8 対応 client が接続した
+場合: client はまず通常の HELLO/ACK（data stream）を試み、成功後に control stream を開こうとするが
+`max_concurrent_bidi_streams=1` の制限で reset される。client はこれを「resume 非対応の helper」と
+解釈し、control stream 無しの Phase 7 動作（resume 機能無効）にフォールバックする。
