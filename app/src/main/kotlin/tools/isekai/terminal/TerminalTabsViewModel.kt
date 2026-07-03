@@ -8,6 +8,7 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,17 +18,26 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
+import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.data.toHelperQuicConfig
+import tools.isekai.terminal.data.toMultipathHelperQuicConfig
 import tools.isekai.terminal.data.toQuicConfig
 import tools.isekai.terminal.data.toSshConfig
 import tools.isekai.terminal.session.AndroidAppExecutor
 import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.AuthValidation
 import tools.isekai.terminal.session.AuthValidator
+import tools.isekai.terminal.session.PhysicalMultipathFds
 import tools.isekai.terminal.session.RealHostKeyChecker
 import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.tssh_core.CellData
+import uniffi.tssh_core.HelperQuicConfig
+import uniffi.tssh_core.MultipathHelperQuicConfig
+import uniffi.tssh_core.QuicConfig
 import uniffi.tssh_core.SshAuth
+import uniffi.tssh_core.SshConfig
+import uniffi.tssh_core.TransportPreference
 
 /**
  * 複数タブ（複数 SSH/QUIC セッション）を横断する Activity/Application スコープの状態管理。
@@ -38,6 +48,17 @@ import uniffi.tssh_core.SshAuth
  * にそのまま委譲し、[TerminalSession] 自体は無改修で複数インスタンス生成するだけに留める
  * （Rust の [uniffi.tssh_core.SessionOrchestratorInterface] もグローバル状態を持たない設計
  * のため、UniFFI 側の変更は不要）。
+ *
+ * 単一セッション時代の [TerminalViewModel] が持っていた全トランスポート分岐・スニペット・
+ * 接続後自動実行コマンド・upstream フェイルオーバー・agent forwarding 確認は、ここでは
+ * タブ([TabState])単位の状態として複製する。
+ *
+ * 既知の制約: 物理マルチパス fd 取得(`acquirePhysicalMultipathFds`)・upstream フェイルオーバー
+ * 監視(`registerUpstreamFailoverMonitor`)は [AppExecutor] 側がプロセス単位のグローバル API
+ * （タブ単位に分離されていない）であるため、複数タブが同時に
+ * `ISEKAI_HELPER_QUIC_MULTIPATH` + 物理マルチパス/upstream フェイルオーバーを有効にした場合は
+ * 後勝ちになる。単一セッション設計時点からの既存の制約であり、このタブ機能追加で新たに
+ * 生まれたものではない。
  */
 class TerminalTabsViewModel(
     app: Application,
@@ -52,9 +73,15 @@ class TerminalTabsViewModel(
         { TerminalSession(RealHostKeyChecker(Repositories.knownHosts)) },
     )
 
+    companion object {
+        // Connected 直後は取りこぼし防止のため少し待ってから自動実行コマンドを送る。
+        private const val POST_CONNECT_DEBOUNCE_MS = 400L
+    }
+
     /**
      * 1タブ分の状態。ドメイン状態の SSOT はあくまで [session]（ひいては Rust 側）であり、
-     * ここで保持するのは接続前バリデーションエラーなど Kotlin ローカルの補助状態のみ。
+     * ここで保持するのは接続前バリデーションエラー・スニペット一覧・接続後自動実行コマンドの
+     * 送信フラグなど Kotlin ローカルの補助状態のみ。
      */
     class TabState internal constructor(
         val tabId: String,
@@ -66,6 +93,17 @@ class TerminalTabsViewModel(
         internal val preConnectError = MutableStateFlow<String?>(null)
         // trzsz アップロードの二重起動防止 (Bug 2 と同種のガード。タブごとに独立させる)。
         internal val uploadInProgress = AtomicBoolean(false)
+
+        // ── 定型コマンド（スニペット）─────────────────────────────
+        internal val snippets = MutableStateFlow<List<Snippet>>(emptyList())
+
+        // ── 接続後自動実行コマンド ────────────────────────────────
+        internal var pendingPostConnectBytes: ByteArray? = null
+        internal val postConnectSent = AtomicBoolean(true)
+
+        // ── upstream フェイルオーバー ────────────────────────────
+        internal var upstreamFailoverEnabledForCurrentSession = false
+        internal val rebindInFlight = AtomicBoolean(false)
 
         /** UI が購読する合成済み状態。 */
         val uiState: Flow<TerminalUiState> = session.state.combine(preConnectError) { s, err ->
@@ -79,7 +117,7 @@ class TerminalTabsViewModel(
     private val _activeTabId = MutableStateFlow<String?>(null)
     val activeTabId: StateFlow<String?> = _activeTabId.asStateFlow()
 
-    // タブごとの監視コルーチン（通知集約の再計算・ダウンロード完了ファンアウト）。closeTab で cancel する。
+    // タブごとの監視コルーチン（通知集約の再計算・ダウンロード完了ファンアウト・接続状態遷移）。closeTab で cancel する。
     private val watchJobs = mutableMapOf<String, Job>()
 
     init {
@@ -124,6 +162,10 @@ class TerminalTabsViewModel(
         tab.session.disconnect()
         tab.session.close()
         watchJobs.remove(tabId)?.cancel()
+        if (tab.upstreamFailoverEnabledForCurrentSession) {
+            executor.releasePhysicalMultipathFds()
+            executor.unregisterUpstreamFailoverMonitor()
+        }
 
         _tabs.update { list -> list.filterNot { it.tabId == tabId } }
         if (_activeTabId.value == tabId) {
@@ -138,7 +180,11 @@ class TerminalTabsViewModel(
 
     private fun tabOrNull(tabId: String): TabState? = _tabs.value.find { it.tabId == tabId }
 
-    /** タブ固有の監視: 通知集約の再計算と、ダウンロード完了ファイルの保存。非アクティブでも動き続ける。 */
+    /**
+     * タブ固有の監視: 通知集約の再計算・ダウンロード完了ファイルの保存・
+     * 接続状態遷移(Connected 立ち上がりでの自動実行コマンド送信・切断時の後始末)・
+     * upstream フェイルオーバーの `NoViablePath` 検知。非アクティブでも動き続ける。
+     */
     private fun watchTab(tab: TabState) {
         watchJobs[tab.tabId] = viewModelScope.launch {
             launch { tab.session.state.collect { updateSessionsSummary() } }
@@ -149,6 +195,30 @@ class TerminalTabsViewModel(
                     tab.session.consumeDownloadFile()
                 }
             }
+            launch {
+                tab.session.noViablePathEvent.collect {
+                    if (tab.upstreamFailoverEnabledForCurrentSession) onWifiUpstreamBroken(tab)
+                }
+            }
+            launch {
+                var prevConnected = false
+                tab.uiState.collect { state ->
+                    val connected = state.connected
+                    if (connected && !prevConnected) {
+                        executor.notifyConnected(state.currentHost ?: "")
+                        if (tab.upstreamFailoverEnabledForCurrentSession) {
+                            executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(tab) }
+                        }
+                        maybeSendPostConnectCommands(tab)
+                    } else if (!connected && prevConnected) {
+                        executor.notifyDisconnected()
+                        executor.releasePhysicalMultipathFds()
+                        executor.unregisterUpstreamFailoverMonitor()
+                        tab.upstreamFailoverEnabledForCurrentSession = false
+                    }
+                    prevConnected = connected
+                }
+            }
         }
     }
 
@@ -156,6 +226,32 @@ class TerminalTabsViewModel(
         val tabs = _tabs.value
         val connected = tabs.count { it.session.state.value.connected }
         executor.updateSessionsSummary(connected, tabs.size)
+    }
+
+    // ── upstream フェイルオーバー ────────────────────────────────────
+
+    /**
+     * 「WiFiは繋がっているがupstreamが死んでいる」を検知した際の処理。
+     * セルラーへの bindSocket 済み fd を取得できたら `rebindToFd` でendpointの
+     * ソケットを丸ごと差し替える。取得できなければ何もしない（日和見的ポリシー）。
+     * [TabState.rebindInFlight] で多重発火（capabilities変化の連続通知等）を防ぐ。
+     */
+    private fun onWifiUpstreamBroken(tab: TabState) {
+        if (!tab.rebindInFlight.compareAndSet(false, true)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val cellular = executor.acquireCellularFd()
+                if (cellular == null) {
+                    RemoteLogger.w("TsshSSH", "upstream failover: cellular fd not available, staying on current path")
+                    return@launch
+                }
+                val (fd, localIp) = cellular
+                RemoteLogger.i("TsshSSH", "upstream failover: rebinding to cellular (localIp=$localIp)")
+                tab.session.rebindToFd(fd, localIp)
+            } finally {
+                tab.rebindInFlight.set(false)
+            }
+        }
     }
 
     // ── 接続 ─────────────────────────────────────────────────────────
@@ -170,18 +266,59 @@ class TerminalTabsViewModel(
         val current = tab.session.state.value
         if (current.connected || current.isConnecting) return
         tab.preConnectError.value = null
+        armPostConnectCommands(tab, profile)
+        loadSnippets(tab.tabId, profile.id)
         RemoteLogger.i(
             "TsshSSH",
-            "connectTab[${tab.tabId}]: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} quic=${profile.useTsshd}",
+            "connectTab[${tab.tabId}]: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} " +
+                "transport=${profile.transportPreference}",
         )
         viewModelScope.launch(Dispatchers.IO) {
             val auth = resolveAuth(tab, profile, password) ?: return@launch
-            if (profile.useTsshd) {
-                tab.session.connectQuic(profile.toQuicConfig(auth))
-            } else {
-                tab.session.connect(profile.toSshConfig(auth))
+            when (profile.transportPreference) {
+                TransportPreference.PLAIN_SSH -> connect(tab, profile.toSshConfig(auth))
+                TransportPreference.TSSHD_QUIC -> connectQuic(tab, profile.toQuicConfig(auth))
+                TransportPreference.ISEKAI_HELPER_QUIC -> connectHelperQuic(tab, profile.toHelperQuicConfig(auth))
+                TransportPreference.AUTO -> connectHelperQuicAuto(tab, profile.toHelperQuicConfig(auth))
+                TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH -> {
+                    // Phase 9-4（実験的機能）: 有効化されていれば物理Wi-Fi/セルラーの
+                    // fdも取得してから接続する。取得に失敗/未取得でも例外にはせず、
+                    // path0/path1のみのマルチパスにフォールバックする（日和見的ポリシー）。
+                    val physicalFds = if (profile.enablePhysicalMultipath) {
+                        executor.acquirePhysicalMultipathFds()
+                    } else {
+                        PhysicalMultipathFds()
+                    }
+                    tab.upstreamFailoverEnabledForCurrentSession = profile.enableUpstreamFailover
+                    connectMultipathHelperQuic(tab, profile.toMultipathHelperQuicConfig(auth, physicalFds))
+                }
             }
         }
+    }
+
+    private fun connect(tab: TabState, config: SshConfig) {
+        executor.ensureServiceRunning()
+        tab.session.connect(config)
+    }
+
+    private fun connectQuic(tab: TabState, config: QuicConfig) {
+        executor.ensureServiceRunning()
+        tab.session.connectQuic(config)
+    }
+
+    private fun connectHelperQuic(tab: TabState, config: HelperQuicConfig) {
+        executor.ensureServiceRunning()
+        tab.session.connectHelperQuic(config)
+    }
+
+    private fun connectHelperQuicAuto(tab: TabState, config: HelperQuicConfig) {
+        executor.ensureServiceRunning()
+        tab.session.connectHelperQuicAuto(config)
+    }
+
+    private fun connectMultipathHelperQuic(tab: TabState, config: MultipathHelperQuicConfig) {
+        executor.ensureServiceRunning()
+        tab.session.connectMultipathHelperQuic(config)
     }
 
     private suspend fun resolveAuth(tab: TabState, profile: ConnectionProfile, password: String?): SshAuth? {
@@ -204,6 +341,41 @@ class TerminalTabsViewModel(
                 null
             }
 
+    // ── 定型コマンド（スニペット）─────────────────────────────────
+
+    /** [profileId] が null なら全プロファイル共通のスニペットのみ、非nullなら共通＋専用をマージして読み込む。 */
+    fun loadSnippets(tabId: String, profileId: Long?) {
+        val tab = tabOrNull(tabId) ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            tab.snippets.value = Repositories.snippets.getForProfile(profileId)
+        }
+    }
+
+    fun sendSnippet(tabId: String, snippet: Snippet) {
+        RemoteLogger.i("TsshSnippet", "send snippet '${snippet.label}' id=${snippet.id} tab=$tabId")
+        send(tabId, SnippetCommands.toBytes(snippet))
+    }
+
+    // ── 接続後自動実行コマンド ────────────────────────────────────
+
+    /** 新しい接続試行のたびに呼び、この接続で送るべきコマンド（あれば）とフラグをリセットする。 */
+    private fun armPostConnectCommands(tab: TabState, profile: ConnectionProfile) {
+        val commands = profile.postConnectCommands?.takeIf { it.isNotBlank() }
+        tab.pendingPostConnectBytes = commands?.let { SnippetCommands.toBytes(it, appendNewline = true) }
+        tab.postConnectSent.set(tab.pendingPostConnectBytes == null)
+    }
+
+    /** Connected 立ち上がりで1回だけ呼ばれる。CAS でセッション単位の二重発火を防ぐ。 */
+    private fun maybeSendPostConnectCommands(tab: TabState) {
+        if (!tab.postConnectSent.compareAndSet(false, true)) return
+        val bytes = tab.pendingPostConnectBytes ?: return
+        viewModelScope.launch {
+            delay(POST_CONNECT_DEBOUNCE_MS)
+            RemoteLogger.i("TsshSSH", "sending post-connect commands (${bytes.size} bytes) tab=${tab.tabId}")
+            send(tab.tabId, bytes)
+        }
+    }
+
     // ── セッション操作（タブ指定。すべて session への薄い委譲）──────────
 
     fun send(tabId: String, bytes: ByteArray) = tabOrNull(tabId)?.session?.send(bytes)
@@ -218,6 +390,9 @@ class TerminalTabsViewModel(
     fun trustUpdatedHostKey(tabId: String) = tabOrNull(tabId)?.session?.trustUpdatedHostKey()
 
     fun dismissHostKeyWarning(tabId: String) = tabOrNull(tabId)?.session?.dismissHostKeyWarning()
+
+    fun respondAgentSignRequest(tabId: String, approved: Boolean) =
+        tabOrNull(tabId)?.session?.respondAgentSignRequest(approved)
 
     fun getSessionLog(tabId: String): String = tabOrNull(tabId)?.session?.log?.value ?: ""
 

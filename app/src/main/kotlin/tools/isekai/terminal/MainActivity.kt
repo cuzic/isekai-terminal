@@ -52,6 +52,10 @@ class MainActivity : ComponentActivity() {
 fun AppRoot() {
     val navController = rememberNavController()
     val navVm: AppNavViewModel = viewModel()
+    // Activity スコープ: NavHost の遷移をまたいでも同一インスタンスが使われるため、
+    // ProfileList に一旦戻ってもバックグラウンドのタブ (共有 ForegroundService 上のセッション)
+    // は生き続ける。
+    val tabsVm: TerminalTabsViewModel = viewModel()
 
     NavHost(navController = navController, startDestination = AppRoutes.PROFILE_LIST) {
 
@@ -60,8 +64,7 @@ fun AppRoot() {
             ProfileListScreen(
                 onConnect = { profile, password ->
                     RemoteLogger.i("TsshNav", "ProfileList → Terminal profile='${profile.label}' authType=${profile.authType}")
-                    navVm.pendingProfile = profile
-                    navVm.pendingPassword = password
+                    tabsVm.openTab(profile, password)
                     navController.navigate(AppRoutes.TERMINAL)
                 },
                 onAddProfile = {
@@ -78,11 +81,10 @@ fun AppRoot() {
         }
 
         composable(AppRoutes.TERMINAL) {
-            RemoteLogger.i("TsshNav", "→ Terminal(profile='${navVm.pendingProfile?.label}' host=${navVm.pendingProfile?.host})")
-            TerminalScreen(
-                profile = navVm.pendingProfile,
-                password = navVm.pendingPassword,
-                onBack = { navController.popBackStack() },
+            RemoteLogger.i("TsshNav", "→ Terminal (tabs=${tabsVm.tabs.value.size})")
+            TerminalHostScreen(
+                tabsVm = tabsVm,
+                onAllTabsClosed = { navController.popBackStack() },
             )
         }
 

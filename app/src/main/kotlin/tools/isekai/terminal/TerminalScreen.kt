@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Paint as AndroidPaint
 import android.graphics.Typeface
+import android.net.Uri
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
@@ -49,6 +50,30 @@ import tools.isekai.terminal.ui.reconstructSelectionText
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.tssh_core.*
 
+/**
+ * [TerminalScreenBody] が呼び出し元 (単一セッションの [TerminalScreen] か、複数タブの
+ * `TerminalTabScreen` か) の違いを気にせず済むようにするための操作の束。
+ *
+ * すべての操作は最終的に [tools.isekai.terminal.session.TerminalSession] への薄い委譲。
+ */
+data class TerminalScreenActions(
+    val onConnect: () -> Unit,
+    val onDisconnect: () -> Unit,
+    val onBack: () -> Unit,
+    val onSend: (ByteArray) -> Unit,
+    val onResize: (UInt, UInt) -> Unit,
+    val onScrollbackCells: (Int, Int) -> List<CellData>?,
+    val onTrustUpdatedHostKey: () -> Unit,
+    val onDismissHostKeyWarning: () -> Unit,
+    val onTrzszStartUpload: (Uri) -> Unit,
+    val onTrzszStartDownload: () -> Unit,
+    val onTrzszCancel: () -> Unit,
+    val onTrzszDismiss: () -> Unit,
+    val onGetSessionLog: () -> String,
+    val onSendSnippet: (Snippet) -> Unit,
+    val onRespondAgentSignRequest: (Boolean) -> Unit,
+)
+
 @Composable
 fun TerminalScreen(
     profile: ConnectionProfile? = null,
@@ -56,13 +81,66 @@ fun TerminalScreen(
     onBack: () -> Unit,
     vm: TerminalViewModel = viewModel(),
 ) {
-    val context = LocalContext.current
     val uiState by vm.uiState.collectAsStateWithLifecycle()
+    val snippets by vm.snippets.collectAsStateWithLifecycle()
+
+    // プロファイルが変わるたび（画面遷移・再接続含む）にそのプロファイル向けスニペットを読み込む
+    LaunchedEffect(profile?.id) {
+        vm.loadSnippets(profile?.id)
+    }
+
+    LaunchedEffect(Unit) {
+        if (!uiState.connected && profile != null) {
+            RemoteLogger.i("TsshSSH", "TerminalScreen: launch connectProfile '${profile.label}' ${profile.username}@${profile.host}:${profile.port}")
+            vm.connectProfile(profile, password)
+        }
+    }
+
+    TerminalScreenBody(
+        uiState = uiState,
+        canReconnect = profile != null,
+        snippets = snippets,
+        actions = TerminalScreenActions(
+            onConnect = { if (profile != null) vm.connectProfile(profile, password) },
+            onDisconnect = { vm.disconnect() },
+            onBack = { vm.disconnect(); onBack() },
+            onSend = vm::send,
+            onResize = vm::resize,
+            onScrollbackCells = vm::scrollbackCells,
+            onTrustUpdatedHostKey = vm::trustUpdatedHostKey,
+            onDismissHostKeyWarning = vm::dismissHostKeyWarning,
+            onTrzszStartUpload = vm::trzszStartUpload,
+            onTrzszStartDownload = vm::trzszStartDownload,
+            onTrzszCancel = vm::trzszCancel,
+            onTrzszDismiss = vm::trzszDismiss,
+            onGetSessionLog = vm::getSessionLog,
+            onSendSnippet = vm::sendSnippet,
+            onRespondAgentSignRequest = vm::respondAgentSignRequest,
+        ),
+    )
+}
+
+/**
+ * ターミナル画面の本体。[TerminalScreen](単一セッション、後方互換)と、複数タブ UI の
+ * `TerminalTabScreen` の両方から共有される。
+ *
+ * [isActive] が false の間は Canvas 描画・IME 入力欄を止める（Rust セッション自体は
+ * 生きたまま）。スクロール位置・フォントスケール等のローカル状態は呼び出し側で
+ * `key(tabId) { }` により分離すること。
+ */
+@Composable
+fun TerminalScreenBody(
+    uiState: TerminalUiState,
+    canReconnect: Boolean,
+    actions: TerminalScreenActions,
+    snippets: List<Snippet> = emptyList(),
+    isActive: Boolean = true,
+) {
+    val context = LocalContext.current
     val connected = uiState.connected
     val statusMsg = uiState.statusMsg
     val screenUpdate = uiState.screenUpdate
     val scrollbackLen = uiState.scrollbackLen
-    val snippets by vm.snippets.collectAsStateWithLifecycle()
     // スクロール位置・選択範囲は Compose local state — ViewModel を経由しない
     // (.claude/rules/rust-ssot.md の「UI 表示だけに閉じた状態」の例外)
     var scrollOffset by remember { mutableIntStateOf(0) }
@@ -73,19 +151,14 @@ fun TerminalScreen(
     // 入力用 AndroidView への参照をここで保持する（入力欄自体は下部に描画）。
     var inputView by remember { mutableStateOf<tools.isekai.terminal.input.TerminalInputView?>(null) }
 
-    // プロファイルが変わるたび（画面遷移・再接続含む）にそのプロファイル向けスニペットを読み込む
-    LaunchedEffect(profile?.id) {
-        vm.loadSnippets(profile?.id)
-    }
-
-    BackHandler(enabled = connected) { showDisconnectDialog = true }
+    BackHandler(enabled = connected && isActive) { showDisconnectDialog = true }
 
     if (showDisconnectDialog) {
         AlertDialog(
             onDismissRequest = { showDisconnectDialog = false },
             title = { Text("切断しますか？") },
             confirmButton = {
-                TextButton(onClick = { vm.disconnect(); showDisconnectDialog = false; onBack() }) {
+                TextButton(onClick = { actions.onDisconnect(); showDisconnectDialog = false; actions.onBack() }) {
                     Text("切断")
                 }
             },
@@ -95,54 +168,49 @@ fun TerminalScreen(
         )
     }
 
-    // Host key changed warning dialog
-    uiState.hostKeyChangedWarning?.let { w ->
-        HostKeyChangedDialog(
-            warning = w,
-            onAccept = { vm.trustUpdatedHostKey() },
-            onReject = { vm.dismissHostKeyWarning() },
-        )
+    // Host key changed warning dialog（非アクティブタブでは表示しない）
+    if (isActive) {
+        uiState.hostKeyChangedWarning?.let { w ->
+            HostKeyChangedDialog(
+                warning = w,
+                onAccept = { actions.onTrustUpdatedHostKey() },
+                onReject = { actions.onDismissHostKeyWarning() },
+            )
+        }
     }
 
     // SSH agent forwarding: 署名要求ごとの確認ダイアログ
     uiState.agentSignRequestFingerprint?.let { fingerprint ->
         AgentSignConfirmDialog(
             fingerprint = fingerprint,
-            onApprove = { vm.respondAgentSignRequest(true) },
-            onReject = { vm.respondAgentSignRequest(false) },
+            onApprove = { actions.onRespondAgentSignRequest(true) },
+            onReject = { actions.onRespondAgentSignRequest(false) },
         )
     }
 
     // trzsz file transfer
     val trzszState = uiState.trzszState
     val transferActive = trzszState is TrzszUiState.WaitingUser || trzszState is TrzszUiState.InProgress
-    if (trzszState != null) {
+    if (isActive && trzszState != null) {
         TrzszTransferSheet(
             state = trzszState,
-            onStartUpload = { uri -> vm.trzszStartUpload(uri) },
-            onStartDownload = { vm.trzszStartDownload() },
-            onCancel = { vm.trzszCancel() },
-            onDismiss = { vm.trzszDismiss() },
+            onStartUpload = { uri -> actions.onTrzszStartUpload(uri) },
+            onStartDownload = { actions.onTrzszStartDownload() },
+            onCancel = { actions.onTrzszCancel() },
+            onDismiss = { actions.onTrzszDismiss() },
         )
     }
 
     // 定型コマンド（スニペット）一覧
-    if (showSnippetSheet) {
+    if (isActive && showSnippetSheet) {
         SnippetPickerSheet(
             snippets = snippets,
             onPick = { snippet ->
-                vm.sendSnippet(snippet)
+                actions.onSendSnippet(snippet)
                 showSnippetSheet = false
             },
             onDismiss = { showSnippetSheet = false },
         )
-    }
-
-    LaunchedEffect(Unit) {
-        if (!connected && profile != null) {
-            RemoteLogger.i("TsshSSH", "TerminalScreen: launch connectProfile '${profile.label}' ${profile.username}@${profile.host}:${profile.port}")
-            vm.connectProfile(profile, password)
-        }
     }
 
     Column(
@@ -169,20 +237,20 @@ fun TerminalScreen(
                 if (!connected) {
                     TextButton(
                         onClick = {
-                            if (profile != null) vm.connectProfile(profile, password)
+                            if (canReconnect) actions.onConnect()
                         },
                         contentPadding = PaddingValues(0.dp),
                     ) { Text("再接続", color = Color.Cyan, fontSize = 11.sp) }
                 } else {
                     TextButton(
-                        onClick = { vm.disconnect() },
+                        onClick = { actions.onDisconnect() },
                         contentPadding = PaddingValues(0.dp),
                     ) { Text("切断", color = Color.Gray, fontSize = 11.sp) }
                 }
                 if (connected) {
                     TextButton(
                         onClick = {
-                            val log = vm.getSessionLog()
+                            val log = actions.onGetSessionLog()
                             val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                             cm.setPrimaryClip(ClipData.newPlainText("tssh log", log))
                         },
@@ -190,7 +258,7 @@ fun TerminalScreen(
                     ) { Text("ログ", color = AppColors.SecondaryText, fontSize = 11.sp) }
                 }
                 TextButton(
-                    onClick = { vm.disconnect(); onBack() },
+                    onClick = { actions.onBack() },
                     contentPadding = PaddingValues(0.dp),
                 ) { Text("戻る", color = Color.Gray, fontSize = 11.sp) }
             }
@@ -209,7 +277,7 @@ fun TerminalScreen(
         }
 
         val update = screenUpdate
-        if (update != null) {
+        if (isActive && update != null) {
             BoxWithConstraints(
                 modifier = Modifier
                     .weight(1f)
@@ -234,14 +302,16 @@ fun TerminalScreen(
                 val cols = (widthPx / cellDims.first).toInt().coerceAtLeast(10)
                 val rows = (heightPx / cellDims.second).toInt().coerceAtLeast(5)
 
+                // タブがアクティブ化された直後にも、このタブの実際のビューポート寸法で
+                // 確実に resize() が送られる（cols/rows は非アクティブ中は計算されないため）。
                 LaunchedEffect(cols, rows, connected) {
-                    if (connected) vm.resize(cols.toUInt(), rows.toUInt())
+                    if (connected) actions.onResize(cols.toUInt(), rows.toUInt())
                 }
 
                 // When scrolled into scrollback, synthesize a ScreenUpdate from the buffer
                 val displayUpdate = remember(scrollOffset, rows, update) {
                     if (scrollOffset > 0) {
-                        val sbCells = vm.scrollbackCells(scrollOffset, rows)
+                        val sbCells = actions.onScrollbackCells(scrollOffset, rows)
                         if (sbCells != null && sbCells.size == rows * cols) {
                             ScreenUpdate(
                                 cols = update.cols,
@@ -382,7 +452,7 @@ fun TerminalScreen(
                     }
                 }
             }
-        } else {
+        } else if (isActive) {
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -396,11 +466,17 @@ fun TerminalScreen(
                     modifier = Modifier.padding(16.dp),
                 )
             }
+        } else {
+            // 非アクティブタブ: Canvas 描画をスキップ（Rust セッションは生かしたまま）。
+            // 幅0のプレースホルダにすることで上の remember 状態 (scrollOffset 等) は保持しつつ、
+            // 描画コストとキーボードのポップアップだけを避ける。
+            Box(modifier = Modifier.weight(1f).fillMaxWidth())
         }
 
         // 入力エリア（キーボードの上に表示される）。転送中はキー入力が
-        // trzsz バイナリストリームに混入するのを防ぐため無効化する。
-        if (connected && !transferActive) {
+        // trzsz バイナリストリームに混入するのを防ぐため無効化する。非アクティブタブでは
+        // ソフトキーボードを誤って呼び出さないよう表示しない。
+        if (isActive && connected && !transferActive) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -420,22 +496,22 @@ fun TerminalScreen(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                 ) {
                     CtrlBtn("Ctrl", active = ctrlArmed) { ctrlArmed = !ctrlArmed }
-                    CtrlBtn("↵") { inputView?.commitComposing(); vm.send(byteArrayOf(0x0D)) }
-                    CtrlBtn("Tab") { vm.send(byteArrayOf(0x09)) }
-                    CtrlBtn("Esc") { vm.send(byteArrayOf(0x1B)) }
-                    CtrlBtn("^C") { vm.send(byteArrayOf(0x03)) }
-                    CtrlBtn("^D") { vm.send(byteArrayOf(0x04)) }
-                    CtrlBtn("^Z") { vm.send(byteArrayOf(0x1A)) }
-                    CtrlBtn("↑") { vm.send(byteArrayOf(0x1B, 0x5B, 0x41)) }
-                    CtrlBtn("↓") { vm.send(byteArrayOf(0x1B, 0x5B, 0x42)) }
-                    CtrlBtn("←") { vm.send(byteArrayOf(0x1B, 0x5B, 0x44)) }
-                    CtrlBtn("→") { vm.send(byteArrayOf(0x1B, 0x5B, 0x43)) }
+                    CtrlBtn("↵") { inputView?.commitComposing(); actions.onSend(byteArrayOf(0x0D)) }
+                    CtrlBtn("Tab") { actions.onSend(byteArrayOf(0x09)) }
+                    CtrlBtn("Esc") { actions.onSend(byteArrayOf(0x1B)) }
+                    CtrlBtn("^C") { actions.onSend(byteArrayOf(0x03)) }
+                    CtrlBtn("^D") { actions.onSend(byteArrayOf(0x04)) }
+                    CtrlBtn("^Z") { actions.onSend(byteArrayOf(0x1A)) }
+                    CtrlBtn("↑") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x41)) }
+                    CtrlBtn("↓") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x42)) }
+                    CtrlBtn("←") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x44)) }
+                    CtrlBtn("→") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x43)) }
                     CtrlBtn("貼付") {
                         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         val text = cm.primaryClip?.takeIf { it.itemCount > 0 }
                             ?.getItemAt(0)?.coerceToText(context)?.toString()
                         if (!text.isNullOrEmpty()) {
-                            vm.send(TerminalKeyEncoder.commitTextBytes(text, screenUpdate?.bracketedPasteMode ?: false))
+                            actions.onSend(TerminalKeyEncoder.commitTextBytes(text, screenUpdate?.bracketedPasteMode ?: false))
                         }
                     }
                     CtrlBtn("定型") { showSnippetSheet = true }
@@ -453,7 +529,7 @@ fun TerminalScreen(
                 AndroidView(
                     factory = { ctx ->
                         tools.isekai.terminal.input.TerminalInputView(ctx).apply {
-                            onSendBytes = { bytes -> vm.send(bytes) }
+                            onSendBytes = { bytes -> actions.onSend(bytes) }
                             onComposingText = { text -> composingText = text }
                         }.also { inputView = it }
                     },

@@ -8,8 +8,8 @@ import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Snippet
 
 class AppNavViewModel : ViewModel() {
-    var pendingProfile     by mutableStateOf<ConnectionProfile?>(null)
-    var pendingPassword    by mutableStateOf<String?>(null)
+    // 接続対象 (pendingProfile/pendingPassword) は TerminalTabsViewModel.openTab() に
+    // 直接渡すようになったため、ここでの中継は不要になった。
     var pendingEditProfile by mutableStateOf<ConnectionProfile?>(null)
     var pendingEditSnippet by mutableStateOf<Snippet?>(null)
 }
