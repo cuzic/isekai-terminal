@@ -772,6 +772,8 @@ internal object IntegrityCheckingUniffiLib {
     }
     external fun uniffi_tssh_core_checksum_func_create_ssh_session(
     ): Int
+    external fun uniffi_tssh_core_checksum_func_set_terminal_theme(
+    ): Int
     external fun uniffi_tssh_core_checksum_func_debug_clear_udp_fault(
     ): Int
     external fun uniffi_tssh_core_checksum_func_debug_cut_udp_fault(
@@ -1114,6 +1116,8 @@ external fun uniffi_tssh_core_fn_init_callback_vtable_sessioncallback(`vtable`: 
 ): Unit
 external fun uniffi_tssh_core_fn_func_create_ssh_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
+external fun uniffi_tssh_core_fn_func_set_terminal_theme(`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_tssh_core_fn_func_debug_clear_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_func_debug_cut_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
@@ -1252,6 +1256,9 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tssh_core_checksum_func_create_ssh_session() != 24804) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_func_set_terminal_theme() != 45632) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_func_debug_clear_udp_fault() != 23483) {
@@ -5464,6 +5471,34 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 /**
  * @suppress
  */
+public object FfiConverterSequenceUInt: FfiConverterRustBuffer<List<kotlin.UInt>> {
+    override fun read(buf: ByteBuffer): List<kotlin.UInt> {
+        val len = buf.getInt()
+        return List<kotlin.UInt>(len) {
+            FfiConverterUInt.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.UInt>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterUInt.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<kotlin.UInt>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterUInt.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeCellData: FfiConverterRustBuffer<List<CellData>> {
     override fun read(buf: ByteBuffer): List<CellData> {
         val len = buf.getInt()
@@ -5493,6 +5528,23 @@ public object FfiConverterSequenceTypeCellData: FfiConverterRustBuffer<List<Cell
 }
     )
     }
+    
+
+        /**
+         * ターミナルの配色テーマを差し替える（プロファイル毎ではなくグローバル設定）。
+         *
+         * `ansi16` は SGR が参照する 16 色を ARGB（`0xAARRGGBB`）で `[normal 8色, bright 8色]`
+         * の順に渡す。16 個に満たない場合は残りを既定テーマの値で埋め、16 個を超える分は無視する。
+         * 呼び出し以降にパースされる SGR にのみ反映され、既に scrollback に積まれた行は
+         * 遡って再着色されない（既知の制約）。
+         */ fun `setTerminalTheme`(`ansi16`: List<kotlin.UInt>, `defaultFg`: kotlin.UInt, `defaultBg`: kotlin.UInt)
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_func_set_terminal_theme(
+    
+        FfiConverterSequenceUInt.lower(`ansi16`),FfiConverterUInt.lower(`defaultFg`),FfiConverterUInt.lower(`defaultBg`),_status)
+}
+    
     
 
         /**
