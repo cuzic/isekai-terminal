@@ -13,7 +13,7 @@ import androidx.compose.ui.graphics.toArgb
 import uniffi.tssh_core.ScreenUpdate
 
 @Composable
-fun SshTerminalCanvas(update: ScreenUpdate, modifier: Modifier = Modifier) {
+fun SshTerminalCanvas(update: ScreenUpdate, selection: SelectionRange? = null, modifier: Modifier = Modifier) {
     val textPaint = remember {
         Paint().apply {
             isAntiAlias = true
@@ -21,6 +21,9 @@ fun SshTerminalCanvas(update: ScreenUpdate, modifier: Modifier = Modifier) {
         }
     }
     val bgPaint = remember { Paint() }
+    val selectionPaint = remember {
+        Paint().apply { color = android.graphics.Color.argb(120, 255, 255, 255) }
+    }
 
     Canvas(modifier = modifier.background(Color.Black)) {
         val cols = update.cols.toInt()
@@ -42,6 +45,18 @@ fun SshTerminalCanvas(update: ScreenUpdate, modifier: Modifier = Modifier) {
         val baseline = -fm.top
 
         val nCanvas = drawContext.canvas.nativeCanvas
+
+        // 選択範囲のハイライト（行単位。文字描画より前に半透明の反転色で塗る）
+        selection?.let { sel ->
+            val startRow = sel.startRow.coerceIn(0, rows - 1)
+            val endRow = sel.endRow.coerceIn(0, rows - 1)
+            if (startRow <= endRow) {
+                for (row in startRow..endRow) {
+                    val y = row * cellH
+                    nCanvas.drawRect(0f, y, size.width, y + cellH, selectionPaint)
+                }
+            }
+        }
 
         for (row in 0 until rows) {
             val y = row * cellH
