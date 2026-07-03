@@ -1,6 +1,6 @@
 [package]
 name = "isekai-helper"
-version = "0.1.0"
+version = "0.3.2"
 edition = "2021"
 
 [[bin]]
@@ -8,7 +8,10 @@ name = "isekai-helper"
 path = "src/main.rs"
 
 [dependencies]
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
+# Phase 9-1: quinn から noq（quinnのmultipathフォーク）へ移行。既存クライアント
+# （quinnベース、Phase 7/8）はopen_path()を呼ばず後方互換のまま動く
+# （Phase 9-0 の compat_check.rs で実証済み）。
+noq = { version = "1.0.1", features = ["rustls", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rcgen = "0.13"
 tokio = { version = "1", features = ["full"] }
@@ -22,3 +25,10 @@ sha2 = "0.10"
 subtle = "2.6"
 base64 = "0.22"
 rand = "0.8"
+
+[dev-dependencies]
+# e2e.rs は本番クライアント（helper_quic_transport.rs、quinnのまま無変更）と
+# 同じ形の quinn クライアントでこのサーバーをテストする。これは Phase 9-1 の
+# 後方互換前提（既存 quinn クライアントが noq サーバーに接続できる）そのものの
+# 回帰確認になる。
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }

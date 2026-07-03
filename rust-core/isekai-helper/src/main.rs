@@ -1,3 +1,5 @@
+mod resume;
+
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,10 +9,12 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
-use quinn::crypto::rustls::QuicServerConfig;
+use noq::crypto::rustls::QuicServerConfig;
 use rcgen::{generate_simple_self_signed, CertifiedKey};
+use resume::{Session, SessionTable};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
@@ -19,6 +23,9 @@ use tokio::time::Instant;
 // 契約の詳細は /HELPER_PROTOCOL.md を参照。このファイルはその契約の実装。
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// S→C output buffer の既定上限（HELPER_PROTOCOL.md §7.4 の既定案）。
+const DEFAULT_RESUME_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 const EXPORTER_LABEL: &[u8] = b"isekai-helper-auth-v1";
 const ALPN: &[u8] = b"isekai-helper/1";
@@ -36,6 +43,7 @@ struct Args {
     target: SocketAddr,
     bind: SocketAddr,
     idle_timeout: u64,
+    resume_window: u64,
     max_idle_lifetime: u64,
     once: bool,
     log_level: String,
@@ -54,7 +62,8 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    --target <ADDR:PORT>          relay destination (default: 127.0.0.1:22)");
     println!("    --bind <ADDR:PORT>             QUIC bind address (default: 0.0.0.0:0)");
-    println!("    --idle-timeout <SECS>          QUIC transport idle timeout (default: 30)");
+    println!("    --idle-timeout <SECS>          QUIC transport idle timeout (default: 15)");
+    println!("    --resume-window <SECS>         how long a parked (disconnected) session stays resumable (default: 120)");
     println!("    --max-idle-lifetime <SECS>     self-exit after this many seconds with no active connection (default: 600)");
     println!("    --once                         exit after the first connection closes");
     println!("    --log-level <LEVEL>            error|warn|info|debug|trace (default: info)");
@@ -65,7 +74,12 @@ fn print_help() {
 fn parse_args() -> Result<Args> {
     let mut target: SocketAddr = "127.0.0.1:22".parse().unwrap();
     let mut bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let mut idle_timeout = 30u64;
+    let mut idle_timeout = 15u64;
+    // 実機検証（Phase 8-4b）で、reattach が5回とも失敗する最悪ケースは
+    // 「各試行の QUIC handshake タイムアウト（`--idle-timeout` と同じ 15秒）」×5回 +
+    // 指数バックオフ合計15秒 で実測 約90秒かかることを確認した。90秒ちょうどだと
+    // ギリギリなので余裕を持たせて120秒にしてある。
+    let mut resume_window = 120u64;
     let mut max_idle_lifetime = 600u64;
     let mut once = false;
     let mut log_level = "info".to_string();
@@ -87,6 +101,11 @@ fn parse_args() -> Result<Args> {
                 idle_timeout = next_val(&mut iter, "--idle-timeout")?
                     .parse()
                     .context("invalid --idle-timeout value")?;
+            }
+            "--resume-window" => {
+                resume_window = next_val(&mut iter, "--resume-window")?
+                    .parse()
+                    .context("invalid --resume-window value")?;
             }
             "--max-idle-lifetime" => {
                 max_idle_lifetime = next_val(&mut iter, "--max-idle-lifetime")?
@@ -110,6 +129,7 @@ fn parse_args() -> Result<Args> {
         target,
         bind,
         idle_timeout,
+        resume_window,
         max_idle_lifetime,
         once,
         log_level,
@@ -169,24 +189,29 @@ async fn main() -> Result<()> {
     // rustls は max_early_data_size を明示的に増やさない限り 0-RTT を送出しないが、契約として明示する。
     server_crypto.max_early_data_size = 0;
 
-    let idle_timeout_cfg = quinn::IdleTimeout::try_from(Duration::from_secs(args.idle_timeout))
+    let idle_timeout_cfg = noq::IdleTimeout::try_from(Duration::from_secs(args.idle_timeout))
         .map_err(|_| anyhow!("invalid --idle-timeout"))?;
     let keep_alive = Duration::from_secs((args.idle_timeout / 3).max(1));
 
-    let mut transport = quinn::TransportConfig::default();
+    let mut transport = noq::TransportConfig::default();
     transport.max_idle_timeout(Some(idle_timeout_cfg));
     transport.keep_alive_interval(Some(keep_alive));
-    // Phase 7 のスコープでは 1 QUIC connection につき 1 bidirectional stream のみを許可する。
-    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1));
-    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    // data stream（Phase 7）+ control stream（Phase 8、resume 用）の 2 本を許可する
+    // （HELPER_PROTOCOL.md §7.1）。3 本目以降は Phase 7 と同様 reset される。
+    transport.max_concurrent_bidi_streams(noq::VarInt::from_u32(2));
+    transport.max_concurrent_uni_streams(noq::VarInt::from_u32(0));
     transport.datagram_receive_buffer_size(None);
+    // Phase 9-1: multipath 対応。既存 quinn クライアント（Phase 7/8）は
+    // open_path() を呼ばないため path0 のみで従来通り動作し、後方互換に
+    // 影響しない（Phase 9-0 の compat_check.rs で実証済み）。
+    transport.max_concurrent_multipath_paths(8);
 
     let mut server_config =
-        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
+        noq::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
     server_config.transport_config(Arc::new(transport));
     // preferred_address は明示的に設定しない（QUIC-Exfil 対策、既定で未使用）。
 
-    let endpoint = quinn::Endpoint::server(server_config, args.bind)?;
+    let endpoint = noq::Endpoint::server(server_config, args.bind)?;
     let listen_port = endpoint.local_addr()?.port();
 
     // 起動ハンドシェイク JSON を stdout に1行だけ出力し、明示的に flush する。
@@ -212,6 +237,30 @@ async fn main() -> Result<()> {
     let active = Arc::new(AtomicBool::new(false));
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let idle_shutdown = Arc::new(Notify::new());
+    // Phase 8: resume 可能セッションのテーブル（session_id → output buffer 等）。
+    let sessions = SessionTable::new();
+
+    // Phase 8-3/8-4: park された（data stream が切れて resume 待ちの）セッションの
+    // 定期掃除。`--resume-window` の長さだけ resume が来なければ TCP を close して
+    // session を破棄する（HELPER_PROTOCOL.md §7.5）。
+    //
+    // `--idle-timeout`（QUIC transport の生存確認）とは意図的に別の値にしてある。
+    // 実機検証（Phase 8-4b）で、この2つを同じ値で共用していると「クライアントが
+    // QUIC connection の喪失を検知する（`--idle-timeout` 待ち）頃には、既に
+    // park セッションが破棄済み」というタイミング不整合が起き、reattach が
+    // 必ず REJECT_UNKNOWN_SESSION になる致命的な不具合を確認した。resume-window は
+    // 検知にかかる時間 + reattach のリトライ予算（指数バックオフ計15秒）より
+    // 十分長い既定値（90秒）にしてある。
+    {
+        let sessions = sessions.clone();
+        let max_parked = Duration::from_secs(args.resume_window);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                sessions.sweep_expired_parked(max_parked).await;
+            }
+        });
+    }
 
     // --max-idle-lifetime の監視タスク。
     // アクティブな接続が無く、かつ最後の接続終了（または起動）からこの秒数が経過したら自己終了する。
@@ -255,13 +304,19 @@ async fn main() -> Result<()> {
                 let secret = session_secret;
                 let active = active.clone();
                 let last_activity = last_activity.clone();
+                let sessions = sessions.clone();
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(conn) => {
-                            let remote = conn.remote_address();
-                            log::info!("QUIC connection established from {remote}");
-                            if let Err(e) = handle_connection(conn, target, secret, active).await {
-                                log::warn!("connection from {remote} ended: {e:#}");
+                            // noq: `remote_address()`はConnectingにしか無い（確立後はpath0/1...
+                            // それぞれに別アドレスがあり得るためmultipath化で無くなった）。
+                            // path0（PathId::ZERO）は常に存在するのでログ用途にはこれで十分。
+                            let remote = conn
+                                .path(noq::PathId::ZERO)
+                                .and_then(|p| p.remote_address().ok());
+                            log::info!("QUIC connection established from {remote:?}");
+                            if let Err(e) = handle_connection(conn, target, secret, active, sessions).await {
+                                log::warn!("connection from {remote:?} ended: {e:#}");
                             }
                         }
                         Err(e) => log::warn!("failed to accept connection: {e:#}"),
@@ -281,32 +336,59 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_connection(
-    conn: quinn::Connection,
+    conn: noq::Connection,
     target: SocketAddr,
     session_secret: [u8; 32],
     active: Arc<AtomicBool>,
+    sessions: SessionTable,
 ) -> Result<()> {
-    // HELLO を一定時間内に送ってこない connection は close する
-    // （QUIC connection だけ張って stream を開かない妨害を防ぐ）。
-    let (send, recv, hello) = tokio::time::timeout(HELLO_TIMEOUT, async {
+    // 最初の1バイトでフレーム種別（HELLO=新規 / RESUME=reattach）を判定してから、
+    // 種別に応じた残りバイト数を読む。いずれも一定時間内に届かなければ
+    // connection を close する（QUIC connection だけ張って stream を開かない
+    // 妨害を防ぐ）。
+    let (send, recv, frame_type, rest) = tokio::time::timeout(HELLO_TIMEOUT, async {
         let (send, mut recv) = conn.accept_bi().await.context("no stream opened")?;
-        let mut hello = [0u8; 33];
-        recv.read_exact(&mut hello)
+        let mut type_byte = [0u8; 1];
+        recv.read_exact(&mut type_byte)
             .await
-            .context("failed to read HELLO frame")?;
-        Ok::<_, anyhow::Error>((send, recv, hello))
+            .context("failed to read frame type")?;
+        let rest_len = match type_byte[0] {
+            FRAME_HELLO => 32,      // proof
+            resume::RESUME => 64,   // session_id(16) + proof(32) + offset(8) + offset(8)
+            _ => 0,
+        };
+        let mut rest = vec![0u8; rest_len];
+        if rest_len > 0 {
+            recv.read_exact(&mut rest).await.context("failed to read frame body")?;
+        }
+        Ok::<_, anyhow::Error>((send, recv, type_byte[0], rest))
     })
     .await
     .context("HELLO timeout")??;
 
-    handle_stream(conn, send, recv, hello, target, session_secret, active).await
+    match frame_type {
+        FRAME_HELLO => {
+            let mut hello = [0u8; 33];
+            hello[0] = FRAME_HELLO;
+            hello[1..].copy_from_slice(&rest);
+            handle_stream(conn, send, recv, hello, target, session_secret, active, sessions).await
+        }
+        resume::RESUME => {
+            handle_resume_stream(conn, send, recv, &rest, target, session_secret, active, sessions).await
+        }
+        other => {
+            let mut send = send;
+            reject(&mut send, FRAME_REJECT_UNSUPPORTED).await;
+            Err(anyhow!("unexpected frame type: {other:#x}"))
+        }
+    }
 }
 
 /// 拒否フレームを送出し、`finish()` 後に `stopped()` で peer への到達を待ってから返す。
 /// これをせずに呼び出し元が即座に `conn` を drop すると、1 byte の応答が飛ぶ前に
 /// QUIC connection が暗黙に閉じられ、client 側が payload を読めないことがある
 /// （実測で確認済みのバグ）。
-async fn reject(send: &mut quinn::SendStream, code: u8) {
+async fn reject(send: &mut noq::SendStream, code: u8) {
     if send.write_all(&[code]).await.is_ok() {
         let _ = send.finish();
         let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
@@ -316,28 +398,21 @@ async fn reject(send: &mut quinn::SendStream, code: u8) {
 /// helper 側の HELLO 検証・target 接続・中継を行う。
 #[allow(clippy::too_many_arguments)]
 async fn handle_stream(
-    conn: quinn::Connection,
-    mut send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    conn: noq::Connection,
+    mut send: noq::SendStream,
+    recv: noq::RecvStream,
     hello: [u8; 33],
     target: SocketAddr,
     session_secret: [u8; 32],
     active: Arc<AtomicBool>,
+    sessions: SessionTable,
 ) -> Result<()> {
     if hello[0] != FRAME_HELLO {
         reject(&mut send, FRAME_REJECT_UNSUPPORTED).await;
         return Err(anyhow!("unexpected frame type: {:#x}", hello[0]));
     }
     let client_proof = &hello[1..33];
-
-    let mut exporter = [0u8; 32];
-    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
-        .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
-
-    let mut mac =
-        HmacSha256::new_from_slice(&session_secret).expect("HMAC accepts any key length");
-    mac.update(&exporter);
-    let expected = mac.finalize().into_bytes();
+    let expected = compute_proof(&conn, &session_secret, EXPORTER_LABEL, b"")?;
 
     if client_proof.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
         reject(&mut send, FRAME_REJECT_AUTH).await;
@@ -355,15 +430,212 @@ async fn handle_stream(
     }
 
     let mut recv = recv;
-    let result = relay(&mut send, &mut recv, target).await;
+    let result = relay_with_resume(&conn, &mut send, &mut recv, target, session_secret, &sessions).await;
     active.store(false, Ordering::SeqCst);
     result
 }
 
-async fn relay(
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
+/// Phase 8-3: `RESUME` フレームを検証し、既存セッションに park された TCP
+/// 接続を取り戻して中継を再開する。`body` は type byte を除いた 64 byte
+/// （session_id(16) + proof(32) + client_sent_offset(8) + client_delivered_offset(8)）。
+#[allow(clippy::too_many_arguments)]
+async fn handle_resume_stream(
+    conn: noq::Connection,
+    mut send: noq::SendStream,
+    mut recv: noq::RecvStream,
+    body: &[u8],
     target: SocketAddr,
+    session_secret: [u8; 32],
+    active: Arc<AtomicBool>,
+    sessions: SessionTable,
+) -> Result<()> {
+    let mut session_id = [0u8; 16];
+    session_id.copy_from_slice(&body[0..16]);
+    let client_proof = &body[16..48];
+    let client_sent_offset = u64::from_be_bytes(body[48..56].try_into().unwrap());
+    let client_delivered_offset = u64::from_be_bytes(body[56..64].try_into().unwrap());
+
+    // resume_proof = HMAC(session_secret, exporter(新connection) || session_id)
+    // （HELPER_PROTOCOL.md §7.3。session_id を混ぜることで、同じ session_secret を
+    // 使い回す複数セッションが互いの resume トークンを流用できないようにする）。
+    let mut exporter = [0u8; 32];
+    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
+        .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
+    let mut mac = HmacSha256::new_from_slice(&session_secret).expect("HMAC accepts any key length");
+    mac.update(&exporter);
+    mac.update(&session_id);
+    let expected = mac.finalize().into_bytes();
+    if client_proof.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
+        reject(&mut send, FRAME_REJECT_AUTH).await;
+        return Err(anyhow!("resume proof mismatch, rejecting"));
+    }
+
+    let Some(handle) = sessions.get(&session_id).await else {
+        reject(&mut send, resume::REJECT_UNKNOWN_SESSION).await;
+        return Err(anyhow!("unknown session_id for resume: {}", hex_lower(&session_id)));
+    };
+
+    let parked = {
+        let mut session = handle.lock().await;
+        session.parked_since = None;
+        session.parked_tcp.take()
+    };
+    let Some((tcp_read, tcp_write)) = parked else {
+        reject(&mut send, resume::REJECT_UNKNOWN_SESSION).await;
+        return Err(anyhow!("session {} not resumable (no parked TCP connection)", hex_lower(&session_id)));
+    };
+
+    if active
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        repark(&handle, tcp_read, tcp_write).await;
+        reject(&mut send, FRAME_REJECT_DUPLICATE).await;
+        return Err(anyhow!("duplicate active connection rejected"));
+    }
+
+    let (helper_committed_offset, helper_sent_offset, replay_bytes) = {
+        let session = handle.lock().await;
+        let replay = session.output_buffer.replay_from(client_delivered_offset);
+        (session.helper_committed_offset, session.output_buffer.end_offset(), replay)
+    };
+    let Some(replay_bytes) = replay_bytes else {
+        active.store(false, Ordering::SeqCst);
+        repark(&handle, tcp_read, tcp_write).await;
+        reject(&mut send, resume::REJECT_OFFSET_GONE).await;
+        return Err(anyhow!(
+            "requested offset {client_delivered_offset} no longer in output buffer for session {}",
+            hex_lower(&session_id)
+        ));
+    };
+
+    log::info!(
+        "resume: session_id={} client_sent_offset={client_sent_offset} client_delivered_offset={client_delivered_offset} \
+         helper_committed_offset={helper_committed_offset} replaying {} bytes",
+        hex_lower(&session_id),
+        replay_bytes.len()
+    );
+
+    let mut ack = Vec::with_capacity(17);
+    ack.push(resume::RESUME_ACK);
+    ack.extend_from_slice(&helper_committed_offset.to_be_bytes());
+    ack.extend_from_slice(&helper_sent_offset.to_be_bytes());
+    if let Err(e) = send.write_all(&ack).await {
+        active.store(false, Ordering::SeqCst);
+        repark(&handle, tcp_read, tcp_write).await;
+        return Err(anyhow!("failed to write RESUME_ACK: {e}"));
+    }
+    if !replay_bytes.is_empty() {
+        if let Err(e) = send.write_all(&replay_bytes).await {
+            active.store(false, Ordering::SeqCst);
+            repark(&handle, tcp_read, tcp_write).await;
+            return Err(anyhow!("failed to replay buffered output: {e}"));
+        }
+    }
+
+    // control stream も新しい connection 上で作り直す（元の control stream は
+    // 古い connection に紐づいたまま失効している）。8-1 と同じ理由で、
+    // 確立を待たずに中継を先に始める。
+    let control_task = {
+        let conn = conn.clone();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret)).await {
+                Ok(Ok((csend, crecv, _new_id))) => {
+                    // control stream 上の session_id は毎回新規発行されるが、
+                    // resume 後も既存の session_id をそのまま使い続ける
+                    // （sessions テーブルのキーは変更しない）。
+                    log::info!("resume: control stream re-established for session_id={}", hex_lower(&session_id));
+                    spawn_app_ack_tasks(csend, crecv, handle);
+                }
+                Ok(Err(e)) => log::info!("resume: control stream re-establish failed ({e:#})"),
+                Err(_) => log::info!("resume: control stream not re-opened within timeout"),
+            }
+        })
+    };
+
+    let outcome = relay_buffered(&mut send, &mut recv, tcp_read, tcp_write, handle.clone(), target).await;
+    control_task.abort();
+    active.store(false, Ordering::SeqCst);
+    finish_or_park_session(&sessions, Some(session_id), handle, outcome).await;
+    Ok(())
+}
+
+/// `handle_resume_stream` の各早期リターン経路で共通の後始末: 取り出した
+/// TCP 接続をもう一度 `Session::parked_tcp` に戻し、`parked_since` を今の
+/// 時刻に更新する（次に来る resume 試行、またはタイムアウトでの破棄に備える）。
+async fn repark(handle: &Arc<Mutex<Session>>, tcp_read: tokio::net::tcp::OwnedReadHalf, tcp_write: tokio::net::tcp::OwnedWriteHalf) {
+    let mut session = handle.lock().await;
+    session.parked_tcp = Some((tcp_read, tcp_write));
+    session.parked_since = Some(std::time::Instant::now());
+}
+
+/// `session_secret` と QUIC connection の exporter から proof を計算する
+/// （data stream HELLO と control stream CONTROL_HELLO で共通のロジック）。
+fn compute_proof(
+    conn: &noq::Connection,
+    session_secret: &[u8; 32],
+    label: &[u8],
+    context: &[u8],
+) -> Result<[u8; 32]> {
+    let mut exporter = [0u8; 32];
+    conn.export_keying_material(&mut exporter, label, context)
+        .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
+    let mut mac =
+        HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
+    mac.update(&exporter);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+/// control stream を accept し、`CONTROL_HELLO` を検証して `session_id` を発行、
+/// `CONTROL_ACK` を返す。Phase 8 未対応の client（control stream を開かない）向けに
+/// 呼び出し側でタイムアウトを掛けることを想定している。
+async fn accept_control_stream(
+    conn: &noq::Connection,
+    session_secret: [u8; 32],
+) -> Result<(noq::SendStream, noq::RecvStream, resume::SessionId)> {
+    let (mut csend, mut crecv) = conn.accept_bi().await.context("no control stream opened")?;
+    let mut hello = [0u8; 33];
+    crecv
+        .read_exact(&mut hello)
+        .await
+        .context("failed to read CONTROL_HELLO")?;
+    if hello[0] != resume::CONTROL_HELLO {
+        return Err(anyhow!("unexpected control frame type: {:#x}", hello[0]));
+    }
+    let expected = compute_proof(conn, &session_secret, EXPORTER_LABEL, b"")?;
+    if hello[1..33].ct_eq(&expected).unwrap_u8() != 1 {
+        return Err(anyhow!("CONTROL_HELLO proof mismatch"));
+    }
+
+    let session_id = SessionTable::generate_session_id();
+    let mut ack = Vec::with_capacity(17);
+    ack.push(resume::CONTROL_ACK);
+    ack.extend_from_slice(&session_id);
+    csend
+        .write_all(&ack)
+        .await
+        .context("failed to write CONTROL_ACK")?;
+
+    Ok((csend, crecv, session_id))
+}
+
+/// target への TCP 接続・ACK 送出の後、中継を**即座に**開始する。
+/// output buffer は常に用意するが、control stream の accept を待って中継開始を
+/// 遅らせることはしない（旧クライアント・resume 非対応クライアントに対して
+/// 無駄な `HELLO_TIMEOUT` 分の遅延を与えないため。当初 control stream の accept
+/// を先に `await` してから中継する実装にしていたが、control stream を開かない
+/// クライアントとの疎通が最大 `HELLO_TIMEOUT` 秒も遅延するリグレッションを
+/// 実際に e2e テストで検出したため、この設計に変更した）。
+/// control stream の accept は背後タスクとして並行に進め、確立できたら
+/// 実行中の中継が使っている `Session` handle にそのまま APP_ACK タスクを紐付ける。
+async fn relay_with_resume(
+    conn: &noq::Connection,
+    send: &mut noq::SendStream,
+    recv: &mut noq::RecvStream,
+    target: SocketAddr,
+    session_secret: [u8; 32],
+    sessions: &SessionTable,
 ) -> Result<()> {
     let tcp = match TcpStream::connect(target).await {
         Ok(s) => s,
@@ -372,73 +644,202 @@ async fn relay(
             return Err(anyhow!("connect to {target} failed: {e}"));
         }
     };
-
     send.write_all(&[FRAME_ACK]).await?;
+    let (tcp_read, tcp_write) = tcp.into_split();
 
-    let mut tcp = tcp;
-    let mut quic = QuicDuplex { send, recv };
-    // 通常終了は stream の finish / half-close を優先し、Connection::close() は使わない
-    // （異常系・protocol violation のみ close を使う方針、HELPER_PROTOCOL.md 参照）。
-    match tokio::io::copy_bidirectional(&mut quic, &mut tcp).await {
-        Ok((to_target, to_client)) => {
-            log::info!(
-                "relay to {target} closed ({to_target} bytes -> target, {to_client} bytes -> client)"
-            );
-        }
-        Err(e) => log::warn!("relay to {target} error: {e}"),
-    }
+    let handle = Arc::new(Mutex::new(Session::new(DEFAULT_RESUME_BUFFER_SIZE)));
+    let established_id: Arc<Mutex<Option<resume::SessionId>>> = Arc::new(Mutex::new(None));
+
+    let control_task = {
+        let conn = conn.clone();
+        let handle = handle.clone();
+        let sessions = sessions.clone();
+        let established_id = established_id.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret)).await {
+                Ok(Ok((csend, crecv, id))) => {
+                    sessions.insert_existing(id, handle.clone()).await;
+                    *established_id.lock().await = Some(id);
+                    log::info!("control stream established, session_id={}", hex_lower(&id));
+                    spawn_app_ack_tasks(csend, crecv, handle);
+                }
+                Ok(Err(e)) => {
+                    log::info!("no resume support for this connection ({e:#})");
+                }
+                Err(_) => {
+                    log::info!("control stream not opened within timeout, continuing without resume support");
+                }
+            }
+        })
+    };
+
+    let outcome = relay_buffered(send, recv, tcp_read, tcp_write, handle.clone(), target).await;
+
+    control_task.abort();
+    let id = *established_id.lock().await;
+    finish_or_park_session(sessions, id, handle, outcome).await;
     Ok(())
 }
 
-struct QuicDuplex<'a> {
-    send: &'a mut quinn::SendStream,
-    recv: &'a mut quinn::RecvStream,
-}
-
-impl tokio::io::AsyncRead for QuicDuplex<'_> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        <quinn::RecvStream as tokio::io::AsyncRead>::poll_read(
-            std::pin::Pin::new(&mut *self.recv),
-            cx,
-            buf,
-        )
+/// data stream 側の中継ループ終了後、TCP 接続がまだ生きているとみなせるなら
+/// `Session::parked_tcp` に戻して resume を待てるようにし、TCP 自体が死んで
+/// いるなら（あるいは control stream が一度も確立せず session_id が無いなら）
+/// テーブルから破棄する。
+async fn finish_or_park_session(
+    sessions: &SessionTable,
+    id: Option<resume::SessionId>,
+    handle: Arc<Mutex<Session>>,
+    outcome: RelayOutcome,
+) {
+    let Some(id) = id else {
+        // control stream が確立せず session_id も発行されていない
+        // （旧クライアント等）。resume できないので何もしない
+        // （handle はテーブルに登録されていないのでこの Arc が drop されて終わり）。
+        return;
+    };
+    match outcome {
+        RelayOutcome::TcpDied => {
+            log::info!("session {} target connection died, discarding", hex_lower(&id));
+            sessions.remove(&id).await;
+        }
+        RelayOutcome::DataStreamDied { tcp_read, tcp_write } => {
+            log::info!("session {} data stream died, parking for possible resume", hex_lower(&id));
+            let mut session = handle.lock().await;
+            session.parked_tcp = Some((tcp_read, tcp_write));
+            session.parked_since = Some(std::time::Instant::now());
+            // sessions テーブルには既に insert_existing 済みなのでそのまま残す。
+        }
     }
 }
 
-impl tokio::io::AsyncWrite for QuicDuplex<'_> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        <quinn::SendStream as tokio::io::AsyncWrite>::poll_write(
-            std::pin::Pin::new(&mut *self.send),
-            cx,
-            buf,
-        )
+/// APP_ACK の送受信を行う背後タスクを spawn する。data stream 側が終わって
+/// `relay_with_resume` が呼び出し元の control_task を abort() すれば、
+/// control stream 側の read/write もいずれエラーになりループを抜ける。
+fn spawn_app_ack_tasks(
+    mut csend: noq::SendStream,
+    mut crecv: noq::RecvStream,
+    session: Arc<Mutex<Session>>,
+) {
+    // APP_ACK 受信: client からの client_delivered_offset を受け取り、
+    // output buffer の破棄範囲を進める。
+    {
+        let session = session.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut frame = [0u8; 9];
+                match crecv.read_exact(&mut frame).await {
+                    Ok(()) if frame[0] == resume::APP_ACK => {
+                        let offset = u64::from_be_bytes(frame[1..9].try_into().unwrap());
+                        session.lock().await.output_buffer.advance_start(offset);
+                    }
+                    _ => break,
+                }
+            }
+        });
     }
 
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        <quinn::SendStream as tokio::io::AsyncWrite>::poll_flush(
-            std::pin::Pin::new(&mut *self.send),
-            cx,
-        )
-    }
+    // APP_ACK 送信: helper_committed_offset（C→S の受信確認）を 200ms ごとに
+    // control stream 経由で client に送る（進みが無ければ送らない）。
+    tokio::spawn(async move {
+        let mut last_sent = 0u64;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let current = session.lock().await.helper_committed_offset;
+            if current == last_sent {
+                continue;
+            }
+            let mut frame = Vec::with_capacity(9);
+            frame.push(resume::APP_ACK);
+            frame.extend_from_slice(&current.to_be_bytes());
+            if csend.write_all(&frame).await.is_err() {
+                break;
+            }
+            last_sent = current;
+        }
+    });
+}
 
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        <quinn::SendStream as tokio::io::AsyncWrite>::poll_shutdown(
-            std::pin::Pin::new(&mut *self.send),
-            cx,
-        )
+/// `relay_buffered` の終了理由。呼び出し側はこれを見て、TCP 接続を
+/// `Session::parked_tcp` に戻して resume を待つか、破棄するかを決める。
+enum RelayOutcome {
+    /// target への TCP 接続自体が終わった（相手が正常/異常終了）。
+    /// resume する意味が無いので session ごと破棄してよい。
+    TcpDied,
+    /// data stream（QUIC）側が終わった。TCP 接続はまだ生きているとみなせるので、
+    /// 呼び出し側に返す。resume を待つために park できる。
+    DataStreamDied {
+        tcp_read: tokio::net::tcp::OwnedReadHalf,
+        tcp_write: tokio::net::tcp::OwnedWriteHalf,
+    },
+}
+
+/// output buffer 付きの中継。S→C 方向は `Session::output_buffer` に tee しつつ
+/// 送出し、C→S 方向は `Session::helper_committed_offset` を進める。
+/// control stream が最終的に確立しなかった場合でも、この関数自体は
+/// Phase 7 と同じ双方向コピーとして機能する（バッファへの tee はしているが
+/// 誰も参照しないだけで、実害はない。上限付きなので無制限には増えない）。
+///
+/// `tokio::join!` で両方向を独立に完了させる設計だと、片方向だけが
+/// data stream 側のエラーで終わり、もう片方向が TCP からの次のデータを
+/// 待ったまま（sshd がしばらく何も出力しない等）永久にブロックし得る
+/// バグがあったため、単一の `tokio::select!` ループに書き直した。
+/// いずれかの方向が「これ以上続けられない」と判断した時点で即座に終了する。
+async fn relay_buffered(
+    send: &mut noq::SendStream,
+    recv: &mut noq::RecvStream,
+    mut tcp_read: tokio::net::tcp::OwnedReadHalf,
+    mut tcp_write: tokio::net::tcp::OwnedWriteHalf,
+    session: Arc<Mutex<Session>>,
+    target: SocketAddr,
+) -> RelayOutcome {
+    let mut c2s_buf = vec![0u8; 16 * 1024];
+    let mut s2c_buf = vec![0u8; 16 * 1024];
+    let mut c2s_done = false; // client → helper 方向が half-close 済み
+
+    loop {
+        tokio::select! {
+            result = recv.read(&mut c2s_buf), if !c2s_done => {
+                match result {
+                    Ok(Some(n)) => {
+                        if let Err(e) = tcp_write.write_all(&c2s_buf[..n]).await {
+                            log::warn!("relay to {target}: tcp write failed: {e}");
+                            return RelayOutcome::TcpDied;
+                        }
+                        session.lock().await.helper_committed_offset += n as u64;
+                    }
+                    Ok(None) => {
+                        // client 側の half-close。S→C 方向はまだ継続する。
+                        let _ = tcp_write.shutdown().await;
+                        c2s_done = true;
+                    }
+                    Err(e) => {
+                        log::info!("relay to {target}: data stream (C->S) ended: {e}");
+                        return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                    }
+                }
+            }
+            result = tcp_read.read(&mut s2c_buf) => {
+                match result {
+                    Ok(0) => {
+                        // target（sshd）側が正常終了。resume する意味が無い。
+                        log::info!("relay to {target}: tcp closed cleanly");
+                        let _ = send.finish();
+                        return RelayOutcome::TcpDied;
+                    }
+                    Ok(n) => {
+                        if let Err(e) = send.write_all(&s2c_buf[..n]).await {
+                            log::info!("relay to {target}: data stream (S->C) write failed: {e}");
+                            return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                        }
+                        session.lock().await.output_buffer.append(&s2c_buf[..n]);
+                    }
+                    Err(e) => {
+                        log::warn!("relay to {target}: tcp read failed: {e}");
+                        return RelayOutcome::TcpDied;
+                    }
+                }
+            }
+        }
     }
 }
+
