@@ -46,6 +46,7 @@ class TerminalSessionTest {
         auth = SshAuth.Password("pass"),
         cols = 80u,
         rows = 24u,
+        forwards = emptyList(),
     )
 
     private suspend fun awaitState(condition: (TerminalUiState) -> Boolean): TerminalUiState =

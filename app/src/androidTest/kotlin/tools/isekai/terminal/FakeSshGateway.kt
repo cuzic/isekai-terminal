@@ -98,6 +98,16 @@ class FakeOrchestrator : SessionOrchestratorInterface {
         }
     }
 
+    val addedForwards = mutableListOf<PortForward>()
+    var removedForwardId: String? = null
+
+    override fun addLocalForward(id: String, bindAddress: String, bindPort: UShort, remoteHost: String, remotePort: UShort) {
+        addedForwards.add(PortForward(ForwardType.LOCAL, bindAddress, bindPort, remoteHost, remotePort))
+    }
+
+    override fun removeForward(id: String) { removedForwardId = id }
+
+
     // trzszDismiss() fires Idle synchronously, matching real Rust behavior
     override fun trzszDismiss() {
         trzszDismissCalled = true

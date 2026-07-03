@@ -394,6 +394,7 @@ class TerminalViewModelTest {
         vm.connect(SshConfig(
             host = "192.168.1.1", port = 22u, username = "user",
             auth = SshAuth.Password("pass"), cols = 80u, rows = 24u,
+            forwards = emptyList(),
         ))
         delay(100)
 
