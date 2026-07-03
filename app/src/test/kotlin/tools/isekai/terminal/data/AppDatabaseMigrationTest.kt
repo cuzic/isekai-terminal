@@ -18,15 +18,15 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 /**
- * MIGRATION_3_4 の実機検証。exportSchema=false のため room-testing の
- * MigrationTestHelper（スキーマ JSON 前提）は使わず、v3 時点の生スキーマを手動構築してから
+ * MIGRATION_8_9 の実機検証。exportSchema=false のため room-testing の
+ * MigrationTestHelper（スキーマ JSON 前提）は使わず、v8 時点の生スキーマを手動構築してから
  * 実際の Migration を適用し、Room が結果スキーマを正しいと認識する（＝以後のクエリが通る）
  * ことと、既存データが保持されることを確認する。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
 class AppDatabaseMigrationTest {
-    private val dbName = "migration-test-3-4.db"
+    private val dbName = "migration-test-8-9.db"
     private lateinit var ctx: Application
 
     @Before
@@ -41,12 +41,13 @@ class AppDatabaseMigrationTest {
     }
 
     @Test
-    fun migrate3To4_addsPostConnectCommandsColumn_andSnippetsTable_preservesExistingData() = runBlocking {
-        // Arrange: v3 スキーマの生データベースを作り、既存プロファイルを1件入れておく
-        val v3Helper = FrameworkSQLiteOpenHelperFactory().create(
+    fun migrate8To9_addsPostConnectCommandsColumn_andSnippetsTable_preservesExistingData() = runBlocking {
+        // Arrange: v8 スキーマ(migration 1→8 適用後の最終形)の生データベースを作り、
+        // 既存プロファイルを1件入れておく。
+        val v8Helper = FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(ctx)
                 .name(dbName)
-                .callback(object : SupportSQLiteOpenHelper.Callback(3) {
+                .callback(object : SupportSQLiteOpenHelper.Callback(8) {
                     override fun onCreate(db: SupportSQLiteDatabase) {
                         db.execSQL(
                             """
@@ -60,7 +61,12 @@ class AppDatabaseMigrationTest {
                                 keyId INTEGER,
                                 sort_order INTEGER NOT NULL DEFAULT 0,
                                 use_tsshd INTEGER NOT NULL DEFAULT 0,
-                                tsshd_port INTEGER NOT NULL DEFAULT 2222
+                                tsshd_port INTEGER NOT NULL DEFAULT 2222,
+                                transport_preference TEXT NOT NULL DEFAULT 'PLAIN_SSH',
+                                direct_address TEXT,
+                                enable_physical_multipath INTEGER NOT NULL DEFAULT 0,
+                                cellular_remote_address TEXT,
+                                enable_upstream_failover INTEGER NOT NULL DEFAULT 0
                             )
                             """.trimIndent()
                         )
@@ -93,8 +99,11 @@ class AppDatabaseMigrationTest {
                         db.execSQL(
                             """
                             INSERT INTO connection_profiles
-                                (label, host, port, username, authType, keyId, sort_order, use_tsshd, tsshd_port)
-                            VALUES ('legacy', 'example.com', 22, 'user', 'password', NULL, 0, 0, 2222)
+                                (label, host, port, username, authType, keyId, sort_order, use_tsshd, tsshd_port,
+                                 transport_preference, direct_address, enable_physical_multipath,
+                                 cellular_remote_address, enable_upstream_failover)
+                            VALUES ('legacy', 'example.com', 22, 'user', 'password', NULL, 0, 0, 2222,
+                                    'PLAIN_SSH', NULL, 0, NULL, 0)
                             """.trimIndent()
                         )
                     }
@@ -103,12 +112,12 @@ class AppDatabaseMigrationTest {
                 })
                 .build()
         )
-        v3Helper.writableDatabase // force onCreate
-        v3Helper.close()
+        v8Helper.writableDatabase // force onCreate
+        v8Helper.close()
 
-        // Act: Room を通じて実際の MIGRATION_3_4 を適用する
+        // Act: Room を通じて実際の MIGRATION_8_9 を適用する
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_3_4)
+            .addMigrations(AppDatabase.MIGRATION_8_9)
             .build()
 
         // Assert: 既存の行は保持され、新カラムは null
