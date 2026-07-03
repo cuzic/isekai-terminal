@@ -634,6 +634,9 @@ internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod5 : com.sun.
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod6 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod7 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`id`: RustBuffer.ByValue,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 internal interface UniffiCallbackInterfaceSessionCallbackMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`data`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
@@ -664,7 +667,10 @@ internal interface UniffiCallbackInterfaceSessionCallbackMethod8 : com.sun.jna.C
 internal interface UniffiCallbackInterfaceSessionCallbackMethod9 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath")
+internal interface UniffiCallbackInterfaceSessionCallbackMethod10 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`id`: RustBuffer.ByValue,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged")
 internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -675,6 +681,7 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `onTrzszStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod4? = null,
     @JvmField internal var `onDownloadComplete`: UniffiCallbackInterfaceOrchestratorCallbackMethod5? = null,
     @JvmField internal var `onNoViablePath`: UniffiCallbackInterfaceOrchestratorCallbackMethod6? = null,
+    @JvmField internal var `onForwardStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod7? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -686,7 +693,8 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onTrzszStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod4? = null,
         `onDownloadComplete`: UniffiCallbackInterfaceOrchestratorCallbackMethod5? = null,
         `onNoViablePath`: UniffiCallbackInterfaceOrchestratorCallbackMethod6? = null,
-    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,), Structure.ByValue
+        `onForwardStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod7? = null,
+    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceOrchestratorCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -698,10 +706,11 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onTrzszStateChanged` = other.`onTrzszStateChanged`
         `onDownloadComplete` = other.`onDownloadComplete`
         `onNoViablePath` = other.`onNoViablePath`
+        `onForwardStateChanged` = other.`onForwardStateChanged`
     }
 
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onData", "onHostKey", "onConnected", "onDisconnected", "onScreenUpdate", "onTrzszRequest", "onTrzszDownloadChunk", "onTrzszProgress", "onTrzszFinished", "onNoViablePath")
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onData", "onHostKey", "onConnected", "onDisconnected", "onScreenUpdate", "onTrzszRequest", "onTrzszDownloadChunk", "onTrzszProgress", "onTrzszFinished", "onNoViablePath", "onForwardStateChanged")
 internal open class UniffiVTableCallbackInterfaceSessionCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -715,6 +724,7 @@ internal open class UniffiVTableCallbackInterfaceSessionCallback(
     @JvmField internal var `onTrzszProgress`: UniffiCallbackInterfaceSessionCallbackMethod7? = null,
     @JvmField internal var `onTrzszFinished`: UniffiCallbackInterfaceSessionCallbackMethod8? = null,
     @JvmField internal var `onNoViablePath`: UniffiCallbackInterfaceSessionCallbackMethod9? = null,
+    @JvmField internal var `onForwardStateChanged`: UniffiCallbackInterfaceSessionCallbackMethod10? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -729,7 +739,8 @@ internal open class UniffiVTableCallbackInterfaceSessionCallback(
         `onTrzszProgress`: UniffiCallbackInterfaceSessionCallbackMethod7? = null,
         `onTrzszFinished`: UniffiCallbackInterfaceSessionCallbackMethod8? = null,
         `onNoViablePath`: UniffiCallbackInterfaceSessionCallbackMethod9? = null,
-    ): UniffiVTableCallbackInterfaceSessionCallback(`uniffiFree`,`uniffiClone`,`onData`,`onHostKey`,`onConnected`,`onDisconnected`,`onScreenUpdate`,`onTrzszRequest`,`onTrzszDownloadChunk`,`onTrzszProgress`,`onTrzszFinished`,`onNoViablePath`,), Structure.ByValue
+        `onForwardStateChanged`: UniffiCallbackInterfaceSessionCallbackMethod10? = null,
+    ): UniffiVTableCallbackInterfaceSessionCallback(`uniffiFree`,`uniffiClone`,`onData`,`onHostKey`,`onConnected`,`onDisconnected`,`onScreenUpdate`,`onTrzszRequest`,`onTrzszDownloadChunk`,`onTrzszProgress`,`onTrzszFinished`,`onNoViablePath`,`onForwardStateChanged`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceSessionCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -744,6 +755,7 @@ internal open class UniffiVTableCallbackInterfaceSessionCallback(
         `onTrzszProgress` = other.`onTrzszProgress`
         `onTrzszFinished` = other.`onTrzszFinished`
         `onNoViablePath` = other.`onNoViablePath`
+        `onForwardStateChanged` = other.`onForwardStateChanged`
     }
 
 }
@@ -856,6 +868,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_send_chunk(
     ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_add_local_forward(
+    ): Int
     external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect(
     ): Int
     external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_helper_quic(
@@ -875,6 +889,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_tssh_core_checksum_method_sessionorchestrator_notify_network_lost(
     ): Int
     external fun uniffi_tssh_core_checksum_method_sessionorchestrator_rebind_to_fd(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_remove_forward(
     ): Int
     external fun uniffi_tssh_core_checksum_method_sessionorchestrator_resize(
     ): Int
@@ -928,6 +944,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_no_viable_path(
     ): Int
+    external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_forward_state_changed(
+    ): Int
     external fun uniffi_tssh_core_checksum_method_sessioncallback_on_data(
     ): Int
     external fun uniffi_tssh_core_checksum_method_sessioncallback_on_host_key(
@@ -947,6 +965,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_finished(
     ): Int
     external fun uniffi_tssh_core_checksum_method_sessioncallback_on_no_viable_path(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessioncallback_on_forward_state_changed(
     ): Int
     external fun ffi_tssh_core_uniffi_contract_version(
     ): Int
@@ -1048,6 +1068,8 @@ external fun uniffi_tssh_core_fn_clone_sessionorchestrator(`handle`: Long,uniffi
 ): Long
 external fun uniffi_tssh_core_fn_free_sessionorchestrator(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_tssh_core_fn_method_sessionorchestrator_add_local_forward(`ptr`: Long,`id`: RustBuffer.ByValue,`bindAddress`: RustBuffer.ByValue,`bindPort`: Short,`remoteHost`: RustBuffer.ByValue,`remotePort`: Short,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_helper_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1067,6 +1089,8 @@ external fun uniffi_tssh_core_fn_method_sessionorchestrator_notify_error(`ptr`: 
 external fun uniffi_tssh_core_fn_method_sessionorchestrator_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_sessionorchestrator_rebind_to_fd(`ptr`: Long,`fd`: Int,`localIp`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionorchestrator_remove_forward(`ptr`: Long,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_sessionorchestrator_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1384,6 +1408,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_send_chunk() != 62085) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_add_local_forward() != 14593) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect() != 59422) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1412,6 +1439,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_rebind_to_fd() != 28412) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_remove_forward() != 32241) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_resize() != 60330) {
@@ -1492,6 +1522,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_no_viable_path() != 17400) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_forward_state_changed() != 107) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_data() != 27387) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1520,6 +1553,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_no_viable_path() != 33355) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_forward_state_changed() != 26529) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -3200,6 +3236,13 @@ public object FfiConverterTypeQuicSession: FfiConverter<QuicSession, Long> {
 
 public interface SessionOrchestratorInterface {
     
+    /**
+     * 接続中にローカルポートフォワード(-L)を動的に追加する。
+     * MVP の UI は接続前に `SshConfig.forwards` へまとめて設定するだけなので現状未使用だが、
+     * 将来「接続したまま転送を足す」UI を追加する際の入り口として用意している。
+     */
+    fun `addLocalForward`(`id`: kotlin.String, `bindAddress`: kotlin.String, `bindPort`: kotlin.UShort, `remoteHost`: kotlin.String, `remotePort`: kotlin.UShort)
+    
     fun `connect`(`config`: SshConfig)
     
     /**
@@ -3243,6 +3286,8 @@ public interface SessionOrchestratorInterface {
      * （所有権はこちらに移る）。マルチパス以外のtransportや未接続時は何もしない。
      */
     fun `rebindToFd`(`fd`: kotlin.Int, `localIp`: kotlin.String)
+    
+    fun `removeForward`(`id`: kotlin.String)
     
     fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
     
@@ -3360,6 +3405,23 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
             UniffiLib.uniffi_tssh_core_fn_clone_sessionorchestrator(handle, status)
         }
     }
+
+    
+    /**
+     * 接続中にローカルポートフォワード(-L)を動的に追加する。
+     * MVP の UI は接続前に `SshConfig.forwards` へまとめて設定するだけなので現状未使用だが、
+     * 将来「接続したまま転送を足す」UI を追加する際の入り口として用意している。
+     */override fun `addLocalForward`(`id`: kotlin.String, `bindAddress`: kotlin.String, `bindPort`: kotlin.UShort, `remoteHost`: kotlin.String, `remotePort`: kotlin.UShort)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_add_local_forward(
+        it,
+        FfiConverterString.lower(`id`),FfiConverterString.lower(`bindAddress`),FfiConverterUShort.lower(`bindPort`),FfiConverterString.lower(`remoteHost`),FfiConverterUShort.lower(`remotePort`),_status)
+}
+    }
+    
+    
 
     
     @Throws(SshException::class)override fun `connect`(`config`: SshConfig)
@@ -3506,6 +3568,18 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_rebind_to_fd(
         it,
         FfiConverterInt.lower(`fd`),FfiConverterString.lower(`localIp`),_status)
+}
+    }
+    
+    
+
+    override fun `removeForward`(`id`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_remove_forward(
+        it,
+        FfiConverterString.lower(`id`),_status)
 }
     }
     
@@ -4262,6 +4336,63 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
 
 
 
+data class PortForward (
+    var `forwardType`: ForwardType
+    , 
+    /**
+     * 待受アドレス。既定は "127.0.0.1"("0.0.0.0" 等にすると同一 LAN 上の
+     * 第三者からアクセスされ得るため UI 側で警告する)。
+     */
+    var `bindAddress`: kotlin.String
+    , 
+    var `bindPort`: kotlin.UShort
+    , 
+    var `remoteHost`: kotlin.String
+    , 
+    var `remotePort`: kotlin.UShort
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePortForward: FfiConverterRustBuffer<PortForward> {
+    override fun read(buf: ByteBuffer): PortForward {
+        return PortForward(
+            FfiConverterTypeForwardType.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterUShort.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterUShort.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PortForward) = (
+            FfiConverterTypeForwardType.allocationSize(value.`forwardType`) +
+            FfiConverterString.allocationSize(value.`bindAddress`) +
+            FfiConverterUShort.allocationSize(value.`bindPort`) +
+            FfiConverterString.allocationSize(value.`remoteHost`) +
+            FfiConverterUShort.allocationSize(value.`remotePort`)
+    )
+
+    override fun write(value: PortForward, buf: ByteBuffer) {
+            FfiConverterTypeForwardType.write(value.`forwardType`, buf)
+            FfiConverterString.write(value.`bindAddress`, buf)
+            FfiConverterUShort.write(value.`bindPort`, buf)
+            FfiConverterString.write(value.`remoteHost`, buf)
+            FfiConverterUShort.write(value.`remotePort`, buf)
+    }
+}
+
+
+
 data class QuicConfig (
     /**
      * tsshd の QUIC エンドポイント (e.g. "100.100.45.36")
@@ -4424,6 +4555,11 @@ data class SshConfig (
     var `cols`: kotlin.UInt
     , 
     var `rows`: kotlin.UInt
+    , 
+    /**
+     * ローカルポートフォワード(-L)の一覧。接続確立後に自動で待受を開始する。
+     */
+    var `forwards`: List<PortForward>
     
 ){
     
@@ -4446,6 +4582,7 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterTypeSshAuth.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterSequenceTypePortForward.read(buf),
         )
     }
 
@@ -4455,7 +4592,8 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterString.allocationSize(value.`username`) +
             FfiConverterTypeSshAuth.allocationSize(value.`auth`) +
             FfiConverterUInt.allocationSize(value.`cols`) +
-            FfiConverterUInt.allocationSize(value.`rows`)
+            FfiConverterUInt.allocationSize(value.`rows`) +
+            FfiConverterSequenceTypePortForward.allocationSize(value.`forwards`)
     )
 
     override fun write(value: SshConfig, buf: ByteBuffer) {
@@ -4465,6 +4603,7 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterTypeSshAuth.write(value.`auth`, buf)
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
+            FfiConverterSequenceTypePortForward.write(value.`forwards`, buf)
     }
 }
 
@@ -4584,6 +4723,132 @@ public object FfiConverterTypeConnectionPublicState : FfiConverterRustBuffer<Con
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
+ * ポートフォワード待受の状態。`OrchestratorCallback::on_forward_state_changed` で通知される。
+ */
+sealed class ForwardState {
+    
+    object Listening : ForwardState()
+    
+    
+    data class Failed(
+        val `reason`: kotlin.String) : ForwardState()
+        
+    {
+        
+
+        companion object
+    }
+    
+    object Stopped : ForwardState()
+    
+    
+
+    
+
+    
+    
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeForwardState : FfiConverterRustBuffer<ForwardState>{
+    override fun read(buf: ByteBuffer): ForwardState {
+        return when(buf.getInt()) {
+            1 -> ForwardState.Listening
+            2 -> ForwardState.Failed(
+                FfiConverterString.read(buf),
+                )
+            3 -> ForwardState.Stopped
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: ForwardState) = when(value) {
+        is ForwardState.Listening -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is ForwardState.Failed -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`reason`)
+            )
+        }
+        is ForwardState.Stopped -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+    }
+
+    override fun write(value: ForwardState, buf: ByteBuffer) {
+        when(value) {
+            is ForwardState.Listening -> {
+                buf.putInt(1)
+                Unit
+            }
+            is ForwardState.Failed -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.`reason`, buf)
+                Unit
+            }
+            is ForwardState.Stopped -> {
+                buf.putInt(3)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+
+enum class ForwardType {
+    
+    /**
+     * `ssh -L bind:remote_host:remote_port` 相当。Dynamic/Remote は将来拡張。
+     */
+    LOCAL;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeForwardType: FfiConverterRustBuffer<ForwardType> {
+    override fun read(buf: ByteBuffer) = try {
+        ForwardType.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: ForwardType) = 4UL
+
+    override fun write(value: ForwardType, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 
@@ -5035,6 +5300,8 @@ public interface OrchestratorCallback {
      */
     fun `onNoViablePath`()
     
+    fun `onForwardStateChanged`(`id`: kotlin.String, `state`: ForwardState)
+    
     companion object
 }
 
@@ -5128,6 +5395,19 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+    internal object `onForwardStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod7 {
+        override fun callback(`uniffiHandle`: Long,`id`: RustBuffer.ByValue,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onForwardStateChanged`(
+                    FfiConverterString.lift(`id`),
+                    FfiConverterTypeForwardState.lift(`state`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
 
     internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
@@ -5151,6 +5431,7 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
         `onTrzszStateChanged`,
         `onDownloadComplete`,
         `onNoViablePath`,
+        `onForwardStateChanged`,
     )
 
     // Registers the foreign callback with the Rust side.
@@ -5192,6 +5473,8 @@ public interface SessionCallback {
     fun `onTrzszFinished`(`transferId`: kotlin.String, `success`: kotlin.Boolean, `message`: kotlin.String?)
     
     fun `onNoViablePath`()
+    
+    fun `onForwardStateChanged`(`id`: kotlin.String, `state`: ForwardState)
     
     companion object
 }
@@ -5327,6 +5610,19 @@ internal object uniffiCallbackInterfaceSessionCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+    internal object `onForwardStateChanged`: UniffiCallbackInterfaceSessionCallbackMethod10 {
+        override fun callback(`uniffiHandle`: Long,`id`: RustBuffer.ByValue,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeSessionCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onForwardStateChanged`(
+                    FfiConverterString.lift(`id`),
+                    FfiConverterTypeForwardState.lift(`state`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
 
     internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
@@ -5353,6 +5649,7 @@ internal object uniffiCallbackInterfaceSessionCallback {
         `onTrzszProgress`,
         `onTrzszFinished`,
         `onNoViablePath`,
+        `onForwardStateChanged`,
     )
 
     // Registers the foreign callback with the Rust side.
@@ -5517,6 +5814,34 @@ public object FfiConverterSequenceTypeCellData: FfiConverterRustBuffer<List<Cell
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeCellData.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<PortForward>> {
+    override fun read(buf: ByteBuffer): List<PortForward> {
+        val len = buf.getInt()
+        return List<PortForward>(len) {
+            FfiConverterTypePortForward.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<PortForward>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypePortForward.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<PortForward>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypePortForward.write(it, buf)
         }
     }
 } fun `createSshSession`(`config`: SshConfig): SshSession {
