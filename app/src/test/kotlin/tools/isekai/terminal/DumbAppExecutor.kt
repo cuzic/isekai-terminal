@@ -14,12 +14,22 @@ class DumbAppExecutor : AppExecutor {
     var keyPem: ByteArray = ByteArray(0)
     var keyPemError: Throwable? = null
 
+    /** updateSessionsSummary() に渡された最後の (connectedCount, totalCount)。 */
+    var lastSessionsSummary: Pair<Int, Int>? = null
+    /** updateSessionsSummary(0, 0)（＝FGS が止まってよいタイミング）が呼ばれた回数。 */
+    var serviceStoppedCount = 0
+
     private var _onAvailable: (() -> Unit)? = null
     private var _onLost: (() -> Unit)? = null
 
     override fun ensureServiceRunning() { serviceRunCount++ }
     override fun notifyConnected(host: String) { connectedHosts.add(host) }
     override fun notifyDisconnected() { disconnectedCount++ }
+
+    override fun updateSessionsSummary(connectedCount: Int, totalCount: Int) {
+        lastSessionsSummary = connectedCount to totalCount
+        if (totalCount <= 0) serviceStoppedCount++
+    }
 
     override fun registerNetworkCallbacks(onAvailable: () -> Unit, onLost: () -> Unit) {
         _onAvailable = onAvailable

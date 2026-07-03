@@ -69,6 +69,10 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
         terminalService?.notifyDisconnected()
     }
 
+    override fun updateSessionsSummary(connectedCount: Int, totalCount: Int) {
+        terminalService?.updateSessionsSummary(connectedCount, totalCount)
+    }
+
     override fun registerNetworkCallbacks(onAvailable: () -> Unit, onLost: () -> Unit) {
         // 単一の "internet capability があるか" ではなく、direct/Tailscale を別々に追跡し、
         // どちらか一方でも使える経路がある間は onLost を鳴らさない（PLAN.md Phase 7-7 参照）。

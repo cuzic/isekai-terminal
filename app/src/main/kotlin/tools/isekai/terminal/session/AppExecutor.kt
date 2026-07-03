@@ -14,6 +14,11 @@ interface AppExecutor {
     fun notifyConnected(host: String)
     /** SSH 切断をシステム通知へ伝える。 */
     fun notifyDisconnected()
+    /**
+     * 複数タブ共有時の集約通知を更新する。[totalCount] が 0 の場合は FGS を停止してよい。
+     * 単一セッションの [notifyConnected]/[notifyDisconnected] とは独立した経路。
+     */
+    fun updateSessionsSummary(connectedCount: Int, totalCount: Int)
     /** ネットワーク変化のコールバックを登録する。 */
     fun registerNetworkCallbacks(onAvailable: () -> Unit, onLost: () -> Unit)
     /** ネットワーク変化のコールバックを解除する。 */

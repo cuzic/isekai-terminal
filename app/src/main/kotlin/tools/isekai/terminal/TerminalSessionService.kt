@@ -31,6 +31,21 @@ class TerminalSessionService : Service() {
         updateNotification("切断済み")
     }
 
+    /**
+     * 複数タブ共有時の集約通知。
+     *
+     * [totalCount] が 0 になった（＝最後のタブが閉じられた）場合のみ自身を停止する。
+     * それ以外は「Nセッション接続中」という1枚の通知に集約する。
+     */
+    fun updateSessionsSummary(connectedCount: Int, totalCount: Int) {
+        if (totalCount <= 0) {
+            stopSelf()
+            return
+        }
+        val label = if (connectedCount > 0) "${connectedCount}セッション接続中" else "${totalCount}タブ（切断済み）"
+        updateNotification(label)
+    }
+
     override fun onBind(intent: Intent): IBinder = binder
 
     override fun onCreate() {
