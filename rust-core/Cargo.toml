@@ -14,8 +14,11 @@ crate-type = ["cdylib", "staticlib"]
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
+rcgen = "0.13"
+tokio = { version = "1", features = ["test-util"] }
 
 [dependencies]
+rand = "0.8"
 uniffi = { version = "0.31", features = ["tokio"] }
 timed-fsm = "0.3.0"
 russh = "0.48"
