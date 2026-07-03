@@ -15,7 +15,9 @@ isekai-helper [OPTIONS]
 OPTIONS:
   --target <ADDR:PORT>          中継先（既定: 127.0.0.1:22）
   --bind <ADDR:PORT>            QUIC バインドアドレス。ポート 0 で OS に空きポートを選ばせる（既定: 0.0.0.0:0）
-  --idle-timeout <SECS>         QUIC トランスポートの max_idle_timeout（既定: 30）
+  --idle-timeout <SECS>         QUIC トランスポートの max_idle_timeout（既定: 15。Phase 8-4b 参照）
+  --resume-window <SECS>        park された（data stream が切れて resume 待ちの）セッションを
+                                 保持する時間。これを過ぎたら破棄する（既定: 120。Phase 8-4b 参照）
   --max-idle-lifetime <SECS>    アクティブな接続が無く、かつ新規接続も来ない状態が続いたら自己終了するまでの秒数（既定: 600）
   --once                        1回の接続が終了したら常駐せず終了する（既定は常駐し、次の接続を待つ）
   --log-level <LEVEL>           error|warn|info|debug|trace（既定: info）。stderr にのみ出力する
