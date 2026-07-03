@@ -73,6 +73,7 @@ fun AppRoot() {
                     navController.navigate(AppRoutes.PROFILE_EDIT)
                 },
                 onManageKeys = { navController.navigate(AppRoutes.KEY_LIST) },
+                onManageSnippets = { navController.navigate(AppRoutes.SNIPPET_LIST) },
             )
         }
 
@@ -106,6 +107,31 @@ fun AppRoot() {
         composable(AppRoutes.KEY_IMPORT) {
             RemoteLogger.i("TsshNav", "→ KeyImport")
             KeyImportScreen(
+                onSave = { navController.popBackStack() },
+                onCancel = { navController.popBackStack() },
+            )
+        }
+
+        composable(AppRoutes.SNIPPET_LIST) {
+            RemoteLogger.i("TsshNav", "→ SnippetList")
+            SnippetListScreen(
+                onAddSnippet = {
+                    navVm.pendingEditSnippet = null
+                    navController.navigate(AppRoutes.SNIPPET_EDIT)
+                },
+                onEditSnippet = { snippet ->
+                    navVm.pendingEditSnippet = snippet
+                    navController.navigate(AppRoutes.SNIPPET_EDIT)
+                },
+                onBack = { navController.popBackStack() },
+            )
+        }
+
+        composable(AppRoutes.SNIPPET_EDIT) {
+            val editing = navVm.pendingEditSnippet
+            RemoteLogger.i("TsshNav", "→ ${if (editing == null) "SnippetEdit(new)" else "SnippetEdit(id=${editing.id} '${editing.label}')"}")
+            SnippetEditScreen(
+                snippet = editing,
                 onSave = { navController.popBackStack() },
                 onCancel = { navController.popBackStack() },
             )

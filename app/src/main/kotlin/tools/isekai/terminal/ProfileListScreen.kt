@@ -51,6 +51,7 @@ fun ProfileListScreen(
     onAddProfile: () -> Unit,
     onEditProfile: (ConnectionProfile) -> Unit,
     onManageKeys: () -> Unit = {},
+    onManageSnippets: () -> Unit = {},
     // Rust 側への実際の反映は差し替え可能にしておく（テストでは native 呼び出しを避けるため no-op を注入する）
     applyTerminalTheme: (TerminalTheme) -> Unit = { theme ->
         setTerminalTheme(theme.ansi16Argb(), theme.foregroundArgb(), theme.backgroundArgb())
@@ -86,6 +87,7 @@ fun ProfileListScreen(
                 horizontalArrangement = Arrangement.End,
             ) {
                 TextButton(onClick = { showThemeDialog = true }) { Text("配色") }
+                TextButton(onClick = onManageSnippets) { Text("定型") }
                 TextButton(onClick = onManageKeys) { Text("鍵管理") }
             }
         },
