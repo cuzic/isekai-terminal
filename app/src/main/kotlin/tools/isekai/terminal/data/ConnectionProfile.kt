@@ -40,6 +40,8 @@ data class ConnectionProfile(
     // 検知したら、noqのopen_path()同時オープン（noq issue #738で判明した不具合）を
     // 使わず、Endpoint::rebind_abstract()でセルラーへ丸ごと切り替える。実験的機能・既定OFF。
     @ColumnInfo(name = "enable_upstream_failover") val enableUpstreamFailover: Boolean = false,
+    // 接続確立後に自動実行するコマンド列（改行区切り、複数可）。null/空なら何もしない。
+    @ColumnInfo(name = "post_connect_commands") val postConnectCommands: String? = null,
 ) : Parcelable {
     val transportPreference: TransportPreference
         get() = try {

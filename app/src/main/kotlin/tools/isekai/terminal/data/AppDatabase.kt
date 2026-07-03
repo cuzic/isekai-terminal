@@ -8,14 +8,15 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-    entities = [KnownHost::class, ConnectionProfile::class, KeyEntry::class],
-    version = 8,
+    entities = [KnownHost::class, ConnectionProfile::class, KeyEntry::class, Snippet::class],
+    version = 9,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun knownHostDao(): KnownHostDao
     abstract fun connectionProfileDao(): ConnectionProfileDao
     abstract fun keyEntryDao(): KeyEntryDao
+    abstract fun snippetDao(): SnippetDao
 
     companion object {
         @Volatile private var instance: AppDatabase? = null
@@ -95,6 +96,24 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        // internal（private ではない）: androidTest/test 側からマイグレーション単体テストで直接使うため。
+        internal val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // スニペット（定型コマンド）機能: 接続後自動実行コマンド列 + snippets テーブル。
+                db.execSQL("ALTER TABLE connection_profiles ADD COLUMN post_connect_commands TEXT")
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS snippets (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        label TEXT NOT NULL,
+                        command TEXT NOT NULL,
+                        sort_order INTEGER NOT NULL DEFAULT 0,
+                        profile_id INTEGER,
+                        append_newline INTEGER NOT NULL DEFAULT 1
+                    )
+                """.trimIndent())
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase =
             instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -104,7 +123,7 @@ abstract class AppDatabase : RoomDatabase() {
                 )
                 .addMigrations(
                     MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7,
-                    MIGRATION_7_8,
+                    MIGRATION_7_8, MIGRATION_8_9,
                 )
                 .build().also { instance = it }
             }

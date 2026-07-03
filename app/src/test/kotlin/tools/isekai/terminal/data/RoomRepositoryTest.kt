@@ -147,6 +147,136 @@ class KeyEntryRepositoryTest {
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
+class SnippetRepositoryTest {
+    private lateinit var db: AppDatabase
+    private lateinit var profileRepo: ConnectionProfileRepository
+    private lateinit var repo: SnippetRepository
+
+    @Before fun setup() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        db = Room.inMemoryDatabaseBuilder(ctx, AppDatabase::class.java)
+            .allowMainThreadQueries().build()
+        profileRepo = ConnectionProfileRepository(db.connectionProfileDao())
+        repo = SnippetRepository(db.snippetDao())
+    }
+
+    @After fun teardown() { db.close() }
+
+    private fun snippet(label: String, profileId: Long? = null, sortOrder: Int = 0) = Snippet(
+        label = label, command = "echo $label", profileId = profileId, sortOrder = sortOrder,
+    )
+
+    @Test fun save_and_getAll_returnsSnippet() = runBlocking {
+        repo.save(snippet("ll"))
+        val all = repo.getAll()
+        assertEquals(1, all.size)
+        assertEquals("ll", all[0].label)
+    }
+
+    @Test fun save_and_findById_returnsSnippet() = runBlocking {
+        val id = repo.save(snippet("ll"))
+        val found = repo.findById(id)
+        assertEquals("ll", found?.label)
+        assertEquals(id, found?.id)
+    }
+
+    @Test fun findById_nonexistent_returnsNull() = runBlocking {
+        assertNull(repo.findById(999))
+    }
+
+    @Test fun defaultValues_appendNewlineTrue_profileIdNull() = runBlocking {
+        val id = repo.save(snippet("ll"))
+        val found = repo.findById(id)!!
+        assertTrue(found.appendNewline)
+        assertNull(found.profileId)
+    }
+
+    @Test fun update_via_upsert_replacesExisting() = runBlocking {
+        val id = repo.save(snippet("original"))
+        val stored = repo.findById(id)!!
+        repo.save(stored.copy(label = "renamed"))
+        val all = repo.getAll()
+        assertEquals(1, all.size)
+        assertEquals("renamed", all[0].label)
+        assertEquals(id, all[0].id)
+    }
+
+    @Test fun delete_removesFromDb() = runBlocking {
+        val id = repo.save(snippet("ll"))
+        repo.delete(repo.findById(id)!!)
+        assertTrue(repo.getAll().isEmpty())
+        assertNull(repo.findById(id))
+    }
+
+    @Test fun getAll_emptyDb_returnsEmpty() = runBlocking {
+        assertTrue(repo.getAll().isEmpty())
+    }
+
+    // ── merge ロジック（共通 + プロファイル専用）────────────────────
+
+    @Test fun getForProfile_returnsOnlyCommonWhenNoProfileSpecific() = runBlocking {
+        val profileId = profileRepo.save(
+            ConnectionProfile(label = "web", host = "h", username = "u", authType = "password")
+        )
+        repo.save(snippet("common", profileId = null))
+        val result = repo.getForProfile(profileId)
+        assertEquals(listOf("common"), result.map { it.label })
+    }
+
+    @Test fun getForProfile_mergesCommonAndProfileSpecific() = runBlocking {
+        val profileId = profileRepo.save(
+            ConnectionProfile(label = "web", host = "h", username = "u", authType = "password")
+        )
+        val otherProfileId = profileRepo.save(
+            ConnectionProfile(label = "db", host = "h2", username = "u", authType = "password")
+        )
+        repo.save(snippet("common", profileId = null))
+        repo.save(snippet("web-only", profileId = profileId))
+        repo.save(snippet("db-only", profileId = otherProfileId))
+
+        val result = repo.getForProfile(profileId).map { it.label }.toSet()
+        assertEquals(setOf("common", "web-only"), result)
+    }
+
+    @Test fun getForProfile_excludesOtherProfilesSnippets() = runBlocking {
+        val profileId = profileRepo.save(
+            ConnectionProfile(label = "web", host = "h", username = "u", authType = "password")
+        )
+        val otherProfileId = profileRepo.save(
+            ConnectionProfile(label = "db", host = "h2", username = "u", authType = "password")
+        )
+        repo.save(snippet("db-only", profileId = otherProfileId))
+
+        val result = repo.getForProfile(profileId)
+        assertTrue(result.none { it.label == "db-only" })
+    }
+
+    @Test fun getForProfile_nullProfileId_returnsOnlyCommonSnippets() = runBlocking {
+        val profileId = profileRepo.save(
+            ConnectionProfile(label = "web", host = "h", username = "u", authType = "password")
+        )
+        repo.save(snippet("common", profileId = null))
+        repo.save(snippet("web-only", profileId = profileId))
+
+        val result = repo.getForProfile(null)
+        assertEquals(listOf("common"), result.map { it.label })
+    }
+
+    @Test fun getForProfile_orderedBySortOrderThenLabel() = runBlocking {
+        val profileId = profileRepo.save(
+            ConnectionProfile(label = "web", host = "h", username = "u", authType = "password")
+        )
+        repo.save(snippet("charlie", profileId = profileId, sortOrder = 1))
+        repo.save(snippet("alpha", profileId = profileId, sortOrder = 1))
+        repo.save(snippet("bravo", profileId = profileId, sortOrder = 0))
+
+        val labels = repo.getForProfile(profileId).map { it.label }
+        assertEquals(listOf("bravo", "alpha", "charlie"), labels)
+    }
+}
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
 class KnownHostRepositoryTest {
     private lateinit var db: AppDatabase
     private lateinit var repo: KnownHostRepository
