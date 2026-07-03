@@ -2,6 +2,7 @@ uniffi::setup_scaffolding!("tssh_core");
 
 pub mod trzsz;
 pub mod quic_transport;
+pub(crate) mod agent_forward;
 pub(crate) mod terminal;
 pub(crate) mod theme;
 pub(crate) mod transport;
@@ -77,6 +78,11 @@ pub struct SshConfig {
     pub rows: u32,
     /// ローカルポートフォワード(-L)の一覧。接続確立後に自動で待受を開始する。
     pub forwards: Vec<PortForward>,
+    /// SSH agent forwarding。既定 OFF・プロファイル単位 opt-in。
+    /// 有効でも公開鍵認証以外（パスワード認証）の場合は転送しない。
+    /// 有効な場合、サーバー側からの署名要求は毎回ユーザー確認を必須とする
+    /// （`OrchestratorCallback::on_agent_sign_request` / `SessionCallback::on_agent_sign_request`）。
+    pub agent_forward: bool,
 }
 
 // ── ポートフォワード(-L のみ、MVP) ───────────────────────
@@ -217,6 +223,12 @@ pub trait OrchestratorCallback: Send + Sync {
     /// マルチパス以外のtransportでは呼ばれない。
     fn on_no_viable_path(&self);
     fn on_forward_state_changed(&self, id: String, state: ForwardState);
+    /// SSH agent forwarding: 転送された鍵での署名要求を、要求ごとにユーザーへ確認する。
+    /// `true` を返すと署名を実行し、`false` なら拒否する。呼び出し元は host key 確認と
+    /// 同じ同期ブロッキング方式（Rust 側の `spawn_blocking` から呼ばれる）を使うため、
+    /// この実装は呼び出し元スレッドをブロックしてユーザー操作を待ってよい
+    /// （実装例は `TerminalSession.kt` の `onAgentSignRequest` を参照）。
+    fn on_agent_sign_request(&self, key_fingerprint: String) -> bool;
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -235,6 +247,7 @@ pub trait SessionCallback: Send + Sync {
     fn on_trzsz_finished(&self, transfer_id: String, success: bool, message: Option<String>);
     fn on_no_viable_path(&self);
     fn on_forward_state_changed(&self, id: String, state: ForwardState);
+    fn on_agent_sign_request(&self, key_fingerprint: String) -> bool;
 }
 
 // ── SshSession ──────────────────────────────────────────
@@ -346,7 +359,8 @@ pub(crate) async fn run_russh_transport(
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let handler = RusshEventHandler { event_tx: event_tx.clone() };
+    let handler = RusshEventHandler::new(event_tx.clone());
+    let agent_key = handler.agent_key.clone();
 
     let addr = format!("{}:{}", config.host, config.port);
     info!("ssh: TCP connecting to {}", addr);
@@ -361,6 +375,7 @@ pub(crate) async fn run_russh_transport(
 
     run_ssh_channel_loop(
         &config.username, &config.auth, config.cols, config.rows,
+        config.agent_forward, agent_key,
         session, cmd_rx, event_tx,
     ).await;
 }

@@ -291,7 +291,8 @@ async fn run_quic_transport(
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let handler = RusshEventHandler { event_tx: event_tx.clone() };
+    let handler = RusshEventHandler::new(event_tx.clone());
+    let agent_key = handler.agent_key.clone();
 
     let session = match client::connect_stream(russh_config, stream, handler).await {
         Ok(s) => s,
@@ -301,8 +302,11 @@ async fn run_quic_transport(
         }
     };
 
+    // Phase 5B の QUIC (tsshd) transport は agent forwarding 未対応（プロファイルの
+    // `SshConfig.agent_forward` 相当のフィールドを `QuicConfig` はまだ持たない）。
     run_ssh_channel_loop(
         &config.username, &config.auth, config.cols, config.rows,
+        false, agent_key,
         session, cmd_rx, event_tx,
     ).await;
 }

@@ -221,6 +221,14 @@ pub(crate) async fn session_event_loop(
                     });
                     None
                 }
+                Some(TransportEvent::AgentSignRequest { key_fingerprint, reply }) => {
+                    let cb = Arc::clone(&callback);
+                    tokio::task::spawn_blocking(move || {
+                        let approved = cb.on_agent_sign_request(key_fingerprint);
+                        let _ = reply.send(approved);
+                    });
+                    None
+                }
                 Some(TransportEvent::Connected) => {
                     callback.on_connected(); None
                 }

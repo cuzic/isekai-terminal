@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use log::{debug, info, warn};
+use parking_lot::Mutex;
 use russh::{client, ChannelMsg};
 use russh_keys::{HashAlg, PrivateKey, PublicKey};
 use tokio::net::TcpListener;
 
+use crate::agent_forward;
 use crate::{ForwardState, SshAuth};
 
 // ── Transport command / event ────────────────────────────
@@ -37,6 +39,14 @@ pub(crate) enum TransportEvent {
     /// マルチパスtransport専用（`multipath_transport.rs`の`PathBroker`から発火）。
     NoViablePath,
     ForwardStateChanged { id: String, state: ForwardState },
+    /// SSH agent forwarding: サーバー（またはサーバー上の他プロセス）が、転送された
+    /// エージェント経由でこの鍵を使った署名を要求してきた。署名は必ずユーザー確認を
+    /// 経てから行う（既定 OFF・opt-in の機能であっても、要求ごとの確認は必須）。
+    /// `reply` に `true` を送ると署名を実行し、`false`／drop（タイムアウト含む）なら拒否する。
+    AgentSignRequest {
+        key_fingerprint: String,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
 }
 
 /// Kotlin → session_event_loop: trzsz 操作（transport を経由しない）
@@ -51,6 +61,17 @@ pub(crate) enum SessionCmd {
 
 pub(crate) struct RusshEventHandler {
     pub(crate) event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+    /// SSH agent forwarding が有効かつ公開鍵認証成功後にのみ `Some` になる、
+    /// 転送する秘密鍵（認証に使ったのと同じ鍵を共有する。鍵の追加受け渡しは不要）。
+    /// `run_ssh_channel_loop` が認証成功後にセットするため `Mutex` 越しに共有する。
+    pub(crate) agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
+}
+
+impl RusshEventHandler {
+    /// agent forwarding を使わない transport（QUIC 等）向けの簡易コンストラクタ。
+    pub(crate) fn new(event_tx: tokio::sync::mpsc::Sender<TransportEvent>) -> Self {
+        RusshEventHandler { event_tx, agent_key: Arc::new(Mutex::new(None)) }
+    }
 }
 
 #[async_trait::async_trait]
@@ -66,6 +87,20 @@ impl client::Handler for RusshEventHandler {
         self.event_tx.send(TransportEvent::HostKey(fp, reply_tx)).await.ok();
         Ok(reply_rx.await.unwrap_or(false))
     }
+
+    /// サーバーが agent-forward チャネルを開き返してきた時に呼ばれる
+    /// （こちらが `channel.agent_forward(true)` を送っていた場合のみ発生する）。
+    /// チャネル I/O はハンドラをブロックしないよう別タスクで処理する。
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let key = self.agent_key.lock().clone();
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(agent_forward::serve_agent_channel(channel, key, event_tx));
+        Ok(())
+    }
 }
 
 // ── SSH チャネルループ（TCP・QUIC 共通）─────────────────
@@ -75,6 +110,8 @@ pub(crate) async fn run_ssh_channel_loop(
     auth: &SshAuth,
     cols: u32,
     rows: u32,
+    agent_forward: bool,
+    agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     mut session: client::Handle<RusshEventHandler>,
     mut cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
@@ -85,6 +122,10 @@ pub(crate) async fn run_ssh_channel_loop(
     };
     info!("ssh: auth {} for {}", auth_method, username);
 
+    // 公開鍵認証に使った鍵を保持しておく。agent forwarding が有効なら、この同じ鍵を
+    // 転送先の署名要求にも使う（鍵の追加受け渡しは不要という設計）。
+    let mut authed_key: Option<Arc<PrivateKey>> = None;
+
     let authenticated = match auth {
         SshAuth::Password { password } => session
             .authenticate_password(username, password)
@@ -93,11 +134,18 @@ pub(crate) async fn run_ssh_channel_loop(
             .unwrap_or(false),
         SshAuth::PublicKey { private_key_pem } => {
             match PrivateKey::from_openssh(private_key_pem) {
-                Ok(key) => session
-                    .authenticate_publickey(username, Arc::new(key))
-                    .await
-                    .ok()
-                    .unwrap_or(false),
+                Ok(key) => {
+                    let key = Arc::new(key);
+                    let ok = session
+                        .authenticate_publickey(username, key.clone())
+                        .await
+                        .ok()
+                        .unwrap_or(false);
+                    if ok {
+                        authed_key = Some(key);
+                    }
+                    ok
+                }
                 Err(e) => {
                     warn!("ssh: private key parse failed: {}", e);
                     false
@@ -113,6 +161,14 @@ pub(crate) async fn run_ssh_channel_loop(
     }
     info!("ssh: auth ok");
 
+    if agent_forward {
+        if let Some(key) = &authed_key {
+            *agent_key.lock() = Some(key.clone());
+        } else {
+            debug!("ssh: agent_forward requested but auth method is not publickey — ignoring");
+        }
+    }
+
     let mut channel = match session.channel_open_session().await {
         Ok(c) => { info!("ssh: session channel opened"); c }
         Err(e) => {
@@ -121,6 +177,13 @@ pub(crate) async fn run_ssh_channel_loop(
             return;
         }
     };
+
+    if agent_forward && authed_key.is_some() {
+        info!("ssh: requesting agent forwarding");
+        if let Err(e) = channel.agent_forward(true).await {
+            warn!("ssh: agent_forward request failed: {}", e);
+        }
+    }
 
     info!("ssh: requesting PTY {}x{}", cols, rows);
     if channel.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await.is_err()
@@ -327,6 +390,7 @@ mod local_forward_e2e_tests {
         fn on_forward_state_changed(&self, id: String, state: ForwardState) {
             let _ = self.tx.send(TestEvent::Forward(id, state));
         }
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
     }
 
     /// 受け取ったバイト列をそのまま返すだけのダミー TCP サーバ。
@@ -461,6 +525,7 @@ mod local_forward_e2e_tests {
                     remote_host: "upstream.invalid".into(),
                     remote_port: echo_addr.port(),
                 }],
+                agent_forward: false,
             };
 
             orchestrator.connect(config).expect("connect() should not fail synchronously");

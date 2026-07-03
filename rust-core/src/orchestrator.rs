@@ -245,6 +245,10 @@ impl SessionCallback for OrchestratorAdapter {
     fn on_forward_state_changed(&self, id: String, state: ForwardState) {
         self.shared.callback.on_forward_state_changed(id, state);
     }
+
+    fn on_agent_sign_request(&self, key_fingerprint: String) -> bool {
+        self.shared.callback.on_agent_sign_request(key_fingerprint)
+    }
 }
 
 // ── SessionOrchestrator ───────────────────────────────────
