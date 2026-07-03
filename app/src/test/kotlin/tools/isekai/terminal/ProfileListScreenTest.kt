@@ -1,6 +1,8 @@
 package tools.isekai.terminal
 
 import android.app.Application
+import android.content.Context
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
@@ -10,7 +12,10 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.test.core.app.ApplicationProvider
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
+import tools.isekai.terminal.ui.TerminalTheme
+import tools.isekai.terminal.ui.TerminalThemes
 import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -28,6 +33,8 @@ class ProfileListScreenTest {
         val ctx = ApplicationProvider.getApplicationContext<Application>()
         Repositories.init(ctx)
         runBlocking { Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) } }
+        // 配色テーマの永続化テストが互いに影響しないよう毎回クリアする
+        ctx.getSharedPreferences("tssh_ui", Context.MODE_PRIVATE).edit().clear().apply()
     }
 
     private fun insertProfile(profile: ConnectionProfile) = runBlocking { Repositories.profiles.save(profile) }
@@ -37,6 +44,8 @@ class ProfileListScreenTest {
         onAddProfile: () -> Unit = {},
         onEditProfile: (ConnectionProfile) -> Unit = {},
         onManageKeys: () -> Unit = {},
+        // Rust への実反映(native)はテストでは呼びたくないので既定で no-op に差し替える
+        applyTerminalTheme: (TerminalTheme) -> Unit = {},
     ) {
         composeTestRule.setContent {
             ProfileListScreen(
@@ -44,6 +53,7 @@ class ProfileListScreenTest {
                 onAddProfile = onAddProfile,
                 onEditProfile = onEditProfile,
                 onManageKeys = onManageKeys,
+                applyTerminalTheme = applyTerminalTheme,
             )
         }
         composeTestRule.waitForIdle()
@@ -113,5 +123,49 @@ class ProfileListScreenTest {
         composeTestRule.onNodeWithText("鍵管理").performClick()
         composeTestRule.waitUntil(3000) { managed }
         assertTrue(managed)
+    }
+
+    // ── 配色テーマ選択（案C）────────────────────────────────────────────
+
+    @Test fun themeButton_opensThemeDialog() {
+        setScreen()
+        composeTestRule.onNodeWithText("配色").performClick()
+        waitForText("配色テーマ")
+        composeTestRule.onNodeWithText("配色テーマ").assertIsDisplayed()
+        // 全プリセットがラジオリストとして表示される
+        TerminalThemes.ALL.forEach { theme ->
+            composeTestRule.onNodeWithText(theme.name).assertIsDisplayed()
+        }
+    }
+
+    @Test fun selectingTheme_persistsToPrefsAndAppliesToRust() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        var appliedTheme: TerminalTheme? = null
+        setScreen(applyTerminalTheme = { appliedTheme = it })
+
+        composeTestRule.onNodeWithText("配色").performClick()
+        waitForText("配色テーマ")
+        composeTestRule.onNodeWithText(TerminalThemes.DRACULA.name).performClick()
+
+        // 選択したテーマが (native 呼び出しの代わりに注入した) applyTerminalTheme に渡る
+        assertEquals(TerminalThemes.DRACULA, appliedTheme)
+
+        // SharedPreferences("tssh_ui") にプリセット名として永続化される
+        val prefs = ctx.getSharedPreferences("tssh_ui", Context.MODE_PRIVATE)
+        assertEquals(TerminalThemes.DRACULA.name, prefs.getString(TerminalThemes.PREF_KEY, null))
+
+        // 選択後はダイアログが閉じる
+        composeTestRule.onAllNodesWithText("配色テーマ").assertCountEquals(0)
+    }
+
+    @Test fun themeDialog_dismissWithoutSelection_leavesPrefsUntouched() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        setScreen()
+        composeTestRule.onNodeWithText("配色").performClick()
+        waitForText("配色テーマ")
+        composeTestRule.onNodeWithText("閉じる").performClick()
+
+        val prefs = ctx.getSharedPreferences("tssh_ui", Context.MODE_PRIVATE)
+        assertEquals(null, prefs.getString(TerminalThemes.PREF_KEY, null))
     }
 }
