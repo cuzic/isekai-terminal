@@ -810,6 +810,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_tssh_core_checksum_func_create_helper_quic_session(
     ): Int
+    external fun uniffi_tssh_core_checksum_func_create_isekai_stun_p2p_session(
+    ): Int
     external fun uniffi_tssh_core_checksum_func_create_multipath_helper_quic_session(
     ): Int
     external fun uniffi_tssh_core_checksum_func_create_session_orchestrator(
@@ -858,6 +860,26 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_tssh_core_checksum_method_helperquicsession_trzsz_send_chunk(
     ): Int
+    external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_connect(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_disconnect(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_resize(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_scrollback_cells(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_scrollback_len(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_send(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_accept_download(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_accept_upload(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_cancel(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_send_chunk(
+    ): Int
     external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_connect(
     ): Int
     external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_disconnect(
@@ -887,6 +909,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_helper_quic(
     ): Int
     external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_helper_quic_auto(
+    ): Int
+    external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_isekai_stun_p2p(
     ): Int
     external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_multipath_helper_quic(
     ): Int
@@ -1054,6 +1078,30 @@ external fun uniffi_tssh_core_fn_method_helperquicsession_trzsz_cancel(`ptr`: Lo
 ): Unit
 external fun uniffi_tssh_core_fn_method_helperquicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_tssh_core_fn_clone_isekaistunp2psession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_tssh_core_fn_free_isekaistunp2psession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_isekaistunp2psession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_isekaistunp2psession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_isekaistunp2psession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_isekaistunp2psession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_tssh_core_fn_method_isekaistunp2psession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Int
+external fun uniffi_tssh_core_fn_method_isekaistunp2psession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_tssh_core_fn_clone_multipathhelperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_tssh_core_fn_free_multipathhelperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1091,6 +1139,8 @@ external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect(`ptr`: Long,
 external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_helper_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_helper_quic_auto(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_isekai_stun_p2p(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_multipath_helper_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1169,6 +1219,8 @@ external fun uniffi_tssh_core_fn_func_debug_set_udp_fault_latency_ms(`ms`: Int,u
 external fun uniffi_tssh_core_fn_func_debug_set_udp_fault_loss_permille(`permille`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_func_create_helper_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_tssh_core_fn_func_create_isekai_stun_p2p_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_tssh_core_fn_func_create_multipath_helper_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
@@ -1319,6 +1371,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tssh_core_checksum_func_create_helper_quic_session() != 57728) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_tssh_core_checksum_func_create_isekai_stun_p2p_session() != 49421) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_tssh_core_checksum_func_create_multipath_helper_quic_session() != 11155) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1391,6 +1446,36 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tssh_core_checksum_method_helperquicsession_trzsz_send_chunk() != 39866) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_connect() != 38552) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_disconnect() != 57846) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_resize() != 53057) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_scrollback_cells() != 34449) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_scrollback_len() != 10790) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_send() != 14483) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_accept_download() != 16307) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_accept_upload() != 59097) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_cancel() != 49855) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_send_chunk() != 5915) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_connect() != 4132) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1434,6 +1519,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect_helper_quic_auto() != 16027) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect_isekai_stun_p2p() != 28376) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect_multipath_helper_quic() != 29572) {
@@ -2466,6 +2554,392 @@ public object FfiConverterTypeHelperQuicSession: FfiConverter<HelperQuicSession,
 //
 
 
+public interface IsekaiStunP2pSessionInterface {
+    
+    /**
+     * STUN+SSH rendezvous による直接 P2P QUIC のみを試す。フォールバック無し
+     * （穴あけが成立しなければ接続失敗として扱う。PLAN.md Phase 10 の設計判断参照）。
+     */
+    fun `connect`(`callback`: SessionCallback)
+    
+    fun `disconnect`()
+    
+    fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
+    
+    fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData>
+    
+    fun `scrollbackLen`(): kotlin.UInt
+    
+    fun `send`(`data`: kotlin.ByteArray)
+    
+    fun `trzszAcceptDownload`(`transferId`: kotlin.String)
+    
+    fun `trzszAcceptUpload`(`transferId`: kotlin.String, `fileName`: kotlin.String, `fileSize`: kotlin.ULong, `mode`: kotlin.UInt)
+    
+    fun `trzszCancel`(`transferId`: kotlin.String)
+    
+    fun `trzszSendChunk`(`transferId`: kotlin.String, `data`: kotlin.ByteArray, `isLast`: kotlin.Boolean)
+    
+    companion object
+}
+
+open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSessionInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_tssh_core_fn_free_isekaistunp2psession(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_tssh_core_fn_clone_isekaistunp2psession(handle, status)
+        }
+    }
+
+    
+    /**
+     * STUN+SSH rendezvous による直接 P2P QUIC のみを試す。フォールバック無し
+     * （穴あけが成立しなければ接続失敗として扱う。PLAN.md Phase 10 の設計判断参照）。
+     */
+    @Throws(SshException::class)override fun `connect`(`callback`: SessionCallback)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(SshException) { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_connect(
+        it,
+        FfiConverterTypeSessionCallback.lower(`callback`),_status)
+}
+    }
+    
+    
+
+    override fun `disconnect`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_disconnect(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    override fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_resize(
+        it,
+        FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),_status)
+}
+    }
+    
+    
+
+    override fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData> {
+            return FfiConverterSequenceTypeCellData.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_scrollback_cells(
+        it,
+        FfiConverterUInt.lower(`offset`),FfiConverterUInt.lower(`rows`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `scrollbackLen`(): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_scrollback_len(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    override fun `send`(`data`: kotlin.ByteArray)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_send(
+        it,
+        FfiConverterByteArray.lower(`data`),_status)
+}
+    }
+    
+    
+
+    override fun `trzszAcceptDownload`(`transferId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_accept_download(
+        it,
+        FfiConverterString.lower(`transferId`),_status)
+}
+    }
+    
+    
+
+    override fun `trzszAcceptUpload`(`transferId`: kotlin.String, `fileName`: kotlin.String, `fileSize`: kotlin.ULong, `mode`: kotlin.UInt)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_accept_upload(
+        it,
+        FfiConverterString.lower(`transferId`),FfiConverterString.lower(`fileName`),FfiConverterULong.lower(`fileSize`),FfiConverterUInt.lower(`mode`),_status)
+}
+    }
+    
+    
+
+    override fun `trzszCancel`(`transferId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_cancel(
+        it,
+        FfiConverterString.lower(`transferId`),_status)
+}
+    }
+    
+    
+
+    override fun `trzszSendChunk`(`transferId`: kotlin.String, `data`: kotlin.ByteArray, `isLast`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_send_chunk(
+        it,
+        FfiConverterString.lower(`transferId`),FfiConverterByteArray.lower(`data`),FfiConverterBoolean.lower(`isLast`),_status)
+}
+    }
+    
+    
+
+    
+
+    
+
+
+    
+    
+    /**
+     * @suppress
+     */
+    companion object
+    
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIsekaiStunP2pSession: FfiConverter<IsekaiStunP2pSession, Long> {
+    override fun lower(value: IsekaiStunP2pSession): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): IsekaiStunP2pSession {
+        return IsekaiStunP2pSession(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): IsekaiStunP2pSession {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: IsekaiStunP2pSession) = 8UL
+
+    override fun write(value: IsekaiStunP2pSession, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
 public interface MultipathHelperQuicSessionInterface {
     
     /**
@@ -3280,6 +3754,13 @@ public interface SessionOrchestratorInterface {
     fun `connectHelperQuicAuto`(`config`: HelperQuicConfig)
     
     /**
+     * Phase 10: `TransportPreference::IsekaiStunP2pQuic` 相当。relay 無し・
+     * STUN+SSH rendezvousによる直接 P2P QUIC。フォールバック無し（穴あけ不成立時は
+     * 接続失敗として扱う。`isekai_stun_p2p_transport.rs` 参照）。
+     */
+    fun `connectIsekaiStunP2p`(`config`: IsekaiStunP2pConfig)
+    
+    /**
      * Phase 9: `TransportPreference::IsekaiHelperQuicMultipath` 相当。フォールバック無し。
      * `config.direct_host` が設定されていれば path0（`ssh_host`）+ path1（`direct_host`）の
      * 受動的マルチパスで接続する。
@@ -3487,6 +3968,24 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_connect_helper_quic_auto(
         it,
         FfiConverterTypeHelperQuicConfig.lower(`config`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Phase 10: `TransportPreference::IsekaiStunP2pQuic` 相当。relay 無し・
+     * STUN+SSH rendezvousによる直接 P2P QUIC。フォールバック無し（穴あけ不成立時は
+     * 接続失敗として扱う。`isekai_stun_p2p_transport.rs` 参照）。
+     */
+    @Throws(SshException::class)override fun `connectIsekaiStunP2p`(`config`: IsekaiStunP2pConfig)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(SshException) { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_connect_isekai_stun_p2p(
+        it,
+        FfiConverterTypeIsekaiStunP2pConfig.lower(`config`),_status)
 }
     }
     
@@ -4244,6 +4743,83 @@ public object FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer<HelperQui
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
             FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
+    }
+}
+
+
+
+data class IsekaiStunP2pConfig (
+    var `sshHost`: kotlin.String
+    , 
+    var `sshPort`: kotlin.UShort
+    , 
+    var `username`: kotlin.String
+    , 
+    var `auth`: SshAuth
+    , 
+    var `cols`: kotlin.UInt
+    , 
+    var `rows`: kotlin.UInt
+    , 
+    /**
+     * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
+     */
+    var `jump`: JumpConfig?
+    , 
+    /**
+     * isekai-terminal・isekai-helper の双方が自分自身の観測アドレスを調べるのに使う
+     * STUN サーバー(`host:port`)。パブリックな STUN サーバー(例: Google の
+     * `stun.l.google.com:19302`)でよい—双方が同じサーバーを使う必要は無く、
+     * それぞれ自分にとって疎通できるものを指定すればよい。
+     */
+    var `stunServer`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIsekaiStunP2pConfig: FfiConverterRustBuffer<IsekaiStunP2pConfig> {
+    override fun read(buf: ByteBuffer): IsekaiStunP2pConfig {
+        return IsekaiStunP2pConfig(
+            FfiConverterString.read(buf),
+            FfiConverterUShort.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterTypeSshAuth.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalTypeJumpConfig.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: IsekaiStunP2pConfig) = (
+            FfiConverterString.allocationSize(value.`sshHost`) +
+            FfiConverterUShort.allocationSize(value.`sshPort`) +
+            FfiConverterString.allocationSize(value.`username`) +
+            FfiConverterTypeSshAuth.allocationSize(value.`auth`) +
+            FfiConverterUInt.allocationSize(value.`cols`) +
+            FfiConverterUInt.allocationSize(value.`rows`) +
+            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`) +
+            FfiConverterString.allocationSize(value.`stunServer`)
+    )
+
+    override fun write(value: IsekaiStunP2pConfig, buf: ByteBuffer) {
+            FfiConverterString.write(value.`sshHost`, buf)
+            FfiConverterUShort.write(value.`sshPort`, buf)
+            FfiConverterString.write(value.`username`, buf)
+            FfiConverterTypeSshAuth.write(value.`auth`, buf)
+            FfiConverterUInt.write(value.`cols`, buf)
+            FfiConverterUInt.write(value.`rows`, buf)
+            FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
+            FfiConverterString.write(value.`stunServer`, buf)
     }
 }
 
@@ -5199,7 +5775,12 @@ enum class TransportPreference {
      * （Phase 9、オプトイン。フォールバック無し）。`direct_host` 未設定なら
      * `IsekaiHelperQuic` と同等（path0 のみ）。
      */
-    ISEKAI_HELPER_QUIC_MULTIPATH;
+    ISEKAI_HELPER_QUIC_MULTIPATH,
+    /**
+     * STUN+SSH rendezvous による直接 P2P QUIC（Phase 10、オプトイン。relay 無し・
+     * 穴あけ不成立時のフォールバック無し）。`isekai_stun_p2p_transport.rs` 参照。
+     */
+    ISEKAI_STUN_P2P_QUIC;
 
     
 
@@ -6117,6 +6698,16 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
     UniffiLib.uniffi_tssh_core_fn_func_create_helper_quic_session(
     
         FfiConverterTypeHelperQuicConfig.lower(`config`),_status)
+}
+    )
+    }
+    
+ fun `createIsekaiStunP2pSession`(`config`: IsekaiStunP2pConfig): IsekaiStunP2pSession {
+            return FfiConverterTypeIsekaiStunP2pSession.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_func_create_isekai_stun_p2p_session(
+    
+        FfiConverterTypeIsekaiStunP2pConfig.lower(`config`),_status)
 }
     )
     }
