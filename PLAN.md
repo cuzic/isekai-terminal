@@ -2017,6 +2017,35 @@ Android向けrustupセットアップのみを行い、`tssh-core`が`include_by
   丸めるため、`Date()`由来のサブミリ秒精度を持つ値をそのまま厳密等価比較すると
   CIで失敗した。テストでは秒単位のDateを明示的に使うことで回避。
 
+- ✅ **NWPathMonitor連携とLocal Network Privacy対応**: `NetworkPathPolicy`
+  （判断ロジック単体、Phase 1CのSessionState導入前提の縮小版
+  `ConnectionHealthHint`を受け取る疎結合設計）+ `NetworkPathObserver`
+  （`network_epoch`発行・debounce・古いepochのキャンセル）。healthy時は
+  短時間debounce、degraded/reconnecting時はsatisfiedへの変化を即時通知、
+  unsatisfiedのままでも切断と断定しない。Info.plistへ
+  `NSLocalNetworkUsageDescription`を追加(`NSBonjourServices`はBonjour未使用
+  のため追加せず)。`LocalNetworkPermissionGuide`で設定アプリへの誘導導線を
+  提供(拒否状態の事前問い合わせAPIが無いため、検知は実際の接続エラーを
+  トリガーに呼び出し側が判断)。XCTest 8件で検証(実ネットワーク切替は
+  CIで再現できないため判断ロジックのみ)。
+
+- ✅ **ターミナル特殊キー→制御シーケンス変換（実機不要範囲）**:
+  `TerminalKeyMapper`。Ctrl+英字の制御バイト・Esc/Tab/Backspace/Delete・
+  矢印キー・Home/End/PageUp/PageDown・F1〜F12(xterm互換)をXCTest 8件で検証。
+  **キーボードアクセサリバーの見た目・レイアウトや選択/コピー/ペーストのUI・
+  Dynamic Typeとは独立したフォントサイズ設定UIは実機/シミュレータでの目視確認が
+  必要なため、このタスクの実機不要範囲には含めていない(実機確認可能になった
+  時点で着手する)。**
+
+**Phase 1B のまとめ（2026-07-04）**: 5項目全てに着手し、実機不要な範囲は
+全て実装・CI検証済み(CredentialVault・SSH/helper信頼ストア・GRDB接続
+プロファイル管理・NWPathMonitor通知ポリシー・ターミナルキー変換ロジック)。
+残っているのは実機/シミュレータでの対話的な確認が必要な部分(Keychainの
+生体認証モード等の追加検証、ターミナルの実際の見た目・操作感、Local Network
+Privacyの実際の許可ダイアログ挙動)のみ。次はPhase 1C(SessionSupervisor・
+バックグラウンド配線・trzsz・resume・実機総合回帰)、または残っている
+Phase 1A(1A-7 IME/カーソル統合・1A-9 QUIC/helper縦切り)に進む。
+
 ---
 
 ## 実装順序
