@@ -76,6 +76,13 @@ class TerminalTabsViewModelTest {
     private suspend fun awaitConnectCalled(o: FakeOrchestrator) =
         withTimeout(3000) { while (!o.connectCalled) kotlinx.coroutines.delay(10) }
 
+    /** connect呼び出し後、同じconnectTab()コルーチン内で続けて呼ばれるsetSessionThemeが
+     *  実際に届くまで待つ(connectCalledとpushThemeToSessionの間には短いスケジューリング
+     *  遅延があり得るため、Dispatchers.IOスレッドの実行が遅れがちな高負荷環境では
+     *  awaitConnectCalledの直後に同期的読みするだけでは早すぎることがある)。 */
+    private suspend fun awaitSetSessionThemeCalled(o: FakeOrchestrator) =
+        withTimeout(3000) { while (o.setSessionThemeCalls.isEmpty()) kotlinx.coroutines.delay(10) }
+
     private fun tab(tabId: String) = vm.tabs.value.first { it.tabId == tabId }
 
     // ── タブ追加/削除でセッション生成・close が呼ばれる ────────────────────
@@ -434,6 +441,7 @@ class TerminalTabsViewModelTest {
     fun openTab_withoutProfileTheme_appliesGlobalDefaultAndIsNotOverridden() = runBlocking {
         val id = vm.openTab(profile("a"), "pass")
         awaitConnectCalled(orchestrators[0])
+        awaitSetSessionThemeCalled(orchestrators[0])
 
         assertFalse(tab(id).isThemeOverridden)
         assertEquals(1, orchestrators[0].setSessionThemeCalls.size)
@@ -444,6 +452,7 @@ class TerminalTabsViewModelTest {
         val p = profile("a").copy(themeName = tools.isekai.terminal.ui.TerminalThemes.DRACULA.name)
         val id = vm.openTab(p, "pass")
         awaitConnectCalled(orchestrators[0])
+        awaitSetSessionThemeCalled(orchestrators[0])
 
         assertTrue(tab(id).isThemeOverridden)
         assertEquals(tools.isekai.terminal.ui.TerminalThemes.DRACULA, tab(id).currentTheme.value)
