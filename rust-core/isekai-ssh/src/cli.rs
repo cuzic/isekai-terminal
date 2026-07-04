@@ -13,6 +13,15 @@
 //! for why a plain (non-`dev-insecure`) debug build's `--help` also never
 //! shows them.
 //!
+//! As of S-6, `connect` also takes `--mode <relay|stun>` (default `relay`)
+//! to pick which `isekai-transport` NAT-traversal path resolves the trust
+//! store entry into: `ConnectMode::Relay`
+//! (`isekai_transport::connect_via_relay`) or `ConnectMode::Stun`
+//! (`isekai_transport::connect_stun_p2p`, requiring `--stun-server`). See
+//! `ConnectArgs::mode`'s docs and `connect.rs`'s module docs for the
+//! relay-first rationale and the STUN mode's known unrecoverable-NAT-loss
+//! caveat.
+//!
 //! `init` (S-3) is the interactive counterpart that populates the trust
 //! store `connect` reads from: it deploys/starts `isekai-helper` on a target
 //! host (via `isekai-bootstrap::OpenSshBackend`) and, on confirmation, writes
@@ -85,9 +94,47 @@ pub struct ConnectArgs {
     #[arg(long, value_name = "JUMPHOST")]
     pub via: Option<String>,
 
+    /// Which NAT-traversal transport to use to reach the target
+    /// isekai-helper (`ISEKAI_SSH_DESIGN.md` "isekai-sshでのNAT越え方式の既定").
+    /// Defaults to `relay` (`isekai_transport::connect_via_relay`): relay
+    /// stays in the data path, so it tolerates any NAT type and — unlike
+    /// `stun` — has no known-unrecoverable failure mode within a session.
+    /// `stun` (`isekai_transport::connect_stun_p2p`) is opt-in low-latency
+    /// P2P; picking it means accepting that **a NAT mapping loss (e.g.
+    /// Wi-Fi<->cellular tethering roaming) during the session cannot be
+    /// recovered** — there is no relay fallback path once the QUIC
+    /// connection to isekai-helper is lost this way. `connect` prints a
+    /// stderr warning to this effect whenever `--mode stun` is used (see
+    /// `connect.rs::run`).
+    #[arg(long, value_enum, default_value_t = ConnectMode::Relay)]
+    pub mode: ConnectMode,
+
+    /// STUN server (`ADDR:PORT`) used to learn this side's own
+    /// NAT-observed address before hole-punching, e.g. `stun.example.com:3478`
+    /// (`isekai_transport::connect_stun_p2p`'s `stun_server` argument).
+    /// Required when `--mode stun` is given; unused (and rejected — clap
+    /// enforces the `--mode stun` pairing) otherwise.
+    #[arg(long, value_name = "ADDR:PORT", required_if_eq("mode", "stun"))]
+    pub stun_server: Option<SocketAddr>,
+
     #[cfg(all(debug_assertions, feature = "dev-insecure"))]
     #[command(flatten)]
     pub dev_insecure: DevInsecureArgs,
+}
+
+/// `--mode` values for `isekai-ssh connect` (`ConnectArgs::mode`). See that
+/// field's docs for the relay-first rationale
+/// (`ISEKAI_SSH_DESIGN.md` "isekai-sshでのNAT越え方式の既定").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ConnectMode {
+    /// `isekai_transport::connect_via_relay` (default): relay stays in the
+    /// data path, tolerant of any NAT type, no unrecoverable-mid-session
+    /// failure mode.
+    Relay,
+    /// `isekai_transport::connect_stun_p2p` (opt-in): relay-free P2P via
+    /// STUN self-observation + simultaneous open. Lower latency, but a NAT
+    /// mapping loss mid-session cannot be recovered (no relay fallback).
+    Stun,
 }
 
 /// DEV/TEST ONLY. Bypasses the trust store lookup (S-2) by letting the
