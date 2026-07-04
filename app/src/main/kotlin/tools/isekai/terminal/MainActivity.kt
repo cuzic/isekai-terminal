@@ -44,7 +44,7 @@ class MainActivity : ComponentActivity() {
     private fun restorePersistedTerminalTheme() {
         val prefs = getSharedPreferences("tssh_ui", MODE_PRIVATE)
         val theme = TerminalThemes.byName(prefs.getString(TerminalThemes.PREF_KEY, null))
-        setTerminalTheme(theme.ansi16Argb(), theme.foregroundArgb(), theme.backgroundArgb())
+        theme.applyTo(::setTerminalTheme)
     }
 }
 
@@ -81,7 +81,7 @@ fun AppRoot() {
                 // (isThemeOverridden=false の)タブにも反映する。tabsVm は Activity スコープ
                 // なので、まだ1つもタブが無い状態(list が空)でも安全に呼べる。
                 applyTerminalTheme = { theme ->
-                    setTerminalTheme(theme.ansi16Argb(), theme.foregroundArgb(), theme.backgroundArgb())
+                    theme.applyTo(::setTerminalTheme)
                     tabsVm.applyGlobalThemeToNonOverriddenTabs(theme)
                 },
             )

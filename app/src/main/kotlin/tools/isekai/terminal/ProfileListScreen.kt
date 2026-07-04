@@ -59,9 +59,7 @@ fun ProfileListScreen(
     onManageKeys: () -> Unit = {},
     onManageSnippets: () -> Unit = {},
     // Rust 側への実際の反映は差し替え可能にしておく（テストでは native 呼び出しを避けるため no-op を注入する）
-    applyTerminalTheme: (TerminalTheme) -> Unit = { theme ->
-        setTerminalTheme(theme.ansi16Argb(), theme.foregroundArgb(), theme.backgroundArgb())
-    },
+    applyTerminalTheme: (TerminalTheme) -> Unit = { theme -> theme.applyTo(::setTerminalTheme) },
 ) {
     val vm: ProfileListViewModel = viewModel()
     val profiles by vm.profiles.collectAsStateWithLifecycle()
