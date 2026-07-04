@@ -24,7 +24,13 @@ final class ProfileDatabaseTests: XCTestCase {
 
     func testInsertAndFetchKeyEntry() throws {
         let db = try ProfileDatabase.inMemory()
-        let entry = KeyEntry(id: "key-1", displayName: "My Key", keyType: "ed25519", publicKey: "AAAA...")
+        // createdAtはDate()由来だとサブミリ秒精度を持つが、GRDBがSQLiteへ保存する際は
+        // ミリ秒精度に丸められるため、Date()のまま厳密等価比較すると丸め誤差で
+        // 失敗する。秒単位のDateを明示的に使い、往復での精度損失を避ける。
+        let entry = KeyEntry(
+            id: "key-1", displayName: "My Key", keyType: "ed25519", publicKey: "AAAA...",
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
 
         try db.insert(keyEntry: entry)
         let fetched = try db.fetchKeyEntry(id: "key-1")
