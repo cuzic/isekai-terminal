@@ -2046,6 +2046,52 @@ Privacyの実際の許可ダイアログ挙動)のみ。次はPhase 1C(SessionSu
 バックグラウンド配線・trzsz・resume・実機総合回帰)、または残っている
 Phase 1A(1A-7 IME/カーソル統合・1A-9 QUIC/helper縦切り)に進む。
 
+### Phase 1B 追記: ターミナルキー変換ロジックのAndroid/iOS共通化（2026-07-04）
+
+「androidと共通化できるところは共通化しよう」という方針に基づき、iOSの
+`TerminalKeyMapper.swift`が独自実装していたキー→制御シーケンス変換ロジックを
+rust-core側へ統合した。
+
+- **Rust側実装**: `rust-core/src/lib.rs`に`TerminalSpecialKey`(uniffi::Enum)・
+  `terminal_special_key_bytes()`・`terminal_unicode_char_bytes()`・
+  `terminal_ctrl_byte()`・`terminal_commit_text_bytes()`を追加。Android版
+  `TerminalKeyEncoder.kt`の挙動を1:1で移植し、Rust側テスト31件
+  (`terminal_key_mapping_tests`、Android golden testの28件+新規3件)で
+  `cargo test -p tssh-core --lib`実行・全件pass確認済み。
+- **追加した新規バリアント**: F1〜F12(xterm互換、Android版には無かった機能。
+  iOS版`TerminalKeyMapper`由来)と`ForwardDelete`(前方削除、`ESC[3~`。iOS版の
+  `.delete`ケースに対応、Android版`KEYCODE_DEL`＝バックスペース相当の
+  `TerminalSpecialKey::Delete`(0x7F)とは別物)。
+- **iOS側**: `TerminalKeyMapper.swift`を、既存の公開Swift API
+  (`controlByte(for:)`/`SpecialKey`/`bytes(for:)`)はそのまま維持しつつ、内部実装を
+  生成済みSwiftバインディング(`terminalCtrlByte`/`terminalSpecialKeyBytes`)への
+  委譲に置き換えた薄いラッパーへ書き換えた。
+  **副作用として`controlByte(for:)`の挙動がAndroid版と揃って拡張された**:
+  従来のiOS版はアルファベットのみ対応(空白・記号は`nil`)だったが、Rust統合後は
+  Android版と同じく`@ [ \ ] ^ _ ? space`もCtrl+<記号>として変換されるようになった
+  (例: space→0x00, `[`→ESC(0x1B), `?`→0x7F)。`TerminalKeyMapperTests.swift`を
+  この拡張された挙動に合わせて更新(space等をnilと期待するテストを削除し、
+  Android paritryを検証するテストを追加)。
+- **Android側は意図的に変更しなかった**: `TerminalKeyEncoder.kt`をRust側の
+  UniFFI関数へ委譲する案も検討したが、**JVM/Robolectric単体テストはホストJVM上で
+  ネイティブライブラリを解決できない**(`cargoBuildRustCore`はarm64-v8a向けの`.so`
+  しかビルドしない)という既存の制約(`TerminalThemeTest.kt`のコメントで既に
+  文書化されていた同じ問題)に阻まれる。Android本番コードから直接UniFFI関数を
+  呼ぶ形に書き換えると、`TerminalKeyEncoderTest.kt`の既存28件が
+  `UnsatisfiedLinkError`等で実行できなくなり、「実機不要な範囲でCI/Robolectricで
+  検証する」という開発フローそのものが壊れる。そのため`TerminalKeyEncoder.kt`は
+  従来通りのプレーンKotlin実装を維持し(golden testで両実装の等価性を継続担保)、
+  ソースにその理由を明記するコメントのみ追加した。
+- **Kotlinバインディング(`app/src/main/kotlin/uniffi/tssh_core/tssh_core.kt`)は
+  再生成した**(実際にはAndroid本番コードから新規関数を呼ばないため機能上は
+  不要だが、Phase 0以降追加した`DiagnosticCallback`/`EventWakeListener`/
+  `core_version`等がAndroid側では一度も再生成されておらずファイルが大きく
+  ドリフトしていたため、この機会に最新のRust APIサーフェスへ同期した)。
+- **結論**: 実質的な「共通化」は、iOSのSwift独自実装をRust側の共通実装へ
+  委譲する形で達成された(Swift側の重複コード削除)。Android側は元から
+  Rust移植の一次ソースだったため変更不要。Rust実装とKotlin実装は今後も
+  golden testで相互検証しながら並行して保守する非対称な構成になる。
+
 ---
 
 ## 実装順序

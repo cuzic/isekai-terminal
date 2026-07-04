@@ -3,6 +3,12 @@ package tools.isekai.terminal.input
 /**
  * キーコード→バイト列の変換ロジック。
  * Android 依存なし（定数は android.view.KeyEvent と一致させている）。
+ *
+ * この変換ロジックは rust-core（`terminal_special_key_bytes`/`terminal_ctrl_byte`等）にも
+ * 移植され、iOS 版 `TerminalKeyMapper.swift` はそちらへ委譲している（Android/iOS 共通化）。
+ * ここを Rust 側へ委譲しないのは、JVM/Robolectric 単体テストがホスト JVM 上でネイティブ
+ * ライブラリ（arm64 向けの `.so` のみビルドされる）を解決できないため（`TerminalThemeTest.kt`
+ * と同じ制約）。golden テスト（`TerminalKeyEncoderTest.kt`）で両実装の等価性を担保する。
  */
 object TerminalKeyEncoder {
 
