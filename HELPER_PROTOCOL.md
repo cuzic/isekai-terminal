@@ -20,6 +20,12 @@ OPTIONS:
                                  保持する時間。これを過ぎたら破棄する（既定: 120。Phase 8-4b 参照）
   --max-idle-lifetime <SECS>    アクティブな接続が無く、かつ新規接続も来ない状態が続いたら自己終了するまでの秒数（既定: 600）
   --once                        1回の接続が終了したら常駐せず終了する（既定は常駐し、次の接続を待つ）
+  --stun-server <ADDR:PORT>     STUN(RFC 5389)サーバーへ問い合わせ、自分の観測アドレスを
+                                ハンドシェイクJSONの `stun_observed_addr` に含める
+                                （TransportPreference::IsekaiStunP2pQuic 用、既定は問い合わせない）
+  --punch-peer <ADDR:PORT>      `--stun-server` 併用時のみ有効。isekai-terminal側が事前に調べた
+                                自分自身のSTUN観測アドレスを渡す（simultaneous open用の
+                                穴あけprobeデータグラムをこのアドレス宛に送る）
   --log-level <LEVEL>           error|warn|info|debug|trace（既定: info）。stderr にのみ出力する
   --version                     バージョン表示して終了
   --help
@@ -36,6 +42,14 @@ OPTIONS:
 - `--max-idle-lifetime`（旧称 `--max-lifetime-idle` から改称。意味を明確化）: 起動直後だけでなく
   **各接続終了後にもこの idle timer を再開する**。「1回だけ接続が来て、その後は誰も繋がずに
   永遠にプロセスが残り続ける」事故を防ぐため、常に「アクティブ接続が無い期間」を計測する。
+- `--stun-server`/`--punch-peer`（Phase 10、STUN+SSHランデブー方式のP2P用）: `--punch-peer` の値を
+  **stdin経由の対話的なやり取りで渡さない**のは、isekai-helperが`setsid`で即座にデタッチされ
+  stdinが`/dev/null`にリダイレクトされる（後述のSSH起動例参照）ため、そもそも対話的なやり取りが
+  できないから。isekai-terminal側はSSHブートストラップの**前に**自分自身のSTUN観測アドレスを
+  ローカルで調べ終えており、それを起動コマンドラインへそのまま埋め込むだけで済む。
+  STUN問い合わせ・穴あけprobeの送出は、いずれも実際にQUICが待ち受けるのと**同一のソケット**
+  （`--bind`でbindしたもの）を使って行う——別ソケットでは観測されるNATマッピング（外部ポート）が
+  変わってしまい、意味が無いため。
 
 ### 終了コード
 
@@ -60,7 +74,7 @@ OPTIONS:
 bind に成功した直後、accept ループに入る前に、**1行だけ** JSON を stdout に出力する。
 
 ```json
-{"v":1,"listen_port":45231,"cert_sha256":"3a7f...（hex, 64文字）","session_secret":"base64エンコードされた32byte"}
+{"v":1,"listen_port":45231,"cert_sha256":"3a7f...（hex, 64文字）","session_secret":"base64エンコードされた32byte","stun_observed_addr":"203.0.113.5:45231"}
 ```
 
 - `v`: ハンドシェイクフォーマットのバージョン（将来の破壊的変更に備える）
@@ -70,6 +84,10 @@ bind に成功した直後、accept ループに入る前に、**1行だけ** JS
   **既に認証済みの SSH チャネル経由**で受け渡す設計。PLAN.md「セキュリティ」節参照）
 - `session_secret`: helper がその起動ごとにランダム生成する秘密（base64）。クライアントはこれを使って
   `proof` を計算する（後述）。
+- `stun_observed_addr`（Phase 10、`--stun-server` 指定時のみ存在。`null` は「未指定」または
+  「STUN問い合わせが失敗した」の両方を表す——後者でもハンドシェイク自体は失敗させず継続する）:
+  `--stun-server` から見た、この helper の観測アドレス（`"ip:port"` 文字列）。isekai-terminal は
+  これを使って直結（hole punching）を試みる。
 
 SSH 側の呼び出し例（ブートストラップスクリプトのイメージ、Phase 7-3 で実装・実機検証済み）:
 
