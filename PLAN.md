@@ -2001,6 +2001,22 @@ Android向けrustupセットアップのみを行い、`tssh-core`が`include_by
   実アプリのentitlementコンテキストが必要なテストは、今後も`TsshTerminalAppTests`
   （素のSwiftPMパッケージの`TsshCoreTests`ではなく）に置くこと。**
 
+- ✅ **SSH/helper信頼ストア**: `SshHostTrustStore`(JSONファイル永続化、GRDB統合前提の
+  暫定実装)。SSH host key/isekai-helper identity/踏み台ホスト鍵を種別ごとに
+  独立した識別子(`TrustIdentifierKind`)で管理。初回接続は`unknownHost`、
+  fingerprint変更時は`mismatch`を返し自動上書きしない(明示的な`trust()`呼び出しの
+  みが上書きできる)。XCTest 7件で検証(entitlement不要、素の`TsshCoreTests`で実行)。
+
+- ✅ **接続プロファイル管理DB(GRDB)**: `GRDB.swift`を依存に追加。`KeyEntry`
+  (CredentialVaultの`key_id`+表示名/鍵種別/公開鍵/認証ポリシーのみ、秘密材料は
+  DBに保存しない)と`ConnectionProfile`(host/port/username/keyEntryId)の2テーブル、
+  `keyEntryId`外部キーは`onDelete(.setNull)`。XCTest 8件で検証
+  (マイグレーション適用・冪等性・CRUD・ソート・外部キーのNULL化)。
+
+  **落とし穴（Dateの往復精度）**: GRDBがSQLiteへ`Date`を保存する際にミリ秒精度へ
+  丸めるため、`Date()`由来のサブミリ秒精度を持つ値をそのまま厳密等価比較すると
+  CIで失敗した。テストでは秒単位のDateを明示的に使うことで回避。
+
 ---
 
 ## 実装順序
