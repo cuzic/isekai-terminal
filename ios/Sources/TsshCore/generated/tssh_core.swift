@@ -578,6 +578,181 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 /**
+ * 診断用の最小EventQueue。`session_id`/`generation`は持たず`sequence`のみを
+ * 発行する（実運用でのSession単位のキューはPhase 1C側で設計する）。
+ */
+public protocol DiagnosticEventQueueProtocol: AnyObject, Sendable {
+    
+    /**
+     * `after_sequence`より新しいイベントを`sequence`昇順で最大`max_count`件返す。
+     * キューからは取り出さず、返した範囲を先頭から削除する（一度読んだ分だけ捨てる）。
+     */
+    func drainEvents(afterSequence: UInt64, maxCount: UInt32)  -> [DiagnosticEventEnvelope]
+    
+    /**
+     * イベントをキューへ追加し、登録済みならwake通知を送る。複数スレッドから
+     * 呼ばれてもキュー内の順序は`sequence`の発行順（Mutex経由の直列化）で決まる。
+     */
+    func push(message: String) 
+    
+    /**
+     * Swift側の`CallbackIngress`をwake通知の宛先として登録する。
+     */
+    func setWakeListener(listener: EventWakeListener) 
+    
+}
+/**
+ * 診断用の最小EventQueue。`session_id`/`generation`は持たず`sequence`のみを
+ * 発行する（実運用でのSession単位のキューはPhase 1C側で設計する）。
+ */
+open class DiagnosticEventQueue: DiagnosticEventQueueProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_tssh_core_fn_clone_diagnosticeventqueue(self.handle, $0) }
+    }
+public convenience init() {
+    let handle =
+        try! rustCall() {
+    uniffi_tssh_core_fn_constructor_diagnosticeventqueue_new($0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_tssh_core_fn_free_diagnosticeventqueue(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * `after_sequence`より新しいイベントを`sequence`昇順で最大`max_count`件返す。
+     * キューからは取り出さず、返した範囲を先頭から削除する（一度読んだ分だけ捨てる）。
+     */
+open func drainEvents(afterSequence: UInt64, maxCount: UInt32) -> [DiagnosticEventEnvelope]  {
+    return try!  FfiConverterSequenceTypeDiagnosticEventEnvelope.lift(try! rustCall() {
+    uniffi_tssh_core_fn_method_diagnosticeventqueue_drain_events(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(afterSequence),
+        FfiConverterUInt32.lower(maxCount),$0
+    )
+})
+}
+    
+    /**
+     * イベントをキューへ追加し、登録済みならwake通知を送る。複数スレッドから
+     * 呼ばれてもキュー内の順序は`sequence`の発行順（Mutex経由の直列化）で決まる。
+     */
+open func push(message: String)  {try! rustCall() {
+    uniffi_tssh_core_fn_method_diagnosticeventqueue_push(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(message),$0
+    )
+}
+}
+    
+    /**
+     * Swift側の`CallbackIngress`をwake通知の宛先として登録する。
+     */
+open func setWakeListener(listener: EventWakeListener)  {try! rustCall() {
+    uniffi_tssh_core_fn_method_diagnosticeventqueue_set_wake_listener(
+            self.uniffiCloneHandle(),
+        FfiConverterCallbackInterfaceEventWakeListener_lower(listener),$0
+    )
+}
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDiagnosticEventQueue: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = DiagnosticEventQueue
+
+    public static func lift(_ handle: UInt64) throws -> DiagnosticEventQueue {
+        return DiagnosticEventQueue(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: DiagnosticEventQueue) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DiagnosticEventQueue {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: DiagnosticEventQueue, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDiagnosticEventQueue_lift(_ handle: UInt64) throws -> DiagnosticEventQueue {
+    return try FfiConverterTypeDiagnosticEventQueue.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDiagnosticEventQueue_lower(_ value: DiagnosticEventQueue) -> UInt64 {
+    return FfiConverterTypeDiagnosticEventQueue.lower(value)
+}
+
+
+
+
+
+
+/**
  * Phase 1A-1 の診断用 UniFFI Object。Swift 側での生成・明示的な破棄が
  * 正しく動くことを確認する（セッション/接続の状態は一切持たない）。
  */
@@ -2567,6 +2742,64 @@ public func FfiConverterTypeCellData_lower(_ value: CellData) -> RustBuffer {
 }
 
 
+/**
+ * `DiagnosticEventQueue`から取り出す1件のイベント。`sequence`はキュー単位で
+ * 単調増加し、Swift側はこの値で「まだ処理していない最古のイベント」を判定する。
+ */
+public struct DiagnosticEventEnvelope: Equatable, Hashable {
+    public var sequence: UInt64
+    public var message: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sequence: UInt64, message: String) {
+        self.sequence = sequence
+        self.message = message
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DiagnosticEventEnvelope: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDiagnosticEventEnvelope: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DiagnosticEventEnvelope {
+        return
+            try DiagnosticEventEnvelope(
+                sequence: FfiConverterUInt64.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DiagnosticEventEnvelope, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.sequence, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDiagnosticEventEnvelope_lift(_ buf: RustBuffer) throws -> DiagnosticEventEnvelope {
+    return try FfiConverterTypeDiagnosticEventEnvelope.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDiagnosticEventEnvelope_lower(_ value: DiagnosticEventEnvelope) -> RustBuffer {
+    return FfiConverterTypeDiagnosticEventEnvelope.lower(value)
+}
+
+
 public struct HelperQuicConfig: Equatable, Hashable {
     public var sshHost: String
     public var sshPort: UInt16
@@ -4289,6 +4522,143 @@ public func FfiConverterCallbackInterfaceDiagnosticCallback_lower(_ v: Diagnosti
 
 
 
+/**
+ * イベントが追加されたことをSwiftへ知らせるためだけのcallback。
+ * 高頻度データ本体はここに載せず、「取りに来てよい」という合図のみを送る。
+ */
+public protocol EventWakeListener: AnyObject, Sendable {
+    
+    func eventsAvailable() 
+    
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceEventWakeListener {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceEventWakeListener = UniffiVTableCallbackInterfaceEventWakeListener(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterCallbackInterfaceEventWakeListener.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface EventWakeListener: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterCallbackInterfaceEventWakeListener.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface EventWakeListener: handle missing in uniffiClone")
+            }
+        },
+        eventsAvailable: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceEventWakeListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.eventsAvailable(
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceEventWakeListener> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceEventWakeListener>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitEventWakeListener() {
+    uniffi_tssh_core_fn_init_callback_vtable_eventwakelistener(UniffiCallbackInterfaceEventWakeListener.vtablePtr)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceEventWakeListener {
+    fileprivate static let handleMap = UniffiHandleMap<EventWakeListener>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceEventWakeListener : FfiConverter {
+    typealias SwiftType = EventWakeListener
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceEventWakeListener_lift(_ handle: UInt64) throws -> EventWakeListener {
+    return try FfiConverterCallbackInterfaceEventWakeListener.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceEventWakeListener_lower(_ v: EventWakeListener) -> UInt64 {
+    return FfiConverterCallbackInterfaceEventWakeListener.lower(v)
+}
+
+
+
+
 public protocol OrchestratorCallback: AnyObject, Sendable {
     
     func onConnectionStateChanged(state: ConnectionPublicState) 
@@ -5235,6 +5605,31 @@ fileprivate struct FfiConverterSequenceTypeCellData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeDiagnosticEventEnvelope: FfiConverterRustBuffer {
+    typealias SwiftType = [DiagnosticEventEnvelope]
+
+    public static func write(_ value: [DiagnosticEventEnvelope], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeDiagnosticEventEnvelope.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [DiagnosticEventEnvelope] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [DiagnosticEventEnvelope]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeDiagnosticEventEnvelope.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypePortForward: FfiConverterRustBuffer {
     typealias SwiftType = [PortForward]
 
@@ -5504,6 +5899,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_tssh_core_checksum_func_create_quic_session() != 25547) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_tssh_core_checksum_method_diagnosticeventqueue_drain_events() != 34129) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_diagnosticeventqueue_push() != 50750) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_diagnosticeventqueue_set_wake_listener() != 51515) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_tssh_core_checksum_method_diagnostichandle_fire_callback() != 38746) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5765,10 +6169,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_tssh_core_checksum_method_quicsession_trzsz_send_chunk() != 12522) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_tssh_core_checksum_constructor_diagnosticeventqueue_new() != 2755) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_tssh_core_checksum_constructor_diagnostichandle_new() != 540) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_method_diagnosticcallback_on_diagnostic_event() != 55189) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_eventwakelistener_events_available() != 26319) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_method_orchestratorcallback_on_connection_state_changed() != 63751) {
@@ -5836,6 +6246,7 @@ private let initializationResult: InitializationResult = {
     }
 
     uniffiCallbackInitDiagnosticCallback()
+    uniffiCallbackInitEventWakeListener()
     uniffiCallbackInitOrchestratorCallback()
     uniffiCallbackInitSessionCallback()
     return InitializationResult.ok

@@ -105,6 +105,90 @@ impl DiagnosticHandle {
     }
 }
 
+// ── Phase 1A-4: 連番付きEventQueue（診断用の最小実装） ──────────
+//
+// 「Swift Actorがcallback到達順序を保証する」という設計は誤りだった
+// （複数RustスレッドからのcallbackをそれぞれTask化すると、Actorへ到達する順序が
+// 元のcallback発生順である保証はない。Swift Task実行順は決定的FIFOではない。
+// ChatGPT外部レビュー2026-07-04、PLAN.md「Phase Y」節参照）。
+// 代わりにRust側が単調増加する`sequence`を払い出すSSOTになり、Swift側は
+// wake通知を受けてから`drain_events()`で能動的に取得する。ここではその最小骨格を
+// 診断用途で実証する（実際のOrchestratorCallbackへの統合はPhase 1Cで行う）。
+
+/// `DiagnosticEventQueue`から取り出す1件のイベント。`sequence`はキュー単位で
+/// 単調増加し、Swift側はこの値で「まだ処理していない最古のイベント」を判定する。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DiagnosticEventEnvelope {
+    pub sequence: u64,
+    pub message: String,
+}
+
+/// イベントが追加されたことをSwiftへ知らせるためだけのcallback。
+/// 高頻度データ本体はここに載せず、「取りに来てよい」という合図のみを送る。
+#[uniffi::export(callback_interface)]
+pub trait EventWakeListener: Send + Sync {
+    fn events_available(&self);
+}
+
+/// 診断用の最小EventQueue。`session_id`/`generation`は持たず`sequence`のみを
+/// 発行する（実運用でのSession単位のキューはPhase 1C側で設計する）。
+#[derive(uniffi::Object)]
+pub struct DiagnosticEventQueue {
+    inner: std::sync::Mutex<std::collections::VecDeque<DiagnosticEventEnvelope>>,
+    next_sequence: std::sync::atomic::AtomicU64,
+    wake_listener: std::sync::Mutex<Option<Box<dyn EventWakeListener>>>,
+}
+
+#[uniffi::export]
+impl DiagnosticEventQueue {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            next_sequence: std::sync::atomic::AtomicU64::new(1),
+            wake_listener: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Swift側の`CallbackIngress`をwake通知の宛先として登録する。
+    pub fn set_wake_listener(&self, listener: Box<dyn EventWakeListener>) {
+        *self.wake_listener.lock().unwrap() = Some(listener);
+    }
+
+    /// イベントをキューへ追加し、登録済みならwake通知を送る。複数スレッドから
+    /// 呼ばれてもキュー内の順序は`sequence`の発行順（Mutex経由の直列化）で決まる。
+    pub fn push(&self, message: String) {
+        let sequence = self
+            .next_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .lock()
+            .unwrap()
+            .push_back(DiagnosticEventEnvelope { sequence, message });
+        if let Some(listener) = self.wake_listener.lock().unwrap().as_ref() {
+            listener.events_available();
+        }
+    }
+
+    /// `after_sequence`より新しいイベントを`sequence`昇順で最大`max_count`件返す。
+    /// キューからは取り出さず、返した範囲を先頭から削除する（一度読んだ分だけ捨てる）。
+    pub fn drain_events(&self, after_sequence: u64, max_count: u32) -> Vec<DiagnosticEventEnvelope> {
+        let mut guard = self.inner.lock().unwrap();
+        let mut result = Vec::new();
+        while let Some(front) = guard.front() {
+            if front.sequence <= after_sequence {
+                guard.pop_front();
+                continue;
+            }
+            if result.len() >= max_count as usize {
+                break;
+            }
+            result.push(guard.pop_front().unwrap());
+        }
+        result
+    }
+}
+
 // ── 公開型 ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -486,4 +570,68 @@ pub(crate) async fn run_russh_transport(
         config.agent_forward, agent_key, config.allow_non_loopback_forward_bind, remote_forwards,
         session, cmd_rx, event_tx,
     ).await;
+}
+
+#[cfg(test)]
+mod diagnostic_event_queue_tests {
+    use super::DiagnosticEventQueue;
+
+    #[test]
+    fn drain_events_returns_in_sequence_order_and_advances_watermark() {
+        let queue = DiagnosticEventQueue::new();
+        queue.push("a".to_string());
+        queue.push("b".to_string());
+        queue.push("c".to_string());
+
+        let first_batch = queue.drain_events(0, 2);
+        assert_eq!(first_batch.len(), 2);
+        assert_eq!(first_batch[0].sequence, 1);
+        assert_eq!(first_batch[0].message, "a");
+        assert_eq!(first_batch[1].sequence, 2);
+        assert_eq!(first_batch[1].message, "b");
+
+        let last_watermark = first_batch.last().unwrap().sequence;
+        let second_batch = queue.drain_events(last_watermark, 10);
+        assert_eq!(second_batch.len(), 1);
+        assert_eq!(second_batch[0].sequence, 3);
+        assert_eq!(second_batch[0].message, "c");
+
+        // 追加のイベントが無ければ空を返す。
+        assert!(queue.drain_events(second_batch[0].sequence, 10).is_empty());
+    }
+
+    #[test]
+    fn drain_events_discards_entries_at_or_below_after_sequence() {
+        let queue = DiagnosticEventQueue::new();
+        queue.push("a".to_string());
+        queue.push("b".to_string());
+
+        // after_sequence が既存の全エントリ以上なら、古い分は破棄されて空が返る
+        // （呼び出し側のwatermarkがキューより進んでいる異常系でも取りこぼしを
+        // 誤って再配信しないことを確認する）。
+        let result = queue.drain_events(100, 10);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn push_wakes_registered_listener() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingListener(Arc<AtomicUsize>);
+        impl super::EventWakeListener for CountingListener {
+            fn events_available(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let queue = DiagnosticEventQueue::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        queue.set_wake_listener(Box::new(CountingListener(count.clone())));
+
+        queue.push("x".to_string());
+        queue.push("y".to_string());
+
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
 }
