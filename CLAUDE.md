@@ -52,6 +52,12 @@ cargo run -p uniffi-bindgen -- generate --library target/debug/libtssh_core.so -
 - 実験的・opt-in の機能(マルチパス、物理 Wi-Fi/セルラー同時利用など)は既定 OFF とし、
   使えない環境では黙ってフォールバックする「日和見的(opportunistic)」設計にする
   (`PLAN.md` Phase 7-7/9 の設計判断を参照)。
+- **Room migration(`AppDatabase.kt`)は勝手に次の番号を使わず、先に予約する**: 複数の並行
+  worktree/エージェントが同時に新しいマイグレーションを追加すると番号を奪い合い、後から
+  再採番する fixup コミットが必要になる(実際に複数回発生済み)。新しい migration を書く前に
+  必ず `scripts/reserve-room-migration.sh <owner-slug>` を実行してバージョン番号を予約すること
+  (詳細は `app/migration_registry.toml` 参照)。CI(`room-migration-check.yml`)が
+  `AppDatabase.kt` の版数と migration チェーンの整合性を検証する。
 
 ## コミット規約
 

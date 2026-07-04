@@ -1,0 +1,29 @@
+# Room DB(AppDatabase)のマイグレーションバージョン予約台帳。
+#
+# 背景: 複数の並行作業(worktree/エージェント)が同時に新しいマイグレーションを追加すると、
+# 同じ version 番号を奪い合い、後から手動で再採番するfixupコミットが必要になる
+# (実際にこの24時間で複数回発生した。PLAN.md「Phase 10完了後の外部レビュー」参照)。
+#
+# ルール:
+# 1. 新しい Room migration を書き始める前に、
+#    `scripts/reserve-room-migration.sh <owner-slug>` を実行してバージョン番号を予約する
+#    (このファイルに [[reserved]] エントリが追記される)。
+# 2. 予約された番号で AppDatabase.kt に MIGRATION_X_Y を実装し、
+#    `@Database(version = ...)` をその Y に更新してマージする。
+# 3. マージしたら、対応する [[reserved]] エントリをこのファイルから削除し、
+#    current を Y に更新する。
+# 4. `scripts/check-room-migrations.sh`(CI: .github/workflows/room-migration-check.yml)が、
+#    - current が AppDatabase.kt の @Database(version=...) と一致していること
+#    - AppDatabase.kt 内の Migration(X, Y) が 1→current まで連番で重複・欠番が無いこと
+#    - reserved に current 以下の値(＝削除し忘れ)が残っていないこと
+#    を検証する。
+
+current = 15
+
+# 予約中のマイグレーション(未マージ)。マージ後は必ず削除すること。
+# 例:
+# [[reserved]]
+# version = 16
+# owner = "phase12-relay-credential-vault"
+# branch = "agent/relay-jwt-keystore"
+# reserved_at = "2026-07-04"

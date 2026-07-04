@@ -1496,8 +1496,15 @@ Web検索で実在・現状Needs Triageであることを確認済み——Phase
    （Room migration 14→15）、`ProfileEditScreen`に「同一Wi-Fi/LAN上の他端末からの待受を許可する」
    チェックボックスを追加し、OFF時は拒否される旨を警告文言に反映。Rust側新規ユニットテスト2件
    （ループバック判定・非ループバックbind拒否のe2e）、Kotlin側新規migrationテスト1件を追加。
-5. Room migration番号の並行worktree衝突（この24hで3件のfixupコミット発生）に対し、
+5. ✅ Room migration番号の並行worktree衝突（この24hで3件のfixupコミット発生）に対し、
    migration予約ファイル+CI重複チェックのような仕組みを検討
+   → `app/migration_registry.toml`（現行版数`current`+未マージの予約`[[reserved]]`一覧）、
+   `scripts/reserve-room-migration.sh <owner-slug>`（次の版数を予約してファイルへ追記）、
+   `scripts/check-room-migrations.sh`（`AppDatabase.kt`の版数とregistryの`current`一致・
+   `Migration(X, Y)`チェーンが1→currentまで欠番/重複無し・マージ後の`[[reserved]]`消し忘れ、
+   の3点を検証）を追加。CI(`.github/workflows/room-migration-check.yml`)で
+   `AppDatabase.kt`/`migration_registry.toml`変更時に自動実行。`CLAUDE.md`にも運用ルールを追記し、
+   今後の並行作業(他エージェント含む)が予約せず直接番号を使わないよう周知した。
 
 **P1（設計候補、Phase 12以降）**
 - `h3-noq`/`isekai-link-masque`/noqの型を上位に漏らさない`isekai-transport` trait層の切り出し
