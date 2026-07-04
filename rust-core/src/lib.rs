@@ -6,6 +6,7 @@ pub(crate) mod agent_forward;
 pub(crate) mod terminal;
 pub(crate) mod theme;
 pub(crate) mod transport;
+pub(crate) mod socks;
 pub(crate) mod session_state;
 pub(crate) mod session;
 pub mod orchestrator;
@@ -102,22 +103,38 @@ pub struct JumpConfig {
     pub auth: SshAuth,
 }
 
-// ── ポートフォワード(-L のみ、MVP) ───────────────────────
+// ── ポートフォワード(-L/-R/-D、Phase 12 P2-2、plain SSHのみ) ─────
 
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum ForwardType {
-    /// `ssh -L bind:remote_host:remote_port` 相当。Dynamic/Remote は将来拡張。
+    /// `ssh -L bind:remote_host:remote_port` 相当。ローカルの`bind_address:bind_port`で
+    /// 待受し、接続をSSHサーバー経由で`remote_host:remote_port`へ中継する。
     Local,
+    /// `ssh -R bind:remote_host:remote_port` 相当。SSHサーバー側に`bind_address:bind_port`
+    /// を listen させ(`tcpip_forward`)、そこへの接続をこちら(クライアント)側から
+    /// `remote_host:remote_port`(ローカルのターゲット)へ中継する。`remote_host`/
+    /// `remote_port`はLocalと違い「クライアントから見たローカルターゲット」を指す。
+    Remote,
+    /// `ssh -D bind_port`(SOCKS4/5プロキシ)相当。ローカルの`bind_address:bind_port`で
+    /// SOCKSクライアントを受け付け、接続ごとにSOCKSハンドシェイクで宛先を読み取ってから
+    /// SSHサーバー経由でそこへ中継する。`remote_host`/`remote_port`は使わない
+    /// (宛先は接続ごとに動的に決まるため)。
+    Dynamic,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PortForward {
     pub forward_type: ForwardType,
-    /// 待受アドレス。既定は "127.0.0.1"("0.0.0.0" 等にすると同一 LAN 上の
-    /// 第三者からアクセスされ得るため UI 側で警告する)。
+    /// 待受アドレス。Local/Dynamicはクライアント(この端末)側の待受、RemoteはSSHサーバー側の
+    /// 待受を指す。既定は "127.0.0.1"("0.0.0.0" 等にすると同一LAN上の第三者から
+    /// アクセスされ得るため、`SshConfig.allow_non_loopback_forward_bind`が false の場合は
+    /// コア側で拒否される)。
     pub bind_address: String,
     pub bind_port: u16,
+    /// Local: 転送先ホスト。Remote: クライアントから見たローカルターゲットのホスト。
+    /// Dynamic: 未使用(空文字列でよい、接続ごとにSOCKSハンドシェイクで決まる)。
     pub remote_host: String,
+    /// Dynamic: 未使用(0でよい)。
     pub remote_port: u16,
 }
 
@@ -294,20 +311,36 @@ impl SshSession {
     pub fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
-        // config.forwards はコマンドチャネル経由で "AddLocalForward" として投入する。
-        // run_ssh_channel_loop がシェル起動後に select ループへ入った時点で消費され、
-        // 待受タスクが起動する(Kotlin から動的に追加/削除する将来の拡張と同じ経路)。
+        // config.forwards はコマンドチャネル経由で forward_type に応じたコマンドとして
+        // 投入する。run_ssh_channel_loop がシェル起動後に select ループへ入った時点で
+        // 消費され、待受タスクが起動する(Kotlin から動的に追加/削除する将来の拡張と
+        // 同じ経路)。
         if let Some(tx) = self.core.command_sender() {
             for (i, pf) in config.forwards.iter().enumerate() {
-                let cmd = TransportCommand::AddLocalForward {
-                    id: format!("lf-{i}"),
-                    bind_addr: pf.bind_address.clone(),
-                    bind_port: pf.bind_port,
-                    remote_host: pf.remote_host.clone(),
-                    remote_port: pf.remote_port,
+                let id = format!("lf-{i}");
+                let cmd = match pf.forward_type {
+                    ForwardType::Local => TransportCommand::AddLocalForward {
+                        id: id.clone(),
+                        bind_addr: pf.bind_address.clone(),
+                        bind_port: pf.bind_port,
+                        remote_host: pf.remote_host.clone(),
+                        remote_port: pf.remote_port,
+                    },
+                    ForwardType::Remote => TransportCommand::AddRemoteForward {
+                        id: id.clone(),
+                        bind_addr: pf.bind_address.clone(),
+                        bind_port: pf.bind_port,
+                        target_host: pf.remote_host.clone(),
+                        target_port: pf.remote_port,
+                    },
+                    ForwardType::Dynamic => TransportCommand::AddDynamicForward {
+                        id: id.clone(),
+                        bind_addr: pf.bind_address.clone(),
+                        bind_port: pf.bind_port,
+                    },
                 };
                 if tx.try_send(cmd).is_err() {
-                    log::warn!("ssh: failed to queue initial forward #{i} (channel full?)");
+                    log::warn!("ssh: failed to queue initial forward #{i} (id={id}, channel full?)");
                 }
             }
         }
@@ -405,10 +438,11 @@ pub(crate) async fn run_russh_transport(
     };
     let session = established.handle;
     let agent_key = established.agent_key;
+    let remote_forwards = established.remote_forwards;
 
     run_ssh_channel_loop(
         &config.username, &config.auth, config.cols, config.rows,
-        config.agent_forward, agent_key, config.allow_non_loopback_forward_bind,
+        config.agent_forward, agent_key, config.allow_non_loopback_forward_bind, remote_forwards,
         session, cmd_rx, event_tx,
     ).await;
 }

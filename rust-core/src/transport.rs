@@ -26,6 +26,23 @@ pub(crate) enum TransportCommand {
         remote_host: String,
         remote_port: u16,
     },
+    /// リモートポートフォワード(-R)を追加する。SSHサーバー側に`bind_addr:bind_port`を
+    /// listenさせ(`tcpip_forward`)、そこへの接続を`target_host:target_port`
+    /// (クライアントから見たローカルターゲット)へ中継する。
+    AddRemoteForward {
+        id: String,
+        bind_addr: String,
+        bind_port: u16,
+        target_host: String,
+        target_port: u16,
+    },
+    /// SOCKS4/5プロキシ(-D)を追加する。`bind_addr:bind_port`でSOCKSクライアントを
+    /// 受け付け、接続ごとにSOCKSハンドシェイクで宛先を読み取ってから中継する。
+    AddDynamicForward {
+        id: String,
+        bind_addr: String,
+        bind_port: u16,
+    },
     /// `id` の待受を停止する(新規 accept を止める。既存の中継コピーは自然終了に任せる)。
     RemoveForward { id: String },
 }
@@ -68,12 +85,22 @@ pub(crate) struct RusshEventHandler {
     /// 転送する秘密鍵（認証に使ったのと同じ鍵を共有する。鍵の追加受け渡しは不要）。
     /// `run_ssh_channel_loop` が認証成功後にセットするため `Mutex` 越しに共有する。
     pub(crate) agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
+    /// リモートポートフォワード(-R)の経路表: サーバー側で実際に bind されたポート番号 →
+    /// (クライアントから見たローカルターゲットのホスト, ポート)。`tcpip_forward` 成功時に
+    /// `run_ssh_channel_loop` が登録し、`server_channel_open_forwarded_tcpip` が
+    /// `connected_port` をキーに引いて中継先を決める。
+    pub(crate) remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
 }
 
 impl RusshEventHandler {
-    /// agent forwarding を使わない transport（QUIC 等）向けの簡易コンストラクタ。
+    /// agent forwarding・リモートポートフォワードを使わない transport（QUIC 等）向けの
+    /// 簡易コンストラクタ。
     pub(crate) fn new(event_tx: tokio::sync::mpsc::Sender<TransportEvent>) -> Self {
-        RusshEventHandler { event_tx, agent_key: Arc::new(Mutex::new(None)) }
+        RusshEventHandler {
+            event_tx,
+            agent_key: Arc::new(Mutex::new(None)),
+            remote_forwards: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -102,6 +129,53 @@ impl client::Handler for RusshEventHandler {
         let key = self.agent_key.lock().clone();
         let event_tx = self.event_tx.clone();
         tokio::spawn(agent_forward::serve_agent_channel(channel, key, event_tx));
+        Ok(())
+    }
+
+    /// リモートポートフォワード(-R)経由でサーバーが新規接続を通知してきた時に呼ばれる
+    /// （こちらが `tcpip_forward(bind_addr, bind_port)` していた場合のみ発生する）。
+    /// `connected_port` で経路表を引き、対応するローカルターゲットへ中継する。
+    /// 経路表に無いポート(既にremoveされた等)の場合はチャネルをそのまま閉じる。
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        _connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let target = self.remote_forwards.lock().get(&(connected_port as u16)).cloned();
+        let Some((target_host, target_port)) = target else {
+            warn!(
+                "remote-forward: no route for connected_port={} (originator={}:{}), closing",
+                connected_port, originator_address, originator_port
+            );
+            return Ok(());
+        };
+        let originator_address = originator_address.to_string();
+        tokio::spawn(async move {
+            debug!(
+                "remote-forward: connection from {}:{} -> relaying to {}:{}",
+                originator_address, originator_port, target_host, target_port
+            );
+            let mut target_stream = match tokio::net::TcpStream::connect((target_host.as_str(), target_port)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("remote-forward: connect to {}:{} failed: {}", target_host, target_port, e);
+                    return;
+                }
+            };
+            let mut channel_stream = channel.into_stream();
+            match tokio::io::copy_bidirectional(&mut channel_stream, &mut target_stream).await {
+                Ok((to_target, to_remote)) => {
+                    debug!("remote-forward: closed (sent {} bytes, received {} bytes)", to_target, to_remote);
+                }
+                Err(e) => {
+                    debug!("remote-forward: copy ended: {}", e);
+                }
+            }
+        });
         Ok(())
     }
 }
@@ -145,6 +219,7 @@ pub(crate) async fn authenticate_session(
 pub(crate) struct EstablishedSession {
     pub(crate) handle: client::Handle<RusshEventHandler>,
     pub(crate) agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
+    pub(crate) remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
     /// 保持するだけで参照はしない(トンネルの接続を生かしておくためだけの目的)。
     _jump_handle: Option<client::Handle<RusshEventHandler>>,
 }
@@ -161,11 +236,12 @@ pub(crate) async fn connect_via_jump_or_direct(
         info!("ssh: TCP connecting to {}", addr);
         let handler = RusshEventHandler::new(event_tx);
         let agent_key = handler.agent_key.clone();
+        let remote_forwards = handler.remote_forwards.clone();
         let handle = client::connect(russh_config, addr.as_str(), handler)
             .await
             .map_err(|e| format!("TCP connect to {addr} failed: {e}"))?;
         info!("ssh: TCP connected to {}", addr);
-        return Ok(EstablishedSession { handle, agent_key, _jump_handle: None });
+        return Ok(EstablishedSession { handle, agent_key, remote_forwards, _jump_handle: None });
     };
 
     let jump_addr = format!("{}:{}", jump.host, jump.port);
@@ -189,12 +265,13 @@ pub(crate) async fn connect_via_jump_or_direct(
 
     let target_handler = RusshEventHandler::new(event_tx);
     let agent_key = target_handler.agent_key.clone();
+    let remote_forwards = target_handler.remote_forwards.clone();
     let handle = client::connect_stream(russh_config, stream, target_handler)
         .await
         .map_err(|e| format!("SSH handshake over jump tunnel to {target_host}:{target_port} failed: {e}"))?;
     info!("ssh: connected to {}:{} via jump {}", target_host, target_port, jump_addr);
 
-    Ok(EstablishedSession { handle, agent_key, _jump_handle: Some(jump_handle) })
+    Ok(EstablishedSession { handle, agent_key, remote_forwards, _jump_handle: Some(jump_handle) })
 }
 
 // ── SSH チャネルループ（TCP・QUIC 共通）─────────────────
@@ -207,6 +284,7 @@ pub(crate) async fn run_ssh_channel_loop(
     agent_forward: bool,
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     allow_non_loopback_forward_bind: bool,
+    remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
     mut session: client::Handle<RusshEventHandler>,
     mut cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
@@ -262,12 +340,16 @@ pub(crate) async fn run_ssh_channel_loop(
 
     event_tx.send(TransportEvent::Connected).await.ok();
 
-    // シェル用チャネルの確立以降、`session`(Handle)自体はもう `&mut` operations
-    // (認証等)には使わない。ポートフォワードは `channel_open_direct_tcpip(&self, ...)`
-    // だけを要求するので、Arc で包んで待受タスクに共有する(Handle は Clone 不可だが
-    // 内部の russh mpsc sender はこの経路で複数タスクから安全に共有できる)。
-    let session = Arc::new(session);
-    let mut forward_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    // シェル用チャネルの確立以降、認証等の `&mut self` operations は使わないが、
+    // Phase 12 P2-2 で追加した `tcpip_forward`/`cancel_tcpip_forward`(リモート
+    // ポートフォワード)は `&mut self` を要求する(SSHのglobal requestは同時に1件しか
+    // in-flightにできないというプロトコル制約をAPI形上も表している)ため、
+    // `channel_open_direct_tcpip(&self, ...)` のみで済んでいたPhase 7時点の
+    // `Arc<Handle>` 共有では足りなくなった。`Arc<tokio::sync::Mutex<Handle>>` に変更し、
+    // 待受タスク側は必要な呼び出しの間だけ lock する(Handle は Clone 不可のため、
+    // 複数タスクからの共有自体は元々このAPI境界でしかできない)。
+    let session = Arc::new(tokio::sync::Mutex::new(session));
+    let mut active_forwards: HashMap<String, ActiveForward> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -305,34 +387,63 @@ pub(crate) async fn run_ssh_channel_loop(
                     }
                     Some(TransportCommand::AddLocalForward { id, bind_addr, bind_port, remote_host, remote_port }) => {
                         if !allow_non_loopback_forward_bind && !is_loopback_bind_address(&bind_addr) {
-                            warn!(
-                                "forward[{}]: rejecting non-loopback bind {} (allow_non_loopback_forward_bind=false)",
-                                id, bind_addr
-                            );
-                            event_tx.send(TransportEvent::ForwardStateChanged {
-                                id,
-                                state: ForwardState::Failed {
-                                    reason: format!(
-                                        "bind address {bind_addr} is not loopback and \
-                                         allow_non_loopback_forward_bind is false"
-                                    ),
-                                },
-                            }).await.ok();
+                            reject_non_loopback_bind(&event_tx, id, &bind_addr).await;
                         } else {
-                            info!("forward[{}]: add {}:{} -> {}:{}", id, bind_addr, bind_port, remote_host, remote_port);
+                            info!("forward[{}]: add(local) {}:{} -> {}:{}", id, bind_addr, bind_port, remote_host, remote_port);
                             let task = tokio::spawn(run_local_forward(
                                 id.clone(), bind_addr, bind_port, remote_host, remote_port,
                                 session.clone(), event_tx.clone(),
                             ));
-                            if let Some(old) = forward_tasks.insert(id, task) {
-                                old.abort();
+                            if let Some(old) = active_forwards.insert(id, ActiveForward::Task(task)) {
+                                teardown_forward(old, session.clone(), remote_forwards.clone());
+                            }
+                        }
+                    }
+                    Some(TransportCommand::AddDynamicForward { id, bind_addr, bind_port }) => {
+                        if !allow_non_loopback_forward_bind && !is_loopback_bind_address(&bind_addr) {
+                            reject_non_loopback_bind(&event_tx, id, &bind_addr).await;
+                        } else {
+                            info!("forward[{}]: add(dynamic/SOCKS) {}:{}", id, bind_addr, bind_port);
+                            let task = tokio::spawn(run_dynamic_forward(
+                                id.clone(), bind_addr, bind_port, session.clone(), event_tx.clone(),
+                            ));
+                            if let Some(old) = active_forwards.insert(id, ActiveForward::Task(task)) {
+                                teardown_forward(old, session.clone(), remote_forwards.clone());
+                            }
+                        }
+                    }
+                    Some(TransportCommand::AddRemoteForward { id, bind_addr, bind_port, target_host, target_port }) => {
+                        if !allow_non_loopback_forward_bind && !is_loopback_bind_address(&bind_addr) {
+                            reject_non_loopback_bind(&event_tx, id, &bind_addr).await;
+                        } else {
+                            info!("forward[{}]: add(remote) {}:{} -> {}:{}", id, bind_addr, bind_port, target_host, target_port);
+                            match session.lock().await.tcpip_forward(bind_addr.clone(), bind_port as u32).await {
+                                Ok(bound_port) => {
+                                    let bound_port = if bind_port == 0 { bound_port as u16 } else { bind_port };
+                                    remote_forwards.lock().insert(bound_port, (target_host, target_port));
+                                    if let Some(old) = active_forwards.insert(
+                                        id.clone(),
+                                        ActiveForward::Remote { bind_addr, bound_port },
+                                    ) {
+                                        teardown_forward(old, session.clone(), remote_forwards.clone());
+                                    }
+                                    event_tx.send(TransportEvent::ForwardStateChanged {
+                                        id, state: ForwardState::Listening,
+                                    }).await.ok();
+                                }
+                                Err(e) => {
+                                    warn!("forward[{}]: tcpip_forward {}:{} failed: {}", id, bind_addr, bind_port, e);
+                                    event_tx.send(TransportEvent::ForwardStateChanged {
+                                        id, state: ForwardState::Failed { reason: e.to_string() },
+                                    }).await.ok();
+                                }
                             }
                         }
                     }
                     Some(TransportCommand::RemoveForward { id }) => {
                         info!("forward[{}]: remove requested", id);
-                        if let Some(task) = forward_tasks.remove(&id) {
-                            task.abort();
+                        if let Some(old) = active_forwards.remove(&id) {
+                            teardown_forward(old, session.clone(), remote_forwards.clone());
                             event_tx.send(TransportEvent::ForwardStateChanged {
                                 id, state: ForwardState::Stopped,
                             }).await.ok();
@@ -349,14 +460,14 @@ pub(crate) async fn run_ssh_channel_loop(
         }
     }
 
-    for (id, task) in forward_tasks.drain() {
-        debug!("forward[{}]: aborting on session teardown", id);
-        task.abort();
+    for (id, forward) in active_forwards.drain() {
+        debug!("forward[{}]: tearing down on session teardown", id);
+        teardown_forward(forward, session.clone(), remote_forwards.clone());
     }
     info!("ssh: I/O loop exited");
 }
 
-// ── ローカルポートフォワード(-L) ──────────────────────────
+// ── ポートフォワード共通(-L/-R/-D) ──────────────────────────
 
 /// `addr` がループバック（127.0.0.0/8・::1）または文字列 "localhost"（大小無視）かどうか。
 /// `allow_non_loopback_forward_bind == false` の場合の bind 許可判定に使う。
@@ -365,6 +476,58 @@ fn is_loopback_bind_address(addr: &str) -> bool {
         return true;
     }
     addr.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
+
+/// 非ループバックbindを`ForwardState::Failed`として拒否する共通処理
+/// (-L/-R/-Dいずれも`allow_non_loopback_forward_bind == false`なら同じ判定)。
+async fn reject_non_loopback_bind(
+    event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
+    id: String,
+    bind_addr: &str,
+) {
+    warn!(
+        "forward[{}]: rejecting non-loopback bind {} (allow_non_loopback_forward_bind=false)",
+        id, bind_addr
+    );
+    event_tx.send(TransportEvent::ForwardStateChanged {
+        id,
+        state: ForwardState::Failed {
+            reason: format!(
+                "bind address {bind_addr} is not loopback and allow_non_loopback_forward_bind is false"
+            ),
+        },
+    }).await.ok();
+}
+
+/// 稼働中のポートフォワード1件分の状態。`-L`/`-D`はクライアント側の待受タスクを、
+/// `-R`はサーバー側に登録した`tcpip_forward`をそれぞれ後始末する必要があるため分ける。
+enum ActiveForward {
+    /// Local(-L)/Dynamic(-D): クライアント側の待受タスク。除去時はabortする。
+    Task(tokio::task::JoinHandle<()>),
+    /// Remote(-R): サーバー側に`tcpip_forward`で登録した内容。除去時は
+    /// `cancel_tcpip_forward`をサーバーへ送り、`remote_forwards`経路表からも消す。
+    Remote { bind_addr: String, bound_port: u16 },
+}
+
+/// [ActiveForward] 1件を後始末する(除去時・同一id上書き時・セッション終了時の3箇所で共通)。
+fn teardown_forward(
+    forward: ActiveForward,
+    session: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
+    remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
+) {
+    match forward {
+        ActiveForward::Task(task) => {
+            task.abort();
+        }
+        ActiveForward::Remote { bind_addr, bound_port } => {
+            remote_forwards.lock().remove(&bound_port);
+            tokio::spawn(async move {
+                if let Err(e) = session.lock().await.cancel_tcpip_forward(bind_addr.clone(), bound_port as u32).await {
+                    warn!("remote-forward: cancel_tcpip_forward {}:{} failed: {}", bind_addr, bound_port, e);
+                }
+            });
+        }
+    }
 }
 
 /// `bind_addr:bind_port` で待受し、accept ごとに `channel_open_direct_tcpip` で
@@ -376,7 +539,7 @@ async fn run_local_forward(
     bind_port: u16,
     remote_host: String,
     remote_port: u16,
-    handle: Arc<client::Handle<RusshEventHandler>>,
+    handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
 ) {
     let listener = match TcpListener::bind((bind_addr.as_str(), bind_port)).await {
@@ -409,7 +572,7 @@ async fn run_local_forward(
         tokio::spawn(async move {
             let originator_ip = peer_addr.ip().to_string();
             let originator_port = peer_addr.port() as u32;
-            let channel = match handle
+            let channel = match handle.lock().await
                 .channel_open_direct_tcpip(remote_host.as_str(), remote_port as u32, originator_ip.as_str(), originator_port)
                 .await
             {
@@ -420,6 +583,80 @@ async fn run_local_forward(
                 }
             };
             let mut tcp_stream = tcp_stream;
+            let mut channel_stream = channel.into_stream();
+            match tokio::io::copy_bidirectional(&mut tcp_stream, &mut channel_stream).await {
+                Ok((to_remote, to_local)) => {
+                    debug!("forward[{}]: closed (sent {} bytes, received {} bytes)", fwd_id, to_remote, to_local);
+                }
+                Err(e) => {
+                    debug!("forward[{}]: copy ended: {}", fwd_id, e);
+                }
+            }
+        });
+    }
+
+    event_tx.send(TransportEvent::ForwardStateChanged { id, state: ForwardState::Stopped }).await.ok();
+}
+
+// ── SOCKSプロキシ(-D、Dynamic port forward) ─────────────────
+
+/// `bind_addr:bind_port` でSOCKS4/4a/5クライアントを受け付け、接続ごとにSOCKSハンドシェイク
+/// (`crate::socks::negotiate`)で宛先を読み取ってから `channel_open_direct_tcpip` で
+/// SSHサーバー経由の接続へ中継する。待受確立/失敗を `ForwardStateChanged` で通知する。
+async fn run_dynamic_forward(
+    id: String,
+    bind_addr: String,
+    bind_port: u16,
+    handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
+    event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+) {
+    let listener = match TcpListener::bind((bind_addr.as_str(), bind_port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("forward[{}]: bind {}:{} failed: {}", id, bind_addr, bind_port, e);
+            event_tx.send(TransportEvent::ForwardStateChanged {
+                id, state: ForwardState::Failed { reason: e.to_string() },
+            }).await.ok();
+            return;
+        }
+    };
+    info!("forward[{}]: listening (SOCKS) on {}:{}", id, bind_addr, bind_port);
+    event_tx.send(TransportEvent::ForwardStateChanged {
+        id: id.clone(), state: ForwardState::Listening,
+    }).await.ok();
+
+    loop {
+        let (tcp_stream, peer_addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("forward[{}]: accept failed: {}", id, e);
+                break;
+            }
+        };
+        debug!("forward[{}]: accepted (SOCKS) from {}", id, peer_addr);
+        let handle = handle.clone();
+        let fwd_id = id.clone();
+        tokio::spawn(async move {
+            let mut tcp_stream = tcp_stream;
+            let (target_host, target_port) = match crate::socks::negotiate(&mut tcp_stream).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("forward[{}]: SOCKS negotiation from {} failed: {}", fwd_id, peer_addr, e);
+                    return;
+                }
+            };
+            let originator_ip = peer_addr.ip().to_string();
+            let originator_port = peer_addr.port() as u32;
+            let channel = match handle.lock().await
+                .channel_open_direct_tcpip(target_host.as_str(), target_port as u32, originator_ip.as_str(), originator_port)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("forward[{}]: channel_open_direct_tcpip to {}:{} failed: {}", fwd_id, target_host, target_port, e);
+                    return;
+                }
+            };
             let mut channel_stream = channel.into_stream();
             match tokio::io::copy_bidirectional(&mut tcp_stream, &mut channel_stream).await {
                 Ok((to_remote, to_local)) => {
@@ -558,6 +795,57 @@ mod local_forward_e2e_tests {
                 };
                 let mut stream = channel.into_stream();
                 let _ = tokio::io::copy_bidirectional(&mut stream, &mut outbound).await;
+            });
+            Ok(true)
+        }
+
+        /// クライアントの `-R`(リモートポートフォワード)要求。実際に `address:port` で
+        /// listenし、着信ごとに `forwarded-tcpip` チャネルをクライアントへ開き返す
+        /// (実sshdの-R処理を模したテスト用の最小実装)。
+        async fn tcpip_forward(
+            &mut self,
+            address: &str,
+            port: &mut u32,
+            session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            let bind_addr = format!("{}:{}", address, port);
+            let listener = match TokioTcpListener::bind(&bind_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("test server: tcpip_forward bind {} failed: {}", bind_addr, e);
+                    return Ok(false);
+                }
+            };
+            let bound_port = listener.local_addr().unwrap().port() as u32;
+            *port = bound_port;
+            let handle = session.handle();
+            let address = address.to_string();
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, peer) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let originator_ip = peer.ip().to_string();
+                    let originator_port = peer.port() as u32;
+                    let handle = handle.clone();
+                    let address = address.clone();
+                    tokio::spawn(async move {
+                        let mut tcp = tcp;
+                        match handle
+                            .channel_open_forwarded_tcpip(address.as_str(), bound_port, originator_ip.as_str(), originator_port)
+                            .await
+                        {
+                            Ok(channel) => {
+                                let mut stream = channel.into_stream();
+                                let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
+                            }
+                            Err(e) => {
+                                warn!("test server: channel_open_forwarded_tcpip failed: {}", e);
+                            }
+                        }
+                    });
+                }
             });
             Ok(true)
         }
@@ -714,6 +1002,156 @@ mod local_forward_e2e_tests {
             }
             let reason = failed_reason.expect("forward did not report Failed within timeout");
             assert!(reason.contains("allow_non_loopback_forward_bind"), "unexpected reason: {reason}");
+
+            orchestrator.disconnect();
+        });
+    }
+
+    #[test]
+    fn remote_forward_relays_bytes_end_to_end() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let echo_addr = spawn_echo_server().await;
+            let ssh_addr = spawn_fake_ssh_server(echo_addr).await;
+
+            // OSに空きポートを選ばせてから即座に閉じ、そのポート番号を-Rの bind_port
+            // (=サーバー側がlistenするポート)に使う。
+            let probe = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bind_port = probe.local_addr().unwrap().port();
+            drop(probe);
+
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback { tx });
+            let orchestrator = create_session_orchestrator(callback);
+
+            let config = SshConfig {
+                host: ssh_addr.ip().to_string(),
+                port: ssh_addr.port(),
+                username: "tester".into(),
+                auth: SshAuth::Password { password: "anything".into() },
+                cols: 80,
+                rows: 24,
+                forwards: vec![PortForward {
+                    forward_type: ForwardType::Remote,
+                    bind_address: "127.0.0.1".into(),
+                    bind_port,
+                    // -Rの場合、remote_host/remote_portは「クライアントから見たローカル
+                    // ターゲット」を指す(Localとは逆に、実際に接続するのはクライアント側の
+                    // このコードなので、Localの-L用テストと違い実在しないホスト名は使えない)。
+                    remote_host: echo_addr.ip().to_string(),
+                    remote_port: echo_addr.port(),
+                }],
+                agent_forward: false,
+                jump: None,
+                allow_non_loopback_forward_bind: false,
+            };
+
+            orchestrator.connect(config).expect("connect() should not fail synchronously");
+
+            let mut listening = false;
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Forward(_, ForwardState::Listening))) => { listening = true; break; }
+                    Ok(Some(TestEvent::Forward(_, ForwardState::Failed { reason }))) => {
+                        panic!("remote forward reported Failed before Listening: {}", reason);
+                    }
+                    _ => continue,
+                }
+            }
+            assert!(listening, "remote forward did not report Listening within timeout");
+
+            // "インターネット側"から、SSHサーバーがlistenしたポートへ接続する。
+            let mut client = tokio::time::timeout(
+                Duration::from_secs(5),
+                TokioTcpStream::connect(("127.0.0.1", bind_port)),
+            ).await.expect("connect to remote-forwarded port timed out")
+             .expect("connect to remote-forwarded port failed");
+
+            client.write_all(b"hello-remote-forward").await.unwrap();
+            let mut buf = [0u8; 32];
+            let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+                .await.expect("read from remote-forwarded port timed out")
+                .expect("read from remote-forwarded port failed");
+            assert_eq!(&buf[..n], b"hello-remote-forward");
+
+            orchestrator.disconnect();
+        });
+    }
+
+    #[test]
+    fn dynamic_forward_socks5_relays_bytes_end_to_end() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let echo_addr = spawn_echo_server().await;
+            let ssh_addr = spawn_fake_ssh_server(echo_addr).await;
+
+            let probe = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bind_port = probe.local_addr().unwrap().port();
+            drop(probe);
+
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback { tx });
+            let orchestrator = create_session_orchestrator(callback);
+
+            let config = SshConfig {
+                host: ssh_addr.ip().to_string(),
+                port: ssh_addr.port(),
+                username: "tester".into(),
+                auth: SshAuth::Password { password: "anything".into() },
+                cols: 80,
+                rows: 24,
+                forwards: vec![PortForward {
+                    forward_type: ForwardType::Dynamic,
+                    bind_address: "127.0.0.1".into(),
+                    bind_port,
+                    remote_host: String::new(),
+                    remote_port: 0,
+                }],
+                agent_forward: false,
+                jump: None,
+                allow_non_loopback_forward_bind: false,
+            };
+
+            orchestrator.connect(config).expect("connect() should not fail synchronously");
+
+            let mut listening = false;
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Forward(_, ForwardState::Listening))) => { listening = true; break; }
+                    Ok(Some(TestEvent::Forward(_, ForwardState::Failed { reason }))) => {
+                        panic!("dynamic forward reported Failed before Listening: {}", reason);
+                    }
+                    _ => continue,
+                }
+            }
+            assert!(listening, "dynamic forward did not report Listening within timeout");
+
+            let mut client = tokio::time::timeout(
+                Duration::from_secs(5),
+                TokioTcpStream::connect(("127.0.0.1", bind_port)),
+            ).await.expect("connect to SOCKS port timed out")
+             .expect("connect to SOCKS port failed");
+
+            // SOCKS5ハンドシェイク: no-auth選択 → fakeサーバーは宛先を無視して常に
+            // echoへ繋ぐので宛先自体は何でもよい。
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut method_reply = [0u8; 2];
+            client.read_exact(&mut method_reply).await.unwrap();
+            assert_eq!(method_reply, [0x05, 0x00]);
+
+            client.write_all(&[0x05, 0x01, 0x00, 0x01, 93, 184, 216, 34, 0x00, 0x50]).await.unwrap();
+            let mut connect_reply = [0u8; 10];
+            client.read_exact(&mut connect_reply).await.unwrap();
+            assert_eq!(connect_reply[1], 0x00, "SOCKS CONNECT should succeed");
+
+            client.write_all(b"hello-dynamic-forward").await.unwrap();
+            let mut buf = [0u8; 32];
+            let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+                .await.expect("read from SOCKS relay timed out")
+                .expect("read from SOCKS relay failed");
+            assert_eq!(&buf[..n], b"hello-dynamic-forward");
 
             orchestrator.disconnect();
         });

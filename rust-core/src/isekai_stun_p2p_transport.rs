@@ -388,6 +388,7 @@ async fn run_over_stream(
     });
     let handler = RusshEventHandler::new(event_tx.clone());
     let agent_key = handler.agent_key.clone();
+    let remote_forwards = handler.remote_forwards.clone();
 
     let session = match client::connect_stream(russh_config, stream, handler).await {
         Ok(s) => s,
@@ -400,7 +401,7 @@ async fn run_over_stream(
     // IsekaiStunP2pConfig は agent forwarding 未対応（`HelperQuicConfig` と同様）。
     run_ssh_channel_loop(
         &config.username, &config.auth, config.cols, config.rows,
-        false, agent_key, false,
+        false, agent_key, false, remote_forwards,
         session, cmd_rx, event_tx,
     ).await;
 }
