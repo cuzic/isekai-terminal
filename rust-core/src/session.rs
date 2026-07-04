@@ -127,8 +127,14 @@ impl SessionCore {
     /// 呼ぶこと)。
     pub(crate) fn set_theme(&self, theme: Theme) {
         *self.current_theme.lock() = theme;
+        self.send_session_cmd(SessionCmd::SetTheme(theme));
+    }
+
+    /// [session_tx]が張られていれば(=`start`後かつ`disconnect`前なら)`cmd`を投げる。
+    /// 未接続/切断済みなら黙って無視する(呼び出し側は都度存在確認しなくてよい)。
+    fn send_session_cmd(&self, cmd: SessionCmd) {
         if let Some(tx) = self.session_tx.lock().as_ref() {
-            let _ = tx.try_send(SessionCmd::SetTheme(theme));
+            let _ = tx.try_send(cmd);
         }
     }
 
@@ -190,27 +196,19 @@ impl SessionCore {
     }
 
     pub(crate) fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
-        if let Some(tx) = self.session_tx.lock().as_ref() {
-            let _ = tx.try_send(SessionCmd::TrzszAcceptUpload { transfer_id, file_name, file_size, mode });
-        }
+        self.send_session_cmd(SessionCmd::TrzszAcceptUpload { transfer_id, file_name, file_size, mode });
     }
 
     pub(crate) fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
-        if let Some(tx) = self.session_tx.lock().as_ref() {
-            let _ = tx.try_send(SessionCmd::TrzszChunk { transfer_id, data, is_last });
-        }
+        self.send_session_cmd(SessionCmd::TrzszChunk { transfer_id, data, is_last });
     }
 
     pub(crate) fn trzsz_accept_download(&self, transfer_id: String) {
-        if let Some(tx) = self.session_tx.lock().as_ref() {
-            let _ = tx.try_send(SessionCmd::TrzszAcceptDownload { transfer_id });
-        }
+        self.send_session_cmd(SessionCmd::TrzszAcceptDownload { transfer_id });
     }
 
     pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
-        if let Some(tx) = self.session_tx.lock().as_ref() {
-            let _ = tx.try_send(SessionCmd::TrzszCancel { transfer_id });
-        }
+        self.send_session_cmd(SessionCmd::TrzszCancel { transfer_id });
     }
 }
 
