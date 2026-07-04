@@ -22,9 +22,6 @@ use crate::transport::RusshEventHandler;
 
 const HELPER_INSTALL_DIR: &str = "~/.local/bin";
 const HELPER_BIN_NAME: &str = "isekai-helper";
-const HANDSHAKE_DIR: &str = "~/.cache/isekai-terminal";
-const HANDSHAKE_FILE: &str = "~/.cache/isekai-terminal/helper.handshake";
-const HANDSHAKE_LOG: &str = "~/.cache/isekai-terminal/helper.log";
 /// 起動後、ハンドシェイク行が書き出されるまでのポーリング回数・間隔。
 const HANDSHAKE_POLL_ATTEMPTS: u32 = 50;
 const HANDSHAKE_POLL_INTERVAL_MS: u32 = 100;
@@ -58,7 +55,8 @@ pub enum BootstrapError {
 
 /// isekai-helperがハンドシェイクを一切書き出せずに終了した場合に、シェル側から
 /// 代わりに出力させるマーカー行。この行が来たら、続く内容はハンドシェイクJSONではなく
-/// stderrログ(`HANDSHAKE_LOG`)そのものとして扱う。
+/// stderrログ(`launch_and_capture_handshake`が`mktemp -d`で作る一時ディレクトリ内の
+/// ログファイル)そのものとして扱う。
 const NO_HANDSHAKE_MARKER: &str = "__ISEKAI_HELPER_NO_HANDSHAKE__";
 
 /// `NO_HANDSHAKE_MARKER`とともに返されたisekai-helperのstderrログを見て、
@@ -66,11 +64,18 @@ const NO_HANDSHAKE_MARKER: &str = "__ISEKAI_HELPER_NO_HANDSHAKE__";
 /// パターンが無ければ(または`bind_port`が指定されていなければ)従来通り
 /// `HandshakeTimeout`のままにする(固定ポート指定と無関係なクラッシュまで
 /// bind失敗として誤分類しないため)。
+///
+/// `isekai-helper`は常にmusl静的リンクバイナリとして配布される(`build-isekai-helper-musl.sh`)。
+/// musl libcの`strerror()`はglibcと文言が異なる場合があり、実際`EADDRINUSE`はglibcでは
+/// "Address already in use"だがmuslでは"Address in use"("already"が無い)になることを
+/// 実機E2Eテストで確認した(開発機のglibc環境で書いた元のパターンは、実際に配布される
+/// muslバイナリの出力に一度もマッチしていなかった)。他の2パターン("Permission denied"/
+/// "Address not available")は偶然glibc/musl間で表記が一致していたため気づかれていなかった。
 fn classify_launch_failure(log_text: &str, bind_port: Option<u16>) -> BootstrapError {
     let Some(port) = bind_port else {
         return BootstrapError::HandshakeTimeout;
     };
-    if log_text.contains("Address already in use") {
+    if log_text.contains("Address already in use") || log_text.contains("Address in use") {
         BootstrapError::BindPortInUse(port)
     } else if log_text.contains("Permission denied") {
         BootstrapError::BindPermissionDenied(port)
@@ -226,6 +231,24 @@ async fn launch_and_capture_handshake(
     // ファイル権限は 0700(dir)/0600(handshake ファイル) を umask で保証する
     // （HELPER_PROTOCOL.md「Bootstrap file permissions」契約）。
     //
+    // ハンドシェイク/ログの出力先は、呼び出しごとに`mktemp -d`で新規作成する一時
+    // ディレクトリにする（固定パス`~/.cache/isekai-terminal/helper.{handshake,log}`を
+    // 全セッション共通で使い回していた旧実装には、同一サーバーへ複数タブ/セッションで
+    // 接続した際に、まだ生きている前のisekai-helperデーモンが同じファイルのfdを
+    // 開いたままの状態で次の起動がそのファイルを`>`で truncateしてしまい、両者の
+    // 書き込みが同一ファイル上で衝突してログが破損する不具合があった（実際に
+    // `second_session_with_same_fixed_port_fails_as_port_in_use`テストで発見。
+    // 壊れた"Error: Address in use (os error 98)"という行——本来なら
+    // "Address already in use"のはず——が生成され、classify_launch_failureが
+    // BindPortInUseを正しく分類できずHandshakeTimeoutに落ちていた）。
+    // `mktemp -d`は呼び出しごとに衝突しない新規ディレクトリを作るため、この種の
+    // 共有状態の衝突が構造的に起きなくなる。`trap ... EXIT`で、スクリプトが
+    // 正常終了/シグナル受信のどちらで終わっても一時ディレクトリを確実に削除する
+    // （SIGKILLはどのプロセスもtrapできないため唯一の例外だが、これはOS一般の制約であり
+    // 対処不能）。isekai-helper本体はsetsidで独立したセッションになっており、
+    // ディレクトリ削除後もまだ開いているfdへの書き込みは継続できる(Linuxのunlink-while-open
+    // 挙動)ため、削除タイミングをデーモンの寿命に合わせる必要はない。
+    //
     // 実機検証の結果、`cmd & disown`（引数無しはもちろん `disown -a` でも）では、
     // 起動元シェル（russh の exec チャネルが実行する `bash -c "..."` 本体）が
     // スクリプル終了後も長時間 `do_wait()` に留まり、isekai-helper（長時間稼働する
@@ -269,15 +292,15 @@ async fn launch_and_capture_handshake(
     // (classify_launch_failure)がこれを見て、bind失敗の具体的な理由を推定できる
     // ようにする(単なる`cat`の空出力だけでは原因が一切わからないため)。
     let launch_cmd = format!(
-        "umask 077 && mkdir -p {HANDSHAKE_DIR} && \
+        "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
          ( setsid {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} {bind_arg}{p2p_arg}--target {ssh_relay_target} \
-         </dev/null >{HANDSHAKE_FILE} 2>{HANDSHAKE_LOG} & ); \
+         </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
          for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
-           [ -s {HANDSHAKE_FILE} ] && break; \
+           [ -s $tmpdir/handshake ] && break; \
            sleep {sleep_secs}; \
          done; \
-         if [ -s {HANDSHAKE_FILE} ]; then cat {HANDSHAKE_FILE}; \
-         else echo {NO_HANDSHAKE_MARKER}; cat {HANDSHAKE_LOG} 2>/dev/null; fi"
+         if [ -s $tmpdir/handshake ]; then cat $tmpdir/handshake; \
+         else echo {NO_HANDSHAKE_MARKER}; cat $tmpdir/log 2>/dev/null; fi"
     );
 
     let (stdout, _exit_status) = run_exec(session, &launch_cmd, None).await?;
@@ -500,6 +523,18 @@ mod tests {
     #[test]
     fn classify_launch_failure_detects_address_in_use() {
         let log = "Error: Address already in use (os error 98)\n";
+        assert!(matches!(
+            classify_launch_failure(log, Some(45900)),
+            BootstrapError::BindPortInUse(45900)
+        ));
+    }
+
+    /// `isekai-helper`の実配布物(musl静的リンク)は同じEADDRINUSEでもglibcと違う文言
+    /// ("already"が無い)を出す。実機E2Eテストで発見(このパターンが無いと本番では
+    /// 常にHandshakeTimeoutへ誤分類されていた)。
+    #[test]
+    fn classify_launch_failure_detects_address_in_use_musl_wording() {
+        let log = "Error: Address in use (os error 98)\n";
         assert!(matches!(
             classify_launch_failure(log, Some(45900)),
             BootstrapError::BindPortInUse(45900)

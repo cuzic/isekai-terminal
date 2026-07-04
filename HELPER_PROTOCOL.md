@@ -124,15 +124,30 @@ bind に成功した直後、accept ループに入る前に、**1行だけ** JS
   フォールバック余地が無く、relay接続自体が失敗すればhelperの起動自体が失敗するため）。
   isekai-terminal はこのアドレスへ直接QUIC接続する（`ssh_host`とは無関係の別アドレス）。
 
-SSH 側の呼び出し例（ブートストラップスクリプトのイメージ、Phase 7-3 で実装・実機検証済み）:
+SSH 側の呼び出し例（ブートストラップスクリプトのイメージ、Phase 7-3 で実装・実機検証済み、
+Phase 10-1c で固定パス共有による衝突バグを踏んで `mktemp -d` へ変更）:
 
 ```bash
-mkdir -p -m 0700 ~/.cache/isekai-terminal
+umask 077
+tmpdir=$(mktemp -d)
+trap 'rm -rf $tmpdir' EXIT
 ( setsid ~/.local/bin/isekai-helper --target 127.0.0.1:22 \
-  </dev/null >~/.cache/isekai-terminal/helper.handshake 2>~/.cache/isekai-terminal/helper.log & )
-chmod 0600 ~/.cache/isekai-terminal/helper.handshake
+  </dev/null >$tmpdir/handshake 2>$tmpdir/log & )
 # 1行目が読めるまで短い timeout 付きでポーリングする（固定 sleep 0.2 に頼らない）
 ```
+
+**固定パスではなく呼び出しごとに`mktemp -d`で新規ディレクトリを作ること（実機E2Eテストで判明した
+重要な差異、Phase 10-1c）**: 旧実装は全セッション共通の固定パス（`~/.cache/isekai-terminal/helper.handshake`/
+`helper.log`）に出力しており、同一サーバーへ複数タブ/セッションで接続した場合（`--bind`固定ポートに
+限らず、通常のエフェメラルポート接続でも起こり得る）、まだ稼働中の前セッションのisekai-helperデーモンが
+同じファイルのfdを開いたままの状態で次の起動がそのファイルを`>`でtruncateしてしまい、両者の書き込みが
+同一ファイル上で衝突してログ内容が破損することを実機E2Eテスト（`second_session_with_same_fixed_port_fails_as_port_in_use`）
+で確認した。`mktemp -d`は呼び出しごとに衝突しない新規ディレクトリを作るため、この種の共有状態の衝突が
+構造的に起きなくなる。`trap ... EXIT`はスクリプトが正常終了/シグナル受信のどちらで終わっても一時
+ディレクトリを確実に削除する（`SIGKILL`はどのプロセスもtrapできないため唯一の例外だが、これはOS一般の
+制約であり対処不能）。isekai-helper本体は`setsid`で独立したセッションになっており、ディレクトリ削除後も
+まだ開いているfdへの書き込みは継続できる（Linuxの unlink-while-open 挙動）ため、削除タイミングを
+デーモンの寿命に合わせる必要はない。
 
 **`cmd & disown` ではなく `( cmd & )` というサブシェル二重 fork にすること（実機検証で判明した重要な差異）**:
 実機で検証したところ、`setsid isekai-helper ... & disown`（`disown` 引数無し、`disown -a` いずれも）では、
@@ -146,13 +161,15 @@ SSH exec チャネルを実行している `bash -c "..."` 本体がスクリプ
 `setsid`（または同等の手段）で SSH セッション終了時の SIGHUP から切り離し、SSH exec チャネルが
 閉じた後もプロセスが生き続けるようにする。
 
-**ファイル権限契約**: `helper.handshake` には `session_secret` が平文で含まれるため、これは実質的な
-bearer secret として扱う。ブートストラップ側（Phase 7-3）は以下を **必須**とする。
+**ファイル権限契約**: `helper.handshake`（上記の`$tmpdir/handshake`）には `session_secret` が平文で
+含まれるため、これは実質的な bearer secret として扱う。ブートストラップ側（Phase 7-3、Phase 10-1c で
+`mktemp -d` に変更）は以下を **必須**とする。
 
-- 出力先ディレクトリ（`~/.cache/isekai-terminal/` 等）は `0700` で作成する
-- `helper.handshake` ファイルは `0600` で作成する（`umask` に依存しない明示的な `chmod`）
-- 既存ファイルを使い回す場合は所有者と permission を検査し、不適切なら失敗させる（他ユーザーが
-  読めるパーミッションのファイルは信用しない）
+- 出力先ディレクトリは `mktemp -d`（`mkdtemp(3)`、umask に関わらず常に `0700` で作成される）で作る
+- `handshake`/`log` ファイルは `umask 077` の下でシェルリダイレクトにより作成し、`0600` を保証する
+- 呼び出しごとに新規ディレクトリを作るため「既存ファイルを使い回す」ケース自体が発生しない
+  （Phase 10-1c 以前は固定パスの使い回しを想定した所有者/permission検査が必要だったが、
+  現在は不要）
 
 **stdout flush 契約**: helper は起動ハンドシェイク JSON と末尾改行を書き出した後、**accept ループに
 入る前に stdout を明示的に flush しなければならない**（stdout がファイルにリダイレクトされる場合、
