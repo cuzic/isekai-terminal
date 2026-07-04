@@ -19,6 +19,7 @@ compile_error!(
 mod cli;
 mod connect;
 mod init;
+mod login;
 
 use clap::Parser;
 
@@ -43,6 +44,8 @@ async fn main() -> std::process::ExitCode {
     let result = match cli.command {
         cli::Command::Connect(args) => connect::run(args).await,
         cli::Command::Init(args) => init::run(args).await,
+        cli::Command::Login(args) => login::run(args).await,
+        cli::Command::Logout => login::run_logout().await,
     };
 
     match result {

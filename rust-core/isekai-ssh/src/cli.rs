@@ -1,7 +1,7 @@
 //! `isekai-ssh` CLI surface (`ISEKAI_SSH_DESIGN.md` "CLIコマンド構成").
 //!
-//! `connect` and `init` are implemented; `login`/`logout`/`trust` are still
-//! out of scope (フェーズ分割案 S-5). As of S-2, `connect` resolves its
+//! `connect`, `init`, `login`, and `logout` are implemented; `trust` is still
+//! out of scope. As of S-2, `connect` resolves its
 //! target from the trust store (`isekai-trust`,
 //! `~/.config/isekai-ssh/known_helpers.toml`) by default; the
 //! `--dev-insecure-*` flags below remain only as a debug/test-only bypass
@@ -17,6 +17,14 @@
 //! store `connect` reads from: it deploys/starts `isekai-helper` on a target
 //! host (via `isekai-bootstrap::OpenSshBackend`) and, on confirmation, writes
 //! a `HelperTrust` entry. See `init.rs`'s module docs for the full flow.
+//!
+//! `login`/`logout` (S-5) manage the relay JWT `isekai-helper --relay` needs
+//! (`init`'s `--relay-jwt` flag, still passed explicitly — wiring `init`'s
+//! `--relay-jwt` to default to the logged-in token is future work, not this
+//! phase's scope): `login` runs a Device Authorization Grant (RFC 8628)
+//! against caller-supplied OAuth endpoints and saves the resulting token via
+//! `isekai-auth`; `logout` deletes the saved token file. See `login.rs`'s
+//! module docs for the full flow.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -48,6 +56,17 @@ pub enum Command {
     /// trust store `connect` reads from. Interactive by design — see
     /// `init.rs`'s module docs.
     Init(InitArgs),
+
+    /// Run a Device Authorization Grant (RFC 8628) against the given OAuth
+    /// endpoints and save the resulting relay JWT (+ refresh token, if any)
+    /// to `~/.config/isekai-ssh/token.json`. Interactive by design (prints
+    /// the verification URL/code to stdout and waits) — see `login.rs`'s
+    /// module docs.
+    Login(LoginArgs),
+
+    /// Delete the saved token file (`~/.config/isekai-ssh/token.json`), if
+    /// any. Not an error if already logged out.
+    Logout,
 }
 
 #[derive(Args)]
@@ -159,4 +178,23 @@ pub struct InitArgs {
     /// only variant, `ISEKAI_SSH_DESIGN.md` "trust store のファイル形式").
     #[arg(long, value_name = "NAME")]
     pub release_channel: Option<String>,
+}
+
+#[derive(Args)]
+pub struct LoginArgs {
+    /// RFC 8628 §3.1 device authorization endpoint URL. Not hardcoded: the
+    /// real Auth0 tenant URL isn't fixed yet
+    /// (`ISEKAI_SSH_DESIGN.md` "引き続き未決の項目").
+    #[arg(long, value_name = "URL")]
+    pub device_auth_endpoint: String,
+
+    /// RFC 8628 §3.4 token endpoint URL, polled during `login` and reused
+    /// later by `FileTokenProvider::get_relay_jwt`'s auto-refresh
+    /// (`isekai_auth::refresh`).
+    #[arg(long, value_name = "URL")]
+    pub token_endpoint: String,
+
+    /// OAuth client id for this (public, device-flow) client.
+    #[arg(long, value_name = "ID")]
+    pub client_id: String,
 }
