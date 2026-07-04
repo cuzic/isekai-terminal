@@ -26,6 +26,16 @@
 //! (`isekai-transport`'s `resume` module is only wired up for `RelayTarget`
 //! today) and keeps using the original one-shot `relay_stdio`.
 //!
+//! Phase S-4d makes the resume window itself configurable
+//! (`ConnectArgs::resume_window`, still defaulting to 120s to match
+//! isekai-helper's own `--resume-window`) and makes `run_relay_resumable`'s
+//! give-up path deliberate rather than incidental: on top of the process
+//! simply exiting (which lets the OS close stdio as a side effect), it now
+//! explicitly shuts down stdout and drops stdin first, and always prints an
+//! stderr message (`eprintln!`, not `log::warn!`, so it is visible
+//! regardless of `RUST_LOG` — matching the `--mode stun` warning above)
+//! saying by how much the resume window was exceeded.
+//!
 //! **stdout purity is the load-bearing invariant of this whole module**: this
 //! process is invoked as `ssh`'s `ProxyCommand`, so anything written to
 //! stdout other than bytes read from the QUIC stream corrupts the SSH
@@ -56,14 +66,6 @@ use crate::resume::C2hReplayBuffer;
 /// `DEFAULT_RESUME_BUFFER_SIZE` (`isekai-helper/src/main.rs`) so neither side
 /// is the tighter bottleneck.
 const C2H_REPLAY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
-
-/// How long `run_relay_resumable` keeps attempting to resume after the QUIC
-/// connection is lost before giving up and letting the process exit
-/// (`ISEKAI_SSH_DESIGN.md`: "resume window...既定120秒", matching
-/// isekai-helper's own `--resume-window` default). This is intentionally the
-/// *minimal* give-up policy the task calls for ("一定回数/時間で諦めて
-/// プロセスを終了する" — a more careful close-down sequence is S-4d's scope).
-const RESUME_WINDOW: Duration = Duration::from_secs(120);
 
 /// Reconnect backoff between resume attempts. Deliberately no jitter here
 /// (`BackoffPolicy::base_delay`, not `delay_for_attempt`) — isekai-ssh is a
@@ -140,7 +142,10 @@ pub async fn run(args: ConnectArgs) -> Result<()> {
     let (target, source) = resolve_target(&args)?;
 
     match target {
-        ResolvedTarget::Relay(relay_target) => run_relay_resumable(relay_target, &args.host, &source).await,
+        ResolvedTarget::Relay(relay_target) => {
+            let resume_window = Duration::from_secs(args.resume_window);
+            run_relay_resumable(relay_target, &args.host, &source, resume_window).await
+        }
         ResolvedTarget::Stun { stun_server, target } => {
             log::info!(
                 "isekai-ssh: connecting to isekai-helper at {} via STUN+SSH rendezvous P2P (--mode stun, \
@@ -385,16 +390,18 @@ fn dev_insecure_target(args: &ConnectArgs) -> Result<Option<RelayTarget>> {
 }
 
 /// `--mode relay`'s connect+relay lifecycle (`ISEKAI_SSH_DESIGN.md` Phase
-/// S-4c): establishes a resumable session, then drives `run_data_pump` in a
-/// loop. As long as `run_data_pump` reports a real disconnect (not a clean
-/// EOF), this function keeps trying `reconnect_and_resume` — bounded by
-/// `RESUME_WINDOW` — before finally giving up. `ssh`'s stdin/stdout are never
-/// explicitly touched here beyond normal reads/writes; giving up simply
-/// returns `Ok(())`, letting the process exit and its stdio fds close as a
-/// side effect of that (`ISEKAI_SSH_DESIGN.md`'s minimal give-up policy for
-/// this phase — see `RESUME_WINDOW`'s docs; a more deliberate close-down
-/// sequence is S-4d's scope).
-async fn run_relay_resumable(target: RelayTarget, host: &str, source: &TargetSource) -> Result<()> {
+/// S-4c/S-4d): establishes a resumable session, then drives `run_data_pump`
+/// in a loop. As long as `run_data_pump` reports a real disconnect (not a
+/// clean EOF), this function keeps trying `reconnect_and_resume` — bounded by
+/// `resume_window` (`ConnectArgs::resume_window`, matching isekai-helper's
+/// own `--resume-window`) — before finally giving up. Giving up
+/// (`resume_window` exceeded) is deliberate, not incidental: it prints an
+/// stderr message saying by how much the window was exceeded, explicitly
+/// shuts down `stdout` and drops `stdin`, and only then returns `Ok(())` —
+/// letting the process exit closes whatever the explicit shutdown/drop
+/// couldn't (e.g. the underlying fds themselves, which `tokio::io::stdout()`'s
+/// `shutdown()` does not close, only flushes/marks done).
+async fn run_relay_resumable(target: RelayTarget, host: &str, source: &TargetSource, resume_window: Duration) -> Result<()> {
     log::info!("isekai-ssh: connecting to isekai-helper at {} (--mode relay)", target.helper_addr);
     let factory = SystemQuicEndpointFactory;
     let established = connect_via_relay_resumable(&factory, &target)
@@ -437,14 +444,32 @@ async fn run_relay_resumable(target: RelayTarget, host: &str, source: &TargetSou
             }
         }
 
-        let deadline = *disconnected_since.get_or_insert_with(Instant::now) + RESUME_WINDOW;
+        let deadline = *disconnected_since.get_or_insert_with(Instant::now) + resume_window;
         let new_stream = loop {
             let now = Instant::now();
             if now >= deadline {
-                log::warn!(
-                    "isekai-ssh: resume window ({RESUME_WINDOW:?}) exceeded for session_id={session_id}, \
-                     giving up and letting the process exit"
+                let exceeded_by = now.saturating_duration_since(deadline);
+                // Deliberately `eprintln!`, not `log::warn!` (module docs):
+                // this must be visible regardless of `RUST_LOG` — it's the
+                // one moment `ssh` is about to see its ProxyCommand die, and
+                // the user deserves a clearer reason than whatever generic
+                // message `ssh` itself prints for a closed pipe.
+                eprintln!(
+                    "isekai-ssh: giving up on session_id={session_id} for '{host}' — the resume window \
+                     ({resume_window:?}) was exceeded by {exceeded_by:?} without reconnecting to \
+                     isekai-helper. Closing stdin/stdout; ssh will treat this like any other lost \
+                     connection. Run `ssh {host}` again once isekai-helper is reachable."
                 );
+                // Explicit close/shutdown before exiting (S-4d): don't just
+                // rely on the process exit to close these as a side effect.
+                // `tokio::io::Stdout::shutdown` flushes and marks the write
+                // side done; `tokio::io::Stdin` has no analogous shutdown
+                // primitive, so dropping our handle to it is the closest
+                // equivalent available from here (the underlying fd itself
+                // is still only actually closed when the process exits,
+                // same as `stdout`'s fd).
+                let _ = stdout.shutdown().await;
+                drop(stdin);
                 return Ok(());
             }
             let delay = RESUME_BACKOFF.base_delay(attempt).min(deadline - now);

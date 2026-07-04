@@ -62,3 +62,10 @@ name = "help_purity"
 [[test]]
 name = "resume_reconnect_e2e"
 required-features = ["dev-insecure"]
+
+# `resume_window_exceeded_e2e.rs` (Phase S-4d) is `resume_reconnect_e2e.rs`'s
+# "resume window exceeded" counterpart — same `--dev-insecure-*` bypass, same
+# gating applies.
+[[test]]
+name = "resume_window_exceeded_e2e"
+required-features = ["dev-insecure"]
