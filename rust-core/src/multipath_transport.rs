@@ -116,6 +116,13 @@ pub struct MultipathHelperQuicConfig {
     pub rows: u32,
     /// ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
     pub jump: Option<JumpConfig>,
+    /// isekai-helperのQUIC待受ポートをユーザー指定で固定する(`None`なら、
+    /// `direct_host`が設定されている場合のみ既定値`DIRECT_MULTIPATH_BIND_PORT`を使う、
+    /// 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
+    /// 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
+    /// `None`の場合はRust側で従来通りの既定値フォールバックを維持する
+    /// (`HelperQuicConfig.bind_port`のdocコメントも参照)。
+    pub bind_port: Option<u16>,
 }
 
 /// noq issue #738（`open_path()`に`local_ip`明示指定した新規pathでPATH_RESPONSEが
@@ -902,7 +909,10 @@ async fn try_connect_multipath(
     rebind_rx: tokio::sync::mpsc::Receiver<RebindRequest>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
 ) -> Result<(noq::SendStream, noq::RecvStream), String> {
-    let bind_port = config.direct_host.is_some().then_some(DIRECT_MULTIPATH_BIND_PORT);
+    // ユーザーが明示指定していればそれを優先し、無指定ならdirect_host使用時のみ
+    // 既定の固定ポートにフォールバックする(後方互換)。
+    let bind_port = config.bind_port
+        .or_else(|| config.direct_host.is_some().then_some(DIRECT_MULTIPATH_BIND_PORT));
     let handshake = helper_quic_transport::bootstrap_helper_via_ssh(
         &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump, bind_port,
         &crate::helper_bootstrap::HelperP2pMode::None,
