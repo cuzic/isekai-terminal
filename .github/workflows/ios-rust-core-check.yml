@@ -117,12 +117,16 @@ jobs:
 
       - name: Run round-trip test on iOS Simulator
         working-directory: ios
+        # CODE_SIGNING_ALLOWED=NOで署名を完全に無効化すると、Keychain APIが
+        # errSecMissingEntitlement(-34018)で失敗する(未署名プロセスはOSが
+        # どのアプリのKeychainか判定できないため)。CredentialVault(Phase 1B)の
+        # テスト追加で発覚。署名は無効化せず、Xcodeの自動ローカル署名
+        # (Apple Developerアカウント不要、Simulator向けなら成立する)に任せる。
         run: |
           xcodebuild -list
           xcodebuild test \
             -scheme TsshCore \
-            -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}' \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+            -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}'
 
       - name: Upload XCFramework
         if: always()
