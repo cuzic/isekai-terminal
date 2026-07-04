@@ -10,6 +10,7 @@ import android.os.IBinder
 import tools.isekai.terminal.TerminalSessionService
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.KeystoreKek
+import tools.isekai.terminal.RelayCredentialVault
 import tools.isekai.terminal.util.RemoteLogger
 import android.content.ContentValues
 import android.net.Uri
@@ -131,6 +132,8 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
         val encBytes = File(keyEntry.encryptedPrivateKeyPath).readBytes()
         return KeystoreKek.decrypt(encBytes)
     }
+
+    override fun decryptRelayJwt(ciphertext: String): String = RelayCredentialVault.decrypt(ciphertext)
 
     override suspend fun openUploadFile(uri: Uri): UploadFile? {
         val cr = app.contentResolver

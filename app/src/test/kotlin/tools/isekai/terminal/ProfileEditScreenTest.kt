@@ -323,7 +323,15 @@ class ProfileEditScreenTest {
     @Test fun saveNewProfile_withRelayConfig_persistsAllThreeFields() {
         var saved = false
         composeTestRule.setContent {
-            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+            // relayJwtの暗号化(RelayCredentialVault)はAndroidKeyStoreを使うためRobolectricでは
+            // 動かない。ここでは恒等関数に差し替えて配線ロジックだけを検証する。
+            ProfileEditScreen(
+                profile = null,
+                onSave = { saved = true },
+                onCancel = {},
+                encryptRelayJwt = { it },
+                decryptRelayJwt = { it },
+            )
         }
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("RelayProfile")
@@ -358,7 +366,15 @@ class ProfileEditScreenTest {
             relaySni = "relay.example.com",
             relayJwt = "eyJhbGciOiJSUzI1NiJ9.test.sig",
         )
-        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.setContent {
+            ProfileEditScreen(
+                profile = profile,
+                onSave = {},
+                onCancel = {},
+                encryptRelayJwt = { it },
+                decryptRelayJwt = { it },
+            )
+        }
         composeTestRule.onNodeWithText("relay.example.com:443").assertExists()
         composeTestRule.onNodeWithText("relay.example.com").assertExists()
         composeTestRule.onNodeWithText("eyJhbGciOiJSUzI1NiJ9.test.sig").assertExists()

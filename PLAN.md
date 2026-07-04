@@ -1508,9 +1508,16 @@ Web検索で実在・現状Needs Triageであることを確認済み——Phase
 
 **P1（設計候補、Phase 12以降）**
 - `h3-noq`/`isekai-link-masque`/noqの型を上位に漏らさない`isekai-transport` trait層の切り出し
-  （`isekai-protocol`/`isekai-trust`との境界分離も含む）
-- relay credential vaultをAndroid Keystoreベースに移行（access_jwt短命・メモリのみ、
-  refresh/device tokenをKEK暗号化保存、という案）
+  （`isekai-protocol`/`isekai-trust`との境界分離も含む、**他エージェントが作業中のため着手しない**）
+- ✅ relay_jwtの平文保存自体は解消（issue #1 close）: `RelayCredentialVault`
+  （`KeystoreKek`＝秘密鍵と同じAndroid Keystore由来AES/GCMを再利用）でRoomには暗号化(Base64)
+  して保存し、`AppExecutor.decryptRelayJwt`(接続直前)・`ProfileEditScreen`の
+  `encryptRelayJwt`/`decryptRelayJwt`引数(既定は`RelayCredentialVault`、テストは恒等関数に
+  差し替え。`AndroidKeyStore`はRobolectricで使えないため`applyTerminalTheme`と同じ注入
+  パターンを採用)でのみ平文化する。`toIsekaiLinkRelayConfig`自体は暗号化を意識しない純粋な
+  マッピング関数のまま維持。実機テスト`RelayCredentialVaultTest`を追加。
+  残作業(未着手、P1として継続): access_jwt短命化・メモリのみ保持、refresh/device token
+  発行・revoke/rotateという、relay認可サーバーの実装を前提とした本格的なcredential vault設計。
 - Phase 9-4を正式機能ではなくexperimental feature flagへ格下げ
 
 **P2（後回しでよい）**

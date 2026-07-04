@@ -87,6 +87,11 @@ fun ProfileEditScreen(
     profile: ConnectionProfile? = null,
     onSave: () -> Unit,
     onCancel: () -> Unit,
+    // relayJwt は Room に暗号化して保存する(issue #1)。AndroidKeyStore は Robolectric で
+    // 使えないため、実際の暗号化処理はデフォルト引数として注入し、テストでは恒等関数
+    // ({ it })に差し替える(ProfileListScreen の applyTerminalTheme と同じパターン)。
+    encryptRelayJwt: (String) -> String = RelayCredentialVault::encrypt,
+    decryptRelayJwt: (String) -> String = RelayCredentialVault::decrypt,
 ) {
     val vm: ProfileEditViewModel = viewModel()
     val keys by vm.keys.collectAsStateWithLifecycle()
@@ -107,7 +112,7 @@ fun ProfileEditScreen(
     var stunServer by remember { mutableStateOf(profile?.stunServer ?: "") }
     var relayAddr by remember { mutableStateOf(profile?.relayAddr ?: "") }
     var relaySni by remember { mutableStateOf(profile?.relaySni ?: "") }
-    var relayJwt by remember { mutableStateOf(profile?.relayJwt ?: "") }
+    var relayJwt by remember { mutableStateOf(profile?.relayJwt?.let(decryptRelayJwt) ?: "") }
     var enableUpstreamFailover by remember { mutableStateOf(profile?.enableUpstreamFailover ?: false) }
     var postConnectCommands by remember { mutableStateOf(profile?.postConnectCommands ?: "") }
     var enableAgentForward by remember { mutableStateOf(profile?.enableAgentForward ?: false) }
@@ -726,7 +731,7 @@ fun ProfileEditScreen(
                         stunServer = stunServer.trim().takeIf { it.isNotBlank() },
                         relayAddr = relayAddr.trim().takeIf { it.isNotBlank() },
                         relaySni = relaySni.trim().takeIf { it.isNotBlank() },
-                        relayJwt = relayJwt.trim().takeIf { it.isNotBlank() },
+                        relayJwt = relayJwt.trim().takeIf { it.isNotBlank() }?.let(encryptRelayJwt),
                     )
                     vm.save(saved) { onSave() }
                 },

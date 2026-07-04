@@ -52,6 +52,7 @@ class DumbAppExecutor : AppExecutor {
         keyPemError?.let { throw it }
         return keyPem
     }
+    override fun decryptRelayJwt(ciphertext: String): String = ciphertext
     override suspend fun openUploadFile(uri: Uri): UploadFile =
         UploadFile(uri.lastPathSegment ?: "fake", 0L, ByteArrayInputStream(ByteArray(0)))
     override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {}

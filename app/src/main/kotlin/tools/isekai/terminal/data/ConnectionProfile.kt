@@ -94,10 +94,12 @@ data class ConnectionProfile(
     // 選択時のみ使うSTUNサーバー(host:port)。null/空なら DEFAULT_STUN_SERVER を使う。
     @ColumnInfo(name = "stun_server") val stunServer: String? = null,
     // Phase 10: MASQUE relay経由P2P QUIC(TransportPreference.ISEKAI_LINK_RELAY_QUIC)選択時のみ使う。
-    // relayJwtは平文でRoomに保存している(既知のsecurity debt、暫定でMVPとして許容中)。
-    // KeystoreKekベースのrelay credential vaultへの移行はissue #1でトラッキングする。
-    // https://github.com/cuzic/isekai-terminal/issues/1
-    // このTODOだけを削除してplaintext保存を放置したまま次フェーズへ進めないこと。
+    // relayJwtは平文ではなく RelayCredentialVault(KeystoreKek由来のAES/GCM、issue #1対応)で
+    // 暗号化した値(Base64)をここに保存する。読み書きは必ず ProfileEditScreen の
+    // encryptRelayJwt/decryptRelayJwt(既定は RelayCredentialVault) と
+    // AppExecutor.decryptRelayJwt(接続直前)を経由すること。この列に直接平文JWTを
+    // 書き込まないこと。access_jwt短命化・refresh/device token化(relay認可サーバー
+    // 前提の本格的なcredential vault)はPLAN.md Phase 12以降の設計候補として別途検討。
     @ColumnInfo(name = "relay_addr") val relayAddr: String? = null,
     @ColumnInfo(name = "relay_sni") val relaySni: String? = null,
     @ColumnInfo(name = "relay_jwt") val relayJwt: String? = null,

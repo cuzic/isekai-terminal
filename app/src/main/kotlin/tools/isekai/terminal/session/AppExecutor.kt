@@ -25,6 +25,12 @@ interface AppExecutor {
     fun unregisterNetworkCallbacks()
     /** 指定 keyId の秘密鍵を復号して PEM バイト列で返す。 */
     suspend fun loadKeyPem(keyId: Long): ByteArray
+    /**
+     * [ConnectionProfile.relayJwt][tools.isekai.terminal.data.ConnectionProfile.relayJwt]
+     * (Roomには`RelayCredentialVault`で暗号化して保存済み)を復号して平文JWTを返す。
+     * relay接続(`toIsekaiLinkRelayConfig`)の直前にのみ呼ぶこと。
+     */
+    fun decryptRelayJwt(ciphertext: String): String
     /** アップロード対象 URI を開いてメタデータ＋InputStream を返す。null なら開けなかった。 */
     suspend fun openUploadFile(uri: Uri): UploadFile?
     /** サービスバインドを解除する (onCleared から呼ぶ)。 */

@@ -306,8 +306,13 @@ class TerminalTabsViewModel(
                 }
                 TransportPreference.ISEKAI_STUN_P2P_QUIC ->
                     connectIsekaiStunP2p(tab, profile.toIsekaiStunP2pConfig(auth, jumpAuth))
-                TransportPreference.ISEKAI_LINK_RELAY_QUIC ->
-                    connectIsekaiLinkRelay(tab, profile.toIsekaiLinkRelayConfig(auth, jumpAuth))
+                TransportPreference.ISEKAI_LINK_RELAY_QUIC -> {
+                    // relayJwt は Room に RelayCredentialVault で暗号化して保存してあるため、
+                    // 実際の接続直前に復号する(toIsekaiLinkRelayConfig 自体は暗号化を意識しない
+                    // 純粋なマッピング関数のまま保つ)。
+                    val decrypted = profile.copy(relayJwt = profile.relayJwt?.let { executor.decryptRelayJwt(it) })
+                    connectIsekaiLinkRelay(tab, decrypted.toIsekaiLinkRelayConfig(auth, jumpAuth))
+                }
             }
         }
     }
