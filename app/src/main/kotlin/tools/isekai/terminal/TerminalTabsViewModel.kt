@@ -351,7 +351,7 @@ class TerminalTabsViewModel(
     }
 
     private fun pushThemeToSession(tab: TabState, theme: TerminalTheme) {
-        tab.session.setTheme(theme.ansi16Argb(), theme.foregroundArgb(), theme.backgroundArgb())
+        theme.applyTo(tab.session::setTheme)
     }
 
     /**
@@ -414,25 +414,25 @@ class TerminalTabsViewModel(
         tab.session.connectIsekaiLinkRelay(config)
     }
 
-    private suspend fun resolveAuth(tab: TabState, profile: ConnectionProfile, password: String?): SshAuth? {
-        return when (val v = AuthValidator.validate(profile.authType, password, profile.keyId)) {
-            is AuthValidation.Error -> {
-                RemoteLogger.w("TsshSSH", "auth error: ${v.statusMsg}")
-                tab.preConnectError.value = v.statusMsg
-                null
-            }
-            is AuthValidation.Password -> SshAuth.Password(v.value)
-            is AuthValidation.PublicKey -> loadPublicKeyAuth(tab, v.keyId)
-        }
-    }
+    private suspend fun resolveAuth(tab: TabState, profile: ConnectionProfile, password: String?): SshAuth? =
+        resolveAuthInternal(tab, profile.authType, password, profile.keyId, errorPrefix = "")
 
     /** 踏み台(jump host)側の認証情報を解決する。[resolveAuth] と同じ検証ロジックを
      *  jump_auth_type/jump_key_id に適用するだけの対の関数。 */
-    private suspend fun resolveJumpAuth(tab: TabState, profile: ConnectionProfile, jumpPassword: String?): SshAuth? {
-        return when (val v = AuthValidator.validate(profile.jumpAuthType ?: "", jumpPassword, profile.jumpKeyId)) {
+    private suspend fun resolveJumpAuth(tab: TabState, profile: ConnectionProfile, jumpPassword: String?): SshAuth? =
+        resolveAuthInternal(tab, profile.jumpAuthType ?: "", jumpPassword, profile.jumpKeyId, errorPrefix = "踏み台: ")
+
+    private suspend fun resolveAuthInternal(
+        tab: TabState,
+        authType: String,
+        password: String?,
+        keyId: Long?,
+        errorPrefix: String,
+    ): SshAuth? {
+        return when (val v = AuthValidator.validate(authType, password, keyId)) {
             is AuthValidation.Error -> {
-                RemoteLogger.w("TsshSSH", "jump auth error: ${v.statusMsg}")
-                tab.preConnectError.value = "踏み台: ${v.statusMsg}"
+                RemoteLogger.w("TsshSSH", "${errorPrefix}auth error: ${v.statusMsg}")
+                tab.preConnectError.value = "$errorPrefix${v.statusMsg}"
                 null
             }
             is AuthValidation.Password -> SshAuth.Password(v.value)
