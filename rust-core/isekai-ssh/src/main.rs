@@ -20,6 +20,7 @@ mod cli;
 mod connect;
 mod init;
 mod login;
+mod resume;
 
 use clap::Parser;
 

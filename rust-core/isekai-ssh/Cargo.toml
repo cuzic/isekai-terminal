@@ -55,3 +55,10 @@ required-features = ["dev-insecure"]
 
 [[test]]
 name = "help_purity"
+
+# `resume_reconnect_e2e.rs` (Phase S-4c) drives the real `isekai-ssh connect`
+# binary via the same `--dev-insecure-*` bypass as `connect_e2e.rs`, for the
+# same reason (no trust store plumbing in this test) — same gating applies.
+[[test]]
+name = "resume_reconnect_e2e"
+required-features = ["dev-insecure"]
