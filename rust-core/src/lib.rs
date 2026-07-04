@@ -64,6 +64,16 @@ pub fn set_terminal_theme(ansi16: Vec<u32>, default_fg: u32, default_bg: u32) {
     theme::set(theme::from_raw(ansi16, default_fg, default_bg));
 }
 
+/// tssh-core の crate バージョン（`Cargo.toml` の `version`）を返す。
+///
+/// iOS 対応 Phase 0 の技術検証スパイクで、UniFFI Swift バインディング経由の
+/// round-trip（Swift → Rust 呼び出し → 戻り値）を確認するための診断用関数
+/// （`PLAN.md` の「Phase Y」節参照）。
+#[uniffi::export]
+pub fn core_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 // ── 公開型 ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, uniffi::Record)]
