@@ -1,0 +1,13 @@
+[package]
+name = "isekai-stun"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "time", "rt"] }
+rand = "0.8"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

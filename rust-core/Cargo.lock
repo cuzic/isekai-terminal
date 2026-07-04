@@ -1307,6 +1307,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "isekai-stun"
+version = "0.1.0"
+dependencies = [
+ "rand 0.8.6",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3219,6 +3228,7 @@ dependencies = [
  "base64",
  "flate2",
  "hmac",
+ "isekai-stun",
  "log",
  "md5 0.8.0",
  "noq",
