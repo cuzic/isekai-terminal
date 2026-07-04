@@ -1,3 +1,4 @@
+mod plain_socket;
 mod resume;
 
 use std::io::Write as _;
@@ -47,6 +48,17 @@ struct Args {
     max_idle_lifetime: u64,
     once: bool,
     log_level: String,
+    /// STUN+SSHランデブー方式のP2P(TransportPreference::IsekaiStunP2pQuic)用。
+    /// 設定されていれば起動時にこのSTUNサーバーへ問い合わせ、自分の観測アドレスを
+    /// ハンドシェイクJSONの`stun_observed_addr`に含める。
+    stun_server: Option<SocketAddr>,
+    /// `stun_server`と併用: isekai-terminal側が事前に自分自身のSTUN観測アドレスを
+    /// 調べた上で、起動コマンドラインにそのまま埋め込んで渡す(stdin越しの対話的な
+    /// 交換は行わない — 対象プロセスはsetsidで即座にデタッチされ、stdinは
+    /// /dev/nullにリダイレクトされるため、そもそも対話的なやり取りができない)。
+    /// 設定されていれば、ハンドシェイクJSON出力前にこのアドレス宛へ穴あけ用の
+    /// probeデータグラムを送出する(simultaneous open)。
+    punch_peer: Option<SocketAddr>,
 }
 
 fn next_val(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
@@ -66,6 +78,10 @@ fn print_help() {
     println!("    --resume-window <SECS>         how long a parked (disconnected) session stays resumable (default: 120)");
     println!("    --max-idle-lifetime <SECS>     self-exit after this many seconds with no active connection (default: 600)");
     println!("    --once                         exit after the first connection closes");
+    println!("    --stun-server <ADDR:PORT>      query this STUN server for our own observed address");
+    println!("                                   (adds \"stun_observed_addr\" to the handshake JSON)");
+    println!("    --punch-peer <ADDR:PORT>       peer's own STUN-observed address (requires --stun-server);");
+    println!("                                   sends hole-punch probe datagrams to it before listening");
     println!("    --log-level <LEVEL>            error|warn|info|debug|trace (default: info)");
     println!("    --version                      print version and exit");
     println!("    -h, --help                     print this help message");
@@ -83,6 +99,8 @@ fn parse_args() -> Result<Args> {
     let mut max_idle_lifetime = 600u64;
     let mut once = false;
     let mut log_level = "info".to_string();
+    let mut stun_server: Option<SocketAddr> = None;
+    let mut punch_peer: Option<SocketAddr> = None;
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -96,6 +114,20 @@ fn parse_args() -> Result<Args> {
                 bind = next_val(&mut iter, "--bind")?
                     .parse()
                     .context("invalid --bind value")?;
+            }
+            "--stun-server" => {
+                stun_server = Some(
+                    next_val(&mut iter, "--stun-server")?
+                        .parse()
+                        .context("invalid --stun-server value")?,
+                );
+            }
+            "--punch-peer" => {
+                punch_peer = Some(
+                    next_val(&mut iter, "--punch-peer")?
+                        .parse()
+                        .context("invalid --punch-peer value")?,
+                );
             }
             "--idle-timeout" => {
                 idle_timeout = next_val(&mut iter, "--idle-timeout")?
@@ -125,6 +157,9 @@ fn parse_args() -> Result<Args> {
             other => return Err(anyhow!("unknown argument: {other}")),
         }
     }
+    if punch_peer.is_some() && stun_server.is_none() {
+        return Err(anyhow!("--punch-peer requires --stun-server"));
+    }
     Ok(Args {
         target,
         bind,
@@ -133,6 +168,8 @@ fn parse_args() -> Result<Args> {
         max_idle_lifetime,
         once,
         log_level,
+        stun_server,
+        punch_peer,
     })
 }
 
@@ -211,7 +248,44 @@ async fn main() -> Result<()> {
     server_config.transport_config(Arc::new(transport));
     // preferred_address は明示的に設定しない（QUIC-Exfil 対策、既定で未使用）。
 
-    let endpoint = noq::Endpoint::server(server_config, args.bind)?;
+    // 自前でbindしたソケットを、noqへ渡す前にSTUN問い合わせ・穴あけprobeへ使う
+    // （bind_faulty_udp_socket的なラップをする前の生ソケットとして扱う唯一の機会 ——
+    // 一度 noq::Endpoint に渡すと、以後の recv は全て noq 自身の poll_recv が
+    // 消費してしまい、こちらから直接 recv_from で読むと競合する）。
+    let std_socket = std::net::UdpSocket::bind(args.bind)?;
+    std_socket.set_nonblocking(true)?;
+    let raw_socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket)?);
+
+    let stun_observed_addr = match args.stun_server {
+        Some(stun_server) => match isekai_stun::query_stun(&raw_socket, stun_server).await {
+            Ok(addr) => {
+                log::info!("stun: observed address is {addr} (via {stun_server})");
+                Some(addr)
+            }
+            Err(e) => {
+                log::warn!("stun: query to {stun_server} failed: {e}, continuing without it");
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Some(peer) = args.punch_peer {
+        log::info!("punch: sending hole-punch probes to {peer}");
+        // 中身はNAT越え専用のマーカーで構わない(相手はQUICパケットとして解釈できない
+        // 限り黙って破棄するだけであり、応答は期待しない・待たない)。
+        for _ in 0..5 {
+            let _ = raw_socket.send_to(b"isekai-punch", peer).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+
+    let endpoint = noq::Endpoint::new_with_abstract_socket(
+        noq::EndpointConfig::default(),
+        Some(server_config),
+        Box::new(plain_socket::PlainUdpSocket::new(raw_socket)),
+        Arc::new(noq::TokioRuntime),
+    )?;
     let listen_port = endpoint.local_addr()?.port();
 
     // 起動ハンドシェイク JSON を stdout に1行だけ出力し、明示的に flush する。
@@ -220,6 +294,7 @@ async fn main() -> Result<()> {
         "listen_port": listen_port,
         "cert_sha256": cert_sha256,
         "session_secret": base64::engine::general_purpose::STANDARD.encode(session_secret),
+        "stun_observed_addr": stun_observed_addr.map(|a| a.to_string()),
     });
     {
         let mut stdout = std::io::stdout();

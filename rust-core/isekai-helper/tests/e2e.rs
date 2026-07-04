@@ -42,6 +42,8 @@ struct Handshake {
     listen_port: u16,
     cert_sha256: String,
     session_secret: String,
+    #[serde(default)]
+    stun_observed_addr: Option<String>,
 }
 
 #[derive(Debug)]
@@ -669,4 +671,125 @@ async fn resume_after_park_expiry_is_rejected_as_unknown_session() {
         resp[0], REJECT_UNKNOWN_SESSION,
         "park 期限切れで sweep された session は unknown 扱いになるはず"
     );
+}
+
+// ── STUN(--stun-server)ハンドシェイク拡張 ─────────────────────────────
+
+/// 最小のモックSTUNサーバー(RFC 5389 Binding Request/Response)。
+/// `isekai-stun`クレート自身のテストと同じ手法: 受け取ったBinding Requestの
+/// 送信元アドレスをそのままXOR-MAPPED-ADDRESSとして返すだけ。
+/// Runs on a dedicated OS thread with a *blocking* `std::net::UdpSocket`
+/// (same technique this file already uses for stderr-draining, see
+/// `spawn_helper`) rather than as a task on the test's own tokio runtime.
+/// `spawn_helper()` below blocks the calling thread on a synchronous
+/// `read_line()` with no `.await` point, so under the default (single-
+/// threaded) `#[tokio::test]` runtime a `tokio::spawn`-based mock server
+/// would never actually get polled while `spawn_helper()` is running —
+/// exactly when isekai-helper's own bounded-retry STUN query needs a
+/// response. A plain OS thread has no such dependency on the test's own
+/// executor.
+fn spawn_mock_stun_server() -> SocketAddr {
+    let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((n, from)) = server.recv_from(&mut buf) else { break };
+            if n < 20 {
+                continue;
+            }
+            let transaction_id = &buf[8..20];
+            let SocketAddr::V4(from_v4) = from else { continue };
+
+            let magic_cookie: u32 = 0x2112_A442;
+            let xport = from_v4.port() ^ ((magic_cookie >> 16) as u16);
+            let xaddr = u32::from(*from_v4.ip()) ^ magic_cookie;
+
+            let mut resp = Vec::with_capacity(32);
+            resp.extend_from_slice(&0x0101u16.to_be_bytes()); // Binding Success Response
+            resp.extend_from_slice(&12u16.to_be_bytes()); // message length: 4 (attr header) + 8 (attr value)
+            resp.extend_from_slice(&magic_cookie.to_be_bytes());
+            resp.extend_from_slice(transaction_id);
+            resp.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+            resp.extend_from_slice(&8u16.to_be_bytes());
+            resp.push(0);
+            resp.push(0x01); // family: IPv4
+            resp.extend_from_slice(&xport.to_be_bytes());
+            resp.extend_from_slice(&xaddr.to_be_bytes());
+
+            let _ = server.send_to(&resp, from);
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn stun_server_flag_populates_observed_address_in_handshake() {
+    let echo_addr = spawn_echo_server().await;
+    let stun_server = spawn_mock_stun_server();
+
+    let helper = spawn_helper(echo_addr, &["--stun-server", &stun_server.to_string()]);
+
+    let observed: SocketAddr = helper
+        .handshake
+        .stun_observed_addr
+        .as_deref()
+        .expect("stun_observed_addr should be populated when --stun-server is given")
+        .parse()
+        .expect("stun_observed_addr should be a valid socket address");
+
+    // ループバック経由なのでNATによるアドレス変換は起きない。STUNサーバーから見えた
+    // ポートは、実際にQUICが待ち受けているポート(handshake.listen_port)と一致する
+    // はず——これは「STUN問い合わせとQUIC待受が本当に同じソケットを共有している」
+    // ことの直接的な証拠になる。
+    assert_eq!(observed.ip(), std::net::Ipv4Addr::LOCALHOST);
+    assert_eq!(observed.port(), helper.handshake.listen_port);
+}
+
+#[tokio::test]
+async fn without_stun_server_flag_handshake_has_no_observed_address() {
+    let echo_addr = spawn_echo_server().await;
+    let helper = spawn_helper(echo_addr, &[]);
+    assert!(helper.handshake.stun_observed_addr.is_none());
+}
+
+#[tokio::test]
+async fn punch_peer_flag_does_not_prevent_normal_startup_or_relay() {
+    let echo_addr = spawn_echo_server().await;
+    let stun_server = spawn_mock_stun_server();
+    // 実在しないダミーの相手アドレス宛にprobeを送るだけなので応答は来ないが、
+    // fire-and-forgetであり、起動・通常のHELLO/ACK/リレー自体は妨げないはず。
+    let dummy_peer = "127.0.0.1:1".to_string();
+
+    let helper = spawn_helper(
+        echo_addr,
+        &["--stun-server", &stun_server.to_string(), "--punch-peer", &dummy_peer],
+    );
+    assert!(helper.handshake.stun_observed_addr.is_some());
+
+    let client_endpoint = make_client_endpoint(&helper.handshake.cert_sha256);
+    let conn = client_endpoint
+        .connect(
+            SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), helper.handshake.listen_port),
+            "isekai-helper.local",
+        )
+        .unwrap()
+        .await
+        .expect("QUIC handshake should still succeed with --punch-peer set");
+
+    let session_secret = base64::engine::general_purpose::STANDARD
+        .decode(&helper.handshake.session_secret)
+        .unwrap();
+    let proof = compute_proof(&conn, &session_secret);
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let mut hello = vec![FRAME_HELLO];
+    hello.extend_from_slice(&proof);
+    send.write_all(&hello).await.unwrap();
+
+    let mut ack = [0u8; 1];
+    tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut ack))
+        .await
+        .expect("timed out waiting for ACK")
+        .unwrap();
+    assert_eq!(ack[0], FRAME_ACK);
 }
