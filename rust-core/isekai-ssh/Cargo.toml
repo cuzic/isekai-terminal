@@ -22,6 +22,7 @@ dev-insecure = []
 
 [dependencies]
 isekai-transport = { path = "../isekai-transport" }
+isekai-trust = { path = "../isekai-trust" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "signal"] }
 log = "0.4"

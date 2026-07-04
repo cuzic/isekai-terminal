@@ -1,6 +1,6 @@
 //! `isekai-ssh`: single static-binary `ssh(1)` `ProxyCommand` wrapper that
 //! reuses isekai-terminal's isekai-helper QUIC connection resilience
-//! (`ISEKAI_SSH_DESIGN.md`). Phase S-1: `connect` only.
+//! (`ISEKAI_SSH_DESIGN.md`). Phase S-2: `connect` backed by the trust store.
 
 // The `dev-insecure` feature bypasses the (not-yet-implemented) trust store
 // so this phase's early end-to-end test can run before S-2 lands. It must
@@ -21,8 +21,17 @@ mod connect;
 
 use clap::Parser;
 
+/// Exit code for "the target host has no trust store entry"
+/// (`ISEKAI_SSH_DESIGN.md` フェーズ分割案 S-2 "exit codeの分類": at minimum,
+/// distinguish this from every other failure). `connect::run` signals this
+/// case via the `connect::TrustNotInitialized` marker error.
+const EXIT_TRUST_NOT_INITIALIZED: u8 = 10;
+/// Every other `connect` failure (invalid arguments, relay/handshake
+/// failure, I/O errors, ...).
+const EXIT_OTHER_ERROR: u8 = 1;
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
     // stdout purity (see connect.rs's module docs) is why this is pinned to
     // stderr explicitly rather than relying on env_logger's default target,
     // which callers should not have to trust blindly to stay stderr-only
@@ -30,7 +39,24 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_default_env().target(env_logger::Target::Stderr).init();
 
     let cli = cli::Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         cli::Command::Connect(args) => connect::run(args).await,
+    };
+
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            // stdout purity: errors are only ever printed to stderr, never
+            // stdout (see connect.rs's module docs; `ssh`'s ProxyCommand
+            // treats our stdout as raw SSH bytes).
+            eprintln!("{err:?}");
+            let is_trust_not_initialized =
+                err.chain().any(|cause| cause.downcast_ref::<connect::TrustNotInitialized>().is_some());
+            std::process::ExitCode::from(if is_trust_not_initialized {
+                EXIT_TRUST_NOT_INITIALIZED
+            } else {
+                EXIT_OTHER_ERROR
+            })
+        }
     }
 }

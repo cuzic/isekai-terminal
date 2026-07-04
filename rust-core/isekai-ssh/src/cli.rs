@@ -1,15 +1,17 @@
 //! `isekai-ssh` CLI surface (`ISEKAI_SSH_DESIGN.md` "CLIコマンド構成").
 //!
-//! Phase S-1 only implements `connect` — `init`/`login`/`logout`/`trust` are
-//! out of scope (フェーズ分割案 S-2/S-3/S-5).
-//!
-//! The `--dev-insecure-*` flags on `connect` exist only to unblock this
-//! phase's end-to-end test before the trust store (S-2) is wired up. They
-//! are compiled in *only* when both `debug_assertions` and the
-//! (non-default) `dev-insecure` Cargo feature are active — see `main.rs`'s
-//! `compile_error!` guard for why a release build can never even have this
-//! feature turned on, and this module's `cfg` gate for why a plain
-//! (non-`dev-insecure`) debug build's `--help` also never shows them.
+//! Only `connect` is implemented so far — `init`/`login`/`logout`/`trust`
+//! are still out of scope (フェーズ分割案 S-3/S-5). As of S-2, `connect`
+//! resolves its target from the trust store (`isekai-trust`,
+//! `~/.config/isekai-ssh/known_helpers.toml`) by default; the
+//! `--dev-insecure-*` flags below remain only as a debug/test-only bypass
+//! of that lookup (originally added to unblock S-1's end-to-end test before
+//! the trust store existed). They are compiled in *only* when both
+//! `debug_assertions` and the (non-default) `dev-insecure` Cargo feature are
+//! active — see `main.rs`'s `compile_error!` guard for why a release build
+//! can never even have this feature turned on, and this module's `cfg` gate
+//! for why a plain (non-`dev-insecure`) debug build's `--help` also never
+//! shows them.
 
 use clap::{Args, Parser, Subcommand};
 
@@ -37,7 +39,10 @@ pub enum Command {
 #[derive(Args)]
 pub struct ConnectArgs {
     /// Host alias, as registered via `isekai-ssh init` (trust store lookup
-    /// key; `init`/the trust store itself are not implemented yet, S-2/S-3).
+    /// key, normalized via `isekai_trust::normalize_host_port`; `init`
+    /// itself is not implemented yet, S-3 — until then, hosts must be
+    /// registered by writing `~/.config/isekai-ssh/known_helpers.toml`
+    /// directly, e.g. via `isekai-trust::save_trust_store`).
     pub host: String,
 
     /// Jump host used only as a fallback to re-deploy/restart isekai-helper
@@ -52,9 +57,9 @@ pub struct ConnectArgs {
     pub dev_insecure: DevInsecureArgs,
 }
 
-/// DEV/TEST ONLY. Bypasses the (not-yet-implemented) trust store lookup by
-/// letting the caller specify isekai-helper's relay-assigned endpoint and
-/// session credentials directly. See this module's docs and `main.rs`'s
+/// DEV/TEST ONLY. Bypasses the trust store lookup (S-2) by letting the
+/// caller specify isekai-helper's relay-assigned endpoint and session
+/// credentials directly. See this module's docs and `main.rs`'s
 /// `compile_error!` guard for why this can never ship in a release binary.
 #[cfg(all(debug_assertions, feature = "dev-insecure"))]
 #[derive(Args)]
