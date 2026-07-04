@@ -382,3 +382,135 @@ fn dispatch_result(
         callback.on_screen_update(upd);
     }
 }
+
+// ── Tests ──────────────────────────────────────────────────
+//
+// `SessionCore::scrollback_cells`(オフセット/行数からscrollbackを切り出す表示ロジック)
+// と`dispatch_result`のscrollback上限トリミングは、実SSH/QUIC接続もTokioランタイムも
+// 不要な純粋なデータ変換だが、`session.rs`にはテストが1つも無かった。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(label: char) -> TermCell {
+        TermCell { ch: smol_str::SmolStr::new(label.to_string()), fg: 0xFF010101, bg: 0xFF020202, bold: false }
+    }
+
+    fn row(label: char, len: usize) -> Vec<TermCell> {
+        vec![cell(label); len]
+    }
+
+    fn core_with_scrollback(cols: u32, rows_by_index: Vec<Vec<TermCell>>) -> SessionCore {
+        let core = SessionCore::new();
+        *core.screen_cols.lock() = cols;
+        *core.scrollback.lock() = VecDeque::from(rows_by_index);
+        core
+    }
+
+    // index0 = newest(直近scrollしたばかりの行、ライブ画面に一番近い)、
+    // 添字が大きいほど古い行 — dispatch_resultがpush_frontで積む順に合わせている。
+
+    #[test]
+    fn scrollback_cells_orders_oldest_to_newest_top_to_bottom() {
+        let core = core_with_scrollback(3, vec![
+            row('0', 3), row('1', 3), row('2', 3), row('3', 3), row('4', 3),
+        ]);
+        let cells = core.scrollback_cells(0, 3);
+        assert_eq!(cells[0 * 3].ch, "2"); // viewport最上段 = idx2(このoffsetでの最古)
+        assert_eq!(cells[1 * 3].ch, "1");
+        assert_eq!(cells[2 * 3].ch, "0"); // viewport最下段 = idx0(ライブ画面に一番近い)
+    }
+
+    #[test]
+    fn scrollback_cells_offset_shifts_further_into_history() {
+        let core = core_with_scrollback(3, vec![
+            row('0', 3), row('1', 3), row('2', 3), row('3', 3), row('4', 3),
+        ]);
+        let cells = core.scrollback_cells(2, 3);
+        assert_eq!(cells[0 * 3].ch, "4");
+        assert_eq!(cells[1 * 3].ch, "3");
+        assert_eq!(cells[2 * 3].ch, "2");
+    }
+
+    #[test]
+    fn scrollback_cells_pads_with_blank_theme_color_past_available_history() {
+        let core = core_with_scrollback(2, vec![row('0', 2)]);
+        let cells = core.scrollback_cells(5, 3); // 唯一ある行よりずっと過去を要求
+        let theme = Theme::default();
+        for c in &cells {
+            assert_eq!(c.ch, " ");
+            assert_eq!(c.fg, theme.default_fg);
+            assert_eq!(c.bg, theme.default_bg);
+        }
+    }
+
+    #[test]
+    fn scrollback_cells_truncates_rows_longer_than_screen_cols() {
+        let core = core_with_scrollback(2, vec![row('x', 5)]); // cols=2より広い行
+        let cells = core.scrollback_cells(0, 1);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].ch, "x");
+        assert_eq!(cells[1].ch, "x");
+    }
+
+    #[test]
+    fn scrollback_cells_pads_rows_shorter_than_screen_cols_with_blanks() {
+        let core = core_with_scrollback(5, vec![row('y', 2)]); // cols=5より狭い行
+        let cells = core.scrollback_cells(0, 1);
+        assert_eq!(cells.len(), 5);
+        assert_eq!(cells[0].ch, "y");
+        assert_eq!(cells[1].ch, "y");
+        assert_eq!(cells[2].ch, " ");
+        assert_eq!(cells[3].ch, " ");
+        assert_eq!(cells[4].ch, " ");
+    }
+
+    // ── dispatch_result: scrollback上限トリミング ────────────
+
+    struct NoopSessionCallback;
+    impl SessionCallback for NoopSessionCallback {
+        fn on_data(&self, _data: Vec<u8>) {}
+        fn on_host_key(&self, _fingerprint: String) -> bool { true }
+        fn on_connected(&self) {}
+        fn on_disconnected(&self, _reason: Option<String>) {}
+        fn on_screen_update(&self, _update: ScreenUpdate) {}
+        fn on_trzsz_request(&self, _transfer_id: String, _mode: String, _suggested_name: Option<String>, _expected_size: Option<u64>) {}
+        fn on_trzsz_download_chunk(&self, _transfer_id: String, _data: Vec<u8>, _is_last: bool) {}
+        fn on_trzsz_progress(&self, _transfer_id: String, _transferred: u64, _total: Option<u64>) {}
+        fn on_trzsz_finished(&self, _transfer_id: String, _success: bool, _message: Option<String>) {}
+        fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+    }
+
+    #[test]
+    fn dispatch_result_trims_scrollback_to_limit_by_dropping_the_oldest() {
+        // SCROLLBACK_LIMIT - 1 件を予め積んでおき、末尾(=最古)に目印の行を置く。
+        let mut initial: VecDeque<Vec<TermCell>> = (0..SCROLLBACK_LIMIT - 1)
+            .map(|_| row('a', 1))
+            .collect();
+        *initial.back_mut().unwrap() = row('Z', 1); // 最古 = 一番最初に落ちるべき行
+        let scrollback = Arc::new(Mutex::new(initial));
+
+        let (transport_cmd_tx, _transport_cmd_rx) = tokio::sync::mpsc::channel(8);
+        let (timeout_tx, _timeout_rx) = tokio::sync::mpsc::channel(1);
+        let mut timer_rt = TokioTimerRuntime::new(timeout_tx);
+        let callback: Arc<dyn SessionCallback> = Arc::new(NoopSessionCallback);
+        let terminal = Terminal::new(80, 24, Theme::default());
+
+        let result = ProcessResult {
+            timer_cmds: Vec::new(),
+            side_effects: Vec::new(),
+            pending_rows: vec![row('N', 1), row('N', 1), row('N', 1)], // 3行新規追加
+            screen_dirty: false,
+        };
+        dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, &terminal, &scrollback);
+
+        let sb = scrollback.lock();
+        assert_eq!(sb.len(), SCROLLBACK_LIMIT, "should be capped at SCROLLBACK_LIMIT, not left at +3 over");
+        assert!(
+            sb.iter().all(|r| r[0].ch != "Z"),
+            "the oldest row (back of the deque) must be the one evicted, not an arbitrary one"
+        );
+    }
+}

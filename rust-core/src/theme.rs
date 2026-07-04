@@ -67,3 +67,46 @@ pub(crate) fn from_raw(ansi16: Vec<u32>, default_fg: u32, default_bg: u32) -> Th
     }
     Theme { ansi16: table, default_fg, default_bg }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_raw_with_empty_ansi16_keeps_all_defaults() {
+        let theme = from_raw(Vec::new(), 0xFF111111, 0xFF222222);
+        assert_eq!(theme.ansi16, Theme::default().ansi16);
+        assert_eq!(theme.default_fg, 0xFF111111);
+        assert_eq!(theme.default_bg, 0xFF222222);
+    }
+
+    #[test]
+    fn from_raw_with_fewer_than_16_overwrites_only_leading_slots() {
+        let theme = from_raw(vec![0xFFAAAAAA, 0xFFBBBBBB], 0, 0);
+        let default = Theme::default().ansi16;
+        assert_eq!(theme.ansi16[0], 0xFFAAAAAA);
+        assert_eq!(theme.ansi16[1], 0xFFBBBBBB);
+        // 残り14スロットは既定値のまま
+        assert_eq!(&theme.ansi16[2..], &default[2..]);
+    }
+
+    #[test]
+    fn from_raw_with_exactly_16_overwrites_every_slot() {
+        let custom: Vec<u32> = (0..16).map(|i| 0xFF000000 + i).collect();
+        let theme = from_raw(custom.clone(), 0, 0);
+        assert_eq!(theme.ansi16.to_vec(), custom);
+    }
+
+    #[test]
+    fn from_raw_with_more_than_16_ignores_extra_entries() {
+        let mut custom: Vec<u32> = (0..16).map(|i| 0xFF000000 + i).collect();
+        custom.push(0xFFFFFFFF); // 17番目、はみ出す分は無視されるはず
+        let theme = from_raw(custom.clone(), 0, 0);
+        assert_eq!(theme.ansi16.to_vec(), &custom[..16]);
+    }
+
+    // `current()`/`set()`は本当にプロセス全体で共有される`static`を読み書きするため、
+    // ここではテストしない — `cargo test`はデフォルトでテストを並列実行するので、
+    // この2つを直接叩くテストは他の(将来`session.rs`に追加されるかもしれない)
+    // `theme::current()`に依存するテストと競合し、フレーキーの原因になりうる。
+}

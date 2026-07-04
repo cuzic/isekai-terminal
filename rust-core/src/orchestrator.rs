@@ -590,3 +590,225 @@ impl SessionOrchestrator {
         );
     }
 }
+
+// ── Tests ──────────────────────────────────────────────────
+//
+// この模块の状態遷移(`ConnPhase`の分岐、`OrchestratorAdapter`のtrzsz状態集約)は
+// 実SSH/QUIC接続を一切必要としない純粋なロジックであり、本来実機は不要だったにも
+// 関わらず`orchestrator.rs`にはテストが1つも無かった。`rust-ssot.md`が「Rust側の
+// SSOTである」ことの根拠として挙げている`notify_network_lost()`自体が無テストだった
+// ため、ここで最初にカバーする。`ActiveSession`は具体的なtransportセッション型しか
+// 保持できない(trait objectではない)ため、`session: Mutex::new(None)`のまま
+// (未接続として)テストする — `notify_network_lost`/`disconnect`は`None`の場合
+// no-opになるよう書かれているので、これで分岐ロジックの検証は完結する。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct RecordingCallback {
+        connection_states: StdMutex<Vec<ConnectionPublicState>>,
+        trzsz_states: StdMutex<Vec<TrzszPublicState>>,
+        downloads: StdMutex<Vec<(Option<String>, Vec<u8>)>>,
+    }
+
+    impl OrchestratorCallback for RecordingCallback {
+        fn on_connection_state_changed(&self, state: ConnectionPublicState) {
+            self.connection_states.lock().unwrap().push(state);
+        }
+        fn on_screen_update(&self, _update: ScreenUpdate) {}
+        fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool {
+            true
+        }
+        fn on_data(&self, _data: Vec<u8>) {}
+        fn on_trzsz_state_changed(&self, state: TrzszPublicState) {
+            self.trzsz_states.lock().unwrap().push(state);
+        }
+        fn on_download_complete(&self, file_name: Option<String>, data: Vec<u8>) {
+            self.downloads.lock().unwrap().push((file_name, data));
+        }
+        fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool {
+            true
+        }
+    }
+
+    fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {
+        let callback = Arc::new(RecordingCallback::default());
+        let shared = Arc::new(OrchestratorShared {
+            state: Mutex::new(OrchestratorState {
+                current_host: Some("example.com".to_string()),
+                current_port: 22,
+                is_quic,
+                phase,
+                current_transfer_id: None,
+                trzsz_mode: None,
+                download_buf: Vec::new(),
+            }),
+            callback: callback.clone(),
+            session: Mutex::new(None),
+        });
+        (shared, callback)
+    }
+
+    fn orchestrator_with_phase(phase: ConnPhase, is_quic: bool) -> (SessionOrchestrator, Arc<RecordingCallback>) {
+        let (shared, callback) = shared_with_phase(phase, is_quic);
+        (SessionOrchestrator { shared }, callback)
+    }
+
+    // ── notify_network_lost ──────────────────────────────────
+
+    #[test]
+    fn notify_network_lost_does_nothing_when_idle() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Idle, false);
+        orch.notify_network_lost();
+        assert!(cb.connection_states.lock().unwrap().is_empty());
+        assert!(orch.shared.state.lock().phase == ConnPhase::Idle);
+    }
+
+    #[test]
+    fn notify_network_lost_aborts_and_reports_disconnected_during_handshake() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connecting, false);
+        orch.notify_network_lost();
+        let events = cb.connection_states.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ConnectionPublicState::Disconnected { reason: Some(r) } if r == "network lost"
+        ));
+        assert!(orch.shared.state.lock().phase == ConnPhase::Idle);
+    }
+
+    #[test]
+    fn notify_network_lost_disconnects_plain_tcp_when_connected() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connected, false);
+        orch.notify_network_lost();
+        let events = cb.connection_states.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ConnectionPublicState::Disconnected { .. }));
+        assert!(orch.shared.state.lock().phase == ConnPhase::Idle);
+    }
+
+    #[test]
+    fn notify_network_lost_ignores_quic_when_connected() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connected, true);
+        orch.notify_network_lost();
+        // QUICは経路変更に自前で耐えるため、切断扱いにせずphaseもConnectedのまま維持する。
+        assert!(cb.connection_states.lock().unwrap().is_empty());
+        assert!(orch.shared.state.lock().phase == ConnPhase::Connected);
+    }
+
+    // ── OrchestratorAdapter (SessionCallback実装) ────────────
+
+    fn adapter_with_phase(phase: ConnPhase, is_quic: bool) -> (OrchestratorAdapter, Arc<OrchestratorShared>, Arc<RecordingCallback>) {
+        let (shared, callback) = shared_with_phase(phase, is_quic);
+        (OrchestratorAdapter { shared: shared.clone() }, shared, callback)
+    }
+
+    #[test]
+    fn on_connected_sets_phase_connected_and_reports_current_host() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connecting, false);
+        adapter.on_connected();
+        assert!(shared.state.lock().phase == ConnPhase::Connected);
+        let events = cb.connection_states.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ConnectionPublicState::Connected { host } if host == "example.com"
+        ));
+    }
+
+    #[test]
+    fn on_disconnected_sets_phase_idle_and_forwards_reason() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        adapter.on_disconnected(Some("peer closed".to_string()));
+        assert!(shared.state.lock().phase == ConnPhase::Idle);
+        let events = cb.connection_states.lock().unwrap();
+        assert!(matches!(
+            &events[0],
+            ConnectionPublicState::Disconnected { reason: Some(r) } if r == "peer closed"
+        ));
+    }
+
+    #[test]
+    fn on_host_key_reports_current_host_and_port_from_state() {
+        let (adapter, _shared, _cb) = adapter_with_phase(ConnPhase::Connecting, false);
+        // RecordingCallback::on_host_key always returns true; verifying it forwards
+        // without panicking exercises the host/port read out of shared state.
+        assert!(adapter.on_host_key("aa:bb:cc".to_string()));
+    }
+
+    #[test]
+    fn on_trzsz_request_records_transfer_and_clears_download_buf() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().download_buf = vec![1, 2, 3];
+        adapter.on_trzsz_request(
+            "t1".to_string(), "download".to_string(), Some("file.txt".to_string()), Some(100),
+        );
+        {
+            let s = shared.state.lock();
+            assert_eq!(s.current_transfer_id.as_deref(), Some("t1"));
+            assert_eq!(s.trzsz_mode.as_deref(), Some("download"));
+            assert!(s.download_buf.is_empty());
+        }
+        let events = cb.trzsz_states.lock().unwrap();
+        assert!(matches!(&events[0], TrzszPublicState::WaitingUser { transfer_id, .. } if transfer_id == "t1"));
+    }
+
+    #[test]
+    fn on_trzsz_download_chunk_accumulates_bytes_across_calls() {
+        let (adapter, shared, _cb) = adapter_with_phase(ConnPhase::Connected, false);
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![1, 2], false);
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![3, 4], true);
+        assert_eq!(shared.state.lock().download_buf, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn on_trzsz_finished_download_success_emits_download_complete_with_accumulated_bytes() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().trzsz_mode = Some("download".to_string());
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![9, 9, 9], true);
+        adapter.on_trzsz_finished("t1".to_string(), true, None);
+        let downloads = cb.downloads.lock().unwrap();
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0].1, vec![9, 9, 9]);
+        // 完了後はtransfer_id/download_bufをクリアし、次の転送に持ち越さない。
+        assert!(shared.state.lock().current_transfer_id.is_none());
+        assert!(shared.state.lock().download_buf.is_empty());
+    }
+
+    #[test]
+    fn on_trzsz_finished_failure_does_not_emit_download_complete() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().trzsz_mode = Some("download".to_string());
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![9, 9, 9], true);
+        adapter.on_trzsz_finished("t1".to_string(), false, Some("connection lost".to_string()));
+        assert!(cb.downloads.lock().unwrap().is_empty());
+        let events = cb.trzsz_states.lock().unwrap();
+        assert!(matches!(&events[0], TrzszPublicState::Done { success: false, .. }));
+    }
+
+    #[test]
+    fn on_trzsz_finished_upload_does_not_emit_download_complete_even_with_buffered_bytes() {
+        // upload完了時にはdownload_bufは本来空のはずだが、万一何か残っていても
+        // is_download判定がfalseならon_download_completeを呼んではいけない。
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().trzsz_mode = Some("upload".to_string());
+        shared.state.lock().download_buf = vec![1, 2, 3];
+        adapter.on_trzsz_finished("t1".to_string(), true, None);
+        assert!(cb.downloads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn on_trzsz_progress_defaults_mode_to_download_when_unset() {
+        let (adapter, _shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        adapter.on_trzsz_progress("t1".to_string(), 50, Some(100));
+        let events = cb.trzsz_states.lock().unwrap();
+        assert!(matches!(
+            &events[0],
+            TrzszPublicState::InProgress { mode, transferred: 50, total: Some(100), .. } if mode == "download"
+        ));
+    }
+}
