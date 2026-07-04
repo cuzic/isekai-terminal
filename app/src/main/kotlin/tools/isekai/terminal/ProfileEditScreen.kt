@@ -335,6 +335,20 @@ fun ProfileEditScreen(
         Spacer(Modifier.height(4.dp))
 
         Text("接続方式")
+        Text(
+            text = "以下の3つは「失敗時どうなるか」が異なる接続ポリシーです。うまく繋がらない場合は" +
+                "上のポリシーへ切り替えてください。",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Spacer(Modifier.height(4.dp))
+        Text("Plain SSH", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        Text(
+            text = "NAT越え・P2Pは一切行わない従来のSSH接続。フォールバックという概念自体が無い基本方式です。",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Row(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier.horizontalScroll(rememberScrollState()),
@@ -349,15 +363,44 @@ fun ProfileEditScreen(
                 onClick = { transportPreference = TransportPreference.TSSHD_QUIC },
                 label = { Text("tsshd QUIC") },
             )
-            FilterChip(
-                selected = transportPreference == TransportPreference.ISEKAI_HELPER_QUIC,
-                onClick = { transportPreference = TransportPreference.ISEKAI_HELPER_QUIC },
-                label = { Text("自作ヘルパー QUIC") },
-            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Text("Smart Connect（推奨）", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        Text(
+            text = "自作ヘルパー経由QUICを試し、失敗したら自動的に通常SSHへフォールバックします。" +
+                "迷ったらこれを選んでください。",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+        ) {
             FilterChip(
                 selected = transportPreference == TransportPreference.AUTO,
                 onClick = { transportPreference = TransportPreference.AUTO },
                 label = { Text("Auto（推奨）") },
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Text("Strict Isekai Link（実験的・フォールバックなし）", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        Text(
+            text = "指定した経路のみを使用します。穴あけ・ヘルパー起動などが失敗しても自動フォールバック" +
+                "せず、その場で接続エラーになります（経路そのものが信頼境界のため、意図せず別経路へ" +
+                "落ちないようにしています）。",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+        ) {
+            FilterChip(
+                selected = transportPreference == TransportPreference.ISEKAI_HELPER_QUIC,
+                onClick = { transportPreference = TransportPreference.ISEKAI_HELPER_QUIC },
+                label = { Text("自作ヘルパー QUIC") },
             )
             FilterChip(
                 selected = transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH,

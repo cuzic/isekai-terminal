@@ -1468,8 +1468,15 @@ Web検索で実在・現状Needs Triageであることを確認済み——Phase
 1. ✅ `relay_jwt`平文保存を「MVP限定TODO」ではなく明示的なsecurity debt issueとして扱う
    → [issue #1](https://github.com/cuzic/isekai-terminal/issues/1)を起票し、`ConnectionProfile.kt`の
    コメントから参照するよう変更（Phase 12でのKeystoreKekベースvault移行までcloseしない）
-2. STUN/Relayの「フォールバックなし」を内部実装のままにしつつ、ユーザー向けには
+2. ✅ STUN/Relayの「フォールバックなし」を内部実装のままにしつつ、ユーザー向けには
    Strict Isekai Link / Smart Connect / Plain SSHのような接続ポリシーとして明示する案
+   → `ProfileEditScreen.kt`の「接続方式」セクションを、実際のRust側フォールバック挙動
+   （`TransportPreference`各バリアントのdocコメント）に基づき3グループに再編:
+   Plain SSH（通常SSH/tsshd QUIC、フォールバック概念自体が無い）／
+   Smart Connect（推奨）（`Auto`のみ、ヘルパーQUIC失敗時に実際にplain SSHへ自動フォールバック
+   する唯一の方式）／Strict Isekai Link（実験的・フォールバックなし）（自作ヘルパーQUIC・
+   マルチパス・STUN P2P・relay P2Pの4方式、すべて明示的にフォールバック無し）。
+   各グループの直下にポリシーレベルのキャプションを追加し、個別方式の詳細キャプションは維持。
 3. noq #738により物理マルチパスがunavailableであることをUI/docs/testsに反映
    （「Multipath」ではなく「Fast Rebind / Resume」寄りの機能名にする案）
 4. 非ループバックport forward bindをRust側（`SshConfig`に`allow_non_loopback_forward_bind: bool`
