@@ -55,16 +55,26 @@ pub struct HelperHandshake {
     /// 参照。`None` は「未指定」と「STUN問い合わせ失敗」の両方を表す（HELPER_PROTOCOL.md参照）。
     #[serde(default)]
     pub stun_observed_addr: Option<String>,
+    /// Phase 10: `--relay` を渡したときのみ存在しうる。`isekai_link_relay_transport.rs`参照。
+    /// STUNと異なり、relay接続自体が失敗すればhelperの起動自体が失敗するため、`--relay`指定時は
+    /// 必ず値が入る（HELPER_PROTOCOL.md参照）。
+    #[serde(default)]
+    pub relay_public_addr: Option<String>,
 }
 
-/// SSH起動コマンドラインに埋め込む、P2P方式ごとの追加引数。enumにすることで
-/// 呼び出し側が矛盾した組み合わせを型として表現できないようにしてある。
+/// SSH起動コマンドラインに埋め込む、P2P方式ごとの追加引数。3方式は互いに排他
+/// （isekai-helper側の`--relay`と`--stun-server`/`--punch-peer`は併用不可、
+/// main.rsのparse_argsも参照）であり、enumにすることで呼び出し側が矛盾した
+/// 組み合わせ（例: stun_serverとrelay_addrを両方Someにする)を型として表現できない
+/// ようにしてある。
 #[derive(Debug, Clone, Default)]
 pub enum HelperP2pMode {
     #[default]
     None,
     /// Phase 10: STUN+SSHランデブー方式(`TransportPreference::IsekaiStunP2pQuic`)。
     Stun { stun_server: SocketAddr, punch_peer: Option<SocketAddr> },
+    /// Phase 10: relay方式(`TransportPreference::IsekaiLinkRelayQuic`)。
+    Relay { relay_addr: SocketAddr, relay_sni: String, relay_jwt: String },
 }
 
 /// 既知の Linux アーキテクチャ用にビルドした isekai-helper の静的バイナリ。
@@ -218,6 +228,9 @@ async fn launch_and_capture_handshake(
                 None => String::new(),
             };
             format!("--stun-server {stun_server} {punch}")
+        }
+        HelperP2pMode::Relay { relay_addr, relay_sni, relay_jwt } => {
+            format!("--relay {relay_addr} --relay-sni {relay_sni} --relay-jwt {relay_jwt} ")
         }
     };
     let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;

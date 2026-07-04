@@ -9,6 +9,7 @@ use crate::quic_transport::{QuicConfig, QuicSession};
 use crate::helper_quic_transport::{HelperQuicConfig, HelperQuicSession};
 use crate::multipath_transport::{MultipathHelperQuicConfig, MultipathHelperQuicSession};
 use crate::isekai_stun_p2p_transport::{IsekaiStunP2pConfig, IsekaiStunP2pSession};
+use crate::isekai_link_relay_transport::{IsekaiLinkRelayConfig, IsekaiLinkRelaySession};
 
 // ── Active session ────────────────────────────────────────
 
@@ -18,6 +19,7 @@ enum ActiveSession {
     HelperQuic(Arc<HelperQuicSession>),
     MultipathHelperQuic(Arc<MultipathHelperQuicSession>),
     IsekaiStunP2p(Arc<IsekaiStunP2pSession>),
+    IsekaiLinkRelay(Arc<IsekaiLinkRelaySession>),
 }
 
 impl ActiveSession {
@@ -28,6 +30,7 @@ impl ActiveSession {
             Self::HelperQuic(s) => s.send(data),
             Self::MultipathHelperQuic(s) => s.send(data),
             Self::IsekaiStunP2p(s) => s.send(data),
+            Self::IsekaiLinkRelay(s) => s.send(data),
         }
     }
     fn resize(&self, cols: u32, rows: u32) {
@@ -37,6 +40,7 @@ impl ActiveSession {
             Self::HelperQuic(s) => s.resize(cols, rows),
             Self::MultipathHelperQuic(s) => s.resize(cols, rows),
             Self::IsekaiStunP2p(s) => s.resize(cols, rows),
+            Self::IsekaiLinkRelay(s) => s.resize(cols, rows),
         }
     }
     fn disconnect(&self) {
@@ -46,6 +50,7 @@ impl ActiveSession {
             Self::HelperQuic(s) => s.disconnect(),
             Self::MultipathHelperQuic(s) => s.disconnect(),
             Self::IsekaiStunP2p(s) => s.disconnect(),
+            Self::IsekaiLinkRelay(s) => s.disconnect(),
         }
     }
     /// マルチパス以外のセッションでは意味を持たないため何もしない
@@ -63,6 +68,7 @@ impl ActiveSession {
             Self::HelperQuic(s) => s.scrollback_len(),
             Self::MultipathHelperQuic(s) => s.scrollback_len(),
             Self::IsekaiStunP2p(s) => s.scrollback_len(),
+            Self::IsekaiLinkRelay(s) => s.scrollback_len(),
         }
     }
     fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
@@ -72,6 +78,7 @@ impl ActiveSession {
             Self::HelperQuic(s) => s.scrollback_cells(offset, rows),
             Self::MultipathHelperQuic(s) => s.scrollback_cells(offset, rows),
             Self::IsekaiStunP2p(s) => s.scrollback_cells(offset, rows),
+            Self::IsekaiLinkRelay(s) => s.scrollback_cells(offset, rows),
         }
     }
     fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
@@ -81,6 +88,7 @@ impl ActiveSession {
             Self::HelperQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
             Self::MultipathHelperQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
             Self::IsekaiStunP2p(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
+            Self::IsekaiLinkRelay(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
         }
     }
     fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
@@ -90,6 +98,7 @@ impl ActiveSession {
             Self::HelperQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
             Self::MultipathHelperQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
             Self::IsekaiStunP2p(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
+            Self::IsekaiLinkRelay(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
         }
     }
     fn trzsz_accept_download(&self, transfer_id: String) {
@@ -99,6 +108,7 @@ impl ActiveSession {
             Self::HelperQuic(s) => s.trzsz_accept_download(transfer_id),
             Self::MultipathHelperQuic(s) => s.trzsz_accept_download(transfer_id),
             Self::IsekaiStunP2p(s) => s.trzsz_accept_download(transfer_id),
+            Self::IsekaiLinkRelay(s) => s.trzsz_accept_download(transfer_id),
         }
     }
     fn trzsz_cancel(&self, transfer_id: String) {
@@ -108,6 +118,7 @@ impl ActiveSession {
             Self::HelperQuic(s) => s.trzsz_cancel(transfer_id),
             Self::MultipathHelperQuic(s) => s.trzsz_cancel(transfer_id),
             Self::IsekaiStunP2p(s) => s.trzsz_cancel(transfer_id),
+            Self::IsekaiLinkRelay(s) => s.trzsz_cancel(transfer_id),
         }
     }
     fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
@@ -116,7 +127,7 @@ impl ActiveSession {
             Self::Quic(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
             // ポートフォワードは MVP スコープ上プレーン SSH / tsshd QUIC のみ対応。
             // isekai-helper 経由の QUIC 系トランスポートは未対応（対象外）。
-            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) | Self::IsekaiStunP2p(_) => {
+            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) | Self::IsekaiStunP2p(_) | Self::IsekaiLinkRelay(_) => {
                 log::warn!("add_local_forward: not supported over helper-QUIC transports");
             }
         }
@@ -125,7 +136,7 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.remove_forward(id),
             Self::Quic(s) => s.remove_forward(id),
-            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) | Self::IsekaiStunP2p(_) => {
+            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) | Self::IsekaiStunP2p(_) | Self::IsekaiLinkRelay(_) => {
                 log::warn!("remove_forward: not supported over helper-QUIC transports");
             }
         }
@@ -393,6 +404,24 @@ impl SessionOrchestrator {
         let session = crate::isekai_stun_p2p_transport::create_isekai_stun_p2p_session(config);
         session.connect(Box::new(adapter))?;
         *self.shared.session.lock() = Some(ActiveSession::IsekaiStunP2p(session));
+        Ok(())
+    }
+
+    /// Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
+    /// P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
+    pub fn connect_isekai_link_relay(&self, config: IsekaiLinkRelayConfig) -> Result<(), SshError> {
+        {
+            let mut s = self.shared.state.lock();
+            s.current_host = Some(config.ssh_host.clone());
+            s.current_port = config.ssh_port;
+            s.is_quic = true;
+            s.phase = ConnPhase::Connecting;
+        }
+        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
+        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let session = crate::isekai_link_relay_transport::create_isekai_link_relay_session(config);
+        session.connect(Box::new(adapter))?;
+        *self.shared.session.lock() = Some(ActiveSession::IsekaiLinkRelay(session));
         Ok(())
     }
 

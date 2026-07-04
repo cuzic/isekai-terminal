@@ -59,6 +59,13 @@ struct Args {
     /// 設定されていれば、ハンドシェイクJSON出力前にこのアドレス宛へ穴あけ用の
     /// probeデータグラムを送出する(simultaneous open)。
     punch_peer: Option<SocketAddr>,
+    /// relay経由P2P(TransportPreference::IsekaiLinkRelayQuic)用。設定されていれば
+    /// `--bind`する代わりにこのMASQUE relay(`isekai-link-masque`のCONNECT-UDP-bind)
+    /// 経由でトンネルを張り、relayが割り当てた公開アドレスをハンドシェイクJSONの
+    /// `relay_public_addr`に含める。`--relay-sni`/`--relay-jwt`と併用必須。
+    relay: Option<SocketAddr>,
+    relay_sni: Option<String>,
+    relay_jwt: Option<String>,
 }
 
 fn next_val(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
@@ -82,6 +89,11 @@ fn print_help() {
     println!("                                   (adds \"stun_observed_addr\" to the handshake JSON)");
     println!("    --punch-peer <ADDR:PORT>       peer's own STUN-observed address (requires --stun-server);");
     println!("                                   sends hole-punch probe datagrams to it before listening");
+    println!("    --relay <ADDR:PORT>            MASQUE relay to tunnel through instead of --bind directly");
+    println!("                                   (adds \"relay_public_addr\" to the handshake JSON);");
+    println!("                                   requires --relay-sni and --relay-jwt");
+    println!("    --relay-sni <NAME>             TLS SNI / HTTP authority for --relay");
+    println!("    --relay-jwt <TOKEN>            Bearer token to authenticate to --relay");
     println!("    --log-level <LEVEL>            error|warn|info|debug|trace (default: info)");
     println!("    --version                      print version and exit");
     println!("    -h, --help                     print this help message");
@@ -101,6 +113,9 @@ fn parse_args() -> Result<Args> {
     let mut log_level = "info".to_string();
     let mut stun_server: Option<SocketAddr> = None;
     let mut punch_peer: Option<SocketAddr> = None;
+    let mut relay: Option<SocketAddr> = None;
+    let mut relay_sni: Option<String> = None;
+    let mut relay_jwt: Option<String> = None;
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -129,6 +144,15 @@ fn parse_args() -> Result<Args> {
                         .context("invalid --punch-peer value")?,
                 );
             }
+            "--relay" => {
+                relay = Some(
+                    next_val(&mut iter, "--relay")?
+                        .parse()
+                        .context("invalid --relay value")?,
+                );
+            }
+            "--relay-sni" => relay_sni = Some(next_val(&mut iter, "--relay-sni")?),
+            "--relay-jwt" => relay_jwt = Some(next_val(&mut iter, "--relay-jwt")?),
             "--idle-timeout" => {
                 idle_timeout = next_val(&mut iter, "--idle-timeout")?
                     .parse()
@@ -160,6 +184,12 @@ fn parse_args() -> Result<Args> {
     if punch_peer.is_some() && stun_server.is_none() {
         return Err(anyhow!("--punch-peer requires --stun-server"));
     }
+    if relay.is_some() && (relay_sni.is_none() || relay_jwt.is_none()) {
+        return Err(anyhow!("--relay requires --relay-sni and --relay-jwt"));
+    }
+    if relay.is_some() && (stun_server.is_some() || punch_peer.is_some()) {
+        return Err(anyhow!("--relay cannot be combined with --stun-server/--punch-peer (different P2P transports)"));
+    }
     Ok(Args {
         target,
         bind,
@@ -170,6 +200,9 @@ fn parse_args() -> Result<Args> {
         log_level,
         stun_server,
         punch_peer,
+        relay,
+        relay_sni,
+        relay_jwt,
     })
 }
 
@@ -248,44 +281,67 @@ async fn main() -> Result<()> {
     server_config.transport_config(Arc::new(transport));
     // preferred_address は明示的に設定しない（QUIC-Exfil 対策、既定で未使用）。
 
-    // 自前でbindしたソケットを、noqへ渡す前にSTUN問い合わせ・穴あけprobeへ使う
-    // （bind_faulty_udp_socket的なラップをする前の生ソケットとして扱う唯一の機会 ——
-    // 一度 noq::Endpoint に渡すと、以後の recv は全て noq 自身の poll_recv が
-    // 消費してしまい、こちらから直接 recv_from で読むと競合する）。
-    let std_socket = std::net::UdpSocket::bind(args.bind)?;
-    std_socket.set_nonblocking(true)?;
-    let raw_socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket)?);
+    let (endpoint, stun_observed_addr, relay_public_addr) = if let Some(relay_addr) = args.relay {
+        // relay版P2P(TransportPreference::IsekaiLinkRelayQuic): 自前でbindする代わりに
+        // MASQUE relayへCONNECT-UDP-bindトンネルを張り、relayが割り当てた公開アドレスを
+        // isekai-terminal側へ(SSHブートストラップのハンドシェイクJSON経由で)伝える。
+        // isekai-terminal自身はrelay/MASQUEを一切意識せず、この公開アドレスへ普通にQUIC
+        // 接続するだけでよい(isekai_link_relay_transport.rs参照)。
+        let relay_sni = args.relay_sni.expect("validated in parse_args");
+        let relay_jwt = args.relay_jwt.expect("validated in parse_args");
+        let (relay_socket, proxy_public_address) =
+            isekai_link_masque::connect_relay_agent(relay_addr, &relay_sni, &relay_jwt)
+                .await
+                .map_err(|e| anyhow!("relay connect failed: {e}"))?;
+        log::info!("relay: tunnel established, proxy_public_address={proxy_public_address}");
+        let endpoint = noq::Endpoint::new_with_abstract_socket(
+            noq::EndpointConfig::default(),
+            Some(server_config),
+            Box::new(relay_socket),
+            Arc::new(noq::TokioRuntime),
+        )?;
+        (endpoint, None, Some(proxy_public_address))
+    } else {
+        // 自前でbindしたソケットを、noqへ渡す前にSTUN問い合わせ・穴あけprobeへ使う
+        // （bind_faulty_udp_socket的なラップをする前の生ソケットとして扱う唯一の機会 ——
+        // 一度 noq::Endpoint に渡すと、以後の recv は全て noq 自身の poll_recv が
+        // 消費してしまい、こちらから直接 recv_from で読むと競合する）。
+        let std_socket = std::net::UdpSocket::bind(args.bind)?;
+        std_socket.set_nonblocking(true)?;
+        let raw_socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket)?);
 
-    let stun_observed_addr = match args.stun_server {
-        Some(stun_server) => match isekai_stun::query_stun(&raw_socket, stun_server).await {
-            Ok(addr) => {
-                log::info!("stun: observed address is {addr} (via {stun_server})");
-                Some(addr)
-            }
-            Err(e) => {
-                log::warn!("stun: query to {stun_server} failed: {e}, continuing without it");
-                None
-            }
-        },
-        None => None,
-    };
+        let stun_observed_addr = match args.stun_server {
+            Some(stun_server) => match isekai_stun::query_stun(&raw_socket, stun_server).await {
+                Ok(addr) => {
+                    log::info!("stun: observed address is {addr} (via {stun_server})");
+                    Some(addr)
+                }
+                Err(e) => {
+                    log::warn!("stun: query to {stun_server} failed: {e}, continuing without it");
+                    None
+                }
+            },
+            None => None,
+        };
 
-    if let Some(peer) = args.punch_peer {
-        log::info!("punch: sending hole-punch probes to {peer}");
-        // 中身はNAT越え専用のマーカーで構わない(相手はQUICパケットとして解釈できない
-        // 限り黙って破棄するだけであり、応答は期待しない・待たない)。
-        for _ in 0..5 {
-            let _ = raw_socket.send_to(b"isekai-punch", peer).await;
-            tokio::time::sleep(Duration::from_millis(150)).await;
+        if let Some(peer) = args.punch_peer {
+            log::info!("punch: sending hole-punch probes to {peer}");
+            // 中身はNAT越え専用のマーカーで構わない(相手はQUICパケットとして解釈できない
+            // 限り黙って破棄するだけであり、応答は期待しない・待たない)。
+            for _ in 0..5 {
+                let _ = raw_socket.send_to(b"isekai-punch", peer).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
         }
-    }
 
-    let endpoint = noq::Endpoint::new_with_abstract_socket(
-        noq::EndpointConfig::default(),
-        Some(server_config),
-        Box::new(plain_socket::PlainUdpSocket::new(raw_socket)),
-        Arc::new(noq::TokioRuntime),
-    )?;
+        let endpoint = noq::Endpoint::new_with_abstract_socket(
+            noq::EndpointConfig::default(),
+            Some(server_config),
+            Box::new(plain_socket::PlainUdpSocket::new(raw_socket)),
+            Arc::new(noq::TokioRuntime),
+        )?;
+        (endpoint, stun_observed_addr, None)
+    };
     let listen_port = endpoint.local_addr()?.port();
 
     // 起動ハンドシェイク JSON を stdout に1行だけ出力し、明示的に flush する。
@@ -295,6 +351,7 @@ async fn main() -> Result<()> {
         "cert_sha256": cert_sha256,
         "session_secret": base64::engine::general_purpose::STANDARD.encode(session_secret),
         "stun_observed_addr": stun_observed_addr.map(|a| a.to_string()),
+        "relay_public_addr": relay_public_addr.map(|a| a.to_string()),
     });
     {
         let mut stdout = std::io::stdout();

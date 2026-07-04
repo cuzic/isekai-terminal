@@ -1,6 +1,6 @@
 [package]
 name = "isekai-helper"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 
 [[bin]]
@@ -26,6 +26,7 @@ subtle = "2.6"
 base64 = "0.22"
 rand = "0.8"
 isekai-stun = { path = "../isekai-stun" }
+isekai-link-masque = { path = "../isekai-link-masque" }
 
 [dev-dependencies]
 # e2e.rs は本番クライアント（helper_quic_transport.rs、quinnのまま無変更）と

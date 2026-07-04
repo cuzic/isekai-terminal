@@ -13,6 +13,7 @@ pub(crate) mod helper_bootstrap;
 pub mod helper_quic_transport;
 pub mod multipath_transport;
 pub mod isekai_stun_p2p_transport;
+pub mod isekai_link_relay_transport;
 #[cfg(test)]
 pub(crate) mod faulty_stream;
 pub(crate) mod faulty_udp_socket;
@@ -191,7 +192,12 @@ pub enum TransportPreference {
     IsekaiHelperQuicMultipath,
     /// STUN+SSH rendezvous による直接 P2P QUIC（Phase 10、オプトイン。relay 無し・
     /// 穴あけ不成立時のフォールバック無し）。`isekai_stun_p2p_transport.rs` 参照。
+    /// relay 経由の MASQUE ベース P2P（`IsekaiLinkRelayQuic`）とは独立したトランスポート。
     IsekaiStunP2pQuic,
+    /// MASQUE relay 経由の P2P QUIC（Phase 10、オプトイン。フォールバック無し）。
+    /// `isekai_link_relay_transport.rs` 参照。`IsekaiStunP2pQuic` と異なり relay が常時
+    /// 経路に残るため NAT の種類に左右されないが、relay サーバー・JWT が必要。
+    IsekaiLinkRelayQuic,
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
