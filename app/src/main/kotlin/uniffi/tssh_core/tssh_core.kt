@@ -5830,6 +5830,15 @@ data class SshConfig (
      * 対象ホストがNAT配下で直接到達できない場合の唯一の到達経路になる。
      */
     var `jump`: JumpConfig?
+    , 
+    /**
+     * `forwards` の `bind_address` が非ループバック（127.0.0.0/8・::1・localhost以外）の
+     * 場合に、それを許可するかどうか。既定 false。Kotlin側UI警告だけに頼らずコア側でも
+     * 強制する（Rust SSOTルール、外部レビュー指摘対応）。false時に非ループバックbindが
+     * 指定された場合、そのforwardは`ForwardState::Failed`として拒否される
+     * （セッション自体は切断されない。他のforwardには影響しない）。
+     */
+    var `allowNonLoopbackForwardBind`: kotlin.Boolean
     
 ){
     
@@ -5855,6 +5864,7 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterSequenceTypePortForward.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterOptionalTypeJumpConfig.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -5867,7 +5877,8 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterUInt.allocationSize(value.`rows`) +
             FfiConverterSequenceTypePortForward.allocationSize(value.`forwards`) +
             FfiConverterBoolean.allocationSize(value.`agentForward`) +
-            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`)
+            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`) +
+            FfiConverterBoolean.allocationSize(value.`allowNonLoopbackForwardBind`)
     )
 
     override fun write(value: SshConfig, buf: ByteBuffer) {
@@ -5880,6 +5891,7 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterSequenceTypePortForward.write(value.`forwards`, buf)
             FfiConverterBoolean.write(value.`agentForward`, buf)
             FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
+            FfiConverterBoolean.write(value.`allowNonLoopbackForwardBind`, buf)
     }
 }
 

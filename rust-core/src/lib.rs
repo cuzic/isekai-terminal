@@ -89,6 +89,12 @@ pub struct SshConfig {
     /// チャネルを開いた上にネストしたSSHセッションを張る（`ssh -J` 相当）。
     /// 対象ホストがNAT配下で直接到達できない場合の唯一の到達経路になる。
     pub jump: Option<JumpConfig>,
+    /// `forwards` の `bind_address` が非ループバック（127.0.0.0/8・::1・localhost以外）の
+    /// 場合に、それを許可するかどうか。既定 false。Kotlin側UI警告だけに頼らずコア側でも
+    /// 強制する（Rust SSOTルール、外部レビュー指摘対応）。false時に非ループバックbindが
+    /// 指定された場合、そのforwardは`ForwardState::Failed`として拒否される
+    /// （セッション自体は切断されない。他のforwardには影響しない）。
+    pub allow_non_loopback_forward_bind: bool,
 }
 
 /// ProxyJump（多段SSH）の踏み台ホストへの接続情報。`SshConfig::jump` 参照。
@@ -401,7 +407,7 @@ pub(crate) async fn run_russh_transport(
 
     run_ssh_channel_loop(
         &config.username, &config.auth, config.cols, config.rows,
-        config.agent_forward, agent_key,
+        config.agent_forward, agent_key, config.allow_non_loopback_forward_bind,
         session, cmd_rx, event_tx,
     ).await;
 }

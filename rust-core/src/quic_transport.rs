@@ -306,7 +306,7 @@ async fn run_quic_transport(
     // `SshConfig.agent_forward` 相当のフィールドを `QuicConfig` はまだ持たない）。
     run_ssh_channel_loop(
         &config.username, &config.auth, config.cols, config.rows,
-        false, agent_key,
+        false, agent_key, false,
         session, cmd_rx, event_tx,
     ).await;
 }

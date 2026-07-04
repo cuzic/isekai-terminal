@@ -203,6 +203,7 @@ pub(crate) async fn run_ssh_channel_loop(
     rows: u32,
     agent_forward: bool,
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
+    allow_non_loopback_forward_bind: bool,
     mut session: client::Handle<RusshEventHandler>,
     mut cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
@@ -300,13 +301,29 @@ pub(crate) async fn run_ssh_channel_loop(
                         event_tx.send(TransportEvent::Resized { cols, rows }).await.ok();
                     }
                     Some(TransportCommand::AddLocalForward { id, bind_addr, bind_port, remote_host, remote_port }) => {
-                        info!("forward[{}]: add {}:{} -> {}:{}", id, bind_addr, bind_port, remote_host, remote_port);
-                        let task = tokio::spawn(run_local_forward(
-                            id.clone(), bind_addr, bind_port, remote_host, remote_port,
-                            session.clone(), event_tx.clone(),
-                        ));
-                        if let Some(old) = forward_tasks.insert(id, task) {
-                            old.abort();
+                        if !allow_non_loopback_forward_bind && !is_loopback_bind_address(&bind_addr) {
+                            warn!(
+                                "forward[{}]: rejecting non-loopback bind {} (allow_non_loopback_forward_bind=false)",
+                                id, bind_addr
+                            );
+                            event_tx.send(TransportEvent::ForwardStateChanged {
+                                id,
+                                state: ForwardState::Failed {
+                                    reason: format!(
+                                        "bind address {bind_addr} is not loopback and \
+                                         allow_non_loopback_forward_bind is false"
+                                    ),
+                                },
+                            }).await.ok();
+                        } else {
+                            info!("forward[{}]: add {}:{} -> {}:{}", id, bind_addr, bind_port, remote_host, remote_port);
+                            let task = tokio::spawn(run_local_forward(
+                                id.clone(), bind_addr, bind_port, remote_host, remote_port,
+                                session.clone(), event_tx.clone(),
+                            ));
+                            if let Some(old) = forward_tasks.insert(id, task) {
+                                old.abort();
+                            }
                         }
                     }
                     Some(TransportCommand::RemoveForward { id }) => {
@@ -337,6 +354,15 @@ pub(crate) async fn run_ssh_channel_loop(
 }
 
 // ── ローカルポートフォワード(-L) ──────────────────────────
+
+/// `addr` がループバック（127.0.0.0/8・::1）または文字列 "localhost"（大小無視）かどうか。
+/// `allow_non_loopback_forward_bind == false` の場合の bind 許可判定に使う。
+fn is_loopback_bind_address(addr: &str) -> bool {
+    if addr.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    addr.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+}
 
 /// `bind_addr:bind_port` で待受し、accept ごとに `channel_open_direct_tcpip` で
 /// リモート `remote_host:remote_port` への SSH チャネルを開き、TCP ソケットと
@@ -588,6 +614,7 @@ mod local_forward_e2e_tests {
                 }],
                 agent_forward: false,
                 jump: None,
+                allow_non_loopback_forward_bind: false,
             };
 
             orchestrator.connect(config).expect("connect() should not fail synchronously");
@@ -616,6 +643,74 @@ mod local_forward_e2e_tests {
                 .await.expect("read from forwarded port timed out")
                 .expect("read from forwarded port failed");
             assert_eq!(&buf[..n], b"hello-forward");
+
+            orchestrator.disconnect();
+        });
+    }
+
+    #[test]
+    fn is_loopback_bind_address_recognizes_loopback_forms() {
+        assert!(super::is_loopback_bind_address("127.0.0.1"));
+        assert!(super::is_loopback_bind_address("127.5.6.7"));
+        assert!(super::is_loopback_bind_address("::1"));
+        assert!(super::is_loopback_bind_address("localhost"));
+        assert!(super::is_loopback_bind_address("LOCALHOST"));
+        assert!(!super::is_loopback_bind_address("0.0.0.0"));
+        assert!(!super::is_loopback_bind_address("10.0.0.5"));
+        assert!(!super::is_loopback_bind_address("192.168.1.1"));
+        assert!(!super::is_loopback_bind_address("not-an-address"));
+    }
+
+    #[test]
+    fn non_loopback_forward_bind_is_rejected_when_not_allowed() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let echo_addr = spawn_echo_server().await;
+            let ssh_addr = spawn_fake_ssh_server(echo_addr).await;
+
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let callback: Box<dyn OrchestratorCallback> = Box::new(TestCallback { tx });
+            let orchestrator = create_session_orchestrator(callback);
+
+            let config = SshConfig {
+                host: ssh_addr.ip().to_string(),
+                port: ssh_addr.port(),
+                username: "tester".into(),
+                auth: SshAuth::Password { password: "anything".into() },
+                cols: 80,
+                rows: 24,
+                forwards: vec![PortForward {
+                    forward_type: ForwardType::Local,
+                    // 実際にbindを試みる前にコア側で拒否されるはずなので、この
+                    // アドレスに実在のNICが無くてもテストは成立する。
+                    bind_address: "203.0.113.1".into(),
+                    bind_port: 0,
+                    remote_host: "upstream.invalid".into(),
+                    remote_port: echo_addr.port(),
+                }],
+                agent_forward: false,
+                jump: None,
+                allow_non_loopback_forward_bind: false,
+            };
+
+            orchestrator.connect(config).expect("connect() should not fail synchronously");
+
+            let mut failed_reason = None;
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Forward(_, ForwardState::Listening))) => {
+                        panic!("non-loopback bind should have been rejected, but started listening");
+                    }
+                    Ok(Some(TestEvent::Forward(_, ForwardState::Failed { reason }))) => {
+                        failed_reason = Some(reason);
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+            let reason = failed_reason.expect("forward did not report Failed within timeout");
+            assert!(reason.contains("allow_non_loopback_forward_bind"), "unexpected reason: {reason}");
 
             orchestrator.disconnect();
         });

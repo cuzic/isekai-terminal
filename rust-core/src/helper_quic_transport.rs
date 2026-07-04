@@ -579,7 +579,7 @@ async fn run_over_stream(
     // 相当のフィールドをまだ持たない）。
     run_ssh_channel_loop(
         &config.username, &config.auth, config.cols, config.rows,
-        false, agent_key,
+        false, agent_key, false,
         session, cmd_rx, event_tx,
     ).await;
 }
@@ -610,6 +610,8 @@ async fn run_helper_quic_transport_auto(
                 // HelperQuicConfig には踏み台(jump host)設定も無いため、フォールバック時は
                 // 対象ホストへ直接SSH接続する前提のまま(SshConfig::jump 参照)。
                 jump: None,
+                // フォールバック時は forwards が空なので実質無関係だが、既定に合わせて false。
+                allow_non_loopback_forward_bind: false,
             };
             crate::run_russh_transport(ssh_config, cmd_rx, event_tx).await;
         }

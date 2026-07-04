@@ -101,6 +101,11 @@ data class ConnectionProfile(
     @ColumnInfo(name = "relay_addr") val relayAddr: String? = null,
     @ColumnInfo(name = "relay_sni") val relaySni: String? = null,
     @ColumnInfo(name = "relay_jwt") val relayJwt: String? = null,
+    // 外部レビュー指摘対応(Phase 11 P0-4): ポートフォワードの非ループバックbindを
+    // Rust側(SshConfig.allowNonLoopbackForwardBind)でも明示許可制にするフラグ。
+    // 既定false。Kotlin UI側の警告表示だけに頼らず、コア側でも同じ判断を強制する
+    // (Rust SSOTルール)。
+    @ColumnInfo(name = "allow_non_loopback_forward_bind") val allowNonLoopbackForwardBind: Boolean = false,
 ) : Parcelable {
     val transportPreference: TransportPreference
         get() = try {
@@ -218,6 +223,7 @@ fun ConnectionProfile.toSshConfig(
         forwards = forwards,
         agentForward = enableAgentForward,
         jump = toJumpConfigOrNull(jumpAuth),
+        allowNonLoopbackForwardBind = allowNonLoopbackForwardBind,
     )
 
 fun ConnectionProfile.toQuicConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt = 24u): QuicConfig =

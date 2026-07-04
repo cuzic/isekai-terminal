@@ -111,6 +111,7 @@ fun ProfileEditScreen(
     var enableUpstreamFailover by remember { mutableStateOf(profile?.enableUpstreamFailover ?: false) }
     var postConnectCommands by remember { mutableStateOf(profile?.postConnectCommands ?: "") }
     var enableAgentForward by remember { mutableStateOf(profile?.enableAgentForward ?: false) }
+    var allowNonLoopbackForwardBind by remember { mutableStateOf(profile?.allowNonLoopbackForwardBind ?: false) }
     var useJumpHost by remember { mutableStateOf(profile?.usesJumpHost ?: false) }
     var jumpHost by remember { mutableStateOf(profile?.jumpHost ?: "") }
     var jumpPort by remember { mutableStateOf((profile?.jumpPort ?: 22).toString()) }
@@ -586,6 +587,20 @@ fun ProfileEditScreen(
             "接続確立後、指定したローカルポートへの接続をリモートホストへ中継します(現状は -L のみ対応)。",
             fontSize = 12.sp,
         )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = allowNonLoopbackForwardBind,
+                onCheckedChange = { allowNonLoopbackForwardBind = it },
+            )
+            Text("同一Wi-Fi/LAN上の他端末からの待受を許可する（非ループバックbind）")
+        }
+        Text(
+            "OFF（既定）の場合、待受アドレスが 127.0.0.1/localhost 以外だとコア側で待受自体が" +
+                "拒否されます（UI警告だけでなく実際に強制されます）。ONにする場合は、同一LAN上の" +
+                "第三者からもアクセスされうることを理解した上で有効にしてください。",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
 
         forwardDrafts.forEachIndexed { index, draft ->
             Column(
@@ -620,7 +635,12 @@ fun ProfileEditScreen(
                     draft.bindAddress != "127.0.0.1" && draft.bindAddress != "localhost"
                 ) {
                     Text(
-                        "⚠ 同一 Wi-Fi/LAN 上の第三者からアクセスされうる待受アドレスです。",
+                        text = if (allowNonLoopbackForwardBind) {
+                            "⚠ 同一 Wi-Fi/LAN 上の第三者からアクセスされうる待受アドレスです。"
+                        } else {
+                            "⚠ このアドレスは上の「非ループバックbind」チェックがOFFのため、" +
+                                "接続時にコア側で待受が拒否されます。"
+                        },
                         color = Color(0xFFB00020),
                         fontSize = 12.sp,
                     )
@@ -696,6 +716,7 @@ fun ProfileEditScreen(
                         enableUpstreamFailover = enableUpstreamFailover,
                         postConnectCommands = postConnectCommands.trim().takeIf { it.isNotEmpty() },
                         forwards = forwardDrafts.mapNotNull { it.toPortForwardOrNull() },
+                        allowNonLoopbackForwardBind = allowNonLoopbackForwardBind,
                         enableAgentForward = enableAgentForward,
                         jumpHost = if (useJumpHost) jumpHost.trim() else null,
                         jumpPort = jumpPort.toIntOrNull() ?: 22,

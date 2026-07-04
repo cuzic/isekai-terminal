@@ -992,7 +992,7 @@ async fn run_over_stream(
     // MultipathHelperQuicConfig は agent forwarding 未対応（HelperQuicConfig と同様）。
     run_ssh_channel_loop(
         &config.username, &config.auth, config.cols, config.rows,
-        false, agent_key,
+        false, agent_key, false,
         session, cmd_rx, event_tx,
     ).await;
 }

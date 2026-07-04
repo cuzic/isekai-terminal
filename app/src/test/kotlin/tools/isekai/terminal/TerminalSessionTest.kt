@@ -49,6 +49,7 @@ class TerminalSessionTest {
         forwards = emptyList(),
         agentForward = false,
         jump = null,
+        allowNonLoopbackForwardBind = false,
     )
 
     private suspend fun awaitState(condition: (TerminalUiState) -> Boolean): TerminalUiState =

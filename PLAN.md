@@ -1485,8 +1485,17 @@ Web検索で実在・現状Needs Triageであることを確認済み——Phase
    ラベルを「（現在利用不可）」に変更しキャプションを状態/原因/フォールバック先を
    明示する形に書き換えた（`ProfileEditScreen.kt`）。チップ自体の改名は不要と判断
    （path0/path1のTailscale⇔直接アドレス切替は#738の対象外で実際に動作するため）。
-4. 非ループバックport forward bindをRust側（`SshConfig`に`allow_non_loopback_forward_bind: bool`
+4. ✅ 非ループバックport forward bindをRust側（`SshConfig`に`allow_non_loopback_forward_bind: bool`
    のような明示許可フラグ）でも制御できるようにする（現状Kotlin UI警告のみでコア側allowlistなし）
+   → `SshConfig.allow_non_loopback_forward_bind: bool`（既定false）を追加し、唯一の実体験装
+   （`transport.rs::run_ssh_channel_loop`の`AddLocalForward`ハンドラ、全transportがここを
+   共有）でbind_addressがループバック（127.0.0.0/8・::1・"localhost"）でない場合に
+   `ForwardState::Failed`で拒否するよう変更（Rust SSOTルール準拠）。QUIC系5トランスポート
+   （quic/multipath/stun_p2p/link_relay/helper_quic）はagent_forwardと同様にfalse固定
+   （Config構造体がforwards自体を持たないため）。Kotlin側は`ConnectionProfile`に同名列を追加
+   （Room migration 14→15）、`ProfileEditScreen`に「同一Wi-Fi/LAN上の他端末からの待受を許可する」
+   チェックボックスを追加し、OFF時は拒否される旨を警告文言に反映。Rust側新規ユニットテスト2件
+   （ループバック判定・非ループバックbind拒否のe2e）、Kotlin側新規migrationテスト1件を追加。
 5. Room migration番号の並行worktree衝突（この24hで3件のfixupコミット発生）に対し、
    migration予約ファイル+CI重複チェックのような仕組みを検討
 

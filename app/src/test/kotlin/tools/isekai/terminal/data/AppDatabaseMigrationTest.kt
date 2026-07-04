@@ -121,6 +121,7 @@ class AppDatabaseMigrationTest {
             .addMigrations(
                 AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11,
                 AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14,
+                AppDatabase.MIGRATION_14_15,
             )
             .build()
 
@@ -234,7 +235,7 @@ class AppDatabaseMigrationTest {
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
             .addMigrations(
                 AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12,
-                AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14,
+                AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15,
             )
             .build()
         try {
@@ -242,6 +243,123 @@ class AppDatabaseMigrationTest {
             assertEquals(1, profiles.size)
             assertEquals("web", profiles[0].label)
             assertTrue("既存行の forwards は空リストであるべき", profiles[0].forwards.isEmpty())
+        } finally {
+            db.close()
+            ctx.deleteDatabase(dbName)
+        }
+    }
+
+    @Test
+    fun migrate14To15_addsAllowNonLoopbackForwardBindColumn_existingRowsDefaultToFalse() {
+        val dbName = "migration-test-14-15.db"
+        ctx.deleteDatabase(dbName)
+
+        // バージョン 14 の connection_profiles テーブル(migration 1→14 適用後の最終形)を
+        // 手で作り、1 行 insert しておく。
+        val factory = FrameworkSQLiteOpenHelperFactory()
+        val config = SupportSQLiteOpenHelper.Configuration.builder(ctx)
+            .name(dbName)
+            .callback(object : SupportSQLiteOpenHelper.Callback(14) {
+                override fun onCreate(db: SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE connection_profiles (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            host TEXT NOT NULL,
+                            port INTEGER NOT NULL DEFAULT 22,
+                            username TEXT NOT NULL,
+                            authType TEXT NOT NULL,
+                            keyId INTEGER,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            use_tsshd INTEGER NOT NULL DEFAULT 0,
+                            tsshd_port INTEGER NOT NULL DEFAULT 2222,
+                            transport_preference TEXT NOT NULL DEFAULT 'PLAIN_SSH',
+                            direct_address TEXT,
+                            enable_physical_multipath INTEGER NOT NULL DEFAULT 0,
+                            cellular_remote_address TEXT,
+                            enable_upstream_failover INTEGER NOT NULL DEFAULT 0,
+                            post_connect_commands TEXT,
+                            forwards TEXT NOT NULL DEFAULT '[]',
+                            enable_agent_forward INTEGER NOT NULL DEFAULT 0,
+                            jump_host TEXT,
+                            jump_port INTEGER NOT NULL DEFAULT 22,
+                            jump_username TEXT,
+                            jump_auth_type TEXT,
+                            jump_key_id INTEGER,
+                            stun_server TEXT,
+                            relay_addr TEXT,
+                            relay_sni TEXT,
+                            relay_jwt TEXT
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE known_hosts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            host TEXT NOT NULL,
+                            port INTEGER NOT NULL,
+                            keyType TEXT NOT NULL,
+                            fingerprintSha256 TEXT NOT NULL,
+                            firstSeenAt INTEGER NOT NULL,
+                            lastSeenAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        "CREATE UNIQUE INDEX index_known_hosts_host_port ON known_hosts (host, port)"
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE key_entries (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            publicKey TEXT NOT NULL,
+                            encryptedPrivateKeyPath TEXT NOT NULL,
+                            kekAlias TEXT NOT NULL,
+                            createdAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE snippets (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            command TEXT NOT NULL,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            profile_id INTEGER,
+                            append_newline INTEGER NOT NULL DEFAULT 1
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        "INSERT INTO connection_profiles (label, host, username, authType) " +
+                            "VALUES ('legacy', 'example.com', 'user', 'password')"
+                    )
+                }
+
+                override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+            })
+            .build()
+        val rawHelper = factory.create(config)
+        rawHelper.writableDatabase // force onCreate
+        rawHelper.close()
+
+        // Room 経由で開くと MIGRATION_14_15 が適用されるはず。
+        val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_14_15)
+            .build()
+        try {
+            val profiles = runBlocking { db.connectionProfileDao().getAll() }
+            assertEquals(1, profiles.size)
+            assertEquals("legacy", profiles[0].label)
+            assertEquals(
+                "既存行の allowNonLoopbackForwardBind は false(既定拒否)であるべき",
+                false,
+                profiles[0].allowNonLoopbackForwardBind,
+            )
         } finally {
             db.close()
             ctx.deleteDatabase(dbName)
