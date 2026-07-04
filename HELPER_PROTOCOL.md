@@ -26,6 +26,13 @@ OPTIONS:
   --punch-peer <ADDR:PORT>      `--stun-server` 併用時のみ有効。isekai-terminal側が事前に調べた
                                 自分自身のSTUN観測アドレスを渡す（simultaneous open用の
                                 穴あけprobeデータグラムをこのアドレス宛に送る）
+  --relay <ADDR:PORT>           MASQUE relay(isekai-link-masqueのCONNECT-UDP-bind)経由でトンネルを
+                                張り、`--bind`する代わりにrelayが割り当てた公開アドレスを
+                                ハンドシェイクJSONの `relay_public_addr` に含める
+                                （TransportPreference::IsekaiLinkRelayQuic 用、`--stun-server`/
+                                `--punch-peer`とは併用不可）。`--relay-sni`/`--relay-jwt`と併用必須
+  --relay-sni <NAME>            `--relay`のTLS SNI/HTTPオーソリティ
+  --relay-jwt <TOKEN>           `--relay`への認証に使うBearerトークン
   --log-level <LEVEL>           error|warn|info|debug|trace（既定: info）。stderr にのみ出力する
   --version                     バージョン表示して終了
   --help
@@ -50,6 +57,14 @@ OPTIONS:
   STUN問い合わせ・穴あけprobeの送出は、いずれも実際にQUICが待ち受けるのと**同一のソケット**
   （`--bind`でbindしたもの）を使って行う——別ソケットでは観測されるNATマッピング（外部ポート）が
   変わってしまい、意味が無いため。
+- `--relay`/`--relay-sni`/`--relay-jwt`（Phase 10、relay版P2P用）: isekai-helperが「agent役」として
+  `isekai-link-masque`クレート経由でMASQUE relay(`seera-networks/axum-masque-rs`の`bound-udp-server`)へ
+  CONNECT-UDP-bindトンネルを張り、relayが割り当てた公開アドレス(`relay_public_addr`)を
+  `--bind`する代わりのQUIC待受アドレスとして使う。isekai-terminal側(`isekai_link_relay_transport.rs`)は
+  MASQUE/HTTP/3/capsuleを一切意識せず、`relay_public_addr`へ普通にQUIC接続するだけでよい——
+  relayから見ればisekai-helperが直接そのアドレスで listen しているのと区別が付かない。
+  JWTの発行・配布フロー自体はPLAN.md Phase 10で別途設計する（このCLI契約はBearerトークンの
+  文字列を受け取るだけで、取得方法には関知しない）。
 
 ### 終了コード
 
@@ -74,7 +89,7 @@ OPTIONS:
 bind に成功した直後、accept ループに入る前に、**1行だけ** JSON を stdout に出力する。
 
 ```json
-{"v":1,"listen_port":45231,"cert_sha256":"3a7f...（hex, 64文字）","session_secret":"base64エンコードされた32byte","stun_observed_addr":"203.0.113.5:45231"}
+{"v":1,"listen_port":45231,"cert_sha256":"3a7f...（hex, 64文字）","session_secret":"base64エンコードされた32byte","stun_observed_addr":"203.0.113.5:45231","relay_public_addr":null}
 ```
 
 - `v`: ハンドシェイクフォーマットのバージョン（将来の破壊的変更に備える）
@@ -88,6 +103,10 @@ bind に成功した直後、accept ループに入る前に、**1行だけ** JS
   「STUN問い合わせが失敗した」の両方を表す——後者でもハンドシェイク自体は失敗させず継続する）:
   `--stun-server` から見た、この helper の観測アドレス（`"ip:port"` 文字列）。isekai-terminal は
   これを使って直結（hole punching）を試みる。
+- `relay_public_addr`（Phase 10、`--relay` 指定時のみ存在。`null` は未指定）: relayが割り当てた
+  公開アドレス（`"ip:port"` 文字列、`--relay`成功時は必ず存在する——STUNと異なり中間失敗時の
+  フォールバック余地が無く、relay接続自体が失敗すればhelperの起動自体が失敗するため）。
+  isekai-terminal はこのアドレスへ直接QUIC接続する（`ssh_host`とは無関係の別アドレス）。
 
 SSH 側の呼び出し例（ブートストラップスクリプトのイメージ、Phase 7-3 で実装・実機検証済み）:
 

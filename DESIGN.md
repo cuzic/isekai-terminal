@@ -445,3 +445,7 @@ data class KeyEntry(
 | Foreground Service type 確定 | P1 序盤で確定 | Android 14 の `fgs-types-required` |
 | Mosh GPLv3 ライセンス方針 | P6 前に法務確認 | clean-room 実装でリスク低減 |
 | tsshd 互換（UDP SSH + roaming）の評価 | P7 で検討 | Mosh SSP より統合しやすい可能性あり |
+| `isekai-transport` trait層の切り出し（noq/h3-noq/MASQUE型を上位に漏らさない） | Phase 11以降で検討（PLAN.md「Phase 10完了後の外部レビュー」参照） | ChatGPT相談で指摘。`isekai-protocol`/`isekai-trust`との境界分離も含む |
+| relay_jwt平文保存・恒久的なJWT発行/配布フロー | Phase 10-4で未設計のまま。Phase 11でsecurity debt issueとして格上げ予定 | Android Keystoreベースのcredential vault化を検討 |
+| STUN P2P/MASQUE relayの「フォールバックなし」のUI表現 | Phase 11で検討 | Strict Isekai Link / Smart Connect / Plain SSHのような接続ポリシーとして明示する案 |
+| 並行worktree開発によるRoom migration番号衝突 | Phase 11で検討 | migration予約ファイル + CI重複チェックの導入案 |
