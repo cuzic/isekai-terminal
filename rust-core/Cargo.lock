@@ -1345,6 +1345,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "isekai-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "isekai-protocol",
+ "log",
+ "russh",
+ "russh-keys",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "isekai-helper"
 version = "0.3.4"
 dependencies = [

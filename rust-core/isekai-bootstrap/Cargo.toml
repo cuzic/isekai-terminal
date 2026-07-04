@@ -1,0 +1,20 @@
+[package]
+name = "isekai-bootstrap"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+isekai-protocol = { path = "../isekai-protocol" }
+async-trait = "0.1.89"
+tokio = { version = "1", features = ["process", "io-util", "rt", "sync", "time", "macros"] }
+base64 = "0.22"
+thiserror = "2.0.18"
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+russh = "0.48"
+russh-keys = "0.48"
+async-trait = "0.1.89"
+tempfile = "3"
