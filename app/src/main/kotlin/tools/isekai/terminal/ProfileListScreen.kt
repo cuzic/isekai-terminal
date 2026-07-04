@@ -48,6 +48,7 @@ import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
+import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.tssh_core.setTerminalTheme
 

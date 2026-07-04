@@ -34,6 +34,7 @@ import tools.isekai.terminal.session.RealHostKeyChecker
 import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
+import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.tssh_core.CellData
 import uniffi.tssh_core.HelperQuicConfig

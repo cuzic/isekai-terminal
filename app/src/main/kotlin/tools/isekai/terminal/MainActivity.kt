@@ -14,6 +14,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import tools.isekai.terminal.ui.TerminalThemes
+import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.tssh_core.setTerminalTheme
 

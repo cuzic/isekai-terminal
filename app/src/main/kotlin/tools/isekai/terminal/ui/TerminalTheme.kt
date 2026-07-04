@@ -27,13 +27,16 @@ data class TerminalTheme(
     fun foregroundArgb(): UInt = foreground.toArgbUInt()
     fun backgroundArgb(): UInt = background.toArgbUInt()
     fun ansi16Argb(): List<UInt> = ansi16.map { it.toArgbUInt() }
-
-    /** [uniffi.tssh_core.setTerminalTheme]/[tools.isekai.terminal.session.TerminalSession.setTheme]
-     *  など、`(ansi16Argb, foregroundArgb, backgroundArgb)` の3引数を取るsetterへ共通の変換で渡す。 */
-    fun applyTo(setter: (List<UInt>, UInt, UInt) -> Unit) = setter(ansi16Argb(), foregroundArgb(), backgroundArgb())
 }
 
 private fun Color.toArgbUInt(): UInt = toArgb().toUInt()
+
+/** [uniffi.tssh_core.setTerminalTheme]/[tools.isekai.terminal.session.TerminalSession.setTheme]
+ *  など、`(ansi16Argb, foregroundArgb, backgroundArgb)` の3引数を取るsetterへ、[TerminalTheme]の
+ *  ARGB変換を共通の形で渡すためのヘルパー(呼び出し側の配線都合であり、テーマデータ自体の
+ *  責務ではないためTerminalThemeのメンバーではなく独立した拡張関数にしている)。 */
+fun TerminalTheme.applyTo(setter: (ansi16: List<UInt>, foreground: UInt, background: UInt) -> Unit) =
+    setter(ansi16Argb(), foregroundArgb(), backgroundArgb())
 
 object TerminalThemes {
     /** `SharedPreferences("tssh_ui")` に保存するテーマ名のキー */
