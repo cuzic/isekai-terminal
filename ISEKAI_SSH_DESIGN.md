@@ -720,6 +720,18 @@ last_via = "bastion.example.com"
 trusted_at = "2026-07-04T..."
 last_seen_at = "2026-07-04T..."
 
+# S-2実装時に追加（確定、2026-07-04）: `connect`が日常的に`--via`を経由せず
+# 直接relay/isekai-helperへ接続できるのは、`init`（または直近の再配布）で得た
+# ハンドシェイク情報をここにキャッシュしているため。`--relay`モードのisekai-helper
+# は常駐が前提（「isekai-helper 側の追加要件」節）なので、helperが再起動しない限り
+# このキャッシュは有効であり続ける。helperが再起動して`session_secret`が変わった
+# 場合、キャッシュを使ったconnectはHELLO/proofの検証に失敗する（isekai-helperが
+# ACKで拒否する）——この失敗が「`--via`経由の再配布が必要」というシグナルになる
+# （「CLIコマンド構成」節の`connect`内フォールバックの契機）。
+cached_relay_addr = "203.0.113.10:45231"
+cached_cert_sha256 = "3a7f..."
+cached_session_secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
+
 [release_keys]
 # 署名検証導入後に使う。Phase 10時点では未設定（＝update_policyは常にexact-digest-only）
 stable = "..."
