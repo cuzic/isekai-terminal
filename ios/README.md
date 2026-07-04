@@ -11,10 +11,10 @@ Swift Package Manager パッケージ雛形です。背景・設計方針は `PL
   `OrchestratorCallback`(9メソッド)・`SessionCallback`・`SshError` を含む全エクスポート面が
   問題なく Swift の `protocol`/`enum: Swift.Error` として生成されることを確認済みです。
 - **iOSクロスコンパイル・XCFramework化・シミュレータでの動作確認は、`.github/workflows/
-  ios-rust-core-check.yml`(GitHub Actions、`macos-26`ランナー)で検証します**。このリポジトリは
-  公開リポジトリのため、GitHub-hostedのmacOSランナーは無課金で使えます(詳細は`PLAN.md`
-  「Phase Y」節のPhase 0-6参照)。ローカルのmacOS環境がある場合は、以下の手順で同じ内容を
-  手元でも実行できます。
+  ios-rust-core-check.yml`(GitHub Actions、`macos-26`ランナー)で2026-07-04に実際にgreenを
+  確認済みです**。このリポジトリは公開リポジトリのため、GitHub-hostedのmacOSランナーは
+  無課金で使えます(詳細は`PLAN.md`「Phase Y」節のPhase 0-6参照)。ローカルのmacOS環境がある
+  場合は、以下の手順で同じ内容を手元でも実行できます。
 
 ## 前提条件(macOS側)
 
@@ -32,6 +32,17 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 ```
 
 ### 2. クロスコンパイル + XCFramework化
+
+先に `isekai-helper` の x86_64/aarch64 musl静的バイナリをビルドしておく必要があります
+(`tssh-core`が`include_bytes!`で埋め込むため。iOS固有ではなく`tssh-core`をビルドする際の
+一般的な前提です):
+
+```bash
+brew install zig
+cargo install cargo-zigbuild --locked
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+bash rust-core/scripts/build-isekai-helper-musl.sh
+```
 
 ```bash
 bash rust-core/scripts/build-ios-xcframework.sh
@@ -73,17 +84,15 @@ xcrun simctl list devices available   # 使えるシミュレータ名を確認
 xcodebuild test -scheme TsshCore -destination 'platform=iOS Simulator,name=iPhone 15'
 ```
 
-`swift-tools-version:5.9` のパッケージ単体で `-scheme TsshCore` が Xcode から見えない場合は、
-最小構成の空 iOS App テンプレートを作り、ローカル SwiftPM 依存としてこの `ios/` ディレクトリを
-追加してテストを実行するフォールバック経路を使ってください。
+`-scheme TsshCore` は `Package.swift` から自動生成されるスキームで、CI(`macos-26`)では
+そのまま動作することを確認済みです。
 
 成功基準: `CoreVersionRoundTripTests.testCoreVersionMatchesCargoPackageVersion` が green になり、
-`coreVersion()` の戻り値が `rust-core/Cargo.toml` の `[package] version` と一致すること。
+`coreVersion()` の戻り値が `rust-core/Cargo.toml` の `[package] version` と一致すること
+(CIで実際にpass済み)。
 
 ## Phase 0 でやらないこと
 
 - 単一tokioランタイム(`LazyLock<Runtime>`、`rust-core/src/lib.rs`)とiOSバックグラウンド
   サスペンド/jetsamの実機検証(`PLAN.md` Phase 0-5 参照。実機が無いため次フェーズに送る)。
-- CI(macOS runner)へのこのビルド手順の組み込み(`PLAN.md` Phase 0-6 参照。手順が
-  確立してから別サブフェーズで着手する)。
 - `prepare_for_background`/`resume_from_background` 等のライフサイクルAPI実装(Phase 1以降)。

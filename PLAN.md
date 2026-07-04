@@ -1744,10 +1744,19 @@ macOS 環境で行う。
   `$OUT_DIR/*` を素朴に回すと、再実行時に既存の `*.sha256` まで再ハッシュして
   `*.sha256.sha256` が増殖するバグがあったため、生成のたびに `OUT_DIR` を `rm -rf` してから
   生成し直す方式に修正済み。
-- **Phase 0-2（iOS 3ターゲットへのクロスコンパイル）**・**Phase 0-3（XCFramework化 +
+- ✅ **Phase 0-2（iOS 3ターゲットへのクロスコンパイル）**・**Phase 0-3（XCFramework化 +
   SwiftPMパッケージ雛形）**・**Phase 0-4（最小round-trip検証）**: 当初は mac 必須のため
   手順書（`ios/README.md`）の用意のみに留めていたが、後述のCI導入判断により
-  **GitHub Actions（`macos-26`ランナー）上で実際に検証する方針に変更**。
+  **GitHub Actions（`macos-26`ランナー）上で実際に検証し、2026-07-04に全項目green
+  で完了した**（実行ログ: run 28706001145、`build-and-test` ジョブ 11m28s）。
+  途中で1点、事前に把握していなかったビルド前提が判明した: `tssh-core`
+  （`helper_quic_transport.rs`）は`isekai-helper`のx86_64/aarch64 musl静的バイナリを
+  `include_bytes!`で埋め込む設計（iOS固有ではなく、tssh-coreをどのホスト/ターゲット向けに
+  ビルドする場合でも必要な一般的な前提。ローカル開発機ではPhase 0-1実行時点で既に
+  `target/`に残っていたため気づかなかった）。CI上でcargo-zigbuild経由の
+  `build-isekai-helper-musl.sh`を先に実行するステップを追加して解消した。
+  シミュレータ上のround-tripテスト（`CoreVersionRoundTripTests.
+  testCoreVersionMatchesCargoPackageVersion`）も実際にpassした。
   `rust-core/scripts/build-ios-xcframework.sh`（`uname` が `Darwin` でなければ即エラー終了。
   Phase 0-1 で確認した生成物のファイル名 `tssh_coreFFI.modulemap` を、
   `xcodebuild -create-xcframework -headers` が期待する `module.modulemap` という名前へ
@@ -1798,9 +1807,13 @@ macOS 環境で行う。
   行うフェーズになったら、Codemagicを「配布専用CI」として追加することを検討する
   （ライブラリ検証はGitHub Actionsのまま維持）。
 
-**次にやること**: `.github/workflows/ios-rust-core-check.yml` を push して実際のCI実行結果を
-確認する。green になった時点で Phase 0 完了とし、本格的な iOS 版 UI 実装（SwiftUI・Keychain・
-trzsz UI 等）の Phase 番号を確定する。
+**Phase 0 完了（2026-07-04）**: 上記の通り Phase 0-1〜0-4 は GitHub Actions
+（`.github/workflows/ios-rust-core-check.yml`、`macos-26`ランナー）上で全てgreenを確認した。
+Phase 0-5（バックグラウンドライフサイクル）・0-6（CI、GitHub Actions採用）も含め、
+「Phase 0: 技術検証スパイク」のゴールは達成された。
+
+**次にやること**: 本格的な iOS 版 UI 実装（SwiftUI・Keychain・trzsz UI 等）の Phase 番号を確定し、
+着手する。
 
 ---
 
