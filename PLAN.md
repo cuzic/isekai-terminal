@@ -1901,6 +1901,46 @@ Phase 1C（isekai-terminal固有の耐障害性を完成させるフェーズ）
 実機検証は各機能タスクの受け入れ条件に前倒しし、最終回帰テストには集約しない方針。
 タスクの詳細はセッションのTaskList（`[Phase 1A-N]`等のタグ付き）を参照。
 
+### Phase 1A 実装進捗（2026-07-04、`worktree-ios-phase1`ブランチ、PR #2）
+
+Phase 1Aの1〜4を実装し、いずれもGitHub Actions（`macos-26`）で実際にgreenを確認した。
+
+- ✅ **1. Xcodeアプリ雛形**: `ios/App/TsshTerminalApp.xcodeproj`（手書き。開発機にmacOS/Xcodeが
+  無いため、Xcode GUIを使わず直接pbxprojを記述した）+ `ContentView`が`coreVersion()`
+  （sync）・`corePing()`（async）・`DiagnosticCallback`経由のcallback受信・
+  `DiagnosticHandle`の明示的破棄を一通り実行する。**既知の落とし穴**: 当初
+  `ios/`直下に`.xcodeproj`を置いたところ、同ディレクトリの`Package.swift`と
+  競合し、既存の`ios-rust-core-check.yml`が使う`xcodebuild test -scheme TsshCore`
+  が「Scheme TsshCore is not currently configured for the test action」で
+  壊れることをCIで発見した。`ios/App/`サブディレクトリへ分離して解消
+  （ローカルパッケージ参照の相対パスは`..`）。
+- ✅ **2. アプリビルドCI**: `.github/workflows/ios-app-build-check.yml`
+  （`macos-26`、`xcodebuild build-for-testing`、署名無効化）。
+- ✅ **3. SSH/helper fixture（CI用）**: `rust-core/scripts/ios-fixture/
+  start-sshd-fixture.sh`/`stop-sshd-fixture.sh`。実行のたびに使い捨てのホスト鍵・
+  ユーザー鍵を生成し127.0.0.1の高番ポートでsshdを起動する。ローカル(Linux)・
+  CI(`macos-26`、`.github/workflows/ios-fixture-check.yml`)双方でSSH round-trip・
+  停止確認を確認済み。実機fixture（LAN上の開発機）は#20a/#20b着手時に用意する。
+- ✅ **4. Rust側連番付きEventQueue + Swift CallbackIngress**: `DiagnosticEventQueue`
+  （`sequence`発行をMutexで直列化するSSOT）+ `EventWakeListener`（wake通知のみ）+
+  Swift `CallbackIngress` actor（wake受信→`drainEvents()`能動呼び出し）。
+  Rust単体テスト3件、Swift XCTest 2件（sequence順で全件受信・drain冪等性）を
+  iOS Simulator上で確認済み。実際の`OrchestratorCallback`統合（ControlEventQueue/
+  RenderMailbox分離含む）はPhase 1Cへ持ち越し。
+
+**副産物として発見した問題（iOS対応とは無関係、別セッションで対応予定）**:
+`fdroid/tools.isekai.terminal.yml`（F-Droid提出用レシピ）の`sudo:`ブロックは
+Android向けrustupセットアップのみを行い、`tssh-core`が`include_bytes!`で要求する
+`isekai-helper`のmusl静的バイナリを事前ビルドしていない。既存の`fdroid-build-check.yml`
+がこの副PRのCIで失敗して発覚（`main`でも同じ理由で既に失敗していることを確認済み）。
+実際のF-Droidビルドサーバーでも同じ理由でビルドが失敗する可能性が高い。CI側だけを
+回避的に直すと問題を覆い隠すことになるため、修正は`fdroid/tools.isekai.terminal.yml`
+本体に対して行う必要がある（詳細はmemory参照）。
+
+**次にやること**: Phase 1A-5（日本語IME単体スパイク）・1A-6（画面更新ブリッジ+
+最小レンダラー）・1A-8（plain SSH最小縦切り）へ進む。これらは実際のUI/対話的な
+挙動確認が必要になるため、CIだけでなく実機/シミュレータでの手動確認も併用する。
+
 ---
 
 ## 実装順序
