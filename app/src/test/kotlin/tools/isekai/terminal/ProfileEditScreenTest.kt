@@ -564,4 +564,126 @@ class ProfileEditScreenTest {
         composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
         composeTestRule.onNodeWithTag("allowNonLoopbackForwardBindCheckbox").assertIsOn()
     }
+
+    // ── トランスポート選択(TransportPreference) ───────────────────────────
+    // STUN P2P / relay P2P は上のセクションで既にチップ選択+保存を検証済みなので、
+    // ここでは残りの全チップ(既定のPLAIN_SSH含む)を網羅する。
+
+    @Test fun savingWithDefaultTransportChip_persistsPlainSsh() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("DefaultTransport")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("通常 SSH").assertIsSelected()
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "DefaultTransport" }
+            assertEquals("PLAIN_SSH", stored.transportPreferenceName)
+        }
+    }
+
+    @Test fun selectingTsshdQuicChip_andSaving_persistsTransportPreference() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("TsshdProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("tsshd QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("tsshd QUIC").assertIsSelected()
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "TsshdProfile" }
+            assertEquals("TSSHD_QUIC", stored.transportPreferenceName)
+        }
+    }
+
+    @Test fun selectingAutoChip_andSaving_persistsTransportPreference() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("AutoProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("Auto（推奨）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("Auto（推奨）").assertIsSelected()
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "AutoProfile" }
+            assertEquals("AUTO", stored.transportPreferenceName)
+        }
+    }
+
+    @Test fun selectingHelperQuicChip_andSaving_persistsTransportPreference() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("HelperQuicProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("自作ヘルパー QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("自作ヘルパー QUIC").assertIsSelected()
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "HelperQuicProfile" }
+            assertEquals("ISEKAI_HELPER_QUIC", stored.transportPreferenceName)
+        }
+    }
+
+    @Test fun selectingHelperQuicMultipathChip_andSaving_persistsTransportPreference() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("HelperQuicMultipathProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("自作ヘルパー QUIC（マルチパス）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("自作ヘルパー QUIC（マルチパス）").assertIsSelected()
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "HelperQuicMultipathProfile" }
+            assertEquals("ISEKAI_HELPER_QUIC_MULTIPATH", stored.transportPreferenceName)
+        }
+    }
 }
