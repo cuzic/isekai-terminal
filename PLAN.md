@@ -1961,6 +1961,24 @@ Android向けrustupセットアップのみを行い、`tssh-core`が`include_by
 実際のSSH接続(`SshSession`/`SshConfig`)を使う本格的な統合になるため、CIでの
 自動検証に加えて実機/シミュレータでの対話的な動作確認も併用する。
 
+### ✅ Phase 1A完了条件を達成（2026-07-04、1A-8）
+
+- ✅ **8. plain SSH最小縦切り**: Android版と共通のRust実装
+  （`createSshSession`/`SshConfig`/`SessionCallback`、変更なし）を使い、
+  `rust-core/scripts/ios-fixture/start-sshd-fixture.sh`が起動する使い捨てsshdへ
+  実際に接続。公開鍵認証→PTYシェル起動→日本語を含む`echo`コマンド送受信→切断が
+  iOS Simulator上で2.4秒で成功した（`.github/workflows/
+  ios-ssh-vertical-slice-check.yml`、`SshVerticalSliceTests`）。**Android版で
+  実装済みのSSHクライアントコードがiOSから初めて実際に動作したことを実証**。
+  ホスト鍵は`onHostKey`で常に受理（信頼ストア#31はPhase 1Bで実装）。
+  fixture不在時はXCTSkipし既存テストスイートには影響しない設計。
+
+これにより「Phase 1A: iOSで成立するかを早期に証明するフェーズ」の主要ゴール
+（Xcode雛形・アプリCI・fixture・EventQueue・IME・画面更新ブリッジ・実SSH接続）を
+全て達成した。残りはPhase 1A-7（IME/カーソル統合）・1A-9（QUIC/helper縦切り、任意）。
+これらは実機での対話的な確認が中心になるため、Phase 1B（CredentialVault・
+GRDB・信頼ストア等）へ先に進むことも選択肢になる。
+
 ---
 
 ## 実装順序
