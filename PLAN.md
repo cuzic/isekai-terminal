@@ -1817,6 +1817,67 @@ Phase 0-5（バックグラウンドライフサイクル）・0-6（CI、GitHub
 
 ---
 
+## Phase S-7: isekai-ssh CLI — musl静的バイナリ配布・実機検証（2026-07-04）
+
+`isekai-ssh`（`rust-core/isekai-ssh/`、`ISEKAI_SSH_DESIGN.md`参照。`tssh-core`とは独立した、
+`ssh`のProxyCommandとして使う単体CLIツール）の実装フェーズ分割案のS-7に対応する。
+
+### muslビルド（このセッションのサンドボックス環境で実施・確認済み）
+
+`rust-core/isekai-helper/`向けの`build-isekai-helper-musl.sh`（Phase 7-2）と同じ手法
+（`cargo-zigbuild`でzigをCクロスコンパイラ/リンカに使い、musl-gcc等のシステムトゥールチェーン
+不要）を転用し、`rust-core/scripts/build-isekai-ssh-musl.sh`を新設した。**配布用ビルドでは
+`--dev-insecure-*`系フラグを有効化する`dev-insecure` feature（`ISEKAI_SSH_DESIGN.md`「実装方針」
+節参照）を明示的に有効化しない**（デフォルトfeatureのみでビルド）。
+
+このセッションには実ネットワークデバイスは無いが、ビルド自体はこの環境で実際に実行できたため、
+以下を実機（このマシン上でのx86_64ネイティブ実行）で確認した:
+
+- `cargo zigbuild --release -p isekai-ssh --target x86_64-unknown-linux-musl` /
+  `--target aarch64-unknown-linux-musl` の両方がビルド成功。
+- `file`で両バイナリとも `ELF 64-bit LSB executable, ..., statically linked, stripped`
+  （x86_64: 5,797,520 bytes、aarch64: 5,003,464 bytes）であることを確認。
+- x86_64バイナリを実際に実行し、トップレベル・`connect`/`init`/`login`/`logout`各サブコマンドの
+  `--help`出力に`--dev-insecure-*`系フラグが一切出現しないことを確認（`isekai-ssh/tests/
+  help_purity.rs`が検証している不変条件と同じ）。同テストをデフォルトfeatureのみで実際に実行し
+  `release_build_connect_help_never_mentions_dev_insecure_flags ... ok`のpassを確認した。
+- 両バイナリのsha256を記録（`.sha256`ファイル、helper版と同じ運用）。
+
+### 配布方法
+
+`isekai-ssh`は個人が`~/.ssh/config`に`ProxyCommand isekai-ssh connect %h`として置く手元用
+CLIツールであり、サーバー側常駐の`isekai-helper`向けに構築したLinuxbrew tap（Phase 7-6、
+`cuzic/homebrew-isekai-terminal`）ほどの配布インフラは現時点の利用規模では不要と判断した。
+GitHub Releaseにx86_64/aarch64両musl静的バイナリ+sha256を添付し、ユーザーが手動ダウンロード→
+sha256照合→配置→`~/.ssh/config`設定、という軽量な配布に留める方針を`ISEKAI_SSH_DESIGN.md`の
+「S-7実施結果」節に記録した（詳細はそちらを参照）。Homebrew tap等のパッケージマネージャー配布は
+将来ニーズが顕在化してから検討する。
+
+### ローカルでのrelay/resume疎通確認（本フェーズ以前に完了済み、参考情報として整理）
+
+複数ネットワーク環境をまたぐ実機検証とは別に、ローカル環境での relay/resume 疎通自体は
+Phase S-4（resume本実装のサブフェーズ、`ISEKAI_SSH_DESIGN.md`参照）のe2eテスト群
+（`isekai-ssh/tests/resume_reconnect_e2e.rs`・`resume_window_exceeded_e2e.rs`・
+`resume_multi_disconnect_e2e.rs`）で、実バイナリ・実UDPブラックホールプロキシによる
+フォルト注入を使い既に厳密に確認済みである。今回のS-7は「配布用バイナリのビルド手順の
+再現性」の検証が主眼であり、relay/resumeのプロトコルレベルの正しさそのものはS-4完了時点で
+担保されている。
+
+### 実機ネットワーク検証（未実施、フォローアップが必要）
+
+複数ネットワーク環境（宅内Wi-Fi NAT配下ホスト・モバイル回線クライアント）をまたいだ
+実relay疎通・resume・ローミング挙動の実機検証は、**このサンドボックス環境（単一マシン、
+実ネットワークデバイス無し）の制約上、今回は実行不可能であり未実施**。これはPhase 9-4・
+Phase 10-5で`tssh-core`/Android側の実機検証が同じ理由（セッションに実ネットワークデバイスを
+持つ端末が接続されていない）で保留されているのと全く同じ扱いであり、疑似的な検証で
+代替することはしていない。次回、実際のWi-Fi NAT配下ホスト＋モバイル回線クライアントの
+組み合わせを用意できる環境で、`phase7-5-roaming-test.sh`相当の手動検証を行う必要がある。
+
+対象外（本フェーズの範囲では）: Homebrew tap等の追加配布インフラの新設、署名検証の導入
+（`ISEKAI_SSH_DESIGN.md`「オープンな課題」参照、未着手のまま）。
+
+---
+
 ## 実装順序
 
 ```

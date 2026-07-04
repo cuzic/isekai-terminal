@@ -822,6 +822,54 @@ CLI専用ユーザー向けに **Device Authorization Flow**（`isekai-ssh login
 リフレッシュも失敗した場合のみ stderr に `isekai-ssh login` の再実行を促して終了する
 （`connect` の中でブラウザログインを開始することはしない）。
 
+### S-7実施結果: muslビルド手順・配布方法（2026-07-04）
+
+**ビルド手順**: `rust-core/isekai-helper/`向けの`rust-core/scripts/build-isekai-helper-musl.sh`
+（Phase 7-2・`cargo-zigbuild`でzigをCクロスコンパイラ/リンカに使い、musl-gcc等のシステム
+トゥールチェーンを不要にする手法）をそのまま転用し、`rust-core/scripts/build-isekai-ssh-musl.sh`
+を新設した。`cargo zigbuild --release -p isekai-ssh --target <triple>`を`x86_64-unknown-linux-musl`/
+`aarch64-unknown-linux-musl`の両方に対して実行するだけの構造で、helper版との唯一の違いは対象
+crateだけである。**配布用ビルドでは`dev-insecure` feature（`--dev-insecure-*`系フラグを有効化する
+開発専用の信頼ストアバイパス、「実装方針」節参照）を明示的に有効化しない**（デフォルトfeatureの
+みでビルドする）ことをスクリプト冒頭のコメントに明記した。
+
+**実施内容と結果（このセッションのサンドボックス環境で実際に実行・確認済み）**:
+
+- `cargo zigbuild --release -p isekai-ssh --target x86_64-unknown-linux-musl` /
+  `--target aarch64-unknown-linux-musl` の両方がビルド成功（各約2分10秒）。
+- `file`コマンドで両バイナリとも `ELF 64-bit LSB executable, ..., statically linked, stripped`
+  であることを確認（動的リンクライブラリへの依存が無いことの確認）。
+- x86_64バイナリ（5,797,520 bytes）はこの環境で実際に実行でき、`--help`（トップレベル・
+  `connect --help`・`init --help`・`login --help`・`logout --help`全て）に`--dev-insecure-*`系
+  フラグが一切出現しないことを`grep`で確認した。これは既存の`isekai-ssh/tests/help_purity.rs`が
+  検証している不変条件と同じであり、実際に`cargo test -p isekai-ssh --test help_purity`
+  （デフォルトfeatureのみ、`--dev-insecure`無し）を実行し
+  `release_build_connect_help_never_mentions_dev_insecure_flags ... ok`のpassを確認した。
+- aarch64バイナリ（5,003,464 bytes）はこの環境（x86_64ホスト）では実行できないため`file`による
+  静的リンク確認のみ（クロスビルド自体の成否確認）。
+- 両バイナリのsha256を`sha256sum`で記録（`.sha256`ファイルとしてビルド成果物に同梱、
+  helper版と同じ運用）。
+
+**配布方法**: `isekai-ssh`はサーバー側常駐の`isekai-helper`とは異なり、**利用者本人が手元の
+`~/.ssh/config`に`ProxyCommand isekai-ssh connect %h`として置く個人用CLIツール**である。
+Phase 7-6の`isekai-helper`向けLinuxbrew tap（`cuzic/homebrew-isekai-terminal`）のような
+配布インフラを新規に構築するほどの利用規模ではまだ無いと判断し、本タスクでは以下の
+軽量な配布に留める:
+
+- GitHub Release（`cuzic/isekai-terminal`）に`isekai-ssh-v<version>`のような形で
+  x86_64/aarch64両musl静的バイナリと`.sha256`ファイルを添付する。
+- ユーザーは該当アーキテクチャのバイナリを手動ダウンロード→sha256照合→`chmod +x`→
+  `$PATH`の通ったディレクトリ（例: `~/.local/bin/`）に配置→`~/.ssh/config`に
+  `ProxyCommand`として設定する、という手順を踏む（Homebrew Formula等の追加の抽象化層は導入しない）。
+- 配布アセットのsha256は**アップロード後に実際のアセットから再計算した値**を使うこと
+  （Phase 7-6で判明した「ビルド直後に記録した値の使い回しは危険（workspace内の別クレート再
+  ビルドの影響で非決定的に再リンクされることがある）」という教訓をここでも踏襲する）。
+- Homebrew tap等のパッケージマネージャー経由配布は、利用者数が増え「バージョン管理・
+  アップデート通知」のニーズが顕在化した時点で改めて検討する（現時点で先回りして構築しない）。
+
+**実機ネットワーク検証**: このサンドボックス環境（単一マシン、実ネットワークデバイス無し）では
+実行不可能なため、`PLAN.md`側に別途記録した（「実機・実relay検証が未実施」の項も参照）。
+
 ## オープンな課題（2026-07-04 改訂）
 
 ### Phase 10の実装・外部レビューにより解決済みになった項目（記録として残す）
@@ -866,8 +914,12 @@ CLI専用ユーザー向けに **Device Authorization Flow**（`isekai-ssh login
 - **リフレッシュトークンの保存場所**: OSのkeychain/Secret Service優先、フォールバックとして
   `0600` ファイルストアという方針までは決まったが、各OS（Linux/macOS/将来のWindows）でのkeychain
   連携ライブラリの選定は未着手。
-- **実機・実relay検証が未実施**: STUNの実hole punching・実 `seera-networks` relay相手の疎通確認は
-  Phase 10-5同様、S-7まで持ち越し（モックrelayでの検証のみ完了）。
+- **実機・実relay検証が未実施**: STUNの実hole punching・実 `seera-networks` relay相手の疎通確認、
+  および複数ネットワーク環境（宅内Wi-Fi NAT配下ホスト・モバイル回線クライアント）をまたいだ
+  実機ローミング確認は引き続き未実施（モックrelayでのプロトコルレベル検証・単一サンドボックス
+  環境でのmuslビルド実行確認のみ完了、S-7実施結果・`PLAN.md`参照）。Phase 10-5と同じ理由
+  （実ネットワークデバイスを持つ実機がこのセッションで利用できない）で、次回実機が用意できる
+  環境でのフォローアップが必要。
 - **配布対象プラットフォーム**: 当面はLinux（x86_64/aarch64、musl静的バイナリ）を優先し、
   macOS/Windows対応の要否・時期は未検討。
 - **`init` の `BatchMode` 方針**: `connect` はfail closed前提で常に`BatchMode=yes`（非対話）とするが、
