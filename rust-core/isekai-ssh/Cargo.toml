@@ -1,0 +1,52 @@
+[package]
+name = "isekai-ssh"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Single static-binary ssh(1) ProxyCommand wrapper reusing isekai-terminal's isekai-helper QUIC connection resilience (ISEKAI_SSH_DESIGN.md)."
+
+[[bin]]
+name = "isekai-ssh"
+path = "src/main.rs"
+
+[features]
+# Opt-in, dev/test-only bypass for the (not-yet-implemented, see S-2) trust
+# store lookup that would normally tell `connect` where to reach the target
+# isekai-helper instance and what its session credentials are
+# (`ISEKAI_SSH_DESIGN.md` フェーズ分割案 S-1). Deliberately *not* a default
+# feature: a plain `cargo build --release -p isekai-ssh` (no explicit
+# `--features`) must never enable it, and `main.rs` additionally asserts via
+# `compile_error!` that it can never be combined with a release profile even
+# if a caller passes `--release --features dev-insecure` explicitly.
+dev-insecure = []
+
+[dependencies]
+isekai-transport = { path = "../isekai-transport" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "signal"] }
+log = "0.4"
+env_logger = "0.11"
+base64 = "0.22"
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+isekai-protocol = { path = "../isekai-protocol" }
+russh = "0.48"
+russh-keys = "0.48"
+async-trait = "0.1.89"
+tempfile = "3"
+
+# `connect_e2e.rs` needs `--dev-insecure-*` flags to exist at all (this
+# phase, S-1, has no trust store yet — see `cli.rs`), so it can only compile
+# when the `dev-insecure` feature is enabled:
+#   cargo test -p isekai-ssh --features dev-insecure
+# `help_purity.rs` intentionally has no such requirement — it must pass with
+# a completely default (no extra `--features`) invocation, since it verifies
+# the exact opposite property (a plain release build shows no dev flags).
+[[test]]
+name = "connect_e2e"
+required-features = ["dev-insecure"]
+
+[[test]]
+name = "help_purity"

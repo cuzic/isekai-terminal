@@ -1411,6 +1411,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "isekai-ssh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "clap",
+ "env_logger",
+ "isekai-protocol",
+ "isekai-transport",
+ "log",
+ "russh",
+ "russh-keys",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "isekai-stun"
 version = "0.1.0"
 dependencies = [
