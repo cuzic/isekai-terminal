@@ -1551,13 +1551,59 @@ Web検索で実在・現状Needs Triageであることを確認済み——Phase
    (ViewModel4件・ProfileEditScreen3件)を追加。
 2. Remote/Dynamic port forward（plain SSH限定、LocalForwardRunner/RemoteForwardRunner/
    DynamicSocksForwardRunnerに責務分離、クライアント側は非ループバックbindを既定拒否）
-3. QUIC系トランスポートでのagent forwarding対応は設計のみ固めて実装は後回し
-   （isekai-helper protocolへのAgentForward stream type追加が前提、relay/MASQUE系は
-   既定OFF・当面対象外、自作helper直結QUICのみ将来opt-in候補）
-4. msquic/channel-masque sidecar実験は今は着手しない（parking lot）。着手条件:
-   外部MASQUEサーバーとのinterop要件発生／noq・h3-noqで仕様上どうしても通せない／
-   商用relay提供者がmsquic前提、のいずれかが発生した時点で再検討。IPCはやるなら
-   まずUnix domain socket(共有メモリは時期尚早)。
+3. ✅ QUIC系トランスポートでのagent forwarding対応は設計のみ固めて実装は後回し
+   （実装は着手しない。以下は将来着手する際の設計メモ）
+
+   **現状**: agent forwardingは`rust-core/src/agent_forward.rs`にrusshのchannelベースで
+   自前実装した最小サブセット(`REQUEST_IDENTITIES`/`SIGN_REQUEST`のみ)で、plain TCP SSH
+   トランスポート(`run_russh_transport`)のみが対応。5種類のQUIC系トランスポート
+   (自作ヘルパーQUIC・マルチパス・STUN P2P・MASQUE relay・tsshd QUIC)は全てConfig構造体
+   自体に`agent_forward`フィールドが無く、常に無効(Phase 11 P0-4 委譲メソッド追加時に
+   確認済み)。
+
+   **拡張ポイント**: `HELPER_PROTOCOL.md`にはPhase 7時点で「1 QUIC connectionにつき
+   data stream 1本のみ、それ以外のstreamは将来のポートフォワード拡張用に予約」という
+   記述があり、Phase 8でこれを実際に「data stream + control stream」の2本構成へ拡張した
+   前例がある。agent forwardingもこの前例に倣い、新しい**agent forward stream**を
+   isekai-helperプロトコルに追加し、`max_concurrent_bidi_streams`をさらに1つ増やす形で
+   拡張するのが自然。ワイヤーフォーマットは`agent_forward.rs`の既存の最小サブセット
+   (`REQUEST_IDENTITIES`/`SIGN_REQUEST`)をそのままこのstream用に再利用できる見込み
+   (russh固有のchannel機構ではなく、isekai-helperの独自フレーミングに載せ替えるだけ)。
+
+   **セキュリティ方針**: agent forwardingは秘密鍵そのものは送らないが、リモート側に
+   「署名オラクル」を渡す機能である点は既存のplain SSH実装でも変わらない。既定OFF・
+   プロファイル単位opt-inという既存方針を維持しつつ、経路ごとに差をつける:
+   - 自作ヘルパーQUIC(直結、relayを介さない): 将来的にopt-in拡張候補。
+   - STUN P2P / MASQUE relay: 第三者が運用するrelayサーバーが経路に常時介在する
+     (relay版)、またはNAT越え成立に依存する不安定な経路である(STUN版)ため、
+     署名オラクルを転送する対象としては既定OFF・当面対象外のままとする。将来的に
+     許可する場合も、通常より強い警告文言を必須にする。
+
+   **優先度**: 実装コスト(HELPER_PROTOCOL改版・5 Config構造体拡張・UniFFI再生成・
+   UI警告)に対して利用頻度が限定的と見込まれるため、当面は設計メモのみでよい。
+4. ✅ msquic/channel-masque sidecar実験は今は着手しない（parking lot、実装は行わない）
+
+   **現状で十分な理由**: 自前relay(`isekai-link-masque`)とのMASQUE通信は既にh3-noq
+   (noq上に自前実装したHTTP/3+MASQUE)で完結しており、外部のmsquic/channel-masqueベースの
+   relay実装と相互運用する必要が今のところ無い。実際、Phase 10のrelay版e2eテスト
+   （`isekai-link-masque/tests/relay_e2e.rs`）を書く際、本物の`bound-udp-server`
+   （msquic依存の`axum-masque`）のローカルビルドはcmake/quictls(OpenSSLフォーク)submodule
+   未チェックアウト等のネイティブビルド依存が深く、コスト対効果が見合わないと判断して
+   断念した経緯がある（上記「relay版のローカルe2eテスト」参照）。同じ理由が
+   msquic/channel-masque sidecarの新規実装にもそのまま当てはまる。
+
+   **方針**: noq単一スタック継続で合意済み(前回外部レビューでも一致)。msquic/channel-masque
+   が必要になっても同一プロセス共存は避け、必要になった時点でsidecarプロセスとして
+   隔離する方針自体は維持するが、具体的な実装(IPC設計・isekai-helperのbootstrap配布
+   フローとの共存)は着手条件が発生するまで行わない。
+
+   **着手条件**(いずれか発生時に再検討):
+   - 外部の(自作でない)MASQUEサーバー実装との相互運用要件が発生した
+   - noq/h3-noqでは仕様上どうしても実現できないMASQUE機能が必要になった
+   - 商用relay提供者・パートナーがmsquic前提の実装を要求してきた
+
+   **着手する場合のIPC方針**: まずUnix domain socketで隔離する(共有メモリはIPC設計が
+   固まった後の性能最適化段階の話であり、最初のsidecar境界には時期尚早)。
 
 判断が割れなかった点（両者一致）: noq単一スタック方針の継続は妥当、フォールバックなし設計自体は
 セキュリティ的に正しい、Room migration番号体系（線形バージョニング）自体は変えない。
