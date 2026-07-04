@@ -13,8 +13,8 @@
 # build-ios-xcframework.sh regenerates this; do not commit prebuilt binaries.
 /ios/Frameworks/
 # Xcode per-user state / SwiftPM local caches (not shared project config).
-/ios/*.xcodeproj/xcuserdata/
-/ios/*.xcodeproj/project.xcworkspace/xcuserdata/
+/ios/App/*.xcodeproj/xcuserdata/
+/ios/App/*.xcodeproj/project.xcworkspace/xcuserdata/
 /ios/.swiftpm/
 /ios/.build/
 

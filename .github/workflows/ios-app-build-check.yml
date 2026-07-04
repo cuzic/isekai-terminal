@@ -1,6 +1,6 @@
 name: iOS app build check
 
-# TsshTerminalApp(ios/TsshTerminalApp.xcodeproj、Phase 1A-1のXcodeアプリ雛形)が
+# TsshTerminalApp(ios/App/TsshTerminalApp.xcodeproj、Phase 1A-1のXcodeアプリ雛形)が
 # TsshCore SwiftPMパッケージ(rust-core経由でビルドしたXCFrameworkを含む)をリンクして
 # iOS Simulator向けにビルドできることを検証する(PLAN.md「Phase Y」節 Phase 1A参照)。
 # コード署名は行わない(シミュレータ向けビルドのみのため不要)。
@@ -72,7 +72,7 @@ jobs:
         run: bash rust-core/scripts/build-ios-xcframework.sh
 
       - name: Resolve Swift package dependencies
-        working-directory: ios
+        working-directory: ios/App
         run: xcodebuild -resolvePackageDependencies -project TsshTerminalApp.xcodeproj -scheme TsshTerminalApp
 
       - name: Pick an available iOS Simulator device
@@ -95,7 +95,7 @@ jobs:
           echo "picked simulator: $DEVICE_NAME"
 
       - name: Build TsshTerminalApp for iOS Simulator
-        working-directory: ios
+        working-directory: ios/App
         run: |
           xcodebuild -list -project TsshTerminalApp.xcodeproj
           xcodebuild build-for-testing \
