@@ -118,6 +118,12 @@ data class ConnectionProfile(
     // "tssh_ui")に従う。タブを開いた時点でのみ解決され、タブ内で個別に上書きもできる
     // (Global default → Profile default → Tab/session override、TerminalTabsViewModel参照)。
     @ColumnInfo(name = "theme_name") val themeName: String? = null,
+    // 自作ヘルパーQUICの待受ポートを固定する(既定null=これまで通りOSがエフェメラル
+    // ポートを選ぶ)。direct_addressへの直接到達(Phase 7-5/9-2実機検証で判明)は
+    // ファイアウォールがそのポートを許可している必要があるため、単一の固定ポートに
+    // しておけば運用側はそのポートだけ開ければよくなる。Rust側(HelperQuicConfig)への
+    // 配線は別途対応(現時点ではプロファイルへの保存のみ)。
+    @ColumnInfo(name = "helper_bind_port") val helperBindPort: Int? = null,
 ) : Parcelable {
     val transportPreference: TransportPreference
         get() = try {

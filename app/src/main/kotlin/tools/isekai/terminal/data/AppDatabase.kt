@@ -10,7 +10,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [KnownHost::class, ConnectionProfile::class, KeyEntry::class, Snippet::class],
-    version = 16,
+    version = 17,
     exportSchema = false,
 )
 @TypeConverters(PortForwardListConverter::class)
@@ -187,6 +187,16 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        // 自作ヘルパーQUICの待受ポートをユーザーがプロファイル単位で固定できるようにする
+        // (未指定ならこれまで通りOSが選ぶエフェメラルポート)。ファイアウォール越しの
+        // direct_address到達性のために単一ポートだけ開ければよいようにするための設定
+        // (PLAN.md Phase 7-5/9-2参照)。Rust側への配線は別途対応。
+        internal val MIGRATION_16_17 = object : Migration(16, 17) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE connection_profiles ADD COLUMN helper_bind_port INTEGER")
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase =
             instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -197,7 +207,7 @@ abstract class AppDatabase : RoomDatabase() {
                 .addMigrations(
                     MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7,
                     MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12,
-                    MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16,
+                    MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
                 )
                 .build().also { instance = it }
             }
