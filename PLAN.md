@@ -1477,8 +1477,14 @@ Web検索で実在・現状Needs Triageであることを確認済み——Phase
    する唯一の方式）／Strict Isekai Link（実験的・フォールバックなし）（自作ヘルパーQUIC・
    マルチパス・STUN P2P・relay P2Pの4方式、すべて明示的にフォールバック無し）。
    各グループの直下にポリシーレベルのキャプションを追加し、個別方式の詳細キャプションは維持。
-3. noq #738により物理マルチパスがunavailableであることをUI/docs/testsに反映
-   （「Multipath」ではなく「Fast Rebind / Resume」寄りの機能名にする案）
+3. ✅ noq #738により物理マルチパスがunavailableであることをUI/docs/testsに反映
+   → 調査の結果、影響範囲は「自作ヘルパー QUIC（マルチパス）」チップ全体
+   （Tailscale⇔直接アドレスのpath0/path1、`open_path(local_ip=None)`）ではなく、
+   その内側の「Wi-Fi/セルラー物理無線も同時に使う」チェックボックス（Phase 9-4、
+   `open_path(local_ip=Some(..))`）だけが noq #738 の対象と判明したため、後者のみ
+   ラベルを「（現在利用不可）」に変更しキャプションを状態/原因/フォールバック先を
+   明示する形に書き換えた（`ProfileEditScreen.kt`）。チップ自体の改名は不要と判断
+   （path0/path1のTailscale⇔直接アドレス切替は#738の対象外で実際に動作するため）。
 4. 非ループバックport forward bindをRust側（`SshConfig`に`allow_non_loopback_forward_bind: bool`
    のような明示許可フラグ）でも制御できるようにする（現状Kotlin UI警告のみでコア側allowlistなし）
 5. Room migration番号の並行worktree衝突（この24hで3件のfixupコミット発生）に対し、

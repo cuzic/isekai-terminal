@@ -505,13 +505,16 @@ fun ProfileEditScreen(
                     checked = enablePhysicalMultipath,
                     onCheckedChange = { enablePhysicalMultipath = it },
                 )
-                Text("Wi-Fi/セルラー物理無線も同時に使う（実験的）")
+                Text("Wi-Fi/セルラー物理無線への同時マルチパス（現在利用不可）")
             }
             Text(
-                text = "Wi-Fiとセルラーの両方の無線を同時に使い、片方が不安定でも即座に" +
-                    "もう片方へ切り替えます。Tailscale使用中はこの機能は効果がありません" +
-                    "（OSの制約でTailscale稼働中は物理無線への明示的なバインドができないため、" +
-                    "自動的に上の直接到達アドレスのみのマルチパスにフォールバックします）。",
+                text = "状態: 現在利用不可。原因: noq側の既知バグ" +
+                    "（open_path()にlocal_ip明示指定した経路でPATH_RESPONSEが届かずvalidation " +
+                    "failedになる、noq issue #738、Needs Triage）。フォールバック: ONにしても" +
+                    "実際には物理無線への同時バインドは行われず、上の「直接到達アドレス」欄による" +
+                    "Tailscale⇔直接アドレスのマルチパスのみが有効なままです（日和見的フォールバック、" +
+                    "黙って無効化されるだけでエラーにはなりません）。noq側の修正が入り次第有効化予定です。" +
+                    "Tailscale使用中はさらにOSの制約で物理無線への明示的なバインドができません。",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
