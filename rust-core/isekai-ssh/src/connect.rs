@@ -186,28 +186,50 @@ fn dev_insecure_target(args: &ConnectArgs) -> Result<Option<RelayTarget>> {
 
 /// Runs the two independent copy tasks (`ISEKAI_SSH_DESIGN.md`: not
 /// `tokio::io::copy_bidirectional`, since stdin/stdout are two separate
-/// handles, not one duplex object) and returns once *either* direction
-/// finishes — aborting the other. A clean process exit at that point closes
-/// this process's stdout, which is how `ssh` (reading our stdout) learns the
-/// pass-through has ended; S-1 deliberately does not try to keep the pipe
-/// alive across a QUIC disconnect (that's resume, S-4).
+/// handles, not one duplex object). A clean EOF on one side does **not**
+/// abort the other: e.g. `ssh` closing its write end of our stdin (C2H EOF)
+/// is routine well before the server has said everything it's going to say,
+/// and prematurely cutting H2C off there would truncate output the user was
+/// still supposed to see. Both directions are allowed to run to their own
+/// completion; only a genuine error (or task panic) on either side aborts
+/// the other and returns early, since at that point continuing the survivor
+/// alone serves no purpose. Once both sides have finished, this process
+/// exits and closes its stdout, which is how `ssh` (reading our stdout)
+/// learns the pass-through has ended; S-1 deliberately does not try to keep
+/// the pipe alive across a QUIC disconnect (that's resume, S-4).
 async fn relay_stdio(stream: Box<dyn ByteStream>) -> Result<()> {
     let (quic_read, quic_write) = stream.split();
 
     let mut c2h = tokio::spawn(pump_stdin_to_quic(quic_write));
     let mut h2c = tokio::spawn(pump_quic_to_stdout(quic_read));
+    let (mut c2h_done, mut h2c_done) = (false, false);
 
-    tokio::select! {
-        res = &mut c2h => {
-            h2c.abort();
-            res.context("isekai-ssh: stdin->QUIC relay task panicked")??;
-        }
-        res = &mut h2c => {
-            c2h.abort();
-            res.context("isekai-ssh: QUIC->stdout relay task panicked")??;
+    while !c2h_done || !h2c_done {
+        tokio::select! {
+            res = &mut c2h, if !c2h_done => {
+                c2h_done = true;
+                if let Err(err) = join_result("isekai-ssh: stdin->QUIC relay task panicked", res) {
+                    h2c.abort();
+                    return Err(err);
+                }
+            }
+            res = &mut h2c, if !h2c_done => {
+                h2c_done = true;
+                if let Err(err) = join_result("isekai-ssh: QUIC->stdout relay task panicked", res) {
+                    c2h.abort();
+                    return Err(err);
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Flattens a `tokio::spawn` result (`Result<Result<()>, JoinError>`) into a
+/// single `Result<()>`, attaching `panic_ctx` if the task itself panicked
+/// rather than returning an error.
+fn join_result(panic_ctx: &str, res: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
+    res.map_err(|e| anyhow::Error::new(e).context(panic_ctx.to_string()))?
 }
 
 /// C2H direction: `ssh` (our stdin) -> isekai-helper (the QUIC stream's send
