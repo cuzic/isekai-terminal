@@ -1084,6 +1084,26 @@ uint64_t uniffi_tssh_core_fn_func_create_ssh_session(RustBuffer config, RustCall
 void uniffi_tssh_core_fn_func_set_terminal_theme(RustBuffer ansi16, uint32_t default_fg, uint32_t default_bg, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_TERMINAL_COMMIT_TEXT_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_TERMINAL_COMMIT_TEXT_BYTES
+RustBuffer uniffi_tssh_core_fn_func_terminal_commit_text_bytes(RustBuffer text, int8_t bracketed_paste_mode, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_TERMINAL_CTRL_BYTE
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_TERMINAL_CTRL_BYTE
+RustBuffer uniffi_tssh_core_fn_func_terminal_ctrl_byte(uint32_t code_point, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_TERMINAL_SPECIAL_KEY_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_TERMINAL_SPECIAL_KEY_BYTES
+RustBuffer uniffi_tssh_core_fn_func_terminal_special_key_bytes(RustBuffer key, int8_t application_cursor_mode, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_TERMINAL_UNICODE_CHAR_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_TERMINAL_UNICODE_CHAR_BYTES
+RustBuffer uniffi_tssh_core_fn_func_terminal_unicode_char_bytes(uint32_t unicode_char, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_DEBUG_CLEAR_UDP_FAULT
 #define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_DEBUG_CLEAR_UDP_FAULT
 void uniffi_tssh_core_fn_func_debug_clear_udp_fault(RustCallStatus *_Nonnull out_status
@@ -1423,6 +1443,30 @@ uint16_t uniffi_tssh_core_checksum_func_create_ssh_session(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_SET_TERMINAL_THEME
 #define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_SET_TERMINAL_THEME
 uint16_t uniffi_tssh_core_checksum_func_set_terminal_theme(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_TERMINAL_COMMIT_TEXT_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_TERMINAL_COMMIT_TEXT_BYTES
+uint16_t uniffi_tssh_core_checksum_func_terminal_commit_text_bytes(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_TERMINAL_CTRL_BYTE
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_TERMINAL_CTRL_BYTE
+uint16_t uniffi_tssh_core_checksum_func_terminal_ctrl_byte(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_TERMINAL_SPECIAL_KEY_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_TERMINAL_SPECIAL_KEY_BYTES
+uint16_t uniffi_tssh_core_checksum_func_terminal_special_key_bytes(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_TERMINAL_UNICODE_CHAR_BYTES
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_TERMINAL_UNICODE_CHAR_BYTES
+uint16_t uniffi_tssh_core_checksum_func_terminal_unicode_char_bytes(void
     
 );
 #endif

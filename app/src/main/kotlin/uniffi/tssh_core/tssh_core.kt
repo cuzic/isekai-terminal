@@ -31,6 +31,13 @@ import java.nio.charset.CodingErrorAction
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 // This is a helper for safely working with byte buffers returned from the Rust code.
 // A rust-owned buffer is represented by its capacity, its current length, and a
@@ -613,6 +620,12 @@ internal open class UniffiForeignFutureResultVoid(
 internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
     fun callback(`callbackData`: Long,`result`: UniffiForeignFutureResultVoid.UniffiByValue,)
 }
+internal interface UniffiCallbackInterfaceDiagnosticCallbackMethod0 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`message`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceEventWakeListenerMethod0 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
@@ -675,6 +688,44 @@ internal interface UniffiCallbackInterfaceSessionCallbackMethod10 : com.sun.jna.
 }
 internal interface UniffiCallbackInterfaceSessionCallbackMethod11 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`keyFingerprint`: RustBuffer.ByValue,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,)
+}
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onDiagnosticEvent")
+internal open class UniffiVTableCallbackInterfaceDiagnosticCallback(
+    @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+    @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
+    @JvmField internal var `onDiagnosticEvent`: UniffiCallbackInterfaceDiagnosticCallbackMethod0? = null,
+) : Structure() {
+    class UniffiByValue(
+        `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+        `uniffiClone`: UniffiCallbackInterfaceClone? = null,
+        `onDiagnosticEvent`: UniffiCallbackInterfaceDiagnosticCallbackMethod0? = null,
+    ): UniffiVTableCallbackInterfaceDiagnosticCallback(`uniffiFree`,`uniffiClone`,`onDiagnosticEvent`,), Structure.ByValue
+
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceDiagnosticCallback) {
+        `uniffiFree` = other.`uniffiFree`
+        `uniffiClone` = other.`uniffiClone`
+        `onDiagnosticEvent` = other.`onDiagnosticEvent`
+    }
+
+}
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "eventsAvailable")
+internal open class UniffiVTableCallbackInterfaceEventWakeListener(
+    @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+    @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
+    @JvmField internal var `eventsAvailable`: UniffiCallbackInterfaceEventWakeListenerMethod0? = null,
+) : Structure() {
+    class UniffiByValue(
+        `uniffiFree`: UniffiCallbackInterfaceFree? = null,
+        `uniffiClone`: UniffiCallbackInterfaceClone? = null,
+        `eventsAvailable`: UniffiCallbackInterfaceEventWakeListenerMethod0? = null,
+    ): UniffiVTableCallbackInterfaceEventWakeListener(`uniffiFree`,`uniffiClone`,`eventsAvailable`,), Structure.ByValue
+
+   internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceEventWakeListener) {
+        `uniffiFree` = other.`uniffiFree`
+        `uniffiClone` = other.`uniffiClone`
+        `eventsAvailable` = other.`eventsAvailable`
+    }
+
 }
 @Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest")
 internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
@@ -794,9 +845,21 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckContractApiVersion(this)
         uniffiCheckApiChecksums(this)
     }
-    external fun uniffi_tssh_core_checksum_func_create_ssh_session(
+    external fun uniffi_tssh_core_checksum_func_core_ping(
+): Int
+external fun uniffi_tssh_core_checksum_func_core_version(
+): Int
+external fun uniffi_tssh_core_checksum_func_create_ssh_session(
 ): Int
 external fun uniffi_tssh_core_checksum_func_set_terminal_theme(
+): Int
+external fun uniffi_tssh_core_checksum_func_terminal_commit_text_bytes(
+): Int
+external fun uniffi_tssh_core_checksum_func_terminal_ctrl_byte(
+): Int
+external fun uniffi_tssh_core_checksum_func_terminal_special_key_bytes(
+): Int
+external fun uniffi_tssh_core_checksum_func_terminal_unicode_char_bytes(
 ): Int
 external fun uniffi_tssh_core_checksum_func_debug_clear_udp_fault(
 ): Int
@@ -819,6 +882,20 @@ external fun uniffi_tssh_core_checksum_func_create_multipath_helper_quic_session
 external fun uniffi_tssh_core_checksum_func_create_session_orchestrator(
 ): Int
 external fun uniffi_tssh_core_checksum_func_create_quic_session(
+): Int
+external fun uniffi_tssh_core_checksum_method_diagnosticeventqueue_drain_events(
+): Int
+external fun uniffi_tssh_core_checksum_method_diagnosticeventqueue_push(
+): Int
+external fun uniffi_tssh_core_checksum_method_diagnosticeventqueue_set_wake_listener(
+): Int
+external fun uniffi_tssh_core_checksum_method_diagnosticframemailbox_publish(
+): Int
+external fun uniffi_tssh_core_checksum_method_diagnosticframemailbox_set_wake_listener(
+): Int
+external fun uniffi_tssh_core_checksum_method_diagnosticframemailbox_take_latest(
+): Int
+external fun uniffi_tssh_core_checksum_method_diagnostichandle_fire_callback(
 ): Int
 external fun uniffi_tssh_core_checksum_method_sshsession_connect(
 ): Int
@@ -992,6 +1069,16 @@ external fun uniffi_tssh_core_checksum_method_quicsession_trzsz_cancel(
 ): Int
 external fun uniffi_tssh_core_checksum_method_quicsession_trzsz_send_chunk(
 ): Int
+external fun uniffi_tssh_core_checksum_constructor_diagnosticeventqueue_new(
+): Int
+external fun uniffi_tssh_core_checksum_constructor_diagnosticframemailbox_new(
+): Int
+external fun uniffi_tssh_core_checksum_constructor_diagnostichandle_new(
+): Int
+external fun uniffi_tssh_core_checksum_method_diagnosticcallback_on_diagnostic_event(
+): Int
+external fun uniffi_tssh_core_checksum_method_eventwakelistener_events_available(
+): Int
 external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_connection_state_changed(
 ): Int
 external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_screen_update(
@@ -1050,11 +1137,45 @@ internal object UniffiLib {
 
     init {
         Native.register(UniffiLib::class.java, findLibraryName(componentName = "tssh_core"))
+        uniffiCallbackInterfaceDiagnosticCallback.register(this)
+        uniffiCallbackInterfaceEventWakeListener.register(this)
         uniffiCallbackInterfaceOrchestratorCallback.register(this)
         uniffiCallbackInterfaceSessionCallback.register(this)
         
     }
-    external fun uniffi_tssh_core_fn_clone_sshsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_tssh_core_fn_clone_diagnosticeventqueue(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_tssh_core_fn_free_diagnosticeventqueue(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_constructor_diagnosticeventqueue_new(uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_tssh_core_fn_method_diagnosticeventqueue_drain_events(`ptr`: Long,`afterSequence`: Long,`maxCount`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_tssh_core_fn_method_diagnosticeventqueue_push(`ptr`: Long,`message`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_diagnosticeventqueue_set_wake_listener(`ptr`: Long,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_clone_diagnosticframemailbox(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_tssh_core_fn_free_diagnosticframemailbox(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_constructor_diagnosticframemailbox_new(uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_tssh_core_fn_method_diagnosticframemailbox_publish(`ptr`: Long,`frame`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_diagnosticframemailbox_set_wake_listener(`ptr`: Long,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_diagnosticframemailbox_take_latest(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_tssh_core_fn_clone_diagnostichandle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_tssh_core_fn_free_diagnostichandle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_constructor_diagnostichandle_new(uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_tssh_core_fn_method_diagnostichandle_fire_callback(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_clone_sshsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_tssh_core_fn_free_sshsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1254,14 +1375,30 @@ external fun uniffi_tssh_core_fn_method_quicsession_trzsz_cancel(`ptr`: Long,`tr
 ): Unit
 external fun uniffi_tssh_core_fn_method_quicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_tssh_core_fn_init_callback_vtable_diagnosticcallback(`vtable`: UniffiVTableCallbackInterfaceDiagnosticCallback,
+): Unit
+external fun uniffi_tssh_core_fn_init_callback_vtable_eventwakelistener(`vtable`: UniffiVTableCallbackInterfaceEventWakeListener,
+): Unit
 external fun uniffi_tssh_core_fn_init_callback_vtable_orchestratorcallback(`vtable`: UniffiVTableCallbackInterfaceOrchestratorCallback,
 ): Unit
 external fun uniffi_tssh_core_fn_init_callback_vtable_sessioncallback(`vtable`: UniffiVTableCallbackInterfaceSessionCallback,
 ): Unit
+external fun uniffi_tssh_core_fn_func_core_ping(
+): Long
+external fun uniffi_tssh_core_fn_func_core_version(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_tssh_core_fn_func_create_ssh_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_tssh_core_fn_func_set_terminal_theme(`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_tssh_core_fn_func_terminal_commit_text_bytes(`text`: RustBuffer.ByValue,`bracketedPasteMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_tssh_core_fn_func_terminal_ctrl_byte(`codePoint`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_tssh_core_fn_func_terminal_special_key_bytes(`key`: RustBuffer.ByValue,`applicationCursorMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_tssh_core_fn_func_terminal_unicode_char_bytes(`unicodeChar`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_tssh_core_fn_func_debug_clear_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_func_debug_cut_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
@@ -1403,10 +1540,28 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_tssh_core_checksum_func_core_ping() != 65359) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_func_core_version() != 13464) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_tssh_core_checksum_func_create_ssh_session() != 24804) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_func_set_terminal_theme() != 45632) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_func_terminal_commit_text_bytes() != 17000) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_func_terminal_ctrl_byte() != 45904) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_func_terminal_special_key_bytes() != 21124) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_func_terminal_unicode_char_bytes() != 49608) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_func_debug_clear_udp_fault() != 23483) {
@@ -1440,6 +1595,27 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_func_create_quic_session() != 25547) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_diagnosticeventqueue_drain_events() != 34129) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_diagnosticeventqueue_push() != 50750) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_diagnosticeventqueue_set_wake_listener() != 51515) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_diagnosticframemailbox_publish() != 63094) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_diagnosticframemailbox_set_wake_listener() != 35625) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_diagnosticframemailbox_take_latest() != 44384) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_diagnostichandle_fire_callback() != 38746) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_sshsession_connect() != 26689) {
@@ -1700,6 +1876,21 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tssh_core_checksum_method_quicsession_trzsz_send_chunk() != 12522) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_tssh_core_checksum_constructor_diagnosticeventqueue_new() != 2755) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_constructor_diagnosticframemailbox_new() != 6452) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_constructor_diagnostichandle_new() != 540) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_diagnosticcallback_on_diagnostic_event() != 55189) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_eventwakelistener_events_available() != 26319) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_connection_state_changed() != 63751) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1776,6 +1967,46 @@ public fun uniffiEnsureInitialized() {
 }
 
 // Async support
+// Async return type handlers
+
+internal const val UNIFFI_RUST_FUTURE_POLL_READY = 0.toByte()
+internal const val UNIFFI_RUST_FUTURE_POLL_WAKE = 1.toByte()
+
+internal val uniffiContinuationHandleMap = UniffiHandleMap<CancellableContinuation<Byte>>()
+
+// FFI type for Rust future continuations
+internal object uniffiRustFutureContinuationCallbackImpl: UniffiRustFutureContinuationCallback {
+    override fun callback(data: Long, pollResult: Byte) {
+        uniffiContinuationHandleMap.remove(data).resume(pollResult)
+    }
+}
+
+internal suspend fun<T, F, E: kotlin.Exception> uniffiRustCallAsync(
+    rustFuture: Long,
+    pollFunc: (Long, UniffiRustFutureContinuationCallback, Long) -> Unit,
+    completeFunc: (Long, UniffiRustCallStatus) -> F,
+    freeFunc: (Long) -> Unit,
+    liftFunc: (F) -> T,
+    errorHandler: UniffiRustCallStatusErrorHandler<E>
+): T {
+    try {
+        do {
+            val pollResult = suspendCancellableCoroutine<Byte> { continuation ->
+                pollFunc(
+                    rustFuture,
+                    uniffiRustFutureContinuationCallbackImpl,
+                    uniffiContinuationHandleMap.insert(continuation)
+                )
+            }
+        } while (pollResult != UNIFFI_RUST_FUTURE_POLL_READY);
+
+        return liftFunc(
+            uniffiRustCallWithError(errorHandler, { status -> completeFunc(rustFuture, status) })
+        )
+    } finally {
+        freeFunc(rustFuture)
+    }
+}
 
 // Public interface members begin here.
 
@@ -1949,6 +2180,33 @@ private class JavaLangRefCleanable(
     val cleanable: java.lang.ref.Cleaner.Cleanable
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUByte: FfiConverter<UByte, Byte> {
+    override fun lift(value: Byte): UByte {
+        return value.toUByte()
+    }
+
+    fun lift(value: Int): UByte {
+        return value.toUByte()
+    }
+
+    override fun read(buf: ByteBuffer): UByte {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: UByte): Byte {
+        return value.toByte()
+    }
+
+    override fun allocationSize(value: UByte) = 1UL
+
+    override fun write(value: UByte, buf: ByteBuffer) {
+        buf.put(value.toByte())
+    }
 }
 
 /**
@@ -2143,6 +2401,903 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
     override fun write(value: ByteArray, buf: ByteBuffer) {
         buf.putInt(value.size)
         buf.put(value)
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * 診断用の最小EventQueue。`session_id`/`generation`は持たず`sequence`のみを
+ * 発行する（実運用でのSession単位のキューはPhase 1C側で設計する）。
+ */
+public interface DiagnosticEventQueueInterface {
+    
+    /**
+     * `after_sequence`より新しいイベントを`sequence`昇順で最大`max_count`件返す。
+     * キューからは取り出さず、返した範囲を先頭から削除する（一度読んだ分だけ捨てる）。
+     */
+    fun `drainEvents`(`afterSequence`: kotlin.ULong, `maxCount`: kotlin.UInt): List<DiagnosticEventEnvelope>
+    
+    /**
+     * イベントをキューへ追加し、登録済みならwake通知を送る。複数スレッドから
+     * 呼ばれてもキュー内の順序は`sequence`の発行順（Mutex経由の直列化）で決まる。
+     */
+    fun `push`(`message`: kotlin.String)
+    
+    /**
+     * Swift側の`CallbackIngress`をwake通知の宛先として登録する。
+     */
+    fun `setWakeListener`(`listener`: EventWakeListener)
+    
+    companion object
+}
+
+/**
+ * 診断用の最小EventQueue。`session_id`/`generation`は持たず`sequence`のみを
+ * 発行する（実運用でのSession単位のキューはPhase 1C側で設計する）。
+ */
+open class DiagnosticEventQueue: Disposable, AutoCloseable, DiagnosticEventQueueInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+    constructor() :
+        this(UniffiWithHandle, 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_constructor_diagnosticeventqueue_new(
+    
+        _status)
+}
+    )
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_tssh_core_fn_free_diagnosticeventqueue(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_tssh_core_fn_clone_diagnosticeventqueue(handle, status)
+        }
+    }
+
+    
+    /**
+     * `after_sequence`より新しいイベントを`sequence`昇順で最大`max_count`件返す。
+     * キューからは取り出さず、返した範囲を先頭から削除する（一度読んだ分だけ捨てる）。
+     */override fun `drainEvents`(`afterSequence`: kotlin.ULong, `maxCount`: kotlin.UInt): List<DiagnosticEventEnvelope> {
+            return FfiConverterSequenceTypeDiagnosticEventEnvelope.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_diagnosticeventqueue_drain_events(
+        it,
+        FfiConverterULong.lower(`afterSequence`),FfiConverterUInt.lower(`maxCount`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * イベントをキューへ追加し、登録済みならwake通知を送る。複数スレッドから
+     * 呼ばれてもキュー内の順序は`sequence`の発行順（Mutex経由の直列化）で決まる。
+     */override fun `push`(`message`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_diagnosticeventqueue_push(
+        it,
+        FfiConverterString.lower(`message`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Swift側の`CallbackIngress`をwake通知の宛先として登録する。
+     */override fun `setWakeListener`(`listener`: EventWakeListener)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_diagnosticeventqueue_set_wake_listener(
+        it,
+        FfiConverterTypeEventWakeListener.lower(`listener`),_status)
+}
+    }
+    
+    
+
+    
+
+    
+
+
+    
+    
+    /**
+     * @suppress
+     */
+    companion object
+    
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeDiagnosticEventQueue: FfiConverter<DiagnosticEventQueue, Long> {
+    override fun lower(value: DiagnosticEventQueue): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): DiagnosticEventQueue {
+        return DiagnosticEventQueue(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): DiagnosticEventQueue {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: DiagnosticEventQueue) = 8UL
+
+    override fun write(value: DiagnosticEventQueue, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * 診断用の最小frame配送ボックス。`DiagnosticEventQueue`と違い全件保持せず、
+ * 常に最新の1件だけを保持する（latest-wins）。`screen_generation`が現在保持
+ * しているものより古い、または同一世代内で`frame_sequence`が進んでいない
+ * frameは黙って破棄する（resize後に古い世代のframeが遅れて届いても
+ * 適用しないための仕組み）。
+ */
+public interface DiagnosticFrameMailboxInterface {
+    
+    /**
+     * frameを配送する。古い世代/古い連番のframeは黙って無視する。
+     * 新規に採用された場合のみwake通知を送る。
+     */
+    fun `publish`(`frame`: TerminalFrameBatch)
+    
+    fun `setWakeListener`(`listener`: EventWakeListener)
+    
+    /**
+     * 保持している最新frameを取り出す（取り出すと空になる。次の`publish`まで
+     * 同じframeを二重に取得することはない）。
+     */
+    fun `takeLatest`(): TerminalFrameBatch?
+    
+    companion object
+}
+
+/**
+ * 診断用の最小frame配送ボックス。`DiagnosticEventQueue`と違い全件保持せず、
+ * 常に最新の1件だけを保持する（latest-wins）。`screen_generation`が現在保持
+ * しているものより古い、または同一世代内で`frame_sequence`が進んでいない
+ * frameは黙って破棄する（resize後に古い世代のframeが遅れて届いても
+ * 適用しないための仕組み）。
+ */
+open class DiagnosticFrameMailbox: Disposable, AutoCloseable, DiagnosticFrameMailboxInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+    constructor() :
+        this(UniffiWithHandle, 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_constructor_diagnosticframemailbox_new(
+    
+        _status)
+}
+    )
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_tssh_core_fn_free_diagnosticframemailbox(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_tssh_core_fn_clone_diagnosticframemailbox(handle, status)
+        }
+    }
+
+    
+    /**
+     * frameを配送する。古い世代/古い連番のframeは黙って無視する。
+     * 新規に採用された場合のみwake通知を送る。
+     */override fun `publish`(`frame`: TerminalFrameBatch)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_diagnosticframemailbox_publish(
+        it,
+        FfiConverterTypeTerminalFrameBatch.lower(`frame`),_status)
+}
+    }
+    
+    
+
+    override fun `setWakeListener`(`listener`: EventWakeListener)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_diagnosticframemailbox_set_wake_listener(
+        it,
+        FfiConverterTypeEventWakeListener.lower(`listener`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * 保持している最新frameを取り出す（取り出すと空になる。次の`publish`まで
+     * 同じframeを二重に取得することはない）。
+     */override fun `takeLatest`(): TerminalFrameBatch? {
+            return FfiConverterOptionalTypeTerminalFrameBatch.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_diagnosticframemailbox_take_latest(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+
+    
+
+
+    
+    
+    /**
+     * @suppress
+     */
+    companion object
+    
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeDiagnosticFrameMailbox: FfiConverter<DiagnosticFrameMailbox, Long> {
+    override fun lower(value: DiagnosticFrameMailbox): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): DiagnosticFrameMailbox {
+        return DiagnosticFrameMailbox(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): DiagnosticFrameMailbox {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: DiagnosticFrameMailbox) = 8UL
+
+    override fun write(value: DiagnosticFrameMailbox, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * Phase 1A-1 の診断用 UniFFI Object。Swift 側での生成・明示的な破棄が
+ * 正しく動くことを確認する（セッション/接続の状態は一切持たない）。
+ */
+public interface DiagnosticHandleInterface {
+    
+    fun `fireCallback`(`callback`: DiagnosticCallback)
+    
+    companion object
+}
+
+/**
+ * Phase 1A-1 の診断用 UniFFI Object。Swift 側での生成・明示的な破棄が
+ * 正しく動くことを確認する（セッション/接続の状態は一切持たない）。
+ */
+open class DiagnosticHandle: Disposable, AutoCloseable, DiagnosticHandleInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+    constructor() :
+        this(UniffiWithHandle, 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_constructor_diagnostichandle_new(
+    
+        _status)
+}
+    )
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_tssh_core_fn_free_diagnostichandle(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_tssh_core_fn_clone_diagnostichandle(handle, status)
+        }
+    }
+
+    override fun `fireCallback`(`callback`: DiagnosticCallback)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_diagnostichandle_fire_callback(
+        it,
+        FfiConverterTypeDiagnosticCallback.lower(`callback`),_status)
+}
+    }
+    
+    
+
+    
+
+    
+
+
+    
+    
+    /**
+     * @suppress
+     */
+    companion object
+    
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeDiagnosticHandle: FfiConverter<DiagnosticHandle, Long> {
+    override fun lower(value: DiagnosticHandle): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): DiagnosticHandle {
+        return DiagnosticHandle(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): DiagnosticHandle {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: DiagnosticHandle) = 8UL
+
+    override fun write(value: DiagnosticHandle, buf: ByteBuffer) {
+        buf.putLong(lower(value))
     }
 }
 
@@ -5172,6 +6327,67 @@ public object FfiConverterTypeSshSession: FfiConverter<SshSession, Long> {
 
 
 
+/**
+ * 1文字分の表示属性。`start`/`length`は`text`のUTF-16コードユニットオフセット。
+ */
+data class AttributeRun (
+    var `start`: kotlin.UInt
+    , 
+    var `length`: kotlin.UInt
+    , 
+    var `fgArgb`: kotlin.UInt
+    , 
+    var `bgArgb`: kotlin.UInt
+    , 
+    var `bold`: kotlin.Boolean
+    , 
+    var `underline`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAttributeRun: FfiConverterRustBuffer<AttributeRun> {
+    override fun read(buf: ByteBuffer): AttributeRun {
+        return AttributeRun(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: AttributeRun) = (
+            FfiConverterUInt.allocationSize(value.`start`) +
+            FfiConverterUInt.allocationSize(value.`length`) +
+            FfiConverterUInt.allocationSize(value.`fgArgb`) +
+            FfiConverterUInt.allocationSize(value.`bgArgb`) +
+            FfiConverterBoolean.allocationSize(value.`bold`) +
+            FfiConverterBoolean.allocationSize(value.`underline`)
+    )
+
+    override fun write(value: AttributeRun, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`start`, buf)
+            FfiConverterUInt.write(value.`length`, buf)
+            FfiConverterUInt.write(value.`fgArgb`, buf)
+            FfiConverterUInt.write(value.`bgArgb`, buf)
+            FfiConverterBoolean.write(value.`bold`, buf)
+            FfiConverterBoolean.write(value.`underline`, buf)
+    }
+}
+
+
+
 data class CellData (
     var `ch`: kotlin.String
     , 
@@ -5215,6 +6431,91 @@ public object FfiConverterTypeCellData: FfiConverterRustBuffer<CellData> {
             FfiConverterUInt.write(value.`fg`, buf)
             FfiConverterUInt.write(value.`bg`, buf)
             FfiConverterBoolean.write(value.`bold`, buf)
+    }
+}
+
+
+
+data class CursorState (
+    var `row`: kotlin.UInt
+    , 
+    var `col`: kotlin.UInt
+    , 
+    var `visible`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCursorState: FfiConverterRustBuffer<CursorState> {
+    override fun read(buf: ByteBuffer): CursorState {
+        return CursorState(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: CursorState) = (
+            FfiConverterUInt.allocationSize(value.`row`) +
+            FfiConverterUInt.allocationSize(value.`col`) +
+            FfiConverterBoolean.allocationSize(value.`visible`)
+    )
+
+    override fun write(value: CursorState, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`row`, buf)
+            FfiConverterUInt.write(value.`col`, buf)
+            FfiConverterBoolean.write(value.`visible`, buf)
+    }
+}
+
+
+
+/**
+ * `DiagnosticEventQueue`から取り出す1件のイベント。`sequence`はキュー単位で
+ * 単調増加し、Swift側はこの値で「まだ処理していない最古のイベント」を判定する。
+ */
+data class DiagnosticEventEnvelope (
+    var `sequence`: kotlin.ULong
+    , 
+    var `message`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeDiagnosticEventEnvelope: FfiConverterRustBuffer<DiagnosticEventEnvelope> {
+    override fun read(buf: ByteBuffer): DiagnosticEventEnvelope {
+        return DiagnosticEventEnvelope(
+            FfiConverterULong.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: DiagnosticEventEnvelope) = (
+            FfiConverterULong.allocationSize(value.`sequence`) +
+            FfiConverterString.allocationSize(value.`message`)
+    )
+
+    override fun write(value: DiagnosticEventEnvelope, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`sequence`, buf)
+            FfiConverterString.write(value.`message`, buf)
     }
 }
 
@@ -5631,6 +6932,54 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
 
 
 
+/**
+ * ターミナル1行分。セルオブジェクトの配列ではなく、UTF-8テキストバッファ+
+ * セル幅配列+属性runにまとめることで、全角文字・結合文字・絵文字を
+ * 個別セルへ分解せずに扱える。
+ */
+data class PackedRow (
+    var `text`: kotlin.String
+    , 
+    var `cellWidths`: kotlin.ByteArray
+    , 
+    var `attributeRuns`: List<AttributeRun>
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePackedRow: FfiConverterRustBuffer<PackedRow> {
+    override fun read(buf: ByteBuffer): PackedRow {
+        return PackedRow(
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterSequenceTypeAttributeRun.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PackedRow) = (
+            FfiConverterString.allocationSize(value.`text`) +
+            FfiConverterByteArray.allocationSize(value.`cellWidths`) +
+            FfiConverterSequenceTypeAttributeRun.allocationSize(value.`attributeRuns`)
+    )
+
+    override fun write(value: PackedRow, buf: ByteBuffer) {
+            FfiConverterString.write(value.`text`, buf)
+            FfiConverterByteArray.write(value.`cellWidths`, buf)
+            FfiConverterSequenceTypeAttributeRun.write(value.`attributeRuns`, buf)
+    }
+}
+
+
+
 data class PortForward (
     var `forwardType`: ForwardType
     , 
@@ -5942,6 +7291,83 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterBoolean.write(value.`agentForward`, buf)
             FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
             FfiConverterBoolean.write(value.`allowNonLoopbackForwardBind`, buf)
+    }
+}
+
+
+
+/**
+ * UniFFI境界を渡す画面更新の単位。`screen_generation`はresize等で
+ * 不連続に変わる世代番号、`frame_sequence`は同一世代内で単調増加する連番。
+ */
+data class TerminalFrameBatch (
+    var `sessionId`: kotlin.String
+    , 
+    var `screenGeneration`: kotlin.ULong
+    , 
+    var `frameSequence`: kotlin.ULong
+    , 
+    var `rows`: List<PackedRow>
+    , 
+    var `dirtyTop`: kotlin.UInt
+    , 
+    var `dirtyBottom`: kotlin.UInt
+    , 
+    var `cursor`: CursorState
+    , 
+    var `title`: kotlin.String?
+    , 
+    var `bell`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTerminalFrameBatch: FfiConverterRustBuffer<TerminalFrameBatch> {
+    override fun read(buf: ByteBuffer): TerminalFrameBatch {
+        return TerminalFrameBatch(
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterSequenceTypePackedRow.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterTypeCursorState.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: TerminalFrameBatch) = (
+            FfiConverterString.allocationSize(value.`sessionId`) +
+            FfiConverterULong.allocationSize(value.`screenGeneration`) +
+            FfiConverterULong.allocationSize(value.`frameSequence`) +
+            FfiConverterSequenceTypePackedRow.allocationSize(value.`rows`) +
+            FfiConverterUInt.allocationSize(value.`dirtyTop`) +
+            FfiConverterUInt.allocationSize(value.`dirtyBottom`) +
+            FfiConverterTypeCursorState.allocationSize(value.`cursor`) +
+            FfiConverterOptionalString.allocationSize(value.`title`) +
+            FfiConverterBoolean.allocationSize(value.`bell`)
+    )
+
+    override fun write(value: TerminalFrameBatch, buf: ByteBuffer) {
+            FfiConverterString.write(value.`sessionId`, buf)
+            FfiConverterULong.write(value.`screenGeneration`, buf)
+            FfiConverterULong.write(value.`frameSequence`, buf)
+            FfiConverterSequenceTypePackedRow.write(value.`rows`, buf)
+            FfiConverterUInt.write(value.`dirtyTop`, buf)
+            FfiConverterUInt.write(value.`dirtyBottom`, buf)
+            FfiConverterTypeCursorState.write(value.`cursor`, buf)
+            FfiConverterOptionalString.write(value.`title`, buf)
+            FfiConverterBoolean.write(value.`bell`, buf)
     }
 }
 
@@ -6409,6 +7835,253 @@ public object FfiConverterTypeSshError : FfiConverterRustBuffer<SshException> {
 
 
 /**
+ * プラットフォーム非依存のターミナル特殊キー。F1〜F12と`ForwardDelete`はAndroid版
+ * には無かった機能で、この統合を機に追加された(iOS版`TerminalKeyMapper`由来)。
+ * `Delete`はAndroidの`KEYCODE_DEL`(実質バックスペース、0x7F)に対応し、iOS版の
+ * 前方削除キー(forward delete, `ESC[3~`)とは別物であることに注意。
+ */
+sealed class TerminalSpecialKey {
+    
+    object Enter : TerminalSpecialKey()
+    
+    
+    object Delete : TerminalSpecialKey()
+    
+    
+    object ForwardDelete : TerminalSpecialKey()
+    
+    
+    object Tab : TerminalSpecialKey()
+    
+    
+    object Escape : TerminalSpecialKey()
+    
+    
+    object ArrowUp : TerminalSpecialKey()
+    
+    
+    object ArrowDown : TerminalSpecialKey()
+    
+    
+    object ArrowLeft : TerminalSpecialKey()
+    
+    
+    object ArrowRight : TerminalSpecialKey()
+    
+    
+    object PageUp : TerminalSpecialKey()
+    
+    
+    object PageDown : TerminalSpecialKey()
+    
+    
+    object Home : TerminalSpecialKey()
+    
+    
+    object End : TerminalSpecialKey()
+    
+    
+    data class FunctionKey(
+        val `number`: kotlin.UByte) : TerminalSpecialKey()
+        
+    {
+        
+
+        companion object
+    }
+    
+
+    
+
+    
+    
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTerminalSpecialKey : FfiConverterRustBuffer<TerminalSpecialKey>{
+    override fun read(buf: ByteBuffer): TerminalSpecialKey {
+        return when(buf.getInt()) {
+            1 -> TerminalSpecialKey.Enter
+            2 -> TerminalSpecialKey.Delete
+            3 -> TerminalSpecialKey.ForwardDelete
+            4 -> TerminalSpecialKey.Tab
+            5 -> TerminalSpecialKey.Escape
+            6 -> TerminalSpecialKey.ArrowUp
+            7 -> TerminalSpecialKey.ArrowDown
+            8 -> TerminalSpecialKey.ArrowLeft
+            9 -> TerminalSpecialKey.ArrowRight
+            10 -> TerminalSpecialKey.PageUp
+            11 -> TerminalSpecialKey.PageDown
+            12 -> TerminalSpecialKey.Home
+            13 -> TerminalSpecialKey.End
+            14 -> TerminalSpecialKey.FunctionKey(
+                FfiConverterUByte.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: TerminalSpecialKey) = when(value) {
+        is TerminalSpecialKey.Enter -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.Delete -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.ForwardDelete -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.Tab -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.Escape -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.ArrowUp -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.ArrowDown -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.ArrowLeft -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.ArrowRight -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.PageUp -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.PageDown -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.Home -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.End -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is TerminalSpecialKey.FunctionKey -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterUByte.allocationSize(value.`number`)
+            )
+        }
+    }
+
+    override fun write(value: TerminalSpecialKey, buf: ByteBuffer) {
+        when(value) {
+            is TerminalSpecialKey.Enter -> {
+                buf.putInt(1)
+                Unit
+            }
+            is TerminalSpecialKey.Delete -> {
+                buf.putInt(2)
+                Unit
+            }
+            is TerminalSpecialKey.ForwardDelete -> {
+                buf.putInt(3)
+                Unit
+            }
+            is TerminalSpecialKey.Tab -> {
+                buf.putInt(4)
+                Unit
+            }
+            is TerminalSpecialKey.Escape -> {
+                buf.putInt(5)
+                Unit
+            }
+            is TerminalSpecialKey.ArrowUp -> {
+                buf.putInt(6)
+                Unit
+            }
+            is TerminalSpecialKey.ArrowDown -> {
+                buf.putInt(7)
+                Unit
+            }
+            is TerminalSpecialKey.ArrowLeft -> {
+                buf.putInt(8)
+                Unit
+            }
+            is TerminalSpecialKey.ArrowRight -> {
+                buf.putInt(9)
+                Unit
+            }
+            is TerminalSpecialKey.PageUp -> {
+                buf.putInt(10)
+                Unit
+            }
+            is TerminalSpecialKey.PageDown -> {
+                buf.putInt(11)
+                Unit
+            }
+            is TerminalSpecialKey.Home -> {
+                buf.putInt(12)
+                Unit
+            }
+            is TerminalSpecialKey.End -> {
+                buf.putInt(13)
+                Unit
+            }
+            is TerminalSpecialKey.FunctionKey -> {
+                buf.putInt(14)
+                FfiConverterUByte.write(value.`number`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
  * Phase 7-4: プロファイルが選択するトランスポート戦略。実際のディスパッチは
  * Kotlin 側でこの値に応じて `SessionOrchestrator::connect` /
  * `connect_quic`（tsshd） / `connect_helper_quic` / `connect_helper_quic_auto`
@@ -6637,6 +8310,133 @@ public object FfiConverterTypeTrzszPublicState : FfiConverterRustBuffer<TrzszPub
 }
 
 
+
+
+
+
+
+/**
+ * Phase 1A-1 の診断用 callback interface。UniFFI の `callback_interface` が
+ * Swift 側で `protocol` として実装でき、実際に呼び出せることを確認する。
+ */
+public interface DiagnosticCallback {
+    
+    fun `onDiagnosticEvent`(`message`: kotlin.String)
+    
+    companion object
+}
+
+
+
+// Put the implementation in an object so we don't pollute the top-level namespace
+internal object uniffiCallbackInterfaceDiagnosticCallback {
+    internal object `onDiagnosticEvent`: UniffiCallbackInterfaceDiagnosticCallbackMethod0 {
+        override fun callback(`uniffiHandle`: Long,`message`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeDiagnosticCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onDiagnosticEvent`(
+                    FfiConverterString.lift(`message`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
+        override fun callback(handle: Long) {
+            FfiConverterTypeDiagnosticCallback.handleMap.remove(handle)
+        }
+    }
+
+    internal object uniffiClone: UniffiCallbackInterfaceClone {
+        override fun callback(handle: Long): Long {
+            return FfiConverterTypeDiagnosticCallback.handleMap.clone(handle)
+        }
+    }
+
+    internal var vtable = UniffiVTableCallbackInterfaceDiagnosticCallback.UniffiByValue(
+        uniffiFree,
+        uniffiClone,
+        `onDiagnosticEvent`,
+    )
+
+    // Registers the foreign callback with the Rust side.
+    // This method is generated for each callback interface.
+    internal fun register(lib: UniffiLib) {
+        lib.uniffi_tssh_core_fn_init_callback_vtable_diagnosticcallback(vtable)
+    }
+}
+
+/**
+ * The ffiConverter which transforms the Callbacks in to handles to pass to Rust.
+ *
+ * @suppress
+ */
+public object FfiConverterTypeDiagnosticCallback: FfiConverterCallbackInterface<DiagnosticCallback>()
+
+
+
+
+
+/**
+ * イベントが追加されたことをSwiftへ知らせるためだけのcallback。
+ * 高頻度データ本体はここに載せず、「取りに来てよい」という合図のみを送る。
+ */
+public interface EventWakeListener {
+    
+    fun `eventsAvailable`()
+    
+    companion object
+}
+
+
+
+// Put the implementation in an object so we don't pollute the top-level namespace
+internal object uniffiCallbackInterfaceEventWakeListener {
+    internal object `eventsAvailable`: UniffiCallbackInterfaceEventWakeListenerMethod0 {
+        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeEventWakeListener.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`eventsAvailable`(
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+
+    internal object uniffiFree: UniffiCallbackInterfaceFree {
+        override fun callback(handle: Long) {
+            FfiConverterTypeEventWakeListener.handleMap.remove(handle)
+        }
+    }
+
+    internal object uniffiClone: UniffiCallbackInterfaceClone {
+        override fun callback(handle: Long): Long {
+            return FfiConverterTypeEventWakeListener.handleMap.clone(handle)
+        }
+    }
+
+    internal var vtable = UniffiVTableCallbackInterfaceEventWakeListener.UniffiByValue(
+        uniffiFree,
+        uniffiClone,
+        `eventsAvailable`,
+    )
+
+    // Registers the foreign callback with the Rust side.
+    // This method is generated for each callback interface.
+    internal fun register(lib: UniffiLib) {
+        lib.uniffi_tssh_core_fn_init_callback_vtable_eventwakelistener(vtable)
+    }
+}
+
+/**
+ * The ffiConverter which transforms the Callbacks in to handles to pass to Rust.
+ *
+ * @suppress
+ */
+public object FfiConverterTypeEventWakeListener: FfiConverterCallbackInterface<EventWakeListener>()
 
 
 
@@ -7074,6 +8874,38 @@ public object FfiConverterTypeSessionCallback: FfiConverterCallbackInterface<Ses
 /**
  * @suppress
  */
+public object FfiConverterOptionalUByte: FfiConverterRustBuffer<kotlin.UByte?> {
+    override fun read(buf: ByteBuffer): kotlin.UByte? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUByte.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UByte?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUByte.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UByte?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUByte.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalInt: FfiConverterRustBuffer<kotlin.Int?> {
     override fun read(buf: ByteBuffer): kotlin.Int? {
         if (buf.get().toInt() == 0) {
@@ -7170,6 +9002,38 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
 /**
  * @suppress
  */
+public object FfiConverterOptionalByteArray: FfiConverterRustBuffer<kotlin.ByteArray?> {
+    override fun read(buf: ByteBuffer): kotlin.ByteArray? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterByteArray.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.ByteArray?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterByteArray.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.ByteArray?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterByteArray.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeJumpConfig: FfiConverterRustBuffer<JumpConfig?> {
     override fun read(buf: ByteBuffer): JumpConfig? {
         if (buf.get().toInt() == 0) {
@@ -7192,6 +9056,38 @@ public object FfiConverterOptionalTypeJumpConfig: FfiConverterRustBuffer<JumpCon
         } else {
             buf.put(1)
             FfiConverterTypeJumpConfig.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeTerminalFrameBatch: FfiConverterRustBuffer<TerminalFrameBatch?> {
+    override fun read(buf: ByteBuffer): TerminalFrameBatch? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeTerminalFrameBatch.read(buf)
+    }
+
+    override fun allocationSize(value: TerminalFrameBatch?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeTerminalFrameBatch.allocationSize(value)
+        }
+    }
+
+    override fun write(value: TerminalFrameBatch?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeTerminalFrameBatch.write(value, buf)
         }
     }
 }
@@ -7230,6 +9126,34 @@ public object FfiConverterSequenceUInt: FfiConverterRustBuffer<List<kotlin.UInt>
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeAttributeRun: FfiConverterRustBuffer<List<AttributeRun>> {
+    override fun read(buf: ByteBuffer): List<AttributeRun> {
+        val len = buf.getInt()
+        return List<AttributeRun>(len) {
+            FfiConverterTypeAttributeRun.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<AttributeRun>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeAttributeRun.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<AttributeRun>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeAttributeRun.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeCellData: FfiConverterRustBuffer<List<CellData>> {
     override fun read(buf: ByteBuffer): List<CellData> {
         val len = buf.getInt()
@@ -7248,6 +9172,62 @@ public object FfiConverterSequenceTypeCellData: FfiConverterRustBuffer<List<Cell
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeCellData.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeDiagnosticEventEnvelope: FfiConverterRustBuffer<List<DiagnosticEventEnvelope>> {
+    override fun read(buf: ByteBuffer): List<DiagnosticEventEnvelope> {
+        val len = buf.getInt()
+        return List<DiagnosticEventEnvelope>(len) {
+            FfiConverterTypeDiagnosticEventEnvelope.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<DiagnosticEventEnvelope>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeDiagnosticEventEnvelope.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<DiagnosticEventEnvelope>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeDiagnosticEventEnvelope.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypePackedRow: FfiConverterRustBuffer<List<PackedRow>> {
+    override fun read(buf: ByteBuffer): List<PackedRow> {
+        val len = buf.getInt()
+        return List<PackedRow>(len) {
+            FfiConverterTypePackedRow.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<PackedRow>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypePackedRow.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<PackedRow>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypePackedRow.write(it, buf)
         }
     }
 }
@@ -7278,7 +9258,50 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
             FfiConverterTypePortForward.write(it, buf)
         }
     }
-} fun `createSshSession`(`config`: SshConfig): SshSession {
+}
+
+
+
+
+
+
+
+
+        /**
+         * Rust の `async fn` が UniFFI 経由で Swift の `async`/`await` として呼べることを
+         * 確認するための診断用関数（Phase 1A-1、iOSアプリ雛形のround-trip検証）。
+         */
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+     suspend fun `corePing`() : kotlin.String {
+        return uniffiRustCallAsync(
+        UniffiLib.uniffi_tssh_core_fn_func_core_ping(),
+        { future, callback, continuation -> UniffiLib.ffi_tssh_core_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_tssh_core_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.ffi_tssh_core_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterString.lift(it) },
+        // Error FFI converter
+        UniffiNullRustCallStatusErrorHandler,
+    )
+    }
+
+        /**
+         * tssh-core の crate バージョン（`Cargo.toml` の `version`）を返す。
+         *
+         * iOS 対応 Phase 0 の技術検証スパイクで、UniFFI Swift バインディング経由の
+         * round-trip（Swift → Rust 呼び出し → 戻り値）を確認するための診断用関数
+         * （`PLAN.md` の「Phase Y」節参照）。
+         */ fun `coreVersion`(): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_func_core_version(
+    
+        _status)
+}
+    )
+    }
+    
+ fun `createSshSession`(`config`: SshConfig): SshSession {
             return FfiConverterTypeSshSession.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_tssh_core_fn_func_create_ssh_session(
@@ -7304,6 +9327,75 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
         FfiConverterSequenceUInt.lower(`ansi16`),FfiConverterUInt.lower(`defaultFg`),FfiConverterUInt.lower(`defaultBg`),_status)
 }
     
+    
+
+        /**
+         * IME確定テキスト／クリップボードペーストのテキスト→バイト列。改行正規化
+         * (`"\r\n"`/`"\n"` → `"\r"`)をここに集約する。複数コードポイントかつ
+         * `bracketed_paste_mode`が有効な場合のみ`ESC[200~`...`ESC[201~`で囲む
+         * (単一コードポイント、例えば絵文字1文字は囲まない)。
+         * (Android版`TerminalKeyEncoder.commitTextBytes()`のRust移植)
+         */ fun `terminalCommitTextBytes`(`text`: kotlin.String, `bracketedPasteMode`: kotlin.Boolean): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_func_terminal_commit_text_bytes(
+    
+        FfiConverterString.lower(`text`),FfiConverterBoolean.lower(`bracketedPasteMode`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * トグル式Ctrlキー用: 1コードポイント→Ctrl+<key>の制御コード。変換できない
+         * 入力(数字・日本語等)は`None`を返し、呼び出し側は変換せず元の入力をそのまま
+         * 送信する。
+         * - a-z / A-Z → 0x01-0x1A (Ctrl+A=0x01 ... Ctrl+Z=0x1A)
+         * - @ [ \ ] ^ _ (0x40-0x5F) → その5bit下位(Ctrl+@=0x00, Ctrl+[=ESC=0x1B等)
+         * - ? (0x3F) → 0x7F (DEL)
+         * - スペース(0x20) → 0x00 (NUL)
+         * (Android版`TerminalKeyEncoder.ctrlByte()`・iOS版`TerminalKeyMapper.controlByte()`を
+         * Rust側へ統合したSSOT実装)
+         */ fun `terminalCtrlByte`(`codePoint`: kotlin.UInt): kotlin.UByte? {
+            return FfiConverterOptionalUByte.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_func_terminal_ctrl_byte(
+    
+        FfiConverterUInt.lower(`codePoint`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * 特殊キーを、ターミナルへ送信するバイト列(ANSI/xtermエスケープシーケンス)に
+         * 変換する。矢印キーは`application_cursor_mode`が有効ならSS3形式(`ESC O A`等、
+         * DECCKM)、無効ならCSI形式(`ESC[A`等)を返す。F1〜F4はSS3形式、F5〜F12は
+         * CSI `~`形式(xterm互換)。未対応のfunction key番号は空配列を返す。
+         */ fun `terminalSpecialKeyBytes`(`key`: TerminalSpecialKey, `applicationCursorMode`: kotlin.Boolean): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_func_terminal_special_key_bytes(
+    
+        FfiConverterTypeTerminalSpecialKey.lower(`key`),FfiConverterBoolean.lower(`applicationCursorMode`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Unicodeコードポイント→バイト列。0(未入力)なら`None`。0x20未満または0x7Fは
+         * 単一の制御バイトとして、それ以外はUTF-8としてエンコードする。
+         * (Android版`TerminalKeyEncoder.unicodeCharBytes()`のRust移植)
+         */ fun `terminalUnicodeCharBytes`(`unicodeChar`: kotlin.UInt): kotlin.ByteArray? {
+            return FfiConverterOptionalByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_func_terminal_unicode_char_bytes(
+    
+        FfiConverterUInt.lower(`unicodeChar`),_status)
+}
+    )
+    }
     
 
         /**

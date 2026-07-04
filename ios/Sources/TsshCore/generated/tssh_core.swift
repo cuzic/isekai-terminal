@@ -425,6 +425,22 @@ private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
+    typealias FfiType = UInt8
+    typealias SwiftType = UInt8
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt8 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: UInt8, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
     typealias FfiType = UInt16
     typealias SwiftType = UInt16
@@ -4599,6 +4615,166 @@ public func FfiConverterTypeSshError_lower(_ value: SshError) -> RustBuffer {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * プラットフォーム非依存のターミナル特殊キー。F1〜F12と`ForwardDelete`はAndroid版
+ * には無かった機能で、この統合を機に追加された(iOS版`TerminalKeyMapper`由来)。
+ * `Delete`はAndroidの`KEYCODE_DEL`(実質バックスペース、0x7F)に対応し、iOS版の
+ * 前方削除キー(forward delete, `ESC[3~`)とは別物であることに注意。
+ */
+
+public enum TerminalSpecialKey: Equatable, Hashable {
+    
+    case enter
+    case delete
+    case forwardDelete
+    case tab
+    case escape
+    case arrowUp
+    case arrowDown
+    case arrowLeft
+    case arrowRight
+    case pageUp
+    case pageDown
+    case home
+    case end
+    case functionKey(number: UInt8
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TerminalSpecialKey: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTerminalSpecialKey: FfiConverterRustBuffer {
+    typealias SwiftType = TerminalSpecialKey
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TerminalSpecialKey {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .enter
+        
+        case 2: return .delete
+        
+        case 3: return .forwardDelete
+        
+        case 4: return .tab
+        
+        case 5: return .escape
+        
+        case 6: return .arrowUp
+        
+        case 7: return .arrowDown
+        
+        case 8: return .arrowLeft
+        
+        case 9: return .arrowRight
+        
+        case 10: return .pageUp
+        
+        case 11: return .pageDown
+        
+        case 12: return .home
+        
+        case 13: return .end
+        
+        case 14: return .functionKey(number: try FfiConverterUInt8.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TerminalSpecialKey, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .enter:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .delete:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .forwardDelete:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .tab:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .escape:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .arrowUp:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .arrowDown:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .arrowLeft:
+            writeInt(&buf, Int32(8))
+        
+        
+        case .arrowRight:
+            writeInt(&buf, Int32(9))
+        
+        
+        case .pageUp:
+            writeInt(&buf, Int32(10))
+        
+        
+        case .pageDown:
+            writeInt(&buf, Int32(11))
+        
+        
+        case .home:
+            writeInt(&buf, Int32(12))
+        
+        
+        case .end:
+            writeInt(&buf, Int32(13))
+        
+        
+        case let .functionKey(number):
+            writeInt(&buf, Int32(14))
+            FfiConverterUInt8.write(number, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalSpecialKey_lift(_ buf: RustBuffer) throws -> TerminalSpecialKey {
+    return try FfiConverterTypeTerminalSpecialKey.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalSpecialKey_lower(_ value: TerminalSpecialKey) -> RustBuffer {
+    return FfiConverterTypeTerminalSpecialKey.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Phase 7-4: プロファイルが選択するトランスポート戦略。実際のディスパッチは
  * Kotlin 側でこの値に応じて `SessionOrchestrator::connect` /
  * `connect_quic`（tsshd） / `connect_helper_quic` / `connect_helper_quic_auto`
@@ -5912,6 +6088,30 @@ public func FfiConverterCallbackInterfaceSessionCallback_lower(_ v: SessionCallb
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt8: FfiConverterRustBuffer {
+    typealias SwiftType = UInt8?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt8.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt8.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionInt32: FfiConverterRustBuffer {
     typealias SwiftType = Int32?
 
@@ -5976,6 +6176,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
+    typealias SwiftType = Data?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterData.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -6282,6 +6506,65 @@ public func setTerminalTheme(ansi16: [UInt32], defaultFg: UInt32, defaultBg: UIn
 }
 }
 /**
+ * IME確定テキスト／クリップボードペーストのテキスト→バイト列。改行正規化
+ * (`"\r\n"`/`"\n"` → `"\r"`)をここに集約する。複数コードポイントかつ
+ * `bracketed_paste_mode`が有効な場合のみ`ESC[200~`...`ESC[201~`で囲む
+ * (単一コードポイント、例えば絵文字1文字は囲まない)。
+ * (Android版`TerminalKeyEncoder.commitTextBytes()`のRust移植)
+ */
+public func terminalCommitTextBytes(text: String, bracketedPasteMode: Bool) -> Data  {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_tssh_core_fn_func_terminal_commit_text_bytes(
+        FfiConverterString.lower(text),
+        FfiConverterBool.lower(bracketedPasteMode),$0
+    )
+})
+}
+/**
+ * トグル式Ctrlキー用: 1コードポイント→Ctrl+<key>の制御コード。変換できない
+ * 入力(数字・日本語等)は`None`を返し、呼び出し側は変換せず元の入力をそのまま
+ * 送信する。
+ * - a-z / A-Z → 0x01-0x1A (Ctrl+A=0x01 ... Ctrl+Z=0x1A)
+ * - @ [ \ ] ^ _ (0x40-0x5F) → その5bit下位(Ctrl+@=0x00, Ctrl+[=ESC=0x1B等)
+ * - ? (0x3F) → 0x7F (DEL)
+ * - スペース(0x20) → 0x00 (NUL)
+ * (Android版`TerminalKeyEncoder.ctrlByte()`・iOS版`TerminalKeyMapper.controlByte()`を
+ * Rust側へ統合したSSOT実装)
+ */
+public func terminalCtrlByte(codePoint: UInt32) -> UInt8?  {
+    return try!  FfiConverterOptionUInt8.lift(try! rustCall() {
+    uniffi_tssh_core_fn_func_terminal_ctrl_byte(
+        FfiConverterUInt32.lower(codePoint),$0
+    )
+})
+}
+/**
+ * 特殊キーを、ターミナルへ送信するバイト列(ANSI/xtermエスケープシーケンス)に
+ * 変換する。矢印キーは`application_cursor_mode`が有効ならSS3形式(`ESC O A`等、
+ * DECCKM)、無効ならCSI形式(`ESC[A`等)を返す。F1〜F4はSS3形式、F5〜F12は
+ * CSI `~`形式(xterm互換)。未対応のfunction key番号は空配列を返す。
+ */
+public func terminalSpecialKeyBytes(key: TerminalSpecialKey, applicationCursorMode: Bool) -> Data  {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_tssh_core_fn_func_terminal_special_key_bytes(
+        FfiConverterTypeTerminalSpecialKey_lower(key),
+        FfiConverterBool.lower(applicationCursorMode),$0
+    )
+})
+}
+/**
+ * Unicodeコードポイント→バイト列。0(未入力)なら`None`。0x20未満または0x7Fは
+ * 単一の制御バイトとして、それ以外はUTF-8としてエンコードする。
+ * (Android版`TerminalKeyEncoder.unicodeCharBytes()`のRust移植)
+ */
+public func terminalUnicodeCharBytes(unicodeChar: UInt32) -> Data?  {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_tssh_core_fn_func_terminal_unicode_char_bytes(
+        FfiConverterUInt32.lower(unicodeChar),$0
+    )
+})
+}
+/**
  * 遅延・ロス・完全断すべてを既定値（無効）へ戻す。
  */
 public func debugClearUdpFault()  {try! rustCall() {
@@ -6391,6 +6674,18 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_func_set_terminal_theme() != 45632) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_func_terminal_commit_text_bytes() != 17000) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_func_terminal_ctrl_byte() != 45904) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_func_terminal_special_key_bytes() != 21124) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_func_terminal_unicode_char_bytes() != 49608) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_func_debug_clear_udp_fault() != 23483) {
