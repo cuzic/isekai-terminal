@@ -154,6 +154,9 @@ mod tests {
             last_via: Some("bastion.example.com".to_string()),
             trusted_at: "2026-07-04T00:00:00Z".to_string(),
             last_seen_at: "2026-07-04T00:00:00Z".to_string(),
+            cached_relay_addr: "203.0.113.10:45231".to_string(),
+            cached_cert_sha256: "3a7f".to_string(),
+            cached_session_secret: "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=".to_string(),
         }
     }
 

@@ -38,6 +38,26 @@ pub struct HelperTrust {
     pub last_via: Option<String>,
     pub trusted_at: String,
     pub last_seen_at: String,
+
+    /// The relay-assigned public address of the remote isekai-helper
+    /// instance (`"ip:port"`), captured the last time `init` (or a
+    /// re-deployment) completed a successful HELLO/proof/ACK handshake.
+    /// `isekai-ssh connect` (S-2) uses this together with
+    /// `cached_cert_sha256`/`cached_session_secret` below to build an
+    /// `isekai_transport::RelayTarget` directly, without going through
+    /// `--via` on the common path (`ISEKAI_SSH_DESIGN.md` "trust store の
+    /// ファイル形式").
+    pub cached_relay_addr: String,
+    /// `HandshakeJson::cert_sha256` from that same handshake.
+    pub cached_cert_sha256: String,
+    /// `HandshakeJson::session_secret` from that same handshake, still
+    /// base64-encoded (as isekai-helper emits it) — callers decode it
+    /// themselves, mirroring how `isekai_transport::RelayTarget::session_secret`
+    /// is populated from `--dev-insecure-session-secret` today. If
+    /// isekai-helper has since restarted, this cached secret no longer
+    /// matches its current session and the HELLO/proof exchange will be
+    /// rejected — see `isekai-ssh::connect`'s handling of that case.
+    pub cached_session_secret: String,
 }
 
 /// The whole `known_helpers.toml` document.
@@ -80,6 +100,9 @@ mod tests {
             last_via: Some("bastion.example.com".to_string()),
             trusted_at: "2026-07-04T00:00:00Z".to_string(),
             last_seen_at: "2026-07-04T00:00:00Z".to_string(),
+            cached_relay_addr: "203.0.113.10:45231".to_string(),
+            cached_cert_sha256: "3a7f".to_string(),
+            cached_session_secret: "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=".to_string(),
         }
     }
 
@@ -106,6 +129,9 @@ release_channel = "stable"
 last_via = "bastion.example.com"
 trusted_at = "2026-07-04T00:00:00Z"
 last_seen_at = "2026-07-04T00:00:00Z"
+cached_relay_addr = "203.0.113.10:45231"
+cached_cert_sha256 = "3a7f..."
+cached_session_secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
 
 [release_keys]
 stable = "release-key-material"
@@ -113,6 +139,9 @@ stable = "release-key-material"
         let store: TrustStore = toml::from_str(toml_str).unwrap();
         let entry = store.get("myhost:22").unwrap();
         assert_eq!(entry.update_policy, UpdatePolicy::ExactDigestOnly);
+        assert_eq!(entry.cached_relay_addr, "203.0.113.10:45231");
+        assert_eq!(entry.cached_cert_sha256, "3a7f...");
+        assert_eq!(entry.cached_session_secret, "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=");
         assert_eq!(store.release_keys.get("stable").unwrap(), "release-key-material");
     }
 
