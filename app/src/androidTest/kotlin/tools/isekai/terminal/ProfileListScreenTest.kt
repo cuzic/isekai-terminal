@@ -36,7 +36,7 @@ class ProfileListScreenTest {
     }
 
     private fun setScreen(
-        onConnect: (ConnectionProfile, String?) -> Unit = { _, _ -> },
+        onConnect: (ConnectionProfile, String?, String?) -> Unit = { _, _, _ -> },
         onAddProfile: () -> Unit = {},
         onEditProfile: (ConnectionProfile) -> Unit = {},
         onManageKeys: () -> Unit = {},
@@ -101,7 +101,7 @@ class ProfileListScreenTest {
             ),
         )
         var connected = false
-        setScreen(onConnect = { _, _ -> connected = true })
+        setScreen(onConnect = { _, _, _ -> connected = true })
         waitForText("KeyHost")
         composeTestRule.onNodeWithText("KeyHost").performClick()
         composeTestRule.waitUntil(3000) { connected }

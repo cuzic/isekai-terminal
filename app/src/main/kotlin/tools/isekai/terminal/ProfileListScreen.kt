@@ -53,7 +53,7 @@ import uniffi.tssh_core.setTerminalTheme
 
 @Composable
 fun ProfileListScreen(
-    onConnect: (profile: ConnectionProfile, password: String?) -> Unit,
+    onConnect: (profile: ConnectionProfile, password: String?, jumpPassword: String?) -> Unit,
     onAddProfile: () -> Unit,
     onEditProfile: (ConnectionProfile) -> Unit,
     onManageKeys: () -> Unit = {},
@@ -142,12 +142,14 @@ fun ProfileListScreen(
                         ProfileCard(
                             profile = profile,
                             onTap = {
-                                if (profile.authType == "password") {
+                                val needsPasswordPrompt = profile.authType == "password" ||
+                                    (profile.usesJumpHost && profile.jumpAuthType == "password")
+                                if (needsPasswordPrompt) {
                                     RemoteLogger.i("TsshProfile", "tap → password dialog: '${profile.label}' ${profile.username}@${profile.host}:${profile.port}")
                                     vm.requestPasswordConnect(profile)
                                 } else {
                                     RemoteLogger.i("TsshProfile", "tap → key connect: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} keyId=${profile.keyId}")
-                                    onConnect(profile, null)
+                                    onConnect(profile, null, null)
                                 }
                             },
                             onEdit = { RemoteLogger.i("TsshProfile", "edit: '${profile.label}' id=${profile.id}"); onEditProfile(profile) },
@@ -162,10 +164,12 @@ fun ProfileListScreen(
     passwordTarget?.let { target ->
         PasswordDialog(
             label = target.label,
+            showMainField = target.authType == "password",
+            jumpLabel = if (target.usesJumpHost && target.jumpAuthType == "password") target.jumpHost else null,
             onDismiss = { vm.dismissPassword() },
-            onConfirm = { password ->
+            onConfirm = { password, jumpPassword ->
                 vm.dismissPassword()
-                onConnect(target, password)
+                onConnect(target, password, jumpPassword)
             },
         )
     }
@@ -270,33 +274,54 @@ private fun ProfileCard(
     }
 }
 
+/**
+ * [showMainField] が false のときは対象ホスト自体は鍵認証だが、踏み台
+ * ([jumpLabel] が non-null)がパスワード認証のため、踏み台分のフィールドだけを表示する。
+ */
 @Composable
 private fun PasswordDialog(
     label: String,
+    showMainField: Boolean,
+    jumpLabel: String?,
     onDismiss: () -> Unit,
-    onConfirm: (String) -> Unit,
+    onConfirm: (password: String, jumpPassword: String?) -> Unit,
 ) {
     var password by remember { mutableStateOf("") }
+    var jumpPassword by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("パスワード入力") },
         text = {
             Column {
-                Text("「$label」のパスワード")
-                Spacer(Modifier.width(8.dp))
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    modifier = Modifier.fillMaxWidth(),
-                )
+                if (showMainField) {
+                    Text("「$label」のパスワード")
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                if (jumpLabel != null) {
+                    if (showMainField) Spacer(Modifier.width(8.dp))
+                    Text("踏み台「$jumpLabel」のパスワード")
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(
+                        value = jumpPassword,
+                        onValueChange = { jumpPassword = it },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
         },
         confirmButton = {
             TextButton(onClick = {
                 RemoteLogger.i("TsshProfile", "password dialog confirmed for: '$label'")
-                onConfirm(password)
+                onConfirm(password, jumpLabel?.let { jumpPassword })
             }) { Text("接続") }
         },
         dismissButton = {

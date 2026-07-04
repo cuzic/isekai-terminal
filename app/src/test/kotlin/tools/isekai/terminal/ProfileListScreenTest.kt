@@ -41,7 +41,7 @@ class ProfileListScreenTest {
     private fun insertProfile(profile: ConnectionProfile) = runBlocking { Repositories.profiles.save(profile) }
 
     private fun setScreen(
-        onConnect: (ConnectionProfile, String?) -> Unit = { _, _ -> },
+        onConnect: (ConnectionProfile, String?, String?) -> Unit = { _, _, _ -> },
         onAddProfile: () -> Unit = {},
         onEditProfile: (ConnectionProfile) -> Unit = {},
         onManageKeys: () -> Unit = {},
@@ -92,7 +92,7 @@ class ProfileListScreenTest {
     @Test fun keyProfile_tap_callsOnConnectDirectly() {
         insertProfile(ConnectionProfile(label = "KeyHost", host = "host", username = "user", authType = "key", keyId = 1L))
         var connected = false
-        setScreen(onConnect = { _, _ -> connected = true })
+        setScreen(onConnect = { _, _, _ -> connected = true })
         waitForText("KeyHost")
         composeTestRule.onNodeWithText("KeyHost").performScrollTo().performClick()
         composeTestRule.waitUntil(3000) { connected }

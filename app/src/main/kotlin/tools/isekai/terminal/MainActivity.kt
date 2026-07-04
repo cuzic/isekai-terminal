@@ -62,9 +62,9 @@ fun AppRoot() {
         composable(AppRoutes.PROFILE_LIST) {
             RemoteLogger.i("TsshNav", "→ ProfileList")
             ProfileListScreen(
-                onConnect = { profile, password ->
+                onConnect = { profile, password, jumpPassword ->
                     RemoteLogger.i("TsshNav", "ProfileList → Terminal profile='${profile.label}' authType=${profile.authType}")
-                    tabsVm.openTab(profile, password)
+                    tabsVm.openTab(profile, password, jumpPassword)
                     navController.navigate(AppRoutes.TERMINAL)
                 },
                 onAddProfile = {

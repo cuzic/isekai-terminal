@@ -107,6 +107,13 @@ fun ProfileEditScreen(
     var enableUpstreamFailover by remember { mutableStateOf(profile?.enableUpstreamFailover ?: false) }
     var postConnectCommands by remember { mutableStateOf(profile?.postConnectCommands ?: "") }
     var enableAgentForward by remember { mutableStateOf(profile?.enableAgentForward ?: false) }
+    var useJumpHost by remember { mutableStateOf(profile?.usesJumpHost ?: false) }
+    var jumpHost by remember { mutableStateOf(profile?.jumpHost ?: "") }
+    var jumpPort by remember { mutableStateOf((profile?.jumpPort ?: 22).toString()) }
+    var jumpUsername by remember { mutableStateOf(profile?.jumpUsername ?: "") }
+    var jumpAuthType by remember { mutableStateOf(profile?.jumpAuthType ?: "password") }
+    var jumpKeyId by remember { mutableStateOf(profile?.jumpKeyId) }
+    var jumpKeyMenuExpanded by remember { mutableStateOf(false) }
     val forwardDrafts = remember {
         mutableStateListOf<ForwardDraft>().apply {
             profile?.forwards?.forEach { add(it.toDraft()) }
@@ -114,8 +121,13 @@ fun ProfileEditScreen(
     }
 
     val selectedKeyLabel = keys.firstOrNull { it.id == keyId }?.label ?: "鍵を選択"
+    val selectedJumpKeyLabel = keys.firstOrNull { it.id == jumpKeyId }?.label ?: "鍵を選択"
     val canSave = label.isNotBlank() && host.isNotBlank() && username.isNotBlank() &&
-        (authType == "password" || keyId != null)
+        (authType == "password" || keyId != null) &&
+        (!useJumpHost || (
+            jumpHost.isNotBlank() && jumpUsername.isNotBlank() &&
+                (jumpAuthType == "password" || jumpKeyId != null)
+        ))
 
     Column(
         modifier = Modifier
@@ -210,6 +222,103 @@ fun ProfileEditScreen(
                                     keyMenuExpanded = false
                                 },
                             )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(4.dp))
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = useJumpHost,
+                onCheckedChange = { useJumpHost = it },
+                modifier = Modifier.testTag("useJumpHostCheckbox"),
+            )
+            Text("踏み台(ProxyJump)経由で接続する")
+        }
+        Text(
+            text = "上の「ホスト」へ直接到達できない場合、まずこの踏み台ホストへSSH接続してから" +
+                "トンネルします(ssh -J 相当)。「tsshd QUIC」接続方式以外の全方式で有効です。",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        if (useJumpHost) {
+            OutlinedTextField(
+                value = jumpHost,
+                onValueChange = { jumpHost = it },
+                label = { Text("踏み台ホスト") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = jumpPort,
+                onValueChange = { new -> jumpPort = new.filter { it.isDigit() }.take(5) },
+                label = { Text("踏み台ポート") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = jumpUsername,
+                onValueChange = { jumpUsername = it },
+                label = { Text("踏み台ユーザー名") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            Text("踏み台の認証方式")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = jumpAuthType == "password",
+                    onClick = { jumpAuthType = "password" },
+                    label = { Text("パスワード") },
+                )
+                FilterChip(
+                    selected = jumpAuthType == "key",
+                    onClick = { jumpAuthType = "key" },
+                    label = { Text("鍵認証") },
+                )
+            }
+
+            if (jumpAuthType == "key") {
+                ExposedDropdownMenuBox(
+                    expanded = jumpKeyMenuExpanded,
+                    onExpandedChange = { jumpKeyMenuExpanded = it },
+                ) {
+                    OutlinedTextField(
+                        value = selectedJumpKeyLabel,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("踏み台の鍵") },
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = jumpKeyMenuExpanded)
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .menuAnchor(MenuAnchorType.PrimaryNotEditable),
+                    )
+                    ExposedDropdownMenu(
+                        expanded = jumpKeyMenuExpanded,
+                        onDismissRequest = { jumpKeyMenuExpanded = false },
+                    ) {
+                        if (keys.isEmpty()) {
+                            DropdownMenuItem(
+                                text = { Text("登録された鍵がありません") },
+                                onClick = { jumpKeyMenuExpanded = false },
+                            )
+                        } else {
+                            keys.forEach { key ->
+                                DropdownMenuItem(
+                                    text = { Text(key.label) },
+                                    onClick = {
+                                        jumpKeyId = key.id
+                                        jumpKeyMenuExpanded = false
+                                    },
+                                )
+                            }
                         }
                     }
                 }
@@ -472,6 +581,11 @@ fun ProfileEditScreen(
                         postConnectCommands = postConnectCommands.trim().takeIf { it.isNotEmpty() },
                         forwards = forwardDrafts.mapNotNull { it.toPortForwardOrNull() },
                         enableAgentForward = enableAgentForward,
+                        jumpHost = if (useJumpHost) jumpHost.trim() else null,
+                        jumpPort = jumpPort.toIntOrNull() ?: 22,
+                        jumpUsername = if (useJumpHost) jumpUsername.trim() else null,
+                        jumpAuthType = if (useJumpHost) jumpAuthType else null,
+                        jumpKeyId = if (useJumpHost && jumpAuthType == "key") jumpKeyId else null,
                     )
                     vm.save(saved) { onSave() }
                 },

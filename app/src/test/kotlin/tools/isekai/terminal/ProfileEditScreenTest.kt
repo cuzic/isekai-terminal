@@ -3,6 +3,7 @@ package tools.isekai.terminal
 import android.app.Application
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -147,4 +148,77 @@ class ProfileEditScreenTest {
             assertTrue(stored.enableAgentForward)
         }
     }
+
+    // ── 踏み台(ProxyJump) ───────────────────────────────────────────────
+
+    @Test fun jumpHostToggle_hiddenFields_untilEnabled() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("踏み台(ProxyJump)経由で接続する").assertExists()
+        composeTestRule.onNodeWithText("踏み台ホスト").assertDoesNotExist()
+    }
+
+    @Test fun jumpHostToggle_enabling_showsFields() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithTag("useJumpHostCheckbox").performScrollTo().performClick()
+        composeTestRule.onNodeWithText("踏み台ホスト").assertExists()
+        composeTestRule.onNodeWithText("踏み台ポート").assertExists()
+        composeTestRule.onNodeWithText("踏み台ユーザー名").assertExists()
+    }
+
+    @Test fun saveButton_disabledWhenJumpHostEnabledButIncomplete() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("WithJump")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("保存").performScrollTo().assertIsEnabled()
+
+        composeTestRule.onNodeWithTag("useJumpHostCheckbox").performScrollTo().performClick()
+        // 踏み台のホスト/ユーザー名が未入力の間は保存不可であるべき。
+        composeTestRule.onNodeWithText("保存").performScrollTo().assertIsNotEnabled()
+    }
+
+    @Test fun saveNewProfile_withJumpHost_persistsJumpFields() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("ViaBastion")
+        fields[1].performTextInput("internal.example.com")
+        fields[3].performTextInput("root")
+
+        composeTestRule.onNodeWithTag("useJumpHostCheckbox").performScrollTo().performClick()
+        composeTestRule.onNodeWithText("踏み台ホスト").performTextInput("bastion.example.com")
+        composeTestRule.onNodeWithText("踏み台ユーザー名").performTextInput("jumper")
+        // 踏み台の認証方式は既定でパスワードなので鍵選択は不要、これで保存可能なはず。
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "ViaBastion" }
+            assertTrue(stored.usesJumpHost)
+            assertTrue(stored.jumpHost == "bastion.example.com")
+            assertTrue(stored.jumpUsername == "jumper")
+            assertTrue(stored.jumpAuthType == "password")
+        }
+    }
+
+    @Test fun editProfile_prefillsJumpHostFields() {
+        val profile = sampleProfile().copy(
+            jumpHost = "bastion.example.com",
+            jumpPort = 2200,
+            jumpUsername = "jumper",
+            jumpAuthType = "password",
+        )
+        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithTag("useJumpHostCheckbox").assertIsOn()
+        composeTestRule.onNodeWithText("bastion.example.com").assertExists()
+        composeTestRule.onNodeWithText("jumper").assertExists()
+        composeTestRule.onNodeWithText("2200").assertExists()
+    }
+
 }

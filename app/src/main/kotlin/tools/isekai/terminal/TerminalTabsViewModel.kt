@@ -138,7 +138,7 @@ class TerminalTabsViewModel(
     // ── タブのライフサイクル ────────────────────────────────────────
 
     /** 新しいタブを開いて接続を開始し、そのタブをアクティブにする。生成した tabId を返す。 */
-    fun openTab(profile: ConnectionProfile, password: String? = null): String {
+    fun openTab(profile: ConnectionProfile, password: String? = null, jumpPassword: String? = null): String {
         val tabId = UUID.randomUUID().toString()
         val session = sessionFactory()
         val tab = TabState(tabId, session, profile, profile.label)
@@ -150,7 +150,7 @@ class TerminalTabsViewModel(
         // 複数セッションを1つの FGS が共有する。初回タブで起動、以後は通知内容の更新のみ。
         executor.ensureServiceRunning()
         watchTab(tab)
-        connectTab(tab, profile, password)
+        connectTab(tab, profile, password, jumpPassword)
         updateSessionsSummary()
         return tabId
     }
@@ -256,13 +256,13 @@ class TerminalTabsViewModel(
 
     // ── 接続 ─────────────────────────────────────────────────────────
 
-    fun reconnect(tabId: String, password: String? = null) {
+    fun reconnect(tabId: String, password: String? = null, jumpPassword: String? = null) {
         val tab = tabOrNull(tabId) ?: return
         val profile = tab.profile ?: return
-        connectTab(tab, profile, password)
+        connectTab(tab, profile, password, jumpPassword)
     }
 
-    private fun connectTab(tab: TabState, profile: ConnectionProfile, password: String?) {
+    private fun connectTab(tab: TabState, profile: ConnectionProfile, password: String?, jumpPassword: String? = null) {
         val current = tab.session.state.value
         if (current.connected || current.isConnecting) return
         tab.preConnectError.value = null
@@ -271,15 +271,23 @@ class TerminalTabsViewModel(
         RemoteLogger.i(
             "TsshSSH",
             "connectTab[${tab.tabId}]: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} " +
-                "transport=${profile.transportPreference}",
+                "transport=${profile.transportPreference}" +
+                (if (profile.usesJumpHost) " via jump ${profile.jumpUsername}@${profile.jumpHost}:${profile.jumpPort}" else ""),
         )
         viewModelScope.launch(Dispatchers.IO) {
             val auth = resolveAuth(tab, profile, password) ?: return@launch
+            // 踏み台(jump host)は、SSHブートストラップを伴う全トランスポートで共通に使える
+            // (TSSHD_QUICのみ旧Phase 5B経路でrust-core側が未対応、Phase 10--1c参照)。
+            val jumpAuth = if (profile.usesJumpHost) {
+                resolveJumpAuth(tab, profile, jumpPassword) ?: return@launch
+            } else {
+                null
+            }
             when (profile.transportPreference) {
-                TransportPreference.PLAIN_SSH -> connect(tab, profile.toSshConfig(auth))
+                TransportPreference.PLAIN_SSH -> connect(tab, profile.toSshConfig(auth, jumpAuth))
                 TransportPreference.TSSHD_QUIC -> connectQuic(tab, profile.toQuicConfig(auth))
-                TransportPreference.ISEKAI_HELPER_QUIC -> connectHelperQuic(tab, profile.toHelperQuicConfig(auth))
-                TransportPreference.AUTO -> connectHelperQuicAuto(tab, profile.toHelperQuicConfig(auth))
+                TransportPreference.ISEKAI_HELPER_QUIC -> connectHelperQuic(tab, profile.toHelperQuicConfig(auth, jumpAuth))
+                TransportPreference.AUTO -> connectHelperQuicAuto(tab, profile.toHelperQuicConfig(auth, jumpAuth))
                 TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH -> {
                     // Phase 9-4（実験的機能）: 有効化されていれば物理Wi-Fi/セルラーの
                     // fdも取得してから接続する。取得に失敗/未取得でも例外にはせず、
@@ -290,7 +298,7 @@ class TerminalTabsViewModel(
                         PhysicalMultipathFds()
                     }
                     tab.upstreamFailoverEnabledForCurrentSession = profile.enableUpstreamFailover
-                    connectMultipathHelperQuic(tab, profile.toMultipathHelperQuicConfig(auth, physicalFds))
+                    connectMultipathHelperQuic(tab, profile.toMultipathHelperQuicConfig(auth, physicalFds, jumpAuth))
                 }
             }
         }
@@ -326,6 +334,20 @@ class TerminalTabsViewModel(
             is AuthValidation.Error -> {
                 RemoteLogger.w("TsshSSH", "auth error: ${v.statusMsg}")
                 tab.preConnectError.value = v.statusMsg
+                null
+            }
+            is AuthValidation.Password -> SshAuth.Password(v.value)
+            is AuthValidation.PublicKey -> loadPublicKeyAuth(tab, v.keyId)
+        }
+    }
+
+    /** 踏み台(jump host)側の認証情報を解決する。[resolveAuth] と同じ検証ロジックを
+     *  jump_auth_type/jump_key_id に適用するだけの対の関数。 */
+    private suspend fun resolveJumpAuth(tab: TabState, profile: ConnectionProfile, jumpPassword: String?): SshAuth? {
+        return when (val v = AuthValidator.validate(profile.jumpAuthType ?: "", jumpPassword, profile.jumpKeyId)) {
+            is AuthValidation.Error -> {
+                RemoteLogger.w("TsshSSH", "jump auth error: ${v.statusMsg}")
+                tab.preConnectError.value = "踏み台: ${v.statusMsg}"
                 null
             }
             is AuthValidation.Password -> SshAuth.Password(v.value)
