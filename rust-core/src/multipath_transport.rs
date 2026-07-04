@@ -37,7 +37,7 @@ use crate::helper_quic_transport::{
     FRAME_REJECT_DUPLICATE, FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED,
 };
 use crate::transport::{run_ssh_channel_loop, TransportCommand, TransportEvent};
-use crate::{init_logger, CellData, SessionCallback, SshAuth, SshError, RUNTIME};
+use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 use base64::Engine as _;
 use russh::client;
@@ -114,6 +114,8 @@ pub struct MultipathHelperQuicConfig {
     pub auth: SshAuth,
     pub cols: u32,
     pub rows: u32,
+    /// ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
+    pub jump: Option<JumpConfig>,
 }
 
 /// noq issue #738（`open_path()`に`local_ip`明示指定した新規pathでPATH_RESPONSEが
@@ -894,7 +896,7 @@ async fn try_connect_multipath(
 ) -> Result<(noq::SendStream, noq::RecvStream), String> {
     let bind_port = config.direct_host.is_some().then_some(DIRECT_MULTIPATH_BIND_PORT);
     let handshake = helper_quic_transport::bootstrap_helper_via_ssh(
-        &config.ssh_host, config.ssh_port, &config.username, &config.auth, bind_port,
+        &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump, bind_port,
     )
     .await?;
 

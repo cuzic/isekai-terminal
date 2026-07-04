@@ -24,11 +24,10 @@ pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use tokio::runtime::Runtime;
-use log::info;
 use russh::client;
 
 use crate::session::SessionCore;
-use crate::transport::{RusshEventHandler, TransportCommand, TransportEvent, run_ssh_channel_loop};
+use crate::transport::{TransportCommand, TransportEvent, run_ssh_channel_loop};
 
 pub(crate) static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
     Runtime::new().expect("Failed to create Tokio runtime")
@@ -83,6 +82,20 @@ pub struct SshConfig {
     /// 有効な場合、サーバー側からの署名要求は毎回ユーザー確認を必須とする
     /// （`OrchestratorCallback::on_agent_sign_request` / `SessionCallback::on_agent_sign_request`）。
     pub agent_forward: bool,
+    /// 設定されていれば、`host:port` へ直接ではなく、まずこの踏み台ホストへ
+    /// SSH接続・認証し、そこから `channel_open_direct_tcpip` で `host:port` への
+    /// チャネルを開いた上にネストしたSSHセッションを張る（`ssh -J` 相当）。
+    /// 対象ホストがNAT配下で直接到達できない場合の唯一の到達経路になる。
+    pub jump: Option<JumpConfig>,
+}
+
+/// ProxyJump（多段SSH）の踏み台ホストへの接続情報。`SshConfig::jump` 参照。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct JumpConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth: SshAuth,
 }
 
 // ── ポートフォワード(-L のみ、MVP) ───────────────────────
@@ -359,19 +372,22 @@ pub(crate) async fn run_russh_transport(
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let handler = RusshEventHandler::new(event_tx.clone());
-    let agent_key = handler.agent_key.clone();
 
-    let addr = format!("{}:{}", config.host, config.port);
-    info!("ssh: TCP connecting to {}", addr);
-    let session = match client::connect(russh_config, addr.as_str(), handler).await {
-        Ok(s) => { info!("ssh: TCP connected to {}", addr); s }
-        Err(e) => {
-            log::warn!("ssh: TCP connect failed to {}: {}", addr, e);
-            event_tx.send(TransportEvent::Disconnected { reason: Some(e.to_string()) }).await.ok();
+    // `established.jump_handle`(Some の場合)は、これが保持する接続の上に
+    // トンネルされた `established.handle` が乗っているため、`run_ssh_channel_loop`
+    // が終わるまで(＝このスコープの終わりまで)drop してはならない。
+    let established = match transport::connect_via_jump_or_direct(
+        &config.jump, russh_config, &config.host, config.port, event_tx.clone(),
+    ).await {
+        Ok(e) => e,
+        Err(msg) => {
+            log::warn!("ssh: {msg}");
+            event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
             return;
         }
     };
+    let session = established.handle;
+    let agent_key = established.agent_key;
 
     run_ssh_channel_loop(
         &config.username, &config.auth, config.cols, config.rows,

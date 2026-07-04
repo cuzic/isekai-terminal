@@ -8,7 +8,7 @@ use russh_keys::{HashAlg, PrivateKey, PublicKey};
 use tokio::net::TcpListener;
 
 use crate::agent_forward;
-use crate::{ForwardState, SshAuth};
+use crate::{ForwardState, JumpConfig, SshAuth};
 
 // ── Transport command / event ────────────────────────────
 
@@ -103,6 +103,97 @@ impl client::Handler for RusshEventHandler {
     }
 }
 
+// ── SSH 認証（TCP・QUIC・ProxyJump 共通）────────────────
+
+/// `session` に対して `auth` で認証する。公開鍵認証が成功した場合はその鍵も返す
+/// （agent forwarding で転送先の署名要求に同じ鍵を使い回すため。鍵の追加受け渡しは
+/// 不要という設計）。
+pub(crate) async fn authenticate_session(
+    session: &mut client::Handle<RusshEventHandler>,
+    username: &str,
+    auth: &SshAuth,
+) -> (bool, Option<Arc<PrivateKey>>) {
+    match auth {
+        SshAuth::Password { password } => {
+            let ok = session.authenticate_password(username, password).await.ok().unwrap_or(false);
+            (ok, None)
+        }
+        SshAuth::PublicKey { private_key_pem } => match PrivateKey::from_openssh(private_key_pem) {
+            Ok(key) => {
+                let key = Arc::new(key);
+                let ok = session.authenticate_publickey(username, key.clone()).await.ok().unwrap_or(false);
+                (ok, ok.then_some(key))
+            }
+            Err(e) => {
+                warn!("ssh: private key parse failed: {}", e);
+                (false, None)
+            }
+        },
+    }
+}
+
+/// [`SshConfig::jump`] が設定されていれば、まず踏み台ホストへ接続・認証し、
+/// `channel_open_direct_tcpip` で `target_host:target_port` へのチャネルを開いた上に
+/// ネストしたSSHセッションを張る（`ssh -J` 相当）。未設定なら直接 TCP 接続する。
+///
+/// 返り値の踏み台側 `Handle`（`Some` の場合）は、戻り値の対象セッションが使う
+/// トンネルの実体を保持しているため、呼び出し元は対象セッションの利用が終わるまで
+/// **必ず生かしたまま(drop しない)保持すること**。
+pub(crate) struct EstablishedSession {
+    pub(crate) handle: client::Handle<RusshEventHandler>,
+    pub(crate) agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
+    /// 保持するだけで参照はしない(トンネルの接続を生かしておくためだけの目的)。
+    _jump_handle: Option<client::Handle<RusshEventHandler>>,
+}
+
+pub(crate) async fn connect_via_jump_or_direct(
+    jump: &Option<JumpConfig>,
+    russh_config: Arc<client::Config>,
+    target_host: &str,
+    target_port: u16,
+    event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+) -> Result<EstablishedSession, String> {
+    let Some(jump) = jump else {
+        let addr = format!("{target_host}:{target_port}");
+        info!("ssh: TCP connecting to {}", addr);
+        let handler = RusshEventHandler::new(event_tx);
+        let agent_key = handler.agent_key.clone();
+        let handle = client::connect(russh_config, addr.as_str(), handler)
+            .await
+            .map_err(|e| format!("TCP connect to {addr} failed: {e}"))?;
+        info!("ssh: TCP connected to {}", addr);
+        return Ok(EstablishedSession { handle, agent_key, _jump_handle: None });
+    };
+
+    let jump_addr = format!("{}:{}", jump.host, jump.port);
+    info!("ssh(jump): TCP connecting to {}", jump_addr);
+    let jump_handler = RusshEventHandler::new(event_tx.clone());
+    let mut jump_handle = client::connect(russh_config.clone(), jump_addr.as_str(), jump_handler)
+        .await
+        .map_err(|e| format!("jump host TCP connect to {jump_addr} failed: {e}"))?;
+
+    let (authenticated, _) = authenticate_session(&mut jump_handle, &jump.username, &jump.auth).await;
+    if !authenticated {
+        return Err(format!("jump host authentication failed for {}@{}", jump.username, jump_addr));
+    }
+    info!("ssh(jump): auth ok, opening direct-tcpip to {}:{}", target_host, target_port);
+
+    let channel = jump_handle
+        .channel_open_direct_tcpip(target_host, target_port as u32, "127.0.0.1", 0)
+        .await
+        .map_err(|e| format!("jump host direct-tcpip to {target_host}:{target_port} failed: {e}"))?;
+    let stream = channel.into_stream();
+
+    let target_handler = RusshEventHandler::new(event_tx);
+    let agent_key = target_handler.agent_key.clone();
+    let handle = client::connect_stream(russh_config, stream, target_handler)
+        .await
+        .map_err(|e| format!("SSH handshake over jump tunnel to {target_host}:{target_port} failed: {e}"))?;
+    info!("ssh: connected to {}:{} via jump {}", target_host, target_port, jump_addr);
+
+    Ok(EstablishedSession { handle, agent_key, _jump_handle: Some(jump_handle) })
+}
+
 // ── SSH チャネルループ（TCP・QUIC 共通）─────────────────
 
 pub(crate) async fn run_ssh_channel_loop(
@@ -122,37 +213,7 @@ pub(crate) async fn run_ssh_channel_loop(
     };
     info!("ssh: auth {} for {}", auth_method, username);
 
-    // 公開鍵認証に使った鍵を保持しておく。agent forwarding が有効なら、この同じ鍵を
-    // 転送先の署名要求にも使う（鍵の追加受け渡しは不要という設計）。
-    let mut authed_key: Option<Arc<PrivateKey>> = None;
-
-    let authenticated = match auth {
-        SshAuth::Password { password } => session
-            .authenticate_password(username, password)
-            .await
-            .ok()
-            .unwrap_or(false),
-        SshAuth::PublicKey { private_key_pem } => {
-            match PrivateKey::from_openssh(private_key_pem) {
-                Ok(key) => {
-                    let key = Arc::new(key);
-                    let ok = session
-                        .authenticate_publickey(username, key.clone())
-                        .await
-                        .ok()
-                        .unwrap_or(false);
-                    if ok {
-                        authed_key = Some(key);
-                    }
-                    ok
-                }
-                Err(e) => {
-                    warn!("ssh: private key parse failed: {}", e);
-                    false
-                }
-            }
-        }
-    };
+    let (authenticated, authed_key) = authenticate_session(&mut session, username, auth).await;
 
     if !authenticated {
         warn!("ssh: auth {} failed for {}", auth_method, username);
@@ -526,6 +587,7 @@ mod local_forward_e2e_tests {
                     remote_port: echo_addr.port(),
                 }],
                 agent_forward: false,
+                jump: None,
             };
 
             orchestrator.connect(config).expect("connect() should not fail synchronously");
@@ -556,6 +618,169 @@ mod local_forward_e2e_tests {
             assert_eq!(&buf[..n], b"hello-forward");
 
             orchestrator.disconnect();
+        });
+    }
+}
+
+#[cfg(test)]
+mod proxy_jump_e2e_tests {
+    use super::*;
+    use crate::JumpConfig;
+    use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
+    use russh::Channel as RusshChannel;
+    use russh_keys::ssh_key::private::Ed25519Keypair;
+    use std::net::SocketAddr;
+    use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
+
+    /// 対象ホスト役の最小 SSH サーバ。パスワード認証は無条件で許可し、
+    /// セッションチャネルの open だけ受け付ける(シェル/PTYまでは要らない —
+    /// ここではネストしたSSHハンドシェイクとチャネル開設ができることだけを検証する)。
+    #[derive(Clone)]
+    struct TargetSshServer;
+
+    impl server::Server for TargetSshServer {
+        type Handler = TargetSshHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> TargetSshHandler {
+            TargetSshHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct TargetSshHandler;
+
+    #[async_trait::async_trait]
+    impl server::Handler for TargetSshHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// 踏み台ホスト役の最小 SSH サーバ。パスワード認証は無条件で許可し、
+    /// `channel_open_direct_tcpip` が要求してきた `host_to_connect:port_to_connect`
+    /// へ実際にTCP接続してバイトを中継する(本物のsshdの`-J`/ProxyJump時の挙動と同じ)。
+    #[derive(Clone)]
+    struct JumpSshServer;
+
+    impl server::Server for JumpSshServer {
+        type Handler = JumpSshHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> JumpSshHandler {
+            JumpSshHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct JumpSshHandler;
+
+    #[async_trait::async_trait]
+    impl server::Handler for JumpSshHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: RusshChannel<ServerMsg>,
+            host_to_connect: &str,
+            port_to_connect: u32,
+            _originator_address: &str,
+            _originator_port: u32,
+            _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            let target = format!("{host_to_connect}:{port_to_connect}");
+            tokio::spawn(async move {
+                let mut outbound = match TokioTcpStream::connect(&target).await {
+                    Ok(s) => s,
+                    Err(e) => { warn!("test jump server: connect to {} failed: {}", target, e); return; }
+                };
+                let mut stream = channel.into_stream();
+                let _ = tokio::io::copy_bidirectional(&mut stream, &mut outbound).await;
+            });
+            Ok(true)
+        }
+    }
+
+    async fn spawn_ssh_server<S: server::Server<Handler = H> + Send + 'static, H>(
+        mut server: S,
+        seed: u8,
+    ) -> SocketAddr
+    where
+        H: server::Handler + Send + 'static,
+    {
+        let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let host_key = PrivateKey::from(keypair);
+        let config = Arc::new(server::Config {
+            keys: vec![host_key],
+            ..Default::default()
+        });
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Err(e) = server.run_on_socket(config, &listener).await {
+                warn!("test ssh server: run_on_socket exited: {}", e);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn connect_via_jump_reaches_target_through_tunneled_ssh_session() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let target_addr = spawn_ssh_server(TargetSshServer, 11).await;
+            let jump_addr = spawn_ssh_server(JumpSshServer, 22).await;
+
+            let jump = JumpConfig {
+                host: jump_addr.ip().to_string(),
+                port: jump_addr.port(),
+                username: "jumper".into(),
+                auth: SshAuth::Password { password: "anything".into() },
+            };
+
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+            // check_server_key はホスト鍵の信頼確認を待つので、テストでは常に許可する。
+            tokio::spawn(async move {
+                while let Some(event) = event_rx.recv().await {
+                    if let TransportEvent::HostKey(_, reply) = event {
+                        let _ = reply.send(true);
+                    }
+                }
+            });
+
+            let russh_config = Arc::new(client::Config::default());
+            let mut established = connect_via_jump_or_direct(
+                &Some(jump),
+                russh_config,
+                &target_addr.ip().to_string(),
+                target_addr.port(),
+                event_tx,
+            )
+            .await
+            .expect("connect_via_jump_or_direct should succeed");
+
+            let target_auth = SshAuth::Password { password: "anything".into() };
+            let (authenticated, _) =
+                authenticate_session(&mut established.handle, "tester", &target_auth).await;
+            assert!(authenticated, "authentication over the jump-tunneled session should succeed");
+
+            // The tunneled session should behave like an ordinary SSH connection
+            // beyond just authenticating: confirm we can actually open a channel
+            // on the target through it.
+            established
+                .handle
+                .channel_open_session()
+                .await
+                .expect("opening a channel on the target through the jump tunnel should succeed");
         });
     }
 }

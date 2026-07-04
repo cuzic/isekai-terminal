@@ -22,8 +22,11 @@ use sha2::{Digest, Sha256};
 
 use crate::helper_bootstrap::{self, BootstrapError, HelperBinaries, HelperHandshake};
 use crate::resume_client::{self, ClientResumeState};
-use crate::transport::{run_ssh_channel_loop, RusshEventHandler, TransportCommand, TransportEvent};
-use crate::{init_logger, CellData, SessionCallback, SshAuth, SshError, RUNTIME};
+use crate::transport::{
+    authenticate_session, connect_via_jump_or_direct, run_ssh_channel_loop, RusshEventHandler,
+    TransportCommand, TransportEvent,
+};
+use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -79,6 +82,8 @@ pub struct HelperQuicConfig {
     pub auth: SshAuth,
     pub cols: u32,
     pub rows: u32,
+    /// ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
+    pub jump: Option<JumpConfig>,
 }
 
 #[derive(uniffi::Object)]
@@ -214,13 +219,19 @@ impl ServerCertVerifier for PinnedCertVerifier {
 // ── ブートストラップ（Phase 7-3 呼び出し） ───────────────
 
 async fn bootstrap_via_ssh(config: &HelperQuicConfig) -> Result<HelperHandshake, String> {
-    bootstrap_helper_via_ssh(&config.ssh_host, config.ssh_port, &config.username, &config.auth, None).await
+    bootstrap_helper_via_ssh(
+        &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump, None,
+    ).await
 }
 
 /// SSH でログインし、isekai-helper をブートストラップして起動ハンドシェイクを得る。
 /// `HelperQuicConfig`（Phase 7/8、フォールバック無し/Auto）と `MultipathHelperQuicConfig`
 /// （Phase 9-2、パス冗長化）は候補アドレスの持ち方が異なるだけで、SSH ブートストラップ自体は
 /// 共通なのでここに切り出してある。
+///
+/// `jump`: 設定されていれば `ssh_host:ssh_port` へ直接ではなく踏み台経由で接続する
+/// （`SshConfig::jump`・`transport::connect_via_jump_or_direct` 参照）。対象ホストが
+/// NAT配下で直接到達できない場合、初回のisekai-helper配布・起動にはこれが唯一の経路になる。
 ///
 /// `bind_port`: `None` なら isekai-helper は既定通りエフェメラルポートで待ち受ける
 /// （Tailscale経由のpath0はこれで十分、`ts-input`チェーンが素通しなため）。
@@ -231,12 +242,13 @@ pub(crate) async fn bootstrap_helper_via_ssh(
     ssh_port: u16,
     username: &str,
     auth: &SshAuth,
+    jump: &Option<JumpConfig>,
     bind_port: Option<u16>,
 ) -> Result<HelperHandshake, String> {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
-    // NOTE: このブートストラップ用 SSH 接続のホスト鍵は、本セッションと同じサーバー・
-    // 同じ known_hosts エントリを検証すべきだが、Phase 7-4 のスコープでは簡略化し
-    // 常に承認する。TODO: 既存の KnownHost チェック（HostKeyChecker）と統合する。
+    // NOTE: このブートストラップ用 SSH 接続(踏み台込み)のホスト鍵は、本セッションと
+    // 同じサーバー・同じ known_hosts エントリを検証すべきだが、Phase 7-4 のスコープでは
+    // 簡略化し常に承認する。TODO: 既存の KnownHost チェック（HostKeyChecker）と統合する。
     tokio::spawn(async move {
         while let Some(ev) = event_rx.recv().await {
             if let TransportEvent::HostKey(_, reply) = ev {
@@ -246,35 +258,19 @@ pub(crate) async fn bootstrap_helper_via_ssh(
     });
 
     let russh_config = Arc::new(client::Config::default());
-    let handler = RusshEventHandler::new(event_tx);
-    let mut session = client::connect(russh_config, (ssh_host, ssh_port), handler)
+    let mut established = connect_via_jump_or_direct(jump, russh_config, ssh_host, ssh_port, event_tx)
         .await
         .map_err(|e| format!("bootstrap SSH connect failed: {e}"))?;
 
-    let authenticated = match auth {
-        SshAuth::Password { password } => session
-            .authenticate_password(username, password)
-            .await
-            .ok()
-            .unwrap_or(false),
-        SshAuth::PublicKey { private_key_pem } => match russh_keys::PrivateKey::from_openssh(private_key_pem) {
-            Ok(key) => session
-                .authenticate_publickey(username, Arc::new(key))
-                .await
-                .ok()
-                .unwrap_or(false),
-            Err(e) => {
-                warn!("helper_quic: bootstrap private key parse failed: {e}");
-                false
-            }
-        },
-    };
+    let (authenticated, _) = authenticate_session(&mut established.handle, username, auth).await;
     if !authenticated {
         return Err("bootstrap SSH authentication failed".to_string());
     }
 
     let binaries = HelperBinaries { x86_64: HELPER_BIN_X86_64, aarch64: HELPER_BIN_AARCH64 };
-    helper_bootstrap::ensure_helper_running(&mut session, &binaries, HELPER_VERSION, "127.0.0.1:22", bind_port)
+    helper_bootstrap::ensure_helper_running(
+        &mut established.handle, &binaries, HELPER_VERSION, "127.0.0.1:22", bind_port,
+    )
         .await
         .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))
 }
@@ -594,6 +590,9 @@ async fn run_helper_quic_transport_auto(
                 // フォールバック時はどちらも無効なプレーン SSH として接続する。
                 forwards: Vec::new(),
                 agent_forward: false,
+                // HelperQuicConfig には踏み台(jump host)設定も無いため、フォールバック時は
+                // 対象ホストへ直接SSH接続する前提のまま(SshConfig::jump 参照)。
+                jump: None,
             };
             crate::run_russh_transport(ssh_config, cmd_rx, event_tx).await;
         }
@@ -649,6 +648,7 @@ mod tests {
             auth: SshAuth::PublicKey { private_key_pem: key_pem.into_bytes() },
             cols: 80,
             rows: 24,
+            jump: None,
         };
 
         let session = create_helper_quic_session(config);
@@ -703,6 +703,7 @@ mod tests {
             auth: SshAuth::PublicKey { private_key_pem: key_pem.into_bytes() },
             cols: 80,
             rows: 24,
+            jump: None,
         };
 
         crate::debug_fault::shared_injector().restore();
