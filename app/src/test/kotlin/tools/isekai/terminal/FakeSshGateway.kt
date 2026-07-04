@@ -16,6 +16,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     var connectHelperQuicCalled = false
     var connectHelperQuicAutoCalled = false
     var connectMultipathHelperQuicCalled = false
+    var connectIsekaiStunP2pCalled = false
     var disconnectCalled = false
     private var quic = false
 
@@ -66,6 +67,14 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     @Throws(SshException::class)
     override fun connectMultipathHelperQuic(config: MultipathHelperQuicConfig) {
         connectMultipathHelperQuicCalled = true
+        quic = true
+        phase = Phase.CONNECTING
+        callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
+    }
+
+    @Throws(SshException::class)
+    override fun connectIsekaiStunP2p(config: IsekaiStunP2pConfig) {
+        connectIsekaiStunP2pCalled = true
         quic = true
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)

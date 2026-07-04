@@ -104,6 +104,7 @@ fun ProfileEditScreen(
     var directAddress by remember { mutableStateOf(profile?.directAddress ?: "") }
     var enablePhysicalMultipath by remember { mutableStateOf(profile?.enablePhysicalMultipath ?: false) }
     var cellularRemoteAddress by remember { mutableStateOf(profile?.cellularRemoteAddress ?: "") }
+    var stunServer by remember { mutableStateOf(profile?.stunServer ?: "") }
     var enableUpstreamFailover by remember { mutableStateOf(profile?.enableUpstreamFailover ?: false) }
     var postConnectCommands by remember { mutableStateOf(profile?.postConnectCommands ?: "") }
     var enableAgentForward by remember { mutableStateOf(profile?.enableAgentForward ?: false) }
@@ -357,15 +358,41 @@ fun ProfileEditScreen(
                 onClick = { transportPreference = TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH },
                 label = { Text("自作ヘルパー QUIC（マルチパス）") },
             )
+            FilterChip(
+                selected = transportPreference == TransportPreference.ISEKAI_STUN_P2P_QUIC,
+                onClick = { transportPreference = TransportPreference.ISEKAI_STUN_P2P_QUIC },
+                label = { Text("STUN P2P QUIC（実験的）") },
+            )
         }
 
         if (transportPreference == TransportPreference.ISEKAI_HELPER_QUIC ||
             transportPreference == TransportPreference.AUTO ||
-            transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH
+            transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH ||
+            transportPreference == TransportPreference.ISEKAI_STUN_P2P_QUIC
         ) {
             Text(
                 text = "初回接続時に SSH 経由で自作ヘルパー（isekai-helper）を自動配布・起動します" +
                     "（対応 OS: Linux x86_64 / aarch64）。",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        if (transportPreference == TransportPreference.ISEKAI_STUN_P2P_QUIC) {
+            OutlinedTextField(
+                value = stunServer,
+                onValueChange = { stunServer = it },
+                label = { Text("STUNサーバー（任意）") },
+                placeholder = { Text(ConnectionProfile.DEFAULT_STUN_SERVER) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                text = "relay サーバーを一切使わず、STUN でお互いの外部アドレスを調べて直接 " +
+                    "UDP 穴あけ（simultaneous open）を試みます。NAT の種類によっては穴あけが " +
+                    "成立せず接続に失敗することがあり、その場合はフォールバックせずエラーになります" +
+                    "（その際は Auto 等、他の接続方式に切り替えてください）。未入力なら " +
+                    "${ConnectionProfile.DEFAULT_STUN_SERVER} を使います。",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -586,6 +613,7 @@ fun ProfileEditScreen(
                         jumpUsername = if (useJumpHost) jumpUsername.trim() else null,
                         jumpAuthType = if (useJumpHost) jumpAuthType else null,
                         jumpKeyId = if (useJumpHost && jumpAuthType == "key") jumpKeyId else null,
+                        stunServer = stunServer.trim().takeIf { it.isNotBlank() },
                     )
                     vm.save(saved) { onSave() }
                 },

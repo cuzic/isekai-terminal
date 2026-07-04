@@ -10,7 +10,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [KnownHost::class, ConnectionProfile::class, KeyEntry::class, Snippet::class],
-    version = 12,
+    version = 13,
     exportSchema = false,
 )
 @TypeConverters(PortForwardListConverter::class)
@@ -146,6 +146,16 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        // internal（private ではない）: androidTest/test 側からマイグレーション単体テストで直接使うため。
+        // Phase 10: STUN+SSHランデブーによる直接P2P QUIC(TransportPreference.ISEKAI_STUN_P2P_QUIC)用の
+        // STUNサーバー設定。未設定(NULL)なら接続時に既定の公開STUNサーバーを使う
+        // （`ConnectionProfile.DEFAULT_STUN_SERVER`参照）。
+        internal val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE connection_profiles ADD COLUMN stun_server TEXT")
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase =
             instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -156,6 +166,7 @@ abstract class AppDatabase : RoomDatabase() {
                 .addMigrations(
                     MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7,
                     MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12,
+                    MIGRATION_12_13,
                 )
                 .build().also { instance = it }
             }

@@ -263,6 +263,22 @@ class TerminalTabsViewModelTest {
         assertEquals(0, executor.acquirePhysicalMultipathFdsCallCount)
     }
 
+    // ── Phase 10: STUN+SSHランデブー方式のP2P ─────────────────────────────
+
+    @Test
+    fun connectTab_stunP2pTransport_dispatchesToConnectIsekaiStunP2p() = runBlocking {
+        val p = profile("a").copy(
+            transportPreferenceName = TransportPreference.ISEKAI_STUN_P2P_QUIC.name,
+            stunServer = "stun.example.com:3478",
+        )
+        vm.openTab(p, "pass")
+
+        withTimeout(3000) { while (!orchestrators[0].connectIsekaiStunP2pCalled) delay(10) }
+
+        assertTrue(orchestrators[0].connectIsekaiStunP2pCalled)
+        assertFalse(orchestrators[0].connectCalled)
+    }
+
     @Test
     fun disconnect_afterConnected_releasesPhysicalMultipathFds() = runBlocking {
         val id = vm.openTab(profile("a"), "pass")

@@ -8,8 +8,8 @@ import org.junit.Test
 import uniffi.tssh_core.SshAuth
 
 /**
- * [ConnectionProfile]の変換関数([toSshConfig]及びそれが使う`toJumpConfigOrNull`)を、
- * UI/ViewModelを介さず直接検証する。
+ * [ConnectionProfile]の変換関数([toSshConfig]/[toIsekaiStunP2pConfig]、
+ * 及びそれらが共通で使う`toJumpConfigOrNull`)を、UI/ViewModelを介さず直接検証する。
  */
 class ConnectionProfileTest {
 
@@ -43,6 +43,38 @@ class ConnectionProfileTest {
         assertEquals(2200.toUShort(), config.jump?.port)
         assertEquals("jumper", config.jump?.username)
         assertEquals(jumpAuth, config.jump?.auth)
+    }
+
+    // ── toIsekaiStunP2pConfig ────────────────────────────────────────────
+
+    @Test fun `toIsekaiStunP2pConfig maps ssh connection fields`() {
+        val config = profile().toIsekaiStunP2pConfig(auth)
+        assertEquals("example.com", config.sshHost)
+        assertEquals(2222.toUShort(), config.sshPort)
+        assertEquals("deploy", config.username)
+        assertEquals(auth, config.auth)
+        assertEquals(80u, config.cols)
+        assertEquals(24u, config.rows)
+    }
+
+    @Test fun `toIsekaiStunP2pConfig uses configured stunServer verbatim`() {
+        val config = profile().copy(stunServer = "stun.example.com:3478").toIsekaiStunP2pConfig(auth)
+        assertEquals("stun.example.com:3478", config.stunServer)
+    }
+
+    @Test fun `toIsekaiStunP2pConfig falls back to DEFAULT_STUN_SERVER when stunServer is null`() {
+        val config = profile().toIsekaiStunP2pConfig(auth)
+        assertEquals(ConnectionProfile.DEFAULT_STUN_SERVER, config.stunServer)
+    }
+
+    @Test fun `toIsekaiStunP2pConfig falls back to DEFAULT_STUN_SERVER when stunServer is blank`() {
+        val config = profile().copy(stunServer = "   ").toIsekaiStunP2pConfig(auth)
+        assertEquals(ConnectionProfile.DEFAULT_STUN_SERVER, config.stunServer)
+    }
+
+    @Test fun `toIsekaiStunP2pConfig has no jump when jumpAuth is not supplied`() {
+        val config = profile().toIsekaiStunP2pConfig(auth)
+        assertNull(config.jump)
     }
 
     // ── usesJumpHost（純粋な算出プロパティ）────────────────────────────

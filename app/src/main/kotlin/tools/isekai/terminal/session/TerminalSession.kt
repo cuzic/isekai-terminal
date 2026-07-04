@@ -253,6 +253,16 @@ class TerminalSession(
         }
     }
 
+    /** Phase 10: STUN+SSHランデブーによる直接P2P QUIC。relay無し・フォールバック無し。 */
+    fun connectIsekaiStunP2p(config: IsekaiStunP2pConfig) {
+        if (_state.value.let { it.connected || it.isConnecting }) return
+        try {
+            orchestrator.connectIsekaiStunP2p(config)
+        } catch (e: SshException) {
+            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
+        }
+    }
+
     fun send(bytes: ByteArray) = orchestrator.send(bytes)
     fun resize(cols: UInt, rows: UInt) = orchestrator.resize(cols, rows)
 

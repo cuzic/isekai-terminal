@@ -11,6 +11,7 @@ import org.json.JSONObject
 import tools.isekai.terminal.session.PhysicalMultipathFds
 import uniffi.tssh_core.ForwardType
 import uniffi.tssh_core.HelperQuicConfig
+import uniffi.tssh_core.IsekaiStunP2pConfig
 import uniffi.tssh_core.JumpConfig
 import uniffi.tssh_core.MultipathHelperQuicConfig
 import uniffi.tssh_core.PortForward
@@ -88,6 +89,9 @@ data class ConnectionProfile(
     @ColumnInfo(name = "jump_username") val jumpUsername: String? = null,
     @ColumnInfo(name = "jump_auth_type") val jumpAuthType: String? = null, // "password" | "key"
     @ColumnInfo(name = "jump_key_id") val jumpKeyId: Long? = null,
+    // Phase 10: STUN+SSHランデブーによる直接P2P QUIC(TransportPreference.ISEKAI_STUN_P2P_QUIC)
+    // 選択時のみ使うSTUNサーバー(host:port)。null/空なら DEFAULT_STUN_SERVER を使う。
+    @ColumnInfo(name = "stun_server") val stunServer: String? = null,
 ) : Parcelable {
     val transportPreference: TransportPreference
         get() = try {
@@ -104,6 +108,10 @@ data class ConnectionProfile(
         /** tsshd のデフォルト待受ポート。変更する場合も過去の Room migration 内の
          *  リテラル値（そのマイグレーションを書いた時点のデフォルト、という歴史的記録）は書き換えないこと。 */
         const val DEFAULT_TSSHD_PORT = 2222
+
+        /** [stunServer] 未設定時に使う既定の公開STUNサーバー。双方が同じサーバーを
+         *  使う必要は無い(isekai_stun_p2p_transport.rs参照)ため、これは単なるデフォルト値。 */
+        const val DEFAULT_STUN_SERVER = "stun.l.google.com:19302"
     }
 }
 
@@ -226,6 +234,23 @@ fun ConnectionProfile.toHelperQuicConfig(
         cols = cols,
         rows = rows,
         jump = toJumpConfigOrNull(jumpAuth),
+    )
+
+fun ConnectionProfile.toIsekaiStunP2pConfig(
+    auth: SshAuth,
+    jumpAuth: SshAuth? = null,
+    cols: UInt = 80u,
+    rows: UInt = 24u,
+): IsekaiStunP2pConfig =
+    IsekaiStunP2pConfig(
+        sshHost = host,
+        sshPort = port.toUShort(),
+        username = username,
+        auth = auth,
+        cols = cols,
+        rows = rows,
+        jump = toJumpConfigOrNull(jumpAuth),
+        stunServer = stunServer?.takeIf { it.isNotBlank() } ?: ConnectionProfile.DEFAULT_STUN_SERVER,
     )
 
 fun ConnectionProfile.toMultipathHelperQuicConfig(

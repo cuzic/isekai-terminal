@@ -20,6 +20,7 @@ import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.data.toHelperQuicConfig
+import tools.isekai.terminal.data.toIsekaiStunP2pConfig
 import tools.isekai.terminal.data.toMultipathHelperQuicConfig
 import tools.isekai.terminal.data.toQuicConfig
 import tools.isekai.terminal.data.toSshConfig
@@ -33,6 +34,7 @@ import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.tssh_core.CellData
 import uniffi.tssh_core.HelperQuicConfig
+import uniffi.tssh_core.IsekaiStunP2pConfig
 import uniffi.tssh_core.MultipathHelperQuicConfig
 import uniffi.tssh_core.QuicConfig
 import uniffi.tssh_core.SshAuth
@@ -300,6 +302,8 @@ class TerminalTabsViewModel(
                     tab.upstreamFailoverEnabledForCurrentSession = profile.enableUpstreamFailover
                     connectMultipathHelperQuic(tab, profile.toMultipathHelperQuicConfig(auth, physicalFds, jumpAuth))
                 }
+                TransportPreference.ISEKAI_STUN_P2P_QUIC ->
+                    connectIsekaiStunP2p(tab, profile.toIsekaiStunP2pConfig(auth, jumpAuth))
             }
         }
     }
@@ -327,6 +331,11 @@ class TerminalTabsViewModel(
     private fun connectMultipathHelperQuic(tab: TabState, config: MultipathHelperQuicConfig) {
         executor.ensureServiceRunning()
         tab.session.connectMultipathHelperQuic(config)
+    }
+
+    private fun connectIsekaiStunP2p(tab: TabState, config: IsekaiStunP2pConfig) {
+        executor.ensureServiceRunning()
+        tab.session.connectIsekaiStunP2p(config)
     }
 
     private suspend fun resolveAuth(tab: TabState, profile: ConnectionProfile, password: String?): SshAuth? {

@@ -6,10 +6,12 @@ import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextInput
 import androidx.test.core.app.ApplicationProvider
 import tools.isekai.terminal.data.Repositories
@@ -219,6 +221,66 @@ class ProfileEditScreenTest {
         composeTestRule.onNodeWithText("bastion.example.com").assertExists()
         composeTestRule.onNodeWithText("jumper").assertExists()
         composeTestRule.onNodeWithText("2200").assertExists()
+    }
+
+    // ── STUN+SSHランデブー方式のP2P ─────────────────────────────────────
+
+    @Test fun stunChip_hiddenField_untilSelected() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("STUN P2P QUIC（実験的）").assertExists()
+        composeTestRule.onNodeWithText("STUNサーバー（任意）").assertDoesNotExist()
+    }
+
+    @Test fun stunChip_selecting_showsStunServerField() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("STUN P2P QUIC（実験的）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("STUNサーバー（任意）").assertExists()
+    }
+
+    @Test fun stunServerField_isOptional_saveButtonStillEnabled() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("StunHost")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("STUN P2P QUIC（実験的）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        // stun_server は任意入力なので、未入力のままでも保存可能であるべき。
+        composeTestRule.onNodeWithText("保存").performScrollTo().assertIsEnabled()
+    }
+
+    @Test fun saveNewProfile_withStunServer_persistsField() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("StunProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("STUN P2P QUIC（実験的）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("STUNサーバー（任意）").performTextInput("stun.example.com:3478")
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "StunProfile" }
+            assertTrue(stored.transportPreferenceName == "ISEKAI_STUN_P2P_QUIC")
+            assertTrue(stored.stunServer == "stun.example.com:3478")
+        }
+    }
+
+    @Test fun editProfile_prefillsStunServer() {
+        val profile = sampleProfile().copy(
+            transportPreferenceName = "ISEKAI_STUN_P2P_QUIC",
+            stunServer = "stun.example.com:3478",
+        )
+        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("stun.example.com:3478").assertExists()
     }
 
 }
