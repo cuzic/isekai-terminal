@@ -1464,8 +1464,10 @@ Web検索で実在・現状Needs Triageであることを確認済み——Phase
 
 次フェーズ着手前に反映すべき指摘（実装はまだ行っていない。次セッションでの着手候補として記録）:
 
-**P0（Phase 11で着手予定、実装未着手）**
-1. `relay_jwt`平文保存を「MVP限定TODO」ではなく明示的なsecurity debt issueとして扱う
+**P0（Phase 11で着手予定）**
+1. ✅ `relay_jwt`平文保存を「MVP限定TODO」ではなく明示的なsecurity debt issueとして扱う
+   → [issue #1](https://github.com/cuzic/isekai-terminal/issues/1)を起票し、`ConnectionProfile.kt`の
+   コメントから参照するよう変更（Phase 12でのKeystoreKekベースvault移行までcloseしない）
 2. STUN/Relayの「フォールバックなし」を内部実装のままにしつつ、ユーザー向けには
    Strict Isekai Link / Smart Connect / Plain SSHのような接続ポリシーとして明示する案
 3. noq #738により物理マルチパスがunavailableであることをUI/docs/testsに反映
