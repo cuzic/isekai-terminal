@@ -141,6 +141,18 @@ impl ActiveSession {
             }
         }
     }
+    /// Phase 12: per-session theme。全トランスポート共通(`Terminal`/`SessionCore`は
+    /// トランスポート非依存)なので、`add_local_forward`と違い対象外の分岐は無い。
+    fn set_theme(&self, theme: crate::theme::Theme) {
+        match self {
+            Self::Ssh(s) => s.set_theme(theme),
+            Self::Quic(s) => s.set_theme(theme),
+            Self::HelperQuic(s) => s.set_theme(theme),
+            Self::MultipathHelperQuic(s) => s.set_theme(theme),
+            Self::IsekaiStunP2p(s) => s.set_theme(theme),
+            Self::IsekaiLinkRelay(s) => s.set_theme(theme),
+        }
+    }
 }
 
 // ── Shared internal state ─────────────────────────────────
@@ -554,6 +566,21 @@ impl SessionOrchestrator {
     pub fn remove_forward(&self, id: String) {
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.remove_forward(id);
+        }
+    }
+
+    /// Phase 12: このセッション(タブ)だけの配色テーマを差し替える(per-session theme)。
+    /// アプリ全体の既定テーマ(`set_terminal_theme`)とは独立しており、以降このタブが
+    /// 解決する SGR にのみ反映される(既に画面/scrollbackに積まれたセルは遡って
+    /// 再着色されない、`set_terminal_theme`と同じ制約)。
+    ///
+    /// `ansi16`/`default_fg`/`default_bg`は`set_terminal_theme`と同じ形式。呼び出し側
+    /// (Kotlin `TerminalTabsViewModel`)が「Global default → Profile default →
+    /// Tab/session override」の解決を行い、結果をここへ渡す。
+    pub fn set_session_theme(&self, ansi16: Vec<u32>, default_fg: u32, default_bg: u32) {
+        let theme = crate::theme::from_raw(ansi16, default_fg, default_bg);
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.set_theme(theme);
         }
     }
 

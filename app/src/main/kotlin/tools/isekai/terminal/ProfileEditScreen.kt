@@ -44,6 +44,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
+import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.tssh_core.ForwardType
 import uniffi.tssh_core.PortForward
@@ -97,6 +98,8 @@ fun ProfileEditScreen(
     val keys by vm.keys.collectAsStateWithLifecycle()
     val isSaving by vm.isSaving.collectAsStateWithLifecycle()
 
+    // Phase 12 P2-1: per-session/per-hostのterminal theme。null="グローバル既定に従う"。
+    var themeName by remember { mutableStateOf(profile?.themeName) }
     var label by remember { mutableStateOf(profile?.label ?: "") }
     var host by remember { mutableStateOf(profile?.host ?: "") }
     var port by remember { mutableStateOf((profile?.port ?: 22).toString()) }
@@ -592,6 +595,33 @@ fun ProfileEditScreen(
 
         Spacer(Modifier.height(4.dp))
 
+        Text("配色テーマ", fontWeight = FontWeight.Bold)
+        Text(
+            "未指定ならアプリ全体の既定テーマに従います（ホームの「配色」設定）。" +
+                "このプロファイルで接続したタブは、後からタブ側で個別に上書きすることもできます。",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+        ) {
+            FilterChip(
+                selected = themeName == null,
+                onClick = { themeName = null },
+                label = { Text("既定に従う") },
+            )
+            TerminalThemes.ALL.forEach { theme ->
+                FilterChip(
+                    selected = themeName == theme.name,
+                    onClick = { themeName = theme.name },
+                    label = { Text(theme.name) },
+                )
+            }
+        }
+
+        Spacer(Modifier.height(4.dp))
+
         Text("ポートフォワード", fontWeight = FontWeight.Bold)
         Text(
             "接続確立後、指定したローカルポートへの接続をリモートホストへ中継します(現状は -L のみ対応)。",
@@ -727,6 +757,7 @@ fun ProfileEditScreen(
                         postConnectCommands = postConnectCommands.trim().takeIf { it.isNotEmpty() },
                         forwards = forwardDrafts.mapNotNull { it.toPortForwardOrNull() },
                         allowNonLoopbackForwardBind = allowNonLoopbackForwardBind,
+                        themeName = themeName,
                         enableAgentForward = enableAgentForward,
                         jumpHost = if (useJumpHost) jumpHost.trim() else null,
                         jumpPort = jumpPort.toIntOrNull() ?: 22,

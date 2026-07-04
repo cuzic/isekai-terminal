@@ -60,11 +60,7 @@ pub(crate) fn init_logger() {}
 /// 遡って再着色されない（既知の制約）。
 #[uniffi::export]
 pub fn set_terminal_theme(ansi16: Vec<u32>, default_fg: u32, default_bg: u32) {
-    let mut table = theme::Theme::default().ansi16;
-    for (slot, v) in table.iter_mut().zip(ansi16.into_iter()) {
-        *slot = v;
-    }
-    theme::set(theme::Theme { ansi16: table, default_fg, default_bg });
+    theme::set(theme::from_raw(ansi16, default_fg, default_bg));
 }
 
 // ── 公開型 ──────────────────────────────────────────────
@@ -373,6 +369,11 @@ impl SshSession {
                 log::warn!("ssh: remove_forward command dropped (channel full)");
             }
         }
+    }
+
+    /// Phase 12: per-session theme。SessionOrchestrator からのみ呼ばれる内部API。
+    pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
+        self.core.set_theme(theme);
     }
 }
 

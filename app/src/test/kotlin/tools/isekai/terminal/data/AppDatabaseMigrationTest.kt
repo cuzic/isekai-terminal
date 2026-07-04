@@ -121,7 +121,7 @@ class AppDatabaseMigrationTest {
             .addMigrations(
                 AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11,
                 AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14,
-                AppDatabase.MIGRATION_14_15,
+                AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16,
             )
             .build()
 
@@ -235,7 +235,7 @@ class AppDatabaseMigrationTest {
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
             .addMigrations(
                 AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12,
-                AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15,
+                AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16,
             )
             .build()
         try {
@@ -349,7 +349,7 @@ class AppDatabaseMigrationTest {
 
         // Room 経由で開くと MIGRATION_14_15 が適用されるはず。
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_14_15)
+            .addMigrations(AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }

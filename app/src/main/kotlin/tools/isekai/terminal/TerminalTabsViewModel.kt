@@ -32,6 +32,8 @@ import tools.isekai.terminal.session.AuthValidator
 import tools.isekai.terminal.session.PhysicalMultipathFds
 import tools.isekai.terminal.session.RealHostKeyChecker
 import tools.isekai.terminal.session.TerminalSession
+import tools.isekai.terminal.ui.TerminalTheme
+import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.tssh_core.CellData
 import uniffi.tssh_core.HelperQuicConfig
@@ -92,6 +94,8 @@ class TerminalTabsViewModel(
         val session: TerminalSession,
         val profile: ConnectionProfile?,
         val label: String,
+        initialTheme: TerminalTheme,
+        initialThemeIsOverridden: Boolean,
     ) {
         // 接続前のバリデーションエラー。session.state (Rust 由来) には混入させず合成する。
         internal val preConnectError = MutableStateFlow<String?>(null)
@@ -108,6 +112,15 @@ class TerminalTabsViewModel(
         // ── upstream フェイルオーバー ────────────────────────────
         internal var upstreamFailoverEnabledForCurrentSession = false
         internal val rebindInFlight = AtomicBoolean(false)
+
+        // ── 配色テーマ（Phase 12 P2-1: per-session/per-host theme）───────
+        // Global default → Profile default → Tab/session override の3段階のうち、
+        // このタブが「今」使っているテーマの解決結果。isThemeOverridden が false の間は
+        // アプリ全体のテーマ変更が [TerminalTabsViewModel.applyGlobalThemeToNonOverriddenTabs]
+        // 経由でここへ反映され続ける。true になった後(このタブだけ個別に変更した後)は
+        // 以後グローバル変更の影響を受けない。
+        internal val currentTheme = MutableStateFlow(initialTheme)
+        internal var isThemeOverridden: Boolean = initialThemeIsOverridden
 
         /** UI が購読する合成済み状態。 */
         val uiState: Flow<TerminalUiState> = session.state.combine(preConnectError) { s, err ->
@@ -141,11 +154,27 @@ class TerminalTabsViewModel(
 
     // ── タブのライフサイクル ────────────────────────────────────────
 
+    /**
+     * アプリ全体の既定テーマ(ProfileListScreenの配色ダイアログが書き込む
+     * SharedPreferences("tssh_ui"))を読む。[openTab]でプロファイルにテーマ指定が
+     * 無い場合の解決や、[applyGlobalThemeToNonOverriddenTabs]の呼び出し元(MainActivity)
+     * が渡してくる値の既定として使う。
+     */
+    private fun currentGlobalTheme(): TerminalTheme {
+        val prefs = getApplication<Application>().getSharedPreferences("tssh_ui", android.content.Context.MODE_PRIVATE)
+        return TerminalThemes.byName(prefs.getString(TerminalThemes.PREF_KEY, null))
+    }
+
     /** 新しいタブを開いて接続を開始し、そのタブをアクティブにする。生成した tabId を返す。 */
     fun openTab(profile: ConnectionProfile, password: String? = null, jumpPassword: String? = null): String {
         val tabId = UUID.randomUUID().toString()
         val session = sessionFactory()
-        val tab = TabState(tabId, session, profile, profile.label)
+        // Phase 12 P2-1: Global default → Profile default の解決。プロファイルに明示的な
+        // テーマ指定があれば、その時点で「上書き済み」タブとして扱う(以後グローバル変更に
+        // 追従しない。ユーザーがそのプロファイル用に選んだ意図を尊重する)。
+        val profileTheme = profile.themeName?.let { TerminalThemes.byName(it) }
+        val initialTheme = profileTheme ?: currentGlobalTheme()
+        val tab = TabState(tabId, session, profile, profile.label, initialTheme, initialThemeIsOverridden = profileTheme != null)
 
         RemoteLogger.i("TsshTabsVM", "openTab '${profile.label}' id=$tabId")
         _tabs.update { it + tab }
@@ -313,6 +342,39 @@ class TerminalTabsViewModel(
                     val decrypted = profile.copy(relayJwt = profile.relayJwt?.let { executor.decryptRelayJwt(it) })
                     connectIsekaiLinkRelay(tab, decrypted.toIsekaiLinkRelayConfig(auth, jumpAuth))
                 }
+            }
+            // Phase 12 P2-1: このタブが解決したテーマ(Global default → Profile default)を
+            // 接続直後に反映する。connect_* はRust側で同期的にActiveSessionを差し込むため、
+            // このタイミングで呼べば確実にセッションへ届く。
+            pushThemeToSession(tab, tab.currentTheme.value)
+        }
+    }
+
+    private fun pushThemeToSession(tab: TabState, theme: TerminalTheme) {
+        tab.session.setTheme(theme.ansi16Argb(), theme.foregroundArgb(), theme.backgroundArgb())
+    }
+
+    /**
+     * このタブだけの配色テーマを明示的に変更する(Tab/session override)。
+     * 以後このタブは[applyGlobalThemeToNonOverriddenTabs]の影響を受けなくなる。
+     */
+    fun setTabTheme(tabId: String, theme: TerminalTheme) {
+        val tab = tabOrNull(tabId) ?: return
+        tab.isThemeOverridden = true
+        tab.currentTheme.value = theme
+        pushThemeToSession(tab, theme)
+    }
+
+    /**
+     * アプリ全体の既定テーマが変更された時に呼ぶ。まだタブ固有の上書きをしていない
+     * ([TabState.isThemeOverridden] が false の)タブにだけそのまま反映する。
+     * MainActivity の ProfileListScreen 側テーマ変更コールバックから呼ばれる想定。
+     */
+    fun applyGlobalThemeToNonOverriddenTabs(theme: TerminalTheme) {
+        _tabs.value.forEach { tab ->
+            if (!tab.isThemeOverridden) {
+                tab.currentTheme.value = theme
+                pushThemeToSession(tab, theme)
             }
         }
     }

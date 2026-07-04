@@ -8,6 +8,7 @@ use russh_keys::{HashAlg, PrivateKey, PublicKey};
 use tokio::net::TcpListener;
 
 use crate::agent_forward;
+use crate::theme::Theme;
 use crate::{ForwardState, JumpConfig, SshAuth};
 
 // ── Transport command / event ────────────────────────────
@@ -55,6 +56,8 @@ pub(crate) enum SessionCmd {
     TrzszChunk         { transfer_id: String, data: Vec<u8>, is_last: bool },
     TrzszAcceptDownload { transfer_id: String },
     TrzszCancel        { transfer_id: String },
+    /// Phase 12: per-session theme。以降にパースされるSGRの色解決にのみ反映される。
+    SetTheme(Theme),
 }
 
 // ── russh Handler ────────────────────────────────────────

@@ -157,6 +157,14 @@ impl HelperQuicSession {
     }
 }
 
+// SessionOrchestrator からのみ呼ばれる内部API(uniffi には直接は出さない)。
+impl HelperQuicSession {
+    /// Phase 12: per-session theme。
+    pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
+        self.core.set_theme(theme);
+    }
+}
+
 // ── 証明書ピン留め ───────────────────────────────────────
 // handshake JSON の cert_sha256（SSH チャネル経由で受け渡し済み、TOFU より強い信頼の起点）
 // とだけ照合する。通常の CA チェーン検証は行わない（自己署名 ephemeral cert のため）。

@@ -108,6 +108,11 @@ impl QuicSession {
             }
         }
     }
+
+    /// Phase 12: per-session theme。SessionOrchestrator からのみ呼ばれる内部API。
+    pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
+        self.core.set_theme(theme);
+    }
 }
 
 // ── 証明書検証スキップ (スパイク用) ──────────────────────

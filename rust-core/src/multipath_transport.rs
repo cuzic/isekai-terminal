@@ -216,6 +216,14 @@ impl MultipathHelperQuicSession {
     }
 }
 
+// SessionOrchestrator からのみ呼ばれる内部API(uniffi には直接は出さない)。
+impl MultipathHelperQuicSession {
+    /// Phase 12: per-session theme。
+    pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
+        self.core.set_theme(theme);
+    }
+}
+
 // ── path broker（二値状態のみ、Phase 9-2 スコープ） ──────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

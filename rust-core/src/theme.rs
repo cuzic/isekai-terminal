@@ -30,24 +30,40 @@ impl Default for Theme {
     }
 }
 
-/// プロセス全体で共有されるグローバルなテーマ設定。
+/// アプリ全体の既定テーマ設定(プロセス全体で共有されるグローバル状態)。
 ///
-/// テーマはプロファイル毎ではなく Kotlin 側の `SharedPreferences("tssh_ui")` に保存される
-/// グローバル設定であり（`set_terminal_theme` 参照）、どのセッション（`Terminal`）から見ても
-/// 同じテーブルを参照する必要があるため、`Terminal` インスタンスにテーブルを持たせるのではなく
-/// プロセス全体の `static` として保持する。既存コードの並行制御パターン
-/// （`parking_lot::Mutex` を使った `Arc<Mutex<_>>` 共有）に合わせ、読み取りが多く書き込みが
-/// 稀なこのテーブルには `parking_lot::RwLock` を採用した。
+/// Kotlin 側の `SharedPreferences("tssh_ui")` に保存される、アプリ全体のデフォルト値
+/// （`set_terminal_theme` 参照）。Phase 12 より前はこれが全セッション共通の唯一の
+/// テーマだったが、現在は各セッション(タブ)が `Terminal.theme`
+/// （`SessionCore::current_theme` 経由）に自分のテーマのスナップショットを持ち、
+/// - 新規タブ作成時（`SessionCore::start`）にこの既定値をスナップショットする
+/// - プロファイル固有のテーマ・タブごとの上書きがあれば、その後
+///   `SessionOrchestrator::set_session_theme` で明示的に上書きする
+/// という形で「Global default → Profile default → Tab/session override」の
+/// 3段階を実現している（Kotlin 側 `TerminalTabsViewModel` 参照）。
 static THEME: LazyLock<RwLock<Theme>> = LazyLock::new(|| RwLock::new(Theme::default()));
 
-/// 現在のテーマのスナップショットを取得する。
-/// 呼び出し以降にパースされる SGR の色解決にのみ影響し、既に scrollback に
-/// 積まれた行は遡って再着色されない（既知の制約）。
+/// アプリ全体の既定テーマのスナップショットを取得する。
+/// 呼び出し以降に新規作成されるセッションの初期テーマにのみ影響し、既存セッションの
+/// テーマを変更したい場合は `SessionOrchestrator::set_session_theme` を使うこと。
 pub(crate) fn current() -> Theme {
     *THEME.read()
 }
 
-/// テーマを差し替える。以降に `Terminal` が解決する SGR の色に反映される。
+/// アプリ全体の既定テーマを差し替える。以降に新規作成される（＝プロファイル/タブ固有の
+/// 上書きを持たない）セッションの初期テーマに反映される。既存セッションには影響しない
+/// （Kotlin 側が非上書きのタブへ個別に `set_session_theme` を呼んで伝播させる設計）。
 pub(crate) fn set(theme: Theme) {
     *THEME.write() = theme;
+}
+
+/// UniFFI境界で渡ってくる生の値(`ansi16`は16色に満たない場合が既定値で埋められる)から
+/// [Theme] を組み立てる。グローバル設定(`set_terminal_theme`)・per-session設定
+/// (`SessionOrchestrator::set_session_theme`)の両方で共有するロジック。
+pub(crate) fn from_raw(ansi16: Vec<u32>, default_fg: u32, default_bg: u32) -> Theme {
+    let mut table = Theme::default().ansi16;
+    for (slot, v) in table.iter_mut().zip(ansi16.into_iter()) {
+        *slot = v;
+    }
+    Theme { ansi16: table, default_fg, default_bg }
 }

@@ -15,7 +15,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -101,6 +103,9 @@ private fun TabLabel(
     onClose: () -> Unit,
 ) {
     val uiState by tab.uiState.collectAsStateWithLifecycle(initialValue = TerminalUiState())
+    val currentTheme by tab.currentTheme.collectAsStateWithLifecycle()
+    var showThemeDialog by remember { mutableStateOf(false) }
+
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
             modifier = Modifier
@@ -119,9 +124,21 @@ private fun TabLabel(
             modifier = Modifier.padding(start = 6.dp, end = 4.dp),
             maxLines = 1,
         )
+        // Phase 12 P2-1: このタブだけの配色テーマ変更(tab/session override)。
+        IconButton(onClick = { showThemeDialog = true }, modifier = Modifier.size(20.dp)) {
+            Text("🎨", fontSize = 12.sp)
+        }
         IconButton(onClick = onClose, modifier = Modifier.size(20.dp)) {
             Text("×", color = Color(0xFFAAAAAA), fontSize = 16.sp)
         }
+    }
+
+    if (showThemeDialog) {
+        TerminalThemeDialog(
+            current = currentTheme.name,
+            onSelect = { theme -> tabsVm.setTabTheme(tab.tabId, theme) },
+            onDismiss = { showThemeDialog = false },
+        )
     }
 }
 

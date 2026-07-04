@@ -18,12 +18,12 @@
 #    - reserved に current 以下の値(＝削除し忘れ)が残っていないこと
 #    を検証する。
 
-current = 15
+current = 16
 
 # 予約中のマイグレーション(未マージ)。マージ後は必ず削除すること。
 # 例:
 # [[reserved]]
-# version = 16
+# version = 17
 # owner = "phase12-relay-credential-vault"
 # branch = "agent/relay-jwt-keystore"
 # reserved_at = "2026-07-04"

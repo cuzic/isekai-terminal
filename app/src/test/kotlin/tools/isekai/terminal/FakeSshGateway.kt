@@ -125,6 +125,11 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     override fun removeForward(id: String) { removedForwardId = id }
 
+    val setSessionThemeCalls = mutableListOf<Triple<List<UInt>, UInt, UInt>>()
+    override fun setSessionTheme(ansi16: List<UInt>, defaultFg: UInt, defaultBg: UInt) {
+        setSessionThemeCalls.add(Triple(ansi16, defaultFg, defaultBg))
+    }
+
 
     // trzszDismiss() fires Idle synchronously, matching real Rust behavior
     override fun trzszDismiss() {

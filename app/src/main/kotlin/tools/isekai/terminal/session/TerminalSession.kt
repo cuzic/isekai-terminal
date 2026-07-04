@@ -284,6 +284,11 @@ class TerminalSession(
     fun scrollbackCells(offset: Int, rows: Int): List<CellData>? =
         orchestrator.scrollbackCells(offset.toUInt(), rows.toUInt())
 
+    /** Phase 12: このタブだけの配色テーマを差し替える(per-session theme)。
+     *  アプリ全体の既定テーマとは独立しており、以降このタブが解決するSGRにのみ反映される。 */
+    fun setTheme(ansi16: List<UInt>, defaultFg: UInt, defaultBg: UInt) =
+        orchestrator.setSessionTheme(ansi16, defaultFg, defaultBg)
+
     // ── Network ───────────────────────────────────────────────────────
 
     /** ネットワーク断イベントをそのまま Rust 側に転送する。

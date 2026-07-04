@@ -1,6 +1,7 @@
 use vte::Parser;
 use timed_fsm::{TimedStateMachine, TimerCommand, Response};
 use crate::terminal::{Terminal, TermCell};
+use crate::theme::Theme;
 use crate::trzsz::{TrzszTransferFsm, TrzszEffect, TrzszEvent, TrzszMode, TrzszTimer};
 
 // ── 出力型 ───────────────────────────────────────────────
@@ -38,9 +39,9 @@ pub(crate) struct SessionState {
 }
 
 impl SessionState {
-    pub(crate) fn new(cols: usize, rows: usize) -> Self {
+    pub(crate) fn new(cols: usize, rows: usize, theme: Theme) -> Self {
         SessionState {
-            terminal: Terminal::new(cols, rows),
+            terminal: Terminal::new(cols, rows, theme),
             parser: Parser::new(),
             fsm: TrzszTransferFsm::new(),
         }
@@ -48,10 +49,17 @@ impl SessionState {
 
     pub(crate) fn terminal(&self) -> &Terminal { &self.terminal }
 
-    /// リサイズ時にターミナル・パーサーをリセットする。
+    /// このセッションのテーマを差し替える。以降にパースされるSGRの色解決にのみ反映される。
+    pub(crate) fn set_theme(&mut self, theme: Theme) {
+        self.terminal.set_theme(theme);
+    }
+
+    /// リサイズ時にターミナル・パーサーをリセットする。現在のテーマは引き継ぐ
+    /// (リサイズのついでにテーマがグローバル既定へ戻ってしまわないようにする)。
     pub(crate) fn reset_for_resize(&mut self, cols: usize, rows: usize) {
+        let theme = self.terminal.theme();
         self.terminal.take_scrollback();  // 旧サイズの pending 行を破棄
-        self.terminal = Terminal::new(cols, rows);
+        self.terminal = Terminal::new(cols, rows, theme);
         self.parser = Parser::new();
     }
 
@@ -132,7 +140,7 @@ mod tests {
 
     #[test]
     fn test_ascii_passthrough_to_vte() {
-        let mut state = SessionState::new(80, 24);
+        let mut state = SessionState::new(80, 24, Theme::default());
         let r = state.on_stdout(b"hello".to_vec());
         assert!(r.screen_dirty);
         assert!(r.side_effects.is_empty());
@@ -143,7 +151,7 @@ mod tests {
 
     #[test]
     fn test_pending_rows_returned_on_scroll() {
-        let mut state = SessionState::new(10, 3);
+        let mut state = SessionState::new(10, 3, Theme::default());
         let mut all_rows: Vec<Vec<TermCell>> = Vec::new();
         for i in 0..5u8 {
             let r = state.on_stdout(format!("line{}\r\n", i).into_bytes());
@@ -156,7 +164,7 @@ mod tests {
     #[test]
     fn test_timer_cmds_forwarded() {
         // タイマー命令が ProcessResult に含まれることを確認
-        let mut state = SessionState::new(80, 24);
+        let mut state = SessionState::new(80, 24, Theme::default());
         let r = state.on_stdout(b"normal text".to_vec());
         // 通常テキストはタイマー命令を生まない
         assert!(r.timer_cmds.is_empty());
@@ -164,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_resize_clears_terminal() {
-        let mut state = SessionState::new(80, 24);
+        let mut state = SessionState::new(80, 24, Theme::default());
         let _ = state.on_stdout(b"hello".to_vec());
         assert_eq!(state.terminal().screen_cells()[0].ch.as_str(), "h");
         state.reset_for_resize(40, 12);
@@ -181,7 +189,7 @@ mod tests {
         fn prop_no_panic_and_invariants(
             bytes in proptest::collection::vec(any::<u8>(), 0..512)
         ) {
-            let mut state = SessionState::new(80, 24);
+            let mut state = SessionState::new(80, 24, Theme::default());
             let r = state.on_stdout(bytes);
             // screen_cells の長さは常に cols × rows
             let t = state.terminal();
@@ -203,7 +211,7 @@ mod tests {
                 1..8,
             )
         ) {
-            let mut state = SessionState::new(40, 12);
+            let mut state = SessionState::new(40, 12, Theme::default());
             for bytes in rounds {
                 let _ = state.on_stdout(bytes);
             }
@@ -220,7 +228,7 @@ mod tests {
             rows in 4usize..40,
             after in proptest::collection::vec(any::<u8>(), 0..256),
         ) {
-            let mut state = SessionState::new(80, 24);
+            let mut state = SessionState::new(80, 24, Theme::default());
             let _ = state.on_stdout(before);
             state.reset_for_resize(cols, rows);
             let _ = state.on_stdout(after);

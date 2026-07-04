@@ -1528,11 +1528,36 @@ Web検索で実在・現状Needs Triageであることを確認済み——Phase
   path1のTailscale⇔直接アドレス切替）と、Phase 9-4bのupstream failover機能
   （`enableUpstreamFailover`、rebind_abstract経由で実機確認済みの別機能）は対象外。
 
-**P2（後回しでよい）**
-- per-session/per-hostのterminal theme（現状グローバルstatic THEME）
-- QUIC系トランスポートでのagent forwarding対応
-- Remote/Dynamic port forward
-- msquic/channel-masque sidecar実験（同一プロセス共存は避ける方針で合意）
+**P2（ユーザー優先度判断: 1→2→3→4の順）**
+
+1. ✅ per-session/per-hostのterminal theme（現状グローバルstatic THEME）
+   → `ThemeDefinition`(グローバル/DB管理)・`ThemeResolved`(session/tabごとのimmutable
+   snapshot)・ANSI→RGB解決はRust側`SessionOrchestrator`配下、という設計方針の通りに実装。
+   Rust側: `Terminal`が`theme: Theme`フィールドを持ち構築時に受け取る(グローバルを都度
+   読みには行かない)。`SessionCore`が`current_theme`(接続=タブ作成時にグローバル既定を
+   スナップショット)を保持し、`set_theme()`で`SessionCmd::SetTheme`経由でTerminalへ
+   反映(以降にパースされるSGRにのみ反映、既存の制約を維持)。全6トランスポート(Ssh/
+   Quic/HelperQuic/MultipathHelperQuic/IsekaiStunP2p/IsekaiLinkRelay)に同じ委譲
+   メソッドを追加し、`SessionOrchestrator::set_session_theme(ansi16, defaultFg,
+   defaultBg)`として統一公開。
+   Kotlin側: `ConnectionProfile.themeName`(Room migration 15→16、null=グローバル既定に
+   従う)を追加。`TerminalTabsViewModel.TabState`が`currentTheme`(StateFlow)・
+   `isThemeOverridden`を持ち、Global default → Profile default → Tab/session override
+   の3段階を解決。`applyGlobalThemeToNonOverriddenTabs`でグローバル変更を非上書きタブに
+   だけ伝播(MainActivityのProfileListScreen呼び出し経由)。`TerminalHostScreen`のタブ
+   ラベルに🎨ボタンを追加しタブ個別上書きが可能。`ProfileEditScreen`にプロファイル
+   単位のテーマ選択(FilterChip、「既定に従う」+プリセット4種)を追加。
+   Rust新規テスト2件(構築時テーマ・set_theme後方影響のみ)、Kotlin新規テスト7件
+   (ViewModel4件・ProfileEditScreen3件)を追加。
+2. Remote/Dynamic port forward（plain SSH限定、LocalForwardRunner/RemoteForwardRunner/
+   DynamicSocksForwardRunnerに責務分離、クライアント側は非ループバックbindを既定拒否）
+3. QUIC系トランスポートでのagent forwarding対応は設計のみ固めて実装は後回し
+   （isekai-helper protocolへのAgentForward stream type追加が前提、relay/MASQUE系は
+   既定OFF・当面対象外、自作helper直結QUICのみ将来opt-in候補）
+4. msquic/channel-masque sidecar実験は今は着手しない（parking lot）。着手条件:
+   外部MASQUEサーバーとのinterop要件発生／noq・h3-noqで仕様上どうしても通せない／
+   商用relay提供者がmsquic前提、のいずれかが発生した時点で再検討。IPCはやるなら
+   まずUnix domain socket(共有メモリは時期尚早)。
 
 判断が割れなかった点（両者一致）: noq単一スタック方針の継続は妥当、フォールバックなし設計自体は
 セキュリティ的に正しい、Room migration番号体系（線形バージョニング）自体は変えない。

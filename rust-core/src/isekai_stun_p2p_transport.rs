@@ -148,6 +148,14 @@ impl IsekaiStunP2pSession {
     }
 }
 
+// SessionOrchestrator からのみ呼ばれる内部API(uniffi には直接は出さない)。
+impl IsekaiStunP2pSession {
+    /// Phase 12: per-session theme。
+    pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
+        self.core.set_theme(theme);
+    }
+}
+
 // ── STUN 問い合わせ・ブートストラップ ─────────────────────
 
 /// 自分自身の STUN 観測アドレスを調べつつ、その同じソケットで SSH ブートストラップ経由の

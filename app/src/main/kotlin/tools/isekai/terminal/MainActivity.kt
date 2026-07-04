@@ -77,6 +77,13 @@ fun AppRoot() {
                 },
                 onManageKeys = { navController.navigate(AppRoutes.KEY_LIST) },
                 onManageSnippets = { navController.navigate(AppRoutes.SNIPPET_LIST) },
+                // Phase 12 P2-1: アプリ全体の既定テーマ変更を、まだ個別上書きしていない
+                // (isThemeOverridden=false の)タブにも反映する。tabsVm は Activity スコープ
+                // なので、まだ1つもタブが無い状態(list が空)でも安全に呼べる。
+                applyTerminalTheme = { theme ->
+                    setTerminalTheme(theme.ansi16Argb(), theme.foregroundArgb(), theme.backgroundArgb())
+                    tabsVm.applyGlobalThemeToNonOverriddenTabs(theme)
+                },
             )
         }
 

@@ -108,6 +108,11 @@ data class ConnectionProfile(
     // 既定false。Kotlin UI側の警告表示だけに頼らず、コア側でも同じ判断を強制する
     // (Rust SSOTルール)。
     @ColumnInfo(name = "allow_non_loopback_forward_bind") val allowNonLoopbackForwardBind: Boolean = false,
+    // Phase 12 P2-1: per-session/per-hostのterminal theme。プロファイル単位の配色既定
+    // (TerminalThemes のプリセット名)。null ならアプリ全体のグローバル既定(SharedPreferences
+    // "tssh_ui")に従う。タブを開いた時点でのみ解決され、タブ内で個別に上書きもできる
+    // (Global default → Profile default → Tab/session override、TerminalTabsViewModel参照)。
+    @ColumnInfo(name = "theme_name") val themeName: String? = null,
 ) : Parcelable {
     val transportPreference: TransportPreference
         get() = try {

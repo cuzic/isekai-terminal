@@ -427,4 +427,56 @@ class TerminalTabsViewModelTest {
         val matching = orchestrators[0].sentBytes.count { it.toString(Charsets.UTF_8) == "echo hi\r" }
         assertEquals(2, matching)
     }
+
+    // ── Phase 12 P2-1: per-session/per-hostのterminal theme ──────────────
+
+    @Test
+    fun openTab_withoutProfileTheme_appliesGlobalDefaultAndIsNotOverridden() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+
+        assertFalse(tab(id).isThemeOverridden)
+        assertEquals(1, orchestrators[0].setSessionThemeCalls.size)
+    }
+
+    @Test
+    fun openTab_withProfileTheme_appliesItAndMarksOverridden() = runBlocking {
+        val p = profile("a").copy(themeName = tools.isekai.terminal.ui.TerminalThemes.DRACULA.name)
+        val id = vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+
+        assertTrue(tab(id).isThemeOverridden)
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.DRACULA, tab(id).currentTheme.value)
+        val (ansi16, fg, bg) = orchestrators[0].setSessionThemeCalls.last()
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.DRACULA.ansi16Argb(), ansi16)
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.DRACULA.foregroundArgb(), fg)
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.DRACULA.backgroundArgb(), bg)
+    }
+
+    @Test
+    fun setTabTheme_marksOverriddenAndPushesToSession() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        val callsBefore = orchestrators[0].setSessionThemeCalls.size
+
+        vm.setTabTheme(id, tools.isekai.terminal.ui.TerminalThemes.NORD)
+
+        assertTrue(tab(id).isThemeOverridden)
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD, tab(id).currentTheme.value)
+        assertEquals(callsBefore + 1, orchestrators[0].setSessionThemeCalls.size)
+    }
+
+    @Test
+    fun applyGlobalThemeToNonOverriddenTabs_skipsOverriddenTabs() = runBlocking {
+        val followingId = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        val overriddenId = vm.openTab(profile("b"), "pass")
+        awaitConnectCalled(orchestrators[1])
+        vm.setTabTheme(overriddenId, tools.isekai.terminal.ui.TerminalThemes.DRACULA)
+
+        vm.applyGlobalThemeToNonOverriddenTabs(tools.isekai.terminal.ui.TerminalThemes.SOLARIZED_DARK)
+
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.SOLARIZED_DARK, tab(followingId).currentTheme.value)
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.DRACULA, tab(overriddenId).currentTheme.value)
+    }
 }

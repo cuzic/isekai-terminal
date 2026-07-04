@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.semantics.SemanticsActions
@@ -378,5 +379,44 @@ class ProfileEditScreenTest {
         composeTestRule.onNodeWithText("relay.example.com:443").assertExists()
         composeTestRule.onNodeWithText("relay.example.com").assertExists()
         composeTestRule.onNodeWithText("eyJhbGciOiJSUzI1NiJ9.test.sig").assertExists()
+    }
+
+    // ── Phase 12 P2-1: per-session/per-hostのterminal theme ──────────────
+
+    @Test fun newProfile_defaultsToFollowingGlobalTheme() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("既定に従う").assertIsSelected()
+    }
+
+    @Test fun selectingProfileTheme_andSaving_persistsThemeName() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("ThemedProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+
+        composeTestRule.onNodeWithText(tools.isekai.terminal.ui.TerminalThemes.DRACULA.name)
+            .performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText(tools.isekai.terminal.ui.TerminalThemes.DRACULA.name).assertIsSelected()
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "ThemedProfile" }
+            assertTrue(stored.themeName == tools.isekai.terminal.ui.TerminalThemes.DRACULA.name)
+        }
+    }
+
+    @Test fun editProfile_prefillsSelectedTheme() {
+        val profile = sampleProfile().copy(themeName = tools.isekai.terminal.ui.TerminalThemes.NORD.name)
+        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText(tools.isekai.terminal.ui.TerminalThemes.NORD.name).assertIsSelected()
     }
 }

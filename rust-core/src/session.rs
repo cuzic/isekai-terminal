@@ -9,6 +9,7 @@ use timed_fsm::TimerCommand;
 use crate::{CellData, ScreenUpdate, SessionCallback, RUNTIME};
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
 use crate::terminal::{TermCell, Terminal};
+use crate::theme::Theme;
 use crate::transport::{SessionCmd, TransportCommand, TransportEvent};
 use crate::trzsz::{TrzszMode, TrzszTimer};
 
@@ -75,6 +76,9 @@ pub(crate) struct SessionCore {
     session_tx: Mutex<Option<tokio::sync::mpsc::Sender<SessionCmd>>>,
     scrollback: Arc<Mutex<VecDeque<Vec<TermCell>>>>,
     screen_cols: Mutex<u32>,
+    /// Phase 12: per-session theme。このセッション(タブ)が現在使っているテーマの
+    /// スナップショット。[scrollback_cells]の空白パディング色にもここから使う。
+    current_theme: Mutex<Theme>,
 }
 
 impl SessionCore {
@@ -84,6 +88,7 @@ impl SessionCore {
             session_tx: Mutex::new(None),
             scrollback: Arc::new(Mutex::new(VecDeque::new())),
             screen_cols: Mutex::new(80),
+            current_theme: Mutex::new(Theme::default()),
         }
     }
 
@@ -101,15 +106,30 @@ impl SessionCore {
         *self.session_tx.lock() = Some(session_cmd_tx);
         *self.screen_cols.lock() = cols;
         self.scrollback.lock().clear();
+        // 接続(タブ作成)時点のグローバル既定テーマをスナップショットする。呼び出し側
+        // (Kotlin)がプロファイル固有のテーマを使いたい場合は、この直後に[set_theme]を
+        // 呼んで明示的に上書きする。
+        let initial_theme = crate::theme::current();
+        *self.current_theme.lock() = initial_theme;
 
         let callback: Arc<dyn SessionCallback> = Arc::from(callback);
         let scrollback = self.scrollback.clone();
 
         RUNTIME.spawn(async move {
-            session_event_loop(event_rx, session_cmd_rx, cmd_tx, callback, scrollback, cols, rows).await;
+            session_event_loop(event_rx, session_cmd_rx, cmd_tx, callback, scrollback, cols, rows, initial_theme).await;
         });
 
         (cmd_rx, event_tx)
+    }
+
+    /// このセッション(タブ)のテーマを差し替える。[start]の前後どちらで呼んでも安全
+    /// (start前に呼んだ場合は次のstart時に上書きされてしまうため、通常はstartの直後に
+    /// 呼ぶこと)。
+    pub(crate) fn set_theme(&self, theme: Theme) {
+        *self.current_theme.lock() = theme;
+        if let Some(tx) = self.session_tx.lock().as_ref() {
+            let _ = tx.try_send(SessionCmd::SetTheme(theme));
+        }
     }
 
     /// transport コマンド送信端を複製して返す。connect() 直後に
@@ -123,7 +143,7 @@ impl SessionCore {
     }
 
     pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
-        let theme = crate::theme::current();
+        let theme = *self.current_theme.lock();
         let cols = *self.screen_cols.lock() as usize;
         let sb = self.scrollback.lock();
         let blank = CellData { ch: " ".into(), fg: theme.default_fg, bg: theme.default_bg, bold: false };
@@ -204,9 +224,10 @@ pub(crate) async fn session_event_loop(
     scrollback: Arc<Mutex<VecDeque<Vec<TermCell>>>>,
     init_cols: u32,
     init_rows: u32,
+    initial_theme: Theme,
 ) {
     info!("session: event loop start {}x{}", init_cols, init_rows);
-    let mut state = SessionState::new(init_cols as usize, init_rows as usize);
+    let mut state = SessionState::new(init_cols as usize, init_rows as usize, initial_theme);
     let (timeout_tx, mut timeout_rx) = tokio::sync::mpsc::channel::<TrzszTimer>(16);
     let mut timer_rt = TokioTimerRuntime::new(timeout_tx);
 
@@ -276,6 +297,15 @@ pub(crate) async fn session_event_loop(
                         state.on_kotlin_accept_download(transfer_id),
                     SessionCmd::TrzszCancel { transfer_id } =>
                         state.on_kotlin_cancel(transfer_id),
+                    SessionCmd::SetTheme(theme) => {
+                        state.set_theme(theme);
+                        ProcessResult {
+                            timer_cmds: Vec::new(),
+                            side_effects: Vec::new(),
+                            pending_rows: Vec::new(),
+                            screen_dirty: false,
+                        }
+                    }
                 }),
                 None => None,
             },

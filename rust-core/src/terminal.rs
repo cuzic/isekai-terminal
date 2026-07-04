@@ -1,5 +1,5 @@
 use vte::Perform;
-use crate::theme::{self, Theme};
+use crate::theme::Theme;
 
 /// `38;5;n` / `48;5;n`（indexed color）を ARGB へ解決する。
 /// `0..=15` は現在のテーマの ANSI 16色テーブルを参照する（それ以外は固定の 216色/グレースケール）。
@@ -32,6 +32,10 @@ pub(crate) struct TermCell {
 /// スクロールアウトした行は `pending_scrollback` に積み、
 /// 呼び出し元が `take_scrollback()` でフラッシュする。
 pub(crate) struct Terminal {
+    /// このセッション(タブ)固有のテーマスナップショット。Phase 12: per-session theme。
+    /// `set_theme()`で明示的に更新されるまで変わらない(グローバルの`theme::current()`を
+    /// 都度読みには行かない)。
+    theme: Theme,
     cols: usize,
     rows: usize,
     main_cells: Vec<TermCell>,
@@ -53,11 +57,14 @@ pub(crate) struct Terminal {
 }
 
 impl Terminal {
-    pub(crate) fn new(cols: usize, rows: usize) -> Self {
-        let theme = theme::current();
+    /// `theme`はこのセッション(タブ)が使う配色のスナップショット。呼び出し元
+    /// (`SessionState`/`SessionCore`)が「グローバル既定を使うか、プロファイル/タブ固有の
+    /// 上書きを使うか」を解決した結果をそのまま渡す。
+    pub(crate) fn new(cols: usize, rows: usize, theme: Theme) -> Self {
         let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: theme.default_fg, bg: theme.default_bg, bold: false };
         let cells = vec![blank.clone(); cols * rows];
         Terminal {
+            theme,
             cols, rows,
             main_cells: cells.clone(),
             alt_cells: cells,
@@ -72,6 +79,18 @@ impl Terminal {
             application_cursor_mode: false,
             bracketed_paste_mode: false,
         }
+    }
+
+    /// このセッションのテーマを差し替える。以降に解決される SGR にのみ反映され、
+    /// 既に解決済みのセル(画面上・scrollback上とも)は遡って再着色されない。
+    pub(crate) fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    /// 現在のテーマのスナップショット([SessionState::reset_for_resize]がリサイズ時に
+    /// 新しい`Terminal`へ引き継ぐために使う)。
+    pub(crate) fn theme(&self) -> Theme {
+        self.theme
     }
 
     /// スクロールアウトした行を取り出す。呼び出し後はバッファが空になる。
@@ -89,7 +108,7 @@ impl Terminal {
     pub(crate) fn screen_cells(&self) -> &[TermCell] { self.cells() }
 
     fn reset_all(&mut self) {
-        let theme = theme::current();
+        let theme = self.theme;
         let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: theme.default_fg, bg: theme.default_bg, bold: false };
         let cells = vec![blank; self.cols * self.rows];
         self.main_cells = cells.clone();
@@ -129,7 +148,7 @@ impl Terminal {
                 self.cur_fg, self.cur_bg, self.cur_bold,
             ));
         }
-        let theme = theme::current();
+        let theme = self.theme;
         self.main_cells = self.cells().clone();
         let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: theme.default_fg, bg: theme.default_bg, bold: false };
         self.alt_cells = vec![blank; self.cols * self.rows];
@@ -206,7 +225,7 @@ impl Terminal {
     fn handle_sgr(&mut self, ps: &[u16]) {
         // SGR 解決に使うテーブルはこの呼び出し時点のグローバルテーマから取得する
         // （`set_terminal_theme` で差し替え可能。以前に解決済みのセルは遡って再着色されない）。
-        let theme = theme::current();
+        let theme = self.theme;
         if ps.is_empty() {
             self.cur_fg = theme.default_fg;
             self.cur_bg = theme.default_bg;
@@ -401,12 +420,6 @@ mod tests {
     use vte::Parser;
     use proptest::prelude::*;
 
-    /// `theme::THEME` はプロセス全体で共有されるグローバル static であり、
-    /// `cargo test` はデフォルトでテストを複数スレッドで並行実行するため、
-    /// テーマの値そのものを検証するテスト同士が競合しないようこのロックで直列化する。
-    /// （テーマを直接読み書きしない大半のテストは対象外でよい）
-    static TEST_THEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn feed(t: &mut Terminal, bytes: &[u8]) {
         let mut p = Parser::new();
         for &b in bytes { p.advance(t, b); }
@@ -418,7 +431,7 @@ mod tests {
 
     #[test]
     fn test_print_ascii() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"hello");
         assert_eq!(cell(&t, 0, 0), "h");
         assert_eq!(cell(&t, 0, 4), "o");
@@ -428,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_cr_lf() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"hello\r\nworld");
         assert_eq!(cell(&t, 0, 0), "h");
         assert_eq!(cell(&t, 1, 0), "w");
@@ -438,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_scroll_pushes_pending() {
-        let mut t = Terminal::new(10, 3);
+        let mut t = Terminal::new(10, 3, Theme::default());
         // 4 行流すと 1 行スクロールアウト
         feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3");
         let pending = t.take_scrollback();
@@ -448,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_cursor_address_csi_h() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b[6;11H");  // row=6, col=11（1-indexed）
         assert_eq!(t.cursor_row(), 5);
         assert_eq!(t.cursor_col(), 10);
@@ -456,7 +469,7 @@ mod tests {
 
     #[test]
     fn test_erase_display_j2() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"hello\x1b[2J");
         assert_eq!(cell(&t, 0, 0), " ");
         assert_eq!(t.cursor_row(), 0);
@@ -465,8 +478,7 @@ mod tests {
 
     #[test]
     fn test_sgr_ansi_color() {
-        let _guard = TEST_THEME_LOCK.lock().unwrap();
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b[31mA");  // red fg
         let c = &t.screen_cells()[0];
         assert_eq!(c.ch.as_str(), "A");
@@ -475,45 +487,53 @@ mod tests {
 
     #[test]
     fn test_sgr_reset() {
-        let _guard = TEST_THEME_LOCK.lock().unwrap();
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b[31m\x1b[0mB");
         assert_eq!(t.screen_cells()[0].fg, Theme::default().default_fg);
     }
 
     #[test]
-    fn test_theme_switch_changes_sgr_resolution() {
-        // 案C: パレットは Rust 側のグローバルテーマとして差し替え可能。
-        // `theme::set()` 以降にパースされる SGR の色解決結果が変わることを検証する。
-        let _guard = TEST_THEME_LOCK.lock().unwrap();
-        let original = theme::current();
-
+    fn test_custom_theme_passed_at_construction_changes_sgr_resolution() {
+        // Phase 12: per-session theme。Terminal::new()に明示的に渡したテーマが
+        // 初期デフォルト色にもSGR解決にも使われる(グローバルは一切参照しない)。
         let mut custom = Theme::default();
         custom.ansi16[1] = 0xFF123456;   // 赤(index 1)を差し替え
         custom.default_fg = 0xFF111111;
         custom.default_bg = 0xFF222222;
-        theme::set(custom);
 
-        // 差し替え後に作成した Terminal は新しいデフォルト色で初期化される
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, custom);
         assert_eq!(t.screen_cells()[0].fg, 0xFF111111);
         assert_eq!(t.screen_cells()[0].bg, 0xFF222222);
 
-        // 差し替え後にパースした SGR も新しいテーブルで解決される
         feed(&mut t, b"\x1b[31mA");
         assert_eq!(t.screen_cells()[0].fg, 0xFF123456);
 
-        // 256色パレットの 0..=15 部分も新テーブルを参照する
+        // 256色パレットの 0..=15 部分も同テーブルを参照する
         feed(&mut t, b"\r\x1b[38;5;1mB");
         assert_eq!(t.screen_cells()[0].fg, 0xFF123456);
+    }
 
-        // 元に戻す（他のテストに影響を残さない）
-        theme::set(original);
+    #[test]
+    fn test_set_theme_affects_only_future_sgr_resolution() {
+        // Phase 12: per-session theme。set_theme()は「以降にパースされるSGR」にのみ
+        // 反映され、既に解決済みのセルは遡って再着色されない(既存の仕様を維持)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[31mA");
+        let original_red = t.screen_cells()[0].fg;
+
+        let mut custom = Theme::default();
+        custom.ansi16[1] = 0xFF123456;
+        t.set_theme(custom);
+
+        assert_eq!(t.screen_cells()[0].fg, original_red);
+
+        feed(&mut t, b"\r\x1b[31mB");
+        assert_eq!(t.screen_cells()[0].fg, 0xFF123456);
     }
 
     #[test]
     fn test_alt_screen_switch() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"main");
         feed(&mut t, b"\x1b[?1049h");   // alt に切り替え（カーソル保存）
         assert_eq!(cell(&t, 0, 0), " "); // alt は空白
@@ -523,14 +543,14 @@ mod tests {
 
     #[test]
     fn test_title_osc() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b]0;My Title\x07");
         assert_eq!(t.title(), Some("My Title"));
     }
 
     #[test]
     fn test_backspace() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"ab\x08c");  // a b BS c → "ac" at col 0,1
         assert_eq!(cell(&t, 0, 0), "a");
         assert_eq!(cell(&t, 0, 1), "c");
@@ -539,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_cursor_up_down_csi() {
-        let mut t = Terminal::new(80, 24);
+        let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b[5B");  // cursor down 5
         assert_eq!(t.cursor_row(), 5);
         feed(&mut t, b"\x1b[2A");  // cursor up 2
@@ -548,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_erase_line_k0() {
-        let mut t = Terminal::new(10, 5);
+        let mut t = Terminal::new(10, 5, Theme::default());
         feed(&mut t, b"hello");
         feed(&mut t, b"\x1b[1G\x1b[2K");  // col=1 then erase whole line
         for i in 0..10 {
@@ -562,14 +582,14 @@ mod tests {
         /// 任意バイト列でパニックしない
         #[test]
         fn prop_no_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
-            let mut t = Terminal::new(80, 24);
+            let mut t = Terminal::new(80, 24, Theme::default());
             feed(&mut t, &bytes);
         }
 
         /// カーソルは常に画面内に収まる
         #[test]
         fn prop_cursor_in_bounds(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
-            let mut t = Terminal::new(80, 24);
+            let mut t = Terminal::new(80, 24, Theme::default());
             feed(&mut t, &bytes);
             prop_assert!(t.cursor_row() < t.rows(),
                 "cursor_row={} >= rows={}", t.cursor_row(), t.rows());
@@ -584,7 +604,7 @@ mod tests {
             rows in 4usize..40,
             bytes in proptest::collection::vec(any::<u8>(), 0..512),
         ) {
-            let mut t = Terminal::new(cols, rows);
+            let mut t = Terminal::new(cols, rows, Theme::default());
             feed(&mut t, &bytes);
             prop_assert_eq!(t.screen_cells().len(), cols * rows);
         }
@@ -596,7 +616,7 @@ mod tests {
             rows in 3usize..10,
             bytes in proptest::collection::vec(any::<u8>(), 0..512),
         ) {
-            let mut t = Terminal::new(cols, rows);
+            let mut t = Terminal::new(cols, rows, Theme::default());
             feed(&mut t, &bytes);
             for row in t.take_scrollback() {
                 prop_assert_eq!(row.len(), cols);

@@ -135,6 +135,14 @@ impl IsekaiLinkRelaySession {
     }
 }
 
+// SessionOrchestrator からのみ呼ばれる内部API(uniffi には直接は出さない)。
+impl IsekaiLinkRelaySession {
+    /// Phase 12: per-session theme。
+    pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
+        self.core.set_theme(theme);
+    }
+}
+
 // ── ブートストラップ ─────────────────────────────────────
 
 async fn try_connect_isekai_link_relay(

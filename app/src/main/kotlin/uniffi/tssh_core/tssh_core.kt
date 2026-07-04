@@ -960,6 +960,8 @@ external fun uniffi_tssh_core_checksum_method_sessionorchestrator_scrollback_len
 ): Int
 external fun uniffi_tssh_core_checksum_method_sessionorchestrator_send(
 ): Int
+external fun uniffi_tssh_core_checksum_method_sessionorchestrator_set_session_theme(
+): Int
 external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_download(
 ): Int
 external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_upload(
@@ -1215,6 +1217,8 @@ external fun uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_cells(`pt
 external fun uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
 external fun uniffi_tssh_core_fn_method_sessionorchestrator_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionorchestrator_set_session_theme(`ptr`: Long,`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_accept_download(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1646,6 +1650,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_send() != 49699) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_set_session_theme() != 1433) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_download() != 63735) {
@@ -4280,6 +4287,18 @@ public interface SessionOrchestratorInterface {
     
     fun `send`(`data`: kotlin.ByteArray)
     
+    /**
+     * Phase 12: このセッション(タブ)だけの配色テーマを差し替える(per-session theme)。
+     * アプリ全体の既定テーマ(`set_terminal_theme`)とは独立しており、以降このタブが
+     * 解決する SGR にのみ反映される(既に画面/scrollbackに積まれたセルは遡って
+     * 再着色されない、`set_terminal_theme`と同じ制約)。
+     *
+     * `ansi16`/`default_fg`/`default_bg`は`set_terminal_theme`と同じ形式。呼び出し側
+     * (Kotlin `TerminalTabsViewModel`)が「Global default → Profile default →
+     * Tab/session override」の解決を行い、結果をここへ渡す。
+     */
+    fun `setSessionTheme`(`ansi16`: List<kotlin.UInt>, `defaultFg`: kotlin.UInt, `defaultBg`: kotlin.UInt)
+    
     fun `trzszAcceptDownload`()
     
     fun `trzszAcceptUpload`(`fileName`: kotlin.String, `fileSize`: kotlin.ULong, `mode`: kotlin.UInt)
@@ -4648,6 +4667,28 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_send(
         it,
         FfiConverterByteArray.lower(`data`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Phase 12: このセッション(タブ)だけの配色テーマを差し替える(per-session theme)。
+     * アプリ全体の既定テーマ(`set_terminal_theme`)とは独立しており、以降このタブが
+     * 解決する SGR にのみ反映される(既に画面/scrollbackに積まれたセルは遡って
+     * 再着色されない、`set_terminal_theme`と同じ制約)。
+     *
+     * `ansi16`/`default_fg`/`default_bg`は`set_terminal_theme`と同じ形式。呼び出し側
+     * (Kotlin `TerminalTabsViewModel`)が「Global default → Profile default →
+     * Tab/session override」の解決を行い、結果をここへ渡す。
+     */override fun `setSessionTheme`(`ansi16`: List<kotlin.UInt>, `defaultFg`: kotlin.UInt, `defaultBg`: kotlin.UInt)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_set_session_theme(
+        it,
+        FfiConverterSequenceUInt.lower(`ansi16`),FfiConverterUInt.lower(`defaultFg`),FfiConverterUInt.lower(`defaultBg`),_status)
 }
     }
     

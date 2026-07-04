@@ -197,7 +197,7 @@ fun ProfileListScreen(
 }
 
 @Composable
-private fun TerminalThemeDialog(
+internal fun TerminalThemeDialog(
     current: String,
     onSelect: (TerminalTheme) -> Unit,
     onDismiss: () -> Unit,
