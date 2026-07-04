@@ -1518,7 +1518,15 @@ Web検索で実在・現状Needs Triageであることを確認済み——Phase
   マッピング関数のまま維持。実機テスト`RelayCredentialVaultTest`を追加。
   残作業(未着手、P1として継続): access_jwt短命化・メモリのみ保持、refresh/device token
   発行・revoke/rotateという、relay認可サーバーの実装を前提とした本格的なcredential vault設計。
-- Phase 9-4を正式機能ではなくexperimental feature flagへ格下げ
+- ✅ Phase 9-4を正式機能ではなくexperimental feature flagへ格下げ
+  → `app/build.gradle.kts`に`BuildConfig.ENABLE_EXPERIMENTAL_PHYSICAL_MULTIPATH`を追加
+  （defaultConfigでtrue・releaseビルドでfalseに上書き）。`ProfileEditScreen`の
+  「Wi-Fi/セルラー物理無線への同時マルチパス」チェックボックス・キャプション・
+  セルラー用別リモートアドレス欄一式をこのフラグでガードし、一般ユーザー向けの
+  リリースビルドでは非表示に、debugビルド(開発・実機検証用)では引き続き表示するように
+  した。noq #738の影響を受けない「自作ヘルパー QUIC（マルチパス）」チップ本体（path0/
+  path1のTailscale⇔直接アドレス切替）と、Phase 9-4bのupstream failover機能
+  （`enableUpstreamFailover`、rebind_abstract経由で実機確認済みの別機能）は対象外。
 
 **P2（後回しでよい）**
 - per-session/per-hostのterminal theme（現状グローバルstatic THEME）

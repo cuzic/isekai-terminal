@@ -506,39 +506,44 @@ fun ProfileEditScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(
-                    checked = enablePhysicalMultipath,
-                    onCheckedChange = { enablePhysicalMultipath = it },
-                )
-                Text("Wi-Fi/セルラー物理無線への同時マルチパス（現在利用不可）")
-            }
-            Text(
-                text = "状態: 現在利用不可。原因: noq側の既知バグ" +
-                    "（open_path()にlocal_ip明示指定した経路でPATH_RESPONSEが届かずvalidation " +
-                    "failedになる、noq issue #738、Needs Triage）。フォールバック: ONにしても" +
-                    "実際には物理無線への同時バインドは行われず、上の「直接到達アドレス」欄による" +
-                    "Tailscale⇔直接アドレスのマルチパスのみが有効なままです（日和見的フォールバック、" +
-                    "黙って無効化されるだけでエラーにはなりません）。noq側の修正が入り次第有効化予定です。" +
-                    "Tailscale使用中はさらにOSの制約で物理無線への明示的なバインドができません。",
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            if (enablePhysicalMultipath) {
-                OutlinedTextField(
-                    value = cellularRemoteAddress,
-                    onValueChange = { cellularRemoteAddress = it },
-                    label = { Text("セルラー用の別リモートアドレス（任意、実験的）") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
+            // Phase 9-4: noq #738により常時no-opなので、一般ユーザー向けリリースビルドでは
+            // 非表示にする(experimental feature flag、外部レビュー指摘対応)。debugビルドでは
+            // 開発・実機検証のため引き続き表示する。
+            if (BuildConfig.ENABLE_EXPERIMENTAL_PHYSICAL_MULTIPATH) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = enablePhysicalMultipath,
+                        onCheckedChange = { enablePhysicalMultipath = it },
+                    )
+                    Text("Wi-Fi/セルラー物理無線への同時マルチパス（現在利用不可・開発者向け）")
+                }
                 Text(
-                    text = "同一サーバーの別アドレス（例: IPv6）をセルラー経路専用に指定できます。" +
-                        "未入力なら上の直接到達アドレスと同じものを使います。",
+                    text = "状態: 現在利用不可。原因: noq側の既知バグ" +
+                        "（open_path()にlocal_ip明示指定した経路でPATH_RESPONSEが届かずvalidation " +
+                        "failedになる、noq issue #738、Needs Triage）。フォールバック: ONにしても" +
+                        "実際には物理無線への同時バインドは行われず、上の「直接到達アドレス」欄による" +
+                        "Tailscale⇔直接アドレスのマルチパスのみが有効なままです（日和見的フォールバック、" +
+                        "黙って無効化されるだけでエラーにはなりません）。noq側の修正が入り次第有効化予定です。" +
+                        "Tailscale使用中はさらにOSの制約で物理無線への明示的なバインドができません。",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+
+                if (enablePhysicalMultipath) {
+                    OutlinedTextField(
+                        value = cellularRemoteAddress,
+                        onValueChange = { cellularRemoteAddress = it },
+                        label = { Text("セルラー用の別リモートアドレス（任意、実験的）") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text(
+                        text = "同一サーバーの別アドレス（例: IPv6）をセルラー経路専用に指定できます。" +
+                            "未入力なら上の直接到達アドレスと同じものを使います。",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
 
             Row(verticalAlignment = Alignment.CenterVertically) {

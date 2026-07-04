@@ -17,6 +17,12 @@ android {
         versionCode = 1
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Phase 9-4(物理Wi-Fi/セルラー同時マルチパス)は noq issue #738
+        // (https://github.com/n0-computer/noq/issues/738、Needs Triage)により現状常に
+        // no-op(黙って直接アドレスのみのマルチパスへフォールバック)。一般ユーザー向けの
+        // リリースビルドでは非表示にし、開発・実機検証用のdebugビルドでのみ見せる
+        // (外部レビュー指摘対応、PLAN.md Phase 10完了後の外部レビューP1参照)。
+        buildConfigField("boolean", "ENABLE_EXPERIMENTAL_PHYSICAL_MULTIPATH", "true")
     }
 
     buildTypes {
@@ -26,6 +32,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            buildConfigField("boolean", "ENABLE_EXPERIMENTAL_PHYSICAL_MULTIPATH", "false")
         }
     }
     compileOptions {
