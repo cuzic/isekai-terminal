@@ -14,9 +14,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use base64::Engine as _;
+use isekai_protocol::handshake::decode_handshake_json;
 use log::{info, warn};
 use russh::{client, ChannelMsg};
-use serde::Deserialize;
 
 use crate::transport::RusshEventHandler;
 
@@ -45,22 +45,14 @@ pub enum BootstrapError {
     HandshakeParse(String),
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct HelperHandshake {
-    pub v: u32,
-    pub listen_port: u16,
-    pub cert_sha256: String,
-    pub session_secret: String,
-    /// Phase 10: `--stun-server` を渡したときのみ存在しうる。`isekai_stun_p2p_transport.rs`
-    /// 参照。`None` は「未指定」と「STUN問い合わせ失敗」の両方を表す（HELPER_PROTOCOL.md参照）。
-    #[serde(default)]
-    pub stun_observed_addr: Option<String>,
-    /// Phase 10: `--relay` を渡したときのみ存在しうる。`isekai_link_relay_transport.rs`参照。
-    /// STUNと異なり、relay接続自体が失敗すればhelperの起動自体が失敗するため、`--relay`指定時は
-    /// 必ず値が入る（HELPER_PROTOCOL.md参照）。
-    #[serde(default)]
-    pub relay_public_addr: Option<String>,
-}
+/// Phase S-0f: 独自定義をやめ、`isekai-protocol`（pure crate、`isekai-ssh`/
+/// `isekai-transport` とも共有）の `HandshakeJson` を型として再利用する
+/// （フィールド構成は元々同一だった。ISEKAI_SSH_DESIGN.md「共有ロジックの
+/// crate 分割」参照）。`stun_observed_addr`/`relay_public_addr` の意味は
+/// `isekai_protocol::handshake::HandshakeJson` のdocコメント、または
+/// Phase 10 の `isekai_stun_p2p_transport.rs`/`isekai_link_relay_transport.rs`
+/// を参照。
+pub type HelperHandshake = isekai_protocol::handshake::HandshakeJson;
 
 /// SSH起動コマンドラインに埋め込む、P2P方式ごとの追加引数。3方式は互いに排他
 /// （isekai-helper側の`--relay`と`--stun-server`/`--punch-peer`は併用不可、
@@ -251,8 +243,12 @@ async fn launch_and_capture_handshake(
         .find(|line| !line.is_empty())
         .ok_or(BootstrapError::HandshakeTimeout)?;
 
-    serde_json::from_slice(first_line)
-        .map_err(|e| BootstrapError::HandshakeParse(e.to_string()))
+    // `decode_handshake_json` は素の `serde_json::from_slice` と違い、サイズ上限・
+    // `v`/`cert_sha256`/`session_secret`/`listen_port` のフォーマット検証も行う
+    // （isekai-protocol crate、`isekai_protocol::handshake` のdocコメント参照）。
+    // isekai-helper からの応答は SSH exec 経由の外部入力なので、この検証強化は
+    // 素直に恩恵がある。
+    decode_handshake_json(first_line).map_err(|e| BootstrapError::HandshakeParse(e.to_string()))
 }
 
 /// isekai-helper が起動していることを保証し、ハンドシェイクを返す。

@@ -20,6 +20,8 @@ use russh::client;
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use sha2::{Digest, Sha256};
 
+use isekai_protocol::hello::{decode_ack_response, encode_hello, AckResponse, Proof};
+
 use crate::helper_bootstrap::{self, BootstrapError, HelperBinaries, HelperHandshake, HelperP2pMode};
 use crate::resume_client::{self, ClientResumeState};
 use crate::transport::{
@@ -47,17 +49,17 @@ const CLIENT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 数回分の PING ロスを許容できるようにする。
 const CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
-// Phase 9-2 (multipath_transport.rs) もこのワイヤー契約・埋め込みバイナリを共有する
-// ため pub(crate) にしてある（HELPER_PROTOCOL.md の契約は接続経路が単一パスか
+// Phase 9-2 (multipath_transport.rs)・Phase 10 (isekai_stun_p2p_transport.rs /
+// isekai_link_relay_transport.rs) もこのワイヤー契約・埋め込みバイナリを共有する
+// ため pub(crate) re-export してある（HELPER_PROTOCOL.md の契約は接続経路が単一パスか
 // multipath かによらず同一）。
-pub(crate) const EXPORTER_LABEL: &[u8] = b"isekai-helper-auth-v1";
-pub(crate) const ALPN: &[u8] = b"isekai-helper/1";
-pub(crate) const FRAME_HELLO: u8 = 0x01;
-pub(crate) const FRAME_ACK: u8 = 0x02;
-pub(crate) const FRAME_REJECT_TARGET: u8 = 0xFC;
-pub(crate) const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
-pub(crate) const FRAME_REJECT_DUPLICATE: u8 = 0xFE;
-pub(crate) const FRAME_REJECT_AUTH: u8 = 0xFF;
+// Phase S-0f: 値そのものの定義は isekai-protocol crate（pure crate、CLI版の
+// isekai-ssh/isekai-transport とも共有）に一本化し、ここでは re-export するだけにする
+// （ISEKAI_SSH_DESIGN.md「共有ロジックの crate 分割」参照）。
+pub(crate) use isekai_protocol::hello::{
+    ALPN, EXPORTER_LABEL, FRAME_ACK, FRAME_HELLO, FRAME_REJECT_AUTH, FRAME_REJECT_DUPLICATE,
+    FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED,
+};
 
 /// isekai-helper/Cargo.toml の version と一致させる。バージョン不一致時は
 /// helper_bootstrap::ensure_helper_running が再配布する。
@@ -392,22 +394,20 @@ async fn connect_helper_quic_stream(
     let proof = compute_proof(&conn, &session_secret, b"")?;
 
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi failed: {e}"))?;
-    let mut hello = Vec::with_capacity(33);
-    hello.push(FRAME_HELLO);
-    hello.extend_from_slice(&proof);
-    send.write_all(&hello).await.map_err(|e| format!("HELLO write failed: {e}"))?;
+    send.write_all(&encode_hello(&Proof::new(proof)))
+        .await
+        .map_err(|e| format!("HELLO write failed: {e}"))?;
 
     let mut resp = [0u8; 1];
     recv.read_exact(&mut resp).await.map_err(|e| format!("ACK read failed: {e}"))?;
-    match resp[0] {
-        FRAME_ACK => {}
-        FRAME_REJECT_AUTH => return Err("isekai-helper rejected: auth (proof mismatch)".to_string()),
-        FRAME_REJECT_DUPLICATE => {
+    match decode_ack_response(resp[0]).map_err(|e| format!("isekai-helper: {e}"))? {
+        AckResponse::Ack => {}
+        AckResponse::RejectAuth => return Err("isekai-helper rejected: auth (proof mismatch)".to_string()),
+        AckResponse::RejectDuplicate => {
             return Err("isekai-helper rejected: duplicate active connection".to_string())
         }
-        FRAME_REJECT_TARGET => return Err("isekai-helper rejected: target unreachable".to_string()),
-        FRAME_REJECT_UNSUPPORTED => return Err("isekai-helper rejected: unsupported frame".to_string()),
-        other => return Err(format!("isekai-helper: unexpected response byte {other:#x}")),
+        AckResponse::RejectTarget => return Err("isekai-helper rejected: target unreachable".to_string()),
+        AckResponse::RejectUnsupported => return Err("isekai-helper rejected: unsupported frame".to_string()),
     }
     info!("helper_quic: HELLO/ACK ok — handing off to SSH");
 
