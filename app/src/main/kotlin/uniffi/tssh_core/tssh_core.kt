@@ -5584,6 +5584,16 @@ data class MultipathHelperQuicConfig (
      * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
      */
     var `jump`: JumpConfig?
+    , 
+    /**
+     * isekai-helperのQUIC待受ポートをユーザー指定で固定する(`None`なら、
+     * `direct_host`が設定されている場合のみ既定値`DIRECT_MULTIPATH_BIND_PORT`を使う、
+     * 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
+     * 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
+     * `None`の場合はRust側で従来通りの既定値フォールバックを維持する
+     * (`HelperQuicConfig.bind_port`のdocコメントも参照)。
+     */
+    var `bindPort`: kotlin.UShort?
     
 ){
     
@@ -5613,6 +5623,7 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalTypeJumpConfig.read(buf),
+            FfiConverterOptionalUShort.read(buf),
         )
     }
 
@@ -5629,7 +5640,8 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
             FfiConverterTypeSshAuth.allocationSize(value.`auth`) +
             FfiConverterUInt.allocationSize(value.`cols`) +
             FfiConverterUInt.allocationSize(value.`rows`) +
-            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`)
+            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`) +
+            FfiConverterOptionalUShort.allocationSize(value.`bindPort`)
     )
 
     override fun write(value: MultipathHelperQuicConfig, buf: ByteBuffer) {
@@ -5646,6 +5658,7 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
             FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
+            FfiConverterOptionalUShort.write(value.`bindPort`, buf)
     }
 }
 

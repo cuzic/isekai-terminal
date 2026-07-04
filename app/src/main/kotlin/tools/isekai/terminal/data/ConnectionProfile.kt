@@ -340,4 +340,5 @@ fun ConnectionProfile.toMultipathHelperQuicConfig(
         cols = cols,
         rows = rows,
         jump = toJumpConfigOrNull(jumpAuth),
+        bindPort = helperBindPort?.toUShort(),
     )

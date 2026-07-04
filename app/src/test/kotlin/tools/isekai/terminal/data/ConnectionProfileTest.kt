@@ -131,6 +131,25 @@ class ConnectionProfileTest {
         assertEquals("", config.relayJwt)
     }
 
+    // ── toMultipathHelperQuicConfig ───────────────────────────────────────
+
+    @Test fun `toMultipathHelperQuicConfig maps ssh connection and direct_host fields`() {
+        val config = profile().copy(directAddress = "203.0.113.5:45823").toMultipathHelperQuicConfig(auth)
+        assertEquals("example.com", config.sshHost)
+        assertEquals(2222.toUShort(), config.sshPort)
+        assertEquals("203.0.113.5:45823", config.directHost)
+    }
+
+    @Test fun `toMultipathHelperQuicConfig maps helperBindPort to bindPort when set`() {
+        val config = profile().copy(helperBindPort = 45900).toMultipathHelperQuicConfig(auth)
+        assertEquals(45900.toUShort(), config.bindPort)
+    }
+
+    @Test fun `toMultipathHelperQuicConfig maps null helperBindPort to null bindPort`() {
+        val config = profile().toMultipathHelperQuicConfig(auth)
+        assertNull(config.bindPort)
+    }
+
     // ── hasRelayConfig / usesJumpHost（純粋な算出プロパティ）──────────────
 
     @Test fun `hasRelayConfig is false when no relay fields are set`() {
