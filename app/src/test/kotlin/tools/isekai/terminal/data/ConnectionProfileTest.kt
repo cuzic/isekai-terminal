@@ -8,7 +8,7 @@ import org.junit.Test
 import uniffi.tssh_core.SshAuth
 
 /**
- * [ConnectionProfile]の変換関数([toSshConfig]/[toIsekaiStunP2pConfig]、
+ * [ConnectionProfile]の変換関数([toSshConfig]/[toIsekaiStunP2pConfig]/[toIsekaiLinkRelayConfig]、
  * 及びそれらが共通で使う`toJumpConfigOrNull`)を、UI/ViewModelを介さず直接検証する。
  */
 class ConnectionProfileTest {
@@ -77,7 +77,59 @@ class ConnectionProfileTest {
         assertNull(config.jump)
     }
 
-    // ── usesJumpHost（純粋な算出プロパティ）────────────────────────────
+    // ── toIsekaiLinkRelayConfig ──────────────────────────────────────────
+
+    @Test fun `toIsekaiLinkRelayConfig maps ssh connection fields`() {
+        val withRelay = profile().copy(
+            relayAddr = "relay.example.com:443",
+            relaySni = "relay.example.com",
+            relayJwt = "eyJhbGciOiJSUzI1NiJ9.test.sig",
+        )
+        val config = withRelay.toIsekaiLinkRelayConfig(auth)
+        assertEquals("example.com", config.sshHost)
+        assertEquals(2222.toUShort(), config.sshPort)
+        assertEquals("deploy", config.username)
+        assertEquals(auth, config.auth)
+    }
+
+    @Test fun `toIsekaiLinkRelayConfig maps relay fields verbatim`() {
+        val withRelay = profile().copy(
+            relayAddr = "relay.example.com:443",
+            relaySni = "relay.example.com",
+            relayJwt = "eyJhbGciOiJSUzI1NiJ9.test.sig",
+        )
+        val config = withRelay.toIsekaiLinkRelayConfig(auth)
+        assertEquals("relay.example.com:443", config.relayAddr)
+        assertEquals("relay.example.com", config.relaySni)
+        assertEquals("eyJhbGciOiJSUzI1NiJ9.test.sig", config.relayJwt)
+    }
+
+    @Test fun `toIsekaiLinkRelayConfig maps missing relay fields to empty strings`() {
+        val config = profile().toIsekaiLinkRelayConfig(auth)
+        assertEquals("", config.relayAddr)
+        assertEquals("", config.relaySni)
+        assertEquals("", config.relayJwt)
+    }
+
+    // ── hasRelayConfig / usesJumpHost（純粋な算出プロパティ）──────────────
+
+    @Test fun `hasRelayConfig is false when no relay fields are set`() {
+        assertFalse(profile().hasRelayConfig)
+    }
+
+    @Test fun `hasRelayConfig is false when relay fields are blank strings`() {
+        val withBlankRelay = profile().copy(relayAddr = "  ", relaySni = "  ", relayJwt = "  ")
+        assertFalse(withBlankRelay.hasRelayConfig)
+    }
+
+    @Test fun `hasRelayConfig is true only when all three relay fields are set`() {
+        val complete = profile().copy(
+            relayAddr = "relay.example.com:443",
+            relaySni = "relay.example.com",
+            relayJwt = "eyJhbGciOiJSUzI1NiJ9.test.sig",
+        )
+        assertTrue(complete.hasRelayConfig)
+    }
 
     @Test fun `usesJumpHost is false when jumpHost is null or blank`() {
         assertFalse(profile().usesJumpHost)

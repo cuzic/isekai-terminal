@@ -283,4 +283,84 @@ class ProfileEditScreenTest {
         composeTestRule.onNodeWithText("stun.example.com:3478").assertExists()
     }
 
+    // ── MASQUE relay経由のP2P ───────────────────────────────────────────
+
+    @Test fun relayChip_hiddenFields_untilSelected() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("relay P2P QUIC（実験的）").assertExists()
+        composeTestRule.onNodeWithText("relayアドレス（host:port）").assertDoesNotExist()
+    }
+
+    @Test fun relayChip_selecting_showsRelayFields() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("relay P2P QUIC（実験的）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("relayアドレス（host:port）").assertExists()
+        composeTestRule.onNodeWithText("relay SNI").assertExists()
+        composeTestRule.onNodeWithText("relay JWT").assertExists()
+    }
+
+    @Test fun saveButton_disabledWhenRelaySelectedButIncomplete() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("WithRelay")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("保存").performScrollTo().assertIsEnabled()
+
+        composeTestRule.onNodeWithText("relay P2P QUIC（実験的）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        // relayアドレス/SNI/JWTの3つが揃うまでは保存不可であるべき。
+        composeTestRule.onNodeWithText("保存").performScrollTo().assertIsNotEnabled()
+
+        composeTestRule.onNodeWithText("relayアドレス（host:port）").performTextInput("relay.example.com:443")
+        composeTestRule.onNodeWithText("保存").performScrollTo().assertIsNotEnabled()
+
+        composeTestRule.onNodeWithText("relay SNI").performTextInput("relay.example.com")
+        composeTestRule.onNodeWithText("保存").performScrollTo().assertIsNotEnabled()
+    }
+
+    @Test fun saveNewProfile_withRelayConfig_persistsAllThreeFields() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("RelayProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+
+        composeTestRule.onNodeWithText("relay P2P QUIC（実験的）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("relayアドレス（host:port）").performTextInput("relay.example.com:443")
+        composeTestRule.onNodeWithText("relay SNI").performTextInput("relay.example.com")
+        composeTestRule.onNodeWithText("relay JWT").performTextInput("eyJhbGciOiJSUzI1NiJ9.test.sig")
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "RelayProfile" }
+            assertTrue(stored.transportPreferenceName == "ISEKAI_LINK_RELAY_QUIC")
+            assertTrue(stored.relayAddr == "relay.example.com:443")
+            assertTrue(stored.relaySni == "relay.example.com")
+            assertTrue(stored.relayJwt == "eyJhbGciOiJSUzI1NiJ9.test.sig")
+            assertTrue(stored.hasRelayConfig)
+        }
+    }
+
+    @Test fun editProfile_prefillsRelayFields() {
+        val profile = sampleProfile().copy(
+            transportPreferenceName = "ISEKAI_LINK_RELAY_QUIC",
+            relayAddr = "relay.example.com:443",
+            relaySni = "relay.example.com",
+            relayJwt = "eyJhbGciOiJSUzI1NiJ9.test.sig",
+        )
+        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("relay.example.com:443").assertExists()
+        composeTestRule.onNodeWithText("relay.example.com").assertExists()
+        composeTestRule.onNodeWithText("eyJhbGciOiJSUzI1NiJ9.test.sig").assertExists()
+    }
 }

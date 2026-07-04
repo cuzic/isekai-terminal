@@ -263,7 +263,7 @@ class TerminalTabsViewModelTest {
         assertEquals(0, executor.acquirePhysicalMultipathFdsCallCount)
     }
 
-    // ── Phase 10: STUN+SSHランデブー方式のP2P ─────────────────────────────
+    // ── Phase 10: STUN+SSHランデブー方式・relay経由のP2P ─────────────────
 
     @Test
     fun connectTab_stunP2pTransport_dispatchesToConnectIsekaiStunP2p() = runBlocking {
@@ -276,6 +276,22 @@ class TerminalTabsViewModelTest {
         withTimeout(3000) { while (!orchestrators[0].connectIsekaiStunP2pCalled) delay(10) }
 
         assertTrue(orchestrators[0].connectIsekaiStunP2pCalled)
+        assertFalse(orchestrators[0].connectCalled)
+    }
+
+    @Test
+    fun connectTab_relayTransport_dispatchesToConnectIsekaiLinkRelay() = runBlocking {
+        val p = profile("a").copy(
+            transportPreferenceName = TransportPreference.ISEKAI_LINK_RELAY_QUIC.name,
+            relayAddr = "relay.example.com:443",
+            relaySni = "relay.example.com",
+            relayJwt = "eyJhbGciOiJSUzI1NiJ9.test.sig",
+        )
+        vm.openTab(p, "pass")
+
+        withTimeout(3000) { while (!orchestrators[0].connectIsekaiLinkRelayCalled) delay(10) }
+
+        assertTrue(orchestrators[0].connectIsekaiLinkRelayCalled)
         assertFalse(orchestrators[0].connectCalled)
     }
 

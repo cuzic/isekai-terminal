@@ -263,6 +263,16 @@ class TerminalSession(
         }
     }
 
+    /** Phase 10: MASQUE relay経由のP2P QUIC。フォールバック無し。 */
+    fun connectIsekaiLinkRelay(config: IsekaiLinkRelayConfig) {
+        if (_state.value.let { it.connected || it.isConnecting }) return
+        try {
+            orchestrator.connectIsekaiLinkRelay(config)
+        } catch (e: SshException) {
+            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
+        }
+    }
+
     fun send(bytes: ByteArray) = orchestrator.send(bytes)
     fun resize(cols: UInt, rows: UInt) = orchestrator.resize(cols, rows)
 

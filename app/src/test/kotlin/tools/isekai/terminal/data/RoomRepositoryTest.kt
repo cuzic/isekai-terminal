@@ -116,6 +116,49 @@ class ConnectionProfileRepositoryTest {
         val id = repo.save(profile("web").copy(stunServer = "stun.example.com:3478"))
         assertEquals("stun.example.com:3478", repo.findById(id)?.stunServer)
     }
+
+    // ── Phase 10: MASQUE relay経由のP2P ────────────────────────────────
+
+    @Test fun relayFields_defaultToNull() = runBlocking {
+        val id = repo.save(profile("web"))
+        val found = repo.findById(id)
+        assertNull(found?.relayAddr)
+        assertNull(found?.relaySni)
+        assertNull(found?.relayJwt)
+    }
+
+    @Test fun save_and_findById_roundtripsRelayFields() = runBlocking {
+        val id = repo.save(
+            profile("web").copy(
+                relayAddr = "relay.example.com:443",
+                relaySni = "relay.example.com",
+                relayJwt = "eyJhbGciOiJSUzI1NiJ9.test.sig",
+            )
+        )
+        val found = repo.findById(id)
+        assertEquals("relay.example.com:443", found?.relayAddr)
+        assertEquals("relay.example.com", found?.relaySni)
+        assertEquals("eyJhbGciOiJSUzI1NiJ9.test.sig", found?.relayJwt)
+    }
+
+    @Test fun hasRelayConfig_falseWhenAnyFieldMissing() = runBlocking {
+        assertFalse(profile("web").hasRelayConfig)
+        assertFalse(profile("web").copy(relayAddr = "relay.example.com:443").hasRelayConfig)
+        assertFalse(
+            profile("web").copy(
+                relayAddr = "relay.example.com:443", relaySni = "relay.example.com",
+            ).hasRelayConfig
+        )
+    }
+
+    @Test fun hasRelayConfig_trueWhenAllThreeFieldsSet() = runBlocking {
+        val complete = profile("web").copy(
+            relayAddr = "relay.example.com:443",
+            relaySni = "relay.example.com",
+            relayJwt = "eyJhbGciOiJSUzI1NiJ9.test.sig",
+        )
+        assertTrue(complete.hasRelayConfig)
+    }
 }
 
 @RunWith(RobolectricTestRunner::class)
@@ -372,7 +415,7 @@ class AppDatabaseMigration3To4Test {
     /**
      * v10 時点(migration 1→10 適用後の最終形、`enable_agent_forward` 列追加前)の
      * データベースを再現する。`known_hosts` / `key_entries` / `snippets` は Room 自身に
-     * 現行（v13）スキーマ一式を作らせてそのまま使い（手書き DDL の食い違いリスクを避ける）、
+     * 現行（v14）スキーマ一式を作らせてそのまま使い（手書き DDL の食い違いリスクを避ける）、
      * `connection_profiles` テーブルだけを v10 の形に手動で作り直したうえで
      * `user_version` を 10 に戻す。
      */
@@ -385,7 +428,10 @@ class AppDatabaseMigration3To4Test {
         val helper = FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(ctx)
                 .name(dbName)
-                .callback(object : SupportSQLiteOpenHelper.Callback(13) {
+                // このコールバックの宣言バージョンは、直前の Room ビルドが作った実ファイルの
+                // user_version（＝AppDatabase の現行 version）と一致させること。ずれると
+                // SQLiteOpenHelper のデフォルト onDowngrade（例外送出）が発火してしまう。
+                .callback(object : SupportSQLiteOpenHelper.Callback(14) {
                     override fun onCreate(db: SupportSQLiteDatabase) {}
                     override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
                 })
@@ -430,7 +476,7 @@ class AppDatabaseMigration3To4Test {
         createV10Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13)
+            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -447,7 +493,7 @@ class AppDatabaseMigration3To4Test {
         createV10Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13)
+            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14)
             .build()
         try {
             val dao = db.connectionProfileDao()
@@ -463,15 +509,16 @@ class AppDatabaseMigration3To4Test {
 }
 
 /**
- * Phase 10: STUN+SSHランデブー方式のP2P用`stun_server`列追加(v12→v13)のRoomマイグレーションの
- * テスト。`AppDatabaseMigration3To4Test`と同じ手法(v12時点のテーブルを手動で構築→対象migration
+ * Phase 10: STUN+SSHランデブー方式のP2P用`stun_server`列追加(v12→v13)・MASQUE relay経由の
+ * P2P用`relay_addr`/`relay_sni`/`relay_jwt`列追加(v13→v14)のRoomマイグレーションのテスト。
+ * `AppDatabaseMigration3To4Test`と同じ手法(v12/v13時点のテーブルを手動で構築→対象migration
  * 込みで開き直す)を踏襲する。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
-class AppDatabaseMigration12To13Test {
+class AppDatabaseMigration12To14Test {
     private lateinit var ctx: Application
-    private val dbName = "migration-test-12-13.db"
+    private val dbName = "migration-test-12-14.db"
 
     @Before fun setup() {
         ctx = ApplicationProvider.getApplicationContext()
@@ -492,7 +539,10 @@ class AppDatabaseMigration12To13Test {
         val helper = FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(ctx)
                 .name(dbName)
-                .callback(object : SupportSQLiteOpenHelper.Callback(13) {
+                // このコールバックの宣言バージョンは、直前の Room ビルドが作った実ファイルの
+                // user_version（＝AppDatabase の現行 version）と一致させること。ずれると
+                // SQLiteOpenHelper のデフォルト onDowngrade（例外送出）が発火してしまう。
+                .callback(object : SupportSQLiteOpenHelper.Callback(14) {
                     override fun onCreate(db: SupportSQLiteDatabase) {}
                     override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
                 })
@@ -543,13 +593,92 @@ class AppDatabaseMigration12To13Test {
         createV12Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_12_13)
+            .addMigrations(AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
             assertEquals(1, profiles.size)
             assertEquals("web", profiles[0].label)
             assertNull(profiles[0].stunServer)
+        } finally {
+            db.close()
+        }
+    }
+
+    /** v13時点(migration 1→13適用後の最終形、relay列追加前)のデータベースを再現する。
+     *  既存行には`stun_server`に非null値を入れておき、13→14マイグレーションが
+     *  他の既存列を壊さないことも合わせて確認できるようにする。 */
+    private fun createV13Database() {
+        Room.databaseBuilder(ctx, AppDatabase::class.java, dbName).build().apply {
+            openHelper.writableDatabase
+            close()
+        }
+
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(ctx)
+                .name(dbName)
+                .callback(object : SupportSQLiteOpenHelper.Callback(14) {
+                    override fun onCreate(db: SupportSQLiteDatabase) {}
+                    override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+                })
+                .build()
+        )
+        helper.writableDatabase.apply {
+            execSQL("DROP TABLE connection_profiles")
+            execSQL(
+                """
+                CREATE TABLE connection_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    label TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER NOT NULL DEFAULT 22,
+                    username TEXT NOT NULL,
+                    authType TEXT NOT NULL,
+                    keyId INTEGER,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    use_tsshd INTEGER NOT NULL DEFAULT 0,
+                    tsshd_port INTEGER NOT NULL DEFAULT 2222,
+                    transport_preference TEXT NOT NULL DEFAULT 'PLAIN_SSH',
+                    direct_address TEXT,
+                    enable_physical_multipath INTEGER NOT NULL DEFAULT 0,
+                    cellular_remote_address TEXT,
+                    enable_upstream_failover INTEGER NOT NULL DEFAULT 0,
+                    post_connect_commands TEXT,
+                    forwards TEXT NOT NULL DEFAULT '[]',
+                    enable_agent_forward INTEGER NOT NULL DEFAULT 0,
+                    jump_host TEXT,
+                    jump_port INTEGER NOT NULL DEFAULT 22,
+                    jump_username TEXT,
+                    jump_auth_type TEXT,
+                    jump_key_id INTEGER,
+                    stun_server TEXT
+                )
+                """.trimIndent()
+            )
+            execSQL(
+                "INSERT INTO connection_profiles (label, host, username, authType, stun_server) " +
+                    "VALUES ('web', 'example.com', 'user', 'password', 'stun.example.com:3478')"
+            )
+            execSQL("PRAGMA user_version = 13")
+            close()
+        }
+    }
+
+    @Test
+    fun migrate13To14_addsRelayColumns_existingRowDefaultsToNull_preservesStunServer() {
+        createV13Database()
+
+        val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_13_14)
+            .build()
+        try {
+            val profiles = runBlocking { db.connectionProfileDao().getAll() }
+            assertEquals(1, profiles.size)
+            assertEquals("web", profiles[0].label)
+            assertEquals("stun.example.com:3478", profiles[0].stunServer)
+            assertNull(profiles[0].relayAddr)
+            assertNull(profiles[0].relaySni)
+            assertNull(profiles[0].relayJwt)
         } finally {
             db.close()
         }

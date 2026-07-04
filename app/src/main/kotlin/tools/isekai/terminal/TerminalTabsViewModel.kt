@@ -20,6 +20,7 @@ import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.data.toHelperQuicConfig
+import tools.isekai.terminal.data.toIsekaiLinkRelayConfig
 import tools.isekai.terminal.data.toIsekaiStunP2pConfig
 import tools.isekai.terminal.data.toMultipathHelperQuicConfig
 import tools.isekai.terminal.data.toQuicConfig
@@ -34,6 +35,7 @@ import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.tssh_core.CellData
 import uniffi.tssh_core.HelperQuicConfig
+import uniffi.tssh_core.IsekaiLinkRelayConfig
 import uniffi.tssh_core.IsekaiStunP2pConfig
 import uniffi.tssh_core.MultipathHelperQuicConfig
 import uniffi.tssh_core.QuicConfig
@@ -304,6 +306,8 @@ class TerminalTabsViewModel(
                 }
                 TransportPreference.ISEKAI_STUN_P2P_QUIC ->
                     connectIsekaiStunP2p(tab, profile.toIsekaiStunP2pConfig(auth, jumpAuth))
+                TransportPreference.ISEKAI_LINK_RELAY_QUIC ->
+                    connectIsekaiLinkRelay(tab, profile.toIsekaiLinkRelayConfig(auth, jumpAuth))
             }
         }
     }
@@ -336,6 +340,11 @@ class TerminalTabsViewModel(
     private fun connectIsekaiStunP2p(tab: TabState, config: IsekaiStunP2pConfig) {
         executor.ensureServiceRunning()
         tab.session.connectIsekaiStunP2p(config)
+    }
+
+    private fun connectIsekaiLinkRelay(tab: TabState, config: IsekaiLinkRelayConfig) {
+        executor.ensureServiceRunning()
+        tab.session.connectIsekaiLinkRelay(config)
     }
 
     private suspend fun resolveAuth(tab: TabState, profile: ConnectionProfile, password: String?): SshAuth? {

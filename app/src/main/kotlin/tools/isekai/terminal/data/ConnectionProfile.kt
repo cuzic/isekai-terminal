@@ -11,6 +11,7 @@ import org.json.JSONObject
 import tools.isekai.terminal.session.PhysicalMultipathFds
 import uniffi.tssh_core.ForwardType
 import uniffi.tssh_core.HelperQuicConfig
+import uniffi.tssh_core.IsekaiLinkRelayConfig
 import uniffi.tssh_core.IsekaiStunP2pConfig
 import uniffi.tssh_core.JumpConfig
 import uniffi.tssh_core.MultipathHelperQuicConfig
@@ -92,6 +93,13 @@ data class ConnectionProfile(
     // Phase 10: STUN+SSHランデブーによる直接P2P QUIC(TransportPreference.ISEKAI_STUN_P2P_QUIC)
     // 選択時のみ使うSTUNサーバー(host:port)。null/空なら DEFAULT_STUN_SERVER を使う。
     @ColumnInfo(name = "stun_server") val stunServer: String? = null,
+    // Phase 10: MASQUE relay経由P2P QUIC(TransportPreference.ISEKAI_LINK_RELAY_QUIC)選択時のみ使う。
+    // relayJwtは接続のたびに有効期限切れ得るため平文保存はリスクがあるが、他の認証情報
+    // (パスワード等)と同様に暗号化ストレージへの格納は将来のJWT発行・配布フロー実装時に
+    // 見直す(PLAN.md Phase 10-4)。現時点ではMVPとしてプロファイルにそのまま保存する。
+    @ColumnInfo(name = "relay_addr") val relayAddr: String? = null,
+    @ColumnInfo(name = "relay_sni") val relaySni: String? = null,
+    @ColumnInfo(name = "relay_jwt") val relayJwt: String? = null,
 ) : Parcelable {
     val transportPreference: TransportPreference
         get() = try {
@@ -103,6 +111,10 @@ data class ConnectionProfile(
     /** 踏み台ホストが設定されているか(多段SSHを使うプロファイルか)。 */
     val usesJumpHost: Boolean
         get() = !jumpHost.isNullOrBlank()
+
+    /** relay版P2P QUIC接続に必要な設定が(relayAddr/relaySni/relayJwtの3つとも)揃っているか。 */
+    val hasRelayConfig: Boolean
+        get() = !relayAddr.isNullOrBlank() && !relaySni.isNullOrBlank() && !relayJwt.isNullOrBlank()
 
     companion object {
         /** tsshd のデフォルト待受ポート。変更する場合も過去の Room migration 内の
@@ -251,6 +263,29 @@ fun ConnectionProfile.toIsekaiStunP2pConfig(
         rows = rows,
         jump = toJumpConfigOrNull(jumpAuth),
         stunServer = stunServer?.takeIf { it.isNotBlank() } ?: ConnectionProfile.DEFAULT_STUN_SERVER,
+    )
+
+/**
+ * [relayAddr]/[relaySni]/[relayJwt] は全て必須(呼び出し前に [ConnectionProfile.hasRelayConfig] で
+ * 確認すること)。MASQUE relay(`bound-udp-server`)経由のP2P QUIC用。
+ */
+fun ConnectionProfile.toIsekaiLinkRelayConfig(
+    auth: SshAuth,
+    jumpAuth: SshAuth? = null,
+    cols: UInt = 80u,
+    rows: UInt = 24u,
+): IsekaiLinkRelayConfig =
+    IsekaiLinkRelayConfig(
+        sshHost = host,
+        sshPort = port.toUShort(),
+        username = username,
+        auth = auth,
+        cols = cols,
+        rows = rows,
+        jump = toJumpConfigOrNull(jumpAuth),
+        relayAddr = relayAddr.orEmpty(),
+        relaySni = relaySni.orEmpty(),
+        relayJwt = relayJwt.orEmpty(),
     )
 
 fun ConnectionProfile.toMultipathHelperQuicConfig(

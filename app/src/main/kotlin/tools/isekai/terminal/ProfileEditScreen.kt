@@ -105,6 +105,9 @@ fun ProfileEditScreen(
     var enablePhysicalMultipath by remember { mutableStateOf(profile?.enablePhysicalMultipath ?: false) }
     var cellularRemoteAddress by remember { mutableStateOf(profile?.cellularRemoteAddress ?: "") }
     var stunServer by remember { mutableStateOf(profile?.stunServer ?: "") }
+    var relayAddr by remember { mutableStateOf(profile?.relayAddr ?: "") }
+    var relaySni by remember { mutableStateOf(profile?.relaySni ?: "") }
+    var relayJwt by remember { mutableStateOf(profile?.relayJwt ?: "") }
     var enableUpstreamFailover by remember { mutableStateOf(profile?.enableUpstreamFailover ?: false) }
     var postConnectCommands by remember { mutableStateOf(profile?.postConnectCommands ?: "") }
     var enableAgentForward by remember { mutableStateOf(profile?.enableAgentForward ?: false) }
@@ -128,6 +131,9 @@ fun ProfileEditScreen(
         (!useJumpHost || (
             jumpHost.isNotBlank() && jumpUsername.isNotBlank() &&
                 (jumpAuthType == "password" || jumpKeyId != null)
+        )) &&
+        (transportPreference != TransportPreference.ISEKAI_LINK_RELAY_QUIC || (
+            relayAddr.isNotBlank() && relaySni.isNotBlank() && relayJwt.isNotBlank()
         ))
 
     Column(
@@ -363,12 +369,18 @@ fun ProfileEditScreen(
                 onClick = { transportPreference = TransportPreference.ISEKAI_STUN_P2P_QUIC },
                 label = { Text("STUN P2P QUIC（実験的）") },
             )
+            FilterChip(
+                selected = transportPreference == TransportPreference.ISEKAI_LINK_RELAY_QUIC,
+                onClick = { transportPreference = TransportPreference.ISEKAI_LINK_RELAY_QUIC },
+                label = { Text("relay P2P QUIC（実験的）") },
+            )
         }
 
         if (transportPreference == TransportPreference.ISEKAI_HELPER_QUIC ||
             transportPreference == TransportPreference.AUTO ||
             transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH ||
-            transportPreference == TransportPreference.ISEKAI_STUN_P2P_QUIC
+            transportPreference == TransportPreference.ISEKAI_STUN_P2P_QUIC ||
+            transportPreference == TransportPreference.ISEKAI_LINK_RELAY_QUIC
         ) {
             Text(
                 text = "初回接続時に SSH 経由で自作ヘルパー（isekai-helper）を自動配布・起動します" +
@@ -393,6 +405,37 @@ fun ProfileEditScreen(
                     "成立せず接続に失敗することがあり、その場合はフォールバックせずエラーになります" +
                     "（その際は Auto 等、他の接続方式に切り替えてください）。未入力なら " +
                     "${ConnectionProfile.DEFAULT_STUN_SERVER} を使います。",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        if (transportPreference == TransportPreference.ISEKAI_LINK_RELAY_QUIC) {
+            OutlinedTextField(
+                value = relayAddr,
+                onValueChange = { relayAddr = it },
+                label = { Text("relayアドレス（host:port）") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = relaySni,
+                onValueChange = { relaySni = it },
+                label = { Text("relay SNI") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = relayJwt,
+                onValueChange = { relayJwt = it },
+                label = { Text("relay JWT") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                text = "MASQUE relay(bound-udp-server)経由で常時到達可能なP2P QUIC接続を行います。" +
+                    "relayが常に経路に残るためNATの種類に依存しませんが、relayアドレス・SNI・JWTの" +
+                    "3つ全てが必要です（JWTの発行・配布フローは別途用意する運用を想定、PLAN.md参照）。",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -614,6 +657,9 @@ fun ProfileEditScreen(
                         jumpAuthType = if (useJumpHost) jumpAuthType else null,
                         jumpKeyId = if (useJumpHost && jumpAuthType == "key") jumpKeyId else null,
                         stunServer = stunServer.trim().takeIf { it.isNotBlank() },
+                        relayAddr = relayAddr.trim().takeIf { it.isNotBlank() },
+                        relaySni = relaySni.trim().takeIf { it.isNotBlank() },
+                        relayJwt = relayJwt.trim().takeIf { it.isNotBlank() },
                     )
                     vm.save(saved) { onSave() }
                 },
