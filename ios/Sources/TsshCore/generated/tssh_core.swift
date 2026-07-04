@@ -753,6 +753,179 @@ public func FfiConverterTypeDiagnosticEventQueue_lower(_ value: DiagnosticEventQ
 
 
 /**
+ * 診断用の最小frame配送ボックス。`DiagnosticEventQueue`と違い全件保持せず、
+ * 常に最新の1件だけを保持する（latest-wins）。`screen_generation`が現在保持
+ * しているものより古い、または同一世代内で`frame_sequence`が進んでいない
+ * frameは黙って破棄する（resize後に古い世代のframeが遅れて届いても
+ * 適用しないための仕組み）。
+ */
+public protocol DiagnosticFrameMailboxProtocol: AnyObject, Sendable {
+    
+    /**
+     * frameを配送する。古い世代/古い連番のframeは黙って無視する。
+     * 新規に採用された場合のみwake通知を送る。
+     */
+    func publish(frame: TerminalFrameBatch) 
+    
+    func setWakeListener(listener: EventWakeListener) 
+    
+    /**
+     * 保持している最新frameを取り出す（取り出すと空になる。次の`publish`まで
+     * 同じframeを二重に取得することはない）。
+     */
+    func takeLatest()  -> TerminalFrameBatch?
+    
+}
+/**
+ * 診断用の最小frame配送ボックス。`DiagnosticEventQueue`と違い全件保持せず、
+ * 常に最新の1件だけを保持する（latest-wins）。`screen_generation`が現在保持
+ * しているものより古い、または同一世代内で`frame_sequence`が進んでいない
+ * frameは黙って破棄する（resize後に古い世代のframeが遅れて届いても
+ * 適用しないための仕組み）。
+ */
+open class DiagnosticFrameMailbox: DiagnosticFrameMailboxProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_tssh_core_fn_clone_diagnosticframemailbox(self.handle, $0) }
+    }
+public convenience init() {
+    let handle =
+        try! rustCall() {
+    uniffi_tssh_core_fn_constructor_diagnosticframemailbox_new($0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_tssh_core_fn_free_diagnosticframemailbox(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * frameを配送する。古い世代/古い連番のframeは黙って無視する。
+     * 新規に採用された場合のみwake通知を送る。
+     */
+open func publish(frame: TerminalFrameBatch)  {try! rustCall() {
+    uniffi_tssh_core_fn_method_diagnosticframemailbox_publish(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeTerminalFrameBatch_lower(frame),$0
+    )
+}
+}
+    
+open func setWakeListener(listener: EventWakeListener)  {try! rustCall() {
+    uniffi_tssh_core_fn_method_diagnosticframemailbox_set_wake_listener(
+            self.uniffiCloneHandle(),
+        FfiConverterCallbackInterfaceEventWakeListener_lower(listener),$0
+    )
+}
+}
+    
+    /**
+     * 保持している最新frameを取り出す（取り出すと空になる。次の`publish`まで
+     * 同じframeを二重に取得することはない）。
+     */
+open func takeLatest() -> TerminalFrameBatch?  {
+    return try!  FfiConverterOptionTypeTerminalFrameBatch.lift(try! rustCall() {
+    uniffi_tssh_core_fn_method_diagnosticframemailbox_take_latest(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDiagnosticFrameMailbox: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = DiagnosticFrameMailbox
+
+    public static func lift(_ handle: UInt64) throws -> DiagnosticFrameMailbox {
+        return DiagnosticFrameMailbox(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: DiagnosticFrameMailbox) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DiagnosticFrameMailbox {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: DiagnosticFrameMailbox, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDiagnosticFrameMailbox_lift(_ handle: UInt64) throws -> DiagnosticFrameMailbox {
+    return try FfiConverterTypeDiagnosticFrameMailbox.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDiagnosticFrameMailbox_lower(_ value: DiagnosticFrameMailbox) -> UInt64 {
+    return FfiConverterTypeDiagnosticFrameMailbox.lower(value)
+}
+
+
+
+
+
+
+/**
  * Phase 1A-1 の診断用 UniFFI Object。Swift 側での生成・明示的な破棄が
  * 正しく動くことを確認する（セッション/接続の状態は一切持たない）。
  */
@@ -2680,6 +2853,79 @@ public func FfiConverterTypeSshSession_lower(_ value: SshSession) -> UInt64 {
 
 
 
+/**
+ * 1文字分の表示属性。`start`/`length`は`text`のUTF-16コードユニットオフセット。
+ */
+public struct AttributeRun: Equatable, Hashable {
+    public var start: UInt32
+    public var length: UInt32
+    public var fgArgb: UInt32
+    public var bgArgb: UInt32
+    public var bold: Bool
+    public var underline: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(start: UInt32, length: UInt32, fgArgb: UInt32, bgArgb: UInt32, bold: Bool, underline: Bool) {
+        self.start = start
+        self.length = length
+        self.fgArgb = fgArgb
+        self.bgArgb = bgArgb
+        self.bold = bold
+        self.underline = underline
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AttributeRun: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAttributeRun: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AttributeRun {
+        return
+            try AttributeRun(
+                start: FfiConverterUInt32.read(from: &buf), 
+                length: FfiConverterUInt32.read(from: &buf), 
+                fgArgb: FfiConverterUInt32.read(from: &buf), 
+                bgArgb: FfiConverterUInt32.read(from: &buf), 
+                bold: FfiConverterBool.read(from: &buf), 
+                underline: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AttributeRun, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.start, into: &buf)
+        FfiConverterUInt32.write(value.length, into: &buf)
+        FfiConverterUInt32.write(value.fgArgb, into: &buf)
+        FfiConverterUInt32.write(value.bgArgb, into: &buf)
+        FfiConverterBool.write(value.bold, into: &buf)
+        FfiConverterBool.write(value.underline, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAttributeRun_lift(_ buf: RustBuffer) throws -> AttributeRun {
+    return try FfiConverterTypeAttributeRun.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAttributeRun_lower(_ value: AttributeRun) -> RustBuffer {
+    return FfiConverterTypeAttributeRun.lower(value)
+}
+
+
 public struct CellData: Equatable, Hashable {
     public var ch: String
     public var fg: UInt32
@@ -2739,6 +2985,64 @@ public func FfiConverterTypeCellData_lift(_ buf: RustBuffer) throws -> CellData 
 #endif
 public func FfiConverterTypeCellData_lower(_ value: CellData) -> RustBuffer {
     return FfiConverterTypeCellData.lower(value)
+}
+
+
+public struct CursorState: Equatable, Hashable {
+    public var row: UInt32
+    public var col: UInt32
+    public var visible: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(row: UInt32, col: UInt32, visible: Bool) {
+        self.row = row
+        self.col = col
+        self.visible = visible
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CursorState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCursorState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CursorState {
+        return
+            try CursorState(
+                row: FfiConverterUInt32.read(from: &buf), 
+                col: FfiConverterUInt32.read(from: &buf), 
+                visible: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CursorState, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.row, into: &buf)
+        FfiConverterUInt32.write(value.col, into: &buf)
+        FfiConverterBool.write(value.visible, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCursorState_lift(_ buf: RustBuffer) throws -> CursorState {
+    return try FfiConverterTypeCursorState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCursorState_lower(_ value: CursorState) -> RustBuffer {
+    return FfiConverterTypeCursorState.lower(value)
 }
 
 
@@ -3317,6 +3621,69 @@ public func FfiConverterTypeMultipathHelperQuicConfig_lower(_ value: MultipathHe
 }
 
 
+/**
+ * ターミナル1行分。セルオブジェクトの配列ではなく、UTF-8テキストバッファ+
+ * セル幅配列+属性runにまとめることで、全角文字・結合文字・絵文字を
+ * 個別セルへ分解せずに扱える。
+ */
+public struct PackedRow: Equatable, Hashable {
+    public var text: String
+    public var cellWidths: Data
+    public var attributeRuns: [AttributeRun]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(text: String, cellWidths: Data, attributeRuns: [AttributeRun]) {
+        self.text = text
+        self.cellWidths = cellWidths
+        self.attributeRuns = attributeRuns
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PackedRow: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePackedRow: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PackedRow {
+        return
+            try PackedRow(
+                text: FfiConverterString.read(from: &buf), 
+                cellWidths: FfiConverterData.read(from: &buf), 
+                attributeRuns: FfiConverterSequenceTypeAttributeRun.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PackedRow, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterData.write(value.cellWidths, into: &buf)
+        FfiConverterSequenceTypeAttributeRun.write(value.attributeRuns, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePackedRow_lift(_ buf: RustBuffer) throws -> PackedRow {
+    return try FfiConverterTypePackedRow.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePackedRow_lower(_ value: PackedRow) -> RustBuffer {
+    return FfiConverterTypePackedRow.lower(value)
+}
+
+
 public struct PortForward: Equatable, Hashable {
     public var forwardType: ForwardType
     /**
@@ -3714,6 +4081,92 @@ public func FfiConverterTypeSshConfig_lift(_ buf: RustBuffer) throws -> SshConfi
 #endif
 public func FfiConverterTypeSshConfig_lower(_ value: SshConfig) -> RustBuffer {
     return FfiConverterTypeSshConfig.lower(value)
+}
+
+
+/**
+ * UniFFI境界を渡す画面更新の単位。`screen_generation`はresize等で
+ * 不連続に変わる世代番号、`frame_sequence`は同一世代内で単調増加する連番。
+ */
+public struct TerminalFrameBatch: Equatable, Hashable {
+    public var sessionId: String
+    public var screenGeneration: UInt64
+    public var frameSequence: UInt64
+    public var rows: [PackedRow]
+    public var dirtyTop: UInt32
+    public var dirtyBottom: UInt32
+    public var cursor: CursorState
+    public var title: String?
+    public var bell: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sessionId: String, screenGeneration: UInt64, frameSequence: UInt64, rows: [PackedRow], dirtyTop: UInt32, dirtyBottom: UInt32, cursor: CursorState, title: String?, bell: Bool) {
+        self.sessionId = sessionId
+        self.screenGeneration = screenGeneration
+        self.frameSequence = frameSequence
+        self.rows = rows
+        self.dirtyTop = dirtyTop
+        self.dirtyBottom = dirtyBottom
+        self.cursor = cursor
+        self.title = title
+        self.bell = bell
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TerminalFrameBatch: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTerminalFrameBatch: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TerminalFrameBatch {
+        return
+            try TerminalFrameBatch(
+                sessionId: FfiConverterString.read(from: &buf), 
+                screenGeneration: FfiConverterUInt64.read(from: &buf), 
+                frameSequence: FfiConverterUInt64.read(from: &buf), 
+                rows: FfiConverterSequenceTypePackedRow.read(from: &buf), 
+                dirtyTop: FfiConverterUInt32.read(from: &buf), 
+                dirtyBottom: FfiConverterUInt32.read(from: &buf), 
+                cursor: FfiConverterTypeCursorState.read(from: &buf), 
+                title: FfiConverterOptionString.read(from: &buf), 
+                bell: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TerminalFrameBatch, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.sessionId, into: &buf)
+        FfiConverterUInt64.write(value.screenGeneration, into: &buf)
+        FfiConverterUInt64.write(value.frameSequence, into: &buf)
+        FfiConverterSequenceTypePackedRow.write(value.rows, into: &buf)
+        FfiConverterUInt32.write(value.dirtyTop, into: &buf)
+        FfiConverterUInt32.write(value.dirtyBottom, into: &buf)
+        FfiConverterTypeCursorState.write(value.cursor, into: &buf)
+        FfiConverterOptionString.write(value.title, into: &buf)
+        FfiConverterBool.write(value.bell, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalFrameBatch_lift(_ buf: RustBuffer) throws -> TerminalFrameBatch {
+    return try FfiConverterTypeTerminalFrameBatch.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalFrameBatch_lower(_ value: TerminalFrameBatch) -> RustBuffer {
+    return FfiConverterTypeTerminalFrameBatch.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -5555,6 +6008,30 @@ fileprivate struct FfiConverterOptionTypeJumpConfig: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeTerminalFrameBatch: FfiConverterRustBuffer {
+    typealias SwiftType = TerminalFrameBatch?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTerminalFrameBatch.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTerminalFrameBatch.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
     typealias SwiftType = [UInt32]
 
@@ -5572,6 +6049,31 @@ fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterUInt32.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeAttributeRun: FfiConverterRustBuffer {
+    typealias SwiftType = [AttributeRun]
+
+    public static func write(_ value: [AttributeRun], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeAttributeRun.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [AttributeRun] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [AttributeRun]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeAttributeRun.read(from: &buf))
         }
         return seq
     }
@@ -5622,6 +6124,31 @@ fileprivate struct FfiConverterSequenceTypeDiagnosticEventEnvelope: FfiConverter
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeDiagnosticEventEnvelope.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePackedRow: FfiConverterRustBuffer {
+    typealias SwiftType = [PackedRow]
+
+    public static func write(_ value: [PackedRow], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePackedRow.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PackedRow] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PackedRow]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePackedRow.read(from: &buf))
         }
         return seq
     }
@@ -5908,6 +6435,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_tssh_core_checksum_method_diagnosticeventqueue_set_wake_listener() != 51515) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_tssh_core_checksum_method_diagnosticframemailbox_publish() != 63094) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_diagnosticframemailbox_set_wake_listener() != 35625) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_diagnosticframemailbox_take_latest() != 44384) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_tssh_core_checksum_method_diagnostichandle_fire_callback() != 38746) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6170,6 +6706,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_constructor_diagnosticeventqueue_new() != 2755) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_constructor_diagnosticframemailbox_new() != 6452) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_constructor_diagnostichandle_new() != 540) {

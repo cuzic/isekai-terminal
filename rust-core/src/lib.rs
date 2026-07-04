@@ -189,6 +189,109 @@ impl DiagnosticEventQueue {
     }
 }
 
+// ── Phase 1A-6: Rust→Swift画面更新ブリッジ（診断用の最小実装） ──────────
+//
+// セルごとにcallbackしない設計。UniFFI境界のデータ形式を具体化し、latest-wins
+// （画面Damageは古いものを破棄してよい）というControlEventQueueとは異なる
+// 配送ポリシーを実証する（ChatGPT外部レビュー2026-07-04、PLAN.md「Phase Y」節）。
+// 実際のVTE(`terminal`モジュール)との統合はPhase 1Bで行う。
+
+/// 1文字分の表示属性。`start`/`length`は`text`のUTF-16コードユニットオフセット。
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AttributeRun {
+    pub start: u32,
+    pub length: u32,
+    pub fg_argb: u32,
+    pub bg_argb: u32,
+    pub bold: bool,
+    pub underline: bool,
+}
+
+/// ターミナル1行分。セルオブジェクトの配列ではなく、UTF-8テキストバッファ+
+/// セル幅配列+属性runにまとめることで、全角文字・結合文字・絵文字を
+/// 個別セルへ分解せずに扱える。
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PackedRow {
+    pub text: String,
+    pub cell_widths: Vec<u8>,
+    pub attribute_runs: Vec<AttributeRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct CursorState {
+    pub row: u32,
+    pub col: u32,
+    pub visible: bool,
+}
+
+/// UniFFI境界を渡す画面更新の単位。`screen_generation`はresize等で
+/// 不連続に変わる世代番号、`frame_sequence`は同一世代内で単調増加する連番。
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct TerminalFrameBatch {
+    pub session_id: String,
+    pub screen_generation: u64,
+    pub frame_sequence: u64,
+    pub rows: Vec<PackedRow>,
+    pub dirty_top: u32,
+    pub dirty_bottom: u32,
+    pub cursor: CursorState,
+    pub title: Option<String>,
+    pub bell: bool,
+}
+
+/// 診断用の最小frame配送ボックス。`DiagnosticEventQueue`と違い全件保持せず、
+/// 常に最新の1件だけを保持する（latest-wins）。`screen_generation`が現在保持
+/// しているものより古い、または同一世代内で`frame_sequence`が進んでいない
+/// frameは黙って破棄する（resize後に古い世代のframeが遅れて届いても
+/// 適用しないための仕組み）。
+#[derive(uniffi::Object)]
+pub struct DiagnosticFrameMailbox {
+    latest: std::sync::Mutex<Option<TerminalFrameBatch>>,
+    wake_listener: std::sync::Mutex<Option<Box<dyn EventWakeListener>>>,
+}
+
+#[uniffi::export]
+impl DiagnosticFrameMailbox {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            latest: std::sync::Mutex::new(None),
+            wake_listener: std::sync::Mutex::new(None),
+        })
+    }
+
+    pub fn set_wake_listener(&self, listener: Box<dyn EventWakeListener>) {
+        *self.wake_listener.lock().unwrap() = Some(listener);
+    }
+
+    /// frameを配送する。古い世代/古い連番のframeは黙って無視する。
+    /// 新規に採用された場合のみwake通知を送る。
+    pub fn publish(&self, frame: TerminalFrameBatch) {
+        let mut guard = self.latest.lock().unwrap();
+        if let Some(existing) = guard.as_ref() {
+            if frame.screen_generation < existing.screen_generation {
+                return;
+            }
+            if frame.screen_generation == existing.screen_generation
+                && frame.frame_sequence <= existing.frame_sequence
+            {
+                return;
+            }
+        }
+        *guard = Some(frame);
+        drop(guard);
+        if let Some(listener) = self.wake_listener.lock().unwrap().as_ref() {
+            listener.events_available();
+        }
+    }
+
+    /// 保持している最新frameを取り出す（取り出すと空になる。次の`publish`まで
+    /// 同じframeを二重に取得することはない）。
+    pub fn take_latest(&self) -> Option<TerminalFrameBatch> {
+        self.latest.lock().unwrap().take()
+    }
+}
+
 // ── 公開型 ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -633,5 +736,68 @@ mod diagnostic_event_queue_tests {
         queue.push("y".to_string());
 
         assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_frame_mailbox_tests {
+    use super::{CursorState, DiagnosticFrameMailbox, TerminalFrameBatch};
+
+    /// どのframeが採用されたかを見分けるためだけに`title`へタグを詰める。
+    fn tagged_frame(generation: u64, sequence: u64, tag: &str) -> TerminalFrameBatch {
+        TerminalFrameBatch {
+            session_id: "test-session".to_string(),
+            screen_generation: generation,
+            frame_sequence: sequence,
+            rows: vec![],
+            dirty_top: 0,
+            dirty_bottom: 0,
+            cursor: CursorState { row: 0, col: 0, visible: true },
+            title: Some(tag.to_string()),
+            bell: false,
+        }
+    }
+
+    #[test]
+    fn newer_sequence_within_same_generation_replaces_latest() {
+        let mailbox = DiagnosticFrameMailbox::new();
+        mailbox.publish(tagged_frame(1, 1, "first"));
+        mailbox.publish(tagged_frame(1, 2, "second"));
+
+        let latest = mailbox.take_latest().unwrap();
+        assert_eq!(latest.title, Some("second".to_string()));
+        assert!(mailbox.take_latest().is_none());
+    }
+
+    #[test]
+    fn stale_sequence_within_same_generation_is_discarded() {
+        let mailbox = DiagnosticFrameMailbox::new();
+        mailbox.publish(tagged_frame(1, 5, "newer"));
+        mailbox.publish(tagged_frame(1, 3, "older-arrived-late"));
+
+        let latest = mailbox.take_latest().unwrap();
+        assert_eq!(latest.title, Some("newer".to_string()));
+    }
+
+    #[test]
+    fn older_generation_is_discarded_even_with_higher_sequence() {
+        let mailbox = DiagnosticFrameMailbox::new();
+        mailbox.publish(tagged_frame(2, 1, "generation-2"));
+        // resize後に古い世代(generation 1)のframeが遅れて届いても、
+        // sequenceが大きくても採用してはいけない。
+        mailbox.publish(tagged_frame(1, 999, "stale-generation-1"));
+
+        let latest = mailbox.take_latest().unwrap();
+        assert_eq!(latest.title, Some("generation-2".to_string()));
+    }
+
+    #[test]
+    fn newer_generation_replaces_regardless_of_sequence() {
+        let mailbox = DiagnosticFrameMailbox::new();
+        mailbox.publish(tagged_frame(1, 100, "generation-1"));
+        mailbox.publish(tagged_frame(2, 1, "generation-2"));
+
+        let latest = mailbox.take_latest().unwrap();
+        assert_eq!(latest.title, Some("generation-2".to_string()));
     }
 }
