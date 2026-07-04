@@ -206,10 +206,12 @@ impl OpenSshBackend {
         let relay_addr = relay.relay_addr;
         let relay_sni = &relay.relay_sni;
         let relay_jwt = &relay.relay_jwt;
+        let idle_lifetime_secs = relay.idle_lifetime_secs;
         let cmd = format!(
             "umask 077 && mkdir -p {HANDSHAKE_DIR} && \
              ( setsid {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} \
              --relay {relay_addr} --relay-sni {relay_sni} --relay-jwt {relay_jwt} \
+             --max-idle-lifetime {idle_lifetime_secs} \
              </dev/null >{HANDSHAKE_FILE} 2>{HANDSHAKE_LOG} & ); \
              for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
                [ -s {HANDSHAKE_FILE} ] && break; \

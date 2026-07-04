@@ -82,14 +82,29 @@ impl JumpSpec {
 }
 
 /// Arguments passed to `isekai-helper --relay ... --relay-sni ... --relay-jwt
-/// ...` (`HelperP2pMode::Relay` in `rust-core/src/helper_bootstrap.rs`,
-/// `HELPER_PROTOCOL.md`). STUN/P2P launch is out of scope for this phase
-/// (`ISEKAI_SSH_DESIGN.md` フェーズ分割案 S-0e-1/S-6).
+/// ... --max-idle-lifetime ...` (`HelperP2pMode::Relay` in
+/// `rust-core/src/helper_bootstrap.rs`, `HELPER_PROTOCOL.md`). STUN/P2P
+/// launch is out of scope for this phase (`ISEKAI_SSH_DESIGN.md` フェーズ
+/// 分割案 S-0e-1/S-6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayLaunchSpec {
     pub relay_addr: SocketAddr,
     pub relay_sni: String,
     pub relay_jwt: String,
+    /// `isekai-helper --max-idle-lifetime <SECS>`: how long the deployed
+    /// helper stays running with no active connection before it self-exits.
+    /// `isekai-helper`'s own default (600s) is tuned for `tssh-core`'s
+    /// per-session bootstrap model (Android re-deploys/re-launches a fresh
+    /// helper on every connection attempt, so a short self-exit window is
+    /// pure cleanup). `isekai-ssh init` deploys a helper once and expects
+    /// `connect` to keep dialing that *same* long-running process across
+    /// many separate `ssh` invocations, potentially hours or days apart, so
+    /// callers building a `RelayLaunchSpec` for that use case must pass a
+    /// much larger value explicitly (`ISEKAI_SSH_DESIGN.md` "引き続き未決の
+    /// 項目" — resolved by making this field required rather than defaulted
+    /// inside this crate, keeping the policy decision in `isekai-ssh`
+    /// itself and leaving `isekai-helper`'s own default untouched).
+    pub idle_lifetime_secs: u64,
 }
 
 /// What a successful `BootstrapBackend::install_and_start` call yields: the

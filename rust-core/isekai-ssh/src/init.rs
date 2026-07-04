@@ -44,7 +44,12 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .map(parse_jump_spec)
         .transpose()
         .with_context(|| format!("isekai-ssh: invalid --via spec '{}'", args.via.as_deref().unwrap_or_default()))?;
-    let relay = RelayLaunchSpec { relay_addr: args.relay_addr, relay_sni: args.relay_sni.clone(), relay_jwt: args.relay_jwt.clone() };
+    let relay = RelayLaunchSpec {
+        relay_addr: args.relay_addr,
+        relay_sni: args.relay_sni.clone(),
+        relay_jwt: args.relay_jwt.clone(),
+        idle_lifetime_secs: args.idle_lifetime,
+    };
 
     println!("Deploying isekai-helper to {}...", args.host);
     let backend = OpenSshBackend::new();
