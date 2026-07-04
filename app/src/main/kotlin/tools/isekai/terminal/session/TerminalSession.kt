@@ -205,73 +205,39 @@ class TerminalSession(
 
     // ── Connection ───────────────────────────────────────────────────
 
-    fun connect(config: SshConfig) {
+    /** 各 connectXxx() 共通のガード(接続済み/接続中なら無視)とエラー処理。 */
+    private inline fun guardedConnect(connect: () -> Unit) {
         if (_state.value.let { it.connected || it.isConnecting }) return
         try {
-            orchestrator.connect(config)
+            connect()
         } catch (e: SshException) {
             _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
         }
     }
 
-    fun connectQuic(config: QuicConfig) {
-        if (_state.value.let { it.connected || it.isConnecting }) return
-        try {
-            orchestrator.connectQuic(config)
-        } catch (e: SshException) {
-            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
-        }
-    }
+    fun connect(config: SshConfig) = guardedConnect { orchestrator.connect(config) }
+
+    fun connectQuic(config: QuicConfig) = guardedConnect { orchestrator.connectQuic(config) }
 
     /** Phase 7: 自作ヘルパー経由 QUIC。フォールバック無し（明示選択時）。 */
-    fun connectHelperQuic(config: HelperQuicConfig) {
-        if (_state.value.let { it.connected || it.isConnecting }) return
-        try {
-            orchestrator.connectHelperQuic(config)
-        } catch (e: SshException) {
-            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
-        }
-    }
+    fun connectHelperQuic(config: HelperQuicConfig) =
+        guardedConnect { orchestrator.connectHelperQuic(config) }
 
     /** Phase 7: 自作ヘルパー経由 QUIC を試し、失敗したら通常の TCP SSH にフォールバックする。 */
-    fun connectHelperQuicAuto(config: HelperQuicConfig) {
-        if (_state.value.let { it.connected || it.isConnecting }) return
-        try {
-            orchestrator.connectHelperQuicAuto(config)
-        } catch (e: SshException) {
-            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
-        }
-    }
+    fun connectHelperQuicAuto(config: HelperQuicConfig) =
+        guardedConnect { orchestrator.connectHelperQuicAuto(config) }
 
     /** Phase 9: 自作ヘルパー経由 QUIC + Tailscale⇔直接アドレスの受動的マルチパス。フォールバック無し。 */
-    fun connectMultipathHelperQuic(config: MultipathHelperQuicConfig) {
-        if (_state.value.let { it.connected || it.isConnecting }) return
-        try {
-            orchestrator.connectMultipathHelperQuic(config)
-        } catch (e: SshException) {
-            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
-        }
-    }
+    fun connectMultipathHelperQuic(config: MultipathHelperQuicConfig) =
+        guardedConnect { orchestrator.connectMultipathHelperQuic(config) }
 
     /** Phase 10: STUN+SSHランデブーによる直接P2P QUIC。relay無し・フォールバック無し。 */
-    fun connectIsekaiStunP2p(config: IsekaiStunP2pConfig) {
-        if (_state.value.let { it.connected || it.isConnecting }) return
-        try {
-            orchestrator.connectIsekaiStunP2p(config)
-        } catch (e: SshException) {
-            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
-        }
-    }
+    fun connectIsekaiStunP2p(config: IsekaiStunP2pConfig) =
+        guardedConnect { orchestrator.connectIsekaiStunP2p(config) }
 
     /** Phase 10: MASQUE relay経由のP2P QUIC。フォールバック無し。 */
-    fun connectIsekaiLinkRelay(config: IsekaiLinkRelayConfig) {
-        if (_state.value.let { it.connected || it.isConnecting }) return
-        try {
-            orchestrator.connectIsekaiLinkRelay(config)
-        } catch (e: SshException) {
-            _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${e.message ?: "不明なエラー"}") }
-        }
-    }
+    fun connectIsekaiLinkRelay(config: IsekaiLinkRelayConfig) =
+        guardedConnect { orchestrator.connectIsekaiLinkRelay(config) }
 
     fun send(bytes: ByteArray) = orchestrator.send(bytes)
     fun resize(cols: UInt, rows: UInt) = orchestrator.resize(cols, rows)
