@@ -86,6 +86,13 @@ pub struct HelperQuicConfig {
     pub rows: u32,
     /// ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
     pub jump: Option<JumpConfig>,
+    /// isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
+    /// エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
+    /// サーバー側ファイアウォールに事前にこのポートだけ許可しておける
+    /// (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
+    /// 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
+    /// 確定した値だけを渡すこと。
+    pub bind_port: Option<u16>,
 }
 
 #[derive(uniffi::Object)]
@@ -230,8 +237,8 @@ impl ServerCertVerifier for PinnedCertVerifier {
 
 async fn bootstrap_via_ssh(config: &HelperQuicConfig) -> Result<HelperHandshake, String> {
     bootstrap_helper_via_ssh(
-        &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump, None,
-        &HelperP2pMode::None,
+        &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump,
+        config.bind_port, &HelperP2pMode::None,
     ).await
 }
 
@@ -677,6 +684,7 @@ mod tests {
             cols: 80,
             rows: 24,
             jump: None,
+            bind_port: None,
         };
 
         let session = create_helper_quic_session(config);
@@ -732,6 +740,7 @@ mod tests {
             cols: 80,
             rows: 24,
             jump: None,
+            bind_port: None,
         };
 
         crate::debug_fault::shared_injector().restore();
