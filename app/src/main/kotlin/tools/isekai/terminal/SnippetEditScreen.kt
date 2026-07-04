@@ -30,6 +30,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -103,7 +104,11 @@ fun SnippetEditScreen(
                 "末尾で Enter する",
                 modifier = androidx.compose.ui.Modifier.align(androidx.compose.ui.Alignment.CenterVertically),
             )
-            Switch(checked = appendNewline, onCheckedChange = { appendNewline = it })
+            Switch(
+                checked = appendNewline,
+                onCheckedChange = { appendNewline = it },
+                modifier = Modifier.testTag("appendNewlineSwitch"),
+            )
         }
 
         Text("適用範囲")
