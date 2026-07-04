@@ -11,10 +11,19 @@ final class TerminalKeyMapperTests: XCTestCase {
         XCTAssertEqual(TerminalKeyMapper.controlByte(for: "z"), 0x1A) // Ctrl+Z
     }
 
-    func testControlByteReturnsNilForNonLetters() {
+    func testControlByteReturnsNilForDigitsAndNonAscii() {
         XCTAssertNil(TerminalKeyMapper.controlByte(for: "1"))
-        XCTAssertNil(TerminalKeyMapper.controlByte(for: " "))
         XCTAssertNil(TerminalKeyMapper.controlByte(for: "あ"))
+    }
+
+    /// Rust側(`terminal_ctrl_byte`)への統合により、Android版と同じ
+    /// `@ [ \ ] ^ _ ? space`もCtrl+<記号>として変換されるようになった
+    /// (統合前のiOS版はアルファベットのみ対応していた)。
+    func testControlByteSupportsAndroidParitySymbols() {
+        XCTAssertEqual(TerminalKeyMapper.controlByte(for: "@"), 0x00)
+        XCTAssertEqual(TerminalKeyMapper.controlByte(for: "["), 0x1B)
+        XCTAssertEqual(TerminalKeyMapper.controlByte(for: "?"), 0x7F)
+        XCTAssertEqual(TerminalKeyMapper.controlByte(for: " "), 0x00)
     }
 
     func testArrowKeySequences() {
