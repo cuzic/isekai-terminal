@@ -7,6 +7,12 @@ let package = Package(
     products: [
         .library(name: "TsshCore", targets: ["TsshCore"])
     ],
+    dependencies: [
+        // 接続プロファイル管理(#10)のローカル永続化に使う。Android版Roomと
+        // 概念的に対称なDatabaseMigrator(明示的マイグレーション管理)を持つため
+        // 第一候補として採用(ChatGPT外部レビュー2026-07-04、PLAN.md「Phase Y」節)。
+        .package(url: "https://github.com/groue/GRDB.swift.git", from: "6.0.0"),
+    ],
     targets: [
         // rust-core/scripts/build-ios-xcframework.sh が生成する。
         // Rust静的ライブラリ + Cヘッダー/modulemapのみを格納し、UniFFI生成の
@@ -18,7 +24,10 @@ let package = Package(
         ),
         .target(
             name: "TsshCore",
-            dependencies: ["TsshCoreFFIBinary"],
+            dependencies: [
+                "TsshCoreFFIBinary",
+                .product(name: "GRDB", package: "GRDB.swift"),
+            ],
             path: "Sources/TsshCore"
         ),
         .testTarget(
