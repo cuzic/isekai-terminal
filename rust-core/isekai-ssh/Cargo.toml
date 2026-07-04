@@ -69,3 +69,11 @@ required-features = ["dev-insecure"]
 [[test]]
 name = "resume_window_exceeded_e2e"
 required-features = ["dev-insecure"]
+
+# `resume_multi_disconnect_e2e.rs` (Phase S-4, final integration check)
+# combines both sibling resume tests' scenarios (a recoverable outage
+# followed by a permanent one) within a single `isekai-ssh connect` process
+# lifecycle — same `--dev-insecure-*` bypass, same gating applies.
+[[test]]
+name = "resume_multi_disconnect_e2e"
+required-features = ["dev-insecure"]
