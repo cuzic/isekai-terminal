@@ -724,6 +724,73 @@ class ProfileEditScreenTest {
         }
     }
 
+    // ── 自作ヘルパーQUICの待受ポート固定 ─────────────────────────────────
+
+    @Test fun helperBindPortField_hiddenForPlainSsh_shownForHelperQuicChips() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意）").assertDoesNotExist()
+
+        composeTestRule.onNodeWithText("自作ヘルパー QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意）").assertExists()
+    }
+
+    @Test fun selectingHelperQuic_settingBindPort_andSaving_persistsHelperBindPort() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("FixedPortProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("自作ヘルパー QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意）").performScrollTo().performTextInput("45900")
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "FixedPortProfile" }
+            assertEquals(45900, stored.helperBindPort)
+        }
+    }
+
+    @Test fun helperBindPort_leftBlank_savesAsNull() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("EphemeralPortProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("自作ヘルパー QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "EphemeralPortProfile" }
+            assertEquals(null, stored.helperBindPort)
+        }
+    }
+
+    @Test fun editProfile_prefillsHelperBindPort() {
+        val profile = sampleProfile().copy(
+            transportPreferenceName = "ISEKAI_HELPER_QUIC",
+            helperBindPort = 45900,
+        )
+        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("45900").assertExists()
+    }
+
     @Test fun selectingHelperQuicMultipathChip_andSaving_persistsTransportPreference() {
         var saved = false
         composeTestRule.setContent {

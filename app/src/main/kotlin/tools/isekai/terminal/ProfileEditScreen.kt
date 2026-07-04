@@ -130,6 +130,7 @@ fun ProfileEditScreen(
     var directAddress by remember { mutableStateOf(profile?.directAddress ?: "") }
     var enablePhysicalMultipath by remember { mutableStateOf(profile?.enablePhysicalMultipath ?: false) }
     var cellularRemoteAddress by remember { mutableStateOf(profile?.cellularRemoteAddress ?: "") }
+    var helperBindPort by remember { mutableStateOf(profile?.helperBindPort?.toString() ?: "") }
     var stunServer by remember { mutableStateOf(profile?.stunServer ?: "") }
     var relayAddr by remember { mutableStateOf(profile?.relayAddr ?: "") }
     var relaySni by remember { mutableStateOf(profile?.relaySni ?: "") }
@@ -455,6 +456,29 @@ fun ProfileEditScreen(
             Text(
                 text = "初回接続時に SSH 経由で自作ヘルパー（isekai-helper）を自動配布・起動します" +
                     "（対応 OS: Linux x86_64 / aarch64）。",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        if (transportPreference == TransportPreference.ISEKAI_HELPER_QUIC ||
+            transportPreference == TransportPreference.AUTO ||
+            transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH
+        ) {
+            OutlinedTextField(
+                value = helperBindPort,
+                onValueChange = { new -> helperBindPort = new.filter { it.isDigit() }.take(5) },
+                label = { Text("ヘルパー待受ポート固定（任意）") },
+                placeholder = { Text("未指定ならOSが自動選択") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                text = "自作ヘルパーのQUIC待受ポートを固定します。サーバーへ直接到達する経路" +
+                    "（direct_address等）を使う場合、サーバー側ファイアウォールで事前にこの" +
+                    "ポートだけを開けておけます（未指定ならOSがエフェメラルポートを選ぶため、" +
+                    "接続前にポート番号が分からずファイアウォール許可ができません）。",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -811,6 +835,7 @@ fun ProfileEditScreen(
                         directAddress = directAddress.trim().takeIf { it.isNotBlank() },
                         enablePhysicalMultipath = enablePhysicalMultipath,
                         cellularRemoteAddress = cellularRemoteAddress.trim().takeIf { it.isNotBlank() },
+                        helperBindPort = helperBindPort.toIntOrNull(),
                         enableUpstreamFailover = enableUpstreamFailover,
                         postConnectCommands = postConnectCommands.trim().takeIf { it.isNotEmpty() },
                         forwards = forwardDrafts.mapNotNull { it.toPortForwardOrNull() },
