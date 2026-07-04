@@ -94,12 +94,14 @@ jobs:
           echo "device_name=$DEVICE_NAME" >> "$GITHUB_OUTPUT"
           echo "picked simulator: $DEVICE_NAME"
 
-      - name: Build TsshTerminalApp for iOS Simulator
+      - name: Build and test TsshTerminalApp on iOS Simulator
+        # CODE_SIGNING_ALLOWED=NOで署名を無効化すると、TsshTerminalAppTests
+        # (CredentialVaultのKeychainテストをホストする)がerrSecMissingEntitlement
+        # (-34018)で失敗する。署名はXcodeの自動ローカル署名に任せる。
         working-directory: ios/App
         run: |
           xcodebuild -list -project TsshTerminalApp.xcodeproj
-          xcodebuild build-for-testing \
+          xcodebuild test \
             -project TsshTerminalApp.xcodeproj \
             -scheme TsshTerminalApp \
-            -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}' \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+            -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}'

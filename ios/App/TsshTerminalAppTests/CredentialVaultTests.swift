@@ -2,8 +2,15 @@ import CryptoKit
 import XCTest
 @testable import TsshCore
 
-/// Phase 1B: CredentialVault(Keychain保護)の検証。iOS Simulatorは実機と同様に
-/// 動作するKeychainを持つため、実機なしでこれらのテストが実行できる。
+/// Phase 1B: CredentialVault(Keychain保護)の検証。
+///
+/// このテストは`TsshCoreTests`(素のSwiftPMパッケージのテストバンドル)ではなく、
+/// `TsshTerminalApp`にホストされる`TsshTerminalAppTests`ターゲットに置く必要がある。
+/// 素のSwiftPMパッケージのXCTestバンドルは実アプリでホストされないため、
+/// Keychain APIが`errSecMissingEntitlement`(-34018)で失敗することをCIで確認した
+/// (未署名/非ホストのプロセスはOSがどのアプリのKeychainか判定できないため)。
+/// iOS Simulatorは実機と同様に動作するKeychainを持つため、実機なしでこれらの
+/// テストが実行できる。
 final class CredentialVaultTests: XCTestCase {
     private var tempDir: URL!
     private var vault: CredentialVault!

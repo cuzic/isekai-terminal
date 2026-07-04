@@ -11,13 +11,27 @@
 		AAAABBBBCCCC00000000000B /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC000000000008 /* ContentView.swift */; };
 		AAAABBBBCCCC00000000000C /* DiagnosticCallbackBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC000000000009 /* DiagnosticCallbackBridge.swift */; };
 		AAAABBBBCCCC000000000018 /* TsshCore in Frameworks */ = {isa = PBXBuildFile; productRef = AAAABBBBCCCC000000000017 /* TsshCore */; };
+		AAAABBBBCCCC00000000001D /* CredentialVaultTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC00000000001C /* CredentialVaultTests.swift */; };
+		AAAABBBBCCCC000000000026 /* TsshCore in Frameworks */ = {isa = PBXBuildFile; productRef = AAAABBBBCCCC000000000017 /* TsshCore */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		AAAABBBBCCCC000000000022 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AAAABBBBCCCC000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AAAABBBBCCCC000000000002;
+			remoteInfo = TsshTerminalApp;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		AAAABBBBCCCC000000000006 /* TsshTerminalApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TsshTerminalApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AAAABBBBCCCC000000000007 /* TsshTerminalApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TsshTerminalApp.swift; sourceTree = "<group>"; };
 		AAAABBBBCCCC000000000008 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		AAAABBBBCCCC000000000009 /* DiagnosticCallbackBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticCallbackBridge.swift; sourceTree = "<group>"; };
+		AAAABBBBCCCC00000000001A /* TsshTerminalAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TsshTerminalAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		AAAABBBBCCCC00000000001C /* CredentialVaultTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CredentialVaultTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -29,6 +43,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AAAABBBBCCCC00000000001F /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AAAABBBBCCCC000000000026 /* TsshCore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -36,6 +58,7 @@
 			isa = PBXGroup;
 			children = (
 				AAAABBBBCCCC000000000006 /* TsshTerminalApp.app */,
+				AAAABBBBCCCC00000000001A /* TsshTerminalAppTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -44,6 +67,7 @@
 			isa = PBXGroup;
 			children = (
 				AAAABBBBCCCC000000000005 /* TsshTerminalApp */,
+				AAAABBBBCCCC00000000001B /* TsshTerminalAppTests */,
 				AAAABBBBCCCC000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -56,6 +80,14 @@
 				AAAABBBBCCCC000000000009 /* DiagnosticCallbackBridge.swift */,
 			);
 			path = TsshTerminalApp;
+			sourceTree = "<group>";
+		};
+		AAAABBBBCCCC00000000001B /* TsshTerminalAppTests */ = {
+			isa = PBXGroup;
+			children = (
+				AAAABBBBCCCC00000000001C /* CredentialVaultTests.swift */,
+			);
+			path = TsshTerminalAppTests;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -80,6 +112,27 @@
 			productName = TsshTerminalApp;
 			productReference = AAAABBBBCCCC000000000006 /* TsshTerminalApp.app */;
 			productType = "com.apple.product-type.application";
+		};
+		AAAABBBBCCCC000000000019 /* TsshTerminalAppTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AAAABBBBCCCC000000000023 /* Build configuration list for PBXNativeTarget "TsshTerminalAppTests" */;
+			buildPhases = (
+				AAAABBBBCCCC00000000001E /* Sources */,
+				AAAABBBBCCCC00000000001F /* Frameworks */,
+				AAAABBBBCCCC000000000020 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				AAAABBBBCCCC000000000021 /* PBXTargetDependency */,
+			);
+			name = TsshTerminalAppTests;
+			packageProductDependencies = (
+				AAAABBBBCCCC000000000017 /* TsshCore */,
+			);
+			productName = TsshTerminalAppTests;
+			productReference = AAAABBBBCCCC00000000001A /* TsshTerminalAppTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
 		};
 /* End PBXNativeTarget section */
 
@@ -108,12 +161,20 @@
 			projectRoot = "";
 			targets = (
 				AAAABBBBCCCC000000000002 /* TsshTerminalApp */,
+				AAAABBBBCCCC000000000019 /* TsshTerminalAppTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		AAAABBBBCCCC00000000000F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AAAABBBBCCCC000000000020 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -133,7 +194,23 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AAAABBBBCCCC00000000001E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AAAABBBBCCCC00000000001D /* CredentialVaultTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		AAAABBBBCCCC000000000021 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = AAAABBBBCCCC000000000002 /* TsshTerminalApp */;
+			targetProxy = AAAABBBBCCCC000000000022 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		AAAABBBBCCCC000000000011 /* Debug */ = {
@@ -302,6 +379,42 @@
 			};
 			name = Release;
 		};
+		AAAABBBBCCCC000000000024 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "tools.isekai.terminal.TsshTerminalAppTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/TsshTerminalApp.app/TsshTerminalApp";
+			};
+			name = Debug;
+		};
+		AAAABBBBCCCC000000000025 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "tools.isekai.terminal.TsshTerminalAppTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/TsshTerminalApp.app/TsshTerminalApp";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -319,6 +432,15 @@
 			buildConfigurations = (
 				AAAABBBBCCCC000000000014 /* Debug */,
 				AAAABBBBCCCC000000000015 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AAAABBBBCCCC000000000023 /* Build configuration list for PBXNativeTarget "TsshTerminalAppTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AAAABBBBCCCC000000000024 /* Debug */,
+				AAAABBBBCCCC000000000025 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
