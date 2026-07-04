@@ -18,6 +18,7 @@ compile_error!(
 
 mod cli;
 mod connect;
+mod init;
 
 use clap::Parser;
 
@@ -41,6 +42,7 @@ async fn main() -> std::process::ExitCode {
     let cli = cli::Cli::parse();
     let result = match cli.command {
         cli::Command::Connect(args) => connect::run(args).await,
+        cli::Command::Init(args) => init::run(args).await,
     };
 
     match result {
