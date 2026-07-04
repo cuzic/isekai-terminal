@@ -8,6 +8,7 @@ use crate::{
 use crate::quic_transport::{QuicConfig, QuicSession};
 use crate::helper_quic_transport::{HelperQuicConfig, HelperQuicSession};
 use crate::multipath_transport::{MultipathHelperQuicConfig, MultipathHelperQuicSession};
+use crate::isekai_stun_p2p_transport::{IsekaiStunP2pConfig, IsekaiStunP2pSession};
 
 // ── Active session ────────────────────────────────────────
 
@@ -16,6 +17,7 @@ enum ActiveSession {
     Quic(Arc<QuicSession>),
     HelperQuic(Arc<HelperQuicSession>),
     MultipathHelperQuic(Arc<MultipathHelperQuicSession>),
+    IsekaiStunP2p(Arc<IsekaiStunP2pSession>),
 }
 
 impl ActiveSession {
@@ -25,6 +27,7 @@ impl ActiveSession {
             Self::Quic(s) => s.send(data),
             Self::HelperQuic(s) => s.send(data),
             Self::MultipathHelperQuic(s) => s.send(data),
+            Self::IsekaiStunP2p(s) => s.send(data),
         }
     }
     fn resize(&self, cols: u32, rows: u32) {
@@ -33,6 +36,7 @@ impl ActiveSession {
             Self::Quic(s) => s.resize(cols, rows),
             Self::HelperQuic(s) => s.resize(cols, rows),
             Self::MultipathHelperQuic(s) => s.resize(cols, rows),
+            Self::IsekaiStunP2p(s) => s.resize(cols, rows),
         }
     }
     fn disconnect(&self) {
@@ -41,6 +45,7 @@ impl ActiveSession {
             Self::Quic(s) => s.disconnect(),
             Self::HelperQuic(s) => s.disconnect(),
             Self::MultipathHelperQuic(s) => s.disconnect(),
+            Self::IsekaiStunP2p(s) => s.disconnect(),
         }
     }
     /// マルチパス以外のセッションでは意味を持たないため何もしない
@@ -57,6 +62,7 @@ impl ActiveSession {
             Self::Quic(s) => s.scrollback_len(),
             Self::HelperQuic(s) => s.scrollback_len(),
             Self::MultipathHelperQuic(s) => s.scrollback_len(),
+            Self::IsekaiStunP2p(s) => s.scrollback_len(),
         }
     }
     fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
@@ -65,6 +71,7 @@ impl ActiveSession {
             Self::Quic(s) => s.scrollback_cells(offset, rows),
             Self::HelperQuic(s) => s.scrollback_cells(offset, rows),
             Self::MultipathHelperQuic(s) => s.scrollback_cells(offset, rows),
+            Self::IsekaiStunP2p(s) => s.scrollback_cells(offset, rows),
         }
     }
     fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
@@ -73,6 +80,7 @@ impl ActiveSession {
             Self::Quic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
             Self::HelperQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
             Self::MultipathHelperQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
+            Self::IsekaiStunP2p(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
         }
     }
     fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
@@ -81,6 +89,7 @@ impl ActiveSession {
             Self::Quic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
             Self::HelperQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
             Self::MultipathHelperQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
+            Self::IsekaiStunP2p(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
         }
     }
     fn trzsz_accept_download(&self, transfer_id: String) {
@@ -89,6 +98,7 @@ impl ActiveSession {
             Self::Quic(s) => s.trzsz_accept_download(transfer_id),
             Self::HelperQuic(s) => s.trzsz_accept_download(transfer_id),
             Self::MultipathHelperQuic(s) => s.trzsz_accept_download(transfer_id),
+            Self::IsekaiStunP2p(s) => s.trzsz_accept_download(transfer_id),
         }
     }
     fn trzsz_cancel(&self, transfer_id: String) {
@@ -97,6 +107,7 @@ impl ActiveSession {
             Self::Quic(s) => s.trzsz_cancel(transfer_id),
             Self::HelperQuic(s) => s.trzsz_cancel(transfer_id),
             Self::MultipathHelperQuic(s) => s.trzsz_cancel(transfer_id),
+            Self::IsekaiStunP2p(s) => s.trzsz_cancel(transfer_id),
         }
     }
     fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
@@ -105,7 +116,7 @@ impl ActiveSession {
             Self::Quic(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
             // ポートフォワードは MVP スコープ上プレーン SSH / tsshd QUIC のみ対応。
             // isekai-helper 経由の QUIC 系トランスポートは未対応（対象外）。
-            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) => {
+            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) | Self::IsekaiStunP2p(_) => {
                 log::warn!("add_local_forward: not supported over helper-QUIC transports");
             }
         }
@@ -114,7 +125,7 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.remove_forward(id),
             Self::Quic(s) => s.remove_forward(id),
-            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) => {
+            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) | Self::IsekaiStunP2p(_) => {
                 log::warn!("remove_forward: not supported over helper-QUIC transports");
             }
         }
@@ -363,6 +374,25 @@ impl SessionOrchestrator {
         let session = crate::multipath_transport::create_multipath_helper_quic_session(config);
         session.connect(Box::new(adapter))?;
         *self.shared.session.lock() = Some(ActiveSession::MultipathHelperQuic(session));
+        Ok(())
+    }
+
+    /// Phase 10: `TransportPreference::IsekaiStunP2pQuic` 相当。relay 無し・
+    /// STUN+SSH rendezvousによる直接 P2P QUIC。フォールバック無し（穴あけ不成立時は
+    /// 接続失敗として扱う。`isekai_stun_p2p_transport.rs` 参照）。
+    pub fn connect_isekai_stun_p2p(&self, config: IsekaiStunP2pConfig) -> Result<(), SshError> {
+        {
+            let mut s = self.shared.state.lock();
+            s.current_host = Some(config.ssh_host.clone());
+            s.current_port = config.ssh_port;
+            s.is_quic = true;
+            s.phase = ConnPhase::Connecting;
+        }
+        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
+        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let session = crate::isekai_stun_p2p_transport::create_isekai_stun_p2p_session(config);
+        session.connect(Box::new(adapter))?;
+        *self.shared.session.lock() = Some(ActiveSession::IsekaiStunP2p(session));
         Ok(())
     }
 

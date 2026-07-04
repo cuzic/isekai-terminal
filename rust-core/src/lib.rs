@@ -12,6 +12,7 @@ pub mod orchestrator;
 pub(crate) mod helper_bootstrap;
 pub mod helper_quic_transport;
 pub mod multipath_transport;
+pub mod isekai_stun_p2p_transport;
 #[cfg(test)]
 pub(crate) mod faulty_stream;
 pub(crate) mod faulty_udp_socket;
@@ -188,6 +189,9 @@ pub enum TransportPreference {
     /// （Phase 9、オプトイン。フォールバック無し）。`direct_host` 未設定なら
     /// `IsekaiHelperQuic` と同等（path0 のみ）。
     IsekaiHelperQuicMultipath,
+    /// STUN+SSH rendezvous による直接 P2P QUIC（Phase 10、オプトイン。relay 無し・
+    /// 穴あけ不成立時のフォールバック無し）。`isekai_stun_p2p_transport.rs` 参照。
+    IsekaiStunP2pQuic,
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]

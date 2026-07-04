@@ -10,6 +10,7 @@
 //! 転送は SFTP ではなく `base64 -d > file` 形式の exec で行う（sshd 側の SFTP subsystem
 //! 設定に依存しないため、より広い環境で動く）。
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -50,6 +51,20 @@ pub struct HelperHandshake {
     pub listen_port: u16,
     pub cert_sha256: String,
     pub session_secret: String,
+    /// Phase 10: `--stun-server` を渡したときのみ存在しうる。`isekai_stun_p2p_transport.rs`
+    /// 参照。`None` は「未指定」と「STUN問い合わせ失敗」の両方を表す（HELPER_PROTOCOL.md参照）。
+    #[serde(default)]
+    pub stun_observed_addr: Option<String>,
+}
+
+/// SSH起動コマンドラインに埋め込む、P2P方式ごとの追加引数。enumにすることで
+/// 呼び出し側が矛盾した組み合わせを型として表現できないようにしてある。
+#[derive(Debug, Clone, Default)]
+pub enum HelperP2pMode {
+    #[default]
+    None,
+    /// Phase 10: STUN+SSHランデブー方式(`TransportPreference::IsekaiStunP2pQuic`)。
+    Stun { stun_server: SocketAddr, punch_peer: Option<SocketAddr> },
 }
 
 /// 既知の Linux アーキテクチャ用にビルドした isekai-helper の静的バイナリ。
@@ -166,6 +181,7 @@ async fn launch_and_capture_handshake(
     session: &mut client::Handle<RusshEventHandler>,
     ssh_relay_target: &str,
     bind_port: Option<u16>,
+    p2p_mode: &HelperP2pMode,
 ) -> Result<HelperHandshake, BootstrapError> {
     // ファイル権限は 0700(dir)/0600(handshake ファイル) を umask で保証する
     // （HELPER_PROTOCOL.md「Bootstrap file permissions」契約）。
@@ -189,10 +205,25 @@ async fn launch_and_capture_handshake(
         Some(port) => format!("--bind [::]:{port} "),
         None => String::new(),
     };
+    // Phase 10: P2P方式ごとの追加引数。isekai-helper の daemon は起動直後に
+    // setsid で stdin を `/dev/null` にリダイレクトするため、対向アドレスやトークンを
+    // インタラクティブな stdin プロトコルで後から渡す手段が無い。このため、必要な値は
+    // 呼び出し側(isekai-terminal)が事前に用意しておき、起動コマンドラインの引数として
+    // そのまま埋め込む（HELPER_PROTOCOL.md 参照）。
+    let p2p_arg = match p2p_mode {
+        HelperP2pMode::None => String::new(),
+        HelperP2pMode::Stun { stun_server, punch_peer } => {
+            let punch = match punch_peer {
+                Some(addr) => format!("--punch-peer {addr} "),
+                None => String::new(),
+            };
+            format!("--stun-server {stun_server} {punch}")
+        }
+    };
     let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
     let launch_cmd = format!(
         "umask 077 && mkdir -p {HANDSHAKE_DIR} && \
-         ( setsid {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} {bind_arg}--target {ssh_relay_target} \
+         ( setsid {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} {bind_arg}{p2p_arg}--target {ssh_relay_target} \
          </dev/null >{HANDSHAKE_FILE} 2>{HANDSHAKE_LOG} & ); \
          for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
            [ -s {HANDSHAKE_FILE} ] && break; \
@@ -219,6 +250,7 @@ pub async fn ensure_helper_running(
     expected_version: &str,
     ssh_relay_target: &str,
     bind_port: Option<u16>,
+    p2p_mode: &HelperP2pMode,
 ) -> Result<HelperHandshake, BootstrapError> {
     if !check_existing_version(session, expected_version).await {
         info!("isekai-helper: no matching existing install, detecting remote arch");
@@ -233,7 +265,7 @@ pub async fn ensure_helper_running(
 
     match tokio::time::timeout(
         Duration::from_secs(10),
-        launch_and_capture_handshake(session, ssh_relay_target, bind_port),
+        launch_and_capture_handshake(session, ssh_relay_target, bind_port, p2p_mode),
     )
     .await
     {
@@ -322,18 +354,20 @@ mod tests {
             aarch64: &aarch64_bin,
         };
 
-        let handshake = ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None)
-            .await
-            .expect("bootstrap failed");
+        let handshake =
+            ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None, &HelperP2pMode::None)
+                .await
+                .expect("bootstrap failed");
         assert_eq!(handshake.v, 1);
         assert!(handshake.listen_port > 0);
         assert_eq!(handshake.cert_sha256.len(), 64);
 
         // 2回目呼び出し: バイナリは既にインストール済みのはずなので、
         // アップロードをスキップしても正常にハンドシェイクを取得できることを確認する。
-        let handshake2 = ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None)
-            .await
-            .expect("second bootstrap call failed");
+        let handshake2 =
+            ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None, &HelperP2pMode::None)
+                .await
+                .expect("second bootstrap call failed");
         assert_eq!(handshake2.v, 1);
         // 起動のたびに ephemeral cert/secret を生成するため、値自体は毎回変わる。
         assert_ne!(handshake.session_secret, handshake2.session_secret);

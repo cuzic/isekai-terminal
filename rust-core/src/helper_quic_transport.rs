@@ -20,7 +20,7 @@ use russh::client;
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use sha2::{Digest, Sha256};
 
-use crate::helper_bootstrap::{self, BootstrapError, HelperBinaries, HelperHandshake};
+use crate::helper_bootstrap::{self, BootstrapError, HelperBinaries, HelperHandshake, HelperP2pMode};
 use crate::resume_client::{self, ClientResumeState};
 use crate::transport::{
     authenticate_session, connect_via_jump_or_direct, run_ssh_channel_loop, RusshEventHandler,
@@ -61,7 +61,7 @@ pub(crate) const FRAME_REJECT_AUTH: u8 = 0xFF;
 
 /// isekai-helper/Cargo.toml の version と一致させる。バージョン不一致時は
 /// helper_bootstrap::ensure_helper_running が再配布する。
-pub(crate) const HELPER_VERSION: &str = "0.3.2";
+pub(crate) const HELPER_VERSION: &str = "0.3.3";
 
 pub(crate) const HELPER_BIN_X86_64: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -221,6 +221,7 @@ impl ServerCertVerifier for PinnedCertVerifier {
 async fn bootstrap_via_ssh(config: &HelperQuicConfig) -> Result<HelperHandshake, String> {
     bootstrap_helper_via_ssh(
         &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump, None,
+        &HelperP2pMode::None,
     ).await
 }
 
@@ -237,6 +238,10 @@ async fn bootstrap_via_ssh(config: &HelperQuicConfig) -> Result<HelperHandshake,
 /// （Tailscale経由のpath0はこれで十分、`ts-input`チェーンが素通しなため）。
 /// `Some(port)` を渡すと、direct_host（外部到達アドレス）向けにファイアウォールで
 /// 個別に許可した固定ポートで待ち受けさせる（Phase 9-4、`multipath_transport.rs`から使用）。
+///
+/// `p2p_mode`: Phase 10 の STUN+SSH rendezvous / relay 経由 P2P
+/// (`isekai_stun_p2p_transport.rs`/`isekai_link_relay_transport.rs`)専用。他の呼び出し元は
+/// 常に `&HelperP2pMode::None` を渡す。
 pub(crate) async fn bootstrap_helper_via_ssh(
     ssh_host: &str,
     ssh_port: u16,
@@ -244,6 +249,7 @@ pub(crate) async fn bootstrap_helper_via_ssh(
     auth: &SshAuth,
     jump: &Option<JumpConfig>,
     bind_port: Option<u16>,
+    p2p_mode: &HelperP2pMode,
 ) -> Result<HelperHandshake, String> {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
     // NOTE: このブートストラップ用 SSH 接続(踏み台込み)のホスト鍵は、本セッションと
@@ -269,7 +275,7 @@ pub(crate) async fn bootstrap_helper_via_ssh(
 
     let binaries = HelperBinaries { x86_64: HELPER_BIN_X86_64, aarch64: HELPER_BIN_AARCH64 };
     helper_bootstrap::ensure_helper_running(
-        &mut established.handle, &binaries, HELPER_VERSION, "127.0.0.1:22", bind_port,
+        &mut established.handle, &binaries, HELPER_VERSION, "127.0.0.1:22", bind_port, p2p_mode,
     )
         .await
         .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))
@@ -280,6 +286,24 @@ pub(crate) async fn bootstrap_helper_via_ssh(
 /// `cert_sha256_hex` にピン留めした QUIC connection を確立する。初回接続・
 /// reattach（`RESUME`）のどちらからも呼ばれる共通処理。
 async fn establish_quic_connection(remote: SocketAddr, cert_sha256_hex: &str) -> Result<noq::Connection, String> {
+    // 実機検証 (Phase 7-5) 用: `debug_fault` 経由で有効化されない限り
+    // `FaultyUdpSocket` は素通しで、通常利用時の挙動には影響しない。
+    let socket = crate::faulty_udp_socket::bind_faulty_udp_socket(
+        "0.0.0.0:0".parse().unwrap(),
+        crate::debug_fault::shared_injector(),
+    )
+    .map_err(|e| format!("endpoint bind failed: {e}"))?;
+    establish_quic_connection_with_socket(socket, remote, cert_sha256_hex).await
+}
+
+/// `establish_quic_connection` の中身のうち、ソケットを事前に用意して渡したい呼び出し元
+/// （Phase 10: `isekai_stun_p2p_transport.rs` が STUN 問い合わせ・穴あけ probe 送信に
+/// 使ったのと同一のソケットを、そのまま QUIC endpoint にも使い回したい）向けの下請け関数。
+pub(crate) async fn establish_quic_connection_with_socket(
+    socket: crate::faulty_udp_socket::FaultyUdpSocket,
+    remote: SocketAddr,
+    cert_sha256_hex: &str,
+) -> Result<noq::Connection, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -308,13 +332,6 @@ async fn establish_quic_connection(remote: SocketAddr, cert_sha256_hex: &str) ->
     let mut client_config = noq::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(transport));
 
-    // 実機検証 (Phase 7-5) 用: `debug_fault` 経由で有効化されない限り
-    // `FaultyUdpSocket` は素通しで、通常利用時の挙動には影響しない。
-    let socket = crate::faulty_udp_socket::bind_faulty_udp_socket(
-        "0.0.0.0:0".parse().unwrap(),
-        crate::debug_fault::shared_injector(),
-    )
-    .map_err(|e| format!("endpoint bind failed: {e}"))?;
     let endpoint = noq::Endpoint::new_with_abstract_socket(
         noq::EndpointConfig::default(),
         None,
@@ -336,7 +353,7 @@ async fn establish_quic_connection(remote: SocketAddr, cert_sha256_hex: &str) ->
 
 /// `session_secret` と QUIC connection の exporter から proof を計算する
 /// （HELLO と RESUME で共通のロジック。RESUME は `extra` に session_id を渡す）。
-fn compute_proof(conn: &noq::Connection, session_secret: &[u8], extra: &[u8]) -> Result<[u8; 32], String> {
+pub(crate) fn compute_proof(conn: &noq::Connection, session_secret: &[u8], extra: &[u8]) -> Result<[u8; 32], String> {
     let mut exporter = [0u8; 32];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|e| format!("export_keying_material failed: {e:?}"))?;
@@ -457,7 +474,7 @@ async fn connect_helper_quic_stream(
 /// control stream を開き、`CONTROL_HELLO` を送って `CONTROL_ACK` を待つ。
 /// data stream の HELLO と同じ `proof` を再利用する（同一 QUIC connection の
 /// exporter から計算されるため同じ値になる、HELPER_PROTOCOL.md §7.3）。
-async fn open_control_stream(
+pub(crate) async fn open_control_stream(
     conn: &noq::Connection,
     proof: &[u8],
 ) -> Result<(noq::SendStream, noq::RecvStream, resume_client::SessionId), String> {
@@ -486,7 +503,7 @@ async fn open_control_stream(
 /// APP_ACK の送受信を行う背後タスクを spawn する。data stream が閉じた後も
 /// これらのタスクは自然に終了しない（control stream 側の read/write が
 /// エラーになった時点でループを抜ける、ベストエフォート設計）。
-fn spawn_app_ack_tasks(
+pub(crate) fn spawn_app_ack_tasks(
     mut csend: noq::SendStream,
     mut crecv: noq::RecvStream,
     state: Arc<std::sync::Mutex<ClientResumeState>>,

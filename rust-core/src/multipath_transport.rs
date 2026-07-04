@@ -897,6 +897,7 @@ async fn try_connect_multipath(
     let bind_port = config.direct_host.is_some().then_some(DIRECT_MULTIPATH_BIND_PORT);
     let handshake = helper_quic_transport::bootstrap_helper_via_ssh(
         &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump, bind_port,
+        &crate::helper_bootstrap::HelperP2pMode::None,
     )
     .await?;
 
