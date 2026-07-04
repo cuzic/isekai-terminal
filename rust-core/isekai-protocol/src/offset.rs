@@ -1,8 +1,8 @@
 //! C2H/H2C stream-position offsets (`ISEKAI_SSH_DESIGN.md` "resume を
 //! ProxyCommand の背後に隠す"節). Naming and direction semantics follow that
 //! section exactly; these are plain value types with overflow-checked
-//! arithmetic only — resume frames that carry them on the wire (`RESUME`/
-//! `RESUME_ACK`) are added later in S-4a.
+//! arithmetic. The resume frames that carry them on the wire (`RESUME`/
+//! `RESUME_ACK`) live in the `resume` module (Phase S-4a).
 
 use crate::error::ProtocolError;
 
