@@ -728,11 +728,11 @@ class ProfileEditScreenTest {
 
     @Test fun helperBindPortField_hiddenForPlainSsh_shownForHelperQuicChips() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
-        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意）").assertDoesNotExist()
+        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意、1024〜65535）").assertDoesNotExist()
 
         composeTestRule.onNodeWithText("自作ヘルパー QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意）").assertExists()
+        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意、1024〜65535）").assertExists()
     }
 
     @Test fun selectingHelperQuic_settingBindPort_andSaving_persistsHelperBindPort() {
@@ -746,7 +746,7 @@ class ProfileEditScreenTest {
         fields[3].performTextInput("root")
         composeTestRule.onNodeWithText("自作ヘルパー QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意）").performScrollTo().performTextInput("45900")
+        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意、1024〜65535）").performScrollTo().performTextInput("45900")
 
         composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
         composeTestRule.waitUntil(5000) {
@@ -779,6 +779,62 @@ class ProfileEditScreenTest {
         runBlocking {
             val stored = Repositories.profiles.getAll().first { it.label == "EphemeralPortProfile" }
             assertEquals(null, stored.helperBindPort)
+        }
+    }
+
+    @Test fun helperBindPort_belowPrivilegedRange_disablesSave() {
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = {}, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("BadPortProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("自作ヘルパー QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意、1024〜65535）").performScrollTo().performTextInput("80")
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().assertIsNotEnabled()
+    }
+
+    @Test fun helperBindPort_abovePortRange_disablesSave() {
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = {}, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("TooHighPortProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("自作ヘルパー QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        // 5桁までしか入力を許していないため、65536以上は現状の桁数制限では防げない値として
+        // 99999(5桁の最大値、範囲外)を使う。
+        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意、1024〜65535）").performScrollTo().performTextInput("99999")
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().assertIsNotEnabled()
+    }
+
+    @Test fun helperBindPort_atRangeBoundaries_allowsSave() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("BoundaryPortProfile")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+        composeTestRule.onNodeWithText("自作ヘルパー QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意、1024〜65535）").performScrollTo().performTextInput("1024")
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "BoundaryPortProfile" }
+            assertEquals(1024, stored.helperBindPort)
         }
     }
 
