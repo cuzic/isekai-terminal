@@ -577,6 +577,137 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 
+/**
+ * Phase 1A-1 の診断用 UniFFI Object。Swift 側での生成・明示的な破棄が
+ * 正しく動くことを確認する（セッション/接続の状態は一切持たない）。
+ */
+public protocol DiagnosticHandleProtocol: AnyObject, Sendable {
+    
+    func fireCallback(callback: DiagnosticCallback) 
+    
+}
+/**
+ * Phase 1A-1 の診断用 UniFFI Object。Swift 側での生成・明示的な破棄が
+ * 正しく動くことを確認する（セッション/接続の状態は一切持たない）。
+ */
+open class DiagnosticHandle: DiagnosticHandleProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_tssh_core_fn_clone_diagnostichandle(self.handle, $0) }
+    }
+public convenience init() {
+    let handle =
+        try! rustCall() {
+    uniffi_tssh_core_fn_constructor_diagnostichandle_new($0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_tssh_core_fn_free_diagnostichandle(handle, $0) }
+    }
+
+    
+
+    
+open func fireCallback(callback: DiagnosticCallback)  {try! rustCall() {
+    uniffi_tssh_core_fn_method_diagnostichandle_fire_callback(
+            self.uniffiCloneHandle(),
+        FfiConverterCallbackInterfaceDiagnosticCallback_lower(callback),$0
+    )
+}
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDiagnosticHandle: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = DiagnosticHandle
+
+    public static func lift(_ handle: UInt64) throws -> DiagnosticHandle {
+        return DiagnosticHandle(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: DiagnosticHandle) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DiagnosticHandle {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: DiagnosticHandle, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDiagnosticHandle_lift(_ handle: UInt64) throws -> DiagnosticHandle {
+    return try FfiConverterTypeDiagnosticHandle.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDiagnosticHandle_lower(_ value: DiagnosticHandle) -> UInt64 {
+    return FfiConverterTypeDiagnosticHandle.lower(value)
+}
+
+
+
+
+
+
 public protocol HelperQuicSessionProtocol: AnyObject, Sendable {
     
     /**
@@ -4019,6 +4150,145 @@ public func FfiConverterTypeTrzszPublicState_lower(_ value: TrzszPublicState) ->
 
 
 
+/**
+ * Phase 1A-1 の診断用 callback interface。UniFFI の `callback_interface` が
+ * Swift 側で `protocol` として実装でき、実際に呼び出せることを確認する。
+ */
+public protocol DiagnosticCallback: AnyObject, Sendable {
+    
+    func onDiagnosticEvent(message: String) 
+    
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceDiagnosticCallback {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceDiagnosticCallback = UniffiVTableCallbackInterfaceDiagnosticCallback(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterCallbackInterfaceDiagnosticCallback.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface DiagnosticCallback: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterCallbackInterfaceDiagnosticCallback.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface DiagnosticCallback: handle missing in uniffiClone")
+            }
+        },
+        onDiagnosticEvent: { (
+            uniffiHandle: UInt64,
+            message: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceDiagnosticCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onDiagnosticEvent(
+                     message: try FfiConverterString.lift(message)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceDiagnosticCallback> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceDiagnosticCallback>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitDiagnosticCallback() {
+    uniffi_tssh_core_fn_init_callback_vtable_diagnosticcallback(UniffiCallbackInterfaceDiagnosticCallback.vtablePtr)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceDiagnosticCallback {
+    fileprivate static let handleMap = UniffiHandleMap<DiagnosticCallback>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceDiagnosticCallback : FfiConverter {
+    typealias SwiftType = DiagnosticCallback
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceDiagnosticCallback_lift(_ handle: UInt64) throws -> DiagnosticCallback {
+    return try FfiConverterCallbackInterfaceDiagnosticCallback.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceDiagnosticCallback_lower(_ v: DiagnosticCallback) -> UInt64 {
+    return FfiConverterCallbackInterfaceDiagnosticCallback.lower(v)
+}
+
+
+
+
 public protocol OrchestratorCallback: AnyObject, Sendable {
     
     func onConnectionStateChanged(state: ConnectionPublicState) 
@@ -4986,6 +5256,73 @@ fileprivate struct FfiConverterSequenceTypePortForward: FfiConverterRustBuffer {
         return seq
     }
 }
+private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
+private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
+
+fileprivate let uniffiContinuationHandleMap = UniffiHandleMap<UnsafeContinuation<Int8, Never>>()
+
+fileprivate func uniffiRustCallAsync<F, T>(
+    rustFutureFunc: () -> UInt64,
+    pollFunc: (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
+    completeFunc: (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
+    freeFunc: (UInt64) -> (),
+    liftFunc: (F) throws -> T,
+    errorHandler: ((RustBuffer) throws -> Swift.Error)?
+) async throws -> T {
+    // Make sure to call the ensure init function since future creation doesn't have a
+    // RustCallStatus param, so doesn't use makeRustCall()
+    uniffiEnsureTsshCoreInitialized()
+    let rustFuture = rustFutureFunc()
+    defer {
+        freeFunc(rustFuture)
+    }
+    var pollResult: Int8;
+    repeat {
+        pollResult = await withUnsafeContinuation {
+            pollFunc(
+                rustFuture,
+                { handle, pollResult in
+                    uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult)
+                },
+                uniffiContinuationHandleMap.insert(obj: $0)
+            )
+        }
+    } while pollResult != UNIFFI_RUST_FUTURE_POLL_READY
+
+    return try liftFunc(makeRustCall(
+        { completeFunc(rustFuture, $0) },
+        errorHandler: errorHandler
+    ))
+}
+
+// Callback handlers for an async calls.  These are invoked by Rust when the future is ready.  They
+// lift the return value or error and resume the suspended function.
+fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: Int8) {
+    if let continuation = try? uniffiContinuationHandleMap.remove(handle: handle) {
+        continuation.resume(returning: pollResult)
+    } else {
+        print("uniffiFutureContinuationCallback invalid handle")
+    }
+}
+/**
+ * Rust の `async fn` が UniFFI 経由で Swift の `async`/`await` として呼べることを
+ * 確認するための診断用関数（Phase 1A-1、iOSアプリ雛形のround-trip検証）。
+ */
+public func corePing()async  -> String  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_tssh_core_fn_func_core_ping(
+                )
+            },
+            pollFunc: ffi_tssh_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_tssh_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_tssh_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: nil
+            
+        )
+}
 /**
  * tssh-core の crate バージョン（`Cargo.toml` の `version`）を返す。
  *
@@ -5122,6 +5459,9 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_tssh_core_checksum_func_core_ping() != 65359) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_tssh_core_checksum_func_core_version() != 13464) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5162,6 +5502,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_func_create_quic_session() != 25547) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_diagnostichandle_fire_callback() != 38746) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_method_sshsession_connect() != 26689) {
@@ -5422,6 +5765,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_tssh_core_checksum_method_quicsession_trzsz_send_chunk() != 12522) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_tssh_core_checksum_constructor_diagnostichandle_new() != 540) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_diagnosticcallback_on_diagnostic_event() != 55189) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_tssh_core_checksum_method_orchestratorcallback_on_connection_state_changed() != 63751) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5486,6 +5835,7 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
 
+    uniffiCallbackInitDiagnosticCallback()
     uniffiCallbackInitOrchestratorCallback()
     uniffiCallbackInitSessionCallback()
     return InitializationResult.ok

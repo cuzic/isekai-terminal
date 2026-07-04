@@ -243,6 +243,13 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK_METHOD0
+typedef void (*UniffiCallbackInterfaceDiagnosticCallbackMethod0)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD0
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD0
 typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod0)(uint64_t, RustBuffer, void* _Nonnull, 
@@ -390,6 +397,15 @@ typedef void (*UniffiCallbackInterfaceSessionCallbackMethod11)(uint64_t, RustBuf
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
+typedef struct UniffiVTableCallbackInterfaceDiagnosticCallback {
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+    UniffiCallbackInterfaceClone _Nonnull uniffiClone;
+    UniffiCallbackInterfaceDiagnosticCallbackMethod0 _Nonnull onDiagnosticEvent;
+} UniffiVTableCallbackInterfaceDiagnosticCallback;
+
+#endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK
 #define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK
 typedef struct UniffiVTableCallbackInterfaceOrchestratorCallback {
@@ -426,6 +442,27 @@ typedef struct UniffiVTableCallbackInterfaceSessionCallback {
     UniffiCallbackInterfaceSessionCallbackMethod11 _Nonnull onAgentSignRequest;
 } UniffiVTableCallbackInterfaceSessionCallback;
 
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_CLONE_DIAGNOSTICHANDLE
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_CLONE_DIAGNOSTICHANDLE
+uint64_t uniffi_tssh_core_fn_clone_diagnostichandle(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FREE_DIAGNOSTICHANDLE
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FREE_DIAGNOSTICHANDLE
+void uniffi_tssh_core_fn_free_diagnostichandle(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_CONSTRUCTOR_DIAGNOSTICHANDLE_NEW
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_CONSTRUCTOR_DIAGNOSTICHANDLE_NEW
+uint64_t uniffi_tssh_core_fn_constructor_diagnostichandle_new(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_METHOD_DIAGNOSTICHANDLE_FIRE_CALLBACK
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_METHOD_DIAGNOSTICHANDLE_FIRE_CALLBACK
+void uniffi_tssh_core_fn_method_diagnostichandle_fire_callback(uint64_t ptr, uint64_t callback, RustCallStatus *_Nonnull out_status
+);
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_CLONE_SSHSESSION
 #define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_CLONE_SSHSESSION
@@ -927,6 +964,11 @@ void uniffi_tssh_core_fn_method_quicsession_trzsz_cancel(uint64_t ptr, RustBuffe
 void uniffi_tssh_core_fn_method_quicsession_trzsz_send_chunk(uint64_t ptr, RustBuffer transfer_id, RustBuffer data, int8_t is_last, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_INIT_CALLBACK_VTABLE_DIAGNOSTICCALLBACK
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_INIT_CALLBACK_VTABLE_DIAGNOSTICCALLBACK
+void uniffi_tssh_core_fn_init_callback_vtable_diagnosticcallback(const UniffiVTableCallbackInterfaceDiagnosticCallback* _Nonnull vtable
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_INIT_CALLBACK_VTABLE_ORCHESTRATORCALLBACK
 #define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_INIT_CALLBACK_VTABLE_ORCHESTRATORCALLBACK
 void uniffi_tssh_core_fn_init_callback_vtable_orchestratorcallback(const UniffiVTableCallbackInterfaceOrchestratorCallback* _Nonnull vtable
@@ -935,6 +977,12 @@ void uniffi_tssh_core_fn_init_callback_vtable_orchestratorcallback(const UniffiV
 #ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_INIT_CALLBACK_VTABLE_SESSIONCALLBACK
 #define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_INIT_CALLBACK_VTABLE_SESSIONCALLBACK
 void uniffi_tssh_core_fn_init_callback_vtable_sessioncallback(const UniffiVTableCallbackInterfaceSessionCallback* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_CORE_PING
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_CORE_PING
+uint64_t uniffi_tssh_core_fn_func_core_ping(void
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_FN_FUNC_CORE_VERSION
@@ -1271,6 +1319,12 @@ void ffi_tssh_core_rust_future_free_void(uint64_t handle
 void ffi_tssh_core_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_CORE_PING
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_CORE_PING
+uint16_t uniffi_tssh_core_checksum_func_core_ping(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_CORE_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_CORE_VERSION
 uint16_t uniffi_tssh_core_checksum_func_core_version(void
@@ -1352,6 +1406,12 @@ uint16_t uniffi_tssh_core_checksum_func_create_session_orchestrator(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_CREATE_QUIC_SESSION
 #define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_FUNC_CREATE_QUIC_SESSION
 uint16_t uniffi_tssh_core_checksum_func_create_quic_session(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_METHOD_DIAGNOSTICHANDLE_FIRE_CALLBACK
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_METHOD_DIAGNOSTICHANDLE_FIRE_CALLBACK
+uint16_t uniffi_tssh_core_checksum_method_diagnostichandle_fire_callback(void
     
 );
 #endif
@@ -1868,6 +1928,18 @@ uint16_t uniffi_tssh_core_checksum_method_quicsession_trzsz_cancel(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_METHOD_QUICSESSION_TRZSZ_SEND_CHUNK
 #define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_METHOD_QUICSESSION_TRZSZ_SEND_CHUNK
 uint16_t uniffi_tssh_core_checksum_method_quicsession_trzsz_send_chunk(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_CONSTRUCTOR_DIAGNOSTICHANDLE_NEW
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_CONSTRUCTOR_DIAGNOSTICHANDLE_NEW
+uint16_t uniffi_tssh_core_checksum_constructor_diagnostichandle_new(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_METHOD_DIAGNOSTICCALLBACK_ON_DIAGNOSTIC_EVENT
+#define UNIFFI_FFIDEF_UNIFFI_TSSH_CORE_CHECKSUM_METHOD_DIAGNOSTICCALLBACK_ON_DIAGNOSTIC_EVENT
+uint16_t uniffi_tssh_core_checksum_method_diagnosticcallback_on_diagnostic_event(void
     
 );
 #endif

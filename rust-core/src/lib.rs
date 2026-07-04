@@ -74,6 +74,37 @@ pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// Rust の `async fn` が UniFFI 経由で Swift の `async`/`await` として呼べることを
+/// 確認するための診断用関数（Phase 1A-1、iOSアプリ雛形のround-trip検証）。
+#[uniffi::export]
+pub async fn core_ping() -> String {
+    "pong".to_string()
+}
+
+/// Phase 1A-1 の診断用 callback interface。UniFFI の `callback_interface` が
+/// Swift 側で `protocol` として実装でき、実際に呼び出せることを確認する。
+#[uniffi::export(callback_interface)]
+pub trait DiagnosticCallback: Send + Sync {
+    fn on_diagnostic_event(&self, message: String);
+}
+
+/// Phase 1A-1 の診断用 UniFFI Object。Swift 側での生成・明示的な破棄が
+/// 正しく動くことを確認する（セッション/接続の状態は一切持たない）。
+#[derive(uniffi::Object)]
+pub struct DiagnosticHandle;
+
+#[uniffi::export]
+impl DiagnosticHandle {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self)
+    }
+
+    pub fn fire_callback(&self, callback: Box<dyn DiagnosticCallback>) {
+        callback.on_diagnostic_event("hello from Rust".to_string());
+    }
+}
+
 // ── 公開型 ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, uniffi::Record)]
