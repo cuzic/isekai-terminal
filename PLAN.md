@@ -1976,8 +1976,30 @@ Android向けrustupセットアップのみを行い、`tssh-core`が`include_by
 これにより「Phase 1A: iOSで成立するかを早期に証明するフェーズ」の主要ゴール
 （Xcode雛形・アプリCI・fixture・EventQueue・IME・画面更新ブリッジ・実SSH接続）を
 全て達成した。残りはPhase 1A-7（IME/カーソル統合）・1A-9（QUIC/helper縦切り、任意）。
-これらは実機での対話的な確認が中心になるため、Phase 1B（CredentialVault・
-GRDB・信頼ストア等）へ先に進むことも選択肢になる。
+これらは実機での対話的な確認が中心になるため、実機が不要な範囲でPhase 1B
+（CredentialVault・GRDB・信頼ストア等）へ先に進むことにした。
+
+### Phase 1B 実装進捗（2026-07-04）
+
+- ✅ **CredentialVault（Keychain保護）**: AES-GCM暗号化 + Keychain保管のKEK
+  （`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`）という構成で実装。
+  暗号化形式のversion・AAD（key_id/key_type/public_keyですり替え検知）・
+  atomic write・key_idのSHA256ハッシュからのパス導出・Keychain追加成功/blob
+  保存失敗時のrollback・鍵ローテーション・orphan blob清掃・端末ロック時の
+  エラー区別を実装し、XCTest 7件で検証。
+
+  **重要な落とし穴（Keychainテストの配置場所）**: 素のSwiftPMパッケージ
+  （`TsshCore`）のXCTestバンドルは実アプリでホストされないため、Keychain APIが
+  `errSecMissingEntitlement`（-34018）で失敗することをCIで発見した（未署名/
+  非ホストのプロセスはOSがどのアプリのKeychainか判定できないため）。
+  `CODE_SIGNING_ALLOWED=NO`を外してXcodeの自動ローカル署名に任せるだけでは
+  解消せず、根本原因は「テストが実アプリにホストされていないこと」だった。
+  `TsshTerminalApp.xcodeproj`に新規ユニットテストターゲット
+  `TsshTerminalAppTests`（`TEST_HOST`/`BUNDLE_LOADER`で`TsshTerminalApp`に
+  ホストされる、明示的な共有scheme付き）を追加し、`CredentialVaultTests`を
+  そこへ移動して解消した。**Keychain・生体認証・Local Network Privacyなど
+  実アプリのentitlementコンテキストが必要なテストは、今後も`TsshTerminalAppTests`
+  （素のSwiftPMパッケージの`TsshCoreTests`ではなく）に置くこと。**
 
 ---
 
