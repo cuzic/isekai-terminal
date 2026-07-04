@@ -487,6 +487,16 @@ fun ProfileEditScreen(
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH &&
+                directAddress.isNotBlank() && helperBindPort.isBlank()
+            ) {
+                Text(
+                    text = "直接到達アドレス(direct_address)が設定されているため、このまま未指定でも" +
+                        "既定の固定ポート45823が使われます(完全なエフェメラルにはなりません)。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             if (!helperBindPortValid) {
                 Text(
                     text = "⚠ 1024〜65535の範囲で指定してください" +

@@ -870,4 +870,21 @@ class ProfileEditScreenTest {
             assertEquals("ISEKAI_HELPER_QUIC_MULTIPATH", stored.transportPreferenceName)
         }
     }
+
+    @Test fun multipathWithDirectAddress_andBlankBindPort_showsDefaultPortNote() {
+        composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("自作ヘルパー QUIC（マルチパス）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("既定の固定ポート45823が使われます", substring = true).assertDoesNotExist()
+
+        composeTestRule.onNodeWithText("直接到達アドレス（path1、任意）").performScrollTo().performTextInput("203.0.113.5:45823")
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("既定の固定ポート45823が使われます", substring = true).assertExists()
+
+        // 固定ポートを明示指定すれば、既定値ノートは消える。
+        composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意、1024〜65535）").performScrollTo().performTextInput("50000")
+        composeTestRule.onNodeWithText("既定の固定ポート45823が使われます", substring = true).assertDoesNotExist()
+    }
 }
