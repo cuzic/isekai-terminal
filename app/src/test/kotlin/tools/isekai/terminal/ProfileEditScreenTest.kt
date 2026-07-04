@@ -17,6 +17,7 @@ import androidx.compose.ui.test.performTextInput
 import androidx.test.core.app.ApplicationProvider
 import tools.isekai.terminal.data.Repositories
 import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -418,5 +419,83 @@ class ProfileEditScreenTest {
         val profile = sampleProfile().copy(themeName = tools.isekai.terminal.ui.TerminalThemes.NORD.name)
         composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
         composeTestRule.onNodeWithText(tools.isekai.terminal.ui.TerminalThemes.NORD.name).assertIsSelected()
+    }
+
+    // ── Phase 12 P2-2: Remote/Dynamic port forward ───────────────────────
+
+    @Test fun addingRemoteForward_andSaving_persistsRemoteForward() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        var fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("WithRemoteForward")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+
+        composeTestRule.onNodeWithText("+ ポートフォワードを追加").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("Remote (-R)").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("Remote (-R)").assertIsSelected()
+
+        // フォワード追加後の新規テキストフィールド: [4]=接続後コマンド, [5]=待受アドレス
+        // (プリフィル済み), [6]=待受ポート, [7]=ローカルターゲットホスト, [8]=ローカルターゲットポート。
+        fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[6].performTextInput("8080")
+        fields[7].performTextInput("192.168.1.5")
+        fields[8].performTextInput("9090")
+        composeTestRule.onNodeWithText("Remote (-R)").assertIsSelected()
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "WithRemoteForward" }
+            assertEquals(1, stored.forwards.size)
+            val fw = stored.forwards[0]
+            assertEquals(uniffi.tssh_core.ForwardType.REMOTE, fw.forwardType)
+            assertEquals(8080.toUShort(), fw.bindPort)
+            assertEquals("192.168.1.5", fw.remoteHost)
+            assertEquals(9090.toUShort(), fw.remotePort)
+        }
+    }
+
+    @Test fun addingDynamicForward_andSaving_persistsDynamicForwardWithoutTarget() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        var fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("WithSocksForward")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+
+        composeTestRule.onNodeWithText("+ ポートフォワードを追加").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("Dynamic/SOCKS (-D)").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+
+        // Dynamicは転送先ホスト/ポート欄が表示されないため、待受ポートのみ入力する。
+        // [4]=接続後コマンド, [5]=待受アドレス(プリフィル済み), [6]=待受ポート。
+        fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[6].performTextInput("1080")
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "WithSocksForward" }
+            assertEquals(1, stored.forwards.size)
+            val fw = stored.forwards[0]
+            assertEquals(uniffi.tssh_core.ForwardType.DYNAMIC, fw.forwardType)
+            assertEquals(1080.toUShort(), fw.bindPort)
+        }
     }
 }

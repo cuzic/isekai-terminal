@@ -5635,15 +5635,24 @@ data class PortForward (
     var `forwardType`: ForwardType
     , 
     /**
-     * 待受アドレス。既定は "127.0.0.1"("0.0.0.0" 等にすると同一 LAN 上の
-     * 第三者からアクセスされ得るため UI 側で警告する)。
+     * 待受アドレス。Local/Dynamicはクライアント(この端末)側の待受、RemoteはSSHサーバー側の
+     * 待受を指す。既定は "127.0.0.1"("0.0.0.0" 等にすると同一LAN上の第三者から
+     * アクセスされ得るため、`SshConfig.allow_non_loopback_forward_bind`が false の場合は
+     * コア側で拒否される)。
      */
     var `bindAddress`: kotlin.String
     , 
     var `bindPort`: kotlin.UShort
     , 
+    /**
+     * Local: 転送先ホスト。Remote: クライアントから見たローカルターゲットのホスト。
+     * Dynamic: 未使用(空文字列でよい、接続ごとにSOCKSハンドシェイクで決まる)。
+     */
     var `remoteHost`: kotlin.String
     , 
+    /**
+     * Dynamic: 未使用(0でよい)。
+     */
     var `remotePort`: kotlin.UShort
     
 ){
@@ -6153,9 +6162,24 @@ public object FfiConverterTypeForwardState : FfiConverterRustBuffer<ForwardState
 enum class ForwardType {
     
     /**
-     * `ssh -L bind:remote_host:remote_port` 相当。Dynamic/Remote は将来拡張。
+     * `ssh -L bind:remote_host:remote_port` 相当。ローカルの`bind_address:bind_port`で
+     * 待受し、接続をSSHサーバー経由で`remote_host:remote_port`へ中継する。
      */
-    LOCAL;
+    LOCAL,
+    /**
+     * `ssh -R bind:remote_host:remote_port` 相当。SSHサーバー側に`bind_address:bind_port`
+     * を listen させ(`tcpip_forward`)、そこへの接続をこちら(クライアント)側から
+     * `remote_host:remote_port`(ローカルのターゲット)へ中継する。`remote_host`/
+     * `remote_port`はLocalと違い「クライアントから見たローカルターゲット」を指す。
+     */
+    REMOTE,
+    /**
+     * `ssh -D bind_port`(SOCKS4/5プロキシ)相当。ローカルの`bind_address:bind_port`で
+     * SOCKSクライアントを受け付け、接続ごとにSOCKSハンドシェイクで宛先を読み取ってから
+     * SSHサーバー経由でそこへ中継する。`remote_host`/`remote_port`は使わない
+     * (宛先は接続ごとに動的に決まるため)。
+     */
+    DYNAMIC;
 
     
 

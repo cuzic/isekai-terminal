@@ -55,6 +55,7 @@ import uniffi.tssh_core.TransportPreference
  * UShort で空文字を表現できないため、テキスト入力中は String で持つ)。
  */
 private data class ForwardDraft(
+    val forwardType: ForwardType = ForwardType.LOCAL,
     val bindAddress: String = "127.0.0.1",
     val bindPort: String = "",
     val remoteHost: String = "",
@@ -62,24 +63,41 @@ private data class ForwardDraft(
 )
 
 private fun PortForward.toDraft() = ForwardDraft(
+    forwardType = forwardType,
     bindAddress = bindAddress,
     bindPort = bindPort.toString(),
     remoteHost = remoteHost,
     remotePort = remotePort.toString(),
 )
 
-/** remoteHost 未入力や不正なポート番号の行は保存対象から除外する。 */
+/**
+ * Local/Remoteはremote_host/remote_portが必須(前者は転送先、後者はクライアントから見た
+ * ローカルターゲット)。Dynamic(SOCKS)は宛先が接続ごとに動的に決まるため両方不要。
+ * 不正な行は保存対象から除外する。
+ */
 private fun ForwardDraft.toPortForwardOrNull(): PortForward? {
     val bp = bindPort.toIntOrNull() ?: return null
-    val rp = remotePort.toIntOrNull() ?: return null
-    if (remoteHost.isBlank() || bp !in 1..65535 || rp !in 1..65535) return null
-    return PortForward(
-        forwardType = ForwardType.LOCAL,
-        bindAddress = bindAddress.ifBlank { "127.0.0.1" },
-        bindPort = bp.toUShort(),
-        remoteHost = remoteHost,
-        remotePort = rp.toUShort(),
-    )
+    if (bp !in 1..65535) return null
+    return when (forwardType) {
+        ForwardType.DYNAMIC -> PortForward(
+            forwardType = ForwardType.DYNAMIC,
+            bindAddress = bindAddress.ifBlank { "127.0.0.1" },
+            bindPort = bp.toUShort(),
+            remoteHost = "",
+            remotePort = 0u,
+        )
+        ForwardType.LOCAL, ForwardType.REMOTE -> {
+            val rp = remotePort.toIntOrNull() ?: return null
+            if (remoteHost.isBlank() || rp !in 1..65535) return null
+            PortForward(
+                forwardType = forwardType,
+                bindAddress = bindAddress.ifBlank { "127.0.0.1" },
+                bindPort = bp.toUShort(),
+                remoteHost = remoteHost,
+                remotePort = rp.toUShort(),
+            )
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -624,7 +642,10 @@ fun ProfileEditScreen(
 
         Text("ポートフォワード", fontWeight = FontWeight.Bold)
         Text(
-            "接続確立後、指定したローカルポートへの接続をリモートホストへ中継します(現状は -L のみ対応)。",
+            "接続確立後にトンネルを張ります(plain SSHトランスポートのみ対応、QUIC系は非対応)。" +
+                "Local(-L)はこの端末のポートへの接続をリモートへ、Remote(-R)はSSHサーバー側の" +
+                "ポートへの接続をこの端末のローカルターゲットへ、Dynamic(-D)はSOCKS4/5プロキシ" +
+                "として動的な宛先への接続を、それぞれ中継します。",
             fontSize = 12.sp,
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -651,14 +672,33 @@ fun ProfileEditScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    Text("ローカルフォワード #${index + 1}(種別: ローカル -L)")
+                    Text("フォワード #${index + 1}")
                     OutlinedButton(onClick = { forwardDrafts.removeAt(index) }) { Text("削除") }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = draft.forwardType == ForwardType.LOCAL,
+                        onClick = { forwardDrafts[index] = draft.copy(forwardType = ForwardType.LOCAL) },
+                        label = { Text("Local (-L)") },
+                    )
+                    FilterChip(
+                        selected = draft.forwardType == ForwardType.REMOTE,
+                        onClick = { forwardDrafts[index] = draft.copy(forwardType = ForwardType.REMOTE) },
+                        label = { Text("Remote (-R)") },
+                    )
+                    FilterChip(
+                        selected = draft.forwardType == ForwardType.DYNAMIC,
+                        onClick = { forwardDrafts[index] = draft.copy(forwardType = ForwardType.DYNAMIC) },
+                        label = { Text("Dynamic/SOCKS (-D)") },
+                    )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
                         value = draft.bindAddress,
                         onValueChange = { new -> forwardDrafts[index] = draft.copy(bindAddress = new) },
-                        label = { Text("待受アドレス") },
+                        label = {
+                            Text(if (draft.forwardType == ForwardType.REMOTE) "待受アドレス(SSHサーバー側)" else "待受アドレス")
+                        },
                         singleLine = true,
                         modifier = Modifier.weight(1f),
                     )
@@ -685,21 +725,38 @@ fun ProfileEditScreen(
                         fontSize = 12.sp,
                     )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = draft.remoteHost,
-                        onValueChange = { new -> forwardDrafts[index] = draft.copy(remoteHost = new) },
-                        label = { Text("転送先ホスト") },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f),
-                    )
-                    OutlinedTextField(
-                        value = draft.remotePort,
-                        onValueChange = { new -> forwardDrafts[index] = draft.copy(remotePort = new.filter { it.isDigit() }.take(5)) },
-                        label = { Text("転送先ポート") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        modifier = Modifier.weight(1f),
+                if (draft.forwardType != ForwardType.DYNAMIC) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = draft.remoteHost,
+                            onValueChange = { new -> forwardDrafts[index] = draft.copy(remoteHost = new) },
+                            label = {
+                                Text(
+                                    if (draft.forwardType == ForwardType.REMOTE) "ローカルターゲットホスト" else "転送先ホスト"
+                                )
+                            },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f),
+                        )
+                        OutlinedTextField(
+                            value = draft.remotePort,
+                            onValueChange = { new -> forwardDrafts[index] = draft.copy(remotePort = new.filter { it.isDigit() }.take(5)) },
+                            label = {
+                                Text(
+                                    if (draft.forwardType == ForwardType.REMOTE) "ローカルターゲットポート" else "転送先ポート"
+                                )
+                            },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                } else {
+                    Text(
+                        "SOCKS4/4a/5クライアントとして動作します。宛先は接続ごとにSOCKS" +
+                            "ハンドシェイクで決まるため、転送先の指定は不要です。",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
