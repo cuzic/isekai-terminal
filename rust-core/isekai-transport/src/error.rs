@@ -45,4 +45,17 @@ pub enum TransportError {
 
     #[error("peer closed the stream before sending a complete response")]
     UnexpectedEof,
+
+    /// Failed to learn this socket's own STUN-observed address
+    /// (`stun_p2p::connect_stun_p2p`'s self-observation step,
+    /// `isekai_stun_p2p_transport.rs`'s equivalent call to
+    /// `isekai_stun::query_stun`).
+    #[error("STUN query failed: {0}")]
+    Stun(#[from] isekai_stun::StunError),
+
+    /// Failed to prepare an already-bound UDP socket for reuse as a QUIC
+    /// endpoint (e.g. `tokio::net::UdpSocket::into_std` failing) — distinct
+    /// from `Bind`, which is specifically about the initial `bind()` syscall.
+    #[error("failed to prepare UDP socket for QUIC use: {0}")]
+    SocketSetup(String),
 }

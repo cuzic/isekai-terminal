@@ -12,7 +12,7 @@ use log::info;
 
 use crate::error::TransportError;
 use crate::proof::compute_proof;
-use crate::traits::{ByteStream, QuicEndpointFactory};
+use crate::traits::{ByteStream, QuicEndpoint, QuicEndpointFactory};
 use crate::types::{BindSpec, RemoteSpec};
 
 /// Everything `connect_via_relay` needs to know about one specific
@@ -55,15 +55,33 @@ pub async fn connect_via_relay(
     target: &RelayTarget,
 ) -> Result<Box<dyn ByteStream>, TransportError> {
     let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await?;
-    let conn = endpoint
-        .connect(RemoteSpec {
+    connect_and_handshake(
+        endpoint.as_ref(),
+        RemoteSpec {
             addr: target.helper_addr,
             server_name: target.server_name.clone(),
             cert_sha256_hex: target.cert_sha256_hex.clone(),
-        })
-        .await?;
+        },
+        &target.session_secret,
+    )
+    .await
+}
 
-    let proof = compute_proof(conn.as_ref(), &target.session_secret, b"").await?;
+/// The HELLO/proof/ACK handshake itself (`HELPER_PROTOCOL.md` §4), layered on
+/// top of an *already-created* `QuicEndpoint`. Shared by `connect_via_relay`
+/// (endpoint from a fresh `QuicEndpointFactory::create_endpoint` call) and
+/// `stun_p2p::connect_stun_p2p` (endpoint wrapping a socket that already did
+/// a STUN query + hole-punch probes) — `ISEKAI_SSH_DESIGN.md` calls out that
+/// "既存の`connect_via_relay`と同じロジックを再利用できるはず" for the STUN/P2P
+/// path, so this is the one place that logic lives.
+pub(crate) async fn connect_and_handshake(
+    endpoint: &dyn QuicEndpoint,
+    remote: RemoteSpec,
+    session_secret: &[u8],
+) -> Result<Box<dyn ByteStream>, TransportError> {
+    let conn = endpoint.connect(remote).await?;
+
+    let proof = compute_proof(conn.as_ref(), session_secret, b"").await?;
 
     let mut stream = conn.open_bi().await?;
     stream.write_all(&encode_hello(&proof)).await?;

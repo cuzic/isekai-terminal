@@ -132,6 +132,30 @@ fn client_config_for(cert_sha256_hex: &str) -> Result<noq::ClientConfig, Transpo
     Ok(client_config)
 }
 
+/// Wraps an already-bound `std::net::UdpSocket` as a `noq`-backed
+/// `QuicEndpoint`. Shared by `SystemQuicEndpointFactory::create_endpoint`
+/// (which binds a fresh socket) and `stun_p2p::connect_stun_p2p` (which
+/// reuses a socket that already performed a STUN query and sent hole-punch
+/// probes on it — `isekai_stun_p2p_transport.rs`'s comment on why the STUN/
+/// probe step must happen *before* handing the socket to `noq::Endpoint`, to
+/// avoid a race between noq's internal `poll_recv` and raw reads on the same
+/// socket) — this is the "既存の生ソケットをQUICエンドポイントにラップする"
+/// logic `ISEKAI_SSH_DESIGN.md` calls out as needing exactly one
+/// implementation shared by both call sites.
+pub(crate) fn quic_endpoint_from_std_socket(
+    std_socket: std::net::UdpSocket,
+) -> Result<Box<dyn QuicEndpoint>, TransportError> {
+    let endpoint = noq::Endpoint::new(
+        noq::EndpointConfig::default(),
+        None,
+        std_socket,
+        Arc::new(noq::TokioRuntime),
+    )
+    .map_err(|e| TransportError::EndpointSetup(e.to_string()))?;
+
+    Ok(Box::new(SystemQuicEndpoint { endpoint }))
+}
+
 /// The CLI's concrete `QuicEndpointFactory`. Stateless — every
 /// `create_endpoint` call binds a fresh UDP socket.
 #[derive(Debug, Default, Clone, Copy)]
@@ -147,15 +171,7 @@ impl QuicEndpointFactory for SystemQuicEndpointFactory {
             .into_std()
             .map_err(|source| TransportError::Bind { addr: bind.local_addr, source })?;
 
-        let endpoint = noq::Endpoint::new(
-            noq::EndpointConfig::default(),
-            None,
-            std_socket,
-            Arc::new(noq::TokioRuntime),
-        )
-        .map_err(|e| TransportError::EndpointSetup(e.to_string()))?;
-
-        Ok(Box::new(SystemQuicEndpoint { endpoint }))
+        quic_endpoint_from_std_socket(std_socket)
     }
 }
 

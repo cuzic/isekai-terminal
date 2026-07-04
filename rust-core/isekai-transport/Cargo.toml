@@ -6,6 +6,9 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 isekai-protocol = { path = "../isekai-protocol" }
+# STUN観測アドレス取得（`isekai_stun_p2p_transport.rs`相当の移植、
+# ISEKAI_SSH_DESIGN.md フェーズS-0d-2）。tssh-core・isekai-helperと共用のpure crate。
+isekai-stun = { path = "../isekai-stun" }
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 # QUIC実装は tssh-core と同じく noq（quinnのマルチパスフォーク）に一本化する。
@@ -17,6 +20,8 @@ hmac = "0.12"
 sha2 = "0.10"
 thiserror = "2.0.18"
 log = "0.4"
+# BackoffPolicyのジッター計算（呼び出し元がRNGを渡す設計、purityを保つ）。
+rand = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
