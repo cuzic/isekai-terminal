@@ -1,0 +1,121 @@
+name: iOS rust-core check
+
+# tssh-core (rust-core) の iOS 向けクロスビルド・UniFFI Swiftバインディング生成・
+# XCFramework化・iOS Simulatorでのround-trip testを検証する(PLAN.md「Phase Y」
+# Phase 0-2〜0-4参照)。コード署名は一切行わない(静的ライブラリのビルドと
+# シミュレータテストのみのため不要)。
+#
+# 公開リポジトリなので標準GitHub-hostedのmacOSランナーは無課金で使える。
+# macos-14は2026-07-06から非推奨(2026-11-02にサポート終了)のためmacos-26を使う。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust-core/**"
+      - "ios/**"
+      - ".github/workflows/ios-rust-core-check.yml"
+  pull_request:
+    paths:
+      - "rust-core/**"
+      - "ios/**"
+      - ".github/workflows/ios-rust-core-check.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-rust-core-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          rustc --version
+          cargo --version
+
+      - name: Install Rust iOS targets
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ios-rust-core-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            ios-rust-core-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Generate Swift bindings and check for drift
+        run: |
+          bash rust-core/scripts/generate-swift-bindings.sh
+          git diff --exit-code -- ios/Sources/TsshCore/generated || {
+            echo "::error::ios/Sources/TsshCore/generated is stale. Run rust-core/scripts/generate-swift-bindings.sh and commit the result." >&2
+            exit 1
+          }
+
+      - name: Build XCFramework
+        run: bash rust-core/scripts/build-ios-xcframework.sh
+
+      - name: Inspect XCFramework slices
+        run: |
+          set -euo pipefail
+          XC=ios/Frameworks/TsshCoreFFI.xcframework
+          test -f "$XC/Info.plist"
+          plutil -lint "$XC/Info.plist"
+          find "$XC" -name libtssh_core.a | while read -r lib; do
+            echo "=== $lib ==="
+            lipo -archs "$lib"
+          done
+
+      - name: Pick an available iOS Simulator device
+        id: sim
+        run: |
+          set -euo pipefail
+          DEVICE_NAME=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data["devices"].items():
+              if "iOS" not in runtime:
+                  continue
+              for d in devices:
+                  if d.get("isAvailable") and d.get("name", "").startswith("iPhone"):
+                      print(d["name"])
+                      sys.exit(0)
+          sys.exit(1)
+          ')
+          echo "device_name=$DEVICE_NAME" >> "$GITHUB_OUTPUT"
+          echo "picked simulator: $DEVICE_NAME"
+
+      - name: Run round-trip test on iOS Simulator
+        working-directory: ios
+        run: |
+          xcodebuild -list
+          xcodebuild test \
+            -scheme TsshCore \
+            -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Upload XCFramework
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TsshCoreFFI-xcframework
+          path: ios/Frameworks/TsshCoreFFI.xcframework
+          retention-days: 7
