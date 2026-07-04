@@ -1,0 +1,23 @@
+[package]
+name = "isekai-transport"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+isekai-protocol = { path = "../isekai-protocol" }
+async-trait = "0.1.89"
+tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
+# QUIC実装は tssh-core と同じく noq（quinnのマルチパスフォーク）に一本化する。
+# `FaultyUdpSocket`等のAndroid専用型・UniFFIはこのcrateからは一切参照しない
+# （ISEKAI_SSH_DESIGN.md「FaultyUdpSocket（Android専用フォルト注入ソケット）の扱い」節）。
+noq = { version = "1.0.1", features = ["rustls", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+hmac = "0.12"
+sha2 = "0.10"
+thiserror = "2.0.18"
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+rcgen = "0.13"

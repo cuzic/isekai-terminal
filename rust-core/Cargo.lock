@@ -1405,6 +1405,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "isekai-transport"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hmac",
+ "isekai-protocol",
+ "log",
+ "noq",
+ "rcgen 0.13.2",
+ "rustls",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "isekai-trust"
 version = "0.1.0"
 dependencies = [
