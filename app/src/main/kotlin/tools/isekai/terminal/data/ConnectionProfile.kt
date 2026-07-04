@@ -276,6 +276,7 @@ fun ConnectionProfile.toHelperQuicConfig(
         cols = cols,
         rows = rows,
         jump = toJumpConfigOrNull(jumpAuth),
+        bindPort = helperBindPort?.toUShort(),
     )
 
 fun ConnectionProfile.toIsekaiStunP2pConfig(

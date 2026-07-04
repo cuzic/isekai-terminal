@@ -794,7 +794,9 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckContractApiVersion(this)
         uniffiCheckApiChecksums(this)
     }
-    external fun uniffi_tssh_core_checksum_func_create_ssh_session(
+    external fun uniffi_tssh_core_checksum_func_core_version(
+): Int
+external fun uniffi_tssh_core_checksum_func_create_ssh_session(
 ): Int
 external fun uniffi_tssh_core_checksum_func_set_terminal_theme(
 ): Int
@@ -1258,6 +1260,8 @@ external fun uniffi_tssh_core_fn_init_callback_vtable_orchestratorcallback(`vtab
 ): Unit
 external fun uniffi_tssh_core_fn_init_callback_vtable_sessioncallback(`vtable`: UniffiVTableCallbackInterfaceSessionCallback,
 ): Unit
+external fun uniffi_tssh_core_fn_func_core_version(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_tssh_core_fn_func_create_ssh_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_tssh_core_fn_func_set_terminal_theme(`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1403,6 +1407,9 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_tssh_core_checksum_func_core_version() != 13464) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_tssh_core_checksum_func_create_ssh_session() != 24804) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -5237,6 +5244,16 @@ data class HelperQuicConfig (
      * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
      */
     var `jump`: JumpConfig?
+    , 
+    /**
+     * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
+     * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
+     * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
+     * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
+     * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
+     * 確定した値だけを渡すこと。
+     */
+    var `bindPort`: kotlin.UShort?
     
 ){
     
@@ -5260,6 +5277,7 @@ public object FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer<HelperQui
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalTypeJumpConfig.read(buf),
+            FfiConverterOptionalUShort.read(buf),
         )
     }
 
@@ -5270,7 +5288,8 @@ public object FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer<HelperQui
             FfiConverterTypeSshAuth.allocationSize(value.`auth`) +
             FfiConverterUInt.allocationSize(value.`cols`) +
             FfiConverterUInt.allocationSize(value.`rows`) +
-            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`)
+            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`) +
+            FfiConverterOptionalUShort.allocationSize(value.`bindPort`)
     )
 
     override fun write(value: HelperQuicConfig, buf: ByteBuffer) {
@@ -5281,6 +5300,7 @@ public object FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer<HelperQui
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
             FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
+            FfiConverterOptionalUShort.write(value.`bindPort`, buf)
     }
 }
 
@@ -7074,6 +7094,38 @@ public object FfiConverterTypeSessionCallback: FfiConverterCallbackInterface<Ses
 /**
  * @suppress
  */
+public object FfiConverterOptionalUShort: FfiConverterRustBuffer<kotlin.UShort?> {
+    override fun read(buf: ByteBuffer): kotlin.UShort? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUShort.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UShort?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUShort.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UShort?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUShort.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalInt: FfiConverterRustBuffer<kotlin.Int?> {
     override fun read(buf: ByteBuffer): kotlin.Int? {
         if (buf.get().toInt() == 0) {
@@ -7278,7 +7330,24 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
             FfiConverterTypePortForward.write(it, buf)
         }
     }
-} fun `createSshSession`(`config`: SshConfig): SshSession {
+}
+        /**
+         * tssh-core の crate バージョン（`Cargo.toml` の `version`）を返す。
+         *
+         * iOS 対応 Phase 0 の技術検証スパイクで、UniFFI Swift バインディング経由の
+         * round-trip（Swift → Rust 呼び出し → 戻り値）を確認するための診断用関数
+         * （`PLAN.md` の「Phase Y」節参照）。
+         */ fun `coreVersion`(): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_func_core_version(
+    
+        _status)
+}
+    )
+    }
+    
+ fun `createSshSession`(`config`: SshConfig): SshSession {
             return FfiConverterTypeSshSession.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_tssh_core_fn_func_create_ssh_session(

@@ -45,6 +45,26 @@ class ConnectionProfileTest {
         assertEquals(jumpAuth, config.jump?.auth)
     }
 
+    // ── toHelperQuicConfig ───────────────────────────────────────────────
+
+    @Test fun `toHelperQuicConfig maps ssh connection fields`() {
+        val config = profile().toHelperQuicConfig(auth)
+        assertEquals("example.com", config.sshHost)
+        assertEquals(2222.toUShort(), config.sshPort)
+        assertEquals("deploy", config.username)
+        assertEquals(auth, config.auth)
+    }
+
+    @Test fun `toHelperQuicConfig maps helperBindPort to bindPort when set`() {
+        val config = profile().copy(helperBindPort = 45900).toHelperQuicConfig(auth)
+        assertEquals(45900.toUShort(), config.bindPort)
+    }
+
+    @Test fun `toHelperQuicConfig maps null helperBindPort to null bindPort`() {
+        val config = profile().toHelperQuicConfig(auth)
+        assertNull(config.bindPort)
+    }
+
     // ── toIsekaiStunP2pConfig ────────────────────────────────────────────
 
     @Test fun `toIsekaiStunP2pConfig maps ssh connection fields`() {
