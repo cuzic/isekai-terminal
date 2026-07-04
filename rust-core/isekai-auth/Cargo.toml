@@ -12,3 +12,12 @@ thiserror = "2.0.18"
 # file_provider.rs, mirroring isekai-trust/src/store.rs. Also reused by
 # tests as a scratch directory factory.
 tempfile = "3"
+# Device Authorization Grant (RFC 8628, `device_flow.rs`) and refresh_token
+# (RFC 6749 §6, `refresh.rs`) HTTP calls, and `FileTokenProvider::get_relay_jwt`'s
+# transparent refresh (`oauth.rs`). Chosen over reqwest/hyper: `TokenProvider`
+# is a plain sync `fn` (see lib.rs docs), `isekai-ssh login` only ever needs
+# one blocking request in flight, and ureq's default features (rustls+ring,
+# gzip via flate2) reuse TLS/compression backends already present elsewhere
+# in this workspace (isekai-transport, tssh-core) rather than pulling in a
+# second async HTTP stack just for a handful of sequential POSTs.
+ureq = "3"

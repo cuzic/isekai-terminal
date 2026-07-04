@@ -44,4 +44,29 @@ pub enum AuthError {
 
     #[error("path {path} has no parent directory")]
     NoParentDir { path: PathBuf },
+
+    // --- Device Authorization Grant (RFC 8628, `device_flow.rs`) / refresh_token
+    // (RFC 6749 §6, `refresh.rs`) errors, phase S-5. ---
+    #[error("HTTP request to {url} failed: {reason}")]
+    HttpRequest { url: String, reason: String },
+
+    #[error("failed to parse the {context} endpoint's response: {reason}")]
+    InvalidTokenResponse { context: String, reason: String },
+
+    /// An OAuth error response (`{"error": ..., "error_description": ...}`,
+    /// RFC 6749 §5.2) that isn't one of the recoverable device-flow-polling
+    /// codes handled directly by `device_flow::poll_for_token`
+    /// (`authorization_pending`/`slow_down`, which never surface as this
+    /// error variant at all).
+    #[error("OAuth {grant} request failed: {error}")]
+    OAuthError { grant: &'static str, error: String, description: Option<String> },
+
+    #[error("device authorization flow was denied")]
+    DeviceFlowDenied,
+
+    #[error("device code expired before the device authorization flow completed")]
+    DeviceFlowExpired,
+
+    #[error("cannot refresh the stored token: {reason}")]
+    RefreshNotConfigured { reason: String },
 }
