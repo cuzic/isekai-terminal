@@ -125,7 +125,7 @@ pub async fn connect_stun_p2p(
         server_name: target.server_name.clone(),
         cert_sha256_hex: target.cert_sha256_hex.clone(),
     };
-    let stream = connect_and_handshake(endpoint.as_ref(), remote, &target.session_secret).await?;
+    let (_conn, stream, _proof) = connect_and_handshake(endpoint.as_ref(), remote, &target.session_secret).await?;
 
     Ok(StunP2pConnection { our_observed_addr, stream })
 }

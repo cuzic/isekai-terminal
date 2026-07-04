@@ -10,9 +10,11 @@ use std::net::SocketAddr;
 use isekai_protocol::hello::{decode_ack_response, encode_hello, AckResponse};
 use log::info;
 
+use isekai_protocol::hello::Proof;
+
 use crate::error::TransportError;
 use crate::proof::compute_proof;
-use crate::traits::{ByteStream, QuicEndpoint, QuicEndpointFactory};
+use crate::traits::{ByteStream, QuicConnection, QuicEndpoint, QuicEndpointFactory};
 use crate::types::{BindSpec, RemoteSpec};
 
 /// Everything `connect_via_relay` needs to know about one specific
@@ -55,7 +57,7 @@ pub async fn connect_via_relay(
     target: &RelayTarget,
 ) -> Result<Box<dyn ByteStream>, TransportError> {
     let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await?;
-    connect_and_handshake(
+    let (_conn, stream, _proof) = connect_and_handshake(
         endpoint.as_ref(),
         RemoteSpec {
             addr: target.helper_addr,
@@ -64,21 +66,26 @@ pub async fn connect_via_relay(
         },
         &target.session_secret,
     )
-    .await
+    .await?;
+    Ok(stream)
 }
 
 /// The HELLO/proof/ACK handshake itself (`HELPER_PROTOCOL.md` §4), layered on
 /// top of an *already-created* `QuicEndpoint`. Shared by `connect_via_relay`
-/// (endpoint from a fresh `QuicEndpointFactory::create_endpoint` call) and
+/// (endpoint from a fresh `QuicEndpointFactory::create_endpoint` call),
 /// `stun_p2p::connect_stun_p2p` (endpoint wrapping a socket that already did
-/// a STUN query + hole-punch probes) — `ISEKAI_SSH_DESIGN.md` calls out that
-/// "既存の`connect_via_relay`と同じロジックを再利用できるはず" for the STUN/P2P
-/// path, so this is the one place that logic lives.
+/// a STUN query + hole-punch probes), and `resume::connect_via_relay_resumable`
+/// (Phase S-4c, which additionally needs the live connection and the HELLO
+/// proof afterward to open a control stream) — `ISEKAI_SSH_DESIGN.md` calls
+/// out that "既存の`connect_via_relay`と同じロジックを再利用できるはず" for both,
+/// so this is the one place the handshake itself lives. Callers that don't
+/// need the connection/proof (`connect_via_relay`, `connect_stun_p2p`) simply
+/// drop them.
 pub(crate) async fn connect_and_handshake(
     endpoint: &dyn QuicEndpoint,
     remote: RemoteSpec,
     session_secret: &[u8],
-) -> Result<Box<dyn ByteStream>, TransportError> {
+) -> Result<(Box<dyn QuicConnection>, Box<dyn ByteStream>, Proof), TransportError> {
     let conn = endpoint.connect(remote).await?;
 
     let proof = compute_proof(conn.as_ref(), session_secret, b"").await?;
@@ -91,7 +98,7 @@ pub(crate) async fn connect_and_handshake(
     match decode_ack_response(resp[0])? {
         AckResponse::Ack => {
             info!("isekai-transport: HELLO/ACK ok — stream ready for pass-through");
-            Ok(stream)
+            Ok((conn, stream, proof))
         }
         other => Err(TransportError::Rejected(other)),
     }
@@ -99,7 +106,9 @@ pub(crate) async fn connect_and_handshake(
 
 /// `ByteStream::read` only guarantees "at most `buf.len()` bytes, possibly
 /// fewer"; the 1-byte ACK response needs the usual `read_exact` loop on top.
-async fn read_exact(stream: &mut dyn ByteStream, buf: &mut [u8]) -> Result<(), TransportError> {
+/// `pub(crate)` so `resume.rs` (control stream / `RESUME_ACK` handshakes) can
+/// reuse it instead of re-implementing the same loop a third time.
+pub(crate) async fn read_exact(stream: &mut dyn ByteStream, buf: &mut [u8]) -> Result<(), TransportError> {
     let mut filled = 0;
     while filled < buf.len() {
         let n = stream.read(&mut buf[filled..]).await?;

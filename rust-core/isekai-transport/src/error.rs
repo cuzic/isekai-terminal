@@ -2,6 +2,7 @@
 //! relay-handshake logic (`ISEKAI_SSH_DESIGN.md` phase S-0d-1).
 
 use isekai_protocol::hello::AckResponse;
+use isekai_protocol::resume::ResumeRejectReason;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -58,4 +59,17 @@ pub enum TransportError {
     /// from `Bind`, which is specifically about the initial `bind()` syscall.
     #[error("failed to prepare UDP socket for QUIC use: {0}")]
     SocketSetup(String),
+
+    /// The control stream handshake (`CONTROL_HELLO`/`CONTROL_ACK`,
+    /// `HELPER_PROTOCOL.md` §7.3) got a response byte other than
+    /// `CONTROL_ACK` (`resume::open_control_stream`).
+    #[error("isekai-helper control stream handshake failed: {0}")]
+    ControlHandshake(String),
+
+    /// isekai-helper rejected a `RESUME` request (`HELPER_PROTOCOL.md` §7.3
+    /// "RESUME の拒否応答"). `UnknownSession`/`OffsetGone` both mean resume is
+    /// not possible for this `session_id` any more — the caller must fall
+    /// back to a fresh (non-resuming) connection.
+    #[error("isekai-helper rejected RESUME: {0:?}")]
+    ResumeRejected(ResumeRejectReason),
 }
