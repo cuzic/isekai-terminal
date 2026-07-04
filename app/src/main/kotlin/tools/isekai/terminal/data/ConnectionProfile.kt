@@ -23,11 +23,15 @@ import uniffi.tssh_core.TransportPreference
 
 /**
  * [PortForward] は uniffi 生成の素の data class で Parcelable ではないため、
- * `@Parcelize` に読み書き方法を教える(MVP では forwardType は LOCAL 固定なので保存しない)。
+ * `@Parcelize` に読み書き方法を教える。
  */
 private object PortForwardParceler : Parceler<PortForward> {
     override fun create(parcel: Parcel): PortForward = PortForward(
-        forwardType = ForwardType.LOCAL,
+        forwardType = try {
+            ForwardType.valueOf(parcel.readString() ?: "LOCAL")
+        } catch (_: IllegalArgumentException) {
+            ForwardType.LOCAL
+        },
         bindAddress = parcel.readString() ?: "127.0.0.1",
         bindPort = parcel.readInt().toUShort(),
         remoteHost = parcel.readString() ?: "",
@@ -35,6 +39,7 @@ private object PortForwardParceler : Parceler<PortForward> {
     )
 
     override fun PortForward.write(parcel: Parcel, flags: Int) {
+        parcel.writeString(forwardType.name)
         parcel.writeString(bindAddress)
         parcel.writeInt(bindPort.toInt())
         parcel.writeString(remoteHost)
@@ -152,7 +157,7 @@ object PortForwardListConverter {
         val arr = JSONArray()
         for (f in forwards) {
             val o = JSONObject()
-            o.put("type", "LOCAL")
+            o.put("type", f.forwardType.name)
             o.put("bindAddress", f.bindAddress)
             o.put("bindPort", f.bindPort.toInt())
             o.put("remoteHost", f.remoteHost)
@@ -169,8 +174,13 @@ object PortForwardListConverter {
         val arr = JSONArray(json)
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
+            val forwardType = try {
+                ForwardType.valueOf(o.optString("type", "LOCAL"))
+            } catch (_: IllegalArgumentException) {
+                ForwardType.LOCAL
+            }
             PortForward(
-                forwardType = ForwardType.LOCAL,
+                forwardType = forwardType,
                 bindAddress = o.getString("bindAddress"),
                 bindPort = o.getInt("bindPort").toUShort(),
                 remoteHost = o.getString("remoteHost"),
