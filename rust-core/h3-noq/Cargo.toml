@@ -1,0 +1,29 @@
+[package]
+name = "h3-noq"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "QUIC transport implementation for h3 based on noq (quinn's multipath fork)."
+keywords = ["http3", "quic", "h3", "noq"]
+categories = ["network-programming", "web-programming"]
+
+[dependencies]
+h3 = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
+h3-datagram = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40", optional = true }
+bytes = "1"
+noq = { version = "1.0.1", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+tokio-util = { version = "0.7.9" }
+futures-util = { version = "0.3.28", default-features = false }
+tracing = { version = "0.1.40", optional = true }
+
+[features]
+tracing = ["dep:tracing"]
+datagram = ["dep:h3-datagram"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+http = "1"
+h3-datagram = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
