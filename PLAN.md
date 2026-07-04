@@ -1937,9 +1937,29 @@ Android向けrustupセットアップのみを行い、`tssh-core`が`include_by
 回避的に直すと問題を覆い隠すことになるため、修正は`fdroid/tools.isekai.terminal.yml`
 本体に対して行う必要がある（詳細はmemory参照）。
 
-**次にやること**: Phase 1A-5（日本語IME単体スパイク）・1A-6（画面更新ブリッジ+
-最小レンダラー）・1A-8（plain SSH最小縦切り）へ進む。これらは実際のUI/対話的な
-挙動確認が必要になるため、CIだけでなく実機/シミュレータでの手動確認も併用する。
+続けて5・6も実装し、いずれもGitHub Actions（`macos-26`）でgreenを確認した。
+
+- ✅ **5. 日本語IME単体スパイク**: `XCUIApplication().typeText()`はソフトウェア
+  キーボード/IMEを経由せずテキストを直接挿入するだけで変換ロジックを検証できない
+  ため、`UITextInput`プロトコル（`setMarkedText`/`unmarkText`/`insertText`等）を
+  実装した`TerminalIMEInputView`を用意し、実際のIMEが呼ぶのと同じメソッドを
+  XCTestから直接呼び出す方式でCI上に落とし込んだ（ChatGPTとの相談で確認した方針）。
+  ローマ字変換→変換中のBackspace→確定、変換キャンセル、絵文字直接入力、複数行
+  ペーストの7シナリオがiOS Simulator上でpass。候補ウィンドウの見た目そのものは
+  CIでは検証できないため実機/シミュレータでの目視確認は別途行う。
+- ✅ **6. Rust→Swift画面更新ブリッジ + 最小レンダラー**: UniFFI境界のデータ形式を
+  具体化（`TerminalFrameBatch`/`PackedRow`/`AttributeRun`/`CursorState`。セル
+  オブジェクト配列ではなくUTF-8テキストバッファ+セル幅配列+属性runにまとめた）。
+  `DiagnosticFrameMailbox`（Rust側、latest-wins、`screen_generation`/
+  `frame_sequence`に基づくstale frame破棄のSSOT）+ `TerminalFrameRenderer`
+  （Core Graphics/Core Textの初期レンダラー）+ `FrameIngress`（Swift actor、
+  wake通知を受けて30fps相当にレート制限しつつdrain、UIView操作は`@MainActor`へ
+  明示的にhop）。Rust単体テスト4件・Swift XCTest 2件で検証。
+
+**次にやること**: Phase 1A-7（IMEとターミナルカーソルの統合）・1A-8（plain SSH
+最小縦切り）・1A-9（isekai-helper/QUIC最小縦切り、任意）へ進む。1A-8以降は
+実際のSSH接続(`SshSession`/`SshConfig`)を使う本格的な統合になるため、CIでの
+自動検証に加えて実機/シミュレータでの対話的な動作確認も併用する。
 
 ---
 
