@@ -8,6 +8,7 @@ import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -15,6 +16,7 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextInput
 import androidx.test.core.app.ApplicationProvider
+import tools.isekai.terminal.data.KeyEntry
 import tools.isekai.terminal.data.Repositories
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -44,6 +46,18 @@ class ProfileEditScreenTest {
         label = "Prod", host = "prod.example.com", port = 2222,
         username = "deploy", authType = "password",
     )
+
+    private fun insertKey(label: String) = runBlocking {
+        Repositories.keys.save(
+            KeyEntry(
+                label = label,
+                publicKey = "ssh-ed25519 AAAAC3$label",
+                encryptedPrivateKeyPath = "/keys/$label.enc",
+                kekAlias = "kek_$label",
+                createdAt = 1_700_000_000_000L,
+            ),
+        )
+    }
 
     @Test fun newProfile_showsAddTitle() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
@@ -223,6 +237,53 @@ class ProfileEditScreenTest {
         composeTestRule.onNodeWithText("bastion.example.com").assertExists()
         composeTestRule.onNodeWithText("jumper").assertExists()
         composeTestRule.onNodeWithText("2200").assertExists()
+    }
+
+    @Test fun saveNewProfile_withJumpHostKeyAuth_persistsJumpKeyId() {
+        val jumpKeyId = insertKey("BastionKey")
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("ViaBastionKey")
+        fields[1].performTextInput("internal.example.com")
+        fields[3].performTextInput("root")
+
+        composeTestRule.onNodeWithTag("useJumpHostCheckbox").performScrollTo().performClick()
+        composeTestRule.onNodeWithText("踏み台ホスト").performTextInput("bastion.example.com")
+        composeTestRule.onNodeWithText("踏み台ユーザー名").performTextInput("jumper")
+
+        // 「鍵認証」チップは主ホスト用/踏み台用の2つ存在するため、2番目(踏み台側)をクリックする。
+        composeTestRule.onAllNodesWithText("鍵認証")[1].performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("踏み台の鍵").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("BastionKey").performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "ViaBastionKey" }
+            assertEquals("key", stored.jumpAuthType)
+            assertEquals(jumpKeyId, stored.jumpKeyId)
+        }
+    }
+
+    @Test fun editProfile_prefillsJumpHostKeyAuth() {
+        val jumpKeyId = insertKey("BastionKey")
+        val profile = sampleProfile().copy(
+            jumpHost = "bastion.example.com",
+            jumpUsername = "jumper",
+            jumpAuthType = "key",
+            jumpKeyId = jumpKeyId,
+        )
+        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("BastionKey").assertExists()
     }
 
     // ── STUN+SSHランデブー方式のP2P ─────────────────────────────────────
