@@ -1549,8 +1549,34 @@ Web検索で実在・現状Needs Triageであることを確認済み——Phase
    単位のテーマ選択(FilterChip、「既定に従う」+プリセット4種)を追加。
    Rust新規テスト2件(構築時テーマ・set_theme後方影響のみ)、Kotlin新規テスト7件
    (ViewModel4件・ProfileEditScreen3件)を追加。
-2. Remote/Dynamic port forward（plain SSH限定、LocalForwardRunner/RemoteForwardRunner/
+2. ✅ Remote/Dynamic port forward（plain SSH限定、LocalForwardRunner/RemoteForwardRunner/
    DynamicSocksForwardRunnerに責務分離、クライアント側は非ループバックbindを既定拒否）
+   → Rust側: `ForwardType`に`Remote`/`Dynamic`を追加(既存`Local`と合わせ3種)。
+   `RusshEventHandler`に`client::Handler::server_channel_open_forwarded_tcpip`を実装し、
+   `-R`相当のリモート側listen(`tcpip_forward`/`cancel_tcpip_forward`、いずれも`&mut self`の
+   ためclient handleを`Arc<tokio::sync::Mutex<_>>`化)からのforwarded接続をこちら側の
+   ローカルターゲットへ中継。`-D`相当は新規`socks.rs`(SOCKS4/4a/5サーバー実装、独立
+   ユニットテスト5件)を使う`run_dynamic_forward`で実装。`active_forwards`を
+   `HashMap<String, ActiveForward>`(`Task`/`Remote{bind_addr,bound_port}`の2バリアント)に
+   拡張し、`teardown_forward()`で種別ごとの後始末(task abort vs
+   `cancel_tcpip_forward`+remote_forwardsマップからの除去)を共通化。非ループバックbind
+   拒否(`reject_non_loopback_bind`)はLocal/Remote/Dynamic全種で共通適用。5種のQUIC系
+   トランスポート(自作ヘルパーQUIC・マルチパス・STUN P2P・MASQUE relay含む)は
+   `run_ssh_channel_loop`呼び出しの配線更新のみで同じロジックを共有。e2eテスト2件
+   (`remote_forward_relays_bytes_end_to_end`・`dynamic_forward_socks5_relays_bytes_end_to_end`)
+   を`local_forward_e2e_tests`に追加。
+   Kotlin側: `ProfileEditScreen`のフォワード編集行にLocal/Remote/Dynamicの3種
+   `FilterChip`を追加。`ForwardDraft`に`forwardType`を追加し、Remoteでは
+   フィールドラベルを「ローカルターゲットホスト/ポート」に、Dynamicでは
+   remoteHost/remotePort欄自体を非表示にしてSOCKS動作の説明文に置き換え。
+   **見つかった実装済みバグ**: `PortForwardListConverter`(Room TypeConverter)と
+   `PortForwardParceler`(`@Parcelize`用)が、LocalのみだったMVP時代の実装のまま
+   `forwardType`を保存せず常に`ForwardType.LOCAL`固定で読み書きしていたため、
+   Remote/Dynamicで保存してもDBラウンドトリップ後にLocalへ化けていた
+   (instrumented testで発覚)。両方とも`forwardType`を実際にシリアライズ/
+   デシリアライズするよう修正。
+   Kotlinテスト2件追加(`addingRemoteForward_andSaving_persistsRemoteForward`・
+   `addingDynamicForward_andSaving_persistsDynamicForwardWithoutTarget`)。
 3. ✅ QUIC系トランスポートでのagent forwarding対応は設計のみ固めて実装は後回し
    （実装は着手しない。以下は将来着手する際の設計メモ）
 
