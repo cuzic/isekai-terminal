@@ -11,6 +11,7 @@ import org.json.JSONObject
 import tools.isekai.terminal.session.PhysicalMultipathFds
 import uniffi.tssh_core.ForwardType
 import uniffi.tssh_core.HelperQuicConfig
+import uniffi.tssh_core.JumpConfig
 import uniffi.tssh_core.MultipathHelperQuicConfig
 import uniffi.tssh_core.PortForward
 import uniffi.tssh_core.QuicConfig
@@ -77,6 +78,16 @@ data class ConnectionProfile(
     @ColumnInfo(name = "post_connect_commands") val postConnectCommands: String? = null,
     /** ローカルポートフォワード(-L)一覧。Room には TEXT(JSON) 列として保存する。 */
     @ColumnInfo(name = "forwards", defaultValue = "[]") val forwards: List<PortForward> = emptyList(),
+    // 多段SSH(ProxyJump、`ssh -J` 相当)。対象ホストへ直接到達できない場合に、
+    // まずこの踏み台ホストへ接続・認証してからトンネルする。null なら直接接続。
+    // 踏み台自体の認証情報は主接続と同じ authType/keyId のパターンを踏襲する
+    // （password の場合は接続時に別途プロンプトする。ConnectionProfile には平文
+    // パスワードを保存しない、という既存方針を踏み台にもそのまま適用する）。
+    @ColumnInfo(name = "jump_host") val jumpHost: String? = null,
+    @ColumnInfo(name = "jump_port") val jumpPort: Int = 22,
+    @ColumnInfo(name = "jump_username") val jumpUsername: String? = null,
+    @ColumnInfo(name = "jump_auth_type") val jumpAuthType: String? = null, // "password" | "key"
+    @ColumnInfo(name = "jump_key_id") val jumpKeyId: Long? = null,
 ) : Parcelable {
     val transportPreference: TransportPreference
         get() = try {
@@ -84,6 +95,10 @@ data class ConnectionProfile(
         } catch (_: IllegalArgumentException) {
             TransportPreference.PLAIN_SSH
         }
+
+    /** 踏み台ホストが設定されているか(多段SSHを使うプロファイルか)。 */
+    val usesJumpHost: Boolean
+        get() = !jumpHost.isNullOrBlank()
 
     companion object {
         /** tsshd のデフォルト待受ポート。変更する場合も過去の Room migration 内の
@@ -147,7 +162,31 @@ interface ConnectionProfileDao {
     suspend fun findById(id: Long): ConnectionProfile?
 }
 
-fun ConnectionProfile.toSshConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt = 24u): SshConfig =
+/**
+ * [jumpAuth] は [ConnectionProfile.usesJumpHost] が true の場合にのみ使う（呼び出し側が
+ * [ConnectionProfile.jumpAuthType]/[ConnectionProfile.jumpKeyId] を解決して渡す。
+ * password の場合は接続時プロンプトで得た値、key の場合はキーストアから読んだ PEM）。
+ * ブートストラップSSH接続を伴う全トランスポート([toSshConfig]/[toHelperQuicConfig]/
+ * [toMultipathHelperQuicConfig])で共通のため、ここに切り出してある。
+ */
+private fun ConnectionProfile.toJumpConfigOrNull(jumpAuth: SshAuth?): JumpConfig? =
+    if (usesJumpHost && jumpAuth != null) {
+        JumpConfig(
+            host = jumpHost!!,
+            port = jumpPort.toUShort(),
+            username = jumpUsername ?: "",
+            auth = jumpAuth,
+        )
+    } else {
+        null
+    }
+
+fun ConnectionProfile.toSshConfig(
+    auth: SshAuth,
+    jumpAuth: SshAuth? = null,
+    cols: UInt = 80u,
+    rows: UInt = 24u,
+): SshConfig =
     SshConfig(
         host = host,
         port = port.toUShort(),
@@ -157,6 +196,7 @@ fun ConnectionProfile.toSshConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt = 
         rows = rows,
         forwards = forwards,
         agentForward = enableAgentForward,
+        jump = toJumpConfigOrNull(jumpAuth),
     )
 
 fun ConnectionProfile.toQuicConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt = 24u): QuicConfig =
@@ -172,7 +212,12 @@ fun ConnectionProfile.toQuicConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt =
         skipCertVerify = true,
     )
 
-fun ConnectionProfile.toHelperQuicConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt = 24u): HelperQuicConfig =
+fun ConnectionProfile.toHelperQuicConfig(
+    auth: SshAuth,
+    jumpAuth: SshAuth? = null,
+    cols: UInt = 80u,
+    rows: UInt = 24u,
+): HelperQuicConfig =
     HelperQuicConfig(
         sshHost = host,
         sshPort = port.toUShort(),
@@ -180,11 +225,13 @@ fun ConnectionProfile.toHelperQuicConfig(auth: SshAuth, cols: UInt = 80u, rows: 
         auth = auth,
         cols = cols,
         rows = rows,
+        jump = toJumpConfigOrNull(jumpAuth),
     )
 
 fun ConnectionProfile.toMultipathHelperQuicConfig(
     auth: SshAuth,
     physicalFds: PhysicalMultipathFds = PhysicalMultipathFds(),
+    jumpAuth: SshAuth? = null,
     cols: UInt = 80u,
     rows: UInt = 24u,
 ): MultipathHelperQuicConfig =
@@ -201,4 +248,5 @@ fun ConnectionProfile.toMultipathHelperQuicConfig(
         auth = auth,
         cols = cols,
         rows = rows,
+        jump = toJumpConfigOrNull(jumpAuth),
     )

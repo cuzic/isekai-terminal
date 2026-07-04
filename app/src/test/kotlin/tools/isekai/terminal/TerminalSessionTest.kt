@@ -48,6 +48,7 @@ class TerminalSessionTest {
         rows = 24u,
         forwards = emptyList(),
         agentForward = false,
+        jump = null,
     )
 
     private suspend fun awaitState(condition: (TerminalUiState) -> Boolean): TerminalUiState =

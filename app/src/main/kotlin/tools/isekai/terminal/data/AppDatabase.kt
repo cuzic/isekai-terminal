@@ -10,7 +10,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [KnownHost::class, ConnectionProfile::class, KeyEntry::class, Snippet::class],
-    version = 11,
+    version = 12,
     exportSchema = false,
 )
 @TypeConverters(PortForwardListConverter::class)
@@ -133,6 +133,19 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        // internal（private ではない）: androidTest/test 側からマイグレーション単体テストで直接使うため。
+        // 多段SSH(ProxyJump)。対象ホストへ直接到達できない場合の踏み台ホスト設定。
+        // 未設定(jump_host が NULL)なら直接接続のまま挙動は変わらない。
+        internal val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE connection_profiles ADD COLUMN jump_host TEXT")
+                db.execSQL("ALTER TABLE connection_profiles ADD COLUMN jump_port INTEGER NOT NULL DEFAULT 22")
+                db.execSQL("ALTER TABLE connection_profiles ADD COLUMN jump_username TEXT")
+                db.execSQL("ALTER TABLE connection_profiles ADD COLUMN jump_auth_type TEXT")
+                db.execSQL("ALTER TABLE connection_profiles ADD COLUMN jump_key_id INTEGER")
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase =
             instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -142,7 +155,7 @@ abstract class AppDatabase : RoomDatabase() {
                 )
                 .addMigrations(
                     MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7,
-                    MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11,
+                    MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12,
                 )
                 .build().also { instance = it }
             }

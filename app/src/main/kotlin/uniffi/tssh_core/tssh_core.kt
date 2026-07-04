@@ -4195,6 +4195,11 @@ data class HelperQuicConfig (
     var `cols`: kotlin.UInt
     , 
     var `rows`: kotlin.UInt
+    , 
+    /**
+     * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
+     */
+    var `jump`: JumpConfig?
     
 ){
     
@@ -4217,6 +4222,7 @@ public object FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer<HelperQui
             FfiConverterTypeSshAuth.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterOptionalTypeJumpConfig.read(buf),
         )
     }
 
@@ -4226,7 +4232,8 @@ public object FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer<HelperQui
             FfiConverterString.allocationSize(value.`username`) +
             FfiConverterTypeSshAuth.allocationSize(value.`auth`) +
             FfiConverterUInt.allocationSize(value.`cols`) +
-            FfiConverterUInt.allocationSize(value.`rows`)
+            FfiConverterUInt.allocationSize(value.`rows`) +
+            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`)
     )
 
     override fun write(value: HelperQuicConfig, buf: ByteBuffer) {
@@ -4236,6 +4243,58 @@ public object FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer<HelperQui
             FfiConverterTypeSshAuth.write(value.`auth`, buf)
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
+            FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
+    }
+}
+
+
+
+/**
+ * ProxyJump（多段SSH）の踏み台ホストへの接続情報。`SshConfig::jump` 参照。
+ */
+data class JumpConfig (
+    var `host`: kotlin.String
+    , 
+    var `port`: kotlin.UShort
+    , 
+    var `username`: kotlin.String
+    , 
+    var `auth`: SshAuth
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeJumpConfig: FfiConverterRustBuffer<JumpConfig> {
+    override fun read(buf: ByteBuffer): JumpConfig {
+        return JumpConfig(
+            FfiConverterString.read(buf),
+            FfiConverterUShort.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterTypeSshAuth.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: JumpConfig) = (
+            FfiConverterString.allocationSize(value.`host`) +
+            FfiConverterUShort.allocationSize(value.`port`) +
+            FfiConverterString.allocationSize(value.`username`) +
+            FfiConverterTypeSshAuth.allocationSize(value.`auth`)
+    )
+
+    override fun write(value: JumpConfig, buf: ByteBuffer) {
+            FfiConverterString.write(value.`host`, buf)
+            FfiConverterUShort.write(value.`port`, buf)
+            FfiConverterString.write(value.`username`, buf)
+            FfiConverterTypeSshAuth.write(value.`auth`, buf)
     }
 }
 
@@ -4294,6 +4353,11 @@ data class MultipathHelperQuicConfig (
     var `cols`: kotlin.UInt
     , 
     var `rows`: kotlin.UInt
+    , 
+    /**
+     * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
+     */
+    var `jump`: JumpConfig?
     
 ){
     
@@ -4322,6 +4386,7 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
             FfiConverterTypeSshAuth.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterOptionalTypeJumpConfig.read(buf),
         )
     }
 
@@ -4337,7 +4402,8 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
             FfiConverterString.allocationSize(value.`username`) +
             FfiConverterTypeSshAuth.allocationSize(value.`auth`) +
             FfiConverterUInt.allocationSize(value.`cols`) +
-            FfiConverterUInt.allocationSize(value.`rows`)
+            FfiConverterUInt.allocationSize(value.`rows`) +
+            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`)
     )
 
     override fun write(value: MultipathHelperQuicConfig, buf: ByteBuffer) {
@@ -4353,6 +4419,7 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
             FfiConverterTypeSshAuth.write(value.`auth`, buf)
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
+            FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
     }
 }
 
@@ -4590,6 +4657,14 @@ data class SshConfig (
      * （`OrchestratorCallback::on_agent_sign_request` / `SessionCallback::on_agent_sign_request`）。
      */
     var `agentForward`: kotlin.Boolean
+    , 
+    /**
+     * 設定されていれば、`host:port` へ直接ではなく、まずこの踏み台ホストへ
+     * SSH接続・認証し、そこから `channel_open_direct_tcpip` で `host:port` への
+     * チャネルを開いた上にネストしたSSHセッションを張る（`ssh -J` 相当）。
+     * 対象ホストがNAT配下で直接到達できない場合の唯一の到達経路になる。
+     */
+    var `jump`: JumpConfig?
     
 ){
     
@@ -4614,6 +4689,7 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterUInt.read(buf),
             FfiConverterSequenceTypePortForward.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterOptionalTypeJumpConfig.read(buf),
         )
     }
 
@@ -4625,7 +4701,8 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterUInt.allocationSize(value.`cols`) +
             FfiConverterUInt.allocationSize(value.`rows`) +
             FfiConverterSequenceTypePortForward.allocationSize(value.`forwards`) +
-            FfiConverterBoolean.allocationSize(value.`agentForward`)
+            FfiConverterBoolean.allocationSize(value.`agentForward`) +
+            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`)
     )
 
     override fun write(value: SshConfig, buf: ByteBuffer) {
@@ -4637,6 +4714,7 @@ public object FfiConverterTypeSshConfig: FfiConverterRustBuffer<SshConfig> {
             FfiConverterUInt.write(value.`rows`, buf)
             FfiConverterSequenceTypePortForward.write(value.`forwards`, buf)
             FfiConverterBoolean.write(value.`agentForward`, buf)
+            FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
     }
 }
 
@@ -5828,6 +5906,38 @@ public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?>
         } else {
             buf.put(1)
             FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeJumpConfig: FfiConverterRustBuffer<JumpConfig?> {
+    override fun read(buf: ByteBuffer): JumpConfig? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeJumpConfig.read(buf)
+    }
+
+    override fun allocationSize(value: JumpConfig?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeJumpConfig.allocationSize(value)
+        }
+    }
+
+    override fun write(value: JumpConfig?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeJumpConfig.write(value, buf)
         }
     }
 }

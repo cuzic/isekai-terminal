@@ -360,20 +360,20 @@ class AppDatabaseMigration3To4Test {
     /**
      * v10 時点(migration 1→10 適用後の最終形、`enable_agent_forward` 列追加前)の
      * データベースを再現する。`known_hosts` / `key_entries` / `snippets` は Room 自身に
-     * 現行（v11）スキーマ一式を作らせてそのまま使い（手書き DDL の食い違いリスクを避ける）、
+     * 現行（v12）スキーマ一式を作らせてそのまま使い（手書き DDL の食い違いリスクを避ける）、
      * `connection_profiles` テーブルだけを v10 の形に手動で作り直したうえで
      * `user_version` を 10 に戻す。
      */
     private fun createV10Database() {
         Room.databaseBuilder(ctx, AppDatabase::class.java, dbName).build().apply {
-            openHelper.writableDatabase // force file creation at v11
+            openHelper.writableDatabase // force file creation at the current version
             close()
         }
 
         val helper = FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(ctx)
                 .name(dbName)
-                .callback(object : SupportSQLiteOpenHelper.Callback(11) {
+                .callback(object : SupportSQLiteOpenHelper.Callback(12) {
                     override fun onCreate(db: SupportSQLiteDatabase) {}
                     override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
                 })
@@ -418,7 +418,7 @@ class AppDatabaseMigration3To4Test {
         createV10Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_10_11)
+            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -435,7 +435,7 @@ class AppDatabaseMigration3To4Test {
         createV10Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_10_11)
+            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12)
             .build()
         try {
             val dao = db.connectionProfileDao()
