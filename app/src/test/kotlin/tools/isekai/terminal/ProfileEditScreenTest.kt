@@ -498,4 +498,70 @@ class ProfileEditScreenTest {
             assertEquals(1080.toUShort(), fw.bindPort)
         }
     }
+
+    @Test fun editProfile_prefillsRemoteForward() {
+        val profile = sampleProfile().copy(
+            forwards = listOf(
+                uniffi.tssh_core.PortForward(
+                    forwardType = uniffi.tssh_core.ForwardType.REMOTE,
+                    bindAddress = "0.0.0.0", bindPort = 8080u,
+                    remoteHost = "192.168.1.5", remotePort = 9090u,
+                ),
+            ),
+        )
+        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("Remote (-R)").assertIsSelected()
+        composeTestRule.onNodeWithText("0.0.0.0").assertExists()
+        composeTestRule.onNodeWithText("8080").assertExists()
+        composeTestRule.onNodeWithText("192.168.1.5").assertExists()
+        composeTestRule.onNodeWithText("9090").assertExists()
+    }
+
+    @Test fun editProfile_prefillsDynamicForward() {
+        val profile = sampleProfile().copy(
+            forwards = listOf(
+                uniffi.tssh_core.PortForward(
+                    forwardType = uniffi.tssh_core.ForwardType.DYNAMIC,
+                    bindAddress = "127.0.0.1", bindPort = 1080u,
+                    remoteHost = "", remotePort = 0u,
+                ),
+            ),
+        )
+        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("Dynamic/SOCKS (-D)").assertIsSelected()
+        composeTestRule.onNodeWithText("1080").assertExists()
+        // Dynamicは転送先ホスト/ポート欄が表示されないはず。
+        composeTestRule.onNodeWithText("転送先ホスト").assertDoesNotExist()
+    }
+
+    // ── 非ループバックbind許可 ─────────────────────────────────────────
+
+    @Test fun allowNonLoopbackForwardBindCheckbox_enabling_andSaving_persistsFlag() {
+        var saved = false
+        composeTestRule.setContent {
+            ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
+        }
+        val fields = composeTestRule.onAllNodes(hasSetTextAction())
+        fields[0].performTextInput("NonLoopbackHost")
+        fields[1].performTextInput("host.example.com")
+        fields[3].performTextInput("root")
+
+        composeTestRule.onNodeWithTag("allowNonLoopbackForwardBindCheckbox").performScrollTo().performClick()
+
+        composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
+        composeTestRule.waitUntil(5000) {
+            composeTestRule.waitForIdle()
+            saved
+        }
+        runBlocking {
+            val stored = Repositories.profiles.getAll().first { it.label == "NonLoopbackHost" }
+            assertTrue(stored.allowNonLoopbackForwardBind)
+        }
+    }
+
+    @Test fun editProfile_prefillsAllowNonLoopbackForwardBind() {
+        val profile = sampleProfile().copy(allowNonLoopbackForwardBind = true)
+        composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithTag("allowNonLoopbackForwardBindCheckbox").assertIsOn()
+    }
 }

@@ -652,6 +652,7 @@ fun ProfileEditScreen(
             Checkbox(
                 checked = allowNonLoopbackForwardBind,
                 onCheckedChange = { allowNonLoopbackForwardBind = it },
+                modifier = Modifier.testTag("allowNonLoopbackForwardBindCheckbox"),
             )
             Text("同一Wi-Fi/LAN上の他端末からの待受を許可する（非ループバックbind）")
         }
