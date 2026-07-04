@@ -1815,6 +1815,92 @@ Phase 0-5（バックグラウンドライフサイクル）・0-6（CI、GitHub
 **次にやること**: 本格的な iOS 版 UI 実装（SwiftUI・Keychain・trzsz UI 等）の Phase 番号を確定し、
 着手する。
 
+### Phase 1 タスク分解への外部レビュー（ChatGPT相談、2026-07-04・2ラウンド）
+
+Phase 1（本格実装）の作業をタスク分解した最初の案（Xcode雛形・Keychain/Secure Enclave・
+プロファイル管理・ターミナル描画/IME・trzsz UI・QUIC接続・バックグラウンド配線・CI・実機確認の
+10項目、番号順）をChatGPTに相談し、2ラウンドの指摘を経て以下の内容に確定した
+（実装はまだ行っていない。以後のPhase 1実装はこのリポジトリの `main` ではなく
+`.claude/worktrees/ios-phase1`（ブランチ `worktree-ios-phase1`）で行う）。
+
+**ラウンド1の指摘**: 「iOS技術スパイク・最小SSHクライアント・製品機能・バックグラウンド耐性の
+4段階が混在しており、番号順にそのまま進めるべきではない」。
+
+**ラウンド2の指摘**（ラウンド1の再構成案に対するさらなるレビュー）:
+1. Xcode雛形タスクと最小SSH縦切りタスクの受け入れ条件が重複していた → Xcode雛形は
+   「Rustの同期/非同期関数を呼べる・テスト用callbackを受信できる・Rustオブジェクトを
+   明示的に破棄できる」までに限定し、実SSH接続は縦切りタスクだけに持たせる。
+2. SSH/helper接続テスト用fixtureは「フェーズ非依存」ではなく、CI統合テスト・最小縦切り・
+   ネットワーク変化テスト・resume試験の前提であるため、Phase 1A前半に移動。CI fixture
+   （GitHub Actions macOSランナー内、pinned host key、外部ネットワーク非依存）と実機fixture
+   （LAN上の開発機、Local Network Privacy確認用、Wi-Fi切断/helper再起動可能）に分ける。
+3. **「Swift Actorで順序保証する」という設計は誤り**: Swift Actorは内部状態への同時アクセスは
+   防ぐが、複数RustスレッドからのcallbackをそれぞれTask化した場合、Actorへ到達する順序が
+   元のcallback発生順である保証はない（Swift Task実行順は決定的FIFOではない）。代わりに
+   Rust側に単一の順序付きEventQueue（`session_id`/`generation`/`sequence`を持つ
+   `EventEnvelope`）を置き、Swiftはwake通知を受けて`drain_events(after_sequence, max_count)`
+   で能動的に取得する設計に変更。イベントは「lossless（接続状態・認証要求・ホスト鍵確認・
+   切断理由・trzsz開始/完了・エラー・バックグラウンドライフサイクル）」と
+   「latest-wins（画面Damage・カーソル点滅・転送進捗中間値）」の2系統に分離する。
+4. 画面更新のUniFFI境界データ形式を具体化: `TerminalFrameBatch`
+   （`session_id`/`screen_generation`/`frame_sequence`/`rows: Vec<PackedRow>`/
+   `dirty_top`/`dirty_bottom`/`cursor`/`title`/`bell`）。`PackedRow`はセルオブジェクト配列
+   ではなくUTF-8テキストバッファ+セル幅配列+属性run+色テーブルにまとめる。
+5. 日本語IMEスパイクを2段階に分割: (a)完全に独立したハーネスでの単体スパイク（固定位置の
+   `UITextView`。完全に透明/ゼロサイズ/画面外は候補位置検証に適さないため避ける）→
+   (b)画面更新ブリッジ完成後にターミナルカーソル位置への統合。
+6. 最小縦切りをplain SSH（#20a）とisekai-helper/QUIC（#20b、任意）に分割し、原因分離しやすく
+   する。キャンセル可能な接続・タイムアウト・二重connect拒否・close冪等性などを最初から含める。
+7. **新規タスク: SSH/helper信頼ストアとホスト鍵確認UI**（秘密鍵管理はあったが接続先サーバーを
+   信頼する仕組みが抜けていた）。初回接続でfingerprint表示・承認、再接続は一致すれば自動許可、
+   変更時は自動許可せず明示的警告。
+8. 鍵管理タスクを「CredentialVault」に拡張（SSH秘密鍵だけでなくパスワード・passphrase・
+   helper認証情報・将来のrelay tokenまで対象）。nonce再利用禁止・AAD・atomic write・
+   rollback/リカバリ・orphan blob清掃・鍵ローテーションなどを受け入れ条件に追加。
+9. NWPathMonitorの通知ポリシーをSessionStateに応じて変える（Active時は短時間coalesce、
+   Degraded/Reconnecting時はsatisfied変化を即時通知、unsatisfiedでも即座に切断とは
+   判断せず実transport errorを待つ）。
+10. バックグラウンドAPIの`deadline_ms`を`budget_ms`に変更（SwiftとRustで基準時計を共有して
+    いないため目安に過ぎない。実際の終了判断はSwift側background task expiration callbackが正）。
+11. バックグラウンド遷移対応に「SceneLifecycleReporter→AppExecutionCoordinator（複数Scene集約）
+    →Rust SessionSupervisor」という層を追加（iPhone単一Scene限定でも将来の複数Scene対応に
+    備えて最初から入れる）。
+12. 総合回帰テストからSecure Enclave試験を除外（Phase 1で必須にしていないため矛盾する）。
+    「メモリ圧迫によるプロセス破棄」は再現性が低いため、`simctl terminate`や
+    cold launch（terminateコールバックなし）からのresume検証に置き換える。
+
+**推奨実装順序（確定）**:
+
+```
+Phase 1A（iOSで成立するかを早期に証明するフェーズ）
+  1. Xcodeアプリ雛形（実SSH接続は含めない）
+  2. アプリビルドCI
+  3. SSH/helper fixture（CI用・実機用）
+  4. Rust側連番付きEventQueue + Swift CallbackIngress
+  5. 日本語IME単体スパイク
+  6. Rust→Swift画面更新ブリッジ + 最小レンダラー
+  7. 日本語IMEとターミナルカーソルの統合
+  8. plain SSH最小縦切り（Phase 1A完了条件）
+  9. isekai-helper/QUIC最小縦切り（任意）
+
+Phase 1B（安全に日常利用できる最小SSHクライアント）
+  10. CredentialVault（Keychain保護）
+  11. SSH/helper信頼ストア・ホスト鍵確認UI
+  12. GRDB + プロファイルCRUD UI
+  13. ターミナル特殊キー操作 + フル機能レンダリング
+  14. NWPathMonitor + Local Network Privacy対応
+
+Phase 1C（isekai-terminal固有の耐障害性を完成させるフェーズ）
+  15. SessionSupervisor（2軸FSM: SessionState / ExecutionMode）
+  16. バックグラウンド遷移対応（複数Scene集約層込み）
+  17. trzszファイル転送 + ファイルサンドボックス橋渡し
+  18. isekai-helper再接続・resume対応
+  19. 実機での総合回帰テスト
+```
+
+実機検証は各機能タスクの受け入れ条件に前倒しし、最終回帰テストには集約しない方針。
+タスクの詳細はセッションのTaskList（`[Phase 1A-N]`等のタグ付き）を参照。
+
 ---
 
 ## 実装順序
