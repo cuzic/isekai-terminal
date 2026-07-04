@@ -13,9 +13,15 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
@@ -76,6 +82,7 @@ fun ProfileListScreen(
         mutableStateOf(prefs.getString(TerminalThemes.PREF_KEY, null) ?: TerminalThemes.DEFAULT_DARK.name)
     }
     var showThemeDialog by remember { mutableStateOf(false) }
+    var showMenu by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -86,9 +93,25 @@ fun ProfileListScreen(
                     .padding(horizontal = 8.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.End,
             ) {
-                TextButton(onClick = { showThemeDialog = true }) { Text("配色") }
-                TextButton(onClick = onManageSnippets) { Text("定型") }
-                TextButton(onClick = onManageKeys) { Text("鍵管理") }
+                Box {
+                    IconButton(onClick = { showMenu = true }) {
+                        Icon(Icons.Default.Menu, contentDescription = "メニュー")
+                    }
+                    DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("配色") },
+                            onClick = { showMenu = false; showThemeDialog = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("定型") },
+                            onClick = { showMenu = false; onManageSnippets() },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("鍵管理") },
+                            onClick = { showMenu = false; onManageKeys() },
+                        )
+                    }
+                }
             }
         },
         floatingActionButton = {

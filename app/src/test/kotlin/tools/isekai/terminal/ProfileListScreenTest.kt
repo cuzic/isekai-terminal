@@ -6,6 +6,7 @@ import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
@@ -119,7 +120,8 @@ class ProfileListScreenTest {
     @Test fun manageKeysButton_callsCallback() {
         var managed = false
         setScreen(onManageKeys = { managed = true })
-        // "鍵管理" is in topBar Row, no scroll needed
+        // "鍵管理" はハンバーガーメニュー内にある
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
         composeTestRule.onNodeWithText("鍵管理").performClick()
         composeTestRule.waitUntil(3000) { managed }
         assertTrue(managed)
@@ -129,6 +131,7 @@ class ProfileListScreenTest {
 
     @Test fun themeButton_opensThemeDialog() {
         setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
         composeTestRule.onNodeWithText("配色").performClick()
         waitForText("配色テーマ")
         composeTestRule.onNodeWithText("配色テーマ").assertIsDisplayed()
@@ -143,6 +146,7 @@ class ProfileListScreenTest {
         var appliedTheme: TerminalTheme? = null
         setScreen(applyTerminalTheme = { appliedTheme = it })
 
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
         composeTestRule.onNodeWithText("配色").performClick()
         waitForText("配色テーマ")
         composeTestRule.onNodeWithText(TerminalThemes.DRACULA.name).performClick()
@@ -161,6 +165,7 @@ class ProfileListScreenTest {
     @Test fun themeDialog_dismissWithoutSelection_leavesPrefsUntouched() {
         val ctx = ApplicationProvider.getApplicationContext<Application>()
         setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
         composeTestRule.onNodeWithText("配色").performClick()
         waitForText("配色テーマ")
         composeTestRule.onNodeWithText("閉じる").performClick()
