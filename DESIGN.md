@@ -21,7 +21,7 @@ trzsz ファイル転送（tssh 互換）と Mosh は後続フェーズとして
 - Mosh 接続（P6、SSP over UDP + AES-128 OCB、Rust 実装）
 
 ### やらないこと（将来フェーズ）
-- iOS 対応（Swift UI + 同 Rust コア共有。UniFFI が Swift バインディングを生成するため UI 層のみ別実装で済む）
+- ~~iOS 対応~~ → 方針転換して着手（Rust コア共有 + Swift UI。詳細は `PLAN.md` の該当節を参照）
 - X11 転送
 - ポートフォワーディング
 - ~~SSH エージェント転送~~ → 方針転換して追加（既定 OFF・プロファイル単位 opt-in、

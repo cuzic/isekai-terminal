@@ -1659,6 +1659,151 @@ Web検索で実在・現状Needs Triageであることを確認済み——Phase
 
 ---
 
+## Phase Y: iOS対応（Rust + Swift）— DESIGN.md の「やらないこと」から方針転換（ユーザー承認済み）
+
+`DESIGN.md`（24行目）は当初 iOS 対応を「やらないこと（将来フェーズ）」としていたが、そこには元々
+「Swift UI + 同 Rust コア共有。UniFFI が Swift バインディングを生成するため UI 層のみ別実装で済む」
+という構想が明記されていた。2026-07-04、この構想を実行に移すことをユーザー承認のもと決定した。
+
+### 方針（2026-07-04 決定）
+- リポジトリ構成: 別リポジトリを切らず、この isekai-terminal リポジトリ内に `ios/` を追加する形で進める。
+- 最初のマイルストーン: Android 版の主要機能フル移植（trzsz・QUIC/isekai-helper連携・鍵管理まで含む）を目標に据える。
+- iOS 最低バージョン: 特にこだわらず、UniFFI/SwiftPM の標準的なサポート範囲（概ね iOS 15+ 目安）に委ねる。
+
+### 調査で判明した技術的前提（2026-07-04）
+- `rust-core`（crate `tssh-core`）は `[lib] crate-type = ["cdylib", "staticlib"]` で既に
+  `staticlib` を含み、iOS 向けに転用しやすい。Android 依存は `#[cfg(target_os = "android")]` の
+  android_logger 初期化のみで極めて薄い。`isekai-helper`（サーバー側常駐バイナリ）も Android
+  依存ゼロで無改修のまま使える。
+- UniFFI は UDL 不使用の proc-macro ベースで、`uniffi-bindgen/src/main.rs` は
+  `uniffi::uniffi_bindgen_main()` の汎用呼び出しのみ。`--language swift` を指定すれば同じ仕組みで
+  Swift バインディング生成できる見込み（未検証、Phase 0 で確認する）。
+- **Swift 側で作り直しが必要（コード共有不可）な部分**: `NetworkPathMonitor.kt`/
+  `PhysicalPathProvider.kt`（Android `ConnectivityManager` 直叩きの物理 Wi-Fi/セルラー同時
+  マルチパス。iOS に同等 API なし）、`KeystoreKek.kt`（→ iOS Keychain/Secure Enclave）、
+  `TerminalSessionService.kt`（Android Foreground Service → iOS のバックグラウンド実行制約は
+  ずっと強い）、`input/` 配下（IME）、`ui/` 配下（Compose → SwiftUI 書き直し）。
+- rust-core は `LazyLock<Runtime>` でプロセス全体に単一 tokio ランタイムを持つ設計。iOS の
+  バックグラウンド時プロセス一時停止/終了との相互作用は未検証（Phase 0 で確認する）。
+
+### 外部レビュー（ChatGPT相談、2026-07-04）
+
+実装着手前に、上記の技術的前提を踏まえて次の4論点を ChatGPT に相談した。実装はまだ行っておらず、
+次フェーズ（Phase 0: 技術検証スパイク）着手時の設計方針として記録する。
+
+1. **バックグラウンド接続維持**: 「無期限にソケットを生かす」ことを iOS 版の仕様として約束しない。
+   `Active → Quiescing → Suspended → Resuming` という明示的なセッション FSM を Rust 側に追加し、
+   正（SSOT）は「iOS 上の QUIC connection の生存」ではなく「helper 側の論理セッション（session
+   lease・H2C リングバッファ・offset）」に置く。既存の resume 機構（Phase 8）の延長で対応可能と
+   いう見立て。`beginBackgroundTask` は短時間の後始末用、`BGAppRefreshTask`/`BGProcessingTask` は
+   常時接続に使えない。Live Activities は v1 必須ではなく実験機能枠。Network Extension
+   （`NEAppPushProvider`）や PushKit の流用はプライバシー説明・審査リスクの観点で非推奨。
+2. **物理 Wi-Fi/セルラー同時マルチパス**: v1 スコープ外にする。`NWParameters.multipathServiceType`
+   は MPTCP 向けで QUIC multipath には使えない。代替として論理マルチパス（Tailscale/直接/relay、
+   Phase 9 相当）+ QUIC connection migration + `NWPathMonitor` 駆動の高速再接続を提供する。
+3. **単一 tokio ランタイム**: 維持してよいが、`SessionSupervisor` + 明示的セッション FSM
+   （`Disconnected/Connecting/Active/Quiescing/Suspended/Resuming/Closing/Closed`）を挟む設計を
+   推奨。UniFFI 越しに `prepare_for_background`/`resume_from_background`/
+   `application_will_terminate`/`memory_warning` 等のライフサイクル API を追加する。UniFFI の
+   async は Swift Task cancellation を自動伝播しないため、セッション固有の `cancel()` を別 API
+   として用意する必要がある。ターミナル再描画は1セル単位で callback せず、snapshot pull 型にする。
+4. **XCFramework/SPM 配布**: XCFramework には Rust 静的ライブラリ + C ヘッダー/modulemap のみを
+   格納し、UniFFI 生成 Swift コードは別途 Swift Package の source target として配布する（バイナリ
+   に焼き込まない。Mozilla 自身もこの構成を採用）。ビルドターゲットは `aarch64-apple-ios`/
+   `aarch64-apple-ios-sim`/`x86_64-apple-ios` の3つ。バージョンは Swift Package version / Rust
+   crate version / wire protocol version の3つを分離管理する。
+
+**まだ決めていない点**: 上記を正式な各 Phase 実装（サブフェーズ分割・番号）に落とし込む詳細設計は、
+Phase 0（技術検証スパイク）の結果を見てから確定する。PLAN.md への Phase 記録を今後もこの Phase Y
+配下に追記していくか、別ファイルに分けるかも Phase 0 着手時点で判断する。
+
+### Phase 0: 技術検証スパイク（2026-07-04 着手）
+
+開発機が Linux（macOS + Xcode 不在）であるため、Phase 0-0/0-1（mac 不要）はこのセッションで
+実装・検証済み、Phase 0-2〜0-6（mac 必須）はスクリプト/手順書の用意のみで実行はユーザーが
+macOS 環境で行う。
+
+- ✅ **Phase 0-0（前提整備）**: `.cargo/config.toml`/`Cargo.toml` は変更不要と判断（iOS クロス
+  ビルドは Xcode 同梱の cc/ar で完結し、Android のような `linker =` 上書きは原則不要という想定）。
+- ✅ **Phase 0-1（Swiftバインディング生成の検証、最大のリスク項目）**: 新規
+  `rust-core/scripts/generate-swift-bindings.sh`（ホストのデフォルトターゲットで cdylib を
+  ビルドし `uniffi-bindgen -- generate --library ... --language swift` を実行。iOS クロス
+  コンパイル環境不要）を実際に実行し、**UniFFI 0.31.2 で `--language swift` が全22箇所の
+  エクスポート面を問題なく生成できることを確認した**。特に懸念していた
+  `callback_interface OrchestratorCallback`（9メソッド）は `public protocol OrchestratorCallback:
+  AnyObject, Sendable { ... }` として、`SessionCallback`（旧API）も同様に、日本語ドキュメント
+  コメントを保持したまま生成された。`SshError`（`uniffi::Error`）も
+  `enum SshError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError` として正しく
+  生成された。生成物一式（`tssh_core.swift`/`tssh_coreFFI.h`/`tssh_coreFFI.modulemap` と
+  各 `.sha256`）は `ios/Sources/TsshCore/generated/` にコミット（Kotlin 側
+  `app/src/main/kotlin/uniffi/tssh_core/tssh_core.kt` の運用と対称）。
+  診断用の round-trip 検証関数 `core_version() -> String`（`rust-core/src/lib.rs`、
+  `env!("CARGO_PKG_VERSION")` を返すだけの純粋関数、Rust SSOT 原則には抵触しない）を追加し、
+  再生成後に Swift 側へ `coreVersion()` として生成されることも確認済み。
+  スクリプト実装上の注意点（見つかった不具合と修正）: sha256 サイドカーファイル生成ループが
+  `$OUT_DIR/*` を素朴に回すと、再実行時に既存の `*.sha256` まで再ハッシュして
+  `*.sha256.sha256` が増殖するバグがあったため、生成のたびに `OUT_DIR` を `rm -rf` してから
+  生成し直す方式に修正済み。
+- **Phase 0-2（iOS 3ターゲットへのクロスコンパイル）**・**Phase 0-3（XCFramework化 +
+  SwiftPMパッケージ雛形）**・**Phase 0-4（最小round-trip検証）**: 当初は mac 必須のため
+  手順書（`ios/README.md`）の用意のみに留めていたが、後述のCI導入判断により
+  **GitHub Actions（`macos-26`ランナー）上で実際に検証する方針に変更**。
+  `rust-core/scripts/build-ios-xcframework.sh`（`uname` が `Darwin` でなければ即エラー終了。
+  Phase 0-1 で確認した生成物のファイル名 `tssh_coreFFI.modulemap` を、
+  `xcodebuild -create-xcframework -headers` が期待する `module.modulemap` という名前へ
+  コピーしてから渡す処理を組み込み済み。module 宣言自体は `tssh_coreFFI` のまま変更しない）、
+  `ios/Package.swift`（`TsshCoreFFIBinary` という binaryTarget名で XCFramework を参照、
+  生成された Swift コードの `import tssh_coreFFI` はモジュール名なので target 名とは別物）、
+  `ios/Tests/TsshCoreTests/CoreVersionRoundTripTests.swift`（`coreVersion()` が
+  `Cargo.toml` の `version = "0.1.0"` と一致することを確認する1テスト）を作成済み。
+  実行結果は下記 Phase 0-6 の CI 実行結果を参照。
+- **Phase 0-5（バックグラウンドライフサイクルの手がかり）**: 机上調査の結論のみ記録。
+  `LazyLock<Runtime>` のワーカースレッドは iOS サスペンド中に停止するが壁時計時間は経過し
+  続けるため、QUIC の idle timeout/keepalive はサスペンド復帰時に stale 化しうる。これは
+  上記の外部レビュー方針（「iOS 上の QUIC connection の生存」ではなく「helper 側の論理
+  セッション」を SSOT にする）の妥当性を裏付ける。新規ライフサイクル API は実装していない
+  （Phase 1 以降のマター）。実機（iPhone）でのサスペンド/jetsam実挙動の検証は、Phase 9-4の
+  「実機検証は未実施」という記録パターンに倣い、明示的に次フェーズへ送る。
+- **Phase 0-6（CI、方針転換: GitHub Actions を採用）**: 当初は「試行錯誤前提のスパイクのため
+  時期尚早」としてPhase 0には含めない判断だったが、次の理由でCI導入に方針転換した。
+
+  1. **開発機がLinuxでmacOS実機が無い制約を、CIが直接解消できる**: このリポジトリ
+     （`cuzic/isekai-terminal`）は**公開リポジトリ**であり、GitHub-hosted の標準ランナー
+     （macOS含む）は公開リポジトリでは無課金で使える。つまりユーザーが自分のMacで
+     `ios/README.md` の手順を実行するのを待たずに、CI上でPhase 0-2〜0-4を実際に検証できる。
+  2. **外部レビュー（ChatGPT相談、2026-07-04）**: 「Phase 0（ライブラリのクロスビルド+
+     シミュレータテストのみ）にはコード署名が一切不要なため、Codemagicの強み（証明書管理・
+     TestFlight/App Store配信の簡便さ）は現段階では効いてこない。既存CI
+     （`fdroid-build-check.yml`/`room-migration-check.yml`）が両方GitHub Actionsである
+     一貫性、公開リポジトリならmacOSランナーも無課金である点から、GitHub Actionsを推す。
+     Codemagicは実際に配布可能なiOSアプリ本体をビルドする段階（TestFlight/App Store提出、
+     証明書・Provisioning Profile管理）になってから、配布専用CIとして追加検討すればよい」
+     という回答を得た。ビルドロジックをCIのYAMLに埋めずリポジトリ内のシェルスクリプトに
+     置く（`rust-core/scripts/*.sh`）という既存方針とも整合する。
+  3. **`macos-14` は使わない**: 2026-07-06から非推奨化開始・2026-11-02サポート終了予定のため
+     （WebSearchで確認済み）、新規ワークフローは `macos-26`（2026-02-26 GA、Apple Silicon
+     ネイティブ）を使う。`macos-latest` は移行期間中（2026-06-15〜07-15）で挙動が不安定な
+     ため使わず、明示的に `macos-26` を指定する。
+
+  新規 `.github/workflows/ios-rust-core-check.yml`（`runs-on: macos-26`、
+  `rust-core/**`/`ios/**` 変更時 + `workflow_dispatch`）を作成。内容:
+  Rust iOSターゲット追加 → cargoキャッシュ → Swiftバインディング再生成+
+  コミット済み生成物とのdiffチェック（Rust公開APIを変更してもSwift生成物の再生成を
+  忘れるケースをPRで検出）→ `build-ios-xcframework.sh` 実行 → `lipo -archs` によるXCFramework
+  スライス検証 → シミュレータ動的選択（`xcrun simctl list devices available`から
+  iPhone系デバイスを1つ選ぶ）→ `xcodebuild test`（`CODE_SIGNING_ALLOWED=NO`等で署名無効化）
+  → XCFrameworkをartifactとしてアップロード。
+
+  将来、実際に配布可能なiOSアプリのビルド（Archive・署名・IPA生成・TestFlight配信）を
+  行うフェーズになったら、Codemagicを「配布専用CI」として追加することを検討する
+  （ライブラリ検証はGitHub Actionsのまま維持）。
+
+**次にやること**: `.github/workflows/ios-rust-core-check.yml` を push して実際のCI実行結果を
+確認する。green になった時点で Phase 0 完了とし、本格的な iOS 版 UI 実装（SwiftUI・Keychain・
+trzsz UI 等）の Phase 番号を確定する。
+
+---
+
 ## 実装順序
 
 ```

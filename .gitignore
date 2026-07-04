@@ -10,6 +10,8 @@
 /rust-core/target/
 # cargoBuildRustCore Gradle task regenerates this; do not commit prebuilt binaries.
 /app/src/main/jniLibs/
+# build-ios-xcframework.sh regenerates this; do not commit prebuilt binaries.
+/ios/Frameworks/
 
 # IDE
 /.idea/
