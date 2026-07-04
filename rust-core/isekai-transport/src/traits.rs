@@ -69,4 +69,39 @@ pub trait ByteStream: Send {
 
     /// Signals that no more data will be written (finishes the send side).
     async fn shutdown(&mut self) -> Result<(), TransportError>;
+
+    /// Splits this stream into independently-owned read/write halves so a
+    /// caller can drive "read from A, write to this stream" and "read from
+    /// this stream, write to B" as two separately `tokio::spawn`ed tasks
+    /// without any shared lock between them (`isekai-ssh`'s stdin/stdout
+    /// relay is exactly this — see `ISEKAI_SSH_DESIGN.md`'s note that
+    /// `tokio::io::copy_bidirectional` doesn't fit because stdin/stdout are
+    /// two separate handles, not one duplex object; the QUIC side has the
+    /// same "two separate handles" shape once split).
+    ///
+    /// Every concrete `ByteStream` already keeps its send/recv sides as
+    /// physically separate fields under the hood (a QUIC bidi stream *is*
+    /// two independent objects, one per direction), so implementations
+    /// should return this as a cheap move/reinterpretation — never a
+    /// runtime-synchronized wrapper (a `Mutex`-guarded single object would
+    /// let a stalled write block an otherwise-ready read, or vice versa,
+    /// defeating the point of splitting in the first place).
+    fn split(self: Box<Self>) -> (Box<dyn ByteStreamReadHalf>, Box<dyn ByteStreamWriteHalf>);
+}
+
+/// The read half of a `ByteStream` after `ByteStream::split`.
+#[async_trait]
+pub trait ByteStreamReadHalf: Send {
+    /// Same contract as `ByteStream::read`.
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError>;
+}
+
+/// The write half of a `ByteStream` after `ByteStream::split`.
+#[async_trait]
+pub trait ByteStreamWriteHalf: Send {
+    /// Same contract as `ByteStream::write_all`.
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportError>;
+
+    /// Same contract as `ByteStream::shutdown`.
+    async fn shutdown(&mut self) -> Result<(), TransportError>;
 }

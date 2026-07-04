@@ -38,5 +38,7 @@ pub use error::TransportError;
 pub use proof::compute_proof;
 pub use relay::{connect_via_relay, RelayTarget};
 pub use system::SystemQuicEndpointFactory;
-pub use traits::{ByteStream, QuicConnection, QuicEndpoint, QuicEndpointFactory};
+pub use traits::{
+    ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf, QuicConnection, QuicEndpoint, QuicEndpointFactory,
+};
 pub use types::{BindSpec, RemoteSpec};

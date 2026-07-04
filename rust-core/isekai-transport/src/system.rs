@@ -24,7 +24,7 @@ use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use sha2::{Digest, Sha256};
 
 use crate::error::TransportError;
-use crate::traits::{ByteStream, QuicConnection, QuicEndpoint, QuicEndpointFactory};
+use crate::traits::{ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf, QuicConnection, QuicEndpoint, QuicEndpointFactory};
 use crate::types::{BindSpec, RemoteSpec};
 
 /// QUIC connection is declared dead after this much silence. Matches
@@ -218,6 +218,40 @@ impl ByteStream for SystemByteStream {
         }
     }
 
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportError> {
+        self.send.write_all(buf).await.map_err(|e| TransportError::StreamIo(e.to_string()))
+    }
+
+    async fn shutdown(&mut self) -> Result<(), TransportError> {
+        self.send.finish().map_err(|e| TransportError::StreamIo(e.to_string()))
+    }
+
+    fn split(self: Box<Self>) -> (Box<dyn ByteStreamReadHalf>, Box<dyn ByteStreamWriteHalf>) {
+        let SystemByteStream { send, recv } = *self;
+        (Box::new(SystemByteStreamReadHalf { recv }), Box::new(SystemByteStreamWriteHalf { send }))
+    }
+}
+
+struct SystemByteStreamReadHalf {
+    recv: noq::RecvStream,
+}
+
+#[async_trait]
+impl ByteStreamReadHalf for SystemByteStreamReadHalf {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        match self.recv.read(buf).await.map_err(|e| TransportError::StreamIo(e.to_string()))? {
+            Some(n) => Ok(n),
+            None => Ok(0), // stream finished cleanly (EOF)
+        }
+    }
+}
+
+struct SystemByteStreamWriteHalf {
+    send: noq::SendStream,
+}
+
+#[async_trait]
+impl ByteStreamWriteHalf for SystemByteStreamWriteHalf {
     async fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportError> {
         self.send.write_all(buf).await.map_err(|e| TransportError::StreamIo(e.to_string()))
     }
