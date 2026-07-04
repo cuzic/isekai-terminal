@@ -1,0 +1,25 @@
+[package]
+name = "isekai-link-masque"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+h3-noq = { path = "../h3-noq", features = ["datagram"] }
+h3 = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
+h3-datagram = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
+noq = { version = "1.0.1", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+bytes = "1"
+http = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2.0.18"
+log = "0.4"
+# 中継サーバー(bound-udp-server)はACME発行の実証明書を使う(isekai-helperの自己署名証明書と
+# 異なりピン留めではなく通常のCA検証)。OSの信頼ストアではなく組み込みのMozilla root storeを
+# 使うことで、Android版でもLinux版(isekai-helperは使わないが将来的なCLI版等)でも動作を揃える。
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+webpki-roots = "0.26"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+rcgen = "0.13"

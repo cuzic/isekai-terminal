@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "uniffi-bindgen", "isekai-helper", "noq-multipath-spike", "h3-noq", "isekai-stun"]
+members = [".", "uniffi-bindgen", "isekai-helper", "noq-multipath-spike", "h3-noq", "isekai-link-masque", "isekai-stun"]
 resolver = "2"
 
 [package]
