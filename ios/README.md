@@ -1,0 +1,89 @@
+# isekai-terminal iOS版(Phase 0: 技術検証スパイク)
+
+このディレクトリは、`rust-core`(crate `tssh-core`)を Rust コアとして共有する iOS 版アプリの
+Swift Package Manager パッケージ雛形です。背景・設計方針は `PLAN.md` の「Phase Y: iOS対応
+(Rust + Swift)」節を参照してください。
+
+## 現状(Phase 0 の到達点)
+
+- **Swiftバインディング生成は Linux 開発機で検証済み**(`rust-core/scripts/generate-swift-bindings.sh`)。
+  `ios/Sources/TsshCore/generated/` に生成済みのファイルをコミットしています。
+  `OrchestratorCallback`(9メソッド)・`SessionCallback`・`SshError` を含む全エクスポート面が
+  問題なく Swift の `protocol`/`enum: Swift.Error` として生成されることを確認済みです。
+- **iOSクロスコンパイル・XCFramework化・シミュレータでの動作確認は、`.github/workflows/
+  ios-rust-core-check.yml`(GitHub Actions、`macos-26`ランナー)で検証します**。このリポジトリは
+  公開リポジトリのため、GitHub-hostedのmacOSランナーは無課金で使えます(詳細は`PLAN.md`
+  「Phase Y」節のPhase 0-6参照)。ローカルのmacOS環境がある場合は、以下の手順で同じ内容を
+  手元でも実行できます。
+
+## 前提条件(macOS側)
+
+- Xcode(バージョンは特にこだわりません。`-create-xcframework` は Xcode 11+、SwiftPM の
+  local path binaryTarget は Xcode 12+ で動作するはずです)
+- Rust ツールチェーン(`rustup`)。`rust-toolchain.toml` は本リポジトリに存在しないため、
+  手元の安定版 rustc で構いません(問題が出た場合のみバージョン固定を検討してください)。
+
+## 手順
+
+### 1. iOS向けRustターゲットを追加
+
+```bash
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+```
+
+### 2. クロスコンパイル + XCFramework化
+
+```bash
+bash rust-core/scripts/build-ios-xcframework.sh
+```
+
+内部で以下を行います(詳細はスクリプト本体を参照):
+1. 3ターゲット(`aarch64-apple-ios` / `aarch64-apple-ios-sim` / `x86_64-apple-ios`)を
+   `cargo build --release -p tssh-core` でビルド(`crate-type = ["cdylib", "staticlib"]` により
+   生成される `.a` のうち **staticlib のみ使用**)。
+2. シミュレータ向け2アーキテクチャ(`aarch64-apple-ios-sim` + `x86_64-apple-ios`)を
+   `lipo -create` でfat化(XCFrameworkは1プラットフォームバリアントにつき1ライブラリの
+   制約があるため必須)。
+3. `ios/Sources/TsshCore/generated/tssh_coreFFI.modulemap` を `module.modulemap` という
+   名前でコピーしたヘッダーディレクトリを用意し(XCFrameworkの `-headers` はこの
+   ファイル名を期待するため。`module` 宣言自体は `tssh_coreFFI` のまま変更しない)、
+   `xcodebuild -create-xcframework` で `ios/Frameworks/TsshCoreFFI.xcframework` を生成。
+
+もし `ring`/`rustls`/`noq` のビルドで SDK 解決に失敗する場合は、シミュレータ向けビルド前に
+以下を試してください:
+
+```bash
+export SDKROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+```
+
+### 3. Swiftバインディングの再生成(Rust側を変更した場合のみ)
+
+```bash
+bash rust-core/scripts/generate-swift-bindings.sh
+```
+
+Linux/macOS どちらでも実行できます(ホストのデフォルトターゲットでビルドした cdylib から
+メタデータを読むだけのため、iOSクロスコンパイル環境は不要です)。
+
+### 4. round-trip検証(最小テスト)
+
+```bash
+cd ios
+xcrun simctl list devices available   # 使えるシミュレータ名を確認
+xcodebuild test -scheme TsshCore -destination 'platform=iOS Simulator,name=iPhone 15'
+```
+
+`swift-tools-version:5.9` のパッケージ単体で `-scheme TsshCore` が Xcode から見えない場合は、
+最小構成の空 iOS App テンプレートを作り、ローカル SwiftPM 依存としてこの `ios/` ディレクトリを
+追加してテストを実行するフォールバック経路を使ってください。
+
+成功基準: `CoreVersionRoundTripTests.testCoreVersionMatchesCargoPackageVersion` が green になり、
+`coreVersion()` の戻り値が `rust-core/Cargo.toml` の `[package] version` と一致すること。
+
+## Phase 0 でやらないこと
+
+- 単一tokioランタイム(`LazyLock<Runtime>`、`rust-core/src/lib.rs`)とiOSバックグラウンド
+  サスペンド/jetsamの実機検証(`PLAN.md` Phase 0-5 参照。実機が無いため次フェーズに送る)。
+- CI(macOS runner)へのこのビルド手順の組み込み(`PLAN.md` Phase 0-6 参照。手順が
+  確立してから別サブフェーズで着手する)。
+- `prepare_for_background`/`resume_from_background` 等のライフサイクルAPI実装(Phase 1以降)。
