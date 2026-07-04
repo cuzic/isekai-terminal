@@ -292,6 +292,156 @@ impl DiagnosticFrameMailbox {
     }
 }
 
+// ── ターミナル入力キー変換（Android/iOS共通化） ──────────────────
+//
+// Android版`TerminalKeyEncoder.kt`(app/src/main/kotlin/tools/isekai/terminal/input/)と
+// iOS版`TerminalKeyMapper.swift`がほぼ同一の「キー→制御シーケンス変換」を
+// それぞれ独立実装していたため、Rust側へ統合した(2026-07-04、Android/iOS共通化の
+// 一環)。純粋関数でセッション/接続状態を持たないためrust-ssot.mdの直接の対象では
+// ないが、両OSで内容が重複していたためSSOTを1箇所にまとめる。
+//
+// Androidの`KeyEvent.keyCode`やiOSの`UIKey`はプラットフォーム固有の値なので、
+// 「どの物理/仮想キーが押されたか」の判定は各OS側に残し、変換後の
+// `TerminalSpecialKey`（プラットフォーム非依存の列挙）だけをこの関数へ渡す設計にする。
+
+/// プラットフォーム非依存のターミナル特殊キー。F1〜F12と`ForwardDelete`はAndroid版
+/// には無かった機能で、この統合を機に追加された(iOS版`TerminalKeyMapper`由来)。
+/// `Delete`はAndroidの`KEYCODE_DEL`(実質バックスペース、0x7F)に対応し、iOS版の
+/// 前方削除キー(forward delete, `ESC[3~`)とは別物であることに注意。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TerminalSpecialKey {
+    Enter,
+    Delete,
+    ForwardDelete,
+    Tab,
+    Escape,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    FunctionKey { number: u8 },
+}
+
+/// 特殊キーを、ターミナルへ送信するバイト列(ANSI/xtermエスケープシーケンス)に
+/// 変換する。矢印キーは`application_cursor_mode`が有効ならSS3形式(`ESC O A`等、
+/// DECCKM)、無効ならCSI形式(`ESC[A`等)を返す。F1〜F4はSS3形式、F5〜F12は
+/// CSI `~`形式(xterm互換)。未対応のfunction key番号は空配列を返す。
+#[uniffi::export]
+pub fn terminal_special_key_bytes(key: TerminalSpecialKey, application_cursor_mode: bool) -> Vec<u8> {
+    match key {
+        TerminalSpecialKey::Enter => vec![0x0D],
+        TerminalSpecialKey::Delete => vec![0x7F],
+        TerminalSpecialKey::ForwardDelete => b"\x1B[3~".to_vec(),
+        TerminalSpecialKey::Tab => vec![0x09],
+        TerminalSpecialKey::Escape => vec![0x1B],
+        TerminalSpecialKey::ArrowUp => terminal_arrow_bytes(b'A', application_cursor_mode),
+        TerminalSpecialKey::ArrowDown => terminal_arrow_bytes(b'B', application_cursor_mode),
+        TerminalSpecialKey::ArrowRight => terminal_arrow_bytes(b'C', application_cursor_mode),
+        TerminalSpecialKey::ArrowLeft => terminal_arrow_bytes(b'D', application_cursor_mode),
+        TerminalSpecialKey::PageUp => b"\x1B[5~".to_vec(),
+        TerminalSpecialKey::PageDown => b"\x1B[6~".to_vec(),
+        TerminalSpecialKey::Home => b"\x1B[H".to_vec(),
+        TerminalSpecialKey::End => b"\x1B[F".to_vec(),
+        TerminalSpecialKey::FunctionKey { number } => terminal_function_key_bytes(number),
+    }
+}
+
+fn terminal_arrow_bytes(letter: u8, application_cursor_mode: bool) -> Vec<u8> {
+    if application_cursor_mode {
+        vec![0x1B, 0x4F, letter] // ESC O <letter> (SS3)
+    } else {
+        vec![0x1B, 0x5B, letter] // ESC [ <letter> (CSI)
+    }
+}
+
+fn terminal_function_key_bytes(n: u8) -> Vec<u8> {
+    match n {
+        1 => b"\x1BOP".to_vec(),
+        2 => b"\x1BOQ".to_vec(),
+        3 => b"\x1BOR".to_vec(),
+        4 => b"\x1BOS".to_vec(),
+        5 => b"\x1B[15~".to_vec(),
+        6 => b"\x1B[17~".to_vec(),
+        7 => b"\x1B[18~".to_vec(),
+        8 => b"\x1B[19~".to_vec(),
+        9 => b"\x1B[20~".to_vec(),
+        10 => b"\x1B[21~".to_vec(),
+        11 => b"\x1B[23~".to_vec(),
+        12 => b"\x1B[24~".to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// Unicodeコードポイント→バイト列。0(未入力)なら`None`。0x20未満または0x7Fは
+/// 単一の制御バイトとして、それ以外はUTF-8としてエンコードする。
+/// (Android版`TerminalKeyEncoder.unicodeCharBytes()`のRust移植)
+#[uniffi::export]
+pub fn terminal_unicode_char_bytes(unicode_char: u32) -> Option<Vec<u8>> {
+    if unicode_char == 0 {
+        return None;
+    }
+    if unicode_char < 0x20 || unicode_char == 0x7F {
+        Some(vec![unicode_char as u8])
+    } else {
+        char::from_u32(unicode_char).map(|c| c.to_string().into_bytes())
+    }
+}
+
+/// トグル式Ctrlキー用: 1コードポイント→Ctrl+<key>の制御コード。変換できない
+/// 入力(数字・日本語等)は`None`を返し、呼び出し側は変換せず元の入力をそのまま
+/// 送信する。
+/// - a-z / A-Z → 0x01-0x1A (Ctrl+A=0x01 ... Ctrl+Z=0x1A)
+/// - @ [ \ ] ^ _ (0x40-0x5F) → その5bit下位(Ctrl+@=0x00, Ctrl+[=ESC=0x1B等)
+/// - ? (0x3F) → 0x7F (DEL)
+/// - スペース(0x20) → 0x00 (NUL)
+/// (Android版`TerminalKeyEncoder.ctrlByte()`・iOS版`TerminalKeyMapper.controlByte()`を
+/// Rust側へ統合したSSOT実装)
+#[uniffi::export]
+pub fn terminal_ctrl_byte(code_point: u32) -> Option<u8> {
+    if !(0x20..=0x7F).contains(&code_point) {
+        return None;
+    }
+    let Some(ch) = char::from_u32(code_point) else { return None; };
+    if ch.is_ascii_alphabetic() {
+        return Some((ch.to_ascii_uppercase() as u32 & 0x1F) as u8);
+    }
+    if (0x40..=0x5F).contains(&code_point) {
+        return Some((code_point & 0x1F) as u8);
+    }
+    match ch {
+        '?' => Some(0x7F),
+        ' ' => Some(0x00),
+        _ => None,
+    }
+}
+
+/// IME確定テキスト／クリップボードペーストのテキスト→バイト列。改行正規化
+/// (`"\r\n"`/`"\n"` → `"\r"`)をここに集約する。複数コードポイントかつ
+/// `bracketed_paste_mode`が有効な場合のみ`ESC[200~`...`ESC[201~`で囲む
+/// (単一コードポイント、例えば絵文字1文字は囲まない)。
+/// (Android版`TerminalKeyEncoder.commitTextBytes()`のRust移植)
+#[uniffi::export]
+pub fn terminal_commit_text_bytes(text: String, bracketed_paste_mode: bool) -> Vec<u8> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    let code_point_count = normalized.chars().count();
+    if code_point_count > 1 && bracketed_paste_mode {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x1B[200~");
+        bytes.extend_from_slice(normalized.as_bytes());
+        bytes.extend_from_slice(b"\x1B[201~");
+        bytes
+    } else {
+        normalized.into_bytes()
+    }
+}
+
 // ── 公開型 ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -799,5 +949,194 @@ mod diagnostic_frame_mailbox_tests {
 
         let latest = mailbox.take_latest().unwrap();
         assert_eq!(latest.title, Some("generation-2".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod terminal_key_mapping_tests {
+    use super::*;
+
+    // Android版TerminalKeyEncoderTest.kt(28件)と対応する形で移植。
+    // 「Rust側へ統合しても既存の挙動が一切変わっていない」ことを両言語で
+    // 相互検証する意図。
+
+    #[test]
+    fn enter_maps_to_cr() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Enter, false), vec![0x0D]);
+    }
+
+    #[test]
+    fn del_maps_to_0x7f() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Delete, false), vec![0x7F]);
+    }
+
+    #[test]
+    fn forward_delete_maps_to_csi_tilde() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ForwardDelete, false), b"\x1B[3~".to_vec());
+    }
+
+    #[test]
+    fn tab_maps_to_0x09() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false), vec![0x09]);
+    }
+
+    #[test]
+    fn escape_maps_to_0x1b() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Escape, false), vec![0x1B]);
+    }
+
+    #[test]
+    fn arrow_keys_map_to_csi() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false), vec![0x1B, 0x5B, 0x41]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, false), vec![0x1B, 0x5B, 0x42]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, false), vec![0x1B, 0x5B, 0x43]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, false), vec![0x1B, 0x5B, 0x44]);
+    }
+
+    #[test]
+    fn arrow_keys_map_to_ss3_in_application_cursor_mode() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, true), vec![0x1B, 0x4F, 0x41]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, true), vec![0x1B, 0x4F, 0x42]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, true), vec![0x1B, 0x4F, 0x43]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, true), vec![0x1B, 0x4F, 0x44]);
+    }
+
+    #[test]
+    fn page_up_down_and_home_end() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageUp, false), b"\x1B[5~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageDown, false), b"\x1B[6~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Home, false), b"\x1B[H".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::End, false), b"\x1B[F".to_vec());
+    }
+
+    #[test]
+    fn function_keys_f1_to_f4_use_ss3() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false), b"\x1BOP".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 4 }, false), b"\x1BOS".to_vec());
+    }
+
+    #[test]
+    fn function_keys_f5_to_f12_use_csi_tilde() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 5 }, false), b"\x1B[15~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 12 }, false), b"\x1B[24~".to_vec());
+    }
+
+    #[test]
+    fn unsupported_function_key_returns_empty() {
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 99 }, false), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn zero_codepoint_returns_none() {
+        assert_eq!(terminal_unicode_char_bytes(0), None);
+    }
+
+    #[test]
+    fn control_char_stays_as_single_byte() {
+        assert_eq!(terminal_unicode_char_bytes(0x03), Some(vec![0x03]));
+    }
+
+    #[test]
+    fn ascii_letter_encodes_as_utf8() {
+        assert_eq!(terminal_unicode_char_bytes('a' as u32), Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn japanese_char_encodes_as_utf8() {
+        assert_eq!(terminal_unicode_char_bytes('あ' as u32), Some("あ".as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn empty_string_returns_empty_bytes() {
+        assert_eq!(terminal_commit_text_bytes(String::new(), false), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn single_char_encodes_as_plain_utf8() {
+        assert_eq!(terminal_commit_text_bytes("a".to_string(), false), b"a".to_vec());
+    }
+
+    #[test]
+    fn multi_char_without_bracketed_paste_mode_encodes_as_plain_utf8() {
+        assert_eq!(terminal_commit_text_bytes("ab".to_string(), false), b"ab".to_vec());
+    }
+
+    #[test]
+    fn multi_char_wraps_in_bracketed_paste_when_enabled() {
+        let bytes = terminal_commit_text_bytes("ab".to_string(), true);
+        assert_eq!(bytes[0], 0x1B);
+        assert!(String::from_utf8_lossy(&bytes).contains("ab"));
+        assert_eq!(*bytes.last().unwrap(), 0x7E);
+    }
+
+    #[test]
+    fn emoji_single_codepoint_does_not_wrap_even_with_bracketed_paste_mode() {
+        let emoji = "😀".to_string();
+        assert_eq!(terminal_commit_text_bytes(emoji.clone(), true), emoji.into_bytes());
+    }
+
+    #[test]
+    fn lowercase_and_uppercase_a_map_to_0x01() {
+        assert_eq!(terminal_ctrl_byte('a' as u32), Some(0x01));
+        assert_eq!(terminal_ctrl_byte('A' as u32), Some(0x01));
+    }
+
+    #[test]
+    fn lowercase_z_maps_to_0x1a() {
+        assert_eq!(terminal_ctrl_byte('z' as u32), Some(0x1A));
+    }
+
+    #[test]
+    fn at_sign_maps_to_0x00() {
+        assert_eq!(terminal_ctrl_byte('@' as u32), Some(0x00));
+    }
+
+    #[test]
+    fn open_bracket_maps_to_esc() {
+        assert_eq!(terminal_ctrl_byte('[' as u32), Some(0x1B));
+    }
+
+    #[test]
+    fn question_mark_maps_to_del() {
+        assert_eq!(terminal_ctrl_byte('?' as u32), Some(0x7F));
+    }
+
+    #[test]
+    fn space_maps_to_nul() {
+        assert_eq!(terminal_ctrl_byte(' ' as u32), Some(0x00));
+    }
+
+    #[test]
+    fn digit_and_japanese_return_none() {
+        assert_eq!(terminal_ctrl_byte('1' as u32), None);
+        assert_eq!(terminal_ctrl_byte('あ' as u32), None);
+    }
+
+    #[test]
+    fn bare_lf_is_normalized_to_cr() {
+        assert_eq!(terminal_commit_text_bytes("a\nb".to_string(), false), "a\rb".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn crlf_is_normalized_to_single_cr() {
+        assert_eq!(terminal_commit_text_bytes("a\r\nb".to_string(), false), "a\rb".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn multiple_lines_all_normalized() {
+        assert_eq!(
+            terminal_commit_text_bytes("line1\r\nline2\nline3".to_string(), false),
+            "line1\rline2\rline3".as_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn newline_normalization_happens_before_bracketed_paste_wrapping() {
+        let bytes = terminal_commit_text_bytes("a\r\nb".to_string(), true);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("a\rb"));
+        assert!(!text.contains("\r\n"));
+        assert_eq!(bytes[0], 0x1B);
+        assert_eq!(*bytes.last().unwrap(), 0x7E);
     }
 }
