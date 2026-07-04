@@ -28,6 +28,11 @@ type HmacSha256 = Hmac<Sha256>;
 /// S→C output buffer の既定上限（HELPER_PROTOCOL.md §7.4 の既定案）。
 const DEFAULT_RESUME_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
+/// `SessionTable` に同時保持できるセッション数の既定上限（Phase S-4b）。
+/// 通常運用でこれだけ同時に resume 待ちセッションが積まれることは想定しにくい
+/// ため、小さめの値にして DoS/リソース枯渇対策を優先する。
+const DEFAULT_MAX_SESSIONS: usize = 16;
+
 const EXPORTER_LABEL: &[u8] = b"isekai-helper-auth-v1";
 const ALPN: &[u8] = b"isekai-helper/1";
 
@@ -46,6 +51,8 @@ struct Args {
     idle_timeout: u64,
     resume_window: u64,
     max_idle_lifetime: u64,
+    /// `SessionTable` に同時保持できるセッション数の上限（Phase S-4b）。
+    max_sessions: usize,
     once: bool,
     log_level: String,
     /// STUN+SSHランデブー方式のP2P(TransportPreference::IsekaiStunP2pQuic)用。
@@ -84,6 +91,9 @@ fn print_help() {
     println!("    --idle-timeout <SECS>          QUIC transport idle timeout (default: 15)");
     println!("    --resume-window <SECS>         how long a parked (disconnected) session stays resumable (default: 120)");
     println!("    --max-idle-lifetime <SECS>     self-exit after this many seconds with no active connection (default: 600)");
+    println!("    --max-sessions <N>             max number of concurrently tracked resume sessions (default: {DEFAULT_MAX_SESSIONS});");
+    println!("                                   once reached, the oldest parked session is evicted to make room,");
+    println!("                                   or the new session is rejected if none are evictable (all active)");
     println!("    --once                         exit after the first connection closes");
     println!("    --stun-server <ADDR:PORT>      query this STUN server for our own observed address");
     println!("                                   (adds \"stun_observed_addr\" to the handshake JSON)");
@@ -109,6 +119,7 @@ fn parse_args() -> Result<Args> {
     // ギリギリなので余裕を持たせて120秒にしてある。
     let mut resume_window = 120u64;
     let mut max_idle_lifetime = 600u64;
+    let mut max_sessions = DEFAULT_MAX_SESSIONS;
     let mut once = false;
     let mut log_level = "info".to_string();
     let mut stun_server: Option<SocketAddr> = None;
@@ -168,6 +179,14 @@ fn parse_args() -> Result<Args> {
                     .parse()
                     .context("invalid --max-idle-lifetime value")?;
             }
+            "--max-sessions" => {
+                max_sessions = next_val(&mut iter, "--max-sessions")?
+                    .parse()
+                    .context("invalid --max-sessions value")?;
+                if max_sessions == 0 {
+                    return Err(anyhow!("--max-sessions must be at least 1"));
+                }
+            }
             "--once" => once = true,
             "--log-level" => log_level = next_val(&mut iter, "--log-level")?,
             "--version" => {
@@ -196,6 +215,7 @@ fn parse_args() -> Result<Args> {
         idle_timeout,
         resume_window,
         max_idle_lifetime,
+        max_sessions,
         once,
         log_level,
         stun_server,
@@ -370,7 +390,8 @@ async fn main() -> Result<()> {
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let idle_shutdown = Arc::new(Notify::new());
     // Phase 8: resume 可能セッションのテーブル（session_id → output buffer 等）。
-    let sessions = SessionTable::new();
+    // Phase S-4b: 同時保持数を `--max-sessions` で上限を設ける（DoS/リソース枯渇対策）。
+    let sessions = SessionTable::with_max_sessions(args.max_sessions);
 
     // Phase 8-3/8-4: park された（data stream が切れて resume 待ちの）セッションの
     // 定期掃除。`--resume-window` の長さだけ resume が来なければ TCP を close して

@@ -107,6 +107,11 @@ impl Session {
     }
 }
 
+/// 16 byte の `SessionId` を小文字16進文字列にする（ログ表示用）。
+fn hex_lower(id: &SessionId) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// helper プロセス内でアクティブな resume 可能セッションのテーブル。
 /// 各エントリは `Arc<Mutex<Session>>` で保持するため、呼び出し側は一度
 /// `get()` した handle を複数の並行タスク（C→S / S→C / control ACK 受信）で
@@ -114,12 +119,25 @@ impl Session {
 #[derive(Clone)]
 pub struct SessionTable {
     inner: Arc<Mutex<HashMap<SessionId, Arc<Mutex<Session>>>>>,
+    /// 同時に保持できるセッション数の上限（Phase S-4b）。悪意/異常な挙動の
+    /// クライアントが `resume_window` 以内に大量の新規HELLOを送り続けても、
+    /// `sweep_expired_parked` が効くまでの間にテーブルサイズ（≒メモリ使用量）が
+    /// 無制限に増えないようにする DoS/リソース枯渇対策。
+    max_sessions: usize,
 }
 
 impl SessionTable {
+    /// 上限無し（実質 `usize::MAX`）のテーブルを作る。既存テスト・
+    /// 上限を意識しない呼び出し元向けの後方互換コンストラクタ。
+    /// 本番の起動経路（`main.rs`）は `with_max_sessions` を使うこと。
     pub fn new() -> Self {
+        Self::with_max_sessions(usize::MAX)
+    }
+
+    pub fn with_max_sessions(max_sessions: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            max_sessions,
         }
     }
 
@@ -140,8 +158,59 @@ impl SessionTable {
     /// 既に中継が使い始めている `Arc<Mutex<Session>>` handle をそのまま登録する。
     /// `relay_with_resume` は control stream の accept を待たずに中継を開始する
     /// ため、`Session` は先に作成済みで、control stream 確立時にこれで登録する。
-    pub async fn insert_existing(&self, id: SessionId, handle: Arc<Mutex<Session>>) {
-        self.inner.lock().await.insert(id, handle);
+    ///
+    /// テーブルサイズが既に `max_sessions` に達している場合:
+    /// - **parked**（`parked_tcp` が `Some`、つまり data stream が切れて resume 待ち）な
+    ///   セッションのうち `parked_since` が最も古いものを1つ立ち退かせてから登録する。
+    /// - 立ち退かせられるセッションが1つも無い（全セッションがアクティブ、
+    ///   `parked_tcp` が `None`）場合は、新規登録自体を拒否する。アクティブな
+    ///   セッションは進行中の中継そのものなので、決して立ち退き対象にしない。
+    ///
+    /// 戻り値は登録できたかどうか。`false` の場合、この `id` はテーブルに
+    /// 存在しないため、以後この session に対する `RESUME` は自然に
+    /// `REJECT_UNKNOWN_SESSION` になる（＝このセッションは resume 不可のまま
+    /// 通常の中継は続く、という安全側のデグレード）。
+    pub async fn insert_existing(&self, id: SessionId, handle: Arc<Mutex<Session>>) -> bool {
+        let mut inner = self.inner.lock().await;
+        if inner.len() >= self.max_sessions && !inner.contains_key(&id) {
+            let mut oldest_parked: Option<(SessionId, std::time::Instant)> = None;
+            for (candidate_id, candidate_handle) in inner.iter() {
+                let candidate = candidate_handle.lock().await;
+                if let Some(since) = candidate.parked_since {
+                    let is_older = oldest_parked
+                        .as_ref()
+                        .map(|(_, oldest_since)| since < *oldest_since)
+                        .unwrap_or(true);
+                    if is_older {
+                        oldest_parked = Some((*candidate_id, since));
+                    }
+                }
+            }
+            match oldest_parked {
+                Some((evict_id, _)) => {
+                    if let Some(evicted) = inner.remove(&evict_id) {
+                        // parked_tcp を drop することで TCP 接続も close される。
+                        drop(evicted.lock().await.parked_tcp.take());
+                        log::warn!(
+                            "session table full (max_sessions={}), evicted oldest parked session {} to make room for {}",
+                            self.max_sessions,
+                            hex_lower(&evict_id),
+                            hex_lower(&id)
+                        );
+                    }
+                }
+                None => {
+                    log::warn!(
+                        "session table full (max_sessions={}) and no parked session to evict (all sessions active), rejecting new session {}",
+                        self.max_sessions,
+                        hex_lower(&id)
+                    );
+                    return false;
+                }
+            }
+        }
+        inner.insert(id, handle);
+        true
     }
 
     pub async fn get(&self, id: &SessionId) -> Option<Arc<Mutex<Session>>> {
@@ -179,7 +248,7 @@ impl SessionTable {
             if let Some(handle) = self.remove(&id).await {
                 // parked_tcp を drop することで TCP 接続も close される。
                 drop(handle.lock().await.parked_tcp.take());
-                log::info!("session {} expired while parked, discarded", id.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                log::info!("session {} expired while parked, discarded", hex_lower(&id));
             }
         }
     }
@@ -316,5 +385,87 @@ mod tests {
         assert!(!table.contains(&expired_id).await, "期限切れの park は破棄されるはず");
         assert!(table.contains(&fresh_id).await, "期限内の park は残るはず");
         assert!(table.contains(&active_id).await, "アクティブな session には触れないはず");
+    }
+
+    /// `max_sessions` に達した状態で新規登録すると、最も古い parked セッションが
+    /// 1つ立ち退き、新規セッションが登録できることを確認する（Phase S-4b）。
+    #[tokio::test]
+    async fn insert_existing_evicts_oldest_parked_when_full() {
+        let table = SessionTable::with_max_sessions(2);
+
+        let older_id = SessionTable::generate_session_id();
+        let mut older_session = Session::new(1024);
+        older_session.parked_tcp = Some(dummy_parked_tcp().await);
+        older_session.parked_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        table.insert_existing(older_id, Arc::new(Mutex::new(older_session))).await;
+
+        let newer_id = SessionTable::generate_session_id();
+        let mut newer_session = Session::new(1024);
+        newer_session.parked_tcp = Some(dummy_parked_tcp().await);
+        newer_session.parked_since = Some(std::time::Instant::now());
+        table.insert_existing(newer_id, Arc::new(Mutex::new(newer_session))).await;
+
+        // テーブルは既に上限(2)に達している。3つ目の登録は最も古い parked
+        // セッション(older_id)を立ち退かせた上で成功するはず。
+        let new_id = SessionTable::generate_session_id();
+        let inserted = table
+            .insert_existing(new_id, Arc::new(Mutex::new(Session::new(1024))))
+            .await;
+
+        assert!(inserted, "立ち退き後に新規セッションは登録できるはず");
+        assert!(!table.contains(&older_id).await, "最も古い parked セッションは立ち退くはず");
+        assert!(table.contains(&newer_id).await, "より新しい parked セッションは残るはず");
+        assert!(table.contains(&new_id).await, "新規セッションは登録されるはず");
+    }
+
+    /// アクティブなセッション（`parked_tcp` が `None`）は決して立ち退き対象に
+    /// ならないことを確認する。立ち退けるセッションが1つも無ければ、新規登録
+    /// 自体を拒否する（Phase S-4b の設計判断）。
+    #[tokio::test]
+    async fn insert_existing_never_evicts_active_sessions_and_rejects_when_full() {
+        let table = SessionTable::with_max_sessions(1);
+
+        let active_id = SessionTable::generate_session_id();
+        // parked_tcp/parked_since が None = 現在アクティブに中継中の session。
+        table
+            .insert_existing(active_id, Arc::new(Mutex::new(Session::new(1024))))
+            .await;
+
+        let new_id = SessionTable::generate_session_id();
+        let inserted = table
+            .insert_existing(new_id, Arc::new(Mutex::new(Session::new(1024))))
+            .await;
+
+        assert!(!inserted, "立ち退けるparkedセッションが無ければ新規登録は拒否されるはず");
+        assert!(table.contains(&active_id).await, "アクティブなセッションは立ち退き対象にならないはず");
+        assert!(!table.contains(&new_id).await, "拒否された新規セッションはテーブルに存在しないはず");
+    }
+
+    /// テーブルにアクティブなセッションと parked セッションが混在している場合、
+    /// 立ち退き対象は必ず parked の方であり、アクティブな方には触れないことを確認する。
+    #[tokio::test]
+    async fn insert_existing_evicts_parked_not_active_when_mixed() {
+        let table = SessionTable::with_max_sessions(2);
+
+        let active_id = SessionTable::generate_session_id();
+        table
+            .insert_existing(active_id, Arc::new(Mutex::new(Session::new(1024))))
+            .await;
+
+        let parked_id = SessionTable::generate_session_id();
+        let mut parked_session = Session::new(1024);
+        parked_session.parked_tcp = Some(dummy_parked_tcp().await);
+        parked_session.parked_since = Some(std::time::Instant::now());
+        table.insert_existing(parked_id, Arc::new(Mutex::new(parked_session))).await;
+
+        let new_id = SessionTable::generate_session_id();
+        let inserted = table
+            .insert_existing(new_id, Arc::new(Mutex::new(Session::new(1024))))
+            .await;
+
+        assert!(inserted);
+        assert!(table.contains(&active_id).await, "アクティブなセッションは残るはず");
+        assert!(!table.contains(&parked_id).await, "parked セッションが立ち退くはず");
+        assert!(table.contains(&new_id).await);
     }
 }

@@ -19,6 +19,10 @@ OPTIONS:
   --resume-window <SECS>        park された（data stream が切れて resume 待ちの）セッションを
                                  保持する時間。これを過ぎたら破棄する（既定: 120。Phase 8-4b 参照）
   --max-idle-lifetime <SECS>    アクティブな接続が無く、かつ新規接続も来ない状態が続いたら自己終了するまでの秒数（既定: 600）
+  --max-sessions <N>            同時に保持できる resume 可能セッション数の上限（既定: 16。Phase S-4b 参照）。
+                                 上限に達した状態で新規セッションを登録する際、parked（data streamが
+                                 切れてresume待ちの）セッションのうち最も古いものを1つ立ち退かせる。
+                                 立ち退けるセッションが無ければ（全セッションがアクティブ）新規登録を拒否する
   --once                        1回の接続が終了したら常駐せず終了する（既定は常駐し、次の接続を待つ）
   --stun-server <ADDR:PORT>     STUN(RFC 5389)サーバーへ問い合わせ、自分の観測アドレスを
                                 ハンドシェイクJSONの `stun_observed_addr` に含める
@@ -49,6 +53,18 @@ OPTIONS:
 - `--max-idle-lifetime`（旧称 `--max-lifetime-idle` から改称。意味を明確化）: 起動直後だけでなく
   **各接続終了後にもこの idle timer を再開する**。「1回だけ接続が来て、その後は誰も繋がずに
   永遠にプロセスが残り続ける」事故を防ぐため、常に「アクティブ接続が無い期間」を計測する。
+- `--max-sessions`（Phase S-4b）: `--resume-window`（既定120秒）・`OutputBuffer` の容量上限は
+  既にセッション単体のリソースを制限しているが、テーブルに登録できる**セッション数自体**には
+  上限が無かった。悪意/異常な挙動のクライアントが `resume-window` 以内に大量の新規HELLOを
+  送り続けると、`sweep_expired_parked` が効くまでの間にセッション数（≒メモリ使用量）が
+  無制限に増え得る。この上限を超えた際の挙動は「立ち退き優先、全滅時のみ拒否」とした:
+  parked（`parked_tcp` が `Some`）セッションは進行中の中継が無い＝失っても resume が
+  次回 `REJECT_UNKNOWN_SESSION` になるだけで実害が小さいため、`parked_since` が最も古い
+  ものから順に立ち退かせる。一方、アクティブなセッション（`parked_tcp` が `None`、＝
+  今まさに中継が進行中）は、進行中の SSH セッションを強制切断することになるため
+  **決して立ち退き対象にしない**。その結果、全セッションがアクティブで空きが無ければ
+  新規登録そのものを拒否する（この場合も、拒否された接続自体の中継は継続する。単に
+  resume 不可のまま扱われるだけで、`RESUME` を試みれば自然に `REJECT_UNKNOWN_SESSION` になる）。
 - `--stun-server`/`--punch-peer`（Phase 10、STUN+SSHランデブー方式のP2P用）: `--punch-peer` の値を
   **stdin経由の対話的なやり取りで渡さない**のは、isekai-helperが`setsid`で即座にデタッチされ
   stdinが`/dev/null`にリダイレクトされる（後述のSSH起動例参照）ため、そもそも対話的なやり取りが
@@ -408,6 +424,8 @@ Phase 8 固有の意味を追加する）:
   `session_id` を無効化する。
 - 1 つの `session_id` に対して同時に有効な data stream は 1 本のみ（Phase 7 の active slot 概念を
   session 単位に引き継ぐ）。
+- helper プロセス全体で同時に保持できる `session_id` の数自体にも `--max-sessions`（既定16、
+  Phase S-4b）で上限がある。詳細・立ち退き/拒否の設計判断は「1. CLI 契約」節の該当箇所を参照。
 - **`--idle-timeout`（QUIC transport の生存確認）と `--resume-window`（park セッションの保持時間）は
   意図的に別の値にしてある**（Phase 8-4b、実機検証で発見）。当初はこの2つを同じ値で共用していたが、
   client が QUIC connection の喪失を検知するまでの時間（`--idle-timeout` 待ち + PTO 再送、実測で
