@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- overall composition scaled up ~10% to raise 48dp occupancy -->
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:scaleX="1.1"
+        android:scaleY="1.1">
+
+        <!-- portal ring: purple -> teal sweep gradient, drawn as a filled donut (evenOdd), thickened.
+             Rotated so both hues stay visible beside the glyph instead of hiding behind it. -->
+        <group
+            android:pivotX="54"
+            android:pivotY="54"
+            android:rotation="135">
+            <path
+                android:pathData="M82,54 A28,28 0 1,0 26,54 A28,28 0 1,0 82,54 Z M76,54 A22,22 0 1,1 32,54 A22,22 0 1,1 76,54 Z"
+                android:fillType="evenOdd">
+                <aapt:attr name="android:fillColor">
+                    <gradient
+                        android:type="sweep"
+                        android:centerX="54"
+                        android:centerY="54"
+                        android:startColor="#8A5CF6"
+                        android:centerColor="#34D8C8"
+                        android:endColor="#8A5CF6" />
+                </aapt:attr>
+            </path>
+        </group>
+
+        <!-- sparkle (single), pulled slightly inward and smaller so it stays clear of mask edges -->
+        <path
+            android:pathData="M33,27.75 L34.02,30.98 L37.25,32 L34.02,33.02 L33,36.25 L31.98,33.02 L28.75,32 L31.98,30.98 Z"
+            android:fillColor="#F2FBFF"
+            android:fillAlpha="0.85" />
+
+        <!-- ">_" glyph, scaled up ~4% in place for 48dp presence -->
+        <group
+            android:pivotX="57"
+            android:pivotY="54"
+            android:scaleX="1.04"
+            android:scaleY="1.04">
+
+            <!-- terminal cursor: ">" chevron, thickened -->
+            <path
+                android:pathData="M43,39 L57,54 L43,69"
+                android:fillColor="#00000000"
+                android:strokeColor="#F5FFFB"
+                android:strokeWidth="8.1"
+                android:strokeLineCap="round"
+                android:strokeLineJoin="round" />
+
+            <!-- terminal cursor: "_" block, thicker and shorter for contrast with the chevron -->
+            <path
+                android:pathData="M64.25,60.25 L69.75,60.25 A3.75,3.75 0 0,1 69.75,67.75 L64.25,67.75 A3.75,3.75 0 0,1 64.25,60.25 Z"
+                android:fillColor="#F5FFFB" />
+        </group>
+    </group>
+</vector>

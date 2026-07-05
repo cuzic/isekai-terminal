@@ -1,0 +1,218 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="tools.isekai.terminal"
+4    android:versionCode="1"
+5    android:versionName="1.0" >
+6
+7    <uses-sdk
+8        android:minSdkVersion="28"
+9        android:targetSdkVersion="36" />
+10
+11    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+11-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:4:5-77
+11-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:4:22-74
+12    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+12-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:5:5-87
+12-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:5:22-84
+13    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+13-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:6:5-77
+13-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:6:22-74
+14    <uses-permission android:name="android.permission.INTERNET" />
+14-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:7:5-67
+14-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:7:22-64
+15    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+15-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:8:5-79
+15-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:8:22-76
+16    <!--
+17 Phase 9-4（実験的機能、既定OFF）: Wi-Fi/セルラー物理無線への同時マルチパスの
+18         ためのrequestNetwork()。プロファイルでオプトインしない限り実際には使われない。
+19    -->
+20    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+20-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:11:5-79
+20-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:11:22-76
+21
+22    <permission
+22-->[androidx.core:core:1.16.0] /home/cuzic/.gradle/caches/8.13/transforms/f59bc561d8608404128bbf2586ef6582/transformed/core-1.16.0/AndroidManifest.xml:22:5-24:47
+23        android:name="tools.isekai.terminal.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+23-->[androidx.core:core:1.16.0] /home/cuzic/.gradle/caches/8.13/transforms/f59bc561d8608404128bbf2586ef6582/transformed/core-1.16.0/AndroidManifest.xml:23:9-81
+24        android:protectionLevel="signature" />
+24-->[androidx.core:core:1.16.0] /home/cuzic/.gradle/caches/8.13/transforms/f59bc561d8608404128bbf2586ef6582/transformed/core-1.16.0/AndroidManifest.xml:24:9-44
+25
+26    <uses-permission android:name="tools.isekai.terminal.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" />
+26-->[androidx.core:core:1.16.0] /home/cuzic/.gradle/caches/8.13/transforms/f59bc561d8608404128bbf2586ef6582/transformed/core-1.16.0/AndroidManifest.xml:26:5-97
+26-->[androidx.core:core:1.16.0] /home/cuzic/.gradle/caches/8.13/transforms/f59bc561d8608404128bbf2586ef6582/transformed/core-1.16.0/AndroidManifest.xml:26:22-94
+27    <!--
+28 CHANGE_NETWORK_STATE (needed by NoqDualFdMultipathSpikeTest's
+29         requestNetwork(TRANSPORT_CELLULAR)) is now granted via the main manifest
+30         (Phase 9-4, PhysicalPathProvider), so it no longer needs to be declared here.
+31    -->
+32    <application
+32-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:13:5-35:19
+33        android:name="tools.isekai.terminal.IsekaiTerminalApplication"
+33-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:14:9-50
+34        android:allowBackup="true"
+34-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:15:9-35
+35        android:appComponentFactory="androidx.core.app.CoreComponentFactory"
+35-->[androidx.core:core:1.16.0] /home/cuzic/.gradle/caches/8.13/transforms/f59bc561d8608404128bbf2586ef6582/transformed/core-1.16.0/AndroidManifest.xml:28:18-86
+36        android:debuggable="true"
+37        android:extractNativeLibs="false"
+38        android:icon="@mipmap/ic_launcher"
+38-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:16:9-43
+39        android:label="@string/app_name"
+39-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:18:9-41
+40        android:networkSecurityConfig="@xml/network_security_config"
+40-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:20:9-69
+41        android:roundIcon="@mipmap/ic_launcher_round"
+41-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:17:9-54
+42        android:supportsRtl="true"
+42-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:19:9-35
+43        android:theme="@android:style/Theme.Material.Light.NoActionBar" >
+43-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:21:9-72
+44        <receiver
+44-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:8:9-18:20
+45            android:name="tools.isekai.terminal.debug.FaultInjectionReceiver"
+45-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:9:13-57
+46            android:exported="true" >
+46-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:10:13-36
+47            <intent-filter>
+47-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:11:13-17:29
+48                <action android:name="tools.isekai.terminal.debug.SET_LATENCY" />
+48-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:12:17-82
+48-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:12:25-79
+49                <action android:name="tools.isekai.terminal.debug.SET_LOSS" />
+49-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:13:17-79
+49-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:13:25-76
+50                <action android:name="tools.isekai.terminal.debug.CUT" />
+50-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:14:17-74
+50-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:14:25-71
+51                <action android:name="tools.isekai.terminal.debug.RESTORE" />
+51-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:15:17-78
+51-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:15:25-75
+52                <action android:name="tools.isekai.terminal.debug.CLEAR" />
+52-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:16:17-76
+52-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/debug/AndroidManifest.xml:16:25-73
+53            </intent-filter>
+54        </receiver>
+55
+56        <activity
+56-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:22:9-30:20
+57            android:name="tools.isekai.terminal.MainActivity"
+57-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:23:13-41
+58            android:exported="true"
+58-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:24:13-36
+59            android:windowSoftInputMode="adjustResize" >
+59-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:25:13-55
+60            <intent-filter>
+60-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:26:13-29:29
+61                <action android:name="android.intent.action.MAIN" />
+61-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:27:17-69
+61-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:27:25-66
+62
+63                <category android:name="android.intent.category.LAUNCHER" />
+63-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:28:17-77
+63-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:28:27-74
+64            </intent-filter>
+65        </activity>
+66
+67        <service
+67-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:31:9-34:56
+68            android:name="tools.isekai.terminal.TerminalSessionService"
+68-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:32:13-51
+69            android:exported="false"
+69-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:33:13-37
+70            android:foregroundServiceType="dataSync" />
+70-->/home/cuzic/isekai-terminal/.claude/worktrees/ios-phase1/android/src/main/AndroidManifest.xml:34:13-53
+71
+72        <activity
+72-->[androidx.compose.ui:ui-tooling-android:1.9.0] /home/cuzic/.gradle/caches/8.13/transforms/45c0719db233d2605cb0c5fd87c54840/transformed/ui-tooling/AndroidManifest.xml:23:9-25:39
+73            android:name="androidx.compose.ui.tooling.PreviewActivity"
+73-->[androidx.compose.ui:ui-tooling-android:1.9.0] /home/cuzic/.gradle/caches/8.13/transforms/45c0719db233d2605cb0c5fd87c54840/transformed/ui-tooling/AndroidManifest.xml:24:13-71
+74            android:exported="true" />
+74-->[androidx.compose.ui:ui-tooling-android:1.9.0] /home/cuzic/.gradle/caches/8.13/transforms/45c0719db233d2605cb0c5fd87c54840/transformed/ui-tooling/AndroidManifest.xml:25:13-36
+75
+76        <provider
+76-->[androidx.emoji2:emoji2:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/e125573127cbe275843e1cc9e4442768/transformed/emoji2-1.4.0/AndroidManifest.xml:24:9-32:20
+77            android:name="androidx.startup.InitializationProvider"
+77-->[androidx.emoji2:emoji2:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/e125573127cbe275843e1cc9e4442768/transformed/emoji2-1.4.0/AndroidManifest.xml:25:13-67
+78            android:authorities="tools.isekai.terminal.androidx-startup"
+78-->[androidx.emoji2:emoji2:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/e125573127cbe275843e1cc9e4442768/transformed/emoji2-1.4.0/AndroidManifest.xml:26:13-68
+79            android:exported="false" >
+79-->[androidx.emoji2:emoji2:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/e125573127cbe275843e1cc9e4442768/transformed/emoji2-1.4.0/AndroidManifest.xml:27:13-37
+80            <meta-data
+80-->[androidx.emoji2:emoji2:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/e125573127cbe275843e1cc9e4442768/transformed/emoji2-1.4.0/AndroidManifest.xml:29:13-31:52
+81                android:name="androidx.emoji2.text.EmojiCompatInitializer"
+81-->[androidx.emoji2:emoji2:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/e125573127cbe275843e1cc9e4442768/transformed/emoji2-1.4.0/AndroidManifest.xml:30:17-75
+82                android:value="androidx.startup" />
+82-->[androidx.emoji2:emoji2:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/e125573127cbe275843e1cc9e4442768/transformed/emoji2-1.4.0/AndroidManifest.xml:31:17-49
+83            <meta-data
+83-->[androidx.lifecycle:lifecycle-process:2.9.4] /home/cuzic/.gradle/caches/8.13/transforms/845c1b7c5dda7e4e4e5373150d157ab4/transformed/lifecycle-process-2.9.4/AndroidManifest.xml:29:13-31:52
+84                android:name="androidx.lifecycle.ProcessLifecycleInitializer"
+84-->[androidx.lifecycle:lifecycle-process:2.9.4] /home/cuzic/.gradle/caches/8.13/transforms/845c1b7c5dda7e4e4e5373150d157ab4/transformed/lifecycle-process-2.9.4/AndroidManifest.xml:30:17-78
+85                android:value="androidx.startup" />
+85-->[androidx.lifecycle:lifecycle-process:2.9.4] /home/cuzic/.gradle/caches/8.13/transforms/845c1b7c5dda7e4e4e5373150d157ab4/transformed/lifecycle-process-2.9.4/AndroidManifest.xml:31:17-49
+86            <meta-data
+86-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:29:13-31:52
+87                android:name="androidx.profileinstaller.ProfileInstallerInitializer"
+87-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:30:17-85
+88                android:value="androidx.startup" />
+88-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:31:17-49
+89        </provider>
+90
+91        <activity
+91-->[androidx.compose.ui:ui-test-manifest:1.9.0] /home/cuzic/.gradle/caches/8.13/transforms/4572ba228c855177546ba0dc675f6d7f/transformed/ui-test-manifest-1.9.0/AndroidManifest.xml:23:9-26:79
+92            android:name="androidx.activity.ComponentActivity"
+92-->[androidx.compose.ui:ui-test-manifest:1.9.0] /home/cuzic/.gradle/caches/8.13/transforms/4572ba228c855177546ba0dc675f6d7f/transformed/ui-test-manifest-1.9.0/AndroidManifest.xml:24:13-63
+93            android:exported="true"
+93-->[androidx.compose.ui:ui-test-manifest:1.9.0] /home/cuzic/.gradle/caches/8.13/transforms/4572ba228c855177546ba0dc675f6d7f/transformed/ui-test-manifest-1.9.0/AndroidManifest.xml:25:13-36
+94            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+94-->[androidx.compose.ui:ui-test-manifest:1.9.0] /home/cuzic/.gradle/caches/8.13/transforms/4572ba228c855177546ba0dc675f6d7f/transformed/ui-test-manifest-1.9.0/AndroidManifest.xml:26:13-76
+95
+96        <service
+96-->[androidx.room:room-runtime-android:2.7.1] /home/cuzic/.gradle/caches/8.13/transforms/89a1c9159326fa92bba191922b3ec0b2/transformed/room-runtime-release/AndroidManifest.xml:24:9-28:63
+97            android:name="androidx.room.MultiInstanceInvalidationService"
+97-->[androidx.room:room-runtime-android:2.7.1] /home/cuzic/.gradle/caches/8.13/transforms/89a1c9159326fa92bba191922b3ec0b2/transformed/room-runtime-release/AndroidManifest.xml:25:13-74
+98            android:directBootAware="true"
+98-->[androidx.room:room-runtime-android:2.7.1] /home/cuzic/.gradle/caches/8.13/transforms/89a1c9159326fa92bba191922b3ec0b2/transformed/room-runtime-release/AndroidManifest.xml:26:13-43
+99            android:exported="false" />
+99-->[androidx.room:room-runtime-android:2.7.1] /home/cuzic/.gradle/caches/8.13/transforms/89a1c9159326fa92bba191922b3ec0b2/transformed/room-runtime-release/AndroidManifest.xml:27:13-37
+100
+101        <receiver
+101-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:34:9-52:20
+102            android:name="androidx.profileinstaller.ProfileInstallReceiver"
+102-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:35:13-76
+103            android:directBootAware="false"
+103-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:36:13-44
+104            android:enabled="true"
+104-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:37:13-35
+105            android:exported="true"
+105-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:38:13-36
+106            android:permission="android.permission.DUMP" >
+106-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:39:13-57
+107            <intent-filter>
+107-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:40:13-42:29
+108                <action android:name="androidx.profileinstaller.action.INSTALL_PROFILE" />
+108-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:41:17-91
+108-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:41:25-88
+109            </intent-filter>
+110            <intent-filter>
+110-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:43:13-45:29
+111                <action android:name="androidx.profileinstaller.action.SKIP_FILE" />
+111-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:44:17-85
+111-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:44:25-82
+112            </intent-filter>
+113            <intent-filter>
+113-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:46:13-48:29
+114                <action android:name="androidx.profileinstaller.action.SAVE_PROFILE" />
+114-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:47:17-88
+114-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:47:25-85
+115            </intent-filter>
+116            <intent-filter>
+116-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:49:13-51:29
+117                <action android:name="androidx.profileinstaller.action.BENCHMARK_OPERATION" />
+117-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:50:17-95
+117-->[androidx.profileinstaller:profileinstaller:1.4.0] /home/cuzic/.gradle/caches/8.13/transforms/19240ee85b2782d7e25b6cbf78a3f31e/transformed/profileinstaller-1.4.0/AndroidManifest.xml:50:25-92
+118            </intent-filter>
+119        </receiver>
+120    </application>
+121
+122</manifest>

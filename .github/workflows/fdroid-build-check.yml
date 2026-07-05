@@ -12,7 +12,7 @@ on:
     branches: [main]
     paths:
       - "fdroid/tools.isekai.terminal.yml"
-      - "app/**"
+      - "android/**"
       - "rust-core/**"
       - "build.gradle.kts"
       - "settings.gradle.kts"
@@ -22,7 +22,7 @@ on:
   pull_request:
     paths:
       - "fdroid/tools.isekai.terminal.yml"
-      - "app/**"
+      - "android/**"
       - "rust-core/**"
       - "build.gradle.kts"
       - "settings.gradle.kts"
@@ -120,5 +120,5 @@ jobs:
 
       - name: Verify an APK was produced
         run: |
-          find app/build/outputs/apk -name "*.apk" -print -exec ls -la {} \;
-          test -n "$(find app/build/outputs/apk -name '*.apk')"
+          find android/build/outputs/apk -name "*.apk" -print -exec ls -la {} \;
+          test -n "$(find android/build/outputs/apk -name '*.apk')"
