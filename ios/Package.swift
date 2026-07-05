@@ -4,34 +4,34 @@ import PackageDescription
 // SwiftPMはbinaryTarget(.xcframework)の実体存在チェックを、そのターゲットが
 // 実際にビルドグラフに含まれるかどうかに関係なくマニフェスト読み込み時に行う。
 // また`swift test`は宣言されている全testTargetを1つのテストプロダクトへ
-// まとめてビルドしようとするため、`TsshCore`/`TsshCoreTests`(UIKit/SwiftUI/
+// まとめてビルドしようとするため、`IsekaiTerminalCore`/`IsekaiTerminalCoreTests`(UIKit/SwiftUI/
 // GRDB/CryptoKit依存)がマニフェストに存在するだけでLinux上の`swift test`が
 // 巻き込まれて失敗する。そのため`#if os(Linux)`でマニフェスト自体から
 // Apple専用ターゲットの宣言を丸ごと出し分ける(このディレクティブはクロス
 // コンパイル先ではなく、`swift build`/`swift test`を実行しているホストOSで
-// 評価される)。Linux上では`TsshCoreLogic`/`TsshCoreLogicTests`だけが存在する
+// 評価される)。Linux上では`IsekaiTerminalCoreLogic`/`IsekaiTerminalCoreLogicTests`だけが存在する
 // パッケージとして解決される。
 #if os(Linux)
 let ffiTargets: [Target] = [
     // rust-core/scripts/build-linux-swift-ffi.sh が生成する(Linux専用)。
     .systemLibrary(
-        name: "TsshCoreFFILinux",
-        path: "Sources/TsshCoreFFILinux"
+        name: "IsekaiTerminalCoreFFILinux",
+        path: "Sources/IsekaiTerminalCoreFFILinux"
     ),
 ]
 let logicFFIDependencies: [Target.Dependency] = [
-    .target(name: "TsshCoreFFILinux"),
+    .target(name: "IsekaiTerminalCoreFFILinux"),
     .product(name: "Crypto", package: "swift-crypto"),
 ]
-let tsshCoreLogicLinkerSettings: [LinkerSetting] = [
+let isekaiTerminalCoreLogicLinkerSettings: [LinkerSetting] = [
     // -L(検索パス)はunsafeFlagsになりXcodeでの非ルートパッケージ利用時に解決エラーに
     // なるため使わない。`LIBRARY_PATH`/`LD_LIBRARY_PATH`環境変数側で渡す運用にする
     // (rust-core/scripts/build-linux-swift-ffi.sh のコメント、
     // .github/workflows/ios-logic-linux-check.yml 参照)。
-    .linkedLibrary("tssh_core"),
+    .linkedLibrary("isekai_terminal_core"),
 ]
 let products: [Product] = [
-    .library(name: "TsshCoreLogic", targets: ["TsshCoreLogic"]),
+    .library(name: "IsekaiTerminalCoreLogic", targets: ["IsekaiTerminalCoreLogic"]),
 ]
 let packageDependencies: [Package.Dependency] = [
     // KeyManager(ed25519生成)がLinuxで`CryptoKit`の代わりに使う。Apple platforms
@@ -44,24 +44,24 @@ let appleOnlyTargets: [Target] = []
 let ffiTargets: [Target] = [
     // rust-core/scripts/build-ios-xcframework.sh が生成する(macOS専用、Apple platforms向け)。
     // Rust静的ライブラリ + Cヘッダー/modulemapのみを格納し、UniFFI生成の
-    // Swiftソースはここに焼き込まず TsshCoreLogic ターゲット(source target)側に置く
+    // Swiftソースはここに焼き込まず IsekaiTerminalCoreLogic ターゲット(source target)側に置く
     // （Swiftコンパイラのバージョン差分の影響を減らすため）。
     .binaryTarget(
-        name: "TsshCoreFFIBinary",
-        path: "Frameworks/TsshCoreFFI.xcframework"
+        name: "IsekaiTerminalCoreFFIBinary",
+        path: "Frameworks/IsekaiTerminalCoreFFI.xcframework"
     ),
 ]
 let logicFFIDependencies: [Target.Dependency] = [
-    .target(name: "TsshCoreFFIBinary"),
+    .target(name: "IsekaiTerminalCoreFFIBinary"),
 ]
-let tsshCoreLogicLinkerSettings: [LinkerSetting] = []
+let isekaiTerminalCoreLogicLinkerSettings: [LinkerSetting] = []
 let products: [Product] = [
-    .library(name: "TsshCore", targets: ["TsshCore"]),
+    .library(name: "IsekaiTerminalCore", targets: ["IsekaiTerminalCore"]),
     // Linux(`swift test`)でも成立する、UIKit/SwiftUI/GRDB/Keychainに依存しない
     // 純ロジック層。Mozillaのrust-components-swiftと同じ考え方(Rust coreは
     // 分厚くテストし、Swift境界は薄い契約テストに絞る)で切り出した
     // (詳細はPLAN.md「Phase Y」節、iOS Linux CI導入の記録を参照)。
-    .library(name: "TsshCoreLogic", targets: ["TsshCoreLogic"]),
+    .library(name: "IsekaiTerminalCoreLogic", targets: ["IsekaiTerminalCoreLogic"]),
 ]
 let packageDependencies: [Package.Dependency] = [
     // 接続プロファイル管理(#10)のローカル永続化に使う。Android版Roomと
@@ -71,23 +71,23 @@ let packageDependencies: [Package.Dependency] = [
 ]
 let appleOnlyTargets: [Target] = [
     .target(
-        name: "TsshCore",
+        name: "IsekaiTerminalCore",
         dependencies: [
-            "TsshCoreLogic",
+            "IsekaiTerminalCoreLogic",
             .product(name: "GRDB", package: "GRDB.swift"),
         ],
-        path: "Sources/TsshCore"
+        path: "Sources/IsekaiTerminalCore"
     ),
     .testTarget(
-        name: "TsshCoreTests",
-        dependencies: ["TsshCore"],
-        path: "Tests/TsshCoreTests"
+        name: "IsekaiTerminalCoreTests",
+        dependencies: ["IsekaiTerminalCore"],
+        path: "Tests/IsekaiTerminalCoreTests"
     ),
 ]
 #endif
 
 let package = Package(
-    name: "TsshCore",
+    name: "IsekaiTerminalCore",
     // Phase 1D: NavigationStack/.navigationDestination(for:)がiOS 16+必須のため15→16へ引き上げ。
     // (Linuxビルド/テストはこの`platforms`指定の対象外であり、影響しない。)
     platforms: [.iOS(.v16)],
@@ -95,20 +95,20 @@ let package = Package(
     dependencies: packageDependencies,
     targets: ffiTargets + appleOnlyTargets + [
         .target(
-            name: "TsshCoreLogic",
+            name: "IsekaiTerminalCoreLogic",
             dependencies: logicFFIDependencies,
-            path: "Sources/TsshCoreLogic",
+            path: "Sources/IsekaiTerminalCoreLogic",
             exclude: [
-                "generated/tssh_core.swift.sha256",
-                "generated/tssh_coreFFI.h.sha256",
-                "generated/tssh_coreFFI.modulemap.sha256",
+                "generated/isekai_terminal_core.swift.sha256",
+                "generated/isekai_terminal_coreFFI.h.sha256",
+                "generated/isekai_terminal_coreFFI.modulemap.sha256",
             ],
-            linkerSettings: tsshCoreLogicLinkerSettings
+            linkerSettings: isekaiTerminalCoreLogicLinkerSettings
         ),
         .testTarget(
-            name: "TsshCoreLogicTests",
-            dependencies: ["TsshCoreLogic"],
-            path: "Tests/TsshCoreLogicTests"
+            name: "IsekaiTerminalCoreLogicTests",
+            dependencies: ["IsekaiTerminalCoreLogic"],
+            path: "Tests/IsekaiTerminalCoreLogicTests"
         ),
     ]
 )
