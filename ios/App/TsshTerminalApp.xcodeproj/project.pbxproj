@@ -13,6 +13,8 @@
 		AAAABBBBCCCC000000000018 /* TsshCore in Frameworks */ = {isa = PBXBuildFile; productRef = AAAABBBBCCCC000000000017 /* TsshCore */; };
 		AAAABBBBCCCC00000000001D /* CredentialVaultTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC00000000001C /* CredentialVaultTests.swift */; };
 		AAAABBBBCCCC000000000026 /* TsshCore in Frameworks */ = {isa = PBXBuildFile; productRef = AAAABBBBCCCC000000000017 /* TsshCore */; };
+		AAAABBBBCCCC000000000028 /* KeyListModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC000000000027 /* KeyListModelTests.swift */; };
+		AAAABBBBCCCC00000000002A /* KeyImportModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC000000000029 /* KeyImportModelTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -32,6 +34,8 @@
 		AAAABBBBCCCC000000000009 /* DiagnosticCallbackBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticCallbackBridge.swift; sourceTree = "<group>"; };
 		AAAABBBBCCCC00000000001A /* TsshTerminalAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TsshTerminalAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		AAAABBBBCCCC00000000001C /* CredentialVaultTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CredentialVaultTests.swift; sourceTree = "<group>"; };
+		AAAABBBBCCCC000000000027 /* KeyListModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyListModelTests.swift; sourceTree = "<group>"; };
+		AAAABBBBCCCC000000000029 /* KeyImportModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyImportModelTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -86,6 +90,8 @@
 			isa = PBXGroup;
 			children = (
 				AAAABBBBCCCC00000000001C /* CredentialVaultTests.swift */,
+				AAAABBBBCCCC000000000027 /* KeyListModelTests.swift */,
+				AAAABBBBCCCC000000000029 /* KeyImportModelTests.swift */,
 			);
 			path = TsshTerminalAppTests;
 			sourceTree = "<group>";
@@ -199,6 +205,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				AAAABBBBCCCC00000000001D /* CredentialVaultTests.swift in Sources */,
+				AAAABBBBCCCC000000000028 /* KeyListModelTests.swift in Sources */,
+				AAAABBBBCCCC00000000002A /* KeyImportModelTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
