@@ -34,7 +34,7 @@ public final class ProfileListModel: ObservableObject {
 
 public struct ProfileListView: View {
     @StateObject private var model: ProfileListModel
-    private let onConnect: (ConnectionProfile, String?) -> Void
+    private let onConnect: (ConnectionProfile, String?, String?) -> Void
     private let onAddProfile: () -> Void
     private let onEditProfile: (ConnectionProfile) -> Void
     private let onManageKeys: () -> Void
@@ -47,7 +47,7 @@ public struct ProfileListView: View {
     // 持たせず、呼び出し側(`body`、MainActor)で明示的に構築してもらう。
     public init(
         model: ProfileListModel,
-        onConnect: @escaping (ConnectionProfile, String?) -> Void,
+        onConnect: @escaping (ConnectionProfile, String?, String?) -> Void,
         onAddProfile: @escaping () -> Void,
         onEditProfile: @escaping (ConnectionProfile) -> Void,
         onManageKeys: @escaping () -> Void,
@@ -72,10 +72,14 @@ public struct ProfileListView: View {
                 ProfileRow(profile: profile)
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        if profile.keyEntryId == nil {
+                        // Android版ProfileListScreen.ktと同じ判断: 主接続または踏み台の
+                        // どちらかがパスワード認証ならプロンプトを出す。
+                        let needsPasswordPrompt = profile.keyEntryId == nil
+                            || (profile.usesJumpHost && profile.jumpKeyEntryId == nil)
+                        if needsPasswordPrompt {
                             model.requestPasswordConnect(profile)
                         } else {
-                            onConnect(profile, nil)
+                            onConnect(profile, nil, nil)
                         }
                     }
                     .accessibilityIdentifier("profileRow_\(profile.id.map(String.init) ?? "new")")
@@ -132,9 +136,11 @@ public struct ProfileListView: View {
             if let target = model.passwordTarget {
                 PasswordPromptView(
                     label: target.displayName,
-                    onConfirm: { password in
+                    showMainField: target.keyEntryId == nil,
+                    jumpLabel: (target.usesJumpHost && target.jumpKeyEntryId == nil) ? target.jumpHost : nil,
+                    onConfirm: { password, jumpPassword in
                         model.dismissPassword()
-                        onConnect(target, password)
+                        onConnect(target, password, jumpPassword)
                     },
                     onCancel: { model.dismissPassword() }
                 )
@@ -161,22 +167,34 @@ private struct ProfileRow: View {
     }
 }
 
-/// パスワード入力用のシンプルなシート。Android版`PasswordDialog`のMVP部分に相当
-/// (踏み台のパスワードは、iOS側にまだ踏み台の概念が無いため対象外)。
+/// パスワード入力用のシート。Android版`PasswordDialog`相当。`showMainField`が
+/// falseの場合(対象ホスト自体は鍵認証だが踏み台がパスワード認証)は踏み台分の
+/// フィールドだけを表示する。
 struct PasswordPromptView: View {
     let label: String
-    let onConfirm: (String) -> Void
+    let showMainField: Bool
+    let jumpLabel: String?
+    let onConfirm: (String, String?) -> Void
     let onCancel: () -> Void
 
     @State private var password: String = ""
+    @State private var jumpPassword: String = ""
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("「\(label)」のパスワード") {
-                    SecureField("パスワード", text: $password)
-                        .accessibilityIdentifier("passwordField")
+                if showMainField {
+                    Section("「\(label)」のパスワード") {
+                        SecureField("パスワード", text: $password)
+                            .accessibilityIdentifier("passwordField")
+                    }
+                }
+                if let jumpLabel {
+                    Section("踏み台「\(jumpLabel)」のパスワード") {
+                        SecureField("パスワード", text: $jumpPassword)
+                            .accessibilityIdentifier("jumpPasswordField")
+                    }
                 }
             }
             .navigationTitle("パスワード入力")
@@ -185,8 +203,11 @@ struct PasswordPromptView: View {
                     Button("キャンセル") { onCancel(); dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("接続") { onConfirm(password); dismiss() }
-                        .accessibilityIdentifier("passwordConfirmButton")
+                    Button("接続") {
+                        onConfirm(password, jumpLabel != nil ? jumpPassword : nil)
+                        dismiss()
+                    }
+                    .accessibilityIdentifier("passwordConfirmButton")
                 }
             }
         }
