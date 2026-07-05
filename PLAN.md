@@ -2261,6 +2261,37 @@ iOS版の主要な画面が一通り実装され、全てCI(iOS Simulator)で検
 真のUI駆動テスト(XCUITest)基盤も新設した。残る主要タスクはPhase 1C
 (SessionSupervisor・バックグラウンド配線・trzsz・resume・実機総合回帰)。
 
+## Android/iOS機能パリティのgap分析(2026-07-04、「androidで実装済機能でまだなものを洗い出して」指示)
+
+Android側の実装済み機能を網羅的に調査し(Explore agent活用)、iOS側との機能差分を
+洗い出してPhase 1E〜1Gとしてタスク化した(タスク#40〜#54)。詳細はタスクリスト参照、
+ここには要点のみ記録する。
+
+**Phase 1E(トランスポート/接続方式、影響最大)**: iOSは現状プレーンSSH直接接続のみ。
+`ConnectionProfile`にjump host/転送方式/forwards/agent forward等のフィールドが
+そもそも無い(#40でスキーマ拡張がまず必要)。ProxyJump(#41)・ポートフォワード
+-L/-R/-D(#42)・SSH agent forwarding(#43)・STUN+SSHランデブーP2P(#44)・
+MASQUE relay P2P(#45)・Tailscale⇔直接アドレスマルチパス(#46)・物理Wi-Fi/
+セルラーマルチパス(#47、実験的・低優先)。**Rust側(rust-core)はこれら全て
+既に実装済み(Android側が使用中)**なので、iOS側はUI/データモデルの配線が
+不足しているだけ。
+
+**Phase 1F(ターミナルUI polish)**: 選択/コピー・ペーストUI(#48)・フォントサイズ
+ピンチズーム(#49)・配色テーマプリセット選択UI(#50、Rust側`setTerminalTheme`は
+既存)・スクロールバックスワイプUI(#51、`scrollbackCells`/`scrollbackLen`は
+既存)・アクセサリバー拡充(^D/^Z/ペースト/定型文シート、#52)。
+
+**Phase 1G(その他)**: 定型文(Snippets)管理画面(#53)・複数タブ/複数セッション
+対応(#54、現状iOSは1画面1セッションのみ)。
+
+**パリティが取れている項目**(参考、gap分析結果): Ed25519鍵生成・パスワード/鍵
+認証・CredentialVault・ホスト鍵TOFU方式・VT100/VTEレンダリング・IME統合。
+
+**How to apply**: 優先度はユーザーとの相談次第だが、影響が最も大きいのは
+Phase 1E(トランスポート層)。ただしAndroid側でもSTUN P2P/relay P2P/物理
+マルチパスは実機未検証の実験的機能のままなので、iOS版でもこれらを「完了」の
+基準にする必要はない(Android自身がそう扱っている)。
+
 ---
 
 ## 実装順序
