@@ -1,6 +1,6 @@
 package tools.isekai.terminal.ui
 
-import uniffi.tssh_core.ScreenUpdate
+import uniffi.isekai_terminal_core.ScreenUpdate
 
 /**
  * ビューポート内の行・列（0-indexed）。

@@ -9,17 +9,17 @@ import kotlinx.parcelize.TypeParceler
 import org.json.JSONArray
 import org.json.JSONObject
 import tools.isekai.terminal.session.PhysicalMultipathFds
-import uniffi.tssh_core.ForwardType
-import uniffi.tssh_core.HelperQuicConfig
-import uniffi.tssh_core.IsekaiLinkRelayConfig
-import uniffi.tssh_core.IsekaiStunP2pConfig
-import uniffi.tssh_core.JumpConfig
-import uniffi.tssh_core.MultipathHelperQuicConfig
-import uniffi.tssh_core.PortForward
-import uniffi.tssh_core.QuicConfig
-import uniffi.tssh_core.SshAuth
-import uniffi.tssh_core.SshConfig
-import uniffi.tssh_core.TransportPreference
+import uniffi.isekai_terminal_core.ForwardType
+import uniffi.isekai_terminal_core.HelperQuicConfig
+import uniffi.isekai_terminal_core.IsekaiLinkRelayConfig
+import uniffi.isekai_terminal_core.IsekaiStunP2pConfig
+import uniffi.isekai_terminal_core.JumpConfig
+import uniffi.isekai_terminal_core.MultipathHelperQuicConfig
+import uniffi.isekai_terminal_core.PortForward
+import uniffi.isekai_terminal_core.QuicConfig
+import uniffi.isekai_terminal_core.SshAuth
+import uniffi.isekai_terminal_core.SshConfig
+import uniffi.isekai_terminal_core.TransportPreference
 
 /**
  * [PortForward] は uniffi 生成の素の data class で Parcelable ではないため、
@@ -115,7 +115,7 @@ data class ConnectionProfile(
     @ColumnInfo(name = "allow_non_loopback_forward_bind") val allowNonLoopbackForwardBind: Boolean = false,
     // Phase 12 P2-1: per-session/per-hostのterminal theme。プロファイル単位の配色既定
     // (TerminalThemes のプリセット名)。null ならアプリ全体のグローバル既定(SharedPreferences
-    // "tssh_ui")に従う。タブを開いた時点でのみ解決され、タブ内で個別に上書きもできる
+    // "isekai_terminal_ui")に従う。タブを開いた時点でのみ解決され、タブ内で個別に上書きもできる
     // (Global default → Profile default → Tab/session override、TerminalTabsViewModel参照)。
     @ColumnInfo(name = "theme_name") val themeName: String? = null,
     // 自作ヘルパーQUICの待受ポートを固定する(既定null=これまで通りOSがエフェメラル

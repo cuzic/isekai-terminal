@@ -30,7 +30,7 @@ class ProfileEditViewModel(app: Application) : AndroidViewModel(app) {
         if (_isSaving.value) return
         _isSaving.value = true
         viewModelScope.launch {
-            RemoteLogger.i("TsshProfile", "saving profile: label='${profile.label}' host=${profile.host}:${profile.port} user=${profile.username} authType=${profile.authType} keyId=${profile.keyId} id=${if (profile.id == 0L) "new" else "${profile.id}"}")
+            RemoteLogger.i("IsekaiTerminalProfile", "saving profile: label='${profile.label}' host=${profile.host}:${profile.port} user=${profile.username} authType=${profile.authType} keyId=${profile.keyId} id=${if (profile.id == 0L) "new" else "${profile.id}"}")
             Repositories.profiles.save(profile) // Room の suspend fun が内部で IO ディスパッチする
             _isSaving.value = false
             onSaved()

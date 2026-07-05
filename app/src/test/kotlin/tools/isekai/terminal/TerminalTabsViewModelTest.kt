@@ -22,7 +22,7 @@ import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.session.TerminalSession
-import uniffi.tssh_core.TransportPreference
+import uniffi.isekai_terminal_core.TransportPreference
 
 /**
  * 複数タブ (複数 SSH セッション) を横断する [TerminalTabsViewModel] のテスト。

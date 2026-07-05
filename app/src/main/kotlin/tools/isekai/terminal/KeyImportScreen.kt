@@ -34,8 +34,8 @@ fun KeyImportScreen(
     ) { uri ->
         selectedUri = uri
         selectedFileName = uri?.lastPathSegment ?: uri?.let { "選択済み" }
-        if (uri != null) RemoteLogger.i("TsshKey", "file selected via SAF: $selectedFileName uri=$uri")
-        else RemoteLogger.i("TsshKey", "SAF file picker cancelled")
+        if (uri != null) RemoteLogger.i("IsekaiTerminalKey", "file selected via SAF: $selectedFileName uri=$uri")
+        else RemoteLogger.i("IsekaiTerminalKey", "SAF file picker cancelled")
     }
 
     Column(
@@ -87,7 +87,7 @@ fun KeyImportScreen(
                         vm.setError("ラベルを入力してください")
                         return@Button
                     }
-                    RemoteLogger.i("TsshKey", "import start: label='$label' file='$selectedFileName'")
+                    RemoteLogger.i("IsekaiTerminalKey", "import start: label='$label' file='$selectedFileName'")
                     vm.importKey(uri, label) { onSave() }
                 },
                 enabled = !isSaving,

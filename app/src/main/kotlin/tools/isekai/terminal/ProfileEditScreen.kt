@@ -46,9 +46,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.util.RemoteLogger
-import uniffi.tssh_core.ForwardType
-import uniffi.tssh_core.PortForward
-import uniffi.tssh_core.TransportPreference
+import uniffi.isekai_terminal_core.ForwardType
+import uniffi.isekai_terminal_core.PortForward
+import uniffi.isekai_terminal_core.TransportPreference
 
 /**
  * ポートフォワード編集欄用の入力中ドラフト([PortForward] は bindPort/remotePort が
@@ -857,7 +857,7 @@ fun ProfileEditScreen(
                 enabled = canSave && !isSaving,
             ) { Text("保存") }
             OutlinedButton(onClick = {
-                RemoteLogger.i("TsshProfile", "cancelled profile edit (${if (profile == null) "new" else "id=${profile.id} '${profile.label}'"})")
+                RemoteLogger.i("IsekaiTerminalProfile", "cancelled profile edit (${if (profile == null) "new" else "id=${profile.id} '${profile.label}'"})")
                 onCancel()
             }) { Text("キャンセル") }
         }

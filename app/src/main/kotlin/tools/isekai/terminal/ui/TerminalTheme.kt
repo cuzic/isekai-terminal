@@ -7,7 +7,7 @@ import androidx.compose.ui.graphics.toArgb
  * ターミナル配色テーマ（プリセット選択・永続化 案C）。
  *
  * SGR 解釈テーブル自体は Rust 側（`rust-core/src/theme.rs`）がグローバル状態として保持し、
- * `uniffi.tssh_core.setTerminalTheme` 経由で差し替える。このクラスは Kotlin 側での
+ * `uniffi.isekai_terminal_core.setTerminalTheme` 経由で差し替える。このクラスは Kotlin 側での
  * プリセット定義・永続化キー・Rust に渡す ARGB への変換のみを担う。
  *
  * 呼び出し以降にパースされる SGR にのみ反映され、既に scrollback に積まれた行は
@@ -31,7 +31,7 @@ data class TerminalTheme(
 
 private fun Color.toArgbUInt(): UInt = toArgb().toUInt()
 
-/** [uniffi.tssh_core.setTerminalTheme]/[tools.isekai.terminal.session.TerminalSession.setTheme]
+/** [uniffi.isekai_terminal_core.setTerminalTheme]/[tools.isekai.terminal.session.TerminalSession.setTheme]
  *  など、`(ansi16Argb, foregroundArgb, backgroundArgb)` の3引数を取るsetterへ、[TerminalTheme]の
  *  ARGB変換を共通の形で渡すためのヘルパー(呼び出し側の配線都合であり、テーマデータ自体の
  *  責務ではないためTerminalThemeのメンバーではなく独立した拡張関数にしている)。 */
@@ -39,7 +39,7 @@ fun TerminalTheme.applyTo(setter: (ansi16: List<UInt>, foreground: UInt, backgro
     setter(ansi16Argb(), foregroundArgb(), backgroundArgb())
 
 object TerminalThemes {
-    /** `SharedPreferences("tssh_ui")` に保存するテーマ名のキー */
+    /** `SharedPreferences("isekai_terminal_ui")` に保存するテーマ名のキー */
     const val PREF_KEY = "terminal_theme"
 
     // 既定ダーク: rust-core/src/theme.rs の Theme::default() と同じ値を維持する

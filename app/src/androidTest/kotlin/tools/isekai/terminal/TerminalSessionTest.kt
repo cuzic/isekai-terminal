@@ -14,9 +14,9 @@ import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
-import uniffi.tssh_core.ScreenUpdate
-import uniffi.tssh_core.SshAuth
-import uniffi.tssh_core.SshConfig
+import uniffi.isekai_terminal_core.ScreenUpdate
+import uniffi.isekai_terminal_core.SshAuth
+import uniffi.isekai_terminal_core.SshConfig
 
 /**
  * TerminalSession の動作テスト。

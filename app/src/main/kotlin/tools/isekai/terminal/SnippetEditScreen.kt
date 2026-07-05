@@ -163,7 +163,7 @@ fun SnippetEditScreen(
                 enabled = canSave && !isSaving,
             ) { Text("保存") }
             OutlinedButton(onClick = {
-                RemoteLogger.i("TsshSnippet", "cancelled snippet edit (${if (snippet == null) "new" else "id=${snippet.id} '${snippet.label}'"})")
+                RemoteLogger.i("IsekaiTerminalSnippet", "cancelled snippet edit (${if (snippet == null) "new" else "id=${snippet.id} '${snippet.label}'"})")
                 onCancel()
             }) { Text("キャンセル") }
         }

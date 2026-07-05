@@ -27,7 +27,7 @@ class ProfileListViewModel(app: Application) : AndroidViewModel(app) {
     fun loadProfiles() {
         viewModelScope.launch(Dispatchers.IO) {
             val list = Repositories.profiles.getAll()
-            RemoteLogger.i("TsshProfile", "loaded ${list.size} profile(s): ${list.map { "'${it.label}'" }}")
+            RemoteLogger.i("IsekaiTerminalProfile", "loaded ${list.size} profile(s): ${list.map { "'${it.label}'" }}")
             _profiles.value = list
         }
     }
@@ -40,7 +40,7 @@ class ProfileListViewModel(app: Application) : AndroidViewModel(app) {
     fun confirmDelete(profile: ConnectionProfile) {
         _deleteTarget.value = null
         viewModelScope.launch(Dispatchers.IO) {
-            RemoteLogger.i("TsshProfile", "deleted profile id=${profile.id} '${profile.label}'")
+            RemoteLogger.i("IsekaiTerminalProfile", "deleted profile id=${profile.id} '${profile.label}'")
             Repositories.profiles.delete(profile)
             loadProfiles()
         }

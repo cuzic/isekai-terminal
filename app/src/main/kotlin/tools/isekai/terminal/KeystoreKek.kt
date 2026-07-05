@@ -16,7 +16,7 @@ object KeystoreKek {
     // 個人利用アプリとしては使用時認証の要件が厳しすぎた（30秒の有効期限切れで
     // 常に UserNotAuthenticatedException になる UX 上の欠陥があった）。
     // v2 では使用時認証を要求せず、Keystore による保存時保護のみに変更。
-    private const val KEY_ALIAS = "tssh_kek_v2"
+    private const val KEY_ALIAS = "isekai_terminal_kek_v2"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
     private const val GCM_TAG_LENGTH = 128
 

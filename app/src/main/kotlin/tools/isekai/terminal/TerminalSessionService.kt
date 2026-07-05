@@ -107,7 +107,7 @@ class TerminalSessionService : Service() {
 
     companion object {
         const val EXTRA_SESSION_LABEL = "session_label"
-        private const val CHANNEL_ID = "tssh_session_main"
+        private const val CHANNEL_ID = "isekai_terminal_session_main"
         private const val NOTIFICATION_ID = 1002
     }
 }

@@ -59,20 +59,20 @@ android {
 val rustCoreDir = rootProject.file("rust-core")
 
 val cargoBuildRustCore = tasks.register<Exec>("cargoBuildRustCore") {
-    description = "Cross-compiles the Rust tssh-core native library for arm64-v8a via cargo/NDK."
+    description = "Cross-compiles the Rust isekai-terminal-core native library for arm64-v8a via cargo/NDK."
     workingDir = rustCoreDir
-    commandLine("cargo", "build", "--release", "--target", "aarch64-linux-android", "-p", "tssh-core")
+    commandLine("cargo", "build", "--release", "--target", "aarch64-linux-android", "-p", "isekai-terminal-core")
     inputs.dir(rustCoreDir.resolve("src"))
     inputs.file(rustCoreDir.resolve("Cargo.toml"))
     inputs.file(rustCoreDir.resolve("Cargo.lock"))
     inputs.dir(rustCoreDir.resolve(".cargo"))
-    outputs.file(rustCoreDir.resolve("target/aarch64-linux-android/release/libtssh_core.so"))
+    outputs.file(rustCoreDir.resolve("target/aarch64-linux-android/release/libisekai_terminal_core.so"))
 }
 
 val copyRustCoreJniLibs = tasks.register<Copy>("copyRustCoreJniLibs") {
-    description = "Copies the cross-compiled tssh-core .so into jniLibs/arm64-v8a."
+    description = "Copies the cross-compiled isekai-terminal-core .so into jniLibs/arm64-v8a."
     dependsOn(cargoBuildRustCore)
-    from(rustCoreDir.resolve("target/aarch64-linux-android/release/libtssh_core.so"))
+    from(rustCoreDir.resolve("target/aarch64-linux-android/release/libisekai_terminal_core.so"))
     into("src/main/jniLibs/arm64-v8a")
 }
 

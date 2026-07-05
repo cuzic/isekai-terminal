@@ -2,7 +2,7 @@ package tools.isekai.terminal
 
 import tools.isekai.terminal.session.HostKeyChecker
 import tools.isekai.terminal.session.HostKeyDecision
-import uniffi.tssh_core.*
+import uniffi.isekai_terminal_core.*
 
 /**
  * テスト用フェイク SessionOrchestrator。

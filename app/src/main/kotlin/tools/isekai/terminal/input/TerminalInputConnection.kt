@@ -28,7 +28,7 @@ class TerminalInputConnection(
         if (str.isNotEmpty()) {
             val codePoints = str.codePointCount(0, str.length)
             if (codePoints > 1 && view.bracketedPasteMode)
-                RemoteLogger.i("TsshIME", "paste $codePoints codepoints → bracketed paste")
+                RemoteLogger.i("IsekaiTerminalIME", "paste $codePoints codepoints → bracketed paste")
             view.onSendBytes?.invoke(TerminalKeyEncoder.commitTextBytes(str, view.bracketedPasteMode))
         }
         return super.commitText(text, newCursorPosition)
@@ -36,7 +36,7 @@ class TerminalInputConnection(
 
     override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
         val newText = text?.toString() ?: ""
-        RemoteLogger.d("TsshIME", "composing: '${newText.take(10)}'")
+        RemoteLogger.d("IsekaiTerminalIME", "composing: '${newText.take(10)}'")
         view.onComposingText?.invoke(newText)
         return super.setComposingText(text, newCursorPosition)
     }
@@ -45,7 +45,7 @@ class TerminalInputConnection(
         val pending = composingText()
         view.onComposingText?.invoke("")
         if (pending.isNotEmpty()) {
-            RemoteLogger.d("TsshIME", "composing finish: '${pending.take(20)}' (${pending.length} chars) → sent")
+            RemoteLogger.d("IsekaiTerminalIME", "composing finish: '${pending.take(20)}' (${pending.length} chars) → sent")
             view.onSendBytes?.invoke(pending.toByteArray(Charsets.UTF_8))
         }
         return super.finishComposingText()

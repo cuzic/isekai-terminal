@@ -3,7 +3,7 @@
 
 @file:Suppress("NAME_SHADOWING")
 
-package uniffi.tssh_core
+package uniffi.isekai_terminal_core
 
 // Common helper code.
 //
@@ -66,7 +66,7 @@ open class RustBuffer : Structure() {
     companion object {
         internal fun alloc(size: ULong = 0UL) = uniffiRustCall() { status ->
             // Note: need to convert the size to a `Long` value to make this work with JVM.
-            UniffiLib.ffi_tssh_core_rustbuffer_alloc(size.toLong(), status)
+            UniffiLib.ffi_isekai_terminal_core_rustbuffer_alloc(size.toLong(), status)
         }.also {
             if(it.data == null) {
                throw RuntimeException("RustBuffer.alloc() returned null data pointer (size=${size})")
@@ -82,7 +82,7 @@ open class RustBuffer : Structure() {
         }
 
         internal fun free(buf: RustBuffer.ByValue) = uniffiRustCall() { status ->
-            UniffiLib.ffi_tssh_core_rustbuffer_free(buf, status)
+            UniffiLib.ffi_isekai_terminal_core_rustbuffer_free(buf, status)
         }
     }
 
@@ -362,7 +362,7 @@ private fun findLibraryName(componentName: String): String {
     if (libOverride != null) {
         return libOverride
     }
-    return "tssh_core"
+    return "isekai_terminal_core"
 }
 
 // Define FFI callback types
@@ -841,323 +841,323 @@ internal open class UniffiVTableCallbackInterfaceSessionCallback(
 // We now use JNA's "direct mapping" - unclear if same considerations apply exactly.
 internal object IntegrityCheckingUniffiLib {
     init {
-        Native.register(IntegrityCheckingUniffiLib::class.java, findLibraryName(componentName = "tssh_core"))
+        Native.register(IntegrityCheckingUniffiLib::class.java, findLibraryName(componentName = "isekai_terminal_core"))
         uniffiCheckContractApiVersion(this)
         uniffiCheckApiChecksums(this)
     }
-    external fun uniffi_tssh_core_checksum_func_core_ping(
+    external fun uniffi_isekai_terminal_core_checksum_func_core_ping(
 ): Int
-external fun uniffi_tssh_core_checksum_func_core_version(
+external fun uniffi_isekai_terminal_core_checksum_func_core_version(
 ): Int
-external fun uniffi_tssh_core_checksum_func_create_ssh_session(
+external fun uniffi_isekai_terminal_core_checksum_func_create_ssh_session(
 ): Int
-external fun uniffi_tssh_core_checksum_func_set_terminal_theme(
+external fun uniffi_isekai_terminal_core_checksum_func_set_terminal_theme(
 ): Int
-external fun uniffi_tssh_core_checksum_func_terminal_commit_text_bytes(
+external fun uniffi_isekai_terminal_core_checksum_func_terminal_commit_text_bytes(
 ): Int
-external fun uniffi_tssh_core_checksum_func_terminal_ctrl_byte(
+external fun uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte(
 ): Int
-external fun uniffi_tssh_core_checksum_func_terminal_special_key_bytes(
+external fun uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes(
 ): Int
-external fun uniffi_tssh_core_checksum_func_terminal_unicode_char_bytes(
+external fun uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes(
 ): Int
-external fun uniffi_tssh_core_checksum_func_debug_clear_udp_fault(
+external fun uniffi_isekai_terminal_core_checksum_func_debug_clear_udp_fault(
 ): Int
-external fun uniffi_tssh_core_checksum_func_debug_cut_udp_fault(
+external fun uniffi_isekai_terminal_core_checksum_func_debug_cut_udp_fault(
 ): Int
-external fun uniffi_tssh_core_checksum_func_debug_restore_udp_fault(
+external fun uniffi_isekai_terminal_core_checksum_func_debug_restore_udp_fault(
 ): Int
-external fun uniffi_tssh_core_checksum_func_debug_set_udp_fault_latency_ms(
+external fun uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_latency_ms(
 ): Int
-external fun uniffi_tssh_core_checksum_func_debug_set_udp_fault_loss_permille(
+external fun uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_loss_permille(
 ): Int
-external fun uniffi_tssh_core_checksum_func_create_helper_quic_session(
+external fun uniffi_isekai_terminal_core_checksum_func_create_helper_quic_session(
 ): Int
-external fun uniffi_tssh_core_checksum_func_create_isekai_link_relay_session(
+external fun uniffi_isekai_terminal_core_checksum_func_create_isekai_link_relay_session(
 ): Int
-external fun uniffi_tssh_core_checksum_func_create_isekai_stun_p2p_session(
+external fun uniffi_isekai_terminal_core_checksum_func_create_isekai_stun_p2p_session(
 ): Int
-external fun uniffi_tssh_core_checksum_func_create_multipath_helper_quic_session(
+external fun uniffi_isekai_terminal_core_checksum_func_create_multipath_helper_quic_session(
 ): Int
-external fun uniffi_tssh_core_checksum_func_create_session_orchestrator(
+external fun uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator(
 ): Int
-external fun uniffi_tssh_core_checksum_func_create_quic_session(
+external fun uniffi_isekai_terminal_core_checksum_func_create_quic_session(
 ): Int
-external fun uniffi_tssh_core_checksum_func_create_session_supervisor(
+external fun uniffi_isekai_terminal_core_checksum_func_create_session_supervisor(
 ): Int
-external fun uniffi_tssh_core_checksum_method_diagnosticeventqueue_drain_events(
+external fun uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_drain_events(
 ): Int
-external fun uniffi_tssh_core_checksum_method_diagnosticeventqueue_push(
+external fun uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_push(
 ): Int
-external fun uniffi_tssh_core_checksum_method_diagnosticeventqueue_set_wake_listener(
+external fun uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_set_wake_listener(
 ): Int
-external fun uniffi_tssh_core_checksum_method_diagnosticframemailbox_publish(
+external fun uniffi_isekai_terminal_core_checksum_method_diagnosticframemailbox_publish(
 ): Int
-external fun uniffi_tssh_core_checksum_method_diagnosticframemailbox_set_wake_listener(
+external fun uniffi_isekai_terminal_core_checksum_method_diagnosticframemailbox_set_wake_listener(
 ): Int
-external fun uniffi_tssh_core_checksum_method_diagnosticframemailbox_take_latest(
+external fun uniffi_isekai_terminal_core_checksum_method_diagnosticframemailbox_take_latest(
 ): Int
-external fun uniffi_tssh_core_checksum_method_diagnostichandle_fire_callback(
+external fun uniffi_isekai_terminal_core_checksum_method_diagnostichandle_fire_callback(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sshsession_connect(
+external fun uniffi_isekai_terminal_core_checksum_method_sshsession_connect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sshsession_disconnect(
+external fun uniffi_isekai_terminal_core_checksum_method_sshsession_disconnect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sshsession_notify_network_lost(
+external fun uniffi_isekai_terminal_core_checksum_method_sshsession_notify_network_lost(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sshsession_resize(
+external fun uniffi_isekai_terminal_core_checksum_method_sshsession_resize(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sshsession_scrollback_cells(
+external fun uniffi_isekai_terminal_core_checksum_method_sshsession_scrollback_cells(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sshsession_scrollback_len(
+external fun uniffi_isekai_terminal_core_checksum_method_sshsession_scrollback_len(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sshsession_send(
+external fun uniffi_isekai_terminal_core_checksum_method_sshsession_send(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sshsession_trzsz_accept_download(
+external fun uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_accept_download(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sshsession_trzsz_accept_upload(
+external fun uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_accept_upload(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sshsession_trzsz_cancel(
+external fun uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_cancel(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sshsession_trzsz_send_chunk(
+external fun uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_send_chunk(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_connect(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_connect_auto(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect_auto(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_disconnect(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_disconnect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_notify_network_lost(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_notify_network_lost(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_resize(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_resize(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_scrollback_cells(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_cells(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_scrollback_len(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_len(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_send(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_send(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_trzsz_accept_download(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_download(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_trzsz_accept_upload(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_upload(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_trzsz_cancel(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_cancel(
 ): Int
-external fun uniffi_tssh_core_checksum_method_helperquicsession_trzsz_send_chunk(
+external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_send_chunk(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_connect(
+external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_connect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_disconnect(
+external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_disconnect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_notify_network_lost(
+external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_notify_network_lost(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_resize(
+external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_resize(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_scrollback_cells(
+external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_scrollback_cells(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_scrollback_len(
+external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_scrollback_len(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_send(
+external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_send(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_accept_download(
+external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_accept_download(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_accept_upload(
+external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_accept_upload(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_cancel(
+external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_cancel(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_send_chunk(
+external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_send_chunk(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_connect(
+external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_connect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_disconnect(
+external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_disconnect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_notify_network_lost(
+external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_notify_network_lost(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_resize(
+external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_resize(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_scrollback_cells(
+external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_scrollback_cells(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_scrollback_len(
+external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_scrollback_len(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_send(
+external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_send(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_accept_download(
+external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_accept_download(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_accept_upload(
+external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_accept_upload(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_cancel(
+external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_cancel(
 ): Int
-external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_send_chunk(
+external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_send_chunk(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_connect(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_connect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_disconnect(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_disconnect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_notify_network_lost(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_notify_network_lost(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_rebind_to_fd(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_rebind_to_fd(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_resize(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_resize(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_scrollback_cells(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_cells(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_scrollback_len(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_len(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_send(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_send(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_accept_download(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_download(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_accept_upload(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_upload(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_cancel(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_cancel(
 ): Int
-external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_send_chunk(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_send_chunk(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_add_local_forward(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_helper_quic(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_helper_quic_auto(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic_auto(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_isekai_link_relay(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_link_relay(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_isekai_stun_p2p(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_stun_p2p(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_multipath_helper_quic(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_multipath_helper_quic(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_connect_quic(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_disconnect(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_is_quic(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_notify_error(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_notify_network_lost(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_network_lost(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_rebind_to_fd(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_rebind_to_fd(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_remove_forward(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_remove_forward(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_resize(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_resize(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_scrollback_cells(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_cells(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_scrollback_len(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_len(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_send(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_set_session_theme(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_set_session_theme(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_download(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_accept_download(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_upload(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_accept_upload(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_cancel(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_cancel(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_dismiss(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_dismiss(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_send_chunk(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_send_chunk(
 ): Int
-external fun uniffi_tssh_core_checksum_method_quicsession_connect(
+external fun uniffi_isekai_terminal_core_checksum_method_quicsession_connect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_quicsession_disconnect(
+external fun uniffi_isekai_terminal_core_checksum_method_quicsession_disconnect(
 ): Int
-external fun uniffi_tssh_core_checksum_method_quicsession_resize(
+external fun uniffi_isekai_terminal_core_checksum_method_quicsession_resize(
 ): Int
-external fun uniffi_tssh_core_checksum_method_quicsession_scrollback_cells(
+external fun uniffi_isekai_terminal_core_checksum_method_quicsession_scrollback_cells(
 ): Int
-external fun uniffi_tssh_core_checksum_method_quicsession_scrollback_len(
+external fun uniffi_isekai_terminal_core_checksum_method_quicsession_scrollback_len(
 ): Int
-external fun uniffi_tssh_core_checksum_method_quicsession_send(
+external fun uniffi_isekai_terminal_core_checksum_method_quicsession_send(
 ): Int
-external fun uniffi_tssh_core_checksum_method_quicsession_trzsz_accept_download(
+external fun uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_accept_download(
 ): Int
-external fun uniffi_tssh_core_checksum_method_quicsession_trzsz_accept_upload(
+external fun uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_accept_upload(
 ): Int
-external fun uniffi_tssh_core_checksum_method_quicsession_trzsz_cancel(
+external fun uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_cancel(
 ): Int
-external fun uniffi_tssh_core_checksum_method_quicsession_trzsz_send_chunk(
+external fun uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_send_chunk(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_application_will_terminate(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_application_will_terminate(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_execution_mode(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_execution_mode(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_mark_suspended(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_mark_suspended(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_memory_warning(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_memory_warning(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_on_connect_failed(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_connect_failed(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_on_connect_requested(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_connect_requested(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_on_connected(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_connected(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_on_disconnected(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_disconnected(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_on_terminated(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_terminated(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_prepare_for_background(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_prepare_for_background(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_resume_from_foreground(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_resume_from_foreground(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessionsupervisor_session_state(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_session_state(
 ): Int
-external fun uniffi_tssh_core_checksum_constructor_diagnosticeventqueue_new(
+external fun uniffi_isekai_terminal_core_checksum_constructor_diagnosticeventqueue_new(
 ): Int
-external fun uniffi_tssh_core_checksum_constructor_diagnosticframemailbox_new(
+external fun uniffi_isekai_terminal_core_checksum_constructor_diagnosticframemailbox_new(
 ): Int
-external fun uniffi_tssh_core_checksum_constructor_diagnostichandle_new(
+external fun uniffi_isekai_terminal_core_checksum_constructor_diagnostichandle_new(
 ): Int
-external fun uniffi_tssh_core_checksum_method_diagnosticcallback_on_diagnostic_event(
+external fun uniffi_isekai_terminal_core_checksum_method_diagnosticcallback_on_diagnostic_event(
 ): Int
-external fun uniffi_tssh_core_checksum_method_eventwakelistener_events_available(
+external fun uniffi_isekai_terminal_core_checksum_method_eventwakelistener_events_available(
 ): Int
-external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_connection_state_changed(
+external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_connection_state_changed(
 ): Int
-external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_screen_update(
+external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_screen_update(
 ): Int
-external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_host_key(
+external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_host_key(
 ): Int
-external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_data(
+external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_data(
 ): Int
-external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_trzsz_state_changed(
+external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_trzsz_state_changed(
 ): Int
-external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_download_complete(
+external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_download_complete(
 ): Int
-external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_no_viable_path(
+external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_no_viable_path(
 ): Int
-external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_forward_state_changed(
+external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_forward_state_changed(
 ): Int
-external fun uniffi_tssh_core_checksum_method_orchestratorcallback_on_agent_sign_request(
+external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_agent_sign_request(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_data(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_data(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_host_key(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_host_key(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_connected(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_connected(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_disconnected(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_disconnected(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_screen_update(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_screen_update(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_request(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_request(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_download_chunk(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_download_chunk(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_progress(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_progress(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_finished(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_finished(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_no_viable_path(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_no_viable_path(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_forward_state_changed(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_forward_state_changed(
 ): Int
-external fun uniffi_tssh_core_checksum_method_sessioncallback_on_agent_sign_request(
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_agent_sign_request(
 ): Int
-external fun ffi_tssh_core_uniffi_contract_version(
+external fun ffi_isekai_terminal_core_uniffi_contract_version(
 ): Int
 
     
@@ -1172,434 +1172,434 @@ internal object UniffiLib {
     
 
     init {
-        Native.register(UniffiLib::class.java, findLibraryName(componentName = "tssh_core"))
+        Native.register(UniffiLib::class.java, findLibraryName(componentName = "isekai_terminal_core"))
         uniffiCallbackInterfaceDiagnosticCallback.register(this)
         uniffiCallbackInterfaceEventWakeListener.register(this)
         uniffiCallbackInterfaceOrchestratorCallback.register(this)
         uniffiCallbackInterfaceSessionCallback.register(this)
         
     }
-    external fun uniffi_tssh_core_fn_clone_diagnosticeventqueue(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_isekai_terminal_core_fn_clone_diagnosticeventqueue(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_free_diagnosticeventqueue(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_diagnosticeventqueue(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_constructor_diagnosticeventqueue_new(uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_constructor_diagnosticeventqueue_new(uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_method_diagnosticeventqueue_drain_events(`ptr`: Long,`afterSequence`: Long,`maxCount`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_diagnosticeventqueue_drain_events(`ptr`: Long,`afterSequence`: Long,`maxCount`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_method_diagnosticeventqueue_push(`ptr`: Long,`message`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_diagnosticeventqueue_push(`ptr`: Long,`message`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_diagnosticeventqueue_set_wake_listener(`ptr`: Long,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_diagnosticeventqueue_set_wake_listener(`ptr`: Long,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_clone_diagnosticframemailbox(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_clone_diagnosticframemailbox(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_free_diagnosticframemailbox(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_diagnosticframemailbox(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_constructor_diagnosticframemailbox_new(uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_constructor_diagnosticframemailbox_new(uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_method_diagnosticframemailbox_publish(`ptr`: Long,`frame`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_diagnosticframemailbox_publish(`ptr`: Long,`frame`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_diagnosticframemailbox_set_wake_listener(`ptr`: Long,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_diagnosticframemailbox_set_wake_listener(`ptr`: Long,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_diagnosticframemailbox_take_latest(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_diagnosticframemailbox_take_latest(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_clone_diagnostichandle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_clone_diagnostichandle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_free_diagnostichandle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_diagnostichandle(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_constructor_diagnostichandle_new(uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_constructor_diagnostichandle_new(uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_method_diagnostichandle_fire_callback(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_diagnostichandle_fire_callback(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_clone_sshsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_clone_sshsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_free_sshsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_sshsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sshsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sshsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sshsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sshsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sshsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sshsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sshsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sshsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sshsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sshsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_method_sshsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sshsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun uniffi_tssh_core_fn_method_sshsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sshsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sshsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sshsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sshsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sshsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_clone_helperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_clone_helperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_free_helperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_helperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_helperquicsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_helperquicsession_connect_auto(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_connect_auto(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_helperquicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_helperquicsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_helperquicsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_helperquicsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_method_helperquicsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun uniffi_tssh_core_fn_method_helperquicsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_helperquicsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_helperquicsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_helperquicsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_helperquicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_clone_isekailinkrelaysession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_clone_isekailinkrelaysession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_free_isekailinkrelaysession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_isekailinkrelaysession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_clone_isekaistunp2psession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_clone_isekaistunp2psession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_free_isekaistunp2psession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_isekaistunp2psession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekaistunp2psession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekaistunp2psession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekaistunp2psession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekaistunp2psession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekaistunp2psession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_method_isekaistunp2psession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun uniffi_tssh_core_fn_method_isekaistunp2psession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_clone_multipathhelperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_clone_multipathhelperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_free_multipathhelperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_multipathhelperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_rebind_to_fd(`ptr`: Long,`fd`: Int,`localIp`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_rebind_to_fd(`ptr`: Long,`fd`: Int,`localIp`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_clone_sessionorchestrator(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_clone_sessionorchestrator(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_free_sessionorchestrator(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_sessionorchestrator(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_add_local_forward(`ptr`: Long,`id`: RustBuffer.ByValue,`bindAddress`: RustBuffer.ByValue,`bindPort`: Short,`remoteHost`: RustBuffer.ByValue,`remotePort`: Short,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_add_local_forward(`ptr`: Long,`id`: RustBuffer.ByValue,`bindAddress`: RustBuffer.ByValue,`bindPort`: Short,`remoteHost`: RustBuffer.ByValue,`remotePort`: Short,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_helper_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_helper_quic_auto(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic_auto(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_isekai_link_relay(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_link_relay(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_isekai_stun_p2p(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_stun_p2p(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_multipath_helper_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_multipath_helper_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_connect_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_is_quic(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_is_quic(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_notify_error(`ptr`: Long,`message`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(`ptr`: Long,`message`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_rebind_to_fd(`ptr`: Long,`fd`: Int,`localIp`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_rebind_to_fd(`ptr`: Long,`fd`: Int,`localIp`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_remove_forward(`ptr`: Long,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_remove_forward(`ptr`: Long,`id`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_set_session_theme(`ptr`: Long,`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_set_session_theme(`ptr`: Long,`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_accept_download(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_accept_download(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_accept_upload(`ptr`: Long,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_accept_upload(`ptr`: Long,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_cancel(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_cancel(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_dismiss(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_dismiss(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_send_chunk(`ptr`: Long,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_send_chunk(`ptr`: Long,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_clone_quicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_clone_quicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_free_quicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_quicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_quicsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_quicsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_quicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_quicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_quicsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_quicsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_quicsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_quicsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_method_quicsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_quicsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun uniffi_tssh_core_fn_method_quicsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_quicsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_quicsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_quicsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_quicsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_quicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_clone_sessionsupervisor(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_clone_sessionsupervisor(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_free_sessionsupervisor(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_sessionsupervisor(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_application_will_terminate(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_application_will_terminate(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_execution_mode(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_execution_mode(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_mark_suspended(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_mark_suspended(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_memory_warning(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_memory_warning(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_on_connect_failed(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_connect_failed(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_on_connect_requested(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_connect_requested(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_on_connected(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_connected(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_on_disconnected(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_disconnected(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_on_terminated(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_terminated(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_prepare_for_background(`ptr`: Long,`budgetMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_prepare_for_background(`ptr`: Long,`budgetMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_resume_from_foreground(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_resume_from_foreground(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_method_sessionsupervisor_session_state(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionsupervisor_session_state(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_init_callback_vtable_diagnosticcallback(`vtable`: UniffiVTableCallbackInterfaceDiagnosticCallback,
+external fun uniffi_isekai_terminal_core_fn_init_callback_vtable_diagnosticcallback(`vtable`: UniffiVTableCallbackInterfaceDiagnosticCallback,
 ): Unit
-external fun uniffi_tssh_core_fn_init_callback_vtable_eventwakelistener(`vtable`: UniffiVTableCallbackInterfaceEventWakeListener,
+external fun uniffi_isekai_terminal_core_fn_init_callback_vtable_eventwakelistener(`vtable`: UniffiVTableCallbackInterfaceEventWakeListener,
 ): Unit
-external fun uniffi_tssh_core_fn_init_callback_vtable_orchestratorcallback(`vtable`: UniffiVTableCallbackInterfaceOrchestratorCallback,
+external fun uniffi_isekai_terminal_core_fn_init_callback_vtable_orchestratorcallback(`vtable`: UniffiVTableCallbackInterfaceOrchestratorCallback,
 ): Unit
-external fun uniffi_tssh_core_fn_init_callback_vtable_sessioncallback(`vtable`: UniffiVTableCallbackInterfaceSessionCallback,
+external fun uniffi_isekai_terminal_core_fn_init_callback_vtable_sessioncallback(`vtable`: UniffiVTableCallbackInterfaceSessionCallback,
 ): Unit
-external fun uniffi_tssh_core_fn_func_core_ping(
+external fun uniffi_isekai_terminal_core_fn_func_core_ping(
 ): Long
-external fun uniffi_tssh_core_fn_func_core_version(uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_core_version(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_func_create_ssh_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_create_ssh_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_func_set_terminal_theme(`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_set_terminal_theme(`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_func_terminal_commit_text_bytes(`text`: RustBuffer.ByValue,`bracketedPasteMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_terminal_commit_text_bytes(`text`: RustBuffer.ByValue,`bracketedPasteMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_func_terminal_ctrl_byte(`codePoint`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_terminal_ctrl_byte(`codePoint`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_func_terminal_special_key_bytes(`key`: RustBuffer.ByValue,`applicationCursorMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(`key`: RustBuffer.ByValue,`applicationCursorMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_func_terminal_unicode_char_bytes(`unicodeChar`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_terminal_unicode_char_bytes(`unicodeChar`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_tssh_core_fn_func_debug_clear_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_debug_clear_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_func_debug_cut_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_debug_cut_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_func_debug_restore_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_debug_restore_udp_fault(uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_func_debug_set_udp_fault_latency_ms(`ms`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_latency_ms(`ms`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_func_debug_set_udp_fault_loss_permille(`permille`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_loss_permille(`permille`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_tssh_core_fn_func_create_helper_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_create_helper_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_func_create_isekai_link_relay_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_create_isekai_link_relay_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_func_create_isekai_stun_p2p_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_create_isekai_stun_p2p_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_func_create_multipath_helper_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_create_multipath_helper_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_func_create_session_orchestrator(`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_create_session_orchestrator(`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_func_create_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_create_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_tssh_core_fn_func_create_session_supervisor(uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_create_session_supervisor(uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun ffi_tssh_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun ffi_tssh_core_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun ffi_tssh_core_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rustbuffer_free(`buf`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun ffi_tssh_core_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rustbuffer_reserve(`buf`: RustBuffer.ByValue,`additional`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun ffi_tssh_core_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_u8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_u8(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_u8(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_u8(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_u8(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_u8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun ffi_tssh_core_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_i8(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_i8(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_i8(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_i8(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_i8(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_i8(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
-external fun ffi_tssh_core_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_u16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_u16(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_u16(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_u16(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_u16(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_u16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun ffi_tssh_core_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_i16(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_i16(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_i16(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_i16(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_i16(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_i16(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Short
-external fun ffi_tssh_core_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_u32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_u32(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_u32(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_u32(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_u32(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_u32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun ffi_tssh_core_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_i32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_i32(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_i32(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_i32(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_i32(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_i32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun ffi_tssh_core_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_u64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_u64(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_u64(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_u64(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_u64(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_u64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun ffi_tssh_core_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_i64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_i64(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_i64(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_i64(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_i64(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_i64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun ffi_tssh_core_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_f32(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_f32(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_f32(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_f32(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_f32(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_f32(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Float
-external fun ffi_tssh_core_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_f64(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_f64(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_f64(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_f64(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_f64(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_f64(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Double
-external fun ffi_tssh_core_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_rust_buffer(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_rust_buffer(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_rust_buffer(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_rust_buffer(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_rust_buffer(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_rust_buffer(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun ffi_tssh_core_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
+external fun ffi_isekai_terminal_core_rust_future_poll_void(`handle`: Long,`callback`: UniffiRustFutureContinuationCallback,`callbackData`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_cancel_void(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_cancel_void(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_free_void(`handle`: Long,
+external fun ffi_isekai_terminal_core_rust_future_free_void(`handle`: Long,
 ): Unit
-external fun ffi_tssh_core_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun ffi_isekai_terminal_core_rust_future_complete_void(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 
     
@@ -1609,479 +1609,479 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
     // Get the bindings contract version from our ComponentInterface
     val bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
-    val scaffolding_contract_version = lib.ffi_tssh_core_uniffi_contract_version()
+    val scaffolding_contract_version = lib.ffi_isekai_terminal_core_uniffi_contract_version()
     if (bindings_contract_version != scaffolding_contract_version) {
         throw RuntimeException("UniFFI contract version mismatch: try cleaning and rebuilding your project")
     }
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_tssh_core_checksum_func_core_ping() != 65359) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_core_ping() != 52569) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_core_version() != 13464) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_core_version() != 21634) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_create_ssh_session() != 24804) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_create_ssh_session() != 1917) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_set_terminal_theme() != 45632) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_set_terminal_theme() != 46107) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_terminal_commit_text_bytes() != 17000) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_commit_text_bytes() != 10768) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_terminal_ctrl_byte() != 45904) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte() != 39410) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_terminal_special_key_bytes() != 21124) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 46056) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_terminal_unicode_char_bytes() != 49608) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes() != 52901) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_debug_clear_udp_fault() != 23483) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_clear_udp_fault() != 8630) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_debug_cut_udp_fault() != 31965) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_cut_udp_fault() != 46820) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_debug_restore_udp_fault() != 22951) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_restore_udp_fault() != 44289) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_debug_set_udp_fault_latency_ms() != 28372) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_latency_ms() != 6689) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_debug_set_udp_fault_loss_permille() != 49924) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_loss_permille() != 50613) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_create_helper_quic_session() != 57728) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_create_helper_quic_session() != 6597) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_create_isekai_link_relay_session() != 47843) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_create_isekai_link_relay_session() != 13613) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_create_isekai_stun_p2p_session() != 49421) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_create_isekai_stun_p2p_session() != 728) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_create_multipath_helper_quic_session() != 11155) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_create_multipath_helper_quic_session() != 7205) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_create_session_orchestrator() != 25564) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator() != 38625) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_create_quic_session() != 25547) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_create_quic_session() != 18349) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_func_create_session_supervisor() != 43886) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_create_session_supervisor() != 8438) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_diagnosticeventqueue_drain_events() != 34129) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_drain_events() != 5861) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_diagnosticeventqueue_push() != 50750) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_push() != 56293) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_diagnosticeventqueue_set_wake_listener() != 51515) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_set_wake_listener() != 16481) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_diagnosticframemailbox_publish() != 63094) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_diagnosticframemailbox_publish() != 17416) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_diagnosticframemailbox_set_wake_listener() != 35625) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_diagnosticframemailbox_set_wake_listener() != 32792) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_diagnosticframemailbox_take_latest() != 44384) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_diagnosticframemailbox_take_latest() != 27603) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_diagnostichandle_fire_callback() != 38746) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_diagnostichandle_fire_callback() != 38453) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sshsession_connect() != 26689) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_connect() != 12334) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sshsession_disconnect() != 2534) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_disconnect() != 10831) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sshsession_notify_network_lost() != 3638) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_notify_network_lost() != 16860) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sshsession_resize() != 59850) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_resize() != 64030) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sshsession_scrollback_cells() != 39495) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_scrollback_cells() != 15875) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sshsession_scrollback_len() != 8009) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_scrollback_len() != 3706) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sshsession_send() != 13419) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_send() != 38367) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sshsession_trzsz_accept_download() != 36580) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_accept_download() != 8922) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sshsession_trzsz_accept_upload() != 8545) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_accept_upload() != 6684) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sshsession_trzsz_cancel() != 40040) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_cancel() != 31811) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sshsession_trzsz_send_chunk() != 29945) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_send_chunk() != 30024) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_connect() != 11318) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect() != 49117) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_connect_auto() != 13193) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect_auto() != 17169) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_disconnect() != 3769) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_disconnect() != 11253) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_notify_network_lost() != 65360) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_notify_network_lost() != 44050) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_resize() != 34438) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_resize() != 9464) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_scrollback_cells() != 35462) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_cells() != 45509) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_scrollback_len() != 44249) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_len() != 32376) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_send() != 21077) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_send() != 15932) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_trzsz_accept_download() != 19325) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_download() != 52142) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_trzsz_accept_upload() != 8568) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_upload() != 11358) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_trzsz_cancel() != 53943) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_cancel() != 14424) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_trzsz_send_chunk() != 39866) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_send_chunk() != 22896) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_connect() != 60971) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_connect() != 50867) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_disconnect() != 56041) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_disconnect() != 46405) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_notify_network_lost() != 45363) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_notify_network_lost() != 59627) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_resize() != 58662) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_resize() != 47452) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_scrollback_cells() != 4580) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_scrollback_cells() != 949) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_scrollback_len() != 55442) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_scrollback_len() != 10091) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_send() != 14469) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_send() != 60831) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_accept_download() != 46291) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_accept_download() != 50323) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_accept_upload() != 39074) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_accept_upload() != 18668) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_cancel() != 48262) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_cancel() != 31539) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_send_chunk() != 40010) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_send_chunk() != 342) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_connect() != 38552) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_connect() != 55857) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_disconnect() != 57846) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_disconnect() != 12896) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_notify_network_lost() != 34752) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_notify_network_lost() != 10127) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_resize() != 53057) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_resize() != 62379) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_scrollback_cells() != 34449) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_scrollback_cells() != 47167) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_scrollback_len() != 10790) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_scrollback_len() != 48506) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_send() != 14483) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_send() != 23803) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_accept_download() != 16307) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_accept_download() != 59252) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_accept_upload() != 59097) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_accept_upload() != 46526) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_cancel() != 49855) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_cancel() != 50337) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_send_chunk() != 5915) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_send_chunk() != 59478) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_connect() != 4132) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_connect() != 15932) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_disconnect() != 50947) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_disconnect() != 13182) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_notify_network_lost() != 46023) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_notify_network_lost() != 18872) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_rebind_to_fd() != 28891) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_rebind_to_fd() != 51928) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_resize() != 39647) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_resize() != 65350) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_scrollback_cells() != 9295) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_cells() != 35785) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_scrollback_len() != 53922) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_len() != 20977) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_send() != 10471) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_send() != 18667) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_accept_download() != 23777) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_download() != 41705) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_accept_upload() != 56025) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_upload() != 60661) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_cancel() != 50106) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_cancel() != 43237) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_send_chunk() != 62085) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_send_chunk() != 40204) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_add_local_forward() != 14593) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward() != 60755) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect() != 59422) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect() != 45531) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect_helper_quic() != 61807) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic() != 14224) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect_helper_quic_auto() != 16027) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic_auto() != 34683) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect_isekai_link_relay() != 29905) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_link_relay() != 63853) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect_isekai_stun_p2p() != 28376) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_stun_p2p() != 21296) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect_multipath_helper_quic() != 29572) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_multipath_helper_quic() != 28117) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_connect_quic() != 17166) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic() != 50706) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_disconnect() != 7875) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_is_quic() != 61715) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic() != 9641) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_notify_error() != 15428) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_notify_network_lost() != 24188) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_network_lost() != 22182) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_rebind_to_fd() != 28412) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_rebind_to_fd() != 19723) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_remove_forward() != 32241) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_remove_forward() != 24342) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_resize() != 60330) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_resize() != 11770) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_scrollback_cells() != 44304) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_cells() != 23042) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_scrollback_len() != 60098) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_len() != 48916) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_send() != 49699) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send() != 59935) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_set_session_theme() != 1433) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_set_session_theme() != 37038) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_download() != 63735) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_accept_download() != 62468) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_upload() != 12551) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_accept_upload() != 5309) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_cancel() != 9112) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_cancel() != 25532) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_dismiss() != 6589) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_dismiss() != 31285) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_send_chunk() != 13645) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_send_chunk() != 51996) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_quicsession_connect() != 11417) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_quicsession_connect() != 52673) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_quicsession_disconnect() != 11534) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_quicsession_disconnect() != 33808) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_quicsession_resize() != 50029) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_quicsession_resize() != 43526) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_quicsession_scrollback_cells() != 46917) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_quicsession_scrollback_cells() != 30858) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_quicsession_scrollback_len() != 54474) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_quicsession_scrollback_len() != 33684) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_quicsession_send() != 9870) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_quicsession_send() != 20013) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_quicsession_trzsz_accept_download() != 29607) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_accept_download() != 45285) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_quicsession_trzsz_accept_upload() != 45770) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_accept_upload() != 20898) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_quicsession_trzsz_cancel() != 56254) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_cancel() != 14107) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_quicsession_trzsz_send_chunk() != 12522) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_send_chunk() != 41601) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_application_will_terminate() != 690) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_application_will_terminate() != 35024) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_execution_mode() != 16415) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_execution_mode() != 53812) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_mark_suspended() != 26228) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_mark_suspended() != 32890) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_memory_warning() != 54621) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_memory_warning() != 36916) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_on_connect_failed() != 63876) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_connect_failed() != 57975) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_on_connect_requested() != 17811) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_connect_requested() != 62659) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_on_connected() != 41642) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_connected() != 44409) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_on_disconnected() != 49117) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_disconnected() != 21436) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_on_terminated() != 21123) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_terminated() != 14687) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_prepare_for_background() != 23290) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_prepare_for_background() != 63099) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_resume_from_foreground() != 37188) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_resume_from_foreground() != 53912) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_session_state() != 5184) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_session_state() != 64821) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_constructor_diagnosticeventqueue_new() != 2755) {
+    if (lib.uniffi_isekai_terminal_core_checksum_constructor_diagnosticeventqueue_new() != 33382) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_constructor_diagnosticframemailbox_new() != 6452) {
+    if (lib.uniffi_isekai_terminal_core_checksum_constructor_diagnosticframemailbox_new() != 94) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_constructor_diagnostichandle_new() != 540) {
+    if (lib.uniffi_isekai_terminal_core_checksum_constructor_diagnostichandle_new() != 41615) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_diagnosticcallback_on_diagnostic_event() != 55189) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_diagnosticcallback_on_diagnostic_event() != 18678) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_eventwakelistener_events_available() != 26319) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_eventwakelistener_events_available() != 16294) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_connection_state_changed() != 63751) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_connection_state_changed() != 26389) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_screen_update() != 30781) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_screen_update() != 51117) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_host_key() != 12009) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_host_key() != 34371) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_data() != 51069) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_data() != 44404) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_trzsz_state_changed() != 55321) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_trzsz_state_changed() != 46274) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_download_complete() != 2381) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_download_complete() != 46536) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_no_viable_path() != 17400) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_no_viable_path() != 15626) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_forward_state_changed() != 107) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_forward_state_changed() != 22560) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_orchestratorcallback_on_agent_sign_request() != 57032) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_agent_sign_request() != 31857) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_data() != 27387) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_data() != 62372) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_host_key() != 41856) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_host_key() != 36190) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_connected() != 6383) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_connected() != 40740) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_disconnected() != 61713) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_disconnected() != 41713) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_screen_update() != 16018) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_screen_update() != 5617) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_request() != 169) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_request() != 27262) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_download_chunk() != 57637) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_download_chunk() != 18250) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_progress() != 42762) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_progress() != 48910) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_finished() != 46114) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_finished() != 59033) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_no_viable_path() != 33355) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_no_viable_path() != 61160) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_forward_state_changed() != 26529) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_forward_state_changed() != 22023) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tssh_core_checksum_method_sessioncallback_on_agent_sign_request() != 60049) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_agent_sign_request() != 536) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -2687,7 +2687,7 @@ open class DiagnosticEventQueue: Disposable, AutoCloseable, DiagnosticEventQueue
     constructor() :
         this(UniffiWithHandle, 
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_constructor_diagnosticeventqueue_new(
+    UniffiLib.uniffi_isekai_terminal_core_fn_constructor_diagnosticeventqueue_new(
     
         _status)
 }
@@ -2747,7 +2747,7 @@ open class DiagnosticEventQueue: Disposable, AutoCloseable, DiagnosticEventQueue
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_tssh_core_fn_free_diagnosticeventqueue(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_diagnosticeventqueue(handle, status)
             }
         }
     }
@@ -2760,7 +2760,7 @@ open class DiagnosticEventQueue: Disposable, AutoCloseable, DiagnosticEventQueue
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_tssh_core_fn_clone_diagnosticeventqueue(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_diagnosticeventqueue(handle, status)
         }
     }
 
@@ -2772,7 +2772,7 @@ open class DiagnosticEventQueue: Disposable, AutoCloseable, DiagnosticEventQueue
             return FfiConverterSequenceTypeDiagnosticEventEnvelope.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_diagnosticeventqueue_drain_events(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_diagnosticeventqueue_drain_events(
         it,
         FfiConverterULong.lower(`afterSequence`),FfiConverterUInt.lower(`maxCount`),_status)
 }
@@ -2789,7 +2789,7 @@ open class DiagnosticEventQueue: Disposable, AutoCloseable, DiagnosticEventQueue
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_diagnosticeventqueue_push(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_diagnosticeventqueue_push(
         it,
         FfiConverterString.lower(`message`),_status)
 }
@@ -2804,7 +2804,7 @@ open class DiagnosticEventQueue: Disposable, AutoCloseable, DiagnosticEventQueue
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_diagnosticeventqueue_set_wake_listener(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_diagnosticeventqueue_set_wake_listener(
         it,
         FfiConverterTypeEventWakeListener.lower(`listener`),_status)
 }
@@ -3006,7 +3006,7 @@ open class DiagnosticFrameMailbox: Disposable, AutoCloseable, DiagnosticFrameMai
     constructor() :
         this(UniffiWithHandle, 
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_constructor_diagnosticframemailbox_new(
+    UniffiLib.uniffi_isekai_terminal_core_fn_constructor_diagnosticframemailbox_new(
     
         _status)
 }
@@ -3066,7 +3066,7 @@ open class DiagnosticFrameMailbox: Disposable, AutoCloseable, DiagnosticFrameMai
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_tssh_core_fn_free_diagnosticframemailbox(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_diagnosticframemailbox(handle, status)
             }
         }
     }
@@ -3079,7 +3079,7 @@ open class DiagnosticFrameMailbox: Disposable, AutoCloseable, DiagnosticFrameMai
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_tssh_core_fn_clone_diagnosticframemailbox(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_diagnosticframemailbox(handle, status)
         }
     }
 
@@ -3091,7 +3091,7 @@ open class DiagnosticFrameMailbox: Disposable, AutoCloseable, DiagnosticFrameMai
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_diagnosticframemailbox_publish(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_diagnosticframemailbox_publish(
         it,
         FfiConverterTypeTerminalFrameBatch.lower(`frame`),_status)
 }
@@ -3103,7 +3103,7 @@ open class DiagnosticFrameMailbox: Disposable, AutoCloseable, DiagnosticFrameMai
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_diagnosticframemailbox_set_wake_listener(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_diagnosticframemailbox_set_wake_listener(
         it,
         FfiConverterTypeEventWakeListener.lower(`listener`),_status)
 }
@@ -3119,7 +3119,7 @@ open class DiagnosticFrameMailbox: Disposable, AutoCloseable, DiagnosticFrameMai
             return FfiConverterOptionalTypeTerminalFrameBatch.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_diagnosticframemailbox_take_latest(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_diagnosticframemailbox_take_latest(
         it,
         _status)
 }
@@ -3304,7 +3304,7 @@ open class DiagnosticHandle: Disposable, AutoCloseable, DiagnosticHandleInterfac
     constructor() :
         this(UniffiWithHandle, 
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_constructor_diagnostichandle_new(
+    UniffiLib.uniffi_isekai_terminal_core_fn_constructor_diagnostichandle_new(
     
         _status)
 }
@@ -3364,7 +3364,7 @@ open class DiagnosticHandle: Disposable, AutoCloseable, DiagnosticHandleInterfac
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_tssh_core_fn_free_diagnostichandle(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_diagnostichandle(handle, status)
             }
         }
     }
@@ -3377,7 +3377,7 @@ open class DiagnosticHandle: Disposable, AutoCloseable, DiagnosticHandleInterfac
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_tssh_core_fn_clone_diagnostichandle(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_diagnostichandle(handle, status)
         }
     }
 
@@ -3385,7 +3385,7 @@ open class DiagnosticHandle: Disposable, AutoCloseable, DiagnosticHandleInterfac
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_diagnostichandle_fire_callback(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_diagnostichandle_fire_callback(
         it,
         FfiConverterTypeDiagnosticCallback.lower(`callback`),_status)
 }
@@ -3648,7 +3648,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_tssh_core_fn_free_helperquicsession(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_helperquicsession(handle, status)
             }
         }
     }
@@ -3661,7 +3661,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_tssh_core_fn_clone_helperquicsession(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_helperquicsession(handle, status)
         }
     }
 
@@ -3673,7 +3673,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_connect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_connect(
         it,
         FfiConverterTypeSessionCallback.lower(`callback`),_status)
 }
@@ -3690,7 +3690,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_connect_auto(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_connect_auto(
         it,
         FfiConverterTypeSessionCallback.lower(`callback`),_status)
 }
@@ -3702,7 +3702,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_disconnect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_disconnect(
         it,
         _status)
 }
@@ -3720,7 +3720,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_notify_network_lost(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_notify_network_lost(
         it,
         _status)
 }
@@ -3732,7 +3732,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_resize(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_resize(
         it,
         FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -3744,7 +3744,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
             return FfiConverterSequenceTypeCellData.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_scrollback_cells(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_cells(
         it,
         FfiConverterUInt.lower(`offset`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -3757,7 +3757,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
             return FfiConverterUInt.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_scrollback_len(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_len(
         it,
         _status)
 }
@@ -3770,7 +3770,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_send(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_send(
         it,
         FfiConverterByteArray.lower(`data`),_status)
 }
@@ -3782,7 +3782,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_trzsz_accept_download(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_download(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -3794,7 +3794,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_trzsz_accept_upload(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_upload(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterString.lower(`fileName`),FfiConverterULong.lower(`fileSize`),FfiConverterUInt.lower(`mode`),_status)
 }
@@ -3806,7 +3806,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_trzsz_cancel(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_cancel(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -3818,7 +3818,7 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_trzsz_send_chunk(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_send_chunk(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterByteArray.lower(`data`),FfiConverterBoolean.lower(`isLast`),_status)
 }
@@ -4076,7 +4076,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_tssh_core_fn_free_isekailinkrelaysession(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_isekailinkrelaysession(handle, status)
             }
         }
     }
@@ -4089,7 +4089,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_tssh_core_fn_clone_isekailinkrelaysession(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_isekailinkrelaysession(handle, status)
         }
     }
 
@@ -4102,7 +4102,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_connect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_connect(
         it,
         FfiConverterTypeSessionCallback.lower(`callback`),_status)
 }
@@ -4114,7 +4114,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_disconnect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_disconnect(
         it,
         _status)
 }
@@ -4132,7 +4132,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_notify_network_lost(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_notify_network_lost(
         it,
         _status)
 }
@@ -4144,7 +4144,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_resize(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_resize(
         it,
         FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -4156,7 +4156,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
             return FfiConverterSequenceTypeCellData.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_scrollback_cells(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_scrollback_cells(
         it,
         FfiConverterUInt.lower(`offset`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -4169,7 +4169,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
             return FfiConverterUInt.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_scrollback_len(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_scrollback_len(
         it,
         _status)
 }
@@ -4182,7 +4182,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_send(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_send(
         it,
         FfiConverterByteArray.lower(`data`),_status)
 }
@@ -4194,7 +4194,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_accept_download(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_accept_download(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -4206,7 +4206,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_accept_upload(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_accept_upload(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterString.lower(`fileName`),FfiConverterULong.lower(`fileSize`),FfiConverterUInt.lower(`mode`),_status)
 }
@@ -4218,7 +4218,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_cancel(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_cancel(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -4230,7 +4230,7 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_send_chunk(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_send_chunk(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterByteArray.lower(`data`),FfiConverterBoolean.lower(`isLast`),_status)
 }
@@ -4488,7 +4488,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_tssh_core_fn_free_isekaistunp2psession(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_isekaistunp2psession(handle, status)
             }
         }
     }
@@ -4501,7 +4501,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_tssh_core_fn_clone_isekaistunp2psession(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_isekaistunp2psession(handle, status)
         }
     }
 
@@ -4514,7 +4514,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_connect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_connect(
         it,
         FfiConverterTypeSessionCallback.lower(`callback`),_status)
 }
@@ -4526,7 +4526,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_disconnect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_disconnect(
         it,
         _status)
 }
@@ -4544,7 +4544,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_notify_network_lost(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_notify_network_lost(
         it,
         _status)
 }
@@ -4556,7 +4556,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_resize(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_resize(
         it,
         FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -4568,7 +4568,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
             return FfiConverterSequenceTypeCellData.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_scrollback_cells(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_scrollback_cells(
         it,
         FfiConverterUInt.lower(`offset`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -4581,7 +4581,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
             return FfiConverterUInt.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_scrollback_len(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_scrollback_len(
         it,
         _status)
 }
@@ -4594,7 +4594,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_send(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_send(
         it,
         FfiConverterByteArray.lower(`data`),_status)
 }
@@ -4606,7 +4606,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_accept_download(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_accept_download(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -4618,7 +4618,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_accept_upload(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_accept_upload(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterString.lower(`fileName`),FfiConverterULong.lower(`fileSize`),FfiConverterUInt.lower(`mode`),_status)
 }
@@ -4630,7 +4630,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_cancel(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_cancel(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -4642,7 +4642,7 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_send_chunk(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_send_chunk(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterByteArray.lower(`data`),FfiConverterBoolean.lower(`isLast`),_status)
 }
@@ -4909,7 +4909,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_tssh_core_fn_free_multipathhelperquicsession(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_multipathhelperquicsession(handle, status)
             }
         }
     }
@@ -4922,7 +4922,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_tssh_core_fn_clone_multipathhelperquicsession(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_multipathhelperquicsession(handle, status)
         }
     }
 
@@ -4935,7 +4935,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_connect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_connect(
         it,
         FfiConverterTypeSessionCallback.lower(`callback`),_status)
 }
@@ -4947,7 +4947,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_disconnect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_disconnect(
         it,
         _status)
 }
@@ -4966,7 +4966,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_notify_network_lost(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_notify_network_lost(
         it,
         _status)
 }
@@ -4984,7 +4984,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_rebind_to_fd(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_rebind_to_fd(
         it,
         FfiConverterInt.lower(`fd`),FfiConverterString.lower(`localIp`),_status)
 }
@@ -4996,7 +4996,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_resize(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_resize(
         it,
         FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -5008,7 +5008,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
             return FfiConverterSequenceTypeCellData.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_scrollback_cells(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_cells(
         it,
         FfiConverterUInt.lower(`offset`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -5021,7 +5021,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
             return FfiConverterUInt.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_scrollback_len(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_len(
         it,
         _status)
 }
@@ -5034,7 +5034,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_send(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_send(
         it,
         FfiConverterByteArray.lower(`data`),_status)
 }
@@ -5046,7 +5046,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_accept_download(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_download(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -5058,7 +5058,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_accept_upload(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_upload(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterString.lower(`fileName`),FfiConverterULong.lower(`fileSize`),FfiConverterUInt.lower(`mode`),_status)
 }
@@ -5070,7 +5070,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_cancel(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_cancel(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -5082,7 +5082,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_send_chunk(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_send_chunk(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterByteArray.lower(`data`),FfiConverterBoolean.lower(`isLast`),_status)
 }
@@ -5328,7 +5328,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_tssh_core_fn_free_quicsession(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_quicsession(handle, status)
             }
         }
     }
@@ -5341,7 +5341,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_tssh_core_fn_clone_quicsession(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_quicsession(handle, status)
         }
     }
 
@@ -5350,7 +5350,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_quicsession_connect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_quicsession_connect(
         it,
         FfiConverterTypeSessionCallback.lower(`callback`),_status)
 }
@@ -5362,7 +5362,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_quicsession_disconnect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_quicsession_disconnect(
         it,
         _status)
 }
@@ -5374,7 +5374,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_quicsession_resize(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_quicsession_resize(
         it,
         FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -5386,7 +5386,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
             return FfiConverterSequenceTypeCellData.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_quicsession_scrollback_cells(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_quicsession_scrollback_cells(
         it,
         FfiConverterUInt.lower(`offset`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -5399,7 +5399,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
             return FfiConverterUInt.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_quicsession_scrollback_len(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_quicsession_scrollback_len(
         it,
         _status)
 }
@@ -5412,7 +5412,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_quicsession_send(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_quicsession_send(
         it,
         FfiConverterByteArray.lower(`data`),_status)
 }
@@ -5424,7 +5424,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_quicsession_trzsz_accept_download(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_accept_download(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -5436,7 +5436,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_quicsession_trzsz_accept_upload(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_accept_upload(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterString.lower(`fileName`),FfiConverterULong.lower(`fileSize`),FfiConverterUInt.lower(`mode`),_status)
 }
@@ -5448,7 +5448,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_quicsession_trzsz_cancel(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_cancel(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -5460,7 +5460,7 @@ open class QuicSession: Disposable, AutoCloseable, QuicSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_quicsession_trzsz_send_chunk(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_send_chunk(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterByteArray.lower(`data`),FfiConverterBoolean.lower(`isLast`),_status)
 }
@@ -5782,7 +5782,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_tssh_core_fn_free_sessionorchestrator(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_sessionorchestrator(handle, status)
             }
         }
     }
@@ -5795,7 +5795,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_tssh_core_fn_clone_sessionorchestrator(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_sessionorchestrator(handle, status)
         }
     }
 
@@ -5808,7 +5808,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_add_local_forward(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_add_local_forward(
         it,
         FfiConverterString.lower(`id`),FfiConverterString.lower(`bindAddress`),FfiConverterUShort.lower(`bindPort`),FfiConverterString.lower(`remoteHost`),FfiConverterUShort.lower(`remotePort`),_status)
 }
@@ -5821,7 +5821,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_connect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect(
         it,
         FfiConverterTypeSshConfig.lower(`config`),_status)
 }
@@ -5838,7 +5838,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_connect_helper_quic(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic(
         it,
         FfiConverterTypeHelperQuicConfig.lower(`config`),_status)
 }
@@ -5855,7 +5855,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_connect_helper_quic_auto(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic_auto(
         it,
         FfiConverterTypeHelperQuicConfig.lower(`config`),_status)
 }
@@ -5872,7 +5872,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_connect_isekai_link_relay(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_link_relay(
         it,
         FfiConverterTypeIsekaiLinkRelayConfig.lower(`config`),_status)
 }
@@ -5890,7 +5890,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_connect_isekai_stun_p2p(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_stun_p2p(
         it,
         FfiConverterTypeIsekaiStunP2pConfig.lower(`config`),_status)
 }
@@ -5908,7 +5908,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_connect_multipath_helper_quic(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_multipath_helper_quic(
         it,
         FfiConverterTypeMultipathHelperQuicConfig.lower(`config`),_status)
 }
@@ -5921,7 +5921,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_connect_quic(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_quic(
         it,
         FfiConverterTypeQuicConfig.lower(`config`),_status)
 }
@@ -5933,7 +5933,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_disconnect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(
         it,
         _status)
 }
@@ -5945,7 +5945,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
             return FfiConverterBoolean.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_is_quic(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_is_quic(
         it,
         _status)
 }
@@ -5958,7 +5958,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_notify_error(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(
         it,
         FfiConverterString.lower(`message`),_status)
 }
@@ -5976,7 +5976,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_notify_network_lost(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_network_lost(
         it,
         _status)
 }
@@ -5993,7 +5993,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_rebind_to_fd(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_rebind_to_fd(
         it,
         FfiConverterInt.lower(`fd`),FfiConverterString.lower(`localIp`),_status)
 }
@@ -6005,7 +6005,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_remove_forward(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_remove_forward(
         it,
         FfiConverterString.lower(`id`),_status)
 }
@@ -6017,7 +6017,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_resize(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_resize(
         it,
         FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -6029,7 +6029,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
             return FfiConverterSequenceTypeCellData.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_cells(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_cells(
         it,
         FfiConverterUInt.lower(`offset`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -6042,7 +6042,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
             return FfiConverterUInt.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_len(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_len(
         it,
         _status)
 }
@@ -6055,7 +6055,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_send(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_send(
         it,
         FfiConverterByteArray.lower(`data`),_status)
 }
@@ -6077,7 +6077,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_set_session_theme(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_set_session_theme(
         it,
         FfiConverterSequenceUInt.lower(`ansi16`),FfiConverterUInt.lower(`defaultFg`),FfiConverterUInt.lower(`defaultBg`),_status)
 }
@@ -6089,7 +6089,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_accept_download(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_accept_download(
         it,
         _status)
 }
@@ -6101,7 +6101,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_accept_upload(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_accept_upload(
         it,
         FfiConverterString.lower(`fileName`),FfiConverterULong.lower(`fileSize`),FfiConverterUInt.lower(`mode`),_status)
 }
@@ -6113,7 +6113,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_cancel(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_cancel(
         it,
         _status)
 }
@@ -6125,7 +6125,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_dismiss(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_dismiss(
         it,
         _status)
 }
@@ -6137,7 +6137,7 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_send_chunk(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_send_chunk(
         it,
         FfiConverterByteArray.lower(`data`),FfiConverterBoolean.lower(`isLast`),_status)
 }
@@ -6451,7 +6451,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_tssh_core_fn_free_sessionsupervisor(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_sessionsupervisor(handle, status)
             }
         }
     }
@@ -6464,7 +6464,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_tssh_core_fn_clone_sessionsupervisor(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_sessionsupervisor(handle, status)
         }
     }
 
@@ -6475,7 +6475,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_application_will_terminate(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_application_will_terminate(
         it,
         _status)
 }
@@ -6487,7 +6487,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
             return FfiConverterTypeExecutionMode.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_execution_mode(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_execution_mode(
         it,
         _status)
 }
@@ -6504,7 +6504,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_mark_suspended(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_mark_suspended(
         it,
         _status)
 }
@@ -6523,7 +6523,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_memory_warning(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_memory_warning(
         it,
         _status)
 }
@@ -6538,7 +6538,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_on_connect_failed(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_connect_failed(
         it,
         _status)
 }
@@ -6553,7 +6553,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_on_connect_requested(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_connect_requested(
         it,
         _status)
 }
@@ -6569,7 +6569,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_on_connected(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_connected(
         it,
         _status)
 }
@@ -6584,7 +6584,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_on_disconnected(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_disconnected(
         it,
         _status)
 }
@@ -6599,7 +6599,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_on_terminated(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_terminated(
         it,
         _status)
 }
@@ -6619,7 +6619,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_prepare_for_background(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_prepare_for_background(
         it,
         FfiConverterUInt.lower(`budgetMs`),_status)
 }
@@ -6637,7 +6637,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_resume_from_foreground(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_resume_from_foreground(
         it,
         _status)
 }
@@ -6649,7 +6649,7 @@ open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterf
             return FfiConverterTypeSessionState.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_session_state(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionsupervisor_session_state(
         it,
         _status)
 }
@@ -6903,7 +6903,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_tssh_core_fn_free_sshsession(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_sshsession(handle, status)
             }
         }
     }
@@ -6916,7 +6916,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_tssh_core_fn_clone_sshsession(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_sshsession(handle, status)
         }
     }
 
@@ -6925,7 +6925,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sshsession_connect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sshsession_connect(
         it,
         FfiConverterTypeSessionCallback.lower(`callback`),_status)
 }
@@ -6937,7 +6937,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sshsession_disconnect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sshsession_disconnect(
         it,
         _status)
 }
@@ -6954,7 +6954,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sshsession_notify_network_lost(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sshsession_notify_network_lost(
         it,
         _status)
 }
@@ -6966,7 +6966,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sshsession_resize(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sshsession_resize(
         it,
         FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -6978,7 +6978,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
             return FfiConverterSequenceTypeCellData.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sshsession_scrollback_cells(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sshsession_scrollback_cells(
         it,
         FfiConverterUInt.lower(`offset`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -6991,7 +6991,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
             return FfiConverterUInt.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sshsession_scrollback_len(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sshsession_scrollback_len(
         it,
         _status)
 }
@@ -7004,7 +7004,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sshsession_send(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sshsession_send(
         it,
         FfiConverterByteArray.lower(`data`),_status)
 }
@@ -7016,7 +7016,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sshsession_trzsz_accept_download(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_accept_download(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -7028,7 +7028,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sshsession_trzsz_accept_upload(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_accept_upload(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterString.lower(`fileName`),FfiConverterULong.lower(`fileSize`),FfiConverterUInt.lower(`mode`),_status)
 }
@@ -7040,7 +7040,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sshsession_trzsz_cancel(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_cancel(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -7052,7 +7052,7 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_method_sshsession_trzsz_send_chunk(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_send_chunk(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterByteArray.lower(`data`),FfiConverterBoolean.lower(`isLast`),_status)
 }
@@ -9256,7 +9256,7 @@ internal object uniffiCallbackInterfaceDiagnosticCallback {
     // Registers the foreign callback with the Rust side.
     // This method is generated for each callback interface.
     internal fun register(lib: UniffiLib) {
-        lib.uniffi_tssh_core_fn_init_callback_vtable_diagnosticcallback(vtable)
+        lib.uniffi_isekai_terminal_core_fn_init_callback_vtable_diagnosticcallback(vtable)
     }
 }
 
@@ -9319,7 +9319,7 @@ internal object uniffiCallbackInterfaceEventWakeListener {
     // Registers the foreign callback with the Rust side.
     // This method is generated for each callback interface.
     internal fun register(lib: UniffiLib) {
-        lib.uniffi_tssh_core_fn_init_callback_vtable_eventwakelistener(vtable)
+        lib.uniffi_isekai_terminal_core_fn_init_callback_vtable_eventwakelistener(vtable)
     }
 }
 
@@ -9516,7 +9516,7 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
     // Registers the foreign callback with the Rust side.
     // This method is generated for each callback interface.
     internal fun register(lib: UniffiLib) {
-        lib.uniffi_tssh_core_fn_init_callback_vtable_orchestratorcallback(vtable)
+        lib.uniffi_isekai_terminal_core_fn_init_callback_vtable_orchestratorcallback(vtable)
     }
 }
 
@@ -9749,7 +9749,7 @@ internal object uniffiCallbackInterfaceSessionCallback {
     // Registers the foreign callback with the Rust side.
     // This method is generated for each callback interface.
     internal fun register(lib: UniffiLib) {
-        lib.uniffi_tssh_core_fn_init_callback_vtable_sessioncallback(vtable)
+        lib.uniffi_isekai_terminal_core_fn_init_callback_vtable_sessioncallback(vtable)
     }
 }
 
@@ -10166,10 +10166,10 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
      suspend fun `corePing`() : kotlin.String {
         return uniffiRustCallAsync(
-        UniffiLib.uniffi_tssh_core_fn_func_core_ping(),
-        { future, callback, continuation -> UniffiLib.ffi_tssh_core_rust_future_poll_rust_buffer(future, callback, continuation) },
-        { future, continuation -> UniffiLib.ffi_tssh_core_rust_future_complete_rust_buffer(future, continuation) },
-        { future -> UniffiLib.ffi_tssh_core_rust_future_free_rust_buffer(future) },
+        UniffiLib.uniffi_isekai_terminal_core_fn_func_core_ping(),
+        { future, callback, continuation -> UniffiLib.ffi_isekai_terminal_core_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_isekai_terminal_core_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.ffi_isekai_terminal_core_rust_future_free_rust_buffer(future) },
         // lift function
         { FfiConverterString.lift(it) },
         // Error FFI converter
@@ -10178,7 +10178,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
     }
 
         /**
-         * tssh-core の crate バージョン（`Cargo.toml` の `version`）を返す。
+         * isekai-terminal-core の crate バージョン（`Cargo.toml` の `version`）を返す。
          *
          * iOS 対応 Phase 0 の技術検証スパイクで、UniFFI Swift バインディング経由の
          * round-trip（Swift → Rust 呼び出し → 戻り値）を確認するための診断用関数
@@ -10186,7 +10186,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
          */ fun `coreVersion`(): kotlin.String {
             return FfiConverterString.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_core_version(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_core_version(
     
         _status)
 }
@@ -10196,7 +10196,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
  fun `createSshSession`(`config`: SshConfig): SshSession {
             return FfiConverterTypeSshSession.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_create_ssh_session(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_ssh_session(
     
         FfiConverterTypeSshConfig.lower(`config`),_status)
 }
@@ -10214,7 +10214,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
          */ fun `setTerminalTheme`(`ansi16`: List<kotlin.UInt>, `defaultFg`: kotlin.UInt, `defaultBg`: kotlin.UInt)
         = 
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_set_terminal_theme(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_set_terminal_theme(
     
         FfiConverterSequenceUInt.lower(`ansi16`),FfiConverterUInt.lower(`defaultFg`),FfiConverterUInt.lower(`defaultBg`),_status)
 }
@@ -10230,7 +10230,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
          */ fun `terminalCommitTextBytes`(`text`: kotlin.String, `bracketedPasteMode`: kotlin.Boolean): kotlin.ByteArray {
             return FfiConverterByteArray.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_terminal_commit_text_bytes(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_commit_text_bytes(
     
         FfiConverterString.lower(`text`),FfiConverterBoolean.lower(`bracketedPasteMode`),_status)
 }
@@ -10251,7 +10251,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
          */ fun `terminalCtrlByte`(`codePoint`: kotlin.UInt): kotlin.UByte? {
             return FfiConverterOptionalUByte.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_terminal_ctrl_byte(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_ctrl_byte(
     
         FfiConverterUInt.lower(`codePoint`),_status)
 }
@@ -10267,7 +10267,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
          */ fun `terminalSpecialKeyBytes`(`key`: TerminalSpecialKey, `applicationCursorMode`: kotlin.Boolean): kotlin.ByteArray {
             return FfiConverterByteArray.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_terminal_special_key_bytes(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(
     
         FfiConverterTypeTerminalSpecialKey.lower(`key`),FfiConverterBoolean.lower(`applicationCursorMode`),_status)
 }
@@ -10282,7 +10282,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
          */ fun `terminalUnicodeCharBytes`(`unicodeChar`: kotlin.UInt): kotlin.ByteArray? {
             return FfiConverterOptionalByteArray.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_terminal_unicode_char_bytes(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_unicode_char_bytes(
     
         FfiConverterUInt.lower(`unicodeChar`),_status)
 }
@@ -10295,7 +10295,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
          */ fun `debugClearUdpFault`()
         = 
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_debug_clear_udp_fault(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_debug_clear_udp_fault(
     
         _status)
 }
@@ -10307,7 +10307,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
          */ fun `debugCutUdpFault`()
         = 
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_debug_cut_udp_fault(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_debug_cut_udp_fault(
     
         _status)
 }
@@ -10319,7 +10319,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
          */ fun `debugRestoreUdpFault`()
         = 
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_debug_restore_udp_fault(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_debug_restore_udp_fault(
     
         _status)
 }
@@ -10331,7 +10331,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
          */ fun `debugSetUdpFaultLatencyMs`(`ms`: kotlin.UInt)
         = 
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_debug_set_udp_fault_latency_ms(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_latency_ms(
     
         FfiConverterUInt.lower(`ms`),_status)
 }
@@ -10343,7 +10343,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
          */ fun `debugSetUdpFaultLossPermille`(`permille`: kotlin.UInt)
         = 
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_debug_set_udp_fault_loss_permille(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_loss_permille(
     
         FfiConverterUInt.lower(`permille`),_status)
 }
@@ -10352,7 +10352,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
  fun `createHelperQuicSession`(`config`: HelperQuicConfig): HelperQuicSession {
             return FfiConverterTypeHelperQuicSession.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_create_helper_quic_session(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_helper_quic_session(
     
         FfiConverterTypeHelperQuicConfig.lower(`config`),_status)
 }
@@ -10362,7 +10362,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
  fun `createIsekaiLinkRelaySession`(`config`: IsekaiLinkRelayConfig): IsekaiLinkRelaySession {
             return FfiConverterTypeIsekaiLinkRelaySession.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_create_isekai_link_relay_session(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_isekai_link_relay_session(
     
         FfiConverterTypeIsekaiLinkRelayConfig.lower(`config`),_status)
 }
@@ -10372,7 +10372,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
  fun `createIsekaiStunP2pSession`(`config`: IsekaiStunP2pConfig): IsekaiStunP2pSession {
             return FfiConverterTypeIsekaiStunP2pSession.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_create_isekai_stun_p2p_session(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_isekai_stun_p2p_session(
     
         FfiConverterTypeIsekaiStunP2pConfig.lower(`config`),_status)
 }
@@ -10382,7 +10382,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
  fun `createMultipathHelperQuicSession`(`config`: MultipathHelperQuicConfig): MultipathHelperQuicSession {
             return FfiConverterTypeMultipathHelperQuicSession.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_create_multipath_helper_quic_session(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_multipath_helper_quic_session(
     
         FfiConverterTypeMultipathHelperQuicConfig.lower(`config`),_status)
 }
@@ -10392,7 +10392,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
  fun `createSessionOrchestrator`(`callback`: OrchestratorCallback): SessionOrchestrator {
             return FfiConverterTypeSessionOrchestrator.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_create_session_orchestrator(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_session_orchestrator(
     
         FfiConverterTypeOrchestratorCallback.lower(`callback`),_status)
 }
@@ -10402,7 +10402,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
  fun `createQuicSession`(`config`: QuicConfig): QuicSession {
             return FfiConverterTypeQuicSession.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_create_quic_session(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_quic_session(
     
         FfiConverterTypeQuicConfig.lower(`config`),_status)
 }
@@ -10412,7 +10412,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
  fun `createSessionSupervisor`(): SessionSupervisor {
             return FfiConverterTypeSessionSupervisor.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_tssh_core_fn_func_create_session_supervisor(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_session_supervisor(
     
         _status)
 }

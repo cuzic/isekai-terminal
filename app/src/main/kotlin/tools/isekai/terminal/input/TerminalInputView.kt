@@ -54,7 +54,7 @@ class TerminalInputView @JvmOverloads constructor(
 
     override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: Rect?) {
         super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
-        RemoteLogger.i("TsshIME", "input view focus: $gainFocus (onSendBytes=${onSendBytes != null})")
+        RemoteLogger.i("IsekaiTerminalIME", "input view focus: $gainFocus (onSendBytes=${onSendBytes != null})")
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {

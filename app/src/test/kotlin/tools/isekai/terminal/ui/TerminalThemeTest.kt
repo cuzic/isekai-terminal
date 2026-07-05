@@ -12,10 +12,10 @@ import org.robolectric.annotation.Config
 /**
  * 配色テーマのプリセット選択・永続化（案C）のテスト。
  *
- * Rust 側への実際の反映（`uniffi.tssh_core.setTerminalTheme`）はホスト JVM 上で
+ * Rust 側への実際の反映（`uniffi.isekai_terminal_core.setTerminalTheme`）はホスト JVM 上で
  * ネイティブライブラリを解決できないため、ここでは native 呼び出しに一切触れず、
  * 1) プリセット名 → テーマの解決ロジック、2) SharedPreferences への永続化・復元、
- * の2点のみを検証する（実際の Rust 反映は `cargo test -p tssh-core --lib` 側でカバー済み）。
+ * の2点のみを検証する（実際の Rust 反映は `cargo test -p isekai-terminal-core --lib` 側でカバー済み）。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -61,21 +61,21 @@ class TerminalThemeTest {
 
     @Test fun `selecting a theme persists to SharedPreferences and survives restart`() {
         val ctx = ApplicationProvider.getApplicationContext<Application>()
-        val prefs = ctx.getSharedPreferences("tssh_ui", Application.MODE_PRIVATE)
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Application.MODE_PRIVATE)
 
         // 選択（ProfileListScreen の onSelect と同じ書き込み方）
         prefs.edit().putString(TerminalThemes.PREF_KEY, TerminalThemes.DRACULA.name).apply()
 
         // 「次回起動時の復元」は永続化されたプリセット名を読み直して解決するだけなので、
         // 新しい SharedPreferences ハンドルで読み直しても同じ結果になることを確認する
-        val restoredPrefs = ctx.getSharedPreferences("tssh_ui", Application.MODE_PRIVATE)
+        val restoredPrefs = ctx.getSharedPreferences("isekai_terminal_ui", Application.MODE_PRIVATE)
         val restored = TerminalThemes.byName(restoredPrefs.getString(TerminalThemes.PREF_KEY, null))
         assertEquals(TerminalThemes.DRACULA, restored)
     }
 
     @Test fun `no persisted value yet resolves to default dark on first launch`() {
         val ctx = ApplicationProvider.getApplicationContext<Application>()
-        val prefs = ctx.getSharedPreferences("tssh_ui_fresh_${System.nanoTime()}", Application.MODE_PRIVATE)
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui_fresh_${System.nanoTime()}", Application.MODE_PRIVATE)
         val restored = TerminalThemes.byName(prefs.getString(TerminalThemes.PREF_KEY, null))
         assertEquals(TerminalThemes.DEFAULT_DARK, restored)
     }

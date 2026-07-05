@@ -30,7 +30,7 @@ class SnippetEditViewModel(app: Application) : AndroidViewModel(app) {
         if (_isSaving.value) return
         _isSaving.value = true
         viewModelScope.launch(Dispatchers.IO) {
-            RemoteLogger.i("TsshSnippet", "saving snippet: label='${snippet.label}' profileId=${snippet.profileId} id=${if (snippet.id == 0L) "new" else "${snippet.id}"}")
+            RemoteLogger.i("IsekaiTerminalSnippet", "saving snippet: label='${snippet.label}' profileId=${snippet.profileId} id=${if (snippet.id == 0L) "new" else "${snippet.id}"}")
             Repositories.snippets.save(snippet)
             _isSaving.value = false
             onSaved()

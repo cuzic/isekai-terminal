@@ -4,11 +4,11 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import tools.isekai.terminal.util.RemoteLogger
-import uniffi.tssh_core.debugClearUdpFault
-import uniffi.tssh_core.debugCutUdpFault
-import uniffi.tssh_core.debugRestoreUdpFault
-import uniffi.tssh_core.debugSetUdpFaultLatencyMs
-import uniffi.tssh_core.debugSetUdpFaultLossPermille
+import uniffi.isekai_terminal_core.debugClearUdpFault
+import uniffi.isekai_terminal_core.debugCutUdpFault
+import uniffi.isekai_terminal_core.debugRestoreUdpFault
+import uniffi.isekai_terminal_core.debugSetUdpFaultLatencyMs
+import uniffi.isekai_terminal_core.debugSetUdpFaultLossPermille
 
 /**
  * Phase 7-5 実機検証専用: `adb shell am broadcast` から isekai-helper QUIC の

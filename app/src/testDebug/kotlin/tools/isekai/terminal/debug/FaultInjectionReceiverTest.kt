@@ -13,7 +13,7 @@ import org.robolectric.annotation.Config
 
 /**
  * Phase 8-4: 実機なしで `FaultInjectionReceiver` の intent 解釈ロジックを検証する。
- * native FFI (`uniffi.tssh_core.debug*`) は実機/エミュレータでしか動かないため、
+ * native FFI (`uniffi.isekai_terminal_core.debug*`) は実機/エミュレータでしか動かないため、
  * [FaultInjectorApi] を fake に差し替えて、5つの broadcast action が正しい
  * 引数で正しい呼び出しにマッピングされることだけを Robolectric 上で確認する。
  * `scripts/phase7-5-roaming-test.sh` が実機で送る `adb shell am broadcast` の

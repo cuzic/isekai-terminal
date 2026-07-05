@@ -2,8 +2,8 @@ package tools.isekai.terminal.ui
 
 import org.junit.Assert.assertEquals
 import org.junit.Test
-import uniffi.tssh_core.CellData
-import uniffi.tssh_core.ScreenUpdate
+import uniffi.isekai_terminal_core.CellData
+import uniffi.isekai_terminal_core.ScreenUpdate
 
 class TerminalSelectionTest {
 

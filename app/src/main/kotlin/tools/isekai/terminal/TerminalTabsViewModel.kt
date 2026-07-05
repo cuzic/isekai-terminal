@@ -36,15 +36,15 @@ import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
-import uniffi.tssh_core.CellData
-import uniffi.tssh_core.HelperQuicConfig
-import uniffi.tssh_core.IsekaiLinkRelayConfig
-import uniffi.tssh_core.IsekaiStunP2pConfig
-import uniffi.tssh_core.MultipathHelperQuicConfig
-import uniffi.tssh_core.QuicConfig
-import uniffi.tssh_core.SshAuth
-import uniffi.tssh_core.SshConfig
-import uniffi.tssh_core.TransportPreference
+import uniffi.isekai_terminal_core.CellData
+import uniffi.isekai_terminal_core.HelperQuicConfig
+import uniffi.isekai_terminal_core.IsekaiLinkRelayConfig
+import uniffi.isekai_terminal_core.IsekaiStunP2pConfig
+import uniffi.isekai_terminal_core.MultipathHelperQuicConfig
+import uniffi.isekai_terminal_core.QuicConfig
+import uniffi.isekai_terminal_core.SshAuth
+import uniffi.isekai_terminal_core.SshConfig
+import uniffi.isekai_terminal_core.TransportPreference
 
 /**
  * 複数タブ（複数 SSH/QUIC セッション）を横断する Activity/Application スコープの状態管理。
@@ -53,7 +53,7 @@ import uniffi.tssh_core.TransportPreference
  * 起動/停止・ネットワーク断の全セッションへのファンアウト——をここに集約する。
  * 個々のセッションのドメインロジック（接続状態機械・trzsz 等）は既存の [TerminalSession]
  * にそのまま委譲し、[TerminalSession] 自体は無改修で複数インスタンス生成するだけに留める
- * （Rust の [uniffi.tssh_core.SessionOrchestratorInterface] もグローバル状態を持たない設計
+ * （Rust の [uniffi.isekai_terminal_core.SessionOrchestratorInterface] もグローバル状態を持たない設計
  * のため、UniFFI 側の変更は不要）。
  *
  * 単一セッション時代の [TerminalViewModel] が持っていた全トランスポート分岐・スニペット・
@@ -139,9 +139,9 @@ class TerminalTabsViewModel(
     private val watchJobs = mutableMapOf<String, Job>()
 
     init {
-        RemoteLogger.i("TsshTabsVM", "TerminalTabsViewModel created")
+        RemoteLogger.i("IsekaiTerminalTabsVM", "TerminalTabsViewModel created")
         executor.registerNetworkCallbacks(
-            onAvailable = { RemoteLogger.i("TsshSSH", "network available") },
+            onAvailable = { RemoteLogger.i("IsekaiTerminalSSH", "network available") },
             onLost = { onNetworkLost() },
         )
     }
@@ -157,12 +157,12 @@ class TerminalTabsViewModel(
 
     /**
      * アプリ全体の既定テーマ(ProfileListScreenの配色ダイアログが書き込む
-     * SharedPreferences("tssh_ui"))を読む。[openTab]でプロファイルにテーマ指定が
+     * SharedPreferences("isekai_terminal_ui"))を読む。[openTab]でプロファイルにテーマ指定が
      * 無い場合の解決や、[applyGlobalThemeToNonOverriddenTabs]の呼び出し元(MainActivity)
      * が渡してくる値の既定として使う。
      */
     private fun currentGlobalTheme(): TerminalTheme {
-        val prefs = getApplication<Application>().getSharedPreferences("tssh_ui", android.content.Context.MODE_PRIVATE)
+        val prefs = getApplication<Application>().getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE)
         return TerminalThemes.byName(prefs.getString(TerminalThemes.PREF_KEY, null))
     }
 
@@ -177,7 +177,7 @@ class TerminalTabsViewModel(
         val initialTheme = profileTheme ?: currentGlobalTheme()
         val tab = TabState(tabId, session, profile, profile.label, initialTheme, initialThemeIsOverridden = profileTheme != null)
 
-        RemoteLogger.i("TsshTabsVM", "openTab '${profile.label}' id=$tabId")
+        RemoteLogger.i("IsekaiTerminalTabsVM", "openTab '${profile.label}' id=$tabId")
         _tabs.update { it + tab }
         _activeTabId.value = tabId
 
@@ -192,7 +192,7 @@ class TerminalTabsViewModel(
     /** タブを切断＋破棄する。最後のタブが閉じられた場合のみ FGS を停止させる。 */
     fun closeTab(tabId: String) {
         val tab = _tabs.value.find { it.tabId == tabId } ?: return
-        RemoteLogger.i("TsshTabsVM", "closeTab id=$tabId")
+        RemoteLogger.i("IsekaiTerminalTabsVM", "closeTab id=$tabId")
         tab.session.disconnect()
         tab.session.close()
         watchJobs.remove(tabId)?.cancel()
@@ -276,11 +276,11 @@ class TerminalTabsViewModel(
             try {
                 val cellular = executor.acquireCellularFd()
                 if (cellular == null) {
-                    RemoteLogger.w("TsshSSH", "upstream failover: cellular fd not available, staying on current path")
+                    RemoteLogger.w("IsekaiTerminalSSH", "upstream failover: cellular fd not available, staying on current path")
                     return@launch
                 }
                 val (fd, localIp) = cellular
-                RemoteLogger.i("TsshSSH", "upstream failover: rebinding to cellular (localIp=$localIp)")
+                RemoteLogger.i("IsekaiTerminalSSH", "upstream failover: rebinding to cellular (localIp=$localIp)")
                 tab.session.rebindToFd(fd, localIp)
             } finally {
                 tab.rebindInFlight.set(false)
@@ -303,7 +303,7 @@ class TerminalTabsViewModel(
         armPostConnectCommands(tab, profile)
         loadSnippets(tab.tabId, profile.id)
         RemoteLogger.i(
-            "TsshSSH",
+            "IsekaiTerminalSSH",
             "connectTab[${tab.tabId}]: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} " +
                 "transport=${profile.transportPreference}" +
                 (if (profile.usesJumpHost) " via jump ${profile.jumpUsername}@${profile.jumpHost}:${profile.jumpPort}" else ""),
@@ -432,7 +432,7 @@ class TerminalTabsViewModel(
     ): SshAuth? {
         return when (val v = AuthValidator.validate(authType, password, keyId)) {
             is AuthValidation.Error -> {
-                RemoteLogger.w("TsshSSH", "${errorPrefix}auth error: ${v.statusMsg}")
+                RemoteLogger.w("IsekaiTerminalSSH", "${errorPrefix}auth error: ${v.statusMsg}")
                 tab.preConnectError.value = "$errorPrefix${v.statusMsg}"
                 null
             }
@@ -444,7 +444,7 @@ class TerminalTabsViewModel(
     private suspend fun loadPublicKeyAuth(tab: TabState, keyId: Long): SshAuth? =
         runCatching { SshAuth.PublicKey(executor.loadKeyPem(keyId)) }
             .getOrElse { e ->
-                RemoteLogger.e("TsshSSH", "key error: ${e.message}", e)
+                RemoteLogger.e("IsekaiTerminalSSH", "key error: ${e.message}", e)
                 tab.preConnectError.value = "鍵エラー: ${e.message}"
                 null
             }
@@ -460,7 +460,7 @@ class TerminalTabsViewModel(
     }
 
     fun sendSnippet(tabId: String, snippet: Snippet) {
-        RemoteLogger.i("TsshSnippet", "send snippet '${snippet.label}' id=${snippet.id} tab=$tabId")
+        RemoteLogger.i("IsekaiTerminalSnippet", "send snippet '${snippet.label}' id=${snippet.id} tab=$tabId")
         send(tabId, SnippetCommands.toBytes(snippet))
     }
 
@@ -479,7 +479,7 @@ class TerminalTabsViewModel(
         val bytes = tab.pendingPostConnectBytes ?: return
         viewModelScope.launch {
             delay(POST_CONNECT_DEBOUNCE_MS)
-            RemoteLogger.i("TsshSSH", "sending post-connect commands (${bytes.size} bytes) tab=${tab.tabId}")
+            RemoteLogger.i("IsekaiTerminalSSH", "sending post-connect commands (${bytes.size} bytes) tab=${tab.tabId}")
             send(tab.tabId, bytes)
         }
     }
@@ -551,7 +551,7 @@ class TerminalTabsViewModel(
 
     override fun onCleared() {
         super.onCleared()
-        RemoteLogger.i("TsshTabsVM", "TerminalTabsViewModel cleared")
+        RemoteLogger.i("IsekaiTerminalTabsVM", "TerminalTabsViewModel cleared")
         watchJobs.values.forEach { it.cancel() }
         _tabs.value.forEach { it.session.close() }
         executor.unregisterNetworkCallbacks()

@@ -45,7 +45,7 @@ import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.offsetToCellPos
 import tools.isekai.terminal.ui.reconstructSelectionText
 import tools.isekai.terminal.util.RemoteLogger
-import uniffi.tssh_core.*
+import uniffi.isekai_terminal_core.*
 
 /**
  * [TerminalScreenBody] が呼び出し元 (単一セッションの [TerminalScreen] か、複数タブの
@@ -202,7 +202,7 @@ fun TerminalScreenBody(
                         onClick = {
                             val log = actions.onGetSessionLog()
                             val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            cm.setPrimaryClip(ClipData.newPlainText("tssh log", log))
+                            cm.setPrimaryClip(ClipData.newPlainText("isekai-terminal log", log))
                         },
                         contentPadding = PaddingValues(0.dp),
                     ) { Text("ログ", color = AppColors.SecondaryText, fontSize = 11.sp) }
@@ -215,7 +215,7 @@ fun TerminalScreenBody(
         }
 
         // ターミナルキャンバス — font scale / 配色テーマは SharedPreferences 経由で永続化
-        val prefs = remember { context.getSharedPreferences("tssh_ui", android.content.Context.MODE_PRIVATE) }
+        val prefs = remember { context.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE) }
         var fontScale by remember { mutableStateOf(prefs.getFloat("font_scale", 1f)) }
         val saveFontScale: (Float) -> Unit = remember {
             { scale -> prefs.edit().putFloat("font_scale", scale).apply() }
@@ -372,7 +372,7 @@ fun TerminalScreenBody(
                                 val text = reconstructSelectionText(displayUpdate, sel)
                                 if (text.isNotEmpty()) {
                                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    cm.setPrimaryClip(ClipData.newPlainText("tssh selection", text))
+                                    cm.setPrimaryClip(ClipData.newPlainText("isekai-terminal selection", text))
                                 }
                                 selection = null
                             }) { Text("コピー", color = Color.Cyan, fontSize = 12.sp) }

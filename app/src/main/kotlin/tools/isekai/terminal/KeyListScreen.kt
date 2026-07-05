@@ -181,7 +181,7 @@ fun KeyListScreen(
                             key = key,
                             createdAtText = dateFmt.format(Date(key.createdAt)),
                             onCopy = {
-                                RemoteLogger.i("TsshKey", "copied public key: '${key.label}' id=${key.id}")
+                                RemoteLogger.i("IsekaiTerminalKey", "copied public key: '${key.label}' id=${key.id}")
                                 val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                 cm.setPrimaryClip(ClipData.newPlainText("public key", key.publicKey))
                             },
