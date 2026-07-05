@@ -71,6 +71,65 @@ final class TerminalIMEInputViewTests: XCTestCase {
         XCTAssertEqual(view.committedText, "ab")
     }
 
+    // MARK: - Phase 1D(#18b): ターミナル統合用フック(onSendBytes/ctrlArmed)
+
+    func testInsertTextSendsCommitBytes() {
+        let view = TerminalIMEInputView()
+        var sent: [Data] = []
+        view.onSendBytes = { sent.append($0) }
+
+        view.insertText("a")
+
+        XCTAssertEqual(sent, [Data("a".utf8)])
+    }
+
+    func testCommittingMarkedTextSendsBytesOnce() {
+        let view = TerminalIMEInputView()
+        var sent: [Data] = []
+        view.onSendBytes = { sent.append($0) }
+
+        view.setMarkedText("こんにちは", selectedRange: NSRange(location: 5, length: 0))
+        view.unmarkText()
+
+        XCTAssertEqual(sent, [Data("こんにちは".utf8)])
+    }
+
+    func testDeleteBackwardAlwaysSendsDelByteEvenWhenBufferEmpty() {
+        let view = TerminalIMEInputView()
+        var sent: [Data] = []
+        view.onSendBytes = { sent.append($0) }
+
+        // バッファは空(何も入力していない)でも、ターミナル側には削除すべき文字が
+        // あり得るため、常にDELバイトを送信する。
+        view.deleteBackward()
+
+        XCTAssertEqual(sent, [Data([0x7F])])
+    }
+
+    func testCtrlArmedConvertsNextSingleCharacterToControlByte() {
+        let view = TerminalIMEInputView()
+        var sent: [Data] = []
+        view.onSendBytes = { sent.append($0) }
+
+        view.ctrlArmed = true
+        view.insertText("c")
+
+        XCTAssertEqual(sent, [Data([0x03])]) // Ctrl+C
+        XCTAssertFalse(view.ctrlArmed, "1文字処理したら自動的にOFFへ戻る")
+    }
+
+    func testCtrlArmedFallsBackToNormalCommitForMultiCharacterInsert() {
+        let view = TerminalIMEInputView()
+        var sent: [Data] = []
+        view.onSendBytes = { sent.append($0) }
+
+        view.ctrlArmed = true
+        view.insertText("ab")
+
+        XCTAssertEqual(sent, [terminalCommitTextBytes(text: "ab", bracketedPasteMode: false)])
+        XCTAssertFalse(view.ctrlArmed)
+    }
+
     func testCanBecomeFirstResponder() {
         let view = TerminalIMEInputView()
         XCTAssertTrue(view.canBecomeFirstResponder)

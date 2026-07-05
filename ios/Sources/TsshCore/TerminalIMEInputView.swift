@@ -26,6 +26,19 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
     /// `setMarkedText`に渡された値をそのまま記録する。テストからの観測用。
     public private(set) var markedTextLog: [String?] = []
 
+    /// Phase 1A-7: ターミナル統合用。テキスト確定時・Backspace時に、実際にSSHへ
+    /// 送信すべきバイト列を通知する(`terminal_commit_text_bytes`/固定バイトで計算)。
+    /// このview自身は「送信」を知らず、呼び出し側(`TerminalView`)がこれを
+    /// セッションへ流す。
+    public var onSendBytes: ((Data) -> Void)?
+    /// ブラケットペーストモード(サーバー側から`ScreenUpdate.bracketedPasteMode`で
+    /// 通知される)。`terminal_commit_text_bytes`のバイト計算に使う。
+    public var bracketedPasteMode: Bool = false
+    /// アクセサリバーの「Ctrl」ボタンがONの間、次に確定された単一文字を
+    /// 通常のテキスト確定ではなくCtrl制御バイト(`terminal_ctrl_byte`)として送信する。
+    /// 該当する1文字を処理し終えたら自動的にfalseへ戻る(トグル式)。
+    public var ctrlArmed: Bool = false
+
     public override init(frame: CGRect) {
         super.init(frame: frame)
     }
@@ -47,15 +60,30 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
         buffer += text
         committedText = buffer
         _selectedTextRange = IndexedTextRange(range: NSRange(location: (buffer as NSString).length, length: 0))
+
+        if ctrlArmed, text.unicodeScalars.count == 1, let scalar = text.unicodeScalars.first,
+           let ctrlByte = terminalCtrlByte(codePoint: scalar.value) {
+            ctrlArmed = false
+            onSendBytes?(Data([ctrlByte]))
+        } else {
+            ctrlArmed = false
+            onSendBytes?(terminalCommitTextBytes(text: text, bracketedPasteMode: bracketedPasteMode))
+        }
     }
 
     public func deleteBackward() {
         // 変換中(marked textあり)のBackspaceは、実際のIMEでは`setMarkedText`の
         // 呼び直しとして表現される(このviewのdeleteBackwardは呼ばれない)。
-        // ここでは確定済みバッファに対する通常のBackspaceのみを扱う。
-        guard markedRange == nil, !buffer.isEmpty else { return }
-        buffer.removeLast()
-        committedText = buffer
+        guard markedRange == nil else { return }
+        // このviewの`buffer`はUITextInputプロトコル用の内部トラッキングに過ぎず、
+        // 実際のターミナル画面の内容とは独立している。そのため送信バイトは
+        // `buffer`が空かどうかに関係なく常に発行する(実際に削除すべき文字が
+        // ターミナル側に存在するかどうかはサーバー側の責務)。
+        if !buffer.isEmpty {
+            buffer.removeLast()
+            committedText = buffer
+        }
+        onSendBytes?(Data([0x7F]))
     }
 
     // MARK: - UITextInput: marked text
@@ -84,6 +112,7 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
         if markedRange != nil, let text = markedTextLog.last, let text {
             buffer += text
             committedText = buffer
+            onSendBytes?(terminalCommitTextBytes(text: text, bracketedPasteMode: bracketedPasteMode))
         }
         markedRange = nil
     }
