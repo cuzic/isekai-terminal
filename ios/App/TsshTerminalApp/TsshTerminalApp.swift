@@ -16,7 +16,7 @@ private enum AppRoute: Hashable {
     case profileEdit(ConnectionProfile?)
     case keyList
     case keyImport
-    case terminal(ConnectionProfile)
+    case terminal(profile: ConnectionProfile, password: String?)
     case diagnostics
 }
 
@@ -27,8 +27,8 @@ struct AppRootView: View {
         NavigationStack(path: $path) {
             ProfileListView(
                 model: ProfileListModel(),
-                onConnect: { profile, _ in
-                    path.append(.terminal(profile))
+                onConnect: { profile, password in
+                    path.append(.terminal(profile: profile, password: password))
                 },
                 onAddProfile: { path.append(.profileEdit(nil)) },
                 onEditProfile: { profile in path.append(.profileEdit(profile)) },
@@ -51,8 +51,8 @@ struct AppRootView: View {
                         onSave: { path.removeLast() },
                         onCancel: { path.removeLast() }
                     )
-                case .terminal(let profile):
-                    TerminalPlaceholderView(profile: profile)
+                case .terminal(let profile, let password):
+                    TerminalView(profile: profile, password: password)
                 case .diagnostics:
                     ContentView()
                 }

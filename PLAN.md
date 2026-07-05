@@ -2187,6 +2187,55 @@ MVPスコープ部分をSwiftUIへ移植した。
    (0.475秒、実接続)することを確認した。これによりAndroid版の
    `AUTH_MAGIC`仕様不一致の修正が正しいことも実証された。
 
+## ターミナル本画面の実装(#18b、2026-07-04、「ターミナル本画面の実装に進んで」指示)
+
+Phase 1D最後の主要ピース。SSH接続・VTE画面描画・日本語IME統合・特殊キーの
+アクセサリバーを1画面にまとめた`TerminalView`を実装した。
+
+- **`TerminalSessionController`/`TerminalUIState`**: `SessionCallback`
+  (Android版の新しい`OrchestratorCallback`ではなく、iOS版がPhase 1A-8で使った
+  従来の`createSshSession`/`SessionCallback`API)を実装する接続コントローラ。
+  `SessionCallback`のメソッドはRustのtokioワーカースレッドから直接呼ばれ、
+  かつ`onHostKey`は同期的に`Bool`を返す必要があるため、コントローラ自体は
+  `@MainActor`にせず(`@unchecked Sendable`の素のclass)、UIへ反映する
+  `@Published`状態だけを別クラス`TerminalUIState`(`@MainActor`)に分離し
+  `Task { @MainActor in }`で明示的に受け渡す設計にした。
+- **描画は`ScreenUpdate`/`CellData`を直接消費**: Phase 1A-6で作った
+  `TerminalFrameBatch`/`DiagnosticFrameMailbox`/`FrameIngress`(診断用の並行表現)は
+  一切使わず、Android版`ui/SshTerminalCanvas.kt`と対称に`CellData.fg`/`bg`を
+  ARGBパックのUInt32として直接解釈する`TerminalScreenView`(Core Graphics)を
+  新規に実装した(PLAN.mdで以前から指摘していた「実際の統合時はScreenUpdate/
+  CellDataを直接使うべき」という方針をここで実行した)。
+- **ホスト鍵確認はAndroid版と同じTOFU方式に決定**: `SshHostTrustStore`自体の
+  設計コメントは「対話的な確認UIを前提」だが、`onHostKey`がRustスレッドから
+  同期的にBoolを返す必要がある制約(接続処理をブロックしてまでUI確認を待つ
+  設計は複雑さに見合わない)を踏まえ、Android版`TerminalSession.kt`の
+  `onHostKey`と同じTrust On First Use方式(初回は自動信頼して記録、
+  fingerprint変化時のみ拒否)を採用した。対話的な確認UIへの格上げは将来の
+  改善候補として明記。
+- **`TerminalIMEInputView`にターミナル統合用フックを追加**(#18bで担う予定だった
+  部分): `onSendBytes`/`bracketedPasteMode`/`ctrlArmed`を追加。`insertText`/
+  `unmarkText`経由の確定テキストは`terminal_commit_text_bytes`で、Backspaceは
+  固定の0x7Fバイトで送信バイトを計算する。**Backspaceの送信は内部bufferの
+  空/非空に関係なく常に発行する**ように修正した(このviewの`buffer`は
+  UITextInputプロトコル用の内部トラッキングに過ぎず実際のターミナル画面内容とは
+  独立しているため、元の「bufferが空ならBackspaceを無視する」ガードは
+  実運用では誤りだった)。
+- **アクセサリバー**: Ctrl(トグル式、次の1文字をCtrl制御バイトに変換)・
+  Esc・Tab・矢印・Home/End/PageUp/PageDownを実装。矢印キーは`TerminalKeyMapper`
+  (Swift版)に`applicationCursorMode`切り替えのAPIが無いため常にCSI形式
+  (既知の制約、将来DECCKM対応する場合はRust関数を直接呼ぶ形へ拡張が必要)。
+- **cols/rowsは固定(80x24)**: 実際のview sizeに応じた動的リサイズ
+  (`SshSession.resize(cols:rows:)`は既に存在する)は後続の改善候補。
+- **テスト**: `TerminalSessionControllerTests`(TOFUロジックを実接続なしで検証)・
+  `TerminalScreenViewTests`(`ScreenUpdate`適用+`draw(_:)`直接呼び出しの
+  スモークテスト。`layer.render(in:)`はキャッシュ済みcontentsの再生でしかなく
+  `draw(_:)`を保証しないため、`UIGraphicsImageRenderer`のコンテキスト内で
+  `draw(_:)`を直接呼ぶ方式にした)・`TerminalIMEInputViewTests`に新規フックの
+  検証を追加(commit/backspace/ctrlArmedの各経路)。実際のSSH接続を伴う
+  ターミナル画面自体のXCUITestはまだ追加していない(実sshdへの接続待ちを伴う
+  ため、CI fixtureとの組み合わせは次の課題)。
+
 ---
 
 ## 実装順序
