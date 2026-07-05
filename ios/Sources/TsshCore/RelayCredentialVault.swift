@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import TsshCoreLogic
 
 /// Phase 1E-6(#45): MASQUE relay経由P2P QUIC接続用のJWT(`ConnectionProfile.relayJwt`)を
 /// GRDBに保存する前に暗号化するための薄いラッパー。Android版`RelayCredentialVault`+

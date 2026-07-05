@@ -1,4 +1,5 @@
 import SwiftUI
+import TsshCoreLogic
 
 /// Phase 1D/1F: Android版`ProfileListScreen.kt`/`ProfileListViewModel.kt`のMVP部分の
 /// 移植。Phase 1F-3(#50)でアプリ全体の既定配色テーマ選択を追加した。定型文管理は

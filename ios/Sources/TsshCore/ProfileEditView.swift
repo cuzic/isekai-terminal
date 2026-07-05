@@ -1,4 +1,5 @@
 import SwiftUI
+import TsshCoreLogic
 
 /// Phase 1D/1E/1F: Android版`ProfileEditScreen.kt`相当。label/host/port/username/
 /// 認証方式に加え、Phase 1Eで踏み台(ProxyJump)・ポートフォワード・SSH agent転送・

@@ -11,6 +11,7 @@
 		AAAABBBBCCCC00000000000B /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC000000000008 /* ContentView.swift */; };
 		AAAABBBBCCCC00000000000C /* DiagnosticCallbackBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC000000000009 /* DiagnosticCallbackBridge.swift */; };
 		AAAABBBBCCCC000000000018 /* TsshCore in Frameworks */ = {isa = PBXBuildFile; productRef = AAAABBBBCCCC000000000017 /* TsshCore */; };
+		AAAABBBBCCCC00000000003B /* TsshCoreLogic in Frameworks */ = {isa = PBXBuildFile; productRef = AAAABBBBCCCC00000000003A /* TsshCoreLogic */; };
 		AAAABBBBCCCC00000000001D /* CredentialVaultTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC00000000001C /* CredentialVaultTests.swift */; };
 		AAAABBBBCCCC000000000026 /* TsshCore in Frameworks */ = {isa = PBXBuildFile; productRef = AAAABBBBCCCC000000000017 /* TsshCore */; };
 		AAAABBBBCCCC000000000028 /* KeyListModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC000000000027 /* KeyListModelTests.swift */; };
@@ -64,6 +65,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AAAABBBBCCCC000000000026 /* TsshCore in Frameworks */,
+				AAAABBBBCCCC00000000003B /* TsshCoreLogic in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -165,6 +167,7 @@
 			name = TsshTerminalAppTests;
 			packageProductDependencies = (
 				AAAABBBBCCCC000000000017 /* TsshCore */,
+				AAAABBBBCCCC00000000003A /* TsshCoreLogic */,
 			);
 			productName = TsshTerminalAppTests;
 			productReference = AAAABBBBCCCC00000000001A /* TsshTerminalAppTests.xctest */;
@@ -581,6 +584,10 @@
 		AAAABBBBCCCC000000000017 /* TsshCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = TsshCore;
+		};
+		AAAABBBBCCCC00000000003A /* TsshCoreLogic */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = TsshCoreLogic;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

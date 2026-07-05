@@ -1,4 +1,5 @@
 import UIKit
+import TsshCoreLogic
 
 /// Phase 1A-5: 日本語IME単体スパイク。
 ///

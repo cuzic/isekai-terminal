@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import TsshCoreLogic
 
 /// Phase 1D(#18b): ターミナル本画面。SSH接続・VTE画面(`ScreenUpdate`)描画・
 /// 日本語IME統合・特殊キーのアクセサリバーを1画面にまとめる。

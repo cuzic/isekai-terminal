@@ -1,4 +1,5 @@
 import SwiftUI
+import TsshCoreLogic
 
 /// Phase 1G-2(#54): 複数タブ/複数セッション対応。Android版`TerminalTabsViewModel`
 /// (`TabState`のリスト+`activeTabId`)のSwift移植。

@@ -1,4 +1,5 @@
 import SwiftUI
+import TsshCoreLogic
 
 /// Phase 1G-1(#53): Android版`SnippetEditScreen.kt`/`SnippetEditViewModel.kt`の移植。
 @MainActor

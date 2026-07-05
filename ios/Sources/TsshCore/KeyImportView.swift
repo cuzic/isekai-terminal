@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import TsshCoreLogic
 
 /// Phase 1D: Android版`KeyImportScreen.kt`/`KeyImportViewModel.kt`の移植。
 /// Android版のSAFファイルピッカーに対応するのは`.fileImporter`。貼り付けでの

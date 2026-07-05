@@ -1,5 +1,6 @@
 import XCTest
 @testable import TsshCore
+import TsshCoreLogic
 
 /// Phase 1D(#18b): `TerminalSessionController`が実sshd(CI fixture)へ実際に接続し、
 /// `onConnected`/`onScreenUpdate`が`TerminalUIState`まで届くことを検証する

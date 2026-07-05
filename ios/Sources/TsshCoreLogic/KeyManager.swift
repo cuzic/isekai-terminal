@@ -1,5 +1,12 @@
 import Foundation
+// LinuxにはCryptoKitが無いため、Linux(`TsshCoreLogic`をLinuxで`swift test`する経路)では
+// swift-cryptoの`Crypto`モジュールを使う。`Curve25519.Signing.PrivateKey`のAPIは
+// CryptoKitと互換なので、この下で使っているAPIはどちらのモジュールでも同じシグネチャで動く。
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 
 /// Phase 1D: ed25519鍵ペア生成 + OpenSSH private key PEM形式のエンコード。
 /// Android版`KeyManager.kt`(`generateEd25519Pair`/`buildOpenSshPrivateKeyPem`/

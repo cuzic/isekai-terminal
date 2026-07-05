@@ -8,7 +8,7 @@
 #   rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 #
 # 先に rust-core/scripts/generate-swift-bindings.sh を実行し、
-# ../ios/Sources/TsshCore/generated/ にバインディングが生成済みであることが前提。
+# ../ios/Sources/TsshCoreLogic/generated/ にバインディングが生成済みであることが前提。
 #
 # 出力: ../ios/Frameworks/TsshCoreFFI.xcframework
 set -euo pipefail
@@ -19,7 +19,7 @@ if [[ "$(uname)" != "Darwin" ]]; then
     exit 1
 fi
 
-GENERATED_DIR="../ios/Sources/TsshCore/generated"
+GENERATED_DIR="../ios/Sources/TsshCoreLogic/generated"
 if [[ ! -f "$GENERATED_DIR/tssh_coreFFI.modulemap" ]]; then
     echo "error: $GENERATED_DIR/tssh_coreFFI.modulemap not found." >&2
     echo "       run rust-core/scripts/generate-swift-bindings.sh first." >&2

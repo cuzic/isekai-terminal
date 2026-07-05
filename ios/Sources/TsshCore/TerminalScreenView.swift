@@ -1,4 +1,5 @@
 import UIKit
+import TsshCoreLogic
 
 /// Phase 1F-2(#49): ピンチズームでのフォント拡縮率のクランプ計算(0.5〜3.0)。
 /// Android版`fontScale.coerceIn(0.5f, 3.0f)`と対称。UIKitのジェスチャコールバックから
@@ -149,7 +150,7 @@ public final class TerminalScreenView: UIView {
         let cols = Int(update.cols)
         let rows = Int(update.rows)
         let point = recognizer.location(in: self)
-        let cell = offsetToCellPos(x: point.x, y: point.y, cellWidth: cellSize.width, cellHeight: cellSize.height, cols: cols, rows: rows)
+        let cell = offsetToCellPos(x: Double(point.x), y: Double(point.y), cellWidth: Double(cellSize.width), cellHeight: Double(cellSize.height), cols: cols, rows: rows)
 
         switch recognizer.state {
         case .began:

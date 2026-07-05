@@ -1,4 +1,5 @@
 import SwiftUI
+import TsshCoreLogic
 
 /// Phase 1F-3(#50): ターミナル配色テーマ(プリセット選択・永続化)。Android版
 /// `ui/TerminalTheme.kt`のSwift移植。

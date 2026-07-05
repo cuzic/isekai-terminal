@@ -77,8 +77,8 @@ jobs:
       - name: Generate Swift bindings and check for drift
         run: |
           bash rust-core/scripts/generate-swift-bindings.sh
-          git diff --exit-code -- ios/Sources/TsshCore/generated || {
-            echo "::error::ios/Sources/TsshCore/generated is stale. Run rust-core/scripts/generate-swift-bindings.sh and commit the result." >&2
+          git diff --exit-code -- ios/Sources/TsshCoreLogic/generated || {
+            echo "::error::ios/Sources/TsshCoreLogic/generated is stale. Run rust-core/scripts/generate-swift-bindings.sh and commit the result." >&2
             exit 1
           }
 

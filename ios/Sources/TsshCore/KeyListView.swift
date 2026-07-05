@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import TsshCoreLogic
 
 /// Phase 1D: Android版`KeyListScreen.kt`/`KeyListViewModel.kt`の移植。
 /// 鍵一覧・削除・ed25519鍵生成をサポートする(既存鍵のインポートは`KeyImportView`)。

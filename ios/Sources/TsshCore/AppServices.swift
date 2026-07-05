@@ -1,4 +1,5 @@
 import Foundation
+import TsshCoreLogic
 
 /// Phase 1D: アプリ全体で共有するローカルDB/Vaultのシングルトン置き場。
 /// Android版`data.Repositories`(DAO/リポジトリのシングルトン集約)に相当する。

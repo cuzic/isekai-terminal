@@ -1,4 +1,5 @@
 import Foundation
+import TsshCoreLogic
 
 /// SSH agentへの署名要求。ユーザーが承認/拒否した結果を`respond`で
 /// `TerminalSessionController`(呼び出し元のRustスレッド、`DispatchSemaphore`で

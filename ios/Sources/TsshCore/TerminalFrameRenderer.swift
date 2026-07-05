@@ -1,4 +1,5 @@
 import UIKit
+import TsshCoreLogic
 
 /// Phase 1A-6: Rust→Swift画面更新ブリッジの最小レンダラー。
 ///

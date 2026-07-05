@@ -1,4 +1,5 @@
 import Foundation
+import TsshCoreLogic
 
 /// `EventWakeListener`をSwiftのクロージャで実装するための薄いブリッジ
 /// (`CallbackIngress.swift`のものと同型だが、frame配送用に独立させている)。

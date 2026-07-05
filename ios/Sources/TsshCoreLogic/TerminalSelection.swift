@@ -1,4 +1,4 @@
-import CoreGraphics
+import Foundation
 
 /// ビューポート内の行・列(0-indexed)。Android版`TerminalSelection.kt`の`CellPos`と対称。
 /// MVPの選択は行単位(linewise)のため`col`は将来のセル単位選択拡張用に保持するのみで、
@@ -35,7 +35,11 @@ public struct SelectionRange: Equatable {
 
 /// 画面上の座標(x, y)をセル位置に変換する。ビューポート範囲外はクランプする。
 /// cols/rowsが0以下(未初期化画面等)の場合は(0, 0)を返す。
-public func offsetToCellPos(x: CGFloat, y: CGFloat, cellWidth: CGFloat, cellHeight: CGFloat, cols: Int, rows: Int) -> CellPos {
+///
+/// 引数は`CGFloat`ではなく`Double`(呼び出し元のUIKit層で`Double(point.x)`のように
+/// 変換する)。`CoreGraphics`はLinuxに存在せず、この関数をLinuxでも`swift test`
+/// 可能にする(`TsshCoreLogic`ターゲット)ためにプラットフォーム非依存の型にしている。
+public func offsetToCellPos(x: Double, y: Double, cellWidth: Double, cellHeight: Double, cols: Int, rows: Int) -> CellPos {
     guard cols > 0, rows > 0, cellWidth > 0, cellHeight > 0 else { return CellPos(row: 0, col: 0) }
     let col = min(max(Int(x / cellWidth), 0), cols - 1)
     let row = min(max(Int(y / cellHeight), 0), rows - 1)

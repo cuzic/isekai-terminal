@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import Security
+import TsshCoreLogic
 
 /// Phase 1B: SSH秘密鍵・パスワード・passphrase・helper認証情報等を保護するための
 /// Vault(ChatGPT外部レビュー2026-07-04で#9aから拡張、PLAN.md「Phase Y」節参照)。
