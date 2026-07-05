@@ -1,1 +1,1 @@
-../TsshCoreLogicTests/SshFixtureConfig.swift
+../IsekaiTerminalCoreLogicTests/SshFixtureConfig.swift
