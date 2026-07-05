@@ -41,6 +41,18 @@ private final class AgentSignResultBox: @unchecked Sendable {
     var approved = false
 }
 
+/// Phase 1A-9(#30): `SshSession`/`HelperQuicSession`など、生成される各セッション型は
+/// 個別の`XxxSessionProtocol`にしか準拠していない(共通の親プロトコルが無い)ため、
+/// `TerminalSessionController`が接続方式を問わず同じ`send`/`resize`/`disconnect`
+/// 呼び出しで扱えるよう、この最小限のプロトコルへ同一モジュール内で事後適合させる。
+private protocol ActiveTerminalSession: AnyObject {
+    func send(data: Data)
+    func resize(cols: UInt32, rows: UInt32)
+    func disconnect()
+}
+extension SshSession: ActiveTerminalSession {}
+extension HelperQuicSession: ActiveTerminalSession {}
+
 /// Phase 1D: `ConnectionProfile`からSSH接続を開始し、`SessionCallback`を実装して
 /// Rust側からのイベントを`TerminalUIState`へ橋渡しする。
 ///
@@ -58,7 +70,7 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     private let db: ProfileDatabase
     private let vault: CredentialVault
     private let trustStore: SshHostTrustStore
-    private var session: SshSession?
+    private var session: ActiveTerminalSession?
 
     public init(
         profile: ConnectionProfile,
@@ -99,11 +111,34 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             )
         }
 
+        switch profile.transportPreference {
+        case .plainSsh:
+            connectPlainSsh(auth: auth, jump: jump, cols: cols, rows: rows)
+        case .isekaiHelperQuic:
+            connectHelperQuic(auth: auth, jump: jump, cols: cols, rows: rows, allowFallback: false)
+        case .auto:
+            connectHelperQuic(auth: auth, jump: jump, cols: cols, rows: rows, allowFallback: true)
+        case .tsshdQuic, .isekaiHelperQuicMultipath, .isekaiStunP2pQuic, .isekaiLinkRelayQuic:
+            // Android版は既に対応済み(Phase 9/10)だが、iOS版はPhase 1E-5〜1E-8で
+            // 順次対応予定(タスク#44〜#47、現時点では未実装)。
+            fail(message: "この接続方式はiOS版ではまだ未対応です")
+        }
+    }
+
+    // MARK: - Config構築(ネットワークに触れない純粋なマッピング)
+    //
+    // Android版`ConnectionProfile.toSshConfig`/`toHelperQuicConfig`相当。実際の
+    // セッション生成(`createSshSession`/`createHelperQuicSession`、Rust FFI越しの
+    // ネットワーク処理)とは分離してあるため、`internal`スコープのままテストから
+    // 直接呼び出して(ネットワークに触れずに)検証できる。
+
+    /// Android版`ConnectionProfile.toSshConfig`相当。
+    func makeSshConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> SshConfig {
         // Android版と同じ方針: agent forwardingは公開鍵認証の場合のみ有効にする
         // (パスワード認証には転送すべき鍵材料が無いため)。
         let agentForward = profile.enableAgentForward && profile.keyEntryId != nil
 
-        let config = SshConfig(
+        return SshConfig(
             host: profile.host,
             port: UInt16(profile.port),
             username: profile.username,
@@ -115,11 +150,48 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             jump: jump,
             allowNonLoopbackForwardBind: profile.allowNonLoopbackForwardBind
         )
+    }
 
+    /// Phase 1A-9(#30): isekai-helper経由QUIC最小縦切り。Android版
+    /// `ConnectionProfile.toHelperQuicConfig`相当。ブートストラップ用の平文SSH接続
+    /// (isekai-helperバイナリの配置)はRust側(`helper_bootstrap.rs`)が内部で行うため、
+    /// Swift側は`SshConfig`と同様の接続情報(ポートフォワード/agent forward以外、
+    /// `HelperQuicConfig`にはまだ無い)を渡すだけでよい。
+    func makeHelperQuicConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> HelperQuicConfig {
+        HelperQuicConfig(
+            sshHost: profile.host,
+            sshPort: UInt16(profile.port),
+            username: profile.username,
+            auth: auth,
+            cols: cols,
+            rows: rows,
+            jump: jump
+        )
+    }
+
+    /// Android版`connect(tab, config)`相当。
+    private func connectPlainSsh(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
+        let config = makeSshConfig(auth: auth, jump: jump, cols: cols, rows: rows)
         let newSession = createSshSession(config: config)
         session = newSession
         do {
             try newSession.connect(callback: self)
+        } catch {
+            fail(message: "\(error)")
+        }
+    }
+
+    /// Android版`connectHelperQuic(tab, config)`/`connectHelperQuicAuto(tab, config)`相当。
+    private func connectHelperQuic(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32, allowFallback: Bool) {
+        let config = makeHelperQuicConfig(auth: auth, jump: jump, cols: cols, rows: rows)
+        let newSession = createHelperQuicSession(config: config)
+        session = newSession
+        do {
+            if allowFallback {
+                try newSession.connectAuto(callback: self)
+            } else {
+                try newSession.connect(callback: self)
+            }
         } catch {
             fail(message: "\(error)")
         }

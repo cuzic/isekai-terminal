@@ -151,4 +151,73 @@ final class TerminalSessionControllerTests: XCTestCase {
         let result = await resultTask.value
         XCTAssertFalse(result)
     }
+
+    // MARK: - Phase 1A-9(#30): isekai-helper/QUIC最小縦切り(transportPreference分岐)
+    //
+    // 実際のネットワーク接続は行わず、Android版`ConnectionProfile.toSshConfig`/
+    // `toHelperQuicConfig`相当の純粋なconfig構築ロジックと、`transportPreference`に
+    // 応じた分岐(未対応方式は`.failed`になること)だけを検証する。
+
+    private func makeControllerWithProfile(_ profile: ConnectionProfile, password: String? = "pw") throws -> TerminalSessionController {
+        let db = try ProfileDatabase.inMemory()
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let vault = try CredentialVault(blobDirectory: tempDir, keychainService: "test.terminalsession.transport.\(UUID().uuidString)")
+        let trustStore = try SshHostTrustStore(storeURL: tempDir.appendingPathComponent("trust.json"))
+        return TerminalSessionController(profile: profile, password: password, db: db, vault: vault, trustStore: trustStore)
+    }
+
+    func testMakeSshConfigMapsProfileFieldsAndGatesAgentForwardOnKeyAuth() throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 2222, username: "user",
+            enableAgentForward: true,
+            forwards: [StoredPortForward(kind: .local, bindPort: 8080, remoteHost: "127.0.0.1", remotePort: 80)],
+            allowNonLoopbackForwardBind: true
+        )
+        let controller = try makeControllerWithProfile(profile)
+
+        // keyEntryIdが無い(パスワード認証)ため、enableAgentForward=trueでもgateされfalseになる。
+        let config = controller.makeSshConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+        XCTAssertEqual(config.host, "example.com")
+        XCTAssertEqual(config.port, 2222)
+        XCTAssertEqual(config.username, "user")
+        XCTAssertFalse(config.agentForward)
+        XCTAssertEqual(config.forwards.count, 1)
+        XCTAssertTrue(config.allowNonLoopbackForwardBind)
+    }
+
+    func testMakeHelperQuicConfigMapsProfileFields() throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 2222, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+        let jump = JumpConfig(host: "bastion.example.com", port: 22, username: "jumpuser", auth: .password(password: "jp"))
+
+        let config = controller.makeHelperQuicConfig(auth: .password(password: "pw"), jump: jump, cols: 100, rows: 40)
+
+        XCTAssertEqual(config.sshHost, "example.com")
+        XCTAssertEqual(config.sshPort, 2222)
+        XCTAssertEqual(config.username, "user")
+        XCTAssertEqual(config.cols, 100)
+        XCTAssertEqual(config.rows, 40)
+        XCTAssertEqual(config.jump, jump)
+    }
+
+    func testConnectWithUnsupportedTransportPreferenceFails() async throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 22, username: "user",
+            transportPreference: .isekaiStunP2pQuic
+        )
+        let controller = try makeControllerWithProfile(profile)
+
+        controller.connect()
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.state != .connecting
+        }
+        guard case .failed(let message) = controller.uiState.state else {
+            XCTFail("expected .failed state, got \(controller.uiState.state)")
+            return
+        }
+        XCTAssertTrue(message.contains("未対応"))
+    }
 }

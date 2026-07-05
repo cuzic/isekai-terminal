@@ -2292,6 +2292,72 @@ Phase 1E(トランスポート層)。ただしAndroid側でもSTUN P2P/relay P2P
 マルチパスは実機未検証の実験的機能のままなので、iOS版でもこれらを「完了」の
 基準にする必要はない(Android自身がそう扱っている)。
 
+### Phase 1E-1〜1E-4実装メモ(2026-07-04、#40〜#43完了)
+
+`ProfileDatabase.swift`に`StoredPortForward`/`StoredTransportPreference`という
+GRDB永続化専用のミラー型を追加した(UniFFI生成型`PortForward`/`TransportPreference`
+自体は`Equatable, Hashable`のみで`Codable`ではなく、別ファイルでの再帰的な
+`Codable`合成もSwiftでは出来ないため)。ハマった点:
+
+- `StoredPortForward.Kind`に`Equatable`/`Hashable`を付け忘れ、外側の
+  `StoredPortForward`自体の合成コンパイルが通らなかった(自己レビューで発見、
+  別コミットで修正)。
+- `StoredTransportPreference`に`DatabaseValueConvertible`を付けないと、GRDBの
+  Codable-record機構がJSON文字列としてダブルクォート付きで保存してしまい、
+  v2 migrationの`ALTER TABLE ... DEFAULT`の素の文字列リテラルと表現が食い違う
+  ところだった(生カラム値を直接読むテストで確認)。
+
+`onAgentSignRequest`(#43、Rustスレッドから同期的にBoolを返す必要がある)は
+`DispatchSemaphore` + `Task { @MainActor in }`でUI確認を橋渡しする方式にした
+(30秒タイムアウト、Android版と同じ方針)。
+
+### Phase 1A-9(#30)実装メモ(2026-07-05、isekai-helper/QUIC最小縦切り)
+
+**アーキテクチャ上の発見**: `createHelperQuicSession`/`HelperQuicSession.connect`・
+`connectAuto`だけでなく、`MultipathHelperQuicSession`・`IsekaiStunP2pSession`・
+`IsekaiLinkRelaySession`(#44〜#46が使う予定)も**全て既存の`SessionCallback`
+プロトコルを使う**ことを確認した(`OrchestratorCallback`/`SessionOrchestrator`への
+移行は不要)。Android側は`SessionOrchestrator`経由で全トランスポートを統一的に
+扱っているが(`TerminalTabsViewModel.connectTab`のトランスポート別分岐を参照)、
+iOS側は当面この直接セッション方式のままで#44〜#47まで実装を進められる。
+`SessionOrchestrator`への移行が必要かどうかは#24(Rust側`SessionSupervisor`実装)の
+スコープと合わせて改めて判断する。
+
+`TerminalSessionController.connect()`に`profile.transportPreference`による分岐を
+追加し(Android版`TerminalTabsViewModel.connectTab`の`when`式と同じ構造)、
+`.plainSsh`→`createSshSession`、`.isekaiHelperQuic`→`HelperQuicSession.connect`、
+`.auto`→`.connectAuto`(フォールバック付き)とし、未実装の残り4方式
+(`.tsshdQuic`/`.isekaiHelperQuicMultipath`/`.isekaiStunP2pQuic`/
+`.isekaiLinkRelayQuic`)は明示的に`.failed`にする。`SshSession`/`HelperQuicSession`は
+共通の親プロトコルを持たないため、`send`/`resize`/`disconnect`だけを要求する
+`ActiveTerminalSession`という薄いプロトコルへ両クラスを同一モジュール内で
+事後適合(`extension SshSession: ActiveTerminalSession {}`)させ、
+`TerminalSessionController.session`の型をそれに統一した。config構築ロジック
+(`makeSshConfig`/`makeHelperQuicConfig`、Android版`ConnectionProfile.toSshConfig`/
+`toHelperQuicConfig`相当)はネットワーク呼び出しから分離し、`internal`スコープで
+テストから直接呼べるようにした。
+
+**E2E検証範囲の意図的な限定(重要)**: `rust-core/src/helper_bootstrap.rs`を調査した
+結果、isekai-helperのブートストラップは**Linux musl static バイナリ**
+(`x86_64-unknown-linux-musl`/`aarch64-unknown-linux-musl`)をSSH経由でリモートに
+配置・実行する前提であることを確認した。一方、既存のiOS CI fixture
+(`rust-core/scripts/ios-fixture/start-sshd-fixture.sh`)は**macOS CIランナー自身の
+上で**sshdをループバック起動する方式のため、そこにLinuxバイナリを配置しても
+実行できない(macOSはLinux ELFをネイティブ実行できない)。この制約は`isekai-helper`
+クレート自体にLinux専用コードが無い(cross-compile自体は可能かもしれない)としても
+変わらない — 本番の埋め込み(`include_bytes!`、rust-core側)はLinux musl向けに
+固定されており、これを差し替えるにはrust-core本体の変更が必要になる。
+
+これはRust側`helper_bootstrap.rs`自身のe2eテストも実機/リモートLinuxサーバーを
+前提にした**opt-in扱い(通常のCIでは実行されない)**という既存の前例と同じ制約
+であり、iOS版だけの新しいギャップではない。したがって#30のCI検証範囲は
+「configのマッピングと`transportPreference`分岐が正しいこと」(ネットワーク非依存の
+unit test、`TerminalSessionControllerTests.swift`)に限定し、**実際のQUIC
+接続性・isekai-helperブートストラップの成否はこのセッションではCI検証しない**。
+将来これを検証したい場合は、(a) macOSランナーから疎通できる実Linuxサーバーを
+別途用意する、(b) 実機(iPhone)でユーザーが手動検証する、のいずれかが必要になる
+(Android版のSTUN P2P/relay P2P/物理マルチパスが実機未検証のままな理由と同種)。
+
 ---
 
 ## 実装順序
