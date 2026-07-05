@@ -2092,6 +2092,50 @@ rust-core側へ統合した。
   Rust移植の一次ソースだったため変更不要。Rust実装とKotlin実装は今後も
   golden testで相互検証しながら並行して保守する非対称な構成になる。
 
+## Phase 1D: iOS本体UI画面実装(2026-07-04、「先に画面の実装もすすめて」指示を受けて着手)
+
+Phase 1B完了時点でiOS側には実際のプロダクト画面(プロファイル一覧・鍵管理・
+ターミナル本体)が無く、Phase 1A-1の診断用`ContentView.swift`しか存在しなかった。
+「xcodeシミュレーターでテストできる範囲を網羅的に」という要望への対応として
+画面実装から着手する方針にユーザーが合意し、Android版の対応画面
+(`ProfileListScreen.kt`/`ProfileEditScreen.kt`/`KeyListScreen.kt`/`KeyImportScreen.kt`)の
+MVPスコープ部分をSwiftUIへ移植した。
+
+- **`KeyManager.swift`**: Android版`KeyManager.kt`(ed25519鍵生成+OpenSSH private key
+  PEMエンコード)をCryptoKitの`Curve25519.Signing.PrivateKey`で移植。
+  **移植時に発見した実装差異**: Android版のOpenSSH `AUTH_MAGIC`が仕様上
+  `"openssh-key-v1"` + 終端NUL(15バイト)であるべきところ、末尾が半角スペースに
+  なっている(仕様不一致の可能性がある既存バグ)。iOS版では仕様通りNULバイトで実装し、
+  実際のsshd(CI fixture)への認証成功をXCTestで検証して裏付けを取った
+  (Android版の修正は本タスクのスコープ外、別途確認が必要)。
+- **`AppServices.swift`**: `ProfileDatabase`/`CredentialVault`のアプリ全体シングルトン
+  (Android版`data.Repositories`相当)。実ファイルパスは`.applicationSupportDirectory`
+  配下。
+- **`ProfileListView`/`ProfileEditView`/`KeyListView`/`KeyImportView`**: いずれも
+  `ios/Sources/TsshCore/`(SwiftPMパッケージ、`ios/App/`のxcodeprojではなく)に配置。
+  これによりXcodeプロジェクトファイル(pbxproj)の手書き編集が一切不要になった
+  (SwiftPMがディレクトリ内の`.swift`ファイルを自動検出するため)。App target
+  (`TsshTerminalApp.swift`)からはこれらを`import TsshCore`で参照するだけでよい。
+- **スコープ**: iOS版`ConnectionProfile`(GRDB)は現時点でlabel/host/port/username/
+  keyEntryIdのみのMVPスキーマのため、踏み台(ProxyJump)・relay・multipath・
+  ポートフォワード等、Android版がPhase 7〜10で段階的に追加した高度な機能は
+  この一次実装のスコープに含めない(後続タスクで追加)。ターミナル本画面
+  (SSH接続+レンダリング+IME統合)も別タスクとして後続に切り出し、接続タップ時は
+  `TerminalPlaceholderView`(未実装であることを明示するプレースホルダー)へ遷移する。
+- **`NavigationStack`/`.navigationDestination(for:)`の採用に伴いiOS最低バージョンを
+  15→16に引き上げた**(`Package.swift`の`platforms`、pbxprojの
+  `IPHONEOS_DEPLOYMENT_TARGET`両方)。プログラム的な配列ベースpath
+  (`NavigationStack(path: $path)`、`AppRoute: Hashable`)を採用。
+- **テスト**: Keychainに触れない`ProfileListModel`/`ProfileEditModel`は素の
+  `TsshCoreTests`(非ホスト)で検証。`KeyManager`は仕様準拠の構造チェックに加えて、
+  CI fixtureのsshdへ実際に認証させるE2Eテストで検証(`KeyManagerTests.swift`)。
+  fixtureの`authorized_keys`はsshd起動後も接続の都度再読込されるため、
+  テスト実行時に動的に追記できることを利用した。既存の`SshVerticalSliceTests.swift`の
+  fixture読込ロジックは`SshFixtureConfig.swift`へ共通化。
+- **未着手(次のタスク)**: `KeyListModel`/`KeyImportModel`(Keychainに触れるため
+  `TsshTerminalAppTests`への追加が必要)・`TsshTerminalAppUITests`(XCUITest、
+  真のUI駆動テスト用の新規ターゲット)・ターミナル本画面の実装。
+
 ---
 
 ## 実装順序
