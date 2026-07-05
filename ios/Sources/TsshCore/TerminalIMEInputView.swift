@@ -47,6 +47,14 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
         super.init(coder: coder)
     }
 
+    // `UIResponder.inputAccessoryView`は既定でget-onlyなため、キーボード
+    // アクセサリバー(`TerminalView`の特殊キーバー)を設定できるようoverrideする。
+    private var _inputAccessoryView: UIView?
+    public override var inputAccessoryView: UIView? {
+        get { _inputAccessoryView }
+        set { _inputAccessoryView = newValue }
+    }
+
     public override var canBecomeFirstResponder: Bool { true }
 
     // MARK: - UIKeyInput
