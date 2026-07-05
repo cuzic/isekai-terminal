@@ -1,7 +1,7 @@
 //! HELLO/proof/ACK types, extracted from
 //! `rust-core/src/helper_quic_transport.rs` (`HELPER_PROTOCOL.md` §4). Only
 //! the message shapes and validation live here; computing the proof itself
-//! (HMAC over the QUIC exporter) stays in `tssh-core`/`isekai-transport`
+//! (HMAC over the QUIC exporter) stays in `isekai-terminal-core`/`isekai-transport`
 //! since it needs the live QUIC connection.
 
 use crate::error::ProtocolError;

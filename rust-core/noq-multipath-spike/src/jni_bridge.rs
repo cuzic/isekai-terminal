@@ -2,7 +2,7 @@
 //! `ConnectivityManager.requestNetwork()` + `Network.bindSocket()`) can hand
 //! two already-bound UDP fds to noq's multipath `Endpoint` in-process.
 //!
-//! Deliberately kept separate from `tssh-core`'s UniFFI surface: `noq` is
+//! Deliberately kept separate from `isekai-terminal-core`'s UniFFI surface: `noq` is
 //! still an experimental dependency for this spike, not something the
 //! production crate should carry yet.
 

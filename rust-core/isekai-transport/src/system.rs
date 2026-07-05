@@ -4,7 +4,7 @@
 //! tokio::net::UdpSocketをbindしてnoq::Endpointのクライアントとして使う").
 //!
 //! Deliberately must never reference `FaultyUdpSocket`, UniFFI, or any other
-//! Android/`tssh-core`-specific type — this crate is also linked into
+//! Android/`isekai-terminal-core`-specific type — this crate is also linked into
 //! `isekai-ssh`, a plain CLI binary with no Android runtime.
 //!
 //! The certificate-pinning logic (`PinnedCertVerifier`) and QUIC transport

@@ -16,7 +16,7 @@
 //!     no real Tailscale/direct addresses or Android fds needed).
 //!
 //! Isolated in `noq-multipath-spike` on purpose -- `noq` is not a dependency of
-//! `tssh-core`/`isekai-helper` yet (see `jni_bridge.rs` doc comment).
+//! `isekai-terminal-core`/`isekai-helper` yet (see `jni_bridge.rs` doc comment).
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;

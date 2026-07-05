@@ -8,7 +8,7 @@
 //! both callers.
 //!
 //! HTTP client: `ureq` (blocking, default `rustls`+`ring` TLS backend — the
-//! same combination `isekai-transport`/`tssh-core` already use elsewhere in
+//! same combination `isekai-transport`/`isekai-terminal-core` already use elsewhere in
 //! this workspace). `TokenProvider::get_relay_jwt` (`lib.rs`) is a plain sync
 //! `fn` by design, and `isekai-ssh login` (`device_flow`'s caller) only ever
 //! has one request in flight at a time, so an async HTTP stack

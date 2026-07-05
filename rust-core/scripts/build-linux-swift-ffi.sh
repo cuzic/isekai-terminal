@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# tssh-core を Linux ネイティブ(x86_64/aarch64-unknown-linux-gnu)向けにビルドし、
-# TsshCoreLogic(Swiftの純ロジック層)をLinux上で`swift build`/`swift test`できる
+# isekai-terminal-core を Linux ネイティブ(x86_64/aarch64-unknown-linux-gnu)向けにビルドし、
+# IsekaiTerminalCoreLogic(Swiftの純ロジック層)をLinux上で`swift build`/`swift test`できる
 # ようにする。XCFramework(build-ios-xcframework.sh)はmacOS専用パッケージング
 # 形式のためLinuxでは使えず、代わりにSwiftPMの`systemLibrary`ターゲット
-# (`ios/Sources/TsshCoreFFILinux/`)から直接 .so をリンクする。
+# (`ios/Sources/IsekaiTerminalCoreFFILinux/`)から直接 .so をリンクする。
 #
 # 事前準備: rust-core/scripts/generate-swift-bindings.sh が
-# ../ios/Sources/TsshCoreLogic/generated/ にSwiftバインディングを生成済みであること
+# ../ios/Sources/IsekaiTerminalCoreLogic/generated/ にSwiftバインディングを生成済みであること
 # (このスクリプトが最初に呼び出すので、単独では前提を満たさなくてよい)。
 #
 # 出力:
-#   ../ios/Frameworks/linux/libtssh_core.so (gitignore対象、CI/ローカルの一時生成物)
-#   ../ios/Sources/TsshCoreFFILinux/module.modulemap (Linux向けに`use "Darwin"`を除去したもの)
+#   ../ios/Frameworks/linux/libisekai_terminal_core.so (gitignore対象、CI/ローカルの一時生成物)
+#   ../ios/Sources/IsekaiTerminalCoreFFILinux/module.modulemap (Linux向けに`use "Darwin"`を除去したもの)
 #
 # 使い方(このスクリプトの実行後、ios/ で):
 #   export LIBRARY_PATH="$(pwd)/../ios/Frameworks/linux:$LIBRARY_PATH"
 #   export LD_LIBRARY_PATH="$(pwd)/../ios/Frameworks/linux:$LD_LIBRARY_PATH"
-#   swift test --filter TsshCoreLogicTests
+#   swift test --filter IsekaiTerminalCoreLogicTests
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -27,8 +27,8 @@ fi
 
 bash scripts/generate-swift-bindings.sh
 
-GENERATED_DIR="../ios/Sources/TsshCoreLogic/generated"
-LIB="target/debug/libtssh_core.so"
+GENERATED_DIR="../ios/Sources/IsekaiTerminalCoreLogic/generated"
+LIB="target/debug/libisekai_terminal_core.so"
 if [[ ! -f "$LIB" ]]; then
     echo "error: $LIB not found (generate-swift-bindings.sh should have built it)" >&2
     exit 1
@@ -36,19 +36,19 @@ fi
 
 OUT_FRAMEWORKS_DIR="../ios/Frameworks/linux"
 mkdir -p "$OUT_FRAMEWORKS_DIR"
-cp "$LIB" "$OUT_FRAMEWORKS_DIR/libtssh_core.so"
+cp "$LIB" "$OUT_FRAMEWORKS_DIR/libisekai_terminal_core.so"
 
 # uniffi-bindgenが生成するmodulemapは常に`use "Darwin"`を含む(ホストOSに関係なく
 # 固定テンプレート)。DarwinモジュールはLinuxに存在せずクラッシュするため、
-# Linux向けターゲット(`TsshCoreFFILinux`)ではこの行を除いたコピーを使う。
-# ヘッダー自体(`tssh_coreFFI.h`)はホストOSによらず内容が同一(既存の
+# Linux向けターゲット(`IsekaiTerminalCoreFFILinux`)ではこの行を除いたコピーを使う。
+# ヘッダー自体(`isekai_terminal_coreFFI.h`)はホストOSによらず内容が同一(既存の
 # XCFramework用生成物と診断で確認済み)なのでシンボリックリンクで共有する。
-FFI_LINUX_DIR="Sources/TsshCoreFFILinux"
+FFI_LINUX_DIR="Sources/IsekaiTerminalCoreFFILinux"
 mkdir -p "../ios/$FFI_LINUX_DIR"
-ln -sf "../TsshCoreLogic/generated/tssh_coreFFI.h" "../ios/$FFI_LINUX_DIR/tssh_coreFFI.h"
-sed '/use "Darwin"/d' "$GENERATED_DIR/tssh_coreFFI.modulemap" > "../ios/$FFI_LINUX_DIR/module.modulemap"
+ln -sf "../IsekaiTerminalCoreLogic/generated/isekai_terminal_coreFFI.h" "../ios/$FFI_LINUX_DIR/isekai_terminal_coreFFI.h"
+sed '/use "Darwin"/d' "$GENERATED_DIR/isekai_terminal_coreFFI.modulemap" > "../ios/$FFI_LINUX_DIR/module.modulemap"
 
 echo
 echo "done."
-echo "  $OUT_FRAMEWORKS_DIR/libtssh_core.so"
+echo "  $OUT_FRAMEWORKS_DIR/libisekai_terminal_core.so"
 echo "  ../ios/$FFI_LINUX_DIR/module.modulemap"

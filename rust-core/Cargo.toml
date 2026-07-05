@@ -3,13 +3,13 @@ members = [".", "uniffi-bindgen", "isekai-helper", "noq-multipath-spike", "h3-no
 resolver = "2"
 
 [package]
-name = "tssh-core"
+name = "isekai-terminal-core"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [lib]
-name = "tssh_core"
+name = "isekai_terminal_core"
 crate-type = ["cdylib", "staticlib"]
 
 [dev-dependencies]

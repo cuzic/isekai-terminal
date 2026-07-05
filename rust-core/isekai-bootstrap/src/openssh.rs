@@ -44,9 +44,9 @@ use crate::error::BootstrapError;
 use crate::types::{BootstrapReport, HostSpec, JumpSpec, RelayLaunchSpec};
 
 /// Mirrors `rust-core/src/helper_bootstrap.rs`'s constants of the same name.
-/// `tssh-core` is built as a `cdylib`/`staticlib` and can't be depended on as
+/// `isekai-terminal-core` is built as a `cdylib`/`staticlib` and can't be depended on as
 /// an ordinary Rust crate, so these are duplicated rather than shared;
-/// unifying them is deferred to the S-0f `tssh-core` facade cleanup
+/// unifying them is deferred to the S-0f `isekai-terminal-core` facade cleanup
 /// (`ISEKAI_SSH_DESIGN.md` "共有ロジックの crate 分割").
 const HELPER_INSTALL_DIR: &str = "~/.local/bin";
 const HELPER_BIN_NAME: &str = "isekai-helper";

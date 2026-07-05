@@ -1,11 +1,11 @@
 //! `RESUME`/`RESUME_ACK` frames (`HELPER_PROTOCOL.md` §7.3), byte-for-byte
 //! compatible with the wire format already implemented (as `pub(crate)`,
-//! non-shareable outside `tssh-core`) by `rust-core/src/resume_client.rs`
+//! non-shareable outside `isekai-terminal-core`) by `rust-core/src/resume_client.rs`
 //! and the `reattach_fn` closures in `helper_quic_transport.rs` /
 //! `isekai_link_relay_transport.rs` / `isekai_stun_p2p_transport.rs`. This
 //! module reimplements only the byte layout as a new, shareable type —
 //! `rust-core/src/` itself is intentionally left untouched (`ISEKAI_SSH_DESIGN.md`
-//! Phase S-4a scope: `tssh-core` migrating onto these types is future work).
+//! Phase S-4a scope: `isekai-terminal-core` migrating onto these types is future work).
 //!
 //! Per `ISEKAI_SSH_DESIGN.md` "resume を ProxyCommand の背後に隠す" /
 //! "session_id は識別子であって認証情報ではない", the `RESUME` frame carries
@@ -18,7 +18,7 @@
 //! field for it, only a type. `resume_proof` computation itself
 //! (`HMAC-SHA256(session_secret, exporter || session_id)`) needs a live QUIC
 //! connection's exporter and stays out of this I/O-free crate, in
-//! `isekai-transport`/`tssh-core`; here `ResumeProof` is deliberately just an
+//! `isekai-transport`/`isekai-terminal-core`; here `ResumeProof` is deliberately just an
 //! opaque 32-byte value, the same treatment `hello::Proof` gets for the
 //! initial HELLO proof.
 
@@ -317,7 +317,7 @@ mod tests {
     /// — using the same constant marker byte values
     /// (`resume_client::RESUME == 0x03`, matching `FRAME_RESUME` here) and
     /// confirms this crate's decoder parses it correctly. `resume_client.rs`
-    /// is `pub(crate)` inside `tssh-core` and out of scope to modify/import
+    /// is `pub(crate)` inside `isekai-terminal-core` and out of scope to modify/import
     /// from here (Phase S-4a instructions), so the bytes are reconstructed
     /// from the documented constants instead of calling into that module.
     #[test]

@@ -191,7 +191,7 @@ pub struct InitArgs {
     /// flag becomes optional, but doing that today would force every
     /// `cargo build -p isekai-ssh` to require a pre-built musl artifact on
     /// disk just to compile — exactly the trap `helper_quic_transport.rs`'s
-    /// unconditional `include_bytes!` fell into for `tssh-core`. Keeping
+    /// unconditional `include_bytes!` fell into for `isekai-terminal-core`. Keeping
     /// this an explicit, required CLI argument keeps `isekai-ssh` buildable
     /// in any environment; tests pass the actual binary built alongside
     /// this crate (`CARGO_BIN_EXE_isekai-helper`/the sibling `target/`

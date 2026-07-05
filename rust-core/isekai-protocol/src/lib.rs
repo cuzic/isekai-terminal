@@ -1,9 +1,9 @@
 //! Pure, dependency-light protocol types shared by isekai-terminal
-//! (`tssh-core`), isekai-helper, and the future `isekai-ssh` CLI
+//! (`isekai-terminal-core`), isekai-helper, and the future `isekai-ssh` CLI
 //! (`ISEKAI_SSH_DESIGN.md` "実装方針"). This crate must never depend on
 //! tokio/quinn/noq/russh/uniffi or any Android-specific type — it only knows
 //! about byte layouts, JSON schemas, and the value types built on top of
-//! them. I/O, QUIC, and SSH live in `isekai-transport`/`tssh-core` instead.
+//! them. I/O, QUIC, and SSH live in `isekai-transport`/`isekai-terminal-core` instead.
 //!
 //! Resume-specific frames (`RESUME`/`RESUME_ACK`, `HELPER_PROTOCOL.md` §7.3)
 //! live in the `resume` module (Phase S-4a), byte-compatible with the
