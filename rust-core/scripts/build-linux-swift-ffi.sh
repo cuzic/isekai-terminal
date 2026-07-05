@@ -46,7 +46,7 @@ cp "$LIB" "$OUT_FRAMEWORKS_DIR/libtssh_core.so"
 FFI_LINUX_DIR="Sources/TsshCoreFFILinux"
 mkdir -p "../ios/$FFI_LINUX_DIR"
 ln -sf "../TsshCoreLogic/generated/tssh_coreFFI.h" "../ios/$FFI_LINUX_DIR/tssh_coreFFI.h"
-sed 's/use "Darwin"//' "$GENERATED_DIR/tssh_coreFFI.modulemap" > "../ios/$FFI_LINUX_DIR/module.modulemap"
+sed '/use "Darwin"/d' "$GENERATED_DIR/tssh_coreFFI.modulemap" > "../ios/$FFI_LINUX_DIR/module.modulemap"
 
 echo
 echo "done."

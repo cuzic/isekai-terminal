@@ -1,6 +1,5 @@
 import Foundation
 import UIKit
-import TsshCoreLogic
 
 /// Phase 1B: Local Network Privacy(LAN内`direct_address`への接続時に必要)の
 /// 許可/拒否時のUI導線をサポートするヘルパー。
