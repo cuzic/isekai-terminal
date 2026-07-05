@@ -64,13 +64,8 @@ pub async fn run(args: LoginArgs) -> Result<()> {
             .context("isekai-ssh: token polling task panicked")??
     };
 
-    let token_set = TokenSet {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        expires_at: token.expires_in.map(|secs| unix_now() + secs as i64),
-        token_endpoint: Some(args.token_endpoint.clone()),
-        client_id: Some(args.client_id.clone()),
-    };
+    let token_set =
+        TokenSet::from_token_response(token, args.token_endpoint.clone(), Some(args.client_id.clone()), None);
 
     let provider = FileTokenProvider::from_default_path()
         .context("isekai-ssh: could not determine the token file path (is $HOME set?)")?;
@@ -93,11 +88,4 @@ pub async fn run_logout() -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("isekai-ssh: failed to remove {}", path.display())),
     }
     Ok(())
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }

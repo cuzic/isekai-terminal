@@ -30,6 +30,7 @@ pub mod error;
 pub mod file_provider;
 mod oauth;
 pub mod refresh;
+mod time;
 
 pub use env_provider::EnvTokenProvider;
 pub use error::AuthError;
