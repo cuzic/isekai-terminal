@@ -164,6 +164,25 @@ final class ProfileDatabaseTests: XCTestCase {
         XCTAssertEqual(fetched.helperBindPort, 5555)
     }
 
+    /// `StoredTransportPreference`が`DatabaseValueConvertible`により素の文字列として
+    /// カラムへ保存されること(JSON文字列として二重にラップされていないこと)を
+    /// 生カラム値を直接読んで確認する。v2 migrationの`ALTER TABLE`デフォルト値
+    /// (素の文字列リテラル)と表現が一致している必要があるため。
+    func testTransportPreferenceIsStoredAsPlainStringNotJson() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profile = ConnectionProfile(
+            displayName: "test", host: "h", port: 22, username: "u",
+            transportPreference: .isekaiStunP2pQuic
+        )
+        try db.insert(profile: &profile)
+
+        let rawValue: String? = try db.dbQueue.read { conn in
+            try String.fetchOne(conn, sql: "SELECT transportPreference FROM connection_profile WHERE id = ?", arguments: [profile.id!])
+        }
+
+        XCTAssertEqual(rawValue, "isekaiStunP2pQuic")
+    }
+
     func testStoredPortForwardConvertsToRealPortForward() {
         let stored = StoredPortForward(kind: .local, bindAddress: "0.0.0.0", bindPort: 8080, remoteHost: "10.0.0.1", remotePort: 443)
 
