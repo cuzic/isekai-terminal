@@ -3,7 +3,8 @@ import PackageDescription
 
 let package = Package(
     name: "TsshCore",
-    platforms: [.iOS(.v15)],
+    // Phase 1D: NavigationStack/.navigationDestination(for:)がiOS 16+必須のため15→16へ引き上げ。
+    platforms: [.iOS(.v16)],
     products: [
         .library(name: "TsshCore", targets: ["TsshCore"])
     ],
