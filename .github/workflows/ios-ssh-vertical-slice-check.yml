@@ -11,7 +11,7 @@ name: iOS SSH vertical slice check
 # ed25519鍵が実際にsshdで認証に使えることの検証)もこのfixtureを使うため、
 # ここで-only-testingに追加している。
 # (TerminalSessionControllerのfixture E2Eテストは、CredentialVault/Keychainに
-# 触れるためios-app-build-check.yml側のTsshTerminalAppTestsに置いている。
+# 触れるためios-app-build-check.yml側のIsekaiTerminalAppTestsに置いている。
 # そちらでも同じfixtureを別途起動する。)
 
 on:
@@ -48,7 +48,7 @@ jobs:
         run: |
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
-      - name: Build isekai-helper musl binaries (build prerequisite for tssh-core)
+      - name: Build isekai-helper musl binaries (build prerequisite for isekai-terminal-core)
         run: |
           brew install zig
           cargo install cargo-zigbuild --locked
@@ -95,10 +95,10 @@ jobs:
         working-directory: ios
         run: |
           xcodebuild test \
-            -scheme TsshCore-Package \
+            -scheme IsekaiTerminalCore-Package \
             -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}' \
-            -only-testing:TsshCoreTests/SshVerticalSliceTests \
-            -only-testing:TsshCoreLogicTests/KeyManagerTests/testGeneratedKeyAuthenticatesAgainstRealSshd \
+            -only-testing:IsekaiTerminalCoreTests/SshVerticalSliceTests \
+            -only-testing:IsekaiTerminalCoreLogicTests/KeyManagerTests/testGeneratedKeyAuthenticatesAgainstRealSshd \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
       - name: Stop sshd fixture

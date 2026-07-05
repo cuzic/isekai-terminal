@@ -611,7 +611,7 @@ replay buffer・両方向オフセット・`last_seen_at`）・`max_resume_windo
 
 `rust-core/src/helper_quic_transport.rs`・`resume_client.rs`・`helper_bootstrap.rs`・`transport.rs`
 の中核ロジック（HELLO/proof/ACK・resumeクライアント・ProxyJump・SSH認証）はロジックとして100%
-流用できる見込みだが、いずれも `tssh-core` 内で `pub(crate)` として書かれており、UniFFI・
+流用できる見込みだが、いずれも `isekai-terminal-core` 内で `pub(crate)` として書かれており、UniFFI・
 `RusshEventHandler`・Android専用 `FaultyUdpSocket` 型に絡んでいるため、そのままでは別バイナリから
 呼べない。`pub(crate)` を場当たり的に `pub` へ広げるのではなく、新しい facade を設計して境界を切り直す。
 
@@ -625,7 +625,7 @@ rust-core/
   isekai-link-masque/  # 既存（Phase 10で実装済み、無改造で共用）
   isekai-stun/         # 既存（Phase 10で実装済み、無改造で共用）
   h3-noq/              # 既存（Phase 10で実装済み、isekai-link-masqueの依存としてのみ）
-  src/(tssh-core)      # Android/UniFFI向けfacade。上記crateを呼ぶだけに薄くする
+  src/(isekai-terminal-core)      # Android/UniFFI向けfacade。上記crateを呼ぶだけに薄くする
   isekai-helper/       # 既存、無改造
   isekai-ssh/          # 新規CLI bin。上記crateを呼び、ACK後はstdin/stdout⇔QUICのbidirectional copy
 ```
@@ -685,7 +685,7 @@ pub trait ByteStream: Send {
 `send_frame`・`resume`等のprotocolロジックは`isekai-transport`/`isekai-protocol`側の上位関数が
 `ByteStream`の上に実装する。`isekai-transport` はこれらtraitだけを知り、`FaultyUdpSocket` を
 含む具象型を一切知らない。`SystemQuicEndpointFactory`（CLI用）・`AndroidQuicEndpointFactory`
-（Android用）・`FaultInjectingEndpointFactory`（`tssh-core` のデバッグ専用モジュール、Android
+（Android用）・`FaultInjectingEndpointFactory`（`isekai-terminal-core` のデバッグ専用モジュール、Android
 専用ソケット型はここに閉じ込める。本番featureからは外れることをビルド設定で保証する）を使う側が
 それぞれ用意する。
 
@@ -706,7 +706,7 @@ pub trait ByteStream: Send {
 | **S-1** | `isekai-ssh connect` 最小実装（`--dev-insecure-skip-trust`等の開発専用フラグで早期E2E、本番ビルドでは`#[cfg(debug_assertions)]`等で確実に無効化） | `ssh -o ProxyCommand=...` で実sshdにログインしecho往復ができ、かつstdoutが完全にクリーンであること |
 | S-2 | trust store（非対話）: 未登録ホストはfail closed、exit codeを分類 | 未登録ホストで `ssh myhost` がクリーンなエラーで終わること |
 | S-3 | `isekai-ssh init`（`--via` 経由の配布・起動・trust登録、確認プロンプトの表示内容を規定） | 未配置ホストに対し `init` → `connect` の一連が通ること |
-| S-0f | `tssh-core` をfacadeに整理（S-1〜S-3が動いた後の「大掃除」として実施） | UniFFI型・`FaultyUdpSocket`等のAndroid専用型が`isekai-*`crateに漏れていないこと |
+| S-0f | `isekai-terminal-core` をfacadeに整理（S-1〜S-3が動いた後の「大掃除」として実施） | UniFFI型・`FaultyUdpSocket`等のAndroid専用型が`isekai-*`crateに漏れていないこと |
 | S-0c-2 / S-5 | `isekai-auth`本実装（Device Authorization Flow・keychain/Secret Service保存）＋`isekai-ssh login`/`logout` | トークン取得・失効・自動リフレッシュの単体テスト |
 | S-0d-2 | `isekai-transport`拡張: STUN/P2P・reconnect/backoffポリシー追加 | `isekai_stun_p2p_transport.rs`相当のロジック移植後もSTUN単体テストが通ること |
 | S-4a〜S-4d | resumeの本実装（後述「resume本実装のサブフェーズ」参照） | フォルト注入でネットワーク瞬断中も `ssh` セッションが継続すること（`phase7-5-roaming-test.sh` 相当） |
@@ -814,7 +814,7 @@ CLI専用ユーザー向けに **Device Authorization Flow**（`isekai-ssh login
   および将来のCLI向け明示オプション・テストで使う（「`--via` の実装方式」節参照）
 - ~~S-0の共有crate境界での `FaultyUdpSocket` の扱い~~: 中核APIをジェネリック化せず、
   `QuicEndpointFactory` という狭いtrait境界に閉じ込めることに決定（「実装方針」節参照）。
-  `FaultyUdpSocket` は `tssh-core` のデバッグ専用モジュールの外に出ない
+  `FaultyUdpSocket` は `isekai-terminal-core` のデバッグ専用モジュールの外に出ない
 - ~~再配布時のバイナリバージョン変更の扱い~~: A/B二択ではなく三段階ポリシーに決定
   （「同一digestの再配布は自動」「署名済みdigestへの更新は自動（署名検証は未実装、将来対応）」
   「未署名の異なるdigestへの変更はfail closed」）。署名検証導入前の暫定策として、`init` で

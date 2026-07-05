@@ -1,9 +1,9 @@
-name: iOS TsshCoreLogic Linux check
+name: iOS IsekaiTerminalCoreLogic Linux check
 
-# ios/Sources/TsshCoreLogic(UIKit/SwiftUI/GRDB/Keychainに依存しない、iOSアプリの
+# ios/Sources/IsekaiTerminalCoreLogic(UIKit/SwiftUI/GRDB/Keychainに依存しない、iOSアプリの
 # 純粋なビジネスロジック層)をLinux上でネイティブに`swift test`する。
-# `ios/Package.swift`は`#if os(Linux)`でTsshCore/TsshCoreTests(Apple専用)自体を
-# マニフェストから除外するため、このジョブではTsshCoreLogic/TsshCoreLogicTestsだけが
+# `ios/Package.swift`は`#if os(Linux)`でIsekaiTerminalCore/IsekaiTerminalCoreTests(Apple専用)自体を
+# マニフェストから除外するため、このジョブではIsekaiTerminalCoreLogic/IsekaiTerminalCoreLogicTestsだけが
 # 解決される。
 #
 # 実iOSアプリのSimulatorビルド・実機同等の検証は引き続き`ios-rust-core-check.yml`/
@@ -17,17 +17,17 @@ on:
     branches: [main]
     paths:
       - "rust-core/**"
-      - "ios/Sources/TsshCoreLogic/**"
-      - "ios/Sources/TsshCoreFFILinux/**"
-      - "ios/Tests/TsshCoreLogicTests/**"
+      - "ios/Sources/IsekaiTerminalCoreLogic/**"
+      - "ios/Sources/IsekaiTerminalCoreFFILinux/**"
+      - "ios/Tests/IsekaiTerminalCoreLogicTests/**"
       - "ios/Package.swift"
       - ".github/workflows/ios-logic-linux-check.yml"
   pull_request:
     paths:
       - "rust-core/**"
-      - "ios/Sources/TsshCoreLogic/**"
-      - "ios/Sources/TsshCoreFFILinux/**"
-      - "ios/Tests/TsshCoreLogicTests/**"
+      - "ios/Sources/IsekaiTerminalCoreLogic/**"
+      - "ios/Sources/IsekaiTerminalCoreFFILinux/**"
+      - "ios/Tests/IsekaiTerminalCoreLogicTests/**"
       - "ios/Package.swift"
       - ".github/workflows/ios-logic-linux-check.yml"
   workflow_dispatch:
@@ -62,7 +62,7 @@ jobs:
           restore-keys: |
             ios-logic-linux-cargo-${{ runner.os }}-
 
-      - name: Cache SwiftPM build (TsshCoreLogic + swift-crypto)
+      - name: Cache SwiftPM build (IsekaiTerminalCoreLogic + swift-crypto)
         # swift-cryptoのCCryptoBoringSSL(BoringSSLのC移植)を最初からビルドすると
         # 数分かかる。Package.resolvedが変わらない限りキャッシュを再利用する。
         uses: actions/cache@v4
@@ -87,15 +87,15 @@ jobs:
           tar xzf /tmp/swift.tar.gz --strip-components=1 -C "$HOME/swift-toolchain"
           echo "$HOME/swift-toolchain/usr/bin" >> "$GITHUB_PATH"
 
-      - name: Build TsshCoreLogic FFI (rust-core native Linux build + UniFFI bindings + drift check)
+      - name: Build IsekaiTerminalCoreLogic FFI (rust-core native Linux build + UniFFI bindings + drift check)
         run: |
           bash rust-core/scripts/build-linux-swift-ffi.sh
-          git diff --exit-code -- ios/Sources/TsshCoreLogic/generated ios/Sources/TsshCoreFFILinux || {
-            echo "::error::ios/Sources/TsshCoreLogic/generated or ios/Sources/TsshCoreFFILinux is stale. Run rust-core/scripts/build-linux-swift-ffi.sh and commit the result." >&2
+          git diff --exit-code -- ios/Sources/IsekaiTerminalCoreLogic/generated ios/Sources/IsekaiTerminalCoreFFILinux || {
+            echo "::error::ios/Sources/IsekaiTerminalCoreLogic/generated or ios/Sources/IsekaiTerminalCoreFFILinux is stale. Run rust-core/scripts/build-linux-swift-ffi.sh and commit the result." >&2
             exit 1
           }
 
-      - name: swift test (TsshCoreLogic)
+      - name: swift test (IsekaiTerminalCoreLogic)
         working-directory: ios
         run: |
           export LIBRARY_PATH="$(pwd)/Frameworks/linux:${LIBRARY_PATH:-}"

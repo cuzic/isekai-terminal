@@ -1,7 +1,7 @@
 name: iOS app build check
 
-# TsshTerminalApp(ios/App/TsshTerminalApp.xcodeproj、Phase 1A-1のXcodeアプリ雛形)が
-# TsshCore SwiftPMパッケージ(rust-core経由でビルドしたXCFrameworkを含む)をリンクして
+# IsekaiTerminalApp(ios/App/IsekaiTerminalApp.xcodeproj、Phase 1A-1のXcodeアプリ雛形)が
+# IsekaiTerminalCore SwiftPMパッケージ(rust-core経由でビルドしたXCFrameworkを含む)をリンクして
 # iOS Simulator向けにビルドできることを検証する(PLAN.md「Phase Y」節 Phase 1A参照)。
 # コード署名は行わない(シミュレータ向けビルドのみのため不要)。
 #
@@ -54,7 +54,7 @@ jobs:
         run: |
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
-      - name: Build isekai-helper musl binaries (build prerequisite for tssh-core)
+      - name: Build isekai-helper musl binaries (build prerequisite for isekai-terminal-core)
         run: |
           brew install zig
           cargo install cargo-zigbuild --locked
@@ -77,7 +77,7 @@ jobs:
 
       - name: Resolve Swift package dependencies
         working-directory: ios/App
-        run: xcodebuild -resolvePackageDependencies -project TsshTerminalApp.xcodeproj -scheme TsshTerminalApp
+        run: xcodebuild -resolvePackageDependencies -project IsekaiTerminalApp.xcodeproj -scheme IsekaiTerminalApp
 
       - name: Start sshd fixture
         run: bash rust-core/scripts/ios-fixture/start-sshd-fixture.sh /tmp/ios-fixture 2298
@@ -101,16 +101,16 @@ jobs:
           echo "device_name=$DEVICE_NAME" >> "$GITHUB_OUTPUT"
           echo "picked simulator: $DEVICE_NAME"
 
-      - name: Build and test TsshTerminalApp on iOS Simulator
-        # CODE_SIGNING_ALLOWED=NOで署名を無効化すると、TsshTerminalAppTests
+      - name: Build and test IsekaiTerminalApp on iOS Simulator
+        # CODE_SIGNING_ALLOWED=NOで署名を無効化すると、IsekaiTerminalAppTests
         # (CredentialVaultのKeychainテストをホストする)がerrSecMissingEntitlement
         # (-34018)で失敗する。署名はXcodeの自動ローカル署名に任せる。
         working-directory: ios/App
         run: |
-          xcodebuild -list -project TsshTerminalApp.xcodeproj
+          xcodebuild -list -project IsekaiTerminalApp.xcodeproj
           xcodebuild test \
-            -project TsshTerminalApp.xcodeproj \
-            -scheme TsshTerminalApp \
+            -project IsekaiTerminalApp.xcodeproj \
+            -scheme IsekaiTerminalApp \
             -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}'
 
       - name: Stop sshd fixture

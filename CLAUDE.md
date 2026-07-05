@@ -1,7 +1,7 @@
 # isekai-terminal
 
 Android 単体で完結する SSH クライアント。Kotlin(Jetpack Compose)の UI 層と、
-Rust(UniFFI 経由)の `rust-core`(crate 名 `tssh-core`)からなる。
+Rust(UniFFI 経由)の `rust-core`(crate 名 `isekai-terminal-core`)からなる。
 
 日本語 IME 完全対応・trzsz ファイル転送・自作ヘルパー(`isekai-helper`)経由の QUIC
 接続耐性(ローミング / 完全切断からの resume / Tailscale⇔直接アドレスのマルチパス)が
@@ -16,10 +16,10 @@ Rust(UniFFI 経由)の `rust-core`(crate 名 `tssh-core`)からなる。
   (実機フォルト注入レシーバー等)、`app/src/test`(Robolectric/JVM)、
   `app/src/androidTest`(実機/エミュレータ)。
 - `rust-core/` — Cargo workspace。
-  - `src/`(crate `tssh-core`, cdylib名 `tssh_core`): SSH(russh)・VT100/VTEパーサー・
+  - `src/`(crate `isekai-terminal-core`, cdylib名 `isekai_terminal_core`): SSH(russh)・VT100/VTEパーサー・
     trzsz転送FSM・QUIC transport・resume/multipath ロジック。UniFFI で Kotlin に公開。
   - `isekai-helper/`: サーバー側に配置する自作 QUIC↔TCP 中継バイナリ(musl static)。
-  - `uniffi-bindgen/`: Kotlin バインディング(`app/src/main/kotlin/uniffi/tssh_core/tssh_core.kt`)
+  - `uniffi-bindgen/`: Kotlin バインディング(`app/src/main/kotlin/uniffi/isekai_terminal_core/isekai_terminal_core.kt`)
     生成用。
   - `noq-multipath-spike/`: `noq`(quinn の multipath フォーク)の実機検証用の使い捨てコード。
 - `PLAN.md` — 実装計画と各 Phase(0〜9)の設計・実機検証結果の記録。最新の設計判断のSSOT。
@@ -38,9 +38,9 @@ Rust(UniFFI 経由)の `rust-core`(crate 名 `tssh-core`)からなる。
 
 # Rust
 cd rust-core
-cargo test -p tssh-core --lib     # コア(SSH/VTE/trzsz/resume/multipath)のユニット・e2eテスト
+cargo test -p isekai-terminal-core --lib     # コア(SSH/VTE/trzsz/resume/multipath)のユニット・e2eテスト
 cargo test -p isekai-helper       # ヘルパーバイナリのユニット・e2eテスト
-cargo run -p uniffi-bindgen -- generate --library target/debug/libtssh_core.so --language kotlin
+cargo run -p uniffi-bindgen -- generate --library target/debug/libisekai_terminal_core.so --language kotlin
                                    # Rust の public API を変更したら Kotlin バインディング再生成が必須
 ```
 
