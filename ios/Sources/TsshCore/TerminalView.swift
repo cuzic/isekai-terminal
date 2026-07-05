@@ -107,12 +107,15 @@ private struct TerminalInputRepresentable: UIViewRepresentable {
 /// 1文字を、`TerminalIMEInputView.ctrlArmed`経由でCtrl制御バイトに変換して送信する。
 private final class TerminalAccessoryBar: UIView {
     private weak var controller: TerminalSessionController?
-    private weak var inputView: TerminalIMEInputView?
+    // `UIResponder.inputView`という既存プロパティと名前が衝突し
+    // 「'strong'プロパティを'weak'でオーバーライドできない」エラーになるため、
+    // `imeInputView`という別名にする。
+    private weak var imeInputView: TerminalIMEInputView?
     private var ctrlButton: UIButton?
 
     init(controller: TerminalSessionController, inputView: TerminalIMEInputView) {
         self.controller = controller
-        self.inputView = inputView
+        self.imeInputView = inputView
         super.init(frame: CGRect(x: 0, y: 0, width: 0, height: 44))
         backgroundColor = .secondarySystemBackground
         autoresizingMask = [.flexibleWidth]
@@ -168,9 +171,9 @@ private final class TerminalAccessoryBar: UIView {
     }
 
     @objc private func handleCtrlTap() {
-        guard let inputView else { return }
-        inputView.ctrlArmed.toggle()
-        ctrlButton?.configuration?.baseBackgroundColor = inputView.ctrlArmed ? .systemBlue : nil
+        guard let imeInputView else { return }
+        imeInputView.ctrlArmed.toggle()
+        ctrlButton?.configuration?.baseBackgroundColor = imeInputView.ctrlArmed ? .systemBlue : nil
     }
 
     @objc private func handleTap(_ sender: UIButton) {

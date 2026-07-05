@@ -15,7 +15,11 @@ public final class TerminalUIState: ObservableObject {
     @Published public internal(set) var state: State = .connecting
     @Published public internal(set) var latestScreenUpdate: ScreenUpdate?
 
-    public init() {}
+    // `TerminalSessionController`(非isolated)のstored property初期値として
+    // 構築されるため、`nonisolated`にして呼び出し側のコンテキストを問わず
+    // 構築できるようにする(`ProfileListView`等のデフォルト引数で踏んだのと
+    // 同種のactor分離エラーを、今度はstored propertyの初期化式で踏んだもの)。
+    public nonisolated init() {}
 }
 
 /// Phase 1D: `ConnectionProfile`からSSH接続を開始し、`SessionCallback`を実装して
