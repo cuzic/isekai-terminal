@@ -239,6 +239,23 @@ pub(crate) struct ReattachableStream {
 const REATTACH_MAX_RETRIES: u32 = 5;
 const REATTACH_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// reattach成功直後、helperがまだ受け取っていないC→Sバイト列を通常のrelayに
+/// 戻す前に再送する。`trigger_reattach`のリトライループから呼ばれる。
+async fn replay_pending_bytes(
+    inner: &ReattachInner,
+    result: &mut ReattachResult,
+) -> Result<(), noq::WriteError> {
+    let to_replay = {
+        let resume = inner.resume.lock().unwrap();
+        resume.replay_buffer.replay_from(result.helper_committed_offset)
+    };
+    let Some(bytes) = to_replay else { return Ok(()) };
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    result.send.write_all(&bytes).await
+}
+
 impl ReattachableStream {
     /// data stream の read/write が I/O エラーを返した際の共通処理。
     /// エラーを呼び出し元（russh）にはまだ見せず、reattach を起動して
@@ -300,25 +317,15 @@ impl ReattachableStream {
                 log::info!("reattach: attempt {attempt}/{REATTACH_MAX_RETRIES}");
                 match (inner.reattach_fn)(session_id, client_sent_offset, client_delivered_offset).await {
                     Ok(mut result) => {
-                        // helper がまだ受け取っていない C→S バイト列を、通常の
-                        // relay に戻す前に replay しておく。
-                        let to_replay = {
-                            let resume = inner.resume.lock().unwrap();
-                            resume.replay_buffer.replay_from(result.helper_committed_offset)
-                        };
-                        if let Some(bytes) = to_replay {
-                            if !bytes.is_empty() {
-                                if let Err(e) = result.send.write_all(&bytes).await {
-                                    log::warn!("reattach: failed to replay C->S bytes: {e}");
-                                    if attempt >= REATTACH_MAX_RETRIES {
-                                        *inner.slot.lock().unwrap() = StreamSlot::Failed(e.to_string());
-                                        inner.wake_all();
-                                        return;
-                                    }
-                                    tokio::time::sleep(REATTACH_BASE_DELAY * 2u32.pow(attempt - 1)).await;
-                                    continue;
-                                }
+                        if let Err(e) = replay_pending_bytes(&inner, &mut result).await {
+                            log::warn!("reattach: failed to replay C->S bytes: {e}");
+                            if attempt >= REATTACH_MAX_RETRIES {
+                                *inner.slot.lock().unwrap() = StreamSlot::Failed(e.to_string());
+                                inner.wake_all();
+                                return;
                             }
+                            tokio::time::sleep(REATTACH_BASE_DELAY * 2u32.pow(attempt - 1)).await;
+                            continue;
                         }
                         {
                             let mut resume = inner.resume.lock().unwrap();
