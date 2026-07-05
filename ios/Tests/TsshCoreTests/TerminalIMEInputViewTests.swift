@@ -1,5 +1,6 @@
 import XCTest
 @testable import TsshCore
+import TsshCoreLogic
 
 /// Phase 1A-5: 日本語IME単体スパイクの検証。
 ///
