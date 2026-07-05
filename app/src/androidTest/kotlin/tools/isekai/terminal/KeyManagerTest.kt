@@ -25,11 +25,11 @@ class KeyManagerTest {
 
     @Before
     fun setup() {
-        keyStore.deleteEntry("tssh_kek_v2")
+        keyStore.deleteEntry("isekai_terminal_kek_v2")
         val keyGen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
         keyGen.init(
             KeyGenParameterSpec.Builder(
-                "tssh_kek_v2",
+                "isekai_terminal_kek_v2",
                 KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
             )
                 .setKeySize(256)
@@ -42,7 +42,7 @@ class KeyManagerTest {
 
     @After
     fun cleanup() {
-        keyStore.deleteEntry("tssh_kek_v2")
+        keyStore.deleteEntry("isekai_terminal_kek_v2")
     }
 
     @Test

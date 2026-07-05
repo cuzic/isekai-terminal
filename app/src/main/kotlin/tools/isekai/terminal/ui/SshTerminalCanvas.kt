@@ -9,7 +9,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
-import uniffi.tssh_core.ScreenUpdate
+import uniffi.isekai_terminal_core.ScreenUpdate
 
 @Composable
 fun SshTerminalCanvas(

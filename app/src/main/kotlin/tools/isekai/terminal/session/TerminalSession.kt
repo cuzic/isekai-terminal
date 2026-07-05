@@ -21,7 +21,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
-import uniffi.tssh_core.*
+import uniffi.isekai_terminal_core.*
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
@@ -73,18 +73,18 @@ class TerminalSession(
                 ConnectionPublicState.Connecting ->
                     _state.update { it.copy(isConnecting = true, connected = false, statusMsg = "接続中…") }
                 is ConnectionPublicState.Connected -> {
-                    RemoteLogger.i("TsshSSH", "✓ connected: ${state.host}")
+                    RemoteLogger.i("IsekaiTerminalSSH", "✓ connected: ${state.host}")
                     _state.update { it.copy(isConnecting = false, connected = true,
                         statusMsg = "接続済み: ${state.host}", currentHost = state.host) }
                 }
                 is ConnectionPublicState.Disconnected -> {
-                    RemoteLogger.i("TsshSSH", "✗ disconnected: reason='${state.reason ?: "none"}'")
+                    RemoteLogger.i("IsekaiTerminalSSH", "✗ disconnected: reason='${state.reason ?: "none"}'")
                     _state.update { it.copy(isConnecting = false, connected = false,
                         statusMsg = state.reason?.let { r -> "切断: $r" } ?: "切断済み (不明)",
                         currentHost = null, screenUpdate = null, trzszState = null) }
                 }
                 is ConnectionPublicState.Error -> {
-                    RemoteLogger.w("TsshSSH", "connection error: ${state.message}")
+                    RemoteLogger.w("IsekaiTerminalSSH", "connection error: ${state.message}")
                     _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${state.message}") }
                 }
             }
@@ -96,28 +96,28 @@ class TerminalSession(
         }
 
         override fun onHostKey(host: String, port: UShort, fingerprint: String): Boolean {
-            RemoteLogger.i("TsshSSH", "host key fingerprint: $fingerprint")
+            RemoteLogger.i("IsekaiTerminalSSH", "host key fingerprint: $fingerprint")
             return try {
                 when (val decision = hostKeyChecker.check(host, port.toInt(), fingerprint)) {
                     is HostKeyDecision.Trust -> {
                         if (decision.isNew) {
-                            RemoteLogger.i("TsshSSH", "TOFU: trusted $host")
+                            RemoteLogger.i("IsekaiTerminalSSH", "TOFU: trusted $host")
                             _state.update { it.copy(lastFingerprint = fingerprint) }
                         }
                         true
                     }
                     is HostKeyDecision.Changed -> {
-                        RemoteLogger.w("TsshSSH", "⚠ HOST KEY CHANGED: $host")
+                        RemoteLogger.w("IsekaiTerminalSSH", "⚠ HOST KEY CHANGED: $host")
                         _state.update { it.copy(hostKeyChangedWarning = decision.warning) }
                         false
                     }
                     is HostKeyDecision.Reject -> {
-                        RemoteLogger.w("TsshSSH", "host key rejected: ${decision.reason}")
+                        RemoteLogger.w("IsekaiTerminalSSH", "host key rejected: ${decision.reason}")
                         false
                     }
                 }
             } catch (e: Exception) {
-                RemoteLogger.e("TsshSSH", "host key check error: ${e.message}", e)
+                RemoteLogger.e("IsekaiTerminalSSH", "host key check error: ${e.message}", e)
                 false
             }
         }
@@ -152,18 +152,18 @@ class TerminalSession(
         }
 
         override fun onNoViablePath() {
-            RemoteLogger.w("TsshSSH", "no viable path (QUIC sees no response on any path)")
+            RemoteLogger.w("IsekaiTerminalSSH", "no viable path (QUIC sees no response on any path)")
             _noViablePathEvent.tryEmit(Unit)
         }
 
         override fun onForwardStateChanged(id: String, state: ForwardState) {
             when (state) {
                 is ForwardState.Listening ->
-                    RemoteLogger.i("TsshSSH", "port forward '$id': listening")
+                    RemoteLogger.i("IsekaiTerminalSSH", "port forward '$id': listening")
                 is ForwardState.Failed ->
-                    RemoteLogger.w("TsshSSH", "port forward '$id': failed: ${state.reason}")
+                    RemoteLogger.w("IsekaiTerminalSSH", "port forward '$id': failed: ${state.reason}")
                 is ForwardState.Stopped ->
-                    RemoteLogger.i("TsshSSH", "port forward '$id': stopped")
+                    RemoteLogger.i("IsekaiTerminalSSH", "port forward '$id': stopped")
             }
         }
 
@@ -171,7 +171,7 @@ class TerminalSession(
         // ユーザーが respondAgentSignRequest() を呼ぶまでこのスレッドをブロックして待つ。
         // タイムアウト（Rust 側の 30 秒より短い 25 秒）した場合も拒否扱いにする。
         override fun onAgentSignRequest(keyFingerprint: String): Boolean {
-            RemoteLogger.i("TsshSSH", "agent sign request: $keyFingerprint")
+            RemoteLogger.i("IsekaiTerminalSSH", "agent sign request: $keyFingerprint")
             val deferred = CompletableDeferred<Boolean>()
             pendingAgentSignRequest.set(deferred)
             _state.update { it.copy(agentSignRequestFingerprint = keyFingerprint) }
@@ -180,7 +180,7 @@ class TerminalSession(
                     try {
                         withTimeout(AGENT_SIGN_CONFIRM_TIMEOUT_MS) { deferred.await() }
                     } catch (e: TimeoutCancellationException) {
-                        RemoteLogger.w("TsshSSH", "agent sign request timed out — denying")
+                        RemoteLogger.w("IsekaiTerminalSSH", "agent sign request timed out — denying")
                         false
                     }
                 }

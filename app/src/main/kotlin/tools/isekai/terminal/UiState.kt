@@ -1,6 +1,6 @@
 package tools.isekai.terminal
 
-import uniffi.tssh_core.ScreenUpdate
+import uniffi.isekai_terminal_core.ScreenUpdate
 
 data class TerminalUiState(
     val connected: Boolean = false,

@@ -47,7 +47,7 @@ class ScreenshotGalleryTest {
             Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) }
             Repositories.keys.getAll().forEach { Repositories.keys.delete(it) }
         }
-        ctx.getSharedPreferences("tssh_ui", Context.MODE_PRIVATE).edit().clear().apply()
+        ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE).edit().clear().apply()
     }
 
     private fun insertProfile(profile: ConnectionProfile) = runBlocking { Repositories.profiles.save(profile) }

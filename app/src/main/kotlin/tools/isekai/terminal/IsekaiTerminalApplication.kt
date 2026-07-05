@@ -4,7 +4,7 @@ import android.app.Application
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.util.RemoteLogger
 
-class TsshApplication : Application() {
+class IsekaiTerminalApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         Repositories.init(this)

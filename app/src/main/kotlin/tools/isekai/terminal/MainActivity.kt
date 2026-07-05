@@ -16,7 +16,7 @@ import androidx.navigation.compose.rememberNavController
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
-import uniffi.tssh_core.setTerminalTheme
+import uniffi.isekai_terminal_core.setTerminalTheme
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -43,7 +43,7 @@ class MainActivity : ComponentActivity() {
      * アプリ起動直後に一度反映しておけば、以降に生成される全セッションに引き継がれる。
      */
     private fun restorePersistedTerminalTheme() {
-        val prefs = getSharedPreferences("tssh_ui", MODE_PRIVATE)
+        val prefs = getSharedPreferences("isekai_terminal_ui", MODE_PRIVATE)
         val theme = TerminalThemes.byName(prefs.getString(TerminalThemes.PREF_KEY, null))
         theme.applyTo(::setTerminalTheme)
     }
@@ -61,10 +61,10 @@ fun AppRoot() {
     NavHost(navController = navController, startDestination = AppRoutes.PROFILE_LIST) {
 
         composable(AppRoutes.PROFILE_LIST) {
-            RemoteLogger.i("TsshNav", "→ ProfileList")
+            RemoteLogger.i("IsekaiTerminalNav", "→ ProfileList")
             ProfileListScreen(
                 onConnect = { profile, password, jumpPassword ->
-                    RemoteLogger.i("TsshNav", "ProfileList → Terminal profile='${profile.label}' authType=${profile.authType}")
+                    RemoteLogger.i("IsekaiTerminalNav", "ProfileList → Terminal profile='${profile.label}' authType=${profile.authType}")
                     tabsVm.openTab(profile, password, jumpPassword)
                     navController.navigate(AppRoutes.TERMINAL)
                 },
@@ -89,7 +89,7 @@ fun AppRoot() {
         }
 
         composable(AppRoutes.TERMINAL) {
-            RemoteLogger.i("TsshNav", "→ Terminal (tabs=${tabsVm.tabs.value.size})")
+            RemoteLogger.i("IsekaiTerminalNav", "→ Terminal (tabs=${tabsVm.tabs.value.size})")
             TerminalHostScreen(
                 tabsVm = tabsVm,
                 onAllTabsClosed = { navController.popBackStack() },
@@ -98,7 +98,7 @@ fun AppRoot() {
 
         composable(AppRoutes.PROFILE_EDIT) {
             val editing = navVm.pendingEditProfile
-            RemoteLogger.i("TsshNav", "→ ${if (editing == null) "ProfileEdit(new)" else "ProfileEdit(id=${editing.id} '${editing.label}')"}")
+            RemoteLogger.i("IsekaiTerminalNav", "→ ${if (editing == null) "ProfileEdit(new)" else "ProfileEdit(id=${editing.id} '${editing.label}')"}")
             ProfileEditScreen(
                 profile = editing,
                 onSave = { navController.popBackStack() },
@@ -107,7 +107,7 @@ fun AppRoot() {
         }
 
         composable(AppRoutes.KEY_LIST) {
-            RemoteLogger.i("TsshNav", "→ KeyList")
+            RemoteLogger.i("IsekaiTerminalNav", "→ KeyList")
             KeyListScreen(
                 onImportKey = { navController.navigate(AppRoutes.KEY_IMPORT) },
                 onBack = { navController.popBackStack() },
@@ -115,7 +115,7 @@ fun AppRoot() {
         }
 
         composable(AppRoutes.KEY_IMPORT) {
-            RemoteLogger.i("TsshNav", "→ KeyImport")
+            RemoteLogger.i("IsekaiTerminalNav", "→ KeyImport")
             KeyImportScreen(
                 onSave = { navController.popBackStack() },
                 onCancel = { navController.popBackStack() },
@@ -123,7 +123,7 @@ fun AppRoot() {
         }
 
         composable(AppRoutes.SNIPPET_LIST) {
-            RemoteLogger.i("TsshNav", "→ SnippetList")
+            RemoteLogger.i("IsekaiTerminalNav", "→ SnippetList")
             SnippetListScreen(
                 onAddSnippet = {
                     navVm.pendingEditSnippet = null
@@ -139,7 +139,7 @@ fun AppRoot() {
 
         composable(AppRoutes.SNIPPET_EDIT) {
             val editing = navVm.pendingEditSnippet
-            RemoteLogger.i("TsshNav", "→ ${if (editing == null) "SnippetEdit(new)" else "SnippetEdit(id=${editing.id} '${editing.label}')"}")
+            RemoteLogger.i("IsekaiTerminalNav", "→ ${if (editing == null) "SnippetEdit(new)" else "SnippetEdit(id=${editing.id} '${editing.label}')"}")
             SnippetEditScreen(
                 snippet = editing,
                 onSave = { navController.popBackStack() },

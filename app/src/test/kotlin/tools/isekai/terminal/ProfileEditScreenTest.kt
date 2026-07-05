@@ -518,7 +518,7 @@ class ProfileEditScreenTest {
             val stored = Repositories.profiles.getAll().first { it.label == "WithRemoteForward" }
             assertEquals(1, stored.forwards.size)
             val fw = stored.forwards[0]
-            assertEquals(uniffi.tssh_core.ForwardType.REMOTE, fw.forwardType)
+            assertEquals(uniffi.isekai_terminal_core.ForwardType.REMOTE, fw.forwardType)
             assertEquals(8080.toUShort(), fw.bindPort)
             assertEquals("192.168.1.5", fw.remoteHost)
             assertEquals(9090.toUShort(), fw.remotePort)
@@ -555,7 +555,7 @@ class ProfileEditScreenTest {
             val stored = Repositories.profiles.getAll().first { it.label == "WithSocksForward" }
             assertEquals(1, stored.forwards.size)
             val fw = stored.forwards[0]
-            assertEquals(uniffi.tssh_core.ForwardType.DYNAMIC, fw.forwardType)
+            assertEquals(uniffi.isekai_terminal_core.ForwardType.DYNAMIC, fw.forwardType)
             assertEquals(1080.toUShort(), fw.bindPort)
         }
     }
@@ -563,8 +563,8 @@ class ProfileEditScreenTest {
     @Test fun editProfile_prefillsRemoteForward() {
         val profile = sampleProfile().copy(
             forwards = listOf(
-                uniffi.tssh_core.PortForward(
-                    forwardType = uniffi.tssh_core.ForwardType.REMOTE,
+                uniffi.isekai_terminal_core.PortForward(
+                    forwardType = uniffi.isekai_terminal_core.ForwardType.REMOTE,
                     bindAddress = "0.0.0.0", bindPort = 8080u,
                     remoteHost = "192.168.1.5", remotePort = 9090u,
                 ),
@@ -581,8 +581,8 @@ class ProfileEditScreenTest {
     @Test fun editProfile_prefillsDynamicForward() {
         val profile = sampleProfile().copy(
             forwards = listOf(
-                uniffi.tssh_core.PortForward(
-                    forwardType = uniffi.tssh_core.ForwardType.DYNAMIC,
+                uniffi.isekai_terminal_core.PortForward(
+                    forwardType = uniffi.isekai_terminal_core.ForwardType.DYNAMIC,
                     bindAddress = "127.0.0.1", bindPort = 1080u,
                     remoteHost = "", remotePort = 0u,
                 ),

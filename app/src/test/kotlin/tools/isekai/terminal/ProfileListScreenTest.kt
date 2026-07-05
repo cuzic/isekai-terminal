@@ -35,7 +35,7 @@ class ProfileListScreenTest {
         Repositories.init(ctx)
         runBlocking { Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) } }
         // 配色テーマの永続化テストが互いに影響しないよう毎回クリアする
-        ctx.getSharedPreferences("tssh_ui", Context.MODE_PRIVATE).edit().clear().apply()
+        ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE).edit().clear().apply()
     }
 
     private fun insertProfile(profile: ConnectionProfile) = runBlocking { Repositories.profiles.save(profile) }
@@ -154,8 +154,8 @@ class ProfileListScreenTest {
         // 選択したテーマが (native 呼び出しの代わりに注入した) applyTerminalTheme に渡る
         assertEquals(TerminalThemes.DRACULA, appliedTheme)
 
-        // SharedPreferences("tssh_ui") にプリセット名として永続化される
-        val prefs = ctx.getSharedPreferences("tssh_ui", Context.MODE_PRIVATE)
+        // SharedPreferences("isekai_terminal_ui") にプリセット名として永続化される
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
         assertEquals(TerminalThemes.DRACULA.name, prefs.getString(TerminalThemes.PREF_KEY, null))
 
         // 選択後はダイアログが閉じる
@@ -170,7 +170,7 @@ class ProfileListScreenTest {
         waitForText("配色テーマ")
         composeTestRule.onNodeWithText("閉じる").performClick()
 
-        val prefs = ctx.getSharedPreferences("tssh_ui", Context.MODE_PRIVATE)
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
         assertEquals(null, prefs.getString(TerminalThemes.PREF_KEY, null))
     }
 }

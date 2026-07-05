@@ -7,8 +7,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import uniffi.tssh_core.ForwardType
-import uniffi.tssh_core.PortForward
+import uniffi.isekai_terminal_core.ForwardType
+import uniffi.isekai_terminal_core.PortForward
 
 /**
  * [PortForwardListConverter](Room TypeConverter)と[PortForwardParceler](`@Parcelize`用)を

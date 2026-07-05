@@ -50,7 +50,7 @@ import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
-import uniffi.tssh_core.setTerminalTheme
+import uniffi.isekai_terminal_core.setTerminalTheme
 
 @Composable
 fun ProfileListScreen(
@@ -76,7 +76,7 @@ fun ProfileListScreen(
 
     // 配色テーマはプロファイル毎ではなくグローバル設定として永続化する
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("tssh_ui", android.content.Context.MODE_PRIVATE) }
+    val prefs = remember { context.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE) }
     var currentThemeName by remember {
         mutableStateOf(prefs.getString(TerminalThemes.PREF_KEY, null) ?: TerminalThemes.DEFAULT_DARK.name)
     }
@@ -144,14 +144,14 @@ fun ProfileListScreen(
                                 val needsPasswordPrompt = profile.authType == "password" ||
                                     (profile.usesJumpHost && profile.jumpAuthType == "password")
                                 if (needsPasswordPrompt) {
-                                    RemoteLogger.i("TsshProfile", "tap → password dialog: '${profile.label}' ${profile.username}@${profile.host}:${profile.port}")
+                                    RemoteLogger.i("IsekaiTerminalProfile", "tap → password dialog: '${profile.label}' ${profile.username}@${profile.host}:${profile.port}")
                                     vm.requestPasswordConnect(profile)
                                 } else {
-                                    RemoteLogger.i("TsshProfile", "tap → key connect: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} keyId=${profile.keyId}")
+                                    RemoteLogger.i("IsekaiTerminalProfile", "tap → key connect: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} keyId=${profile.keyId}")
                                     onConnect(profile, null, null)
                                 }
                             },
-                            onEdit = { RemoteLogger.i("TsshProfile", "edit: '${profile.label}' id=${profile.id}"); onEditProfile(profile) },
+                            onEdit = { RemoteLogger.i("IsekaiTerminalProfile", "edit: '${profile.label}' id=${profile.id}"); onEditProfile(profile) },
                             onDelete = { vm.requestDelete(profile) },
                         )
                     }
@@ -319,7 +319,7 @@ private fun PasswordDialog(
         },
         confirmButton = {
             TextButton(onClick = {
-                RemoteLogger.i("TsshProfile", "password dialog confirmed for: '$label'")
+                RemoteLogger.i("IsekaiTerminalProfile", "password dialog confirmed for: '$label'")
                 onConfirm(password, jumpLabel?.let { jumpPassword })
             }) { Text("接続") }
         },

@@ -32,7 +32,7 @@ class KeyListViewModel(app: Application) : AndroidViewModel(app) {
     fun loadKeys() {
         viewModelScope.launch(Dispatchers.IO) {
             val list = Repositories.keys.getAll()
-            RemoteLogger.i("TsshKey", "loaded ${list.size} key(s): ${list.map { "'${it.label}'" }}")
+            RemoteLogger.i("IsekaiTerminalKey", "loaded ${list.size} key(s): ${list.map { "'${it.label}'" }}")
             _keys.value = list
         }
     }
@@ -43,7 +43,7 @@ class KeyListViewModel(app: Application) : AndroidViewModel(app) {
     fun confirmDelete(key: KeyEntry) {
         _pendingDelete.value = null
         viewModelScope.launch(Dispatchers.IO) {
-            RemoteLogger.i("TsshKey", "deleting key id=${key.id} '${key.label}'")
+            RemoteLogger.i("IsekaiTerminalKey", "deleting key id=${key.id} '${key.label}'")
             Repositories.keys.delete(key)
             runCatching { File(key.encryptedPrivateKeyPath).delete() }
             loadKeys()
@@ -58,7 +58,7 @@ class KeyListViewModel(app: Application) : AndroidViewModel(app) {
                 val (pemBytes, pubKey) = withContext(Dispatchers.Default) {
                     KeyManager.generateEd25519Pair()
                 }
-                RemoteLogger.i("TsshKey", "generated ed25519 key pair")
+                RemoteLogger.i("IsekaiTerminalKey", "generated ed25519 key pair")
                 withContext(Dispatchers.IO) {
                     val app = getApplication<Application>()
                     val path = KeyManager.saveEncryptedKey(app, pemBytes)
@@ -71,13 +71,13 @@ class KeyListViewModel(app: Application) : AndroidViewModel(app) {
                             createdAt = System.currentTimeMillis(),
                         )
                     )
-                    RemoteLogger.i("TsshKey", "generated key saved id=$id '$label'")
+                    RemoteLogger.i("IsekaiTerminalKey", "generated key saved id=$id '$label'")
                 }
                 _generatedPubKey.value = pubKey
                 onSuccess()
                 loadKeys()
             } catch (e: Exception) {
-                RemoteLogger.e("TsshKey", "key generation failed: ${e.message}", e)
+                RemoteLogger.e("IsekaiTerminalKey", "key generation failed: ${e.message}", e)
                 onError("生成失敗: ${e.message}")
             } finally {
                 _isGenerating.value = false

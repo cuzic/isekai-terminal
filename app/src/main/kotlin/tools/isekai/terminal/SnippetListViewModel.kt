@@ -24,7 +24,7 @@ class SnippetListViewModel(app: Application) : AndroidViewModel(app) {
     fun loadSnippets() {
         viewModelScope.launch(Dispatchers.IO) {
             val list = Repositories.snippets.getAll()
-            RemoteLogger.i("TsshSnippet", "loaded ${list.size} snippet(s): ${list.map { "'${it.label}'" }}")
+            RemoteLogger.i("IsekaiTerminalSnippet", "loaded ${list.size} snippet(s): ${list.map { "'${it.label}'" }}")
             _snippets.value = list
         }
     }
@@ -35,7 +35,7 @@ class SnippetListViewModel(app: Application) : AndroidViewModel(app) {
     fun confirmDelete(snippet: Snippet) {
         _deleteTarget.value = null
         viewModelScope.launch(Dispatchers.IO) {
-            RemoteLogger.i("TsshSnippet", "deleted snippet id=${snippet.id} '${snippet.label}'")
+            RemoteLogger.i("IsekaiTerminalSnippet", "deleted snippet id=${snippet.id} '${snippet.label}'")
             Repositories.snippets.delete(snippet)
             loadSnippets()
         }

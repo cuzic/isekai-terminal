@@ -5,7 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import uniffi.tssh_core.SshAuth
+import uniffi.isekai_terminal_core.SshAuth
 
 /**
  * [ConnectionProfile]の変換関数([toSshConfig]/[toIsekaiStunP2pConfig]/[toIsekaiLinkRelayConfig]、

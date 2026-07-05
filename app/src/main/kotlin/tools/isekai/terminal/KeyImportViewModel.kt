@@ -35,11 +35,11 @@ class KeyImportViewModel(app: Application) : AndroidViewModel(app) {
                     app.contentResolver.openInputStream(uri)?.use { it.readBytes() }
                         ?: throw IllegalStateException("ファイルを読み込めませんでした")
                 }
-                RemoteLogger.i("TsshKey", "read PEM: ${pemBytes.size} bytes")
+                RemoteLogger.i("IsekaiTerminalKey", "read PEM: ${pemBytes.size} bytes")
                 withContext(Dispatchers.IO) {
                     val path = KeyManager.saveEncryptedKey(app, pemBytes)
                     val hint = KeyManager.extractPublicKeyHint(pemBytes)
-                    RemoteLogger.i("TsshKey", "encrypted key saved → $path")
+                    RemoteLogger.i("IsekaiTerminalKey", "encrypted key saved → $path")
                     val id = Repositories.keys.save(
                         KeyEntry(
                             label = label,
@@ -49,11 +49,11 @@ class KeyImportViewModel(app: Application) : AndroidViewModel(app) {
                             createdAt = System.currentTimeMillis(),
                         )
                     )
-                    RemoteLogger.i("TsshKey", "key saved to DB: id=$id label='$label'")
+                    RemoteLogger.i("IsekaiTerminalKey", "key saved to DB: id=$id label='$label'")
                 }
                 onSaved()
             } catch (e: Exception) {
-                RemoteLogger.e("TsshKey", "import failed: ${e.message}", e)
+                RemoteLogger.e("IsekaiTerminalKey", "import failed: ${e.message}", e)
                 _errorMsg.value = "保存に失敗しました: ${e.message}"
             } finally {
                 _isSaving.value = false

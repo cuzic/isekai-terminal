@@ -35,10 +35,10 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             terminalService = (binder as TerminalSessionService.SessionBinder).getService()
-            RemoteLogger.i("TsshVM", "service bound OK")
+            RemoteLogger.i("IsekaiTerminalVM", "service bound OK")
         }
         override fun onServiceDisconnected(name: ComponentName) {
-            RemoteLogger.w("TsshVM", "service disconnected unexpectedly")
+            RemoteLogger.w("IsekaiTerminalVM", "service disconnected unexpectedly")
             terminalService = null
         }
     }
@@ -48,7 +48,7 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
         isServiceBound = app.bindService(
             Intent(app, TerminalSessionService::class.java), serviceConnection, 0
         )
-        RemoteLogger.i("TsshVM", "AndroidAppExecutor init (serviceBound=$isServiceBound)")
+        RemoteLogger.i("IsekaiTerminalVM", "AndroidAppExecutor init (serviceBound=$isServiceBound)")
     }
 
     override fun ensureServiceRunning() {
@@ -128,7 +128,7 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
     override suspend fun loadKeyPem(keyId: Long): ByteArray {
         val keyEntry = Repositories.keys.findById(keyId)
             ?: error("鍵が見つかりません (id=$keyId)")
-        RemoteLogger.i("TsshSSH", "decrypting key '${keyEntry.label}'")
+        RemoteLogger.i("IsekaiTerminalSSH", "decrypting key '${keyEntry.label}'")
         val encBytes = File(keyEntry.encryptedPrivateKeyPath).readBytes()
         return KeystoreKek.decrypt(encBytes)
     }

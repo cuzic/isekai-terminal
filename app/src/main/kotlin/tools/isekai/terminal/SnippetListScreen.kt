@@ -89,7 +89,7 @@ fun SnippetListScreen(
                         SnippetCard(
                             snippet = snippet,
                             onEdit = {
-                                RemoteLogger.i("TsshSnippet", "edit: '${snippet.label}' id=${snippet.id}")
+                                RemoteLogger.i("IsekaiTerminalSnippet", "edit: '${snippet.label}' id=${snippet.id}")
                                 onEditSnippet(snippet)
                             },
                             onDelete = { vm.requestDelete(snippet) },
