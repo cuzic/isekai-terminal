@@ -34,6 +34,20 @@
                ReferencedContainer = "container:TsshTerminalApp.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "AAAABBBBCCCC00000000002F"
+               BuildableName = "TsshTerminalAppUITests.xctest"
+               BlueprintName = "TsshTerminalAppUITests"
+               ReferencedContainer = "container:TsshTerminalApp.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction
@@ -49,6 +63,16 @@
                BlueprintIdentifier = "AAAABBBBCCCC000000000019"
                BuildableName = "TsshTerminalAppTests.xctest"
                BlueprintName = "TsshTerminalAppTests"
+               ReferencedContainer = "container:TsshTerminalApp.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "AAAABBBBCCCC00000000002F"
+               BuildableName = "TsshTerminalAppUITests.xctest"
+               BlueprintName = "TsshTerminalAppUITests"
                ReferencedContainer = "container:TsshTerminalApp.xcodeproj">
             </BuildableReference>
          </TestableReference>

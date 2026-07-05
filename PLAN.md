@@ -2132,8 +2132,30 @@ MVPスコープ部分をSwiftUIへ移植した。
   fixtureの`authorized_keys`はsshd起動後も接続の都度再読込されるため、
   テスト実行時に動的に追記できることを利用した。既存の`SshVerticalSliceTests.swift`の
   fixture読込ロジックは`SshFixtureConfig.swift`へ共通化。
-- **未着手(次のタスク)**: `TsshTerminalAppUITests`(XCUITest、真のUI駆動テスト用の
-  新規ターゲット)・ターミナル本画面の実装。
+- **未着手(次のタスク)**: ターミナル本画面の実装。
+
+### `TsshTerminalAppUITests`(XCUITest)新設(2026-07-04)
+
+ユーザーからの「xcodeシミュレーターでテストできる範囲を網羅的に」という要望に対応。
+これまでの`TsshCoreTests`/`TsshTerminalAppTests`はいずれも「XCTestCaseから対象の
+メソッド/モデルを直接呼び出す」ユニットテストスタイルで、`XCUIApplication`で実際に
+アプリを起動しタップ・文字入力・スワイプ・メニュー操作・システムアラート確認を行う
+「真のUI駆動テスト」は一つも無かった。`TsshTerminalApp.xcodeproj`に
+`com.apple.product-type.bundle.ui-testing`型の新規ターゲット`TsshTerminalAppUITests`
+を(`TsshTerminalAppTests`追加時と同じ手法で)手書きのpbxproj編集で追加し、
+既存の共有scheme(`TsshTerminalApp.xcscheme`)にもBuildActionEntry/TestableReferenceを
+追加した(`ios-app-build-check.yml`が実行する`xcodebuild test -scheme TsshTerminalApp`が
+自動的にこの新規ターゲットも実行するため、新規CI workflowは不要)。
+
+`AppLaunchUITests.swift`として以下4件を追加:
+- アプリ起動→接続先一覧画面が表示されることの確認(スクリーンショット添付)
+- 「+」→フォーム入力→保存→一覧に新しい行が現れることの確認
+- 行のスワイプ削除→削除確認アラート→行が消えることの確認
+- メニュー→鍵管理→鍵生成→生成完了アラート→一覧に新しい鍵が現れることの確認
+
+**既知の制約**: `AppServices.shared`は実ファイル(GRDB DB・Keychain)を使う
+シングルトンでテスト間でリセットされないため、各テストは`UUID`ベースのユニークな
+ラベルで新規行を識別する設計にした(既存データの有無を前提にしない)。
 
 **CIで発見・修正した2件の不具合(2026-07-04)**:
 1. **アクター分離エラー**: `ProfileListView`/`KeyListView`/`KeyImportView`の`init`が
