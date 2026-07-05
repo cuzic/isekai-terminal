@@ -313,6 +313,16 @@ impl PathBroker {
     }
 }
 
+/// pathイベント(`Established`/`Abandoned`/`Discarded`)が共通で行う
+/// 「brokerに登録済みのcandidateを探し、状態を反映する」処理。未登録のid
+/// (このタスク起動前にイベントが飛んだ場合等)は無視する。戻り値は反映できた
+/// candidate(呼び出し側が状態遷移後の追加処理をするかどうかの判断に使う)。
+fn set_path_state(broker: &PathBroker, id: noq::PathId, state: PathState) -> Option<PathCandidateId> {
+    let candidate = broker.candidate_for(id)?;
+    broker.set(candidate, state);
+    Some(candidate)
+}
+
 // ── Phase 9-4: 物理Wi-Fi/セルラー無線を束ねる `MultiUdpSocket` ─────────
 //
 // `noq-multipath-spike/src/dual_fd_socket.rs`の`DualUdpSocket`（bindされた
@@ -634,8 +644,7 @@ async fn establish_multipath_connection(
             while let Some(ev) = events.next().await {
                 match ev {
                     Ok(noq::PathEvent::Established { id, .. }) => {
-                        if let Some(candidate) = broker.candidate_for(id) {
-                            broker.set(candidate, PathState::Validated);
+                        if let Some(candidate) = set_path_state(&broker, id, PathState::Validated) {
                             spawn_health_monitor(
                                 conn_for_events.clone(), id, candidate, broker.clone(), event_tx.clone(),
                             );
@@ -643,14 +652,12 @@ async fn establish_multipath_connection(
                     }
                     Ok(noq::PathEvent::Abandoned { id, reason, .. }) => {
                         info!("multipath_quic: path {id:?} abandoned: {reason:?}");
-                        if let Some(candidate) = broker.candidate_for(id) {
-                            broker.set(candidate, PathState::Failed);
+                        if set_path_state(&broker, id, PathState::Failed).is_some() {
                             notify_if_no_viable_path(&broker, &event_tx);
                         }
                     }
                     Ok(noq::PathEvent::Discarded { id, .. }) => {
-                        if let Some(candidate) = broker.candidate_for(id) {
-                            broker.set(candidate, PathState::Failed);
+                        if set_path_state(&broker, id, PathState::Failed).is_some() {
                             notify_if_no_viable_path(&broker, &event_tx);
                         }
                     }
