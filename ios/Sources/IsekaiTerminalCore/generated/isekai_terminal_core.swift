@@ -7,8 +7,8 @@ import Foundation
 // Depending on the consumer's build setup, the low-level FFI code
 // might be in a separate module, or it might be compiled inline into
 // this module. This is a bit of light hackery to work with both.
-#if canImport(tssh_coreFFI)
-import tssh_coreFFI
+#if canImport(isekai_terminal_coreFFI)
+import isekai_terminal_coreFFI
 #endif
 
 fileprivate extension RustBuffer {
@@ -25,13 +25,13 @@ fileprivate extension RustBuffer {
     }
 
     static func from(_ ptr: UnsafeBufferPointer<UInt8>) -> RustBuffer {
-        try! rustCall { ffi_tssh_core_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
+        try! rustCall { ffi_isekai_terminal_core_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
     }
 
     // Frees the buffer in place.
     // The buffer must not be used after this is called.
     func deallocate() {
-        try! rustCall { ffi_tssh_core_rustbuffer_free(self, $0) }
+        try! rustCall { ffi_isekai_terminal_core_rustbuffer_free(self, $0) }
     }
 }
 
@@ -281,7 +281,7 @@ private func makeRustCall<T, E: Swift.Error>(
     _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
     errorHandler: ((RustBuffer) throws -> E)?
 ) throws -> T {
-    uniffiEnsureTsshCoreInitialized()
+    uniffiEnsureIsekaiTerminalCoreInitialized()
     var callStatus = RustCallStatus.init()
     let returnedVal = callback(&callStatus)
     try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
@@ -646,7 +646,7 @@ open class HelperQuicSession: HelperQuicSessionProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_tssh_core_fn_clone_helperquicsession(self.handle, $0) }
+        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_helperquicsession(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -656,7 +656,7 @@ open class HelperQuicSession: HelperQuicSessionProtocol, @unchecked Sendable {
             return
         }
 
-        try! rustCall { uniffi_tssh_core_fn_free_helperquicsession(handle, $0) }
+        try! rustCall { uniffi_isekai_terminal_core_fn_free_helperquicsession(handle, $0) }
     }
 
     
@@ -666,7 +666,7 @@ open class HelperQuicSession: HelperQuicSessionProtocol, @unchecked Sendable {
      * 明示的にヘルパー経由 QUIC のみを試す（フォールバック無し）。
      */
 open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_helperquicsession_connect(
+    uniffi_isekai_terminal_core_fn_method_helperquicsession_connect(
             self.uniffiCloneHandle(),
         FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
     )
@@ -678,7 +678,7 @@ open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiC
      * 通常の TCP SSH（Phase 1-4）にフォールバックする。
      */
 open func connectAuto(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_helperquicsession_connect_auto(
+    uniffi_isekai_terminal_core_fn_method_helperquicsession_connect_auto(
             self.uniffiCloneHandle(),
         FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
     )
@@ -686,14 +686,14 @@ open func connectAuto(callback: SessionCallback)throws   {try rustCallWithError(
 }
     
 open func disconnect()  {try! rustCall() {
-    uniffi_tssh_core_fn_method_helperquicsession_disconnect(
+    uniffi_isekai_terminal_core_fn_method_helperquicsession_disconnect(
             self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_helperquicsession_resize(
+    uniffi_isekai_terminal_core_fn_method_helperquicsession_resize(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(cols),
         FfiConverterUInt32.lower(rows),$0
@@ -703,7 +703,7 @@ open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
     
 open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     return try!  FfiConverterSequenceTypeCellData.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_helperquicsession_scrollback_cells(
+    uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_cells(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(offset),
         FfiConverterUInt32.lower(rows),$0
@@ -713,14 +713,14 @@ open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     
 open func scrollbackLen() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_helperquicsession_scrollback_len(
+    uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_len(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func send(data: Data)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_helperquicsession_send(
+    uniffi_isekai_terminal_core_fn_method_helperquicsession_send(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(data),$0
     )
@@ -728,7 +728,7 @@ open func send(data: Data)  {try! rustCall() {
 }
     
 open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_helperquicsession_trzsz_accept_download(
+    uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_download(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -736,7 +736,7 @@ open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
 }
     
 open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_helperquicsession_trzsz_accept_upload(
+    uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_upload(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterString.lower(fileName),
@@ -747,7 +747,7 @@ open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt
 }
     
 open func trzszCancel(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_helperquicsession_trzsz_cancel(
+    uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_cancel(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -755,7 +755,7 @@ open func trzszCancel(transferId: String)  {try! rustCall() {
 }
     
 open func trzszSendChunk(transferId: String, data: Data, isLast: Bool)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_helperquicsession_trzsz_send_chunk(
+    uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_send_chunk(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterData.lower(data),
@@ -878,7 +878,7 @@ open class IsekaiLinkRelaySession: IsekaiLinkRelaySessionProtocol, @unchecked Se
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_tssh_core_fn_clone_isekailinkrelaysession(self.handle, $0) }
+        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_isekailinkrelaysession(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -888,7 +888,7 @@ open class IsekaiLinkRelaySession: IsekaiLinkRelaySessionProtocol, @unchecked Se
             return
         }
 
-        try! rustCall { uniffi_tssh_core_fn_free_isekailinkrelaysession(handle, $0) }
+        try! rustCall { uniffi_isekai_terminal_core_fn_free_isekailinkrelaysession(handle, $0) }
     }
 
     
@@ -899,7 +899,7 @@ open class IsekaiLinkRelaySession: IsekaiLinkRelaySessionProtocol, @unchecked Se
      * （relayへの到達・認証・トンネル確立のいずれかが失敗すれば接続失敗として扱う）。
      */
 open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_isekailinkrelaysession_connect(
+    uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_connect(
             self.uniffiCloneHandle(),
         FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
     )
@@ -907,14 +907,14 @@ open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiC
 }
     
 open func disconnect()  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekailinkrelaysession_disconnect(
+    uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_disconnect(
             self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekailinkrelaysession_resize(
+    uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_resize(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(cols),
         FfiConverterUInt32.lower(rows),$0
@@ -924,7 +924,7 @@ open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
     
 open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     return try!  FfiConverterSequenceTypeCellData.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_isekailinkrelaysession_scrollback_cells(
+    uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_scrollback_cells(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(offset),
         FfiConverterUInt32.lower(rows),$0
@@ -934,14 +934,14 @@ open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     
 open func scrollbackLen() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_isekailinkrelaysession_scrollback_len(
+    uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_scrollback_len(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func send(data: Data)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekailinkrelaysession_send(
+    uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_send(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(data),$0
     )
@@ -949,7 +949,7 @@ open func send(data: Data)  {try! rustCall() {
 }
     
 open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_accept_download(
+    uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_accept_download(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -957,7 +957,7 @@ open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
 }
     
 open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_accept_upload(
+    uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_accept_upload(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterString.lower(fileName),
@@ -968,7 +968,7 @@ open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt
 }
     
 open func trzszCancel(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_cancel(
+    uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_cancel(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -976,7 +976,7 @@ open func trzszCancel(transferId: String)  {try! rustCall() {
 }
     
 open func trzszSendChunk(transferId: String, data: Data, isLast: Bool)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekailinkrelaysession_trzsz_send_chunk(
+    uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_send_chunk(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterData.lower(data),
@@ -1099,7 +1099,7 @@ open class IsekaiStunP2pSession: IsekaiStunP2pSessionProtocol, @unchecked Sendab
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_tssh_core_fn_clone_isekaistunp2psession(self.handle, $0) }
+        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_isekaistunp2psession(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -1109,7 +1109,7 @@ open class IsekaiStunP2pSession: IsekaiStunP2pSessionProtocol, @unchecked Sendab
             return
         }
 
-        try! rustCall { uniffi_tssh_core_fn_free_isekaistunp2psession(handle, $0) }
+        try! rustCall { uniffi_isekai_terminal_core_fn_free_isekaistunp2psession(handle, $0) }
     }
 
     
@@ -1120,7 +1120,7 @@ open class IsekaiStunP2pSession: IsekaiStunP2pSessionProtocol, @unchecked Sendab
      * （穴あけが成立しなければ接続失敗として扱う。PLAN.md Phase 10 の設計判断参照）。
      */
 open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_isekaistunp2psession_connect(
+    uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_connect(
             self.uniffiCloneHandle(),
         FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
     )
@@ -1128,14 +1128,14 @@ open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiC
 }
     
 open func disconnect()  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekaistunp2psession_disconnect(
+    uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_disconnect(
             self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekaistunp2psession_resize(
+    uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_resize(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(cols),
         FfiConverterUInt32.lower(rows),$0
@@ -1145,7 +1145,7 @@ open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
     
 open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     return try!  FfiConverterSequenceTypeCellData.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_isekaistunp2psession_scrollback_cells(
+    uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_scrollback_cells(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(offset),
         FfiConverterUInt32.lower(rows),$0
@@ -1155,14 +1155,14 @@ open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     
 open func scrollbackLen() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_isekaistunp2psession_scrollback_len(
+    uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_scrollback_len(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func send(data: Data)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekaistunp2psession_send(
+    uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_send(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(data),$0
     )
@@ -1170,7 +1170,7 @@ open func send(data: Data)  {try! rustCall() {
 }
     
 open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_accept_download(
+    uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_accept_download(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -1178,7 +1178,7 @@ open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
 }
     
 open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_accept_upload(
+    uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_accept_upload(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterString.lower(fileName),
@@ -1189,7 +1189,7 @@ open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt
 }
     
 open func trzszCancel(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_cancel(
+    uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_cancel(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -1197,7 +1197,7 @@ open func trzszCancel(transferId: String)  {try! rustCall() {
 }
     
 open func trzszSendChunk(transferId: String, data: Data, isLast: Bool)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_isekaistunp2psession_trzsz_send_chunk(
+    uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_send_chunk(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterData.lower(data),
@@ -1328,7 +1328,7 @@ open class MultipathHelperQuicSession: MultipathHelperQuicSessionProtocol, @unch
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_tssh_core_fn_clone_multipathhelperquicsession(self.handle, $0) }
+        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_multipathhelperquicsession(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -1338,7 +1338,7 @@ open class MultipathHelperQuicSession: MultipathHelperQuicSessionProtocol, @unch
             return
         }
 
-        try! rustCall { uniffi_tssh_core_fn_free_multipathhelperquicsession(handle, $0) }
+        try! rustCall { uniffi_isekai_terminal_core_fn_free_multipathhelperquicsession(handle, $0) }
     }
 
     
@@ -1349,7 +1349,7 @@ open class MultipathHelperQuicSession: MultipathHelperQuicSessionProtocol, @unch
      * エラーを返す（`TransportPreference::IsekaiHelperQuicMultipath` 相当）。
      */
 open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_multipathhelperquicsession_connect(
+    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_connect(
             self.uniffiCloneHandle(),
         FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
     )
@@ -1357,7 +1357,7 @@ open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiC
 }
     
 open func disconnect()  {try! rustCall() {
-    uniffi_tssh_core_fn_method_multipathhelperquicsession_disconnect(
+    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_disconnect(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -1370,7 +1370,7 @@ open func disconnect()  {try! rustCall() {
      * （エラーにはしない——呼び出し側は日和見的に呼べばよい）。
      */
 open func rebindToFd(fd: Int32, localIp: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_multipathhelperquicsession_rebind_to_fd(
+    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_rebind_to_fd(
             self.uniffiCloneHandle(),
         FfiConverterInt32.lower(fd),
         FfiConverterString.lower(localIp),$0
@@ -1379,7 +1379,7 @@ open func rebindToFd(fd: Int32, localIp: String)  {try! rustCall() {
 }
     
 open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_multipathhelperquicsession_resize(
+    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_resize(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(cols),
         FfiConverterUInt32.lower(rows),$0
@@ -1389,7 +1389,7 @@ open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
     
 open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     return try!  FfiConverterSequenceTypeCellData.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_multipathhelperquicsession_scrollback_cells(
+    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_cells(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(offset),
         FfiConverterUInt32.lower(rows),$0
@@ -1399,14 +1399,14 @@ open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     
 open func scrollbackLen() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_multipathhelperquicsession_scrollback_len(
+    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_len(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func send(data: Data)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_multipathhelperquicsession_send(
+    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_send(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(data),$0
     )
@@ -1414,7 +1414,7 @@ open func send(data: Data)  {try! rustCall() {
 }
     
 open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_accept_download(
+    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_download(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -1422,7 +1422,7 @@ open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
 }
     
 open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_accept_upload(
+    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_upload(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterString.lower(fileName),
@@ -1433,7 +1433,7 @@ open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt
 }
     
 open func trzszCancel(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_cancel(
+    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_cancel(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -1441,7 +1441,7 @@ open func trzszCancel(transferId: String)  {try! rustCall() {
 }
     
 open func trzszSendChunk(transferId: String, data: Data, isLast: Bool)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_multipathhelperquicsession_trzsz_send_chunk(
+    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_send_chunk(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterData.lower(data),
@@ -1560,7 +1560,7 @@ open class QuicSession: QuicSessionProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_tssh_core_fn_clone_quicsession(self.handle, $0) }
+        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_quicsession(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -1570,14 +1570,14 @@ open class QuicSession: QuicSessionProtocol, @unchecked Sendable {
             return
         }
 
-        try! rustCall { uniffi_tssh_core_fn_free_quicsession(handle, $0) }
+        try! rustCall { uniffi_isekai_terminal_core_fn_free_quicsession(handle, $0) }
     }
 
     
 
     
 open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_quicsession_connect(
+    uniffi_isekai_terminal_core_fn_method_quicsession_connect(
             self.uniffiCloneHandle(),
         FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
     )
@@ -1585,14 +1585,14 @@ open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiC
 }
     
 open func disconnect()  {try! rustCall() {
-    uniffi_tssh_core_fn_method_quicsession_disconnect(
+    uniffi_isekai_terminal_core_fn_method_quicsession_disconnect(
             self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_quicsession_resize(
+    uniffi_isekai_terminal_core_fn_method_quicsession_resize(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(cols),
         FfiConverterUInt32.lower(rows),$0
@@ -1602,7 +1602,7 @@ open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
     
 open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     return try!  FfiConverterSequenceTypeCellData.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_quicsession_scrollback_cells(
+    uniffi_isekai_terminal_core_fn_method_quicsession_scrollback_cells(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(offset),
         FfiConverterUInt32.lower(rows),$0
@@ -1612,14 +1612,14 @@ open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     
 open func scrollbackLen() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_quicsession_scrollback_len(
+    uniffi_isekai_terminal_core_fn_method_quicsession_scrollback_len(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func send(data: Data)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_quicsession_send(
+    uniffi_isekai_terminal_core_fn_method_quicsession_send(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(data),$0
     )
@@ -1627,7 +1627,7 @@ open func send(data: Data)  {try! rustCall() {
 }
     
 open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_quicsession_trzsz_accept_download(
+    uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_accept_download(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -1635,7 +1635,7 @@ open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
 }
     
 open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_quicsession_trzsz_accept_upload(
+    uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_accept_upload(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterString.lower(fileName),
@@ -1646,7 +1646,7 @@ open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt
 }
     
 open func trzszCancel(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_quicsession_trzsz_cancel(
+    uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_cancel(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -1654,7 +1654,7 @@ open func trzszCancel(transferId: String)  {try! rustCall() {
 }
     
 open func trzszSendChunk(transferId: String, data: Data, isLast: Bool)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_quicsession_trzsz_send_chunk(
+    uniffi_isekai_terminal_core_fn_method_quicsession_trzsz_send_chunk(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterData.lower(data),
@@ -1849,7 +1849,7 @@ open class SessionOrchestrator: SessionOrchestratorProtocol, @unchecked Sendable
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_tssh_core_fn_clone_sessionorchestrator(self.handle, $0) }
+        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_sessionorchestrator(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -1859,7 +1859,7 @@ open class SessionOrchestrator: SessionOrchestratorProtocol, @unchecked Sendable
             return
         }
 
-        try! rustCall { uniffi_tssh_core_fn_free_sessionorchestrator(handle, $0) }
+        try! rustCall { uniffi_isekai_terminal_core_fn_free_sessionorchestrator(handle, $0) }
     }
 
     
@@ -1871,7 +1871,7 @@ open class SessionOrchestrator: SessionOrchestratorProtocol, @unchecked Sendable
      * 将来「接続したまま転送を足す」UI を追加する際の入り口として用意している。
      */
 open func addLocalForward(id: String, bindAddress: String, bindPort: UInt16, remoteHost: String, remotePort: UInt16)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_add_local_forward(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_add_local_forward(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(id),
         FfiConverterString.lower(bindAddress),
@@ -1883,7 +1883,7 @@ open func addLocalForward(id: String, bindAddress: String, bindPort: UInt16, rem
 }
     
 open func connect(config: SshConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_sessionorchestrator_connect(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect(
             self.uniffiCloneHandle(),
         FfiConverterTypeSshConfig_lower(config),$0
     )
@@ -1895,7 +1895,7 @@ open func connect(config: SshConfig)throws   {try rustCallWithError(FfiConverter
      * （`TransportPreference::IsekaiHelperQuic` 相当、明示選択時に使う）。
      */
 open func connectHelperQuic(config: HelperQuicConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_sessionorchestrator_connect_helper_quic(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic(
             self.uniffiCloneHandle(),
         FfiConverterTypeHelperQuicConfig_lower(config),$0
     )
@@ -1907,7 +1907,7 @@ open func connectHelperQuic(config: HelperQuicConfig)throws   {try rustCallWithE
      * 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
      */
 open func connectHelperQuicAuto(config: HelperQuicConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_sessionorchestrator_connect_helper_quic_auto(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic_auto(
             self.uniffiCloneHandle(),
         FfiConverterTypeHelperQuicConfig_lower(config),$0
     )
@@ -1919,7 +1919,7 @@ open func connectHelperQuicAuto(config: HelperQuicConfig)throws   {try rustCallW
      * P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
      */
 open func connectIsekaiLinkRelay(config: IsekaiLinkRelayConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_sessionorchestrator_connect_isekai_link_relay(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_link_relay(
             self.uniffiCloneHandle(),
         FfiConverterTypeIsekaiLinkRelayConfig_lower(config),$0
     )
@@ -1932,7 +1932,7 @@ open func connectIsekaiLinkRelay(config: IsekaiLinkRelayConfig)throws   {try rus
      * 接続失敗として扱う。`isekai_stun_p2p_transport.rs` 参照）。
      */
 open func connectIsekaiStunP2p(config: IsekaiStunP2pConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_sessionorchestrator_connect_isekai_stun_p2p(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_stun_p2p(
             self.uniffiCloneHandle(),
         FfiConverterTypeIsekaiStunP2pConfig_lower(config),$0
     )
@@ -1945,7 +1945,7 @@ open func connectIsekaiStunP2p(config: IsekaiStunP2pConfig)throws   {try rustCal
      * 受動的マルチパスで接続する。
      */
 open func connectMultipathHelperQuic(config: MultipathHelperQuicConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_sessionorchestrator_connect_multipath_helper_quic(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_multipath_helper_quic(
             self.uniffiCloneHandle(),
         FfiConverterTypeMultipathHelperQuicConfig_lower(config),$0
     )
@@ -1953,7 +1953,7 @@ open func connectMultipathHelperQuic(config: MultipathHelperQuicConfig)throws   
 }
     
 open func connectQuic(config: QuicConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_sessionorchestrator_connect_quic(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_quic(
             self.uniffiCloneHandle(),
         FfiConverterTypeQuicConfig_lower(config),$0
     )
@@ -1961,7 +1961,7 @@ open func connectQuic(config: QuicConfig)throws   {try rustCallWithError(FfiConv
 }
     
 open func disconnect()  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_disconnect(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -1969,14 +1969,14 @@ open func disconnect()  {try! rustCall() {
     
 open func isQuic() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_is_quic(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_is_quic(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func notifyError(message: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_notify_error(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(message),$0
     )
@@ -1990,7 +1990,7 @@ open func notifyError(message: String)  {try! rustCall() {
      * Kotlin 側はイベントをそのまま転送するだけ）。
      */
 open func notifyNetworkLost()  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_notify_network_lost(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_network_lost(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -2002,7 +2002,7 @@ open func notifyNetworkLost()  {try! rustCall() {
      * （所有権はこちらに移る）。マルチパス以外のtransportや未接続時は何もしない。
      */
 open func rebindToFd(fd: Int32, localIp: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_rebind_to_fd(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_rebind_to_fd(
             self.uniffiCloneHandle(),
         FfiConverterInt32.lower(fd),
         FfiConverterString.lower(localIp),$0
@@ -2011,7 +2011,7 @@ open func rebindToFd(fd: Int32, localIp: String)  {try! rustCall() {
 }
     
 open func removeForward(id: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_remove_forward(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_remove_forward(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(id),$0
     )
@@ -2019,7 +2019,7 @@ open func removeForward(id: String)  {try! rustCall() {
 }
     
 open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_resize(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_resize(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(cols),
         FfiConverterUInt32.lower(rows),$0
@@ -2029,7 +2029,7 @@ open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
     
 open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     return try!  FfiConverterSequenceTypeCellData.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_cells(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_cells(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(offset),
         FfiConverterUInt32.lower(rows),$0
@@ -2039,14 +2039,14 @@ open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     
 open func scrollbackLen() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_scrollback_len(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_len(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func send(data: Data)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_send(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_send(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(data),$0
     )
@@ -2064,7 +2064,7 @@ open func send(data: Data)  {try! rustCall() {
      * Tab/session override」の解決を行い、結果をここへ渡す。
      */
 open func setSessionTheme(ansi16: [UInt32], defaultFg: UInt32, defaultBg: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_set_session_theme(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_set_session_theme(
             self.uniffiCloneHandle(),
         FfiConverterSequenceUInt32.lower(ansi16),
         FfiConverterUInt32.lower(defaultFg),
@@ -2074,14 +2074,14 @@ open func setSessionTheme(ansi16: [UInt32], defaultFg: UInt32, defaultBg: UInt32
 }
     
 open func trzszAcceptDownload()  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_accept_download(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_accept_download(
             self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func trzszAcceptUpload(fileName: String, fileSize: UInt64, mode: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_accept_upload(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_accept_upload(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(fileName),
         FfiConverterUInt64.lower(fileSize),
@@ -2091,21 +2091,21 @@ open func trzszAcceptUpload(fileName: String, fileSize: UInt64, mode: UInt32)  {
 }
     
 open func trzszCancel()  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_cancel(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_cancel(
             self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func trzszDismiss()  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_dismiss(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_dismiss(
             self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func trzszSendChunk(data: Data, isLast: Bool)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sessionorchestrator_trzsz_send_chunk(
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_trzsz_send_chunk(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(data),
         FfiConverterBool.lower(isLast),$0
@@ -2223,7 +2223,7 @@ open class SshSession: SshSessionProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_tssh_core_fn_clone_sshsession(self.handle, $0) }
+        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_sshsession(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -2233,14 +2233,14 @@ open class SshSession: SshSessionProtocol, @unchecked Sendable {
             return
         }
 
-        try! rustCall { uniffi_tssh_core_fn_free_sshsession(handle, $0) }
+        try! rustCall { uniffi_isekai_terminal_core_fn_free_sshsession(handle, $0) }
     }
 
     
 
     
 open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_tssh_core_fn_method_sshsession_connect(
+    uniffi_isekai_terminal_core_fn_method_sshsession_connect(
             self.uniffiCloneHandle(),
         FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
     )
@@ -2248,14 +2248,14 @@ open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiC
 }
     
 open func disconnect()  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sshsession_disconnect(
+    uniffi_isekai_terminal_core_fn_method_sshsession_disconnect(
             self.uniffiCloneHandle(),$0
     )
 }
 }
     
 open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sshsession_resize(
+    uniffi_isekai_terminal_core_fn_method_sshsession_resize(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(cols),
         FfiConverterUInt32.lower(rows),$0
@@ -2265,7 +2265,7 @@ open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
     
 open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     return try!  FfiConverterSequenceTypeCellData.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_sshsession_scrollback_cells(
+    uniffi_isekai_terminal_core_fn_method_sshsession_scrollback_cells(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(offset),
         FfiConverterUInt32.lower(rows),$0
@@ -2275,14 +2275,14 @@ open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     
 open func scrollbackLen() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_tssh_core_fn_method_sshsession_scrollback_len(
+    uniffi_isekai_terminal_core_fn_method_sshsession_scrollback_len(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func send(data: Data)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sshsession_send(
+    uniffi_isekai_terminal_core_fn_method_sshsession_send(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(data),$0
     )
@@ -2290,7 +2290,7 @@ open func send(data: Data)  {try! rustCall() {
 }
     
 open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sshsession_trzsz_accept_download(
+    uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_accept_download(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -2298,7 +2298,7 @@ open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
 }
     
 open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sshsession_trzsz_accept_upload(
+    uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_accept_upload(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterString.lower(fileName),
@@ -2309,7 +2309,7 @@ open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt
 }
     
 open func trzszCancel(transferId: String)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sshsession_trzsz_cancel(
+    uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_cancel(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -2317,7 +2317,7 @@ open func trzszCancel(transferId: String)  {try! rustCall() {
 }
     
 open func trzszSendChunk(transferId: String, data: Data, isLast: Bool)  {try! rustCall() {
-    uniffi_tssh_core_fn_method_sshsession_trzsz_send_chunk(
+    uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_send_chunk(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterData.lower(data),
@@ -2447,13 +2447,30 @@ public struct HelperQuicConfig: Equatable, Hashable {
      * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
      */
     public var jump: JumpConfig?
+    /**
+     * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
+     * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
+     * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
+     * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
+     * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
+     * 確定した値だけを渡すこと。
+     */
+    public var bindPort: UInt16?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(sshHost: String, sshPort: UInt16, username: String, auth: SshAuth, cols: UInt32, rows: UInt32, 
         /**
          * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
-         */jump: JumpConfig?) {
+         */jump: JumpConfig?, 
+        /**
+         * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
+         * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
+         * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
+         * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
+         * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
+         * 確定した値だけを渡すこと。
+         */bindPort: UInt16?) {
         self.sshHost = sshHost
         self.sshPort = sshPort
         self.username = username
@@ -2461,6 +2478,7 @@ public struct HelperQuicConfig: Equatable, Hashable {
         self.cols = cols
         self.rows = rows
         self.jump = jump
+        self.bindPort = bindPort
     }
 
     
@@ -2485,7 +2503,8 @@ public struct FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer {
                 auth: FfiConverterTypeSshAuth.read(from: &buf), 
                 cols: FfiConverterUInt32.read(from: &buf), 
                 rows: FfiConverterUInt32.read(from: &buf), 
-                jump: FfiConverterOptionTypeJumpConfig.read(from: &buf)
+                jump: FfiConverterOptionTypeJumpConfig.read(from: &buf), 
+                bindPort: FfiConverterOptionUInt16.read(from: &buf)
         )
     }
 
@@ -2497,6 +2516,7 @@ public struct FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.cols, into: &buf)
         FfiConverterUInt32.write(value.rows, into: &buf)
         FfiConverterOptionTypeJumpConfig.write(value.jump, into: &buf)
+        FfiConverterOptionUInt16.write(value.bindPort, into: &buf)
     }
 }
 
@@ -2837,6 +2857,15 @@ public struct MultipathHelperQuicConfig: Equatable, Hashable {
      * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
      */
     public var jump: JumpConfig?
+    /**
+     * isekai-helperのQUIC待受ポートをユーザー指定で固定する(`None`なら、
+     * `direct_host`が設定されている場合のみ既定値`DIRECT_MULTIPATH_BIND_PORT`を使う、
+     * 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
+     * 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
+     * `None`の場合はRust側で従来通りの既定値フォールバックを維持する
+     * (`HelperQuicConfig.bind_port`のdocコメントも参照)。
+     */
+    public var bindPort: UInt16?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2872,7 +2901,15 @@ public struct MultipathHelperQuicConfig: Equatable, Hashable {
          */cellularFd: Int32?, cellularLocalIp: String?, username: String, auth: SshAuth, cols: UInt32, rows: UInt32, 
         /**
          * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
-         */jump: JumpConfig?) {
+         */jump: JumpConfig?, 
+        /**
+         * isekai-helperのQUIC待受ポートをユーザー指定で固定する(`None`なら、
+         * `direct_host`が設定されている場合のみ既定値`DIRECT_MULTIPATH_BIND_PORT`を使う、
+         * 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
+         * 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
+         * `None`の場合はRust側で従来通りの既定値フォールバックを維持する
+         * (`HelperQuicConfig.bind_port`のdocコメントも参照)。
+         */bindPort: UInt16?) {
         self.sshHost = sshHost
         self.sshPort = sshPort
         self.directHost = directHost
@@ -2886,6 +2923,7 @@ public struct MultipathHelperQuicConfig: Equatable, Hashable {
         self.cols = cols
         self.rows = rows
         self.jump = jump
+        self.bindPort = bindPort
     }
 
     
@@ -2916,7 +2954,8 @@ public struct FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer 
                 auth: FfiConverterTypeSshAuth.read(from: &buf), 
                 cols: FfiConverterUInt32.read(from: &buf), 
                 rows: FfiConverterUInt32.read(from: &buf), 
-                jump: FfiConverterOptionTypeJumpConfig.read(from: &buf)
+                jump: FfiConverterOptionTypeJumpConfig.read(from: &buf), 
+                bindPort: FfiConverterOptionUInt16.read(from: &buf)
         )
     }
 
@@ -2934,6 +2973,7 @@ public struct FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer 
         FfiConverterUInt32.write(value.cols, into: &buf)
         FfiConverterUInt32.write(value.rows, into: &buf)
         FfiConverterOptionTypeJumpConfig.write(value.jump, into: &buf)
+        FfiConverterOptionUInt16.write(value.bindPort, into: &buf)
     }
 }
 
@@ -4316,7 +4356,7 @@ fileprivate struct UniffiCallbackInterfaceOrchestratorCallback {
 }
 
 private func uniffiCallbackInitOrchestratorCallback() {
-    uniffi_tssh_core_fn_init_callback_vtable_orchestratorcallback(UniffiCallbackInterfaceOrchestratorCallback.vtablePtr)
+    uniffi_isekai_terminal_core_fn_init_callback_vtable_orchestratorcallback(UniffiCallbackInterfaceOrchestratorCallback.vtablePtr)
 }
 
 // FfiConverter protocol for callback interfaces
@@ -4753,7 +4793,7 @@ fileprivate struct UniffiCallbackInterfaceSessionCallback {
 }
 
 private func uniffiCallbackInitSessionCallback() {
-    uniffi_tssh_core_fn_init_callback_vtable_sessioncallback(UniffiCallbackInterfaceSessionCallback.vtablePtr)
+    uniffi_isekai_terminal_core_fn_init_callback_vtable_sessioncallback(UniffiCallbackInterfaceSessionCallback.vtablePtr)
 }
 
 // FfiConverter protocol for callback interfaces
@@ -4814,6 +4854,30 @@ public func FfiConverterCallbackInterfaceSessionCallback_lift(_ handle: UInt64) 
 #endif
 public func FfiConverterCallbackInterfaceSessionCallback_lower(_ v: SessionCallback) -> UInt64 {
     return FfiConverterCallbackInterfaceSessionCallback.lower(v)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt16: FfiConverterRustBuffer {
+    typealias SwiftType = UInt16?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt16.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt16.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
 }
 
 #if swift(>=5.8)
@@ -4987,7 +5051,7 @@ fileprivate struct FfiConverterSequenceTypePortForward: FfiConverterRustBuffer {
     }
 }
 /**
- * tssh-core の crate バージョン（`Cargo.toml` の `version`）を返す。
+ * isekai-terminal-core の crate バージョン（`Cargo.toml` の `version`）を返す。
  *
  * iOS 対応 Phase 0 の技術検証スパイクで、UniFFI Swift バインディング経由の
  * round-trip（Swift → Rust 呼び出し → 戻り値）を確認するための診断用関数
@@ -4995,13 +5059,13 @@ fileprivate struct FfiConverterSequenceTypePortForward: FfiConverterRustBuffer {
  */
 public func coreVersion() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_tssh_core_fn_func_core_version($0
+    uniffi_isekai_terminal_core_fn_func_core_version($0
     )
 })
 }
 public func createSshSession(config: SshConfig) -> SshSession  {
     return try!  FfiConverterTypeSshSession_lift(try! rustCall() {
-    uniffi_tssh_core_fn_func_create_ssh_session(
+    uniffi_isekai_terminal_core_fn_func_create_ssh_session(
         FfiConverterTypeSshConfig_lower(config),$0
     )
 })
@@ -5015,7 +5079,7 @@ public func createSshSession(config: SshConfig) -> SshSession  {
  * 遡って再着色されない（既知の制約）。
  */
 public func setTerminalTheme(ansi16: [UInt32], defaultFg: UInt32, defaultBg: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_func_set_terminal_theme(
+    uniffi_isekai_terminal_core_fn_func_set_terminal_theme(
         FfiConverterSequenceUInt32.lower(ansi16),
         FfiConverterUInt32.lower(defaultFg),
         FfiConverterUInt32.lower(defaultBg),$0
@@ -5026,7 +5090,7 @@ public func setTerminalTheme(ansi16: [UInt32], defaultFg: UInt32, defaultBg: UIn
  * 遅延・ロス・完全断すべてを既定値（無効）へ戻す。
  */
 public func debugClearUdpFault()  {try! rustCall() {
-    uniffi_tssh_core_fn_func_debug_clear_udp_fault($0
+    uniffi_isekai_terminal_core_fn_func_debug_clear_udp_fault($0
     )
 }
 }
@@ -5034,7 +5098,7 @@ public func debugClearUdpFault()  {try! rustCall() {
  * 完全なネットワーク断（電波圏外相当）を発生させる。
  */
 public func debugCutUdpFault()  {try! rustCall() {
-    uniffi_tssh_core_fn_func_debug_cut_udp_fault($0
+    uniffi_isekai_terminal_core_fn_func_debug_cut_udp_fault($0
     )
 }
 }
@@ -5042,7 +5106,7 @@ public func debugCutUdpFault()  {try! rustCall() {
  * `debug_cut_udp_fault()` で発生させた完全断を解除する。
  */
 public func debugRestoreUdpFault()  {try! rustCall() {
-    uniffi_tssh_core_fn_func_debug_restore_udp_fault($0
+    uniffi_isekai_terminal_core_fn_func_debug_restore_udp_fault($0
     )
 }
 }
@@ -5050,7 +5114,7 @@ public func debugRestoreUdpFault()  {try! rustCall() {
  * `helper_quic` の QUIC クライアントソケットの片道遅延をミリ秒で設定する。
  */
 public func debugSetUdpFaultLatencyMs(ms: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_func_debug_set_udp_fault_latency_ms(
+    uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_latency_ms(
         FfiConverterUInt32.lower(ms),$0
     )
 }
@@ -5059,49 +5123,49 @@ public func debugSetUdpFaultLatencyMs(ms: UInt32)  {try! rustCall() {
  * パケットロス率を千分率（0〜1000）で設定する。
  */
 public func debugSetUdpFaultLossPermille(permille: UInt32)  {try! rustCall() {
-    uniffi_tssh_core_fn_func_debug_set_udp_fault_loss_permille(
+    uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_loss_permille(
         FfiConverterUInt32.lower(permille),$0
     )
 }
 }
 public func createHelperQuicSession(config: HelperQuicConfig) -> HelperQuicSession  {
     return try!  FfiConverterTypeHelperQuicSession_lift(try! rustCall() {
-    uniffi_tssh_core_fn_func_create_helper_quic_session(
+    uniffi_isekai_terminal_core_fn_func_create_helper_quic_session(
         FfiConverterTypeHelperQuicConfig_lower(config),$0
     )
 })
 }
 public func createIsekaiLinkRelaySession(config: IsekaiLinkRelayConfig) -> IsekaiLinkRelaySession  {
     return try!  FfiConverterTypeIsekaiLinkRelaySession_lift(try! rustCall() {
-    uniffi_tssh_core_fn_func_create_isekai_link_relay_session(
+    uniffi_isekai_terminal_core_fn_func_create_isekai_link_relay_session(
         FfiConverterTypeIsekaiLinkRelayConfig_lower(config),$0
     )
 })
 }
 public func createIsekaiStunP2pSession(config: IsekaiStunP2pConfig) -> IsekaiStunP2pSession  {
     return try!  FfiConverterTypeIsekaiStunP2pSession_lift(try! rustCall() {
-    uniffi_tssh_core_fn_func_create_isekai_stun_p2p_session(
+    uniffi_isekai_terminal_core_fn_func_create_isekai_stun_p2p_session(
         FfiConverterTypeIsekaiStunP2pConfig_lower(config),$0
     )
 })
 }
 public func createMultipathHelperQuicSession(config: MultipathHelperQuicConfig) -> MultipathHelperQuicSession  {
     return try!  FfiConverterTypeMultipathHelperQuicSession_lift(try! rustCall() {
-    uniffi_tssh_core_fn_func_create_multipath_helper_quic_session(
+    uniffi_isekai_terminal_core_fn_func_create_multipath_helper_quic_session(
         FfiConverterTypeMultipathHelperQuicConfig_lower(config),$0
     )
 })
 }
 public func createSessionOrchestrator(callback: OrchestratorCallback) -> SessionOrchestrator  {
     return try!  FfiConverterTypeSessionOrchestrator_lift(try! rustCall() {
-    uniffi_tssh_core_fn_func_create_session_orchestrator(
+    uniffi_isekai_terminal_core_fn_func_create_session_orchestrator(
         FfiConverterCallbackInterfaceOrchestratorCallback_lower(callback),$0
     )
 })
 }
 public func createQuicSession(config: QuicConfig) -> QuicSession  {
     return try!  FfiConverterTypeQuicSession_lift(try! rustCall() {
-    uniffi_tssh_core_fn_func_create_quic_session(
+    uniffi_isekai_terminal_core_fn_func_create_quic_session(
         FfiConverterTypeQuicConfig_lower(config),$0
     )
 })
@@ -5118,371 +5182,371 @@ private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
     let bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
-    let scaffolding_contract_version = ffi_tssh_core_uniffi_contract_version()
+    let scaffolding_contract_version = ffi_isekai_terminal_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_tssh_core_checksum_func_core_version() != 13464) {
+    if (uniffi_isekai_terminal_core_checksum_func_core_version() != 15635) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_create_ssh_session() != 24804) {
+    if (uniffi_isekai_terminal_core_checksum_func_create_ssh_session() != 1917) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_set_terminal_theme() != 45632) {
+    if (uniffi_isekai_terminal_core_checksum_func_set_terminal_theme() != 46107) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_debug_clear_udp_fault() != 23483) {
+    if (uniffi_isekai_terminal_core_checksum_func_debug_clear_udp_fault() != 8630) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_debug_cut_udp_fault() != 31965) {
+    if (uniffi_isekai_terminal_core_checksum_func_debug_cut_udp_fault() != 46820) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_debug_restore_udp_fault() != 22951) {
+    if (uniffi_isekai_terminal_core_checksum_func_debug_restore_udp_fault() != 44289) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_debug_set_udp_fault_latency_ms() != 28372) {
+    if (uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_latency_ms() != 6689) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_debug_set_udp_fault_loss_permille() != 49924) {
+    if (uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_loss_permille() != 50613) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_create_helper_quic_session() != 57728) {
+    if (uniffi_isekai_terminal_core_checksum_func_create_helper_quic_session() != 6597) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_create_isekai_link_relay_session() != 47843) {
+    if (uniffi_isekai_terminal_core_checksum_func_create_isekai_link_relay_session() != 13613) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_create_isekai_stun_p2p_session() != 49421) {
+    if (uniffi_isekai_terminal_core_checksum_func_create_isekai_stun_p2p_session() != 728) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_create_multipath_helper_quic_session() != 11155) {
+    if (uniffi_isekai_terminal_core_checksum_func_create_multipath_helper_quic_session() != 7205) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_create_session_orchestrator() != 25564) {
+    if (uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator() != 38625) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_func_create_quic_session() != 25547) {
+    if (uniffi_isekai_terminal_core_checksum_func_create_quic_session() != 18349) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sshsession_connect() != 26689) {
+    if (uniffi_isekai_terminal_core_checksum_method_sshsession_connect() != 12334) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sshsession_disconnect() != 2534) {
+    if (uniffi_isekai_terminal_core_checksum_method_sshsession_disconnect() != 10831) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sshsession_resize() != 59850) {
+    if (uniffi_isekai_terminal_core_checksum_method_sshsession_resize() != 64030) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sshsession_scrollback_cells() != 39495) {
+    if (uniffi_isekai_terminal_core_checksum_method_sshsession_scrollback_cells() != 15875) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sshsession_scrollback_len() != 8009) {
+    if (uniffi_isekai_terminal_core_checksum_method_sshsession_scrollback_len() != 3706) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sshsession_send() != 13419) {
+    if (uniffi_isekai_terminal_core_checksum_method_sshsession_send() != 38367) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sshsession_trzsz_accept_download() != 36580) {
+    if (uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_accept_download() != 8922) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sshsession_trzsz_accept_upload() != 8545) {
+    if (uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_accept_upload() != 6684) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sshsession_trzsz_cancel() != 40040) {
+    if (uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_cancel() != 31811) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sshsession_trzsz_send_chunk() != 29945) {
+    if (uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_send_chunk() != 30024) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_helperquicsession_connect() != 11318) {
+    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect() != 49117) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_helperquicsession_connect_auto() != 13193) {
+    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect_auto() != 17169) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_helperquicsession_disconnect() != 3769) {
+    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_disconnect() != 11253) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_helperquicsession_resize() != 34438) {
+    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_resize() != 9464) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_helperquicsession_scrollback_cells() != 35462) {
+    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_cells() != 45509) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_helperquicsession_scrollback_len() != 44249) {
+    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_len() != 32376) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_helperquicsession_send() != 21077) {
+    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_send() != 15932) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_helperquicsession_trzsz_accept_download() != 19325) {
+    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_download() != 52142) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_helperquicsession_trzsz_accept_upload() != 8568) {
+    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_upload() != 11358) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_helperquicsession_trzsz_cancel() != 53943) {
+    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_cancel() != 14424) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_helperquicsession_trzsz_send_chunk() != 39866) {
+    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_send_chunk() != 22896) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_connect() != 60971) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_connect() != 50867) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_disconnect() != 56041) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_disconnect() != 46405) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_resize() != 58662) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_resize() != 47452) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_scrollback_cells() != 4580) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_scrollback_cells() != 949) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_scrollback_len() != 55442) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_scrollback_len() != 10091) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_send() != 14469) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_send() != 60831) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_accept_download() != 46291) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_accept_download() != 50323) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_accept_upload() != 39074) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_accept_upload() != 18668) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_cancel() != 48262) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_cancel() != 31539) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_trzsz_send_chunk() != 40010) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_send_chunk() != 342) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekaistunp2psession_connect() != 38552) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_connect() != 55857) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekaistunp2psession_disconnect() != 57846) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_disconnect() != 12896) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekaistunp2psession_resize() != 53057) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_resize() != 62379) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekaistunp2psession_scrollback_cells() != 34449) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_scrollback_cells() != 47167) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekaistunp2psession_scrollback_len() != 10790) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_scrollback_len() != 48506) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekaistunp2psession_send() != 14483) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_send() != 23803) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_accept_download() != 16307) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_accept_download() != 59252) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_accept_upload() != 59097) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_accept_upload() != 46526) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_cancel() != 49855) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_cancel() != 50337) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_send_chunk() != 5915) {
+    if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_send_chunk() != 59478) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_connect() != 4132) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_connect() != 15932) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_disconnect() != 50947) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_disconnect() != 13182) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_rebind_to_fd() != 28891) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_rebind_to_fd() != 51928) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_resize() != 39647) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_resize() != 65350) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_scrollback_cells() != 9295) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_cells() != 35785) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_scrollback_len() != 53922) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_len() != 20977) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_send() != 10471) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_send() != 18667) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_accept_download() != 23777) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_download() != 41705) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_accept_upload() != 56025) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_upload() != 60661) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_cancel() != 50106) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_cancel() != 43237) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_trzsz_send_chunk() != 62085) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_send_chunk() != 40204) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_add_local_forward() != 14593) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward() != 60755) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_connect() != 59422) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect() != 45531) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_connect_helper_quic() != 61807) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic() != 14224) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_connect_helper_quic_auto() != 16027) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic_auto() != 34683) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_connect_isekai_link_relay() != 29905) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_link_relay() != 63853) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_connect_isekai_stun_p2p() != 28376) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_stun_p2p() != 21296) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_connect_multipath_helper_quic() != 29572) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_multipath_helper_quic() != 28117) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_connect_quic() != 17166) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic() != 50706) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_disconnect() != 7875) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_is_quic() != 61715) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic() != 9641) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_notify_error() != 15428) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_notify_network_lost() != 24188) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_network_lost() != 22182) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_rebind_to_fd() != 28412) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_rebind_to_fd() != 19723) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_remove_forward() != 32241) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_remove_forward() != 24342) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_resize() != 60330) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_resize() != 11770) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_scrollback_cells() != 44304) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_cells() != 23042) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_scrollback_len() != 60098) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_len() != 48916) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_send() != 49699) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send() != 59935) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_set_session_theme() != 1433) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_set_session_theme() != 37038) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_download() != 63735) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_accept_download() != 62468) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_accept_upload() != 12551) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_accept_upload() != 5309) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_cancel() != 9112) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_cancel() != 25532) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_dismiss() != 6589) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_dismiss() != 31285) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessionorchestrator_trzsz_send_chunk() != 13645) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_send_chunk() != 51996) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_quicsession_connect() != 11417) {
+    if (uniffi_isekai_terminal_core_checksum_method_quicsession_connect() != 52673) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_quicsession_disconnect() != 11534) {
+    if (uniffi_isekai_terminal_core_checksum_method_quicsession_disconnect() != 33808) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_quicsession_resize() != 50029) {
+    if (uniffi_isekai_terminal_core_checksum_method_quicsession_resize() != 43526) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_quicsession_scrollback_cells() != 46917) {
+    if (uniffi_isekai_terminal_core_checksum_method_quicsession_scrollback_cells() != 30858) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_quicsession_scrollback_len() != 54474) {
+    if (uniffi_isekai_terminal_core_checksum_method_quicsession_scrollback_len() != 33684) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_quicsession_send() != 9870) {
+    if (uniffi_isekai_terminal_core_checksum_method_quicsession_send() != 20013) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_quicsession_trzsz_accept_download() != 29607) {
+    if (uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_accept_download() != 45285) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_quicsession_trzsz_accept_upload() != 45770) {
+    if (uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_accept_upload() != 20898) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_quicsession_trzsz_cancel() != 56254) {
+    if (uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_cancel() != 14107) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_quicsession_trzsz_send_chunk() != 12522) {
+    if (uniffi_isekai_terminal_core_checksum_method_quicsession_trzsz_send_chunk() != 41601) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_orchestratorcallback_on_connection_state_changed() != 63751) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_connection_state_changed() != 26389) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_orchestratorcallback_on_screen_update() != 30781) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_screen_update() != 51117) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_orchestratorcallback_on_host_key() != 12009) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_host_key() != 34371) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_orchestratorcallback_on_data() != 51069) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_data() != 44404) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_orchestratorcallback_on_trzsz_state_changed() != 55321) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_trzsz_state_changed() != 46274) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_orchestratorcallback_on_download_complete() != 2381) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_download_complete() != 46536) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_orchestratorcallback_on_no_viable_path() != 17400) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_no_viable_path() != 15626) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_orchestratorcallback_on_forward_state_changed() != 107) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_forward_state_changed() != 22560) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_orchestratorcallback_on_agent_sign_request() != 57032) {
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_agent_sign_request() != 31857) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_data() != 27387) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_data() != 62372) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_host_key() != 41856) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_host_key() != 36190) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_connected() != 6383) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_connected() != 40740) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_disconnected() != 61713) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_disconnected() != 41713) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_screen_update() != 16018) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_screen_update() != 5617) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_request() != 169) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_request() != 27262) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_download_chunk() != 57637) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_download_chunk() != 18250) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_progress() != 42762) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_progress() != 48910) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_trzsz_finished() != 46114) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_trzsz_finished() != 59033) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_no_viable_path() != 33355) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_no_viable_path() != 61160) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_forward_state_changed() != 26529) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_forward_state_changed() != 22023) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_tssh_core_checksum_method_sessioncallback_on_agent_sign_request() != 60049) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_agent_sign_request() != 536) {
         return InitializationResult.apiChecksumMismatch
     }
 
@@ -5493,7 +5557,7 @@ private let initializationResult: InitializationResult = {
 
 // Make the ensure init function public so that other modules which have external type references to
 // our types can call it.
-public func uniffiEnsureTsshCoreInitialized() {
+public func uniffiEnsureIsekaiTerminalCoreInitialized() {
     switch initializationResult {
     case .ok:
         break

@@ -1,5 +1,5 @@
 # UniFFI generated bindings — JNA loads these by name at runtime
--keep class uniffi.tssh_core.** { *; }
+-keep class uniffi.isekai_terminal_core.** { *; }
 
 # JNA
 -keep class com.sun.jna.** { *; }
