@@ -116,6 +116,13 @@ pub struct MultipathHelperQuicConfig {
     pub rows: u32,
     /// ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
     pub jump: Option<JumpConfig>,
+    /// isekai-helperのQUIC待受ポートをユーザー指定で固定する(`None`なら、
+    /// `direct_host`が設定されている場合のみ既定値`DIRECT_MULTIPATH_BIND_PORT`を使う、
+    /// 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
+    /// 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
+    /// `None`の場合はRust側で従来通りの既定値フォールバックを維持する
+    /// (`HelperQuicConfig.bind_port`のdocコメントも参照)。
+    pub bind_port: Option<u16>,
 }
 
 /// noq issue #738（`open_path()`に`local_ip`明示指定した新規pathでPATH_RESPONSEが
@@ -911,7 +918,10 @@ async fn try_connect_multipath(
     rebind_rx: tokio::sync::mpsc::Receiver<RebindRequest>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
 ) -> Result<(noq::SendStream, noq::RecvStream), String> {
-    let bind_port = config.direct_host.is_some().then_some(DIRECT_MULTIPATH_BIND_PORT);
+    // ユーザーが明示指定していればそれを優先し、無指定ならdirect_host使用時のみ
+    // 既定の固定ポートにフォールバックする(後方互換)。
+    let bind_port = config.bind_port
+        .or_else(|| config.direct_host.is_some().then_some(DIRECT_MULTIPATH_BIND_PORT));
     let handshake = helper_quic_transport::bootstrap_helper_via_ssh(
         &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump, bind_port,
         &crate::helper_bootstrap::HelperP2pMode::None,
@@ -1025,6 +1035,30 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    /// 実UDP/QUICを使うテストのpath検証待ちで共通に使うポーリング上限。
+    ///
+    /// このワーカーは複数の`claude`エージェント/Gradleデーモンが同時稼働する開発機で
+    /// 動くことが常態化しており(`uptime`のload averageが4〜5になることがある)、
+    /// もともとの固定`for _ in 0..50 { sleep(100ms) }`(=5秒)では、path確立自体は
+    /// 正常でも単にCPUスケジューリング待ちで間に合わずflakyに失敗することを確認した
+    /// (`HEALTH_CHECK_INTERVAL`が3秒であることを踏まえても、5秒は1周分の余裕しかない)。
+    /// 実際に壊れている場合はこの上限まで待っても永遠にVICmatchしないため、上限自体を
+    /// 緩めても「本当のバグを見逃す」方向には倒れない。
+    const PATH_VALIDATION_POLL_TIMEOUT: Duration = Duration::from_secs(20);
+    const PATH_VALIDATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// `broker.get(id)`が`want`になるまで`PATH_VALIDATION_POLL_TIMEOUT`を上限にポーリングする。
+    /// 上限に達した場合は最後に観測した状態を返す(呼び出し側でassert_eqのメッセージに使う)。
+    async fn poll_until_path_state(broker: &PathBroker, id: PathCandidateId, want: PathState) -> PathState {
+        let mut last = broker.get(id);
+        let deadline = tokio::time::Instant::now() + PATH_VALIDATION_POLL_TIMEOUT;
+        while last != want && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(PATH_VALIDATION_POLL_INTERVAL).await;
+            last = broker.get(id);
+        }
+        last
+    }
+
     async fn start_test_server() -> (u16, String, [u8; 32]) {
         let cert = rcgen::generate_simple_self_signed(vec!["isekai-helper.local".to_string()]).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().clone());
@@ -1112,11 +1146,8 @@ mod tests {
         drop(recv);
 
         // path1 の確立はバックグラウンドタスクなので少し待つ。
-        for _ in 0..50 {
-            if broker.get(PathCandidateId::Secondary) == PathState::Validated { break; }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(broker.get(PathCandidateId::Secondary), PathState::Validated, "path1 should validate within timeout");
+        let state = poll_until_path_state(&broker, PathCandidateId::Secondary, PathState::Validated).await;
+        assert_eq!(state, PathState::Validated, "path1 should validate within timeout");
         assert!(broker.any_validated());
 
         conn.close(0u32.into(), b"test done");
@@ -1132,7 +1163,19 @@ mod tests {
         drop(send);
         drop(recv);
 
-        assert_eq!(broker.get(PathCandidateId::Primary), PathState::Validated);
+        // 確立直後にPrimaryが一時的にDegraded判定されることがある(健全性チェックが
+        // heavy load下でRTTを大きく観測した場合)。すぐ回復するはずなのでポーリングするが、
+        // load averageが高い開発機ではDegradedのまま回復しないことさえある——これは
+        // 「実際にRTTが閾値を超えている」という健全性チェックとしては正しい結果であり、
+        // このテストが検証したい「direct_hostが無ければpath0だけが確立し、path1は
+        // 開かれない」こととは無関係。Validated/Degradedのどちらでも「到達はしている」
+        // ことに変わりは無いので、両方を許容する(Unknown/Failedなら本当に確立して
+        // いないので、そちらは今まで通り失敗として扱う)。
+        let state = poll_until_path_state(&broker, PathCandidateId::Primary, PathState::Validated).await;
+        assert!(
+            matches!(state, PathState::Validated | PathState::Degraded),
+            "path0 should have established (Validated or Degraded), got {state:?}"
+        );
         assert_eq!(broker.get(PathCandidateId::Secondary), PathState::Unknown);
 
         conn.close(0u32.into(), b"test done");
@@ -1213,19 +1256,29 @@ mod tests {
         let path1: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
 
         let (conn, broker, _endpoint) = establish_multipath_connection(path0, Some(path1), Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
-        for _ in 0..50 {
-            if broker.get(PathCandidateId::Secondary) == PathState::Validated { break; }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(broker.get(PathCandidateId::Secondary), PathState::Validated);
+        let state = poll_until_path_state(&broker, PathCandidateId::Secondary, PathState::Validated).await;
+        assert_eq!(state, PathState::Validated, "path1 should validate within timeout");
 
         if let Some(p0) = conn.path(noq::PathId::ZERO) {
             let _ = p0.close();
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // path0 close後もコネクションは生きており、新しいHELLO/ACK往復に応答できる。
-        let (send, recv) = hello_ack(&conn, &secret).await.expect("connection should survive path0 closing");
+        // heavy load下ではclose直後すぐには応答できないことがあるため、固定の1回
+        // sleep+1回試行ではなくリトライする(本当に生き延びていなければ何度試しても
+        // 失敗するので、リトライを増やしても偽陽性にはならない)。
+        let mut last_err = None;
+        let mut result = None;
+        for attempt in 0..10 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            match hello_ack(&conn, &secret).await {
+                Ok(pair) => { result = Some(pair); break; }
+                Err(e) => { last_err = Some((attempt, e)); }
+            }
+        }
+        let (send, recv) = result.unwrap_or_else(|| {
+            panic!("connection should survive path0 closing (last error: {last_err:?})")
+        });
         drop(send);
         drop(recv);
 
@@ -1266,12 +1319,9 @@ mod tests {
         let (conn, broker, _endpoint) =
             establish_multipath_connection(path0, Some(direct), physical, &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
 
-        for _ in 0..50 {
-            if broker.get(PathCandidateId::PhysicalWifi) == PathState::Validated { break; }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let state = poll_until_path_state(&broker, PathCandidateId::PhysicalWifi, PathState::Validated).await;
         assert_eq!(
-            broker.get(PathCandidateId::PhysicalWifi), PathState::Validated,
+            state, PathState::Validated,
             "physical wifi path should validate within timeout",
         );
 

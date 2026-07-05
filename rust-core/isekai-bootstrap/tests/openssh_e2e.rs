@@ -238,6 +238,7 @@ fn dummy_relay_spec() -> RelayLaunchSpec {
         relay_addr: "127.0.0.1:1".parse().unwrap(),
         relay_sni: "relay.isekai-ssh.test".to_string(),
         relay_jwt: "test-jwt-token".to_string(),
+        idle_lifetime_secs: 2_592_000,
     }
 }
 
@@ -276,6 +277,59 @@ async fn install_and_start_gets_a_real_handshake_over_a_real_ssh_subprocess() {
     assert_eq!(report.handshake.v, 1);
     assert_eq!(report.handshake.listen_port, 45231);
     assert_eq!(report.handshake.cert_sha256.len(), 64);
+}
+
+/// `RelayLaunchSpec::idle_lifetime_secs` must actually reach the launched
+/// `isekai-helper` process's argv as `--max-idle-lifetime <SECS>` — this is
+/// the fix for the `ISEKAI_SSH_DESIGN.md` "引き続き未決の項目" gap where a
+/// helper deployed via `isekai-ssh init` would inherit `isekai-helper`'s own
+/// short default (600s, tuned for `isekai-terminal-core`'s per-session bootstrap) and
+/// self-exit long before a `connect` invocation hours/days later could reach
+/// it again.
+#[tokio::test]
+async fn install_and_start_passes_idle_lifetime_to_the_launched_helper() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+
+    // Same stand-in as the other tests, but it also records its own argv to
+    // a side file so this test can inspect exactly what `OpenSshBackend`
+    // launched it with (its stdout must stay pure JSON, matching the real
+    // isekai-helper's contract, so argv can't be echoed there instead).
+    let argv_log = home.join("argv.log");
+    let fake_helper_script =
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{VALID_HANDSHAKE_JSON}'\n", argv_log.display());
+
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+    let relay = RelayLaunchSpec {
+        relay_addr: "127.0.0.1:1".parse().unwrap(),
+        relay_sni: "relay.isekai-ssh.test".to_string(),
+        relay_jwt: "test-jwt-token".to_string(),
+        idle_lifetime_secs: 2_592_000,
+    };
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &relay),
+    )
+    .await
+    .expect("install_and_start should not hang")
+    .expect("install_and_start should succeed against the mock server");
+
+    let argv = std::fs::read_to_string(&argv_log).expect("stand-in script should have recorded its argv");
+    assert!(
+        argv.contains("--max-idle-lifetime 2592000"),
+        "expected the launched isekai-helper's argv to contain '--max-idle-lifetime 2592000', got: {argv:?}"
+    );
 }
 
 #[tokio::test]

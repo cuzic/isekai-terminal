@@ -7311,6 +7311,16 @@ data class HelperQuicConfig (
      * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
      */
     var `jump`: JumpConfig?
+    , 
+    /**
+     * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
+     * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
+     * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
+     * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
+     * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
+     * 確定した値だけを渡すこと。
+     */
+    var `bindPort`: kotlin.UShort?
     
 ){
     
@@ -7334,6 +7344,7 @@ public object FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer<HelperQui
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalTypeJumpConfig.read(buf),
+            FfiConverterOptionalUShort.read(buf),
         )
     }
 
@@ -7344,7 +7355,8 @@ public object FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer<HelperQui
             FfiConverterTypeSshAuth.allocationSize(value.`auth`) +
             FfiConverterUInt.allocationSize(value.`cols`) +
             FfiConverterUInt.allocationSize(value.`rows`) +
-            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`)
+            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`) +
+            FfiConverterOptionalUShort.allocationSize(value.`bindPort`)
     )
 
     override fun write(value: HelperQuicConfig, buf: ByteBuffer) {
@@ -7355,6 +7367,7 @@ public object FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer<HelperQui
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
             FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
+            FfiConverterOptionalUShort.write(value.`bindPort`, buf)
     }
 }
 
@@ -7638,6 +7651,16 @@ data class MultipathHelperQuicConfig (
      * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
      */
     var `jump`: JumpConfig?
+    , 
+    /**
+     * isekai-helperのQUIC待受ポートをユーザー指定で固定する(`None`なら、
+     * `direct_host`が設定されている場合のみ既定値`DIRECT_MULTIPATH_BIND_PORT`を使う、
+     * 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
+     * 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
+     * `None`の場合はRust側で従来通りの既定値フォールバックを維持する
+     * (`HelperQuicConfig.bind_port`のdocコメントも参照)。
+     */
+    var `bindPort`: kotlin.UShort?
     
 ){
     
@@ -7667,6 +7690,7 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalTypeJumpConfig.read(buf),
+            FfiConverterOptionalUShort.read(buf),
         )
     }
 
@@ -7683,7 +7707,8 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
             FfiConverterTypeSshAuth.allocationSize(value.`auth`) +
             FfiConverterUInt.allocationSize(value.`cols`) +
             FfiConverterUInt.allocationSize(value.`rows`) +
-            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`)
+            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`) +
+            FfiConverterOptionalUShort.allocationSize(value.`bindPort`)
     )
 
     override fun write(value: MultipathHelperQuicConfig, buf: ByteBuffer) {
@@ -7700,6 +7725,7 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
             FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
+            FfiConverterOptionalUShort.write(value.`bindPort`, buf)
     }
 }
 
@@ -9788,6 +9814,38 @@ public object FfiConverterOptionalUByte: FfiConverterRustBuffer<kotlin.UByte?> {
         } else {
             buf.put(1)
             FfiConverterUByte.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalUShort: FfiConverterRustBuffer<kotlin.UShort?> {
+    override fun read(buf: ByteBuffer): kotlin.UShort? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUShort.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UShort?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUShort.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UShort?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUShort.write(value, buf)
         }
     }
 }

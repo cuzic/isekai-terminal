@@ -154,6 +154,9 @@ fun ProfileEditScreen(
 
     val selectedKeyLabel = keys.firstOrNull { it.id == keyId }?.label ?: "鍵を選択"
     val selectedJumpKeyLabel = keys.firstOrNull { it.id == jumpKeyId }?.label ?: "鍵を選択"
+    // 1024未満は多くの環境でサーバー側の管理者権限(CAP_NET_BIND_SERVICE)が必要になるため、
+    // ユーザーが誤って指定しないよう非特権ポート範囲のみ許可する(空欄はこれまで通りOK)。
+    val helperBindPortValid = helperBindPort.isBlank() || (helperBindPort.toIntOrNull()?.let { it in 1024..65535 } ?: false)
     val canSave = label.isNotBlank() && host.isNotBlank() && username.isNotBlank() &&
         (authType == "password" || keyId != null) &&
         (!useJumpHost || (
@@ -162,7 +165,8 @@ fun ProfileEditScreen(
         )) &&
         (transportPreference != TransportPreference.ISEKAI_LINK_RELAY_QUIC || (
             relayAddr.isNotBlank() && relaySni.isNotBlank() && relayJwt.isNotBlank()
-        ))
+        )) &&
+        helperBindPortValid
 
     Column(
         modifier = Modifier
@@ -468,20 +472,39 @@ fun ProfileEditScreen(
             OutlinedTextField(
                 value = helperBindPort,
                 onValueChange = { new -> helperBindPort = new.filter { it.isDigit() }.take(5) },
-                label = { Text("ヘルパー待受ポート固定（任意）") },
-                placeholder = { Text("未指定ならOSが自動選択") },
+                label = { Text("ヘルパー待受ポート固定（任意、1024〜65535）") },
+                placeholder = { Text("未指定なら自動割り当て") },
                 singleLine = true,
+                isError = !helperBindPortValid,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(),
             )
             Text(
                 text = "自作ヘルパーのQUIC待受ポートを固定します。サーバーへ直接到達する経路" +
                     "（direct_address等）を使う場合、サーバー側ファイアウォールで事前にこの" +
-                    "ポートだけを開けておけます（未指定ならOSがエフェメラルポートを選ぶため、" +
+                    "ポートだけを開けておけます（未指定ならこれまで通り自動割り当てのため、" +
                     "接続前にポート番号が分からずファイアウォール許可ができません）。",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH &&
+                directAddress.isNotBlank() && helperBindPort.isBlank()
+            ) {
+                Text(
+                    text = "直接到達アドレス(direct_address)が設定されているため、このまま未指定でも" +
+                        "既定の固定ポート45823が使われます(完全なエフェメラルにはなりません)。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (!helperBindPortValid) {
+                Text(
+                    text = "⚠ 1024〜65535の範囲で指定してください" +
+                        "（1024未満は多くの環境でサーバー側の管理者権限が必要です）。",
+                    color = Color(0xFFB00020),
+                    fontSize = 12.sp,
+                )
+            }
         }
 
         if (transportPreference == TransportPreference.ISEKAI_STUN_P2P_QUIC) {
@@ -835,7 +858,7 @@ fun ProfileEditScreen(
                         directAddress = directAddress.trim().takeIf { it.isNotBlank() },
                         enablePhysicalMultipath = enablePhysicalMultipath,
                         cellularRemoteAddress = cellularRemoteAddress.trim().takeIf { it.isNotBlank() },
-                        helperBindPort = helperBindPort.toIntOrNull(),
+                        helperBindPort = helperBindPort.toIntOrNull()?.takeIf { it in 1024..65535 },
                         enableUpstreamFailover = enableUpstreamFailover,
                         postConnectCommands = postConnectCommands.trim().takeIf { it.isNotEmpty() },
                         forwards = forwardDrafts.mapNotNull { it.toPortForwardOrNull() },

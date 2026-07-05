@@ -44,7 +44,12 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .map(parse_jump_spec)
         .transpose()
         .with_context(|| format!("isekai-ssh: invalid --via spec '{}'", args.via.as_deref().unwrap_or_default()))?;
-    let relay = RelayLaunchSpec { relay_addr: args.relay_addr, relay_sni: args.relay_sni.clone(), relay_jwt: args.relay_jwt.clone() };
+    let relay = RelayLaunchSpec {
+        relay_addr: args.relay_addr,
+        relay_sni: args.relay_sni.clone(),
+        relay_jwt: args.relay_jwt.clone(),
+        idle_lifetime_secs: args.idle_lifetime,
+    };
 
     println!("Deploying isekai-helper to {}...", args.host);
     let backend = OpenSshBackend::new();
@@ -165,12 +170,12 @@ fn format_rfc3339_utc(unix_secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-/// Parses a `[user@]host[:port]` spec into a `HostSpec`, mirroring
-/// `isekai_trust::normalize_host_port`'s tokenization but keeping user/port
+/// Parses a `[user@]host[:port]` spec into a `HostSpec`, reusing
+/// `isekai_trust::split_user_host_port`'s tokenization but keeping user/port
 /// as separate optional fields (as `HostSpec`/`ssh(1)` want them) instead of
 /// collapsing to a single normalized `host:port` string.
 fn parse_host_spec(spec: &str) -> Result<HostSpec> {
-    let (host, port, user) = split_user_host_port(spec)?;
+    let (host, port, user) = isekai_trust::split_user_host_port(spec)?;
     let mut hs = HostSpec::new(host);
     if let Some(port) = port {
         hs = hs.with_port(port);
@@ -183,7 +188,7 @@ fn parse_host_spec(spec: &str) -> Result<HostSpec> {
 
 /// Same tokenization as `parse_host_spec`, for the `--via` jump host.
 fn parse_jump_spec(spec: &str) -> Result<JumpSpec> {
-    let (host, port, user) = split_user_host_port(spec)?;
+    let (host, port, user) = isekai_trust::split_user_host_port(spec)?;
     let mut js = JumpSpec::new(host);
     if let Some(port) = port {
         js = js.with_port(port);
@@ -192,28 +197,6 @@ fn parse_jump_spec(spec: &str) -> Result<JumpSpec> {
         js = js.with_user(user);
     }
     Ok(js)
-}
-
-fn split_user_host_port(spec: &str) -> Result<(String, Option<u16>, Option<String>)> {
-    let spec = spec.trim();
-    anyhow::ensure!(!spec.is_empty(), "empty host spec");
-
-    let (user, rest) = match spec.rsplit_once('@') {
-        Some((user, rest)) => (Some(user.to_string()), rest),
-        None => (None, spec),
-    };
-    anyhow::ensure!(!rest.is_empty(), "empty host in spec '{spec}'");
-
-    let (host, port) = match rest.rsplit_once(':') {
-        Some((host, port_str)) => {
-            let port: u16 = port_str.parse().with_context(|| format!("'{port_str}' is not a valid port number"))?;
-            (host, Some(port))
-        }
-        None => (rest, None),
-    };
-    anyhow::ensure!(!host.is_empty(), "empty host in spec '{spec}'");
-
-    Ok((host.to_string(), port, user))
 }
 
 #[cfg(test)]

@@ -117,7 +117,7 @@ cd /home/cuzic/android-tssh
 
 ### logcat フィルタ起動（別ターミナルで常時表示）
 ```bash
-adb logcat -s IsekaiTerminalNav IsekaiTerminalProfile IsekaiTerminalKey IsekaiTerminalSSH IsekaiTerminalIME TsshSvc IsekaiTerminalVM
+adb logcat -s IsekaiTerminalNav IsekaiTerminalProfile IsekaiTerminalKey IsekaiTerminalSSH IsekaiTerminalIME IsekaiTerminalSvc IsekaiTerminalVM
 ```
 
 ---
@@ -240,8 +240,8 @@ IsekaiTerminalProfile: password dialog confirmed for: 'test'
 IsekaiTerminalNav: ProfileList → Terminal via profile='test' authType=password
 IsekaiTerminalNav: → Terminal(profile='test' host=<IP>)
 IsekaiTerminalVM: TerminalViewModel created (rotationRecovery=false)
-TsshSvc: service created
-TsshSvc: onStartCommand label='SSH セッション' flags=0 startId=1
+IsekaiTerminalSvc: service created
+IsekaiTerminalSvc: onStartCommand label='SSH セッション' flags=0 startId=1
 IsekaiTerminalVM: service bound OK (session=false)
 IsekaiTerminalSSH: TerminalScreen: launch connectProfile 'test' <USER>@<IP>:22
 IsekaiTerminalSSH: connectProfile: 'test' <USER>@<IP>:22 authType=password keyId=null
@@ -364,7 +364,7 @@ IsekaiTerminalVM: service bound OK (session=true)
 IsekaiTerminalSSH: terminal geometry: <C>×<R> px=...   ← 横向きの新ジオメトリ
 IsekaiTerminalSSH: resize → <C>×<R>
 ```
-`TsshSvc: service created/destroyed` は出ないことを確認（Service は回転でも生存）
+`IsekaiTerminalSvc: service created/destroyed` は出ないことを確認（Service は回転でも生存）
 
 ### NG 時の確認ポイント
 - `TerminalViewModel cleared (session=true)` で session が false → Service より先に session が null にされている（`onCleared` の順序問題）
@@ -383,7 +383,7 @@ IsekaiTerminalSSH: resize → <C>×<R>
 ```
 IsekaiTerminalVM: TerminalViewModel cleared (session=true)   ← Activity が停止・VM 破棄
 ```
-（`TsshSvc: service destroyed` が出ないことを確認 — Foreground Service はバックグラウンドでも生存）
+（`IsekaiTerminalSvc: service destroyed` が出ないことを確認 — Foreground Service はバックグラウンドでも生存）
 
 ### 期待ログ（復帰時）
 ```
@@ -394,8 +394,8 @@ IsekaiTerminalSSH: terminal geometry: ...
 ```
 
 ### NG 時の確認ポイント
-- `TsshSvc: service destroyed` が出る → 通知が消えた/OOM Killer に殺された（Foreground 通知の設定を確認）
-- `rotationRecovery=false` → processが再起動された（ `TsshSvc: service created` も出ているはず）
+- `IsekaiTerminalSvc: service destroyed` が出る → 通知が消えた/OOM Killer に殺された（Foreground 通知の設定を確認）
+- `rotationRecovery=false` → processが再起動された（ `IsekaiTerminalSvc: service created` も出ているはず）
 - 画面が黒いまま → `session?.let { terminalService?.holdSession(it) }` が service bound 前に呼ばれていない競合
 
 ---
@@ -439,7 +439,7 @@ IsekaiTerminalNav: → ProfileList
 | タグ | 対象コンポーネント |
 |---|---|
 | `IsekaiTerminalVM` | TerminalViewModel ライフサイクル |
-| `TsshSvc` | TerminalSessionService ライフサイクル |
+| `IsekaiTerminalSvc` | TerminalSessionService ライフサイクル |
 | `IsekaiTerminalSSH` | SSH セッション接続・切断・データ |
 | `IsekaiTerminalNav` | 画面遷移 |
 | `IsekaiTerminalProfile` | プロファイル CRUD |
@@ -448,7 +448,7 @@ IsekaiTerminalNav: → ProfileList
 
 ```bash
 # 全タグ同時フィルタ
-adb logcat -s IsekaiTerminalVM TsshSvc IsekaiTerminalSSH IsekaiTerminalNav IsekaiTerminalProfile IsekaiTerminalKey IsekaiTerminalIME
+adb logcat -s IsekaiTerminalVM IsekaiTerminalSvc IsekaiTerminalSSH IsekaiTerminalNav IsekaiTerminalProfile IsekaiTerminalKey IsekaiTerminalIME
 
 # クラッシュが出た時
 adb logcat -d -b crash | tail -n 200
@@ -473,7 +473,7 @@ trzsz ファイル転送（trz=アップロード / tsz=ダウンロード）が
   ```
 - ログキャプチャを別ターミナルで起動:
   ```bash
-  ./scripts/capture_trzsz_log.sh           # isekai-terminal-core + Tssh* の trzsz 行のみ抽出
+  ./scripts/capture_trzsz_log.sh           # isekai-terminal-core + IsekaiTerminal* の trzsz 行のみ抽出
   ```
 
 ### 13-A アップロード (trz)

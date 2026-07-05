@@ -3561,13 +3561,30 @@ public struct HelperQuicConfig: Equatable, Hashable {
      * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
      */
     public var jump: JumpConfig?
+    /**
+     * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
+     * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
+     * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
+     * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
+     * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
+     * 確定した値だけを渡すこと。
+     */
+    public var bindPort: UInt16?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(sshHost: String, sshPort: UInt16, username: String, auth: SshAuth, cols: UInt32, rows: UInt32, 
         /**
          * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
-         */jump: JumpConfig?) {
+         */jump: JumpConfig?, 
+        /**
+         * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
+         * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
+         * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
+         * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
+         * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
+         * 確定した値だけを渡すこと。
+         */bindPort: UInt16?) {
         self.sshHost = sshHost
         self.sshPort = sshPort
         self.username = username
@@ -3575,6 +3592,7 @@ public struct HelperQuicConfig: Equatable, Hashable {
         self.cols = cols
         self.rows = rows
         self.jump = jump
+        self.bindPort = bindPort
     }
 
     
@@ -3599,7 +3617,8 @@ public struct FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer {
                 auth: FfiConverterTypeSshAuth.read(from: &buf), 
                 cols: FfiConverterUInt32.read(from: &buf), 
                 rows: FfiConverterUInt32.read(from: &buf), 
-                jump: FfiConverterOptionTypeJumpConfig.read(from: &buf)
+                jump: FfiConverterOptionTypeJumpConfig.read(from: &buf), 
+                bindPort: FfiConverterOptionUInt16.read(from: &buf)
         )
     }
 
@@ -3611,6 +3630,7 @@ public struct FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.cols, into: &buf)
         FfiConverterUInt32.write(value.rows, into: &buf)
         FfiConverterOptionTypeJumpConfig.write(value.jump, into: &buf)
+        FfiConverterOptionUInt16.write(value.bindPort, into: &buf)
     }
 }
 
@@ -3951,6 +3971,15 @@ public struct MultipathHelperQuicConfig: Equatable, Hashable {
      * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
      */
     public var jump: JumpConfig?
+    /**
+     * isekai-helperのQUIC待受ポートをユーザー指定で固定する(`None`なら、
+     * `direct_host`が設定されている場合のみ既定値`DIRECT_MULTIPATH_BIND_PORT`を使う、
+     * 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
+     * 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
+     * `None`の場合はRust側で従来通りの既定値フォールバックを維持する
+     * (`HelperQuicConfig.bind_port`のdocコメントも参照)。
+     */
+    public var bindPort: UInt16?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3986,7 +4015,15 @@ public struct MultipathHelperQuicConfig: Equatable, Hashable {
          */cellularFd: Int32?, cellularLocalIp: String?, username: String, auth: SshAuth, cols: UInt32, rows: UInt32, 
         /**
          * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
-         */jump: JumpConfig?) {
+         */jump: JumpConfig?, 
+        /**
+         * isekai-helperのQUIC待受ポートをユーザー指定で固定する(`None`なら、
+         * `direct_host`が設定されている場合のみ既定値`DIRECT_MULTIPATH_BIND_PORT`を使う、
+         * 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
+         * 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
+         * `None`の場合はRust側で従来通りの既定値フォールバックを維持する
+         * (`HelperQuicConfig.bind_port`のdocコメントも参照)。
+         */bindPort: UInt16?) {
         self.sshHost = sshHost
         self.sshPort = sshPort
         self.directHost = directHost
@@ -4000,6 +4037,7 @@ public struct MultipathHelperQuicConfig: Equatable, Hashable {
         self.cols = cols
         self.rows = rows
         self.jump = jump
+        self.bindPort = bindPort
     }
 
     
@@ -4030,7 +4068,8 @@ public struct FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer 
                 auth: FfiConverterTypeSshAuth.read(from: &buf), 
                 cols: FfiConverterUInt32.read(from: &buf), 
                 rows: FfiConverterUInt32.read(from: &buf), 
-                jump: FfiConverterOptionTypeJumpConfig.read(from: &buf)
+                jump: FfiConverterOptionTypeJumpConfig.read(from: &buf), 
+                bindPort: FfiConverterOptionUInt16.read(from: &buf)
         )
     }
 
@@ -4048,6 +4087,7 @@ public struct FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer 
         FfiConverterUInt32.write(value.cols, into: &buf)
         FfiConverterUInt32.write(value.rows, into: &buf)
         FfiConverterOptionTypeJumpConfig.write(value.jump, into: &buf)
+        FfiConverterOptionUInt16.write(value.bindPort, into: &buf)
     }
 }
 
@@ -6755,6 +6795,30 @@ fileprivate struct FfiConverterOptionUInt8: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterUInt8.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt16: FfiConverterRustBuffer {
+    typealias SwiftType = UInt16?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt16.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt16.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }

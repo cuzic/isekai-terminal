@@ -117,6 +117,24 @@ pub struct ConnectArgs {
     #[arg(long, value_name = "ADDR:PORT", required_if_eq("mode", "stun"))]
     pub stun_server: Option<SocketAddr>,
 
+    /// How long `--mode relay` (`connect.rs::run_relay_resumable`) keeps
+    /// retrying `RESUME` after losing the QUIC connection to isekai-helper
+    /// before giving up, explicitly closing stdin/stdout, and letting the
+    /// process exit (`ISEKAI_SSH_DESIGN.md` "resume を ProxyCommand の背後に
+    /// 隠す"). Named and defaulted (120s) to match isekai-helper's own
+    /// `--resume-window` (`isekai-helper --help`) — the two are logically the
+    /// same knob viewed from either end of the same resumable session, and
+    /// keeping them equal (or this side no longer than isekai-helper's) is
+    /// what `ISEKAI_SSH_DESIGN.md`'s "`ssh` 自身の生存確認とのレース" section
+    /// recommends: if isekai-ssh kept retrying *longer* than isekai-helper's
+    /// own window, every attempt made after isekai-helper has already swept
+    /// the parked session would just fail with `REJECT_UNKNOWN_SESSION`
+    /// instead of isekai-ssh's own clean give-up message. Unused by `--mode
+    /// stun`, which has no resume support at all (see `connect.rs`'s module
+    /// docs).
+    #[arg(long, value_name = "SECS", default_value_t = 120)]
+    pub resume_window: u64,
+
     #[cfg(all(debug_assertions, feature = "dev-insecure"))]
     #[command(flatten)]
     pub dev_insecure: DevInsecureArgs,
@@ -225,6 +243,18 @@ pub struct InitArgs {
     /// only variant, `ISEKAI_SSH_DESIGN.md` "trust store のファイル形式").
     #[arg(long, value_name = "NAME")]
     pub release_channel: Option<String>,
+
+    /// Passed straight through as `isekai-helper --max-idle-lifetime <SECS>`:
+    /// how long the deployed helper stays running with no active connection
+    /// before self-exiting. Defaults to 30 days rather than isekai-helper's
+    /// own 600s default, because `init` deploys a helper once and `connect`
+    /// is expected to keep dialing that same long-running process across
+    /// many separate, possibly hours/days-apart `ssh` invocations — unlike
+    /// `isekai-terminal-core`'s (Android's) per-session bootstrap, which re-deploys a
+    /// fresh helper on every connection attempt and so is unaffected by a
+    /// short self-exit window (`ISEKAI_SSH_DESIGN.md` "引き続き未決の項目").
+    #[arg(long, value_name = "SECS", default_value_t = 2_592_000)]
+    pub idle_lifetime: u64,
 }
 
 #[derive(Args)]

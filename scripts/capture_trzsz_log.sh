@@ -3,7 +3,7 @@
 #
 # Rust コア (rust-core) は android_logger のタグ "isekai-terminal-core" でログを出力する
 # (rust-core/src/lib.rs: .with_tag("isekai-terminal-core"))。
-# trzsz の wire プロトコルマーカーと UI 側 (Tssh* タグ) の転送イベントを抽出する。
+# trzsz の wire プロトコルマーカーと UI 側 (IsekaiTerminal* タグ) の転送イベントを抽出する。
 #
 # Usage: ./scripts/capture_trzsz_log.sh [device-serial]
 #   device-serial: 複数デバイス接続時に対象を指定 (省略可)
@@ -14,7 +14,7 @@ DEVICE="${1:-}"
 ADB=(adb)
 [ -n "$DEVICE" ] && ADB=(adb -s "$DEVICE")
 
-echo "=== Capturing trzsz transfer log (tag: isekai-terminal-core + Tssh*) ==="
+echo "=== Capturing trzsz transfer log (tag: isekai-terminal-core + IsekaiTerminal*) ==="
 echo "Ctrl+C to stop"
 echo ""
 

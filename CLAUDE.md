@@ -19,6 +19,10 @@ Rust(UniFFI 経由)の `rust-core`(crate 名 `isekai-terminal-core`)からなる
   - `src/`(crate `isekai-terminal-core`, cdylib名 `isekai_terminal_core`): SSH(russh)・VT100/VTEパーサー・
     trzsz転送FSM・QUIC transport・resume/multipath ロジック。UniFFI で Kotlin に公開。
   - `isekai-helper/`: サーバー側に配置する自作 QUIC↔TCP 中継バイナリ(musl static)。
+  - `isekai-ssh/`: `ssh(1)` の `ProxyCommand` に差し込む単体 CLI バイナリ。`isekai-terminal-core`とは独立
+    (`isekai-protocol`/`isekai-trust`/`isekai-auth`/`isekai-transport`/`isekai-bootstrap`から
+    構成)で、`isekai-helper`経由のQUIC接続耐性をAndroidアプリ以外の`ssh`からも使えるようにする。
+    利用者向けガイドは`rust-core/isekai-ssh/README.md`、設計は`ISEKAI_SSH_DESIGN.md`参照。
   - `uniffi-bindgen/`: Kotlin バインディング(`app/src/main/kotlin/uniffi/isekai_terminal_core/isekai_terminal_core.kt`)
     生成用。
   - `noq-multipath-spike/`: `noq`(quinn の multipath フォーク)の実機検証用の使い捨てコード。
@@ -26,6 +30,7 @@ Rust(UniFFI 経由)の `rust-core`(crate 名 `isekai-terminal-core`)からなる
 - `DESIGN.md` — 初期スコープ定義(一部の「やらないこと」は後の Phase で方針転換済みなので
   `PLAN.md` の該当 Phase と食い違う場合は `PLAN.md` を優先する)。
 - `HELPER_PROTOCOL.md` — `isekai-helper` の CLI/ワイヤープロトコル契約。
+- `ISEKAI_SSH_DESIGN.md` — `isekai-ssh`(CLI)の設計判断・フェーズ分割案の記録。
 - `TESTING.md` — 実機での手動動作確認手順。
 - `SSH3_PROTOCOL_NOTES.md` — SSH3/HTTP3 化の調査記録(不採用、記録として保持)。
 

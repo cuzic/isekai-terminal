@@ -1344,6 +1344,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 name = "isekai-auth"
 version = "0.1.0"
 dependencies = [
+ "isekai-fs-guard",
  "serde",
  "serde_json",
  "tempfile",
@@ -1364,6 +1365,13 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "isekai-fs-guard"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -1505,6 +1513,7 @@ dependencies = [
 name = "isekai-trust"
 version = "0.1.0"
 dependencies = [
+ "isekai-fs-guard",
  "serde",
  "tempfile",
  "thiserror 2.0.18",

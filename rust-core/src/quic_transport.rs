@@ -316,3 +316,23 @@ async fn run_quic_transport(
         session, cmd_rx, event_tx,
     ).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `build_client_config`はネットワークI/Oを一切行わないrustls/noqのconfig構築のみ
+    // だが、テストが一つも無かった。ここが壊れると(rustlsのバージョン更新等で
+    // `with_safe_default_protocol_versions()`が失敗する、等)このtransportの全接続が
+    // 実機を叩くまで気付かれない致命的な壊れ方をするため、最低限どちらの分岐でも
+    // 構築自体が成功することを確認する。
+    #[test]
+    fn build_client_config_succeeds_with_cert_verification_skipped() {
+        assert!(build_client_config(true).is_ok());
+    }
+
+    #[test]
+    fn build_client_config_succeeds_with_cert_verification_enabled() {
+        assert!(build_client_config(false).is_ok());
+    }
+}

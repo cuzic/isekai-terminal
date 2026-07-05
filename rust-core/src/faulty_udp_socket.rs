@@ -290,6 +290,25 @@ mod tests {
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     use std::net::Ipv4Addr;
 
+    /// noqの既定`max_idle_timeout`(30秒)は通常十分だが、このワーカーは複数の
+    /// `claude`エージェント/Gradleデーモンが同時稼働することが常態化しており
+    /// (load averageが7を超えることも観測済み)、単発のQUIC往復が
+    /// `ConnectionLost(TimedOut)`で失敗することを確認した——注入した遅延/ロス
+    /// (最大でも50ms/10%程度)自体が原因ではなく、CPUスケジューリング待ちの間に
+    /// 相手からの応答が来ないまま既定のidle timeoutへ近づいてしまうため。
+    /// 本番の`quic_transport::build_client_config`が同じ理由で
+    /// `max_idle_timeout(300s)`にしているのに合わせ、テストでも現実的な余裕を持たせる
+    /// (このファイルの各テストは自前で`tokio::time::timeout`によるタイトな期限を
+    /// 併用しているため、コネクション自体を長生きさせても「本当のバグを見逃す」
+    /// 方向には倒れない)。
+    fn generous_transport_config() -> noq::TransportConfig {
+        let mut transport = noq::TransportConfig::default();
+        // quic_transport::build_client_config(本番のtsshd QUIC transport)と同じ300秒に
+        // 揃える。120秒でもこのマシンの一番重い瞬間には足りなかったため。
+        transport.max_idle_timeout(Some(Duration::from_secs(300).try_into().unwrap()));
+        transport
+    }
+
     fn server_endpoint() -> (noq::Endpoint, Vec<u8>) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = CertificateDer::from(cert.cert);
@@ -299,7 +318,8 @@ mod tests {
             .with_single_cert(vec![cert_der.clone()], key_der.into())
             .unwrap();
         let quic_crypto = noq::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap();
-        let server_config = noq::ServerConfig::with_crypto(Arc::new(quic_crypto));
+        let mut server_config = noq::ServerConfig::with_crypto(Arc::new(quic_crypto));
+        server_config.transport_config(Arc::new(generous_transport_config()));
         let endpoint = noq::Endpoint::server(
             server_config,
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
@@ -315,7 +335,9 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let quic_crypto = noq::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap();
-        noq::ClientConfig::new(Arc::new(quic_crypto))
+        let mut client_config = noq::ClientConfig::new(Arc::new(quic_crypto));
+        client_config.transport_config(Arc::new(generous_transport_config()));
+        client_config
     }
 
     fn faulty_client_endpoint(injector: UdpFaultInjector, client_config: noq::ClientConfig) -> noq::Endpoint {

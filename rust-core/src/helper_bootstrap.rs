@@ -20,14 +20,13 @@ use russh::{client, ChannelMsg};
 
 use crate::transport::RusshEventHandler;
 
-const HELPER_INSTALL_DIR: &str = "~/.local/bin";
-const HELPER_BIN_NAME: &str = "isekai-helper";
-const HANDSHAKE_DIR: &str = "~/.cache/isekai-terminal";
-const HANDSHAKE_FILE: &str = "~/.cache/isekai-terminal/helper.handshake";
-const HANDSHAKE_LOG: &str = "~/.cache/isekai-terminal/helper.log";
-/// 起動後、ハンドシェイク行が書き出されるまでのポーリング回数・間隔。
-const HANDSHAKE_POLL_ATTEMPTS: u32 = 50;
-const HANDSHAKE_POLL_INTERVAL_MS: u32 = 100;
+// `HELPER_INSTALL_DIR`/`HELPER_BIN_NAME`/`HANDSHAKE_POLL_ATTEMPTS`/
+// `HANDSHAKE_POLL_INTERVAL_MS` は `isekai_protocol::bootstrap` で共有している
+// （`isekai-bootstrap::openssh` 側の同名定数と実体を一致させるため — 詳細は
+// そちらのモジュールdoc参照）。
+use isekai_protocol::bootstrap::{
+    HANDSHAKE_POLL_ATTEMPTS, HANDSHAKE_POLL_INTERVAL_MS, HELPER_BIN_NAME, HELPER_INSTALL_DIR,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
@@ -43,6 +42,52 @@ pub enum BootstrapError {
     HandshakeTimeout,
     #[error("failed to parse handshake JSON: {0}")]
     HandshakeParse(String),
+    /// 固定ポート(`--bind`)でのUDP bindが既に使用中で失敗した(同一サーバーへの
+    /// 別セッション/別プロセスが同じポートを握っている可能性が高い)。
+    #[error("isekai-helper failed to bind UDP port {0}: already in use (another session on this server may already be using it)")]
+    BindPortInUse(u16),
+    /// 固定ポートでのUDP bindが権限不足で失敗した(1024未満のポートは通常サーバー側の
+    /// 管理者権限が必要)。
+    #[error("isekai-helper failed to bind UDP port {0}: permission denied (ports below 1024 usually require elevated privileges on the server)")]
+    BindPermissionDenied(u16),
+    /// 固定ポートでのUDP bindがこのホストでは使えないアドレスのため失敗した。
+    #[error("isekai-helper failed to bind UDP port {0}: address not available on this host")]
+    BindAddressUnavailable(u16),
+}
+
+/// isekai-helperがハンドシェイクを一切書き出せずに終了した場合に、シェル側から
+/// 代わりに出力させるマーカー行。この行が来たら、続く内容はハンドシェイクJSONではなく
+/// stderrログ(`launch_and_capture_handshake`が`mktemp -d`で作る一時ディレクトリ内の
+/// ログファイル)そのものとして扱う。
+const NO_HANDSHAKE_MARKER: &str = "__ISEKAI_HELPER_NO_HANDSHAKE__";
+
+/// `NO_HANDSHAKE_MARKER`とともに返されたisekai-helperのstderrログを見て、
+/// `--bind`固定ポート指定時のUDP bind失敗かどうかを分類する。マッチする既知の
+/// パターンが無ければ(または`bind_port`が指定されていなければ)従来通り
+/// `HandshakeTimeout`のままにする(固定ポート指定と無関係なクラッシュまで
+/// bind失敗として誤分類しないため)。
+///
+/// `isekai-helper`は常にmusl静的リンクバイナリとして配布される(`build-isekai-helper-musl.sh`)。
+/// musl libcの`strerror()`はglibcと文言が異なる場合があり、実際`EADDRINUSE`はglibcでは
+/// "Address already in use"だがmuslでは"Address in use"("already"が無い)になることを
+/// 実機E2Eテストで確認した(開発機のglibc環境で書いた元のパターンは、実際に配布される
+/// muslバイナリの出力に一度もマッチしていなかった)。他の2パターン("Permission denied"/
+/// "Address not available")は偶然glibc/musl間で表記が一致していたため気づかれていなかった。
+fn classify_launch_failure(log_text: &str, bind_port: Option<u16>) -> BootstrapError {
+    let Some(port) = bind_port else {
+        return BootstrapError::HandshakeTimeout;
+    };
+    if log_text.contains("Address already in use") || log_text.contains("Address in use") {
+        BootstrapError::BindPortInUse(port)
+    } else if log_text.contains("Permission denied") {
+        BootstrapError::BindPermissionDenied(port)
+    } else if log_text.contains("Cannot assign requested address")
+        || log_text.contains("Address not available")
+    {
+        BootstrapError::BindAddressUnavailable(port)
+    } else {
+        BootstrapError::HandshakeTimeout
+    }
 }
 
 /// Phase S-0f: 独自定義をやめ、`isekai-protocol`（pure crate、`isekai-ssh`/
@@ -188,6 +233,24 @@ async fn launch_and_capture_handshake(
     // ファイル権限は 0700(dir)/0600(handshake ファイル) を umask で保証する
     // （HELPER_PROTOCOL.md「Bootstrap file permissions」契約）。
     //
+    // ハンドシェイク/ログの出力先は、呼び出しごとに`mktemp -d`で新規作成する一時
+    // ディレクトリにする（固定パス`~/.cache/isekai-terminal/helper.{handshake,log}`を
+    // 全セッション共通で使い回していた旧実装には、同一サーバーへ複数タブ/セッションで
+    // 接続した際に、まだ生きている前のisekai-helperデーモンが同じファイルのfdを
+    // 開いたままの状態で次の起動がそのファイルを`>`で truncateしてしまい、両者の
+    // 書き込みが同一ファイル上で衝突してログが破損する不具合があった（実際に
+    // `second_session_with_same_fixed_port_fails_as_port_in_use`テストで発見。
+    // 壊れた"Error: Address in use (os error 98)"という行——本来なら
+    // "Address already in use"のはず——が生成され、classify_launch_failureが
+    // BindPortInUseを正しく分類できずHandshakeTimeoutに落ちていた）。
+    // `mktemp -d`は呼び出しごとに衝突しない新規ディレクトリを作るため、この種の
+    // 共有状態の衝突が構造的に起きなくなる。`trap ... EXIT`で、スクリプトが
+    // 正常終了/シグナル受信のどちらで終わっても一時ディレクトリを確実に削除する
+    // （SIGKILLはどのプロセスもtrapできないため唯一の例外だが、これはOS一般の制約であり
+    // 対処不能）。isekai-helper本体はsetsidで独立したセッションになっており、
+    // ディレクトリ削除後もまだ開いているfdへの書き込みは継続できる(Linuxのunlink-while-open
+    // 挙動)ため、削除タイミングをデーモンの寿命に合わせる必要はない。
+    //
     // 実機検証の結果、`cmd & disown`（引数無しはもちろん `disown -a` でも）では、
     // 起動元シェル（russh の exec チャネルが実行する `bash -c "..."` 本体）が
     // スクリプル終了後も長時間 `do_wait()` に留まり、isekai-helper（長時間稼働する
@@ -226,22 +289,33 @@ async fn launch_and_capture_handshake(
         }
     };
     let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
+    // ハンドシェイクが空のまま(=isekai-helperが起動直後にクラッシュした等)なら、
+    // ハンドシェイクJSONの代わりにマーカー行+stderrログを返す。呼び出し側
+    // (classify_launch_failure)がこれを見て、bind失敗の具体的な理由を推定できる
+    // ようにする(単なる`cat`の空出力だけでは原因が一切わからないため)。
     let launch_cmd = format!(
-        "umask 077 && mkdir -p {HANDSHAKE_DIR} && \
+        "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
          ( setsid {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} {bind_arg}{p2p_arg}--target {ssh_relay_target} \
-         </dev/null >{HANDSHAKE_FILE} 2>{HANDSHAKE_LOG} & ); \
+         </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
          for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
-           [ -s {HANDSHAKE_FILE} ] && break; \
+           [ -s $tmpdir/handshake ] && break; \
            sleep {sleep_secs}; \
          done; \
-         cat {HANDSHAKE_FILE}"
+         if [ -s $tmpdir/handshake ]; then cat $tmpdir/handshake; \
+         else echo {NO_HANDSHAKE_MARKER}; cat $tmpdir/log 2>/dev/null; fi"
     );
 
     let (stdout, _exit_status) = run_exec(session, &launch_cmd, None).await?;
-    let first_line = stdout
-        .split(|&b| b == b'\n')
-        .find(|line| !line.is_empty())
-        .ok_or(BootstrapError::HandshakeTimeout)?;
+    let mut lines = stdout.split(|&b| b == b'\n').filter(|line| !line.is_empty());
+    let first_line = lines.next().ok_or(BootstrapError::HandshakeTimeout)?;
+
+    if first_line == NO_HANDSHAKE_MARKER.as_bytes() {
+        let log_text = lines
+            .map(String::from_utf8_lossy)
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(classify_launch_failure(&log_text, bind_port));
+    }
 
     // `decode_handshake_json` は素の `serde_json::from_slice` と違い、サイズ上限・
     // `v`/`cert_sha256`/`session_secret`/`listen_port` のフォーマット検証も行う
@@ -380,5 +454,127 @@ mod tests {
         assert_eq!(handshake2.v, 1);
         // 起動のたびに ephemeral cert/secret を生成するため、値自体は毎回変わる。
         assert_ne!(handshake.session_secret, handshake2.session_secret);
+    }
+
+    /// 固定ポート(`--bind`)を指定してブートストラップし、実際にそのポートで
+    /// 待ち受けていることを確認する(実 sshd + テスト鍵が必要な opt-in E2E)。
+    #[tokio::test]
+    async fn bootstraps_with_fixed_bind_port() {
+        let Some(key_path) = test_key_path() else {
+            eprintln!("skipping: HELPER_BOOTSTRAP_TEST_KEY not set");
+            return;
+        };
+        let mut session = connect_test_session(&key_path).await;
+        let _ = run_exec(&mut session, &format!("rm -f {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}"), None).await;
+
+        let x86_64_bin = read_musl_binary("x86_64-unknown-linux-musl");
+        let aarch64_bin = read_musl_binary("aarch64-unknown-linux-musl");
+        let binaries = HelperBinaries { x86_64: &x86_64_bin, aarch64: &aarch64_bin };
+
+        // OSに割り当てられたエフェメラルレンジと衝突しにくい高番ポートを使う。
+        let fixed_port: u16 = 58123;
+        let handshake = ensure_helper_running(
+            &mut session, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &HelperP2pMode::None,
+        )
+        .await
+        .expect("bootstrap with fixed bind port failed");
+        assert_eq!(handshake.listen_port, fixed_port);
+    }
+
+    /// 同一サーバー・同一固定ポートで2セッション目を開いた場合、黙ってエフェメラル
+    /// ポートへフォールバックしたりハングしたりせず、`BindPortInUse`として安全に
+    /// 失敗することを確認する(実 sshd + テスト鍵が必要な opt-in E2E)。
+    #[tokio::test]
+    async fn second_session_with_same_fixed_port_fails_as_port_in_use() {
+        let Some(key_path) = test_key_path() else {
+            eprintln!("skipping: HELPER_BOOTSTRAP_TEST_KEY not set");
+            return;
+        };
+        let mut session1 = connect_test_session(&key_path).await;
+        let mut session2 = connect_test_session(&key_path).await;
+        let _ = run_exec(&mut session1, &format!("rm -f {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}"), None).await;
+
+        let x86_64_bin = read_musl_binary("x86_64-unknown-linux-musl");
+        let aarch64_bin = read_musl_binary("aarch64-unknown-linux-musl");
+        let binaries = HelperBinaries { x86_64: &x86_64_bin, aarch64: &aarch64_bin };
+
+        let fixed_port: u16 = 58124;
+        let _handshake1 = ensure_helper_running(
+            &mut session1, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &HelperP2pMode::None,
+        )
+        .await
+        .expect("first session should bind the fixed port successfully");
+
+        // 1セッション目がまだ同じ固定ポートで待ち受けている間に、2セッション目を
+        // 同じポートで開こうとする。ensure_helper_running は「既存インストール確認」
+        // のみ行い実行中プロセスの有無は見ないため、新しいisekai-helperプロセスが
+        // 起動を試み、bindの時点で衝突するはず。
+        let second_result = ensure_helper_running(
+            &mut session2, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &HelperP2pMode::None,
+        )
+        .await;
+
+        match second_result {
+            Err(BootstrapError::BindPortInUse(port)) => assert_eq!(port, fixed_port),
+            other => panic!("expected BindPortInUse({fixed_port}), got {other:?}"),
+        }
+    }
+
+    // ── classify_launch_failure(純粋関数、実SSH不要) ──────────────────
+
+    #[test]
+    fn classify_launch_failure_detects_address_in_use() {
+        let log = "Error: Address already in use (os error 98)\n";
+        assert!(matches!(
+            classify_launch_failure(log, Some(45900)),
+            BootstrapError::BindPortInUse(45900)
+        ));
+    }
+
+    /// `isekai-helper`の実配布物(musl静的リンク)は同じEADDRINUSEでもglibcと違う文言
+    /// ("already"が無い)を出す。実機E2Eテストで発見(このパターンが無いと本番では
+    /// 常にHandshakeTimeoutへ誤分類されていた)。
+    #[test]
+    fn classify_launch_failure_detects_address_in_use_musl_wording() {
+        let log = "Error: Address in use (os error 98)\n";
+        assert!(matches!(
+            classify_launch_failure(log, Some(45900)),
+            BootstrapError::BindPortInUse(45900)
+        ));
+    }
+
+    #[test]
+    fn classify_launch_failure_detects_permission_denied() {
+        let log = "Error: Permission denied (os error 13)\n";
+        assert!(matches!(
+            classify_launch_failure(log, Some(80)),
+            BootstrapError::BindPermissionDenied(80)
+        ));
+    }
+
+    #[test]
+    fn classify_launch_failure_detects_address_unavailable() {
+        let log = "Error: Cannot assign requested address (os error 99)\n";
+        assert!(matches!(
+            classify_launch_failure(log, Some(45900)),
+            BootstrapError::BindAddressUnavailable(45900)
+        ));
+    }
+
+    #[test]
+    fn classify_launch_failure_falls_back_to_timeout_for_unknown_reason() {
+        let log = "some unrelated crash message\n";
+        assert!(matches!(
+            classify_launch_failure(log, Some(45900)),
+            BootstrapError::HandshakeTimeout
+        ));
+    }
+
+    #[test]
+    fn classify_launch_failure_falls_back_to_timeout_when_no_bind_port_was_requested() {
+        // bind_portを指定していない(エフェメラルポート)場合、bind関連の文字列が
+        // たまたまログに含まれていてもbind失敗として誤分類しない。
+        let log = "Error: Address already in use (os error 98)\n";
+        assert!(matches!(classify_launch_failure(log, None), BootstrapError::HandshakeTimeout));
     }
 }

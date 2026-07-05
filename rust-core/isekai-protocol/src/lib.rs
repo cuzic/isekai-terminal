@@ -9,6 +9,7 @@
 //! live in the `resume` module (Phase S-4a), byte-compatible with the
 //! existing `pub(crate)` implementation in `rust-core/src/resume_client.rs`.
 
+pub mod bootstrap;
 pub mod error;
 pub mod handshake;
 pub mod hello;

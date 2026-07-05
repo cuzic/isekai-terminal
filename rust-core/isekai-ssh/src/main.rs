@@ -20,6 +20,7 @@ mod cli;
 mod connect;
 mod init;
 mod login;
+mod resume;
 
 use clap::Parser;
 
@@ -33,7 +34,7 @@ const EXIT_TRUST_NOT_INITIALIZED: u8 = 10;
 const EXIT_OTHER_ERROR: u8 = 1;
 
 #[tokio::main]
-async fn main() -> std::process::ExitCode {
+async fn main() {
     // stdout purity (see connect.rs's module docs) is why this is pinned to
     // stderr explicitly rather than relying on env_logger's default target,
     // which callers should not have to trust blindly to stay stderr-only
@@ -48,8 +49,8 @@ async fn main() -> std::process::ExitCode {
         cli::Command::Logout => login::run_logout().await,
     };
 
-    match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+    let exit_code: u8 = match result {
+        Ok(()) => 0,
         Err(err) => {
             // stdout purity: errors are only ever printed to stderr, never
             // stdout (see connect.rs's module docs; `ssh`'s ProxyCommand
@@ -57,11 +58,39 @@ async fn main() -> std::process::ExitCode {
             eprintln!("{err:?}");
             let is_trust_not_initialized =
                 err.chain().any(|cause| cause.downcast_ref::<connect::TrustNotInitialized>().is_some());
-            std::process::ExitCode::from(if is_trust_not_initialized {
+            if is_trust_not_initialized {
                 EXIT_TRUST_NOT_INITIALIZED
             } else {
                 EXIT_OTHER_ERROR
-            })
+            }
         }
-    }
+    };
+
+    // `std::process::exit` — not `return`/`ExitCode` — deliberately, on every
+    // path (`ISEKAI_SSH_DESIGN.md` Phase S-4d): `connect`'s stdin pump
+    // (`connect.rs::pump_c2h`) reads from `tokio::io::stdin()`, which
+    // dispatches each read to a background OS thread that Tokio's own docs
+    // say is "not currently cancelled" on runtime shutdown and can leave the
+    // process "hang ... indefinitely" if that thread is blocked in a read
+    // call when the runtime is dropped. That is exactly `pump_c2h`'s steady
+    // state (blocked waiting for the next keystroke) at the moment
+    // `run_relay_resumable` gives up after exceeding the resume window: `ssh`
+    // (the ProxyCommand parent) has no reason to have closed its write end of
+    // this pipe yet, since from its perspective the session is still alive.
+    // Letting `main` return normally here would drop the `#[tokio::main]`
+    // runtime and block on that orphaned thread — silently reintroducing the
+    // exact indefinite hang this phase exists to prevent, on every host where
+    // `ServerAliveInterval 0` (no keepalive) leaves `ssh` itself with no
+    // timeout of its own to eventually close that pipe
+    // (`ISEKAI_SSH_DESIGN.md`'s "制約: sshの生存確認とのレース" note on this
+    // exact configuration). `std::process::exit` terminates immediately
+    // without waiting for any thread, orphaned or not. Flushing stdout/stderr
+    // first ensures the `eprintln!` above (and anything `connect::run`'s
+    // give-up path already flushed via `tokio`'s async `stdout.shutdown()`)
+    // is not lost — `process::exit` skips destructors, not already-completed
+    // writes, but a belt-and-suspenders flush costs nothing here.
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(exit_code as i32);
 }

@@ -3,6 +3,7 @@ plugins {
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
+    alias(libs.plugins.roborazzi)
     id("kotlin-parcelize")
 }
 
@@ -52,6 +53,10 @@ android {
         unitTests {
             isReturnDefaultValues = true
             isIncludeAndroidResources = true
+            all {
+                // Roborazzi のCompose UIスクリーンショットにハードウェアレンダリングを使う
+                it.systemProperties["robolectric.pixelCopyRenderMode"] = "hardware"
+            }
         }
     }
 }
@@ -106,6 +111,8 @@ dependencies {
     testImplementation("androidx.room:room-testing:2.7.1")
     testImplementation(platform(libs.androidx.compose.bom))
     testImplementation("androidx.compose.ui:ui-test-junit4")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi:${libs.versions.roborazzi.get()}")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi-compose:${libs.versions.roborazzi.get()}")
 
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")

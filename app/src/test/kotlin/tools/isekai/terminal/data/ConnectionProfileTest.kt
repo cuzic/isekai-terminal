@@ -45,6 +45,26 @@ class ConnectionProfileTest {
         assertEquals(jumpAuth, config.jump?.auth)
     }
 
+    // ── toHelperQuicConfig ───────────────────────────────────────────────
+
+    @Test fun `toHelperQuicConfig maps ssh connection fields`() {
+        val config = profile().toHelperQuicConfig(auth)
+        assertEquals("example.com", config.sshHost)
+        assertEquals(2222.toUShort(), config.sshPort)
+        assertEquals("deploy", config.username)
+        assertEquals(auth, config.auth)
+    }
+
+    @Test fun `toHelperQuicConfig maps helperBindPort to bindPort when set`() {
+        val config = profile().copy(helperBindPort = 45900).toHelperQuicConfig(auth)
+        assertEquals(45900.toUShort(), config.bindPort)
+    }
+
+    @Test fun `toHelperQuicConfig maps null helperBindPort to null bindPort`() {
+        val config = profile().toHelperQuicConfig(auth)
+        assertNull(config.bindPort)
+    }
+
     // ── toIsekaiStunP2pConfig ────────────────────────────────────────────
 
     @Test fun `toIsekaiStunP2pConfig maps ssh connection fields`() {
@@ -109,6 +129,25 @@ class ConnectionProfileTest {
         assertEquals("", config.relayAddr)
         assertEquals("", config.relaySni)
         assertEquals("", config.relayJwt)
+    }
+
+    // ── toMultipathHelperQuicConfig ───────────────────────────────────────
+
+    @Test fun `toMultipathHelperQuicConfig maps ssh connection and direct_host fields`() {
+        val config = profile().copy(directAddress = "203.0.113.5:45823").toMultipathHelperQuicConfig(auth)
+        assertEquals("example.com", config.sshHost)
+        assertEquals(2222.toUShort(), config.sshPort)
+        assertEquals("203.0.113.5:45823", config.directHost)
+    }
+
+    @Test fun `toMultipathHelperQuicConfig maps helperBindPort to bindPort when set`() {
+        val config = profile().copy(helperBindPort = 45900).toMultipathHelperQuicConfig(auth)
+        assertEquals(45900.toUShort(), config.bindPort)
+    }
+
+    @Test fun `toMultipathHelperQuicConfig maps null helperBindPort to null bindPort`() {
+        val config = profile().toMultipathHelperQuicConfig(auth)
+        assertNull(config.bindPort)
     }
 
     // ── hasRelayConfig / usesJumpHost（純粋な算出プロパティ）──────────────
