@@ -251,7 +251,8 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             auth: auth,
             cols: cols,
             rows: rows,
-            jump: jump
+            jump: jump,
+            bindPort: nil
         )
     }
 
@@ -317,7 +318,8 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             auth: auth,
             cols: cols,
             rows: rows,
-            jump: jump
+            jump: jump,
+            bindPort: nil
         )
     }
 
