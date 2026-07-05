@@ -69,10 +69,11 @@ impl C2hReplayBuffer {
     /// Discards bytes isekai-helper has confirmed (`c2h_helper_committed_offset`,
     /// from an `APP_ACK` or a `RESUME_ACK`), freeing room for more stdin reads.
     pub fn advance_start(&mut self, confirmed_offset: u64) {
-        while self.start_offset < confirmed_offset && !self.data.is_empty() {
-            self.data.pop_front();
-            self.start_offset += 1;
-        }
+        let wanted = confirmed_offset.saturating_sub(self.start_offset) as usize;
+        let drop_count = wanted.min(self.data.len());
+        self.data.drain(..drop_count);
+        self.start_offset += drop_count as u64;
+
         if confirmed_offset > self.start_offset {
             // isekai-helper confirmed further than we have data for (e.g. we
             // already discarded up to some earlier confirmed offset and this
