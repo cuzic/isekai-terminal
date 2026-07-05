@@ -12,8 +12,8 @@ import XCTest
 /// fixtureを起動した上で明示的に実行する。
 final class SshVerticalSliceTests: XCTestCase {
     func testConnectSendJapaneseTextAndDisconnect() async throws {
-        guard let fixture = try? FixtureConfig.load() else {
-            throw XCTSkip("SSH fixture not available at \(FixtureConfig.defaultPath); run start-sshd-fixture.sh first")
+        guard let fixture = try? SshFixtureConfig.load() else {
+            throw XCTSkip("SSH fixture not available at \(SshFixtureConfig.defaultPath); run start-sshd-fixture.sh first")
         }
 
         let privateKeyData = try Data(contentsOf: URL(fileURLWithPath: fixture.privateKeyPath))
@@ -35,56 +35,21 @@ final class SshVerticalSliceTests: XCTestCase {
         let recorder = SshVerticalSliceRecorder()
         try session.connect(callback: recorder)
 
-        try await waitUntil(timeout: 10) { await recorder.connected }
+        try await waitUntilFixtureCondition(timeout: 10) { await recorder.connected }
 
         // 日本語を含む文字列を送受信できることを確認する。
         let marker = "isekai-terminal-ios-spike-こんにちは-\(UUID().uuidString.prefix(8))"
         session.send(data: Data("echo \(marker)\n".utf8))
 
-        try await waitUntil(timeout: 10) {
+        try await waitUntilFixtureCondition(timeout: 10) {
             let text = await recorder.receivedText
             return text.contains(marker)
         }
 
         session.disconnect()
 
-        try await waitUntil(timeout: 10) { await recorder.disconnected }
+        try await waitUntilFixtureCondition(timeout: 10) { await recorder.disconnected }
     }
-}
-
-// MARK: - フィクスチャ設定の読み込み
-
-private struct FixtureConfig: Decodable {
-    static let defaultPath = "/tmp/ios-fixture/fixture.json"
-
-    let host: String
-    let port: Int
-    let user: String
-    let privateKeyPath: String
-    let hostKeyFingerprint: String
-
-    enum CodingKeys: String, CodingKey {
-        case host, port, user
-        case privateKeyPath = "private_key_path"
-        case hostKeyFingerprint = "host_key_fingerprint"
-    }
-
-    static func load() throws -> FixtureConfig {
-        let path = ProcessInfo.processInfo.environment["IOS_SSH_FIXTURE_JSON"] ?? defaultPath
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
-        return try JSONDecoder().decode(FixtureConfig.self, from: data)
-    }
-}
-
-// MARK: - 簡易ポーリングヘルパー
-
-private func waitUntil(timeout: TimeInterval, condition: () async -> Bool) async throws {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if await condition() { return }
-        try await Task.sleep(nanoseconds: 50_000_000) // 50ms
-    }
-    XCTFail("condition not met within \(timeout)s")
 }
 
 // MARK: - SessionCallback記録用actor
