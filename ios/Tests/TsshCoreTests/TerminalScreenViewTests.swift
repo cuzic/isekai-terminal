@@ -1,5 +1,6 @@
 import XCTest
 @testable import TsshCore
+import TsshCoreLogic
 
 /// Phase 1D(#18b): `TerminalScreenView`が`ScreenUpdate`を受け取ってクラッシュせず
 /// 描画できることのスモークテスト(実際のピクセル出力の目視確認は対象外)。

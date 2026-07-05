@@ -1,5 +1,6 @@
 import XCTest
 @testable import TsshCore
+import TsshCoreLogic
 
 /// Phase 1A-6: Rust→Swift画面更新ブリッジの検証。
 /// `DiagnosticFrameMailbox`(latest-wins、Rust側でstaleなframeを破棄する)と

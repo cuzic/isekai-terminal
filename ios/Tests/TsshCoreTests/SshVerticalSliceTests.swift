@@ -1,5 +1,6 @@
 import XCTest
 @testable import TsshCore
+import TsshCoreLogic
 
 /// Phase 1A-8: plain SSH最小縦切り。ハードコードした接続先(実際は
 /// `rust-core/scripts/ios-fixture/start-sshd-fixture.sh`が起動するCI fixture)へ
