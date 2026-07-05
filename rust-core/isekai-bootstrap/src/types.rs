@@ -93,7 +93,7 @@ pub struct RelayLaunchSpec {
     pub relay_jwt: String,
     /// `isekai-helper --max-idle-lifetime <SECS>`: how long the deployed
     /// helper stays running with no active connection before it self-exits.
-    /// `isekai-helper`'s own default (600s) is tuned for `tssh-core`'s
+    /// `isekai-helper`'s own default (600s) is tuned for `isekai-terminal-core`'s
     /// per-session bootstrap model (Android re-deploys/re-launches a fresh
     /// helper on every connection attempt, so a short self-exit window is
     /// pure cleanup). `isekai-ssh init` deploys a helper once and expects

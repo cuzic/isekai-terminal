@@ -1,8 +1,8 @@
 //! QUIC connection establishment + HELLO/proof/ACK handshake (both relay and
-//! STUN+SSH-rendezvous P2P), extracted from `tssh-core`'s
+//! STUN+SSH-rendezvous P2P), extracted from `isekai-terminal-core`'s
 //! `helper_quic_transport.rs` / `isekai_link_relay_transport.rs` /
 //! `isekai_stun_p2p_transport.rs` so `isekai-ssh` (a plain CLI binary) can
-//! reuse the same logic without depending on `tssh-core`, UniFFI, or any
+//! reuse the same logic without depending on `isekai-terminal-core`, UniFFI, or any
 //! Android-specific type (`ISEKAI_SSH_DESIGN.md` "実装方針", phases S-0d-1/
 //! S-0d-2).
 //!
@@ -46,7 +46,7 @@
 //!   `ISEKAI_SSH_DESIGN.md`'s "isekai-sshでのNAT越え方式の既定").
 //!
 //! This crate must never depend on UniFFI, Android-specific types, or
-//! `tssh-core` itself — see `traits.rs`'s module docs for why the trait
+//! `isekai-terminal-core` itself — see `traits.rs`'s module docs for why the trait
 //! boundary exists in the first place.
 
 pub mod backoff;

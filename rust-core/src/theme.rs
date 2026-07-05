@@ -32,7 +32,7 @@ impl Default for Theme {
 
 /// アプリ全体の既定テーマ設定(プロセス全体で共有されるグローバル状態)。
 ///
-/// Kotlin 側の `SharedPreferences("tssh_ui")` に保存される、アプリ全体のデフォルト値
+/// Kotlin 側の `SharedPreferences("isekai_terminal_ui")` に保存される、アプリ全体のデフォルト値
 /// （`set_terminal_theme` 参照）。Phase 12 より前はこれが全セッション共通の唯一の
 /// テーマだったが、現在は各セッション(タブ)が `Terminal.theme`
 /// （`SessionCore::current_theme` 経由）に自分のテーマのスナップショットを持ち、

@@ -3,13 +3,13 @@
 //! `rust-core/src/helper_quic_transport.rs`'s `open_control_stream` /
 //! `spawn_app_ack_tasks` and `rust-core/src/isekai_link_relay_transport.rs`'s
 //! `reattach_fn` closure — minus anything that touches `noq` directly,
-//! `FaultyUdpSocket`, or `tssh-core`'s UniFFI types. The wire format matches
+//! `FaultyUdpSocket`, or `isekai-terminal-core`'s UniFFI types. The wire format matches
 //! `HELPER_PROTOCOL.md` §7.3/§7.4 byte-for-byte (confirmed against the real
 //! `isekai-helper` implementation, `isekai-helper/src/main.rs` +
 //! `isekai-helper/src/resume.rs`, which is the actual interop target — not
 //! just the design doc's prose).
 //!
-//! Deliberately **not** ported from `tssh-core`: the `ReattachableStream`
+//! Deliberately **not** ported from `isekai-terminal-core`: the `ReattachableStream`
 //! `AsyncRead`/`AsyncWrite` wrapper. That type exists on the Android side
 //! purely to present a single object russh can keep driving across a
 //! reconnect. `isekai-ssh` has no russh in the loop — it drives its own

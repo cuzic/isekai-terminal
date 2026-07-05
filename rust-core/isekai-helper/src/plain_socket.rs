@@ -8,7 +8,7 @@
 //! socket.
 //!
 //! This is a plain pass-through with no fault injection (unlike
-//! `tssh-core`'s `faulty_udp_socket.rs`/`multipath_transport.rs`, which are
+//! `isekai-terminal-core`'s `faulty_udp_socket.rs`/`multipath_transport.rs`, which are
 //! Android-app-only debug tooling isekai-helper has no access to as a
 //! separate crate) — it exists solely to let a socket be used twice (once
 //! raw, once as a QUIC transport), not to alter behavior.

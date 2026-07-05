@@ -8,7 +8,7 @@
 //! (`isekai_protocol::hello`).
 //!
 //! This is loopback-only, so there is no real NAT to punch through — like
-//! `tssh-core`'s own `isekai_stun_p2p_transport.rs` test suite, this proves
+//! `isekai-terminal-core`'s own `isekai_stun_p2p_transport.rs` test suite, this proves
 //! the code path executes correctly end-to-end (STUN query → probe
 //! datagrams → QUIC-over-the-same-socket → HELLO/ACK), not that hole
 //! punching succeeds against a real NAT (that requires two real networks,

@@ -1450,6 +1450,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "isekai-terminal-core"
+version = "0.1.0"
+dependencies = [
+ "android_logger",
+ "async-trait",
+ "base64",
+ "flate2",
+ "hmac",
+ "isekai-protocol",
+ "isekai-stun",
+ "log",
+ "md5 0.8.0",
+ "noq",
+ "parking_lot",
+ "proptest",
+ "rand 0.8.6",
+ "rcgen 0.13.2",
+ "russh",
+ "russh-keys",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smol_str",
+ "thiserror 2.0.18",
+ "timed-fsm",
+ "tokio",
+ "tokio-stream",
+ "unicode-width",
+ "uniffi",
+ "vte",
+]
+
+[[package]]
 name = "isekai-transport"
 version = "0.1.0"
 dependencies = [
@@ -3442,40 +3476,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "tssh-core"
-version = "0.1.0"
-dependencies = [
- "android_logger",
- "async-trait",
- "base64",
- "flate2",
- "hmac",
- "isekai-protocol",
- "isekai-stun",
- "log",
- "md5 0.8.0",
- "noq",
- "parking_lot",
- "proptest",
- "rand 0.8.6",
- "rcgen 0.13.2",
- "russh",
- "russh-keys",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "smol_str",
- "thiserror 2.0.18",
- "timed-fsm",
- "tokio",
- "tokio-stream",
- "unicode-width",
- "uniffi",
- "vte",
 ]
 
 [[package]]

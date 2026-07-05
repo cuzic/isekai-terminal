@@ -1,5 +1,5 @@
 //! STUN+SSH rendezvous P2P QUIC connection establishment
-//! (`ISEKAI_SSH_DESIGN.md` phase S-0d-2), extracted from `tssh-core`'s
+//! (`ISEKAI_SSH_DESIGN.md` phase S-0d-2), extracted from `isekai-terminal-core`'s
 //! `isekai_stun_p2p_transport.rs`.
 //!
 //! Scope of this module (mirrors `try_connect_isekai_stun_p2p` /

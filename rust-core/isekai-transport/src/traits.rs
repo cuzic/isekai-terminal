@@ -5,7 +5,7 @@
 //! These exist so that `isekai-transport`'s relay-connection logic
 //! (`relay.rs`) never has to know whether it is running against a real
 //! `tokio::net::UdpSocket` (`system::SystemQuicEndpointFactory`, used by the
-//! CLI) or an Android-specific instrumented socket (`tssh-core`'s
+//! CLI) or an Android-specific instrumented socket (`isekai-terminal-core`'s
 //! debug-only fault-injection factory, kept out of this crate entirely).
 //! Only *connection establishment and stream opening* lives behind this
 //! boundary — HELLO/proof/ACK protocol logic is layered on top in
@@ -15,7 +15,7 @@
 //! the HELLO/ACK code that calls it).
 //!
 //! Async trait methods are made object-safe via `async-trait`, the same
-//! crate `tssh-core` already depends on — no new dependency introduced here.
+//! crate `isekai-terminal-core` already depends on — no new dependency introduced here.
 
 use async_trait::async_trait;
 

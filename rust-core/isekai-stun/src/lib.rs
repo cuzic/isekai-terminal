@@ -5,7 +5,7 @@
 //! implementation — isekai-terminal/isekai-helper only need "what does the
 //! outside world see as my address on this socket", nothing else.
 //!
-//! Shared by both `tssh-core` (isekai-terminal, the client role) and
+//! Shared by both `isekai-terminal-core` (isekai-terminal, the client role) and
 //! `isekai-helper` (the agent role) so the wire-level STUN handling can't
 //! drift between the two sides of the hole-punch handshake.
 //!

@@ -1,4 +1,4 @@
-uniffi::setup_scaffolding!("tssh_core");
+uniffi::setup_scaffolding!("isekai_terminal_core");
 
 pub mod trzsz;
 pub mod quic_transport;
@@ -41,7 +41,7 @@ pub(crate) fn init_logger() {
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Debug)
-            .with_tag("tssh-core"),
+            .with_tag("isekai-terminal-core"),
     );
 }
 
@@ -64,7 +64,7 @@ pub fn set_terminal_theme(ansi16: Vec<u32>, default_fg: u32, default_bg: u32) {
     theme::set(theme::from_raw(ansi16, default_fg, default_bg));
 }
 
-/// tssh-core の crate バージョン（`Cargo.toml` の `version`）を返す。
+/// isekai-terminal-core の crate バージョン（`Cargo.toml` の `version`）を返す。
 ///
 /// iOS 対応 Phase 0 の技術検証スパイクで、UniFFI Swift バインディング経由の
 /// round-trip（Swift → Rust 呼び出し → 戻り値）を確認するための診断用関数

@@ -209,7 +209,7 @@ pub struct InitArgs {
     /// flag becomes optional, but doing that today would force every
     /// `cargo build -p isekai-ssh` to require a pre-built musl artifact on
     /// disk just to compile — exactly the trap `helper_quic_transport.rs`'s
-    /// unconditional `include_bytes!` fell into for `tssh-core`. Keeping
+    /// unconditional `include_bytes!` fell into for `isekai-terminal-core`. Keeping
     /// this an explicit, required CLI argument keeps `isekai-ssh` buildable
     /// in any environment; tests pass the actual binary built alongside
     /// this crate (`CARGO_BIN_EXE_isekai-helper`/the sibling `target/`
@@ -250,7 +250,7 @@ pub struct InitArgs {
     /// own 600s default, because `init` deploys a helper once and `connect`
     /// is expected to keep dialing that same long-running process across
     /// many separate, possibly hours/days-apart `ssh` invocations — unlike
-    /// `tssh-core`'s (Android's) per-session bootstrap, which re-deploys a
+    /// `isekai-terminal-core`'s (Android's) per-session bootstrap, which re-deploys a
     /// fresh helper on every connection attempt and so is unaffected by a
     /// short self-exit window (`ISEKAI_SSH_DESIGN.md` "引き続き未決の項目").
     #[arg(long, value_name = "SECS", default_value_t = 2_592_000)]

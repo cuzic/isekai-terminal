@@ -12,7 +12,7 @@
 //! アプリ層から見て透過的——`noq`が内部でどのpathを使うか選ぶ）。
 //!
 //! `helper_quic_transport.rs`のPhase 7/8コードは一切変更していない
-//! （既存の3 e2eテスト+tssh-core 66テストで無回帰を確認済み、Phase 9-1）。
+//! （既存の3 e2eテスト+isekai-terminal-core 66テストで無回帰を確認済み、Phase 9-1）。
 //! HELPER_PROTOCOL.mdのHELLO/ACK/proof契約・埋め込みヘルパーバイナリ・
 //! ブートストラップロジックはそちらの`pub(crate)`公開分をそのまま再利用する。
 
@@ -1458,7 +1458,7 @@ mod tests {
     ///
     /// `debug_fault::shared_injector()`はプロセスグローバルな状態なので、
     /// このテストは他のフォルト注入系テストと同時実行しないこと
-    /// （`cargo test -p tssh-core --lib multipath_transport::tests::path0_degrades_and_recovers_under_injected_latency`
+    /// （`cargo test -p isekai-terminal-core --lib multipath_transport::tests::path0_degrades_and_recovers_under_injected_latency`
     /// のように単独実行する）。
     #[tokio::test]
     async fn path0_degrades_and_recovers_under_injected_latency() {

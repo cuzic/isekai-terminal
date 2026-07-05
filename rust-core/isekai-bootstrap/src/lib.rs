@@ -7,7 +7,7 @@
 //! construction, handshake capture/validation) behind a `BootstrapBackend`
 //! trait, so `isekai-ssh` (a plain CLI binary with no `russh::client::Handle`
 //! of its own) can reuse it via a plain `ssh(1)` subprocess
-//! (`OpenSshBackend`) instead. `tssh-core`/Android keeps its existing
+//! (`OpenSshBackend`) instead. `isekai-terminal-core`/Android keeps its existing
 //! `russh`-based implementation; a `RusshBackend` adapter for it is future
 //! work (see `backend` module docs).
 //!

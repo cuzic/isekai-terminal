@@ -283,7 +283,7 @@ async fn install_and_start_gets_a_real_handshake_over_a_real_ssh_subprocess() {
 /// `isekai-helper` process's argv as `--max-idle-lifetime <SECS>` — this is
 /// the fix for the `ISEKAI_SSH_DESIGN.md` "引き続き未決の項目" gap where a
 /// helper deployed via `isekai-ssh init` would inherit `isekai-helper`'s own
-/// short default (600s, tuned for `tssh-core`'s per-session bootstrap) and
+/// short default (600s, tuned for `isekai-terminal-core`'s per-session bootstrap) and
 /// self-exit long before a `connect` invocation hours/days later could reach
 /// it again.
 #[tokio::test]

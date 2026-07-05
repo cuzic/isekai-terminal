@@ -18,6 +18,6 @@ tempfile = "3"
 # is a plain sync `fn` (see lib.rs docs), `isekai-ssh login` only ever needs
 # one blocking request in flight, and ureq's default features (rustls+ring,
 # gzip via flate2) reuse TLS/compression backends already present elsewhere
-# in this workspace (isekai-transport, tssh-core) rather than pulling in a
+# in this workspace (isekai-transport, isekai-terminal-core) rather than pulling in a
 # second async HTTP stack just for a handful of sequential POSTs.
 ureq = "3"
