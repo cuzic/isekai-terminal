@@ -9,6 +9,9 @@ import UIKit
 public struct TerminalView: View {
     @State private var controller: TerminalSessionController
     @ObservedObject private var uiState: TerminalUIState
+    /// Phase 1F-1(#48): 現在の選択範囲。`TerminalScreenView`(UIKit側)からの通知で更新され、
+    /// フローティングツールバーの表示・コピー/キャンセル操作の両方に使う。
+    @State private var selection: SelectionRange?
 
     public init(
         profile: ConnectionProfile,
@@ -23,7 +26,7 @@ public struct TerminalView: View {
 
     public var body: some View {
         ZStack(alignment: .topLeading) {
-            TerminalScreenRepresentable(uiState: uiState)
+            TerminalScreenRepresentable(uiState: uiState, selection: $selection)
                 .accessibilityIdentifier("terminalScreen")
 
             TerminalInputRepresentable(controller: controller, uiState: uiState)
@@ -31,6 +34,12 @@ public struct TerminalView: View {
                 .opacity(0.01) // 非表示にしつつfirstResponderにはなれる状態を保つ
 
             statusOverlay
+
+            if let selection {
+                selectionToolbar(selection)
+                    .frame(maxWidth: .infinity, alignment: .top)
+                    .padding(.top, 8)
+            }
         }
         .background(Color.black)
         .navigationBarTitleDisplayMode(.inline)
@@ -76,19 +85,53 @@ public struct TerminalView: View {
                 .accessibilityIdentifier("terminalErrorOverlay")
         }
     }
+
+    /// Phase 1F-1(#48): 選択中のフローティングツールバー(コピー/キャンセル)。
+    /// Android版`TerminalScreen.kt`のフローティングツールバーと同じ役割。
+    @ViewBuilder
+    private func selectionToolbar(_ selection: SelectionRange) -> some View {
+        HStack(spacing: 4) {
+            Button("コピー") {
+                if let update = uiState.latestScreenUpdate {
+                    let text = reconstructSelectionText(update: update, selection: selection)
+                    if !text.isEmpty {
+                        UIPasteboard.general.string = text
+                    }
+                }
+                self.selection = nil
+            }
+            .foregroundStyle(.cyan)
+            .accessibilityIdentifier("copySelectionButton")
+
+            Button("キャンセル") { self.selection = nil }
+                .foregroundStyle(.gray)
+                .accessibilityIdentifier("cancelSelectionButton")
+        }
+        .font(.caption)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.black.opacity(0.8))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
 }
 
 private struct TerminalScreenRepresentable: UIViewRepresentable {
     @ObservedObject var uiState: TerminalUIState
+    @Binding var selection: SelectionRange?
 
     func makeUIView(context: Context) -> TerminalScreenView {
-        TerminalScreenView()
+        let view = TerminalScreenView()
+        view.onSelectionChanged = { newValue in
+            selection = newValue
+        }
+        return view
     }
 
     func updateUIView(_ uiView: TerminalScreenView, context: Context) {
         if let update = uiState.latestScreenUpdate {
             uiView.apply(update)
         }
+        uiView.selection = selection
     }
 }
 
@@ -138,6 +181,9 @@ private final class TerminalAccessoryBar: UIView {
         ctrl.addTarget(self, action: #selector(handleCtrlTap), for: .touchUpInside)
         ctrlButton = ctrl
 
+        let paste = makeButton(title: "貼付", tag: -2)
+        paste.addTarget(self, action: #selector(handlePasteTap), for: .touchUpInside)
+
         let labels: [(String, TerminalKeyMapper.SpecialKey)] = [
             ("Esc", .escape),
             ("Tab", .tab),
@@ -153,7 +199,7 @@ private final class TerminalAccessoryBar: UIView {
         self.keys = labels.map { $0.1 }
 
         let keyButtons = labels.enumerated().map { index, item in makeButton(title: item.0, tag: index) }
-        let stack = UIStackView(arrangedSubviews: [ctrl] + keyButtons)
+        let stack = UIStackView(arrangedSubviews: [ctrl, paste] + keyButtons)
         stack.axis = .horizontal
         stack.distribution = .fillEqually
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -188,6 +234,16 @@ private final class TerminalAccessoryBar: UIView {
         guard let imeInputView else { return }
         imeInputView.ctrlArmed.toggle()
         ctrlButton?.configuration?.baseBackgroundColor = imeInputView.ctrlArmed ? .systemBlue : nil
+    }
+
+    /// Phase 1F-1(#48): クリップボードの内容をターミナルへ送る。Android版
+    /// (Ctrl行の「貼付」ボタン、`TerminalKeyEncoder.commitTextBytes`相当)と同じく
+    /// bracketed paste modeを考慮する(`TerminalIMEInputView.bracketedPasteMode`は
+    /// `ScreenUpdate.bracketedPasteMode`から都度反映されている、`TerminalView`参照)。
+    @objc private func handlePasteTap() {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
+        let bracketedPasteMode = imeInputView?.bracketedPasteMode ?? false
+        controller?.send(terminalCommitTextBytes(text: text, bracketedPasteMode: bracketedPasteMode))
     }
 
     @objc private func handleTap(_ sender: UIButton) {
