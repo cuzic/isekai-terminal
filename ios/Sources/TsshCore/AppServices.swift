@@ -9,6 +9,7 @@ public final class AppServices {
     public let db: ProfileDatabase
     public let vault: CredentialVault
     public let trustStore: SshHostTrustStore
+    public let relayVault = RelayCredentialVault()
 
     private init() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]

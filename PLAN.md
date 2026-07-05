@@ -2374,6 +2374,30 @@ unit test、`TerminalSessionControllerTests.swift`)に限定し、**実際のQUI
 残り#45(MASQUE relay)・#46(マルチパス)・#47(物理マルチパス、低優先)も
 同じパターンで実装できる見込み。
 
+### Phase 1E-6(#45)実装メモ(2026-07-05、MASQUE relay P2P)
+
+`IsekaiLinkRelayConfig`は`relayAddr`/`relaySni`/`relayJwt`(全て`String`必須、
+Optionalではない)を要求する。`ConnectionProfile.relayJwt`はPhase 1E-1の時点で
+「暗号化して保存すること(現時点ではまだ平文格納のプレースホルダー)」と明記
+されていたため、このタスクでAndroid版`RelayCredentialVault`+`KeystoreKek`相当を
+Swift側にも実装した:
+
+- 新規`ios/Sources/TsshCore/RelayCredentialVault.swift`: `CredentialVault.swift`に
+  既にある`KeychainKEKStore`(Keychain由来のAES-GCM対称鍵ストア)を、秘密鍵ごとの
+  鍵ではなく固定1鍵(`"relay-jwt-kek"`)で再利用する薄いラッパー。
+  `encrypt(String) throws -> String`/`decrypt(String) throws -> String`のみ。
+- `AppServices.shared.relayVault`として公開し、`ProfileEditModel`(保存時に暗号化・
+  編集読込時に復号、Android版`encryptRelayJwt`/`decryptRelayJwt`と同じタイミング)と
+  `TerminalSessionController`(接続直前に復号、Android版`connectTab`内の
+  `decryptRelayJwt`呼び出しと同じタイミング)の両方に注入した。
+- **Keychainテスト配置の罠(4回目)**: `RelayCredentialVault.encrypt/decrypt`を
+  実際に呼ぶテストは素の`TsshCoreTests`では`errSecMissingEntitlement`になるため、
+  最初からアプリホスト型の`TsshTerminalAppTests`(既存の
+  `TerminalSessionControllerE2ETests.swift`に追記、新規ファイルにすると
+  pbxproj手編集が要るため既存ファイルへの追記で済ませた)に置いた。
+  `Tests/TsshCoreTests`側には「relayJwt未設定でnilを返す」経路(Keychainに触れない)
+  だけを残した。
+
 ---
 
 ## 実装順序

@@ -158,13 +158,17 @@ final class TerminalSessionControllerTests: XCTestCase {
     // `toHelperQuicConfig`相当の純粋なconfig構築ロジックと、`transportPreference`に
     // 応じた分岐(未対応方式は`.failed`になること)だけを検証する。
 
-    private func makeControllerWithProfile(_ profile: ConnectionProfile, password: String? = "pw") throws -> TerminalSessionController {
+    private func makeControllerWithProfile(
+        _ profile: ConnectionProfile,
+        password: String? = "pw",
+        relayVault: RelayCredentialVault = RelayCredentialVault(keychainService: "test.relayvault.\(UUID().uuidString)")
+    ) throws -> TerminalSessionController {
         let db = try ProfileDatabase.inMemory()
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         let vault = try CredentialVault(blobDirectory: tempDir, keychainService: "test.terminalsession.transport.\(UUID().uuidString)")
         let trustStore = try SshHostTrustStore(storeURL: tempDir.appendingPathComponent("trust.json"))
-        return TerminalSessionController(profile: profile, password: password, db: db, vault: vault, trustStore: trustStore)
+        return TerminalSessionController(profile: profile, password: password, db: db, vault: vault, relayVault: relayVault, trustStore: trustStore)
     }
 
     func testMakeSshConfigMapsProfileFieldsAndGatesAgentForwardOnKeyAuth() throws {
@@ -230,10 +234,46 @@ final class TerminalSessionControllerTests: XCTestCase {
         }
     }
 
-    func testConnectWithUnsupportedTransportPreferenceFails() async throws {
+    // MARK: - Phase 1E-6(#45): MASQUE relay P2P(config構築のみ、実接続なし)
+    //
+    // 実際の暗号化/復号(`RelayCredentialVault`、Keychainに触れる)を伴うテストは
+    // 素の`TsshCoreTests`では`errSecMissingEntitlement`になるため、アプリホスト型の
+    // `TsshTerminalAppTests`側に`RelayCredentialVaultTests.swift`として置いている
+    // (`CredentialVaultTests.swift`と同じ理由)。ここではKeychainに触れない
+    // 「relayJwt未設定」経路だけを検証する。
+
+    func testMakeIsekaiLinkRelayConfigReturnsNilWhenRelayJwtMissing() throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+
+        let config = controller.makeIsekaiLinkRelayConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+        XCTAssertNil(config)
+    }
+
+    func testConnectIsekaiLinkRelayFailsCleanlyWhenRelayJwtMissing() async throws {
         let profile = ConnectionProfile(
             displayName: "test", host: "example.com", port: 22, username: "user",
             transportPreference: .isekaiLinkRelayQuic
+        )
+        let controller = try makeControllerWithProfile(profile)
+
+        controller.connect()
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.state != .connecting
+        }
+        guard case .failed(let message) = controller.uiState.state else {
+            XCTFail("expected .failed state, got \(controller.uiState.state)")
+            return
+        }
+        XCTAssertTrue(message.contains("復号"))
+    }
+
+    func testConnectWithUnsupportedTransportPreferenceFails() async throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 22, username: "user",
+            transportPreference: .tsshdQuic
         )
         let controller = try makeControllerWithProfile(profile)
 

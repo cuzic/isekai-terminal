@@ -55,6 +55,98 @@ final class TerminalSessionControllerE2ETests: XCTestCase {
     }
 }
 
+/// Phase 1E-6(#45): MASQUE relay P2Pで使う`RelayCredentialVault`(Keychain由来の
+/// AES-GCM鍵でrelay JWTを暗号化するラッパー)の検証。`TerminalSessionController`と
+/// 同様Keychainに触れるため、このアプリホスト型ターゲットに置く。
+final class RelayCredentialVaultTests: XCTestCase {
+    func testEncryptThenDecryptRoundTripsPlainJwt() throws {
+        let vault = RelayCredentialVault(keychainService: "test.relayvault.\(UUID().uuidString)")
+
+        let encrypted = try vault.encrypt("plain-jwt-value")
+        XCTAssertNotEqual(encrypted, "plain-jwt-value")
+        let decrypted = try vault.decrypt(encrypted)
+
+        XCTAssertEqual(decrypted, "plain-jwt-value")
+    }
+
+    func testDecryptWithGarbageValueThrows() throws {
+        let vault = RelayCredentialVault(keychainService: "test.relayvault.\(UUID().uuidString)")
+
+        XCTAssertThrowsError(try vault.decrypt("not-valid-base64-or-ciphertext"))
+    }
+}
+
+/// Phase 1E-6(#45): `TerminalSessionController.makeIsekaiLinkRelayConfig`が
+/// `RelayCredentialVault`で暗号化されたrelay JWTを正しく復号してconfigへ渡すことを
+/// 検証する(実接続は行わない)。Keychainに触れるためこのターゲットに置く。
+@MainActor
+final class TerminalSessionControllerRelayConfigTests: XCTestCase {
+    func testMakeIsekaiLinkRelayConfigDecryptsStoredJwtAndMapsFields() throws {
+        let relayVault = RelayCredentialVault(keychainService: "test.relayvault.\(UUID().uuidString)")
+        let encryptedJwt = try relayVault.encrypt("plain-jwt-value")
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 22, username: "user",
+            relayAddr: "relay.example.com:4433", relaySni: "relay.example.com", relayJwt: encryptedJwt
+        )
+        let db = try ProfileDatabase.inMemory()
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let vault = try CredentialVault(blobDirectory: tempDir, keychainService: "test.terminalsession.relay.\(UUID().uuidString)")
+        let trustStore = try SshHostTrustStore(storeURL: tempDir.appendingPathComponent("trust.json"))
+        let controller = TerminalSessionController(profile: profile, password: "pw", db: db, vault: vault, relayVault: relayVault, trustStore: trustStore)
+
+        let config = controller.makeIsekaiLinkRelayConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+        XCTAssertEqual(config?.relayAddr, "relay.example.com:4433")
+        XCTAssertEqual(config?.relaySni, "relay.example.com")
+        XCTAssertEqual(config?.relayJwt, "plain-jwt-value")
+    }
+}
+
+/// Phase 1E-6(#45): `ProfileEditModel.save()`がrelay JWTを`RelayCredentialVault`で
+/// 暗号化してDBへ保存し、既存プロファイル編集時には復号して表示することを検証する。
+/// Keychainに触れるためこのターゲットに置く。
+@MainActor
+final class ProfileEditModelRelayTests: XCTestCase {
+    func testSaveEncryptsRelayJwtAndEditRestoresDecryptedValue() throws {
+        let db = try ProfileDatabase.inMemory()
+        let relayVault = RelayCredentialVault(keychainService: "test.relayvault.\(UUID().uuidString)")
+        let model = ProfileEditModel(profile: nil, db: db, relayVault: relayVault)
+        model.displayName = "dev box"
+        model.host = "127.0.0.1"
+        model.username = "tester"
+        model.transportPreference = .isekaiLinkRelayQuic
+        model.relayAddr = "relay.example.com:4433"
+        model.relaySni = "relay.example.com"
+        model.relayJwt = "plain-jwt-value"
+
+        XCTAssertTrue(model.save())
+
+        let saved = try XCTUnwrap(try db.fetchAllProfiles().first)
+        XCTAssertNotEqual(saved.relayJwt, "plain-jwt-value")
+
+        let editModel = ProfileEditModel(profile: saved, db: db, relayVault: relayVault)
+        XCTAssertEqual(editModel.relayJwt, "plain-jwt-value")
+        XCTAssertEqual(editModel.relayAddr, "relay.example.com:4433")
+        XCTAssertEqual(editModel.relaySni, "relay.example.com")
+    }
+
+    func testSaveWithIsekaiLinkRelayQuicRequiresAllRelayFields() throws {
+        let db = try ProfileDatabase.inMemory()
+        let relayVault = RelayCredentialVault(keychainService: "test.relayvault.\(UUID().uuidString)")
+        let model = ProfileEditModel(profile: nil, db: db, relayVault: relayVault)
+        model.displayName = "dev box"
+        model.host = "127.0.0.1"
+        model.username = "tester"
+        model.transportPreference = .isekaiLinkRelayQuic
+        model.relayAddr = "relay.example.com:4433"
+        // relaySni/relayJwtは未入力のまま。
+
+        XCTAssertFalse(model.save())
+        XCTAssertNotNil(model.errorMessage)
+    }
+}
+
 /// `ios/Tests/TsshCoreTests/SshFixtureConfig.swift`と同内容だが、別テストターゲット
 /// (別モジュール)のため共有できず複製している。
 private struct E2EFixtureConfig: Decodable {

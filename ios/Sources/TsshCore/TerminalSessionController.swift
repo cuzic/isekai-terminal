@@ -53,6 +53,7 @@ private protocol ActiveTerminalSession: AnyObject {
 extension SshSession: ActiveTerminalSession {}
 extension HelperQuicSession: ActiveTerminalSession {}
 extension IsekaiStunP2pSession: ActiveTerminalSession {}
+extension IsekaiLinkRelaySession: ActiveTerminalSession {}
 
 /// Android版`ConnectionProfile.DEFAULT_STUN_SERVER`と同じ既定STUNサーバー
 /// (双方が同じSTUNサーバーを使う必要は無いため、単なるデフォルト値)。
@@ -74,6 +75,7 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     private let jumpPassword: String?
     private let db: ProfileDatabase
     private let vault: CredentialVault
+    private let relayVault: RelayCredentialVault
     private let trustStore: SshHostTrustStore
     private var session: ActiveTerminalSession?
 
@@ -83,6 +85,7 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         jumpPassword: String? = nil,
         db: ProfileDatabase = AppServices.shared.db,
         vault: CredentialVault = AppServices.shared.vault,
+        relayVault: RelayCredentialVault = AppServices.shared.relayVault,
         trustStore: SshHostTrustStore
     ) {
         self.profile = profile
@@ -90,6 +93,7 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         self.jumpPassword = jumpPassword
         self.db = db
         self.vault = vault
+        self.relayVault = relayVault
         self.trustStore = trustStore
     }
 
@@ -125,9 +129,11 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             connectHelperQuic(auth: auth, jump: jump, cols: cols, rows: rows, allowFallback: true)
         case .isekaiStunP2pQuic:
             connectIsekaiStunP2p(auth: auth, jump: jump, cols: cols, rows: rows)
-        case .tsshdQuic, .isekaiHelperQuicMultipath, .isekaiLinkRelayQuic:
-            // Android版は既に対応済み(Phase 9/10)だが、iOS版はPhase 1E-6〜1E-8で
-            // 順次対応予定(タスク#45〜#47、現時点では未実装)。
+        case .isekaiLinkRelayQuic:
+            connectIsekaiLinkRelay(auth: auth, jump: jump, cols: cols, rows: rows)
+        case .tsshdQuic, .isekaiHelperQuicMultipath:
+            // Android版は既に対応済み(Phase 9/10)だが、iOS版はPhase 1E-7〜1E-8で
+            // 順次対応予定(タスク#46〜#47、現時点では未実装)。
             fail(message: "この接続方式はiOS版ではまだ未対応です")
         }
     }
@@ -194,6 +200,29 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         )
     }
 
+    /// Phase 1E-6(#45): MASQUE relay P2P。Android版
+    /// `ConnectionProfile.toIsekaiLinkRelayConfig`相当。`profile.relayJwt`は
+    /// `relayVault`で暗号化して保存されているため、接続直前にここで復号する
+    /// (Android版`TerminalTabsViewModel.connectTab`の`decryptRelayJwt`呼び出しと
+    /// 同じタイミング)。復号失敗時(未設定・鍵ローテーション後等)はnilを返す。
+    func makeIsekaiLinkRelayConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> IsekaiLinkRelayConfig? {
+        guard let encryptedJwt = profile.relayJwt, let jwt = try? relayVault.decrypt(encryptedJwt) else {
+            return nil
+        }
+        return IsekaiLinkRelayConfig(
+            sshHost: profile.host,
+            sshPort: UInt16(profile.port),
+            username: profile.username,
+            auth: auth,
+            cols: cols,
+            rows: rows,
+            jump: jump,
+            relayAddr: profile.relayAddr ?? "",
+            relaySni: profile.relaySni ?? "",
+            relayJwt: jwt
+        )
+    }
+
     /// Android版`connect(tab, config)`相当。
     private func connectPlainSsh(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
         let config = makeSshConfig(auth: auth, jump: jump, cols: cols, rows: rows)
@@ -226,6 +255,21 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     private func connectIsekaiStunP2p(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
         let config = makeIsekaiStunP2pConfig(auth: auth, jump: jump, cols: cols, rows: rows)
         let newSession = createIsekaiStunP2pSession(config: config)
+        session = newSession
+        do {
+            try newSession.connect(callback: self)
+        } catch {
+            fail(message: "\(error)")
+        }
+    }
+
+    /// Android版`connectIsekaiLinkRelay(tab, config)`相当。
+    private func connectIsekaiLinkRelay(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
+        guard let config = makeIsekaiLinkRelayConfig(auth: auth, jump: jump, cols: cols, rows: rows) else {
+            fail(message: "relay JWTの復号に失敗しました")
+            return
+        }
+        let newSession = createIsekaiLinkRelaySession(config: config)
         session = newSession
         do {
             try newSession.connect(callback: self)

@@ -2,10 +2,10 @@ import SwiftUI
 
 /// Phase 1D/1E: Android版`ProfileEditScreen.kt`相当。label/host/port/username/
 /// 認証方式に加え、Phase 1Eで踏み台(ProxyJump)・ポートフォワード・SSH agent転送・
-/// 接続方式(プレーンSSH/isekai-helper経由QUIC/自動フォールバック/STUN+SSHランデブーP2P)
-/// を追加した。MASQUE relay/マルチパスの選択肢とそれぞれ専用の設定項目は、Rust側は
+/// 接続方式(プレーンSSH/isekai-helper経由QUIC/自動フォールバック/STUN+SSHランデブーP2P/
+/// MASQUE relay P2P)を追加した。マルチパスの選択肢と専用の設定項目は、Rust側は
 /// 既に対応済みだがiOS側のセッション接続ロジックがまだ無いため
-/// (`TerminalSessionController.connect()`参照)、後続タスク(#45〜#47)で追加する。
+/// (`TerminalSessionController.connect()`参照)、後続タスク(#46〜#47)で追加する。
 @MainActor
 public final class ProfileEditModel: ObservableObject {
     @Published public var displayName: String
@@ -32,20 +32,29 @@ public final class ProfileEditModel: ObservableObject {
     // Phase 1E-4: SSH agent forwarding。
     @Published public var enableAgentForward: Bool
 
-    // Phase 1A-9/1E-5: 接続方式。現時点でiOS側が実際に接続できるのは
-    // plainSsh/isekaiHelperQuic/auto/isekaiStunP2pQuicの4方式のみ(残りは#45〜#47で
-    // 追加予定)なので、Pickerの選択肢もこの4つに絞る。
+    // Phase 1A-9/1E-5/1E-6: 接続方式。現時点でiOS側が実際に接続できるのは
+    // plainSsh/isekaiHelperQuic/auto/isekaiStunP2pQuic/isekaiLinkRelayQuicの5方式のみ
+    // (残りは#46〜#47で追加予定)なので、Pickerの選択肢もこの5つに絞る。
     @Published public var transportPreference: StoredTransportPreference
     // Phase 1E-5: STUN+SSHランデブーP2P選択時のみ使うSTUNサーバー(host:port)。
     // 空ならAndroid版と同じ既定値(`defaultStunServer`)にフォールバックする。
     @Published public var stunServer: String
 
+    // Phase 1E-6: MASQUE relay P2P選択時のみ使う。relayJwtはUI上は平文で編集するが、
+    // 保存時に`relayVault`で暗号化してDBへ書き込む(Android版`encryptRelayJwt`/
+    // `decryptRelayJwt`と同じ方針)。
+    @Published public var relayAddr: String
+    @Published public var relaySni: String
+    @Published public var relayJwt: String
+
     private let db: ProfileDatabase
+    private let relayVault: RelayCredentialVault
     private let existingId: Int64?
     private let existingCreatedAt: Date
 
-    public init(profile: ConnectionProfile?, db: ProfileDatabase = AppServices.shared.db) {
+    public init(profile: ConnectionProfile?, db: ProfileDatabase = AppServices.shared.db, relayVault: RelayCredentialVault = AppServices.shared.relayVault) {
         self.db = db
+        self.relayVault = relayVault
         self.existingId = profile?.id
         self.existingCreatedAt = profile?.createdAt ?? Date()
         self.displayName = profile?.displayName ?? ""
@@ -69,6 +78,10 @@ public final class ProfileEditModel: ObservableObject {
 
         self.transportPreference = profile?.transportPreference ?? .plainSsh
         self.stunServer = profile?.stunServer ?? ""
+
+        self.relayAddr = profile?.relayAddr ?? ""
+        self.relaySni = profile?.relaySni ?? ""
+        self.relayJwt = profile?.relayJwt.flatMap { try? relayVault.decrypt($0) } ?? ""
     }
 
     public func loadAvailableKeys() {
@@ -140,6 +153,22 @@ public final class ProfileEditModel: ObservableObject {
             resolvedJumpKeyEntryId = jumpUseKeyAuth ? jumpSelectedKeyEntryId : nil
         }
 
+        var resolvedRelayJwt: String?
+        if transportPreference == .isekaiLinkRelayQuic {
+            guard !relayAddr.trimmingCharacters(in: .whitespaces).isEmpty,
+                  !relaySni.trimmingCharacters(in: .whitespaces).isEmpty,
+                  !relayJwt.trimmingCharacters(in: .whitespaces).isEmpty else {
+                errorMessage = "relayアドレス/SNI/JWTを全て入力してください"
+                return false
+            }
+            do {
+                resolvedRelayJwt = try relayVault.encrypt(relayJwt)
+            } catch {
+                errorMessage = "relay JWTの暗号化に失敗しました: \(error)"
+                return false
+            }
+        }
+
         var profile = ConnectionProfile(
             id: existingId,
             displayName: displayName,
@@ -156,6 +185,9 @@ public final class ProfileEditModel: ObservableObject {
             jumpUsername: resolvedJumpUsername,
             jumpKeyEntryId: resolvedJumpKeyEntryId,
             stunServer: stunServer.trimmingCharacters(in: .whitespaces).isEmpty ? nil : stunServer,
+            relayAddr: relayAddr.trimmingCharacters(in: .whitespaces).isEmpty ? nil : relayAddr,
+            relaySni: relaySni.trimmingCharacters(in: .whitespaces).isEmpty ? nil : relaySni,
+            relayJwt: resolvedRelayJwt,
             allowNonLoopbackForwardBind: allowNonLoopbackForwardBind
         )
         do {
@@ -226,6 +258,7 @@ public struct ProfileEditView: View {
                     Text("isekai-helper経由QUIC").tag(StoredTransportPreference.isekaiHelperQuic)
                     Text("自動(QUIC優先、失敗時SSHへ)").tag(StoredTransportPreference.auto)
                     Text("STUN+SSHランデブーP2P").tag(StoredTransportPreference.isekaiStunP2pQuic)
+                    Text("MASQUE relay P2P").tag(StoredTransportPreference.isekaiLinkRelayQuic)
                 }
                 .accessibilityIdentifier("transportPreferencePicker")
 
@@ -239,7 +272,25 @@ public struct ProfileEditView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Text("MASQUE relay/マルチパスは今後のアップデートで追加予定です。")
+                if model.transportPreference == .isekaiLinkRelayQuic {
+                    TextField("relayアドレス(host:port)", text: $model.relayAddr)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("relayAddrField")
+                    TextField("relay SNI", text: $model.relaySni)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("relaySniField")
+                    TextField("relay JWT", text: $model.relayJwt)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("relayJwtField")
+                    Text("MASQUE relay(bound-udp-server)経由で常時到達可能なP2P QUIC接続を行います。JWTは端末内で暗号化して保存します。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("マルチパスは今後のアップデートで追加予定です。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
