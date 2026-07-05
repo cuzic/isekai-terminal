@@ -221,38 +221,48 @@ class TerminalTabsViewModel(
      */
     private fun watchTab(tab: TabState) {
         watchJobs[tab.tabId] = viewModelScope.launch {
-            launch { tab.session.state.collect { updateSessionsSummary() } }
-            launch {
-                tab.session.pendingDownloadFile.collect { pending ->
-                    pending ?: return@collect
-                    executor.saveDownloadFile(pending.first, pending.second)
-                    tab.session.consumeDownloadFile()
+            launch { observeSummary(tab) }
+            launch { observeDownloads(tab) }
+            launch { observeFailover(tab) }
+            launch { observeConnectionTransitions(tab) }
+        }
+    }
+
+    private suspend fun observeSummary(tab: TabState) {
+        tab.session.state.collect { updateSessionsSummary() }
+    }
+
+    private suspend fun observeDownloads(tab: TabState) {
+        tab.session.pendingDownloadFile.collect { pending ->
+            pending ?: return@collect
+            executor.saveDownloadFile(pending.first, pending.second)
+            tab.session.consumeDownloadFile()
+        }
+    }
+
+    private suspend fun observeFailover(tab: TabState) {
+        tab.session.noViablePathEvent.collect {
+            if (tab.upstreamFailoverEnabledForCurrentSession) onWifiUpstreamBroken(tab)
+        }
+    }
+
+    private suspend fun observeConnectionTransitions(tab: TabState) {
+        var prevConnected = false
+        tab.uiState.collect { state ->
+            val connected = state.connected
+            if (connected && !prevConnected) {
+                executor.notifyConnected(state.currentHost ?: "")
+                if (tab.upstreamFailoverEnabledForCurrentSession) {
+                    executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(tab) }
                 }
+                maybeSendPostConnectCommands(tab)
+            } else if (!connected && prevConnected) {
+                executor.notifyDisconnected()
+                executor.releasePhysicalMultipathFds()
+                executor.unregisterUpstreamFailoverMonitor()
+                tab.upstreamFailoverEnabledForCurrentSession = false
             }
-            launch {
-                tab.session.noViablePathEvent.collect {
-                    if (tab.upstreamFailoverEnabledForCurrentSession) onWifiUpstreamBroken(tab)
-                }
-            }
-            launch {
-                var prevConnected = false
-                tab.uiState.collect { state ->
-                    val connected = state.connected
-                    if (connected && !prevConnected) {
-                        executor.notifyConnected(state.currentHost ?: "")
-                        if (tab.upstreamFailoverEnabledForCurrentSession) {
-                            executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(tab) }
-                        }
-                        maybeSendPostConnectCommands(tab)
-                    } else if (!connected && prevConnected) {
-                        executor.notifyDisconnected()
-                        executor.releasePhysicalMultipathFds()
-                        executor.unregisterUpstreamFailoverMonitor()
-                        tab.upstreamFailoverEnabledForCurrentSession = false
-                    }
-                    prevConnected = connected
-                }
-            }
+            prevConnected = connected
         }
     }
 
