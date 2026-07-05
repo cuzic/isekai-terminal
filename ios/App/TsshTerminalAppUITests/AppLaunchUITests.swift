@@ -114,4 +114,100 @@ final class AppLaunchUITests: XCTestCase {
         let newKeyRow = app.staticTexts[label]
         XCTAssertTrue(newKeyRow.waitForExistence(timeout: 5))
     }
+
+    func testEditProfileFlowUpdatesRow() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        let originalLabel = "UITest-Edit-\(UUID().uuidString.prefix(8))"
+        let renamedLabel = "UITest-Edited-\(UUID().uuidString.prefix(8))"
+
+        app.buttons["addProfileButton"].tap()
+        app.textFields["profileLabelField"].tap()
+        app.textFields["profileLabelField"].typeText(originalLabel)
+        app.textFields["profileHostField"].tap()
+        app.textFields["profileHostField"].typeText("127.0.0.1")
+        app.textFields["profileUsernameField"].tap()
+        app.textFields["profileUsernameField"].typeText("tester")
+        app.buttons["saveProfileButton"].tap()
+
+        let originalRow = app.staticTexts[originalLabel]
+        XCTAssertTrue(originalRow.waitForExistence(timeout: 5))
+
+        originalRow.swipeLeft()
+        app.buttons["編集"].firstMatch.tap()
+
+        let labelField = app.textFields["profileLabelField"]
+        XCTAssertTrue(labelField.waitForExistence(timeout: 5))
+        // 既存の値をクリアしてから新しいラベルを入力する
+        // (タップ直後はカーソルが末尾付近にある前提でbackspaceを繰り返す、
+        // XCUITestでテキストフィールドをクリアする定番の方法)。
+        labelField.tap()
+        if let existing = labelField.value as? String {
+            labelField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: existing.count))
+        }
+        labelField.typeText(renamedLabel)
+        app.buttons["saveProfileButton"].tap()
+
+        XCTAssertTrue(app.staticTexts[renamedLabel].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.staticTexts[originalLabel].exists)
+    }
+
+    func testKeyImportFlowViaPasteCreatesNewKeyRow() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        let label = "UITest-Import-\(UUID().uuidString.prefix(8))"
+
+        app.buttons["profileListMenu"].tap()
+        app.buttons["manageKeysMenuItem"].tap()
+
+        XCTAssertTrue(app.buttons["importKeyButton"].waitForExistence(timeout: 5))
+        app.buttons["importKeyButton"].tap()
+
+        let importLabelField = app.textFields["keyImportLabelField"]
+        XCTAssertTrue(importLabelField.waitForExistence(timeout: 5))
+        importLabelField.tap()
+        importLabelField.typeText(label)
+
+        // TextField(axis: .vertical)がtextFields/textViewsのどちらでアクセシビリティ
+        // 公開されるか(iOSバージョンにより異なりうる)不確定なため、要素種別を問わない
+        // クエリで探す。
+        let pasteField = app.descendants(matching: .any)["keyImportPasteField"]
+        XCTAssertTrue(pasteField.waitForExistence(timeout: 5))
+        pasteField.tap()
+        pasteField.typeText("-----BEGIN OPENSSH PRIVATE KEY-----\ndummy-for-ui-test\n-----END OPENSSH PRIVATE KEY-----\n")
+
+        app.buttons["saveImportedKeyButton"].tap()
+
+        XCTAssertTrue(app.staticTexts[label].waitForExistence(timeout: 5))
+    }
+
+    func testPasswordAuthProfileTapShowsPasswordPrompt() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        let label = "UITest-PwPrompt-\(UUID().uuidString.prefix(8))"
+
+        app.buttons["addProfileButton"].tap()
+        app.textFields["profileLabelField"].tap()
+        app.textFields["profileLabelField"].typeText(label)
+        app.textFields["profileHostField"].tap()
+        app.textFields["profileHostField"].typeText("127.0.0.1")
+        app.textFields["profileUsernameField"].tap()
+        app.textFields["profileUsernameField"].typeText("tester")
+        // 認証方式は既定でパスワード(鍵は選択しない)。
+        app.buttons["saveProfileButton"].tap()
+
+        let row = app.staticTexts[label]
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        row.tap()
+
+        let passwordField = app.secureTextFields["passwordField"]
+        XCTAssertTrue(passwordField.waitForExistence(timeout: 5))
+
+        // ターミナル本画面は未実装のため、ここではダイアログの出現だけ確認しキャンセルする。
+        app.navigationBars.buttons["キャンセル"].firstMatch.tap()
+        XCTAssertFalse(passwordField.exists)
+    }
 }
