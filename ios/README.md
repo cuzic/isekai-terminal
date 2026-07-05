@@ -4,6 +4,30 @@
 Swift Package Manager パッケージ雛形です。背景・設計方針は `PLAN.md` の「Phase Y: iOS対応
 (Rust + Swift)」節を参照してください。
 
+## Linux上でのロジック層テスト(`swift test`、macOS/Xcode不要)
+
+`Sources/TsshCoreLogic`(UIKit/SwiftUI/GRDB/Keychainに依存しない純粋なビジネスロジック層)
+は、macOS/Xcodeが無くてもLinux上でネイティブに`swift test`できます(詳細は`PLAN.md`
+「Phase Y」節の「iOS Linux CI: TsshCoreLogicの切り出し」参照)。
+
+```bash
+# 初回のみ: rust-core/scripts/build-linux-swift-ffi.sh がRustコアをLinuxネイティブビルドし、
+# UniFFI Swiftバインディングを生成し、Linux向けFFIリンク設定(Sources/TsshCoreFFILinux)を用意する。
+bash rust-core/scripts/build-linux-swift-ffi.sh
+
+cd ios
+export LIBRARY_PATH="$(pwd)/Frameworks/linux:${LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$(pwd)/Frameworks/linux:${LD_LIBRARY_PATH:-}"
+swift test
+```
+
+`ios/Package.swift`はホストOSが Linux の場合、マニフェスト自体から `TsshCore`/`TsshCoreTests`
+(Apple専用、UIKit/GRDB/Keychainに依存)を除外するため、上記コマンドは`TsshCoreLogic`/
+`TsshCoreLogicTests`だけを解決・実行します。実iOSアプリ全体のビルド・シミュレータ実行は
+引き続き下記の macOS 手順(または `.github/workflows/ios-rust-core-check.yml` /
+`ios-app-build-check.yml`)が必要です。CIでは `.github/workflows/ios-logic-linux-check.yml`
+(`ubuntu-24.04`ランナー)がこのレーンを担当します。
+
 ## 現状(Phase 0 の到達点)
 
 - **Swiftバインディング生成は Linux 開発機で検証済み**(`rust-core/scripts/generate-swift-bindings.sh`)。
