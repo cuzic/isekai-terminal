@@ -2132,9 +2132,25 @@ MVPスコープ部分をSwiftUIへ移植した。
   fixtureの`authorized_keys`はsshd起動後も接続の都度再読込されるため、
   テスト実行時に動的に追記できることを利用した。既存の`SshVerticalSliceTests.swift`の
   fixture読込ロジックは`SshFixtureConfig.swift`へ共通化。
-- **未着手(次のタスク)**: `KeyListModel`/`KeyImportModel`(Keychainに触れるため
-  `TsshTerminalAppTests`への追加が必要)・`TsshTerminalAppUITests`(XCUITest、
-  真のUI駆動テスト用の新規ターゲット)・ターミナル本画面の実装。
+- **未着手(次のタスク)**: `TsshTerminalAppUITests`(XCUITest、真のUI駆動テスト用の
+  新規ターゲット)・ターミナル本画面の実装。
+
+**CIで発見・修正した2件の不具合(2026-07-04)**:
+1. **アクター分離エラー**: `ProfileListView`/`KeyListView`/`KeyImportView`の`init`が
+   `model: XxxModel = XxxModel()`という形でデフォルト引数を持たせていたが、
+   デフォルト引数式は呼び出し側の非isolatedなコンテキストで評価されるため、
+   `@MainActor`なモデルのinitを呼べずコンパイルエラーになった
+   (`ProfileEditView`は`StateObject(wrappedValue:)`のautoclosureに包まれた形で
+   init本体内に構築していたため問題が出なかった)。デフォルト値を廃止し、
+   呼び出し側(`body`、MainActor)で明示的に構築するよう修正。
+2. **KeyManagerの実sshd認証テストが素通りしていた**: `ios-ssh-vertical-slice-check.yml`
+   は`-only-testing:TsshCoreTests/SshVerticalSliceTests`で絞り込んでいたため、
+   fixtureを使う`KeyManagerTests.testGeneratedKeyAuthenticatesAgainstRealSshd`は
+   一度も実行されず(`ios-rust-core-check.yml`側はfixtureが無く常にXCTSkip)、
+   「生成した鍵が実際にsshdで認証できる」という最重要の検証が実質未実施だった。
+   `-only-testing`にこのテストを追加して修正し、実行後に実際にpass
+   (0.475秒、実接続)することを確認した。これによりAndroid版の
+   `AUTH_MAGIC`仕様不一致の修正が正しいことも実証された。
 
 ---
 
