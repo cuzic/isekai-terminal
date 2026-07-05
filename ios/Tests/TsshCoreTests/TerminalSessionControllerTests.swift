@@ -270,6 +270,41 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertTrue(message.contains("復号"))
     }
 
+    // MARK: - Phase 1E-7(#46): Tailscale⇔直接アドレスのマルチパス(config構築のみ、実接続なし)
+
+    func testMakeMultipathHelperQuicConfigMapsDirectAndCellularAddresses() throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "tailscale.example.com", port: 22, username: "user",
+            directAddress: "203.0.113.5:4433",
+            cellularRemoteAddress: "[2001:db8::1]:4433"
+        )
+        let controller = try makeControllerWithProfile(profile)
+
+        let config = controller.makeMultipathHelperQuicConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+        XCTAssertEqual(config.sshHost, "tailscale.example.com")
+        XCTAssertEqual(config.directHost, "203.0.113.5:4433")
+        XCTAssertEqual(config.cellularRemoteHost, "[2001:db8::1]:4433")
+        XCTAssertNil(config.wifiFd)
+        XCTAssertNil(config.wifiLocalIp)
+        XCTAssertNil(config.cellularFd)
+        XCTAssertNil(config.cellularLocalIp)
+    }
+
+    func testMakeMultipathHelperQuicConfigTreatsBlankDirectAddressAsNil() throws {
+        for directAddress in [nil, "", "   "] {
+            let profile = ConnectionProfile(
+                displayName: "test", host: "example.com", port: 22, username: "user",
+                directAddress: directAddress
+            )
+            let controller = try makeControllerWithProfile(profile)
+
+            let config = controller.makeMultipathHelperQuicConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+            XCTAssertNil(config.directHost)
+        }
+    }
+
     func testConnectWithUnsupportedTransportPreferenceFails() async throws {
         let profile = ConnectionProfile(
             displayName: "test", host: "example.com", port: 22, username: "user",

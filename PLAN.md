@@ -2398,6 +2398,25 @@ Swift側にも実装した:
   `Tests/TsshCoreTests`側には「relayJwt未設定でnilを返す」経路(Keychainに触れない)
   だけを残した。
 
+### Phase 1E-7(#46)実装メモ(2026-07-05、Tailscale⇔直接アドレスのマルチパス)
+
+`MultipathHelperQuicConfig`は`directHost`/`cellularRemoteHost`(Tailscale⇔直接
+アドレス切替、このタスクの対象)と`wifiFd`/`wifiLocalIp`/`cellularFd`/
+`cellularLocalIp`(物理Wi-Fi/セルラー無線への同時バインド、#47の対象)が同じ構造体に
+混在している。Android版`ProfileEditScreen.kt`を読んだところ、**Android自身の物理
+マルチパスも現状noq側の既知バグ(noq issue #738、`open_path()`にlocal_ip明示指定した
+経路でPATH_RESPONSEが届かずvalidation failedになる)により事実上no-op**であることが
+判明した(`BuildConfig.ENABLE_EXPERIMENTAL_PHYSICAL_MULTIPATH`でdebugビルドのみ
+表示、リリースビルドは非表示)。このため#47を「低優先」とした当初の判断は妥当であり、
+iOS版もこのタスクでは`wifiFd`等を常に`nil`にした(#30/#44/#45と同じ、config構築を
+ネットワーク呼び出しから分離してunit testableにするパターンを踏襲)。
+
+`TransportPreference.tsshdQuic`はAndroid版では対応済みだが(`tsshd`バイナリ経由の
+別実装、Phase 5B)、#40〜#54のAndroid/iOS機能パリティ調査ではisekai-helper系を優先
+したため対象外にしてあり、タスク番号が無い。iOS版`TerminalSessionController.connect()`
+では`.tsshdQuic`のみ引き続き「未対応」の`.failed`にしている(意図的な既知ギャップ、
+新しいタスクではない)。
+
 ---
 
 ## 実装順序

@@ -3,9 +3,9 @@ import SwiftUI
 /// Phase 1D/1E: Android版`ProfileEditScreen.kt`相当。label/host/port/username/
 /// 認証方式に加え、Phase 1Eで踏み台(ProxyJump)・ポートフォワード・SSH agent転送・
 /// 接続方式(プレーンSSH/isekai-helper経由QUIC/自動フォールバック/STUN+SSHランデブーP2P/
-/// MASQUE relay P2P)を追加した。マルチパスの選択肢と専用の設定項目は、Rust側は
-/// 既に対応済みだがiOS側のセッション接続ロジックがまだ無いため
-/// (`TerminalSessionController.connect()`参照)、後続タスク(#46〜#47)で追加する。
+/// MASQUE relay P2P/Tailscale⇔直接アドレスのマルチパス)を追加した。物理Wi-Fi/セルラー
+/// マルチパス(#47、実験的・低優先。Android版もnoq側既知バグにより現状事実上no-op)は
+/// まだ追加していない。
 @MainActor
 public final class ProfileEditModel: ObservableObject {
     @Published public var displayName: String
@@ -32,9 +32,10 @@ public final class ProfileEditModel: ObservableObject {
     // Phase 1E-4: SSH agent forwarding。
     @Published public var enableAgentForward: Bool
 
-    // Phase 1A-9/1E-5/1E-6: 接続方式。現時点でiOS側が実際に接続できるのは
-    // plainSsh/isekaiHelperQuic/auto/isekaiStunP2pQuic/isekaiLinkRelayQuicの5方式のみ
-    // (残りは#46〜#47で追加予定)なので、Pickerの選択肢もこの5つに絞る。
+    // Phase 1A-9/1E-5/1E-6/1E-7: 接続方式。現時点でiOS側が実際に接続できるのは
+    // plainSsh/isekaiHelperQuic/auto/isekaiStunP2pQuic/isekaiLinkRelayQuic/
+    // isekaiHelperQuicMultipathの6方式のみ(残りはtsshdQuicと#47で追加予定)なので、
+    // Pickerの選択肢もこの6つに絞る。
     @Published public var transportPreference: StoredTransportPreference
     // Phase 1E-5: STUN+SSHランデブーP2P選択時のみ使うSTUNサーバー(host:port)。
     // 空ならAndroid版と同じ既定値(`defaultStunServer`)にフォールバックする。
@@ -46,6 +47,10 @@ public final class ProfileEditModel: ObservableObject {
     @Published public var relayAddr: String
     @Published public var relaySni: String
     @Published public var relayJwt: String
+
+    // Phase 1E-7: Tailscale⇔直接アドレスのマルチパス選択時のみ使う。空/未設定なら
+    // multipath化されずpath0(host欄、通常Tailscale経由)のみで動く。
+    @Published public var directAddress: String
 
     private let db: ProfileDatabase
     private let relayVault: RelayCredentialVault
@@ -82,6 +87,8 @@ public final class ProfileEditModel: ObservableObject {
         self.relayAddr = profile?.relayAddr ?? ""
         self.relaySni = profile?.relaySni ?? ""
         self.relayJwt = profile?.relayJwt.flatMap { try? relayVault.decrypt($0) } ?? ""
+
+        self.directAddress = profile?.directAddress ?? ""
     }
 
     public func loadAvailableKeys() {
@@ -179,6 +186,7 @@ public final class ProfileEditModel: ObservableObject {
             createdAt: existingCreatedAt,
             enableAgentForward: enableAgentForward,
             transportPreference: transportPreference,
+            directAddress: directAddress.trimmingCharacters(in: .whitespaces).isEmpty ? nil : directAddress,
             forwards: forwards,
             jumpHost: resolvedJumpHost,
             jumpPort: resolvedJumpPort,
@@ -259,6 +267,7 @@ public struct ProfileEditView: View {
                     Text("自動(QUIC優先、失敗時SSHへ)").tag(StoredTransportPreference.auto)
                     Text("STUN+SSHランデブーP2P").tag(StoredTransportPreference.isekaiStunP2pQuic)
                     Text("MASQUE relay P2P").tag(StoredTransportPreference.isekaiLinkRelayQuic)
+                    Text("Tailscale⇔直接アドレスのマルチパス").tag(StoredTransportPreference.isekaiHelperQuicMultipath)
                 }
                 .accessibilityIdentifier("transportPreferencePicker")
 
@@ -290,7 +299,17 @@ public struct ProfileEditView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Text("マルチパスは今後のアップデートで追加予定です。")
+                if model.transportPreference == .isekaiHelperQuicMultipath {
+                    TextField("直接到達アドレス(path1、任意)", text: $model.directAddress)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("directAddressField")
+                    Text("上の「ホスト」欄(通常Tailscale経由アドレス)と、こちらの直接到達可能なアドレスの両方を同時に維持し、片方が不安定でも即座にもう片方へ切り替えます。未入力なら通常のisekai-helper経由QUICと同じ動作になります。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("物理Wi-Fi/セルラーマルチパスは今後のアップデートで追加予定です。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

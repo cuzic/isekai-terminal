@@ -54,6 +54,7 @@ extension SshSession: ActiveTerminalSession {}
 extension HelperQuicSession: ActiveTerminalSession {}
 extension IsekaiStunP2pSession: ActiveTerminalSession {}
 extension IsekaiLinkRelaySession: ActiveTerminalSession {}
+extension MultipathHelperQuicSession: ActiveTerminalSession {}
 
 /// Android版`ConnectionProfile.DEFAULT_STUN_SERVER`と同じ既定STUNサーバー
 /// (双方が同じSTUNサーバーを使う必要は無いため、単なるデフォルト値)。
@@ -131,9 +132,12 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             connectIsekaiStunP2p(auth: auth, jump: jump, cols: cols, rows: rows)
         case .isekaiLinkRelayQuic:
             connectIsekaiLinkRelay(auth: auth, jump: jump, cols: cols, rows: rows)
-        case .tsshdQuic, .isekaiHelperQuicMultipath:
-            // Android版は既に対応済み(Phase 9/10)だが、iOS版はPhase 1E-7〜1E-8で
-            // 順次対応予定(タスク#46〜#47、現時点では未実装)。
+        case .isekaiHelperQuicMultipath:
+            connectMultipathHelperQuic(auth: auth, jump: jump, cols: cols, rows: rows)
+        case .tsshdQuic:
+            // Android版は対応済み(tsshdバイナリ経由の別実装、Phase 5B)だが、
+            // iOS版のAndroid機能パリティ調査(#40〜#54)ではisekai-helper系を優先し
+            // tsshd系は対象外にした(タスク未採番、優先度が低いため現時点では未実装)。
             fail(message: "この接続方式はiOS版ではまだ未対応です")
         }
     }
@@ -223,6 +227,31 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         )
     }
 
+    /// Phase 1E-7(#46): Tailscale⇔直接アドレスのマルチパス。Android版
+    /// `ConnectionProfile.toMultipathHelperQuicConfig`相当。`profile.directAddress`
+    /// (path1、任意)が空/未設定ならmultipath化されずpath0のみで動く(通常のhelper QUICと
+    /// 同等の耐性、Rust側のドキュメント参照)。物理Wi-Fi/セルラー無線への同時バインド
+    /// (`wifiFd`/`cellularFd`等、#47の対象)は現時点では未実装のため常にnilを渡す
+    /// (Android版もnoq側の既知バグ(issue #738)により現在は事実上no-opで、
+    /// 効果があるのはpath0/path1のTailscale⇔直接アドレス切替のみ)。
+    func makeMultipathHelperQuicConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> MultipathHelperQuicConfig {
+        MultipathHelperQuicConfig(
+            sshHost: profile.host,
+            sshPort: UInt16(profile.port),
+            directHost: profile.directAddress?.trimmingCharacters(in: .whitespaces).isEmpty == false ? profile.directAddress : nil,
+            cellularRemoteHost: profile.cellularRemoteAddress?.trimmingCharacters(in: .whitespaces).isEmpty == false ? profile.cellularRemoteAddress : nil,
+            wifiFd: nil,
+            wifiLocalIp: nil,
+            cellularFd: nil,
+            cellularLocalIp: nil,
+            username: profile.username,
+            auth: auth,
+            cols: cols,
+            rows: rows,
+            jump: jump
+        )
+    }
+
     /// Android版`connect(tab, config)`相当。
     private func connectPlainSsh(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
         let config = makeSshConfig(auth: auth, jump: jump, cols: cols, rows: rows)
@@ -270,6 +299,18 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             return
         }
         let newSession = createIsekaiLinkRelaySession(config: config)
+        session = newSession
+        do {
+            try newSession.connect(callback: self)
+        } catch {
+            fail(message: "\(error)")
+        }
+    }
+
+    /// Android版`connectMultipathHelperQuic(tab, config)`相当。
+    private func connectMultipathHelperQuic(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
+        let config = makeMultipathHelperQuicConfig(auth: auth, jump: jump, cols: cols, rows: rows)
+        let newSession = createMultipathHelperQuicSession(config: config)
         session = newSession
         do {
             try newSession.connect(callback: self)

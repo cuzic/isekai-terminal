@@ -294,6 +294,52 @@ final class ProfileEditModelTests: XCTestCase {
         XCTAssertEqual(model.stunServer, "stun.example.com:3478")
     }
 
+    // MARK: - Phase 1E-7(#46): Tailscale⇔直接アドレスのマルチパス
+
+    func testSavePersistsDirectAddress() throws {
+        let db = try ProfileDatabase.inMemory()
+        let model = ProfileEditModel(profile: nil, db: db)
+        model.displayName = "dev box"
+        model.host = "tailscale.example.com"
+        model.username = "tester"
+        model.transportPreference = .isekaiHelperQuicMultipath
+        model.directAddress = "203.0.113.5:4433"
+
+        XCTAssertTrue(model.save())
+
+        let saved = try XCTUnwrap(try db.fetchAllProfiles().first)
+        XCTAssertEqual(saved.directAddress, "203.0.113.5:4433")
+    }
+
+    func testSaveWithBlankDirectAddressPersistsNil() throws {
+        let db = try ProfileDatabase.inMemory()
+        let model = ProfileEditModel(profile: nil, db: db)
+        model.displayName = "dev box"
+        model.host = "127.0.0.1"
+        model.username = "tester"
+        model.directAddress = "   "
+
+        XCTAssertTrue(model.save())
+
+        let saved = try XCTUnwrap(try db.fetchAllProfiles().first)
+        XCTAssertNil(saved.directAddress)
+    }
+
+    func testEditingExistingProfileRestoresDirectAddress() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profile = ConnectionProfile(
+            displayName: "existing", host: "tailscale.example.com", port: 22, username: "user",
+            transportPreference: .isekaiHelperQuicMultipath,
+            directAddress: "203.0.113.5:4433"
+        )
+        try db.insert(profile: &profile)
+
+        let model = ProfileEditModel(profile: profile, db: db)
+
+        XCTAssertEqual(model.transportPreference, .isekaiHelperQuicMultipath)
+        XCTAssertEqual(model.directAddress, "203.0.113.5:4433")
+    }
+
     // MARK: - 既存プロファイルの編集時の初期値復元
 
     func testEditingExistingProfileRestoresJumpAndForwardFields() throws {
