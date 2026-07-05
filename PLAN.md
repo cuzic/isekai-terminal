@@ -2235,6 +2235,31 @@ Phase 1D最後の主要ピース。SSH接続・VTE画面描画・日本語IME統
   検証を追加(commit/backspace/ctrlArmedの各経路)。実際のSSH接続を伴う
   ターミナル画面自体のXCUITestはまだ追加していない(実sshdへの接続待ちを伴う
   ため、CI fixtureとの組み合わせは次の課題)。
+- **`TerminalSessionControllerE2ETests`(実sshd接続の統合テスト)**:
+  鍵認証プロファイル(CredentialVault経由の秘密鍵解決)でCI fixtureへ実際に
+  接続し、`onConnected`/`echo`コマンド送信/`onScreenUpdate`受信/`onDisconnected`が
+  一通り動くことを検証する。**CredentialVault(Keychain)に触れるため、
+  最初は素の`TsshCoreTests`に置いてしまい`errSecMissingEntitlement`(-34018)で
+  CI red化した**(`CredentialVaultTests.swift`で既に文書化されていた制約を
+  また踏んだ)。アプリホスト型の`TsshTerminalAppTests`へ移動し(fixtureを
+  共有できないモジュール境界のため、`SshFixtureConfig`相当を最小限複製)、
+  `ios-app-build-check.yml`側でもCI fixtureを起動するよう追加した
+  (`ios-ssh-vertical-slice-check.yml`とはポート2298/2299で分離)。
+- **CIで発見・修正した追加の3件の不具合(ターミナル本画面実装時)**:
+  1. `TerminalUIState()`を`TerminalSessionController`(非isolated)のstored
+     property初期値として構築しようとし、以前のView初期化子デフォルト引数と
+     同種のactor分離エラーになった → `TerminalUIState.init()`を`nonisolated`に。
+  2. `TerminalAccessoryBar`の`inputView`プロパティが`UIResponder.inputView`と
+     名前が衝突し「'strong'プロパティを'weak'でオーバーライドできない」エラー
+     になった → `imeInputView`へリネーム。
+  3. `TerminalIMEInputView`から`inputAccessoryView`を外部から設定しようとしたが
+     `UIResponder.inputAccessoryView`は既定でget-onlyだった → overrideして
+     get/set可能にした。
+
+**Phase 1Dのまとめ**: プロファイル管理・鍵管理・ターミナル本画面という
+iOS版の主要な画面が一通り実装され、全てCI(iOS Simulator)で検証済み。
+真のUI駆動テスト(XCUITest)基盤も新設した。残る主要タスクはPhase 1C
+(SessionSupervisor・バックグラウンド配線・trzsz・resume・実機総合回帰)。
 
 ---
 
