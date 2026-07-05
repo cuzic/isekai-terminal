@@ -2358,6 +2358,22 @@ unit test、`TerminalSessionControllerTests.swift`)に限定し、**実際のQUI
 別途用意する、(b) 実機(iPhone)でユーザーが手動検証する、のいずれかが必要になる
 (Android版のSTUN P2P/relay P2P/物理マルチパスが実機未検証のままな理由と同種)。
 
+### Phase 1E-5(#44)実装メモ(2026-07-05、STUN+SSHランデブーP2P)
+
+#30と全く同じパターンで実装: `TerminalSessionController`に
+`makeIsekaiStunP2pConfig`(config構築、ネットワーク非依存でunit testable)+
+`connectIsekaiStunP2p`(`createIsekaiStunP2pSession`呼び出し)を追加し、
+`IsekaiStunP2pSession`も`ActiveTerminalSession`へ事後適合させた。
+`ProfileEditView`にも「接続方式」Pickerへ選択肢を追加し、選択時のみ
+`stunServer`(host:port)入力欄を表示する(空欄ならAndroid版と同じ既定STUN
+サーバー`stun.l.google.com:19302`にフォールバック、Android版
+`ConnectionProfile.DEFAULT_STUN_SERVER`と同じ値)。E2E検証の限界は#30と同一
+(STUN穴あけ+isekai-helperブートストラップの実接続性はmacOS CI fixtureでは
+検証できない)ため、テストはconfig構築ロジックのみに限定した。
+
+残り#45(MASQUE relay)・#46(マルチパス)・#47(物理マルチパス、低優先)も
+同じパターンで実装できる見込み。
+
 ---
 
 ## 実装順序

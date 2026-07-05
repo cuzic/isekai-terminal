@@ -1,9 +1,11 @@
 import SwiftUI
 
 /// Phase 1D/1E: Android版`ProfileEditScreen.kt`相当。label/host/port/username/
-/// 認証方式に加え、Phase 1Eで踏み台(ProxyJump)・ポートフォワード・SSH agent転送を
-/// 追加した。relay/STUN P2P/マルチパス等のトランスポート方式選択は後続タスク
-/// (#44〜#47)で追加する。
+/// 認証方式に加え、Phase 1Eで踏み台(ProxyJump)・ポートフォワード・SSH agent転送・
+/// 接続方式(プレーンSSH/isekai-helper経由QUIC/自動フォールバック/STUN+SSHランデブーP2P)
+/// を追加した。MASQUE relay/マルチパスの選択肢とそれぞれ専用の設定項目は、Rust側は
+/// 既に対応済みだがiOS側のセッション接続ロジックがまだ無いため
+/// (`TerminalSessionController.connect()`参照)、後続タスク(#45〜#47)で追加する。
 @MainActor
 public final class ProfileEditModel: ObservableObject {
     @Published public var displayName: String
@@ -29,6 +31,14 @@ public final class ProfileEditModel: ObservableObject {
 
     // Phase 1E-4: SSH agent forwarding。
     @Published public var enableAgentForward: Bool
+
+    // Phase 1A-9/1E-5: 接続方式。現時点でiOS側が実際に接続できるのは
+    // plainSsh/isekaiHelperQuic/auto/isekaiStunP2pQuicの4方式のみ(残りは#45〜#47で
+    // 追加予定)なので、Pickerの選択肢もこの4つに絞る。
+    @Published public var transportPreference: StoredTransportPreference
+    // Phase 1E-5: STUN+SSHランデブーP2P選択時のみ使うSTUNサーバー(host:port)。
+    // 空ならAndroid版と同じ既定値(`defaultStunServer`)にフォールバックする。
+    @Published public var stunServer: String
 
     private let db: ProfileDatabase
     private let existingId: Int64?
@@ -56,6 +66,9 @@ public final class ProfileEditModel: ObservableObject {
         self.allowNonLoopbackForwardBind = profile?.allowNonLoopbackForwardBind ?? false
 
         self.enableAgentForward = profile?.enableAgentForward ?? false
+
+        self.transportPreference = profile?.transportPreference ?? .plainSsh
+        self.stunServer = profile?.stunServer ?? ""
     }
 
     public func loadAvailableKeys() {
@@ -137,10 +150,12 @@ public final class ProfileEditModel: ObservableObject {
             createdAt: existingCreatedAt,
             enableAgentForward: enableAgentForward,
             forwards: forwards,
+            transportPreference: transportPreference,
             jumpHost: resolvedJumpHost,
             jumpPort: resolvedJumpPort,
             jumpUsername: resolvedJumpUsername,
             jumpKeyEntryId: resolvedJumpKeyEntryId,
+            stunServer: stunServer.trimmingCharacters(in: .whitespaces).isEmpty ? nil : stunServer,
             allowNonLoopbackForwardBind: allowNonLoopbackForwardBind
         )
         do {
@@ -203,6 +218,30 @@ public struct ProfileEditView: View {
                 if model.useKeyAuth {
                     keyPicker(selection: $model.selectedKeyEntryId, identifier: "keyEntryPicker")
                 }
+            }
+
+            Section("接続方式") {
+                Picker("接続方式", selection: $model.transportPreference) {
+                    Text("プレーンSSH").tag(StoredTransportPreference.plainSsh)
+                    Text("isekai-helper経由QUIC").tag(StoredTransportPreference.isekaiHelperQuic)
+                    Text("自動(QUIC優先、失敗時SSHへ)").tag(StoredTransportPreference.auto)
+                    Text("STUN+SSHランデブーP2P").tag(StoredTransportPreference.isekaiStunP2pQuic)
+                }
+                .accessibilityIdentifier("transportPreferencePicker")
+
+                if model.transportPreference == .isekaiStunP2pQuic {
+                    TextField("STUNサーバー(host:port)", text: $model.stunServer)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("stunServerField")
+                    Text("空欄なら既定のパブリックSTUNサーバーを使います。双方が同じサーバーを使う必要はありません。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("MASQUE relay/マルチパスは今後のアップデートで追加予定です。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("踏み台(ProxyJump)") {

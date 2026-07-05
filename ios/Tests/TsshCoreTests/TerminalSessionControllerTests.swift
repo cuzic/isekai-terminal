@@ -202,10 +202,38 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(config.jump, jump)
     }
 
+    // MARK: - Phase 1E-5(#44): STUN+SSHランデブーP2P(config構築のみ、実接続なし)
+
+    func testMakeIsekaiStunP2pConfigUsesProfileStunServerWhenSet() throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 22, username: "user",
+            stunServer: "stun.example.com:3478"
+        )
+        let controller = try makeControllerWithProfile(profile)
+
+        let config = controller.makeIsekaiStunP2pConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+        XCTAssertEqual(config.stunServer, "stun.example.com:3478")
+    }
+
+    func testMakeIsekaiStunP2pConfigFallsBackToDefaultWhenStunServerIsNilOrBlank() throws {
+        for stunServer in [nil, "", "   "] {
+            let profile = ConnectionProfile(
+                displayName: "test", host: "example.com", port: 22, username: "user",
+                stunServer: stunServer
+            )
+            let controller = try makeControllerWithProfile(profile)
+
+            let config = controller.makeIsekaiStunP2pConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+            XCTAssertEqual(config.stunServer, defaultStunServer)
+        }
+    }
+
     func testConnectWithUnsupportedTransportPreferenceFails() async throws {
         let profile = ConnectionProfile(
             displayName: "test", host: "example.com", port: 22, username: "user",
-            transportPreference: .isekaiStunP2pQuic
+            transportPreference: .isekaiLinkRelayQuic
         )
         let controller = try makeControllerWithProfile(profile)
 

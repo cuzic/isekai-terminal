@@ -52,6 +52,11 @@ private protocol ActiveTerminalSession: AnyObject {
 }
 extension SshSession: ActiveTerminalSession {}
 extension HelperQuicSession: ActiveTerminalSession {}
+extension IsekaiStunP2pSession: ActiveTerminalSession {}
+
+/// Android版`ConnectionProfile.DEFAULT_STUN_SERVER`と同じ既定STUNサーバー
+/// (双方が同じSTUNサーバーを使う必要は無いため、単なるデフォルト値)。
+let defaultStunServer = "stun.l.google.com:19302"
 
 /// Phase 1D: `ConnectionProfile`からSSH接続を開始し、`SessionCallback`を実装して
 /// Rust側からのイベントを`TerminalUIState`へ橋渡しする。
@@ -118,9 +123,11 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             connectHelperQuic(auth: auth, jump: jump, cols: cols, rows: rows, allowFallback: false)
         case .auto:
             connectHelperQuic(auth: auth, jump: jump, cols: cols, rows: rows, allowFallback: true)
-        case .tsshdQuic, .isekaiHelperQuicMultipath, .isekaiStunP2pQuic, .isekaiLinkRelayQuic:
-            // Android版は既に対応済み(Phase 9/10)だが、iOS版はPhase 1E-5〜1E-8で
-            // 順次対応予定(タスク#44〜#47、現時点では未実装)。
+        case .isekaiStunP2pQuic:
+            connectIsekaiStunP2p(auth: auth, jump: jump, cols: cols, rows: rows)
+        case .tsshdQuic, .isekaiHelperQuicMultipath, .isekaiLinkRelayQuic:
+            // Android版は既に対応済み(Phase 9/10)だが、iOS版はPhase 1E-6〜1E-8で
+            // 順次対応予定(タスク#45〜#47、現時点では未実装)。
             fail(message: "この接続方式はiOS版ではまだ未対応です")
         }
     }
@@ -169,6 +176,24 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         )
     }
 
+    /// Phase 1E-5(#44): STUN+SSHランデブーP2P。Android版
+    /// `ConnectionProfile.toIsekaiStunP2pConfig`相当。`profile.stunServer`が
+    /// 未設定/空文字なら`defaultStunServer`を使う(Android版`DEFAULT_STUN_SERVER`と同じ方針、
+    /// 双方が同じSTUNサーバーを使う必要は無いため単なるデフォルト値)。
+    func makeIsekaiStunP2pConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> IsekaiStunP2pConfig {
+        let stunServer = profile.stunServer?.trimmingCharacters(in: .whitespaces)
+        return IsekaiStunP2pConfig(
+            sshHost: profile.host,
+            sshPort: UInt16(profile.port),
+            username: profile.username,
+            auth: auth,
+            cols: cols,
+            rows: rows,
+            jump: jump,
+            stunServer: (stunServer?.isEmpty ?? true) ? defaultStunServer : stunServer!
+        )
+    }
+
     /// Android版`connect(tab, config)`相当。
     private func connectPlainSsh(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
         let config = makeSshConfig(auth: auth, jump: jump, cols: cols, rows: rows)
@@ -192,6 +217,18 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             } else {
                 try newSession.connect(callback: self)
             }
+        } catch {
+            fail(message: "\(error)")
+        }
+    }
+
+    /// Android版`connectIsekaiStunP2p(tab, config)`相当。
+    private func connectIsekaiStunP2p(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
+        let config = makeIsekaiStunP2pConfig(auth: auth, jump: jump, cols: cols, rows: rows)
+        let newSession = createIsekaiStunP2pSession(config: config)
+        session = newSession
+        do {
+            try newSession.connect(callback: self)
         } catch {
             fail(message: "\(error)")
         }

@@ -214,6 +214,86 @@ final class ProfileEditModelTests: XCTestCase {
         XCTAssertTrue(saved.enableAgentForward)
     }
 
+    // MARK: - Phase 1A-9(#30): 接続方式(transportPreference)
+
+    func testDefaultTransportPreferenceIsPlainSsh() {
+        let model = ProfileEditModel(profile: nil, db: try! ProfileDatabase.inMemory())
+        XCTAssertEqual(model.transportPreference, .plainSsh)
+    }
+
+    func testSavePersistsTransportPreference() throws {
+        let db = try ProfileDatabase.inMemory()
+        let model = ProfileEditModel(profile: nil, db: db)
+        model.displayName = "dev box"
+        model.host = "127.0.0.1"
+        model.username = "tester"
+        model.transportPreference = .isekaiHelperQuic
+
+        XCTAssertTrue(model.save())
+
+        let saved = try XCTUnwrap(try db.fetchAllProfiles().first)
+        XCTAssertEqual(saved.transportPreference, .isekaiHelperQuic)
+    }
+
+    func testEditingExistingProfileRestoresTransportPreference() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profile = ConnectionProfile(
+            displayName: "existing", host: "example.com", port: 22, username: "user",
+            transportPreference: .auto
+        )
+        try db.insert(profile: &profile)
+
+        let model = ProfileEditModel(profile: profile, db: db)
+
+        XCTAssertEqual(model.transportPreference, .auto)
+    }
+
+    // MARK: - Phase 1E-5(#44): STUN+SSHランデブーP2P
+
+    func testSavePersistsStunServer() throws {
+        let db = try ProfileDatabase.inMemory()
+        let model = ProfileEditModel(profile: nil, db: db)
+        model.displayName = "dev box"
+        model.host = "127.0.0.1"
+        model.username = "tester"
+        model.transportPreference = .isekaiStunP2pQuic
+        model.stunServer = "stun.example.com:3478"
+
+        XCTAssertTrue(model.save())
+
+        let saved = try XCTUnwrap(try db.fetchAllProfiles().first)
+        XCTAssertEqual(saved.stunServer, "stun.example.com:3478")
+    }
+
+    func testSaveWithBlankStunServerPersistsNil() throws {
+        let db = try ProfileDatabase.inMemory()
+        let model = ProfileEditModel(profile: nil, db: db)
+        model.displayName = "dev box"
+        model.host = "127.0.0.1"
+        model.username = "tester"
+        model.stunServer = "   "
+
+        XCTAssertTrue(model.save())
+
+        let saved = try XCTUnwrap(try db.fetchAllProfiles().first)
+        XCTAssertNil(saved.stunServer)
+    }
+
+    func testEditingExistingProfileRestoresStunServer() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profile = ConnectionProfile(
+            displayName: "existing", host: "example.com", port: 22, username: "user",
+            transportPreference: .isekaiStunP2pQuic,
+            stunServer: "stun.example.com:3478"
+        )
+        try db.insert(profile: &profile)
+
+        let model = ProfileEditModel(profile: profile, db: db)
+
+        XCTAssertEqual(model.transportPreference, .isekaiStunP2pQuic)
+        XCTAssertEqual(model.stunServer, "stun.example.com:3478")
+    }
+
     // MARK: - 既存プロファイルの編集時の初期値復元
 
     func testEditingExistingProfileRestoresJumpAndForwardFields() throws {
