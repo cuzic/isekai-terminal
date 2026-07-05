@@ -1,5 +1,5 @@
 import XCTest
-@testable import TsshCore
+@testable import TsshCoreLogic
 
 /// iOS対応 Phase 0 の技術検証スパイク: Swift側からRustの `core_version()`
 /// （`rust-core/src/lib.rs`）を呼び出すround-tripが成功することを確認する。

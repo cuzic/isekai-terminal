@@ -1,5 +1,5 @@
 import XCTest
-@testable import TsshCore
+@testable import TsshCoreLogic
 
 /// Phase 1F-1(#48): ターミナル選択のconfig非依存な純粋ロジック(`offsetToCellPos`/
 /// `reconstructSelectionText`)を検証する。Android版`TerminalSelectionTest.kt`相当。
@@ -84,19 +84,5 @@ final class TerminalSelectionTests: XCTestCase {
         let selection = SelectionRange(anchor: CellPos(row: 0, col: 0), head: CellPos(row: 50, col: 0))
 
         XCTAssertEqual(reconstructSelectionText(update: update, selection: selection), "only line")
-    }
-
-    // MARK: - Phase 1F-2(#49): clampedFontScale
-
-    func testClampedFontScaleAppliesZoomDelta() {
-        XCTAssertEqual(clampedFontScale(current: 1.0, zoomDelta: 1.2), 1.2, accuracy: 0.0001)
-    }
-
-    func testClampedFontScaleClampsToMinimum() {
-        XCTAssertEqual(clampedFontScale(current: 0.6, zoomDelta: 0.1), 0.5, accuracy: 0.0001)
-    }
-
-    func testClampedFontScaleClampsToMaximum() {
-        XCTAssertEqual(clampedFontScale(current: 2.9, zoomDelta: 2.0), 3.0, accuracy: 0.0001)
     }
 }

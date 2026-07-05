@@ -1,5 +1,5 @@
 import XCTest
-@testable import TsshCore
+@testable import TsshCoreLogic
 
 /// Phase 1A-4: Swift Actorに順序保証を持たせるのではなく、Rust側の連番付き
 /// EventQueueが順序のSSOTであることを確認する。ChatGPT外部レビュー

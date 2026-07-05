@@ -1,5 +1,5 @@
 import XCTest
-@testable import TsshCore
+@testable import TsshCoreLogic
 
 /// Phase 1B: NetworkPathPolicy/NetworkPathObserverの検証。実際のNWPathMonitorの
 /// ネットワーク切替そのものはCI/シミュレータでは再現できないため、判断ロジック

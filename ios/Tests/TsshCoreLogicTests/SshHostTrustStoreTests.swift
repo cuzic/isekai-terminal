@@ -1,5 +1,5 @@
 import XCTest
-@testable import TsshCore
+@testable import TsshCoreLogic
 
 /// Phase 1B: SSH/helper信頼ストアの検証。ファイルI/Oのみで完結し
 /// entitlementを必要としないため、素のSwiftPMパッケージのテストバンドル

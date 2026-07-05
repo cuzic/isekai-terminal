@@ -1,5 +1,5 @@
 import XCTest
-@testable import TsshCore
+@testable import TsshCoreLogic
 
 /// Phase 1B: TerminalKeyMapper(キー→制御シーケンス変換)の検証。
 final class TerminalKeyMapperTests: XCTestCase {

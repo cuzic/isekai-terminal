@@ -1,5 +1,6 @@
 import XCTest
 @testable import TsshCore
+import TsshCoreLogic
 
 /// Phase 1D(#18b): `TerminalSessionController.onHostKey`のTOFU(Trust On First Use)
 /// ロジックの検証。実際のSSH接続は行わず、ホスト鍵確認ロジックだけを直接呼び出す。

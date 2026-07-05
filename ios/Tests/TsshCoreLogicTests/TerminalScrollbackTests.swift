@@ -1,5 +1,5 @@
 import XCTest
-@testable import TsshCore
+@testable import TsshCoreLogic
 
 /// Phase 1F-4(#51): スクロールバック表示用の`ScreenUpdate`合成ロジックを検証する。
 /// Android版`TerminalScreen.kt`の`displayUpdate`と対称。

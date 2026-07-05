@@ -40,4 +40,23 @@ final class TerminalScreenViewTests: XCTestCase {
         let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
         _ = renderer.image { _ in view.draw(view.bounds) }
     }
+
+    // MARK: - Phase 1F-2(#49): clampedFontScale
+    //
+    // `CGFloat`を使うため`TsshCoreLogic`(Linuxでも`swift test`可能な純ロジック層)には
+    // 移していない。純粋ロジック自体の検証は`Tests/TsshCoreLogicTests/TerminalSelectionTests.swift`
+    // に集約する方針だが、この関数はCoreGraphics依存のため`TerminalScreenView.swift`
+    // (`TsshCore`ターゲット)に残している。
+
+    func testClampedFontScaleAppliesZoomDelta() {
+        XCTAssertEqual(clampedFontScale(current: 1.0, zoomDelta: 1.2), 1.2, accuracy: 0.0001)
+    }
+
+    func testClampedFontScaleClampsToMinimum() {
+        XCTAssertEqual(clampedFontScale(current: 0.6, zoomDelta: 0.1), 0.5, accuracy: 0.0001)
+    }
+
+    func testClampedFontScaleClampsToMaximum() {
+        XCTAssertEqual(clampedFontScale(current: 2.9, zoomDelta: 2.0), 3.0, accuracy: 0.0001)
+    }
 }

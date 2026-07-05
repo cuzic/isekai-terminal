@@ -1,5 +1,5 @@
 import XCTest
-@testable import TsshCore
+@testable import TsshCoreLogic
 
 /// Phase 1D: `KeyManager`(ed25519生成+OpenSSH PEMエンコード)の検証。
 final class KeyManagerTests: XCTestCase {

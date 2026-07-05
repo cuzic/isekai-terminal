@@ -1,5 +1,6 @@
 import XCTest
 @testable import TsshCore
+import TsshCoreLogic
 
 /// Phase 1G-2(#54): `TerminalTabsModel`(Android版`TerminalTabsViewModel`のタブ
 /// リスト/アクティブタブ管理部分)の検証。実際のネットワーク接続は行わない
