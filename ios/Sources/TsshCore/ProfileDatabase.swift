@@ -45,7 +45,7 @@ public struct KeyEntry: Codable, Equatable, FetchableRecord, PersistableRecord {
 /// ため)。GRDBのJSON列として保存できるようこの専用型を使い、実際に接続する際
 /// (Phase 1E-3)に`asPortForward`でRust側の`PortForward`へ変換する。
 public struct StoredPortForward: Codable, Equatable, Hashable {
-    public enum Kind: String, Codable {
+    public enum Kind: String, Codable, Equatable, Hashable, CaseIterable {
         case local, remote, dynamic
     }
 
@@ -76,8 +76,11 @@ public struct StoredPortForward: Codable, Equatable, Hashable {
 
 /// Android版`TransportPreference`の保存用の軽量な複製(理由は`StoredPortForward`と同じ)。
 /// DBには`rawValue`をTEXTとして保存し、`asTransportPreference`でRust側の実際の
-/// `TransportPreference`へ変換する。
-public enum StoredTransportPreference: String, Codable, Equatable, Hashable, CaseIterable {
+/// `TransportPreference`へ変換する。`DatabaseValueConvertible`に明示適合させることで、
+/// GRDBのCodableレコード機構が(JSON文字列として二重にラップせず)素の文字列として
+/// 直接カラムへ読み書きするようにする(v2 migrationの`ALTER TABLE`デフォルト値が
+/// 素の文字列リテラルであることと一致させるため)。
+public enum StoredTransportPreference: String, Codable, Equatable, Hashable, CaseIterable, DatabaseValueConvertible {
     case plainSsh
     case tsshdQuic
     case isekaiHelperQuic
