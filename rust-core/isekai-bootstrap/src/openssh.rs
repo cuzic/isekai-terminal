@@ -43,18 +43,18 @@ use crate::backend::BootstrapBackend;
 use crate::error::BootstrapError;
 use crate::types::{BootstrapReport, HostSpec, JumpSpec, RelayLaunchSpec};
 
-/// Mirrors `rust-core/src/helper_bootstrap.rs`'s constants of the same name.
-/// `isekai-terminal-core` is built as a `cdylib`/`staticlib` and can't be depended on as
-/// an ordinary Rust crate, so these are duplicated rather than shared;
-/// unifying them is deferred to the S-0f `isekai-terminal-core` facade cleanup
-/// (`ISEKAI_SSH_DESIGN.md` "共有ロジックの crate 分割").
-const HELPER_INSTALL_DIR: &str = "~/.local/bin";
-const HELPER_BIN_NAME: &str = "isekai-helper";
+// `HELPER_INSTALL_DIR`/`HELPER_BIN_NAME`/`HANDSHAKE_POLL_ATTEMPTS`/
+// `HANDSHAKE_POLL_INTERVAL_MS` live in `isekai_protocol::bootstrap`, shared
+// with `rust-core/src/helper_bootstrap.rs`'s identical constants (see that
+// module's docs for why they must actually be the same literals, not just
+// mirrored ones).
+use isekai_protocol::bootstrap::{
+    HANDSHAKE_POLL_ATTEMPTS, HANDSHAKE_POLL_INTERVAL_MS, HELPER_BIN_NAME, HELPER_INSTALL_DIR,
+};
+
 const HANDSHAKE_DIR: &str = "~/.cache/isekai-terminal";
 const HANDSHAKE_FILE: &str = "~/.cache/isekai-terminal/helper.handshake";
 const HANDSHAKE_LOG: &str = "~/.cache/isekai-terminal/helper.log";
-const HANDSHAKE_POLL_ATTEMPTS: u32 = 50;
-const HANDSHAKE_POLL_INTERVAL_MS: u32 = 100;
 
 /// The CLI-default `BootstrapBackend`. Spawns the system `ssh(1)` binary.
 pub struct OpenSshBackend {

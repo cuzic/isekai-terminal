@@ -20,11 +20,13 @@ use russh::{client, ChannelMsg};
 
 use crate::transport::RusshEventHandler;
 
-const HELPER_INSTALL_DIR: &str = "~/.local/bin";
-const HELPER_BIN_NAME: &str = "isekai-helper";
-/// 起動後、ハンドシェイク行が書き出されるまでのポーリング回数・間隔。
-const HANDSHAKE_POLL_ATTEMPTS: u32 = 50;
-const HANDSHAKE_POLL_INTERVAL_MS: u32 = 100;
+// `HELPER_INSTALL_DIR`/`HELPER_BIN_NAME`/`HANDSHAKE_POLL_ATTEMPTS`/
+// `HANDSHAKE_POLL_INTERVAL_MS` は `isekai_protocol::bootstrap` で共有している
+// （`isekai-bootstrap::openssh` 側の同名定数と実体を一致させるため — 詳細は
+// そちらのモジュールdoc参照）。
+use isekai_protocol::bootstrap::{
+    HANDSHAKE_POLL_ATTEMPTS, HANDSHAKE_POLL_INTERVAL_MS, HELPER_BIN_NAME, HELPER_INSTALL_DIR,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
