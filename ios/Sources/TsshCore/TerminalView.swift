@@ -13,9 +13,10 @@ public struct TerminalView: View {
     public init(
         profile: ConnectionProfile,
         password: String?,
+        jumpPassword: String? = nil,
         trustStore: SshHostTrustStore = AppServices.shared.trustStore
     ) {
-        let c = TerminalSessionController(profile: profile, password: password, trustStore: trustStore)
+        let c = TerminalSessionController(profile: profile, password: password, jumpPassword: jumpPassword, trustStore: trustStore)
         _controller = State(initialValue: c)
         _uiState = ObservedObject(wrappedValue: c.uiState)
     }
@@ -35,6 +36,19 @@ public struct TerminalView: View {
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { controller.connect() }
         .onDisappear { controller.disconnect() }
+        .alert(
+            "Agent署名要求",
+            isPresented: Binding(
+                get: { uiState.pendingAgentSignRequest != nil },
+                set: { if !$0 { controller.respondToAgentSignRequest(approved: false) } }
+            )
+        ) {
+            Button("拒否", role: .cancel) { controller.respondToAgentSignRequest(approved: false) }
+            Button("承認") { controller.respondToAgentSignRequest(approved: true) }
+                .accessibilityIdentifier("approveAgentSignButton")
+        } message: {
+            Text("サーバーが鍵(\(uiState.pendingAgentSignRequest?.fingerprint ?? ""))での署名を要求しています。許可しますか？")
+        }
     }
 
     @ViewBuilder
