@@ -33,7 +33,7 @@ fun KeyListScreen(
     val context = LocalContext.current
     val vm: KeyListViewModel = viewModel()
     val keys by vm.keys.collectAsStateWithLifecycle()
-    val pendingDelete by vm.pendingDelete.collectAsStateWithLifecycle()
+    val deleteTarget by vm.deleteTarget.collectAsStateWithLifecycle()
     val generatedPubKey by vm.generatedPubKey.collectAsStateWithLifecycle()
     val isGenerating by vm.isGenerating.collectAsStateWithLifecycle()
 
@@ -45,7 +45,7 @@ fun KeyListScreen(
     val dateFmt = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
 
     // Delete confirmation dialog
-    pendingDelete?.let { key ->
+    deleteTarget?.let { key ->
         DeleteConfirmDialog(
             title = "鍵を削除",
             message = "「${key.label}」を削除しますか？この操作は元に戻せません。",
