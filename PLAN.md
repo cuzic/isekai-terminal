@@ -2621,6 +2621,39 @@ Phase 1G-2(#54)が実装され(`46d3881`→`1322c12`)、未コミットの`impor
 importを再度追加した。`Tests/TsshCoreTests/TerminalTabsModelTests.swift`
 (`SshHostTrustStore`を直接使用)にも同様に追加が必要だった。
 
+### Phase 1C(#14)実装メモ(2026-07-05、バックグラウンド遷移対応)
+
+**スコープ**: iOS版のバックグラウンド遷移対応のうち、Swiftだけで完結する範囲
+(OSライフサイクルの中継+フォアグラウンド復帰時の再接続)に限定した。Rust側の
+`SessionSupervisor`/2軸FSM(`SessionState`/`ExecutionMode`)によるバックグラウンド専用
+UniFFI APIの追加は#24のスコープとし、このタスクでは行わない(既存の
+`.claude/rules/rust-ssot.md`が要求する「セッション状態の判断はRust側」という原則には、
+現時点でRust側にバックグラウンド遷移という概念自体が無いため踏み込めず、#24でその
+概念を導入した後にこのSwift側実装を作り直す前提)。
+
+**実装内容**:
+- `TerminalTabsModel`(`TerminalTabsHostView.swift`)が`UIApplication.didEnterBackgroundNotification`/
+  `.willEnterForegroundNotification`をクロージャベースの
+  `NotificationCenter.addObserver(forName:object:queue:using:)`で購読する
+  (このクラスは`NSObject`を継承しないプレーンな`ObservableObject`のため、
+  `#selector`/`@objc`方式は使えない)。バックグラウンド遷移時は
+  `UIApplication.beginBackgroundTask(withName:expirationHandler:)`で約30秒の猶予を得る
+  (AndroidのForeground Service相当の仕組みがiOSに無いため、あくまでベストエフォート。
+  この猶予中も実際のセッション生存はhelper側の論理セッション/QUIC idle timeoutに
+  委ねる方針で、`ios/README.md`のPhase 0-5の机上調査結論と一貫させている)。
+  フォアグラウンド復帰時は全タブに対し`controller.reconnect()`を呼ぶ。
+- `TerminalSessionController.reconnect()`(新規): `.connecting`/`.connected`中は
+  二重接続防止のため無視し、`.disconnected`/`.failed`の場合のみ`connect()`を
+  最後に使ったcols/rowsで呼び直す(既存セッションはRust側にresumeの概念が無いため
+  単純に破棄して作り直す)。
+- `TerminalView`の切断/エラーオーバーレイに「再接続」ボタンを追加
+  (自動復帰後もなお繋がらない場合の手動リトライ手段)。
+
+**やらないこと**: trzsz転送中のバックグラウンド遷移時の扱い(#25)、
+isekai-helperの実際のresumeハンドシェイク(#26、現状の`reconnect()`は
+「新規セッションとして繋ぎ直す」だけで、Android版のresumeトークンによる
+連続性維持とは異なる)。
+
 ---
 
 ## 実装順序

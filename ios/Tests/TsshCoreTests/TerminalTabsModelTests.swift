@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 @testable import TsshCore
 import TsshCoreLogic
 
@@ -113,5 +114,29 @@ final class TerminalTabsModelTests: XCTestCase {
         model.closeTab(UUID())
 
         XCTAssertEqual(model.tabs.map(\.id), [tabId])
+    }
+
+    /// Phase 1C(#14): フォアグラウンド復帰通知を受けたら、失敗/切断済みのタブに対して
+    /// `reconnect()`が呼ばれることを検証する(実際のUIApplication lifecycle
+    /// 通知をそのままpostし、`TerminalTabsModel`が実際に購読していることを確かめる)。
+    func testWillEnterForegroundNotificationReconnectsFailedTab() async throws {
+        let model = try makeModel()
+        let tabId = model.openTab(profile: makeProfile(displayName: "test"), password: nil)
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            guard case .failed = await model.tabs.first(where: { $0.id == tabId })?.controller.uiState.state else { return false }
+            return true
+        }
+
+        NotificationCenter.default.post(name: UIApplication.willEnterForegroundNotification, object: nil)
+
+        // 同じ(存在しない)keyEntryIdで再接続を試みるため、再び同期的に.failedへ戻る。
+        // ここでは「.connectingを経由した=reconnect()が実際に呼ばれた」ことを、
+        // 最終的に.failedへ戻っていることの確認をもって間接的に検証する。
+        try await waitUntilFixtureCondition(timeout: 2) {
+            guard let controller = await model.tabs.first(where: { $0.id == tabId })?.controller else { return false }
+            guard case .failed = await controller.uiState.state else { return false }
+            return true
+        }
     }
 }

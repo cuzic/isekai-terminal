@@ -118,18 +118,33 @@ public struct TerminalView: View {
         case .connected:
             EmptyView()
         case .disconnected(let reason):
-            Text(reason.map { "切断されました: \($0)" } ?? "切断されました")
-                .foregroundStyle(.white)
-                .padding()
-                .background(.black.opacity(0.7))
-                .accessibilityIdentifier("terminalDisconnectedOverlay")
+            VStack(spacing: 12) {
+                Text(reason.map { "切断されました: \($0)" } ?? "切断されました")
+                    .foregroundStyle(.white)
+                reconnectButton
+            }
+            .padding()
+            .background(.black.opacity(0.7))
+            .accessibilityIdentifier("terminalDisconnectedOverlay")
         case .failed(let message):
-            Text("エラー: \(message)")
-                .foregroundStyle(.red)
-                .padding()
-                .background(.black.opacity(0.7))
-                .accessibilityIdentifier("terminalErrorOverlay")
+            VStack(spacing: 12) {
+                Text("エラー: \(message)")
+                    .foregroundStyle(.red)
+                reconnectButton
+            }
+            .padding()
+            .background(.black.opacity(0.7))
+            .accessibilityIdentifier("terminalErrorOverlay")
         }
+    }
+
+    /// Phase 1C(#14): 切断後/接続失敗後に手動で再接続するボタン。バックグラウンド
+    /// 復帰時は`TerminalTabsModel`が自動で`reconnect()`を呼ぶが、それでも
+    /// 繋がらなかった場合(helper未起動・ネットワーク未復旧等)の手動リトライ手段。
+    private var reconnectButton: some View {
+        Button("再接続") { controller.reconnect() }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("reconnectButton")
     }
 
     /// Phase 1F-1(#48): 選択中のフローティングツールバー(コピー/キャンセル)。

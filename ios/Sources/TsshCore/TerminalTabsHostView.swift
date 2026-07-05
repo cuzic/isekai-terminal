@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import TsshCoreLogic
 
 /// Phase 1G-2(#54): 複数タブ/複数セッション対応。Android版`TerminalTabsViewModel`
@@ -32,6 +33,13 @@ public final class TerminalTabsModel: ObservableObject {
     private let db: ProfileDatabase
     private let vault: CredentialVault
     private let relayVault: RelayCredentialVault
+    /// Phase 1C(#14): バックグラウンド遷移中、OSに切断されるまでの猶予をもらうための
+    /// トークン。iOSにはAndroidのForeground Serviceに相当する仕組みが無く、
+    /// `beginBackgroundTask`は約30秒の猶予しか保証しないため、あくまでベストエフォート
+    /// (Rust側のtokioワーカーもサスペンド中は停止するため、この間の実際の生存は
+    /// helper側の論理セッション/QUIC idle timeoutに委ねる。`PLAN.md`のPhase 0-5の
+    /// 机上調査結論を参照)。
+    private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
 
     public init(
         trustStore: SshHostTrustStore = AppServices.shared.trustStore,
@@ -43,6 +51,47 @@ public final class TerminalTabsModel: ObservableObject {
         self.db = db
         self.vault = vault
         self.relayVault = relayVault
+        observeLifecycleNotifications()
+    }
+
+    /// Phase 1C(#14): アプリのバックグラウンド遷移/復帰をそのまま受け取る。Android版
+    /// `TerminalTabsViewModel`は同種の判断をRust側の状態を見て行っているわけではなく、
+    /// UI表示に閉じないセッション生存の話ではあるが、iOS版では現時点でRust側に
+    /// バックグラウンド遷移専用のUniFFIメソッドが無い(#24でSessionSupervisor導入後に
+    /// 追加予定)ため、暫定的にSwift側で「フォアグラウンド復帰時に切断済みタブを
+    /// 再接続する」までを行う(生セッション状態の分岐はconnect()/reconnect()に閉じており、
+    /// ここではOSイベントの中継のみ)。
+    private func observeLifecycleNotifications() {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleDidEnterBackground() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleWillEnterForeground() }
+        }
+    }
+
+    private func handleDidEnterBackground() {
+        endBackgroundTaskIfNeeded()
+        backgroundTaskId = UIApplication.shared.beginBackgroundTask(withName: "isekai-terminal-sessions") { [weak self] in
+            Task { @MainActor in self?.endBackgroundTaskIfNeeded() }
+        }
+    }
+
+    private func handleWillEnterForeground() {
+        endBackgroundTaskIfNeeded()
+        for tab in tabs {
+            tab.controller.reconnect()
+        }
+    }
+
+    private func endBackgroundTaskIfNeeded() {
+        guard backgroundTaskId != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTaskId)
+        backgroundTaskId = .invalid
     }
 
     /// 新しいタブを開いて接続を開始し、そのタブをアクティブにする。生成したtab idを返す。

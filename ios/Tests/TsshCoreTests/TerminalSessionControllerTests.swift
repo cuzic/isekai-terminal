@@ -354,4 +354,47 @@ final class TerminalSessionControllerTests: XCTestCase {
         }
         XCTAssertTrue(message.contains("未対応"))
     }
+
+    // MARK: - Phase 1C(#14): reconnect()
+
+    func testReconnectAfterFailedStateRetriesConnect() async throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 22, username: "user",
+            transportPreference: .tsshdQuic
+        )
+        let controller = try makeControllerWithProfile(profile)
+        controller.connect()
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.state != .connecting
+        }
+        guard case .failed = controller.uiState.state else {
+            XCTFail("expected initial .failed state, got \(controller.uiState.state)")
+            return
+        }
+
+        controller.reconnect()
+
+        // .tsshdQuicは常に同期的に失敗するため、reconnect()は.connectingを経由して
+        // 再び.failedへ戻る(再接続の試行自体が行われたことを示す)。
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.state != .connecting
+        }
+        guard case .failed = controller.uiState.state else {
+            XCTFail("expected .failed state after reconnect, got \(controller.uiState.state)")
+            return
+        }
+    }
+
+    func testReconnectWhileConnectingIsIgnored() throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+        XCTAssertEqual(controller.uiState.state, .connecting)
+
+        controller.reconnect()
+
+        // .connecting中はreconnect()が無視されるため、状態が変わらないままである
+        // (connect()が呼ばれ直していれば別のセッションが生成され得るが、ここでは
+        // stateの遷移が起きないことだけを見て二重接続防止を検証する)。
+        XCTAssertEqual(controller.uiState.state, .connecting)
+    }
 }

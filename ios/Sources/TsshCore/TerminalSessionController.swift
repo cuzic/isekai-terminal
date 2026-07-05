@@ -82,6 +82,9 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     private let relayVault: RelayCredentialVault
     private let trustStore: SshHostTrustStore
     private var session: ActiveTerminalSession?
+    /// Phase 1C(#14): `reconnect()`が最後に使ったcols/rowsで再接続できるように保持する。
+    private var lastCols: UInt32 = 80
+    private var lastRows: UInt32 = 24
 
     public init(
         profile: ConnectionProfile,
@@ -103,6 +106,9 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
 
     /// 接続を開始する。鍵認証の場合はCredentialVaultから秘密鍵を復号して使う。
     public func connect(cols: UInt32 = 80, rows: UInt32 = 24) {
+        lastCols = cols
+        lastRows = rows
+
         // Phase 1F-3(#50): Global default → Profile defaultの解決(Android版
         // `TerminalTabsViewModel.openTab`と同じ方針)。SGR解釈テーブルはRust側の
         // グローバル状態のため、接続開始前に適用しておけば以降の出力に反映される。
@@ -367,6 +373,23 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
 
     public func disconnect() {
         session?.disconnect()
+    }
+
+    /// Phase 1C(#14): バックグラウンドからの復帰時や「再接続」ボタンから呼ぶ。
+    /// 接続中/接続済みの間は二重接続を避けるため無視する(background/foreground
+    /// 通知と手動ボタンの両方から呼ばれ得るため)。`connect()`と同じ
+    /// cols/rows・認証情報でセッションを最初から作り直す(Rust側にresumeできる
+    /// 論理セッションの概念はまだ無いため、既存セッションはただ破棄する)。
+    @MainActor
+    public func reconnect() {
+        switch uiState.state {
+        case .connecting, .connected:
+            return
+        case .disconnected, .failed:
+            uiState.state = .connecting
+            uiState.latestScreenUpdate = nil
+            connect(cols: lastCols, rows: lastRows)
+        }
     }
 
     /// Phase 1F-4(#51): スクロールバックのスワイプUI用。Android版
