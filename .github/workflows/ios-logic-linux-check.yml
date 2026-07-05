@@ -1,0 +1,103 @@
+name: iOS TsshCoreLogic Linux check
+
+# ios/Sources/TsshCoreLogic(UIKit/SwiftUI/GRDB/Keychainに依存しない、iOSアプリの
+# 純粋なビジネスロジック層)をLinux上でネイティブに`swift test`する。
+# `ios/Package.swift`は`#if os(Linux)`でTsshCore/TsshCoreTests(Apple専用)自体を
+# マニフェストから除外するため、このジョブではTsshCoreLogic/TsshCoreLogicTestsだけが
+# 解決される。
+#
+# 実iOSアプリのSimulatorビルド・実機同等の検証は引き続き`ios-rust-core-check.yml`/
+# `ios-app-build-check.yml`(macOSランナー)が担当する。このジョブはそれらより
+# 大幅に安く速い(Xcode/Simulator不要)ため、ロジック層のリグレッションを
+# 素早く検出するための第一段のゲートとして位置づける
+# (PLAN.md「Phase Y」節、iOS Linux CI導入の記録参照)。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust-core/**"
+      - "ios/Sources/TsshCoreLogic/**"
+      - "ios/Sources/TsshCoreFFILinux/**"
+      - "ios/Tests/TsshCoreLogicTests/**"
+      - "ios/Package.swift"
+      - ".github/workflows/ios-logic-linux-check.yml"
+  pull_request:
+    paths:
+      - "rust-core/**"
+      - "ios/Sources/TsshCoreLogic/**"
+      - "ios/Sources/TsshCoreFFILinux/**"
+      - "ios/Tests/TsshCoreLogicTests/**"
+      - "ios/Package.swift"
+      - ".github/workflows/ios-logic-linux-check.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-logic-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SWIFT_VERSION: "6.3.3"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ios-logic-linux-cargo-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            ios-logic-linux-cargo-${{ runner.os }}-
+
+      - name: Cache SwiftPM build (TsshCoreLogic + swift-crypto)
+        # swift-cryptoのCCryptoBoringSSL(BoringSSLのC移植)を最初からビルドすると
+        # 数分かかる。Package.resolvedが変わらない限りキャッシュを再利用する。
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/.build
+          key: ios-logic-linux-swiftpm-${{ runner.os }}-${{ hashFiles('ios/Package.resolved') }}
+          restore-keys: |
+            ios-logic-linux-swiftpm-${{ runner.os }}-
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Install Swift toolchain
+        run: |
+          set -euo pipefail
+          curl -fL -o /tmp/swift.tar.gz \
+            "https://download.swift.org/swift-${SWIFT_VERSION}-release/ubuntu2404/swift-${SWIFT_VERSION}-RELEASE/swift-${SWIFT_VERSION}-RELEASE-ubuntu24.04.tar.gz"
+          mkdir -p "$HOME/swift-toolchain"
+          tar xzf /tmp/swift.tar.gz --strip-components=1 -C "$HOME/swift-toolchain"
+          echo "$HOME/swift-toolchain/usr/bin" >> "$GITHUB_PATH"
+
+      - name: Build TsshCoreLogic FFI (rust-core native Linux build + UniFFI bindings + drift check)
+        run: |
+          bash rust-core/scripts/build-linux-swift-ffi.sh
+          git diff --exit-code -- ios/Sources/TsshCoreLogic/generated ios/Sources/TsshCoreFFILinux || {
+            echo "::error::ios/Sources/TsshCoreLogic/generated or ios/Sources/TsshCoreFFILinux is stale. Run rust-core/scripts/build-linux-swift-ffi.sh and commit the result." >&2
+            exit 1
+          }
+
+      - name: swift test (TsshCoreLogic)
+        working-directory: ios
+        run: |
+          export LIBRARY_PATH="$(pwd)/Frameworks/linux:${LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$(pwd)/Frameworks/linux:${LD_LIBRARY_PATH:-}"
+          swift test
