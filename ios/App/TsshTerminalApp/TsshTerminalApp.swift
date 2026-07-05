@@ -26,6 +26,7 @@ struct AppRootView: View {
     var body: some View {
         NavigationStack(path: $path) {
             ProfileListView(
+                model: ProfileListModel(),
                 onConnect: { profile, _ in
                     path.append(.terminal(profile))
                 },
@@ -43,9 +44,10 @@ struct AppRootView: View {
                         onCancel: { path.removeLast() }
                     )
                 case .keyList:
-                    KeyListView(onImportKey: { path.append(.keyImport) })
+                    KeyListView(model: KeyListModel(), onImportKey: { path.append(.keyImport) })
                 case .keyImport:
                     KeyImportView(
+                        model: KeyImportModel(),
                         onSave: { path.removeLast() },
                         onCancel: { path.removeLast() }
                     )

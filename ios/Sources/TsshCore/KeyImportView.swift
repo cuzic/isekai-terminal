@@ -62,7 +62,8 @@ public struct KeyImportView: View {
     @State private var selectedFileName: String?
     @State private var showFileImporter = false
 
-    public init(model: KeyImportModel = KeyImportModel(), onSave: @escaping () -> Void, onCancel: @escaping () -> Void) {
+    // `model`にデフォルト値を持たせられない理由は`ProfileListView.init`のコメント参照。
+    public init(model: KeyImportModel, onSave: @escaping () -> Void, onCancel: @escaping () -> Void) {
         _model = StateObject(wrappedValue: model)
         self.onSave = onSave
         self.onCancel = onCancel

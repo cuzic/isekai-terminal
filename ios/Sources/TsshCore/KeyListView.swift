@@ -67,7 +67,8 @@ public struct KeyListView: View {
     @State private var showGenerateSheet = false
     @State private var generateLabel = ""
 
-    public init(model: KeyListModel = KeyListModel(), onImportKey: @escaping () -> Void) {
+    // `model`にデフォルト値を持たせられない理由は`ProfileListView.init`のコメント参照。
+    public init(model: KeyListModel, onImportKey: @escaping () -> Void) {
         _model = StateObject(wrappedValue: model)
         self.onImportKey = onImportKey
     }

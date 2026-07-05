@@ -40,8 +40,13 @@ public struct ProfileListView: View {
     private let onManageKeys: () -> Void
     private let onShowDiagnostics: (() -> Void)?
 
+    // `model`にデフォルト値を持たせると、そのデフォルト式`ProfileListModel()`は
+    // (SwiftのStateObject(wrappedValue:)のautoclosureとは違い)呼び出し側の
+    // 非isolatedなコンテキストで即座に評価されるため、`@MainActor`な
+    // `ProfileListModel.init()`を呼べずコンパイルエラーになる。そのためデフォルト値は
+    // 持たせず、呼び出し側(`body`、MainActor)で明示的に構築してもらう。
     public init(
-        model: ProfileListModel = ProfileListModel(),
+        model: ProfileListModel,
         onConnect: @escaping (ConnectionProfile, String?) -> Void,
         onAddProfile: @escaping () -> Void,
         onEditProfile: @escaping (ConnectionProfile) -> Void,
