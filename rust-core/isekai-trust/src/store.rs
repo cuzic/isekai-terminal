@@ -92,51 +92,32 @@ pub fn save_trust_store(path: &Path, store: &TrustStore) -> Result<(), TrustErro
     Ok(())
 }
 
-/// Creates `dir` (as `0700`) if it doesn't exist yet; otherwise checks that
-/// it isn't world-writable and fails closed if it is.
-fn ensure_private_dir(dir: &Path) -> Result<(), TrustError> {
-    if !dir.exists() {
-        fs::create_dir_all(dir).map_err(|e| TrustError::CreateDir { path: dir.to_path_buf(), source: e })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-                .map_err(|e| TrustError::CreateDir { path: dir.to_path_buf(), source: e })?;
-        }
-        Ok(())
-    } else {
-        check_not_world_writable(dir)
+/// Translates a `FsGuardError` (path-less by design, see its docs) into this
+/// crate's own `TrustError`, attaching `path` back.
+fn map_fs_guard_err(path: &Path, err: isekai_fs_guard::FsGuardError) -> TrustError {
+    use isekai_fs_guard::FsGuardError;
+    match err {
+        FsGuardError::CreateDir(source) => TrustError::CreateDir { path: path.to_path_buf(), source },
+        FsGuardError::Stat(source) => TrustError::Stat { path: path.to_path_buf(), source },
+        FsGuardError::SetPermissions(source) => TrustError::Write { path: path.to_path_buf(), source },
+        FsGuardError::WorldWritable { mode } => TrustError::WorldWritable { path: path.to_path_buf(), mode },
     }
 }
 
-#[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> Result<(), TrustError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| TrustError::Write { path: path.to_path_buf(), source: e })
+/// Creates `dir` (as `0700`) if it doesn't exist yet; otherwise checks that
+/// it isn't world-writable and fails closed if it is.
+fn ensure_private_dir(dir: &Path) -> Result<(), TrustError> {
+    isekai_fs_guard::ensure_private_dir(dir).map_err(|e| map_fs_guard_err(dir, e))
 }
 
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> Result<(), TrustError> {
-    Ok(())
+fn set_private_file_permissions(path: &Path) -> Result<(), TrustError> {
+    isekai_fs_guard::set_private_file_permissions(path).map_err(|e| map_fs_guard_err(path, e))
 }
 
 /// Fails closed if `path` is writable by users other than its owner
 /// (mode bit `0o002`). Unix-only; a no-op elsewhere.
-#[cfg(unix)]
 fn check_not_world_writable(path: &Path) -> Result<(), TrustError> {
-    use std::os::unix::fs::PermissionsExt;
-    let metadata = fs::metadata(path).map_err(|e| TrustError::Stat { path: path.to_path_buf(), source: e })?;
-    let mode = metadata.permissions().mode();
-    if mode & 0o002 != 0 {
-        return Err(TrustError::WorldWritable { path: path.to_path_buf(), mode: mode & 0o777 });
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_not_world_writable(_path: &Path) -> Result<(), TrustError> {
-    Ok(())
+    isekai_fs_guard::check_not_world_writable(path).map_err(|e| map_fs_guard_err(path, e))
 }
 
 #[cfg(test)]

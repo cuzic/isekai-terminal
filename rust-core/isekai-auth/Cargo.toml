@@ -9,9 +9,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.18"
 # Used for atomic writes (write to a sibling temp file, then rename) in
-# file_provider.rs, mirroring isekai-trust/src/store.rs. Also reused by
-# tests as a scratch directory factory.
+# file_provider.rs. Also reused by tests as a scratch directory factory.
 tempfile = "3"
+# 0600/0700 permission + world-writable checks, shared with isekai-trust's
+# trust store (see isekai-fs-guard's crate docs).
+isekai-fs-guard = { path = "../isekai-fs-guard" }
 # Device Authorization Grant (RFC 8628, `device_flow.rs`) and refresh_token
 # (RFC 6749 §6, `refresh.rs`) HTTP calls, and `FileTokenProvider::get_relay_jwt`'s
 # transparent refresh (`oauth.rs`). Chosen over reqwest/hyper: `TokenProvider`

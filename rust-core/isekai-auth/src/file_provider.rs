@@ -1,8 +1,8 @@
 //! `TokenProvider` backed by `~/.config/isekai-ssh/token.json`.
 //!
 //! This file holds a bearer token (the relay JWT), so it gets the same
-//! protection as `isekai-trust`'s `known_helpers.toml`
-//! (`isekai-trust::store`, which this module mirrors): writes are atomic
+//! protection as `isekai-trust`'s `known_helpers.toml` (the permission
+//! checks themselves live in the shared `isekai-fs-guard` crate): writes are atomic
 //! (temp file in the same directory, then `rename`), the file is created
 //! with `0600` permissions and its parent directory with `0700`, and both
 //! are checked for world-writability before use — fail closed if either is
@@ -228,51 +228,32 @@ fn write_atomically(path: &Path, serialized: &str) -> Result<(), AuthError> {
     Ok(())
 }
 
-/// Creates `dir` (as `0700`) if it doesn't exist yet; otherwise checks that
-/// it isn't world-writable and fails closed if it is.
-fn ensure_private_dir(dir: &Path) -> Result<(), AuthError> {
-    if !dir.exists() {
-        fs::create_dir_all(dir).map_err(|e| AuthError::CreateDir { path: dir.to_path_buf(), source: e })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-                .map_err(|e| AuthError::CreateDir { path: dir.to_path_buf(), source: e })?;
-        }
-        Ok(())
-    } else {
-        check_not_world_writable(dir)
+/// Translates a `FsGuardError` (path-less by design, see its docs) into this
+/// crate's own `AuthError`, attaching `path` back.
+fn map_fs_guard_err(path: &Path, err: isekai_fs_guard::FsGuardError) -> AuthError {
+    use isekai_fs_guard::FsGuardError;
+    match err {
+        FsGuardError::CreateDir(source) => AuthError::CreateDir { path: path.to_path_buf(), source },
+        FsGuardError::Stat(source) => AuthError::Stat { path: path.to_path_buf(), source },
+        FsGuardError::SetPermissions(source) => AuthError::Write { path: path.to_path_buf(), source },
+        FsGuardError::WorldWritable { mode } => AuthError::WorldWritable { path: path.to_path_buf(), mode },
     }
 }
 
-#[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> Result<(), AuthError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e })
+/// Creates `dir` (as `0700`) if it doesn't exist yet; otherwise checks that
+/// it isn't world-writable and fails closed if it is.
+fn ensure_private_dir(dir: &Path) -> Result<(), AuthError> {
+    isekai_fs_guard::ensure_private_dir(dir).map_err(|e| map_fs_guard_err(dir, e))
 }
 
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> Result<(), AuthError> {
-    Ok(())
+fn set_private_file_permissions(path: &Path) -> Result<(), AuthError> {
+    isekai_fs_guard::set_private_file_permissions(path).map_err(|e| map_fs_guard_err(path, e))
 }
 
 /// Fails closed if `path` is writable by users other than its owner
 /// (mode bit `0o002`). Unix-only; a no-op elsewhere.
-#[cfg(unix)]
 fn check_not_world_writable(path: &Path) -> Result<(), AuthError> {
-    use std::os::unix::fs::PermissionsExt;
-    let metadata = fs::metadata(path).map_err(|e| AuthError::Stat { path: path.to_path_buf(), source: e })?;
-    let mode = metadata.permissions().mode();
-    if mode & 0o002 != 0 {
-        return Err(AuthError::WorldWritable { path: path.to_path_buf(), mode: mode & 0o777 });
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_not_world_writable(_path: &Path) -> Result<(), AuthError> {
-    Ok(())
+    isekai_fs_guard::check_not_world_writable(path).map_err(|e| map_fs_guard_err(path, e))
 }
 
 /// Reads the relay JWT from `~/.config/isekai-ssh/token.json` (or a custom
