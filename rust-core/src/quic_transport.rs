@@ -138,10 +138,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message, cert, dss,
-            &self.0.signature_verification_algorithms,
-        )
+        crate::tls_verify::verify_tls12_signature(message, cert, dss, &self.0)
     }
 
     fn verify_tls13_signature(
@@ -150,14 +147,11 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message, cert, dss,
-            &self.0.signature_verification_algorithms,
-        )
+        crate::tls_verify::verify_tls13_signature(message, cert, dss, &self.0)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        crate::tls_verify::supported_verify_schemes(&self.0)
     }
 }
 

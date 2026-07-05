@@ -220,9 +220,7 @@ impl ServerCertVerifier for PinnedCertVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message, cert, dss, &self.provider.signature_verification_algorithms,
-        )
+        crate::tls_verify::verify_tls12_signature(message, cert, dss, &self.provider)
     }
 
     fn verify_tls13_signature(
@@ -231,13 +229,11 @@ impl ServerCertVerifier for PinnedCertVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message, cert, dss, &self.provider.signature_verification_algorithms,
-        )
+        crate::tls_verify::verify_tls13_signature(message, cert, dss, &self.provider)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        crate::tls_verify::supported_verify_schemes(&self.provider)
     }
 }
 
