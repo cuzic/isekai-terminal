@@ -2454,6 +2454,36 @@ config構築ロジックと同様、`offsetToCellPos`/`reconstructSelectionText`
 ネットワーク非依存の純粋関数としてテストした(`TerminalSelectionTests.swift`、
 `Tests/TsshCoreTests`、Keychain等に触れないため素のターゲットで動く)。
 
+### Phase 1F-2/1F-3/1F-4(#49/#50/#51)実装メモ(2026-07-05)
+
+3タスクまとめて実装した(いずれもAndroid版`TerminalScreen.kt`/`ui/TerminalTheme.kt`の
+既存機能をSwiftへ1:1移植する作業で、新規のRust側変更は不要だった)。
+
+- **#49(ピンチズーム)**: `TerminalScreenView`に`UIPinchGestureRecognizer`を追加。
+  クランプ計算(`clampedFontScale`、0.5〜3.0)を`@objc`ハンドラから分離した純粋関数に
+  してテスト容易にした。永続化はAndroid版`SharedPreferences`の`"font_scale"`キーと
+  対称の`UserDefaults`キーへ`@AppStorage`経由で行う。
+- **#50(配色テーマ)**: 新規`TerminalThemes.swift`(Default Dark/Solarized Dark/
+  Dracula/Nordの4プリセット、Android版`ui/TerminalTheme.kt`と同じ値)。
+  `setTerminalTheme(ansi16:defaultFg:defaultBg:)`はセッション単位ではなくRust側の
+  グローバル状態への設定関数だったため、`TerminalSessionController.connect()`の
+  冒頭で`resolveTheme().apply()`を呼ぶだけで済んだ(Android版のような
+  タブ毎の`pushThemeToSession`配線は現時点でiOSがシングルタブのため不要、
+  複数タブ対応(#54)時に再検討)。Global default(`ProfileListView`の配色テーマ
+  選択、`UserDefaults`)→ Profile default(`ProfileEditView`の`themeName`上書き)の
+  解決順はAndroid版`TerminalTabsViewModel.openTab`と同じ。
+- **#51(スクロールバックのスワイプ)**: `TerminalScreenView`に`UIPanGestureRecognizer`
+  (`maximumNumberOfTouches = 1`)を追加。ライブの`ScreenUpdate`とスクロールバックの
+  行から表示用updateを合成するロジックを`synthesizeDisplayUpdate`(新規
+  `TerminalScrollback.swift`)として純粋関数に分離しテストした。長押し(選択)・
+  ピンチ(ズーム)・pan(スクロール)の3ジェスチャが同一Viewに共存するが、UIKitの
+  既定動作(同一View上の複数`UIGestureRecognizer`の同時認識は明示的に許可しない限り
+  OFF)により、Android版がCompose側で手動分岐していたのと同じ排他制御が
+  追加コード無しで得られた(気づきとして記録)。選択中にスクロールバックへ入っている
+  場合、コピー対象もスクロールバック側の内容になるよう`TerminalView`の
+  コピー処理を修正した(Android版`reconstructSelectionText(displayUpdate, sel)`と
+  同じ)。
+
 ---
 
 ## 実装順序

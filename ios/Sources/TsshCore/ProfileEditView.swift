@@ -1,11 +1,11 @@
 import SwiftUI
 
-/// Phase 1D/1E: Android版`ProfileEditScreen.kt`相当。label/host/port/username/
+/// Phase 1D/1E/1F: Android版`ProfileEditScreen.kt`相当。label/host/port/username/
 /// 認証方式に加え、Phase 1Eで踏み台(ProxyJump)・ポートフォワード・SSH agent転送・
 /// 接続方式(プレーンSSH/isekai-helper経由QUIC/自動フォールバック/STUN+SSHランデブーP2P/
-/// MASQUE relay P2P/Tailscale⇔直接アドレスのマルチパス)を追加した。物理Wi-Fi/セルラー
-/// マルチパス(#47、実験的・低優先。Android版もnoq側既知バグにより現状事実上no-op)は
-/// まだ追加していない。
+/// MASQUE relay P2P/Tailscale⇔直接アドレスのマルチパス)を、Phase 1F-3(#50)で
+/// プロファイル固有の配色テーマ上書きを追加した。物理Wi-Fi/セルラーマルチパス
+/// (#47、実験的・低優先。Android版もnoq側既知バグにより現状事実上no-op)はまだ追加していない。
 @MainActor
 public final class ProfileEditModel: ObservableObject {
     @Published public var displayName: String
@@ -52,6 +52,11 @@ public final class ProfileEditModel: ObservableObject {
     // multipath化されずpath0(host欄、通常Tailscale経由)のみで動く。
     @Published public var directAddress: String
 
+    // Phase 1F-3(#50): プロファイル固有の配色テーマ上書き。nilならアプリ全体の
+    // 既定テーマ(`ProfileListView`側で選択)を使う(Android版`ConnectionProfile.themeName`と
+    // 同じ方針、Global default → Profile default)。
+    @Published public var themeName: String?
+
     private let db: ProfileDatabase
     private let relayVault: RelayCredentialVault
     private let existingId: Int64?
@@ -89,6 +94,8 @@ public final class ProfileEditModel: ObservableObject {
         self.relayJwt = profile?.relayJwt.flatMap { try? relayVault.decrypt($0) } ?? ""
 
         self.directAddress = profile?.directAddress ?? ""
+
+        self.themeName = profile?.themeName
     }
 
     public func loadAvailableKeys() {
@@ -196,7 +203,8 @@ public final class ProfileEditModel: ObservableObject {
             relayAddr: relayAddr.trimmingCharacters(in: .whitespaces).isEmpty ? nil : relayAddr,
             relaySni: relaySni.trimmingCharacters(in: .whitespaces).isEmpty ? nil : relaySni,
             relayJwt: resolvedRelayJwt,
-            allowNonLoopbackForwardBind: allowNonLoopbackForwardBind
+            allowNonLoopbackForwardBind: allowNonLoopbackForwardBind,
+            themeName: themeName
         )
         do {
             if existingId != nil {
@@ -367,6 +375,16 @@ public struct ProfileEditView: View {
                 Text("サーバー側があなたの鍵での署名をこのアプリに要求できるようになります(署名要求ごとに確認が必要)。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            Section("配色テーマ") {
+                Picker("配色テーマ", selection: $model.themeName) {
+                    Text("アプリの既定を使用").tag(String?.none)
+                    ForEach(TerminalThemes.all, id: \.name) { theme in
+                        Text(theme.name).tag(String?.some(theme.name))
+                    }
+                }
+                .accessibilityIdentifier("profileThemePicker")
             }
 
             if let error = model.errorMessage {

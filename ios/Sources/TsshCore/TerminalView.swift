@@ -12,6 +12,13 @@ public struct TerminalView: View {
     /// Phase 1F-1(#48): 現在の選択範囲。`TerminalScreenView`(UIKit側)からの通知で更新され、
     /// フローティングツールバーの表示・コピー/キャンセル操作の両方に使う。
     @State private var selection: SelectionRange?
+    /// Phase 1F-2(#49): フォントサイズ拡縮率。Android版`SharedPreferences`の
+    /// `"font_scale"`キーと対称の`UserDefaults`キーへ`@AppStorage`経由で永続化する。
+    @AppStorage("font_scale") private var fontScale: Double = 1.0
+    /// Phase 1F-4(#51): スクロールバックのスワイプで表示中のオフセット(0 = ライブ)。
+    /// `TerminalScreenView`(UIKit側)からの通知で更新され、「ライブへ戻る」ボタンからも
+    /// 0を書き戻す(`selection`/`fontScale`と同じ双方向バインディング)。
+    @State private var scrollOffset: UInt32 = 0
 
     public init(
         profile: ConnectionProfile,
@@ -26,8 +33,11 @@ public struct TerminalView: View {
 
     public var body: some View {
         ZStack(alignment: .topLeading) {
-            TerminalScreenRepresentable(uiState: uiState, selection: $selection)
-                .accessibilityIdentifier("terminalScreen")
+            TerminalScreenRepresentable(
+                uiState: uiState, controller: controller,
+                selection: $selection, fontScale: $fontScale, scrollOffset: $scrollOffset
+            )
+            .accessibilityIdentifier("terminalScreen")
 
             TerminalInputRepresentable(controller: controller, uiState: uiState)
                 .frame(width: 1, height: 1)
@@ -39,6 +49,12 @@ public struct TerminalView: View {
                 selectionToolbar(selection)
                     .frame(maxWidth: .infinity, alignment: .top)
                     .padding(.top, 8)
+            }
+
+            if scrollOffset > 0 {
+                backToLiveButton
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .padding(.bottom, 8)
             }
         }
         .background(Color.black)
@@ -93,7 +109,12 @@ public struct TerminalView: View {
         HStack(spacing: 4) {
             Button("コピー") {
                 if let update = uiState.latestScreenUpdate {
-                    let text = reconstructSelectionText(update: update, selection: selection)
+                    // Phase 1F-4(#51): スクロールバック表示中はスクロールバックの内容から
+                    // コピーする(Android版`reconstructSelectionText(displayUpdate, sel)`と
+                    // 同じ、ライブの内容が誤ってコピーされないようにする)。
+                    let cells = scrollOffset > 0 ? controller.scrollbackCells(offset: scrollOffset, rows: update.rows) : []
+                    let displayUpdate = synthesizeDisplayUpdate(live: update, scrollOffset: scrollOffset, scrollbackCells: cells)
+                    let text = reconstructSelectionText(update: displayUpdate, selection: selection)
                     if !text.isEmpty {
                         UIPasteboard.general.string = text
                     }
@@ -113,16 +134,49 @@ public struct TerminalView: View {
         .background(Color.black.opacity(0.8))
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
+
+    /// Phase 1F-4(#51): スクロールバック中に表示する「ライブへ戻る」ボタン。Android版
+    /// `TerminalScreen.kt`の"↓ ライブへ戻る ($scrollOffset / $scrollbackLen)"ボタンと対称。
+    private var backToLiveButton: some View {
+        Button {
+            scrollOffset = 0
+        } label: {
+            Text("↓ ライブへ戻る (\(scrollOffset) / \(controller.scrollbackLen()))")
+                .font(.caption)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.black.opacity(0.8))
+                .foregroundStyle(.white)
+                .clipShape(Capsule())
+        }
+        .accessibilityIdentifier("backToLiveButton")
+    }
 }
 
 private struct TerminalScreenRepresentable: UIViewRepresentable {
     @ObservedObject var uiState: TerminalUIState
+    let controller: TerminalSessionController
     @Binding var selection: SelectionRange?
+    @Binding var fontScale: Double
+    @Binding var scrollOffset: UInt32
 
     func makeUIView(context: Context) -> TerminalScreenView {
         let view = TerminalScreenView()
+        view.fontScale = CGFloat(fontScale)
         view.onSelectionChanged = { newValue in
             selection = newValue
+        }
+        view.onFontScaleChanged = { newValue in
+            fontScale = Double(newValue)
+        }
+        view.onScrollbackRequest = { [weak controller] offset, rows in
+            controller?.scrollbackCells(offset: offset, rows: rows) ?? []
+        }
+        view.onScrollbackLenRequest = { [weak controller] in
+            controller?.scrollbackLen() ?? 0
+        }
+        view.onScrollOffsetChanged = { newValue in
+            scrollOffset = newValue
         }
         return view
     }
@@ -132,6 +186,8 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
             uiView.apply(update)
         }
         uiView.selection = selection
+        uiView.fontScale = CGFloat(fontScale)
+        uiView.scrollOffset = scrollOffset
     }
 }
 

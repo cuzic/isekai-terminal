@@ -305,6 +305,36 @@ final class TerminalSessionControllerTests: XCTestCase {
         }
     }
 
+    // MARK: - Phase 1F-3(#50): 配色テーマの解決(Global default → Profile default)
+
+    func testResolveThemeUsesProfileThemeNameWhenSet() throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 22, username: "user",
+            themeName: "Dracula"
+        )
+        let controller = try makeControllerWithProfile(profile)
+        let defaults = UserDefaults(suiteName: "test.themes.\(UUID().uuidString)")!
+
+        XCTAssertEqual(controller.resolveTheme(defaults: defaults), TerminalThemes.dracula)
+    }
+
+    func testResolveThemeFallsBackToGlobalDefaultWhenProfileThemeIsNil() throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+        let defaults = UserDefaults(suiteName: "test.themes.\(UUID().uuidString)")!
+        defaults.set("Nord", forKey: TerminalThemes.prefKey)
+
+        XCTAssertEqual(controller.resolveTheme(defaults: defaults), TerminalThemes.nord)
+    }
+
+    func testResolveThemeFallsBackToDefaultDarkWhenNeitherIsSet() throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+        let defaults = UserDefaults(suiteName: "test.themes.\(UUID().uuidString)")!
+
+        XCTAssertEqual(controller.resolveTheme(defaults: defaults), TerminalThemes.defaultDark)
+    }
+
     func testConnectWithUnsupportedTransportPreferenceFails() async throws {
         let profile = ConnectionProfile(
             displayName: "test", host: "example.com", port: 22, username: "user",

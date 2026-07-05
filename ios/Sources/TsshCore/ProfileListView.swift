@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// Phase 1D: Android版`ProfileListScreen.kt`/`ProfileListViewModel.kt`のMVP部分の移植。
-/// 配色テーマ・定型文管理はこの一次実装のスコープに含めない(別途後続で対応)。
+/// Phase 1D/1F: Android版`ProfileListScreen.kt`/`ProfileListViewModel.kt`のMVP部分の
+/// 移植。Phase 1F-3(#50)でアプリ全体の既定配色テーマ選択を追加した。定型文管理は
+/// この実装のスコープに含めない(別途後続で対応)。
 @MainActor
 public final class ProfileListModel: ObservableObject {
     @Published public private(set) var profiles: [ConnectionProfile] = []
@@ -39,6 +40,11 @@ public struct ProfileListView: View {
     private let onEditProfile: (ConnectionProfile) -> Void
     private let onManageKeys: () -> Void
     private let onShowDiagnostics: (() -> Void)?
+
+    /// Phase 1F-3(#50): アプリ全体の既定配色テーマ(Android版`SharedPreferences`の
+    /// `PREF_KEY`と同じキーで`UserDefaults`へ永続化、プロファイル単位ではなくグローバル設定)。
+    @AppStorage(TerminalThemes.prefKey) private var currentThemeName: String = TerminalThemes.defaultDark.name
+    @State private var showThemePicker = false
 
     // `model`にデフォルト値を持たせると、そのデフォルト式`ProfileListModel()`は
     // (SwiftのStateObject(wrappedValue:)のautoclosureとは違い)呼び出し側の
@@ -96,6 +102,8 @@ public struct ProfileListView: View {
                 Menu {
                     Button("鍵管理", action: onManageKeys)
                         .accessibilityIdentifier("manageKeysMenuItem")
+                    Button("配色テーマ") { showThemePicker = true }
+                        .accessibilityIdentifier("themePickerMenuItem")
                     if let onShowDiagnostics {
                         Button("診断 (Phase 1A-1)", action: onShowDiagnostics)
                             .accessibilityIdentifier("diagnosticsMenuItem")
@@ -144,6 +152,48 @@ public struct ProfileListView: View {
                     },
                     onCancel: { model.dismissPassword() }
                 )
+            }
+        }
+        .sheet(isPresented: $showThemePicker) {
+            TerminalThemePickerView(selectedName: $currentThemeName)
+        }
+    }
+}
+
+/// Phase 1F-3(#50): アプリ全体の既定配色テーマ選択シート。Android版
+/// `ProfileListScreen.kt`の`TerminalThemeDialog`と同じ役割。
+private struct TerminalThemePickerView: View {
+    @Binding var selectedName: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List(TerminalThemes.all, id: \.name) { theme in
+                Button {
+                    selectedName = theme.name
+                    dismiss()
+                } label: {
+                    HStack {
+                        Circle()
+                            .fill(theme.backgroundColor)
+                            .frame(width: 20, height: 20)
+                            .overlay(Circle().stroke(Color.secondary, lineWidth: 1))
+                        Text(theme.name)
+                            .foregroundStyle(.primary)
+                        Spacer()
+                        if theme.name == selectedName {
+                            Image(systemName: "checkmark")
+                                .foregroundStyle(.tint)
+                        }
+                    }
+                }
+                .accessibilityIdentifier("themeOption_\(theme.name)")
+            }
+            .navigationTitle("配色テーマ")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("閉じる") { dismiss() }
+                }
             }
         }
     }

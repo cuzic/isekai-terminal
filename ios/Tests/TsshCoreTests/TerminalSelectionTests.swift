@@ -85,4 +85,18 @@ final class TerminalSelectionTests: XCTestCase {
 
         XCTAssertEqual(reconstructSelectionText(update: update, selection: selection), "only line")
     }
+
+    // MARK: - Phase 1F-2(#49): clampedFontScale
+
+    func testClampedFontScaleAppliesZoomDelta() {
+        XCTAssertEqual(clampedFontScale(current: 1.0, zoomDelta: 1.2), 1.2, accuracy: 0.0001)
+    }
+
+    func testClampedFontScaleClampsToMinimum() {
+        XCTAssertEqual(clampedFontScale(current: 0.6, zoomDelta: 0.1), 0.5, accuracy: 0.0001)
+    }
+
+    func testClampedFontScaleClampsToMaximum() {
+        XCTAssertEqual(clampedFontScale(current: 2.9, zoomDelta: 2.0), 3.0, accuracy: 0.0001)
+    }
 }

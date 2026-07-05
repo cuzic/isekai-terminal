@@ -49,6 +49,8 @@ private protocol ActiveTerminalSession: AnyObject {
     func send(data: Data)
     func resize(cols: UInt32, rows: UInt32)
     func disconnect()
+    func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]
+    func scrollbackLen() -> UInt32
 }
 extension SshSession: ActiveTerminalSession {}
 extension HelperQuicSession: ActiveTerminalSession {}
@@ -100,6 +102,11 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
 
     /// 接続を開始する。鍵認証の場合はCredentialVaultから秘密鍵を復号して使う。
     public func connect(cols: UInt32 = 80, rows: UInt32 = 24) {
+        // Phase 1F-3(#50): Global default → Profile defaultの解決(Android版
+        // `TerminalTabsViewModel.openTab`と同じ方針)。SGR解釈テーブルはRust側の
+        // グローバル状態のため、接続開始前に適用しておけば以降の出力に反映される。
+        resolveTheme().apply()
+
         guard let auth = resolveAuth(keyEntryId: profile.keyEntryId, password: password, label: "接続先") else {
             return
         }
@@ -319,6 +326,17 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         }
     }
 
+    /// Phase 1F-3(#50): プロファイル固有のテーマ指定があればそれを、無ければ
+    /// アプリ全体の既定テーマ(`ProfileListView`の配色テーマ選択が書き込む
+    /// `UserDefaults`)を使う(Android版`TerminalTabsViewModel.currentGlobalTheme`/
+    /// `openTab`のGlobal default → Profile default解決と同じ方針)。
+    func resolveTheme(defaults: UserDefaults = .standard) -> TerminalTheme {
+        if let themeName = profile.themeName {
+            return TerminalThemes.byName(themeName)
+        }
+        return TerminalThemes.byName(defaults.string(forKey: TerminalThemes.prefKey))
+    }
+
     /// `keyEntryId`があればCredentialVaultから秘密鍵を復号して`.publicKey`認証を、
     /// 無ければ渡された`password`で`.password`認証を組み立てる。
     /// 失敗時は`fail(message:)`を呼びnilを返す。
@@ -348,6 +366,17 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
 
     public func disconnect() {
         session?.disconnect()
+    }
+
+    /// Phase 1F-4(#51): スクロールバックのスワイプUI用。Android版
+    /// `actions.onScrollbackCells`相当。セッション未確立時は空配列を返す。
+    public func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData] {
+        session?.scrollbackCells(offset: offset, rows: rows) ?? []
+    }
+
+    /// Android版`uiState.scrollbackLen`相当。セッション未確立時は0を返す。
+    public func scrollbackLen() -> UInt32 {
+        session?.scrollbackLen() ?? 0
     }
 
     /// 保留中のagent署名要求に応答する(UI、MainActorから呼ぶ)。
