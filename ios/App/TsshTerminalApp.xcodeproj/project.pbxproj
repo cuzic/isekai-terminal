@@ -15,6 +15,7 @@
 		AAAABBBBCCCC000000000026 /* TsshCore in Frameworks */ = {isa = PBXBuildFile; productRef = AAAABBBBCCCC000000000017 /* TsshCore */; };
 		AAAABBBBCCCC000000000028 /* KeyListModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC000000000027 /* KeyListModelTests.swift */; };
 		AAAABBBBCCCC00000000002A /* KeyImportModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC000000000029 /* KeyImportModelTests.swift */; };
+		AAAABBBBCCCC000000000039 /* TerminalSessionControllerE2ETests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC000000000038 /* TerminalSessionControllerE2ETests.swift */; };
 		AAAABBBBCCCC00000000002D /* AppLaunchUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAABBBBCCCC00000000002C /* AppLaunchUITests.swift */; };
 /* End PBXBuildFile section */
 
@@ -44,6 +45,7 @@
 		AAAABBBBCCCC00000000001C /* CredentialVaultTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CredentialVaultTests.swift; sourceTree = "<group>"; };
 		AAAABBBBCCCC000000000027 /* KeyListModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyListModelTests.swift; sourceTree = "<group>"; };
 		AAAABBBBCCCC000000000029 /* KeyImportModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyImportModelTests.swift; sourceTree = "<group>"; };
+		AAAABBBBCCCC000000000038 /* TerminalSessionControllerE2ETests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSessionControllerE2ETests.swift; sourceTree = "<group>"; };
 		AAAABBBBCCCC00000000002B /* TsshTerminalAppUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TsshTerminalAppUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		AAAABBBBCCCC00000000002C /* AppLaunchUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLaunchUITests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -111,6 +113,7 @@
 				AAAABBBBCCCC00000000001C /* CredentialVaultTests.swift */,
 				AAAABBBBCCCC000000000027 /* KeyListModelTests.swift */,
 				AAAABBBBCCCC000000000029 /* KeyImportModelTests.swift */,
+				AAAABBBBCCCC000000000038 /* TerminalSessionControllerE2ETests.swift */,
 			);
 			path = TsshTerminalAppTests;
 			sourceTree = "<group>";
@@ -260,6 +263,7 @@
 				AAAABBBBCCCC00000000001D /* CredentialVaultTests.swift in Sources */,
 				AAAABBBBCCCC000000000028 /* KeyListModelTests.swift in Sources */,
 				AAAABBBBCCCC00000000002A /* KeyImportModelTests.swift in Sources */,
+				AAAABBBBCCCC000000000039 /* TerminalSessionControllerE2ETests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

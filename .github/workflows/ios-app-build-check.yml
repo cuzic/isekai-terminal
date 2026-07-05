@@ -7,6 +7,10 @@ name: iOS app build check
 #
 # rust-core/isekai-helper側のビルド前提・XCFramework生成手順は
 # ios-rust-core-check.ymlと同じ(公開リポジトリなのでmacOSランナーは無課金)。
+#
+# Phase 1D: TerminalSessionControllerE2ETests(実sshdへの接続+CredentialVault
+# 経由の鍵解決を検証する)がCI fixtureを必要とするため、ここでも起動する
+# (ios-ssh-vertical-slice-check.ymlとはポートを分けて2298を使う)。
 
 on:
   push:
@@ -75,6 +79,9 @@ jobs:
         working-directory: ios/App
         run: xcodebuild -resolvePackageDependencies -project TsshTerminalApp.xcodeproj -scheme TsshTerminalApp
 
+      - name: Start sshd fixture
+        run: bash rust-core/scripts/ios-fixture/start-sshd-fixture.sh /tmp/ios-fixture 2298
+
       - name: Pick an available iOS Simulator device
         id: sim
         run: |
@@ -105,3 +112,7 @@ jobs:
             -project TsshTerminalApp.xcodeproj \
             -scheme TsshTerminalApp \
             -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}'
+
+      - name: Stop sshd fixture
+        if: always()
+        run: bash rust-core/scripts/ios-fixture/stop-sshd-fixture.sh /tmp/ios-fixture
