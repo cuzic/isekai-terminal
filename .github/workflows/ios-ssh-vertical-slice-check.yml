@@ -8,8 +8,10 @@ name: iOS SSH vertical slice check
 # (SshVerticalSliceTests自体もfixture不在ならXCTSkipする二重の安全策)。
 #
 # Phase 1D: KeyManagerTests.testGeneratedKeyAuthenticatesAgainstRealSshd(生成した
-# ed25519鍵が実際にsshdで認証に使えることの検証)もこのfixtureを使うため、
-# ここで-only-testingに追加している。
+# ed25519鍵が実際にsshdで認証に使えることの検証)・TerminalSessionControllerTests.
+# testConnectReceivesRealScreenUpdateFromFixture(ターミナル本画面のSSH接続
+# コントローラが実際にonConnected/onScreenUpdateを受け取れることの検証)も
+# このfixtureを使うため、ここで-only-testingに追加している。
 
 on:
   push:
@@ -96,6 +98,7 @@ jobs:
             -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}' \
             -only-testing:TsshCoreTests/SshVerticalSliceTests \
             -only-testing:TsshCoreTests/KeyManagerTests/testGeneratedKeyAuthenticatesAgainstRealSshd \
+            -only-testing:TsshCoreTests/TerminalSessionControllerTests/testConnectReceivesRealScreenUpdateFromFixture \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
       - name: Stop sshd fixture
