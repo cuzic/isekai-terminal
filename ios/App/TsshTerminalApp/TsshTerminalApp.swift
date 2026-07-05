@@ -16,7 +16,11 @@ private enum AppRoute: Hashable {
     case profileEdit(ConnectionProfile?)
     case keyList
     case keyImport
-    case terminal(profile: ConnectionProfile, password: String?, jumpPassword: String?)
+    /// Phase 1G-2(#54): 複数タブ/複数セッションのホスト画面。旧`.terminal(profile:...)`
+    /// (1画面1セッション)から置き換えた。状態は関連値ではなく`AppRootView`が保持する
+    /// `TerminalTabsModel`側にあるため、associated valueを持たない
+    /// (`AppRootView`が離れて戻ってきても同じ`tabsModel`インスタンスを参照する)。
+    case terminalHost
     case diagnostics
     case snippetList
     case snippetEdit(Snippet?)
@@ -24,13 +28,25 @@ private enum AppRoute: Hashable {
 
 struct AppRootView: View {
     @State private var path: [AppRoute] = []
+    // `@StateObject`のプロパティ宣言に直接デフォルト式を書かず、明示的な`init`内で
+    // `StateObject(wrappedValue:)`のautoclosure経由で構築する(`ProfileEditView`等
+    // 既存コードと同じ回避策 — `@MainActor`な型のデフォルト式が呼び出し側の
+    // 非isolatedなコンテキストで評価されコンパイルエラーになる問題を避けるため)。
+    @StateObject private var tabsModel: TerminalTabsModel
+
+    init() {
+        _tabsModel = StateObject(wrappedValue: TerminalTabsModel())
+    }
 
     var body: some View {
         NavigationStack(path: $path) {
             ProfileListView(
                 model: ProfileListModel(),
                 onConnect: { profile, password, jumpPassword in
-                    path.append(.terminal(profile: profile, password: password, jumpPassword: jumpPassword))
+                    tabsModel.openTab(profile: profile, password: password, jumpPassword: jumpPassword)
+                    if !path.contains(.terminalHost) {
+                        path.append(.terminalHost)
+                    }
                 },
                 onAddProfile: { path.append(.profileEdit(nil)) },
                 onEditProfile: { profile in path.append(.profileEdit(profile)) },
@@ -54,8 +70,11 @@ struct AppRootView: View {
                         onSave: { path.removeLast() },
                         onCancel: { path.removeLast() }
                     )
-                case .terminal(let profile, let password, let jumpPassword):
-                    TerminalView(profile: profile, password: password, jumpPassword: jumpPassword)
+                case .terminalHost:
+                    TerminalTabsHostView(
+                        tabsModel: tabsModel,
+                        onAllTabsClosed: { path.removeAll { $0 == .terminalHost } }
+                    )
                 case .diagnostics:
                     ContentView()
                 case .snippetList:

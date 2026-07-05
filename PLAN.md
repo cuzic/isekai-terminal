@@ -2511,6 +2511,54 @@ config構築ロジックと同様、`offsetToCellPos`/`reconstructSelectionText`
   `fetchSnippets(forProfileId:)`を呼び、選択したスニペットを
   `SnippetCommands.toBytes(snippet:)`で送信する。
 
+### Phase 1G-2(#54)実装メモ(2026-07-05、複数タブ/複数セッション対応)
+
+Explore agentでAndroid版`TerminalTabsViewModel.kt`(`TabState`/タブ追加・切替・
+クローズ・`watchTab`による非アクティブタブの継続動作・単一FGS共有)と
+`TerminalHostScreen.kt`(タブバーUI)を事前調査した上で実装した。
+
+**スコープ限定(意図的)**: Android版のマルチセッション生存は共有Foreground
+Serviceに支えられているが、iOSにFGS相当の仕組みは無い。このタスクは
+「アプリがフォアグラウンドの間、複数セッションを同時に維持する」ことだけを
+スコープとし、バックグラウンドでの生存は#14(バックグラウンド遷移対応)に
+委ねる(Explore agentの調査結果を踏まえた判断)。
+
+**Android版からの意図的なUX変更(プラットフォーム制約への適応)**: Android版は
+タブ追加用の「+」を持たず、プロファイル一覧へ戻って再接続することで新規タブを
+開く(`tabsVm`がActivity scopeで生き続けるため可能)。iOSの`NavigationStack`は
+ポップされたdestinationを保持しない(破棄される)ため、同じ手段を採ると
+タブ一覧画面から一度離れただけで全セッションが切断されてしまう。そのため
+iOS版はタブバーに明示的な「+」ボタンを持たせ、タブ一覧画面(`TerminalTabsHostView`)
+から離れずに新しいタブを開けるようにした。`.navigationBarBackButtonHidden(true)`
+も設定し、システムの戻るジェスチャで誤って全セッションを切断しないようにした
+(Android版の「全タブを閉じたときだけ一覧へ戻る」という設計と実質的に同じ効果)。
+
+**実装**:
+- `TerminalTabsModel`(新規`TerminalTabsHostView.swift`): `[Tab]`(`profile`+
+  `controller`)+`activeTabId`を持つ。`openTab`はAndroid版`openTab`と同じく
+  タブを開いた瞬間に`controller.connect()`を呼ぶ(Viewのマウントタイミングに
+  依存しない)。
+- `TerminalView`のinitを「profileから内部でcontrollerを構築する」方式から
+  「外部(`TerminalTabsModel`)が構築したcontrollerを受け取る」方式へ変更した。
+  `.onAppear`での`connect()`呼び出しは削除した(`openTab`が既に呼んでいるため、
+  二重呼び出しを避ける)。
+- 複数タブの`TerminalView`を`ZStack`に**同時にマウントしたまま**、非アクティブな
+  ものは`.opacity(0)`+`.allowsHitTesting(false)`にする方式にした(Android版が
+  全タブのComposableをコンポジションに残したままゼロサイズにするのと同じ狙い:
+  スクロール位置・選択範囲・IME状態をタブ切替時も保持する)。
+- `isActive`フラグを`TerminalView`→`TerminalInputRepresentable`まで通し、
+  アクティブなタブだけがIMEのfirst responderを持つようにした(非アクティブに
+  なったら`resignFirstResponder()`)。これが無いと複数タブ同時マウント時に
+  どのタブがキーボード入力を受け取るか不定になる。
+- タブバー(`TerminalTabsHostView.tabBar`)の状態ドット(緑=接続済み/黄=接続中/
+  灰=それ以外)は各タブの`controller.uiState`を`@ObservedObject`で直接観測する
+  (`TabChip`)。テーマ切替🎨相当の機能はこのタスクのスコープ外。
+
+**テスト**: `TerminalTabsModel`の状態遷移(`openTab`/`setActiveTab`/`closeTab`)を
+ネットワーク非依存でテストした(`TerminalTabsModelTests.swift`、存在しない
+`keyEntryId`を使い`resolveAuth`が即座に失敗して`connect()`がネットワークに
+触れる前に終わることを利用、既存の`TerminalSessionControllerTests`と同じ手法)。
+
 ---
 
 ## 実装順序

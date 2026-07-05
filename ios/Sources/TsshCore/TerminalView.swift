@@ -1,14 +1,26 @@
 import SwiftUI
 import UIKit
+import TsshCoreLogic
 
 /// Phase 1D(#18b): ターミナル本画面。SSH接続・VTE画面(`ScreenUpdate`)描画・
 /// 日本語IME統合・特殊キーのアクセサリバーを1画面にまとめる。
 ///
 /// cols/rowsは現時点では固定(80x24)。実際のview sizeやDynamic Type設定に応じた
 /// 動的リサイズ(`SshSession.resize(cols:rows:)`は既に存在する)は後続の改善候補。
+///
+/// Phase 1G-2(#54): 複数タブ対応のため、`controller`は外部(`TerminalTabsModel`)から
+/// 注入される(このView自身は構築しない)。接続開始(`connect()`)もタブモデル側の
+/// 責務(タブを開いた瞬間に呼ぶ、Android版`TerminalTabsViewModel.openTab`と同じ方針)
+/// にし、このViewの`.onAppear`では呼ばない — 複数タブを同時にマウントしたまま
+/// 表示/非表示を切り替える(Android版`key(tabId)`+ゼロサイズ方式と対称)ため、
+/// マウントとconnect()のタイミングを分離する必要があるため。
 public struct TerminalView: View {
     @State private var controller: TerminalSessionController
     @ObservedObject private var uiState: TerminalUIState
+    /// Phase 1G-2(#54): このタブが現在アクティブ(表示中)かどうか。非アクティブな間も
+    /// セッションは接続を維持するが、IMEのfirst responderは持たない
+    /// (`TerminalInputRepresentable`参照)。
+    private let isActive: Bool
     /// Phase 1F-1(#48): 現在の選択範囲。`TerminalScreenView`(UIKit側)からの通知で更新され、
     /// フローティングツールバーの表示・コピー/キャンセル操作の両方に使う。
     @State private var selection: SelectionRange?
@@ -26,15 +38,14 @@ public struct TerminalView: View {
     private let db: ProfileDatabase
 
     public init(
+        controller: TerminalSessionController,
         profile: ConnectionProfile,
-        password: String?,
-        jumpPassword: String? = nil,
-        trustStore: SshHostTrustStore = AppServices.shared.trustStore,
+        isActive: Bool = true,
         db: ProfileDatabase = AppServices.shared.db
     ) {
-        let c = TerminalSessionController(profile: profile, password: password, jumpPassword: jumpPassword, trustStore: trustStore)
-        _controller = State(initialValue: c)
-        _uiState = ObservedObject(wrappedValue: c.uiState)
+        _controller = State(initialValue: controller)
+        _uiState = ObservedObject(wrappedValue: controller.uiState)
+        self.isActive = isActive
         self.profileId = profile.id
         self.db = db
     }
@@ -47,7 +58,7 @@ public struct TerminalView: View {
             )
             .accessibilityIdentifier("terminalScreen")
 
-            TerminalInputRepresentable(controller: controller, uiState: uiState, onShowSnippets: { showSnippetSheet = true })
+            TerminalInputRepresentable(controller: controller, uiState: uiState, isActive: isActive, onShowSnippets: { showSnippetSheet = true })
                 .frame(width: 1, height: 1)
                 .opacity(0.01) // 非表示にしつつfirstResponderにはなれる状態を保つ
 
@@ -68,7 +79,6 @@ public struct TerminalView: View {
         .background(Color.black)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            controller.connect()
             snippets = (try? db.fetchSnippets(forProfileId: profileId)) ?? []
         }
         .onDisappear { controller.disconnect() }
@@ -214,20 +224,33 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
 private struct TerminalInputRepresentable: UIViewRepresentable {
     let controller: TerminalSessionController
     @ObservedObject var uiState: TerminalUIState
+    /// Phase 1G-2(#54): 複数タブが同時にマウントされる中でも、アクティブなタブだけが
+    /// IMEのfirst responderを持つようにする(非アクティブなタブは接続を維持したまま
+    /// キーボード入力を受け取らない)。
+    let isActive: Bool
     let onShowSnippets: () -> Void
 
     func makeUIView(context: Context) -> TerminalIMEInputView {
         let view = TerminalIMEInputView()
         view.onSendBytes = { [weak controller] data in controller?.send(data) }
         view.inputAccessoryView = TerminalAccessoryBar(controller: controller, inputView: view, onShowSnippets: onShowSnippets)
-        DispatchQueue.main.async {
-            view.becomeFirstResponder()
+        if isActive {
+            DispatchQueue.main.async {
+                view.becomeFirstResponder()
+            }
         }
         return view
     }
 
     func updateUIView(_ uiView: TerminalIMEInputView, context: Context) {
         uiView.bracketedPasteMode = uiState.latestScreenUpdate?.bracketedPasteMode ?? false
+        if isActive {
+            if !uiView.isFirstResponder {
+                DispatchQueue.main.async { uiView.becomeFirstResponder() }
+            }
+        } else if uiView.isFirstResponder {
+            uiView.resignFirstResponder()
+        }
     }
 }
 
