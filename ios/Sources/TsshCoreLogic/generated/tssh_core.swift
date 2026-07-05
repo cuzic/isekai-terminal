@@ -2658,6 +2658,331 @@ public func FfiConverterTypeSessionOrchestrator_lower(_ value: SessionOrchestrat
 
 
 
+/**
+ * `SessionState`×`ExecutionMode`の2軸FSMを保持する、判断ロジックのみのオブジェクト。
+ * 意図的にどのtransport(`SshSession`/`HelperQuicSession`等)とも結び付けていない
+ * (`.claude/rules/rust-ssot.md`が要求する「状態と、それに基づく意思決定ロジックは
+ * Rust側に置く」を満たす最小単位として切り出し、実際の接続開始/切断呼び出しは
+ * 呼び出し側(Kotlin/Swift)が現在の状態を見て行う。既存`SessionOrchestrator`の
+ * `ConnPhase`(Idle/Connecting/Connected)を置き換えるかどうかは別途判断が必要な
+ * 大きめの移行のため#24のスコープには含めず、まずはこの新しいFSM自体を
+ * 単体テスト可能な形で実装することを優先した。PLAN.md「Phase 1C(#24)実装メモ」参照)。
+ */
+public protocol SessionSupervisorProtocol: AnyObject, Sendable {
+    
+    /**
+     * アプリ終了(`applicationWillTerminate`相当)。以降の再利用は想定しない終端。
+     */
+    func applicationWillTerminate() 
+    
+    func executionMode()  -> ExecutionMode
+    
+    /**
+     * バックグラウンド猶予(`budget_ms`)が尽きた、またはOSにより実際に一時停止/
+     * 終了させられたことを通知する。`Quiescing`中のみ`Suspended`へ遷移する。
+     */
+    func markSuspended() 
+    
+    /**
+     * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを
+     * 終了される可能性が高まったとみなし、`Quiescing`中であれば猶予を待たず
+     * 保守的に`Suspended`扱いにする(実際に終了されるとは限らないが、次の
+     * フォアグラウンド復帰時に「再接続が必要」側へ倒しておく方が、ユーザーに
+     * 無言で固まった画面を見せるより安全という判断)。
+     */
+    func memoryWarning() 
+    
+    /**
+     * 接続試行が失敗したことを通知する(ハンドシェイク失敗・タイムアウト等)。
+     */
+    func onConnectFailed() 
+    
+    /**
+     * 接続試行を開始したことを通知する。
+     */
+    func onConnectRequested() 
+    
+    /**
+     * 接続確立(または再接続成功)を通知する。`Connecting`/`Resuming`のどちらからでも
+     * `Active`へ遷移できる(`Resuming`はフォアグラウンド復帰後の再接続が成功した場合)。
+     */
+    func onConnected() 
+    
+    /**
+     * 切断(意図的/エラー問わず)を通知する。
+     */
+    func onDisconnected() 
+    
+    /**
+     * `Closing`中の後始末(実トランスポートの切断)が完了したことを通知する。
+     */
+    func onTerminated() 
+    
+    /**
+     * アプリがバックグラウンドへ遷移したことを通知する。`budget_ms`は
+     * `UIApplication.beginBackgroundTask`等が保証する猶予の目安(実際の期限管理は
+     * 呼び出し側が持つ。PLAN.md外部レビュー論点10参照、Rust側では記録しない)。
+     * `Active`の場合のみ`Quiescing`へ遷移する(`Disconnected`/`Connecting`中に
+     * バックグラウンド化しても新規にセッションを維持し始めるわけではないため、
+     * `session_state`自体は変えない)。
+     */
+    func prepareForBackground(budgetMs: UInt32) 
+    
+    /**
+     * アプリがフォアグラウンドへ復帰したことを通知する。`Quiescing`は猶予内に
+     * 復帰できたとみなしそのまま`Active`へ戻す(接続は生きている前提)。
+     * `Suspended`は既に接続が失われている前提のため`Resuming`にし、呼び出し側が
+     * 実際に再接続してから`on_connected()`を呼ぶ必要がある。
+     */
+    func resumeFromForeground() 
+    
+    func sessionState()  -> SessionState
+    
+}
+/**
+ * `SessionState`×`ExecutionMode`の2軸FSMを保持する、判断ロジックのみのオブジェクト。
+ * 意図的にどのtransport(`SshSession`/`HelperQuicSession`等)とも結び付けていない
+ * (`.claude/rules/rust-ssot.md`が要求する「状態と、それに基づく意思決定ロジックは
+ * Rust側に置く」を満たす最小単位として切り出し、実際の接続開始/切断呼び出しは
+ * 呼び出し側(Kotlin/Swift)が現在の状態を見て行う。既存`SessionOrchestrator`の
+ * `ConnPhase`(Idle/Connecting/Connected)を置き換えるかどうかは別途判断が必要な
+ * 大きめの移行のため#24のスコープには含めず、まずはこの新しいFSM自体を
+ * 単体テスト可能な形で実装することを優先した。PLAN.md「Phase 1C(#24)実装メモ」参照)。
+ */
+open class SessionSupervisor: SessionSupervisorProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_tssh_core_fn_clone_sessionsupervisor(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_tssh_core_fn_free_sessionsupervisor(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * アプリ終了(`applicationWillTerminate`相当)。以降の再利用は想定しない終端。
+     */
+open func applicationWillTerminate()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_application_will_terminate(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+open func executionMode() -> ExecutionMode  {
+    return try!  FfiConverterTypeExecutionMode_lift(try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_execution_mode(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * バックグラウンド猶予(`budget_ms`)が尽きた、またはOSにより実際に一時停止/
+     * 終了させられたことを通知する。`Quiescing`中のみ`Suspended`へ遷移する。
+     */
+open func markSuspended()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_mark_suspended(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを
+     * 終了される可能性が高まったとみなし、`Quiescing`中であれば猶予を待たず
+     * 保守的に`Suspended`扱いにする(実際に終了されるとは限らないが、次の
+     * フォアグラウンド復帰時に「再接続が必要」側へ倒しておく方が、ユーザーに
+     * 無言で固まった画面を見せるより安全という判断)。
+     */
+open func memoryWarning()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_memory_warning(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * 接続試行が失敗したことを通知する(ハンドシェイク失敗・タイムアウト等)。
+     */
+open func onConnectFailed()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_on_connect_failed(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * 接続試行を開始したことを通知する。
+     */
+open func onConnectRequested()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_on_connect_requested(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * 接続確立(または再接続成功)を通知する。`Connecting`/`Resuming`のどちらからでも
+     * `Active`へ遷移できる(`Resuming`はフォアグラウンド復帰後の再接続が成功した場合)。
+     */
+open func onConnected()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_on_connected(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * 切断(意図的/エラー問わず)を通知する。
+     */
+open func onDisconnected()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_on_disconnected(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * `Closing`中の後始末(実トランスポートの切断)が完了したことを通知する。
+     */
+open func onTerminated()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_on_terminated(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * アプリがバックグラウンドへ遷移したことを通知する。`budget_ms`は
+     * `UIApplication.beginBackgroundTask`等が保証する猶予の目安(実際の期限管理は
+     * 呼び出し側が持つ。PLAN.md外部レビュー論点10参照、Rust側では記録しない)。
+     * `Active`の場合のみ`Quiescing`へ遷移する(`Disconnected`/`Connecting`中に
+     * バックグラウンド化しても新規にセッションを維持し始めるわけではないため、
+     * `session_state`自体は変えない)。
+     */
+open func prepareForBackground(budgetMs: UInt32)  {try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_prepare_for_background(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(budgetMs),$0
+    )
+}
+}
+    
+    /**
+     * アプリがフォアグラウンドへ復帰したことを通知する。`Quiescing`は猶予内に
+     * 復帰できたとみなしそのまま`Active`へ戻す(接続は生きている前提)。
+     * `Suspended`は既に接続が失われている前提のため`Resuming`にし、呼び出し側が
+     * 実際に再接続してから`on_connected()`を呼ぶ必要がある。
+     */
+open func resumeFromForeground()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_resume_from_foreground(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+open func sessionState() -> SessionState  {
+    return try!  FfiConverterTypeSessionState_lift(try! rustCall() {
+    uniffi_tssh_core_fn_method_sessionsupervisor_session_state(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionSupervisor: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = SessionSupervisor
+
+    public static func lift(_ handle: UInt64) throws -> SessionSupervisor {
+        return SessionSupervisor(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: SessionSupervisor) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionSupervisor {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: SessionSupervisor, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionSupervisor_lift(_ handle: UInt64) throws -> SessionSupervisor {
+    return try FfiConverterTypeSessionSupervisor.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionSupervisor_lower(_ value: SessionSupervisor) -> UInt64 {
+    return FfiConverterTypeSessionSupervisor.lower(value)
+}
+
+
+
+
+
+
 public protocol SshSessionProtocol: AnyObject, Sendable {
     
     func connect(callback: SessionCallback) throws 
@@ -4278,6 +4603,79 @@ public func FfiConverterTypeConnectionPublicState_lower(_ value: ConnectionPubli
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * アプリの実行モード。iOSの`UIApplication.didEnterBackground`/
+ * `willEnterForeground`、Androidの同等のライフサイクルイベントを集約した結果を表す
+ * (PLAN.md外部レビュー論点11の「SceneLifecycleReporter→AppExecutionCoordinator→
+ * Rust SessionSupervisor」のうち、Rust側が受け取る最終形)。
+ */
+
+public enum ExecutionMode: Equatable, Hashable {
+    
+    case foreground
+    case background
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ExecutionMode: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeExecutionMode: FfiConverterRustBuffer {
+    typealias SwiftType = ExecutionMode
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ExecutionMode {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .foreground
+        
+        case 2: return .background
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ExecutionMode, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .foreground:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .background:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeExecutionMode_lift(_ buf: RustBuffer) throws -> ExecutionMode {
+    return try FfiConverterTypeExecutionMode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeExecutionMode_lower(_ value: ExecutionMode) -> RustBuffer {
+    return FfiConverterTypeExecutionMode.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * ポートフォワード待受の状態。`OrchestratorCallback::on_forward_state_changed` で通知される。
  */
 
@@ -4442,6 +4840,154 @@ public func FfiConverterTypeForwardType_lift(_ buf: RustBuffer) throws -> Forwar
 #endif
 public func FfiConverterTypeForwardType_lower(_ value: ForwardType) -> RustBuffer {
     return FfiConverterTypeForwardType.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * セッションの生存状態(接続状態 × バックグラウンド遷移の合成)。PLAN.md「Phase Y」の
+ * 外部レビュー(2026-07-04)で提案された8状態FSMをそのまま採用している。
+ *
+ * **注意**: `crate::session_state::SessionState`(1セッション分のVTE/trzszパーサー状態、
+ * `pub(crate)`でUniFFI越しには公開されない)とは名前が同じだが別物。こちらは
+ * UniFFI越しにKotlin/Swift双方へ公開する「接続ライフサイクル」のFSMで、
+ * 実際のターミナル描画状態は一切持たない。
+ */
+
+public enum SessionState: Equatable, Hashable {
+    
+    /**
+     * 接続試行前、または完全に切断済み。
+     */
+    case disconnected
+    /**
+     * ハンドシェイク/認証中。
+     */
+    case connecting
+    /**
+     * 接続確立済みでフォアグラウンド相当の通常運用中。
+     */
+    case active
+    /**
+     * バックグラウンド遷移が通知され、`ExecutionMode::Background`の間の猶予
+     * (`prepare_for_background`の`budget_ms`)内で接続維持を試みている状態。
+     * 実際の猶予終了判断はSwift側の`beginBackgroundTask`失効コールバックが正
+     * (Rust/Swiftで基準時計を共有していないため、Rust側でタイマーは持たない。
+     * PLAN.md外部レビュー論点10の`budget_ms`化と同じ理由)。
+     */
+    case quiescing
+    /**
+     * バックグラウンド猶予が尽きた(呼び出し側が`mark_suspended`を呼んだ)、または
+     * OSにプロセスを一時停止/終了された後。実際のトランスポートは既に失われている
+     * 前提で、次にフォアグラウンド復帰した際は再接続(reconnect)が必要になる。
+     */
+    case suspended
+    /**
+     * フォアグラウンド復帰が通知され、再接続/セッション有効性確認を行っている状態。
+     */
+    case resuming
+    /**
+     * 意図的な切断処理が進行中(ユーザーによる切断・アプリ終了通知後の後始末等)。
+     */
+    case closing
+    /**
+     * 完全に終了した終端状態。
+     */
+    case closed
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SessionState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionState: FfiConverterRustBuffer {
+    typealias SwiftType = SessionState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .disconnected
+        
+        case 2: return .connecting
+        
+        case 3: return .active
+        
+        case 4: return .quiescing
+        
+        case 5: return .suspended
+        
+        case 6: return .resuming
+        
+        case 7: return .closing
+        
+        case 8: return .closed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SessionState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .disconnected:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .connecting:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .active:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .quiescing:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .suspended:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .resuming:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .closing:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .closed:
+            writeInt(&buf, Int32(8))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionState_lift(_ buf: RustBuffer) throws -> SessionState {
+    return try FfiConverterTypeSessionState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionState_lower(_ value: SessionState) -> RustBuffer {
+    return FfiConverterTypeSessionState.lower(value)
 }
 
 
@@ -6648,6 +7194,12 @@ public func createQuicSession(config: QuicConfig) -> QuicSession  {
     )
 })
 }
+public func createSessionSupervisor() -> SessionSupervisor  {
+    return try!  FfiConverterTypeSessionSupervisor_lift(try! rustCall() {
+    uniffi_tssh_core_fn_func_create_session_supervisor($0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -6719,6 +7271,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_func_create_quic_session() != 25547) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_func_create_session_supervisor() != 43886) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_method_diagnosticeventqueue_drain_events() != 34129) {
@@ -6998,6 +7553,42 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_method_quicsession_trzsz_send_chunk() != 12522) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_application_will_terminate() != 690) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_execution_mode() != 16415) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_mark_suspended() != 26228) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_memory_warning() != 54621) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_on_connect_failed() != 63876) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_on_connect_requested() != 17811) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_on_connected() != 41642) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_on_disconnected() != 49117) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_on_terminated() != 21123) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_prepare_for_background() != 23290) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_resume_from_foreground() != 37188) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_sessionsupervisor_session_state() != 5184) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_constructor_diagnosticeventqueue_new() != 2755) {
