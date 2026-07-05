@@ -6,6 +6,10 @@ name: iOS SSH vertical slice check
 # ios-rust-core-check.ymlとは別ワークフローにし、fixtureが無い環境でも
 # 既存のテストスイートが壊れないようにしている
 # (SshVerticalSliceTests自体もfixture不在ならXCTSkipする二重の安全策)。
+#
+# Phase 1D: KeyManagerTests.testGeneratedKeyAuthenticatesAgainstRealSshd(生成した
+# ed25519鍵が実際にsshdで認証に使えることの検証)もこのfixtureを使うため、
+# ここで-only-testingに追加している。
 
 on:
   push:
@@ -91,6 +95,7 @@ jobs:
             -scheme TsshCore \
             -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}' \
             -only-testing:TsshCoreTests/SshVerticalSliceTests \
+            -only-testing:TsshCoreTests/KeyManagerTests/testGeneratedKeyAuthenticatesAgainstRealSshd \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
       - name: Stop sshd fixture
