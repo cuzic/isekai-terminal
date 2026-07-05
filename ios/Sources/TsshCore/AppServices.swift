@@ -8,6 +8,7 @@ public final class AppServices {
 
     public let db: ProfileDatabase
     public let vault: CredentialVault
+    public let trustStore: SshHostTrustStore
 
     private init() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -15,6 +16,7 @@ public final class AppServices {
             try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
             db = try ProfileDatabase(path: support.appendingPathComponent("tssh_terminal.sqlite").path)
             vault = try CredentialVault(blobDirectory: support.appendingPathComponent("credential_vault", isDirectory: true))
+            trustStore = try SshHostTrustStore(storeURL: support.appendingPathComponent("ssh_host_trust.json"))
         } catch {
             fatalError("AppServices initialization failed: \(error)")
         }
