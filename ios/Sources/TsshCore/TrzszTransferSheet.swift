@@ -71,7 +71,7 @@ struct TrzszTransferSheet: View {
     private func doneView(success: Bool, message: String?) -> some View {
         Text(success ? "転送完了" : "転送失敗")
             .font(.headline)
-            .foregroundStyle(success ? .primary : .red)
+            .foregroundStyle(success ? Color.primary : Color.red)
         if let message {
             Text(message).foregroundStyle(.secondary)
         }
