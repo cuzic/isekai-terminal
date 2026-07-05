@@ -2484,6 +2484,33 @@ config構築ロジックと同様、`offsetToCellPos`/`reconstructSelectionText`
   コピー処理を修正した(Android版`reconstructSelectionText(displayUpdate, sel)`と
   同じ)。
 
+### Phase 1F-5/1G-1(#52/#53)実装メモ(2026-07-05、アクセサリバー拡充+定型コマンド)
+
+#52(^D/^Z/定型文シート)は#53(定型コマンド管理画面)のデータモデルに依存するため、
+まとめて実装した。Android版`data/Snippet.kt`(Room `@Entity`)+`SnippetCommands.kt`+
+`SnippetListScreen.kt`/`SnippetEditScreen.kt`/`SnippetListViewModel.kt`/
+`SnippetEditViewModel.kt`をSwiftへ1:1移植した。
+
+- `ProfileDatabase.swift`に`Snippet`(GRDBレコード)+`v3_create_snippets`
+  migrationを追加(`connection_profile`と違い、Android版もFK制約を付けていない
+  ため、iOS版も`profileId`カラムに明示的なFK制約を付けない — プロファイル削除で
+  スニペットが孤立しても実害が無いため)。`fetchSnippets(forProfileId:)`は
+  Android版`SnippetDao.getForProfile`(`WHERE profile_id IS NULL OR
+  profile_id = :profileId`)と同じクエリで、全プロファイル共通+指定
+  プロファイル専用の両方を返す。
+- `SnippetCommands.toBytes(command:appendNewline:)`はAndroid版と同じ正規化
+  ロジック(`\r\n`/`\n`を`\r`に統一、`appendNewline`時は末尾に`\r`を追加)の
+  純粋関数として移植・テストした。
+- 新規`SnippetListView.swift`/`SnippetEditView.swift`(Android版の一覧/編集画面と
+  同じUI)。`ProfileListView`のメニューに「定型コマンド」項目を追加し、
+  `TsshTerminalApp.swift`のナビゲーションに`.snippetList`/`.snippetEdit`を追加した。
+- `TerminalAccessoryBar`に^C/^D/^Zの制御バイト直接送信ボタン(Android版が
+  トグル式Ctrlボタンとは別に持つ即時送信ショートカット)と「定型」ボタン
+  (SwiftUI側の`showSnippetSheet`をトリガーするクロージャ経由)を追加した。
+  定型コマンド選択シート(`SnippetPickerSheet`)は現在のプロファイルIDで
+  `fetchSnippets(forProfileId:)`を呼び、選択したスニペットを
+  `SnippetCommands.toBytes(snippet:)`で送信する。
+
 ---
 
 ## 実装順序

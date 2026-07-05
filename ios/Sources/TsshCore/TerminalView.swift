@@ -19,16 +19,24 @@ public struct TerminalView: View {
     /// `TerminalScreenView`(UIKit側)からの通知で更新され、「ライブへ戻る」ボタンからも
     /// 0を書き戻す(`selection`/`fontScale`と同じ双方向バインディング)。
     @State private var scrollOffset: UInt32 = 0
+    /// Phase 1F-5(#52): 定型コマンドシート。Android版`showSnippetSheet`と対称。
+    @State private var showSnippetSheet = false
+    @State private var snippets: [Snippet] = []
+    private let profileId: Int64?
+    private let db: ProfileDatabase
 
     public init(
         profile: ConnectionProfile,
         password: String?,
         jumpPassword: String? = nil,
-        trustStore: SshHostTrustStore = AppServices.shared.trustStore
+        trustStore: SshHostTrustStore = AppServices.shared.trustStore,
+        db: ProfileDatabase = AppServices.shared.db
     ) {
         let c = TerminalSessionController(profile: profile, password: password, jumpPassword: jumpPassword, trustStore: trustStore)
         _controller = State(initialValue: c)
         _uiState = ObservedObject(wrappedValue: c.uiState)
+        self.profileId = profile.id
+        self.db = db
     }
 
     public var body: some View {
@@ -39,7 +47,7 @@ public struct TerminalView: View {
             )
             .accessibilityIdentifier("terminalScreen")
 
-            TerminalInputRepresentable(controller: controller, uiState: uiState)
+            TerminalInputRepresentable(controller: controller, uiState: uiState, onShowSnippets: { showSnippetSheet = true })
                 .frame(width: 1, height: 1)
                 .opacity(0.01) // 非表示にしつつfirstResponderにはなれる状態を保つ
 
@@ -59,8 +67,20 @@ public struct TerminalView: View {
         }
         .background(Color.black)
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear { controller.connect() }
+        .onAppear {
+            controller.connect()
+            snippets = (try? db.fetchSnippets(forProfileId: profileId)) ?? []
+        }
         .onDisappear { controller.disconnect() }
+        .sheet(isPresented: $showSnippetSheet) {
+            SnippetPickerSheet(
+                snippets: snippets,
+                onPick: { snippet in
+                    controller.send(SnippetCommands.toBytes(snippet: snippet))
+                    showSnippetSheet = false
+                }
+            )
+        }
         .alert(
             "Agent署名要求",
             isPresented: Binding(
@@ -194,11 +214,12 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
 private struct TerminalInputRepresentable: UIViewRepresentable {
     let controller: TerminalSessionController
     @ObservedObject var uiState: TerminalUIState
+    let onShowSnippets: () -> Void
 
     func makeUIView(context: Context) -> TerminalIMEInputView {
         let view = TerminalIMEInputView()
         view.onSendBytes = { [weak controller] data in controller?.send(data) }
-        view.inputAccessoryView = TerminalAccessoryBar(controller: controller, inputView: view)
+        view.inputAccessoryView = TerminalAccessoryBar(controller: controller, inputView: view, onShowSnippets: onShowSnippets)
         DispatchQueue.main.async {
             view.becomeFirstResponder()
         }
@@ -225,10 +246,19 @@ private final class TerminalAccessoryBar: UIView {
     // `imeInputView`という別名にする。
     private weak var imeInputView: TerminalIMEInputView?
     private var ctrlButton: UIButton?
+    private let onShowSnippets: () -> Void
 
-    init(controller: TerminalSessionController, inputView: TerminalIMEInputView) {
+    /// Phase 1F-5(#52): ^C/^D/^Zの制御バイト直接送信ボタン。Android版`TerminalScreen.kt`の
+    /// `CtrlBtn("^C") { actions.onSend(byteArrayOf(0x03)) }`等と同じ(トグル式の「Ctrl」
+    /// ボタンとは別の、よく使う3つだけの即時送信ショートカット)。
+    private let controlByteButtons: [(title: String, byte: UInt8)] = [
+        ("^C", 0x03), ("^D", 0x04), ("^Z", 0x1A),
+    ]
+
+    init(controller: TerminalSessionController, inputView: TerminalIMEInputView, onShowSnippets: @escaping () -> Void = {}) {
         self.controller = controller
         self.imeInputView = inputView
+        self.onShowSnippets = onShowSnippets
         super.init(frame: CGRect(x: 0, y: 0, width: 0, height: 44))
         backgroundColor = .secondarySystemBackground
         autoresizingMask = [.flexibleWidth]
@@ -239,6 +269,15 @@ private final class TerminalAccessoryBar: UIView {
 
         let paste = makeButton(title: "貼付", tag: -2)
         paste.addTarget(self, action: #selector(handlePasteTap), for: .touchUpInside)
+
+        let snippets = makeButton(title: "定型", tag: -3)
+        snippets.addTarget(self, action: #selector(handleSnippetsTap), for: .touchUpInside)
+
+        let controlButtons = controlByteButtons.enumerated().map { index, item in
+            let button = makeButton(title: item.title, tag: -10 - index)
+            button.addTarget(self, action: #selector(handleControlByteTap(_:)), for: .touchUpInside)
+            return button
+        }
 
         let labels: [(String, TerminalKeyMapper.SpecialKey)] = [
             ("Esc", .escape),
@@ -255,7 +294,7 @@ private final class TerminalAccessoryBar: UIView {
         self.keys = labels.map { $0.1 }
 
         let keyButtons = labels.enumerated().map { index, item in makeButton(title: item.0, tag: index) }
-        let stack = UIStackView(arrangedSubviews: [ctrl, paste] + keyButtons)
+        let stack = UIStackView(arrangedSubviews: [ctrl] + controlButtons + [paste, snippets] + keyButtons)
         stack.axis = .horizontal
         stack.distribution = .fillEqually
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -306,5 +345,61 @@ private final class TerminalAccessoryBar: UIView {
         guard keys.indices.contains(sender.tag) else { return }
         let bytes = TerminalKeyMapper.bytes(for: keys[sender.tag])
         controller?.send(Data(bytes))
+    }
+
+    /// Phase 1F-5(#52): ^C/^D/^Zの制御バイトを直接送信する。
+    @objc private func handleControlByteTap(_ sender: UIButton) {
+        let index = -sender.tag - 10
+        guard controlByteButtons.indices.contains(index) else { return }
+        controller?.send(Data([controlByteButtons[index].byte]))
+    }
+
+    /// Phase 1F-5(#52): 定型コマンドシートを開く(SwiftUI側、`TerminalView`が保持する)。
+    @objc private func handleSnippetsTap() {
+        onShowSnippets()
+    }
+}
+
+/// Phase 1F-5(#52): 定型コマンド選択シート。Android版`TerminalScreen.kt`の
+/// `SnippetPickerSheet`と同じ役割。
+private struct SnippetPickerSheet: View {
+    let snippets: [Snippet]
+    let onPick: (Snippet) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if snippets.isEmpty {
+                    Text("登録された定型コマンドがありません。プロファイル一覧の「定型コマンド」から追加できます。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .padding()
+                } else {
+                    List(snippets, id: \.id) { snippet in
+                        Button {
+                            onPick(snippet)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(snippet.label)
+                                    .foregroundStyle(.primary)
+                                Text(snippet.command.split(separator: "\n").first.map(String.init) ?? "")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .accessibilityIdentifier("snippetPickerOption_\(snippet.label)")
+                    }
+                }
+            }
+            .navigationTitle("定型コマンド")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("閉じる") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
     }
 }

@@ -220,6 +220,59 @@ public struct ConnectionProfile: Codable, Equatable, Hashable, FetchableRecord, 
     }
 }
 
+/// Phase 1G-1(#53): 定型コマンド(スニペット)。Android版`data.Snippet`相当。
+/// `profileId`がnilなら全プロファイル共通、非nilならそのプロファイル専用として表示される
+/// (Android版と同じくFK制約は付けない — プロファイル削除時に孤立したスニペットが
+/// 残っても単に「該当プロファイルが見つからない」だけで実害が無いため)。
+public struct Snippet: Codable, Equatable, Hashable, FetchableRecord, MutablePersistableRecord {
+    public var id: Int64?
+    public var label: String
+    public var command: String
+    public var sortOrder: Int
+    public var profileId: Int64?
+    public var appendNewline: Bool
+
+    public static let databaseTableName = "snippets"
+
+    public init(
+        id: Int64? = nil,
+        label: String,
+        command: String,
+        sortOrder: Int = 0,
+        profileId: Int64? = nil,
+        appendNewline: Bool = true
+    ) {
+        self.id = id
+        self.label = label
+        self.command = command
+        self.sortOrder = sortOrder
+        self.profileId = profileId
+        self.appendNewline = appendNewline
+    }
+
+    public mutating func didInsert(_ inserted: InsertionSuccess) {
+        id = inserted.rowID
+    }
+}
+
+/// Phase 1G-1(#53): スニペットのコマンド文字列をターミナルへ送信するバイト列に変換する
+/// 純粋関数。Android版`SnippetCommands.toBytes`と対称(Rust/UIに依存しないため単体テストが容易)。
+public enum SnippetCommands {
+    /// `command`の各行区切り(`\n`, `\r\n`)を`\r`(CR)に正規化してUTF-8バイト列にする。
+    /// `appendNewline`がtrueかつ末尾がまだ`\r`で終わっていなければ、末尾にも`\r`を追加する
+    /// (=最後の行もEnterされる)。falseなら最後の行はEnterされずに残る。
+    public static func toBytes(command: String, appendNewline: Bool = true) -> Data {
+        guard !command.isEmpty else { return Data() }
+        let normalized = command.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\n", with: "\r")
+        let withTrailing = (appendNewline && !normalized.hasSuffix("\r")) ? normalized + "\r" : normalized
+        return Data(withTrailing.utf8)
+    }
+
+    public static func toBytes(snippet: Snippet) -> Data {
+        toBytes(command: snippet.command, appendNewline: snippet.appendNewline)
+    }
+}
+
 public final class ProfileDatabase {
     public let dbQueue: DatabaseQueue
 
@@ -281,6 +334,16 @@ public final class ProfileDatabase {
                 t.add(column: "helperBindPort", .integer)
             }
         }
+        migrator.registerMigration("v3_create_snippets") { db in
+            try db.create(table: "snippets") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("label", .text).notNull()
+                t.column("command", .text).notNull()
+                t.column("sortOrder", .integer).notNull().defaults(to: 0)
+                t.column("profileId", .integer)
+                t.column("appendNewline", .boolean).notNull().defaults(to: true)
+            }
+        }
         return migrator
     }
 
@@ -322,5 +385,41 @@ public final class ProfileDatabase {
 
     public func fetchProfile(id: Int64) throws -> ConnectionProfile? {
         try dbQueue.read { db in try ConnectionProfile.fetchOne(db, key: id) }
+    }
+
+    // MARK: - Snippet CRUD
+
+    public func insert(snippet: inout Snippet) throws {
+        try dbQueue.write { db in try snippet.insert(db) }
+    }
+
+    public func update(snippet: Snippet) throws {
+        try dbQueue.write { db in try snippet.update(db) }
+    }
+
+    public func deleteSnippet(id: Int64) throws {
+        _ = try dbQueue.write { db in try Snippet.deleteOne(db, key: id) }
+    }
+
+    /// Android版`SnippetDao.getAll`と同じ並び順(sortOrder ASC, label ASC)。
+    public func fetchAllSnippets() throws -> [Snippet] {
+        try dbQueue.read { db in
+            try Snippet.order(Column("sortOrder"), Column("label")).fetchAll(db)
+        }
+    }
+
+    /// Android版`SnippetDao.getForProfile`相当: 全プロファイル共通(`profileId == nil`)
+    /// のスニペットと、指定した`profileId`専用のスニペットの両方を返す。
+    public func fetchSnippets(forProfileId profileId: Int64?) throws -> [Snippet] {
+        try dbQueue.read { db in
+            try Snippet
+                .filter(Column("profileId") == nil || Column("profileId") == profileId)
+                .order(Column("sortOrder"), Column("label"))
+                .fetchAll(db)
+        }
+    }
+
+    public func fetchSnippet(id: Int64) throws -> Snippet? {
+        try dbQueue.read { db in try Snippet.fetchOne(db, key: id) }
     }
 }

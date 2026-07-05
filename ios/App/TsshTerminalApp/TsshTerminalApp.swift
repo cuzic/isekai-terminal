@@ -18,6 +18,8 @@ private enum AppRoute: Hashable {
     case keyImport
     case terminal(profile: ConnectionProfile, password: String?, jumpPassword: String?)
     case diagnostics
+    case snippetList
+    case snippetEdit(Snippet?)
 }
 
 struct AppRootView: View {
@@ -33,6 +35,7 @@ struct AppRootView: View {
                 onAddProfile: { path.append(.profileEdit(nil)) },
                 onEditProfile: { profile in path.append(.profileEdit(profile)) },
                 onManageKeys: { path.append(.keyList) },
+                onManageSnippets: { path.append(.snippetList) },
                 onShowDiagnostics: { path.append(.diagnostics) }
             )
             .navigationDestination(for: AppRoute.self) { route in
@@ -55,6 +58,18 @@ struct AppRootView: View {
                     TerminalView(profile: profile, password: password, jumpPassword: jumpPassword)
                 case .diagnostics:
                     ContentView()
+                case .snippetList:
+                    SnippetListView(
+                        model: SnippetListModel(),
+                        onAddSnippet: { path.append(.snippetEdit(nil)) },
+                        onEditSnippet: { snippet in path.append(.snippetEdit(snippet)) }
+                    )
+                case .snippetEdit(let snippet):
+                    SnippetEditView(
+                        snippet: snippet,
+                        onSave: { path.removeLast() },
+                        onCancel: { path.removeLast() }
+                    )
                 }
             }
         }

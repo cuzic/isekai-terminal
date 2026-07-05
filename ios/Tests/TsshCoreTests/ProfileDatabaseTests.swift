@@ -203,4 +203,102 @@ final class ProfileDatabaseTests: XCTestCase {
         XCTAssertEqual(StoredTransportPreference.auto.asTransportPreference, .auto)
         XCTAssertEqual(StoredTransportPreference.isekaiStunP2pQuic.asTransportPreference, .isekaiStunP2pQuic)
     }
+
+    // MARK: - Phase 1G-1(#53): Snippet CRUD
+
+    func testInsertAndFetchSnippet() throws {
+        let db = try ProfileDatabase.inMemory()
+        var snippet = Snippet(label: "list files", command: "ls -la")
+
+        try db.insert(snippet: &snippet)
+
+        XCTAssertNotNil(snippet.id)
+        let fetched = try db.fetchSnippet(id: snippet.id!)
+        XCTAssertEqual(fetched?.label, "list files")
+        XCTAssertEqual(fetched?.command, "ls -la")
+        XCTAssertTrue(fetched?.appendNewline ?? false)
+        XCTAssertNil(fetched?.profileId)
+    }
+
+    func testUpdateSnippet() throws {
+        let db = try ProfileDatabase.inMemory()
+        var snippet = Snippet(label: "old", command: "echo old")
+        try db.insert(snippet: &snippet)
+
+        snippet.label = "new"
+        snippet.command = "echo new"
+        try db.update(snippet: snippet)
+
+        let fetched = try db.fetchSnippet(id: snippet.id!)
+        XCTAssertEqual(fetched?.label, "new")
+        XCTAssertEqual(fetched?.command, "echo new")
+    }
+
+    func testDeleteSnippet() throws {
+        let db = try ProfileDatabase.inMemory()
+        var snippet = Snippet(label: "temp", command: "echo temp")
+        try db.insert(snippet: &snippet)
+
+        try db.deleteSnippet(id: snippet.id!)
+
+        XCTAssertNil(try db.fetchSnippet(id: snippet.id!))
+    }
+
+    func testFetchAllSnippetsOrderedBySortOrderThenLabel() throws {
+        let db = try ProfileDatabase.inMemory()
+        var b = Snippet(label: "B", command: "echo b", sortOrder: 1)
+        var a = Snippet(label: "A", command: "echo a", sortOrder: 0)
+        var c = Snippet(label: "C", command: "echo c", sortOrder: 1)
+        try db.insert(snippet: &b)
+        try db.insert(snippet: &a)
+        try db.insert(snippet: &c)
+
+        let all = try db.fetchAllSnippets()
+
+        XCTAssertEqual(all.map(\.label), ["A", "B", "C"])
+    }
+
+    func testSnippetWithProfileIdRoundTrips() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        try db.insert(profile: &profile)
+        var snippet = Snippet(label: "profile-specific", command: "echo hi", profileId: profile.id)
+
+        try db.insert(snippet: &snippet)
+
+        let fetched = try db.fetchSnippet(id: snippet.id!)
+        XCTAssertEqual(fetched?.profileId, profile.id)
+    }
+
+    func testFetchSnippetsForProfileIncludesSharedAndProfileSpecific() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profileA = ConnectionProfile(displayName: "A", host: "a.example.com", port: 22, username: "user")
+        var profileB = ConnectionProfile(displayName: "B", host: "b.example.com", port: 22, username: "user")
+        try db.insert(profile: &profileA)
+        try db.insert(profile: &profileB)
+        var shared = Snippet(label: "shared", command: "echo shared")
+        var forA = Snippet(label: "for-a", command: "echo a", profileId: profileA.id)
+        var forB = Snippet(label: "for-b", command: "echo b", profileId: profileB.id)
+        try db.insert(snippet: &shared)
+        try db.insert(snippet: &forA)
+        try db.insert(snippet: &forB)
+
+        let forProfileA = try db.fetchSnippets(forProfileId: profileA.id)
+
+        XCTAssertEqual(Set(forProfileA.map(\.label)), Set(["shared", "for-a"]))
+    }
+
+    func testFetchSnippetsForNilProfileReturnsOnlySharedSnippets() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        try db.insert(profile: &profile)
+        var shared = Snippet(label: "shared", command: "echo shared")
+        var specific = Snippet(label: "specific", command: "echo specific", profileId: profile.id)
+        try db.insert(snippet: &shared)
+        try db.insert(snippet: &specific)
+
+        let result = try db.fetchSnippets(forProfileId: nil)
+
+        XCTAssertEqual(result.map(\.label), ["shared"])
+    }
 }
