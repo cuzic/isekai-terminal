@@ -39,7 +39,68 @@ public struct KeyEntry: Codable, Equatable, FetchableRecord, PersistableRecord {
     }
 }
 
-/// Android版`ConnectionProfile`相当(MVPスコープ、必要に応じて後続Phaseで拡張)。
+/// Android版`PortForward`(uniffi生成のRust型)の保存用の軽量な複製。
+/// `generated/tssh_core.swift`の`PortForward`/`ForwardType`は`Codable`に対応して
+/// いない(別ファイルの型へextensionで`Codable`適合を後付けしてもSwiftは自動合成しない
+/// ため)。GRDBのJSON列として保存できるようこの専用型を使い、実際に接続する際
+/// (Phase 1E-3)に`asPortForward`でRust側の`PortForward`へ変換する。
+public struct StoredPortForward: Codable, Equatable, Hashable {
+    public enum Kind: String, Codable {
+        case local, remote, dynamic
+    }
+
+    public var kind: Kind
+    public var bindAddress: String
+    public var bindPort: UInt16
+    public var remoteHost: String
+    public var remotePort: UInt16
+
+    public init(kind: Kind, bindAddress: String = "127.0.0.1", bindPort: UInt16, remoteHost: String, remotePort: UInt16) {
+        self.kind = kind
+        self.bindAddress = bindAddress
+        self.bindPort = bindPort
+        self.remoteHost = remoteHost
+        self.remotePort = remotePort
+    }
+
+    public var asPortForward: PortForward {
+        let forwardType: ForwardType
+        switch kind {
+        case .local: forwardType = .local
+        case .remote: forwardType = .remote
+        case .dynamic: forwardType = .dynamic
+        }
+        return PortForward(forwardType: forwardType, bindAddress: bindAddress, bindPort: bindPort, remoteHost: remoteHost, remotePort: remotePort)
+    }
+}
+
+/// Android版`TransportPreference`の保存用の軽量な複製(理由は`StoredPortForward`と同じ)。
+/// DBには`rawValue`をTEXTとして保存し、`asTransportPreference`でRust側の実際の
+/// `TransportPreference`へ変換する。
+public enum StoredTransportPreference: String, Codable, Equatable, Hashable, CaseIterable {
+    case plainSsh
+    case tsshdQuic
+    case isekaiHelperQuic
+    case auto
+    case isekaiHelperQuicMultipath
+    case isekaiStunP2pQuic
+    case isekaiLinkRelayQuic
+
+    public var asTransportPreference: TransportPreference {
+        switch self {
+        case .plainSsh: return .plainSsh
+        case .tsshdQuic: return .tsshdQuic
+        case .isekaiHelperQuic: return .isekaiHelperQuic
+        case .auto: return .auto
+        case .isekaiHelperQuicMultipath: return .isekaiHelperQuicMultipath
+        case .isekaiStunP2pQuic: return .isekaiStunP2pQuic
+        case .isekaiLinkRelayQuic: return .isekaiLinkRelayQuic
+        }
+    }
+}
+
+/// Android版`ConnectionProfile`相当。Phase 1E(トランスポート/接続方式パリティ)で
+/// jump host・トランスポート方式・ポートフォワード・agent forward等のフィールドを追加した。
 /// `Hashable`はSwiftUIの`NavigationStack`パス(`AppRoute`)に格納するために必要。
 public struct ConnectionProfile: Codable, Equatable, Hashable, FetchableRecord, MutablePersistableRecord {
     public var id: Int64?
@@ -51,7 +112,49 @@ public struct ConnectionProfile: Codable, Equatable, Hashable, FetchableRecord, 
     public var keyEntryId: String?
     public var createdAt: Date
 
+    /// SSH agent forwarding。既定OFF・プロファイル単位opt-in(Android版と同じ方針)。
+    public var enableAgentForward: Bool
+    /// トランスポート戦略。DBには`StoredTransportPreference.rawValue`を保存する。
+    public var transportPreference: StoredTransportPreference
+    /// マルチパス(path1)用の直接到達アドレス。`isekaiHelperQuicMultipath`選択時のみ使う。
+    public var directAddress: String?
+    /// 実験的機能・既定OFF: Wi-Fi/セルラー物理無線への同時マルチパスも試す。
+    public var enablePhysicalMultipath: Bool
+    /// 実験的機能: セルラー物理path候補だけdirectAddressとは別のリモートアドレスへ向ける。
+    public var cellularRemoteAddress: String?
+    /// 実験的機能・既定OFF: upstream失効検知時にセルラーへ丸ごと切り替える。
+    public var enableUpstreamFailover: Bool
+    /// 接続確立後に自動実行するコマンド列(改行区切り、複数可)。nil/空なら何もしない。
+    public var postConnectCommands: String?
+    /// ローカル/リモート/ダイナミックポートフォワード一覧。GRDBのCodable JSON列として保存。
+    public var forwards: [StoredPortForward]
+    /// 多段SSH(ProxyJump)。nilなら直接接続。
+    public var jumpHost: String?
+    public var jumpPort: Int
+    public var jumpUsername: String?
+    /// nilならパスワード認証(踏み台自身の認証方式)。
+    public var jumpKeyEntryId: String?
+    /// STUN+SSHランデブーP2P(`isekaiStunP2pQuic`)選択時のみ使うSTUNサーバー(host:port)。
+    public var stunServer: String?
+    /// MASQUE relay経由P2P(`isekaiLinkRelayQuic`)選択時のみ使う。`relayJwt`は平文ではなく
+    /// CredentialVault経由で暗号化した値を保存すること(Phase 1E-6で対応、現時点ではまだ
+    /// 平文格納のプレースホルダー)。
+    public var relayAddr: String?
+    public var relaySni: String?
+    public var relayJwt: String?
+    /// ポートフォワードの非ループバックbindを明示許可するか。既定false。
+    public var allowNonLoopbackForwardBind: Bool
+    /// プロファイル単位の配色テーマ既定(`TerminalThemes`のプリセット名)。nilならグローバル既定。
+    public var themeName: String?
+    /// isekai-helper QUICの待受ポートを固定する(nil=OSがエフェメラルポートを選ぶ)。
+    public var helperBindPort: Int?
+
     public static let databaseTableName = "connection_profile"
+
+    /// 踏み台ホストが設定されているか(多段SSHを使うプロファイルか)。
+    public var usesJumpHost: Bool {
+        !(jumpHost?.isEmpty ?? true)
+    }
 
     public init(
         id: Int64? = nil,
@@ -60,7 +163,26 @@ public struct ConnectionProfile: Codable, Equatable, Hashable, FetchableRecord, 
         port: Int,
         username: String,
         keyEntryId: String? = nil,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        enableAgentForward: Bool = false,
+        transportPreference: StoredTransportPreference = .plainSsh,
+        directAddress: String? = nil,
+        enablePhysicalMultipath: Bool = false,
+        cellularRemoteAddress: String? = nil,
+        enableUpstreamFailover: Bool = false,
+        postConnectCommands: String? = nil,
+        forwards: [StoredPortForward] = [],
+        jumpHost: String? = nil,
+        jumpPort: Int = 22,
+        jumpUsername: String? = nil,
+        jumpKeyEntryId: String? = nil,
+        stunServer: String? = nil,
+        relayAddr: String? = nil,
+        relaySni: String? = nil,
+        relayJwt: String? = nil,
+        allowNonLoopbackForwardBind: Bool = false,
+        themeName: String? = nil,
+        helperBindPort: Int? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -69,6 +191,25 @@ public struct ConnectionProfile: Codable, Equatable, Hashable, FetchableRecord, 
         self.username = username
         self.keyEntryId = keyEntryId
         self.createdAt = createdAt
+        self.enableAgentForward = enableAgentForward
+        self.transportPreference = transportPreference
+        self.directAddress = directAddress
+        self.enablePhysicalMultipath = enablePhysicalMultipath
+        self.cellularRemoteAddress = cellularRemoteAddress
+        self.enableUpstreamFailover = enableUpstreamFailover
+        self.postConnectCommands = postConnectCommands
+        self.forwards = forwards
+        self.jumpHost = jumpHost
+        self.jumpPort = jumpPort
+        self.jumpUsername = jumpUsername
+        self.jumpKeyEntryId = jumpKeyEntryId
+        self.stunServer = stunServer
+        self.relayAddr = relayAddr
+        self.relaySni = relaySni
+        self.relayJwt = relayJwt
+        self.allowNonLoopbackForwardBind = allowNonLoopbackForwardBind
+        self.themeName = themeName
+        self.helperBindPort = helperBindPort
     }
 
     public mutating func didInsert(_ inserted: InsertionSuccess) {
@@ -112,6 +253,29 @@ public final class ProfileDatabase {
                 t.column("keyEntryId", .text)
                     .references("key_entry", onDelete: .setNull)
                 t.column("createdAt", .datetime).notNull()
+            }
+        }
+        migrator.registerMigration("v2_add_transport_and_jump_fields") { db in
+            try db.alter(table: "connection_profile") { t in
+                t.add(column: "enableAgentForward", .boolean).notNull().defaults(to: false)
+                t.add(column: "transportPreference", .text).notNull().defaults(to: StoredTransportPreference.plainSsh.rawValue)
+                t.add(column: "directAddress", .text)
+                t.add(column: "enablePhysicalMultipath", .boolean).notNull().defaults(to: false)
+                t.add(column: "cellularRemoteAddress", .text)
+                t.add(column: "enableUpstreamFailover", .boolean).notNull().defaults(to: false)
+                t.add(column: "postConnectCommands", .text)
+                t.add(column: "forwards", .text).notNull().defaults(to: "[]")
+                t.add(column: "jumpHost", .text)
+                t.add(column: "jumpPort", .integer).notNull().defaults(to: 22)
+                t.add(column: "jumpUsername", .text)
+                t.add(column: "jumpKeyEntryId", .text)
+                t.add(column: "stunServer", .text)
+                t.add(column: "relayAddr", .text)
+                t.add(column: "relaySni", .text)
+                t.add(column: "relayJwt", .text)
+                t.add(column: "allowNonLoopbackForwardBind", .boolean).notNull().defaults(to: false)
+                t.add(column: "themeName", .text)
+                t.add(column: "helperBindPort", .integer)
             }
         }
         return migrator
