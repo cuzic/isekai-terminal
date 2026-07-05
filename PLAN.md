@@ -2801,6 +2801,65 @@ Resuming/Closing/Closed)×`ExecutionMode`(Foreground/Background)の2軸FSMを、
 分岐追加)。バックグラウンド遷移中の転送継続保証(#24の`SessionSupervisor`との
 統合が前提になるため、#24の「やらないこと」と同じ理由で見送り)。
 
+### Phase 1C(#26)実装メモ(2026-07-05、isekai-helper再接続・resume対応)
+
+**アーキテクチャ調査(Explore agent)の最重要な発見**: isekai-helper経由のresume
+(セッション断からの再接続)は**Rust側で既に完全に透過的に動作しており、この
+タスクで新規に追加すべきresume APIは存在しない**。`rust-core/src/resume_client.rs`
+の`ReattachableStream`が、`HelperQuicSession`/`MultipathHelperQuicSession`/
+`IsekaiStunP2pSession`/`IsekaiLinkRelaySession`のQUIC接続断をI/Oエラーとして
+russh/transportに見せる前に検知し、内部で新しいQUIC接続を張り直して
+`RESUME`ハンドシェイク(`session_id`+送受信オフセット)を行い、再送すべき
+C→Sバイトをreplayしてから元のストリームへ差し替える。この一連の処理は
+セッションオブジェクト(タスク)が生きている限り完全に自動で、UniFFI越しに
+明示的な`resume()`呼び出しは一切不要(生成済みSwiftバインディングにも
+`resume`/`reattach`に相当するメソッドは存在しないことを確認済み)。iOS側の
+`TerminalSessionController.reconnect()`(#14)は`.disconnected`/`.failed`の場合の
+みフレッシュ接続を張り直すが、これは`ReattachableStream`が(既定
+`REATTACH_MAX_RETRIES`到達後)本当に諦めた後にしか`.disconnected`にならないため、
+既存実装のままで矛盾なく動作する。
+
+**実際に見つかったギャップ**: #23で作った`NetworkPathPolicy`/`NetworkPathObserver`
+(NWPathMonitorの生イベントをdebounce/coalesceしてRustへ通知するタイミングだけを
+決める判断層、実際の接続可否判断はRust側に委ねる設計で元々書かれていた)が、
+実機の`NWPathMonitor`と一切結線されておらず「宙に浮いていた」。Android版は
+`SessionOrchestrator::notify_network_lost()`(`ConnPhase`に応じてQUICなら無視/
+非QUICや接続中なら中断)を持つが、iOS側は`SessionOrchestrator`を経由しない
+低レベルセッションを直接使う(#24決定通り)ため、この判断ロジックを呼べる
+Rust APIが存在しなかった。
+
+**実装内容**:
+- `rust-core/src/session.rs`の`SessionCore`に`connected: Arc<AtomicBool>`を追加
+  (`start()`でfalseにリセット、`TransportEvent::Connected`受信時にtrueへ、
+  `Disconnected`/チャネルクローズ時にfalseへ戻す)。
+- `SessionCore::notify_network_lost(is_quic: bool)`を追加。判断ロジック本体は
+  `should_abort_on_network_lost(has_session, connected, is_quic) -> bool`という
+  純粋関数に切り出し(Idleなら無視/ハンドシェイク中は中断/接続済みQUICは
+  transport自身のtransparent resumeを信頼して無視/接続済み非QUICは中断、の
+  4パターンを実チャネル・tokioタスク無しで単体テストした、4 tests)。
+  実際の中断は既存の`disconnect()`をそのまま呼ぶ(新しいteardown経路を書かず、
+  既に使われている安全な経路に乗せる)。
+- `SshSession`(`is_quic=false`)、`HelperQuicSession`/`MultipathHelperQuicSession`/
+  `IsekaiStunP2pSession`/`IsekaiLinkRelaySession`(いずれも`is_quic=true`)に
+  `notify_network_lost()`を追加。UniFFI経由でSwift/Kotlin双方のバインディングを
+  再生成した(Androidは`SessionOrchestrator`経由のままなので、この新APIを
+  呼び出すKotlinコードは無い)。
+- iOS側`TerminalSessionController`に実`NWPathMonitor`を追加し、`init`で
+  `startNetworkPathMonitoring()`を呼んで生イベントを`networkPathObserver`
+  (既存#23の判断層)へ転送するだけにする(生イベントの中継のみ、判断は一切
+  しない、`.claude/rules/rust-ssot.md`)。`networkPathObserver`のonNotifyが
+  実際に呼ばれた場合、`isSatisfied == false`(断)の時だけ
+  `session?.notifyNetworkLost()`を呼ぶ(`isSatisfied == true`(復帰)に対応する
+  Rust APIは無いため何もしない — 復帰の検知は既存のtransport再試行/#14の
+  フォアグラウンド復帰時`reconnect()`に委ねる)。`deinit`で`cancel()`する。
+
+**やらないこと**: `SessionOrchestrator`側への同種統合(Android版は`ConnPhase`
+ベースの独自実装を既に持っており、影響なし)。QUICのpath recovery通知
+(`isSatisfied == true`)に対応するRust APIの新設(現時点で必要性が無いため)。
+実機でのローミング/圏外復帰の実地検証(開発機にmacOS/実機が無いため、
+Simulatorでは`NWPathMonitor`の実経路変化を再現できない。既存のPhase 9-4等と
+同じ理由で実機検証は次フェーズ(#28)へ持ち越し)。
+
 ---
 
 ## 実装順序

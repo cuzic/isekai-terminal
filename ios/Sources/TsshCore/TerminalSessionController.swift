@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import TsshCoreLogic
 
 /// SSH agentへの署名要求。ユーザーが承認/拒否した結果を`respond`で
@@ -62,6 +63,7 @@ private protocol ActiveTerminalSession: AnyObject {
     func trzszSendChunk(transferId: String, data: Data, isLast: Bool)
     func trzszAcceptDownload(transferId: String)
     func trzszCancel(transferId: String)
+    func notifyNetworkLost()
 }
 extension SshSession: ActiveTerminalSession {}
 extension HelperQuicSession: ActiveTerminalSession {}
@@ -107,6 +109,17 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     /// 安全)。
     private var downloadFileHandle: FileHandle?
     private var downloadTempURL: URL?
+    /// Phase 1C(#26): OSの経路変化を検知するためのmonitor。実際にRustへ通知するか
+    /// どうかの判断(debounce/coalesce)は`networkPathObserver`(既存#23の判断層)に
+    /// 委ね、ここでは生イベントを橋渡しするだけにする(`.claude/rules/rust-ssot.md`)。
+    private let networkPathMonitor = NWPathMonitor()
+    private lazy var networkPathObserver = NetworkPathObserver { [weak self] _, isSatisfied in
+        // 復帰(isSatisfied == true)はRust側に対応するAPIが無い(`notify_network_lost`
+        // のみ)ため何もしない。復帰の検知は既存の transport 再試行/#14の
+        // フォアグラウンド復帰時reconnect()に委ねる。
+        guard !isSatisfied else { return }
+        self?.session?.notifyNetworkLost()
+    }
 
     public init(
         profile: ConnectionProfile,
@@ -124,6 +137,26 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         self.vault = vault
         self.relayVault = relayVault
         self.trustStore = trustStore
+        startNetworkPathMonitoring()
+    }
+
+    deinit {
+        networkPathMonitor.cancel()
+    }
+
+    /// Phase 1C(#26): `NWPathMonitor`の生イベントを`NetworkPathObserver`(既存#23の
+    /// debounce/coalesce判断層)へ橋渡しする。判断結果に応じたRustへの実際の通知は
+    /// `networkPathObserver`のonNotifyクロージャ(上記)が行う。
+    private func startNetworkPathMonitoring() {
+        networkPathMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let isSatisfied = path.status == .satisfied
+            Task { @MainActor in
+                let health: ConnectionHealthHint = self.uiState.state == .connected ? .healthy : .degradedOrReconnecting
+                self.networkPathObserver.handlePathUpdate(isSatisfied: isSatisfied, health: health)
+            }
+        }
+        networkPathMonitor.start(queue: DispatchQueue(label: "tools.isekai.terminal.network-path-monitor"))
     }
 
     /// 接続を開始する。鍵認証の場合はCredentialVaultから秘密鍵を復号して使う。

@@ -1087,6 +1087,14 @@ public protocol HelperQuicSessionProtocol: AnyObject, Sendable {
     
     func disconnect() 
     
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+    func notifyNetworkLost() 
+    
     func resize(cols: UInt32, rows: UInt32) 
     
     func scrollbackCells(offset: UInt32, rows: UInt32)  -> [CellData]
@@ -1182,6 +1190,19 @@ open func connectAuto(callback: SessionCallback)throws   {try rustCallWithError(
     
 open func disconnect()  {try! rustCall() {
     uniffi_tssh_core_fn_method_helperquicsession_disconnect(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+open func notifyNetworkLost()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_helperquicsession_notify_network_lost(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -1319,6 +1340,14 @@ public protocol IsekaiLinkRelaySessionProtocol: AnyObject, Sendable {
     
     func disconnect() 
     
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+    func notifyNetworkLost() 
+    
     func resize(cols: UInt32, rows: UInt32) 
     
     func scrollbackCells(offset: UInt32, rows: UInt32)  -> [CellData]
@@ -1403,6 +1432,19 @@ open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiC
     
 open func disconnect()  {try! rustCall() {
     uniffi_tssh_core_fn_method_isekailinkrelaysession_disconnect(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+open func notifyNetworkLost()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_isekailinkrelaysession_notify_network_lost(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -1540,6 +1582,14 @@ public protocol IsekaiStunP2pSessionProtocol: AnyObject, Sendable {
     
     func disconnect() 
     
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+    func notifyNetworkLost() 
+    
     func resize(cols: UInt32, rows: UInt32) 
     
     func scrollbackCells(offset: UInt32, rows: UInt32)  -> [CellData]
@@ -1624,6 +1674,19 @@ open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiC
     
 open func disconnect()  {try! rustCall() {
     uniffi_tssh_core_fn_method_isekaistunp2psession_disconnect(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+open func notifyNetworkLost()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_isekaistunp2psession_notify_network_lost(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -1762,6 +1825,15 @@ public protocol MultipathHelperQuicSessionProtocol: AnyObject, Sendable {
     func disconnect() 
     
     /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない(物理Wi-Fi/セルラー切替はpath0/path1のmultipath自体が別途担う、
+     * `rebind_to_fd`参照)。
+     */
+    func notifyNetworkLost() 
+    
+    /**
      * 「WiFiは繋がっているがupstreamが死んでいる」等を検知したKotlin側から呼ぶ。
      * `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
      * （所有権はこちらに移る）。接続確立前や既にrebind中の場合は素通りする
@@ -1853,6 +1925,20 @@ open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiC
     
 open func disconnect()  {try! rustCall() {
     uniffi_tssh_core_fn_method_multipathhelperquicsession_disconnect(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない(物理Wi-Fi/セルラー切替はpath0/path1のmultipath自体が別途担う、
+     * `rebind_to_fd`参照)。
+     */
+open func notifyNetworkLost()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_multipathhelperquicsession_notify_network_lost(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -2989,6 +3075,13 @@ public protocol SshSessionProtocol: AnyObject, Sendable {
     
     func disconnect() 
     
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。プレーンSSH
+     * (TCP)は`is_quic=false`固定 — 接続済みでも切断扱いにする。
+     */
+    func notifyNetworkLost() 
+    
     func resize(cols: UInt32, rows: UInt32) 
     
     func scrollbackCells(offset: UInt32, rows: UInt32)  -> [CellData]
@@ -3069,6 +3162,18 @@ open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiC
     
 open func disconnect()  {try! rustCall() {
     uniffi_tssh_core_fn_method_sshsession_disconnect(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。プレーンSSH
+     * (TCP)は`is_quic=false`固定 — 接続済みでも切断扱いにする。
+     */
+open func notifyNetworkLost()  {try! rustCall() {
+    uniffi_tssh_core_fn_method_sshsession_notify_network_lost(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -7303,6 +7408,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_tssh_core_checksum_method_sshsession_disconnect() != 2534) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_tssh_core_checksum_method_sshsession_notify_network_lost() != 3638) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_tssh_core_checksum_method_sshsession_resize() != 59850) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7336,6 +7444,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_tssh_core_checksum_method_helperquicsession_disconnect() != 3769) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_tssh_core_checksum_method_helperquicsession_notify_network_lost() != 65360) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_tssh_core_checksum_method_helperquicsession_resize() != 34438) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7364,6 +7475,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_disconnect() != 56041) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_notify_network_lost() != 45363) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_method_isekailinkrelaysession_resize() != 58662) {
@@ -7396,6 +7510,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_tssh_core_checksum_method_isekaistunp2psession_disconnect() != 57846) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_tssh_core_checksum_method_isekaistunp2psession_notify_network_lost() != 34752) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_tssh_core_checksum_method_isekaistunp2psession_resize() != 53057) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7424,6 +7541,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_disconnect() != 50947) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_notify_network_lost() != 46023) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_tssh_core_checksum_method_multipathhelperquicsession_rebind_to_fd() != 28891) {

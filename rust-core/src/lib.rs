@@ -758,6 +758,13 @@ impl SshSession {
     pub fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
     }
+
+    /// Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+    /// 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。プレーンSSH
+    /// (TCP)は`is_quic=false`固定 — 接続済みでも切断扱いにする。
+    pub fn notify_network_lost(&self) {
+        self.core.notify_network_lost(false);
+    }
 }
 
 // ── ポートフォワードの動的追加/削除 ───────────────────────

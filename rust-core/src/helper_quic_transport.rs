@@ -157,6 +157,14 @@ impl HelperQuicSession {
     pub fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
     }
+
+    /// Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+    /// 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+    /// `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+    /// 何もしない。
+    pub fn notify_network_lost(&self) {
+        self.core.notify_network_lost(true);
+    }
 }
 
 // SessionOrchestrator からのみ呼ばれる内部API(uniffi には直接は出さない)。

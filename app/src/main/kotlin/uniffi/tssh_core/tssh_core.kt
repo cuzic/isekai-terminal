@@ -903,6 +903,8 @@ external fun uniffi_tssh_core_checksum_method_sshsession_connect(
 ): Int
 external fun uniffi_tssh_core_checksum_method_sshsession_disconnect(
 ): Int
+external fun uniffi_tssh_core_checksum_method_sshsession_notify_network_lost(
+): Int
 external fun uniffi_tssh_core_checksum_method_sshsession_resize(
 ): Int
 external fun uniffi_tssh_core_checksum_method_sshsession_scrollback_cells(
@@ -925,6 +927,8 @@ external fun uniffi_tssh_core_checksum_method_helperquicsession_connect_auto(
 ): Int
 external fun uniffi_tssh_core_checksum_method_helperquicsession_disconnect(
 ): Int
+external fun uniffi_tssh_core_checksum_method_helperquicsession_notify_network_lost(
+): Int
 external fun uniffi_tssh_core_checksum_method_helperquicsession_resize(
 ): Int
 external fun uniffi_tssh_core_checksum_method_helperquicsession_scrollback_cells(
@@ -944,6 +948,8 @@ external fun uniffi_tssh_core_checksum_method_helperquicsession_trzsz_send_chunk
 external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_connect(
 ): Int
 external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_disconnect(
+): Int
+external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_notify_network_lost(
 ): Int
 external fun uniffi_tssh_core_checksum_method_isekailinkrelaysession_resize(
 ): Int
@@ -965,6 +971,8 @@ external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_connect(
 ): Int
 external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_disconnect(
 ): Int
+external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_notify_network_lost(
+): Int
 external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_resize(
 ): Int
 external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_scrollback_cells(
@@ -984,6 +992,8 @@ external fun uniffi_tssh_core_checksum_method_isekaistunp2psession_trzsz_send_ch
 external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_connect(
 ): Int
 external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_disconnect(
+): Int
+external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_notify_network_lost(
 ): Int
 external fun uniffi_tssh_core_checksum_method_multipathhelperquicsession_rebind_to_fd(
 ): Int
@@ -1209,6 +1219,8 @@ external fun uniffi_tssh_core_fn_method_sshsession_connect(`ptr`: Long,`callback
 ): Unit
 external fun uniffi_tssh_core_fn_method_sshsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_tssh_core_fn_method_sshsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_tssh_core_fn_method_sshsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_sshsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1235,6 +1247,8 @@ external fun uniffi_tssh_core_fn_method_helperquicsession_connect_auto(`ptr`: Lo
 ): Unit
 external fun uniffi_tssh_core_fn_method_helperquicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_tssh_core_fn_method_helperquicsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_tssh_core_fn_method_helperquicsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_helperquicsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1258,6 +1272,8 @@ external fun uniffi_tssh_core_fn_free_isekailinkrelaysession(`handle`: Long,unif
 external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_isekailinkrelaysession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1283,6 +1299,8 @@ external fun uniffi_tssh_core_fn_method_isekaistunp2psession_connect(`ptr`: Long
 ): Unit
 external fun uniffi_tssh_core_fn_method_isekaistunp2psession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_tssh_core_fn_method_isekaistunp2psession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_tssh_core_fn_method_isekaistunp2psession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_isekaistunp2psession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1306,6 +1324,8 @@ external fun uniffi_tssh_core_fn_free_multipathhelperquicsession(`handle`: Long,
 external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_tssh_core_fn_method_multipathhelperquicsession_rebind_to_fd(`ptr`: Long,`fd`: Int,`localIp`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1683,6 +1703,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tssh_core_checksum_method_sshsession_disconnect() != 2534) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_tssh_core_checksum_method_sshsession_notify_network_lost() != 3638) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_tssh_core_checksum_method_sshsession_resize() != 59850) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1716,6 +1739,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tssh_core_checksum_method_helperquicsession_disconnect() != 3769) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_tssh_core_checksum_method_helperquicsession_notify_network_lost() != 65360) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_tssh_core_checksum_method_helperquicsession_resize() != 34438) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1744,6 +1770,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_disconnect() != 56041) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_notify_network_lost() != 45363) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_isekailinkrelaysession_resize() != 58662) {
@@ -1776,6 +1805,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_disconnect() != 57846) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_notify_network_lost() != 34752) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_tssh_core_checksum_method_isekaistunp2psession_resize() != 53057) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1804,6 +1836,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_disconnect() != 50947) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_notify_network_lost() != 46023) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_multipathhelperquicsession_rebind_to_fd() != 28891) {
@@ -3507,6 +3542,14 @@ public interface HelperQuicSessionInterface {
     
     fun `disconnect`()
     
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+    fun `notifyNetworkLost`()
+    
     fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
     
     fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData>
@@ -3660,6 +3703,24 @@ open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterf
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_disconnect(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */override fun `notifyNetworkLost`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_helperquicsession_notify_network_lost(
         it,
         _status)
 }
@@ -3909,6 +3970,14 @@ public interface IsekaiLinkRelaySessionInterface {
     
     fun `disconnect`()
     
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+    fun `notifyNetworkLost`()
+    
     fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
     
     fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData>
@@ -4046,6 +4115,24 @@ open class IsekaiLinkRelaySession: Disposable, AutoCloseable, IsekaiLinkRelaySes
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_disconnect(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */override fun `notifyNetworkLost`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekailinkrelaysession_notify_network_lost(
         it,
         _status)
 }
@@ -4295,6 +4382,14 @@ public interface IsekaiStunP2pSessionInterface {
     
     fun `disconnect`()
     
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+    fun `notifyNetworkLost`()
+    
     fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
     
     fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData>
@@ -4432,6 +4527,24 @@ open class IsekaiStunP2pSession: Disposable, AutoCloseable, IsekaiStunP2pSession
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_disconnect(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */override fun `notifyNetworkLost`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_isekaistunp2psession_notify_network_lost(
         it,
         _status)
 }
@@ -4682,6 +4795,15 @@ public interface MultipathHelperQuicSessionInterface {
     fun `disconnect`()
     
     /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない(物理Wi-Fi/セルラー切替はpath0/path1のmultipath自体が別途担う、
+     * `rebind_to_fd`参照)。
+     */
+    fun `notifyNetworkLost`()
+    
+    /**
      * 「WiFiは繋がっているがupstreamが死んでいる」等を検知したKotlin側から呼ぶ。
      * `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
      * （所有権はこちらに移る）。接続確立前や既にrebind中の場合は素通りする
@@ -4826,6 +4948,25 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_disconnect(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない(物理Wi-Fi/セルラー切替はpath0/path1のmultipath自体が別途担う、
+     * `rebind_to_fd`参照)。
+     */override fun `notifyNetworkLost`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_multipathhelperquicsession_notify_network_lost(
         it,
         _status)
 }
@@ -6657,6 +6798,13 @@ public interface SshSessionInterface {
     
     fun `disconnect`()
     
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。プレーンSSH
+     * (TCP)は`is_quic=false`固定 — 接続済みでも切断扱いにする。
+     */
+    fun `notifyNetworkLost`()
+    
     fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
     
     fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData>
@@ -6790,6 +6938,23 @@ open class SshSession: Disposable, AutoCloseable, SshSessionInterface
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_tssh_core_fn_method_sshsession_disconnect(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。プレーンSSH
+     * (TCP)は`is_quic=false`固定 — 接続済みでも切断扱いにする。
+     */override fun `notifyNetworkLost`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sshsession_notify_network_lost(
         it,
         _status)
 }
