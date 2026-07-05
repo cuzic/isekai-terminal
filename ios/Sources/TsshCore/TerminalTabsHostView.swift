@@ -106,7 +106,9 @@ public struct TerminalTabsHostView: View {
         }
         .background(Color.black)
         .navigationBarBackButtonHidden(true)
-        .onChange(of: tabsModel.tabs.count) { _, newCount in
+        // iOS 16対応(このパッケージのplatforms指定): 2引数版onChange(of:initial:_:)は
+        // iOS 17+限定のため、1引数版(旧API)を使う。
+        .onChange(of: tabsModel.tabs.count) { newCount in
             if newCount == 0 { onAllTabsClosed() }
         }
         .sheet(isPresented: $showAddTabSheet) {
