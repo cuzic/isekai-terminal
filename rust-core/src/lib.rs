@@ -10,6 +10,7 @@ pub(crate) mod socks;
 pub(crate) mod session_state;
 pub(crate) mod session;
 pub mod orchestrator;
+pub mod session_supervisor;
 pub(crate) mod helper_bootstrap;
 pub mod helper_quic_transport;
 pub mod multipath_transport;
@@ -23,6 +24,7 @@ pub(crate) mod resume_client;
 
 pub use quic_transport::{create_quic_session, QuicConfig, QuicSession};
 pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};
+pub use session_supervisor::{create_session_supervisor, ExecutionMode, SessionState, SessionSupervisor};
 
 use std::sync::Arc;
 use std::sync::LazyLock;

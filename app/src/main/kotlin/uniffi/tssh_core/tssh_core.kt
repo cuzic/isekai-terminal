@@ -883,6 +883,8 @@ external fun uniffi_tssh_core_checksum_func_create_session_orchestrator(
 ): Int
 external fun uniffi_tssh_core_checksum_func_create_quic_session(
 ): Int
+external fun uniffi_tssh_core_checksum_func_create_session_supervisor(
+): Int
 external fun uniffi_tssh_core_checksum_method_diagnosticeventqueue_drain_events(
 ): Int
 external fun uniffi_tssh_core_checksum_method_diagnosticeventqueue_push(
@@ -1068,6 +1070,30 @@ external fun uniffi_tssh_core_checksum_method_quicsession_trzsz_accept_upload(
 external fun uniffi_tssh_core_checksum_method_quicsession_trzsz_cancel(
 ): Int
 external fun uniffi_tssh_core_checksum_method_quicsession_trzsz_send_chunk(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_application_will_terminate(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_execution_mode(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_mark_suspended(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_memory_warning(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_on_connect_failed(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_on_connect_requested(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_on_connected(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_on_disconnected(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_on_terminated(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_prepare_for_background(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_resume_from_foreground(
+): Int
+external fun uniffi_tssh_core_checksum_method_sessionsupervisor_session_state(
 ): Int
 external fun uniffi_tssh_core_checksum_constructor_diagnosticeventqueue_new(
 ): Int
@@ -1375,6 +1401,34 @@ external fun uniffi_tssh_core_fn_method_quicsession_trzsz_cancel(`ptr`: Long,`tr
 ): Unit
 external fun uniffi_tssh_core_fn_method_quicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_tssh_core_fn_clone_sessionsupervisor(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_tssh_core_fn_free_sessionsupervisor(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_application_will_terminate(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_execution_mode(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_mark_suspended(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_memory_warning(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_on_connect_failed(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_on_connect_requested(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_on_connected(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_on_disconnected(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_on_terminated(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_prepare_for_background(`ptr`: Long,`budgetMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_resume_from_foreground(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_tssh_core_fn_method_sessionsupervisor_session_state(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_tssh_core_fn_init_callback_vtable_diagnosticcallback(`vtable`: UniffiVTableCallbackInterfaceDiagnosticCallback,
 ): Unit
 external fun uniffi_tssh_core_fn_init_callback_vtable_eventwakelistener(`vtable`: UniffiVTableCallbackInterfaceEventWakeListener,
@@ -1420,6 +1474,8 @@ external fun uniffi_tssh_core_fn_func_create_multipath_helper_quic_session(`conf
 external fun uniffi_tssh_core_fn_func_create_session_orchestrator(`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_tssh_core_fn_func_create_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_tssh_core_fn_func_create_session_supervisor(uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun ffi_tssh_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1595,6 +1651,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_func_create_quic_session() != 25547) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_func_create_session_supervisor() != 43886) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_diagnosticeventqueue_drain_events() != 34129) {
@@ -1874,6 +1933,42 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_method_quicsession_trzsz_send_chunk() != 12522) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_application_will_terminate() != 690) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_execution_mode() != 16415) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_mark_suspended() != 26228) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_memory_warning() != 54621) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_on_connect_failed() != 63876) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_on_connect_requested() != 17811) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_on_connected() != 41642) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_on_disconnected() != 49117) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_on_terminated() != 21123) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_prepare_for_background() != 23290) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_resume_from_foreground() != 37188) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_tssh_core_checksum_method_sessionsupervisor_session_state() != 5184) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tssh_core_checksum_constructor_diagnosticeventqueue_new() != 2755) {
@@ -6043,6 +6138,519 @@ public object FfiConverterTypeSessionOrchestrator: FfiConverter<SessionOrchestra
 //
 
 
+/**
+ * `SessionState`×`ExecutionMode`の2軸FSMを保持する、判断ロジックのみのオブジェクト。
+ * 意図的にどのtransport(`SshSession`/`HelperQuicSession`等)とも結び付けていない
+ * (`.claude/rules/rust-ssot.md`が要求する「状態と、それに基づく意思決定ロジックは
+ * Rust側に置く」を満たす最小単位として切り出し、実際の接続開始/切断呼び出しは
+ * 呼び出し側(Kotlin/Swift)が現在の状態を見て行う。既存`SessionOrchestrator`の
+ * `ConnPhase`(Idle/Connecting/Connected)を置き換えるかどうかは別途判断が必要な
+ * 大きめの移行のため#24のスコープには含めず、まずはこの新しいFSM自体を
+ * 単体テスト可能な形で実装することを優先した。PLAN.md「Phase 1C(#24)実装メモ」参照)。
+ */
+public interface SessionSupervisorInterface {
+    
+    /**
+     * アプリ終了(`applicationWillTerminate`相当)。以降の再利用は想定しない終端。
+     */
+    fun `applicationWillTerminate`()
+    
+    fun `executionMode`(): ExecutionMode
+    
+    /**
+     * バックグラウンド猶予(`budget_ms`)が尽きた、またはOSにより実際に一時停止/
+     * 終了させられたことを通知する。`Quiescing`中のみ`Suspended`へ遷移する。
+     */
+    fun `markSuspended`()
+    
+    /**
+     * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを
+     * 終了される可能性が高まったとみなし、`Quiescing`中であれば猶予を待たず
+     * 保守的に`Suspended`扱いにする(実際に終了されるとは限らないが、次の
+     * フォアグラウンド復帰時に「再接続が必要」側へ倒しておく方が、ユーザーに
+     * 無言で固まった画面を見せるより安全という判断)。
+     */
+    fun `memoryWarning`()
+    
+    /**
+     * 接続試行が失敗したことを通知する(ハンドシェイク失敗・タイムアウト等)。
+     */
+    fun `onConnectFailed`()
+    
+    /**
+     * 接続試行を開始したことを通知する。
+     */
+    fun `onConnectRequested`()
+    
+    /**
+     * 接続確立(または再接続成功)を通知する。`Connecting`/`Resuming`のどちらからでも
+     * `Active`へ遷移できる(`Resuming`はフォアグラウンド復帰後の再接続が成功した場合)。
+     */
+    fun `onConnected`()
+    
+    /**
+     * 切断(意図的/エラー問わず)を通知する。
+     */
+    fun `onDisconnected`()
+    
+    /**
+     * `Closing`中の後始末(実トランスポートの切断)が完了したことを通知する。
+     */
+    fun `onTerminated`()
+    
+    /**
+     * アプリがバックグラウンドへ遷移したことを通知する。`budget_ms`は
+     * `UIApplication.beginBackgroundTask`等が保証する猶予の目安(実際の期限管理は
+     * 呼び出し側が持つ。PLAN.md外部レビュー論点10参照、Rust側では記録しない)。
+     * `Active`の場合のみ`Quiescing`へ遷移する(`Disconnected`/`Connecting`中に
+     * バックグラウンド化しても新規にセッションを維持し始めるわけではないため、
+     * `session_state`自体は変えない)。
+     */
+    fun `prepareForBackground`(`budgetMs`: kotlin.UInt)
+    
+    /**
+     * アプリがフォアグラウンドへ復帰したことを通知する。`Quiescing`は猶予内に
+     * 復帰できたとみなしそのまま`Active`へ戻す(接続は生きている前提)。
+     * `Suspended`は既に接続が失われている前提のため`Resuming`にし、呼び出し側が
+     * 実際に再接続してから`on_connected()`を呼ぶ必要がある。
+     */
+    fun `resumeFromForeground`()
+    
+    fun `sessionState`(): SessionState
+    
+    companion object
+}
+
+/**
+ * `SessionState`×`ExecutionMode`の2軸FSMを保持する、判断ロジックのみのオブジェクト。
+ * 意図的にどのtransport(`SshSession`/`HelperQuicSession`等)とも結び付けていない
+ * (`.claude/rules/rust-ssot.md`が要求する「状態と、それに基づく意思決定ロジックは
+ * Rust側に置く」を満たす最小単位として切り出し、実際の接続開始/切断呼び出しは
+ * 呼び出し側(Kotlin/Swift)が現在の状態を見て行う。既存`SessionOrchestrator`の
+ * `ConnPhase`(Idle/Connecting/Connected)を置き換えるかどうかは別途判断が必要な
+ * 大きめの移行のため#24のスコープには含めず、まずはこの新しいFSM自体を
+ * 単体テスト可能な形で実装することを優先した。PLAN.md「Phase 1C(#24)実装メモ」参照)。
+ */
+open class SessionSupervisor: Disposable, AutoCloseable, SessionSupervisorInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_tssh_core_fn_free_sessionsupervisor(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_tssh_core_fn_clone_sessionsupervisor(handle, status)
+        }
+    }
+
+    
+    /**
+     * アプリ終了(`applicationWillTerminate`相当)。以降の再利用は想定しない終端。
+     */override fun `applicationWillTerminate`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_application_will_terminate(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    override fun `executionMode`(): ExecutionMode {
+            return FfiConverterTypeExecutionMode.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_execution_mode(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * バックグラウンド猶予(`budget_ms`)が尽きた、またはOSにより実際に一時停止/
+     * 終了させられたことを通知する。`Quiescing`中のみ`Suspended`へ遷移する。
+     */override fun `markSuspended`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_mark_suspended(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを
+     * 終了される可能性が高まったとみなし、`Quiescing`中であれば猶予を待たず
+     * 保守的に`Suspended`扱いにする(実際に終了されるとは限らないが、次の
+     * フォアグラウンド復帰時に「再接続が必要」側へ倒しておく方が、ユーザーに
+     * 無言で固まった画面を見せるより安全という判断)。
+     */override fun `memoryWarning`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_memory_warning(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * 接続試行が失敗したことを通知する(ハンドシェイク失敗・タイムアウト等)。
+     */override fun `onConnectFailed`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_on_connect_failed(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * 接続試行を開始したことを通知する。
+     */override fun `onConnectRequested`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_on_connect_requested(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * 接続確立(または再接続成功)を通知する。`Connecting`/`Resuming`のどちらからでも
+     * `Active`へ遷移できる(`Resuming`はフォアグラウンド復帰後の再接続が成功した場合)。
+     */override fun `onConnected`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_on_connected(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * 切断(意図的/エラー問わず)を通知する。
+     */override fun `onDisconnected`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_on_disconnected(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * `Closing`中の後始末(実トランスポートの切断)が完了したことを通知する。
+     */override fun `onTerminated`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_on_terminated(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * アプリがバックグラウンドへ遷移したことを通知する。`budget_ms`は
+     * `UIApplication.beginBackgroundTask`等が保証する猶予の目安(実際の期限管理は
+     * 呼び出し側が持つ。PLAN.md外部レビュー論点10参照、Rust側では記録しない)。
+     * `Active`の場合のみ`Quiescing`へ遷移する(`Disconnected`/`Connecting`中に
+     * バックグラウンド化しても新規にセッションを維持し始めるわけではないため、
+     * `session_state`自体は変えない)。
+     */override fun `prepareForBackground`(`budgetMs`: kotlin.UInt)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_prepare_for_background(
+        it,
+        FfiConverterUInt.lower(`budgetMs`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * アプリがフォアグラウンドへ復帰したことを通知する。`Quiescing`は猶予内に
+     * 復帰できたとみなしそのまま`Active`へ戻す(接続は生きている前提)。
+     * `Suspended`は既に接続が失われている前提のため`Resuming`にし、呼び出し側が
+     * 実際に再接続してから`on_connected()`を呼ぶ必要がある。
+     */override fun `resumeFromForeground`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_resume_from_foreground(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    override fun `sessionState`(): SessionState {
+            return FfiConverterTypeSessionState.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_method_sessionsupervisor_session_state(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+
+    
+
+
+    
+    
+    /**
+     * @suppress
+     */
+    companion object
+    
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSessionSupervisor: FfiConverter<SessionSupervisor, Long> {
+    override fun lower(value: SessionSupervisor): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): SessionSupervisor {
+        return SessionSupervisor(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): SessionSupervisor {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: SessionSupervisor) = 8UL
+
+    override fun write(value: SessionSupervisor, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
 public interface SshSessionInterface {
     
     fun `connect`(`callback`: SessionCallback)
@@ -7495,6 +8103,46 @@ public object FfiConverterTypeConnectionPublicState : FfiConverterRustBuffer<Con
 
 
 /**
+ * アプリの実行モード。iOSの`UIApplication.didEnterBackground`/
+ * `willEnterForeground`、Androidの同等のライフサイクルイベントを集約した結果を表す
+ * (PLAN.md外部レビュー論点11の「SceneLifecycleReporter→AppExecutionCoordinator→
+ * Rust SessionSupervisor」のうち、Rust側が受け取る最終形)。
+ */
+
+enum class ExecutionMode {
+    
+    FOREGROUND,
+    BACKGROUND;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeExecutionMode: FfiConverterRustBuffer<ExecutionMode> {
+    override fun read(buf: ByteBuffer) = try {
+        ExecutionMode.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: ExecutionMode) = 4UL
+
+    override fun write(value: ExecutionMode, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
  * ポートフォワード待受の状態。`OrchestratorCallback::on_forward_state_changed` で通知される。
  */
 sealed class ForwardState {
@@ -7627,6 +8275,85 @@ public object FfiConverterTypeForwardType: FfiConverterRustBuffer<ForwardType> {
     override fun allocationSize(value: ForwardType) = 4UL
 
     override fun write(value: ForwardType, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * セッションの生存状態(接続状態 × バックグラウンド遷移の合成)。PLAN.md「Phase Y」の
+ * 外部レビュー(2026-07-04)で提案された8状態FSMをそのまま採用している。
+ *
+ * **注意**: `crate::session_state::SessionState`(1セッション分のVTE/trzszパーサー状態、
+ * `pub(crate)`でUniFFI越しには公開されない)とは名前が同じだが別物。こちらは
+ * UniFFI越しにKotlin/Swift双方へ公開する「接続ライフサイクル」のFSMで、
+ * 実際のターミナル描画状態は一切持たない。
+ */
+
+enum class SessionState {
+    
+    /**
+     * 接続試行前、または完全に切断済み。
+     */
+    DISCONNECTED,
+    /**
+     * ハンドシェイク/認証中。
+     */
+    CONNECTING,
+    /**
+     * 接続確立済みでフォアグラウンド相当の通常運用中。
+     */
+    ACTIVE,
+    /**
+     * バックグラウンド遷移が通知され、`ExecutionMode::Background`の間の猶予
+     * (`prepare_for_background`の`budget_ms`)内で接続維持を試みている状態。
+     * 実際の猶予終了判断はSwift側の`beginBackgroundTask`失効コールバックが正
+     * (Rust/Swiftで基準時計を共有していないため、Rust側でタイマーは持たない。
+     * PLAN.md外部レビュー論点10の`budget_ms`化と同じ理由)。
+     */
+    QUIESCING,
+    /**
+     * バックグラウンド猶予が尽きた(呼び出し側が`mark_suspended`を呼んだ)、または
+     * OSにプロセスを一時停止/終了された後。実際のトランスポートは既に失われている
+     * 前提で、次にフォアグラウンド復帰した際は再接続(reconnect)が必要になる。
+     */
+    SUSPENDED,
+    /**
+     * フォアグラウンド復帰が通知され、再接続/セッション有効性確認を行っている状態。
+     */
+    RESUMING,
+    /**
+     * 意図的な切断処理が進行中(ユーザーによる切断・アプリ終了通知後の後始末等)。
+     */
+    CLOSING,
+    /**
+     * 完全に終了した終端状態。
+     */
+    CLOSED;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSessionState: FfiConverterRustBuffer<SessionState> {
+    override fun read(buf: ByteBuffer) = try {
+        SessionState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: SessionState) = 4UL
+
+    override fun write(value: SessionState, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -9513,6 +10240,16 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
     UniffiLib.uniffi_tssh_core_fn_func_create_quic_session(
     
         FfiConverterTypeQuicConfig.lower(`config`),_status)
+}
+    )
+    }
+    
+ fun `createSessionSupervisor`(): SessionSupervisor {
+            return FfiConverterTypeSessionSupervisor.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_tssh_core_fn_func_create_session_supervisor(
+    
+        _status)
 }
     )
     }

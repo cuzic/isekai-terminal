@@ -2672,6 +2672,80 @@ isekai-helperの実際のresumeハンドシェイク(#26、現状の`reconnect()
 「新規セッションとして繋ぎ直す」だけで、Android版のresumeトークンによる
 連続性維持とは異なる)。
 
+### Phase 1C(#24)実装メモ(2026-07-05、SessionSupervisorと2軸FSM)
+
+**スコープ決定**: 外部レビュー(2026-07-04、本ファイル1689行目以降)が提案した
+`SessionState`(8状態: Disconnected/Connecting/Active/Quiescing/Suspended/
+Resuming/Closing/Closed)×`ExecutionMode`(Foreground/Background)の2軸FSMを、
+新規`rust-core/src/session_supervisor.rs`の`SessionSupervisor`(UniFFI Object)
+として実装した。既存`SessionOrchestrator`(`orchestrator.rs`)の`ConnPhase`
+(Idle/Connecting/Connectedの3状態、Androidが使用中)を置き換えるか、iOS側を
+低レベルAPI(`SshSession`等、`SessionCallback`直接実装)から`SessionOrchestrator`
+経由に移行するかは、#30実装メモで「#24のスコープと合わせて改めて判断する」と
+していた通り本タスクの検討事項だったが、次の理由で**両者とも据え置き、
+`SessionSupervisor`は独立した新規オブジェクトとして追加するに留めた**:
+
+- Android/iOSとも現行の接続コード(`SessionOrchestrator`/低レベルAPI)は
+  #20〜#54で実機/CI検証済みで実際に動いている。`ConnPhase`を8状態FSMへ
+  置き換える、あるいはiOSを`SessionOrchestrator`経由に移行するのは、
+  どちらもUniFFI境界・コールバック配線・既存テスト一式に影響する大きめの
+  リファクタで、実機検証環境が無い(Linux開発機+CI simulatorのみ)状況では
+  リスクに見合わない。
+- 一方で「Rust側にSessionState/ExecutionMode FSMを実装する」というタスクの
+  核心(判断ロジックをRust SSOTへ置く、`.claude/rules/rust-ssot.md`)自体は、
+  既存の接続コードと結合させなくても単体で満たせる。`SessionSupervisor`を
+  独立オブジェクトにしたことで、実transportに一切触れない純粋な状態機械として
+  ハードウェア/ネットワーク不要で網羅的にテストできた(13テスト、全遷移パターン
+  カバー、`rust-core-test-coverage-audit`の方針と同じ「ハードウェア不要な
+  Rustロジックはまず単体テストで固める」を踏襲)。
+- `SessionOrchestrator`への統合(`ConnPhase`を`SessionState`へ差し替え、
+  `prepare_for_background`等を`SessionOrchestrator`のメソッドとして生やす)や、
+  iOS`TerminalSessionController`が`SessionSupervisor`を実際に参照して
+  `#14`の`reconnect()`をより賢く(例: `Suspended`時のみ再接続、`Quiescing`中は
+  何もしない、等)する統合作業は、明示的に**未実施のまま次フェーズ以降へ持ち越す**
+  (現時点でこの新APIを呼び出すKotlin/Swiftコードは無い)。
+
+**実装内容**:
+- `rust-core/src/session_supervisor.rs`(新規): `SessionState`/`ExecutionMode`
+  (いずれも`#[derive(uniffi::Enum)]`)、`SessionSupervisor`(`#[derive(uniffi::Object)]`、
+  `create_session_supervisor()`で生成)。メソッド: `session_state()`/
+  `execution_mode()`(getter)、`on_connect_requested()`/`on_connected()`/
+  `on_connect_failed()`/`on_disconnected()`(接続ライフサイクル)、
+  `prepare_for_background(budget_ms)`/`resume_from_foreground()`/
+  `mark_suspended()`/`memory_warning()`(バックグラウンド遷移、外部レビュー論点1・3・10
+  相当)、`application_will_terminate()`/`on_terminated()`(終了)。
+- 遷移の要点: `prepare_for_background`は`Active`の場合のみ`Quiescing`へ遷移する
+  (`Disconnected`/`Connecting`中の場合はそもそも維持すべきセッションが無いため
+  状態を変えない)。`Quiescing`中に`resume_from_foreground`が来れば猶予内に
+  復帰できたとみなし`Active`へ戻すが、`mark_suspended`(猶予切れ)や
+  `memory_warning`(iOSの`didReceiveMemoryWarning`相当、保守的に早期`Suspended`扱い)
+  を経由していた場合は`Resuming`にし、呼び出し側が実際に再接続してから
+  `on_connected()`を呼ぶまで`Active`に戻さない。`budget_ms`自体はRust側でタイマー
+  管理せず記録もしない(外部レビュー論点10: Swift/Rustで基準時計を共有していない
+  ため、実際の期限判断はSwift側`beginBackgroundTask`失効コールバックが正という
+  既存方針をそのまま踏襲)。
+- `lib.rs`に`pub mod session_supervisor;`と
+  `pub use session_supervisor::{create_session_supervisor, ExecutionMode, SessionState, SessionSupervisor};`
+  を追加。Kotlinバインディング(`app/src/main/kotlin/uniffi/tssh_core/tssh_core.kt`)
+  を`generate-swift-bindings.sh`と対の手順(`uniffi-bindgen -- generate --library
+  target/debug/libtssh_core.so --language kotlin`)で再生成し直コミット
+  (CLAUDE.mdの「Rust の public API を変更したら Kotlin バインディング再生成が必須」
+  に従う。新規追加のみで既存生成物への変更は無いことを確認済み)。iOS向けSwift
+  バインディング(`ios/Sources/TsshCoreLogic/generated/`)はCI
+  (`ios-rust-core-check.yml`の「Generate Swift bindings and check for drift」)が
+  次回実行時に自動生成・差分チェックする。
+
+**命名の注意**: `crate::session_state::SessionState`(1セッション分のVTE/trzsz
+パーサー状態、`pub(crate)`でUniFFI非公開)と`session_supervisor::SessionState`
+(このタスクの8状態FSM、UniFFI公開)は同名だが別モジュールの別型。前者は
+クレート内部でのみ使われ、`pub use`で再エクスポートされていないため名前衝突は
+発生しない(`session_supervisor.rs`冒頭に両者の関係を明記するdocコメントを残した)。
+
+**やらないこと(次フェーズ以降へ持ち越し)**: `SessionOrchestrator`/`ConnPhase`との
+統合、iOS`TerminalSessionController`/Android`TerminalTabsViewModel`からの実際の
+呼び出し配線、`budget_ms`の実際の算出ロジック(現状#14のiOS実装は固定値を渡す
+想定すらしておらず、Swift側`beginBackgroundTask`のexpirationHandlerで検知するのみ)。
+
 ---
 
 ## 実装順序
