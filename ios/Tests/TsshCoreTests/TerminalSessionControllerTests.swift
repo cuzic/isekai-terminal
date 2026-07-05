@@ -397,4 +397,88 @@ final class TerminalSessionControllerTests: XCTestCase {
         // stateの遷移が起きないことだけを見て二重接続防止を検証する)。
         XCTAssertEqual(controller.uiState.state, .connecting)
     }
+
+    // MARK: - Phase 1C(#25): trzszファイル転送
+
+    func testOnTrzszRequestSetsWaitingUserState() async throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+
+        controller.onTrzszRequest(transferId: "t1", mode: "download", suggestedName: "report.txt", expectedSize: 1024)
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.trzszState != nil
+        }
+        XCTAssertEqual(
+            controller.uiState.trzszState,
+            .waitingUser(transferId: "t1", mode: "download", suggestedName: "report.txt", expectedSize: 1024)
+        )
+    }
+
+    func testOnTrzszProgressCarriesOverModeAndFileNameFromRequest() async throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+
+        controller.onTrzszRequest(transferId: "t1", mode: "download", suggestedName: "report.txt", expectedSize: 1024)
+        controller.onTrzszProgress(transferId: "t1", transferred: 512, total: 1024)
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            guard case .inProgress = await controller.uiState.trzszState else { return false }
+            return true
+        }
+        XCTAssertEqual(
+            controller.uiState.trzszState,
+            .inProgress(transferId: "t1", mode: "download", fileName: "report.txt", transferred: 512, total: 1024)
+        )
+    }
+
+    func testOnTrzszFinishedForUploadDoesNotSetCompletedDownloadURL() async throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+
+        controller.onTrzszRequest(transferId: "t1", mode: "upload", suggestedName: nil, expectedSize: nil)
+        controller.onTrzszFinished(transferId: "t1", success: true, message: nil)
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            guard case .done = await controller.uiState.trzszState else { return false }
+            return true
+        }
+        XCTAssertNil(controller.uiState.completedDownloadURL)
+    }
+
+    func testDownloadRequestWritesChunksToTempFileAndExposesURLOnFinish() async throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+
+        controller.onTrzszRequest(transferId: "t1", mode: "download", suggestedName: "hello.txt", expectedSize: 5)
+        controller.trzszStartDownload()
+        controller.onTrzszDownloadChunk(transferId: "t1", data: Data("hello".utf8), isLast: true)
+        controller.onTrzszFinished(transferId: "t1", success: true, message: nil)
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.completedDownloadURL != nil
+        }
+        let url = try XCTUnwrap(controller.uiState.completedDownloadURL)
+        XCTAssertEqual(try Data(contentsOf: url), Data("hello".utf8))
+
+        controller.trzszDismiss()
+        XCTAssertNil(controller.uiState.trzszState)
+        XCTAssertNil(controller.uiState.completedDownloadURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testTrzszDismissClearsStateWithoutCompletedDownload() async throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+
+        controller.onTrzszRequest(transferId: "t1", mode: "upload", suggestedName: nil, expectedSize: nil)
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.trzszState != nil
+        }
+
+        controller.trzszDismiss()
+
+        XCTAssertNil(controller.uiState.trzszState)
+        XCTAssertNil(controller.uiState.completedDownloadURL)
+    }
 }

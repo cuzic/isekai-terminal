@@ -2746,6 +2746,61 @@ Resuming/Closing/Closed)×`ExecutionMode`(Foreground/Background)の2軸FSMを、
 呼び出し配線、`budget_ms`の実際の算出ロジック(現状#14のiOS実装は固定値を渡す
 想定すらしておらず、Swift側`beginBackgroundTask`のexpirationHandlerで検知するのみ)。
 
+### Phase 1C(#25)実装メモ(2026-07-05、trzszファイル転送とサンドボックス橋渡し)
+
+**アーキテクチャ調査(Explore agent)の要点**: iOS側`TerminalSessionController`は
+低レベルの`SessionCallback`を直接実装しており(#24で`SessionOrchestrator`統合は
+見送り済み)、trzsz関連の4コールバック(`onTrzszRequest`/`onTrzszDownloadChunk`/
+`onTrzszProgress`/`onTrzszFinished`)は空スタブのままだった。Android版は
+`SessionOrchestrator`経由の高レベルAPI(`onTrzszStateChanged`+ダウンロード完了時に
+まとめて全バイト列を受け取る`onDownloadComplete`)に移行済みだが、iOS側は生の
+チャンク単位コールバックをそのまま受ける必要がある(`on_trzsz_download_chunk`が
+プロトコルのDATAフレーム単位で逐次発火する、Rust側にはAndroidのような
+「ダウンロード全体をバッファしてから渡す」機構が無い)。
+
+**実装内容**:
+- `TrzszUiState`(新規`TrzszTransfer.swift`): Android版`TrzszUiState`(sealed class)
+  と対称の3ケースenum(`waitingUser`/`inProgress`/`done`)。`TerminalUIState`に
+  `@Published trzszState: TrzszUiState?`と`completedDownloadURL: URL?`を追加。
+- `ActiveTerminalSession`プロトコルに`trzszAcceptUpload`/`trzszSendChunk`/
+  `trzszAcceptDownload`/`trzszCancel`を追加(生成済みUniFFIバインディングの
+  6セッション型全てが既に同名メソッドを持つため、`extension X: ActiveTerminalSession {}`
+  の事後適合だけで済んだ)。
+- アップロード: `trzszStartUpload(url:)`が`.fileImporter`で選択されたsecurity-scoped
+  URLを受け取り、バックグラウンドキューで`startAccessingSecurityScopedResource`の
+  スコープ内で読み込む。Android版`TerminalTabsViewModel.trzszStartUpload`と同じ
+  64KBチャンク+「1チャンク先読みしてisLastを判定」方式。この読み出しループ自体は
+  `TerminalSessionController.trzszSendChunked(readNext:send:)`という純粋関数
+  (`Data`のクロージャベース)に切り出し、実ファイルI/Oなしで境界条件
+  (0バイトファイル・ちょうどchunkSize境界)を単体テストできるようにした
+  (`makeSshConfig`等、#30以来のパターンの踏襲)。
+- ダウンロード: `trzszStartDownload()`が`transferId`単位の一時ディレクトリ
+  (`FileManager.default.temporaryDirectory/trzsz-<transferId>/`)に書き込み用
+  `FileHandle`を開いてから`trzszAcceptDownload`を呼ぶ。`onTrzszDownloadChunk`は
+  そのハンドルへ逐次`write`する(Rustスレッドから直接呼ばれるためMainActorへは
+  ホップしない)。`transferId`でnamespaceしているのは、同じ`suggestedName`を持つ
+  別タブ/別転送が同じ一時パスへ衝突するのを避けるため。
+- `onTrzszFinished`(成功かつdownloadモードの場合のみ)で`completedDownloadURL`を
+  設定し、UI側は`.fileMover(isPresented:file:)`(iOS 16+、既存ファイルURLをそのまま
+  ユーザー選択の保存先へコピーできる)でFilesアプリ等への保存を提供する。
+  `.fileExporter`(`FileDocument`が必要)ではなく`.fileMover`を選んだのは、
+  既に一時ファイルとしてディスク上に存在するものをそのまま渡せるため
+  (メモリに載せ直す必要がない)。
+- `TrzszTransferSheet`(新規、Android版`TrzszTransferSheet.kt`のModalBottomSheetと
+  対称の3状態表示)。完了画面はダウンロード成功時のみ「保存」ボタンを出し、それが
+  ローカルな`@State showTrzszFileMover`(`uiState.completedDownloadURL`を直接
+  isPresentedに使わなかったのは、ユーザーが保存をキャンセルした場合に正しく
+  閉じられる必要があるため)経由で`.fileMover`を開く。
+- `trzszDismiss()`(クライアント側のみ、Rust API呼び出しなし): `trzszState`/
+  `completedDownloadURL`をクリアし、一時ディレクトリを削除する(`.fileMover`で
+  既に書き出し済みでも、コピー先とは別物の一時ファイルなのでどのみち不要)。
+
+**やらないこと**: ディレクトリ転送(`mode == "dir"`)のUI対応(Android版も未対応、
+`TrzszUiState.mode`は文字列のまま素通しし、"upload"/"download"以外は現状
+`waitingUserView`の`else`分岐(ダウンロード扱い)に落ちる。実害があれば別タスクで
+分岐追加)。バックグラウンド遷移中の転送継続保証(#24の`SessionSupervisor`との
+統合が前提になるため、#24の「やらないこと」と同じ理由で見送り)。
+
 ---
 
 ## 実装順序

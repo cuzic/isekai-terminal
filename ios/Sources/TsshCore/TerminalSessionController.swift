@@ -26,6 +26,12 @@ public final class TerminalUIState: ObservableObject {
     @Published public internal(set) var latestScreenUpdate: ScreenUpdate?
     /// Phase 1E-4: SSH agentへの署名要求。非nilの間、確認ダイアログを表示する。
     @Published public internal(set) var pendingAgentSignRequest: AgentSignRequest?
+    /// Phase 1C(#25): trzszファイル転送の状態。非nilの間、転送シートを表示する。
+    @Published public internal(set) var trzszState: TrzszUiState?
+    /// Phase 1C(#25): ダウンロード完了後、ユーザーがFilesアプリ等へ保存できる
+    /// 一時ファイルのURL。`trzszState`が`.done(success: true, ...)`かつダウンロード
+    /// だった場合のみ設定される。
+    @Published public internal(set) var completedDownloadURL: URL?
 
     // `TerminalSessionController`(非isolated)のstored property初期値として
     // 構築されるため、`nonisolated`にして呼び出し側のコンテキストを問わず
@@ -52,6 +58,10 @@ private protocol ActiveTerminalSession: AnyObject {
     func disconnect()
     func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]
     func scrollbackLen() -> UInt32
+    func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32)
+    func trzszSendChunk(transferId: String, data: Data, isLast: Bool)
+    func trzszAcceptDownload(transferId: String)
+    func trzszCancel(transferId: String)
 }
 extension SshSession: ActiveTerminalSession {}
 extension HelperQuicSession: ActiveTerminalSession {}
@@ -85,6 +95,18 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     /// Phase 1C(#14): `reconnect()`が最後に使ったcols/rowsで再接続できるように保持する。
     private var lastCols: UInt32 = 80
     private var lastRows: UInt32 = 24
+    /// Phase 1C(#25): 進行中のtrzsz転送のID/mode/表示名。`onTrzszRequest`で設定し、
+    /// `trzszDismiss()`でクリアする。Rustスレッド(callback)とUI操作スレッドの両方から
+    /// 触るため、単純な代入のみで完結する範囲でしか使わない(複雑な排他制御はしない)。
+    private var activeTrzszTransferId: String?
+    private var activeTrzszMode: String?
+    private var activeTrzszFileName: String?
+    /// Phase 1C(#25): ダウンロード中に書き込む一時ファイル。`trzszStartDownload()`で
+    /// 開き、`onTrzszDownloadChunk`(isLast)/`onTrzszFinished`のどちらか先に来た方で
+    /// 閉じる(両方から呼ばれても2回目はno-op、`FileHandle.closeFile()`は複数回呼んでも
+    /// 安全)。
+    private var downloadFileHandle: FileHandle?
+    private var downloadTempURL: URL?
 
     public init(
         profile: ConnectionProfile,
@@ -410,6 +432,96 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         uiState.pendingAgentSignRequest = nil
     }
 
+    // MARK: - trzsz(#25)
+
+    /// アップロード開始。`url`はユーザーが`.fileImporter`で選択したファイル
+    /// (security-scoped URL)。ファイルI/Oはメインスレッドをブロックしないよう
+    /// バックグラウンドキューで行う。Android版`TerminalTabsViewModel.trzszStartUpload`
+    /// と同じ「1チャンク先読みしてisLastを判定」方式(`Self.trzszSendChunked`)を使う。
+    public func trzszStartUpload(url: URL) {
+        guard let transferId = activeTrzszTransferId else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let didAccess = url.startAccessingSecurityScopedResource()
+            defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+
+            guard let fileHandle = try? FileHandle(forReadingFrom: url),
+                  let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let fileSize = (attrs[.size] as? NSNumber)?.uint64Value
+            else {
+                self.session?.trzszCancel(transferId: transferId)
+                return
+            }
+            defer { try? fileHandle.close() }
+
+            self.activeTrzszFileName = url.lastPathComponent
+            self.session?.trzszAcceptUpload(
+                transferId: transferId, fileName: url.lastPathComponent, fileSize: fileSize, mode: 0
+            )
+            Self.trzszSendChunked(
+                readNext: { fileHandle.readData(ofLength: Self.trzszChunkSize) },
+                send: { chunk, isLast in
+                    self.session?.trzszSendChunk(transferId: transferId, data: chunk, isLast: isLast)
+                }
+            )
+        }
+    }
+
+    /// ダウンロード開始。受信データを書き込む一時ファイルを開いてから
+    /// `trzszAcceptDownload`を呼ぶ(受信チャンクは`onTrzszDownloadChunk`で届く)。
+    public func trzszStartDownload() {
+        guard let transferId = activeTrzszTransferId else { return }
+        // transferIdでnamespaceしたディレクトリに置く(同じ`suggestedName`の別転送/別タブが
+        // 同じ一時パスへ書き込んで衝突するのを避けつつ、`.fileMover`に見せるファイル名は
+        // 人間可読なままにする)。
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "trzsz-\(transferId)", isDirectory: true
+        )
+        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let tempURL = tempDir.appendingPathComponent(activeTrzszFileName ?? UUID().uuidString)
+        FileManager.default.createFile(atPath: tempURL.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: tempURL) else {
+            session?.trzszCancel(transferId: transferId)
+            return
+        }
+        downloadFileHandle = handle
+        downloadTempURL = tempURL
+        session?.trzszAcceptDownload(transferId: transferId)
+    }
+
+    /// 進行中のtrzsz転送をキャンセルする。実際の`.done`遷移はRust側から
+    /// `onTrzszFinished(success: false, ...)`が来るのを待つ(Android版と同じ、
+    /// ここで即座にUI状態を書き換えない)。
+    public func trzszCancel() {
+        guard let transferId = activeTrzszTransferId else { return }
+        session?.trzszCancel(transferId: transferId)
+    }
+
+    /// 転送完了シートを閉じる(クライアント側のみの状態リセット、Rust APIコールなし)。
+    /// ダウンロード完了後の一時ファイルは、`.fileMover`で書き出し済みかどうかに
+    /// 関わらずここで削除する(書き出し済みなら既に宛先へコピーされているため
+    /// 一時ファイル自体はもう不要)。
+    @MainActor
+    public func trzszDismiss() {
+        if let url = downloadTempURL {
+            // 個々のファイルだけでなく、`trzszStartDownload()`が作った
+            // transferId単位の一時ディレクトリごと削除する。
+            try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        }
+        uiState.trzszState = nil
+        uiState.completedDownloadURL = nil
+        activeTrzszTransferId = nil
+        activeTrzszMode = nil
+        activeTrzszFileName = nil
+        downloadFileHandle = nil
+        downloadTempURL = nil
+    }
+
+    private func closeDownloadHandleIfNeeded() {
+        try? downloadFileHandle?.close()
+        downloadFileHandle = nil
+    }
+
     private func fail(message: String) {
         Task { @MainActor in self.uiState.state = .failed(message: message) }
     }
@@ -451,10 +563,51 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     }
 
     public func onData(data: Data) {}
-    public func onTrzszRequest(transferId: String, mode: String, suggestedName: String?, expectedSize: UInt64?) {}
-    public func onTrzszDownloadChunk(transferId: String, data: Data, isLast: Bool) {}
-    public func onTrzszProgress(transferId: String, transferred: UInt64, total: UInt64?) {}
-    public func onTrzszFinished(transferId: String, success: Bool, message: String?) {}
+
+    /// リモートからtrzsz転送要求が届いた。Android版`TerminalSession.kt`の
+    /// `onTrzszRequest`→`TrzszUiState.WaitingUser`と同じ、まずはユーザー確認待ちにする。
+    public func onTrzszRequest(transferId: String, mode: String, suggestedName: String?, expectedSize: UInt64?) {
+        activeTrzszTransferId = transferId
+        activeTrzszMode = mode
+        activeTrzszFileName = suggestedName
+        Task { @MainActor in
+            self.uiState.trzszState = .waitingUser(
+                transferId: transferId, mode: mode, suggestedName: suggestedName, expectedSize: expectedSize
+            )
+        }
+    }
+
+    /// ダウンロード中のデータチャンク。`trzszStartDownload()`が開いた一時ファイルへ
+    /// 逐次書き込む(Rustスレッドから直接呼ばれるため、MainActorへはホップしない)。
+    public func onTrzszDownloadChunk(transferId: String, data: Data, isLast: Bool) {
+        downloadFileHandle?.write(data)
+        if isLast {
+            closeDownloadHandleIfNeeded()
+        }
+    }
+
+    public func onTrzszProgress(transferId: String, transferred: UInt64, total: UInt64?) {
+        let mode = activeTrzszMode ?? ""
+        let fileName = activeTrzszFileName
+        Task { @MainActor in
+            self.uiState.trzszState = .inProgress(
+                transferId: transferId, mode: mode, fileName: fileName, transferred: transferred, total: total
+            )
+        }
+    }
+
+    /// 転送完了。ダウンロードが成功した場合のみ、一時ファイルのURLをUIへ渡して
+    /// `.fileMover`での保存を可能にする(Android版がアプリのDL完了通知経由でSAF保存を
+    /// 促すのと同じ役割)。
+    public func onTrzszFinished(transferId: String, success: Bool, message: String?) {
+        closeDownloadHandleIfNeeded()
+        let completedURL = (success && activeTrzszMode == "download") ? downloadTempURL : nil
+        Task { @MainActor in
+            self.uiState.trzszState = .done(transferId: transferId, success: success, message: message)
+            self.uiState.completedDownloadURL = completedURL
+        }
+    }
+
     public func onNoViablePath() {}
     public func onForwardStateChanged(id: String, state: ForwardState) {}
 

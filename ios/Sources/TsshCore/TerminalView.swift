@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 import TsshCoreLogic
 
 /// Phase 1D(#18b): ターミナル本画面。SSH接続・VTE画面(`ScreenUpdate`)描画・
@@ -34,6 +35,13 @@ public struct TerminalView: View {
     /// Phase 1F-5(#52): 定型コマンドシート。Android版`showSnippetSheet`と対称。
     @State private var showSnippetSheet = false
     @State private var snippets: [Snippet] = []
+    /// Phase 1C(#25): trzszアップロード時のファイル選択ピッカー表示フラグ。
+    @State private var showTrzszFileImporter = false
+    /// Phase 1C(#25): trzszダウンロード完了後、保存先を選ぶ`.fileMover`の表示フラグ。
+    /// `uiState.completedDownloadURL`(いつ設定されるか制御できない)ではなく
+    /// このローカルな`@State`をisPresentedに使うことで、ユーザーが保存をキャンセル
+    /// した場合に正しく閉じられるようにする。
+    @State private var showTrzszFileMover = false
     private let profileId: Int64?
     private let db: ProfileDatabase
 
@@ -104,6 +112,31 @@ public struct TerminalView: View {
         } message: {
             Text("サーバーが鍵(\(uiState.pendingAgentSignRequest?.fingerprint ?? ""))での署名を要求しています。許可しますか？")
         }
+        .sheet(
+            isPresented: Binding(
+                get: { uiState.trzszState != nil },
+                set: { if !$0 { controller.trzszDismiss() } }
+            )
+        ) {
+            if let trzszState = uiState.trzszState {
+                TrzszTransferSheet(
+                    state: trzszState,
+                    completedDownloadURL: uiState.completedDownloadURL,
+                    onStartUpload: { showTrzszFileImporter = true },
+                    onStartDownload: { controller.trzszStartDownload() },
+                    onCancel: { controller.trzszCancel() },
+                    onSave: { showTrzszFileMover = true },
+                    onDismiss: { controller.trzszDismiss() }
+                )
+                .presentationDetents([.medium])
+            }
+        }
+        .fileImporter(isPresented: $showTrzszFileImporter, allowedContentTypes: [.item]) { result in
+            if case .success(let url) = result {
+                controller.trzszStartUpload(url: url)
+            }
+        }
+        .fileMover(isPresented: $showTrzszFileMover, file: uiState.completedDownloadURL) { _ in }
     }
 
     @ViewBuilder
