@@ -2621,6 +2621,24 @@ Phase 1G-2(#54)が実装され(`46d3881`→`1322c12`)、未コミットの`impor
 importを再度追加した。`Tests/TsshCoreTests/TerminalTabsModelTests.swift`
 (`SshHostTrustStore`を直接使用)にも同様に追加が必要だった。
 
+**分離直後にCIで発覚した3件の不整合(このコミットで修正)**:
+1. `ios-rust-core-check.yml`/`ios-ssh-vertical-slice-check.yml`が使う
+   `xcodebuild test -scheme TsshCore`が「Scheme TsshCore is not currently
+   configured for the test action」で壊れた。`TsshCoreLogic`分離により
+   自動生成スキームが`GRDB-Package`/`TsshCore`/`TsshCore-Package`/`TsshCoreLogic`
+   の4つになり、個別ターゲットスキーム(`TsshCore`)にはテストアクションが
+   構成されなくなったため。全ターゲットのテストを束ねる`TsshCore-Package`へ
+   両ワークフローの`-scheme`を変更した(`ios/README.md`の該当箇所も追随)。
+2. 同じ理由で`ios-ssh-vertical-slice-check.yml`の
+   `-only-testing:TsshCoreTests/KeyManagerTests/...`が誤り(`KeyManagerTests`は
+   `TsshCoreLogicTests`へ移動済み)だったため修正。
+3. `ios/App/TsshTerminalApp/ContentView.swift`/`DiagnosticCallbackBridge.swift`
+   が`DiagnosticCallback`(生成UniFFIバインディング、`TsshCoreLogic`へ移動済み)を
+   使うにもかかわらず`import TsshCore`のみで`import TsshCoreLogic`が無く、
+   「cannot find type 'DiagnosticCallback' in scope」でビルドが壊れていた
+   (`TsshCore`は`TsshCoreLogic`を`@_exported import`していないため、依存先の
+   publicな型は自動では見えない)。
+
 ### Phase 1C(#14)実装メモ(2026-07-05、バックグラウンド遷移対応)
 
 **スコープ**: iOS版のバックグラウンド遷移対応のうち、Swiftだけで完結する範囲

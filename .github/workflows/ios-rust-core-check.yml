@@ -125,7 +125,7 @@ jobs:
         run: |
           xcodebuild -list
           xcodebuild test \
-            -scheme TsshCore \
+            -scheme TsshCore-Package \
             -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}'
 
       - name: Upload XCFramework

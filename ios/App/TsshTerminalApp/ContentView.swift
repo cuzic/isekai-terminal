@@ -1,5 +1,6 @@
 import SwiftUI
 import TsshCore
+import TsshCoreLogic
 
 /// Phase 1A-1: rust-coreをSwiftUIアプリからリンクできること、Rustの同期/非同期関数呼び出し・
 /// callback受信・Rustオブジェクトの明示的な破棄が一通り動くことを確認するための最小画面。

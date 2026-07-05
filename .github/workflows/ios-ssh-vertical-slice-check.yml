@@ -95,10 +95,10 @@ jobs:
         working-directory: ios
         run: |
           xcodebuild test \
-            -scheme TsshCore \
+            -scheme TsshCore-Package \
             -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}' \
             -only-testing:TsshCoreTests/SshVerticalSliceTests \
-            -only-testing:TsshCoreTests/KeyManagerTests/testGeneratedKeyAuthenticatesAgainstRealSshd \
+            -only-testing:TsshCoreLogicTests/KeyManagerTests/testGeneratedKeyAuthenticatesAgainstRealSshd \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
       - name: Stop sshd fixture

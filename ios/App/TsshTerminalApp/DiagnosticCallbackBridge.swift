@@ -1,4 +1,5 @@
 import TsshCore
+import TsshCoreLogic
 
 /// `DiagnosticCallback`(Rust `callback_interface`)をSwiftのクロージャで
 /// 実装するための薄いブリッジ。Phase 1A-1のsmoke testでのみ使う診断用コードで、
