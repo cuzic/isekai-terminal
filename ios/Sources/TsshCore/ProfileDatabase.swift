@@ -40,7 +40,8 @@ public struct KeyEntry: Codable, Equatable, FetchableRecord, PersistableRecord {
 }
 
 /// Android版`ConnectionProfile`相当(MVPスコープ、必要に応じて後続Phaseで拡張)。
-public struct ConnectionProfile: Codable, Equatable, FetchableRecord, MutablePersistableRecord {
+/// `Hashable`はSwiftUIの`NavigationStack`パス(`AppRoute`)に格納するために必要。
+public struct ConnectionProfile: Codable, Equatable, Hashable, FetchableRecord, MutablePersistableRecord {
     public var id: Int64?
     public var displayName: String
     public var host: String
