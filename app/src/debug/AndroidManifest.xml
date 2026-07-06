@@ -7,7 +7,7 @@
     <application>
         <receiver
             android:name=".debug.FaultInjectionReceiver"
-            android:exported="true">
+            android:exported="false">
             <intent-filter>
                 <action android:name="tools.isekai.terminal.debug.SET_LATENCY" />
                 <action android:name="tools.isekai.terminal.debug.SET_LOSS" />
