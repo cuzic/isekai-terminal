@@ -29,4 +29,14 @@ pub enum ProtocolError {
 
     #[error("unsupported version {got} (supported range {min}..={max})")]
     UnsupportedVersion { got: u32, min: u32, max: u32 },
+
+    /// A value destined for interpolation into a remote bootstrap shell
+    /// command (`relay_sni`/`relay_jwt`, see `bootstrap::validate_relay_sni`/
+    /// `bootstrap::validate_relay_jwt`) contains a character outside the
+    /// strict allowed set. This is defense-in-depth on top of shell-quoting:
+    /// a compromised or misconfigured relay/JWT issuer should not be able to
+    /// smuggle shell metacharacters into either value in the first place
+    /// (security review #57).
+    #[error("invalid bootstrap argument {field}: {reason}")]
+    InvalidBootstrapArg { field: &'static str, reason: String },
 }
