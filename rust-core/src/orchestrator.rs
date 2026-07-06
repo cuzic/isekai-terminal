@@ -166,6 +166,13 @@ enum ConnPhase {
     Connected,
 }
 
+/// trzsz ダウンロードの累積バッファに設ける上限(#60)。trzsz プロトコルの
+/// `SIZE`(申告値)はサーバー側の自己申告に過ぎず強制されないため、悪意ある/
+/// 壊れたサーバーが巨大な SIZE を申告して DATA を送り続けると `download_buf` が
+/// 無制限に肥大化し端末が OOM でクラッシュし得る。実際に受信したバイト数の実測値
+/// (`download_buf.len() + 今回のchunk長`)がこの上限を超えたら転送を中断する。
+const MAX_DOWNLOAD_BUF_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+
 struct OrchestratorState {
     current_host: Option<String>,
     current_port: u16,
@@ -177,6 +184,12 @@ struct OrchestratorState {
     trzsz_mode: Option<String>,
     /// Accumulates bytes from on_trzsz_download_chunk; drained on on_trzsz_finished
     download_buf: Vec<u8>,
+    /// #60: `MAX_DOWNLOAD_BUF_BYTES` を超えてローカルに中断した転送のID。
+    /// `trzsz_cancel` は非同期(セッションイベントループへのコマンド送信)なので、
+    /// 実際の `on_trzsz_finished`(success=false, message="Cancelled" 等の汎用文言)が
+    /// 届くのは少し後になる。その届いた際にこのIDが一致すれば、汎用文言ではなく
+    /// ユーザーに分かりやすい「大きすぎる」メッセージへ差し替える。
+    size_limit_exceeded_for: Option<String>,
 }
 
 pub(crate) struct OrchestratorShared {
@@ -236,14 +249,40 @@ impl SessionCallback for OrchestratorAdapter {
             s.current_transfer_id = Some(transfer_id.clone());
             s.trzsz_mode = Some(mode.clone());
             s.download_buf.clear();
+            s.size_limit_exceeded_for = None;
         }
         self.shared.callback.on_trzsz_state_changed(
             TrzszPublicState::WaitingUser { transfer_id, mode, suggested_name, expected_size }
         );
     }
 
-    fn on_trzsz_download_chunk(&self, _transfer_id: String, data: Vec<u8>, _is_last: bool) {
-        self.shared.state.lock().download_buf.extend_from_slice(&data);
+    /// #60: trzsz の `SIZE` 申告値はサーバーの自己申告に過ぎず強制されないため、
+    /// 実際に受信したバイト数(累積 `download_buf` 長)を都度 `MAX_DOWNLOAD_BUF_BYTES`
+    /// と比較する。超過したら OOM する前に `download_buf` を捨て、転送そのものも
+    /// `trzsz_cancel` で中断させる(FSM側は非同期に `on_trzsz_finished` を返してくる
+    /// ので、そちらで success=false・分かりやすいメッセージに揃える)。
+    fn on_trzsz_download_chunk(&self, transfer_id: String, data: Vec<u8>, _is_last: bool) {
+        let exceeded = {
+            let mut s = self.shared.state.lock();
+            let would_be_len = s.download_buf.len().saturating_add(data.len());
+            if would_be_len > MAX_DOWNLOAD_BUF_BYTES {
+                log::warn!(
+                    "trzsz: download {} exceeds {} byte cap (would reach {}), aborting to avoid OOM",
+                    transfer_id, MAX_DOWNLOAD_BUF_BYTES, would_be_len
+                );
+                s.download_buf.clear();
+                s.size_limit_exceeded_for = Some(transfer_id.clone());
+                true
+            } else {
+                s.download_buf.extend_from_slice(&data);
+                false
+            }
+        };
+        if exceeded {
+            if let Some(session) = self.shared.session.lock().as_ref() {
+                session.trzsz_cancel(transfer_id);
+            }
+        }
     }
 
     fn on_trzsz_progress(&self, transfer_id: String, transferred: u64, total: Option<u64>) {
@@ -258,11 +297,21 @@ impl SessionCallback for OrchestratorAdapter {
     }
 
     fn on_trzsz_finished(&self, transfer_id: String, success: bool, message: Option<String>) {
-        let (data, is_download) = {
+        let (data, is_download, success, message) = {
             let mut s = self.shared.state.lock();
             s.current_transfer_id = None;
-            (std::mem::take(&mut s.download_buf),
-             s.trzsz_mode.as_deref() == Some("download"))
+            let size_limit_hit = s.size_limit_exceeded_for.take().as_deref() == Some(transfer_id.as_str());
+            let data = std::mem::take(&mut s.download_buf);
+            let is_download = s.trzsz_mode.as_deref() == Some("download");
+            if size_limit_hit {
+                // #60: on_trzsz_download_chunk側で既に中断済み。trzsz_cancel経由の
+                // 汎用的な message(例: "Cancelled")を、ユーザーに分かりやすい文言へ
+                // 差し替える。success も常にfalseにする(万一cancel競合でtrueが
+                // 届いても、上限超過を成功扱いにしてはいけない)。
+                (data, is_download, false, Some("ファイルが大きすぎるため転送を中断しました".to_string()))
+            } else {
+                (data, is_download, success, message)
+            }
         };
         if success && is_download && !data.is_empty() {
             self.shared.callback.on_download_complete(None, data);
@@ -304,6 +353,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
             current_transfer_id: None,
             trzsz_mode: None,
             download_buf: Vec::new(),
+            size_limit_exceeded_for: None,
         }),
         callback: Arc::from(callback),
         session: Mutex::new(None),
@@ -601,6 +651,10 @@ impl SessionOrchestrator {
 // 保持できない(trait objectではない)ため、`session: Mutex::new(None)`のまま
 // (未接続として)テストする — `notify_network_lost`/`disconnect`は`None`の場合
 // no-opになるよう書かれているので、これで分岐ロジックの検証は完結する。
+//
+// #60: `on_trzsz_download_chunk`が上限超過時に呼ぶ`session.trzsz_cancel(..)`も
+// 同様に`None`の場合no-opになるよう書かれているので、trzszバッファ上限のロジック
+// (実SSH/QUIC不要)もここで検証できる。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +700,7 @@ mod tests {
                 current_transfer_id: None,
                 trzsz_mode: None,
                 download_buf: Vec::new(),
+                size_limit_exceeded_for: None,
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
@@ -744,6 +799,7 @@ mod tests {
     fn on_trzsz_request_records_transfer_and_clears_download_buf() {
         let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
         shared.state.lock().download_buf = vec![1, 2, 3];
+        shared.state.lock().size_limit_exceeded_for = Some("stale".to_string());
         adapter.on_trzsz_request(
             "t1".to_string(), "download".to_string(), Some("file.txt".to_string()), Some(100),
         );
@@ -752,6 +808,7 @@ mod tests {
             assert_eq!(s.current_transfer_id.as_deref(), Some("t1"));
             assert_eq!(s.trzsz_mode.as_deref(), Some("download"));
             assert!(s.download_buf.is_empty());
+            assert!(s.size_limit_exceeded_for.is_none(), "新しい転送開始時に前回の状態を持ち越さない");
         }
         let events = cb.trzsz_states.lock().unwrap();
         assert!(matches!(&events[0], TrzszPublicState::WaitingUser { transfer_id, .. } if transfer_id == "t1"));
@@ -763,6 +820,75 @@ mod tests {
         adapter.on_trzsz_download_chunk("t1".to_string(), vec![1, 2], false);
         adapter.on_trzsz_download_chunk("t1".to_string(), vec![3, 4], true);
         assert_eq!(shared.state.lock().download_buf, vec![1, 2, 3, 4]);
+    }
+
+    // #60: 上限超過時にOOMせず転送を中断し、download_bufを破棄することを確認する。
+    // `vec![0u8; MAX_DOWNLOAD_BUF_BYTES]`はLinux上ではゼロページの遅延確保のため
+    // 実メモリをほぼ消費せず高速(かつ本テストはそれ以上書き込まない)。
+    #[test]
+    fn on_trzsz_download_chunk_clears_buffer_and_marks_size_limit_when_cap_exceeded() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().current_transfer_id = Some("t1".to_string());
+        shared.state.lock().trzsz_mode = Some("download".to_string());
+        shared.state.lock().download_buf = vec![0u8; MAX_DOWNLOAD_BUF_BYTES];
+
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![1], false);
+
+        let s = shared.state.lock();
+        assert!(s.download_buf.is_empty(), "上限超過時はOOM回避のためdownload_bufを破棄する");
+        assert_eq!(s.size_limit_exceeded_for.as_deref(), Some("t1"));
+        drop(s);
+        // まだon_trzsz_finishedが来ていないので、この時点ではDoneはまだ出ていない
+        assert!(cb.trzsz_states.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn on_trzsz_download_chunk_stays_under_cap_does_not_mark_size_limit() {
+        let (adapter, shared, _cb) = adapter_with_phase(ConnPhase::Connected, false);
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![1, 2, 3], false);
+        let s = shared.state.lock();
+        assert_eq!(s.download_buf, vec![1, 2, 3]);
+        assert!(s.size_limit_exceeded_for.is_none());
+    }
+
+    // #60: 上限超過後、非同期のtrzsz_cancel往復で本物のon_trzsz_finishedが
+    // (success=false, message="Cancelled"等の汎用文言で)届いた際に、ユーザーへ
+    // 分かりやすい「大きすぎる」メッセージへ差し替えて伝えることを確認する。
+    #[test]
+    fn on_trzsz_finished_overrides_message_when_size_limit_was_exceeded() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().current_transfer_id = Some("t1".to_string());
+        shared.state.lock().trzsz_mode = Some("download".to_string());
+        shared.state.lock().download_buf = vec![0u8; MAX_DOWNLOAD_BUF_BYTES];
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![1], false);
+
+        // 実際のFSMはtrzsz_cancel経由で非同期に success=false, message="Cancelled" を
+        // 返してくる。ここではそれをシミュレートする。
+        adapter.on_trzsz_finished("t1".to_string(), false, Some("Cancelled".to_string()));
+
+        assert!(cb.downloads.lock().unwrap().is_empty(), "中断された転送でdownload_completeを呼んではいけない");
+        let events = cb.trzsz_states.lock().unwrap();
+        assert!(matches!(
+            &events[0],
+            TrzszPublicState::Done { success: false, message: Some(m), .. } if m.contains("大きすぎる")
+        ));
+        assert!(shared.state.lock().size_limit_exceeded_for.is_none(), "一度使ったフラグは消費してクリアする");
+    }
+
+    // #60: 万一cancelが競合してsuccess=trueが返ってきても、上限超過を検知していた
+    // 転送は成功扱いにしない(かつ空のdownload_bufをon_download_completeへ渡さない)。
+    #[test]
+    fn on_trzsz_finished_forces_failure_when_size_limit_was_exceeded_even_if_reported_success() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().current_transfer_id = Some("t1".to_string());
+        shared.state.lock().trzsz_mode = Some("download".to_string());
+        shared.state.lock().size_limit_exceeded_for = Some("t1".to_string());
+
+        adapter.on_trzsz_finished("t1".to_string(), true, None);
+
+        assert!(cb.downloads.lock().unwrap().is_empty());
+        let events = cb.trzsz_states.lock().unwrap();
+        assert!(matches!(&events[0], TrzszPublicState::Done { success: false, .. }));
     }
 
     #[test]

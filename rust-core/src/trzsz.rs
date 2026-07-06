@@ -92,6 +92,13 @@ pub enum TrzszTimer {
 
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// サーバーが `SIZE` フレームで申告してくるファイルサイズの「妥当性」上限(#60)。
+/// あくまで `u64::MAX` 等の明らかに異常な値を弾くための緩いサニティチェックであり、
+/// 実際のメモリ使用量そのものは `orchestrator.rs` の `MAX_DOWNLOAD_BUF_BYTES`
+/// (受信済みバイト数の実測値ベース)側で別途強制される。trzsz は SIZE を強制する
+/// プロトコル機構を持たない(自己申告)ため、二重に防御する。
+const MAX_DECLARED_TRZSZ_SIZE: u64 = 1 << 40; // 1 TiB
+
 // ── FSM 内部状態 ──────────────────────────────────────────
 
 enum TrzszFsmState {
@@ -372,14 +379,31 @@ impl TrzszTransferFsm {
                         }
                         "SIZE" if *step == DownloadStep::WaitSize => {
                             let n = payload.parse::<u64>().unwrap_or(0);
-                            *total = Some(n);
-                            effects.push(TrzszEffect::SendStdin(frame_int("SUCC", n)));
-                            effects.push(TrzszEffect::OnProgress {
-                                transfer_id: transfer_id.clone(),
-                                transferred: *transferred,
-                                total: *total,
-                            });
-                            *step = DownloadStep::Receiving;
+                            if n > MAX_DECLARED_TRZSZ_SIZE {
+                                // サーバーが明らかに異常な(またはu64::MAX付近の)SIZEを
+                                // 申告してきた。以降DATAを受け取ってもOOMするだけなので、
+                                // NUM/NAME同様にSUCCで応答する前にここで転送を中断する。
+                                log::warn!(
+                                    "trzsz: server declared implausible SIZE={} (sanity cap={}), aborting",
+                                    n, MAX_DECLARED_TRZSZ_SIZE
+                                );
+                                effects.push(TrzszEffect::SendStdin(vec![0x03])); // Ctrl+C
+                                effects.push(TrzszEffect::OnFinished {
+                                    transfer_id: transfer_id.clone(),
+                                    success: false,
+                                    message: Some("ファイルが大きすぎるため転送を中断しました".to_string()),
+                                });
+                                terminal = Some(false);
+                            } else {
+                                *total = Some(n);
+                                effects.push(TrzszEffect::SendStdin(frame_int("SUCC", n)));
+                                effects.push(TrzszEffect::OnProgress {
+                                    transfer_id: transfer_id.clone(),
+                                    transferred: *transferred,
+                                    total: *total,
+                                });
+                                *step = DownloadStep::Receiving;
+                            }
                         }
                         "DATA" if *step == DownloadStep::Receiving => {
                             let Some(data) = decode_bytes(&payload) else { continue; };
@@ -1167,6 +1191,33 @@ mod tests {
         assert!(matches!(fsm.state, TrzszFsmState::Normal));
     }
 
+    // download: SIZEがサニティ上限を超える場合は中断する(#60: OOM対策)。
+    // trzszはSIZEを強制するプロトコル機構を持たない(サーバーの自己申告)ため、
+    // 悪意あるサーバーが巨大なSIZEを申告してDATAを送り続けるとOOMし得る。
+    #[test]
+    fn test_download_size_exceeding_sanity_cap_aborts_transfer() {
+        let mut fsm = TrzszTransferFsm::new();
+        let resp = feed(&mut fsm, trigger("S"));
+        let tid = request_tid(&resp).unwrap();
+        accept_download_and_cfg(&mut fsm, &tid);
+
+        fsm.on_event(TrzszEvent::StdoutBytes(frame_int("NUM", 1)));
+        fsm.on_event(TrzszEvent::StdoutBytes(frame_bin("NAME", b"a.bin")));
+
+        // 明らかに異常なSIZE(u64::MAX)を申告してくる悪意あるサーバーを模す
+        let r = fsm.on_event(TrzszEvent::StdoutBytes(frame_int("SIZE", u64::MAX)));
+
+        let finished = r.actions.iter().find_map(|a| {
+            if let TrzszEffect::OnFinished { success, message, .. } = a {
+                Some((*success, message.clone()))
+            } else { None }
+        }).unwrap();
+        assert!(!finished.0, "異常なSIZEは転送失敗として扱う");
+        assert!(finished.1.is_some(), "ユーザーに分かるメッセージを添える");
+        assert!(!contains_subseq(&stdin_bytes(&r), b"#SUCC:"), "SIZEへのSUCCは送らず中断する");
+        assert!(matches!(fsm.state, TrzszFsmState::Recovering));
+    }
+
     // FAIL メッセージ → Recovering へ
     #[test]
     fn test_fail_message_goes_to_recovering() {
@@ -1251,6 +1302,34 @@ mod tests {
             let mut fsm = TrzszTransferFsm::new();
             fsm.on_event(TrzszEvent::StdoutBytes(setup_bytes));
             fsm.on_event(TrzszEvent::KotlinCancel { transfer_id: cancel_id });
+        }
+
+        /// #60: サーバーが申告する download の SIZE に任意の u64 を与えてもパニックせず、
+        /// サニティ上限(MAX_DECLARED_TRZSZ_SIZE)を超える場合は必ず転送失敗として
+        /// 扱われる(=DATAを無制限に受理し続ける状態には決して進まない)。
+        #[test]
+        fn prop_download_size_field_bounded_or_rejected(size in any::<u64>()) {
+            let mut fsm = TrzszTransferFsm::new();
+            let resp = feed(&mut fsm, trigger("S"));
+            let tid = request_tid(&resp).unwrap();
+            accept_download_and_cfg(&mut fsm, &tid);
+            fsm.on_event(TrzszEvent::StdoutBytes(frame_int("NUM", 1)));
+            fsm.on_event(TrzszEvent::StdoutBytes(frame_bin("NAME", b"a.bin")));
+
+            let r = fsm.on_event(TrzszEvent::StdoutBytes(frame_int("SIZE", size)));
+
+            if size > MAX_DECLARED_TRZSZ_SIZE {
+                prop_assert!(
+                    r.actions.iter().any(|a| matches!(a, TrzszEffect::OnFinished { success: false, .. })),
+                    "上限超過のSIZEは転送失敗として中断されるべき"
+                );
+                prop_assert!(matches!(fsm.state, TrzszFsmState::Recovering));
+            } else {
+                prop_assert!(
+                    r.actions.iter().any(|a| matches!(a, TrzszEffect::OnProgress { total: Some(t), .. } if *t == size)),
+                    "上限内のSIZEは通常通り受理されるべき"
+                );
+            }
         }
     }
 }
