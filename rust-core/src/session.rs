@@ -79,6 +79,15 @@ pub(crate) struct SessionCore {
     /// Phase 12: per-session theme。このセッション(タブ)が現在使っているテーマの
     /// スナップショット。[scrollback_cells]の空白パディング色にもここから使う。
     current_theme: Mutex<Theme>,
+    /// [start] に渡された callback の複製。ブートストラップ用 SSH 接続
+    /// （`helper_quic_transport::bootstrap_helper_via_ssh` 等、isekai-helper を
+    /// 起動するための踏み台 SSH）が発火する `TransportEvent::HostKey` を、本セッションの
+    /// `on_host_key`（Kotlin 側の `KnownHostRepository` を参照する既存の TOFU/変更検知
+    /// ロジック）へそのまま転送するために保持する。このセッションで発生し得る唯一の
+    /// HostKey イベントはこのブートストラップ SSH 由来であり（QUIC データプレーン自体は
+    /// ホスト鍵という概念を持たず cert_sha256 ピン留めのみ)、同一の意思決定ロジックを
+    /// 流用してよい（`[callback]` getter 参照）。
+    callback: Mutex<Option<Arc<dyn SessionCallback>>>,
 }
 
 impl SessionCore {
@@ -89,6 +98,7 @@ impl SessionCore {
             scrollback: Arc::new(Mutex::new(VecDeque::new())),
             screen_cols: Mutex::new(80),
             current_theme: Mutex::new(Theme::default()),
+            callback: Mutex::new(None),
         }
     }
 
@@ -113,6 +123,7 @@ impl SessionCore {
         *self.current_theme.lock() = initial_theme;
 
         let callback: Arc<dyn SessionCallback> = Arc::from(callback);
+        *self.callback.lock() = Some(Arc::clone(&callback));
         let scrollback = self.scrollback.clone();
 
         RUNTIME.spawn(async move {
@@ -120,6 +131,13 @@ impl SessionCore {
         });
 
         (cmd_rx, event_tx)
+    }
+
+    /// [start] に渡された callback の複製を返す(`start` 呼び出し後のみ `Some`)。
+    /// ブートストラップ SSH のホスト鍵検証をこのセッション本来の callback に
+    /// 委譲したい呼び出し元（`helper_quic_transport` 等）向け。
+    pub(crate) fn callback(&self) -> Option<Arc<dyn SessionCallback>> {
+        self.callback.lock().clone()
     }
 
     /// このセッション(タブ)のテーマを差し替える。[start]の前後どちらで呼んでも安全

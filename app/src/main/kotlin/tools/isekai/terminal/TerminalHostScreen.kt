@@ -172,6 +172,8 @@ private fun TerminalTabScreen(
             onScrollbackCells = { offset, rows -> tabsVm.scrollbackCells(tabId, offset, rows) },
             onTrustUpdatedHostKey = { tabsVm.trustUpdatedHostKey(tabId) },
             onDismissHostKeyWarning = { tabsVm.dismissHostKeyWarning(tabId) },
+            onTrustNewHostKey = { tabsVm.trustNewHostKey(tabId) },
+            onDismissNewHostKeyPrompt = { tabsVm.dismissNewHostKeyPrompt(tabId) },
             onTrzszStartUpload = { uri -> tabsVm.trzszStartUpload(tabId, uri) },
             onTrzszStartDownload = { tabsVm.trzszStartDownload(tabId) },
             onTrzszCancel = { tabsVm.trzszCancel(tabId) },

@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import tools.isekai.terminal.data.ConnectionProfile
+import tools.isekai.terminal.data.HostKeySettings
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.data.toHelperQuicConfig
@@ -77,7 +78,13 @@ class TerminalTabsViewModel(
     constructor(app: Application) : this(
         app,
         AndroidAppExecutor(app),
-        { TerminalSession(RealHostKeyChecker(Repositories.knownHosts)) },
+        {
+            TerminalSession(
+                RealHostKeyChecker(Repositories.knownHosts) {
+                    HostKeySettings.isAutoTrustNewHostKeysEnabled(app)
+                }
+            )
+        },
     )
 
     companion object {
@@ -344,10 +351,27 @@ class TerminalTabsViewModel(
                     connectIsekaiLinkRelay(tab, decrypted.toIsekaiLinkRelayConfig(auth, jumpAuth))
                 }
             }
+            // タスク#65: 復号済み秘密鍵PEMのベストエフォートなメモリ消去。
+            // connect_* はUniFFI越しのFFI呼び出しで、呼び出し内でByteArrayの内容を
+            // 同期的にRust側へコピーしてから戻る(直上のコメント参照)ため、
+            // ここで元のByteArrayをゼロ埋めしてもRust側の認証には影響しない。
+            // ただしJVM上に他の参照(GCされるまでのコピー等)が残っていないことまでは
+            // 保証できないベストエフォートの対策。
+            wipeIfPublicKey(auth)
+            wipeIfPublicKey(jumpAuth)
             // Phase 12 P2-1: このタブが解決したテーマ(Global default → Profile default)を
             // 接続直後に反映する。connect_* はRust側で同期的にActiveSessionを差し込むため、
             // このタイミングで呼べば確実にセッションへ届く。
             pushThemeToSession(tab, tab.currentTheme.value)
+        }
+    }
+
+    /** [auth]が公開鍵認証なら復号済みPEMのByteArrayをその場でゼロ埋めする(タスク#65)。
+     *  パスワード認証の`String`は不変かつCompose `TextField`がString前提のため、
+     *  完全なゼロ化は行わない(ベストエフォート対策として本コメントで言及するに留める)。 */
+    private fun wipeIfPublicKey(auth: SshAuth?) {
+        if (auth is SshAuth.PublicKey) {
+            java.util.Arrays.fill(auth.privateKeyPem, 0)
         }
     }
 
@@ -498,6 +522,10 @@ class TerminalTabsViewModel(
     fun trustUpdatedHostKey(tabId: String) = tabOrNull(tabId)?.session?.trustUpdatedHostKey()
 
     fun dismissHostKeyWarning(tabId: String) = tabOrNull(tabId)?.session?.dismissHostKeyWarning()
+
+    fun trustNewHostKey(tabId: String) = tabOrNull(tabId)?.session?.trustNewHostKey()
+
+    fun dismissNewHostKeyPrompt(tabId: String) = tabOrNull(tabId)?.session?.dismissNewHostKeyPrompt()
 
     fun respondAgentSignRequest(tabId: String, approved: Boolean) =
         tabOrNull(tabId)?.session?.respondAgentSignRequest(approved)

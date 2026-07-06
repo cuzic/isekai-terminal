@@ -162,8 +162,11 @@ impl MultipathHelperQuicSession {
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         let (rebind_tx, rebind_rx) = tokio::sync::mpsc::channel(4);
         *self.rebind_tx.lock().unwrap() = Some(rebind_tx);
+        // ブートストラップ用SSHのホスト鍵検証を本セッションのcallbackに委譲する
+        // (`helper_quic_transport::bootstrap_helper_via_ssh`のNOTE参照)。
+        let host_key_callback = self.core.callback();
         RUNTIME.spawn(async move {
-            match try_connect_multipath(&config, rebind_rx, event_tx.clone()).await {
+            match try_connect_multipath(&config, rebind_rx, event_tx.clone(), host_key_callback).await {
                 Ok(stream) => run_over_stream(config, stream, cmd_rx, event_tx).await,
                 Err(e) => {
                     warn!("multipath_quic: connect failed: {e}");
@@ -908,6 +911,7 @@ async fn try_connect_multipath(
     config: &MultipathHelperQuicConfig,
     rebind_rx: tokio::sync::mpsc::Receiver<RebindRequest>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<(noq::SendStream, noq::RecvStream), String> {
     // ユーザーが明示指定していればそれを優先し、無指定ならdirect_host使用時のみ
     // 既定の固定ポートにフォールバックする(後方互換)。
@@ -915,7 +919,7 @@ async fn try_connect_multipath(
         .or_else(|| config.direct_host.is_some().then_some(DIRECT_MULTIPATH_BIND_PORT));
     let handshake = helper_quic_transport::bootstrap_helper_via_ssh(
         &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump, bind_port,
-        &crate::helper_bootstrap::HelperP2pMode::None,
+        &crate::helper_bootstrap::HelperP2pMode::None, host_key_callback,
     )
     .await?;
 
@@ -979,7 +983,7 @@ fn spawn_rebind_listener(endpoint: noq::Endpoint, mut rebind_rx: tokio::sync::mp
 }
 
 async fn run_over_stream(
-    config: MultipathHelperQuicConfig,
+    mut config: MultipathHelperQuicConfig,
     (send, recv): (noq::SendStream, noq::RecvStream),
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
@@ -1010,7 +1014,7 @@ async fn run_over_stream(
 
     // MultipathHelperQuicConfig は agent forwarding 未対応（HelperQuicConfig と同様）。
     run_ssh_channel_loop(
-        &config.username, &config.auth, config.cols, config.rows,
+        &config.username, &mut config.auth, config.cols, config.rows,
         false, agent_key, false, remote_forwards,
         session, cmd_rx, event_tx,
     ).await;

@@ -423,7 +423,7 @@ impl SshSession {
 // ── TCP transport task ───────────────────────────────────
 
 pub(crate) async fn run_russh_transport(
-    config: SshConfig,
+    mut config: SshConfig,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
 ) {
@@ -451,7 +451,7 @@ pub(crate) async fn run_russh_transport(
     let remote_forwards = established.remote_forwards;
 
     run_ssh_channel_loop(
-        &config.username, &config.auth, config.cols, config.rows,
+        &config.username, &mut config.auth, config.cols, config.rows,
         config.agent_forward, agent_key, config.allow_non_loopback_forward_bind, remote_forwards,
         session, cmd_rx, event_tx,
     ).await;

@@ -301,7 +301,7 @@ async fn open_proxy_stream(
 }
 
 async fn run_quic_transport(
-    config: QuicConfig,
+    mut config: QuicConfig,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
 ) {
@@ -334,7 +334,7 @@ async fn run_quic_transport(
     // Phase 5B の QUIC (tsshd) transport は agent forwarding 未対応（プロファイルの
     // `SshConfig.agent_forward` 相当のフィールドを `QuicConfig` はまだ持たない）。
     run_ssh_channel_loop(
-        &config.username, &config.auth, config.cols, config.rows,
+        &config.username, &mut config.auth, config.cols, config.rows,
         false, agent_key, false, remote_forwards,
         session, cmd_rx, event_tx,
     ).await;

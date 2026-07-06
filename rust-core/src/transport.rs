@@ -209,6 +209,23 @@ pub(crate) async fn authenticate_session(
     }
 }
 
+/// タスク#65: パスワード・復号済み秘密鍵PEMのベストエフォートなメモリゼロ化。
+///
+/// `SshAuth` は UniFFI の `Enum` としてKotlin側と直接やり取りされる公開型のため、
+/// フィールドの型自体を`zeroize::Zeroizing<_>`に変えたり`Drop`を実装したりすると
+/// (UniFFIの`FfiConverter`生成コードがフィールドをムーブして取り出す都合上コンパイルが
+/// 通らない・要バインディング再生成になる)ため、型はそのままに、もう使い終わった時点で
+/// 呼び出し側から明示的にこの関数を呼んでヒープ上の実体を上書きする方式にしている。
+/// `run_ssh_channel_loop` は接続ごとに一度しか認証しないため、認証成功/失敗を問わず
+/// 呼び出し直後に呼べば安全(以降そのメモリを`SshAuth`として再利用することはない)。
+pub(crate) fn zeroize_ssh_auth(auth: &mut SshAuth) {
+    use zeroize::Zeroize;
+    match auth {
+        SshAuth::Password { password } => password.zeroize(),
+        SshAuth::PublicKey { private_key_pem } => private_key_pem.zeroize(),
+    }
+}
+
 /// [`SshConfig::jump`] が設定されていれば、まず踏み台ホストへ接続・認証し、
 /// `channel_open_direct_tcpip` で `target_host:target_port` へのチャネルを開いた上に
 /// ネストしたSSHセッションを張る（`ssh -J` 相当）。未設定なら直接 TCP 接続する。
@@ -278,7 +295,7 @@ pub(crate) async fn connect_via_jump_or_direct(
 
 pub(crate) async fn run_ssh_channel_loop(
     username: &str,
-    auth: &SshAuth,
+    auth: &mut SshAuth,
     cols: u32,
     rows: u32,
     agent_forward: bool,
@@ -295,7 +312,10 @@ pub(crate) async fn run_ssh_channel_loop(
     };
     info!("ssh: auth {} for {}", auth_method, username);
 
-    let (authenticated, authed_key) = authenticate_session(&mut session, username, auth).await;
+    let (authenticated, authed_key) = authenticate_session(&mut session, username, &*auth).await;
+    // タスク#65: 認証に使い終わったので、平文の認証情報(パスワード・復号済み秘密鍵PEM)を
+    // ここで即座にゼロ化する(このセッションの以降の処理で`auth`が再び必要になることはない)。
+    zeroize_ssh_auth(auth);
 
     if !authenticated {
         warn!("ssh: auth {} failed for {}", auth_method, username);

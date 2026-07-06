@@ -159,10 +159,11 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
     }
 
     override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {
+        val safeName = sanitizeDownloadFileName(fileName)
         withContext(Dispatchers.IO) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.DISPLAY_NAME, safeName)
                     put(MediaStore.Downloads.IS_PENDING, 1)
                 }
                 val resolver = app.contentResolver
@@ -178,8 +179,34 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
                     Environment.DIRECTORY_DOWNLOADS
                 )
                 dir.mkdirs()
-                File(dir, fileName).writeBytes(data)
+                File(dir, safeName).writeBytes(data)
             }
+        }
+    }
+
+    companion object {
+        private const val MAX_FILE_NAME_LENGTH = 255
+
+        /**
+         * ダウンロード保存用のファイル名をサニタイズする。
+         *
+         * サーバー由来のファイル名(将来 trzsz の `suggested_name`/`file_name` を
+         * 配線した場合に想定される入力)にパストラバーサル(`../..`)や絶対パスが
+         * 含まれていても、ダウンロードディレクトリ外への書き込みが起きないよう
+         * basename のみを抽出する。現状は呼び出し元(`TerminalSession.kt`)が常に
+         * リテラル `"download"` を渡すため到達不能だが、将来配線した際の防御。
+         */
+        internal fun sanitizeDownloadFileName(rawName: String): String {
+            // Android/Linux では `\` はパス区切りとして扱われないため、
+            // File().name だけでは Windows 風のパスからの basename 抽出ができない。
+            // 先に `\` を `/` に正規化してから File().name で basename を取り出す。
+            val basename = File(rawName.replace('\\', '/')).name
+            val sanitized = when {
+                basename.isBlank() -> "download"
+                basename == "." || basename == ".." -> "download"
+                else -> basename
+            }
+            return sanitized.take(MAX_FILE_NAME_LENGTH).ifBlank { "download" }
         }
     }
 }
