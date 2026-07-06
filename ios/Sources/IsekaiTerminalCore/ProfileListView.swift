@@ -94,7 +94,10 @@ public struct ProfileListView: View {
                     .accessibilityIdentifier("profileRow_\(profile.id.map(String.init) ?? "new")")
                     .swipeActions {
                         Button("削除", role: .destructive) { model.requestDelete(profile) }
-                        Button("編集") { onEditProfile(profile) }.tint(.blue)
+                            .accessibilityIdentifier("deleteProfileSwipeButton")
+                        Button("編集") { onEditProfile(profile) }
+                            .tint(.blue)
+                            .accessibilityIdentifier("editProfileSwipeButton")
                     }
             }
         }

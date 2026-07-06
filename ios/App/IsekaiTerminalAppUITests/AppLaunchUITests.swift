@@ -74,7 +74,9 @@ final class AppLaunchUITests: XCTestCase {
         XCTAssertTrue(row.waitForExistence(timeout: 5))
 
         row.swipeLeft()
-        app.buttons["削除"].firstMatch.tap()
+        let deleteSwipeButton = app.buttons["deleteProfileSwipeButton"]
+        XCTAssertTrue(deleteSwipeButton.waitForExistence(timeout: 5))
+        deleteSwipeButton.tap()
 
         let confirmButton = app.alerts["削除確認"].buttons["削除"]
         XCTAssertTrue(confirmButton.waitForExistence(timeout: 5))
@@ -135,7 +137,9 @@ final class AppLaunchUITests: XCTestCase {
         XCTAssertTrue(originalRow.waitForExistence(timeout: 5))
 
         originalRow.swipeLeft()
-        app.buttons["編集"].firstMatch.tap()
+        let editSwipeButton = app.buttons["editProfileSwipeButton"]
+        XCTAssertTrue(editSwipeButton.waitForExistence(timeout: 5))
+        editSwipeButton.tap()
 
         let labelField = app.textFields["profileLabelField"]
         XCTAssertTrue(labelField.waitForExistence(timeout: 5))
