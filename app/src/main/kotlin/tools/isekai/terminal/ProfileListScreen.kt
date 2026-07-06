@@ -1,5 +1,6 @@
 package tools.isekai.terminal
 
+import android.app.Activity
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -86,6 +87,12 @@ fun ProfileListScreen(
     var showMenu by remember { mutableStateOf(false) }
     var showSecurityDialog by remember { mutableStateOf(false) }
 
+    // 画面の保護(FLAG_SECURE、#62)もプロファイル毎ではなくグローバル設定として永続化する。
+    // 既定OFF(常時ONは一部ユーザに不便なため)のオプトイン機能。
+    var screenProtectionEnabled by remember {
+        mutableStateOf(prefs.getBoolean(PREF_KEY_SCREEN_PROTECTION, false))
+    }
+
     Scaffold(
         topBar = {
             Row(
@@ -111,6 +118,15 @@ fun ProfileListScreen(
                         DropdownMenuItem(
                             text = { Text("鍵管理") },
                             onClick = { showMenu = false; onManageKeys() },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (screenProtectionEnabled) "画面の保護: ON" else "画面の保護: OFF") },
+                            onClick = {
+                                showMenu = false
+                                screenProtectionEnabled = !screenProtectionEnabled
+                                prefs.edit().putBoolean(PREF_KEY_SCREEN_PROTECTION, screenProtectionEnabled).apply()
+                                (context as? Activity)?.let { applyScreenProtection(it, screenProtectionEnabled) }
+                            },
                         )
                         DropdownMenuItem(
                             text = { Text("セキュリティ") },

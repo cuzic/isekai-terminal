@@ -1,6 +1,8 @@
 package tools.isekai.terminal
 
+import android.app.Activity
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -18,11 +20,32 @@ import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.setTerminalTheme
 
+/** `SharedPreferences("isekai_terminal_ui")` に保存する「画面の保護」(FLAG_SECURE) 設定のキー。 */
+const val PREF_KEY_SCREEN_PROTECTION = "screen_protection_enabled"
+
+/**
+ * 画面の保護(スクリーンショット・画面録画・「最近使ったアプリ」のサムネイルを禁止する
+ * [WindowManager.LayoutParams.FLAG_SECURE])を適用/解除する。
+ *
+ * 既定OFFのオプトイン機能(常時ONは一部ユーザに不便なため。#62)。アプリ全体で1枚の window
+ * しか持たないため、ここで一度適用すればプロファイル一覧・パスワード入力ダイアログ・
+ * ターミナルセッションなど、以降遷移する全画面に効く(最低限求められる「パスワード入力
+ * ダイアログ表示中」「アクティブなターミナルセッション中」の保護も自動的に満たす)。
+ */
+fun applyScreenProtection(activity: Activity, enabled: Boolean) {
+    if (enabled) {
+        activity.window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+    } else {
+        activity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         RemoteLogger.i("MainActivity", "app started")
         restorePersistedTerminalTheme()
+        restorePersistedScreenProtection()
         enableEdgeToEdge()
         setContent {
             MaterialTheme {
@@ -46,6 +69,16 @@ class MainActivity : ComponentActivity() {
         val prefs = getSharedPreferences("isekai_terminal_ui", MODE_PRIVATE)
         val theme = TerminalThemes.byName(prefs.getString(TerminalThemes.PREF_KEY, null))
         theme.applyTo(::setTerminalTheme)
+    }
+
+    /**
+     * 前回設定した「画面の保護」(既定OFF) を、アプリ起動直後にこの Activity の window へ
+     * 復元する。実行中のトグルは [applyScreenProtection] を直接呼ぶ側([ProfileListScreen] の
+     * メニュー)が担当するので、ここは起動時の1回だけでよい。
+     */
+    private fun restorePersistedScreenProtection() {
+        val prefs = getSharedPreferences("isekai_terminal_ui", MODE_PRIVATE)
+        applyScreenProtection(this, prefs.getBoolean(PREF_KEY_SCREEN_PROTECTION, false))
     }
 }
 
