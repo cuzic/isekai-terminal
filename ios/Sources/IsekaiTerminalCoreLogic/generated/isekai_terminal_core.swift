@@ -4278,7 +4278,10 @@ public struct QuicConfig: Equatable, Hashable {
     public var cols: UInt32
     public var rows: UInt32
     /**
-     * スパイク用: TLS 証明書検証をスキップ
+     * 設計上許容(issue #61 で確認済み)。既定 true(呼び出し元は常に true を渡す)。
+     * QUIC/TLS 層の証明書検証を無条件でスキップする。詳細な理由・非対称性は
+     * [`SkipServerVerification`] のコメント、および
+     * `ConnectionProfile.toQuicConfig`(Kotlin 側)のコメントを参照。
      */
     public var skipCertVerify: Bool
 
@@ -4292,7 +4295,10 @@ public struct QuicConfig: Equatable, Hashable {
          * tsshd がこのアドレスで SSH サーバーに接続する
          */sshHost: String, sshPort: UInt16, username: String, auth: SshAuth, cols: UInt32, rows: UInt32, 
         /**
-         * スパイク用: TLS 証明書検証をスキップ
+         * 設計上許容(issue #61 で確認済み)。既定 true(呼び出し元は常に true を渡す)。
+         * QUIC/TLS 層の証明書検証を無条件でスキップする。詳細な理由・非対称性は
+         * [`SkipServerVerification`] のコメント、および
+         * `ConnectionProfile.toQuicConfig`(Kotlin 側)のコメントを参照。
          */skipCertVerify: Bool) {
         self.tsshdHost = tsshdHost
         self.tsshdPort = tsshdPort
