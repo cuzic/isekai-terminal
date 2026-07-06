@@ -249,6 +249,22 @@ fun ConnectionProfile.toSshConfig(
         allowNonLoopbackForwardBind = allowNonLoopbackForwardBind,
     )
 
+// 設計上許容(issue #61 で到達性・内側SSHホスト鍵検証の強制を調査確認済み): skipCertVerify=true は、
+// サーバー側に事前インストールされた第三者実装の tsshd(Phase 5B、
+// TransportPreference.TSSHD_QUIC、ProfileEditScreen で選択可能・現役の経路)に対する
+// QUIC/TLS 層の証明書検証を無条件でスキップする。[toHelperQuicConfig](自作 isekai-helper 経路)が
+// cert_sha256 でピン留めするのとは非対称だが、これは意図的な非対称である:
+//   - helper 経路は、既に認証済みの SSH チャネル経由でヘルパーをブートストラップし、その
+//     ephemeral 自己署名証明書の SHA-256 を「認証済みチャネル越しに」受け取れるため、
+//     ピン留め可能な信頼の起点が存在する(helper_quic_transport.rs 参照)。
+//   - tsshd 経路は、こちらが配布・管理していない既存の tsshd デーモンへ最初から QUIC で
+//     直接つなぎに行くため、ピン留めすべき証明書フィンガープリントを事前に得る手段が無い。
+// そのため QUIC/TLS 層自体は非認証のままにし、信頼は QUIC トンネル確立後に流れる
+// 「本物の内側 SSH」のホスト鍵検証(TOFU。quic_transport.rs の
+// `RusshEventHandler::check_server_key` → `OrchestratorAdapter::on_host_key` →
+// Kotlin `TerminalSession.onHostKey` → `RealHostKeyChecker`、TCP SSH と全く同じコードパス)に
+// 全面委譲している。内側 SSH のホスト鍵検証を弱める変更をする場合、この経路の安全性の
+// 前提そのものが崩れる点に注意。
 fun ConnectionProfile.toQuicConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt = 24u): QuicConfig =
     QuicConfig(
         tsshdHost = host,

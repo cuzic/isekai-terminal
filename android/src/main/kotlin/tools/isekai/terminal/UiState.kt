@@ -11,6 +11,9 @@ data class TerminalUiState(
     val scrollbackLen: Int = 0,
     val currentHost: String? = null,
     val hostKeyChangedWarning: HostKeyChangedWarning? = null,
+    // 初回接続(Unknown host key)時、ユーザーの明示確認待ちの間だけ入る
+    // (`HostKeySettings`で「初回は自動信頼」が無効な既定設定の場合)。
+    val newHostKeyPrompt: NewHostKeyPrompt? = null,
     val trzszState: TrzszUiState? = null,
     // SSH agent forwarding: サーバー側から署名要求が来て、ユーザーの承認/拒否待ちの間だけ
     // fingerprint が入る。UI 表示だけに閉じた状態ではないが、Rust 側の oneshot 応答待ちを
@@ -47,4 +50,11 @@ data class HostKeyChangedWarning(
     val port: Int,
     val oldFingerprint: String,
     val newFingerprint: String,
+)
+
+/** 初回接続(Unknown host key)時、ユーザーに信頼するか確認するためのプロンプト内容。 */
+data class NewHostKeyPrompt(
+    val host: String,
+    val port: Int,
+    val fingerprint: String,
 )

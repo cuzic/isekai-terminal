@@ -173,4 +173,40 @@ class ProfileListScreenTest {
         val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
         assertEquals(null, prefs.getString(TerminalThemes.PREF_KEY, null))
     }
+
+    // ── 画面の保護 (FLAG_SECURE、#62) ────────────────────────────────────
+
+    @Test fun screenProtection_defaultsToOff() {
+        setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("画面の保護: OFF").assertIsDisplayed()
+    }
+
+    @Test fun screenProtection_toggleOn_persistsToPrefs() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        setScreen()
+
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("画面の保護: OFF").performClick()
+
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
+        assertTrue(prefs.getBoolean(PREF_KEY_SCREEN_PROTECTION, false))
+
+        // メニューを開き直すと表示も ON に切り替わっている
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("画面の保護: ON").assertIsDisplayed()
+    }
+
+    @Test fun screenProtection_toggleOnThenOff_clearsPrefs() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        setScreen()
+
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("画面の保護: OFF").performClick()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("画面の保護: ON").performClick()
+
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
+        assertTrue(!prefs.getBoolean(PREF_KEY_SCREEN_PROTECTION, false))
+    }
 }

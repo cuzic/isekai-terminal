@@ -25,9 +25,9 @@ use russh::client;
 use crate::helper_bootstrap::{self, BootstrapError, HelperBinaries, HelperHandshake, HelperP2pMode};
 use crate::helper_quic_transport::{
     self, compute_proof, establish_quic_connection_with_socket, open_control_stream,
-    spawn_app_ack_tasks, FRAME_ACK, FRAME_HELLO, FRAME_REJECT_AUTH, FRAME_REJECT_DUPLICATE,
-    FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED, HELPER_BIN_AARCH64, HELPER_BIN_X86_64,
-    HELPER_VERSION,
+    spawn_app_ack_tasks, spawn_bootstrap_host_key_forwarder, FRAME_ACK, FRAME_HELLO,
+    FRAME_REJECT_AUTH, FRAME_REJECT_DUPLICATE, FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED,
+    HELPER_BIN_AARCH64, HELPER_BIN_X86_64, HELPER_VERSION,
 };
 use crate::resume_client::{self, ClientResumeState};
 use crate::transport::{
@@ -83,8 +83,15 @@ impl IsekaiLinkRelaySession {
     pub fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
+        // ブートストラップ用SSHのホスト鍵検証を本セッションのcallbackに委譲する
+        // (`helper_quic_transport::bootstrap_helper_via_ssh`のNOTE参照)。
+        let host_key_callback = self.core.callback();
         RUNTIME.spawn(async move {
-            match tokio::time::timeout(CONNECT_TIMEOUT, try_connect_isekai_link_relay(&config)).await
+            match tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                try_connect_isekai_link_relay(&config, host_key_callback),
+            )
+            .await
             {
                 Ok(Ok(stream)) => run_over_stream(config, stream, cmd_rx, event_tx).await,
                 Ok(Err(e)) => {
@@ -155,6 +162,7 @@ impl IsekaiLinkRelaySession {
 
 async fn try_connect_isekai_link_relay(
     config: &IsekaiLinkRelayConfig,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<resume_client::ReattachableStream, String> {
     let relay_addr: SocketAddr = tokio::net::lookup_host(&config.relay_addr)
         .await
@@ -162,7 +170,7 @@ async fn try_connect_isekai_link_relay(
         .next()
         .ok_or_else(|| "relayのアドレスが解決できません".to_string())?;
 
-    let handshake = bootstrap_via_ssh_with_relay(config, relay_addr).await?;
+    let handshake = bootstrap_via_ssh_with_relay(config, relay_addr, host_key_callback).await?;
 
     let helper_addr: SocketAddr = handshake
         .relay_public_addr
@@ -181,19 +189,15 @@ async fn try_connect_isekai_link_relay(
 
 /// ProxyJump対応のSSH接続を張り、`--relay`/`--relay-sni`/`--relay-jwt`付きでisekai-helperを
 /// ブートストラップ起動する。`isekai_stun_p2p_transport.rs::bootstrap_via_ssh_with_punch`と
-/// 同じ理由でコード共有はせず複製している。
+/// 同じ理由でコード共有はせず複製している。ホスト鍵検証ループ
+/// (`spawn_bootstrap_host_key_forwarder`)自体は共有する。
 async fn bootstrap_via_ssh_with_relay(
     config: &IsekaiLinkRelayConfig,
     relay_addr: SocketAddr,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<HelperHandshake, String> {
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
-    tokio::spawn(async move {
-        while let Some(ev) = event_rx.recv().await {
-            if let TransportEvent::HostKey(_, reply) = ev {
-                let _ = reply.send(true);
-            }
-        }
-    });
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+    spawn_bootstrap_host_key_forwarder(event_rx, host_key_callback);
 
     let russh_config = Arc::new(client::Config::default());
     let mut established = connect_via_jump_or_direct(
@@ -342,7 +346,7 @@ async fn connect_relay_stream(
 }
 
 async fn run_over_stream(
-    config: IsekaiLinkRelayConfig,
+    mut config: IsekaiLinkRelayConfig,
     stream: resume_client::ReattachableStream,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
@@ -366,7 +370,7 @@ async fn run_over_stream(
 
     // IsekaiLinkRelayConfig は agent forwarding 未対応（`HelperQuicConfig` と同様）。
     run_ssh_channel_loop(
-        &config.username, &config.auth, config.cols, config.rows,
+        &config.username, &mut config.auth, config.cols, config.rows,
         false, agent_key, false, remote_forwards,
         session, cmd_rx, event_tx,
     ).await;

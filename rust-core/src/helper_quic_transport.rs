@@ -113,8 +113,12 @@ impl HelperQuicSession {
     pub fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
+        // ブートストラップ用SSH(isekai-helperを起動するための踏み台接続)のホスト鍵検証を
+        // 本セッションのcallback(Kotlin側のKnownHostRepositoryを参照する既存のTOFU/
+        // 変更検知ロジック)にそのまま委譲する（`bootstrap_helper_via_ssh`参照）。
+        let host_key_callback = self.core.callback();
         RUNTIME.spawn(async move {
-            match try_connect_helper_quic(&config).await {
+            match try_connect_helper_quic(&config, host_key_callback).await {
                 Ok(stream) => run_over_stream(config, stream, cmd_rx, event_tx).await,
                 Err(e) => {
                     warn!("helper_quic: connect failed: {e}");
@@ -130,8 +134,9 @@ impl HelperQuicSession {
     pub fn connect_auto(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
+        let host_key_callback = self.core.callback();
         RUNTIME.spawn(async move {
-            run_helper_quic_transport_auto(config, cmd_rx, event_tx).await;
+            run_helper_quic_transport_auto(config, cmd_rx, event_tx, host_key_callback).await;
         });
         Ok(())
     }
@@ -243,11 +248,46 @@ impl ServerCertVerifier for PinnedCertVerifier {
 
 // ── ブートストラップ（Phase 7-3 呼び出し） ───────────────
 
-async fn bootstrap_via_ssh(config: &HelperQuicConfig) -> Result<HelperHandshake, String> {
+async fn bootstrap_via_ssh(
+    config: &HelperQuicConfig,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
+) -> Result<HelperHandshake, String> {
     bootstrap_helper_via_ssh(
         &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump,
-        config.bind_port, &HelperP2pMode::None,
+        config.bind_port, &HelperP2pMode::None, host_key_callback,
     ).await
+}
+
+/// ブートストラップ用 SSH 接続（`bootstrap_helper_via_ssh` 等）が受け取る
+/// `TransportEvent::HostKey` を、本セッションの `on_host_key`（Kotlin 側の
+/// `KnownHostRepository` を参照する既存の TOFU/変更検知ロジック）へ転送する
+/// イベントループを spawn する。このセッションで発生し得る唯一の HostKey イベントは
+/// このブートストラップ SSH 由来であり(QUIC データプレーン自体はホスト鍵という概念を
+/// 持たず cert_sha256 ピン留めのみ)、同一の判断ロジックを流用してよい。
+///
+/// `callback` が `None`(呼び出し元がセッションのcallbackを取得できなかった場合)は、
+/// フェイルセーフとして常に拒否する — 以前のように無条件承認はしない。
+pub(crate) fn spawn_bootstrap_host_key_forwarder(
+    mut event_rx: tokio::sync::mpsc::Receiver<TransportEvent>,
+    callback: Option<Arc<dyn SessionCallback>>,
+) {
+    tokio::spawn(async move {
+        while let Some(ev) = event_rx.recv().await {
+            if let TransportEvent::HostKey(fp, reply) = ev {
+                let accepted = match &callback {
+                    Some(cb) => {
+                        let cb = Arc::clone(cb);
+                        tokio::task::spawn_blocking(move || cb.on_host_key(fp)).await.unwrap_or(false)
+                    }
+                    None => {
+                        warn!("bootstrap host key check: no session callback available, rejecting for safety");
+                        false
+                    }
+                };
+                let _ = reply.send(accepted);
+            }
+        }
+    });
 }
 
 /// SSH でログインし、isekai-helper をブートストラップして起動ハンドシェイクを得る。
@@ -267,6 +307,11 @@ async fn bootstrap_via_ssh(config: &HelperQuicConfig) -> Result<HelperHandshake,
 /// `p2p_mode`: Phase 10 の STUN+SSH rendezvous / relay 経由 P2P
 /// (`isekai_stun_p2p_transport.rs`/`isekai_link_relay_transport.rs`)専用。他の呼び出し元は
 /// 常に `&HelperP2pMode::None` を渡す。
+///
+/// `host_key_callback`: このブートストラップ用 SSH 接続(踏み台込み)のホスト鍵を、
+/// 本セッションと同じ known_hosts エントリ(Kotlin 側 `KnownHostRepository`)で検証する
+/// ための callback。呼び出し元は `SessionCore::callback()` から取得したものをそのまま
+/// 渡す（`spawn_bootstrap_host_key_forwarder` 参照）。
 pub(crate) async fn bootstrap_helper_via_ssh(
     ssh_host: &str,
     ssh_port: u16,
@@ -275,18 +320,10 @@ pub(crate) async fn bootstrap_helper_via_ssh(
     jump: &Option<JumpConfig>,
     bind_port: Option<u16>,
     p2p_mode: &HelperP2pMode,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<HelperHandshake, String> {
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
-    // NOTE: このブートストラップ用 SSH 接続(踏み台込み)のホスト鍵は、本セッションと
-    // 同じサーバー・同じ known_hosts エントリを検証すべきだが、Phase 7-4 のスコープでは
-    // 簡略化し常に承認する。TODO: 既存の KnownHost チェック（HostKeyChecker）と統合する。
-    tokio::spawn(async move {
-        while let Some(ev) = event_rx.recv().await {
-            if let TransportEvent::HostKey(_, reply) = ev {
-                let _ = reply.send(true);
-            }
-        }
-    });
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+    spawn_bootstrap_host_key_forwarder(event_rx, host_key_callback);
 
     let russh_config = Arc::new(client::Config::default());
     let mut established = connect_via_jump_or_direct(jump, russh_config, ssh_host, ssh_port, event_tx)
@@ -571,13 +608,14 @@ pub(crate) fn spawn_app_ack_tasks(
 
 async fn try_connect_helper_quic(
     config: &HelperQuicConfig,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<resume_client::ReattachableStream, String> {
-    let handshake = bootstrap_via_ssh(config).await?;
+    let handshake = bootstrap_via_ssh(config, host_key_callback).await?;
     connect_helper_quic_stream(&config.ssh_host, &handshake).await
 }
 
 async fn run_over_stream(
-    config: HelperQuicConfig,
+    mut config: HelperQuicConfig,
     stream: resume_client::ReattachableStream,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
@@ -602,7 +640,7 @@ async fn run_over_stream(
     // HelperQuicConfig は agent forwarding 未対応（プロファイルの `SshConfig.agent_forward`
     // 相当のフィールドをまだ持たない）。
     run_ssh_channel_loop(
-        &config.username, &config.auth, config.cols, config.rows,
+        &config.username, &mut config.auth, config.cols, config.rows,
         false, agent_key, false, remote_forwards,
         session, cmd_rx, event_tx,
     ).await;
@@ -615,8 +653,9 @@ async fn run_helper_quic_transport_auto(
     config: HelperQuicConfig,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) {
-    match try_connect_helper_quic(&config).await {
+    match try_connect_helper_quic(&config, host_key_callback).await {
         Ok(stream) => run_over_stream(config, stream, cmd_rx, event_tx).await,
         Err(e) => {
             warn!("helper_quic auto: falling back to plain SSH after: {e}");
@@ -650,6 +689,78 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Notify;
+
+    // ── spawn_bootstrap_host_key_forwarder: 実SSH/QUIC不要のユニットテスト ──
+    // Task #56: ブートストラップ用SSH接続のホスト鍵イベントが、以前のように無条件で
+    // 承認されるのではなく、本セッションのcallback(Kotlin側のKnownHostRepositoryを
+    // 参照する既存のTOFU/変更検知ロジック相当)の判断どおりに承認/拒否されることを検証する。
+
+    struct FixedResponseCallback {
+        /// このfingerprintに一致する場合のみ承認する(=既知ホストの正しい鍵)。
+        /// それ以外(=ホスト鍵変更・MITMシナリオ)は拒否する。
+        trusted_fingerprint: String,
+    }
+
+    impl SessionCallback for FixedResponseCallback {
+        fn on_data(&self, _data: Vec<u8>) {}
+        fn on_host_key(&self, fingerprint: String) -> bool { fingerprint == self.trusted_fingerprint }
+        fn on_connected(&self) {}
+        fn on_disconnected(&self, _reason: Option<String>) {}
+        fn on_screen_update(&self, _update: crate::ScreenUpdate) {}
+        fn on_trzsz_request(&self, _t: String, _m: String, _n: Option<String>, _s: Option<u64>) {}
+        fn on_trzsz_download_chunk(&self, _t: String, _d: Vec<u8>, _l: bool) {}
+        fn on_trzsz_progress(&self, _t: String, _tr: u64, _to: Option<u64>) {}
+        fn on_trzsz_finished(&self, _t: String, _s: bool, _m: Option<String>) {}
+        fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+    }
+
+    /// 既知ホストと異なる鍵(ホスト鍵変更/MITMシナリオ)を返した場合、ブートストラップ
+    /// 接続が拒否されることを確認する。修正前は`reply.send(true)`固定で、この
+    /// シナリオでも常に接続が承認されてしまっていた。
+    #[tokio::test]
+    async fn bootstrap_host_key_forwarder_rejects_changed_host_key() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(4);
+        spawn_bootstrap_host_key_forwarder(
+            event_rx,
+            Some(Arc::new(FixedResponseCallback { trusted_fingerprint: "known-good-fp".to_string() })),
+        );
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        event_tx
+            .send(TransportEvent::HostKey("attacker-fp-after-mitm".to_string(), reply_tx))
+            .await
+            .unwrap();
+        assert!(!reply_rx.await.unwrap(), "changed host key must be rejected, not silently accepted");
+    }
+
+    /// 既知ホストと同じ鍵(通常の再接続)なら承認されることも確認する(拒否一辺倒の
+    /// 実装への逃げを防ぐ)。
+    #[tokio::test]
+    async fn bootstrap_host_key_forwarder_accepts_matching_known_host_key() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(4);
+        spawn_bootstrap_host_key_forwarder(
+            event_rx,
+            Some(Arc::new(FixedResponseCallback { trusted_fingerprint: "known-good-fp".to_string() })),
+        );
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        event_tx.send(TransportEvent::HostKey("known-good-fp".to_string(), reply_tx)).await.unwrap();
+        assert!(reply_rx.await.unwrap(), "matching known host key must be accepted");
+    }
+
+    /// callback を取得できなかった場合(プログラミングエラー等)は、フェイルセーフとして
+    /// 常に拒否する(無条件承認にフォールバックしてはいけない)。
+    #[tokio::test]
+    async fn bootstrap_host_key_forwarder_rejects_when_callback_missing() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(4);
+        spawn_bootstrap_host_key_forwarder(event_rx, None);
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        event_tx.send(TransportEvent::HostKey("whatever-fp".to_string(), reply_tx)).await.unwrap();
+        assert!(!reply_rx.await.unwrap(), "missing callback must fail closed (reject), not fail open");
+    }
 
     struct TestCallback {
         buf: Arc<StdMutex<Vec<u8>>>,

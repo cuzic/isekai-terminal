@@ -1,5 +1,6 @@
 package tools.isekai.terminal
 
+import android.app.Activity
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,6 +27,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -45,6 +47,7 @@ import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
+import tools.isekai.terminal.data.HostKeySettings
 import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
@@ -82,6 +85,13 @@ fun ProfileListScreen(
     }
     var showThemeDialog by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
+    var showSecurityDialog by remember { mutableStateOf(false) }
+
+    // 画面の保護(FLAG_SECURE、#62)もプロファイル毎ではなくグローバル設定として永続化する。
+    // 既定OFF(常時ONは一部ユーザに不便なため)のオプトイン機能。
+    var screenProtectionEnabled by remember {
+        mutableStateOf(prefs.getBoolean(PREF_KEY_SCREEN_PROTECTION, false))
+    }
 
     Scaffold(
         topBar = {
@@ -108,6 +118,19 @@ fun ProfileListScreen(
                         DropdownMenuItem(
                             text = { Text("鍵管理") },
                             onClick = { showMenu = false; onManageKeys() },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (screenProtectionEnabled) "画面の保護: ON" else "画面の保護: OFF") },
+                            onClick = {
+                                showMenu = false
+                                screenProtectionEnabled = !screenProtectionEnabled
+                                prefs.edit().putBoolean(PREF_KEY_SCREEN_PROTECTION, screenProtectionEnabled).apply()
+                                (context as? Activity)?.let { applyScreenProtection(it, screenProtectionEnabled) }
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("セキュリティ") },
+                            onClick = { showMenu = false; showSecurityDialog = true },
                         )
                     }
                 }
@@ -193,6 +216,59 @@ fun ProfileListScreen(
             onDismiss = { showThemeDialog = false },
         )
     }
+
+    if (showSecurityDialog) {
+        SecuritySettingsDialog(
+            context = context,
+            onDismiss = { showSecurityDialog = false },
+        )
+    }
+}
+
+/**
+ * ホスト鍵関連のセキュリティ設定。初回接続(Unknown host key)を確認ダイアログ無しで
+ * 自動信頼するかどうかのオプトアウト設定([HostKeySettings])のみを扱う
+ * (ホスト鍵変更検知の警告は既に堅牢なため常時有効・設定不可)。
+ */
+@Composable
+private fun SecuritySettingsDialog(
+    context: android.content.Context,
+    onDismiss: () -> Unit,
+) {
+    var autoTrust by remember { mutableStateOf(HostKeySettings.isAutoTrustNewHostKeysEnabled(context)) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("セキュリティ") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("初回接続を自動的に信頼する", fontSize = 14.sp)
+                        Text(
+                            "オフ(既定)の場合、初めて接続するホストの fingerprint を毎回確認します。",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = autoTrust,
+                        onCheckedChange = { enabled ->
+                            autoTrust = enabled
+                            HostKeySettings.setAutoTrustNewHostKeysEnabled(context, enabled)
+                        },
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("閉じる") }
+        },
+    )
 }
 
 @Composable

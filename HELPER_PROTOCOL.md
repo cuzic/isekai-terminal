@@ -34,9 +34,19 @@ OPTIONS:
                                 張り、`--bind`する代わりにrelayが割り当てた公開アドレスを
                                 ハンドシェイクJSONの `relay_public_addr` に含める
                                 （TransportPreference::IsekaiLinkRelayQuic 用、`--stun-server`/
-                                `--punch-peer`とは併用不可）。`--relay-sni`/`--relay-jwt`と併用必須
+                                `--punch-peer`とは併用不可）。`--relay-sni`と、
+                                `--relay-jwt`/`--relay-jwt-file`のいずれか一方との併用必須
   --relay-sni <NAME>            `--relay`のTLS SNI/HTTPオーソリティ
-  --relay-jwt <TOKEN>           `--relay`への認証に使うBearerトークン
+  --relay-jwt-file <PATH>        `--relay`への認証に使うBearerトークンを格納したファイルのパス
+                                （推奨。`--relay-jwt`と異なりargv/`ps aux`/`/proc/<pid>/cmdline`に
+                                一切現れない。起動時に一度だけ読み取り、直後にファイル内容を
+                                ゼロクリア・unlinkする）
+  --relay-jwt <TOKEN>            `--relay`への認証に使うBearerトークン（非推奨。他のローカル
+                                ユーザーから`ps aux`/`/proc/<pid>/cmdline`経由で読める。
+                                `--relay-jwt-file`と併用不可。後方互換のためのみ残しており、
+                                ブートストラップ側の実装（`helper_bootstrap.rs`/
+                                `isekai-bootstrap::openssh`）は全て`--relay-jwt-file`に
+                                切り替え済み——セキュリティレビュー #58）
   --log-level <LEVEL>           error|warn|info|debug|trace（既定: info）。stderr にのみ出力する
   --version                     バージョン表示して終了
   --help
@@ -81,6 +91,22 @@ OPTIONS:
   relayから見ればisekai-helperが直接そのアドレスで listen しているのと区別が付かない。
   JWTの発行・配布フロー自体はPLAN.md Phase 10で別途設計する（このCLI契約はBearerトークンの
   文字列を受け取るだけで、取得方法には関知しない）。
+- **`relay_jwt`はargvではなくファイル経由で渡す（`--relay-jwt-file`、セキュリティレビュー #58）**:
+  `session_secret`が元々「CLI引数や環境変数には載せない」設計だったのに対し、`relay_jwt`は
+  当初この配慮が漏れており、`ps aux`/`/proc/<pid>/cmdline`から同一サーバー上の他のローカル
+  ユーザーに読める状態だった。ブートストラップ側（`rust-core/src/helper_bootstrap.rs`/
+  `isekai-bootstrap::openssh`）は、`mktemp -d`で作った一時ディレクトリ内のファイルへ
+  SSH execチャネルのstdin経由でJWTを書き込み（`umask 077`により0600を保証）、そのファイル
+  パスを`--relay-jwt-file`として渡す。isekai-helper側は起動時に一度だけ読み取り、直後に
+  ファイル内容をゼロクリアしunlinkする。
+- **`relay_sni`/`relay_jwt`はリモートシェルコマンドへ補間する前にシェルクォート＋厳格な
+  許容文字集合で検証する（セキュリティレビュー #57）**: 両ブートストラップ実装は
+  `relay_sni`/`relay_jwt`をリモートログインシェル経由で実行するコマンド文字列に補間する。
+  正常なJWT/SNIにはシェルメタ文字が含まれないため通常は問題にならないが、relay/JWT発行元が
+  侵害・誤設定された場合に任意のシェルコマンドが埋め込まれる余地があった。単一引用符クォート
+  （`isekai_protocol::bootstrap::shell_single_quote`）に加え、`relay_sni`は`[A-Za-z0-9._-]`、
+  `relay_jwt`は同じ文字集合（base64url + `.`セパレータで元々この範囲に収まる）で多層防御の
+  検証を行う。
 
 ### 終了コード
 
@@ -162,14 +188,20 @@ SSH exec チャネルを実行している `bash -c "..."` 本体がスクリプ
 閉じた後もプロセスが生き続けるようにする。
 
 **ファイル権限契約**: `helper.handshake`（上記の`$tmpdir/handshake`）には `session_secret` が平文で
-含まれるため、これは実質的な bearer secret として扱う。ブートストラップ側（Phase 7-3、Phase 10-1c で
-`mktemp -d` に変更）は以下を **必須**とする。
+含まれるため、これは実質的な bearer secret として扱う。`--relay`使用時に`$tmpdir/relay_jwt`へ
+書き出す`relay_jwt`も同様に扱う（セキュリティレビュー #58）。ブートストラップ側（Phase 7-3、
+Phase 10-1c で `mktemp -d` に変更、`isekai-ssh` CLI側は当初取り残されていたが同じパターンに
+統一済み——セキュリティレビュー #68）は以下を **必須**とする。
 
 - 出力先ディレクトリは `mktemp -d`（`mkdtemp(3)`、umask に関わらず常に `0700` で作成される）で作る
-- `handshake`/`log` ファイルは `umask 077` の下でシェルリダイレクトにより作成し、`0600` を保証する
+- `handshake`/`log`/`relay_jwt` ファイルは `umask 077` の下でシェルリダイレクトにより作成し、
+  `0600` を保証する
 - 呼び出しごとに新規ディレクトリを作るため「既存ファイルを使い回す」ケース自体が発生しない
   （Phase 10-1c 以前は固定パスの使い回しを想定した所有者/permission検査が必要だったが、
   現在は不要）
+- isekai-helper は `--relay-jwt-file` を読み取った直後にファイル内容をゼロクリアしunlinkする
+  （`resolve_relay_jwt`/`zeroize_string`、`isekai-helper/src/main.rs`）。一時ディレクトリ自体は
+  `trap ... EXIT` でも最終的に回収されるため、この即時unlinkは露出時間を短縮する追加の防御層
 
 **stdout flush 契約**: helper は起動ハンドシェイク JSON と末尾改行を書き出した後、**accept ループに
 入る前に stdout を明示的に flush しなければならない**（stdout がファイルにリダイレクトされる場合、

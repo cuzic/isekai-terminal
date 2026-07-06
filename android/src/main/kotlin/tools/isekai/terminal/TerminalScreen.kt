@@ -39,6 +39,7 @@ import tools.isekai.terminal.input.TerminalKeyEncoder
 import tools.isekai.terminal.ui.AgentSignConfirmDialog
 import tools.isekai.terminal.ui.AppColors
 import tools.isekai.terminal.ui.HostKeyChangedDialog
+import tools.isekai.terminal.ui.HostKeyUnknownDialog
 import tools.isekai.terminal.ui.SelectionRange
 import tools.isekai.terminal.ui.SshTerminalCanvas
 import tools.isekai.terminal.ui.TerminalThemes
@@ -62,6 +63,8 @@ data class TerminalScreenActions(
     val onScrollbackCells: (Int, Int) -> List<CellData>?,
     val onTrustUpdatedHostKey: () -> Unit,
     val onDismissHostKeyWarning: () -> Unit,
+    val onTrustNewHostKey: () -> Unit,
+    val onDismissNewHostKeyPrompt: () -> Unit,
     val onTrzszStartUpload: (Uri) -> Unit,
     val onTrzszStartDownload: () -> Unit,
     val onTrzszCancel: () -> Unit,
@@ -125,6 +128,19 @@ fun TerminalScreenBody(
                 warning = w,
                 onAccept = { actions.onTrustUpdatedHostKey() },
                 onReject = { actions.onDismissHostKeyWarning() },
+            )
+        }
+    }
+
+    // 初回接続(Unknown host key)確認ダイアログ（非アクティブタブでは表示しない）
+    if (isActive) {
+        uiState.newHostKeyPrompt?.let { prompt ->
+            HostKeyUnknownDialog(
+                host = prompt.host,
+                port = prompt.port,
+                fingerprint = prompt.fingerprint,
+                onAccept = { actions.onTrustNewHostKey() },
+                onReject = { actions.onDismissNewHostKeyPrompt() },
             )
         }
     }

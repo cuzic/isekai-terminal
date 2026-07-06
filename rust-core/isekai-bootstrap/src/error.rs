@@ -37,4 +37,13 @@ pub enum BootstrapError {
     /// JSON schema/validation (`isekai_protocol::handshake::decode_handshake_json`).
     #[error("failed to parse handshake JSON: {0}")]
     HandshakeParse(#[from] isekai_protocol::ProtocolError),
+
+    /// `relay_sni`/`relay_jwt` failed the strict allow-list charset
+    /// validation in `isekai_protocol::bootstrap::validate_relay_sni`/
+    /// `validate_relay_jwt` (security review #57). Kept distinct from
+    /// `HandshakeParse` — both wrap a `ProtocolError`, but this failure
+    /// happens before ever talking to the remote host and has nothing to do
+    /// with parsing the handshake response.
+    #[error("invalid relay parameter: {0}")]
+    InvalidRelayParam(String),
 }

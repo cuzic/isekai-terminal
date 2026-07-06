@@ -72,7 +72,14 @@ struct Args {
     /// `relay_public_addr`に含める。`--relay-sni`/`--relay-jwt`と併用必須。
     relay: Option<SocketAddr>,
     relay_sni: Option<String>,
+    /// セキュリティレビュー #58: argv経由(`--relay-jwt`)は他のローカルユーザーから
+    /// `ps aux`/`/proc/<pid>/cmdline`で読める。後方互換のため引数自体は残すが、
+    /// 実際のブートストラップ呼び出し元(`helper_bootstrap.rs`/`isekai-bootstrap::openssh`)
+    /// は全て`relay_jwt_file`(ファイル経由)に切り替え済み。
     relay_jwt: Option<String>,
+    /// `--relay-jwt`の推奨代替。ファイルパスを受け取り、起動時に一度だけ読み取ってから
+    /// 直ちに内容をゼロクリアしunlinkする(`resolve_relay_jwt`参照)。
+    relay_jwt_file: Option<String>,
 }
 
 fn next_val(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
@@ -101,9 +108,14 @@ fn print_help() {
     println!("                                   sends hole-punch probe datagrams to it before listening");
     println!("    --relay <ADDR:PORT>            MASQUE relay to tunnel through instead of --bind directly");
     println!("                                   (adds \"relay_public_addr\" to the handshake JSON);");
-    println!("                                   requires --relay-sni and --relay-jwt");
+    println!("                                   requires --relay-sni and one of --relay-jwt/--relay-jwt-file");
     println!("    --relay-sni <NAME>             TLS SNI / HTTP authority for --relay");
-    println!("    --relay-jwt <TOKEN>            Bearer token to authenticate to --relay");
+    println!("    --relay-jwt-file <PATH>        path to a file containing the Bearer token for --relay");
+    println!("                                   (preferred: unlike --relay-jwt, never appears in");
+    println!("                                   `ps`/`/proc/<pid>/cmdline`; read once at startup and removed)");
+    println!("    --relay-jwt <TOKEN>            Bearer token to authenticate to --relay (deprecated: visible");
+    println!("                                   to other local users via `ps`/`/proc/<pid>/cmdline`;");
+    println!("                                   prefer --relay-jwt-file)");
     println!("    --log-level <LEVEL>            error|warn|info|debug|trace (default: info)");
     println!("    --version                      print version and exit");
     println!("    -h, --help                     print this help message");
@@ -127,6 +139,7 @@ fn parse_args() -> Result<Args> {
     let mut relay: Option<SocketAddr> = None;
     let mut relay_sni: Option<String> = None;
     let mut relay_jwt: Option<String> = None;
+    let mut relay_jwt_file: Option<String> = None;
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -164,6 +177,7 @@ fn parse_args() -> Result<Args> {
             }
             "--relay-sni" => relay_sni = Some(next_val(&mut iter, "--relay-sni")?),
             "--relay-jwt" => relay_jwt = Some(next_val(&mut iter, "--relay-jwt")?),
+            "--relay-jwt-file" => relay_jwt_file = Some(next_val(&mut iter, "--relay-jwt-file")?),
             "--idle-timeout" => {
                 idle_timeout = next_val(&mut iter, "--idle-timeout")?
                     .parse()
@@ -203,8 +217,19 @@ fn parse_args() -> Result<Args> {
     if punch_peer.is_some() && stun_server.is_none() {
         return Err(anyhow!("--punch-peer requires --stun-server"));
     }
-    if relay.is_some() && (relay_sni.is_none() || relay_jwt.is_none()) {
-        return Err(anyhow!("--relay requires --relay-sni and --relay-jwt"));
+    if relay.is_some() && relay_sni.is_none() {
+        return Err(anyhow!("--relay requires --relay-sni and one of --relay-jwt/--relay-jwt-file"));
+    }
+    if relay.is_some() {
+        match (&relay_jwt, &relay_jwt_file) {
+            (None, None) => {
+                return Err(anyhow!("--relay requires one of --relay-jwt/--relay-jwt-file"))
+            }
+            (Some(_), Some(_)) => {
+                return Err(anyhow!("--relay-jwt and --relay-jwt-file are mutually exclusive"))
+            }
+            _ => {}
+        }
     }
     if relay.is_some() && (stun_server.is_some() || punch_peer.is_some()) {
         return Err(anyhow!("--relay cannot be combined with --stun-server/--punch-peer (different P2P transports)"));
@@ -223,7 +248,51 @@ fn parse_args() -> Result<Args> {
         relay,
         relay_sni,
         relay_jwt,
+        relay_jwt_file,
     })
+}
+
+/// `--relay-jwt`/`--relay-jwt-file`のどちらが指定されたかに応じてJWT文字列を解決する。
+/// `parse_args`で相互排他・少なくとも一方の存在は検証済み(`--relay`未指定なら両方
+/// `None`のままで、この関数は呼ばれない)。
+///
+/// ファイル経由の場合(推奨、セキュリティレビュー #58): 読み取り後直ちにファイルを
+/// unlinkし、読み取ったバッファもベストエフォートでゼロクリアする(呼び出し元の
+/// `helper_bootstrap.rs`/`isekai-bootstrap::openssh`が`mktemp -d`で作る一時
+/// ディレクトリは`trap ... EXIT`でも最終的に回収されるが、露出時間を最小化する)。
+fn resolve_relay_jwt(relay_jwt: Option<String>, relay_jwt_file: Option<String>) -> Result<String> {
+    match (relay_jwt, relay_jwt_file) {
+        (Some(jwt), None) => Ok(jwt),
+        (None, Some(path)) => {
+            let mut content = std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read --relay-jwt-file {path}"))?;
+            // ベストエフォートで即座に削除する(削除に失敗しても致命的ではない —
+            // 呼び出し元シェルの`trap ... EXIT`が一時ディレクトリごと最終的に回収する)。
+            if let Err(e) = std::fs::remove_file(&path) {
+                log::warn!("failed to remove --relay-jwt-file {path} after reading: {e}");
+            }
+            let trimmed = content.trim_end_matches(['\n', '\r']).to_string();
+            zeroize_string(&mut content);
+            Ok(trimmed)
+        }
+        (None, None) | (Some(_), Some(_)) => {
+            unreachable!("relay_jwt/relay_jwt_file exclusivity already validated in parse_args")
+        }
+    }
+}
+
+/// `s`のバイト列をその場でゼロ埋めする、ベストエフォートのメモリスクラブ。
+/// 全バイトを`0x00`(有効なASCII/UTF-8)で上書きするため`String`の不変条件
+/// (UTF-8妥当性)を壊さない。`write_volatile`はコンパイラによる dead-store
+/// elimination を抑止する意図(完全な保証ではないが、ここでは多層防御の
+/// 一部でしかないため十分)。
+fn zeroize_string(s: &mut String) {
+    // SAFETY: 全バイトを0x00で上書きするだけであり、長さ・容量は変えないため
+    // UTF-8妥当性は保たれる(0x00は単独で有効なUTF-8バイト列)。
+    let bytes = unsafe { s.as_mut_vec() };
+    for b in bytes.iter_mut() {
+        unsafe { std::ptr::write_volatile(b as *mut u8, 0) };
+    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -308,7 +377,7 @@ async fn main() -> Result<()> {
         // isekai-terminal自身はrelay/MASQUEを一切意識せず、この公開アドレスへ普通にQUIC
         // 接続するだけでよい(isekai_link_relay_transport.rs参照)。
         let relay_sni = args.relay_sni.expect("validated in parse_args");
-        let relay_jwt = args.relay_jwt.expect("validated in parse_args");
+        let relay_jwt = resolve_relay_jwt(args.relay_jwt, args.relay_jwt_file)?;
         let (relay_socket, proxy_public_address) =
             isekai_link_masque::connect_relay_agent(relay_addr, &relay_sni, &relay_jwt)
                 .await

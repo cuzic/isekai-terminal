@@ -111,6 +111,11 @@ class TerminalSession(
                         _state.update { it.copy(hostKeyChangedWarning = decision.warning) }
                         false
                     }
+                    is HostKeyDecision.Unconfirmed -> {
+                        RemoteLogger.i("IsekaiTerminalSSH", "first connection: awaiting user confirmation for $host")
+                        _state.update { it.copy(newHostKeyPrompt = decision.prompt) }
+                        false
+                    }
                     is HostKeyDecision.Reject -> {
                         RemoteLogger.w("IsekaiTerminalSSH", "host key rejected: ${decision.reason}")
                         false
@@ -279,6 +284,22 @@ class TerminalSession(
 
     fun dismissHostKeyWarning() {
         _state.update { it.copy(hostKeyChangedWarning = null) }
+        disconnect()
+    }
+
+    /** 初回接続確認ダイアログで「信頼して接続」を選んだ時に呼ぶ。trust store を更新するのみで、
+     *  接続自体は(ホスト鍵変更時と同様)ユーザーが手動で再接続する想定
+     *  (`TerminalScreenBody`の「再接続」ボタン、`canReconnect`が true の間表示される)。 */
+    fun trustNewHostKey() {
+        val p = _state.value.newHostKeyPrompt ?: return
+        _state.update { it.copy(newHostKeyPrompt = null) }
+        ioScope.launch {
+            hostKeyChecker.trustUpdated(p.host, p.port, p.fingerprint)
+        }
+    }
+
+    fun dismissNewHostKeyPrompt() {
+        _state.update { it.copy(newHostKeyPrompt = null) }
         disconnect()
     }
 

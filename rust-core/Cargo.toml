@@ -34,6 +34,9 @@ unicode-width = "0.1"
 base64 = "0.22"
 flate2 = "1"
 md5 = "0.8"
+# タスク#65: パスワード・復号済み秘密鍵PEMをdrop時にゼロ化するために使う
+# (`SshAuth`のDrop実装、`src/lib.rs`参照)。
+zeroize = "1"
 # QUIC実装は noq（quinnのマルチパスフォーク）に一本化している。
 # helper_quic_transport.rs（Phase 7/8、単一パス）・quic_transport.rs（Phase 5B）・
 # resume_client.rs も含め、quinn は使っていない
