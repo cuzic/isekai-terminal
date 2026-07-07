@@ -435,18 +435,28 @@ pub(crate) fn compute_proof(conn: &noq::Connection, session_secret: &[u8], extra
     Ok(mac.finalize().into_bytes().into())
 }
 
+/// Resolve the explicit `direct-by-bootstrap-host` mode.
+///
+/// This compatibility path reuses the SSH bootstrap host as the QUIC dial host.
+/// It is isolated here so ordinary candidate selection does not inherit the
+/// false premise that bootstrap reachability implies UDP/QUIC reachability.
+pub(crate) async fn resolve_direct_by_bootstrap_host(
+    bootstrap_host: &str,
+    handshake: &HelperHandshake,
+) -> Result<SocketAddr, String> {
+    let port = handshake.direct_by_bootstrap_host_port();
+    tokio::net::lookup_host((bootstrap_host, port))
+        .await
+        .map_err(|e| format!("DNS lookup failed for direct-by-bootstrap-host {bootstrap_host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("no address resolved for direct-by-bootstrap-host {bootstrap_host}:{port}"))
+}
+
 async fn connect_helper_quic_stream(
     ssh_host: &str,
     handshake: &HelperHandshake,
 ) -> Result<resume_client::ReattachableStream, String> {
-    // direct-by-bootstrap-host: bootstrap SSH の host 名を QUIC の host 部分にも使う。
-    // ProxyJump でしか到達できない host ではこの前提は成立しない。STUN/relay 経路は
-    // helper 起動後の handshake JSON に含まれる観測 endpoint を使う。
-    let remote: SocketAddr = tokio::net::lookup_host((ssh_host, handshake.listen_port))
-        .await
-        .map_err(|e| format!("DNS lookup failed: {e}"))?
-        .next()
-        .ok_or_else(|| "no address resolved for isekai-helper host".to_string())?;
+    let remote = resolve_direct_by_bootstrap_host(ssh_host, handshake).await?;
     let cert_sha256_hex = handshake.cert_sha256.clone();
     let session_secret = base64::engine::general_purpose::STANDARD
         .decode(&handshake.session_secret)

@@ -17,6 +17,9 @@ pub const MAX_HANDSHAKE_JSON_LEN: usize = 4096;
 pub const CERT_SHA256_HEX_LEN: usize = 64;
 pub const SESSION_SECRET_DECODED_LEN: usize = 32;
 pub const SUPPORTED_HANDSHAKE_VERSION: u32 = 1;
+pub const CANDIDATE_DIRECT_BY_BOOTSTRAP_HOST: &str = "direct-by-bootstrap-host";
+pub const CANDIDATE_SERVER_REFLEXIVE: &str = "server-reflexive";
+pub const CANDIDATE_RELAYED: &str = "relayed";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandshakeJson {
@@ -80,6 +83,20 @@ pub struct HandshakeCandidate {
     pub port: Option<u16>,
     #[serde(default)]
     pub source: Option<String>,
+}
+
+impl HandshakeJson {
+    /// Port for the legacy-compatible `direct-by-bootstrap-host` mode.
+    ///
+    /// New helpers advertise this explicitly as a candidate. Old helpers only
+    /// have top-level `listen_port`, so callers keep using that as the fallback.
+    pub fn direct_by_bootstrap_host_port(&self) -> u16 {
+        self.candidates
+            .iter()
+            .find(|candidate| candidate.kind == CANDIDATE_DIRECT_BY_BOOTSTRAP_HOST)
+            .and_then(|candidate| candidate.port)
+            .unwrap_or(self.listen_port)
+    }
 }
 
 /// Parses and validates one line of handshake JSON. Rejects oversized input
@@ -180,6 +197,25 @@ pub fn validate_handshake(h: &HandshakeJson) -> Result<(), ProtocolError> {
                 });
             }
         }
+        match candidate.kind.as_str() {
+            CANDIDATE_DIRECT_BY_BOOTSTRAP_HOST => {
+                if candidate.port.is_none() {
+                    return Err(ProtocolError::HandshakeField {
+                        field: "candidates.port",
+                        reason: "direct-by-bootstrap-host requires port".to_string(),
+                    });
+                }
+            }
+            CANDIDATE_SERVER_REFLEXIVE | CANDIDATE_RELAYED => {
+                if candidate.endpoint.is_none() {
+                    return Err(ProtocolError::HandshakeField {
+                        field: "candidates.endpoint",
+                        reason: format!("{} requires endpoint", candidate.kind),
+                    });
+                }
+            }
+            _ => {}
+        }
     }
 
     Ok(())
@@ -235,7 +271,39 @@ mod tests {
         );
         assert_eq!(h.services[0].name, "ssh");
         assert_eq!(h.candidates[0].kind, "direct-by-bootstrap-host");
-        assert_eq!(h.candidates[0].port, Some(45231));
+        assert_eq!(h.direct_by_bootstrap_host_port(), 45231);
+    }
+
+    #[test]
+    fn direct_by_bootstrap_host_port_falls_back_to_legacy_listen_port() {
+        let h = decode_handshake_json(&valid_json()).unwrap();
+        assert_eq!(h.direct_by_bootstrap_host_port(), 45231);
+    }
+
+    #[test]
+    fn rejects_direct_by_bootstrap_host_candidate_without_port() {
+        let json = br#"{"v":1,"listen_port":1,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","candidates":[{"kind":"direct-by-bootstrap-host","source":"bootstrap-ssh"}]}"#;
+        let err = decode_handshake_json(json).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::HandshakeField {
+                field: "candidates.port",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_relayed_candidate_without_endpoint() {
+        let json = br#"{"v":1,"listen_port":1,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","candidates":[{"kind":"relayed","source":"isekai-link-relay"}]}"#;
+        let err = decode_handshake_json(json).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::HandshakeField {
+                field: "candidates.endpoint",
+                ..
+            }
+        ));
     }
 
     #[test]

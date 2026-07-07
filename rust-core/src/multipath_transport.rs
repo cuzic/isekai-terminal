@@ -937,11 +937,9 @@ async fn try_connect_multipath(
         .decode(&handshake.session_secret)
         .map_err(|e| format!("invalid session_secret encoding: {e}"))?;
 
-    let path0_addr: SocketAddr = tokio::net::lookup_host((config.ssh_host.as_str(), handshake.listen_port))
+    let path0_addr = helper_quic_transport::resolve_direct_by_bootstrap_host(&config.ssh_host, &handshake)
         .await
-        .map_err(|e| format!("DNS lookup failed (path0/{}): {e}", config.ssh_host))?
-        .next()
-        .ok_or_else(|| format!("no address resolved for path0 host {}", config.ssh_host))?;
+        .map_err(|e| format!("multipath path0: {e}"))?;
 
     let path1_addr = match &config.direct_host {
         Some(host) => tokio::net::lookup_host((host.as_str(), handshake.listen_port))
