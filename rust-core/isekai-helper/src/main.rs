@@ -51,6 +51,8 @@ struct Args {
     idle_timeout: u64,
     resume_window: u64,
     max_idle_lifetime: u64,
+    /// S→C 方向（helper→client）の resume 用 output buffer 上限。
+    resume_buffer_size: usize,
     /// `SessionTable` に同時保持できるセッション数の上限（Phase S-4b）。
     max_sessions: usize,
     once: bool,
@@ -83,7 +85,8 @@ struct Args {
 }
 
 fn next_val(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
-    iter.next().ok_or_else(|| anyhow!("{flag} requires a value"))
+    iter.next()
+        .ok_or_else(|| anyhow!("{flag} requires a value"))
 }
 
 fn print_help() {
@@ -97,24 +100,35 @@ fn print_help() {
     println!("    --bind <ADDR:PORT>             QUIC bind address (default: 0.0.0.0:0)");
     println!("    --idle-timeout <SECS>          QUIC transport idle timeout (default: 15)");
     println!("    --resume-window <SECS>         how long a parked (disconnected) session stays resumable (default: 120)");
+    println!("    --resume-buffer-size <BYTES>   S->C replay buffer size per session (default: {DEFAULT_RESUME_BUFFER_SIZE})");
     println!("    --max-idle-lifetime <SECS>     self-exit after this many seconds with no active connection (default: 600)");
     println!("    --max-sessions <N>             max number of concurrently tracked resume sessions (default: {DEFAULT_MAX_SESSIONS});");
     println!("                                   once reached, the oldest parked session is evicted to make room,");
     println!("                                   or the new session is rejected if none are evictable (all active)");
     println!("    --once                         exit after the first connection closes");
-    println!("    --stun-server <ADDR:PORT>      query this STUN server for our own observed address");
-    println!("                                   (adds \"stun_observed_addr\" to the handshake JSON)");
+    println!(
+        "    --stun-server <ADDR:PORT>      query this STUN server for our own observed address"
+    );
+    println!(
+        "                                   (adds \"stun_observed_addr\" to the handshake JSON)"
+    );
     println!("    --punch-peer <ADDR:PORT>       peer's own STUN-observed address (requires --stun-server);");
     println!("                                   sends hole-punch probe datagrams to it before listening");
     println!("    --relay <ADDR:PORT>            MASQUE relay to tunnel through instead of --bind directly");
-    println!("                                   (adds \"relay_public_addr\" to the handshake JSON);");
+    println!(
+        "                                   (adds \"relay_public_addr\" to the handshake JSON);"
+    );
     println!("                                   requires --relay-sni and one of --relay-jwt/--relay-jwt-file");
     println!("    --relay-sni <NAME>             TLS SNI / HTTP authority for --relay");
-    println!("    --relay-jwt-file <PATH>        path to a file containing the Bearer token for --relay");
+    println!(
+        "    --relay-jwt-file <PATH>        path to a file containing the Bearer token for --relay"
+    );
     println!("                                   (preferred: unlike --relay-jwt, never appears in");
     println!("                                   `ps`/`/proc/<pid>/cmdline`; read once at startup and removed)");
     println!("    --relay-jwt <TOKEN>            Bearer token to authenticate to --relay (deprecated: visible");
-    println!("                                   to other local users via `ps`/`/proc/<pid>/cmdline`;");
+    println!(
+        "                                   to other local users via `ps`/`/proc/<pid>/cmdline`;"
+    );
     println!("                                   prefer --relay-jwt-file)");
     println!("    --log-level <LEVEL>            error|warn|info|debug|trace (default: info)");
     println!("    --version                      print version and exit");
@@ -130,6 +144,7 @@ fn parse_args() -> Result<Args> {
     // 指数バックオフ合計15秒 で実測 約90秒かかることを確認した。90秒ちょうどだと
     // ギリギリなので余裕を持たせて120秒にしてある。
     let mut resume_window = 120u64;
+    let mut resume_buffer_size = DEFAULT_RESUME_BUFFER_SIZE;
     let mut max_idle_lifetime = 600u64;
     let mut max_sessions = DEFAULT_MAX_SESSIONS;
     let mut once = false;
@@ -188,6 +203,14 @@ fn parse_args() -> Result<Args> {
                     .parse()
                     .context("invalid --resume-window value")?;
             }
+            "--resume-buffer-size" => {
+                resume_buffer_size = next_val(&mut iter, "--resume-buffer-size")?
+                    .parse()
+                    .context("invalid --resume-buffer-size value")?;
+                if resume_buffer_size == 0 {
+                    return Err(anyhow!("--resume-buffer-size must be at least 1"));
+                }
+            }
             "--max-idle-lifetime" => {
                 max_idle_lifetime = next_val(&mut iter, "--max-idle-lifetime")?
                     .parse()
@@ -218,27 +241,36 @@ fn parse_args() -> Result<Args> {
         return Err(anyhow!("--punch-peer requires --stun-server"));
     }
     if relay.is_some() && relay_sni.is_none() {
-        return Err(anyhow!("--relay requires --relay-sni and one of --relay-jwt/--relay-jwt-file"));
+        return Err(anyhow!(
+            "--relay requires --relay-sni and one of --relay-jwt/--relay-jwt-file"
+        ));
     }
     if relay.is_some() {
         match (&relay_jwt, &relay_jwt_file) {
             (None, None) => {
-                return Err(anyhow!("--relay requires one of --relay-jwt/--relay-jwt-file"))
+                return Err(anyhow!(
+                    "--relay requires one of --relay-jwt/--relay-jwt-file"
+                ))
             }
             (Some(_), Some(_)) => {
-                return Err(anyhow!("--relay-jwt and --relay-jwt-file are mutually exclusive"))
+                return Err(anyhow!(
+                    "--relay-jwt and --relay-jwt-file are mutually exclusive"
+                ))
             }
             _ => {}
         }
     }
     if relay.is_some() && (stun_server.is_some() || punch_peer.is_some()) {
-        return Err(anyhow!("--relay cannot be combined with --stun-server/--punch-peer (different P2P transports)"));
+        return Err(anyhow!(
+            "--relay cannot be combined with --stun-server/--punch-peer (different P2P transports)"
+        ));
     }
     Ok(Args {
         target,
         bind,
         idle_timeout,
         resume_window,
+        resume_buffer_size,
         max_idle_lifetime,
         max_sessions,
         once,
@@ -527,6 +559,7 @@ async fn main() -> Result<()> {
                 let active = active.clone();
                 let last_activity = last_activity.clone();
                 let sessions = sessions.clone();
+                let resume_buffer_size = args.resume_buffer_size;
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(conn) => {
@@ -537,7 +570,7 @@ async fn main() -> Result<()> {
                                 .path(noq::PathId::ZERO)
                                 .and_then(|p| p.remote_address().ok());
                             log::info!("QUIC connection established from {remote:?}");
-                            if let Err(e) = handle_connection(conn, target, secret, active, sessions).await {
+                            if let Err(e) = handle_connection(conn, target, secret, active, sessions, resume_buffer_size).await {
                                 log::warn!("connection from {remote:?} ended: {e:#}");
                             }
                         }
@@ -563,6 +596,7 @@ async fn handle_connection(
     session_secret: [u8; 32],
     active: Arc<AtomicBool>,
     sessions: SessionTable,
+    resume_buffer_size: usize,
 ) -> Result<()> {
     // 最初の1バイトでフレーム種別（HELLO=新規 / RESUME=reattach）を判定してから、
     // 種別に応じた残りバイト数を読む。いずれも一定時間内に届かなければ
@@ -575,13 +609,15 @@ async fn handle_connection(
             .await
             .context("failed to read frame type")?;
         let rest_len = match type_byte[0] {
-            FRAME_HELLO => 32,      // proof
-            resume::RESUME => 64,   // session_id(16) + proof(32) + offset(8) + offset(8)
+            FRAME_HELLO => 32,    // proof
+            resume::RESUME => 64, // session_id(16) + proof(32) + offset(8) + offset(8)
             _ => 0,
         };
         let mut rest = vec![0u8; rest_len];
         if rest_len > 0 {
-            recv.read_exact(&mut rest).await.context("failed to read frame body")?;
+            recv.read_exact(&mut rest)
+                .await
+                .context("failed to read frame body")?;
         }
         Ok::<_, anyhow::Error>((send, recv, type_byte[0], rest))
     })
@@ -593,10 +629,31 @@ async fn handle_connection(
             let mut hello = [0u8; 33];
             hello[0] = FRAME_HELLO;
             hello[1..].copy_from_slice(&rest);
-            handle_stream(conn, send, recv, hello, target, session_secret, active, sessions).await
+            handle_stream(
+                conn,
+                send,
+                recv,
+                hello,
+                target,
+                session_secret,
+                active,
+                sessions,
+                resume_buffer_size,
+            )
+            .await
         }
         resume::RESUME => {
-            handle_resume_stream(conn, send, recv, &rest, target, session_secret, active, sessions).await
+            handle_resume_stream(
+                conn,
+                send,
+                recv,
+                &rest,
+                target,
+                session_secret,
+                active,
+                sessions,
+            )
+            .await
         }
         other => {
             let mut send = send;
@@ -628,6 +685,7 @@ async fn handle_stream(
     session_secret: [u8; 32],
     active: Arc<AtomicBool>,
     sessions: SessionTable,
+    resume_buffer_size: usize,
 ) -> Result<()> {
     if hello[0] != FRAME_HELLO {
         reject(&mut send, FRAME_REJECT_UNSUPPORTED).await;
@@ -652,7 +710,16 @@ async fn handle_stream(
     }
 
     let mut recv = recv;
-    let result = relay_with_resume(&conn, &mut send, &mut recv, target, session_secret, &sessions).await;
+    let result = relay_with_resume(
+        &conn,
+        &mut send,
+        &mut recv,
+        target,
+        session_secret,
+        &sessions,
+        resume_buffer_size,
+    )
+    .await;
     active.store(false, Ordering::SeqCst);
     result
 }
@@ -694,7 +761,10 @@ async fn handle_resume_stream(
 
     let Some(handle) = sessions.get(&session_id).await else {
         reject(&mut send, resume::REJECT_UNKNOWN_SESSION).await;
-        return Err(anyhow!("unknown session_id for resume: {}", hex_lower(&session_id)));
+        return Err(anyhow!(
+            "unknown session_id for resume: {}",
+            hex_lower(&session_id)
+        ));
     };
 
     let parked = {
@@ -704,7 +774,10 @@ async fn handle_resume_stream(
     };
     let Some((tcp_read, tcp_write)) = parked else {
         reject(&mut send, resume::REJECT_UNKNOWN_SESSION).await;
-        return Err(anyhow!("session {} not resumable (no parked TCP connection)", hex_lower(&session_id)));
+        return Err(anyhow!(
+            "session {} not resumable (no parked TCP connection)",
+            hex_lower(&session_id)
+        ));
     };
 
     if active
@@ -719,7 +792,11 @@ async fn handle_resume_stream(
     let (helper_committed_offset, helper_sent_offset, replay_bytes) = {
         let session = handle.lock().await;
         let replay = session.output_buffer.replay_from(client_delivered_offset);
-        (session.helper_committed_offset, session.output_buffer.end_offset(), replay)
+        (
+            session.helper_committed_offset,
+            session.output_buffer.end_offset(),
+            replay,
+        )
     };
     let Some(replay_bytes) = replay_bytes else {
         active.store(false, Ordering::SeqCst);
@@ -762,12 +839,17 @@ async fn handle_resume_stream(
         let conn = conn.clone();
         let handle = handle.clone();
         tokio::spawn(async move {
-            match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret)).await {
+            match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret))
+                .await
+            {
                 Ok(Ok((csend, crecv, _new_id))) => {
                     // control stream 上の session_id は毎回新規発行されるが、
                     // resume 後も既存の session_id をそのまま使い続ける
                     // （sessions テーブルのキーは変更しない）。
-                    log::info!("resume: control stream re-established for session_id={}", hex_lower(&session_id));
+                    log::info!(
+                        "resume: control stream re-established for session_id={}",
+                        hex_lower(&session_id)
+                    );
                     spawn_app_ack_tasks(csend, crecv, handle);
                 }
                 Ok(Err(e)) => log::info!("resume: control stream re-establish failed ({e:#})"),
@@ -776,7 +858,15 @@ async fn handle_resume_stream(
         })
     };
 
-    let outcome = relay_buffered(&mut send, &mut recv, tcp_read, tcp_write, handle.clone(), target).await;
+    let outcome = relay_buffered(
+        &mut send,
+        &mut recv,
+        tcp_read,
+        tcp_write,
+        handle.clone(),
+        target,
+    )
+    .await;
     control_task.abort();
     active.store(false, Ordering::SeqCst);
     finish_or_park_session(&sessions, Some(session_id), handle, outcome).await;
@@ -786,7 +876,11 @@ async fn handle_resume_stream(
 /// `handle_resume_stream` の各早期リターン経路で共通の後始末: 取り出した
 /// TCP 接続をもう一度 `Session::parked_tcp` に戻し、`parked_since` を今の
 /// 時刻に更新する（次に来る resume 試行、またはタイムアウトでの破棄に備える）。
-async fn repark(handle: &Arc<Mutex<Session>>, tcp_read: tokio::net::tcp::OwnedReadHalf, tcp_write: tokio::net::tcp::OwnedWriteHalf) {
+async fn repark(
+    handle: &Arc<Mutex<Session>>,
+    tcp_read: tokio::net::tcp::OwnedReadHalf,
+    tcp_write: tokio::net::tcp::OwnedWriteHalf,
+) {
     let mut session = handle.lock().await;
     session.parked_tcp = Some((tcp_read, tcp_write));
     session.parked_since = Some(std::time::Instant::now());
@@ -803,8 +897,7 @@ fn compute_proof(
     let mut exporter = [0u8; 32];
     conn.export_keying_material(&mut exporter, label, context)
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
-    let mut mac =
-        HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
     mac.update(&exporter);
     Ok(mac.finalize().into_bytes().into())
 }
@@ -858,6 +951,7 @@ async fn relay_with_resume(
     target: SocketAddr,
     session_secret: [u8; 32],
     sessions: &SessionTable,
+    resume_buffer_size: usize,
 ) -> Result<()> {
     let tcp = match TcpStream::connect(target).await {
         Ok(s) => s,
@@ -869,7 +963,7 @@ async fn relay_with_resume(
     send.write_all(&[FRAME_ACK]).await?;
     let (tcp_read, tcp_write) = tcp.into_split();
 
-    let handle = Arc::new(Mutex::new(Session::new(DEFAULT_RESUME_BUFFER_SIZE)));
+    let handle = Arc::new(Mutex::new(Session::new(resume_buffer_size)));
     let established_id: Arc<Mutex<Option<resume::SessionId>>> = Arc::new(Mutex::new(None));
 
     let control_task = {
@@ -878,7 +972,9 @@ async fn relay_with_resume(
         let sessions = sessions.clone();
         let established_id = established_id.clone();
         tokio::spawn(async move {
-            match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret)).await {
+            match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret))
+                .await
+            {
                 Ok(Ok((csend, crecv, id))) => {
                     sessions.insert_existing(id, handle.clone()).await;
                     *established_id.lock().await = Some(id);
@@ -921,11 +1017,20 @@ async fn finish_or_park_session(
     };
     match outcome {
         RelayOutcome::TcpDied => {
-            log::info!("session {} target connection died, discarding", hex_lower(&id));
+            log::info!(
+                "session {} target connection died, discarding",
+                hex_lower(&id)
+            );
             sessions.remove(&id).await;
         }
-        RelayOutcome::DataStreamDied { tcp_read, tcp_write } => {
-            log::info!("session {} data stream died, parking for possible resume", hex_lower(&id));
+        RelayOutcome::DataStreamDied {
+            tcp_read,
+            tcp_write,
+        } => {
+            log::info!(
+                "session {} data stream died, parking for possible resume",
+                hex_lower(&id)
+            );
             let mut session = handle.lock().await;
             session.parked_tcp = Some((tcp_read, tcp_write));
             session.parked_since = Some(std::time::Instant::now());
@@ -952,7 +1057,19 @@ fn spawn_app_ack_tasks(
                 match crecv.read_exact(&mut frame).await {
                     Ok(()) if frame[0] == resume::APP_ACK => {
                         let offset = u64::from_be_bytes(frame[1..9].try_into().unwrap());
-                        session.lock().await.output_buffer.advance_start(offset);
+                        let notify = {
+                            let mut session = session.lock().await;
+                            let was_full = session.output_buffer.is_full();
+                            session.output_buffer.advance_start(offset);
+                            if was_full && !session.output_buffer.is_full() {
+                                Some(session.output_space_available.clone())
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(notify) = notify {
+                            notify.notify_waiters();
+                        }
                     }
                     _ => break,
                 }
@@ -1017,8 +1134,16 @@ async fn relay_buffered(
     let mut c2s_buf = vec![0u8; 16 * 1024];
     let mut s2c_buf = vec![0u8; 16 * 1024];
     let mut c2s_done = false; // client → helper 方向が half-close 済み
+    let output_space_available = session.lock().await.output_space_available.clone();
 
     loop {
+        let s2c_read_len = {
+            let session = session.lock().await;
+            session
+                .output_buffer
+                .remaining_capacity()
+                .min(s2c_buf.len())
+        };
         tokio::select! {
             result = recv.read(&mut c2s_buf), if !c2s_done => {
                 match result {
@@ -1040,7 +1165,13 @@ async fn relay_buffered(
                     }
                 }
             }
-            result = tcp_read.read(&mut s2c_buf) => {
+            _ = output_space_available.notified(), if s2c_read_len == 0 => {
+                continue;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)), if s2c_read_len == 0 => {
+                continue;
+            }
+            result = tcp_read.read(&mut s2c_buf[..s2c_read_len]), if s2c_read_len > 0 => {
                 match result {
                     Ok(0) => {
                         // target（sshd）側が正常終了。resume する意味が無い。
@@ -1053,7 +1184,12 @@ async fn relay_buffered(
                             log::info!("relay to {target}: data stream (S->C) write failed: {e}");
                             return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
                         }
-                        session.lock().await.output_buffer.append(&s2c_buf[..n]);
+                        if !session.lock().await.output_buffer.append(&s2c_buf[..n]) {
+                            log::warn!(
+                                "relay to {target}: output buffer had no room after bounded read; treating as data stream failure"
+                            );
+                            return RelayOutcome::DataStreamDied { tcp_read, tcp_write };
+                        }
                     }
                     Err(e) => {
                         log::warn!("relay to {target}: tcp read failed: {e}");
@@ -1064,4 +1200,3 @@ async fn relay_buffered(
         }
     }
 }
-

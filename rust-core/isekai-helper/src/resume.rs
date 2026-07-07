@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 pub const CONTROL_HELLO: u8 = 0x10;
 pub const CONTROL_ACK: u8 = 0x11;
@@ -35,15 +35,33 @@ impl OutputBuffer {
         }
     }
 
-    /// 送出したバイト列をバッファに書き足す。上限を超えた古いバイトは
-    /// 即座に破棄する（`advance_start` を待たない — 上限超過は
-    /// `REJECT_OFFSET_GONE` を招くが、無制限のメモリ増加よりは安全という判断）。
-    pub fn append(&mut self, bytes: &[u8]) {
-        self.data.extend(bytes.iter().copied());
-        while self.data.len() > self.capacity {
-            self.data.pop_front();
-            self.start_offset += 1;
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn remaining_capacity(&self) -> usize {
+        self.capacity.saturating_sub(self.data.len())
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.remaining_capacity() == 0
+    }
+
+    /// 送出したバイト列をバッファに書き足す。上限を超える場合は何も書かず
+    /// `false` を返す。呼び出し側は `remaining_capacity()` 以下だけ読み込む
+    /// ことで、古い未確認データを失わず TCP backpressure をかける。
+    pub fn append(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() > self.remaining_capacity() {
+            return false;
         }
+        self.data.extend(bytes.iter().copied());
+        true
     }
 
     /// 相手（client）が `client_delivered_offset` として確認した位置まで、
@@ -94,6 +112,8 @@ pub struct Session {
     /// `parked_tcp` に入れられた時刻。resume が一定時間来なければ
     /// `SessionTable::sweep_expired_parked` で破棄する（HELPER_PROTOCOL.md §7.5）。
     pub parked_since: Option<std::time::Instant>,
+    /// S→C output buffer に空きが戻ったことを relay loop へ伝える通知。
+    pub output_space_available: Arc<Notify>,
 }
 
 impl Session {
@@ -103,6 +123,7 @@ impl Session {
             helper_committed_offset: 0,
             parked_tcp: None,
             parked_since: None,
+            output_space_available: Arc::new(Notify::new()),
         }
     }
 }
@@ -267,8 +288,8 @@ mod tests {
     #[test]
     fn append_and_replay_full_range() {
         let mut buf = OutputBuffer::new(1024);
-        buf.append(b"hello");
-        buf.append(b" world");
+        assert!(buf.append(b"hello"));
+        assert!(buf.append(b" world"));
         assert_eq!(buf.end_offset(), 11);
         assert_eq!(buf.replay_from(0).unwrap(), b"hello world");
         assert_eq!(buf.replay_from(5).unwrap(), b" world");
@@ -278,42 +299,48 @@ mod tests {
     #[test]
     fn replay_from_beyond_end_is_none() {
         let mut buf = OutputBuffer::new(1024);
-        buf.append(b"hi");
+        assert!(buf.append(b"hi"));
         assert!(buf.replay_from(3).is_none());
     }
 
     #[test]
     fn advance_start_discards_confirmed_prefix() {
         let mut buf = OutputBuffer::new(1024);
-        buf.append(b"0123456789");
+        assert!(buf.append(b"0123456789"));
         buf.advance_start(4);
         assert_eq!(buf.start_offset(), 4);
         assert_eq!(buf.replay_from(4).unwrap(), b"456789");
-        assert!(buf.replay_from(0).is_none(), "破棄済み範囲は None を返すべき");
-    }
-
-    #[test]
-    fn capacity_overflow_evicts_oldest_bytes() {
-        let mut buf = OutputBuffer::new(4);
-        buf.append(b"abcdefgh"); // 8 bytes into a 4-byte buffer
-        assert_eq!(buf.start_offset(), 4);
-        assert_eq!(buf.end_offset(), 8);
-        assert_eq!(buf.replay_from(4).unwrap(), b"efgh");
         assert!(
             buf.replay_from(0).is_none(),
-            "capacity 超過で古いバイトは破棄済みのはず"
+            "破棄済み範囲は None を返すべき"
         );
     }
 
     #[test]
-    fn capacity_overflow_across_multiple_appends() {
+    fn capacity_overflow_is_rejected_without_evicting_oldest_bytes() {
+        let mut buf = OutputBuffer::new(4);
+        assert!(buf.append(b"abcd"));
+        assert!(!buf.append(b"e"));
+        assert_eq!(buf.start_offset(), 0);
+        assert_eq!(buf.end_offset(), 4);
+        assert_eq!(buf.len(), 4);
+        assert_eq!(buf.capacity(), 4);
+        assert!(buf.is_full());
+        assert_eq!(buf.remaining_capacity(), 0);
+        assert_eq!(buf.replay_from(0).unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn advance_start_frees_capacity_for_later_appends() {
         let mut buf = OutputBuffer::new(10);
-        for _ in 0..5 {
-            buf.append(b"abcd"); // 20 bytes total into a 10-byte buffer
-        }
-        assert_eq!(buf.end_offset(), 20);
-        assert_eq!(buf.start_offset(), 10);
-        assert_eq!(buf.replay_from(10).unwrap().len(), 10);
+        assert!(buf.append(b"abcdefghij"));
+        assert!(buf.is_full());
+        buf.advance_start(6);
+        assert_eq!(buf.start_offset(), 6);
+        assert_eq!(buf.remaining_capacity(), 6);
+        assert!(buf.append(b"klmnop"));
+        assert_eq!(buf.end_offset(), 16);
+        assert_eq!(buf.replay_from(6).unwrap(), b"ghijklmnop");
     }
 
     #[tokio::test]
@@ -323,13 +350,16 @@ mod tests {
         assert!(!table.contains(&id).await);
 
         let mut session = Session::new(1024);
-        session.output_buffer.append(b"payload");
+        assert!(session.output_buffer.append(b"payload"));
         session.helper_committed_offset = 42;
         table.insert(id, session).await;
 
         assert!(table.contains(&id).await);
         let handle_before_remove = table.get(&id).await.expect("session should be gettable");
-        assert_eq!(handle_before_remove.lock().await.helper_committed_offset, 42);
+        assert_eq!(
+            handle_before_remove.lock().await.helper_committed_offset,
+            42
+        );
 
         let removed = table.remove(&id).await.expect("session should exist");
         let removed = removed.lock().await;
@@ -367,7 +397,8 @@ mod tests {
         let expired_id = SessionTable::generate_session_id();
         let mut expired_session = Session::new(1024);
         expired_session.parked_tcp = Some(dummy_parked_tcp().await);
-        expired_session.parked_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        expired_session.parked_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
         table.insert(expired_id, expired_session).await;
 
         let fresh_id = SessionTable::generate_session_id();
@@ -382,9 +413,15 @@ mod tests {
 
         table.sweep_expired_parked(max_parked).await;
 
-        assert!(!table.contains(&expired_id).await, "期限切れの park は破棄されるはず");
+        assert!(
+            !table.contains(&expired_id).await,
+            "期限切れの park は破棄されるはず"
+        );
         assert!(table.contains(&fresh_id).await, "期限内の park は残るはず");
-        assert!(table.contains(&active_id).await, "アクティブな session には触れないはず");
+        assert!(
+            table.contains(&active_id).await,
+            "アクティブな session には触れないはず"
+        );
     }
 
     /// `max_sessions` に達した状態で新規登録すると、最も古い parked セッションが
@@ -396,14 +433,19 @@ mod tests {
         let older_id = SessionTable::generate_session_id();
         let mut older_session = Session::new(1024);
         older_session.parked_tcp = Some(dummy_parked_tcp().await);
-        older_session.parked_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
-        table.insert_existing(older_id, Arc::new(Mutex::new(older_session))).await;
+        older_session.parked_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        table
+            .insert_existing(older_id, Arc::new(Mutex::new(older_session)))
+            .await;
 
         let newer_id = SessionTable::generate_session_id();
         let mut newer_session = Session::new(1024);
         newer_session.parked_tcp = Some(dummy_parked_tcp().await);
         newer_session.parked_since = Some(std::time::Instant::now());
-        table.insert_existing(newer_id, Arc::new(Mutex::new(newer_session))).await;
+        table
+            .insert_existing(newer_id, Arc::new(Mutex::new(newer_session)))
+            .await;
 
         // テーブルは既に上限(2)に達している。3つ目の登録は最も古い parked
         // セッション(older_id)を立ち退かせた上で成功するはず。
@@ -413,9 +455,18 @@ mod tests {
             .await;
 
         assert!(inserted, "立ち退き後に新規セッションは登録できるはず");
-        assert!(!table.contains(&older_id).await, "最も古い parked セッションは立ち退くはず");
-        assert!(table.contains(&newer_id).await, "より新しい parked セッションは残るはず");
-        assert!(table.contains(&new_id).await, "新規セッションは登録されるはず");
+        assert!(
+            !table.contains(&older_id).await,
+            "最も古い parked セッションは立ち退くはず"
+        );
+        assert!(
+            table.contains(&newer_id).await,
+            "より新しい parked セッションは残るはず"
+        );
+        assert!(
+            table.contains(&new_id).await,
+            "新規セッションは登録されるはず"
+        );
     }
 
     /// アクティブなセッション（`parked_tcp` が `None`）は決して立ち退き対象に
@@ -436,9 +487,18 @@ mod tests {
             .insert_existing(new_id, Arc::new(Mutex::new(Session::new(1024))))
             .await;
 
-        assert!(!inserted, "立ち退けるparkedセッションが無ければ新規登録は拒否されるはず");
-        assert!(table.contains(&active_id).await, "アクティブなセッションは立ち退き対象にならないはず");
-        assert!(!table.contains(&new_id).await, "拒否された新規セッションはテーブルに存在しないはず");
+        assert!(
+            !inserted,
+            "立ち退けるparkedセッションが無ければ新規登録は拒否されるはず"
+        );
+        assert!(
+            table.contains(&active_id).await,
+            "アクティブなセッションは立ち退き対象にならないはず"
+        );
+        assert!(
+            !table.contains(&new_id).await,
+            "拒否された新規セッションはテーブルに存在しないはず"
+        );
     }
 
     /// テーブルにアクティブなセッションと parked セッションが混在している場合、
@@ -456,7 +516,9 @@ mod tests {
         let mut parked_session = Session::new(1024);
         parked_session.parked_tcp = Some(dummy_parked_tcp().await);
         parked_session.parked_since = Some(std::time::Instant::now());
-        table.insert_existing(parked_id, Arc::new(Mutex::new(parked_session))).await;
+        table
+            .insert_existing(parked_id, Arc::new(Mutex::new(parked_session)))
+            .await;
 
         let new_id = SessionTable::generate_session_id();
         let inserted = table
@@ -464,8 +526,14 @@ mod tests {
             .await;
 
         assert!(inserted);
-        assert!(table.contains(&active_id).await, "アクティブなセッションは残るはず");
-        assert!(!table.contains(&parked_id).await, "parked セッションが立ち退くはず");
+        assert!(
+            table.contains(&active_id).await,
+            "アクティブなセッションは残るはず"
+        );
+        assert!(
+            !table.contains(&parked_id).await,
+            "parked セッションが立ち退くはず"
+        );
         assert!(table.contains(&new_id).await);
     }
 }

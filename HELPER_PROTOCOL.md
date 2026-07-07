@@ -18,6 +18,8 @@ OPTIONS:
   --idle-timeout <SECS>         QUIC トランスポートの max_idle_timeout（既定: 15。Phase 8-4b 参照）
   --resume-window <SECS>        park された（data stream が切れて resume 待ちの）セッションを
                                  保持する時間。これを過ぎたら破棄する（既定: 120。Phase 8-4b 参照）
+  --resume-buffer-size <BYTES>  helper→client 方向の resume 用 output buffer 上限（既定: 4MiB）。
+                                 上限到達時は `--target` からの読み込みを止め、TCP backpressure をかける
   --max-idle-lifetime <SECS>    アクティブな接続が無く、かつ新規接続も来ない状態が続いたら自己終了するまでの秒数（既定: 600）
   --max-sessions <N>            同時に保持できる resume 可能セッション数の上限（既定: 16。Phase S-4b 参照）。
                                  上限に達した状態で新規セッションを登録する際、parked（data streamが
@@ -451,14 +453,17 @@ Phase 8 固有の意味を追加する）:
 | `0xFF` (REJECT_AUTH) | `resume_proof` が不正 |
 | `0xF9` (REJECT_UNKNOWN_SESSION) | `session_id` が存在しない（helper 再起動・タイムアウト等で
   セッション情報が失われた）。client は Phase 7 の通常ブートストラップからやり直す以外に手段がない |
-| `0xF8` (REJECT_OFFSET_GONE) | 要求された offset がすでに helper 側バッファの範囲外（バッファ
-  上限超過で古いデータを破棄済み）。`REJECT_UNKNOWN_SESSION` と同様、再送不能なので resume を諦める |
+| `0xF8` (REJECT_OFFSET_GONE) | 要求された offset が helper 側 output buffer の範囲外。現在の helper は
+  上限到達時に古い未確認データを捨てず `--target` からの読み込みを止めるため、通常は client が
+  既に確認済みより古い offset を要求した場合、旧実装からの移行、または異常系を表す。
+  `REJECT_UNKNOWN_SESSION` と同様、再送不能なので resume を諦める |
 
 ### 7.4 バッファ契約（Phase 8-1 / 8-2 の前提）
 
-- helper 側 output buffer（S→C 再送用）: 上限サイズを設ける（既定案 4MiB、`--resume-buffer-size`
-  で変更可能とする）。上限到達時は `--target` からの読み込みを止める（TCP backpressure、PLAN.md
-  「実装上の難所」通り）。バッファから追い出した範囲を resume 要求された場合は `REJECT_OFFSET_GONE`。
+- helper 側 output buffer（S→C 再送用）: 上限サイズを設ける（既定4MiB、`--resume-buffer-size`
+  で変更可能）。上限到達時は古い未確認データを破棄せず、`--target` からの読み込みを止める
+  （TCP backpressure、PLAN.md「実装上の難所」通り）。`APP_ACK` によって
+  `client_delivered_offset` が進み、空き容量が戻ったら読み込みを再開する。
 - client 側 input replay buffer（C→S 再送用）: 同様に上限を設ける。russh が生成する送信バイトは
   ほぼ全てユーザー入力起因で小さいため、helper 側ほど肥大化しにくいが、trzsz アップロード中は
   大きくなり得るため上限は必須。
