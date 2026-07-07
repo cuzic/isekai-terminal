@@ -1,0 +1,9 @@
+[package]
+name = "isekai-pipe-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Core library skeleton for the future isekai-pipe data plane."
+
+[dependencies]
+isekai-pipe-protocol = { path = "../isekai-pipe-protocol" }

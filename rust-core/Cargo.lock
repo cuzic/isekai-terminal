@@ -1416,6 +1416,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "isekai-pipe"
+version = "0.1.0"
+dependencies = [
+ "isekai-pipe-core",
+]
+
+[[package]]
+name = "isekai-pipe-core"
+version = "0.1.0"
+dependencies = [
+ "isekai-pipe-protocol",
+]
+
+[[package]]
+name = "isekai-pipe-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "isekai-protocol"
 version = "0.1.0"
 dependencies = [

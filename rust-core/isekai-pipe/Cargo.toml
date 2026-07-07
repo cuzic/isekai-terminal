@@ -1,0 +1,13 @@
+[package]
+name = "isekai-pipe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "CLI skeleton for isekai-pipe connect/serve/probe/inspect."
+
+[[bin]]
+name = "isekai-pipe"
+path = "src/main.rs"
+
+[dependencies]
+isekai-pipe-core = { path = "../isekai-pipe-core" }
