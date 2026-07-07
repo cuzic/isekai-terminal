@@ -134,10 +134,9 @@ Host myhost
 
 `ServerAliveInterval`/`ServerAliveCountMax`/`TCPKeepAlive no` は必須ではないが強く推奨する。
 `isekai-pipe connect` は `ConnectionIntent` を atomic claim し、`isekai_transport` で
-relay/STUN transport を直接起動して stdio bridge を所有する。relay resume pump は移行中のため、
-QUIC 接続が切れた場合の再開処理は今後 `isekai-pipe connect` 側へ移す。
-resume が有効になった後は `--resume-window`(既定120秒、isekai-helper 側の
-既定と揃える予定)の間は `ssh` 側の stdin/stdout を閉じずに粘るので、
+relay/STUN transport を直接起動して stdio bridge を所有する。relay mode では QUIC 接続が
+切れても `--resume-window`(既定120秒、isekai-helper 側の既定と揃えてある)の間は
+resume を試み続けて `ssh` 側の stdin/stdout を閉じずに粘るので、
 `ssh` 自身の生存確認(`ServerAliveInterval × ServerAliveCountMax`)は resume window より
 十分長く設定しておくと、瞬断のたびに `ssh` 自身が先にセッションを諦めてしまう事故を防げる
 (`ISEKAI_SSH_DESIGN.md`「`ssh` 自身の生存確認とのレース」参照)。

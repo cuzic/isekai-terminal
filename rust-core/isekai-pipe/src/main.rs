@@ -1,5 +1,8 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -8,13 +11,22 @@ use isekai_pipe_core::{
     IntentTransport, ServerIdentity, ServiceSpec,
 };
 use isekai_transport::{
-    connect_stun_p2p, connect_via_relay, ByteStream, RelayTarget, StunP2pTarget,
-    SystemQuicEndpointFactory,
+    connect_stun_p2p, connect_via_relay_resumable, reconnect_and_resume, spawn_app_ack_tasks,
+    AppAckCounters, BackoffPolicy, ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf,
+    C2hSentOffset, H2cClientDeliveredOffset, RelayTarget, StunP2pTarget, SystemQuicEndpointFactory,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const EX_USAGE: u8 = 64;
 const EX_UNAVAILABLE: u8 = 69;
+const DEFAULT_RESUME_WINDOW: Duration = Duration::from_secs(120);
+const C2H_REPLAY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
+const RESUME_BACKOFF: BackoffPolicy = BackoffPolicy {
+    initial: Duration::from_millis(500),
+    max: Duration::from_secs(10),
+    jitter: 0.0,
+};
+const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 fn print_help() {
     println!("isekai-pipe - data plane for isekai-ssh");
@@ -52,6 +64,7 @@ struct ConnectLaunch {
     stdio: bool,
     mode: ConnectMode,
     stun_server: Option<String>,
+    resume_window: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +127,7 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
     let mut stdio = false;
     let mut mode = ConnectMode::Relay;
     let mut stun_server = None;
+    let mut resume_window = DEFAULT_RESUME_WINDOW;
     let mut iter = args.peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -170,11 +184,15 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 })?);
             }
             "--resume-window" => {
-                let _ = next_arg("connect", &mut iter, &arg).map_err(|e| {
+                let value = next_arg("connect", &mut iter, &arg).map_err(|e| {
                     eprintln!("{e}");
                     ExitCode::from(EX_USAGE)
                 })?;
-                eprintln!("isekai-pipe connect: --resume-window is reserved until pipe-owned resume lands");
+                let secs: u64 = value.parse().map_err(|_| {
+                    eprintln!("isekai-pipe connect: --resume-window must be a number of seconds");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                resume_window = Duration::from_secs(secs);
             }
             "--listen" => {
                 eprintln!(
@@ -220,6 +238,7 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
         stdio,
         mode,
         stun_server,
+        resume_window,
     }))
 }
 
@@ -266,51 +285,51 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
         );
     }
 
-    let stream: Box<dyn ByteStream> = match intent.transport {
+    let profile = intent.profile.clone();
+    match intent.transport {
         IntentTransport::Relay {
             helper_addr,
             server_name,
             session_secret_b64,
+        } => run_relay_resumable(
+            &RelayTarget {
+                helper_addr: helper_addr
+                    .parse()
+                    .with_context(|| format!("invalid relay helper_addr {helper_addr:?}"))?,
+                server_name,
+                cert_sha256_hex: intent.expected_server_identity.cert_sha256_hex,
+                session_secret: decode_secret(&session_secret_b64)?,
+            },
+            &profile,
+            launch.resume_window,
+        )
+        .await
+        .context("isekai-pipe connect: relay transport failed"),
+        IntentTransport::StunP2p {
+            stun_server,
+            peer_addr,
+            server_name,
+            session_secret_b64,
         } => {
-            let factory = SystemQuicEndpointFactory;
-            connect_via_relay(
-                &factory,
-                &RelayTarget {
-                    helper_addr: helper_addr
+            let stream = connect_stun_p2p(
+                stun_server
+                    .parse()
+                    .with_context(|| format!("invalid stun_server {stun_server:?}"))?,
+                &StunP2pTarget {
+                    peer_addr: peer_addr
                         .parse()
-                        .with_context(|| format!("invalid relay helper_addr {helper_addr:?}"))?,
+                        .with_context(|| format!("invalid stun peer_addr {peer_addr:?}"))?,
                     server_name,
                     cert_sha256_hex: intent.expected_server_identity.cert_sha256_hex,
                     session_secret: decode_secret(&session_secret_b64)?,
                 },
             )
             .await
-            .context("isekai-pipe connect: relay transport failed")?
+            .map(|conn| conn.stream)
+            .context("isekai-pipe connect: STUN P2P transport failed")?;
+            relay_stdio(stream).await
         }
-        IntentTransport::StunP2p {
-            stun_server,
-            peer_addr,
-            server_name,
-            session_secret_b64,
-        } => connect_stun_p2p(
-            stun_server
-                .parse()
-                .with_context(|| format!("invalid stun_server {stun_server:?}"))?,
-            &StunP2pTarget {
-                peer_addr: peer_addr
-                    .parse()
-                    .with_context(|| format!("invalid stun peer_addr {peer_addr:?}"))?,
-                server_name,
-                cert_sha256_hex: intent.expected_server_identity.cert_sha256_hex,
-                session_secret: decode_secret(&session_secret_b64)?,
-            },
-        )
-        .await
-        .map(|conn| conn.stream)
-        .context("isekai-pipe connect: STUN P2P transport failed")?,
-    };
-
-    relay_stdio(stream).await
+    }
 }
 
 fn resolve_connection_intent(launch: &ConnectLaunch) -> Result<ConnectionIntent> {
@@ -436,6 +455,250 @@ async fn relay_stdio(stream: Box<dyn ByteStream>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn run_relay_resumable(
+    target: &RelayTarget,
+    profile: &str,
+    resume_window: Duration,
+) -> Result<()> {
+    let factory = SystemQuicEndpointFactory;
+    let established = connect_via_relay_resumable(&factory, target).await?;
+    let session_id = established.session_id;
+    drop(established.connection);
+
+    let counters = Arc::new(AppAckCounters::new());
+    let app_ack_tasks = spawn_app_ack_tasks(established.control_stream, counters.clone());
+    let replay = Arc::new(Mutex::new(C2hReplayBuffer::new(C2H_REPLAY_BUFFER_CAPACITY)));
+
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut data_stream = established.data_stream;
+    let mut disconnected_since: Option<Instant> = None;
+    let mut attempt: u32 = 0;
+
+    loop {
+        let (quic_read, quic_write) = data_stream.split();
+        let outcome = run_data_pump(
+            &mut stdin,
+            &mut stdout,
+            quic_read,
+            quic_write,
+            &replay,
+            &counters,
+        )
+        .await;
+        app_ack_tasks.abort();
+
+        if outcome.is_ok() {
+            return Ok(());
+        }
+
+        let deadline = *disconnected_since.get_or_insert_with(Instant::now) + resume_window;
+        let new_stream = loop {
+            let now = Instant::now();
+            if now >= deadline {
+                let exceeded_by = now.saturating_duration_since(deadline);
+                eprintln!(
+                    "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
+                     the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}. \
+                     Closing stdin/stdout; ssh will treat this as a lost connection."
+                );
+                let _ = stdout.shutdown().await;
+                drop(stdin);
+                return Ok(());
+            }
+
+            let delay = RESUME_BACKOFF.base_delay(attempt).min(deadline - now);
+            attempt = attempt.saturating_add(1);
+            tokio::time::sleep(delay).await;
+
+            let client_sent_offset = C2hSentOffset::new(replay.lock().unwrap().end_offset());
+            let client_delivered_offset =
+                H2cClientDeliveredOffset::new(counters.h2c_client_delivered_offset());
+            match reconnect_and_resume(
+                &factory,
+                target,
+                session_id,
+                client_sent_offset,
+                client_delivered_offset,
+            )
+            .await
+            {
+                Ok(mut resumed) => {
+                    drop(resumed.connection);
+                    let to_replay = {
+                        replay
+                            .lock()
+                            .unwrap()
+                            .replay_from(resumed.helper_committed_offset.get())
+                    };
+                    if let Some(bytes) = to_replay {
+                        if !bytes.is_empty() && resumed.data_stream.write_all(&bytes).await.is_err()
+                        {
+                            continue;
+                        }
+                    }
+                    replay
+                        .lock()
+                        .unwrap()
+                        .advance_start(resumed.helper_committed_offset.get());
+                    break resumed.data_stream;
+                }
+                Err(e) => {
+                    eprintln!("isekai-pipe connect: resume attempt {attempt} failed: {e:#}");
+                }
+            }
+        };
+
+        data_stream = new_stream;
+        disconnected_since = None;
+        attempt = 0;
+    }
+}
+
+async fn run_data_pump(
+    stdin: &mut (impl AsyncRead + Unpin),
+    stdout: &mut (impl AsyncWrite + Unpin),
+    quic_read: Box<dyn ByteStreamReadHalf>,
+    quic_write: Box<dyn ByteStreamWriteHalf>,
+    replay: &Arc<Mutex<C2hReplayBuffer>>,
+    counters: &Arc<AppAckCounters>,
+) -> Result<()> {
+    let c2h_fut = pump_c2h(stdin, quic_write, replay.clone(), counters.clone());
+    let h2c_fut = pump_h2c(quic_read, stdout, counters.clone());
+    tokio::pin!(c2h_fut);
+    tokio::pin!(h2c_fut);
+
+    let mut c2h_done = false;
+    let mut h2c_done = false;
+    loop {
+        tokio::select! {
+            res = &mut c2h_fut, if !c2h_done => {
+                res.context("isekai-pipe connect: C2H pump failed")?;
+                c2h_done = true;
+            }
+            res = &mut h2c_fut, if !h2c_done => {
+                res.context("isekai-pipe connect: H2C pump failed")?;
+                h2c_done = true;
+            }
+        }
+        if c2h_done && h2c_done {
+            return Ok(());
+        }
+    }
+}
+
+async fn pump_c2h(
+    stdin: &mut (impl AsyncRead + Unpin),
+    mut quic_write: Box<dyn ByteStreamWriteHalf>,
+    replay: Arc<Mutex<C2hReplayBuffer>>,
+    counters: Arc<AppAckCounters>,
+) -> Result<()> {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        loop {
+            let mut r = replay.lock().unwrap();
+            r.advance_start(counters.c2h_helper_committed_offset());
+            if !r.is_full() {
+                break;
+            }
+            drop(r);
+            tokio::time::sleep(BACKPRESSURE_POLL_INTERVAL).await;
+        }
+
+        let read_len = buf.len().min(replay.lock().unwrap().remaining_capacity());
+        let n = stdin
+            .read(&mut buf[..read_len])
+            .await
+            .context("reading stdin failed")?;
+        if n == 0 {
+            let _ = quic_write.shutdown().await;
+            return Ok(());
+        }
+        quic_write
+            .write_all(&buf[..n])
+            .await
+            .context("writing to remote stream failed")?;
+        replay.lock().unwrap().append(&buf[..n]);
+    }
+}
+
+async fn pump_h2c(
+    mut quic_read: Box<dyn ByteStreamReadHalf>,
+    stdout: &mut (impl AsyncWrite + Unpin),
+    counters: Arc<AppAckCounters>,
+) -> Result<()> {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = quic_read
+            .read(&mut buf)
+            .await
+            .context("reading remote stream failed")?;
+        if n == 0 {
+            return Ok(());
+        }
+        stdout
+            .write_all(&buf[..n])
+            .await
+            .context("writing stdout failed")?;
+        stdout.flush().await.context("flushing stdout failed")?;
+        counters.advance_h2c_client_delivered_offset(n as u64);
+    }
+}
+
+struct C2hReplayBuffer {
+    data: VecDeque<u8>,
+    start_offset: u64,
+    capacity: usize,
+}
+
+impl C2hReplayBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            data: VecDeque::with_capacity(capacity.min(1 << 20)),
+            start_offset: 0,
+            capacity,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.data.len() >= self.capacity
+    }
+
+    fn remaining_capacity(&self) -> usize {
+        self.capacity.saturating_sub(self.data.len())
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        debug_assert!(
+            self.data.len() + bytes.len() <= self.capacity,
+            "C2hReplayBuffer::append called past capacity"
+        );
+        self.data.extend(bytes.iter().copied());
+    }
+
+    fn advance_start(&mut self, confirmed_offset: u64) {
+        let wanted = confirmed_offset.saturating_sub(self.start_offset) as usize;
+        let drop_count = wanted.min(self.data.len());
+        self.data.drain(..drop_count);
+        self.start_offset += drop_count as u64;
+        if confirmed_offset > self.start_offset {
+            self.start_offset = confirmed_offset;
+        }
+    }
+
+    fn end_offset(&self) -> u64 {
+        self.start_offset + self.data.len() as u64
+    }
+
+    fn replay_from(&self, from: u64) -> Option<Vec<u8>> {
+        if from < self.start_offset || from > self.end_offset() {
+            return None;
+        }
+        let skip = (from - self.start_offset) as usize;
+        Some(self.data.iter().skip(skip).copied().collect())
+    }
 }
 
 fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>, ExitCode> {
@@ -579,6 +842,7 @@ mod tests {
         );
         assert!(launch.stdio);
         assert_eq!(launch.mode, ConnectMode::Relay);
+        assert_eq!(launch.resume_window, Duration::from_secs(30));
     }
 
     #[test]
@@ -587,6 +851,7 @@ mod tests {
 
         assert_eq!(launch.profile.as_deref(), Some("production"));
         assert!(launch.stdio);
+        assert_eq!(launch.resume_window, DEFAULT_RESUME_WINDOW);
     }
 
     #[test]
@@ -613,6 +878,31 @@ mod tests {
                 .map(str::to_string)
         )
         .is_err());
+    }
+
+    #[test]
+    fn replay_buffer_replays_unconfirmed_suffix() {
+        let mut buffer = C2hReplayBuffer::new(16);
+        buffer.append(b"hello ");
+        buffer.append(b"world");
+
+        assert_eq!(buffer.end_offset(), 11);
+        assert_eq!(buffer.replay_from(6).unwrap(), b"world");
+        buffer.advance_start(6);
+        assert_eq!(buffer.remaining_capacity(), 11);
+        assert!(buffer.replay_from(0).is_none());
+    }
+
+    #[test]
+    fn replay_buffer_backpressures_at_capacity() {
+        let mut buffer = C2hReplayBuffer::new(4);
+        buffer.append(b"abcd");
+
+        assert!(buffer.is_full());
+        assert_eq!(buffer.remaining_capacity(), 0);
+        buffer.advance_start(2);
+        assert!(!buffer.is_full());
+        assert_eq!(buffer.replay_from(2).unwrap(), b"cd");
     }
 
     #[test]

@@ -109,12 +109,12 @@ PR に詰め込まない。
 - [x] `isekai-pipe connect --profile <name> --service ssh --stdio` の入口を作る。
 - [x] `ConnectionIntent` の runtime-dir 保存と atomic claim を実装する。
 - [x] `connect` が profile/intent から relay/STUN transport を開始する形にする。
-- [ ] 現行 `isekai-ssh connect` の resume pump を `isekai-pipe connect` へ移す。
+- [x] 現行 `isekai-ssh connect` の resume pump を `isekai-pipe connect` へ移す。
 - [ ] `ssh_host:listen_port` 直結は `direct-by-bootstrap-host` mode として残す。
 - [x] ProxyCommand は `isekai-pipe connect --profile "%n" --service ssh --stdio` を基本形にする。
 
 現時点では `isekai-pipe connect` が `ConnectionIntent` を claim し、`isekai_transport` を直接
-起動して stdio bridge を所有する。relay resume pump の移設は後続で行う。
+起動して stdio bridge と relay resume pump を所有する。STUN path は従来どおり non-resumable。
 
 ### P4: isekai-ssh wrapper 化
 
