@@ -1,8 +1,8 @@
 # isekai-ssh
 
-`ssh(1)` の `ProxyCommand` に差し込んで使う単体バイナリ。`isekai-terminal`(Android アプリ)が
-使っている自作ヘルパー `isekai-helper` 経由の QUIC 接続耐性(ローミング・瞬断からの resume・relay
-経由の NAT 越え)を、Android アプリに限らず手元の `ssh` からもそのまま使えるようにする。
+`ssh(1)` のフロントエンドとして動く単体バイナリ。`isekai-terminal`(Android アプリ)が使っている
+自作ヘルパー `isekai-helper` 経由の QUIC 接続耐性(ローミング・瞬断からの resume・relay 経由の
+NAT 越え)を、Android アプリに限らず手元の `ssh` からもそのまま使えるようにする。
 
 設計の背景・各コマンドの詳細な契約は [`ISEKAI_SSH_DESIGN.md`](../../ISEKAI_SSH_DESIGN.md) を、
 `isekai-helper` 側のワイヤプロトコルは [`HELPER_PROTOCOL.md`](../../HELPER_PROTOCOL.md) を参照。
@@ -103,22 +103,36 @@ isekai-ssh init myhost \
 `connect` の信頼判定の正本**であり、未登録のホストへは `connect` は fail closed で一切接続しない
 (下記「トラブルシューティング」参照)。
 
-### 3. 日常的に接続する(`connect` を `ProxyCommand` に登録する)
+### 3. 日常的に接続する(`isekai-ssh` を ssh wrapper として使う)
 
-`~/.ssh/config` に一度書いておけば、以後は普段どおり `ssh myhost` を打つだけでよい。
+`init` 済みの host へは、`ssh` の代わりに `isekai-ssh` を入口にする。
 
+```bash
+isekai-ssh myhost
+isekai-ssh -p 2222 myhost
+isekai-ssh -L 5432:127.0.0.1:5432 myhost
+isekai-ssh myhost 'journalctl -f'
 ```
+
+`isekai-ssh` は OpenSSH を起動し、`ProxyCommand isekai-pipe connect --profile <host> --service ssh --stdio`
+を自動で差し込む。OpenSSH のパスを変えたい場合は `--isekai-ssh-path PATH`、`isekai-pipe` のパスを
+変えたい場合は `--isekai-pipe-path PATH` を使う。
+
+既存の `~/.ssh/config` へ直接書く互換運用も残している。
+
+```sshconfig
 # ~/.ssh/config
 Host myhost
     HostName 10.0.5.20
-    ProxyCommand isekai-ssh connect myhost
+    ProxyCommand isekai-pipe connect --profile myhost --service ssh --stdio
     ServerAliveInterval 30
     ServerAliveCountMax 6
     TCPKeepAlive no
 ```
 
 `ServerAliveInterval`/`ServerAliveCountMax`/`TCPKeepAlive no` は必須ではないが強く推奨する。
-`isekai-ssh connect` は QUIC 接続が切れても `--resume-window`(既定120秒、isekai-helper 側の
+`isekai-pipe connect` は現時点では互換 runtime として `isekai-ssh connect` を起動する。
+QUIC 接続が切れても `--resume-window`(既定120秒、isekai-helper 側の
 既定と揃えてある)の間は resume を試み続けて `ssh` 側の stdin/stdout を閉じずに粘るので、
 `ssh` 自身の生存確認(`ServerAliveInterval × ServerAliveCountMax`)は resume window より
 十分長く設定しておくと、瞬断のたびに `ssh` 自身が先にセッションを諦めてしまう事故を防げる
@@ -132,7 +146,7 @@ Host myhost
 relay を経由しない直結を試したい場合、opt-in で使える。
 
 ```
-ProxyCommand isekai-ssh connect myhost --mode stun --stun-server stun.example.com:3478
+ProxyCommand isekai-pipe connect --profile myhost --service ssh --stdio --mode stun --stun-server stun.example.com:3478
 ```
 
 relay モードと違い、**セッション中に NAT マッピングが失われる(Wi-Fi⇔モバイル回線のローミング等)と

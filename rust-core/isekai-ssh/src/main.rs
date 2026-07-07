@@ -21,6 +21,7 @@ mod connect;
 mod init;
 mod login;
 mod resume;
+mod wrapper;
 
 use clap::Parser;
 
@@ -39,29 +40,45 @@ async fn main() {
     // stderr explicitly rather than relying on env_logger's default target,
     // which callers should not have to trust blindly to stay stderr-only
     // across dependency upgrades.
-    env_logger::Builder::from_default_env().target(env_logger::Target::Stderr).init();
+    env_logger::Builder::from_default_env()
+        .target(env_logger::Target::Stderr)
+        .init();
 
-    let cli = cli::Cli::parse();
-    let result = match cli.command {
-        cli::Command::Connect(args) => connect::run(args).await,
-        cli::Command::Init(args) => init::run(args).await,
-        cli::Command::Login(args) => login::run(args).await,
-        cli::Command::Logout => login::run_logout().await,
-    };
-
-    let exit_code: u8 = match result {
-        Ok(()) => 0,
-        Err(err) => {
-            // stdout purity: errors are only ever printed to stderr, never
-            // stdout (see connect.rs's module docs; `ssh`'s ProxyCommand
-            // treats our stdout as raw SSH bytes).
-            eprintln!("{err:?}");
-            let is_trust_not_initialized =
-                err.chain().any(|cause| cause.downcast_ref::<connect::TrustNotInitialized>().is_some());
-            if is_trust_not_initialized {
-                EXIT_TRUST_NOT_INITIALIZED
-            } else {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let exit_code: u8 = if wrapper::should_run_wrapper(&raw_args) {
+        match wrapper::run(raw_args).await {
+            Ok(code) => code,
+            Err(err) => {
+                eprintln!("{err:?}");
                 EXIT_OTHER_ERROR
+            }
+        }
+    } else {
+        let cli = cli::Cli::parse();
+        let result = match cli.command {
+            cli::Command::Connect(args) => connect::run(args).await,
+            cli::Command::Init(args) => init::run(args).await,
+            cli::Command::Login(args) => login::run(args).await,
+            cli::Command::Logout => login::run_logout().await,
+        };
+
+        match result {
+            Ok(()) => 0,
+            Err(err) => {
+                // stdout purity: errors are only ever printed to stderr, never
+                // stdout (see connect.rs's module docs; `ssh`'s ProxyCommand
+                // treats our stdout as raw SSH bytes).
+                eprintln!("{err:?}");
+                let is_trust_not_initialized = err.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<connect::TrustNotInitialized>()
+                        .is_some()
+                });
+                if is_trust_not_initialized {
+                    EXIT_TRUST_NOT_INITIALIZED
+                } else {
+                    EXIT_OTHER_ERROR
+                }
             }
         }
     };

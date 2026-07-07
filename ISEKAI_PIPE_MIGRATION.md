@@ -117,11 +117,14 @@ PR に詰め込まない。
 
 ### P4: isekai-ssh wrapper 化
 
-- [ ] `isekai-ssh [SSH_OPTIONS] destination [command...]` を入口にする。
+- [x] `isekai-ssh [SSH_OPTIONS] destination [command...]` を入口にする。
 - [ ] `ssh -G` と `#@isekai` を使って logical host と bootstrap candidate を解決する。
 - [ ] 必要に応じて `isekai-pipe serve` を配布・起動する。
 - [ ] ConnectionIntent を作り、OpenSSH を `ProxyCommand isekai-pipe connect ...` 付きで起動する。
 - [ ] stdout/stderr 契約を整理する。OpenSSH の byte stream は `isekai-pipe connect` の stdout のみ。
+
+現時点では `isekai-ssh` が OpenSSH に `ProxyCommand isekai-pipe connect --profile <destination>
+--service ssh --stdio` を注入する。bootstrap / ConnectionIntent 生成 / `ssh -G` 解析は後続で行う。
 
 ### P5: 旧名整理
 
