@@ -92,7 +92,7 @@ step0_precheck() {
 
 step0_install_launch() {
     echo "== debug APK インストール =="
-    adb install -r "$REPO_DIR/app/build/outputs/apk/debug/app-debug.apk"
+    adb install -r "$REPO_DIR/android/build/outputs/apk/debug/android-debug.apk"
     echo "== アプリ起動 =="
     adb shell am start -n "${PKG}/.MainActivity"
     echo "この後、プロファイル一覧からテスト対象プロファイルをタップして手動接続してください。"

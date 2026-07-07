@@ -1,6 +1,6 @@
 # Android build
 /build/
-/app/build/
+/android/build/
 /.gradle/
 /.kotlin/
 *.apk
@@ -9,9 +9,14 @@
 # Rust build
 /rust-core/target/
 # cargoBuildRustCore Gradle task regenerates this; do not commit prebuilt binaries.
-/app/src/main/jniLibs/
+/android/src/main/jniLibs/
 # build-ios-xcframework.sh regenerates this; do not commit prebuilt binaries.
 /ios/Frameworks/
+# Xcode per-user state / SwiftPM local caches (not shared project config).
+/ios/App/*.xcodeproj/xcuserdata/
+/ios/App/*.xcodeproj/project.xcworkspace/xcuserdata/
+/ios/.swiftpm/
+/ios/.build/
 
 # IDE
 /.idea/

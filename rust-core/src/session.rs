@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,6 +80,13 @@ pub(crate) struct SessionCore {
     /// Phase 12: per-session theme。このセッション(タブ)が現在使っているテーマの
     /// スナップショット。[scrollback_cells]の空白パディング色にもここから使う。
     current_theme: Mutex<Theme>,
+    /// Phase 1C(#26): [notify_network_lost]が「ハンドシェイク中か接続済みか」を
+    /// 判断するために見る。`start()`でfalseにリセットし、`TransportEvent::Connected`
+    /// を受け取った時点で`session_event_loop`がtrueにする(Android版
+    /// `SessionOrchestrator`の`ConnPhase`と同種の情報だが、iOSは`SessionOrchestrator`
+    /// を経由しない低レベルセッションを直接使うため、ここ`SessionCore`に持たせる
+    /// 必要がある)。
+    connected: Arc<AtomicBool>,
     /// [start] に渡された callback の複製。ブートストラップ用 SSH 接続
     /// （`helper_quic_transport::bootstrap_helper_via_ssh` 等、isekai-helper を
     /// 起動するための踏み台 SSH）が発火する `TransportEvent::HostKey` を、本セッションの
@@ -98,6 +106,7 @@ impl SessionCore {
             scrollback: Arc::new(Mutex::new(VecDeque::new())),
             screen_cols: Mutex::new(80),
             current_theme: Mutex::new(Theme::default()),
+            connected: Arc::new(AtomicBool::new(false)),
             callback: Mutex::new(None),
         }
     }
@@ -116,6 +125,7 @@ impl SessionCore {
         *self.session_tx.lock() = Some(session_cmd_tx);
         *self.screen_cols.lock() = cols;
         self.scrollback.lock().clear();
+        self.connected.store(false, Ordering::SeqCst);
         // 接続(タブ作成)時点のグローバル既定テーマをスナップショットする。呼び出し側
         // (Kotlin)がプロファイル固有のテーマを使いたい場合は、この直後に[set_theme]を
         // 呼んで明示的に上書きする。
@@ -125,9 +135,10 @@ impl SessionCore {
         let callback: Arc<dyn SessionCallback> = Arc::from(callback);
         *self.callback.lock() = Some(Arc::clone(&callback));
         let scrollback = self.scrollback.clone();
+        let connected = self.connected.clone();
 
         RUNTIME.spawn(async move {
-            session_event_loop(event_rx, session_cmd_rx, cmd_tx, callback, scrollback, cols, rows, initial_theme).await;
+            session_event_loop(event_rx, session_cmd_rx, cmd_tx, callback, scrollback, connected, cols, rows, initial_theme).await;
         });
 
         (cmd_rx, event_tx)
@@ -228,6 +239,42 @@ impl SessionCore {
     pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
         self.send_session_cmd(SessionCmd::TrzszCancel { transfer_id });
     }
+
+    /// Phase 1C(#26): OSからネットワーク断(Wi-Fi/セルラー消失等)を通知された時の対応を
+    /// 決める。`SessionOrchestrator::notify_network_lost`(Android版が使う)と同じ方針
+    /// (QUIC接続はパス変更に自前で耐えられるため無視し、ハンドシェイク中やプレーンTCPは
+    /// 切断扱いにする)を、iOSが直接使う低レベルセッション(`SshSession`/
+    /// `HelperQuicSession`等)側でも成立させる。呼び出し側(Swift)はOSの生イベントを
+    /// そのまま転送するだけで、判断はこの関数(Rust SSOT)が行う。
+    pub(crate) fn notify_network_lost(&self, is_quic: bool) {
+        let has_session = self.handle_tx.lock().is_some();
+        let connected = self.connected.load(Ordering::SeqCst);
+        if should_abort_on_network_lost(has_session, connected, is_quic) {
+            log::warn!(
+                "session: network lost — aborting (is_quic={is_quic}, connected={connected})"
+            );
+            self.disconnect();
+        } else {
+            log::info!(
+                "session: network lost — ignoring (has_session={has_session}, is_quic={is_quic}, connected={connected})"
+            );
+        }
+    }
+}
+
+/// [SessionCore::notify_network_lost]の判断ロジック本体。実チャネル/AtomicBoolから
+/// 切り離した純粋関数にすることで、tokioタスクを起動せずに全パターンを単体テストできる。
+fn should_abort_on_network_lost(has_session: bool, connected: bool, is_quic: bool) -> bool {
+    if !has_session {
+        // 維持すべき接続がそもそも無い(Idle)。
+        return false;
+    }
+    if connected && is_quic {
+        // 接続済みQUICはtransport自身のtransparent resumeを信頼し、何もしない。
+        return false;
+    }
+    // ハンドシェイク中(connected==false)、または接続済み非QUIC(プレーンSSH等)。
+    true
 }
 
 // ── session event loop（薄い async ラッパー）──────────────
@@ -238,6 +285,7 @@ pub(crate) async fn session_event_loop(
     transport_cmd_tx: tokio::sync::mpsc::Sender<TransportCommand>,
     callback: Arc<dyn SessionCallback>,
     scrollback: Arc<Mutex<VecDeque<Vec<TermCell>>>>,
+    connected: Arc<AtomicBool>,
     init_cols: u32,
     init_rows: u32,
     initial_theme: Theme,
@@ -267,6 +315,7 @@ pub(crate) async fn session_event_loop(
                     None
                 }
                 Some(TransportEvent::Connected) => {
+                    connected.store(true, Ordering::SeqCst);
                     callback.on_connected(); None
                 }
                 Some(TransportEvent::Stdout(bytes)) => {
@@ -284,6 +333,7 @@ pub(crate) async fn session_event_loop(
                 }
                 Some(TransportEvent::Disconnected { reason }) => {
                     info!("session: disconnected reason={:?}", reason);
+                    connected.store(false, Ordering::SeqCst);
                     callback.on_disconnected(reason); break 'outer;
                 }
                 Some(TransportEvent::NoViablePath) => {
@@ -292,6 +342,7 @@ pub(crate) async fn session_event_loop(
                 }
                 None => {
                     info!("session: event channel closed");
+                    connected.store(false, Ordering::SeqCst);
                     callback.on_disconnected(None); break 'outer;
                 }
             },
@@ -401,8 +452,38 @@ fn dispatch_result(
     }
 }
 
-// ── Tests ──────────────────────────────────────────────────
-//
+// ── Tests ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod should_abort_on_network_lost_tests {
+    use super::should_abort_on_network_lost;
+
+    #[test]
+    fn idle_is_always_ignored() {
+        assert!(!should_abort_on_network_lost(false, false, false));
+        assert!(!should_abort_on_network_lost(false, false, true));
+        // has_session=falseならconnectedは実質意味を持たないが念のため網羅する。
+        assert!(!should_abort_on_network_lost(false, true, false));
+        assert!(!should_abort_on_network_lost(false, true, true));
+    }
+
+    #[test]
+    fn handshake_in_progress_is_always_aborted_regardless_of_transport() {
+        assert!(should_abort_on_network_lost(true, false, false));
+        assert!(should_abort_on_network_lost(true, false, true));
+    }
+
+    #[test]
+    fn connected_quic_is_ignored_trusting_transparent_resume() {
+        assert!(!should_abort_on_network_lost(true, true, true));
+    }
+
+    #[test]
+    fn connected_non_quic_is_aborted() {
+        assert!(should_abort_on_network_lost(true, true, false));
+    }
+}
+
 // `SessionCore::scrollback_cells`(オフセット/行数からscrollbackを切り出す表示ロジック)
 // と`dispatch_result`のscrollback上限トリミングは、実SSH/QUIC接続もTokioランタイムも
 // 不要な純粋なデータ変換だが、`session.rs`にはテストが1つも無かった。

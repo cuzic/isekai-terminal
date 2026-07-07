@@ -77,8 +77,8 @@ jobs:
       - name: Generate Swift bindings and check for drift
         run: |
           bash rust-core/scripts/generate-swift-bindings.sh
-          git diff --exit-code -- ios/Sources/IsekaiTerminalCore/generated || {
-            echo "::error::ios/Sources/IsekaiTerminalCore/generated is stale. Run rust-core/scripts/generate-swift-bindings.sh and commit the result." >&2
+          git diff --exit-code -- ios/Sources/IsekaiTerminalCoreLogic/generated || {
+            echo "::error::ios/Sources/IsekaiTerminalCoreLogic/generated is stale. Run rust-core/scripts/generate-swift-bindings.sh and commit the result." >&2
             exit 1
           }
 
@@ -117,12 +117,16 @@ jobs:
 
       - name: Run round-trip test on iOS Simulator
         working-directory: ios
+        # CODE_SIGNING_ALLOWED=NOで署名を完全に無効化すると、Keychain APIが
+        # errSecMissingEntitlement(-34018)で失敗する(未署名プロセスはOSが
+        # どのアプリのKeychainか判定できないため)。CredentialVault(Phase 1B)の
+        # テスト追加で発覚。署名は無効化せず、Xcodeの自動ローカル署名
+        # (Apple Developerアカウント不要、Simulator向けなら成立する)に任せる。
         run: |
           xcodebuild -list
           xcodebuild test \
-            -scheme IsekaiTerminalCore \
-            -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}' \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+            -scheme IsekaiTerminalCore-Package \
+            -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}'
 
       - name: Upload XCFramework
         if: always()

@@ -11,10 +11,10 @@ Rust(UniFFI 経由)の `rust-core`(crate 名 `isekai-terminal-core`)からなる
 
 ## ディレクトリ構成
 
-- `app/` — Kotlin/Compose UI 層(`tools.isekai.terminal` パッケージ)。
-  `app/src/main` 本体、`app/src/debug` は debug ビルドのみ含まれるデバッグ専用コード
-  (実機フォルト注入レシーバー等)、`app/src/test`(Robolectric/JVM)、
-  `app/src/androidTest`(実機/エミュレータ)。
+- `android/` — Kotlin/Compose UI 層(`tools.isekai.terminal` パッケージ)。
+  `android/src/main` 本体、`android/src/debug` は debug ビルドのみ含まれるデバッグ専用コード
+  (実機フォルト注入レシーバー等)、`android/src/test`(Robolectric/JVM)、
+  `android/src/androidTest`(実機/エミュレータ)。
 - `rust-core/` — Cargo workspace。
   - `src/`(crate `isekai-terminal-core`, cdylib名 `isekai_terminal_core`): SSH(russh)・VT100/VTEパーサー・
     trzsz転送FSM・QUIC transport・resume/multipath ロジック。UniFFI で Kotlin に公開。
@@ -23,7 +23,7 @@ Rust(UniFFI 経由)の `rust-core`(crate 名 `isekai-terminal-core`)からなる
     (`isekai-protocol`/`isekai-trust`/`isekai-auth`/`isekai-transport`/`isekai-bootstrap`から
     構成)で、`isekai-helper`経由のQUIC接続耐性をAndroidアプリ以外の`ssh`からも使えるようにする。
     利用者向けガイドは`rust-core/isekai-ssh/README.md`、設計は`ISEKAI_SSH_DESIGN.md`参照。
-  - `uniffi-bindgen/`: Kotlin バインディング(`app/src/main/kotlin/uniffi/isekai_terminal_core/isekai_terminal_core.kt`)
+  - `uniffi-bindgen/`: Kotlin バインディング(`android/src/main/kotlin/uniffi/isekai_terminal_core/isekai_terminal_core.kt`)
     生成用。
   - `noq-multipath-spike/`: `noq`(quinn の multipath フォーク)の実機検証用の使い捨てコード。
 - `PLAN.md` — 実装計画と各 Phase(0〜9)の設計・実機検証結果の記録。最新の設計判断のSSOT。
@@ -61,7 +61,7 @@ cargo run -p uniffi-bindgen -- generate --library target/debug/libisekai_termina
   worktree/エージェントが同時に新しいマイグレーションを追加すると番号を奪い合い、後から
   再採番する fixup コミットが必要になる(実際に複数回発生済み)。新しい migration を書く前に
   必ず `scripts/reserve-room-migration.sh <owner-slug>` を実行してバージョン番号を予約すること
-  (詳細は `app/migration_registry.toml` 参照)。CI(`room-migration-check.yml`)が
+  (詳細は `android/migration_registry.toml` 参照)。CI(`room-migration-check.yml`)が
   `AppDatabase.kt` の版数と migration チェーンの整合性を検証する。
 
 ## コミット規約

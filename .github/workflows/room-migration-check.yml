@@ -4,19 +4,19 @@ name: Room migration consistency check
 # 複数の並行作業(worktree/エージェント)が同時に新しいマイグレーションを追加すると、
 # 同じ version 番号を奪い合って後から再採番が必要になる問題(実際に過去複数回発生、
 # PLAN.md「Phase 10完了後の外部レビュー」参照)を早期に検出するためのゲート。
-# 詳細は app/migration_registry.toml と scripts/check-room-migrations.sh を参照。
+# 詳細は android/migration_registry.toml と scripts/check-room-migrations.sh を参照。
 
 on:
   push:
     branches: [main]
     paths:
-      - "app/src/main/kotlin/tools/isekai/terminal/data/AppDatabase.kt"
-      - "app/migration_registry.toml"
+      - "android/src/main/kotlin/tools/isekai/terminal/data/AppDatabase.kt"
+      - "android/migration_registry.toml"
       - "scripts/check-room-migrations.sh"
   pull_request:
     paths:
-      - "app/src/main/kotlin/tools/isekai/terminal/data/AppDatabase.kt"
-      - "app/migration_registry.toml"
+      - "android/src/main/kotlin/tools/isekai/terminal/data/AppDatabase.kt"
+      - "android/migration_registry.toml"
       - "scripts/check-room-migrations.sh"
   workflow_dispatch:
 

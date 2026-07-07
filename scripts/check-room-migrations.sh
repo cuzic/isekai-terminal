@@ -3,17 +3,17 @@
 # ローカルの両方から実行できる。
 #
 # 検証内容:
-#  1. AppDatabase.kt の @Database(version = N) と app/migration_registry.toml の
+#  1. AppDatabase.kt の @Database(version = N) と android/migration_registry.toml の
 #     current が一致していること。
 #  2. AppDatabase.kt 内の Migration(X, Y) が 1 -> N まで、欠番・重複無く連続していること
 #     (各マイグレーションは必ず Y = X + 1 であること前提)。
-#  3. app/migration_registry.toml の [[reserved]] に current 以下の版が残っていないこと
+#  3. android/migration_registry.toml の [[reserved]] に current 以下の版が残っていないこと
 #     (マージ後の削除し忘れの検出)。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DB_FILE="$ROOT/app/src/main/kotlin/tools/isekai/terminal/data/AppDatabase.kt"
-REGISTRY="$ROOT/app/migration_registry.toml"
+DB_FILE="$ROOT/android/src/main/kotlin/tools/isekai/terminal/data/AppDatabase.kt"
+REGISTRY="$ROOT/android/migration_registry.toml"
 
 fail() {
   echo "ERROR: $*" >&2
@@ -66,7 +66,7 @@ STALE=$(grep -E '^version = ' "$REGISTRY" | sed -E 's/^version = ([0-9]+).*/\1/'
   | awk -v cur="$REGISTRY_CURRENT" '$1 <= cur' || true)
 if [ -n "$STALE" ]; then
   echo "$STALE" >&2
-  fail "app/migration_registry.toml has [[reserved]] entries <= current ($REGISTRY_CURRENT); \
+  fail "android/migration_registry.toml has [[reserved]] entries <= current ($REGISTRY_CURRENT); \
 remove them after merging (see file header)."
 fi
 
