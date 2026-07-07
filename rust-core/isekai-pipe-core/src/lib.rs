@@ -12,6 +12,8 @@ pub use isekai_pipe_protocol::{LogicalHost, ServiceName};
 
 pub const CONNECTION_INTENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_INTENT_TTL: Duration = Duration::from_secs(120);
+pub const DEFAULT_CANDIDATE_RACE_DELAY_MS: u64 = 150;
+pub const DEFAULT_RELAY_DELAY_MS: u64 = 750;
 
 /// A remote service exposed by `isekai-pipe serve`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,8 +90,20 @@ pub struct ConnectionIntent {
     pub peer_id: String,
     pub expected_server_identity: ServerIdentity,
     pub service: String,
+    #[serde(default)]
+    pub link_endpoints: Vec<String>,
+    #[serde(default)]
+    pub rendezvous: Vec<String>,
+    #[serde(default)]
+    pub stun_servers: Vec<String>,
+    #[serde(default)]
+    pub relay_endpoints: Vec<String>,
     pub transport: IntentTransport,
     pub relay_policy: RelayPolicy,
+    #[serde(default = "default_candidate_race_delay_ms")]
+    pub candidate_race_delay_ms: u64,
+    #[serde(default = "default_relay_delay_ms")]
+    pub relay_delay_ms: u64,
     pub punch_generation: u64,
     pub created_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
@@ -114,8 +128,14 @@ impl ConnectionIntent {
             profile,
             expected_server_identity,
             service: service.into(),
+            link_endpoints: Vec::new(),
+            rendezvous: Vec::new(),
+            stun_servers: Vec::new(),
+            relay_endpoints: Vec::new(),
             transport,
             relay_policy: RelayPolicy::RelayAllowed,
+            candidate_race_delay_ms: DEFAULT_CANDIDATE_RACE_DELAY_MS,
+            relay_delay_ms: DEFAULT_RELAY_DELAY_MS,
             punch_generation: 0,
             created_at_unix_ms: now,
             expires_at_unix_ms: expires,
@@ -132,6 +152,14 @@ impl ConnectionIntent {
         }
         Ok(())
     }
+}
+
+fn default_candidate_race_delay_ms() -> u64 {
+    DEFAULT_CANDIDATE_RACE_DELAY_MS
+}
+
+fn default_relay_delay_ms() -> u64 {
+    DEFAULT_RELAY_DELAY_MS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,6 +402,12 @@ mod tests {
                 key: "production:22".to_string(),
             },
         );
+        assert_eq!(intent.link_endpoints, Vec::<String>::new());
+        assert_eq!(
+            intent.candidate_race_delay_ms,
+            DEFAULT_CANDIDATE_RACE_DELAY_MS
+        );
+        assert_eq!(intent.relay_delay_ms, DEFAULT_RELAY_DELAY_MS);
 
         write_connection_intent(&root, &intent).unwrap();
         let claimed = claim_connection_intent(&root, &intent.intent_id).unwrap();

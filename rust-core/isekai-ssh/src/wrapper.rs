@@ -13,7 +13,8 @@ use std::process::Stdio;
 use anyhow::{anyhow, Context, Result};
 use isekai_pipe_core::{
     default_runtime_dir, write_connection_intent, BootstrapProvenance, ConnectionIntent,
-    IntentTransport, ServerIdentity, ServiceSpec,
+    IntentTransport, ServerIdentity, ServiceSpec, DEFAULT_CANDIDATE_RACE_DELAY_MS,
+    DEFAULT_RELAY_DELAY_MS,
 };
 use tokio::process::Command;
 
@@ -55,6 +56,14 @@ struct IsekaiConfig {
     remote_path: Option<String>,
     services: Vec<ServiceSpec>,
     bootstrap_candidates: Vec<BootstrapCandidate>,
+    link_endpoints: Vec<String>,
+    rendezvous: Vec<String>,
+    stun_servers: Vec<String>,
+    relay_endpoints: Vec<String>,
+    resume_grace_secs: u64,
+    candidate_race_delay_ms: u64,
+    relay_delay_ms: u64,
+    install_mode: InstallMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +78,12 @@ struct BootstrapCandidate {
     target: String,
     via: Vec<String>,
     priority: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallMode {
+    User,
+    System,
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +193,7 @@ fn build_connection_intent(resolution: &WrapperResolution) -> Result<ConnectionI
         )
     })?;
 
-    Ok(ConnectionIntent::new(
+    let mut intent = ConnectionIntent::new(
         resolution.isekai.profile.clone(),
         primary_service(&resolution.isekai).name().as_str(),
         ServerIdentity {
@@ -190,7 +205,14 @@ fn build_connection_intent(resolution: &WrapperResolution) -> Result<ConnectionI
             session_secret_b64: entry.cached_session_secret.clone(),
         },
         BootstrapProvenance::TrustStore { key },
-    ))
+    );
+    intent.link_endpoints = resolution.isekai.link_endpoints.clone();
+    intent.rendezvous = resolution.isekai.rendezvous.clone();
+    intent.stun_servers = resolution.isekai.stun_servers.clone();
+    intent.relay_endpoints = resolution.isekai.relay_endpoints.clone();
+    intent.candidate_race_delay_ms = resolution.isekai.candidate_race_delay_ms;
+    intent.relay_delay_ms = resolution.isekai.relay_delay_ms;
+    Ok(intent)
 }
 
 fn primary_service(config: &IsekaiConfig) -> &ServiceSpec {
@@ -345,6 +367,14 @@ fn resolve_isekai_config(
         remote_path: None,
         services: Vec::new(),
         bootstrap_candidates: Vec::new(),
+        link_endpoints: Vec::new(),
+        rendezvous: Vec::new(),
+        stun_servers: Vec::new(),
+        relay_endpoints: Vec::new(),
+        resume_grace_secs: None,
+        candidate_race_delay_ms: None,
+        relay_delay_ms: None,
+        install_mode: None,
     };
     for directive in directives {
         apply_isekai_directive(&mut builder, directive)?;
@@ -372,6 +402,16 @@ fn resolve_isekai_config(
         remote_path: builder.remote_path,
         services: builder.services,
         bootstrap_candidates: builder.bootstrap_candidates,
+        link_endpoints: builder.link_endpoints,
+        rendezvous: builder.rendezvous,
+        stun_servers: builder.stun_servers,
+        relay_endpoints: builder.relay_endpoints,
+        resume_grace_secs: builder.resume_grace_secs.unwrap_or(120),
+        candidate_race_delay_ms: builder
+            .candidate_race_delay_ms
+            .unwrap_or(DEFAULT_CANDIDATE_RACE_DELAY_MS),
+        relay_delay_ms: builder.relay_delay_ms.unwrap_or(DEFAULT_RELAY_DELAY_MS),
+        install_mode: builder.install_mode.unwrap_or(InstallMode::User),
     })
 }
 
@@ -383,6 +423,14 @@ struct IsekaiConfigBuilder {
     remote_path: Option<String>,
     services: Vec<ServiceSpec>,
     bootstrap_candidates: Vec<BootstrapCandidate>,
+    link_endpoints: Vec<String>,
+    rendezvous: Vec<String>,
+    stun_servers: Vec<String>,
+    relay_endpoints: Vec<String>,
+    resume_grace_secs: Option<u64>,
+    candidate_race_delay_ms: Option<u64>,
+    relay_delay_ms: Option<u64>,
+    install_mode: Option<InstallMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,16 +489,51 @@ fn apply_isekai_directive(
                 .push(parse_bootstrap_candidate(&directive.args)?);
             Ok(())
         }
-        "link"
-        | "rendezvous"
-        | "stun"
-        | "relay"
-        | "resume-grace"
-        | "candidate-race-delay"
-        | "relay-delay"
-        | "install-mode" => Ok(()),
+        "link" => append_args(&mut builder.link_endpoints, &directive),
+        "rendezvous" => append_args(&mut builder.rendezvous, &directive),
+        "stun" => append_args(&mut builder.stun_servers, &directive),
+        "relay" => append_args(&mut builder.relay_endpoints, &directive),
+        "resume-grace" => set_once(
+            &mut builder.resume_grace_secs,
+            parse_duration_ms(one_arg(&directive)?, "resume-grace")?.div_ceil(1000),
+            "resume-grace",
+        ),
+        "candidate-race-delay" => set_once(
+            &mut builder.candidate_race_delay_ms,
+            parse_duration_ms(one_arg(&directive)?, "candidate-race-delay")?,
+            "candidate-race-delay",
+        ),
+        "relay-delay" => set_once(
+            &mut builder.relay_delay_ms,
+            parse_duration_ms(one_arg(&directive)?, "relay-delay")?,
+            "relay-delay",
+        ),
+        "install-mode" => set_once(
+            &mut builder.install_mode,
+            match one_arg(&directive)? {
+                "user" => InstallMode::User,
+                "system" => InstallMode::System,
+                other => {
+                    return Err(anyhow!(
+                        "isekai-ssh: invalid #@isekai install-mode {other:?}"
+                    ))
+                }
+            },
+            "install-mode",
+        ),
         other => Err(anyhow!("isekai-ssh: unknown #@isekai directive {other:?}")),
     }
+}
+
+fn append_args(target: &mut Vec<String>, directive: &IsekaiDirective) -> Result<()> {
+    if directive.args.is_empty() {
+        return Err(anyhow!(
+            "isekai-ssh: #@isekai {} expects at least one argument",
+            directive.name
+        ));
+    }
+    target.extend(directive.args.iter().cloned());
+    Ok(())
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<()> {
@@ -477,6 +560,22 @@ fn parse_yes_no(value: &str) -> Result<bool> {
         "no" | "false" | "off" | "0" => Ok(false),
         _ => Err(anyhow!("isekai-ssh: expected yes/no, got {value:?}")),
     }
+}
+
+fn parse_duration_ms(value: &str, field: &str) -> Result<u64> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1000)
+    } else {
+        (value, 1000)
+    };
+    let amount: u64 = number
+        .parse()
+        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai {field} duration {value:?}"))?;
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("isekai-ssh: #@isekai {field} duration is too large"))
 }
 
 fn parse_bootstrap_candidate(args: &[String]) -> Result<BootstrapCandidate> {
@@ -899,12 +998,26 @@ cached_session_secret = "c2VjcmV0"
                 remote_path: None,
                 services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
                 bootstrap_candidates: Vec::new(),
+                link_endpoints: vec!["https://link.example.com".to_string()],
+                rendezvous: vec!["https://rendezvous.example.com".to_string()],
+                stun_servers: vec!["stun1.example.com:3478".to_string()],
+                relay_endpoints: vec!["masque://relay.example.com".to_string()],
+                resume_grace_secs: 120,
+                candidate_race_delay_ms: 150,
+                relay_delay_ms: 750,
+                install_mode: InstallMode::User,
             },
         };
         let intent = build_connection_intent(&resolution).unwrap();
 
         assert_eq!(intent.profile, "production");
         assert_eq!(intent.service, "ssh");
+        assert_eq!(intent.link_endpoints, vec!["https://link.example.com"]);
+        assert_eq!(intent.rendezvous, vec!["https://rendezvous.example.com"]);
+        assert_eq!(intent.stun_servers, vec!["stun1.example.com:3478"]);
+        assert_eq!(intent.relay_endpoints, vec!["masque://relay.example.com"]);
+        assert_eq!(intent.candidate_race_delay_ms, 150);
+        assert_eq!(intent.relay_delay_ms, 750);
         assert_eq!(
             intent.transport,
             IntentTransport::Relay {
@@ -947,6 +1060,14 @@ Host production
     #@isekai bootstrap-candidate target=10.20.0.15:22 via=bastion,edge priority=120
     #@isekai remote-path ~/.local/bin/isekai-pipe
     #@isekai service ssh=127.0.0.1:2222
+    #@isekai link https://link.example.com
+    #@isekai rendezvous https://rendezvous.example.com
+    #@isekai stun stun1.example.com:3478
+    #@isekai relay masque://relay.example.com
+    #@isekai resume-grace 180s
+    #@isekai candidate-race-delay 250ms
+    #@isekai relay-delay 900ms
+    #@isekai install-mode system
 
 Host *
     #@isekai service postgres=127.0.0.1:5432
@@ -978,6 +1099,14 @@ Host *
                 priority: 120,
             }]
         );
+        assert_eq!(resolved.link_endpoints, vec!["https://link.example.com"]);
+        assert_eq!(resolved.rendezvous, vec!["https://rendezvous.example.com"]);
+        assert_eq!(resolved.stun_servers, vec!["stun1.example.com:3478"]);
+        assert_eq!(resolved.relay_endpoints, vec!["masque://relay.example.com"]);
+        assert_eq!(resolved.resume_grace_secs, 180);
+        assert_eq!(resolved.candidate_race_delay_ms, 250);
+        assert_eq!(resolved.relay_delay_ms, 900);
+        assert_eq!(resolved.install_mode, InstallMode::System);
     }
 
     #[test]
@@ -1005,5 +1134,12 @@ Host *
                 priority: 100,
             }]
         );
+        assert_eq!(resolved.link_endpoints, Vec::<String>::new());
+        assert_eq!(
+            resolved.candidate_race_delay_ms,
+            DEFAULT_CANDIDATE_RACE_DELAY_MS
+        );
+        assert_eq!(resolved.relay_delay_ms, DEFAULT_RELAY_DELAY_MS);
+        assert_eq!(resolved.install_mode, InstallMode::User);
     }
 }
