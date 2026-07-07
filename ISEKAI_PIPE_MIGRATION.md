@@ -89,24 +89,31 @@ PR に詰め込まない。
 
 ### P1: isekai-pipe skeleton
 
-- [ ] `isekai-pipe-protocol`、`isekai-pipe-core`、`isekai-pipe` の crate 境界を作る。
-- [ ] まずは既存 `isekai-protocol` / `isekai-transport` を再利用し、重複実装を避ける。
-- [ ] `isekai-pipe` binary に `connect` / `serve` / `probe` / `inspect` の CLI skeleton を置く。
-- [ ] 既存 `isekai-helper` binary は削除せず、互換入口として残す。
+- [x] `isekai-pipe-protocol`、`isekai-pipe-core`、`isekai-pipe` の crate 境界を作る。
+- [x] まずは既存 `isekai-protocol` / `isekai-transport` を再利用し、重複実装を避ける。
+- [x] `isekai-pipe` binary に `connect` / `serve` / `probe` / `inspect` の CLI skeleton を置く。
+- [x] 既存 `isekai-helper` binary は削除せず、互換入口として残す。
 
 ### P2: serve 移行
 
-- [ ] `isekai-helper` の機能を `isekai-pipe serve --service ssh=127.0.0.1:22` へ寄せる。
-- [ ] `--target` は `--service` の単一 service 互換 alias とする。
+- [x] `isekai-helper` の機能を `isekai-pipe serve --service ssh=127.0.0.1:22` へ寄せる。
+- [x] `--target` は `--service` の単一 service 互換 alias とする。
 - [ ] STUN / relay / resume session table / service target を serve 側責務として整理する。
 - [ ] handshake JSON を peer/service/candidate 表現へ拡張する。ただし旧 client が読む字段は維持する。
 
+現時点では `isekai-pipe serve` が sibling の `isekai-helper` を起動する互換レイヤとして
+動作する。serve runtime の library 化と protocol 名の更新は後続で行う。
+
 ### P3: connect 移行
 
+- [x] `isekai-pipe connect --profile <name> --service ssh --stdio` の入口を作る。
 - [ ] 現行 `isekai-ssh connect` の stdio relay と resume pump を `isekai-pipe connect` へ移す。
 - [ ] `connect` が profile/intent から candidate 収集を始める形にする。
 - [ ] `ssh_host:listen_port` 直結は `direct-by-bootstrap-host` mode として残す。
-- [ ] ProxyCommand は `isekai-pipe connect --profile "%n" --service ssh --stdio` を基本形にする。
+- [x] ProxyCommand は `isekai-pipe connect --profile "%n" --service ssh --stdio` を基本形にする。
+
+現時点では `isekai-pipe connect` が sibling の `isekai-ssh connect` を起動する互換レイヤとして
+動作する。stdout は legacy runtime から継承し、ProxyCommand の byte stream 契約を維持する。
 
 ### P4: isekai-ssh wrapper 化
 

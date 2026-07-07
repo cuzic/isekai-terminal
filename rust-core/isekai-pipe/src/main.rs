@@ -13,8 +13,8 @@ fn print_help() {
     println!("    isekai-pipe <COMMAND> [OPTIONS]");
     println!();
     println!("COMMANDS:");
-    println!("    connect    local stdio/TCP side (skeleton)");
-    println!("    serve      remote service side (skeleton)");
+    println!("    connect    local stdio side");
+    println!("    serve      remote service side");
     println!("    probe      connectivity probe (skeleton)");
     println!("    inspect    profile/path inspection (skeleton)");
     println!("    version    print version");
@@ -35,14 +35,21 @@ struct ServeLaunch {
     helper_args: Vec<String>,
 }
 
-fn helper_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("ISEKAI_HELPER_PATH") {
+#[derive(Debug)]
+struct ConnectLaunch {
+    profile: String,
+    service: ServiceSpec,
+    ssh_args: Vec<String>,
+}
+
+fn sibling_binary_path(env_var: &str, name: &str) -> PathBuf {
+    if let Some(path) = std::env::var_os(env_var) {
         return PathBuf::from(path);
     }
 
     if let Ok(current) = std::env::current_exe() {
         if let Some(dir) = current.parent() {
-            let mut sibling = dir.join("isekai-helper");
+            let mut sibling = dir.join(name);
             if cfg!(windows) {
                 sibling.set_extension("exe");
             }
@@ -52,12 +59,161 @@ fn helper_path() -> PathBuf {
         }
     }
 
-    PathBuf::from("isekai-helper")
+    PathBuf::from(name)
 }
 
-fn next_arg(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+fn helper_path() -> PathBuf {
+    sibling_binary_path("ISEKAI_HELPER_PATH", "isekai-helper")
+}
+
+fn ssh_path() -> PathBuf {
+    sibling_binary_path("ISEKAI_SSH_PATH", "isekai-ssh")
+}
+
+fn next_arg(
+    command: &str,
+    iter: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> Result<String, String> {
     iter.next()
-        .ok_or_else(|| format!("isekai-pipe serve: {flag} requires a value"))
+        .ok_or_else(|| format!("isekai-pipe {command}: {flag} requires a value"))
+}
+
+fn validate_connect_service(value: &str) -> Result<ServiceSpec, ExitCode> {
+    let spec = ServiceSpec::new(isekai_pipe_core::ServiceName::new(value), "legacy-connect")
+        .map_err(|e| {
+            eprintln!("isekai-pipe connect: invalid --service {value:?}: {e}");
+            ExitCode::from(EX_USAGE)
+        })?;
+    if spec.name().as_str() != "ssh" {
+        eprintln!(
+            "isekai-pipe connect: only ssh service is wired to the legacy connect runtime for now"
+        );
+        return Err(ExitCode::from(EX_USAGE));
+    }
+    Ok(spec)
+}
+
+fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLaunch>, ExitCode> {
+    let mut profile: Option<String> = None;
+    let mut service: Option<ServiceSpec> = None;
+    let mut stdio = false;
+    let mut ssh_args = Vec::new();
+    let mut iter = args.peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("USAGE:");
+                println!(
+                    "    isekai-pipe connect --profile production --service ssh --stdio [OPTIONS]"
+                );
+                println!();
+                println!("COMPATIBILITY:");
+                println!("    Positional PROFILE is accepted as a legacy alias for --profile.");
+                println!("    ISEKAI_SSH_PATH can override the legacy connect runtime path.");
+                return Ok(None);
+            }
+            "--profile" => {
+                let value = next_arg("connect", &mut iter, "--profile").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                if profile.replace(value).is_some() {
+                    eprintln!("isekai-pipe connect: only one --profile is supported");
+                    return Err(ExitCode::from(EX_USAGE));
+                }
+            }
+            "--service" => {
+                let value = next_arg("connect", &mut iter, "--service").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                let spec = validate_connect_service(&value)?;
+                if service.replace(spec).is_some() {
+                    eprintln!("isekai-pipe connect: only one --service is supported");
+                    return Err(ExitCode::from(EX_USAGE));
+                }
+            }
+            "--stdio" => stdio = true,
+            "--mode" | "--stun-server" | "--resume-window" => {
+                let value = next_arg("connect", &mut iter, &arg).map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                ssh_args.push(arg);
+                ssh_args.push(value);
+            }
+            "--listen" => {
+                eprintln!(
+                    "isekai-pipe connect: --listen is not wired to the legacy connect runtime yet"
+                );
+                return Err(ExitCode::from(EX_USAGE));
+            }
+            other if other.starts_with('-') => {
+                eprintln!("isekai-pipe connect: unsupported option: {other}");
+                return Err(ExitCode::from(EX_USAGE));
+            }
+            positional => {
+                if profile.replace(positional.to_string()).is_some() {
+                    eprintln!("isekai-pipe connect: multiple profiles were provided");
+                    return Err(ExitCode::from(EX_USAGE));
+                }
+            }
+        }
+    }
+
+    let Some(profile) = profile else {
+        eprintln!("isekai-pipe connect: --profile is required");
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    let Some(service) = service else {
+        eprintln!("isekai-pipe connect: --service is required");
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    if !stdio {
+        eprintln!("isekai-pipe connect: --stdio is required until --listen is implemented");
+        return Err(ExitCode::from(EX_USAGE));
+    }
+
+    Ok(Some(ConnectLaunch {
+        profile,
+        service,
+        ssh_args,
+    }))
+}
+
+fn run_child(command_name: &str, binary: PathBuf, args: &[String]) -> ExitCode {
+    let status = match Command::new(&binary).args(args).status() {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!(
+                "isekai-pipe {command_name}: failed to execute legacy runtime at {}: {e}",
+                binary.display()
+            );
+            return ExitCode::from(EX_UNAVAILABLE);
+        }
+    };
+
+    match status.code() {
+        Some(code) => ExitCode::from(code as u8),
+        None => ExitCode::from(EX_UNAVAILABLE),
+    }
+}
+
+fn connect_command(args: impl Iterator<Item = String>) -> ExitCode {
+    let launch = match parse_connect(args) {
+        Ok(Some(launch)) => launch,
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(code) => return code,
+    };
+
+    let _service = launch.service;
+    let mut ssh_args = Vec::with_capacity(2 + launch.ssh_args.len());
+    ssh_args.push("connect".to_string());
+    ssh_args.push(launch.profile);
+    ssh_args.extend(launch.ssh_args);
+
+    run_child("connect", ssh_path(), &ssh_args)
 }
 
 fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>, ExitCode> {
@@ -76,7 +232,7 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
                 return Ok(None);
             }
             "--service" => {
-                let value = next_arg(&mut iter, "--service").map_err(|e| {
+                let value = next_arg("serve", &mut iter, "--service").map_err(|e| {
                     eprintln!("{e}");
                     ExitCode::from(EX_USAGE)
                 })?;
@@ -96,7 +252,7 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
                 }
             }
             "--target" => {
-                let value = next_arg(&mut iter, "--target").map_err(|e| {
+                let value = next_arg("serve", &mut iter, "--target").map_err(|e| {
                     eprintln!("{e}");
                     ExitCode::from(EX_USAGE)
                 })?;
@@ -123,7 +279,7 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
             | "--relay-jwt"
             | "--relay-jwt-file"
             | "--log-level" => {
-                let value = next_arg(&mut iter, &arg).map_err(|e| {
+                let value = next_arg("serve", &mut iter, &arg).map_err(|e| {
                     eprintln!("{e}");
                     ExitCode::from(EX_USAGE)
                 })?;
@@ -158,37 +314,87 @@ fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
     helper_args.push("--target".to_string());
     helper_args.push(launch.service.target().to_string());
 
-    let helper = helper_path();
-    let status = match Command::new(&helper).args(&helper_args).status() {
-        Ok(status) => status,
-        Err(e) => {
-            eprintln!(
-                "isekai-pipe serve: failed to execute legacy helper runtime at {}: {e}",
-                helper.display()
-            );
-            return ExitCode::from(EX_UNAVAILABLE);
-        }
-    };
-
-    match status.code() {
-        Some(code) => ExitCode::from(code as u8),
-        None => ExitCode::from(EX_UNAVAILABLE),
-    }
+    run_child("serve", helper_path(), &helper_args)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> ServeLaunch {
+    fn parse_connect_args(args: &[&str]) -> ConnectLaunch {
+        parse_connect(args.iter().map(|arg| arg.to_string()))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn parse_serve_args(args: &[&str]) -> ServeLaunch {
         parse_serve(args.iter().map(|arg| arg.to_string()))
             .unwrap()
             .unwrap()
     }
 
     #[test]
+    fn connect_accepts_profile_service_and_stdio() {
+        let launch = parse_connect_args(&[
+            "--profile",
+            "production",
+            "--service",
+            "ssh",
+            "--stdio",
+            "--mode",
+            "relay",
+            "--resume-window",
+            "30",
+        ]);
+
+        assert_eq!(launch.profile, "production");
+        assert_eq!(
+            launch.service,
+            ServiceSpec::new(isekai_pipe_core::ServiceName::new("ssh"), "legacy-connect").unwrap()
+        );
+        assert_eq!(
+            launch.ssh_args,
+            vec!["--mode", "relay", "--resume-window", "30"]
+        );
+    }
+
+    #[test]
+    fn connect_accepts_positional_profile_for_compatibility() {
+        let launch = parse_connect_args(&["production", "--service", "ssh", "--stdio"]);
+
+        assert_eq!(launch.profile, "production");
+        assert!(launch.ssh_args.is_empty());
+    }
+
+    #[test]
+    fn connect_rejects_non_ssh_service_until_dispatch_exists() {
+        assert!(parse_connect(
+            [
+                "--profile",
+                "production",
+                "--service",
+                "postgres",
+                "--stdio"
+            ]
+            .into_iter()
+            .map(str::to_string)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn connect_requires_stdio_until_listen_exists() {
+        assert!(parse_connect(
+            ["--profile", "production", "--service", "ssh"]
+                .into_iter()
+                .map(str::to_string)
+        )
+        .is_err());
+    }
+
+    #[test]
     fn serve_accepts_named_ssh_service() {
-        let launch = parse(&[
+        let launch = parse_serve_args(&[
             "--service",
             "ssh=127.0.0.1:22",
             "--bind",
@@ -205,7 +411,7 @@ mod tests {
 
     #[test]
     fn serve_maps_legacy_target_to_ssh_service() {
-        let launch = parse(&["--target", "127.0.0.1:2222"]);
+        let launch = parse_serve_args(&["--target", "127.0.0.1:2222"]);
 
         assert_eq!(
             launch.service,
@@ -236,7 +442,7 @@ fn main() -> ExitCode {
             println!("isekai-pipe {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Some("connect") => unimplemented_command("connect"),
+        Some("connect") => connect_command(args),
         Some("serve") => serve_command(args),
         Some("probe") => unimplemented_command("probe"),
         Some("inspect") => unimplemented_command("inspect"),
