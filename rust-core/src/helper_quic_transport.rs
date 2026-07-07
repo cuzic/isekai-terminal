@@ -4,6 +4,14 @@
 //! 前提とせず、SSH 経由で isekai-helper を自動ブートストラップ（Phase 7-3）してから
 //! QUIC 接続する。ワイヤー契約の詳細は `/HELPER_PROTOCOL.md` を参照。
 //!
+//! 重要: この transport は bootstrap 用 SSH 宛先（`ssh_host`）を、そのまま
+//! QUIC dial 先の host 部分にも使う direct-by-bootstrap-host 経路である。
+//! これは Tailscale、LAN、既知 direct host など、client から `ssh_host:listen_port`
+//! へ UDP/QUIC で直接到達できる場合だけ成立する。ProxyJump で bootstrap できる
+//! ことは、`ssh_host` へ QUIC dial できることを意味しない。NAT 越えや relay 前提の
+//! 接続では `isekai_stun_p2p_transport.rs` / `isekai_link_relay_transport.rs` のように、
+//! helper 起動後の観測 endpoint を使う経路を選ぶ。
+//!
 //! ビルド前提: `rust-core/scripts/build-isekai-helper-musl.sh` を先に実行し、
 //! `target/{x86_64,aarch64}-unknown-linux-musl/release/isekai-helper` が存在すること
 //! （`include_bytes!` でこの crate の Android ビルドに埋め込む）。
@@ -423,6 +431,9 @@ async fn connect_helper_quic_stream(
     ssh_host: &str,
     handshake: &HelperHandshake,
 ) -> Result<resume_client::ReattachableStream, String> {
+    // direct-by-bootstrap-host: bootstrap SSH の host 名を QUIC の host 部分にも使う。
+    // ProxyJump でしか到達できない host ではこの前提は成立しない。STUN/relay 経路は
+    // helper 起動後の handshake JSON に含まれる観測 endpoint を使う。
     let remote: SocketAddr = tokio::net::lookup_host((ssh_host, handshake.listen_port))
         .await
         .map_err(|e| format!("DNS lookup failed: {e}"))?
