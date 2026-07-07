@@ -98,11 +98,11 @@ PR に詰め込まない。
 
 - [x] `isekai-helper` の機能を `isekai-pipe serve --service ssh=127.0.0.1:22` へ寄せる。
 - [x] `--target` は `--service` の単一 service 互換 alias とする。
-- [ ] STUN / relay / resume session table / service target を serve 側責務として整理する。
+- [x] STUN / relay / resume session table / service target を serve 側責務として整理する。
 - [ ] handshake JSON を peer/service/candidate 表現へ拡張する。ただし旧 client が読む字段は維持する。
 
-現時点では `isekai-pipe serve` が sibling の `isekai-helper` を起動する互換レイヤとして
-動作する。serve runtime の library 化と protocol 名の更新は後続で行う。
+現時点では `isekai-pipe serve` が `isekai-helper` runtime library を同一プロセス内で起動する。
+protocol 名の更新と handshake JSON 拡張は後続で行う。
 
 ### P3: connect 移行
 

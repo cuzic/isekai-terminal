@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 isekai-pipe-core = { path = "../isekai-pipe-core" }
+isekai-helper = { path = "../isekai-helper" }
 isekai-transport = { path = "../isekai-transport" }
 isekai-trust = { path = "../isekai-trust" }
 anyhow = "1"

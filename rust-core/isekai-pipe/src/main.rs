@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
-use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -71,30 +70,6 @@ struct ConnectLaunch {
 enum ConnectMode {
     Relay,
     Stun,
-}
-
-fn sibling_binary_path(env_var: &str, name: &str) -> PathBuf {
-    if let Some(path) = std::env::var_os(env_var) {
-        return PathBuf::from(path);
-    }
-
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(dir) = current.parent() {
-            let mut sibling = dir.join(name);
-            if cfg!(windows) {
-                sibling.set_extension("exe");
-            }
-            if sibling.exists() {
-                return sibling;
-            }
-        }
-    }
-
-    PathBuf::from(name)
-}
-
-fn helper_path() -> PathBuf {
-    sibling_binary_path("ISEKAI_HELPER_PATH", "isekai-helper")
 }
 
 fn next_arg(
@@ -240,24 +215,6 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
         stun_server,
         resume_window,
     }))
-}
-
-fn run_child(command_name: &str, binary: PathBuf, args: &[String]) -> ExitCode {
-    let status = match Command::new(&binary).args(args).status() {
-        Ok(status) => status,
-        Err(e) => {
-            eprintln!(
-                "isekai-pipe {command_name}: failed to execute legacy runtime at {}: {e}",
-                binary.display()
-            );
-            return ExitCode::from(EX_UNAVAILABLE);
-        }
-    };
-
-    match status.code() {
-        Some(code) => ExitCode::from(code as u8),
-        None => ExitCode::from(EX_UNAVAILABLE),
-    }
 }
 
 async fn connect_command(args: impl Iterator<Item = String>) -> ExitCode {
@@ -713,7 +670,7 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
                 println!();
                 println!("COMPATIBILITY:");
                 println!("    --target 127.0.0.1:22 is accepted as --service ssh=127.0.0.1:22");
-                println!("    ISEKAI_HELPER_PATH can override the helper binary path.");
+                println!("    Existing helper protocol clients are still supported.");
                 return Ok(None);
             }
             "--service" => {
@@ -727,7 +684,7 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
                 })?;
                 if spec.name().as_str() != "ssh" {
                     eprintln!(
-                        "isekai-pipe serve: only ssh service is wired to the legacy helper runtime for now"
+                        "isekai-pipe serve: only ssh service is wired to the helper runtime for now"
                     );
                     return Err(ExitCode::from(EX_USAGE));
                 }
@@ -788,7 +745,7 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
     }))
 }
 
-fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
+async fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
     let launch = match parse_serve(args) {
         Ok(Some(launch)) => launch,
         Ok(None) => return ExitCode::SUCCESS,
@@ -799,7 +756,13 @@ fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
     helper_args.push("--target".to_string());
     helper_args.push(launch.service.target().to_string());
 
-    run_child("serve", helper_path(), &helper_args)
+    match isekai_helper::run_from_args(helper_args).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e:?}");
+            ExitCode::from(EX_UNAVAILABLE)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -957,7 +920,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("connect") => connect_command(args).await,
-        Some("serve") => serve_command(args),
+        Some("serve") => serve_command(args).await,
         Some("probe") => unimplemented_command("probe"),
         Some("inspect") => unimplemented_command("inspect"),
         Some(other) => {
