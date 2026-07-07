@@ -6,13 +6,14 @@
 //! injected `ProxyCommand` that delegates the byte stream to `isekai-pipe
 //! connect`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use isekai_pipe_core::{
     default_runtime_dir, write_connection_intent, BootstrapProvenance, ConnectionIntent,
-    IntentTransport, ServerIdentity,
+    IntentTransport, ServerIdentity, ServiceSpec,
 };
 use tokio::process::Command;
 
@@ -22,8 +23,58 @@ const LEGACY_SUBCOMMANDS: &[&str] = &["connect", "init", "login", "logout"];
 struct WrapperPlan {
     openssh_path: PathBuf,
     pipe_path: PathBuf,
-    profile: String,
+    destination: String,
+    destination_index: usize,
     ssh_args: Vec<String>,
+    isekai: WrapperIsekaiOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct WrapperIsekaiOptions {
+    bootstrap: bool,
+    no_bootstrap: bool,
+    direct: bool,
+    explain: bool,
+    dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct OpenSshEffectiveConfig {
+    hostname: Option<String>,
+    user: Option<String>,
+    port: Option<u16>,
+    proxy_jump: Option<String>,
+    proxy_command: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IsekaiConfig {
+    enabled: bool,
+    bootstrap_policy: BootstrapPolicy,
+    profile: String,
+    remote_path: Option<String>,
+    services: Vec<ServiceSpec>,
+    bootstrap_candidates: Vec<BootstrapCandidate>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapPolicy {
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootstrapCandidate {
+    target: String,
+    via: Vec<String>,
+    priority: u32,
+}
+
+#[derive(Debug, Clone)]
+struct WrapperResolution {
+    openssh: OpenSshEffectiveConfig,
+    isekai: IsekaiConfig,
 }
 
 pub fn should_run_wrapper(args: &[String]) -> bool {
@@ -36,10 +87,41 @@ pub fn should_run_wrapper(args: &[String]) -> bool {
 
 pub async fn run(args: Vec<String>) -> Result<u8> {
     let plan = parse_wrapper(args)?;
-    let intent = build_connection_intent(&plan)?;
+    if plan.isekai.direct {
+        return run_openssh_direct(&plan).await;
+    }
+    let resolution = resolve_wrapper(&plan).await?;
+    if !resolution.isekai.enabled {
+        return run_openssh_direct(&plan).await;
+    }
+    if plan.isekai.explain || plan.isekai.dry_run {
+        eprintln!(
+            "isekai-ssh: resolved OpenSSH config: {:?}",
+            resolution.openssh
+        );
+        eprintln!(
+            "isekai-ssh: resolved isekai config: {:?}",
+            resolution.isekai
+        );
+        if plan.isekai.dry_run {
+            return Ok(0);
+        }
+    }
+    let intent = match build_connection_intent(&resolution) {
+        Ok(intent) => intent,
+        Err(err) if should_bootstrap(&plan, &resolution) => {
+            return Err(anyhow!(
+                "{err}\n\
+                 isekai-ssh: bootstrap is required, but automatic `isekai-pipe serve` deployment is not wired yet. \
+                 resolved bootstrap candidates: {:?}",
+                resolution.isekai.bootstrap_candidates
+            ));
+        }
+        Err(err) => return Err(err),
+    };
     let runtime_dir = default_runtime_dir()?;
     write_connection_intent(&runtime_dir, &intent)?;
-    let proxy_command = proxy_command(&plan.pipe_path, &plan.profile);
+    let proxy_command = proxy_command(&plan.pipe_path, &resolution.isekai.profile);
 
     let mut command = Command::new(&plan.openssh_path);
     command
@@ -61,23 +143,44 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
     Ok(status.code().unwrap_or(1) as u8)
 }
 
-fn build_connection_intent(plan: &WrapperPlan) -> Result<ConnectionIntent> {
-    let key = isekai_trust::normalize_host_port(&plan.profile)
-        .map_err(|e| anyhow!("isekai-ssh: invalid destination {:?}: {e}", plan.profile))?;
+async fn run_openssh_direct(plan: &WrapperPlan) -> Result<u8> {
+    let status = Command::new(&plan.openssh_path)
+        .args(&plan.ssh_args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "isekai-ssh: failed to execute OpenSSH at {}: {e}",
+                plan.openssh_path.display()
+            )
+        })?;
+    Ok(status.code().unwrap_or(1) as u8)
+}
+
+fn build_connection_intent(resolution: &WrapperResolution) -> Result<ConnectionIntent> {
+    let key = isekai_trust::normalize_host_port(&resolution.isekai.profile).map_err(|e| {
+        anyhow!(
+            "isekai-ssh: invalid profile {:?}: {e}",
+            resolution.isekai.profile
+        )
+    })?;
     let store_path = isekai_trust::default_trust_store_path()?;
     let store = isekai_trust::load_trust_store(&store_path)?;
     let entry = store.get(&key).ok_or_else(|| {
         anyhow!(
             "isekai-ssh: {:?} is not a trusted host yet (looked up as {:?} in {})",
-            plan.profile,
+            resolution.isekai.profile,
             key,
             store_path.display()
         )
     })?;
 
     Ok(ConnectionIntent::new(
-        plan.profile.clone(),
-        "ssh",
+        resolution.isekai.profile.clone(),
+        primary_service(&resolution.isekai).name().as_str(),
         ServerIdentity {
             cert_sha256_hex: entry.cached_cert_sha256.clone(),
         },
@@ -90,14 +193,42 @@ fn build_connection_intent(plan: &WrapperPlan) -> Result<ConnectionIntent> {
     ))
 }
 
+fn primary_service(config: &IsekaiConfig) -> &ServiceSpec {
+    config
+        .services
+        .iter()
+        .find(|service| service.name().as_str() == "ssh")
+        .or_else(|| config.services.first())
+        .expect("IsekaiConfig always has at least one service")
+}
+
+fn should_bootstrap(plan: &WrapperPlan, resolution: &WrapperResolution) -> bool {
+    if plan.isekai.no_bootstrap
+        || matches!(resolution.isekai.bootstrap_policy, BootstrapPolicy::Never)
+    {
+        return false;
+    }
+    plan.isekai.bootstrap
+        || matches!(
+            resolution.isekai.bootstrap_policy,
+            BootstrapPolicy::Always | BootstrapPolicy::Auto
+        )
+}
+
 fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
     let mut openssh_path = PathBuf::from("ssh");
     let mut pipe_path = default_pipe_path();
     let mut ssh_args = Vec::new();
+    let mut isekai = WrapperIsekaiOptions::default();
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--isekai-bootstrap" => isekai.bootstrap = true,
+            "--isekai-no-bootstrap" => isekai.no_bootstrap = true,
+            "--isekai-direct" => isekai.direct = true,
+            "--isekai-explain" => isekai.explain = true,
+            "--isekai-dry-run" => isekai.dry_run = true,
             "--isekai-ssh-path" => {
                 openssh_path = PathBuf::from(next_value(&mut iter, "--isekai-ssh-path")?);
             }
@@ -108,21 +239,481 @@ fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
         }
     }
 
-    let profile = find_destination(&ssh_args)
-        .ok_or_else(|| anyhow!("isekai-ssh: destination is required"))?
-        .to_string();
+    if isekai.bootstrap && isekai.no_bootstrap {
+        return Err(anyhow!(
+            "isekai-ssh: --isekai-bootstrap conflicts with --isekai-no-bootstrap"
+        ));
+    }
+    let destination_index = find_destination_index(&ssh_args)
+        .ok_or_else(|| anyhow!("isekai-ssh: destination is required"))?;
+    let destination = ssh_args[destination_index].clone();
 
     Ok(WrapperPlan {
         openssh_path,
         pipe_path,
-        profile,
+        destination,
+        destination_index,
         ssh_args,
+        isekai,
     })
+}
+
+async fn resolve_wrapper(plan: &WrapperPlan) -> Result<WrapperResolution> {
+    let openssh = resolve_openssh_effective_config(plan).await?;
+    let isekai = resolve_isekai_config(plan, &openssh)?;
+    Ok(WrapperResolution { openssh, isekai })
+}
+
+async fn resolve_openssh_effective_config(plan: &WrapperPlan) -> Result<OpenSshEffectiveConfig> {
+    let mut command = Command::new(&plan.openssh_path);
+    command.arg("-G");
+    command.args(ssh_args_through_destination(plan));
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let output = command.output().await.map_err(|e| {
+        anyhow!(
+            "isekai-ssh: failed to execute `{} -G`: {e}",
+            plan.openssh_path.display()
+        )
+    })?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "isekai-ssh: `{} -G` failed: {}",
+            plan.openssh_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_ssh_g_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn ssh_args_through_destination(plan: &WrapperPlan) -> &[String] {
+    &plan.ssh_args[..=plan.destination_index]
+}
+
+fn parse_ssh_g_output(output: &str) -> Result<OpenSshEffectiveConfig> {
+    let mut config = OpenSshEffectiveConfig::default();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let value = value.trim();
+        match key.to_ascii_lowercase().as_str() {
+            "hostname" => config.hostname = Some(value.to_string()),
+            "user" => config.user = Some(value.to_string()),
+            "port" => {
+                config.port = Some(
+                    value
+                        .parse()
+                        .with_context(|| format!("invalid ssh -G port: {value}"))?,
+                );
+            }
+            "proxyjump" if value != "none" => config.proxy_jump = Some(value.to_string()),
+            "proxycommand" if value != "none" => config.proxy_command = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Ok(config)
 }
 
 fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
     iter.next()
         .ok_or_else(|| anyhow!("isekai-ssh: {flag} requires a value"))
+}
+
+fn resolve_isekai_config(
+    plan: &WrapperPlan,
+    openssh: &OpenSshEffectiveConfig,
+) -> Result<IsekaiConfig> {
+    let directives = load_isekai_directives(plan)?;
+    let default_target = format!(
+        "{}:{}",
+        openssh
+            .hostname
+            .as_deref()
+            .unwrap_or(plan.destination.as_str()),
+        openssh.port.unwrap_or(22)
+    );
+    let mut builder = IsekaiConfigBuilder {
+        enabled: None,
+        bootstrap_policy: None,
+        profile: None,
+        remote_path: None,
+        services: Vec::new(),
+        bootstrap_candidates: Vec::new(),
+    };
+    for directive in directives {
+        apply_isekai_directive(&mut builder, directive)?;
+    }
+    if builder.bootstrap_candidates.is_empty() {
+        builder.bootstrap_candidates.push(BootstrapCandidate {
+            target: default_target,
+            via: openssh
+                .proxy_jump
+                .as_deref()
+                .map(parse_jump_chain)
+                .unwrap_or_default(),
+            priority: 100,
+        });
+    }
+    if builder.services.is_empty() {
+        builder
+            .services
+            .push(ServiceSpec::ssh_target("127.0.0.1:22").expect("default service is valid"));
+    }
+    Ok(IsekaiConfig {
+        enabled: builder.enabled.unwrap_or(true),
+        bootstrap_policy: builder.bootstrap_policy.unwrap_or(BootstrapPolicy::Auto),
+        profile: builder.profile.unwrap_or_else(|| plan.destination.clone()),
+        remote_path: builder.remote_path,
+        services: builder.services,
+        bootstrap_candidates: builder.bootstrap_candidates,
+    })
+}
+
+#[derive(Debug)]
+struct IsekaiConfigBuilder {
+    enabled: Option<bool>,
+    bootstrap_policy: Option<BootstrapPolicy>,
+    profile: Option<String>,
+    remote_path: Option<String>,
+    services: Vec<ServiceSpec>,
+    bootstrap_candidates: Vec<BootstrapCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IsekaiDirective {
+    name: String,
+    args: Vec<String>,
+}
+
+fn apply_isekai_directive(
+    builder: &mut IsekaiConfigBuilder,
+    directive: IsekaiDirective,
+) -> Result<()> {
+    match directive.name.as_str() {
+        "enabled" => set_once(
+            &mut builder.enabled,
+            parse_yes_no(one_arg(&directive)?)?,
+            "enabled",
+        ),
+        "bootstrap-policy" => set_once(
+            &mut builder.bootstrap_policy,
+            match one_arg(&directive)? {
+                "auto" => BootstrapPolicy::Auto,
+                "always" => BootstrapPolicy::Always,
+                "never" => BootstrapPolicy::Never,
+                other => {
+                    return Err(anyhow!(
+                        "isekai-ssh: invalid #@isekai bootstrap-policy {other:?}"
+                    ))
+                }
+            },
+            "bootstrap-policy",
+        ),
+        "profile" => set_once(
+            &mut builder.profile,
+            one_arg(&directive)?.to_string(),
+            "profile",
+        ),
+        "remote-path" => set_once(
+            &mut builder.remote_path,
+            one_arg(&directive)?.to_string(),
+            "remote-path",
+        ),
+        "service" => {
+            for arg in &directive.args {
+                builder.services.push(
+                    ServiceSpec::parse(arg).map_err(|e| {
+                        anyhow!("isekai-ssh: invalid #@isekai service {arg:?}: {e}")
+                    })?,
+                );
+            }
+            Ok(())
+        }
+        "bootstrap-candidate" => {
+            builder
+                .bootstrap_candidates
+                .push(parse_bootstrap_candidate(&directive.args)?);
+            Ok(())
+        }
+        "link"
+        | "rendezvous"
+        | "stun"
+        | "relay"
+        | "resume-grace"
+        | "candidate-race-delay"
+        | "relay-delay"
+        | "install-mode" => Ok(()),
+        other => Err(anyhow!("isekai-ssh: unknown #@isekai directive {other:?}")),
+    }
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<()> {
+    if slot.is_none() {
+        *slot = Some(value);
+    }
+    let _ = name;
+    Ok(())
+}
+
+fn one_arg(directive: &IsekaiDirective) -> Result<&str> {
+    match directive.args.as_slice() {
+        [single] => Ok(single),
+        _ => Err(anyhow!(
+            "isekai-ssh: #@isekai {} expects exactly one argument",
+            directive.name
+        )),
+    }
+}
+
+fn parse_yes_no(value: &str) -> Result<bool> {
+    match value {
+        "yes" | "true" | "on" | "1" => Ok(true),
+        "no" | "false" | "off" | "0" => Ok(false),
+        _ => Err(anyhow!("isekai-ssh: expected yes/no, got {value:?}")),
+    }
+}
+
+fn parse_bootstrap_candidate(args: &[String]) -> Result<BootstrapCandidate> {
+    let mut target = None;
+    let mut via = Vec::new();
+    let mut priority = 100;
+    for arg in args {
+        let Some((key, value)) = arg.split_once('=') else {
+            return Err(anyhow!(
+                "isekai-ssh: bootstrap-candidate argument must be key=value: {arg:?}"
+            ));
+        };
+        match key {
+            "target" => target = Some(value.to_string()),
+            "via" => via = parse_jump_chain(value),
+            "priority" => {
+                priority = value.parse().map_err(|_| {
+                    anyhow!("isekai-ssh: invalid bootstrap-candidate priority {value:?}")
+                })?;
+            }
+            _ => {
+                return Err(anyhow!(
+                    "isekai-ssh: unknown bootstrap-candidate key {key:?}"
+                ))
+            }
+        }
+    }
+    Ok(BootstrapCandidate {
+        target: target
+            .ok_or_else(|| anyhow!("isekai-ssh: bootstrap-candidate requires target=..."))?,
+        via,
+        priority,
+    })
+}
+
+fn parse_jump_chain(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|hop| !hop.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn load_isekai_directives(plan: &WrapperPlan) -> Result<Vec<IsekaiDirective>> {
+    let roots = config_roots(plan);
+    let mut visited = HashSet::new();
+    let mut directives = Vec::new();
+    for root in roots {
+        if root.exists() {
+            load_isekai_directives_from_file(
+                &root,
+                &plan.destination,
+                &mut visited,
+                &mut directives,
+            )?;
+        }
+    }
+    Ok(directives)
+}
+
+fn config_roots(plan: &WrapperPlan) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut i = 0;
+    while i < plan.ssh_args.len() {
+        match plan.ssh_args[i].as_str() {
+            "-F" if i + 1 < plan.ssh_args.len() => {
+                roots.push(expand_path(&plan.ssh_args[i + 1], None));
+                i += 2;
+            }
+            "-F" => break,
+            _ => i += ssh_option_width(plan.ssh_args[i].as_str()),
+        }
+    }
+    if roots.is_empty() {
+        if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join(".ssh").join("config"));
+        }
+    }
+    roots
+}
+
+fn load_isekai_directives_from_file(
+    path: &Path,
+    destination: &str,
+    visited: &mut HashSet<PathBuf>,
+    directives: &mut Vec<IsekaiDirective>,
+) -> Result<()> {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical) {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("isekai-ssh: failed to read ssh config {}", path.display()))?;
+    let base_dir = path.parent();
+    let mut active = true;
+    let mut in_match = false;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#@isekai") {
+            if in_match {
+                return Err(anyhow!(
+                    "ISEKAI_CONFIG_UNSUPPORTED_MATCH: #@isekai inside Match block"
+                ));
+            }
+            if active {
+                directives.push(parse_isekai_directive(rest.trim())?);
+            }
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let (keyword, rest) = split_keyword(line);
+        match keyword.to_ascii_lowercase().as_str() {
+            "include" => {
+                for pattern in split_words(rest) {
+                    for include in expand_include_pattern(&pattern, base_dir)? {
+                        load_isekai_directives_from_file(
+                            &include,
+                            destination,
+                            visited,
+                            directives,
+                        )?;
+                    }
+                }
+            }
+            "host" => {
+                in_match = false;
+                active = host_patterns_match(rest, destination);
+            }
+            "match" => {
+                in_match = true;
+                active = false;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn parse_isekai_directive(rest: &str) -> Result<IsekaiDirective> {
+    let mut words = split_words(rest);
+    let name = words
+        .next()
+        .ok_or_else(|| anyhow!("isekai-ssh: empty #@isekai directive"))?;
+    Ok(IsekaiDirective {
+        name,
+        args: words.collect(),
+    })
+}
+
+fn split_keyword(line: &str) -> (&str, &str) {
+    match line.find(char::is_whitespace) {
+        Some(index) => (&line[..index], line[index..].trim()),
+        None => (line, ""),
+    }
+}
+
+fn split_words(input: &str) -> impl Iterator<Item = String> + '_ {
+    input.split_whitespace().map(str::to_string)
+}
+
+fn expand_include_pattern(pattern: &str, base_dir: Option<&Path>) -> Result<Vec<PathBuf>> {
+    let expanded = expand_path(pattern, base_dir);
+    let pattern = expanded.to_string_lossy().into_owned();
+    let mut paths = Vec::new();
+    if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+        for entry in
+            glob::glob(&pattern).with_context(|| format!("invalid Include pattern {pattern:?}"))?
+        {
+            paths.push(entry?);
+        }
+        paths.sort();
+    } else {
+        paths.push(PathBuf::from(pattern));
+    }
+    Ok(paths)
+}
+
+fn expand_path(input: &str, base_dir: Option<&Path>) -> PathBuf {
+    let expanded = if input == "~" {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(input))
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(rest))
+            .unwrap_or_else(|| PathBuf::from(input))
+    } else {
+        PathBuf::from(input)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        base_dir.unwrap_or_else(|| Path::new(".")).join(expanded)
+    }
+}
+
+fn host_patterns_match(patterns: &str, destination: &str) -> bool {
+    let mut matched = false;
+    for pattern in patterns.split_whitespace() {
+        if let Some(negative) = pattern.strip_prefix('!') {
+            if wildcard_match(negative, destination) {
+                return false;
+            }
+        } else if wildcard_match(pattern, destination) {
+            matched = true;
+        }
+    }
+    matched
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    wildcard_match_bytes(pattern.as_bytes(), value.as_bytes())
+}
+
+fn wildcard_match_bytes(pattern: &[u8], value: &[u8]) -> bool {
+    match (pattern.split_first(), value.split_first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some((&b'*', rest)), _) => {
+            wildcard_match_bytes(rest, value)
+                || value
+                    .split_first()
+                    .map(|(_, value_rest)| wildcard_match_bytes(pattern, value_rest))
+                    .unwrap_or(false)
+        }
+        (Some((&b'?', rest)), Some((_, value_rest))) => wildcard_match_bytes(rest, value_rest),
+        (Some((&p, rest)), Some((&v, value_rest))) if p == v => {
+            wildcard_match_bytes(rest, value_rest)
+        }
+        _ => false,
+    }
 }
 
 fn default_pipe_path() -> PathBuf {
@@ -169,15 +760,15 @@ fn shell_quote(value: &str) -> String {
     quoted
 }
 
-fn find_destination(args: &[String]) -> Option<&str> {
+fn find_destination_index(args: &[String]) -> Option<usize> {
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
         if arg == "--" {
-            return args.get(i + 1).map(String::as_str);
+            return (i + 1 < args.len()).then_some(i + 1);
         }
         if !arg.starts_with('-') || arg == "-" {
-            return Some(arg);
+            return Some(i);
         }
         i += ssh_option_width(arg);
     }
@@ -246,7 +837,8 @@ mod tests {
 
         assert_eq!(plan.openssh_path, PathBuf::from("/usr/bin/ssh"));
         assert_eq!(plan.pipe_path, PathBuf::from("/opt/isekai pipe"));
-        assert_eq!(plan.profile, "user@production");
+        assert_eq!(plan.destination, "user@production");
+        assert_eq!(plan.destination_index, 2);
         assert_eq!(
             plan.ssh_args,
             s(&["-p", "2222", "user@production", "uptime"])
@@ -256,16 +848,16 @@ mod tests {
     #[test]
     fn finds_destination_after_common_ssh_options() {
         assert_eq!(
-            find_destination(&s(&[
+            find_destination_index(&s(&[
                 "-i",
                 "id key",
                 "-o",
                 "StrictHostKeyChecking=no",
                 "prod"
             ])),
-            Some("prod")
+            Some(4)
         );
-        assert_eq!(find_destination(&s(&["-vvv", "--", "prod"])), Some("prod"));
+        assert_eq!(find_destination_index(&s(&["-vvv", "--", "prod"])), Some(2));
     }
 
     #[test]
@@ -298,13 +890,18 @@ cached_session_secret = "c2VjcmV0"
         let old_home = std::env::var_os("HOME");
         std::env::set_var("HOME", &home);
 
-        let plan = WrapperPlan {
-            openssh_path: PathBuf::from("ssh"),
-            pipe_path: PathBuf::from("isekai-pipe"),
-            profile: "production".to_string(),
-            ssh_args: s(&["production"]),
+        let resolution = WrapperResolution {
+            openssh: OpenSshEffectiveConfig::default(),
+            isekai: IsekaiConfig {
+                enabled: true,
+                bootstrap_policy: BootstrapPolicy::Auto,
+                profile: "production".to_string(),
+                remote_path: None,
+                services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
+                bootstrap_candidates: Vec::new(),
+            },
         };
-        let intent = build_connection_intent(&plan).unwrap();
+        let intent = build_connection_intent(&resolution).unwrap();
 
         assert_eq!(intent.profile, "production");
         assert_eq!(intent.service, "ssh");
@@ -323,5 +920,90 @@ cached_session_secret = "c2VjcmV0"
             std::env::remove_var("HOME");
         }
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn parses_ssh_g_output() {
+        let config = parse_ssh_g_output(
+            "user deploy\nhostname 10.20.0.15\nport 2222\nproxyjump bastion,edge\nproxycommand none\n",
+        )
+        .unwrap();
+        assert_eq!(config.user.as_deref(), Some("deploy"));
+        assert_eq!(config.hostname.as_deref(), Some("10.20.0.15"));
+        assert_eq!(config.port, Some(2222));
+        assert_eq!(config.proxy_jump.as_deref(), Some("bastion,edge"));
+        assert_eq!(config.proxy_command, None);
+    }
+
+    #[test]
+    fn resolves_isekai_directives_from_matching_host_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("ssh_config");
+        std::fs::write(
+            &config,
+            r#"
+Host production
+    #@isekai profile production-east
+    #@isekai bootstrap-candidate target=10.20.0.15:22 via=bastion,edge priority=120
+    #@isekai remote-path ~/.local/bin/isekai-pipe
+    #@isekai service ssh=127.0.0.1:2222
+
+Host *
+    #@isekai service postgres=127.0.0.1:5432
+"#,
+        )
+        .unwrap();
+        let plan = parse_wrapper(s(&["-F", config.to_str().unwrap(), "production"])).unwrap();
+        let openssh = OpenSshEffectiveConfig {
+            hostname: Some("10.20.0.15".to_string()),
+            port: Some(22),
+            ..Default::default()
+        };
+        let resolved = resolve_isekai_config(&plan, &openssh).unwrap();
+        assert_eq!(resolved.profile, "production-east");
+        assert_eq!(
+            resolved.remote_path.as_deref(),
+            Some("~/.local/bin/isekai-pipe")
+        );
+        assert_eq!(resolved.services.len(), 2);
+        assert_eq!(
+            resolved.services[0],
+            ServiceSpec::ssh_target("127.0.0.1:2222").unwrap()
+        );
+        assert_eq!(
+            resolved.bootstrap_candidates,
+            vec![BootstrapCandidate {
+                target: "10.20.0.15:22".to_string(),
+                via: s(&["bastion", "edge"]),
+                priority: 120,
+            }]
+        );
+    }
+
+    #[test]
+    fn defaults_bootstrap_candidate_from_ssh_g() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("ssh_config");
+        std::fs::write(
+            &config,
+            "Host production\n    #@isekai profile production\n",
+        )
+        .unwrap();
+        let plan = parse_wrapper(s(&["-F", config.to_str().unwrap(), "production"])).unwrap();
+        let openssh = OpenSshEffectiveConfig {
+            hostname: Some("10.20.0.15".to_string()),
+            port: Some(2200),
+            proxy_jump: Some("bastion".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_isekai_config(&plan, &openssh).unwrap();
+        assert_eq!(
+            resolved.bootstrap_candidates,
+            vec![BootstrapCandidate {
+                target: "10.20.0.15:2200".to_string(),
+                via: s(&["bastion"]),
+                priority: 100,
+            }]
+        );
     }
 }

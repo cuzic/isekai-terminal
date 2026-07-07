@@ -1461,6 +1461,7 @@ dependencies = [
  "base64",
  "clap",
  "env_logger",
+ "glob",
  "isekai-auth",
  "isekai-bootstrap",
  "isekai-pipe-core",

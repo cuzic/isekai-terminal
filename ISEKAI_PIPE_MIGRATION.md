@@ -123,14 +123,16 @@ handshake JSON は旧 top-level fields に加えて `protocol` / `peer` / `servi
 ### P4: isekai-ssh wrapper 化
 
 - [x] `isekai-ssh [SSH_OPTIONS] destination [command...]` を入口にする。
-- [ ] `ssh -G` と `#@isekai` を使って logical host と bootstrap candidate を解決する。
+- [x] `ssh -G` と `#@isekai` を使って logical host と bootstrap candidate を解決する。
 - [ ] 必要に応じて `isekai-pipe serve` を配布・起動する。
 - [x] ConnectionIntent を作り、OpenSSH を `ProxyCommand isekai-pipe connect ...` 付きで起動する。
 - [ ] stdout/stderr 契約を整理する。OpenSSH の byte stream は `isekai-pipe connect` の stdout のみ。
 
 現時点では `isekai-ssh` が OpenSSH に `ProxyCommand isekai-pipe connect --profile <destination>
 --service ssh --stdio` を注入し、`ISEKAI_INTENT_ID` で短命な `ConnectionIntent` を渡す。
-bootstrap / `ssh -G` 解析は後続で行う。
+wrapper は `ssh -G` の実効設定と `#@isekai` コメントから `profile` / `service` /
+`remote-path` / `bootstrap-candidate` を解決する。trust store が無く bootstrap が必要な場合の
+remote `isekai-pipe serve` 配布・起動は後続で行う。
 
 ### P5: 旧名整理
 
