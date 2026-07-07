@@ -25,6 +25,7 @@ isekai-transport = { path = "../isekai-transport" }
 isekai-trust = { path = "../isekai-trust" }
 isekai-bootstrap = { path = "../isekai-bootstrap" }
 isekai-auth = { path = "../isekai-auth" }
+isekai-pipe-core = { path = "../isekai-pipe-core" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "signal"] }
 log = "0.4"

@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{anyhow, Result};
+use isekai_pipe_core::{
+    default_runtime_dir, write_connection_intent, BootstrapProvenance, ConnectionIntent,
+    IntentTransport, ServerIdentity,
+};
 use tokio::process::Command;
 
 const LEGACY_SUBCOMMANDS: &[&str] = &["connect", "init", "login", "logout"];
@@ -32,10 +36,15 @@ pub fn should_run_wrapper(args: &[String]) -> bool {
 
 pub async fn run(args: Vec<String>) -> Result<u8> {
     let plan = parse_wrapper(args)?;
+    let intent = build_connection_intent(&plan)?;
+    let runtime_dir = default_runtime_dir()?;
+    write_connection_intent(&runtime_dir, &intent)?;
     let proxy_command = proxy_command(&plan.pipe_path, &plan.profile);
 
     let mut command = Command::new(&plan.openssh_path);
     command
+        .env("ISEKAI_INTENT_ID", &intent.intent_id)
+        .env("ISEKAI_PIPE_RUNTIME_DIR", &runtime_dir)
         .arg("-o")
         .arg(format!("ProxyCommand={proxy_command}"))
         .args(&plan.ssh_args)
@@ -50,6 +59,35 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
         )
     })?;
     Ok(status.code().unwrap_or(1) as u8)
+}
+
+fn build_connection_intent(plan: &WrapperPlan) -> Result<ConnectionIntent> {
+    let key = isekai_trust::normalize_host_port(&plan.profile)
+        .map_err(|e| anyhow!("isekai-ssh: invalid destination {:?}: {e}", plan.profile))?;
+    let store_path = isekai_trust::default_trust_store_path()?;
+    let store = isekai_trust::load_trust_store(&store_path)?;
+    let entry = store.get(&key).ok_or_else(|| {
+        anyhow!(
+            "isekai-ssh: {:?} is not a trusted host yet (looked up as {:?} in {})",
+            plan.profile,
+            key,
+            store_path.display()
+        )
+    })?;
+
+    Ok(ConnectionIntent::new(
+        plan.profile.clone(),
+        "ssh",
+        ServerIdentity {
+            cert_sha256_hex: entry.cached_cert_sha256.clone(),
+        },
+        IntentTransport::Relay {
+            helper_addr: entry.cached_relay_addr.clone(),
+            server_name: "isekai-helper".to_string(),
+            session_secret_b64: entry.cached_session_secret.clone(),
+        },
+        BootstrapProvenance::TrustStore { key },
+    ))
 }
 
 fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
@@ -236,5 +274,54 @@ mod tests {
             proxy_command(Path::new("/opt/isekai pipe"), "prod'host"),
             "'/opt/isekai pipe' connect --profile 'prod'\\''host' --service ssh --stdio"
         );
+    }
+
+    #[test]
+    fn builds_connection_intent_from_trust_store() {
+        let home =
+            std::env::temp_dir().join(format!("isekai-ssh-wrapper-intent-{}", std::process::id()));
+        let config = home.join(".config").join("isekai-ssh");
+        std::fs::create_dir_all(&config).unwrap();
+        let trust = r#"
+[helpers."production:22"]
+identity_pubkey = "pk"
+trusted_helper_sha256 = "sha"
+trusted_helper_version = "0.1.0"
+update_policy = "exact-digest-only"
+trusted_at = "2026-07-04T00:00:00Z"
+last_seen_at = "2026-07-04T00:00:00Z"
+cached_relay_addr = "127.0.0.1:1234"
+cached_cert_sha256 = "ab"
+cached_session_secret = "c2VjcmV0"
+"#;
+        std::fs::write(config.join("known_helpers.toml"), trust).unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+
+        let plan = WrapperPlan {
+            openssh_path: PathBuf::from("ssh"),
+            pipe_path: PathBuf::from("isekai-pipe"),
+            profile: "production".to_string(),
+            ssh_args: s(&["production"]),
+        };
+        let intent = build_connection_intent(&plan).unwrap();
+
+        assert_eq!(intent.profile, "production");
+        assert_eq!(intent.service, "ssh");
+        assert_eq!(
+            intent.transport,
+            IntentTransport::Relay {
+                helper_addr: "127.0.0.1:1234".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string()
+            }
+        );
+
+        if let Some(old_home) = old_home {
+            std::env::set_var("HOME", old_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all(home);
     }
 }

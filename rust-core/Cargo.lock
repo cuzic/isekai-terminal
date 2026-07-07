@@ -1419,7 +1419,12 @@ dependencies = [
 name = "isekai-pipe"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "base64",
  "isekai-pipe-core",
+ "isekai-transport",
+ "isekai-trust",
+ "tokio",
 ]
 
 [[package]]
@@ -1427,6 +1432,9 @@ name = "isekai-pipe-core"
 version = "0.1.0"
 dependencies = [
  "isekai-pipe-protocol",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1454,6 +1462,7 @@ dependencies = [
  "env_logger",
  "isekai-auth",
  "isekai-bootstrap",
+ "isekai-pipe-core",
  "isekai-protocol",
  "isekai-transport",
  "isekai-trust",

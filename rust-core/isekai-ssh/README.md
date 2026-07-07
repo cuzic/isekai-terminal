@@ -114,8 +114,10 @@ isekai-ssh -L 5432:127.0.0.1:5432 myhost
 isekai-ssh myhost 'journalctl -f'
 ```
 
-`isekai-ssh` は OpenSSH を起動し、`ProxyCommand isekai-pipe connect --profile <host> --service ssh --stdio`
-を自動で差し込む。OpenSSH のパスを変えたい場合は `--isekai-ssh-path PATH`、`isekai-pipe` のパスを
+`isekai-ssh` は短命な `ConnectionIntent` をユーザー専用 runtime directory に保存してから
+OpenSSH を起動し、`ProxyCommand isekai-pipe connect --profile <host> --service ssh --stdio` を
+自動で差し込む。OpenSSH へ渡すのは `ISEKAI_INTENT_ID` だけで、session secret は argv/env には
+載せない。OpenSSH のパスを変えたい場合は `--isekai-ssh-path PATH`、`isekai-pipe` のパスを
 変えたい場合は `--isekai-pipe-path PATH` を使う。
 
 既存の `~/.ssh/config` へ直接書く互換運用も残している。
@@ -131,9 +133,11 @@ Host myhost
 ```
 
 `ServerAliveInterval`/`ServerAliveCountMax`/`TCPKeepAlive no` は必須ではないが強く推奨する。
-`isekai-pipe connect` は現時点では互換 runtime として `isekai-ssh connect` を起動する。
-QUIC 接続が切れても `--resume-window`(既定120秒、isekai-helper 側の
-既定と揃えてある)の間は resume を試み続けて `ssh` 側の stdin/stdout を閉じずに粘るので、
+`isekai-pipe connect` は `ConnectionIntent` を atomic claim し、`isekai_transport` で
+relay/STUN transport を直接起動して stdio bridge を所有する。relay resume pump は移行中のため、
+QUIC 接続が切れた場合の再開処理は今後 `isekai-pipe connect` 側へ移す。
+resume が有効になった後は `--resume-window`(既定120秒、isekai-helper 側の
+既定と揃える予定)の間は `ssh` 側の stdin/stdout を閉じずに粘るので、
 `ssh` 自身の生存確認(`ServerAliveInterval × ServerAliveCountMax`)は resume window より
 十分長く設定しておくと、瞬断のたびに `ssh` 自身が先にセッションを諦めてしまう事故を防げる
 (`ISEKAI_SSH_DESIGN.md`「`ssh` 自身の生存確認とのレース」参照)。

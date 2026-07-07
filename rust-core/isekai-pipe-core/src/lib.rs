@@ -1,11 +1,17 @@
-//! Core library skeleton for the future `isekai-pipe` data plane.
-//!
-//! This crate will own candidate collection, path selection, QUIC/session
-//! management, service dispatch, and resume buffers as the migration proceeds.
-//! It currently exposes only the responsibility boundary so downstream code can
-//! depend on the crate without pulling in the existing `isekai-helper` logic.
+//! Core value types and local runtime storage for `isekai-pipe`.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
 
 pub use isekai_pipe_protocol::{LogicalHost, ServiceName};
+
+pub const CONNECTION_INTENT_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_INTENT_TTL: Duration = Duration::from_secs(120);
 
 /// A remote service exposed by `isekai-pipe serve`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +80,242 @@ pub enum PipeRole {
     Serve,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionIntent {
+    pub schema_version: u32,
+    pub intent_id: String,
+    pub profile: String,
+    pub peer_id: String,
+    pub expected_server_identity: ServerIdentity,
+    pub service: String,
+    pub transport: IntentTransport,
+    pub relay_policy: RelayPolicy,
+    pub punch_generation: u64,
+    pub created_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub bootstrap_provenance: BootstrapProvenance,
+}
+
+impl ConnectionIntent {
+    pub fn new(
+        profile: impl Into<String>,
+        service: impl Into<String>,
+        expected_server_identity: ServerIdentity,
+        transport: IntentTransport,
+        bootstrap_provenance: BootstrapProvenance,
+    ) -> Self {
+        let profile = profile.into();
+        let now = unix_ms(SystemTime::now());
+        let expires = now + DEFAULT_INTENT_TTL.as_millis() as u64;
+        Self {
+            schema_version: CONNECTION_INTENT_SCHEMA_VERSION,
+            intent_id: new_intent_id(),
+            peer_id: profile.clone(),
+            profile,
+            expected_server_identity,
+            service: service.into(),
+            transport,
+            relay_policy: RelayPolicy::RelayAllowed,
+            punch_generation: 0,
+            created_at_unix_ms: now,
+            expires_at_unix_ms: expires,
+            bootstrap_provenance,
+        }
+    }
+
+    pub fn validate_for_use(&self, now: SystemTime) -> Result<(), IntentError> {
+        if self.schema_version != CONNECTION_INTENT_SCHEMA_VERSION {
+            return Err(IntentError::UnsupportedSchema(self.schema_version));
+        }
+        if unix_ms(now) > self.expires_at_unix_ms {
+            return Err(IntentError::Expired);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerIdentity {
+    pub cert_sha256_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum IntentTransport {
+    Relay {
+        helper_addr: String,
+        server_name: String,
+        session_secret_b64: String,
+    },
+    StunP2p {
+        stun_server: String,
+        peer_addr: String,
+        server_name: String,
+        session_secret_b64: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelayPolicy {
+    RelayAllowed,
+    RelayRequired,
+    DirectOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum BootstrapProvenance {
+    TrustStore { key: String },
+    ExplicitProfile,
+}
+
+#[derive(Debug)]
+pub enum IntentError {
+    Io(io::Error),
+    Json(serde_json::Error),
+    InvalidIntentId,
+    Missing,
+    Expired,
+    UnsupportedSchema(u32),
+}
+
+impl std::fmt::Display for IntentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Json(e) => write!(f, "{e}"),
+            Self::InvalidIntentId => write!(f, "intent id contains invalid characters"),
+            Self::Missing => write!(f, "connection intent was not found"),
+            Self::Expired => write!(f, "connection intent has expired"),
+            Self::UnsupportedSchema(version) => {
+                write!(f, "unsupported connection intent schema version {version}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for IntentError {}
+
+impl From<io::Error> for IntentError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<serde_json::Error> for IntentError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(value)
+    }
+}
+
+pub fn default_runtime_dir() -> io::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("ISEKAI_PIPE_RUNTIME_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return Ok(PathBuf::from(path).join("isekai"));
+    }
+    Ok(std::env::temp_dir().join(format!("isekai-{}", current_uid())))
+}
+
+pub fn write_connection_intent(
+    runtime_dir: &Path,
+    intent: &ConnectionIntent,
+) -> Result<PathBuf, IntentError> {
+    validate_intent_id(&intent.intent_id)?;
+    let intents = runtime_dir.join("intents");
+    create_private_dir(runtime_dir)?;
+    create_private_dir(&intents)?;
+    let path = intents.join(format!("{}.json", intent.intent_id));
+    let tmp = intents.join(format!("{}.{}.tmp", intent.intent_id, std::process::id()));
+    let bytes = serde_json::to_vec_pretty(intent)?;
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+pub fn claim_connection_intent(
+    runtime_dir: &Path,
+    intent_id: &str,
+) -> Result<ConnectionIntent, IntentError> {
+    validate_intent_id(intent_id)?;
+    let src = runtime_dir
+        .join("intents")
+        .join(format!("{intent_id}.json"));
+    let claimed_dir = runtime_dir.join("claimed");
+    create_private_dir(runtime_dir)?;
+    create_private_dir(&claimed_dir)?;
+    let dst = claimed_dir.join(format!("{intent_id}.{}.json", std::process::id()));
+    match fs::rename(&src, &dst) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(IntentError::Missing),
+        Err(e) => return Err(IntentError::Io(e)),
+    }
+    let bytes = fs::read(&dst)?;
+    let intent: ConnectionIntent = serde_json::from_slice(&bytes)?;
+    intent.validate_for_use(SystemTime::now())?;
+    Ok(intent)
+}
+
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn validate_intent_id(intent_id: &str) -> Result<(), IntentError> {
+    let valid = !intent_id.is_empty()
+        && intent_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(IntentError::InvalidIntentId)
+    }
+}
+
+fn new_intent_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn unix_ms(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        libc_getuid()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+#[cfg(unix)]
+fn libc_getuid() -> u32 {
+    unsafe extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +353,35 @@ mod tests {
             ServiceSpec::parse("ssh=").unwrap_err(),
             ServiceSpecError::EmptyTarget
         );
+    }
+
+    #[test]
+    fn writes_and_claims_connection_intent_once() {
+        let root =
+            std::env::temp_dir().join(format!("isekai-pipe-intent-test-{}", new_intent_id()));
+        let intent = ConnectionIntent::new(
+            "production",
+            "ssh",
+            ServerIdentity {
+                cert_sha256_hex: "ab".repeat(32),
+            },
+            IntentTransport::Relay {
+                helper_addr: "127.0.0.1:1234".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore {
+                key: "production:22".to_string(),
+            },
+        );
+
+        write_connection_intent(&root, &intent).unwrap();
+        let claimed = claim_connection_intent(&root, &intent.intent_id).unwrap();
+        assert_eq!(claimed, intent);
+        assert!(matches!(
+            claim_connection_intent(&root, &intent.intent_id).unwrap_err(),
+            IntentError::Missing
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 }

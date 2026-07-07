@@ -11,3 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 isekai-pipe-core = { path = "../isekai-pipe-core" }
+isekai-transport = { path = "../isekai-transport" }
+isekai-trust = { path = "../isekai-trust" }
+anyhow = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std"] }

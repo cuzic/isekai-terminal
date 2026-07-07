@@ -1,7 +1,17 @@
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
-use isekai_pipe_core::ServiceSpec;
+use anyhow::{Context, Result};
+use base64::Engine as _;
+use isekai_pipe_core::{
+    claim_connection_intent, default_runtime_dir, BootstrapProvenance, ConnectionIntent,
+    IntentTransport, ServerIdentity, ServiceSpec,
+};
+use isekai_transport::{
+    connect_stun_p2p, connect_via_relay, ByteStream, RelayTarget, StunP2pTarget,
+    SystemQuicEndpointFactory,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const EX_USAGE: u8 = 64;
 const EX_UNAVAILABLE: u8 = 69;
@@ -37,9 +47,17 @@ struct ServeLaunch {
 
 #[derive(Debug)]
 struct ConnectLaunch {
-    profile: String,
-    service: ServiceSpec,
-    ssh_args: Vec<String>,
+    profile: Option<String>,
+    service: Option<ServiceSpec>,
+    stdio: bool,
+    mode: ConnectMode,
+    stun_server: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectMode {
+    Relay,
+    Stun,
 }
 
 fn sibling_binary_path(env_var: &str, name: &str) -> PathBuf {
@@ -64,10 +82,6 @@ fn sibling_binary_path(env_var: &str, name: &str) -> PathBuf {
 
 fn helper_path() -> PathBuf {
     sibling_binary_path("ISEKAI_HELPER_PATH", "isekai-helper")
-}
-
-fn ssh_path() -> PathBuf {
-    sibling_binary_path("ISEKAI_SSH_PATH", "isekai-ssh")
 }
 
 fn next_arg(
@@ -98,7 +112,8 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
     let mut profile: Option<String> = None;
     let mut service: Option<ServiceSpec> = None;
     let mut stdio = false;
-    let mut ssh_args = Vec::new();
+    let mut mode = ConnectMode::Relay;
+    let mut stun_server = None;
     let mut iter = args.peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -108,9 +123,8 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                     "    isekai-pipe connect --profile production --service ssh --stdio [OPTIONS]"
                 );
                 println!();
-                println!("COMPATIBILITY:");
-                println!("    Positional PROFILE is accepted as a legacy alias for --profile.");
-                println!("    ISEKAI_SSH_PATH can override the legacy connect runtime path.");
+                println!("INTENT:");
+                println!("    If ISEKAI_INTENT_ID is set, the matching ConnectionIntent is claimed first.");
                 return Ok(None);
             }
             "--profile" => {
@@ -135,13 +149,32 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 }
             }
             "--stdio" => stdio = true,
-            "--mode" | "--stun-server" | "--resume-window" => {
+            "--mode" => {
                 let value = next_arg("connect", &mut iter, &arg).map_err(|e| {
                     eprintln!("{e}");
                     ExitCode::from(EX_USAGE)
                 })?;
-                ssh_args.push(arg);
-                ssh_args.push(value);
+                mode = match value.as_str() {
+                    "relay" => ConnectMode::Relay,
+                    "stun" => ConnectMode::Stun,
+                    _ => {
+                        eprintln!("isekai-pipe connect: --mode must be relay or stun");
+                        return Err(ExitCode::from(EX_USAGE));
+                    }
+                };
+            }
+            "--stun-server" => {
+                stun_server = Some(next_arg("connect", &mut iter, &arg).map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            "--resume-window" => {
+                let _ = next_arg("connect", &mut iter, &arg).map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                eprintln!("isekai-pipe connect: --resume-window is reserved until pipe-owned resume lands");
             }
             "--listen" => {
                 eprintln!(
@@ -162,23 +195,31 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
         }
     }
 
-    let Some(profile) = profile else {
-        eprintln!("isekai-pipe connect: --profile is required");
-        return Err(ExitCode::from(EX_USAGE));
-    };
-    let Some(service) = service else {
-        eprintln!("isekai-pipe connect: --service is required");
-        return Err(ExitCode::from(EX_USAGE));
-    };
     if !stdio {
         eprintln!("isekai-pipe connect: --stdio is required until --listen is implemented");
         return Err(ExitCode::from(EX_USAGE));
+    }
+    if std::env::var_os("ISEKAI_INTENT_ID").is_none() {
+        if profile.is_none() {
+            eprintln!(
+                "isekai-pipe connect: --profile is required when ISEKAI_INTENT_ID is not set"
+            );
+            return Err(ExitCode::from(EX_USAGE));
+        }
+        if service.is_none() {
+            eprintln!(
+                "isekai-pipe connect: --service is required when ISEKAI_INTENT_ID is not set"
+            );
+            return Err(ExitCode::from(EX_USAGE));
+        }
     }
 
     Ok(Some(ConnectLaunch {
         profile,
         service,
-        ssh_args,
+        stdio,
+        mode,
+        stun_server,
     }))
 }
 
@@ -200,20 +241,201 @@ fn run_child(command_name: &str, binary: PathBuf, args: &[String]) -> ExitCode {
     }
 }
 
-fn connect_command(args: impl Iterator<Item = String>) -> ExitCode {
+async fn connect_command(args: impl Iterator<Item = String>) -> ExitCode {
     let launch = match parse_connect(args) {
         Ok(Some(launch)) => launch,
         Ok(None) => return ExitCode::SUCCESS,
         Err(code) => return code,
     };
 
-    let _service = launch.service;
-    let mut ssh_args = Vec::with_capacity(2 + launch.ssh_args.len());
-    ssh_args.push("connect".to_string());
-    ssh_args.push(launch.profile);
-    ssh_args.extend(launch.ssh_args);
+    match run_connect(launch).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e:?}");
+            ExitCode::from(EX_UNAVAILABLE)
+        }
+    }
+}
 
-    run_child("connect", ssh_path(), &ssh_args)
+async fn run_connect(launch: ConnectLaunch) -> Result<()> {
+    let intent = resolve_connection_intent(&launch)?;
+    if intent.service != "ssh" {
+        anyhow::bail!(
+            "isekai-pipe connect: unsupported service in ConnectionIntent: {}",
+            intent.service
+        );
+    }
+
+    let stream: Box<dyn ByteStream> = match intent.transport {
+        IntentTransport::Relay {
+            helper_addr,
+            server_name,
+            session_secret_b64,
+        } => {
+            let factory = SystemQuicEndpointFactory;
+            connect_via_relay(
+                &factory,
+                &RelayTarget {
+                    helper_addr: helper_addr
+                        .parse()
+                        .with_context(|| format!("invalid relay helper_addr {helper_addr:?}"))?,
+                    server_name,
+                    cert_sha256_hex: intent.expected_server_identity.cert_sha256_hex,
+                    session_secret: decode_secret(&session_secret_b64)?,
+                },
+            )
+            .await
+            .context("isekai-pipe connect: relay transport failed")?
+        }
+        IntentTransport::StunP2p {
+            stun_server,
+            peer_addr,
+            server_name,
+            session_secret_b64,
+        } => connect_stun_p2p(
+            stun_server
+                .parse()
+                .with_context(|| format!("invalid stun_server {stun_server:?}"))?,
+            &StunP2pTarget {
+                peer_addr: peer_addr
+                    .parse()
+                    .with_context(|| format!("invalid stun peer_addr {peer_addr:?}"))?,
+                server_name,
+                cert_sha256_hex: intent.expected_server_identity.cert_sha256_hex,
+                session_secret: decode_secret(&session_secret_b64)?,
+            },
+        )
+        .await
+        .map(|conn| conn.stream)
+        .context("isekai-pipe connect: STUN P2P transport failed")?,
+    };
+
+    relay_stdio(stream).await
+}
+
+fn resolve_connection_intent(launch: &ConnectLaunch) -> Result<ConnectionIntent> {
+    if let Some(intent_id) = std::env::var_os("ISEKAI_INTENT_ID") {
+        let intent_id = intent_id.to_string_lossy();
+        let runtime_dir = default_runtime_dir()
+            .context("isekai-pipe connect: could not determine runtime dir")?;
+        return claim_connection_intent(&runtime_dir, &intent_id)
+            .context("isekai-pipe connect: failed to claim ConnectionIntent");
+    }
+
+    let profile = launch.profile.as_deref().context("missing profile")?;
+    let service = launch
+        .service
+        .as_ref()
+        .map(|service| service.name().as_str())
+        .unwrap_or("ssh");
+    intent_from_profile(profile, service, launch)
+}
+
+fn intent_from_profile(
+    profile: &str,
+    service: &str,
+    launch: &ConnectLaunch,
+) -> Result<ConnectionIntent> {
+    let key = isekai_trust::normalize_host_port(profile)
+        .with_context(|| format!("isekai-pipe connect: invalid profile {profile:?}"))?;
+    let store_path = isekai_trust::default_trust_store_path()
+        .context("isekai-pipe connect: could not determine trust store path")?;
+    let store = isekai_trust::load_trust_store(&store_path).with_context(|| {
+        format!(
+            "isekai-pipe connect: failed to load {}",
+            store_path.display()
+        )
+    })?;
+    let entry = store.get(&key).with_context(|| {
+        format!(
+            "isekai-pipe connect: profile {profile:?} is not trusted yet (looked up as {key:?})"
+        )
+    })?;
+
+    let transport = match launch.mode {
+        ConnectMode::Relay => IntentTransport::Relay {
+            helper_addr: entry.cached_relay_addr.clone(),
+            server_name: "isekai-helper".to_string(),
+            session_secret_b64: entry.cached_session_secret.clone(),
+        },
+        ConnectMode::Stun => IntentTransport::StunP2p {
+            stun_server: launch
+                .stun_server
+                .clone()
+                .context("isekai-pipe connect: --stun-server is required with --mode stun")?,
+            peer_addr: entry.cached_relay_addr.clone(),
+            server_name: "isekai-helper".to_string(),
+            session_secret_b64: entry.cached_session_secret.clone(),
+        },
+    };
+
+    Ok(ConnectionIntent::new(
+        profile,
+        service,
+        ServerIdentity {
+            cert_sha256_hex: entry.cached_cert_sha256.clone(),
+        },
+        transport,
+        BootstrapProvenance::TrustStore { key },
+    ))
+}
+
+fn decode_secret(b64: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .context("invalid session_secret_b64")
+}
+
+async fn relay_stdio(stream: Box<dyn ByteStream>) -> Result<()> {
+    let (mut quic_read, mut quic_write) = stream.split();
+    let mut c2h = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = stdin.read(&mut buf).await.context("reading stdin failed")?;
+            if n == 0 {
+                let _ = quic_write.shutdown().await;
+                return Ok::<_, anyhow::Error>(());
+            }
+            quic_write
+                .write_all(&buf[..n])
+                .await
+                .context("writing to remote stream failed")?;
+        }
+    });
+    let mut h2c = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = quic_read
+                .read(&mut buf)
+                .await
+                .context("reading remote stream failed")?;
+            if n == 0 {
+                return Ok::<_, anyhow::Error>(());
+            }
+            stdout
+                .write_all(&buf[..n])
+                .await
+                .context("writing stdout failed")?;
+            stdout.flush().await.context("flushing stdout failed")?;
+        }
+    });
+
+    let (mut c2h_done, mut h2c_done) = (false, false);
+    while !c2h_done || !h2c_done {
+        tokio::select! {
+            res = &mut c2h, if !c2h_done => {
+                c2h_done = true;
+                res.context("stdin->remote task panicked")??;
+            }
+            res = &mut h2c, if !h2c_done => {
+                h2c_done = true;
+                res.context("remote->stdout task panicked")??;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>, ExitCode> {
@@ -347,23 +569,24 @@ mod tests {
             "30",
         ]);
 
-        assert_eq!(launch.profile, "production");
+        assert_eq!(launch.profile.as_deref(), Some("production"));
         assert_eq!(
             launch.service,
-            ServiceSpec::new(isekai_pipe_core::ServiceName::new("ssh"), "legacy-connect").unwrap()
+            Some(
+                ServiceSpec::new(isekai_pipe_core::ServiceName::new("ssh"), "legacy-connect")
+                    .unwrap()
+            )
         );
-        assert_eq!(
-            launch.ssh_args,
-            vec!["--mode", "relay", "--resume-window", "30"]
-        );
+        assert!(launch.stdio);
+        assert_eq!(launch.mode, ConnectMode::Relay);
     }
 
     #[test]
     fn connect_accepts_positional_profile_for_compatibility() {
         let launch = parse_connect_args(&["production", "--service", "ssh", "--stdio"]);
 
-        assert_eq!(launch.profile, "production");
-        assert!(launch.ssh_args.is_empty());
+        assert_eq!(launch.profile.as_deref(), Some("production"));
+        assert!(launch.stdio);
     }
 
     #[test]
@@ -431,7 +654,8 @@ mod tests {
     }
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         None | Some("-h") | Some("--help") | Some("help") => {
@@ -442,7 +666,7 @@ fn main() -> ExitCode {
             println!("isekai-pipe {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Some("connect") => connect_command(args),
+        Some("connect") => connect_command(args).await,
         Some("serve") => serve_command(args),
         Some("probe") => unimplemented_command("probe"),
         Some("inspect") => unimplemented_command("inspect"),
