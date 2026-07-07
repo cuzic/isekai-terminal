@@ -133,7 +133,7 @@ OPTIONS:
 bind に成功した直後、accept ループに入る前に、**1行だけ** JSON を stdout に出力する。
 
 ```json
-{"v":1,"listen_port":45231,"cert_sha256":"3a7f...（hex, 64文字）","session_secret":"base64エンコードされた32byte","stun_observed_addr":"203.0.113.5:45231","relay_public_addr":null}
+{"v":1,"listen_port":45231,"cert_sha256":"3a7f...（hex, 64文字）","session_secret":"base64エンコードされた32byte","stun_observed_addr":"203.0.113.5:45231","relay_public_addr":null,"protocol":{"name":"isekai-pipe","alpn":"isekai-helper/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f...（hex, 64文字）"}},"services":[{"name":"ssh","target":"127.0.0.1:22"}],"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"},{"kind":"server-reflexive","endpoint":"203.0.113.5:45231","source":"stun"}]}
 ```
 
 - `v`: ハンドシェイクフォーマットのバージョン（将来の破壊的変更に備える）
@@ -151,6 +151,22 @@ bind に成功した直後、accept ループに入る前に、**1行だけ** JS
   公開アドレス（`"ip:port"` 文字列、`--relay`成功時は必ず存在する——STUNと異なり中間失敗時の
   フォールバック余地が無く、relay接続自体が失敗すればhelperの起動自体が失敗するため）。
   isekai-terminal はこのアドレスへ直接QUIC接続する（`ssh_host`とは無関係の別アドレス）。
+- `protocol`: この process が話す pipe/helper wire protocol。現行は `name=isekai-pipe`,
+  `alpn=isekai-helper/1`。ALPN は QUIC/TLS の実値と一致させる。
+- `peer.server_identity`: bootstrap SSH channel で導入される remote peer の暗号学的 identity。
+  現行は top-level `cert_sha256` と同じ QUIC 証明書 fingerprint を
+  `kind=quic-cert-sha256` として表す。
+- `services`: serve 側が公開する service policy。v1 は単一 service のみで、`isekai-pipe serve
+  --service ssh=127.0.0.1:22` なら `name=ssh`, `target=127.0.0.1:22` になる。client は任意の
+  target を指定せず、service 名で OPEN する。
+- `candidates`: 実行時に得られた到達候補。`direct-by-bootstrap-host` は public IP を helper が
+  知っているという意味ではなく、client が既に知っている bootstrap SSH host と `port` を組み合わせて
+  試す互換 path を表す。`server-reflexive` は STUN 観測値、`relayed` は ISEKAI-link/MASQUE relay が
+  割り当てた公開 endpoint を表す。
+
+`listen_port` / `cert_sha256` / `session_secret` / `stun_observed_addr` / `relay_public_addr` は
+既存 client 用の互換フィールドとして維持する。新しい実装は `peer` / `services` / `candidates`
+を優先して解釈してよいが、旧フィールドだけの handshake JSON も引き続き受理しなければならない。
 
 SSH 側の呼び出し例（ブートストラップスクリプトのイメージ、Phase 7-3 で実装・実機検証済み、
 Phase 10-1c で固定パス共有による衝突バグを踏んで `mktemp -d` へ変更）:

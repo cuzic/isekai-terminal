@@ -753,6 +753,8 @@ async fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
     };
 
     let mut helper_args = launch.helper_args;
+    helper_args.push("--service-name".to_string());
+    helper_args.push(launch.service.name().as_str().to_string());
     helper_args.push("--target".to_string());
     helper_args.push(launch.service.target().to_string());
 

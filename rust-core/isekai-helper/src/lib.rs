@@ -47,6 +47,7 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Args {
     target: SocketAddr,
+    service_name: String,
     bind: SocketAddr,
     idle_timeout: u64,
     resume_window: u64,
@@ -137,6 +138,7 @@ fn print_help() {
 
 fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+    let mut service_name = "ssh".to_string();
     let mut bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let mut idle_timeout = 15u64;
     // 実機検証（Phase 8-4b）で、reattach が5回とも失敗する最悪ケースは
@@ -164,6 +166,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
                     .parse()
                     .context("invalid --target value")?;
             }
+            "--service-name" => service_name = next_val(&mut iter, "--service-name")?,
             "--bind" => {
                 bind = next_val(&mut iter, "--bind")?
                     .parse()
@@ -265,8 +268,12 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--relay cannot be combined with --stun-server/--punch-peer (different P2P transports)"
         ));
     }
+    if service_name.is_empty() {
+        return Err(anyhow!("--service-name must not be empty"));
+    }
     Ok(Args {
         target,
+        service_name,
         bind,
         idle_timeout,
         resume_window,
@@ -457,15 +464,55 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         (endpoint, stun_observed_addr, None)
     };
     let listen_port = endpoint.local_addr()?.port();
+    let session_secret_b64 = base64::engine::general_purpose::STANDARD.encode(session_secret);
+    let stun_observed_addr_json = stun_observed_addr.map(|a| a.to_string());
+    let relay_public_addr_json = relay_public_addr.map(|a| a.to_string());
+
+    let mut candidates = vec![serde_json::json!({
+        "kind": "direct-by-bootstrap-host",
+        "port": listen_port,
+        "source": "bootstrap-ssh",
+    })];
+    if let Some(addr) = &stun_observed_addr_json {
+        candidates.push(serde_json::json!({
+            "kind": "server-reflexive",
+            "endpoint": addr,
+            "source": "stun",
+        }));
+    }
+    if let Some(addr) = &relay_public_addr_json {
+        candidates.push(serde_json::json!({
+            "kind": "relayed",
+            "endpoint": addr,
+            "source": "isekai-link-relay",
+        }));
+    }
 
     // 起動ハンドシェイク JSON を stdout に1行だけ出力し、明示的に flush する。
     let handshake = serde_json::json!({
         "v": 1,
         "listen_port": listen_port,
         "cert_sha256": cert_sha256,
-        "session_secret": base64::engine::general_purpose::STANDARD.encode(session_secret),
-        "stun_observed_addr": stun_observed_addr.map(|a| a.to_string()),
-        "relay_public_addr": relay_public_addr.map(|a| a.to_string()),
+        "session_secret": session_secret_b64,
+        "stun_observed_addr": stun_observed_addr_json,
+        "relay_public_addr": relay_public_addr_json,
+        "protocol": {
+            "name": "isekai-pipe",
+            "alpn": "isekai-helper/1",
+        },
+        "peer": {
+            "server_identity": {
+                "kind": "quic-cert-sha256",
+                "cert_sha256": cert_sha256,
+            },
+        },
+        "services": [
+            {
+                "name": args.service_name,
+                "target": args.target.to_string(),
+            },
+        ],
+        "candidates": candidates,
     });
     {
         let mut stdout = std::io::stdout();
