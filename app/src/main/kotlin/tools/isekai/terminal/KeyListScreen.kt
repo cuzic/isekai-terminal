@@ -13,6 +13,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -58,6 +61,10 @@ fun KeyListScreen(
     // Key generation dialog
     if (showGenDialog) {
         AlertDialog(
+            // AlertDialog は別ウィンドウ(Dialog)で描画されるため、MainActivity の
+            // ルートに設定した testTagsAsResourceId はここには伝播しない(実機で確認済み)。
+            // ダイアログ単位で明示的に有効化する必要がある。
+            modifier = Modifier.semantics { testTagsAsResourceId = BuildConfig.DEBUG },
             onDismissRequest = { if (!isGenerating) showGenDialog = false },
             title = { Text("ed25519 鍵を生成") },
             text = {
@@ -67,7 +74,7 @@ fun KeyListScreen(
                         onValueChange = { genLabel = it; genError = null },
                         label = { Text("ラベル") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().testTag("generateKeyLabelField"),
                     )
                     genError?.let { Text(it, color = AppColors.Error, fontSize = 12.sp) }
                 }
@@ -84,10 +91,15 @@ fun KeyListScreen(
                         )
                     },
                     enabled = !isGenerating,
+                    modifier = Modifier.testTag("generateKeyConfirmButton"),
                 ) { Text(if (isGenerating) "生成中…" else "生成") }
             },
             dismissButton = {
-                TextButton(onClick = { showGenDialog = false }, enabled = !isGenerating) {
+                TextButton(
+                    onClick = { showGenDialog = false },
+                    enabled = !isGenerating,
+                    modifier = Modifier.testTag("generateKeyCancelButton"),
+                ) {
                     Text("キャンセル")
                 }
             },
@@ -97,6 +109,7 @@ fun KeyListScreen(
     // Generated public key copy dialog
     generatedPubKey?.let { pubKey ->
         AlertDialog(
+            modifier = Modifier.semantics { testTagsAsResourceId = BuildConfig.DEBUG },
             onDismissRequest = { vm.dismissGeneratedPubKey() },
             title = { Text("鍵を生成しました") },
             text = {
@@ -112,14 +125,20 @@ fun KeyListScreen(
                 }
             },
             confirmButton = {
-                TextButton(onClick = {
-                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(ClipData.newPlainText("public key", pubKey))
-                    vm.dismissGeneratedPubKey()
-                }) { Text("コピーして閉じる") }
+                TextButton(
+                    onClick = {
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("public key", pubKey))
+                        vm.dismissGeneratedPubKey()
+                    },
+                    modifier = Modifier.testTag("copyGeneratedKeyButton"),
+                ) { Text("コピーして閉じる") }
             },
             dismissButton = {
-                TextButton(onClick = { vm.dismissGeneratedPubKey() }) { Text("閉じる") }
+                TextButton(
+                    onClick = { vm.dismissGeneratedPubKey() },
+                    modifier = Modifier.testTag("dismissGeneratedKeyButton"),
+                ) { Text("閉じる") }
             },
         )
     }
@@ -133,10 +152,11 @@ fun KeyListScreen(
                 SmallFloatingActionButton(
                     onClick = { genLabel = ""; genError = null; showGenDialog = true },
                     containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                    modifier = Modifier.testTag("generateKeyFab"),
                 ) {
                     Text("生成", fontSize = 11.sp)
                 }
-                FloatingActionButton(onClick = onImportKey) {
+                FloatingActionButton(onClick = onImportKey, modifier = Modifier.testTag("importKeyFab")) {
                     Text("＋", fontSize = 24.sp)
                 }
             }
@@ -156,7 +176,9 @@ fun KeyListScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text("鍵一覧", color = Color.White, fontSize = 18.sp)
-                TextButton(onClick = onBack) { Text("戻る", color = AppColors.SecondaryText) }
+                TextButton(onClick = onBack, modifier = Modifier.testTag("keyListBackButton")) {
+                    Text("戻る", color = AppColors.SecondaryText)
+                }
             }
 
             if (keys.isEmpty()) {
@@ -216,8 +238,12 @@ private fun KeyCard(
             fontSize = 11.sp,
         )
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TextButton(onClick = onCopy) { Text("コピー", color = Color.Cyan, fontSize = 12.sp) }
-            TextButton(onClick = onDelete) { Text("削除", color = AppColors.Error, fontSize = 12.sp) }
+            TextButton(onClick = onCopy, modifier = Modifier.testTag("keyCopyButton")) {
+                Text("コピー", color = Color.Cyan, fontSize = 12.sp)
+            }
+            TextButton(onClick = onDelete, modifier = Modifier.testTag("keyDeleteButton")) {
+                Text("削除", color = AppColors.Error, fontSize = 12.sp)
+            }
         }
     }
 }

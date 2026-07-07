@@ -11,6 +11,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -50,7 +52,13 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(
-                    modifier = Modifier.fillMaxSize(),
+                    // デバッグビルドのみ testTag を uiautomator dump 上の resource-id として
+                    // 露出する(scripts/device_verify.sh がテキストではなく resource-id で
+                    // 要素を掴めるようにするため)。リリースビルドでは無効(アクセシビリティ
+                    // サービス経由で内部タグ名が外部に見える面を増やさない)。
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .semantics { testTagsAsResourceId = BuildConfig.DEBUG },
                     color = MaterialTheme.colorScheme.background
                 ) {
                     AppRoot()

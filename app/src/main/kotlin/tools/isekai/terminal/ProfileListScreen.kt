@@ -38,6 +38,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -137,7 +138,7 @@ fun ProfileListScreen(
             }
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = onAddProfile) {
+            FloatingActionButton(onClick = onAddProfile, modifier = Modifier.testTag("addProfileFab")) {
                 Text("＋", fontSize = 24.sp)
             }
         }
@@ -343,8 +344,8 @@ private fun ProfileCard(
                     color = MaterialTheme.colorScheme.primary,
                 )
             }
-            TextButton(onClick = onEdit) { Text("編集") }
-            TextButton(onClick = onDelete) { Text("削除") }
+            TextButton(onClick = onEdit, modifier = Modifier.testTag("profileEditButton")) { Text("編集") }
+            TextButton(onClick = onDelete, modifier = Modifier.testTag("profileDeleteButton")) { Text("削除") }
         }
     }
 }

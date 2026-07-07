@@ -22,6 +22,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -128,7 +129,7 @@ private fun TabLabel(
         IconButton(onClick = { showThemeDialog = true }, modifier = Modifier.size(20.dp)) {
             Text("🎨", fontSize = 12.sp)
         }
-        IconButton(onClick = onClose, modifier = Modifier.size(20.dp)) {
+        IconButton(onClick = onClose, modifier = Modifier.size(20.dp).testTag("closeTabButton")) {
             Text("×", color = Color(0xFFAAAAAA), fontSize = 16.sp)
         }
     }

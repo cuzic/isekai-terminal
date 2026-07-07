@@ -629,6 +629,15 @@ TCP SSH の遅延と切断耐性を実測する。
 |---|---|
 | `scripts/measure_latency.sh` | Phase 5 判断ゲート: TCP SSH 往復遅延計測 |
 | `scripts/capture_trzsz_log.sh` | Phase 4D: trzsz 転送ログ（isekai-terminal-core）キャプチャ |
+| `scripts/device_verify.sh` | 実機での動作確認（本ファイルの手順のうち adb だけで完結する範囲）を自動化。uiautomator dump ベースの座標タップで UI を操作し、logcat の期待ログ行を検証する。`--help` 参照。 |
+
+> **Note**: `scripts/device_verify.sh` 作成時点（2026-07-05）で、本ファイルの一部のセクション
+> （1, 9, 10, 12 の期待ログ例）はタブ化（複数セッション対応）以前の実装を前提にしており、
+> 現行実装のログ文言と食い違っている（例:「TerminalViewModel created/cleared」は
+> 存在せず「TerminalTabsViewModel created/cleared」に統合、`(session=...)`/`(rotationRecovery=...)`
+> 等の括弧書きは軒並み削除、`terminal geometry`/`resize →` のログは削除済み、
+> `IsekaiTerminalSvc` タグのログは無し）。`scripts/device_verify.sh` は現行実装に
+> 合わせて書き直し済みなので、そちらのアサーションを正とすること。
 
 ---
 

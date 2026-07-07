@@ -187,14 +187,14 @@ fun ProfileEditScreen(
             onValueChange = { label = it },
             label = { Text("ラベル") },
             singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().testTag("profileLabelField"),
         )
         OutlinedTextField(
             value = host,
             onValueChange = { host = it },
             label = { Text("ホスト") },
             singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().testTag("profileHostField"),
         )
         OutlinedTextField(
             value = port,
@@ -202,14 +202,14 @@ fun ProfileEditScreen(
             label = { Text("ポート") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().testTag("profilePortField"),
         )
         OutlinedTextField(
             value = username,
             onValueChange = { username = it },
             label = { Text("ユーザー名") },
             singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().testTag("profileUsernameField"),
         )
 
         Text("認証方式")
@@ -218,11 +218,13 @@ fun ProfileEditScreen(
                 selected = authType == "password",
                 onClick = { authType = "password" },
                 label = { Text("パスワード") },
+                modifier = Modifier.testTag("authTypePasswordChip"),
             )
             FilterChip(
                 selected = authType == "key",
                 onClick = { authType = "key" },
                 label = { Text("鍵認証") },
+                modifier = Modifier.testTag("authTypeKeyChip"),
             )
         }
 
@@ -241,7 +243,8 @@ fun ProfileEditScreen(
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .menuAnchor(MenuAnchorType.PrimaryNotEditable),
+                        .menuAnchor(MenuAnchorType.PrimaryNotEditable)
+                        .testTag("profileKeyDropdownField"),
                 )
                 ExposedDropdownMenu(
                     expanded = keyMenuExpanded,
@@ -878,11 +881,15 @@ fun ProfileEditScreen(
                     vm.save(saved) { onSave() }
                 },
                 enabled = canSave && !isSaving,
+                modifier = Modifier.testTag("profileSaveButton"),
             ) { Text("保存") }
-            OutlinedButton(onClick = {
-                RemoteLogger.i("IsekaiTerminalProfile", "cancelled profile edit (${if (profile == null) "new" else "id=${profile.id} '${profile.label}'"})")
-                onCancel()
-            }) { Text("キャンセル") }
+            OutlinedButton(
+                onClick = {
+                    RemoteLogger.i("IsekaiTerminalProfile", "cancelled profile edit (${if (profile == null) "new" else "id=${profile.id} '${profile.label}'"})")
+                    onCancel()
+                },
+                modifier = Modifier.testTag("profileCancelButton"),
+            ) { Text("キャンセル") }
         }
     }
 }
