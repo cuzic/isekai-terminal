@@ -67,6 +67,8 @@ cleanup() {
         for f in "$WORKDIR"/sshd.log "$WORKDIR"/serve.stdout "$WORKDIR"/serve.stderr "$WORKDIR"/ssh.log; do
             [ -f "$f" ] && { echo "--- $f ---" >&2; cat "$f" >&2; }
         done
+        echo "--- dmesg (tail) ---" >&2
+        dmesg -T 2>&1 | tail -80 >&2
     fi
     netlab_down
     rm -rf "$WORKDIR"
@@ -114,8 +116,8 @@ for _ in $(seq 1 50); do
 done
 
 # --- isekai-pipe serve: server ns内、UDPを直接bind(direct mode)。
-ip netns exec "$NETLAB_SERVER_NS" "$ISEKAI_PIPE_BIN" serve \
-    --target 127.0.0.1:2222 --bind 0.0.0.0:0 --once --log-level debug \
+ip netns exec "$NETLAB_SERVER_NS" env RUST_LOG=trace "$ISEKAI_PIPE_BIN" serve \
+    --target 127.0.0.1:2222 --bind 0.0.0.0:0 --once --log-level trace \
     > "$WORKDIR/serve.stdout" 2> "$WORKDIR/serve.stderr" &
 SERVE_PID=$!
 
@@ -161,7 +163,7 @@ LOCAL_SUM="$(sha256sum "$WORKDIR/payload.bin" | awk '{print $1}')"
 set +e
 timeout 60 ip netns exec "$NETLAB_CLIENT_NS" env \
     HOME="$CLIENT_HOME" PATH="$PATH" \
-    RUST_LOG=isekai_transport=debug,isekai_pipe=debug \
+    RUST_LOG=trace \
     ssh -F /dev/null \
         -o IdentityFile="$WORKDIR/client_key" \
         -o IdentitiesOnly=yes \
