@@ -1,24 +1,33 @@
 //! Minimal OpenSSH frontend for the `chatgpt.md` migration path.
 //!
-//! Existing subcommands (`connect`, `init`, `login`, `logout`) remain the
-//! compatibility surface. A non-subcommand invocation, such as
-//! `isekai-ssh production`, is treated as an OpenSSH invocation with an
-//! injected `ProxyCommand` that delegates the byte stream to `isekai-pipe
-//! connect`.
+//! `init`/`login`/`logout` remain as the interactive trust-store
+//! subcommands. A non-subcommand invocation, such as `isekai-ssh
+//! production`, is treated as an OpenSSH invocation with an injected
+//! `ProxyCommand` that delegates the byte stream to `isekai-pipe connect`.
 
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
+use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend};
 use isekai_pipe_core::{
     default_runtime_dir, write_connection_intent, BootstrapProvenance, ConnectionIntent,
     IntentTransport, ServerIdentity, ServiceSpec, DEFAULT_CANDIDATE_RACE_DELAY_MS,
     DEFAULT_RELAY_DELAY_MS,
 };
+use isekai_trust::{HelperTrust, UpdatePolicy};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-const LEGACY_SUBCOMMANDS: &[&str] = &["connect", "init", "login", "logout"];
+const LEGACY_SUBCOMMANDS: &[&str] = &["init", "login", "logout"];
+
+/// Matches `isekai-ssh init`'s own default (`cli::InitArgs::idle_lifetime`):
+/// the auto-bootstrapped helper is expected to keep running across many
+/// separate `isekai-ssh <destination>` invocations, possibly hours/days
+/// apart, unlike `isekai-terminal-core`'s (Android's) per-session bootstrap.
+const DEFAULT_IDLE_LIFETIME_SECS: u64 = 2_592_000;
 
 #[derive(Debug, PartialEq, Eq)]
 struct WrapperPlan {
@@ -37,6 +46,12 @@ struct WrapperIsekaiOptions {
     direct: bool,
     explain: bool,
     dry_run: bool,
+    /// Local path to the `isekai-helper` binary to upload when auto
+    /// bootstrap is triggered (`--isekai-helper-binary`). No embedded
+    /// default exists yet — see `cli::InitArgs::helper_binary`'s doc comment
+    /// for why this stays an explicit, required-when-needed argument rather
+    /// than a guessed default.
+    helper_binary: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -125,12 +140,11 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
     let intent = match build_connection_intent(&resolution) {
         Ok(intent) => intent,
         Err(err) if should_bootstrap(&plan, &resolution) => {
-            return Err(anyhow!(
-                "{err}\n\
-                 isekai-ssh: bootstrap is required, but automatic `isekai-pipe serve` deployment is not wired yet. \
-                 resolved bootstrap candidates: {:?}",
-                resolution.isekai.bootstrap_candidates
-            ));
+            bootstrap_and_register(&plan, &resolution)
+                .await
+                .with_context(|| format!("{err}\nisekai-ssh: auto-bootstrap failed"))?;
+            build_connection_intent(&resolution)
+                .context("isekai-ssh: still not trusted after auto-bootstrap")?
         }
         Err(err) => return Err(err),
     };
@@ -212,7 +226,175 @@ fn build_connection_intent(resolution: &WrapperResolution) -> Result<ConnectionI
     intent.relay_endpoints = resolution.isekai.relay_endpoints.clone();
     intent.candidate_race_delay_ms = resolution.isekai.candidate_race_delay_ms;
     intent.relay_delay_ms = resolution.isekai.relay_delay_ms;
+    intent.resume_grace_secs = resolution.isekai.resume_grace_secs;
     Ok(intent)
+}
+
+/// Deploys `isekai-helper` to the highest-priority bootstrap candidate in
+/// `direct-by-bootstrap-host` mode (no relay, no STUN — see this module's
+/// docs) and, after an explicit `[y/N]` confirmation, registers it in the
+/// trust store `build_connection_intent` reads from. Mirrors `init.rs`'s
+/// deploy-then-confirm-then-register flow, but triggered automatically by
+/// `run()` on a trust-store miss instead of via the standalone `init`
+/// subcommand.
+///
+/// Scoped deliberately narrow: only a single (or absent) `--via` hop is
+/// supported, and only the `direct-by-bootstrap-host` candidate — relay/STUN
+/// auto-bootstrap needs a JWT source that doesn't exist yet
+/// (`archive/ISEKAI_PIPE_MIGRATION.md` P4). A host that only has relay/STUN
+/// candidates, or a multi-hop `--via` chain, still needs `isekai-ssh init`.
+async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution) -> Result<()> {
+    let helper_binary_path = plan.isekai.helper_binary.as_ref().ok_or_else(|| {
+        anyhow!(
+            "no --isekai-helper-binary given (or `isekai-ssh init` was never run for this host); \
+             auto-bootstrap needs a local isekai-helper binary to upload"
+        )
+    })?;
+    let candidate = resolution
+        .isekai
+        .bootstrap_candidates
+        .iter()
+        .max_by_key(|candidate| candidate.priority)
+        .ok_or_else(|| anyhow!("no bootstrap candidates were resolved"))?;
+
+    let (host, port) = candidate
+        .target
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("bootstrap candidate target {:?} is not host:port", candidate.target))?;
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("bootstrap candidate target {:?} has an invalid port", candidate.target))?;
+    let target = HostSpec::new(host).with_port(port);
+
+    let via = match candidate.via.as_slice() {
+        [] => None,
+        [single] => {
+            let (via_host, via_port, via_user) = isekai_trust::split_user_host_port(single)
+                .with_context(|| format!("invalid --via hop {single:?}"))?;
+            let mut spec = JumpSpec::new(via_host);
+            if let Some(port) = via_port {
+                spec = spec.with_port(port);
+            }
+            if let Some(user) = via_user {
+                spec = spec.with_user(user);
+            }
+            Some(spec)
+        }
+        multiple => {
+            return Err(anyhow!(
+                "auto-bootstrap only supports a single --via hop, got {}: {:?} — run `isekai-ssh init` instead",
+                multiple.len(),
+                multiple
+            ));
+        }
+    };
+
+    let helper_binary = std::fs::read(helper_binary_path)
+        .with_context(|| format!("failed to read helper binary at {}", helper_binary_path.display()))?;
+    let helper_sha256 = hex_sha256(&helper_binary);
+
+    eprintln!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
+    let backend = OpenSshBackend::new();
+    let report = backend
+        .install_and_start(
+            &target,
+            via.as_ref(),
+            &helper_binary,
+            &LaunchSpec::Direct { idle_lifetime_secs: DEFAULT_IDLE_LIFETIME_SECS },
+            resolution.isekai.remote_path.as_deref(),
+        )
+        .await
+        .with_context(|| format!("failed to deploy/start isekai-helper on {:?}", candidate.target))?;
+    let handshake = &report.handshake;
+    let direct_port = handshake
+        .direct_by_bootstrap_host_port()
+        .ok_or_else(|| anyhow!("isekai-helper did not advertise a direct-by-bootstrap-host candidate"))?;
+    let identity = handshake.cert_sha256().to_string();
+
+    eprintln!();
+    eprintln!("Host:            {}", candidate.target);
+    eprintln!("Helper identity: {identity}");
+    eprintln!("Binary sha256:   {helper_sha256}");
+    eprintln!();
+    eprint!(
+        "Trust this isekai-helper and register it for {:?}? [y/N] ",
+        resolution.isekai.profile
+    );
+    std::io::stderr().flush().ok();
+
+    let mut reader = BufReader::new(tokio::io::stdin());
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .context("failed to read confirmation from stdin")?;
+    if !matches!(line.trim(), "y" | "Y") {
+        return Err(anyhow!("aborted — user declined the trust confirmation"));
+    }
+
+    let store_path = isekai_trust::default_trust_store_path()
+        .context("could not determine the trust store path (is $HOME set?)")?;
+    let mut store = isekai_trust::load_trust_store(&store_path)
+        .with_context(|| format!("failed to load trust store at {}", store_path.display()))?;
+    let key = isekai_trust::normalize_host_port(&resolution.isekai.profile)
+        .with_context(|| format!("invalid profile {:?}", resolution.isekai.profile))?;
+    let now = now_rfc3339();
+    store.insert(
+        key.clone(),
+        HelperTrust {
+            identity_pubkey: identity.clone(),
+            trusted_helper_sha256: helper_sha256,
+            trusted_helper_version: "unknown".to_string(),
+            update_policy: UpdatePolicy::ExactDigestOnly,
+            release_channel: None,
+            last_via: candidate.via.first().cloned(),
+            trusted_at: now.clone(),
+            last_seen_at: now,
+            cached_relay_addr: format!("{host}:{direct_port}"),
+            cached_cert_sha256: identity,
+            cached_session_secret: handshake.session_secret.clone(),
+        },
+    );
+    isekai_trust::save_trust_store(&store_path, &store)
+        .with_context(|| format!("failed to write trust store at {}", store_path.display()))?;
+    eprintln!("Registered {key:?} in {}", store_path.display());
+    Ok(())
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Current UTC time formatted as RFC 3339, matching `init.rs`'s own
+/// `now_rfc3339`/`format_rfc3339_utc` (duplicated rather than shared across
+/// two ~60-line modules for a single timestamp helper).
+fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format_rfc3339_utc(secs)
+}
+
+fn format_rfc3339_utc(unix_secs: u64) -> String {
+    let days = unix_secs / 86_400;
+    let secs_of_day = unix_secs % 86_400;
+    let (hour, minute, second) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn primary_service(config: &IsekaiConfig) -> &ServiceSpec {
@@ -256,6 +438,10 @@ fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
             }
             "--isekai-pipe-path" => {
                 pipe_path = PathBuf::from(next_value(&mut iter, "--isekai-pipe-path")?);
+            }
+            "--isekai-helper-binary" => {
+                isekai.helper_binary =
+                    Some(PathBuf::from(next_value(&mut iter, "--isekai-helper-binary")?));
             }
             _ => ssh_args.push(arg),
         }
@@ -394,6 +580,20 @@ fn resolve_isekai_config(
         builder
             .services
             .push(ServiceSpec::ssh_target("127.0.0.1:22").expect("default service is valid"));
+    }
+    // `install-mode=system` needs sudo handling, ownership/permissions,
+    // overwrite-of-an-existing-binary semantics, signature/hash verification,
+    // and update/rollback — none of which exist yet. Rather than silently
+    // wiring it through as if it were equivalent to `user` (or silently
+    // ignoring it), fail closed here at config-resolution time so a typo'd or
+    // aspirational `#@isekai install-mode system` never gets treated as
+    // meaning something it doesn't (`ISEKAI_PIPE_DESIGN.md`).
+    if builder.install_mode == Some(InstallMode::System) {
+        return Err(anyhow!(
+            "isekai-ssh: '#@isekai install-mode system' is not supported yet (no sudo/ownership/\
+             signature-verification/rollback design exists) — remove the directive or use \
+             'install-mode user'"
+        ));
     }
     Ok(IsekaiConfig {
         enabled: builder.enabled.unwrap_or(true),
@@ -915,7 +1115,9 @@ mod tests {
     #[test]
     fn wrapper_is_only_for_non_subcommand_invocations() {
         assert!(!should_run_wrapper(&s(&[])));
-        assert!(!should_run_wrapper(&s(&["connect", "host"])));
+        assert!(!should_run_wrapper(&s(&["init", "host"])));
+        assert!(!should_run_wrapper(&s(&["login", "host"])));
+        assert!(!should_run_wrapper(&s(&["logout"])));
         assert!(!should_run_wrapper(&s(&["--help"])));
         assert!(should_run_wrapper(&s(&["production"])));
     }
@@ -984,6 +1186,17 @@ last_seen_at = "2026-07-04T00:00:00Z"
 cached_relay_addr = "127.0.0.1:1234"
 cached_cert_sha256 = "ab"
 cached_session_secret = "c2VjcmV0"
+
+[helpers."distinctive:22"]
+identity_pubkey = "pk"
+trusted_helper_sha256 = "sha"
+trusted_helper_version = "0.1.0"
+update_policy = "exact-digest-only"
+trusted_at = "2026-07-04T00:00:00Z"
+last_seen_at = "2026-07-04T00:00:00Z"
+cached_relay_addr = "127.0.0.1:1234"
+cached_cert_sha256 = "ab"
+cached_session_secret = "c2VjcmV0"
 "#;
         std::fs::write(config.join("known_helpers.toml"), trust).unwrap();
         let old_home = std::env::var_os("HOME");
@@ -1002,7 +1215,7 @@ cached_session_secret = "c2VjcmV0"
                 rendezvous: vec!["https://rendezvous.example.com".to_string()],
                 stun_servers: vec!["stun1.example.com:3478".to_string()],
                 relay_endpoints: vec!["masque://relay.example.com".to_string()],
-                resume_grace_secs: 120,
+                resume_grace_secs: 180,
                 candidate_race_delay_ms: 150,
                 relay_delay_ms: 750,
                 install_mode: InstallMode::User,
@@ -1016,6 +1229,7 @@ cached_session_secret = "c2VjcmV0"
         assert_eq!(intent.rendezvous, vec!["https://rendezvous.example.com"]);
         assert_eq!(intent.stun_servers, vec!["stun1.example.com:3478"]);
         assert_eq!(intent.relay_endpoints, vec!["masque://relay.example.com"]);
+        assert_eq!(intent.resume_grace_secs, 180);
         assert_eq!(intent.candidate_race_delay_ms, 150);
         assert_eq!(intent.relay_delay_ms, 750);
         assert_eq!(
@@ -1026,6 +1240,78 @@ cached_session_secret = "c2VjcmV0"
                 session_secret_b64: "c2VjcmV0".to_string()
             }
         );
+
+        // Regression-prevention contract check (ChatGPT second opinion,
+        // 2026-07-08): this project has twice shipped a `#@isekai` directive
+        // that parsed and reached `IsekaiConfig`/`IsekaiConfigBuilder` but was
+        // silently dropped before ever reaching `ConnectionIntent` or the
+        // actual connection (`remote-path` and `resume-grace`, both before
+        // their respective fixes landed). Reusing this test's own `home`/
+        // trust-store fixture (rather than a second test function) avoids a
+        // cross-thread race on the process-global `$HOME` env var that a
+        // separate `#[test]` mutating it concurrently would hit.
+        //
+        // Every directive must be accounted for by *exactly one* of:
+        //   (a) asserted below to change `build_connection_intent`'s output
+        //       when the directive's value changes, or
+        //   (b) verified elsewhere (named in the table) to change some other
+        //       concrete downstream behavior, for a stated reason it is
+        //       deliberately NOT part of `ConnectionIntent`.
+        //
+        // | directive              | consumed by                                                                     |
+        // |------------------------|----------------------------------------------------------------------------------|
+        // | `enabled`              | `run()`'s own branch — controls the wrapper, not a `ConnectionIntent` field       |
+        // | `bootstrap-policy`     | `should_bootstrap()` — controls auto-bootstrap, not a `ConnectionIntent` field    |
+        // | `profile`              | (a) `intent.profile`                                                              |
+        // | `remote-path`          | `bootstrap_and_register` (bootstrap-time only; see `wrapper_auto_bootstrap_honors_remote_path_directive` e2e test) |
+        // | `service`              | (a) `intent.service`                                                              |
+        // | `bootstrap-candidate`  | `bootstrap_and_register`'s candidate selection (bootstrap-time only; no `ConnectionIntent` field exists for it) |
+        // | `link`                 | (a) `intent.link_endpoints`                                                       |
+        // | `rendezvous`           | (a) `intent.rendezvous`                                                           |
+        // | `stun`                 | (a) `intent.stun_servers`                                                         |
+        // | `relay`                | (a) `intent.relay_endpoints`                                                      |
+        // | `resume-grace`         | (a) `intent.resume_grace_secs`                                                    |
+        // | `candidate-race-delay` | (a) `intent.candidate_race_delay_ms`                                              |
+        // | `relay-delay`          | (a) `intent.relay_delay_ms`                                                       |
+        // | `install-mode`         | `resolve_isekai_config`'s fail-closed check for `system` (see `install_mode_system_is_rejected_at_config_resolution`); `user` needs no plumbing (already the only implemented behavior) |
+        //
+        // If a new directive is ever added to `apply_isekai_directive`
+        // without a corresponding row above (and without extending whichever
+        // verification mechanism applies), that omission is itself the exact
+        // class of bug this check exists to catch.
+        let distinctive_isekai = IsekaiConfig {
+            profile: "distinctive".to_string(),
+            services: vec![ServiceSpec::parse("postgres=127.0.0.1:5432").unwrap()],
+            link_endpoints: vec!["https://distinctive.example.com".to_string()],
+            rendezvous: vec!["https://distinctive-rendezvous.example.com".to_string()],
+            stun_servers: vec!["distinctive-stun.example.com:3478".to_string()],
+            relay_endpoints: vec!["masque://distinctive-relay.example.com".to_string()],
+            resume_grace_secs: 999,
+            candidate_race_delay_ms: 987,
+            relay_delay_ms: 8765,
+            ..resolution.isekai.clone()
+        };
+        let distinctive_intent = build_connection_intent(&WrapperResolution {
+            openssh: OpenSshEffectiveConfig::default(),
+            isekai: distinctive_isekai,
+        })
+        .unwrap();
+
+        assert_ne!(intent.profile, distinctive_intent.profile, "profile directive");
+        assert_ne!(intent.service, distinctive_intent.service, "service directive");
+        assert_ne!(intent.link_endpoints, distinctive_intent.link_endpoints, "link directive");
+        assert_ne!(intent.rendezvous, distinctive_intent.rendezvous, "rendezvous directive");
+        assert_ne!(intent.stun_servers, distinctive_intent.stun_servers, "stun directive");
+        assert_ne!(intent.relay_endpoints, distinctive_intent.relay_endpoints, "relay directive");
+        assert_ne!(
+            intent.resume_grace_secs, distinctive_intent.resume_grace_secs,
+            "resume-grace directive"
+        );
+        assert_ne!(
+            intent.candidate_race_delay_ms, distinctive_intent.candidate_race_delay_ms,
+            "candidate-race-delay directive"
+        );
+        assert_ne!(intent.relay_delay_ms, distinctive_intent.relay_delay_ms, "relay-delay directive");
 
         if let Some(old_home) = old_home {
             std::env::set_var("HOME", old_home);
@@ -1067,7 +1353,7 @@ Host production
     #@isekai resume-grace 180s
     #@isekai candidate-race-delay 250ms
     #@isekai relay-delay 900ms
-    #@isekai install-mode system
+    #@isekai install-mode user
 
 Host *
     #@isekai service postgres=127.0.0.1:5432
@@ -1106,7 +1392,29 @@ Host *
         assert_eq!(resolved.resume_grace_secs, 180);
         assert_eq!(resolved.candidate_race_delay_ms, 250);
         assert_eq!(resolved.relay_delay_ms, 900);
-        assert_eq!(resolved.install_mode, InstallMode::System);
+        assert_eq!(resolved.install_mode, InstallMode::User);
+    }
+
+    #[test]
+    fn install_mode_system_is_rejected_at_config_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("ssh_config");
+        std::fs::write(
+            &config,
+            "Host production\n    #@isekai profile production\n    #@isekai install-mode system\n",
+        )
+        .unwrap();
+        let plan = parse_wrapper(s(&["-F", config.to_str().unwrap(), "production"])).unwrap();
+        let openssh = OpenSshEffectiveConfig {
+            hostname: Some("10.20.0.15".to_string()),
+            port: Some(22),
+            ..Default::default()
+        };
+        let err = resolve_isekai_config(&plan, &openssh).unwrap_err();
+        assert!(
+            err.to_string().contains("install-mode system"),
+            "expected a fail-closed error mentioning install-mode system, got: {err}"
+        );
     }
 
     #[test]
