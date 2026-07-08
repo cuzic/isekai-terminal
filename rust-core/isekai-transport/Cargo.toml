@@ -6,6 +6,9 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 isekai-protocol = { path = "../isekai-protocol" }
+# Candidateモデルのpure値型(CandidateDraft/CandidateDraftBatch等)とConnectionIntent。
+# isekai-pipe-coreはisekai-transportに依存しない一方向の依存(circularではない)。
+isekai-pipe-core = { path = "../isekai-pipe-core" }
 # STUN観測アドレス取得（`isekai_stun_p2p_transport.rs`相当の移植、
 # ISEKAI_SSH_DESIGN.md フェーズS-0d-2）。isekai-terminal-core・isekai-helperと共用のpure crate。
 isekai-stun = { path = "../isekai-stun" }
