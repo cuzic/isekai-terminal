@@ -433,13 +433,13 @@ fun ProfileEditScreen(
             modifier = Modifier.horizontalScroll(rememberScrollState()),
         ) {
             FilterChip(
-                selected = transportPreference == TransportPreference.ISEKAI_HELPER_QUIC,
-                onClick = { transportPreference = TransportPreference.ISEKAI_HELPER_QUIC },
+                selected = transportPreference == TransportPreference.ISEKAI_PIPE_QUIC,
+                onClick = { transportPreference = TransportPreference.ISEKAI_PIPE_QUIC },
                 label = { Text("自作ヘルパー QUIC") },
             )
             FilterChip(
-                selected = transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH,
-                onClick = { transportPreference = TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH },
+                selected = transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH,
+                onClick = { transportPreference = TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH },
                 label = { Text("自作ヘルパー QUIC（マルチパス）") },
             )
             FilterChip(
@@ -454,9 +454,9 @@ fun ProfileEditScreen(
             )
         }
 
-        if (transportPreference == TransportPreference.ISEKAI_HELPER_QUIC ||
+        if (transportPreference == TransportPreference.ISEKAI_PIPE_QUIC ||
             transportPreference == TransportPreference.AUTO ||
-            transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH ||
+            transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH ||
             transportPreference == TransportPreference.ISEKAI_STUN_P2P_QUIC ||
             transportPreference == TransportPreference.ISEKAI_LINK_RELAY_QUIC
         ) {
@@ -468,9 +468,9 @@ fun ProfileEditScreen(
             )
         }
 
-        if (transportPreference == TransportPreference.ISEKAI_HELPER_QUIC ||
+        if (transportPreference == TransportPreference.ISEKAI_PIPE_QUIC ||
             transportPreference == TransportPreference.AUTO ||
-            transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH
+            transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH
         ) {
             OutlinedTextField(
                 value = helperBindPort,
@@ -490,7 +490,7 @@ fun ProfileEditScreen(
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            if (transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH &&
+            if (transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH &&
                 directAddress.isNotBlank() && helperBindPort.isBlank()
             ) {
                 Text(
@@ -561,7 +561,7 @@ fun ProfileEditScreen(
             )
         }
 
-        if (transportPreference == TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH) {
+        if (transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH) {
             OutlinedTextField(
                 value = directAddress,
                 onValueChange = { directAddress = it },

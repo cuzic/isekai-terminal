@@ -51,7 +51,7 @@ struct SupervisorState {
 }
 
 /// `SessionState`×`ExecutionMode`の2軸FSMを保持する、判断ロジックのみのオブジェクト。
-/// 意図的にどのtransport(`SshSession`/`HelperQuicSession`等)とも結び付けていない
+/// 意図的にどのtransport(`SshSession`/`IsekaiPipeQuicSession`等)とも結び付けていない
 /// (`.claude/rules/rust-ssot.md`が要求する「状態と、それに基づく意思決定ロジックは
 /// Rust側に置く」を満たす最小単位として切り出し、実際の接続開始/切断呼び出しは
 /// 呼び出し側(Kotlin/Swift)が現在の状態を見て行う。既存`SessionOrchestrator`の

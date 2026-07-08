@@ -871,13 +871,13 @@ external fun uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_laten
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_loss_permille(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_func_create_helper_quic_session(
-): Int
 external fun uniffi_isekai_terminal_core_checksum_func_create_isekai_link_relay_session(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_func_create_isekai_pipe_quic_session(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_func_create_isekai_stun_p2p_session(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_func_create_multipath_helper_quic_session(
+external fun uniffi_isekai_terminal_core_checksum_func_create_multipath_isekai_pipe_quic_session(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator(
 ): Int
@@ -921,30 +921,6 @@ external fun uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_cancel
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_send_chunk(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect_auto(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_disconnect(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_notify_network_lost(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_resize(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_cells(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_len(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_send(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_download(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_upload(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_cancel(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_send_chunk(
-): Int
 external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_connect(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_disconnect(
@@ -966,6 +942,30 @@ external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_
 external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_cancel(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_send_chunk(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_connect(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_connect_auto(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_disconnect(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_notify_network_lost(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_resize(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_scrollback_cells(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_scrollback_len(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_send(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_accept_download(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_accept_upload(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_cancel(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_send_chunk(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_connect(
 ): Int
@@ -989,43 +989,43 @@ external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_tr
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_send_chunk(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_connect(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_connect(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_disconnect(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_disconnect(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_notify_network_lost(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_notify_network_lost(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_rebind_to_fd(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_rebind_to_fd(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_resize(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_resize(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_cells(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_scrollback_cells(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_len(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_scrollback_len(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_send(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_send(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_download(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_accept_download(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_upload(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_accept_upload(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_cancel(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_cancel(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_send_chunk(
+external fun uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_send_chunk(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic(
-): Int
-external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic_auto(
-): Int
 external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_link_relay(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_pipe_quic(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_pipe_quic_auto(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_stun_p2p(
 ): Int
-external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_multipath_helper_quic(
+external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_multipath_isekai_pipe_quic(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic(
 ): Int
@@ -1237,34 +1237,6 @@ external fun uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_cancel(`ptr`
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sshsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_clone_helperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Long
-external fun uniffi_isekai_terminal_core_fn_free_helperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_connect_auto(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
-): RustBuffer.ByValue
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
-): Int
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
 external fun uniffi_isekai_terminal_core_fn_clone_isekailinkrelaysession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_isekai_terminal_core_fn_free_isekailinkrelaysession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1290,6 +1262,34 @@ external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_
 external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_isekailinkrelaysession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_clone_isekaipipequicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_isekai_terminal_core_fn_free_isekaipipequicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_connect_auto(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Int
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_clone_isekaistunp2psession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
@@ -1317,33 +1317,33 @@ external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_ca
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_isekaistunp2psession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_clone_multipathhelperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_clone_multipathisekaipipequicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_isekai_terminal_core_fn_free_multipathhelperquicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_free_multipathisekaipipequicsession(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_connect(`ptr`: Long,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_notify_network_lost(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_rebind_to_fd(`ptr`: Long,`fd`: Int,`localIp`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_rebind_to_fd(`ptr`: Long,`fd`: Int,`localIp`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_resize(`ptr`: Long,`cols`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_scrollback_cells(`ptr`: Long,`offset`: Int,`rows`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_accept_download(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_accept_upload(`ptr`: Long,`transferId`: RustBuffer.ByValue,`fileName`: RustBuffer.ByValue,`fileSize`: Long,`mode`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_cancel(`ptr`: Long,`transferId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_send_chunk(`ptr`: Long,`transferId`: RustBuffer.ByValue,`data`: RustBuffer.ByValue,`isLast`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_clone_sessionorchestrator(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
@@ -1353,15 +1353,15 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_add_local
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
-external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic_auto(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_link_relay(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_pipe_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_pipe_quic_auto(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_stun_p2p(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_multipath_helper_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_multipath_isekai_pipe_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1483,13 +1483,13 @@ external fun uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_latency_ms(
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_loss_permille(`permille`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-external fun uniffi_isekai_terminal_core_fn_func_create_helper_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
-): Long
 external fun uniffi_isekai_terminal_core_fn_func_create_isekai_link_relay_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_isekai_terminal_core_fn_func_create_isekai_pipe_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_isekai_terminal_core_fn_func_create_isekai_stun_p2p_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
-external fun uniffi_isekai_terminal_core_fn_func_create_multipath_helper_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_create_multipath_isekai_pipe_quic_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_isekai_terminal_core_fn_func_create_session_orchestrator(`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
@@ -1649,22 +1649,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_func_debug_restore_udp_fault() != 44289) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_latency_ms() != 6689) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_latency_ms() != 5729) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_loss_permille() != 50613) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_func_create_helper_quic_session() != 6597) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_create_isekai_link_relay_session() != 13613) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_func_create_isekai_link_relay_session() != 13613) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_create_isekai_pipe_quic_session() != 15061) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_create_isekai_stun_p2p_session() != 728) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_func_create_multipath_helper_quic_session() != 7205) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_create_multipath_isekai_pipe_quic_session() != 27497) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator() != 38625) {
@@ -1730,42 +1730,6 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_send_chunk() != 30024) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect() != 49117) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect_auto() != 17169) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_disconnect() != 11253) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_notify_network_lost() != 44050) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_resize() != 9464) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_cells() != 45509) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_len() != 32376) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_send() != 15932) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_download() != 52142) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_upload() != 11358) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_cancel() != 14424) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_send_chunk() != 22896) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_connect() != 50867) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1797,6 +1761,42 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_send_chunk() != 342) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_connect() != 48147) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_connect_auto() != 28091) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_disconnect() != 28535) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_notify_network_lost() != 7517) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_resize() != 44852) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_scrollback_cells() != 64205) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_scrollback_len() != 407) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_send() != 33120) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_accept_download() != 51833) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_accept_upload() != 31563) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_cancel() != 41151) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_send_chunk() != 41275) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_connect() != 55857) {
@@ -1832,40 +1832,40 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_send_chunk() != 59478) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_connect() != 15932) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_connect() != 33391) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_disconnect() != 13182) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_disconnect() != 21323) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_notify_network_lost() != 18872) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_notify_network_lost() != 65253) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_rebind_to_fd() != 51928) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_rebind_to_fd() != 62874) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_resize() != 65350) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_resize() != 19025) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_cells() != 35785) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_scrollback_cells() != 40510) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_len() != 20977) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_scrollback_len() != 16811) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_send() != 18667) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_send() != 35009) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_download() != 41705) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_accept_download() != 11761) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_upload() != 60661) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_accept_upload() != 9880) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_cancel() != 43237) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_cancel() != 44775) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_send_chunk() != 40204) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_send_chunk() != 48046) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward() != 60755) {
@@ -1874,19 +1874,19 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect() != 45531) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic() != 14224) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic_auto() != 34683) {
-        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_link_relay() != 63853) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_pipe_quic() != 26041) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_pipe_quic_auto() != 6919) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_stun_p2p() != 21296) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_multipath_helper_quic() != 28117) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_multipath_isekai_pipe_quic() != 28992) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic() != 50706) {
@@ -3527,439 +3527,6 @@ public object FfiConverterTypeDiagnosticHandle: FfiConverter<DiagnosticHandle, L
 //
 
 
-public interface HelperQuicSessionInterface {
-    
-    /**
-     * 明示的にヘルパー経由 QUIC のみを試す（フォールバック無し）。
-     */
-    fun `connect`(`callback`: SessionCallback)
-    
-    /**
-     * `TransportPreference::Auto` 相当: ヘルパー経由 QUIC を試し、失敗したら
-     * 通常の TCP SSH（Phase 1-4）にフォールバックする。
-     */
-    fun `connectAuto`(`callback`: SessionCallback)
-    
-    fun `disconnect`()
-    
-    /**
-     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
-     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
-     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
-     * 何もしない。
-     */
-    fun `notifyNetworkLost`()
-    
-    fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
-    
-    fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData>
-    
-    fun `scrollbackLen`(): kotlin.UInt
-    
-    fun `send`(`data`: kotlin.ByteArray)
-    
-    fun `trzszAcceptDownload`(`transferId`: kotlin.String)
-    
-    fun `trzszAcceptUpload`(`transferId`: kotlin.String, `fileName`: kotlin.String, `fileSize`: kotlin.ULong, `mode`: kotlin.UInt)
-    
-    fun `trzszCancel`(`transferId`: kotlin.String)
-    
-    fun `trzszSendChunk`(`transferId`: kotlin.String, `data`: kotlin.ByteArray, `isLast`: kotlin.Boolean)
-    
-    companion object
-}
-
-open class HelperQuicSession: Disposable, AutoCloseable, HelperQuicSessionInterface
-{
-
-    @Suppress("UNUSED_PARAMETER")
-    /**
-     * @suppress
-     */
-    constructor(withHandle: UniffiWithHandle, handle: Long) {
-        this.handle = handle
-        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
-    }
-
-    /**
-     * @suppress
-     *
-     * This constructor can be used to instantiate a fake object. Only used for tests. Any
-     * attempt to actually use an object constructed this way will fail as there is no
-     * connected Rust object.
-     */
-    @Suppress("UNUSED_PARAMETER")
-    constructor(noHandle: NoHandle) {
-        this.handle = 0
-        this.cleanable = null
-    }
-
-    protected val handle: Long
-    protected val cleanable: UniffiCleaner.Cleanable?
-
-    private val wasDestroyed = AtomicBoolean(false)
-    private val callCounter = AtomicLong(1)
-
-    override fun destroy() {
-        // Only allow a single call to this method.
-        // TODO: maybe we should log a warning if called more than once?
-        if (this.wasDestroyed.compareAndSet(false, true)) {
-            // This decrement always matches the initial count of 1 given at creation time.
-            if (this.callCounter.decrementAndGet() == 0L) {
-                cleanable?.clean()
-            }
-        }
-    }
-
-    @Synchronized
-    override fun close() {
-        this.destroy()
-    }
-
-    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
-        // Check and increment the call counter, to keep the object alive.
-        // This needs a compare-and-set retry loop in case of concurrent updates.
-        do {
-            val c = this.callCounter.get()
-            if (c == 0L) {
-                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
-            }
-            if (c == Long.MAX_VALUE) {
-                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
-            }
-        } while (! this.callCounter.compareAndSet(c, c + 1L))
-        // Now we can safely do the method call without the handle being freed concurrently.
-        try {
-            return block(this.uniffiCloneHandle())
-        } finally {
-            // This decrement always matches the increment we performed above.
-            if (this.callCounter.decrementAndGet() == 0L) {
-                cleanable?.clean()
-            }
-        }
-    }
-
-    // Use a static inner class instead of a closure so as not to accidentally
-    // capture `this` as part of the cleanable's action.
-    private class UniffiCleanAction(private val handle: Long) : Runnable {
-        override fun run() {
-            if (handle == 0.toLong()) {
-                // Fake object created with `NoHandle`, don't try to free.
-                return;
-            }
-            uniffiRustCall { status ->
-                UniffiLib.uniffi_isekai_terminal_core_fn_free_helperquicsession(handle, status)
-            }
-        }
-    }
-
-    /**
-     * @suppress
-     */
-    fun uniffiCloneHandle(): Long {
-        if (handle == 0.toLong()) {
-            throw InternalException("uniffiCloneHandle() called on NoHandle object");
-        }
-        return uniffiRustCall() { status ->
-            UniffiLib.uniffi_isekai_terminal_core_fn_clone_helperquicsession(handle, status)
-        }
-    }
-
-    
-    /**
-     * 明示的にヘルパー経由 QUIC のみを試す（フォールバック無し）。
-     */
-    @Throws(SshException::class)override fun `connect`(`callback`: SessionCallback)
-        = 
-    callWithHandle {
-    uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_connect(
-        it,
-        FfiConverterTypeSessionCallback.lower(`callback`),_status)
-}
-    }
-    
-    
-
-    
-    /**
-     * `TransportPreference::Auto` 相当: ヘルパー経由 QUIC を試し、失敗したら
-     * 通常の TCP SSH（Phase 1-4）にフォールバックする。
-     */
-    @Throws(SshException::class)override fun `connectAuto`(`callback`: SessionCallback)
-        = 
-    callWithHandle {
-    uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_connect_auto(
-        it,
-        FfiConverterTypeSessionCallback.lower(`callback`),_status)
-}
-    }
-    
-    
-
-    override fun `disconnect`()
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_disconnect(
-        it,
-        _status)
-}
-    }
-    
-    
-
-    
-    /**
-     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
-     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
-     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
-     * 何もしない。
-     */override fun `notifyNetworkLost`()
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_notify_network_lost(
-        it,
-        _status)
-}
-    }
-    
-    
-
-    override fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_resize(
-        it,
-        FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),_status)
-}
-    }
-    
-    
-
-    override fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData> {
-            return FfiConverterSequenceTypeCellData.lift(
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_cells(
-        it,
-        FfiConverterUInt.lower(`offset`),FfiConverterUInt.lower(`rows`),_status)
-}
-    }
-    )
-    }
-    
-
-    override fun `scrollbackLen`(): kotlin.UInt {
-            return FfiConverterUInt.lift(
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_len(
-        it,
-        _status)
-}
-    }
-    )
-    }
-    
-
-    override fun `send`(`data`: kotlin.ByteArray)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_send(
-        it,
-        FfiConverterByteArray.lower(`data`),_status)
-}
-    }
-    
-    
-
-    override fun `trzszAcceptDownload`(`transferId`: kotlin.String)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_download(
-        it,
-        FfiConverterString.lower(`transferId`),_status)
-}
-    }
-    
-    
-
-    override fun `trzszAcceptUpload`(`transferId`: kotlin.String, `fileName`: kotlin.String, `fileSize`: kotlin.ULong, `mode`: kotlin.UInt)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_upload(
-        it,
-        FfiConverterString.lower(`transferId`),FfiConverterString.lower(`fileName`),FfiConverterULong.lower(`fileSize`),FfiConverterUInt.lower(`mode`),_status)
-}
-    }
-    
-    
-
-    override fun `trzszCancel`(`transferId`: kotlin.String)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_cancel(
-        it,
-        FfiConverterString.lower(`transferId`),_status)
-}
-    }
-    
-    
-
-    override fun `trzszSendChunk`(`transferId`: kotlin.String, `data`: kotlin.ByteArray, `isLast`: kotlin.Boolean)
-        = 
-    callWithHandle {
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_send_chunk(
-        it,
-        FfiConverterString.lower(`transferId`),FfiConverterByteArray.lower(`data`),FfiConverterBoolean.lower(`isLast`),_status)
-}
-    }
-    
-    
-
-    
-
-    
-
-
-    
-    
-    /**
-     * @suppress
-     */
-    companion object
-    
-}
-
-
-/**
- * @suppress
- */
-public object FfiConverterTypeHelperQuicSession: FfiConverter<HelperQuicSession, Long> {
-    override fun lower(value: HelperQuicSession): Long {
-        return value.uniffiCloneHandle()
-    }
-
-    override fun lift(value: Long): HelperQuicSession {
-        return HelperQuicSession(UniffiWithHandle, value)
-    }
-
-    override fun read(buf: ByteBuffer): HelperQuicSession {
-        return lift(buf.getLong())
-    }
-
-    override fun allocationSize(value: HelperQuicSession) = 8UL
-
-    override fun write(value: HelperQuicSession, buf: ByteBuffer) {
-        buf.putLong(lower(value))
-    }
-}
-
-
-// This template implements a class for working with a Rust struct via a handle
-// to the live Rust struct on the other side of the FFI.
-//
-// There's some subtlety here, because we have to be careful not to operate on a Rust
-// struct after it has been dropped, and because we must expose a public API for freeing
-// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
-//
-//   * Each instance holds an opaque handle to the underlying Rust struct.
-//     Method calls need to read this handle from the object's state and pass it in to
-//     the Rust FFI.
-//
-//   * When an instance is no longer needed, its handle should be passed to a
-//     special destructor function provided by the Rust FFI, which will drop the
-//     underlying Rust struct.
-//
-//   * Given an instance, calling code is expected to call the special
-//     `destroy` method in order to free it after use, either by calling it explicitly
-//     or by using a higher-level helper like the `use` method. Failing to do so risks
-//     leaking the underlying Rust struct.
-//
-//   * We can't assume that calling code will do the right thing, and must be prepared
-//     to handle Kotlin method calls executing concurrently with or even after a call to
-//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
-//
-//   * We must never allow Rust code to operate on the underlying Rust struct after
-//     the destructor has been called, and must never call the destructor more than once.
-//     Doing so may trigger memory unsafety.
-//
-//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
-//     is implemented to call the destructor when the Kotlin object becomes unreachable.
-//     This is done in a background thread. This is not a panacea, and client code should be aware that
-//      1. the thread may starve if some there are objects that have poorly performing
-//     `drop` methods or do significant work in their `drop` methods.
-//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
-//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
-//
-// If we try to implement this with mutual exclusion on access to the handle, there is the
-// possibility of a race between a method call and a concurrent call to `destroy`:
-//
-//    * Thread A starts a method call, reads the value of the handle, but is interrupted
-//      before it can pass the handle over the FFI to Rust.
-//    * Thread B calls `destroy` and frees the underlying Rust struct.
-//    * Thread A resumes, passing the already-read handle value to Rust and triggering
-//      a use-after-free.
-//
-// One possible solution would be to use a `ReadWriteLock`, with each method call taking
-// a read lock (and thus allowed to run concurrently) and the special `destroy` method
-// taking a write lock (and thus blocking on live method calls). However, we aim not to
-// generate methods with any hidden blocking semantics, and a `destroy` method that might
-// block if called incorrectly seems to meet that bar.
-//
-// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
-// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
-// has been called. These are updated according to the following rules:
-//
-//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
-//      The initial value for the flag is false.
-//
-//    * At the start of each method call, we atomically check the counter.
-//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
-//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
-//
-//    * At the end of each method call, we atomically decrement and check the counter.
-//      If it has reached zero then we destroy the underlying Rust struct.
-//
-//    * When `destroy` is called, we atomically flip the flag from false to true.
-//      If the flag was already true we silently fail.
-//      Otherwise we atomically decrement and check the counter.
-//      If it has reached zero then we destroy the underlying Rust struct.
-//
-// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
-// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
-//
-// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
-// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
-// of the underlying Rust code.
-//
-// This makes a cleaner a better alternative to _not_ calling `destroy()` as
-// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
-// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
-// thread may be starved, and the app will leak memory.
-//
-// In this case, `destroy`ing manually may be a better solution.
-//
-// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
-// with Rust peers are reclaimed:
-//
-// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
-// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
-// 3. The memory is reclaimed when the process terminates.
-//
-// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
-//
-
-
 public interface IsekaiLinkRelaySessionInterface {
     
     /**
@@ -4272,6 +3839,449 @@ public object FfiConverterTypeIsekaiLinkRelaySession: FfiConverter<IsekaiLinkRel
     override fun allocationSize(value: IsekaiLinkRelaySession) = 8UL
 
     override fun write(value: IsekaiLinkRelaySession, buf: ByteBuffer) {
+        buf.putLong(lower(value))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a handle
+// to the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque handle to the underlying Rust struct.
+//     Method calls need to read this handle from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its handle should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the handle, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the handle, but is interrupted
+//      before it can pass the handle over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read handle value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+public interface IsekaiPipeQuicSessionInterface {
+    
+    /**
+     * 明示的にヘルパー経由 QUIC のみを試す（フォールバック無し）。SSH接続プーリング
+     * (`archive/ISEKAI_SSH_DESIGN.md`参照)により、同一ホスト/ユーザー/鍵/ブートストラップ
+     * パラメータへ既にプールされたHandleがあれば、ブートストラップSSH・ヘルパー起動・
+     * QUICハンドシェイク・ネストしたSSH認証を丸ごとスキップして新しいSSHチャネルだけ開く。
+     */
+    fun `connect`(`callback`: SessionCallback)
+    
+    /**
+     * `TransportPreference::Auto` 相当: ヘルパー経由 QUIC を試し、失敗したら
+     * 通常の TCP SSH（Phase 1-4）にフォールバックする。プーリングのプールヒット時、
+     * および他タブの確立待ち(waiter)がその後失敗を観測した場合はフォールバックしない
+     * (自分自身がダイヤルを試みて失敗した場合のみフォールバックする、既存の挙動を維持)。
+     */
+    fun `connectAuto`(`callback`: SessionCallback)
+    
+    fun `disconnect`()
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+    fun `notifyNetworkLost`()
+    
+    fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
+    
+    fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData>
+    
+    fun `scrollbackLen`(): kotlin.UInt
+    
+    fun `send`(`data`: kotlin.ByteArray)
+    
+    fun `trzszAcceptDownload`(`transferId`: kotlin.String)
+    
+    fun `trzszAcceptUpload`(`transferId`: kotlin.String, `fileName`: kotlin.String, `fileSize`: kotlin.ULong, `mode`: kotlin.UInt)
+    
+    fun `trzszCancel`(`transferId`: kotlin.String)
+    
+    fun `trzszSendChunk`(`transferId`: kotlin.String, `data`: kotlin.ByteArray, `isLast`: kotlin.Boolean)
+    
+    companion object
+}
+
+open class IsekaiPipeQuicSession: Disposable, AutoCloseable, IsekaiPipeQuicSessionInterface
+{
+
+    @Suppress("UNUSED_PARAMETER")
+    /**
+     * @suppress
+     */
+    constructor(withHandle: UniffiWithHandle, handle: Long) {
+        this.handle = handle
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(handle))
+    }
+
+    /**
+     * @suppress
+     *
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noHandle: NoHandle) {
+        this.handle = 0
+        this.cleanable = null
+    }
+
+    protected val handle: Long
+    protected val cleanable: UniffiCleaner.Cleanable?
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithHandle(block: (handle: Long) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the handle being freed concurrently.
+        try {
+            return block(this.uniffiCloneHandle())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable?.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val handle: Long) : Runnable {
+        override fun run() {
+            if (handle == 0.toLong()) {
+                // Fake object created with `NoHandle`, don't try to free.
+                return;
+            }
+            uniffiRustCall { status ->
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_isekaipipequicsession(handle, status)
+            }
+        }
+    }
+
+    /**
+     * @suppress
+     */
+    fun uniffiCloneHandle(): Long {
+        if (handle == 0.toLong()) {
+            throw InternalException("uniffiCloneHandle() called on NoHandle object");
+        }
+        return uniffiRustCall() { status ->
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_isekaipipequicsession(handle, status)
+        }
+    }
+
+    
+    /**
+     * 明示的にヘルパー経由 QUIC のみを試す（フォールバック無し）。SSH接続プーリング
+     * (`archive/ISEKAI_SSH_DESIGN.md`参照)により、同一ホスト/ユーザー/鍵/ブートストラップ
+     * パラメータへ既にプールされたHandleがあれば、ブートストラップSSH・ヘルパー起動・
+     * QUICハンドシェイク・ネストしたSSH認証を丸ごとスキップして新しいSSHチャネルだけ開く。
+     */
+    @Throws(SshException::class)override fun `connect`(`callback`: SessionCallback)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(SshException) { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_connect(
+        it,
+        FfiConverterTypeSessionCallback.lower(`callback`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * `TransportPreference::Auto` 相当: ヘルパー経由 QUIC を試し、失敗したら
+     * 通常の TCP SSH（Phase 1-4）にフォールバックする。プーリングのプールヒット時、
+     * および他タブの確立待ち(waiter)がその後失敗を観測した場合はフォールバックしない
+     * (自分自身がダイヤルを試みて失敗した場合のみフォールバックする、既存の挙動を維持)。
+     */
+    @Throws(SshException::class)override fun `connectAuto`(`callback`: SessionCallback)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(SshException) { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_connect_auto(
+        it,
+        FfiConverterTypeSessionCallback.lower(`callback`),_status)
+}
+    }
+    
+    
+
+    override fun `disconnect`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_disconnect(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */override fun `notifyNetworkLost`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_notify_network_lost(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    override fun `resize`(`cols`: kotlin.UInt, `rows`: kotlin.UInt)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_resize(
+        it,
+        FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),_status)
+}
+    }
+    
+    
+
+    override fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData> {
+            return FfiConverterSequenceTypeCellData.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_scrollback_cells(
+        it,
+        FfiConverterUInt.lower(`offset`),FfiConverterUInt.lower(`rows`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `scrollbackLen`(): kotlin.UInt {
+            return FfiConverterUInt.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_scrollback_len(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    override fun `send`(`data`: kotlin.ByteArray)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_send(
+        it,
+        FfiConverterByteArray.lower(`data`),_status)
+}
+    }
+    
+    
+
+    override fun `trzszAcceptDownload`(`transferId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_accept_download(
+        it,
+        FfiConverterString.lower(`transferId`),_status)
+}
+    }
+    
+    
+
+    override fun `trzszAcceptUpload`(`transferId`: kotlin.String, `fileName`: kotlin.String, `fileSize`: kotlin.ULong, `mode`: kotlin.UInt)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_accept_upload(
+        it,
+        FfiConverterString.lower(`transferId`),FfiConverterString.lower(`fileName`),FfiConverterULong.lower(`fileSize`),FfiConverterUInt.lower(`mode`),_status)
+}
+    }
+    
+    
+
+    override fun `trzszCancel`(`transferId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_cancel(
+        it,
+        FfiConverterString.lower(`transferId`),_status)
+}
+    }
+    
+    
+
+    override fun `trzszSendChunk`(`transferId`: kotlin.String, `data`: kotlin.ByteArray, `isLast`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_send_chunk(
+        it,
+        FfiConverterString.lower(`transferId`),FfiConverterByteArray.lower(`data`),FfiConverterBoolean.lower(`isLast`),_status)
+}
+    }
+    
+    
+
+    
+
+    
+
+
+    
+    
+    /**
+     * @suppress
+     */
+    companion object
+    
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIsekaiPipeQuicSession: FfiConverter<IsekaiPipeQuicSession, Long> {
+    override fun lower(value: IsekaiPipeQuicSession): Long {
+        return value.uniffiCloneHandle()
+    }
+
+    override fun lift(value: Long): IsekaiPipeQuicSession {
+        return IsekaiPipeQuicSession(UniffiWithHandle, value)
+    }
+
+    override fun read(buf: ByteBuffer): IsekaiPipeQuicSession {
+        return lift(buf.getLong())
+    }
+
+    override fun allocationSize(value: IsekaiPipeQuicSession) = 8UL
+
+    override fun write(value: IsekaiPipeQuicSession, buf: ByteBuffer) {
         buf.putLong(lower(value))
     }
 }
@@ -4784,11 +4794,11 @@ public object FfiConverterTypeIsekaiStunP2pSession: FfiConverter<IsekaiStunP2pSe
 //
 
 
-public interface MultipathHelperQuicSessionInterface {
+public interface MultipathIsekaiPipeQuicSessionInterface {
     
     /**
      * フォールバック無し。path0/path1 のブートストラップ・QUIC 接続に失敗したら
-     * エラーを返す（`TransportPreference::IsekaiHelperQuicMultipath` 相当）。
+     * エラーを返す（`TransportPreference::IsekaiPipeQuicMultipath` 相当）。
      */
     fun `connect`(`callback`: SessionCallback)
     
@@ -4830,7 +4840,7 @@ public interface MultipathHelperQuicSessionInterface {
     companion object
 }
 
-open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelperQuicSessionInterface
+open class MultipathIsekaiPipeQuicSession: Disposable, AutoCloseable, MultipathIsekaiPipeQuicSessionInterface
 {
 
     @Suppress("UNUSED_PARAMETER")
@@ -4909,7 +4919,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
                 return;
             }
             uniffiRustCall { status ->
-                UniffiLib.uniffi_isekai_terminal_core_fn_free_multipathhelperquicsession(handle, status)
+                UniffiLib.uniffi_isekai_terminal_core_fn_free_multipathisekaipipequicsession(handle, status)
             }
         }
     }
@@ -4922,20 +4932,20 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
             throw InternalException("uniffiCloneHandle() called on NoHandle object");
         }
         return uniffiRustCall() { status ->
-            UniffiLib.uniffi_isekai_terminal_core_fn_clone_multipathhelperquicsession(handle, status)
+            UniffiLib.uniffi_isekai_terminal_core_fn_clone_multipathisekaipipequicsession(handle, status)
         }
     }
 
     
     /**
      * フォールバック無し。path0/path1 のブートストラップ・QUIC 接続に失敗したら
-     * エラーを返す（`TransportPreference::IsekaiHelperQuicMultipath` 相当）。
+     * エラーを返す（`TransportPreference::IsekaiPipeQuicMultipath` 相当）。
      */
     @Throws(SshException::class)override fun `connect`(`callback`: SessionCallback)
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_connect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_connect(
         it,
         FfiConverterTypeSessionCallback.lower(`callback`),_status)
 }
@@ -4947,7 +4957,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_disconnect(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_disconnect(
         it,
         _status)
 }
@@ -4966,7 +4976,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_notify_network_lost(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_notify_network_lost(
         it,
         _status)
 }
@@ -4984,7 +4994,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_rebind_to_fd(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_rebind_to_fd(
         it,
         FfiConverterInt.lower(`fd`),FfiConverterString.lower(`localIp`),_status)
 }
@@ -4996,7 +5006,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_resize(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_resize(
         it,
         FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -5008,7 +5018,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
             return FfiConverterSequenceTypeCellData.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_cells(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_scrollback_cells(
         it,
         FfiConverterUInt.lower(`offset`),FfiConverterUInt.lower(`rows`),_status)
 }
@@ -5021,7 +5031,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
             return FfiConverterUInt.lift(
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_len(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_scrollback_len(
         it,
         _status)
 }
@@ -5034,7 +5044,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_send(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_send(
         it,
         FfiConverterByteArray.lower(`data`),_status)
 }
@@ -5046,7 +5056,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_download(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_accept_download(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -5058,7 +5068,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_upload(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_accept_upload(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterString.lower(`fileName`),FfiConverterULong.lower(`fileSize`),FfiConverterUInt.lower(`mode`),_status)
 }
@@ -5070,7 +5080,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_cancel(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_cancel(
         it,
         FfiConverterString.lower(`transferId`),_status)
 }
@@ -5082,7 +5092,7 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
         = 
     callWithHandle {
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_send_chunk(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_send_chunk(
         it,
         FfiConverterString.lower(`transferId`),FfiConverterByteArray.lower(`data`),FfiConverterBoolean.lower(`isLast`),_status)
 }
@@ -5108,22 +5118,22 @@ open class MultipathHelperQuicSession: Disposable, AutoCloseable, MultipathHelpe
 /**
  * @suppress
  */
-public object FfiConverterTypeMultipathHelperQuicSession: FfiConverter<MultipathHelperQuicSession, Long> {
-    override fun lower(value: MultipathHelperQuicSession): Long {
+public object FfiConverterTypeMultipathIsekaiPipeQuicSession: FfiConverter<MultipathIsekaiPipeQuicSession, Long> {
+    override fun lower(value: MultipathIsekaiPipeQuicSession): Long {
         return value.uniffiCloneHandle()
     }
 
-    override fun lift(value: Long): MultipathHelperQuicSession {
-        return MultipathHelperQuicSession(UniffiWithHandle, value)
+    override fun lift(value: Long): MultipathIsekaiPipeQuicSession {
+        return MultipathIsekaiPipeQuicSession(UniffiWithHandle, value)
     }
 
-    override fun read(buf: ByteBuffer): MultipathHelperQuicSession {
+    override fun read(buf: ByteBuffer): MultipathIsekaiPipeQuicSession {
         return lift(buf.getLong())
     }
 
-    override fun allocationSize(value: MultipathHelperQuicSession) = 8UL
+    override fun allocationSize(value: MultipathIsekaiPipeQuicSession) = 8UL
 
-    override fun write(value: MultipathHelperQuicSession, buf: ByteBuffer) {
+    override fun write(value: MultipathIsekaiPipeQuicSession, buf: ByteBuffer) {
         buf.putLong(lower(value))
     }
 }
@@ -5614,22 +5624,22 @@ public interface SessionOrchestratorInterface {
     fun `connect`(`config`: SshConfig)
     
     /**
-     * Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
-     * （`TransportPreference::IsekaiHelperQuic` 相当、明示選択時に使う）。
+     * Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
+     * P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
      */
-    fun `connectHelperQuic`(`config`: HelperQuicConfig)
+    fun `connectIsekaiLinkRelay`(`config`: IsekaiLinkRelayConfig)
+    
+    /**
+     * Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
+     * （`TransportPreference::IsekaiPipeQuic` 相当、明示選択時に使う）。
+     */
+    fun `connectIsekaiPipeQuic`(`config`: IsekaiPipeQuicConfig)
     
     /**
      * Phase 7: `TransportPreference::Auto` 相当。自作ヘルパー経由 QUIC のブートストラップ/
      * 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
      */
-    fun `connectHelperQuicAuto`(`config`: HelperQuicConfig)
-    
-    /**
-     * Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
-     * P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
-     */
-    fun `connectIsekaiLinkRelay`(`config`: IsekaiLinkRelayConfig)
+    fun `connectIsekaiPipeQuicAuto`(`config`: IsekaiPipeQuicConfig)
     
     /**
      * Phase 10: `TransportPreference::IsekaiStunP2pQuic` 相当。relay 無し・
@@ -5639,11 +5649,11 @@ public interface SessionOrchestratorInterface {
     fun `connectIsekaiStunP2p`(`config`: IsekaiStunP2pConfig)
     
     /**
-     * Phase 9: `TransportPreference::IsekaiHelperQuicMultipath` 相当。フォールバック無し。
+     * Phase 9: `TransportPreference::IsekaiPipeQuicMultipath` 相当。フォールバック無し。
      * `config.direct_host` が設定されていれば path0（`ssh_host`）+ path1（`direct_host`）の
      * 受動的マルチパスで接続する。
      */
-    fun `connectMultipathHelperQuic`(`config`: MultipathHelperQuicConfig)
+    fun `connectMultipathIsekaiPipeQuic`(`config`: MultipathIsekaiPipeQuicConfig)
     
     fun `connectQuic`(`config`: QuicConfig)
     
@@ -5831,40 +5841,6 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
 
     
     /**
-     * Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
-     * （`TransportPreference::IsekaiHelperQuic` 相当、明示選択時に使う）。
-     */
-    @Throws(SshException::class)override fun `connectHelperQuic`(`config`: HelperQuicConfig)
-        = 
-    callWithHandle {
-    uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic(
-        it,
-        FfiConverterTypeHelperQuicConfig.lower(`config`),_status)
-}
-    }
-    
-    
-
-    
-    /**
-     * Phase 7: `TransportPreference::Auto` 相当。自作ヘルパー経由 QUIC のブートストラップ/
-     * 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
-     */
-    @Throws(SshException::class)override fun `connectHelperQuicAuto`(`config`: HelperQuicConfig)
-        = 
-    callWithHandle {
-    uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic_auto(
-        it,
-        FfiConverterTypeHelperQuicConfig.lower(`config`),_status)
-}
-    }
-    
-    
-
-    
-    /**
      * Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
      * P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
      */
@@ -5875,6 +5851,40 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_link_relay(
         it,
         FfiConverterTypeIsekaiLinkRelayConfig.lower(`config`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
+     * （`TransportPreference::IsekaiPipeQuic` 相当、明示選択時に使う）。
+     */
+    @Throws(SshException::class)override fun `connectIsekaiPipeQuic`(`config`: IsekaiPipeQuicConfig)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(SshException) { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_pipe_quic(
+        it,
+        FfiConverterTypeIsekaiPipeQuicConfig.lower(`config`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * Phase 7: `TransportPreference::Auto` 相当。自作ヘルパー経由 QUIC のブートストラップ/
+     * 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
+     */
+    @Throws(SshException::class)override fun `connectIsekaiPipeQuicAuto`(`config`: IsekaiPipeQuicConfig)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(SshException) { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_pipe_quic_auto(
+        it,
+        FfiConverterTypeIsekaiPipeQuicConfig.lower(`config`),_status)
 }
     }
     
@@ -5900,17 +5910,17 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
 
     
     /**
-     * Phase 9: `TransportPreference::IsekaiHelperQuicMultipath` 相当。フォールバック無し。
+     * Phase 9: `TransportPreference::IsekaiPipeQuicMultipath` 相当。フォールバック無し。
      * `config.direct_host` が設定されていれば path0（`ssh_host`）+ path1（`direct_host`）の
      * 受動的マルチパスで接続する。
      */
-    @Throws(SshException::class)override fun `connectMultipathHelperQuic`(`config`: MultipathHelperQuicConfig)
+    @Throws(SshException::class)override fun `connectMultipathIsekaiPipeQuic`(`config`: MultipathIsekaiPipeQuicConfig)
         = 
     callWithHandle {
     uniffiRustCallWithError(SshException) { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_multipath_helper_quic(
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_multipath_isekai_pipe_quic(
         it,
-        FfiConverterTypeMultipathHelperQuicConfig.lower(`config`),_status)
+        FfiConverterTypeMultipathIsekaiPipeQuicConfig.lower(`config`),_status)
 }
     }
     
@@ -6281,7 +6291,7 @@ public object FfiConverterTypeSessionOrchestrator: FfiConverter<SessionOrchestra
 
 /**
  * `SessionState`×`ExecutionMode`の2軸FSMを保持する、判断ロジックのみのオブジェクト。
- * 意図的にどのtransport(`SshSession`/`HelperQuicSession`等)とも結び付けていない
+ * 意図的にどのtransport(`SshSession`/`IsekaiPipeQuicSession`等)とも結び付けていない
  * (`.claude/rules/rust-ssot.md`が要求する「状態と、それに基づく意思決定ロジックは
  * Rust側に置く」を満たす最小単位として切り出し、実際の接続開始/切断呼び出しは
  * 呼び出し側(Kotlin/Swift)が現在の状態を見て行う。既存`SessionOrchestrator`の
@@ -6364,7 +6374,7 @@ public interface SessionSupervisorInterface {
 
 /**
  * `SessionState`×`ExecutionMode`の2軸FSMを保持する、判断ロジックのみのオブジェクト。
- * 意図的にどのtransport(`SshSession`/`HelperQuicSession`等)とも結び付けていない
+ * 意図的にどのtransport(`SshSession`/`IsekaiPipeQuicSession`等)とも結び付けていない
  * (`.claude/rules/rust-ssot.md`が要求する「状態と、それに基づく意思決定ロジックは
  * Rust側に置く」を満たす最小単位として切り出し、実際の接続開始/切断呼び出しは
  * 呼び出し側(Kotlin/Swift)が現在の状態を見て行う。既存`SessionOrchestrator`の
@@ -7294,85 +7304,6 @@ public object FfiConverterTypeDiagnosticEventEnvelope: FfiConverterRustBuffer<Di
 
 
 
-data class HelperQuicConfig (
-    var `sshHost`: kotlin.String
-    , 
-    var `sshPort`: kotlin.UShort
-    , 
-    var `username`: kotlin.String
-    , 
-    var `auth`: SshAuth
-    , 
-    var `cols`: kotlin.UInt
-    , 
-    var `rows`: kotlin.UInt
-    , 
-    /**
-     * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
-     */
-    var `jump`: JumpConfig?
-    , 
-    /**
-     * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
-     * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
-     * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
-     * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
-     * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
-     * 確定した値だけを渡すこと。
-     */
-    var `bindPort`: kotlin.UShort?
-    
-){
-    
-
-    
-
-    
-    companion object
-}
-
-/**
- * @suppress
- */
-public object FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer<HelperQuicConfig> {
-    override fun read(buf: ByteBuffer): HelperQuicConfig {
-        return HelperQuicConfig(
-            FfiConverterString.read(buf),
-            FfiConverterUShort.read(buf),
-            FfiConverterString.read(buf),
-            FfiConverterTypeSshAuth.read(buf),
-            FfiConverterUInt.read(buf),
-            FfiConverterUInt.read(buf),
-            FfiConverterOptionalTypeJumpConfig.read(buf),
-            FfiConverterOptionalUShort.read(buf),
-        )
-    }
-
-    override fun allocationSize(value: HelperQuicConfig) = (
-            FfiConverterString.allocationSize(value.`sshHost`) +
-            FfiConverterUShort.allocationSize(value.`sshPort`) +
-            FfiConverterString.allocationSize(value.`username`) +
-            FfiConverterTypeSshAuth.allocationSize(value.`auth`) +
-            FfiConverterUInt.allocationSize(value.`cols`) +
-            FfiConverterUInt.allocationSize(value.`rows`) +
-            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`) +
-            FfiConverterOptionalUShort.allocationSize(value.`bindPort`)
-    )
-
-    override fun write(value: HelperQuicConfig, buf: ByteBuffer) {
-            FfiConverterString.write(value.`sshHost`, buf)
-            FfiConverterUShort.write(value.`sshPort`, buf)
-            FfiConverterString.write(value.`username`, buf)
-            FfiConverterTypeSshAuth.write(value.`auth`, buf)
-            FfiConverterUInt.write(value.`cols`, buf)
-            FfiConverterUInt.write(value.`rows`, buf)
-            FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
-            FfiConverterOptionalUShort.write(value.`bindPort`, buf)
-    }
-}
-
-
-
 data class IsekaiLinkRelayConfig (
     var `sshHost`: kotlin.String
     , 
@@ -7460,6 +7391,85 @@ public object FfiConverterTypeIsekaiLinkRelayConfig: FfiConverterRustBuffer<Isek
             FfiConverterString.write(value.`relayAddr`, buf)
             FfiConverterString.write(value.`relaySni`, buf)
             FfiConverterString.write(value.`relayJwt`, buf)
+    }
+}
+
+
+
+data class IsekaiPipeQuicConfig (
+    var `sshHost`: kotlin.String
+    , 
+    var `sshPort`: kotlin.UShort
+    , 
+    var `username`: kotlin.String
+    , 
+    var `auth`: SshAuth
+    , 
+    var `cols`: kotlin.UInt
+    , 
+    var `rows`: kotlin.UInt
+    , 
+    /**
+     * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
+     */
+    var `jump`: JumpConfig?
+    , 
+    /**
+     * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
+     * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
+     * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
+     * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
+     * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
+     * 確定した値だけを渡すこと。
+     */
+    var `bindPort`: kotlin.UShort?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeIsekaiPipeQuicConfig: FfiConverterRustBuffer<IsekaiPipeQuicConfig> {
+    override fun read(buf: ByteBuffer): IsekaiPipeQuicConfig {
+        return IsekaiPipeQuicConfig(
+            FfiConverterString.read(buf),
+            FfiConverterUShort.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterTypeSshAuth.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalTypeJumpConfig.read(buf),
+            FfiConverterOptionalUShort.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: IsekaiPipeQuicConfig) = (
+            FfiConverterString.allocationSize(value.`sshHost`) +
+            FfiConverterUShort.allocationSize(value.`sshPort`) +
+            FfiConverterString.allocationSize(value.`username`) +
+            FfiConverterTypeSshAuth.allocationSize(value.`auth`) +
+            FfiConverterUInt.allocationSize(value.`cols`) +
+            FfiConverterUInt.allocationSize(value.`rows`) +
+            FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`) +
+            FfiConverterOptionalUShort.allocationSize(value.`bindPort`)
+    )
+
+    override fun write(value: IsekaiPipeQuicConfig, buf: ByteBuffer) {
+            FfiConverterString.write(value.`sshHost`, buf)
+            FfiConverterUShort.write(value.`sshPort`, buf)
+            FfiConverterString.write(value.`username`, buf)
+            FfiConverterTypeSshAuth.write(value.`auth`, buf)
+            FfiConverterUInt.write(value.`cols`, buf)
+            FfiConverterUInt.write(value.`rows`, buf)
+            FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
+            FfiConverterOptionalUShort.write(value.`bindPort`, buf)
     }
 }
 
@@ -7593,7 +7603,7 @@ public object FfiConverterTypeJumpConfig: FfiConverterRustBuffer<JumpConfig> {
 
 
 
-data class MultipathHelperQuicConfig (
+data class MultipathIsekaiPipeQuicConfig (
     /**
      * ブートストラップに使う SSH ホスト。通常は Tailscale 経由アドレス（path0）。
      */
@@ -7658,7 +7668,7 @@ data class MultipathHelperQuicConfig (
      * 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
      * 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
      * `None`の場合はRust側で従来通りの既定値フォールバックを維持する
-     * (`HelperQuicConfig.bind_port`のdocコメントも参照)。
+     * (`IsekaiPipeQuicConfig.bind_port`のdocコメントも参照)。
      */
     var `bindPort`: kotlin.UShort?
     
@@ -7674,9 +7684,9 @@ data class MultipathHelperQuicConfig (
 /**
  * @suppress
  */
-public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<MultipathHelperQuicConfig> {
-    override fun read(buf: ByteBuffer): MultipathHelperQuicConfig {
-        return MultipathHelperQuicConfig(
+public object FfiConverterTypeMultipathIsekaiPipeQuicConfig: FfiConverterRustBuffer<MultipathIsekaiPipeQuicConfig> {
+    override fun read(buf: ByteBuffer): MultipathIsekaiPipeQuicConfig {
+        return MultipathIsekaiPipeQuicConfig(
             FfiConverterString.read(buf),
             FfiConverterUShort.read(buf),
             FfiConverterOptionalString.read(buf),
@@ -7694,7 +7704,7 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
         )
     }
 
-    override fun allocationSize(value: MultipathHelperQuicConfig) = (
+    override fun allocationSize(value: MultipathIsekaiPipeQuicConfig) = (
             FfiConverterString.allocationSize(value.`sshHost`) +
             FfiConverterUShort.allocationSize(value.`sshPort`) +
             FfiConverterOptionalString.allocationSize(value.`directHost`) +
@@ -7711,7 +7721,7 @@ public object FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer<
             FfiConverterOptionalUShort.allocationSize(value.`bindPort`)
     )
 
-    override fun write(value: MultipathHelperQuicConfig, buf: ByteBuffer) {
+    override fun write(value: MultipathIsekaiPipeQuicConfig, buf: ByteBuffer) {
             FfiConverterString.write(value.`sshHost`, buf)
             FfiConverterUShort.write(value.`sshPort`, buf)
             FfiConverterOptionalString.write(value.`directHost`, buf)
@@ -7869,7 +7879,10 @@ data class QuicConfig (
     var `rows`: kotlin.UInt
     , 
     /**
-     * スパイク用: TLS 証明書検証をスキップ
+     * 設計上許容(issue #61 で確認済み)。既定 true(呼び出し元は常に true を渡す)。
+     * QUIC/TLS 層の証明書検証を無条件でスキップする。詳細な理由・非対称性は
+     * [`SkipServerVerification`] のコメント、および
+     * `ConnectionProfile.toQuicConfig`(Kotlin 側)のコメントを参照。
      */
     var `skipCertVerify`: kotlin.Boolean
     
@@ -9002,7 +9015,7 @@ public object FfiConverterTypeTerminalSpecialKey : FfiConverterRustBuffer<Termin
 /**
  * Phase 7-4: プロファイルが選択するトランスポート戦略。実際のディスパッチは
  * Kotlin 側でこの値に応じて `SessionOrchestrator::connect` /
- * `connect_quic`（tsshd） / `connect_helper_quic` / `connect_helper_quic_auto`
+ * `connect_quic`（tsshd） / `connect_isekai_pipe_quic` / `connect_isekai_pipe_quic_auto`
  * のいずれかを呼び分ける（設定の意図を表す列挙型であり、単一の万能 connect API
  * を意図したものではない。既存の transport ごとに別メソッドを持つ設計を踏襲する）。
  */
@@ -9021,7 +9034,7 @@ enum class TransportPreference {
     /**
      * 自作ヘルパー経由 QUIC、フォールバック無し（Phase 7、明示選択時）。
      */
-    ISEKAI_HELPER_QUIC,
+    ISEKAI_PIPE_QUIC,
     /**
      * 自作ヘルパー経由 QUIC を試し、失敗したら通常の TCP SSH にフォールバックする
      * （Phase 7、既定推奨）。
@@ -9030,9 +9043,9 @@ enum class TransportPreference {
     /**
      * 自作ヘルパー経由 QUIC + Tailscale⇔直接アドレスの受動的マルチパスフェイルオーバー
      * （Phase 9、オプトイン。フォールバック無し）。`direct_host` 未設定なら
-     * `IsekaiHelperQuic` と同等（path0 のみ）。
+     * `IsekaiPipeQuic` と同等（path0 のみ）。
      */
-    ISEKAI_HELPER_QUIC_MULTIPATH,
+    ISEKAI_PIPE_QUIC_MULTIPATH,
     /**
      * STUN+SSH rendezvous による直接 P2P QUIC（Phase 10、オプトイン。relay 無し・
      * 穴あけ不成立時のフォールバック無し）。`isekai_stun_p2p_transport.rs` 参照。
@@ -10385,7 +10398,7 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
     
 
         /**
-         * `helper_quic` の QUIC クライアントソケットの片道遅延をミリ秒で設定する。
+         * `isekai_pipe_quic` の QUIC クライアントソケットの片道遅延をミリ秒で設定する。
          */ fun `debugSetUdpFaultLatencyMs`(`ms`: kotlin.UInt)
         = 
     uniffiRustCall() { _status ->
@@ -10407,22 +10420,22 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
 }
     
     
- fun `createHelperQuicSession`(`config`: HelperQuicConfig): HelperQuicSession {
-            return FfiConverterTypeHelperQuicSession.lift(
-    uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_helper_quic_session(
-    
-        FfiConverterTypeHelperQuicConfig.lower(`config`),_status)
-}
-    )
-    }
-    
  fun `createIsekaiLinkRelaySession`(`config`: IsekaiLinkRelayConfig): IsekaiLinkRelaySession {
             return FfiConverterTypeIsekaiLinkRelaySession.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_isekai_terminal_core_fn_func_create_isekai_link_relay_session(
     
         FfiConverterTypeIsekaiLinkRelayConfig.lower(`config`),_status)
+}
+    )
+    }
+    
+ fun `createIsekaiPipeQuicSession`(`config`: IsekaiPipeQuicConfig): IsekaiPipeQuicSession {
+            return FfiConverterTypeIsekaiPipeQuicSession.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_isekai_pipe_quic_session(
+    
+        FfiConverterTypeIsekaiPipeQuicConfig.lower(`config`),_status)
 }
     )
     }
@@ -10437,12 +10450,12 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
     )
     }
     
- fun `createMultipathHelperQuicSession`(`config`: MultipathHelperQuicConfig): MultipathHelperQuicSession {
-            return FfiConverterTypeMultipathHelperQuicSession.lift(
+ fun `createMultipathIsekaiPipeQuicSession`(`config`: MultipathIsekaiPipeQuicConfig): MultipathIsekaiPipeQuicSession {
+            return FfiConverterTypeMultipathIsekaiPipeQuicSession.lift(
     uniffiRustCall() { _status ->
-    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_multipath_helper_quic_session(
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_create_multipath_isekai_pipe_quic_session(
     
-        FfiConverterTypeMultipathHelperQuicConfig.lower(`config`),_status)
+        FfiConverterTypeMultipathIsekaiPipeQuicConfig.lower(`config`),_status)
 }
     )
     }

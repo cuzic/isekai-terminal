@@ -291,48 +291,130 @@ pub(crate) async fn connect_via_jump_or_direct(
     Ok(EstablishedSession { handle, agent_key, remote_forwards, _jump_handle: Some(jump_handle) })
 }
 
-// ── SSH チャネルループ（TCP・QUIC 共通）─────────────────
+// ── SSH接続プーリング用: 認証済みHandleの確立とチャネルの追加 ──
+//
+// SSH接続プーリング(`archive/ISEKAI_SSH_DESIGN.md`「2026-07-07: 上記オープンな課題の
+// 調査・設計確定」節)により、「認証済み`client::Handle`を確立する」処理と
+// 「そのHandle上に1本SSHチャネルを開いてI/Oループを回す」処理を分離する。前者は
+// プールにヒットした2本目以降のタブではスキップされ、後者は毎回(プールの有無に
+// 関わらず)タブごとに1回ずつ行われる。
 
-pub(crate) async fn run_ssh_channel_loop(
+/// 複数タブ(チャネル)から共有される、認証済みの`client::Handle`。プレーンSSH・
+/// isekai-pipe QUIC系(ネストしたSSH)いずれの確立方法でも同じ形にまとめる
+/// (`run_ssh_channel_loop`から見れば、TCPの上かQUICトンネルの上かは区別不要なため)。
+pub(crate) struct PooledSshHandle {
+    pub(crate) handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
+    agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
+    remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
+    /// 踏み台経由の場合、対象への接続が続く限り保持し続ける必要がある
+    /// (`EstablishedSession::_jump_handle`と同じ理由)。QUICネスト経由(踏み台なし)では`None`。
+    _jump_handle: Option<client::Handle<RusshEventHandler>>,
+}
+
+/// 未認証の`client::Handle`(TCP直結・踏み台経由・QUICトンネル経由いずれでも可)に対して
+/// 認証を行い、成功したら[PooledSshHandle]へラップする。`agent_forward`はプールキーの
+/// 一部でもあるため、プールエントリ全体に対して1回だけ`agent_key`を設定すればよい
+/// (2本目以降のチャネルは個別に認証しないため、チャネル単位で毎回設定する必要が無い)。
+async fn finish_establishing_handle(
+    mut handle: client::Handle<RusshEventHandler>,
+    agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
+    remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
+    jump_handle: Option<client::Handle<RusshEventHandler>>,
     username: &str,
     auth: &mut SshAuth,
-    cols: u32,
-    rows: u32,
     agent_forward: bool,
-    agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
-    allow_non_loopback_forward_bind: bool,
-    remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
-    mut session: client::Handle<RusshEventHandler>,
-    mut cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
-    event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
-) {
+) -> Result<PooledSshHandle, String> {
     let auth_method = match auth {
         SshAuth::Password { .. } => "password",
         SshAuth::PublicKey { .. } => "pubkey",
     };
     info!("ssh: auth {} for {}", auth_method, username);
 
-    let (authenticated, authed_key) = authenticate_session(&mut session, username, &*auth).await;
+    let (authenticated, authed_key) = authenticate_session(&mut handle, username, &*auth).await;
     // タスク#65: 認証に使い終わったので、平文の認証情報(パスワード・復号済み秘密鍵PEM)を
-    // ここで即座にゼロ化する(このセッションの以降の処理で`auth`が再び必要になることはない)。
+    // ここで即座にゼロ化する(このHandleの以降の処理で`auth`が再び必要になることはない)。
     zeroize_ssh_auth(auth);
 
     if !authenticated {
         warn!("ssh: auth {} failed for {}", auth_method, username);
-        event_tx.send(TransportEvent::Disconnected { reason: Some("Authentication failed".into()) }).await.ok();
-        return;
+        return Err("Authentication failed".to_string());
     }
     info!("ssh: auth ok");
 
     if agent_forward {
-        if let Some(key) = &authed_key {
-            *agent_key.lock() = Some(key.clone());
+        if let Some(key) = authed_key {
+            *agent_key.lock() = Some(key);
         } else {
             debug!("ssh: agent_forward requested but auth method is not publickey — ignoring");
         }
     }
 
-    let mut channel = match session.channel_open_session().await {
+    Ok(PooledSshHandle {
+        handle: Arc::new(tokio::sync::Mutex::new(handle)),
+        agent_key,
+        remote_forwards,
+        _jump_handle: jump_handle,
+    })
+}
+
+/// プレーンSSH(TCP直結・踏み台経由)用の確立関数。`connect_via_jump_or_direct` +
+/// 認証をまとめて行う。
+pub(crate) async fn establish_ssh_handle(
+    jump: &Option<JumpConfig>,
+    russh_config: Arc<client::Config>,
+    host: &str,
+    port: u16,
+    username: &str,
+    auth: &mut SshAuth,
+    agent_forward: bool,
+    event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
+) -> Result<PooledSshHandle, String> {
+    let established = connect_via_jump_or_direct(jump, russh_config, host, port, event_tx.clone()).await?;
+    finish_establishing_handle(
+        established.handle, established.agent_key, established.remote_forwards,
+        established._jump_handle, username, auth, agent_forward,
+    ).await
+}
+
+/// isekai-pipe QUIC系(ネストしたSSH、`client::connect_stream`)用の確立関数。呼び出し元が
+/// QUIC接続確立(ヘルパー起動・QUICハンドシェイク等)を済ませ、`stream`を渡す。踏み台は
+/// QUIC確立側(ヘルパー起動用ブートストラップSSH)で既に使われているため、ここでは扱わない
+/// (`_jump_handle`は常に`None`)。
+pub(crate) async fn establish_ssh_handle_over_stream<S>(
+    russh_config: Arc<client::Config>,
+    stream: S,
+    username: &str,
+    auth: &mut SshAuth,
+    agent_forward: bool,
+    event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
+) -> Result<PooledSshHandle, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let handler = RusshEventHandler::new(event_tx.clone());
+    let agent_key = handler.agent_key.clone();
+    let remote_forwards = handler.remote_forwards.clone();
+    let handle = client::connect_stream(russh_config, stream, handler)
+        .await
+        .map_err(|e| e.to_string())?;
+    finish_establishing_handle(handle, agent_key, remote_forwards, None, username, auth, agent_forward).await
+}
+
+// ── SSH チャネルループ（TCP・QUIC 共通）─────────────────
+
+/// [pooled]（既に認証済み）に対して新しいSSHチャネル(セッション/PTY/シェル)を1本開き、
+/// そのチャネルのI/Oループを回す。プールにヒットした2本目以降のタブも最初のタブも、
+/// この関数から始まる(呼び出し元が先に確立関数を呼ぶかプールから取得するかだけが違う)。
+pub(crate) async fn run_ssh_channel_loop(
+    pooled: &PooledSshHandle,
+    cols: u32,
+    rows: u32,
+    agent_forward: bool,
+    allow_non_loopback_forward_bind: bool,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
+    event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+) {
+    let mut channel = match pooled.handle.lock().await.channel_open_session().await {
         Ok(c) => { info!("ssh: session channel opened"); c }
         Err(e) => {
             warn!("ssh: channel_open_session failed: {}", e);
@@ -341,7 +423,7 @@ pub(crate) async fn run_ssh_channel_loop(
         }
     };
 
-    if agent_forward && authed_key.is_some() {
+    if agent_forward && pooled.agent_key.lock().is_some() {
         info!("ssh: requesting agent forwarding");
         if let Err(e) = channel.agent_forward(true).await {
             warn!("ssh: agent_forward request failed: {}", e);
@@ -368,7 +450,13 @@ pub(crate) async fn run_ssh_channel_loop(
     // `Arc<Handle>` 共有では足りなくなった。`Arc<tokio::sync::Mutex<Handle>>` に変更し、
     // 待受タスク側は必要な呼び出しの間だけ lock する(Handle は Clone 不可のため、
     // 複数タスクからの共有自体は元々このAPI境界でしかできない)。
-    let session = Arc::new(tokio::sync::Mutex::new(session));
+    //
+    // SSH接続プーリング後は、この`Arc<Mutex<Handle>>`は自タブ専用ではなく[pooled]から
+    // 複製した「プールエントリと共有」のハンドルになる。複数タブが同じHandleに対して
+    // 独立にforwardを追加/削除しても、`remote_forwards`(ポート→転送先の経路表)は
+    // [pooled]から複製したものを共有するため経路表自体は一貫する。
+    let session = pooled.handle.clone();
+    let remote_forwards = pooled.remote_forwards.clone();
     let mut active_forwards: HashMap<String, ActiveForward> = HashMap::new();
 
     loop {
@@ -1337,6 +1425,595 @@ mod proxy_jump_e2e_tests {
                 .channel_open_session()
                 .await
                 .expect("opening a channel on the target through the jump tunnel should succeed");
+        });
+    }
+}
+
+// ── e2e テスト: SSH接続プーリング(タスク#3/#4) ──────────────
+//
+// 認証済みの`client::Handle`を複数タブが共有し、2本目以降は`channel_open_session()`だけで
+// 済むこと(サーバー側が観測する認証回数で検証する)、および1タブのチャネルが切断されても
+// 他タブのチャネルに影響しないことを、in-processのrusshサーバーで検証する。
+#[cfg(test)]
+mod pooling_e2e_tests {
+    use super::*;
+    use crate::{
+        create_session_orchestrator, ConnectionPublicState, OrchestratorCallback, ScreenUpdate,
+        SshAuth, SshConfig, TrzszPublicState,
+    };
+    use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
+    use russh::{Channel as RusshChannel, ChannelId, CryptoVec, Pty};
+    use russh_keys::ssh_key::private::Ed25519Keypair;
+    use crate::faulty_stream::{FaultInjector, FaultyStream};
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+    #[allow(dead_code)]
+    enum TestEvent {
+        Connection(ConnectionPublicState),
+        Data(Vec<u8>),
+    }
+
+    struct TestCallback {
+        tx: UnboundedSender<TestEvent>,
+    }
+
+    impl OrchestratorCallback for TestCallback {
+        fn on_connection_state_changed(&self, state: ConnectionPublicState) {
+            let _ = self.tx.send(TestEvent::Connection(state));
+        }
+        fn on_screen_update(&self, _update: ScreenUpdate) {}
+        fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool { true }
+        fn on_data(&self, data: Vec<u8>) {
+            let _ = self.tx.send(TestEvent::Data(data));
+        }
+        fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
+        fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
+        fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+    }
+
+    /// 公開鍵認証を無条件で受け入れつつ認証回数を数え、シェルチャネルへ書き込まれた
+    /// バイト列をそのままechoし返す最小SSHサーバ。プーリングが効いていれば
+    /// 複数タブ(=複数`channel_open_session()`)でも`auth_count`は1のまま増えない
+    /// (プールにヒットしなければ、タブごとに新規TCP接続・新規認証が走り増える)。
+    #[derive(Clone)]
+    struct CountingEchoServer {
+        auth_count: Arc<AtomicUsize>,
+    }
+
+    impl server::Server for CountingEchoServer {
+        type Handler = CountingEchoHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> CountingEchoHandler {
+            CountingEchoHandler { auth_count: self.auth_count.clone() }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingEchoHandler {
+        auth_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl server::Handler for CountingEchoHandler {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self, _user: &str, _public_key: &russh_keys::ssh_key::PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            self.auth_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn pty_request(
+            &mut self, channel: ChannelId, _term: &str, _cols: u32, _rows: u32,
+            _pix_width: u32, _pix_height: u32, _modes: &[(Pty, u32)], session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            Ok(())
+        }
+
+        async fn shell_request(
+            &mut self, channel: ChannelId, session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            Ok(())
+        }
+
+        async fn data(
+            &mut self, channel: ChannelId, data: &[u8], session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            // タスク#4: 「リモートシェルプロセスがexitする」を模す特殊トリガー。
+            // このチャネルだけexit-status通知+closeし、他のチャネル(=他タブ、
+            // 同じclient::Handleを共有している場合)には一切触れない。
+            if data == b"__test_exit__" {
+                session.exit_status_request(channel, 0)?;
+                session.close(channel)?;
+                return Ok(());
+            }
+            session.data(channel, CryptoVec::from(data.to_vec()))?;
+            Ok(())
+        }
+    }
+
+    async fn spawn_counting_echo_server(auth_count: Arc<AtomicUsize>) -> SocketAddr {
+        let keypair = Ed25519Keypair::from_seed(&[42u8; 32]);
+        let host_key = russh_keys::PrivateKey::from(keypair);
+        let config = Arc::new(server::Config {
+            keys: vec![host_key],
+            ..Default::default()
+        });
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut sh = CountingEchoServer { auth_count };
+        tokio::spawn(async move {
+            use server::Server as _;
+            if let Err(e) = sh.run_on_socket(config, &listener).await {
+                warn!("test ssh server: run_on_socket exited: {}", e);
+            }
+        });
+        addr
+    }
+
+    fn key_auth(seed: u8) -> SshAuth {
+        let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let key = russh_keys::PrivateKey::from(keypair);
+        SshAuth::PublicKey {
+            private_key_pem: key.to_openssh(Default::default()).unwrap().as_bytes().to_vec(),
+        }
+    }
+
+    fn ssh_config(host: SocketAddr, auth: SshAuth) -> SshConfig {
+        SshConfig {
+            host: host.ip().to_string(),
+            port: host.port(),
+            username: "tester".into(),
+            auth,
+            cols: 80,
+            rows: 24,
+            forwards: Vec::new(),
+            agent_forward: false,
+            jump: None,
+            allow_non_loopback_forward_bind: false,
+        }
+    }
+
+    async fn wait_connected(rx: &mut UnboundedReceiver<TestEvent>) {
+        for _ in 0..50 {
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(TestEvent::Connection(ConnectionPublicState::Connected { .. }))) => return,
+                Ok(Some(TestEvent::Connection(ConnectionPublicState::Error { message }))) => {
+                    panic!("connection reported Error before Connected: {message}");
+                }
+                Ok(Some(TestEvent::Connection(ConnectionPublicState::Disconnected { reason }))) => {
+                    panic!("connection reported Disconnected before Connected: {reason:?}");
+                }
+                _ => continue,
+            }
+        }
+        panic!("did not become Connected within timeout");
+    }
+
+    async fn wait_echo(rx: &mut UnboundedReceiver<TestEvent>, expected: &[u8]) {
+        let mut got = Vec::new();
+        for _ in 0..50 {
+            if got.windows(expected.len().max(1)).any(|w| w == expected) {
+                return;
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(TestEvent::Data(data))) => got.extend_from_slice(&data),
+                _ => continue,
+            }
+        }
+        panic!("did not observe expected echo {:?} within timeout, got {:?}", expected, got);
+    }
+
+    #[test]
+    fn two_tabs_to_same_key_share_one_authenticated_connection() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+            let auth = key_auth(1);
+
+            let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
+            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            orch_a.connect(ssh_config(addr, auth.clone())).expect("tab A connect should not fail synchronously");
+            wait_connected(&mut rx_a).await;
+
+            let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
+            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+            orch_b.connect(ssh_config(addr, auth)).expect("tab B connect should not fail synchronously");
+            wait_connected(&mut rx_b).await;
+
+            assert_eq!(
+                auth_count.load(Ordering::SeqCst), 1,
+                "second tab should reuse the pooled connection instead of authenticating again"
+            );
+
+            // 両方のチャネルが独立に動作することを確認する。
+            orch_a.send(b"hello-a".to_vec());
+            wait_echo(&mut rx_a, b"hello-a").await;
+            orch_b.send(b"hello-b".to_vec());
+            wait_echo(&mut rx_b, b"hello-b").await;
+
+            // タブAを切断してもタブBのチャネルは影響を受けない(共有Handleは生き続ける)。
+            orch_a.disconnect();
+            orch_b.send(b"still-alive".to_vec());
+            wait_echo(&mut rx_b, b"still-alive").await;
+
+            orch_b.disconnect();
+        });
+    }
+
+    #[test]
+    fn two_tabs_with_different_keys_do_not_share_a_connection() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+
+            let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
+            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            orch_a.connect(ssh_config(addr, key_auth(1))).expect("tab A connect should not fail synchronously");
+            wait_connected(&mut rx_a).await;
+
+            let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
+            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+            orch_b.connect(ssh_config(addr, key_auth(2))).expect("tab B connect should not fail synchronously");
+            wait_connected(&mut rx_b).await;
+
+            assert_eq!(
+                auth_count.load(Ordering::SeqCst), 2,
+                "different keys to the same host must not share a pooled connection"
+            );
+
+            orch_a.disconnect();
+            orch_b.disconnect();
+        });
+    }
+
+    #[test]
+    fn three_tabs_share_one_connection_and_survive_partial_disconnects() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+            let auth = key_auth(80);
+
+            let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
+            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            orch_a.connect(ssh_config(addr, auth.clone())).expect("tab A connect should not fail synchronously");
+            wait_connected(&mut rx_a).await;
+
+            let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
+            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+            orch_b.connect(ssh_config(addr, auth.clone())).expect("tab B connect should not fail synchronously");
+            wait_connected(&mut rx_b).await;
+
+            let (tx_c, mut rx_c) = unbounded_channel::<TestEvent>();
+            let orch_c = create_session_orchestrator(Box::new(TestCallback { tx: tx_c }));
+            orch_c.connect(ssh_config(addr, auth)).expect("tab C connect should not fail synchronously");
+            wait_connected(&mut rx_c).await;
+
+            assert_eq!(
+                auth_count.load(Ordering::SeqCst), 1,
+                "three tabs to the same key should share a single authenticated connection"
+            );
+
+            orch_a.send(b"a".to_vec());
+            wait_echo(&mut rx_a, b"a").await;
+            orch_b.send(b"b".to_vec());
+            wait_echo(&mut rx_b, b"b").await;
+            orch_c.send(b"c".to_vec());
+            wait_echo(&mut rx_c, b"c").await;
+
+            // タブAを切断してもB・Cのチャネルは無事(共有Handleは refcount=2 でまだ生きている)。
+            orch_a.disconnect();
+            orch_b.send(b"b-after-a-gone".to_vec());
+            wait_echo(&mut rx_b, b"b-after-a-gone").await;
+            orch_c.send(b"c-after-a-gone".to_vec());
+            wait_echo(&mut rx_c, b"c-after-a-gone").await;
+
+            // 続けてタブBも切断してもCのチャネルはまだ無事(refcount=1)。
+            orch_b.disconnect();
+            orch_c.send(b"c-after-b-gone".to_vec());
+            wait_echo(&mut rx_c, b"c-after-b-gone").await;
+
+            orch_c.disconnect();
+        });
+    }
+
+    #[test]
+    fn concurrent_connects_to_same_key_only_authenticate_once() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+            let auth = key_auth(90);
+
+            let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
+            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
+            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+
+            // どちらも完了を待たずに立て続けにconnect()する。プール側の「確立中」状態
+            // (Connecting/Waiter)を、synthetic な型ではなく実際の非同期I/Oのタイミングで踏む。
+            orch_a.connect(ssh_config(addr, auth.clone())).expect("tab A connect should not fail synchronously");
+            orch_b.connect(ssh_config(addr, auth)).expect("tab B connect should not fail synchronously");
+
+            wait_connected(&mut rx_a).await;
+            wait_connected(&mut rx_b).await;
+
+            assert_eq!(
+                auth_count.load(Ordering::SeqCst), 1,
+                "connecting two tabs back-to-back without waiting must not race into two separate authentications"
+            );
+
+            orch_a.disconnect();
+            orch_b.disconnect();
+        });
+    }
+
+    #[test]
+    fn different_agent_forward_settings_do_not_share_a_pooled_connection() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+            let auth = key_auth(100);
+
+            let mut config_a = ssh_config(addr, auth.clone());
+            config_a.agent_forward = false;
+            let mut config_b = ssh_config(addr, auth);
+            config_b.agent_forward = true;
+
+            let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
+            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            orch_a.connect(config_a).expect("tab A connect should not fail synchronously");
+            wait_connected(&mut rx_a).await;
+
+            let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
+            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+            orch_b.connect(config_b).expect("tab B connect should not fail synchronously");
+            wait_connected(&mut rx_b).await;
+
+            assert_eq!(
+                auth_count.load(Ordering::SeqCst), 2,
+                "differing agent_forward settings must not share the same pooled Handle \
+                 (agent_key is set once per Handle, not per channel)"
+            );
+
+            orch_a.disconnect();
+            orch_b.disconnect();
+        });
+    }
+
+    #[test]
+    fn pooled_connection_is_reestablished_after_idle_grace_elapses() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+            let auth = key_auth(110);
+            let key = crate::pool::SshPoolKey::for_target(
+                &addr.ip().to_string(), addr.port(), "tester", &auth, false, &None,
+            ).expect("pubkey auth should produce a pool key");
+
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+            tokio::spawn(async move {
+                while let Some(event) = event_rx.recv().await {
+                    if let TransportEvent::HostKey(_, reply) = event {
+                        let _ = reply.send(true);
+                    }
+                }
+            });
+
+            // 1本目: 確立してプールへ登録する(本番の`run_russh_transport`が行うのと同じ手順)。
+            let mut auth1 = auth.clone();
+            match crate::pool::try_attach(&crate::pool::SSH_POOL, &key) {
+                crate::pool::AttachOutcome::Establisher => {
+                    let pooled = establish_ssh_handle(
+                        &None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+                        "tester", &mut auth1, false, &event_tx,
+                    ).await.expect("establish should succeed");
+                    crate::pool::publish_success(&crate::pool::SSH_POOL, &key, pooled);
+                }
+                _ => panic!("a brand new key must be the Establisher"),
+            }
+            assert_eq!(auth_count.load(Ordering::SeqCst), 1);
+
+            // 短い猶予(本番は30秒だが、テストでは待てないので直接短い値でreleaseする)で
+            // 参照を手放し、猶予経過後にプールエントリが消えることを確認する。
+            crate::pool::release(&crate::pool::SSH_POOL, key.clone(), Duration::from_millis(30));
+            let mut removed = false;
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if !crate::pool::SSH_POOL.lock().contains_key(&key) {
+                    removed = true;
+                    break;
+                }
+            }
+            assert!(removed, "pool entry should be removed once the idle grace elapses");
+
+            // 次のアタッチはEstablisherに戻り、サーバーは2回目の認証を観測する。
+            let mut auth2 = auth;
+            match crate::pool::try_attach(&crate::pool::SSH_POOL, &key) {
+                crate::pool::AttachOutcome::Establisher => {
+                    let pooled = establish_ssh_handle(
+                        &None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+                        "tester", &mut auth2, false, &event_tx,
+                    ).await.expect("re-establish should succeed");
+                    crate::pool::publish_success(&crate::pool::SSH_POOL, &key, pooled);
+                }
+                _ => panic!("after expiry, the next tab must become the Establisher again"),
+            }
+            assert_eq!(
+                auth_count.load(Ordering::SeqCst), 2,
+                "a new connection must re-authenticate once the previously pooled one has expired"
+            );
+
+            // 後始末: このテストが共有staticの`SSH_POOL`に残留エントリを残さないようにする。
+            crate::pool::release(&crate::pool::SSH_POOL, key.clone(), Duration::from_millis(10));
+            for _ in 0..50 {
+                if !crate::pool::SSH_POOL.lock().contains_key(&key) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+    }
+
+    // ── タスク#4: 共有SSH接続における障害分離 ──────────────────
+
+    /// 単発のチャネルを共有Handle上に開き、`Connected`を受け取ってから
+    /// `(コマンド送信端, イベント受信端)`を返す。オーケストレータ/`SessionCore`を
+    /// 経由せず`run_ssh_channel_loop`を直接叩くことで、プールされたHandleを
+    /// 複数「タブ」で共有する状況を最小構成で再現する。
+    async fn spawn_pooled_tab(
+        pooled: Arc<PooledSshHandle>,
+    ) -> (tokio::sync::mpsc::Sender<TransportCommand>, tokio::sync::mpsc::Receiver<TransportEvent>) {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TransportCommand>(16);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TransportEvent>(16);
+        tokio::spawn(async move {
+            run_ssh_channel_loop(&pooled, 80, 24, false, false, cmd_rx, event_tx).await;
+        });
+        match tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await {
+            Ok(Some(TransportEvent::Connected)) => {}
+            Ok(Some(_)) => panic!("expected Connected as the first event"),
+            Ok(None) => panic!("channel loop exited before reporting Connected"),
+            Err(_) => panic!("timed out waiting for Connected"),
+        }
+        (cmd_tx, event_rx)
+    }
+
+    async fn expect_disconnected(rx: &mut tokio::sync::mpsc::Receiver<TransportEvent>, context: &str) {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(TransportEvent::Disconnected { .. })) => {}
+            Ok(Some(_)) => panic!("{context}: expected Disconnected, got a different event"),
+            Ok(None) => {} // チャネル終了(送信端drop)も「切断された」の一種として許容する。
+            Err(_) => panic!("{context}: timed out waiting for Disconnected"),
+        }
+    }
+
+    /// 基盤の接続そのものが失われた場合の"fate sharing": プールされた1本の
+    /// `client::Handle`を共有する全タブが、他タブの個別事情(チャネル終了等)とは
+    /// 違って一斉に`Disconnected`になるべきことを検証する。生TCP接続を
+    /// `FaultyStream`(元々TCP/QUIC両対応で作られたテスト用故障注入ラッパー、
+    /// 従来multipath/QUIC系のテストでのみ使われていた)で包み、`inject.cut()`で
+    /// 基盤接続を強制的に切断する。
+    #[test]
+    fn underlying_connection_loss_disconnects_all_sharing_tabs() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+            let auth = key_auth(120);
+            let key = crate::pool::SshPoolKey::for_target(
+                &addr.ip().to_string(), addr.port(), "tester", &auth, false, &None,
+            ).expect("pubkey auth should produce a pool key");
+
+            let (hostkey_tx, mut hostkey_rx) = tokio::sync::mpsc::channel::<TransportEvent>(16);
+            tokio::spawn(async move {
+                while let Some(event) = hostkey_rx.recv().await {
+                    if let TransportEvent::HostKey(_, reply) = event {
+                        let _ = reply.send(true);
+                    }
+                }
+            });
+
+            // 生TCPをFaultyStreamで包んでからHandleを確立する。QUICネスト用の
+            // `establish_ssh_handle_over_stream`は任意のAsyncRead+AsyncWriteを
+            // 受け付けるので、「故障注入可能なプレーンSSH接続」としてそのまま使える。
+            let tcp = TokioTcpStream::connect(addr).await.expect("tcp connect should succeed");
+            let injector = FaultInjector::new();
+            let faulty = FaultyStream::new(tcp, injector.clone());
+            let mut auth1 = auth;
+            let pooled = establish_ssh_handle_over_stream(
+                Arc::new(client::Config::default()), faulty, "tester", &mut auth1, false, &hostkey_tx,
+            ).await.expect("establish over the faulty-wrapped TCP stream should succeed");
+            let pooled = crate::pool::publish_success(&crate::pool::SSH_POOL, &key, pooled);
+            assert_eq!(auth_count.load(Ordering::SeqCst), 1);
+
+            // 3タブがこの1本のHandleを共有する。
+            let (_cmd_a, mut rx_a) = spawn_pooled_tab(pooled.clone()).await;
+            let (_cmd_b, mut rx_b) = spawn_pooled_tab(pooled.clone()).await;
+            let (_cmd_c, mut rx_c) = spawn_pooled_tab(pooled.clone()).await;
+
+            // 基盤接続そのものを切断する(TCP RST相当)。個別チャネルの問題ではなく
+            // 接続そのものの喪失なので、共有中の全タブに伝播する"べき"。
+            injector.cut();
+
+            expect_disconnected(&mut rx_a, "tab A").await;
+            expect_disconnected(&mut rx_b, "tab B").await;
+            expect_disconnected(&mut rx_c, "tab C").await;
+
+            crate::pool::release(&crate::pool::SSH_POOL, key.clone(), Duration::from_millis(10));
+        });
+    }
+
+    /// 個別チャネルの終了(リモートシェルプロセスの`exit`等)は、他タブに伝播
+    /// "してはいけない"ことを検証する。`underlying_connection_loss_...`とは
+    /// 対になるテストで、「伝播すべきもの」と「伝播してはいけないもの」の境界を
+    /// 両方とも実際のI/Oで確認する。
+    #[test]
+    fn one_tab_remote_exit_does_not_disconnect_sibling_tabs() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+            let auth = key_auth(130);
+
+            let (tx_a, mut rx_a) = unbounded_channel::<TestEvent>();
+            let orch_a = create_session_orchestrator(Box::new(TestCallback { tx: tx_a }));
+            orch_a.connect(ssh_config(addr, auth.clone())).expect("tab A connect should not fail synchronously");
+            wait_connected(&mut rx_a).await;
+
+            let (tx_b, mut rx_b) = unbounded_channel::<TestEvent>();
+            let orch_b = create_session_orchestrator(Box::new(TestCallback { tx: tx_b }));
+            orch_b.connect(ssh_config(addr, auth)).expect("tab B connect should not fail synchronously");
+            wait_connected(&mut rx_b).await;
+
+            assert_eq!(auth_count.load(Ordering::SeqCst), 1, "both tabs should share one pooled connection");
+
+            // タブAのリモート側だけ"exit"させる(サーバー側がそのチャネルだけexit-status
+            // 通知+closeする、基盤のTCP接続やタブBのチャネルには一切触れない)。
+            orch_a.send(b"__test_exit__".to_vec());
+            let mut tab_a_disconnected = false;
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx_a.recv()).await {
+                    Ok(Some(TestEvent::Connection(ConnectionPublicState::Disconnected { .. }))) => {
+                        tab_a_disconnected = true;
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+            assert!(tab_a_disconnected, "tab A should observe Disconnected after its remote channel exits");
+
+            // タブBは無事: 共有Handle自体は生きているので送受信できる。
+            orch_b.send(b"still-here".to_vec());
+            wait_echo(&mut rx_b, b"still-here").await;
+
+            orch_b.disconnect();
         });
     }
 }

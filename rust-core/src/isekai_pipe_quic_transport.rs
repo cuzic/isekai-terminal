@@ -12,9 +12,11 @@
 //! 接続では `isekai_stun_p2p_transport.rs` / `isekai_link_relay_transport.rs` のように、
 //! helper 起動後の観測 endpoint を使う経路を選ぶ。
 //!
-//! ビルド前提: `rust-core/scripts/build-isekai-helper-musl.sh` を先に実行し、
-//! `target/{x86_64,aarch64}-unknown-linux-musl/release/isekai-helper` が存在すること
-//! （`include_bytes!` でこの crate の Android ビルドに埋め込む）。
+//! ビルド前提: `rust-core/scripts/build-isekai-pipe-musl.sh` を先に実行し、
+//! `target/{x86_64,aarch64}-unknown-linux-musl/release/isekai-pipe` が存在すること
+//! （`include_bytes!` でこの crate の Android ビルドに埋め込む。リモートでは
+//! `isekai-pipe serve ...` として起動する。旧 isekai-helper crate は
+//! `archive/ISEKAI_PIPE_MIGRATION.md` P5 で isekai-pipe へ統合済み）。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,11 +32,11 @@ use sha2::{Digest, Sha256};
 
 use isekai_protocol::hello::{decode_ack_response, encode_hello, AckResponse, Proof};
 
-use crate::helper_bootstrap::{self, BootstrapError, HelperBinaries, HelperHandshake, HelperP2pMode};
+use crate::helper_bootstrap::{self, BootstrapError, IsekaiPipeBinaries, IsekaiPipeHandshake, IsekaiPipeP2pMode};
 use crate::resume_client::{self, ClientResumeState};
 use crate::transport::{
-    authenticate_session, connect_via_jump_or_direct, run_ssh_channel_loop, RusshEventHandler,
-    TransportCommand, TransportEvent,
+    authenticate_session, connect_via_jump_or_direct, establish_ssh_handle_over_stream,
+    run_ssh_channel_loop, zeroize_ssh_auth, PooledSshHandle, TransportEvent,
 };
 use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
@@ -66,26 +68,27 @@ const CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 // （ISEKAI_SSH_DESIGN.md「共有ロジックの crate 分割」参照）。
 pub(crate) use isekai_protocol::hello::{
     ALPN, EXPORTER_LABEL, FRAME_ACK, FRAME_HELLO, FRAME_REJECT_AUTH, FRAME_REJECT_DUPLICATE,
-    FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED,
+    FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED, RESUME_GRACE_LEN,
 };
 
-/// isekai-helper/Cargo.toml の version と一致させる。バージョン不一致時は
-/// helper_bootstrap::ensure_helper_running が再配布する。
-pub(crate) const HELPER_VERSION: &str = "0.3.3";
+/// `isekai-pipe/Cargo.toml` の version と一致させる（`isekai-pipe --version` の出力に
+/// この文字列が部分一致することを`check_existing_version`が確認する）。バージョン
+/// 不一致時は helper_bootstrap::ensure_helper_running が再配布する。
+pub(crate) const ISEKAI_PIPE_VERSION: &str = "0.1.0";
 
-pub(crate) const HELPER_BIN_X86_64: &[u8] = include_bytes!(concat!(
+pub(crate) const ISEKAI_PIPE_BIN_X86_64: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/target/x86_64-unknown-linux-musl/release/isekai-helper"
+    "/target/x86_64-unknown-linux-musl/release/isekai-pipe"
 ));
-pub(crate) const HELPER_BIN_AARCH64: &[u8] = include_bytes!(concat!(
+pub(crate) const ISEKAI_PIPE_BIN_AARCH64: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/target/aarch64-unknown-linux-musl/release/isekai-helper"
+    "/target/aarch64-unknown-linux-musl/release/isekai-pipe"
 ));
 
 // ── 公開型 ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct HelperQuicConfig {
+pub struct IsekaiPipeQuicConfig {
     pub ssh_host: String,
     pub ssh_port: u16,
     pub username: String,
@@ -104,32 +107,41 @@ pub struct HelperQuicConfig {
 }
 
 #[derive(uniffi::Object)]
-pub struct HelperQuicSession {
-    config: HelperQuicConfig,
+pub struct IsekaiPipeQuicSession {
+    config: IsekaiPipeQuicConfig,
     core: SessionCore,
 }
 
 #[uniffi::export]
-pub fn create_helper_quic_session(config: HelperQuicConfig) -> Arc<HelperQuicSession> {
+pub fn create_isekai_pipe_quic_session(config: IsekaiPipeQuicConfig) -> Arc<IsekaiPipeQuicSession> {
     init_logger();
-    Arc::new(HelperQuicSession { config, core: SessionCore::new() })
+    Arc::new(IsekaiPipeQuicSession { config, core: SessionCore::new() })
 }
 
 #[uniffi::export]
-impl HelperQuicSession {
-    /// 明示的にヘルパー経由 QUIC のみを試す（フォールバック無し）。
+impl IsekaiPipeQuicSession {
+    /// 明示的にヘルパー経由 QUIC のみを試す（フォールバック無し）。SSH接続プーリング
+    /// (`archive/ISEKAI_SSH_DESIGN.md`参照)により、同一ホスト/ユーザー/鍵/ブートストラップ
+    /// パラメータへ既にプールされたHandleがあれば、ブートストラップSSH・ヘルパー起動・
+    /// QUICハンドシェイク・ネストしたSSH認証を丸ごとスキップして新しいSSHチャネルだけ開く。
     pub fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
-        let config = self.config.clone();
+        let mut config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         // ブートストラップ用SSH(isekai-helperを起動するための踏み台接続)のホスト鍵検証を
         // 本セッションのcallback(Kotlin側のKnownHostRepositoryを参照する既存のTOFU/
         // 変更検知ロジック)にそのまま委譲する（`bootstrap_helper_via_ssh`参照）。
         let host_key_callback = self.core.callback();
         RUNTIME.spawn(async move {
-            match try_connect_helper_quic(&config, host_key_callback).await {
-                Ok(stream) => run_over_stream(config, stream, cmd_rx, event_tx).await,
-                Err(e) => {
-                    warn!("helper_quic: connect failed: {e}");
+            let (cols, rows) = (config.cols, config.rows);
+            match acquire_pooled_handle(&mut config, host_key_callback, &event_tx).await {
+                AcquireOutcome::Attached(pooled, pool_key) => {
+                    run_ssh_channel_loop(&pooled, cols, rows, false, false, cmd_rx, event_tx).await;
+                    if let Some(key) = pool_key {
+                        crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);
+                    }
+                }
+                AcquireOutcome::DialFailed(e) | AcquireOutcome::OtherFailed(e) => {
+                    warn!("isekai_pipe_quic: connect failed: {e}");
                     event_tx.send(TransportEvent::Disconnected { reason: Some(e) }).await.ok();
                 }
             }
@@ -138,13 +150,46 @@ impl HelperQuicSession {
     }
 
     /// `TransportPreference::Auto` 相当: ヘルパー経由 QUIC を試し、失敗したら
-    /// 通常の TCP SSH（Phase 1-4）にフォールバックする。
+    /// 通常の TCP SSH（Phase 1-4）にフォールバックする。プーリングのプールヒット時、
+    /// および他タブの確立待ち(waiter)がその後失敗を観測した場合はフォールバックしない
+    /// (自分自身がダイヤルを試みて失敗した場合のみフォールバックする、既存の挙動を維持)。
     pub fn connect_auto(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
-        let config = self.config.clone();
+        let mut config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         let host_key_callback = self.core.callback();
         RUNTIME.spawn(async move {
-            run_helper_quic_transport_auto(config, cmd_rx, event_tx, host_key_callback).await;
+            let (cols, rows) = (config.cols, config.rows);
+            match acquire_pooled_handle(&mut config, host_key_callback, &event_tx).await {
+                AcquireOutcome::Attached(pooled, pool_key) => {
+                    run_ssh_channel_loop(&pooled, cols, rows, false, false, cmd_rx, event_tx).await;
+                    if let Some(key) = pool_key {
+                        crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);
+                    }
+                }
+                AcquireOutcome::DialFailed(e) => {
+                    warn!("isekai_pipe_quic auto: falling back to plain SSH after: {e}");
+                    let ssh_config = crate::SshConfig {
+                        host: config.ssh_host,
+                        port: config.ssh_port,
+                        username: config.username,
+                        auth: config.auth,
+                        cols, rows,
+                        // IsekaiPipeQuicConfig にはポートフォワード設定・agent forwarding 設定が無いため、
+                        // フォールバック時はどちらも無効なプレーン SSH として接続する。
+                        forwards: Vec::new(),
+                        agent_forward: false,
+                        // IsekaiPipeQuicConfig には踏み台(jump host)設定も無いため、フォールバック時は
+                        // 対象ホストへ直接SSH接続する前提のまま(SshConfig::jump 参照)。
+                        jump: None,
+                        allow_non_loopback_forward_bind: false,
+                    };
+                    crate::run_russh_transport(ssh_config, cmd_rx, event_tx).await;
+                }
+                AcquireOutcome::OtherFailed(e) => {
+                    warn!("isekai_pipe_quic auto: {e}");
+                    event_tx.send(TransportEvent::Disconnected { reason: Some(e) }).await.ok();
+                }
+            }
         });
         Ok(())
     }
@@ -188,7 +233,7 @@ impl HelperQuicSession {
 }
 
 // SessionOrchestrator からのみ呼ばれる内部API(uniffi には直接は出さない)。
-impl HelperQuicSession {
+impl IsekaiPipeQuicSession {
     /// Phase 12: per-session theme。
     pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
         self.core.set_theme(theme);
@@ -257,12 +302,12 @@ impl ServerCertVerifier for PinnedCertVerifier {
 // ── ブートストラップ（Phase 7-3 呼び出し） ───────────────
 
 async fn bootstrap_via_ssh(
-    config: &HelperQuicConfig,
+    config: &IsekaiPipeQuicConfig,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
-) -> Result<HelperHandshake, String> {
+) -> Result<IsekaiPipeHandshake, String> {
     bootstrap_helper_via_ssh(
         &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump,
-        config.bind_port, &HelperP2pMode::None, host_key_callback,
+        config.bind_port, &IsekaiPipeP2pMode::None, host_key_callback,
     ).await
 }
 
@@ -299,7 +344,7 @@ pub(crate) fn spawn_bootstrap_host_key_forwarder(
 }
 
 /// SSH でログインし、isekai-helper をブートストラップして起動ハンドシェイクを得る。
-/// `HelperQuicConfig`（Phase 7/8、フォールバック無し/Auto）と `MultipathHelperQuicConfig`
+/// `IsekaiPipeQuicConfig`（Phase 7/8、フォールバック無し/Auto）と `MultipathIsekaiPipeQuicConfig`
 /// （Phase 9-2、パス冗長化）は候補アドレスの持ち方が異なるだけで、SSH ブートストラップ自体は
 /// 共通なのでここに切り出してある。
 ///
@@ -314,7 +359,7 @@ pub(crate) fn spawn_bootstrap_host_key_forwarder(
 ///
 /// `p2p_mode`: Phase 10 の STUN+SSH rendezvous / relay 経由 P2P
 /// (`isekai_stun_p2p_transport.rs`/`isekai_link_relay_transport.rs`)専用。他の呼び出し元は
-/// 常に `&HelperP2pMode::None` を渡す。
+/// 常に `&IsekaiPipeP2pMode::None` を渡す。
 ///
 /// `host_key_callback`: このブートストラップ用 SSH 接続(踏み台込み)のホスト鍵を、
 /// 本セッションと同じ known_hosts エントリ(Kotlin 側 `KnownHostRepository`)で検証する
@@ -327,9 +372,9 @@ pub(crate) async fn bootstrap_helper_via_ssh(
     auth: &SshAuth,
     jump: &Option<JumpConfig>,
     bind_port: Option<u16>,
-    p2p_mode: &HelperP2pMode,
+    p2p_mode: &IsekaiPipeP2pMode,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
-) -> Result<HelperHandshake, String> {
+) -> Result<IsekaiPipeHandshake, String> {
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
     spawn_bootstrap_host_key_forwarder(event_rx, host_key_callback);
 
@@ -343,9 +388,9 @@ pub(crate) async fn bootstrap_helper_via_ssh(
         return Err("bootstrap SSH authentication failed".to_string());
     }
 
-    let binaries = HelperBinaries { x86_64: HELPER_BIN_X86_64, aarch64: HELPER_BIN_AARCH64 };
+    let binaries = IsekaiPipeBinaries { x86_64: ISEKAI_PIPE_BIN_X86_64, aarch64: ISEKAI_PIPE_BIN_AARCH64 };
     helper_bootstrap::ensure_helper_running(
-        &mut established.handle, &binaries, HELPER_VERSION, "127.0.0.1:22", bind_port, p2p_mode,
+        &mut established.handle, &binaries, ISEKAI_PIPE_VERSION, "127.0.0.1:22", bind_port, p2p_mode,
     )
         .await
         .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))
@@ -411,13 +456,13 @@ pub(crate) async fn establish_quic_connection_with_socket(
     .map_err(|e| format!("endpoint bind failed: {e}"))?;
     endpoint.set_default_client_config(client_config);
 
-    info!("helper_quic: connecting to {remote}");
+    info!("isekai_pipe_quic: connecting to {remote}");
     let conn = endpoint
-        .connect(remote, "isekai-helper.local")
+        .connect(remote, "isekai-pipe.local")
         .map_err(|e| format!("connect setup failed: {e}"))?
         .await
         .map_err(|e| format!("QUIC handshake failed: {e}"))?;
-    info!("helper_quic: QUIC handshake ok rtt={:?}", conn.rtt(noq::PathId::ZERO));
+    info!("isekai_pipe_quic: QUIC handshake ok rtt={:?}", conn.rtt(noq::PathId::ZERO));
     Ok(conn)
 }
 
@@ -442,9 +487,11 @@ pub(crate) fn compute_proof(conn: &noq::Connection, session_secret: &[u8], extra
 /// false premise that bootstrap reachability implies UDP/QUIC reachability.
 pub(crate) async fn resolve_direct_by_bootstrap_host(
     bootstrap_host: &str,
-    handshake: &HelperHandshake,
+    handshake: &IsekaiPipeHandshake,
 ) -> Result<SocketAddr, String> {
-    let port = handshake.direct_by_bootstrap_host_port();
+    let port = handshake
+        .direct_by_bootstrap_host_port()
+        .ok_or_else(|| "handshake did not advertise a direct-by-bootstrap-host candidate".to_string())?;
     tokio::net::lookup_host((bootstrap_host, port))
         .await
         .map_err(|e| format!("DNS lookup failed for direct-by-bootstrap-host {bootstrap_host}:{port}: {e}"))?
@@ -452,12 +499,12 @@ pub(crate) async fn resolve_direct_by_bootstrap_host(
         .ok_or_else(|| format!("no address resolved for direct-by-bootstrap-host {bootstrap_host}:{port}"))
 }
 
-async fn connect_helper_quic_stream(
+async fn connect_isekai_pipe_quic_stream(
     ssh_host: &str,
-    handshake: &HelperHandshake,
+    handshake: &IsekaiPipeHandshake,
 ) -> Result<resume_client::ReattachableStream, String> {
     let remote = resolve_direct_by_bootstrap_host(ssh_host, handshake).await?;
-    let cert_sha256_hex = handshake.cert_sha256.clone();
+    let cert_sha256_hex = handshake.cert_sha256().to_string();
     let session_secret = base64::engine::general_purpose::STANDARD
         .decode(&handshake.session_secret)
         .map_err(|e| format!("invalid session_secret encoding: {e}"))?;
@@ -467,14 +514,23 @@ async fn connect_helper_quic_stream(
     let proof = compute_proof(&conn, &session_secret, b"")?;
 
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi failed: {e}"))?;
-    send.write_all(&encode_hello(&Proof::new(proof)))
+    // No client-configurable resume-grace concept on Android yet — `0` means
+    // "no preference, use the server's own default/max"
+    // (`isekai_protocol::hello::decode_ack_response`'s docs).
+    send.write_all(&encode_hello(&Proof::new(proof), 0))
         .await
         .map_err(|e| format!("HELLO write failed: {e}"))?;
 
-    let mut resp = [0u8; 1];
-    recv.read_exact(&mut resp).await.map_err(|e| format!("ACK read failed: {e}"))?;
-    match decode_ack_response(resp[0]).map_err(|e| format!("isekai-helper: {e}"))? {
-        AckResponse::Ack => {}
+    let mut type_byte = [0u8; 1];
+    recv.read_exact(&mut type_byte).await.map_err(|e| format!("ACK read failed: {e}"))?;
+    let mut resp = vec![type_byte[0]];
+    if type_byte[0] == FRAME_ACK {
+        let mut rest = [0u8; RESUME_GRACE_LEN];
+        recv.read_exact(&mut rest).await.map_err(|e| format!("ACK read failed: {e}"))?;
+        resp.extend_from_slice(&rest);
+    }
+    match decode_ack_response(&resp).map_err(|e| format!("isekai-helper: {e}"))? {
+        AckResponse::Ack { .. } => {}
         AckResponse::RejectAuth => return Err("isekai-helper rejected: auth (proof mismatch)".to_string()),
         AckResponse::RejectDuplicate => {
             return Err("isekai-helper rejected: duplicate active connection".to_string())
@@ -482,7 +538,7 @@ async fn connect_helper_quic_stream(
         AckResponse::RejectTarget => return Err("isekai-helper rejected: target unreachable".to_string()),
         AckResponse::RejectUnsupported => return Err("isekai-helper rejected: unsupported frame".to_string()),
     }
-    info!("helper_quic: HELLO/ACK ok — handing off to SSH");
+    info!("isekai_pipe_quic: HELLO/ACK ok — handing off to SSH");
 
     let resume_state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(
         DEFAULT_RESUME_BUFFER_SIZE,
@@ -503,17 +559,17 @@ async fn connect_helper_quic_stream(
             match tokio::time::timeout(CONTROL_STREAM_TIMEOUT, open_control_stream(&conn, &proof)).await {
                 Ok(Ok((csend, crecv, session_id))) => {
                     info!(
-                        "helper_quic: control stream established (resume support enabled), session_id={}",
+                        "isekai_pipe_quic: control stream established (resume support enabled), session_id={}",
                         session_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
                     );
                     resume_state.lock().unwrap().session_id = Some(session_id);
                     spawn_app_ack_tasks(csend, crecv, resume_state);
                 }
                 Ok(Err(e)) => {
-                    info!("helper_quic: control stream handshake failed ({e}), continuing without resume support");
+                    info!("isekai_pipe_quic: control stream handshake failed ({e}), continuing without resume support");
                 }
                 Err(_) => {
-                    info!("helper_quic: control stream not accepted within timeout, continuing without resume support");
+                    info!("isekai_pipe_quic: control stream not accepted within timeout, continuing without resume support");
                 }
             }
         });
@@ -544,7 +600,7 @@ async fn connect_helper_quic_stream(
             let mut rest = [0u8; 16];
             recv.read_exact(&mut rest).await.map_err(|e| format!("RESUME_ACK body read failed: {e}"))?;
             let helper_committed_offset = u64::from_be_bytes(rest[0..8].try_into().unwrap());
-            info!("helper_quic: resume succeeded, helper_committed_offset={helper_committed_offset}");
+            info!("isekai_pipe_quic: resume succeeded, helper_committed_offset={helper_committed_offset}");
             Ok(resume_client::ReattachResult { send, recv, helper_committed_offset })
         })
     });
@@ -627,86 +683,156 @@ pub(crate) fn spawn_app_ack_tasks(
     });
 }
 
-async fn try_connect_helper_quic(
-    config: &HelperQuicConfig,
+async fn try_connect_isekai_pipe_quic(
+    config: &IsekaiPipeQuicConfig,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<resume_client::ReattachableStream, String> {
     let handshake = bootstrap_via_ssh(config, host_key_callback).await?;
-    connect_helper_quic_stream(&config.ssh_host, &handshake).await
+    connect_isekai_pipe_quic_stream(&config.ssh_host, &handshake).await
 }
 
-async fn run_over_stream(
-    mut config: HelperQuicConfig,
-    stream: resume_client::ReattachableStream,
-    cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
-    event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
-) {
+// ── SSH接続プーリング(isekai-pipe QUICファミリー) ────────────
+//
+// `archive/ISEKAI_SSH_DESIGN.md`「QUIC系トランスポート(isekai-pipeファミリー)への拡張」
+// 節参照。isekai-pipeのwireプロトコルは「1 QUIC connection = 1 data stream」の
+// 1対1構造しか持たないため、QUIC接続を複数タブで共有する時点で、その上のネストした
+// SSH `client::Handle`も自動的に1個だけになる。したがって「ブートストラップSSH→
+// ヘルパー起動→QUICハンドシェイク→ネストしたSSH認証」という一連の処理全体を、
+// プレーンSSHの`client::Handle`プーリングと同じ形(1プールエントリに複数タブが
+// `channel_open_session()`するだけ)で扱える。
+
+/// isekai-pipe QUIC接続の同一性を決める識別子。パスワード認証は`for_config`が`None`を
+/// 返す(常にプール対象外)。フィールドの根拠は`SshPoolKey`と同様(`pool.rs`参照)。
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct IsekaiPipeQuicPoolKey {
+    ssh_host: String,
+    ssh_port: u16,
+    username: String,
+    auth_identity: String,
+    /// (host, port, username, auth_identity)。ブートストラップ用踏み台の同一性判定にのみ使う。
+    jump: Option<(String, u16, String, String)>,
+    /// ヘルパーの固定待受ポート指定。タブによって食い違うと同一ヘルパーインスタンスに
+    /// 繋がる保証が無いためキーに含める。
+    bind_port: Option<u16>,
+}
+
+impl IsekaiPipeQuicPoolKey {
+    fn for_config(config: &IsekaiPipeQuicConfig) -> Option<Self> {
+        let auth_identity = crate::pool::auth_identity_fingerprint(&config.auth)?;
+        let jump = match &config.jump {
+            None => None,
+            Some(j) => {
+                let jump_auth_identity = crate::pool::auth_identity_fingerprint(&j.auth)?;
+                Some((j.host.clone(), j.port, j.username.clone(), jump_auth_identity))
+            }
+        };
+        Some(IsekaiPipeQuicPoolKey {
+            ssh_host: config.ssh_host.clone(),
+            ssh_port: config.ssh_port,
+            username: config.username.clone(),
+            auth_identity,
+            jump,
+            bind_port: config.bind_port,
+        })
+    }
+}
+
+static ISEKAI_PIPE_QUIC_POOL: std::sync::LazyLock<crate::pool::PoolMap<IsekaiPipeQuicPoolKey, PooledSshHandle>> =
+    std::sync::LazyLock::new(crate::pool::new_pool_map);
+
+/// QUIC接続確立コスト(ヘルパー起動＋QUICハンドシェイク＋ネスト認証)はプレーンSSHの
+/// TCP接続よりも明らかに高いため、プレーンSSH(30秒、`pool::PLAIN_SSH_IDLE_GRACE`)より
+/// 長い猶予を置く。
+const ISEKAI_PIPE_QUIC_IDLE_GRACE: Duration = Duration::from_secs(90);
+
+enum AcquireError {
+    /// ブートストラップSSH/QUICハンドシェイク自体の失敗。`connect_auto`はこの場合のみ
+    /// プレーンSSHへフォールバックする(既存の挙動を維持)。
+    DialFailed(String),
+    /// ダイヤル自体は成功したが、その後(ネストしたSSH認証等)で失敗。フォールバック対象外
+    /// (既存の挙動を維持、`Disconnected`イベントで通常通り報告する)。
+    PostDialFailed(String),
+}
+
+/// ダイヤル(ブートストラップ+QUICハンドシェイク)からネストしたSSH認証までを毎回
+/// フルで行う。プールにヒットしなかった場合、またはこのタブがプールの確立担当に
+/// なった場合にのみ呼ばれる。
+async fn establish_fresh(
+    config: &mut IsekaiPipeQuicConfig,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
+    event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
+) -> Result<PooledSshHandle, AcquireError> {
+    let stream = try_connect_isekai_pipe_quic(config, host_key_callback)
+        .await
+        .map_err(AcquireError::DialFailed)?;
     let russh_config = Arc::new(client::Config {
         keepalive_interval: Some(Duration::from_secs(60)),
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let handler = RusshEventHandler::new(event_tx.clone());
-    let agent_key = handler.agent_key.clone();
-    let remote_forwards = handler.remote_forwards.clone();
-
-    let session = match client::connect_stream(russh_config, stream, handler).await {
-        Ok(s) => s,
-        Err(e) => {
-            event_tx.send(TransportEvent::Disconnected { reason: Some(e.to_string()) }).await.ok();
-            return;
-        }
-    };
-
-    // HelperQuicConfig は agent forwarding 未対応（プロファイルの `SshConfig.agent_forward`
+    // IsekaiPipeQuicConfig は agent forwarding 未対応（プロファイルの `SshConfig.agent_forward`
     // 相当のフィールドをまだ持たない）。
-    run_ssh_channel_loop(
-        &config.username, &mut config.auth, config.cols, config.rows,
-        false, agent_key, false, remote_forwards,
-        session, cmd_rx, event_tx,
-    ).await;
+    establish_ssh_handle_over_stream(russh_config, stream, &config.username, &mut config.auth, false, event_tx)
+        .await
+        .map_err(AcquireError::PostDialFailed)
 }
 
-/// `TransportPreference::Auto`: ヘルパー経由 QUIC を試し、ブートストラップ/QUIC 接続の
-/// 時点で失敗したら通常の TCP SSH にフォールバックする。一度 russh セッションが確立した
-/// 後の切断はフォールバック対象にしない（正常な切断イベントとして扱う）。
-async fn run_helper_quic_transport_auto(
-    config: HelperQuicConfig,
-    cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
-    event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+enum AcquireOutcome {
+    Attached(Arc<PooledSshHandle>, Option<IsekaiPipeQuicPoolKey>),
+    DialFailed(String),
+    OtherFailed(String),
+}
+
+/// プールにヒットすればダイヤル(ブートストラップ+QUICハンドシェイク+ネスト認証)を
+/// 丸ごとスキップし、既存の認証済みHandleを返す。ヒットしなければ`establish_fresh`で
+/// ゼロから確立してプールへ登録する。
+async fn acquire_pooled_handle(
+    config: &mut IsekaiPipeQuicConfig,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
-) {
-    match try_connect_helper_quic(&config, host_key_callback).await {
-        Ok(stream) => run_over_stream(config, stream, cmd_rx, event_tx).await,
-        Err(e) => {
-            warn!("helper_quic auto: falling back to plain SSH after: {e}");
-            let ssh_config = crate::SshConfig {
-                host: config.ssh_host,
-                port: config.ssh_port,
-                username: config.username,
-                auth: config.auth,
-                cols: config.cols,
-                rows: config.rows,
-                // HelperQuicConfig にはポートフォワード設定・agent forwarding 設定が無いため、
-                // フォールバック時はどちらも無効なプレーン SSH として接続する。
-                forwards: Vec::new(),
-                agent_forward: false,
-                // HelperQuicConfig には踏み台(jump host)設定も無いため、フォールバック時は
-                // 対象ホストへ直接SSH接続する前提のまま(SshConfig::jump 参照)。
-                jump: None,
-                // フォールバック時は forwards が空なので実質無関係だが、既定に合わせて false。
-                allow_non_loopback_forward_bind: false,
-            };
-            crate::run_russh_transport(ssh_config, cmd_rx, event_tx).await;
-        }
+    event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
+) -> AcquireOutcome {
+    match IsekaiPipeQuicPoolKey::for_config(config) {
+        None => match establish_fresh(config, host_key_callback, event_tx).await {
+            Ok(p) => AcquireOutcome::Attached(Arc::new(p), None),
+            Err(AcquireError::DialFailed(m)) => AcquireOutcome::DialFailed(m),
+            Err(AcquireError::PostDialFailed(m)) => AcquireOutcome::OtherFailed(m),
+        },
+        Some(key) => match crate::pool::try_attach(&ISEKAI_PIPE_QUIC_POOL, &key) {
+            crate::pool::AttachOutcome::Ready(v) => {
+                zeroize_ssh_auth(&mut config.auth);
+                AcquireOutcome::Attached(v, Some(key))
+            }
+            crate::pool::AttachOutcome::Waiter(rx) => {
+                zeroize_ssh_auth(&mut config.auth);
+                match crate::pool::wait_for_establish(rx).await {
+                    Ok(v) => AcquireOutcome::Attached(v, Some(key)),
+                    Err(m) => AcquireOutcome::OtherFailed(m),
+                }
+            }
+            crate::pool::AttachOutcome::Establisher => {
+                match establish_fresh(config, host_key_callback, event_tx).await {
+                    Ok(p) => AcquireOutcome::Attached(
+                        crate::pool::publish_success(&ISEKAI_PIPE_QUIC_POOL, &key, p), Some(key),
+                    ),
+                    Err(AcquireError::DialFailed(m)) => {
+                        crate::pool::publish_failure(&ISEKAI_PIPE_QUIC_POOL, &key, m.clone());
+                        AcquireOutcome::DialFailed(m)
+                    }
+                    Err(AcquireError::PostDialFailed(m)) => {
+                        crate::pool::publish_failure(&ISEKAI_PIPE_QUIC_POOL, &key, m.clone());
+                        AcquireOutcome::OtherFailed(m)
+                    }
+                }
+            }
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
-    //! `HelperQuicSession` を orchestrator レベルではなく直接使い、SSH ブートストラップ →
+    //! `IsekaiPipeQuicSession` を orchestrator レベルではなく直接使い、SSH ブートストラップ →
     //! isekai-helper QUIC → russh チャネル → 実シェルコマンド実行までを通しで検証する。
-    //! 実 sshd（127.0.0.1:22）+ `HELPER_BOOTSTRAP_TEST_KEY` が必要な opt-in テスト。
+    //! 実 sshd（127.0.0.1:22）+ `ISEKAI_PIPE_BOOTSTRAP_TEST_KEY` が必要な opt-in テスト。
     use super::*;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Notify;
@@ -810,13 +936,13 @@ mod tests {
 
     #[tokio::test]
     async fn full_stack_bootstrap_quic_and_shell_command() {
-        let Ok(key_path) = std::env::var("HELPER_BOOTSTRAP_TEST_KEY") else {
-            eprintln!("skipping: HELPER_BOOTSTRAP_TEST_KEY not set");
+        let Ok(key_path) = std::env::var("ISEKAI_PIPE_BOOTSTRAP_TEST_KEY") else {
+            eprintln!("skipping: ISEKAI_PIPE_BOOTSTRAP_TEST_KEY not set");
             return;
         };
         let key_pem = std::fs::read_to_string(&key_path).unwrap();
         // 秘密鍵の実体はテストなので PEM のまま渡す（本番の SshAuth::PublicKey と同じ形）。
-        let config = HelperQuicConfig {
+        let config = IsekaiPipeQuicConfig {
             ssh_host: "127.0.0.1".to_string(),
             ssh_port: 22,
             username: std::env::var("USER").unwrap_or_else(|_| "root".to_string()),
@@ -827,7 +953,7 @@ mod tests {
             bind_port: None,
         };
 
-        let session = create_helper_quic_session(config);
+        let session = create_isekai_pipe_quic_session(config);
         let buf = Arc::new(StdMutex::new(Vec::new()));
         let notify = Arc::new(Notify::new());
         let callback = TestCallback { buf: buf.clone(), notify: notify.clone() };
@@ -863,16 +989,16 @@ mod tests {
     /// `ReattachableStream` が russh にエラーを見せずに同じ SSH セッションを
     /// 継続させることを検証する。`debug_fault::shared_injector()` はプロセス
     /// グローバルな状態なので、**このテストは他のテストと同時実行しないこと**
-    /// （`cargo test --lib helper_quic_transport::tests::resume_survives_connection_cut`
+    /// （`cargo test --lib isekai_pipe_quic_transport::tests::resume_survives_connection_cut`
     /// のように単独実行する）。
     #[tokio::test]
     async fn resume_survives_connection_cut() {
-        let Ok(key_path) = std::env::var("HELPER_BOOTSTRAP_TEST_KEY") else {
-            eprintln!("skipping: HELPER_BOOTSTRAP_TEST_KEY not set");
+        let Ok(key_path) = std::env::var("ISEKAI_PIPE_BOOTSTRAP_TEST_KEY") else {
+            eprintln!("skipping: ISEKAI_PIPE_BOOTSTRAP_TEST_KEY not set");
             return;
         };
         let key_pem = std::fs::read_to_string(&key_path).unwrap();
-        let config = HelperQuicConfig {
+        let config = IsekaiPipeQuicConfig {
             ssh_host: "127.0.0.1".to_string(),
             ssh_port: 22,
             username: std::env::var("USER").unwrap_or_else(|_| "root".to_string()),
@@ -887,7 +1013,7 @@ mod tests {
         crate::debug_fault::shared_injector().set_latency(Duration::ZERO);
         crate::debug_fault::shared_injector().set_loss_rate(0.0);
 
-        let session = create_helper_quic_session(config);
+        let session = create_isekai_pipe_quic_session(config);
         let buf = Arc::new(StdMutex::new(Vec::new()));
         let notify = Arc::new(Notify::new());
         let callback = TestCallback { buf: buf.clone(), notify: notify.clone() };
@@ -941,5 +1067,128 @@ mod tests {
                 .await
                 .ok();
         }
+    }
+}
+
+// ── IsekaiPipeQuicPoolKey: 実SSH/QUIC不要のユニットテスト ──────────
+//
+// プーリングの要である`IsekaiPipeQuicPoolKey::for_config`の同一性判定は、既存の
+// opt-in e2eテスト(実sshd必須)だけではカバーされていなかった。`pool.rs`の
+// `SshPoolKey`テストと同じ観点を、QUIC固有のフィールド(`bind_port`)も含めて検証する。
+#[cfg(test)]
+mod pool_key_tests {
+    use super::*;
+
+    fn password_config() -> IsekaiPipeQuicConfig {
+        IsekaiPipeQuicConfig {
+            ssh_host: "host".into(),
+            ssh_port: 22,
+            username: "user".into(),
+            auth: SshAuth::Password { password: "hunter2".into() },
+            cols: 80,
+            rows: 24,
+            jump: None,
+            bind_port: None,
+        }
+    }
+
+    fn key_config(seed: u8) -> IsekaiPipeQuicConfig {
+        use russh_keys::ssh_key::private::Ed25519Keypair;
+        let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let key = russh_keys::PrivateKey::from(keypair);
+        IsekaiPipeQuicConfig {
+            ssh_host: "host".into(),
+            ssh_port: 22,
+            username: "user".into(),
+            auth: SshAuth::PublicKey {
+                private_key_pem: key.to_openssh(Default::default()).unwrap().as_bytes().to_vec(),
+            },
+            cols: 80,
+            rows: 24,
+            jump: None,
+            bind_port: None,
+        }
+    }
+
+    #[test]
+    fn password_auth_never_produces_a_pool_key() {
+        assert!(IsekaiPipeQuicPoolKey::for_config(&password_config()).is_none());
+    }
+
+    #[test]
+    fn same_config_produces_equal_keys() {
+        let a = IsekaiPipeQuicPoolKey::for_config(&key_config(1)).unwrap();
+        let b = IsekaiPipeQuicPoolKey::for_config(&key_config(1)).unwrap();
+        assert!(a == b);
+    }
+
+    #[test]
+    fn different_keys_produce_different_pool_keys() {
+        let a = IsekaiPipeQuicPoolKey::for_config(&key_config(1)).unwrap();
+        let b = IsekaiPipeQuicPoolKey::for_config(&key_config(2)).unwrap();
+        assert!(a != b);
+    }
+
+    #[test]
+    fn different_ssh_host_produces_different_pool_keys() {
+        let mut cfg_b = key_config(1);
+        cfg_b.ssh_host = "other-host".into();
+        let a = IsekaiPipeQuicPoolKey::for_config(&key_config(1)).unwrap();
+        let b = IsekaiPipeQuicPoolKey::for_config(&cfg_b).unwrap();
+        assert!(a != b);
+    }
+
+    #[test]
+    fn different_bind_port_produces_different_pool_keys() {
+        let mut cfg_a = key_config(1);
+        cfg_a.bind_port = Some(45000);
+        let mut cfg_b = key_config(1);
+        cfg_b.bind_port = Some(45001);
+        let a = IsekaiPipeQuicPoolKey::for_config(&cfg_a).unwrap();
+        let b = IsekaiPipeQuicPoolKey::for_config(&cfg_b).unwrap();
+        assert!(a != b, "a fixed helper listen port mismatch must not share a pooled connection");
+    }
+
+    #[test]
+    fn same_bind_port_produces_equal_keys() {
+        let mut cfg_a = key_config(1);
+        cfg_a.bind_port = Some(45000);
+        let mut cfg_b = key_config(1);
+        cfg_b.bind_port = Some(45000);
+        let a = IsekaiPipeQuicPoolKey::for_config(&cfg_a).unwrap();
+        let b = IsekaiPipeQuicPoolKey::for_config(&cfg_b).unwrap();
+        assert!(a == b);
+    }
+
+    #[test]
+    fn different_jump_produces_different_pool_keys() {
+        let mut cfg_a = key_config(1);
+        let mut cfg_b = key_config(1);
+        let jump_auth = |seed: u8| {
+            use russh_keys::ssh_key::private::Ed25519Keypair;
+            let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+            let key = russh_keys::PrivateKey::from(keypair);
+            SshAuth::PublicKey {
+                private_key_pem: key.to_openssh(Default::default()).unwrap().as_bytes().to_vec(),
+            }
+        };
+        cfg_a.jump = Some(JumpConfig { host: "jump-a".into(), port: 22, username: "j".into(), auth: jump_auth(9) });
+        cfg_b.jump = Some(JumpConfig { host: "jump-b".into(), port: 22, username: "j".into(), auth: jump_auth(9) });
+        let a = IsekaiPipeQuicPoolKey::for_config(&cfg_a).unwrap();
+        let b = IsekaiPipeQuicPoolKey::for_config(&cfg_b).unwrap();
+        assert!(a != b);
+    }
+
+    #[test]
+    fn jump_with_password_auth_makes_the_whole_config_unpoolable() {
+        let mut cfg = key_config(1);
+        cfg.jump = Some(JumpConfig {
+            host: "jump".into(), port: 22, username: "j".into(),
+            auth: SshAuth::Password { password: "hunter2".into() },
+        });
+        assert!(
+            IsekaiPipeQuicPoolKey::for_config(&cfg).is_none(),
+            "a password-authenticated jump host has no stable identity, so pooling must be skipped entirely"
+        );
     }
 }

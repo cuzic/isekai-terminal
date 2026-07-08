@@ -1,4 +1,4 @@
-//! 実機検証用: `helper_quic_transport.rs` の QUIC クライアントソケットに
+//! 実機検証用: `isekai_pipe_quic_transport.rs` の QUIC クライアントソケットに
 //! 注入するフォルト（遅延・ロス・完全断）を、アプリ実行中に Kotlin 側から
 //! 動的に切り替えるための UniFFI エクスポート。
 //!
@@ -19,7 +19,7 @@ pub(crate) fn shared_injector() -> UdpFaultInjector {
     INJECTOR.get_or_init(UdpFaultInjector::new).clone()
 }
 
-/// `helper_quic` の QUIC クライアントソケットの片道遅延をミリ秒で設定する。
+/// `isekai_pipe_quic` の QUIC クライアントソケットの片道遅延をミリ秒で設定する。
 #[uniffi::export]
 pub fn debug_set_udp_fault_latency_ms(ms: u32) {
     shared_injector().set_latency(Duration::from_millis(ms as u64));

@@ -1,6 +1,6 @@
 //! `noq::AsyncUdpSocket` を包み、UDP データグラム単位でパケットロス・遅延・
 //! 完全断をシミュレートする。デバッグ用フォルトインジェクションのため
-//! 本番コード（`helper_quic_transport.rs`）にも配線されているが、
+//! 本番コード（`isekai_pipe_quic_transport.rs`）にも配線されているが、
 //! `debug_fault::shared_injector()` の既定値（遅延0・ロス0・cut無し）では
 //! 素通しのラッパーとして動作し、通常利用時の挙動には影響しない。
 //! 有効化は `debug_fault.rs` が export する `debug_set_udp_fault_*` 関数

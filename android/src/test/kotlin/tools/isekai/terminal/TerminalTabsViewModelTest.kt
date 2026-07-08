@@ -247,12 +247,12 @@ class TerminalTabsViewModelTest {
             wifiFd = 42, wifiLocalIp = "192.168.1.5",
         )
         val p = profile("a").copy(
-            transportPreferenceName = TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH.name,
+            transportPreferenceName = TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH.name,
             enablePhysicalMultipath = true,
         )
         vm.openTab(p, "pass")
 
-        withTimeout(3000) { while (!orchestrators[0].connectMultipathHelperQuicCalled) delay(10) }
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
 
         assertEquals(1, executor.acquirePhysicalMultipathFdsCallCount)
     }
@@ -260,12 +260,12 @@ class TerminalTabsViewModelTest {
     @Test
     fun connectTab_multipathTransport_physicalMultipathDisabled_doesNotAcquirePhysicalFds() = runBlocking {
         val p = profile("a").copy(
-            transportPreferenceName = TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH.name,
+            transportPreferenceName = TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH.name,
             enablePhysicalMultipath = false,
         )
         vm.openTab(p, "pass")
 
-        withTimeout(3000) { while (!orchestrators[0].connectMultipathHelperQuicCalled) delay(10) }
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
 
         assertEquals(0, executor.acquirePhysicalMultipathFdsCallCount)
     }

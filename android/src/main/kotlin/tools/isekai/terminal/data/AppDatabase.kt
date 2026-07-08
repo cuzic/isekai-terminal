@@ -69,7 +69,7 @@ abstract class AppDatabase : RoomDatabase() {
         private val MIGRATION_4_5 = object : Migration(4, 5) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // Phase 9: Tailscale⇔直接アドレスの受動的マルチパスフェイルオーバー用の
-                // 第2アドレス（path1）。未設定なら path0 のみで動く（IsekaiHelperQuic 相当）。
+                // 第2アドレス（path1）。未設定なら path0 のみで動く（IsekaiPipeQuic 相当）。
                 db.execSQL("ALTER TABLE connection_profiles ADD COLUMN direct_address TEXT")
             }
         }

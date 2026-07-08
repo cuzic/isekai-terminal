@@ -700,13 +700,13 @@ class ProfileEditScreenTest {
         }
     }
 
-    @Test fun selectingHelperQuicChip_andSaving_persistsTransportPreference() {
+    @Test fun selectingIsekaiPipeQuicChip_andSaving_persistsTransportPreference() {
         var saved = false
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
         }
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
-        fields[0].performTextInput("HelperQuicProfile")
+        fields[0].performTextInput("IsekaiPipeQuicProfile")
         fields[1].performTextInput("host.example.com")
         fields[3].performTextInput("root")
         composeTestRule.onNodeWithText("自作ヘルパー QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
@@ -719,14 +719,14 @@ class ProfileEditScreenTest {
             saved
         }
         runBlocking {
-            val stored = Repositories.profiles.getAll().first { it.label == "HelperQuicProfile" }
-            assertEquals("ISEKAI_HELPER_QUIC", stored.transportPreferenceName)
+            val stored = Repositories.profiles.getAll().first { it.label == "IsekaiPipeQuicProfile" }
+            assertEquals("ISEKAI_PIPE_QUIC", stored.transportPreferenceName)
         }
     }
 
     // ── 自作ヘルパーQUICの待受ポート固定 ─────────────────────────────────
 
-    @Test fun helperBindPortField_hiddenForPlainSsh_shownForHelperQuicChips() {
+    @Test fun helperBindPortField_hiddenForPlainSsh_shownForIsekaiPipeQuicChips() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
         composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意、1024〜65535）").assertDoesNotExist()
 
@@ -735,7 +735,7 @@ class ProfileEditScreenTest {
         composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意、1024〜65535）").assertExists()
     }
 
-    @Test fun selectingHelperQuic_settingBindPort_andSaving_persistsHelperBindPort() {
+    @Test fun selectingIsekaiPipeQuic_settingBindPort_andSaving_persistsHelperBindPort() {
         var saved = false
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
@@ -840,20 +840,20 @@ class ProfileEditScreenTest {
 
     @Test fun editProfile_prefillsHelperBindPort() {
         val profile = sampleProfile().copy(
-            transportPreferenceName = "ISEKAI_HELPER_QUIC",
+            transportPreferenceName = "ISEKAI_PIPE_QUIC",
             helperBindPort = 45900,
         )
         composeTestRule.setContent { ProfileEditScreen(profile = profile, onSave = {}, onCancel = {}) }
         composeTestRule.onNodeWithText("45900").assertExists()
     }
 
-    @Test fun selectingHelperQuicMultipathChip_andSaving_persistsTransportPreference() {
+    @Test fun selectingIsekaiPipeQuicMultipathChip_andSaving_persistsTransportPreference() {
         var saved = false
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
         }
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
-        fields[0].performTextInput("HelperQuicMultipathProfile")
+        fields[0].performTextInput("IsekaiPipeQuicMultipathProfile")
         fields[1].performTextInput("host.example.com")
         fields[3].performTextInput("root")
         composeTestRule.onNodeWithText("自作ヘルパー QUIC（マルチパス）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
@@ -866,8 +866,8 @@ class ProfileEditScreenTest {
             saved
         }
         runBlocking {
-            val stored = Repositories.profiles.getAll().first { it.label == "HelperQuicMultipathProfile" }
-            assertEquals("ISEKAI_HELPER_QUIC_MULTIPATH", stored.transportPreferenceName)
+            val stored = Repositories.profiles.getAll().first { it.label == "IsekaiPipeQuicMultipathProfile" }
+            assertEquals("ISEKAI_PIPE_QUIC_MULTIPATH", stored.transportPreferenceName)
         }
     }
 

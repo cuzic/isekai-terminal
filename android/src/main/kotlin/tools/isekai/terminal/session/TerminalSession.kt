@@ -225,16 +225,16 @@ class TerminalSession(
     fun connectQuic(config: QuicConfig) = guardedConnect { orchestrator.connectQuic(config) }
 
     /** Phase 7: 自作ヘルパー経由 QUIC。フォールバック無し（明示選択時）。 */
-    fun connectHelperQuic(config: HelperQuicConfig) =
-        guardedConnect { orchestrator.connectHelperQuic(config) }
+    fun connectIsekaiPipeQuic(config: IsekaiPipeQuicConfig) =
+        guardedConnect { orchestrator.connectIsekaiPipeQuic(config) }
 
     /** Phase 7: 自作ヘルパー経由 QUIC を試し、失敗したら通常の TCP SSH にフォールバックする。 */
-    fun connectHelperQuicAuto(config: HelperQuicConfig) =
-        guardedConnect { orchestrator.connectHelperQuicAuto(config) }
+    fun connectIsekaiPipeQuicAuto(config: IsekaiPipeQuicConfig) =
+        guardedConnect { orchestrator.connectIsekaiPipeQuicAuto(config) }
 
     /** Phase 9: 自作ヘルパー経由 QUIC + Tailscale⇔直接アドレスの受動的マルチパス。フォールバック無し。 */
-    fun connectMultipathHelperQuic(config: MultipathHelperQuicConfig) =
-        guardedConnect { orchestrator.connectMultipathHelperQuic(config) }
+    fun connectMultipathIsekaiPipeQuic(config: MultipathIsekaiPipeQuicConfig) =
+        guardedConnect { orchestrator.connectMultipathIsekaiPipeQuic(config) }
 
     /** Phase 10: STUN+SSHランデブーによる直接P2P QUIC。relay無し・フォールバック無し。 */
     fun connectIsekaiStunP2p(config: IsekaiStunP2pConfig) =

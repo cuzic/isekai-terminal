@@ -20,10 +20,10 @@ import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.HostKeySettings
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.data.Snippet
-import tools.isekai.terminal.data.toHelperQuicConfig
+import tools.isekai.terminal.data.toIsekaiPipeQuicConfig
 import tools.isekai.terminal.data.toIsekaiLinkRelayConfig
 import tools.isekai.terminal.data.toIsekaiStunP2pConfig
-import tools.isekai.terminal.data.toMultipathHelperQuicConfig
+import tools.isekai.terminal.data.toMultipathIsekaiPipeQuicConfig
 import tools.isekai.terminal.data.toQuicConfig
 import tools.isekai.terminal.data.toSshConfig
 import tools.isekai.terminal.session.AndroidAppExecutor
@@ -38,10 +38,10 @@ import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.CellData
-import uniffi.isekai_terminal_core.HelperQuicConfig
+import uniffi.isekai_terminal_core.IsekaiPipeQuicConfig
 import uniffi.isekai_terminal_core.IsekaiLinkRelayConfig
 import uniffi.isekai_terminal_core.IsekaiStunP2pConfig
-import uniffi.isekai_terminal_core.MultipathHelperQuicConfig
+import uniffi.isekai_terminal_core.MultipathIsekaiPipeQuicConfig
 import uniffi.isekai_terminal_core.QuicConfig
 import uniffi.isekai_terminal_core.SshAuth
 import uniffi.isekai_terminal_core.SshConfig
@@ -64,7 +64,7 @@ import uniffi.isekai_terminal_core.TransportPreference
  * 既知の制約: 物理マルチパス fd 取得(`acquirePhysicalMultipathFds`)・upstream フェイルオーバー
  * 監視(`registerUpstreamFailoverMonitor`)は [AppExecutor] 側がプロセス単位のグローバル API
  * （タブ単位に分離されていない）であるため、複数タブが同時に
- * `ISEKAI_HELPER_QUIC_MULTIPATH` + 物理マルチパス/upstream フェイルオーバーを有効にした場合は
+ * `ISEKAI_PIPE_QUIC_MULTIPATH` + 物理マルチパス/upstream フェイルオーバーを有効にした場合は
  * 後勝ちになる。単一セッション設計時点からの既存の制約であり、このタブ機能追加で新たに
  * 生まれたものではない。
  */
@@ -327,9 +327,9 @@ class TerminalTabsViewModel(
             when (profile.transportPreference) {
                 TransportPreference.PLAIN_SSH -> connect(tab, profile.toSshConfig(auth, jumpAuth))
                 TransportPreference.TSSHD_QUIC -> connectQuic(tab, profile.toQuicConfig(auth))
-                TransportPreference.ISEKAI_HELPER_QUIC -> connectHelperQuic(tab, profile.toHelperQuicConfig(auth, jumpAuth))
-                TransportPreference.AUTO -> connectHelperQuicAuto(tab, profile.toHelperQuicConfig(auth, jumpAuth))
-                TransportPreference.ISEKAI_HELPER_QUIC_MULTIPATH -> {
+                TransportPreference.ISEKAI_PIPE_QUIC -> connectIsekaiPipeQuic(tab, profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
+                TransportPreference.AUTO -> connectIsekaiPipeQuicAuto(tab, profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
+                TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH -> {
                     // Phase 9-4（実験的機能）: 有効化されていれば物理Wi-Fi/セルラーの
                     // fdも取得してから接続する。取得に失敗/未取得でも例外にはせず、
                     // path0/path1のみのマルチパスにフォールバックする（日和見的ポリシー）。
@@ -339,7 +339,7 @@ class TerminalTabsViewModel(
                         PhysicalMultipathFds()
                     }
                     tab.upstreamFailoverEnabledForCurrentSession = profile.enableUpstreamFailover
-                    connectMultipathHelperQuic(tab, profile.toMultipathHelperQuicConfig(auth, physicalFds, jumpAuth))
+                    connectMultipathIsekaiPipeQuic(tab, profile.toMultipathIsekaiPipeQuicConfig(auth, physicalFds, jumpAuth))
                 }
                 TransportPreference.ISEKAI_STUN_P2P_QUIC ->
                     connectIsekaiStunP2p(tab, profile.toIsekaiStunP2pConfig(auth, jumpAuth))
@@ -414,19 +414,19 @@ class TerminalTabsViewModel(
         tab.session.connectQuic(config)
     }
 
-    private fun connectHelperQuic(tab: TabState, config: HelperQuicConfig) {
+    private fun connectIsekaiPipeQuic(tab: TabState, config: IsekaiPipeQuicConfig) {
         executor.ensureServiceRunning()
-        tab.session.connectHelperQuic(config)
+        tab.session.connectIsekaiPipeQuic(config)
     }
 
-    private fun connectHelperQuicAuto(tab: TabState, config: HelperQuicConfig) {
+    private fun connectIsekaiPipeQuicAuto(tab: TabState, config: IsekaiPipeQuicConfig) {
         executor.ensureServiceRunning()
-        tab.session.connectHelperQuicAuto(config)
+        tab.session.connectIsekaiPipeQuicAuto(config)
     }
 
-    private fun connectMultipathHelperQuic(tab: TabState, config: MultipathHelperQuicConfig) {
+    private fun connectMultipathIsekaiPipeQuic(tab: TabState, config: MultipathIsekaiPipeQuicConfig) {
         executor.ensureServiceRunning()
-        tab.session.connectMultipathHelperQuic(config)
+        tab.session.connectMultipathIsekaiPipeQuic(config)
     }
 
     private fun connectIsekaiStunP2p(tab: TabState, config: IsekaiStunP2pConfig) {

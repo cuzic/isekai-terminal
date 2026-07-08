@@ -181,7 +181,7 @@ pub(crate) struct ReattachResult {
     pub(crate) helper_committed_offset: u64,
 }
 
-/// 1回の reattach 試行を行う関数の型。呼び出し元（`helper_quic_transport.rs`）が
+/// 1回の reattach 試行を行う関数の型。呼び出し元（`isekai_pipe_quic_transport.rs`）が
 /// noq/rustls の具体的な接続手順を実装し、`ReattachableStream` はこれを
 /// 抽象的に呼び出すだけにする（層を分離する）。
 pub(crate) type ReattachFn = Arc<
@@ -202,7 +202,7 @@ enum StreamSlot {
 struct ReattachInner {
     slot: Mutex<StreamSlot>,
     wakers: Mutex<Vec<Waker>>,
-    /// `helper_quic_transport.rs` の control stream タスク（APP_ACK 送受信）とも
+    /// `isekai_pipe_quic_transport.rs` の control stream タスク（APP_ACK 送受信）とも
     /// 共有するため、外部で作られた `Arc<Mutex<_>>` をそのまま保持する
     /// （このモジュール自身は所有しない）。
     resume: Arc<Mutex<ClientResumeState>>,

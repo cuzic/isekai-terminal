@@ -45,23 +45,23 @@ class ConnectionProfileTest {
         assertEquals(jumpAuth, config.jump?.auth)
     }
 
-    // ── toHelperQuicConfig ───────────────────────────────────────────────
+    // ── toIsekaiPipeQuicConfig ───────────────────────────────────────────────
 
-    @Test fun `toHelperQuicConfig maps ssh connection fields`() {
-        val config = profile().toHelperQuicConfig(auth)
+    @Test fun `toIsekaiPipeQuicConfig maps ssh connection fields`() {
+        val config = profile().toIsekaiPipeQuicConfig(auth)
         assertEquals("example.com", config.sshHost)
         assertEquals(2222.toUShort(), config.sshPort)
         assertEquals("deploy", config.username)
         assertEquals(auth, config.auth)
     }
 
-    @Test fun `toHelperQuicConfig maps helperBindPort to bindPort when set`() {
-        val config = profile().copy(helperBindPort = 45900).toHelperQuicConfig(auth)
+    @Test fun `toIsekaiPipeQuicConfig maps helperBindPort to bindPort when set`() {
+        val config = profile().copy(helperBindPort = 45900).toIsekaiPipeQuicConfig(auth)
         assertEquals(45900.toUShort(), config.bindPort)
     }
 
-    @Test fun `toHelperQuicConfig maps null helperBindPort to null bindPort`() {
-        val config = profile().toHelperQuicConfig(auth)
+    @Test fun `toIsekaiPipeQuicConfig maps null helperBindPort to null bindPort`() {
+        val config = profile().toIsekaiPipeQuicConfig(auth)
         assertNull(config.bindPort)
     }
 
@@ -131,22 +131,22 @@ class ConnectionProfileTest {
         assertEquals("", config.relayJwt)
     }
 
-    // ── toMultipathHelperQuicConfig ───────────────────────────────────────
+    // ── toMultipathIsekaiPipeQuicConfig ───────────────────────────────────────
 
-    @Test fun `toMultipathHelperQuicConfig maps ssh connection and direct_host fields`() {
-        val config = profile().copy(directAddress = "203.0.113.5:45823").toMultipathHelperQuicConfig(auth)
+    @Test fun `toMultipathIsekaiPipeQuicConfig maps ssh connection and direct_host fields`() {
+        val config = profile().copy(directAddress = "203.0.113.5:45823").toMultipathIsekaiPipeQuicConfig(auth)
         assertEquals("example.com", config.sshHost)
         assertEquals(2222.toUShort(), config.sshPort)
         assertEquals("203.0.113.5:45823", config.directHost)
     }
 
-    @Test fun `toMultipathHelperQuicConfig maps helperBindPort to bindPort when set`() {
-        val config = profile().copy(helperBindPort = 45900).toMultipathHelperQuicConfig(auth)
+    @Test fun `toMultipathIsekaiPipeQuicConfig maps helperBindPort to bindPort when set`() {
+        val config = profile().copy(helperBindPort = 45900).toMultipathIsekaiPipeQuicConfig(auth)
         assertEquals(45900.toUShort(), config.bindPort)
     }
 
-    @Test fun `toMultipathHelperQuicConfig maps null helperBindPort to null bindPort`() {
-        val config = profile().toMultipathHelperQuicConfig(auth)
+    @Test fun `toMultipathIsekaiPipeQuicConfig maps null helperBindPort to null bindPort`() {
+        val config = profile().toMultipathIsekaiPipeQuicConfig(auth)
         assertNull(config.bindPort)
     }
 

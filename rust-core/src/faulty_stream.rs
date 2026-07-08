@@ -4,7 +4,7 @@
 //! ソケットラッパーとしてアプリケーション層でこれらの障害を再現する。
 //!
 //! TCP 経路 (`run_russh_transport`) も QUIC 経路 (`quic_transport`,
-//! `helper_quic_transport`) も、russh には `AsyncRead + AsyncWrite` の
+//! `isekai_pipe_quic_transport`) も、russh には `AsyncRead + AsyncWrite` の
 //! ストリームとして渡っているだけなので、このラッパーを間に挟めば両方の
 //! テストで使い回せる。
 //!

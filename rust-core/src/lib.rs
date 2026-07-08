@@ -6,13 +6,14 @@ pub(crate) mod agent_forward;
 pub(crate) mod terminal;
 pub(crate) mod theme;
 pub(crate) mod transport;
+pub(crate) mod pool;
 pub(crate) mod socks;
 pub(crate) mod session_state;
 pub(crate) mod session;
 pub mod orchestrator;
 pub mod session_supervisor;
 pub(crate) mod helper_bootstrap;
-pub mod helper_quic_transport;
+pub mod isekai_pipe_quic_transport;
 pub mod multipath_transport;
 pub mod isekai_stun_p2p_transport;
 pub mod isekai_link_relay_transport;
@@ -570,7 +571,7 @@ pub struct ScreenUpdate {
 
 /// Phase 7-4: プロファイルが選択するトランスポート戦略。実際のディスパッチは
 /// Kotlin 側でこの値に応じて `SessionOrchestrator::connect` /
-/// `connect_quic`（tsshd） / `connect_helper_quic` / `connect_helper_quic_auto`
+/// `connect_quic`（tsshd） / `connect_isekai_pipe_quic` / `connect_isekai_pipe_quic_auto`
 /// のいずれかを呼び分ける（設定の意図を表す列挙型であり、単一の万能 connect API
 /// を意図したものではない。既存の transport ごとに別メソッドを持つ設計を踏襲する）。
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
@@ -581,14 +582,14 @@ pub enum TransportPreference {
     /// 前身を前提とする旧経路）。
     TsshdQuic,
     /// 自作ヘルパー経由 QUIC、フォールバック無し（Phase 7、明示選択時）。
-    IsekaiHelperQuic,
+    IsekaiPipeQuic,
     /// 自作ヘルパー経由 QUIC を試し、失敗したら通常の TCP SSH にフォールバックする
     /// （Phase 7、既定推奨）。
     Auto,
     /// 自作ヘルパー経由 QUIC + Tailscale⇔直接アドレスの受動的マルチパスフェイルオーバー
     /// （Phase 9、オプトイン。フォールバック無し）。`direct_host` 未設定なら
-    /// `IsekaiHelperQuic` と同等（path0 のみ）。
-    IsekaiHelperQuicMultipath,
+    /// `IsekaiPipeQuic` と同等（path0 のみ）。
+    IsekaiPipeQuicMultipath,
     /// STUN+SSH rendezvous による直接 P2P QUIC（Phase 10、オプトイン。relay 無し・
     /// 穴あけ不成立時のフォールバック無し）。`isekai_stun_p2p_transport.rs` 参照。
     /// relay 経由の MASQUE ベース P2P（`IsekaiLinkRelayQuic`）とは独立したトランスポート。
@@ -799,6 +800,11 @@ impl SshSession {
 
 // ── TCP transport task ───────────────────────────────────
 
+/// SSH接続プーリング(`archive/ISEKAI_SSH_DESIGN.md`参照): 同一ホスト/ユーザー/鍵/
+/// `agent_forward`/踏み台へ既に確立済みの認証済み`client::Handle`があれば、新規TCP接続・
+/// 新規認証を行わずそれを使い回し、新しいSSHチャネルを1本追加するだけで済ませる。
+/// パスワード認証は`pool::SshPoolKey::for_target`が`None`を返すため常にプール対象外
+/// (毎回新規接続する、これまでと同じ挙動)。
 pub(crate) async fn run_russh_transport(
     mut config: SshConfig,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
@@ -810,28 +816,67 @@ pub(crate) async fn run_russh_transport(
         ..client::Config::default()
     });
 
-    // `established.jump_handle`(Some の場合)は、これが保持する接続の上に
-    // トンネルされた `established.handle` が乗っているため、`run_ssh_channel_loop`
-    // が終わるまで(＝このスコープの終わりまで)drop してはならない。
-    let established = match transport::connect_via_jump_or_direct(
-        &config.jump, russh_config, &config.host, config.port, event_tx.clone(),
-    ).await {
-        Ok(e) => e,
-        Err(msg) => {
-            log::warn!("ssh: {msg}");
-            event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
-            return;
+    let pool_key = pool::SshPoolKey::for_target(
+        &config.host, config.port, &config.username, &config.auth,
+        config.agent_forward, &config.jump,
+    );
+
+    let pooled = match &pool_key {
+        None => {
+            match transport::establish_ssh_handle(
+                &config.jump, russh_config, &config.host, config.port,
+                &config.username, &mut config.auth, config.agent_forward, &event_tx,
+            ).await {
+                Ok(p) => Arc::new(p),
+                Err(msg) => {
+                    log::warn!("ssh: {msg}");
+                    event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
+                    return;
+                }
+            }
         }
+        Some(key) => match pool::try_attach(&pool::SSH_POOL, key) {
+            pool::AttachOutcome::Ready(v) => {
+                transport::zeroize_ssh_auth(&mut config.auth);
+                v
+            }
+            pool::AttachOutcome::Waiter(rx) => {
+                transport::zeroize_ssh_auth(&mut config.auth);
+                match pool::wait_for_establish(rx).await {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        log::warn!("ssh: {msg}");
+                        event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
+                        return;
+                    }
+                }
+            }
+            pool::AttachOutcome::Establisher => {
+                match transport::establish_ssh_handle(
+                    &config.jump, russh_config, &config.host, config.port,
+                    &config.username, &mut config.auth, config.agent_forward, &event_tx,
+                ).await {
+                    Ok(p) => pool::publish_success(&pool::SSH_POOL, key, p),
+                    Err(msg) => {
+                        pool::publish_failure(&pool::SSH_POOL, key, msg.clone());
+                        log::warn!("ssh: {msg}");
+                        event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
+                        return;
+                    }
+                }
+            }
+        },
     };
-    let session = established.handle;
-    let agent_key = established.agent_key;
-    let remote_forwards = established.remote_forwards;
 
     run_ssh_channel_loop(
-        &config.username, &mut config.auth, config.cols, config.rows,
-        config.agent_forward, agent_key, config.allow_non_loopback_forward_bind, remote_forwards,
-        session, cmd_rx, event_tx,
+        &pooled, config.cols, config.rows,
+        config.agent_forward, config.allow_non_loopback_forward_bind,
+        cmd_rx, event_tx,
     ).await;
+
+    if let Some(key) = pool_key {
+        pool::release(&pool::SSH_POOL, key, pool::PLAIN_SSH_IDLE_GRACE);
+    }
 }
 
 #[cfg(test)]

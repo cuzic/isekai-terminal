@@ -16,7 +16,7 @@ use crate::{
     init_logger, CellData, SessionCallback, SshAuth, SshError, RUNTIME,
 };
 use crate::session::SessionCore;
-use crate::transport::{RusshEventHandler, TransportCommand, TransportEvent, run_ssh_channel_loop};
+use crate::transport::{TransportCommand, TransportEvent, run_ssh_channel_loop};
 
 // ── 公開型 ──────────────────────────────────────────────
 
@@ -124,7 +124,7 @@ impl QuicSession {
 // `TransportPreference::TsshdQuic`、`ProfileEditScreen` で選択可能な現役の transport)は
 // サーバー側に事前インストールされた第三者実装の tsshd へ QUIC で直接つなぎに行く。
 //
-// `helper_quic_transport.rs` の `PinnedCertVerifier`(自作 isekai-helper 経路)は
+// `isekai_pipe_quic_transport.rs` の `PinnedCertVerifier`(自作 isekai-helper 経路)は
 // cert_sha256 で証明書をピン留めするが、ここでは意図的にそれをしていない:
 //   - helper 経路は、既に認証済みの SSH チャネル経由でヘルパーをブートストラップし、
 //     その ephemeral 自己署名証明書の SHA-256 を「認証済みチャネル越しに」受け取れる
@@ -319,25 +319,23 @@ async fn run_quic_transport(
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let handler = RusshEventHandler::new(event_tx.clone());
-    let agent_key = handler.agent_key.clone();
-    let remote_forwards = handler.remote_forwards.clone();
 
-    let session = match client::connect_stream(russh_config, stream, handler).await {
-        Ok(s) => s,
-        Err(e) => {
-            event_tx.send(TransportEvent::Disconnected { reason: Some(e.to_string()) }).await.ok();
+    // tsshd (Phase 5B) はSSH接続プーリング(`archive/ISEKAI_SSH_DESIGN.md`参照)の
+    // スコープ外(今後の課題)。タブごとに毎回新規のQUIC接続・ネストしたSSH認証を行う、
+    // これまでと同じ挙動のまま。
+    let pooled = match crate::transport::establish_ssh_handle_over_stream(
+        russh_config, stream, &config.username, &mut config.auth, false, &event_tx,
+    ).await {
+        Ok(p) => p,
+        Err(msg) => {
+            event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
             return;
         }
     };
 
     // Phase 5B の QUIC (tsshd) transport は agent forwarding 未対応（プロファイルの
     // `SshConfig.agent_forward` 相当のフィールドを `QuicConfig` はまだ持たない）。
-    run_ssh_channel_loop(
-        &config.username, &mut config.auth, config.cols, config.rows,
-        false, agent_key, false, remote_forwards,
-        session, cmd_rx, event_tx,
-    ).await;
+    run_ssh_channel_loop(&pooled, config.cols, config.rows, false, false, cmd_rx, event_tx).await;
 }
 
 #[cfg(test)]

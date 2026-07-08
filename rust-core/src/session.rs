@@ -88,7 +88,7 @@ pub(crate) struct SessionCore {
     /// 必要がある)。
     connected: Arc<AtomicBool>,
     /// [start] に渡された callback の複製。ブートストラップ用 SSH 接続
-    /// （`helper_quic_transport::bootstrap_helper_via_ssh` 等、isekai-helper を
+    /// （`isekai_pipe_quic_transport::bootstrap_helper_via_ssh` 等、isekai-helper を
     /// 起動するための踏み台 SSH）が発火する `TransportEvent::HostKey` を、本セッションの
     /// `on_host_key`（Kotlin 側の `KnownHostRepository` を参照する既存の TOFU/変更検知
     /// ロジック）へそのまま転送するために保持する。このセッションで発生し得る唯一の
@@ -146,7 +146,7 @@ impl SessionCore {
 
     /// [start] に渡された callback の複製を返す(`start` 呼び出し後のみ `Some`)。
     /// ブートストラップ SSH のホスト鍵検証をこのセッション本来の callback に
-    /// 委譲したい呼び出し元（`helper_quic_transport` 等）向け。
+    /// 委譲したい呼び出し元（`isekai_pipe_quic_transport` 等）向け。
     pub(crate) fn callback(&self) -> Option<Arc<dyn SessionCallback>> {
         self.callback.lock().clone()
     }
@@ -244,7 +244,7 @@ impl SessionCore {
     /// 決める。`SessionOrchestrator::notify_network_lost`(Android版が使う)と同じ方針
     /// (QUIC接続はパス変更に自前で耐えられるため無視し、ハンドシェイク中やプレーンTCPは
     /// 切断扱いにする)を、iOSが直接使う低レベルセッション(`SshSession`/
-    /// `HelperQuicSession`等)側でも成立させる。呼び出し側(Swift)はOSの生イベントを
+    /// `IsekaiPipeQuicSession`等)側でも成立させる。呼び出し側(Swift)はOSの生イベントを
     /// そのまま転送するだけで、判断はこの関数(Rust SSOT)が行う。
     pub(crate) fn notify_network_lost(&self, is_quic: bool) {
         let has_session = self.handle_tx.lock().is_some();

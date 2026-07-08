@@ -13,9 +13,9 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     var connectCalled = false
     var connectQuicCalled = false
-    var connectHelperQuicCalled = false
-    var connectHelperQuicAutoCalled = false
-    var connectMultipathHelperQuicCalled = false
+    var connectIsekaiPipeQuicCalled = false
+    var connectIsekaiPipeQuicAutoCalled = false
+    var connectMultipathIsekaiPipeQuicCalled = false
     var connectIsekaiStunP2pCalled = false
     var connectIsekaiLinkRelayCalled = false
     var disconnectCalled = false
@@ -50,24 +50,24 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     }
 
     @Throws(SshException::class)
-    override fun connectHelperQuic(config: HelperQuicConfig) {
-        connectHelperQuicCalled = true
+    override fun connectIsekaiPipeQuic(config: IsekaiPipeQuicConfig) {
+        connectIsekaiPipeQuicCalled = true
         quic = true
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
 
     @Throws(SshException::class)
-    override fun connectHelperQuicAuto(config: HelperQuicConfig) {
-        connectHelperQuicAutoCalled = true
+    override fun connectIsekaiPipeQuicAuto(config: IsekaiPipeQuicConfig) {
+        connectIsekaiPipeQuicAutoCalled = true
         quic = true
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)
     }
 
     @Throws(SshException::class)
-    override fun connectMultipathHelperQuic(config: MultipathHelperQuicConfig) {
-        connectMultipathHelperQuicCalled = true
+    override fun connectMultipathIsekaiPipeQuic(config: MultipathIsekaiPipeQuicConfig) {
+        connectMultipathIsekaiPipeQuicCalled = true
         quic = true
         phase = Phase.CONNECTING
         callback!!.onConnectionStateChanged(ConnectionPublicState.Connecting)

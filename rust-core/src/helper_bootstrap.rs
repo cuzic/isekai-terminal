@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::transport::RusshEventHandler;
 
-// `HELPER_INSTALL_DIR`/`HELPER_BIN_NAME`/`HANDSHAKE_POLL_ATTEMPTS`/
+// `ISEKAI_PIPE_INSTALL_DIR`/`ISEKAI_PIPE_BIN_NAME`/`HANDSHAKE_POLL_ATTEMPTS`/
 // `HANDSHAKE_POLL_INTERVAL_MS` は `isekai_protocol::bootstrap` で共有している
 // （`isekai-bootstrap::openssh` 側の同名定数と実体を一致させるため — 詳細は
 // そちらのモジュールdoc参照）。`shell_single_quote`/`validate_relay_sni`/
@@ -29,7 +29,7 @@ use crate::transport::RusshEventHandler;
 // `isekai-bootstrap::openssh`と共有する）。
 use isekai_protocol::bootstrap::{
     shell_single_quote, validate_relay_jwt, validate_relay_sni, HANDSHAKE_POLL_ATTEMPTS,
-    HANDSHAKE_POLL_INTERVAL_MS, HELPER_BIN_NAME, HELPER_INSTALL_DIR,
+    HANDSHAKE_POLL_INTERVAL_MS, ISEKAI_PIPE_BIN_NAME, ISEKAI_PIPE_INSTALL_DIR,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -106,7 +106,7 @@ fn classify_launch_failure(log_text: &str, bind_port: Option<u16>) -> BootstrapE
 /// `isekai_protocol::handshake::HandshakeJson` のdocコメント、または
 /// Phase 10 の `isekai_stun_p2p_transport.rs`/`isekai_link_relay_transport.rs`
 /// を参照。
-pub type HelperHandshake = isekai_protocol::handshake::HandshakeJson;
+pub type IsekaiPipeHandshake = isekai_protocol::handshake::HandshakeJson;
 
 /// SSH起動コマンドラインに埋め込む、P2P方式ごとの追加引数。3方式は互いに排他
 /// （isekai-helper側の`--relay`と`--stun-server`/`--punch-peer`は併用不可、
@@ -114,7 +114,7 @@ pub type HelperHandshake = isekai_protocol::handshake::HandshakeJson;
 /// 組み合わせ（例: stun_serverとrelay_addrを両方Someにする)を型として表現できない
 /// ようにしてある。
 #[derive(Debug, Clone, Default)]
-pub enum HelperP2pMode {
+pub enum IsekaiPipeP2pMode {
     #[default]
     None,
     /// Phase 10: STUN+SSHランデブー方式(`TransportPreference::IsekaiStunP2pQuic`)。
@@ -125,12 +125,12 @@ pub enum HelperP2pMode {
 
 /// 既知の Linux アーキテクチャ用にビルドした isekai-helper の静的バイナリ。
 /// 呼び出し側（Kotlin/Android ビルド成果物、または include_bytes!）が供給する。
-pub struct HelperBinaries<'a> {
+pub struct IsekaiPipeBinaries<'a> {
     pub x86_64: &'a [u8],
     pub aarch64: &'a [u8],
 }
 
-impl<'a> HelperBinaries<'a> {
+impl<'a> IsekaiPipeBinaries<'a> {
     fn select_for(&self, uname_m: &str) -> Result<&'a [u8], BootstrapError> {
         match uname_m.trim() {
             "x86_64" => Ok(self.x86_64),
@@ -202,7 +202,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// バージョン文字列の一致だけでは、`~/.local/bin/isekai-helper`
 /// への書き込み権限を持つ別ローカルユーザー(または侵害されたアカウント)が、正しい
 /// バージョン文字列を出力するトロイ化バイナリに差し替えても検出できない。埋め込み
-/// バイナリ(`helper_quic_transport.rs`の`include_bytes!`)から計算した
+/// バイナリ(`isekai_pipe_quic_transport.rs`の`include_bytes!`)から計算した
 /// `expected_sha256_hex`とリモート上のバイナリの実際のSHA-256を比較することで、
 /// バージョン一致だけでなく「配布したバイナリそのもの」であることを検証する。
 ///
@@ -216,8 +216,8 @@ async fn check_existing_version(
     expected_sha256_hex: &str,
 ) -> bool {
     let cmd = format!(
-        "test -x {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} && {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} --version && \
-         (command -v sha256sum >/dev/null 2>&1 && sha256sum {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} || echo NO_SHA256SUM)"
+        "test -x {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} && {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} --version && \
+         (command -v sha256sum >/dev/null 2>&1 && sha256sum {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} || echo NO_SHA256SUM)"
     );
     match run_exec(session, &cmd, None).await {
         Ok((stdout, Some(0))) => {
@@ -251,10 +251,10 @@ async fn upload_binary(
 ) -> Result<(), BootstrapError> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
     let cmd = format!(
-        "umask 077 && mkdir -p {HELPER_INSTALL_DIR} && \
-         base64 -d > {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}.tmp && \
-         chmod 0700 {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}.tmp && \
-         mv {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}.tmp {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}"
+        "umask 077 && mkdir -p {ISEKAI_PIPE_INSTALL_DIR} && \
+         base64 -d > {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}.tmp && \
+         chmod 0700 {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}.tmp && \
+         mv {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}.tmp {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}"
     );
     let (stdout, exit_status) = run_exec(session, &cmd, Some(encoded.as_bytes())).await?;
     if exit_status != Some(0) {
@@ -274,8 +274,8 @@ async fn launch_and_capture_handshake(
     session: &mut client::Handle<RusshEventHandler>,
     ssh_relay_target: &str,
     bind_port: Option<u16>,
-    p2p_mode: &HelperP2pMode,
-) -> Result<HelperHandshake, BootstrapError> {
+    p2p_mode: &IsekaiPipeP2pMode,
+) -> Result<IsekaiPipeHandshake, BootstrapError> {
     // ファイル権限は 0700(dir)/0600(handshake ファイル) を umask で保証する
     // （HELPER_PROTOCOL.md「Bootstrap file permissions」契約）。
     //
@@ -332,15 +332,15 @@ async fn launch_and_capture_handshake(
     // #58)。このexecチャネルのstdinへ書き込み、リモート側で`mktemp -d`した一時ディレクトリ
     // 内のファイルに`cat`で保存してから、そのファイルパスを`--relay-jwt-file`として渡す。
     let (p2p_arg, jwt_stdin): (String, Option<Vec<u8>>) = match p2p_mode {
-        HelperP2pMode::None => (String::new(), None),
-        HelperP2pMode::Stun { stun_server, punch_peer } => {
+        IsekaiPipeP2pMode::None => (String::new(), None),
+        IsekaiPipeP2pMode::Stun { stun_server, punch_peer } => {
             let punch = match punch_peer {
                 Some(addr) => format!("--punch-peer {addr} "),
                 None => String::new(),
             };
             (format!("--stun-server {stun_server} {punch}"), None)
         }
-        HelperP2pMode::Relay { relay_addr, relay_sni, relay_jwt } => {
+        IsekaiPipeP2pMode::Relay { relay_addr, relay_sni, relay_jwt } => {
             // セキュリティレビュー #57: シェルクォートに加え、厳格な許容文字集合での
             // 検証も行う(多層防御。relay/JWT発行元が侵害・誤設定された場合でも
             // シェルメタ文字を埋め込めないようにする)。
@@ -368,7 +368,7 @@ async fn launch_and_capture_handshake(
     let launch_cmd = format!(
         "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
          {write_jwt_step}\
-         ( setsid {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} {bind_arg}{p2p_arg}--target {quoted_target} \
+         ( setsid {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} serve {bind_arg}{p2p_arg}--target {quoted_target} \
          </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
          for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
            [ -s $tmpdir/handshake ] && break; \
@@ -402,12 +402,12 @@ async fn launch_and_capture_handshake(
 /// 既存インストールが使えればそれを再利用し、無ければ配布・起動する。
 pub async fn ensure_helper_running(
     session: &mut client::Handle<RusshEventHandler>,
-    binaries: &HelperBinaries<'_>,
+    binaries: &IsekaiPipeBinaries<'_>,
     expected_version: &str,
     ssh_relay_target: &str,
     bind_port: Option<u16>,
-    p2p_mode: &HelperP2pMode,
-) -> Result<HelperHandshake, BootstrapError> {
+    p2p_mode: &IsekaiPipeP2pMode,
+) -> Result<IsekaiPipeHandshake, BootstrapError> {
     // チェックサム検証(セキュリティレビュー #67)には、既存インストール確認より前に
     // アーキテクチャを知る必要がある(比較対象のバイナリを選ぶため)。以前は
     // 「既存インストールがバージョン不一致だった場合のみ」uname -mを実行していたが、
@@ -442,14 +442,14 @@ pub async fn ensure_helper_running(
 mod tests {
     //! ローカルの実 sshd（127.0.0.1:22）に対する E2E テスト。
     //! 実 sshd（127.0.0.1:22）+ 事前に authorized_keys へ登録したテスト用鍵が必要な
-    //! 実機 E2E テスト。`HELPER_BOOTSTRAP_TEST_KEY`（鍵ファイルパス）が設定されていない
+    //! 実機 E2E テスト。`ISEKAI_PIPE_BOOTSTRAP_TEST_KEY`（鍵ファイルパス）が設定されていない
     //! 環境では自動的にスキップする（CI/他の開発者の `cargo test` を壊さないようにするため。
     //! opt-in 方式であり、明示的な SKIP フラグの有無に依存しない）。
     use super::*;
     use std::sync::Arc;
 
     fn test_key_path() -> Option<String> {
-        std::env::var("HELPER_BOOTSTRAP_TEST_KEY").ok()
+        std::env::var("ISEKAI_PIPE_BOOTSTRAP_TEST_KEY").ok()
     }
 
     async fn connect_test_session(key_path: &str) -> client::Handle<RusshEventHandler> {
@@ -482,19 +482,19 @@ mod tests {
 
     fn read_musl_binary(target: &str) -> Vec<u8> {
         let path = format!(
-            "{}/target/{}/release/isekai-helper",
+            "{}/target/{}/release/isekai-pipe",
             env!("CARGO_MANIFEST_DIR"),
             target
         );
         std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("failed to read {path} (build it first via rust-core/scripts/build-isekai-helper-musl.sh): {e}"))
+            .unwrap_or_else(|e| panic!("failed to read {path} (build it first via rust-core/scripts/build-isekai-pipe-musl.sh): {e}"))
     }
 
     #[tokio::test]
     async fn bootstraps_and_launches_helper_over_real_ssh() {
         let Some(key_path) = test_key_path() else {
             eprintln!(
-                "skipping: HELPER_BOOTSTRAP_TEST_KEY not set (requires a real sshd + registered test key)"
+                "skipping: ISEKAI_PIPE_BOOTSTRAP_TEST_KEY not set (requires a real sshd + registered test key)"
             );
             return;
         };
@@ -503,30 +503,30 @@ mod tests {
         // クリーンな状態から検証するため、既存インストールを削除しておく。
         let _ = run_exec(
             &mut session,
-            &format!("rm -f {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}"),
+            &format!("rm -f {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}"),
             None,
         )
         .await;
 
         let x86_64_bin = read_musl_binary("x86_64-unknown-linux-musl");
         let aarch64_bin = read_musl_binary("aarch64-unknown-linux-musl");
-        let binaries = HelperBinaries {
+        let binaries = IsekaiPipeBinaries {
             x86_64: &x86_64_bin,
             aarch64: &aarch64_bin,
         };
 
         let handshake =
-            ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None, &HelperP2pMode::None)
+            ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None, &IsekaiPipeP2pMode::None)
                 .await
                 .expect("bootstrap failed");
         assert_eq!(handshake.v, 1);
-        assert!(handshake.listen_port > 0);
-        assert_eq!(handshake.cert_sha256.len(), 64);
+        assert!(handshake.direct_by_bootstrap_host_port().unwrap() > 0);
+        assert_eq!(handshake.cert_sha256().len(), 64);
 
         // 2回目呼び出し: バイナリは既にインストール済みのはずなので、
         // アップロードをスキップしても正常にハンドシェイクを取得できることを確認する。
         let handshake2 =
-            ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None, &HelperP2pMode::None)
+            ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None, &IsekaiPipeP2pMode::None)
                 .await
                 .expect("second bootstrap call failed");
         assert_eq!(handshake2.v, 1);
@@ -539,24 +539,24 @@ mod tests {
     #[tokio::test]
     async fn bootstraps_with_fixed_bind_port() {
         let Some(key_path) = test_key_path() else {
-            eprintln!("skipping: HELPER_BOOTSTRAP_TEST_KEY not set");
+            eprintln!("skipping: ISEKAI_PIPE_BOOTSTRAP_TEST_KEY not set");
             return;
         };
         let mut session = connect_test_session(&key_path).await;
-        let _ = run_exec(&mut session, &format!("rm -f {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}"), None).await;
+        let _ = run_exec(&mut session, &format!("rm -f {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}"), None).await;
 
         let x86_64_bin = read_musl_binary("x86_64-unknown-linux-musl");
         let aarch64_bin = read_musl_binary("aarch64-unknown-linux-musl");
-        let binaries = HelperBinaries { x86_64: &x86_64_bin, aarch64: &aarch64_bin };
+        let binaries = IsekaiPipeBinaries { x86_64: &x86_64_bin, aarch64: &aarch64_bin };
 
         // OSに割り当てられたエフェメラルレンジと衝突しにくい高番ポートを使う。
         let fixed_port: u16 = 58123;
         let handshake = ensure_helper_running(
-            &mut session, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &HelperP2pMode::None,
+            &mut session, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &IsekaiPipeP2pMode::None,
         )
         .await
         .expect("bootstrap with fixed bind port failed");
-        assert_eq!(handshake.listen_port, fixed_port);
+        assert_eq!(handshake.direct_by_bootstrap_host_port(), Some(fixed_port));
     }
 
     /// 同一サーバー・同一固定ポートで2セッション目を開いた場合、黙ってエフェメラル
@@ -565,20 +565,20 @@ mod tests {
     #[tokio::test]
     async fn second_session_with_same_fixed_port_fails_as_port_in_use() {
         let Some(key_path) = test_key_path() else {
-            eprintln!("skipping: HELPER_BOOTSTRAP_TEST_KEY not set");
+            eprintln!("skipping: ISEKAI_PIPE_BOOTSTRAP_TEST_KEY not set");
             return;
         };
         let mut session1 = connect_test_session(&key_path).await;
         let mut session2 = connect_test_session(&key_path).await;
-        let _ = run_exec(&mut session1, &format!("rm -f {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}"), None).await;
+        let _ = run_exec(&mut session1, &format!("rm -f {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}"), None).await;
 
         let x86_64_bin = read_musl_binary("x86_64-unknown-linux-musl");
         let aarch64_bin = read_musl_binary("aarch64-unknown-linux-musl");
-        let binaries = HelperBinaries { x86_64: &x86_64_bin, aarch64: &aarch64_bin };
+        let binaries = IsekaiPipeBinaries { x86_64: &x86_64_bin, aarch64: &aarch64_bin };
 
         let fixed_port: u16 = 58124;
         let _handshake1 = ensure_helper_running(
-            &mut session1, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &HelperP2pMode::None,
+            &mut session1, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &IsekaiPipeP2pMode::None,
         )
         .await
         .expect("first session should bind the fixed port successfully");
@@ -588,7 +588,7 @@ mod tests {
         // のみ行い実行中プロセスの有無は見ないため、新しいisekai-helperプロセスが
         // 起動を試み、bindの時点で衝突するはず。
         let second_result = ensure_helper_running(
-            &mut session2, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &HelperP2pMode::None,
+            &mut session2, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &IsekaiPipeP2pMode::None,
         )
         .await;
 

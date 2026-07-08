@@ -10,11 +10,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 import tools.isekai.terminal.session.PhysicalMultipathFds
 import uniffi.isekai_terminal_core.ForwardType
-import uniffi.isekai_terminal_core.HelperQuicConfig
+import uniffi.isekai_terminal_core.IsekaiPipeQuicConfig
 import uniffi.isekai_terminal_core.IsekaiLinkRelayConfig
 import uniffi.isekai_terminal_core.IsekaiStunP2pConfig
 import uniffi.isekai_terminal_core.JumpConfig
-import uniffi.isekai_terminal_core.MultipathHelperQuicConfig
+import uniffi.isekai_terminal_core.MultipathIsekaiPipeQuicConfig
 import uniffi.isekai_terminal_core.PortForward
 import uniffi.isekai_terminal_core.QuicConfig
 import uniffi.isekai_terminal_core.SshAuth
@@ -67,7 +67,7 @@ data class ConnectionProfile(
     @ColumnInfo(name = "enable_agent_forward") val enableAgentForward: Boolean = false,
     // Phase 7: トランスポート戦略。DB には TransportPreference の name() を文字列で保存する。
     @ColumnInfo(name = "transport_preference") val transportPreferenceName: String = TransportPreference.PLAIN_SSH.name,
-    // Phase 9: マルチパス(path1)用の直接到達アドレス。IsekaiHelperQuicMultipath 選択時のみ使う。
+    // Phase 9: マルチパス(path1)用の直接到達アドレス。IsekaiPipeQuicMultipath 選択時のみ使う。
     @ColumnInfo(name = "direct_address") val directAddress: String? = null,
     // Phase 9-4（実験的機能、既定OFF）: Wi-Fi/セルラー物理無線への同時マルチパスも試す。
     // Tailscale稼働中はbindSocket自体が失敗するため効果が無い（日和見的にpath0/path1へ
@@ -121,7 +121,7 @@ data class ConnectionProfile(
     // 自作ヘルパーQUICの待受ポートを固定する(既定null=これまで通りOSがエフェメラル
     // ポートを選ぶ)。direct_addressへの直接到達(Phase 7-5/9-2実機検証で判明)は
     // ファイアウォールがそのポートを許可している必要があるため、単一の固定ポートに
-    // しておけば運用側はそのポートだけ開ければよくなる。Rust側(HelperQuicConfig)への
+    // しておけば運用側はそのポートだけ開ければよくなる。Rust側(IsekaiPipeQuicConfig)への
     // 配線は別途対応(現時点ではプロファイルへの保存のみ)。
     @ColumnInfo(name = "helper_bind_port") val helperBindPort: Int? = null,
 ) : Parcelable {
@@ -215,8 +215,8 @@ interface ConnectionProfileDao {
  * [jumpAuth] は [ConnectionProfile.usesJumpHost] が true の場合にのみ使う（呼び出し側が
  * [ConnectionProfile.jumpAuthType]/[ConnectionProfile.jumpKeyId] を解決して渡す。
  * password の場合は接続時プロンプトで得た値、key の場合はキーストアから読んだ PEM）。
- * ブートストラップSSH接続を伴う全トランスポート([toSshConfig]/[toHelperQuicConfig]/
- * [toMultipathHelperQuicConfig])で共通のため、ここに切り出してある。
+ * ブートストラップSSH接続を伴う全トランスポート([toSshConfig]/[toIsekaiPipeQuicConfig]/
+ * [toMultipathIsekaiPipeQuicConfig])で共通のため、ここに切り出してある。
  */
 private fun ConnectionProfile.toJumpConfigOrNull(jumpAuth: SshAuth?): JumpConfig? =
     if (usesJumpHost && jumpAuth != null) {
@@ -252,11 +252,11 @@ fun ConnectionProfile.toSshConfig(
 // 設計上許容(issue #61 で到達性・内側SSHホスト鍵検証の強制を調査確認済み): skipCertVerify=true は、
 // サーバー側に事前インストールされた第三者実装の tsshd(Phase 5B、
 // TransportPreference.TSSHD_QUIC、ProfileEditScreen で選択可能・現役の経路)に対する
-// QUIC/TLS 層の証明書検証を無条件でスキップする。[toHelperQuicConfig](自作 isekai-helper 経路)が
+// QUIC/TLS 層の証明書検証を無条件でスキップする。[toIsekaiPipeQuicConfig](自作 isekai-helper 経路)が
 // cert_sha256 でピン留めするのとは非対称だが、これは意図的な非対称である:
 //   - helper 経路は、既に認証済みの SSH チャネル経由でヘルパーをブートストラップし、その
 //     ephemeral 自己署名証明書の SHA-256 を「認証済みチャネル越しに」受け取れるため、
-//     ピン留め可能な信頼の起点が存在する(helper_quic_transport.rs 参照)。
+//     ピン留め可能な信頼の起点が存在する(isekai_pipe_quic_transport.rs 参照)。
 //   - tsshd 経路は、こちらが配布・管理していない既存の tsshd デーモンへ最初から QUIC で
 //     直接つなぎに行くため、ピン留めすべき証明書フィンガープリントを事前に得る手段が無い。
 // そのため QUIC/TLS 層自体は非認証のままにし、信頼は QUIC トンネル確立後に流れる
@@ -278,13 +278,13 @@ fun ConnectionProfile.toQuicConfig(auth: SshAuth, cols: UInt = 80u, rows: UInt =
         skipCertVerify = true,
     )
 
-fun ConnectionProfile.toHelperQuicConfig(
+fun ConnectionProfile.toIsekaiPipeQuicConfig(
     auth: SshAuth,
     jumpAuth: SshAuth? = null,
     cols: UInt = 80u,
     rows: UInt = 24u,
-): HelperQuicConfig =
-    HelperQuicConfig(
+): IsekaiPipeQuicConfig =
+    IsekaiPipeQuicConfig(
         sshHost = host,
         sshPort = port.toUShort(),
         username = username,
@@ -335,14 +335,14 @@ fun ConnectionProfile.toIsekaiLinkRelayConfig(
         relayJwt = relayJwt.orEmpty(),
     )
 
-fun ConnectionProfile.toMultipathHelperQuicConfig(
+fun ConnectionProfile.toMultipathIsekaiPipeQuicConfig(
     auth: SshAuth,
     physicalFds: PhysicalMultipathFds = PhysicalMultipathFds(),
     jumpAuth: SshAuth? = null,
     cols: UInt = 80u,
     rows: UInt = 24u,
-): MultipathHelperQuicConfig =
-    MultipathHelperQuicConfig(
+): MultipathIsekaiPipeQuicConfig =
+    MultipathIsekaiPipeQuicConfig(
         sshHost = host,
         sshPort = port.toUShort(),
         directHost = directAddress?.takeIf { it.isNotBlank() },
