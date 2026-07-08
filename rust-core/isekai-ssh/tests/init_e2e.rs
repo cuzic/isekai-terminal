@@ -1,4 +1,4 @@
-//! End-to-end tests for `isekai-ssh init` (`ISEKAI_SSH_DESIGN.md` フェーズ分割案
+//! End-to-end tests for `isekai-ssh init` (`archive/ISEKAI_SSH_DESIGN.md` フェーズ分割案
 //! S-3's acceptance criteria: "isekai-helper未配置ホストに対しinit→connectの
 //! 一連が通ること").
 //!
@@ -69,31 +69,35 @@ fn isekai_ssh_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_isekai-ssh"))
 }
 
-/// See `connect_e2e.rs::isekai_helper_bin_path` for why this walks up from
+/// Locates a sibling workspace package's binary by walking up from
 /// `current_exe()` rather than using a `CARGO_BIN_EXE_*` variable (that
 /// mechanism only covers binaries of the package currently being compiled,
-/// and `isekai-helper` is a separate workspace package).
-fn isekai_helper_bin_path() -> PathBuf {
+/// and `isekai-helper`/`isekai-pipe` are separate workspace packages).
+fn sibling_bin_path(package: &str, bin_name: &str) -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // this test binary itself
     if path.ends_with("deps") {
         path.pop();
     }
     let is_release = path.file_name().map(|n| n == "release").unwrap_or(false);
-    path.push("isekai-helper");
+    path.push(bin_name);
 
     if !path.exists() {
-        eprintln!("isekai-helper binary not found at {path:?}; building it now");
+        eprintln!("{bin_name} binary not found at {path:?}; building it now");
         let mut cmd = std::process::Command::new(env!("CARGO"));
-        cmd.args(["build", "-p", "isekai-helper"]);
+        cmd.args(["build", "-p", package]);
         if is_release {
             cmd.arg("--release");
         }
-        let status = cmd.status().expect("failed to invoke `cargo build -p isekai-helper`");
-        assert!(status.success(), "`cargo build -p isekai-helper` failed");
-        assert!(path.exists(), "isekai-helper binary still missing at {path:?} after building it");
+        let status = cmd.status().unwrap_or_else(|_| panic!("failed to invoke `cargo build -p {package}`"));
+        assert!(status.success(), "`cargo build -p {package}` failed");
+        assert!(path.exists(), "{bin_name} binary still missing at {path:?} after building it");
     }
     path
+}
+
+fn isekai_pipe_bin_path() -> PathBuf {
+    sibling_bin_path("isekai-pipe", "isekai-pipe")
 }
 
 async fn read_all<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
@@ -249,13 +253,14 @@ impl Drop for HelperProcess {
     }
 }
 
-/// Spawns the real compiled `isekai-helper` binary directly (no `--relay`),
-/// standing in for "the isekai-helper instance that a real deployment would
-/// have left running" — see this file's module docs for why `init`'s own
-/// deploy step can't drive this through a live `--relay` handshake.
+/// Spawns the real compiled `isekai-pipe serve` (no `--relay`), standing in
+/// for "the isekai-pipe serve instance that a real deployment would have
+/// left running" — see this file's module docs for why `init`'s own deploy
+/// step can't drive this through a live `--relay` handshake.
 fn spawn_helper(target_addr: SocketAddr) -> HelperProcess {
-    let mut cmd = std::process::Command::new(isekai_helper_bin_path());
-    cmd.arg("--target")
+    let mut cmd = std::process::Command::new(isekai_pipe_bin_path());
+    cmd.arg("serve")
+        .arg("--target")
         .arg(target_addr.to_string())
         .arg("--bind")
         .arg("127.0.0.1:0")
@@ -264,7 +269,7 @@ fn spawn_helper(target_addr: SocketAddr) -> HelperProcess {
         .stdout(StdStdio::piped())
         .stderr(StdStdio::piped());
 
-    let mut child = cmd.spawn().expect("failed to spawn isekai-helper");
+    let mut child = cmd.spawn().expect("failed to spawn isekai-pipe serve");
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
@@ -311,7 +316,7 @@ fn real_ssh_path() -> PathBuf {
 /// installs a tiny `ssh` shim ahead of the real one on `$PATH` that always
 /// adds `-F <this test's throwaway config>` — functionally identical to
 /// what a real user's own `~/.ssh/config` would provide for a
-/// freshly-provisioned host (`ISEKAI_SSH_DESIGN.md`'s own recommended
+/// freshly-provisioned host (`archive/ISEKAI_SSH_DESIGN.md`'s own recommended
 /// `~/.ssh/config` stanza), just injected without touching the test
 /// runner's actual home directory.
 ///
@@ -375,7 +380,15 @@ fn trust_store_path_under(home: &std::path::Path) -> PathBuf {
 /// listen address — see this file's module docs.
 fn stand_in_helper_script(real_helper_addr: SocketAddr, real_handshake: &HandshakeJson) -> Vec<u8> {
     let mut handshake = real_handshake.clone();
-    handshake.relay_public_addr = Some(real_helper_addr.to_string());
+    handshake
+        .candidates
+        .retain(|candidate| candidate.kind != isekai_protocol::handshake::CANDIDATE_RELAYED);
+    handshake.candidates.push(isekai_protocol::handshake::HandshakeCandidate {
+        kind: isekai_protocol::handshake::CANDIDATE_RELAYED.to_string(),
+        endpoint: Some(real_helper_addr.to_string()),
+        port: None,
+        source: Some("isekai-link-relay".to_string()),
+    });
     let json_line = serde_json::to_string(&handshake).unwrap();
     format!("#!/bin/sh\necho '{json_line}'\n").into_bytes()
 }
@@ -439,7 +452,7 @@ async fn init_then_connect_succeeds_for_a_freshly_deployed_host() {
     // The "already deployed" real isekai-helper instance init's stand-in
     // script will hand back the credentials for (see module docs).
     let real_helper = spawn_helper(mock_sshd_addr);
-    let real_helper_addr: SocketAddr = format!("127.0.0.1:{}", real_helper.handshake.listen_port).parse().unwrap();
+    let real_helper_addr: SocketAddr = format!("127.0.0.1:{}", real_helper.handshake.direct_by_bootstrap_host_port().unwrap()).parse().unwrap();
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
@@ -456,7 +469,7 @@ async fn init_then_connect_succeeds_for_a_freshly_deployed_host() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Helper identity:"), "expected identity line in init output: {stdout}");
-    assert!(stdout.contains(&real_helper.handshake.cert_sha256), "expected cert_sha256 to appear in init output: {stdout}");
+    assert!(stdout.contains(&real_helper.handshake.cert_sha256()), "expected cert_sha256 to appear in init output: {stdout}");
     assert!(stdout.contains("Registered"), "expected a confirmation of trust-store registration: {stdout}");
 
     let trust_store_path = trust_store_path_under(&home);
@@ -464,14 +477,20 @@ async fn init_then_connect_succeeds_for_a_freshly_deployed_host() {
     let store = isekai_trust::load_trust_store(&trust_store_path).unwrap();
     let entry = store.get("dummy-host:22").expect("expected a trust entry for dummy-host:22");
     assert_eq!(entry.cached_relay_addr, real_helper_addr.to_string());
-    assert_eq!(entry.cached_cert_sha256, real_helper.handshake.cert_sha256);
+    assert_eq!(entry.cached_cert_sha256, real_helper.handshake.cert_sha256());
     assert_eq!(entry.cached_session_secret, real_helper.handshake.session_secret);
     assert_eq!(entry.update_policy, isekai_trust::UpdatePolicy::ExactDigestOnly);
 
-    // Second half: `connect` (default build, no --dev-insecure-*) drives a
-    // real SSH login through the real isekai-helper process using exactly
-    // the trust store entry `init` just wrote.
-    let proxy_command = format!("{} connect dummy-host", isekai_ssh_bin_path().display());
+    // Second half: `isekai-pipe connect` drives a real SSH login through the
+    // real isekai-helper process using exactly the trust store entry `init`
+    // just wrote (the standalone `isekai-ssh connect` subcommand this test
+    // used to exercise directly has been removed now that the wrapper +
+    // `isekai-pipe connect` cover the same ground, `archive/ISEKAI_PIPE_MIGRATION.md`
+    // P5).
+    let proxy_command = format!(
+        "{} connect --profile dummy-host --service ssh --stdio",
+        isekai_pipe_bin_path().display()
+    );
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         TokioCommand::new("ssh")
@@ -522,7 +541,7 @@ async fn init_writes_nothing_when_confirmation_is_declined() {
 
     let mock_sshd_addr = spawn_fake_ssh_server(remote_home, client_pubkey).await;
     let real_helper = spawn_helper(mock_sshd_addr);
-    let real_helper_addr: SocketAddr = format!("127.0.0.1:{}", real_helper.handshake.listen_port).parse().unwrap();
+    let real_helper_addr: SocketAddr = format!("127.0.0.1:{}", real_helper.handshake.direct_by_bootstrap_host_port().unwrap()).parse().unwrap();
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
