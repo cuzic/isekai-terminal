@@ -1,5 +1,5 @@
 //! `TokenProvider` backed by an environment variable
-//! (`ISEKAI_SSH_DESIGN.md` フェーズ表 S-0c-1: "`ISEKAI_RELAY_JWT`環境変数からの
+//! (`archive/ISEKAI_SSH_DESIGN.md` フェーズ表 S-0c-1: "`ISEKAI_RELAY_JWT`環境変数からの
 //! トークン取得が動くこと").
 
 use crate::{AuthError, TokenProvider};

@@ -1,6 +1,6 @@
 //! Trust store for `isekai-ssh`: tracks which `isekai-helper` instances have
 //! been explicitly trusted for which SSH targets
-//! (`ISEKAI_SSH_DESIGN.md` "trust store のファイル形式").
+//! (`archive/ISEKAI_SSH_DESIGN.md` "trust store のファイル形式").
 //!
 //! Unlike `isekai-protocol`, this crate performs real filesystem I/O
 //! (reading/writing `~/.config/isekai-ssh/known_helpers.toml`), but it is

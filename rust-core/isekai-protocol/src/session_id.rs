@@ -3,7 +3,7 @@ use crate::error::ProtocolError;
 pub const SESSION_ID_LEN: usize = 16;
 
 /// Opaque identifier the helper assigns to a resumable session
-/// (`HELPER_PROTOCOL.md` §7.2). It is not a secret by itself — `resume::ResumeFrame`
+/// (`archive/HELPER_PROTOCOL.md` §7.2). It is not a secret by itself — `resume::ResumeFrame`
 /// (Phase S-4a) also carries a `resume_proof` derived from `session_secret`
 /// so that guessing/observing a `session_id` alone cannot hijack a session.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

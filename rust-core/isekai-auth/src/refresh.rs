@@ -1,7 +1,7 @@
 //! OAuth2 `refresh_token` grant (RFC 6749 §6), used by
 //! `FileTokenProvider::get_relay_jwt` (`file_provider.rs`) to transparently
 //! refresh a near-expiry/expired access token
-//! (`ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー": "`connect` 実行中のトークン
+//! (`archive/ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー": "`connect` 実行中のトークン
 //! 失効は裏で自動リフレッシュを試みる"). Wiring this into `isekai-ssh connect`
 //! itself is out of scope for phase S-5 (`connect.rs` is unchanged) — this
 //! module only provides the primitive `get_relay_jwt` calls internally.

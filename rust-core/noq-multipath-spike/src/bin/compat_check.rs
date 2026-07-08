@@ -6,7 +6,7 @@
 //!     frame bytes) is reproducible on top of `noq` instead of `quinn` -- both
 //!     client and server side.
 //!  2. A plain, unmodified `quinn` client (the exact shape used by
-//!     `helper_quic_transport.rs::establish_quic_connection`) can still complete
+//!     `isekai_pipe_quic_transport.rs::establish_quic_connection`) can still complete
 //!     a QUIC handshake and the HELLO/ACK exchange against a `noq` server. This
 //!     is the backward-compatibility premise the Phase 9 plan depends on: if
 //!     this holds, isekai-helper can move to a single noq-based listener without
@@ -29,8 +29,8 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const EXPORTER_LABEL: &[u8] = b"isekai-helper-auth-v1";
-const ALPN: &[u8] = b"isekai-helper/1";
+const EXPORTER_LABEL: &[u8] = b"isekai-pipe-auth-v1";
+const ALPN: &[u8] = b"isekai-pipe/1";
 const FRAME_HELLO: u8 = 0x01;
 const FRAME_ACK: u8 = 0x02;
 const FRAME_REJECT_AUTH: u8 = 0xFF;
@@ -160,7 +160,7 @@ fn compute_proof_quinn(conn: &quinn::Connection, session_secret: &[u8; 32]) -> R
     Ok(mac.finalize().into_bytes().into())
 }
 
-// ── cert pinning verifier, replicated verbatim from helper_quic_transport.rs ─
+// ── cert pinning verifier, replicated verbatim from isekai_pipe_quic_transport.rs ─
 
 #[derive(Debug)]
 struct PinnedCertVerifier {
@@ -243,7 +243,7 @@ async fn check_noq_multipath_client(
     endpoint.set_default_client_config(client_config);
 
     let path0_addr: SocketAddr = format!("127.0.0.1:{server_port}").parse()?;
-    let conn = endpoint.connect(path0_addr, "isekai-helper.local")?.await.context("path0 handshake")?;
+    let conn = endpoint.connect(path0_addr, "isekai-pipe.local")?.await.context("path0 handshake")?;
     println!("[noq-client] path0 established");
 
     hello_ack_roundtrip_noq(&conn, &session_secret, "via path0").await?;
@@ -314,7 +314,7 @@ async fn check_quinn_backward_compat(server_port: u16, cert_sha256_hex: &str, se
     endpoint.set_default_client_config(client_config);
 
     let addr: SocketAddr = format!("127.0.0.1:{server_port}").parse()?;
-    let conn = endpoint.connect(addr, "isekai-helper.local")?.await.context("quinn handshake against noq server")?;
+    let conn = endpoint.connect(addr, "isekai-pipe.local")?.await.context("quinn handshake against noq server")?;
     println!("[quinn-client] QUIC handshake OK against noq server, rtt={:?}", conn.rtt());
 
     let proof = compute_proof_quinn(&conn, &session_secret)?;
@@ -343,7 +343,7 @@ async fn check_quinn_backward_compat(server_port: u16, cert_sha256_hex: &str, se
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let cert = rcgen::generate_simple_self_signed(vec!["isekai-helper.local".to_string()])?;
+    let cert = rcgen::generate_simple_self_signed(vec!["isekai-pipe.local".to_string()])?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().clone());
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
         .map_err(|e| anyhow!("key conversion failed: {e}"))?;

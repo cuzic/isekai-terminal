@@ -31,7 +31,7 @@ pub enum FsGuardError {
 
 /// Fails closed if `path` is writable by users other than its owner (mode
 /// bit `0o002`). Unix-only; a no-op elsewhere (matching this project's
-/// Linux-only "配布対象プラットフォーム" scope, `ISEKAI_SSH_DESIGN.md`).
+/// Linux-only "配布対象プラットフォーム" scope, `archive/ISEKAI_SSH_DESIGN.md`).
 #[cfg(unix)]
 pub fn check_not_world_writable(path: &Path) -> Result<(), FsGuardError> {
     use std::os::unix::fs::PermissionsExt;

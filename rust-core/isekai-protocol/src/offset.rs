@@ -1,4 +1,4 @@
-//! C2H/H2C stream-position offsets (`ISEKAI_SSH_DESIGN.md` "resume を
+//! C2H/H2C stream-position offsets (`archive/ISEKAI_SSH_DESIGN.md` "resume を
 //! ProxyCommand の背後に隠す"節). Naming and direction semantics follow that
 //! section exactly; these are plain value types with overflow-checked
 //! arithmetic. The resume frames that carry them on the wire (`RESUME`/

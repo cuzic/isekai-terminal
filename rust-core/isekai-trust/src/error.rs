@@ -3,7 +3,7 @@ use std::path::PathBuf;
 /// All failure modes of `isekai-trust` are designed to fail closed: a
 /// malformed store, an unexpected file permission, or an unrecognized
 /// `update_policy` value must surface as an `Err`, never a silent fallback
-/// to a default/empty trust store (`ISEKAI_SSH_DESIGN.md` "trust store の
+/// to a default/empty trust store (`archive/ISEKAI_SSH_DESIGN.md` "trust store の
 /// ファイル形式").
 #[derive(Debug, thiserror::Error)]
 pub enum TrustError {

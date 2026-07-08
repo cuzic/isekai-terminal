@@ -1,4 +1,4 @@
-//! `isekai-ssh login`/`logout` (`ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー",
+//! `isekai-ssh login`/`logout` (`archive/ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー",
 //! フェーズ分割案 S-5).
 //!
 //! `login` runs an RFC 8628 Device Authorization Grant, implemented in
@@ -16,7 +16,7 @@
 //!
 //! The three OAuth endpoints/`client_id` are required CLI flags
 //! (`cli::LoginArgs`) rather than hardcoded: the real Auth0 tenant URL isn't
-//! fixed yet (`ISEKAI_SSH_DESIGN.md` "引き続き未決の項目"), so hardcoding a
+//! fixed yet (`archive/ISEKAI_SSH_DESIGN.md` "引き続き未決の項目"), so hardcoding a
 //! placeholder here would just have to be replaced later anyway.
 //!
 //! `isekai_auth::device_flow`'s HTTP calls are blocking (`ureq`, see that

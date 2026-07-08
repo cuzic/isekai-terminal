@@ -1,6 +1,6 @@
 //! Reading/writing `known_helpers.toml` from disk.
 //!
-//! Three properties are load-bearing here (`ISEKAI_SSH_DESIGN.md` "trust
+//! Three properties are load-bearing here (`archive/ISEKAI_SSH_DESIGN.md` "trust
 //! store のファイル形式", task acceptance criteria):
 //!
 //! 1. Writes are atomic: `save_trust_store` writes to a sibling temp file in
@@ -14,7 +14,7 @@
 //!
 //! The permission checks are Unix-only (`std::os::unix::fs::PermissionsExt`)
 //! per the task scope; on other platforms they are a no-op, matching
-//! `ISEKAI_SSH_DESIGN.md`'s "配布対象プラットフォーム" note that only Linux
+//! `archive/ISEKAI_SSH_DESIGN.md`'s "配布対象プラットフォーム" note that only Linux
 //! is targeted today.
 
 use std::fs;
@@ -28,7 +28,7 @@ pub const CONFIG_DIR_NAME: &str = "isekai-ssh";
 pub const TRUST_STORE_FILE_NAME: &str = "known_helpers.toml";
 
 /// `~/.config/isekai-ssh` (XDG Base Directory convention, per
-/// `ISEKAI_SSH_DESIGN.md`).
+/// `archive/ISEKAI_SSH_DESIGN.md`).
 pub fn default_config_dir() -> Result<PathBuf, TrustError> {
     let home = std::env::var_os("HOME").ok_or(TrustError::NoHomeDir)?;
     Ok(config_dir_from_home(Path::new(&home)))

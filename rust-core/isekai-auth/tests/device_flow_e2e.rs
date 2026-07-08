@@ -1,5 +1,5 @@
 //! End-to-end test for `isekai_auth::device_flow` (RFC 8628 Device
-//! Authorization Grant, `ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー", フェーズ
+//! Authorization Grant, `archive/ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー", フェーズ
 //! 分割案 S-5). Drives `request_device_authorization` + `poll_for_token`
 //! against a real (if minimal) HTTP server on `127.0.0.1`, not a type-level
 //! mock — this proves the actual HTTP request shapes, JSON decoding, and the

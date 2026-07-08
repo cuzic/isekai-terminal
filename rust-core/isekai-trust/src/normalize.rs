@@ -1,7 +1,7 @@
 //! Normalizes the many ways a user can spell an SSH connection target
 //! (`myhost`, `myhost:22`, `user@myhost`, `user@myhost:2222`, ...) into the
 //! single `host:port` form used as the trust store's map key
-//! (`ISEKAI_SSH_DESIGN.md` "キーの正規化"). Port defaults to 22 when
+//! (`archive/ISEKAI_SSH_DESIGN.md` "キーの正規化"). Port defaults to 22 when
 //! omitted; the username, if any, is dropped entirely — trust is scoped to
 //! the (host, port) pair, not to who connects. `--via` (the jumphost) is a
 //! separate, non-identity concept and is intentionally not part of this key

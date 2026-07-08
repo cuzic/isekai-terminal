@@ -6,7 +6,7 @@
 //! (temp file in the same directory, then `rename`), the file is created
 //! with `0600` permissions and its parent directory with `0700`, and both
 //! are checked for world-writability before use — fail closed if either is
-//! writable by others. This isn't spelled out in `ISEKAI_SSH_DESIGN.md` yet,
+//! writable by others. This isn't spelled out in `archive/ISEKAI_SSH_DESIGN.md` yet,
 //! but the token file is exactly as sensitive as the trust store's identity
 //! material, so it gets the same treatment.
 //!
@@ -22,7 +22,7 @@
 //! Authorization Grant (`device_flow.rs`) returns an `access_token` plus,
 //! usually, a `refresh_token` and an `expires_in`, so the on-disk schema
 //! grows to `TokenSet` (`{"access_token", "refresh_token"?, "expires_at"?,
-//! "token_endpoint"?, "client_id"?}`, `ISEKAI_SSH_DESIGN.md`
+//! "token_endpoint"?, "client_id"?}`, `archive/ISEKAI_SSH_DESIGN.md`
 //! "JWT発行・配布フロー"). Both schemas are read transparently via
 //! `TokenFileSchema`'s `#[serde(untagged)]` union: an old-style file with
 //! only `relay_jwt` loads as a `TokenSet` with `access_token` set to that
@@ -32,7 +32,7 @@
 //! `relay_jwt` shape, so existing callers see no behavior change.
 //!
 //! OS keychain/Secret Service integration is intentionally not attempted
-//! here (`ISEKAI_SSH_DESIGN.md` calls it "可能な限り" — best-effort — and the
+//! here (`archive/ISEKAI_SSH_DESIGN.md` calls it "可能な限り" — best-effort — and the
 //! sandboxed/headless environments this crate is tested in can't exercise
 //! one anyway). The `0600`/`0700` file store below is the only backing store
 //! for now; a real keychain-backed `TokenProvider` implementation could be
@@ -52,7 +52,7 @@ pub const CONFIG_DIR_NAME: &str = "isekai-ssh";
 pub const TOKEN_FILE_NAME: &str = "token.json";
 
 /// How close to (or past) `expires_at` counts as "refresh now"
-/// (`ISEKAI_SSH_DESIGN.md`: "保存済みトークンの`expires_at`が近い/過ぎている
+/// (`archive/ISEKAI_SSH_DESIGN.md`: "保存済みトークンの`expires_at`が近い/過ぎている
 /// 場合"). A flat 60s skew comfortably covers the round trip of the SSH
 /// connection this token is about to authenticate, without refreshing so
 /// eagerly that every call does an extra network round trip.
@@ -153,7 +153,7 @@ enum TokenFileSchema {
 }
 
 /// `~/.config/isekai-ssh` (XDG Base Directory convention, per
-/// `ISEKAI_SSH_DESIGN.md`; same directory `isekai-trust` uses for
+/// `archive/ISEKAI_SSH_DESIGN.md`; same directory `isekai-trust` uses for
 /// `known_helpers.toml`).
 pub fn default_config_dir() -> Result<PathBuf, AuthError> {
     let home = std::env::var_os("HOME").ok_or(AuthError::NoHomeDir)?;
@@ -341,7 +341,7 @@ impl FileTokenProvider {
 impl TokenProvider for FileTokenProvider {
     /// Returns a currently-valid access token, transparently refreshing it
     /// first if the stored `TokenSet.expires_at` is near/past
-    /// (`ISEKAI_SSH_DESIGN.md`: "`connect` 実行中のトークン失効は裏で自動
+    /// (`archive/ISEKAI_SSH_DESIGN.md`: "`connect` 実行中のトークン失効は裏で自動
     /// リフレッシュを試みる"). Legacy v1 (plain `relay_jwt`, no expiry) files
     /// are returned as-is, matching this method's pre-phase-S-5 behavior
     /// exactly — `needs_refresh()` is always `false` for them.

@@ -1,5 +1,5 @@
 //! Version negotiation, new for the isekai-ssh work (not present in the
-//! current `HELPER_PROTOCOL.md` wire format). `ISEKAI_SSH_DESIGN.md`
+//! current `archive/HELPER_PROTOCOL.md` wire format). `archive/ISEKAI_SSH_DESIGN.md`
 //! "実装方針" calls for `protocol_version`/`min_supported_version`/`features`
 //! to exist from the start so Android/CLI/isekai-helper/e2e tests can all
 //! speak the same vocabulary once `isekai-transport` wires this up.
