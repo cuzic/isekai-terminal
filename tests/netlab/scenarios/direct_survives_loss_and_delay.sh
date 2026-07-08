@@ -117,7 +117,7 @@ done
 
 # --- isekai-pipe serve: server ns内、UDPを直接bind(direct mode)。
 ip netns exec "$NETLAB_SERVER_NS" env RUST_LOG=trace "$ISEKAI_PIPE_BIN" serve \
-    --target 127.0.0.1:2222 --bind 0.0.0.0:0 --once --log-level trace \
+    --target 127.0.0.1:2222 --bind "$NETLAB_SERVER_IP:0" --once --log-level trace \
     > "$WORKDIR/serve.stdout" 2> "$WORKDIR/serve.stderr" &
 SERVE_PID=$!
 
