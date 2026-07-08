@@ -9,19 +9,7 @@ description = "Single static-binary ssh(1) ProxyCommand wrapper reusing isekai-t
 name = "isekai-ssh"
 path = "src/main.rs"
 
-[features]
-# Opt-in, dev/test-only bypass for the (not-yet-implemented, see S-2) trust
-# store lookup that would normally tell `connect` where to reach the target
-# isekai-helper instance and what its session credentials are
-# (`ISEKAI_SSH_DESIGN.md` フェーズ分割案 S-1). Deliberately *not* a default
-# feature: a plain `cargo build --release -p isekai-ssh` (no explicit
-# `--features`) must never enable it, and `main.rs` additionally asserts via
-# `compile_error!` that it can never be combined with a release profile even
-# if a caller passes `--release --features dev-insecure` explicitly.
-dev-insecure = []
-
 [dependencies]
-isekai-transport = { path = "../isekai-transport" }
 isekai-trust = { path = "../isekai-trust" }
 isekai-bootstrap = { path = "../isekai-bootstrap" }
 isekai-auth = { path = "../isekai-auth" }
@@ -43,39 +31,3 @@ russh-keys = "0.48"
 async-trait = "0.1.89"
 tempfile = "3"
 serde_json = "1"
-
-# `connect_e2e.rs` needs `--dev-insecure-*` flags to exist at all (this
-# phase, S-1, has no trust store yet — see `cli.rs`), so it can only compile
-# when the `dev-insecure` feature is enabled:
-#   cargo test -p isekai-ssh --features dev-insecure
-# `help_purity.rs` intentionally has no such requirement — it must pass with
-# a completely default (no extra `--features`) invocation, since it verifies
-# the exact opposite property (a plain release build shows no dev flags).
-[[test]]
-name = "connect_e2e"
-required-features = ["dev-insecure"]
-
-[[test]]
-name = "help_purity"
-
-# `resume_reconnect_e2e.rs` (Phase S-4c) drives the real `isekai-ssh connect`
-# binary via the same `--dev-insecure-*` bypass as `connect_e2e.rs`, for the
-# same reason (no trust store plumbing in this test) — same gating applies.
-[[test]]
-name = "resume_reconnect_e2e"
-required-features = ["dev-insecure"]
-
-# `resume_window_exceeded_e2e.rs` (Phase S-4d) is `resume_reconnect_e2e.rs`'s
-# "resume window exceeded" counterpart — same `--dev-insecure-*` bypass, same
-# gating applies.
-[[test]]
-name = "resume_window_exceeded_e2e"
-required-features = ["dev-insecure"]
-
-# `resume_multi_disconnect_e2e.rs` (Phase S-4, final integration check)
-# combines both sibling resume tests' scenarios (a recoverable outage
-# followed by a permanent one) within a single `isekai-ssh connect` process
-# lifecycle — same `--dev-insecure-*` bypass, same gating applies.
-[[test]]
-name = "resume_multi_disconnect_e2e"
-required-features = ["dev-insecure"]

@@ -1,29 +1,14 @@
-//! `isekai-ssh` CLI surface (`ISEKAI_SSH_DESIGN.md` "CLIコマンド構成").
+//! `isekai-ssh` CLI surface for the legacy, interactive trust-bootstrapping
+//! subcommands (`archive/ISEKAI_SSH_DESIGN.md` "CLIコマンド構成"). The day-to-day
+//! connection path is the non-subcommand wrapper mode (`isekai-ssh
+//! <destination>`, `wrapper.rs`), which delegates the actual QUIC relay to
+//! the separate `isekai-pipe connect` binary
+//! (`archive/ISEKAI_PIPE_MIGRATION.md` P4). The standalone `connect` subcommand that
+//! used to duplicate that relay logic directly inside `isekai-ssh` has been
+//! removed now that the wrapper covers the same ground.
 //!
-//! `connect`, `init`, `login`, and `logout` are implemented; `trust` is still
-//! out of scope. As of S-2, `connect` resolves its
-//! target from the trust store (`isekai-trust`,
-//! `~/.config/isekai-ssh/known_helpers.toml`) by default; the
-//! `--dev-insecure-*` flags below remain only as a debug/test-only bypass
-//! of that lookup (originally added to unblock S-1's end-to-end test before
-//! the trust store existed). They are compiled in *only* when both
-//! `debug_assertions` and the (non-default) `dev-insecure` Cargo feature are
-//! active — see `main.rs`'s `compile_error!` guard for why a release build
-//! can never even have this feature turned on, and this module's `cfg` gate
-//! for why a plain (non-`dev-insecure`) debug build's `--help` also never
-//! shows them.
-//!
-//! As of S-6, `connect` also takes `--mode <relay|stun>` (default `relay`)
-//! to pick which `isekai-transport` NAT-traversal path resolves the trust
-//! store entry into: `ConnectMode::Relay`
-//! (`isekai_transport::connect_via_relay`) or `ConnectMode::Stun`
-//! (`isekai_transport::connect_stun_p2p`, requiring `--stun-server`). See
-//! `ConnectArgs::mode`'s docs and `connect.rs`'s module docs for the
-//! relay-first rationale and the STUN mode's known unrecoverable-NAT-loss
-//! caveat.
-//!
-//! `init` (S-3) is the interactive counterpart that populates the trust
-//! store `connect` reads from: it deploys/starts `isekai-helper` on a target
+//! `init` (S-3) is the interactive command that populates the trust store
+//! `wrapper.rs` reads from: it deploys/starts `isekai-helper` on a target
 //! host (via `isekai-bootstrap::OpenSshBackend`) and, on confirmation, writes
 //! a `HelperTrust` entry. See `init.rs`'s module docs for the full flow.
 //!
@@ -53,16 +38,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Connect to a trusted host's isekai-helper and relay this process's
-    /// stdin/stdout against the established QUIC stream. Meant to be
-    /// invoked as `ssh`'s ProxyCommand: non-interactive, and stdout carries
-    /// nothing but the raw byte stream from isekai-helper (all logging goes
-    /// to stderr) — see `ISEKAI_SSH_DESIGN.md` "ユーザー体験の流れ".
-    Connect(ConnectArgs),
-
     /// Deploy/start isekai-helper on `<host>` (optionally via a jump host)
     /// and, after an explicit `[y/N]` confirmation, register it in the
-    /// trust store `connect` reads from. Interactive by design — see
+    /// trust store the wrapper reads from. Interactive by design — see
     /// `init.rs`'s module docs.
     Init(InitArgs),
 
@@ -79,124 +57,16 @@ pub enum Command {
 }
 
 #[derive(Args)]
-pub struct ConnectArgs {
-    /// Host alias, as registered via `isekai-ssh init` (trust store lookup
-    /// key, normalized via `isekai_trust::normalize_host_port`; `init`
-    /// itself is not implemented yet, S-3 — until then, hosts must be
-    /// registered by writing `~/.config/isekai-ssh/known_helpers.toml`
-    /// directly, e.g. via `isekai-trust::save_trust_store`).
-    pub host: String,
-
-    /// Jump host used only as a fallback to re-deploy/restart isekai-helper
-    /// when the relay path itself is unreachable. Not implemented yet
-    /// (reserved for S-3); accepted here so `~/.ssh/config` entries written
-    /// against the eventual CLI already parse.
-    #[arg(long, value_name = "JUMPHOST")]
-    pub via: Option<String>,
-
-    /// Which NAT-traversal transport to use to reach the target
-    /// isekai-helper (`ISEKAI_SSH_DESIGN.md` "isekai-sshでのNAT越え方式の既定").
-    /// Defaults to `relay` (`isekai_transport::connect_via_relay`): relay
-    /// stays in the data path, so it tolerates any NAT type and — unlike
-    /// `stun` — has no known-unrecoverable failure mode within a session.
-    /// `stun` (`isekai_transport::connect_stun_p2p`) is opt-in low-latency
-    /// P2P; picking it means accepting that **a NAT mapping loss (e.g.
-    /// Wi-Fi<->cellular tethering roaming) during the session cannot be
-    /// recovered** — there is no relay fallback path once the QUIC
-    /// connection to isekai-helper is lost this way. `connect` prints a
-    /// stderr warning to this effect whenever `--mode stun` is used (see
-    /// `connect.rs::run`).
-    #[arg(long, value_enum, default_value_t = ConnectMode::Relay)]
-    pub mode: ConnectMode,
-
-    /// STUN server (`ADDR:PORT`) used to learn this side's own
-    /// NAT-observed address before hole-punching, e.g. `stun.example.com:3478`
-    /// (`isekai_transport::connect_stun_p2p`'s `stun_server` argument).
-    /// Required when `--mode stun` is given; unused (and rejected — clap
-    /// enforces the `--mode stun` pairing) otherwise.
-    #[arg(long, value_name = "ADDR:PORT", required_if_eq("mode", "stun"))]
-    pub stun_server: Option<SocketAddr>,
-
-    /// How long `--mode relay` (`connect.rs::run_relay_resumable`) keeps
-    /// retrying `RESUME` after losing the QUIC connection to isekai-helper
-    /// before giving up, explicitly closing stdin/stdout, and letting the
-    /// process exit (`ISEKAI_SSH_DESIGN.md` "resume を ProxyCommand の背後に
-    /// 隠す"). Named and defaulted (120s) to match isekai-helper's own
-    /// `--resume-window` (`isekai-helper --help`) — the two are logically the
-    /// same knob viewed from either end of the same resumable session, and
-    /// keeping them equal (or this side no longer than isekai-helper's) is
-    /// what `ISEKAI_SSH_DESIGN.md`'s "`ssh` 自身の生存確認とのレース" section
-    /// recommends: if isekai-ssh kept retrying *longer* than isekai-helper's
-    /// own window, every attempt made after isekai-helper has already swept
-    /// the parked session would just fail with `REJECT_UNKNOWN_SESSION`
-    /// instead of isekai-ssh's own clean give-up message. Unused by `--mode
-    /// stun`, which has no resume support at all (see `connect.rs`'s module
-    /// docs).
-    #[arg(long, value_name = "SECS", default_value_t = 120)]
-    pub resume_window: u64,
-
-    #[cfg(all(debug_assertions, feature = "dev-insecure"))]
-    #[command(flatten)]
-    pub dev_insecure: DevInsecureArgs,
-}
-
-/// `--mode` values for `isekai-ssh connect` (`ConnectArgs::mode`). See that
-/// field's docs for the relay-first rationale
-/// (`ISEKAI_SSH_DESIGN.md` "isekai-sshでのNAT越え方式の既定").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum ConnectMode {
-    /// `isekai_transport::connect_via_relay` (default): relay stays in the
-    /// data path, tolerant of any NAT type, no unrecoverable-mid-session
-    /// failure mode.
-    Relay,
-    /// `isekai_transport::connect_stun_p2p` (opt-in): relay-free P2P via
-    /// STUN self-observation + simultaneous open. Lower latency, but a NAT
-    /// mapping loss mid-session cannot be recovered (no relay fallback).
-    Stun,
-}
-
-/// DEV/TEST ONLY. Bypasses the trust store lookup (S-2) by letting the
-/// caller specify isekai-helper's relay-assigned endpoint and session
-/// credentials directly. See this module's docs and `main.rs`'s
-/// `compile_error!` guard for why this can never ship in a release binary.
-#[cfg(all(debug_assertions, feature = "dev-insecure"))]
-#[derive(Args)]
-pub struct DevInsecureArgs {
-    /// DEV ONLY: skip the trust store and connect directly to this
-    /// isekai-helper address (e.g. `127.0.0.1:45231`) instead of resolving
-    /// `host`. Must be given together with the other `--dev-insecure-*`
-    /// flags below.
-    #[arg(long, value_name = "ADDR:PORT")]
-    pub dev_insecure_target: Option<String>,
-
-    /// DEV ONLY: the target isekai-helper's `cert_sha256` fingerprint
-    /// (`HandshakeJson::cert_sha256`), lowercase hex.
-    #[arg(long, value_name = "HEX64")]
-    pub dev_insecure_cert_sha256: Option<String>,
-
-    /// DEV ONLY: the target isekai-helper's `session_secret`
-    /// (`HandshakeJson::session_secret`), base64-encoded.
-    #[arg(long, value_name = "BASE64")]
-    pub dev_insecure_session_secret: Option<String>,
-
-    /// DEV ONLY: QUIC SNI / server name to present during the handshake.
-    /// isekai-helper ignores it (see `isekai_transport::RelayTarget`'s
-    /// docs), so the default is just a placeholder.
-    #[arg(long, value_name = "NAME", default_value = "isekai-helper")]
-    pub dev_insecure_server_name: String,
-}
-
-#[derive(Args)]
 pub struct InitArgs {
     /// Host to deploy/register, e.g. `myhost`, `myhost:2222`, or
-    /// `user@myhost` — same spec accepted by `connect`. Normalized via
+    /// `user@myhost` — same spec accepted by the wrapper. Normalized via
     /// `isekai_trust::normalize_host_port` before being used as the trust
     /// store key.
     pub host: String,
 
     /// Jump host used to reach `<host>` for this one-time deployment
     /// (`ssh -J`-style `[user@]host[:port]`). Recorded as `last_via` in the
-    /// trust store entry, purely informational for `connect`'s own
+    /// trust store entry, purely informational for the wrapper's own
     /// re-deployment fallback (not implemented yet).
     #[arg(long, value_name = "JUMPHOST")]
     pub via: Option<String>,
@@ -208,7 +78,7 @@ pub struct InitArgs {
     /// (S-7, see `rust-core/scripts/build-isekai-helper-musl.sh`) so this
     /// flag becomes optional, but doing that today would force every
     /// `cargo build -p isekai-ssh` to require a pre-built musl artifact on
-    /// disk just to compile — exactly the trap `helper_quic_transport.rs`'s
+    /// disk just to compile — exactly the trap `isekai_pipe_quic_transport.rs`'s
     /// unconditional `include_bytes!` fell into for `isekai-terminal-core`. Keeping
     /// this an explicit, required CLI argument keeps `isekai-ssh` buildable
     /// in any environment; tests pass the actual binary built alongside
@@ -218,7 +88,7 @@ pub struct InitArgs {
     pub helper_binary: PathBuf,
 
     /// The isekai-link relay `isekai-helper --relay` should tunnel through
-    /// (`HELPER_PROTOCOL.md`, `ISEKAI_SSH_DESIGN.md` "接続シーケンス").
+    /// (`archive/HELPER_PROTOCOL.md`, `archive/ISEKAI_SSH_DESIGN.md` "接続シーケンス").
     #[arg(long, value_name = "ADDR:PORT")]
     pub relay_addr: SocketAddr,
 
@@ -240,19 +110,20 @@ pub struct InitArgs {
 
     /// Recorded as `release_channel` in the trust store entry. Unused by
     /// any policy decision today (`UpdatePolicy::ExactDigestOnly` is the
-    /// only variant, `ISEKAI_SSH_DESIGN.md` "trust store のファイル形式").
+    /// only variant, `archive/ISEKAI_SSH_DESIGN.md` "trust store のファイル形式").
     #[arg(long, value_name = "NAME")]
     pub release_channel: Option<String>,
 
     /// Passed straight through as `isekai-helper --max-idle-lifetime <SECS>`:
     /// how long the deployed helper stays running with no active connection
     /// before self-exiting. Defaults to 30 days rather than isekai-helper's
-    /// own 600s default, because `init` deploys a helper once and `connect`
-    /// is expected to keep dialing that same long-running process across
-    /// many separate, possibly hours/days-apart `ssh` invocations — unlike
-    /// `isekai-terminal-core`'s (Android's) per-session bootstrap, which re-deploys a
-    /// fresh helper on every connection attempt and so is unaffected by a
-    /// short self-exit window (`ISEKAI_SSH_DESIGN.md` "引き続き未決の項目").
+    /// own 600s default, because `init` deploys a helper once and the
+    /// wrapper is expected to keep dialing that same long-running process
+    /// across many separate, possibly hours/days-apart `ssh` invocations —
+    /// unlike `isekai-terminal-core`'s (Android's) per-session bootstrap,
+    /// which re-deploys a fresh helper on every connection attempt and so is
+    /// unaffected by a short self-exit window
+    /// (`archive/ISEKAI_SSH_DESIGN.md` "引き続き未決の項目").
     #[arg(long, value_name = "SECS", default_value_t = 2_592_000)]
     pub idle_lifetime: u64,
 }
@@ -261,7 +132,7 @@ pub struct InitArgs {
 pub struct LoginArgs {
     /// RFC 8628 §3.1 device authorization endpoint URL. Not hardcoded: the
     /// real Auth0 tenant URL isn't fixed yet
-    /// (`ISEKAI_SSH_DESIGN.md` "引き続き未決の項目").
+    /// (`archive/ISEKAI_SSH_DESIGN.md` "引き続き未決の項目").
     #[arg(long, value_name = "URL")]
     pub device_auth_endpoint: String,
 
