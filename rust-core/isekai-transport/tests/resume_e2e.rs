@@ -1,7 +1,7 @@
 //! End-to-end test for `isekai-transport`'s resume support (`resume.rs`,
-//! `ISEKAI_SSH_DESIGN.md` Phase S-4c) against a real local QUIC server
+//! `archive/ISEKAI_SSH_DESIGN.md` Phase S-4c) against a real local QUIC server
 //! speaking isekai-helper's actual Phase 8 wire protocol
-//! (`HELPER_PROTOCOL.md` §7), modeled directly on
+//! (`archive/HELPER_PROTOCOL.md` §7), modeled directly on
 //! `rust-core/isekai-helper/src/main.rs`'s `handle_connection`/
 //! `handle_stream`/`handle_resume_stream`/`accept_control_stream`.
 //!
@@ -10,7 +10,7 @@
 //! server's self-signed certificate fingerprint, and exchanges the real
 //! `HELLO`/`ACK`, `CONTROL_HELLO`/`CONTROL_ACK`, and `RESUME`/`RESUME_ACK`
 //! wire bytes end-to-end. The key scenario this test exists to prove
-//! (`ISEKAI_SSH_DESIGN.md`'s acceptance criteria for S-4c) is: establish a
+//! (`archive/ISEKAI_SSH_DESIGN.md`'s acceptance criteria for S-4c) is: establish a
 //! resumable session, **actually sever the QUIC connection** (the client
 //! closes its own connection, standing in for "a client-side socket dies"),
 //! dial a **brand-new** QUIC connection, `RESUME` on it, and confirm the byte
@@ -36,14 +36,17 @@ use isekai_protocol::resume::{decode_resume, encode_resume_ack, ResumeAckFrame};
 use isekai_protocol::session_id::{SessionId, SESSION_ID_LEN};
 use isekai_transport::{
     connect_via_relay_resumable, reconnect_and_resume, C2hHelperCommittedOffset, C2hSentOffset,
-    H2cClientDeliveredOffset, H2cSentOffset, RelayTarget, SystemQuicEndpointFactory,
+    CandidateIdentity, H2cClientDeliveredOffset, H2cSentOffset, RelayTarget, SystemQuicEndpointFactory,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const SNI: &str = "isekai-helper.local";
+const TEST_IDENTITY: CandidateIdentity<'static> =
+    CandidateIdentity { kind: "relay", source: "test", provider: "test", id: "test" };
+
+const SNI: &str = "isekai-pipe.local";
 const CONTROL_HELLO: u8 = 0x10;
 const CONTROL_ACK: u8 = 0x11;
 
@@ -125,18 +128,22 @@ async fn handle_connection(conn: noq::Connection, session_secret: Vec<u8>, sessi
 
     match type_byte[0] {
         isekai_protocol::hello::FRAME_HELLO => {
-            let mut rest = [0u8; isekai_protocol::hello::PROOF_LEN];
+            let mut rest = [0u8; HELLO_FRAME_LEN - 1];
             recv.read_exact(&mut rest).await.unwrap();
             let mut hello = [0u8; HELLO_FRAME_LEN];
             hello[0] = isekai_protocol::hello::FRAME_HELLO;
             hello[1..].copy_from_slice(&rest);
-            let proof = decode_hello(&hello).unwrap();
+            let hello = decode_hello(&hello).unwrap();
             let expected = compute_expected_proof(&conn, &session_secret, b"");
-            if !proof.ct_eq(&expected) {
-                send.write_all(&[encode_ack_response(AckResponse::RejectAuth)]).await.ok();
+            if !hello.proof.ct_eq(&expected) {
+                send.write_all(&encode_ack_response(AckResponse::RejectAuth)).await.ok();
                 return;
             }
-            send.write_all(&[encode_ack_response(AckResponse::Ack)]).await.unwrap();
+            send.write_all(&encode_ack_response(AckResponse::Ack {
+                effective_resume_grace_secs: hello.requested_resume_grace_secs,
+            }))
+            .await
+            .unwrap();
 
             let session = Arc::new(Mutex::new(MockSession { committed_offset: 0, output: Vec::new() }));
 
@@ -297,10 +304,17 @@ async fn resume_survives_a_client_initiated_disconnect_and_relay_continues() {
     let factory = SystemQuicEndpointFactory;
 
     // 1. Establish the first (resumable) connection.
-    let session = tokio::time::timeout(Duration::from_secs(10), connect_via_relay_resumable(&factory, &target))
-        .await
-        .expect("connect_via_relay_resumable should not hang")
-        .expect("connect_via_relay_resumable should complete HELLO/ACK + CONTROL_HELLO/ACK");
+    let session = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_via_relay_resumable(&factory, &target, 180, TEST_IDENTITY),
+    )
+    .await
+    .expect("connect_via_relay_resumable should not hang")
+    .expect("connect_via_relay_resumable should complete HELLO/ACK + CONTROL_HELLO/ACK");
+    assert_eq!(
+        session.effective_resume_grace_secs, 180,
+        "mock server should echo back the requested grace verbatim (it has no lower max configured)"
+    );
 
     let mut data_stream = session.data_stream;
 
@@ -316,7 +330,7 @@ async fn resume_survives_a_client_initiated_disconnect_and_relay_continues() {
 
     // 3. Simulate a client-side socket/connection death: close our own QUIC
     // connection out from under the still-open data stream
-    // (`ISEKAI_SSH_DESIGN.md`'s acceptance criterion: "クライアント側の
+    // (`archive/ISEKAI_SSH_DESIGN.md`'s acceptance criterion: "クライアント側の
     // ソケットを閉じる"). Subsequent reads/writes on `data_stream` must fail.
     session.connection.close().await;
     drop(data_stream);

@@ -73,8 +73,9 @@ pub use error::TransportError;
 pub use proof::compute_proof;
 pub use relay::{connect_via_relay, RelayTarget};
 pub use resume::{
-    connect_via_relay_resumable, open_control_stream, reconnect_and_resume, spawn_app_ack_tasks, AppAckCounters,
-    AppAckTasks, ControlStream, ResumableRelaySession, ResumeAckOutcome,
+    connect_via_relay_resumable, connect_via_relay_resumable_with_fallback, open_control_stream,
+    reconnect_and_resume, spawn_app_ack_tasks, AppAckCounters, AppAckTasks, ControlStream, ResumableRelaySession,
+    ResumeAckOutcome, SequentialConnectError, SequentialFailure, SequentialRelayCandidate,
 };
 pub use stun_p2p::{connect_stun_p2p, StunP2pConnection, StunP2pTarget};
 pub use system::SystemQuicEndpointFactory;

@@ -1,6 +1,6 @@
 //! End-to-end test for `connect_via_relay` against a real local QUIC server
 //! standing in for isekai-helper's own noq server (the peer side of
-//! `helper_quic_transport.rs::establish_quic_connection_with_socket`). This
+//! `isekai_pipe_quic_transport.rs::establish_quic_connection_with_socket`). This
 //! is not a type-checking-only mock: `SystemQuicEndpointFactory` binds an
 //! actual UDP socket, performs a real QUIC handshake pinned to the server's
 //! self-signed certificate fingerprint, opens a real bidirectional QUIC
@@ -21,10 +21,10 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const SNI: &str = "isekai-helper.local";
+const SNI: &str = "isekai-pipe.local";
 
 /// Generates a self-signed certificate (standing in for isekai-helper's own
-/// ephemeral cert, `HELPER_PROTOCOL.md` §2) and returns it alongside the
+/// ephemeral cert, `archive/HELPER_PROTOCOL.md` §2) and returns it alongside the
 /// lowercase-hex SHA-256 fingerprint a real client would receive out-of-band
 /// over the bootstrap SSH channel.
 fn generate_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>, String) {
@@ -38,7 +38,7 @@ fn generate_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>, Str
 }
 
 /// A real `noq` server endpoint, configured exactly like isekai-helper's own
-/// QUIC server (`HELPER_PROTOCOL.md` §4 ALPN, self-signed cert).
+/// QUIC server (`archive/HELPER_PROTOCOL.md` §4 ALPN, self-signed cert).
 fn mock_helper_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs8KeyDer<'static>) -> noq::Endpoint {
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -52,7 +52,7 @@ fn mock_helper_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs8Ke
 
 /// Accepts exactly one connection and one bidirectional stream, reads the
 /// HELLO frame, verifies the proof the same way isekai-helper would
-/// (`HELPER_PROTOCOL.md` §4: `HMAC-SHA256(session_secret, exporter)`), and
+/// (`archive/HELPER_PROTOCOL.md` §4: `HMAC-SHA256(session_secret, exporter)`), and
 /// replies ACK/REJECT_AUTH accordingly. On ACK, echoes back one more message
 /// to prove the returned stream is a real, working, bidirectional
 /// pass-through afterward — not just a handshake stub.
@@ -74,7 +74,7 @@ async fn run_mock_helper(
 
     let mut hello = [0u8; HELLO_FRAME_LEN];
     recv.read_exact(&mut hello).await.unwrap();
-    let proof = decode_hello(&hello).unwrap();
+    let hello = decode_hello(&hello).unwrap();
 
     let mut exporter = [0u8; 32];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"").unwrap();
@@ -83,10 +83,15 @@ async fn run_mock_helper(
     let expected_bytes: [u8; 32] = mac.finalize().into_bytes().into();
     let expected = Proof::new(expected_bytes);
 
-    let ack = if proof.ct_eq(&expected) { AckResponse::Ack } else { AckResponse::RejectAuth };
-    send.write_all(&[encode_ack_response(ack)]).await.unwrap();
+    let is_ack = hello.proof.ct_eq(&expected);
+    let ack = if is_ack {
+        AckResponse::Ack { effective_resume_grace_secs: hello.requested_resume_grace_secs }
+    } else {
+        AckResponse::RejectAuth
+    };
+    send.write_all(&encode_ack_response(ack)).await.unwrap();
 
-    if ack == AckResponse::Ack {
+    if is_ack {
         let mut buf = [0u8; 64];
         if let Ok(Some(n)) = recv.read(&mut buf).await {
             send.write_all(&buf[..n]).await.unwrap();

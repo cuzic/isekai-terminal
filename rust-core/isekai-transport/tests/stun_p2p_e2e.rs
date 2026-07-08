@@ -12,7 +12,7 @@
 //! the code path executes correctly end-to-end (STUN query → probe
 //! datagrams → QUIC-over-the-same-socket → HELLO/ACK), not that hole
 //! punching succeeds against a real NAT (that requires two real networks,
-//! `ISEKAI_SSH_DESIGN.md` phase S-7).
+//! `archive/ISEKAI_SSH_DESIGN.md` phase S-7).
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -22,13 +22,16 @@ use hmac::{Hmac, Mac};
 use isekai_protocol::hello::{
     decode_hello, encode_ack_response, AckResponse, Proof, ALPN, EXPORTER_LABEL, HELLO_FRAME_LEN,
 };
-use isekai_transport::{connect_stun_p2p, StunP2pTarget, TransportError};
+use isekai_transport::{connect_stun_p2p, CandidateIdentity, StunP2pTarget, TransportError};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const SNI: &str = "isekai-helper.local";
+const TEST_IDENTITY: CandidateIdentity<'static> =
+    CandidateIdentity { kind: "stun-p2p", source: "test", provider: "test", id: "test" };
+
+const SNI: &str = "isekai-pipe.local";
 
 /// A minimal mock STUN server (RFC 5389 Binding Request/Response): replies to
 /// every Binding Request with a Binding Success Response whose
@@ -118,7 +121,7 @@ async fn run_mock_peer(
 
     let mut hello = [0u8; HELLO_FRAME_LEN];
     recv.read_exact(&mut hello).await.unwrap();
-    let proof = decode_hello(&hello).unwrap();
+    let hello = decode_hello(&hello).unwrap();
 
     let mut exporter = [0u8; 32];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"").unwrap();
@@ -127,10 +130,15 @@ async fn run_mock_peer(
     let expected_bytes: [u8; 32] = mac.finalize().into_bytes().into();
     let expected = Proof::new(expected_bytes);
 
-    let ack = if proof.ct_eq(&expected) { AckResponse::Ack } else { AckResponse::RejectAuth };
-    send.write_all(&[encode_ack_response(ack)]).await.unwrap();
+    let is_ack = hello.proof.ct_eq(&expected);
+    let ack = if is_ack {
+        AckResponse::Ack { effective_resume_grace_secs: hello.requested_resume_grace_secs }
+    } else {
+        AckResponse::RejectAuth
+    };
+    send.write_all(&encode_ack_response(ack)).await.unwrap();
 
-    if ack == AckResponse::Ack {
+    if is_ack {
         let mut buf = [0u8; 64];
         if let Ok(Some(n)) = recv.read(&mut buf).await {
             send.write_all(&buf[..n]).await.unwrap();
@@ -162,14 +170,14 @@ async fn connect_stun_p2p_completes_stun_probe_and_hello_ack_over_a_real_quic_co
         session_secret,
     };
 
-    let mut connection = tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p(stun_server, &target))
+    let mut connection = tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p(stun_server, &target, TEST_IDENTITY))
         .await
         .expect("connect_stun_p2p should not hang")
         .expect("connect_stun_p2p should complete STUN + probes + HELLO/ACK over a real QUIC connection");
 
     // The mock STUN server observed our own probe socket over real UDP —
     // this is the value a real caller would go on to hand to a bootstrap/
-    // signaling channel (out of scope for this crate, `ISEKAI_SSH_DESIGN.md`
+    // signaling channel (out of scope for this crate, `archive/ISEKAI_SSH_DESIGN.md`
     // S-6), but here we can at least assert it is a real, non-zero loopback
     // address rather than a placeholder.
     assert_eq!(connection.our_observed_addr.ip(), Ipv4Addr::LOCALHOST);
@@ -205,7 +213,7 @@ async fn connect_stun_p2p_surfaces_reject_auth_for_a_wrong_session_secret() {
         session_secret: b"client-side-secret-does-not-match".to_vec(),
     };
 
-    match tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p(stun_server, &target)).await {
+    match tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p(stun_server, &target, TEST_IDENTITY)).await {
         Ok(Ok(_conn)) => panic!("a mismatched session_secret must be rejected, but it succeeded"),
         Ok(Err(err)) => {
             assert!(matches!(err, TransportError::Rejected(AckResponse::RejectAuth)), "got: {err:?}")
@@ -232,7 +240,7 @@ async fn connect_stun_p2p_fails_fast_when_the_stun_server_is_unreachable() {
         session_secret: b"unused".to_vec(),
     };
 
-    match tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p(dead_stun_server, &target)).await {
+    match tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p(dead_stun_server, &target, TEST_IDENTITY)).await {
         Ok(Ok(_conn)) => panic!("an unreachable STUN server must fail the connection, but it succeeded"),
         Ok(Err(err)) => assert!(matches!(err, TransportError::Stun(_)), "got: {err:?}"),
         Err(_) => panic!("connect_stun_p2p should fail fast rather than hang forever"),
