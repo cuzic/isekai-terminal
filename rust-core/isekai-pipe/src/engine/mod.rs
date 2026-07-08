@@ -597,7 +597,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                 let sessions = sessions.clone();
                 let resume_buffer_size = args.resume_buffer_size;
                 let max_resume_grace_secs = args.resume_window;
-                tokio::spawn(async move {
+                let handle_incoming = async move {
                     match incoming.await {
                         Ok(conn) => {
                             // noq: `remote_address()`はConnectingにしか無い（確立後はpath0/1...
@@ -614,11 +614,20 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                         Err(e) => log::warn!("failed to accept connection: {e:#}"),
                     }
                     *last_activity.lock().await = Instant::now();
-                });
+                };
                 if once {
+                    // `endpoint.accept()`はハンドシェイク未完了の`Connecting`しか返さない
+                    // (実際のハンドシェイク完了は`handle_incoming`内の`incoming.await`)。
+                    // 以前は`tokio::spawn`した直後にここで`endpoint.close()`していたため、
+                    // spawnされたタスクが最初にpollされる前にendpoint自体が閉じてしまい、
+                    // `--once`が自分自身が処理するはずだった最初の接続を常に道連れに
+                    // していた(netlab PoCで実netns越しに実バイナリを繋いで発見)。
+                    // 1接続しか処理しない契約なので、ここでは同期的にawaitしてから閉じる。
+                    handle_incoming.await;
                     endpoint.close(0u32.into(), b"once");
                     break;
                 }
+                tokio::spawn(handle_incoming);
             }
         }
     }
