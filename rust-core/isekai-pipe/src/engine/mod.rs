@@ -33,8 +33,8 @@ const DEFAULT_RESUME_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 /// ため、小さめの値にして DoS/リソース枯渇対策を優先する。
 const DEFAULT_MAX_SESSIONS: usize = 16;
 
-const EXPORTER_LABEL: &[u8] = b"isekai-helper-auth-v1";
-const ALPN: &[u8] = b"isekai-helper/1";
+const EXPORTER_LABEL: &[u8] = b"isekai-pipe-auth-v1";
+const ALPN: &[u8] = b"isekai-pipe/1";
 
 const FRAME_HELLO: u8 = 0x01;
 const FRAME_ACK: u8 = 0x02;
@@ -91,10 +91,10 @@ fn next_val(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 }
 
 fn print_help() {
-    println!("isekai-helper - authenticated QUIC-to-TCP relay (see HELPER_PROTOCOL.md)");
+    println!("isekai-pipe serve - authenticated QUIC-to-TCP relay (see ISEKAI_PIPE_DESIGN.md)");
     println!();
     println!("USAGE:");
-    println!("    isekai-helper [OPTIONS]");
+    println!("    isekai-pipe serve [OPTIONS]");
     println!();
     println!("OPTIONS:");
     println!("    --target <ADDR:PORT>          relay destination (default: 127.0.0.1:22)");
@@ -230,7 +230,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--once" => once = true,
             "--log-level" => log_level = next_val(&mut iter, "--log-level")?,
             "--version" => {
-                println!("isekai-helper {}", env!("CARGO_PKG_VERSION"));
+                println!("isekai-pipe {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "-h" | "--help" => {
@@ -359,7 +359,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
 
     // 起動のたびに ephemeral な自己署名証明書を生成する（永続化しない）。
     let CertifiedKey { cert, key_pair } =
-        generate_simple_self_signed(vec!["isekai-helper.local".to_string()])?;
+        generate_simple_self_signed(vec!["isekai-pipe.local".to_string()])?;
     let cert_der = cert.der().clone();
     let cert_sha256 = {
         let mut hasher = Sha256::new();
@@ -491,14 +491,10 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
     // 起動ハンドシェイク JSON を stdout に1行だけ出力し、明示的に flush する。
     let handshake = serde_json::json!({
         "v": 1,
-        "listen_port": listen_port,
-        "cert_sha256": cert_sha256,
         "session_secret": session_secret_b64,
-        "stun_observed_addr": stun_observed_addr_json,
-        "relay_public_addr": relay_public_addr_json,
         "protocol": {
             "name": "isekai-pipe",
-            "alpn": "isekai-helper/1",
+            "alpn": "isekai-pipe/1",
         },
         "peer": {
             "server_identity": {
@@ -600,6 +596,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                 let last_activity = last_activity.clone();
                 let sessions = sessions.clone();
                 let resume_buffer_size = args.resume_buffer_size;
+                let max_resume_grace_secs = args.resume_window;
                 tokio::spawn(async move {
                     match incoming.await {
                         Ok(conn) => {
@@ -610,7 +607,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                                 .path(noq::PathId::ZERO)
                                 .and_then(|p| p.remote_address().ok());
                             log::info!("QUIC connection established from {remote:?}");
-                            if let Err(e) = handle_connection(conn, target, secret, active, sessions, resume_buffer_size).await {
+                            if let Err(e) = handle_connection(conn, target, secret, active, sessions, resume_buffer_size, max_resume_grace_secs).await {
                                 log::warn!("connection from {remote:?} ended: {e:#}");
                             }
                         }
@@ -637,6 +634,7 @@ async fn handle_connection(
     active: Arc<AtomicBool>,
     sessions: SessionTable,
     resume_buffer_size: usize,
+    max_resume_grace_secs: u64,
 ) -> Result<()> {
     // 最初の1バイトでフレーム種別（HELLO=新規 / RESUME=reattach）を判定してから、
     // 種別に応じた残りバイト数を読む。いずれも一定時間内に届かなければ
@@ -649,7 +647,7 @@ async fn handle_connection(
             .await
             .context("failed to read frame type")?;
         let rest_len = match type_byte[0] {
-            FRAME_HELLO => 32,    // proof
+            FRAME_HELLO => 36,    // proof(32) + requested_resume_grace_secs(4)
             resume::RESUME => 64, // session_id(16) + proof(32) + offset(8) + offset(8)
             _ => 0,
         };
@@ -666,7 +664,7 @@ async fn handle_connection(
 
     match frame_type {
         FRAME_HELLO => {
-            let mut hello = [0u8; 33];
+            let mut hello = [0u8; 37];
             hello[0] = FRAME_HELLO;
             hello[1..].copy_from_slice(&rest);
             handle_stream(
@@ -679,6 +677,7 @@ async fn handle_connection(
                 active,
                 sessions,
                 resume_buffer_size,
+                max_resume_grace_secs,
             )
             .await
         }
@@ -720,12 +719,13 @@ async fn handle_stream(
     conn: noq::Connection,
     mut send: noq::SendStream,
     recv: noq::RecvStream,
-    hello: [u8; 33],
+    hello: [u8; 37],
     target: SocketAddr,
     session_secret: [u8; 32],
     active: Arc<AtomicBool>,
     sessions: SessionTable,
     resume_buffer_size: usize,
+    max_resume_grace_secs: u64,
 ) -> Result<()> {
     if hello[0] != FRAME_HELLO {
         reject(&mut send, FRAME_REJECT_UNSUPPORTED).await;
@@ -738,6 +738,14 @@ async fn handle_stream(
         reject(&mut send, FRAME_REJECT_AUTH).await;
         return Err(anyhow!("proof mismatch, rejecting"));
     }
+
+    // クライアントが希望する resume-grace 期間（0 = 希望なし）。この値を
+    // そのまま信用してsession保持時間(≒リソース消費)を決めるのではなく、
+    // このサーバー自身の `--resume-window`（`max_resume_grace_secs`）で
+    // clampした上でACKに実効値を返す（ISEKAI_PIPE_DESIGN.md — client任せに
+    // しない設計）。
+    let requested_resume_grace_secs = u32::from_be_bytes(hello[33..37].try_into().unwrap());
+    let effective_resume_grace_secs = effective_resume_grace(requested_resume_grace_secs, max_resume_grace_secs);
 
     // 同時アクティブ接続は1本まで。target への TCP 接続成功直後に slot を確保する
     // （HELPER_PROTOCOL.md「ハンドシェイクの処理順序」参照）。
@@ -758,6 +766,7 @@ async fn handle_stream(
         session_secret,
         &sessions,
         resume_buffer_size,
+        effective_resume_grace_secs,
     )
     .await;
     active.store(false, Ordering::SeqCst);
@@ -926,6 +935,21 @@ async fn repark(
     session.parked_since = Some(std::time::Instant::now());
 }
 
+/// クライアントが`HELLO`で希望したresume-grace期間を、このサーバー自身の
+/// `--resume-window`(`max_resume_grace_secs`、実際にsessionをparkし続ける上限)で
+/// clampする。`requested == 0`は「希望なし」を意味し、その場合はこのサーバーの
+/// 上限をそのまま実効値として使う——クライアント側の設定だけでサーバー上の
+/// session保持時間(≒リソース消費)を際限なく増やせる設計にしないための境界
+/// (ISEKAI_PIPE_DESIGN.md)。
+fn effective_resume_grace(requested_resume_grace_secs: u32, max_resume_grace_secs: u64) -> u32 {
+    let max = u32::try_from(max_resume_grace_secs).unwrap_or(u32::MAX);
+    if requested_resume_grace_secs == 0 {
+        max
+    } else {
+        requested_resume_grace_secs.min(max)
+    }
+}
+
 /// `session_secret` と QUIC connection の exporter から proof を計算する
 /// （data stream HELLO と control stream CONTROL_HELLO で共通のロジック）。
 fn compute_proof(
@@ -992,6 +1016,7 @@ async fn relay_with_resume(
     session_secret: [u8; 32],
     sessions: &SessionTable,
     resume_buffer_size: usize,
+    effective_resume_grace_secs: u32,
 ) -> Result<()> {
     let tcp = match TcpStream::connect(target).await {
         Ok(s) => s,
@@ -1000,7 +1025,10 @@ async fn relay_with_resume(
             return Err(anyhow!("connect to {target} failed: {e}"));
         }
     };
-    send.write_all(&[FRAME_ACK]).await?;
+    let mut ack = Vec::with_capacity(5);
+    ack.push(FRAME_ACK);
+    ack.extend_from_slice(&effective_resume_grace_secs.to_be_bytes());
+    send.write_all(&ack).await?;
     let (tcp_read, tcp_write) = tcp.into_split();
 
     let handle = Arc::new(Mutex::new(Session::new(resume_buffer_size)));

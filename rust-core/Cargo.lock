@@ -1375,29 +1375,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "isekai-helper"
-version = "0.3.4"
-dependencies = [
- "anyhow",
- "base64",
- "env_logger",
- "hmac",
- "isekai-link-masque",
- "isekai-stun",
- "log",
- "noq",
- "quinn",
- "rand 0.8.6",
- "rcgen 0.13.2",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tokio",
-]
-
-[[package]]
 name = "isekai-link-masque"
 version = "0.1.0"
 dependencies = [
@@ -1421,10 +1398,25 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
- "isekai-helper",
+ "env_logger",
+ "hmac",
+ "isekai-link-masque",
  "isekai-pipe-core",
+ "isekai-protocol",
+ "isekai-stun",
  "isekai-transport",
  "isekai-trust",
+ "log",
+ "noq",
+ "quinn",
+ "rand 0.8.6",
+ "rcgen 0.13.2",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
  "tokio",
 ]
 
@@ -1433,6 +1425,7 @@ name = "isekai-pipe-core"
 version = "0.1.0"
 dependencies = [
  "isekai-pipe-protocol",
+ "isekai-trust",
  "rand 0.8.6",
  "serde",
  "serde_json",
@@ -1466,7 +1459,6 @@ dependencies = [
  "isekai-bootstrap",
  "isekai-pipe-core",
  "isekai-protocol",
- "isekai-transport",
  "isekai-trust",
  "log",
  "russh",
@@ -1527,6 +1519,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "hmac",
+ "isekai-pipe-core",
  "isekai-protocol",
  "isekai-stun",
  "log",

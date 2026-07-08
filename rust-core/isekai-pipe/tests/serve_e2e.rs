@@ -1,9 +1,11 @@
-//! isekai-helper の E2E テスト。
+//! `isekai-pipe serve` の E2E テスト(旧 isekai-helper crate から移設、
+//! `archive/ISEKAI_PIPE_MIGRATION.md` P5「isekai-pipe serveの独立実装化」)。
 //!
-//! コンパイル済みの isekai-helper バイナリをサブプロセスとして起動し、
-//! ローカル TCP エコーサーバーを --target にして、実際に QUIC 経由で
+//! コンパイル済みの isekai-pipe バイナリを `serve` サブコマンドでサブプロセスとして
+//! 起動し、ローカル TCP エコーサーバーを --target にして、実際に QUIC 経由で
 //! HELLO/ACK ハンドシェイクと双方向リレーが機能することを確認する。
-//! 契約の詳細は /HELPER_PROTOCOL.md を参照。
+//! 契約の詳細は /HELPER_PROTOCOL.md を参照。エンジン本体は
+//! `isekai-pipe/src/engine/`(旧 `isekai-helper/src/lib.rs`)。
 
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
@@ -22,8 +24,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 type HmacSha256 = Hmac<Sha256>;
-const EXPORTER_LABEL: &[u8] = b"isekai-helper-auth-v1";
-const ALPN: &[u8] = b"isekai-helper/1";
+const EXPORTER_LABEL: &[u8] = b"isekai-pipe-auth-v1";
+const ALPN: &[u8] = b"isekai-pipe/1";
 const FRAME_HELLO: u8 = 0x01;
 const FRAME_ACK: u8 = 0x02;
 const FRAME_REJECT_AUTH: u8 = 0xFF;
@@ -34,16 +36,82 @@ const RESUME: u8 = 0x03;
 const RESUME_ACK: u8 = 0x13;
 const REJECT_UNKNOWN_SESSION: u8 = 0xF9;
 const REJECT_OFFSET_GONE: u8 = 0xF8;
+/// Size of the `requested_resume_grace_secs`/`effective_resume_grace_secs`
+/// trailer on `HELLO`/`ACK` (`isekai_protocol::hello::RESUME_GRACE_LEN`).
+const RESUME_GRACE_LEN: usize = 4;
+
+/// Builds a `HELLO` frame requesting no particular resume-grace preference
+/// (`0`) — none of these tests exercise the negotiated value itself, they
+/// only need a wire-correct frame so the server's fixed-size read doesn't
+/// block waiting for bytes that never arrive.
+fn hello_frame(proof: &[u8; 32]) -> Vec<u8> {
+    let mut hello = vec![FRAME_HELLO];
+    hello.extend_from_slice(proof);
+    hello.extend_from_slice(&0u32.to_be_bytes());
+    hello
+}
+
+/// Reads a full `ACK` frame and returns its type byte: the type byte first,
+/// then — only for `FRAME_ACK` — `RESUME_GRACE_LEN` more bytes, mirroring
+/// `isekai_protocol::hello::decode_ack_response`'s framing. Reject variants
+/// stay a bare single byte.
+async fn read_ack_type_byte(recv: &mut quinn::RecvStream) -> u8 {
+    let mut type_byte = [0u8; 1];
+    recv.read_exact(&mut type_byte).await.unwrap();
+    if type_byte[0] == FRAME_ACK {
+        let mut rest = [0u8; RESUME_GRACE_LEN];
+        recv.read_exact(&mut rest).await.unwrap();
+    }
+    type_byte[0]
+}
 
 #[derive(Debug, Deserialize)]
 struct Handshake {
     #[allow(dead_code)]
     v: u32,
-    listen_port: u16,
-    cert_sha256: String,
     session_secret: String,
+    peer: HandshakePeer,
     #[serde(default)]
-    stun_observed_addr: Option<String>,
+    candidates: Vec<HandshakeCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HandshakePeer {
+    server_identity: HandshakeServerIdentity,
+}
+
+#[derive(Debug, Deserialize)]
+struct HandshakeServerIdentity {
+    cert_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HandshakeCandidate {
+    kind: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+}
+
+impl Handshake {
+    fn cert_sha256(&self) -> &str {
+        &self.peer.server_identity.cert_sha256
+    }
+
+    fn direct_by_bootstrap_host_port(&self) -> Option<u16> {
+        self.candidates
+            .iter()
+            .find(|candidate| candidate.kind == "direct-by-bootstrap-host")
+            .and_then(|candidate| candidate.port)
+    }
+
+    fn stun_observed_addr(&self) -> Option<&str> {
+        self.candidates
+            .iter()
+            .find(|candidate| candidate.kind == "server-reflexive")
+            .and_then(|candidate| candidate.endpoint.as_deref())
+    }
 }
 
 #[derive(Debug)]
@@ -105,19 +173,13 @@ impl Drop for HelperProcess {
 }
 
 fn helper_bin_path() -> std::path::PathBuf {
-    // `cargo test` はテストバイナリと同じ target/{debug,release} に isekai-helper も置く
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // テストバイナリ自身を除く
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push("isekai-helper");
-    path
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_isekai-pipe"))
 }
 
 fn spawn_helper(target: SocketAddr, extra_args: &[&str]) -> HelperProcess {
     let mut cmd = Command::new(helper_bin_path());
-    cmd.arg("--target")
+    cmd.arg("serve")
+        .arg("--target")
         .arg(target.to_string())
         .arg("--bind")
         .arg("127.0.0.1:0")
@@ -214,25 +276,22 @@ async fn hello_ack_and_relay_roundtrip() {
         .decode(&helper.handshake.session_secret)
         .unwrap();
 
-    let endpoint = make_client_endpoint(&helper.handshake.cert_sha256);
-    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.listen_port)
+    let endpoint = make_client_endpoint(helper.handshake.cert_sha256());
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
         .parse()
         .unwrap();
     let conn = endpoint
-        .connect(server_addr, "isekai-helper.local")
+        .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .expect("QUIC handshake failed");
 
     let proof = compute_proof(&conn, &session_secret);
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let mut hello = vec![FRAME_HELLO];
-    hello.extend_from_slice(&proof);
-    send.write_all(&hello).await.unwrap();
+    send.write_all(&hello_frame(&proof)).await.unwrap();
 
-    let mut resp = [0u8; 1];
-    recv.read_exact(&mut resp).await.unwrap();
-    assert_eq!(resp[0], FRAME_ACK, "expected ACK");
+    let resp = read_ack_type_byte(&mut recv).await;
+    assert_eq!(resp, FRAME_ACK, "expected ACK");
 
     let payload = b"hello-isekai-helper-e2e-test";
     send.write_all(payload).await.unwrap();
@@ -251,12 +310,12 @@ async fn wrong_proof_is_rejected_before_connection_closes() {
     let echo_addr = spawn_echo_server().await;
     let helper = spawn_helper(echo_addr, &[]);
 
-    let endpoint = make_client_endpoint(&helper.handshake.cert_sha256);
-    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.listen_port)
+    let endpoint = make_client_endpoint(helper.handshake.cert_sha256());
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
         .parse()
         .unwrap();
     let conn = endpoint
-        .connect(server_addr, "isekai-helper.local")
+        .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .expect("QUIC handshake failed");
@@ -264,9 +323,7 @@ async fn wrong_proof_is_rejected_before_connection_closes() {
     let bogus_secret = [0xAAu8; 32];
     let proof = compute_proof(&conn, &bogus_secret);
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let mut hello = vec![FRAME_HELLO];
-    hello.extend_from_slice(&proof);
-    send.write_all(&hello).await.unwrap();
+    send.write_all(&hello_frame(&proof)).await.unwrap();
 
     let mut resp = [0u8; 1];
     tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut resp))
@@ -283,38 +340,33 @@ async fn duplicate_connection_is_rejected() {
     let session_secret = base64::engine::general_purpose::STANDARD
         .decode(&helper.handshake.session_secret)
         .unwrap();
-    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.listen_port)
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
         .parse()
         .unwrap();
 
     // 1本目: ACK まで進めて能動的にリレー状態にする
-    let endpoint1 = make_client_endpoint(&helper.handshake.cert_sha256);
+    let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn1 = endpoint1
-        .connect(server_addr, "isekai-helper.local")
+        .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .unwrap();
     let proof1 = compute_proof(&conn1, &session_secret);
     let (mut send1, mut recv1) = conn1.open_bi().await.unwrap();
-    let mut hello1 = vec![FRAME_HELLO];
-    hello1.extend_from_slice(&proof1);
-    send1.write_all(&hello1).await.unwrap();
-    let mut resp1 = [0u8; 1];
-    recv1.read_exact(&mut resp1).await.unwrap();
-    assert_eq!(resp1[0], FRAME_ACK);
+    send1.write_all(&hello_frame(&proof1)).await.unwrap();
+    let resp1 = read_ack_type_byte(&mut recv1).await;
+    assert_eq!(resp1, FRAME_ACK);
 
     // 2本目: 同じ session_secret で proof は正しいが、1本目がまだアクティブなので拒否される
-    let endpoint2 = make_client_endpoint(&helper.handshake.cert_sha256);
+    let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn2 = endpoint2
-        .connect(server_addr, "isekai-helper.local")
+        .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .unwrap();
     let proof2 = compute_proof(&conn2, &session_secret);
     let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
-    let mut hello2 = vec![FRAME_HELLO];
-    hello2.extend_from_slice(&proof2);
-    send2.write_all(&hello2).await.unwrap();
+    send2.write_all(&hello_frame(&proof2)).await.unwrap();
     let mut resp2 = [0u8; 1];
     tokio::time::timeout(Duration::from_secs(5), recv2.read_exact(&mut resp2))
         .await
@@ -333,26 +385,23 @@ async fn resume_after_connection_loss_replays_and_continues() {
     let session_secret = base64::engine::general_purpose::STANDARD
         .decode(&helper.handshake.session_secret)
         .unwrap();
-    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.listen_port)
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
         .parse()
         .unwrap();
 
     // 1本目の connection: HELLO/ACK + control stream で session_id を取得し、
     // データを1往復させる（このバイト列を後で「未確認のまま失われた」ことにする）。
-    let endpoint1 = make_client_endpoint(&helper.handshake.cert_sha256);
+    let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn1 = endpoint1
-        .connect(server_addr, "isekai-helper.local")
+        .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .unwrap();
     let proof1 = compute_proof(&conn1, &session_secret);
     let (mut send1, mut recv1) = conn1.open_bi().await.unwrap();
-    let mut hello1 = vec![FRAME_HELLO];
-    hello1.extend_from_slice(&proof1);
-    send1.write_all(&hello1).await.unwrap();
-    let mut ack1 = [0u8; 1];
-    recv1.read_exact(&mut ack1).await.unwrap();
-    assert_eq!(ack1[0], FRAME_ACK);
+    send1.write_all(&hello_frame(&proof1)).await.unwrap();
+    let ack1 = read_ack_type_byte(&mut recv1).await;
+    assert_eq!(ack1, FRAME_ACK);
 
     let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
     let mut chello1 = vec![CONTROL_HELLO];
@@ -384,9 +433,9 @@ async fn resume_after_connection_loss_replays_and_continues() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // 2本目の connection: 新しい QUIC connection から RESUME で reattach する。
-    let endpoint2 = make_client_endpoint(&helper.handshake.cert_sha256);
+    let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn2 = endpoint2
-        .connect(server_addr, "isekai-helper.local")
+        .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .expect("second QUIC handshake failed");
@@ -451,13 +500,13 @@ async fn resume_with_unknown_session_id_is_rejected() {
     let session_secret = base64::engine::general_purpose::STANDARD
         .decode(&helper.handshake.session_secret)
         .unwrap();
-    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.listen_port)
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
         .parse()
         .unwrap();
 
-    let endpoint = make_client_endpoint(&helper.handshake.cert_sha256);
+    let endpoint = make_client_endpoint(helper.handshake.cert_sha256());
     let conn = endpoint
-        .connect(server_addr, "isekai-helper.local")
+        .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .expect("QUIC handshake failed");
@@ -500,25 +549,22 @@ async fn resume_with_offset_beyond_buffer_is_rejected() {
     let session_secret = base64::engine::general_purpose::STANDARD
         .decode(&helper.handshake.session_secret)
         .unwrap();
-    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.listen_port)
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
         .parse()
         .unwrap();
 
     // 1本目: HELLO/ACK + control stream で本物の session_id を取得する。
-    let endpoint1 = make_client_endpoint(&helper.handshake.cert_sha256);
+    let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn1 = endpoint1
-        .connect(server_addr, "isekai-helper.local")
+        .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .unwrap();
     let proof1 = compute_proof(&conn1, &session_secret);
     let (mut send1, mut recv1) = conn1.open_bi().await.unwrap();
-    let mut hello1 = vec![FRAME_HELLO];
-    hello1.extend_from_slice(&proof1);
-    send1.write_all(&hello1).await.unwrap();
-    let mut ack1 = [0u8; 1];
-    recv1.read_exact(&mut ack1).await.unwrap();
-    assert_eq!(ack1[0], FRAME_ACK);
+    send1.write_all(&hello_frame(&proof1)).await.unwrap();
+    let ack1 = read_ack_type_byte(&mut recv1).await;
+    assert_eq!(ack1, FRAME_ACK);
 
     let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
     let mut chello1 = vec![CONTROL_HELLO];
@@ -551,9 +597,9 @@ async fn resume_with_offset_beyond_buffer_is_rejected() {
 
     // 2本目: 実際に送出済みのバイト数（= end_offset）をはるかに超える
     // client_delivered_offset を主張して reattach を試みる。
-    let endpoint2 = make_client_endpoint(&helper.handshake.cert_sha256);
+    let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn2 = endpoint2
-        .connect(server_addr, "isekai-helper.local")
+        .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .expect("second QUIC handshake failed");
@@ -596,24 +642,21 @@ async fn resume_after_park_expiry_is_rejected_as_unknown_session() {
     let session_secret = base64::engine::general_purpose::STANDARD
         .decode(&helper.handshake.session_secret)
         .unwrap();
-    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.listen_port)
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
         .parse()
         .unwrap();
 
-    let endpoint1 = make_client_endpoint(&helper.handshake.cert_sha256);
+    let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn1 = endpoint1
-        .connect(server_addr, "isekai-helper.local")
+        .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .unwrap();
     let proof1 = compute_proof(&conn1, &session_secret);
     let (mut send1, mut recv1) = conn1.open_bi().await.unwrap();
-    let mut hello1 = vec![FRAME_HELLO];
-    hello1.extend_from_slice(&proof1);
-    send1.write_all(&hello1).await.unwrap();
-    let mut ack1 = [0u8; 1];
-    recv1.read_exact(&mut ack1).await.unwrap();
-    assert_eq!(ack1[0], FRAME_ACK);
+    send1.write_all(&hello_frame(&proof1)).await.unwrap();
+    let ack1 = read_ack_type_byte(&mut recv1).await;
+    assert_eq!(ack1, FRAME_ACK);
 
     let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
     let mut chello1 = vec![CONTROL_HELLO];
@@ -638,9 +681,9 @@ async fn resume_after_park_expiry_is_rejected_as_unknown_session() {
     // sweep 間隔(5秒) + resume-window(2秒) を十分に超えるまで待つ。
     tokio::time::sleep(Duration::from_secs(9)).await;
 
-    let endpoint2 = make_client_endpoint(&helper.handshake.cert_sha256);
+    let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn2 = endpoint2
-        .connect(server_addr, "isekai-helper.local")
+        .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .expect("second QUIC handshake failed");
@@ -732,25 +775,24 @@ async fn stun_server_flag_populates_observed_address_in_handshake() {
 
     let observed: SocketAddr = helper
         .handshake
-        .stun_observed_addr
-        .as_deref()
+        .stun_observed_addr()
         .expect("stun_observed_addr should be populated when --stun-server is given")
         .parse()
         .expect("stun_observed_addr should be a valid socket address");
 
     // ループバック経由なのでNATによるアドレス変換は起きない。STUNサーバーから見えた
-    // ポートは、実際にQUICが待ち受けているポート(handshake.listen_port)と一致する
+    // ポートは、実際にQUICが待ち受けているポート(handshake.direct_by_bootstrap_host_port())と一致する
     // はず——これは「STUN問い合わせとQUIC待受が本当に同じソケットを共有している」
     // ことの直接的な証拠になる。
     assert_eq!(observed.ip(), std::net::Ipv4Addr::LOCALHOST);
-    assert_eq!(observed.port(), helper.handshake.listen_port);
+    assert_eq!(observed.port(), helper.handshake.direct_by_bootstrap_host_port().unwrap());
 }
 
 #[tokio::test]
 async fn without_stun_server_flag_handshake_has_no_observed_address() {
     let echo_addr = spawn_echo_server().await;
     let helper = spawn_helper(echo_addr, &[]);
-    assert!(helper.handshake.stun_observed_addr.is_none());
+    assert!(helper.handshake.stun_observed_addr().is_none());
 }
 
 #[tokio::test]
@@ -765,13 +807,13 @@ async fn punch_peer_flag_does_not_prevent_normal_startup_or_relay() {
         echo_addr,
         &["--stun-server", &stun_server.to_string(), "--punch-peer", &dummy_peer],
     );
-    assert!(helper.handshake.stun_observed_addr.is_some());
+    assert!(helper.handshake.stun_observed_addr().is_some());
 
-    let client_endpoint = make_client_endpoint(&helper.handshake.cert_sha256);
+    let client_endpoint = make_client_endpoint(helper.handshake.cert_sha256());
     let conn = client_endpoint
         .connect(
-            SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), helper.handshake.listen_port),
-            "isekai-helper.local",
+            SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), helper.handshake.direct_by_bootstrap_host_port().unwrap()),
+            "isekai-pipe.local",
         )
         .unwrap()
         .await
@@ -782,14 +824,10 @@ async fn punch_peer_flag_does_not_prevent_normal_startup_or_relay() {
         .unwrap();
     let proof = compute_proof(&conn, &session_secret);
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let mut hello = vec![FRAME_HELLO];
-    hello.extend_from_slice(&proof);
-    send.write_all(&hello).await.unwrap();
+    send.write_all(&hello_frame(&proof)).await.unwrap();
 
-    let mut ack = [0u8; 1];
-    tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut ack))
+    let ack = tokio::time::timeout(Duration::from_secs(5), read_ack_type_byte(&mut recv))
         .await
-        .expect("timed out waiting for ACK")
-        .unwrap();
-    assert_eq!(ack[0], FRAME_ACK);
+        .expect("timed out waiting for ACK");
+    assert_eq!(ack, FRAME_ACK);
 }

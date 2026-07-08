@@ -19,7 +19,7 @@ pub type SessionId = [u8; 16];
 
 /// S→C 方向（helper → client）に送出したバイト列を保持するバウンデッドバッファ。
 /// `start_offset` は `data` の先頭バイトの絶対オフセット、`end_offset` は
-/// 送出済みバイト数の累計（= `HELPER_PROTOCOL.md` の `helper_sent_offset`）。
+/// 送出済みバイト数の累計（= `archive/HELPER_PROTOCOL.md` の `helper_sent_offset`）。
 pub struct OutputBuffer {
     data: VecDeque<u8>,
     start_offset: u64,
