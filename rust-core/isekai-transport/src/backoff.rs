@@ -1,4 +1,4 @@
-//! Pure reconnect backoff calculation (`ISEKAI_SSH_DESIGN.md` phase S-0d-2,
+//! Pure reconnect backoff calculation (`archive/ISEKAI_SSH_DESIGN.md` phase S-0d-2,
 //! "`BackoffPolicy`（純粋関数、過剰な抽象化をしない）"). This module
 //! deliberately does *not* introduce a `Clock` abstraction or drive an actual
 //! reconnect loop — that lands in S-4 once `isekai-ssh`/resume needs it. All

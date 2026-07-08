@@ -1,5 +1,5 @@
 //! Errors surfaced by `isekai-transport`'s connection-establishment and
-//! relay-handshake logic (`ISEKAI_SSH_DESIGN.md` phase S-0d-1).
+//! relay-handshake logic (`archive/ISEKAI_SSH_DESIGN.md` phase S-0d-1).
 
 use isekai_protocol::hello::AckResponse;
 use isekai_protocol::resume::ResumeRejectReason;
@@ -35,7 +35,7 @@ pub enum TransportError {
     ExportKeyingMaterial(String),
 
     /// isekai-helper responded to `HELLO` with something other than `ACK`
-    /// (`HELPER_PROTOCOL.md` §4).
+    /// (`archive/HELPER_PROTOCOL.md` §4).
     #[error("isekai-helper rejected the connection: {0:?}")]
     Rejected(AckResponse),
 
@@ -61,12 +61,12 @@ pub enum TransportError {
     SocketSetup(String),
 
     /// The control stream handshake (`CONTROL_HELLO`/`CONTROL_ACK`,
-    /// `HELPER_PROTOCOL.md` §7.3) got a response byte other than
+    /// `archive/HELPER_PROTOCOL.md` §7.3) got a response byte other than
     /// `CONTROL_ACK` (`resume::open_control_stream`).
     #[error("isekai-helper control stream handshake failed: {0}")]
     ControlHandshake(String),
 
-    /// isekai-helper rejected a `RESUME` request (`HELPER_PROTOCOL.md` §7.3
+    /// isekai-helper rejected a `RESUME` request (`archive/HELPER_PROTOCOL.md` §7.3
     /// "RESUME の拒否応答"). `UnknownSession`/`OffsetGone` both mean resume is
     /// not possible for this `session_id` any more — the caller must fall
     /// back to a fresh (non-resuming) connection.

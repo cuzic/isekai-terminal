@@ -1,7 +1,7 @@
 //! HELLO/RESUME proof computation, extracted from
-//! `helper_quic_transport.rs::compute_proof` and generalized to work behind
+//! `isekai_pipe_quic_transport.rs::compute_proof` and generalized to work behind
 //! the `QuicConnection` trait instead of a concrete `noq::Connection`
-//! (`ISEKAI_SSH_DESIGN.md` "実装方針").
+//! (`archive/ISEKAI_SSH_DESIGN.md` "実装方針").
 
 use hmac::{Hmac, Mac};
 use isekai_protocol::hello::{Proof, EXPORTER_LABEL, PROOF_LEN};
@@ -13,11 +13,11 @@ use crate::traits::QuicConnection;
 type HmacSha256 = Hmac<Sha256>;
 
 /// `proof = HMAC-SHA256(session_secret, exporter [|| extra])`
-/// (`HELPER_PROTOCOL.md` §4, `helper_quic_transport.rs::compute_proof`).
+/// (`archive/HELPER_PROTOCOL.md` §4, `isekai_pipe_quic_transport.rs::compute_proof`).
 ///
 /// `extra` is empty for the initial HELLO. A non-empty `extra` (the
 /// `session_id` bytes) is how a future `RESUME` frame's proof would be
-/// computed — not implemented by this crate yet (`ISEKAI_SSH_DESIGN.md`
+/// computed — not implemented by this crate yet (`archive/ISEKAI_SSH_DESIGN.md`
 /// phase S-4a), but this function already supports it so that phase doesn't
 /// need to duplicate the HMAC logic.
 pub async fn compute_proof(

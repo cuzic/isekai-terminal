@@ -1,4 +1,4 @@
-//! `APP_ACK` background exchange (`HELPER_PROTOCOL.md` §7.4): the
+//! `APP_ACK` background exchange (`archive/HELPER_PROTOCOL.md` §7.4): the
 //! thread-safe counters bridge (`AppAckCounters`) between `isekai-ssh`'s C2H/
 //! H2C offset bookkeeping and the two background tasks
 //! (`spawn_app_ack_tasks`) that actually put `APP_ACK` frames on the wire.
@@ -18,7 +18,7 @@ use super::APP_ACK;
 const APP_ACK_FRAME_LEN: usize = 1 + 8;
 
 /// How often the `APP_ACK` sender loop wakes up to check whether its side's
-/// offset has advanced since the last send (`HELPER_PROTOCOL.md` §7.4: "64KiB
+/// offset has advanced since the last send (`archive/HELPER_PROTOCOL.md` §7.4: "64KiB
 /// 受信ごと、または200msごとのどちらか早い方" — this module only implements the
 /// time-based half, matching `resume_client.rs`/`isekai-helper/src/main.rs`'s
 /// own `spawn_app_ack_tasks`, which also only implements the 200ms timer).
@@ -27,7 +27,7 @@ const APP_ACK_INTERVAL: Duration = Duration::from_millis(200);
 /// Shared, thread-safe bridge between `isekai-ssh`'s C2H/H2C offset
 /// bookkeeping and this module's `APP_ACK` send/receive loops
 /// (`spawn_app_ack_tasks`). `isekai-ssh` owns the actual replay buffer and
-/// stdout-delivery bookkeeping (`ISEKAI_SSH_DESIGN.md`'s task split: replay
+/// stdout-delivery bookkeeping (`archive/ISEKAI_SSH_DESIGN.md`'s task split: replay
 /// buffer/backpressure are `isekai-ssh`'s job, control-stream/`APP_ACK`
 /// wire-level exchange is `isekai-transport`'s) — this type is the seam
 /// between them, plain atomics rather than a callback/closure so both sides
@@ -35,11 +35,11 @@ const APP_ACK_INTERVAL: Duration = Duration::from_millis(200);
 ///
 /// - `h2c_client_delivered_offset`: written by `isekai-ssh`'s H2C pump loop
 ///   every time it successfully `write_all`s to its own stdout (the H2C
-///   "delivered" source of truth, `ISEKAI_SSH_DESIGN.md`); read by this
+///   "delivered" source of truth, `archive/ISEKAI_SSH_DESIGN.md`); read by this
 ///   module's `APP_ACK` sender loop, and also by `isekai-ssh` itself when
 ///   building a `RESUME` frame's `client_delivered_offset` after a
 ///   disconnect (this is exactly the "pending ACK, held locally while
-///   disconnected" value `ISEKAI_SSH_DESIGN.md`'s H2C-delivered-boundary
+///   disconnected" value `archive/ISEKAI_SSH_DESIGN.md`'s H2C-delivered-boundary
 ///   note describes).
 /// - `c2h_helper_committed_offset`: written by this module's `APP_ACK`
 ///   receiver loop whenever isekai-helper reports progress; read by
@@ -96,8 +96,8 @@ impl AppAckTasks {
     }
 }
 
-/// Spawns the two `APP_ACK` background tasks (`HELPER_PROTOCOL.md` §7.4) on
-/// `control_stream`, matching `helper_quic_transport.rs::spawn_app_ack_tasks`
+/// Spawns the two `APP_ACK` background tasks (`archive/HELPER_PROTOCOL.md` §7.4) on
+/// `control_stream`, matching `isekai_pipe_quic_transport.rs::spawn_app_ack_tasks`
 /// byte-for-byte on the wire:
 ///
 /// - send loop: every `APP_ACK_INTERVAL`, if `counters`'s
@@ -253,7 +253,7 @@ mod tests {
         // The client's send loop should have told the helper "I've delivered
         // 42 bytes of H2C", landing in the helper's own
         // `c2h_helper_committed_offset` field... wait, no: APP_ACK's meaning
-        // is direction-dependent (`HELPER_PROTOCOL.md` §7.3) — from the
+        // is direction-dependent (`archive/HELPER_PROTOCOL.md` §7.3) — from the
         // client, the payload is `client_delivered_offset` (H2C); from the
         // helper, it's `helper_committed_offset` (C2H). Both sides of this
         // test use the *same* `AppAckCounters` shape/receive loop, so what

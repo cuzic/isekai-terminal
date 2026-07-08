@@ -1,5 +1,5 @@
 //! Value types shared by the `QuicEndpointFactory`/`QuicEndpoint` traits
-//! (`ISEKAI_SSH_DESIGN.md` "実装方針" trait design).
+//! (`archive/ISEKAI_SSH_DESIGN.md` "実装方針" trait design).
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -28,7 +28,7 @@ impl BindSpec {
 }
 
 /// Remote endpoint to connect to, plus the certificate-pinning fingerprint
-/// that must be checked instead of a normal CA chain (`HELPER_PROTOCOL.md`
+/// that must be checked instead of a normal CA chain (`archive/HELPER_PROTOCOL.md`
 /// §2/§4: isekai-helper serves an ephemeral self-signed certificate, and its
 /// SHA-256 fingerprint is delivered out-of-band over the bootstrap SSH
 /// channel).

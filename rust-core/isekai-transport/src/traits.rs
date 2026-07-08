@@ -1,5 +1,5 @@
 //! `QuicEndpointFactory` / `QuicEndpoint` / `QuicConnection` / `ByteStream`
-//! traits (`ISEKAI_SSH_DESIGN.md` "実装方針", "`FaultyUdpSocket`（Android専用
+//! traits (`archive/ISEKAI_SSH_DESIGN.md` "実装方針", "`FaultyUdpSocket`（Android専用
 //! フォルト注入ソケット）の扱い" 節).
 //!
 //! These exist so that `isekai-transport`'s relay-connection logic
@@ -11,7 +11,7 @@
 //! boundary — HELLO/proof/ACK protocol logic is layered on top in
 //! `relay.rs`/`proof.rs` using `isekai_protocol`, not baked into these
 //! traits (mirrors the split already proven out by
-//! `helper_quic_transport.rs`'s `establish_quic_connection_with_socket` vs.
+//! `isekai_pipe_quic_transport.rs`'s `establish_quic_connection_with_socket` vs.
 //! the HELLO/ACK code that calls it).
 //!
 //! Async trait methods are made object-safe via `async-trait`, the same
@@ -48,7 +48,7 @@ pub trait QuicConnection: Send + Sync {
     async fn close(&self);
 
     /// Exports keying material from the live TLS session
-    /// (`helper_quic_transport.rs::compute_proof`'s
+    /// (`isekai_pipe_quic_transport.rs::compute_proof`'s
     /// `conn.export_keying_material` call, generalized behind this trait so
     /// `isekai-transport`'s proof computation (`proof.rs`) never touches a
     /// concrete `noq::Connection`). Always returns exactly 32 bytes, which is
@@ -74,7 +74,7 @@ pub trait ByteStream: Send {
     /// caller can drive "read from A, write to this stream" and "read from
     /// this stream, write to B" as two separately `tokio::spawn`ed tasks
     /// without any shared lock between them (`isekai-ssh`'s stdin/stdout
-    /// relay is exactly this — see `ISEKAI_SSH_DESIGN.md`'s note that
+    /// relay is exactly this — see `archive/ISEKAI_SSH_DESIGN.md`'s note that
     /// `tokio::io::copy_bidirectional` doesn't fit because stdin/stdout are
     /// two separate handles, not one duplex object; the QUIC side has the
     /// same "two separate handles" shape once split).
