@@ -10,10 +10,37 @@ use serde::{Deserialize, Serialize};
 
 pub use isekai_pipe_protocol::{LogicalHost, ServiceName};
 
+mod candidate;
+pub use candidate::{
+    Candidate, CandidateClass, CandidateConversionError, CandidateDraft, CandidateDraftBatch,
+    CandidateGeneration, CandidateId, CandidateKey, CandidateOrigin, CandidateOriginKind, CandidatePriority,
+    CandidateRoute, CandidateSnapshot, CandidateValidity, CertificatePinError, CertificatePinSha256,
+    NormalizedServerName, ServerNameError, LEGACY_INTENT_PROVIDER_ID,
+};
+
+mod profile;
+pub use profile::{
+    default_profiles_dir, load_persistent_profile, migrate_trust_store, write_persistent_profile,
+    LegacyRelayTransport, PathHint, PersistentProfile, PERSISTENT_PROFILE_SCHEMA_VERSION,
+};
+
 pub const CONNECTION_INTENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_INTENT_TTL: Duration = Duration::from_secs(120);
 pub const DEFAULT_CANDIDATE_RACE_DELAY_MS: u64 = 150;
 pub const DEFAULT_RELAY_DELAY_MS: u64 = 750;
+/// Requested resume-grace period sent in `HELLO` (`isekai_protocol::hello`),
+/// absent an explicit `#@isekai resume-grace` override — the server clamps
+/// this to its own configured max and echoes back the effective value in
+/// `ACK` (`ISEKAI_PIPE_DESIGN.md`).
+pub const DEFAULT_RESUME_GRACE_SECS: u64 = 120;
+
+/// STUN hole-punch retry counter, distinct from `CandidateGeneration`
+/// (candidate-collection round) and any future connection-attach generation
+/// (`#18`) — newtyped specifically to prevent those three counters from
+/// being confused with one another (`candidate.rs`'s module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PunchGeneration(pub u64);
 
 /// A remote service exposed by `isekai-pipe serve`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +131,13 @@ pub struct ConnectionIntent {
     pub candidate_race_delay_ms: u64,
     #[serde(default = "default_relay_delay_ms")]
     pub relay_delay_ms: u64,
-    pub punch_generation: u64,
+    /// Requested resume-grace period, in seconds, sent to the server as part
+    /// of `HELLO` — the *request*, not the negotiated value (the server
+    /// always has final say via its `ACK`'s effective value). `0` means "no
+    /// preference, use the server's own default/max".
+    #[serde(default = "default_resume_grace_secs")]
+    pub resume_grace_secs: u64,
+    pub punch_generation: PunchGeneration,
     pub created_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
     pub bootstrap_provenance: BootstrapProvenance,
@@ -136,7 +169,8 @@ impl ConnectionIntent {
             relay_policy: RelayPolicy::RelayAllowed,
             candidate_race_delay_ms: DEFAULT_CANDIDATE_RACE_DELAY_MS,
             relay_delay_ms: DEFAULT_RELAY_DELAY_MS,
-            punch_generation: 0,
+            resume_grace_secs: DEFAULT_RESUME_GRACE_SECS,
+            punch_generation: PunchGeneration(0),
             created_at_unix_ms: now,
             expires_at_unix_ms: expires,
             bootstrap_provenance,
@@ -160,6 +194,10 @@ fn default_candidate_race_delay_ms() -> u64 {
 
 fn default_relay_delay_ms() -> u64 {
     DEFAULT_RELAY_DELAY_MS
+}
+
+fn default_resume_grace_secs() -> u64 {
+    DEFAULT_RESUME_GRACE_SECS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
