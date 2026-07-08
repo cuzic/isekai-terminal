@@ -1,9 +1,16 @@
-//! isekai-helper's startup handshake JSON (`HELPER_PROTOCOL.md` §2), mirrored
-//! from `rust-core/src/helper_bootstrap.rs::HelperHandshake`. This module
+//! isekai-helper's startup handshake JSON (`archive/HELPER_PROTOCOL.md` §2), mirrored
+//! from `rust-core/src/helper_bootstrap.rs::IsekaiPipeHandshake`. This module
 //! adds the field-level validation that the original `#[derive(Deserialize)]`
 //! left to callers (length/format of `cert_sha256`/`session_secret`, a size
 //! cap on the JSON itself) since bootstrap code must treat this line as
 //! untrusted input coming back over an SSH exec channel.
+//!
+//! Single schema, no legacy/flat duplicate fields: identity lives under
+//! `peer.server_identity`, and every reachability fact (the direct QUIC
+//! port, a STUN-observed address, a relay-assigned address) is a
+//! `candidates` entry rather than its own top-level field. There is exactly
+//! one representation of each fact to keep in sync (`archive/ISEKAI_PIPE_MIGRATION.md`
+//! P5 "旧名整理").
 
 use serde::{Deserialize, Serialize};
 
@@ -24,17 +31,9 @@ pub const CANDIDATE_RELAYED: &str = "relayed";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandshakeJson {
     pub v: u32,
-    pub listen_port: u16,
-    pub cert_sha256: String,
     pub session_secret: String,
-    #[serde(default)]
-    pub stun_observed_addr: Option<String>,
-    #[serde(default)]
-    pub relay_public_addr: Option<String>,
-    #[serde(default)]
-    pub protocol: Option<HandshakeProtocol>,
-    #[serde(default)]
-    pub peer: Option<HandshakePeer>,
+    pub protocol: HandshakeProtocol,
+    pub peer: HandshakePeer,
     #[serde(default)]
     pub services: Vec<HandshakeService>,
     #[serde(default)]
@@ -86,16 +85,40 @@ pub struct HandshakeCandidate {
 }
 
 impl HandshakeJson {
-    /// Port for the legacy-compatible `direct-by-bootstrap-host` mode.
-    ///
-    /// New helpers advertise this explicitly as a candidate. Old helpers only
-    /// have top-level `listen_port`, so callers keep using that as the fallback.
-    pub fn direct_by_bootstrap_host_port(&self) -> u16 {
+    /// `peer.server_identity.cert_sha256`, the sole source of the QUIC
+    /// certificate fingerprint clients pin against.
+    pub fn cert_sha256(&self) -> &str {
+        &self.peer.server_identity.cert_sha256
+    }
+
+    /// Port for the `direct-by-bootstrap-host` candidate, if advertised.
+    pub fn direct_by_bootstrap_host_port(&self) -> Option<u16> {
+        self.candidate_port(CANDIDATE_DIRECT_BY_BOOTSTRAP_HOST)
+    }
+
+    /// Endpoint for the `server-reflexive` (STUN-observed) candidate, if
+    /// advertised.
+    pub fn stun_observed_addr(&self) -> Option<&str> {
+        self.candidate_endpoint(CANDIDATE_SERVER_REFLEXIVE)
+    }
+
+    /// Endpoint for the `relayed` candidate, if advertised.
+    pub fn relay_public_addr(&self) -> Option<&str> {
+        self.candidate_endpoint(CANDIDATE_RELAYED)
+    }
+
+    fn candidate_port(&self, kind: &str) -> Option<u16> {
         self.candidates
             .iter()
-            .find(|candidate| candidate.kind == CANDIDATE_DIRECT_BY_BOOTSTRAP_HOST)
+            .find(|candidate| candidate.kind == kind)
             .and_then(|candidate| candidate.port)
-            .unwrap_or(self.listen_port)
+    }
+
+    fn candidate_endpoint(&self, kind: &str) -> Option<&str> {
+        self.candidates
+            .iter()
+            .find(|candidate| candidate.kind == kind)
+            .and_then(|candidate| candidate.endpoint.as_deref())
     }
 }
 
@@ -124,13 +147,22 @@ pub fn validate_handshake(h: &HandshakeJson) -> Result<(), ProtocolError> {
         });
     }
 
-    let is_lowercase_hex64 = h.cert_sha256.len() == CERT_SHA256_HEX_LEN
-        && h.cert_sha256
+    validate_non_empty("protocol.name", &h.protocol.name)?;
+    validate_non_empty("protocol.alpn", &h.protocol.alpn)?;
+
+    if let Some(peer_id) = &h.peer.peer_id {
+        validate_non_empty("peer.peer_id", peer_id)?;
+    }
+    validate_non_empty("peer.server_identity.kind", &h.peer.server_identity.kind)?;
+
+    let cert_sha256 = &h.peer.server_identity.cert_sha256;
+    let is_lowercase_hex64 = cert_sha256.len() == CERT_SHA256_HEX_LEN
+        && cert_sha256
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
     if !is_lowercase_hex64 {
         return Err(ProtocolError::HandshakeField {
-            field: "cert_sha256",
+            field: "peer.server_identity.cert_sha256",
             reason: format!("must be {CERT_SHA256_HEX_LEN} lowercase hex characters"),
         });
     }
@@ -152,31 +184,6 @@ pub fn validate_handshake(h: &HandshakeJson) -> Result<(), ProtocolError> {
                 SESSION_SECRET_DECODED_LEN
             ),
         });
-    }
-
-    if h.listen_port == 0 {
-        return Err(ProtocolError::HandshakeField {
-            field: "listen_port",
-            reason: "must be non-zero".to_string(),
-        });
-    }
-
-    if let Some(protocol) = &h.protocol {
-        validate_non_empty("protocol.name", &protocol.name)?;
-        validate_non_empty("protocol.alpn", &protocol.alpn)?;
-    }
-
-    if let Some(peer) = &h.peer {
-        if let Some(peer_id) = &peer.peer_id {
-            validate_non_empty("peer.peer_id", peer_id)?;
-        }
-        validate_non_empty("peer.server_identity.kind", &peer.server_identity.kind)?;
-        if peer.server_identity.cert_sha256 != h.cert_sha256 {
-            return Err(ProtocolError::HandshakeField {
-                field: "peer.server_identity.cert_sha256",
-                reason: "must match top-level cert_sha256".to_string(),
-            });
-        }
     }
 
     for service in &h.services {
@@ -236,53 +243,44 @@ mod tests {
     use super::*;
 
     fn valid_json() -> Vec<u8> {
-        br#"{"v":1,"listen_port":45231,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","stun_observed_addr":"203.0.113.5:45231","relay_public_addr":null}"#.to_vec()
+        br#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"},{"kind":"server-reflexive","endpoint":"203.0.113.5:45231","source":"stun"}]}"#.to_vec()
     }
 
     #[test]
     fn decodes_valid_handshake() {
         let h = decode_handshake_json(&valid_json()).unwrap();
         assert_eq!(h.v, 1);
-        assert_eq!(h.listen_port, 45231);
-        assert_eq!(h.stun_observed_addr.as_deref(), Some("203.0.113.5:45231"));
-        assert_eq!(h.relay_public_addr, None);
+        assert_eq!(h.direct_by_bootstrap_host_port(), Some(45231));
+        assert_eq!(h.stun_observed_addr(), Some("203.0.113.5:45231"));
+        assert_eq!(h.relay_public_addr(), None);
+        assert_eq!(
+            h.cert_sha256(),
+            "3a7f00000000000000000000000000000000000000000000000000000000aabb"
+        );
     }
 
     #[test]
-    fn optional_fields_default_to_none_when_absent() {
-        let json = br#"{"v":1,"listen_port":1,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="}"#;
+    fn optional_fields_default_to_empty_when_absent() {
+        let json = br#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}}}"#;
         let h = decode_handshake_json(json).unwrap();
-        assert_eq!(h.stun_observed_addr, None);
-        assert_eq!(h.relay_public_addr, None);
-        assert_eq!(h.protocol, None);
-        assert_eq!(h.peer, None);
+        assert_eq!(h.direct_by_bootstrap_host_port(), None);
+        assert_eq!(h.stun_observed_addr(), None);
+        assert_eq!(h.relay_public_addr(), None);
         assert!(h.services.is_empty());
         assert!(h.candidates.is_empty());
     }
 
     #[test]
-    fn decodes_peer_service_candidate_handshake() {
-        let json = br#"{"v":1,"listen_port":45231,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-helper/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"services":[{"name":"ssh","target":"127.0.0.1:22"}],"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"},{"kind":"server-reflexive","endpoint":"203.0.113.5:45231","source":"stun"}]}"#;
+    fn decodes_relayed_candidate() {
+        let json = br#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"services":[{"name":"ssh","target":"127.0.0.1:22"}],"candidates":[{"kind":"relayed","endpoint":"203.0.113.9:45900","source":"isekai-link-relay"}]}"#;
         let h = decode_handshake_json(json).unwrap();
-        assert_eq!(h.protocol.as_ref().unwrap().name, "isekai-pipe");
-        assert_eq!(
-            h.peer.as_ref().unwrap().server_identity.cert_sha256,
-            h.cert_sha256
-        );
         assert_eq!(h.services[0].name, "ssh");
-        assert_eq!(h.candidates[0].kind, "direct-by-bootstrap-host");
-        assert_eq!(h.direct_by_bootstrap_host_port(), 45231);
-    }
-
-    #[test]
-    fn direct_by_bootstrap_host_port_falls_back_to_legacy_listen_port() {
-        let h = decode_handshake_json(&valid_json()).unwrap();
-        assert_eq!(h.direct_by_bootstrap_host_port(), 45231);
+        assert_eq!(h.relay_public_addr(), Some("203.0.113.9:45900"));
     }
 
     #[test]
     fn rejects_direct_by_bootstrap_host_candidate_without_port() {
-        let json = br#"{"v":1,"listen_port":1,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","candidates":[{"kind":"direct-by-bootstrap-host","source":"bootstrap-ssh"}]}"#;
+        let json = br#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"direct-by-bootstrap-host","source":"bootstrap-ssh"}]}"#;
         let err = decode_handshake_json(json).unwrap_err();
         assert!(matches!(
             err,
@@ -295,25 +293,12 @@ mod tests {
 
     #[test]
     fn rejects_relayed_candidate_without_endpoint() {
-        let json = br#"{"v":1,"listen_port":1,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","candidates":[{"kind":"relayed","source":"isekai-link-relay"}]}"#;
+        let json = br#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"relayed","source":"isekai-link-relay"}]}"#;
         let err = decode_handshake_json(json).unwrap_err();
         assert!(matches!(
             err,
             ProtocolError::HandshakeField {
                 field: "candidates.endpoint",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_peer_identity_mismatch() {
-        let json = br#"{"v":1,"listen_port":1,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}}"#;
-        let err = decode_handshake_json(json).unwrap_err();
-        assert!(matches!(
-            err,
-            ProtocolError::HandshakeField {
-                field: "peer.server_identity.cert_sha256",
                 ..
             }
         ));
@@ -335,7 +320,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_version() {
-        let json = br#"{"v":99,"listen_port":1,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="}"#;
+        let json = br#"{"v":99,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}}}"#;
         let err = decode_handshake_json(json).unwrap_err();
         assert_eq!(
             err,
@@ -349,12 +334,12 @@ mod tests {
 
     #[test]
     fn rejects_bad_cert_sha256_length() {
-        let json = br#"{"v":1,"listen_port":1,"cert_sha256":"deadbeef","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="}"#;
+        let json = br#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"deadbeef"}}}"#;
         let err = decode_handshake_json(json).unwrap_err();
         assert!(matches!(
             err,
             ProtocolError::HandshakeField {
-                field: "cert_sha256",
+                field: "peer.server_identity.cert_sha256",
                 ..
             }
         ));
@@ -362,12 +347,12 @@ mod tests {
 
     #[test]
     fn rejects_uppercase_cert_sha256() {
-        let json = br#"{"v":1,"listen_port":1,"cert_sha256":"3A7F000000000000000000000000000000000000000000000000000000AA","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="}"#;
+        let json = br#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3A7F000000000000000000000000000000000000000000000000000000AA"}}}"#;
         let err = decode_handshake_json(json).unwrap_err();
         assert!(matches!(
             err,
             ProtocolError::HandshakeField {
-                field: "cert_sha256",
+                field: "peer.server_identity.cert_sha256",
                 ..
             }
         ));
@@ -375,7 +360,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_session_secret_encoding() {
-        let json = br#"{"v":1,"listen_port":1,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"not-base64!!"}"#;
+        let json = br#"{"v":1,"session_secret":"not-base64!!","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}}}"#;
         let err = decode_handshake_json(json).unwrap_err();
         assert!(matches!(
             err,
@@ -388,7 +373,7 @@ mod tests {
 
     #[test]
     fn rejects_session_secret_of_wrong_decoded_length() {
-        let json = br#"{"v":1,"listen_port":1,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"YWJj"}"#;
+        let json = br#"{"v":1,"session_secret":"YWJj","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}}}"#;
         let err = decode_handshake_json(json).unwrap_err();
         assert!(matches!(
             err,
@@ -400,13 +385,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_listen_port() {
-        let json = br#"{"v":1,"listen_port":0,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="}"#;
+    fn rejects_zero_candidate_port() {
+        let json = br#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"direct-by-bootstrap-host","port":0,"source":"bootstrap-ssh"}]}"#;
         let err = decode_handshake_json(json).unwrap_err();
         assert!(matches!(
             err,
             ProtocolError::HandshakeField {
-                field: "listen_port",
+                field: "candidates.port",
                 ..
             }
         ));
