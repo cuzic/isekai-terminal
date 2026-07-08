@@ -135,8 +135,8 @@ for _ in $(seq 1 50); do
 done
 
 # --- isekai-pipe serve: server ns内、UDPを直接bind(direct mode)。
-ip netns exec "$NETLAB_SERVER_NS" env RUST_LOG=trace "$ISEKAI_PIPE_BIN" serve \
-    --target 127.0.0.1:2222 --bind "$NETLAB_SERVER_IP:0" --once --log-level trace \
+ip netns exec "$NETLAB_SERVER_NS" "$ISEKAI_PIPE_BIN" serve \
+    --target 127.0.0.1:2222 --bind 0.0.0.0:0 --once --log-level debug \
     > "$WORKDIR/serve.stdout" 2> "$WORKDIR/serve.stderr" &
 SERVE_PID=$!
 
@@ -182,7 +182,7 @@ LOCAL_SUM="$(sha256sum "$WORKDIR/payload.bin" | awk '{print $1}')"
 set +e
 timeout 60 ip netns exec "$NETLAB_CLIENT_NS" env \
     HOME="$CLIENT_HOME" PATH="$PATH" \
-    RUST_LOG=trace \
+    RUST_LOG=isekai_transport=debug,isekai_pipe=debug \
     ssh -F /dev/null \
         -o IdentityFile="$WORKDIR/client_key" \
         -o IdentitiesOnly=yes \
