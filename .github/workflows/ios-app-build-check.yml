@@ -56,6 +56,11 @@ jobs:
 
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
         run: |
+          # GitHub-hostedのmacOSランナーには`aws/tap`が既にtapされているが、
+          # 最近のHomebrewはtap trust必須化により、無関係なbrew installでも
+          # 未trustのtapがあるだけで失敗するようになった。zig自体はこのtapと
+          # 無関係なので、先に外してしまう(存在しない/既に外れていてもよい)。
+          brew untap aws/tap || true
           brew install zig
           cargo install cargo-zigbuild --locked
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
