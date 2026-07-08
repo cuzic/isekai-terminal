@@ -55,12 +55,14 @@ source "$NETLAB_DIR/topology.sh"
 WORKDIR="$(mktemp -d)"
 SERVE_PID=""
 SSHD_PID=""
+UNLOCKED_LOGIN_USER=""
 
 cleanup() {
     local exit_code=$?
     set +e
     [ -n "$SERVE_PID" ] && kill "$SERVE_PID" 2>/dev/null
     [ -n "$SSHD_PID" ] && kill "$SSHD_PID" 2>/dev/null
+    [ -n "$UNLOCKED_LOGIN_USER" ] && passwd -l "$UNLOCKED_LOGIN_USER" >/dev/null 2>&1
     if [ "$exit_code" -ne 0 ]; then
         echo "=== FAILURE: dumping diagnostics ===" >&2
         netlab_diagnostics >&2
@@ -103,6 +105,18 @@ UsePAM no
 StrictModes no
 LogLevel VERBOSE
 EOF
+
+# sshdはPasswordAuthentication no/pubkeyのみでも、ログインユーザーの
+# shadowパスワードが"locked"(先頭!、GitHub Actionsのrunnerユーザー等)だと
+# "account is locked"でpreauth拒否する。`passwd -u`はそもそもパスワード
+# ハッシュが無い(!!)アカウントには"passwordless account"として拒否される
+# ことがあるため、使い捨てのランダムパスワードをchpasswdで設定して
+# unlockする(PasswordAuthentication noなので実際にログインには使えない)。
+# 元がlockedだった場合はcleanupで必ずlockし直す。
+if passwd -S "$SSH_LOGIN_USER" 2>/dev/null | awk '{exit ($2 == "L") ? 0 : 1}'; then
+    echo "$SSH_LOGIN_USER:$(head -c 32 /dev/urandom | base64)" | chpasswd
+    UNLOCKED_LOGIN_USER="$SSH_LOGIN_USER"
+fi
 
 mkdir -p /run/sshd
 chmod 755 /run/sshd
