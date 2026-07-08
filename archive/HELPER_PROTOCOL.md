@@ -1,5 +1,12 @@
 # isekai-helper CLI / ワイヤープロトコル契約（Phase 7-0）
 
+> **ARCHIVED（2026-07-07）**: `isekai-helper` crate/binaryは`isekai-pipe`へ統合され廃止された
+> （`ISEKAI_PIPE_DESIGN.md`参照）。ここに記録されたHELLO/proof/ACK・resume・handshake JSONの
+> ワイヤー契約自体は現在も`isekai-pipe serve`が実装しているものと(handshake JSONスキーマの
+> フラットフィールド廃止・ALPN/exporter labelの改称を除き)ほぼ同一だが、CLI起動方法
+> （`isekai-helper --target ...`ではなく`isekai-pipe serve --target ...`）やcrate構成は
+> 変わっている。現在の正確な契約は`ISEKAI_PIPE_DESIGN.md`を参照すること。
+
 Phase 7（自作ヘルパー方式による QUIC 接続耐性）の実装に先立ち、`isekai-helper` の CLI インターフェースと
 ワイヤー上の契約をここで固定する。Phase 7-1（最小実装）はこの契約に従う。
 
@@ -133,40 +140,36 @@ OPTIONS:
 bind に成功した直後、accept ループに入る前に、**1行だけ** JSON を stdout に出力する。
 
 ```json
-{"v":1,"listen_port":45231,"cert_sha256":"3a7f...（hex, 64文字）","session_secret":"base64エンコードされた32byte","stun_observed_addr":"203.0.113.5:45231","relay_public_addr":null,"protocol":{"name":"isekai-pipe","alpn":"isekai-helper/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f...（hex, 64文字）"}},"services":[{"name":"ssh","target":"127.0.0.1:22"}],"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"},{"kind":"server-reflexive","endpoint":"203.0.113.5:45231","source":"stun"}]}
+{"v":1,"session_secret":"base64エンコードされた32byte","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f...（hex, 64文字）"}},"services":[{"name":"ssh","target":"127.0.0.1:22"}],"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"},{"kind":"server-reflexive","endpoint":"203.0.113.5:45231","source":"stun"}]}
 ```
 
+単一スキーマ（`ISEKAI_PIPE_MIGRATION.md` P5「旧名整理」）: 各事実は1箇所にしか存在しない。
+旧クライアント向けの `listen_port`/`cert_sha256`/`stun_observed_addr`/`relay_public_addr` という
+フラットな重複フィールドは廃止済み——実利用者がほぼいない段階と判断し、互換 alias は作らず
+削除した。
+
 - `v`: ハンドシェイクフォーマットのバージョン（将来の破壊的変更に備える）
-- `listen_port`: 実際に bind されたポート番号（`--bind` で 0 を指定した場合、OS が選んだ実ポート）
-- `cert_sha256`: 自己署名証明書（起動のたびに生成する ephemeral cert）の DER 全体の SHA-256（hex）。
-  クライアントは QUIC 接続時にこの値でピン留めする（証明書 fingerprint は QUIC 接続時の素の TOFU ではなく、
-  **既に認証済みの SSH チャネル経由**で受け渡す設計。PLAN.md「セキュリティ」節参照）
 - `session_secret`: helper がその起動ごとにランダム生成する秘密（base64）。クライアントはこれを使って
   `proof` を計算する（後述）。
-- `stun_observed_addr`（Phase 10、`--stun-server` 指定時のみ存在。`null` は「未指定」または
-  「STUN問い合わせが失敗した」の両方を表す——後者でもハンドシェイク自体は失敗させず継続する）:
-  `--stun-server` から見た、この helper の観測アドレス（`"ip:port"` 文字列）。isekai-terminal は
-  これを使って直結（hole punching）を試みる。
-- `relay_public_addr`（Phase 10、`--relay` 指定時のみ存在。`null` は未指定）: relayが割り当てた
-  公開アドレス（`"ip:port"` 文字列、`--relay`成功時は必ず存在する——STUNと異なり中間失敗時の
-  フォールバック余地が無く、relay接続自体が失敗すればhelperの起動自体が失敗するため）。
-  isekai-terminal はこのアドレスへ直接QUIC接続する（`ssh_host`とは無関係の別アドレス）。
 - `protocol`: この process が話す pipe/helper wire protocol。現行は `name=isekai-pipe`,
-  `alpn=isekai-helper/1`。ALPN は QUIC/TLS の実値と一致させる。
-- `peer.server_identity`: bootstrap SSH channel で導入される remote peer の暗号学的 identity。
-  現行は top-level `cert_sha256` と同じ QUIC 証明書 fingerprint を
-  `kind=quic-cert-sha256` として表す。
+  `alpn=isekai-pipe/1`。ALPN は QUIC/TLS の実値と一致させる。
+- `peer.server_identity.cert_sha256`: 自己署名証明書（起動のたびに生成する ephemeral cert）の
+  DER 全体の SHA-256（hex）。クライアントは QUIC 接続時にこの値でピン留めする（証明書
+  fingerprint は QUIC 接続時の素の TOFU ではなく、**既に認証済みの SSH チャネル経由**で
+  受け渡す設計。PLAN.md「セキュリティ」節参照）。これが cert fingerprint の唯一の表現であり、
+  他のどのフィールドにも重複しない。
 - `services`: serve 側が公開する service policy。v1 は単一 service のみで、`isekai-pipe serve
   --service ssh=127.0.0.1:22` なら `name=ssh`, `target=127.0.0.1:22` になる。client は任意の
   target を指定せず、service 名で OPEN する。
-- `candidates`: 実行時に得られた到達候補。`direct-by-bootstrap-host` は public IP を helper が
-  知っているという意味ではなく、client が既に知っている bootstrap SSH host と `port` を組み合わせて
-  試す互換 path を表す。`server-reflexive` は STUN 観測値、`relayed` は ISEKAI-link/MASQUE relay が
-  割り当てた公開 endpoint を表す。
-
-`listen_port` / `cert_sha256` / `session_secret` / `stun_observed_addr` / `relay_public_addr` は
-既存 client 用の互換フィールドとして維持する。新しい実装は `peer` / `services` / `candidates`
-を優先して解釈してよいが、旧フィールドだけの handshake JSON も引き続き受理しなければならない。
+- `candidates`: 実行時に得られた到達候補。実際の接続に使う値（QUIC listen port・STUN観測アドレス・
+  relay公開アドレス）はすべてここにしか存在しない。
+  - `direct-by-bootstrap-host`（`port`のみ）: public IP を helper が知っているという意味ではなく、
+    client が既に知っている bootstrap SSH host と `port` を組み合わせて試す path を表す。
+    `isekai-helper` は起動のたびにこの candidate を必ず1つ出力する（実際にbindしたQUIC listen
+    port）。
+  - `server-reflexive`（`endpoint`のみ、`--stun-server` 指定時のみ存在）: STUN 観測値。
+  - `relayed`（`endpoint`のみ、`--relay` 指定時のみ存在）: ISEKAI-link/MASQUE relay が
+    割り当てた公開 endpoint。
 
 SSH 側の呼び出し例（ブートストラップスクリプトのイメージ、Phase 7-3 で実装・実機検証済み、
 Phase 10-1c で固定パス共有による衝突バグを踏んで `mktemp -d` へ変更）:
@@ -230,7 +233,7 @@ Phase 10-1c で `mktemp -d` に変更、`isekai-ssh` CLI側は当初取り残さ
 
 ## 3. QUIC / TLS 契約
 
-- ALPN: `isekai-helper/1`（バージョン付き。将来の破壊的変更は `/2` にし、旧クライアントは
+- ALPN: `isekai-pipe/1`（バージョン付き。将来の破壊的変更は `/2` にし、旧クライアントは
   自然にネゴシエーション失敗するようにする）
 - TLS: 起動のたびに自己署名証明書を生成する（永続化しない、ephemeral）。fingerprint はハンドシェイク
   JSON で報告する。
@@ -273,13 +276,13 @@ byte 1..33:  proof（32 byte）
 ```
 
 `proof = HMAC-SHA256(session_secret, exporter)`
-`exporter = quic_connection.export_keying_material(label = b"isekai-helper-auth-v1", context = b"", length = 32)`
+`exporter = quic_connection.export_keying_material(label = b"isekai-pipe-auth-v1", context = b"", length = 32)`
 
 **エンコーディングの厳密な規定**（実装差異を避けるため固定する）:
 - `session_secret`: RFC 4648 **standard** alphabet、**padding あり**の base64。decode 後ちょうど 32 byte。
 - `cert_sha256`: leaf certificate の DER 全体の SHA-256、**lowercase hex 64文字**、区切り文字なし。
 - `proof` の比較は **constant-time equality** で行う（タイミング攻撃対策）。
-- exporter の `label` は ASCII byte string `"isekai-helper-auth-v1"`、`context` は zero-length byte string。
+- exporter の `label` は ASCII byte string `"isekai-pipe-auth-v1"`、`context` は zero-length byte string。
 
 helper → クライアント（応答、1 byte）:
 
@@ -446,7 +449,7 @@ byte 49..57: client_sent_offset（u64）
 byte 57..65: client_delivered_offset（u64）
 ```
 `resume_proof = HMAC-SHA256(session_secret, exporter || session_id)`
-（`exporter` は **新しい** QUIC connection の `export_keying_material(label = b"isekai-helper-resume-v1", context = "", length = 32)`。
+（`exporter` は **新しい** QUIC connection の `export_keying_material(label = b"isekai-pipe-resume-v1", context = "", length = 32)`。
 `session_id` を HMAC 対象に含めることで、同じ `session_secret` を使い回す複数セッションが
 互いの resume トークンを流用できないようにする）
 
@@ -502,7 +505,7 @@ Phase 8 固有の意味を追加する）:
   40秒前後かかることを確認）が、helper 側の park 保持時間（当時30秒）を上回ってしまい、
   「client が reattach を試みる頃には既に helper が session を破棄済み」という理由で
   **reattach が必ず `REJECT_UNKNOWN_SESSION` になる**致命的なタイミング不整合が起きていた。
-  client 側（`helper_quic_transport.rs`）にも `keep_alive_interval`（NAT UDP マッピング維持、
+  client 側（`isekai_pipe_quic_transport.rs`）にも `keep_alive_interval`（NAT UDP マッピング維持、
   5秒間隔）と短い `max_idle_timeout`（15秒）を設定し検知を高速化した上で、`--resume-window`
   を検知時間 + reattach のリトライ予算より十分長い既定値にしてこの2つを分離した。
   なお実機での追加検証（大量出力中の切断）で、reattach が失敗する各試行自体も
