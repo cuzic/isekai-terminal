@@ -1,6 +1,6 @@
 //! Phase 10: STUN+SSH rendezvous による P2P QUIC トランスポート。
 //!
-//! `helper_quic_transport.rs`（Phase 7、SSH経由到達アドレスへ直接QUIC接続）とは異なり、
+//! `isekai_pipe_quic_transport.rs`（Phase 7、SSH経由到達アドレスへ直接QUIC接続）とは異なり、
 //! こちらは isekai-terminal・isekai-helper の双方が STUN(RFC 5389) で自分自身の
 //! NAT外から見えるアドレスを調べ、その値を（ライブなシグナリングチャネル無しで）
 //! 既存の SSH ブートストラップチャネルに相乗りさせて交換し、直接の UDP 穴あけ
@@ -21,7 +21,7 @@
 //!    （`isekai-helper/src/main.rs`）。
 //! 3. ハンドシェイク JSON から isekai-helper 側の観測アドレス（`stun_observed_addr`）を受け取る。
 //! 4. 同じソケットから isekai-helper 側の観測アドレスへ probe を送る（simultaneous open）。
-//! 5. そのままそのソケットを noq の QUIC endpoint に渡し、`helper_quic_transport.rs` と
+//! 5. そのままそのソケットを noq の QUIC endpoint に渡し、`isekai_pipe_quic_transport.rs` と
 //!    同じ HELLO/proof/ACK クライアントロジックで接続を確立する。
 
 use std::net::SocketAddr;
@@ -32,22 +32,22 @@ use base64::Engine as _;
 use log::{info, warn};
 use russh::client;
 
-use crate::helper_bootstrap::{self, BootstrapError, HelperBinaries, HelperHandshake, HelperP2pMode};
-use crate::helper_quic_transport::{
+use crate::helper_bootstrap::{self, BootstrapError, IsekaiPipeBinaries, IsekaiPipeHandshake, IsekaiPipeP2pMode};
+use crate::isekai_pipe_quic_transport::{
     self, compute_proof, establish_quic_connection_with_socket, open_control_stream,
-    spawn_app_ack_tasks, FRAME_ACK, FRAME_HELLO, FRAME_REJECT_AUTH, FRAME_REJECT_DUPLICATE,
-    FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED, HELPER_BIN_AARCH64, HELPER_BIN_X86_64,
-    HELPER_VERSION,
+    spawn_app_ack_tasks, spawn_bootstrap_host_key_forwarder, FRAME_ACK, FRAME_HELLO,
+    FRAME_REJECT_AUTH, FRAME_REJECT_DUPLICATE, FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED,
+    ISEKAI_PIPE_BIN_AARCH64, ISEKAI_PIPE_BIN_X86_64, ISEKAI_PIPE_VERSION, RESUME_GRACE_LEN,
 };
 use crate::resume_client::{self, ClientResumeState};
 use crate::transport::{
-    authenticate_session, connect_via_jump_or_direct, run_ssh_channel_loop, RusshEventHandler,
+    authenticate_session, connect_via_jump_or_direct, run_ssh_channel_loop,
     TransportCommand, TransportEvent,
 };
 use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 
-/// C→S input replay buffer の既定上限（`helper_quic_transport.rs` と揃える）。
+/// C→S input replay buffer の既定上限（`isekai_pipe_quic_transport.rs` と揃える）。
 const DEFAULT_RESUME_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 /// control stream を開く/CONTROL_ACK を待つタイムアウト。
 const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -96,8 +96,15 @@ impl IsekaiStunP2pSession {
     pub fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
+        // ブートストラップ用SSHのホスト鍵検証を本セッションのcallbackに委譲する
+        // (`isekai_pipe_quic_transport::bootstrap_helper_via_ssh`のNOTE参照)。
+        let host_key_callback = self.core.callback();
         RUNTIME.spawn(async move {
-            match tokio::time::timeout(CONNECT_TIMEOUT, try_connect_isekai_stun_p2p(&config)).await
+            match tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                try_connect_isekai_stun_p2p(&config, host_key_callback),
+            )
+            .await
             {
                 Ok(Ok(stream)) => run_over_stream(config, stream, cmd_rx, event_tx).await,
                 Ok(Err(e)) => {
@@ -146,6 +153,14 @@ impl IsekaiStunP2pSession {
     pub fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
     }
+
+    /// Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+    /// 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+    /// `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+    /// 何もしない。
+    pub fn notify_network_lost(&self) {
+        self.core.notify_network_lost(true);
+    }
 }
 
 // SessionOrchestrator からのみ呼ばれる内部API(uniffi には直接は出さない)。
@@ -162,6 +177,7 @@ impl IsekaiStunP2pSession {
 /// isekai-helper 起動・穴あけ probe 送信・QUIC 接続確立までを行う。
 async fn try_connect_isekai_stun_p2p(
     config: &IsekaiStunP2pConfig,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<resume_client::ReattachableStream, String> {
     let stun_addr: SocketAddr = tokio::net::lookup_host(&config.stun_server)
         .await
@@ -185,11 +201,11 @@ async fn try_connect_isekai_stun_p2p(
         .map_err(|e| format!("自分自身のSTUN観測アドレス取得に失敗: {e}"))?;
     info!("isekai_stun_p2p: our observed address is {our_observed_addr} (via {stun_addr})");
 
-    let handshake = bootstrap_via_ssh_with_punch(config, stun_addr, our_observed_addr).await?;
+    let handshake =
+        bootstrap_via_ssh_with_punch(config, stun_addr, our_observed_addr, host_key_callback).await?;
 
     let peer_addr: SocketAddr = handshake
-        .stun_observed_addr
-        .as_deref()
+        .stun_observed_addr()
         .ok_or_else(|| {
             "isekai-helper がSTUN観測アドレスを報告しませんでした（--stun-server指定でも \
              STUN問い合わせ自体に失敗した可能性があります）"
@@ -215,23 +231,19 @@ async fn try_connect_isekai_stun_p2p(
 }
 
 /// ProxyJump対応のSSH接続を張り、`--stun-server`/`--punch-peer`付きでisekai-helperを
-/// ブートストラップ起動する。`helper_quic_transport::bootstrap_helper_via_ssh`と
+/// ブートストラップ起動する。`isekai_pipe_quic_transport::bootstrap_helper_via_ssh`と
 /// ほぼ同じ処理だが、STUN関連の2引数を渡す点のみ異なるため、コード共有はせず
-/// そのまま複製している（呼び出し元の型(`IsekaiStunP2pConfig`/`HelperQuicConfig`)が
-/// 異なり、関数抽出すると引数が増えて可読性が落ちるため）。
+/// そのまま複製している（呼び出し元の型(`IsekaiStunP2pConfig`/`IsekaiPipeQuicConfig`)が
+/// 異なり、関数抽出すると引数が増えて可読性が落ちるため）。ホスト鍵検証ループ
+/// (`spawn_bootstrap_host_key_forwarder`)自体は共有する。
 async fn bootstrap_via_ssh_with_punch(
     config: &IsekaiStunP2pConfig,
     stun_server: SocketAddr,
     punch_peer: SocketAddr,
-) -> Result<HelperHandshake, String> {
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
-    tokio::spawn(async move {
-        while let Some(ev) = event_rx.recv().await {
-            if let TransportEvent::HostKey(_, reply) = ev {
-                let _ = reply.send(true);
-            }
-        }
-    });
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
+) -> Result<IsekaiPipeHandshake, String> {
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+    spawn_bootstrap_host_key_forwarder(event_rx, host_key_callback);
 
     let russh_config = Arc::new(client::Config::default());
     let mut established = connect_via_jump_or_direct(
@@ -246,12 +258,12 @@ async fn bootstrap_via_ssh_with_punch(
         return Err("bootstrap SSH authentication failed".to_string());
     }
 
-    let binaries = HelperBinaries { x86_64: HELPER_BIN_X86_64, aarch64: HELPER_BIN_AARCH64 };
-    let p2p_mode = HelperP2pMode::Stun { stun_server, punch_peer: Some(punch_peer) };
+    let binaries = IsekaiPipeBinaries { x86_64: ISEKAI_PIPE_BIN_X86_64, aarch64: ISEKAI_PIPE_BIN_AARCH64 };
+    let p2p_mode = IsekaiPipeP2pMode::Stun { stun_server, punch_peer: Some(punch_peer) };
     helper_bootstrap::ensure_helper_running(
         &mut established.handle,
         &binaries,
-        HELPER_VERSION,
+        ISEKAI_PIPE_VERSION,
         "127.0.0.1:22",
         None,
         &p2p_mode,
@@ -261,7 +273,7 @@ async fn bootstrap_via_ssh_with_punch(
 }
 
 // ── QUIC 接続（HELLO/ACK ハンドシェイク） ───────────────
-// `helper_quic_transport.rs` と同じワイヤー契約(HELPER_PROTOCOL.md)を再利用する。
+// `isekai_pipe_quic_transport.rs` と同じワイヤー契約(HELPER_PROTOCOL.md)を再利用する。
 // 唯一の違いは、接続先アドレス解決を DNS ではなく STUN 観測アドレスの交換で行うことと、
 // QUIC endpoint に STUN 問い合わせ・穴あけ probe 送信で使ったのと同一のソケットを
 // 渡すこと。
@@ -269,9 +281,9 @@ async fn bootstrap_via_ssh_with_punch(
 async fn connect_stun_p2p_stream(
     socket: crate::faulty_udp_socket::FaultyUdpSocket,
     peer_addr: SocketAddr,
-    handshake: &HelperHandshake,
+    handshake: &IsekaiPipeHandshake,
 ) -> Result<resume_client::ReattachableStream, String> {
-    let cert_sha256_hex = handshake.cert_sha256.clone();
+    let cert_sha256_hex = handshake.cert_sha256().to_string();
     let session_secret = base64::engine::general_purpose::STANDARD
         .decode(&handshake.session_secret)
         .map_err(|e| format!("invalid session_secret encoding: {e}"))?;
@@ -281,15 +293,21 @@ async fn connect_stun_p2p_stream(
     let proof = compute_proof(&conn, &session_secret, b"")?;
 
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi failed: {e}"))?;
-    let mut hello = Vec::with_capacity(33);
+    let mut hello = Vec::with_capacity(37);
     hello.push(FRAME_HELLO);
     hello.extend_from_slice(&proof);
+    // No client-configurable resume-grace concept on Android yet — `0` means
+    // "no preference, use the server's own default/max".
+    hello.extend_from_slice(&0u32.to_be_bytes());
     send.write_all(&hello).await.map_err(|e| format!("HELLO write failed: {e}"))?;
 
-    let mut resp = [0u8; 1];
-    recv.read_exact(&mut resp).await.map_err(|e| format!("ACK read failed: {e}"))?;
-    match resp[0] {
-        FRAME_ACK => {}
+    let mut type_byte = [0u8; 1];
+    recv.read_exact(&mut type_byte).await.map_err(|e| format!("ACK read failed: {e}"))?;
+    match type_byte[0] {
+        FRAME_ACK => {
+            let mut rest = [0u8; RESUME_GRACE_LEN];
+            recv.read_exact(&mut rest).await.map_err(|e| format!("ACK read failed: {e}"))?;
+        }
         FRAME_REJECT_AUTH => return Err("isekai-helper rejected: auth (proof mismatch)".to_string()),
         FRAME_REJECT_DUPLICATE => {
             return Err("isekai-helper rejected: duplicate active connection".to_string())
@@ -339,7 +357,7 @@ async fn connect_stun_p2p_stream(
         let cert_sha256_hex = cert_sha256_hex.clone();
         let session_secret = session_secret.clone();
         Box::pin(async move {
-            let conn = helper_quic_transport::establish_quic_connection_with_socket(
+            let conn = isekai_pipe_quic_transport::establish_quic_connection_with_socket(
                 crate::faulty_udp_socket::bind_faulty_udp_socket(
                     "0.0.0.0:0".parse().unwrap(),
                     crate::debug_fault::shared_injector(),
@@ -376,7 +394,7 @@ async fn connect_stun_p2p_stream(
 }
 
 async fn run_over_stream(
-    config: IsekaiStunP2pConfig,
+    mut config: IsekaiStunP2pConfig,
     stream: resume_client::ReattachableStream,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
@@ -386,31 +404,29 @@ async fn run_over_stream(
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let handler = RusshEventHandler::new(event_tx.clone());
-    let agent_key = handler.agent_key.clone();
-    let remote_forwards = handler.remote_forwards.clone();
 
-    let session = match client::connect_stream(russh_config, stream, handler).await {
-        Ok(s) => s,
-        Err(e) => {
-            event_tx.send(TransportEvent::Disconnected { reason: Some(e.to_string()) }).await.ok();
+    // STUN P2P(実験的opt-in機能)はSSH接続プーリング(`archive/ISEKAI_SSH_DESIGN.md`
+    // 「今後の課題」参照)のスコープ外。タブごとに毎回新規のQUIC接続・ネストしたSSH認証を
+    // 行う、これまでと同じ挙動のまま。
+    let pooled = match crate::transport::establish_ssh_handle_over_stream(
+        russh_config, stream, &config.username, &mut config.auth, false, &event_tx,
+    ).await {
+        Ok(p) => p,
+        Err(msg) => {
+            event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
             return;
         }
     };
 
-    // IsekaiStunP2pConfig は agent forwarding 未対応（`HelperQuicConfig` と同様）。
-    run_ssh_channel_loop(
-        &config.username, &config.auth, config.cols, config.rows,
-        false, agent_key, false, remote_forwards,
-        session, cmd_rx, event_tx,
-    ).await;
+    // IsekaiStunP2pConfig は agent forwarding 未対応（`IsekaiPipeQuicConfig` と同様）。
+    run_ssh_channel_loop(&pooled, config.cols, config.rows, false, false, cmd_rx, event_tx).await;
 }
 
 #[cfg(test)]
 mod tests {
     //! ループバック上の実 sshd（127.0.0.1:22）+ ローカルモックSTUNサーバーに対する
-    //! E2Eテスト。`HELPER_BOOTSTRAP_TEST_KEY`（鍵ファイルパス）が設定されていない環境
-    //! では自動的にスキップする（`helper_quic_transport.rs`のテストと同じ opt-in 方式）。
+    //! E2Eテスト。`ISEKAI_PIPE_BOOTSTRAP_TEST_KEY`（鍵ファイルパス）が設定されていない環境
+    //! では自動的にスキップする（`isekai_pipe_quic_transport.rs`のテストと同じ opt-in 方式）。
     //!
     //! ループバック経由なのでNATは介在せず「本当の」穴あけにはならないが、
     //! STUN問い合わせ→SSHブートストラップ経由でのアドレス交換→probe送信→
@@ -484,8 +500,8 @@ mod tests {
 
     #[tokio::test]
     async fn full_stack_stun_bootstrap_quic_and_shell_command() {
-        let Ok(key_path) = std::env::var("HELPER_BOOTSTRAP_TEST_KEY") else {
-            eprintln!("skipping: HELPER_BOOTSTRAP_TEST_KEY not set");
+        let Ok(key_path) = std::env::var("ISEKAI_PIPE_BOOTSTRAP_TEST_KEY") else {
+            eprintln!("skipping: ISEKAI_PIPE_BOOTSTRAP_TEST_KEY not set");
             return;
         };
         let key_pem = std::fs::read_to_string(&key_path).unwrap();

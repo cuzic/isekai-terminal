@@ -1,5 +1,5 @@
 //! `isekai-ssh`'s `--via` bootstrap logic: installing and launching
-//! `isekai-helper` on a remote host over SSH (`ISEKAI_SSH_DESIGN.md`
+//! `isekai-helper` on a remote host over SSH (`archive/ISEKAI_SSH_DESIGN.md`
 //! "共有ロジックの crate 分割", phase S-0e-1).
 //!
 //! This crate extracts the *logic* of
@@ -7,7 +7,7 @@
 //! construction, handshake capture/validation) behind a `BootstrapBackend`
 //! trait, so `isekai-ssh` (a plain CLI binary with no `russh::client::Handle`
 //! of its own) can reuse it via a plain `ssh(1)` subprocess
-//! (`OpenSshBackend`) instead. `tssh-core`/Android keeps its existing
+//! (`OpenSshBackend`) instead. `isekai-terminal-core`/Android keeps its existing
 //! `russh`-based implementation; a `RusshBackend` adapter for it is future
 //! work (see `backend` module docs).
 //!
@@ -27,4 +27,4 @@ pub mod types;
 pub use backend::BootstrapBackend;
 pub use error::BootstrapError;
 pub use openssh::OpenSshBackend;
-pub use types::{BootstrapReport, HostSpec, JumpSpec, RelayLaunchSpec};
+pub use types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec};

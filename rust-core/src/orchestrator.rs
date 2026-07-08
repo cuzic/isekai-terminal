@@ -6,8 +6,8 @@ use crate::{
     SessionCallback, SshConfig, SshError, TrzszPublicState,
 };
 use crate::quic_transport::{QuicConfig, QuicSession};
-use crate::helper_quic_transport::{HelperQuicConfig, HelperQuicSession};
-use crate::multipath_transport::{MultipathHelperQuicConfig, MultipathHelperQuicSession};
+use crate::isekai_pipe_quic_transport::{IsekaiPipeQuicConfig, IsekaiPipeQuicSession};
+use crate::multipath_transport::{MultipathIsekaiPipeQuicConfig, MultipathIsekaiPipeQuicSession};
 use crate::isekai_stun_p2p_transport::{IsekaiStunP2pConfig, IsekaiStunP2pSession};
 use crate::isekai_link_relay_transport::{IsekaiLinkRelayConfig, IsekaiLinkRelaySession};
 
@@ -16,8 +16,8 @@ use crate::isekai_link_relay_transport::{IsekaiLinkRelayConfig, IsekaiLinkRelayS
 enum ActiveSession {
     Ssh(Arc<crate::SshSession>),
     Quic(Arc<QuicSession>),
-    HelperQuic(Arc<HelperQuicSession>),
-    MultipathHelperQuic(Arc<MultipathHelperQuicSession>),
+    IsekaiPipeQuic(Arc<IsekaiPipeQuicSession>),
+    MultipathIsekaiPipeQuic(Arc<MultipathIsekaiPipeQuicSession>),
     IsekaiStunP2p(Arc<IsekaiStunP2pSession>),
     IsekaiLinkRelay(Arc<IsekaiLinkRelaySession>),
 }
@@ -27,8 +27,8 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.send(data),
             Self::Quic(s) => s.send(data),
-            Self::HelperQuic(s) => s.send(data),
-            Self::MultipathHelperQuic(s) => s.send(data),
+            Self::IsekaiPipeQuic(s) => s.send(data),
+            Self::MultipathIsekaiPipeQuic(s) => s.send(data),
             Self::IsekaiStunP2p(s) => s.send(data),
             Self::IsekaiLinkRelay(s) => s.send(data),
         }
@@ -37,8 +37,8 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.resize(cols, rows),
             Self::Quic(s) => s.resize(cols, rows),
-            Self::HelperQuic(s) => s.resize(cols, rows),
-            Self::MultipathHelperQuic(s) => s.resize(cols, rows),
+            Self::IsekaiPipeQuic(s) => s.resize(cols, rows),
+            Self::MultipathIsekaiPipeQuic(s) => s.resize(cols, rows),
             Self::IsekaiStunP2p(s) => s.resize(cols, rows),
             Self::IsekaiLinkRelay(s) => s.resize(cols, rows),
         }
@@ -47,8 +47,8 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.disconnect(),
             Self::Quic(s) => s.disconnect(),
-            Self::HelperQuic(s) => s.disconnect(),
-            Self::MultipathHelperQuic(s) => s.disconnect(),
+            Self::IsekaiPipeQuic(s) => s.disconnect(),
+            Self::MultipathIsekaiPipeQuic(s) => s.disconnect(),
             Self::IsekaiStunP2p(s) => s.disconnect(),
             Self::IsekaiLinkRelay(s) => s.disconnect(),
         }
@@ -57,7 +57,7 @@ impl ActiveSession {
     /// （呼び出し側は「そのとき使っているtransportがマルチパスかどうか」を
     /// 意識せず日和見的に呼べばよい）。
     fn rebind_to_fd(&self, fd: i32, local_ip: String) {
-        if let Self::MultipathHelperQuic(s) = self {
+        if let Self::MultipathIsekaiPipeQuic(s) = self {
             s.rebind_to_fd(fd, local_ip);
         }
     }
@@ -65,8 +65,8 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.scrollback_len(),
             Self::Quic(s) => s.scrollback_len(),
-            Self::HelperQuic(s) => s.scrollback_len(),
-            Self::MultipathHelperQuic(s) => s.scrollback_len(),
+            Self::IsekaiPipeQuic(s) => s.scrollback_len(),
+            Self::MultipathIsekaiPipeQuic(s) => s.scrollback_len(),
             Self::IsekaiStunP2p(s) => s.scrollback_len(),
             Self::IsekaiLinkRelay(s) => s.scrollback_len(),
         }
@@ -75,8 +75,8 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.scrollback_cells(offset, rows),
             Self::Quic(s) => s.scrollback_cells(offset, rows),
-            Self::HelperQuic(s) => s.scrollback_cells(offset, rows),
-            Self::MultipathHelperQuic(s) => s.scrollback_cells(offset, rows),
+            Self::IsekaiPipeQuic(s) => s.scrollback_cells(offset, rows),
+            Self::MultipathIsekaiPipeQuic(s) => s.scrollback_cells(offset, rows),
             Self::IsekaiStunP2p(s) => s.scrollback_cells(offset, rows),
             Self::IsekaiLinkRelay(s) => s.scrollback_cells(offset, rows),
         }
@@ -85,8 +85,8 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
             Self::Quic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
-            Self::HelperQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
-            Self::MultipathHelperQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
+            Self::IsekaiPipeQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
+            Self::MultipathIsekaiPipeQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
             Self::IsekaiStunP2p(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
             Self::IsekaiLinkRelay(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
         }
@@ -95,8 +95,8 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
             Self::Quic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
-            Self::HelperQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
-            Self::MultipathHelperQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
+            Self::IsekaiPipeQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
+            Self::MultipathIsekaiPipeQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
             Self::IsekaiStunP2p(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
             Self::IsekaiLinkRelay(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
         }
@@ -105,8 +105,8 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.trzsz_accept_download(transfer_id),
             Self::Quic(s) => s.trzsz_accept_download(transfer_id),
-            Self::HelperQuic(s) => s.trzsz_accept_download(transfer_id),
-            Self::MultipathHelperQuic(s) => s.trzsz_accept_download(transfer_id),
+            Self::IsekaiPipeQuic(s) => s.trzsz_accept_download(transfer_id),
+            Self::MultipathIsekaiPipeQuic(s) => s.trzsz_accept_download(transfer_id),
             Self::IsekaiStunP2p(s) => s.trzsz_accept_download(transfer_id),
             Self::IsekaiLinkRelay(s) => s.trzsz_accept_download(transfer_id),
         }
@@ -115,8 +115,8 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.trzsz_cancel(transfer_id),
             Self::Quic(s) => s.trzsz_cancel(transfer_id),
-            Self::HelperQuic(s) => s.trzsz_cancel(transfer_id),
-            Self::MultipathHelperQuic(s) => s.trzsz_cancel(transfer_id),
+            Self::IsekaiPipeQuic(s) => s.trzsz_cancel(transfer_id),
+            Self::MultipathIsekaiPipeQuic(s) => s.trzsz_cancel(transfer_id),
             Self::IsekaiStunP2p(s) => s.trzsz_cancel(transfer_id),
             Self::IsekaiLinkRelay(s) => s.trzsz_cancel(transfer_id),
         }
@@ -127,7 +127,7 @@ impl ActiveSession {
             Self::Quic(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
             // ポートフォワードは MVP スコープ上プレーン SSH / tsshd QUIC のみ対応。
             // isekai-helper 経由の QUIC 系トランスポートは未対応（対象外）。
-            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) | Self::IsekaiStunP2p(_) | Self::IsekaiLinkRelay(_) => {
+            Self::IsekaiPipeQuic(_) | Self::MultipathIsekaiPipeQuic(_) | Self::IsekaiStunP2p(_) | Self::IsekaiLinkRelay(_) => {
                 log::warn!("add_local_forward: not supported over helper-QUIC transports");
             }
         }
@@ -136,7 +136,7 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.remove_forward(id),
             Self::Quic(s) => s.remove_forward(id),
-            Self::HelperQuic(_) | Self::MultipathHelperQuic(_) | Self::IsekaiStunP2p(_) | Self::IsekaiLinkRelay(_) => {
+            Self::IsekaiPipeQuic(_) | Self::MultipathIsekaiPipeQuic(_) | Self::IsekaiStunP2p(_) | Self::IsekaiLinkRelay(_) => {
                 log::warn!("remove_forward: not supported over helper-QUIC transports");
             }
         }
@@ -147,8 +147,8 @@ impl ActiveSession {
         match self {
             Self::Ssh(s) => s.set_theme(theme),
             Self::Quic(s) => s.set_theme(theme),
-            Self::HelperQuic(s) => s.set_theme(theme),
-            Self::MultipathHelperQuic(s) => s.set_theme(theme),
+            Self::IsekaiPipeQuic(s) => s.set_theme(theme),
+            Self::MultipathIsekaiPipeQuic(s) => s.set_theme(theme),
             Self::IsekaiStunP2p(s) => s.set_theme(theme),
             Self::IsekaiLinkRelay(s) => s.set_theme(theme),
         }
@@ -166,6 +166,13 @@ enum ConnPhase {
     Connected,
 }
 
+/// trzsz ダウンロードの累積バッファに設ける上限(#60)。trzsz プロトコルの
+/// `SIZE`(申告値)はサーバー側の自己申告に過ぎず強制されないため、悪意ある/
+/// 壊れたサーバーが巨大な SIZE を申告して DATA を送り続けると `download_buf` が
+/// 無制限に肥大化し端末が OOM でクラッシュし得る。実際に受信したバイト数の実測値
+/// (`download_buf.len() + 今回のchunk長`)がこの上限を超えたら転送を中断する。
+const MAX_DOWNLOAD_BUF_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+
 struct OrchestratorState {
     current_host: Option<String>,
     current_port: u16,
@@ -177,6 +184,12 @@ struct OrchestratorState {
     trzsz_mode: Option<String>,
     /// Accumulates bytes from on_trzsz_download_chunk; drained on on_trzsz_finished
     download_buf: Vec<u8>,
+    /// #60: `MAX_DOWNLOAD_BUF_BYTES` を超えてローカルに中断した転送のID。
+    /// `trzsz_cancel` は非同期(セッションイベントループへのコマンド送信)なので、
+    /// 実際の `on_trzsz_finished`(success=false, message="Cancelled" 等の汎用文言)が
+    /// 届くのは少し後になる。その届いた際にこのIDが一致すれば、汎用文言ではなく
+    /// ユーザーに分かりやすい「大きすぎる」メッセージへ差し替える。
+    size_limit_exceeded_for: Option<String>,
 }
 
 pub(crate) struct OrchestratorShared {
@@ -236,14 +249,40 @@ impl SessionCallback for OrchestratorAdapter {
             s.current_transfer_id = Some(transfer_id.clone());
             s.trzsz_mode = Some(mode.clone());
             s.download_buf.clear();
+            s.size_limit_exceeded_for = None;
         }
         self.shared.callback.on_trzsz_state_changed(
             TrzszPublicState::WaitingUser { transfer_id, mode, suggested_name, expected_size }
         );
     }
 
-    fn on_trzsz_download_chunk(&self, _transfer_id: String, data: Vec<u8>, _is_last: bool) {
-        self.shared.state.lock().download_buf.extend_from_slice(&data);
+    /// #60: trzsz の `SIZE` 申告値はサーバーの自己申告に過ぎず強制されないため、
+    /// 実際に受信したバイト数(累積 `download_buf` 長)を都度 `MAX_DOWNLOAD_BUF_BYTES`
+    /// と比較する。超過したら OOM する前に `download_buf` を捨て、転送そのものも
+    /// `trzsz_cancel` で中断させる(FSM側は非同期に `on_trzsz_finished` を返してくる
+    /// ので、そちらで success=false・分かりやすいメッセージに揃える)。
+    fn on_trzsz_download_chunk(&self, transfer_id: String, data: Vec<u8>, _is_last: bool) {
+        let exceeded = {
+            let mut s = self.shared.state.lock();
+            let would_be_len = s.download_buf.len().saturating_add(data.len());
+            if would_be_len > MAX_DOWNLOAD_BUF_BYTES {
+                log::warn!(
+                    "trzsz: download {} exceeds {} byte cap (would reach {}), aborting to avoid OOM",
+                    transfer_id, MAX_DOWNLOAD_BUF_BYTES, would_be_len
+                );
+                s.download_buf.clear();
+                s.size_limit_exceeded_for = Some(transfer_id.clone());
+                true
+            } else {
+                s.download_buf.extend_from_slice(&data);
+                false
+            }
+        };
+        if exceeded {
+            if let Some(session) = self.shared.session.lock().as_ref() {
+                session.trzsz_cancel(transfer_id);
+            }
+        }
     }
 
     fn on_trzsz_progress(&self, transfer_id: String, transferred: u64, total: Option<u64>) {
@@ -258,11 +297,21 @@ impl SessionCallback for OrchestratorAdapter {
     }
 
     fn on_trzsz_finished(&self, transfer_id: String, success: bool, message: Option<String>) {
-        let (data, is_download) = {
+        let (data, is_download, success, message) = {
             let mut s = self.shared.state.lock();
             s.current_transfer_id = None;
-            (std::mem::take(&mut s.download_buf),
-             s.trzsz_mode.as_deref() == Some("download"))
+            let size_limit_hit = s.size_limit_exceeded_for.take().as_deref() == Some(transfer_id.as_str());
+            let data = std::mem::take(&mut s.download_buf);
+            let is_download = s.trzsz_mode.as_deref() == Some("download");
+            if size_limit_hit {
+                // #60: on_trzsz_download_chunk側で既に中断済み。trzsz_cancel経由の
+                // 汎用的な message(例: "Cancelled")を、ユーザーに分かりやすい文言へ
+                // 差し替える。success も常にfalseにする(万一cancel競合でtrueが
+                // 届いても、上限超過を成功扱いにしてはいけない)。
+                (data, is_download, false, Some("ファイルが大きすぎるため転送を中断しました".to_string()))
+            } else {
+                (data, is_download, success, message)
+            }
         };
         if success && is_download && !data.is_empty() {
             self.shared.callback.on_download_complete(None, data);
@@ -304,6 +353,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
             current_transfer_id: None,
             trzsz_mode: None,
             download_buf: Vec::new(),
+            size_limit_exceeded_for: None,
         }),
         callback: Arc::from(callback),
         session: Mutex::new(None),
@@ -346,8 +396,8 @@ impl SessionOrchestrator {
     }
 
     /// Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
-    /// （`TransportPreference::IsekaiHelperQuic` 相当、明示選択時に使う）。
-    pub fn connect_helper_quic(&self, config: HelperQuicConfig) -> Result<(), SshError> {
+    /// （`TransportPreference::IsekaiPipeQuic` 相当、明示選択時に使う）。
+    pub fn connect_isekai_pipe_quic(&self, config: IsekaiPipeQuicConfig) -> Result<(), SshError> {
         {
             let mut s = self.shared.state.lock();
             s.current_host = Some(config.ssh_host.clone());
@@ -357,15 +407,15 @@ impl SessionOrchestrator {
         }
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
         let adapter = OrchestratorAdapter { shared: self.shared.clone() };
-        let session = crate::helper_quic_transport::create_helper_quic_session(config);
+        let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
         session.connect(Box::new(adapter))?;
-        *self.shared.session.lock() = Some(ActiveSession::HelperQuic(session));
+        *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
         Ok(())
     }
 
     /// Phase 7: `TransportPreference::Auto` 相当。自作ヘルパー経由 QUIC のブートストラップ/
     /// 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
-    pub fn connect_helper_quic_auto(&self, config: HelperQuicConfig) -> Result<(), SshError> {
+    pub fn connect_isekai_pipe_quic_auto(&self, config: IsekaiPipeQuicConfig) -> Result<(), SshError> {
         {
             let mut s = self.shared.state.lock();
             s.current_host = Some(config.ssh_host.clone());
@@ -375,16 +425,16 @@ impl SessionOrchestrator {
         }
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
         let adapter = OrchestratorAdapter { shared: self.shared.clone() };
-        let session = crate::helper_quic_transport::create_helper_quic_session(config);
+        let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
         session.connect_auto(Box::new(adapter))?;
-        *self.shared.session.lock() = Some(ActiveSession::HelperQuic(session));
+        *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
         Ok(())
     }
 
-    /// Phase 9: `TransportPreference::IsekaiHelperQuicMultipath` 相当。フォールバック無し。
+    /// Phase 9: `TransportPreference::IsekaiPipeQuicMultipath` 相当。フォールバック無し。
     /// `config.direct_host` が設定されていれば path0（`ssh_host`）+ path1（`direct_host`）の
     /// 受動的マルチパスで接続する。
-    pub fn connect_multipath_helper_quic(&self, config: MultipathHelperQuicConfig) -> Result<(), SshError> {
+    pub fn connect_multipath_isekai_pipe_quic(&self, config: MultipathIsekaiPipeQuicConfig) -> Result<(), SshError> {
         {
             let mut s = self.shared.state.lock();
             s.current_host = Some(config.ssh_host.clone());
@@ -394,9 +444,9 @@ impl SessionOrchestrator {
         }
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
         let adapter = OrchestratorAdapter { shared: self.shared.clone() };
-        let session = crate::multipath_transport::create_multipath_helper_quic_session(config);
+        let session = crate::multipath_transport::create_multipath_isekai_pipe_quic_session(config);
         session.connect(Box::new(adapter))?;
-        *self.shared.session.lock() = Some(ActiveSession::MultipathHelperQuic(session));
+        *self.shared.session.lock() = Some(ActiveSession::MultipathIsekaiPipeQuic(session));
         Ok(())
     }
 
@@ -588,5 +638,303 @@ impl SessionOrchestrator {
         self.shared.callback.on_connection_state_changed(
             ConnectionPublicState::Error { message }
         );
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────
+//
+// この模块の状態遷移(`ConnPhase`の分岐、`OrchestratorAdapter`のtrzsz状態集約)は
+// 実SSH/QUIC接続を一切必要としない純粋なロジックであり、本来実機は不要だったにも
+// 関わらず`orchestrator.rs`にはテストが1つも無かった。`rust-ssot.md`が「Rust側の
+// SSOTである」ことの根拠として挙げている`notify_network_lost()`自体が無テストだった
+// ため、ここで最初にカバーする。`ActiveSession`は具体的なtransportセッション型しか
+// 保持できない(trait objectではない)ため、`session: Mutex::new(None)`のまま
+// (未接続として)テストする — `notify_network_lost`/`disconnect`は`None`の場合
+// no-opになるよう書かれているので、これで分岐ロジックの検証は完結する。
+//
+// #60: `on_trzsz_download_chunk`が上限超過時に呼ぶ`session.trzsz_cancel(..)`も
+// 同様に`None`の場合no-opになるよう書かれているので、trzszバッファ上限のロジック
+// (実SSH/QUIC不要)もここで検証できる。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct RecordingCallback {
+        connection_states: StdMutex<Vec<ConnectionPublicState>>,
+        trzsz_states: StdMutex<Vec<TrzszPublicState>>,
+        downloads: StdMutex<Vec<(Option<String>, Vec<u8>)>>,
+    }
+
+    impl OrchestratorCallback for RecordingCallback {
+        fn on_connection_state_changed(&self, state: ConnectionPublicState) {
+            self.connection_states.lock().unwrap().push(state);
+        }
+        fn on_screen_update(&self, _update: ScreenUpdate) {}
+        fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool {
+            true
+        }
+        fn on_data(&self, _data: Vec<u8>) {}
+        fn on_trzsz_state_changed(&self, state: TrzszPublicState) {
+            self.trzsz_states.lock().unwrap().push(state);
+        }
+        fn on_download_complete(&self, file_name: Option<String>, data: Vec<u8>) {
+            self.downloads.lock().unwrap().push((file_name, data));
+        }
+        fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool {
+            true
+        }
+    }
+
+    fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {
+        let callback = Arc::new(RecordingCallback::default());
+        let shared = Arc::new(OrchestratorShared {
+            state: Mutex::new(OrchestratorState {
+                current_host: Some("example.com".to_string()),
+                current_port: 22,
+                is_quic,
+                phase,
+                current_transfer_id: None,
+                trzsz_mode: None,
+                download_buf: Vec::new(),
+                size_limit_exceeded_for: None,
+            }),
+            callback: callback.clone(),
+            session: Mutex::new(None),
+        });
+        (shared, callback)
+    }
+
+    fn orchestrator_with_phase(phase: ConnPhase, is_quic: bool) -> (SessionOrchestrator, Arc<RecordingCallback>) {
+        let (shared, callback) = shared_with_phase(phase, is_quic);
+        (SessionOrchestrator { shared }, callback)
+    }
+
+    // ── notify_network_lost ──────────────────────────────────
+
+    #[test]
+    fn notify_network_lost_does_nothing_when_idle() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Idle, false);
+        orch.notify_network_lost();
+        assert!(cb.connection_states.lock().unwrap().is_empty());
+        assert!(orch.shared.state.lock().phase == ConnPhase::Idle);
+    }
+
+    #[test]
+    fn notify_network_lost_aborts_and_reports_disconnected_during_handshake() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connecting, false);
+        orch.notify_network_lost();
+        let events = cb.connection_states.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ConnectionPublicState::Disconnected { reason: Some(r) } if r == "network lost"
+        ));
+        assert!(orch.shared.state.lock().phase == ConnPhase::Idle);
+    }
+
+    #[test]
+    fn notify_network_lost_disconnects_plain_tcp_when_connected() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connected, false);
+        orch.notify_network_lost();
+        let events = cb.connection_states.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ConnectionPublicState::Disconnected { .. }));
+        assert!(orch.shared.state.lock().phase == ConnPhase::Idle);
+    }
+
+    #[test]
+    fn notify_network_lost_ignores_quic_when_connected() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connected, true);
+        orch.notify_network_lost();
+        // QUICは経路変更に自前で耐えるため、切断扱いにせずphaseもConnectedのまま維持する。
+        assert!(cb.connection_states.lock().unwrap().is_empty());
+        assert!(orch.shared.state.lock().phase == ConnPhase::Connected);
+    }
+
+    // ── OrchestratorAdapter (SessionCallback実装) ────────────
+
+    fn adapter_with_phase(phase: ConnPhase, is_quic: bool) -> (OrchestratorAdapter, Arc<OrchestratorShared>, Arc<RecordingCallback>) {
+        let (shared, callback) = shared_with_phase(phase, is_quic);
+        (OrchestratorAdapter { shared: shared.clone() }, shared, callback)
+    }
+
+    #[test]
+    fn on_connected_sets_phase_connected_and_reports_current_host() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connecting, false);
+        adapter.on_connected();
+        assert!(shared.state.lock().phase == ConnPhase::Connected);
+        let events = cb.connection_states.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ConnectionPublicState::Connected { host } if host == "example.com"
+        ));
+    }
+
+    #[test]
+    fn on_disconnected_sets_phase_idle_and_forwards_reason() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        adapter.on_disconnected(Some("peer closed".to_string()));
+        assert!(shared.state.lock().phase == ConnPhase::Idle);
+        let events = cb.connection_states.lock().unwrap();
+        assert!(matches!(
+            &events[0],
+            ConnectionPublicState::Disconnected { reason: Some(r) } if r == "peer closed"
+        ));
+    }
+
+    #[test]
+    fn on_host_key_reports_current_host_and_port_from_state() {
+        let (adapter, _shared, _cb) = adapter_with_phase(ConnPhase::Connecting, false);
+        // RecordingCallback::on_host_key always returns true; verifying it forwards
+        // without panicking exercises the host/port read out of shared state.
+        assert!(adapter.on_host_key("aa:bb:cc".to_string()));
+    }
+
+    #[test]
+    fn on_trzsz_request_records_transfer_and_clears_download_buf() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().download_buf = vec![1, 2, 3];
+        shared.state.lock().size_limit_exceeded_for = Some("stale".to_string());
+        adapter.on_trzsz_request(
+            "t1".to_string(), "download".to_string(), Some("file.txt".to_string()), Some(100),
+        );
+        {
+            let s = shared.state.lock();
+            assert_eq!(s.current_transfer_id.as_deref(), Some("t1"));
+            assert_eq!(s.trzsz_mode.as_deref(), Some("download"));
+            assert!(s.download_buf.is_empty());
+            assert!(s.size_limit_exceeded_for.is_none(), "新しい転送開始時に前回の状態を持ち越さない");
+        }
+        let events = cb.trzsz_states.lock().unwrap();
+        assert!(matches!(&events[0], TrzszPublicState::WaitingUser { transfer_id, .. } if transfer_id == "t1"));
+    }
+
+    #[test]
+    fn on_trzsz_download_chunk_accumulates_bytes_across_calls() {
+        let (adapter, shared, _cb) = adapter_with_phase(ConnPhase::Connected, false);
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![1, 2], false);
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![3, 4], true);
+        assert_eq!(shared.state.lock().download_buf, vec![1, 2, 3, 4]);
+    }
+
+    // #60: 上限超過時にOOMせず転送を中断し、download_bufを破棄することを確認する。
+    // `vec![0u8; MAX_DOWNLOAD_BUF_BYTES]`はLinux上ではゼロページの遅延確保のため
+    // 実メモリをほぼ消費せず高速(かつ本テストはそれ以上書き込まない)。
+    #[test]
+    fn on_trzsz_download_chunk_clears_buffer_and_marks_size_limit_when_cap_exceeded() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().current_transfer_id = Some("t1".to_string());
+        shared.state.lock().trzsz_mode = Some("download".to_string());
+        shared.state.lock().download_buf = vec![0u8; MAX_DOWNLOAD_BUF_BYTES];
+
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![1], false);
+
+        let s = shared.state.lock();
+        assert!(s.download_buf.is_empty(), "上限超過時はOOM回避のためdownload_bufを破棄する");
+        assert_eq!(s.size_limit_exceeded_for.as_deref(), Some("t1"));
+        drop(s);
+        // まだon_trzsz_finishedが来ていないので、この時点ではDoneはまだ出ていない
+        assert!(cb.trzsz_states.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn on_trzsz_download_chunk_stays_under_cap_does_not_mark_size_limit() {
+        let (adapter, shared, _cb) = adapter_with_phase(ConnPhase::Connected, false);
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![1, 2, 3], false);
+        let s = shared.state.lock();
+        assert_eq!(s.download_buf, vec![1, 2, 3]);
+        assert!(s.size_limit_exceeded_for.is_none());
+    }
+
+    // #60: 上限超過後、非同期のtrzsz_cancel往復で本物のon_trzsz_finishedが
+    // (success=false, message="Cancelled"等の汎用文言で)届いた際に、ユーザーへ
+    // 分かりやすい「大きすぎる」メッセージへ差し替えて伝えることを確認する。
+    #[test]
+    fn on_trzsz_finished_overrides_message_when_size_limit_was_exceeded() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().current_transfer_id = Some("t1".to_string());
+        shared.state.lock().trzsz_mode = Some("download".to_string());
+        shared.state.lock().download_buf = vec![0u8; MAX_DOWNLOAD_BUF_BYTES];
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![1], false);
+
+        // 実際のFSMはtrzsz_cancel経由で非同期に success=false, message="Cancelled" を
+        // 返してくる。ここではそれをシミュレートする。
+        adapter.on_trzsz_finished("t1".to_string(), false, Some("Cancelled".to_string()));
+
+        assert!(cb.downloads.lock().unwrap().is_empty(), "中断された転送でdownload_completeを呼んではいけない");
+        let events = cb.trzsz_states.lock().unwrap();
+        assert!(matches!(
+            &events[0],
+            TrzszPublicState::Done { success: false, message: Some(m), .. } if m.contains("大きすぎる")
+        ));
+        assert!(shared.state.lock().size_limit_exceeded_for.is_none(), "一度使ったフラグは消費してクリアする");
+    }
+
+    // #60: 万一cancelが競合してsuccess=trueが返ってきても、上限超過を検知していた
+    // 転送は成功扱いにしない(かつ空のdownload_bufをon_download_completeへ渡さない)。
+    #[test]
+    fn on_trzsz_finished_forces_failure_when_size_limit_was_exceeded_even_if_reported_success() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().current_transfer_id = Some("t1".to_string());
+        shared.state.lock().trzsz_mode = Some("download".to_string());
+        shared.state.lock().size_limit_exceeded_for = Some("t1".to_string());
+
+        adapter.on_trzsz_finished("t1".to_string(), true, None);
+
+        assert!(cb.downloads.lock().unwrap().is_empty());
+        let events = cb.trzsz_states.lock().unwrap();
+        assert!(matches!(&events[0], TrzszPublicState::Done { success: false, .. }));
+    }
+
+    #[test]
+    fn on_trzsz_finished_download_success_emits_download_complete_with_accumulated_bytes() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().trzsz_mode = Some("download".to_string());
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![9, 9, 9], true);
+        adapter.on_trzsz_finished("t1".to_string(), true, None);
+        let downloads = cb.downloads.lock().unwrap();
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0].1, vec![9, 9, 9]);
+        // 完了後はtransfer_id/download_bufをクリアし、次の転送に持ち越さない。
+        assert!(shared.state.lock().current_transfer_id.is_none());
+        assert!(shared.state.lock().download_buf.is_empty());
+    }
+
+    #[test]
+    fn on_trzsz_finished_failure_does_not_emit_download_complete() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().trzsz_mode = Some("download".to_string());
+        adapter.on_trzsz_download_chunk("t1".to_string(), vec![9, 9, 9], true);
+        adapter.on_trzsz_finished("t1".to_string(), false, Some("connection lost".to_string()));
+        assert!(cb.downloads.lock().unwrap().is_empty());
+        let events = cb.trzsz_states.lock().unwrap();
+        assert!(matches!(&events[0], TrzszPublicState::Done { success: false, .. }));
+    }
+
+    #[test]
+    fn on_trzsz_finished_upload_does_not_emit_download_complete_even_with_buffered_bytes() {
+        // upload完了時にはdownload_bufは本来空のはずだが、万一何か残っていても
+        // is_download判定がfalseならon_download_completeを呼んではいけない。
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().trzsz_mode = Some("upload".to_string());
+        shared.state.lock().download_buf = vec![1, 2, 3];
+        adapter.on_trzsz_finished("t1".to_string(), true, None);
+        assert!(cb.downloads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn on_trzsz_progress_defaults_mode_to_download_when_unset() {
+        let (adapter, _shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        adapter.on_trzsz_progress("t1".to_string(), 50, Some(100));
+        let events = cb.trzsz_states.lock().unwrap();
+        assert!(matches!(
+            &events[0],
+            TrzszPublicState::InProgress { mode, transferred: 50, total: Some(100), .. } if mode == "download"
+        ));
     }
 }

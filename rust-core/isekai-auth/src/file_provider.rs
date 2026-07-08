@@ -1,12 +1,12 @@
 //! `TokenProvider` backed by `~/.config/isekai-ssh/token.json`.
 //!
 //! This file holds a bearer token (the relay JWT), so it gets the same
-//! protection as `isekai-trust`'s `known_helpers.toml`
-//! (`isekai-trust::store`, which this module mirrors): writes are atomic
+//! protection as `isekai-trust`'s `known_helpers.toml` (the permission
+//! checks themselves live in the shared `isekai-fs-guard` crate): writes are atomic
 //! (temp file in the same directory, then `rename`), the file is created
 //! with `0600` permissions and its parent directory with `0700`, and both
 //! are checked for world-writability before use — fail closed if either is
-//! writable by others. This isn't spelled out in `ISEKAI_SSH_DESIGN.md` yet,
+//! writable by others. This isn't spelled out in `archive/ISEKAI_SSH_DESIGN.md` yet,
 //! but the token file is exactly as sensitive as the trust store's identity
 //! material, so it gets the same treatment.
 //!
@@ -22,7 +22,7 @@
 //! Authorization Grant (`device_flow.rs`) returns an `access_token` plus,
 //! usually, a `refresh_token` and an `expires_in`, so the on-disk schema
 //! grows to `TokenSet` (`{"access_token", "refresh_token"?, "expires_at"?,
-//! "token_endpoint"?, "client_id"?}`, `ISEKAI_SSH_DESIGN.md`
+//! "token_endpoint"?, "client_id"?}`, `archive/ISEKAI_SSH_DESIGN.md`
 //! "JWT発行・配布フロー"). Both schemas are read transparently via
 //! `TokenFileSchema`'s `#[serde(untagged)]` union: an old-style file with
 //! only `relay_jwt` loads as a `TokenSet` with `access_token` set to that
@@ -32,7 +32,7 @@
 //! `relay_jwt` shape, so existing callers see no behavior change.
 //!
 //! OS keychain/Secret Service integration is intentionally not attempted
-//! here (`ISEKAI_SSH_DESIGN.md` calls it "可能な限り" — best-effort — and the
+//! here (`archive/ISEKAI_SSH_DESIGN.md` calls it "可能な限り" — best-effort — and the
 //! sandboxed/headless environments this crate is tested in can't exercise
 //! one anyway). The `0600`/`0700` file store below is the only backing store
 //! for now; a real keychain-backed `TokenProvider` implementation could be
@@ -42,17 +42,17 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{refresh, AuthError, TokenProvider};
+use crate::time::unix_now;
+use crate::{refresh, AuthError, TokenProvider, TokenResponse};
 
 pub const CONFIG_DIR_NAME: &str = "isekai-ssh";
 pub const TOKEN_FILE_NAME: &str = "token.json";
 
 /// How close to (or past) `expires_at` counts as "refresh now"
-/// (`ISEKAI_SSH_DESIGN.md`: "保存済みトークンの`expires_at`が近い/過ぎている
+/// (`archive/ISEKAI_SSH_DESIGN.md`: "保存済みトークンの`expires_at`が近い/過ぎている
 /// 場合"). A flat 60s skew comfortably covers the round trip of the SSH
 /// connection this token is about to authenticate, without refreshing so
 /// eagerly that every call does an extra network round trip.
@@ -97,7 +97,33 @@ impl TokenSet {
     pub fn needs_refresh(&self) -> bool {
         match self.expires_at {
             None => false,
-            Some(expires_at) => now_unix() >= expires_at - REFRESH_SKEW_SECS,
+            Some(expires_at) => unix_now() >= expires_at - REFRESH_SKEW_SECS,
+        }
+    }
+
+    /// Builds a `TokenSet` from a raw `TokenResponse` (device-code grant or
+    /// refresh grant — both `isekai-ssh login`, `device_flow.rs`, and
+    /// `refresh_and_save` below go through this), stamping `expires_in` (a
+    /// relative duration) into an absolute `expires_at` via `unix_now()`.
+    ///
+    /// `fallback_refresh_token` covers RFC 6749 §6's "the authorization
+    /// server MAY issue a new refresh token" wording: some servers rotate it
+    /// on every refresh and some don't, so a refresh response that omits
+    /// `refresh_token` should keep whatever was already stored rather than
+    /// silently dropping it. Device-code logins have no prior token to fall
+    /// back to, so `login.rs` passes `None` here.
+    pub fn from_token_response(
+        response: TokenResponse,
+        token_endpoint: String,
+        client_id: Option<String>,
+        fallback_refresh_token: Option<String>,
+    ) -> TokenSet {
+        TokenSet {
+            access_token: response.access_token,
+            refresh_token: response.refresh_token.or(fallback_refresh_token),
+            expires_at: response.expires_in.map(|secs| unix_now() + secs as i64),
+            token_endpoint: Some(token_endpoint),
+            client_id,
         }
     }
 }
@@ -126,12 +152,8 @@ enum TokenFileSchema {
     V1(TokenFileV1),
 }
 
-fn now_unix() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
-}
-
 /// `~/.config/isekai-ssh` (XDG Base Directory convention, per
-/// `ISEKAI_SSH_DESIGN.md`; same directory `isekai-trust` uses for
+/// `archive/ISEKAI_SSH_DESIGN.md`; same directory `isekai-trust` uses for
 /// `known_helpers.toml`).
 pub fn default_config_dir() -> Result<PathBuf, AuthError> {
     let home = std::env::var_os("HOME").ok_or(AuthError::NoHomeDir)?;
@@ -228,51 +250,32 @@ fn write_atomically(path: &Path, serialized: &str) -> Result<(), AuthError> {
     Ok(())
 }
 
-/// Creates `dir` (as `0700`) if it doesn't exist yet; otherwise checks that
-/// it isn't world-writable and fails closed if it is.
-fn ensure_private_dir(dir: &Path) -> Result<(), AuthError> {
-    if !dir.exists() {
-        fs::create_dir_all(dir).map_err(|e| AuthError::CreateDir { path: dir.to_path_buf(), source: e })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-                .map_err(|e| AuthError::CreateDir { path: dir.to_path_buf(), source: e })?;
-        }
-        Ok(())
-    } else {
-        check_not_world_writable(dir)
+/// Translates a `FsGuardError` (path-less by design, see its docs) into this
+/// crate's own `AuthError`, attaching `path` back.
+fn map_fs_guard_err(path: &Path, err: isekai_fs_guard::FsGuardError) -> AuthError {
+    use isekai_fs_guard::FsGuardError;
+    match err {
+        FsGuardError::CreateDir(source) => AuthError::CreateDir { path: path.to_path_buf(), source },
+        FsGuardError::Stat(source) => AuthError::Stat { path: path.to_path_buf(), source },
+        FsGuardError::SetPermissions(source) => AuthError::Write { path: path.to_path_buf(), source },
+        FsGuardError::WorldWritable { mode } => AuthError::WorldWritable { path: path.to_path_buf(), mode },
     }
 }
 
-#[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> Result<(), AuthError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| AuthError::Write { path: path.to_path_buf(), source: e })
+/// Creates `dir` (as `0700`) if it doesn't exist yet; otherwise checks that
+/// it isn't world-writable and fails closed if it is.
+fn ensure_private_dir(dir: &Path) -> Result<(), AuthError> {
+    isekai_fs_guard::ensure_private_dir(dir).map_err(|e| map_fs_guard_err(dir, e))
 }
 
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> Result<(), AuthError> {
-    Ok(())
+fn set_private_file_permissions(path: &Path) -> Result<(), AuthError> {
+    isekai_fs_guard::set_private_file_permissions(path).map_err(|e| map_fs_guard_err(path, e))
 }
 
 /// Fails closed if `path` is writable by users other than its owner
 /// (mode bit `0o002`). Unix-only; a no-op elsewhere.
-#[cfg(unix)]
 fn check_not_world_writable(path: &Path) -> Result<(), AuthError> {
-    use std::os::unix::fs::PermissionsExt;
-    let metadata = fs::metadata(path).map_err(|e| AuthError::Stat { path: path.to_path_buf(), source: e })?;
-    let mode = metadata.permissions().mode();
-    if mode & 0o002 != 0 {
-        return Err(AuthError::WorldWritable { path: path.to_path_buf(), mode: mode & 0o777 });
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_not_world_writable(_path: &Path) -> Result<(), AuthError> {
-    Ok(())
+    isekai_fs_guard::check_not_world_writable(path).map_err(|e| map_fs_guard_err(path, e))
 }
 
 /// Reads the relay JWT from `~/.config/isekai-ssh/token.json` (or a custom
@@ -328,16 +331,8 @@ impl FileTokenProvider {
         })?;
 
         let response = refresh::refresh_access_token(&token_endpoint, current.client_id.as_deref(), &refresh_token)?;
-        let refreshed = TokenSet {
-            access_token: response.access_token,
-            // Some authorization servers rotate the refresh token on every
-            // use and some don't (RFC 6749 §6 leaves this optional) — keep
-            // the old one if the response didn't include a new one.
-            refresh_token: response.refresh_token.or(Some(refresh_token)),
-            expires_at: response.expires_in.map(|secs| now_unix() + secs as i64),
-            token_endpoint: Some(token_endpoint),
-            client_id: current.client_id,
-        };
+        let refreshed =
+            TokenSet::from_token_response(response, token_endpoint, current.client_id, Some(refresh_token));
         self.save_token_set(&refreshed)?;
         Ok(refreshed)
     }
@@ -346,7 +341,7 @@ impl FileTokenProvider {
 impl TokenProvider for FileTokenProvider {
     /// Returns a currently-valid access token, transparently refreshing it
     /// first if the stored `TokenSet.expires_at` is near/past
-    /// (`ISEKAI_SSH_DESIGN.md`: "`connect` 実行中のトークン失効は裏で自動
+    /// (`archive/ISEKAI_SSH_DESIGN.md`: "`connect` 実行中のトークン失効は裏で自動
     /// リフレッシュを試みる"). Legacy v1 (plain `relay_jwt`, no expiry) files
     /// are returned as-is, matching this method's pre-phase-S-5 behavior
     /// exactly — `needs_refresh()` is always `false` for them.
@@ -533,7 +528,7 @@ mod tests {
     fn token_set_round_trips_through_save_and_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token.json");
-        let ts = token_set("an-access-token", Some(now_unix() + 3600));
+        let ts = token_set("an-access-token", Some(unix_now() + 3600));
 
         save_token_set(&path, &ts).unwrap();
         assert_eq!(load_token_set(&path).unwrap(), ts);
@@ -558,20 +553,20 @@ mod tests {
 
     #[test]
     fn needs_refresh_is_false_when_expires_at_is_far_in_the_future() {
-        let ts = token_set("a-token", Some(now_unix() + 3600));
+        let ts = token_set("a-token", Some(unix_now() + 3600));
         assert!(!ts.needs_refresh());
     }
 
     #[test]
     fn needs_refresh_is_true_when_expires_at_is_in_the_past() {
-        let ts = token_set("a-token", Some(now_unix() - 10));
+        let ts = token_set("a-token", Some(unix_now() - 10));
         assert!(ts.needs_refresh());
     }
 
     #[test]
     fn needs_refresh_is_true_within_the_skew_window() {
         // Expires in 30s — inside the 60s REFRESH_SKEW_SECS window.
-        let ts = token_set("a-token", Some(now_unix() + 30));
+        let ts = token_set("a-token", Some(unix_now() + 30));
         assert!(ts.needs_refresh());
     }
 
@@ -579,7 +574,7 @@ mod tests {
     fn provider_get_relay_jwt_returns_a_non_expired_token_set_as_is() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token.json");
-        let ts = token_set("a-fresh-token", Some(now_unix() + 3600));
+        let ts = token_set("a-fresh-token", Some(unix_now() + 3600));
         save_token_set(&path, &ts).unwrap();
 
         let provider = FileTokenProvider::new(path);
@@ -590,7 +585,7 @@ mod tests {
     fn provider_get_relay_jwt_fails_closed_when_expired_with_no_refresh_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token.json");
-        let mut ts = token_set("an-expired-token", Some(now_unix() - 10));
+        let mut ts = token_set("an-expired-token", Some(unix_now() - 10));
         ts.refresh_token = None;
         save_token_set(&path, &ts).unwrap();
 
@@ -603,7 +598,7 @@ mod tests {
     fn provider_get_relay_jwt_fails_closed_when_expired_with_no_token_endpoint() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token.json");
-        let mut ts = token_set("an-expired-token", Some(now_unix() - 10));
+        let mut ts = token_set("an-expired-token", Some(unix_now() - 10));
         ts.token_endpoint = None;
         save_token_set(&path, &ts).unwrap();
 

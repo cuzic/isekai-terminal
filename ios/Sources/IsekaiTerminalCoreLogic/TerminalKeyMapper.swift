@@ -1,0 +1,63 @@
+import Foundation
+
+/// Phase 1B: ターミナル特殊キー操作(#11c/d)のうち、実機を必要としない
+/// 「キー→制御シーケンス変換」ロジックの部分。キーボードアクセサリバーの
+/// 見た目・レイアウトや選択/コピー/ペーストのUI・Dynamic Typeとは独立した
+/// フォントサイズ設定UIは実機/シミュレータでの目視確認が必要なため、
+/// この実装のスコープには含めない(PLAN.md「Phase Y」節参照)。
+///
+/// 実際の変換ロジックはRust側(`terminal_ctrl_byte`/`terminal_special_key_bytes`)に
+/// 統合済み(Android版`TerminalKeyEncoder.kt`とのAndroid/iOS共通化、rust-core側が
+/// SSOT)。この型は既存のSwift APIをそのまま維持する薄いラッパー。
+/// `applicationCursorMode`(DECCKM)を意識しない、常にCSI形式を返す従来のSwift API
+/// はそのまま残しつつ、内部実装だけをRustへ委譲している。
+public enum TerminalKeyMapper {
+    /// Ctrl+<英字>を対応する制御バイト(0x01〜0x1A)に変換する。
+    /// 大文字・小文字どちらの入力でも同じ結果になる(実際のCtrlキーの挙動に合わせる)。
+    public static func controlByte(for letter: Character) -> UInt8? {
+        guard let ascii = letter.asciiValue else { return nil }
+        return terminalCtrlByte(codePoint: UInt32(ascii))
+    }
+
+    public enum SpecialKey: Equatable {
+        case escape
+        case tab
+        case backspace
+        case delete
+        case arrowUp, arrowDown, arrowLeft, arrowRight
+        case home
+        case end
+        case pageUp
+        case pageDown
+        case functionKey(Int) // F1〜F12
+    }
+
+    /// 特殊キーに対応する、ターミナルへ送信するバイト列(xterm互換のANSI
+    /// エスケープシーケンス)を返す。未対応のfunction key番号は空配列を返す。
+    public static func bytes(for key: SpecialKey) -> [UInt8] {
+        Array(terminalSpecialKeyBytes(key: key.rustKey, applicationCursorMode: false))
+    }
+}
+
+private extension TerminalKeyMapper.SpecialKey {
+    /// このSwift APIには`applicationCursorMode`の概念が無く常にCSI形式を返すため、
+    /// `.backspace`はRust版の`Delete`(0x7F)に、`.delete`(前方削除)はAndroidに
+    /// 存在しないRust版の`ForwardDelete`(`ESC[3~`)に対応する。
+    var rustKey: TerminalSpecialKey {
+        switch self {
+        case .escape: return .escape
+        case .tab: return .tab
+        case .backspace: return .delete
+        case .delete: return .forwardDelete
+        case .arrowUp: return .arrowUp
+        case .arrowDown: return .arrowDown
+        case .arrowLeft: return .arrowLeft
+        case .arrowRight: return .arrowRight
+        case .home: return .home
+        case .end: return .end
+        case .pageUp: return .pageUp
+        case .pageDown: return .pageDown
+        case .functionKey(let n): return .functionKey(number: UInt8(clamping: n))
+        }
+    }
+}

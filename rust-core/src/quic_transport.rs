@@ -16,7 +16,7 @@ use crate::{
     init_logger, CellData, SessionCallback, SshAuth, SshError, RUNTIME,
 };
 use crate::session::SessionCore;
-use crate::transport::{RusshEventHandler, TransportCommand, TransportEvent, run_ssh_channel_loop};
+use crate::transport::{TransportCommand, TransportEvent, run_ssh_channel_loop};
 
 // ── 公開型 ──────────────────────────────────────────────
 
@@ -32,7 +32,10 @@ pub struct QuicConfig {
     pub auth: SshAuth,
     pub cols: u32,
     pub rows: u32,
-    /// スパイク用: TLS 証明書検証をスキップ
+    /// 設計上許容(issue #61 で確認済み)。既定 true(呼び出し元は常に true を渡す)。
+    /// QUIC/TLS 層の証明書検証を無条件でスキップする。詳細な理由・非対称性は
+    /// [`SkipServerVerification`] のコメント、および
+    /// `ConnectionProfile.toQuicConfig`(Kotlin 側)のコメントを参照。
     pub skip_cert_verify: bool,
 }
 
@@ -115,8 +118,28 @@ impl QuicSession {
     }
 }
 
-// ── 証明書検証スキップ (スパイク用) ──────────────────────
-
+// ── 証明書検証スキップ ──────────────────────────────────
+//
+// 設計上許容(issue #61 で到達性・下流の防御を調査確認済み)。この経路(Phase 5B、
+// `TransportPreference::TsshdQuic`、`ProfileEditScreen` で選択可能な現役の transport)は
+// サーバー側に事前インストールされた第三者実装の tsshd へ QUIC で直接つなぎに行く。
+//
+// `isekai_pipe_quic_transport.rs` の `PinnedCertVerifier`(自作 isekai-helper 経路)は
+// cert_sha256 で証明書をピン留めするが、ここでは意図的にそれをしていない:
+//   - helper 経路は、既に認証済みの SSH チャネル経由でヘルパーをブートストラップし、
+//     その ephemeral 自己署名証明書の SHA-256 を「認証済みチャネル越しに」受け取れる
+//     ため、ピン留め可能な信頼の起点が存在する。
+//   - tsshd 経路は、こちらが配布・管理していない既存の tsshd デーモンに最初から QUIC で
+//     直接つなぎに行くため、ピン留めすべき証明書フィンガープリントを事前に得る手段が無い。
+//
+// そのため QUIC/TLS 層自体は非認証のままにし、信頼は QUIC トンネル確立後に流れる
+// 「本物の内側 SSH」のホスト鍵検証(TOFU)に全面委譲する。この委譲は実際に機能している:
+// `RusshEventHandler::check_server_key`(transport.rs)が `TransportEvent::HostKey` を
+// `session_event_loop` 経由で `OrchestratorAdapter::on_host_key`(orchestrator.rs)へ送り、
+// そこから Kotlin の `TerminalSession.onHostKey` → `RealHostKeyChecker`(TOFU 判定・
+// 鍵変更時は明示 reject)へ届く — これは plain TCP SSH と全く同じコードパスであり、
+// この QUIC 層のためだけの特別な bypass は存在しない。内側 SSH のホスト鍵検証ロジックを
+// 変更する際は、この経路の安全性がその検証だけに依存している点に注意すること。
 #[derive(Debug)]
 struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
@@ -278,7 +301,7 @@ async fn open_proxy_stream(
 }
 
 async fn run_quic_transport(
-    config: QuicConfig,
+    mut config: QuicConfig,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
 ) {
@@ -296,23 +319,41 @@ async fn run_quic_transport(
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let handler = RusshEventHandler::new(event_tx.clone());
-    let agent_key = handler.agent_key.clone();
-    let remote_forwards = handler.remote_forwards.clone();
 
-    let session = match client::connect_stream(russh_config, stream, handler).await {
-        Ok(s) => s,
-        Err(e) => {
-            event_tx.send(TransportEvent::Disconnected { reason: Some(e.to_string()) }).await.ok();
+    // tsshd (Phase 5B) はSSH接続プーリング(`archive/ISEKAI_SSH_DESIGN.md`参照)の
+    // スコープ外(今後の課題)。タブごとに毎回新規のQUIC接続・ネストしたSSH認証を行う、
+    // これまでと同じ挙動のまま。
+    let pooled = match crate::transport::establish_ssh_handle_over_stream(
+        russh_config, stream, &config.username, &mut config.auth, false, &event_tx,
+    ).await {
+        Ok(p) => p,
+        Err(msg) => {
+            event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
             return;
         }
     };
 
     // Phase 5B の QUIC (tsshd) transport は agent forwarding 未対応（プロファイルの
     // `SshConfig.agent_forward` 相当のフィールドを `QuicConfig` はまだ持たない）。
-    run_ssh_channel_loop(
-        &config.username, &config.auth, config.cols, config.rows,
-        false, agent_key, false, remote_forwards,
-        session, cmd_rx, event_tx,
-    ).await;
+    run_ssh_channel_loop(&pooled, config.cols, config.rows, false, false, cmd_rx, event_tx).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `build_client_config`はネットワークI/Oを一切行わないrustls/noqのconfig構築のみ
+    // だが、テストが一つも無かった。ここが壊れると(rustlsのバージョン更新等で
+    // `with_safe_default_protocol_versions()`が失敗する、等)このtransportの全接続が
+    // 実機を叩くまで気付かれない致命的な壊れ方をするため、最低限どちらの分岐でも
+    // 構築自体が成功することを確認する。
+    #[test]
+    fn build_client_config_succeeds_with_cert_verification_skipped() {
+        assert!(build_client_config(true).is_ok());
+    }
+
+    #[test]
+    fn build_client_config_succeeds_with_cert_verification_enabled() {
+        assert!(build_client_config(false).is_ok());
+    }
 }

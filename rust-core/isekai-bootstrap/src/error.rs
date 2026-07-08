@@ -1,6 +1,6 @@
 //! Errors a `BootstrapBackend` can fail with. Every stdout-related variant
 //! here exists to enforce the fail-closed contract from
-//! `ISEKAI_SSH_DESIGN.md`'s "`--via` の実装方式" section: a `ssh(1)`
+//! `archive/ISEKAI_SSH_DESIGN.md`'s "`--via` の実装方式" section: a `ssh(1)`
 //! subprocess's stdout may contain *only* the one-line `isekai-helper`
 //! handshake JSON, never anything else.
 
@@ -37,4 +37,19 @@ pub enum BootstrapError {
     /// JSON schema/validation (`isekai_protocol::handshake::decode_handshake_json`).
     #[error("failed to parse handshake JSON: {0}")]
     HandshakeParse(#[from] isekai_protocol::ProtocolError),
+
+    /// `relay_sni`/`relay_jwt` failed the strict allow-list charset
+    /// validation in `isekai_protocol::bootstrap::validate_relay_sni`/
+    /// `validate_relay_jwt` (security review #57). Kept distinct from
+    /// `HandshakeParse` — both wrap a `ProtocolError`, but this failure
+    /// happens before ever talking to the remote host and has nothing to do
+    /// with parsing the handshake response.
+    #[error("invalid relay parameter: {0}")]
+    InvalidRelayParam(String),
+
+    /// A caller-supplied remote binary path (`#@isekai remote-path`) failed
+    /// `isekai_protocol::bootstrap::validate_remote_path`'s strict allow-list
+    /// charset check. Same defense-in-depth rationale as `InvalidRelayParam`.
+    #[error("invalid remote path: {0}")]
+    InvalidRemotePath(String),
 }

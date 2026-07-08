@@ -1344,6 +1344,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 name = "isekai-auth"
 version = "0.1.0"
 dependencies = [
+ "isekai-fs-guard",
  "serde",
  "serde_json",
  "tempfile",
@@ -1367,26 +1368,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "isekai-helper"
-version = "0.3.4"
+name = "isekai-fs-guard"
+version = "0.1.0"
 dependencies = [
- "anyhow",
- "base64",
- "env_logger",
- "hmac",
- "isekai-link-masque",
- "isekai-stun",
- "log",
- "noq",
- "quinn",
- "rand 0.8.6",
- "rcgen 0.13.2",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tokio",
+ "tempfile",
 ]
 
 [[package]]
@@ -1408,6 +1393,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "isekai-pipe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "env_logger",
+ "hmac",
+ "isekai-link-masque",
+ "isekai-pipe-core",
+ "isekai-protocol",
+ "isekai-stun",
+ "isekai-transport",
+ "isekai-trust",
+ "log",
+ "noq",
+ "quinn",
+ "rand 0.8.6",
+ "rcgen 0.13.2",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "isekai-pipe-core"
+version = "0.1.0"
+dependencies = [
+ "isekai-pipe-protocol",
+ "isekai-trust",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "isekai-pipe-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "isekai-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1426,10 +1454,11 @@ dependencies = [
  "base64",
  "clap",
  "env_logger",
+ "glob",
  "isekai-auth",
  "isekai-bootstrap",
+ "isekai-pipe-core",
  "isekai-protocol",
- "isekai-transport",
  "isekai-trust",
  "log",
  "russh",
@@ -1450,11 +1479,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "isekai-terminal-core"
+version = "0.1.0"
+dependencies = [
+ "android_logger",
+ "async-trait",
+ "base64",
+ "flate2",
+ "hmac",
+ "isekai-protocol",
+ "isekai-stun",
+ "log",
+ "md5 0.8.0",
+ "noq",
+ "parking_lot",
+ "proptest",
+ "rand 0.8.6",
+ "rcgen 0.13.2",
+ "russh",
+ "russh-keys",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smol_str",
+ "thiserror 2.0.18",
+ "timed-fsm",
+ "tokio",
+ "tokio-stream",
+ "unicode-width",
+ "uniffi",
+ "vte",
+ "zeroize",
+]
+
+[[package]]
 name = "isekai-transport"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "hmac",
+ "isekai-pipe-core",
  "isekai-protocol",
  "isekai-stun",
  "log",
@@ -1471,6 +1536,7 @@ dependencies = [
 name = "isekai-trust"
 version = "0.1.0"
 dependencies = [
+ "isekai-fs-guard",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
@@ -3442,40 +3508,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "tssh-core"
-version = "0.1.0"
-dependencies = [
- "android_logger",
- "async-trait",
- "base64",
- "flate2",
- "hmac",
- "isekai-protocol",
- "isekai-stun",
- "log",
- "md5 0.8.0",
- "noq",
- "parking_lot",
- "proptest",
- "rand 0.8.6",
- "rcgen 0.13.2",
- "russh",
- "russh-keys",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "smol_str",
- "thiserror 2.0.18",
- "timed-fsm",
- "tokio",
- "tokio-stream",
- "unicode-width",
- "uniffi",
- "vte",
 ]
 
 [[package]]

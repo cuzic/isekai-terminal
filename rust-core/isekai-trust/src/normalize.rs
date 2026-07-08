@@ -1,7 +1,7 @@
 //! Normalizes the many ways a user can spell an SSH connection target
 //! (`myhost`, `myhost:22`, `user@myhost`, `user@myhost:2222`, ...) into the
 //! single `host:port` form used as the trust store's map key
-//! (`ISEKAI_SSH_DESIGN.md` "キーの正規化"). Port defaults to 22 when
+//! (`archive/ISEKAI_SSH_DESIGN.md` "キーの正規化"). Port defaults to 22 when
 //! omitted; the username, if any, is dropped entirely — trust is scoped to
 //! the (host, port) pair, not to who connects. `--via` (the jumphost) is a
 //! separate, non-identity concept and is intentionally not part of this key
@@ -18,6 +18,18 @@ use crate::error::TrustError;
 /// (`[::1]:22`) — that is out of scope for the current MVP and not
 /// exercised by isekai-ssh's target host list yet.
 pub fn normalize_host_port(spec: &str) -> Result<String, TrustError> {
+    let (host, port, _user) = split_user_host_port(spec)?;
+    Ok(format!("{host}:{}", port.unwrap_or(22)))
+}
+
+/// Tokenizes a `[user@]host[:port]` spec into its parts, without collapsing
+/// a missing port to the default `22` (unlike `normalize_host_port`, which
+/// is built on top of this and does that collapsing itself). Shared with
+/// `isekai-ssh`'s `init` command (`init.rs`'s `parse_host_spec`/
+/// `parse_jump_spec`), which needs `user`/`port` kept separate (as
+/// `HostSpec`/`JumpSpec` want them) rather than collapsed into a single
+/// normalized string.
+pub fn split_user_host_port(spec: &str) -> Result<(String, Option<u16>, Option<String>), TrustError> {
     let spec = spec.trim();
     if spec.is_empty() {
         return Err(TrustError::EmptyHost);
@@ -25,9 +37,9 @@ pub fn normalize_host_port(spec: &str) -> Result<String, TrustError> {
 
     // Drop a "user@" prefix. Usernames cannot contain '@', so splitting on
     // the last '@' is unambiguous.
-    let after_user = match spec.rsplit_once('@') {
-        Some((_user, rest)) => rest,
-        None => spec,
+    let (user, after_user) = match spec.rsplit_once('@') {
+        Some((user, rest)) => (Some(user.to_string()), rest),
+        None => (None, spec),
     };
     if after_user.is_empty() {
         return Err(TrustError::EmptyHost);
@@ -39,15 +51,15 @@ pub fn normalize_host_port(spec: &str) -> Result<String, TrustError> {
                 spec: spec.to_string(),
                 reason: format!("{port_str:?} is not a valid port number"),
             })?;
-            (host, port)
+            (host, Some(port))
         }
-        None => (after_user, 22u16),
+        None => (after_user, None),
     };
     if host.is_empty() {
         return Err(TrustError::EmptyHost);
     }
 
-    Ok(format!("{host}:{port}"))
+    Ok((host.to_string(), port, user))
 }
 
 #[cfg(test)]
@@ -98,5 +110,18 @@ mod tests {
     fn rejects_non_numeric_port() {
         let err = normalize_host_port("myhost:abc").unwrap_err();
         assert!(matches!(err, TrustError::InvalidPort { .. }));
+    }
+
+    #[test]
+    fn split_keeps_user_and_port_separate() {
+        assert_eq!(
+            split_user_host_port("alice@myhost:2222").unwrap(),
+            ("myhost".to_string(), Some(2222), Some("alice".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_leaves_port_none_when_missing() {
+        assert_eq!(split_user_host_port("myhost").unwrap(), ("myhost".to_string(), None, None));
     }
 }

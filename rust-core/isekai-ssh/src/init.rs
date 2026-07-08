@@ -1,4 +1,4 @@
-//! `isekai-ssh init` (`ISEKAI_SSH_DESIGN.md` "接続シーケンス", `init` side;
+//! `isekai-ssh init` (`archive/ISEKAI_SSH_DESIGN.md` "接続シーケンス", `init` side;
 //! フェーズ分割案 S-3). Unlike `connect`, this is an explicitly interactive,
 //! one-time-per-host command: it deploys/starts `isekai-helper` on `<host>`
 //! (optionally via a jump host) using `isekai-bootstrap::OpenSshBackend`,
@@ -8,7 +8,7 @@
 //! (`~/.config/isekai-ssh/known_helpers.toml`, `isekai-trust`).
 //!
 //! Unlike `connect.rs`, stdout purity is *not* a constraint here — `init` is
-//! never invoked as `ssh`'s `ProxyCommand` (`ISEKAI_SSH_DESIGN.md` "ユーザー
+//! never invoked as `ssh`'s `ProxyCommand` (`archive/ISEKAI_SSH_DESIGN.md` "ユーザー
 //!体験の流れ" A節) — so the confirmation prompt and its supporting summary
 //! are written directly to stdout.
 //!
@@ -24,7 +24,7 @@
 use std::io::Write as _;
 
 use anyhow::{Context, Result};
-use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, OpenSshBackend, RelayLaunchSpec};
+use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
 use isekai_trust::{HelperTrust, UpdatePolicy};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -44,12 +44,17 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .map(parse_jump_spec)
         .transpose()
         .with_context(|| format!("isekai-ssh: invalid --via spec '{}'", args.via.as_deref().unwrap_or_default()))?;
-    let relay = RelayLaunchSpec { relay_addr: args.relay_addr, relay_sni: args.relay_sni.clone(), relay_jwt: args.relay_jwt.clone() };
+    let relay = RelayLaunchSpec {
+        relay_addr: args.relay_addr,
+        relay_sni: args.relay_sni.clone(),
+        relay_jwt: args.relay_jwt.clone(),
+        idle_lifetime_secs: args.idle_lifetime,
+    };
 
     println!("Deploying isekai-helper to {}...", args.host);
     let backend = OpenSshBackend::new();
     let report = backend
-        .install_and_start(&target, via.as_ref(), &helper_binary, &relay)
+        .install_and_start(&target, via.as_ref(), &helper_binary, &LaunchSpec::Relay(relay), None)
         .await
         .with_context(|| format!("isekai-ssh: failed to deploy/start isekai-helper on '{}'", args.host))?;
     let handshake = &report.handshake;
@@ -58,7 +63,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // field yet (that's still `cert_sha256`'s job — see the crate's own
     // module docs) — use it as the displayed "identity" until isekai-helper
     // grows a dedicated identity key.
-    let identity = handshake.cert_sha256.clone();
+    let identity = handshake.cert_sha256().to_string();
 
     println!();
     println!("Host:            {}", args.host);
@@ -93,11 +98,14 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .with_context(|| format!("isekai-ssh: invalid host spec '{}'", args.host))?;
     let now = now_rfc3339();
     // `relay_public_addr` is the address a real deployment's isekai-helper
-    // reports back once its `--relay` tunnel is up (`HELPER_PROTOCOL.md`).
+    // reports back once its `--relay` tunnel is up (`archive/HELPER_PROTOCOL.md`).
     // Falling back to the `--relay-addr` we were given only guards against a
     // helper that (e.g. in a test double) never populated the field; a real
     // isekai-helper launched with `--relay` always sets it.
-    let cached_relay_addr = handshake.relay_public_addr.clone().unwrap_or_else(|| args.relay_addr.to_string());
+    let cached_relay_addr = handshake
+        .relay_public_addr()
+        .map(str::to_string)
+        .unwrap_or_else(|| args.relay_addr.to_string());
 
     store.insert(
         key.clone(),
@@ -111,7 +119,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
             trusted_at: now.clone(),
             last_seen_at: now,
             cached_relay_addr,
-            cached_cert_sha256: handshake.cert_sha256.clone(),
+            cached_cert_sha256: handshake.cert_sha256().to_string(),
             cached_session_secret: handshake.session_secret.clone(),
         },
     );
@@ -165,12 +173,12 @@ fn format_rfc3339_utc(unix_secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-/// Parses a `[user@]host[:port]` spec into a `HostSpec`, mirroring
-/// `isekai_trust::normalize_host_port`'s tokenization but keeping user/port
+/// Parses a `[user@]host[:port]` spec into a `HostSpec`, reusing
+/// `isekai_trust::split_user_host_port`'s tokenization but keeping user/port
 /// as separate optional fields (as `HostSpec`/`ssh(1)` want them) instead of
 /// collapsing to a single normalized `host:port` string.
 fn parse_host_spec(spec: &str) -> Result<HostSpec> {
-    let (host, port, user) = split_user_host_port(spec)?;
+    let (host, port, user) = isekai_trust::split_user_host_port(spec)?;
     let mut hs = HostSpec::new(host);
     if let Some(port) = port {
         hs = hs.with_port(port);
@@ -183,7 +191,7 @@ fn parse_host_spec(spec: &str) -> Result<HostSpec> {
 
 /// Same tokenization as `parse_host_spec`, for the `--via` jump host.
 fn parse_jump_spec(spec: &str) -> Result<JumpSpec> {
-    let (host, port, user) = split_user_host_port(spec)?;
+    let (host, port, user) = isekai_trust::split_user_host_port(spec)?;
     let mut js = JumpSpec::new(host);
     if let Some(port) = port {
         js = js.with_port(port);
@@ -192,28 +200,6 @@ fn parse_jump_spec(spec: &str) -> Result<JumpSpec> {
         js = js.with_user(user);
     }
     Ok(js)
-}
-
-fn split_user_host_port(spec: &str) -> Result<(String, Option<u16>, Option<String>)> {
-    let spec = spec.trim();
-    anyhow::ensure!(!spec.is_empty(), "empty host spec");
-
-    let (user, rest) = match spec.rsplit_once('@') {
-        Some((user, rest)) => (Some(user.to_string()), rest),
-        None => (None, spec),
-    };
-    anyhow::ensure!(!rest.is_empty(), "empty host in spec '{spec}'");
-
-    let (host, port) = match rest.rsplit_once(':') {
-        Some((host, port_str)) => {
-            let port: u16 = port_str.parse().with_context(|| format!("'{port_str}' is not a valid port number"))?;
-            (host, Some(port))
-        }
-        None => (rest, None),
-    };
-    anyhow::ensure!(!host.is_empty(), "empty host in spec '{spec}'");
-
-    Ok((host.to_string(), port, user))
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 //! 設計の背景・スコープは `/home/cuzic/.claude/plans/typed-dancing-codd.md` および
 //! `PLAN.md` の「Phase 9」節を参照。
 //!
-//! `helper_quic_transport.rs`（Phase 7/8、単一パス + 完全喪失後の明示的な`RESUME`
+//! `isekai_pipe_quic_transport.rs`（Phase 7/8、単一パス + 完全喪失後の明示的な`RESUME`
 //! 再接続。後にquinnからnoqへ移行）とは別の新規トランスポート。こちらは`noq`のQUIC
 //! multipathを使い、同一QUICコネクションの中にpath0（`ssh_host`、通常は
 //! Tailscale経由アドレス）とpath1（`direct_host`、直接到達可能なアドレス）を
@@ -11,8 +11,8 @@
 //! （SSHセッションが載っているのはコネクション1本であり、pathの生死は
 //! アプリ層から見て透過的——`noq`が内部でどのpathを使うか選ぶ）。
 //!
-//! `helper_quic_transport.rs`のPhase 7/8コードは一切変更していない
-//! （既存の3 e2eテスト+tssh-core 66テストで無回帰を確認済み、Phase 9-1）。
+//! `isekai_pipe_quic_transport.rs`のPhase 7/8コードは一切変更していない
+//! （既存の3 e2eテスト+isekai-terminal-core 66テストで無回帰を確認済み、Phase 9-1）。
 //! HELPER_PROTOCOL.mdのHELLO/ACK/proof契約・埋め込みヘルパーバイナリ・
 //! ブートストラップロジックはそちらの`pub(crate)`公開分をそのまま再利用する。
 
@@ -32,9 +32,9 @@ use log::{info, warn};
 use noq::udp::{RecvMeta, Transmit};
 use noq::{AsyncUdpSocket, UdpSender};
 
-use crate::helper_quic_transport::{
+use crate::isekai_pipe_quic_transport::{
     self, PinnedCertVerifier, ALPN, EXPORTER_LABEL, FRAME_ACK, FRAME_HELLO, FRAME_REJECT_AUTH,
-    FRAME_REJECT_DUPLICATE, FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED,
+    FRAME_REJECT_DUPLICATE, FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED, RESUME_GRACE_LEN,
 };
 use crate::transport::{run_ssh_channel_loop, TransportCommand, TransportEvent};
 use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
@@ -82,7 +82,7 @@ const DIRECT_MULTIPATH_BIND_PORT: u16 = 45823;
 // ── 公開型 ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct MultipathHelperQuicConfig {
+pub struct MultipathIsekaiPipeQuicConfig {
     /// ブートストラップに使う SSH ホスト。通常は Tailscale 経由アドレス（path0）。
     pub ssh_host: String,
     pub ssh_port: u16,
@@ -116,6 +116,13 @@ pub struct MultipathHelperQuicConfig {
     pub rows: u32,
     /// ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
     pub jump: Option<JumpConfig>,
+    /// isekai-helperのQUIC待受ポートをユーザー指定で固定する(`None`なら、
+    /// `direct_host`が設定されている場合のみ既定値`DIRECT_MULTIPATH_BIND_PORT`を使う、
+    /// 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
+    /// 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
+    /// `None`の場合はRust側で従来通りの既定値フォールバックを維持する
+    /// (`IsekaiPipeQuicConfig.bind_port`のdocコメントも参照)。
+    pub bind_port: Option<u16>,
 }
 
 /// noq issue #738（`open_path()`に`local_ip`明示指定した新規pathでPATH_RESPONSEが
@@ -134,29 +141,32 @@ struct RebindRequest {
 }
 
 #[derive(uniffi::Object)]
-pub struct MultipathHelperQuicSession {
-    config: MultipathHelperQuicConfig,
+pub struct MultipathIsekaiPipeQuicSession {
+    config: MultipathIsekaiPipeQuicConfig,
     core: SessionCore,
     rebind_tx: StdMutex<Option<tokio::sync::mpsc::Sender<RebindRequest>>>,
 }
 
 #[uniffi::export]
-pub fn create_multipath_helper_quic_session(config: MultipathHelperQuicConfig) -> Arc<MultipathHelperQuicSession> {
+pub fn create_multipath_isekai_pipe_quic_session(config: MultipathIsekaiPipeQuicConfig) -> Arc<MultipathIsekaiPipeQuicSession> {
     init_logger();
-    Arc::new(MultipathHelperQuicSession { config, core: SessionCore::new(), rebind_tx: StdMutex::new(None) })
+    Arc::new(MultipathIsekaiPipeQuicSession { config, core: SessionCore::new(), rebind_tx: StdMutex::new(None) })
 }
 
 #[uniffi::export]
-impl MultipathHelperQuicSession {
+impl MultipathIsekaiPipeQuicSession {
     /// フォールバック無し。path0/path1 のブートストラップ・QUIC 接続に失敗したら
-    /// エラーを返す（`TransportPreference::IsekaiHelperQuicMultipath` 相当）。
+    /// エラーを返す（`TransportPreference::IsekaiPipeQuicMultipath` 相当）。
     pub fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         let (rebind_tx, rebind_rx) = tokio::sync::mpsc::channel(4);
         *self.rebind_tx.lock().unwrap() = Some(rebind_tx);
+        // ブートストラップ用SSHのホスト鍵検証を本セッションのcallbackに委譲する
+        // (`isekai_pipe_quic_transport::bootstrap_helper_via_ssh`のNOTE参照)。
+        let host_key_callback = self.core.callback();
         RUNTIME.spawn(async move {
-            match try_connect_multipath(&config, rebind_rx, event_tx.clone()).await {
+            match try_connect_multipath(&config, rebind_rx, event_tx.clone(), host_key_callback).await {
                 Ok(stream) => run_over_stream(config, stream, cmd_rx, event_tx).await,
                 Err(e) => {
                     warn!("multipath_quic: connect failed: {e}");
@@ -214,10 +224,19 @@ impl MultipathHelperQuicSession {
     pub fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
     }
+
+    /// Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+    /// 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+    /// `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+    /// 何もしない(物理Wi-Fi/セルラー切替はpath0/path1のmultipath自体が別途担う、
+    /// `rebind_to_fd`参照)。
+    pub fn notify_network_lost(&self) {
+        self.core.notify_network_lost(true);
+    }
 }
 
 // SessionOrchestrator からのみ呼ばれる内部API(uniffi には直接は出さない)。
-impl MultipathHelperQuicSession {
+impl MultipathIsekaiPipeQuicSession {
     /// Phase 12: per-session theme。
     pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
         self.core.set_theme(theme);
@@ -312,7 +331,7 @@ pub(crate) struct NamedUdpSocket {
     pub(crate) socket: Arc<tokio::net::UdpSocket>,
 }
 
-/// Phase 9-5実機検証用: `helper_quic_transport.rs`/`faulty_udp_socket.rs`が既に
+/// Phase 9-5実機検証用: `isekai_pipe_quic_transport.rs`/`faulty_udp_socket.rs`が既に
 /// 使っている`debug_fault::shared_injector()`（`UdpFaultInjector`）をそのまま
 /// 再利用する。新しいフォルト注入state・adb broadcast・UniFFI関数は一切増やさない
 /// ——既存の`isekai-fault-latency300`/`isekai-fault-loss200`等のclipwireターゲット
@@ -471,7 +490,7 @@ fn udp_socket_from_raw_fd(fd: RawFd) -> Result<Arc<tokio::net::UdpSocket>, Strin
     Ok(Arc::new(tokio_sock))
 }
 
-// ── QUIC 接続（noq、HELPER_PROTOCOL.md契約はhelper_quic_transport.rsと共通） ──
+// ── QUIC 接続（noq、HELPER_PROTOCOL.md契約はisekai_pipe_quic_transport.rsと共通） ──
 
 fn build_pinned_client_config(cert_sha256_hex: &str) -> Result<noq::ClientConfig, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -485,7 +504,7 @@ fn build_pinned_client_config(cert_sha256_hex: &str) -> Result<noq::ClientConfig
         }))
         .with_no_client_auth();
     crypto.alpn_protocols = vec![ALPN.to_vec()];
-    // 0-RTT はここでも使わない（HELPER_PROTOCOL.md契約、helper_quic_transport.rsと同じ）。
+    // 0-RTT はここでも使わない（HELPER_PROTOCOL.md契約、isekai_pipe_quic_transport.rsと同じ）。
 
     let quic_crypto = noq::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|e| format!("QUIC crypto config failed: {e}"))?;
@@ -515,15 +534,21 @@ async fn hello_ack(
 ) -> Result<(noq::SendStream, noq::RecvStream), String> {
     let proof = compute_proof(conn, session_secret)?;
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi failed: {e}"))?;
-    let mut hello = Vec::with_capacity(33);
+    let mut hello = Vec::with_capacity(37);
     hello.push(FRAME_HELLO);
     hello.extend_from_slice(&proof);
+    // No client-configurable resume-grace concept on Android yet — `0` means
+    // "no preference, use the server's own default/max".
+    hello.extend_from_slice(&0u32.to_be_bytes());
     send.write_all(&hello).await.map_err(|e| format!("HELLO write failed: {e}"))?;
 
-    let mut resp = [0u8; 1];
-    recv.read_exact(&mut resp).await.map_err(|e| format!("ACK read failed: {e}"))?;
-    match resp[0] {
-        FRAME_ACK => {}
+    let mut type_byte = [0u8; 1];
+    recv.read_exact(&mut type_byte).await.map_err(|e| format!("ACK read failed: {e}"))?;
+    match type_byte[0] {
+        FRAME_ACK => {
+            let mut rest = [0u8; RESUME_GRACE_LEN];
+            recv.read_exact(&mut rest).await.map_err(|e| format!("ACK read failed: {e}"))?;
+        }
         FRAME_REJECT_AUTH => return Err("isekai-helper rejected: auth (proof mismatch)".to_string()),
         FRAME_REJECT_DUPLICATE => return Err("isekai-helper rejected: duplicate active connection".to_string()),
         FRAME_REJECT_TARGET => return Err("isekai-helper rejected: target unreachable".to_string()),
@@ -591,7 +616,7 @@ async fn establish_multipath_connection(
 
     info!("multipath_quic: connecting path0 -> {path0_addr}");
     let conn = endpoint
-        .connect(path0_addr, "isekai-helper.local")
+        .connect(path0_addr, "isekai-pipe.local")
         .map_err(|e| format!("connect setup failed: {e}"))?
         .await
         .map_err(|e| format!("QUIC handshake failed: {e}"))?;
@@ -846,7 +871,7 @@ pub(crate) fn has_zero_response(prev: Option<&noq::PathStats>, curr: &noq::PathS
     sent_delta > 0 && recv_delta == 0
 }
 
-/// `MultipathHelperQuicConfig`のwifi_fd/wifi_local_ip・cellular_fd/cellular_local_ip
+/// `MultipathIsekaiPipeQuicConfig`のwifi_fd/wifi_local_ip・cellular_fd/cellular_local_ip
 /// から`PhysicalPathCandidate`を組み立てる。fdとlocal_ipが両方揃っている場合のみ
 /// 候補にする（片方だけ来ることは想定しないが、防御的に無視する）。ローカルIPの
 /// パースに失敗した場合もその候補だけ無視する（他の候補・path0/path1には影響しない）。
@@ -855,7 +880,7 @@ pub(crate) fn has_zero_response(prev: Option<&noq::PathStats>, curr: &noq::PathS
 /// （同一remoteに複数local IPでopen_pathするとnoq側でvalidationが失敗する実機での
 /// 発見に対する回避策の検証用、Phase 9-4追加調査）。
 async fn physical_path_candidates(
-    config: &MultipathHelperQuicConfig,
+    config: &MultipathIsekaiPipeQuicConfig,
     default_target: SocketAddr,
     listen_port: u16,
 ) -> Vec<PhysicalPathCandidate> {
@@ -898,30 +923,35 @@ async fn physical_path_candidates(
 }
 
 async fn try_connect_multipath(
-    config: &MultipathHelperQuicConfig,
+    config: &MultipathIsekaiPipeQuicConfig,
     rebind_rx: tokio::sync::mpsc::Receiver<RebindRequest>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+    host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<(noq::SendStream, noq::RecvStream), String> {
-    let bind_port = config.direct_host.is_some().then_some(DIRECT_MULTIPATH_BIND_PORT);
-    let handshake = helper_quic_transport::bootstrap_helper_via_ssh(
+    // ユーザーが明示指定していればそれを優先し、無指定ならdirect_host使用時のみ
+    // 既定の固定ポートにフォールバックする(後方互換)。
+    let bind_port = config.bind_port
+        .or_else(|| config.direct_host.is_some().then_some(DIRECT_MULTIPATH_BIND_PORT));
+    let handshake = isekai_pipe_quic_transport::bootstrap_helper_via_ssh(
         &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump, bind_port,
-        &crate::helper_bootstrap::HelperP2pMode::None,
+        &crate::helper_bootstrap::IsekaiPipeP2pMode::None, host_key_callback,
     )
     .await?;
 
-    let cert_sha256_hex = handshake.cert_sha256.clone();
+    let cert_sha256_hex = handshake.cert_sha256().to_string();
     let session_secret = base64::engine::general_purpose::STANDARD
         .decode(&handshake.session_secret)
         .map_err(|e| format!("invalid session_secret encoding: {e}"))?;
 
-    let path0_addr: SocketAddr = tokio::net::lookup_host((config.ssh_host.as_str(), handshake.listen_port))
+    let path0_addr = isekai_pipe_quic_transport::resolve_direct_by_bootstrap_host(&config.ssh_host, &handshake)
         .await
-        .map_err(|e| format!("DNS lookup failed (path0/{}): {e}", config.ssh_host))?
-        .next()
-        .ok_or_else(|| format!("no address resolved for path0 host {}", config.ssh_host))?;
+        .map_err(|e| format!("multipath path0: {e}"))?;
 
+    let direct_by_bootstrap_host_port = handshake
+        .direct_by_bootstrap_host_port()
+        .ok_or("handshake did not advertise a direct-by-bootstrap-host candidate")?;
     let path1_addr = match &config.direct_host {
-        Some(host) => tokio::net::lookup_host((host.as_str(), handshake.listen_port))
+        Some(host) => tokio::net::lookup_host((host.as_str(), direct_by_bootstrap_host_port))
             .await
             .ok()
             .and_then(|mut it| it.next()),
@@ -932,7 +962,7 @@ async fn try_connect_multipath(
     }
 
     let physical = match path1_addr {
-        Some(addr) => physical_path_candidates(config, addr, handshake.listen_port).await,
+        Some(addr) => physical_path_candidates(config, addr, direct_by_bootstrap_host_port).await,
         None => Vec::new(),
     };
     let (conn, _broker, endpoint) = establish_multipath_connection(
@@ -969,7 +999,7 @@ fn spawn_rebind_listener(endpoint: noq::Endpoint, mut rebind_rx: tokio::sync::mp
 }
 
 async fn run_over_stream(
-    config: MultipathHelperQuicConfig,
+    mut config: MultipathIsekaiPipeQuicConfig,
     (send, recv): (noq::SendStream, noq::RecvStream),
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
@@ -979,9 +1009,6 @@ async fn run_over_stream(
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let handler = crate::transport::RusshEventHandler::new(event_tx.clone());
-    let agent_key = handler.agent_key.clone();
-    let remote_forwards = handler.remote_forwards.clone();
 
     // path0/path1 の内訳はアプリ層から見えない単一の双方向バイトストリーム
     // （noqが内部でpathを選ぶ）。resume/reattach層は無いので、Phase 7の
@@ -990,20 +1017,21 @@ async fn run_over_stream(
     // そのままjoinしてrusshに渡す。
     let stream = tokio::io::join(recv, send);
 
-    let session = match client::connect_stream(russh_config, stream, handler).await {
-        Ok(s) => s,
-        Err(e) => {
-            event_tx.send(TransportEvent::Disconnected { reason: Some(e.to_string()) }).await.ok();
+    // マルチパス(実験的opt-in機能)はSSH接続プーリング(`archive/ISEKAI_SSH_DESIGN.md`
+    // 「今後の課題」参照)のスコープ外。タブごとに毎回新規のQUIC接続・ネストしたSSH認証を
+    // 行う、これまでと同じ挙動のまま。
+    let pooled = match crate::transport::establish_ssh_handle_over_stream(
+        russh_config, stream, &config.username, &mut config.auth, false, &event_tx,
+    ).await {
+        Ok(p) => p,
+        Err(msg) => {
+            event_tx.send(TransportEvent::Disconnected { reason: Some(msg) }).await.ok();
             return;
         }
     };
 
-    // MultipathHelperQuicConfig は agent forwarding 未対応（HelperQuicConfig と同様）。
-    run_ssh_channel_loop(
-        &config.username, &config.auth, config.cols, config.rows,
-        false, agent_key, false, remote_forwards,
-        session, cmd_rx, event_tx,
-    ).await;
+    // MultipathIsekaiPipeQuicConfig は agent forwarding 未対応（IsekaiPipeQuicConfig と同様）。
+    run_ssh_channel_loop(&pooled, config.cols, config.rows, false, false, cmd_rx, event_tx).await;
 }
 
 #[cfg(test)]
@@ -1016,8 +1044,32 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    /// 実UDP/QUICを使うテストのpath検証待ちで共通に使うポーリング上限。
+    ///
+    /// このワーカーは複数の`claude`エージェント/Gradleデーモンが同時稼働する開発機で
+    /// 動くことが常態化しており(`uptime`のload averageが4〜5になることがある)、
+    /// もともとの固定`for _ in 0..50 { sleep(100ms) }`(=5秒)では、path確立自体は
+    /// 正常でも単にCPUスケジューリング待ちで間に合わずflakyに失敗することを確認した
+    /// (`HEALTH_CHECK_INTERVAL`が3秒であることを踏まえても、5秒は1周分の余裕しかない)。
+    /// 実際に壊れている場合はこの上限まで待っても永遠にVICmatchしないため、上限自体を
+    /// 緩めても「本当のバグを見逃す」方向には倒れない。
+    const PATH_VALIDATION_POLL_TIMEOUT: Duration = Duration::from_secs(20);
+    const PATH_VALIDATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// `broker.get(id)`が`want`になるまで`PATH_VALIDATION_POLL_TIMEOUT`を上限にポーリングする。
+    /// 上限に達した場合は最後に観測した状態を返す(呼び出し側でassert_eqのメッセージに使う)。
+    async fn poll_until_path_state(broker: &PathBroker, id: PathCandidateId, want: PathState) -> PathState {
+        let mut last = broker.get(id);
+        let deadline = tokio::time::Instant::now() + PATH_VALIDATION_POLL_TIMEOUT;
+        while last != want && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(PATH_VALIDATION_POLL_INTERVAL).await;
+            last = broker.get(id);
+        }
+        last
+    }
+
     async fn start_test_server() -> (u16, String, [u8; 32]) {
-        let cert = rcgen::generate_simple_self_signed(vec!["isekai-helper.local".to_string()]).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["isekai-pipe.local".to_string()]).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().clone());
         let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
         let cert_sha256_hex = {
@@ -1062,7 +1114,10 @@ mod tests {
                         let secret = secret;
                         let conn = conn.clone();
                         tokio::spawn(async move {
-                            let mut hello = [0u8; 33];
+                            // 37 bytes: type(1) + proof(32) + requested_resume_grace_secs(4)
+                            // — `hello_ack`（このテストが検証対象とする本番クライアント
+                            // ロジック）の現在の送信フォーマットと揃える。
+                            let mut hello = [0u8; 37];
                             if recv.read_exact(&mut hello).await.is_err() { return; }
                             let mut exporter = [0u8; 32];
                             if conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"").is_err() { return; }
@@ -1073,7 +1128,12 @@ mod tests {
                                 let _ = send.write_all(&[FRAME_REJECT_AUTH]).await;
                                 return;
                             }
-                            let _ = send.write_all(&[FRAME_ACK]).await;
+                            // ACKもtype(1) + effective_resume_grace_secs(4)の5byte——
+                            // `hello_ack`側は`FRAME_ACK`と分かった時点で追加4byteを読むので、
+                            // 何を返すかは任意（テストは値そのものを検証しない）。
+                            let mut ack = vec![FRAME_ACK];
+                            ack.extend_from_slice(&0u32.to_be_bytes());
+                            let _ = send.write_all(&ack).await;
                             if let Ok(data) = recv.read_to_end(4096).await {
                                 let mut reply = b"echo:".to_vec();
                                 reply.extend_from_slice(&data);
@@ -1103,11 +1163,8 @@ mod tests {
         drop(recv);
 
         // path1 の確立はバックグラウンドタスクなので少し待つ。
-        for _ in 0..50 {
-            if broker.get(PathCandidateId::Secondary) == PathState::Validated { break; }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(broker.get(PathCandidateId::Secondary), PathState::Validated, "path1 should validate within timeout");
+        let state = poll_until_path_state(&broker, PathCandidateId::Secondary, PathState::Validated).await;
+        assert_eq!(state, PathState::Validated, "path1 should validate within timeout");
         assert!(broker.any_validated());
 
         conn.close(0u32.into(), b"test done");
@@ -1123,7 +1180,19 @@ mod tests {
         drop(send);
         drop(recv);
 
-        assert_eq!(broker.get(PathCandidateId::Primary), PathState::Validated);
+        // 確立直後にPrimaryが一時的にDegraded判定されることがある(健全性チェックが
+        // heavy load下でRTTを大きく観測した場合)。すぐ回復するはずなのでポーリングするが、
+        // load averageが高い開発機ではDegradedのまま回復しないことさえある——これは
+        // 「実際にRTTが閾値を超えている」という健全性チェックとしては正しい結果であり、
+        // このテストが検証したい「direct_hostが無ければpath0だけが確立し、path1は
+        // 開かれない」こととは無関係。Validated/Degradedのどちらでも「到達はしている」
+        // ことに変わりは無いので、両方を許容する(Unknown/Failedなら本当に確立して
+        // いないので、そちらは今まで通り失敗として扱う)。
+        let state = poll_until_path_state(&broker, PathCandidateId::Primary, PathState::Validated).await;
+        assert!(
+            matches!(state, PathState::Validated | PathState::Degraded),
+            "path0 should have established (Validated or Degraded), got {state:?}"
+        );
         assert_eq!(broker.get(PathCandidateId::Secondary), PathState::Unknown);
 
         conn.close(0u32.into(), b"test done");
@@ -1149,13 +1218,16 @@ mod tests {
         {
             let proof = compute_proof(&conn, &secret).unwrap();
             let (mut send, mut recv) = conn.open_bi().await.unwrap();
-            let mut hello = Vec::with_capacity(33);
+            let mut hello = Vec::with_capacity(37);
             hello.push(FRAME_HELLO);
             hello.extend_from_slice(&proof);
+            hello.extend_from_slice(&0u32.to_be_bytes());
             send.write_all(&hello).await.unwrap();
             let mut resp = [0u8; 1];
             recv.read_exact(&mut resp).await.unwrap();
             assert_eq!(resp[0], FRAME_ACK);
+            let mut resp_rest = [0u8; 4];
+            recv.read_exact(&mut resp_rest).await.unwrap();
             send.write_all(b"before-rebind").await.unwrap();
             send.finish().unwrap();
             let reply = recv.read_to_end(4096).await.unwrap();
@@ -1179,13 +1251,16 @@ mod tests {
         {
             let proof = compute_proof(&conn, &secret).unwrap();
             let (mut send, mut recv) = conn.open_bi().await.unwrap();
-            let mut hello = Vec::with_capacity(33);
+            let mut hello = Vec::with_capacity(37);
             hello.push(FRAME_HELLO);
             hello.extend_from_slice(&proof);
+            hello.extend_from_slice(&0u32.to_be_bytes());
             send.write_all(&hello).await.unwrap();
             let mut resp = [0u8; 1];
             recv.read_exact(&mut resp).await.unwrap();
             assert_eq!(resp[0], FRAME_ACK);
+            let mut resp_rest = [0u8; 4];
+            recv.read_exact(&mut resp_rest).await.unwrap();
             send.write_all(b"after-rebind").await.unwrap();
             send.finish().unwrap();
             let reply = recv.read_to_end(4096).await.unwrap();
@@ -1204,19 +1279,29 @@ mod tests {
         let path1: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
 
         let (conn, broker, _endpoint) = establish_multipath_connection(path0, Some(path1), Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
-        for _ in 0..50 {
-            if broker.get(PathCandidateId::Secondary) == PathState::Validated { break; }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(broker.get(PathCandidateId::Secondary), PathState::Validated);
+        let state = poll_until_path_state(&broker, PathCandidateId::Secondary, PathState::Validated).await;
+        assert_eq!(state, PathState::Validated, "path1 should validate within timeout");
 
         if let Some(p0) = conn.path(noq::PathId::ZERO) {
             let _ = p0.close();
         }
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // path0 close後もコネクションは生きており、新しいHELLO/ACK往復に応答できる。
-        let (send, recv) = hello_ack(&conn, &secret).await.expect("connection should survive path0 closing");
+        // heavy load下ではclose直後すぐには応答できないことがあるため、固定の1回
+        // sleep+1回試行ではなくリトライする(本当に生き延びていなければ何度試しても
+        // 失敗するので、リトライを増やしても偽陽性にはならない)。
+        let mut last_err = None;
+        let mut result = None;
+        for attempt in 0..10 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            match hello_ack(&conn, &secret).await {
+                Ok(pair) => { result = Some(pair); break; }
+                Err(e) => { last_err = Some((attempt, e)); }
+            }
+        }
+        let (send, recv) = result.unwrap_or_else(|| {
+            panic!("connection should survive path0 closing (last error: {last_err:?})")
+        });
         drop(send);
         drop(recv);
 
@@ -1257,12 +1342,9 @@ mod tests {
         let (conn, broker, _endpoint) =
             establish_multipath_connection(path0, Some(direct), physical, &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
 
-        for _ in 0..50 {
-            if broker.get(PathCandidateId::PhysicalWifi) == PathState::Validated { break; }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let state = poll_until_path_state(&broker, PathCandidateId::PhysicalWifi, PathState::Validated).await;
         assert_eq!(
-            broker.get(PathCandidateId::PhysicalWifi), PathState::Validated,
+            state, PathState::Validated,
             "physical wifi path should validate within timeout",
         );
 
@@ -1402,13 +1484,13 @@ mod tests {
     }
 
     /// Phase 9-5実機検証の前段: loopbackで実際に`debug_fault`（既存のフォルト注入
-    /// インフラ、`helper_quic_transport.rs`/`faulty_udp_socket.rs`と共有）を使って
+    /// インフラ、`isekai_pipe_quic_transport.rs`/`faulty_udp_socket.rs`と共有）を使って
     /// 遅延を注入し、ヘルスモニタが本当にPathState::Degradedへ遷移させ、
     /// 遅延解除後にValidatedへ回復することを確認する。
     ///
     /// `debug_fault::shared_injector()`はプロセスグローバルな状態なので、
     /// このテストは他のフォルト注入系テストと同時実行しないこと
-    /// （`cargo test -p tssh-core --lib multipath_transport::tests::path0_degrades_and_recovers_under_injected_latency`
+    /// （`cargo test -p isekai-terminal-core --lib multipath_transport::tests::path0_degrades_and_recovers_under_injected_latency`
     /// のように単独実行する）。
     #[tokio::test]
     async fn path0_degrades_and_recovers_under_injected_latency() {

@@ -1,14 +1,15 @@
 //! Pure, dependency-light protocol types shared by isekai-terminal
-//! (`tssh-core`), isekai-helper, and the future `isekai-ssh` CLI
-//! (`ISEKAI_SSH_DESIGN.md` "実装方針"). This crate must never depend on
+//! (`isekai-terminal-core`), isekai-helper, and the future `isekai-ssh` CLI
+//! (`archive/ISEKAI_SSH_DESIGN.md` "実装方針"). This crate must never depend on
 //! tokio/quinn/noq/russh/uniffi or any Android-specific type — it only knows
 //! about byte layouts, JSON schemas, and the value types built on top of
-//! them. I/O, QUIC, and SSH live in `isekai-transport`/`tssh-core` instead.
+//! them. I/O, QUIC, and SSH live in `isekai-transport`/`isekai-terminal-core` instead.
 //!
-//! Resume-specific frames (`RESUME`/`RESUME_ACK`, `HELPER_PROTOCOL.md` §7.3)
+//! Resume-specific frames (`RESUME`/`RESUME_ACK`, `archive/HELPER_PROTOCOL.md` §7.3)
 //! live in the `resume` module (Phase S-4a), byte-compatible with the
 //! existing `pub(crate)` implementation in `rust-core/src/resume_client.rs`.
 
+pub mod bootstrap;
 pub mod error;
 pub mod handshake;
 pub mod hello;
@@ -49,7 +50,7 @@ pub fn identify_frame_type(byte: u8) -> Result<FrameType, ProtocolError> {
         hello::FRAME_HELLO => Ok(FrameType::Hello),
         hello::FRAME_ACK => Ok(FrameType::Ack),
         // `resume::FRAME_RESUME_REJECT_AUTH` is defined as this same byte
-        // (`HELPER_PROTOCOL.md` §7.3 reuses HELLO/ACK's reject vocabulary for
+        // (`archive/HELPER_PROTOCOL.md` §7.3 reuses HELLO/ACK's reject vocabulary for
         // RESUME's proof check), so this one match arm covers both frame
         // families and intentionally reports `RejectAuth` either way.
         hello::FRAME_REJECT_AUTH => Ok(FrameType::RejectAuth),

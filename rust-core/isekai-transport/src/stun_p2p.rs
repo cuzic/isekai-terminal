@@ -1,5 +1,5 @@
 //! STUN+SSH rendezvous P2P QUIC connection establishment
-//! (`ISEKAI_SSH_DESIGN.md` phase S-0d-2), extracted from `tssh-core`'s
+//! (`archive/ISEKAI_SSH_DESIGN.md` phase S-0d-2), extracted from `isekai-terminal-core`'s
 //! `isekai_stun_p2p_transport.rs`.
 //!
 //! Scope of this module (mirrors `try_connect_isekai_stun_p2p` /
@@ -14,7 +14,7 @@
 //!   HELLO/proof/ACK handshake against the peer
 //!   (`relay::connect_and_handshake`, shared with `connect_via_relay`).
 //!
-//! Explicitly **out of scope** here (`ISEKAI_SSH_DESIGN.md`'s task
+//! Explicitly **out of scope** here (`archive/ISEKAI_SSH_DESIGN.md`'s task
 //! description for this phase):
 //! - The SSH-bootstrap step that actually exchanges `our_observed_addr`/
 //!   `peer_addr` out-of-band between the two sides
@@ -56,9 +56,9 @@ const PUNCH_PROBE_PAYLOAD: &[u8] = b"isekai-punch";
 #[derive(Debug, Clone)]
 pub struct StunP2pTarget {
     /// The peer's (isekai-helper's) own STUN-observed address
-    /// (`HelperHandshake::stun_observed_addr` on the Android side), obtained
+    /// (`IsekaiPipeHandshake::stun_observed_addr` on the Android side), obtained
     /// out-of-band by the caller. Exchanging this value is explicitly out of
-    /// scope for this crate (`ISEKAI_SSH_DESIGN.md` S-6: a future
+    /// scope for this crate (`archive/ISEKAI_SSH_DESIGN.md` S-6: a future
     /// `isekai-bootstrap`/`isekai-ssh` concern).
     pub peer_addr: SocketAddr,
     /// TLS SNI / QUIC server name (`RemoteSpec::server_name`'s docs: ignored
@@ -75,7 +75,7 @@ pub struct StunP2pTarget {
 /// stream, plus this side's own STUN-observed address — in case the caller
 /// still needs to hand it to a signaling/bootstrap channel. Producing that
 /// value is this crate's job; wiring it anywhere is not
-/// (`ISEKAI_SSH_DESIGN.md` S-6).
+/// (`archive/ISEKAI_SSH_DESIGN.md` S-6).
 pub struct StunP2pConnection {
     pub our_observed_addr: SocketAddr,
     pub stream: Box<dyn ByteStream>,
@@ -96,6 +96,7 @@ pub struct StunP2pConnection {
 pub async fn connect_stun_p2p(
     stun_server: SocketAddr,
     target: &StunP2pTarget,
+    identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<StunP2pConnection, TransportError> {
     let bind_addr = BindSpec::any_ipv4().local_addr;
     let socket = tokio::net::UdpSocket::bind(bind_addr)
@@ -125,7 +126,10 @@ pub async fn connect_stun_p2p(
         server_name: target.server_name.clone(),
         cert_sha256_hex: target.cert_sha256_hex.clone(),
     };
-    let stream = connect_and_handshake(endpoint.as_ref(), remote, &target.session_secret).await?;
+    // No resume support on this path (module docs), so there is no grace
+    // period to request — `0` ("no preference").
+    let (_conn, stream, _proof, _effective_resume_grace_secs) =
+        connect_and_handshake(endpoint.as_ref(), remote, &target.session_secret, 0, identity).await?;
 
     Ok(StunP2pConnection { our_observed_addr, stream })
 }

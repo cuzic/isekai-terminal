@@ -1,0 +1,106 @@
+name: iOS SSH vertical slice check
+
+# Phase 1A-8: ハードコードした接続先(rust-core/scripts/ios-fixture/が起動する
+# 使い捨てsshd)へ実際にSSH接続し、認証・PTY・echoコマンド・日本語送受信・切断が
+# 一通り動くことをiOS Simulator上で検証する(PLAN.md「Phase Y」節参照)。
+# ios-rust-core-check.ymlとは別ワークフローにし、fixtureが無い環境でも
+# 既存のテストスイートが壊れないようにしている
+# (SshVerticalSliceTests自体もfixture不在ならXCTSkipする二重の安全策)。
+#
+# Phase 1D: KeyManagerTests.testGeneratedKeyAuthenticatesAgainstRealSshd(生成した
+# ed25519鍵が実際にsshdで認証に使えることの検証)もこのfixtureを使うため、
+# ここで-only-testingに追加している。
+# (TerminalSessionControllerのfixture E2Eテストは、CredentialVault/Keychainに
+# 触れるためios-app-build-check.yml側のIsekaiTerminalAppTestsに置いている。
+# そちらでも同じfixtureを別途起動する。)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust-core/**"
+      - "ios/**"
+      - ".github/workflows/ios-ssh-vertical-slice-check.yml"
+  pull_request:
+    paths:
+      - "rust-core/**"
+      - "ios/**"
+      - ".github/workflows/ios-ssh-vertical-slice-check.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-ssh-vertical-slice-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  vertical-slice:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust iOS targets
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+
+      - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
+        run: |
+          brew install zig
+          cargo install cargo-zigbuild --locked
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          bash rust-core/scripts/build-isekai-pipe-musl.sh
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ios-ssh-slice-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            ios-ssh-slice-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build XCFramework
+        run: bash rust-core/scripts/build-ios-xcframework.sh
+
+      - name: Start sshd fixture
+        run: bash rust-core/scripts/ios-fixture/start-sshd-fixture.sh /tmp/ios-fixture 2299
+
+      - name: Pick an available iOS Simulator device
+        id: sim
+        run: |
+          set -euo pipefail
+          DEVICE_NAME=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data["devices"].items():
+              if "iOS" not in runtime:
+                  continue
+              for d in devices:
+                  if d.get("isAvailable") and d.get("name", "").startswith("iPhone"):
+                      print(d["name"])
+                      sys.exit(0)
+          sys.exit(1)
+          ')
+          echo "device_name=$DEVICE_NAME" >> "$GITHUB_OUTPUT"
+          echo "picked simulator: $DEVICE_NAME"
+
+      - name: Run SSH vertical slice test on iOS Simulator
+        working-directory: ios
+        run: |
+          xcodebuild test \
+            -scheme IsekaiTerminalCore-Package \
+            -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}' \
+            -only-testing:IsekaiTerminalCoreTests/SshVerticalSliceTests \
+            -only-testing:IsekaiTerminalCoreLogicTests/KeyManagerTests/testGeneratedKeyAuthenticatesAgainstRealSshd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Stop sshd fixture
+        if: always()
+        run: bash rust-core/scripts/ios-fixture/stop-sshd-fixture.sh /tmp/ios-fixture

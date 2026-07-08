@@ -14,4 +14,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "isekai-terminal"
-include(":app")
+include(":android")

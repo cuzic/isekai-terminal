@@ -1,14 +1,14 @@
 //! RFC 8628 OAuth 2.0 Device Authorization Grant client
-//! (`ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー", フェーズ分割案 S-5). Used by
+//! (`archive/ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー", フェーズ分割案 S-5). Used by
 //! `isekai-ssh login` (`isekai-ssh/src/login.rs`) to obtain an initial
 //! access/refresh token pair without embedding any OAuth client secret in
 //! the CLI — device flow is a public-client flow (RFC 8628 §1). PKCE / an
 //! in-app OAuth client are explicitly out of scope for this phase
-//! (`ISEKAI_SSH_DESIGN.md` "含めないもの").
+//! (`archive/ISEKAI_SSH_DESIGN.md` "含めないもの").
 //!
 //! The device-authorization/token endpoints and `client_id` are not
 //! hardcoded here: the real Auth0 tenant URL isn't fixed yet
-//! (`ISEKAI_SSH_DESIGN.md` "引き続き未決の項目"), so `isekai-ssh login`
+//! (`archive/ISEKAI_SSH_DESIGN.md` "引き続き未決の項目"), so `isekai-ssh login`
 //! exposes them as CLI flags (`--device-auth-endpoint`/`--token-endpoint`/
 //! `--client-id`) that get threaded straight into `DeviceFlowConfig`.
 //!

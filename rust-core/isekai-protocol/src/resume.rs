@@ -1,24 +1,24 @@
-//! `RESUME`/`RESUME_ACK` frames (`HELPER_PROTOCOL.md` §7.3), byte-for-byte
+//! `RESUME`/`RESUME_ACK` frames (`archive/HELPER_PROTOCOL.md` §7.3), byte-for-byte
 //! compatible with the wire format already implemented (as `pub(crate)`,
-//! non-shareable outside `tssh-core`) by `rust-core/src/resume_client.rs`
-//! and the `reattach_fn` closures in `helper_quic_transport.rs` /
+//! non-shareable outside `isekai-terminal-core`) by `rust-core/src/resume_client.rs`
+//! and the `reattach_fn` closures in `isekai_pipe_quic_transport.rs` /
 //! `isekai_link_relay_transport.rs` / `isekai_stun_p2p_transport.rs`. This
 //! module reimplements only the byte layout as a new, shareable type —
-//! `rust-core/src/` itself is intentionally left untouched (`ISEKAI_SSH_DESIGN.md`
-//! Phase S-4a scope: `tssh-core` migrating onto these types is future work).
+//! `rust-core/src/` itself is intentionally left untouched (`archive/ISEKAI_SSH_DESIGN.md`
+//! Phase S-4a scope: `isekai-terminal-core` migrating onto these types is future work).
 //!
-//! Per `ISEKAI_SSH_DESIGN.md` "resume を ProxyCommand の背後に隠す" /
+//! Per `archive/ISEKAI_SSH_DESIGN.md` "resume を ProxyCommand の背後に隠す" /
 //! "session_id は識別子であって認証情報ではない", the `RESUME` frame carries
 //! a `resume_proof` alongside `session_id` specifically to prevent session
 //! hijacking by anyone who merely guesses/observes a `session_id`. That
 //! `resume_proof` field already exists in the current wire format (see
-//! `helper_quic_transport.rs`'s `reattach_fn`, which builds
+//! `isekai_pipe_quic_transport.rs`'s `reattach_fn`, which builds
 //! `[RESUME] || session_id || resume_proof || client_sent_offset ||
 //! client_delivered_offset`) — this module does not need to invent a new
 //! field for it, only a type. `resume_proof` computation itself
 //! (`HMAC-SHA256(session_secret, exporter || session_id)`) needs a live QUIC
 //! connection's exporter and stays out of this I/O-free crate, in
-//! `isekai-transport`/`tssh-core`; here `ResumeProof` is deliberately just an
+//! `isekai-transport`/`isekai-terminal-core`; here `ResumeProof` is deliberately just an
 //! opaque 32-byte value, the same treatment `hello::Proof` gets for the
 //! initial HELLO proof.
 
@@ -27,12 +27,12 @@ use crate::hello::FRAME_REJECT_AUTH;
 use crate::offset::{C2hHelperCommittedOffset, C2hSentOffset, H2cClientDeliveredOffset, H2cSentOffset};
 use crate::session_id::{decode_session_id, SessionId, SESSION_ID_LEN};
 
-/// `HELPER_PROTOCOL.md` §4 reserves this value for `RESUME` ahead of time; it
+/// `archive/HELPER_PROTOCOL.md` §4 reserves this value for `RESUME` ahead of time; it
 /// is not adjacent to the HELLO/ACK frame bytes (`0x01`/`0x02`).
 pub const FRAME_RESUME: u8 = 0x03;
 pub const FRAME_RESUME_ACK: u8 = 0x13;
 
-/// `RESUME` rejection reasons (`HELPER_PROTOCOL.md` §7.3 "RESUME の拒否応答").
+/// `RESUME` rejection reasons (`archive/HELPER_PROTOCOL.md` §7.3 "RESUME の拒否応答").
 /// `Auth` deliberately reuses `hello::FRAME_REJECT_AUTH` (`0xFF`) rather than
 /// minting a new byte — the spec explicitly re-purposes the existing
 /// HELLO/ACK reject vocabulary for resume's proof check, since both mean
@@ -49,7 +49,7 @@ pub const RESUME_FRAME_LEN: usize = 1 + SESSION_ID_LEN + RESUME_PROOF_LEN + 8 + 
 pub const RESUME_ACK_FRAME_LEN: usize = 1 + 8 + 8;
 
 /// `resume_proof = HMAC-SHA256(session_secret, exporter || session_id)`
-/// (`HELPER_PROTOCOL.md` §7.3). Computing this needs the live QUIC
+/// (`archive/HELPER_PROTOCOL.md` §7.3). Computing this needs the live QUIC
 /// connection's `export_keying_material`, which this I/O-free crate has no
 /// access to — so, like `hello::Proof`, it is modeled here only as an opaque
 /// 32-byte value. `Debug` hides the bytes so a stray `{:?}` in a log line
@@ -68,7 +68,7 @@ impl ResumeProof {
 
     /// Constant-time comparison, mirroring `hello::Proof::ct_eq` — resume
     /// proof checks are exactly as security-sensitive as the initial HELLO
-    /// proof check (`HELPER_PROTOCOL.md` §4 constant-time mandate applies
+    /// proof check (`archive/HELPER_PROTOCOL.md` §4 constant-time mandate applies
     /// equally here per §7.3).
     pub fn ct_eq(&self, other: &ResumeProof) -> bool {
         let mut diff = 0u8;
@@ -86,7 +86,7 @@ impl std::fmt::Debug for ResumeProof {
 }
 
 /// `RESUME` request (client → helper, new QUIC connection's control stream
-/// head; `HELPER_PROTOCOL.md` §7.3).
+/// head; `archive/HELPER_PROTOCOL.md` §7.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResumeFrame {
     pub session_id: SessionId,
@@ -97,7 +97,7 @@ pub struct ResumeFrame {
 
 /// Encodes `[[FRAME_RESUME] || session_id || resume_proof ||
 /// client_sent_offset || client_delivered_offset]`, matching
-/// `helper_quic_transport.rs`'s `reattach_fn` byte-for-byte.
+/// `isekai_pipe_quic_transport.rs`'s `reattach_fn` byte-for-byte.
 pub fn encode_resume(frame: &ResumeFrame) -> Vec<u8> {
     let mut buf = Vec::with_capacity(RESUME_FRAME_LEN);
     buf.push(FRAME_RESUME);
@@ -136,7 +136,7 @@ pub fn decode_resume(buf: &[u8]) -> Result<ResumeFrame, ProtocolError> {
     Ok(ResumeFrame { session_id, resume_proof: ResumeProof::new(proof_bytes), client_sent_offset, client_delivered_offset })
 }
 
-/// `RESUME_ACK` response (helper → client; `HELPER_PROTOCOL.md` §7.3).
+/// `RESUME_ACK` response (helper → client; `archive/HELPER_PROTOCOL.md` §7.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResumeAckFrame {
     pub helper_committed_offset: C2hHelperCommittedOffset,
@@ -145,7 +145,7 @@ pub struct ResumeAckFrame {
 
 /// Encodes `[[FRAME_RESUME_ACK] || helper_committed_offset ||
 /// helper_sent_offset]`, matching the response body
-/// `helper_quic_transport.rs`'s `reattach_fn` reads byte-for-byte.
+/// `isekai_pipe_quic_transport.rs`'s `reattach_fn` reads byte-for-byte.
 pub fn encode_resume_ack(frame: &ResumeAckFrame) -> Vec<u8> {
     let mut buf = Vec::with_capacity(RESUME_ACK_FRAME_LEN);
     buf.push(FRAME_RESUME_ACK);
@@ -168,7 +168,7 @@ pub fn decode_resume_ack(buf: &[u8]) -> Result<ResumeAckFrame, ProtocolError> {
     Ok(ResumeAckFrame { helper_committed_offset, helper_sent_offset })
 }
 
-/// Why a `RESUME` request was rejected (`HELPER_PROTOCOL.md` §7.3). Each
+/// Why a `RESUME` request was rejected (`archive/HELPER_PROTOCOL.md` §7.3). Each
 /// variant is a single-byte response with no body, unlike `RESUME_ACK`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeRejectReason {
@@ -305,9 +305,9 @@ mod tests {
         assert!(!a.ct_eq(&b));
     }
 
-    /// Existing-wire-format compatibility check (`ISEKAI_SSH_DESIGN.md` Phase
+    /// Existing-wire-format compatibility check (`archive/ISEKAI_SSH_DESIGN.md` Phase
     /// S-4a acceptance criteria): builds the exact byte sequence that
-    /// `rust-core/src/helper_quic_transport.rs`'s `reattach_fn` closure
+    /// `rust-core/src/isekai_pipe_quic_transport.rs`'s `reattach_fn` closure
     /// produces —
     /// `let mut frame = vec![resume_client::RESUME];`
     /// `frame.extend_from_slice(&session_id);`
@@ -317,7 +317,7 @@ mod tests {
     /// — using the same constant marker byte values
     /// (`resume_client::RESUME == 0x03`, matching `FRAME_RESUME` here) and
     /// confirms this crate's decoder parses it correctly. `resume_client.rs`
-    /// is `pub(crate)` inside `tssh-core` and out of scope to modify/import
+    /// is `pub(crate)` inside `isekai-terminal-core` and out of scope to modify/import
     /// from here (Phase S-4a instructions), so the bytes are reconstructed
     /// from the documented constants instead of calling into that module.
     #[test]
@@ -342,7 +342,7 @@ mod tests {
     }
 
     /// Same as above for `RESUME_ACK`, mirroring the read side of
-    /// `helper_quic_transport.rs`'s `reattach_fn`:
+    /// `isekai_pipe_quic_transport.rs`'s `reattach_fn`:
     /// `let mut resp = [0u8; 1]; recv.read_exact(&mut resp)...`
     /// `if resp[0] != resume_client::RESUME_ACK { ... }`
     /// `let mut rest = [0u8; 16]; recv.read_exact(&mut rest)...`

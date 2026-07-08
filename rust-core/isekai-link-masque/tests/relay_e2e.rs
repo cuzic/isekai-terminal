@@ -193,7 +193,7 @@ async fn full_tunnel_round_trips_real_quic_traffic_through_the_relay() {
 
     // `isekai-helper`'s own noq server endpoint, using the relay tunnel as
     // its abstract socket instead of a real bound UDP socket.
-    let (downstream_cert, downstream_key) = generate_cert("isekai-helper.local");
+    let (downstream_cert, downstream_key) = generate_cert("isekai-pipe.local");
     let downstream_cert_der = downstream_cert.clone();
     let helper_endpoint = noq::Endpoint::new_with_abstract_socket(
         noq::EndpointConfig::default(),
@@ -239,7 +239,7 @@ async fn full_tunnel_round_trips_real_quic_traffic_through_the_relay() {
 
     let conn = tokio::time::timeout(
         Duration::from_secs(10),
-        terminal_endpoint.connect(proxy_public_address, "isekai-helper.local").unwrap(),
+        terminal_endpoint.connect(proxy_public_address, "isekai-pipe.local").unwrap(),
     )
     .await
     .expect("QUIC handshake through the relay tunnel timed out")

@@ -1,6 +1,6 @@
 //! Trust store for `isekai-ssh`: tracks which `isekai-helper` instances have
 //! been explicitly trusted for which SSH targets
-//! (`ISEKAI_SSH_DESIGN.md` "trust store のファイル形式").
+//! (`archive/ISEKAI_SSH_DESIGN.md` "trust store のファイル形式").
 //!
 //! Unlike `isekai-protocol`, this crate performs real filesystem I/O
 //! (reading/writing `~/.config/isekai-ssh/known_helpers.toml`), but it is
@@ -31,6 +31,6 @@ pub mod schema;
 pub mod store;
 
 pub use error::TrustError;
-pub use normalize::normalize_host_port;
+pub use normalize::{normalize_host_port, split_user_host_port};
 pub use schema::{HelperTrust, TrustStore, UpdatePolicy};
 pub use store::{default_config_dir, default_trust_store_path, load_trust_store, save_trust_store};

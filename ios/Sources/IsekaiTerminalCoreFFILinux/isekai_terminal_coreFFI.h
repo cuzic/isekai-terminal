@@ -1,0 +1,1 @@
+../IsekaiTerminalCoreLogic/generated/isekai_terminal_coreFFI.h

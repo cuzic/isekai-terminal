@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- CHANGE_NETWORK_STATE (needed by NoqDualFdMultipathSpikeTest's
+         requestNetwork(TRANSPORT_CELLULAR)) is now granted via the main manifest
+         (Phase 9-4, PhysicalPathProvider), so it no longer needs to be declared here. -->
+
+    <application>
+        <receiver
+            android:name=".debug.FaultInjectionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="tools.isekai.terminal.debug.SET_LATENCY" />
+                <action android:name="tools.isekai.terminal.debug.SET_LOSS" />
+                <action android:name="tools.isekai.terminal.debug.CUT" />
+                <action android:name="tools.isekai.terminal.debug.RESTORE" />
+                <action android:name="tools.isekai.terminal.debug.CLEAR" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

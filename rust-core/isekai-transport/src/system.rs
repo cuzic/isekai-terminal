@@ -1,15 +1,15 @@
 //! `SystemQuicEndpointFactory`: the CLI's concrete `QuicEndpointFactory`,
 //! built directly on `noq` + `rustls` + a plain `tokio::net::UdpSocket`
-//! (`ISEKAI_SSH_DESIGN.md` "実装方針": "中身はnoqとrustlsを直接使い、
+//! (`archive/ISEKAI_SSH_DESIGN.md` "実装方針": "中身はnoqとrustlsを直接使い、
 //! tokio::net::UdpSocketをbindしてnoq::Endpointのクライアントとして使う").
 //!
 //! Deliberately must never reference `FaultyUdpSocket`, UniFFI, or any other
-//! Android/`tssh-core`-specific type — this crate is also linked into
+//! Android/`isekai-terminal-core`-specific type — this crate is also linked into
 //! `isekai-ssh`, a plain CLI binary with no Android runtime.
 //!
 //! The certificate-pinning logic (`PinnedCertVerifier`) and QUIC transport
 //! tuning (idle timeout / keepalive interval) are copied verbatim from
-//! `helper_quic_transport.rs::establish_quic_connection_with_socket` and its
+//! `isekai_pipe_quic_transport.rs::establish_quic_connection_with_socket` and its
 //! `PinnedCertVerifier`, minus the `FaultyUdpSocket` parameter — this crate
 //! binds a real `tokio::net::UdpSocket` instead.
 
@@ -28,19 +28,19 @@ use crate::traits::{ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf, QuicCon
 use crate::types::{BindSpec, RemoteSpec};
 
 /// QUIC connection is declared dead after this much silence. Matches
-/// `helper_quic_transport.rs::CLIENT_MAX_IDLE_TIMEOUT` — see that file's
+/// `isekai_pipe_quic_transport.rs::CLIENT_MAX_IDLE_TIMEOUT` — see that file's
 /// comment on the Phase 8-4b timing bug this specific value avoids (must be
 /// short enough that a dead connection is detected before isekai-helper's
 /// parked-session TTL expires).
 const CLIENT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// PING interval to keep NAT UDP mappings alive. Matches
-/// `helper_quic_transport.rs::CLIENT_KEEP_ALIVE_INTERVAL` (kept at 1/3 of the
+/// `isekai_pipe_quic_transport.rs::CLIENT_KEEP_ALIVE_INTERVAL` (kept at 1/3 of the
 /// idle timeout so a handful of lost PINGs can be tolerated).
 const CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Verifies the server's leaf certificate against a pinned SHA-256
 /// fingerprint instead of a CA chain — copied from
-/// `helper_quic_transport.rs::PinnedCertVerifier`. isekai-helper presents an
+/// `isekai_pipe_quic_transport.rs::PinnedCertVerifier`. isekai-helper presents an
 /// ephemeral self-signed cert, so ordinary CA validation cannot apply; the
 /// fingerprint itself is the trust root, delivered out-of-band over the
 /// bootstrap SSH channel (`HandshakeJson::cert_sha256`).
@@ -111,7 +111,7 @@ fn client_config_for(cert_sha256_hex: &str) -> Result<noq::ClientConfig, Transpo
         }))
         .with_no_client_auth();
     crypto.alpn_protocols = vec![ALPN.to_vec()];
-    // 0-RTT is never used client-side either (`HELPER_PROTOCOL.md`: "0-RTT は
+    // 0-RTT is never used client-side either (`archive/HELPER_PROTOCOL.md`: "0-RTT は
     // クライアント・サーバー双方で完全に無効化する"). Not calling
     // `Connecting::into_0rtt()` anywhere in this module is what implements
     // that half of the contract.
@@ -140,7 +140,7 @@ fn client_config_for(cert_sha256_hex: &str) -> Result<noq::ClientConfig, Transpo
 /// probe step must happen *before* handing the socket to `noq::Endpoint`, to
 /// avoid a race between noq's internal `poll_recv` and raw reads on the same
 /// socket) — this is the "既存の生ソケットをQUICエンドポイントにラップする"
-/// logic `ISEKAI_SSH_DESIGN.md` calls out as needing exactly one
+/// logic `archive/ISEKAI_SSH_DESIGN.md` calls out as needing exactly one
 /// implementation shared by both call sites.
 pub(crate) fn quic_endpoint_from_std_socket(
     std_socket: std::net::UdpSocket,

@@ -1,4 +1,4 @@
-//! `isekai-ssh login`/`logout` (`ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー",
+//! `isekai-ssh login`/`logout` (`archive/ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー",
 //! フェーズ分割案 S-5).
 //!
 //! `login` runs an RFC 8628 Device Authorization Grant, implemented in
@@ -16,7 +16,7 @@
 //!
 //! The three OAuth endpoints/`client_id` are required CLI flags
 //! (`cli::LoginArgs`) rather than hardcoded: the real Auth0 tenant URL isn't
-//! fixed yet (`ISEKAI_SSH_DESIGN.md` "引き続き未決の項目"), so hardcoding a
+//! fixed yet (`archive/ISEKAI_SSH_DESIGN.md` "引き続き未決の項目"), so hardcoding a
 //! placeholder here would just have to be replaced later anyway.
 //!
 //! `isekai_auth::device_flow`'s HTTP calls are blocking (`ureq`, see that
@@ -64,13 +64,8 @@ pub async fn run(args: LoginArgs) -> Result<()> {
             .context("isekai-ssh: token polling task panicked")??
     };
 
-    let token_set = TokenSet {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        expires_at: token.expires_in.map(|secs| unix_now() + secs as i64),
-        token_endpoint: Some(args.token_endpoint.clone()),
-        client_id: Some(args.client_id.clone()),
-    };
+    let token_set =
+        TokenSet::from_token_response(token, args.token_endpoint.clone(), Some(args.client_id.clone()), None);
 
     let provider = FileTokenProvider::from_default_path()
         .context("isekai-ssh: could not determine the token file path (is $HOME set?)")?;
@@ -93,11 +88,4 @@ pub async fn run_logout() -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("isekai-ssh: failed to remove {}", path.display())),
     }
     Ok(())
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }

@@ -117,7 +117,7 @@ cd /home/cuzic/android-tssh
 
 ### logcat フィルタ起動（別ターミナルで常時表示）
 ```bash
-adb logcat -s TsshNav TsshProfile TsshKey TsshSSH TsshIME TsshSvc TsshVM
+adb logcat -s IsekaiTerminalNav IsekaiTerminalProfile IsekaiTerminalKey IsekaiTerminalSSH IsekaiTerminalIME IsekaiTerminalSvc IsekaiTerminalVM
 ```
 
 ---
@@ -129,9 +129,9 @@ adb logcat -s TsshNav TsshProfile TsshKey TsshSSH TsshIME TsshSvc TsshVM
 
 ### 期待ログ
 ```
-TsshVM: TerminalViewModel created (rotationRecovery=false)
-TsshNav: → ProfileList
-TsshProfile: loaded 0 profile(s): []
+IsekaiTerminalVM: TerminalViewModel created (rotationRecovery=false)
+IsekaiTerminalNav: → ProfileList
+IsekaiTerminalProfile: loaded 0 profile(s): []
 ```
 
 ### NG 時の確認ポイント
@@ -150,10 +150,10 @@ TsshProfile: loaded 0 profile(s): []
 
 ### 期待ログ
 ```
-TsshNav: → ProfileEdit(new)
-TsshProfile: saving profile: label='test' host=<IP>:22 user=<USER> authType=password keyId=null id=new
-TsshNav: → ProfileList
-TsshProfile: loaded 1 profile(s): ['test']
+IsekaiTerminalNav: → ProfileEdit(new)
+IsekaiTerminalProfile: saving profile: label='test' host=<IP>:22 user=<USER> authType=password keyId=null id=new
+IsekaiTerminalNav: → ProfileList
+IsekaiTerminalProfile: loaded 1 profile(s): ['test']
 ```
 
 ### NG 時の確認ポイント
@@ -170,11 +170,11 @@ TsshProfile: loaded 1 profile(s): ['test']
 
 ### 期待ログ（編集）
 ```
-TsshProfile: edit: 'test' id=1
-TsshNav: → ProfileEdit(id=1 'test')
-TsshProfile: saving profile: label='test2' ... id=1
-TsshNav: → ProfileList
-TsshProfile: loaded 1 profile(s): ['test2']
+IsekaiTerminalProfile: edit: 'test' id=1
+IsekaiTerminalNav: → ProfileEdit(id=1 'test')
+IsekaiTerminalProfile: saving profile: label='test2' ... id=1
+IsekaiTerminalNav: → ProfileList
+IsekaiTerminalProfile: loaded 1 profile(s): ['test2']
 ```
 
 ### 手順（削除）
@@ -182,8 +182,8 @@ TsshProfile: loaded 1 profile(s): ['test2']
 
 ### 期待ログ（削除）
 ```
-TsshProfile: deleted profile id=1 'test2'
-TsshProfile: loaded 0 profile(s): []
+IsekaiTerminalProfile: deleted profile id=1 'test2'
+IsekaiTerminalProfile: loaded 0 profile(s): []
 ```
 
 ---
@@ -204,16 +204,16 @@ TsshProfile: loaded 0 profile(s): []
 
 ### 期待ログ
 ```
-TsshNav: → KeyList
-TsshKey: loaded 0 key(s): []
-TsshNav: → KeyImport
-TsshKey: file selected via SAF: id_ed25519.pem uri=content://...
-TsshKey: import start: label='mykey' file='id_ed25519.pem'
-TsshKey: read PEM: <N> bytes
-TsshKey: encrypted key saved → /data/data/tools.isekai.terminal/files/keys/<UUID>.enc
-TsshKey: key saved to DB: id=1 label='mykey'
-TsshNav: → KeyList
-TsshKey: loaded 1 key(s): ['mykey']
+IsekaiTerminalNav: → KeyList
+IsekaiTerminalKey: loaded 0 key(s): []
+IsekaiTerminalNav: → KeyImport
+IsekaiTerminalKey: file selected via SAF: id_ed25519.pem uri=content://...
+IsekaiTerminalKey: import start: label='mykey' file='id_ed25519.pem'
+IsekaiTerminalKey: read PEM: <N> bytes
+IsekaiTerminalKey: encrypted key saved → /data/data/tools.isekai.terminal/files/keys/<UUID>.enc
+IsekaiTerminalKey: key saved to DB: id=1 label='mykey'
+IsekaiTerminalNav: → KeyList
+IsekaiTerminalKey: loaded 1 key(s): ['mykey']
 ```
 
 ### NG 時の確認ポイント
@@ -235,24 +235,24 @@ TsshKey: loaded 1 key(s): ['mykey']
 
 ### 期待ログ
 ```
-TsshProfile: tap → password dialog: 'test' <USER>@<IP>:22
-TsshProfile: password dialog confirmed for: 'test'
-TsshNav: ProfileList → Terminal via profile='test' authType=password
-TsshNav: → Terminal(profile='test' host=<IP>)
-TsshVM: TerminalViewModel created (rotationRecovery=false)
-TsshSvc: service created
-TsshSvc: onStartCommand label='SSH セッション' flags=0 startId=1
-TsshVM: service bound OK (session=false)
-TsshSSH: TerminalScreen: launch connectProfile 'test' <USER>@<IP>:22
-TsshSSH: connectProfile: 'test' <USER>@<IP>:22 authType=password keyId=null
-TsshSSH: buildAuth: password auth → OK
-TsshSSH: connect: <USER>@<IP>:22
-TsshSSH: network available
-TsshSSH: host key fingerprint: SHA256:...
-TsshSSH: ✓ connected: <USER>@<IP>:22
-TsshSSH: first data: <N>B
-TsshSSH: terminal geometry: <C>×<R> px=<W>×<H> connected=true
-TsshSSH: resize → <C>×<R>
+IsekaiTerminalProfile: tap → password dialog: 'test' <USER>@<IP>:22
+IsekaiTerminalProfile: password dialog confirmed for: 'test'
+IsekaiTerminalNav: ProfileList → Terminal via profile='test' authType=password
+IsekaiTerminalNav: → Terminal(profile='test' host=<IP>)
+IsekaiTerminalVM: TerminalViewModel created (rotationRecovery=false)
+IsekaiTerminalSvc: service created
+IsekaiTerminalSvc: onStartCommand label='SSH セッション' flags=0 startId=1
+IsekaiTerminalVM: service bound OK (session=false)
+IsekaiTerminalSSH: TerminalScreen: launch connectProfile 'test' <USER>@<IP>:22
+IsekaiTerminalSSH: connectProfile: 'test' <USER>@<IP>:22 authType=password keyId=null
+IsekaiTerminalSSH: buildAuth: password auth → OK
+IsekaiTerminalSSH: connect: <USER>@<IP>:22
+IsekaiTerminalSSH: network available
+IsekaiTerminalSSH: host key fingerprint: SHA256:...
+IsekaiTerminalSSH: ✓ connected: <USER>@<IP>:22
+IsekaiTerminalSSH: first data: <N>B
+IsekaiTerminalSSH: terminal geometry: <C>×<R> px=<W>×<H> connected=true
+IsekaiTerminalSSH: resize → <C>×<R>
 ```
 
 ### NG 時の確認ポイント
@@ -260,7 +260,7 @@ TsshSSH: resize → <C>×<R>
 - `connect error:` → ネットワーク到達不可 or 認証失敗（エラー本文を確認）
 - `✓ connected` が出るが画面が黒いまま → `first data` を確認、出ていれば terminal geometry 計算の問題
 - `terminal geometry` は出るが `resize` が出ない → `connected=false` のまま（`collectAsStateWithLifecycle` の遅延）
-- `TsshVM: service bound OK` が出ない → Foreground Service が起動できていない（Manifest の `foregroundServiceType` を確認）
+- `IsekaiTerminalVM: service bound OK` が出ない → Foreground Service が起動できていない（Manifest の `foregroundServiceType` を確認）
 
 ---
 
@@ -275,13 +275,13 @@ TsshSSH: resize → <C>×<R>
 
 ### 期待ログ
 ```
-TsshSSH: connectProfile: 'test' ... authType=key keyId=1
-TsshSSH: buildAuth: loading key id=1
-TsshSSH: buildAuth: decrypting key 'mykey' path=.../keys/<UUID>.enc
-TsshSSH: buildAuth: key file exists=true size=<N>B
-TsshSSH: buildAuth: key decrypted OK (<M> bytes) → SshAuth.PublicKey
-TsshSSH: connect: <USER>@<IP>:22
-TsshSSH: ✓ connected: <USER>@<IP>:22
+IsekaiTerminalSSH: connectProfile: 'test' ... authType=key keyId=1
+IsekaiTerminalSSH: buildAuth: loading key id=1
+IsekaiTerminalSSH: buildAuth: decrypting key 'mykey' path=.../keys/<UUID>.enc
+IsekaiTerminalSSH: buildAuth: key file exists=true size=<N>B
+IsekaiTerminalSSH: buildAuth: key decrypted OK (<M> bytes) → SshAuth.PublicKey
+IsekaiTerminalSSH: connect: <USER>@<IP>:22
+IsekaiTerminalSSH: ✓ connected: <USER>@<IP>:22
 ```
 
 ### NG 時の確認ポイント
@@ -300,7 +300,7 @@ TsshSSH: ✓ connected: <USER>@<IP>:22
 
 ### 期待ログ
 ```
-TsshIME: input view focus: true (onSendBytes=true)
+IsekaiTerminalIME: input view focus: true (onSendBytes=true)
 ```
 （ `ls -la` + Enter の各キーは `setComposingText`/`commitText`/`sendKeyEvent` 経由で送信されるが、1 文字ずつは DEBUG レベルのため通常ログには出ない）
 
@@ -313,8 +313,8 @@ TsshIME: input view focus: true (onSendBytes=true)
 
 ### 期待ログ
 ```
-TsshIME: composing start: '日'
-TsshIME: composing finish: '日本語' (3 chars) → sent
+IsekaiTerminalIME: composing start: '日'
+IsekaiTerminalIME: composing finish: '日本語' (3 chars) → sent
 ```
 
 ### NG 時の確認ポイント
@@ -327,7 +327,7 @@ TsshIME: composing finish: '日本語' (3 chars) → sent
 
 ### 期待ログ
 ```
-TsshIME: paste <N> chars → bracketed paste
+IsekaiTerminalIME: paste <N> chars → bracketed paste
 ```
 
 ### NG 時の確認ポイント
@@ -342,8 +342,8 @@ TsshIME: paste <N> chars → bracketed paste
 
 ### 期待ログ
 ```
-TsshSSH: terminal geometry: <C>×<R> px=...    ← 文字サイズ変化でジオメトリ再計算
-TsshSSH: resize → <C>×<R>
+IsekaiTerminalSSH: terminal geometry: <C>×<R> px=...    ← 文字サイズ変化でジオメトリ再計算
+IsekaiTerminalSSH: resize → <C>×<R>
 ```
 
 ### NG 時の確認ポイント
@@ -358,13 +358,13 @@ TsshSSH: resize → <C>×<R>
 
 ### 期待ログ（回転 = Activity 再生成）
 ```
-TsshVM: TerminalViewModel cleared (session=true)   ← 旧 VM が破棄（session は true のまま！サービスが保持）
-TsshVM: TerminalViewModel created (rotationRecovery=true)   ← 新 VM が生成
-TsshVM: service bound OK (session=true)
-TsshSSH: terminal geometry: <C>×<R> px=...   ← 横向きの新ジオメトリ
-TsshSSH: resize → <C>×<R>
+IsekaiTerminalVM: TerminalViewModel cleared (session=true)   ← 旧 VM が破棄（session は true のまま！サービスが保持）
+IsekaiTerminalVM: TerminalViewModel created (rotationRecovery=true)   ← 新 VM が生成
+IsekaiTerminalVM: service bound OK (session=true)
+IsekaiTerminalSSH: terminal geometry: <C>×<R> px=...   ← 横向きの新ジオメトリ
+IsekaiTerminalSSH: resize → <C>×<R>
 ```
-`TsshSvc: service created/destroyed` は出ないことを確認（Service は回転でも生存）
+`IsekaiTerminalSvc: service created/destroyed` は出ないことを確認（Service は回転でも生存）
 
 ### NG 時の確認ポイント
 - `TerminalViewModel cleared (session=true)` で session が false → Service より先に session が null にされている（`onCleared` の順序問題）
@@ -381,21 +381,21 @@ TsshSSH: resize → <C>×<R>
 
 ### 期待ログ（ホーム押下時）
 ```
-TsshVM: TerminalViewModel cleared (session=true)   ← Activity が停止・VM 破棄
+IsekaiTerminalVM: TerminalViewModel cleared (session=true)   ← Activity が停止・VM 破棄
 ```
-（`TsshSvc: service destroyed` が出ないことを確認 — Foreground Service はバックグラウンドでも生存）
+（`IsekaiTerminalSvc: service destroyed` が出ないことを確認 — Foreground Service はバックグラウンドでも生存）
 
 ### 期待ログ（復帰時）
 ```
-TsshVM: TerminalViewModel created (rotationRecovery=true)
-TsshVM: service bound OK (session=true)
-TsshSSH: ✓ connected: ...   ← onConnected は出ない（既に接続済み）
-TsshSSH: terminal geometry: ...
+IsekaiTerminalVM: TerminalViewModel created (rotationRecovery=true)
+IsekaiTerminalVM: service bound OK (session=true)
+IsekaiTerminalSSH: ✓ connected: ...   ← onConnected は出ない（既に接続済み）
+IsekaiTerminalSSH: terminal geometry: ...
 ```
 
 ### NG 時の確認ポイント
-- `TsshSvc: service destroyed` が出る → 通知が消えた/OOM Killer に殺された（Foreground 通知の設定を確認）
-- `rotationRecovery=false` → processが再起動された（ `TsshSvc: service created` も出ているはず）
+- `IsekaiTerminalSvc: service destroyed` が出る → 通知が消えた/OOM Killer に殺された（Foreground 通知の設定を確認）
+- `rotationRecovery=false` → processが再起動された（ `IsekaiTerminalSvc: service created` も出ているはず）
 - 画面が黒いまま → `session?.let { terminalService?.holdSession(it) }` が service bound 前に呼ばれていない競合
 
 ---
@@ -407,8 +407,8 @@ TsshSSH: terminal geometry: ...
 
 ### 期待ログ
 ```
-TsshSSH: network lost (wasConnected=true)
-TsshSSH: ✗ disconnected: reason='...' host=<IP>
+IsekaiTerminalSSH: network lost (wasConnected=true)
+IsekaiTerminalSSH: ✗ disconnected: reason='...' host=<IP>
 ```
 
 ### NG 時の確認ポイント
@@ -424,9 +424,9 @@ TsshSSH: ✗ disconnected: reason='...' host=<IP>
 
 ### 期待ログ
 ```
-TsshSSH: disconnect called (connected=true)
-TsshSSH: ✗ disconnected: reason='...'
-TsshNav: → ProfileList
+IsekaiTerminalSSH: disconnect called (connected=true)
+IsekaiTerminalSSH: ✗ disconnected: reason='...'
+IsekaiTerminalNav: → ProfileList
 ```
 
 ### NG 時の確認ポイント
@@ -438,17 +438,17 @@ TsshNav: → ProfileList
 
 | タグ | 対象コンポーネント |
 |---|---|
-| `TsshVM` | TerminalViewModel ライフサイクル |
-| `TsshSvc` | TerminalSessionService ライフサイクル |
-| `TsshSSH` | SSH セッション接続・切断・データ |
-| `TsshNav` | 画面遷移 |
-| `TsshProfile` | プロファイル CRUD |
-| `TsshKey` | 鍵インポート・管理 |
-| `TsshIME` | IME 入力・ペースト・フォーカス |
+| `IsekaiTerminalVM` | TerminalViewModel ライフサイクル |
+| `IsekaiTerminalSvc` | TerminalSessionService ライフサイクル |
+| `IsekaiTerminalSSH` | SSH セッション接続・切断・データ |
+| `IsekaiTerminalNav` | 画面遷移 |
+| `IsekaiTerminalProfile` | プロファイル CRUD |
+| `IsekaiTerminalKey` | 鍵インポート・管理 |
+| `IsekaiTerminalIME` | IME 入力・ペースト・フォーカス |
 
 ```bash
 # 全タグ同時フィルタ
-adb logcat -s TsshVM TsshSvc TsshSSH TsshNav TsshProfile TsshKey TsshIME
+adb logcat -s IsekaiTerminalVM IsekaiTerminalSvc IsekaiTerminalSSH IsekaiTerminalNav IsekaiTerminalProfile IsekaiTerminalKey IsekaiTerminalIME
 
 # クラッシュが出た時
 adb logcat -d -b crash | tail -n 200
@@ -460,7 +460,7 @@ adb logcat -d | grep -E "FATAL|AndroidRuntime|E/.*Exception" | tail -n 50
 ## 13. Phase 4D: trzsz 実機回帰テスト (#70)
 
 trzsz ファイル転送（trz=アップロード / tsz=ダウンロード）が実機・実サーバーで
-正しく動作することを確認する。Rust コアのプロトコルログはタグ `tssh-core` で出る。
+正しく動作することを確認する。Rust コアのプロトコルログはタグ `isekai-terminal-core` で出る。
 
 ### 前提
 
@@ -473,7 +473,7 @@ trzsz ファイル転送（trz=アップロード / tsz=ダウンロード）が
   ```
 - ログキャプチャを別ターミナルで起動:
   ```bash
-  ./scripts/capture_trzsz_log.sh           # tssh-core + Tssh* の trzsz 行のみ抽出
+  ./scripts/capture_trzsz_log.sh           # isekai-terminal-core + IsekaiTerminal* の trzsz 行のみ抽出
   ```
 
 ### 13-A アップロード (trz)
@@ -493,14 +493,14 @@ md5sum <filename>          # サーバー側
 アプリは upload 完了時に `#MD5:` を送出する。サーバーの `trz` 側で MD5 不一致が
 報告されないこと（不一致ならログに `#SUCC:false` 相当が出る）。
 
-#### 期待ログ（tssh-core）
+#### 期待ログ（isekai-terminal-core）
 ```
-tssh-core: ::TRZSZ:TRANSFER:S:1.1.7:<id>   ← upload(send) トリガ検出
-tssh-core: #ACT ...                         ← action handshake
-tssh-core: #NUM / #NAME / #SIZE ...         ← ファイルメタ送出
-tssh-core: #DATA ...                        ← チャンク送出
-tssh-core: #MD5 ...                         ← チェックサム
-tssh-core: #SUCC ...                        ← 完了
+isekai-terminal-core: ::TRZSZ:TRANSFER:S:1.1.7:<id>   ← upload(send) トリガ検出
+isekai-terminal-core: #ACT ...                         ← action handshake
+isekai-terminal-core: #NUM / #NAME / #SIZE ...         ← ファイルメタ送出
+isekai-terminal-core: #DATA ...                        ← チャンク送出
+isekai-terminal-core: #MD5 ...                         ← チェックサム
+isekai-terminal-core: #SUCC ...                        ← 完了
 ```
 
 ### 13-B ダウンロード (tsz)
@@ -515,18 +515,18 @@ tssh-core: #SUCC ...                        ← 完了
 4. 転送完了後、ファイルが端末の Downloads に保存されることを確認
 5. 内容一致を確認（保存ファイルを開く or `adb pull` して `md5sum`）
 
-#### 期待ログ（tssh-core）
+#### 期待ログ（isekai-terminal-core）
 ```
-tssh-core: ::TRZSZ:TRANSFER:R:1.1.7:<id>   ← download(receive) トリガ検出
-tssh-core: #ACT ... / #NAME ... / #SIZE ...
-tssh-core: #DATA ...                        ← onTrzszDownloadChunk へ
-tssh-core: #SUCC ...
+isekai-terminal-core: ::TRZSZ:TRANSFER:R:1.1.7:<id>   ← download(receive) トリガ検出
+isekai-terminal-core: #ACT ... / #NAME ... / #SIZE ...
+isekai-terminal-core: #DATA ...                        ← onTrzszDownloadChunk へ
+isekai-terminal-core: #SUCC ...
 ```
 
 ### 13-C ACT/CFG ハンドシェイク確認
 
 ```bash
-adb logcat -s tssh-core | grep -E '#ACT|#NUM|#NAME|#SIZE|#MD5|#SUCC'
+adb logcat -s isekai-terminal-core | grep -E '#ACT|#NUM|#NAME|#SIZE|#MD5|#SUCC'
 ```
 `#ACT` に続いてメタ情報（`#NUM`/`#NAME`/`#SIZE`）→ `#DATA` → `#MD5`/`#SUCC`
 の順で流れること。
@@ -571,7 +571,7 @@ TCP SSH の遅延と切断耐性を実測する。
 1. 実機で SSH 接続し、`top` などを表示したまま保持
 2. 5G（モバイル）→ WiFi（またはその逆）に切り替える
 3. TCP SSH セッションが**実際に切れるか**を観察
-   - `TsshSSH: network lost` / `✗ disconnected` が出れば切断
+   - `IsekaiTerminalSSH: network lost` / `✗ disconnected` が出れば切断
 4. 判断:
    - 切れる → Phase 5（tsshd/QUIC によるローミング耐性）に価値あり
    - 切れない（TCP が生存し続ける）→ **Phase 5 はスキップ**
@@ -582,12 +582,62 @@ TCP SSH の遅延と切断耐性を実測する。
 
 ---
 
+## 15. 画面の保護 (FLAG_SECURE) 実機確認 (#62)
+
+ターミナル画面（機密コマンド出力）とパスワード入力ダイアログが、スクリーンショット・
+画面録画・「最近使ったアプリ」のサムネイルに残らないようにする、既定OFFのオプトイン設定。
+
+### 前提
+- 実機（エミュレータでもよいがスクリーンショットの見た目確認は実機が確実）
+- プロファイル一覧画面右上のハンバーガーメニューに「画面の保護: OFF/ON」の項目がある
+
+### 15-A 設定トグルの確認
+1. アプリを起動し、プロファイル一覧のハンバーガーメニュー(右上)を開く
+2. 「画面の保護: OFF」をタップ → メニューが閉じ、次回開くと「画面の保護: ON」に変わっている
+3. この状態でスクリーンショットを撮る(電源+音量下ボタン、または `adb shell screencap`)
+   - 期待: 画面が真っ黒(または「セキュリティ上の理由で保護されています」等のOS標準メッセージ)
+     になり、実際の画面内容がキャプチャされない
+4. 「最近使ったアプリ」一覧(オーバービュー)を開く
+   - 期待: このアプリのサムネイルが黒塗り(または非表示)になっている
+5. 再度メニューから「画面の保護: ON」をタップして OFF に戻す → スクリーンショットが通常通り撮れることを確認
+
+### 15-B パスワード入力ダイアログ・ターミナルセッションでの保護
+「画面の保護: ON」の状態は Activity 全体の window に適用されるため、以下のいずれの画面でも
+スクリーンショットが真っ黒になることを確認する:
+1. パスワード認証のプロファイルをタップし、パスワード入力ダイアログを表示 → スクリーンショットが真っ黒
+2. 実際に接続してターミナルセッションを表示 → スクリーンショットが真っ黒
+3. プロファイル一覧に戻る → 引き続き真っ黒(ON の間は画面遷移によらず常に保護される)
+
+### 15-C 再起動後も設定が保持されることの確認
+1. 「画面の保護: ON」にした状態でアプリを完全終了(タスクキル)→ 再起動
+2. 起動直後(プロファイル一覧が出た直後)にスクリーンショットを撮る
+   - 期待: 再起動直後から真っ黒(`MainActivity.onCreate()` で起動時に設定を復元しているため)
+
+### NG 時の確認ポイント
+- OFF のままスクリーンショットが真っ黒になる/ONにしても真っ黒にならない
+  → `SharedPreferences("isekai_terminal_ui")` のキー `screen_protection_enabled` の読み書きと
+    `MainActivity`/`ProfileListScreen` から呼ばれる `applyScreenProtection()` の呼び出し漏れを確認
+- 一部の画面(パスワードダイアログ表示中など)でだけ保護が効かない
+  → FLAG_SECURE は Activity の window 単位で効くため、途中で `clearFlags` している箇所が
+    無いか確認(本実装では ON の間は画面遷移に関わらず常時適用される設計)
+
+---
+
 ## スクリプト一覧
 
 | スクリプト | 用途 |
 |---|---|
 | `scripts/measure_latency.sh` | Phase 5 判断ゲート: TCP SSH 往復遅延計測 |
-| `scripts/capture_trzsz_log.sh` | Phase 4D: trzsz 転送ログ（tssh-core）キャプチャ |
+| `scripts/capture_trzsz_log.sh` | Phase 4D: trzsz 転送ログ（isekai-terminal-core）キャプチャ |
+| `scripts/device_verify.sh` | 実機での動作確認（本ファイルの手順のうち adb だけで完結する範囲）を自動化。uiautomator dump ベースの座標タップで UI を操作し、logcat の期待ログ行を検証する。`--help` 参照。 |
+
+> **Note**: `scripts/device_verify.sh` 作成時点（2026-07-05）で、本ファイルの一部のセクション
+> （1, 9, 10, 12 の期待ログ例）はタブ化（複数セッション対応）以前の実装を前提にしており、
+> 現行実装のログ文言と食い違っている（例:「TerminalViewModel created/cleared」は
+> 存在せず「TerminalTabsViewModel created/cleared」に統合、`(session=...)`/`(rotationRecovery=...)`
+> 等の括弧書きは軒並み削除、`terminal geometry`/`resize →` のログは削除済み、
+> `IsekaiTerminalSvc` タグのログは無し）。`scripts/device_verify.sh` は現行実装に
+> 合わせて書き直し済みなので、そちらのアサーションを正とすること。
 
 ---
 

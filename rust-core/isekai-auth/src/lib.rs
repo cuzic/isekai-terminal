@@ -1,5 +1,5 @@
 //! Token retrieval + Device Authorization Grant for `isekai-ssh`
-//! (`ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー").
+//! (`archive/ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー").
 //!
 //! Started (phase S-0c-1) as the smallest useful slice of "how does
 //! `isekai-ssh connect` get a relay JWT": a `TokenProvider` trait plus two
@@ -30,6 +30,7 @@ pub mod error;
 pub mod file_provider;
 mod oauth;
 pub mod refresh;
+mod time;
 
 pub use env_provider::EnvTokenProvider;
 pub use error::AuthError;
@@ -40,7 +41,7 @@ pub use file_provider::{
 pub use oauth::TokenResponse;
 
 /// A source of the relay JWT used to authenticate to the relay's HTTP/3 API
-/// (`ISEKAI_SSH_DESIGN.md` "シグナリングサーバー = relay の HTTP/3 API
+/// (`archive/ISEKAI_SSH_DESIGN.md` "シグナリングサーバー = relay の HTTP/3 API
 /// （JWTベアラー認証）").
 ///
 /// Synchronous by design — see the module-level docs for why this isn't

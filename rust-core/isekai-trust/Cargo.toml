@@ -8,6 +8,9 @@ license = "MIT OR Apache-2.0"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "2.0.18"
+# 0600/0700 permission + world-writable checks, shared with isekai-auth's
+# token file (see isekai-fs-guard's crate docs).
+isekai-fs-guard = { path = "../isekai-fs-guard" }
 # Used for atomic writes (write to a sibling temp file, then rename) in
 # store.rs. Also reused by tests as a scratch directory factory.
 tempfile = "3"

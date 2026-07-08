@@ -1,0 +1,60 @@
+name: iOS SSH fixture check
+
+# iOS接続確認用の使い捨てsshd fixture(rust-core/scripts/ios-fixture/)が実際に
+# macOS上で起動・SSH接続・停止できることを検証する(PLAN.md「Phase Y」節 Phase 1A-3参照)。
+# Phase 1A-8以降の実SSH縦切りテストがこのfixtureに依存するため、macOSランナー上での
+# 動作を単体で先に確認しておく。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust-core/scripts/ios-fixture/**"
+      - ".github/workflows/ios-fixture-check.yml"
+  pull_request:
+    paths:
+      - "rust-core/scripts/ios-fixture/**"
+      - ".github/workflows/ios-fixture-check.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-fixture-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fixture-smoke-test:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start sshd fixture
+        run: |
+          bash rust-core/scripts/ios-fixture/start-sshd-fixture.sh /tmp/ios-fixture 2299
+
+      - name: SSH round-trip against the fixture
+        run: |
+          set -euo pipefail
+          OUTPUT=$(ssh -i /tmp/ios-fixture/user_ed25519_key -p 2299 \
+            -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile=/tmp/ios-fixture/known_hosts \
+            -o BatchMode=yes \
+            "$(whoami)@127.0.0.1" 'echo "hello from fixture"')
+          echo "received: $OUTPUT"
+          [[ "$OUTPUT" == "hello from fixture" ]]
+
+      - name: Stop sshd fixture
+        if: always()
+        run: bash rust-core/scripts/ios-fixture/stop-sshd-fixture.sh /tmp/ios-fixture
+
+      - name: Verify sshd actually stopped
+        run: |
+          if ssh -i /tmp/ios-fixture/user_ed25519_key -p 2299 -o ConnectTimeout=2 -o BatchMode=yes \
+              "$(whoami)@127.0.0.1" 'echo should-not-happen' 2>/dev/null; then
+            echo "::error::sshd fixture is still reachable after stop" >&2
+            exit 1
+          fi
+          echo "confirmed: sshd fixture no longer reachable"

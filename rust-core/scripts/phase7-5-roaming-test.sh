@@ -27,7 +27,7 @@ RUST_CORE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_DIR="$(cd "$RUST_CORE_DIR/.." && pwd)"
 
 PKG="tools.isekai.terminal"
-LOG_TAGS="tssh-core:V TsshSSH:V TsshVM:V FaultInjection:V ActivityManager:I *:S"
+LOG_TAGS="isekai-terminal-core:V IsekaiTerminalSSH:V IsekaiTerminalVM:V FaultInjection:V ActivityManager:I *:S"
 LOG_DIR="${LOG_DIR:-/tmp/claude-1001/-home-cuzic-isekai-terminal/1366600f-e921-4fad-93ea-f62b10133c99/scratchpad/phase7-5-logs}"
 mkdir -p "$LOG_DIR"
 
@@ -87,12 +87,12 @@ step0_precheck() {
     echo "== adb devices =="
     adb devices -l
     echo "== ローカル自動テスト (faulty_udp_socket, 実機不要) =="
-    (cd "$RUST_CORE_DIR" && cargo test -p tssh-core faulty_udp_socket -- --nocapture)
+    (cd "$RUST_CORE_DIR" && cargo test -p isekai-terminal-core faulty_udp_socket -- --nocapture)
 }
 
 step0_install_launch() {
     echo "== debug APK インストール =="
-    adb install -r "$REPO_DIR/app/build/outputs/apk/debug/app-debug.apk"
+    adb install -r "$REPO_DIR/android/build/outputs/apk/debug/android-debug.apk"
     echo "== アプリ起動 =="
     adb shell am start -n "${PKG}/.MainActivity"
     echo "この後、プロファイル一覧からテスト対象プロファイルをタップして手動接続してください。"

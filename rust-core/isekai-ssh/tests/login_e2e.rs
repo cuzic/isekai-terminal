@@ -1,5 +1,5 @@
 //! End-to-end tests for `isekai-ssh login`/`logout`
-//! (`ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー", フェーズ分割案 S-5).
+//! (`archive/ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー", フェーズ分割案 S-5).
 //!
 //! Spawns the real compiled `isekai-ssh` binary (not a library-level call —
 //! this crate has no `[lib]` target, only `[[bin]]`, matching

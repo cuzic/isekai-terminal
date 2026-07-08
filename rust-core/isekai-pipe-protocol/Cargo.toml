@@ -1,0 +1,8 @@
+[package]
+name = "isekai-pipe-protocol"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Pure protocol value types for the future isekai-pipe connect/serve split."
+
+[dependencies]

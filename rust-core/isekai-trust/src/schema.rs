@@ -1,5 +1,5 @@
 //! Value types for `~/.config/isekai-ssh/known_helpers.toml`
-//! (`ISEKAI_SSH_DESIGN.md` "trust store のファイル形式").
+//! (`archive/ISEKAI_SSH_DESIGN.md` "trust store のファイル形式").
 
 use std::collections::BTreeMap;
 
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// `isekai-helper` binary without re-running `init`.
 ///
 /// Only `ExactDigestOnly` exists today because release signing is not
-/// implemented yet (`ISEKAI_SSH_DESIGN.md` "引き続き未決の項目"). This is a
+/// implemented yet (`archive/ISEKAI_SSH_DESIGN.md` "引き続き未決の項目"). This is a
 /// closed enum on purpose: `serde`'s derived `Deserialize` rejects any
 /// string that isn't a known variant, which is what makes loading a store
 /// with a future/unknown `update_policy` (e.g. a `"signed-compatible"`
@@ -45,7 +45,7 @@ pub struct HelperTrust {
     /// `isekai-ssh connect` (S-2) uses this together with
     /// `cached_cert_sha256`/`cached_session_secret` below to build an
     /// `isekai_transport::RelayTarget` directly, without going through
-    /// `--via` on the common path (`ISEKAI_SSH_DESIGN.md` "trust store の
+    /// `--via` on the common path (`archive/ISEKAI_SSH_DESIGN.md` "trust store の
     /// ファイル形式").
     pub cached_relay_addr: String,
     /// `HandshakeJson::cert_sha256` from that same handshake.

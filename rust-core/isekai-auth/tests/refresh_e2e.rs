@@ -1,6 +1,6 @@
 //! End-to-end tests for `isekai_auth::refresh` (RFC 6749 §6 `refresh_token`
 //! grant) and, more importantly, for `FileTokenProvider::get_relay_jwt`'s
-//! auto-refresh path (`ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー":
+//! auto-refresh path (`archive/ISEKAI_SSH_DESIGN.md` "JWT発行・配布フロー":
 //! "保存済みトークンの`expires_at`が近い/過ぎている場合、`refresh_token`を
 //! 使って自動的にリフレッシュを試みる"). Uses the same hand-rolled
 //! `std::net::TcpListener`-based mock HTTP server as `device_flow_e2e.rs`
@@ -124,7 +124,7 @@ fn refresh_access_token_surfaces_invalid_grant() {
     ));
 }
 
-/// The acceptance-critical scenario (`ISEKAI_SSH_DESIGN.md` "JWT発行・配布
+/// The acceptance-critical scenario (`archive/ISEKAI_SSH_DESIGN.md` "JWT発行・配布
 /// フロー"): a token file whose `expires_at` is already in the past gets
 /// transparently refreshed by `FileTokenProvider::get_relay_jwt`, and the
 /// refreshed token (including the rotated refresh token) is persisted back

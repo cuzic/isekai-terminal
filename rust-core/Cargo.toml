@@ -1,15 +1,15 @@
 [workspace]
-members = [".", "uniffi-bindgen", "isekai-helper", "noq-multipath-spike", "h3-noq", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-ssh"]
+members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe"]
 resolver = "2"
 
 [package]
-name = "tssh-core"
+name = "isekai-terminal-core"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [lib]
-name = "tssh_core"
+name = "isekai_terminal_core"
 crate-type = ["cdylib", "staticlib"]
 
 [dev-dependencies]
@@ -34,6 +34,9 @@ unicode-width = "0.1"
 base64 = "0.22"
 flate2 = "1"
 md5 = "0.8"
+# タスク#65: パスワード・復号済み秘密鍵PEMをdrop時にゼロ化するために使う
+# (`SshAuth`のDrop実装、`src/lib.rs`参照)。
+zeroize = "1"
 # QUIC実装は noq（quinnのマルチパスフォーク）に一本化している。
 # helper_quic_transport.rs（Phase 7/8、単一パス）・quic_transport.rs（Phase 5B）・
 # resume_client.rs も含め、quinn は使っていない
@@ -56,4 +59,3 @@ android_logger = "0.15"
 
 [profile.release]
 panic = "abort"
-

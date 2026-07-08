@@ -28,7 +28,7 @@ noq = { version = "1.0.1", features = ["rustls", "ring"] }
 # Phase 9-0 only: proves an unmodified quinn client can still talk to a noq
 # server (see compat_check.rs). Not a dependency of the noq client/server
 # paths themselves -- kept isolated here, same as `noq` is kept out of
-# tssh-core/isekai-helper for now.
+# isekai-terminal-core/isekai-helper for now.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net"] }
 tokio-stream = "0.1"

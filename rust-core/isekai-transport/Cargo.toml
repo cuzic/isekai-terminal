@@ -6,12 +6,15 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 isekai-protocol = { path = "../isekai-protocol" }
+# Candidateモデルのpure値型(CandidateDraft/CandidateDraftBatch等)とConnectionIntent。
+# isekai-pipe-coreはisekai-transportに依存しない一方向の依存(circularではない)。
+isekai-pipe-core = { path = "../isekai-pipe-core" }
 # STUN観測アドレス取得（`isekai_stun_p2p_transport.rs`相当の移植、
-# ISEKAI_SSH_DESIGN.md フェーズS-0d-2）。tssh-core・isekai-helperと共用のpure crate。
+# ISEKAI_SSH_DESIGN.md フェーズS-0d-2）。isekai-terminal-core・isekai-helperと共用のpure crate。
 isekai-stun = { path = "../isekai-stun" }
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
-# QUIC実装は tssh-core と同じく noq（quinnのマルチパスフォーク）に一本化する。
+# QUIC実装は isekai-terminal-core と同じく noq（quinnのマルチパスフォーク）に一本化する。
 # `FaultyUdpSocket`等のAndroid専用型・UniFFIはこのcrateからは一切参照しない
 # （ISEKAI_SSH_DESIGN.md「FaultyUdpSocket（Android専用フォルト注入ソケット）の扱い」節）。
 noq = { version = "1.0.1", features = ["rustls", "ring"] }
