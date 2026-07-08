@@ -15,14 +15,14 @@
 //! without needing a real isekai-helper binary.
 //!
 //! Skips itself (rather than failing) when no `ssh(1)` binary is available,
-//! per `ISEKAI_SSH_DESIGN.md`'s acceptance criteria for this phase.
+//! per `archive/ISEKAI_SSH_DESIGN.md`'s acceptance criteria for this phase.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio as StdStdio;
 
-use isekai_bootstrap::{BootstrapBackend, BootstrapError, HostSpec, OpenSshBackend, RelayLaunchSpec};
+use isekai_bootstrap::{BootstrapBackend, BootstrapError, HostSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
 use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
 use russh::{Channel as RusshChannel, ChannelId, CryptoVec};
 use russh_keys::ssh_key::private::Ed25519Keypair;
@@ -242,7 +242,7 @@ fn dummy_relay_spec() -> RelayLaunchSpec {
     }
 }
 
-const VALID_HANDSHAKE_JSON: &str = r#"{"v":1,"listen_port":45231,"cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb","session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="}"#;
+const VALID_HANDSHAKE_JSON: &str = r#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"}]}"#;
 
 #[tokio::test]
 async fn install_and_start_gets_a_real_handshake_over_a_real_ssh_subprocess() {
@@ -268,20 +268,20 @@ async fn install_and_start_gets_a_real_handshake_over_a_real_ssh_subprocess() {
 
     let report = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &dummy_relay_spec()),
+        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None),
     )
     .await
     .expect("install_and_start should not hang")
     .expect("install_and_start should succeed against the mock server");
 
     assert_eq!(report.handshake.v, 1);
-    assert_eq!(report.handshake.listen_port, 45231);
-    assert_eq!(report.handshake.cert_sha256.len(), 64);
+    assert_eq!(report.handshake.direct_by_bootstrap_host_port(), Some(45231));
+    assert_eq!(report.handshake.cert_sha256().len(), 64);
 }
 
 /// `RelayLaunchSpec::idle_lifetime_secs` must actually reach the launched
 /// `isekai-helper` process's argv as `--max-idle-lifetime <SECS>` — this is
-/// the fix for the `ISEKAI_SSH_DESIGN.md` "引き続き未決の項目" gap where a
+/// the fix for the `archive/ISEKAI_SSH_DESIGN.md` "引き続き未決の項目" gap where a
 /// helper deployed via `isekai-ssh init` would inherit `isekai-helper`'s own
 /// short default (600s, tuned for `isekai-terminal-core`'s per-session bootstrap) and
 /// self-exit long before a `connect` invocation hours/days later could reach
@@ -319,7 +319,7 @@ async fn install_and_start_passes_idle_lifetime_to_the_launched_helper() {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &relay),
+        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(relay), None),
     )
     .await
     .expect("install_and_start should not hang")
@@ -330,6 +330,114 @@ async fn install_and_start_passes_idle_lifetime_to_the_launched_helper() {
         argv.contains("--max-idle-lifetime 2592000"),
         "expected the launched isekai-helper's argv to contain '--max-idle-lifetime 2592000', got: {argv:?}"
     );
+    // `isekai-pipe serve` (the merged binary, `archive/ISEKAI_PIPE_MIGRATION.md` P5)
+    // requires an explicit `serve` subcommand and a `--target`/`--service`,
+    // unlike the standalone `isekai-helper` binary this replaced (which
+    // defaulted `--target` to `127.0.0.1:22`).
+    assert!(argv.starts_with("serve "), "expected argv to start with the 'serve' subcommand, got: {argv:?}");
+    assert!(argv.contains("--target 127.0.0.1:22"), "expected argv to contain '--target 127.0.0.1:22', got: {argv:?}");
+}
+
+/// `LaunchSpec::Direct` (the wrapper's auto-bootstrap path,
+/// `archive/ISEKAI_PIPE_MIGRATION.md` P4) must never pass any `--relay*` argument —
+/// there is no relay JWT to source in that mode — and must still get the
+/// idle lifetime through.
+#[tokio::test]
+async fn install_and_start_direct_never_passes_relay_args() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+
+    let argv_log = home.join("argv.log");
+    let fake_helper_script =
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{VALID_HANDSHAKE_JSON}'\n", argv_log.display());
+
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(
+            &target,
+            None,
+            fake_helper_script.as_bytes(),
+            &LaunchSpec::Direct { idle_lifetime_secs: 86_400 },
+            None,
+        ),
+    )
+    .await
+    .expect("install_and_start should not hang")
+    .expect("install_and_start should succeed against the mock server");
+
+    assert_eq!(report.handshake.direct_by_bootstrap_host_port(), Some(45231));
+
+    let argv = std::fs::read_to_string(&argv_log).expect("stand-in script should have recorded its argv");
+    assert!(
+        argv.contains("--max-idle-lifetime 86400"),
+        "expected argv to contain '--max-idle-lifetime 86400', got: {argv:?}"
+    );
+    assert!(!argv.contains("--relay"), "direct mode must never pass --relay*, got argv: {argv:?}");
+    assert!(argv.starts_with("serve "), "expected argv to start with the 'serve' subcommand, got: {argv:?}");
+    assert!(argv.contains("--target 127.0.0.1:22"), "expected argv to contain '--target 127.0.0.1:22', got: {argv:?}");
+}
+
+/// `#@isekai remote-path` (`isekai-ssh/src/wrapper.rs`) must actually change
+/// where `OpenSshBackend` uploads and launches the binary from — not just
+/// get parsed and silently ignored.
+#[tokio::test]
+async fn install_and_start_uses_custom_remote_binary_path() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+
+    let fake_helper_script = format!("#!/bin/sh\necho '{VALID_HANDSHAKE_JSON}'\n");
+
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+
+    // A nested, non-default directory: exercises both the `mkdir -p` of the
+    // parent directory and the upload/launch path override together.
+    let custom_path = "~/custom/nested/dir/isekai-pipe-custom";
+
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(
+            &target,
+            None,
+            fake_helper_script.as_bytes(),
+            &LaunchSpec::Direct { idle_lifetime_secs: 86_400 },
+            Some(custom_path),
+        ),
+    )
+    .await
+    .expect("install_and_start should not hang")
+    .expect("install_and_start should succeed against the mock server");
+
+    assert_eq!(report.handshake.direct_by_bootstrap_host_port(), Some(45231));
+
+    let uploaded = home.join("custom/nested/dir/isekai-pipe-custom");
+    assert!(
+        uploaded.exists(),
+        "expected the binary to be uploaded at the custom remote path {uploaded:?}"
+    );
+    // Nothing should have been written to the default install dir instead.
+    assert!(!home.join(".local/bin").exists(), "must not fall back to the default install dir");
 }
 
 #[tokio::test]
@@ -359,7 +467,7 @@ async fn install_and_start_fails_closed_when_stdout_has_extra_lines() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &dummy_relay_spec()),
+        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None),
     )
     .await
     .expect("install_and_start should not hang");

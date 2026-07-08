@@ -1,6 +1,6 @@
 //! Errors a `BootstrapBackend` can fail with. Every stdout-related variant
 //! here exists to enforce the fail-closed contract from
-//! `ISEKAI_SSH_DESIGN.md`'s "`--via` の実装方式" section: a `ssh(1)`
+//! `archive/ISEKAI_SSH_DESIGN.md`'s "`--via` の実装方式" section: a `ssh(1)`
 //! subprocess's stdout may contain *only* the one-line `isekai-helper`
 //! handshake JSON, never anything else.
 
@@ -46,4 +46,10 @@ pub enum BootstrapError {
     /// with parsing the handshake response.
     #[error("invalid relay parameter: {0}")]
     InvalidRelayParam(String),
+
+    /// A caller-supplied remote binary path (`#@isekai remote-path`) failed
+    /// `isekai_protocol::bootstrap::validate_remote_path`'s strict allow-list
+    /// charset check. Same defense-in-depth rationale as `InvalidRelayParam`.
+    #[error("invalid remote path: {0}")]
+    InvalidRemotePath(String),
 }

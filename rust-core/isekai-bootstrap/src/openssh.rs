@@ -1,6 +1,6 @@
 //! `OpenSshBackend`: the CLI's default `BootstrapBackend`, built on spawning
 //! the user's own `ssh(1)` rather than reimplementing SSH client behavior
-//! (`ISEKAI_SSH_DESIGN.md` "`--via` の実装方式" — reusing `~/.ssh/config`,
+//! (`archive/ISEKAI_SSH_DESIGN.md` "`--via` の実装方式" — reusing `~/.ssh/config`,
 //! `IdentityFile`, `IdentityAgent`, `ProxyJump`, etc. is worth far more than
 //! anything a from-scratch client could offer here).
 //!
@@ -56,9 +56,9 @@ use tokio::process::Command;
 
 use crate::backend::BootstrapBackend;
 use crate::error::BootstrapError;
-use crate::types::{BootstrapReport, HostSpec, JumpSpec, RelayLaunchSpec};
+use crate::types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec};
 
-// `HELPER_INSTALL_DIR`/`HELPER_BIN_NAME`/`HANDSHAKE_POLL_ATTEMPTS`/
+// `ISEKAI_PIPE_INSTALL_DIR`/`ISEKAI_PIPE_BIN_NAME`/`HANDSHAKE_POLL_ATTEMPTS`/
 // `HANDSHAKE_POLL_INTERVAL_MS`/`shell_single_quote`/`validate_relay_sni`/
 // `validate_relay_jwt` live in `isekai_protocol::bootstrap`, shared with
 // `rust-core/src/helper_bootstrap.rs`'s identical constants/helpers (see
@@ -66,8 +66,9 @@ use crate::types::{BootstrapReport, HostSpec, JumpSpec, RelayLaunchSpec};
 // just mirrored ones — security review #57/#58 applies to both call sites
 // identically).
 use isekai_protocol::bootstrap::{
-    shell_single_quote, validate_relay_jwt, validate_relay_sni, HANDSHAKE_POLL_ATTEMPTS,
-    HANDSHAKE_POLL_INTERVAL_MS, HELPER_BIN_NAME, HELPER_INSTALL_DIR,
+    shell_single_quote, validate_relay_jwt, validate_relay_sni, validate_remote_path,
+    HANDSHAKE_POLL_ATTEMPTS, HANDSHAKE_POLL_INTERVAL_MS, ISEKAI_PIPE_BIN_NAME,
+    ISEKAI_PIPE_INSTALL_DIR,
 };
 
 /// The CLI-default `BootstrapBackend`. Spawns the system `ssh(1)` binary.
@@ -192,13 +193,15 @@ impl OpenSshBackend {
         target: &HostSpec,
         via: Option<&JumpSpec>,
         binary: &[u8],
+        remote_binary_path: &str,
     ) -> Result<(), BootstrapError> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
+        let remote_dir = remote_parent_dir(remote_binary_path);
         let cmd = format!(
-            "umask 077 && mkdir -p {HELPER_INSTALL_DIR} && \
-             base64 -d > {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}.tmp && \
-             chmod 0700 {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}.tmp && \
-             mv {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}.tmp {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME}"
+            "umask 077 && mkdir -p {remote_dir} && \
+             base64 -d > {remote_binary_path}.tmp && \
+             chmod 0700 {remote_binary_path}.tmp && \
+             mv {remote_binary_path}.tmp {remote_binary_path}"
         );
         let out = self.run_ssh_command(target, via, &cmd, Some(encoded.as_bytes())).await?;
         if out.status != Some(0) {
@@ -214,56 +217,81 @@ impl OpenSshBackend {
         &self,
         target: &HostSpec,
         via: Option<&JumpSpec>,
-        relay: &RelayLaunchSpec,
+        launch: &LaunchSpec,
+        remote_binary_path: &str,
     ) -> Result<isekai_protocol::HandshakeJson, BootstrapError> {
-        // Security review #57: validate `relay_sni`/`relay_jwt` against a
-        // strict allow-list charset *before* interpolating either into a
-        // remote shell command string, in addition to shell-quoting
-        // `relay_sni` below (defense in depth — a compromised/misconfigured
-        // relay or JWT issuer should not be able to smuggle shell
-        // metacharacters into either value).
-        validate_relay_sni(&relay.relay_sni)
-            .map_err(|e| BootstrapError::InvalidRelayParam(e.to_string()))?;
-        validate_relay_jwt(&relay.relay_jwt)
-            .map_err(|e| BootstrapError::InvalidRelayParam(e.to_string()))?;
-
         let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
-        let relay_addr = relay.relay_addr;
-        let quoted_sni = shell_single_quote(&relay.relay_sni);
-        let idle_lifetime_secs = relay.idle_lifetime_secs;
-        // Security review #68: use the same per-invocation `mktemp -d` +
-        // `trap ... EXIT` pattern as `rust-core/src/helper_bootstrap.rs`
-        // (Android bootstrap path) instead of a fixed shared path. The fixed
-        // path (`~/.cache/isekai-terminal/helper.{handshake,log}`) that used
-        // to live here had the exact same class of bug that
-        // `helper_bootstrap.rs`'s doc comment describes in detail: two
-        // overlapping `isekai-ssh init` invocations against the same host
-        // would truncate/collide on the same files. `mktemp -d` makes that
-        // structurally impossible, matching `HELPER_PROTOCOL.md`'s §2
-        // contract.
-        //
-        // Security review #58: `relay_jwt` (the MASQUE relay bearer token)
-        // is written to `$tmpdir/relay_jwt` via this ssh(1) subprocess's
-        // stdin rather than embedded in the command line, then passed to
-        // isekai-helper as `--relay-jwt-file` — argv would otherwise be
-        // readable by any other local user on the remote host via `ps
-        // aux`/`/proc/<pid>/cmdline`, exactly like `session_secret` already
-        // avoids that path.
-        let cmd = format!(
-            "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
-             cat > $tmpdir/relay_jwt && \
-             ( setsid {HELPER_INSTALL_DIR}/{HELPER_BIN_NAME} \
-             --relay {relay_addr} --relay-sni {quoted_sni} --relay-jwt-file $tmpdir/relay_jwt \
-             --max-idle-lifetime {idle_lifetime_secs} \
-             </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
-             for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
-               [ -s $tmpdir/handshake ] && break; \
-               sleep {sleep_secs}; \
-             done; \
-             cat $tmpdir/handshake"
-        );
-        let out =
-            self.run_ssh_command(target, via, &cmd, Some(relay.relay_jwt.as_bytes())).await?;
+
+        let (cmd, stdin_payload) = match launch {
+            LaunchSpec::Relay(relay) => {
+                // Security review #57: validate `relay_sni`/`relay_jwt` against a
+                // strict allow-list charset *before* interpolating either into a
+                // remote shell command string, in addition to shell-quoting
+                // `relay_sni` below (defense in depth — a compromised/misconfigured
+                // relay or JWT issuer should not be able to smuggle shell
+                // metacharacters into either value).
+                validate_relay_sni(&relay.relay_sni)
+                    .map_err(|e| BootstrapError::InvalidRelayParam(e.to_string()))?;
+                validate_relay_jwt(&relay.relay_jwt)
+                    .map_err(|e| BootstrapError::InvalidRelayParam(e.to_string()))?;
+
+                let relay_addr = relay.relay_addr;
+                let quoted_sni = shell_single_quote(&relay.relay_sni);
+                let idle_lifetime_secs = relay.idle_lifetime_secs;
+                // Security review #68: use the same per-invocation `mktemp -d` +
+                // `trap ... EXIT` pattern as `rust-core/src/helper_bootstrap.rs`
+                // (Android bootstrap path) instead of a fixed shared path. The fixed
+                // path (`~/.cache/isekai-terminal/helper.{handshake,log}`) that used
+                // to live here had the exact same class of bug that
+                // `helper_bootstrap.rs`'s doc comment describes in detail: two
+                // overlapping `isekai-ssh init` invocations against the same host
+                // would truncate/collide on the same files. `mktemp -d` makes that
+                // structurally impossible, matching `archive/HELPER_PROTOCOL.md`'s §2
+                // contract.
+                //
+                // Security review #58: `relay_jwt` (the MASQUE relay bearer token)
+                // is written to `$tmpdir/relay_jwt` via this ssh(1) subprocess's
+                // stdin rather than embedded in the command line, then passed to
+                // isekai-helper as `--relay-jwt-file` — argv would otherwise be
+                // readable by any other local user on the remote host via `ps
+                // aux`/`/proc/<pid>/cmdline`, exactly like `session_secret` already
+                // avoids that path.
+                let cmd = format!(
+                    "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
+                     cat > $tmpdir/relay_jwt && \
+                     ( setsid {remote_binary_path} serve --target 127.0.0.1:22 \
+                     --relay {relay_addr} --relay-sni {quoted_sni} --relay-jwt-file $tmpdir/relay_jwt \
+                     --max-idle-lifetime {idle_lifetime_secs} \
+                     </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
+                     for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
+                       [ -s $tmpdir/handshake ] && break; \
+                       sleep {sleep_secs}; \
+                     done; \
+                     cat $tmpdir/handshake"
+                );
+                (cmd, Some(relay.relay_jwt.clone().into_bytes()))
+            }
+            // No relay, no STUN: the client dials this host's own SSH
+            // bootstrap address at the port reported in `candidates`
+            // (`direct-by-bootstrap-host`, `archive/HELPER_PROTOCOL.md` §2). No
+            // stdin payload needed (nothing secret to deliver out of band).
+            LaunchSpec::Direct { idle_lifetime_secs } => {
+                let cmd = format!(
+                    "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
+                     ( setsid {remote_binary_path} serve --target 127.0.0.1:22 \
+                     --bind 0.0.0.0:0 --max-idle-lifetime {idle_lifetime_secs} \
+                     </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
+                     for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
+                       [ -s $tmpdir/handshake ] && break; \
+                       sleep {sleep_secs}; \
+                     done; \
+                     cat $tmpdir/handshake"
+                );
+                (cmd, None)
+            }
+        };
+
+        let out = self.run_ssh_command(target, via, &cmd, stdin_payload.as_deref()).await?;
 
         let non_empty_lines: Vec<&[u8]> =
             out.stdout.split(|&b| b == b'\n').filter(|line| !line.is_empty()).collect();
@@ -285,6 +313,19 @@ struct SshOutput {
     stderr: Vec<u8>,
 }
 
+/// The directory `mkdir -p` should create for `path` (a full remote binary
+/// path, e.g. `~/.local/bin/isekai-pipe` -> `~/.local/bin`). Falls back to
+/// `.` for a bare filename with no directory component (harmless: `mkdir -p
+/// .` always succeeds) and to `/` for a path directly under the filesystem
+/// root.
+fn remote_parent_dir(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((dir, _)) if !dir.is_empty() => dir,
+        Some(_) => "/",
+        None => ".",
+    }
+}
+
 #[async_trait]
 impl BootstrapBackend for OpenSshBackend {
     async fn install_and_start(
@@ -292,10 +333,17 @@ impl BootstrapBackend for OpenSshBackend {
         target: &HostSpec,
         via: Option<&JumpSpec>,
         helper_binary: &[u8],
-        relay: &RelayLaunchSpec,
+        launch: &LaunchSpec,
+        remote_binary_path: Option<&str>,
     ) -> Result<BootstrapReport, BootstrapError> {
-        self.upload_binary(target, via, helper_binary).await?;
-        let handshake = self.launch_and_capture_handshake(target, via, relay).await?;
+        let default_path = format!("{ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}");
+        let remote_binary_path = remote_binary_path.unwrap_or(&default_path);
+        validate_remote_path(remote_binary_path)
+            .map_err(|e| BootstrapError::InvalidRemotePath(e.to_string()))?;
+
+        self.upload_binary(target, via, helper_binary, remote_binary_path).await?;
+        let handshake =
+            self.launch_and_capture_handshake(target, via, launch, remote_binary_path).await?;
         Ok(BootstrapReport { handshake })
     }
 }
