@@ -48,12 +48,12 @@ jobs:
         run: |
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
-      - name: Build isekai-helper musl binaries (build prerequisite for isekai-terminal-core)
+      - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
         run: |
           brew install zig
           cargo install cargo-zigbuild --locked
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-          bash rust-core/scripts/build-isekai-helper-musl.sh
+          bash rust-core/scripts/build-isekai-pipe-musl.sh
 
       - name: Cache cargo
         uses: actions/cache@v4

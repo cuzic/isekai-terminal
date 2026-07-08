@@ -5,7 +5,7 @@ name: iOS app build check
 # iOS Simulator向けにビルドできることを検証する(PLAN.md「Phase Y」節 Phase 1A参照)。
 # コード署名は行わない(シミュレータ向けビルドのみのため不要)。
 #
-# rust-core/isekai-helper側のビルド前提・XCFramework生成手順は
+# rust-core/isekai-pipe側のビルド前提・XCFramework生成手順は
 # ios-rust-core-check.ymlと同じ(公開リポジトリなのでmacOSランナーは無課金)。
 #
 # Phase 1D: TerminalSessionControllerE2ETests(実sshdへの接続+CredentialVault
@@ -54,12 +54,12 @@ jobs:
         run: |
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
-      - name: Build isekai-helper musl binaries (build prerequisite for isekai-terminal-core)
+      - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
         run: |
           brew install zig
           cargo install cargo-zigbuild --locked
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-          bash rust-core/scripts/build-isekai-helper-musl.sh
+          bash rust-core/scripts/build-isekai-pipe-musl.sh
 
       - name: Cache cargo
         uses: actions/cache@v4

@@ -8,7 +8,7 @@ name: F-Droid build check
 # of this has been verified against a real F-Droid buildserver yet.
 
 on:
-  # このジョブは現状 isekai-helper の musl バイナリを未ビルドのまま
+  # このジョブは現状 isekai-pipe の musl バイナリを未ビルドのまま
   # `cargo build` を叩くため、常に失敗する(#67参照)。musl バイナリの
   # ビルド手順を組み込むまでの間、push/PR 毎の必須チェックからは外し、
   # リリースタグ(`v*`)を打った時とworkflow_dispatchでの手動実行のみにする。

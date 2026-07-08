@@ -57,7 +57,7 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
 ### 2. クロスコンパイル + XCFramework化
 
-先に `isekai-helper` の x86_64/aarch64 musl静的バイナリをビルドしておく必要があります
+先に `isekai-pipe` の x86_64/aarch64 musl静的バイナリをビルドしておく必要があります
 (`isekai-terminal-core`が`include_bytes!`で埋め込むため。iOS固有ではなく`isekai-terminal-core`をビルドする際の
 一般的な前提です):
 
@@ -65,7 +65,7 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 brew install zig
 cargo install cargo-zigbuild --locked
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-bash rust-core/scripts/build-isekai-helper-musl.sh
+bash rust-core/scripts/build-isekai-pipe-musl.sh
 ```
 
 ```bash
