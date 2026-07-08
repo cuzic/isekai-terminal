@@ -90,7 +90,12 @@ netlab_apply_netem "$NETLAB_LOSS" "$NETLAB_DELAY"
 ssh-keygen -t ed25519 -N '' -q -f "$WORKDIR/host_key"
 ssh-keygen -t ed25519 -N '' -q -f "$WORKDIR/client_key"
 cp "$WORKDIR/client_key.pub" "$WORKDIR/authorized_keys"
-chmod 600 "$WORKDIR/authorized_keys" "$WORKDIR/host_key" "$WORKDIR/client_key"
+chmod 600 "$WORKDIR/host_key" "$WORKDIR/client_key"
+# sshdはAuthorizedKeysFileを(StrictModes noでもなお)ログインユーザーの
+# 権限に落としてから読むため、root所有・700のWORKDIR配下に置くだけでは
+# $SSH_LOGIN_USERから読めない。鍵は公開鍵なので世界読み取り可でよい。
+chmod 711 "$WORKDIR"
+chmod 644 "$WORKDIR/authorized_keys"
 
 cat > "$WORKDIR/sshd_config" <<EOF
 Port 2222
