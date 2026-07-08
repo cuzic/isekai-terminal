@@ -1,3 +1,5 @@
+mod engine;
+
 use std::collections::VecDeque;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -6,13 +8,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use isekai_pipe_core::{
-    claim_connection_intent, default_runtime_dir, BootstrapProvenance, ConnectionIntent,
-    IntentTransport, ServerIdentity, ServiceSpec,
+    claim_connection_intent, default_runtime_dir, BootstrapProvenance, Candidate, CandidateGeneration,
+    CandidateRoute, ConnectionIntent, IntentTransport, ServerIdentity, ServiceSpec,
 };
 use isekai_transport::{
-    connect_stun_p2p, connect_via_relay_resumable, reconnect_and_resume, spawn_app_ack_tasks,
-    AppAckCounters, BackoffPolicy, ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf,
-    C2hSentOffset, H2cClientDeliveredOffset, RelayTarget, StunP2pTarget, SystemQuicEndpointFactory,
+    connect_stun_p2p, connect_via_relay_resumable, connect_via_relay_resumable_with_fallback,
+    reconnect_and_resume, spawn_app_ack_tasks, AppAckCounters, BackoffPolicy, ByteStream, ByteStreamReadHalf,
+    ByteStreamWriteHalf, C2hSentOffset, CandidatePool, CandidateProvider, ConfigRelayProvider, GatherContext,
+    H2cClientDeliveredOffset, LegacyIntentProvider, RelayTarget, SequentialRelayCandidate, StunP2pTarget,
+    SystemQuicEndpointFactory,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -224,6 +228,14 @@ async fn connect_command(args: impl Iterator<Item = String>) -> ExitCode {
         Err(code) => return code,
     };
 
+    // stdout carries only the SSH byte stream (module docs/`stdout_purity.rs`
+    // e2e tests) — logs, including `isekai-transport`'s per-candidate-attempt
+    // telemetry, must go to stderr only, exactly like `isekai-pipe serve`'s
+    // own `env_logger` setup (`engine::run_from_args`).
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Stderr)
+        .init();
+
     match run_connect(launch).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -243,43 +255,56 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
     }
 
     let profile = intent.profile.clone();
-    match intent.transport {
-        IntentTransport::Relay {
-            helper_addr,
-            server_name,
-            session_secret_b64,
-        } => run_relay_resumable(
+    // Session auth material never travels through the candidate model itself
+    // (`Candidate`/`CandidateKey` deliberately carry no secrets,
+    // `ISEKAI_PIPE_DESIGN.md` task #17) — decoded once here from the intent
+    // and threaded alongside whichever candidate is selected.
+    let session_secret = decode_secret(intent_session_secret_b64(&intent.transport))?;
+
+    // `#@isekai relay <addr>` (`ConnectionIntent.relay_endpoints`) opts into
+    // multi-candidate relay fallback (`ISEKAI_PIPE_DESIGN.md` task #12) —
+    // when unset, behavior is exactly the pre-#12 single-candidate path
+    // (`ConfigRelayProvider` is simply never consulted).
+    if !intent.relay_endpoints.is_empty() {
+        let candidates = resolve_relay_candidates(&intent, &session_secret).await?;
+        return run_relay_resumable_with_fallback(&candidates, &profile, intent.resume_grace_secs)
+            .await
+            .context("isekai-pipe connect: relay transport (with fallback) failed");
+    }
+
+    let candidate = resolve_single_candidate(&intent).await?;
+    let candidate_id_str = candidate.id.0.to_string();
+    let identity = isekai_transport::CandidateIdentity {
+        kind: candidate.route.kind_label(),
+        source: candidate.origins.first().map(|o| o.source.label()).unwrap_or("unknown"),
+        provider: candidate.origins.first().map(|o| o.provider_id.as_str()).unwrap_or("unknown"),
+        id: &candidate_id_str,
+    };
+
+    match &candidate.route {
+        CandidateRoute::Relay { cert_pin, helper_addr, server_name } => run_relay_resumable(
             &RelayTarget {
-                helper_addr: helper_addr
-                    .parse()
-                    .with_context(|| format!("invalid relay helper_addr {helper_addr:?}"))?,
-                server_name,
-                cert_sha256_hex: intent.expected_server_identity.cert_sha256_hex,
-                session_secret: decode_secret(&session_secret_b64)?,
+                helper_addr: *helper_addr,
+                server_name: server_name.as_str().to_string(),
+                cert_sha256_hex: cert_pin.to_hex(),
+                session_secret,
             },
             &profile,
-            launch.resume_window,
+            intent.resume_grace_secs,
+            identity,
         )
         .await
         .context("isekai-pipe connect: relay transport failed"),
-        IntentTransport::StunP2p {
-            stun_server,
-            peer_addr,
-            server_name,
-            session_secret_b64,
-        } => {
+        CandidateRoute::StunP2p { cert_pin, peer_addr, stun_server, server_name } => {
             let stream = connect_stun_p2p(
-                stun_server
-                    .parse()
-                    .with_context(|| format!("invalid stun_server {stun_server:?}"))?,
+                *stun_server,
                 &StunP2pTarget {
-                    peer_addr: peer_addr
-                        .parse()
-                        .with_context(|| format!("invalid stun peer_addr {peer_addr:?}"))?,
-                    server_name,
-                    cert_sha256_hex: intent.expected_server_identity.cert_sha256_hex,
-                    session_secret: decode_secret(&session_secret_b64)?,
+                    peer_addr: *peer_addr,
+                    server_name: server_name.as_str().to_string(),
+                    cert_sha256_hex: cert_pin.to_hex(),
+                    session_secret,
                 },
+                identity,
             )
             .await
             .map(|conn| conn.stream)
@@ -287,6 +312,103 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
             relay_stdio(stream).await
         }
     }
+}
+
+fn intent_session_secret_b64(transport: &IntentTransport) -> &str {
+    match transport {
+        IntentTransport::Relay { session_secret_b64, .. } => session_secret_b64,
+        IntentTransport::StunP2p { session_secret_b64, .. } => session_secret_b64,
+    }
+}
+
+/// Runs `intent` through the candidate pipeline (`LegacyIntentProvider` →
+/// `CandidatePool`) and asserts exactly one candidate came out. Today that's
+/// always true — the legacy provider only ever produces the single candidate
+/// `intent.transport` already described — so anything else is a bug to fail
+/// loudly on, not a selection policy decision to make silently (no `.first()`
+/// — `ISEKAI_PIPE_DESIGN.md` task #23). This is deliberately the only place
+/// `intent.transport` gets converted into a `Candidate`: everything past this
+/// point (including which transport variant to dial) reads `candidate.route`,
+/// not `intent.transport`, directly.
+async fn resolve_single_candidate(intent: &ConnectionIntent) -> Result<Candidate> {
+    let ctx = GatherContext {
+        generation: CandidateGeneration::INITIAL,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+        intent,
+    };
+    let batch = LegacyIntentProvider
+        .gather(&ctx)
+        .await
+        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: candidate discovery failed: {e}"))?;
+
+    let mut pool = CandidatePool::new();
+    let snapshot = pool
+        .replace_generation(batch)
+        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: stale candidate generation ({e:?})"))?;
+
+    let [candidate] = snapshot.candidates.as_slice() else {
+        anyhow::bail!(
+            "isekai-pipe connect: expected exactly one candidate from the legacy provider, got {}",
+            snapshot.candidates.len()
+        );
+    };
+    Ok(candidate.clone())
+}
+
+/// Runs `intent.relay_endpoints` through `ConfigRelayProvider` → `CandidatePool`,
+/// returning every resulting candidate — sorted by priority (rank 0 =
+/// `relay_endpoints[0]`, most preferred) — as ready-to-dial
+/// `SequentialRelayCandidate`s. Only called when `relay_endpoints` is
+/// non-empty (`run_connect` decides which of this or
+/// `resolve_single_candidate` applies); every candidate `ConfigRelayProvider`
+/// produces is `CandidateRoute::Relay` by construction
+/// (`isekai-pipe-core::candidate`'s docs), so encountering anything else here
+/// is a bug, not a runtime condition to route around.
+async fn resolve_relay_candidates(
+    intent: &ConnectionIntent,
+    session_secret: &[u8],
+) -> Result<Vec<SequentialRelayCandidate>> {
+    let ctx = GatherContext {
+        generation: CandidateGeneration::INITIAL,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+        intent,
+    };
+    let batch = ConfigRelayProvider
+        .gather(&ctx)
+        .await
+        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: relay candidate discovery failed: {e}"))?;
+
+    let mut pool = CandidatePool::new();
+    let snapshot = pool
+        .replace_generation(batch)
+        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: stale candidate generation ({e:?})"))?;
+
+    // Explicit sort by priority rank, rather than relying on
+    // `CandidatePool`'s own (currently coincidentally priority-matching)
+    // internal ordering — the fallback order is a correctness property
+    // (`ISEKAI_PIPE_DESIGN.md` task #12's acceptance criteria: deterministic,
+    // configured-order fallback), not an implementation detail to leave
+    // implicit.
+    let mut candidates = snapshot.candidates;
+    candidates.sort_by_key(|c| c.priority.rank);
+
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            let CandidateRoute::Relay { cert_pin, helper_addr, server_name } = &candidate.route else {
+                anyhow::bail!("isekai-pipe connect: ConfigRelayProvider produced a non-relay candidate (bug)");
+            };
+            Ok(SequentialRelayCandidate {
+                target: RelayTarget {
+                    helper_addr: *helper_addr,
+                    server_name: server_name.as_str().to_string(),
+                    cert_sha256_hex: cert_pin.to_hex(),
+                    session_secret: session_secret.to_vec(),
+                },
+                candidate_id: candidate.id.0.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn resolve_connection_intent(launch: &ConnectLaunch) -> Result<ConnectionIntent> {
@@ -345,7 +467,7 @@ fn intent_from_profile(
         },
     };
 
-    Ok(ConnectionIntent::new(
+    let mut intent = ConnectionIntent::new(
         profile,
         service,
         ServerIdentity {
@@ -353,7 +475,9 @@ fn intent_from_profile(
         },
         transport,
         BootstrapProvenance::TrustStore { key },
-    ))
+    );
+    intent.resume_grace_secs = launch.resume_window.as_secs();
+    Ok(intent)
 }
 
 fn decode_secret(b64: &str) -> Result<Vec<u8>> {
@@ -417,12 +541,57 @@ async fn relay_stdio(stream: Box<dyn ByteStream>) -> Result<()> {
 async fn run_relay_resumable(
     target: &RelayTarget,
     profile: &str,
-    resume_window: Duration,
+    requested_resume_grace_secs: u64,
+    identity: isekai_transport::CandidateIdentity<'_>,
 ) -> Result<()> {
     let factory = SystemQuicEndpointFactory;
-    let established = connect_via_relay_resumable(&factory, target).await?;
+    let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
+    let established = connect_via_relay_resumable(&factory, target, requested, identity).await?;
+    run_resume_loop(&factory, target, profile, established).await
+}
+
+/// Like `run_relay_resumable`, but tries `candidates` in priority order
+/// (`ISEKAI_PIPE_DESIGN.md` task #12: relay-endpoint fallback) instead of
+/// dialing a single fixed target. Falls back only across pre-attach
+/// failures — see `connect_via_relay_resumable_with_fallback`'s and
+/// `AttemptFailure`'s docs for why an ambiguous or terminal failure on one
+/// candidate stops the whole attempt rather than trying the next one.
+async fn run_relay_resumable_with_fallback(
+    candidates: &[SequentialRelayCandidate],
+    profile: &str,
+    requested_resume_grace_secs: u64,
+) -> Result<()> {
+    let factory = SystemQuicEndpointFactory;
+    let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
+    let (established, winning_target) = connect_via_relay_resumable_with_fallback(&factory, candidates, requested)
+        .await
+        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: relay fallback failed: {e}"))?;
+    run_resume_loop(&factory, &winning_target, profile, established).await
+}
+
+/// Runs the C2H/H2C data pump against `established`, resuming (via
+/// `reconnect_and_resume` against `target` — the *specific* candidate that
+/// won, in the fallback case) across disconnects until either the local side
+/// closes cleanly or the resume window is exceeded. Shared by both
+/// `run_relay_resumable` (single fixed target) and
+/// `run_relay_resumable_with_fallback` (the winning target out of several
+/// candidates) — resuming a session is always scoped to the one connection
+/// that established it, never a fresh candidate search.
+async fn run_resume_loop(
+    factory: &SystemQuicEndpointFactory,
+    target: &RelayTarget,
+    profile: &str,
+    established: isekai_transport::ResumableRelaySession,
+) -> Result<()> {
     let session_id = established.session_id;
     drop(established.connection);
+
+    // The server clamps our request to its own configured max (or applies
+    // its own default when we requested `0`) and echoes back what it
+    // actually granted — that, not our own request, is the real deadline: the
+    // server will have already discarded the parked session past this point
+    // regardless of how long we keep retrying (`ISEKAI_PIPE_DESIGN.md`).
+    let resume_window = Duration::from_secs(established.effective_resume_grace_secs.into());
 
     let counters = Arc::new(AppAckCounters::new());
     let app_ack_tasks = spawn_app_ack_tasks(established.control_stream, counters.clone());
@@ -474,7 +643,7 @@ async fn run_relay_resumable(
             let client_delivered_offset =
                 H2cClientDeliveredOffset::new(counters.h2c_client_delivered_offset());
             match reconnect_and_resume(
-                &factory,
+                factory,
                 target,
                 session_id,
                 client_sent_offset,
@@ -758,7 +927,7 @@ async fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
     helper_args.push("--target".to_string());
     helper_args.push(launch.service.target().to_string());
 
-    match isekai_helper::run_from_args(helper_args).await {
+    match engine::run_from_args(helper_args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e:?}");
@@ -781,6 +950,103 @@ mod tests {
         parse_serve(args.iter().map(|arg| arg.to_string()))
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn resolve_single_candidate_never_leaks_the_session_secret() {
+        let intent = ConnectionIntent::new(
+            "production",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::Relay {
+                helper_addr: "203.0.113.5:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "top-secret-value".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "production:22".to_string() },
+        );
+
+        let candidate = resolve_single_candidate(&intent).await.unwrap();
+        let debug = format!("{candidate:?}");
+        assert!(!debug.contains("top-secret-value"), "Candidate must never carry session_secret");
+    }
+
+    #[tokio::test]
+    async fn resolve_single_candidate_matches_the_legacy_transport() {
+        let intent = ConnectionIntent::new(
+            "production",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::Relay {
+                helper_addr: "203.0.113.5:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "production:22".to_string() },
+        );
+
+        let candidate = resolve_single_candidate(&intent).await.unwrap();
+        assert!(matches!(
+            candidate.route,
+            CandidateRoute::Relay { helper_addr, .. } if helper_addr == "203.0.113.5:45231".parse().unwrap()
+        ));
+    }
+
+    fn intent_with_relay_endpoints(relay_endpoints: Vec<String>) -> ConnectionIntent {
+        let mut intent = ConnectionIntent::new(
+            "production",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::Relay {
+                helper_addr: "203.0.113.5:1".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "production:22".to_string() },
+        );
+        intent.relay_endpoints = relay_endpoints;
+        intent
+    }
+
+    #[tokio::test]
+    async fn resolve_relay_candidates_preserves_configured_order() {
+        let intent = intent_with_relay_endpoints(vec![
+            "203.0.113.10:45231".to_string(),
+            "198.51.100.7:45231".to_string(),
+            "192.0.2.3:45231".to_string(),
+        ]);
+
+        let candidates = resolve_relay_candidates(&intent, b"session-secret").await.unwrap();
+
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].target.helper_addr, "203.0.113.10:45231".parse().unwrap());
+        assert_eq!(candidates[1].target.helper_addr, "198.51.100.7:45231".parse().unwrap());
+        assert_eq!(candidates[2].target.helper_addr, "192.0.2.3:45231".parse().unwrap());
+        // Every candidate must carry the shared cert pin/server name/secret.
+        for candidate in &candidates {
+            assert_eq!(candidate.target.cert_sha256_hex, "ab".repeat(32));
+            assert_eq!(candidate.target.server_name, "isekai-helper");
+            assert_eq!(candidate.target.session_secret, b"session-secret");
+        }
+        // Candidate ids must be distinct (used for telemetry/error correlation).
+        assert_ne!(candidates[0].candidate_id, candidates[1].candidate_id);
+        assert_ne!(candidates[1].candidate_id, candidates[2].candidate_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_relay_candidates_never_leaks_the_session_secret_via_debug() {
+        let intent = intent_with_relay_endpoints(vec!["203.0.113.10:45231".to_string()]);
+        let candidates = resolve_relay_candidates(&intent, b"top-secret-value").await.unwrap();
+        // `RelayTarget` isn't `Debug`, so this proves via the one field that
+        // actually carries the secret: it must be exactly what was passed in,
+        // never derived from/mixed with candidate identity data.
+        assert_eq!(candidates[0].target.session_secret, b"top-secret-value");
+    }
+
+    #[tokio::test]
+    async fn resolve_relay_candidates_rejects_a_malformed_endpoint() {
+        let intent = intent_with_relay_endpoints(vec!["not-an-address".to_string()]);
+        assert!(resolve_relay_candidates(&intent, b"secret").await.is_err());
     }
 
     #[test]
