@@ -185,12 +185,18 @@ pub async fn resolve_helper_binary(
         return std::fs::read(path).with_context(|| format!("failed to read helper binary at {}", path.display()));
     }
 
+    // Test-only override (real callers never set this) — points the
+    // download at a local mock HTTP server instead of real GitHub, the same
+    // way `ISEKAI_PIPE_PROFILES_DIR`/`ISEKAI_SSH_HELPER_CACHE_DIR` already
+    // let tests redirect other real paths.
+    let base_url = std::env::var("ISEKAI_SSH_HELPER_RELEASE_BASE_URL").unwrap_or_else(|_| GITHUB_BASE_URL.to_string());
+
     let arch = backend
         .detect_remote_arch(target, via)
         .await
         .context("failed to detect the remote architecture (uname -m) needed to auto-download a helper binary")?;
     let cache_dir = default_helper_cache_dir().context("could not determine the helper binary cache directory")?;
-    let path = ensure_helper_binary_cached(&cache_dir, source, &arch, GITHUB_BASE_URL)
+    let path = ensure_helper_binary_cached(&cache_dir, source, &arch, &base_url)
         .await
         .with_context(|| format!("auto-downloading an isekai-pipe binary for architecture {arch:?} from {}/{} failed", source.repo, source.tag.as_deref().unwrap_or("latest")))?;
     std::fs::read(&path).with_context(|| format!("failed to read downloaded helper binary at {}", path.display()))

@@ -794,6 +794,74 @@ sshを実行する」実装は避ける。
   から`ssh -G`経由で取れることを検証している(`wrapper.rs::defaults_bootstrap_candidate_from_ssh_g`
   の実route)。3回連続実行して安定を確認済み(各回45〜56秒)。
 
+### Epic L: 初回接続と2回目以降を同じ`isekai-ssh <host>`一発で完結させる — 完了(2026-07-09)
+
+ユーザーからの要望:「初回は`init`、2回目から`isekai-ssh`という使い分けを意識したくない。
+1つのコマンドで初回も2回目も接続できるようにしたい」。調査の結果、これは2つの別々の
+ギャップに分解できた:
+
+1. **relay経由の自動bootstrapに必要なrelayアドレス+SNIをどこから得るか** — 実は追加コード
+   不要で既に可能だった。`wrapper.rs::load_isekai_directives_from_file`は`ssh_config(5)`と
+   同じ「複数の`Host`ブロックがマッチしたら先勝ち」というカスケード方式で`#@isekai`
+   ディレクティブを収集しているため、`~/.ssh/config`の末尾に`Host *`ブロックで
+   `#@isekai bootstrap-relay addr=... sni=...`を一度書いておけば、個別の`Host`ブロックが
+   無い新規ホストに対しても「全ホスト共通のデフォルトrelay」として効く(個別ブロックが
+   あればそちらが優先される)。この事実自体はEpic Hの実装時から存在していたが、
+   ドキュメント化されていなかった(READMEにQuick Startとして追記)。
+2. **ヘルパーバイナリ(`isekai-pipe`)の調達** — `--isekai-helper-binary <path>`を毎回手で
+   渡さないと`no --isekai-helper-binary given`で即座に失敗していた。埋め込みバイナリは
+   意図的に無い(`cli::InitArgs::helper_binary`のdoc comment参照: 全ての`cargo build -p
+   isekai-ssh`がmuslアーティファクトを要求するようになる罠を避けるため)。
+
+2番の解決策として、ユーザーの選択によりGitHub Releasesからの自動ダウンロード機構を
+実装した。**このプロジェクトはまだGitHub Release配布を一切始めていない**(Epic Dで
+確認済み: 署名鍵の生成・保管方針が未確定のため意図的に保留中)ため、今回のスコープは
+isekai-ssh側の自動ダウンロード機構の実装のみとし、実際にGitHub Releaseを発行するCI
+ワークフロー・署名鍵の生成/保管・実在するrelease assetの用意は対象外(honest gap、
+README「既知の制限」に明記)。
+
+- ✅ **リモートアーキテクチャ検出**: `isekai-bootstrap::openssh::OpenSshBackend::
+  detect_remote_arch(target, via)`を追加。`uname -m`を単独のssh(1)ラウンドトリップとして
+  実行し、`"x86_64"`/`"aarch64"`(`"arm64"`もaarch64として受理)に正規化する
+  (`rust-core/src/helper_bootstrap.rs`の`IsekaiPipeBinaries::select_for`、Android側の
+  既存remote-bootstrap実装と同じarch分岐を踏襲)。`BootstrapError`に
+  `RemoteCommandFailed`/`UnsupportedArch`を追加。
+- ✅ **GitHub Releaseダウンロード+キャッシュ**: 新モジュール`isekai-ssh/src/helper_download.rs`。
+  `isekai-auth::oauth`/`device_flow`と同じ`ureq`(blocking、`tokio::task::spawn_blocking`で
+  包む)を使い、`{repo}/releases/latest/download/{asset}`(GitHubのredirectで実タグへ飛ぶ、
+  API呼び出し・JSON parse不要)からダウンロードする。asset名規約は
+  `isekai-pipe-<arch>-unknown-linux-musl`(`build-isekai-pipe-musl.sh`の出力アーキと対応)。
+  `.sha256`サイドカー(存在すれば)で整合性検証(ベストエフォート、404は許容)。
+  `$XDG_CACHE_HOME/isekai-ssh/helpers`(既定`~/.cache/isekai-ssh/helpers`)にatomic writeで
+  キャッシュし、以降は同じ`(repo, tag, arch)`に対して再ダウンロードしない(自動的な鮮度
+  チェックは意図的に省略、honest gap)。
+- ✅ **`init.rs`/`wrapper.rs`への配線**: `InitArgs::helper_binary`を`PathBuf`(必須)から
+  `Option<PathBuf>`に緩和。`--helper-binary`/`--isekai-helper-binary`省略時、
+  `helper_download::resolve_helper_binary`が`detect_remote_arch`→
+  `ensure_helper_binary_cached`の順で解決を試み、失敗時は既存の明示的エラーメッセージ
+  (`--helper-binary`を渡すか`isekai-ssh init`を実行するよう促す)にフォールバックする。
+  明示指定時はアーキ検出・ダウンロードを一切スキップし、既存ユーザーの挙動・性能に
+  影響を与えない。`--helper-release-repo`/`--helper-release-tag`(init)・
+  `--isekai-helper-release-repo`/`--isekai-helper-release-tag`(wrapper)を追加
+  (既定`cuzic/isekai-terminal`/latest)。マニフェスト検証(`--helper-manifest`)は
+  ダウンロード結果に対してもそのまま適用できる(新しい検証ロジックは追加していない)。
+- ✅ テスト: `isekai-bootstrap`に`normalize_uname_arch`のunit test + 実sshd越しの
+  `detect_remote_arch`統合test。`helper_download`にURL構築/キャッシュパス計算の純粋関数
+  unit testと、ローカルmock HTTPサーバー(このcrateの既存mock STUN serverと同じ
+  「最小限を手書きする」慣習)に対する実ダウンロードe2eテスト(ダウンロード成功・
+  キャッシュ再利用・sha256不一致拒否・サイドカー欠如の許容・404失敗)。
+  **エンドツーエンド受け入れテスト**`isekai-ssh/tests/wrapper_auto_download_relay_bootstrap_e2e.rs`:
+  実sshd(mock) + mock HTTPサーバーを組み合わせ、`~/.ssh/config`に`Host *` +
+  `#@isekai bootstrap-relay`だけを置いた状態で`--isekai-helper-binary`を一切渡さず
+  `isekai-ssh <新規ホスト>`を実行し、アーキ検出→ダウンロード→relay bootstrap→
+  `PersistentProfile`登録まで完走することを確認(ユーザーが求めていた体験そのものの証明、
+  3.4秒で完走・3回連続実行で安定確認済み)。デバッグ中に発見したハマりどころ: 新しく
+  duplicateしたmock sshdサーバー実装で`channel_eof`ハンドラのコピーを一度忘れ、
+  アップロードのstdin書き込み後にEOFがリモートの`base64 -d`まで伝播せず無期限ハング
+  した(既存の`wrapper_auto_bootstrap_e2e.rs`にはこのハンドラが実装済みだったが、
+  duplicateする際に見落とした)。
+  既存の`isekai-bootstrap`(unit 10+e2e 8)・`isekai-ssh`(unit 54+e2e 20)は全てgreenのまま。
+
 ### ADR: 複数isekai-sshプロセスによるisekai-pipe共有(マルチプレクス) — 実装しない(Deferred)
 
 検討の結果、SSH ControlMaster/ControlPersist(CLI)・SSH接続プーリング(Android)という
