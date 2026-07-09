@@ -441,7 +441,7 @@ enum BootstrapFailure {
   install/start、reconnect/resume)は、環境依存のため本Epicとは別枠(P2、release checklist側)
   で扱う。
 
-### Epic D: リリース成果物の署名検証(公開配布のRelease Gate)— manifest検証機構のみ完了(2026-07-08)
+### Epic D: リリース成果物の署名検証(公開配布のRelease Gate)— manifest検証機構+wrapper配線まで完了(2026-07-09)
 
 対象は`known_helpers.toml`ではなく、リモートbootstrapで配置する`isekai-pipe`等の**リリース
 成果物**。SHA-256のみでは、artifactとdigestを同じ配布元から取得している限り攻撃者が両方を
@@ -470,11 +470,19 @@ enum BootstrapFailure {
 - ✅ テスト: `isekai-ssh/src/init.rs`内のunit test 5件(正常系・改ざんバイナリ・信頼鍵なし・
   expect-platform未指定・署名者と異なる鍵を信頼している場合)と、実バイナリを起動してCLI配線を
   検証するprocess-level e2eテスト`isekai-ssh/tests/init_manifest_verification_e2e.rs`2件。
+- ✅ `wrapper.rs`の自動bootstrap経路(`bootstrap_and_register`)への同フラグの追加、
+  完了(2026-07-09)。`--isekai-helper-manifest`/`--isekai-trusted-release-key`(複数可)/
+  `--isekai-expect-platform`/`--isekai-expect-architecture`を追加し、`init.rs`の
+  `verify_helper_manifest`を`&InitArgs`から切り離して(`pub(crate)`、primitive引数)
+  wrapperからも同じ検証ロジックを呼べるようにした。検証失敗は`BootstrapFailure::
+  RemoteBinaryUntrusted`として分類し(Epic I)、`isekai-ssh init`への誘導メッセージが出る。
+  確認メッセージは`init`(stdout)と違い`eprintln!`(stderr)——wrapperのstdout purity契約
+  (`ProxyCommand`経由でsshに丸ごと渡る)を守るため。テスト: `wrapper.rs`内のunit test2件
+  (CLI解析・信頼鍵無しでの検証失敗が`RemoteBinaryUntrusted`に分類されること)。既存の
+  `isekai-ssh`テスト(unit 41件・e2e 20本)は全てgreenのまま。
 - 未着手として意図的に残している点:
   - offline release signing keyの実際の生成・保管方式、key ID運用、鍵ローテーション・
     emergency revocation方針の確定。
-  - `wrapper.rs`の自動bootstrap経路(`bootstrap_and_register`)への同フラグの追加(`init`のみ
-    に配線済み。自動bootstrapへの拡張はEpic Iと合わせて検討する)。
   - CI側でのrelease signing・manifest生成・鍵ローテーションtestは、実際にGitHub Releaseでの
     配布を開始するまで意味を持たないため保留。
   - 「一時ファイルのままinstallせず既存バイナリを維持する」という受け入れ条件は、今回配線した

@@ -40,8 +40,18 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let helper_sha256 = hex_sha256(&helper_binary);
 
     if let Some(manifest_path) = &args.helper_manifest {
-        verify_helper_manifest(&args, manifest_path, &helper_binary)
-            .with_context(|| "isekai-ssh: release manifest verification failed — refusing to deploy an unverified binary".to_string())?;
+        let signed = verify_helper_manifest(
+            manifest_path,
+            &args.trusted_release_keys,
+            args.expect_platform.as_deref(),
+            args.expect_architecture.as_deref(),
+            &helper_binary,
+        )
+        .with_context(|| "isekai-ssh: release manifest verification failed — refusing to deploy an unverified binary".to_string())?;
+        println!(
+            "Release manifest verified: version={} key_id={} channel={}",
+            signed.manifest.version, signed.manifest.key_id, signed.manifest.release_channel
+        );
     }
 
     let target = parse_host_spec(&args.host)
@@ -159,14 +169,29 @@ fn hex_sha256(bytes: &[u8]) -> String {
 /// `--trusted-release-key`, and verifies `helper_binary` against it
 /// (`isekai-release-verify`, `ISEKAI_PIPE_DESIGN.md` §8 Epic D). Returns an
 /// error — never deploys — on any verification failure.
-fn verify_helper_manifest(args: &InitArgs, manifest_path: &std::path::Path, helper_binary: &[u8]) -> Result<()> {
+/// Verifies `helper_binary` against a signed release manifest
+/// (`isekai-release-verify`, `ISEKAI_PIPE_DESIGN.md` §8 Epic D), returning
+/// the verified `SignedManifest` on success. Takes primitive parameters
+/// rather than `&InitArgs` so `wrapper.rs`'s auto-bootstrap path
+/// (`ISEKAI_PIPE_DESIGN.md` §8 Epic D's "未着手として意図的に残している点":
+/// this flag set was wired to `init` only) can call the exact same
+/// verification logic with its own `--isekai-*`-prefixed flags — the two
+/// commands' argument-parsing shapes differ, but the check itself
+/// shouldn't be duplicated.
+pub(crate) fn verify_helper_manifest(
+    manifest_path: &std::path::Path,
+    trusted_release_keys: &[String],
+    expect_platform: Option<&str>,
+    expect_architecture: Option<&str>,
+    helper_binary: &[u8],
+) -> Result<SignedManifest> {
     let manifest_bytes = std::fs::read(manifest_path)
         .with_context(|| format!("failed to read --helper-manifest at {}", manifest_path.display()))?;
     let signed: SignedManifest = serde_json::from_slice(&manifest_bytes)
         .with_context(|| format!("failed to parse --helper-manifest at {} as a signed release manifest", manifest_path.display()))?;
 
     let mut keys = TrustedReleaseKeys::new();
-    for entry in &args.trusted_release_keys {
+    for entry in trusted_release_keys {
         let (key_id, hex_pubkey) = entry
             .split_once('=')
             .ok_or_else(|| anyhow!("invalid --trusted-release-key {entry:?}: expected KEY_ID=HEXPUBKEY"))?;
@@ -175,17 +200,13 @@ fn verify_helper_manifest(args: &InitArgs, manifest_path: &std::path::Path, help
     if keys.is_empty() {
         return Err(anyhow!("--helper-manifest was given but no --trusted-release-key was provided"));
     }
-    let expect_platform = args.expect_platform.as_deref().ok_or_else(|| anyhow!("--expect-platform is required when --helper-manifest is given"))?;
+    let expect_platform = expect_platform.ok_or_else(|| anyhow!("--expect-platform is required when --helper-manifest is given"))?;
     let expect_architecture =
-        args.expect_architecture.as_deref().ok_or_else(|| anyhow!("--expect-architecture is required when --helper-manifest is given"))?;
+        expect_architecture.ok_or_else(|| anyhow!("--expect-architecture is required when --helper-manifest is given"))?;
 
     verify_artifact(&signed, helper_binary, &keys, ExpectedTarget { platform: expect_platform, architecture: expect_architecture })
         .map_err(|e| anyhow!("{e}"))?;
-    println!(
-        "Release manifest verified: version={} key_id={} channel={}",
-        signed.manifest.version, signed.manifest.key_id, signed.manifest.release_channel
-    );
-    Ok(())
+    Ok(signed)
 }
 
 /// Current UTC time formatted as RFC 3339 (`trusted_at`/`last_seen_at` are
@@ -448,7 +469,7 @@ mod tests {
         args.expect_platform = Some("linux".to_string());
         args.expect_architecture = Some("x86_64".to_string());
 
-        assert!(verify_helper_manifest(&args, &manifest_path, &binary).is_ok());
+        assert!(verify_helper_manifest(&manifest_path, &args.trusted_release_keys, args.expect_platform.as_deref(), args.expect_architecture.as_deref(), &binary).is_ok());
     }
 
     #[test]
@@ -466,7 +487,7 @@ mod tests {
         args.expect_architecture = Some("x86_64".to_string());
 
         let tampered = b"pretend-isekai-pipe-BYTES".to_vec();
-        assert!(verify_helper_manifest(&args, &manifest_path, &tampered).is_err());
+        assert!(verify_helper_manifest(&manifest_path, &args.trusted_release_keys, args.expect_platform.as_deref(), args.expect_architecture.as_deref(), &tampered).is_err());
     }
 
     #[test]
@@ -482,7 +503,7 @@ mod tests {
         args.expect_architecture = Some("x86_64".to_string());
         // Deliberately no --trusted-release-key.
 
-        let err = verify_helper_manifest(&args, &manifest_path, &binary).unwrap_err();
+        let err = verify_helper_manifest(&manifest_path, &args.trusted_release_keys, args.expect_platform.as_deref(), args.expect_architecture.as_deref(), &binary).unwrap_err();
         assert!(err.to_string().contains("no --trusted-release-key"), "{err}");
     }
 
@@ -500,7 +521,7 @@ mod tests {
         args.expect_architecture = Some("x86_64".to_string());
         // Deliberately no --expect-platform.
 
-        let err = verify_helper_manifest(&args, &manifest_path, &binary).unwrap_err();
+        let err = verify_helper_manifest(&manifest_path, &args.trusted_release_keys, args.expect_platform.as_deref(), args.expect_architecture.as_deref(), &binary).unwrap_err();
         assert!(err.to_string().contains("--expect-platform"), "{err}");
     }
 
@@ -520,6 +541,6 @@ mod tests {
         args.expect_platform = Some("linux".to_string());
         args.expect_architecture = Some("x86_64".to_string());
 
-        assert!(verify_helper_manifest(&args, &manifest_path, &binary).is_err());
+        assert!(verify_helper_manifest(&manifest_path, &args.trusted_release_keys, args.expect_platform.as_deref(), args.expect_architecture.as_deref(), &binary).is_err());
     }
 }

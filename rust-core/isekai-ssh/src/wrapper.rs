@@ -55,6 +55,15 @@ struct WrapperIsekaiOptions {
     /// for why this stays an explicit, required-when-needed argument rather
     /// than a guessed default.
     helper_binary: Option<PathBuf>,
+    /// Mirrors `cli::InitArgs::helper_manifest`/`trusted_release_keys`/
+    /// `expect_platform`/`expect_architecture` (`ISEKAI_PIPE_DESIGN.md` §8
+    /// Epic D's manifest verification, extended to the wrapper's own
+    /// auto-bootstrap path rather than `init` only). Optional and off by
+    /// default, same as `init`'s equivalent flags.
+    helper_manifest: Option<PathBuf>,
+    trusted_release_keys: Vec<String>,
+    expect_platform: Option<String>,
+    expect_architecture: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -380,6 +389,22 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
         .with_context(|| format!("failed to read helper binary at {}", helper_binary_path.display()))?;
     let helper_sha256 = hex_sha256(&helper_binary);
 
+    if let Some(manifest_path) = &plan.isekai.helper_manifest {
+        let signed = crate::init::verify_helper_manifest(
+            manifest_path,
+            &plan.isekai.trusted_release_keys,
+            plan.isekai.expect_platform.as_deref(),
+            plan.isekai.expect_architecture.as_deref(),
+            &helper_binary,
+        )
+        .map_err(|e| e.context(BootstrapFailure::RemoteBinaryUntrusted))
+        .with_context(|| "isekai-ssh: release manifest verification failed — refusing to deploy an unverified binary".to_string())?;
+        eprintln!(
+            "isekai-ssh: release manifest verified: version={} key_id={} channel={}",
+            signed.manifest.version, signed.manifest.key_id, signed.manifest.release_channel
+        );
+    }
+
     // `#@isekai stun` directives are collected as plain strings without
     // socket-address validation (`resolve_isekai_config`'s `append_args`
     // just accumulates whatever text follows the directive) — a malformed
@@ -586,6 +611,19 @@ fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
             "--isekai-helper-binary" => {
                 isekai.helper_binary =
                     Some(PathBuf::from(next_value(&mut iter, "--isekai-helper-binary")?));
+            }
+            "--isekai-helper-manifest" => {
+                isekai.helper_manifest =
+                    Some(PathBuf::from(next_value(&mut iter, "--isekai-helper-manifest")?));
+            }
+            "--isekai-trusted-release-key" => {
+                isekai.trusted_release_keys.push(next_value(&mut iter, "--isekai-trusted-release-key")?);
+            }
+            "--isekai-expect-platform" => {
+                isekai.expect_platform = Some(next_value(&mut iter, "--isekai-expect-platform")?);
+            }
+            "--isekai-expect-architecture" => {
+                isekai.expect_architecture = Some(next_value(&mut iter, "--isekai-expect-architecture")?);
             }
             _ => ssh_args.push(arg),
         }
@@ -1422,6 +1460,83 @@ mod tests {
             plan.ssh_args,
             s(&["-p", "2222", "user@production", "uptime"])
         );
+    }
+
+    #[test]
+    fn parses_manifest_verification_flags() {
+        let plan = parse_wrapper(s(&[
+            "--isekai-helper-binary",
+            "/opt/isekai-pipe",
+            "--isekai-helper-manifest",
+            "/opt/manifest.json",
+            "--isekai-trusted-release-key",
+            "prod=aabbcc",
+            "--isekai-trusted-release-key",
+            "staging=ddeeff",
+            "--isekai-expect-platform",
+            "linux",
+            "--isekai-expect-architecture",
+            "x86_64",
+            "production",
+        ]))
+        .unwrap();
+
+        assert_eq!(plan.isekai.helper_manifest, Some(PathBuf::from("/opt/manifest.json")));
+        assert_eq!(plan.isekai.trusted_release_keys, vec!["prod=aabbcc".to_string(), "staging=ddeeff".to_string()]);
+        assert_eq!(plan.isekai.expect_platform, Some("linux".to_string()));
+        assert_eq!(plan.isekai.expect_architecture, Some("x86_64".to_string()));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_and_register_classifies_a_manifest_verification_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let helper_binary_path = tmp.path().join("isekai-pipe");
+        std::fs::write(&helper_binary_path, b"pretend-binary-bytes").unwrap();
+        // No `--isekai-trusted-release-key` given — `verify_helper_manifest`
+        // fails closed before ever reading the (nonexistent) manifest file's
+        // contents matter, matching `init.rs`'s own
+        // `verify_helper_manifest_rejects_when_no_trusted_key_given`.
+        let manifest_path = tmp.path().join("manifest.json");
+        std::fs::write(&manifest_path, b"{}").unwrap();
+
+        let mut plan = WrapperPlan {
+            openssh_path: PathBuf::from("/usr/bin/ssh"),
+            pipe_path: PathBuf::from("/usr/bin/isekai-pipe"),
+            destination: "production".to_string(),
+            destination_index: 0,
+            ssh_args: Vec::new(),
+            isekai: WrapperIsekaiOptions::default(),
+        };
+        plan.isekai.helper_binary = Some(helper_binary_path);
+        plan.isekai.helper_manifest = Some(manifest_path);
+
+        let resolution = WrapperResolution {
+            openssh: OpenSshEffectiveConfig::default(),
+            isekai: IsekaiConfig {
+                enabled: true,
+                bootstrap_policy: BootstrapPolicy::Auto,
+                profile: "production".to_string(),
+                remote_path: None,
+                services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
+                bootstrap_candidates: vec![BootstrapCandidate { target: "production:22".to_string(), via: Vec::new(), priority: 0 }],
+                link_endpoints: Vec::new(),
+                rendezvous: Vec::new(),
+                stun_servers: Vec::new(),
+                relay_endpoints: Vec::new(),
+                resume_grace_secs: 180,
+                candidate_race_delay_ms: 150,
+                relay_delay_ms: 750,
+                install_mode: InstallMode::User,
+                bootstrap_relay: None,
+            },
+        };
+
+        let err = bootstrap_and_register(&plan, &resolution).await.unwrap_err();
+        let failure = err
+            .downcast_ref::<BootstrapFailure>()
+            .expect("a classified BootstrapFailure should be attached to the error chain");
+        assert!(matches!(failure, BootstrapFailure::RemoteBinaryUntrusted));
+        assert!(failure.should_redirect_to_init());
     }
 
     #[test]
