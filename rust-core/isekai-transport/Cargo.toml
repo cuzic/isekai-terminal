@@ -25,6 +25,12 @@ thiserror = "2.0.18"
 log = "0.4"
 # BackoffPolicyのジッター計算（呼び出し元がRNGを渡す設計、purityを保つ）。
 rand = "0.8"
+# マルチパス(物理インタフェース列挙・束縛)。`discovery` featureでnetdev経由の
+# インタフェース列挙(`quicsock::discovery`)も使う。quicsock-noqのPathSocket traitは
+# ソケット型に対してジェネリックなので、ここでもFaultyUdpSocket等のAndroid専用型を
+# 参照する必要はない(Androidは`NamedPath::from_socket`に束縛済みソケットを渡すだけ)。
+quicsock = { path = "../quicsock", features = ["discovery"] }
+quicsock-noq = { path = "../quicsock-noq" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

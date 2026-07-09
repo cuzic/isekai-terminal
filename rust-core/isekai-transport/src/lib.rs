@@ -33,6 +33,14 @@
 //!   times and how long to keep retrying is `isekai-ssh`'s job (it also owns
 //!   the C2H replay buffer/backpressure, `archive/ISEKAI_SSH_DESIGN.md`'s task
 //!   split).
+//! - `path_health` (isekai-terminal-core/isekai-transport crate共有化,
+//!   multipath移植): path RTT/loss/black-hole classification and the
+//!   ping-driven health monitor loop, ported and generalized from
+//!   `isekai-terminal-core`'s `multipath_transport.rs` (`PathBroker`/
+//!   `spawn_health_monitor`, real-hardware verified). See that module's docs
+//!   for exactly which parts of the Android implementation this does and
+//!   does not port (noq issue #738 means same-connection physical-interface
+//!   multipath is a confirmed dead end, not ported).
 //!
 //! Explicitly **out of scope** for this phase (left for later phases per
 //! `archive/ISEKAI_SSH_DESIGN.md`'s フェーズ分割案):
@@ -55,6 +63,7 @@ pub mod candidate_pool;
 pub mod candidate_provider;
 pub mod error;
 pub mod generation_coordinator;
+pub mod path_health;
 pub mod proof;
 pub mod race;
 pub mod relay;
@@ -77,6 +86,10 @@ pub use candidate_provider::{
     LegacyIntentProvider,
 };
 pub use error::TransportError;
+pub use path_health::{
+    classify_path_health, has_zero_response, notify_if_no_viable_path, spawn_health_monitor, PathHealthEvent,
+    PathHealthTracker, PathLabel, PathState,
+};
 pub use proof::compute_proof;
 pub use relay::{connect_via_relay, connect_via_relay_with_connection, RelayTarget};
 pub use resume::{
