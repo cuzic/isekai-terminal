@@ -343,9 +343,14 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
         }
         ConnectRoute::StunWithFallback => {
             let (target, candidates) = resolve_stun_candidates(&intent, &session_secret).await?;
-            return run_stun_p2p_with_fallback(&target, &candidates)
-                .await
-                .context("isekai-pipe connect: STUN P2P transport (with fallback) failed");
+            let stun_result = run_stun_p2p_with_fallback(&target, &candidates).await;
+            return recover_via_cross_family_fallback(
+                stun_result,
+                &intent,
+                "STUN P2P transport (with fallback)",
+                launch.experimental_network_rebind,
+            )
+            .await;
         }
         ConnectRoute::SingleCandidate => {}
     }
@@ -375,7 +380,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
         .await
         .context("isekai-pipe connect: relay transport failed"),
         CandidateRoute::StunP2p { cert_pin, peer_addr, stun_server, server_name } => {
-            let stream = connect_stun_p2p(
+            let stun_result = connect_stun_p2p(
                 *stun_server,
                 &StunP2pTarget {
                     peer_addr: *peer_addr,
@@ -386,11 +391,67 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                 identity,
             )
             .await
-            .map(|conn| conn.stream)
-            .context("isekai-pipe connect: STUN P2P transport failed")?;
-            relay_stdio(stream).await
+            .map(|conn| conn.stream);
+            match stun_result {
+                Ok(stream) => relay_stdio(stream).await,
+                Err(e) => {
+                    recover_via_cross_family_fallback(
+                        Err(anyhow::Error::new(e)),
+                        &intent,
+                        "STUN P2P transport",
+                        launch.experimental_network_rebind,
+                    )
+                    .await
+                }
+            }
         }
     }
+}
+
+/// If `result` failed and `intent.cross_family_fallback` names a `Relay`
+/// transport, retries once via that transport instead — sequential
+/// cross-family fallback (`ISEKAI_PIPE_DESIGN.md` §8 Epic I's
+/// `I-route-scheduler`, the ordered-fallback half only; racing a second
+/// family concurrently remains out of scope, same as `select_transport`'s
+/// own STUN-vs-relay choice in `isekai-ssh/src/wrapper.rs`). `context_label`
+/// names `result`'s own failed attempt for the combined error message if the
+/// fallback also fails (or doesn't exist).
+async fn recover_via_cross_family_fallback(
+    result: Result<()>,
+    intent: &ConnectionIntent,
+    context_label: &str,
+    experimental_network_rebind: bool,
+) -> Result<()> {
+    let Err(primary_err) = result else { return Ok(()) };
+    let Some(IntentTransport::Relay { helper_addr, server_name, session_secret_b64 }) = &intent.cross_family_fallback else {
+        return Err(primary_err).with_context(|| format!("isekai-pipe connect: {context_label} failed"));
+    };
+    log::warn!("isekai-pipe connect: {context_label} failed ({primary_err:#}); trying cross-family relay fallback");
+    let session_secret = decode_secret(session_secret_b64).with_context(|| {
+        format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback's session secret was invalid")
+    })?;
+    let identity = isekai_transport::CandidateIdentity {
+        kind: "relay",
+        source: "cross-family-fallback",
+        provider: "cross-family-fallback",
+        id: "cross-family-fallback",
+    };
+    run_relay_resumable(
+        &RelayTarget {
+            helper_addr: helper_addr
+                .parse()
+                .with_context(|| format!("isekai-pipe connect: invalid cross_family_fallback helper_addr {helper_addr:?}"))?,
+            server_name: server_name.clone(),
+            cert_sha256_hex: intent.expected_server_identity.cert_sha256_hex.clone(),
+            session_secret,
+        },
+        &intent.profile,
+        intent.resume_grace_secs,
+        identity,
+        experimental_network_rebind,
+    )
+    .await
+    .with_context(|| format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback also failed"))
 }
 
 fn intent_session_secret_b64(transport: &IntentTransport) -> &str {
@@ -2642,6 +2703,71 @@ mod tests {
         let status = ProbeStageStatus::Failed { detail: "boom".to_string() };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(json, r#"{"status":"failed","detail":"boom"}"#);
+    }
+
+    fn sample_stun_primary_intent() -> ConnectionIntent {
+        ConnectionIntent::new(
+            "production",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::StunP2p {
+                stun_server: "203.0.113.9:3478".to_string(),
+                peer_addr: "198.51.100.7:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "production:22".to_string() },
+        )
+    }
+
+    #[tokio::test]
+    async fn recover_via_cross_family_fallback_passes_success_through_untouched() {
+        let intent = sample_stun_primary_intent();
+        let result = recover_via_cross_family_fallback(Ok(()), &intent, "STUN P2P transport", false).await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn recover_via_cross_family_fallback_propagates_the_original_error_when_no_fallback_exists() {
+        let intent = sample_stun_primary_intent();
+        assert_eq!(intent.cross_family_fallback, None);
+
+        let result = recover_via_cross_family_fallback(
+            Err(anyhow::anyhow!("simulated STUN failure")),
+            &intent,
+            "STUN P2P transport",
+            false,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("simulated STUN failure"), "{err:#}");
+        assert!(format!("{err:#}").contains("STUN P2P transport failed"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn recover_via_cross_family_fallback_reports_both_failures_when_the_fallback_dial_also_fails() {
+        let mut intent = sample_stun_primary_intent();
+        // A relay target nothing is listening on — the fallback dial itself
+        // must fail too, and the combined error should mention both.
+        intent.cross_family_fallback = Some(IntentTransport::Relay {
+            helper_addr: "127.0.0.1:1".to_string(),
+            server_name: "isekai-helper".to_string(),
+            session_secret_b64: "c2VjcmV0".to_string(),
+        });
+
+        let result = recover_via_cross_family_fallback(
+            Err(anyhow::anyhow!("simulated STUN failure")),
+            &intent,
+            "STUN P2P transport",
+            false,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("simulated STUN failure"), "{rendered}");
+        assert!(rendered.contains("cross-family relay fallback also failed"), "{rendered}");
     }
 }
 

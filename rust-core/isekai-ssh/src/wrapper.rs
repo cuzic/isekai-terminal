@@ -231,7 +231,7 @@ fn build_connection_intent(resolution: &WrapperResolution) -> Result<ConnectionI
             profiles_dir.display()
         )
     })?;
-    let transport = select_transport(&profile, &resolution.isekai.stun_servers).ok_or_else(|| {
+    let (transport, cross_family_fallback) = select_transport(&profile, &resolution.isekai.stun_servers).ok_or_else(|| {
         anyhow!(
             "isekai-ssh: profile {:?} has no cached relay transport (candidate-source profiles are not supported by the wrapper yet)",
             key
@@ -245,6 +245,7 @@ fn build_connection_intent(resolution: &WrapperResolution) -> Result<ConnectionI
         transport,
         BootstrapProvenance::TrustStore { key },
     );
+    intent.cross_family_fallback = cross_family_fallback;
     intent.link_endpoints = resolution.isekai.link_endpoints.clone();
     intent.rendezvous = resolution.isekai.rendezvous.clone();
     intent.stun_servers = resolution.isekai.stun_servers.clone();
@@ -267,27 +268,30 @@ fn build_connection_intent(resolution: &WrapperResolution) -> Result<ConnectionI
 /// - the profile has a `cached_stun_observed_addr` — bootstrap actually got
 ///   a `server-reflexive` candidate back from the deployed helper.
 ///
-/// Deliberately does *not* race STUN against the direct/relay candidate —
-/// `ConnectionIntent` still has "one primary transport plus same-family
-/// fallback lists" shape, not an ordered cross-family candidate list, so
-/// honestly expressing "try STUN, then fall back to direct" as a single
-/// connection attempt isn't possible without a schema change. When STUN
-/// evidence exists, it's chosen outright; the wrapper does not retry via
-/// `legacy_relay_transport` if the STUN attempt itself later fails (a
-/// cross-family fallback/scheduler is a later Epic I integration step, not
-/// this one).
-fn select_transport(profile: &PersistentProfile, configured_stun_servers: &[String]) -> Option<IntentTransport> {
+/// Deliberately does *not race* STUN against the direct/relay candidate —
+/// `ConnectionIntent::transport` is still a single primary, not an ordered
+/// concurrent candidate list, so honestly expressing "try both at once" isn't
+/// possible without a bigger schema change than this crate has taken on. It
+/// *does* return a sequential cross-family fallback (`ConnectionIntent::
+/// cross_family_fallback`, `ISEKAI_PIPE_DESIGN.md` §8 Epic I's
+/// `I-route-scheduler`, ordered-fallback half only) — when STUN evidence
+/// wins as primary, the same `legacy_relay_transport` this function would
+/// otherwise have returned outright becomes the fallback instead of being
+/// discarded, so `isekai-pipe connect` can fall back to it if the STUN P2P
+/// attempt fails entirely.
+fn select_transport(profile: &PersistentProfile, configured_stun_servers: &[String]) -> Option<(IntentTransport, Option<IntentTransport>)> {
     if let (Some(peer_addr), Some(stun_server), Some(legacy)) =
         (&profile.cached_stun_observed_addr, configured_stun_servers.first(), &profile.legacy_relay_transport)
     {
-        return Some(IntentTransport::StunP2p {
+        let primary = IntentTransport::StunP2p {
             stun_server: stun_server.clone(),
             peer_addr: peer_addr.clone(),
             server_name: "isekai-helper".to_string(),
             session_secret_b64: legacy.session_secret_b64.clone(),
-        });
+        };
+        return Some((primary, profile.to_legacy_relay_transport()));
     }
-    profile.to_legacy_relay_transport()
+    profile.to_legacy_relay_transport().map(|relay| (relay, None))
 }
 
 /// Looks for a [`BootstrapFailure`] attached anywhere in `err`'s context
@@ -1734,7 +1738,7 @@ mod tests {
         let profile = PersistentProfile::migrate_legacy_helper_trust("stun-host:22", &trust);
         let stun_servers = vec!["stun1.example.com:3478".to_string(), "stun2.example.com:3478".to_string()];
 
-        let transport = select_transport(&profile, &stun_servers).unwrap();
+        let (transport, fallback) = select_transport(&profile, &stun_servers).unwrap();
 
         assert_eq!(
             transport,
@@ -1745,6 +1749,17 @@ mod tests {
                 session_secret_b64: "c2VjcmV0".to_string(),
             }
         );
+        // STUN P2P is primary, but the relay transport that would otherwise
+        // have been chosen outright becomes the cross-family fallback
+        // instead of being discarded (`ISEKAI_PIPE_DESIGN.md` §8 Epic I).
+        assert_eq!(
+            fallback,
+            Some(IntentTransport::Relay {
+                helper_addr: "127.0.0.1:1234".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -1753,7 +1768,7 @@ mod tests {
         let profile = PersistentProfile::migrate_legacy_helper_trust("no-stun-host:22", &trust);
         let stun_servers = vec!["stun1.example.com:3478".to_string()];
 
-        let transport = select_transport(&profile, &stun_servers).unwrap();
+        let (transport, fallback) = select_transport(&profile, &stun_servers).unwrap();
 
         assert_eq!(
             transport,
@@ -1763,6 +1778,7 @@ mod tests {
                 session_secret_b64: "c2VjcmV0".to_string(),
             }
         );
+        assert_eq!(fallback, None, "relay is already primary — no further family to fall back to");
     }
 
     #[test]
@@ -1774,7 +1790,7 @@ mod tests {
         let trust = sample_trust_with_stun_observed(Some("198.51.100.7:45231"));
         let profile = PersistentProfile::migrate_legacy_helper_trust("stun-host:22", &trust);
 
-        let transport = select_transport(&profile, &[]).unwrap();
+        let (transport, fallback) = select_transport(&profile, &[]).unwrap();
 
         assert_eq!(
             transport,
@@ -1784,6 +1800,7 @@ mod tests {
                 session_secret_b64: "c2VjcmV0".to_string(),
             }
         );
+        assert_eq!(fallback, None);
     }
 
     #[test]
@@ -1828,6 +1845,15 @@ mod tests {
                 server_name: "isekai-helper".to_string(),
                 session_secret_b64: "c2VjcmV0".to_string(),
             }
+        );
+        assert_eq!(
+            intent.cross_family_fallback,
+            Some(IntentTransport::Relay {
+                helper_addr: "127.0.0.1:1234".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            }),
+            "the connection intent should carry the relay transport as a cross-family fallback"
         );
 
         if let Some(old_home) = old_home {

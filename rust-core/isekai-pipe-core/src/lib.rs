@@ -126,6 +126,17 @@ pub struct ConnectionIntent {
     #[serde(default)]
     pub relay_endpoints: Vec<String>,
     pub transport: IntentTransport,
+    /// `ISEKAI_PIPE_DESIGN.md` §8 Epic I's `I-route-scheduler`: an alternate
+    /// transport *family* to try, in order, if `transport` fails entirely —
+    /// not a same-family fallback (that's what `stun_servers`/`relay_endpoints`
+    /// already express) and not racing (deliberately out of scope, see this
+    /// crate's docs on `IntentTransport`). `None` — today's default — means
+    /// no cross-family fallback exists for this intent; a caller (e.g.
+    /// `isekai-ssh/src/wrapper.rs::select_transport`, which already computes
+    /// the "the other family also had a usable transport" fact but
+    /// previously discarded it) may set this when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_family_fallback: Option<IntentTransport>,
     pub relay_policy: RelayPolicy,
     #[serde(default = "default_candidate_race_delay_ms")]
     pub candidate_race_delay_ms: u64,
@@ -166,6 +177,7 @@ impl ConnectionIntent {
             stun_servers: Vec::new(),
             relay_endpoints: Vec::new(),
             transport,
+            cross_family_fallback: None,
             relay_policy: RelayPolicy::RelayAllowed,
             candidate_race_delay_ms: DEFAULT_CANDIDATE_RACE_DELAY_MS,
             relay_delay_ms: DEFAULT_RELAY_DELAY_MS,
