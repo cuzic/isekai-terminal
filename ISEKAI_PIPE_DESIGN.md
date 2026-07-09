@@ -35,8 +35,7 @@ CLI環境でも使えるようにする。
 | service target | remote `serve`から見たTCP接続先。SSHなら通常`127.0.0.1:22` |
 | candidate endpoint | STUN・relay等で実測・交換される短命な到達候補(`direct-by-bootstrap-host`/`server-reflexive`/`relayed`) |
 | ConnectionIntent | `isekai-ssh`が生成し`isekai-pipe connect`に渡す短命な接続指示 |
-| trust store / known_helpers.toml | `~/.config/isekai-ssh/known_helpers.toml`。信頼済みhelperのidentity・接続情報をキャッシュする |
-| PersistentProfile | `known_helpers.toml`より新しいprofile schema(candidate list対応)。migration関数のみ実装済み、実際の読み書きは今後 |
+| PersistentProfile | `~/.local/state/isekai/profiles/<host:port>.json`。信頼済みhelperのidentity・接続情報をキャッシュする現行の唯一のprofile store(§8 Epic Bで実配線済み、2026-07-08)。旧`known_helpers.toml`はもう読まれない |
 | direct-by-bootstrap-host | bootstrap用SSH宛先を、そのままQUIC dial先のhost部分にも使う経路。Tailscale・LAN・既知direct hostでのみ成立する |
 
 ## 3. アーキテクチャ
@@ -286,25 +285,390 @@ resume window超過時は明示的にstdin/stdoutをクローズし、`std::proc
   含める。`session_id`を知っているだけでresumeできてはならない。
 - `relay_jwt`はargvではなくファイル経由(`--relay-jwt-file`)で渡す。`relay_sni`/`relay_jwt`は
   シェル補間前にシェルクォート+厳格な許容文字集合で検証する。
-- helper identity keyとrelease signing keyは別概念(署名検証は未実装、`update_policy`は
-  `exact-digest-only`のみ)。
+- helper identity keyとrelease signing keyは別概念。`isekai-ssh init --helper-manifest`で
+  ed25519署名付きmanifestのopt-in検証ができる(`isekai-release-verify`crate、§8 Epic D)が、
+  実際の署名鍵の発行・埋め込みはまだ無い(検証機構のみ)。`update_policy`は`exact-digest-only`
+  のみで、いずれの検証結果も自動更新可否の判断には未接続。
 
 ## 8. 既知のギャップ・今後の課題
 
-- **wrapper自動bootstrapのrelay/STUN対応**: JWT取得手段(`isekai-ssh login`との連携)が未整備。
-- **複数hop `--via`チェーンの自動bootstrap対応**: 現在は単一hopのみ。
-- **実機・実SSH検証**: `helper_bootstrap`のopt-in E2Eテスト(`HELPER_BOOTSTRAP_TEST_KEY`要)・
-  実機Androidでのリモートブートストラップ動作は本ドキュメント作成時点で未実施。
-- **PersistentProfile migrationの実配線**: 変換関数はあるが、`wrapper.rs`/`isekai-pipe connect`は
-  まだ`known_helpers.toml`を直接読む。
-- **isekai-pipe probe/inspect**: CLIスケルトンのみで未実装。
-- **複数isekai-sshプロセスによるisekai-pipe共有(マルチプレクス)**: 検討したが、SSH ControlMaster/
-  ControlPersist(CLI)・SSH接続プーリング(Android)というSSHプロトコル層での代替手段の方が
-  シンプルだと判明したため優先度を下げた。詳細案は`archive/ISEKAI_SSH_DESIGN.md`
-  「複数isekai-sshプロセスによるisekai-pipe共有」節に記録として保持。
-  Android側のSSH接続プーリング（プールキー・ライフサイクル・障害分離方針）の詳細設計は
-  `archive/ISEKAI_SSH_DESIGN.md`「2026-07-07: 上記オープンな課題の調査・設計確定」節で確定済み。
-  `TransportPreference::PLAIN_SSH`に加え、isekai-pipe QUICファミリー（`ISEKAI_PIPE_QUIC`/
-  `AUTO`/`ISEKAI_PIPE_QUIC_MULTIPATH`/`ISEKAI_STUN_P2P_QUIC`/`ISEKAI_LINK_RELAY_QUIC`）も対象
-  （「1 QUIC connection = 1 data stream」制約によりQUIC接続とネストしたSSH認証が実質1つの
-  プールエントリに収束するため）。`TSSHD_QUIC`は今後の課題として据え置き。実装は未着手。
+2026-07-08にバックログとして再編した。着手順を決める実装タスクとして、粒度(Epic/子タスク)・
+性質(機能追加/データ移行/セキュリティ基盤/テスト基盤/Deferred ADR)を揃えている。
+このセッションでは後方互換性(旧`known_helpers.toml`との共存・dual-read・migration猶予期間等)は
+一切考慮しない前提で書き換えている。実装に着手する際は改めて後方互換要否を判断すること。
+
+### 依存関係
+
+```text
+Epic A: BootstrapPlan共通基盤
+        │
+        ├──────────────┐
+        ▼              ▼
+Epic B: PersistentProfile   Epic D: リリース署名検証
+   移行の実配線                  │(公開配布のRelease Gate)
+        │
+        ▼
+Epic E: inspect
+        │
+        ├────────────────────┐
+        ▼                    ▼
+   (Epic A完了)          Epic F: login/token provider
+        │                    │
+        ├─────────┬──────────┘
+        ▼         ▼
+Epic G: STUN   Epic H: relay
+  bootstrap      bootstrap
+        │         │
+        └────┬────┘
+             ▼
+      Epic I: wrapper自動bootstrap統合
+             │
+             ▼
+      Epic K: multi-hop --via自動bootstrap
+
+Epic C: 実OpenSSH E2Eハーネス は上記全Epicの受け入れ条件が依拠する共通基盤として並行して進める。
+```
+
+### Epic A: BootstrapPlan共通基盤(P0、Epic 1/2の前提)
+
+route軸(direct / STUN / relay)とtopology軸(0-hop / 1-hop / multi-hop)を別々にロジック実装すると
+組合せが爆発するため、先に共通のI/Oなし計画生成レイヤーを導入する。
+
+```rust
+struct BootstrapPlan {
+    destination: BootstrapTarget,
+    jump_chain: Vec<JumpHost>,
+    route_policy: RoutePolicy,
+    credential_source: CredentialSource,
+    persistence_policy: PersistencePolicy,
+}
+
+enum BootstrapFailure {
+    AuthenticationRequired,
+    TokenExpired,
+    HostKeyRejected,
+    JumpHostUnreachable,
+    RemoteBinaryMissing,
+    RemoteBinaryUntrusted,
+    CandidateExchangeFailed,
+    StunUnreachable,
+    RelayUnauthorized,
+    RelayUnavailable,
+    QuicHandshakeFailed,
+    HelperIdentityMismatch,
+    TargetUnreachable,
+    PersistenceFailed,
+}
+```
+
+- 文字列エラーではなく`BootstrapFailure`で分類し、retry可否・`login`/`init`への誘導・
+  direct→relay fallbackを判定できるようにする。
+- overall bootstrap deadlineと、SSH bootstrap / candidate gathering / direct attempt /
+  relay fallbackそれぞれのbudgetを分離する(順番に試すと単純合算で著しく遅くなるため)。
+- キャンセル・タイムアウト時に remote `isekai-pipe serve` プロセス・relay reservation・
+  一時ファイルが残らないこと、未検証candidateをprofileに書かないことを受け入れ条件にする。
+- profile migration・token refresh・known helper更新・helper binary install・relay
+  reservationなど複数`isekai-ssh`プロセス間の競合が起き得る箇所は、共有接続の実装(Epic外/
+  Deferred、下記ADR参照)を待たずに排他制御を入れる。
+
+### Epic B: PersistentProfile移行の実配線(P0、Epic Iのハード依存)— 完了(2026-07-08)
+
+- schema versionとmigration policyを確定する。→ `PersistentProfile`(schema_version 1)に
+  `HelperTrust`が持っていた信頼メタデータ(`identity_pubkey`/`trusted_helper_sha256`/
+  `update_policy`/`release_channel`/`last_via`/`last_seen_at`/`cached_stun_observed_addr`)を
+  全て追加し、`migrate_legacy_helper_trust`変換がロスレスになるようにした。
+- `wrapper.rs`(`build_connection_intent`/`bootstrap_and_register`)・`init.rs`・
+  `isekai-pipe connect`の`intent_from_profile`の読み書きを`known_helpers.toml`から
+  `PersistentProfile`(`~/.local/state/isekai/profiles/<host:port>.json`)へ一括で切り替えた
+  (後方互換を気にしないため、dual-read期間・旧形式fallback・deprecation警告は設けていない。
+  旧`known_helpers.toml`はもうどのコードパスからも読まれない)。
+- atomic write(temp file + rename、`write_persistent_profile`)は既存実装のまま流用。
+- 受け入れ条件のうち、migrationの冪等性・atomic write・secretの非保存は
+  `isekai-pipe-core::profile`の既存実装/テストで担保。実SSH e2eテスト
+  (`isekai-ssh/tests/init_e2e.rs`・`wrapper_auto_bootstrap_e2e.rs`・
+  `isekai-pipe/tests/connect_stun_fallback_e2e.rs`・`stdout_purity.rs`)を
+  `PersistentProfile`ベースのアサーションに書き換えて全て green を確認済み。
+  複数プロセス同時起動時のlost update防止(ファイルロック)は未着手のまま残っている。
+
+### Epic C: 実OpenSSH E2Eハーネス(P0、共通テスト基盤)— bootstrap部分完了(2026-07-08)
+
+- ✅ `rust-core/isekai-ssh/tests/real_sshd_bootstrap_e2e.rs`: 一時ホスト鍵・一時
+  `sshd_config`で実`/usr/sbin/sshd`(root不要、非特権ユーザーとして起動)を立て、
+  wrapper自動bootstrap(`LaunchSpec::Direct`、`init`の`--relay`経路と違いCA検証壁が無く
+  実sshd向けに書ける)経由で**実際にビルド済みの`isekai-pipe`バイナリ**をbase64/SSH exec
+  でアップロード・`setsid`でデタッチ実行・handshake捕捉・`PersistentProfile`登録まで
+  検証する。アップロード済みバイナリのsha256をローカルの実バイナリと突き合わせて一致を
+  確認済み。既存の`init_e2e.rs`/`wrapper_auto_bootstrap_e2e.rs`(in-process `russh` mock
+  server + stand-inスクリプト)では検証できていなかった「実OpenSSHサーバーに対する実バイナリ
+  配置」の穴を埋める。`sshd`が無い環境では自動的にskipする(他のopt-inテストと同じ規約)。
+- 未完了として残っている点(honest gap、silent capにしない):
+  - 接続断・resume・known host検証はこのharnessでは未実装。SSH層のresumeは
+    `isekai-pipe/tests/serve_e2e.rs`がQUIC/attachプロトコル層で別途カバー済みだが、実sshdの
+    SSHセッションを通した経路では未検証。「known host検証」はOpenSSH自身のhost key照合
+    ではなく実質的にisekai-pipe側のcert pin検証(`BootstrapFailure::HelperIdentityMismatch`)
+    を指すが、そちらの専用テストの有無は本Epicでは調査していない。
+  - Linux network namespace/veth/tcを使ったtopology testは、`tests/netlab/`
+    (リポジトリルート、rust-core外)に**root権限が必要な単一シナリオのbashスクリプト**
+    (`direct_survives_loss_and_delay.sh`)としてすでに存在するが、Rustテストへの統合はして
+    いない。このスクリプトは明示的に「isekai-sshのbootstrap-over-sshはスコープ外」と
+    書いており、今回作った`real_sshd_bootstrap_e2e.rs`と役割は重複しない
+    (前者はネットワーク耐性、後者はbootstrap配線の正しさ)。
+  - **CI未接続**: 調査の結果、このリポジトリには現時点で`cargo test`をrust-core全体に対して
+    実行するCIワークフローが一つも存在しない(`.github/workflows/*.yml`はすべてビルド検証
+    (musl/xcframework/アプリビルド)のみで、Rustテストスイートの自動実行は無い。
+    `rust-core-netlab-check.yml`のみ`workflow_dispatch`専用のPoC)。したがって
+    `real_sshd_bootstrap_e2e.rs`を含むすべてのcargo testは引き続き手動実行が前提であり、
+    「CI実行可能」ではあるが「CI実行されている」わけではない。rust-core全体のcargo testを
+    CIに接続するかどうかは本Epicの範囲を超える別判断として残す。
+- Epic G/H/I/Kが自身のE2Eを追加する際は、このharnessのパターン(実sshd、`#@isekai
+  remote-path`で`$HOME`非依存に保つ)を再利用できる。
+- staging環境(実STUN・実relay・異なるネットワーク・symmetric NAT相当・relay fallback・token
+  expiry)とAndroid実機smoke test(モバイル回線/Wi-Fi切替、app background/foreground、helper
+  install/start、reconnect/resume)は、環境依存のため本Epicとは別枠(P2、release checklist側)
+  で扱う。
+
+### Epic D: リリース成果物の署名検証(公開配布のRelease Gate)— manifest検証機構のみ完了(2026-07-08)
+
+対象は`known_helpers.toml`ではなく、リモートbootstrapで配置する`isekai-pipe`等の**リリース
+成果物**。SHA-256のみでは、artifactとdigestを同じ配布元から取得している限り攻撃者が両方を
+差し替えられるため不十分。
+
+着手前に調査した結果、**現時点でGitHub Releaseによる配布自体が一切存在しない**
+(`isekai-ssh/README.md`「まだGitHub Releaseとして配布していないので、現状はソースから
+ビルドする」)ことが判明した。したがって「配布元が改ざんされたバイナリを自動ダウンロードする」
+という本来のRelease Gateの脅威モデルは今は成立しないが、「ユーザーが手元でGitHub Releaseから
+ダウンロードした(と思っている)バイナリを`init --helper-binary`に渡す」ケースは今でも現実の
+脅威(配布ページの改ざん・MITM)であり、そちらを守る検証機構だけを先に実装した。**鍵の実際の
+生成・保管・ローテーション方針の確定とCI署名パイプラインの構築は、実際にGitHub Releaseの配布を
+開始するタイミングまで意図的に保留している**(このセッションでの判断、ユーザー確認済み)。
+
+- ✅ 新規crate`rust-core/isekai-release-verify/`: `ReleaseManifest`
+  (version/platform/architecture/artifact_filename/size/sha256/protocol_compat/
+  release_channel/key_id)と、その正規化JSONバイト列に対するed25519署名を持つ`SignedManifest`。
+  `TrustedReleaseKeys`(key_id→公開鍵のレジストリ、鍵の実際の出所には無関係)と
+  `verify_artifact`(signature検証→platform/architecture一致→size一致→SHA-256一致の順で検証し、
+  署名を検証する前にmanifestの中身を一切信用しない設計)を実装。I/Oフリー・17ユニットテスト。
+- ✅ `isekai-ssh init`に`--helper-manifest <path>`/`--trusted-release-key <key_id=hexpubkey>`
+  (複数指定可)/`--expect-platform`/`--expect-architecture`をopt-inフラグとして追加。
+  `--helper-manifest`を指定した場合のみ検証が走り、失敗時はSSH接続を一切行わずに終了する
+  (デプロイ前に検証が完了するため、実sshdもモックサーバーも不要にテストできる)。指定しない
+  場合は既存の挙動と完全に同じ(デフォルトoff)。
+- ✅ テスト: `isekai-ssh/src/init.rs`内のunit test 5件(正常系・改ざんバイナリ・信頼鍵なし・
+  expect-platform未指定・署名者と異なる鍵を信頼している場合)と、実バイナリを起動してCLI配線を
+  検証するprocess-level e2eテスト`isekai-ssh/tests/init_manifest_verification_e2e.rs`2件。
+- 未着手として意図的に残している点:
+  - offline release signing keyの実際の生成・保管方式、key ID運用、鍵ローテーション・
+    emergency revocation方針の確定。
+  - `wrapper.rs`の自動bootstrap経路(`bootstrap_and_register`)への同フラグの追加(`init`のみ
+    に配線済み。自動bootstrapへの拡張はEpic Iと合わせて検討する)。
+  - CI側でのrelease signing・manifest生成・鍵ローテーションtestは、実際にGitHub Releaseでの
+    配布を開始するまで意味を持たないため保留。
+  - 「一時ファイルのままinstallせず既存バイナリを維持する」という受け入れ条件は、今回配線した
+    `init`が対象にしている**ローカルの`--helper-binary`**に対する検証であり、リモート側への
+    アップロード・install自体の話ではないため該当しない(将来、実際のダウンロード→install
+    パイプラインができた時点で改めて検討する)。
+
+### Epic E: `isekai-pipe inspect`(P1)— 完了(2026-07-08)
+
+passiveな状態確認のみ(通信は発生させない)。
+
+- ✅ `isekai-pipe inspect --profile <name> [--json] [--redact] [--verbose]`を実装
+  (`isekai-pipe/src/main.rs`)。`default_profiles_dir()`/`load_persistent_profile`で
+  `PersistentProfile`を読むだけで、ソケットは一切開かない。
+- 表示項目: profile schema version(+inspect自体の出力schema version)、helper identity
+  (cert_sha256)、configured endpoints(件数は常時、実リストは`--verbose`時のみ)、
+  前回選択経路(`last_path_hint`)、credentialの有無(`legacy_relay_transport`の有無、種別名の
+  み)。**secret値(`session_secret_b64`)は`--redact`の有無に関わらず常に非表示**——設計時の
+  想定「secret自体は非表示」の通り、redactの有無で切り替わるのはそれ以外の
+  ネットワーク特定情報(endpointリスト・`last_via`・`cached_stun_observed_addr`・cert
+  fingerprintの切り詰め)。
+  - `cached candidates(origin/priority/validity)`は今回は表示していない: `PersistentProfile`
+    のシリアライズ形式は`link_endpoints`等のフラットな`Vec<String>`のみを永続化しており、
+    `isekai_pipe_core::candidate`側の`CandidateOrigin`/`CandidatePriority`/`CandidateValidity`
+    はランタイム専用でPersistentProfileに永続化されていない(honest gap、今回のスコープでは
+    捏造しない)。
+- ✅ `--json`は`inspect_schema_version`フィールドを持つ(現在`1`)。
+- テスト: `isekai-pipe/src/main.rs`内のunit test 12件(secretが`--redact`なしでも一切JSONに
+  現れないことを含む)。`cargo build`した実バイナリに対して人手でhuman出力・`--verbose`・
+  `--redact --verbose`・`--json`・profile未存在時(exit 69)の5パターンを実行し目視確認済み。
+
+### Epic F: login/token provider基盤(P1、Epic H/Iの前提)— `init`への配線のみ完了(2026-07-09)
+
+着手前の調査で判明: `isekai-ssh login`/`logout`・secure token cache(`isekai-auth::FileTokenProvider`、
+`~/.config/isekai-ssh/token.json`、refresh処理、token source優先順位)は**このEpicに着手する前から
+既に実装済み**だった(本ドキュメント作成時点でこの節が「未着手」と書いていたのは実態と
+ずれていた)。したがって本Epicの実質的な残タスクは「既存の`FileTokenProvider`を実際の
+bootstrap経路(`isekai-ssh init`のrelay launch)から呼び出せるようにする」ことだけだった。
+
+codex CLIへの2回のセカンドオピニオン相談(1回目: F/G/Hの全体方針、2回目: 「relay自動bootstrapの
+トリガーをどう設計するか」という着手中に浮上した未決点)を経て、次のスコープに絞った:
+
+- ✅ `isekai-ssh init`に`--relay-jwt-from-login`フラグを追加。`--relay-jwt <TOKEN>`は
+  `Option<String>`化し、`--relay-jwt`/`--relay-jwt-from-login`のどちらか一方を必須
+  (clapの`required_unless_present`/`conflicts_with`で強制)。`--relay-jwt-from-login`指定時は
+  `FileTokenProvider::from_default_path()?.get_relay_jwt()`(既存のrefresh処理込み)を呼び、
+  トークンが無い/読み込み失敗時は`isekai-ssh login`実行を促すメッセージでfail closedする
+  (CLIで`--relay-jwt-from-login`単体・両方指定・トークン未保存の3パターンを手動実行し確認済み)。
+- `relay_jwt`のargv非経由(SSH execのstdin経由で渡す)は`isekai-bootstrap::openssh`側で元々
+  実装済みだったため変更不要。
+- テスト: `init.rs`内のunit test 4件(直接指定・login経由取得・トークン未保存時のエラー・
+  両方未指定時のエラー)。
+- **意図的に今回はやらないこと**: `wrapper.rs`の自動bootstrap(`bootstrap_and_register`)は
+  依然として`LaunchSpec::Direct`のみで、relay launchを選択するトリガーが無い
+  (`#@isekai relay`ディレクティブは接続後のfallback候補用でbootstrap時のlaunch指定とは
+  形が違う——`SocketAddr`+SNIを持たない)。新しいbootstrap用ディレクティブ(例:
+  `#@isekai bootstrap-relay <addr> <sni>`)を今Epic Hの設計を固める前に先走って追加しない、
+  というのがcodexの推奨であり採用した判断。したがって「wrapperが自動でrelayを選ぶ」経路は
+  Epic Hの課題として残っている。
+- relay audience・`session_id`・短命化・単回nonce等のトークン自体のスコープ強化は、
+  既存`FileTokenProvider`のスキーマ(`TokenSet`: access_token/refresh_token/expires_at/
+  token_endpoint/client_id)を変更する話であり、今回は着手していない(将来の課題として残す)。
+
+**テスト実装時に見つけた既存の不具合を合わせて修正**: `isekai-ssh`のunit testの一部
+(`init.rs`/`wrapper.rs`)が process-global な`$HOME`環境変数を書き換える方式で、
+`cargo test`のデフォルト並列実行下でスレッド間competitionを起こし得た(既存コードの
+コメントで「既知のリスク」として言及されていたが、テストが1つしか無かったため
+これまで顕在化していなかった)。今回`$HOME`を書き換えるテストが複数になったことで実際に
+flakyな失敗が発生したため、`main.rs`に`#[cfg(test)] static HOME_ENV_LOCK: Mutex<()>`を追加し、
+該当する4件のテスト全てがこれを取得してから`$HOME`を書き換えるように修正した(5回連続実行で
+安定を確認)。
+
+### Epic G: STUN自動bootstrap route追加(P1、Epic A依存)— 単一primary版で完了(2026-07-09)
+
+着手前にF/G/Hの設計について外部ツール(codex CLI)へセカンドオピニオンを相談した。重要な訂正:
+`isekai-auth`/`isekai-ssh login`/`logout`は調査時点で**既に実装済み**(`FileTokenProvider`、
+`~/.config/isekai-ssh/token.json`、リフレッシュ対応、e2eテストあり)だった。Epic Fは実質
+「既存のFileTokenProviderをbootstrap経路に配線するだけ」に縮小される(下記Epic F参照)。
+
+STUN/direct/relayを1回の接続試行の中でcross-family racing/fallbackさせることは、
+`ConnectionIntent`が今も「主transport1つ+同系統fallbackリスト」という形のままであるため
+正直に表現できない(スキーマ変更かスケジューラ新設が要る)。したがって今回は
+**cross-family racingをやらないスコープに縮小**した:
+
+- ✅ `isekai-ssh/src/wrapper.rs`に`select_transport(profile, configured_stun_servers)`を追加。
+  「`#@isekai stun`が1つ以上のSTUNサーバーに解決される」かつ「profileに
+  `cached_stun_observed_addr`がある(=bootstrap時に実際にSTUN交換が成立した)」の**両方**が
+  揃った場合のみ`IntentTransport::StunP2p`を選び、既存の`ConfigStunProvider`/
+  `connect_stun_p2p_with_fallback`をそのまま再利用する。どちらか片方でも欠けていれば従来通り
+  `legacy_relay_transport`由来の`IntentTransport::Relay`(direct-by-bootstrap-host)にfallback
+  する。STUN選択後に接続が失敗した場合の「directへの再フォールバック」は今回のスコープ外
+  (`I-route-scheduler`として後回し、下記Epic I参照)。
+  STUN候補の収集自体(`--stun-server`経由のserver-reflexive candidate交換)は本Epic着手前から
+  `isekai-bootstrap`層で既に動いていた(`init`/wrapper両方)——今回追加したのは「収集済みの
+  候補を実際の接続試行に使う」選択ロジックのみ。
+- テスト: `wrapper.rs`内のunit test 4件(STUN選択・evidence無しでのfallback・config無しでの
+  fallback・`build_connection_intent`を通した統合テスト)。既存の
+  `builds_connection_intent_from_persistent_profile`テストが無変更でpassし続けることも確認
+  (`cached_stun_observed_addr`が無いprofileでは従来通りRelayが選ばれる回帰確認)。
+
+### Epic H: relay自動bootstrap route追加(P1、Epic A・F依存)— 完了(2026-07-09)
+
+codexへの3回目のセカンドオピニオン相談(directive設計の具体案を依頼)を経て実装。
+
+- ✅ 新しいdirective `#@isekai bootstrap-relay addr=<SocketAddr> sni=<name>`を追加
+  (`wrapper.rs`)。既存の`#@isekai relay <url>`(接続後fallback候補リスト、`SocketAddr`+SNIの
+  対を持てない形)とは別名・別型(`BootstrapRelayTarget`)にした。`addr`/`sni`両方必須、
+  不明キーは拒否、複数回指定時は既存の`set_once`パターン(他の単一値directiveと同じ、最初の
+  指定が勝つ)を踏襲。
+- ✅ トリガー条件はEpic Gの「single evidence-gated選択、racingなし」方針を踏襲する固定ルール:
+  `bootstrap-relay`が存在すれば`bootstrap_and_register`は常に`LaunchSpec::Relay`を選び、
+  `LaunchSpec::Direct`は一切試みない(存在しなければ従来通りDirect)。relay launchが失敗しても
+  directへの自動フォールバックはしない(silent fallbackはoperatorの意図——relay到達性・
+  露出制御に依存している可能性——を裏切るため、というcodexの判断を採用)。
+  bootstrap-relay/bootstrap-policy/`--isekai-no-bootstrap`は独立: 後者2つは
+  「auto-bootstrapするかどうか」、前者は「する場合どのlaunch modeか」を制御する。
+  `#@isekai bootstrap-relay`自体が明示的なopt-inのため、別途の有効化フラグは設けていない。
+  registration時のcached addressもlaunch modeで分岐: direct launchは
+  `handshake.direct_by_bootstrap_host_port()`から、relay launchは
+  `handshake.relay_public_addr()`(無ければ設定した`relay_addr`にfallback、`init.rs`と同じ
+  ロジック)から作る。
+- ✅ JWTソースは`isekai_auth::FileTokenProvider::from_default_path()?.get_relay_jwt()`を
+  `bootstrap-relay`存在時に無条件で呼ぶ(wrapperには`init --relay-jwt-from-login`のような
+  per-invocationフラグが無いため、これが唯一のソース)。トークン無し/読み込み失敗時は
+  `init.rs`と同じ文言でfail closedする。`relay_jwt`のargv非経由は`isekai-bootstrap::openssh`側
+  で元々担保済み(stdin経由)。
+- テスト: `wrapper.rs`内のunit test(directive parsing 6件・directive統合1件)、実SSH e2eテスト
+  `wrapper_auto_bootstrap_honors_bootstrap_relay_directive`(スタンドインスクリプトのargv捕捉で
+  `--relay`/`--relay-sni`が実際にlaunchコマンドへ到達すること、relay_jwtの値がargvに一切
+  現れないこと、登録されたprofileのcached addressが`relayed` candidateから来ていることを検証)。
+  全既存テスト(unit 37件・e2e 14件)がgreenのまま。
+
+### Epic I: wrapper自動bootstrap統合(P1、Epic B・G・H依存)— route選択部分は完了、エラー分類は未着手(2026-07-09)
+
+codexの提案(2回目の相談)により、一括ゲートにせず`I-G`/`I-H`/`I-route-scheduler`に分割する
+方針を採用した。
+
+- ✅ `I-G`(wrapperがSTUN自動bootstrap結果を使う)・`I-H`(wrapperがrelay自動bootstrap結果を
+  使う): Epic G・Epic Hそのものの実装として吸収済み(`select_transport`/
+  `#@isekai bootstrap-relay`)。未登録ホストからの自動実行・profile保存は元々`bootstrap_and_
+  register`にあった機能で変更なし。
+- ❌ **未着手**: Epic Aで作った`isekai-bootstrap-plan`crate(`BootstrapFailure`)は、この
+  ドキュメント作成時点で`isekai-ssh`のどこからも参照されていない(依存として追加すらして
+  いない)。`bootstrap_and_register`のエラーは現在も素の`anyhow!`/`.context(...)`のままで、
+  「retryしてよいか/loginへ誘導するか/initへ誘導するか/directからrelayへfallbackするか」を
+  `BootstrapFailure`のvariantとして分類してはいない。`init`への誘導条件(`BootstrapFailure::
+  should_redirect_to_init()`等)も未接続。
+- ❌ **未着手**: `I-route-scheduler`(cross-family ordered fallback/racing、`ConnectionIntent`
+  のスキーマ変更が要る)は、Epic G/Hの相談時点でcodexが明示的に先送りを推奨しており、今回も
+  着手していない。
+
+**codexによるコードレビュー(2026-07-09、Epic A〜H実装一式に対して実施)で見つかったEpic間の
+相互作用バグ2件を修正済み**:
+
+1. `isekai-pipe/src/main.rs`の`run_connect`が`intent.relay_endpoints`の非空だけを見てrelay経路
+   へ進んでおり、`intent.transport`を確認していなかった。STUN check側は元々`intent.transport`が
+   `StunP2p`であることをgateしていたが、relay側だけこのgateが無かったため、`#@isekai stun`と
+   `#@isekai relay`を両方設定したホストでは、Epic Gが`StunP2p`をprimaryに選んでいても
+   `relay_endpoints`が非空というだけで黙ってrelay経路に上書きされていた。両分岐の判定を
+   `choose_connect_route`という純粋関数に切り出し、`intent.transport`の一致を両方でgateする
+   ように修正、回帰テスト3件を追加。
+2. `isekai-pipe inspect --profile myhost`(ポート省略のエイリアス)が、`connect`/`init`/wrapper
+   と違って`isekai_trust::normalize_host_port`を通さずに`load_persistent_profile`を呼んでおり、
+   `myhost:22.json`ではなく存在しない`myhost.json`を探して"not found"になっていた。他コマンドと
+   同じ正規化を追加、回帰テスト1件を追加。
+
+**codexが指摘したが未対応のまま残している点**: `PersistentProfile`の`schema_version`は`1`のまま
+だが、今回のEpic Bで`identity_pubkey`等の新規必須(非Option)フィールドを追加したため、もし
+このスキーマ形状より前に書かれた`PersistentProfile` JSONファイルが存在すればデシリアライズに
+失敗する。ただし調査済みの通り、Epic B着手前は`PersistentProfile`の読み書きはどのライブコード
+パスからも一切行われていなかった(テストコード内のみ)ため、この形状より前のファイルが実際に
+存在するケースは無いはずであり、実害は無いと判断した。将来的な安全策として`schema_version`を
+2へ上げることは低コストで可能だが、今回は据え置いている。
+
+`inspect`と異なり実際に通信を発生させる。DNS解決→STUN discovery→relay認証→relay接続→QUIC
+handshake→certificate pin→helper HELLO/ACK→target TCP到達性を段階ごとに表示し、「成功/失敗」の
+二値ではなくどの段階まで成功したかを返す。
+
+### Epic K: 複数hop `--via`チェーンの自動bootstrap(P2、Epic A依存)
+
+`isekai-ssh init`という既存の代替経路があるため優先度は下げてよいが、単純に「hopをループして
+sshを実行する」実装は避ける。
+
+- planner(2-a): I/Oなしでhop正規化・循環検出・最大hop数・unsupported構成判定・実行コマンドの
+  論理構造を計画する純粋関数。
+- executor(2-b): 標準の`ssh -J`/`ProxyJump`で最終ホストへの接続を作れる場合、中間ホスト上で
+  さらに`ssh`を実行するnested-shell方式は避ける。中間hopにbootstrap payloadやcredentialを
+  解釈させない構成を優先する。
+- Epic Cのharnessを使った最低2-hop構成のE2Eを受け入れ条件にする。
+
+### ADR: 複数isekai-sshプロセスによるisekai-pipe共有(マルチプレクス) — 実装しない(Deferred)
+
+検討の結果、SSH ControlMaster/ControlPersist(CLI)・SSH接続プーリング(Android)という
+SSHプロトコル層での代替手段の方がシンプルだと判明したため、独自QUIC broker(常駐broker・
+ローカルIPC・process lifecycle・crash recovery・session isolation・per-session flow
+control・multiplex protocol・broker upgrade・stale session cleanupが必要)は実装しない。
+詳細案は`archive/ISEKAI_SSH_DESIGN.md`「複数isekai-sshプロセスによるisekai-pipe共有」節に
+記録として保持。Android側のSSH接続プーリング（プールキー・ライフサイクル・障害分離方針）の
+詳細設計は`archive/ISEKAI_SSH_DESIGN.md`「2026-07-07: 上記オープンな課題の調査・設計確定」節で
+確定済み。`TransportPreference::PLAIN_SSH`に加え、isekai-pipe QUICファミリー（`ISEKAI_PIPE_QUIC`/
+`AUTO`/`ISEKAI_PIPE_QUIC_MULTIPATH`/`ISEKAI_STUN_P2P_QUIC`/`ISEKAI_LINK_RELAY_QUIC`）も対象
+（「1 QUIC connection = 1 data stream」制約によりQUIC接続とネストしたSSH認証が実質1つの
+プールエントリに収束するため）。`TSSHD_QUIC`も同様にDeferred。
+
+**再検討条件**(いずれかを満たした場合のみ新しいEpicとして起票する):
+
+- ControlMasterが使えないクライアントが主要用途になった。
+- QUIC handshake・relay確立コストが支配的になった。
+- 多数セッションによるrelay費用が問題になった。
+- Android側プールとCLI側の共通brokerが必要になった。
+- 「1 connection = 1 stream」制約を廃止するprotocol revisionを行う。

@@ -42,7 +42,7 @@ pub enum Command {
     /// and, after an explicit `[y/N]` confirmation, register it in the
     /// trust store the wrapper reads from. Interactive by design — see
     /// `init.rs`'s module docs.
-    Init(InitArgs),
+    Init(Box<InitArgs>),
 
     /// Run a Device Authorization Grant (RFC 8628) against the given OAuth
     /// endpoints and save the resulting relay JWT (+ refresh token, if any)
@@ -96,11 +96,18 @@ pub struct InitArgs {
     #[arg(long, value_name = "NAME")]
     pub relay_sni: String,
 
-    /// Bearer token authenticating isekai-helper to the relay. Obtaining
-    /// this automatically (Device Authorization Flow, `isekai-ssh login`)
-    /// is out of scope for this phase (S-5) — pass it directly for now.
-    #[arg(long, value_name = "TOKEN")]
-    pub relay_jwt: String,
+    /// Bearer token authenticating isekai-helper to the relay. Exactly one
+    /// of `--relay-jwt`/`--relay-jwt-from-login` is required.
+    #[arg(long, value_name = "TOKEN", required_unless_present = "relay_jwt_from_login")]
+    pub relay_jwt: Option<String>,
+
+    /// Source the relay bearer token from `isekai-ssh login`'s saved token
+    /// file (`isekai_auth::FileTokenProvider`, `~/.config/isekai-ssh/token.json`,
+    /// auto-refreshed if near expiry) instead of passing it directly via
+    /// `--relay-jwt`. Exactly one of the two is required
+    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic F).
+    #[arg(long, conflicts_with = "relay_jwt")]
+    pub relay_jwt_from_login: bool,
 
     /// Free-form version string recorded as `trusted_helper_version` in the
     /// trust store entry (no automated version detection exists yet — this
@@ -126,6 +133,49 @@ pub struct InitArgs {
     /// (`archive/ISEKAI_SSH_DESIGN.md` "引き続き未決の項目").
     #[arg(long, value_name = "SECS", default_value_t = 2_592_000)]
     pub idle_lifetime: u64,
+
+    /// STUN server(s) to query for this side's own observed address,
+    /// exchanged with the remote isekai-helper over the bootstrap channel
+    /// (`#20b`) — this side's candidates go out as
+    /// `BootstrapRequestV2.client_candidates`, and the first one is also
+    /// passed to the remote `isekai-helper` so it reports its own
+    /// `server-reflexive` candidate back. Repeatable; omit entirely to
+    /// disable STUN candidate exchange (today's pre-`#20b` behavior).
+    #[arg(long = "stun-server", value_name = "ADDR:PORT")]
+    pub stun_servers: Vec<SocketAddr>,
+
+    /// Signed release manifest (`isekai_release_verify::SignedManifest` JSON)
+    /// covering `--helper-binary`. When given, `init` verifies the binary's
+    /// signature/size/digest/platform/architecture against it
+    /// (`isekai-release-verify`, `ISEKAI_PIPE_DESIGN.md` §8 Epic D) *before*
+    /// deploying, and refuses to proceed on any mismatch. Optional and
+    /// off by default — this only adds a check on top of the existing
+    /// SHA-256-pinning trust model, it never replaces it.
+    #[arg(long, value_name = "PATH")]
+    pub helper_manifest: Option<PathBuf>,
+
+    /// One release-signing public key to trust for `--helper-manifest`
+    /// verification, as `<key_id>=<hex-ed25519-pubkey>`. Repeatable — a
+    /// manifest is accepted if its own `key_id` field matches one of these.
+    /// Required (at least one) when `--helper-manifest` is given; ignored
+    /// otherwise. There is deliberately no embedded default key yet: no
+    /// release-signing key exists until real GitHub Releases are published
+    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic D).
+    #[arg(long = "trusted-release-key", value_name = "KEY_ID=HEXPUBKEY")]
+    pub trusted_release_keys: Vec<String>,
+
+    /// The platform `--helper-manifest` must declare (e.g. `linux`) —
+    /// required when `--helper-manifest` is given, so a validly signed
+    /// manifest for the wrong platform is still rejected rather than
+    /// silently deployed.
+    #[arg(long, value_name = "PLATFORM")]
+    pub expect_platform: Option<String>,
+
+    /// The architecture `--helper-manifest` must declare (e.g. `x86_64`) —
+    /// required when `--helper-manifest` is given, same rationale as
+    /// `--expect-platform`.
+    #[arg(long, value_name = "ARCH")]
+    pub expect_architecture: Option<String>,
 }
 
 #[derive(Args)]

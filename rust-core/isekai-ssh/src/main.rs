@@ -14,6 +14,17 @@ mod init;
 mod login;
 mod wrapper;
 
+/// Serializes tests (across `init.rs`/`wrapper.rs`) that mutate the
+/// process-global `$HOME` env var to point at a throwaway fixture
+/// directory. `cargo test` runs `#[test]` functions on multiple threads
+/// within the same process by default, and `std::env::set_var` has no
+/// thread-local scoping — without this, one test's `$HOME` mutation can be
+/// clobbered mid-flight by a concurrently-running test in a different
+/// module, causing spurious "profile not found" failures that have nothing
+/// to do with either test's actual logic.
+#[cfg(test)]
+pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use clap::Parser;
 
 const EXIT_OTHER_ERROR: u8 = 1;
@@ -40,7 +51,7 @@ async fn main() {
     } else {
         let cli = cli::Cli::parse();
         let result = match cli.command {
-            cli::Command::Init(args) => init::run(args).await,
+            cli::Command::Init(args) => init::run(*args).await,
             cli::Command::Login(args) => login::run(args).await,
             cli::Command::Logout => login::run_logout().await,
         };

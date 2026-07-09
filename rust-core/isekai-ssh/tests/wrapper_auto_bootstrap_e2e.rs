@@ -256,11 +256,24 @@ fn shim_ssh_with_bootstrap_config(
     (bin_dir, path_env)
 }
 
-fn trust_store_path_under(home: &std::path::Path) -> PathBuf {
-    home.join(".config").join(isekai_trust::store::CONFIG_DIR_NAME).join(isekai_trust::store::TRUST_STORE_FILE_NAME)
+fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
+    home.join(".local").join("state").join("isekai").join("profiles")
+}
+
+fn profile_path_under(home: &std::path::Path, key: &str) -> PathBuf {
+    profiles_dir_under(home).join(format!("{key}.json"))
 }
 
 const VALID_HANDSHAKE_JSON: &str = r#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"}]}"#;
+
+/// `#20a-4`: every real `OpenSshBackend` launch now sends a
+/// `BootstrapRequestV2` over stdin, so a compliant `isekai-pipe serve`
+/// always echoes back a `BootstrapReportV2` envelope (never a bare
+/// `HandshakeJson`) on stdout — the stand-in helper scripts below must match
+/// that shape. `session_id`/`bootstrap_attempt_id` here are arbitrary valid
+/// hex; these tests don't correlate them against the request the fake
+/// script actually received.
+const VALID_BOOTSTRAP_REPORT_JSON: &str = r#"{"v":2,"session_id":"00000000000000000000000000000000","bootstrap_attempt_id":"11111111111111111111111111111111","handshake":{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"}]}}"#;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
@@ -285,15 +298,15 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
     // one line of valid handshake JSON — same technique as
     // `init_e2e.rs`/`isekai-bootstrap/tests/openssh_e2e.rs`.
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
-    std::fs::write(&helper_script_path, format!("#!/bin/sh\necho '{VALID_HANDSHAKE_JSON}'\n")).unwrap();
+    std::fs::write(&helper_script_path, format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n")).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&helper_script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let trust_store_path = trust_store_path_under(&home);
-    assert!(!trust_store_path.exists(), "trust store must not exist before this test runs");
+    let profile_path = profile_path_under(&home, "auto-bootstrap-host:22");
+    assert!(!profile_path.exists(), "profile must not exist before this test runs");
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
         .arg("--isekai-helper-binary")
@@ -337,14 +350,16 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
     let _ = child.wait().await;
 
     assert!(saw_registered, "expected wrapper stderr to report trust-store registration");
-    assert!(trust_store_path.exists(), "expected trust store to be written at {trust_store_path:?}");
+    assert!(profile_path.exists(), "expected profile to be written at {profile_path:?}");
 
-    let store = isekai_trust::load_trust_store(&trust_store_path).unwrap();
-    let entry = store.get("auto-bootstrap-host:22").expect("expected a trust entry for auto-bootstrap-host:22");
-    assert_eq!(entry.cached_relay_addr, "127.0.0.1:45231");
+    let profile = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), "auto-bootstrap-host:22")
+        .unwrap()
+        .expect("expected a profile for auto-bootstrap-host:22");
+    let legacy_relay = profile.legacy_relay_transport.as_ref().expect("expected a cached relay transport");
+    assert_eq!(legacy_relay.helper_addr, "127.0.0.1:45231");
     let handshake = decode_handshake_json(VALID_HANDSHAKE_JSON.as_bytes()).unwrap();
-    assert_eq!(entry.cached_cert_sha256, handshake.cert_sha256());
-    assert_eq!(entry.update_policy, isekai_trust::UpdatePolicy::ExactDigestOnly);
+    assert_eq!(profile.server_identity.cert_sha256_hex, handshake.cert_sha256());
+    assert_eq!(profile.update_policy, isekai_trust::UpdatePolicy::ExactDigestOnly);
 }
 
 /// `#@isekai remote-path` (`isekai-ssh/src/wrapper.rs::resolve_isekai_config`)
@@ -383,7 +398,7 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
     .unwrap();
 
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
-    std::fs::write(&helper_script_path, format!("#!/bin/sh\necho '{VALID_HANDSHAKE_JSON}'\n")).unwrap();
+    std::fs::write(&helper_script_path, format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n")).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -437,6 +452,230 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
     );
 }
 
+/// `#20b`: `#@isekai stun <addr>` must reach `OpenSshBackend::install_and_start`
+/// (verified via the stand-in script's own captured argv — it always echoes
+/// the same canned `server-reflexive`-bearing report regardless of args, so
+/// the argv check is what actually proves the directive was threaded
+/// through, not just that the trust store ended up with *some* value), and
+/// the resulting `server-reflexive` candidate must land in
+/// `HelperTrust.cached_stun_observed_addr`.
+#[tokio::test(flavor = "multi_thread")]
+async fn wrapper_auto_bootstrap_honors_stun_directive() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1)/ssh-keygen(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let remote_home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&remote_home).unwrap();
+
+    let mock_sshd_addr = spawn_fake_ssh_server(remote_home.clone(), client_pubkey).await;
+
+    let home = tmp.path().join("client-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let (_bin_dir, path_env) =
+        shim_ssh_with_bootstrap_config(tmp.path(), "stun-directive-host", mock_sshd_addr, &key_path);
+
+    let ssh_dir = home.join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    std::fs::write(
+        ssh_dir.join("config"),
+        "Host stun-directive-host\n    #@isekai stun 203.0.113.9:3478\n",
+    )
+    .unwrap();
+
+    // Stand-in for the real `isekai-pipe serve` process: ignores every arg
+    // except recording them for inspection, and always echoes a canned
+    // report with a fixed `server-reflexive` candidate (standing in for what
+    // a real serve process would report after actually querying
+    // `--stun-server`).
+    let argv_log = remote_home.join("argv.log");
+    let report_with_stun = VALID_BOOTSTRAP_REPORT_JSON.replace(
+        r#""candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"}]"#,
+        r#""candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"},{"kind":"server-reflexive","endpoint":"198.51.100.42:56789","source":"stun"}]"#,
+    );
+    let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
+    std::fs::write(
+        &helper_script_path,
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{report_with_stun}'\n", argv_log.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper_script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .arg("--isekai-helper-binary")
+        .arg(&helper_script_path)
+        .arg("stun-directive-host")
+        .env("HOME", &home)
+        .env("PATH", &path_env)
+        .env_remove("RUST_LOG")
+        .stdin(StdStdio::piped())
+        .stdout(StdStdio::piped())
+        .stderr(StdStdio::piped())
+        .spawn()
+        .expect("failed to spawn isekai-ssh");
+
+    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut saw_registered = false;
+    for _ in 0..200 {
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(_)) => {
+                eprint!("[isekai-ssh stderr] {line}");
+                if line.contains("Registered") {
+                    saw_registered = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+
+    assert!(saw_registered, "expected wrapper stderr to report trust-store registration");
+
+    let argv = std::fs::read_to_string(&argv_log).expect("stand-in script should have recorded its argv");
+    assert!(
+        argv.contains("--stun-server 203.0.113.9:3478"),
+        "expected #@isekai stun to reach the remote launch command's argv, got: {argv:?}"
+    );
+
+    let profile = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), "stun-directive-host:22")
+        .unwrap()
+        .expect("expected a profile for stun-directive-host:22");
+    assert_eq!(
+        profile.cached_stun_observed_addr.as_deref(),
+        Some("198.51.100.42:56789"),
+        "the server-reflexive candidate from the handshake should be cached"
+    );
+}
+
+/// `ISEKAI_PIPE_DESIGN.md` §8 Epic H: `#@isekai bootstrap-relay addr=... sni=...`
+/// must make auto-bootstrap deploy via `LaunchSpec::Relay` (verified via the
+/// stand-in script's captured argv, same technique as
+/// `wrapper_auto_bootstrap_honors_stun_directive`) instead of the default
+/// `LaunchSpec::Direct`, sourcing the relay JWT from `isekai-ssh login`'s
+/// saved token file rather than any CLI flag (the wrapper has none), and the
+/// resulting profile's cached address must come from the handshake's
+/// `relayed` candidate, not `direct-by-bootstrap-host`.
+#[tokio::test(flavor = "multi_thread")]
+async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1)/ssh-keygen(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let remote_home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&remote_home).unwrap();
+
+    let mock_sshd_addr = spawn_fake_ssh_server(remote_home.clone(), client_pubkey).await;
+
+    let home = tmp.path().join("client-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let (_bin_dir, path_env) =
+        shim_ssh_with_bootstrap_config(tmp.path(), "bootstrap-relay-host", mock_sshd_addr, &key_path);
+
+    let ssh_dir = home.join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    std::fs::write(
+        ssh_dir.join("config"),
+        "Host bootstrap-relay-host\n    #@isekai bootstrap-relay addr=203.0.113.10:443 sni=relay.example.com\n",
+    )
+    .unwrap();
+
+    // Pre-seed `isekai-ssh login`'s saved token file — the wrapper has no
+    // per-invocation JWT flag (unlike `init --relay-jwt-from-login`), so
+    // `bootstrap_and_register` must source it from here unconditionally
+    // once `bootstrap-relay` is present. Built via an explicit path (not
+    // `FileTokenProvider::from_default_path()`) so this never touches the
+    // *test process's own* `$HOME` — only the child `isekai-ssh` process
+    // sees `home` via its own `env("HOME", ...)` below.
+    let token_path = home.join(".config").join("isekai-ssh").join("token.json");
+    isekai_auth::FileTokenProvider::new(token_path).save_relay_jwt("relay-jwt-from-login-store").unwrap();
+
+    let argv_log = remote_home.join("argv.log");
+    let report_with_relay = VALID_BOOTSTRAP_REPORT_JSON.replace(
+        r#""candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"}]"#,
+        r#""candidates":[{"kind":"relayed","endpoint":"198.51.100.99:45900","source":"relay"}]"#,
+    );
+    let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
+    std::fs::write(
+        &helper_script_path,
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{report_with_relay}'\n", argv_log.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper_script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .arg("--isekai-helper-binary")
+        .arg(&helper_script_path)
+        .arg("bootstrap-relay-host")
+        .env("HOME", &home)
+        .env("PATH", &path_env)
+        .env_remove("RUST_LOG")
+        .stdin(StdStdio::piped())
+        .stdout(StdStdio::piped())
+        .stderr(StdStdio::piped())
+        .spawn()
+        .expect("failed to spawn isekai-ssh");
+
+    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut saw_registered = false;
+    let mut stderr_text = String::new();
+    for _ in 0..200 {
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(_)) => {
+                eprint!("[isekai-ssh stderr] {line}");
+                stderr_text.push_str(&line);
+                if line.contains("Registered") {
+                    saw_registered = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+
+    assert!(saw_registered, "expected wrapper stderr to report trust-store registration");
+    assert!(stderr_text.contains("Relay:"), "expected the trust summary to print the relay address, got: {stderr_text:?}");
+
+    let argv = std::fs::read_to_string(&argv_log).expect("stand-in script should have recorded its argv");
+    assert!(argv.contains("--relay 203.0.113.10:443"), "expected bootstrap-relay's addr to reach the launch command argv, got: {argv:?}");
+    assert!(argv.contains("--relay-sni relay.example.com"), "expected bootstrap-relay's sni to reach the launch command argv, got: {argv:?}");
+    assert!(!argv.contains("relay-jwt-from-login-store"), "the relay JWT must never appear in argv, got: {argv:?}");
+
+    let profile = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), "bootstrap-relay-host:22")
+        .unwrap()
+        .expect("expected a profile for bootstrap-relay-host:22");
+    let legacy_relay = profile.legacy_relay_transport.as_ref().expect("expected a cached relay transport");
+    assert_eq!(
+        legacy_relay.helper_addr, "198.51.100.99:45900",
+        "cached address should come from the handshake's relayed candidate, not direct-by-bootstrap-host"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
     if !ssh_binary_available() {
@@ -457,14 +696,14 @@ async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
         shim_ssh_with_bootstrap_config(tmp.path(), "declined-bootstrap-host", mock_sshd_addr, &key_path);
 
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
-    std::fs::write(&helper_script_path, format!("#!/bin/sh\necho '{VALID_HANDSHAKE_JSON}'\n")).unwrap();
+    std::fs::write(&helper_script_path, format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n")).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&helper_script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let trust_store_path = trust_store_path_under(&home);
+    let profile_path = profile_path_under(&home, "declined-bootstrap-host:22");
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
         .arg("--isekai-helper-binary")
@@ -489,7 +728,7 @@ async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
     assert!(!output.status.success(), "wrapper must exit non-zero when the user declines the confirmation");
     assert!(output.stdout.is_empty(), "stdout must stay empty, got {:?}", String::from_utf8_lossy(&output.stdout));
     assert!(
-        !trust_store_path.exists(),
-        "declining the confirmation must not create a trust store file at {trust_store_path:?}"
+        !profile_path.exists(),
+        "declining the confirmation must not create a profile file at {profile_path:?}"
     );
 }

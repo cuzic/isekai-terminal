@@ -8,15 +8,19 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use isekai_pipe_core::{
-    claim_connection_intent, default_runtime_dir, BootstrapProvenance, Candidate, CandidateGeneration,
-    CandidateRoute, ConnectionIntent, IntentTransport, ServerIdentity, ServiceSpec,
+    claim_connection_intent, default_profiles_dir, default_runtime_dir, load_persistent_profile,
+    BootstrapProvenance, Candidate, CandidateGeneration, CandidateRoute, ConnectionIntent, IntentTransport,
+    ServiceSpec,
 };
+#[cfg(test)]
+use isekai_pipe_core::ServerIdentity;
 use isekai_transport::{
-    connect_stun_p2p, connect_via_relay_resumable, connect_via_relay_resumable_with_fallback,
-    reconnect_and_resume, spawn_app_ack_tasks, AppAckCounters, BackoffPolicy, ByteStream, ByteStreamReadHalf,
-    ByteStreamWriteHalf, C2hSentOffset, CandidatePool, CandidateProvider, ConfigRelayProvider, GatherContext,
-    H2cClientDeliveredOffset, LegacyIntentProvider, RelayTarget, SequentialRelayCandidate, StunP2pTarget,
-    SystemQuicEndpointFactory,
+    connect_stun_p2p, connect_stun_p2p_with_fallback, connect_via_relay_resumable,
+    connect_via_relay_resumable_with_fallback, reconnect_and_resume, spawn_app_ack_tasks, AppAckCounters,
+    BackoffPolicy, BindSpec, ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf, C2hSentOffset, CandidatePool,
+    CandidateProvider, ConfigRelayProvider, ConfigStunProvider, GatherContext, H2cClientDeliveredOffset,
+    LegacyIntentProvider, QuicEndpointRebinder, RelayTarget, SequentialRelayCandidate, SequentialStunCandidate,
+    StunP2pTarget, SystemQuicEndpointFactory,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -41,7 +45,7 @@ fn print_help() {
     println!("    connect    local stdio side");
     println!("    serve      remote service side");
     println!("    probe      connectivity probe (skeleton)");
-    println!("    inspect    profile/path inspection (skeleton)");
+    println!("    inspect    passive profile inspection (--profile, --json, --redact, --verbose)");
     println!("    version    print version");
     println!();
     println!(
@@ -66,8 +70,23 @@ struct ConnectLaunch {
     service: Option<ServiceSpec>,
     stdio: bool,
     mode: ConnectMode,
-    stun_server: Option<String>,
+    /// Repeatable `--stun-server` (accumulates, matching `--relay`'s
+    /// `relay_endpoints`/`isekai-ssh`'s `#@isekai stun` directive
+    /// convention). `--mode stun` requires at least one; the first entry
+    /// backs the legacy single-candidate `IntentTransport::StunP2p.stun_server`
+    /// field, the full list drives `ConfigStunProvider` fallback across the
+    /// rest (`#11`).
+    stun_servers: Vec<String>,
     resume_window: Duration,
+    /// Experimental, default-off (`ISEKAI_PIPE_DESIGN.md`'s convention for
+    /// opt-in features): on an OS-reported network change, try
+    /// `isekai_transport::QuicEndpointRebinder::rebind` (a fresh local
+    /// socket, same QUIC endpoint/connection — no RESUME round trip) before
+    /// falling back to today's "close and RESUME" reconnect. See
+    /// `run_resume_loop`'s module-level comment on why this needed a
+    /// restructure rather than a one-line addition to the existing
+    /// `select!`.
+    experimental_network_rebind: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,8 +124,9 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
     let mut service: Option<ServiceSpec> = None;
     let mut stdio = false;
     let mut mode = ConnectMode::Relay;
-    let mut stun_server = None;
+    let mut stun_servers: Vec<String> = Vec::new();
     let mut resume_window = DEFAULT_RESUME_WINDOW;
+    let mut experimental_network_rebind = false;
     let mut iter = args.peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -118,6 +138,14 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 println!();
                 println!("INTENT:");
                 println!("    If ISEKAI_INTENT_ID is set, the matching ConnectionIntent is claimed first.");
+                println!();
+                println!("EXPERIMENTAL:");
+                println!(
+                    "    --experimental-network-rebind  try a fast in-place socket rebind on network"
+                );
+                println!(
+                    "                                   change before falling back to RESUME (default off)"
+                );
                 return Ok(None);
             }
             "--profile" => {
@@ -157,7 +185,7 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 };
             }
             "--stun-server" => {
-                stun_server = Some(next_arg("connect", &mut iter, &arg).map_err(|e| {
+                stun_servers.push(next_arg("connect", &mut iter, &arg).map_err(|e| {
                     eprintln!("{e}");
                     ExitCode::from(EX_USAGE)
                 })?);
@@ -173,6 +201,7 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 })?;
                 resume_window = Duration::from_secs(secs);
             }
+            "--experimental-network-rebind" => experimental_network_rebind = true,
             "--listen" => {
                 eprintln!(
                     "isekai-pipe connect: --listen is not wired to the legacy connect runtime yet"
@@ -216,8 +245,9 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
         service,
         stdio,
         mode,
-        stun_server,
+        stun_servers,
         resume_window,
+        experimental_network_rebind,
     }))
 }
 
@@ -245,6 +275,48 @@ async fn connect_command(args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
+/// Which of the three connect-time paths `run_connect` takes for a given
+/// `ConnectionIntent`. Extracted to a pure function so the routing decision
+/// (in particular, that a non-empty `relay_endpoints`/`stun_servers` list
+/// alone is *not* enough to pick that family — `intent.transport` must
+/// actually match) is directly unit-testable without a real network stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectRoute {
+    RelayWithFallback,
+    StunWithFallback,
+    SingleCandidate,
+}
+
+/// - `#@isekai relay <addr>` (`ConnectionIntent.relay_endpoints`) opts into
+///   multi-candidate relay fallback (`ISEKAI_PIPE_DESIGN.md` task #12) —
+///   when unset, behavior is exactly the pre-#12 single-candidate path
+///   (`ConfigRelayProvider` is simply never consulted). Also gated on
+///   `intent.transport` actually being `Relay` — `ISEKAI_PIPE_DESIGN.md` §8
+///   Epic G's `select_transport` can choose `IntentTransport::StunP2p` as
+///   primary while `relay_endpoints` is still populated as a *different*
+///   fallback list (e.g. a host configured with both `#@isekai stun` and
+///   `#@isekai relay`); without this check, a non-empty `relay_endpoints`
+///   would silently override an evidence-gated STUN primary with relay.
+/// - `#@isekai stun <addr>` / repeated `--mode stun --stun-server <addr>`
+///   (`ConnectionIntent.stun_servers`) opts into multi-STUN-server fallback
+///   (`#11`) — gated on `intent.transport` actually being `StunP2p` (not
+///   just `stun_servers` being non-empty) so that `isekai-ssh/src/wrapper.rs`'s
+///   `#@isekai stun` directive, which can be paired with either a `Relay`
+///   transport (no STUN evidence yet, `stun_servers` copied through for
+///   future use — a harmless no-op here) or, once `select_transport` finds
+///   a cached STUN-observed address, a `StunP2p` primary transport (Epic G),
+///   reaches the right fallback path in both cases instead of newly
+///   erroring out via `ConfigStunProvider`'s `StunServersWithoutStunP2pTransport`.
+fn choose_connect_route(intent: &ConnectionIntent) -> ConnectRoute {
+    if !intent.relay_endpoints.is_empty() && matches!(intent.transport, IntentTransport::Relay { .. }) {
+        ConnectRoute::RelayWithFallback
+    } else if !intent.stun_servers.is_empty() && matches!(intent.transport, IntentTransport::StunP2p { .. }) {
+        ConnectRoute::StunWithFallback
+    } else {
+        ConnectRoute::SingleCandidate
+    }
+}
+
 async fn run_connect(launch: ConnectLaunch) -> Result<()> {
     let intent = resolve_connection_intent(&launch)?;
     if intent.service != "ssh" {
@@ -261,15 +333,25 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
     // and threaded alongside whichever candidate is selected.
     let session_secret = decode_secret(intent_session_secret_b64(&intent.transport))?;
 
-    // `#@isekai relay <addr>` (`ConnectionIntent.relay_endpoints`) opts into
-    // multi-candidate relay fallback (`ISEKAI_PIPE_DESIGN.md` task #12) —
-    // when unset, behavior is exactly the pre-#12 single-candidate path
-    // (`ConfigRelayProvider` is simply never consulted).
-    if !intent.relay_endpoints.is_empty() {
-        let candidates = resolve_relay_candidates(&intent, &session_secret).await?;
-        return run_relay_resumable_with_fallback(&candidates, &profile, intent.resume_grace_secs)
+    match choose_connect_route(&intent) {
+        ConnectRoute::RelayWithFallback => {
+            let candidates = resolve_relay_candidates(&intent, &session_secret).await?;
+            return run_relay_resumable_with_fallback(
+                &candidates,
+                &profile,
+                intent.resume_grace_secs,
+                launch.experimental_network_rebind,
+            )
             .await
             .context("isekai-pipe connect: relay transport (with fallback) failed");
+        }
+        ConnectRoute::StunWithFallback => {
+            let (target, candidates) = resolve_stun_candidates(&intent, &session_secret).await?;
+            return run_stun_p2p_with_fallback(&target, &candidates)
+                .await
+                .context("isekai-pipe connect: STUN P2P transport (with fallback) failed");
+        }
+        ConnectRoute::SingleCandidate => {}
     }
 
     let candidate = resolve_single_candidate(&intent).await?;
@@ -292,6 +374,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
             &profile,
             intent.resume_grace_secs,
             identity,
+            launch.experimental_network_rebind,
         )
         .await
         .context("isekai-pipe connect: relay transport failed"),
@@ -411,6 +494,67 @@ async fn resolve_relay_candidates(
         .collect()
 }
 
+/// Runs `intent.stun_servers` through `ConfigStunProvider` → `CandidatePool`,
+/// returning the shared `StunP2pTarget` (peer/session identity, the same for
+/// every candidate — only `stun_server` varies) alongside every resulting
+/// candidate — sorted by priority (rank 0 = `stun_servers[0]`, most
+/// preferred) — as ready-to-dial `SequentialStunCandidate`s (`#11`). Only
+/// called when `stun_servers` is non-empty *and* `intent.transport` is
+/// `StunP2p` (`run_connect` decides); every candidate `ConfigStunProvider`
+/// produces is `CandidateRoute::StunP2p` by construction
+/// (`isekai-pipe-core::candidate`'s docs), so encountering anything else here
+/// is a bug, not a runtime condition to route around.
+async fn resolve_stun_candidates(
+    intent: &ConnectionIntent,
+    session_secret: &[u8],
+) -> Result<(StunP2pTarget, Vec<SequentialStunCandidate>)> {
+    let IntentTransport::StunP2p { peer_addr, server_name, .. } = &intent.transport else {
+        anyhow::bail!("isekai-pipe connect: resolve_stun_candidates requires an IntentTransport::StunP2p intent (bug)");
+    };
+
+    let ctx = GatherContext {
+        generation: CandidateGeneration::INITIAL,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+        intent,
+    };
+    let batch = ConfigStunProvider
+        .gather(&ctx)
+        .await
+        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: STUN candidate discovery failed: {e}"))?;
+
+    let mut pool = CandidatePool::new();
+    let snapshot = pool
+        .replace_generation(batch)
+        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: stale candidate generation ({e:?})"))?;
+
+    // Explicit sort by priority rank — same rationale as
+    // `resolve_relay_candidates`'s own sort (`ISEKAI_PIPE_DESIGN.md` task
+    // `#12`'s acceptance criteria, mirrored for `#11`): deterministic,
+    // configured-order fallback is a correctness property, not an
+    // implementation detail to leave implicit.
+    let mut candidates = snapshot.candidates;
+    candidates.sort_by_key(|c| c.priority.rank);
+
+    let target = StunP2pTarget {
+        peer_addr: peer_addr.parse().context("isekai-pipe connect: invalid peer_addr in IntentTransport::StunP2p")?,
+        server_name: server_name.clone(),
+        cert_sha256_hex: intent.expected_server_identity.cert_sha256_hex.clone(),
+        session_secret: session_secret.to_vec(),
+    };
+
+    let candidates = candidates
+        .into_iter()
+        .map(|candidate| {
+            let CandidateRoute::StunP2p { stun_server, .. } = &candidate.route else {
+                anyhow::bail!("isekai-pipe connect: ConfigStunProvider produced a non-stun-p2p candidate (bug)");
+            };
+            Ok(SequentialStunCandidate { stun_server: *stun_server, candidate_id: candidate.id.0.to_string() })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((target, candidates))
+}
+
 fn resolve_connection_intent(launch: &ConnectLaunch) -> Result<ConnectionIntent> {
     if let Some(intent_id) = std::env::var_os("ISEKAI_INTENT_ID") {
         let intent_id = intent_id.to_string_lossy();
@@ -436,47 +580,51 @@ fn intent_from_profile(
 ) -> Result<ConnectionIntent> {
     let key = isekai_trust::normalize_host_port(profile)
         .with_context(|| format!("isekai-pipe connect: invalid profile {profile:?}"))?;
-    let store_path = isekai_trust::default_trust_store_path()
-        .context("isekai-pipe connect: could not determine trust store path")?;
-    let store = isekai_trust::load_trust_store(&store_path).with_context(|| {
-        format!(
-            "isekai-pipe connect: failed to load {}",
-            store_path.display()
-        )
-    })?;
-    let entry = store.get(&key).with_context(|| {
-        format!(
-            "isekai-pipe connect: profile {profile:?} is not trusted yet (looked up as {key:?})"
-        )
+    let profiles_dir =
+        default_profiles_dir().context("isekai-pipe connect: could not determine profiles directory")?;
+    let entry = load_persistent_profile(&profiles_dir, &key)
+        .with_context(|| format!("isekai-pipe connect: failed to load profile from {}", profiles_dir.display()))?
+        .with_context(|| {
+            format!("isekai-pipe connect: profile {profile:?} is not trusted yet (looked up as {key:?})")
+        })?;
+    let legacy_relay = entry.legacy_relay_transport.as_ref().with_context(|| {
+        format!("isekai-pipe connect: profile {profile:?} has no cached relay transport to connect with")
     })?;
 
     let transport = match launch.mode {
         ConnectMode::Relay => IntentTransport::Relay {
-            helper_addr: entry.cached_relay_addr.clone(),
+            helper_addr: legacy_relay.helper_addr.clone(),
             server_name: "isekai-helper".to_string(),
-            session_secret_b64: entry.cached_session_secret.clone(),
+            session_secret_b64: legacy_relay.session_secret_b64.clone(),
         },
         ConnectMode::Stun => IntentTransport::StunP2p {
+            // The first configured `--stun-server` backs the legacy
+            // single-candidate field (`resolve_single_candidate`'s
+            // `LegacyIntentProvider` path, still exercised whenever only one
+            // is given) — `intent.stun_servers` below carries the full list
+            // for `ConfigStunProvider` fallback (`#11`).
             stun_server: launch
-                .stun_server
-                .clone()
+                .stun_servers
+                .first()
+                .cloned()
                 .context("isekai-pipe connect: --stun-server is required with --mode stun")?,
-            peer_addr: entry.cached_relay_addr.clone(),
+            peer_addr: legacy_relay.helper_addr.clone(),
             server_name: "isekai-helper".to_string(),
-            session_secret_b64: entry.cached_session_secret.clone(),
+            session_secret_b64: legacy_relay.session_secret_b64.clone(),
         },
     };
 
     let mut intent = ConnectionIntent::new(
         profile,
         service,
-        ServerIdentity {
-            cert_sha256_hex: entry.cached_cert_sha256.clone(),
-        },
+        entry.server_identity.clone(),
         transport,
         BootstrapProvenance::TrustStore { key },
     );
     intent.resume_grace_secs = launch.resume_window.as_secs();
+    if launch.mode == ConnectMode::Stun {
+        intent.stun_servers = launch.stun_servers.clone();
+    }
     Ok(intent)
 }
 
@@ -543,11 +691,12 @@ async fn run_relay_resumable(
     profile: &str,
     requested_resume_grace_secs: u64,
     identity: isekai_transport::CandidateIdentity<'_>,
+    experimental_network_rebind: bool,
 ) -> Result<()> {
     let factory = SystemQuicEndpointFactory;
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
     let established = connect_via_relay_resumable(&factory, target, requested, identity).await?;
-    run_resume_loop(&factory, target, profile, established).await
+    run_resume_loop(&factory, target, profile, established, experimental_network_rebind).await
 }
 
 /// Like `run_relay_resumable`, but tries `candidates` in priority order
@@ -560,13 +709,29 @@ async fn run_relay_resumable_with_fallback(
     candidates: &[SequentialRelayCandidate],
     profile: &str,
     requested_resume_grace_secs: u64,
+    experimental_network_rebind: bool,
 ) -> Result<()> {
     let factory = SystemQuicEndpointFactory;
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
     let (established, winning_target) = connect_via_relay_resumable_with_fallback(&factory, candidates, requested)
         .await
         .map_err(|e| anyhow::anyhow!("isekai-pipe connect: relay fallback failed: {e}"))?;
-    run_resume_loop(&factory, &winning_target, profile, established).await
+    run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind).await
+}
+
+/// Like the single-candidate `CandidateRoute::StunP2p` path in `run_connect`,
+/// but tries `candidates` (each a different STUN server against the same
+/// peer) in priority order (`#11`) instead of dialing a single fixed STUN
+/// server. STUN P2P has no resume/control-stream concept (`stun_p2p.rs`'s
+/// module docs), so — unlike `run_relay_resumable_with_fallback` — there is
+/// no `run_resume_loop` step here: the winning candidate's stream goes
+/// straight into `relay_stdio`, exactly like the legacy single-candidate path
+/// already does.
+async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidates: &[SequentialStunCandidate]) -> Result<()> {
+    let (connection, _winning_stun_server) = connect_stun_p2p_with_fallback(target, candidates)
+        .await
+        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: STUN P2P fallback failed: {e}"))?;
+    relay_stdio(connection.stream).await
 }
 
 /// Runs the C2H/H2C data pump against `established`, resuming (via
@@ -577,11 +742,115 @@ async fn run_relay_resumable_with_fallback(
 /// `run_relay_resumable_with_fallback` (the winning target out of several
 /// candidates) — resuming a session is always scoped to the one connection
 /// that established it, never a fresh candidate search.
+/// Picks an OS-assigned-ephemeral-port wildcard bind address matching
+/// `remote`'s address family — the same "let the OS pick a fresh source"
+/// approach `BindSpec::any_ipv4()` already uses for every *new* connection,
+/// reused here for `QuicEndpointRebinder::rebind`'s replacement socket. Not
+/// an explicit interface choice (see `QuicEndpointRebinder::rebind`'s docs):
+/// just a fresh socket for the OS to route via its current default path,
+/// which is what actually helps after e.g. a Wi-Fi disconnect where the OS
+/// has since switched its default route to something else.
+fn remote_bind_spec(remote: std::net::SocketAddr) -> BindSpec {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    let local_addr = if remote.is_ipv4() {
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
+    } else {
+        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
+    };
+    BindSpec { local_addr }
+}
+
+/// Spawns this connection generation's "the current connection should be
+/// abandoned and reconnected via RESUME" signal source for `run_resume_loop`,
+/// and returns a task to `.abort()` once the caller's own `select!` resolves
+/// (unconditionally — cheap/harmless to abort either shape below) alongside
+/// a receiver that yields exactly once, the moment reconnection should
+/// happen.
+///
+/// Two shapes, chosen by whether `rebinder` is both present and
+/// `experimental_network_rebind` is set:
+///
+/// - **Default** (`experimental_network_rebind` off, or this generation's
+///   `QuicEndpointFactory` doesn't support rebinding): every OS-reported
+///   network change (`isekai-netmon`; a no-op on platforms other than
+///   Windows/macOS today) is forwarded immediately — this is exactly the
+///   behavior this function replaced (`network_monitor.next_change()` raced
+///   directly against `run_data_pump` in the same `select!`), just moved
+///   into its own task so both shapes can feed the same channel.
+/// - **Experimental with a rebinder**: tries `QuicEndpointRebinder::rebind`
+///   first on every change; only a *failed* rebind attempt is forwarded,
+///   and this task then stops (that generation's endpoint is about to be
+///   abandoned by the RESUME reconnect the failure triggers, so continuing
+///   to watch it is pointless). A *successful* rebind is invisible to the
+///   caller's `select!` entirely — `run_data_pump`'s QUIC stream keeps
+///   running untouched, because `rebind` only swaps the endpoint's local
+///   socket, never the connection/stream objects above it (the same
+///   property Android's `multipath_transport.rs` relies on for its own
+///   `rebind_abstract()`-based failover, verified there on real hardware).
+///   `rebind`'s own success only means "the local socket switch itself
+///   succeeded" — not that the new path can actually reach the peer, which
+///   this task has no way to confirm; a rebind that succeeds but doesn't
+///   restore connectivity eventually surfaces as an ordinary QUIC idle
+///   timeout, same as before this feature existed.
+///
+/// `monitor` is a fresh `isekai_netmon::system_monitor()` from the caller
+/// (rather than one long-lived instance shared across every generation)
+/// because a rebinder is only valid for the specific endpoint it came from —
+/// once a RESUME reconnect replaces that endpoint, the old rebinder (and, by
+/// construction, the old task holding it) must not keep running, so each
+/// connection generation gets its own task and its own OS registration
+/// rather than one shared across the whole `run_resume_loop` call. Taken as
+/// a parameter rather than constructed inside this function so tests can
+/// inject a controllable mock instead of the real (on this development
+/// platform, Linux, always-`NoopNetworkChangeMonitor`) OS-backed one.
+fn spawn_reconnect_signal(
+    monitor: Box<dyn isekai_netmon::NetworkChangeMonitor>,
+    rebinder: Option<Box<dyn QuicEndpointRebinder>>,
+    experimental_network_rebind: bool,
+    helper_addr: std::net::SocketAddr,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<()>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
+    let handle = tokio::spawn(async move {
+        let mut network_monitor = monitor;
+        match (experimental_network_rebind, rebinder) {
+            (true, Some(rebinder)) => {
+                let bind = remote_bind_spec(helper_addr);
+                while network_monitor.next_change().await.is_some() {
+                    log::info!("isekai-pipe connect: rebind_attempted");
+                    match rebinder.rebind(bind).await {
+                        Ok(()) => {
+                            log::info!(
+                                "isekai-pipe connect: rebind ok, continuing existing connection"
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("isekai-pipe connect: rebind_immediate_error: {e}");
+                            let _ = tx.send(()).await;
+                            return;
+                        }
+                    }
+                }
+            }
+            _ => {
+                if network_monitor.next_change().await.is_some() {
+                    log::info!(
+                        "isekai-pipe connect: OS reported a network change; treating the current connection \
+                         as stale and reconnecting now instead of waiting for it to time out"
+                    );
+                    let _ = tx.send(()).await;
+                }
+            }
+        }
+    });
+    (handle, rx)
+}
+
 async fn run_resume_loop(
     factory: &SystemQuicEndpointFactory,
     target: &RelayTarget,
     profile: &str,
     established: isekai_transport::ResumableRelaySession,
+    experimental_network_rebind: bool,
 ) -> Result<()> {
     let session_id = established.session_id;
     drop(established.connection);
@@ -602,18 +871,31 @@ async fn run_resume_loop(
     let mut data_stream = established.data_stream;
     let mut disconnected_since: Option<Instant> = None;
     let mut attempt: u32 = 0;
+    let mut network_rebinder = established.network_rebinder;
 
     loop {
+        // See `spawn_reconnect_signal`'s docs for the full design rationale
+        // (this replaces what used to be a single `network_monitor` shared
+        // across the whole loop, racing `run_data_pump` directly — that
+        // shape cancelled the data pump, and the QUIC stream halves split
+        // out of `data_stream` below with it, the instant *any* network
+        // change fired, leaving no way to try a fast rebind without losing
+        // the stream first).
+        let (reconnect_signal_task, mut reconnect_signal_rx) = spawn_reconnect_signal(
+            isekai_netmon::system_monitor(),
+            network_rebinder.take(),
+            experimental_network_rebind,
+            target.helper_addr,
+        );
+
         let (quic_read, quic_write) = data_stream.split();
-        let outcome = run_data_pump(
-            &mut stdin,
-            &mut stdout,
-            quic_read,
-            quic_write,
-            &replay,
-            &counters,
-        )
-        .await;
+        let outcome = tokio::select! {
+            outcome = run_data_pump(&mut stdin, &mut stdout, quic_read, quic_write, &replay, &counters) => outcome,
+            Some(()) = reconnect_signal_rx.recv() => {
+                Err(anyhow::anyhow!("network change detected, reconnecting"))
+            }
+        };
+        reconnect_signal_task.abort();
         app_ack_tasks.abort();
 
         if outcome.is_ok() {
@@ -669,6 +951,7 @@ async fn run_resume_loop(
                         .lock()
                         .unwrap()
                         .advance_start(resumed.helper_committed_offset.get());
+                    network_rebinder = resumed.network_rebinder;
                     break resumed.data_stream;
                 }
                 Err(e) => {
@@ -889,6 +1172,7 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
             | "--relay-sni"
             | "--relay-jwt"
             | "--relay-jwt-file"
+            | "--bootstrap-request-file"
             | "--log-level" => {
                 let value = next_arg("serve", &mut iter, &arg).map_err(|e| {
                     eprintln!("{e}");
@@ -936,6 +1220,270 @@ async fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
+// ---------------------------------------------------------------------
+// inspect: passive `PersistentProfile` state dump (`ISEKAI_PIPE_DESIGN.md`
+// §8 Epic E). Never opens a socket — everything here reads only what's
+// already on disk. Secrets (`legacy_relay_transport.session_secret_b64`)
+// are never surfaced, with or without `--redact`; `--redact` additionally
+// hides other network-topology-identifying values (full endpoint lists,
+// `last_via`, `cached_stun_observed_addr`, and truncates the cert
+// fingerprint) so output can be pasted into a bug report without leaking
+// where a profile actually points.
+// ---------------------------------------------------------------------
+
+const INSPECT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug)]
+struct InspectLaunch {
+    profile: String,
+    json: bool,
+    redact: bool,
+    verbose: bool,
+}
+
+fn parse_inspect(args: impl Iterator<Item = String>) -> Result<Option<InspectLaunch>, ExitCode> {
+    let mut profile: Option<String> = None;
+    let mut json = false;
+    let mut redact = false;
+    let mut verbose = false;
+    let mut iter = args.peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("USAGE:");
+                println!("    isekai-pipe inspect --profile production [--json] [--redact] [--verbose]");
+                return Ok(None);
+            }
+            "--profile" => {
+                let value = next_arg("inspect", &mut iter, "--profile").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                if profile.replace(value).is_some() {
+                    eprintln!("isekai-pipe inspect: only one --profile is supported");
+                    return Err(ExitCode::from(EX_USAGE));
+                }
+            }
+            "--json" => json = true,
+            "--redact" => redact = true,
+            "--verbose" => verbose = true,
+            other => {
+                eprintln!("isekai-pipe inspect: unknown argument {other:?}");
+                return Err(ExitCode::from(EX_USAGE));
+            }
+        }
+    }
+    let Some(profile) = profile else {
+        eprintln!("isekai-pipe inspect: --profile is required");
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    Ok(Some(InspectLaunch { profile, json, redact, verbose }))
+}
+
+async fn inspect_command(args: impl Iterator<Item = String>) -> ExitCode {
+    let launch = match parse_inspect(args) {
+        Ok(Some(launch)) => launch,
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(code) => return code,
+    };
+    match run_inspect(launch) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e:?}");
+            ExitCode::from(EX_UNAVAILABLE)
+        }
+    }
+}
+
+fn run_inspect(launch: InspectLaunch) -> Result<()> {
+    // Profiles are always written under the normalized `host:port` key
+    // (`isekai-ssh`'s `init`/wrapper, `isekai-pipe connect`'s own
+    // `intent_from_profile` path) — `inspect` must resolve the same way, or
+    // `--profile myhost` (without an explicit port) would look for a
+    // `myhost.json` that never exists.
+    let key = isekai_trust::normalize_host_port(&launch.profile)
+        .with_context(|| format!("isekai-pipe inspect: invalid profile {:?}", launch.profile))?;
+    let profiles_dir = default_profiles_dir().context("isekai-pipe inspect: could not determine profiles directory")?;
+    let profile = load_persistent_profile(&profiles_dir, &key)
+        .with_context(|| format!("isekai-pipe inspect: failed to load profile from {}", profiles_dir.display()))?
+        .with_context(|| format!("isekai-pipe inspect: profile {:?} not found (looked up as {key:?} in {})", launch.profile, profiles_dir.display()))?;
+
+    let report = build_inspect_report(&profile, launch.verbose, launch.redact);
+    if launch.json {
+        println!("{}", serde_json::to_string_pretty(&report).expect("InspectReport always serializes"));
+    } else {
+        print_inspect_report_human(&report);
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct InspectReport {
+    inspect_schema_version: u32,
+    profile: String,
+    profile_schema_version: u32,
+    service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_id: Option<String>,
+    server_identity_cert_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_channel: Option<String>,
+    update_policy: isekai_trust::UpdatePolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_bootstrap_at: Option<String>,
+    last_seen_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_via: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_path_hint: Option<InspectPathHint>,
+    endpoints: InspectEndpoints,
+    credential: InspectCredential,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stun_observed_addr: Option<String>,
+    redacted: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct InspectPathHint {
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct InspectEndpoints {
+    link_count: usize,
+    rendezvous_count: usize,
+    stun_server_count: usize,
+    relay_endpoint_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rendezvous: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stun_servers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relay_endpoints: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct InspectCredential {
+    present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+}
+
+/// Truncates a hex certificate fingerprint for `--redact` — enough left to
+/// eyeball "is this the same profile as before", not enough to identify the
+/// actual peer.
+fn redact_cert_sha256(hex: &str) -> String {
+    match hex.get(..12) {
+        Some(prefix) => format!("{prefix}…"),
+        None => "…".to_string(),
+    }
+}
+
+fn build_inspect_report(profile: &isekai_pipe_core::PersistentProfile, verbose: bool, redact: bool) -> InspectReport {
+    let show_lists = verbose && !redact;
+    InspectReport {
+        inspect_schema_version: INSPECT_SCHEMA_VERSION,
+        profile: profile.profile.clone(),
+        profile_schema_version: profile.schema_version,
+        service: profile.service.clone(),
+        peer_id: profile.peer_id.clone(),
+        server_identity_cert_sha256: if redact {
+            redact_cert_sha256(&profile.server_identity.cert_sha256_hex)
+        } else {
+            profile.server_identity.cert_sha256_hex.clone()
+        },
+        remote_version: profile.remote_version.clone(),
+        release_channel: profile.release_channel.clone(),
+        update_policy: profile.update_policy,
+        last_bootstrap_at: profile.last_bootstrap_at.clone(),
+        last_seen_at: profile.last_seen_at.clone(),
+        last_via: if redact { None } else { profile.last_via.clone() },
+        last_path_hint: profile
+            .last_path_hint
+            .as_ref()
+            .map(|hint| InspectPathHint { kind: hint.kind.clone(), expires_at: hint.expires_at.clone() }),
+        endpoints: InspectEndpoints {
+            link_count: profile.link_endpoints.len(),
+            rendezvous_count: profile.rendezvous.len(),
+            stun_server_count: profile.stun_servers.len(),
+            relay_endpoint_count: profile.relay_endpoints.len(),
+            link: show_lists.then(|| profile.link_endpoints.clone()),
+            rendezvous: show_lists.then(|| profile.rendezvous.clone()),
+            stun_servers: show_lists.then(|| profile.stun_servers.clone()),
+            relay_endpoints: show_lists.then(|| profile.relay_endpoints.clone()),
+        },
+        credential: InspectCredential {
+            present: profile.legacy_relay_transport.is_some(),
+            kind: profile.legacy_relay_transport.as_ref().map(|_| "legacy-relay-session-secret"),
+        },
+        stun_observed_addr: if redact { None } else { profile.cached_stun_observed_addr.clone() },
+        redacted: redact,
+    }
+}
+
+fn print_inspect_report_human(report: &InspectReport) {
+    println!("profile:              {}", report.profile);
+    println!("schema version:       {} (inspect output: {})", report.profile_schema_version, report.inspect_schema_version);
+    println!("service:              {}", report.service);
+    if let Some(peer_id) = &report.peer_id {
+        println!("peer id:              {peer_id}");
+    }
+    println!("helper identity:      {}", report.server_identity_cert_sha256);
+    if let Some(v) = &report.remote_version {
+        println!("remote version:       {v}");
+    }
+    if let Some(ch) = &report.release_channel {
+        println!("release channel:      {ch}");
+    }
+    println!("update policy:        {:?}", report.update_policy);
+    if let Some(t) = &report.last_bootstrap_at {
+        println!("last bootstrap at:    {t}");
+    }
+    println!("last seen at:         {}", report.last_seen_at);
+    if let Some(via) = &report.last_via {
+        println!("last via:             {via}");
+    }
+    if let Some(hint) = &report.last_path_hint {
+        match &hint.expires_at {
+            Some(exp) => println!("last path hint:       {} (expires {exp})", hint.kind),
+            None => println!("last path hint:       {}", hint.kind),
+        }
+    }
+    println!(
+        "endpoints:            link={} rendezvous={} stun={} relay={}",
+        report.endpoints.link_count, report.endpoints.rendezvous_count, report.endpoints.stun_server_count, report.endpoints.relay_endpoint_count
+    );
+    for (label, values) in [
+        ("link", &report.endpoints.link),
+        ("rendezvous", &report.endpoints.rendezvous),
+        ("stun servers", &report.endpoints.stun_servers),
+        ("relay endpoints", &report.endpoints.relay_endpoints),
+    ] {
+        if let Some(values) = values {
+            for v in values {
+                println!("  {label}: {v}");
+            }
+        }
+    }
+    match report.credential.kind {
+        Some(kind) => println!("credential:           present ({kind}, value not shown)"),
+        None => println!("credential:           {}", if report.credential.present { "present" } else { "none" }),
+    }
+    if let Some(addr) = &report.stun_observed_addr {
+        println!("stun observed addr:   {addr}");
+    }
+    if report.redacted {
+        println!();
+        println!("(--redact: network-identifying fields hidden/truncated above)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,6 +1498,92 @@ mod tests {
         parse_serve(args.iter().map(|arg| arg.to_string()))
             .unwrap()
             .unwrap()
+    }
+
+    #[test]
+    fn choose_connect_route_prefers_stun_over_relay_endpoints_when_transport_is_stun_p2p() {
+        // Regression test: a host configured with both `#@isekai stun` and
+        // `#@isekai relay` — `select_transport` (Epic G) already chose
+        // `StunP2p` as the primary, so `relay_endpoints` being non-empty
+        // must not silently steer this back onto the relay path.
+        let mut intent = ConnectionIntent::new(
+            "production",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::StunP2p {
+                stun_server: "203.0.113.9:3478".to_string(),
+                peer_addr: "198.51.100.7:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "production:22".to_string() },
+        );
+        intent.relay_endpoints = vec!["masque://relay.example.com".to_string()];
+        intent.stun_servers = vec!["203.0.113.9:3478".to_string()];
+
+        assert_eq!(choose_connect_route(&intent), ConnectRoute::StunWithFallback);
+    }
+
+    #[test]
+    fn choose_connect_route_uses_relay_fallback_when_transport_is_relay() {
+        let mut intent = ConnectionIntent::new(
+            "production",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::Relay {
+                helper_addr: "203.0.113.5:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "production:22".to_string() },
+        );
+        intent.relay_endpoints = vec!["masque://relay.example.com".to_string()];
+
+        assert_eq!(choose_connect_route(&intent), ConnectRoute::RelayWithFallback);
+    }
+
+    #[test]
+    fn choose_connect_route_defaults_to_single_candidate_with_no_fallback_lists() {
+        let intent = ConnectionIntent::new(
+            "production",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::Relay {
+                helper_addr: "203.0.113.5:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "production:22".to_string() },
+        );
+
+        assert_eq!(choose_connect_route(&intent), ConnectRoute::SingleCandidate);
+    }
+
+    #[test]
+    fn run_inspect_normalizes_a_bare_profile_alias() {
+        // Regression test: profiles are written under the normalized
+        // `host:port` key, but `--profile myhost` (no explicit port) must
+        // still resolve to it, matching every other command
+        // (`connect`/`init`/wrapper) that normalizes before lookup.
+        let dir = tempfile::tempdir().unwrap();
+        // Only test in this file that touches `ISEKAI_PIPE_PROFILES_DIR` —
+        // safe to mutate unguarded today, but the next one added here should
+        // serialize against this one (see `isekai-ssh`'s `HOME_ENV_LOCK` for
+        // the exact failure mode this would otherwise hit).
+        let old = std::env::var_os("ISEKAI_PIPE_PROFILES_DIR");
+        std::env::set_var("ISEKAI_PIPE_PROFILES_DIR", dir.path());
+
+        let profile = sample_profile_for_inspect();
+        isekai_pipe_core::write_persistent_profile(dir.path(), &profile).unwrap();
+
+        let result = run_inspect(InspectLaunch { profile: "myhost".to_string(), json: true, redact: false, verbose: false });
+
+        if let Some(old) = old {
+            std::env::set_var("ISEKAI_PIPE_PROFILES_DIR", old);
+        } else {
+            std::env::remove_var("ISEKAI_PIPE_PROFILES_DIR");
+        }
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]
@@ -1047,6 +1681,78 @@ mod tests {
     async fn resolve_relay_candidates_rejects_a_malformed_endpoint() {
         let intent = intent_with_relay_endpoints(vec!["not-an-address".to_string()]);
         assert!(resolve_relay_candidates(&intent, b"secret").await.is_err());
+    }
+
+    fn intent_with_stun_servers(stun_servers: Vec<String>) -> ConnectionIntent {
+        let mut intent = ConnectionIntent::new(
+            "production",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::StunP2p {
+                stun_server: stun_servers.first().cloned().unwrap_or_default(),
+                peer_addr: "203.0.113.5:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "production:22".to_string() },
+        );
+        intent.stun_servers = stun_servers;
+        intent
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_candidates_preserves_configured_order() {
+        let intent = intent_with_stun_servers(vec![
+            "192.0.2.10:3478".to_string(),
+            "192.0.2.11:3478".to_string(),
+            "192.0.2.12:3478".to_string(),
+        ]);
+
+        let (target, candidates) = resolve_stun_candidates(&intent, b"session-secret").await.unwrap();
+
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].stun_server, "192.0.2.10:3478".parse().unwrap());
+        assert_eq!(candidates[1].stun_server, "192.0.2.11:3478".parse().unwrap());
+        assert_eq!(candidates[2].stun_server, "192.0.2.12:3478".parse().unwrap());
+        // Every candidate shares the same peer/session identity.
+        assert_eq!(target.peer_addr, "203.0.113.5:45231".parse().unwrap());
+        assert_eq!(target.server_name, "isekai-helper");
+        assert_eq!(target.cert_sha256_hex, "ab".repeat(32));
+        assert_eq!(target.session_secret, b"session-secret");
+        assert_ne!(candidates[0].candidate_id, candidates[1].candidate_id);
+        assert_ne!(candidates[1].candidate_id, candidates[2].candidate_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_candidates_never_leaks_the_session_secret_via_debug() {
+        let intent = intent_with_stun_servers(vec!["192.0.2.10:3478".to_string()]);
+        let (target, _candidates) = resolve_stun_candidates(&intent, b"top-secret-value").await.unwrap();
+        assert_eq!(target.session_secret, b"top-secret-value");
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_candidates_rejects_a_malformed_stun_server() {
+        let intent = intent_with_stun_servers(vec!["not-an-address".to_string()]);
+        assert!(resolve_stun_candidates(&intent, b"secret").await.is_err());
+    }
+
+    #[test]
+    fn connect_accepts_multiple_stun_server_flags_in_order() {
+        let launch = parse_connect_args(&[
+            "--profile",
+            "production",
+            "--service",
+            "ssh",
+            "--stdio",
+            "--mode",
+            "stun",
+            "--stun-server",
+            "192.0.2.10:3478",
+            "--stun-server",
+            "192.0.2.11:3478",
+        ]);
+
+        assert_eq!(launch.stun_servers, vec!["192.0.2.10:3478".to_string(), "192.0.2.11:3478".to_string()]);
     }
 
     #[test]
@@ -1173,6 +1879,267 @@ mod tests {
         )
         .is_err());
     }
+
+    /// A `NetworkChangeMonitor` that fires exactly one event, then never
+    /// resolves again — enough to prove `run_resume_loop`'s `tokio::select!`
+    /// (`#20b`'s follow-on network-change wiring) actually treats a signal
+    /// arriving *before* the data pump finishes as a reason to abandon the
+    /// current connection and reconnect, without needing a real OS backend
+    /// or a real QUIC connection to exercise that race in isolation.
+    struct FireOnceNetworkChangeMonitor {
+        fired: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl isekai_netmon::NetworkChangeMonitor for FireOnceNetworkChangeMonitor {
+        async fn next_change(&mut self) -> Option<isekai_netmon::NetworkChangeEvent> {
+            if self.fired {
+                std::future::pending().await
+            } else {
+                self.fired = true;
+                Some(isekai_netmon::NetworkChangeEvent)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn network_change_event_wins_the_race_against_a_pump_that_never_finishes() {
+        let mut monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
+            Box::new(FireOnceNetworkChangeMonitor { fired: false });
+        // Stands in for `run_data_pump` (which would otherwise only resolve
+        // on clean stdin EOF or a real I/O error) — mirrors the general
+        // "pump vs. network-change signal" `tokio::select!` shape
+        // `run_resume_loop` uses (today via `spawn_reconnect_signal`'s
+        // channel rather than polling a monitor directly in this exact
+        // `select!`, but the race semantics under test here are the same
+        // either way), without needing real stdin/stdout or a QUIC
+        // connection.
+        let never_finishes = std::future::pending::<Result<()>>();
+
+        let outcome: Result<()> = tokio::select! {
+            outcome = never_finishes => outcome,
+            Some(_) = monitor.next_change() => Err(anyhow::anyhow!("network change detected, reconnecting early")),
+        };
+
+        assert!(outcome.is_err(), "a network-change event must win the race and produce an early-reconnect signal");
+    }
+
+    #[tokio::test]
+    async fn no_network_change_event_leaves_the_pump_to_finish_on_its_own() {
+        let mut monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> = Box::new(isekai_netmon::NoopNetworkChangeMonitor);
+        let finishes_soon = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let outcome: Result<()> = tokio::select! {
+            outcome = finishes_soon => outcome,
+            Some(_) = monitor.next_change() => Err(anyhow::anyhow!("network change detected, reconnecting early")),
+        };
+
+        assert!(outcome.is_ok(), "with no network-change signal, the pump's own outcome must be used unchanged");
+    }
+
+    struct MockRebinder {
+        should_succeed: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl QuicEndpointRebinder for MockRebinder {
+        async fn rebind(&self, _bind: BindSpec) -> Result<(), isekai_transport::TransportError> {
+            if self.should_succeed {
+                Ok(())
+            } else {
+                Err(isekai_transport::TransportError::Rebind("mock failure".to_string()))
+            }
+        }
+    }
+
+    const TEST_HELPER_ADDR: &str = "127.0.0.1:9";
+
+    #[tokio::test]
+    async fn spawn_reconnect_signal_forwards_plain_network_change_when_not_experimental() {
+        let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
+            Box::new(FireOnceNetworkChangeMonitor { fired: false });
+        let (task, mut rx) = spawn_reconnect_signal(monitor, None, /* experimental */ false, TEST_HELPER_ADDR.parse().unwrap());
+
+        assert!(rx.recv().await.is_some(), "a plain network change must be forwarded when experimental rebind is off");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn spawn_reconnect_signal_forwards_plain_network_change_when_experimental_but_no_rebinder() {
+        // Experimental is on, but this generation's endpoint factory doesn't
+        // support rebinding (`rebinder: None`) - must fall back to exactly
+        // the non-experimental behavior, not silently drop the event.
+        let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
+            Box::new(FireOnceNetworkChangeMonitor { fired: false });
+        let (task, mut rx) = spawn_reconnect_signal(monitor, None, /* experimental */ true, TEST_HELPER_ADDR.parse().unwrap());
+
+        assert!(rx.recv().await.is_some(), "with no rebinder available, a network change must still be forwarded");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn spawn_reconnect_signal_does_not_forward_after_a_successful_rebind() {
+        let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
+            Box::new(FireOnceNetworkChangeMonitor { fired: false });
+        let rebinder: Box<dyn QuicEndpointRebinder> = Box::new(MockRebinder { should_succeed: true });
+        let (task, mut rx) = spawn_reconnect_signal(
+            monitor,
+            Some(rebinder),
+            /* experimental */ true,
+            TEST_HELPER_ADDR.parse().unwrap(),
+        );
+
+        let result = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "a successful rebind must not forward a reconnect signal - the caller's data pump should keep running untouched"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn spawn_reconnect_signal_forwards_after_a_failed_rebind() {
+        let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
+            Box::new(FireOnceNetworkChangeMonitor { fired: false });
+        let rebinder: Box<dyn QuicEndpointRebinder> = Box::new(MockRebinder { should_succeed: false });
+        let (task, mut rx) = spawn_reconnect_signal(
+            monitor,
+            Some(rebinder),
+            /* experimental */ true,
+            TEST_HELPER_ADDR.parse().unwrap(),
+        );
+
+        assert!(rx.recv().await.is_some(), "a failed rebind attempt must fall back to the reconnect signal");
+        task.abort();
+    }
+
+    fn parse_inspect_args(args: &[&str]) -> InspectLaunch {
+        parse_inspect(args.iter().map(|arg| arg.to_string())).unwrap().unwrap()
+    }
+
+    fn sample_profile_for_inspect() -> isekai_pipe_core::PersistentProfile {
+        isekai_pipe_core::PersistentProfile::migrate_legacy_helper_trust(
+            "myhost:22",
+            &isekai_trust::HelperTrust {
+                identity_pubkey: "pk-abc".to_string(),
+                trusted_helper_sha256: "a".repeat(64),
+                trusted_helper_version: "0.5.0".to_string(),
+                update_policy: isekai_trust::UpdatePolicy::ExactDigestOnly,
+                release_channel: Some("stable".to_string()),
+                last_via: Some("bastion.example.com".to_string()),
+                trusted_at: "2026-07-04T00:00:00Z".to_string(),
+                last_seen_at: "2026-07-08T00:00:00Z".to_string(),
+                cached_relay_addr: "203.0.113.10:45231".to_string(),
+                cached_cert_sha256: "3a7f".repeat(16),
+                cached_session_secret: "super-secret-value".to_string(),
+                cached_stun_observed_addr: Some("198.51.100.7:45231".to_string()),
+            },
+        )
+    }
+
+    #[test]
+    fn parse_inspect_requires_profile() {
+        assert!(parse_inspect(std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn parse_inspect_reads_flags() {
+        let launch = parse_inspect_args(&["--profile", "prod", "--json", "--redact", "--verbose"]);
+        assert_eq!(launch.profile, "prod");
+        assert!(launch.json);
+        assert!(launch.redact);
+        assert!(launch.verbose);
+    }
+
+    #[test]
+    fn parse_inspect_defaults_flags_to_false() {
+        let launch = parse_inspect_args(&["--profile", "prod"]);
+        assert!(!launch.json);
+        assert!(!launch.redact);
+        assert!(!launch.verbose);
+    }
+
+    #[test]
+    fn inspect_report_never_contains_the_session_secret_even_unredacted() {
+        let profile = sample_profile_for_inspect();
+        for redact in [false, true] {
+            for verbose in [false, true] {
+                let report = build_inspect_report(&profile, verbose, redact);
+                let json = serde_json::to_string(&report).unwrap();
+                assert!(!json.contains("super-secret-value"), "redact={redact} verbose={verbose}: {json}");
+            }
+        }
+    }
+
+    #[test]
+    fn inspect_report_default_view_omits_endpoint_lists_but_keeps_counts() {
+        let mut profile = sample_profile_for_inspect();
+        profile.link_endpoints = vec!["https://link.example.com".to_string()];
+        let report = build_inspect_report(&profile, false, false);
+        assert_eq!(report.endpoints.link_count, 1);
+        assert_eq!(report.endpoints.link, None);
+    }
+
+    #[test]
+    fn inspect_report_verbose_includes_endpoint_lists() {
+        let mut profile = sample_profile_for_inspect();
+        profile.link_endpoints = vec!["https://link.example.com".to_string()];
+        let report = build_inspect_report(&profile, true, false);
+        assert_eq!(report.endpoints.link, Some(vec!["https://link.example.com".to_string()]));
+    }
+
+    #[test]
+    fn inspect_report_redact_hides_lists_even_when_verbose() {
+        let mut profile = sample_profile_for_inspect();
+        profile.link_endpoints = vec!["https://link.example.com".to_string()];
+        let report = build_inspect_report(&profile, true, true);
+        assert_eq!(report.endpoints.link, None, "redact must win over verbose");
+    }
+
+    #[test]
+    fn inspect_report_redact_truncates_cert_and_hides_via_and_stun_addr() {
+        let profile = sample_profile_for_inspect();
+        let report = build_inspect_report(&profile, false, true);
+        assert!(report.server_identity_cert_sha256.ends_with('…'));
+        assert!(report.server_identity_cert_sha256.len() < profile.server_identity.cert_sha256_hex.len());
+        assert_eq!(report.last_via, None);
+        assert_eq!(report.stun_observed_addr, None);
+        assert!(report.redacted);
+    }
+
+    #[test]
+    fn inspect_report_unredacted_shows_full_cert_via_and_stun_addr() {
+        let profile = sample_profile_for_inspect();
+        let report = build_inspect_report(&profile, false, false);
+        assert_eq!(report.server_identity_cert_sha256, profile.server_identity.cert_sha256_hex);
+        assert_eq!(report.last_via, profile.last_via);
+        assert_eq!(report.stun_observed_addr, profile.cached_stun_observed_addr);
+        assert!(!report.redacted);
+    }
+
+    #[test]
+    fn inspect_report_reports_credential_presence_without_the_secret() {
+        let profile = sample_profile_for_inspect();
+        let report = build_inspect_report(&profile, false, false);
+        assert!(report.credential.present);
+        assert_eq!(report.credential.kind, Some("legacy-relay-session-secret"));
+
+        let mut profile_without = profile;
+        profile_without.legacy_relay_transport = None;
+        let report_without = build_inspect_report(&profile_without, false, false);
+        assert!(!report_without.credential.present);
+        assert_eq!(report_without.credential.kind, None);
+    }
+
+    #[test]
+    fn inspect_report_carries_the_output_schema_version() {
+        let profile = sample_profile_for_inspect();
+        let report = build_inspect_report(&profile, false, false);
+        assert_eq!(report.inspect_schema_version, INSPECT_SCHEMA_VERSION);
+    }
 }
 
 #[tokio::main]
@@ -1190,7 +2157,7 @@ async fn main() -> ExitCode {
         Some("connect") => connect_command(args).await,
         Some("serve") => serve_command(args).await,
         Some("probe") => unimplemented_command("probe"),
-        Some("inspect") => unimplemented_command("inspect"),
+        Some("inspect") => inspect_command(args).await,
         Some(other) => {
             eprintln!("isekai-pipe: unknown command: {other}");
             eprintln!("try `isekai-pipe --help`");

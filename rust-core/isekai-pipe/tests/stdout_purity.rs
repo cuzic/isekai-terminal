@@ -22,7 +22,8 @@ use std::process::Stdio as StdStdio;
 use std::time::Duration;
 
 use base64::Engine as _;
-use isekai_trust::schema::{HelperTrust, TrustStore, UpdatePolicy};
+use isekai_pipe_core::PersistentProfile;
+use isekai_trust::schema::{HelperTrust, UpdatePolicy};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
 
@@ -30,10 +31,8 @@ fn isekai_pipe_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_isekai-pipe"))
 }
 
-fn trust_store_path_under(home: &std::path::Path) -> PathBuf {
-    home.join(".config")
-        .join(isekai_trust::store::CONFIG_DIR_NAME)
-        .join(isekai_trust::store::TRUST_STORE_FILE_NAME)
+fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
+    home.join(".local").join("state").join("isekai").join("profiles")
 }
 
 fn sample_trust_entry(
@@ -53,16 +52,15 @@ fn sample_trust_entry(
         cached_relay_addr: cached_relay_addr.to_string(),
         cached_cert_sha256,
         cached_session_secret,
+        cached_stun_observed_addr: None,
     }
 }
 
 fn register_trust(home: &std::path::Path, host: &str, entry: HelperTrust) {
-    let trust_store_path = trust_store_path_under(home);
     let key = isekai_trust::normalize_host_port(host).unwrap();
-    let mut store = TrustStore::default();
-    store.insert(key, entry);
-    isekai_trust::save_trust_store(&trust_store_path, &store)
-        .expect("failed to write trust store fixture");
+    let profile = PersistentProfile::migrate_legacy_helper_trust(&key, &entry);
+    isekai_pipe_core::write_persistent_profile(&profiles_dir_under(home), &profile)
+        .expect("failed to write persistent profile fixture");
 }
 
 async fn run_connect_to_completion(
@@ -96,7 +94,7 @@ async fn connect_stdout_empty_for_untrusted_profile() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
-    // Deliberately no known_helpers.toml at all.
+    // Deliberately no persisted profile at all.
 
     let output = run_connect_to_completion(&home, "unknown-profile", None).await;
 

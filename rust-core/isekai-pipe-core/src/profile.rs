@@ -1,17 +1,18 @@
-//! Persistent profile schema (`chatgpt.md` §13 "永続profile") and its
-//! migration path from the legacy `known_helpers.toml` trust store
-//! (`isekai_trust::schema::{TrustStore, HelperTrust}`,
-//! `archive/ISEKAI_PIPE_MIGRATION.md` P5 "旧名整理").
+//! Persistent profile schema (`chatgpt.md` §13 "永続profile") -- the sole
+//! on-disk store `isekai-ssh`/`isekai-pipe` read and write
+//! (`ISEKAI_PIPE_DESIGN.md` §8 Epic B). The legacy `known_helpers.toml`
+//! trust store (`isekai_trust::schema::{TrustStore, HelperTrust}`) is no
+//! longer read by any live code path -- `migrate_legacy_helper_trust`/
+//! `migrate_trust_store` below remain only as one-off conversion helpers for
+//! a caller that still has an old `known_helpers.toml` lying around and
+//! wants to hand-convert it.
 //!
-//! `known_helpers.toml` is keyed by `host:port` and stores a single cached
-//! relay address/session secret per entry -- it has no concept of
-//! `peer_id`, multiple candidate sources, or a `last_path_hint`. This module
-//! does not invent values for fields the legacy schema cannot supply, and
-//! it does not remove or rewrite `known_helpers.toml` itself: per
-//! `archive/ISEKAI_PIPE_MIGRATION.md`'s "互換名" note, behavior changes and name
-//! changes ship in separate PRs, so callers keep reading/writing the legacy
-//! store exactly as before until something is wired up to actually prefer
-//! `PersistentProfile`.
+//! `known_helpers.toml` was keyed by `host:port` and stored a single cached
+//! relay address/session secret per entry, plus release-trust metadata
+//! (`identity_pubkey`/`trusted_helper_sha256`/`update_policy`/
+//! `release_channel`/`last_via`/`last_seen_at`/`cached_stun_observed_addr`).
+//! `PersistentProfile` carries all of that (see the fields below) so cutting
+//! over from `HelperTrust` loses nothing a live code path used.
 
 use std::fs;
 use std::io;
@@ -19,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use isekai_trust::schema::{HelperTrust, TrustStore};
+use isekai_trust::schema::{HelperTrust, TrustStore, UpdatePolicy};
 
 use crate::{IntentTransport, RelayPolicy, ServerIdentity};
 
@@ -65,6 +66,29 @@ pub struct PersistentProfile {
     /// `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_relay_transport: Option<LegacyRelayTransport>,
+    /// The deployed `isekai-pipe serve` binary's own identity, and the
+    /// digest pin used to decide whether a re-deployed binary may be
+    /// accepted without re-running `init` (`isekai_trust::schema::HelperTrust`'s
+    /// former job -- `UpdatePolicy::ExactDigestOnly` is not consulted for
+    /// any policy decision yet, matching that type's own doc comment, but
+    /// the pin is still recorded here so Epic D's signature verification
+    /// has something to build on rather than starting from nothing).
+    pub identity_pubkey: String,
+    pub trusted_helper_sha256: String,
+    pub update_policy: UpdatePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_channel: Option<String>,
+    /// The jump host last used to reach this destination -- purely
+    /// informational, not part of the profile's identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_via: Option<String>,
+    pub last_seen_at: String,
+    /// `HandshakeJson::stun_observed_addr()` from the most recent successful
+    /// handshake, if the remote reported one. See `HelperTrust`'s own field
+    /// of the same name for why this is a cache of server-side self
+    /// observation, not a connection decision made here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_stun_observed_addr: Option<String>,
 }
 
 /// `chatgpt.md` §13's `last_path_hint`: a short-lived observation used only
@@ -86,11 +110,14 @@ pub struct LegacyRelayTransport {
 }
 
 impl PersistentProfile {
-    /// Converts a single `known_helpers.toml` entry (keyed by `host:port`,
-    /// e.g. `isekai_trust::normalize_host_port`'s output) into the new
-    /// schema. Fields the legacy schema cannot supply (`peer_id`,
-    /// `link_endpoints`, `rendezvous`, `stun_servers`, `relay_endpoints`,
-    /// `last_path_hint`) are left empty/`None` rather than guessed.
+    /// Converts a `HelperTrust` value (freshly built from a bootstrap
+    /// handshake, or -- for a one-off conversion tool -- loaded from an old
+    /// `known_helpers.toml`) into a `PersistentProfile`. Fields the legacy
+    /// schema has no equivalent for at all (`peer_id`, `link_endpoints`,
+    /// `rendezvous`, `stun_servers`, `relay_endpoints`, `last_path_hint`)
+    /// are left empty/`None` rather than guessed; every other field
+    /// (including the release-trust metadata `HelperTrust` carries) is
+    /// preserved.
     pub fn migrate_legacy_helper_trust(profile_name: &str, trust: &HelperTrust) -> Self {
         Self {
             schema_version: PERSISTENT_PROFILE_SCHEMA_VERSION,
@@ -112,6 +139,13 @@ impl PersistentProfile {
                 helper_addr: trust.cached_relay_addr.clone(),
                 session_secret_b64: trust.cached_session_secret.clone(),
             }),
+            identity_pubkey: trust.identity_pubkey.clone(),
+            trusted_helper_sha256: trust.trusted_helper_sha256.clone(),
+            update_policy: trust.update_policy,
+            release_channel: trust.release_channel.clone(),
+            last_via: trust.last_via.clone(),
+            last_seen_at: trust.last_seen_at.clone(),
+            cached_stun_observed_addr: trust.cached_stun_observed_addr.clone(),
         }
     }
 
@@ -204,7 +238,6 @@ pub fn load_persistent_profile(dir: &Path, profile_name: &str) -> io::Result<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use isekai_trust::schema::UpdatePolicy;
 
     fn sample_trust() -> HelperTrust {
         HelperTrust {
@@ -219,6 +252,7 @@ mod tests {
             cached_relay_addr: "203.0.113.10:45231".to_string(),
             cached_cert_sha256: "3a7f".repeat(16),
             cached_session_secret: "c2VjcmV0MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM=".to_string(),
+            cached_stun_observed_addr: None,
         }
     }
 
@@ -245,6 +279,13 @@ mod tests {
                 session_secret_b64: trust.cached_session_secret.clone(),
             })
         );
+        assert_eq!(profile.identity_pubkey, trust.identity_pubkey);
+        assert_eq!(profile.trusted_helper_sha256, trust.trusted_helper_sha256);
+        assert_eq!(profile.update_policy, trust.update_policy);
+        assert_eq!(profile.release_channel, trust.release_channel);
+        assert_eq!(profile.last_via, trust.last_via);
+        assert_eq!(profile.last_seen_at, trust.last_seen_at);
+        assert_eq!(profile.cached_stun_observed_addr, trust.cached_stun_observed_addr);
     }
 
     #[test]
@@ -281,6 +322,13 @@ mod tests {
             last_bootstrap_at: None,
             last_path_hint: None,
             legacy_relay_transport: None,
+            identity_pubkey: "pk-future".to_string(),
+            trusted_helper_sha256: "b".repeat(64),
+            update_policy: UpdatePolicy::ExactDigestOnly,
+            release_channel: None,
+            last_via: None,
+            last_seen_at: "2026-07-08T00:00:00Z".to_string(),
+            cached_stun_observed_addr: None,
         };
         assert_eq!(profile.to_legacy_relay_transport(), None);
     }

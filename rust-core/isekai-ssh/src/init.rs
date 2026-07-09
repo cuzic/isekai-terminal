@@ -3,9 +3,9 @@
 //! one-time-per-host command: it deploys/starts `isekai-helper` on `<host>`
 //! (optionally via a jump host) using `isekai-bootstrap::OpenSshBackend`,
 //! shows the operator what it just talked to, waits for an explicit `[y/N]`
-//! confirmation, and — only on `y`/`Y` — writes a `HelperTrust` entry to the
-//! trust store `connect` reads from
-//! (`~/.config/isekai-ssh/known_helpers.toml`, `isekai-trust`).
+//! confirmation, and — only on `y`/`Y` — writes a `PersistentProfile`
+//! (`isekai-pipe-core`) that `connect` reads from (`ISEKAI_PIPE_DESIGN.md`
+//! §8 Epic B).
 //!
 //! Unlike `connect.rs`, stdout purity is *not* a constraint here — `init` is
 //! never invoked as `ssh`'s `ProxyCommand` (`archive/ISEKAI_SSH_DESIGN.md` "ユーザー
@@ -23,8 +23,11 @@
 
 use std::io::Write as _;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use isekai_auth::TokenProvider;
 use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
+use isekai_pipe_core::{default_profiles_dir, write_persistent_profile, PersistentProfile};
+use isekai_release_verify::{verify_artifact, ExpectedTarget, SignedManifest, TrustedReleaseKeys};
 use isekai_trust::{HelperTrust, UpdatePolicy};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -36,6 +39,11 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .with_context(|| format!("isekai-ssh: failed to read helper binary at {}", args.helper_binary.display()))?;
     let helper_sha256 = hex_sha256(&helper_binary);
 
+    if let Some(manifest_path) = &args.helper_manifest {
+        verify_helper_manifest(&args, manifest_path, &helper_binary)
+            .with_context(|| "isekai-ssh: release manifest verification failed — refusing to deploy an unverified binary".to_string())?;
+    }
+
     let target = parse_host_spec(&args.host)
         .with_context(|| format!("isekai-ssh: invalid host spec '{}'", args.host))?;
     let via = args
@@ -44,17 +52,18 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .map(parse_jump_spec)
         .transpose()
         .with_context(|| format!("isekai-ssh: invalid --via spec '{}'", args.via.as_deref().unwrap_or_default()))?;
+    let relay_jwt = resolve_relay_jwt(&args)?;
     let relay = RelayLaunchSpec {
         relay_addr: args.relay_addr,
         relay_sni: args.relay_sni.clone(),
-        relay_jwt: args.relay_jwt.clone(),
+        relay_jwt,
         idle_lifetime_secs: args.idle_lifetime,
     };
 
     println!("Deploying isekai-helper to {}...", args.host);
     let backend = OpenSshBackend::new();
     let report = backend
-        .install_and_start(&target, via.as_ref(), &helper_binary, &LaunchSpec::Relay(relay), None)
+        .install_and_start(&target, via.as_ref(), &helper_binary, &LaunchSpec::Relay(relay), None, &args.stun_servers)
         .await
         .with_context(|| format!("isekai-ssh: failed to deploy/start isekai-helper on '{}'", args.host))?;
     let handshake = &report.handshake;
@@ -89,10 +98,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
         return Ok(());
     }
 
-    let store_path = isekai_trust::default_trust_store_path()
-        .context("isekai-ssh: could not determine the trust store path (is $HOME set?)")?;
-    let mut store = isekai_trust::load_trust_store(&store_path)
-        .with_context(|| format!("isekai-ssh: failed to load trust store at {}", store_path.display()))?;
+    let profiles_dir = default_profiles_dir()
+        .context("isekai-ssh: could not determine the profiles directory (is $HOME set?)")?;
 
     let key = isekai_trust::normalize_host_port(&args.host)
         .with_context(|| format!("isekai-ssh: invalid host spec '{}'", args.host))?;
@@ -107,33 +114,83 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .map(str::to_string)
         .unwrap_or_else(|| args.relay_addr.to_string());
 
-    store.insert(
-        key.clone(),
-        HelperTrust {
-            identity_pubkey: identity,
-            trusted_helper_sha256: helper_sha256,
-            trusted_helper_version: args.helper_version.clone(),
-            update_policy: UpdatePolicy::ExactDigestOnly,
-            release_channel: args.release_channel.clone(),
-            last_via: args.via.clone(),
-            trusted_at: now.clone(),
-            last_seen_at: now,
-            cached_relay_addr,
-            cached_cert_sha256: handshake.cert_sha256().to_string(),
-            cached_session_secret: handshake.session_secret.clone(),
-        },
-    );
+    let trust = HelperTrust {
+        identity_pubkey: identity,
+        trusted_helper_sha256: helper_sha256,
+        trusted_helper_version: args.helper_version.clone(),
+        update_policy: UpdatePolicy::ExactDigestOnly,
+        release_channel: args.release_channel.clone(),
+        last_via: args.via.clone(),
+        trusted_at: now.clone(),
+        last_seen_at: now,
+        cached_relay_addr,
+        cached_cert_sha256: handshake.cert_sha256().to_string(),
+        cached_session_secret: handshake.session_secret.clone(),
+        cached_stun_observed_addr: handshake.stun_observed_addr().map(str::to_string),
+    };
+    let profile = PersistentProfile::migrate_legacy_helper_trust(&key, &trust);
+    let path = write_persistent_profile(&profiles_dir, &profile)
+        .with_context(|| format!("isekai-ssh: failed to write profile to {}", profiles_dir.display()))?;
 
-    isekai_trust::save_trust_store(&store_path, &store)
-        .with_context(|| format!("isekai-ssh: failed to write trust store at {}", store_path.display()))?;
-
-    println!("Registered '{key}' in {}", store_path.display());
+    println!("Registered '{key}' in {}", path.display());
     Ok(())
+}
+
+/// Resolves the relay bearer token for `RelayLaunchSpec::relay_jwt`: either
+/// `--relay-jwt` verbatim, or (when `--relay-jwt-from-login` is set)
+/// `isekai-ssh login`'s saved token file via `isekai_auth::FileTokenProvider`
+/// (`ISEKAI_PIPE_DESIGN.md` §8 Epic F). `cli::InitArgs`'s `required_unless_present`/
+/// `conflicts_with` clap attributes already guarantee exactly one of the two
+/// was given, so the `None`/`None` and `Some`/`true` cases below are
+/// unreachable in practice — handled anyway rather than trusting that
+/// invariant blindly.
+fn resolve_relay_jwt(args: &InitArgs) -> Result<String> {
+    match (&args.relay_jwt, args.relay_jwt_from_login) {
+        (Some(jwt), false) => Ok(jwt.clone()),
+        (None, true) => isekai_auth::FileTokenProvider::from_default_path()
+            .and_then(|provider| provider.get_relay_jwt())
+            .context("isekai-ssh: failed to load a relay token from `isekai-ssh login` — run `isekai-ssh login` first"),
+        (Some(_), true) => Err(anyhow!("--relay-jwt and --relay-jwt-from-login are mutually exclusive")),
+        (None, false) => Err(anyhow!("one of --relay-jwt or --relay-jwt-from-login is required")),
+    }
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Loads `--helper-manifest`, builds a [`TrustedReleaseKeys`] registry from
+/// `--trusted-release-key`, and verifies `helper_binary` against it
+/// (`isekai-release-verify`, `ISEKAI_PIPE_DESIGN.md` §8 Epic D). Returns an
+/// error — never deploys — on any verification failure.
+fn verify_helper_manifest(args: &InitArgs, manifest_path: &std::path::Path, helper_binary: &[u8]) -> Result<()> {
+    let manifest_bytes = std::fs::read(manifest_path)
+        .with_context(|| format!("failed to read --helper-manifest at {}", manifest_path.display()))?;
+    let signed: SignedManifest = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("failed to parse --helper-manifest at {} as a signed release manifest", manifest_path.display()))?;
+
+    let mut keys = TrustedReleaseKeys::new();
+    for entry in &args.trusted_release_keys {
+        let (key_id, hex_pubkey) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid --trusted-release-key {entry:?}: expected KEY_ID=HEXPUBKEY"))?;
+        keys.insert_hex(key_id, hex_pubkey).with_context(|| format!("invalid --trusted-release-key for key_id {key_id:?}"))?;
+    }
+    if keys.is_empty() {
+        return Err(anyhow!("--helper-manifest was given but no --trusted-release-key was provided"));
+    }
+    let expect_platform = args.expect_platform.as_deref().ok_or_else(|| anyhow!("--expect-platform is required when --helper-manifest is given"))?;
+    let expect_architecture =
+        args.expect_architecture.as_deref().ok_or_else(|| anyhow!("--expect-architecture is required when --helper-manifest is given"))?;
+
+    verify_artifact(&signed, helper_binary, &keys, ExpectedTarget { platform: expect_platform, architecture: expect_architecture })
+        .map_err(|e| anyhow!("{e}"))?;
+    println!(
+        "Release manifest verified: version={} key_id={} channel={}",
+        signed.manifest.version, signed.manifest.key_id, signed.manifest.release_channel
+    );
+    Ok(())
 }
 
 /// Current UTC time formatted as RFC 3339 (`trusted_at`/`last_seen_at` are
@@ -259,5 +316,198 @@ mod tests {
     fn hex_sha256_matches_known_vector() {
         // sha256("") — a standard test vector.
         assert_eq!(hex_sha256(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    fn sample_init_args() -> InitArgs {
+        InitArgs {
+            host: "myhost".to_string(),
+            via: None,
+            helper_binary: std::path::PathBuf::from("/dev/null"),
+            relay_addr: "127.0.0.1:1".parse().unwrap(),
+            relay_sni: "relay.example.test".to_string(),
+            relay_jwt: Some("test-jwt".to_string()),
+            relay_jwt_from_login: false,
+            helper_version: "unknown".to_string(),
+            release_channel: None,
+            idle_lifetime: 2_592_000,
+            stun_servers: Vec::new(),
+            helper_manifest: None,
+            trusted_release_keys: Vec::new(),
+            expect_platform: None,
+            expect_architecture: None,
+        }
+    }
+
+    #[test]
+    fn resolve_relay_jwt_uses_the_explicit_flag_when_given() {
+        let mut args = sample_init_args();
+        args.relay_jwt = Some("explicit-token".to_string());
+        args.relay_jwt_from_login = false;
+        assert_eq!(resolve_relay_jwt(&args).unwrap(), "explicit-token");
+    }
+
+    #[test]
+    fn resolve_relay_jwt_sources_from_the_login_token_file() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("isekai-ssh-init-relay-jwt-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+
+        isekai_auth::FileTokenProvider::from_default_path().unwrap().save_relay_jwt("token-from-login").unwrap();
+
+        let mut args = sample_init_args();
+        args.relay_jwt = None;
+        args.relay_jwt_from_login = true;
+        assert_eq!(resolve_relay_jwt(&args).unwrap(), "token-from-login");
+
+        if let Some(old_home) = old_home {
+            std::env::set_var("HOME", old_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn resolve_relay_jwt_errors_when_login_requested_but_no_token_file_exists() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("isekai-ssh-init-relay-jwt-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+
+        let mut args = sample_init_args();
+        args.relay_jwt = None;
+        args.relay_jwt_from_login = true;
+        let err = resolve_relay_jwt(&args).unwrap_err();
+        assert!(err.to_string().contains("isekai-ssh login"), "{err}");
+
+        if let Some(old_home) = old_home {
+            std::env::set_var("HOME", old_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn resolve_relay_jwt_errors_when_neither_option_is_set() {
+        let mut args = sample_init_args();
+        args.relay_jwt = None;
+        args.relay_jwt_from_login = false;
+        assert!(resolve_relay_jwt(&args).is_err());
+    }
+
+    fn signed_manifest_for(binary: &[u8], signing_key: &ed25519_dalek::SigningKey) -> isekai_release_verify::SignedManifest {
+        isekai_release_verify::sign_manifest(
+            isekai_release_verify::ReleaseManifest {
+                version: "0.5.0".to_string(),
+                platform: "linux".to_string(),
+                architecture: "x86_64".to_string(),
+                artifact_filename: "isekai-pipe".to_string(),
+                size: binary.len() as u64,
+                sha256: hex_sha256(binary),
+                protocol_compat: "isekai-pipe/1".to_string(),
+                release_channel: "stable".to_string(),
+                key_id: "test-key".to_string(),
+            },
+            signing_key,
+        )
+    }
+
+    fn write_manifest(dir: &std::path::Path, signed: &isekai_release_verify::SignedManifest) -> std::path::PathBuf {
+        let path = dir.join("manifest.json");
+        std::fs::write(&path, serde_json::to_vec(signed).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn verify_helper_manifest_accepts_a_valid_matching_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = b"pretend-isekai-pipe-bytes".to_vec();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let signed = signed_manifest_for(&binary, &signing_key);
+        let manifest_path = write_manifest(tmp.path(), &signed);
+
+        let mut args = sample_init_args();
+        let pubkey_hex: String = signing_key.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        args.trusted_release_keys = vec![format!("test-key={pubkey_hex}")];
+        args.expect_platform = Some("linux".to_string());
+        args.expect_architecture = Some("x86_64".to_string());
+
+        assert!(verify_helper_manifest(&args, &manifest_path, &binary).is_ok());
+    }
+
+    #[test]
+    fn verify_helper_manifest_rejects_a_tampered_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = b"pretend-isekai-pipe-bytes".to_vec();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let signed = signed_manifest_for(&binary, &signing_key);
+        let manifest_path = write_manifest(tmp.path(), &signed);
+
+        let mut args = sample_init_args();
+        let pubkey_hex: String = signing_key.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        args.trusted_release_keys = vec![format!("test-key={pubkey_hex}")];
+        args.expect_platform = Some("linux".to_string());
+        args.expect_architecture = Some("x86_64".to_string());
+
+        let tampered = b"pretend-isekai-pipe-BYTES".to_vec();
+        assert!(verify_helper_manifest(&args, &manifest_path, &tampered).is_err());
+    }
+
+    #[test]
+    fn verify_helper_manifest_rejects_when_no_trusted_key_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = b"pretend-isekai-pipe-bytes".to_vec();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let signed = signed_manifest_for(&binary, &signing_key);
+        let manifest_path = write_manifest(tmp.path(), &signed);
+
+        let mut args = sample_init_args();
+        args.expect_platform = Some("linux".to_string());
+        args.expect_architecture = Some("x86_64".to_string());
+        // Deliberately no --trusted-release-key.
+
+        let err = verify_helper_manifest(&args, &manifest_path, &binary).unwrap_err();
+        assert!(err.to_string().contains("no --trusted-release-key"), "{err}");
+    }
+
+    #[test]
+    fn verify_helper_manifest_rejects_missing_expect_platform() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = b"pretend-isekai-pipe-bytes".to_vec();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let signed = signed_manifest_for(&binary, &signing_key);
+        let manifest_path = write_manifest(tmp.path(), &signed);
+
+        let mut args = sample_init_args();
+        let pubkey_hex: String = signing_key.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        args.trusted_release_keys = vec![format!("test-key={pubkey_hex}")];
+        args.expect_architecture = Some("x86_64".to_string());
+        // Deliberately no --expect-platform.
+
+        let err = verify_helper_manifest(&args, &manifest_path, &binary).unwrap_err();
+        assert!(err.to_string().contains("--expect-platform"), "{err}");
+    }
+
+    #[test]
+    fn verify_helper_manifest_rejects_a_signature_from_an_untrusted_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = b"pretend-isekai-pipe-bytes".to_vec();
+        let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let signed = signed_manifest_for(&binary, &attacker_key);
+        let manifest_path = write_manifest(tmp.path(), &signed);
+
+        let mut args = sample_init_args();
+        // Trust a *different* key under the same key_id the manifest uses.
+        let real_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey_hex: String = real_key.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        args.trusted_release_keys = vec![format!("test-key={pubkey_hex}")];
+        args.expect_platform = Some("linux".to_string());
+        args.expect_architecture = Some("x86_64".to_string());
+
+        assert!(verify_helper_manifest(&args, &manifest_path, &binary).is_err());
     }
 }

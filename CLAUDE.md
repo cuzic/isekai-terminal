@@ -23,8 +23,12 @@ Rust(UniFFI 経由)の `rust-core`(crate 名 `isekai-terminal-core`)からなる
     中継の実体。`serve`はmusl staticビルド(`scripts/build-isekai-pipe-musl.sh`)されて
     `isekai-terminal-core`に埋め込まれ、Android側のリモートブートストラップでも配布・起動される。
   - `isekai-ssh/`: `ssh(1)` の `ProxyCommand` に差し込む単体 CLI バイナリ。`isekai-terminal-core`とは独立
-    (`isekai-protocol`/`isekai-trust`/`isekai-auth`/`isekai-transport`/`isekai-bootstrap`から
-    構成)で、`isekai-pipe`経由のQUIC接続耐性をAndroidアプリ以外の`ssh`からも使えるようにする。
+    (`isekai-protocol`/`isekai-trust`/`isekai-auth`/`isekai-transport`/`isekai-bootstrap`/
+    `isekai-bootstrap-plan`/`isekai-release-verify`から構成)で、`isekai-pipe`経由のQUIC接続耐性を
+    Androidアプリ以外の`ssh`からも使えるようにする。`isekai-bootstrap-plan`はroute種別
+    (direct/STUN/relay)×hop構成(0/1/multi-hop)を横断するI/OなしのBootstrapPlan/BootstrapFailure
+    共通層(`ISEKAI_PIPE_DESIGN.md` §8 Epic A)。`isekai-release-verify`はed25519署名付き
+    releaseマニフェストの検証crate(`init --helper-manifest`のopt-inフック、§8 Epic D)。
     利用者向けガイドは`rust-core/isekai-ssh/README.md`、設計は`ISEKAI_PIPE_DESIGN.md`参照。
   - `uniffi-bindgen/`: Kotlin バインディング(`android/src/main/kotlin/uniffi/isekai_terminal_core/isekai_terminal_core.kt`)
     生成用。

@@ -7,15 +7,17 @@
 
 use std::collections::HashSet;
 use std::io::Write as _;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
-use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend};
+use isekai_auth::TokenProvider;
+use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
 use isekai_pipe_core::{
-    default_runtime_dir, write_connection_intent, BootstrapProvenance, ConnectionIntent,
-    IntentTransport, ServerIdentity, ServiceSpec, DEFAULT_CANDIDATE_RACE_DELAY_MS,
-    DEFAULT_RELAY_DELAY_MS,
+    default_profiles_dir, default_runtime_dir, load_persistent_profile, write_connection_intent,
+    write_persistent_profile, BootstrapProvenance, ConnectionIntent, IntentTransport, PersistentProfile,
+    ServiceSpec, DEFAULT_CANDIDATE_RACE_DELAY_MS, DEFAULT_RELAY_DELAY_MS,
 };
 use isekai_trust::{HelperTrust, UpdatePolicy};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -79,6 +81,7 @@ struct IsekaiConfig {
     candidate_race_delay_ms: u64,
     relay_delay_ms: u64,
     install_mode: InstallMode,
+    bootstrap_relay: Option<BootstrapRelayTarget>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +96,18 @@ struct BootstrapCandidate {
     target: String,
     via: Vec<String>,
     priority: u32,
+}
+
+/// `#@isekai bootstrap-relay addr=<SocketAddr> sni=<name>` (`ISEKAI_PIPE_DESIGN.md`
+/// §8 Epic H): opts auto-bootstrap into deploying via relay instead of
+/// `direct-by-bootstrap-host`. Deliberately a distinct directive/type from
+/// `relay_endpoints` (the `#@isekai relay <url>` connect-time fallback
+/// list) — `RelayLaunchSpec` needs an address+SNI pair atomically, which
+/// that list's bare-string shape can't express.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootstrapRelayTarget {
+    relay_addr: SocketAddr,
+    relay_sni: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,28 +211,27 @@ fn build_connection_intent(resolution: &WrapperResolution) -> Result<ConnectionI
             resolution.isekai.profile
         )
     })?;
-    let store_path = isekai_trust::default_trust_store_path()?;
-    let store = isekai_trust::load_trust_store(&store_path)?;
-    let entry = store.get(&key).ok_or_else(|| {
+    let profiles_dir = default_profiles_dir()?;
+    let profile = load_persistent_profile(&profiles_dir, &key)?.ok_or_else(|| {
         anyhow!(
             "isekai-ssh: {:?} is not a trusted host yet (looked up as {:?} in {})",
             resolution.isekai.profile,
             key,
-            store_path.display()
+            profiles_dir.display()
+        )
+    })?;
+    let transport = select_transport(&profile, &resolution.isekai.stun_servers).ok_or_else(|| {
+        anyhow!(
+            "isekai-ssh: profile {:?} has no cached relay transport (candidate-source profiles are not supported by the wrapper yet)",
+            key
         )
     })?;
 
     let mut intent = ConnectionIntent::new(
         resolution.isekai.profile.clone(),
         primary_service(&resolution.isekai).name().as_str(),
-        ServerIdentity {
-            cert_sha256_hex: entry.cached_cert_sha256.clone(),
-        },
-        IntentTransport::Relay {
-            helper_addr: entry.cached_relay_addr.clone(),
-            server_name: "isekai-helper".to_string(),
-            session_secret_b64: entry.cached_session_secret.clone(),
-        },
+        profile.server_identity.clone(),
+        transport,
         BootstrapProvenance::TrustStore { key },
     );
     intent.link_endpoints = resolution.isekai.link_endpoints.clone();
@@ -230,19 +244,57 @@ fn build_connection_intent(resolution: &WrapperResolution) -> Result<ConnectionI
     Ok(intent)
 }
 
-/// Deploys `isekai-helper` to the highest-priority bootstrap candidate in
-/// `direct-by-bootstrap-host` mode (no relay, no STUN — see this module's
-/// docs) and, after an explicit `[y/N]` confirmation, registers it in the
-/// trust store `build_connection_intent` reads from. Mirrors `init.rs`'s
+/// Chooses the primary transport for a trusted profile (`ISEKAI_PIPE_DESIGN.md`
+/// §8 Epic G). Prefers `IntentTransport::StunP2p` over the
+/// `direct-by-bootstrap-host`/relay-shaped `legacy_relay_transport` when all
+/// of the following hold — the same evidence `#20b`'s bootstrap-time STUN
+/// exchange already collects, just never previously consulted here:
+///
+/// - `#@isekai stun` resolved to at least one configured STUN server
+///   (`configured_stun_servers` non-empty) — an operator opt-in, not an
+///   always-on default.
+/// - the profile has a `cached_stun_observed_addr` — bootstrap actually got
+///   a `server-reflexive` candidate back from the deployed helper.
+///
+/// Deliberately does *not* race STUN against the direct/relay candidate —
+/// `ConnectionIntent` still has "one primary transport plus same-family
+/// fallback lists" shape, not an ordered cross-family candidate list, so
+/// honestly expressing "try STUN, then fall back to direct" as a single
+/// connection attempt isn't possible without a schema change. When STUN
+/// evidence exists, it's chosen outright; the wrapper does not retry via
+/// `legacy_relay_transport` if the STUN attempt itself later fails (a
+/// cross-family fallback/scheduler is a later Epic I integration step, not
+/// this one).
+fn select_transport(profile: &PersistentProfile, configured_stun_servers: &[String]) -> Option<IntentTransport> {
+    if let (Some(peer_addr), Some(stun_server), Some(legacy)) =
+        (&profile.cached_stun_observed_addr, configured_stun_servers.first(), &profile.legacy_relay_transport)
+    {
+        return Some(IntentTransport::StunP2p {
+            stun_server: stun_server.clone(),
+            peer_addr: peer_addr.clone(),
+            server_name: "isekai-helper".to_string(),
+            session_secret_b64: legacy.session_secret_b64.clone(),
+        });
+    }
+    profile.to_legacy_relay_transport()
+}
+
+/// Deploys `isekai-helper` to the highest-priority bootstrap candidate and,
+/// after an explicit `[y/N]` confirmation, registers it in the trust store
+/// `build_connection_intent` reads from. Mirrors `init.rs`'s
 /// deploy-then-confirm-then-register flow, but triggered automatically by
 /// `run()` on a trust-store miss instead of via the standalone `init`
 /// subcommand.
 ///
-/// Scoped deliberately narrow: only a single (or absent) `--via` hop is
-/// supported, and only the `direct-by-bootstrap-host` candidate — relay/STUN
-/// auto-bootstrap needs a JWT source that doesn't exist yet
-/// (`archive/ISEKAI_PIPE_MIGRATION.md` P4). A host that only has relay/STUN
-/// candidates, or a multi-hop `--via` chain, still needs `isekai-ssh init`.
+/// Launch mode is a fixed, evidence-gated choice, no racing (`ISEKAI_PIPE_DESIGN.md`
+/// §8 Epic H, matching Epic G's `select_transport` precedent for the same
+/// "`ConnectionIntent`/deploy step can't honestly express a multi-way race"
+/// reason): `#@isekai bootstrap-relay addr=... sni=...` present → always
+/// `LaunchSpec::Relay` (JWT sourced from `isekai-ssh login`'s saved token,
+/// fail closed if none — no `LaunchSpec::Direct` attempt at all); absent →
+/// `LaunchSpec::Direct` (`direct-by-bootstrap-host`, no relay, no STUN launch
+/// mode). Only a single (or absent) `--via` hop is supported either way — a
+/// multi-hop `--via` chain still needs `isekai-ssh init`.
 async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution) -> Result<()> {
     let helper_binary_path = plan.isekai.helper_binary.as_ref().ok_or_else(|| {
         anyhow!(
@@ -293,26 +345,71 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
         .with_context(|| format!("failed to read helper binary at {}", helper_binary_path.display()))?;
     let helper_sha256 = hex_sha256(&helper_binary);
 
+    // `#@isekai stun` directives are collected as plain strings without
+    // socket-address validation (`resolve_isekai_config`'s `append_args`
+    // just accumulates whatever text follows the directive) — a malformed
+    // entry is skipped with a warning here rather than failing the whole
+    // auto-bootstrap over one bad directive (`#20b`).
+    let stun_servers: Vec<SocketAddr> = resolution
+        .isekai
+        .stun_servers
+        .iter()
+        .filter_map(|entry| match entry.parse::<SocketAddr>() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                eprintln!("isekai-ssh: ignoring malformed #@isekai stun entry {entry:?}: {e}");
+                None
+            }
+        })
+        .collect();
+
+    let launch = match &resolution.isekai.bootstrap_relay {
+        Some(relay_target) => {
+            let relay_jwt = isekai_auth::FileTokenProvider::from_default_path()
+                .and_then(|provider| provider.get_relay_jwt())
+                .context("failed to load a relay token from `isekai-ssh login` — run `isekai-ssh login` first")?;
+            LaunchSpec::Relay(RelayLaunchSpec {
+                relay_addr: relay_target.relay_addr,
+                relay_sni: relay_target.relay_sni.clone(),
+                relay_jwt,
+                idle_lifetime_secs: DEFAULT_IDLE_LIFETIME_SECS,
+            })
+        }
+        None => LaunchSpec::Direct { idle_lifetime_secs: DEFAULT_IDLE_LIFETIME_SECS },
+    };
+
     eprintln!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
     let backend = OpenSshBackend::new();
     let report = backend
-        .install_and_start(
-            &target,
-            via.as_ref(),
-            &helper_binary,
-            &LaunchSpec::Direct { idle_lifetime_secs: DEFAULT_IDLE_LIFETIME_SECS },
-            resolution.isekai.remote_path.as_deref(),
-        )
+        .install_and_start(&target, via.as_ref(), &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
         .await
         .with_context(|| format!("failed to deploy/start isekai-helper on {:?}", candidate.target))?;
     let handshake = &report.handshake;
-    let direct_port = handshake
-        .direct_by_bootstrap_host_port()
-        .ok_or_else(|| anyhow!("isekai-helper did not advertise a direct-by-bootstrap-host candidate"))?;
     let identity = handshake.cert_sha256().to_string();
+
+    // Direct launch: dial the same bootstrap host at the port the helper
+    // reports (`direct-by-bootstrap-host`). Relay launch: dial the relay's
+    // own public address, falling back to the configured `relay_addr` if
+    // the handshake didn't report one (mirrors `init.rs`'s identical
+    // fallback for the same reason — a test double that never populated
+    // the field; a real deployment's `--relay` tunnel always sets it).
+    let cached_relay_addr = match &resolution.isekai.bootstrap_relay {
+        Some(relay_target) => {
+            handshake.relay_public_addr().map(str::to_string).unwrap_or_else(|| relay_target.relay_addr.to_string())
+        }
+        None => {
+            let direct_port = handshake
+                .direct_by_bootstrap_host_port()
+                .ok_or_else(|| anyhow!("isekai-helper did not advertise a direct-by-bootstrap-host candidate"))?;
+            format!("{host}:{direct_port}")
+        }
+    };
 
     eprintln!();
     eprintln!("Host:            {}", candidate.target);
+    if let Some(relay_target) = &resolution.isekai.bootstrap_relay {
+        eprintln!("Relay:           {}", relay_target.relay_addr);
+    }
     eprintln!("Helper identity: {identity}");
     eprintln!("Binary sha256:   {helper_sha256}");
     eprintln!();
@@ -332,32 +429,29 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
         return Err(anyhow!("aborted — user declined the trust confirmation"));
     }
 
-    let store_path = isekai_trust::default_trust_store_path()
-        .context("could not determine the trust store path (is $HOME set?)")?;
-    let mut store = isekai_trust::load_trust_store(&store_path)
-        .with_context(|| format!("failed to load trust store at {}", store_path.display()))?;
+    let profiles_dir =
+        default_profiles_dir().context("could not determine the profiles directory (is $HOME set?)")?;
     let key = isekai_trust::normalize_host_port(&resolution.isekai.profile)
         .with_context(|| format!("invalid profile {:?}", resolution.isekai.profile))?;
     let now = now_rfc3339();
-    store.insert(
-        key.clone(),
-        HelperTrust {
-            identity_pubkey: identity.clone(),
-            trusted_helper_sha256: helper_sha256,
-            trusted_helper_version: "unknown".to_string(),
-            update_policy: UpdatePolicy::ExactDigestOnly,
-            release_channel: None,
-            last_via: candidate.via.first().cloned(),
-            trusted_at: now.clone(),
-            last_seen_at: now,
-            cached_relay_addr: format!("{host}:{direct_port}"),
-            cached_cert_sha256: identity,
-            cached_session_secret: handshake.session_secret.clone(),
-        },
-    );
-    isekai_trust::save_trust_store(&store_path, &store)
-        .with_context(|| format!("failed to write trust store at {}", store_path.display()))?;
-    eprintln!("Registered {key:?} in {}", store_path.display());
+    let trust = HelperTrust {
+        identity_pubkey: identity.clone(),
+        trusted_helper_sha256: helper_sha256,
+        trusted_helper_version: "unknown".to_string(),
+        update_policy: UpdatePolicy::ExactDigestOnly,
+        release_channel: None,
+        last_via: candidate.via.first().cloned(),
+        trusted_at: now.clone(),
+        last_seen_at: now,
+        cached_relay_addr,
+        cached_cert_sha256: identity,
+        cached_session_secret: handshake.session_secret.clone(),
+        cached_stun_observed_addr: handshake.stun_observed_addr().map(str::to_string),
+    };
+    let profile = PersistentProfile::migrate_legacy_helper_trust(&key, &trust);
+    let path = write_persistent_profile(&profiles_dir, &profile)
+        .with_context(|| format!("failed to write profile to {}", profiles_dir.display()))?;
+    eprintln!("Registered {key:?} in {}", path.display());
     Ok(())
 }
 
@@ -561,6 +655,7 @@ fn resolve_isekai_config(
         candidate_race_delay_ms: None,
         relay_delay_ms: None,
         install_mode: None,
+        bootstrap_relay: None,
     };
     for directive in directives {
         apply_isekai_directive(&mut builder, directive)?;
@@ -612,6 +707,7 @@ fn resolve_isekai_config(
             .unwrap_or(DEFAULT_CANDIDATE_RACE_DELAY_MS),
         relay_delay_ms: builder.relay_delay_ms.unwrap_or(DEFAULT_RELAY_DELAY_MS),
         install_mode: builder.install_mode.unwrap_or(InstallMode::User),
+        bootstrap_relay: builder.bootstrap_relay,
     })
 }
 
@@ -627,6 +723,7 @@ struct IsekaiConfigBuilder {
     rendezvous: Vec<String>,
     stun_servers: Vec<String>,
     relay_endpoints: Vec<String>,
+    bootstrap_relay: Option<BootstrapRelayTarget>,
     resume_grace_secs: Option<u64>,
     candidate_race_delay_ms: Option<u64>,
     relay_delay_ms: Option<u64>,
@@ -707,6 +804,11 @@ fn apply_isekai_directive(
             &mut builder.relay_delay_ms,
             parse_duration_ms(one_arg(&directive)?, "relay-delay")?,
             "relay-delay",
+        ),
+        "bootstrap-relay" => set_once(
+            &mut builder.bootstrap_relay,
+            parse_bootstrap_relay(&directive.args)?,
+            "bootstrap-relay",
         ),
         "install-mode" => set_once(
             &mut builder.install_mode,
@@ -808,6 +910,34 @@ fn parse_bootstrap_candidate(args: &[String]) -> Result<BootstrapCandidate> {
             .ok_or_else(|| anyhow!("isekai-ssh: bootstrap-candidate requires target=..."))?,
         via,
         priority,
+    })
+}
+
+fn parse_bootstrap_relay(args: &[String]) -> Result<BootstrapRelayTarget> {
+    let mut relay_addr = None;
+    let mut relay_sni = None;
+    for arg in args {
+        let Some((key, value)) = arg.split_once('=') else {
+            return Err(anyhow!("isekai-ssh: bootstrap-relay argument must be key=value: {arg:?}"));
+        };
+        match key {
+            "addr" => {
+                relay_addr = Some(
+                    value.parse::<SocketAddr>().map_err(|e| anyhow!("isekai-ssh: invalid bootstrap-relay addr {value:?}: {e}"))?,
+                )
+            }
+            "sni" => {
+                if value.is_empty() {
+                    return Err(anyhow!("isekai-ssh: bootstrap-relay sni must not be empty"));
+                }
+                relay_sni = Some(value.to_string())
+            }
+            _ => return Err(anyhow!("isekai-ssh: unknown bootstrap-relay key {key:?}")),
+        }
+    }
+    Ok(BootstrapRelayTarget {
+        relay_addr: relay_addr.ok_or_else(|| anyhow!("isekai-ssh: bootstrap-relay requires addr=..."))?,
+        relay_sni: relay_sni.ok_or_else(|| anyhow!("isekai-ssh: bootstrap-relay requires sni=..."))?,
     })
 }
 
@@ -1170,37 +1300,33 @@ mod tests {
     }
 
     #[test]
-    fn builds_connection_intent_from_trust_store() {
+    fn builds_connection_intent_from_persistent_profile() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home =
             std::env::temp_dir().join(format!("isekai-ssh-wrapper-intent-{}", std::process::id()));
-        let config = home.join(".config").join("isekai-ssh");
-        std::fs::create_dir_all(&config).unwrap();
-        let trust = r#"
-[helpers."production:22"]
-identity_pubkey = "pk"
-trusted_helper_sha256 = "sha"
-trusted_helper_version = "0.1.0"
-update_policy = "exact-digest-only"
-trusted_at = "2026-07-04T00:00:00Z"
-last_seen_at = "2026-07-04T00:00:00Z"
-cached_relay_addr = "127.0.0.1:1234"
-cached_cert_sha256 = "ab"
-cached_session_secret = "c2VjcmV0"
-
-[helpers."distinctive:22"]
-identity_pubkey = "pk"
-trusted_helper_sha256 = "sha"
-trusted_helper_version = "0.1.0"
-update_policy = "exact-digest-only"
-trusted_at = "2026-07-04T00:00:00Z"
-last_seen_at = "2026-07-04T00:00:00Z"
-cached_relay_addr = "127.0.0.1:1234"
-cached_cert_sha256 = "ab"
-cached_session_secret = "c2VjcmV0"
-"#;
-        std::fs::write(config.join("known_helpers.toml"), trust).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
         let old_home = std::env::var_os("HOME");
         std::env::set_var("HOME", &home);
+
+        let sample_trust = || HelperTrust {
+            identity_pubkey: "pk".to_string(),
+            trusted_helper_sha256: "sha".to_string(),
+            trusted_helper_version: "0.1.0".to_string(),
+            update_policy: UpdatePolicy::ExactDigestOnly,
+            release_channel: None,
+            last_via: None,
+            trusted_at: "2026-07-04T00:00:00Z".to_string(),
+            last_seen_at: "2026-07-04T00:00:00Z".to_string(),
+            cached_relay_addr: "127.0.0.1:1234".to_string(),
+            cached_cert_sha256: "ab".to_string(),
+            cached_session_secret: "c2VjcmV0".to_string(),
+            cached_stun_observed_addr: None,
+        };
+        let profiles_dir = default_profiles_dir().unwrap();
+        for key in ["production:22", "distinctive:22"] {
+            let profile = PersistentProfile::migrate_legacy_helper_trust(key, &sample_trust());
+            write_persistent_profile(&profiles_dir, &profile).unwrap();
+        }
 
         let resolution = WrapperResolution {
             openssh: OpenSshEffectiveConfig::default(),
@@ -1219,6 +1345,7 @@ cached_session_secret = "c2VjcmV0"
                 candidate_race_delay_ms: 150,
                 relay_delay_ms: 750,
                 install_mode: InstallMode::User,
+                bootstrap_relay: None,
             },
         };
         let intent = build_connection_intent(&resolution).unwrap();
@@ -1321,6 +1448,133 @@ cached_session_secret = "c2VjcmV0"
         let _ = std::fs::remove_dir_all(home);
     }
 
+    fn sample_trust_with_stun_observed(stun_observed: Option<&str>) -> HelperTrust {
+        HelperTrust {
+            identity_pubkey: "pk".to_string(),
+            trusted_helper_sha256: "sha".to_string(),
+            trusted_helper_version: "0.1.0".to_string(),
+            update_policy: UpdatePolicy::ExactDigestOnly,
+            release_channel: None,
+            last_via: None,
+            trusted_at: "2026-07-04T00:00:00Z".to_string(),
+            last_seen_at: "2026-07-04T00:00:00Z".to_string(),
+            cached_relay_addr: "127.0.0.1:1234".to_string(),
+            cached_cert_sha256: "ab".to_string(),
+            cached_session_secret: "c2VjcmV0".to_string(),
+            cached_stun_observed_addr: stun_observed.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn select_transport_prefers_stun_p2p_when_evidence_and_config_both_exist() {
+        let trust = sample_trust_with_stun_observed(Some("198.51.100.7:45231"));
+        let profile = PersistentProfile::migrate_legacy_helper_trust("stun-host:22", &trust);
+        let stun_servers = vec!["stun1.example.com:3478".to_string(), "stun2.example.com:3478".to_string()];
+
+        let transport = select_transport(&profile, &stun_servers).unwrap();
+
+        assert_eq!(
+            transport,
+            IntentTransport::StunP2p {
+                stun_server: "stun1.example.com:3478".to_string(),
+                peer_addr: "198.51.100.7:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn select_transport_falls_back_to_direct_relay_shape_without_stun_evidence() {
+        let trust = sample_trust_with_stun_observed(None);
+        let profile = PersistentProfile::migrate_legacy_helper_trust("no-stun-host:22", &trust);
+        let stun_servers = vec!["stun1.example.com:3478".to_string()];
+
+        let transport = select_transport(&profile, &stun_servers).unwrap();
+
+        assert_eq!(
+            transport,
+            IntentTransport::Relay {
+                helper_addr: "127.0.0.1:1234".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn select_transport_falls_back_to_direct_when_stun_not_configured_even_with_evidence() {
+        // Bootstrap-time STUN candidate exchange happened at some point in
+        // the past (evidence is cached), but the operator hasn't opted in
+        // via `#@isekai stun` for *this* connection attempt — must not use
+        // STUN unasked.
+        let trust = sample_trust_with_stun_observed(Some("198.51.100.7:45231"));
+        let profile = PersistentProfile::migrate_legacy_helper_trust("stun-host:22", &trust);
+
+        let transport = select_transport(&profile, &[]).unwrap();
+
+        assert_eq!(
+            transport,
+            IntentTransport::Relay {
+                helper_addr: "127.0.0.1:1234".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_connection_intent_selects_stun_p2p_when_profile_has_observed_address() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("isekai-ssh-wrapper-stun-intent-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+
+        let trust = sample_trust_with_stun_observed(Some("198.51.100.7:45231"));
+        let profile = PersistentProfile::migrate_legacy_helper_trust("stun-host:22", &trust);
+        write_persistent_profile(&default_profiles_dir().unwrap(), &profile).unwrap();
+
+        let resolution = WrapperResolution {
+            openssh: OpenSshEffectiveConfig::default(),
+            isekai: IsekaiConfig {
+                enabled: true,
+                bootstrap_policy: BootstrapPolicy::Auto,
+                profile: "stun-host".to_string(),
+                remote_path: None,
+                services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
+                bootstrap_candidates: Vec::new(),
+                link_endpoints: Vec::new(),
+                rendezvous: Vec::new(),
+                stun_servers: vec!["stun1.example.com:3478".to_string()],
+                relay_endpoints: Vec::new(),
+                resume_grace_secs: 120,
+                candidate_race_delay_ms: 150,
+                relay_delay_ms: 750,
+                install_mode: InstallMode::User,
+                bootstrap_relay: None,
+            },
+        };
+
+        let intent = build_connection_intent(&resolution).unwrap();
+        assert_eq!(
+            intent.transport,
+            IntentTransport::StunP2p {
+                stun_server: "stun1.example.com:3478".to_string(),
+                peer_addr: "198.51.100.7:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            }
+        );
+
+        if let Some(old_home) = old_home {
+            std::env::set_var("HOME", old_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     #[test]
     fn parses_ssh_g_output() {
         let config = parse_ssh_g_output(
@@ -1350,6 +1604,7 @@ Host production
     #@isekai rendezvous https://rendezvous.example.com
     #@isekai stun stun1.example.com:3478
     #@isekai relay masque://relay.example.com
+    #@isekai bootstrap-relay addr=203.0.113.10:443 sni=relay.example.com
     #@isekai resume-grace 180s
     #@isekai candidate-race-delay 250ms
     #@isekai relay-delay 900ms
@@ -1389,10 +1644,45 @@ Host *
         assert_eq!(resolved.rendezvous, vec!["https://rendezvous.example.com"]);
         assert_eq!(resolved.stun_servers, vec!["stun1.example.com:3478"]);
         assert_eq!(resolved.relay_endpoints, vec!["masque://relay.example.com"]);
+        assert_eq!(
+            resolved.bootstrap_relay,
+            Some(BootstrapRelayTarget { relay_addr: "203.0.113.10:443".parse().unwrap(), relay_sni: "relay.example.com".to_string() })
+        );
         assert_eq!(resolved.resume_grace_secs, 180);
         assert_eq!(resolved.candidate_race_delay_ms, 250);
         assert_eq!(resolved.relay_delay_ms, 900);
         assert_eq!(resolved.install_mode, InstallMode::User);
+    }
+
+    #[test]
+    fn parse_bootstrap_relay_accepts_addr_and_sni() {
+        let target = parse_bootstrap_relay(&s(&["addr=203.0.113.10:443", "sni=relay.example.com"])).unwrap();
+        assert_eq!(target, BootstrapRelayTarget { relay_addr: "203.0.113.10:443".parse().unwrap(), relay_sni: "relay.example.com".to_string() });
+    }
+
+    #[test]
+    fn parse_bootstrap_relay_rejects_missing_addr() {
+        assert!(parse_bootstrap_relay(&s(&["sni=relay.example.com"])).is_err());
+    }
+
+    #[test]
+    fn parse_bootstrap_relay_rejects_missing_sni() {
+        assert!(parse_bootstrap_relay(&s(&["addr=203.0.113.10:443"])).is_err());
+    }
+
+    #[test]
+    fn parse_bootstrap_relay_rejects_invalid_addr() {
+        assert!(parse_bootstrap_relay(&s(&["addr=not-an-addr", "sni=relay.example.com"])).is_err());
+    }
+
+    #[test]
+    fn parse_bootstrap_relay_rejects_empty_sni() {
+        assert!(parse_bootstrap_relay(&s(&["addr=203.0.113.10:443", "sni="])).is_err());
+    }
+
+    #[test]
+    fn parse_bootstrap_relay_rejects_unknown_key() {
+        assert!(parse_bootstrap_relay(&s(&["addr=203.0.113.10:443", "sni=relay.example.com", "jwt=abc"])).is_err());
     }
 
     #[test]

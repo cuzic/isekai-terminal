@@ -258,6 +258,14 @@ impl Drop for HelperProcess {
 /// left running" — see this file's module docs for why `init`'s own deploy
 /// step can't drive this through a live `--relay` handshake.
 fn spawn_helper(target_addr: SocketAddr) -> HelperProcess {
+    spawn_helper_with_args(target_addr, &[])
+}
+
+/// Like `spawn_helper`, but forwards `extra_args` to the real `isekai-pipe
+/// serve` process (`#20b`: used to pass `--stun-server` so the real
+/// handshake this test's stand-in script relays back genuinely carries a
+/// `server-reflexive` candidate).
+fn spawn_helper_with_args(target_addr: SocketAddr, extra_args: &[&str]) -> HelperProcess {
     let mut cmd = std::process::Command::new(isekai_pipe_bin_path());
     cmd.arg("serve")
         .arg("--target")
@@ -266,6 +274,7 @@ fn spawn_helper(target_addr: SocketAddr) -> HelperProcess {
         .arg("127.0.0.1:0")
         .arg("--log-level")
         .arg("debug")
+        .args(extra_args)
         .stdout(StdStdio::piped())
         .stderr(StdStdio::piped());
 
@@ -369,15 +378,27 @@ fn shim_ssh_with_bootstrap_config(
     (bin_dir, path_env)
 }
 
-fn trust_store_path_under(home: &std::path::Path) -> PathBuf {
-    home.join(".config").join(isekai_trust::store::CONFIG_DIR_NAME).join(isekai_trust::store::TRUST_STORE_FILE_NAME)
+fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
+    home.join(".local").join("state").join("isekai").join("profiles")
+}
+
+fn profile_path_under(home: &std::path::Path, key: &str) -> PathBuf {
+    profiles_dir_under(home).join(format!("{key}.json"))
 }
 
 /// Builds the stand-in "isekai-helper" script `init --helper-binary` is
-/// pointed at: ignores every argument (including the `--relay-*` flags
-/// `OpenSshBackend` always passes) and echoes `real_helper`'s actual
-/// handshake JSON, with `relay_public_addr` set to that real process's own
-/// listen address — see this file's module docs.
+/// pointed at: ignores every argument (including the `--relay-*` flags and
+/// `--bootstrap-request-file` `OpenSshBackend` always passes) and echoes
+/// `real_helper`'s actual handshake JSON, with `relay_public_addr` set to
+/// that real process's own listen address — see this file's module docs.
+///
+/// `#20a-4`: `OpenSshBackend::launch_and_capture_handshake` now always
+/// decodes stdout as a `BootstrapReportV2` envelope (every real launch sends
+/// a `BootstrapRequestV2`, so a compliant `isekai-pipe serve` always echoes
+/// one back) — so this stand-in must wrap the handshake the same way, with
+/// arbitrary valid `session_id`/`bootstrap_attempt_id` since this test
+/// doesn't correlate them against the request the real `OpenSshBackend`
+/// sent.
 fn stand_in_helper_script(real_helper_addr: SocketAddr, real_handshake: &HandshakeJson) -> Vec<u8> {
     let mut handshake = real_handshake.clone();
     handshake
@@ -389,7 +410,13 @@ fn stand_in_helper_script(real_helper_addr: SocketAddr, real_handshake: &Handsha
         port: None,
         source: Some("isekai-link-relay".to_string()),
     });
-    let json_line = serde_json::to_string(&handshake).unwrap();
+    let report = serde_json::json!({
+        "v": isekai_protocol::BOOTSTRAP_PROTOCOL_V2,
+        "session_id": "77".repeat(16),
+        "bootstrap_attempt_id": "88".repeat(16),
+        "handshake": handshake,
+    });
+    let json_line = serde_json::to_string(&report).unwrap();
     format!("#!/bin/sh\necho '{json_line}'\n").into_bytes()
 }
 
@@ -472,14 +499,16 @@ async fn init_then_connect_succeeds_for_a_freshly_deployed_host() {
     assert!(stdout.contains(&real_helper.handshake.cert_sha256()), "expected cert_sha256 to appear in init output: {stdout}");
     assert!(stdout.contains("Registered"), "expected a confirmation of trust-store registration: {stdout}");
 
-    let trust_store_path = trust_store_path_under(&home);
-    assert!(trust_store_path.exists(), "expected trust store to be written at {trust_store_path:?}");
-    let store = isekai_trust::load_trust_store(&trust_store_path).unwrap();
-    let entry = store.get("dummy-host:22").expect("expected a trust entry for dummy-host:22");
-    assert_eq!(entry.cached_relay_addr, real_helper_addr.to_string());
-    assert_eq!(entry.cached_cert_sha256, real_helper.handshake.cert_sha256());
-    assert_eq!(entry.cached_session_secret, real_helper.handshake.session_secret);
-    assert_eq!(entry.update_policy, isekai_trust::UpdatePolicy::ExactDigestOnly);
+    let profile_path = profile_path_under(&home, "dummy-host:22");
+    assert!(profile_path.exists(), "expected profile to be written at {profile_path:?}");
+    let profile = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), "dummy-host:22")
+        .unwrap()
+        .expect("expected a profile for dummy-host:22");
+    let legacy_relay = profile.legacy_relay_transport.as_ref().expect("expected a cached relay transport");
+    assert_eq!(legacy_relay.helper_addr, real_helper_addr.to_string());
+    assert_eq!(profile.server_identity.cert_sha256_hex, real_helper.handshake.cert_sha256());
+    assert_eq!(legacy_relay.session_secret_b64, real_helper.handshake.session_secret);
+    assert_eq!(profile.update_policy, isekai_trust::UpdatePolicy::ExactDigestOnly);
 
     // Second half: `isekai-pipe connect` drives a real SSH login through the
     // real isekai-helper process using exactly the trust store entry `init`
@@ -526,6 +555,125 @@ async fn init_then_connect_succeeds_for_a_freshly_deployed_host() {
     assert!(stdout.contains("hello-from-init-then-connect"), "unexpected ssh stdout: {stdout:?}");
 }
 
+/// Minimal mock STUN server (RFC 5389 Binding Request/Response), same shape
+/// used throughout this workspace.
+fn spawn_mock_stun_server() -> SocketAddr {
+    let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((n, from)) = server.recv_from(&mut buf) else { break };
+            if n < 20 {
+                continue;
+            }
+            let transaction_id = &buf[8..20];
+            let SocketAddr::V4(from_v4) = from else { continue };
+
+            let magic_cookie: u32 = 0x2112_A442;
+            let xport = from_v4.port() ^ ((magic_cookie >> 16) as u16);
+            let xaddr = u32::from(*from_v4.ip()) ^ magic_cookie;
+
+            let mut resp = Vec::with_capacity(32);
+            resp.extend_from_slice(&0x0101u16.to_be_bytes());
+            resp.extend_from_slice(&12u16.to_be_bytes());
+            resp.extend_from_slice(&magic_cookie.to_be_bytes());
+            resp.extend_from_slice(transaction_id);
+            resp.extend_from_slice(&0x0020u16.to_be_bytes());
+            resp.extend_from_slice(&8u16.to_be_bytes());
+            resp.push(0);
+            resp.push(0x01);
+            resp.extend_from_slice(&xport.to_be_bytes());
+            resp.extend_from_slice(&xaddr.to_be_bytes());
+
+            let _ = server.send_to(&resp, from);
+        }
+    });
+    addr
+}
+
+/// `#20b`: `isekai-ssh init --stun-server <addr>` must (a) actually pass the
+/// STUN server through the whole bootstrap pipeline down to the real
+/// `isekai-pipe serve` process (which then reports a real `server-reflexive`
+/// candidate in its handshake) and (b) capture that candidate's endpoint
+/// into `HelperTrust.cached_stun_observed_addr`.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_with_stun_server_saves_the_observed_address_to_the_trust_store() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1)/ssh-keygen(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let remote_home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&remote_home).unwrap();
+
+    let mock_sshd_addr = spawn_fake_ssh_server(remote_home, client_pubkey).await;
+    let stun_server = spawn_mock_stun_server();
+
+    // A *real* `isekai-pipe serve` process launched with `--stun-server`, so
+    // its own handshake genuinely carries a `server-reflexive` candidate —
+    // `stand_in_helper_script` below relays this handshake through
+    // untouched (aside from re-pointing the `relayed` candidate), so
+    // whatever `init` receives is exactly what a real deployment would see.
+    let real_helper = spawn_helper_with_args(mock_sshd_addr, &["--stun-server", &stun_server.to_string()]);
+    assert!(
+        real_helper.handshake.stun_observed_addr().is_some(),
+        "the real isekai-pipe serve process should have reported its own STUN-observed address"
+    );
+    let real_helper_addr: SocketAddr =
+        format!("127.0.0.1:{}", real_helper.handshake.direct_by_bootstrap_host_port().unwrap()).parse().unwrap();
+
+    let home = tmp.path().join("client-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let (_bin_dir, path_env) = shim_ssh_with_bootstrap_config(tmp.path(), "stun-host", mock_sshd_addr, &key_path);
+
+    let helper_script = stand_in_helper_script(real_helper_addr, &real_helper.handshake);
+    let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
+    std::fs::write(&helper_script_path, &helper_script).unwrap();
+
+    let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .arg("init")
+        .arg("stun-host")
+        .arg("--helper-binary")
+        .arg(&helper_script_path)
+        .arg("--relay-addr")
+        .arg("127.0.0.1:1")
+        .arg("--relay-sni")
+        .arg("relay.isekai-ssh.test")
+        .arg("--relay-jwt")
+        .arg("test-jwt-token")
+        .arg("--stun-server")
+        .arg(stun_server.to_string())
+        .env("HOME", &home)
+        .env("PATH", &path_env)
+        .env_remove("RUST_LOG")
+        .stdin(StdStdio::piped())
+        .stdout(StdStdio::piped())
+        .stderr(StdStdio::piped())
+        .spawn()
+        .expect("failed to spawn isekai-ssh init");
+    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        .await
+        .expect("isekai-ssh init should not hang")
+        .expect("failed to wait for isekai-ssh init");
+
+    eprintln!("init stdout:\n{}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("init stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "isekai-ssh init failed: {output:?}");
+
+    let profile = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), "stun-host:22")
+        .unwrap()
+        .expect("expected a profile for stun-host:22");
+    assert_eq!(
+        profile.cached_stun_observed_addr.as_deref(),
+        real_helper.handshake.stun_observed_addr(),
+        "cached_stun_observed_addr should match the real helper's own server-reflexive candidate"
+    );
+}
+
 /// Declining the `[y/N]` prompt must leave the trust store untouched.
 #[tokio::test(flavor = "multi_thread")]
 async fn init_writes_nothing_when_confirmation_is_declined() {
@@ -551,8 +699,8 @@ async fn init_writes_nothing_when_confirmation_is_declined() {
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
     std::fs::write(&helper_script_path, &helper_script).unwrap();
 
-    let trust_store_path = trust_store_path_under(&home);
-    assert!(!trust_store_path.exists(), "trust store must not exist before this test runs");
+    let profile_path = profile_path_under(&home, "dummy-host:22");
+    assert!(!profile_path.exists(), "profile must not exist before this test runs");
 
     let output = spawn_init(&home, "dummy-host", &helper_script_path, &path_env, "n\n").await;
     eprintln!("init stdout:\n{}", String::from_utf8_lossy(&output.stdout));
@@ -563,7 +711,7 @@ async fn init_writes_nothing_when_confirmation_is_declined() {
     assert!(stdout.contains("Aborted"), "expected an explicit abort message: {stdout}");
 
     assert!(
-        !trust_store_path.exists(),
-        "declining the confirmation must not create a trust store file at {trust_store_path:?}"
+        !profile_path.exists(),
+        "declining the confirmation must not create a profile file at {profile_path:?}"
     );
 }
