@@ -126,9 +126,152 @@ pub fn validate_remote_path(path: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// The directory `mkdir -p` should create for `path` (a full remote binary
+/// path, e.g. `~/.local/bin/isekai-pipe` -> `~/.local/bin`). Falls back to
+/// `.` for a bare filename with no directory component (harmless: `mkdir -p
+/// .` always succeeds) and to `/` for a path directly under the filesystem
+/// root. Shared by both bootstrap implementations so `upload_binary_command`
+/// callers derive the same directory the same way.
+pub fn remote_parent_dir(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((dir, _)) if !dir.is_empty() => dir,
+        Some(_) => "/",
+        None => ".",
+    }
+}
+
+/// Builds the remote shell command that uploads a base64-encoded binary
+/// (fed via the exec channel's stdin) to `remote_binary_path`: create the
+/// parent directory, decode into a `.tmp` sibling, `chmod 0700`, then
+/// atomically `mv` it into place (`archive/HELPER_PROTOCOL.md`'s "Bootstrap
+/// file permissions" contract — 0700, never a partially-written executable
+/// visible at the final path). Identical between
+/// `rust-core/src/helper_bootstrap.rs` (Android) and
+/// `isekai-bootstrap::openssh` (CLI) — only the exec transport (russh
+/// channel vs. `ssh(1)` subprocess) differs, not this command string.
+///
+/// `remote_binary_path`/`remote_dir` are interpolated unquoted (so a leading
+/// `~` still expands via the remote shell) — the caller must validate any
+/// externally-supplied path with [`validate_remote_path`] first, exactly
+/// like `isekai-bootstrap::openssh` already does; a crate's own trusted
+/// constant (e.g. `ISEKAI_PIPE_INSTALL_DIR`/`ISEKAI_PIPE_BIN_NAME`) needs no
+/// such validation.
+pub fn upload_binary_command(remote_binary_path: &str, remote_dir: &str) -> String {
+    format!(
+        "umask 077 && mkdir -p {remote_dir} && \
+         base64 -d > {remote_binary_path}.tmp && \
+         chmod 0700 {remote_binary_path}.tmp && \
+         mv {remote_binary_path}.tmp {remote_binary_path}"
+    )
+}
+
+/// Outcome of [`classify_launch_failure`]: what kind of `--bind` failure (if
+/// any) explains why `isekai-pipe serve` wrote no handshake before exiting.
+/// Deliberately crate-neutral rather than either bootstrap implementation's
+/// own error enum — `rust-core/src/helper_bootstrap.rs`'s `BootstrapError`
+/// and `isekai-bootstrap::error::BootstrapError` have different variant
+/// sets, so each caller maps this into its own type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchFailureClass {
+    BindPortInUse,
+    BindPermissionDenied,
+    BindAddressUnavailable,
+    Unknown,
+}
+
+/// Classifies a captured stderr log (`isekai-pipe serve`'s stderr, retrieved
+/// when it wrote no handshake before exiting) into a known `--bind` failure
+/// reason, so the caller can surface something more actionable than a bare
+/// timeout. `bind_port_requested` should be `false` when the launch didn't
+/// request a fixed `--bind` port at all (an ephemeral-port launch failing
+/// for some unrelated reason must never be misclassified as a bind failure).
+///
+/// `isekai-helper`/`isekai-pipe` is always distributed as a musl static
+/// binary (`build-isekai-pipe-musl.sh`). musl libc's `strerror()` wording
+/// differs from glibc's — `EADDRINUSE` is "Address already in use" on glibc
+/// but "Address in use" (no "already") on musl — confirmed against the
+/// actual musl-built binary in a real E2E test; a pattern written against a
+/// glibc dev machine's wording alone never matched the real distributed
+/// binary's output.
+pub fn classify_launch_failure(log_text: &str, bind_port_requested: bool) -> LaunchFailureClass {
+    if !bind_port_requested {
+        return LaunchFailureClass::Unknown;
+    }
+    if log_text.contains("Address already in use") || log_text.contains("Address in use") {
+        LaunchFailureClass::BindPortInUse
+    } else if log_text.contains("Permission denied") {
+        LaunchFailureClass::BindPermissionDenied
+    } else if log_text.contains("Cannot assign requested address")
+        || log_text.contains("Address not available")
+    {
+        LaunchFailureClass::BindAddressUnavailable
+    } else {
+        LaunchFailureClass::Unknown
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_parent_dir_splits_off_the_filename() {
+        assert_eq!(remote_parent_dir("~/.local/bin/isekai-pipe"), "~/.local/bin");
+        assert_eq!(remote_parent_dir("/opt/isekai-pipe"), "/opt");
+        assert_eq!(remote_parent_dir("/isekai-pipe"), "/");
+        assert_eq!(remote_parent_dir("isekai-pipe"), ".");
+    }
+
+    #[test]
+    fn upload_binary_command_embeds_path_and_dir() {
+        let cmd = upload_binary_command("~/.local/bin/isekai-pipe", "~/.local/bin");
+        assert!(cmd.contains("mkdir -p ~/.local/bin"));
+        assert!(cmd.contains("base64 -d > ~/.local/bin/isekai-pipe.tmp"));
+        assert!(cmd.contains("chmod 0700 ~/.local/bin/isekai-pipe.tmp"));
+        assert!(cmd.contains("mv ~/.local/bin/isekai-pipe.tmp ~/.local/bin/isekai-pipe"));
+    }
+
+    #[test]
+    fn classify_launch_failure_detects_address_in_use() {
+        let log = "Error: Address already in use (os error 98)\n";
+        assert_eq!(classify_launch_failure(log, true), LaunchFailureClass::BindPortInUse);
+    }
+
+    /// `isekai-helper`'s real distributed binary (musl static-linked) reports
+    /// the same EADDRINUSE with different wording than glibc (no "already").
+    /// Found via a real E2E test — without this pattern, production launches
+    /// always misclassified as `HandshakeTimeout`.
+    #[test]
+    fn classify_launch_failure_detects_address_in_use_musl_wording() {
+        let log = "Error: Address in use (os error 98)\n";
+        assert_eq!(classify_launch_failure(log, true), LaunchFailureClass::BindPortInUse);
+    }
+
+    #[test]
+    fn classify_launch_failure_detects_permission_denied() {
+        let log = "Error: Permission denied (os error 13)\n";
+        assert_eq!(classify_launch_failure(log, true), LaunchFailureClass::BindPermissionDenied);
+    }
+
+    #[test]
+    fn classify_launch_failure_detects_address_unavailable() {
+        let log = "Error: Cannot assign requested address (os error 99)\n";
+        assert_eq!(classify_launch_failure(log, true), LaunchFailureClass::BindAddressUnavailable);
+    }
+
+    #[test]
+    fn classify_launch_failure_falls_back_to_unknown_for_unrelated_reason() {
+        let log = "some unrelated crash message\n";
+        assert_eq!(classify_launch_failure(log, true), LaunchFailureClass::Unknown);
+    }
+
+    #[test]
+    fn classify_launch_failure_falls_back_to_unknown_when_no_bind_port_was_requested() {
+        // bind_portを指定していない(エフェメラルポート)場合、bind関連の文字列が
+        // たまたまログに含まれていてもbind失敗として誤分類しない。
+        let log = "Error: Address already in use (os error 98)\n";
+        assert_eq!(classify_launch_failure(log, false), LaunchFailureClass::Unknown);
+    }
 
     #[test]
     fn shell_single_quote_wraps_plain_values() {
