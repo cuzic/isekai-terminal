@@ -248,25 +248,24 @@ impl QuicEndpoint for SystemQuicEndpoint {
 /// [`noq::Endpoint::rebind`], the same operation
 /// `multipath_transport.rs`'s Android code exercises (both on real hardware
 /// and in loopback tests) as `Endpoint::rebind_abstract()`. This uses the
-/// plain `rebind()` overload instead (a `std::net::UdpSocket`, not a custom
-/// `AsyncUdpSocket` impl) since all this needs is "hand it a fresh, plainly-
-/// bound socket" — there is no per-path fan-out logic to plug in here the
-/// way `quicsock-noq`'s `MultiPathSocket` has for Android's physical-
-/// interface case.
+/// plain `rebind()` overload (a `std::net::UdpSocket`, not a custom
+/// `AsyncUdpSocket` impl) since all this needs is "hand it an already-bound
+/// socket" — the caller (`QuicEndpointRebinder::rebind_socket`'s caller)
+/// decides how that socket got bound (a plain ephemeral port via
+/// [`QuicEndpointRebinder::rebind`]'s default impl, or a specific physical
+/// interface via `physical_interface::bind_physical_interface`).
 ///
 /// `noq::Endpoint::rebind`'s own doc comment: "On error, the old UDP socket
-/// is retained" — a failed [`QuicEndpointRebinder::rebind`] call through
-/// this type never leaves the endpoint in a half-switched state; the
-/// connection keeps using whatever socket it had before the attempt.
+/// is retained" — a failed [`QuicEndpointRebinder::rebind_socket`] call
+/// through this type never leaves the endpoint in a half-switched state;
+/// the connection keeps using whatever socket it had before the attempt.
 struct SystemQuicEndpointRebinder {
     endpoint: noq::Endpoint,
 }
 
 #[async_trait]
 impl QuicEndpointRebinder for SystemQuicEndpointRebinder {
-    async fn rebind(&self, bind: BindSpec) -> Result<(), TransportError> {
-        let socket = std::net::UdpSocket::bind(bind.local_addr)
-            .map_err(|source| TransportError::Bind { addr: bind.local_addr, source })?;
+    async fn rebind_socket(&self, socket: std::net::UdpSocket) -> Result<(), TransportError> {
         self.endpoint.rebind(socket).map_err(|e| TransportError::Rebind(e.to_string()))
     }
 }

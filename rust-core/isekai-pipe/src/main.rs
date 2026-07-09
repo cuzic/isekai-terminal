@@ -1947,7 +1947,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl QuicEndpointRebinder for MockRebinder {
-        async fn rebind(&self, _bind: BindSpec) -> Result<(), isekai_transport::TransportError> {
+        async fn rebind_socket(&self, _socket: std::net::UdpSocket) -> Result<(), isekai_transport::TransportError> {
             if self.should_succeed {
                 Ok(())
             } else {
