@@ -274,7 +274,7 @@ async fn install_and_start_gets_a_real_handshake_over_a_real_ssh_subprocess() {
 
     let report = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None, &[]),
+        backend.install_and_start(&target, &[], fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None, &[]),
     )
     .await
     .expect("install_and_start should not hang")
@@ -325,7 +325,7 @@ async fn install_and_start_passes_idle_lifetime_to_the_launched_helper() {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(relay), None, &[]),
+        backend.install_and_start(&target, &[], fake_helper_script.as_bytes(), &LaunchSpec::Relay(relay), None, &[]),
     )
     .await
     .expect("install_and_start should not hang")
@@ -373,7 +373,7 @@ async fn install_and_start_direct_never_passes_relay_args() {
         std::time::Duration::from_secs(20),
         backend.install_and_start(
             &target,
-            None,
+            &[],
             fake_helper_script.as_bytes(),
             &LaunchSpec::Direct { idle_lifetime_secs: 86_400 },
             None,
@@ -426,7 +426,7 @@ async fn install_and_start_uses_custom_remote_binary_path() {
         std::time::Duration::from_secs(20),
         backend.install_and_start(
             &target,
-            None,
+            &[],
             fake_helper_script.as_bytes(),
             &LaunchSpec::Direct { idle_lifetime_secs: 86_400 },
             Some(custom_path),
@@ -475,7 +475,7 @@ async fn install_and_start_fails_closed_when_stdout_has_extra_lines() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None, &[]),
+        backend.install_and_start(&target, &[], fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None, &[]),
     )
     .await
     .expect("install_and_start should not hang");
@@ -533,7 +533,7 @@ async fn install_and_start_delivers_an_intact_bootstrap_request_alongside_relay_
 
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(relay.clone()), None, &[]),
+        backend.install_and_start(&target, &[], fake_helper_script.as_bytes(), &LaunchSpec::Relay(relay.clone()), None, &[]),
     )
     .await
     .expect("install_and_start should not hang")
@@ -631,7 +631,7 @@ async fn install_and_start_delivers_real_stun_candidates_when_stun_servers_are_c
         std::time::Duration::from_secs(20),
         backend.install_and_start(
             &target,
-            None,
+            &[],
             fake_helper_script.as_bytes(),
             &LaunchSpec::Direct { idle_lifetime_secs: 86_400 },
             None,

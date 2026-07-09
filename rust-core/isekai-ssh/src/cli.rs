@@ -64,12 +64,16 @@ pub struct InitArgs {
     /// store key.
     pub host: String,
 
-    /// Jump host used to reach `<host>` for this one-time deployment
-    /// (`ssh -J`-style `[user@]host[:port]`). Recorded as `last_via` in the
+    /// Jump host(s) used to reach `<host>` for this one-time deployment
+    /// (`ssh -J`-style `[user@]host[:port]` each). Repeat `--via` to chain
+    /// through multiple hops in order (`ISEKAI_PIPE_DESIGN.md` §8 Epic K) —
+    /// `isekai-bootstrap::OpenSshBackend` passes the whole chain to `ssh(1)`
+    /// as a single comma-joined `-J` argument, not one nested `ssh`
+    /// invocation per hop. Recorded (comma-joined) as `last_via` in the
     /// trust store entry, purely informational for the wrapper's own
     /// re-deployment fallback (not implemented yet).
     #[arg(long, value_name = "JUMPHOST")]
-    pub via: Option<String>,
+    pub via: Vec<String>,
 
     /// Path to the isekai-helper binary to upload and start on `<host>`.
     ///

@@ -327,8 +327,12 @@ fn print_bootstrap_failure_guidance(err: &anyhow::Error) {
 /// `LaunchSpec::Relay` (JWT sourced from `isekai-ssh login`'s saved token,
 /// fail closed if none — no `LaunchSpec::Direct` attempt at all); absent →
 /// `LaunchSpec::Direct` (`direct-by-bootstrap-host`, no relay, no STUN launch
-/// mode). Only a single (or absent) `--via` hop is supported either way — a
-/// multi-hop `--via` chain still needs `isekai-ssh init`.
+/// mode). `candidate.via` may chain through any number of hops
+/// (`ISEKAI_PIPE_DESIGN.md` §8 Epic K) — validated with the same
+/// `isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain` cycle/hop-count
+/// checks `init.rs` uses, then passed to `OpenSshBackend::install_and_start`
+/// as a single `ssh(1)` `-J host1,host2,...` invocation, not nested `ssh`
+/// executions per hop.
 async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution) -> Result<()> {
     let helper_binary_path = plan.isekai.helper_binary.as_ref().ok_or_else(|| {
         anyhow!(
@@ -353,11 +357,12 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
         .with_context(|| format!("bootstrap candidate target {:?} has an invalid port", candidate.target))?;
     let target = HostSpec::new(host).with_port(port);
 
-    let via = match candidate.via.as_slice() {
-        [] => None,
-        [single] => {
-            let (via_host, via_port, via_user) = isekai_trust::split_user_host_port(single)
-                .with_context(|| format!("invalid --via hop {single:?}"))?;
+    let via: Vec<JumpSpec> = candidate
+        .via
+        .iter()
+        .map(|hop| {
+            let (via_host, via_port, via_user) =
+                isekai_trust::split_user_host_port(hop).with_context(|| format!("invalid --via hop {hop:?}"))?;
             let mut spec = JumpSpec::new(via_host);
             if let Some(port) = via_port {
                 spec = spec.with_port(port);
@@ -365,16 +370,11 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
             if let Some(user) = via_user {
                 spec = spec.with_user(user);
             }
-            Some(spec)
-        }
-        multiple => {
-            return Err(anyhow!(
-                "auto-bootstrap only supports a single --via hop, got {}: {:?} — run `isekai-ssh init` instead",
-                multiple.len(),
-                multiple
-            ));
-        }
-    };
+            Ok(spec)
+        })
+        .collect::<Result<_>>()?;
+    isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain(&target, &via)
+        .with_context(|| format!("invalid --via chain {:?}", candidate.via))?;
 
     let helper_binary = std::fs::read(helper_binary_path)
         .with_context(|| format!("failed to read helper binary at {}", helper_binary_path.display()))?;
@@ -420,7 +420,7 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
     eprintln!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
     let backend = OpenSshBackend::new();
     let report = backend
-        .install_and_start(&target, via.as_ref(), &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
+        .install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
         .await
         .map_err(|e| {
             let failure = classify_bootstrap_error(&e);
@@ -487,7 +487,7 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
         trusted_helper_version: "unknown".to_string(),
         update_policy: UpdatePolicy::ExactDigestOnly,
         release_channel: None,
-        last_via: candidate.via.first().cloned(),
+        last_via: (!candidate.via.is_empty()).then(|| candidate.via.join(",")),
         trusted_at: now.clone(),
         last_seen_at: now,
         cached_relay_addr,
@@ -1334,6 +1334,60 @@ mod tests {
         assert!(failure.should_redirect_to_init());
         assert!(!failure.should_redirect_to_login());
         assert!(!failure.may_retry());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_and_register_accepts_a_multi_hop_via_chain_and_rejects_a_looping_one() {
+        let mut plan = WrapperPlan {
+            openssh_path: PathBuf::from("/usr/bin/ssh"),
+            pipe_path: PathBuf::from("/usr/bin/isekai-pipe"),
+            destination: "production".to_string(),
+            destination_index: 0,
+            ssh_args: Vec::new(),
+            isekai: WrapperIsekaiOptions::default(),
+        };
+        // A nonexistent path is enough: chain validation runs, and fails
+        // closed, before this path is ever read from disk.
+        plan.isekai.helper_binary = Some(PathBuf::from("/nonexistent/isekai-helper"));
+
+        let resolution_with_via = |via: Vec<String>| WrapperResolution {
+            openssh: OpenSshEffectiveConfig::default(),
+            isekai: IsekaiConfig {
+                enabled: true,
+                bootstrap_policy: BootstrapPolicy::Auto,
+                profile: "production".to_string(),
+                remote_path: None,
+                services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
+                bootstrap_candidates: vec![BootstrapCandidate { target: "production:22".to_string(), via, priority: 0 }],
+                link_endpoints: Vec::new(),
+                rendezvous: Vec::new(),
+                stun_servers: Vec::new(),
+                relay_endpoints: Vec::new(),
+                resume_grace_secs: 180,
+                candidate_race_delay_ms: 150,
+                relay_delay_ms: 750,
+                install_mode: InstallMode::User,
+                bootstrap_relay: None,
+            },
+        };
+
+        // A valid 2-hop chain: passes chain validation, then fails on the
+        // (expected, unrelated) missing helper binary file — proving the
+        // multi-hop path is no longer rejected outright the way it used to
+        // be (`ISEKAI_PIPE_DESIGN.md` §8 Epic K).
+        let resolution = resolution_with_via(vec!["bastion-a".to_string(), "bastion-b".to_string()]);
+        let err = bootstrap_and_register(&plan, &resolution).await.unwrap_err();
+        assert!(err.downcast_ref::<BootstrapFailure>().is_none(), "a plain io::Error, not a BootstrapFailure: {err:?}");
+        assert!(format!("{err:#}").contains("nonexistent/isekai-helper"), "{err:#}");
+
+        // A looping chain (repeats the destination, same host *and* port —
+        // cycle detection is port-sensitive, matching `plan.rs`'s own
+        // `distinct_ports_on_the_same_host_are_not_a_cycle`) is still
+        // rejected, now via `isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain`
+        // rather than the old single-hop-only guard.
+        let looping = resolution_with_via(vec!["bastion-a".to_string(), "production:22".to_string()]);
+        let err = bootstrap_and_register(&plan, &looping).await.unwrap_err();
+        assert!(format!("{err:#}").contains("more than once"), "{err:#}");
     }
 
     #[test]

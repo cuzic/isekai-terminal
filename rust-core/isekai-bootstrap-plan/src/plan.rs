@@ -137,11 +137,24 @@ impl BootstrapPlan {
         credential_source: CredentialSource,
         persistence_policy: PersistencePolicy,
     ) -> Result<Self, PlanError> {
+        Self::validate_jump_chain(&destination, &jump_chain)?;
+        Ok(Self { destination, jump_chain, route_policy, credential_source, persistence_policy })
+    }
+
+    /// Validates a `--via` jump-host chain on its own (hop-count/cycle
+    /// checks only — no route policy, credential source, or persistence
+    /// policy needed), per `ISEKAI_PIPE_DESIGN.md` §8 Epic K's planner
+    /// (`2-a`): I/O-less hop normalization/cycle detection/max-hop-count
+    /// judgment that both `isekai-ssh init` and `isekai-ssh`'s wrapper
+    /// auto-bootstrap (`ISEKAI_PIPE_DESIGN.md`'s "unsupported構成判定")
+    /// share, instead of each hand-rolling its own chain validation or
+    /// inventing placeholder `RoutePolicy`/`CredentialSource` values just to
+    /// call [`Self::new`]. [`Self::new`] itself is defined in terms of this.
+    pub fn validate_jump_chain(destination: &BootstrapTarget, jump_chain: &[JumpHost]) -> Result<(), PlanError> {
         if jump_chain.len() > MAX_JUMP_HOPS {
             return Err(PlanError::TooManyHops { got: jump_chain.len(), max: MAX_JUMP_HOPS });
         }
-        check_no_repeated_host(&jump_chain, &destination)?;
-        Ok(Self { destination, jump_chain, route_policy, credential_source, persistence_policy })
+        check_no_repeated_host(jump_chain, destination)
     }
 
     /// Today's default shape: no jump hops, `direct-by-bootstrap-host`
@@ -314,6 +327,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.hop_count(), MAX_JUMP_HOPS);
+    }
+
+    #[test]
+    fn validate_jump_chain_matches_new_for_a_valid_chain() {
+        assert_eq!(BootstrapPlan::validate_jump_chain(&host("dest"), &[jump("bastion-a"), jump("bastion-b")]), Ok(()));
+    }
+
+    #[test]
+    fn validate_jump_chain_matches_new_for_a_repeated_host() {
+        assert_eq!(
+            BootstrapPlan::validate_jump_chain(&host("dest"), &[jump("bastion-a"), jump("bastion-a")]),
+            Err(PlanError::RepeatedHost { host: "bastion-a".to_string() })
+        );
+    }
+
+    #[test]
+    fn validate_jump_chain_matches_new_for_a_too_long_chain() {
+        let chain: Vec<JumpHost> = (0..=MAX_JUMP_HOPS).map(|i| jump(&format!("hop-{i}"))).collect();
+        assert_eq!(
+            BootstrapPlan::validate_jump_chain(&host("dest"), &chain),
+            Err(PlanError::TooManyHops { got: MAX_JUMP_HOPS + 1, max: MAX_JUMP_HOPS })
+        );
     }
 
     #[test]

@@ -650,17 +650,30 @@ codexの提案(2回目の相談)により、一括ゲートにせず`I-G`/`I-H`/
 handshake→certificate pin→helper HELLO/ACK→target TCP到達性を段階ごとに表示し、「成功/失敗」の
 二値ではなくどの段階まで成功したかを返す。
 
-### Epic K: 複数hop `--via`チェーンの自動bootstrap(P2、Epic A依存)
+### Epic K: 複数hop `--via`チェーンの自動bootstrap(P2、Epic A依存)— planner/executorは完了、E2Eは進行中(2026-07-09)
 
 `isekai-ssh init`という既存の代替経路があるため優先度は下げてよいが、単純に「hopをループして
 sshを実行する」実装は避ける。
 
-- planner(2-a): I/Oなしでhop正規化・循環検出・最大hop数・unsupported構成判定・実行コマンドの
-  論理構造を計画する純粋関数。
-- executor(2-b): 標準の`ssh -J`/`ProxyJump`で最終ホストへの接続を作れる場合、中間ホスト上で
-  さらに`ssh`を実行するnested-shell方式は避ける。中間hopにbootstrap payloadやcredentialを
-  解釈させない構成を優先する。
-- Epic Cのharnessを使った最低2-hop構成のE2Eを受け入れ条件にする。
+- ✅ planner(2-a): `isekai-bootstrap-plan::BootstrapPlan::validate_jump_chain(destination,
+  jump_chain)`として実装(`BootstrapPlan::new`もこれを呼ぶよう再実装、重複なし)。I/Oなしで
+  hop正規化・循環検出・最大hop数判定を行う純粋関数で、「unsupported構成判定」はこの循環検出/
+  最大hop数チェック自体が担う(それを超える追加の制約は見つからなかった——`relay_jwt`は
+  経由hop数に関わらず常に最終destinationのstdin経由でのみ配送されるため、multi-hopと
+  relay launchの組み合わせに新規の制約は生じない)。`isekai-ssh init`(`init.rs::parse_via_chain`)・
+  wrapper自動bootstrap(`wrapper.rs::bootstrap_and_register`)の両方がこの1つの実装を共有する。
+- ✅ executor(2-b): `isekai-bootstrap::openssh::join_via_chain`が`ssh(1)`ネイティブの
+  `-J host1,host2,...`(カンマ区切り複数hop)を1回の`ssh(1)`呼び出しで組み立てる——中間ホスト上で
+  さらに`ssh`を実行するnested-shell方式は使わない。`BootstrapBackend::install_and_start`の
+  `via`引数を`Option<&JumpSpec>`(0or1hop)から`&[JumpSpec]`(0..N hop)へ変更し、
+  `isekai-ssh init`/wrapper両方の`--via`/`bootstrap-candidate via=...`が複数hopを渡せるように
+  なった(`InitArgs.via`は`Option<String>`から`Vec<String>`(`--via`複数指定)へ変更)。中間hopは
+  `ssh(1)`のProxyJump機構自体が中継するだけで、bootstrap payload/credentialを一切解釈しない
+  (`-J`の性質上、中間hopはTCP転送のみを行う)。テスト: `isekai-bootstrap`側に`join_via_chain`の
+  unit test 3件、`isekai-bootstrap-plan`側に`validate_jump_chain`のunit test 3件、`isekai-ssh`側に
+  `bootstrap_and_register_accepts_a_multi_hop_via_chain_and_rejects_a_looping_one`を追加。
+  既存の`isekai-bootstrap`(unit 7+e2e 7)・`isekai-ssh`(unit 39+e2e 18)は全てgreenのまま。
+- Epic Cのharnessを使った最低2-hop構成のE2Eを受け入れ条件にする(進行中)。
 
 ### ADR: 複数isekai-sshプロセスによるisekai-pipe共有(マルチプレクス) — 実装しない(Deferred)
 

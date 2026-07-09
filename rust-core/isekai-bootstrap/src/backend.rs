@@ -11,8 +11,12 @@ use crate::error::BootstrapError;
 use crate::types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec};
 
 /// Installs (if needed) and launches `isekai-helper` on `target`, optionally
-/// routed through a `via` jump host, and returns the handshake JSON it
-/// printed on success.
+/// routed through a chain of `via` jump hosts (`ISEKAI_PIPE_DESIGN.md` §8
+/// Epic K — an empty slice means no jump host, a 0-hop direct connection;
+/// multiple entries chain through each hop in order using `ssh(1)`'s own
+/// multi-hop `-J host1,host2,...` support rather than nesting a separate
+/// `ssh` invocation per hop, per Epic K's executor requirement), and returns
+/// the handshake JSON it printed on success.
 ///
 /// `remote_binary_path` overrides the remote install path (full path to the
 /// uploaded binary, not just a directory) sourced from `#@isekai remote-path`
@@ -37,7 +41,7 @@ pub trait BootstrapBackend: Send + Sync {
     async fn install_and_start(
         &self,
         target: &HostSpec,
-        via: Option<&JumpSpec>,
+        via: &[JumpSpec],
         helper_binary: &[u8],
         launch: &LaunchSpec,
         remote_binary_path: Option<&str>,

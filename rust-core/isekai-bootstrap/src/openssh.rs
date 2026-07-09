@@ -112,7 +112,7 @@ impl OpenSshBackend {
         self
     }
 
-    fn build_args(&self, target: &HostSpec, via: Option<&JumpSpec>, remote_command: &str) -> Vec<String> {
+    fn build_args(&self, target: &HostSpec, via: &[JumpSpec], remote_command: &str) -> Vec<String> {
         let mut args = vec![
             "-T".to_string(),
             "-o".to_string(),
@@ -121,9 +121,9 @@ impl OpenSshBackend {
             "LogLevel=ERROR".to_string(),
         ];
         args.extend(self.extra_args.iter().cloned());
-        if let Some(via) = via {
+        if let Some(via_arg) = join_via_chain(via) {
             args.push("-J".to_string());
-            args.push(via.to_arg());
+            args.push(via_arg);
         }
         if let Some(port) = target.port {
             args.push("-p".to_string());
@@ -141,7 +141,7 @@ impl OpenSshBackend {
     async fn run_ssh_command(
         &self,
         target: &HostSpec,
-        via: Option<&JumpSpec>,
+        via: &[JumpSpec],
         remote_command: &str,
         stdin_payload: Option<&[u8]>,
     ) -> Result<SshOutput, BootstrapError> {
@@ -197,7 +197,7 @@ impl OpenSshBackend {
     async fn upload_binary(
         &self,
         target: &HostSpec,
-        via: Option<&JumpSpec>,
+        via: &[JumpSpec],
         binary: &[u8],
         remote_binary_path: &str,
     ) -> Result<(), BootstrapError> {
@@ -222,7 +222,7 @@ impl OpenSshBackend {
     async fn launch_and_capture_handshake(
         &self,
         target: &HostSpec,
-        via: Option<&JumpSpec>,
+        via: &[JumpSpec],
         launch: &LaunchSpec,
         remote_binary_path: &str,
         stun_servers: &[SocketAddr],
@@ -446,6 +446,21 @@ async fn fresh_bootstrap_request_v2(stun_servers: &[SocketAddr]) -> BootstrapReq
 /// `.` for a bare filename with no directory component (harmless: `mkdir -p
 /// .` always succeeds) and to `/` for a path directly under the filesystem
 /// root.
+/// Builds the value for `ssh(1)`'s `-J` flag from a jump-host chain, per
+/// `ISEKAI_PIPE_DESIGN.md` §8 Epic K's executor requirement: `-J` natively
+/// accepts a comma-separated list of `[user@]host[:port]` hops and chains
+/// through all of them in a single `ssh(1)` invocation, so a multi-hop chain
+/// needs no nested `ssh`-inside-`ssh` execution (which would additionally
+/// force each intermediate hop to interpret bootstrap payload/credentials it
+/// has no business seeing). Returns `None` for an empty chain (0-hop direct
+/// connection, no `-J` at all).
+fn join_via_chain(via: &[JumpSpec]) -> Option<String> {
+    if via.is_empty() {
+        return None;
+    }
+    Some(via.iter().map(JumpSpec::to_arg).collect::<Vec<_>>().join(","))
+}
+
 fn remote_parent_dir(path: &str) -> &str {
     match path.rsplit_once('/') {
         Some((dir, _)) if !dir.is_empty() => dir,
@@ -459,7 +474,7 @@ impl BootstrapBackend for OpenSshBackend {
     async fn install_and_start(
         &self,
         target: &HostSpec,
-        via: Option<&JumpSpec>,
+        via: &[JumpSpec],
         helper_binary: &[u8],
         launch: &LaunchSpec,
         remote_binary_path: Option<&str>,
@@ -557,6 +572,26 @@ mod tests {
     #[tokio::test]
     async fn collect_client_stun_candidates_is_empty_for_no_servers() {
         assert!(collect_client_stun_candidates(&[]).await.is_empty());
+    }
+
+    #[test]
+    fn join_via_chain_is_none_for_an_empty_chain() {
+        assert_eq!(join_via_chain(&[]), None);
+    }
+
+    #[test]
+    fn join_via_chain_renders_a_single_hop_unchanged() {
+        assert_eq!(join_via_chain(&[JumpSpec::new("bastion")]), Some("bastion".to_string()));
+    }
+
+    #[test]
+    fn join_via_chain_comma_joins_multiple_hops_in_order() {
+        let chain = [
+            JumpSpec::new("bastion-a").with_user("alice").with_port(2222),
+            JumpSpec::new("bastion-b"),
+            JumpSpec::new("bastion-c").with_port(22),
+        ];
+        assert_eq!(join_via_chain(&chain), Some("alice@bastion-a:2222,bastion-b,bastion-c:22".to_string()));
     }
 
     #[tokio::test]

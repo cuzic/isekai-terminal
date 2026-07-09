@@ -46,12 +46,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     let target = parse_host_spec(&args.host)
         .with_context(|| format!("isekai-ssh: invalid host spec '{}'", args.host))?;
-    let via = args
-        .via
-        .as_deref()
-        .map(parse_jump_spec)
-        .transpose()
-        .with_context(|| format!("isekai-ssh: invalid --via spec '{}'", args.via.as_deref().unwrap_or_default()))?;
+    let via = parse_via_chain(&target, &args.via)?;
     let relay_jwt = resolve_relay_jwt(&args)?;
     let relay = RelayLaunchSpec {
         relay_addr: args.relay_addr,
@@ -63,7 +58,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
     println!("Deploying isekai-helper to {}...", args.host);
     let backend = OpenSshBackend::new();
     let report = backend
-        .install_and_start(&target, via.as_ref(), &helper_binary, &LaunchSpec::Relay(relay), None, &args.stun_servers)
+        .install_and_start(&target, &via, &helper_binary, &LaunchSpec::Relay(relay), None, &args.stun_servers)
         .await
         .with_context(|| format!("isekai-ssh: failed to deploy/start isekai-helper on '{}'", args.host))?;
     let handshake = &report.handshake;
@@ -76,8 +71,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     println!();
     println!("Host:            {}", args.host);
-    if let Some(via) = &args.via {
-        println!("Via:             {via}");
+    if !args.via.is_empty() {
+        println!("Via:             {}", args.via.join(" -> "));
     }
     println!("Helper identity: {identity}");
     println!("Binary sha256:   {helper_sha256}");
@@ -120,7 +115,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         trusted_helper_version: args.helper_version.clone(),
         update_policy: UpdatePolicy::ExactDigestOnly,
         release_channel: args.release_channel.clone(),
-        last_via: args.via.clone(),
+        last_via: (!args.via.is_empty()).then(|| args.via.join(",")),
         trusted_at: now.clone(),
         last_seen_at: now,
         cached_relay_addr,
@@ -246,6 +241,23 @@ fn parse_host_spec(spec: &str) -> Result<HostSpec> {
     Ok(hs)
 }
 
+/// Parses every `--via` occurrence (in the order given, the traversal
+/// order — first hop reached from the client, last hop before `target`)
+/// into a jump-host chain and validates it with
+/// `isekai-bootstrap-plan`'s shared hop-count/cycle checks
+/// (`ISEKAI_PIPE_DESIGN.md` §8 Epic K), the same validation
+/// `wrapper.rs`'s auto-bootstrap `--via` handling reuses rather than each
+/// duplicating its own.
+fn parse_via_chain(target: &HostSpec, via: &[String]) -> Result<Vec<JumpSpec>> {
+    let chain: Vec<JumpSpec> =
+        via.iter().map(|spec| parse_jump_spec(spec)).collect::<Result<_>>().with_context(|| {
+            format!("isekai-ssh: invalid --via spec in {via:?}")
+        })?;
+    isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain(target, &chain)
+        .with_context(|| format!("isekai-ssh: invalid --via chain {via:?}"))?;
+    Ok(chain)
+}
+
 /// Same tokenization as `parse_host_spec`, for the `--via` jump host.
 fn parse_jump_spec(spec: &str) -> Result<JumpSpec> {
     let (host, port, user) = isekai_trust::split_user_host_port(spec)?;
@@ -321,7 +333,7 @@ mod tests {
     fn sample_init_args() -> InitArgs {
         InitArgs {
             host: "myhost".to_string(),
-            via: None,
+            via: Vec::new(),
             helper_binary: std::path::PathBuf::from("/dev/null"),
             relay_addr: "127.0.0.1:1".parse().unwrap(),
             relay_sni: "relay.example.test".to_string(),
