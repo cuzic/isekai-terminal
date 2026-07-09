@@ -85,8 +85,8 @@ pub use resume::{
     ResumeAckOutcome, SequentialConnectError, SequentialFailure, SequentialRelayCandidate,
 };
 pub use stun_p2p::{
-    connect_stun_p2p, connect_stun_p2p_with_fallback, SequentialStunCandidate, SequentialStunConnectError,
-    StunP2pConnection, StunP2pTarget,
+    connect_stun_p2p, connect_stun_p2p_on_socket, connect_stun_p2p_with_fallback, SequentialStunCandidate,
+    SequentialStunConnectError, StunP2pConnection, StunP2pTarget,
 };
 pub use system::SystemQuicEndpointFactory;
 pub use telemetry::{CandidateAttempt, CandidateIdentity, CandidateOutcome};
