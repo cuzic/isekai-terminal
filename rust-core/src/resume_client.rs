@@ -29,11 +29,6 @@ use std::task::{Context, Poll};
 use isekai_transport::traits::{ByteStreamReadHalf, ByteStreamWriteHalf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-pub(crate) const CONTROL_HELLO: u8 = 0x10;
-pub(crate) const CONTROL_ACK: u8 = 0x11;
-pub(crate) const APP_ACK: u8 = 0x12;
-pub(crate) const RESUME: u8 = 0x03;
-pub(crate) const RESUME_ACK: u8 = 0x13;
 #[allow(dead_code)]
 pub(crate) const REJECT_UNKNOWN_SESSION: u8 = 0xF9;
 #[allow(dead_code)]

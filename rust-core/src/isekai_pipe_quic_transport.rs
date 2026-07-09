@@ -23,18 +23,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
 use log::{info, warn};
-use noq::crypto::rustls::QuicClientConfig;
 use russh::client;
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use sha2::{Digest, Sha256};
 
 use isekai_protocol::attach::{
-    attach_hello_proof_transcript, decode_attach_response, encode_attach_activate, encode_attach_hello,
-    AttachActivate, AttachHello, AttachProof, AttachRejectReason, AttachResponse, AttemptId, ConnectionGeneration,
-    ATTACH_READY_FRAME_LEN, ATTEMPT_ID_LEN, FRAME_ATTACH_READY, FRAME_REJECT_STALE_GENERATION,
-    STALE_GENERATION_REJECT_FRAME_LEN,
+    decode_attach_response, AttachRejectReason, AttachResponse, AttemptId, ATTACH_READY_FRAME_LEN, ATTEMPT_ID_LEN,
+    FRAME_ATTACH_READY, FRAME_REJECT_STALE_GENERATION, STALE_GENERATION_REJECT_FRAME_LEN,
 };
 use isekai_protocol::session_id::{SessionId, SESSION_ID_LEN};
 use rand::RngCore;
@@ -48,23 +44,10 @@ use crate::transport::{
 use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 
-type HmacSha256 = Hmac<Sha256>;
-
 /// C→S input replay buffer の既定上限（helper 側 `DEFAULT_RESUME_BUFFER_SIZE` と揃える）。
 const DEFAULT_RESUME_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 /// control stream を開く/CONTROL_ACK を待つタイムアウト（helper 側 `HELLO_TIMEOUT` と揃える）。
 const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// QUIC connection が本当に死んだことを検知するまでの時間。実機検証（Phase 8-4b）で、
-/// この値が未設定（quinn のデフォルト任せ）だと検知に 40 秒以上かかり、helper 側の
-/// park セッション破棄（`isekai-helper::DEFAULT_PARKED_SESSION_TTL`）より遅くなって
-/// reattach が必ず `REJECT_UNKNOWN_SESSION` になる、という致命的なタイミング不整合が
-/// 見つかった。検知を速くしつつ、NAT の UDP マッピング（通常 30 秒）が切れて偽陽性の
-/// タイムアウトが起きないよう `CLIENT_KEEP_ALIVE_INTERVAL` で PING を送り続ける。
-const CLIENT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
-/// NAT マッピング維持のための PING 間隔。`CLIENT_MAX_IDLE_TIMEOUT` の 1/3 以下にして、
-/// 数回分の PING ロスを許容できるようにする。
-const CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 // Phase 9-2 (multipath_transport.rs)・Phase 10 (isekai_stun_p2p_transport.rs /
 // isekai_link_relay_transport.rs) もこのワイヤー契約・埋め込みバイナリを共有する
@@ -405,62 +388,12 @@ pub(crate) async fn bootstrap_helper_via_ssh(
         .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))
 }
 
-// ── QUIC 接続（HELLO/ACK ハンドシェイク） ───────────────
-
-/// `establish_quic_connection_with_socket`の中身のうち、ソケットを事前に用意して渡したい呼び出し元
-/// （Phase 10: `isekai_stun_p2p_transport.rs` が STUN 問い合わせ・穴あけ probe 送信に
-/// 使ったのと同一のソケットを、そのまま QUIC endpoint にも使い回したい）向けの下請け関数。
-pub(crate) async fn establish_quic_connection_with_socket(
-    socket: crate::faulty_udp_socket::FaultyUdpSocket,
-    remote: SocketAddr,
-    cert_sha256_hex: &str,
-) -> Result<noq::Connection, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|_| "TLS config failed".to_string())?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier {
-            expected_sha256_hex: cert_sha256_hex.to_string(),
-            provider,
-        }))
-        .with_no_client_auth();
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
-    // 0-RTT はクライアント側でも使わない（HELPER_PROTOCOL.md「0-RTT はクライアント・
-    // サーバー双方で完全に無効化する」契約）。noq::Connecting::into_0rtt() を呼ばず
-    // 通常のハンドシェイク完了を待つのがクライアント側の対応。
-
-    let quic_crypto = QuicClientConfig::try_from(crypto).map_err(|_| "QUIC crypto config failed".to_string())?;
-
-    let mut transport = noq::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(noq::VarInt::from_u32(1));
-    transport.max_concurrent_uni_streams(noq::VarInt::from_u32(0));
-    transport.max_idle_timeout(Some(
-        noq::IdleTimeout::try_from(CLIENT_MAX_IDLE_TIMEOUT).expect("valid idle timeout"),
-    ));
-    transport.keep_alive_interval(Some(CLIENT_KEEP_ALIVE_INTERVAL));
-
-    let mut client_config = noq::ClientConfig::new(Arc::new(quic_crypto));
-    client_config.transport_config(Arc::new(transport));
-
-    let endpoint = noq::Endpoint::new_with_abstract_socket(
-        noq::EndpointConfig::default(),
-        None,
-        Box::new(socket),
-        Arc::new(noq::TokioRuntime),
-    )
-    .map_err(|e| format!("endpoint bind failed: {e}"))?;
-    endpoint.set_default_client_config(client_config);
-
-    info!("isekai_pipe_quic: connecting to {remote}");
-    let conn = endpoint
-        .connect(remote, "isekai-pipe.local")
-        .map_err(|e| format!("connect setup failed: {e}"))?
-        .await
-        .map_err(|e| format!("QUIC handshake failed: {e}"))?;
-    info!("isekai_pipe_quic: QUIC handshake ok rtt={:?}", conn.rtt(noq::PathId::ZERO));
-    Ok(conn)
-}
+// ── ATTACH v2 補助（multipath_transport.rs と共有） ───────────────
+// isekai_pipe_quic_transport.rs 自身は自前のQUIC接続確立/ATTACH実装を
+// isekai-transport経由へ置き換え済み(isekai-terminal-core/isekai-transport
+// crate共有化 Phase 1c)だが、multipath_transport.rs(Phase 9、物理マルチパス、
+// isekai-transportにまだ対応する抽象が無いため対象外)はこの節の関数群を
+// 引き続き参照する。
 
 /// ブランドニューな論理セッション用のランダムな `SessionId`（ATTACH v2 では
 /// クライアントが接続開始前に採番する、`#18-4`）。1 接続 = 1 セッションなので
@@ -476,43 +409,6 @@ pub(crate) fn random_attempt_id() -> AttemptId {
     let mut bytes = [0u8; ATTEMPT_ID_LEN];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     AttemptId::from_bytes(bytes)
-}
-
-/// ATTACH v2 ハンドシェイク（`ATTACH_HELLO`/`AttachReadyV2`/`ATTACH_ACTIVATE`）を、
-/// 既に確立済みの QUIC connection 上の新しい bi-directional stream で行う。成功時は
-/// 以降そのまま SSH のパススルーに使えるデータ stream を返す。`isekai-transport::relay::
-/// connect_and_handshake` の ATTACH 部分を Android 側の 3 経路（direct/relay/STUN）で
-/// 共有するために切り出したもの。Android には generation を進める fencing/リトライ層は
-/// 無いので常に `ConnectionGeneration::INITIAL` を使う。
-pub(crate) async fn attach_handshake(
-    conn: &noq::Connection,
-    session_secret: &[u8],
-) -> Result<(noq::SendStream, noq::RecvStream), String> {
-    let session_id = random_session_id();
-    let generation = ConnectionGeneration::INITIAL;
-    let attempt_id = random_attempt_id();
-    // No client-configurable resume-grace concept on Android yet — `0` means
-    // "no preference, use the server's own default/max".
-    let requested_resume_grace_secs = 0;
-    let transcript = attach_hello_proof_transcript(&session_id, generation, &attempt_id, requested_resume_grace_secs);
-    let attach_proof = AttachProof::new(compute_proof(conn, session_secret, &transcript)?);
-
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi failed: {e}"))?;
-    let hello = AttachHello { session_id, generation, attempt_id, requested_resume_grace_secs, proof: attach_proof };
-    send.write_all(&encode_attach_hello(&hello))
-        .await
-        .map_err(|e| format!("ATTACH_HELLO write failed: {e}"))?;
-
-    match read_attach_response(&mut recv).await? {
-        AttachResponse::Ready { attach_token, .. } => {
-            let activate = AttachActivate { session_id, generation, attempt_id, attach_token };
-            send.write_all(&encode_attach_activate(&activate))
-                .await
-                .map_err(|e| format!("ATTACH_ACTIVATE write failed: {e}"))?;
-            Ok((send, recv))
-        }
-        AttachResponse::Reject(reason) => Err(attach_reject_message(reason)),
-    }
 }
 
 /// `AttachResponse` を wire から読む: まず 1 バイトの type、その値に応じて追加バイトを
@@ -558,57 +454,6 @@ pub(crate) fn attach_reject_message(reason: AttachRejectReason) -> String {
             format!("isekai-helper rejected: stale generation (server is at generation {current_generation})")
         }
     }
-}
-
-/// `session_secret` と QUIC connection の exporter から proof を計算する
-/// （ATTACH の `extra` には proof transcript、RESUME は session_id、CONTROL_HELLO は
-/// 空を渡す）。
-pub(crate) fn compute_proof(conn: &noq::Connection, session_secret: &[u8], extra: &[u8]) -> Result<[u8; 32], String> {
-    let mut exporter = [0u8; 32];
-    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
-        .map_err(|e| format!("export_keying_material failed: {e:?}"))?;
-    let mut mac = HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
-    mac.update(&exporter);
-    if !extra.is_empty() {
-        mac.update(extra);
-    }
-    Ok(mac.finalize().into_bytes().into())
-}
-
-/// `RESUME`フレームを送り`RESUME_ACK`を待つ。`conn`は呼び出し元が経路(direct/relay/STUN)
-/// ごとに異なる方法で確立済みの、resume先への新規QUIC connectionであること。
-/// quic/relay/stunの3ファイルで重複していたRESUME送受信ロジックを集約したもの
-/// (isekai-terminal-core/isekai-transport crate共有化 Phase 1a)。
-pub(crate) async fn send_resume_and_await_ack(
-    conn: &noq::Connection,
-    session_secret: &[u8],
-    session_id: resume_client::SessionId,
-    client_sent_offset: u64,
-    client_delivered_offset: u64,
-) -> Result<resume_client::ReattachResult, String> {
-    let resume_proof = compute_proof(conn, session_secret, &session_id)?;
-
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi (resume) failed: {e}"))?;
-    let mut frame = vec![resume_client::RESUME];
-    frame.extend_from_slice(&session_id);
-    frame.extend_from_slice(&resume_proof);
-    frame.extend_from_slice(&client_sent_offset.to_be_bytes());
-    frame.extend_from_slice(&client_delivered_offset.to_be_bytes());
-    send.write_all(&frame).await.map_err(|e| format!("RESUME write failed: {e}"))?;
-
-    let mut resp = [0u8; 1];
-    recv.read_exact(&mut resp).await.map_err(|e| format!("RESUME_ACK read failed: {e}"))?;
-    if resp[0] != resume_client::RESUME_ACK {
-        return Err(format!("isekai-helper rejected resume: {:#x}", resp[0]));
-    }
-    let mut rest = [0u8; 16];
-    recv.read_exact(&mut rest).await.map_err(|e| format!("RESUME_ACK body read failed: {e}"))?;
-    let helper_committed_offset = u64::from_be_bytes(rest[0..8].try_into().unwrap());
-    Ok(resume_client::ReattachResult {
-        read: Box::new(crate::android_quic_endpoint::AndroidByteStreamReadHalf::new(recv)),
-        write: Box::new(crate::android_quic_endpoint::AndroidByteStreamWriteHalf::new(send)),
-        helper_committed_offset,
-    })
 }
 
 /// Resolve the explicit `direct-by-bootstrap-host` mode.
@@ -755,80 +600,6 @@ pub(crate) fn spawn_app_ack_bridge(
     });
 }
 
-/// control stream を開き、`CONTROL_HELLO` を送って `CONTROL_ACK` を待つ。
-/// data stream の HELLO と同じ `proof` を再利用する（同一 QUIC connection の
-/// exporter から計算されるため同じ値になる、HELPER_PROTOCOL.md §7.3）。
-pub(crate) async fn open_control_stream(
-    conn: &noq::Connection,
-    proof: &[u8],
-) -> Result<(noq::SendStream, noq::RecvStream, resume_client::SessionId), String> {
-    let (mut csend, mut crecv) = conn.open_bi().await.map_err(|e| format!("open_bi (control) failed: {e}"))?;
-    let mut hello = Vec::with_capacity(33);
-    hello.push(resume_client::CONTROL_HELLO);
-    hello.extend_from_slice(proof);
-    csend
-        .write_all(&hello)
-        .await
-        .map_err(|e| format!("CONTROL_HELLO write failed: {e}"))?;
-
-    let mut ack = [0u8; 17];
-    crecv
-        .read_exact(&mut ack)
-        .await
-        .map_err(|e| format!("CONTROL_ACK read failed: {e}"))?;
-    if ack[0] != resume_client::CONTROL_ACK {
-        return Err(format!("unexpected control response byte {:#x}", ack[0]));
-    }
-    let mut session_id = [0u8; 16];
-    session_id.copy_from_slice(&ack[1..17]);
-    Ok((csend, crecv, session_id))
-}
-
-/// APP_ACK の送受信を行う背後タスクを spawn する。data stream が閉じた後も
-/// これらのタスクは自然に終了しない（control stream 側の read/write が
-/// エラーになった時点でループを抜ける、ベストエフォート設計）。
-pub(crate) fn spawn_app_ack_tasks(
-    mut csend: noq::SendStream,
-    mut crecv: noq::RecvStream,
-    state: Arc<std::sync::Mutex<ClientResumeState>>,
-) {
-    // APP_ACK 受信: helper からの helper_committed_offset を受け取り、
-    // input replay buffer の破棄範囲を進める。
-    {
-        let state = state.clone();
-        RUNTIME.spawn(async move {
-            loop {
-                let mut frame = [0u8; 9];
-                match crecv.read_exact(&mut frame).await {
-                    Ok(()) if frame[0] == resume_client::APP_ACK => {
-                        let offset = u64::from_be_bytes(frame[1..9].try_into().unwrap());
-                        state.lock().unwrap().replay_buffer.advance_start(offset);
-                    }
-                    _ => break,
-                }
-            }
-        });
-    }
-
-    // APP_ACK 送信: client_delivered_offset（S→C の受信確認）を 200ms ごとに送る。
-    RUNTIME.spawn(async move {
-        let mut last_sent = 0u64;
-        loop {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let current = state.lock().unwrap().client_delivered_offset;
-            if current == last_sent {
-                continue;
-            }
-            let mut frame = Vec::with_capacity(9);
-            frame.push(resume_client::APP_ACK);
-            frame.extend_from_slice(&current.to_be_bytes());
-            if csend.write_all(&frame).await.is_err() {
-                break;
-            }
-            last_sent = current;
-        }
-    });
-}
 
 async fn try_connect_isekai_pipe_quic(
     config: &IsekaiPipeQuicConfig,
