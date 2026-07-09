@@ -1536,6 +1536,7 @@ dependencies = [
  "base64",
  "flate2",
  "hmac",
+ "isekai-bootstrap",
  "isekai-protocol",
  "isekai-stun",
  "log",

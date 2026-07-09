@@ -216,6 +216,8 @@ async fn bootstrap_via_ssh_with_relay(
         relay_sni: config.relay_sni.clone(),
         relay_jwt: config.relay_jwt.clone(),
     };
+    // relay経路にはSTUNサーバー設定が無いため常に空スライス
+    // (isekai-terminal-core/isekai-ssh crate共有化 Phase 2c)。
     helper_bootstrap::ensure_helper_running(
         &mut established.handle,
         &binaries,
@@ -223,6 +225,7 @@ async fn bootstrap_via_ssh_with_relay(
         "127.0.0.1:22",
         None,
         &p2p_mode,
+        &[],
     )
     .await
     .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))

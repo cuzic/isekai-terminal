@@ -70,10 +70,16 @@ pub struct IsekaiStunP2pConfig {
     /// ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
     pub jump: Option<JumpConfig>,
     /// isekai-terminal・isekai-helper の双方が自分自身の観測アドレスを調べるのに使う
-    /// STUN サーバー(`host:port`)。パブリックな STUN サーバー(例: Google の
+    /// STUN サーバー(`host:port`)のリスト。パブリックな STUN サーバー(例: Google の
     /// `stun.l.google.com:19302`)でよい—双方が同じサーバーを使う必要は無く、
-    /// それぞれ自分にとって疎通できるものを指定すればよい。
-    pub stun_server: String,
+    /// それぞれ自分にとって疎通できるものを指定すればよい。空であってはならない
+    /// （呼び出し側が既定値にフォールバックすること）。先頭の1件が実際の
+    /// STUN+SSHランデブー穴あけ機構（自分自身の観測アドレス取得・isekai-helper起動時の
+    /// `--stun-server`/`--punch-peer`）に使われ、残りは`BootstrapRequestV2`の
+    /// `client_candidates`（isekai-bootstrap crate共有化 Phase 2c、`#20b`と同じ仕組み）
+    /// として追加の穴あけ候補をサーバー側へ渡すためだけに使われる（冗長性向上、
+    /// 複数STUNサーバーの応答が異なるNATマッピングを示す場合の取りこぼし対策）。
+    pub stun_servers: Vec<String>,
 }
 
 #[derive(uniffi::Object)]
@@ -172,17 +178,39 @@ impl IsekaiStunP2pSession {
 
 // ── STUN 問い合わせ・ブートストラップ ─────────────────────
 
+/// `stun_servers`(`host:port`文字列のリスト)を順にDNS解決する。解決できないエントリは
+/// 警告ログを出してスキップする(1件の設定ミス/一時的な名前解決失敗で接続全体を諦めない
+/// ため — `isekai-bootstrap::client_candidates::collect_client_stun_candidates`が
+/// 個々のSTUN問い合わせ失敗をスキップするのと同じ設計判断)。1件も解決できなければ
+/// エラーにする(先頭のエントリが実際のSTUN+SSHランデブー機構に必須のため)。
+async fn resolve_stun_servers(entries: &[String]) -> Result<Vec<SocketAddr>, String> {
+    let mut resolved = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match tokio::net::lookup_host(entry).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => resolved.push(addr),
+                None => warn!("isekai_stun_p2p: STUNサーバー{entry:?}のDNS解決結果が空のためスキップします"),
+            },
+            Err(e) => warn!("isekai_stun_p2p: STUNサーバー{entry:?}のDNS解決に失敗したためスキップします: {e}"),
+        }
+    }
+    if resolved.is_empty() {
+        return Err("設定されたSTUNサーバーを1件も解決できませんでした".to_string());
+    }
+    Ok(resolved)
+}
+
 /// 自分自身の STUN 観測アドレスを調べつつ、その同じソケットで SSH ブートストラップ経由の
 /// isekai-helper 起動・穴あけ probe 送信・QUIC 接続確立までを行う。
 async fn try_connect_isekai_stun_p2p(
     config: &IsekaiStunP2pConfig,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<resume_client::ReattachableStream, String> {
-    let stun_addr: SocketAddr = tokio::net::lookup_host(&config.stun_server)
-        .await
-        .map_err(|e| format!("STUNサーバーのDNS解決に失敗: {e}"))?
-        .next()
-        .ok_or_else(|| "STUNサーバーのアドレスが解決できません".to_string())?;
+    // 先頭のエントリが実際のSTUN+SSHランデブー穴あけ機構に使う「主」STUNサーバー、
+    // 残り(あれば)はブートストラップ時の追加client_candidatesとしてのみ使う
+    // (`IsekaiStunP2pConfig::stun_servers`のdocコメント参照)。
+    let stun_addrs = resolve_stun_servers(&config.stun_servers).await?;
+    let stun_addr = stun_addrs[0];
 
     // STUN問い合わせ・穴あけprobe送信・QUIC接続を同一ソケットで行う必要があるため、
     // 生の std ソケットを bind し、noq に渡す前に raw な send_to/recv_from で使う
@@ -201,7 +229,7 @@ async fn try_connect_isekai_stun_p2p(
     info!("isekai_stun_p2p: our observed address is {our_observed_addr} (via {stun_addr})");
 
     let handshake =
-        bootstrap_via_ssh_with_punch(config, stun_addr, our_observed_addr, host_key_callback).await?;
+        bootstrap_via_ssh_with_punch(config, stun_addr, our_observed_addr, &stun_addrs, host_key_callback).await?;
 
     let peer_addr: SocketAddr = handshake
         .stun_observed_addr()
@@ -239,6 +267,7 @@ async fn bootstrap_via_ssh_with_punch(
     config: &IsekaiStunP2pConfig,
     stun_server: SocketAddr,
     punch_peer: SocketAddr,
+    stun_servers: &[SocketAddr],
     host_key_callback: Option<Arc<dyn SessionCallback>>,
 ) -> Result<IsekaiPipeHandshake, String> {
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
@@ -266,6 +295,7 @@ async fn bootstrap_via_ssh_with_punch(
         "127.0.0.1:22",
         None,
         &p2p_mode,
+        stun_servers,
     )
     .await
     .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))
@@ -493,7 +523,7 @@ mod tests {
             cols: 80,
             rows: 24,
             jump: None,
-            stun_server: stun_server.to_string(),
+            stun_servers: vec![stun_server.to_string()],
         };
 
         let session = create_isekai_stun_p2p_session(config);

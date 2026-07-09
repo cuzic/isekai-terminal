@@ -395,8 +395,11 @@ pub(crate) async fn bootstrap_helper_via_ssh(
     }
 
     let binaries = IsekaiPipeBinaries { x86_64: ISEKAI_PIPE_BIN_X86_64, aarch64: ISEKAI_PIPE_BIN_AARCH64 };
+    // このtransportにはSTUNサーバー設定が無いため常に空スライス
+    // (client_candidatesは付かないが、`--bootstrap-request-file`封筒自体は
+    // 一貫して送る。isekai-terminal-core/isekai-ssh crate共有化 Phase 2c)。
     helper_bootstrap::ensure_helper_running(
-        &mut established.handle, &binaries, ISEKAI_PIPE_VERSION, "127.0.0.1:22", bind_port, p2p_mode,
+        &mut established.handle, &binaries, ISEKAI_PIPE_VERSION, "127.0.0.1:22", bind_port, p2p_mode, &[],
     )
         .await
         .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))

@@ -53,6 +53,11 @@ isekai-stun = { path = "isekai-stun" }
 # Phase S-0f: HELLO/proof/ACK・handshake JSON の型は isekai-protocol (pure crate)
 # を SSOT にする。ISEKAI_SSH_DESIGN.md「共有ロジックの crate 分割」参照。
 isekai-protocol = { path = "isekai-protocol" }
+# Phase 2c(isekai-terminal-core/isekai-ssh crate共有化): クライアント側STUN candidate
+# 収集ロジック(client_candidates::fresh_bootstrap_request_v2)をisekai-ssh CLIと共有する。
+# isekai-bootstrapはisekai-terminal-core/UniFFI/Android専用型に一切依存しないpure寄りの
+# crateなので、この一方向依存は循環しない。
+isekai-bootstrap = { path = "isekai-bootstrap" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"
