@@ -58,6 +58,20 @@ pub struct HelperTrust {
     /// matches its current session and the HELLO/proof exchange will be
     /// rejected — see `isekai-ssh::connect`'s handling of that case.
     pub cached_session_secret: String,
+    /// `HandshakeJson::stun_observed_addr()` (`"ip:port"`) from that same
+    /// handshake, if the remote `isekai-helper` was launched with
+    /// `--stun-server` (`#20b`) and it answered. `None` when no STUN
+    /// exchange happened (the common case before `#20b`, or when every
+    /// configured STUN server failed to respond,
+    /// `isekai-bootstrap::openssh::collect_client_stun_candidates`) — this is
+    /// purely a cache of what the *server* observed about itself; deciding
+    /// whether/how to actually attempt a direct STUN-P2P connection using it
+    /// is deferred to a future candidate-selection pass (`#13b`), not this
+    /// field's own concern. `#[serde(default)]` keeps existing
+    /// `known_helpers.toml` files (written before this field existed) loading
+    /// unchanged, with this simply absent/`None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_stun_observed_addr: Option<String>,
 }
 
 /// The whole `known_helpers.toml` document.
@@ -103,6 +117,7 @@ mod tests {
             cached_relay_addr: "203.0.113.10:45231".to_string(),
             cached_cert_sha256: "3a7f".to_string(),
             cached_session_secret: "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=".to_string(),
+            cached_stun_observed_addr: Some("198.51.100.7:45231".to_string()),
         }
     }
 
@@ -142,6 +157,10 @@ stable = "release-key-material"
         assert_eq!(entry.cached_relay_addr, "203.0.113.10:45231");
         assert_eq!(entry.cached_cert_sha256, "3a7f...");
         assert_eq!(entry.cached_session_secret, "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=");
+        // `#20b`: a `known_helpers.toml` written before this field existed
+        // (no `cached_stun_observed_addr` key at all) must still load, with
+        // this simply defaulting to `None`.
+        assert_eq!(entry.cached_stun_observed_addr, None);
         assert_eq!(store.release_keys.get("stable").unwrap(), "release-key-material");
     }
 

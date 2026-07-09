@@ -28,10 +28,12 @@ pub const CONFIG_DIR_NAME: &str = "isekai-ssh";
 pub const TRUST_STORE_FILE_NAME: &str = "known_helpers.toml";
 
 /// `~/.config/isekai-ssh` (XDG Base Directory convention, per
-/// `archive/ISEKAI_SSH_DESIGN.md`).
+/// `archive/ISEKAI_SSH_DESIGN.md`). Resolves the home directory via
+/// `isekai_fs_guard::resolve_home_dir` (`$HOME`, falling back to
+/// `%USERPROFILE%` on Windows where `HOME` isn't reliably set).
 pub fn default_config_dir() -> Result<PathBuf, TrustError> {
-    let home = std::env::var_os("HOME").ok_or(TrustError::NoHomeDir)?;
-    Ok(config_dir_from_home(Path::new(&home)))
+    let home = isekai_fs_guard::resolve_home_dir().ok_or(TrustError::NoHomeDir)?;
+    Ok(config_dir_from_home(&home))
 }
 
 /// Pure helper split out of `default_config_dir` so the path-joining logic
@@ -138,6 +140,7 @@ mod tests {
             cached_relay_addr: "203.0.113.10:45231".to_string(),
             cached_cert_sha256: "3a7f".to_string(),
             cached_session_secret: "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=".to_string(),
+            cached_stun_observed_addr: None,
         }
     }
 
