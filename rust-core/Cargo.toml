@@ -1,6 +1,17 @@
 [workspace]
-members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-release-verify", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe"]
+members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-release-verify", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "quicsock", "quicsock-noq"]
 resolver = "2"
+
+# quicsock/quicsock-noq(/home/cuzic/quicsockからvendor。isekai-transportへの
+# マルチパス移植のための物理インタフェース束縛層)は`*.workspace = true`で
+# これらを継承する。vendor元のCargo.tomlをそのまま保つための最小限のセクションで、
+# 既存クレートはどれもこれを参照していない。
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cuzic/quicsock"
 
 [package]
 name = "isekai-terminal-core"

@@ -1,0 +1,34 @@
+[package]
+name = "quicsock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cross-platform UDP/TCP/raw IP sockets bound to a specific network interface — e.g. for QUIC implementations (quinn, noq, s2n-quic, quiche, msquic, ...) that need to pick which physical/logical interface a path uses."
+repository.workspace = true
+readme = "README.md"
+keywords = ["quic", "socket", "network-interface", "multipath", "socket2"]
+categories = ["network-programming", "os"]
+
+[dependencies]
+socket2 = { version = "0.6", features = ["all"] }
+
+# Optional interface enumeration convenience layer. `quicsock`'s core `bind`
+# API only needs a raw interface index (see module docs on why), so this is
+# opt-in rather than a hard dependency.
+netdev = { version = "0.45", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-sys = "0.6"
+
+[features]
+discovery = ["dep:netdev"]
+
+[dev-dependencies]
+netdev = "0.45"
