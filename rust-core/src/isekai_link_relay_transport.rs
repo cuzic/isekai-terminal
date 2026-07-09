@@ -305,26 +305,12 @@ async fn connect_relay_stream(
                 &cert_sha256_hex,
             )
             .await?;
-            let resume_proof = compute_proof(&conn, &session_secret, &session_id)?;
-
-            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi (resume) failed: {e}"))?;
-            let mut frame = vec![resume_client::RESUME];
-            frame.extend_from_slice(&session_id);
-            frame.extend_from_slice(&resume_proof);
-            frame.extend_from_slice(&client_sent_offset.to_be_bytes());
-            frame.extend_from_slice(&client_delivered_offset.to_be_bytes());
-            send.write_all(&frame).await.map_err(|e| format!("RESUME write failed: {e}"))?;
-
-            let mut resp = [0u8; 1];
-            recv.read_exact(&mut resp).await.map_err(|e| format!("RESUME_ACK read failed: {e}"))?;
-            if resp[0] != resume_client::RESUME_ACK {
-                return Err(format!("isekai-helper rejected resume: {:#x}", resp[0]));
-            }
-            let mut rest = [0u8; 16];
-            recv.read_exact(&mut rest).await.map_err(|e| format!("RESUME_ACK body read failed: {e}"))?;
-            let helper_committed_offset = u64::from_be_bytes(rest[0..8].try_into().unwrap());
-            info!("isekai_link_relay: resume succeeded, helper_committed_offset={helper_committed_offset}");
-            Ok(resume_client::ReattachResult { send, recv, helper_committed_offset })
+            let result = isekai_pipe_quic_transport::send_resume_and_await_ack(
+                &conn, &session_secret, session_id, client_sent_offset, client_delivered_offset,
+            )
+            .await?;
+            info!("isekai_link_relay: resume succeeded, helper_committed_offset={}", result.helper_committed_offset);
+            Ok(result)
         })
     });
 

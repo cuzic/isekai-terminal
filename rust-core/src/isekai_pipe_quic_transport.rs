@@ -588,6 +588,38 @@ pub(crate) fn compute_proof(conn: &noq::Connection, session_secret: &[u8], extra
     Ok(mac.finalize().into_bytes().into())
 }
 
+/// `RESUME`フレームを送り`RESUME_ACK`を待つ。`conn`は呼び出し元が経路(direct/relay/STUN)
+/// ごとに異なる方法で確立済みの、resume先への新規QUIC connectionであること。
+/// quic/relay/stunの3ファイルで重複していたRESUME送受信ロジックを集約したもの
+/// (isekai-terminal-core/isekai-transport crate共有化 Phase 1a)。
+pub(crate) async fn send_resume_and_await_ack(
+    conn: &noq::Connection,
+    session_secret: &[u8],
+    session_id: resume_client::SessionId,
+    client_sent_offset: u64,
+    client_delivered_offset: u64,
+) -> Result<resume_client::ReattachResult, String> {
+    let resume_proof = compute_proof(conn, session_secret, &session_id)?;
+
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi (resume) failed: {e}"))?;
+    let mut frame = vec![resume_client::RESUME];
+    frame.extend_from_slice(&session_id);
+    frame.extend_from_slice(&resume_proof);
+    frame.extend_from_slice(&client_sent_offset.to_be_bytes());
+    frame.extend_from_slice(&client_delivered_offset.to_be_bytes());
+    send.write_all(&frame).await.map_err(|e| format!("RESUME write failed: {e}"))?;
+
+    let mut resp = [0u8; 1];
+    recv.read_exact(&mut resp).await.map_err(|e| format!("RESUME_ACK read failed: {e}"))?;
+    if resp[0] != resume_client::RESUME_ACK {
+        return Err(format!("isekai-helper rejected resume: {:#x}", resp[0]));
+    }
+    let mut rest = [0u8; 16];
+    recv.read_exact(&mut rest).await.map_err(|e| format!("RESUME_ACK body read failed: {e}"))?;
+    let helper_committed_offset = u64::from_be_bytes(rest[0..8].try_into().unwrap());
+    Ok(resume_client::ReattachResult { send, recv, helper_committed_offset })
+}
+
 /// Resolve the explicit `direct-by-bootstrap-host` mode.
 ///
 /// This compatibility path reuses the SSH bootstrap host as the QUIC dial host.
@@ -669,26 +701,9 @@ async fn connect_isekai_pipe_quic_stream(
         let session_secret = session_secret.clone();
         Box::pin(async move {
             let conn = establish_quic_connection(remote, &cert_sha256_hex).await?;
-            let resume_proof = compute_proof(&conn, &session_secret, &session_id)?;
-
-            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi (resume) failed: {e}"))?;
-            let mut frame = vec![resume_client::RESUME];
-            frame.extend_from_slice(&session_id);
-            frame.extend_from_slice(&resume_proof);
-            frame.extend_from_slice(&client_sent_offset.to_be_bytes());
-            frame.extend_from_slice(&client_delivered_offset.to_be_bytes());
-            send.write_all(&frame).await.map_err(|e| format!("RESUME write failed: {e}"))?;
-
-            let mut resp = [0u8; 1];
-            recv.read_exact(&mut resp).await.map_err(|e| format!("RESUME_ACK read failed: {e}"))?;
-            if resp[0] != resume_client::RESUME_ACK {
-                return Err(format!("isekai-helper rejected resume: {:#x}", resp[0]));
-            }
-            let mut rest = [0u8; 16];
-            recv.read_exact(&mut rest).await.map_err(|e| format!("RESUME_ACK body read failed: {e}"))?;
-            let helper_committed_offset = u64::from_be_bytes(rest[0..8].try_into().unwrap());
-            info!("isekai_pipe_quic: resume succeeded, helper_committed_offset={helper_committed_offset}");
-            Ok(resume_client::ReattachResult { send, recv, helper_committed_offset })
+            let result = send_resume_and_await_ack(&conn, &session_secret, session_id, client_sent_offset, client_delivered_offset).await?;
+            info!("isekai_pipe_quic: resume succeeded, helper_committed_offset={}", result.helper_committed_offset);
+            Ok(result)
         })
     });
 
