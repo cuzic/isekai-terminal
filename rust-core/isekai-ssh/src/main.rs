@@ -10,6 +10,7 @@
 //! populate/manage the trust store the wrapper reads from.
 
 mod cli;
+mod helper_download;
 mod init;
 mod login;
 mod wrapper;

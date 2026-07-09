@@ -154,6 +154,14 @@ pub fn classify_bootstrap_error(err: &isekai_bootstrap::BootstrapError) -> Optio
         E::HandshakeMissing { .. } => Some(BootstrapFailure::JumpHostUnreachable),
         E::UnexpectedStdout { .. } => Some(BootstrapFailure::RemoteBinaryUntrusted),
         E::HandshakeParse(_) => Some(BootstrapFailure::RemoteBinaryUntrusted),
+        // `uname -m` (a supporting probe, not the upload/launch step itself)
+        // failed to run at all — a connectivity-shaped failure, same bucket
+        // as `HandshakeMissing`.
+        E::RemoteCommandFailed { .. } => Some(BootstrapFailure::JumpHostUnreachable),
+        // No pre-built `isekai-pipe` exists for this remote's architecture —
+        // there is no upload step this plan can perform, matching
+        // `RemoteBinaryMissing`'s own doc comment.
+        E::UnsupportedArch(_) => Some(BootstrapFailure::RemoteBinaryMissing),
         E::InvalidRelayParam(_) | E::InvalidRemotePath(_) => None,
     }
 }
@@ -250,6 +258,13 @@ mod tests {
 
         let invalid_path = BootstrapError::InvalidRemotePath("bad path".to_string());
         assert!(classify_bootstrap_error(&invalid_path).is_none());
+
+        let remote_command_failed =
+            BootstrapError::RemoteCommandFailed { command: "uname -m".to_string(), status: Some(1), stderr: String::new() };
+        assert!(matches!(classify_bootstrap_error(&remote_command_failed), Some(BootstrapFailure::JumpHostUnreachable)));
+
+        let unsupported_arch = BootstrapError::UnsupportedArch("riscv64".to_string());
+        assert!(matches!(classify_bootstrap_error(&unsupported_arch), Some(BootstrapFailure::RemoteBinaryMissing)));
     }
 
     #[test]
