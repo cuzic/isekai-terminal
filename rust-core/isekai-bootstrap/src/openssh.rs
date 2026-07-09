@@ -112,6 +112,28 @@ impl OpenSshBackend {
         self
     }
 
+    /// Runs `uname -m` on `target` (through `via`, if given) and normalizes
+    /// the result to `"x86_64"`/`"aarch64"` — a *separate* `ssh(1)`
+    /// round-trip from `install_and_start`'s own upload/launch steps
+    /// (matching this module's existing "one ssh(1) invocation per logical
+    /// step" shape). Exists so a caller with no explicit `--helper-binary`
+    /// can pick which pre-built `isekai-pipe` variant to fetch/upload before
+    /// ever calling `install_and_start` — mirrors `rust-core/src/
+    /// helper_bootstrap.rs`'s `ensure_helper_running` (Android's own
+    /// remote-bootstrap path), which runs the identical `uname -m` probe for
+    /// the identical reason.
+    pub async fn detect_remote_arch(&self, target: &HostSpec, via: &[JumpSpec]) -> Result<String, BootstrapError> {
+        let out = self.run_ssh_command(target, via, "uname -m", None).await?;
+        if out.status != Some(0) {
+            return Err(BootstrapError::RemoteCommandFailed {
+                command: "uname -m".to_string(),
+                status: out.status,
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        normalize_uname_arch(&String::from_utf8_lossy(&out.stdout))
+    }
+
     fn build_args(&self, target: &HostSpec, via: &[JumpSpec], remote_command: &str) -> Vec<String> {
         let mut args = vec![
             "-T".to_string(),
@@ -461,6 +483,18 @@ fn join_via_chain(via: &[JumpSpec]) -> Option<String> {
     Some(via.iter().map(JumpSpec::to_arg).collect::<Vec<_>>().join(","))
 }
 
+/// Normalizes `uname -m`'s output to `"x86_64"`/`"aarch64"`, or rejects it —
+/// same mapping as `rust-core/src/helper_bootstrap.rs`'s
+/// `IsekaiPipeBinaries::select_for` (Android's own remote-bootstrap path),
+/// kept identical deliberately rather than reinvented here.
+fn normalize_uname_arch(uname_m: &str) -> Result<String, BootstrapError> {
+    match uname_m.trim() {
+        "x86_64" => Ok("x86_64".to_string()),
+        "aarch64" | "arm64" => Ok("aarch64".to_string()),
+        other => Err(BootstrapError::UnsupportedArch(other.to_string())),
+    }
+}
+
 fn remote_parent_dir(path: &str) -> &str {
     match path.rsplit_once('/') {
         Some((dir, _)) if !dir.is_empty() => dir,
@@ -592,6 +626,23 @@ mod tests {
             JumpSpec::new("bastion-c").with_port(22),
         ];
         assert_eq!(join_via_chain(&chain), Some("alice@bastion-a:2222,bastion-b,bastion-c:22".to_string()));
+    }
+
+    #[test]
+    fn normalize_uname_arch_accepts_x86_64() {
+        assert_eq!(normalize_uname_arch("x86_64\n").unwrap(), "x86_64");
+    }
+
+    #[test]
+    fn normalize_uname_arch_accepts_aarch64_and_arm64_aliases() {
+        assert_eq!(normalize_uname_arch("aarch64\n").unwrap(), "aarch64");
+        assert_eq!(normalize_uname_arch("arm64\n").unwrap(), "aarch64");
+    }
+
+    #[test]
+    fn normalize_uname_arch_rejects_unknown_architectures() {
+        let err = normalize_uname_arch("riscv64\n").unwrap_err();
+        assert!(matches!(err, BootstrapError::UnsupportedArch(ref a) if a == "riscv64"));
     }
 
     #[tokio::test]

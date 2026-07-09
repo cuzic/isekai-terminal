@@ -285,6 +285,41 @@ async fn install_and_start_gets_a_real_handshake_over_a_real_ssh_subprocess() {
     assert_eq!(report.handshake.cert_sha256().len(), 64);
 }
 
+/// `detect_remote_arch` over a real `ssh(1)` subprocess against the mock
+/// server (which genuinely execs `uname -m` via `sh -c` on this test
+/// machine, per this file's module docs) — the "remote" arch is therefore
+/// this test machine's own, normalized the same way
+/// `std::env::consts::ARCH` would be. Not pinned to `"x86_64"` so this test
+/// stays meaningful on aarch64 runners too.
+#[tokio::test(flavor = "multi_thread")]
+async fn detect_remote_arch_normalizes_this_machines_own_uname_m() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home, client_pubkey).await;
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+
+    let arch = tokio::time::timeout(std::time::Duration::from_secs(20), backend.detect_remote_arch(&target, &[]))
+        .await
+        .expect("detect_remote_arch should not hang")
+        .expect("detect_remote_arch should succeed against the mock server");
+
+    let expected = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => panic!("this test machine's own arch {other:?} isn't one this test can assert against"),
+    };
+    assert_eq!(arch, expected);
+}
+
 /// `RelayLaunchSpec::idle_lifetime_secs` must actually reach the launched
 /// `isekai-helper` process's argv as `--max-idle-lifetime <SECS>` — this is
 /// the fix for the `archive/ISEKAI_SSH_DESIGN.md` "引き続き未決の項目" gap where a

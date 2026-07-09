@@ -52,4 +52,19 @@ pub enum BootstrapError {
     /// charset check. Same defense-in-depth rationale as `InvalidRelayParam`.
     #[error("invalid remote path: {0}")]
     InvalidRemotePath(String),
+
+    /// A supporting one-off remote command (currently only `uname -m`, for
+    /// [`crate::openssh::OpenSshBackend::detect_remote_arch`]) exited
+    /// non-zero — distinct from [`Self::UploadFailed`]/[`Self::HandshakeMissing`],
+    /// which are specific to the upload/launch steps proper.
+    #[error("remote command {command:?} exited with status {status:?}: {stderr}")]
+    RemoteCommandFailed { command: String, status: Option<i32>, stderr: String },
+
+    /// `uname -m`'s output didn't match an architecture this project ships
+    /// pre-built `isekai-pipe` binaries for. Mirrors
+    /// `rust-core/src/helper_bootstrap.rs`'s `IsekaiPipeBinaries::select_for`
+    /// (Android's own remote-bootstrap path) — same two supported
+    /// architectures, same `"aarch64"`/`"arm64"` aliasing.
+    #[error("unsupported remote architecture {0:?} (uname -m)")]
+    UnsupportedArch(String),
 }
