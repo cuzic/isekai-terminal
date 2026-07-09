@@ -117,13 +117,24 @@ impl ServerCertVerifier for PinnedCertVerifier {
 /// (`TransportConfig::max_concurrent_multipath_paths`) — required on *both*
 /// sides of a connection before `noq::Connection::open_path` will do
 /// anything but fail with "multipath extension not negotiated" (confirmed
-/// via `multipath::connect_multipath`'s own e2e test). `false` for ordinary
-/// single-path connections (`relay.rs`/`stun_p2p.rs`/
-/// `android_quic_endpoint.rs`) — advertising a capability those connections
-/// never use would be a pointless (if harmless) transport-parameter change
-/// from what isekai-helper today expects, and `multipath_transport.rs`'s
-/// own `build_pinned_client_config` deliberately keeps this opt-in for the
-/// same reason.
+/// via `multipath::connect_multipath`'s own e2e test). This is *also* a
+/// prerequisite for `noq::Endpoint::rebind`'s own connection-migration
+/// (PATH_CHALLENGE/PATH_RESPONSE) validation to succeed rather than hang
+/// (confirmed via `rebind_e2e.rs` — without it, rebinding a live connection
+/// onto a new socket silently breaks it) — so `SystemQuicEndpoint::connect`
+/// passes `true` unconditionally: any connection it makes might later go
+/// through its own `rebinder()` (`isekai-pipe`'s `--experimental-network-
+/// rebind`), and `isekai-pipe serve`'s own server-side `TransportConfig`
+/// (`isekai-pipe/src/engine/mod.rs`) already negotiates this unconditionally
+/// too, for the identical reason ("既存clientはopen_path()を呼ばないため影響なし",
+/// Phase 9-1) — a client that doesn't negotiate it back was the one actual
+/// asymmetry, not a deliberate opt-in. `android_quic_endpoint.rs` is the one
+/// caller that still passes `false`: `AndroidQuicEndpoint::rebinder()` is
+/// unconditionally `None` (Android's own `multipath_transport.rs` handles
+/// physical-interface failover through its own mechanism, not this trait —
+/// see that type's docs), so there is nothing on the Android side that could
+/// ever call `rebind()` through this path to make multipath negotiation
+/// worth the (harmless, but non-zero) extra transport parameter.
 pub fn client_config_for(cert_sha256_hex: &str, multipath: bool) -> Result<noq::ClientConfig, TransportError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -218,7 +229,7 @@ struct SystemQuicEndpoint {
 #[async_trait]
 impl QuicEndpoint for SystemQuicEndpoint {
     async fn connect(&self, remote: RemoteSpec) -> Result<Box<dyn QuicConnection>, TransportError> {
-        let client_config = client_config_for(&remote.cert_sha256_hex, false)?;
+        let client_config = client_config_for(&remote.cert_sha256_hex, true)?;
         info!("isekai-transport: connecting to {}", remote.addr);
         let conn = self
             .endpoint

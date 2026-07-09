@@ -1,5 +1,4 @@
-//! End-to-end test for `noq::Endpoint::rebind` (what
-//! `QuicEndpointRebinder::rebind_socket` calls, `system.rs`) fed a socket
+//! End-to-end test for `QuicEndpointRebinder::rebind_socket` fed a socket
 //! bound via `isekai_transport::bind_physical_interface` (the vendored
 //! `quicsock` crate) — proves the CLI/PC physical-interface-rebind path
 //! (`isekai-transport::physical_interface`, the reactive-failover half of
@@ -8,29 +7,28 @@
 //! not just that `quicsock::bind_udp` succeeds in isolation
 //! (`physical_interface.rs`'s own unit tests only cover that part).
 //!
-//! This deliberately does **not** go through `SystemQuicEndpointFactory` (the
-//! production single-path connection path) — building the connection this
-//! test found a real, separate, pre-existing issue: `noq::Endpoint::rebind`
-//! relies on QUIC connection-migration path validation, which in `noq`
-//! 1.0.1 only succeeds if *both* sides negotiated the multipath extension
-//! (`TransportConfig::max_concurrent_multipath_paths`) at connect time —
-//! `SystemQuicEndpointFactory`'s connections don't (`client_config_for`'s
-//! `multipath: bool` param, `false` there on purpose, matching what
-//! `isekai-pipe serve` negotiates today). That means `isekai-pipe`'s
-//! `--experimental-network-rebind` likely does not actually work as shipped
-//! — tracked separately, not fixed here (production fix needs
-//! `isekai-pipe serve`'s server-side transport config changed too, out of
-//! scope for the isekai-transport crate-sharing work this test belongs to).
-//! This test builds its own multipath-negotiated connection directly so it
-//! can still prove the piece actually in scope: quicsock-bound sockets are
-//! valid, working `noq` rebind targets.
+//! Goes through `SystemQuicEndpointFactory` — the actual production
+//! single-path connection path `isekai-pipe`'s `--experimental-network-
+//! rebind` uses — rather than a hand-rolled connection. Earlier versions of
+//! this test could not do that: `noq::Endpoint::rebind`'s connection-
+//! migration (PATH_CHALLENGE/PATH_RESPONSE) validation only succeeds if
+//! *both* sides negotiated noq's multipath extension
+//! (`TransportConfig::max_concurrent_multipath_paths`), and
+//! `SystemQuicEndpoint::connect` didn't negotiate it — meaning
+//! `--experimental-network-rebind` would silently break the connection on
+//! its first rebind. Fixed in `system.rs`'s `client_config_for` call site
+//! (now unconditionally `true`, matching `isekai-pipe serve`'s own
+//! server-side `TransportConfig`, which already negotiated this
+//! unconditionally since Phase 9-1). This test exercises the real,
+//! now-fixed path end-to-end.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use isekai_protocol::hello::ALPN;
-use isekai_transport::{bind_physical_interface, system::client_config_for, InterfaceIndex};
+use isekai_transport::traits::QuicEndpointFactory as _;
+use isekai_transport::{bind_physical_interface, BindSpec, InterfaceIndex, RemoteSpec, SystemQuicEndpointFactory};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
@@ -55,7 +53,10 @@ fn loopback_index() -> InterfaceIndex {
 }
 
 /// Bound to the wildcard address so it keeps receiving from the client's
-/// socket after it rebinds to a different loopback address.
+/// socket after it rebinds to a different loopback address. Matches
+/// `isekai-pipe serve`'s own transport config (`max_concurrent_multipath_paths`
+/// negotiated unconditionally, Phase 9-1) rather than hand-tuning it for
+/// this test.
 async fn run_echo_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs8KeyDer<'static>) -> SocketAddr {
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -66,8 +67,6 @@ async fn run_echo_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs
     let mut config = noq::ServerConfig::with_crypto(Arc::new(quic_crypto));
     let mut transport = noq::TransportConfig::default();
     transport.max_concurrent_bidi_streams(noq::VarInt::from_u32(2));
-    // Required for the client's post-rebind path-migration validation to
-    // succeed — see this file's module docs.
     transport.max_concurrent_multipath_paths(8);
     config.transport_config(Arc::new(transport));
     let endpoint = noq::Endpoint::server(config, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).unwrap();
@@ -94,44 +93,46 @@ async fn rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable() {
     let (cert_der, key_der, cert_sha256_hex) = generate_cert();
     let server_addr = run_echo_server(cert_der, key_der).await;
 
-    // Built directly (not via `SystemQuicEndpointFactory`) with multipath
-    // negotiated — see this file's module docs for why.
-    let client_config = client_config_for(&cert_sha256_hex, true).unwrap();
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-    let endpoint =
-        noq::Endpoint::new(noq::EndpointConfig::default(), None, socket, Arc::new(noq::TokioRuntime)).unwrap();
-    let conn = endpoint.connect_with(client_config, server_addr, SNI).unwrap().await.expect("initial connect should succeed");
+    let factory = SystemQuicEndpointFactory;
+    let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint should succeed");
+    let conn = endpoint
+        .connect(RemoteSpec { addr: server_addr, server_name: SNI.to_string(), cert_sha256_hex })
+        .await
+        .expect("initial connect should succeed");
 
     // Prove the connection works before rebinding.
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    send.write_all(b"before rebind").await.unwrap();
-    send.finish().unwrap();
+    let mut stream = conn.open_bi().await.unwrap();
+    stream.write_all(b"before rebind").await.unwrap();
+    stream.shutdown().await.unwrap();
     let mut buf = [0u8; 64];
-    let n = recv.read(&mut buf).await.unwrap().unwrap();
+    let n = stream.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"before rebind");
 
     let physical_socket = bind_physical_interface(loopback_index(), SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 4)), 0))
         .expect("quicsock should bind a loopback-restricted socket");
     let physical_addr = physical_socket.local_addr().unwrap();
-    // What `system::SystemQuicEndpointRebinder::rebind_socket` calls under
-    // the hood — see that type's docs.
-    endpoint.rebind(physical_socket).expect("rebind onto the quicsock-bound socket should succeed");
+    let rebinder = endpoint.rebinder().expect("SystemQuicEndpoint should support rebinding");
+    tokio::time::timeout(Duration::from_secs(5), rebinder.rebind_socket(physical_socket))
+        .await
+        .expect("rebind_socket should not hang")
+        .expect("rebind onto the quicsock-bound socket should succeed");
 
     // Prove the connection is still usable — over a fresh stream, on the
-    // endpoint's new (quicsock-bound) socket — after the rebind.
-    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+    // endpoint's new (quicsock-bound) socket — after the rebind. Before the
+    // fix this described in this file's module docs, this step would hang
+    // (the connection was silently broken by the rebind).
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
         .await
         .expect("open_bi after rebind should not hang")
         .expect("open_bi after rebind should succeed");
-    send.write_all(b"after rebind").await.unwrap();
-    send.finish().unwrap();
+    stream.write_all(b"after rebind").await.unwrap();
+    stream.shutdown().await.unwrap();
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut buf))
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
         .await
         .expect("read after rebind should not hang")
-        .unwrap()
         .unwrap();
     assert_eq!(&buf[..n], b"after rebind", "connection must keep working after rebinding onto {physical_addr}");
 
-    conn.close(noq::VarInt::from_u32(0), b"");
+    conn.close().await;
 }
