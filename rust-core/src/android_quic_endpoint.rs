@@ -127,8 +127,22 @@ impl ByteStream for AndroidByteStream {
     }
 }
 
-struct AndroidByteStreamReadHalf {
+/// `pub(crate)` (not module-private): `resume_client.rs`'s `ReattachableStream`
+/// works over `isekai_transport::traits::ByteStreamReadHalf`/`WriteHalf`
+/// rather than raw `noq` types (isekai-terminal-core/isekai-transport crate
+/// 共有化 Phase 1d) — this lets the 3 existing transport files construct one
+/// of these directly from a `noq::SendStream`/`RecvStream` pair obtained via
+/// their own (not-yet-migrated) connection-establishment code, without
+/// forcing that migration to land in the same change as the
+/// `ReattachableStream` rewrite itself.
+pub(crate) struct AndroidByteStreamReadHalf {
     recv: noq::RecvStream,
+}
+
+impl AndroidByteStreamReadHalf {
+    pub(crate) fn new(recv: noq::RecvStream) -> Self {
+        Self { recv }
+    }
 }
 
 #[async_trait]
@@ -141,8 +155,14 @@ impl ByteStreamReadHalf for AndroidByteStreamReadHalf {
     }
 }
 
-struct AndroidByteStreamWriteHalf {
+pub(crate) struct AndroidByteStreamWriteHalf {
     send: noq::SendStream,
+}
+
+impl AndroidByteStreamWriteHalf {
+    pub(crate) fn new(send: noq::SendStream) -> Self {
+        Self { send }
+    }
 }
 
 #[async_trait]

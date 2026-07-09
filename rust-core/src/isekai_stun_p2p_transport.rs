@@ -384,7 +384,12 @@ async fn connect_stun_p2p_stream(
         })
     });
 
-    Ok(resume_client::ReattachableStream::new(send, recv, resume_state, reattach_fn))
+    Ok(resume_client::ReattachableStream::new(
+        Box::new(crate::android_quic_endpoint::AndroidByteStreamReadHalf::new(recv)),
+        Box::new(crate::android_quic_endpoint::AndroidByteStreamWriteHalf::new(send)),
+        resume_state,
+        reattach_fn,
+    ))
 }
 
 async fn run_over_stream(

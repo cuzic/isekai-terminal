@@ -617,7 +617,11 @@ pub(crate) async fn send_resume_and_await_ack(
     let mut rest = [0u8; 16];
     recv.read_exact(&mut rest).await.map_err(|e| format!("RESUME_ACK body read failed: {e}"))?;
     let helper_committed_offset = u64::from_be_bytes(rest[0..8].try_into().unwrap());
-    Ok(resume_client::ReattachResult { send, recv, helper_committed_offset })
+    Ok(resume_client::ReattachResult {
+        read: Box::new(crate::android_quic_endpoint::AndroidByteStreamReadHalf::new(recv)),
+        write: Box::new(crate::android_quic_endpoint::AndroidByteStreamWriteHalf::new(send)),
+        helper_committed_offset,
+    })
 }
 
 /// Resolve the explicit `direct-by-bootstrap-host` mode.
@@ -707,7 +711,12 @@ async fn connect_isekai_pipe_quic_stream(
         })
     });
 
-    Ok(resume_client::ReattachableStream::new(send, recv, resume_state, reattach_fn))
+    Ok(resume_client::ReattachableStream::new(
+        Box::new(crate::android_quic_endpoint::AndroidByteStreamReadHalf::new(recv)),
+        Box::new(crate::android_quic_endpoint::AndroidByteStreamWriteHalf::new(send)),
+        resume_state,
+        reattach_fn,
+    ))
 }
 
 /// control stream を開き、`CONTROL_HELLO` を送って `CONTROL_ACK` を待つ。

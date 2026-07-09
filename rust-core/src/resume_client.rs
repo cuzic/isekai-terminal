@@ -6,15 +6,28 @@
 //! 逆方向（C→S）のバッファ。データ構造は同じ設計（バウンデッド・確認済み
 //! offset 破棄・指定 offset からの再送）だが、別クレート（`isekai-helper` は
 //! 独立したバイナリクレート）のため共有せず重複実装している。
+//!
+//! Phase 1d(isekai-terminal-core/isekai-transport crate共有化):
+//! `ReattachableStream`は生の`noq::SendStream`/`RecvStream`ではなく
+//! `isekai_transport::traits::{ByteStreamReadHalf, ByteStreamWriteHalf}`の上に
+//! 実装されている。async-trait由来の`async fn`ベースのtraitは、poll方式の
+//! `AsyncRead`/`AsyncWrite`へ1回のpollごとに橋渡しするのが難しい
+//! （呼び出し元が渡す`buf`の生存期間がpollごとに変わるため、future自体を
+//! poll間で保持できない）。そのため`tokio::io::duplex`を挟んだ
+//! バックグラウンドpumpタスク方式にした: 呼び出し元(russh)が触るのは常に
+//! 素通しの`DuplexStream`側であり、reattach・replay・offset管理は全て
+//! pumpタスク側の実`.await`ベースのループで行う。pollベースの手書き
+//! waker管理が不要になり、read/write両方向の失敗を1つのタスクの
+//! `tokio::select!`で自然に直列化できる（同時に2つのreattachが走らない）。
 
 use std::collections::VecDeque;
-use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use isekai_transport::traits::{ByteStreamReadHalf, ByteStreamWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub(crate) const CONTROL_HELLO: u8 = 0x10;
 pub(crate) const CONTROL_ACK: u8 = 0x11;
@@ -71,7 +84,6 @@ impl ReplayBuffer {
     }
 
     /// Phase 8-3（reattach ハンドシェイク）で使用する。8-2 の時点では未配線。
-    #[allow(dead_code)]
     pub(crate) fn replay_from(&self, from: u64) -> Option<Vec<u8>> {
         if from < self.start_offset || from > self.end_offset() {
             return None;
@@ -89,7 +101,6 @@ pub(crate) struct ClientResumeState {
     pub(crate) client_delivered_offset: u64,
     /// control stream 確立時に helper が発行した session_id。
     /// Phase 8-3（reattach ハンドシェイク）で `RESUME` フレームに使う。
-    #[allow(dead_code)]
     pub(crate) session_id: Option<SessionId>,
 }
 
@@ -171,57 +182,34 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ResumeAwareStream<S> {
     }
 }
 
-// ── Phase 8-3: reattach 対応ストリーム ──────────────────────────────
+// ── Phase 8-3 / Phase 1d: reattach 対応ストリーム ──────────────────────
 
 /// reattach（新しい QUIC connection への `RESUME` 送信）が成功した結果。
 pub(crate) struct ReattachResult {
-    pub(crate) send: noq::SendStream,
-    pub(crate) recv: noq::RecvStream,
+    pub(crate) read: Box<dyn ByteStreamReadHalf>,
+    pub(crate) write: Box<dyn ByteStreamWriteHalf>,
     /// helper が確認した C→S オフセット。これより前の replay_buffer は破棄してよい。
     pub(crate) helper_committed_offset: u64,
 }
 
-/// 1回の reattach 試行を行う関数の型。呼び出し元（`isekai_pipe_quic_transport.rs`）が
+/// 1回の reattach 試行を行う関数の型。呼び出し元（`isekai_pipe_quic_transport.rs`等）が
 /// noq/rustls の具体的な接続手順を実装し、`ReattachableStream` はこれを
 /// 抽象的に呼び出すだけにする（層を分離する）。
 pub(crate) type ReattachFn = Arc<
-    dyn Fn(SessionId, u64, u64) -> Pin<Box<dyn Future<Output = Result<ReattachResult, String>> + Send>>
+    dyn Fn(SessionId, u64, u64) -> Pin<Box<dyn std::future::Future<Output = Result<ReattachResult, String>> + Send>>
         + Send
         + Sync,
 >;
 
-enum StreamSlot {
-    Connected(noq::RecvStream, noq::SendStream),
-    /// 背後で reattach 試行中。完了したら `Connected` か `Failed` に遷移する。
-    Reattaching,
-    /// リトライ上限に達し、諦めた。以降の poll は実際の I/O エラーを返す
-    /// （呼び出し元＝ russh がここで初めて「セッションが本当に切れた」と認識する）。
-    Failed(String),
-}
+/// リトライ回数・間隔（固定値。指数バックオフ）。
+const REATTACH_MAX_RETRIES: u32 = 5;
+const REATTACH_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
-struct ReattachInner {
-    slot: Mutex<StreamSlot>,
-    wakers: Mutex<Vec<Waker>>,
-    /// `isekai_pipe_quic_transport.rs` の control stream タスク（APP_ACK 送受信）とも
-    /// 共有するため、外部で作られた `Arc<Mutex<_>>` をそのまま保持する
-    /// （このモジュール自身は所有しない）。
-    resume: Arc<Mutex<ClientResumeState>>,
-    reattach_fn: ReattachFn,
-    /// 二重に reattach タスクを起動しないためのガード。
-    reattaching_started: std::sync::atomic::AtomicBool,
-}
-
-impl ReattachInner {
-    fn register_waker(&self, cx: &Context<'_>) {
-        self.wakers.lock().unwrap().push(cx.waker().clone());
-    }
-
-    fn wake_all(&self) {
-        for w in self.wakers.lock().unwrap().drain(..) {
-            w.wake();
-        }
-    }
-}
+/// 呼び出し元(russh)とpumpタスクの間を橋渡しするバッファサイズ。
+/// reattach中もある程度は素通しに書き込み続けられる猶予として、
+/// 単発のSSHパケットが十分収まるサイズにしてある。
+const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
+const RECV_CHUNK_SIZE: usize = 16 * 1024;
 
 /// data stream を包み、QUIC connection が失われても（`RESUME` による reattach が
 /// 成功する限り）呼び出し元（russh）に I/O エラーを見せない。
@@ -231,223 +219,266 @@ impl ReattachInner {
 /// 一度でも I/O エラーを返すと russh はそのセッションを終了とみなすため、
 /// 「同じ SSH セッションを継続する」という Phase 8 の目的を達成するには、
 /// **stream オブジェクト自身が背後で新しい QUIC connection に張り替わり、
-/// 呼び出し元には何も気づかせない**必要がある。エラーを見た poll_read/
-/// poll_write は即座にエラーを返さず、reattach タスクを起動して
-/// `Poll::Pending` を返し、reattach 完了時に waker で起こす。
-/// リトライ上限に達した場合のみ、最終的に実際のエラーを返す。
-#[derive(Clone)]
+/// 呼び出し元には何も気づかせない**必要がある。
+///
+/// 呼び出し元が実際に読み書きするのは `tokio::io::duplex` の片側
+/// (`caller_side`) だけで、もう片側 (`pump_side`) をバックグラウンドタスクが
+/// 握って `ByteStreamReadHalf`/`WriteHalf` との実データ授受・reattach・
+/// replay・offset管理を行う。呼び出し元から見た「エラーを見せない」性質は、
+/// duplexの内部バッファによる自然なバックプレッシャー（reattach中は
+/// pumpタスクが busy なのでバッファが埋まるまで書き込みが単純にブロックする）
+/// と、リトライ上限到達時のみ立つ`terminal_error`フラグの2つで実現する。
 pub(crate) struct ReattachableStream {
-    inner: Arc<ReattachInner>,
+    duplex: tokio::io::DuplexStream,
+    terminal_error: Arc<Mutex<Option<String>>>,
 }
 
-/// リトライ回数・間隔（固定値。指数バックオフ）。
-const REATTACH_MAX_RETRIES: u32 = 5;
-const REATTACH_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-
 impl ReattachableStream {
-    /// data stream の read/write が I/O エラーを返した際の共通処理。
-    /// エラーを呼び出し元（russh）にはまだ見せず、reattach を起動して
-    /// waker を登録するところまでを行う（`Poll::Pending` を返すのは呼び出し側）。
-    fn begin_reattach_after_io_error(&self, cx: &Context<'_>, e: impl std::fmt::Display, direction: &str) {
-        log::warn!("reattach: data stream {direction} failed ({e}), triggering reattach");
-        self.trigger_reattach();
-        self.inner.register_waker(cx);
-    }
-
     pub(crate) fn new(
-        send: noq::SendStream,
-        recv: noq::RecvStream,
+        read: Box<dyn ByteStreamReadHalf>,
+        write: Box<dyn ByteStreamWriteHalf>,
         resume_state: Arc<Mutex<ClientResumeState>>,
         reattach_fn: ReattachFn,
     ) -> Self {
-        Self {
-            inner: Arc::new(ReattachInner {
-                slot: Mutex::new(StreamSlot::Connected(recv, send)),
-                wakers: Mutex::new(Vec::new()),
-                resume: resume_state,
-                reattach_fn,
-                reattaching_started: std::sync::atomic::AtomicBool::new(false),
-            }),
-        }
+        let (caller_side, pump_side) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
+        let terminal_error = Arc::new(Mutex::new(None));
+        tokio::spawn(run_pump(pump_side, read, write, resume_state, reattach_fn, terminal_error.clone()));
+        Self { duplex: caller_side, terminal_error }
     }
 
-    fn trigger_reattach(&self) {
-        use std::sync::atomic::Ordering;
-        if self
-            .inner
-            .reattaching_started
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            // 既に別の poll がトリガー済み。
-            return;
-        }
-        *self.inner.slot.lock().unwrap() = StreamSlot::Reattaching;
-
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            let mut attempt = 0u32;
-            loop {
-                attempt += 1;
-                let (session_id, client_sent_offset, client_delivered_offset) = {
-                    let resume = inner.resume.lock().unwrap();
-                    let Some(id) = resume.session_id else {
-                        // control stream が一度も確立していない = resume 不可能。
-                        let mut slot = inner.slot.lock().unwrap();
-                        *slot = StreamSlot::Failed("no session_id, resume not supported for this connection".into());
-                        drop(slot);
-                        inner.wake_all();
-                        return;
-                    };
-                    (id, resume.replay_buffer.end_offset(), resume.client_delivered_offset)
-                };
-
-                log::info!("reattach: attempt {attempt}/{REATTACH_MAX_RETRIES}");
-                match (inner.reattach_fn)(session_id, client_sent_offset, client_delivered_offset).await {
-                    Ok(mut result) => {
-                        // helper がまだ受け取っていない C→S バイト列を、通常の
-                        // relay に戻す前に replay しておく。
-                        let to_replay = {
-                            let resume = inner.resume.lock().unwrap();
-                            resume.replay_buffer.replay_from(result.helper_committed_offset)
-                        };
-                        if let Some(bytes) = to_replay {
-                            if !bytes.is_empty() {
-                                if let Err(e) = result.send.write_all(&bytes).await {
-                                    log::warn!("reattach: failed to replay C->S bytes: {e}");
-                                    if attempt >= REATTACH_MAX_RETRIES {
-                                        *inner.slot.lock().unwrap() = StreamSlot::Failed(e.to_string());
-                                        inner.wake_all();
-                                        return;
-                                    }
-                                    tokio::time::sleep(REATTACH_BASE_DELAY * 2u32.pow(attempt - 1)).await;
-                                    continue;
-                                }
-                            }
-                        }
-                        {
-                            let mut resume = inner.resume.lock().unwrap();
-                            resume.replay_buffer.advance_start(result.helper_committed_offset);
-                        }
-                        *inner.slot.lock().unwrap() = StreamSlot::Connected(result.recv, result.send);
-                        inner.reattaching_started.store(false, Ordering::SeqCst);
-                        log::info!("reattach: succeeded on attempt {attempt}");
-                        inner.wake_all();
-                        return;
-                    }
-                    Err(e) => {
-                        log::warn!("reattach: attempt {attempt} failed: {e}");
-                        if attempt >= REATTACH_MAX_RETRIES {
-                            *inner.slot.lock().unwrap() = StreamSlot::Failed(e);
-                            inner.wake_all();
-                            return;
-                        }
-                        let delay = REATTACH_BASE_DELAY * 2u32.pow(attempt - 1);
-                        tokio::time::sleep(delay).await;
-                    }
-                }
-            }
-        });
+    fn check_terminal_error(&self) -> Option<io::Error> {
+        self.terminal_error.lock().unwrap().clone().map(|msg| io::Error::new(io::ErrorKind::NotConnected, msg))
     }
 }
 
 impl AsyncRead for ReattachableStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        let mut slot = this.inner.slot.lock().unwrap();
-        match &mut *slot {
-            StreamSlot::Connected(recv, _send) => {
-                let before = buf.filled().len();
-                match Pin::new(recv).poll_read(cx, buf) {
-                    Poll::Ready(Ok(())) => {
-                        let n = buf.filled().len() - before;
-                        drop(slot);
-                        if n > 0 {
-                            this.inner.resume.lock().unwrap().client_delivered_offset += n as u64;
-                        }
-                        Poll::Ready(Ok(()))
-                    }
-                    Poll::Ready(Err(e)) => {
-                        drop(slot);
-                        this.begin_reattach_after_io_error(cx, e, "read");
-                        Poll::Pending
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-            StreamSlot::Reattaching => {
-                drop(slot);
-                this.inner.register_waker(cx);
-                Poll::Pending
-            }
-            StreamSlot::Failed(msg) => {
-                let err = io::Error::new(io::ErrorKind::NotConnected, msg.clone());
-                Poll::Ready(Err(err))
-            }
+        if let Some(err) = this.check_terminal_error() {
+            return Poll::Ready(Err(err));
         }
+        Pin::new(&mut this.duplex).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for ReattachableStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let mut slot = this.inner.slot.lock().unwrap();
-        match &mut *slot {
-            StreamSlot::Connected(_recv, send) => match Pin::new(send).poll_write(cx, buf) {
-                Poll::Ready(Ok(n)) => {
-                    drop(slot);
-                    if n > 0 {
-                        this.inner.resume.lock().unwrap().replay_buffer.append(&buf[..n]);
-                    }
-                    Poll::Ready(Ok(n))
-                }
-                Poll::Ready(Err(e)) => {
-                    drop(slot);
-                    this.begin_reattach_after_io_error(cx, e, "write");
-                    Poll::Pending
-                }
-                Poll::Pending => Poll::Pending,
-            },
-            StreamSlot::Reattaching => {
-                drop(slot);
-                this.inner.register_waker(cx);
-                Poll::Pending
-            }
-            StreamSlot::Failed(msg) => {
-                let err = io::Error::new(io::ErrorKind::NotConnected, msg.clone());
-                Poll::Ready(Err(err))
-            }
+        if let Some(err) = this.check_terminal_error() {
+            return Poll::Ready(Err(err));
         }
+        Pin::new(&mut this.duplex).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        let mut slot = this.inner.slot.lock().unwrap();
-        match &mut *slot {
-            StreamSlot::Connected(_recv, send) => Pin::new(send).poll_flush(cx),
-            StreamSlot::Reattaching => {
-                drop(slot);
-                this.inner.register_waker(cx);
-                Poll::Pending
-            }
-            StreamSlot::Failed(msg) => Poll::Ready(Err(io::Error::new(io::ErrorKind::NotConnected, msg.clone()))),
+        if let Some(err) = this.check_terminal_error() {
+            return Poll::Ready(Err(err));
         }
+        Pin::new(&mut this.duplex).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // shutdown 中に既に failed 状態でも、呼び出し元は既にセッションを
+        // 終わらせようとしているので成功扱いにする(旧pollベース実装と同じ判断)。
         let this = self.get_mut();
-        let mut slot = this.inner.slot.lock().unwrap();
-        match &mut *slot {
-            StreamSlot::Connected(_recv, send) => Pin::new(send).poll_shutdown(cx),
-            // shutdown 中に reattach が要る状態なら、素直に成功扱いにする
-            // （呼び出し元は既にセッションを終わらせようとしている）。
-            StreamSlot::Reattaching | StreamSlot::Failed(_) => Poll::Ready(Ok(())),
+        Pin::new(&mut this.duplex).poll_shutdown(cx)
+    }
+}
+
+/// `run_pump`が実データ授受のループから抜けて reattach を試みる理由。
+enum PumpEvent {
+    /// 呼び出し元(duplex)からバイト列を読んだ。helperへ転送する。
+    FromCaller(Vec<u8>),
+    /// 呼び出し元が書き込み側を閉じた(EOF)。もう送るデータは無い。
+    FromCallerClosed,
+    /// helperからバイト列を読んだ。呼び出し元(duplex)へ転送する。
+    FromHelper(Vec<u8>),
+    /// helperが読み込み方向をclean EOFで閉じた。
+    FromHelperClosed,
+    /// helperとの読み書きいずれかが失敗した。reattachが必要。
+    Failed { direction: &'static str, message: String },
+}
+
+async fn next_pump_event(
+    pump_read: &mut (impl AsyncRead + Unpin),
+    read: &mut dyn ByteStreamReadHalf,
+    send_buf: &mut [u8],
+    recv_buf: &mut [u8],
+    helper_read_done: bool,
+) -> PumpEvent {
+    tokio::select! {
+        result = pump_read.read(send_buf) => {
+            match result {
+                Ok(0) => PumpEvent::FromCallerClosed,
+                Ok(n) => PumpEvent::FromCaller(send_buf[..n].to_vec()),
+                Err(_) => PumpEvent::FromCallerClosed,
+            }
+        }
+        result = read.read(recv_buf), if !helper_read_done => {
+            match result {
+                Ok(0) => PumpEvent::FromHelperClosed,
+                Ok(n) => PumpEvent::FromHelper(recv_buf[..n].to_vec()),
+                Err(e) => PumpEvent::Failed { direction: "read", message: e.to_string() },
+            }
+        }
+    }
+}
+
+/// `reattach_fn`を呼び、成功したら`helper_committed_offset`より前を
+/// `replay_buffer`から破棄し、そこから先を新しいwrite側へ再送する。
+/// 再送自体が失敗した場合もreattach全体の失敗として扱い、同じ試行回数の
+/// 予算内で`reattach_fn`をもう一度呼び直す(旧pollベース実装の
+/// `trigger_reattach`と同じ「reattach+replayを1回の試行として数える」設計)。
+async fn attempt_reattach(
+    resume_state: &Arc<Mutex<ClientResumeState>>,
+    reattach_fn: &ReattachFn,
+) -> Result<(Box<dyn ByteStreamReadHalf>, Box<dyn ByteStreamWriteHalf>), String> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let (session_id, client_sent_offset, client_delivered_offset) = {
+            let resume = resume_state.lock().unwrap();
+            let Some(id) = resume.session_id else {
+                return Err("no session_id, resume not supported for this connection".to_string());
+            };
+            (id, resume.replay_buffer.end_offset(), resume.client_delivered_offset)
+        };
+
+        log::info!("reattach: attempt {attempt}/{REATTACH_MAX_RETRIES}");
+        let outcome = match reattach_fn(session_id, client_sent_offset, client_delivered_offset).await {
+            Ok(ReattachResult { read, mut write, helper_committed_offset }) => {
+                let to_replay = {
+                    let mut resume = resume_state.lock().unwrap();
+                    resume.replay_buffer.advance_start(helper_committed_offset);
+                    resume.replay_buffer.replay_from(helper_committed_offset)
+                };
+                match to_replay {
+                    Some(bytes) if !bytes.is_empty() => match write.write_all(&bytes).await {
+                        Ok(()) => Ok((read, write)),
+                        Err(e) => Err(format!("failed to replay C->S bytes: {e}")),
+                    },
+                    _ => Ok((read, write)),
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        match outcome {
+            Ok(halves) => {
+                log::info!("reattach: succeeded on attempt {attempt}");
+                return Ok(halves);
+            }
+            Err(e) => {
+                log::warn!("reattach: attempt {attempt} failed: {e}");
+                if attempt >= REATTACH_MAX_RETRIES {
+                    return Err(e);
+                }
+                tokio::time::sleep(REATTACH_BASE_DELAY * 2u32.pow(attempt - 1)).await;
+            }
+        }
+    }
+}
+
+/// `chunk`をhelperへ書き込む。失敗したら成功するまで(または諦めるまで)
+/// `attempt_reattach`を挟みながらリトライする — トップレベルの`write.write_all`
+/// が1回失敗しただけで即座にreattachへ移る(壊れたかもしれない同じ接続への
+/// 無条件リトライはしない、旧pollベース実装と同じ判断)。
+async fn write_with_reattach(
+    chunk: Vec<u8>,
+    read: &mut Box<dyn ByteStreamReadHalf>,
+    write: &mut Box<dyn ByteStreamWriteHalf>,
+    resume_state: &Arc<Mutex<ClientResumeState>>,
+    reattach_fn: &ReattachFn,
+    helper_read_done: &mut bool,
+) -> Result<(), String> {
+    loop {
+        match write.write_all(&chunk).await {
+            Ok(()) => {
+                resume_state.lock().unwrap().replay_buffer.append(&chunk);
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!("reattach: data stream write failed ({e}), triggering reattach");
+                let (new_read, new_write) = attempt_reattach(resume_state, reattach_fn).await?;
+                *read = new_read;
+                *write = new_write;
+                *helper_read_done = false;
+                // ループの先頭に戻り、同じchunkを新しい接続へ再送する。
+            }
+        }
+    }
+}
+
+/// `ReattachableStream`のバックグラウンドpumpタスク本体。呼び出し元(duplex)と
+/// helper(`ByteStreamReadHalf`/`WriteHalf`)の間で双方向にバイトを転送し続け、
+/// 片方向が失敗したら`attempt_reattach`でreattachしてから転送を再開する。
+/// 両方向を同じタスク内の`tokio::select!`で扱うことで、reattachの起動が
+/// 自然に直列化される(2つのreattachが同時に走ることはない)。
+async fn run_pump(
+    pump_side: tokio::io::DuplexStream,
+    mut read: Box<dyn ByteStreamReadHalf>,
+    mut write: Box<dyn ByteStreamWriteHalf>,
+    resume_state: Arc<Mutex<ClientResumeState>>,
+    reattach_fn: ReattachFn,
+    terminal_error: Arc<Mutex<Option<String>>>,
+) {
+    let (mut pump_read, mut pump_write) = tokio::io::split(pump_side);
+    let mut send_buf = vec![0u8; RECV_CHUNK_SIZE];
+    let mut recv_buf = vec![0u8; RECV_CHUNK_SIZE];
+    let mut helper_read_done = false;
+
+    loop {
+        match next_pump_event(&mut pump_read, read.as_mut(), &mut send_buf, &mut recv_buf, helper_read_done).await {
+            PumpEvent::FromCaller(chunk) => {
+                if let Err(final_err) =
+                    write_with_reattach(chunk, &mut read, &mut write, &resume_state, &reattach_fn, &mut helper_read_done)
+                        .await
+                {
+                    *terminal_error.lock().unwrap() = Some(final_err);
+                    return;
+                }
+            }
+            PumpEvent::FromCallerClosed => return,
+            PumpEvent::FromHelper(chunk) => {
+                if pump_write.write_all(&chunk).await.is_err() {
+                    return; // 呼び出し元(duplex)側が閉じられた。
+                }
+                resume_state.lock().unwrap().client_delivered_offset += chunk.len() as u64;
+            }
+            PumpEvent::FromHelperClosed => {
+                // helper側がread方向をclean EOFで閉じた。これはエラーではない
+                // ので reattach しない。以後この方向は select 対象から外し
+                // （`helper_read_done`ガード）、busy-loopを避ける。
+                let _ = pump_write.shutdown().await;
+                helper_read_done = true;
+            }
+            PumpEvent::Failed { direction, message } => {
+                log::warn!("reattach: data stream {direction} failed ({message}), triggering reattach");
+                match attempt_reattach(&resume_state, &reattach_fn).await {
+                    Ok((new_read, new_write)) => {
+                        read = new_read;
+                        write = new_write;
+                        helper_read_done = false;
+                    }
+                    Err(final_err) => {
+                        *terminal_error.lock().unwrap() = Some(final_err);
+                        return;
+                    }
+                }
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use isekai_transport::error::TransportError;
+    use tokio::sync::mpsc;
+
     use super::*;
 
     #[test]
@@ -506,30 +537,149 @@ mod tests {
         assert_eq!(s.replay_buffer.replay_from(0).unwrap(), b"hello");
     }
 
+    // ── ReattachableStream(mock ByteStream経由) ─────────────────────
+
+    /// テスト専用のchannelベースmock。`rx`から読んだ`Err`はread失敗を、
+    /// `fail_write_once`がtrueの間の`write_all`呼び出しは1回だけ失敗を
+    /// 模擬する。
+    struct MockReadHalf {
+        rx: mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
+    }
+
+    #[async_trait]
+    impl ByteStreamReadHalf for MockReadHalf {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            match self.rx.recv().await {
+                Some(Ok(bytes)) => {
+                    let n = bytes.len().min(buf.len());
+                    buf[..n].copy_from_slice(&bytes[..n]);
+                    Ok(n)
+                }
+                Some(Err(msg)) => Err(TransportError::StreamIo(msg)),
+                None => Ok(0), // channel closed -> EOF
+            }
+        }
+    }
+
+    struct MockWriteHalf {
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+        fail_write_once: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ByteStreamWriteHalf for MockWriteHalf {
+        async fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportError> {
+            if self.fail_write_once.swap(false, Ordering::SeqCst) {
+                return Err(TransportError::StreamIo("mock write failure".to_string()));
+            }
+            let _ = self.tx.send(buf.to_vec());
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// (read half, write half, helperへの書き込みを観測するreceiver,
+    /// helperからの読み取りを注入するsender, 次のwrite_all呼び出しを
+    /// 1回だけ失敗させるフラグ) を組で作る。
+    #[allow(clippy::type_complexity)]
+    fn mock_pair() -> (
+        Box<dyn ByteStreamReadHalf>,
+        Box<dyn ByteStreamWriteHalf>,
+        mpsc::UnboundedReceiver<Vec<u8>>,
+        mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+        Arc<AtomicBool>,
+    ) {
+        let (read_tx, read_rx) = mpsc::unbounded_channel::<Result<Vec<u8>, String>>();
+        let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let fail_write_once = Arc::new(AtomicBool::new(false));
+        let read: Box<dyn ByteStreamReadHalf> = Box::new(MockReadHalf { rx: read_rx });
+        let write: Box<dyn ByteStreamWriteHalf> =
+            Box::new(MockWriteHalf { tx: write_tx, fail_write_once: fail_write_once.clone() });
+        (read, write, write_rx, read_tx, fail_write_once)
+    }
+
+    fn resume_state_with_session() -> Arc<Mutex<ClientResumeState>> {
+        Arc::new(Mutex::new(ClientResumeState {
+            replay_buffer: ReplayBuffer::new(1 << 20),
+            client_delivered_offset: 0,
+            session_id: Some([7u8; 16]),
+        }))
+    }
+
+    #[tokio::test]
+    async fn pass_through_read_and_write_both_directions() {
+        let (read, write, mut helper_write_rx, helper_read_tx, _fail) = mock_pair();
+        let resume_state = resume_state_with_session();
+        let reattach_fn: ReattachFn = Arc::new(|_id, _sent, _delivered| {
+            Box::pin(async { Err::<ReattachResult, String>("reattach should not be called in this test".to_string()) })
+        });
+        let mut stream = ReattachableStream::new(read, write, resume_state.clone(), reattach_fn);
+
+        stream.write_all(b"hello helper").await.unwrap();
+        let received = helper_write_rx.recv().await.unwrap();
+        assert_eq!(received, b"hello helper");
+
+        helper_read_tx.send(Ok(b"hello client".to_vec())).unwrap();
+        let mut buf = [0u8; 32];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello client");
+
+        assert_eq!(resume_state.lock().unwrap().client_delivered_offset, 12);
+    }
+
+    #[tokio::test]
+    async fn write_failure_triggers_transparent_reattach_and_replays_the_failed_chunk() {
+        let (read1, write1, _write_rx1, _read_tx1, fail_write_once) = mock_pair();
+        fail_write_once.store(true, Ordering::SeqCst);
+
+        let (read2, write2, mut helper_write_rx2, _read_tx2, _fail2) = mock_pair();
+        let reattach_calls = Arc::new(AtomicUsize::new(0));
+
+        let reattach_calls_for_closure = reattach_calls.clone();
+        let read2 = Arc::new(Mutex::new(Some(read2)));
+        let write2 = Arc::new(Mutex::new(Some(write2)));
+        let reattach_fn: ReattachFn = Arc::new(move |_id, _sent, _delivered| {
+            reattach_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            let read2 = read2.clone();
+            let write2 = write2.clone();
+            Box::pin(async move {
+                let read = read2.lock().unwrap().take().expect("reattach_fn called more than once in this test");
+                let write = write2.lock().unwrap().take().unwrap();
+                Ok(ReattachResult { read, write, helper_committed_offset: 0 })
+            })
+        });
+
+        let resume_state = resume_state_with_session();
+        let mut stream = ReattachableStream::new(read1, write1, resume_state, reattach_fn);
+
+        // caller視点ではエラーは一切見えない: write_allは(duplexへのbuffer完了として)
+        // 成功し、実際の再送は裏で起きる。
+        stream.write_all(b"world").await.unwrap();
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), helper_write_rx2.recv())
+            .await
+            .expect("timed out waiting for the replayed chunk on the new connection")
+            .expect("channel closed unexpectedly");
+        assert_eq!(received, b"world");
+        assert_eq!(reattach_calls.load(Ordering::SeqCst), 1);
+    }
+
     /// Phase 8-4: reattach が `REATTACH_MAX_RETRIES` 回すべて失敗し続けた場合、
-    /// `ReattachableStream` は無限に `Pending` を返し続けるのではなく、最終的に
-    /// 呼び出し元（russh）へ実際の `io::Error` を返すことを確認する。
+    /// `ReattachableStream` は呼び出し元(russh)へ実際の `io::Error` を返す。
     /// 指数バックオフの累計待ち時間（1+2+4+8=15秒）は仮想時間で進める。
     #[tokio::test(start_paused = true)]
     async fn reattach_gives_up_after_max_retries_and_surfaces_error() {
-        let resume_state = Arc::new(Mutex::new(ClientResumeState {
-            replay_buffer: ReplayBuffer::new(1024),
-            client_delivered_offset: 0,
-            session_id: Some([7u8; 16]),
-        }));
+        let (read, write, _write_rx, read_tx, _fail) = mock_pair();
         let reattach_fn: ReattachFn =
             Arc::new(|_id, _sent, _delivered| Box::pin(async { Err("mock: helper unreachable".to_string()) }));
-        let inner = Arc::new(ReattachInner {
-            // 初期値は trigger_reattach が即座に上書きするので何でもよい。
-            slot: Mutex::new(StreamSlot::Reattaching),
-            wakers: Mutex::new(Vec::new()),
-            resume: resume_state,
-            reattach_fn,
-            reattaching_started: std::sync::atomic::AtomicBool::new(false),
-        });
-        let stream = ReattachableStream { inner };
+        let resume_state = resume_state_with_session();
+        let mut stream = ReattachableStream::new(read, write, resume_state, reattach_fn);
 
-        stream.trigger_reattach();
+        // helper側の読み取りを失敗させ、reattachループを起動する。
+        read_tx.send(Err("mock: connection lost".to_string())).unwrap();
 
         // バックオフの累計(15秒)を確実に超えるまで、少しずつ仮想時間を進めながら
         // 都度スケジューラに制御を返す（一度に大きく進めるとタイマーの発火順が
@@ -540,10 +690,10 @@ mod tests {
         }
 
         let mut buf = [0u8; 1];
-        let mut read_buf = ReadBuf::new(&mut buf);
-        let err = std::future::poll_fn(|cx| Pin::new(&mut stream.clone()).poll_read(cx, &mut read_buf))
+        let err = stream
+            .read(&mut buf)
             .await
-            .expect_err("5回リトライを使い切ったら poll_read は実エラーを返すはず");
+            .expect_err("5回リトライを使い切ったら read は実エラーを返すはず");
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
         assert!(err.to_string().contains("mock: helper unreachable"));
     }
