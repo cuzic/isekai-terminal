@@ -22,7 +22,7 @@
 use isekai_pipe_core::{
     CandidateConversionError, CandidateDraft, CandidateDraftBatch, CandidateGeneration, CandidateOrigin,
     CandidateOriginKind, CandidatePriority, CandidateRoute, CandidateValidity, CertificatePinSha256,
-    ConnectionIntent, NormalizedServerName,
+    ConnectionIntent, IntentTransport, NormalizedServerName,
 };
 use tokio::time::Instant;
 
@@ -50,6 +50,22 @@ pub enum CandidateProviderError {
     /// malformed. `entry` names the offending endpoint string so a
     /// misconfiguration points at the exact input.
     InvalidRelayEndpoint { entry: String, reason: String },
+    /// An entry in `ConnectionIntent::stun_servers` (`ConfigStunProvider`,
+    /// `#11`) could not be turned into a STUN-P2P candidate — either it did
+    /// not parse as a `SocketAddr`, or the shared cert pin / peer address /
+    /// server name (from `IntentTransport::StunP2p`) was itself malformed.
+    InvalidStunServer { entry: String, reason: String },
+    /// `ConnectionIntent::stun_servers` was non-empty, but `intent.transport`
+    /// was not `IntentTransport::StunP2p` — there is no `peer_addr`/
+    /// `server_name` to pair the configured STUN servers with. Today's only
+    /// producer of `stun_servers` (`isekai-ssh/src/wrapper.rs`'s `#@isekai
+    /// stun` directive) always builds a `Relay` transport, so this is
+    /// expected to fire whenever that combination reaches this provider —
+    /// surfaced as a distinct, named error rather than silently producing no
+    /// candidates, so a caller that *does* expect STUN P2P candidates here
+    /// notices the misconfiguration instead of quietly falling through to
+    /// relay-only.
+    StunServersWithoutStunP2pTransport,
 }
 
 impl std::fmt::Display for CandidateProviderError {
@@ -58,6 +74,12 @@ impl std::fmt::Display for CandidateProviderError {
             Self::Conversion(e) => write!(f, "candidate conversion failed: {e}"),
             Self::InvalidRelayEndpoint { entry, reason } => {
                 write!(f, "invalid relay endpoint {entry:?}: {reason}")
+            }
+            Self::InvalidStunServer { entry, reason } => {
+                write!(f, "invalid stun server {entry:?}: {reason}")
+            }
+            Self::StunServersWithoutStunP2pTransport => {
+                write!(f, "ConnectionIntent.stun_servers is non-empty but intent.transport is not StunP2p")
             }
         }
     }
@@ -148,6 +170,86 @@ impl CandidateProvider for ConfigRelayProvider {
                 origin: CandidateOrigin {
                     source: CandidateOriginKind::ConfigRelay,
                     provider_id: CONFIG_RELAY_PROVIDER_ID.to_string(),
+                },
+                priority: CandidatePriority { rank: index as u16 },
+                validity: CandidateValidity::Static,
+            });
+        }
+
+        Ok(CandidateDraftBatch { generation: ctx.generation, candidates })
+    }
+}
+
+/// `provider_id` `ConfigStunProvider` stamps onto every [`CandidateOrigin`]
+/// it produces. There is one instance of this provider kind, so a fixed
+/// literal is enough — the individual STUN server is distinguished by its
+/// `stun_server` field / priority rank, not by `provider_id`.
+pub const CONFIG_STUN_PROVIDER_ID: &str = "config-stun";
+
+/// Expands `ConnectionIntent::stun_servers` — a list of alternate STUN
+/// servers to use when learning this side's own observed address before
+/// hole-punching toward the *same* peer (`#11`) — into one STUN-P2P
+/// [`CandidateDraft`] per entry.
+///
+/// `peer_addr`/`server_name` come from `intent.transport`
+/// (`IntentTransport::StunP2p`'s own fields, shared by every candidate this
+/// provider produces — only `stun_server` varies per entry, matching
+/// `CandidateRoute::StunP2p`'s dedup-identity docs). If `intent.transport` is
+/// not `StunP2p` while `stun_servers` is non-empty, there is no `peer_addr`
+/// to pair the configured STUN servers with —
+/// [`CandidateProviderError::StunServersWithoutStunP2pTransport`] is
+/// returned rather than silently producing no candidates (module docs on
+/// that variant explain when this legitimately fires today).
+///
+/// Vec order is preference order: entry index becomes the
+/// [`CandidatePriority`] rank (index 0 = rank 0 = most preferred).
+///
+/// An empty `stun_servers` is a valid (if useless) input and yields an empty
+/// batch, not an error — deciding whether to use this provider or
+/// [`LegacyIntentProvider`] based on whether `stun_servers` is populated is
+/// the caller's job, not this one's (mirrors [`ConfigRelayProvider`]'s same
+/// convention).
+pub struct ConfigStunProvider;
+
+#[async_trait::async_trait]
+impl CandidateProvider for ConfigStunProvider {
+    async fn gather(&self, ctx: &GatherContext<'_>) -> Result<CandidateDraftBatch, CandidateProviderError> {
+        let intent = ctx.intent;
+        if intent.stun_servers.is_empty() {
+            return Ok(CandidateDraftBatch { generation: ctx.generation, candidates: Vec::new() });
+        }
+
+        let IntentTransport::StunP2p { peer_addr, server_name, .. } = &intent.transport else {
+            return Err(CandidateProviderError::StunServersWithoutStunP2pTransport);
+        };
+
+        let mut candidates = Vec::with_capacity(intent.stun_servers.len());
+        for (index, entry) in intent.stun_servers.iter().enumerate() {
+            let cert_pin = CertificatePinSha256::from_hex(&intent.expected_server_identity.cert_sha256_hex)
+                .map_err(|e| CandidateProviderError::InvalidStunServer {
+                    entry: entry.clone(),
+                    reason: format!("invalid expected_server_identity.cert_sha256_hex: {e}"),
+                })?;
+            let stun_server = entry.parse().map_err(|_| CandidateProviderError::InvalidStunServer {
+                entry: entry.clone(),
+                reason: "not a valid socket address".to_string(),
+            })?;
+            let peer_addr = peer_addr.parse().map_err(|_| CandidateProviderError::InvalidStunServer {
+                entry: entry.clone(),
+                reason: "intent.transport's peer_addr is not a valid socket address".to_string(),
+            })?;
+            let server_name = NormalizedServerName::new(server_name).map_err(|e| {
+                CandidateProviderError::InvalidStunServer {
+                    entry: entry.clone(),
+                    reason: format!("intent.transport's server_name is invalid: {e}"),
+                }
+            })?;
+
+            candidates.push(CandidateDraft {
+                route: CandidateRoute::StunP2p { cert_pin, peer_addr, stun_server, server_name },
+                origin: CandidateOrigin {
+                    source: CandidateOriginKind::ConfigStun,
+                    provider_id: CONFIG_STUN_PROVIDER_ID.to_string(),
                 },
                 priority: CandidatePriority { rank: index as u16 },
                 validity: CandidateValidity::Static,
@@ -277,6 +379,114 @@ mod tests {
             assert_eq!(candidate.origin.source, CandidateOriginKind::ConfigRelay);
             assert_eq!(candidate.origin.provider_id, CONFIG_RELAY_PROVIDER_ID);
             assert_eq!(candidate.origin.provider_id, "config-relay");
+        }
+    }
+
+    fn sample_stun_intent() -> ConnectionIntent {
+        ConnectionIntent::new(
+            "production",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::StunP2p {
+                stun_server: "192.0.2.1:3478".to_string(),
+                peer_addr: "203.0.113.5:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "production:22".to_string() },
+        )
+    }
+
+    fn stun_route(batch: &CandidateDraftBatch, index: usize) -> &CandidateRoute {
+        &batch.candidates[index].route
+    }
+
+    #[tokio::test]
+    async fn config_stun_provider_yields_one_candidate_per_stun_server_in_priority_order() {
+        let mut intent = sample_stun_intent();
+        intent.stun_servers = vec![
+            "192.0.2.10:3478".to_string(),
+            "192.0.2.11:3478".to_string(),
+            "192.0.2.12:3478".to_string(),
+        ];
+        let ctx = GatherContext { generation: CandidateGeneration(3), deadline: Instant::now(), intent: &intent };
+
+        let batch = ConfigStunProvider.gather(&ctx).await.unwrap();
+
+        assert_eq!(batch.candidates.len(), 3);
+        for (index, expected_stun) in ["192.0.2.10:3478", "192.0.2.11:3478", "192.0.2.12:3478"].iter().enumerate() {
+            assert_eq!(batch.candidates[index].priority, CandidatePriority { rank: index as u16 });
+            match stun_route(&batch, index) {
+                CandidateRoute::StunP2p { stun_server, peer_addr, server_name, .. } => {
+                    assert_eq!(stun_server, &expected_stun.parse().unwrap());
+                    assert_eq!(peer_addr, &"203.0.113.5:45231".parse().unwrap());
+                    assert_eq!(server_name.as_str(), "isekai-helper");
+                }
+                other => panic!("expected stun-p2p route, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn config_stun_provider_empty_stun_servers_yields_empty_batch_not_error() {
+        let intent = sample_stun_intent();
+        assert!(intent.stun_servers.is_empty());
+        let ctx = GatherContext { generation: CandidateGeneration(5), deadline: Instant::now(), intent: &intent };
+
+        let batch = ConfigStunProvider.gather(&ctx).await.unwrap();
+
+        assert_eq!(batch.generation, CandidateGeneration(5));
+        assert!(batch.candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn config_stun_provider_rejects_malformed_stun_server_naming_the_offender() {
+        let mut intent = sample_stun_intent();
+        intent.stun_servers = vec!["192.0.2.10:3478".to_string(), "not-an-address".to_string()];
+        let ctx = GatherContext { generation: CandidateGeneration::INITIAL, deadline: Instant::now(), intent: &intent };
+
+        let err = ConfigStunProvider.gather(&ctx).await.unwrap_err();
+
+        match &err {
+            CandidateProviderError::InvalidStunServer { entry, .. } => assert_eq!(entry, "not-an-address"),
+            other => panic!("expected InvalidStunServer, got {other:?}"),
+        }
+        assert!(err.to_string().contains("not-an-address"), "error message must name the offending entry: {err}");
+    }
+
+    #[tokio::test]
+    async fn config_stun_provider_rejects_stun_servers_without_stun_p2p_transport() {
+        let mut intent = sample_intent(); // transport: Relay
+        intent.stun_servers = vec!["192.0.2.10:3478".to_string()];
+        let ctx = GatherContext { generation: CandidateGeneration::INITIAL, deadline: Instant::now(), intent: &intent };
+
+        let err = ConfigStunProvider.gather(&ctx).await.unwrap_err();
+        assert!(matches!(err, CandidateProviderError::StunServersWithoutStunP2pTransport));
+    }
+
+    #[tokio::test]
+    async fn config_stun_provider_output_generation_matches_context() {
+        let mut intent = sample_stun_intent();
+        intent.stun_servers = vec!["192.0.2.10:3478".to_string()];
+        let ctx = GatherContext { generation: CandidateGeneration(42), deadline: Instant::now(), intent: &intent };
+
+        let batch = ConfigStunProvider.gather(&ctx).await.unwrap();
+
+        assert_eq!(batch.generation, CandidateGeneration(42));
+    }
+
+    #[tokio::test]
+    async fn config_stun_provider_stamps_config_stun_origin() {
+        let mut intent = sample_stun_intent();
+        intent.stun_servers = vec!["192.0.2.10:3478".to_string(), "192.0.2.11:3478".to_string()];
+        let ctx = GatherContext { generation: CandidateGeneration::INITIAL, deadline: Instant::now(), intent: &intent };
+
+        let batch = ConfigStunProvider.gather(&ctx).await.unwrap();
+
+        for candidate in &batch.candidates {
+            assert_eq!(candidate.origin.source, CandidateOriginKind::ConfigStun);
+            assert_eq!(candidate.origin.provider_id, CONFIG_STUN_PROVIDER_ID);
+            assert_eq!(candidate.origin.provider_id, "config-stun");
         }
     }
 }

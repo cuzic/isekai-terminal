@@ -4,17 +4,20 @@
 //! is not a type-checking-only mock: `SystemQuicEndpointFactory` binds an
 //! actual UDP socket, performs a real QUIC handshake pinned to the server's
 //! self-signed certificate fingerprint, opens a real bidirectional QUIC
-//! stream, and exchanges the real HELLO/ACK wire bytes
-//! (`isekai_protocol::hello`) end-to-end.
+//! stream, and exchanges the real ATTACH v2 wire bytes
+//! (`isekai_protocol::attach`: ATTACH_HELLO / AttachReadyV2 / AttachActivate)
+//! end-to-end.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
-use isekai_protocol::hello::{
-    decode_hello, encode_ack_response, AckResponse, Proof, ALPN, EXPORTER_LABEL, HELLO_FRAME_LEN,
+use isekai_protocol::attach::{
+    attach_hello_proof_transcript, decode_attach_activate, decode_attach_hello, encode_attach_response, AttachProof,
+    AttachRejectReason, AttachResponse, AttachToken, ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,
 };
+use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
 use isekai_transport::{connect_via_relay, RelayTarget, SystemQuicEndpointFactory, TransportError};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
@@ -51,11 +54,13 @@ fn mock_helper_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs8Ke
 }
 
 /// Accepts exactly one connection and one bidirectional stream, reads the
-/// HELLO frame, verifies the proof the same way isekai-helper would
-/// (`archive/HELPER_PROTOCOL.md` §4: `HMAC-SHA256(session_secret, exporter)`), and
-/// replies ACK/REJECT_AUTH accordingly. On ACK, echoes back one more message
-/// to prove the returned stream is a real, working, bidirectional
-/// pass-through afterward — not just a handshake stub.
+/// ATTACH_HELLO frame, verifies the proof the same way isekai-helper would
+/// (`isekai_protocol::attach`: `HMAC-SHA256(session_secret, exporter ||
+/// attach_hello_proof_transcript(..))`), and replies AttachReadyV2 /
+/// REJECT_AUTH accordingly. On AttachReadyV2 it then reads the client's
+/// AttachActivate before echoing back one more message, to prove the returned
+/// stream is a real, working, bidirectional pass-through afterward — not just
+/// a handshake stub.
 ///
 /// `client_done` must fire only after the client side has finished reading
 /// everything it needs from this connection. Dropping `conn`/`endpoint`
@@ -72,30 +77,50 @@ async fn run_mock_helper(
     let conn = incoming.await.unwrap();
     let (mut send, mut recv) = conn.accept_bi().await.unwrap();
 
-    let mut hello = [0u8; HELLO_FRAME_LEN];
-    recv.read_exact(&mut hello).await.unwrap();
-    let hello = decode_hello(&hello).unwrap();
+    let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
+    recv.read_exact(&mut hello_bytes).await.unwrap();
+    let hello = decode_attach_hello(&hello_bytes).unwrap();
 
     let mut exporter = [0u8; 32];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"").unwrap();
+    let transcript = attach_hello_proof_transcript(
+        &hello.session_id,
+        hello.generation,
+        &hello.attempt_id,
+        hello.requested_resume_grace_secs,
+    );
     let mut mac = HmacSha256::new_from_slice(&session_secret).unwrap();
     mac.update(&exporter);
+    mac.update(&transcript);
     let expected_bytes: [u8; 32] = mac.finalize().into_bytes().into();
-    let expected = Proof::new(expected_bytes);
+    let expected = AttachProof::new(expected_bytes);
 
-    let is_ack = hello.proof.ct_eq(&expected);
-    let ack = if is_ack {
-        AckResponse::Ack { effective_resume_grace_secs: hello.requested_resume_grace_secs }
-    } else {
-        AckResponse::RejectAuth
+    if !hello.proof.ct_eq(&expected) {
+        let reject = AttachResponse::Reject(AttachRejectReason::Auth);
+        send.write_all(&encode_attach_response(&reject)).await.unwrap();
+        send.finish().ok();
+        client_done.await.ok();
+        return;
+    }
+
+    let ready = AttachResponse::Ready {
+        session_id: hello.session_id,
+        generation: hello.generation,
+        attempt_id: hello.attempt_id,
+        negotiated_resume_grace_secs: hello.requested_resume_grace_secs,
+        attach_token: AttachToken::new(rand::random()),
     };
-    send.write_all(&encode_ack_response(ack)).await.unwrap();
+    send.write_all(&encode_attach_response(&ready)).await.unwrap();
 
-    if is_ack {
-        let mut buf = [0u8; 64];
-        if let Ok(Some(n)) = recv.read(&mut buf).await {
-            send.write_all(&buf[..n]).await.unwrap();
-        }
+    // The client confirms the attach with AttachActivate on the same stream
+    // before it becomes a raw pass-through.
+    let mut activate_bytes = [0u8; ATTACH_ACTIVATE_FRAME_LEN];
+    recv.read_exact(&mut activate_bytes).await.unwrap();
+    decode_attach_activate(&activate_bytes).unwrap();
+
+    let mut buf = [0u8; 64];
+    if let Ok(Some(n)) = recv.read(&mut buf).await {
+        send.write_all(&buf[..n]).await.unwrap();
     }
     send.finish().ok();
 
@@ -191,7 +216,7 @@ async fn connect_via_relay_surfaces_reject_auth_for_a_wrong_session_secret() {
     match tokio::time::timeout(Duration::from_secs(10), connect_via_relay(&factory, &target)).await {
         Ok(Ok(_stream)) => panic!("a mismatched session_secret must be rejected, but it succeeded"),
         Ok(Err(err)) => {
-            assert!(matches!(err, TransportError::Rejected(AckResponse::RejectAuth)), "got: {err:?}")
+            assert!(matches!(err, TransportError::Rejected(AttachRejectReason::Auth)), "got: {err:?}")
         }
         Err(_) => panic!("connect_via_relay should not hang"),
     }

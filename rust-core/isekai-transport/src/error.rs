@@ -1,7 +1,7 @@
 //! Errors surfaced by `isekai-transport`'s connection-establishment and
 //! relay-handshake logic (`archive/ISEKAI_SSH_DESIGN.md` phase S-0d-1).
 
-use isekai_protocol::hello::AckResponse;
+use isekai_protocol::attach::AttachRejectReason;
 use isekai_protocol::resume::ResumeRejectReason;
 
 #[derive(Debug, thiserror::Error)]
@@ -34,10 +34,10 @@ pub enum TransportError {
     #[error("failed to export keying material from the QUIC connection: {0}")]
     ExportKeyingMaterial(String),
 
-    /// isekai-helper responded to `HELLO` with something other than `ACK`
-    /// (`archive/HELPER_PROTOCOL.md` §4).
+    /// isekai-helper responded to `ATTACH_HELLO` with a reject rather than
+    /// `AttachReadyV2` (`#18`, ATTACH v2).
     #[error("isekai-helper rejected the connection: {0:?}")]
-    Rejected(AckResponse),
+    Rejected(AttachRejectReason),
 
     /// A frame from `isekai_protocol` failed to decode (e.g. an unexpected
     /// response byte on the HELLO/ACK stream).
@@ -59,6 +59,14 @@ pub enum TransportError {
     /// from `Bind`, which is specifically about the initial `bind()` syscall.
     #[error("failed to prepare UDP socket for QUIC use: {0}")]
     SocketSetup(String),
+
+    /// `QuicEndpointRebinder::rebind` failed — either the replacement local
+    /// socket couldn't be bound (see `source`'s message for which), or the
+    /// underlying engine rejected the switch itself. Distinct from `Bind`,
+    /// which is specifically the *initial* endpoint creation, not a later
+    /// in-place rebind of an already-live one.
+    #[error("failed to rebind QUIC endpoint to a new local socket: {0}")]
+    Rebind(String),
 
     /// The control stream handshake (`CONTROL_HELLO`/`CONTROL_ACK`,
     /// `archive/HELPER_PROTOCOL.md` §7.3) got a response byte other than

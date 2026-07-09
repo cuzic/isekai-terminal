@@ -43,6 +43,7 @@ mod app_ack;
 
 pub use app_ack::{AppAckCounters, AppAckTasks, spawn_app_ack_tasks};
 
+use isekai_protocol::attach::ConnectionGeneration;
 use isekai_protocol::hello::Proof;
 use isekai_protocol::offset::{C2hHelperCommittedOffset, C2hSentOffset, H2cClientDeliveredOffset, H2cSentOffset};
 use isekai_protocol::resume::{
@@ -54,8 +55,8 @@ use log::info;
 
 use crate::error::TransportError;
 use crate::proof::compute_proof;
-use crate::relay::{connect_and_handshake, read_exact, RelayTarget};
-use crate::traits::{ByteStream, QuicConnection, QuicEndpointFactory};
+use crate::relay::{connect_and_handshake, random_session_id, read_exact, RelayTarget};
+use crate::traits::{ByteStream, QuicConnection, QuicEndpointFactory, QuicEndpointRebinder};
 use crate::types::{BindSpec, RemoteSpec};
 
 /// `archive/HELPER_PROTOCOL.md` §7.3 control-stream frame markers. `RESUME`/
@@ -77,7 +78,10 @@ const CONTROL_HELLO_FRAME_LEN: usize = 1 + isekai_protocol::hello::PROOF_LEN;
 const CONTROL_ACK_FRAME_LEN: usize = 1 + SESSION_ID_LEN;
 
 /// A successfully-established control stream (`archive/ISEKAI_SSH_DESIGN.md`
-/// "接続確立順序" step 2), plus the `session_id` isekai-helper assigned it.
+/// "接続確立順序" step 2), plus the `session_id` isekai-helper echoed back
+/// (`#18-4`: the client itself generated this value before ever connecting
+/// and already sent it in `ATTACH_HELLO`; `CONTROL_ACK` merely confirms the
+/// server recorded the same one).
 pub struct ControlStream {
     pub stream: Box<dyn ByteStream>,
     pub session_id: SessionId,
@@ -135,6 +139,16 @@ pub struct ResumableRelaySession {
     /// server will have already discarded the parked session past this point
     /// regardless (`ISEKAI_PIPE_DESIGN.md`).
     pub effective_resume_grace_secs: u32,
+    /// A handle to switch this session's underlying QUIC endpoint to a new
+    /// local socket without a full RESUME reconnect, if the endpoint that
+    /// produced `connection` supports it (`QuicEndpoint::rebinder`) — `None`
+    /// for any `QuicEndpointFactory` implementation that doesn't (every one
+    /// today except `system::SystemQuicEndpointFactory`). Tied to *this*
+    /// connection's endpoint specifically: after a `reconnect_and_resume`
+    /// call replaces `connection`, the caller must take this field's fresh
+    /// value from that call's `ResumeAckOutcome`, not keep reusing an old one
+    /// pointing at an endpoint that may no longer be driving anything.
+    pub network_rebinder: Option<Box<dyn QuicEndpointRebinder>>,
 }
 
 /// Like `relay::connect_via_relay`, but additionally opens the control stream
@@ -157,10 +171,18 @@ pub async fn connect_via_relay_resumable(
             cert_sha256_hex: target.cert_sha256_hex.clone(),
         },
         &target.session_secret,
+        random_session_id(),
+        ConnectionGeneration::INITIAL,
         requested_resume_grace_secs,
         identity,
     )
     .await?;
+
+    // Taken before `endpoint` goes out of scope at the end of this function
+    // — `noq::Endpoint::rebinder()`'s returned handle clones the underlying
+    // `noq::Endpoint`, which stays independently usable afterward (see
+    // `SystemQuicEndpoint::rebinder`'s doc comment).
+    let network_rebinder = endpoint.rebinder();
 
     let control = open_control_stream(conn.as_ref(), &proof).await?;
     info!("isekai-transport: control stream established, session_id={}", control.session_id);
@@ -171,6 +193,7 @@ pub async fn connect_via_relay_resumable(
         control_stream: control.stream,
         session_id: control.session_id,
         effective_resume_grace_secs,
+        network_rebinder,
     })
 }
 
@@ -220,6 +243,23 @@ pub enum SequentialConnectError {
     /// the plain (non-resumable) data stream instead, but that's out of
     /// scope for `#12`.
     AttachedButControlStreamFailed { candidate_id: String, source: TransportError },
+    /// `#25-3`: a later candidate was told `ATTACH_ALREADY_ESTABLISHED`
+    /// (`AttemptFailure::MustResume`), implying an earlier ambiguous
+    /// candidate's attach actually succeeded server-side — but the
+    /// subsequent `RESUME` attempt against that earlier candidate's target
+    /// itself failed (or its own control-stream open failed).
+    MustResumeButResumeFailed { candidate_id: String, source: TransportError },
+    /// `#25-2`: an `AmbiguousAfterAttach`/`StaleAttempt` failure kept
+    /// recurring until [`crate::generation_coordinator::GenerationCoordinator`]'s
+    /// retry budget was exhausted — every generation advance this round was
+    /// allowed still ended up ambiguous or stale. Distinct from
+    /// `AllCandidatesFailed` (every candidate cleanly failed pre-attach in a
+    /// *single* round) — this means the ATTACH control path itself looks
+    /// unstable, not that the candidates are simply unreachable.
+    GaveUpAfterGenerationRetries {
+        failures: Vec<SequentialFailure>,
+        budget: crate::generation_coordinator::AdvanceGenerationError,
+    },
 }
 
 impl std::fmt::Display for SequentialConnectError {
@@ -239,6 +279,20 @@ impl std::fmt::Display for SequentialConnectError {
             Self::AttachedButControlStreamFailed { candidate_id, source } => {
                 write!(f, "candidate {candidate_id:?} attached but its control stream failed: {source}")
             }
+            Self::MustResumeButResumeFailed { candidate_id, source } => {
+                write!(
+                    f,
+                    "candidate {candidate_id:?} reported ATTACH_ALREADY_ESTABLISHED, but resuming the earlier \
+                     ambiguous attempt failed: {source}"
+                )
+            }
+            Self::GaveUpAfterGenerationRetries { failures, budget } => {
+                write!(f, "gave up after generation retries were exhausted ({budget}); {} pre-attach failure(s) along the way:", failures.len())?;
+                for failure in failures {
+                    write!(f, " [{}: {}]", failure.candidate_id, failure.failure)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -246,16 +300,24 @@ impl std::fmt::Display for SequentialConnectError {
 impl std::error::Error for SequentialConnectError {}
 
 /// Like [`connect_via_relay_resumable`], but tries each of `candidates` in
-/// order (index 0 first) and falls back to the next one when a candidate
-/// fails in a way that's provably safe to retry
+/// order and falls back to the next one when a candidate fails in a way
+/// that's provably safe to retry within the same generation
 /// (`AttemptFailure::may_retry_pre_fencing`, `ISEKAI_PIPE_DESIGN.md` task
 /// `#12`) — i.e. nothing was ever sent to that candidate's server, so trying
-/// a different candidate cannot cause a double-attach. Any other failure
-/// (ambiguous, terminal, or a definitive-but-not-retryable reject) stops the
-/// whole attempt immediately rather than continuing to the next candidate —
-/// see `AttemptFailure`'s module docs for the double-attach risk this avoids
-/// (full safe continuation past an ambiguous failure is `#25`, which needs
-/// `#18`'s fencing first).
+/// a different candidate cannot cause a double-attach.
+///
+/// An `AmbiguousAfterAttach`/`StaleAttempt` failure no longer stops the whole
+/// attempt (`#25-2`, now that `#18`'s fencing exists): the
+/// [`crate::generation_coordinator::GenerationCoordinator`] advances to a new
+/// generation — safely superseding the earlier, not-yet-`Established`
+/// attempt server-side (`AttachArbiter::ClosingForSupersede`, `#18`) — and a
+/// fresh round starts from the *next* candidate after the one that went
+/// ambiguous, wrapping around the candidate list (ring rotation) rather than
+/// giving up on that candidate forever or fixating on retrying it
+/// immediately. A `DefinitiveRejectNotRetryable`/`Terminal`/`LostRace` failure
+/// still stops the whole attempt immediately — see `AttemptFailure`'s module
+/// docs. `MustResume` also still stops here for now (`#25-3` wires it into an
+/// actual resume attempt).
 ///
 /// Returns the winning candidate's `RelayTarget` alongside the session — a
 /// later disconnect must be resumed (`reconnect_and_resume`) against that
@@ -271,81 +333,230 @@ pub async fn connect_via_relay_resumable_with_fallback(
         return Err(SequentialConnectError::NoCandidates);
     }
 
+    // `#18-5`/`#25-1`: every candidate in one round shares the same
+    // `session_id`/`generation` (`GenerationCoordinator`'s `current_round()`)
+    // so the server can tell that a fallback attempt to a *different*
+    // candidate is still logically the same attach round as the one before
+    // it (`AttachArbiter`'s winner rule, `#18`). Only the coordinator is
+    // allowed to advance `generation`, and only after an
+    // `AmbiguousAfterAttach`/`StaleAttempt` failure — never for a
+    // `RetryablePreAttach` one.
+    let mut coordinator = crate::generation_coordinator::GenerationCoordinator::new(random_session_id());
+    let mut start_index = 0usize;
     let mut failures = Vec::new();
-    for candidate in candidates {
-        let identity = crate::telemetry::CandidateIdentity {
-            kind: "relay",
-            source: "config-relay",
-            provider: "config-relay",
-            id: &candidate.candidate_id,
-        };
+    // `#25-3`: the most recent candidate whose attach went ambiguous — if a
+    // *later* candidate is told `ATTACH_ALREADY_ESTABLISHED`, this is the
+    // candidate whose earlier, unconfirmed attempt most plausibly actually
+    // succeeded server-side (the client just never found out), so this is
+    // who a resume attempt should target.
+    let mut last_ambiguous_target: Option<RelayTarget> = None;
 
-        let endpoint = match factory.create_endpoint(BindSpec::any_ipv4()).await {
-            Ok(endpoint) => endpoint,
-            Err(source) => {
-                // Binding our own local socket never touches the remote
-                // server at all — unconditionally safe to move on.
-                failures.push(SequentialFailure {
-                    candidate_id: candidate.candidate_id.clone(),
-                    failure: crate::attempt::AttemptFailure::RetryablePreAttach { source },
-                });
-                continue;
-            }
-        };
+    'rounds: loop {
+        let round = coordinator.current_round();
+        for offset in 0..candidates.len() {
+            let idx = (start_index + offset) % candidates.len();
+            let candidate = &candidates[idx];
+            let identity = crate::telemetry::CandidateIdentity {
+                kind: "relay",
+                source: "config-relay",
+                provider: "config-relay",
+                id: &candidate.candidate_id,
+            };
 
-        let attempt = connect_and_handshake(
-            endpoint.as_ref(),
-            RemoteSpec {
-                addr: candidate.target.helper_addr,
-                server_name: candidate.target.server_name.clone(),
-                cert_sha256_hex: candidate.target.cert_sha256_hex.clone(),
-            },
-            &candidate.target.session_secret,
-            requested_resume_grace_secs,
-            identity,
-        )
-        .await;
-
-        let (conn, data_stream, proof, effective_resume_grace_secs) = match attempt {
-            Ok(ok) => ok,
-            Err(attempt_err) => {
-                let failure = crate::attempt::AttemptFailure::from(attempt_err);
-                if failure.may_retry_pre_fencing() {
-                    failures.push(SequentialFailure { candidate_id: candidate.candidate_id.clone(), failure });
+            let endpoint = match factory.create_endpoint(BindSpec::any_ipv4()).await {
+                Ok(endpoint) => endpoint,
+                Err(source) => {
+                    // Binding our own local socket never touches the remote
+                    // server at all — unconditionally safe to move on.
+                    failures.push(SequentialFailure {
+                        candidate_id: candidate.candidate_id.clone(),
+                        failure: crate::attempt::AttemptFailure::RetryablePreAttach { source },
+                    });
                     continue;
                 }
-                return Err(SequentialConnectError::StoppedEarly {
-                    candidate_id: candidate.candidate_id.clone(),
-                    failure,
-                });
-            }
-        };
+            };
 
-        let control = match open_control_stream(conn.as_ref(), &proof).await {
-            Ok(control) => control,
-            Err(source) => {
-                return Err(SequentialConnectError::AttachedButControlStreamFailed {
-                    candidate_id: candidate.candidate_id.clone(),
-                    source,
-                });
-            }
-        };
-        info!(
-            "isekai-transport: control stream established, session_id={}, candidate_id={}",
-            control.session_id, candidate.candidate_id
-        );
+            let attempt = connect_and_handshake(
+                endpoint.as_ref(),
+                RemoteSpec {
+                    addr: candidate.target.helper_addr,
+                    server_name: candidate.target.server_name.clone(),
+                    cert_sha256_hex: candidate.target.cert_sha256_hex.clone(),
+                },
+                &candidate.target.session_secret,
+                round.session_id,
+                round.generation,
+                requested_resume_grace_secs,
+                identity,
+            )
+            .await;
 
-        let session = ResumableRelaySession {
-            connection: conn,
-            data_stream,
-            control_stream: control.stream,
-            session_id: control.session_id,
-            effective_resume_grace_secs,
-        };
-        return Ok((session, candidate.target.clone()));
+            let (conn, data_stream, proof, effective_resume_grace_secs) = match attempt {
+                Ok(ok) => ok,
+                Err(attempt_err) => {
+                    let failure = crate::attempt::AttemptFailure::from(attempt_err);
+                    match &failure {
+                        crate::attempt::AttemptFailure::RetryablePreAttach { .. } => {
+                            failures.push(SequentialFailure { candidate_id: candidate.candidate_id.clone(), failure });
+                            continue;
+                        }
+                        crate::attempt::AttemptFailure::AmbiguousAfterAttach { .. } => {
+                            last_ambiguous_target = Some(candidate.target.clone());
+                            let server_floor = None;
+                            match coordinator.advance_generation(server_floor) {
+                                Ok(new_round) => {
+                                    crate::telemetry::log_generation_advance(
+                                        round.session_id,
+                                        round.generation,
+                                        new_round.generation,
+                                        "ambiguous",
+                                        coordinator.generation_advances(),
+                                        coordinator.max_generation_advances(),
+                                    );
+                                    start_index = (idx + 1) % candidates.len();
+                                    continue 'rounds;
+                                }
+                                Err(budget) => {
+                                    return Err(SequentialConnectError::GaveUpAfterGenerationRetries {
+                                        failures,
+                                        budget,
+                                    });
+                                }
+                            }
+                        }
+                        crate::attempt::AttemptFailure::StaleAttempt { current_generation, .. } => {
+                            match coordinator.advance_generation(Some(*current_generation)) {
+                                Ok(new_round) => {
+                                    crate::telemetry::log_generation_advance(
+                                        round.session_id,
+                                        round.generation,
+                                        new_round.generation,
+                                        "stale",
+                                        coordinator.generation_advances(),
+                                        coordinator.max_generation_advances(),
+                                    );
+                                    start_index = (idx + 1) % candidates.len();
+                                    continue 'rounds;
+                                }
+                                Err(budget) => {
+                                    return Err(SequentialConnectError::GaveUpAfterGenerationRetries {
+                                        failures,
+                                        budget,
+                                    });
+                                }
+                            }
+                        }
+                        crate::attempt::AttemptFailure::MustResume { .. } => {
+                            let Some(resume_target) = last_ambiguous_target.clone() else {
+                                // No prior ambiguous candidate in this round
+                                // plausibly caused this — nothing sensible to
+                                // resume against.
+                                return Err(SequentialConnectError::StoppedEarly {
+                                    candidate_id: candidate.candidate_id.clone(),
+                                    failure,
+                                });
+                            };
+                            crate::telemetry::log_must_resume_convergence(round.session_id, &candidate.candidate_id);
+                            return finish_via_resume(
+                                factory,
+                                &resume_target,
+                                round.session_id,
+                                candidate.candidate_id.clone(),
+                            )
+                            .await;
+                        }
+                        _ => {
+                            return Err(SequentialConnectError::StoppedEarly {
+                                candidate_id: candidate.candidate_id.clone(),
+                                failure,
+                            });
+                        }
+                    }
+                }
+            };
+
+            // Taken before `endpoint` goes out of scope at the end of this
+            // loop iteration — see `connect_via_relay_resumable`'s identical
+            // comment on why that's safe.
+            let network_rebinder = endpoint.rebinder();
+
+            let control = match open_control_stream(conn.as_ref(), &proof).await {
+                Ok(control) => control,
+                Err(source) => {
+                    return Err(SequentialConnectError::AttachedButControlStreamFailed {
+                        candidate_id: candidate.candidate_id.clone(),
+                        source,
+                    });
+                }
+            };
+            info!(
+                "isekai-transport: control stream established, session_id={}, candidate_id={}",
+                control.session_id, candidate.candidate_id
+            );
+
+            let session = ResumableRelaySession {
+                connection: conn,
+                data_stream,
+                control_stream: control.stream,
+                session_id: control.session_id,
+                effective_resume_grace_secs,
+                network_rebinder,
+            };
+            return Ok((session, candidate.target.clone()));
+        }
+
+        // Every candidate in this round failed `RetryablePreAttach` — no
+        // ambiguous/stale failure occurred, so there's no reason to advance
+        // the generation and try again.
+        return Err(SequentialConnectError::AllCandidatesFailed { failures });
     }
+}
 
-    Err(SequentialConnectError::AllCandidatesFailed { failures })
+/// `#25-3`: the `MustResume` convergence path. `resume_target` is the
+/// earlier candidate whose ambiguous attach most plausibly actually
+/// succeeded server-side; dials it fresh and issues `RESUME` for
+/// `session_id` with zero offsets (this client never got far enough into
+/// that earlier attempt to have sent or received any application data —
+/// only the ambiguous attach itself may have completed), then opens a
+/// control stream on the resumed connection so the returned
+/// `ResumableRelaySession` is just as resume-capable as a freshly attached
+/// one going forward.
+async fn finish_via_resume(
+    factory: &dyn QuicEndpointFactory,
+    resume_target: &RelayTarget,
+    session_id: SessionId,
+    candidate_id: String,
+) -> Result<(ResumableRelaySession, RelayTarget), SequentialConnectError> {
+    let resumed = reconnect_and_resume(factory, resume_target, session_id, C2hSentOffset::ZERO, H2cClientDeliveredOffset::ZERO)
+        .await
+        .map_err(|source| SequentialConnectError::MustResumeButResumeFailed { candidate_id: candidate_id.clone(), source })?;
+
+    let proof = compute_proof(resumed.connection.as_ref(), &resume_target.session_secret, b"")
+        .await
+        .map_err(|source| SequentialConnectError::MustResumeButResumeFailed { candidate_id: candidate_id.clone(), source })?;
+    let control = open_control_stream(resumed.connection.as_ref(), &proof)
+        .await
+        .map_err(|source| SequentialConnectError::MustResumeButResumeFailed { candidate_id, source })?;
+
+    info!(
+        "isekai-transport: resumed after MustResume convergence, session_id={}, helper_committed_offset={}",
+        control.session_id, resumed.helper_committed_offset
+    );
+
+    let session = ResumableRelaySession {
+        connection: resumed.connection,
+        data_stream: resumed.data_stream,
+        control_stream: control.stream,
+        session_id: control.session_id,
+        // No fresh negotiation happens on a bare RESUME/RESUME_ACK exchange
+        // (unlike the initial ATTACH_HELLO/AttachReadyV2) — `0` here means
+        // "unknown", matching this codebase's existing "no preference"
+        // convention elsewhere, since the server-granted value from the
+        // original (ambiguous) attach was never observed by this client.
+        effective_resume_grace_secs: 0,
+        network_rebinder: resumed.network_rebinder,
+    };
+    Ok((session, resume_target.clone()))
 }
 
 /// The result of a successful `RESUME` (`archive/HELPER_PROTOCOL.md` §7.3): a fresh
@@ -361,6 +572,10 @@ pub struct ResumeAckOutcome {
     pub data_stream: Box<dyn ByteStream>,
     pub helper_committed_offset: C2hHelperCommittedOffset,
     pub helper_sent_offset: H2cSentOffset,
+    /// See `ResumableRelaySession::network_rebinder` — this reconnect made a
+    /// brand-new endpoint, so this is a fresh handle onto *that* one, not a
+    /// stale reference to whatever endpoint the previous connection used.
+    pub network_rebinder: Option<Box<dyn QuicEndpointRebinder>>,
 }
 
 /// Dials a brand-new QUIC connection to `target.helper_addr` and sends
@@ -390,6 +605,9 @@ pub async fn reconnect_and_resume(
             cert_sha256_hex: target.cert_sha256_hex.clone(),
         })
         .await?;
+    // Taken before `endpoint` goes out of scope at the end of this function
+    // — see `connect_via_relay_resumable`'s identical comment.
+    let network_rebinder = endpoint.rebinder();
 
     // `resume_proof = HMAC-SHA256(session_secret, exporter || session_id)`
     // (`archive/HELPER_PROTOCOL.md` §7.3). `compute_proof`'s `extra` parameter is
@@ -430,5 +648,6 @@ pub async fn reconnect_and_resume(
         data_stream: stream,
         helper_committed_offset: ack.helper_committed_offset,
         helper_sent_offset: ack.helper_sent_offset,
+        network_rebinder,
     })
 }

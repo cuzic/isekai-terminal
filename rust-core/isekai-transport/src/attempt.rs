@@ -6,66 +6,89 @@
 //! The safety property this exists to encode: whether moving on to another
 //! candidate is safe depends on whether the server could plausibly have
 //! already committed this attempt's session-attach
-//! (`isekai-pipe serve`'s `active: AtomicBool` compare-exchange,
-//! `engine/mod.rs::handle_stream`). If the client sent `HELLO` and then lost
-//! the ability to observe the outcome (write failure, read failure, no
-//! response before giving up), the server may have already flipped `active`
-//! to `true` and be mid-`TcpStream::connect` to the target — a *different*
-//! candidate that reaches the *same* underlying helper (e.g. another relay
-//! endpoint for it, `#12`'s own scope) would then either collide
-//! (`FRAME_REJECT_DUPLICATE`) or, once per-candidate independent sessions
-//! exist, leave the first attempt's session orphaned with nothing to
-//! reconcile it. `#18`/`#25` add that reconciliation (`session_id`/
-//! `connection_generation`/`fencing_token`-based winner determination); this
-//! crate doesn't have it yet, so the only safe answer today is "fail closed"
-//! for anything ambiguous.
+//! (`isekai-pipe serve`'s `AttachArbiter`, `#18`). If the client sent
+//! `ATTACH_HELLO`/`AttachActivate` and then lost the ability to observe the
+//! outcome (write failure, read failure, no response before giving up), the
+//! server may have already moved this attempt into `PendingActivation` or
+//! `Established` — a *different* candidate that reaches the *same*
+//! underlying helper (e.g. another relay endpoint for it, `#12`'s own scope)
+//! would then either collide (`ALREADY_ATTACHED`) or, before `#25` exists,
+//! leave the first attempt's session orphaned with nothing to reconcile it.
+//! `#25` (post-`#18`) adds that reconciliation (advancing
+//! `ConnectionGeneration` to safely supersede an ambiguous earlier attempt);
+//! this crate doesn't retry past it yet, so the only safe answer today is
+//! "fail closed" for anything ambiguous.
 
-use isekai_protocol::hello::AckResponse;
+use isekai_protocol::attach::{AttachRejectReason, ConnectionGeneration};
 
 use crate::error::TransportError;
 
-/// Which phase of the HELLO/proof/ACK handshake a `connect_and_handshake`
-/// attempt failed in. `pub(crate)` — only `relay.rs` constructs these; the
-/// public classification callers branch on is [`AttemptFailure`].
+/// Which phase of the `ATTACH_HELLO`/proof/`AttachReadyV2`/`AttachActivate`
+/// handshake a `connect_and_handshake` attempt failed in. `pub(crate)` —
+/// only `relay.rs` constructs these; the public classification callers
+/// branch on is [`AttemptFailure`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectAttemptStage {
     QuicConnect,
     ComputeProof,
     OpenStream,
     HelloWrite,
-    /// No `ACK`/reject byte arrived before the read itself failed (I/O error,
-    /// unexpected EOF) — distinct from receiving an explicit reject byte,
-    /// which is [`ConnectAttemptStage::Rejected`] instead.
+    /// No `AttachReadyV2`/reject byte arrived before the read itself failed
+    /// (I/O error, unexpected EOF) — distinct from receiving an explicit
+    /// reject, which is [`ConnectAttemptStage::Rejected`] instead.
     AckRead,
+    /// The server sent `AttachReadyV2`, but writing `AttachActivate` back
+    /// failed — exactly as ambiguous as `HelloWrite`/`AckRead`: the server
+    /// may or may not have received it before moving on
+    /// (`AttachArbiter::PendingActivation`'s own timeout is what eventually
+    /// reclaims the slot server-side if it never arrives).
+    ActivateWrite,
     /// The server responded with an explicit reject byte (not silence, not
     /// an I/O failure) — the client *does* know the outcome for certain.
     Rejected(RejectReason),
 }
 
-/// The four ACK-reject reasons `isekai_protocol::hello::AckResponse` can
-/// carry, minus the success case (`Ack`, which never reaches this type —
-/// `connect_and_handshake` only tags a stage as `Rejected` on its `other =>`
-/// match arm, which by construction excludes `Ack`).
+/// Mirrors `isekai_protocol::attach::AttachRejectReason`, minus the payload
+/// on `StaleGeneration` (kept alongside instead, since [`AttemptFailure`]'s
+/// `StaleAttempt` variant is where callers actually want it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RejectReason {
     Auth,
-    Duplicate,
     Target,
     Unsupported,
+    AlreadyAttached,
+    StaleGeneration { current_generation: ConnectionGeneration },
+    BusyOtherSession,
+    AttachAlreadyEstablished,
 }
 
 impl RejectReason {
-    /// Panics on `AckResponse::Ack` — callers must only invoke this from the
-    /// reject branch of an ACK match, never the success branch.
-    pub(crate) fn from_ack_response(resp: AckResponse) -> Self {
-        match resp {
-            AckResponse::RejectAuth => Self::Auth,
-            AckResponse::RejectDuplicate => Self::Duplicate,
-            AckResponse::RejectTarget => Self::Target,
-            AckResponse::RejectUnsupported => Self::Unsupported,
-            AckResponse::Ack { .. } => {
-                unreachable!("RejectReason is only constructed from the reject arm of an ACK match")
+    pub(crate) fn from_attach_reject(reason: AttachRejectReason) -> Self {
+        match reason {
+            AttachRejectReason::Auth => Self::Auth,
+            AttachRejectReason::Target => Self::Target,
+            AttachRejectReason::Unsupported => Self::Unsupported,
+            AttachRejectReason::AlreadyAttached => Self::AlreadyAttached,
+            AttachRejectReason::StaleGeneration { current_generation } => {
+                Self::StaleGeneration { current_generation }
             }
+            AttachRejectReason::BusyOtherSession => Self::BusyOtherSession,
+            AttachRejectReason::AttachAlreadyEstablished => Self::AttachAlreadyEstablished,
+        }
+    }
+
+    #[cfg(test)]
+    fn as_attach_reject(self) -> AttachRejectReason {
+        match self {
+            Self::Auth => AttachRejectReason::Auth,
+            Self::Target => AttachRejectReason::Target,
+            Self::Unsupported => AttachRejectReason::Unsupported,
+            Self::AlreadyAttached => AttachRejectReason::AlreadyAttached,
+            Self::StaleGeneration { current_generation } => {
+                AttachRejectReason::StaleGeneration { current_generation }
+            }
+            Self::BusyOtherSession => AttachRejectReason::BusyOtherSession,
+            Self::AttachAlreadyEstablished => AttachRejectReason::AttachAlreadyEstablished,
         }
     }
 }
@@ -108,26 +131,40 @@ impl From<ConnectAttemptError> for TransportError {
 #[derive(Debug)]
 pub enum AttemptFailure {
     /// Nothing was ever sent to the server for this candidate (failed at or
-    /// before opening the QUIC stream, or before finishing the `HELLO`
-    /// write) — trying the next candidate is always safe.
+    /// before opening the QUIC stream, or before finishing the
+    /// `ATTACH_HELLO` write) — trying the next candidate is always safe.
     RetryablePreAttach { source: TransportError },
     /// The server rejected this attempt for a reason that would recur
     /// identically against this *same* underlying helper regardless of which
-    /// candidate reached it (`REJECT_TARGET`: the helper's own configured
-    /// target is unreachable) — not a security concern, but retrying a
-    /// different candidate *of the same helper* cannot help either.
+    /// candidate reached it (`Target`: the helper's own configured target is
+    /// unreachable) — not a security concern, but retrying a different
+    /// candidate *of the same helper* cannot help either.
     DefinitiveRejectNotRetryable { source: TransportError },
-    /// `HELLO` was sent and then the outcome became unobservable (read
-    /// failure, no response before giving up) before any `ACK`/reject byte
-    /// arrived — the server may or may not have already committed this
-    /// attempt's session-attach. Must not be silently followed by trying
-    /// another candidate before `#18`'s fencing exists (`#12`'s own scope
-    /// stops here; `#25` extends past it once fencing exists).
+    /// `ATTACH_HELLO`/`AttachActivate` was sent and then the outcome became
+    /// unobservable (read/write failure, no response before giving up)
+    /// before a definitive response arrived — the server may or may not
+    /// have already committed this attempt's session-attach. Must not be
+    /// silently followed by trying another candidate before `#25` exists
+    /// (`#12`'s own scope stops here; `#25` extends past it once it can
+    /// safely supersede via a new `ConnectionGeneration`).
     AmbiguousAfterAttach { source: TransportError },
+    /// `ALREADY_ATTACHED`: a *different* attempt already won this exact
+    /// `(session_id, generation)` — this candidate lost a race (`#19`), not
+    /// a terminal failure for the session as a whole.
+    LostRace { source: TransportError },
+    /// `STALE_GENERATION`: this attempt's generation is behind the server's
+    /// current one for this session — carries the server's
+    /// `current_generation` so a future caller (`#25`) knows exactly how far
+    /// to jump rather than guessing.
+    StaleAttempt { source: TransportError, current_generation: ConnectionGeneration },
+    /// `ATTACH_ALREADY_ESTABLISHED`: this session already completed its
+    /// initial attach — a new attach round shouldn't be started for it,
+    /// `RESUME` should be used instead.
+    MustResume { source: TransportError },
     /// A reason to stop entirely, not just skip this candidate — an auth
     /// rejection (wrong session secret, or a MITM/replay), a protocol
-    /// version mismatch, or (`REJECT_DUPLICATE`) a signal that some other
-    /// connection may already be attached to this helper right now. Worth
+    /// version mismatch, or a signal that some other logical session is
+    /// occupying the server right now (`BUSY_OTHER_SESSION`). Worth
     /// surfacing loudly, not quietly retrying past.
     Terminal { source: TransportError },
 }
@@ -138,6 +175,9 @@ impl std::fmt::Display for AttemptFailure {
             Self::RetryablePreAttach { source }
             | Self::DefinitiveRejectNotRetryable { source }
             | Self::AmbiguousAfterAttach { source }
+            | Self::LostRace { source }
+            | Self::StaleAttempt { source, .. }
+            | Self::MustResume { source }
             | Self::Terminal { source } => write!(f, "{source}"),
         }
     }
@@ -147,9 +187,9 @@ impl std::error::Error for AttemptFailure {}
 
 impl AttemptFailure {
     /// Whether a sequential fallback connector may safely try a different
-    /// candidate after this failure, *without* `#18`'s fencing machinery.
-    /// `#25` (post-`#18`) will need its own, less conservative check for the
-    /// `AmbiguousAfterAttach` case.
+    /// candidate after this failure, *without* `#25`'s generation-advancing
+    /// machinery. `#25` will need its own, less conservative check for the
+    /// `AmbiguousAfterAttach`/`LostRace` cases.
     pub fn may_retry_pre_fencing(&self) -> bool {
         matches!(self, Self::RetryablePreAttach { .. })
     }
@@ -162,6 +202,9 @@ impl AttemptFailure {
             Self::RetryablePreAttach { source }
             | Self::DefinitiveRejectNotRetryable { source }
             | Self::AmbiguousAfterAttach { source }
+            | Self::LostRace { source }
+            | Self::StaleAttempt { source, .. }
+            | Self::MustResume { source }
             | Self::Terminal { source } => source,
         }
     }
@@ -173,18 +216,28 @@ impl From<ConnectAttemptError> for AttemptFailure {
             ConnectAttemptStage::QuicConnect | ConnectAttemptStage::ComputeProof | ConnectAttemptStage::OpenStream => {
                 AttemptFailure::RetryablePreAttach { source: e.source }
             }
-            // A write failure mid-HELLO is exactly as ambiguous as a read
-            // failure waiting for the ACK: in both cases we cannot tell
-            // whether the server ever saw (and acted on) the HELLO.
-            ConnectAttemptStage::HelloWrite | ConnectAttemptStage::AckRead => {
+            // A write/read failure anywhere from the HELLO write through the
+            // Activate write is exactly as ambiguous: in every case we
+            // cannot tell whether the server ever saw (and acted on) the
+            // frame in question.
+            ConnectAttemptStage::HelloWrite | ConnectAttemptStage::AckRead | ConnectAttemptStage::ActivateWrite => {
                 AttemptFailure::AmbiguousAfterAttach { source: e.source }
             }
             ConnectAttemptStage::Rejected(RejectReason::Target) => {
                 AttemptFailure::DefinitiveRejectNotRetryable { source: e.source }
             }
+            ConnectAttemptStage::Rejected(RejectReason::AlreadyAttached) => {
+                AttemptFailure::LostRace { source: e.source }
+            }
+            ConnectAttemptStage::Rejected(RejectReason::StaleGeneration { current_generation }) => {
+                AttemptFailure::StaleAttempt { source: e.source, current_generation }
+            }
+            ConnectAttemptStage::Rejected(RejectReason::AttachAlreadyEstablished) => {
+                AttemptFailure::MustResume { source: e.source }
+            }
             ConnectAttemptStage::Rejected(RejectReason::Auth)
             | ConnectAttemptStage::Rejected(RejectReason::Unsupported)
-            | ConnectAttemptStage::Rejected(RejectReason::Duplicate) => {
+            | ConnectAttemptStage::Rejected(RejectReason::BusyOtherSession) => {
                 AttemptFailure::Terminal { source: e.source }
             }
         }
@@ -196,12 +249,23 @@ mod tests {
     use super::*;
 
     fn err(stage: ConnectAttemptStage) -> ConnectAttemptError {
-        ConnectAttemptError { stage, source: TransportError::UnexpectedEof }
+        let reason = match stage {
+            ConnectAttemptStage::Rejected(r) => Some(r.as_attach_reject()),
+            _ => None,
+        };
+        ConnectAttemptError {
+            stage,
+            source: match reason {
+                Some(reason) => TransportError::Rejected(reason),
+                None => TransportError::UnexpectedEof,
+            },
+        }
     }
 
     #[test]
     fn pre_attach_stages_classify_as_retryable() {
-        for stage in [ConnectAttemptStage::QuicConnect, ConnectAttemptStage::ComputeProof, ConnectAttemptStage::OpenStream] {
+        for stage in [ConnectAttemptStage::QuicConnect, ConnectAttemptStage::ComputeProof, ConnectAttemptStage::OpenStream]
+        {
             let failure = AttemptFailure::from(err(stage));
             assert!(matches!(failure, AttemptFailure::RetryablePreAttach { .. }));
             assert!(failure.may_retry_pre_fencing());
@@ -209,11 +273,11 @@ mod tests {
     }
 
     #[test]
-    fn hello_write_and_ack_read_classify_as_ambiguous() {
-        for stage in [ConnectAttemptStage::HelloWrite, ConnectAttemptStage::AckRead] {
+    fn hello_write_ack_read_and_activate_write_classify_as_ambiguous() {
+        for stage in [ConnectAttemptStage::HelloWrite, ConnectAttemptStage::AckRead, ConnectAttemptStage::ActivateWrite] {
             let failure = AttemptFailure::from(err(stage));
             assert!(matches!(failure, AttemptFailure::AmbiguousAfterAttach { .. }));
-            assert!(!failure.may_retry_pre_fencing(), "ambiguous failures must not be retried before #18 exists");
+            assert!(!failure.may_retry_pre_fencing(), "ambiguous failures must not be retried before #25 exists");
         }
     }
 
@@ -225,8 +289,35 @@ mod tests {
     }
 
     #[test]
-    fn reject_auth_duplicate_and_unsupported_classify_as_terminal() {
-        for reason in [RejectReason::Auth, RejectReason::Duplicate, RejectReason::Unsupported] {
+    fn reject_already_attached_classifies_as_lost_race() {
+        let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(RejectReason::AlreadyAttached)));
+        assert!(matches!(failure, AttemptFailure::LostRace { .. }));
+        assert!(!failure.may_retry_pre_fencing());
+    }
+
+    #[test]
+    fn reject_stale_generation_classifies_as_stale_attempt_with_current_generation() {
+        let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(RejectReason::StaleGeneration {
+            current_generation: ConnectionGeneration::new(7),
+        })));
+        match failure {
+            AttemptFailure::StaleAttempt { current_generation, .. } => {
+                assert_eq!(current_generation, ConnectionGeneration::new(7));
+            }
+            other => panic!("expected StaleAttempt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_attach_already_established_classifies_as_must_resume() {
+        let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(RejectReason::AttachAlreadyEstablished)));
+        assert!(matches!(failure, AttemptFailure::MustResume { .. }));
+        assert!(!failure.may_retry_pre_fencing());
+    }
+
+    #[test]
+    fn reject_auth_unsupported_and_busy_other_session_classify_as_terminal() {
+        for reason in [RejectReason::Auth, RejectReason::Unsupported, RejectReason::BusyOtherSession] {
             let failure = AttemptFailure::from(err(ConnectAttemptStage::Rejected(reason)));
             assert!(matches!(failure, AttemptFailure::Terminal { .. }), "{reason:?} should be Terminal");
             assert!(!failure.may_retry_pre_fencing());

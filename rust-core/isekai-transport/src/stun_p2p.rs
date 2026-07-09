@@ -30,8 +30,12 @@ use std::time::Duration;
 
 use log::info;
 
+use isekai_protocol::attach::ConnectionGeneration;
+use isekai_protocol::session_id::SessionId;
+
+use crate::attempt::AttemptFailure;
 use crate::error::TransportError;
-use crate::relay::connect_and_handshake;
+use crate::relay::{connect_and_handshake, random_session_id};
 use crate::system::quic_endpoint_from_std_socket;
 use crate::traits::ByteStream;
 use crate::types::{BindSpec, RemoteSpec};
@@ -98,12 +102,136 @@ pub async fn connect_stun_p2p(
     target: &StunP2pTarget,
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<StunP2pConnection, TransportError> {
-    let bind_addr = BindSpec::any_ipv4().local_addr;
-    let socket = tokio::net::UdpSocket::bind(bind_addr)
+    connect_stun_p2p_with_round(stun_server, target, random_session_id(), ConnectionGeneration::INITIAL, identity)
         .await
-        .map_err(|source| TransportError::Bind { addr: bind_addr, source })?;
+        .map_err(AttemptFailure::into_source)
+}
 
-    let our_observed_addr = isekai_stun::query_stun(&socket, stun_server).await?;
+/// Like [`connect_stun_p2p`], but takes an externally-provided
+/// `session_id`/`generation` instead of generating its own — for `#19`'s
+/// direct/relay race, where both candidates must share one round's fencing
+/// identity (`AttachArbiter`'s winner rule, `#18`). Classifies failures via
+/// [`AttemptFailure`] instead of the plain `TransportError` so a race runner
+/// can distinguish pre-attach failures (safe to just let the other candidate
+/// win) from ambiguous/terminal ones the same way the sequential fallback
+/// connector does (`#25`).
+/// One STUN-server candidate as [`connect_stun_p2p_with_fallback`] needs it:
+/// which STUN server to query plus the id telemetry logs it under. Every
+/// candidate passed to one fallback call dials the *same* `StunP2pTarget`
+/// (same peer, same session secret) — only `stun_server` (and therefore this
+/// side's own observed address) varies, matching
+/// `isekai-pipe-core::candidate::CandidateRoute::StunP2p`'s dedup-identity
+/// docs ("same peer, different STUN server" is a different candidate, not a
+/// duplicate).
+#[derive(Debug, Clone)]
+pub struct SequentialStunCandidate {
+    pub stun_server: SocketAddr,
+    pub candidate_id: String,
+}
+
+#[derive(Debug)]
+pub enum SequentialStunConnectError {
+    /// [`connect_stun_p2p_with_fallback`] was called with an empty candidate
+    /// list — a caller bug, not a connectivity failure.
+    NoCandidates,
+    /// Every candidate failed with a pre-attach reason
+    /// (`AttemptFailure::may_retry_pre_fencing() == true`); every one was
+    /// tried.
+    AllCandidatesFailed { failures: Vec<crate::resume::SequentialFailure> },
+    /// A candidate's failure was not safely pre-attach-retryable — stopped
+    /// immediately rather than trying the next candidate, exactly like the
+    /// original (pre-`#25`) relay fallback's `StoppedEarly` behavior. STUN
+    /// P2P has no resume/control-stream concept to converge an ambiguous
+    /// failure through (unlike relay's `#25`), so this stays intentionally
+    /// simple until real-world STUN failure-mode telemetry (`#13b`) shows a
+    /// generation-retry-aware version is actually needed.
+    StoppedEarly { candidate_id: String, failure: crate::attempt::AttemptFailure },
+}
+
+impl std::fmt::Display for SequentialStunConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoCandidates => write!(f, "no candidates were provided to try"),
+            Self::AllCandidatesFailed { failures } => {
+                write!(f, "all {} candidate(s) failed:", failures.len())?;
+                for failure in failures {
+                    write!(f, " [{}: {}]", failure.candidate_id, failure.failure)?;
+                }
+                Ok(())
+            }
+            Self::StoppedEarly { candidate_id, failure } => {
+                write!(f, "stopped after candidate {candidate_id:?} failed ambiguously or terminally: {failure}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SequentialStunConnectError {}
+
+/// Like [`connect_stun_p2p`], but tries each of `candidates` (each a
+/// different STUN server, same `target`) in order and falls back to the next
+/// one when a candidate fails in a way that's provably safe to retry
+/// (`AttemptFailure::may_retry_pre_fencing`) — mirrors
+/// `resume::connect_via_relay_resumable_with_fallback`'s original (`#12`)
+/// simplicity rather than its later (`#25`) generation-retry/`MustResume`
+/// convergence machinery, since that machinery exists specifically to
+/// recover a relay session via `RESUME`, and STUN P2P has no such resume path
+/// (module docs).
+///
+/// Every candidate in one call shares the same `session_id`/
+/// `ConnectionGeneration::INITIAL` (`#18-5`'s fencing identity) so the peer
+/// can tell a fallback attempt to a different STUN server is still logically
+/// the same attach round, not a second concurrent session.
+pub async fn connect_stun_p2p_with_fallback(
+    target: &StunP2pTarget,
+    candidates: &[SequentialStunCandidate],
+) -> Result<(StunP2pConnection, SocketAddr), SequentialStunConnectError> {
+    if candidates.is_empty() {
+        return Err(SequentialStunConnectError::NoCandidates);
+    }
+
+    let session_id = random_session_id();
+    let mut failures = Vec::new();
+
+    for candidate in candidates {
+        let identity = crate::telemetry::CandidateIdentity {
+            kind: "stun-p2p",
+            source: "config-stun",
+            provider: "config-stun",
+            id: &candidate.candidate_id,
+        };
+        match connect_stun_p2p_with_round(candidate.stun_server, target, session_id, ConnectionGeneration::INITIAL, identity)
+            .await
+        {
+            Ok(conn) => return Ok((conn, candidate.stun_server)),
+            Err(failure) => {
+                if failure.may_retry_pre_fencing() {
+                    failures.push(crate::resume::SequentialFailure { candidate_id: candidate.candidate_id.clone(), failure });
+                    continue;
+                }
+                return Err(SequentialStunConnectError::StoppedEarly { candidate_id: candidate.candidate_id.clone(), failure });
+            }
+        }
+    }
+
+    Err(SequentialStunConnectError::AllCandidatesFailed { failures })
+}
+
+pub(crate) async fn connect_stun_p2p_with_round(
+    stun_server: SocketAddr,
+    target: &StunP2pTarget,
+    session_id: SessionId,
+    generation: ConnectionGeneration,
+    identity: crate::telemetry::CandidateIdentity<'_>,
+) -> Result<StunP2pConnection, AttemptFailure> {
+    let bind_addr = BindSpec::any_ipv4().local_addr;
+    let socket = tokio::net::UdpSocket::bind(bind_addr).await.map_err(|source| AttemptFailure::RetryablePreAttach {
+        source: TransportError::Bind { addr: bind_addr, source },
+    })?;
+
+    let our_observed_addr = isekai_stun::query_stun(&socket, stun_server)
+        .await
+        .map_err(|source| AttemptFailure::RetryablePreAttach { source: source.into() })?;
     info!("isekai-transport: our STUN-observed address is {our_observed_addr} (via {stun_server})");
 
     // Simultaneous open: fire a handful of probes at the peer's observed
@@ -116,10 +244,11 @@ pub async fn connect_stun_p2p(
         tokio::time::sleep(PUNCH_PROBE_INTERVAL).await;
     }
 
-    let std_socket = socket
-        .into_std()
-        .map_err(|e| TransportError::SocketSetup(e.to_string()))?;
-    let endpoint = quic_endpoint_from_std_socket(std_socket)?;
+    let std_socket = socket.into_std().map_err(|e| AttemptFailure::RetryablePreAttach {
+        source: TransportError::SocketSetup(e.to_string()),
+    })?;
+    let endpoint = quic_endpoint_from_std_socket(std_socket)
+        .map_err(|source| AttemptFailure::RetryablePreAttach { source })?;
 
     let remote = RemoteSpec {
         addr: target.peer_addr,
@@ -129,7 +258,9 @@ pub async fn connect_stun_p2p(
     // No resume support on this path (module docs), so there is no grace
     // period to request — `0` ("no preference").
     let (_conn, stream, _proof, _effective_resume_grace_secs) =
-        connect_and_handshake(endpoint.as_ref(), remote, &target.session_secret, 0, identity).await?;
+        connect_and_handshake(endpoint.as_ref(), remote, &target.session_secret, session_id, generation, 0, identity)
+            .await
+            .map_err(AttemptFailure::from)?;
 
     Ok(StunP2pConnection { our_observed_addr, stream })
 }

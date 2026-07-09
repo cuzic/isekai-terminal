@@ -6,13 +6,16 @@
 //! duplicating the mock-server helpers rather than sharing them across
 //! files).
 //!
-//! The scenarios here specifically exercise the safety property task #12
-//! exists to protect (ChatGPT second-opinion review, 2026-07-08): a
-//! pre-attach failure on candidate 1 must fall back to candidate 2, but an
-//! *ambiguous* (or definitively terminal) failure on candidate 1 must stop
-//! immediately — trying candidate 2 after an ambiguous failure would risk a
-//! double-attach against the same underlying helper, unsafe before `#18`'s
-//! fencing exists.
+//! The scenarios here specifically exercise the safety properties tasks #12
+//! and #25-2 exist to protect (ChatGPT second-opinion reviews, 2026-07-08):
+//! a pre-attach failure on candidate 1 must fall back to candidate 2 within
+//! the same generation; an *ambiguous* failure on candidate 1 must now
+//! (`#25-2`, on top of `#18`'s fencing) safely fall back to candidate 2 too,
+//! but only after advancing to a new generation — trying candidate 2 with
+//! the *same* generation after an ambiguous failure would still risk a
+//! double-attach against the same underlying helper. A definitively
+//! terminal rejection (e.g. auth failure) still stops the whole attempt
+//! immediately; retrying with any generation cannot help there.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,9 +23,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
-use isekai_protocol::hello::{
-    decode_hello, encode_ack_response, AckResponse, Proof, ALPN, EXPORTER_LABEL, HELLO_FRAME_LEN,
+use isekai_protocol::attach::{
+    attach_hello_proof_transcript, decode_attach_activate, decode_attach_hello, encode_attach_response, AttachProof,
+    AttachRejectReason, AttachResponse, AttachToken, ConnectionGeneration, ATTACH_ACTIVATE_FRAME_LEN,
+    ATTACH_HELLO_FRAME_LEN,
 };
+use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
+use isekai_protocol::offset::{C2hHelperCommittedOffset, H2cSentOffset};
+use isekai_protocol::resume::{decode_resume, encode_resume_ack, ResumeAckFrame, ResumeProof, RESUME_FRAME_LEN};
 use isekai_transport::{
     connect_via_relay_resumable_with_fallback, RelayTarget, SequentialConnectError, SequentialRelayCandidate,
     SystemQuicEndpointFactory,
@@ -80,27 +88,48 @@ async fn run_full_mock_helper(endpoint: noq::Endpoint, contacted: Option<Arc<Ato
     }
 
     let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-    let mut hello = [0u8; HELLO_FRAME_LEN];
-    recv.read_exact(&mut hello).await.unwrap();
-    let hello = decode_hello(&hello).unwrap();
+    let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
+    recv.read_exact(&mut hello_bytes).await.unwrap();
+    let hello = decode_attach_hello(&hello_bytes).unwrap();
 
     let mut exporter = [0u8; 32];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"").unwrap();
+    let transcript = attach_hello_proof_transcript(
+        &hello.session_id,
+        hello.generation,
+        &hello.attempt_id,
+        hello.requested_resume_grace_secs,
+    );
     let mut mac = HmacSha256::new_from_slice(SESSION_SECRET).unwrap();
     mac.update(&exporter);
-    let expected = Proof::new(mac.finalize().into_bytes().into());
+    mac.update(&transcript);
+    let expected = AttachProof::new(mac.finalize().into_bytes().into());
     assert!(hello.proof.ct_eq(&expected), "test setup bug: session secret mismatch");
 
-    send.write_all(&encode_ack_response(AckResponse::Ack { effective_resume_grace_secs: 0 })).await.unwrap();
+    let ready = AttachResponse::Ready {
+        session_id: hello.session_id,
+        generation: hello.generation,
+        attempt_id: hello.attempt_id,
+        negotiated_resume_grace_secs: 0,
+        attach_token: AttachToken::new(rand::random()),
+    };
+    send.write_all(&encode_attach_response(&ready)).await.unwrap();
+
+    // The winning candidate confirms with AttachActivate before any relay.
+    let mut activate_bytes = [0u8; ATTACH_ACTIVATE_FRAME_LEN];
+    recv.read_exact(&mut activate_bytes).await.unwrap();
+    decode_attach_activate(&activate_bytes).unwrap();
 
     // CONTROL_HELLO/CONTROL_ACK, matching `resume.rs::open_control_stream`'s
-    // wire contract exactly (`archive/HELPER_PROTOCOL.md` §7.3).
+    // wire contract exactly (`archive/HELPER_PROTOCOL.md` §7.3). The session_id
+    // now comes from the client's ATTACH_HELLO, so echo it back verbatim like
+    // the real server does (#18-4).
     let (mut csend, mut crecv) = conn.accept_bi().await.unwrap();
     let mut chello = [0u8; 33];
     crecv.read_exact(&mut chello).await.unwrap();
     assert_eq!(chello[0], 0x10, "expected CONTROL_HELLO");
     let mut cack = vec![0x11u8];
-    cack.extend_from_slice(&[0u8; 16]); // session_id: any 16 bytes, unchecked by this test
+    cack.extend_from_slice(hello.session_id.as_bytes());
     csend.write_all(&cack).await.unwrap();
 
     // Keep the connection alive briefly so the client can finish reading.
@@ -114,10 +143,29 @@ async fn run_silent_after_hello_helper(endpoint: noq::Endpoint) {
     let incoming = endpoint.accept().await.unwrap();
     let conn = incoming.await.unwrap();
     let (_send, mut recv) = conn.accept_bi().await.unwrap();
-    let mut hello = [0u8; HELLO_FRAME_LEN];
-    recv.read_exact(&mut hello).await.unwrap();
-    // Deliberately no response, no ACK — just drop everything.
+    let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
+    recv.read_exact(&mut hello_bytes).await.unwrap();
+    // Deliberately no response, no AttachReadyV2 — just drop everything.
     conn.close(0u32.into(), b"simulated ack loss");
+}
+
+/// A server that unconditionally rejects `ATTACH_HELLO` with
+/// `STALE_GENERATION`, reporting `current_generation` — standing in for a
+/// candidate whose helper has already moved past the generation this client
+/// is using (`#25-4`).
+async fn run_reject_stale_generation_helper(endpoint: noq::Endpoint, current_generation: u64) {
+    let incoming = endpoint.accept().await.unwrap();
+    let conn = incoming.await.unwrap();
+    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+    let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
+    recv.read_exact(&mut hello_bytes).await.unwrap();
+    let _ = decode_attach_hello(&hello_bytes).unwrap();
+    let reject = AttachResponse::Reject(AttachRejectReason::StaleGeneration {
+        current_generation: ConnectionGeneration::new(current_generation),
+    });
+    send.write_all(&encode_attach_response(&reject)).await.unwrap();
+    let _ = send.finish();
+    let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
 }
 
 /// A server that rejects every HELLO with `RejectAuth` (session secret
@@ -126,10 +174,11 @@ async fn run_reject_auth_helper(endpoint: noq::Endpoint) {
     let incoming = endpoint.accept().await.unwrap();
     let conn = incoming.await.unwrap();
     let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-    let mut hello = [0u8; HELLO_FRAME_LEN];
-    recv.read_exact(&mut hello).await.unwrap();
-    let _ = decode_hello(&hello).unwrap();
-    send.write_all(&encode_ack_response(AckResponse::RejectAuth)).await.unwrap();
+    let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
+    recv.read_exact(&mut hello_bytes).await.unwrap();
+    let _ = decode_attach_hello(&hello_bytes).unwrap();
+    let reject = AttachResponse::Reject(AttachRejectReason::Auth);
+    send.write_all(&encode_attach_response(&reject)).await.unwrap();
     let _ = send.finish();
     let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
 }
@@ -173,41 +222,44 @@ async fn first_candidate_pre_attach_failure_falls_back_to_second() {
     let _ = tokio::time::timeout(Duration::from_secs(5), server2_task).await;
 }
 
+/// `#25-2`: an ambiguous failure on candidate 1 (ACK/AttachReadyV2 lost
+/// after HELLO) no longer stops the whole attempt — the
+/// `GenerationCoordinator` advances to a new generation and candidate 2 is
+/// tried under that new generation. `run_full_mock_helper` accepts whatever
+/// generation it's handed (it just echoes back what the client sent), so
+/// this proves the fallback reaches and succeeds against candidate 2 without
+/// asserting on the specific generation value itself — the safety property
+/// (never retrying the *same* generation against a possibly-committed
+/// candidate 1) is `AttachArbiter`'s own job and already covered by `#18-7`'s
+/// fencing e2e tests; this test only proves the client-side continuation
+/// actually happens end to end.
 #[tokio::test]
-async fn first_candidate_ambiguous_failure_stops_early_without_trying_second() {
+async fn first_candidate_ambiguous_failure_safely_falls_back_to_second_with_a_new_generation() {
     let (cert1_der, key1_der, cert1_hex) = generate_cert();
     let endpoint1 = mock_server(cert1_der, key1_der);
     let addr1 = endpoint1.local_addr().unwrap();
     let server1_task = tokio::spawn(run_silent_after_hello_helper(endpoint1));
 
-    // Candidate 2 must never be contacted — proven via this flag.
     let (cert2_der, key2_der, cert2_hex) = generate_cert();
     let endpoint2 = mock_server(cert2_der, key2_der);
     let addr2 = endpoint2.local_addr().unwrap();
-    let contacted = Arc::new(AtomicBool::new(false));
-    let server2_task = tokio::spawn(run_full_mock_helper(endpoint2, Some(contacted.clone())));
+    let server2_task = tokio::spawn(run_full_mock_helper(endpoint2, None));
 
     let candidates = vec![candidate("relay-1", addr1, cert1_hex), candidate("relay-2", addr2, cert2_hex)];
 
     let factory = SystemQuicEndpointFactory;
-    let result = tokio::time::timeout(
+    let (session, winning_target) = tokio::time::timeout(
         Duration::from_secs(10),
         connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
     )
     .await
-    .expect("should not hang");
+    .expect("should not hang")
+    .expect("an ambiguous failure on candidate 1 should safely fall back to candidate 2 with a new generation");
+    assert_eq!(winning_target.helper_addr, addr2, "the winning target must be candidate 2's, not candidate 1's");
 
-    match result {
-        Err(SequentialConnectError::StoppedEarly { candidate_id, .. }) => {
-            assert_eq!(candidate_id, "relay-1");
-        }
-        Ok(_) => panic!("expected StoppedEarly on the ambiguous first candidate, but connecting succeeded"),
-        Err(other) => panic!("expected StoppedEarly on the ambiguous first candidate, got: {other}"),
-    }
-    assert!(!contacted.load(Ordering::SeqCst), "candidate 2 must never be contacted after an ambiguous failure");
-
+    drop(session.connection);
     server1_task.abort();
-    server2_task.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), server2_task).await;
 }
 
 #[tokio::test]
@@ -291,4 +343,230 @@ async fn all_candidates_pre_attach_failing_returns_all_candidates_failed() {
 
     server1_task.abort();
     server2_task.abort();
+}
+
+/// A server that goes silent right after reading `ATTACH_HELLO` on its
+/// *first* connection (simulating "the AttachReadyV2/AttachActivate exchange
+/// was lost", exactly like `run_silent_after_hello_helper`) but — unlike
+/// that helper — actually did commit the attach server-side. It proves this
+/// by accepting a *second*, fresh connection and completing a real `RESUME`
+/// for the same `session_id`, standing in for `#25-3`'s premise: an
+/// ambiguous candidate's attach may have genuinely succeeded even though the
+/// client never found out.
+async fn run_silent_then_resumable_helper(endpoint: noq::Endpoint) {
+    let incoming = endpoint.accept().await.unwrap();
+    let conn = incoming.await.unwrap();
+    let (_send, mut recv) = conn.accept_bi().await.unwrap();
+    let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
+    recv.read_exact(&mut hello_bytes).await.unwrap();
+    let hello = decode_attach_hello(&hello_bytes).unwrap();
+    conn.close(0u32.into(), b"simulated ack loss");
+
+    let incoming2 = endpoint.accept().await.unwrap();
+    let conn2 = incoming2.await.unwrap();
+    let (mut send2, mut recv2) = conn2.accept_bi().await.unwrap();
+    let mut resume_bytes = [0u8; RESUME_FRAME_LEN];
+    recv2.read_exact(&mut resume_bytes).await.unwrap();
+    let resume_frame = decode_resume(&resume_bytes).unwrap();
+    assert_eq!(resume_frame.session_id, hello.session_id, "resume must target the same session_id the ambiguous attach used");
+
+    let mut exporter = [0u8; 32];
+    conn2.export_keying_material(&mut exporter, EXPORTER_LABEL, b"").unwrap();
+    let mut mac = HmacSha256::new_from_slice(SESSION_SECRET).unwrap();
+    mac.update(&exporter);
+    mac.update(resume_frame.session_id.as_bytes());
+    let expected = ResumeProof::new(mac.finalize().into_bytes().into());
+    assert!(resume_frame.resume_proof.ct_eq(&expected), "test setup bug: resume proof mismatch");
+
+    let ack = ResumeAckFrame {
+        helper_committed_offset: C2hHelperCommittedOffset::new(0),
+        helper_sent_offset: H2cSentOffset::new(0),
+    };
+    send2.write_all(&encode_resume_ack(&ack)).await.unwrap();
+
+    let (mut csend2, mut crecv2) = conn2.accept_bi().await.unwrap();
+    let mut chello = [0u8; 33];
+    crecv2.read_exact(&mut chello).await.unwrap();
+    assert_eq!(chello[0], 0x10, "expected CONTROL_HELLO");
+    let mut cack = vec![0x11u8];
+    cack.extend_from_slice(resume_frame.session_id.as_bytes());
+    csend2.write_all(&cack).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+/// A server that unconditionally rejects `ATTACH_HELLO` with
+/// `ATTACH_ALREADY_ESTABLISHED` — standing in for a candidate that routes to
+/// the same underlying helper as one that already reached `Established` via
+/// a different candidate.
+async fn run_reject_already_established_helper(endpoint: noq::Endpoint) {
+    let incoming = endpoint.accept().await.unwrap();
+    let conn = incoming.await.unwrap();
+    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+    let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
+    recv.read_exact(&mut hello_bytes).await.unwrap();
+    let _ = decode_attach_hello(&hello_bytes).unwrap();
+    let reject = AttachResponse::Reject(AttachRejectReason::AttachAlreadyEstablished);
+    send.write_all(&encode_attach_response(&reject)).await.unwrap();
+    let _ = send.finish();
+    let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
+}
+
+/// `#25-3`: candidate 1 goes ambiguous (ACK lost after HELLO); candidate 2
+/// is told `ATTACH_ALREADY_ESTABLISHED`, implying candidate 1's attach
+/// actually succeeded. The fallback connector should converge on resuming
+/// candidate 1's session rather than surfacing an error.
+#[tokio::test]
+async fn ambiguous_then_already_established_converges_on_resuming_the_ambiguous_candidate() {
+    let (cert1_der, key1_der, cert1_hex) = generate_cert();
+    let endpoint1 = mock_server(cert1_der, key1_der);
+    let addr1 = endpoint1.local_addr().unwrap();
+    let server1_task = tokio::spawn(run_silent_then_resumable_helper(endpoint1));
+
+    let (cert2_der, key2_der, cert2_hex) = generate_cert();
+    let endpoint2 = mock_server(cert2_der, key2_der);
+    let addr2 = endpoint2.local_addr().unwrap();
+    let server2_task = tokio::spawn(run_reject_already_established_helper(endpoint2));
+
+    let candidates = vec![candidate("relay-1", addr1, cert1_hex), candidate("relay-2", addr2, cert2_hex)];
+
+    let factory = SystemQuicEndpointFactory;
+    let (session, winning_target) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
+    )
+    .await
+    .expect("should not hang")
+    .expect("ATTACH_ALREADY_ESTABLISHED after an ambiguous candidate should converge on resuming it");
+    assert_eq!(
+        winning_target.helper_addr, addr1,
+        "the resumed session must be against candidate 1 (the one that went ambiguous), not candidate 2"
+    );
+
+    drop(session.connection);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server1_task).await;
+    server2_task.abort();
+}
+
+/// `#25-4`: an `ambiguous` failure on the first *two* candidates should
+/// each independently advance the generation and rotate forward — proving
+/// the round runner correctly handles more than one consecutive advance,
+/// not just the single-hop case the other tests exercise.
+#[tokio::test]
+async fn ambiguous_failures_on_two_consecutive_candidates_both_rotate_forward() {
+    let (cert1_der, key1_der, cert1_hex) = generate_cert();
+    let endpoint1 = mock_server(cert1_der, key1_der);
+    let addr1 = endpoint1.local_addr().unwrap();
+    let server1_task = tokio::spawn(run_silent_after_hello_helper(endpoint1));
+
+    let (cert2_der, key2_der, cert2_hex) = generate_cert();
+    let endpoint2 = mock_server(cert2_der, key2_der);
+    let addr2 = endpoint2.local_addr().unwrap();
+    let server2_task = tokio::spawn(run_silent_after_hello_helper(endpoint2));
+
+    let (cert3_der, key3_der, cert3_hex) = generate_cert();
+    let endpoint3 = mock_server(cert3_der, key3_der);
+    let addr3 = endpoint3.local_addr().unwrap();
+    let server3_task = tokio::spawn(run_full_mock_helper(endpoint3, None));
+
+    let candidates = vec![
+        candidate("relay-1", addr1, cert1_hex),
+        candidate("relay-2", addr2, cert2_hex),
+        candidate("relay-3", addr3, cert3_hex),
+    ];
+
+    let factory = SystemQuicEndpointFactory;
+    let (session, winning_target) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
+    )
+    .await
+    .expect("should not hang")
+    .expect("two consecutive ambiguous failures should each advance the generation and reach candidate 3");
+    assert_eq!(winning_target.helper_addr, addr3);
+
+    drop(session.connection);
+    server1_task.abort();
+    server2_task.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), server3_task).await;
+}
+
+/// `#25-4`: `STALE_GENERATION` (a candidate reporting the server is already
+/// ahead of this client's generation) is recovered from the same way
+/// `AmbiguousAfterAttach` is — advance past the reported floor and rotate to
+/// the next candidate — rather than stopping the whole attempt.
+#[tokio::test]
+async fn stale_generation_is_recovered_by_advancing_past_the_reported_floor() {
+    let (cert1_der, key1_der, cert1_hex) = generate_cert();
+    let endpoint1 = mock_server(cert1_der, key1_der);
+    let addr1 = endpoint1.local_addr().unwrap();
+    let server1_task = tokio::spawn(run_reject_stale_generation_helper(endpoint1, 10));
+
+    let (cert2_der, key2_der, cert2_hex) = generate_cert();
+    let endpoint2 = mock_server(cert2_der, key2_der);
+    let addr2 = endpoint2.local_addr().unwrap();
+    let server2_task = tokio::spawn(run_full_mock_helper(endpoint2, None));
+
+    let candidates = vec![candidate("relay-1", addr1, cert1_hex), candidate("relay-2", addr2, cert2_hex)];
+
+    let factory = SystemQuicEndpointFactory;
+    let (session, winning_target) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
+    )
+    .await
+    .expect("should not hang")
+    .expect("STALE_GENERATION should be recovered by advancing past the reported floor, not stopping early");
+    assert_eq!(winning_target.helper_addr, addr2);
+
+    drop(session.connection);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server1_task).await;
+    server2_task.abort();
+}
+
+/// `#25-4`: if ambiguity keeps recurring past
+/// `GenerationCoordinator`'s retry budget (`DEFAULT_MAX_GENERATION_ADVANCES`
+/// = 2), the whole attempt gives up deterministically
+/// (`SequentialConnectError::GaveUpAfterGenerationRetries`) instead of
+/// advancing generations forever.
+#[tokio::test]
+async fn generation_retry_budget_exhaustion_gives_up_deterministically() {
+    let (cert1_der, key1_der, cert1_hex) = generate_cert();
+    let endpoint1 = mock_server(cert1_der, key1_der);
+    let addr1 = endpoint1.local_addr().unwrap();
+    let server1_task = tokio::spawn(run_silent_after_hello_helper(endpoint1));
+
+    let (cert2_der, key2_der, cert2_hex) = generate_cert();
+    let endpoint2 = mock_server(cert2_der, key2_der);
+    let addr2 = endpoint2.local_addr().unwrap();
+    let server2_task = tokio::spawn(run_silent_after_hello_helper(endpoint2));
+
+    let (cert3_der, key3_der, cert3_hex) = generate_cert();
+    let endpoint3 = mock_server(cert3_der, key3_der);
+    let addr3 = endpoint3.local_addr().unwrap();
+    let server3_task = tokio::spawn(run_silent_after_hello_helper(endpoint3));
+
+    let candidates = vec![
+        candidate("relay-1", addr1, cert1_hex),
+        candidate("relay-2", addr2, cert2_hex),
+        candidate("relay-3", addr3, cert3_hex),
+    ];
+
+    let factory = SystemQuicEndpointFactory;
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
+    )
+    .await
+    .expect("should not hang");
+
+    match result {
+        Err(SequentialConnectError::GaveUpAfterGenerationRetries { .. }) => {}
+        Ok(_) => panic!("expected GaveUpAfterGenerationRetries, but connecting succeeded"),
+        Err(other) => panic!("expected GaveUpAfterGenerationRetries, got: {other}"),
+    }
+
+    server1_task.abort();
+    server2_task.abort();
+    server3_task.abort();
 }

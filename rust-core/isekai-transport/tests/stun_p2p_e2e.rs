@@ -19,9 +19,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
-use isekai_protocol::hello::{
-    decode_hello, encode_ack_response, AckResponse, Proof, ALPN, EXPORTER_LABEL, HELLO_FRAME_LEN,
+use isekai_protocol::attach::{
+    attach_hello_proof_transcript, decode_attach_activate, decode_attach_hello, encode_attach_response, AttachProof,
+    AttachRejectReason, AttachResponse, AttachToken, ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,
 };
+use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
 use isekai_transport::{connect_stun_p2p, CandidateIdentity, StunP2pTarget, TransportError};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
@@ -106,9 +108,10 @@ fn mock_peer_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs8KeyD
 }
 
 /// Accepts exactly one connection and one bidirectional stream, verifies the
-/// HELLO proof the same way isekai-helper would, and replies ACK/REJECT_AUTH
-/// accordingly. On ACK, echoes back one more message to prove the returned
-/// stream is a live, working, bidirectional pass-through — not just a
+/// ATTACH_HELLO proof the same way isekai-helper would, and replies
+/// AttachReadyV2 / REJECT_AUTH accordingly. On AttachReadyV2 it reads the
+/// client's AttachActivate, then echoes back one more message to prove the
+/// returned stream is a live, working, bidirectional pass-through — not just a
 /// handshake stub (mirrors `relay_e2e.rs::run_mock_helper`).
 async fn run_mock_peer(
     endpoint: noq::Endpoint,
@@ -119,30 +122,48 @@ async fn run_mock_peer(
     let conn = incoming.await.unwrap();
     let (mut send, mut recv) = conn.accept_bi().await.unwrap();
 
-    let mut hello = [0u8; HELLO_FRAME_LEN];
-    recv.read_exact(&mut hello).await.unwrap();
-    let hello = decode_hello(&hello).unwrap();
+    let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
+    recv.read_exact(&mut hello_bytes).await.unwrap();
+    let hello = decode_attach_hello(&hello_bytes).unwrap();
 
     let mut exporter = [0u8; 32];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"").unwrap();
+    let transcript = attach_hello_proof_transcript(
+        &hello.session_id,
+        hello.generation,
+        &hello.attempt_id,
+        hello.requested_resume_grace_secs,
+    );
     let mut mac = HmacSha256::new_from_slice(&session_secret).unwrap();
     mac.update(&exporter);
+    mac.update(&transcript);
     let expected_bytes: [u8; 32] = mac.finalize().into_bytes().into();
-    let expected = Proof::new(expected_bytes);
+    let expected = AttachProof::new(expected_bytes);
 
-    let is_ack = hello.proof.ct_eq(&expected);
-    let ack = if is_ack {
-        AckResponse::Ack { effective_resume_grace_secs: hello.requested_resume_grace_secs }
-    } else {
-        AckResponse::RejectAuth
+    if !hello.proof.ct_eq(&expected) {
+        let reject = AttachResponse::Reject(AttachRejectReason::Auth);
+        send.write_all(&encode_attach_response(&reject)).await.unwrap();
+        send.finish().ok();
+        client_done.await.ok();
+        return;
+    }
+
+    let ready = AttachResponse::Ready {
+        session_id: hello.session_id,
+        generation: hello.generation,
+        attempt_id: hello.attempt_id,
+        negotiated_resume_grace_secs: hello.requested_resume_grace_secs,
+        attach_token: AttachToken::new(rand::random()),
     };
-    send.write_all(&encode_ack_response(ack)).await.unwrap();
+    send.write_all(&encode_attach_response(&ready)).await.unwrap();
 
-    if is_ack {
-        let mut buf = [0u8; 64];
-        if let Ok(Some(n)) = recv.read(&mut buf).await {
-            send.write_all(&buf[..n]).await.unwrap();
-        }
+    let mut activate_bytes = [0u8; ATTACH_ACTIVATE_FRAME_LEN];
+    recv.read_exact(&mut activate_bytes).await.unwrap();
+    decode_attach_activate(&activate_bytes).unwrap();
+
+    let mut buf = [0u8; 64];
+    if let Ok(Some(n)) = recv.read(&mut buf).await {
+        send.write_all(&buf[..n]).await.unwrap();
     }
     send.finish().ok();
 
@@ -216,7 +237,7 @@ async fn connect_stun_p2p_surfaces_reject_auth_for_a_wrong_session_secret() {
     match tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p(stun_server, &target, TEST_IDENTITY)).await {
         Ok(Ok(_conn)) => panic!("a mismatched session_secret must be rejected, but it succeeded"),
         Ok(Err(err)) => {
-            assert!(matches!(err, TransportError::Rejected(AckResponse::RejectAuth)), "got: {err:?}")
+            assert!(matches!(err, TransportError::Rejected(AttachRejectReason::Auth)), "got: {err:?}")
         }
         Err(_) => panic!("connect_stun_p2p should not hang"),
     }

@@ -13,7 +13,7 @@ isekai-pipe-core = { path = "../isekai-pipe-core" }
 # ISEKAI_SSH_DESIGN.md フェーズS-0d-2）。isekai-terminal-core・isekai-helperと共用のpure crate。
 isekai-stun = { path = "../isekai-stun" }
 async-trait = "0.1.89"
-tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 # QUIC実装は isekai-terminal-core と同じく noq（quinnのマルチパスフォーク）に一本化する。
 # `FaultyUdpSocket`等のAndroid専用型・UniFFIはこのcrateからは一切参照しない
 # （ISEKAI_SSH_DESIGN.md「FaultyUdpSocket（Android専用フォルト注入ソケット）の扱い」節）。

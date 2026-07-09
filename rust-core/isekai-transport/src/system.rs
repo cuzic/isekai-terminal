@@ -24,7 +24,10 @@ use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use sha2::{Digest, Sha256};
 
 use crate::error::TransportError;
-use crate::traits::{ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf, QuicConnection, QuicEndpoint, QuicEndpointFactory};
+use crate::traits::{
+    ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf, QuicConnection, QuicEndpoint, QuicEndpointFactory,
+    QuicEndpointRebinder,
+};
 use crate::types::{BindSpec, RemoteSpec};
 
 /// QUIC connection is declared dead after this much silence. Matches
@@ -192,6 +195,46 @@ impl QuicEndpoint for SystemQuicEndpoint {
             .map_err(|e| TransportError::Handshake(e.to_string()))?;
         info!("isekai-transport: QUIC handshake ok rtt={:?}", conn.rtt(noq::PathId::ZERO));
         Ok(Box::new(SystemQuicConnection { conn }))
+    }
+
+    fn rebinder(&self) -> Option<Box<dyn QuicEndpointRebinder>> {
+        // `noq::Endpoint` is a cheap, `Clone`-able handle onto shared
+        // internal state ("May be cloned to obtain another handle to the
+        // same endpoint" — its own doc comment), not the owner of a
+        // background task that dies with this particular value, so cloning
+        // it here and handing the clone to an independently-held rebinder
+        // is exactly the intended usage (mirrors `multipath_transport.rs`'s
+        // `spawn_rebind_listener`, which keeps its own `noq::Endpoint` value
+        // for the same purpose, entirely separate from wherever the
+        // `noq::Connection` it produced lives).
+        Some(Box::new(SystemQuicEndpointRebinder { endpoint: self.endpoint.clone() }))
+    }
+}
+
+/// [`QuicEndpointRebinder`] for the CLI's `noq`-backed endpoint —
+/// [`noq::Endpoint::rebind`], the same operation
+/// `multipath_transport.rs`'s Android code exercises (both on real hardware
+/// and in loopback tests) as `Endpoint::rebind_abstract()`. This uses the
+/// plain `rebind()` overload instead (a `std::net::UdpSocket`, not a custom
+/// `AsyncUdpSocket` impl) since all this needs is "hand it a fresh, plainly-
+/// bound socket" — there is no per-path fan-out logic to plug in here the
+/// way `quicsock-noq`'s `MultiPathSocket` has for Android's physical-
+/// interface case.
+///
+/// `noq::Endpoint::rebind`'s own doc comment: "On error, the old UDP socket
+/// is retained" — a failed [`QuicEndpointRebinder::rebind`] call through
+/// this type never leaves the endpoint in a half-switched state; the
+/// connection keeps using whatever socket it had before the attempt.
+struct SystemQuicEndpointRebinder {
+    endpoint: noq::Endpoint,
+}
+
+#[async_trait]
+impl QuicEndpointRebinder for SystemQuicEndpointRebinder {
+    async fn rebind(&self, bind: BindSpec) -> Result<(), TransportError> {
+        let socket = std::net::UdpSocket::bind(bind.local_addr)
+            .map_err(|source| TransportError::Bind { addr: bind.local_addr, source })?;
+        self.endpoint.rebind(socket).map_err(|e| TransportError::Rebind(e.to_string()))
     }
 }
 

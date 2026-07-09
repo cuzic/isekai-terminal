@@ -8,10 +8,15 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use isekai_protocol::hello::{decode_ack_response, encode_hello, AckResponse};
-use log::info;
-
+use isekai_protocol::attach::{
+    attach_hello_proof_transcript, decode_attach_response, encode_attach_activate, encode_attach_hello, AttachActivate,
+    AttachHello, AttachProof, AttachResponse, AttemptId, ConnectionGeneration, ATTACH_READY_FRAME_LEN,
+    ATTEMPT_ID_LEN, FRAME_ATTACH_READY, FRAME_REJECT_STALE_GENERATION, STALE_GENERATION_REJECT_FRAME_LEN,
+};
 use isekai_protocol::hello::Proof;
+use isekai_protocol::session_id::{SessionId, SESSION_ID_LEN};
+use log::info;
+use rand::RngCore;
 
 use crate::attempt::{ConnectAttemptError, ConnectAttemptStage, RejectReason};
 use crate::error::TransportError;
@@ -19,6 +24,25 @@ use crate::proof::compute_proof;
 use crate::telemetry::{log_candidate_attempt, CandidateAttempt, CandidateIdentity, CandidateOutcome};
 use crate::traits::{ByteStream, QuicConnection, QuicEndpoint, QuicEndpointFactory};
 use crate::types::{BindSpec, RemoteSpec};
+
+/// Generates a fresh, random `SessionId` for a brand-new logical session
+/// (`#18-4`: the client picks `session_id` before ever connecting, rather
+/// than the server assigning one after the fact via `CONTROL_HELLO`/
+/// `CONTROL_ACK`). Every candidate that participates in the *same* round of
+/// connection attempts (`resume::connect_via_relay_resumable_with_fallback`)
+/// must share the one `SessionId` generated for that round — this helper is
+/// meant to be called once per round, not once per candidate.
+pub(crate) fn random_session_id() -> SessionId {
+    let mut bytes = [0u8; SESSION_ID_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    SessionId::from_bytes(bytes)
+}
+
+fn random_attempt_id() -> AttemptId {
+    let mut bytes = [0u8; ATTEMPT_ID_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    AttemptId::from_bytes(bytes)
+}
 
 /// Everything `connect_via_relay` needs to know about one specific
 /// isekai-helper instance's relay-assigned endpoint. Mirrors the subset of
@@ -70,6 +94,8 @@ pub async fn connect_via_relay(
             cert_sha256_hex: target.cert_sha256_hex.clone(),
         },
         &target.session_secret,
+        random_session_id(),
+        ConnectionGeneration::INITIAL,
         0,
         CandidateIdentity { kind: "relay", source: "n/a", provider: "n/a", id: &target.helper_addr.to_string() },
     )
@@ -88,10 +114,13 @@ pub async fn connect_via_relay(
 /// so this is the one place the handshake itself lives. Callers that don't
 /// need the connection/proof (`connect_via_relay`, `connect_stun_p2p`) simply
 /// drop them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_and_handshake(
     endpoint: &dyn QuicEndpoint,
     remote: RemoteSpec,
     session_secret: &[u8],
+    session_id: SessionId,
+    generation: ConnectionGeneration,
     requested_resume_grace_secs: u32,
     identity: CandidateIdentity<'_>,
 ) -> Result<(Box<dyn QuicConnection>, Box<dyn ByteStream>, Proof, u32), ConnectAttemptError> {
@@ -101,11 +130,18 @@ pub(crate) async fn connect_and_handshake(
     // consumers don't need a schema migration once that lands.
     let start_delay = Duration::ZERO;
     let attempt_start = Instant::now();
+    // Generated up front (independent of the connection) so it's available
+    // to every `cancelled(..)` call below, including the earliest failure
+    // points (`#13a`: every attempt log line carries this attempt's id).
+    let attempt_id = random_attempt_id();
     let cancelled = |failure_stage: &str,
                      quic_handshake_time: Option<Duration>,
                      authenticated_ready_time: Option<Duration>| {
         log_candidate_attempt(&CandidateAttempt {
             identity,
+            session_id,
+            generation,
+            attempt_id,
             start_delay,
             quic_handshake_time,
             authenticated_ready_time,
@@ -123,8 +159,20 @@ pub(crate) async fn connect_and_handshake(
     };
     let quic_handshake_time = attempt_start.elapsed();
 
+    // The plain (non-ATTACH-specific) proof, reused as-is by the control
+    // stream's `CONTROL_HELLO` (`resume::open_control_stream`) — unrelated to
+    // ATTACH v2's own, separately domain-separated proof below.
     let proof = match compute_proof(conn.as_ref(), session_secret, b"").await {
         Ok(proof) => proof,
+        Err(e) => {
+            cancelled("compute-proof", Some(quic_handshake_time), None);
+            return Err(ConnectAttemptError { stage: ConnectAttemptStage::ComputeProof, source: e });
+        }
+    };
+
+    let transcript = attach_hello_proof_transcript(&session_id, generation, &attempt_id, requested_resume_grace_secs);
+    let attach_proof = match compute_proof(conn.as_ref(), session_secret, &transcript).await {
+        Ok(proof) => AttachProof::new(*proof.as_bytes()),
         Err(e) => {
             cancelled("compute-proof", Some(quic_handshake_time), None);
             return Err(ConnectAttemptError { stage: ConnectAttemptStage::ComputeProof, source: e });
@@ -138,58 +186,71 @@ pub(crate) async fn connect_and_handshake(
             return Err(ConnectAttemptError { stage: ConnectAttemptStage::OpenStream, source: e });
         }
     };
-    if let Err(e) = stream.write_all(&encode_hello(&proof, requested_resume_grace_secs)).await {
+    let hello = AttachHello { session_id, generation, attempt_id, requested_resume_grace_secs, proof: attach_proof };
+    if let Err(e) = stream.write_all(&encode_attach_hello(&hello)).await {
         cancelled("hello-write", Some(quic_handshake_time), None);
         return Err(ConnectAttemptError { stage: ConnectAttemptStage::HelloWrite, source: e });
     }
 
-    let ack = match read_ack_response(stream.as_mut()).await {
-        Ok(ack) => ack,
+    let response = match read_attach_response(stream.as_mut()).await {
+        Ok(response) => response,
         Err(e) => {
             cancelled("ack-read", Some(quic_handshake_time), None);
             return Err(ConnectAttemptError { stage: ConnectAttemptStage::AckRead, source: e });
         }
     };
-    match ack {
-        AckResponse::Ack { effective_resume_grace_secs } => {
+    match response {
+        AttachResponse::Ready { attach_token, negotiated_resume_grace_secs, .. } => {
+            let activate = AttachActivate { session_id, generation, attempt_id, attach_token };
+            if let Err(e) = stream.write_all(&encode_attach_activate(&activate)).await {
+                cancelled("activate-write", Some(quic_handshake_time), None);
+                return Err(ConnectAttemptError { stage: ConnectAttemptStage::ActivateWrite, source: e });
+            }
             let authenticated_ready_time = attempt_start.elapsed();
-            info!("isekai-transport: HELLO/ACK ok — stream ready for pass-through");
+            info!("isekai-transport: ATTACH_HELLO/AttachReadyV2/AttachActivate ok — stream ready for pass-through");
             log_candidate_attempt(&CandidateAttempt {
                 identity,
+                session_id,
+                generation,
+                attempt_id,
                 start_delay,
                 quic_handshake_time: Some(quic_handshake_time),
                 authenticated_ready_time: Some(authenticated_ready_time),
                 failure_stage: None,
                 outcome: CandidateOutcome::Selected,
             });
-            Ok((conn, stream, proof, effective_resume_grace_secs))
+            Ok((conn, stream, proof, negotiated_resume_grace_secs))
         }
-        other => {
-            cancelled(&format!("rejected:{other:?}"), Some(quic_handshake_time), None);
-            let reason = RejectReason::from_ack_response(other);
+        AttachResponse::Reject(reason) => {
+            cancelled(&format!("rejected:{reason:?}"), Some(quic_handshake_time), None);
             Err(ConnectAttemptError {
-                stage: ConnectAttemptStage::Rejected(reason),
-                source: TransportError::Rejected(other),
+                stage: ConnectAttemptStage::Rejected(RejectReason::from_attach_reject(reason)),
+                source: TransportError::Rejected(reason),
             })
         }
     }
 }
 
-/// Reads a full `ACK` frame: the type byte first, then — only when it's
-/// `FRAME_ACK` — `RESUME_GRACE_LEN` more bytes, since reject variants stay a
-/// bare single byte (`isekai_protocol::hello::decode_ack_response`'s docs).
-async fn read_ack_response(stream: &mut dyn ByteStream) -> Result<AckResponse, TransportError> {
-    use isekai_protocol::hello::{FRAME_ACK, RESUME_GRACE_LEN};
-
+/// Reads a full `AttachResponse`: the type byte first, then — depending on
+/// its value — more bytes: `ATTACH_READY_FRAME_LEN - 1` for `AttachReadyV2`,
+/// `STALE_GENERATION_REJECT_FRAME_LEN - 1` for `STALE_GENERATION`, or nothing
+/// for every other known reject byte (`isekai_protocol::attach::decode_attach_response`'s
+/// docs — mirrors the old `read_ack_response`'s two-step read).
+async fn read_attach_response(stream: &mut dyn ByteStream) -> Result<AttachResponse, TransportError> {
     let mut type_byte = [0u8; 1];
     read_exact(stream, &mut type_byte).await?;
     let mut full = vec![type_byte[0]];
-    if type_byte[0] == FRAME_ACK {
-        let mut rest = [0u8; RESUME_GRACE_LEN];
+    let extra_len = match type_byte[0] {
+        FRAME_ATTACH_READY => ATTACH_READY_FRAME_LEN - 1,
+        FRAME_REJECT_STALE_GENERATION => STALE_GENERATION_REJECT_FRAME_LEN - 1,
+        _ => 0,
+    };
+    if extra_len > 0 {
+        let mut rest = vec![0u8; extra_len];
         read_exact(stream, &mut rest).await?;
         full.extend_from_slice(&rest);
     }
-    Ok(decode_ack_response(&full)?)
+    Ok(decode_attach_response(&full)?)
 }
 
 /// `ByteStream::read` only guarantees "at most `buf.len()` bytes, possibly

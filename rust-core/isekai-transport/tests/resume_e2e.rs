@@ -29,9 +29,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
-use isekai_protocol::hello::{
-    decode_hello, encode_ack_response, AckResponse, Proof, ALPN, EXPORTER_LABEL, HELLO_FRAME_LEN,
+use isekai_protocol::attach::{
+    attach_hello_proof_transcript, decode_attach_activate, decode_attach_hello, encode_attach_response, AttachProof,
+    AttachRejectReason, AttachResponse, AttachToken, ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,
+    FRAME_ATTACH_HELLO,
 };
+use isekai_protocol::hello::{Proof, ALPN, EXPORTER_LABEL};
 use isekai_protocol::resume::{decode_resume, encode_resume_ack, ResumeAckFrame};
 use isekai_protocol::session_id::{SessionId, SESSION_ID_LEN};
 use isekai_transport::{
@@ -127,23 +130,39 @@ async fn handle_connection(conn: noq::Connection, session_secret: Vec<u8>, sessi
     recv.read_exact(&mut type_byte).await.unwrap();
 
     match type_byte[0] {
-        isekai_protocol::hello::FRAME_HELLO => {
-            let mut rest = [0u8; HELLO_FRAME_LEN - 1];
+        FRAME_ATTACH_HELLO => {
+            let mut rest = [0u8; ATTACH_HELLO_FRAME_LEN - 1];
             recv.read_exact(&mut rest).await.unwrap();
-            let mut hello = [0u8; HELLO_FRAME_LEN];
-            hello[0] = isekai_protocol::hello::FRAME_HELLO;
-            hello[1..].copy_from_slice(&rest);
-            let hello = decode_hello(&hello).unwrap();
-            let expected = compute_expected_proof(&conn, &session_secret, b"");
-            if !hello.proof.ct_eq(&expected) {
-                send.write_all(&encode_ack_response(AckResponse::RejectAuth)).await.ok();
+            let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
+            hello_bytes[0] = FRAME_ATTACH_HELLO;
+            hello_bytes[1..].copy_from_slice(&rest);
+            let hello = decode_attach_hello(&hello_bytes).unwrap();
+
+            let transcript = attach_hello_proof_transcript(
+                &hello.session_id,
+                hello.generation,
+                &hello.attempt_id,
+                hello.requested_resume_grace_secs,
+            );
+            let expected = compute_expected_proof(&conn, &session_secret, &transcript);
+            if !hello.proof.ct_eq(&AttachProof::new(*expected.as_bytes())) {
+                let reject = AttachResponse::Reject(AttachRejectReason::Auth);
+                send.write_all(&encode_attach_response(&reject)).await.ok();
                 return;
             }
-            send.write_all(&encode_ack_response(AckResponse::Ack {
-                effective_resume_grace_secs: hello.requested_resume_grace_secs,
-            }))
-            .await
-            .unwrap();
+            let ready = AttachResponse::Ready {
+                session_id: hello.session_id,
+                generation: hello.generation,
+                attempt_id: hello.attempt_id,
+                negotiated_resume_grace_secs: hello.requested_resume_grace_secs,
+                attach_token: AttachToken::new(rand::random()),
+            };
+            send.write_all(&encode_attach_response(&ready)).await.unwrap();
+
+            // The client confirms with AttachActivate before any relay begins.
+            let mut activate_bytes = [0u8; ATTACH_ACTIVATE_FRAME_LEN];
+            recv.read_exact(&mut activate_bytes).await.unwrap();
+            decode_attach_activate(&activate_bytes).unwrap();
 
             let session = Arc::new(Mutex::new(MockSession { committed_offset: 0, output: Vec::new() }));
 

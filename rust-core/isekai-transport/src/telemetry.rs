@@ -48,6 +48,9 @@
 
 use std::time::Duration;
 
+use isekai_protocol::attach::{AttemptId, ConnectionGeneration};
+use isekai_protocol::session_id::SessionId;
+
 /// What ultimately happened to one connection attempt. `Cancelled` covers
 /// both "failed outright" (the only case that exists today) and, once
 /// multi-candidate racing exists, "succeeded but lost the race to a faster
@@ -93,9 +96,20 @@ pub struct CandidateIdentity<'a> {
 /// One connection attempt's full timing/outcome record. See the module docs
 /// for what each field means and why it's always present (even when `None`)
 /// rather than shaped differently per outcome.
+///
+/// `session_id`/`generation`/`attempt_id` (`#13a`, ChatGPT second-opinion
+/// consultation 2026-07-08 3rd round: "測定可能性は先に実装する") are the same
+/// ATTACH v2 fencing identifiers `#18` introduced — logging them lets a log
+/// consumer correlate every attempt in one round (same `session_id` +
+/// `generation`) and see exactly how many times a round advanced its
+/// generation (`#25`) before succeeding or giving up, without needing a
+/// separate correlation id.
 #[derive(Debug, Clone, Copy)]
 pub struct CandidateAttempt<'a> {
     pub identity: CandidateIdentity<'a>,
+    pub session_id: SessionId,
+    pub generation: ConnectionGeneration,
+    pub attempt_id: AttemptId,
     pub start_delay: Duration,
     pub quic_handshake_time: Option<Duration>,
     pub authenticated_ready_time: Option<Duration>,
@@ -118,12 +132,16 @@ pub fn log_candidate_attempt(attempt: &CandidateAttempt<'_>) {
 
     let line = format!(
         "candidate attempt: candidate_kind={} candidate_source={} candidate_provider={} candidate_id={} \
+         session_id={} generation={} attempt_id={} \
          start_delay_ms={} quic_handshake_time_ms={quic_handshake_ms} \
          authenticated_ready_time_ms={authenticated_ready_ms} failure_stage={failure_stage} outcome={}",
         attempt.identity.kind,
         attempt.identity.source,
         attempt.identity.provider,
         attempt.identity.id,
+        attempt.session_id,
+        attempt.generation,
+        attempt.attempt_id,
         attempt.start_delay.as_millis(),
         attempt.outcome,
     );
@@ -131,6 +149,37 @@ pub fn log_candidate_attempt(attempt: &CandidateAttempt<'_>) {
         CandidateOutcome::Selected => log::info!("isekai-transport: {line}"),
         CandidateOutcome::Cancelled => log::warn!("isekai-transport: {line}"),
     }
+}
+
+/// Logged whenever a round runner (`resume::connect_via_relay_resumable_with_fallback`,
+/// `#25`) advances `GenerationCoordinator`'s generation — `reason` is
+/// `"ambiguous"` or `"stale"` (matching the `AttemptFailure` variant that
+/// triggered it). `advances_used`/`advances_budget` let a log consumer see
+/// how close a round came to `SequentialConnectError::GaveUpAfterGenerationRetries`
+/// without needing to reconstruct it from individual attempt failures.
+pub fn log_generation_advance(
+    session_id: SessionId,
+    from_generation: ConnectionGeneration,
+    to_generation: ConnectionGeneration,
+    reason: &str,
+    advances_used: u8,
+    advances_budget: u8,
+) {
+    log::info!(
+        "isekai-transport: generation advance: session_id={session_id} from_generation={from_generation} \
+         to_generation={to_generation} reason={reason} advances_used={advances_used} advances_budget={advances_budget}"
+    );
+}
+
+/// Logged once when a round converges via `AttemptFailure::MustResume`
+/// (`#25-3`) — a later candidate reported `ATTACH_ALREADY_ESTABLISHED`,
+/// implying an earlier ambiguous candidate's attach actually succeeded, and
+/// the round runner is now attempting `RESUME` against it instead of a fresh
+/// attach.
+pub fn log_must_resume_convergence(session_id: SessionId, resume_candidate_id: &str) {
+    log::info!(
+        "isekai-transport: must-resume convergence: session_id={session_id} resume_candidate_id={resume_candidate_id}"
+    );
 }
 
 fn format_duration_ms(d: Option<Duration>) -> String {
@@ -161,8 +210,13 @@ mod tests {
         // Smoke test only — this function's job is to log, not to return a
         // value; the point is just that constructing/formatting every field
         // combination (all-`None` durations included) never panics.
+        let session_id = SessionId::from_bytes([1u8; 16]);
+        let attempt_id = AttemptId::from_bytes([2u8; 16]);
         log_candidate_attempt(&CandidateAttempt {
             identity: CandidateIdentity { kind: "relay", source: "legacy-intent", provider: "legacy-intent", id: "0" },
+            session_id,
+            generation: ConnectionGeneration::INITIAL,
+            attempt_id,
             start_delay: Duration::ZERO,
             quic_handshake_time: None,
             authenticated_ready_time: None,
@@ -171,11 +225,31 @@ mod tests {
         });
         log_candidate_attempt(&CandidateAttempt {
             identity: CandidateIdentity { kind: "stun-p2p", source: "legacy-intent", provider: "legacy-intent", id: "0" },
+            session_id,
+            generation: ConnectionGeneration::INITIAL,
+            attempt_id,
             start_delay: Duration::ZERO,
             quic_handshake_time: Some(Duration::from_millis(30)),
             authenticated_ready_time: Some(Duration::from_millis(45)),
             failure_stage: None,
             outcome: CandidateOutcome::Selected,
         });
+    }
+
+    #[test]
+    fn log_generation_advance_does_not_panic() {
+        log_generation_advance(
+            SessionId::from_bytes([1u8; 16]),
+            ConnectionGeneration::INITIAL,
+            ConnectionGeneration::new(1),
+            "ambiguous",
+            1,
+            2,
+        );
+    }
+
+    #[test]
+    fn log_must_resume_convergence_does_not_panic() {
+        log_must_resume_convergence(SessionId::from_bytes([1u8; 16]), "relay-1");
     }
 }

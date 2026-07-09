@@ -34,6 +34,40 @@ pub trait QuicEndpointFactory: Send + Sync {
 #[async_trait]
 pub trait QuicEndpoint: Send + Sync {
     async fn connect(&self, remote: RemoteSpec) -> Result<Box<dyn QuicConnection>, TransportError>;
+
+    /// Returns a handle that can later switch this endpoint's local UDP
+    /// socket without tearing down any connection made through it — for a
+    /// caller that wants to react to an OS-reported network change faster
+    /// than falling all the way back to a brand-new connection + RESUME
+    /// handshake (`isekai-pipe`'s `--experimental-network-rebind`; see
+    /// `system::SystemQuicEndpointRebinder`'s docs for the underlying
+    /// mechanism and its caveats).
+    ///
+    /// `None` by default — this is deliberately *not* a required method,
+    /// because "switch the local socket of an already-connected endpoint"
+    /// is an engine-specific capability with no meaningful generic
+    /// implementation (unlike `connect`/`open_bi`/etc., which every QUIC
+    /// engine this trait could plausibly be backed by supports in some
+    /// form). Only `system::SystemQuicEndpoint` overrides this today.
+    fn rebinder(&self) -> Option<Box<dyn QuicEndpointRebinder>> {
+        None
+    }
+}
+
+/// A handle that can switch its [`QuicEndpoint`]'s local UDP socket in
+/// place, without disturbing any connection already established through it
+/// — see [`QuicEndpoint::rebinder`] for why this is a separate, optional
+/// trait rather than a method on `QuicEndpoint`/`QuicConnection` directly.
+#[async_trait]
+pub trait QuicEndpointRebinder: Send + Sync {
+    /// Binds a fresh local UDP socket at `bind` and switches the endpoint to
+    /// it. A successful return means the switch itself succeeded — it does
+    /// **not** mean the new socket can actually reach the peer (that can
+    /// only be learned by observing whether the connection keeps working
+    /// afterward). On failure, the endpoint keeps using its previous socket
+    /// (whatever guarantee the underlying engine's own rebind operation
+    /// gives here — `system::SystemQuicEndpointRebinder`'s docs cite noq's).
+    async fn rebind(&self, bind: BindSpec) -> Result<(), TransportError>;
 }
 
 /// An established QUIC connection.

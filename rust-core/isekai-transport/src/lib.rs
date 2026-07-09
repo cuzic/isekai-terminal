@@ -54,7 +54,9 @@ pub mod backoff;
 pub mod candidate_pool;
 pub mod candidate_provider;
 pub mod error;
+pub mod generation_coordinator;
 pub mod proof;
+pub mod race;
 pub mod relay;
 pub mod resume;
 pub mod stun_p2p;
@@ -66,8 +68,13 @@ pub mod types;
 pub use attempt::AttemptFailure;
 pub use backoff::BackoffPolicy;
 pub use candidate_pool::{CandidatePool, Clock, StaleGeneration, SystemClock};
+pub use generation_coordinator::{
+    AdvanceGenerationError, GenerationCoordinator, RoundContext, DEFAULT_MAX_GENERATION_ADVANCES,
+};
+pub use race::{race_direct_and_relay, DirectRelayRaceTargets, RaceConnectError, RaceOutcome, RaceWinner, DEFAULT_RELAY_DELAY};
 pub use candidate_provider::{
-    CandidateProvider, CandidateProviderError, ConfigRelayProvider, GatherContext, LegacyIntentProvider,
+    CandidateProvider, CandidateProviderError, ConfigRelayProvider, ConfigStunProvider, GatherContext,
+    LegacyIntentProvider,
 };
 pub use error::TransportError;
 pub use proof::compute_proof;
@@ -77,11 +84,15 @@ pub use resume::{
     reconnect_and_resume, spawn_app_ack_tasks, AppAckCounters, AppAckTasks, ControlStream, ResumableRelaySession,
     ResumeAckOutcome, SequentialConnectError, SequentialFailure, SequentialRelayCandidate,
 };
-pub use stun_p2p::{connect_stun_p2p, StunP2pConnection, StunP2pTarget};
+pub use stun_p2p::{
+    connect_stun_p2p, connect_stun_p2p_with_fallback, SequentialStunCandidate, SequentialStunConnectError,
+    StunP2pConnection, StunP2pTarget,
+};
 pub use system::SystemQuicEndpointFactory;
 pub use telemetry::{CandidateAttempt, CandidateIdentity, CandidateOutcome};
 pub use traits::{
     ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf, QuicConnection, QuicEndpoint, QuicEndpointFactory,
+    QuicEndpointRebinder,
 };
 pub use types::{BindSpec, RemoteSpec};
 
@@ -89,6 +100,7 @@ pub use types::{BindSpec, RemoteSpec};
 // `isekai-transport` don't also need a direct `isekai-protocol` dependency
 // just to name `SessionId`/the C2H/H2C offset types in their own resume
 // bookkeeping (`archive/ISEKAI_SSH_DESIGN.md` Phase S-4c task split).
+pub use isekai_protocol::attach::ConnectionGeneration;
 pub use isekai_protocol::offset::{C2hHelperCommittedOffset, C2hSentOffset, H2cClientDeliveredOffset, H2cSentOffset};
 pub use isekai_protocol::resume::ResumeRejectReason;
 pub use isekai_protocol::session_id::SessionId;
