@@ -49,6 +49,23 @@ impl QuicEndpointFactory for AndroidQuicEndpointFactory {
 
         Ok(Box::new(AndroidQuicEndpoint { endpoint }))
     }
+
+    async fn wrap_bound_socket(&self, socket: tokio::net::UdpSocket) -> Result<Box<dyn QuicEndpoint>, TransportError> {
+        // `stun_p2p::connect_stun_p2p`向け: STUN問い合わせ・穴あけprobe送信を
+        // 既に済ませた生ソケットを、そのままQUIC endpointとしても使い回す
+        // (isekai_stun_p2p_transport.rsが元々していたのと同じソケット共用)。
+        let socket = faulty_udp_socket::FaultyUdpSocket::new(Arc::new(socket), debug_fault::shared_injector());
+
+        let endpoint = noq::Endpoint::new_with_abstract_socket(
+            noq::EndpointConfig::default(),
+            None,
+            Box::new(socket),
+            Arc::new(noq::TokioRuntime),
+        )
+        .map_err(|e| TransportError::EndpointSetup(e.to_string()))?;
+
+        Ok(Box::new(AndroidQuicEndpoint { endpoint }))
+    }
 }
 
 struct AndroidQuicEndpoint {

@@ -186,6 +186,11 @@ impl QuicEndpointFactory for SystemQuicEndpointFactory {
 
         quic_endpoint_from_std_socket(std_socket)
     }
+
+    async fn wrap_bound_socket(&self, socket: tokio::net::UdpSocket) -> Result<Box<dyn QuicEndpoint>, TransportError> {
+        let std_socket = socket.into_std().map_err(|e| TransportError::SocketSetup(e.to_string()))?;
+        quic_endpoint_from_std_socket(std_socket)
+    }
 }
 
 struct SystemQuicEndpoint {

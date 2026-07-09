@@ -380,6 +380,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
         .context("isekai-pipe connect: relay transport failed"),
         CandidateRoute::StunP2p { cert_pin, peer_addr, stun_server, server_name } => {
             let stream = connect_stun_p2p(
+                &SystemQuicEndpointFactory,
                 *stun_server,
                 &StunP2pTarget {
                     peer_addr: *peer_addr,
@@ -728,7 +729,7 @@ async fn run_relay_resumable_with_fallback(
 /// straight into `relay_stdio`, exactly like the legacy single-candidate path
 /// already does.
 async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidates: &[SequentialStunCandidate]) -> Result<()> {
-    let (connection, _winning_stun_server) = connect_stun_p2p_with_fallback(target, candidates)
+    let (connection, _winning_stun_server) = connect_stun_p2p_with_fallback(&SystemQuicEndpointFactory, target, candidates)
         .await
         .map_err(|e| anyhow::anyhow!("isekai-pipe connect: STUN P2P fallback failed: {e}"))?;
     relay_stdio(connection.stream).await

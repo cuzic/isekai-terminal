@@ -28,6 +28,20 @@ use crate::types::{BindSpec, RemoteSpec};
 #[async_trait]
 pub trait QuicEndpointFactory: Send + Sync {
     async fn create_endpoint(&self, bind: BindSpec) -> Result<Box<dyn QuicEndpoint>, TransportError>;
+
+    /// Wraps an already-bound `tokio::net::UdpSocket` as a QUIC endpoint,
+    /// instead of binding a fresh one via [`QuicEndpointFactory::create_endpoint`]
+    /// (isekai-terminal-core/isekai-transport crate共有化 Phase 1c). For
+    /// `stun_p2p::connect_stun_p2p`, which must do its own raw STUN-query/
+    /// hole-punch-probe I/O on a specific socket *before* handing it to
+    /// `noq` — that raw phase can't go through `create_endpoint`'s
+    /// bind-a-fresh-socket contract, but the *implementation-specific* part
+    /// (which concrete `noq::AsyncUdpSocket` wraps it — plain for
+    /// `system::SystemQuicEndpointFactory`, fault-injectable for
+    /// `isekai-terminal-core`'s own factory) still needs to be pluggable the
+    /// same way `create_endpoint` already is, so this crate's STUN P2P logic
+    /// never has to know which concrete socket type it's running against.
+    async fn wrap_bound_socket(&self, socket: tokio::net::UdpSocket) -> Result<Box<dyn QuicEndpoint>, TransportError>;
 }
 
 /// A bound QUIC endpoint, capable of initiating outbound connections.
