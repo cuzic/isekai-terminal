@@ -1,0 +1,81 @@
+name: rust-core netlab check (PoC)
+
+# 実バイナリ(isekai-pipe serve/connect + 実sshd + 実ssh)を、tc netemで
+# パケットロス/遅延を注入した2つのnetwork namespace間で動かし、1本の
+# SSHセッションが壊れずに完走することを検証する(PLAN.md:1322「物理2
+# ネットワークでの実機検証は未実施」のギャップに対する、CI上での代替第一段)。
+# シナリオ本体は tests/netlab/scenarios/direct_survives_loss_and_delay.sh。
+#
+# まだPoC段階のため workflow_dispatch のみで手動起動する。安定したら
+# push/pull_request トリガーへ昇格させる。
+
+on:
+  workflow_dispatch:
+    inputs:
+      loss:
+        description: "tc netem packet loss (例: 3%)"
+        required: false
+        default: "3%"
+      delay:
+        description: "tc netem delay+jitter (例: 80ms 20ms)"
+        required: false
+        default: "80ms 20ms"
+      payload_bytes:
+        description: "往復させるペイロードサイズ(バイト)"
+        required: false
+        default: "2097152"
+
+concurrency:
+  group: rust-core-netlab-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  direct-survives-loss-and-delay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: netlab-cargo-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            netlab-cargo-${{ runner.os }}-
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Install openssh-server + jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server jq
+
+      - name: Build isekai-pipe
+        working-directory: rust-core
+        run: cargo build -p isekai-pipe --bin isekai-pipe
+
+      - name: Run direct_survives_loss_and_delay scenario
+        env:
+          NETLAB_LOSS: ${{ inputs.loss }}
+          NETLAB_DELAY: ${{ inputs.delay }}
+          PAYLOAD_BYTES: ${{ inputs.payload_bytes }}
+        run: |
+          sudo -E env \
+            ISEKAI_PIPE_BIN="$PWD/rust-core/target/debug/isekai-pipe" \
+            NETLAB_LOSS="$NETLAB_LOSS" \
+            NETLAB_DELAY="$NETLAB_DELAY" \
+            PAYLOAD_BYTES="$PAYLOAD_BYTES" \
+            PATH="$PATH" \
+            bash tests/netlab/scenarios/direct_survives_loss_and_delay.sh
