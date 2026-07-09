@@ -650,7 +650,7 @@ codexの提案(2回目の相談)により、一括ゲートにせず`I-G`/`I-H`/
 handshake→certificate pin→helper HELLO/ACK→target TCP到達性を段階ごとに表示し、「成功/失敗」の
 二値ではなくどの段階まで成功したかを返す。
 
-### Epic K: 複数hop `--via`チェーンの自動bootstrap(P2、Epic A依存)— planner/executorは完了、E2Eは進行中(2026-07-09)
+### Epic K: 複数hop `--via`チェーンの自動bootstrap(P2、Epic A依存)— 完了(2026-07-09)
 
 `isekai-ssh init`という既存の代替経路があるため優先度は下げてよいが、単純に「hopをループして
 sshを実行する」実装は避ける。
@@ -673,7 +673,13 @@ sshを実行する」実装は避ける。
   unit test 3件、`isekai-bootstrap-plan`側に`validate_jump_chain`のunit test 3件、`isekai-ssh`側に
   `bootstrap_and_register_accepts_a_multi_hop_via_chain_and_rejects_a_looping_one`を追加。
   既存の`isekai-bootstrap`(unit 7+e2e 7)・`isekai-ssh`(unit 39+e2e 18)は全てgreenのまま。
-- Epic Cのharnessを使った最低2-hop構成のE2Eを受け入れ条件にする(進行中)。
+- ✅ E2E: `isekai-ssh/tests/real_sshd_multihop_bootstrap_e2e.rs`。Epic Cの実`sshd`ハーネス
+  (`real_sshd_bootstrap_e2e.rs`)を拡張し、`127.0.0.1`上の異なるポートで実`/usr/sbin/sshd`を
+  2つ(bastion/target)起動、`ssh(1)`ネイティブの`-J`で繋いで実バイナリのアップロード・起動・
+  `PersistentProfile`登録まで検証する。`via`は`#@isekai bootstrap-candidate ... via=...`
+  ディレクティブではなく実際の`ProxyJump`(OpenSSH標準キーワード、shim `-F`設定の`Host`ブロック)
+  から`ssh -G`経由で取れることを検証している(`wrapper.rs::defaults_bootstrap_candidate_from_ssh_g`
+  の実route)。3回連続実行して安定を確認済み(各回45〜56秒)。
 
 ### ADR: 複数isekai-sshプロセスによるisekai-pipe共有(マルチプレクス) — 実装しない(Deferred)
 
