@@ -1,0 +1,73 @@
+name: rust-core test check
+
+# rust-core全体のcargo testをCIで実行する(ISEKAI_PIPE_DESIGN.md §8 Epic Cで
+# 指摘されていたギャップ: 「rust-core全体のcargo testを実行するCIワークフローが
+# 一つも存在しない」への対応)。noq-multipath-spike(実機検証用の使い捨てコード、
+# CLAUDE.md参照)のみ除外する——それ以外は`real_sshd_bootstrap_e2e.rs`のような
+# opt-in E2Eテスト(実/usr/sbin/sshdを非特権ユーザーとして起動)を含め、
+# GitHub-hosted ubuntu runnerだけで完結する。
+#
+# ネットワークnamespace/tc netemを使うnetlabシナリオ(root権限が必要)は対象外
+# (rust-core-netlab-check.ymlが別途カバーする)。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust-core/**"
+      - "!rust-core/noq-multipath-spike/**"
+      - ".github/workflows/rust-core-test-check.yml"
+  pull_request:
+    paths:
+      - "rust-core/**"
+      - "!rust-core/noq-multipath-spike/**"
+      - ".github/workflows/rust-core-test-check.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-core-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      # `real_sshd_bootstrap_e2e.rs`等がstderrに出すisekai-transport/isekai-bootstrapの
+      # debug/infoログでCI出力が読みにくくなるのを避ける(ローカル開発時のデフォルトは
+      # env_logger未設定=warn相当のまま)。
+      RUST_LOG: warn
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          ssh -V
+          /usr/sbin/sshd -V || true
+          ssh-keygen -V || true
+
+      - name: Install openssh-server (opt-in real-sshd E2E tests need /usr/sbin/sshd)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: rust-core-test-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            rust-core-test-${{ runner.os }}-
+
+      - name: cargo test --workspace (excluding noq-multipath-spike)
+        working-directory: rust-core
+        run: cargo test --workspace --exclude noq-multipath-spike

@@ -427,13 +427,16 @@ enum BootstrapFailure {
     いない。このスクリプトは明示的に「isekai-sshのbootstrap-over-sshはスコープ外」と
     書いており、今回作った`real_sshd_bootstrap_e2e.rs`と役割は重複しない
     (前者はネットワーク耐性、後者はbootstrap配線の正しさ)。
-  - **CI未接続**: 調査の結果、このリポジトリには現時点で`cargo test`をrust-core全体に対して
-    実行するCIワークフローが一つも存在しない(`.github/workflows/*.yml`はすべてビルド検証
-    (musl/xcframework/アプリビルド)のみで、Rustテストスイートの自動実行は無い。
-    `rust-core-netlab-check.yml`のみ`workflow_dispatch`専用のPoC)。したがって
-    `real_sshd_bootstrap_e2e.rs`を含むすべてのcargo testは引き続き手動実行が前提であり、
-    「CI実行可能」ではあるが「CI実行されている」わけではない。rust-core全体のcargo testを
-    CIに接続するかどうかは本Epicの範囲を超える別判断として残す。
+  - **CI接続、完了(2026-07-09)**: `.github/workflows/rust-core-test-check.yml`を追加し、
+    `push`(main)/`pull_request`(`rust-core/**`変更時、`noq-multipath-spike/**`のみの変更は
+    除外)で`cargo test --workspace --exclude noq-multipath-spike`(`noq-multipath-spike`は
+    実機検証用の使い捨てコード、CLAUDE.md参照)を実行するようにした。`openssh-server`を
+    `apt-get install`することで`real_sshd_bootstrap_e2e.rs`/`real_sshd_multihop_bootstrap_e2e.rs`
+    (Epic K)を含むopt-in E2Eテスト一式もGitHub-hosted `ubuntu-24.04`ランナーだけで完結する
+    (root権限やnetwork namespaceが要る`tests/netlab/`シナリオのみ対象外、そちらは既存の
+    `rust-core-netlab-check.yml`が別途カバー)。ローカルで`cargo test --workspace --exclude
+    noq-multipath-spike`を実行し55件全testsuiteがgreenであることを確認済み(所要時間
+    合計約200秒)。
 - Epic G/H/I/Kが自身のE2Eを追加する際は、このharnessのパターン(実sshd、`#@isekai
   remote-path`で`$HOME`非依存に保つ)を再利用できる。
 - staging環境(実STUN・実relay・異なるネットワーク・symmetric NAT相当・relay fallback・token
