@@ -78,7 +78,7 @@ pub use candidate_provider::{
 };
 pub use error::TransportError;
 pub use proof::compute_proof;
-pub use relay::{connect_via_relay, RelayTarget};
+pub use relay::{connect_via_relay, connect_via_relay_with_connection, RelayTarget};
 pub use resume::{
     connect_via_relay_resumable, connect_via_relay_resumable_with_fallback, open_control_stream,
     reconnect_and_resume, spawn_app_ack_tasks, AppAckCounters, AppAckTasks, ControlStream, ResumableRelaySession,

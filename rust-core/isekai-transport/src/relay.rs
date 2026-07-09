@@ -103,6 +103,45 @@ pub async fn connect_via_relay(
     Ok(stream)
 }
 
+/// Like [`connect_via_relay`], but also returns the underlying connection
+/// (and the plain HELLO proof) instead of dropping them — for a caller that
+/// needs to open additional streams on the *same* connection afterward
+/// without going through [`resume::connect_via_relay_resumable`]'s bundled,
+/// synchronous control-stream establishment (isekai-terminal-core/
+/// isekai-transport crate共有化 Phase 1c: `isekai-terminal-core`'s Android
+/// transport opens its control stream in a backgrounded, timeout-bounded
+/// task instead, specifically to avoid delaying the SSH hand-off when the
+/// remote is slow to accept a second stream — a real regression it hit once
+/// already, see `rust-core/src/isekai_pipe_quic_transport.rs`'s
+/// `connect_isekai_pipe_quic_stream` doc comment). Does **not** open a
+/// control stream itself — that remains entirely the caller's job, using
+/// [`resume::open_control_stream`] on the returned connection whenever (and
+/// however) it wants.
+pub async fn connect_via_relay_with_connection(
+    factory: &dyn QuicEndpointFactory,
+    target: &RelayTarget,
+) -> Result<(Box<dyn QuicConnection>, Box<dyn ByteStream>, Proof), TransportError> {
+    let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await?;
+    // No resume-grace preference from this entry point (module docs on
+    // `connect_via_relay`) — the caller decides resume policy for itself via
+    // whichever `resume::*` functions it calls afterward.
+    let (conn, stream, proof, _effective_resume_grace_secs) = connect_and_handshake(
+        endpoint.as_ref(),
+        RemoteSpec {
+            addr: target.helper_addr,
+            server_name: target.server_name.clone(),
+            cert_sha256_hex: target.cert_sha256_hex.clone(),
+        },
+        &target.session_secret,
+        random_session_id(),
+        ConnectionGeneration::INITIAL,
+        0,
+        CandidateIdentity { kind: "relay", source: "n/a", provider: "n/a", id: &target.helper_addr.to_string() },
+    )
+    .await?;
+    Ok((conn, stream, proof))
+}
+
 /// The HELLO/proof/ACK handshake itself (`archive/HELPER_PROTOCOL.md` §4), layered on
 /// top of an *already-created* `QuicEndpoint`. Shared by `connect_via_relay`
 /// (endpoint from a fresh `QuicEndpointFactory::create_endpoint` call),
