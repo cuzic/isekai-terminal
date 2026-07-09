@@ -388,7 +388,21 @@ enum BootstrapFailure {
   (`isekai-ssh/tests/init_e2e.rs`・`wrapper_auto_bootstrap_e2e.rs`・
   `isekai-pipe/tests/connect_stun_fallback_e2e.rs`・`stdout_purity.rs`)を
   `PersistentProfile`ベースのアサーションに書き換えて全て green を確認済み。
-  複数プロセス同時起動時のlost update防止(ファイルロック)は未着手のまま残っている。
+  複数プロセス同時起動時のlost update防止(ファイルロック)— `isekai-pipe-core::profile`に
+  `update_persistent_profile(dir, key, F)`(flock(2)による`<key>.lock`単位の排他ロック→
+  `load_persistent_profile`→`F`で新しい値を計算→`write_persistent_profile`)を追加、
+  完了(2026-07-09)。ロックは`ProfileLock`(fdのdropで自動解放、プロセスクラッシュ時も
+  リークしない)としてスコープし、無関係なprofile同士は互いをブロックしない。
+  調査の結果、**現行の呼び出し元(`isekai-ssh init`/wrapper自動bootstrap)はどちらも
+  既存profileを読んでから書くのではなく、handshake結果から毎回まっさらな
+  `PersistentProfile`を組み立てて上書きする設計**であり、read-modify-writeを行っていない
+  (`write_persistent_profile`自体もPID付き一時ファイル+atomic renameで元々ファイル破損は
+  起きない)ため、今回はどちらもこの新関数への移行対象にしていない——
+  `update_persistent_profile`は「profile migration・token refresh・known helper更新・
+  helper binary install・relay reservation」といった将来のread-modify-write型更新のための
+  インフラとして先に用意した(honest gap: 現時点でこの関数を実際に呼ぶライブコードパスは
+  無い)。テスト: 生成/既存値の受け渡し/25並行スレッドでのカウンタ加算がロック無しでは
+  失われるはずのlost updateを確実に防ぐことを検証する結合テストの3件。
 
 ### Epic C: 実OpenSSH E2Eハーネス(P0、共通テスト基盤)— bootstrap部分完了(2026-07-08)
 

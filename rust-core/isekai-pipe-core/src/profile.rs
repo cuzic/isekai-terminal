@@ -221,6 +221,73 @@ pub fn write_persistent_profile(dir: &Path, profile: &PersistentProfile) -> io::
     Ok(path)
 }
 
+/// Holds an exclusive advisory lock (`flock(2)`, `LOCK_EX`) on
+/// `<dir>/<key>.lock` for its lifetime — scoped per profile key, so
+/// concurrent updates to *different* profiles never block each other.
+/// `flock` is held by the open file description, and is released
+/// automatically when the underlying fd is closed (this struct's `Drop`),
+/// even if the holding process crashes or is killed — no separate cleanup
+/// step is needed, unlike a lockfile whose mere *existence* signals
+/// ownership (`ISEKAI_PIPE_DESIGN.md` §8 Epic A: "複数`isekai-ssh`プロセス間の
+/// 競合が起き得る箇所は...排他制御を入れる").
+#[cfg(unix)]
+struct ProfileLock {
+    _file: fs::File,
+}
+
+#[cfg(unix)]
+impl ProfileLock {
+    fn acquire(dir: &Path, key: &str) -> io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        fs::create_dir_all(dir)?;
+        let lock_path = dir.join(format!("{key}.lock"));
+        let file = fs::OpenOptions::new().create(true).write(true).open(&lock_path)?;
+        // SAFETY: `file.as_raw_fd()` is a valid, open fd for the duration of
+        // this call (the `File` outlives it), matching `flock(2)`'s contract.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// Not unix: locking is a no-op (every current build target is unix — the
+/// Android app talks to `rust-core` through UniFFI, never this CLI-facing
+/// module; `isekai-ssh`/`isekai-pipe` themselves only ship for
+/// Linux/macOS). Kept so this module still compiles rather than gating the
+/// whole crate on `cfg(unix)`.
+#[cfg(not(unix))]
+struct ProfileLock;
+
+#[cfg(not(unix))]
+impl ProfileLock {
+    fn acquire(_dir: &Path, _key: &str) -> io::Result<Self> {
+        Ok(Self)
+    }
+}
+
+/// Reads the current profile for `key` (`None` if it doesn't exist yet),
+/// passes it to `update` to compute the new value, and writes the result —
+/// all while holding [`ProfileLock`], so two concurrent processes updating
+/// the *same* profile serialize instead of racing a lost update (one
+/// process's change silently discarded by the other's unconditional
+/// overwrite). `write_persistent_profile` itself does not lock (it's used
+/// by callers that always construct a whole fresh profile from scratch —
+/// `isekai-ssh init`/wrapper's auto-bootstrap — where there is no prior read
+/// to race against; see this function's module docs for which future
+/// callers this exists for instead).
+pub fn update_persistent_profile<F>(dir: &Path, key: &str, update: F) -> io::Result<PathBuf>
+where
+    F: FnOnce(Option<PersistentProfile>) -> PersistentProfile,
+{
+    let _lock = ProfileLock::acquire(dir, key)?;
+    let current = load_persistent_profile(dir, key)?;
+    let next = update(current);
+    write_persistent_profile(dir, &next)
+}
+
 /// Loads a previously written persistent profile, if present.
 pub fn load_persistent_profile(dir: &Path, profile_name: &str) -> io::Result<Option<PersistentProfile>> {
     let path = dir.join(format!("{profile_name}.json"));
@@ -373,6 +440,76 @@ mod tests {
 
         assert_eq!(load_persistent_profile(&dir, "no-such-host").unwrap(), None);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn update_persistent_profile_creates_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "myhost:22";
+
+        let path = update_persistent_profile(dir.path(), key, |current| {
+            assert_eq!(current, None, "no profile exists yet");
+            PersistentProfile::migrate_legacy_helper_trust(key, &sample_trust())
+        })
+        .unwrap();
+
+        assert!(path.exists());
+        let loaded = load_persistent_profile(dir.path(), key).unwrap();
+        assert_eq!(loaded.unwrap().profile, key);
+    }
+
+    #[test]
+    fn update_persistent_profile_passes_the_existing_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "myhost:22";
+        let initial = PersistentProfile::migrate_legacy_helper_trust(key, &sample_trust());
+        write_persistent_profile(dir.path(), &initial).unwrap();
+
+        update_persistent_profile(dir.path(), key, |current| {
+            let mut current = current.expect("the profile written above should be visible here");
+            current.remote_version = Some("updated".to_string());
+            current
+        })
+        .unwrap();
+
+        let loaded = load_persistent_profile(dir.path(), key).unwrap().unwrap();
+        assert_eq!(loaded.remote_version.as_deref(), Some("updated"));
+    }
+
+    /// Without `ProfileLock` serializing the read-modify-write cycle, N
+    /// concurrent updaters incrementing the same counter lose updates
+    /// (thread A reads 5, thread B reads 5, both write 6 — one increment
+    /// vanishes) — this is exactly the race `ISEKAI_PIPE_DESIGN.md` §8 Epic A
+    /// calls out ("複数`isekai-ssh`プロセス間の競合...排他制御を入れる").
+    /// Spawning real OS threads (not just calling the function serially) is
+    /// the point: `flock(2)` must actually block a second opener of the same
+    /// path, not merely look correct in single-threaded use.
+    #[test]
+    fn update_persistent_profile_serializes_concurrent_updaters_without_lost_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "myhost:22";
+        const UPDATERS: u64 = 25;
+
+        let handles: Vec<_> = (0..UPDATERS)
+            .map(|_| {
+                let dir_path = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    update_persistent_profile(&dir_path, key, |current| {
+                        let mut profile = current.unwrap_or_else(|| PersistentProfile::migrate_legacy_helper_trust(key, &sample_trust()));
+                        let n: u64 = profile.remote_version.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        profile.remote_version = Some((n + 1).to_string());
+                        profile
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let loaded = load_persistent_profile(dir.path(), key).unwrap().unwrap();
+        assert_eq!(loaded.remote_version.as_deref(), Some(UPDATERS.to_string().as_str()), "every updater's increment should have been preserved");
     }
 
     fn profile_test_nonce() -> u64 {
