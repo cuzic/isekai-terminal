@@ -24,10 +24,9 @@ use russh::client;
 
 use crate::helper_bootstrap::{self, BootstrapError, IsekaiPipeBinaries, IsekaiPipeHandshake, IsekaiPipeP2pMode};
 use crate::isekai_pipe_quic_transport::{
-    self, compute_proof, establish_quic_connection_with_socket, open_control_stream,
-    spawn_app_ack_tasks, spawn_bootstrap_host_key_forwarder, FRAME_ACK, FRAME_HELLO,
-    FRAME_REJECT_AUTH, FRAME_REJECT_DUPLICATE, FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED,
-    ISEKAI_PIPE_BIN_AARCH64, ISEKAI_PIPE_BIN_X86_64, ISEKAI_PIPE_VERSION, RESUME_GRACE_LEN,
+    self, attach_handshake, compute_proof, establish_quic_connection_with_socket, open_control_stream,
+    spawn_app_ack_tasks, spawn_bootstrap_host_key_forwarder, ISEKAI_PIPE_BIN_AARCH64, ISEKAI_PIPE_BIN_X86_64,
+    ISEKAI_PIPE_VERSION,
 };
 use crate::resume_client::{self, ClientResumeState};
 use crate::transport::{
@@ -250,33 +249,12 @@ async fn connect_relay_stream(
     .map_err(|e| format!("endpoint bind failed: {e}"))?;
     let conn = establish_quic_connection_with_socket(socket, helper_addr, &cert_sha256_hex).await?;
 
+    // control stream の CONTROL_HELLO 用 plain proof（ATTACH の transcript 付き proof とは
+    // 別物、`isekai_pipe_quic_transport::attach_handshake` 参照）。
     let proof = compute_proof(&conn, &session_secret, b"")?;
 
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi failed: {e}"))?;
-    let mut hello = Vec::with_capacity(37);
-    hello.push(FRAME_HELLO);
-    hello.extend_from_slice(&proof);
-    // No client-configurable resume-grace concept on Android yet — `0` means
-    // "no preference, use the server's own default/max".
-    hello.extend_from_slice(&0u32.to_be_bytes());
-    send.write_all(&hello).await.map_err(|e| format!("HELLO write failed: {e}"))?;
-
-    let mut type_byte = [0u8; 1];
-    recv.read_exact(&mut type_byte).await.map_err(|e| format!("ACK read failed: {e}"))?;
-    match type_byte[0] {
-        FRAME_ACK => {
-            let mut rest = [0u8; RESUME_GRACE_LEN];
-            recv.read_exact(&mut rest).await.map_err(|e| format!("ACK read failed: {e}"))?;
-        }
-        FRAME_REJECT_AUTH => return Err("isekai-helper rejected: auth (proof mismatch)".to_string()),
-        FRAME_REJECT_DUPLICATE => {
-            return Err("isekai-helper rejected: duplicate active connection".to_string())
-        }
-        FRAME_REJECT_TARGET => return Err("isekai-helper rejected: target unreachable".to_string()),
-        FRAME_REJECT_UNSUPPORTED => return Err("isekai-helper rejected: unsupported frame".to_string()),
-        other => return Err(format!("isekai-helper: unexpected response byte {other:#x}")),
-    }
-    info!("isekai_link_relay: HELLO/ACK ok — handing off to SSH");
+    let (send, recv) = attach_handshake(&conn, &session_secret).await?;
+    info!("isekai_link_relay: ATTACH ok — handing off to SSH");
 
     let resume_state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(
         DEFAULT_RESUME_BUFFER_SIZE,

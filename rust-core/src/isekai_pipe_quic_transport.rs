@@ -30,7 +30,14 @@ use russh::client;
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use sha2::{Digest, Sha256};
 
-use isekai_protocol::hello::{decode_ack_response, encode_hello, AckResponse, Proof};
+use isekai_protocol::attach::{
+    attach_hello_proof_transcript, decode_attach_response, encode_attach_activate, encode_attach_hello,
+    AttachActivate, AttachHello, AttachProof, AttachRejectReason, AttachResponse, AttemptId, ConnectionGeneration,
+    ATTACH_READY_FRAME_LEN, ATTEMPT_ID_LEN, FRAME_ATTACH_READY, FRAME_REJECT_STALE_GENERATION,
+    STALE_GENERATION_REJECT_FRAME_LEN,
+};
+use isekai_protocol::session_id::{SessionId, SESSION_ID_LEN};
+use rand::RngCore;
 
 use crate::helper_bootstrap::{self, BootstrapError, IsekaiPipeBinaries, IsekaiPipeHandshake, IsekaiPipeP2pMode};
 use crate::resume_client::{self, ClientResumeState};
@@ -61,15 +68,14 @@ const CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 // Phase 9-2 (multipath_transport.rs)・Phase 10 (isekai_stun_p2p_transport.rs /
 // isekai_link_relay_transport.rs) もこのワイヤー契約・埋め込みバイナリを共有する
-// ため pub(crate) re-export してある（HELPER_PROTOCOL.md の契約は接続経路が単一パスか
+// ため pub(crate) re-export してある（ATTACH v2 の契約は接続経路が単一パスか
 // multipath かによらず同一）。
 // Phase S-0f: 値そのものの定義は isekai-protocol crate（pure crate、CLI版の
 // isekai-ssh/isekai-transport とも共有）に一本化し、ここでは re-export するだけにする
-// （ISEKAI_SSH_DESIGN.md「共有ロジックの crate 分割」参照）。
-pub(crate) use isekai_protocol::hello::{
-    ALPN, EXPORTER_LABEL, FRAME_ACK, FRAME_HELLO, FRAME_REJECT_AUTH, FRAME_REJECT_DUPLICATE,
-    FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED, RESUME_GRACE_LEN,
-};
+// （ISEKAI_SSH_DESIGN.md「共有ロジックの crate 分割」参照）。ATTACH v2 のフレーム
+// 定数・codec は各ファイルが直接 `isekai_protocol::attach` から import する（HELLO/ACK
+// v1 のフレーム定数はサーバー側で撤去されたため re-export しない）。
+pub(crate) use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
 
 /// `isekai-pipe/Cargo.toml` の version と一致させる（`isekai-pipe --version` の出力に
 /// この文字列が部分一致することを`check_existing_version`が確認する）。バージョン
@@ -466,8 +472,107 @@ pub(crate) async fn establish_quic_connection_with_socket(
     Ok(conn)
 }
 
+/// ブランドニューな論理セッション用のランダムな `SessionId`（ATTACH v2 では
+/// クライアントが接続開始前に採番する、`#18-4`）。1 接続 = 1 セッションなので
+/// 呼び出しごとに新規生成してよい（isekai-transport のような複数候補で 1 つの
+/// session_id を共有する round の概念は Android 側には無い）。
+pub(crate) fn random_session_id() -> SessionId {
+    let mut bytes = [0u8; SESSION_ID_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    SessionId::from_bytes(bytes)
+}
+
+pub(crate) fn random_attempt_id() -> AttemptId {
+    let mut bytes = [0u8; ATTEMPT_ID_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    AttemptId::from_bytes(bytes)
+}
+
+/// ATTACH v2 ハンドシェイク（`ATTACH_HELLO`/`AttachReadyV2`/`ATTACH_ACTIVATE`）を、
+/// 既に確立済みの QUIC connection 上の新しい bi-directional stream で行う。成功時は
+/// 以降そのまま SSH のパススルーに使えるデータ stream を返す。`isekai-transport::relay::
+/// connect_and_handshake` の ATTACH 部分を Android 側の 3 経路（direct/relay/STUN）で
+/// 共有するために切り出したもの。Android には generation を進める fencing/リトライ層は
+/// 無いので常に `ConnectionGeneration::INITIAL` を使う。
+pub(crate) async fn attach_handshake(
+    conn: &noq::Connection,
+    session_secret: &[u8],
+) -> Result<(noq::SendStream, noq::RecvStream), String> {
+    let session_id = random_session_id();
+    let generation = ConnectionGeneration::INITIAL;
+    let attempt_id = random_attempt_id();
+    // No client-configurable resume-grace concept on Android yet — `0` means
+    // "no preference, use the server's own default/max".
+    let requested_resume_grace_secs = 0;
+    let transcript = attach_hello_proof_transcript(&session_id, generation, &attempt_id, requested_resume_grace_secs);
+    let attach_proof = AttachProof::new(compute_proof(conn, session_secret, &transcript)?);
+
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi failed: {e}"))?;
+    let hello = AttachHello { session_id, generation, attempt_id, requested_resume_grace_secs, proof: attach_proof };
+    send.write_all(&encode_attach_hello(&hello))
+        .await
+        .map_err(|e| format!("ATTACH_HELLO write failed: {e}"))?;
+
+    match read_attach_response(&mut recv).await? {
+        AttachResponse::Ready { attach_token, .. } => {
+            let activate = AttachActivate { session_id, generation, attempt_id, attach_token };
+            send.write_all(&encode_attach_activate(&activate))
+                .await
+                .map_err(|e| format!("ATTACH_ACTIVATE write failed: {e}"))?;
+            Ok((send, recv))
+        }
+        AttachResponse::Reject(reason) => Err(attach_reject_message(reason)),
+    }
+}
+
+/// `AttachResponse` を wire から読む: まず 1 バイトの type、その値に応じて追加バイトを
+/// 読む（`FRAME_ATTACH_READY` は `ATTACH_READY_FRAME_LEN - 1`、
+/// `FRAME_REJECT_STALE_GENERATION` は `STALE_GENERATION_REJECT_FRAME_LEN - 1`、
+/// その他の既知 reject byte は追加なし）。`decode_attach_response` の契約に合わせた
+/// 二段読み。
+pub(crate) async fn read_attach_response(recv: &mut noq::RecvStream) -> Result<AttachResponse, String> {
+    let mut type_byte = [0u8; 1];
+    recv.read_exact(&mut type_byte).await.map_err(|e| format!("ATTACH response read failed: {e}"))?;
+    let mut full = vec![type_byte[0]];
+    let extra_len = match type_byte[0] {
+        FRAME_ATTACH_READY => ATTACH_READY_FRAME_LEN - 1,
+        FRAME_REJECT_STALE_GENERATION => STALE_GENERATION_REJECT_FRAME_LEN - 1,
+        _ => 0,
+    };
+    if extra_len > 0 {
+        let mut rest = vec![0u8; extra_len];
+        recv.read_exact(&mut rest).await.map_err(|e| format!("ATTACH response read failed: {e}"))?;
+        full.extend_from_slice(&rest);
+    }
+    decode_attach_response(&full).map_err(|e| format!("isekai-helper: {e}"))
+}
+
+/// `AttachRejectReason` を人間可読なエラー文字列にする。v1 の
+/// `RejectAuth`/`RejectTarget`/`RejectUnsupported`/`RejectDuplicate` 相当に加え、
+/// ATTACH v2 で新設された fencing 系の理由も区別できるメッセージにする。
+pub(crate) fn attach_reject_message(reason: AttachRejectReason) -> String {
+    match reason {
+        AttachRejectReason::Auth => "isekai-helper rejected: auth (proof mismatch)".to_string(),
+        AttachRejectReason::Target => "isekai-helper rejected: target unreachable".to_string(),
+        AttachRejectReason::Unsupported => "isekai-helper rejected: unsupported frame".to_string(),
+        AttachRejectReason::AlreadyAttached => {
+            "isekai-helper rejected: a different attempt already attached".to_string()
+        }
+        AttachRejectReason::BusyOtherSession => {
+            "isekai-helper rejected: a different session is currently active".to_string()
+        }
+        AttachRejectReason::AttachAlreadyEstablished => {
+            "isekai-helper rejected: session already established, should resume instead".to_string()
+        }
+        AttachRejectReason::StaleGeneration { current_generation } => {
+            format!("isekai-helper rejected: stale generation (server is at generation {current_generation})")
+        }
+    }
+}
+
 /// `session_secret` と QUIC connection の exporter から proof を計算する
-/// （HELLO と RESUME で共通のロジック。RESUME は `extra` に session_id を渡す）。
+/// （ATTACH の `extra` には proof transcript、RESUME は session_id、CONTROL_HELLO は
+/// 空を渡す）。
 pub(crate) fn compute_proof(conn: &noq::Connection, session_secret: &[u8], extra: &[u8]) -> Result<[u8; 32], String> {
     let mut exporter = [0u8; 32];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
@@ -511,34 +616,13 @@ async fn connect_isekai_pipe_quic_stream(
 
     let conn = establish_quic_connection(remote, &cert_sha256_hex).await?;
 
+    // control stream の CONTROL_HELLO で使う plain proof（exporter のみ、ATTACH の
+    // transcript 付き proof とは別物）。ATTACH ハンドシェイク自体は attach_handshake が
+    // 独自に transcript 付き proof を計算する。
     let proof = compute_proof(&conn, &session_secret, b"")?;
 
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi failed: {e}"))?;
-    // No client-configurable resume-grace concept on Android yet — `0` means
-    // "no preference, use the server's own default/max"
-    // (`isekai_protocol::hello::decode_ack_response`'s docs).
-    send.write_all(&encode_hello(&Proof::new(proof), 0))
-        .await
-        .map_err(|e| format!("HELLO write failed: {e}"))?;
-
-    let mut type_byte = [0u8; 1];
-    recv.read_exact(&mut type_byte).await.map_err(|e| format!("ACK read failed: {e}"))?;
-    let mut resp = vec![type_byte[0]];
-    if type_byte[0] == FRAME_ACK {
-        let mut rest = [0u8; RESUME_GRACE_LEN];
-        recv.read_exact(&mut rest).await.map_err(|e| format!("ACK read failed: {e}"))?;
-        resp.extend_from_slice(&rest);
-    }
-    match decode_ack_response(&resp).map_err(|e| format!("isekai-helper: {e}"))? {
-        AckResponse::Ack { .. } => {}
-        AckResponse::RejectAuth => return Err("isekai-helper rejected: auth (proof mismatch)".to_string()),
-        AckResponse::RejectDuplicate => {
-            return Err("isekai-helper rejected: duplicate active connection".to_string())
-        }
-        AckResponse::RejectTarget => return Err("isekai-helper rejected: target unreachable".to_string()),
-        AckResponse::RejectUnsupported => return Err("isekai-helper rejected: unsupported frame".to_string()),
-    }
-    info!("isekai_pipe_quic: HELLO/ACK ok — handing off to SSH");
+    let (send, recv) = attach_handshake(&conn, &session_secret).await?;
+    info!("isekai_pipe_quic: ATTACH ok — handing off to SSH");
 
     let resume_state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(
         DEFAULT_RESUME_BUFFER_SIZE,

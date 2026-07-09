@@ -32,9 +32,10 @@ use log::{info, warn};
 use noq::udp::{RecvMeta, Transmit};
 use noq::{AsyncUdpSocket, UdpSender};
 
-use crate::isekai_pipe_quic_transport::{
-    self, PinnedCertVerifier, ALPN, EXPORTER_LABEL, FRAME_ACK, FRAME_HELLO, FRAME_REJECT_AUTH,
-    FRAME_REJECT_DUPLICATE, FRAME_REJECT_TARGET, FRAME_REJECT_UNSUPPORTED, RESUME_GRACE_LEN,
+use crate::isekai_pipe_quic_transport::{self, PinnedCertVerifier, ALPN, EXPORTER_LABEL};
+use isekai_protocol::attach::{
+    attach_hello_proof_transcript, encode_attach_activate, encode_attach_hello, AttachActivate, AttachHello,
+    AttachProof, AttachResponse, ConnectionGeneration,
 };
 use crate::transport::{run_ssh_channel_loop, TransportCommand, TransportEvent};
 use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
@@ -519,43 +520,55 @@ fn build_pinned_client_config(cert_sha256_hex: &str) -> Result<noq::ClientConfig
     Ok(client_config)
 }
 
-fn compute_proof(conn: &noq::Connection, session_secret: &[u8]) -> Result<[u8; 32], String> {
+/// `session_secret` と QUIC connection の exporter から proof を計算する
+/// （ATTACH の `extra` には proof transcript を渡す。`isekai_pipe_quic_transport::
+/// compute_proof` と同じロジックだが、このトランスポートは独立実装として自前で持つ）。
+fn compute_proof(conn: &noq::Connection, session_secret: &[u8], extra: &[u8]) -> Result<[u8; 32], String> {
     let mut exporter = [0u8; 32];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|e| format!("export_keying_material failed: {e:?}"))?;
     let mut mac = HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
     mac.update(&exporter);
+    if !extra.is_empty() {
+        mac.update(extra);
+    }
     Ok(mac.finalize().into_bytes().into())
 }
 
+/// ATTACH v2 ハンドシェイク（`ATTACH_HELLO`/`AttachReadyV2`/`ATTACH_ACTIVATE`）を行い、
+/// 以降 SSH のパススルーに使えるデータ stream を返す。session_id/attempt_id 採番・reject
+/// メッセージ整形・レスポンス読み取りは `isekai_pipe_quic_transport` の共有ヘルパーを
+/// 使う（Android には generation を進める fencing 層が無いので常に
+/// `ConnectionGeneration::INITIAL`）。
 async fn hello_ack(
     conn: &noq::Connection,
     session_secret: &[u8],
 ) -> Result<(noq::SendStream, noq::RecvStream), String> {
-    let proof = compute_proof(conn, session_secret)?;
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi failed: {e}"))?;
-    let mut hello = Vec::with_capacity(37);
-    hello.push(FRAME_HELLO);
-    hello.extend_from_slice(&proof);
+    let session_id = isekai_pipe_quic_transport::random_session_id();
+    let generation = ConnectionGeneration::INITIAL;
+    let attempt_id = isekai_pipe_quic_transport::random_attempt_id();
     // No client-configurable resume-grace concept on Android yet — `0` means
     // "no preference, use the server's own default/max".
-    hello.extend_from_slice(&0u32.to_be_bytes());
-    send.write_all(&hello).await.map_err(|e| format!("HELLO write failed: {e}"))?;
+    let requested_resume_grace_secs = 0;
+    let transcript = attach_hello_proof_transcript(&session_id, generation, &attempt_id, requested_resume_grace_secs);
+    let proof = AttachProof::new(compute_proof(conn, session_secret, &transcript)?);
 
-    let mut type_byte = [0u8; 1];
-    recv.read_exact(&mut type_byte).await.map_err(|e| format!("ACK read failed: {e}"))?;
-    match type_byte[0] {
-        FRAME_ACK => {
-            let mut rest = [0u8; RESUME_GRACE_LEN];
-            recv.read_exact(&mut rest).await.map_err(|e| format!("ACK read failed: {e}"))?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi failed: {e}"))?;
+    let hello = AttachHello { session_id, generation, attempt_id, requested_resume_grace_secs, proof };
+    send.write_all(&encode_attach_hello(&hello))
+        .await
+        .map_err(|e| format!("ATTACH_HELLO write failed: {e}"))?;
+
+    match isekai_pipe_quic_transport::read_attach_response(&mut recv).await? {
+        AttachResponse::Ready { attach_token, .. } => {
+            let activate = AttachActivate { session_id, generation, attempt_id, attach_token };
+            send.write_all(&encode_attach_activate(&activate))
+                .await
+                .map_err(|e| format!("ATTACH_ACTIVATE write failed: {e}"))?;
+            Ok((send, recv))
         }
-        FRAME_REJECT_AUTH => return Err("isekai-helper rejected: auth (proof mismatch)".to_string()),
-        FRAME_REJECT_DUPLICATE => return Err("isekai-helper rejected: duplicate active connection".to_string()),
-        FRAME_REJECT_TARGET => return Err("isekai-helper rejected: target unreachable".to_string()),
-        FRAME_REJECT_UNSUPPORTED => return Err("isekai-helper rejected: unsupported frame".to_string()),
-        other => return Err(format!("isekai-helper: unexpected response byte {other:#x}")),
+        AttachResponse::Reject(reason) => Err(isekai_pipe_quic_transport::attach_reject_message(reason)),
     }
-    Ok((send, recv))
 }
 
 /// Phase 9-4: 物理無線に明示的にバインドされたpath候補1本分（`RawFd`は
@@ -1042,6 +1055,10 @@ mod tests {
     //! ではなく `establish_multipath_connection` を直接呼ぶ）ので、実機・実
     //! ネットワーク不要でCIから常時実行できる。
     use super::*;
+    use isekai_protocol::attach::{
+        decode_attach_activate, decode_attach_hello, encode_attach_response, AttachRejectReason, AttachToken,
+        ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,
+    };
     use std::net::{IpAddr, Ipv4Addr};
 
     /// 実UDP/QUICを使うテストのpath検証待ちで共通に使うポーリング上限。
@@ -1114,26 +1131,46 @@ mod tests {
                         let secret = secret;
                         let conn = conn.clone();
                         tokio::spawn(async move {
-                            // 37 bytes: type(1) + proof(32) + requested_resume_grace_secs(4)
+                            // ATTACH v2: type(1) + session_id(16) + generation(8) +
+                            // attempt_id(16) + requested_resume_grace_secs(4) + proof(32)
                             // — `hello_ack`（このテストが検証対象とする本番クライアント
-                            // ロジック）の現在の送信フォーマットと揃える。
-                            let mut hello = [0u8; 37];
-                            if recv.read_exact(&mut hello).await.is_err() { return; }
+                            // ロジック）の送信フォーマットと揃える。
+                            let mut hello_buf = [0u8; ATTACH_HELLO_FRAME_LEN];
+                            if recv.read_exact(&mut hello_buf).await.is_err() { return; }
+                            let Ok(hello) = decode_attach_hello(&hello_buf) else { return; };
                             let mut exporter = [0u8; 32];
                             if conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"").is_err() { return; }
+                            // proof = HMAC(secret, exporter || attach_hello_proof_transcript(..))。
+                            let transcript = attach_hello_proof_transcript(
+                                &hello.session_id, hello.generation, &hello.attempt_id, hello.requested_resume_grace_secs,
+                            );
                             let mut mac = HmacSha256::new_from_slice(&secret).unwrap();
                             mac.update(&exporter);
-                            let expected = mac.finalize().into_bytes();
-                            if hello[0] != FRAME_HELLO || hello[1..33] != expected[..] {
-                                let _ = send.write_all(&[FRAME_REJECT_AUTH]).await;
+                            mac.update(&transcript);
+                            let expected: [u8; 32] = mac.finalize().into_bytes().into();
+                            if !hello.proof.ct_eq(&AttachProof::new(expected)) {
+                                let _ = send
+                                    .write_all(&encode_attach_response(&AttachResponse::Reject(
+                                        AttachRejectReason::Auth,
+                                    )))
+                                    .await;
                                 return;
                             }
-                            // ACKもtype(1) + effective_resume_grace_secs(4)の5byte——
-                            // `hello_ack`側は`FRAME_ACK`と分かった時点で追加4byteを読むので、
-                            // 何を返すかは任意（テストは値そのものを検証しない）。
-                            let mut ack = vec![FRAME_ACK];
-                            ack.extend_from_slice(&0u32.to_be_bytes());
-                            let _ = send.write_all(&ack).await;
+                            // AttachReadyV2: 受け取った識別子をそのままエコーし、任意の
+                            // attach_token を返す（テストは値そのものは検証しない）。
+                            let ready = AttachResponse::Ready {
+                                session_id: hello.session_id,
+                                generation: hello.generation,
+                                attempt_id: hello.attempt_id,
+                                negotiated_resume_grace_secs: 0,
+                                attach_token: AttachToken::new([0u8; 16]),
+                            };
+                            let _ = send.write_all(&encode_attach_response(&ready)).await;
+                            // ATTACH_ACTIVATE をちょうど 1 フレーム分だけ読む（後続のデータ
+                            // stream を食わないよう read_to_end は使わない）。
+                            let mut activate_buf = [0u8; ATTACH_ACTIVATE_FRAME_LEN];
+                            if recv.read_exact(&mut activate_buf).await.is_err() { return; }
+                            if decode_attach_activate(&activate_buf).is_err() { return; }
                             if let Ok(data) = recv.read_to_end(4096).await {
                                 let mut reply = b"echo:".to_vec();
                                 reply.extend_from_slice(&data);
@@ -1216,18 +1253,7 @@ mod tests {
 
         // rebind前: 通常のecho往復が動くことを確認。
         {
-            let proof = compute_proof(&conn, &secret).unwrap();
-            let (mut send, mut recv) = conn.open_bi().await.unwrap();
-            let mut hello = Vec::with_capacity(37);
-            hello.push(FRAME_HELLO);
-            hello.extend_from_slice(&proof);
-            hello.extend_from_slice(&0u32.to_be_bytes());
-            send.write_all(&hello).await.unwrap();
-            let mut resp = [0u8; 1];
-            recv.read_exact(&mut resp).await.unwrap();
-            assert_eq!(resp[0], FRAME_ACK);
-            let mut resp_rest = [0u8; 4];
-            recv.read_exact(&mut resp_rest).await.unwrap();
+            let (mut send, mut recv) = hello_ack(&conn, &secret).await.unwrap();
             send.write_all(b"before-rebind").await.unwrap();
             send.finish().unwrap();
             let reply = recv.read_to_end(4096).await.unwrap();
@@ -1249,18 +1275,7 @@ mod tests {
         // rebind後: 新しいbi-directionalストリームでもecho往復が動くことを確認
         // （＝コネクションがローカルアドレス変更を生き延びた）。
         {
-            let proof = compute_proof(&conn, &secret).unwrap();
-            let (mut send, mut recv) = conn.open_bi().await.unwrap();
-            let mut hello = Vec::with_capacity(37);
-            hello.push(FRAME_HELLO);
-            hello.extend_from_slice(&proof);
-            hello.extend_from_slice(&0u32.to_be_bytes());
-            send.write_all(&hello).await.unwrap();
-            let mut resp = [0u8; 1];
-            recv.read_exact(&mut resp).await.unwrap();
-            assert_eq!(resp[0], FRAME_ACK);
-            let mut resp_rest = [0u8; 4];
-            recv.read_exact(&mut resp_rest).await.unwrap();
+            let (mut send, mut recv) = hello_ack(&conn, &secret).await.unwrap();
             send.write_all(b"after-rebind").await.unwrap();
             send.finish().unwrap();
             let reply = recv.read_to_end(4096).await.unwrap();
