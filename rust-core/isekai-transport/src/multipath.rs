@@ -57,9 +57,33 @@ pub struct MultipathConnection {
     pub endpoint: noq::Endpoint,
 }
 
-/// Binds a UDP socket at `bind`, connects to `primary`, then opens every
-/// address in `secondaries` as an additional simultaneous path on the same
-/// connection (each via [`open_path_with_retry`], serialized one at a time —
+/// Binds a plain UDP socket at `bind` and delegates to
+/// [`connect_multipath_with_socket`] — the common case (`isekai-pipe`/
+/// `isekai-ssh`, no need to control the underlying socket type). See
+/// [`connect_multipath_with_socket`]'s docs for everything else.
+pub async fn connect_multipath(
+    bind: BindSpec,
+    primary: RemoteSpec,
+    secondaries: Vec<SecondaryPath>,
+    event_tx: tokio::sync::mpsc::Sender<PathHealthEvent>,
+) -> Result<MultipathConnection, TransportError> {
+    use noq::Runtime as _;
+
+    let socket = tokio::net::UdpSocket::bind(bind.local_addr)
+        .await
+        .map_err(|source| TransportError::Bind { addr: bind.local_addr, source })?;
+    let std_socket =
+        socket.into_std().map_err(|source| TransportError::Bind { addr: bind.local_addr, source })?;
+    let async_socket = noq::TokioRuntime
+        .wrap_udp_socket(std_socket)
+        .map_err(|e| TransportError::EndpointSetup(e.to_string()))?;
+
+    connect_multipath_with_socket(async_socket, primary, secondaries, event_tx).await
+}
+
+/// Connects to `primary` over `socket`, then opens every address in
+/// `secondaries` as an additional simultaneous path on the same connection
+/// (each via [`open_path_with_retry`], serialized one at a time —
 /// `multipath_transport.rs` found opening multiple paths concurrently makes
 /// every path but the first reliably fail validation on real hardware, see
 /// that module's `establish_multipath_connection` comment). All paths use
@@ -67,28 +91,34 @@ pub struct MultipathConnection {
 /// that is the load-bearing constraint that keeps this working, unlike
 /// Android's abandoned physical-interface variant.
 ///
+/// Takes an already-constructed `Box<dyn noq::AsyncUdpSocket>` rather than
+/// binding one itself (unlike [`connect_multipath`]) so a caller that needs
+/// a non-default socket — e.g. `isekai-terminal-core`'s fault-injection-
+/// wrapped `MultiUdpSocket`, used for both its own physical-path fan-out
+/// (out of scope here, see this module's docs) and its real-device fault-
+/// injection test harness — can supply it. `noq::AsyncUdpSocket` is a plain
+/// `noq` trait, not an Android-specific type, so accepting it here doesn't
+/// cross this crate's "no Android/UniFFI types" boundary (mirrors
+/// `traits::QuicEndpointFactory::wrap_bound_socket`'s reason for existing
+/// alongside `create_endpoint`).
+///
 /// [`PathHealthEvent`]s (currently just [`PathHealthEvent::NoViablePath`])
 /// are sent on `event_tx` as paths degrade/recover/get abandoned — the
-/// caller decides what queue depth and backpressure policy fit its use case
-/// (`isekai-pipe`/`isekai-ssh` vs. a future Android caller may want very
-/// different channel sizing), so this function takes an already-constructed
-/// sender rather than owning the channel itself.
-pub async fn connect_multipath(
-    bind: BindSpec,
+/// caller decides what queue depth and backpressure policy fit its use case,
+/// so this function takes an already-constructed sender rather than owning
+/// the channel itself.
+pub async fn connect_multipath_with_socket(
+    socket: Box<dyn noq::AsyncUdpSocket>,
     primary: RemoteSpec,
     secondaries: Vec<SecondaryPath>,
     event_tx: tokio::sync::mpsc::Sender<PathHealthEvent>,
 ) -> Result<MultipathConnection, TransportError> {
     let client_config = client_config_for(&primary.cert_sha256_hex, true)?;
 
-    let socket = tokio::net::UdpSocket::bind(bind.local_addr)
-        .await
-        .map_err(|source| TransportError::Bind { addr: bind.local_addr, source })?;
-    let std_socket =
-        socket.into_std().map_err(|source| TransportError::Bind { addr: bind.local_addr, source })?;
-
-    let endpoint = noq::Endpoint::new(noq::EndpointConfig::default(), None, std_socket, Arc::new(noq::TokioRuntime))
-        .map_err(|e| TransportError::EndpointSetup(e.to_string()))?;
+    let endpoint = noq::Endpoint::new_with_abstract_socket(
+        noq::EndpointConfig::default(), None, socket, Arc::new(noq::TokioRuntime),
+    )
+    .map_err(|e| TransportError::EndpointSetup(e.to_string()))?;
     // Paths opened later via `open_path` ride on the already-authenticated
     // connection (no fresh TLS handshake per path), so this is the only
     // place a client_config is needed — mirrors

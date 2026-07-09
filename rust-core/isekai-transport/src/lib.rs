@@ -100,7 +100,7 @@ pub use candidate_provider::{
     LegacyIntentProvider,
 };
 pub use error::TransportError;
-pub use multipath::{connect_multipath, MultipathConnection, SecondaryPath, PRIMARY_PATH_LABEL};
+pub use multipath::{connect_multipath, connect_multipath_with_socket, MultipathConnection, SecondaryPath, PRIMARY_PATH_LABEL};
 pub use physical_interface::{bind_physical_interface, InterfaceIndex};
 pub use path_health::{
     classify_path_health, has_zero_response, notify_if_no_viable_path, spawn_health_monitor, PathHealthEvent,
