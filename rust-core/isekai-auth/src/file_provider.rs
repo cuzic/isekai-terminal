@@ -154,10 +154,12 @@ enum TokenFileSchema {
 
 /// `~/.config/isekai-ssh` (XDG Base Directory convention, per
 /// `archive/ISEKAI_SSH_DESIGN.md`; same directory `isekai-trust` uses for
-/// `known_helpers.toml`).
+/// `known_helpers.toml`). Resolves the home directory via
+/// `isekai_fs_guard::resolve_home_dir` (`$HOME`, falling back to
+/// `%USERPROFILE%` on Windows where `HOME` isn't reliably set).
 pub fn default_config_dir() -> Result<PathBuf, AuthError> {
-    let home = std::env::var_os("HOME").ok_or(AuthError::NoHomeDir)?;
-    Ok(config_dir_from_home(Path::new(&home)))
+    let home = isekai_fs_guard::resolve_home_dir().ok_or(AuthError::NoHomeDir)?;
+    Ok(config_dir_from_home(&home))
 }
 
 /// Pure helper split out of `default_config_dir` so the path-joining logic

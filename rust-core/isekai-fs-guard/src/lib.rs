@@ -14,8 +14,9 @@
 //! Pure `std::fs`, no async/tokio — both callers only ever use this
 //! synchronously.
 
+use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A permission-guard failure, deliberately without a `path` field: callers
 /// already know which path they passed in and attach it to their own error
@@ -76,9 +77,55 @@ pub fn set_private_file_permissions(_path: &Path) -> Result<(), FsGuardError> {
     Ok(())
 }
 
+/// Resolves the user's home directory across platforms: `$HOME` (Unix, and
+/// Windows environments like Git Bash/MSYS/WSL that set it too), falling
+/// back to `%USERPROFILE%` (native `cmd.exe`/PowerShell, which does not set
+/// `HOME`). `isekai-trust`/`isekai-auth`'s config-directory layout
+/// (`.config/isekai-ssh`, the existing Unix XDG-style join) is unchanged by
+/// this — this function only makes the *lookup* work on Windows, not the
+/// resulting path idiomatic there (a Windows-native `%APPDATA%`/OS-keychain
+/// layout is a separate, still-open design question, `archive/ISEKAI_SSH_DESIGN.md`'s
+/// "配布対象プラットフォーム" note).
+pub fn resolve_home_dir() -> Option<PathBuf> {
+    resolve_home_dir_from(|key| std::env::var_os(key))
+}
+
+/// Pure helper split out of `resolve_home_dir` so the `HOME`-then-
+/// `USERPROFILE` priority order can be unit-tested without mutating the
+/// process-wide environment (`std::env::set_var` is process-global and not
+/// safe to toggle from concurrently-running tests — same rationale as
+/// `isekai-trust::store::config_dir_from_home`).
+fn resolve_home_dir_from(lookup: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    lookup("HOME").or_else(|| lookup("USERPROFILE")).map(PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_home_dir_from_prefers_home_over_userprofile() {
+        let home = resolve_home_dir_from(|key| match key {
+            "HOME" => Some(OsString::from("/home/alice")),
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\alice")),
+            _ => None,
+        });
+        assert_eq!(home, Some(PathBuf::from("/home/alice")));
+    }
+
+    #[test]
+    fn resolve_home_dir_from_falls_back_to_userprofile_when_home_is_unset() {
+        let home = resolve_home_dir_from(|key| match key {
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\alice")),
+            _ => None,
+        });
+        assert_eq!(home, Some(PathBuf::from(r"C:\Users\alice")));
+    }
+
+    #[test]
+    fn resolve_home_dir_from_is_none_when_neither_is_set() {
+        assert_eq!(resolve_home_dir_from(|_| None), None);
+    }
 
     #[test]
     fn ensure_private_dir_creates_missing_dir_as_0700() {
