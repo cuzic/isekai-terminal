@@ -1607,6 +1607,7 @@ name = "isekai-transport"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "env_logger",
  "hmac",
  "isekai-pipe-core",
  "isekai-protocol",
@@ -1621,6 +1622,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

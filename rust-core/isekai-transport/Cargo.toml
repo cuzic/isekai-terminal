@@ -31,7 +31,11 @@ rand = "0.8"
 # 参照する必要はない(Androidは`NamedPath::from_socket`に束縛済みソケットを渡すだけ)。
 quicsock = { path = "../quicsock", features = ["discovery"] }
 quicsock-noq = { path = "../quicsock-noq" }
+# `noq::Connection::path_events()`のStream実装をpollするために使う
+# (multipath.rs、isekai-terminal-coreのmultipath_transport.rsと同じ用途)。
+tokio-stream = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 rcgen = "0.13"
+env_logger = "0.11"

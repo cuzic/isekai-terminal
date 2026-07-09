@@ -112,7 +112,19 @@ impl ServerCertVerifier for PinnedCertVerifier {
 /// dependency, only `noq`/`rustls`, so widening its visibility doesn't cross
 /// the "no Android/UniFFI types in this crate" boundary the module docs
 /// describe.
-pub fn client_config_for(cert_sha256_hex: &str) -> Result<noq::ClientConfig, TransportError> {
+///
+/// `multipath`: whether to advertise noq's multipath extension
+/// (`TransportConfig::max_concurrent_multipath_paths`) — required on *both*
+/// sides of a connection before `noq::Connection::open_path` will do
+/// anything but fail with "multipath extension not negotiated" (confirmed
+/// via `multipath::connect_multipath`'s own e2e test). `false` for ordinary
+/// single-path connections (`relay.rs`/`stun_p2p.rs`/
+/// `android_quic_endpoint.rs`) — advertising a capability those connections
+/// never use would be a pointless (if harmless) transport-parameter change
+/// from what isekai-helper today expects, and `multipath_transport.rs`'s
+/// own `build_pinned_client_config` deliberately keeps this opt-in for the
+/// same reason.
+pub fn client_config_for(cert_sha256_hex: &str, multipath: bool) -> Result<noq::ClientConfig, TransportError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -139,6 +151,12 @@ pub fn client_config_for(cert_sha256_hex: &str) -> Result<noq::ClientConfig, Tra
         noq::IdleTimeout::try_from(CLIENT_MAX_IDLE_TIMEOUT).expect("valid idle timeout"),
     ));
     transport.keep_alive_interval(Some(CLIENT_KEEP_ALIVE_INTERVAL));
+    if multipath {
+        // Matches `multipath_transport.rs::build_pinned_client_config`'s value —
+        // no product requirement drove "8" specifically, just "more than the
+        // 1 primary + a small number of secondaries this crate opens".
+        transport.max_concurrent_multipath_paths(8);
+    }
 
     let mut client_config = noq::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(transport));
@@ -200,7 +218,7 @@ struct SystemQuicEndpoint {
 #[async_trait]
 impl QuicEndpoint for SystemQuicEndpoint {
     async fn connect(&self, remote: RemoteSpec) -> Result<Box<dyn QuicConnection>, TransportError> {
-        let client_config = client_config_for(&remote.cert_sha256_hex)?;
+        let client_config = client_config_for(&remote.cert_sha256_hex, false)?;
         info!("isekai-transport: connecting to {}", remote.addr);
         let conn = self
             .endpoint

@@ -63,6 +63,7 @@ pub mod candidate_pool;
 pub mod candidate_provider;
 pub mod error;
 pub mod generation_coordinator;
+pub mod multipath;
 pub mod path_health;
 pub mod proof;
 pub mod race;
@@ -86,6 +87,7 @@ pub use candidate_provider::{
     LegacyIntentProvider,
 };
 pub use error::TransportError;
+pub use multipath::{connect_multipath, MultipathConnection, SecondaryPath, PRIMARY_PATH_LABEL};
 pub use path_health::{
     classify_path_health, has_zero_response, notify_if_no_viable_path, spawn_health_monitor, PathHealthEvent,
     PathHealthTracker, PathLabel, PathState,
