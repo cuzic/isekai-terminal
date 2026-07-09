@@ -24,7 +24,18 @@ use isekai_trust::schema::{HelperTrust, TrustStore, UpdatePolicy};
 
 use crate::{IntentTransport, RelayPolicy, ServerIdentity};
 
-pub const PERSISTENT_PROFILE_SCHEMA_VERSION: u32 = 1;
+/// Bumped from `1` to `2` (`ISEKAI_PIPE_DESIGN.md` §8 Epic I's "codexが
+///指摘したが未対応のまま残している点") as a forward-looking safety marker,
+/// *not* because the on-disk shape changed here — every real `1`-tagged
+/// file any live code path has ever written already has today's shape
+/// (`identity_pubkey`/etc. were added as required fields under the `1` tag
+/// itself, before this bump; no live path ever wrote the older,
+/// `identity_pubkey`-less shape that number would otherwise imply). `2`
+/// exists so a *future* shape change has an unambiguous version to gate on;
+/// `load_persistent_profile` intentionally does not reject `1` here — doing
+/// so would break every already-written real profile over a label that was
+/// never actually wrong for its contents.
+pub const PERSISTENT_PROFILE_SCHEMA_VERSION: u32 = 2;
 
 /// `chatgpt.md` §13's persistent profile document, one per logical host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
