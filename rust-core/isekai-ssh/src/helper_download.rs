@@ -30,7 +30,13 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use isekai_bootstrap::{HostSpec, JumpSpec, OpenSshBackend};
 use sha2::{Digest, Sha256};
+
+/// Production GitHub base URL. Tests override this with a local mock HTTP
+/// server's address instead (`ensure_helper_binary_cached`'s `base_url`
+/// parameter) — this constant is only ever passed at the real call sites.
+pub const GITHUB_BASE_URL: &str = "https://github.com";
 
 /// Duplicated from `init.rs`/`wrapper.rs`'s own `hex_sha256` per this
 /// crate's established convention of small private per-module helpers
@@ -161,6 +167,33 @@ pub async fn ensure_helper_binary_cached(cache_dir: &Path, source: &ReleaseSourc
     tokio::task::spawn_blocking(move || download_and_cache(&cache_dir, &source, &asset_name, &base_url))
         .await
         .context("isekai-ssh: helper binary download task panicked")?
+}
+
+/// The single entry point `init.rs`/`wrapper.rs` call: `explicit_path`
+/// (`--helper-binary`/`--isekai-helper-binary`) always wins outright — no
+/// arch detection, no network, matching today's behavior exactly for
+/// callers who already pass it. Only when it's `None` does this detect the
+/// remote's architecture and fall through to the download+cache path.
+pub async fn resolve_helper_binary(
+    explicit_path: Option<&Path>,
+    backend: &OpenSshBackend,
+    target: &HostSpec,
+    via: &[JumpSpec],
+    source: &ReleaseSource,
+) -> Result<Vec<u8>> {
+    if let Some(path) = explicit_path {
+        return std::fs::read(path).with_context(|| format!("failed to read helper binary at {}", path.display()));
+    }
+
+    let arch = backend
+        .detect_remote_arch(target, via)
+        .await
+        .context("failed to detect the remote architecture (uname -m) needed to auto-download a helper binary")?;
+    let cache_dir = default_helper_cache_dir().context("could not determine the helper binary cache directory")?;
+    let path = ensure_helper_binary_cached(&cache_dir, source, &arch, GITHUB_BASE_URL)
+        .await
+        .with_context(|| format!("auto-downloading an isekai-pipe binary for architecture {arch:?} from {}/{} failed", source.repo, source.tag.as_deref().unwrap_or("latest")))?;
+    std::fs::read(&path).with_context(|| format!("failed to read downloaded helper binary at {}", path.display()))
 }
 
 fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str, base_url: &str) -> Result<PathBuf> {
@@ -375,5 +408,22 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let source = ReleaseSource::default_repo();
         assert!(ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_helper_binary_prefers_the_explicit_path_and_never_touches_the_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary_path = tmp.path().join("isekai-pipe");
+        std::fs::write(&binary_path, b"explicit-binary-bytes").unwrap();
+
+        // A backend/target that would fail immediately if `detect_remote_arch`
+        // were ever called (nothing listens on this port) — proving the
+        // explicit-path branch really does skip SSH/network entirely.
+        let backend = OpenSshBackend::new();
+        let target = HostSpec::new("127.0.0.1").with_port(1);
+        let source = ReleaseSource::default_repo();
+
+        let bytes = resolve_helper_binary(Some(&binary_path), &backend, &target, &[], &source).await.unwrap();
+        assert_eq!(bytes, b"explicit-binary-bytes");
     }
 }

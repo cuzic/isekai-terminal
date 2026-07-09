@@ -77,19 +77,34 @@ pub struct InitArgs {
 
     /// Path to the isekai-helper binary to upload and start on `<host>`.
     ///
-    /// There is deliberately no default here: a real release of isekai-ssh
-    /// is expected to eventually embed a musl-static isekai-helper binary
-    /// (S-7, see `rust-core/scripts/build-isekai-helper-musl.sh`) so this
-    /// flag becomes optional, but doing that today would force every
-    /// `cargo build -p isekai-ssh` to require a pre-built musl artifact on
-    /// disk just to compile — exactly the trap `isekai_pipe_quic_transport.rs`'s
-    /// unconditional `include_bytes!` fell into for `isekai-terminal-core`. Keeping
-    /// this an explicit, required CLI argument keeps `isekai-ssh` buildable
-    /// in any environment; tests pass the actual binary built alongside
-    /// this crate (`CARGO_BIN_EXE_isekai-helper`/the sibling `target/`
-    /// directory).
+    /// There is deliberately no *embedded* default here: a real release of
+    /// isekai-ssh is expected to eventually embed a musl-static
+    /// isekai-helper binary (S-7, see `rust-core/scripts/build-isekai-helper-musl.sh`),
+    /// but doing that today would force every `cargo build -p isekai-ssh` to
+    /// require a pre-built musl artifact on disk just to compile — exactly
+    /// the trap `isekai_pipe_quic_transport.rs`'s unconditional
+    /// `include_bytes!` fell into for `isekai-terminal-core`. When omitted,
+    /// `init` instead detects the remote's architecture (`uname -m`) and
+    /// downloads a matching release asset (`helper_download`, `--helper-release-repo`/
+    /// `--helper-release-tag`) — this only succeeds once this project
+    /// actually publishes GitHub Releases (honest gap today, see
+    /// `helper_download`'s module docs), so passing this flag explicitly
+    /// remains the reliable path until then; tests pass the actual binary
+    /// built alongside this crate (`CARGO_BIN_EXE_isekai-helper`/the sibling
+    /// `target/` directory).
     #[arg(long, value_name = "PATH")]
-    pub helper_binary: PathBuf,
+    pub helper_binary: Option<PathBuf>,
+
+    /// `owner/repo` to fetch a release asset from when `--helper-binary` is
+    /// omitted (`helper_download::ReleaseSource`). Defaults to this
+    /// project's own repository.
+    #[arg(long, value_name = "OWNER/REPO", default_value = crate::helper_download::ReleaseSource::DEFAULT_REPO)]
+    pub helper_release_repo: String,
+
+    /// Pin a specific release tag to fetch a helper binary from when
+    /// `--helper-binary` is omitted. Defaults to the latest release.
+    #[arg(long, value_name = "TAG")]
+    pub helper_release_tag: Option<String>,
 
     /// The isekai-link relay `isekai-helper --relay` should tunnel through
     /// (`archive/HELPER_PROTOCOL.md`, `archive/ISEKAI_SSH_DESIGN.md` "接続シーケンス").

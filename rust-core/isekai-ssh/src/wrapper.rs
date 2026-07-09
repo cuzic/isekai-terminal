@@ -42,7 +42,7 @@ struct WrapperPlan {
     isekai: WrapperIsekaiOptions,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WrapperIsekaiOptions {
     bootstrap: bool,
     no_bootstrap: bool,
@@ -52,9 +52,15 @@ struct WrapperIsekaiOptions {
     /// Local path to the `isekai-helper` binary to upload when auto
     /// bootstrap is triggered (`--isekai-helper-binary`). No embedded
     /// default exists yet — see `cli::InitArgs::helper_binary`'s doc comment
-    /// for why this stays an explicit, required-when-needed argument rather
-    /// than a guessed default.
+    /// for why this stays an explicit argument rather than a guessed
+    /// default. When `None`, `bootstrap_and_register` falls through to
+    /// `helper_download::resolve_helper_binary` (arch detection + GitHub
+    /// Release download) before giving up.
     helper_binary: Option<PathBuf>,
+    /// Mirrors `cli::InitArgs::helper_release_repo`/`helper_release_tag` —
+    /// see `helper_download::ReleaseSource`.
+    helper_release_repo: String,
+    helper_release_tag: Option<String>,
     /// Mirrors `cli::InitArgs::helper_manifest`/`trusted_release_keys`/
     /// `expect_platform`/`expect_architecture` (`ISEKAI_PIPE_DESIGN.md` §8
     /// Epic D's manifest verification, extended to the wrapper's own
@@ -64,6 +70,25 @@ struct WrapperIsekaiOptions {
     trusted_release_keys: Vec<String>,
     expect_platform: Option<String>,
     expect_architecture: Option<String>,
+}
+
+impl Default for WrapperIsekaiOptions {
+    fn default() -> Self {
+        Self {
+            bootstrap: false,
+            no_bootstrap: false,
+            direct: false,
+            explain: false,
+            dry_run: false,
+            helper_binary: None,
+            helper_release_repo: crate::helper_download::ReleaseSource::DEFAULT_REPO.to_string(),
+            helper_release_tag: None,
+            helper_manifest: None,
+            trusted_release_keys: Vec::new(),
+            expect_platform: None,
+            expect_architecture: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -347,13 +372,6 @@ fn print_bootstrap_failure_guidance(err: &anyhow::Error) {
 /// as a single `ssh(1)` `-J host1,host2,...` invocation, not nested `ssh`
 /// executions per hop.
 async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution) -> Result<()> {
-    let helper_binary_path = plan.isekai.helper_binary.as_ref().ok_or_else(|| {
-        anyhow!(
-            "no --isekai-helper-binary given (or `isekai-ssh init` was never run for this host); \
-             auto-bootstrap needs a local isekai-helper binary to upload"
-        )
-        .context(BootstrapFailure::RemoteBinaryMissing)
-    })?;
     let candidate = resolution
         .isekai
         .bootstrap_candidates
@@ -389,8 +407,27 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
     isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain(&target, &via)
         .with_context(|| format!("invalid --via chain {:?}", candidate.via))?;
 
-    let helper_binary = std::fs::read(helper_binary_path)
-        .with_context(|| format!("failed to read helper binary at {}", helper_binary_path.display()))?;
+    let backend = OpenSshBackend::new();
+    let helper_binary_was_explicit = plan.isekai.helper_binary.is_some();
+    let helper_binary = crate::helper_download::resolve_helper_binary(
+        plan.isekai.helper_binary.as_deref(),
+        &backend,
+        &target,
+        &via,
+        &crate::helper_download::ReleaseSource { repo: plan.isekai.helper_release_repo.clone(), tag: plan.isekai.helper_release_tag.clone() },
+    )
+    .await
+    .map_err(|e| {
+        let e = if helper_binary_was_explicit {
+            e
+        } else {
+            e.context(
+                "no --isekai-helper-binary given (or `isekai-ssh init` was never run for this host) and \
+                 auto-download failed; auto-bootstrap needs a local isekai-helper binary to upload",
+            )
+        };
+        e.context(BootstrapFailure::RemoteBinaryMissing)
+    })?;
     let helper_sha256 = hex_sha256(&helper_binary);
 
     if let Some(manifest_path) = &plan.isekai.helper_manifest {
@@ -447,7 +484,6 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
     };
 
     eprintln!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
-    let backend = OpenSshBackend::new();
     let report = backend
         .install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
         .await
@@ -615,6 +651,12 @@ fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
             "--isekai-helper-binary" => {
                 isekai.helper_binary =
                     Some(PathBuf::from(next_value(&mut iter, "--isekai-helper-binary")?));
+            }
+            "--isekai-helper-release-repo" => {
+                isekai.helper_release_repo = next_value(&mut iter, "--isekai-helper-release-repo")?;
+            }
+            "--isekai-helper-release-tag" => {
+                isekai.helper_release_tag = Some(next_value(&mut iter, "--isekai-helper-release-tag")?);
             }
             "--isekai-helper-manifest" => {
                 isekai.helper_manifest =
@@ -1352,7 +1394,15 @@ mod tests {
                 profile: "production".to_string(),
                 remote_path: None,
                 services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
-                bootstrap_candidates: vec![BootstrapCandidate { target: "production:22".to_string(), via: Vec::new(), priority: 0 }],
+                // `127.0.0.1:1` (not `production:22`): nothing listens on
+                // port 1, so the `ssh(1)` subprocess `detect_remote_arch`
+                // spawns for its `uname -m` probe fails instantly with
+                // "connection refused" — no DNS lookup, no timeout wait,
+                // keeping this a fast/deterministic test despite now doing
+                // a real subprocess spawn (`plan.isekai.helper_binary` is
+                // `None`, so `resolve_helper_binary` no longer short-circuits
+                // before *some* I/O — see `helper_download::resolve_helper_binary`).
+                bootstrap_candidates: vec![BootstrapCandidate { target: "127.0.0.1:1".to_string(), via: Vec::new(), priority: 0 }],
                 link_endpoints: Vec::new(),
                 rendezvous: Vec::new(),
                 stun_servers: Vec::new(),
@@ -1365,9 +1415,12 @@ mod tests {
             },
         };
 
-        // `plan.isekai.helper_binary` is `None` (the default), so this
-        // returns before any filesystem/network I/O — the exact site this
-        // test targets is `bootstrap_and_register`'s first `ok_or_else`.
+        // `plan.isekai.helper_binary` is `None` (the default): no explicit
+        // path is given, `detect_remote_arch` fails against the unreachable
+        // target above, and `resolve_helper_binary` surfaces that failure —
+        // classified the same as the old "no --isekai-helper-binary given"
+        // hard error used to be, since the practical guidance is identical
+        // either way ("no local isekai-pipe binary to upload").
         let err = bootstrap_and_register(&plan, &resolution).await.unwrap_err();
         let failure = err
             .downcast_ref::<BootstrapFailure>()
@@ -1416,10 +1469,15 @@ mod tests {
         // A valid 2-hop chain: passes chain validation, then fails on the
         // (expected, unrelated) missing helper binary file — proving the
         // multi-hop path is no longer rejected outright the way it used to
-        // be (`ISEKAI_PIPE_DESIGN.md` §8 Epic K).
+        // be (`ISEKAI_PIPE_DESIGN.md` §8 Epic K). Classified as
+        // `RemoteBinaryMissing` (helper_download's arch-detect/auto-download
+        // fallback is skipped here since `--isekai-helper-binary` was given
+        // explicitly, but a failure to read *that* still means "no local
+        // binary to upload").
         let resolution = resolution_with_via(vec!["bastion-a".to_string(), "bastion-b".to_string()]);
         let err = bootstrap_and_register(&plan, &resolution).await.unwrap_err();
-        assert!(err.downcast_ref::<BootstrapFailure>().is_none(), "a plain io::Error, not a BootstrapFailure: {err:?}");
+        let failure = err.downcast_ref::<BootstrapFailure>().expect("classified as a BootstrapFailure");
+        assert!(matches!(failure, BootstrapFailure::RemoteBinaryMissing), "{failure:?}");
         assert!(format!("{err:#}").contains("nonexistent/isekai-helper"), "{err:#}");
 
         // A looping chain (repeats the destination, same host *and* port —
@@ -1489,6 +1547,27 @@ mod tests {
         assert_eq!(plan.isekai.trusted_release_keys, vec!["prod=aabbcc".to_string(), "staging=ddeeff".to_string()]);
         assert_eq!(plan.isekai.expect_platform, Some("linux".to_string()));
         assert_eq!(plan.isekai.expect_architecture, Some("x86_64".to_string()));
+    }
+
+    #[test]
+    fn helper_release_source_defaults_to_this_projects_repo_and_latest() {
+        let plan = parse_wrapper(s(&["production"])).unwrap();
+        assert_eq!(plan.isekai.helper_release_repo, crate::helper_download::ReleaseSource::DEFAULT_REPO);
+        assert_eq!(plan.isekai.helper_release_tag, None);
+    }
+
+    #[test]
+    fn parses_helper_release_flags() {
+        let plan = parse_wrapper(s(&[
+            "--isekai-helper-release-repo",
+            "someone/fork",
+            "--isekai-helper-release-tag",
+            "v1.2.3",
+            "production",
+        ]))
+        .unwrap();
+        assert_eq!(plan.isekai.helper_release_repo, "someone/fork");
+        assert_eq!(plan.isekai.helper_release_tag, Some("v1.2.3".to_string()));
     }
 
     #[tokio::test]

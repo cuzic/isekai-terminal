@@ -35,8 +35,23 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::cli::InitArgs;
 
 pub async fn run(args: InitArgs) -> Result<()> {
-    let helper_binary = std::fs::read(&args.helper_binary)
-        .with_context(|| format!("isekai-ssh: failed to read helper binary at {}", args.helper_binary.display()))?;
+    let target = parse_host_spec(&args.host)
+        .with_context(|| format!("isekai-ssh: invalid host spec '{}'", args.host))?;
+    let via = parse_via_chain(&target, &args.via)?;
+    let backend = OpenSshBackend::new();
+
+    let helper_binary = crate::helper_download::resolve_helper_binary(
+        args.helper_binary.as_deref(),
+        &backend,
+        &target,
+        &via,
+        &crate::helper_download::ReleaseSource { repo: args.helper_release_repo.clone(), tag: args.helper_release_tag.clone() },
+    )
+    .await
+    .context(
+        "isekai-ssh: no --helper-binary given and auto-download failed; pass --helper-binary explicitly \
+         (or check --helper-release-repo/--helper-release-tag)",
+    )?;
     let helper_sha256 = hex_sha256(&helper_binary);
 
     if let Some(manifest_path) = &args.helper_manifest {
@@ -54,9 +69,6 @@ pub async fn run(args: InitArgs) -> Result<()> {
         );
     }
 
-    let target = parse_host_spec(&args.host)
-        .with_context(|| format!("isekai-ssh: invalid host spec '{}'", args.host))?;
-    let via = parse_via_chain(&target, &args.via)?;
     let relay_jwt = resolve_relay_jwt(&args)?;
     let relay = RelayLaunchSpec {
         relay_addr: args.relay_addr,
@@ -66,7 +78,6 @@ pub async fn run(args: InitArgs) -> Result<()> {
     };
 
     println!("Deploying isekai-helper to {}...", args.host);
-    let backend = OpenSshBackend::new();
     let report = backend
         .install_and_start(&target, &via, &helper_binary, &LaunchSpec::Relay(relay), None, &args.stun_servers)
         .await
@@ -355,7 +366,9 @@ mod tests {
         InitArgs {
             host: "myhost".to_string(),
             via: Vec::new(),
-            helper_binary: std::path::PathBuf::from("/dev/null"),
+            helper_binary: Some(std::path::PathBuf::from("/dev/null")),
+            helper_release_repo: crate::helper_download::ReleaseSource::DEFAULT_REPO.to_string(),
+            helper_release_tag: None,
             relay_addr: "127.0.0.1:1".parse().unwrap(),
             relay_sni: "relay.example.test".to_string(),
             relay_jwt: Some("test-jwt".to_string()),
