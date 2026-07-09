@@ -20,6 +20,7 @@
 //! - `BootstrapError` (`error.rs`).
 
 pub mod backend;
+pub mod client_candidates;
 pub mod error;
 pub mod openssh;
 pub mod types;
