@@ -102,7 +102,17 @@ impl ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-fn client_config_for(cert_sha256_hex: &str) -> Result<noq::ClientConfig, TransportError> {
+/// Builds a `noq::ClientConfig` pinned to `cert_sha256_hex` (see
+/// [`PinnedCertVerifier`]) with this crate's fixed idle-timeout/keepalive/
+/// stream-limit tuning. `pub` (not crate-private) so `isekai-terminal-core`'s
+/// own `QuicEndpoint` adapter (`rust-core/src/android_quic_endpoint.rs`) can
+/// reuse the exact same TLS/transport config instead of keeping its own
+/// near-identical copy (isekai-terminal-core/isekai-transport crate共有化
+/// Phase 1b) — this function has no Android-specific or CLI-specific
+/// dependency, only `noq`/`rustls`, so widening its visibility doesn't cross
+/// the "no Android/UniFFI types in this crate" boundary the module docs
+/// describe.
+pub fn client_config_for(cert_sha256_hex: &str) -> Result<noq::ClientConfig, TransportError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
