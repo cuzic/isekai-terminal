@@ -9,7 +9,9 @@
 //! live in the `resume` module (Phase S-4a), byte-compatible with the
 //! existing `pub(crate)` implementation in `rust-core/src/resume_client.rs`.
 
+pub mod attach;
 pub mod bootstrap;
+pub mod bootstrap_request;
 pub mod error;
 pub mod handshake;
 pub mod hello;
@@ -18,6 +20,13 @@ pub mod resume;
 pub mod session_id;
 pub mod version;
 
+pub use attach::{
+    AttachActivate, AttachHello, AttachKey, AttachProof, AttachRejectReason, AttachResponse, AttachToken, AttemptId,
+    CancelAttach, ConnectionGeneration,
+};
+pub use bootstrap_request::{
+    BootstrapAttemptId, BootstrapCandidateV2, BootstrapRequestV2, BootstrapReportV2, BOOTSTRAP_PROTOCOL_V2,
+};
 pub use error::ProtocolError;
 pub use handshake::HandshakeJson;
 pub use hello::{AckResponse, Proof};

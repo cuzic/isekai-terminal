@@ -18,6 +18,9 @@ pub enum ProtocolError {
     #[error("arithmetic overflow while advancing a stream offset")]
     OffsetOverflow,
 
+    #[error("connection generation overflowed while advancing")]
+    GenerationOverflow,
+
     #[error("handshake JSON is {got} bytes, exceeding the {max} byte limit")]
     HandshakeTooLarge { got: usize, max: usize },
 
