@@ -514,7 +514,7 @@ fun ProfileEditScreen(
             OutlinedTextField(
                 value = stunServer,
                 onValueChange = { stunServer = it },
-                label = { Text("STUNサーバー（任意）") },
+                label = { Text("STUNサーバー（任意、複数はカンマ区切り）") },
                 placeholder = { Text(ConnectionProfile.DEFAULT_STUN_SERVER) },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
@@ -524,7 +524,9 @@ fun ProfileEditScreen(
                     "UDP 穴あけ（simultaneous open）を試みます。NAT の種類によっては穴あけが " +
                     "成立せず接続に失敗することがあり、その場合はフォールバックせずエラーになります" +
                     "（その際は Auto 等、他の接続方式に切り替えてください）。未入力なら " +
-                    "${ConnectionProfile.DEFAULT_STUN_SERVER} を使います。",
+                    "${ConnectionProfile.DEFAULT_STUN_SERVER} を使います。カンマ区切りで複数指定すると、" +
+                    "先頭の1件を実際の穴あけに使いつつ、残りは冗長性向上のための追加候補として" +
+                    "サーバー側へ伝えます。",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

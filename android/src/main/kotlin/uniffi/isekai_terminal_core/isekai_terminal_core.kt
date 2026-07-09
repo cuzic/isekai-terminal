@@ -7495,11 +7495,17 @@ data class IsekaiStunP2pConfig (
     , 
     /**
      * isekai-terminal・isekai-helper の双方が自分自身の観測アドレスを調べるのに使う
-     * STUN サーバー(`host:port`)。パブリックな STUN サーバー(例: Google の
+     * STUN サーバー(`host:port`)のリスト。パブリックな STUN サーバー(例: Google の
      * `stun.l.google.com:19302`)でよい—双方が同じサーバーを使う必要は無く、
-     * それぞれ自分にとって疎通できるものを指定すればよい。
+     * それぞれ自分にとって疎通できるものを指定すればよい。空であってはならない
+     * （呼び出し側が既定値にフォールバックすること）。先頭の1件が実際の
+     * STUN+SSHランデブー穴あけ機構（自分自身の観測アドレス取得・isekai-helper起動時の
+     * `--stun-server`/`--punch-peer`）に使われ、残りは`BootstrapRequestV2`の
+     * `client_candidates`（isekai-bootstrap crate共有化 Phase 2c、`#20b`と同じ仕組み）
+     * として追加の穴あけ候補をサーバー側へ渡すためだけに使われる（冗長性向上、
+     * 複数STUNサーバーの応答が異なるNATマッピングを示す場合の取りこぼし対策）。
      */
-    var `stunServer`: kotlin.String
+    var `stunServers`: List<kotlin.String>
     
 ){
     
@@ -7523,7 +7529,7 @@ public object FfiConverterTypeIsekaiStunP2pConfig: FfiConverterRustBuffer<Isekai
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalTypeJumpConfig.read(buf),
-            FfiConverterString.read(buf),
+            FfiConverterSequenceString.read(buf),
         )
     }
 
@@ -7535,7 +7541,7 @@ public object FfiConverterTypeIsekaiStunP2pConfig: FfiConverterRustBuffer<Isekai
             FfiConverterUInt.allocationSize(value.`cols`) +
             FfiConverterUInt.allocationSize(value.`rows`) +
             FfiConverterOptionalTypeJumpConfig.allocationSize(value.`jump`) +
-            FfiConverterString.allocationSize(value.`stunServer`)
+            FfiConverterSequenceString.allocationSize(value.`stunServers`)
     )
 
     override fun write(value: IsekaiStunP2pConfig, buf: ByteBuffer) {
@@ -7546,7 +7552,7 @@ public object FfiConverterTypeIsekaiStunP2pConfig: FfiConverterRustBuffer<Isekai
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
             FfiConverterOptionalTypeJumpConfig.write(value.`jump`, buf)
-            FfiConverterString.write(value.`stunServer`, buf)
+            FfiConverterSequenceString.write(value.`stunServers`, buf)
     }
 }
 
@@ -10079,6 +10085,34 @@ public object FfiConverterSequenceUInt: FfiConverterRustBuffer<List<kotlin.UInt>
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterUInt.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.String>> {
+    override fun read(buf: ByteBuffer): List<kotlin.String> {
+        val len = buf.getInt()
+        return List<kotlin.String>(len) {
+            FfiConverterString.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<kotlin.String>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterString.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<kotlin.String>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterString.write(it, buf)
         }
     }
 }

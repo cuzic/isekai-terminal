@@ -97,6 +97,9 @@ data class ConnectionProfile(
     @ColumnInfo(name = "jump_key_id") val jumpKeyId: Long? = null,
     // Phase 10: STUN+SSHランデブーによる直接P2P QUIC(TransportPreference.ISEKAI_STUN_P2P_QUIC)
     // 選択時のみ使うSTUNサーバー(host:port)。null/空なら DEFAULT_STUN_SERVER を使う。
+    // Phase 2c(isekai-terminal-core/isekai-ssh crate共有化): 複数指定したい場合は
+    // カンマまたは空白区切りで並べる(スキーマ変更を避けるため、列自体は単一TEXTのまま。
+    // [stunServers] 参照)。
     @ColumnInfo(name = "stun_server") val stunServer: String? = null,
     // Phase 10: MASQUE relay経由P2P QUIC(TransportPreference.ISEKAI_LINK_RELAY_QUIC)選択時のみ使う。
     // relayJwtは平文ではなく RelayCredentialVault(KeystoreKek由来のAES/GCM、issue #1対応)で
@@ -139,6 +142,21 @@ data class ConnectionProfile(
     /** relay版P2P QUIC接続に必要な設定が(relayAddr/relaySni/relayJwtの3つとも)揃っているか。 */
     val hasRelayConfig: Boolean
         get() = !relayAddr.isNullOrBlank() && !relaySni.isNullOrBlank() && !relayJwt.isNullOrBlank()
+
+    /**
+     * [stunServer] をカンマ/空白区切りで複数値としてパースしたもの。空/未設定なら
+     * [ConnectionProfile.DEFAULT_STUN_SERVER] 1件にフォールバックする。先頭の1件が
+     * 実際のSTUN+SSHランデブー穴あけ機構に使われ、残りは冗長性向上のための追加
+     * bootstrap candidate としてのみ使われる(`isekai_stun_p2p_transport.rs`の
+     * `IsekaiStunP2pConfig::stun_servers`参照)。
+     */
+    val stunServers: List<String>
+        get() = stunServer
+            ?.split(',', ' ', '\n', '\t')
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?.takeIf { it.isNotEmpty() }
+            ?: listOf(ConnectionProfile.DEFAULT_STUN_SERVER)
 
     companion object {
         /** tsshd のデフォルト待受ポート。変更する場合も過去の Room migration 内の
@@ -309,7 +327,7 @@ fun ConnectionProfile.toIsekaiStunP2pConfig(
         cols = cols,
         rows = rows,
         jump = toJumpConfigOrNull(jumpAuth),
-        stunServer = stunServer?.takeIf { it.isNotBlank() } ?: ConnectionProfile.DEFAULT_STUN_SERVER,
+        stunServers = stunServers,
     )
 
 /**
