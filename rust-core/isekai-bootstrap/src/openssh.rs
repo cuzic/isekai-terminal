@@ -72,8 +72,8 @@ use crate::types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec};
 // just mirrored ones — security review #57/#58 applies to both call sites
 // identically).
 use isekai_protocol::bootstrap::{
-    shell_single_quote, validate_relay_jwt, validate_relay_sni, validate_remote_path,
-    HANDSHAKE_POLL_ATTEMPTS, HANDSHAKE_POLL_INTERVAL_MS, ISEKAI_PIPE_BIN_NAME,
+    remote_parent_dir, shell_single_quote, upload_binary_command, validate_relay_jwt, validate_relay_sni,
+    validate_remote_path, HANDSHAKE_POLL_ATTEMPTS, HANDSHAKE_POLL_INTERVAL_MS, ISEKAI_PIPE_BIN_NAME,
     ISEKAI_PIPE_INSTALL_DIR,
 };
 
@@ -202,13 +202,7 @@ impl OpenSshBackend {
         remote_binary_path: &str,
     ) -> Result<(), BootstrapError> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
-        let remote_dir = remote_parent_dir(remote_binary_path);
-        let cmd = format!(
-            "umask 077 && mkdir -p {remote_dir} && \
-             base64 -d > {remote_binary_path}.tmp && \
-             chmod 0700 {remote_binary_path}.tmp && \
-             mv {remote_binary_path}.tmp {remote_binary_path}"
-        );
+        let cmd = upload_binary_command(remote_binary_path, remote_parent_dir(remote_binary_path));
         let out = self.run_ssh_command(target, via, &cmd, Some(encoded.as_bytes())).await?;
         if out.status != Some(0) {
             return Err(BootstrapError::UploadFailed {
@@ -438,19 +432,6 @@ async fn fresh_bootstrap_request_v2(stun_servers: &[SocketAddr]) -> BootstrapReq
         session_id: SessionId::from_bytes(session_id_bytes).to_hex(),
         bootstrap_attempt_id: BootstrapAttemptId::from_bytes(attempt_id_bytes).to_hex(),
         client_candidates: collect_client_stun_candidates(stun_servers).await,
-    }
-}
-
-/// The directory `mkdir -p` should create for `path` (a full remote binary
-/// path, e.g. `~/.local/bin/isekai-pipe` -> `~/.local/bin`). Falls back to
-/// `.` for a bare filename with no directory component (harmless: `mkdir -p
-/// .` always succeeds) and to `/` for a path directly under the filesystem
-/// root.
-fn remote_parent_dir(path: &str) -> &str {
-    match path.rsplit_once('/') {
-        Some((dir, _)) if !dir.is_empty() => dir,
-        Some(_) => "/",
-        None => ".",
     }
 }
 

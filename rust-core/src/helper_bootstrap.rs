@@ -28,7 +28,8 @@ use crate::transport::RusshEventHandler;
 // `validate_relay_jwt`も同モジュール由来（セキュリティレビュー #57、同じ理由で
 // `isekai-bootstrap::openssh`と共有する）。
 use isekai_protocol::bootstrap::{
-    shell_single_quote, validate_relay_jwt, validate_relay_sni, HANDSHAKE_POLL_ATTEMPTS,
+    classify_launch_failure as classify_launch_failure_shared, remote_parent_dir, shell_single_quote,
+    upload_binary_command, validate_relay_jwt, validate_relay_sni, LaunchFailureClass, HANDSHAKE_POLL_ATTEMPTS,
     HANDSHAKE_POLL_INTERVAL_MS, ISEKAI_PIPE_BIN_NAME, ISEKAI_PIPE_INSTALL_DIR,
 };
 
@@ -71,31 +72,18 @@ pub enum BootstrapError {
 const NO_HANDSHAKE_MARKER: &str = "__ISEKAI_HELPER_NO_HANDSHAKE__";
 
 /// `NO_HANDSHAKE_MARKER`とともに返されたisekai-helperのstderrログを見て、
-/// `--bind`固定ポート指定時のUDP bind失敗かどうかを分類する。マッチする既知の
-/// パターンが無ければ(または`bind_port`が指定されていなければ)従来通り
-/// `HandshakeTimeout`のままにする(固定ポート指定と無関係なクラッシュまで
-/// bind失敗として誤分類しないため)。
-///
-/// `isekai-helper`は常にmusl静的リンクバイナリとして配布される(`build-isekai-helper-musl.sh`)。
-/// musl libcの`strerror()`はglibcと文言が異なる場合があり、実際`EADDRINUSE`はglibcでは
-/// "Address already in use"だがmuslでは"Address in use"("already"が無い)になることを
-/// 実機E2Eテストで確認した(開発機のglibc環境で書いた元のパターンは、実際に配布される
-/// muslバイナリの出力に一度もマッチしていなかった)。他の2パターン("Permission denied"/
-/// "Address not available")は偶然glibc/musl間で表記が一致していたため気づかれていなかった。
+/// `--bind`固定ポート指定時のUDP bind失敗かどうかを分類する。実際のパターン
+/// マッチング(musl/glibc `strerror()`文言差異への対応含む)は`isekai-bootstrap::openssh`
+/// と共有の`isekai_protocol::bootstrap::classify_launch_failure`に一本化されている。
 fn classify_launch_failure(log_text: &str, bind_port: Option<u16>) -> BootstrapError {
     let Some(port) = bind_port else {
         return BootstrapError::HandshakeTimeout;
     };
-    if log_text.contains("Address already in use") || log_text.contains("Address in use") {
-        BootstrapError::BindPortInUse(port)
-    } else if log_text.contains("Permission denied") {
-        BootstrapError::BindPermissionDenied(port)
-    } else if log_text.contains("Cannot assign requested address")
-        || log_text.contains("Address not available")
-    {
-        BootstrapError::BindAddressUnavailable(port)
-    } else {
-        BootstrapError::HandshakeTimeout
+    match classify_launch_failure_shared(log_text, true) {
+        LaunchFailureClass::BindPortInUse => BootstrapError::BindPortInUse(port),
+        LaunchFailureClass::BindPermissionDenied => BootstrapError::BindPermissionDenied(port),
+        LaunchFailureClass::BindAddressUnavailable => BootstrapError::BindAddressUnavailable(port),
+        LaunchFailureClass::Unknown => BootstrapError::HandshakeTimeout,
     }
 }
 
@@ -250,12 +238,8 @@ async fn upload_binary(
     binary: &[u8],
 ) -> Result<(), BootstrapError> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
-    let cmd = format!(
-        "umask 077 && mkdir -p {ISEKAI_PIPE_INSTALL_DIR} && \
-         base64 -d > {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}.tmp && \
-         chmod 0700 {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}.tmp && \
-         mv {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}.tmp {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}"
-    );
+    let remote_binary_path = format!("{ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}");
+    let cmd = upload_binary_command(&remote_binary_path, remote_parent_dir(&remote_binary_path));
     let (stdout, exit_status) = run_exec(session, &cmd, Some(encoded.as_bytes())).await?;
     if exit_status != Some(0) {
         return Err(BootstrapError::Upload(format!(
