@@ -25,8 +25,6 @@ use std::time::Duration;
 use base64::Engine as _;
 use log::{info, warn};
 use russh::client;
-use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
-use sha2::{Digest, Sha256};
 
 use isekai_protocol::attach::{
     decode_attach_response, AttachRejectReason, AttachResponse, AttemptId, ATTACH_READY_FRAME_LEN, ATTEMPT_ID_LEN,
@@ -230,63 +228,10 @@ impl IsekaiPipeQuicSession {
 }
 
 // ── 証明書ピン留め ───────────────────────────────────────
-// handshake JSON の cert_sha256（SSH チャネル経由で受け渡し済み、TOFU より強い信頼の起点）
-// とだけ照合する。通常の CA チェーン検証は行わない（自己署名 ephemeral cert のため）。
-
-#[derive(Debug)]
-pub(crate) struct PinnedCertVerifier {
-    pub(crate) expected_sha256_hex: String,
-    pub(crate) provider: Arc<rustls::crypto::CryptoProvider>,
-}
-
-impl ServerCertVerifier for PinnedCertVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        let mut hasher = Sha256::new();
-        hasher.update(end_entity.as_ref());
-        let got: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        if got == self.expected_sha256_hex {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General(format!(
-                "isekai-helper cert pin mismatch: expected {} got {}",
-                self.expected_sha256_hex, got
-            )))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message, cert, dss, &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message, cert, dss, &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
-    }
-}
+// かつてここにあった`PinnedCertVerifier`は、最後の呼び出し元だった
+// multipath_transport.rsがisekai_transport::system::client_config_for
+// (同等のpin検証ロジックを内蔵)経由に移行したことで完全に不要になったため削除した
+// (isekai-terminal-core/isekai-transport crate共有化)。
 
 // ── ブートストラップ（Phase 7-3 呼び出し） ───────────────
 
