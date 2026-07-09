@@ -284,7 +284,7 @@ Host production
 | `resume-grace` | `<n>ms` / `<n>s` / `<n>`(単位省略時は秒) | `120s` | QUIC 接続が切れてから resume を試み続ける猶予時間 |
 | `candidate-race-delay` | 同上の duration 表記 | `150ms` | 複数 candidate を同時に試す際の後発 candidate の遅延 |
 | `relay-delay` | 同上の duration 表記 | `750ms` | direct 系 candidate に対して relay を遅らせて追い掛けさせる遅延 |
-| `install-mode` | `user`\|`system` | `user` | `system` は sudo・所有権・署名検証・rollback が未実装のため、指定すると設定解決時点でエラーになる(fail closed) |
+| `install-mode` | `user`\|`system` | `user` | `system` は sudo・所有権・rollback が未実装かつ実装予定も無いため、指定すると設定解決時点でエラーになる(fail closed)。将来必要になった場合もisekai-ssh本体には組み込まず、`curl ... \| sudo bash`的な別のインストーラースクリプト/ラッパーとして提供する想定 |
 
 `bootstrap-candidate`/`link`/`rendezvous`/`stun`/`relay`/`service` は複数行書くと追記されていく。
 それ以外(`enabled`/`bootstrap-policy`/`profile`/`remote-path`/`resume-grace`/

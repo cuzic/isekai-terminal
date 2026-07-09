@@ -814,8 +814,14 @@ sshを実行する」実装は避ける。
   `isekai-pipe-<arch>-unknown-linux-musl`(`build-isekai-pipe-musl.sh`の出力アーキと対応)。
   `.sha256`サイドカー(存在すれば)で整合性検証(ベストエフォート、404は許容)。
   `$XDG_CACHE_HOME/isekai-ssh/helpers`(既定`~/.cache/isekai-ssh/helpers`)にatomic writeで
-  キャッシュし、以降は同じ`(repo, tag, arch)`に対して再ダウンロードしない(自動的な鮮度
-  チェックは意図的に省略、honest gap)。
+  キャッシュする。**鮮度チェック**(2026-07-09追加): pinned tag(`--helper-release-tag`指定時)は
+  GitHub上のrelease assetが不変であるためキャッシュを無期限に信頼するが、`"latest"`
+  (tag省略時)は`.last-checked`サイドカー(Unixタイムスタンプ)で最終チェック時刻を記録し、
+  `DEFAULT_FRESHNESS_TTL_SECS`(既定24時間、`ISEKAI_SSH_HELPER_CACHE_TTL_SECS`で上書き可)を
+  超えたら再ダウンロードして内容を比較する(バイト列が同じならキャッシュファイル自体は
+  書き換えず`.last-checked`だけ更新)。再チェック中にネットワークが不通の場合はエラーにせず
+  既存のキャッシュへ警告ログ付きでフォールバックする(`CLAUDE.md`の日和見的フォールバック
+  設計に合わせた判断 — オフライン環境でも一度キャッシュ済みなら動き続けるべきため)。
 - ✅ **`init.rs`/`wrapper.rs`への配線**: `InitArgs::helper_binary`を`PathBuf`(必須)から
   `Option<PathBuf>`に緩和。`--helper-binary`/`--isekai-helper-binary`省略時、
   `helper_download::resolve_helper_binary`が`detect_remote_arch`→

@@ -769,16 +769,19 @@ fn resolve_isekai_config(
             .push(ServiceSpec::ssh_target("127.0.0.1:22").expect("default service is valid"));
     }
     // `install-mode=system` needs sudo handling, ownership/permissions,
-    // overwrite-of-an-existing-binary semantics, signature/hash verification,
-    // and update/rollback — none of which exist yet. Rather than silently
-    // wiring it through as if it were equivalent to `user` (or silently
-    // ignoring it), fail closed here at config-resolution time so a typo'd or
-    // aspirational `#@isekai install-mode system` never gets treated as
-    // meaning something it doesn't (`ISEKAI_PIPE_DESIGN.md`).
+    // overwrite-of-an-existing-binary semantics, and update/rollback — none
+    // of which exist, and none of which are currently planned (if ever
+    // pursued, a separate `curl ... | sudo bash`-style installer script/
+    // wrapper is the likely shape, not native support inside `isekai-ssh`
+    // itself). Rather than silently wiring it through as if it were
+    // equivalent to `user` (or silently ignoring it), fail closed here at
+    // config-resolution time so a typo'd or aspirational `#@isekai
+    // install-mode system` never gets treated as meaning something it
+    // doesn't (`ISEKAI_PIPE_DESIGN.md`).
     if builder.install_mode == Some(InstallMode::System) {
         return Err(anyhow!(
-            "isekai-ssh: '#@isekai install-mode system' is not supported yet (no sudo/ownership/\
-             signature-verification/rollback design exists) — remove the directive or use \
+            "isekai-ssh: '#@isekai install-mode system' is not supported (no sudo/ownership/\
+             rollback design exists, and none is planned) — remove the directive or use \
              'install-mode user'"
         ));
     }

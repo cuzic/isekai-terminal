@@ -34,10 +34,60 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use isekai_bootstrap::{HostSpec, JumpSpec, OpenSshBackend};
 use sha2::{Digest, Sha256};
+
+/// How long a cached "latest" binary is trusted before
+/// `ensure_helper_binary_cached` re-checks GitHub for a newer release
+/// (`ISEKAI_SSH_HELPER_CACHE_TTL_SECS` overrides this, mainly for tests).
+/// Pinned-tag caches (`ReleaseSource::tag = Some(_)`) never expire — a
+/// specific release tag's assets are immutable on GitHub, so there is
+/// nothing to revalidate.
+const DEFAULT_FRESHNESS_TTL_SECS: u64 = 24 * 60 * 60;
+
+fn freshness_ttl() -> Duration {
+    std::env::var("ISEKAI_SSH_HELPER_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_FRESHNESS_TTL_SECS))
+}
+
+/// Sidecar path recording when `cache_file` was last checked against the
+/// remote release (a plain Unix-seconds timestamp) — separate from the
+/// `.sha256` sidecar, which records the remote's own integrity digest, not
+/// our local check time.
+fn last_checked_path(cache_file: &Path) -> PathBuf {
+    let mut name = cache_file.as_os_str().to_os_string();
+    name.push(".last-checked");
+    PathBuf::from(name)
+}
+
+fn read_last_checked(path: &Path) -> Option<SystemTime> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let secs: u64 = content.trim().parse().ok()?;
+    Some(UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+fn write_last_checked(path: &Path, now: SystemTime) -> Result<()> {
+    let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    std::fs::write(path, secs.to_string())
+        .with_context(|| format!("isekai-ssh: failed to write freshness marker {}", path.display()))
+}
+
+/// Whether `cache_file` (already known to exist) is due for a freshness
+/// re-check. No recorded timestamp (e.g. a cache written by a version of
+/// this tool that predates freshness tracking) counts as stale, forcing one
+/// revalidation.
+fn is_stale(cache_file: &Path) -> bool {
+    match read_last_checked(&last_checked_path(cache_file)) {
+        Some(last_checked) => SystemTime::now().duration_since(last_checked).unwrap_or_default() >= freshness_ttl(),
+        None => true,
+    }
+}
 
 /// Production GitHub base URL. Tests override this with a local mock HTTP
 /// server's address instead (`ensure_helper_binary_cached`'s `base_url`
@@ -153,15 +203,23 @@ fn verify_sha256_sidecar_if_present(agent: &ureq::Agent, sidecar_url: &str, byte
 /// path. Blocking (`ureq`) work runs inside `tokio::task::spawn_blocking`,
 /// matching `isekai-auth`'s convention.
 ///
-/// Caching is deliberately simple: once downloaded, a given
-/// `(source, arch)` combination is trusted indefinitely (no freshness/ETag
-/// re-validation) — forcing a refresh means passing `--helper-binary`
-/// explicitly or clearing the cache directory by hand. Automatic staleness
-/// detection is an intentionally deferred nicety, not attempted here.
+/// A pinned tag (`source.tag = Some(_)`) is trusted indefinitely once
+/// cached — a specific release's assets never change on GitHub, so there is
+/// nothing to re-check. A `"latest"` cache (`source.tag = None`) is
+/// re-validated once `DEFAULT_FRESHNESS_TTL_SECS` has passed since the last
+/// check: this function re-downloads and compares against the cached bytes,
+/// replacing the cache only if the content actually changed
+/// (`download_and_cache`). Network failure during that re-check falls back
+/// to the existing (stale but still valid) cached binary with a warning,
+/// rather than failing the caller outright — matching this project's
+/// opportunistic-fallback design (`CLAUDE.md` 設計原則): a briefly
+/// unreachable GitHub shouldn't break an `isekai-ssh <host>` invocation that
+/// would otherwise have worked from cache alone.
 pub async fn ensure_helper_binary_cached(cache_dir: &Path, source: &ReleaseSource, arch: &str, base_url: &str) -> Result<PathBuf> {
     let asset_name = asset_name_for_arch(arch)?;
     let path = cache_path(cache_dir, source, &asset_name);
-    if path.exists() {
+    let cache_existed = path.exists();
+    if cache_existed && (source.tag.is_some() || !is_stale(&path)) {
         log::debug!("isekai-ssh: using cached isekai-pipe binary at {}", path.display());
         return Ok(path);
     }
@@ -169,9 +227,22 @@ pub async fn ensure_helper_binary_cached(cache_dir: &Path, source: &ReleaseSourc
     let base_url = base_url.to_string();
     let source = source.clone();
     let cache_dir = cache_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || download_and_cache(&cache_dir, &source, &asset_name, &base_url))
+    let asset_name_for_task = asset_name.clone();
+    let result = tokio::task::spawn_blocking(move || download_and_cache(&cache_dir, &source, &asset_name_for_task, &base_url))
         .await
-        .context("isekai-ssh: helper binary download task panicked")?
+        .context("isekai-ssh: helper binary download task panicked")?;
+
+    match result {
+        Ok(path) => Ok(path),
+        Err(e) if cache_existed => {
+            log::warn!(
+                "isekai-ssh: failed to check for a newer isekai-pipe release ({e:#}); continuing with the cached binary at {}",
+                path.display()
+            );
+            Ok(path)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The single entry point `init.rs`/`wrapper.rs` call: `explicit_path`
@@ -210,6 +281,7 @@ pub async fn resolve_helper_binary(
 fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str, base_url: &str) -> Result<PathBuf> {
     let url = download_url(base_url, source, asset_name);
     let path = cache_path(cache_dir, source, asset_name);
+    let previously_cached = std::fs::read(&path).ok();
 
     let agent: ureq::Agent = ureq::Agent::config_builder().build().into();
     let mut response = agent
@@ -227,18 +299,26 @@ fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str
 
     let parent = path.parent().expect("cache_path always has a parent directory");
     std::fs::create_dir_all(parent).with_context(|| format!("isekai-ssh: failed to create helper cache directory {}", parent.display()))?;
-    let tmp = parent.join(format!("{}.{}.tmp", asset_name, std::process::id()));
-    {
-        let mut file = std::fs::File::create(&tmp).with_context(|| format!("isekai-ssh: failed to create temp file {}", tmp.display()))?;
-        file.write_all(&bytes).with_context(|| format!("isekai-ssh: failed to write {}", tmp.display()))?;
-        #[cfg(unix)]
+
+    if previously_cached.as_deref() == Some(bytes.as_slice()) {
+        log::debug!("isekai-ssh: cached isekai-pipe binary at {} is already up to date", path.display());
+    } else {
+        let tmp = parent.join(format!("{}.{}.tmp", asset_name, std::process::id()));
         {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            let mut file = std::fs::File::create(&tmp).with_context(|| format!("isekai-ssh: failed to create temp file {}", tmp.display()))?;
+            file.write_all(&bytes).with_context(|| format!("isekai-ssh: failed to write {}", tmp.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
         }
+        std::fs::rename(&tmp, &path).with_context(|| format!("isekai-ssh: failed to move downloaded binary into place at {}", path.display()))?;
+        let verb = if previously_cached.is_some() { "updated" } else { "cached" };
+        log::info!("isekai-ssh: {verb} isekai-pipe binary ({} bytes) at {}", bytes.len(), path.display());
     }
-    std::fs::rename(&tmp, &path).with_context(|| format!("isekai-ssh: failed to move downloaded binary into place at {}", path.display()))?;
-    log::info!("isekai-ssh: cached isekai-pipe binary ({} bytes) at {}", bytes.len(), path.display());
+
+    write_last_checked(&last_checked_path(&path), SystemTime::now())?;
     Ok(path)
 }
 
@@ -369,6 +449,100 @@ mod tests {
         let unreachable = "http://127.0.0.1:1";
         let cached_path = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable).await.unwrap();
         assert_eq!(cached_path, path);
+    }
+
+    /// Seeds a cache directory as if a binary had already been downloaded
+    /// `age` ago — same layout `download_and_cache` itself produces.
+    fn seed_stale_cache(cache_dir: &Path, source: &ReleaseSource, bytes: &[u8], age: Duration) -> PathBuf {
+        let asset_name = asset_name_for_arch("x86_64").unwrap();
+        let path = cache_path(cache_dir, source, &asset_name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        write_last_checked(&last_checked_path(&path), SystemTime::now() - age).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn ensure_helper_binary_cached_redownloads_a_stale_latest_cache_when_the_content_changed() {
+        let old_bytes = b"old-isekai-pipe-bytes".to_vec();
+        let new_bytes = b"new-isekai-pipe-bytes-longer".to_vec();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let source = ReleaseSource::default_repo();
+        let path = seed_stale_cache(cache_dir.path(), &source, &old_bytes, Duration::from_secs(25 * 60 * 60));
+
+        let sha256_line = format!("{}  isekai-pipe-x86_64-unknown-linux-musl\n", hex_sha256(&new_bytes));
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "/cuzic/isekai-terminal/releases/latest/download/isekai-pipe-x86_64-unknown-linux-musl".to_string(),
+            new_bytes.clone(),
+        );
+        routes.insert(
+            "/cuzic/isekai-terminal/releases/latest/download/isekai-pipe-x86_64-unknown-linux-musl.sha256".to_string(),
+            sha256_line.into_bytes(),
+        );
+        let addr = spawn_mock_release_server(routes);
+        let base_url = format!("http://{addr}");
+
+        let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url).await.unwrap();
+        assert_eq!(returned, path);
+        assert_eq!(std::fs::read(&path).unwrap(), new_bytes);
+    }
+
+    #[tokio::test]
+    async fn ensure_helper_binary_cached_never_revalidates_a_pinned_tag() {
+        let old_bytes = b"pinned-tag-bytes-never-change".to_vec();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let source = ReleaseSource { repo: "cuzic/isekai-terminal".to_string(), tag: Some("v1.0.0".to_string()) };
+        // Stale by a huge margin, and no last-checked marker at all — a
+        // pinned tag must still skip revalidation entirely.
+        let path = cache_path(cache_dir.path(), &source, &asset_name_for_arch("x86_64").unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &old_bytes).unwrap();
+
+        let unreachable = "http://127.0.0.1:1";
+        let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable).await.unwrap();
+        assert_eq!(returned, path);
+        assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+    }
+
+    #[tokio::test]
+    async fn ensure_helper_binary_cached_falls_back_to_a_stale_cache_when_revalidation_is_unreachable() {
+        let old_bytes = b"stale-but-still-usable-bytes".to_vec();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let source = ReleaseSource::default_repo();
+        let path = seed_stale_cache(cache_dir.path(), &source, &old_bytes, Duration::from_secs(25 * 60 * 60));
+
+        let unreachable = "http://127.0.0.1:1";
+        let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable).await.unwrap();
+        assert_eq!(returned, path);
+        assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+    }
+
+    #[tokio::test]
+    async fn ensure_helper_binary_cached_refreshes_the_freshness_marker_without_rewriting_identical_bytes() {
+        let bytes = b"unchanged-isekai-pipe-bytes".to_vec();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let source = ReleaseSource::default_repo();
+        let path = seed_stale_cache(cache_dir.path(), &source, &bytes, Duration::from_secs(25 * 60 * 60));
+
+        let sha256_line = format!("{}  isekai-pipe-x86_64-unknown-linux-musl\n", hex_sha256(&bytes));
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "/cuzic/isekai-terminal/releases/latest/download/isekai-pipe-x86_64-unknown-linux-musl".to_string(),
+            bytes.clone(),
+        );
+        routes.insert(
+            "/cuzic/isekai-terminal/releases/latest/download/isekai-pipe-x86_64-unknown-linux-musl.sha256".to_string(),
+            sha256_line.into_bytes(),
+        );
+        let addr = spawn_mock_release_server(routes);
+        let base_url = format!("http://{addr}");
+
+        ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        // The marker must have been refreshed even though the bytes were
+        // identical — otherwise every single invocation would re-check.
+        assert!(!is_stale(&path));
     }
 
     #[tokio::test]
