@@ -177,8 +177,8 @@ rust-core/
 ```bash
 isekai-pipe connect --profile production --service ssh --stdio    # local stdio side (ProxyCommand用)
 isekai-pipe serve --service ssh=127.0.0.1:22 [--bind ...] [--relay ...]  # remote service side
-isekai-pipe probe   # 未実装(skeleton)
-isekai-pipe inspect # 未実装(skeleton)
+isekai-pipe probe   # 段階別到達性確認(Epic J、実装済み)
+isekai-pipe inspect # passiveな状態確認(Epic E、実装済み)
 ```
 
 `serve`の`--target <addr>`は`--service ssh=<addr>`の互換alias。`--service`/`--target`の
@@ -646,9 +646,60 @@ codexの提案(2回目の相談)により、一括ゲートにせず`I-G`/`I-H`/
 存在するケースは無いはずであり、実害は無いと判断した。将来的な安全策として`schema_version`を
 2へ上げることは低コストで可能だが、今回は据え置いている。
 
+### Epic J: `isekai-pipe probe`(段階別到達性確認)— 完了(2026-07-09)
+
 `inspect`と異なり実際に通信を発生させる。DNS解決→STUN discovery→relay認証→relay接続→QUIC
 handshake→certificate pin→helper HELLO/ACK→target TCP到達性を段階ごとに表示し、「成功/失敗」の
 二値ではなくどの段階まで成功したかを返す。
+
+- ✅ `isekai-pipe probe --profile <name> [--stun-server <addr>] [--json]`を実装
+  (`isekai-pipe/src/main.rs`)。`PersistentProfile`を読むだけで(`inspect`と同じ
+  `normalize_host_port`→`load_persistent_profile`)、`intent_from_profile`のような
+  `ISEKAI_INTENT_ID`経由の実行時ハンドオフは一切使わない——`--profile`から直接
+  一時的な接続試行を組み立てる。
+- 実装前に`connect_and_handshake`(`isekai-transport/src/relay.rs`)・`AttemptFailure`
+  (`isekai-transport/src/attempt.rs`)を調査し、「DNS解決→STUN discovery→relay認証→
+  relay接続→QUIC handshake→certificate pin→helper HELLO/ACK→target TCP到達性」の
+  8段階のうち実際に個別観測可能なのはどこまでかを確認した:
+  - **DNS解決**: このパイプラインには存在しない(`PersistentProfile`はhelper_addr/
+    peer_addrを常に解決済み`SocketAddr`文字列として保持し、ホスト名DNS解決は一切
+    発生しない)。`Skipped`として正直に報告し、no-opの成功を捏造しない。
+  - **STUN discovery**: `isekai_stun::query_stun`を単体で呼び出し独立した段階として
+    観測(profileに`cached_stun_observed_addr`があり`--stun-server`も指定された場合の
+    み。`wrapper.rs::select_transport`のevidence-gatingを踏襲)。`connect_stun_p2p_with_
+    fallback`が内部でも同じクエリを再度行うため厳密には冗長(STUNパケット2往復)だが、
+    「観測できない内部ステップを捏造するより誠実に多少非効率な方を選ぶ」という判断。
+  - **relay認証/relay接続/QUIC handshake/certificate pin/helper HELLO/ACK**: `isekai-
+    transport`の`connect_and_handshake`が`pub(crate)`で1つの不透明な呼び出しにバンドル
+    されており、公開APIとして個別に観測する手段がない。`connect_via_relay_resumable_
+    with_fallback`/`connect_stun_p2p_with_fallback`(`_with_fallback`系のみ`AttemptFailure`
+    分類を保持する)を1候補のみで呼び、返る`AttemptFailure`のvariantから単一の
+    `handshake`段階として報告する(細分化を捏造しない)。
+  - **target TCP到達性**: `AttemptFailure::DefinitiveRejectNotRetryable`は
+    `AttachRejectReason::Target`からのみ生成される(`attempt.rs`の`From<ConnectAttemptError>`
+    match全体を確認済み)ため、このvariantのみが「handshakeは成功したがremoteの
+    target到達に失敗」を意味する——既存の公開APIだけで正確に表現できることを確認して
+    実装した。成功時は`target_reachability`も`Ok`。
+  - `SequentialConnectError`(relay resumable経路)には`SequentialStunConnectError`に
+    無い3variant(`AttachedButControlStreamFailed`/`MustResumeButResumeFailed`/
+    `GaveUpAfterGenerationRetries`)がある。特に`AttachedButControlStreamFailed`は
+    「data streamのattach自体は成功(=target到達も成功)したが、その後のresumable
+    control stream openだけ失敗」という状態のため、`handshake`は`Failed`・
+    `target_reachability`は`Ok`という非対称な報告になる(handshake全体としては
+    完了していないが、target到達の事実は既に判明している)。
+  - `requested_resume_grace_secs: 0`で呼ぶ——probeは一回限りの診断であり、
+    resumeセッションを維持する理由がない。成功した接続はresume loopを一切開始せず
+    即座に`drop`する(サーバー側は通常の切断として扱いresume-parkingに入るだけで、
+    リークにはならない)。
+- テスト: `isekai-pipe/src/main.rs`内のunit test(`parse_probe`のCLI解析4件、
+  `stage_from_attempt_failure`/`stage_from_relay_connect_error`の段階分類4件、
+  `ProbeReport::fully_reachable`のロジック1件、JSON出力の tagged 形式1件)。
+  実E2Eテスト`isekai-pipe/tests/probe_e2e.rs`2件: 実`isekai-pipe serve`プロセス+実TCP
+  リスナーに対する`probe_reports_every_stage_ok_for_a_reachable_target`(全段階`ok`・
+  exit 0を確認)、helperプロセスを落としてからの
+  `probe_reports_a_failed_handshake_when_the_helper_is_gone`(`handshake: failed`・
+  `target_reachability: not_attempted`・exit非0を確認)。既存の`isekai-pipe`テスト
+  (unit 83件・e2e 25本)は全てgreenのまま。
 
 ### Epic K: 複数hop `--via`チェーンの自動bootstrap(P2、Epic A依存)— 完了(2026-07-09)
 
