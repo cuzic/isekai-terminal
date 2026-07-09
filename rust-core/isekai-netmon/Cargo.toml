@@ -1,0 +1,25 @@
+[package]
+name = "isekai-netmon"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+async-trait = "0.1.89"
+log = "0.4"
+tokio = { version = "1", features = ["sync", "rt"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.6"
+core-foundation = "0.9"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
