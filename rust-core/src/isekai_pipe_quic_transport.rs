@@ -634,7 +634,7 @@ pub(crate) async fn resolve_direct_by_bootstrap_host(
 /// 一切検証しない固定文字列でよい(`RemoteSpec::server_name`のdocコメント参照、
 /// 証明書検証は`cert_sha256_hex`のピン留めのみで行う)。Android側3経路(direct/
 /// relay/STUN)で揃えて使ってきた既存の値をそのまま踏襲する。
-const QUIC_SERVER_NAME: &str = "isekai-pipe.local";
+pub(crate) const QUIC_SERVER_NAME: &str = "isekai-pipe.local";
 
 async fn connect_isekai_pipe_quic_stream(
     ssh_host: &str,
@@ -734,7 +734,7 @@ async fn connect_isekai_pipe_quic_stream(
 /// 既に使っている`ClientResumeState`ベースのreplay/offset管理と直接には
 /// つながらない — 200ms間隔(APP_ACK自体の送信間隔と同じ)でどちらの方向も
 /// 同期する(isekai-terminal-core/isekai-transport crate共有化 Phase 1c)。
-fn spawn_app_ack_bridge(
+pub(crate) fn spawn_app_ack_bridge(
     resume_state: Arc<std::sync::Mutex<ClientResumeState>>,
     counters: Arc<isekai_transport::resume::AppAckCounters>,
 ) {
