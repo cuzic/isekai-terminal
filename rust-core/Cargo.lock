@@ -1615,7 +1615,6 @@ dependencies = [
  "log",
  "noq",
  "quicsock",
- "quicsock-noq",
  "rand 0.8.6",
  "rcgen 0.13.2",
  "rustls",
@@ -2522,16 +2521,6 @@ dependencies = [
  "netdev",
  "socket2",
  "windows",
-]
-
-[[package]]
-name = "quicsock-noq"
-version = "0.1.0"
-dependencies = [
- "netdev",
- "noq",
- "quicsock",
- "tokio",
 ]
 
 [[package]]

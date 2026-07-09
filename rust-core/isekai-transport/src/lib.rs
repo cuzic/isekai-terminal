@@ -41,6 +41,18 @@
 //!   for exactly which parts of the Android implementation this does and
 //!   does not port (noq issue #738 means same-connection physical-interface
 //!   multipath is a confirmed dead end, not ported).
+//! - `multipath` (isekai-terminal-core/isekai-transport crate共有化):
+//!   `connect_multipath` holds a primary QUIC path plus any number of
+//!   secondary remote-address paths open simultaneously (`open_path`,
+//!   `local_ip: None`) — the proven-working half of
+//!   `multipath_transport.rs`'s Phase 9 work (path0/path1).
+//! - `physical_interface` (isekai-terminal-core/isekai-transport crate共有化):
+//!   binds a UDP socket to a specific physical network interface (via the
+//!   vendored `quicsock` crate) for
+//!   [`traits::QuicEndpointRebinder::rebind_socket`] — the CLI/PC side of
+//!   the proven-working reactive physical-interface failover
+//!   (`rebind_abstract()`, Phase 9-4b). Android's own rebind path does not
+//!   go through this module — see its docs.
 //!
 //! Explicitly **out of scope** for this phase (left for later phases per
 //! `archive/ISEKAI_SSH_DESIGN.md`'s フェーズ分割案):
@@ -65,6 +77,7 @@ pub mod error;
 pub mod generation_coordinator;
 pub mod multipath;
 pub mod path_health;
+pub mod physical_interface;
 pub mod proof;
 pub mod race;
 pub mod relay;
@@ -88,6 +101,7 @@ pub use candidate_provider::{
 };
 pub use error::TransportError;
 pub use multipath::{connect_multipath, MultipathConnection, SecondaryPath, PRIMARY_PATH_LABEL};
+pub use physical_interface::{bind_physical_interface, InterfaceIndex};
 pub use path_health::{
     classify_path_health, has_zero_response, notify_if_no_viable_path, spawn_health_monitor, PathHealthEvent,
     PathHealthTracker, PathLabel, PathState,
