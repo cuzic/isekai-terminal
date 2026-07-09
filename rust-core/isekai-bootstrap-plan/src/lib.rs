@@ -18,5 +18,5 @@ pub mod failure;
 pub mod plan;
 
 pub use budget::{BootstrapBudget, BootstrapPhase, BudgetError};
-pub use failure::BootstrapFailure;
+pub use failure::{classify_bootstrap_error, BootstrapFailure};
 pub use plan::{BootstrapPlan, BootstrapTarget, CredentialSource, JumpHost, PersistencePolicy, PlanError, RouteKind, RoutePolicy};

@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 isekai-trust = { path = "../isekai-trust" }
 isekai-bootstrap = { path = "../isekai-bootstrap" }
+isekai-bootstrap-plan = { path = "../isekai-bootstrap-plan" }
 isekai-auth = { path = "../isekai-auth" }
 isekai-pipe-core = { path = "../isekai-pipe-core" }
 isekai-release-verify = { path = "../isekai-release-verify" }

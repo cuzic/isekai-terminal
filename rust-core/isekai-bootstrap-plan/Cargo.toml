@@ -7,3 +7,6 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 isekai-bootstrap = { path = "../isekai-bootstrap" }
 thiserror = "2.0.18"
+
+[dev-dependencies]
+isekai-protocol = { path = "../isekai-protocol" }

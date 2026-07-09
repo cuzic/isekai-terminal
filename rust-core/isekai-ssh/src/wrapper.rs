@@ -14,6 +14,7 @@ use std::process::Stdio;
 use anyhow::{anyhow, Context, Result};
 use isekai_auth::TokenProvider;
 use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
+use isekai_bootstrap_plan::{classify_bootstrap_error, BootstrapFailure};
 use isekai_pipe_core::{
     default_profiles_dir, default_runtime_dir, load_persistent_profile, write_connection_intent,
     write_persistent_profile, BootstrapProvenance, ConnectionIntent, IntentTransport, PersistentProfile,
@@ -155,9 +156,10 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
     let intent = match build_connection_intent(&resolution) {
         Ok(intent) => intent,
         Err(err) if should_bootstrap(&plan, &resolution) => {
-            bootstrap_and_register(&plan, &resolution)
-                .await
-                .with_context(|| format!("{err}\nisekai-ssh: auto-bootstrap failed"))?;
+            if let Err(bootstrap_err) = bootstrap_and_register(&plan, &resolution).await {
+                print_bootstrap_failure_guidance(&bootstrap_err);
+                return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
+            }
             build_connection_intent(&resolution)
                 .context("isekai-ssh: still not trusted after auto-bootstrap")?
         }
@@ -279,6 +281,38 @@ fn select_transport(profile: &PersistentProfile, configured_stun_servers: &[Stri
     profile.to_legacy_relay_transport()
 }
 
+/// Looks for a [`BootstrapFailure`] attached anywhere in `err`'s context
+/// chain (`bootstrap_and_register`'s classifiable failure sites attach one
+/// via `anyhow::Error::context`, per `ISEKAI_PIPE_DESIGN.md` §8 Epic I) and,
+/// if found, prints an actionable next step to stderr — `isekai-ssh login`,
+/// `isekai-ssh init`, or "this looked transient, retrying may help" —
+/// instead of leaving the user to interpret a raw `ssh(1)`/QUIC error.
+/// Unclassified failures (no `BootstrapFailure` anywhere in the chain, e.g.
+/// a local `--via`/argument-validation error) print nothing extra here; the
+/// underlying error's own `Display` (propagated by the caller) is
+/// self-explanatory for those.
+///
+/// Deliberately calls `anyhow::Error::downcast_ref` directly on the
+/// top-level `err` rather than walking `err.chain()` and downcast-ing each
+/// `&dyn Error` frame: anyhow's context/downcast pairing (`Error::context`
+/// docs, "Effect on downcasting") is implemented as a custom vtable lookup
+/// on the top-level `anyhow::Error` that finds a `C` at *any* depth,
+/// including inside a `ContextError<C, E>` a plain `dyn
+/// Error::downcast_ref` on a chain frame cannot see (that only matches a
+/// frame whose *concrete* type is exactly `C`, which `ContextError` never is).
+fn print_bootstrap_failure_guidance(err: &anyhow::Error) {
+    let Some(failure) = err.downcast_ref::<BootstrapFailure>() else {
+        return;
+    };
+    if failure.should_redirect_to_login() {
+        eprintln!("isekai-ssh: {failure} — run `isekai-ssh login` and try again.");
+    } else if failure.should_redirect_to_init() {
+        eprintln!("isekai-ssh: {failure} — run `isekai-ssh init` to set up trust/credentials for this host.");
+    } else if failure.may_retry() {
+        eprintln!("isekai-ssh: {failure} — this looks transient; retrying may help.");
+    }
+}
+
 /// Deploys `isekai-helper` to the highest-priority bootstrap candidate and,
 /// after an explicit `[y/N]` confirmation, registers it in the trust store
 /// `build_connection_intent` reads from. Mirrors `init.rs`'s
@@ -301,6 +335,7 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
             "no --isekai-helper-binary given (or `isekai-ssh init` was never run for this host); \
              auto-bootstrap needs a local isekai-helper binary to upload"
         )
+        .context(BootstrapFailure::RemoteBinaryMissing)
     })?;
     let candidate = resolution
         .isekai
@@ -367,7 +402,11 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
         Some(relay_target) => {
             let relay_jwt = isekai_auth::FileTokenProvider::from_default_path()
                 .and_then(|provider| provider.get_relay_jwt())
-                .context("failed to load a relay token from `isekai-ssh login` — run `isekai-ssh login` first")?;
+                .map_err(|e| {
+                    anyhow::Error::new(e)
+                        .context("failed to load a relay token from `isekai-ssh login` — run `isekai-ssh login` first")
+                        .context(BootstrapFailure::TokenExpired)
+                })?;
             LaunchSpec::Relay(RelayLaunchSpec {
                 relay_addr: relay_target.relay_addr,
                 relay_sni: relay_target.relay_sni.clone(),
@@ -383,6 +422,14 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
     let report = backend
         .install_and_start(&target, via.as_ref(), &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
         .await
+        .map_err(|e| {
+            let failure = classify_bootstrap_error(&e);
+            let err = anyhow::Error::new(e);
+            match failure {
+                Some(f) => err.context(f),
+                None => err,
+            }
+        })
         .with_context(|| format!("failed to deploy/start isekai-helper on {:?}", candidate.target))?;
     let handshake = &report.handshake;
     let identity = handshake.cert_sha256().to_string();
@@ -426,7 +473,7 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
         .await
         .context("failed to read confirmation from stdin")?;
     if !matches!(line.trim(), "y" | "Y") {
-        return Err(anyhow!("aborted — user declined the trust confirmation"));
+        return Err(anyhow!("aborted — user declined the trust confirmation").context(BootstrapFailure::HostKeyRejected));
     }
 
     let profiles_dir =
@@ -450,7 +497,10 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
     };
     let profile = PersistentProfile::migrate_legacy_helper_trust(&key, &trust);
     let path = write_persistent_profile(&profiles_dir, &profile)
-        .with_context(|| format!("failed to write profile to {}", profiles_dir.display()))?;
+        .map_err(|e| {
+            anyhow::Error::new(e)
+                .context(BootstrapFailure::PersistenceFailed(format!("failed to write profile to {}", profiles_dir.display())))
+        })?;
     eprintln!("Registered {key:?} in {}", path.display());
     Ok(())
 }
@@ -1240,6 +1290,50 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn bootstrap_and_register_classifies_missing_helper_binary() {
+        let plan = WrapperPlan {
+            openssh_path: PathBuf::from("/usr/bin/ssh"),
+            pipe_path: PathBuf::from("/usr/bin/isekai-pipe"),
+            destination: "production".to_string(),
+            destination_index: 0,
+            ssh_args: Vec::new(),
+            isekai: WrapperIsekaiOptions::default(),
+        };
+        let resolution = WrapperResolution {
+            openssh: OpenSshEffectiveConfig::default(),
+            isekai: IsekaiConfig {
+                enabled: true,
+                bootstrap_policy: BootstrapPolicy::Auto,
+                profile: "production".to_string(),
+                remote_path: None,
+                services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
+                bootstrap_candidates: vec![BootstrapCandidate { target: "production:22".to_string(), via: Vec::new(), priority: 0 }],
+                link_endpoints: Vec::new(),
+                rendezvous: Vec::new(),
+                stun_servers: Vec::new(),
+                relay_endpoints: Vec::new(),
+                resume_grace_secs: 180,
+                candidate_race_delay_ms: 150,
+                relay_delay_ms: 750,
+                install_mode: InstallMode::User,
+                bootstrap_relay: None,
+            },
+        };
+
+        // `plan.isekai.helper_binary` is `None` (the default), so this
+        // returns before any filesystem/network I/O — the exact site this
+        // test targets is `bootstrap_and_register`'s first `ok_or_else`.
+        let err = bootstrap_and_register(&plan, &resolution).await.unwrap_err();
+        let failure = err
+            .downcast_ref::<BootstrapFailure>()
+            .expect("a classified BootstrapFailure should be attached to the error chain");
+        assert!(matches!(failure, BootstrapFailure::RemoteBinaryMissing));
+        assert!(failure.should_redirect_to_init());
+        assert!(!failure.should_redirect_to_login());
+        assert!(!failure.may_retry());
     }
 
     #[test]

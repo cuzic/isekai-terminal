@@ -118,6 +118,46 @@ impl BootstrapFailure {
     }
 }
 
+/// Classifies an `isekai_bootstrap::BootstrapBackend::install_and_start`
+/// failure into a [`BootstrapFailure`], per `ISEKAI_PIPE_DESIGN.md` §8 Epic I
+/// ("BootstrapFailure分類をwrapper.rsに配線"). `BootstrapError` doesn't carry
+/// enough structure to distinguish every real-world cause (`ssh(1)` reports
+/// most of it as opaque stderr text, and this crate deliberately never
+/// string-matches error messages — see the module doc), so a couple of
+/// choices below are a documented best fit rather than a certainty:
+///
+/// - `Io`/`HandshakeMissing`: no confirmed response from the remote at all,
+///   treated as connectivity (`JumpHostUnreachable`) even though `Io` can
+///   also mean `ssh(1)` itself is missing locally — retrying is harmless
+///   either way and is the more actionable default.
+/// - `UploadFailed`: whatever the root cause, the direct consequence is that
+///   `isekai-pipe` never landed on the remote, matching `RemoteBinaryMissing`
+///   (which already routes to `isekai-ssh init`, an interactive flow better
+///   equipped to surface the underlying `ssh(1)` stderr than a wrapper retry
+///   loop).
+/// - `UnexpectedStdout`/`HandshakeParse`: some response was received but
+///   couldn't be trusted (stdout-purity violation or schema mismatch) —
+///   bucketed with `RemoteBinaryUntrusted`, which is never auto-retried or
+///   routed around, matching the "don't execute what you can't validate"
+///   contract those two error variants exist to enforce.
+///
+/// Returns `None` for `InvalidRelayParam`/`InvalidRemotePath`: those are
+/// local argument-validation failures caught before ever contacting the
+/// remote host, i.e. a plan/config problem rather than a bootstrap *attempt*
+/// failure — the thing this classification exists to describe (honest gap,
+/// not silently mapped to the nearest variant).
+pub fn classify_bootstrap_error(err: &isekai_bootstrap::BootstrapError) -> Option<BootstrapFailure> {
+    use isekai_bootstrap::BootstrapError as E;
+    match err {
+        E::Io(_) => Some(BootstrapFailure::JumpHostUnreachable),
+        E::UploadFailed { .. } => Some(BootstrapFailure::RemoteBinaryMissing),
+        E::HandshakeMissing { .. } => Some(BootstrapFailure::JumpHostUnreachable),
+        E::UnexpectedStdout { .. } => Some(BootstrapFailure::RemoteBinaryUntrusted),
+        E::HandshakeParse(_) => Some(BootstrapFailure::RemoteBinaryUntrusted),
+        E::InvalidRelayParam(_) | E::InvalidRemotePath(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +224,32 @@ mod tests {
         assert!(!f.should_redirect_to_login());
         assert!(!f.should_redirect_to_init());
         assert!(!f.should_fallback_to_relay());
+    }
+
+    #[test]
+    fn classifies_bootstrap_error_variants() {
+        use isekai_bootstrap::BootstrapError;
+
+        let io = BootstrapError::Io(std::io::Error::other("broken pipe"));
+        assert!(matches!(classify_bootstrap_error(&io), Some(BootstrapFailure::JumpHostUnreachable)));
+
+        let upload_failed = BootstrapError::UploadFailed { status: Some(1), stderr: "permission denied".to_string() };
+        assert!(matches!(classify_bootstrap_error(&upload_failed), Some(BootstrapFailure::RemoteBinaryMissing)));
+
+        let handshake_missing = BootstrapError::HandshakeMissing { status: None, stderr: String::new() };
+        assert!(matches!(classify_bootstrap_error(&handshake_missing), Some(BootstrapFailure::JumpHostUnreachable)));
+
+        let unexpected_stdout = BootstrapError::UnexpectedStdout { extra_lines: 2 };
+        assert!(matches!(classify_bootstrap_error(&unexpected_stdout), Some(BootstrapFailure::RemoteBinaryUntrusted)));
+
+        let handshake_parse = BootstrapError::HandshakeParse(isekai_protocol::ProtocolError::UnknownFrameType(0xff));
+        assert!(matches!(classify_bootstrap_error(&handshake_parse), Some(BootstrapFailure::RemoteBinaryUntrusted)));
+
+        let invalid_relay = BootstrapError::InvalidRelayParam("bad sni".to_string());
+        assert!(classify_bootstrap_error(&invalid_relay).is_none());
+
+        let invalid_path = BootstrapError::InvalidRemotePath("bad path".to_string());
+        assert!(classify_bootstrap_error(&invalid_path).is_none());
     }
 
     #[test]
