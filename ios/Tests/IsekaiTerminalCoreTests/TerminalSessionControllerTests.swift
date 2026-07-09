@@ -156,7 +156,7 @@ final class TerminalSessionControllerTests: XCTestCase {
     // MARK: - Phase 1A-9(#30): isekai-helper/QUIC最小縦切り(transportPreference分岐)
     //
     // 実際のネットワーク接続は行わず、Android版`ConnectionProfile.toSshConfig`/
-    // `toHelperQuicConfig`相当の純粋なconfig構築ロジックと、`transportPreference`に
+    // `toIsekaiPipeQuicConfig`相当の純粋なconfig構築ロジックと、`transportPreference`に
     // 応じた分岐(未対応方式は`.failed`になること)だけを検証する。
 
     private func makeControllerWithProfile(
@@ -192,12 +192,12 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertTrue(config.allowNonLoopbackForwardBind)
     }
 
-    func testMakeHelperQuicConfigMapsProfileFields() throws {
+    func testMakeIsekaiPipeQuicConfigMapsProfileFields() throws {
         let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 2222, username: "user")
         let controller = try makeControllerWithProfile(profile)
         let jump = JumpConfig(host: "bastion.example.com", port: 22, username: "jumpuser", auth: .password(password: "jp"))
 
-        let config = controller.makeHelperQuicConfig(auth: .password(password: "pw"), jump: jump, cols: 100, rows: 40)
+        let config = controller.makeIsekaiPipeQuicConfig(auth: .password(password: "pw"), jump: jump, cols: 100, rows: 40)
 
         XCTAssertEqual(config.sshHost, "example.com")
         XCTAssertEqual(config.sshPort, 2222)
@@ -273,7 +273,7 @@ final class TerminalSessionControllerTests: XCTestCase {
 
     // MARK: - Phase 1E-7(#46): Tailscale⇔直接アドレスのマルチパス(config構築のみ、実接続なし)
 
-    func testMakeMultipathHelperQuicConfigMapsDirectAndCellularAddresses() throws {
+    func testMakeMultipathIsekaiPipeQuicConfigMapsDirectAndCellularAddresses() throws {
         let profile = ConnectionProfile(
             displayName: "test", host: "tailscale.example.com", port: 22, username: "user",
             directAddress: "203.0.113.5:4433",
@@ -281,7 +281,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         )
         let controller = try makeControllerWithProfile(profile)
 
-        let config = controller.makeMultipathHelperQuicConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+        let config = controller.makeMultipathIsekaiPipeQuicConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
 
         XCTAssertEqual(config.sshHost, "tailscale.example.com")
         XCTAssertEqual(config.directHost, "203.0.113.5:4433")
@@ -292,7 +292,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertNil(config.cellularLocalIp)
     }
 
-    func testMakeMultipathHelperQuicConfigTreatsBlankDirectAddressAsNil() throws {
+    func testMakeMultipathIsekaiPipeQuicConfigTreatsBlankDirectAddressAsNil() throws {
         for directAddress in [nil, "", "   "] {
             let profile = ConnectionProfile(
                 displayName: "test", host: "example.com", port: 22, username: "user",
@@ -300,7 +300,7 @@ final class TerminalSessionControllerTests: XCTestCase {
             )
             let controller = try makeControllerWithProfile(profile)
 
-            let config = controller.makeMultipathHelperQuicConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+            let config = controller.makeMultipathIsekaiPipeQuicConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
 
             XCTAssertNil(config.directHost)
         }
