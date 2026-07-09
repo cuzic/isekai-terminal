@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe"]
+members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe"]
 resolver = "2"
 
 [package]
