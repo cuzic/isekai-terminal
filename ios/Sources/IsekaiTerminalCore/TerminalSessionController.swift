@@ -49,7 +49,7 @@ private final class AgentSignResultBox: @unchecked Sendable {
     var approved = false
 }
 
-/// Phase 1A-9(#30): `SshSession`/`HelperQuicSession`など、生成される各セッション型は
+/// Phase 1A-9(#30): `SshSession`/`IsekaiPipeQuicSession`など、生成される各セッション型は
 /// 個別の`XxxSessionProtocol`にしか準拠していない(共通の親プロトコルが無い)ため、
 /// `TerminalSessionController`が接続方式を問わず同じ`send`/`resize`/`disconnect`
 /// 呼び出しで扱えるよう、この最小限のプロトコルへ同一モジュール内で事後適合させる。
@@ -66,10 +66,10 @@ private protocol ActiveTerminalSession: AnyObject {
     func notifyNetworkLost()
 }
 extension SshSession: ActiveTerminalSession {}
-extension HelperQuicSession: ActiveTerminalSession {}
+extension IsekaiPipeQuicSession: ActiveTerminalSession {}
 extension IsekaiStunP2pSession: ActiveTerminalSession {}
 extension IsekaiLinkRelaySession: ActiveTerminalSession {}
-extension MultipathHelperQuicSession: ActiveTerminalSession {}
+extension MultipathIsekaiPipeQuicSession: ActiveTerminalSession {}
 
 /// Android版`ConnectionProfile.DEFAULT_STUN_SERVER`と同じ既定STUNサーバー
 /// (双方が同じSTUNサーバーを使う必要は無いため、単なるデフォルト値)。
@@ -194,15 +194,15 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         case .plainSsh:
             connectPlainSsh(auth: auth, jump: jump, cols: cols, rows: rows)
         case .isekaiHelperQuic:
-            connectHelperQuic(auth: auth, jump: jump, cols: cols, rows: rows, allowFallback: false)
+            connectIsekaiPipeQuic(auth: auth, jump: jump, cols: cols, rows: rows, allowFallback: false)
         case .auto:
-            connectHelperQuic(auth: auth, jump: jump, cols: cols, rows: rows, allowFallback: true)
+            connectIsekaiPipeQuic(auth: auth, jump: jump, cols: cols, rows: rows, allowFallback: true)
         case .isekaiStunP2pQuic:
             connectIsekaiStunP2p(auth: auth, jump: jump, cols: cols, rows: rows)
         case .isekaiLinkRelayQuic:
             connectIsekaiLinkRelay(auth: auth, jump: jump, cols: cols, rows: rows)
         case .isekaiHelperQuicMultipath:
-            connectMultipathHelperQuic(auth: auth, jump: jump, cols: cols, rows: rows)
+            connectMultipathIsekaiPipeQuic(auth: auth, jump: jump, cols: cols, rows: rows)
         case .tsshdQuic:
             // Android版は対応済み(tsshdバイナリ経由の別実装、Phase 5B)だが、
             // iOS版のAndroid機能パリティ調査(#40〜#54)ではisekai-helper系を優先し
@@ -213,8 +213,8 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
 
     // MARK: - Config構築(ネットワークに触れない純粋なマッピング)
     //
-    // Android版`ConnectionProfile.toSshConfig`/`toHelperQuicConfig`相当。実際の
-    // セッション生成(`createSshSession`/`createHelperQuicSession`、Rust FFI越しの
+    // Android版`ConnectionProfile.toSshConfig`/`toIsekaiPipeQuicConfig`相当。実際の
+    // セッション生成(`createSshSession`/`createIsekaiPipeQuicSession`、Rust FFI越しの
     // ネットワーク処理)とは分離してあるため、`internal`スコープのままテストから
     // 直接呼び出して(ネットワークに触れずに)検証できる。
 
@@ -239,12 +239,12 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     }
 
     /// Phase 1A-9(#30): isekai-helper経由QUIC最小縦切り。Android版
-    /// `ConnectionProfile.toHelperQuicConfig`相当。ブートストラップ用の平文SSH接続
+    /// `ConnectionProfile.toIsekaiPipeQuicConfig`相当。ブートストラップ用の平文SSH接続
     /// (isekai-helperバイナリの配置)はRust側(`helper_bootstrap.rs`)が内部で行うため、
     /// Swift側は`SshConfig`と同様の接続情報(ポートフォワード/agent forward以外、
-    /// `HelperQuicConfig`にはまだ無い)を渡すだけでよい。
-    func makeHelperQuicConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> HelperQuicConfig {
-        HelperQuicConfig(
+    /// `IsekaiPipeQuicConfig`にはまだ無い)を渡すだけでよい。
+    func makeIsekaiPipeQuicConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> IsekaiPipeQuicConfig {
+        IsekaiPipeQuicConfig(
             sshHost: profile.host,
             sshPort: UInt16(profile.port),
             username: profile.username,
@@ -298,14 +298,14 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     }
 
     /// Phase 1E-7(#46): Tailscale⇔直接アドレスのマルチパス。Android版
-    /// `ConnectionProfile.toMultipathHelperQuicConfig`相当。`profile.directAddress`
+    /// `ConnectionProfile.toMultipathIsekaiPipeQuicConfig`相当。`profile.directAddress`
     /// (path1、任意)が空/未設定ならmultipath化されずpath0のみで動く(通常のhelper QUICと
     /// 同等の耐性、Rust側のドキュメント参照)。物理Wi-Fi/セルラー無線への同時バインド
     /// (`wifiFd`/`cellularFd`等、#47の対象)は現時点では未実装のため常にnilを渡す
     /// (Android版もnoq側の既知バグ(issue #738)により現在は事実上no-opで、
     /// 効果があるのはpath0/path1のTailscale⇔直接アドレス切替のみ)。
-    func makeMultipathHelperQuicConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> MultipathHelperQuicConfig {
-        MultipathHelperQuicConfig(
+    func makeMultipathIsekaiPipeQuicConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> MultipathIsekaiPipeQuicConfig {
+        MultipathIsekaiPipeQuicConfig(
             sshHost: profile.host,
             sshPort: UInt16(profile.port),
             directHost: profile.directAddress?.trimmingCharacters(in: .whitespaces).isEmpty == false ? profile.directAddress : nil,
@@ -335,10 +335,10 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         }
     }
 
-    /// Android版`connectHelperQuic(tab, config)`/`connectHelperQuicAuto(tab, config)`相当。
-    private func connectHelperQuic(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32, allowFallback: Bool) {
-        let config = makeHelperQuicConfig(auth: auth, jump: jump, cols: cols, rows: rows)
-        let newSession = createHelperQuicSession(config: config)
+    /// Android版`connectIsekaiPipeQuic(tab, config)`/`connectIsekaiPipeQuicAuto(tab, config)`相当。
+    private func connectIsekaiPipeQuic(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32, allowFallback: Bool) {
+        let config = makeIsekaiPipeQuicConfig(auth: auth, jump: jump, cols: cols, rows: rows)
+        let newSession = createIsekaiPipeQuicSession(config: config)
         session = newSession
         do {
             if allowFallback {
@@ -378,10 +378,10 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         }
     }
 
-    /// Android版`connectMultipathHelperQuic(tab, config)`相当。
-    private func connectMultipathHelperQuic(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
-        let config = makeMultipathHelperQuicConfig(auth: auth, jump: jump, cols: cols, rows: rows)
-        let newSession = createMultipathHelperQuicSession(config: config)
+    /// Android版`connectMultipathIsekaiPipeQuic(tab, config)`相当。
+    private func connectMultipathIsekaiPipeQuic(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
+        let config = makeMultipathIsekaiPipeQuicConfig(auth: auth, jump: jump, cols: cols, rows: rows)
+        let newSession = createMultipathIsekaiPipeQuicSession(config: config)
         session = newSession
         do {
             try newSession.connect(callback: self)
