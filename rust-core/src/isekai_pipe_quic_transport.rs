@@ -407,20 +407,7 @@ pub(crate) async fn bootstrap_helper_via_ssh(
 
 // ── QUIC 接続（HELLO/ACK ハンドシェイク） ───────────────
 
-/// `cert_sha256_hex` にピン留めした QUIC connection を確立する。初回接続・
-/// reattach（`RESUME`）のどちらからも呼ばれる共通処理。
-async fn establish_quic_connection(remote: SocketAddr, cert_sha256_hex: &str) -> Result<noq::Connection, String> {
-    // 実機検証 (Phase 7-5) 用: `debug_fault` 経由で有効化されない限り
-    // `FaultyUdpSocket` は素通しで、通常利用時の挙動には影響しない。
-    let socket = crate::faulty_udp_socket::bind_faulty_udp_socket(
-        "0.0.0.0:0".parse().unwrap(),
-        crate::debug_fault::shared_injector(),
-    )
-    .map_err(|e| format!("endpoint bind failed: {e}"))?;
-    establish_quic_connection_with_socket(socket, remote, cert_sha256_hex).await
-}
-
-/// `establish_quic_connection` の中身のうち、ソケットを事前に用意して渡したい呼び出し元
+/// `establish_quic_connection_with_socket`の中身のうち、ソケットを事前に用意して渡したい呼び出し元
 /// （Phase 10: `isekai_stun_p2p_transport.rs` が STUN 問い合わせ・穴あけ probe 送信に
 /// 使ったのと同一のソケットを、そのまま QUIC endpoint にも使い回したい）向けの下請け関数。
 pub(crate) async fn establish_quic_connection_with_socket(
@@ -643,6 +630,12 @@ pub(crate) async fn resolve_direct_by_bootstrap_host(
         .ok_or_else(|| format!("no address resolved for direct-by-bootstrap-host {bootstrap_host}:{port}"))
 }
 
+/// isekai-transport::relay::RelayTarget"の`server_name`はisekai-pipe serveが
+/// 一切検証しない固定文字列でよい(`RemoteSpec::server_name`のdocコメント参照、
+/// 証明書検証は`cert_sha256_hex`のピン留めのみで行う)。Android側3経路(direct/
+/// relay/STUN)で揃えて使ってきた既存の値をそのまま踏襲する。
+const QUIC_SERVER_NAME: &str = "isekai-pipe.local";
+
 async fn connect_isekai_pipe_quic_stream(
     ssh_host: &str,
     handshake: &IsekaiPipeHandshake,
@@ -653,14 +646,16 @@ async fn connect_isekai_pipe_quic_stream(
         .decode(&handshake.session_secret)
         .map_err(|e| format!("invalid session_secret encoding: {e}"))?;
 
-    let conn = establish_quic_connection(remote, &cert_sha256_hex).await?;
-
-    // control stream の CONTROL_HELLO で使う plain proof（exporter のみ、ATTACH の
-    // transcript 付き proof とは別物）。ATTACH ハンドシェイク自体は attach_handshake が
-    // 独自に transcript 付き proof を計算する。
-    let proof = compute_proof(&conn, &session_secret, b"")?;
-
-    let (send, recv) = attach_handshake(&conn, &session_secret).await?;
+    let target = isekai_transport::RelayTarget {
+        helper_addr: remote,
+        server_name: QUIC_SERVER_NAME.to_string(),
+        cert_sha256_hex,
+        session_secret,
+    };
+    let factory = crate::android_quic_endpoint::AndroidQuicEndpointFactory;
+    let (conn, data_stream, proof) = isekai_transport::connect_via_relay_with_connection(&factory, &target)
+        .await
+        .map_err(|e| e.to_string())?;
     info!("isekai_pipe_quic: ATTACH ok — handing off to SSH");
 
     let resume_state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(
@@ -673,20 +668,29 @@ async fn connect_isekai_pipe_quic_stream(
     // ここで await してしまうと旧 helper 相手に毎回 CONTROL_STREAM_TIMEOUT 分
     // シェル開始が遅延する（isekai-helper 側の e2e テストで実際に踏んだ
     // リグレッションと同種の問題）。control stream の確立は背後タスクとして
-    // 並行に進める。
+    // 並行に進める。`conn`はここでしか使わないためそのままmoveする
+    // （isekai-transportの`Box<dyn QuicConnection>`は`noq::Connection`と違い
+    // `Clone`ではないが、streamが内部でconnectionを生かし続けるため元々clone
+    // する必要は無かった）。
     {
-        let conn = conn.clone();
-        let proof = proof.to_vec();
         let resume_state = resume_state.clone();
         RUNTIME.spawn(async move {
-            match tokio::time::timeout(CONTROL_STREAM_TIMEOUT, open_control_stream(&conn, &proof)).await {
-                Ok(Ok((csend, crecv, session_id))) => {
+            match tokio::time::timeout(
+                CONTROL_STREAM_TIMEOUT,
+                isekai_transport::resume::open_control_stream(conn.as_ref(), &proof),
+            )
+            .await
+            {
+                Ok(Ok(control)) => {
+                    let session_id = *control.session_id.as_bytes();
                     info!(
                         "isekai_pipe_quic: control stream established (resume support enabled), session_id={}",
                         session_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
                     );
                     resume_state.lock().unwrap().session_id = Some(session_id);
-                    spawn_app_ack_tasks(csend, crecv, resume_state);
+                    let counters = Arc::new(isekai_transport::resume::AppAckCounters::new());
+                    isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
+                    spawn_app_ack_bridge(resume_state, counters);
                 }
                 Ok(Err(e)) => {
                     info!("isekai_pipe_quic: control stream handshake failed ({e}), continuing without resume support");
@@ -699,24 +703,56 @@ async fn connect_isekai_pipe_quic_stream(
     }
 
     // Phase 8-3: QUIC connection が失われても RESUME で reattach する
-    // クロージャ。`remote`/`cert_sha256_hex`/`session_secret` を捕捉する。
+    // クロージャ。`target`を捕捉する。
     let reattach_fn: resume_client::ReattachFn = Arc::new(move |session_id, client_sent_offset, client_delivered_offset| {
-        let cert_sha256_hex = cert_sha256_hex.clone();
-        let session_secret = session_secret.clone();
+        let factory = crate::android_quic_endpoint::AndroidQuicEndpointFactory;
+        let target = target.clone();
         Box::pin(async move {
-            let conn = establish_quic_connection(remote, &cert_sha256_hex).await?;
-            let result = send_resume_and_await_ack(&conn, &session_secret, session_id, client_sent_offset, client_delivered_offset).await?;
-            info!("isekai_pipe_quic: resume succeeded, helper_committed_offset={}", result.helper_committed_offset);
-            Ok(result)
+            let outcome = isekai_transport::resume::reconnect_and_resume(
+                &factory,
+                &target,
+                isekai_transport::SessionId::from_bytes(session_id),
+                isekai_transport::C2hSentOffset::new(client_sent_offset),
+                isekai_transport::H2cClientDeliveredOffset::new(client_delivered_offset),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            info!("isekai_pipe_quic: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
+            let (read, write) = outcome.data_stream.split();
+            Ok(resume_client::ReattachResult { read, write, helper_committed_offset: outcome.helper_committed_offset.get() })
         })
     });
 
-    Ok(resume_client::ReattachableStream::new(
-        Box::new(crate::android_quic_endpoint::AndroidByteStreamReadHalf::new(recv)),
-        Box::new(crate::android_quic_endpoint::AndroidByteStreamWriteHalf::new(send)),
-        resume_state,
-        reattach_fn,
-    ))
+    let (data_read, data_write) = data_stream.split();
+    Ok(resume_client::ReattachableStream::new(data_read, data_write, resume_state, reattach_fn))
+}
+
+/// isekai-transportの`AppAckCounters`(atomicベース)とAndroid側の
+/// `ClientResumeState`(replay_buffer/client_delivered_offsetベース)を
+/// 定期的に橋渡しする。`isekai_transport::resume::spawn_app_ack_tasks`は
+/// `AppAckCounters`のみを更新するため、`resume_client::ReattachableStream`が
+/// 既に使っている`ClientResumeState`ベースのreplay/offset管理と直接には
+/// つながらない — 200ms間隔(APP_ACK自体の送信間隔と同じ)でどちらの方向も
+/// 同期する(isekai-terminal-core/isekai-transport crate共有化 Phase 1c)。
+fn spawn_app_ack_bridge(
+    resume_state: Arc<std::sync::Mutex<ClientResumeState>>,
+    counters: Arc<isekai_transport::resume::AppAckCounters>,
+) {
+    RUNTIME.spawn(async move {
+        let mut last_delivered_synced = 0u64;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let current_delivered = {
+                let mut st = resume_state.lock().unwrap();
+                st.replay_buffer.advance_start(counters.c2h_helper_committed_offset());
+                st.client_delivered_offset
+            };
+            if current_delivered > last_delivered_synced {
+                counters.advance_h2c_client_delivered_offset(current_delivered - last_delivered_synced);
+                last_delivered_synced = current_delivered;
+            }
+        }
+    });
 }
 
 /// control stream を開き、`CONTROL_HELLO` を送って `CONTROL_ACK` を待つ。
