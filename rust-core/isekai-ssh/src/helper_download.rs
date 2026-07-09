@@ -5,15 +5,21 @@
 //! no way to source a binary to upload without the user supplying one by
 //! hand on every invocation).
 //!
-//! **This project does not publish GitHub Releases yet** (`isekai-release-verify`'s
-//! Epic D deliberately deferred that — signing-key generation/storage policy
-//! is unconfirmed). This module is therefore honestly incomplete in
-//! practice today: the download will 404 until a real release matching the
-//! naming convention below exists. Callers (`wrapper.rs`/`init.rs`) treat a
-//! failure here as just one more reason to fall back to the pre-existing
-//! "pass `--helper-binary` explicitly, or run `isekai-ssh init`" error — no
-//! behavior regresses, this only adds a chance of success before that
-//! fallback.
+//! **This project does not publish GitHub Releases yet**, so this module is
+//! honestly incomplete in practice today: the download will 404 until a real
+//! release matching the naming convention below exists. Callers
+//! (`wrapper.rs`/`init.rs`) treat a failure here as just one more reason to
+//! fall back to the pre-existing "pass `--helper-binary` explicitly, or run
+//! `isekai-ssh init`" error — no behavior regresses, this only adds a chance
+//! of success before that fallback.
+//!
+//! Integrity checking is sha256-only (`.sha256` sidecar, below) — signed
+//! release manifests (`isekai-release-verify`) were tried in an earlier
+//! iteration of this project and deliberately removed: GitHub's own
+//! HTTPS/infrastructure already protects the download path, and ed25519
+//! signing only adds protection against GitHub itself being compromised,
+//! which is disproportionate for this project's threat model
+//! (`ISEKAI_PIPE_DESIGN.md` §8 Epic D).
 //!
 //! HTTP client: `ureq` (blocking), same choice and same `tokio::task::
 //! spawn_blocking`-wrapping convention as `isekai-auth::oauth`/`device_flow`
@@ -121,14 +127,13 @@ pub fn default_helper_cache_dir() -> std::io::Result<PathBuf> {
 /// `build-isekai-pipe-musl.sh`'s own sidecar convention) if present, and
 /// verifies `bytes` against it. A missing sidecar (404) is *not* a failure —
 /// no real release exists yet to guarantee one, so this is best-effort
-/// integrity checking, not authentication (opt-in `--helper-manifest`
-/// signature verification, applied by the caller after this function
-/// returns, is what actually authenticates the binary).
+/// integrity checking (the only integrity checking this project does —
+/// see this module's docs for why signing was deliberately not added).
 fn verify_sha256_sidecar_if_present(agent: &ureq::Agent, sidecar_url: &str, bytes: &[u8]) -> Result<()> {
     let response = match agent.get(sidecar_url).call() {
         Ok(response) => response,
         Err(ureq::Error::StatusCode(404)) => {
-            log::warn!("isekai-ssh: no .sha256 sidecar at {sidecar_url} — skipping integrity check (no signed manifest either unless --helper-manifest was given)");
+            log::warn!("isekai-ssh: no .sha256 sidecar at {sidecar_url} — skipping integrity check");
             return Ok(());
         }
         Err(e) => anyhow::bail!("isekai-ssh: failed to fetch sha256 sidecar {sidecar_url}: {e}"),

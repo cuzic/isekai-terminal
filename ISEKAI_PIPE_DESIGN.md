@@ -128,7 +128,7 @@ cached_session_secret = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
 ```
 
 `update_policy`は閉じたenum(`ExactDigestOnly`のみ)で、serdeが未知のvariantをfail closedで
-拒否する。署名検証(release signing key)は未実装。
+拒否する。署名検証(release signing key)は導入しない方針(恒久決定、§8 Epic D参照)。
 
 **PersistentProfile migration path**(`isekai-pipe-core::profile`): `known_helpers.toml`から
 chatgpt.md §13相当の新schema(`peer_id`/`link_endpoints`/`stun_servers`/`relay_endpoints`/
@@ -285,10 +285,10 @@ resume window超過時は明示的にstdin/stdoutをクローズし、`std::proc
   含める。`session_id`を知っているだけでresumeできてはならない。
 - `relay_jwt`はargvではなくファイル経由(`--relay-jwt-file`)で渡す。`relay_sni`/`relay_jwt`は
   シェル補間前にシェルクォート+厳格な許容文字集合で検証する。
-- helper identity keyとrelease signing keyは別概念。`isekai-ssh init --helper-manifest`で
-  ed25519署名付きmanifestのopt-in検証ができる(`isekai-release-verify`crate、§8 Epic D)が、
-  実際の署名鍵の発行・埋め込みはまだ無い(検証機構のみ)。`update_policy`は`exact-digest-only`
-  のみで、いずれの検証結果も自動更新可否の判断には未接続。
+- helper identity keyとrelease signing keyは別概念。release signingは実装したうえで
+  恒久的に不採用と判断し撤去した(§8 Epic D参照)。バイナリの完全性はダウンロード時の
+  `.sha256`サイドカー照合と、`trusted_helper_sha256`(`update_policy = exact-digest-only`)
+  による記憶だけで担保する。
 
 ## 8. 既知のギャップ・今後の課題
 
@@ -444,54 +444,35 @@ enum BootstrapFailure {
   install/start、reconnect/resume)は、環境依存のため本Epicとは別枠(P2、release checklist側)
   で扱う。
 
-### Epic D: リリース成果物の署名検証(公開配布のRelease Gate)— manifest検証機構+wrapper配線まで完了(2026-07-09)
+### Epic D: リリース成果物の署名検証 — 実装したうえで撤去、sha256のみを恒久方針とする(2026-07-09)
 
 対象は`known_helpers.toml`ではなく、リモートbootstrapで配置する`isekai-pipe`等の**リリース
-成果物**。SHA-256のみでは、artifactとdigestを同じ配布元から取得している限り攻撃者が両方を
-差し替えられるため不十分。
+成果物**。当初はSHA-256のみでは、artifactとdigestを同じ配布元から取得している限り攻撃者が
+両方を差し替えられるため不十分と考え、ed25519署名によるmanifest検証機構(`isekai-release-verify`
+crate、`isekai-ssh init --helper-manifest`/`--trusted-release-key`/`--expect-platform`/
+`--expect-architecture`、および`wrapper.rs`の自動bootstrap経路への同フラグの配線)を実装した
+(`isekai-ssh`のunit test 41件・e2e 20本を含め全てgreenの状態まで完成させた)。
 
-着手前に調査した結果、**現時点でGitHub Releaseによる配布自体が一切存在しない**
-(`isekai-ssh/README.md`「まだGitHub Releaseとして配布していないので、現状はソースから
-ビルドする」)ことが判明した。したがって「配布元が改ざんされたバイナリを自動ダウンロードする」
-という本来のRelease Gateの脅威モデルは今は成立しないが、「ユーザーが手元でGitHub Releaseから
-ダウンロードした(と思っている)バイナリを`init --helper-binary`に渡す」ケースは今でも現実の
-脅威(配布ページの改ざん・MITM)であり、そちらを守る検証機構だけを先に実装した。**鍵の実際の
-生成・保管・ローテーション方針の確定とCI署名パイプラインの構築は、実際にGitHub Releaseの配布を
-開始するタイミングまで意図的に保留している**(このセッションでの判断、ユーザー確認済み)。
+その後、この署名検証機構が実際に守る脅威モデルをユーザーと議論した結果、**この規模の
+プロジェクトには過剰であり不要**と判断し、実装済みだった署名検証機構一式を完全に撤去した:
 
-- ✅ 新規crate`rust-core/isekai-release-verify/`: `ReleaseManifest`
-  (version/platform/architecture/artifact_filename/size/sha256/protocol_compat/
-  release_channel/key_id)と、その正規化JSONバイト列に対するed25519署名を持つ`SignedManifest`。
-  `TrustedReleaseKeys`(key_id→公開鍵のレジストリ、鍵の実際の出所には無関係)と
-  `verify_artifact`(signature検証→platform/architecture一致→size一致→SHA-256一致の順で検証し、
-  署名を検証する前にmanifestの中身を一切信用しない設計)を実装。I/Oフリー・17ユニットテスト。
-- ✅ `isekai-ssh init`に`--helper-manifest <path>`/`--trusted-release-key <key_id=hexpubkey>`
-  (複数指定可)/`--expect-platform`/`--expect-architecture`をopt-inフラグとして追加。
-  `--helper-manifest`を指定した場合のみ検証が走り、失敗時はSSH接続を一切行わずに終了する
-  (デプロイ前に検証が完了するため、実sshdもモックサーバーも不要にテストできる)。指定しない
-  場合は既存の挙動と完全に同じ(デフォルトoff)。
-- ✅ テスト: `isekai-ssh/src/init.rs`内のunit test 5件(正常系・改ざんバイナリ・信頼鍵なし・
-  expect-platform未指定・署名者と異なる鍵を信頼している場合)と、実バイナリを起動してCLI配線を
-  検証するprocess-level e2eテスト`isekai-ssh/tests/init_manifest_verification_e2e.rs`2件。
-- ✅ `wrapper.rs`の自動bootstrap経路(`bootstrap_and_register`)への同フラグの追加、
-  完了(2026-07-09)。`--isekai-helper-manifest`/`--isekai-trusted-release-key`(複数可)/
-  `--isekai-expect-platform`/`--isekai-expect-architecture`を追加し、`init.rs`の
-  `verify_helper_manifest`を`&InitArgs`から切り離して(`pub(crate)`、primitive引数)
-  wrapperからも同じ検証ロジックを呼べるようにした。検証失敗は`BootstrapFailure::
-  RemoteBinaryUntrusted`として分類し(Epic I)、`isekai-ssh init`への誘導メッセージが出る。
-  確認メッセージは`init`(stdout)と違い`eprintln!`(stderr)——wrapperのstdout purity契約
-  (`ProxyCommand`経由でsshに丸ごと渡る)を守るため。テスト: `wrapper.rs`内のunit test2件
-  (CLI解析・信頼鍵無しでの検証失敗が`RemoteBinaryUntrusted`に分類されること)。既存の
-  `isekai-ssh`テスト(unit 41件・e2e 20本)は全てgreenのまま。
-- 未着手として意図的に残している点:
-  - offline release signing keyの実際の生成・保管方式、key ID運用、鍵ローテーション・
-    emergency revocation方針の確定。
-  - CI側でのrelease signing・manifest生成・鍵ローテーションtestは、実際にGitHub Releaseでの
-    配布を開始するまで意味を持たないため保留。
-  - 「一時ファイルのままinstallせず既存バイナリを維持する」という受け入れ条件は、今回配線した
-    `init`が対象にしている**ローカルの`--helper-binary`**に対する検証であり、リモート側への
-    アップロード・install自体の話ではないため該当しない(将来、実際のダウンロード→install
-    パイプラインができた時点で改めて検討する)。
+- GitHub Releaseからのダウンロード自体は既にHTTPS+GitHub自身のインフラで保護されている。
+  ed25519署名を追加で載せても守れるのは「GitHub自体が侵害された」というケースだけで、
+  個人規模のツールとしては非現実的な脅威モデルに対する防御になってしまう。
+- 一方で「同じ配布元がartifactとdigestの両方を差し替えられる」という懸念自体は正しいため、
+  sha256サイドカー照合(`isekai-ssh/src/helper_download.rs`)と、`init`/自動bootstrap時に
+  アップロードした実体のsha256を`trusted_helper_sha256`として記憶しておく既存の仕組み
+  (`update_policy = exact-digest-only`)は維持する。TOFU(`[y/N]`)確認も維持する
+  (これは変更しない、ユーザー明示指示)。
+
+撤去した内容: `rust-core/isekai-release-verify/`crate全体、`isekai-ssh`側の
+`--helper-manifest`/`--trusted-release-key`/`--expect-platform`/`--expect-architecture`
+(および`--isekai-`プレフィックス版)フラグと検証呼び出し(`init.rs`/`wrapper.rs`)、
+関連テスト(`init.rs`内unit test 5件・`wrapper.rs`内unit test 2件・process-level e2e
+`init_manifest_verification_e2e.rs`)、workspace `Cargo.toml`のmembers。
+
+鍵の生成・保管・ローテーション方針やCI署名パイプラインは、上記の理由によりそもそも
+不要と判断したため、今後も導入しない(「保留中」ではなく恒久決定)。
 
 ### Epic E: `isekai-pipe inspect`(P1)— 完了(2026-07-08)
 
@@ -814,11 +795,11 @@ sshを実行する」実装は避ける。
    isekai-ssh`がmuslアーティファクトを要求するようになる罠を避けるため)。
 
 2番の解決策として、ユーザーの選択によりGitHub Releasesからの自動ダウンロード機構を
-実装した。**このプロジェクトはまだGitHub Release配布を一切始めていない**(Epic Dで
-確認済み: 署名鍵の生成・保管方針が未確定のため意図的に保留中)ため、今回のスコープは
-isekai-ssh側の自動ダウンロード機構の実装のみとし、実際にGitHub Releaseを発行するCI
-ワークフロー・署名鍵の生成/保管・実在するrelease assetの用意は対象外(honest gap、
-README「既知の制限」に明記)。
+実装した。**このプロジェクトはまだGitHub Release配布を一切始めていない**ため、今回の
+スコープはisekai-ssh側の自動ダウンロード機構の実装のみとし、実際にGitHub Releaseを
+発行するCIワークフロー・実在するrelease assetの用意は対象外(honest gap、README
+「既知の制限」に明記)。署名鍵の生成/保管は、Epic Dで実装したうえで恒久的に不要と
+判断し撤去済みのため、そもそも対象外。
 
 - ✅ **リモートアーキテクチャ検出**: `isekai-bootstrap::openssh::OpenSshBackend::
   detect_remote_arch(target, via)`を追加。`uname -m`を単独のssh(1)ラウンドトリップとして
@@ -843,8 +824,8 @@ README「既知の制限」に明記)。
   明示指定時はアーキ検出・ダウンロードを一切スキップし、既存ユーザーの挙動・性能に
   影響を与えない。`--helper-release-repo`/`--helper-release-tag`(init)・
   `--isekai-helper-release-repo`/`--isekai-helper-release-tag`(wrapper)を追加
-  (既定`cuzic/isekai-terminal`/latest)。マニフェスト検証(`--helper-manifest`)は
-  ダウンロード結果に対してもそのまま適用できる(新しい検証ロジックは追加していない)。
+  (既定`cuzic/isekai-terminal`/latest)。整合性検証はダウンロード時の`.sha256`サイドカー
+  照合のみ(Epic D参照、署名検証は導入しない)。
 - ✅ テスト: `isekai-bootstrap`に`normalize_uname_arch`のunit test + 実sshd越しの
   `detect_remote_arch`統合test。`helper_download`にURL構築/キャッシュパス計算の純粋関数
   unit testと、ローカルmock HTTPサーバー(このcrateの既存mock STUN serverと同じ

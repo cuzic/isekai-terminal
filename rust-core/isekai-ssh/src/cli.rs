@@ -162,39 +162,6 @@ pub struct InitArgs {
     /// disable STUN candidate exchange (today's pre-`#20b` behavior).
     #[arg(long = "stun-server", value_name = "ADDR:PORT")]
     pub stun_servers: Vec<SocketAddr>,
-
-    /// Signed release manifest (`isekai_release_verify::SignedManifest` JSON)
-    /// covering `--helper-binary`. When given, `init` verifies the binary's
-    /// signature/size/digest/platform/architecture against it
-    /// (`isekai-release-verify`, `ISEKAI_PIPE_DESIGN.md` §8 Epic D) *before*
-    /// deploying, and refuses to proceed on any mismatch. Optional and
-    /// off by default — this only adds a check on top of the existing
-    /// SHA-256-pinning trust model, it never replaces it.
-    #[arg(long, value_name = "PATH")]
-    pub helper_manifest: Option<PathBuf>,
-
-    /// One release-signing public key to trust for `--helper-manifest`
-    /// verification, as `<key_id>=<hex-ed25519-pubkey>`. Repeatable — a
-    /// manifest is accepted if its own `key_id` field matches one of these.
-    /// Required (at least one) when `--helper-manifest` is given; ignored
-    /// otherwise. There is deliberately no embedded default key yet: no
-    /// release-signing key exists until real GitHub Releases are published
-    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic D).
-    #[arg(long = "trusted-release-key", value_name = "KEY_ID=HEXPUBKEY")]
-    pub trusted_release_keys: Vec<String>,
-
-    /// The platform `--helper-manifest` must declare (e.g. `linux`) —
-    /// required when `--helper-manifest` is given, so a validly signed
-    /// manifest for the wrong platform is still rejected rather than
-    /// silently deployed.
-    #[arg(long, value_name = "PLATFORM")]
-    pub expect_platform: Option<String>,
-
-    /// The architecture `--helper-manifest` must declare (e.g. `x86_64`) —
-    /// required when `--helper-manifest` is given, same rationale as
-    /// `--expect-platform`.
-    #[arg(long, value_name = "ARCH")]
-    pub expect_architecture: Option<String>,
 }
 
 #[derive(Args)]

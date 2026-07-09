@@ -1484,18 +1484,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "isekai-release-verify"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "isekai-ssh"
 version = "0.1.0"
 dependencies = [
@@ -1503,7 +1491,6 @@ dependencies = [
  "async-trait",
  "base64",
  "clap",
- "ed25519-dalek",
  "env_logger",
  "glob",
  "isekai-auth",
@@ -1511,7 +1498,6 @@ dependencies = [
  "isekai-bootstrap-plan",
  "isekai-pipe-core",
  "isekai-protocol",
- "isekai-release-verify",
  "isekai-trust",
  "log",
  "russh",

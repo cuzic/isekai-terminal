@@ -27,7 +27,6 @@ use anyhow::{anyhow, Context, Result};
 use isekai_auth::TokenProvider;
 use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
 use isekai_pipe_core::{default_profiles_dir, write_persistent_profile, PersistentProfile};
-use isekai_release_verify::{verify_artifact, ExpectedTarget, SignedManifest, TrustedReleaseKeys};
 use isekai_trust::{HelperTrust, UpdatePolicy};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -53,21 +52,6 @@ pub async fn run(args: InitArgs) -> Result<()> {
          (or check --helper-release-repo/--helper-release-tag)",
     )?;
     let helper_sha256 = hex_sha256(&helper_binary);
-
-    if let Some(manifest_path) = &args.helper_manifest {
-        let signed = verify_helper_manifest(
-            manifest_path,
-            &args.trusted_release_keys,
-            args.expect_platform.as_deref(),
-            args.expect_architecture.as_deref(),
-            &helper_binary,
-        )
-        .with_context(|| "isekai-ssh: release manifest verification failed — refusing to deploy an unverified binary".to_string())?;
-        println!(
-            "Release manifest verified: version={} key_id={} channel={}",
-            signed.manifest.version, signed.manifest.key_id, signed.manifest.release_channel
-        );
-    }
 
     let relay_jwt = resolve_relay_jwt(&args)?;
     let relay = RelayLaunchSpec {
@@ -174,50 +158,6 @@ fn resolve_relay_jwt(args: &InitArgs) -> Result<String> {
 fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Loads `--helper-manifest`, builds a [`TrustedReleaseKeys`] registry from
-/// `--trusted-release-key`, and verifies `helper_binary` against it
-/// (`isekai-release-verify`, `ISEKAI_PIPE_DESIGN.md` §8 Epic D). Returns an
-/// error — never deploys — on any verification failure.
-/// Verifies `helper_binary` against a signed release manifest
-/// (`isekai-release-verify`, `ISEKAI_PIPE_DESIGN.md` §8 Epic D), returning
-/// the verified `SignedManifest` on success. Takes primitive parameters
-/// rather than `&InitArgs` so `wrapper.rs`'s auto-bootstrap path
-/// (`ISEKAI_PIPE_DESIGN.md` §8 Epic D's "未着手として意図的に残している点":
-/// this flag set was wired to `init` only) can call the exact same
-/// verification logic with its own `--isekai-*`-prefixed flags — the two
-/// commands' argument-parsing shapes differ, but the check itself
-/// shouldn't be duplicated.
-pub(crate) fn verify_helper_manifest(
-    manifest_path: &std::path::Path,
-    trusted_release_keys: &[String],
-    expect_platform: Option<&str>,
-    expect_architecture: Option<&str>,
-    helper_binary: &[u8],
-) -> Result<SignedManifest> {
-    let manifest_bytes = std::fs::read(manifest_path)
-        .with_context(|| format!("failed to read --helper-manifest at {}", manifest_path.display()))?;
-    let signed: SignedManifest = serde_json::from_slice(&manifest_bytes)
-        .with_context(|| format!("failed to parse --helper-manifest at {} as a signed release manifest", manifest_path.display()))?;
-
-    let mut keys = TrustedReleaseKeys::new();
-    for entry in trusted_release_keys {
-        let (key_id, hex_pubkey) = entry
-            .split_once('=')
-            .ok_or_else(|| anyhow!("invalid --trusted-release-key {entry:?}: expected KEY_ID=HEXPUBKEY"))?;
-        keys.insert_hex(key_id, hex_pubkey).with_context(|| format!("invalid --trusted-release-key for key_id {key_id:?}"))?;
-    }
-    if keys.is_empty() {
-        return Err(anyhow!("--helper-manifest was given but no --trusted-release-key was provided"));
-    }
-    let expect_platform = expect_platform.ok_or_else(|| anyhow!("--expect-platform is required when --helper-manifest is given"))?;
-    let expect_architecture =
-        expect_architecture.ok_or_else(|| anyhow!("--expect-architecture is required when --helper-manifest is given"))?;
-
-    verify_artifact(&signed, helper_binary, &keys, ExpectedTarget { platform: expect_platform, architecture: expect_architecture })
-        .map_err(|e| anyhow!("{e}"))?;
-    Ok(signed)
 }
 
 /// Current UTC time formatted as RFC 3339 (`trusted_at`/`last_seen_at` are
@@ -377,10 +317,6 @@ mod tests {
             release_channel: None,
             idle_lifetime: 2_592_000,
             stun_servers: Vec::new(),
-            helper_manifest: None,
-            trusted_release_keys: Vec::new(),
-            expect_platform: None,
-            expect_architecture: None,
         }
     }
 
@@ -445,115 +381,4 @@ mod tests {
         assert!(resolve_relay_jwt(&args).is_err());
     }
 
-    fn signed_manifest_for(binary: &[u8], signing_key: &ed25519_dalek::SigningKey) -> isekai_release_verify::SignedManifest {
-        isekai_release_verify::sign_manifest(
-            isekai_release_verify::ReleaseManifest {
-                version: "0.5.0".to_string(),
-                platform: "linux".to_string(),
-                architecture: "x86_64".to_string(),
-                artifact_filename: "isekai-pipe".to_string(),
-                size: binary.len() as u64,
-                sha256: hex_sha256(binary),
-                protocol_compat: "isekai-pipe/1".to_string(),
-                release_channel: "stable".to_string(),
-                key_id: "test-key".to_string(),
-            },
-            signing_key,
-        )
-    }
-
-    fn write_manifest(dir: &std::path::Path, signed: &isekai_release_verify::SignedManifest) -> std::path::PathBuf {
-        let path = dir.join("manifest.json");
-        std::fs::write(&path, serde_json::to_vec(signed).unwrap()).unwrap();
-        path
-    }
-
-    #[test]
-    fn verify_helper_manifest_accepts_a_valid_matching_manifest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let binary = b"pretend-isekai-pipe-bytes".to_vec();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let signed = signed_manifest_for(&binary, &signing_key);
-        let manifest_path = write_manifest(tmp.path(), &signed);
-
-        let mut args = sample_init_args();
-        let pubkey_hex: String = signing_key.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        args.trusted_release_keys = vec![format!("test-key={pubkey_hex}")];
-        args.expect_platform = Some("linux".to_string());
-        args.expect_architecture = Some("x86_64".to_string());
-
-        assert!(verify_helper_manifest(&manifest_path, &args.trusted_release_keys, args.expect_platform.as_deref(), args.expect_architecture.as_deref(), &binary).is_ok());
-    }
-
-    #[test]
-    fn verify_helper_manifest_rejects_a_tampered_binary() {
-        let tmp = tempfile::tempdir().unwrap();
-        let binary = b"pretend-isekai-pipe-bytes".to_vec();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let signed = signed_manifest_for(&binary, &signing_key);
-        let manifest_path = write_manifest(tmp.path(), &signed);
-
-        let mut args = sample_init_args();
-        let pubkey_hex: String = signing_key.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        args.trusted_release_keys = vec![format!("test-key={pubkey_hex}")];
-        args.expect_platform = Some("linux".to_string());
-        args.expect_architecture = Some("x86_64".to_string());
-
-        let tampered = b"pretend-isekai-pipe-BYTES".to_vec();
-        assert!(verify_helper_manifest(&manifest_path, &args.trusted_release_keys, args.expect_platform.as_deref(), args.expect_architecture.as_deref(), &tampered).is_err());
-    }
-
-    #[test]
-    fn verify_helper_manifest_rejects_when_no_trusted_key_given() {
-        let tmp = tempfile::tempdir().unwrap();
-        let binary = b"pretend-isekai-pipe-bytes".to_vec();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let signed = signed_manifest_for(&binary, &signing_key);
-        let manifest_path = write_manifest(tmp.path(), &signed);
-
-        let mut args = sample_init_args();
-        args.expect_platform = Some("linux".to_string());
-        args.expect_architecture = Some("x86_64".to_string());
-        // Deliberately no --trusted-release-key.
-
-        let err = verify_helper_manifest(&manifest_path, &args.trusted_release_keys, args.expect_platform.as_deref(), args.expect_architecture.as_deref(), &binary).unwrap_err();
-        assert!(err.to_string().contains("no --trusted-release-key"), "{err}");
-    }
-
-    #[test]
-    fn verify_helper_manifest_rejects_missing_expect_platform() {
-        let tmp = tempfile::tempdir().unwrap();
-        let binary = b"pretend-isekai-pipe-bytes".to_vec();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let signed = signed_manifest_for(&binary, &signing_key);
-        let manifest_path = write_manifest(tmp.path(), &signed);
-
-        let mut args = sample_init_args();
-        let pubkey_hex: String = signing_key.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        args.trusted_release_keys = vec![format!("test-key={pubkey_hex}")];
-        args.expect_architecture = Some("x86_64".to_string());
-        // Deliberately no --expect-platform.
-
-        let err = verify_helper_manifest(&manifest_path, &args.trusted_release_keys, args.expect_platform.as_deref(), args.expect_architecture.as_deref(), &binary).unwrap_err();
-        assert!(err.to_string().contains("--expect-platform"), "{err}");
-    }
-
-    #[test]
-    fn verify_helper_manifest_rejects_a_signature_from_an_untrusted_key() {
-        let tmp = tempfile::tempdir().unwrap();
-        let binary = b"pretend-isekai-pipe-bytes".to_vec();
-        let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-        let signed = signed_manifest_for(&binary, &attacker_key);
-        let manifest_path = write_manifest(tmp.path(), &signed);
-
-        let mut args = sample_init_args();
-        // Trust a *different* key under the same key_id the manifest uses.
-        let real_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let pubkey_hex: String = real_key.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        args.trusted_release_keys = vec![format!("test-key={pubkey_hex}")];
-        args.expect_platform = Some("linux".to_string());
-        args.expect_architecture = Some("x86_64".to_string());
-
-        assert!(verify_helper_manifest(&manifest_path, &args.trusted_release_keys, args.expect_platform.as_deref(), args.expect_architecture.as_deref(), &binary).is_err());
-    }
 }

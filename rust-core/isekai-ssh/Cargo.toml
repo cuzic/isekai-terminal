@@ -15,7 +15,6 @@ isekai-bootstrap = { path = "../isekai-bootstrap" }
 isekai-bootstrap-plan = { path = "../isekai-bootstrap-plan" }
 isekai-auth = { path = "../isekai-auth" }
 isekai-pipe-core = { path = "../isekai-pipe-core" }
-isekai-release-verify = { path = "../isekai-release-verify" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "signal"] }
 log = "0.4"
@@ -34,4 +33,3 @@ russh = "0.48"
 russh-keys = "0.48"
 async-trait = "0.1.89"
 tempfile = "3"
-ed25519-dalek = "2"
