@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 isekai-pipe-core = { path = "../isekai-pipe-core" }
+isekai-protocol = { path = "../isekai-protocol" }
 isekai-transport = { path = "../isekai-transport" }
 isekai-trust = { path = "../isekai-trust" }
 # `engine` module (formerly the standalone `isekai-helper` crate,
@@ -24,6 +25,7 @@ subtle = "2.6"
 rand = "0.8"
 isekai-stun = { path = "../isekai-stun" }
 isekai-link-masque = { path = "../isekai-link-masque" }
+isekai-netmon = { path = "../isekai-netmon" }
 anyhow = "1"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
@@ -33,8 +35,8 @@ env_logger = "0.11"
 tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
-isekai-protocol = { path = "../isekai-protocol" }
 tempfile = "3"
+async-trait = "0.1.89"
 # e2e tests exercise this crate's `serve` engine with the same quinn-based
 # client `isekai-helper`'s own e2e tests used (Phase 9-1's noq/quinn
 # backward-compat guarantee).

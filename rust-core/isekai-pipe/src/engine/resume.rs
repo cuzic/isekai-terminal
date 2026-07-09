@@ -162,6 +162,10 @@ impl SessionTable {
         }
     }
 
+    /// production側では#18-4以降未使用(session_idはクライアントが
+    /// `ATTACH_HELLO`で決める)——この crate 内のテストが任意のsession_idを
+    /// 作るためだけに使う。
+    #[allow(dead_code)]
     pub fn generate_session_id() -> SessionId {
         use rand::RngCore;
         let mut id = [0u8; 16];

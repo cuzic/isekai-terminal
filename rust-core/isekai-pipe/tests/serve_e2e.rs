@@ -15,8 +15,15 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
+use isekai_protocol::attach::{
+    attach_hello_proof_transcript, decode_attach_response, encode_attach_activate, encode_attach_hello, AttachActivate,
+    AttachHello, AttachProof, AttachResponse, AttemptId, ConnectionGeneration, FRAME_ATTACH_READY,
+    FRAME_REJECT_STALE_GENERATION, STALE_GENERATION_REJECT_FRAME_LEN,
+};
+use isekai_protocol::session_id::SessionId;
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint};
+use rand::RngCore;
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -26,43 +33,108 @@ use tokio::net::TcpListener;
 type HmacSha256 = Hmac<Sha256>;
 const EXPORTER_LABEL: &[u8] = b"isekai-pipe-auth-v1";
 const ALPN: &[u8] = b"isekai-pipe/1";
-const FRAME_HELLO: u8 = 0x01;
-const FRAME_ACK: u8 = 0x02;
 const FRAME_REJECT_AUTH: u8 = 0xFF;
-const FRAME_REJECT_DUPLICATE: u8 = 0xFE;
+const FRAME_REJECT_BUSY_OTHER_SESSION: u8 = 0xF2;
 const CONTROL_HELLO: u8 = 0x10;
 const CONTROL_ACK: u8 = 0x11;
 const RESUME: u8 = 0x03;
 const RESUME_ACK: u8 = 0x13;
 const REJECT_UNKNOWN_SESSION: u8 = 0xF9;
 const REJECT_OFFSET_GONE: u8 = 0xF8;
-/// Size of the `requested_resume_grace_secs`/`effective_resume_grace_secs`
-/// trailer on `HELLO`/`ACK` (`isekai_protocol::hello::RESUME_GRACE_LEN`).
-const RESUME_GRACE_LEN: usize = 4;
 
-/// Builds a `HELLO` frame requesting no particular resume-grace preference
-/// (`0`) — none of these tests exercise the negotiated value itself, they
-/// only need a wire-correct frame so the server's fixed-size read doesn't
-/// block waiting for bytes that never arrive.
-fn hello_frame(proof: &[u8; 32]) -> Vec<u8> {
-    let mut hello = vec![FRAME_HELLO];
-    hello.extend_from_slice(proof);
-    hello.extend_from_slice(&0u32.to_be_bytes());
-    hello
+/// One client-side attach identity: a fresh `SessionId`, the INITIAL
+/// generation, and a fresh `AttemptId` — everything the ATTACH v2 handshake
+/// needs the client to pick before connecting (`#18-4`).
+fn fresh_attach_ids() -> (SessionId, ConnectionGeneration, AttemptId) {
+    let mut sid = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut sid);
+    let mut aid = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut aid);
+    (SessionId::from_bytes(sid), ConnectionGeneration::INITIAL, AttemptId::from_bytes(aid))
 }
 
-/// Reads a full `ACK` frame and returns its type byte: the type byte first,
-/// then — only for `FRAME_ACK` — `RESUME_GRACE_LEN` more bytes, mirroring
-/// `isekai_protocol::hello::decode_ack_response`'s framing. Reject variants
-/// stay a bare single byte.
-async fn read_ack_type_byte(recv: &mut quinn::RecvStream) -> u8 {
+/// Computes the ATTACH_HELLO proof exactly like the client:
+/// `HMAC-SHA256(session_secret, exporter || attach_hello_proof_transcript(..))`.
+fn compute_attach_proof(
+    conn: &quinn::Connection,
+    secret: &[u8],
+    session_id: &SessionId,
+    generation: ConnectionGeneration,
+    attempt_id: &AttemptId,
+    requested_resume_grace_secs: u32,
+) -> AttachProof {
+    let mut exporter = [0u8; 32];
+    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"").unwrap();
+    let transcript = attach_hello_proof_transcript(session_id, generation, attempt_id, requested_resume_grace_secs);
+    let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+    mac.update(&exporter);
+    mac.update(&transcript);
+    let bytes: [u8; 32] = mac.finalize().into_bytes().into();
+    AttachProof::new(bytes)
+}
+
+/// Builds an ATTACH_HELLO frame requesting no particular resume-grace
+/// preference (`0`) — none of these tests exercise the negotiated value
+/// itself, they only need a wire-correct frame.
+fn attach_hello_frame(
+    session_id: SessionId,
+    generation: ConnectionGeneration,
+    attempt_id: AttemptId,
+    proof: AttachProof,
+) -> Vec<u8> {
+    encode_attach_hello(&AttachHello {
+        session_id,
+        generation,
+        attempt_id,
+        requested_resume_grace_secs: 0,
+        proof,
+    })
+}
+
+/// Reads a full `AttachResponse` off the wire using the same two-step read the
+/// real client uses (`isekai-transport::relay::read_attach_response`): the type
+/// byte first, then — only for `FRAME_ATTACH_READY` / `FRAME_REJECT_STALE_GENERATION`
+/// — the remaining bytes; every other reject byte is a bare single byte.
+async fn read_attach_response(recv: &mut quinn::RecvStream) -> AttachResponse {
     let mut type_byte = [0u8; 1];
     recv.read_exact(&mut type_byte).await.unwrap();
-    if type_byte[0] == FRAME_ACK {
-        let mut rest = [0u8; RESUME_GRACE_LEN];
+    let mut full = vec![type_byte[0]];
+    let extra_len = match type_byte[0] {
+        FRAME_ATTACH_READY => {
+            isekai_protocol::attach::ATTACH_READY_FRAME_LEN - 1
+        }
+        FRAME_REJECT_STALE_GENERATION => STALE_GENERATION_REJECT_FRAME_LEN - 1,
+        _ => 0,
+    };
+    if extra_len > 0 {
+        let mut rest = vec![0u8; extra_len];
         recv.read_exact(&mut rest).await.unwrap();
+        full.extend_from_slice(&rest);
     }
-    type_byte[0]
+    decode_attach_response(&full).unwrap()
+}
+
+/// Drives the full happy-path attach on `conn`'s data stream: sends
+/// ATTACH_HELLO, expects AttachReadyV2, sends the matching AttachActivate, and
+/// returns the open stream halves ready for raw relay. Panics if the server
+/// rejects.
+async fn attach_and_activate(
+    conn: &quinn::Connection,
+    session_secret: &[u8],
+    session_id: SessionId,
+    generation: ConnectionGeneration,
+    attempt_id: AttemptId,
+) -> (quinn::SendStream, quinn::RecvStream) {
+    let proof = compute_attach_proof(conn, session_secret, &session_id, generation, &attempt_id, 0);
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(&attach_hello_frame(session_id, generation, attempt_id, proof)).await.unwrap();
+    let attach_token = match read_attach_response(&mut recv).await {
+        AttachResponse::Ready { attach_token, .. } => attach_token,
+        other => panic!("expected AttachReadyV2, got {other:?}"),
+    };
+    let activate = AttachActivate { session_id, generation, attempt_id, attach_token };
+    send.write_all(&encode_attach_activate(&activate)).await.unwrap();
+    (send, recv)
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,12 +358,8 @@ async fn hello_ack_and_relay_roundtrip() {
         .await
         .expect("QUIC handshake failed");
 
-    let proof = compute_proof(&conn, &session_secret);
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    send.write_all(&hello_frame(&proof)).await.unwrap();
-
-    let resp = read_ack_type_byte(&mut recv).await;
-    assert_eq!(resp, FRAME_ACK, "expected ACK");
+    let (sid, generation, aid) = fresh_attach_ids();
+    let (mut send, mut recv) = attach_and_activate(&conn, &session_secret, sid, generation, aid).await;
 
     let payload = b"hello-isekai-helper-e2e-test";
     send.write_all(payload).await.unwrap();
@@ -320,10 +388,14 @@ async fn wrong_proof_is_rejected_before_connection_closes() {
         .await
         .expect("QUIC handshake failed");
 
+    // A well-formed ATTACH_HELLO whose proof was computed with the wrong
+    // secret — so the server reaches the proof check and rejects with
+    // REJECT_AUTH (0xFF, unchanged from v1), not a decode/Unsupported failure.
+    let (sid, generation, aid) = fresh_attach_ids();
     let bogus_secret = [0xAAu8; 32];
-    let proof = compute_proof(&conn, &bogus_secret);
+    let proof = compute_attach_proof(&conn, &bogus_secret, &sid, generation, &aid, 0);
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    send.write_all(&hello_frame(&proof)).await.unwrap();
+    send.write_all(&attach_hello_frame(sid, generation, aid, proof)).await.unwrap();
 
     let mut resp = [0u8; 1];
     tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut resp))
@@ -333,6 +405,13 @@ async fn wrong_proof_is_rejected_before_connection_closes() {
     assert_eq!(resp[0], FRAME_REJECT_AUTH);
 }
 
+/// ATTACH v2 (`#18`): a single `isekai-pipe serve` instance only ever serves
+/// one logical session at a time. Once conn1 has reached `Established` (full
+/// ATTACH_HELLO → AttachReadyV2 → AttachActivate), a second, independent client
+/// (its own fresh `session_id`) attempting to attach is rejected with
+/// `BusyOtherSession` (0xF2). This is the faithful modernization of the old v1
+/// "duplicate connection" test, whose `REJECT_DUPLICATE` (0xFE) byte no longer
+/// exists — a genuinely different client can't co-opt this server instance.
 #[tokio::test]
 async fn duplicate_connection_is_rejected() {
     let echo_addr = spawn_echo_server().await;
@@ -344,35 +423,37 @@ async fn duplicate_connection_is_rejected() {
         .parse()
         .unwrap();
 
-    // 1本目: ACK まで進めて能動的にリレー状態にする
+    // 1本目: ATTACH_HELLO → AttachReadyV2 → AttachActivate まで進めて `Established`
+    // にする(AttachActivate を送らないと slot は `PendingActivation` のままで、
+    // 2本目の衝突が別の reject 理由になってしまう)。
     let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn1 = endpoint1
         .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .unwrap();
-    let proof1 = compute_proof(&conn1, &session_secret);
-    let (mut send1, mut recv1) = conn1.open_bi().await.unwrap();
-    send1.write_all(&hello_frame(&proof1)).await.unwrap();
-    let resp1 = read_ack_type_byte(&mut recv1).await;
-    assert_eq!(resp1, FRAME_ACK);
+    let (sid1, gen1, aid1) = fresh_attach_ids();
+    let (_send1, _recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
 
-    // 2本目: 同じ session_secret で proof は正しいが、1本目がまだアクティブなので拒否される
+    // 2本目: proof 自体は正しいが、別の(独立した)session_id で attach しようと
+    // するので、この serve インスタンスが既に別 session を抱えていることを理由に
+    // `BusyOtherSession` で拒否される。
     let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn2 = endpoint2
         .connect(server_addr, "isekai-pipe.local")
         .unwrap()
         .await
         .unwrap();
-    let proof2 = compute_proof(&conn2, &session_secret);
+    let (sid2, gen2, aid2) = fresh_attach_ids();
+    let proof2 = compute_attach_proof(&conn2, &session_secret, &sid2, gen2, &aid2, 0);
     let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
-    send2.write_all(&hello_frame(&proof2)).await.unwrap();
+    send2.write_all(&attach_hello_frame(sid2, gen2, aid2, proof2)).await.unwrap();
     let mut resp2 = [0u8; 1];
     tokio::time::timeout(Duration::from_secs(5), recv2.read_exact(&mut resp2))
         .await
-        .expect("timed out waiting for REJECT_DUPLICATE")
-        .expect("connection closed before REJECT_DUPLICATE byte was delivered");
-    assert_eq!(resp2[0], FRAME_REJECT_DUPLICATE);
+        .expect("timed out waiting for REJECT_BUSY_OTHER_SESSION")
+        .expect("connection closed before REJECT_BUSY_OTHER_SESSION byte was delivered");
+    assert_eq!(resp2[0], FRAME_REJECT_BUSY_OTHER_SESSION);
 }
 
 /// Phase 8-3: QUIC connection が失われた後、`RESUME` で reattach すると
@@ -397,12 +478,12 @@ async fn resume_after_connection_loss_replays_and_continues() {
         .unwrap()
         .await
         .unwrap();
-    let proof1 = compute_proof(&conn1, &session_secret);
-    let (mut send1, mut recv1) = conn1.open_bi().await.unwrap();
-    send1.write_all(&hello_frame(&proof1)).await.unwrap();
-    let ack1 = read_ack_type_byte(&mut recv1).await;
-    assert_eq!(ack1, FRAME_ACK);
+    let (sid1, gen1, aid1) = fresh_attach_ids();
+    let (mut send1, recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
 
+    // CONTROL_HELLO の proof はプレーンな exporter HMAC(transcript 無し)のままで、
+    // ATTACH v2 でも変更されていない。
+    let proof1 = compute_proof(&conn1, &session_secret);
     let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
     let mut chello1 = vec![CONTROL_HELLO];
     chello1.extend_from_slice(&proof1);
@@ -560,12 +641,12 @@ async fn resume_with_offset_beyond_buffer_is_rejected() {
         .unwrap()
         .await
         .unwrap();
-    let proof1 = compute_proof(&conn1, &session_secret);
-    let (mut send1, mut recv1) = conn1.open_bi().await.unwrap();
-    send1.write_all(&hello_frame(&proof1)).await.unwrap();
-    let ack1 = read_ack_type_byte(&mut recv1).await;
-    assert_eq!(ack1, FRAME_ACK);
+    let (sid1, gen1, aid1) = fresh_attach_ids();
+    let (mut send1, mut recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
 
+    // CONTROL_HELLO の proof はプレーンな exporter HMAC(transcript 無し)のままで、
+    // ATTACH v2 でも変更されていない。
+    let proof1 = compute_proof(&conn1, &session_secret);
     let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
     let mut chello1 = vec![CONTROL_HELLO];
     chello1.extend_from_slice(&proof1);
@@ -652,12 +733,12 @@ async fn resume_after_park_expiry_is_rejected_as_unknown_session() {
         .unwrap()
         .await
         .unwrap();
-    let proof1 = compute_proof(&conn1, &session_secret);
-    let (mut send1, mut recv1) = conn1.open_bi().await.unwrap();
-    send1.write_all(&hello_frame(&proof1)).await.unwrap();
-    let ack1 = read_ack_type_byte(&mut recv1).await;
-    assert_eq!(ack1, FRAME_ACK);
+    let (sid1, gen1, aid1) = fresh_attach_ids();
+    let (send1, recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
 
+    // CONTROL_HELLO の proof はプレーンな exporter HMAC(transcript 無し)のままで、
+    // ATTACH v2 でも変更されていない。
+    let proof1 = compute_proof(&conn1, &session_secret);
     let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
     let mut chello1 = vec![CONTROL_HELLO];
     chello1.extend_from_slice(&proof1);
@@ -822,12 +903,193 @@ async fn punch_peer_flag_does_not_prevent_normal_startup_or_relay() {
     let session_secret = base64::engine::general_purpose::STANDARD
         .decode(&helper.handshake.session_secret)
         .unwrap();
-    let proof = compute_proof(&conn, &session_secret);
+    // Only checks that startup + the ATTACH handshake reaches AttachReadyV2
+    // (mirrors the original scope of "just prove --punch-peer doesn't break
+    // the ACK"); no AttachActivate / full relay needed here.
+    let (sid, generation, aid) = fresh_attach_ids();
+    let proof = compute_attach_proof(&conn, &session_secret, &sid, generation, &aid, 0);
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    send.write_all(&hello_frame(&proof)).await.unwrap();
+    send.write_all(&attach_hello_frame(sid, generation, aid, proof)).await.unwrap();
 
-    let ack = tokio::time::timeout(Duration::from_secs(5), read_ack_type_byte(&mut recv))
+    let response = tokio::time::timeout(Duration::from_secs(5), read_attach_response(&mut recv))
         .await
-        .expect("timed out waiting for ACK");
-    assert_eq!(ack, FRAME_ACK);
+        .expect("timed out waiting for AttachReadyV2");
+    assert!(matches!(response, AttachResponse::Ready { .. }), "expected AttachReadyV2, got {response:?}");
+}
+
+/// `#20a-4`: when launched with `--bootstrap-request-file` (the real
+/// `isekai-bootstrap::openssh` call shape, `#20a-2`), `isekai-pipe serve`
+/// must wrap its handshake in a `BootstrapReportV2` envelope echoing back
+/// the request's `session_id`/`bootstrap_attempt_id`, rather than emitting
+/// the bare `HandshakeJson` line every other test in this file expects
+/// (`spawn_helper` deliberately never passes this flag).
+#[tokio::test]
+async fn bootstrap_request_file_wraps_handshake_in_a_bootstrap_report_v2() {
+    let echo_addr = spawn_echo_server().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let request_path = tmp.path().join("bootstrap-request.json");
+    let request = isekai_protocol::BootstrapRequestV2 {
+        v: isekai_protocol::BOOTSTRAP_PROTOCOL_V2,
+        session_id: SessionId::from_bytes([0x55; 16]).to_hex(),
+        bootstrap_attempt_id: "66".repeat(16),
+        client_candidates: vec![],
+    };
+    std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+
+    let mut cmd = Command::new(helper_bin_path());
+    cmd.arg("serve")
+        .arg("--target")
+        .arg(echo_addr.to_string())
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--log-level")
+        .arg("debug")
+        .arg("--bootstrap-request-file")
+        .arg(request_path.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn isekai-pipe");
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("failed to read bootstrap report line from isekai-pipe stdout");
+
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(stderr);
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                if r.read_line(&mut buf).unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        });
+    }
+    std::mem::forget(reader);
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let report: isekai_protocol::BootstrapReportV2 =
+        serde_json::from_str(line.trim()).expect("stdout line should be a valid BootstrapReportV2");
+    assert_eq!(report.v, isekai_protocol::BOOTSTRAP_PROTOCOL_V2);
+    assert_eq!(report.session_id, request.session_id);
+    assert_eq!(report.bootstrap_attempt_id, request.bootstrap_attempt_id);
+    assert_eq!(report.handshake.v, 1);
+    assert!(report.handshake.direct_by_bootstrap_host_port().is_some());
+}
+
+/// `#20a-5`: the full `#20a` stack in one test — a `BootstrapRequestV2`
+/// carrying a real `client_candidates` entry actually gets punched (not just
+/// parsed), and the resulting `BootstrapReportV2`'s wrapped handshake is
+/// genuinely usable for a real ATTACH v2 QUIC connection, not just
+/// well-formed JSON. Ties `#20a-3` (candidate punch) and `#20a-4` (report
+/// wrap) together against the real compiled `isekai-pipe` binary, the same
+/// way `punch_peer_flag_does_not_prevent_normal_startup_or_relay` already
+/// does for the pre-`#20a` `--punch-peer` flag.
+#[tokio::test]
+async fn bootstrap_request_file_candidates_are_punched_and_the_report_yields_a_working_connection() {
+    let echo_addr = spawn_echo_server().await;
+    let stun_server = spawn_mock_stun_server();
+
+    // Stands in for the "peer" `isekai-terminal` would be punching toward —
+    // a plain UDP socket that just needs to observe at least one probe
+    // datagram, proving `client_candidate_punch_targets` actually reached
+    // the punch loop rather than only being parsed and discarded.
+    let peer_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer_socket.local_addr().unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let request_path = tmp.path().join("bootstrap-request.json");
+    let request = isekai_protocol::BootstrapRequestV2 {
+        v: isekai_protocol::BOOTSTRAP_PROTOCOL_V2,
+        session_id: SessionId::from_bytes([0x77; 16]).to_hex(),
+        bootstrap_attempt_id: "88".repeat(16),
+        client_candidates: vec![isekai_protocol::BootstrapCandidateV2 {
+            route: "stun-p2p".to_string(),
+            endpoint: peer_addr.to_string(),
+            valid_for_ms: 30_000,
+        }],
+    };
+    std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+
+    let mut cmd = Command::new(helper_bin_path());
+    cmd.arg("serve")
+        .arg("--target")
+        .arg(echo_addr.to_string())
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--log-level")
+        .arg("debug")
+        .arg("--stun-server")
+        .arg(stun_server.to_string())
+        .arg("--bootstrap-request-file")
+        .arg(request_path.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn isekai-pipe");
+
+    let mut punch_buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), peer_socket.recv_from(&mut punch_buf))
+        .await
+        .expect("timed out waiting for a hole-punch probe from the bootstrap candidate")
+        .expect("recv_from failed");
+    assert_eq!(&punch_buf[..n], b"isekai-punch");
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("failed to read bootstrap report line from isekai-pipe stdout");
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(stderr);
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                if r.read_line(&mut buf).unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        });
+    }
+    std::mem::forget(reader);
+
+    let report: isekai_protocol::BootstrapReportV2 =
+        serde_json::from_str(line.trim()).expect("stdout line should be a valid BootstrapReportV2");
+    assert_eq!(report.session_id, request.session_id);
+    assert_eq!(report.bootstrap_attempt_id, request.bootstrap_attempt_id);
+    assert!(report.handshake.stun_observed_addr().is_some());
+
+    let client_endpoint = make_client_endpoint(report.handshake.cert_sha256());
+    let conn = client_endpoint
+        .connect(
+            SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), report.handshake.direct_by_bootstrap_host_port().unwrap()),
+            "isekai-pipe.local",
+        )
+        .unwrap()
+        .await
+        .expect("QUIC handshake should succeed using the wrapped BootstrapReportV2's handshake");
+
+    let session_secret = base64::engine::general_purpose::STANDARD
+        .decode(&report.handshake.session_secret)
+        .unwrap();
+    let (sid, generation, aid) = fresh_attach_ids();
+    let proof = compute_attach_proof(&conn, &session_secret, &sid, generation, &aid, 0);
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(&attach_hello_frame(sid, generation, aid, proof)).await.unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(5), read_attach_response(&mut recv))
+        .await
+        .expect("timed out waiting for AttachReadyV2");
+    assert!(matches!(response, AttachResponse::Ready { .. }), "expected AttachReadyV2, got {response:?}");
+
+    let _ = child.kill();
+    let _ = child.wait();
 }

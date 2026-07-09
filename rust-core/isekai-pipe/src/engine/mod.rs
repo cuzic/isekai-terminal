@@ -1,27 +1,35 @@
+mod attach_arbiter;
+mod attach_runtime;
 mod plain_socket;
 mod resume;
 
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use attach_runtime::{AttachRuntime, HelloOutcome};
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
+use isekai_protocol::attach::{
+    attach_hello_proof_transcript, cancel_attach_proof_transcript, decode_attach_activate, decode_attach_hello,
+    decode_cancel_attach, encode_attach_response, AttachKey, AttachProof, AttachRejectReason, AttachResponse,
+    ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN, CANCEL_ATTACH_FRAME_LEN, FRAME_ATTACH_CANCEL,
+    FRAME_ATTACH_HELLO,
+};
 use noq::crypto::rustls::QuicServerConfig;
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use resume::{Session, SessionTable};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 
 // isekai-helper: 認証付き QUIC↔TCP リレー。
-// 契約の詳細は /HELPER_PROTOCOL.md を参照。このファイルはその契約の実装。
+// 契約の詳細は /HELPER_PROTOCOL.md、ATTACH v2 の fencing 部分は `#18`
+// (`ISEKAI_PIPE_DESIGN.md`) を参照。このファイルはその契約の実装。
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -36,12 +44,13 @@ const DEFAULT_MAX_SESSIONS: usize = 16;
 const EXPORTER_LABEL: &[u8] = b"isekai-pipe-auth-v1";
 const ALPN: &[u8] = b"isekai-pipe/1";
 
-const FRAME_HELLO: u8 = 0x01;
-const FRAME_ACK: u8 = 0x02;
-const FRAME_REJECT_TARGET: u8 = 0xFC;
-const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
-const FRAME_REJECT_DUPLICATE: u8 = 0xFE;
+/// `RESUME`(reattach)の拒否応答専用。データストリームの初回attach
+/// (`ATTACH_HELLO`)はもう`isekai_protocol::attach`のreject語彙(#18)を使うため、
+/// ここに残るのは`resume`フレームファミリー(このファイル・`resume`submoduleが
+/// 直接扱う`RESUME`/`CONTROL_HELLO`等)専用の値だけ。
 const FRAME_REJECT_AUTH: u8 = 0xFF;
+/// 完全に未知のフレーム種別(ATTACH_HELLOでもRESUMEでもない)を読んだ場合専用。
+const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -83,6 +92,12 @@ struct Args {
     /// `--relay-jwt`の推奨代替。ファイルパスを受け取り、起動時に一度だけ読み取ってから
     /// 直ちに内容をゼロクリアしunlinkする(`resolve_relay_jwt`参照)。
     relay_jwt_file: Option<String>,
+    /// `#20a-3`: `isekai-bootstrap`/`helper_bootstrap.rs`がSSH bootstrap execの
+    /// stdin経由で渡す`BootstrapRequestV2`(JSON)のファイルパス。起動時に一度だけ
+    /// 読み取り・検証してから unlink する(`resolve_bootstrap_request`参照)。
+    /// `client_candidates`は既存の`--punch-peer`と同じ穴あけprobe送出対象に
+    /// 追加される(両方指定されていれば両方へ送出する)。
+    bootstrap_request_file: Option<String>,
 }
 
 fn next_val(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
@@ -131,6 +146,13 @@ fn print_help() {
         "                                   to other local users via `ps`/`/proc/<pid>/cmdline`;"
     );
     println!("                                   prefer --relay-jwt-file)");
+    println!(
+        "    --bootstrap-request-file <PATH> path to a BootstrapRequestV2 JSON file (#20a); its"
+    );
+    println!(
+        "                                   client_candidates are added as additional hole-punch"
+    );
+    println!("                                   targets alongside --punch-peer");
     println!("    --log-level <LEVEL>            error|warn|info|debug|trace (default: info)");
     println!("    --version                      print version and exit");
     println!("    -h, --help                     print this help message");
@@ -157,6 +179,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut relay_sni: Option<String> = None;
     let mut relay_jwt: Option<String> = None;
     let mut relay_jwt_file: Option<String> = None;
+    let mut bootstrap_request_file: Option<String> = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -196,6 +219,9 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--relay-sni" => relay_sni = Some(next_val(&mut iter, "--relay-sni")?),
             "--relay-jwt" => relay_jwt = Some(next_val(&mut iter, "--relay-jwt")?),
             "--relay-jwt-file" => relay_jwt_file = Some(next_val(&mut iter, "--relay-jwt-file")?),
+            "--bootstrap-request-file" => {
+                bootstrap_request_file = Some(next_val(&mut iter, "--bootstrap-request-file")?)
+            }
             "--idle-timeout" => {
                 idle_timeout = next_val(&mut iter, "--idle-timeout")?
                     .parse()
@@ -288,6 +314,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
         relay_sni,
         relay_jwt,
         relay_jwt_file,
+        bootstrap_request_file,
     })
 }
 
@@ -325,6 +352,43 @@ fn resolve_relay_jwt(relay_jwt: Option<String>, relay_jwt_file: Option<String>) 
 /// (UTF-8妥当性)を壊さない。`write_volatile`はコンパイラによる dead-store
 /// elimination を抑止する意図(完全な保証ではないが、ここでは多層防御の
 /// 一部でしかないため十分)。
+/// `#20a-3`: reads and validates a `BootstrapRequestV2` from `path`, then
+/// unlinks the file (matching `resolve_relay_jwt`'s "read once, remove
+/// immediately" pattern — the caller's `mktemp -d`/`trap ... EXIT` also
+/// reclaims it eventually, this just minimizes exposure time). A malformed
+/// request fails the whole startup (all-or-nothing, matching
+/// `decode_bootstrap_request_v2`'s own contract) rather than silently
+/// continuing without candidates — something is clearly wrong with the SSH
+/// bootstrap pipeline itself if this file doesn't parse.
+fn resolve_bootstrap_request(path: &str) -> Result<isekai_protocol::BootstrapRequestV2> {
+    let bytes = std::fs::read(path).with_context(|| format!("failed to read --bootstrap-request-file {path}"))?;
+    if let Err(e) = std::fs::remove_file(path) {
+        log::warn!("failed to remove --bootstrap-request-file {path} after reading: {e}");
+    }
+    isekai_protocol::bootstrap_request::decode_bootstrap_request_v2(&bytes)
+        .with_context(|| format!("invalid BootstrapRequestV2 in --bootstrap-request-file {path}"))
+}
+
+/// `#20a-3`: `client_candidates.endpoint` is already validated (during
+/// `decode_bootstrap_request_v2`) to parse as a `SocketAddr` — this just
+/// does that parse again to get the typed value for punching. A candidate
+/// whose `endpoint` somehow fails to parse here anyway (defensive; should
+/// be unreachable given the earlier validation) is skipped with a warning
+/// rather than failing the whole startup over one bad entry.
+fn client_candidate_punch_targets(request: &isekai_protocol::BootstrapRequestV2) -> Vec<SocketAddr> {
+    request
+        .client_candidates
+        .iter()
+        .filter_map(|candidate| match candidate.endpoint.parse::<SocketAddr>() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                log::warn!("bootstrap request candidate endpoint {:?} failed to parse, skipping: {e}", candidate.endpoint);
+                None
+            }
+        })
+        .collect()
+}
+
 fn zeroize_string(s: &mut String) {
     // SAFETY: 全バイトを0x00で上書きするだけであり、長さ・容量は変えないため
     // UTF-8妥当性は保たれる(0x00は単独で有効なUTF-8バイト列)。
@@ -349,6 +413,15 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow!("failed to install rustls ring crypto provider"))?;
+
+    // `#20a-3`: `--bootstrap-request-file`は`--relay`/直接P2Pのどちらの起動でも
+    // `isekai-bootstrap::openssh`から常に渡され得る(呼び出し元は起動方式を問わず
+    // 送信する)ため、branch分岐より前にここで解決する。実際に`client_candidates`を
+    // 穴あけprobeへ使うのは非relay分岐のみ(下記参照) — relay分岐では黙って無視する。
+    let bootstrap_request = match &args.bootstrap_request_file {
+        Some(path) => Some(resolve_bootstrap_request(path)?),
+        None => None,
+    };
 
     // session_secret をランダム生成する（CLI 引数や環境変数には載せない）。
     let mut session_secret = [0u8; 32];
@@ -445,12 +518,31 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
             None => None,
         };
 
+        // `#20a-3`: `--punch-peer`(単一・既存)と`--bootstrap-request-file`由来の
+        // `client_candidates`(複数・新規)を同じ穴あけprobe送出対象として合流させる。
+        let mut punch_targets: Vec<SocketAddr> = Vec::new();
         if let Some(peer) = args.punch_peer {
-            log::info!("punch: sending hole-punch probes to {peer}");
+            punch_targets.push(peer);
+        }
+        if let Some(request) = &bootstrap_request {
+            punch_targets.extend(client_candidate_punch_targets(request));
+        }
+        if !punch_targets.is_empty() && args.stun_server.is_none() {
+            return Err(anyhow!(
+                "--punch-peer/--bootstrap-request-file candidates require --stun-server"
+            ));
+        }
+
+        if !punch_targets.is_empty() {
+            log::info!("punch: sending hole-punch probes to {punch_targets:?}");
             // 中身はNAT越え専用のマーカーで構わない(相手はQUICパケットとして解釈できない
-            // 限り黙って破棄するだけであり、応答は期待しない・待たない)。
+            // 限り黙って破棄するだけであり、応答は期待しない・待たない)。simultaneous
+            // openの意図を保つため、対象ごとに入れ子ループでsleepするのではなく、
+            // 1ラウンドで全対象へ送出してからまとめてsleepする。
             for _ in 0..5 {
-                let _ = raw_socket.send_to(b"isekai-punch", peer).await;
+                for target in &punch_targets {
+                    let _ = raw_socket.send_to(b"isekai-punch", *target).await;
+                }
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
         }
@@ -510,9 +602,32 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         ],
         "candidates": candidates,
     });
+    // `#20a-4`: when this launch carried a `BootstrapRequestV2` (real bootstrap
+    // callers always send one, `#20a-2`), wrap the handshake in a
+    // `BootstrapReportV2` envelope echoing back its `session_id`/
+    // `bootstrap_attempt_id` rather than adding fields to the handshake
+    // itself (module docs on `isekai_protocol::bootstrap_request`). Without a
+    // request (direct/manual invocation, e.g. this crate's own e2e tests),
+    // keep emitting the bare `HandshakeJson` exactly as before.
+    let output_line = match &bootstrap_request {
+        Some(request) => serde_json::json!({
+            "v": isekai_protocol::BOOTSTRAP_PROTOCOL_V2,
+            "session_id": request.session_id,
+            "bootstrap_attempt_id": request.bootstrap_attempt_id,
+            "handshake": handshake,
+        })
+        .to_string(),
+        None => handshake.to_string(),
+    };
     {
+        // 1回の write_all にまとめて呼ぶ(本文と改行を別々の書き込みにしない)ことで、
+        // シェル側の`[ -s $tmpdir/handshake ]`ポーリングが書きかけの断片を
+        // 観測しないことを保証する(このJSON1行は行を跨がないため、単一の
+        // write()システムコールで完結すれば十分)。
+        let mut line = output_line.into_bytes();
+        line.push(b'\n');
         let mut stdout = std::io::stdout();
-        writeln!(stdout, "{handshake}").context("failed to write handshake to stdout")?;
+        stdout.write_all(&line).context("failed to write handshake to stdout")?;
         stdout.flush().context("failed to flush stdout handshake")?;
     }
 
@@ -523,7 +638,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         cert_sha256
     );
 
-    let active = Arc::new(AtomicBool::new(false));
+    let attach_runtime = AttachRuntime::new(args.target);
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let idle_shutdown = Arc::new(Notify::new());
     // Phase 8: resume 可能セッションのテーブル（session_id → output buffer 等）。
@@ -555,14 +670,14 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
     // --max-idle-lifetime の監視タスク。
     // アクティブな接続が無く、かつ最後の接続終了（または起動）からこの秒数が経過したら自己終了する。
     {
-        let active = active.clone();
+        let attach_runtime = attach_runtime.clone();
         let last_activity = last_activity.clone();
         let max_idle = Duration::from_secs(args.max_idle_lifetime);
         let idle_shutdown = idle_shutdown.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                if active.load(Ordering::SeqCst) {
+                if !attach_runtime.is_vacant().await {
                     continue;
                 }
                 let elapsed = last_activity.lock().await.elapsed();
@@ -592,7 +707,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                 let Some(incoming) = incoming else { break };
                 let target = args.target;
                 let secret = session_secret;
-                let active = active.clone();
+                let attach_runtime = attach_runtime.clone();
                 let last_activity = last_activity.clone();
                 let sessions = sessions.clone();
                 let resume_buffer_size = args.resume_buffer_size;
@@ -607,7 +722,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                                 .path(noq::PathId::ZERO)
                                 .and_then(|p| p.remote_address().ok());
                             log::info!("QUIC connection established from {remote:?}");
-                            if let Err(e) = handle_connection(conn, target, secret, active, sessions, resume_buffer_size, max_resume_grace_secs).await {
+                            if let Err(e) = handle_connection(conn, target, secret, attach_runtime, sessions, resume_buffer_size, max_resume_grace_secs).await {
                                 log::warn!("connection from {remote:?} ended: {e:#}");
                             }
                         }
@@ -631,15 +746,15 @@ async fn handle_connection(
     conn: noq::Connection,
     target: SocketAddr,
     session_secret: [u8; 32],
-    active: Arc<AtomicBool>,
+    attach_runtime: Arc<AttachRuntime>,
     sessions: SessionTable,
     resume_buffer_size: usize,
     max_resume_grace_secs: u64,
 ) -> Result<()> {
-    // 最初の1バイトでフレーム種別（HELLO=新規 / RESUME=reattach）を判定してから、
-    // 種別に応じた残りバイト数を読む。いずれも一定時間内に届かなければ
-    // connection を close する（QUIC connection だけ張って stream を開かない
-    // 妨害を防ぐ）。
+    // 最初の1バイトでフレーム種別（ATTACH_HELLO=新規 / RESUME=reattach）を
+    // 判定してから、種別に応じた残りバイト数を読む。いずれも一定時間内に
+    // 届かなければ connection を close する（QUIC connection だけ張って
+    // stream を開かない妨害を防ぐ）。
     let (send, recv, frame_type, rest) = tokio::time::timeout(HELLO_TIMEOUT, async {
         let (send, mut recv) = conn.accept_bi().await.context("no stream opened")?;
         let mut type_byte = [0u8; 1];
@@ -647,7 +762,8 @@ async fn handle_connection(
             .await
             .context("failed to read frame type")?;
         let rest_len = match type_byte[0] {
-            FRAME_HELLO => 36,    // proof(32) + requested_resume_grace_secs(4)
+            FRAME_ATTACH_HELLO => ATTACH_HELLO_FRAME_LEN - 1,
+            FRAME_ATTACH_CANCEL => CANCEL_ATTACH_FRAME_LEN - 1,
             resume::RESUME => 64, // session_id(16) + proof(32) + offset(8) + offset(8)
             _ => 0,
         };
@@ -663,18 +779,18 @@ async fn handle_connection(
     .context("HELLO timeout")??;
 
     match frame_type {
-        FRAME_HELLO => {
-            let mut hello = [0u8; 37];
-            hello[0] = FRAME_HELLO;
-            hello[1..].copy_from_slice(&rest);
-            handle_stream(
+        FRAME_ATTACH_HELLO => {
+            let mut hello_bytes = [0u8; ATTACH_HELLO_FRAME_LEN];
+            hello_bytes[0] = FRAME_ATTACH_HELLO;
+            hello_bytes[1..].copy_from_slice(&rest);
+            handle_attach_stream(
                 conn,
                 send,
                 recv,
-                hello,
+                hello_bytes,
                 target,
                 session_secret,
-                active,
+                attach_runtime,
                 sessions,
                 resume_buffer_size,
                 max_resume_grace_secs,
@@ -682,95 +798,197 @@ async fn handle_connection(
             .await
         }
         resume::RESUME => {
-            handle_resume_stream(
-                conn,
-                send,
-                recv,
-                &rest,
-                target,
-                session_secret,
-                active,
-                sessions,
-            )
-            .await
+            handle_resume_stream(conn, send, recv, &rest, target, session_secret, attach_runtime, sessions).await
+        }
+        FRAME_ATTACH_CANCEL => {
+            let mut cancel_bytes = [0u8; CANCEL_ATTACH_FRAME_LEN];
+            cancel_bytes[0] = FRAME_ATTACH_CANCEL;
+            cancel_bytes[1..].copy_from_slice(&rest);
+            handle_cancel_attach(conn, cancel_bytes, session_secret, attach_runtime).await
         }
         other => {
             let mut send = send;
-            reject(&mut send, FRAME_REJECT_UNSUPPORTED).await;
+            reject(&mut send, &[FRAME_REJECT_UNSUPPORTED]).await;
             Err(anyhow!("unexpected frame type: {other:#x}"))
         }
     }
 }
 
+/// `CANCEL_ATTACH`(best-effort、`#18`): 完全一致した`(session_id, generation,
+/// attempt_id)`だけを対象にリソースの早期解放を試みる。届かなくても
+/// `AttachRuntime`のpending-activationタイマー等が最終的に安全側へ収束する
+/// ため、応答フレームは送らないfire-and-forgetでよい。
+async fn handle_cancel_attach(
+    conn: noq::Connection,
+    cancel_bytes: [u8; CANCEL_ATTACH_FRAME_LEN],
+    session_secret: [u8; 32],
+    attach_runtime: Arc<AttachRuntime>,
+) -> Result<()> {
+    let cancel = decode_cancel_attach(&cancel_bytes).context("failed to decode CancelAttach")?;
+    let transcript = cancel_attach_proof_transcript(&cancel.session_id, cancel.generation, &cancel.attempt_id);
+    let expected = compute_attach_proof(&conn, &session_secret, &transcript)?;
+    if !cancel.proof.ct_eq(&AttachProof::new(expected)) {
+        return Err(anyhow!("CancelAttach proof mismatch, ignoring"));
+    }
+    let key = AttachKey { session_id: cancel.session_id, generation: cancel.generation, attempt_id: cancel.attempt_id };
+    attach_runtime.cancel(key).await;
+    Ok(())
+}
+
 /// 拒否フレームを送出し、`finish()` 後に `stopped()` で peer への到達を待ってから返す。
-/// これをせずに呼び出し元が即座に `conn` を drop すると、1 byte の応答が飛ぶ前に
+/// これをせずに呼び出し元が即座に `conn` を drop すると、応答が飛ぶ前に
 /// QUIC connection が暗黙に閉じられ、client 側が payload を読めないことがある
-/// （実測で確認済みのバグ）。
-async fn reject(send: &mut noq::SendStream, code: u8) {
-    if send.write_all(&[code]).await.is_ok() {
+/// （実測で確認済みのバグ）。`ATTACH_HELLO`のreject語彙(#18)は`STALE_GENERATION`
+/// のように1byteを超える場合があるため、単一byteではなく`&[u8]`を受け取る。
+async fn reject(send: &mut noq::SendStream, bytes: &[u8]) {
+    if send.write_all(bytes).await.is_ok() {
         let _ = send.finish();
         let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
     }
 }
 
-/// helper 側の HELLO 検証・target 接続・中継を行う。
+async fn reject_attach(send: &mut noq::SendStream, reason: AttachRejectReason) {
+    reject(send, &encode_attach_response(&AttachResponse::Reject(reason))).await;
+}
+
+/// helper 側の `ATTACH_HELLO` 検証・fencing判定([`AttachRuntime::hello`])・
+/// `AttachActivate`待ち・中継を行う(`#18`)。`PendingActivation`(ACK送信後
+/// `AttachActivate`受信前)の間は、まだtargetへのSSHユーザーデータを一切
+/// 流さない — `#12`で見つかった曖昧区間の修正そのもの。
 #[allow(clippy::too_many_arguments)]
-async fn handle_stream(
+async fn handle_attach_stream(
     conn: noq::Connection,
     mut send: noq::SendStream,
-    recv: noq::RecvStream,
-    hello: [u8; 37],
+    mut recv: noq::RecvStream,
+    hello_bytes: [u8; ATTACH_HELLO_FRAME_LEN],
     target: SocketAddr,
     session_secret: [u8; 32],
-    active: Arc<AtomicBool>,
+    attach_runtime: Arc<AttachRuntime>,
     sessions: SessionTable,
     resume_buffer_size: usize,
     max_resume_grace_secs: u64,
 ) -> Result<()> {
-    if hello[0] != FRAME_HELLO {
-        reject(&mut send, FRAME_REJECT_UNSUPPORTED).await;
-        return Err(anyhow!("unexpected frame type: {:#x}", hello[0]));
-    }
-    let client_proof = &hello[1..33];
-    let expected = compute_proof(&conn, &session_secret, EXPORTER_LABEL, b"")?;
+    let hello = match decode_attach_hello(&hello_bytes) {
+        Ok(hello) => hello,
+        Err(e) => {
+            reject_attach(&mut send, AttachRejectReason::Unsupported).await;
+            return Err(anyhow!("failed to decode ATTACH_HELLO: {e}"));
+        }
+    };
 
-    if client_proof.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
-        reject(&mut send, FRAME_REJECT_AUTH).await;
-        return Err(anyhow!("proof mismatch, rejecting"));
+    let transcript = attach_hello_proof_transcript(
+        &hello.session_id,
+        hello.generation,
+        &hello.attempt_id,
+        hello.requested_resume_grace_secs,
+    );
+    let expected = compute_attach_proof(&conn, &session_secret, &transcript)?;
+    if !hello.proof.ct_eq(&AttachProof::new(expected)) {
+        reject_attach(&mut send, AttachRejectReason::Auth).await;
+        return Err(anyhow!("ATTACH_HELLO proof mismatch, rejecting"));
     }
+
+    let key = AttachKey { session_id: hello.session_id, generation: hello.generation, attempt_id: hello.attempt_id };
+    let (lease, attach_token) = match attach_runtime.hello(key).await {
+        HelloOutcome::Reject(reason) => {
+            reject_attach(&mut send, reason).await;
+            return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));
+        }
+        HelloOutcome::Ready { lease, attach_token } => (lease, attach_token),
+    };
 
     // クライアントが希望する resume-grace 期間（0 = 希望なし）。この値を
     // そのまま信用してsession保持時間(≒リソース消費)を決めるのではなく、
     // このサーバー自身の `--resume-window`（`max_resume_grace_secs`）で
     // clampした上でACKに実効値を返す（ISEKAI_PIPE_DESIGN.md — client任せに
     // しない設計）。
-    let requested_resume_grace_secs = u32::from_be_bytes(hello[33..37].try_into().unwrap());
-    let effective_resume_grace_secs = effective_resume_grace(requested_resume_grace_secs, max_resume_grace_secs);
+    let negotiated_resume_grace_secs =
+        effective_resume_grace(hello.requested_resume_grace_secs, max_resume_grace_secs);
+    let ready = AttachResponse::Ready {
+        session_id: hello.session_id,
+        generation: hello.generation,
+        attempt_id: hello.attempt_id,
+        negotiated_resume_grace_secs,
+        attach_token,
+    };
+    send.write_all(&encode_attach_response(&ready)).await.context("failed to write AttachReadyV2")?;
 
-    // 同時アクティブ接続は1本まで。target への TCP 接続成功直後に slot を確保する
-    // （HELPER_PROTOCOL.md「ハンドシェイクの処理順序」参照）。
-    if active
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        reject(&mut send, FRAME_REJECT_DUPLICATE).await;
-        return Err(anyhow!("duplicate active connection rejected"));
-    }
-
-    let mut recv = recv;
-    let result = relay_with_resume(
-        &conn,
-        &mut send,
-        &mut recv,
-        target,
-        session_secret,
-        &sessions,
-        resume_buffer_size,
-        effective_resume_grace_secs,
-    )
+    // `AttachActivate`を待つ。ここで届かなくても(timeout・切断・不一致)、
+    // `AttachRuntime`自身のpending-activationタイマーが最終的にサーバー側の
+    // stateを安全に後始末する — この読み取りタイムアウトはこの接続タスク
+    // 自身が諦めるタイミングを決めるだけで、正しさはそちらに依存しない。
+    let activate = tokio::time::timeout(HELLO_TIMEOUT, async {
+        let mut buf = [0u8; ATTACH_ACTIVATE_FRAME_LEN];
+        recv.read_exact(&mut buf).await.context("failed to read AttachActivate")?;
+        decode_attach_activate(&buf).context("failed to decode AttachActivate")
+    })
     .await;
-    active.store(false, Ordering::SeqCst);
-    result
+
+    let tcp = match activate {
+        Ok(Ok(activate))
+            if activate.session_id == key.session_id
+                && activate.generation == key.generation
+                && activate.attempt_id == key.attempt_id =>
+        {
+            attach_runtime.activate(key, activate.attach_token).await
+        }
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => {
+            log::info!("failed to decode AttachActivate: {e:#}");
+            None
+        }
+        Err(_) => {
+            log::info!("AttachActivate not received within timeout");
+            None
+        }
+    };
+    let Some(tcp) = tcp else {
+        return Err(anyhow!("attach never activated (timeout, decode failure, or superseded)"));
+    };
+
+    let (tcp_read, tcp_write) = tcp.into_split();
+    let handle = Arc::new(Mutex::new(Session::new(resume_buffer_size)));
+    let session_id_bytes = *hello.session_id.as_bytes();
+    sessions.insert_existing(session_id_bytes, handle.clone()).await;
+    log::info!("attach established, session_id={}", hex_lower(&session_id_bytes));
+
+    // control stream(APP_ACK用)は既知のsession_idを再利用するだけで、新規
+    // 発行は行わない(#18-4: session_idはクライアントがATTACH_HELLOで既に
+    // 決めている)。8-1と同じ理由で、確立を待たずに中継を先に始める。
+    let control_task = {
+        let conn = conn.clone();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret, session_id_bytes))
+                .await
+            {
+                Ok(Ok((csend, crecv))) => {
+                    log::info!("control stream established, session_id={}", hex_lower(&session_id_bytes));
+                    spawn_app_ack_tasks(csend, crecv, handle);
+                }
+                Ok(Err(e)) => log::info!("no resume support for this connection ({e:#})"),
+                Err(_) => log::info!("control stream not opened within timeout, continuing without resume support"),
+            }
+        })
+    };
+
+    let outcome = relay_buffered(&mut send, &mut recv, tcp_read, tcp_write, handle.clone(), target).await;
+    control_task.abort();
+
+    match outcome {
+        RelayOutcome::TcpDied => {
+            attach_runtime.relay_ended(lease).await;
+            sessions.remove(&session_id_bytes).await;
+        }
+        RelayOutcome::DataStreamDied { tcp_read, tcp_write } => {
+            // まだ`Established`のまま(=fencing slotを保持したまま)にする —
+            // 一致する`RESUME`がこのsession_idの元へ戻ってこられるように。
+            let mut session = handle.lock().await;
+            session.parked_tcp = Some((tcp_read, tcp_write));
+            session.parked_since = Some(std::time::Instant::now());
+        }
+    }
+    Ok(())
 }
 
 /// Phase 8-3: `RESUME` フレームを検証し、既存セッションに park された TCP
@@ -784,7 +1002,7 @@ async fn handle_resume_stream(
     body: &[u8],
     target: SocketAddr,
     session_secret: [u8; 32],
-    active: Arc<AtomicBool>,
+    attach_runtime: Arc<AttachRuntime>,
     sessions: SessionTable,
 ) -> Result<()> {
     let mut session_id = [0u8; 16];
@@ -804,12 +1022,12 @@ async fn handle_resume_stream(
     mac.update(&session_id);
     let expected = mac.finalize().into_bytes();
     if client_proof.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
-        reject(&mut send, FRAME_REJECT_AUTH).await;
+        reject(&mut send, &[FRAME_REJECT_AUTH]).await;
         return Err(anyhow!("resume proof mismatch, rejecting"));
     }
 
     let Some(handle) = sessions.get(&session_id).await else {
-        reject(&mut send, resume::REJECT_UNKNOWN_SESSION).await;
+        reject(&mut send, &[resume::REJECT_UNKNOWN_SESSION]).await;
         return Err(anyhow!(
             "unknown session_id for resume: {}",
             hex_lower(&session_id)
@@ -822,21 +1040,23 @@ async fn handle_resume_stream(
         session.parked_tcp.take()
     };
     let Some((tcp_read, tcp_write)) = parked else {
-        reject(&mut send, resume::REJECT_UNKNOWN_SESSION).await;
+        reject(&mut send, &[resume::REJECT_UNKNOWN_SESSION]).await;
         return Err(anyhow!(
             "session {} not resumable (no parked TCP connection)",
             hex_lower(&session_id)
         ));
     };
 
-    if active
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    // `RESUME`は`ATTACH_HELLO`のfencing判定(`AttachRuntime::hello`)を経由
+    // しない — この`session_id`が現在まさに`Established`スロットを占有して
+    // いる、その`lease`を確認するだけでよい(module docs: 同一sessionへの
+    // resumeはfencing上の競合になり得ない)。
+    let Some(lease) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(session_id)).await
+    else {
         repark(&handle, tcp_read, tcp_write).await;
-        reject(&mut send, FRAME_REJECT_DUPLICATE).await;
-        return Err(anyhow!("duplicate active connection rejected"));
-    }
+        reject(&mut send, &[resume::REJECT_UNKNOWN_SESSION]).await;
+        return Err(anyhow!("no established attach slot for session {}", hex_lower(&session_id)));
+    };
 
     let (helper_committed_offset, helper_sent_offset, replay_bytes) = {
         let session = handle.lock().await;
@@ -848,9 +1068,8 @@ async fn handle_resume_stream(
         )
     };
     let Some(replay_bytes) = replay_bytes else {
-        active.store(false, Ordering::SeqCst);
         repark(&handle, tcp_read, tcp_write).await;
-        reject(&mut send, resume::REJECT_OFFSET_GONE).await;
+        reject(&mut send, &[resume::REJECT_OFFSET_GONE]).await;
         return Err(anyhow!(
             "requested offset {client_delivered_offset} no longer in output buffer for session {}",
             hex_lower(&session_id)
@@ -869,13 +1088,11 @@ async fn handle_resume_stream(
     ack.extend_from_slice(&helper_committed_offset.to_be_bytes());
     ack.extend_from_slice(&helper_sent_offset.to_be_bytes());
     if let Err(e) = send.write_all(&ack).await {
-        active.store(false, Ordering::SeqCst);
         repark(&handle, tcp_read, tcp_write).await;
         return Err(anyhow!("failed to write RESUME_ACK: {e}"));
     }
     if !replay_bytes.is_empty() {
         if let Err(e) = send.write_all(&replay_bytes).await {
-            active.store(false, Ordering::SeqCst);
             repark(&handle, tcp_read, tcp_write).await;
             return Err(anyhow!("failed to replay buffered output: {e}"));
         }
@@ -883,22 +1100,16 @@ async fn handle_resume_stream(
 
     // control stream も新しい connection 上で作り直す（元の control stream は
     // 古い connection に紐づいたまま失効している）。8-1 と同じ理由で、
-    // 確立を待たずに中継を先に始める。
+    // 確立を待たずに中継を先に始める。既知のsession_idをそのまま再利用する
+    // (#18-4: 新規発行はしない)。
     let control_task = {
         let conn = conn.clone();
         let handle = handle.clone();
         tokio::spawn(async move {
-            match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret))
-                .await
+            match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret, session_id)).await
             {
-                Ok(Ok((csend, crecv, _new_id))) => {
-                    // control stream 上の session_id は毎回新規発行されるが、
-                    // resume 後も既存の session_id をそのまま使い続ける
-                    // （sessions テーブルのキーは変更しない）。
-                    log::info!(
-                        "resume: control stream re-established for session_id={}",
-                        hex_lower(&session_id)
-                    );
+                Ok(Ok((csend, crecv))) => {
+                    log::info!("resume: control stream re-established for session_id={}", hex_lower(&session_id));
                     spawn_app_ack_tasks(csend, crecv, handle);
                 }
                 Ok(Err(e)) => log::info!("resume: control stream re-establish failed ({e:#})"),
@@ -917,8 +1128,7 @@ async fn handle_resume_stream(
     )
     .await;
     control_task.abort();
-    active.store(false, Ordering::SeqCst);
-    finish_or_park_session(&sessions, Some(session_id), handle, outcome).await;
+    finish_or_park_session(&sessions, &attach_runtime, lease, Some(session_id), handle, outcome).await;
     Ok(())
 }
 
@@ -966,13 +1176,30 @@ fn compute_proof(
     Ok(mac.finalize().into_bytes().into())
 }
 
-/// control stream を accept し、`CONTROL_HELLO` を検証して `session_id` を発行、
-/// `CONTROL_ACK` を返す。Phase 8 未対応の client（control stream を開かない）向けに
-/// 呼び出し側でタイムアウトを掛けることを想定している。
+/// `ATTACH_HELLO`/`CancelAttach`のproof計算(`#18`): 通常の`compute_proof`と
+/// 同じexporterを使うが、`isekai_transport::proof::compute_proof`の`extra`
+/// パラメータと対称になるよう、`transcript`(`attach_hello_proof_transcript`
+/// 等が返すbyte列)をHMACに追加で混ぜ込む。
+fn compute_attach_proof(conn: &noq::Connection, session_secret: &[u8; 32], transcript: &[u8]) -> Result<[u8; 32]> {
+    let mut exporter = [0u8; 32];
+    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
+        .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
+    let mut mac = HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
+    mac.update(&exporter);
+    mac.update(transcript);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+/// control stream を accept し、`CONTROL_HELLO` を検証して`CONTROL_ACK`を返す。
+/// `session_id`は(#18-4以降)クライアントが`ATTACH_HELLO`で既に決めているため、
+/// ここでは新規発行せず、そのままecho backするだけ。Phase 8 未対応の
+/// client（control stream を開かない）向けに呼び出し側でタイムアウトを
+/// 掛けることを想定している。
 async fn accept_control_stream(
     conn: &noq::Connection,
     session_secret: [u8; 32],
-) -> Result<(noq::SendStream, noq::RecvStream, resume::SessionId)> {
+    session_id: resume::SessionId,
+) -> Result<(noq::SendStream, noq::RecvStream)> {
     let (mut csend, mut crecv) = conn.accept_bi().await.context("no control stream opened")?;
     let mut hello = [0u8; 33];
     crecv
@@ -987,7 +1214,6 @@ async fn accept_control_stream(
         return Err(anyhow!("CONTROL_HELLO proof mismatch"));
     }
 
-    let session_id = SessionTable::generate_session_id();
     let mut ack = Vec::with_capacity(17);
     ack.push(resume::CONTROL_ACK);
     ack.extend_from_slice(&session_id);
@@ -996,91 +1222,25 @@ async fn accept_control_stream(
         .await
         .context("failed to write CONTROL_ACK")?;
 
-    Ok((csend, crecv, session_id))
-}
-
-/// target への TCP 接続・ACK 送出の後、中継を**即座に**開始する。
-/// output buffer は常に用意するが、control stream の accept を待って中継開始を
-/// 遅らせることはしない（旧クライアント・resume 非対応クライアントに対して
-/// 無駄な `HELLO_TIMEOUT` 分の遅延を与えないため。当初 control stream の accept
-/// を先に `await` してから中継する実装にしていたが、control stream を開かない
-/// クライアントとの疎通が最大 `HELLO_TIMEOUT` 秒も遅延するリグレッションを
-/// 実際に e2e テストで検出したため、この設計に変更した）。
-/// control stream の accept は背後タスクとして並行に進め、確立できたら
-/// 実行中の中継が使っている `Session` handle にそのまま APP_ACK タスクを紐付ける。
-async fn relay_with_resume(
-    conn: &noq::Connection,
-    send: &mut noq::SendStream,
-    recv: &mut noq::RecvStream,
-    target: SocketAddr,
-    session_secret: [u8; 32],
-    sessions: &SessionTable,
-    resume_buffer_size: usize,
-    effective_resume_grace_secs: u32,
-) -> Result<()> {
-    let tcp = match TcpStream::connect(target).await {
-        Ok(s) => s,
-        Err(e) => {
-            reject(send, FRAME_REJECT_TARGET).await;
-            return Err(anyhow!("connect to {target} failed: {e}"));
-        }
-    };
-    let mut ack = Vec::with_capacity(5);
-    ack.push(FRAME_ACK);
-    ack.extend_from_slice(&effective_resume_grace_secs.to_be_bytes());
-    send.write_all(&ack).await?;
-    let (tcp_read, tcp_write) = tcp.into_split();
-
-    let handle = Arc::new(Mutex::new(Session::new(resume_buffer_size)));
-    let established_id: Arc<Mutex<Option<resume::SessionId>>> = Arc::new(Mutex::new(None));
-
-    let control_task = {
-        let conn = conn.clone();
-        let handle = handle.clone();
-        let sessions = sessions.clone();
-        let established_id = established_id.clone();
-        tokio::spawn(async move {
-            match tokio::time::timeout(HELLO_TIMEOUT, accept_control_stream(&conn, session_secret))
-                .await
-            {
-                Ok(Ok((csend, crecv, id))) => {
-                    sessions.insert_existing(id, handle.clone()).await;
-                    *established_id.lock().await = Some(id);
-                    log::info!("control stream established, session_id={}", hex_lower(&id));
-                    spawn_app_ack_tasks(csend, crecv, handle);
-                }
-                Ok(Err(e)) => {
-                    log::info!("no resume support for this connection ({e:#})");
-                }
-                Err(_) => {
-                    log::info!("control stream not opened within timeout, continuing without resume support");
-                }
-            }
-        })
-    };
-
-    let outcome = relay_buffered(send, recv, tcp_read, tcp_write, handle.clone(), target).await;
-
-    control_task.abort();
-    let id = *established_id.lock().await;
-    finish_or_park_session(sessions, id, handle, outcome).await;
-    Ok(())
+    Ok((csend, crecv))
 }
 
 /// data stream 側の中継ループ終了後、TCP 接続がまだ生きているとみなせるなら
-/// `Session::parked_tcp` に戻して resume を待てるようにし、TCP 自体が死んで
-/// いるなら（あるいは control stream が一度も確立せず session_id が無いなら）
-/// テーブルから破棄する。
+/// `Session::parked_tcp` に戻して resume を待てるようにし(`AttachArbiter`は
+/// `Established`のまま、`lease`もfencing slotを占有し続ける)、TCP 自体が
+/// 死んでいるなら`AttachRuntime::relay_ended`でslotを解放しテーブルから
+/// 破棄する。`id`が`None`なのは起こり得ない(#18-4以降、session_idは常に
+/// `ATTACH_HELLO`の時点で存在する)が、呼び出し側の型を単純に保つため
+/// `Option`のまま残す。
 async fn finish_or_park_session(
     sessions: &SessionTable,
+    attach_runtime: &Arc<AttachRuntime>,
+    lease: attach_arbiter::LeaseId,
     id: Option<resume::SessionId>,
     handle: Arc<Mutex<Session>>,
     outcome: RelayOutcome,
 ) {
     let Some(id) = id else {
-        // control stream が確立せず session_id も発行されていない
-        // （旧クライアント等）。resume できないので何もしない
-        // （handle はテーブルに登録されていないのでこの Arc が drop されて終わり）。
         return;
     };
     match outcome {
@@ -1089,6 +1249,7 @@ async fn finish_or_park_session(
                 "session {} target connection died, discarding",
                 hex_lower(&id)
             );
+            attach_runtime.relay_ended(lease).await;
             sessions.remove(&id).await;
         }
         RelayOutcome::DataStreamDied {
@@ -1103,6 +1264,7 @@ async fn finish_or_park_session(
             session.parked_tcp = Some((tcp_read, tcp_write));
             session.parked_since = Some(std::time::Instant::now());
             // sessions テーブルには既に insert_existing 済みなのでそのまま残す。
+            // `attach_runtime`はEstablishedのまま(=fencing slotを保持)にする。
         }
     }
 }
@@ -1266,5 +1428,80 @@ async fn relay_buffered(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_request_tests {
+    use super::*;
+    use isekai_protocol::BootstrapCandidateV2;
+
+    fn sample_request(client_candidates: Vec<BootstrapCandidateV2>) -> isekai_protocol::BootstrapRequestV2 {
+        isekai_protocol::BootstrapRequestV2 {
+            v: isekai_protocol::BOOTSTRAP_PROTOCOL_V2,
+            session_id: "00".repeat(16),
+            bootstrap_attempt_id: "11".repeat(16),
+            client_candidates,
+        }
+    }
+
+    #[test]
+    fn resolve_bootstrap_request_reads_validates_and_unlinks_the_file() {
+        let request = sample_request(vec![]);
+        let json = serde_json::to_vec(&request).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bootstrap-request.json");
+        std::fs::write(&path, &json).unwrap();
+
+        let decoded = resolve_bootstrap_request(path.to_str().unwrap()).unwrap();
+        assert_eq!(decoded, request);
+        assert!(!path.exists(), "file should be unlinked after a successful read");
+    }
+
+    #[test]
+    fn resolve_bootstrap_request_rejects_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bootstrap-request.json");
+        std::fs::write(&path, b"not json").unwrap();
+
+        let err = resolve_bootstrap_request(path.to_str().unwrap());
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn resolve_bootstrap_request_errors_on_missing_file() {
+        let err = resolve_bootstrap_request("/nonexistent/isekai-bootstrap-request.json");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn client_candidate_punch_targets_parses_valid_endpoints() {
+        let request = sample_request(vec![
+            BootstrapCandidateV2 {
+                route: "stun-p2p".to_string(),
+                endpoint: "203.0.113.5:4000".to_string(),
+                valid_for_ms: 5_000,
+            },
+            BootstrapCandidateV2 {
+                route: "stun-p2p".to_string(),
+                endpoint: "203.0.113.6:4001".to_string(),
+                valid_for_ms: 5_000,
+            },
+        ]);
+
+        let targets = client_candidate_punch_targets(&request);
+        assert_eq!(
+            targets,
+            vec![
+                "203.0.113.5:4000".parse::<SocketAddr>().unwrap(),
+                "203.0.113.6:4001".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn client_candidate_punch_targets_is_empty_for_no_candidates() {
+        let request = sample_request(vec![]);
+        assert!(client_candidate_punch_targets(&request).is_empty());
     }
 }
