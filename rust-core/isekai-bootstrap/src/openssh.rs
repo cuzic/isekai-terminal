@@ -47,12 +47,18 @@
 //! mock server inject those via `with_extra_ssh_args`, which production
 //! callers have no reason to use.
 
+use std::net::SocketAddr;
 use std::process::Stdio;
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+
+use isekai_protocol::bootstrap_request::{BootstrapCandidateV2, BootstrapRequestV2, BOOTSTRAP_PROTOCOL_V2};
+use isekai_protocol::session_id::{SessionId, SESSION_ID_LEN};
+use isekai_protocol::BootstrapAttemptId;
 
 use crate::backend::BootstrapBackend;
 use crate::error::BootstrapError;
@@ -219,8 +225,39 @@ impl OpenSshBackend {
         via: Option<&JumpSpec>,
         launch: &LaunchSpec,
         remote_binary_path: &str,
+        stun_servers: &[SocketAddr],
     ) -> Result<isekai_protocol::HandshakeJson, BootstrapError> {
         let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
+
+        // `#20a`/`#20b`: every bootstrap operation carries a
+        // `BootstrapRequestV2` over this same exec's stdin, alongside
+        // whatever launch-specific secret (`relay_jwt`) already travels that
+        // way. `client_candidates` is now real: one entry per `stun_servers`
+        // entry that actually answered (`collect_client_stun_candidates`).
+        // `session_id`/`bootstrap_attempt_id` are freshly random per call —
+        // see `isekai_protocol::bootstrap_request`'s module docs for why
+        // these are their own identifiers, unrelated to any later ATTACH v2
+        // fencing identity the eventual QUIC connection will use.
+        let bootstrap_request = fresh_bootstrap_request_v2(stun_servers).await;
+        let request_bytes = serde_json::to_vec(&bootstrap_request).expect("BootstrapRequestV2 always serializes");
+
+        // `#20b`: pass the first configured STUN server through to the
+        // remote `isekai-pipe serve` too (`LaunchSpec::Direct` only —
+        // `isekai-pipe serve` itself rejects `--stun-server`/`--relay`
+        // together, since they're alternative transports, `#11`'s own
+        // research confirmed this validation already exists), so it reports
+        // its *own* `server-reflexive` candidate back in the handshake
+        // (completing the other half of the exchange —
+        // `client_candidates` above is the client's own address(es), this is
+        // the server's). Only one is needed server-side (`isekai-pipe serve
+        // --stun-server` has always been single-valued, `#11` deliberately
+        // scoped multi-STUN collection to the client side only); the
+        // remaining configured servers still contribute to
+        // `client_candidates` regardless.
+        let stun_server_arg = match stun_servers.first() {
+            Some(addr) => format!(" --stun-server {addr}"),
+            None => String::new(),
+        };
 
         let (cmd, stdin_payload) = match launch {
             LaunchSpec::Relay(relay) => {
@@ -256,11 +293,29 @@ impl OpenSshBackend {
                 // readable by any other local user on the remote host via `ps
                 // aux`/`/proc/<pid>/cmdline`, exactly like `session_secret` already
                 // avoids that path.
+                //
+                // `#20a-2`: the `BootstrapRequestV2` JSON travels first on this
+                // same stdin, immediately followed by `relay_jwt` — both
+                // length-prefixed (the lengths themselves aren't secret, so
+                // they're safe to interpolate into the command string) and
+                // split with `head -c` (not `dd bs=1`, which reads one byte
+                // per syscall and would be needlessly slow for a JSON payload
+                // that can run to several KB once real candidates are wired
+                // in by `#20b`). Byte counts are verified with `wc -c` before
+                // launch so a truncated stdin (e.g. the ssh connection
+                // dropping mid-write) fails closed instead of launching
+                // `isekai-pipe serve` against a partially-written file.
+                let request_len = request_bytes.len();
+                let jwt_len = relay.relay_jwt.len();
                 let cmd = format!(
                     "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
-                     cat > $tmpdir/relay_jwt && \
+                     head -c {request_len} > $tmpdir/bootstrap-request.json && \
+                     head -c {jwt_len} > $tmpdir/relay_jwt && \
+                     [ \"$(wc -c < $tmpdir/bootstrap-request.json)\" -eq {request_len} ] && \
+                     [ \"$(wc -c < $tmpdir/relay_jwt)\" -eq {jwt_len} ] && \
                      ( setsid {remote_binary_path} serve --target 127.0.0.1:22 \
                      --relay {relay_addr} --relay-sni {quoted_sni} --relay-jwt-file $tmpdir/relay_jwt \
+                     --bootstrap-request-file $tmpdir/bootstrap-request.json \
                      --max-idle-lifetime {idle_lifetime_secs} \
                      </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
                      for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
@@ -269,17 +324,23 @@ impl OpenSshBackend {
                      done; \
                      cat $tmpdir/handshake"
                 );
-                (cmd, Some(relay.relay_jwt.clone().into_bytes()))
+                let stdin_payload = [request_bytes.as_slice(), relay.relay_jwt.as_bytes()].concat();
+                (cmd, Some(stdin_payload))
             }
             // No relay, no STUN: the client dials this host's own SSH
             // bootstrap address at the port reported in `candidates`
-            // (`direct-by-bootstrap-host`, `archive/HELPER_PROTOCOL.md` §2). No
-            // stdin payload needed (nothing secret to deliver out of band).
+            // (`direct-by-bootstrap-host`, `archive/HELPER_PROTOCOL.md` §2).
+            // Only the (non-secret-carrying) `BootstrapRequestV2` travels over
+            // stdin here — nothing else to deliver out of band.
             LaunchSpec::Direct { idle_lifetime_secs } => {
+                let request_len = request_bytes.len();
                 let cmd = format!(
                     "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
+                     head -c {request_len} > $tmpdir/bootstrap-request.json && \
+                     [ \"$(wc -c < $tmpdir/bootstrap-request.json)\" -eq {request_len} ] && \
                      ( setsid {remote_binary_path} serve --target 127.0.0.1:22 \
-                     --bind 0.0.0.0:0 --max-idle-lifetime {idle_lifetime_secs} \
+                     --bind 0.0.0.0:0 --bootstrap-request-file $tmpdir/bootstrap-request.json{stun_server_arg} \
+                     --max-idle-lifetime {idle_lifetime_secs} \
                      </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
                      for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
                        [ -s $tmpdir/handshake ] && break; \
@@ -287,7 +348,7 @@ impl OpenSshBackend {
                      done; \
                      cat $tmpdir/handshake"
                 );
-                (cmd, None)
+                (cmd, Some(request_bytes.clone()))
             }
         };
 
@@ -301,7 +362,11 @@ impl OpenSshBackend {
                 status: out.status,
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             }),
-            [single] => Ok(isekai_protocol::handshake::decode_handshake_json(single)?),
+            // `#20a-4`: every launch above sends a `BootstrapRequestV2`, so a
+            // compliant `isekai-pipe serve` always echoes back a
+            // `BootstrapReportV2` envelope (never a bare `HandshakeJson`) —
+            // decode accordingly and unwrap the inner handshake.
+            [single] => Ok(isekai_protocol::bootstrap_request::decode_bootstrap_report_v2(single)?.handshake),
             _ => Err(BootstrapError::UnexpectedStdout { extra_lines: non_empty_lines.len() - 1 }),
         }
     }
@@ -311,6 +376,69 @@ struct SshOutput {
     status: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+/// How long a bootstrap-discovered client candidate is claimed valid for
+/// (`BootstrapCandidateV2::valid_for_ms`) — comfortably longer than a single
+/// bootstrap round trip (typically well under a second on loopback, at most a
+/// few seconds over a real network) but far under
+/// `isekai_protocol::bootstrap_request::MAX_CANDIDATE_VALID_FOR_MS` (5
+/// minutes), which the receiver clamps to regardless.
+const CLIENT_CANDIDATE_VALID_FOR_MS: u64 = 30_000;
+
+/// Queries each of `stun_servers` for this side's own observed address — a
+/// fresh, throwaway UDP socket per query (discovery only, never reused for
+/// an actual QUIC dial later) — producing one [`BootstrapCandidateV2`] per
+/// server that answered (`#20b`). A server that fails to respond
+/// (unreachable, timed out, local bind failure) is logged and skipped rather
+/// than failing the whole bootstrap attempt: the server-side punch loop
+/// (`isekai-pipe serve`, `#20a-3`) simply gets fewer candidates to try, and
+/// the existing `direct-by-bootstrap-host`/relay candidates are unaffected
+/// either way.
+async fn collect_client_stun_candidates(stun_servers: &[SocketAddr]) -> Vec<BootstrapCandidateV2> {
+    let mut candidates = Vec::with_capacity(stun_servers.len());
+    for &stun_server in stun_servers {
+        let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Ok(socket) => socket,
+            Err(e) => {
+                log::warn!(
+                    "isekai-bootstrap: failed to bind a UDP socket to query STUN server {stun_server}, skipping: {e}"
+                );
+                continue;
+            }
+        };
+        match isekai_stun::query_stun(&socket, stun_server).await {
+            Ok(observed_addr) => candidates.push(BootstrapCandidateV2 {
+                route: "stun-p2p".to_string(),
+                endpoint: observed_addr.to_string(),
+                valid_for_ms: CLIENT_CANDIDATE_VALID_FOR_MS,
+            }),
+            Err(e) => {
+                log::warn!("isekai-bootstrap: STUN query to {stun_server} failed, skipping this candidate: {e}");
+            }
+        }
+    }
+    candidates
+}
+
+/// Builds a fresh `BootstrapRequestV2` with randomly-generated
+/// `session_id`/`bootstrap_attempt_id` and real client candidates collected
+/// from `stun_servers` (`#20b`, `collect_client_stun_candidates`). See
+/// `isekai_protocol::bootstrap_request`'s module docs for why the
+/// session/attempt identifiers are generated here, independent of any ATTACH
+/// v2 fencing identity a later QUIC connection attempt will use.
+async fn fresh_bootstrap_request_v2(stun_servers: &[SocketAddr]) -> BootstrapRequestV2 {
+    let mut session_id_bytes = [0u8; SESSION_ID_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut session_id_bytes);
+    let mut attempt_id_bytes = [0u8; isekai_protocol::bootstrap_request::BOOTSTRAP_ATTEMPT_ID_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut attempt_id_bytes);
+
+    BootstrapRequestV2 {
+        v: BOOTSTRAP_PROTOCOL_V2,
+        session_id: SessionId::from_bytes(session_id_bytes).to_hex(),
+        bootstrap_attempt_id: BootstrapAttemptId::from_bytes(attempt_id_bytes).to_hex(),
+        client_candidates: collect_client_stun_candidates(stun_servers).await,
+    }
 }
 
 /// The directory `mkdir -p` should create for `path` (a full remote binary
@@ -335,6 +463,7 @@ impl BootstrapBackend for OpenSshBackend {
         helper_binary: &[u8],
         launch: &LaunchSpec,
         remote_binary_path: Option<&str>,
+        stun_servers: &[SocketAddr],
     ) -> Result<BootstrapReport, BootstrapError> {
         let default_path = format!("{ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}");
         let remote_binary_path = remote_binary_path.unwrap_or(&default_path);
@@ -342,8 +471,102 @@ impl BootstrapBackend for OpenSshBackend {
             .map_err(|e| BootstrapError::InvalidRemotePath(e.to_string()))?;
 
         self.upload_binary(target, via, helper_binary, remote_binary_path).await?;
-        let handshake =
-            self.launch_and_capture_handshake(target, via, launch, remote_binary_path).await?;
+        let handshake = self
+            .launch_and_capture_handshake(target, via, launch, remote_binary_path, stun_servers)
+            .await?;
         Ok(BootstrapReport { handshake })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same minimal mock STUN server (RFC 5389 Binding Request/Response) used
+    /// throughout this workspace (`isekai-pipe/tests/serve_e2e.rs`,
+    /// `isekai-transport/tests/stun_p2p_e2e.rs`) — duplicated per this
+    /// crate's own convention rather than shared.
+    async fn spawn_mock_stun_server() -> SocketAddr {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, from)) = server.recv_from(&mut buf).await else { break };
+                if n < 20 {
+                    continue;
+                }
+                let transaction_id = &buf[8..20];
+                let SocketAddr::V4(from_v4) = from else { continue };
+
+                let magic_cookie: u32 = 0x2112_A442;
+                let xport = from_v4.port() ^ ((magic_cookie >> 16) as u16);
+                let xaddr = u32::from(*from_v4.ip()) ^ magic_cookie;
+
+                let mut resp = Vec::with_capacity(32);
+                resp.extend_from_slice(&0x0101u16.to_be_bytes());
+                resp.extend_from_slice(&12u16.to_be_bytes());
+                resp.extend_from_slice(&magic_cookie.to_be_bytes());
+                resp.extend_from_slice(transaction_id);
+                resp.extend_from_slice(&0x0020u16.to_be_bytes());
+                resp.extend_from_slice(&8u16.to_be_bytes());
+                resp.push(0);
+                resp.push(0x01);
+                resp.extend_from_slice(&xport.to_be_bytes());
+                resp.extend_from_slice(&xaddr.to_be_bytes());
+
+                let _ = server.send_to(&resp, from).await;
+            }
+        });
+        addr
+    }
+
+    async fn dead_stun_server() -> SocketAddr {
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        addr
+    }
+
+    #[tokio::test]
+    async fn collect_client_stun_candidates_yields_one_per_responding_server() {
+        let stun_a = spawn_mock_stun_server().await;
+        let stun_b = spawn_mock_stun_server().await;
+
+        let candidates = collect_client_stun_candidates(&[stun_a, stun_b]).await;
+
+        assert_eq!(candidates.len(), 2);
+        for candidate in &candidates {
+            assert_eq!(candidate.route, "stun-p2p");
+            assert_eq!(candidate.valid_for_ms, CLIENT_CANDIDATE_VALID_FOR_MS);
+            let addr: SocketAddr = candidate.endpoint.parse().expect("endpoint should be a valid socket address");
+            assert_eq!(addr.ip(), std::net::Ipv4Addr::LOCALHOST);
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_client_stun_candidates_skips_unreachable_servers_without_failing() {
+        let dead = dead_stun_server().await;
+        let real = spawn_mock_stun_server().await;
+
+        let candidates = collect_client_stun_candidates(&[dead, real]).await;
+
+        assert_eq!(candidates.len(), 1, "the dead server should be skipped, not fail the whole collection");
+    }
+
+    #[tokio::test]
+    async fn collect_client_stun_candidates_is_empty_for_no_servers() {
+        assert!(collect_client_stun_candidates(&[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fresh_bootstrap_request_v2_carries_the_collected_candidates() {
+        let real = spawn_mock_stun_server().await;
+        let request = fresh_bootstrap_request_v2(&[real]).await;
+
+        assert_eq!(request.v, BOOTSTRAP_PROTOCOL_V2);
+        assert!(request.session_id().is_ok());
+        assert!(request.bootstrap_attempt_id().is_ok());
+        assert_eq!(request.client_candidates.len(), 1);
     }
 }

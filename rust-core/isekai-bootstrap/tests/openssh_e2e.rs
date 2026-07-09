@@ -242,7 +242,13 @@ fn dummy_relay_spec() -> RelayLaunchSpec {
     }
 }
 
-const VALID_HANDSHAKE_JSON: &str = r#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"}]}"#;
+/// `#20a-4`: every real `OpenSshBackend` launch now sends a
+/// `BootstrapRequestV2` over stdin, so a compliant `isekai-pipe serve`
+/// always echoes back a `BootstrapReportV2` envelope (never a bare
+/// `HandshakeJson`) on stdout. `session_id`/`bootstrap_attempt_id` here are
+/// arbitrary valid hex — these tests don't correlate them against the
+/// request the fake script actually received.
+const VALID_BOOTSTRAP_REPORT_JSON: &str = r#"{"v":2,"session_id":"00000000000000000000000000000000","bootstrap_attempt_id":"11111111111111111111111111111111","handshake":{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"}]}}"#;
 
 #[tokio::test]
 async fn install_and_start_gets_a_real_handshake_over_a_real_ssh_subprocess() {
@@ -261,14 +267,14 @@ async fn install_and_start_gets_a_real_handshake_over_a_real_ssh_subprocess() {
     // Stands in for the isekai-helper binary: a shell script that ignores
     // its args and just emits exactly one line of valid handshake JSON,
     // exactly like the real isekai-helper does on stdout at startup.
-    let fake_helper_script = format!("#!/bin/sh\necho '{VALID_HANDSHAKE_JSON}'\n");
+    let fake_helper_script = format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n");
 
     let backend = test_backend(&key_path);
     let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
 
     let report = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None),
+        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None, &[]),
     )
     .await
     .expect("install_and_start should not hang")
@@ -306,7 +312,7 @@ async fn install_and_start_passes_idle_lifetime_to_the_launched_helper() {
     // isekai-helper's contract, so argv can't be echoed there instead).
     let argv_log = home.join("argv.log");
     let fake_helper_script =
-        format!("#!/bin/sh\necho \"$@\" > {}\necho '{VALID_HANDSHAKE_JSON}'\n", argv_log.display());
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n", argv_log.display());
 
     let backend = test_backend(&key_path);
     let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
@@ -319,7 +325,7 @@ async fn install_and_start_passes_idle_lifetime_to_the_launched_helper() {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(relay), None),
+        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(relay), None, &[]),
     )
     .await
     .expect("install_and_start should not hang")
@@ -358,7 +364,7 @@ async fn install_and_start_direct_never_passes_relay_args() {
 
     let argv_log = home.join("argv.log");
     let fake_helper_script =
-        format!("#!/bin/sh\necho \"$@\" > {}\necho '{VALID_HANDSHAKE_JSON}'\n", argv_log.display());
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n", argv_log.display());
 
     let backend = test_backend(&key_path);
     let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
@@ -371,6 +377,7 @@ async fn install_and_start_direct_never_passes_relay_args() {
             fake_helper_script.as_bytes(),
             &LaunchSpec::Direct { idle_lifetime_secs: 86_400 },
             None,
+            &[],
         ),
     )
     .await
@@ -406,7 +413,7 @@ async fn install_and_start_uses_custom_remote_binary_path() {
 
     let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
 
-    let fake_helper_script = format!("#!/bin/sh\necho '{VALID_HANDSHAKE_JSON}'\n");
+    let fake_helper_script = format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n");
 
     let backend = test_backend(&key_path);
     let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
@@ -423,6 +430,7 @@ async fn install_and_start_uses_custom_remote_binary_path() {
             fake_helper_script.as_bytes(),
             &LaunchSpec::Direct { idle_lifetime_secs: 86_400 },
             Some(custom_path),
+            &[],
         ),
     )
     .await
@@ -460,14 +468,14 @@ async fn install_and_start_fails_closed_when_stdout_has_extra_lines() {
     // JSON. `OpenSshBackend` must reject this rather than guess which line
     // is "the real one".
     let fake_helper_script =
-        format!("#!/bin/sh\necho '{VALID_HANDSHAKE_JSON}'\necho 'unexpected warning: something else happened'\n");
+        format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\necho 'unexpected warning: something else happened'\n");
 
     let backend = test_backend(&key_path);
     let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None),
+        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None, &[]),
     )
     .await
     .expect("install_and_start should not hang");
@@ -478,4 +486,174 @@ async fn install_and_start_fails_closed_when_stdout_has_extra_lines() {
         }
         other => panic!("expected UnexpectedStdout, got: {other:?}"),
     }
+}
+
+/// `#20a-2`: the `BootstrapRequestV2` JSON travels intact over the same
+/// stdin as `relay_jwt`, length-prefixed and split apart remotely — this
+/// proves the split actually produces byte-exact, independently-decodable
+/// files rather than corrupting either payload (e.g. off-by-one length
+/// arithmetic truncating the JSON or bleeding into the JWT file).
+#[tokio::test]
+async fn install_and_start_delivers_an_intact_bootstrap_request_alongside_relay_jwt() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+
+    // Stands in for `isekai-pipe serve --bootstrap-request-file <path>`
+    // (`#20a-3`, not implemented yet): captures whatever the remote shell
+    // wrote to the request/JWT files it was given as its own argv, so this
+    // test can inspect both independently of any real parsing logic.
+    let request_copy = home.join("captured-request.json");
+    let jwt_copy = home.join("captured-relay-jwt");
+    let fake_helper_script = format!(
+        "#!/bin/sh\n\
+         while [ $# -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             --bootstrap-request-file) cp \"$2\" {request_copy}; shift 2 ;;\n\
+             --relay-jwt-file) cp \"$2\" {jwt_copy}; shift 2 ;;\n\
+             *) shift ;;\n\
+           esac\n\
+         done\n\
+         echo '{VALID_BOOTSTRAP_REPORT_JSON}'\n",
+        request_copy = request_copy.display(),
+        jwt_copy = jwt_copy.display(),
+    );
+
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+    let relay = dummy_relay_spec();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, None, fake_helper_script.as_bytes(), &LaunchSpec::Relay(relay.clone()), None, &[]),
+    )
+    .await
+    .expect("install_and_start should not hang")
+    .expect("install_and_start should succeed against the mock server");
+
+    let captured_request = std::fs::read(&request_copy).expect("bootstrap request file should have been captured");
+    let request: isekai_protocol::BootstrapRequestV2 =
+        serde_json::from_slice(&captured_request).expect("captured bootstrap request should be valid JSON");
+    assert_eq!(request.v, isekai_protocol::BOOTSTRAP_PROTOCOL_V2);
+    assert!(request.session_id().is_ok(), "session_id should decode as a valid hex SessionId");
+    assert!(request.bootstrap_attempt_id().is_ok(), "bootstrap_attempt_id should decode as a valid hex id");
+    assert!(request.client_candidates.is_empty(), "#20a-2 sends no client candidates yet (#20b's job)");
+
+    let captured_jwt = std::fs::read_to_string(&jwt_copy).expect("relay_jwt file should have been captured");
+    assert_eq!(captured_jwt, relay.relay_jwt, "relay_jwt must arrive byte-exact despite sharing stdin with the request JSON");
+}
+
+/// Minimal mock STUN server (RFC 5389 Binding Request/Response), same shape
+/// used throughout this workspace.
+async fn spawn_mock_stun_server() -> SocketAddr {
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((n, from)) = server.recv_from(&mut buf).await else { break };
+            if n < 20 {
+                continue;
+            }
+            let transaction_id = &buf[8..20];
+            let SocketAddr::V4(from_v4) = from else { continue };
+
+            let magic_cookie: u32 = 0x2112_A442;
+            let xport = from_v4.port() ^ ((magic_cookie >> 16) as u16);
+            let xaddr = u32::from(*from_v4.ip()) ^ magic_cookie;
+
+            let mut resp = Vec::with_capacity(32);
+            resp.extend_from_slice(&0x0101u16.to_be_bytes());
+            resp.extend_from_slice(&12u16.to_be_bytes());
+            resp.extend_from_slice(&magic_cookie.to_be_bytes());
+            resp.extend_from_slice(transaction_id);
+            resp.extend_from_slice(&0x0020u16.to_be_bytes());
+            resp.extend_from_slice(&8u16.to_be_bytes());
+            resp.push(0);
+            resp.push(0x01);
+            resp.extend_from_slice(&xport.to_be_bytes());
+            resp.extend_from_slice(&xaddr.to_be_bytes());
+
+            let _ = server.send_to(&resp, from).await;
+        }
+    });
+    addr
+}
+
+/// `#20b`: when `install_and_start` is given real STUN servers, the
+/// `BootstrapRequestV2` it sends must carry a real client candidate learned
+/// from querying them, and the remote launch command (`LaunchSpec::Direct`)
+/// must pass the first one through as `--stun-server` so the remote side
+/// reports its own `server-reflexive` candidate back too.
+#[tokio::test]
+async fn install_and_start_delivers_real_stun_candidates_when_stun_servers_are_configured() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+    let stun_server = spawn_mock_stun_server().await;
+
+    let request_copy = home.join("captured-request.json");
+    let argv_log = home.join("argv.log");
+    let fake_helper_script = format!(
+        "#!/bin/sh\n\
+         echo \"$@\" > {argv_log}\n\
+         while [ $# -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             --bootstrap-request-file) cp \"$2\" {request_copy}; shift 2 ;;\n\
+             *) shift ;;\n\
+           esac\n\
+         done\n\
+         echo '{VALID_BOOTSTRAP_REPORT_JSON}'\n",
+        request_copy = request_copy.display(),
+        argv_log = argv_log.display(),
+    );
+
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(
+            &target,
+            None,
+            fake_helper_script.as_bytes(),
+            &LaunchSpec::Direct { idle_lifetime_secs: 86_400 },
+            None,
+            &[stun_server],
+        ),
+    )
+    .await
+    .expect("install_and_start should not hang")
+    .expect("install_and_start should succeed against the mock server");
+
+    let captured_request = std::fs::read(&request_copy).expect("bootstrap request file should have been captured");
+    let request: isekai_protocol::BootstrapRequestV2 =
+        serde_json::from_slice(&captured_request).expect("captured bootstrap request should be valid JSON");
+    assert_eq!(request.client_candidates.len(), 1, "querying one real STUN server should yield one client candidate");
+    assert_eq!(request.client_candidates[0].route, "stun-p2p");
+    let candidate_addr: SocketAddr =
+        request.client_candidates[0].endpoint.parse().expect("candidate endpoint should be a valid socket address");
+    assert_eq!(candidate_addr.ip(), std::net::Ipv4Addr::LOCALHOST);
+
+    let argv = std::fs::read_to_string(&argv_log).expect("stand-in script should have recorded its argv");
+    assert!(
+        argv.contains(&format!("--stun-server {stun_server}")),
+        "expected argv to contain '--stun-server {stun_server}', got: {argv:?}"
+    );
 }

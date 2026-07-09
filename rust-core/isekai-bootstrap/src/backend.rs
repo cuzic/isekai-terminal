@@ -3,6 +3,8 @@
 //! `--via` fallback path (`archive/ISEKAI_SSH_DESIGN.md` "CLIコマンド構成" /
 //! "`--via` の実装方式").
 
+use std::net::SocketAddr;
+
 use async_trait::async_trait;
 
 use crate::error::BootstrapError;
@@ -17,6 +19,15 @@ use crate::types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec};
 /// (`ISEKAI_PIPE_DESIGN.md`); `None` falls back to
 /// `isekai_protocol::bootstrap::{ISEKAI_PIPE_INSTALL_DIR, ISEKAI_PIPE_BIN_NAME}`.
 ///
+/// `stun_servers` (`#20b`): STUN servers the caller has configured (e.g.
+/// `isekai-ssh`'s `#@isekai stun` directive / `isekai-ssh init --stun-server`)
+/// — the implementation queries each for this side's own observed address
+/// and includes the results as `BootstrapRequestV2.client_candidates` sent
+/// to the remote side, and passes the first one through to the launched
+/// `isekai-helper` so it reports its own `server-reflexive` candidate back
+/// too. An empty slice disables STUN candidate exchange entirely (today's
+/// pre-`#20b` behavior).
+///
 /// Implementations must never let anything but the `isekai-helper` binary's
 /// own stdout(1-line-handshake-JSON)/stderr reach their caller — see
 /// `OpenSshBackend`'s module docs for the concrete contract this phase
@@ -30,6 +41,7 @@ pub trait BootstrapBackend: Send + Sync {
         helper_binary: &[u8],
         launch: &LaunchSpec,
         remote_binary_path: Option<&str>,
+        stun_servers: &[SocketAddr],
     ) -> Result<BootstrapReport, BootstrapError>;
 }
 

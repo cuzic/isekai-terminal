@@ -321,6 +321,14 @@ pub enum CandidateOriginKind {
     /// all pointing at the same isekai-helper instance (same cert pin,
     /// session secret, and server name) for relay-endpoint fallback.
     ConfigRelay,
+    /// One of the alternate STUN servers listed in
+    /// `ConnectionIntent::stun_servers` (`ConfigStunProvider`, `#11`) — every
+    /// candidate targets the *same* peer (`IntentTransport::StunP2p`'s own
+    /// `peer_addr`/`server_name`), only the STUN server used to learn this
+    /// side's own observed address before hole-punching differs
+    /// (`CandidateRoute::StunP2p`'s own docs on why that's a distinct
+    /// candidate, not a duplicate).
+    ConfigStun,
 }
 
 impl CandidateOriginKind {
@@ -330,6 +338,7 @@ impl CandidateOriginKind {
         match self {
             CandidateOriginKind::LegacyIntent => "legacy-intent",
             CandidateOriginKind::ConfigRelay => "config-relay",
+            CandidateOriginKind::ConfigStun => "config-stun",
         }
     }
 }
