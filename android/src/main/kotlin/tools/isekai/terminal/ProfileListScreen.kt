@@ -101,6 +101,12 @@ fun ProfileListScreen(
         mutableStateOf(prefs.getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE, false))
     }
 
+    // リモートからの OSC 52 query(クリップボード読み出し)応答も push とは別にopt-inする
+    // (デバイス側の機密情報がリモートへ流出するリスクがあるため、既定OFF)。
+    var remoteClipboardPullEnabled by remember {
+        mutableStateOf(prefs.getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL, false))
+    }
+
     Scaffold(
         topBar = {
             Row(
@@ -143,6 +149,16 @@ fun ProfileListScreen(
                                 remoteClipboardWriteEnabled = !remoteClipboardWriteEnabled
                                 prefs.edit()
                                     .putBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE, remoteClipboardWriteEnabled)
+                                    .apply()
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (remoteClipboardPullEnabled) "リモートへのクリップボード送信: ON" else "リモートへのクリップボード送信: OFF") },
+                            onClick = {
+                                showMenu = false
+                                remoteClipboardPullEnabled = !remoteClipboardPullEnabled
+                                prefs.edit()
+                                    .putBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL, remoteClipboardPullEnabled)
                                     .apply()
                             },
                         )

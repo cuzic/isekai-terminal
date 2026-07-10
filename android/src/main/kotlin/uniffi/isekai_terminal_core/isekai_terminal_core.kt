@@ -656,6 +656,9 @@ internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod8 : com.sun.
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod9 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod10 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 internal interface UniffiCallbackInterfaceSessionCallbackMethod0 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`data`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
@@ -695,6 +698,9 @@ internal interface UniffiCallbackInterfaceSessionCallbackMethod11 : com.sun.jna.
 internal interface UniffiCallbackInterfaceSessionCallbackMethod12 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceSessionCallbackMethod13 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 @Structure.FieldOrder("uniffiFree", "uniffiClone", "onDiagnosticEvent")
 internal open class UniffiVTableCallbackInterfaceDiagnosticCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -733,7 +739,7 @@ internal open class UniffiVTableCallbackInterfaceEventWakeListener(
     }
 
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite")
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest")
 internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -747,6 +753,7 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `onForwardStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod7? = null,
     @JvmField internal var `onAgentSignRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod8? = null,
     @JvmField internal var `onClipboardWrite`: UniffiCallbackInterfaceOrchestratorCallbackMethod9? = null,
+    @JvmField internal var `onClipboardPullRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod10? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -761,7 +768,8 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onForwardStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod7? = null,
         `onAgentSignRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod8? = null,
         `onClipboardWrite`: UniffiCallbackInterfaceOrchestratorCallbackMethod9? = null,
-    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,), Structure.ByValue
+        `onClipboardPullRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod10? = null,
+    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceOrchestratorCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -776,10 +784,11 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onForwardStateChanged` = other.`onForwardStateChanged`
         `onAgentSignRequest` = other.`onAgentSignRequest`
         `onClipboardWrite` = other.`onClipboardWrite`
+        `onClipboardPullRequest` = other.`onClipboardPullRequest`
     }
 
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onData", "onHostKey", "onConnected", "onDisconnected", "onScreenUpdate", "onTrzszRequest", "onTrzszDownloadChunk", "onTrzszProgress", "onTrzszFinished", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite")
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onData", "onHostKey", "onConnected", "onDisconnected", "onScreenUpdate", "onTrzszRequest", "onTrzszDownloadChunk", "onTrzszProgress", "onTrzszFinished", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest")
 internal open class UniffiVTableCallbackInterfaceSessionCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -796,6 +805,7 @@ internal open class UniffiVTableCallbackInterfaceSessionCallback(
     @JvmField internal var `onForwardStateChanged`: UniffiCallbackInterfaceSessionCallbackMethod10? = null,
     @JvmField internal var `onAgentSignRequest`: UniffiCallbackInterfaceSessionCallbackMethod11? = null,
     @JvmField internal var `onClipboardWrite`: UniffiCallbackInterfaceSessionCallbackMethod12? = null,
+    @JvmField internal var `onClipboardPullRequest`: UniffiCallbackInterfaceSessionCallbackMethod13? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -813,7 +823,8 @@ internal open class UniffiVTableCallbackInterfaceSessionCallback(
         `onForwardStateChanged`: UniffiCallbackInterfaceSessionCallbackMethod10? = null,
         `onAgentSignRequest`: UniffiCallbackInterfaceSessionCallbackMethod11? = null,
         `onClipboardWrite`: UniffiCallbackInterfaceSessionCallbackMethod12? = null,
-    ): UniffiVTableCallbackInterfaceSessionCallback(`uniffiFree`,`uniffiClone`,`onData`,`onHostKey`,`onConnected`,`onDisconnected`,`onScreenUpdate`,`onTrzszRequest`,`onTrzszDownloadChunk`,`onTrzszProgress`,`onTrzszFinished`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,), Structure.ByValue
+        `onClipboardPullRequest`: UniffiCallbackInterfaceSessionCallbackMethod13? = null,
+    ): UniffiVTableCallbackInterfaceSessionCallback(`uniffiFree`,`uniffiClone`,`onData`,`onHostKey`,`onConnected`,`onDisconnected`,`onScreenUpdate`,`onTrzszRequest`,`onTrzszDownloadChunk`,`onTrzszProgress`,`onTrzszFinished`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceSessionCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -831,6 +842,7 @@ internal open class UniffiVTableCallbackInterfaceSessionCallback(
         `onForwardStateChanged` = other.`onForwardStateChanged`
         `onAgentSignRequest` = other.`onAgentSignRequest`
         `onClipboardWrite` = other.`onClipboardWrite`
+        `onClipboardPullRequest` = other.`onClipboardPullRequest`
     }
 
 }
@@ -1147,6 +1159,8 @@ external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_write(
 ): Int
+external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_pull_request(
+): Int
 external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_data(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_host_key(
@@ -1172,6 +1186,8 @@ external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_forw
 external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_agent_sign_request(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_write(
+): Int
+external fun uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_pull_request(
 ): Int
 external fun ffi_isekai_terminal_core_uniffi_contract_version(
 ): Int
@@ -2067,6 +2083,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_write() != 56361) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_pull_request() != 24281) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_data() != 62372) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2104,6 +2123,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_write() != 3663) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_pull_request() != 20969) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -9437,6 +9459,15 @@ public interface OrchestratorCallback {
      */
     fun `onClipboardWrite`(`text`: kotlin.String)
     
+    /**
+     * リモートが OSC 52 query(`ESC]52;c;?BEL`)でクリップボードの読み出しを要求した。
+     * `host_key`/`agent_sign_request`確認と同じ同期ブロッキング方式(Rust側の
+     * `spawn_blocking`から呼ばれる)。opt-in設定が無効、またはクリップボードが
+     * 空/取得不可なら`None`を返す(この場合デバイス側からは応答を一切送らない——
+     * 何も返さない方が「機能の有無自体を教えない」という意味で安全なため)。
+     */
+    fun `onClipboardPullRequest`(): kotlin.String?
+    
     companion object
 }
 
@@ -9567,6 +9598,17 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+    internal object `onClipboardPullRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod10 {
+        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onClipboardPullRequest`(
+                )
+            }
+            val writeReturn = { value: kotlin.String? -> uniffiOutReturn.setValue(FfiConverterOptionalString.lower(value)) }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
 
     internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
@@ -9593,6 +9635,7 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
         `onForwardStateChanged`,
         `onAgentSignRequest`,
         `onClipboardWrite`,
+        `onClipboardPullRequest`,
     )
 
     // Registers the foreign callback with the Rust side.
@@ -9640,6 +9683,8 @@ public interface SessionCallback {
     fun `onAgentSignRequest`(`keyFingerprint`: kotlin.String): kotlin.Boolean
     
     fun `onClipboardWrite`(`text`: kotlin.String)
+    
+    fun `onClipboardPullRequest`(): kotlin.String?
     
     companion object
 }
@@ -9812,6 +9857,17 @@ internal object uniffiCallbackInterfaceSessionCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+    internal object `onClipboardPullRequest`: UniffiCallbackInterfaceSessionCallbackMethod13 {
+        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeSessionCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onClipboardPullRequest`(
+                )
+            }
+            val writeReturn = { value: kotlin.String? -> uniffiOutReturn.setValue(FfiConverterOptionalString.lower(value)) }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
 
     internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
@@ -9841,6 +9897,7 @@ internal object uniffiCallbackInterfaceSessionCallback {
         `onForwardStateChanged`,
         `onAgentSignRequest`,
         `onClipboardWrite`,
+        `onClipboardPullRequest`,
     )
 
     // Registers the foreign callback with the Rust side.

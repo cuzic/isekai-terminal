@@ -35,6 +35,15 @@ const val PREF_KEY_SCREEN_PROTECTION = "screen_protection_enabled"
 const val PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE = "allow_remote_clipboard_write"
 
 /**
+ * `SharedPreferences("isekai_terminal_ui")` に保存する「リモートからのクリップボード読み出し
+ * (OSC 52 query への応答)を許可する」設定のキー。既定OFFのオプトイン(デバイス側の
+ * クリップボード内容(パスワード等を含みうる)がリモートへ流出するリスクがあるため、
+ * 書き込み側([PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE])とは別々にopt-inできるようにしている、
+ * `ISEKAI_PIPE_DESIGN.md` §8 Epic M参照)。
+ */
+const val PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL = "allow_remote_clipboard_pull"
+
+/**
  * 画面の保護(スクリーンショット・画面録画・「最近使ったアプリ」のサムネイルを禁止する
  * [WindowManager.LayoutParams.FLAG_SECURE])を適用/解除する。
  *
