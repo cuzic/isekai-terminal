@@ -22,36 +22,33 @@ enum ActiveSession {
     IsekaiLinkRelay(Arc<IsekaiLinkRelaySession>),
 }
 
+/// `ActiveSession`の全バリアントに同じメソッド呼び出しを委譲するだけのmatchを
+/// 展開する。6トランスポートすべてが同じ`SessionCore`委譲メソッドを持つため
+/// （各transportモジュール参照）、ここは常に「アームごとの分岐ロジックが無い」
+/// 純粋な委譲にのみ使う。`add_local_forward`/`remove_forward`のように一部の
+/// トランスポートで挙動が違うメソッドは対象外とし、手書きのmatchのままにする。
+macro_rules! dispatch_all {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            Self::Ssh(s) => s.$method($($arg),*),
+            Self::Quic(s) => s.$method($($arg),*),
+            Self::IsekaiPipeQuic(s) => s.$method($($arg),*),
+            Self::MultipathIsekaiPipeQuic(s) => s.$method($($arg),*),
+            Self::IsekaiStunP2p(s) => s.$method($($arg),*),
+            Self::IsekaiLinkRelay(s) => s.$method($($arg),*),
+        }
+    };
+}
+
 impl ActiveSession {
     fn send(&self, data: Vec<u8>) {
-        match self {
-            Self::Ssh(s) => s.send(data),
-            Self::Quic(s) => s.send(data),
-            Self::IsekaiPipeQuic(s) => s.send(data),
-            Self::MultipathIsekaiPipeQuic(s) => s.send(data),
-            Self::IsekaiStunP2p(s) => s.send(data),
-            Self::IsekaiLinkRelay(s) => s.send(data),
-        }
+        dispatch_all!(self, send, data)
     }
     fn resize(&self, cols: u32, rows: u32) {
-        match self {
-            Self::Ssh(s) => s.resize(cols, rows),
-            Self::Quic(s) => s.resize(cols, rows),
-            Self::IsekaiPipeQuic(s) => s.resize(cols, rows),
-            Self::MultipathIsekaiPipeQuic(s) => s.resize(cols, rows),
-            Self::IsekaiStunP2p(s) => s.resize(cols, rows),
-            Self::IsekaiLinkRelay(s) => s.resize(cols, rows),
-        }
+        dispatch_all!(self, resize, cols, rows)
     }
     fn disconnect(&self) {
-        match self {
-            Self::Ssh(s) => s.disconnect(),
-            Self::Quic(s) => s.disconnect(),
-            Self::IsekaiPipeQuic(s) => s.disconnect(),
-            Self::MultipathIsekaiPipeQuic(s) => s.disconnect(),
-            Self::IsekaiStunP2p(s) => s.disconnect(),
-            Self::IsekaiLinkRelay(s) => s.disconnect(),
-        }
+        dispatch_all!(self, disconnect)
     }
     /// マルチパス以外のセッションでは意味を持たないため何もしない
     /// （呼び出し側は「そのとき使っているtransportがマルチパスかどうか」を
@@ -62,64 +59,22 @@ impl ActiveSession {
         }
     }
     fn scrollback_len(&self) -> u32 {
-        match self {
-            Self::Ssh(s) => s.scrollback_len(),
-            Self::Quic(s) => s.scrollback_len(),
-            Self::IsekaiPipeQuic(s) => s.scrollback_len(),
-            Self::MultipathIsekaiPipeQuic(s) => s.scrollback_len(),
-            Self::IsekaiStunP2p(s) => s.scrollback_len(),
-            Self::IsekaiLinkRelay(s) => s.scrollback_len(),
-        }
+        dispatch_all!(self, scrollback_len)
     }
     fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
-        match self {
-            Self::Ssh(s) => s.scrollback_cells(offset, rows),
-            Self::Quic(s) => s.scrollback_cells(offset, rows),
-            Self::IsekaiPipeQuic(s) => s.scrollback_cells(offset, rows),
-            Self::MultipathIsekaiPipeQuic(s) => s.scrollback_cells(offset, rows),
-            Self::IsekaiStunP2p(s) => s.scrollback_cells(offset, rows),
-            Self::IsekaiLinkRelay(s) => s.scrollback_cells(offset, rows),
-        }
+        dispatch_all!(self, scrollback_cells, offset, rows)
     }
     fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
-        match self {
-            Self::Ssh(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
-            Self::Quic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
-            Self::IsekaiPipeQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
-            Self::MultipathIsekaiPipeQuic(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
-            Self::IsekaiStunP2p(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
-            Self::IsekaiLinkRelay(s) => s.trzsz_accept_upload(transfer_id, file_name, file_size, mode),
-        }
+        dispatch_all!(self, trzsz_accept_upload, transfer_id, file_name, file_size, mode)
     }
     fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
-        match self {
-            Self::Ssh(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
-            Self::Quic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
-            Self::IsekaiPipeQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
-            Self::MultipathIsekaiPipeQuic(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
-            Self::IsekaiStunP2p(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
-            Self::IsekaiLinkRelay(s) => s.trzsz_send_chunk(transfer_id, data, is_last),
-        }
+        dispatch_all!(self, trzsz_send_chunk, transfer_id, data, is_last)
     }
     fn trzsz_accept_download(&self, transfer_id: String) {
-        match self {
-            Self::Ssh(s) => s.trzsz_accept_download(transfer_id),
-            Self::Quic(s) => s.trzsz_accept_download(transfer_id),
-            Self::IsekaiPipeQuic(s) => s.trzsz_accept_download(transfer_id),
-            Self::MultipathIsekaiPipeQuic(s) => s.trzsz_accept_download(transfer_id),
-            Self::IsekaiStunP2p(s) => s.trzsz_accept_download(transfer_id),
-            Self::IsekaiLinkRelay(s) => s.trzsz_accept_download(transfer_id),
-        }
+        dispatch_all!(self, trzsz_accept_download, transfer_id)
     }
     fn trzsz_cancel(&self, transfer_id: String) {
-        match self {
-            Self::Ssh(s) => s.trzsz_cancel(transfer_id),
-            Self::Quic(s) => s.trzsz_cancel(transfer_id),
-            Self::IsekaiPipeQuic(s) => s.trzsz_cancel(transfer_id),
-            Self::MultipathIsekaiPipeQuic(s) => s.trzsz_cancel(transfer_id),
-            Self::IsekaiStunP2p(s) => s.trzsz_cancel(transfer_id),
-            Self::IsekaiLinkRelay(s) => s.trzsz_cancel(transfer_id),
-        }
+        dispatch_all!(self, trzsz_cancel, transfer_id)
     }
     fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
         match self {
@@ -144,14 +99,7 @@ impl ActiveSession {
     /// Phase 12: per-session theme。全トランスポート共通(`Terminal`/`SessionCore`は
     /// トランスポート非依存)なので、`add_local_forward`と違い対象外の分岐は無い。
     fn set_theme(&self, theme: crate::theme::Theme) {
-        match self {
-            Self::Ssh(s) => s.set_theme(theme),
-            Self::Quic(s) => s.set_theme(theme),
-            Self::IsekaiPipeQuic(s) => s.set_theme(theme),
-            Self::MultipathIsekaiPipeQuic(s) => s.set_theme(theme),
-            Self::IsekaiStunP2p(s) => s.set_theme(theme),
-            Self::IsekaiLinkRelay(s) => s.set_theme(theme),
-        }
+        dispatch_all!(self, set_theme, theme)
     }
 }
 
@@ -361,18 +309,27 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
     Arc::new(SessionOrchestrator { shared })
 }
 
-#[uniffi::export]
 impl SessionOrchestrator {
-    pub fn connect(&self, config: SshConfig) -> Result<(), SshError> {
+    /// 各`connect_*`が共通で行う「state更新→Connecting通知→adapter生成」を
+    /// 一箇所にまとめる。session生成・接続・`ActiveSession`格納は呼び出し側が
+    /// トランスポートごとに行う（`connect`のエラー型/セッション型がそれぞれ違うため）。
+    fn begin_connect(&self, host: String, port: u16, is_quic: bool) -> OrchestratorAdapter {
         {
             let mut s = self.shared.state.lock();
-            s.current_host = Some(config.host.clone());
-            s.current_port = config.port;
-            s.is_quic = false;
+            s.current_host = Some(host);
+            s.current_port = port;
+            s.is_quic = is_quic;
             s.phase = ConnPhase::Connecting;
         }
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
-        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        OrchestratorAdapter { shared: self.shared.clone() }
+    }
+}
+
+#[uniffi::export]
+impl SessionOrchestrator {
+    pub fn connect(&self, config: SshConfig) -> Result<(), SshError> {
+        let adapter = self.begin_connect(config.host.clone(), config.port, false);
         let session = crate::create_ssh_session(config);
         session.connect(Box::new(adapter))?;
         *self.shared.session.lock() = Some(ActiveSession::Ssh(session));
@@ -380,15 +337,7 @@ impl SessionOrchestrator {
     }
 
     pub fn connect_quic(&self, config: QuicConfig) -> Result<(), SshError> {
-        {
-            let mut s = self.shared.state.lock();
-            s.current_host = Some(config.ssh_host.clone());
-            s.current_port = config.ssh_port;
-            s.is_quic = true;
-            s.phase = ConnPhase::Connecting;
-        }
-        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
-        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
         let session = crate::quic_transport::create_quic_session(config);
         session.connect(Box::new(adapter))?;
         *self.shared.session.lock() = Some(ActiveSession::Quic(session));
@@ -398,15 +347,7 @@ impl SessionOrchestrator {
     /// Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
     /// （`TransportPreference::IsekaiPipeQuic` 相当、明示選択時に使う）。
     pub fn connect_isekai_pipe_quic(&self, config: IsekaiPipeQuicConfig) -> Result<(), SshError> {
-        {
-            let mut s = self.shared.state.lock();
-            s.current_host = Some(config.ssh_host.clone());
-            s.current_port = config.ssh_port;
-            s.is_quic = true;
-            s.phase = ConnPhase::Connecting;
-        }
-        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
-        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
         let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
         session.connect(Box::new(adapter))?;
         *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
@@ -416,15 +357,7 @@ impl SessionOrchestrator {
     /// Phase 7: `TransportPreference::Auto` 相当。自作ヘルパー経由 QUIC のブートストラップ/
     /// 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
     pub fn connect_isekai_pipe_quic_auto(&self, config: IsekaiPipeQuicConfig) -> Result<(), SshError> {
-        {
-            let mut s = self.shared.state.lock();
-            s.current_host = Some(config.ssh_host.clone());
-            s.current_port = config.ssh_port;
-            s.is_quic = true;
-            s.phase = ConnPhase::Connecting;
-        }
-        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
-        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
         let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
         session.connect_auto(Box::new(adapter))?;
         *self.shared.session.lock() = Some(ActiveSession::IsekaiPipeQuic(session));
@@ -435,15 +368,7 @@ impl SessionOrchestrator {
     /// `config.direct_host` が設定されていれば path0（`ssh_host`）+ path1（`direct_host`）の
     /// 受動的マルチパスで接続する。
     pub fn connect_multipath_isekai_pipe_quic(&self, config: MultipathIsekaiPipeQuicConfig) -> Result<(), SshError> {
-        {
-            let mut s = self.shared.state.lock();
-            s.current_host = Some(config.ssh_host.clone());
-            s.current_port = config.ssh_port;
-            s.is_quic = true;
-            s.phase = ConnPhase::Connecting;
-        }
-        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
-        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
         let session = crate::multipath_transport::create_multipath_isekai_pipe_quic_session(config);
         session.connect(Box::new(adapter))?;
         *self.shared.session.lock() = Some(ActiveSession::MultipathIsekaiPipeQuic(session));
@@ -454,15 +379,7 @@ impl SessionOrchestrator {
     /// STUN+SSH rendezvousによる直接 P2P QUIC。フォールバック無し（穴あけ不成立時は
     /// 接続失敗として扱う。`isekai_stun_p2p_transport.rs` 参照）。
     pub fn connect_isekai_stun_p2p(&self, config: IsekaiStunP2pConfig) -> Result<(), SshError> {
-        {
-            let mut s = self.shared.state.lock();
-            s.current_host = Some(config.ssh_host.clone());
-            s.current_port = config.ssh_port;
-            s.is_quic = true;
-            s.phase = ConnPhase::Connecting;
-        }
-        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
-        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
         let session = crate::isekai_stun_p2p_transport::create_isekai_stun_p2p_session(config);
         session.connect(Box::new(adapter))?;
         *self.shared.session.lock() = Some(ActiveSession::IsekaiStunP2p(session));
@@ -472,15 +389,7 @@ impl SessionOrchestrator {
     /// Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
     /// P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
     pub fn connect_isekai_link_relay(&self, config: IsekaiLinkRelayConfig) -> Result<(), SshError> {
-        {
-            let mut s = self.shared.state.lock();
-            s.current_host = Some(config.ssh_host.clone());
-            s.current_port = config.ssh_port;
-            s.is_quic = true;
-            s.phase = ConnPhase::Connecting;
-        }
-        self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
-        let adapter = OrchestratorAdapter { shared: self.shared.clone() };
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
         let session = crate::isekai_link_relay_transport::create_isekai_link_relay_session(config);
         session.connect(Box::new(adapter))?;
         *self.shared.session.lock() = Some(ActiveSession::IsekaiLinkRelay(session));
