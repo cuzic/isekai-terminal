@@ -79,30 +79,34 @@ class TerminalTabsViewModel(
         app,
         AndroidAppExecutor(app),
         {
+            val clipboardPolicy = RemoteClipboardPolicy(
+                isWriteAllowed = {
+                    app.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE)
+                        .getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE, false)
+                },
+                isPullAllowed = {
+                    app.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE)
+                        .getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL, false)
+                },
+                writeToClipboard = { text ->
+                    val cm = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                        as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("isekai-terminal (remote)", text))
+                },
+                readFromClipboard = {
+                    val cm = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                        as android.content.ClipboardManager
+                    cm.primaryClip?.takeIf { it.itemCount > 0 }
+                        ?.getItemAt(0)?.coerceToText(app)?.toString()
+                        ?.takeIf { it.isNotEmpty() }
+                },
+            )
             TerminalSession(
                 RealHostKeyChecker(Repositories.knownHosts) {
                     HostKeySettings.isAutoTrustNewHostKeysEnabled(app)
                 },
-                onClipboardWriteRequested = { text ->
-                    val prefs = app.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE)
-                    if (prefs.getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE, false)) {
-                        val cm = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                            as android.content.ClipboardManager
-                        cm.setPrimaryClip(android.content.ClipData.newPlainText("isekai-terminal (remote)", text))
-                    }
-                },
-                onClipboardPullRequested = {
-                    val prefs = app.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE)
-                    if (prefs.getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL, false)) {
-                        val cm = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                            as android.content.ClipboardManager
-                        cm.primaryClip?.takeIf { it.itemCount > 0 }
-                            ?.getItemAt(0)?.coerceToText(app)?.toString()
-                            ?.takeIf { it.isNotEmpty() }
-                    } else {
-                        null
-                    }
-                },
+                onClipboardWriteRequested = clipboardPolicy::onClipboardWriteRequested,
+                onClipboardPullRequested = clipboardPolicy::onClipboardPullRequested,
             )
         },
     )
