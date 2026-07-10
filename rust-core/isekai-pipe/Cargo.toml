@@ -12,7 +12,12 @@ path = "src/main.rs"
 [dependencies]
 isekai-pipe-core = { path = "../isekai-pipe-core" }
 isekai-protocol = { path = "../isekai-protocol" }
-isekai-transport = { path = "../isekai-transport" }
+# `qmux-relay`: isekai-pipe already unconditionally depends on
+# `isekai-link-masque`, which itself unconditionally needs `h3-qmux`/`qmux`
+# (`#qmux-leg2`), so enabling this here (`#qmux-leg1`, isekai-pipe connect's
+# own client-side relay dial) adds no new dependency weight — opt-in happens
+# via `isekai-pipe connect --relay-transport qmux`, not a Cargo feature flag.
+isekai-transport = { path = "../isekai-transport", features = ["qmux-relay"] }
 isekai-trust = { path = "../isekai-trust" }
 # `engine` module (formerly the standalone `isekai-helper` crate,
 # `ISEKAI_PIPE_MIGRATION.md` P5): the `serve` engine noq/rustls stack.

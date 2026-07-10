@@ -19,9 +19,9 @@ use isekai_transport::{
     connect_via_relay_resumable_with_fallback, reconnect_and_resume, spawn_app_ack_tasks, AppAckCounters,
     AttemptFailure, BackoffPolicy, BindSpec, ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf, C2hSentOffset,
     CandidatePool, CandidateProvider, ConfigRelayProvider, ConfigStunProvider, GatherContext,
-    H2cClientDeliveredOffset, LegacyIntentProvider, QuicEndpointRebinder, RelayTarget, SequentialConnectError,
-    SequentialFailure, SequentialRelayCandidate, SequentialStunCandidate, SequentialStunConnectError, StunP2pTarget,
-    SystemQuicEndpointFactory,
+    H2cClientDeliveredOffset, LegacyIntentProvider, QmuxQuicEndpointFactory, QuicEndpointFactory,
+    QuicEndpointRebinder, RelayTarget, SequentialConnectError, SequentialFailure, SequentialRelayCandidate,
+    SequentialStunCandidate, SequentialStunConnectError, StunP2pTarget, SystemQuicEndpointFactory,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -83,6 +83,48 @@ struct ConnectLaunch {
     /// restructure rather than a one-line addition to the existing
     /// `select!`.
     experimental_network_rebind: bool,
+    /// `--relay-transport <udp|qmux>` (`#qmux-leg1`, default `Udp`): which
+    /// transport this side uses to reach the relay-assigned `isekai-helper`
+    /// endpoint. Mirrors `engine::RelayTransportKind` (`isekai-pipe serve`'s
+    /// own equivalent for the `isekai-helper→relay` leg, `#qmux-leg2`) —
+    /// deliberately a separate, locally-scoped type rather than shared
+    /// across the `connect`/`serve` sides of this binary, since the two
+    /// sides have no other coupling. Per `ISEKAI_PIPE_DESIGN.md` Epic G/H's
+    /// "single evidence-gated selection, no runtime fallback" policy, this
+    /// is chosen once up front — never retried automatically if the `Udp`
+    /// path fails.
+    relay_transport: RelayTransportKind,
+}
+
+/// See `ConnectLaunch::relay_transport`'s doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RelayTransportKind {
+    #[default]
+    Udp,
+    Qmux,
+}
+
+impl std::str::FromStr for RelayTransportKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "udp" => Ok(RelayTransportKind::Udp),
+            "qmux" => Ok(RelayTransportKind::Qmux),
+            other => Err(format!("invalid --relay-transport value: {other} (expected udp|qmux)")),
+        }
+    }
+}
+
+/// `connect_via_relay_resumable`/`_with_fallback`/`reconnect_and_resume`
+/// (`isekai-transport`) already take `&dyn QuicEndpointFactory` — this just
+/// picks which concrete factory backs it, once, up front (never re-picked
+/// mid-connection, matching `ConnectLaunch::relay_transport`'s doc comment).
+fn relay_endpoint_factory(kind: RelayTransportKind) -> Box<dyn QuicEndpointFactory> {
+    match kind {
+        RelayTransportKind::Udp => Box::new(SystemQuicEndpointFactory),
+        RelayTransportKind::Qmux => Box::new(QmuxQuicEndpointFactory),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +165,7 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
     let mut stun_servers: Vec<String> = Vec::new();
     let mut resume_window = DEFAULT_RESUME_WINDOW;
     let mut experimental_network_rebind = false;
+    let mut relay_transport = RelayTransportKind::default();
     let mut iter = args.peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -141,6 +184,18 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 );
                 println!(
                     "                                   change before falling back to RESUME (default off)"
+                );
+                println!(
+                    "    --relay-transport <udp|qmux>   transport to the relay-assigned isekai-helper endpoint"
+                );
+                println!(
+                    "                                   (default: udp); qmux uses QMux-over-TLS-over-TCP for"
+                );
+                println!(
+                    "                                   networks that block outbound UDP on this side"
+                );
+                println!(
+                    "                                   (EXPERIMENTAL, unverified wire compat with the deployed relay)"
                 );
                 return Ok(None);
             }
@@ -198,6 +253,16 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 resume_window = Duration::from_secs(secs);
             }
             "--experimental-network-rebind" => experimental_network_rebind = true,
+            "--relay-transport" => {
+                let value = next_arg("connect", &mut iter, &arg).map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                relay_transport = value.parse().map_err(|e| {
+                    eprintln!("isekai-pipe connect: {e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+            }
             "--listen" => {
                 eprintln!(
                     "isekai-pipe connect: --listen is not wired to the legacy connect runtime yet"
@@ -244,6 +309,7 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
         stun_servers,
         resume_window,
         experimental_network_rebind,
+        relay_transport,
     }))
 }
 
@@ -412,6 +478,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                 &profile,
                 intent.resume_grace_secs,
                 launch.experimental_network_rebind,
+                launch.relay_transport,
             )
             .await
             .context("isekai-pipe connect: relay transport (with fallback) failed");
@@ -424,6 +491,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                 &intent,
                 "STUN P2P transport (with fallback)",
                 launch.experimental_network_rebind,
+                launch.relay_transport,
             )
             .await;
         }
@@ -451,6 +519,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
             intent.resume_grace_secs,
             identity,
             launch.experimental_network_rebind,
+            launch.relay_transport,
         )
         .await
         .context("isekai-pipe connect: relay transport failed"),
@@ -476,6 +545,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                         &intent,
                         "STUN P2P transport",
                         launch.experimental_network_rebind,
+                        launch.relay_transport,
                     )
                     .await
                 }
@@ -497,6 +567,7 @@ async fn recover_via_cross_family_fallback(
     intent: &ConnectionIntent,
     context_label: &str,
     experimental_network_rebind: bool,
+    relay_transport: RelayTransportKind,
 ) -> Result<()> {
     let Err(primary_err) = result else { return Ok(()) };
     let Some(IntentTransport::Relay { helper_addr, server_name, session_secret_b64 }) = &intent.cross_family_fallback else {
@@ -525,6 +596,7 @@ async fn recover_via_cross_family_fallback(
         intent.resume_grace_secs,
         identity,
         experimental_network_rebind,
+        relay_transport,
     )
     .await
     .with_context(|| format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback also failed"))
@@ -1240,13 +1312,14 @@ async fn run_relay_resumable(
     requested_resume_grace_secs: u64,
     identity: isekai_transport::CandidateIdentity<'_>,
     experimental_network_rebind: bool,
+    relay_transport: RelayTransportKind,
 ) -> Result<()> {
-    let factory = SystemQuicEndpointFactory;
+    let factory = relay_endpoint_factory(relay_transport);
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
-    let established = connect_via_relay_resumable(&factory, target, requested, identity)
+    let established = connect_via_relay_resumable(factory.as_ref(), target, requested, identity)
         .await
         .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(&factory, target, profile, established, experimental_network_rebind).await
+    run_resume_loop(factory.as_ref(), target, profile, established, experimental_network_rebind).await
 }
 
 /// Like `run_relay_resumable`, but tries `candidates` in priority order
@@ -1260,13 +1333,15 @@ async fn run_relay_resumable_with_fallback(
     profile: &str,
     requested_resume_grace_secs: u64,
     experimental_network_rebind: bool,
+    relay_transport: RelayTransportKind,
 ) -> Result<()> {
-    let factory = SystemQuicEndpointFactory;
+    let factory = relay_endpoint_factory(relay_transport);
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
-    let (established, winning_target) = connect_via_relay_resumable_with_fallback(&factory, candidates, requested)
-        .await
-        .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind).await
+    let (established, winning_target) =
+        connect_via_relay_resumable_with_fallback(factory.as_ref(), candidates, requested)
+            .await
+            .map_err(attach_stale_trust_signal)?;
+    run_resume_loop(factory.as_ref(), &winning_target, profile, established, experimental_network_rebind).await
 }
 
 /// Like the single-candidate `CandidateRoute::StunP2p` path in `run_connect`,
@@ -1396,7 +1471,7 @@ fn spawn_reconnect_signal(
 }
 
 async fn run_resume_loop(
-    factory: &SystemQuicEndpointFactory,
+    factory: &dyn QuicEndpointFactory,
     target: &RelayTarget,
     profile: &str,
     established: isekai_transport::ResumableRelaySession,
@@ -2330,6 +2405,36 @@ mod tests {
         assert!(launch.stdio);
         assert_eq!(launch.mode, ConnectMode::Relay);
         assert_eq!(launch.resume_window, Duration::from_secs(30));
+        assert_eq!(launch.relay_transport, RelayTransportKind::Udp);
+    }
+
+    #[test]
+    fn connect_relay_transport_defaults_to_udp() {
+        let launch = parse_connect_args(&["production", "--service", "ssh", "--stdio"]);
+        assert_eq!(launch.relay_transport, RelayTransportKind::Udp);
+    }
+
+    #[test]
+    fn connect_relay_transport_qmux_parses() {
+        let launch = parse_connect_args(&[
+            "production",
+            "--service",
+            "ssh",
+            "--stdio",
+            "--relay-transport",
+            "qmux",
+        ]);
+        assert_eq!(launch.relay_transport, RelayTransportKind::Qmux);
+    }
+
+    #[test]
+    fn connect_relay_transport_rejects_unknown_value() {
+        let result = parse_connect(
+            ["production", "--service", "ssh", "--stdio", "--relay-transport", "bogus"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -2841,7 +2946,7 @@ mod tests {
     #[tokio::test]
     async fn recover_via_cross_family_fallback_passes_success_through_untouched() {
         let intent = sample_stun_primary_intent();
-        let result = recover_via_cross_family_fallback(Ok(()), &intent, "STUN P2P transport", false).await;
+        let result = recover_via_cross_family_fallback(Ok(()), &intent, "STUN P2P transport", false, RelayTransportKind::Udp).await;
         assert!(result.is_ok(), "{result:?}");
     }
 
@@ -2855,6 +2960,7 @@ mod tests {
             &intent,
             "STUN P2P transport",
             false,
+            RelayTransportKind::Udp,
         )
         .await;
 
@@ -2879,6 +2985,7 @@ mod tests {
             &intent,
             "STUN P2P transport",
             false,
+            RelayTransportKind::Udp,
         )
         .await;
 
