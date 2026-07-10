@@ -13,7 +13,7 @@
 //! `PinnedCertVerifier`, minus the `FaultyUdpSocket` parameter — this crate
 //! binds a real `tokio::net::UdpSocket` instead.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -51,6 +51,14 @@ const CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 struct PinnedCertVerifier {
     expected_sha256_hex: String,
     provider: Arc<rustls::crypto::CryptoProvider>,
+    /// Set right before returning `Err` on a mismatch, since
+    /// `ServerCertVerifier::verify_server_cert`'s return type is fixed to
+    /// `Result<_, rustls::Error>` and can't carry a typed
+    /// `TransportError::CertPinMismatch` directly. `SystemQuicEndpoint::connect`
+    /// checks this slot after a handshake failure to recover the structured
+    /// reason (`ISEKAI_PIPE_DESIGN.md` §8 Epic N) — the TLS behavior itself
+    /// (still returning `Err`, aborting the handshake) is unchanged.
+    mismatch: Arc<Mutex<Option<(String, String)>>>,
 }
 
 impl ServerCertVerifier for PinnedCertVerifier {
@@ -68,6 +76,7 @@ impl ServerCertVerifier for PinnedCertVerifier {
         if got == self.expected_sha256_hex {
             Ok(ServerCertVerified::assertion())
         } else {
+            *self.mismatch.lock().unwrap() = Some((self.expected_sha256_hex.clone(), got.clone()));
             Err(rustls::Error::General(format!(
                 "isekai-helper cert pin mismatch: expected {} got {}",
                 self.expected_sha256_hex, got
@@ -102,7 +111,8 @@ impl ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-fn client_config_for(cert_sha256_hex: &str) -> Result<noq::ClientConfig, TransportError> {
+fn client_config_for(cert_sha256_hex: &str) -> Result<(noq::ClientConfig, Arc<Mutex<Option<(String, String)>>>), TransportError> {
+    let mismatch = Arc::new(Mutex::new(None));
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -111,6 +121,7 @@ fn client_config_for(cert_sha256_hex: &str) -> Result<noq::ClientConfig, Transpo
         .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier {
             expected_sha256_hex: cert_sha256_hex.to_string(),
             provider,
+            mismatch: mismatch.clone(),
         }))
         .with_no_client_auth();
     crypto.alpn_protocols = vec![ALPN.to_vec()];
@@ -132,7 +143,7 @@ fn client_config_for(cert_sha256_hex: &str) -> Result<noq::ClientConfig, Transpo
 
     let mut client_config = noq::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(transport));
-    Ok(client_config)
+    Ok((client_config, mismatch))
 }
 
 /// Wraps an already-bound `std::net::UdpSocket` as a `noq`-backed
@@ -185,14 +196,17 @@ struct SystemQuicEndpoint {
 #[async_trait]
 impl QuicEndpoint for SystemQuicEndpoint {
     async fn connect(&self, remote: RemoteSpec) -> Result<Box<dyn QuicConnection>, TransportError> {
-        let client_config = client_config_for(&remote.cert_sha256_hex)?;
+        let (client_config, mismatch) = client_config_for(&remote.cert_sha256_hex)?;
         info!("isekai-transport: connecting to {}", remote.addr);
         let conn = self
             .endpoint
             .connect_with(client_config, remote.addr, &remote.server_name)
             .map_err(|e| TransportError::ConnectSetup(e.to_string()))?
             .await
-            .map_err(|e| TransportError::Handshake(e.to_string()))?;
+            .map_err(|e| match mismatch.lock().unwrap().take() {
+                Some((expected, got)) => TransportError::CertPinMismatch { expected, got },
+                None => TransportError::Handshake(e.to_string()),
+            })?;
         info!("isekai-transport: QUIC handshake ok rtt={:?}", conn.rtt(noq::PathId::ZERO));
         Ok(Box::new(SystemQuicConnection { conn }))
     }

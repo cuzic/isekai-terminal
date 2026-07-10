@@ -262,6 +262,26 @@ pub enum SequentialConnectError {
     },
 }
 
+impl SequentialConnectError {
+    /// Whether *any* underlying failure captured here looks like stale
+    /// cached trust material (`ISEKAI_PIPE_DESIGN.md` §8 Epic N) — any-of
+    /// semantics across the failure list, since a single high-confidence
+    /// stale-trust signal from any candidate is reason enough for the
+    /// caller to consider a re-bootstrap worthwhile.
+    pub fn is_stale_trust_signal(&self) -> bool {
+        match self {
+            Self::NoCandidates => false,
+            Self::AllCandidatesFailed { failures } | Self::GaveUpAfterGenerationRetries { failures, .. } => {
+                failures.iter().any(|f| f.failure.is_stale_trust_signal())
+            }
+            Self::StoppedEarly { failure, .. } => failure.is_stale_trust_signal(),
+            Self::AttachedButControlStreamFailed { source, .. } | Self::MustResumeButResumeFailed { source, .. } => {
+                source.is_stale_trust_signal()
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for SequentialConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -650,4 +670,79 @@ pub async fn reconnect_and_resume(
         helper_sent_offset: ack.helper_sent_offset,
         network_rebinder,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attempt::AttemptFailure;
+
+    fn stale_failure() -> SequentialFailure {
+        SequentialFailure {
+            candidate_id: "c1".to_string(),
+            failure: AttemptFailure::Terminal {
+                source: TransportError::Rejected(isekai_protocol::attach::AttachRejectReason::Auth),
+            },
+        }
+    }
+
+    fn not_stale_failure() -> SequentialFailure {
+        SequentialFailure { candidate_id: "c2".to_string(), failure: AttemptFailure::RetryablePreAttach { source: TransportError::UnexpectedEof } }
+    }
+
+    #[test]
+    fn no_candidates_is_never_a_stale_trust_signal() {
+        assert!(!SequentialConnectError::NoCandidates.is_stale_trust_signal());
+    }
+
+    #[test]
+    fn all_candidates_failed_is_stale_if_any_failure_is() {
+        assert!(SequentialConnectError::AllCandidatesFailed { failures: vec![not_stale_failure(), stale_failure()] }.is_stale_trust_signal());
+        assert!(!SequentialConnectError::AllCandidatesFailed { failures: vec![not_stale_failure()] }.is_stale_trust_signal());
+    }
+
+    #[test]
+    fn stopped_early_delegates_to_its_failure() {
+        assert!(SequentialConnectError::StoppedEarly { candidate_id: "c1".to_string(), failure: stale_failure().failure }
+            .is_stale_trust_signal());
+        assert!(!SequentialConnectError::StoppedEarly { candidate_id: "c2".to_string(), failure: not_stale_failure().failure }
+            .is_stale_trust_signal());
+    }
+
+    #[test]
+    fn attached_but_control_stream_failed_delegates_to_source() {
+        assert!(SequentialConnectError::AttachedButControlStreamFailed {
+            candidate_id: "c1".to_string(),
+            source: TransportError::Rejected(isekai_protocol::attach::AttachRejectReason::Auth),
+        }
+        .is_stale_trust_signal());
+        assert!(!SequentialConnectError::AttachedButControlStreamFailed {
+            candidate_id: "c1".to_string(),
+            source: TransportError::UnexpectedEof,
+        }
+        .is_stale_trust_signal());
+    }
+
+    #[test]
+    fn must_resume_but_resume_failed_delegates_to_source() {
+        assert!(SequentialConnectError::MustResumeButResumeFailed {
+            candidate_id: "c1".to_string(),
+            source: TransportError::CertPinMismatch { expected: "a".to_string(), got: "b".to_string() },
+        }
+        .is_stale_trust_signal());
+    }
+
+    #[test]
+    fn gave_up_after_generation_retries_is_stale_if_any_failure_is() {
+        assert!(SequentialConnectError::GaveUpAfterGenerationRetries {
+            failures: vec![stale_failure()],
+            budget: crate::generation_coordinator::AdvanceGenerationError::RetryBudgetExceeded { advances: 3, max: 3 },
+        }
+        .is_stale_trust_signal());
+        assert!(!SequentialConnectError::GaveUpAfterGenerationRetries {
+            failures: vec![not_stale_failure()],
+            budget: crate::generation_coordinator::AdvanceGenerationError::RetryBudgetExceeded { advances: 3, max: 3 },
+        }
+        .is_stale_trust_signal());
+    }
 }

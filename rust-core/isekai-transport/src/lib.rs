@@ -76,7 +76,7 @@ pub use candidate_provider::{
     CandidateProvider, CandidateProviderError, ConfigRelayProvider, ConfigStunProvider, GatherContext,
     LegacyIntentProvider,
 };
-pub use error::TransportError;
+pub use error::{StaleTrustSignal, TransportError};
 pub use proof::compute_proof;
 pub use relay::{connect_via_relay, RelayTarget};
 pub use resume::{

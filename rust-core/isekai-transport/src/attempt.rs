@@ -208,6 +208,22 @@ impl AttemptFailure {
             | Self::Terminal { source } => source,
         }
     }
+
+    /// Delegates to the wrapped `TransportError::is_stale_trust_signal`
+    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic N) — the sequential-fallback
+    /// classification this type adds is orthogonal to whether the
+    /// *underlying* failure looks like stale cached trust material.
+    pub fn is_stale_trust_signal(&self) -> bool {
+        match self {
+            Self::RetryablePreAttach { source }
+            | Self::DefinitiveRejectNotRetryable { source }
+            | Self::AmbiguousAfterAttach { source }
+            | Self::LostRace { source }
+            | Self::StaleAttempt { source, .. }
+            | Self::MustResume { source }
+            | Self::Terminal { source } => source.is_stale_trust_signal(),
+        }
+    }
 }
 
 impl From<ConnectAttemptError> for AttemptFailure {
@@ -335,5 +351,14 @@ mod tests {
     fn attempt_failure_into_source_recovers_the_transport_error() {
         let failure = AttemptFailure::from(err(ConnectAttemptStage::AckRead));
         assert!(matches!(failure.into_source(), TransportError::UnexpectedEof));
+    }
+
+    #[test]
+    fn attempt_failure_delegates_stale_trust_signal_to_its_source() {
+        let stale = AttemptFailure::from(err(ConnectAttemptStage::Rejected(RejectReason::Auth)));
+        assert!(stale.is_stale_trust_signal());
+
+        let not_stale = AttemptFailure::from(err(ConnectAttemptStage::QuicConnect));
+        assert!(!not_stale.is_stale_trust_signal());
     }
 }

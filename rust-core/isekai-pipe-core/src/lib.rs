@@ -24,6 +24,11 @@ pub use profile::{
     write_persistent_profile, LegacyRelayTransport, PathHint, PersistentProfile, PERSISTENT_PROFILE_SCHEMA_VERSION,
 };
 
+mod outcome;
+pub use outcome::{
+    claim_connect_outcome, write_connect_outcome, ConnectOutcome, ConnectOutcomeClass, CONNECT_OUTCOME_SCHEMA_VERSION,
+};
+
 pub const CONNECTION_INTENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_INTENT_TTL: Duration = Duration::from_secs(120);
 pub const DEFAULT_CANDIDATE_RACE_DELAY_MS: u64 = 150;

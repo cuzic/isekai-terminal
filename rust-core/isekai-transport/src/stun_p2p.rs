@@ -148,6 +148,18 @@ pub enum SequentialStunConnectError {
     StoppedEarly { candidate_id: String, failure: crate::attempt::AttemptFailure },
 }
 
+impl SequentialStunConnectError {
+    /// Same any-of semantics as `SequentialConnectError::is_stale_trust_signal`
+    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic N).
+    pub fn is_stale_trust_signal(&self) -> bool {
+        match self {
+            Self::NoCandidates => false,
+            Self::AllCandidatesFailed { failures } => failures.iter().any(|f| f.failure.is_stale_trust_signal()),
+            Self::StoppedEarly { failure, .. } => failure.is_stale_trust_signal(),
+        }
+    }
+}
+
 impl std::fmt::Display for SequentialStunConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -263,4 +275,43 @@ pub(crate) async fn connect_stun_p2p_with_round(
             .map_err(AttemptFailure::from)?;
 
     Ok(StunP2pConnection { our_observed_addr, stream })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resume::SequentialFailure;
+
+    fn stale_failure() -> SequentialFailure {
+        SequentialFailure {
+            candidate_id: "c1".to_string(),
+            failure: AttemptFailure::Terminal {
+                source: TransportError::Rejected(isekai_protocol::attach::AttachRejectReason::Auth),
+            },
+        }
+    }
+
+    fn not_stale_failure() -> SequentialFailure {
+        SequentialFailure { candidate_id: "c2".to_string(), failure: AttemptFailure::RetryablePreAttach { source: TransportError::UnexpectedEof } }
+    }
+
+    #[test]
+    fn no_candidates_is_never_a_stale_trust_signal() {
+        assert!(!SequentialStunConnectError::NoCandidates.is_stale_trust_signal());
+    }
+
+    #[test]
+    fn all_candidates_failed_is_stale_if_any_failure_is() {
+        assert!(SequentialStunConnectError::AllCandidatesFailed { failures: vec![not_stale_failure(), stale_failure()] }
+            .is_stale_trust_signal());
+        assert!(!SequentialStunConnectError::AllCandidatesFailed { failures: vec![not_stale_failure()] }.is_stale_trust_signal());
+    }
+
+    #[test]
+    fn stopped_early_delegates_to_its_failure() {
+        assert!(SequentialStunConnectError::StoppedEarly { candidate_id: "c1".to_string(), failure: stale_failure().failure }
+            .is_stale_trust_signal());
+        assert!(!SequentialStunConnectError::StoppedEarly { candidate_id: "c2".to_string(), failure: not_stale_failure().failure }
+            .is_stale_trust_signal());
+    }
 }

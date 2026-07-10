@@ -80,4 +80,96 @@ pub enum TransportError {
     /// back to a fresh (non-resuming) connection.
     #[error("isekai-helper rejected RESUME: {0:?}")]
     ResumeRejected(ResumeRejectReason),
+
+    /// The peer's presented leaf certificate didn't match the pinned
+    /// `cert_sha256_hex` this attempt expected (`system::PinnedCertVerifier`).
+    /// Recovered out-of-band from a `rustls::Error::General` via a shared
+    /// slot (rustls's `ServerCertVerifier` trait can't return a typed error
+    /// directly) — see `system.rs`'s `client_config_for`/`SystemQuicEndpoint::connect`.
+    #[error("isekai-helper cert pin mismatch: expected {expected} got {got}")]
+    CertPinMismatch { expected: String, got: String },
+}
+
+impl TransportError {
+    /// Whether this failure is a high-confidence signal that a
+    /// `PersistentProfile`'s cached trust material (session_secret/cert
+    /// pin) is stale — most commonly because the deployed `isekai-pipe
+    /// serve` process restarted and regenerated both (`engine/mod.rs`
+    /// generates fresh ephemeral values on every launch, never persisting
+    /// them). Deliberately narrow: only `CertPinMismatch` and an explicit
+    /// server-side auth reject qualify. Plain connectivity failures
+    /// (timeout, connection refused, DNS, etc.) do *not* — those are
+    /// indistinguishable from an ordinary transient network problem over a
+    /// single attempt, and treating them as "stale" would trigger a
+    /// wasted SSH re-deploy attempt on every blip (`ISEKAI_PIPE_DESIGN.md`
+    /// §8 Epic N).
+    pub fn is_stale_trust_signal(&self) -> bool {
+        matches!(self, Self::CertPinMismatch { .. } | Self::Rejected(AttachRejectReason::Auth))
+    }
+}
+
+/// Attached via `anyhow::Error::context` at the point a connect-time error
+/// classified by `is_stale_trust_signal()` is converted to `anyhow::Error`
+/// (`isekai-pipe/src/main.rs`), so `isekai-pipe connect` can later
+/// `downcast_ref` it off the top-level error to decide whether to write a
+/// `ConnectOutcome::StaleTrust` side-channel file for the `isekai-ssh`
+/// wrapper to notice (`ISEKAI_PIPE_DESIGN.md` §8 Epic N). Mirrors
+/// `isekai-bootstrap-plan::BootstrapFailure`'s own
+/// attach-at-the-source/downcast-at-the-top shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleTrustSignal;
+
+impl std::fmt::Display for StaleTrustSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cached trust looks stale (cert pin mismatch or session-secret rejected)")
+    }
+}
+
+impl std::error::Error for StaleTrustSignal {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cert_pin_mismatch_is_a_stale_trust_signal() {
+        assert!(TransportError::CertPinMismatch { expected: "a".to_string(), got: "b".to_string() }.is_stale_trust_signal());
+    }
+
+    #[test]
+    fn rejected_auth_is_a_stale_trust_signal() {
+        assert!(TransportError::Rejected(AttachRejectReason::Auth).is_stale_trust_signal());
+    }
+
+    #[test]
+    fn other_rejected_reasons_are_not_stale_trust_signals() {
+        for reason in [
+            AttachRejectReason::Target,
+            AttachRejectReason::Unsupported,
+            AttachRejectReason::AlreadyAttached,
+            AttachRejectReason::StaleGeneration { current_generation: isekai_protocol::attach::ConnectionGeneration::INITIAL },
+            AttachRejectReason::BusyOtherSession,
+            AttachRejectReason::AttachAlreadyEstablished,
+        ] {
+            assert!(!TransportError::Rejected(reason).is_stale_trust_signal());
+        }
+    }
+
+    #[test]
+    fn plain_connectivity_failures_are_not_stale_trust_signals() {
+        assert!(!TransportError::Bind { addr: "127.0.0.1:0".parse().unwrap(), source: std::io::Error::other("x") }
+            .is_stale_trust_signal());
+        assert!(!TransportError::EndpointSetup("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::TlsConfig("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::ConnectSetup("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::Handshake("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::OpenStream("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::StreamIo("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::ExportKeyingMaterial("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::UnexpectedEof.is_stale_trust_signal());
+        assert!(!TransportError::SocketSetup("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::Rebind("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::ControlHandshake("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::ResumeRejected(ResumeRejectReason::UnknownSession).is_stale_trust_signal());
+    }
 }

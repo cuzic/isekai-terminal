@@ -262,12 +262,42 @@ async fn connect_command(args: impl Iterator<Item = String>) -> ExitCode {
         .target(env_logger::Target::Stderr)
         .init();
 
+    let profile_for_outcome = launch.profile.clone().unwrap_or_default();
     match run_connect(launch).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e:?}");
+            if e.downcast_ref::<isekai_transport::StaleTrustSignal>().is_some() {
+                write_stale_trust_outcome(&profile_for_outcome, &e);
+            }
             ExitCode::from(EX_UNAVAILABLE)
         }
+    }
+}
+
+/// Writes a `ConnectOutcome::StaleTrust` side-channel file for `isekai-ssh`'s
+/// wrapper to notice after `ssh` exits (`ISEKAI_PIPE_DESIGN.md` §8 Epic N).
+/// Only does anything when `ISEKAI_INTENT_ID` is set — a manual, standalone
+/// `isekai-pipe connect` invocation has no wrapper watching, so there is
+/// nowhere useful to write to. Failure to write is logged and swallowed:
+/// this must never change `connect_command`'s own exit code or touch
+/// stdout (stdout purity is a separately-tested hard invariant elsewhere).
+fn write_stale_trust_outcome(profile: &str, err: &anyhow::Error) {
+    let Some(intent_id) = std::env::var_os("ISEKAI_INTENT_ID") else { return };
+    let intent_id = intent_id.to_string_lossy().into_owned();
+    let Ok(runtime_dir) = default_runtime_dir() else {
+        log::warn!("isekai-pipe connect: could not determine runtime dir to record a stale-trust outcome");
+        return;
+    };
+    let outcome = isekai_pipe_core::ConnectOutcome {
+        schema_version: isekai_pipe_core::CONNECT_OUTCOME_SCHEMA_VERSION,
+        intent_id,
+        profile: profile.to_string(),
+        class: isekai_pipe_core::ConnectOutcomeClass::StaleTrust,
+        detail: format!("{err:#}"),
+    };
+    if let Err(e) = isekai_pipe_core::write_connect_outcome(&runtime_dir, &outcome) {
+        log::warn!("isekai-pipe connect: failed to record a stale-trust outcome: {e}");
     }
 }
 
@@ -310,6 +340,51 @@ fn choose_connect_route(intent: &ConnectionIntent) -> ConnectRoute {
         ConnectRoute::StunWithFallback
     } else {
         ConnectRoute::SingleCandidate
+    }
+}
+
+/// The connect-time typed errors that carry a stale-trust classification
+/// (`ISEKAI_PIPE_DESIGN.md` §8 Epic N) — implemented for every type that
+/// crosses the typed-error → `anyhow::Error` boundary in this file, so
+/// `attach_stale_trust_signal` below is the single place that boundary is
+/// crossed, instead of duplicating the check at each of the four call sites.
+trait StaleTrustSignalSource {
+    fn is_stale_trust_signal(&self) -> bool;
+}
+impl StaleTrustSignalSource for isekai_transport::TransportError {
+    fn is_stale_trust_signal(&self) -> bool {
+        isekai_transport::TransportError::is_stale_trust_signal(self)
+    }
+}
+impl StaleTrustSignalSource for SequentialConnectError {
+    fn is_stale_trust_signal(&self) -> bool {
+        SequentialConnectError::is_stale_trust_signal(self)
+    }
+}
+impl StaleTrustSignalSource for SequentialStunConnectError {
+    fn is_stale_trust_signal(&self) -> bool {
+        SequentialStunConnectError::is_stale_trust_signal(self)
+    }
+}
+
+/// Converts a connect-time typed error to `anyhow::Error`, attaching
+/// `isekai_transport::StaleTrustSignal` when `e.is_stale_trust_signal()` so
+/// `connect_command` can later `downcast_ref` it off the top-level error
+/// (`ISEKAI_PIPE_DESIGN.md` §8 Epic N) — mirrors
+/// `isekai-bootstrap-plan::BootstrapFailure`'s attach-at-the-source/
+/// downcast-at-the-top shape. Callers rely on the outer `.context(...)`
+/// already added at each `run_connect` call site for the human-readable
+/// message; this only adds the machine-readable marker.
+fn attach_stale_trust_signal<E>(e: E) -> anyhow::Error
+where
+    E: std::error::Error + Send + Sync + StaleTrustSignalSource + 'static,
+{
+    let is_stale = e.is_stale_trust_signal();
+    let err = anyhow::Error::new(e);
+    if is_stale {
+        err.context(isekai_transport::StaleTrustSignal)
+    } else {
+        err
     }
 }
 
@@ -396,7 +471,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                 Ok(stream) => relay_stdio(stream).await,
                 Err(e) => {
                     recover_via_cross_family_fallback(
-                        Err(anyhow::Error::new(e)),
+                        Err(attach_stale_trust_signal(e)),
                         &intent,
                         "STUN P2P transport",
                         launch.experimental_network_rebind,
@@ -1150,7 +1225,9 @@ async fn run_relay_resumable(
 ) -> Result<()> {
     let factory = SystemQuicEndpointFactory;
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
-    let established = connect_via_relay_resumable(&factory, target, requested, identity).await?;
+    let established = connect_via_relay_resumable(&factory, target, requested, identity)
+        .await
+        .map_err(attach_stale_trust_signal)?;
     run_resume_loop(&factory, target, profile, established, experimental_network_rebind).await
 }
 
@@ -1170,7 +1247,7 @@ async fn run_relay_resumable_with_fallback(
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
     let (established, winning_target) = connect_via_relay_resumable_with_fallback(&factory, candidates, requested)
         .await
-        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: relay fallback failed: {e}"))?;
+        .map_err(attach_stale_trust_signal)?;
     run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind).await
 }
 
@@ -1185,7 +1262,7 @@ async fn run_relay_resumable_with_fallback(
 async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidates: &[SequentialStunCandidate]) -> Result<()> {
     let (connection, _winning_stun_server) = connect_stun_p2p_with_fallback(target, candidates)
         .await
-        .map_err(|e| anyhow::anyhow!("isekai-pipe connect: STUN P2P fallback failed: {e}"))?;
+        .map_err(attach_stale_trust_signal)?;
     relay_stdio(connection.stream).await
 }
 
