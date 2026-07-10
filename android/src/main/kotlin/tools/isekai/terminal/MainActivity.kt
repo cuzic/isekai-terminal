@@ -70,6 +70,18 @@ fun applyScreenProtection(activity: Activity, enabled: Boolean) {
     }
 }
 
+/**
+ * [MainActivity.restorePersistedCtlSocketForward]の中核ロジック。SharedPreferencesの
+ * 読み取りとRust側([setCtlSocketForwardEnabled]、native/UniFFI呼び出し)への反映を分離し、
+ * [apply]を差し替えればテストから native 呼び出し無しで検証できるようにする。
+ */
+internal fun restoreCtlSocketForwardEnabled(
+    prefs: android.content.SharedPreferences,
+    apply: (Boolean) -> Unit = ::setCtlSocketForwardEnabled,
+) {
+    apply(prefs.getBoolean(PREF_KEY_ENABLE_CTL_SOCKET_FORWARD, false))
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -125,8 +137,7 @@ class MainActivity : ComponentActivity() {
      * ここは起動時の1回だけでよい。
      */
     private fun restorePersistedCtlSocketForward() {
-        val prefs = getSharedPreferences("isekai_terminal_ui", MODE_PRIVATE)
-        setCtlSocketForwardEnabled(prefs.getBoolean(PREF_KEY_ENABLE_CTL_SOCKET_FORWARD, false))
+        restoreCtlSocketForwardEnabled(getSharedPreferences("isekai_terminal_ui", MODE_PRIVATE))
     }
 }
 
