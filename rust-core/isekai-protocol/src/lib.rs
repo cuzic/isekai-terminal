@@ -12,6 +12,7 @@
 pub mod attach;
 pub mod bootstrap;
 pub mod bootstrap_request;
+pub mod ctl;
 pub mod error;
 pub mod handshake;
 pub mod hello;
@@ -23,6 +24,10 @@ pub mod version;
 pub use attach::{
     AttachActivate, AttachHello, AttachKey, AttachProof, AttachRejectReason, AttachResponse, AttachToken, AttemptId,
     CancelAttach, ConnectionGeneration,
+};
+pub use ctl::{
+    decode_ctl_message, validate_ctl_message, ClipboardMime, CtlMessage, MAX_CLIPBOARD_IMAGE_DECODED_LEN,
+    MAX_CLIPBOARD_TEXT_DECODED_LEN, MAX_CTL_MESSAGE_LINE_LEN,
 };
 pub use bootstrap_request::{
     BootstrapAttemptId, BootstrapCandidateV2, BootstrapRequestV2, BootstrapReportV2, BOOTSTRAP_PROTOCOL_V2,
