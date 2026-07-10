@@ -29,11 +29,6 @@ use std::task::{Context, Poll};
 use isekai_transport::traits::{ByteStreamReadHalf, ByteStreamWriteHalf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-#[allow(dead_code)]
-pub(crate) const REJECT_UNKNOWN_SESSION: u8 = 0xF9;
-#[allow(dead_code)]
-pub(crate) const REJECT_OFFSET_GONE: u8 = 0xF8;
-
 pub(crate) type SessionId = [u8; 16];
 
 /// C→S 方向（client → helper）に送出したバイト列を保持するバウンデッドバッファ。
@@ -69,6 +64,7 @@ impl ReplayBuffer {
         }
     }
 
+    /// 本体コードからは呼ばれず、このファイル末尾のテストからのみ使われる。
     #[allow(dead_code)]
     pub(crate) fn start_offset(&self) -> u64 {
         self.start_offset
@@ -78,7 +74,7 @@ impl ReplayBuffer {
         self.start_offset + self.data.len() as u64
     }
 
-    /// Phase 8-3（reattach ハンドシェイク）で使用する。8-2 の時点では未配線。
+    /// Phase 8-3（reattach ハンドシェイク）で使用する（`trigger_reattach`参照）。
     pub(crate) fn replay_from(&self, from: u64) -> Option<Vec<u8>> {
         if from < self.start_offset || from > self.end_offset() {
             return None;
