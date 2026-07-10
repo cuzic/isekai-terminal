@@ -16,9 +16,9 @@ use isekai_auth::TokenProvider;
 use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
 use isekai_bootstrap_plan::{classify_bootstrap_error, BootstrapFailure};
 use isekai_pipe_core::{
-    default_profiles_dir, default_runtime_dir, load_persistent_profile, write_connection_intent,
-    write_persistent_profile, BootstrapProvenance, ConnectionIntent, IntentTransport, PersistentProfile,
-    ServiceSpec, DEFAULT_CANDIDATE_RACE_DELAY_MS, DEFAULT_RELAY_DELAY_MS,
+    claim_connect_outcome, default_profiles_dir, default_runtime_dir, load_persistent_profile,
+    write_connection_intent, write_persistent_profile, BootstrapProvenance, ConnectionIntent, IntentTransport,
+    PersistentProfile, ServiceSpec, DEFAULT_CANDIDATE_RACE_DELAY_MS, DEFAULT_RELAY_DELAY_MS,
 };
 use isekai_trust::{HelperTrust, UpdatePolicy};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -177,7 +177,7 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
     let intent = match build_connection_intent(&resolution) {
         Ok(intent) => intent,
         Err(err) if should_bootstrap(&plan, &resolution) => {
-            if let Err(bootstrap_err) = bootstrap_and_register(&plan, &resolution).await {
+            if let Err(bootstrap_err) = bootstrap_and_register(&plan, &resolution, TofuConfirmation::AlwaysPrompt).await {
                 print_bootstrap_failure_guidance(&bootstrap_err);
                 return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
             }
@@ -186,14 +186,82 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
         }
         Err(err) => return Err(err),
     };
+    run_ssh_with_stale_trust_recovery(&plan, &resolution, intent).await
+}
+
+/// Runs `ssh` once against `intent`; if it fails *and* `isekai-pipe connect`
+/// left behind a `ConnectOutcomeClass::StaleTrust` side-channel file for
+/// this exact attempt (`isekai-pipe-core::claim_connect_outcome`,
+/// `ISEKAI_PIPE_DESIGN.md` §8 Epic N), silently refreshes the trust store
+/// (no `[y/N]` prompt — confirmed product decision: this profile was
+/// already trusted once, and the underlying SSH re-deploy connection is
+/// still gated by the user's own `~/.ssh/known_hosts`, `OpenSshBackend`'s
+/// module docs) and retries exactly once more. Structurally at most two
+/// `ssh` invocations ever happen here — no loop, no recursion — so this
+/// cannot run away even if the retry's own attempt is *also* stale (e.g. a
+/// crash-looping helper): whatever the second attempt returns is final.
+///
+/// Only reachable *after* `build_connection_intent` already succeeded once
+/// in `run()` — a brand-new (never-registered) profile's own, separately
+/// prompted bootstrap path is untouched by this function entirely.
+async fn run_ssh_with_stale_trust_recovery(
+    plan: &WrapperPlan,
+    resolution: &WrapperResolution,
+    intent: ConnectionIntent,
+) -> Result<u8> {
     let runtime_dir = default_runtime_dir()?;
-    write_connection_intent(&runtime_dir, &intent)?;
-    let proxy_command = proxy_command(&plan.pipe_path, &resolution.isekai.profile);
+    let (status, intent_id) = run_ssh_once(plan, &resolution.isekai.profile, &intent, &runtime_dir).await?;
+    if status.success() {
+        return Ok(0);
+    }
+
+    let Some(outcome) = claim_connect_outcome(&runtime_dir, &intent_id)
+        .map_err(|e| anyhow!("isekai-ssh: failed to check for a stale-trust signal: {e}"))?
+    else {
+        return Ok(status.code().unwrap_or(1) as u8);
+    };
+    if !should_bootstrap(plan, resolution) {
+        eprintln!(
+            "isekai-ssh: cached trust for {:?} looks stale ({}), but auto-bootstrap is disabled \
+             (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
+            resolution.isekai.profile, outcome.detail
+        );
+        return Ok(status.code().unwrap_or(1) as u8);
+    }
+
+    eprintln!(
+        "isekai-ssh: cached trust for {:?} looks stale ({}); refreshing automatically...",
+        resolution.isekai.profile, outcome.detail
+    );
+    if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
+        print_bootstrap_failure_guidance(&bootstrap_err);
+        return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a stale-trust signal failed"));
+    }
+    let intent2 = build_connection_intent(resolution).context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
+    let (status2, _) = run_ssh_once(plan, &resolution.isekai.profile, &intent2, &runtime_dir).await?;
+    Ok(status2.code().unwrap_or(1) as u8)
+}
+
+/// Writes `intent`, execs `ssh` with the `isekai-pipe connect` `ProxyCommand`
+/// injected, and waits for it to exit. All three of `ssh`'s stdio streams
+/// are inherited (interactive TTY passthrough) — `.status()` (not
+/// `.output()`) still blocks until the whole process tree, including the
+/// `ProxyCommand` grandchild, has exited, which is what makes inspecting a
+/// side-channel file in `runtime_dir` immediately afterward both correct
+/// and zero-cost to this stdio wiring (`run_ssh_with_stale_trust_recovery`).
+async fn run_ssh_once(
+    plan: &WrapperPlan,
+    profile: &str,
+    intent: &ConnectionIntent,
+    runtime_dir: &Path,
+) -> Result<(std::process::ExitStatus, String)> {
+    write_connection_intent(runtime_dir, intent)?;
+    let proxy_command = proxy_command(&plan.pipe_path, profile);
 
     let mut command = Command::new(&plan.openssh_path);
     command
         .env("ISEKAI_INTENT_ID", &intent.intent_id)
-        .env("ISEKAI_PIPE_RUNTIME_DIR", &runtime_dir)
+        .env("ISEKAI_PIPE_RUNTIME_DIR", runtime_dir)
         .arg("-o")
         .arg(format!("ProxyCommand={proxy_command}"))
         .args(&plan.ssh_args)
@@ -207,7 +275,7 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
             plan.openssh_path.display()
         )
     })?;
-    Ok(status.code().unwrap_or(1) as u8)
+    Ok((status, intent.intent_id.clone()))
 }
 
 async fn run_openssh_direct(plan: &WrapperPlan) -> Result<u8> {
@@ -338,11 +406,28 @@ fn print_bootstrap_failure_guidance(err: &anyhow::Error) {
     }
 }
 
+/// Whether `bootstrap_and_register` shows the interactive `[y/N]` TOFU
+/// prompt before registering. `AlwaysPrompt` is used for a genuinely new
+/// (never-before-registered) profile — this requirement is fixed and never
+/// changes. `Silent` is used only by `run_ssh_with_stale_trust_recovery`'s
+/// automatic re-bootstrap of an *already-trusted* profile whose cached
+/// session_secret/cert pin just went stale (confirmed product decision:
+/// the redeploy SSH connection is still gated by the user's own
+/// `~/.ssh/known_hosts`, so this is a refresh of ephemeral material for a
+/// host already trusted once, not a new trust decision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TofuConfirmation {
+    AlwaysPrompt,
+    Silent,
+}
+
 /// Deploys `isekai-helper` to the highest-priority bootstrap candidate and,
-/// after an explicit `[y/N]` confirmation, registers it in the trust store
+/// depending on `confirmation`, either after an explicit `[y/N]`
+/// confirmation or silently, registers it in the trust store
 /// `build_connection_intent` reads from. Mirrors `init.rs`'s
 /// deploy-then-confirm-then-register flow, but triggered automatically by
-/// `run()` on a trust-store miss instead of via the standalone `init`
+/// `run()` on a trust-store miss (or by `run_ssh_with_stale_trust_recovery`
+/// on a detected stale-trust signal) instead of via the standalone `init`
 /// subcommand.
 ///
 /// Launch mode is a fixed, evidence-gated choice, no racing (`ISEKAI_PIPE_DESIGN.md`
@@ -358,7 +443,7 @@ fn print_bootstrap_failure_guidance(err: &anyhow::Error) {
 /// checks `init.rs` uses, then passed to `OpenSshBackend::install_and_start`
 /// as a single `ssh(1)` `-J host1,host2,...` invocation, not nested `ssh`
 /// executions per hop.
-async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution) -> Result<()> {
+async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution, confirmation: TofuConfirmation) -> Result<()> {
     let candidate = resolution
         .isekai
         .bootstrap_candidates
@@ -496,20 +581,32 @@ async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResoluti
     eprintln!("Helper identity: {identity}");
     eprintln!("Binary sha256:   {helper_sha256}");
     eprintln!();
-    eprint!(
-        "Trust this isekai-helper and register it for {:?}? [y/N] ",
-        resolution.isekai.profile
-    );
-    std::io::stderr().flush().ok();
 
-    let mut reader = BufReader::new(tokio::io::stdin());
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("failed to read confirmation from stdin")?;
-    if !matches!(line.trim(), "y" | "Y") {
-        return Err(anyhow!("aborted — user declined the trust confirmation").context(BootstrapFailure::HostKeyRejected));
+    match confirmation {
+        TofuConfirmation::AlwaysPrompt => {
+            eprint!(
+                "Trust this isekai-helper and register it for {:?}? [y/N] ",
+                resolution.isekai.profile
+            );
+            std::io::stderr().flush().ok();
+
+            let mut reader = BufReader::new(tokio::io::stdin());
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .context("failed to read confirmation from stdin")?;
+            if !matches!(line.trim(), "y" | "Y") {
+                return Err(anyhow!("aborted — user declined the trust confirmation").context(BootstrapFailure::HostKeyRejected));
+            }
+        }
+        TofuConfirmation::Silent => {
+            eprintln!(
+                "isekai-ssh: refreshing trust for {:?} automatically (already trusted; cached session material \
+                 just went stale) — no confirmation needed.",
+                resolution.isekai.profile
+            );
+        }
     }
 
     let profiles_dir =
@@ -1382,7 +1479,7 @@ mod tests {
         // classified the same as the old "no --isekai-helper-binary given"
         // hard error used to be, since the practical guidance is identical
         // either way ("no local isekai-pipe binary to upload").
-        let err = bootstrap_and_register(&plan, &resolution).await.unwrap_err();
+        let err = bootstrap_and_register(&plan, &resolution, TofuConfirmation::AlwaysPrompt).await.unwrap_err();
         let failure = err
             .downcast_ref::<BootstrapFailure>()
             .expect("a classified BootstrapFailure should be attached to the error chain");
@@ -1436,7 +1533,7 @@ mod tests {
         // explicitly, but a failure to read *that* still means "no local
         // binary to upload").
         let resolution = resolution_with_via(vec!["bastion-a".to_string(), "bastion-b".to_string()]);
-        let err = bootstrap_and_register(&plan, &resolution).await.unwrap_err();
+        let err = bootstrap_and_register(&plan, &resolution, TofuConfirmation::AlwaysPrompt).await.unwrap_err();
         let failure = err.downcast_ref::<BootstrapFailure>().expect("classified as a BootstrapFailure");
         assert!(matches!(failure, BootstrapFailure::RemoteBinaryMissing), "{failure:?}");
         assert!(format!("{err:#}").contains("nonexistent/isekai-helper"), "{err:#}");
@@ -1447,7 +1544,7 @@ mod tests {
         // rejected, now via `isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain`
         // rather than the old single-hop-only guard.
         let looping = resolution_with_via(vec!["bastion-a".to_string(), "production:22".to_string()]);
-        let err = bootstrap_and_register(&plan, &looping).await.unwrap_err();
+        let err = bootstrap_and_register(&plan, &looping, TofuConfirmation::AlwaysPrompt).await.unwrap_err();
         assert!(format!("{err:#}").contains("more than once"), "{err:#}");
     }
 
