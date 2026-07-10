@@ -1,7 +1,6 @@
 package tools.isekai.terminal
 
 import android.app.Application
-import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import tools.isekai.terminal.data.KeyEntry
 import tools.isekai.terminal.data.Repositories
@@ -14,12 +13,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
-class KeyListViewModel(app: Application) : AndroidViewModel(app) {
-    private val _keys = MutableStateFlow<List<KeyEntry>>(emptyList())
-    val keys: StateFlow<List<KeyEntry>> = _keys.asStateFlow()
-
-    private val _pendingDelete = MutableStateFlow<KeyEntry?>(null)
-    val pendingDelete: StateFlow<KeyEntry?> = _pendingDelete.asStateFlow()
+class KeyListViewModel(app: Application) : DeletableListViewModel<KeyEntry>(app) {
+    val keys: StateFlow<List<KeyEntry>> get() = items
 
     private val _generatedPubKey = MutableStateFlow<String?>(null)
     val generatedPubKey: StateFlow<String?> = _generatedPubKey.asStateFlow()
@@ -29,25 +24,18 @@ class KeyListViewModel(app: Application) : AndroidViewModel(app) {
 
     init { loadKeys() }
 
-    fun loadKeys() {
-        viewModelScope.launch(Dispatchers.IO) {
-            val list = Repositories.keys.getAll()
-            RemoteLogger.i("IsekaiTerminalKey", "loaded ${list.size} key(s): ${list.map { "'${it.label}'" }}")
-            _keys.value = list
-        }
+    fun loadKeys() = load()
+
+    override suspend fun fetchAll(): List<KeyEntry> = Repositories.keys.getAll()
+
+    override fun onLoaded(list: List<KeyEntry>) {
+        RemoteLogger.i("IsekaiTerminalKey", "loaded ${list.size} key(s): ${list.map { "'${it.label}'" }}")
     }
 
-    fun requestDelete(key: KeyEntry) { _pendingDelete.value = key }
-    fun dismissDelete() { _pendingDelete.value = null }
-
-    fun confirmDelete(key: KeyEntry) {
-        _pendingDelete.value = null
-        viewModelScope.launch(Dispatchers.IO) {
-            RemoteLogger.i("IsekaiTerminalKey", "deleting key id=${key.id} '${key.label}'")
-            Repositories.keys.delete(key)
-            runCatching { File(key.encryptedPrivateKeyPath).delete() }
-            loadKeys()
-        }
+    override suspend fun deleteItem(item: KeyEntry) {
+        RemoteLogger.i("IsekaiTerminalKey", "deleting key id=${item.id} '${item.label}'")
+        Repositories.keys.delete(item)
+        runCatching { File(item.encryptedPrivateKeyPath).delete() }
     }
 
     fun generateKey(label: String, onError: (String) -> Unit, onSuccess: () -> Unit) {

@@ -54,8 +54,8 @@ class KeyListViewModelTest {
         assertTrue(vm.keys.value.isEmpty())
     }
 
-    @Test fun initialState_pendingDeleteNull() {
-        assertNull(vm.pendingDelete.value)
+    @Test fun initialState_deleteTargetNull() {
+        assertNull(vm.deleteTarget.value)
     }
 
     @Test fun initialState_generatedPubKeyNull() {
@@ -82,16 +82,16 @@ class KeyListViewModelTest {
         assertEquals(2, list.size)
     }
 
-    @Test fun requestDelete_setsPendingDelete() {
+    @Test fun requestDelete_setsDeleteTarget() {
         val k = key("ToDelete")
         vm.requestDelete(k)
-        assertEquals("ToDelete", vm.pendingDelete.value?.label)
+        assertEquals("ToDelete", vm.deleteTarget.value?.label)
     }
 
-    @Test fun dismissDelete_clearsPendingDelete() {
+    @Test fun dismissDelete_clearsDeleteTarget() {
         vm.requestDelete(key("ToDelete"))
         vm.dismissDelete()
-        assertNull(vm.pendingDelete.value)
+        assertNull(vm.deleteTarget.value)
     }
 
     @Test fun confirmDelete_removesKeyFromDb() = runBlocking {
@@ -105,7 +105,7 @@ class KeyListViewModelTest {
         assertNull(Repositories.keys.findById(id))
     }
 
-    @Test fun confirmDelete_clearsPendingDelete() = runBlocking {
+    @Test fun confirmDelete_clearsDeleteTarget() = runBlocking {
         val id = Repositories.keys.save(key("RemoveMe"))
         vm.loadKeys()
         awaitKeys { it.isNotEmpty() }
@@ -113,7 +113,7 @@ class KeyListViewModelTest {
         vm.requestDelete(toDelete)
         vm.confirmDelete(toDelete)
         awaitKeys { it.isEmpty() }
-        assertNull(vm.pendingDelete.value)
+        assertNull(vm.deleteTarget.value)
     }
 
     @Test fun dismissGeneratedPubKey_clearsState() {
