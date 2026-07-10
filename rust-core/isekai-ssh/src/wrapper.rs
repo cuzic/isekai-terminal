@@ -269,32 +269,67 @@ async fn run_ssh_with_stale_trust_recovery(
     if status.success() {
         return Ok(0);
     }
+    let exit_code = status.code().unwrap_or(1) as u8;
 
-    let Some(outcome) = claim_connect_outcome(&runtime_dir, &intent_id)
-        .map_err(|e| anyhow!("isekai-ssh: failed to check for a stale-trust signal: {e}"))?
-    else {
-        return Ok(status.code().unwrap_or(1) as u8);
-    };
-    if !should_bootstrap(plan, resolution) {
-        eprintln!(
-            "isekai-ssh: cached trust for {:?} looks stale ({}), but auto-bootstrap is disabled \
-             (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
-            resolution.isekai.profile, outcome.detail
-        );
-        return Ok(status.code().unwrap_or(1) as u8);
-    }
+    let outcome = claim_connect_outcome(&runtime_dir, &intent_id)
+        .map_err(|e| anyhow!("isekai-ssh: failed to check for a stale-trust signal: {e}"))?;
 
-    eprintln!(
-        "isekai-ssh: cached trust for {:?} looks stale ({}); refreshing automatically...",
-        resolution.isekai.profile, outcome.detail
-    );
-    if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
-        print_bootstrap_failure_guidance(&bootstrap_err);
-        return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a stale-trust signal failed"));
+    match decide_stale_trust_recovery(outcome.is_some(), should_bootstrap(plan, resolution)) {
+        StaleTrustRecoveryAction::NoStaleTrustSignal => Ok(exit_code),
+        StaleTrustRecoveryAction::AutoBootstrapDisabled => {
+            let outcome = outcome.expect("AutoBootstrapDisabled only returned when a stale-trust signal was found");
+            eprintln!(
+                "isekai-ssh: cached trust for {:?} looks stale ({}), but auto-bootstrap is disabled \
+                 (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
+                resolution.isekai.profile, outcome.detail
+            );
+            Ok(exit_code)
+        }
+        StaleTrustRecoveryAction::RebootstrapAndRetry => {
+            let outcome = outcome.expect("RebootstrapAndRetry only returned when a stale-trust signal was found");
+            eprintln!(
+                "isekai-ssh: cached trust for {:?} looks stale ({}); refreshing automatically...",
+                resolution.isekai.profile, outcome.detail
+            );
+            if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
+                print_bootstrap_failure_guidance(&bootstrap_err);
+                return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a stale-trust signal failed"));
+            }
+            let intent2 = build_connection_intent(resolution)
+                .context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
+            let (status2, _) = run_ssh_once(plan, resolution, &intent2, &runtime_dir).await?;
+            Ok(status2.code().unwrap_or(1) as u8)
+        }
     }
-    let intent2 = build_connection_intent(resolution).context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
-    let (status2, _) = run_ssh_once(plan, resolution, &intent2, &runtime_dir).await?;
-    Ok(status2.code().unwrap_or(1) as u8)
+}
+
+/// The three ways a failed first `ssh` attempt in
+/// [`run_ssh_with_stale_trust_recovery`] can be handled, given whether
+/// `isekai-pipe connect` left behind a `ConnectOutcomeClass::StaleTrust`
+/// side-channel signal and whether auto-bootstrap is currently allowed. Pure
+/// decision, no I/O — split out from the surrounding async function so each
+/// branch is unit-testable without spawning a real `ssh`/bootstrap process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleTrustRecoveryAction {
+    /// No stale-trust signal for this attempt — return the exit code as-is.
+    NoStaleTrustSignal,
+    /// A signal was found, but auto-bootstrap is disabled
+    /// (`--isekai-no-bootstrap` / `#@isekai bootstrap-policy never`) —
+    /// return the exit code as-is, with guidance to run `isekai-ssh init`.
+    AutoBootstrapDisabled,
+    /// A signal was found and auto-bootstrap is allowed — attempt a silent
+    /// re-bootstrap and retry `ssh` exactly once more.
+    RebootstrapAndRetry,
+}
+
+fn decide_stale_trust_recovery(stale_trust_detected: bool, should_bootstrap: bool) -> StaleTrustRecoveryAction {
+    if !stale_trust_detected {
+        StaleTrustRecoveryAction::NoStaleTrustSignal
+    } else if !should_bootstrap {
+        StaleTrustRecoveryAction::AutoBootstrapDisabled
+    } else {
+        StaleTrustRecoveryAction::RebootstrapAndRetry
+    }
 }
 
 /// Writes `intent`, execs `ssh` with the `isekai-pipe connect` `ProxyCommand`
@@ -1539,6 +1574,23 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn decide_stale_trust_recovery_returns_no_signal_when_no_signal_was_found() {
+        assert_eq!(decide_stale_trust_recovery(false, true), StaleTrustRecoveryAction::NoStaleTrustSignal);
+        // Whether auto-bootstrap is allowed is irrelevant without a signal.
+        assert_eq!(decide_stale_trust_recovery(false, false), StaleTrustRecoveryAction::NoStaleTrustSignal);
+    }
+
+    #[test]
+    fn decide_stale_trust_recovery_returns_disabled_when_signal_found_but_bootstrap_off() {
+        assert_eq!(decide_stale_trust_recovery(true, false), StaleTrustRecoveryAction::AutoBootstrapDisabled);
+    }
+
+    #[test]
+    fn decide_stale_trust_recovery_retries_when_signal_found_and_bootstrap_allowed() {
+        assert_eq!(decide_stale_trust_recovery(true, true), StaleTrustRecoveryAction::RebootstrapAndRetry);
     }
 
     #[tokio::test]
