@@ -104,6 +104,12 @@ struct IsekaiConfig {
     relay_delay_ms: u64,
     install_mode: InstallMode,
     bootstrap_relay: Option<BootstrapRelayTarget>,
+    /// `#@isekai ctl-socket yes` (`ISEKAI_PIPE_DESIGN.md` §8 Epic M):
+    /// opt-in, default off. Requests a per-invocation `-R` UNIX domain
+    /// socket forward carrying the title/clipboard control-plane, so it
+    /// works even when this connection ends up sharing an underlying
+    /// transport via ControlMaster/ControlPersist (see `ctl_forward.rs`).
+    ctl_socket_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,13 +196,45 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
     write_connection_intent(&runtime_dir, &intent)?;
     let proxy_command = proxy_command(&plan.pipe_path, &resolution.isekai.profile);
 
+    let ctl_forward = if crate::ctl_forward::should_attempt_ctl_forward(
+        resolution.isekai.ctl_socket_enabled,
+        plan.ssh_args.len(),
+        plan.destination_index,
+    ) {
+        match crate::ctl_forward::prepare_ctl_forward(&runtime_dir) {
+            Ok(forward) => {
+                crate::ctl_forward::spawn_ctl_listener(forward.local_path.clone()).await;
+                Some(forward)
+            }
+            Err(e) => {
+                // Opportunistic feature (`ISEKAI_PIPE_DESIGN.md` Epic M):
+                // never fail the connection over this, just skip it.
+                eprintln!("isekai-ssh: ctl-socket forward unavailable, continuing without it: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut command = Command::new(&plan.openssh_path);
     command
         .env("ISEKAI_INTENT_ID", &intent.intent_id)
         .env("ISEKAI_PIPE_RUNTIME_DIR", &runtime_dir)
         .arg("-o")
-        .arg(format!("ProxyCommand={proxy_command}"))
-        .args(&plan.ssh_args)
+        .arg(format!("ProxyCommand={proxy_command}"));
+    if let Some(forward) = &ctl_forward {
+        // `-R` is an ssh(1) option, so it must precede the destination
+        // (`plan.ssh_args`'s last element, per `should_attempt_ctl_forward`)
+        // — anything appended after the destination is the remote command,
+        // not an option, to ssh(1).
+        command.args(crate::ctl_forward::forward_option_args(forward));
+    }
+    command.args(&plan.ssh_args);
+    if let Some(forward) = &ctl_forward {
+        command.arg(crate::ctl_forward::remote_command_arg(forward));
+    }
+    command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -748,6 +786,7 @@ fn resolve_isekai_config(
         relay_delay_ms: None,
         install_mode: None,
         bootstrap_relay: None,
+        ctl_socket_enabled: None,
     };
     for directive in directives {
         apply_isekai_directive(&mut builder, directive)?;
@@ -803,6 +842,7 @@ fn resolve_isekai_config(
         relay_delay_ms: builder.relay_delay_ms.unwrap_or(DEFAULT_RELAY_DELAY_MS),
         install_mode: builder.install_mode.unwrap_or(InstallMode::User),
         bootstrap_relay: builder.bootstrap_relay,
+        ctl_socket_enabled: builder.ctl_socket_enabled.unwrap_or(false),
     })
 }
 
@@ -823,6 +863,7 @@ struct IsekaiConfigBuilder {
     candidate_race_delay_ms: Option<u64>,
     relay_delay_ms: Option<u64>,
     install_mode: Option<InstallMode>,
+    ctl_socket_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -917,6 +958,11 @@ fn apply_isekai_directive(
                 }
             },
             "install-mode",
+        ),
+        "ctl-socket" => set_once(
+            &mut builder.ctl_socket_enabled,
+            parse_yes_no(one_arg(&directive)?)?,
+            "ctl-socket",
         ),
         other => Err(anyhow!("isekai-ssh: unknown #@isekai directive {other:?}")),
     }
@@ -1373,6 +1419,7 @@ mod tests {
                 relay_delay_ms: 750,
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
+                ctl_socket_enabled: false,
             },
         };
 
@@ -1424,6 +1471,7 @@ mod tests {
                 relay_delay_ms: 750,
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
+                ctl_socket_enabled: false,
             },
         };
 
@@ -1576,6 +1624,7 @@ mod tests {
                 relay_delay_ms: 750,
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
+                ctl_socket_enabled: false,
             },
         };
         let intent = build_connection_intent(&resolution).unwrap();
@@ -1796,6 +1845,7 @@ mod tests {
                 relay_delay_ms: 750,
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
+                ctl_socket_enabled: false,
             },
         };
 

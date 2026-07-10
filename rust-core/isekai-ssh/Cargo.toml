@@ -15,8 +15,9 @@ isekai-bootstrap = { path = "../isekai-bootstrap" }
 isekai-bootstrap-plan = { path = "../isekai-bootstrap-plan" }
 isekai-auth = { path = "../isekai-auth" }
 isekai-pipe-core = { path = "../isekai-pipe-core" }
+isekai-protocol = { path = "../isekai-protocol" }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "signal", "net"] }
 log = "0.4"
 env_logger = "0.11"
 base64 = "0.22"
@@ -25,10 +26,10 @@ sha2 = "0.10"
 glob = "0.3"
 serde_json = "1"
 ureq = "3"
+rand = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-isekai-protocol = { path = "../isekai-protocol" }
 russh = "0.48"
 russh-keys = "0.48"
 async-trait = "0.1.89"
