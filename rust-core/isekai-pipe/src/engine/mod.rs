@@ -54,6 +54,27 @@ const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// See `Args::relay_transport`'s doc comment for the design rationale
+/// (evidence-gated opt-in, not a runtime fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RelayTransportKind {
+    #[default]
+    Udp,
+    Qmux,
+}
+
+impl std::str::FromStr for RelayTransportKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "udp" => Ok(RelayTransportKind::Udp),
+            "qmux" => Ok(RelayTransportKind::Qmux),
+            other => Err(anyhow!("invalid --relay-transport value: {other} (expected udp|qmux)")),
+        }
+    }
+}
+
 struct Args {
     target: SocketAddr,
     service_name: String,
@@ -84,6 +105,14 @@ struct Args {
     /// `relay_public_addr`に含める。`--relay-sni`/`--relay-jwt`と併用必須。
     relay: Option<SocketAddr>,
     relay_sni: Option<String>,
+    /// `--relay`と併用: relayへの接続に使う下層トランスポート。既定`Udp`は既存の
+    /// QUIC-over-UDP(`isekai_link_masque::connect_relay_agent`)。`Qmux`はUDP遮断
+    /// 環境向けのQMux-over-TLS-over-TCP経路(`connect_relay_agent_via_qmux`、`#qmux-leg2`)。
+    /// `ISEKAI_PIPE_DESIGN.md` Epic G/Hの「single evidence-gated選択、racingなし」方針に
+    /// 従い、これは接続開始前の明示的opt-inであり、UDP接続が失敗した場合の自動フォールバック
+    /// ではない(そちらは別途 `#@isekai bootstrap-relay transport=qmux` ディレクティブが
+    /// isekai-bootstrapの起動コマンドライン組み立て時に静的に選ぶ)。
+    relay_transport: RelayTransportKind,
     /// セキュリティレビュー #58: argv経由(`--relay-jwt`)は他のローカルユーザーから
     /// `ps aux`/`/proc/<pid>/cmdline`で読める。後方互換のため引数自体は残すが、
     /// 実際のブートストラップ呼び出し元(`helper_bootstrap.rs`/`isekai-bootstrap::openssh`)
@@ -137,6 +166,16 @@ fn print_help() {
     println!("                                   requires --relay-sni and one of --relay-jwt/--relay-jwt-file");
     println!("    --relay-sni <NAME>             TLS SNI / HTTP authority for --relay");
     println!(
+        "    --relay-transport <udp|qmux>   transport to the relay itself (default: udp); qmux uses"
+    );
+    println!(
+        "                                   QMux-over-TLS-over-TCP (EXPERIMENTAL, unverified wire"
+    );
+    println!(
+        "                                   compat with the deployed relay) for networks that block"
+    );
+    println!("                                   outbound UDP; requires --relay");
+    println!(
         "    --relay-jwt-file <PATH>        path to a file containing the Bearer token for --relay"
     );
     println!("                                   (preferred: unlike --relay-jwt, never appears in");
@@ -177,6 +216,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut punch_peer: Option<SocketAddr> = None;
     let mut relay: Option<SocketAddr> = None;
     let mut relay_sni: Option<String> = None;
+    let mut relay_transport = RelayTransportKind::default();
     let mut relay_jwt: Option<String> = None;
     let mut relay_jwt_file: Option<String> = None;
     let mut bootstrap_request_file: Option<String> = None;
@@ -217,6 +257,9 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
                 );
             }
             "--relay-sni" => relay_sni = Some(next_val(&mut iter, "--relay-sni")?),
+            "--relay-transport" => {
+                relay_transport = next_val(&mut iter, "--relay-transport")?.parse()?;
+            }
             "--relay-jwt" => relay_jwt = Some(next_val(&mut iter, "--relay-jwt")?),
             "--relay-jwt-file" => relay_jwt_file = Some(next_val(&mut iter, "--relay-jwt-file")?),
             "--bootstrap-request-file" => {
@@ -294,6 +337,9 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--relay cannot be combined with --stun-server/--punch-peer (different P2P transports)"
         ));
     }
+    if relay.is_none() && relay_transport != RelayTransportKind::Udp {
+        return Err(anyhow!("--relay-transport requires --relay"));
+    }
     if service_name.is_empty() {
         return Err(anyhow!("--service-name must not be empty"));
     }
@@ -312,6 +358,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
         punch_peer,
         relay,
         relay_sni,
+        relay_transport,
         relay_jwt,
         relay_jwt_file,
         bootstrap_request_file,
@@ -483,11 +530,20 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         // 接続するだけでよい(isekai_link_relay_transport.rs参照)。
         let relay_sni = args.relay_sni.expect("validated in parse_args");
         let relay_jwt = resolve_relay_jwt(args.relay_jwt, args.relay_jwt_file)?;
-        let (relay_socket, proxy_public_address) =
-            isekai_link_masque::connect_relay_agent(relay_addr, &relay_sni, &relay_jwt)
+        let (relay_socket, proxy_public_address) = match args.relay_transport {
+            RelayTransportKind::Udp => isekai_link_masque::connect_relay_agent(relay_addr, &relay_sni, &relay_jwt)
                 .await
-                .map_err(|e| anyhow!("relay connect failed: {e}"))?;
-        log::info!("relay: tunnel established, proxy_public_address={proxy_public_address}");
+                .map_err(|e| anyhow!("relay connect failed: {e}"))?,
+            RelayTransportKind::Qmux => {
+                isekai_link_masque::connect_relay_agent_via_qmux(relay_addr, &relay_sni, &relay_jwt)
+                    .await
+                    .map_err(|e| anyhow!("relay connect (qmux) failed: {e}"))?
+            }
+        };
+        log::info!(
+            "relay: tunnel established via {:?}, proxy_public_address={proxy_public_address}",
+            args.relay_transport
+        );
         let endpoint = noq::Endpoint::new_with_abstract_socket(
             noq::EndpointConfig::default(),
             Some(server_config),
@@ -1503,5 +1559,46 @@ mod bootstrap_request_tests {
     fn client_candidate_punch_targets_is_empty_for_no_candidates() {
         let request = sample_request(vec![]);
         assert!(client_candidate_punch_targets(&request).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod relay_transport_tests {
+    use super::*;
+
+    fn args_with(extra: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = vec![
+            "--relay", "203.0.113.1:4433", "--relay-sni", "relay.test", "--relay-jwt", "test-jwt",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn relay_transport_defaults_to_udp() {
+        let args = parse_args_from(args_with(&[])).unwrap();
+        assert_eq!(args.relay_transport, RelayTransportKind::Udp);
+    }
+
+    #[test]
+    fn relay_transport_qmux_parses() {
+        let args = parse_args_from(args_with(&["--relay-transport", "qmux"])).unwrap();
+        assert_eq!(args.relay_transport, RelayTransportKind::Qmux);
+    }
+
+    #[test]
+    fn relay_transport_rejects_unknown_value() {
+        let err = parse_args_from(args_with(&["--relay-transport", "bogus"]));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn relay_transport_requires_relay() {
+        let args: Vec<String> = vec!["--relay-transport", "qmux"].into_iter().map(String::from).collect();
+        let err = parse_args_from(args);
+        assert!(err.is_err(), "--relay-transport without --relay should be rejected");
     }
 }
