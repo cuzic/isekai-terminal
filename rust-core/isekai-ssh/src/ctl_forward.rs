@@ -110,6 +110,12 @@ pub(crate) fn remote_command_arg(forward: &CtlForward) -> String {
     )
 }
 
+/// No abnormal-exit cleanup runs continuously (`ISEKAI_PIPE_DESIGN.md` §8
+/// Epic M "stale UNIX domain socketのGC"): a crashed/`kill -9`'d tab's
+/// local socket only gets removed the next time some tab prepares a new
+/// one, which is what this constant bounds.
+const LOCAL_SOCK_STALE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 #[cfg(unix)]
 pub(crate) fn prepare_ctl_forward(runtime_dir: &std::path::Path) -> Result<CtlForward> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -120,6 +126,14 @@ pub(crate) fn prepare_ctl_forward(runtime_dir: &std::path::Path) -> Result<CtlFo
         .with_context(|| format!("failed to create {}", local_dir.display()))?;
     std::fs::set_permissions(&local_dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("failed to chmod 0700 {}", local_dir.display()))?;
+
+    // Best-effort: a sweep failure should never block this tab's own
+    // connection from proceeding.
+    if let Ok(removed) = isekai_pipe_core::sweep_stale_sockets(&local_dir, "", LOCAL_SOCK_STALE_THRESHOLD) {
+        if !removed.is_empty() {
+            log::info!("isekai-ssh: swept {} stale ctl-socket file(s) under {}", removed.len(), local_dir.display());
+        }
+    }
 
     Ok(CtlForward {
         remote_path: format!("{REMOTE_SOCK_PREFIX}{token}.sock"),

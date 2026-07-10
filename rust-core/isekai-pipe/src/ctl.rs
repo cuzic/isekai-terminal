@@ -337,7 +337,12 @@ mod tests {
 
     #[test]
     fn resolves_sock_from_explicit_flag_over_env() {
-        // SAFETY: test-only, single-threaded within this test's scope.
+        // `crate::ENV_LOCK`: `std::env::set_var`/`remove_var` are process-
+        // global with no thread-local scoping, and `cargo test` runs
+        // `#[test]`s on multiple threads by default — without this, this
+        // test's mutation of `$ISEKAI_CTL_SOCK` can race with the other two
+        // env-mutating tests below (matches `isekai-ssh`'s `HOME_ENV_LOCK`).
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ENV_CTL_SOCK, "/from/env.sock");
         let resolved = resolve_ctl_socket_path(Some("/from/flag.sock".to_string())).unwrap();
         assert_eq!(resolved, PathBuf::from("/from/flag.sock"));
@@ -346,6 +351,7 @@ mod tests {
 
     #[test]
     fn resolves_sock_from_env_when_no_flag() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ENV_CTL_SOCK, "/from/env.sock");
         let resolved = resolve_ctl_socket_path(None).unwrap();
         assert_eq!(resolved, PathBuf::from("/from/env.sock"));
@@ -354,6 +360,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_sock() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(ENV_CTL_SOCK);
         let err = resolve_ctl_socket_path(None).unwrap_err();
         assert_eq!(err, ExitCode::from(EX_USAGE));
