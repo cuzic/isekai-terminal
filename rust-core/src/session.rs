@@ -308,6 +308,29 @@ fn handle_session_cmd(state: &mut SessionState, c: SessionCmd) -> ProcessResult 
     }
 }
 
+/// `CtlMessage::ClipboardPush`の`data_b64`をUTF-8テキストへデコードする。
+/// base64/UTF-8いずれかが不正なら`warn!`ログを出して`None`を返す(既存の
+/// 「不正な入力はドロップして継続する」opportunisticな方針を維持)。
+/// `session_event_loop`のselect!アームから切り出したもの — base64/UTF-8
+/// デコードという純粋な部分だけを、`spawn_blocking`によるコールバック分岐
+/// (非同期・I/O)から分離してユニットテスト可能にする。
+fn decode_clipboard_push(data_b64: &str) -> Option<String> {
+    let decoded = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            warn!("ctl-socket: clipboard push data_b64 was not valid base64: {e}");
+            return None;
+        }
+    };
+    match String::from_utf8(decoded) {
+        Ok(text) => Some(text),
+        Err(e) => {
+            warn!("ctl-socket: clipboard push was not valid UTF-8: {e}");
+            None
+        }
+    }
+}
+
 // ── session event loop（薄い async ラッパー）──────────────
 
 pub(crate) async fn session_event_loop(
@@ -368,15 +391,9 @@ pub(crate) async fn session_event_loop(
                             Some(state.set_title_from_ctl(value))
                         }
                         isekai_protocol::CtlMessage::ClipboardPush { data_b64, .. } => {
-                            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data_b64) {
-                                Ok(decoded) => match String::from_utf8(decoded) {
-                                    Ok(text) => {
-                                        let cb = Arc::clone(&callback);
-                                        tokio::task::spawn_blocking(move || cb.on_clipboard_write(text));
-                                    }
-                                    Err(e) => warn!("ctl-socket: clipboard push was not valid UTF-8: {e}"),
-                                },
-                                Err(e) => warn!("ctl-socket: clipboard push data_b64 was not valid base64: {e}"),
+                            if let Some(text) = decode_clipboard_push(&data_b64) {
+                                let cb = Arc::clone(&callback);
+                                tokio::task::spawn_blocking(move || cb.on_clipboard_write(text));
                             }
                             None
                         }
@@ -624,6 +641,36 @@ mod handle_session_cmd_tests {
         let result = handle_session_cmd(&mut state, SessionCmd::TrzszCancel { transfer_id: "t1".to_string() });
 
         assert_is_noop(&result);
+    }
+}
+
+// ctl-socket forward(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)経由で届く
+// `CtlMessage::ClipboardPush`のdata_b64デコード。base64/UTF-8双方の不正入力を
+// dropして継続する(opportunisticな)方針をカバーする。
+#[cfg(test)]
+mod decode_clipboard_push_tests {
+    use super::decode_clipboard_push;
+
+    #[test]
+    fn decodes_valid_base64_utf8_text() {
+        // "hello" の標準base64
+        assert_eq!(decode_clipboard_push("aGVsbG8="), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn returns_none_on_invalid_base64() {
+        assert_eq!(decode_clipboard_push("not valid base64!!"), None);
+    }
+
+    #[test]
+    fn returns_none_on_valid_base64_that_is_not_utf8() {
+        // 0xFF 0xFE は単独では不正なUTF-8シーケンス。base64エンコード済み("//4=")。
+        assert_eq!(decode_clipboard_push("//4="), None);
+    }
+
+    #[test]
+    fn decodes_empty_string_to_empty_text() {
+        assert_eq!(decode_clipboard_push(""), Some(String::new()));
     }
 }
 

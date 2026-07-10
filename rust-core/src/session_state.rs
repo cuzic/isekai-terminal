@@ -193,6 +193,20 @@ mod tests {
     }
 
     #[test]
+    fn set_title_from_ctl_reflects_in_terminal_title_and_marks_screen_dirty() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        assert_eq!(state.terminal().title(), None);
+
+        let r = state.set_title_from_ctl("remote title".to_string());
+
+        assert_eq!(state.terminal().title(), Some("remote title"));
+        assert!(r.screen_dirty);
+        assert!(r.side_effects.is_empty());
+        assert!(r.timer_cmds.is_empty());
+        assert!(r.pending_rows.is_empty());
+    }
+
+    #[test]
     fn test_timer_cmds_forwarded() {
         // タイマー命令が ProcessResult に含まれることを確認
         let mut state = SessionState::new(80, 24, Theme::default());
