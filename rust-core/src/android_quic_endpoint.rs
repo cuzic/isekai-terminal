@@ -75,7 +75,7 @@ struct AndroidQuicEndpoint {
 #[async_trait]
 impl QuicEndpoint for AndroidQuicEndpoint {
     async fn connect(&self, remote: RemoteSpec) -> Result<Box<dyn QuicConnection>, TransportError> {
-        let client_config = client_config_for(&remote.cert_sha256_hex, false)?;
+        let (client_config, _mismatch) = client_config_for(&remote.cert_sha256_hex, false)?;
         log::info!("android_quic_endpoint: connecting to {}", remote.addr);
         let conn = self
             .endpoint

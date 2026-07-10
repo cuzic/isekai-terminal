@@ -113,7 +113,7 @@ pub async fn connect_multipath_with_socket(
     secondaries: Vec<SecondaryPath>,
     event_tx: tokio::sync::mpsc::Sender<PathHealthEvent>,
 ) -> Result<MultipathConnection, TransportError> {
-    let client_config = client_config_for(&primary.cert_sha256_hex, true)?;
+    let (client_config, _mismatch) = client_config_for(&primary.cert_sha256_hex, true)?;
 
     let endpoint = noq::Endpoint::new_with_abstract_socket(
         noq::EndpointConfig::default(), None, socket, Arc::new(noq::TokioRuntime),
