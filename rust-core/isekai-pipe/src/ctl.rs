@@ -1,0 +1,437 @@
+//! `isekai-pipe ctl` — the remote-side CLI for the tabごとの title/clipboard
+//! control-plane (`ISEKAI_PIPE_DESIGN.md` §8 Epic M). Connects to the
+//! per-tab UNIX domain socket forwarded in via `$ISEKAI_CTL_SOCK`
+//! (`-R remote-sock:local-sock`, requested by the `isekai-ssh` wrapper) and
+//! sends/receives one `isekai_protocol::CtlMessage` per invocation. Never
+//! touches the pane's PTY, so tmux's OSC 0/2/52 interception is irrelevant.
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use anyhow::{bail, Context, Result};
+use base64::Engine as _;
+use isekai_protocol::{decode_ctl_message, ClipboardMime, CtlMessage};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
+use crate::{next_arg, EX_UNAVAILABLE, EX_USAGE};
+
+const ENV_CTL_SOCK: &str = "ISEKAI_CTL_SOCK";
+
+#[derive(Debug, PartialEq, Eq)]
+enum CtlLaunch {
+    Title { sock: Option<String>, value: String },
+    ClipPush { sock: Option<String>, mime: ClipboardMime },
+    ClipPull { sock: Option<String> },
+}
+
+fn print_ctl_help() {
+    println!("USAGE:");
+    println!("    isekai-pipe ctl title <text> [--sock <path>]");
+    println!("    isekai-pipe ctl clip push --mime <text/plain|text/html|image/png> [--sock <path>]");
+    println!("        (reads the payload from stdin)");
+    println!("    isekai-pipe ctl clip pull [--sock <path>]");
+    println!("        (writes the decoded payload to stdout)");
+    println!();
+    println!("Without --sock, reads the target UNIX domain socket path from ${ENV_CTL_SOCK}.");
+}
+
+fn parse_mime(value: &str) -> Result<ClipboardMime, String> {
+    match value {
+        "text/plain" => Ok(ClipboardMime::TextPlain),
+        "text/html" => Ok(ClipboardMime::TextHtml),
+        "image/png" => Ok(ClipboardMime::ImagePng),
+        other => Err(format!(
+            "isekai-pipe ctl clip push: unsupported --mime {other:?} (expected text/plain, text/html, or image/png)"
+        )),
+    }
+}
+
+fn parse_ctl(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
+    match args.next().as_deref() {
+        None | Some("-h") | Some("--help") => {
+            print_ctl_help();
+            Ok(None)
+        }
+        Some("title") => parse_ctl_title(args),
+        Some("clip") => parse_ctl_clip(args),
+        Some(other) => {
+            eprintln!("isekai-pipe ctl: unknown subcommand {other:?}");
+            Err(ExitCode::from(EX_USAGE))
+        }
+    }
+}
+
+fn parse_ctl_title(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
+    let mut sock: Option<String> = None;
+    let mut value: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--sock" => {
+                sock = Some(next_arg("ctl title", &mut args, "--sock").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            other if value.is_none() => value = Some(other.to_string()),
+            other => {
+                eprintln!("isekai-pipe ctl title: unexpected extra argument {other:?}");
+                return Err(ExitCode::from(EX_USAGE));
+            }
+        }
+    }
+    let Some(value) = value else {
+        eprintln!("isekai-pipe ctl title: a title text argument is required");
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    Ok(Some(CtlLaunch::Title { sock, value }))
+}
+
+fn parse_ctl_clip(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
+    match args.next().as_deref() {
+        Some("push") => {
+            let mut sock: Option<String> = None;
+            let mut mime: Option<ClipboardMime> = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--sock" => {
+                        sock = Some(next_arg("ctl clip push", &mut args, "--sock").map_err(|e| {
+                            eprintln!("{e}");
+                            ExitCode::from(EX_USAGE)
+                        })?);
+                    }
+                    "--mime" => {
+                        let value = next_arg("ctl clip push", &mut args, "--mime").map_err(|e| {
+                            eprintln!("{e}");
+                            ExitCode::from(EX_USAGE)
+                        })?;
+                        mime = Some(parse_mime(&value).map_err(|e| {
+                            eprintln!("{e}");
+                            ExitCode::from(EX_USAGE)
+                        })?);
+                    }
+                    other => {
+                        eprintln!("isekai-pipe ctl clip push: unknown argument {other:?}");
+                        return Err(ExitCode::from(EX_USAGE));
+                    }
+                }
+            }
+            let Some(mime) = mime else {
+                eprintln!("isekai-pipe ctl clip push: --mime is required");
+                return Err(ExitCode::from(EX_USAGE));
+            };
+            Ok(Some(CtlLaunch::ClipPush { sock, mime }))
+        }
+        Some("pull") => {
+            let mut sock: Option<String> = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--sock" => {
+                        sock = Some(next_arg("ctl clip pull", &mut args, "--sock").map_err(|e| {
+                            eprintln!("{e}");
+                            ExitCode::from(EX_USAGE)
+                        })?);
+                    }
+                    other => {
+                        eprintln!("isekai-pipe ctl clip pull: unknown argument {other:?}");
+                        return Err(ExitCode::from(EX_USAGE));
+                    }
+                }
+            }
+            Ok(Some(CtlLaunch::ClipPull { sock }))
+        }
+        other => {
+            eprintln!("isekai-pipe ctl clip: expected \"push\" or \"pull\", got {other:?}");
+            Err(ExitCode::from(EX_USAGE))
+        }
+    }
+}
+
+fn resolve_ctl_socket_path(explicit: Option<String>) -> Result<PathBuf, ExitCode> {
+    if let Some(explicit) = explicit {
+        return Ok(PathBuf::from(explicit));
+    }
+    match std::env::var_os(ENV_CTL_SOCK) {
+        Some(v) if !v.is_empty() => Ok(PathBuf::from(v)),
+        _ => {
+            eprintln!(
+                "isekai-pipe ctl: no --sock given and ${ENV_CTL_SOCK} is unset or empty"
+            );
+            Err(ExitCode::from(EX_USAGE))
+        }
+    }
+}
+
+pub(crate) async fn ctl_command(args: impl Iterator<Item = String>) -> ExitCode {
+    let launch = match parse_ctl(args) {
+        Ok(Some(launch)) => launch,
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(code) => return code,
+    };
+    let sock = match &launch {
+        CtlLaunch::Title { sock, .. } | CtlLaunch::ClipPush { sock, .. } | CtlLaunch::ClipPull { sock } => {
+            sock.clone()
+        }
+    };
+    let sock_path = match resolve_ctl_socket_path(sock) {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+    match run_ctl(&sock_path, launch).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // Fire-and-forget by design (`ISEKAI_PIPE_DESIGN.md` Epic M
+            // "既知の制限"): a stale/missing socket (e.g. a tmux session
+            // attached across a different SSH connection) is logged, not
+            // fatal to the caller's shell.
+            eprintln!("isekai-pipe ctl: {e:?}");
+            ExitCode::from(EX_UNAVAILABLE)
+        }
+    }
+}
+
+async fn run_ctl(sock_path: &Path, launch: CtlLaunch) -> Result<()> {
+    match launch {
+        CtlLaunch::Title { value, .. } => send_ctl_message(sock_path, CtlMessage::SetTitle { value }).await,
+        CtlLaunch::ClipPush { mime, .. } => {
+            let mut raw = Vec::new();
+            tokio::io::stdin()
+                .read_to_end(&mut raw)
+                .await
+                .context("isekai-pipe ctl clip push: failed to read stdin")?;
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+            send_ctl_message(sock_path, CtlMessage::ClipboardPush { mime, data_b64 }).await
+        }
+        CtlLaunch::ClipPull { .. } => {
+            let response = send_ctl_message_and_read_response(sock_path, CtlMessage::ClipboardPullRequest {})
+                .await?;
+            match response {
+                CtlMessage::ClipboardPullResponse { data_b64, .. } => {
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(&data_b64)
+                        .context("isekai-pipe ctl clip pull: response data_b64 was not valid base64")?;
+                    tokio::io::stdout()
+                        .write_all(&decoded)
+                        .await
+                        .context("isekai-pipe ctl clip pull: failed to write stdout")?;
+                    Ok(())
+                }
+                other => bail!("isekai-pipe ctl clip pull: unexpected response {other:?}"),
+            }
+        }
+    }
+}
+
+async fn send_ctl_message(sock_path: &Path, msg: CtlMessage) -> Result<()> {
+    let mut stream = UnixStream::connect(sock_path)
+        .await
+        .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;
+    let mut line = serde_json::to_vec(&msg).context("isekai-pipe ctl: failed to encode ctl message")?;
+    line.push(b'\n');
+    stream
+        .write_all(&line)
+        .await
+        .context("isekai-pipe ctl: failed to write ctl message")?;
+    // Half-close the write side so a listener reading line-by-line sees a
+    // clean EOF after this one message; we never keep a ctl connection open
+    // across multiple messages (§8 Epic M "ワイヤーフォーマット").
+    stream.shutdown().await.ok();
+    Ok(())
+}
+
+async fn send_ctl_message_and_read_response(sock_path: &Path, msg: CtlMessage) -> Result<CtlMessage> {
+    let stream = UnixStream::connect(sock_path)
+        .await
+        .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut line = serde_json::to_vec(&msg).context("isekai-pipe ctl: failed to encode ctl message")?;
+    line.push(b'\n');
+    write_half
+        .write_all(&line)
+        .await
+        .context("isekai-pipe ctl: failed to write ctl message")?;
+    write_half.shutdown().await.ok();
+
+    let mut reader = BufReader::new(read_half);
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .await
+        .context("isekai-pipe ctl: failed to read response")?;
+    if response_line.is_empty() {
+        bail!("isekai-pipe ctl: connection closed before a response was received");
+    }
+    decode_ctl_message(response_line.trim_end_matches('\n').as_bytes())
+        .map_err(anyhow::Error::from)
+        .context("isekai-pipe ctl: malformed response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    fn args(strs: &[&str]) -> impl Iterator<Item = String> {
+        strs.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn parses_title() {
+        let launch = parse_ctl(args(&["title", "my tab"])).unwrap().unwrap();
+        assert_eq!(
+            launch,
+            CtlLaunch::Title { sock: None, value: "my tab".to_string() }
+        );
+    }
+
+    #[test]
+    fn parses_title_with_explicit_sock() {
+        let launch = parse_ctl(args(&["title", "--sock", "/tmp/a.sock", "hi"])).unwrap().unwrap();
+        assert_eq!(
+            launch,
+            CtlLaunch::Title { sock: Some("/tmp/a.sock".to_string()), value: "hi".to_string() }
+        );
+    }
+
+    #[test]
+    fn rejects_title_without_text() {
+        let err = parse_ctl(args(&["title"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn parses_clip_push() {
+        let launch = parse_ctl(args(&["clip", "push", "--mime", "text/plain"])).unwrap().unwrap();
+        assert_eq!(launch, CtlLaunch::ClipPush { sock: None, mime: ClipboardMime::TextPlain });
+    }
+
+    #[test]
+    fn parses_clip_push_image() {
+        let launch = parse_ctl(args(&["clip", "push", "--mime", "image/png"])).unwrap().unwrap();
+        assert_eq!(launch, CtlLaunch::ClipPush { sock: None, mime: ClipboardMime::ImagePng });
+    }
+
+    #[test]
+    fn rejects_clip_push_without_mime() {
+        let err = parse_ctl(args(&["clip", "push"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn rejects_clip_push_with_unknown_mime() {
+        let err = parse_ctl(args(&["clip", "push", "--mime", "application/octet-stream"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn parses_clip_pull() {
+        let launch = parse_ctl(args(&["clip", "pull"])).unwrap().unwrap();
+        assert_eq!(launch, CtlLaunch::ClipPull { sock: None });
+    }
+
+    #[test]
+    fn rejects_unknown_subcommand() {
+        let err = parse_ctl(args(&["frobnicate"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn resolves_sock_from_explicit_flag_over_env() {
+        // SAFETY: test-only, single-threaded within this test's scope.
+        std::env::set_var(ENV_CTL_SOCK, "/from/env.sock");
+        let resolved = resolve_ctl_socket_path(Some("/from/flag.sock".to_string())).unwrap();
+        assert_eq!(resolved, PathBuf::from("/from/flag.sock"));
+        std::env::remove_var(ENV_CTL_SOCK);
+    }
+
+    #[test]
+    fn resolves_sock_from_env_when_no_flag() {
+        std::env::set_var(ENV_CTL_SOCK, "/from/env.sock");
+        let resolved = resolve_ctl_socket_path(None).unwrap();
+        assert_eq!(resolved, PathBuf::from("/from/env.sock"));
+        std::env::remove_var(ENV_CTL_SOCK);
+    }
+
+    #[test]
+    fn rejects_missing_sock() {
+        std::env::remove_var(ENV_CTL_SOCK);
+        let err = resolve_ctl_socket_path(None).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    /// e2e: a minimal hand-written listener (matches this crate's convention
+    /// of small hand-rolled mock servers per test file rather than a shared
+    /// `tests/common`) that reads one line, asserts it decodes to the
+    /// expected `CtlMessage`, and closes.
+    #[tokio::test]
+    async fn send_ctl_message_delivers_set_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("ctl.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let server = tokio::spawn({
+            let sock_path = sock_path.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let msg = decode_ctl_message(line.trim_end().as_bytes()).unwrap();
+                assert_eq!(msg, CtlMessage::SetTitle { value: "hello".to_string() });
+                drop(sock_path);
+            }
+        });
+
+        send_ctl_message(&sock_path, CtlMessage::SetTitle { value: "hello".to_string() })
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_ctl_message_and_read_response_round_trips_clip_pull() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("ctl.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let msg = decode_ctl_message(line.trim_end().as_bytes()).unwrap();
+            assert_eq!(msg, CtlMessage::ClipboardPullRequest {});
+
+            let response = CtlMessage::ClipboardPullResponse {
+                mime: ClipboardMime::TextPlain,
+                data_b64: base64::engine::general_purpose::STANDARD.encode("clipboard contents"),
+            };
+            let mut out = serde_json::to_vec(&response).unwrap();
+            out.push(b'\n');
+            write_half.write_all(&out).await.unwrap();
+        });
+
+        let response = send_ctl_message_and_read_response(&sock_path, CtlMessage::ClipboardPullRequest {})
+            .await
+            .unwrap();
+        assert_eq!(
+            response,
+            CtlMessage::ClipboardPullResponse {
+                mime: ClipboardMime::TextPlain,
+                data_b64: base64::engine::general_purpose::STANDARD.encode("clipboard contents"),
+            }
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_ctl_message_fails_cleanly_when_socket_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("does-not-exist.sock");
+        let err = send_ctl_message(&sock_path, CtlMessage::SetTitle { value: "x".to_string() })
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("failed to connect"));
+    }
+}

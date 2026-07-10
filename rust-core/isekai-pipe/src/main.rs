@@ -1,3 +1,4 @@
+mod ctl;
 mod engine;
 
 use std::collections::VecDeque;
@@ -47,6 +48,7 @@ fn print_help() {
     println!("    serve      remote service side");
     println!("    probe      connectivity probe (skeleton)");
     println!("    inspect    passive profile inspection (--profile, --json, --redact, --verbose)");
+    println!("    ctl        title/clipboard control-plane client (see `isekai-pipe ctl --help`)");
     println!("    version    print version");
     println!();
     println!(
@@ -2864,6 +2866,7 @@ async fn main() -> ExitCode {
         Some("serve") => serve_command(args).await,
         Some("probe") => probe_command(args).await,
         Some("inspect") => inspect_command(args).await,
+        Some("ctl") => ctl::ctl_command(args).await,
         Some(other) => {
             eprintln!("isekai-pipe: unknown command: {other}");
             eprintln!("try `isekai-pipe --help`");
