@@ -317,6 +317,12 @@ async fn spawn_echo_server() -> SocketAddr {
 }
 
 fn make_client_endpoint(cert_sha256_hex: &str) -> Endpoint {
+    // isekai-link-masque's qmux dependency links `aws-lc-rs` alongside quinn's
+    // own `ring`, so rustls can no longer auto-select a single process-wide
+    // crypto provider — every test that reaches here builds a real quinn
+    // client, so fixing it once at this chokepoint covers all of them.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let mut client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier {
