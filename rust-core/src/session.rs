@@ -550,6 +550,83 @@ mod should_abort_on_network_lost_tests {
     }
 }
 
+// `handle_session_cmd`自体はSessionState上のメソッドへのルーティングのみが責務で、
+// Trzsz転送FSMの状態遷移そのものはtrzsz.rsに厚いテストがあるため、ここでは
+// 「正しいメソッドへ配線されているか」を薄く確認するだけに留める。
+#[cfg(test)]
+mod handle_session_cmd_tests {
+    use super::*;
+
+    fn fresh_state() -> SessionState {
+        SessionState::new(80, 24, Theme::default())
+    }
+
+    fn assert_is_noop(result: &ProcessResult) {
+        assert!(result.side_effects.is_empty());
+        assert!(result.timer_cmds.is_empty());
+        assert!(!result.screen_dirty);
+        assert!(result.pending_rows.is_empty());
+        assert!(result.pending_clipboard_write.is_none());
+        assert!(!result.clipboard_pull_requested);
+    }
+
+    #[test]
+    fn set_theme_routes_to_session_state_set_theme() {
+        let mut state = fresh_state();
+        let custom = Theme { default_fg: 0x11223344, ..Theme::default() };
+        assert_ne!(state.terminal().theme(), custom);
+
+        let result = handle_session_cmd(&mut state, SessionCmd::SetTheme(custom));
+
+        assert_eq!(state.terminal().theme(), custom);
+        assert_is_noop(&result);
+    }
+
+    #[test]
+    fn trzsz_accept_upload_routes_to_on_kotlin_accept_upload() {
+        let mut state = fresh_state();
+
+        // FSMがWaitingKotlin状態でない(=リモートからのtrzsz開始マジックを未検出)ため
+        // consume()のno-opになる — ここで確認したいのはhandle_session_cmdが
+        // on_kotlin_accept_uploadへ正しく引数を渡して呼び出せることだけ。
+        let result = handle_session_cmd(&mut state, SessionCmd::TrzszAcceptUpload {
+            transfer_id: "t1".to_string(), file_name: "f.bin".to_string(), file_size: 42, mode: 0o644,
+        });
+
+        assert_is_noop(&result);
+    }
+
+    #[test]
+    fn trzsz_chunk_routes_to_on_kotlin_chunk() {
+        let mut state = fresh_state();
+
+        let result = handle_session_cmd(&mut state, SessionCmd::TrzszChunk {
+            transfer_id: "t1".to_string(), data: vec![1, 2, 3], is_last: true,
+        });
+
+        assert_is_noop(&result);
+    }
+
+    #[test]
+    fn trzsz_accept_download_routes_to_on_kotlin_accept_download() {
+        let mut state = fresh_state();
+
+        let result =
+            handle_session_cmd(&mut state, SessionCmd::TrzszAcceptDownload { transfer_id: "t1".to_string() });
+
+        assert_is_noop(&result);
+    }
+
+    #[test]
+    fn trzsz_cancel_routes_to_on_kotlin_cancel() {
+        let mut state = fresh_state();
+
+        let result = handle_session_cmd(&mut state, SessionCmd::TrzszCancel { transfer_id: "t1".to_string() });
+
+        assert_is_noop(&result);
+    }
+}
+
 // `SessionCore::scrollback_cells`(オフセット/行数からscrollbackを切り出す表示ロジック)
 // と`dispatch_result`のscrollback上限トリミングは、実SSH/QUIC接続もTokioランタイムも
 // 不要な純粋なデータ変換だが、`session.rs`にはテストが1つも無かった。
