@@ -404,3 +404,71 @@ impl ByteStreamWriteHalf for SystemByteStreamWriteHalf {
         self.send.finish().map_err(|e| TransportError::StreamIo(e.to_string()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+    // `verify_server_cert`はASN.1として妥当な証明書を要求しない(生バイト列を
+    // sha256するだけ)ので、テスト用の適当なバイト列で十分。
+    const FAKE_CERT_BYTES: &[u8] = b"isekai-transport system.rs test fixture, not a real cert";
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn verifier_with(
+        expected_sha256_hex: &str,
+    ) -> (PinnedCertVerifier, Arc<Mutex<Option<(String, String)>>>) {
+        let mismatch = Arc::new(Mutex::new(None));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        (PinnedCertVerifier::new(expected_sha256_hex.to_string(), provider, mismatch.clone()), mismatch)
+    }
+
+    fn verify(verifier: &PinnedCertVerifier, cert_bytes: &[u8]) -> Result<ServerCertVerified, rustls::Error> {
+        let cert = CertificateDer::from(cert_bytes.to_vec());
+        let server_name = ServerName::try_from("isekai-helper.invalid").unwrap();
+        verifier.verify_server_cert(&cert, &[], &server_name, &[], UnixTime::now())
+    }
+
+    #[test]
+    fn verify_server_cert_succeeds_when_pin_matches() {
+        let expected = sha256_hex(FAKE_CERT_BYTES);
+        let (verifier, mismatch) = verifier_with(&expected);
+
+        let result = verify(&verifier, FAKE_CERT_BYTES);
+
+        assert!(result.is_ok());
+        assert_eq!(*mismatch.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn verify_server_cert_rejects_and_records_expected_and_got_on_mismatch() {
+        let expected = "0".repeat(64);
+        let got = sha256_hex(FAKE_CERT_BYTES);
+        let (verifier, mismatch) = verifier_with(&expected);
+
+        let result = verify(&verifier, FAKE_CERT_BYTES);
+
+        assert!(result.is_err());
+        assert_eq!(*mismatch.lock().unwrap(), Some((expected, got)));
+    }
+
+    #[test]
+    fn mismatch_slot_stays_empty_until_a_verify_call_fails() {
+        let expected = sha256_hex(FAKE_CERT_BYTES);
+        let (_verifier, mismatch) = verifier_with(&expected);
+
+        assert_eq!(*mismatch.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn client_config_for_succeeds_and_returns_an_empty_mismatch_slot() {
+        let (_config, mismatch) = client_config_for(&sha256_hex(FAKE_CERT_BYTES), true).unwrap();
+
+        assert_eq!(*mismatch.lock().unwrap(), None);
+    }
+}
