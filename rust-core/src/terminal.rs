@@ -240,23 +240,17 @@ impl Terminal {
                 22 => { self.cur_bold = false; }
                 30..=37 => { self.cur_fg = theme.ansi16[(ps[i] - 30) as usize]; }
                 38 => {
-                    if ps.get(i + 1) == Some(&5) {
-                        if let Some(&n) = ps.get(i + 2) { self.cur_fg = ansi256_to_argb(&theme, n as u8); i += 2; }
-                    } else if ps.get(i + 1) == Some(&2) && i + 4 < ps.len() {
-                        let (r, g, b) = (ps[i+2] as u32, ps[i+3] as u32, ps[i+4] as u32);
-                        self.cur_fg = 0xFF000000 | (r << 16) | (g << 8) | b;
-                        i += 4;
+                    if let Some((color, advance)) = parse_extended_color(&theme, ps, i) {
+                        self.cur_fg = color;
+                        i += advance;
                     }
                 }
                 39 => { self.cur_fg = theme.default_fg; }
                 40..=47 => { self.cur_bg = theme.ansi16[(ps[i] - 40) as usize]; }
                 48 => {
-                    if ps.get(i + 1) == Some(&5) {
-                        if let Some(&n) = ps.get(i + 2) { self.cur_bg = ansi256_to_argb(&theme, n as u8); i += 2; }
-                    } else if ps.get(i + 1) == Some(&2) && i + 4 < ps.len() {
-                        let (r, g, b) = (ps[i+2] as u32, ps[i+3] as u32, ps[i+4] as u32);
-                        self.cur_bg = 0xFF000000 | (r << 16) | (g << 8) | b;
-                        i += 4;
+                    if let Some((color, advance)) = parse_extended_color(&theme, ps, i) {
+                        self.cur_bg = color;
+                        i += advance;
                     }
                 }
                 49  => { self.cur_bg = theme.default_bg; }
@@ -267,6 +261,22 @@ impl Terminal {
             i += 1;
         }
     }
+}
+
+/// SGR `38`(前景色)/`48`(背景色)ケースが共通で使う拡張色パース。
+/// 256色パレット(`5;n`)とtrue color(`2;r;g;b`)の2形式に対応する。
+/// 戻り値は`(解決した色, psを追加で消費した数)`。パースできなければ`None`
+/// (呼び出し側は色を変更せず、通常通り`i`を1つ進めるだけでよい)。
+fn parse_extended_color(theme: &Theme, ps: &[u16], i: usize) -> Option<(u32, usize)> {
+    if ps.get(i + 1) == Some(&5) {
+        let n = *ps.get(i + 2)?;
+        return Some((ansi256_to_argb(theme, n as u8), 2));
+    }
+    if ps.get(i + 1) == Some(&2) && i + 4 < ps.len() {
+        let (r, g, b) = (ps[i + 2] as u32, ps[i + 3] as u32, ps[i + 4] as u32);
+        return Some((0xFF000000 | (r << 16) | (g << 8) | b, 4));
+    }
+    None
 }
 
 impl Perform for Terminal {
