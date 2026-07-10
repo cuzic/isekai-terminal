@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.MaterialTheme
@@ -31,6 +30,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.util.RemoteLogger
 
 @Composable
@@ -101,16 +101,11 @@ fun SnippetListScreen(
     }
 
     deleteTarget?.let { target ->
-        AlertDialog(
-            onDismissRequest = { vm.dismissDelete() },
-            title = { Text("削除確認") },
-            text = { Text("「${target.label}」を削除しますか？") },
-            confirmButton = {
-                TextButton(onClick = { vm.confirmDelete(target) }) { Text("削除") }
-            },
-            dismissButton = {
-                TextButton(onClick = { vm.dismissDelete() }) { Text("キャンセル") }
-            },
+        DeleteConfirmDialog(
+            title = "削除確認",
+            message = "「${target.label}」を削除しますか？",
+            onConfirm = { vm.confirmDelete(target) },
+            onDismiss = { vm.dismissDelete() },
         )
     }
 }
