@@ -238,6 +238,7 @@ fn dummy_relay_spec() -> RelayLaunchSpec {
         relay_addr: "127.0.0.1:1".parse().unwrap(),
         relay_sni: "relay.isekai-ssh.test".to_string(),
         relay_jwt: "test-jwt-token".to_string(),
+        relay_transport: isekai_bootstrap::RelayTransportKind::Udp,
         idle_lifetime_secs: 2_592_000,
     }
 }
@@ -355,6 +356,7 @@ async fn install_and_start_passes_idle_lifetime_to_the_launched_helper() {
         relay_addr: "127.0.0.1:1".parse().unwrap(),
         relay_sni: "relay.isekai-ssh.test".to_string(),
         relay_jwt: "test-jwt-token".to_string(),
+        relay_transport: isekai_bootstrap::RelayTransportKind::Udp,
         idle_lifetime_secs: 2_592_000,
     };
 
@@ -377,6 +379,54 @@ async fn install_and_start_passes_idle_lifetime_to_the_launched_helper() {
     // defaulted `--target` to `127.0.0.1:22`).
     assert!(argv.starts_with("serve "), "expected argv to start with the 'serve' subcommand, got: {argv:?}");
     assert!(argv.contains("--target 127.0.0.1:22"), "expected argv to contain '--target 127.0.0.1:22', got: {argv:?}");
+}
+
+/// `RelayLaunchSpec::relay_transport: Qmux` (`#qmux-leg2`) must add
+/// `--relay-transport qmux` to the launched isekai-helper's argv; the
+/// default (`Udp`) must add nothing (the flag doesn't even exist on older
+/// `isekai-pipe serve` builds, so omitting it entirely — not passing
+/// `--relay-transport udp` — keeps backward compatibility with them).
+#[tokio::test]
+async fn install_and_start_relay_transport_qmux_adds_the_flag() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+
+    let argv_log = home.join("argv.log");
+    let fake_helper_script =
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n", argv_log.display());
+
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+    let relay = RelayLaunchSpec {
+        relay_addr: "127.0.0.1:1".parse().unwrap(),
+        relay_sni: "relay.isekai-ssh.test".to_string(),
+        relay_jwt: "test-jwt-token".to_string(),
+        relay_transport: isekai_bootstrap::RelayTransportKind::Qmux,
+        idle_lifetime_secs: 2_592_000,
+    };
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], fake_helper_script.as_bytes(), &LaunchSpec::Relay(relay), None, &[]),
+    )
+    .await
+    .expect("install_and_start should not hang")
+    .expect("install_and_start should succeed against the mock server");
+
+    let argv = std::fs::read_to_string(&argv_log).expect("stand-in script should have recorded its argv");
+    assert!(
+        argv.contains("--relay-transport qmux"),
+        "expected argv to contain '--relay-transport qmux', got: {argv:?}"
+    );
 }
 
 /// `LaunchSpec::Direct` (the wrapper's auto-bootstrap path,

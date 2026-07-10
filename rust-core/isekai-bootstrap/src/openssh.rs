@@ -287,6 +287,13 @@ impl OpenSshBackend {
                 let relay_addr = relay.relay_addr;
                 let quoted_sni = shell_single_quote(&relay.relay_sni);
                 let idle_lifetime_secs = relay.idle_lifetime_secs;
+                // `#qmux-leg2`: evidence-gated static choice (`ISEKAI_PIPE_DESIGN.md`
+                // Epic G/H) — the deployed helper is told once, up front, which
+                // transport to use to reach the relay; never a runtime fallback.
+                let relay_transport_arg = match relay.relay_transport {
+                    crate::types::RelayTransportKind::Udp => String::new(),
+                    crate::types::RelayTransportKind::Qmux => " --relay-transport qmux".to_string(),
+                };
                 // Security review #68: use the same per-invocation `mktemp -d` +
                 // `trap ... EXIT` pattern as `rust-core/src/helper_bootstrap.rs`
                 // (Android bootstrap path) instead of a fixed shared path. The fixed
@@ -327,7 +334,7 @@ impl OpenSshBackend {
                      [ \"$(wc -c < $tmpdir/relay_jwt)\" -eq {jwt_len} ] && \
                      ( setsid {remote_binary_path} serve --target 127.0.0.1:22 \
                      --relay {relay_addr} --relay-sni {quoted_sni} --relay-jwt-file $tmpdir/relay_jwt \
-                     --bootstrap-request-file $tmpdir/bootstrap-request.json \
+                     --bootstrap-request-file $tmpdir/bootstrap-request.json{relay_transport_arg} \
                      --max-idle-lifetime {idle_lifetime_secs} \
                      </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
                      for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \

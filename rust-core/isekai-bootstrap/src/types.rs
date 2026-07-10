@@ -81,6 +81,23 @@ impl JumpSpec {
     }
 }
 
+/// Which transport the deployed `isekai-helper` should use to reach the
+/// relay itself (`isekai-pipe serve --relay-transport`, `#qmux-leg2`).
+/// `Udp` (the default) is ordinary QUIC-over-UDP
+/// (`isekai_link_masque::connect_relay_agent`); `Qmux` is the
+/// QMux-over-TLS-over-TCP path (`connect_relay_agent_via_qmux`) for
+/// networks that block outbound UDP on the *server* (helper) side. Mirrors
+/// `ISEKAI_PIPE_DESIGN.md` Epic G/H's "single evidence-gated selection, no
+/// runtime fallback" policy: this is chosen once, statically, when building
+/// the bootstrap launch command — never retried automatically if the `Udp`
+/// path would have failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RelayTransportKind {
+    #[default]
+    Udp,
+    Qmux,
+}
+
 /// Arguments passed to `isekai-helper --relay ... --relay-sni ... --relay-jwt
 /// ... --max-idle-lifetime ...` (`IsekaiPipeP2pMode::Relay` in
 /// `rust-core/src/helper_bootstrap.rs`, `archive/HELPER_PROTOCOL.md`). STUN/P2P
@@ -91,6 +108,9 @@ pub struct RelayLaunchSpec {
     pub relay_addr: SocketAddr,
     pub relay_sni: String,
     pub relay_jwt: String,
+    /// See [`RelayTransportKind`]. Defaults to `Udp` for existing callers
+    /// that construct this struct without setting it explicitly.
+    pub relay_transport: RelayTransportKind,
     /// `isekai-helper --max-idle-lifetime <SECS>`: how long the deployed
     /// helper stays running with no active connection before it self-exits.
     /// `isekai-helper`'s own default (600s) is tuned for `isekai-terminal-core`'s

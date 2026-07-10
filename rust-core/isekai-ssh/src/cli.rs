@@ -23,7 +23,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -64,6 +64,25 @@ pub enum Command {
     /// (`wrapper.rs::run_ssh_with_stale_trust_recovery`); this is purely
     /// for a human to inspect on demand. See `doctor.rs`'s module docs.
     Doctor(DoctorArgs),
+}
+
+/// CLI-facing mirror of `isekai_bootstrap::RelayTransportKind` — kept
+/// separate rather than deriving `clap::ValueEnum` directly on that type so
+/// `isekai-bootstrap` (shared with `isekai-terminal-core`/Android) never
+/// needs a `clap` dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RelayTransportArg {
+    Udp,
+    Qmux,
+}
+
+impl From<RelayTransportArg> for isekai_bootstrap::RelayTransportKind {
+    fn from(value: RelayTransportArg) -> Self {
+        match value {
+            RelayTransportArg::Udp => isekai_bootstrap::RelayTransportKind::Udp,
+            RelayTransportArg::Qmux => isekai_bootstrap::RelayTransportKind::Qmux,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -124,6 +143,15 @@ pub struct InitArgs {
     /// TLS SNI / HTTP authority for `--relay-addr`.
     #[arg(long, value_name = "NAME")]
     pub relay_sni: String,
+
+    /// Transport the deployed isekai-helper uses to reach `--relay-addr`
+    /// itself (`#qmux-leg2`). `qmux` (QMux-over-TLS-over-TCP,
+    /// EXPERIMENTAL — wire compatibility with the deployed relay is
+    /// unverified) is for networks that block outbound UDP on the *server*
+    /// side; see `isekai_bootstrap::RelayTransportKind`'s docs for why this
+    /// is a static, evidence-gated choice, not a runtime fallback.
+    #[arg(long, value_enum, default_value_t = RelayTransportArg::Udp)]
+    pub relay_transport: RelayTransportArg,
 
     /// Bearer token authenticating isekai-helper to the relay. Exactly one
     /// of `--relay-jwt`/`--relay-jwt-from-login` is required.

@@ -28,4 +28,4 @@ pub mod types;
 pub use backend::BootstrapBackend;
 pub use error::BootstrapError;
 pub use openssh::OpenSshBackend;
-pub use types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec};
+pub use types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec, RelayTransportKind};

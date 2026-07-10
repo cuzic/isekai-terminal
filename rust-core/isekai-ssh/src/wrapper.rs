@@ -13,7 +13,9 @@ use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
 use isekai_auth::TokenProvider;
-use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
+use isekai_bootstrap::{
+    BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec, RelayTransportKind,
+};
 use isekai_bootstrap_plan::{classify_bootstrap_error, BootstrapFailure};
 use isekai_pipe_core::{
     claim_connect_outcome, default_profiles_dir, default_runtime_dir, load_persistent_profile,
@@ -146,6 +148,11 @@ struct BootstrapCandidate {
 struct BootstrapRelayTarget {
     relay_addr: SocketAddr,
     relay_sni: String,
+    /// `transport=qmux` (`#qmux-leg2`, defaults to `udp`) — see
+    /// `isekai_bootstrap::RelayTransportKind`'s docs for why this is a
+    /// static, evidence-gated choice at bootstrap time, not a runtime
+    /// fallback.
+    relay_transport: RelayTransportKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -575,6 +582,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
                 relay_addr: relay_target.relay_addr,
                 relay_sni: relay_target.relay_sni.clone(),
                 relay_jwt,
+                relay_transport: relay_target.relay_transport,
                 idle_lifetime_secs: DEFAULT_IDLE_LIFETIME_SECS,
             })
         }
@@ -1150,6 +1158,7 @@ fn parse_bootstrap_candidate(args: &[String]) -> Result<BootstrapCandidate> {
 fn parse_bootstrap_relay(args: &[String]) -> Result<BootstrapRelayTarget> {
     let mut relay_addr = None;
     let mut relay_sni = None;
+    let mut relay_transport = RelayTransportKind::Udp;
     for arg in args {
         let Some((key, value)) = arg.split_once('=') else {
             return Err(anyhow!("isekai-ssh: bootstrap-relay argument must be key=value: {arg:?}"));
@@ -1166,12 +1175,22 @@ fn parse_bootstrap_relay(args: &[String]) -> Result<BootstrapRelayTarget> {
                 }
                 relay_sni = Some(value.to_string())
             }
+            "transport" => {
+                relay_transport = match value {
+                    "udp" => RelayTransportKind::Udp,
+                    "qmux" => RelayTransportKind::Qmux,
+                    other => {
+                        return Err(anyhow!("isekai-ssh: invalid bootstrap-relay transport {other:?} (expected udp|qmux)"))
+                    }
+                }
+            }
             _ => return Err(anyhow!("isekai-ssh: unknown bootstrap-relay key {key:?}")),
         }
     }
     Ok(BootstrapRelayTarget {
         relay_addr: relay_addr.ok_or_else(|| anyhow!("isekai-ssh: bootstrap-relay requires addr=..."))?,
         relay_sni: relay_sni.ok_or_else(|| anyhow!("isekai-ssh: bootstrap-relay requires sni=..."))?,
+        relay_transport,
     })
 }
 
@@ -2037,7 +2056,11 @@ Host *
         assert_eq!(resolved.relay_endpoints, vec!["masque://relay.example.com"]);
         assert_eq!(
             resolved.bootstrap_relay,
-            Some(BootstrapRelayTarget { relay_addr: "203.0.113.10:443".parse().unwrap(), relay_sni: "relay.example.com".to_string() })
+            Some(BootstrapRelayTarget {
+                relay_addr: "203.0.113.10:443".parse().unwrap(),
+                relay_sni: "relay.example.com".to_string(),
+                relay_transport: RelayTransportKind::Udp,
+            })
         );
         assert_eq!(resolved.resume_grace_secs, 180);
         assert_eq!(resolved.candidate_race_delay_ms, 250);
@@ -2048,7 +2071,27 @@ Host *
     #[test]
     fn parse_bootstrap_relay_accepts_addr_and_sni() {
         let target = parse_bootstrap_relay(&s(&["addr=203.0.113.10:443", "sni=relay.example.com"])).unwrap();
-        assert_eq!(target, BootstrapRelayTarget { relay_addr: "203.0.113.10:443".parse().unwrap(), relay_sni: "relay.example.com".to_string() });
+        assert_eq!(
+            target,
+            BootstrapRelayTarget {
+                relay_addr: "203.0.113.10:443".parse().unwrap(),
+                relay_sni: "relay.example.com".to_string(),
+                relay_transport: RelayTransportKind::Udp,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_relay_accepts_transport_qmux() {
+        let target =
+            parse_bootstrap_relay(&s(&["addr=203.0.113.10:443", "sni=relay.example.com", "transport=qmux"])).unwrap();
+        assert_eq!(target.relay_transport, RelayTransportKind::Qmux);
+    }
+
+    #[test]
+    fn parse_bootstrap_relay_rejects_unknown_transport() {
+        let err = parse_bootstrap_relay(&s(&["addr=203.0.113.10:443", "sni=relay.example.com", "transport=bogus"]));
+        assert!(err.is_err());
     }
 
     #[test]

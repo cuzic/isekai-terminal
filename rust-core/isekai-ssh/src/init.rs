@@ -58,6 +58,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         relay_addr: args.relay_addr,
         relay_sni: args.relay_sni.clone(),
         relay_jwt,
+        relay_transport: args.relay_transport.into(),
         idle_lifetime_secs: args.idle_lifetime,
     };
 
@@ -311,6 +312,7 @@ mod tests {
             helper_release_tag: None,
             relay_addr: "127.0.0.1:1".parse().unwrap(),
             relay_sni: "relay.example.test".to_string(),
+            relay_transport: crate::cli::RelayTransportArg::Udp,
             relay_jwt: Some("test-jwt".to_string()),
             relay_jwt_from_login: false,
             helper_version: "unknown".to_string(),
