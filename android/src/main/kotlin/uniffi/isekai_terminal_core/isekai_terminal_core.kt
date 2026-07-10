@@ -875,6 +875,8 @@ external fun uniffi_isekai_terminal_core_checksum_func_core_version(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_func_create_ssh_session(
 ): Int
+external fun uniffi_isekai_terminal_core_checksum_func_set_ctl_socket_forward_enabled(
+): Int
 external fun uniffi_isekai_terminal_core_checksum_func_set_terminal_theme(
 ): Int
 external fun uniffi_isekai_terminal_core_checksum_func_terminal_commit_text_bytes(
@@ -1495,6 +1497,8 @@ external fun uniffi_isekai_terminal_core_fn_func_core_version(uniffi_out_err: Un
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_create_ssh_session(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
+external fun uniffi_isekai_terminal_core_fn_func_set_ctl_socket_forward_enabled(`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_isekai_terminal_core_fn_func_set_terminal_theme(`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_func_terminal_commit_text_bytes(`text`: RustBuffer.ByValue,`bracketedPasteMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
@@ -1655,6 +1659,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_create_ssh_session() != 1917) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_set_ctl_socket_forward_enabled() != 57920) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_set_terminal_theme() != 46107) {
@@ -10388,6 +10395,21 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
 }
     )
     }
+    
+
+        /**
+         * tmux 迂回 control-plane(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)を有効にするか
+         * (プロファイル毎ではなくグローバル設定、`set_terminal_theme`と同じ形)。有効な間、
+         * 新しく開くSSHチャネル(タブ)は接続直後にリモートへ`streamlocal_forward`を要求し、
+         * `isekai-pipe ctl title|clip push`をtmuxを経由せず直接受け取れるようにする。
+         */ fun `setCtlSocketForwardEnabled`(`enabled`: kotlin.Boolean)
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_set_ctl_socket_forward_enabled(
+    
+        FfiConverterBoolean.lower(`enabled`),_status)
+}
+    
     
 
         /**

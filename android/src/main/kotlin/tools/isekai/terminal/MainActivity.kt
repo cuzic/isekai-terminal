@@ -20,6 +20,7 @@ import androidx.navigation.compose.rememberNavController
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
+import uniffi.isekai_terminal_core.setCtlSocketForwardEnabled
 import uniffi.isekai_terminal_core.setTerminalTheme
 
 /** `SharedPreferences("isekai_terminal_ui")` に保存する「画面の保護」(FLAG_SECURE) 設定のキー。 */
@@ -44,6 +45,15 @@ const val PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE = "allow_remote_clipboard_write"
 const val PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL = "allow_remote_clipboard_pull"
 
 /**
+ * `SharedPreferences("isekai_terminal_ui")` に保存する「tmux 迂回 control-plane(russh の
+ * streamlocal forward経由でリモートの`isekai-pipe ctl title|clip push`を直接受け取る、
+ * `ISEKAI_PIPE_DESIGN.md` §8 Epic M)を有効にする」設定のキー。既定OFFのオプトイン。
+ * [restorePersistedScreenProtection]と同様、Rust側はプロセスグローバルな状態
+ * ([setCtlSocketForwardEnabled])として持つため、アプリ起動時に一度反映すればよい。
+ */
+const val PREF_KEY_ENABLE_CTL_SOCKET_FORWARD = "enable_ctl_socket_forward"
+
+/**
  * 画面の保護(スクリーンショット・画面録画・「最近使ったアプリ」のサムネイルを禁止する
  * [WindowManager.LayoutParams.FLAG_SECURE])を適用/解除する。
  *
@@ -66,6 +76,7 @@ class MainActivity : ComponentActivity() {
         RemoteLogger.i("MainActivity", "app started")
         restorePersistedTerminalTheme()
         restorePersistedScreenProtection()
+        restorePersistedCtlSocketForward()
         enableEdgeToEdge()
         setContent {
             MaterialTheme {
@@ -105,6 +116,17 @@ class MainActivity : ComponentActivity() {
     private fun restorePersistedScreenProtection() {
         val prefs = getSharedPreferences("isekai_terminal_ui", MODE_PRIVATE)
         applyScreenProtection(this, prefs.getBoolean(PREF_KEY_SCREEN_PROTECTION, false))
+    }
+
+    /**
+     * 前回設定した「tmux 迂回 control-plane」(既定OFF) を、Rust側のプロセスグローバルな
+     * 状態(`set_ctl_socket_forward_enabled`)へ起動直後に一度反映する。実行中のトグルは
+     * [ProfileListScreen] のメニューが直接 [setCtlSocketForwardEnabled] を呼ぶので、
+     * ここは起動時の1回だけでよい。
+     */
+    private fun restorePersistedCtlSocketForward() {
+        val prefs = getSharedPreferences("isekai_terminal_ui", MODE_PRIVATE)
+        setCtlSocketForwardEnabled(prefs.getBoolean(PREF_KEY_ENABLE_CTL_SOCKET_FORWARD, false))
     }
 }
 
