@@ -25,6 +25,7 @@
 //! that advertises both a `stun_observed_addr` and a `relay_public_addr` for
 //! the same helper process.
 
+use std::future::Future;
 use std::time::Duration;
 
 use isekai_protocol::attach::ConnectionGeneration;
@@ -115,46 +116,93 @@ pub async fn race_direct_and_relay(
     let generation = ConnectionGeneration::INITIAL;
 
     let direct_identity = CandidateIdentity { kind: "stun-p2p", source: "race", provider: "race", id: "direct" };
-    let mut direct_fut = Box::pin(connect_stun_p2p_with_round(
-        factory, targets.stun_server, &targets.direct, session_id, generation, direct_identity,
-    ));
+    let direct_fut = async {
+        connect_stun_p2p_with_round(factory, targets.stun_server, &targets.direct, session_id, generation, direct_identity)
+            .await
+            .map(|conn| conn.stream)
+    };
 
     let relay_identity = CandidateIdentity { kind: "relay", source: "race", provider: "race", id: "relay" };
+    let make_relay_fut = || relay_attempt(factory, &targets.relay, session_id, generation, relay_identity);
 
-    // Phase 1: give direct a head start. If it finishes (either way) before
-    // `relay_delay` elapses, relay never even starts.
-    if let Ok(direct_result) = tokio::time::timeout(relay_delay, direct_fut.as_mut()).await {
-        return match direct_result {
-            Ok(conn) => Ok(RaceOutcome { winner: RaceWinner::Direct, stream: conn.stream }),
-            Err(direct_err) => match relay_attempt(factory, &targets.relay, session_id, generation, relay_identity).await {
-                Ok(stream) => Ok(RaceOutcome { winner: RaceWinner::Relay, stream }),
-                Err(relay_err) => Err(RaceConnectError { direct: direct_err, relay: relay_err }),
+    match race_two(direct_fut, relay_delay, make_relay_fut).await {
+        Ok((RaceSlot::First, stream)) => Ok(RaceOutcome { winner: RaceWinner::Direct, stream }),
+        Ok((RaceSlot::Second, stream)) => Ok(RaceOutcome { winner: RaceWinner::Relay, stream }),
+        Err((direct, relay)) => Err(RaceConnectError { direct, relay }),
+    }
+}
+
+/// Which of [`race_two`]'s two futures produced the value it returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RaceSlot {
+    First,
+    Second,
+}
+
+/// The generic Happy-Eyeballs-style two-way race behind
+/// [`race_direct_and_relay`] (see this module's docs for why a staggered
+/// start rather than launching both at once): run `first` immediately; if it
+/// hasn't finished (succeeded *or* failed) within `second_delay`, construct
+/// `second` (via `make_second`, called at most once — lazily, so a `first`
+/// that wins outright never causes `second`'s setup, e.g. a socket bind, to
+/// happen at all) and take whichever of the two finishes successfully first,
+/// falling back to whichever is still in flight if the other one already
+/// failed. Only errors if both ultimately fail.
+///
+/// No I/O of its own — operates on any two futures sharing a success type
+/// `T` and this crate's [`AttemptFailure`], so it can be driven by cheap fake
+/// futures under `tokio::time::pause()` in tests instead of real STUN/relay
+/// connection attempts (`connect_stun_p2p_with_round`/`relay_attempt` call
+/// directly into `stun_p2p_with_round`/`relay_attempt`'s own real sockets, so
+/// racing *those* directly in a unit test isn't possible — this is the seam
+/// that lets the scheduling logic be tested without them, per the note left
+/// in `#66`).
+async fn race_two<T, F1, F2>(
+    first: F1,
+    second_delay: Duration,
+    make_second: impl FnOnce() -> F2,
+) -> Result<(RaceSlot, T), (AttemptFailure, AttemptFailure)>
+where
+    F1: Future<Output = Result<T, AttemptFailure>>,
+    F2: Future<Output = Result<T, AttemptFailure>>,
+{
+    tokio::pin!(first);
+
+    // Phase 1: give `first` a head start. If it finishes (either way) before
+    // `second_delay` elapses, `second` never even starts.
+    if let Ok(first_result) = tokio::time::timeout(second_delay, first.as_mut()).await {
+        return match first_result {
+            Ok(v) => Ok((RaceSlot::First, v)),
+            Err(first_err) => match make_second().await {
+                Ok(v) => Ok((RaceSlot::Second, v)),
+                Err(second_err) => Err((first_err, second_err)),
             },
         };
     }
 
-    // Phase 2: direct is still running past the stagger window; relay joins
-    // the race. Whichever succeeds first wins; if the first to finish
+    // Phase 2: `first` is still running past the stagger window; `second`
+    // joins the race. Whichever succeeds first wins; if the first to finish
     // failed, keep waiting on the other one rather than giving up
     // immediately (both must fail for this to be an error).
-    let mut relay_fut = Box::pin(relay_attempt(factory, &targets.relay, session_id, generation, relay_identity));
+    let second = make_second();
+    tokio::pin!(second);
 
     tokio::select! {
-        direct_result = direct_fut.as_mut() => {
-            match direct_result {
-                Ok(conn) => Ok(RaceOutcome { winner: RaceWinner::Direct, stream: conn.stream }),
-                Err(direct_err) => match relay_fut.await {
-                    Ok(stream) => Ok(RaceOutcome { winner: RaceWinner::Relay, stream }),
-                    Err(relay_err) => Err(RaceConnectError { direct: direct_err, relay: relay_err }),
+        first_result = first.as_mut() => {
+            match first_result {
+                Ok(v) => Ok((RaceSlot::First, v)),
+                Err(first_err) => match second.as_mut().await {
+                    Ok(v) => Ok((RaceSlot::Second, v)),
+                    Err(second_err) => Err((first_err, second_err)),
                 },
             }
         }
-        relay_result = relay_fut.as_mut() => {
-            match relay_result {
-                Ok(stream) => Ok(RaceOutcome { winner: RaceWinner::Relay, stream }),
-                Err(relay_err) => match direct_fut.await {
-                    Ok(conn) => Ok(RaceOutcome { winner: RaceWinner::Direct, stream: conn.stream }),
-                    Err(direct_err) => Err(RaceConnectError { direct: direct_err, relay: relay_err }),
+        second_result = second.as_mut() => {
+            match second_result {
+                Ok(v) => Ok((RaceSlot::Second, v)),
+                Err(second_err) => match first.as_mut().await {
+                    Ok(v) => Ok((RaceSlot::First, v)),
+                    Err(first_err) => Err((first_err, second_err)),
                 },
             }
         }
@@ -196,5 +244,100 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("direct"));
         assert!(rendered.contains("relay"));
+    }
+}
+
+#[cfg(test)]
+mod race_two_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::error::TransportError;
+
+    fn some_failure() -> AttemptFailure {
+        AttemptFailure::Terminal { source: TransportError::UnexpectedEof }
+    }
+
+    async fn after(delay: Duration, result: Result<i32, AttemptFailure>) -> Result<i32, AttemptFailure> {
+        tokio::time::sleep(delay).await;
+        result
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_wins_before_the_delay_and_second_never_starts() {
+        let second_started = AtomicUsize::new(0);
+
+        let outcome = race_two(
+            after(Duration::from_millis(10), Ok(1)),
+            Duration::from_millis(1000),
+            || {
+                second_started.fetch_add(1, Ordering::SeqCst);
+                after(Duration::from_millis(10), Ok(2))
+            },
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok((RaceSlot::First, 1))));
+        assert_eq!(second_started.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_wins_after_first_fails_within_the_delay_window() {
+        let outcome = race_two(
+            after(Duration::from_millis(10), Err(some_failure())),
+            Duration::from_millis(1000),
+            || after(Duration::from_millis(10), Ok(2)),
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok((RaceSlot::Second, 2))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn both_fail_within_the_delay_window() {
+        let outcome = race_two(
+            after(Duration::from_millis(10), Err(some_failure())),
+            Duration::from_millis(1000),
+            || after(Duration::from_millis(10), Err(some_failure())),
+        )
+        .await;
+
+        assert!(matches!(outcome, Err((AttemptFailure::Terminal { .. }, AttemptFailure::Terminal { .. }))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_wins_in_phase_two_while_first_is_still_in_flight() {
+        let outcome = race_two(
+            after(Duration::from_millis(500), Ok(1)),
+            Duration::from_millis(50),
+            || after(Duration::from_millis(10), Ok(2)),
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok((RaceSlot::Second, 2))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_wins_late_in_phase_two_after_second_already_failed() {
+        let outcome = race_two(
+            after(Duration::from_millis(200), Ok(5)),
+            Duration::from_millis(50),
+            || after(Duration::from_millis(10), Err(some_failure())),
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok((RaceSlot::First, 5))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn both_fail_in_phase_two() {
+        let outcome = race_two(
+            after(Duration::from_millis(100), Err(some_failure())),
+            Duration::from_millis(50),
+            || after(Duration::from_millis(10), Err(some_failure())),
+        )
+        .await;
+
+        assert!(matches!(outcome, Err((AttemptFailure::Terminal { .. }, AttemptFailure::Terminal { .. }))));
     }
 }
