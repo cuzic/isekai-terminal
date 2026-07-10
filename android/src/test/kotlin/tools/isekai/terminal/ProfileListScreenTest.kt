@@ -47,6 +47,7 @@ class ProfileListScreenTest {
         onManageKeys: () -> Unit = {},
         // Rust への実反映(native)はテストでは呼びたくないので既定で no-op に差し替える
         applyTerminalTheme: (TerminalTheme) -> Unit = {},
+        applyCtlSocketForwardEnabled: (Boolean) -> Unit = {},
     ) {
         composeTestRule.setContent {
             ProfileListScreen(
@@ -55,6 +56,7 @@ class ProfileListScreenTest {
                 onEditProfile = onEditProfile,
                 onManageKeys = onManageKeys,
                 applyTerminalTheme = applyTerminalTheme,
+                applyCtlSocketForwardEnabled = applyCtlSocketForwardEnabled,
             )
         }
         composeTestRule.waitForIdle()
@@ -208,5 +210,88 @@ class ProfileListScreenTest {
 
         val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
         assertTrue(!prefs.getBoolean(PREF_KEY_SCREEN_PROTECTION, false))
+    }
+
+    // ── リモートクリップボード opt-in (`ISEKAI_PIPE_DESIGN.md` §8 Epic M) ───────
+
+    @Test fun remoteClipboardWrite_defaultsToOff() {
+        setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("リモートからのクリップボード書込: OFF").assertIsDisplayed()
+    }
+
+    @Test fun remoteClipboardWrite_toggleOn_persistsToPrefs() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        setScreen()
+
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("リモートからのクリップボード書込: OFF").performClick()
+
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
+        assertTrue(prefs.getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE, false))
+
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("リモートからのクリップボード書込: ON").assertIsDisplayed()
+    }
+
+    @Test fun remoteClipboardPull_defaultsToOff() {
+        setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("リモートへのクリップボード送信: OFF").assertIsDisplayed()
+    }
+
+    @Test fun remoteClipboardPull_toggleOn_persistsToPrefs() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        setScreen()
+
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("リモートへのクリップボード送信: OFF").performClick()
+
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
+        assertTrue(prefs.getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL, false))
+
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("リモートへのクリップボード送信: ON").assertIsDisplayed()
+    }
+
+    // ── tmux迂回control-plane opt-in (`ISEKAI_PIPE_DESIGN.md` §8 Epic M) ───────
+
+    @Test fun ctlSocketForward_defaultsToOff() {
+        setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("tmux迂回control-plane: OFF").assertIsDisplayed()
+    }
+
+    @Test fun ctlSocketForward_toggleOn_persistsToPrefsAndAppliesToRust() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        var applied: Boolean? = null
+        setScreen(applyCtlSocketForwardEnabled = { applied = it })
+
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("tmux迂回control-plane: OFF").performClick()
+
+        // (native 呼び出しの代わりに注入した) applyCtlSocketForwardEnabled に反映値が渡る
+        assertEquals(true, applied)
+
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
+        assertTrue(prefs.getBoolean(PREF_KEY_ENABLE_CTL_SOCKET_FORWARD, false))
+
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("tmux迂回control-plane: ON").assertIsDisplayed()
+    }
+
+    @Test fun ctlSocketForward_toggleOnThenOff_appliesFalseToRust() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        var applied: Boolean? = null
+        setScreen(applyCtlSocketForwardEnabled = { applied = it })
+
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("tmux迂回control-plane: OFF").performClick()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("tmux迂回control-plane: ON").performClick()
+
+        assertEquals(false, applied)
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
+        assertTrue(!prefs.getBoolean(PREF_KEY_ENABLE_CTL_SOCKET_FORWARD, false))
     }
 }

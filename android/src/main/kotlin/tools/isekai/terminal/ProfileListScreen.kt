@@ -66,6 +66,8 @@ fun ProfileListScreen(
     onManageSnippets: () -> Unit = {},
     // Rust 側への実際の反映は差し替え可能にしておく（テストでは native 呼び出しを避けるため no-op を注入する）
     applyTerminalTheme: (TerminalTheme) -> Unit = { theme -> theme.applyTo(::setTerminalTheme) },
+    // tmux迂回control-planeのRust側プロセスグローバル状態への反映も同様に差し替え可能にする。
+    applyCtlSocketForwardEnabled: (Boolean) -> Unit = ::setCtlSocketForwardEnabled,
 ) {
     val vm: ProfileListViewModel = viewModel()
     val profiles by vm.profiles.collectAsStateWithLifecycle()
@@ -178,7 +180,7 @@ fun ProfileListScreen(
                                 prefs.edit()
                                     .putBoolean(PREF_KEY_ENABLE_CTL_SOCKET_FORWARD, ctlSocketForwardEnabled)
                                     .apply()
-                                setCtlSocketForwardEnabled(ctlSocketForwardEnabled)
+                                applyCtlSocketForwardEnabled(ctlSocketForwardEnabled)
                             },
                         )
                         DropdownMenuItem(
