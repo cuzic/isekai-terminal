@@ -277,6 +277,35 @@ fn should_abort_on_network_lost(has_session: bool, connected: bool, is_quic: boo
     true
 }
 
+/// Kotlin/Swift側から送られてきた`SessionCmd`を`SessionState`に適用する。
+/// `session_event_loop`の`select!`アームから切り出したもの
+/// (select → match(cmd) → match(c)という三重ネストを避けるため)。
+fn handle_session_cmd(state: &mut SessionState, c: SessionCmd) -> ProcessResult {
+    match c {
+        SessionCmd::TrzszAcceptUpload { transfer_id, file_name, file_size, mode } => {
+            info!("session: TrzszAcceptUpload id={} file={} size={}", transfer_id, file_name, file_size);
+            state.on_kotlin_accept_upload(transfer_id, file_name, file_size, mode)
+        }
+        SessionCmd::TrzszChunk { transfer_id, data, is_last } => {
+            info!("session: TrzszChunk id={} size={} is_last={}", transfer_id, data.len(), is_last);
+            state.on_kotlin_chunk(transfer_id, data, is_last)
+        }
+        SessionCmd::TrzszAcceptDownload { transfer_id } =>
+            state.on_kotlin_accept_download(transfer_id),
+        SessionCmd::TrzszCancel { transfer_id } =>
+            state.on_kotlin_cancel(transfer_id),
+        SessionCmd::SetTheme(theme) => {
+            state.set_theme(theme);
+            ProcessResult {
+                timer_cmds: Vec::new(),
+                side_effects: Vec::new(),
+                pending_rows: Vec::new(),
+                screen_dirty: false,
+            }
+        }
+    }
+}
+
 // ── session event loop（薄い async ラッパー）──────────────
 
 pub(crate) async fn session_event_loop(
@@ -351,29 +380,7 @@ pub(crate) async fn session_event_loop(
                 None => None,
             },
             cmd = session_cmd_rx.recv() => match cmd {
-                Some(c) => Some(match c {
-                    SessionCmd::TrzszAcceptUpload { transfer_id, file_name, file_size, mode } => {
-                        info!("session: TrzszAcceptUpload id={} file={} size={}", transfer_id, file_name, file_size);
-                        state.on_kotlin_accept_upload(transfer_id, file_name, file_size, mode)
-                    }
-                    SessionCmd::TrzszChunk { transfer_id, data, is_last } => {
-                        info!("session: TrzszChunk id={} size={} is_last={}", transfer_id, data.len(), is_last);
-                        state.on_kotlin_chunk(transfer_id, data, is_last)
-                    }
-                    SessionCmd::TrzszAcceptDownload { transfer_id } =>
-                        state.on_kotlin_accept_download(transfer_id),
-                    SessionCmd::TrzszCancel { transfer_id } =>
-                        state.on_kotlin_cancel(transfer_id),
-                    SessionCmd::SetTheme(theme) => {
-                        state.set_theme(theme);
-                        ProcessResult {
-                            timer_cmds: Vec::new(),
-                            side_effects: Vec::new(),
-                            pending_rows: Vec::new(),
-                            screen_dirty: false,
-                        }
-                    }
-                }),
+                Some(c) => Some(handle_session_cmd(&mut state, c)),
                 None => None,
             },
         };
