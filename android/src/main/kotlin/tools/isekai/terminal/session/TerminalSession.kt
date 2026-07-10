@@ -34,6 +34,14 @@ import java.util.concurrent.atomic.AtomicReference
 class TerminalSession(
     private val hostKeyChecker: HostKeyChecker,
     orchestratorFactory: (OrchestratorCallback) -> SessionOrchestratorInterface = { createSessionOrchestrator(it) },
+    /**
+     * リモートが OSC 52 でクリップボード書き込みを要求したときに呼ばれる
+     * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。既定は no-op — 実際に Android の
+     * `ClipboardManager` へ書くかどうか(opt-in設定のチェック含む)は呼び出し元の責務とし、
+     * `Context` を持たないこのクラス自体には持ち込まない([RealHostKeyChecker]を
+     * `TerminalTabsViewModel`側から注入するのと同じ構成)。
+     */
+    private val onClipboardWriteRequested: (String) -> Unit = {},
 ) : AutoCloseable {
 
     companion object {
@@ -170,6 +178,10 @@ class TerminalSession(
                 is ForwardState.Stopped ->
                     RemoteLogger.i("IsekaiTerminalSSH", "port forward '$id': stopped")
             }
+        }
+
+        override fun onClipboardWrite(text: String) {
+            onClipboardWriteRequested(text)
         }
 
         // SSH agent forwarding: Rust 側の spawn_blocking スレッドから同期呼び出しされる。

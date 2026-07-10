@@ -121,7 +121,12 @@ private fun TabLabel(
                 ),
         )
         Text(
-            text = tab.label,
+            // リモートの OSC 0/2 タイトル変更があればそれを優先表示する(セッション/Rust側の
+            // ScreenUpdate.title が SSOT)。tmux が横取りして届かない環境や、まだ何も
+            // タイトルを送っていない接続直後は tab.label (プロファイル名) にフォールバックする
+            // (ISEKAI_PIPE_DESIGN.md Epic M: 「tmuxに握りつぶされたときのフォールバック」の逆で、
+            // ここは「OSCが届く環境ではそれを使う」通常経路)。
+            text = uiState.screenUpdate?.title?.takeIf { it.isNotBlank() } ?: tab.label,
             modifier = Modifier.padding(start = 6.dp, end = 4.dp),
             maxLines = 1,
         )

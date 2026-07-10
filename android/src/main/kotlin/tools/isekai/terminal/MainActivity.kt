@@ -26,6 +26,15 @@ import uniffi.isekai_terminal_core.setTerminalTheme
 const val PREF_KEY_SCREEN_PROTECTION = "screen_protection_enabled"
 
 /**
+ * `SharedPreferences("isekai_terminal_ui")` に保存する「リモートからのクリップボード書き込み
+ * (OSC 52)を許可する」設定のキー。既定OFFのオプトイン(`ISEKAI_PIPE_DESIGN.md` §8 Epic M:
+ * リモートが仕込んだコマンドを気づかず貼り付けて実行してしまう「クリップボードハイジャック」
+ * のリスクがあるため)。[applyScreenProtection]と違い window へ即時反映する状態を持たないので、
+ * アプリ起動時の復元処理は不要——[TerminalTabsViewModel]がセッション生成時に都度読む。
+ */
+const val PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE = "allow_remote_clipboard_write"
+
+/**
  * 画面の保護(スクリーンショット・画面録画・「最近使ったアプリ」のサムネイルを禁止する
  * [WindowManager.LayoutParams.FLAG_SECURE])を適用/解除する。
  *

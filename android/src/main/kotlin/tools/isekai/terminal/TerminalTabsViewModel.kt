@@ -82,7 +82,15 @@ class TerminalTabsViewModel(
             TerminalSession(
                 RealHostKeyChecker(Repositories.knownHosts) {
                     HostKeySettings.isAutoTrustNewHostKeysEnabled(app)
-                }
+                },
+                onClipboardWriteRequested = { text ->
+                    val prefs = app.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE)
+                    if (prefs.getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE, false)) {
+                        val cm = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                        cm.setPrimaryClip(android.content.ClipData.newPlainText("isekai-terminal (remote)", text))
+                    }
+                },
             )
         },
     )
