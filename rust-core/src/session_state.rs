@@ -61,6 +61,21 @@ impl SessionState {
         self.terminal.set_theme(theme);
     }
 
+    /// tmux 迂回 control-plane(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)経由でリモートから
+    /// 届いたタイトルを、OSC 0/2 のパースを経由せず直接反映する。次の`ScreenUpdate`に
+    /// 乗せて`onScreenUpdate`まで届くよう`screen_dirty`を立てる。
+    pub(crate) fn set_title_from_ctl(&mut self, title: String) -> ProcessResult {
+        self.terminal.set_title(title);
+        ProcessResult {
+            timer_cmds: Vec::new(),
+            side_effects: Vec::new(),
+            pending_rows: Vec::new(),
+            screen_dirty: true,
+            pending_clipboard_write: None,
+            clipboard_pull_requested: false,
+        }
+    }
+
     /// リサイズ時にターミナル・パーサーをリセットする。現在のテーマは引き継ぐ
     /// (リサイズのついでにテーマがグローバル既定へ戻ってしまわないようにする)。
     pub(crate) fn reset_for_resize(&mut self, cols: usize, rows: usize) {

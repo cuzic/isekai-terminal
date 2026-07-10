@@ -67,6 +67,15 @@ pub fn set_terminal_theme(ansi16: Vec<u32>, default_fg: u32, default_bg: u32) {
     theme::set(theme::from_raw(ansi16, default_fg, default_bg));
 }
 
+/// tmux 迂回 control-plane(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)を有効にするか
+/// (プロファイル毎ではなくグローバル設定、`set_terminal_theme`と同じ形)。有効な間、
+/// 新しく開くSSHチャネル(タブ)は接続直後にリモートへ`streamlocal_forward`を要求し、
+/// `isekai-pipe ctl title|clip push`をtmuxを経由せず直接受け取れるようにする。
+#[uniffi::export]
+pub fn set_ctl_socket_forward_enabled(enabled: bool) {
+    transport::set_ctl_socket_forward_enabled(enabled);
+}
+
 /// isekai-terminal-core の crate バージョン（`Cargo.toml` の `version`）を返す。
 ///
 /// iOS 対応 Phase 0 の技術検証スパイクで、UniFFI Swift バインディング経由の

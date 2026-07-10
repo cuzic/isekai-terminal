@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 use timed_fsm::TimerCommand;
 
@@ -330,6 +330,36 @@ pub(crate) async fn session_event_loop(
                 }
                 Some(TransportEvent::ForwardStateChanged { id, state }) => {
                     callback.on_forward_state_changed(id, state); None
+                }
+                Some(TransportEvent::CtlMessage(msg)) => {
+                    match msg {
+                        isekai_protocol::CtlMessage::SetTitle { value } => {
+                            Some(state.set_title_from_ctl(value))
+                        }
+                        isekai_protocol::CtlMessage::ClipboardPush { data_b64, .. } => {
+                            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data_b64) {
+                                Ok(decoded) => match String::from_utf8(decoded) {
+                                    Ok(text) => {
+                                        let cb = Arc::clone(&callback);
+                                        tokio::task::spawn_blocking(move || cb.on_clipboard_write(text));
+                                    }
+                                    Err(e) => warn!("ctl-socket: clipboard push was not valid UTF-8: {e}"),
+                                },
+                                Err(e) => warn!("ctl-socket: clipboard push data_b64 was not valid base64: {e}"),
+                            }
+                            None
+                        }
+                        // device→host のクリップボード読み出し(pull)は、この新しい
+                        // チャネルでの応答書き込みが未実装(`ISEKAI_PIPE_DESIGN.md` §8
+                        // Epic M follow-up、タスク#84の既知の残作業)。OSC 52経由の
+                        // pull(`ClipboardPullRequest`をterminal.rsが検出するパス)は
+                        // 別に実装済み — こちらは無視するだけ。
+                        isekai_protocol::CtlMessage::ClipboardPullRequest {} => {
+                            debug!("ctl-socket: clipboard pull over ctl-socket is not yet implemented, ignoring");
+                            None
+                        }
+                        isekai_protocol::CtlMessage::ClipboardPullResponse { .. } => None,
+                    }
                 }
                 Some(TransportEvent::Disconnected { reason }) => {
                     info!("session: disconnected reason={:?}", reason);

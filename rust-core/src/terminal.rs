@@ -128,6 +128,12 @@ impl Terminal {
     pub(crate) fn cursor_row(&self) -> usize { self.cursor_row }
     pub(crate) fn cursor_col(&self) -> usize { self.cursor_col }
     pub(crate) fn title(&self) -> Option<&str> { self.title.as_deref() }
+
+    /// OSC 0/2 のパース経由ではなく、外部(tmux迂回control-plane、`ISEKAI_PIPE_DESIGN.md`
+    /// §8 Epic M)から直接タイトルを設定する。
+    pub(crate) fn set_title(&mut self, title: String) {
+        self.title = Some(title);
+    }
     pub(crate) fn application_cursor_mode(&self) -> bool { self.application_cursor_mode }
     pub(crate) fn bracketed_paste_mode(&self) -> bool { self.bracketed_paste_mode }
     pub(crate) fn screen_cells(&self) -> &[TermCell] { self.cells() }
