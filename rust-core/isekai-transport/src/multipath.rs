@@ -156,6 +156,16 @@ pub async fn connect_multipath_with_socket(
     Ok(MultipathConnection { conn, tracker, endpoint })
 }
 
+/// `Established`/`Abandoned`/`Discarded`が共通で行う「trackerに登録済みの
+/// labelを探し、状態を反映する」処理。未登録のid(このリスナー起動前に
+/// イベントが飛んだ場合等)は無視する。戻り値は反映できたlabel(呼び出し側が
+/// 状態遷移後の追加処理をするかどうかの判断に使う)。
+fn set_path_state(tracker: &PathHealthTracker, id: noq::PathId, state: path_health::PathState) -> Option<PathLabel> {
+    let label = tracker.label_for(id)?;
+    tracker.set(label.clone(), state);
+    Some(label)
+}
+
 /// Watches `conn.path_events()` and keeps `tracker` in sync with paths this
 /// module didn't itself open the health monitor for yet (`Established`), or
 /// that the peer/network tore down out from under us (`Abandoned`/
@@ -169,21 +179,18 @@ fn spawn_path_event_listener(
         while let Some(ev) = events.next().await {
             match ev {
                 Ok(noq::PathEvent::Established { id, .. }) => {
-                    if let Some(label) = tracker.label_for(id) {
-                        tracker.set(label.clone(), path_health::PathState::Validated);
+                    if let Some(label) = set_path_state(&tracker, id, path_health::PathState::Validated) {
                         path_health::spawn_health_monitor(conn.clone(), id, label, tracker.clone(), event_tx.clone());
                     }
                 }
                 Ok(noq::PathEvent::Abandoned { id, reason, .. }) => {
                     info!("isekai-transport::multipath: path {id:?} abandoned: {reason:?}");
-                    if let Some(label) = tracker.label_for(id) {
-                        tracker.set(label, path_health::PathState::Failed);
+                    if set_path_state(&tracker, id, path_health::PathState::Failed).is_some() {
                         path_health::notify_if_no_viable_path(&tracker, &event_tx);
                     }
                 }
                 Ok(noq::PathEvent::Discarded { id, .. }) => {
-                    if let Some(label) = tracker.label_for(id) {
-                        tracker.set(label, path_health::PathState::Failed);
+                    if set_path_state(&tracker, id, path_health::PathState::Failed).is_some() {
                         path_health::notify_if_no_viable_path(&tracker, &event_tx);
                     }
                 }
