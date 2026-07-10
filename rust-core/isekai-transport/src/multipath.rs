@@ -237,3 +237,57 @@ async fn open_path_with_retry(
     warn!("isekai-transport::multipath: giving up on path {label:?} after {OPEN_PATH_MAX_ATTEMPTS} attempts");
     path_health::notify_if_no_viable_path(tracker, event_tx);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::path_health::PathState;
+
+    fn tracker_with_primary() -> PathHealthTracker {
+        let tracker = PathHealthTracker::new();
+        tracker.register_path(noq::PathId::ZERO, PRIMARY_PATH_LABEL.into());
+        tracker
+    }
+
+    #[test]
+    fn unregistered_path_id_returns_none_and_leaves_tracker_untouched() {
+        let tracker = tracker_with_primary();
+
+        let label = set_path_state(&tracker, noq::PathId::MAX, PathState::Validated);
+
+        assert_eq!(label, None);
+        assert_eq!(tracker.get(&PathLabel::from(PRIMARY_PATH_LABEL)), PathState::Unknown);
+    }
+
+    #[test]
+    fn registered_path_id_transitions_to_validated() {
+        let tracker = tracker_with_primary();
+
+        let label = set_path_state(&tracker, noq::PathId::ZERO, PathState::Validated);
+
+        assert_eq!(label, Some(PathLabel::from(PRIMARY_PATH_LABEL)));
+        assert_eq!(tracker.get(&PathLabel::from(PRIMARY_PATH_LABEL)), PathState::Validated);
+    }
+
+    #[test]
+    fn registered_path_id_transitions_to_failed() {
+        let tracker = tracker_with_primary();
+        set_path_state(&tracker, noq::PathId::ZERO, PathState::Validated);
+
+        let label = set_path_state(&tracker, noq::PathId::ZERO, PathState::Failed);
+
+        assert_eq!(label, Some(PathLabel::from(PRIMARY_PATH_LABEL)));
+        assert_eq!(tracker.get(&PathLabel::from(PRIMARY_PATH_LABEL)), PathState::Failed);
+    }
+
+    #[test]
+    fn setting_the_same_state_twice_is_idempotent() {
+        let tracker = tracker_with_primary();
+        set_path_state(&tracker, noq::PathId::ZERO, PathState::Validated);
+
+        let label = set_path_state(&tracker, noq::PathId::ZERO, PathState::Validated);
+
+        assert_eq!(label, Some(PathLabel::from(PRIMARY_PATH_LABEL)));
+        assert_eq!(tracker.get(&PathLabel::from(PRIMARY_PATH_LABEL)), PathState::Validated);
+    }
+}
