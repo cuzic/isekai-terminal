@@ -657,6 +657,12 @@ pub trait OrchestratorCallback: Send + Sync {
     /// `ClipboardManager` へ書くかどうかの判断はKotlin側の責務(単なるイベント通知であり、
     /// セッション/プロトコル状態ではないため`.claude/rules/rust-ssot.md`の対象外)。
     fn on_clipboard_write(&self, text: String);
+    /// リモートが OSC 52 query(`ESC]52;c;?BEL`)でクリップボードの読み出しを要求した。
+    /// `host_key`/`agent_sign_request`確認と同じ同期ブロッキング方式(Rust側の
+    /// `spawn_blocking`から呼ばれる)。opt-in設定が無効、またはクリップボードが
+    /// 空/取得不可なら`None`を返す(この場合デバイス側からは応答を一切送らない——
+    /// 何も返さない方が「機能の有無自体を教えない」という意味で安全なため)。
+    fn on_clipboard_pull_request(&self) -> Option<String>;
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -677,6 +683,7 @@ pub trait SessionCallback: Send + Sync {
     fn on_forward_state_changed(&self, id: String, state: ForwardState);
     fn on_agent_sign_request(&self, key_fingerprint: String) -> bool;
     fn on_clipboard_write(&self, text: String);
+    fn on_clipboard_pull_request(&self) -> Option<String>;
 }
 
 // ── SshSession ──────────────────────────────────────────

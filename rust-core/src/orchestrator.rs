@@ -336,6 +336,10 @@ impl SessionCallback for OrchestratorAdapter {
     fn on_clipboard_write(&self, text: String) {
         self.shared.callback.on_clipboard_write(text);
     }
+
+    fn on_clipboard_pull_request(&self) -> Option<String> {
+        self.shared.callback.on_clipboard_pull_request()
+    }
 }
 
 // ── SessionOrchestrator ───────────────────────────────────
@@ -692,6 +696,7 @@ mod tests {
             true
         }
         fn on_clipboard_write(&self, _text: String) {}
+        fn on_clipboard_pull_request(&self) -> Option<String> { None }
     }
 
     fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {

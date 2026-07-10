@@ -372,6 +372,7 @@ pub(crate) async fn session_event_loop(
                             pending_rows: Vec::new(),
                             screen_dirty: false,
                             pending_clipboard_write: None,
+                            clipboard_pull_requested: false,
                         }
                     }
                 }),
@@ -380,8 +381,26 @@ pub(crate) async fn session_event_loop(
         };
 
         if let Some(r) = result {
+            let clipboard_pull_requested = r.clipboard_pull_requested;
             dispatch_result(r, &mut timer_rt, &transport_cmd_tx, &callback,
                             state.terminal(), &scrollback);
+            if clipboard_pull_requested {
+                // Fetching the current Android clipboard text needs a Kotlin
+                // round trip (`on_host_key`/`on_agent_sign_request`'s same
+                // `spawn_blocking` pattern) that `dispatch_result` — a plain
+                // sync fn — can't perform. `None` means "opt-in disabled or
+                // no clipboard content": send nothing back rather than an
+                // explicit empty reply (`ISEKAI_PIPE_DESIGN.md` §8 Epic M).
+                let cb = Arc::clone(&callback);
+                let tx = transport_cmd_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(text) = cb.on_clipboard_pull_request() {
+                        let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text);
+                        let response = format!("\x1b]52;c;{data_b64}\x07").into_bytes();
+                        let _ = tx.blocking_send(TransportCommand::WriteStdin(response));
+                    }
+                });
+            }
         }
     }
 }
@@ -591,6 +610,7 @@ mod tests {
         fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
         fn on_clipboard_write(&self, _text: String) {}
+        fn on_clipboard_pull_request(&self) -> Option<String> { None }
     }
 
     #[test]
@@ -614,6 +634,7 @@ mod tests {
             pending_rows: vec![row('N', 1), row('N', 1), row('N', 1)], // 3行新規追加
             screen_dirty: false,
             pending_clipboard_write: None,
+            clipboard_pull_requested: false,
         };
         dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, &terminal, &scrollback);
 

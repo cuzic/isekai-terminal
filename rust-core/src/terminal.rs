@@ -55,9 +55,13 @@ pub(crate) struct Terminal {
     /// 場合、次に`take_pending_clipboard_write()`が呼ばれるまで保持する
     /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic M: tmuxが`set-titles`/`allow-passthrough`を
     /// 適切に設定していれば、control-plane機構を使わずこの標準OSC経路だけで動く)。
-    /// query(`Pd == "?"`)は未対応(device→hostのクリップボード読み出しは
-    /// Android/iOS本体アプリではまだ実装していない、タスク#82参照)。
     pending_clipboard_write: Option<String>,
+    /// リモートが OSC 52 query(`ESC]52;c;?BEL`)でクリップボードの読み出しを要求した
+    /// 場合に立つ。実際の応答(device→hostへの base64 OSC 52 フレーム送信)は
+    /// このモジュールの外(`session_state.rs`/`session.rs`)が担う——
+    /// Android のクリップボード内容を取得するには非同期の Kotlin 往復が要るため、
+    /// この同期的な VTE コールバックの中では完結できない。
+    pending_clipboard_pull_request: bool,
     pending_scrollback: Vec<Vec<TermCell>>,
     application_cursor_mode: bool,
     bracketed_paste_mode: bool,
@@ -83,6 +87,7 @@ impl Terminal {
             scroll_top: 0, scroll_bottom: rows - 1,
             title: None,
             pending_clipboard_write: None,
+            pending_clipboard_pull_request: false,
             pending_scrollback: Vec::new(),
             application_cursor_mode: false,
             bracketed_paste_mode: false,
@@ -112,6 +117,12 @@ impl Terminal {
         self.pending_clipboard_write.take()
     }
 
+    /// 保留中の OSC 52 クリップボード読み出し要求を取り出す(1回きり、trueだった場合は
+    /// falseにリセットされる)。
+    pub(crate) fn take_pending_clipboard_pull_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_clipboard_pull_request)
+    }
+
     pub(crate) fn cols(&self) -> usize { self.cols }
     pub(crate) fn rows(&self) -> usize { self.rows }
     pub(crate) fn cursor_row(&self) -> usize { self.cursor_row }
@@ -135,6 +146,7 @@ impl Terminal {
         self.scroll_top = 0; self.scroll_bottom = self.rows - 1;
         self.title = None;
         self.pending_clipboard_write = None;
+        self.pending_clipboard_pull_request = false;
         self.application_cursor_mode = false;
         self.bracketed_paste_mode = false;
     }
@@ -402,11 +414,17 @@ impl Perform for Terminal {
             // `pending_clipboard_write` field doc comment).
             (Some(&b"52"), _) => {
                 if let Some(&payload) = params.get(2) {
-                    if payload != b"?" {
-                        if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload) {
-                            if let Ok(text) = String::from_utf8(decoded) {
-                                self.pending_clipboard_write = Some(text);
-                            }
+                    if payload == b"?" {
+                        // Query (device→host read). The actual reply (an OSC 52
+                        // response written back to the remote's stdin) needs an
+                        // async round trip to Kotlin for the current clipboard
+                        // text, which this synchronous VTE callback can't do —
+                        // it only flags the request; `session_state.rs`/`session.rs`
+                        // drain it and perform the round trip.
+                        self.pending_clipboard_pull_request = true;
+                    } else if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload) {
+                        if let Ok(text) = String::from_utf8(decoded) {
+                            self.pending_clipboard_write = Some(text);
                         }
                     }
                 }
@@ -594,6 +612,30 @@ mod tests {
         let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b]52;c;?\x07");
         assert_eq!(t.take_pending_clipboard_write(), None);
+    }
+
+    #[test]
+    fn test_clipboard_query_sets_pending_pull_request() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]52;c;?\x07");
+        assert!(t.take_pending_clipboard_pull_request());
+        // Consumed once — a second take returns false until the next query.
+        assert!(!t.take_pending_clipboard_pull_request());
+    }
+
+    #[test]
+    fn test_clipboard_write_does_not_set_pending_pull_request() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(!t.take_pending_clipboard_pull_request());
+    }
+
+    #[test]
+    fn test_reset_clears_pending_clipboard_pull_request() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]52;c;?\x07");
+        feed(&mut t, b"\x1bc"); // RIS (full reset)
+        assert!(!t.take_pending_clipboard_pull_request());
     }
 
     #[test]
