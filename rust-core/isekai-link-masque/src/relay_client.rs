@@ -164,7 +164,105 @@ pub async fn connect_relay_agent_with_client_config(
         .await
         .map_err(|e| RelayClientError::QuicConnect(format!("QUIC handshake failed: {e}")))?;
 
-    let h3_conn = h3_noq::Connection::new(conn);
+    run_connect_udp_bind_agent(h3_noq::Connection::new(conn), relay_sni, jwt).await
+}
+
+/// ALPN token the relay's msquic-native QMux ingress expects for this
+/// (non-H3-tunneled, raw CONNECT-UDP-bind) leg — distinct from `h3qx-01`,
+/// which is what the relay's own H3-carrying agent registration channel
+/// uses (draft-ietf-quic-qmux-02 §8.1 requires each application-protocol
+/// mapping to register its own ALPN token, and this crate's CONNECT-UDP-bind
+/// exchange over QMux is exactly such a mapping). **Unverified against the
+/// real relay** — confirm this against `isekai-link-server`'s actual QMux
+/// ingress configuration before relying on this in production; see
+/// `tests/relay_e2e_qmux.rs`'s module docs for what *is* verified (the
+/// capsule/compression/datagram-pump logic is transport-agnostic) versus
+/// what isn't (this exact ALPN string).
+const H3_QMUX_ALPN: &str = "h3qx-01";
+
+/// [`connect_relay_agent`]'s QMux-over-TCP+TLS counterpart (`#qmux-leg2`) —
+/// used when `isekai-helper` itself sits behind a network that blocks
+/// outbound UDP, so the ordinary QUIC-over-UDP path to the relay
+/// (`connect_relay_agent`) can't even reach it. Everything from the
+/// CONNECT-UDP-bind request onward is identical to the UDP path (shared via
+/// [`run_connect_udp_bind_agent`]) — only how the underlying HTTP/3
+/// connection to the relay is established differs.
+///
+/// Unlike [`connect_relay_agent`], this performs the TLS handshake manually
+/// (`tokio_rustls::TlsConnector`, not `qmux::tls::Client`) purely because
+/// `qmux::Session::connect`'s convenience TLS wrapper takes ownership of the
+/// stream immediately — this crate has no need for the exporter capture
+/// `isekai-transport`'s equivalent QMux leg needs (this tunnel is
+/// authenticated by `jwt`, not a keying-material proof), so the manual
+/// handshake here is only to control the ALPN list precisely.
+pub async fn connect_relay_agent_via_qmux(
+    relay_addr: SocketAddr,
+    relay_sni: &str,
+    jwt: &str,
+) -> Result<(RelayUdpSocket, SocketAddr), RelayClientError> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![H3_QMUX_ALPN.as_bytes().to_vec()];
+
+    connect_relay_agent_via_qmux_with_tls_config(relay_addr, relay_sni, jwt, tls_config).await
+}
+
+/// Core of [`connect_relay_agent_via_qmux`], parameterized over the
+/// `rustls::ClientConfig` (and therefore the TLS verifier) so tests can
+/// exercise everything below the certificate-trust layer against a local
+/// mock relay with a self-signed cert — the QMux-leg counterpart of
+/// [`connect_relay_agent_with_client_config`].
+pub async fn connect_relay_agent_via_qmux_with_tls_config(
+    relay_addr: SocketAddr,
+    relay_sni: &str,
+    jwt: &str,
+    tls_config: rustls::ClientConfig,
+) -> Result<(RelayUdpSocket, SocketAddr), RelayClientError> {
+    let tcp = tokio::net::TcpStream::connect(relay_addr)
+        .await
+        .map_err(RelayClientError::Bind)?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from(relay_sni.to_string())
+        .map_err(|e| RelayClientError::QuicConnect(format!("invalid relay_sni: {e}")))?;
+    let tls_stream = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| RelayClientError::QuicConnect(format!("TLS handshake failed: {e}")))?;
+
+    let config = qmux::Config::negotiated(qmux::Version::QMux01, Some(H3_QMUX_ALPN.to_string()));
+    let transport = qmux::transport::Stream::new(tls_stream, config.version, config.max_record_size);
+    let session = qmux::Session::connect(transport, config)
+        .await
+        .map_err(|e| RelayClientError::QuicConnect(format!("QMux handshake failed: {e}")))?;
+
+    run_connect_udp_bind_agent(h3_qmux::Connection::new(session, false), relay_sni, jwt).await
+}
+
+/// Everything from HTTP/3 connection setup onward — the CONNECT-UDP-bind
+/// request, compression-context registration, and datagram pump tasks — is
+/// identical regardless of which transport carries the underlying HTTP/3
+/// connection, so it's shared here between [`connect_relay_agent_with_client_config`]
+/// (real QUIC-over-UDP via `h3-noq`) and [`connect_relay_agent_via_qmux`]
+/// (QMux-over-TLS-over-TCP via `h3-qmux`).
+async fn run_connect_udp_bind_agent<C>(
+    h3_conn: C,
+    relay_sni: &str,
+    jwt: &str,
+) -> Result<(RelayUdpSocket, SocketAddr), RelayClientError>
+where
+    C: h3::quic::Connection<Bytes> + h3_datagram::quic_traits::DatagramConnectionExt<Bytes> + Send + 'static,
+    <C as h3::quic::Connection<Bytes>>::RecvStream: Send,
+    <C as h3::quic::Connection<Bytes>>::OpenStreams: Send,
+    <<C as h3::quic::Connection<Bytes>>::OpenStreams as h3::quic::OpenStreams<Bytes>>::SendStream: Send,
+    <<C as h3::quic::Connection<Bytes>>::OpenStreams as h3::quic::OpenStreams<Bytes>>::BidiStream: Send,
+    <C as h3_datagram::quic_traits::DatagramConnectionExt<Bytes>>::RecvDatagramHandler:
+        h3_datagram::quic_traits::RecvDatagram<Buffer = Bytes> + Send,
+    <C as h3_datagram::quic_traits::DatagramConnectionExt<Bytes>>::SendDatagramHandler:
+        h3_datagram::quic_traits::SendDatagram<Bytes> + Send,
+{
     let (mut driver, mut send_request) = h3::client::new(h3_conn)
         .await
         .map_err(|e| RelayClientError::H3Handshake(e.to_string()))?;

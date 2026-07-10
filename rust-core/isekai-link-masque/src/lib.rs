@@ -21,6 +21,6 @@ mod varint;
 pub use capsule::{Capsule, CapsuleDecodeError, CapsuleReader};
 pub use datagram_codec::{decode_datagram_payload, encode_datagram_payload, peek_context_id};
 pub use relay_client::{
-    connect_relay_agent, connect_relay_agent_with_client_config, uplink_transport_config,
-    RelayClientError, RelayUdpSocket,
+    connect_relay_agent, connect_relay_agent_via_qmux, connect_relay_agent_via_qmux_with_tls_config,
+    connect_relay_agent_with_client_config, uplink_transport_config, RelayClientError, RelayUdpSocket,
 };

@@ -173,6 +173,11 @@ async fn run_mock_relay(server_endpoint: noq::Endpoint, public_socket: Arc<tokio
 
 #[tokio::test]
 async fn full_tunnel_round_trips_real_quic_traffic_through_the_relay() {
+    // Pulling in `qmux` (for the QMux leg, `relay_e2e_qmux.rs`) links
+    // `aws-lc-rs` alongside `noq`'s `ring` feature, so rustls can no longer
+    // auto-select a single process-wide crypto provider.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let (relay_cert, relay_key) = generate_cert("relay.test");
     let relay_endpoint = noq::Endpoint::server(
         relay_server_config(relay_cert.clone(), relay_key),
