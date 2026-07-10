@@ -54,6 +54,16 @@ pub enum Command {
     /// Delete the saved token file (`~/.config/isekai-ssh/token.json`), if
     /// any. Not an error if already logged out.
     Logout,
+
+    /// Manual diagnostic for `<host>`: reports whether it has ever been
+    /// bootstrapped and, if so, actually dials its cached transport
+    /// (`isekai-pipe probe`) to check whether it's reachable and whether
+    /// the cached trust material (session_secret/cert pin) looks stale.
+    /// Never part of `isekai-ssh <host>`'s own connection path — that
+    /// already detects and silently recovers from staleness on its own
+    /// (`wrapper.rs::run_ssh_with_stale_trust_recovery`); this is purely
+    /// for a human to inspect on demand. See `doctor.rs`'s module docs.
+    Doctor(DoctorArgs),
 }
 
 #[derive(Args)]
@@ -181,4 +191,33 @@ pub struct LoginArgs {
     /// OAuth client id for this (public, device-flow) client.
     #[arg(long, value_name = "ID")]
     pub client_id: String,
+}
+
+#[derive(Args)]
+pub struct DoctorArgs {
+    /// Host to diagnose, same spec `init`/the wrapper accept.
+    pub host: String,
+
+    /// If a stale-trust signal is found, immediately re-bootstrap (no
+    /// `[y/N]` prompt — same silent-refresh behavior as the wrapper's own
+    /// automatic recovery). Without this flag, `doctor` only reports what
+    /// it found.
+    #[arg(long)]
+    pub fix: bool,
+
+    /// STUN server to probe against, if the profile has cached STUN
+    /// evidence — mirrors `isekai-pipe probe --stun-server`. Omit to only
+    /// probe the profile's primary (relay/direct) transport.
+    #[arg(long, value_name = "ADDR:PORT")]
+    pub stun_server: Option<SocketAddr>,
+
+    /// Path to the isekai-helper binary to upload during `--fix`'s
+    /// re-bootstrap — mirrors the wrapper's own `--isekai-helper-binary`.
+    /// When omitted, `--fix` falls through to the same arch-detection +
+    /// GitHub Release auto-download `helper_download::resolve_helper_binary`
+    /// already provides for the wrapper's own automatic recovery (honest
+    /// gap: only actually succeeds once this project publishes releases,
+    /// see `helper_download.rs`'s module docs).
+    #[arg(long, value_name = "PATH")]
+    pub helper_binary: Option<PathBuf>,
 }

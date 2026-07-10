@@ -802,6 +802,15 @@ struct ProbeReport {
     stun_discovery: ProbeStageStatus,
     handshake: ProbeStageStatus,
     target_reachability: ProbeStageStatus,
+    /// Whether the `handshake` failure looks like stale cached trust
+    /// material (cert pin mismatch / session-secret auth reject —
+    /// `TransportError::is_stale_trust_signal`, `ISEKAI_PIPE_DESIGN.md` §8
+    /// Epic N) rather than a plain connectivity problem. `isekai-ssh doctor`
+    /// surfaces this as "run with --fix to refresh"; unrelated to
+    /// `handshake`'s own `Ok`/`Failed` status (`false` whenever `handshake`
+    /// succeeded).
+    #[serde(default)]
+    stale_trust_suspected: bool,
 }
 
 impl ProbeReport {
@@ -1037,6 +1046,9 @@ fn print_probe_report(report: &ProbeReport) {
     print_probe_stage("stun discovery", &report.stun_discovery);
     print_probe_stage("handshake (relay-auth/quic-connect/cert-pin/hello-ack)", &report.handshake);
     print_probe_stage("target reachability", &report.target_reachability);
+    if report.stale_trust_suspected {
+        println!("[stale-trust] cached trust material looks stale (cert pin mismatch or session-secret rejected) -- `isekai-ssh doctor <host> --fix` or `isekai-ssh <host>` (self-heals automatically) can refresh it");
+    }
 }
 
 fn print_probe_stage(label: &str, status: &ProbeStageStatus) {
@@ -1101,7 +1113,9 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
             session_secret,
         };
         let candidates = vec![SequentialStunCandidate { stun_server, candidate_id: "probe".to_string() }];
-        let (handshake, target_reachability) = match connect_stun_p2p_with_fallback(&target, &candidates).await {
+        let stun_result = connect_stun_p2p_with_fallback(&target, &candidates).await;
+        let stale_trust_suspected = stun_result.as_ref().err().is_some_and(|e| e.is_stale_trust_signal());
+        let (handshake, target_reachability) = match stun_result {
             Ok(_established) => (ProbeStageStatus::Ok { detail: None }, ProbeStageStatus::Ok { detail: None }),
             Err(SequentialStunConnectError::NoCandidates) => unreachable!("probe always passes exactly one candidate"),
             Err(SequentialStunConnectError::StoppedEarly { failure, .. }) => stage_from_attempt_failure(&failure),
@@ -1116,6 +1130,7 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
             stun_discovery,
             handshake,
             target_reachability,
+            stale_trust_suspected,
         });
     }
 
@@ -1144,14 +1159,15 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
     // check, not a session to keep alive; dropping the returned session
     // immediately below closes the QUIC connection cleanly (the server sees
     // an ordinary disconnect, not a leak — no resume loop is ever started).
-    let (handshake, target_reachability) =
-        match connect_via_relay_resumable_with_fallback(&SystemQuicEndpointFactory, &candidates, 0).await {
-            Ok((session, _winning_target)) => {
-                drop(session);
-                (ProbeStageStatus::Ok { detail: None }, ProbeStageStatus::Ok { detail: None })
-            }
-            Err(e) => stage_from_relay_connect_error(&e),
-        };
+    let relay_result = connect_via_relay_resumable_with_fallback(&SystemQuicEndpointFactory, &candidates, 0).await;
+    let stale_trust_suspected = relay_result.as_ref().err().is_some_and(|e| e.is_stale_trust_signal());
+    let (handshake, target_reachability) = match relay_result {
+        Ok((session, _winning_target)) => {
+            drop(session);
+            (ProbeStageStatus::Ok { detail: None }, ProbeStageStatus::Ok { detail: None })
+        }
+        Err(e) => stage_from_relay_connect_error(&e),
+    };
 
     Ok(ProbeReport {
         probe_schema_version: PROBE_SCHEMA_VERSION,
@@ -1161,6 +1177,7 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
         stun_discovery,
         handshake,
         target_reachability,
+        stale_trust_suspected,
     })
 }
 
@@ -2754,6 +2771,7 @@ mod tests {
             stun_discovery: ProbeStageStatus::Skipped { reason: "no --stun-server given".to_string() },
             handshake: ProbeStageStatus::Ok { detail: None },
             target_reachability: ProbeStageStatus::Ok { detail: None },
+            stale_trust_suspected: false,
         };
         assert!(base.fully_reachable());
 
@@ -2769,6 +2787,7 @@ mod tests {
             stun_discovery: ProbeStageStatus::Failed { detail: "no response".to_string() },
             handshake: ProbeStageStatus::Ok { detail: None },
             target_reachability: ProbeStageStatus::Ok { detail: None },
+            stale_trust_suspected: false,
         };
         assert!(!failed_stun.fully_reachable());
         failed_stun.stun_discovery = ProbeStageStatus::Ok { detail: None };
@@ -2780,6 +2799,27 @@ mod tests {
         let status = ProbeStageStatus::Failed { detail: "boom".to_string() };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(json, r#"{"status":"failed","detail":"boom"}"#);
+    }
+
+    #[test]
+    fn probe_report_stale_trust_suspected_is_independent_of_fully_reachable() {
+        let mut report = ProbeReport {
+            probe_schema_version: PROBE_SCHEMA_VERSION,
+            profile: "prod".to_string(),
+            transport: "relay",
+            dns_resolution: ProbeStageStatus::Skipped { reason: "n/a".to_string() },
+            stun_discovery: ProbeStageStatus::Skipped { reason: "no --stun-server given".to_string() },
+            handshake: ProbeStageStatus::Failed { detail: "isekai-helper rejected the connection: Auth".to_string() },
+            target_reachability: ProbeStageStatus::NotAttempted { reason: "handshake did not complete".to_string() },
+            stale_trust_suspected: true,
+        };
+        assert!(!report.fully_reachable());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains(r#""stale_trust_suspected":true"#), "{json}");
+
+        report.stale_trust_suspected = false;
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains(r#""stale_trust_suspected":false"#), "{json}");
     }
 
     fn sample_stun_primary_intent() -> ConnectionIntent {

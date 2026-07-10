@@ -24,7 +24,13 @@ use isekai_trust::{HelperTrust, UpdatePolicy};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-const LEGACY_SUBCOMMANDS: &[&str] = &["init", "login", "logout"];
+/// Reserved words that `should_run_wrapper` never treats as an SSH
+/// destination — the interactive trust-store subcommands (`init`/`login`/
+/// `logout`, all pre-existing) plus `doctor` (manual diagnostic,
+/// `ISEKAI_PIPE_DESIGN.md` §8 Epic N). Not purely "legacy" any more, but
+/// kept as one flat list since `should_run_wrapper`'s only job is "is the
+/// first arg one of these known subcommand names or an SSH destination".
+const RESERVED_SUBCOMMANDS: &[&str] = &["init", "login", "logout", "doctor"];
 
 /// Matches `isekai-ssh init`'s own default (`cli::InitArgs::idle_lifetime`):
 /// the auto-bootstrapped helper is expected to keep running across many
@@ -33,13 +39,23 @@ const LEGACY_SUBCOMMANDS: &[&str] = &["init", "login", "logout"];
 const DEFAULT_IDLE_LIFETIME_SECS: u64 = 2_592_000;
 
 #[derive(Debug, PartialEq, Eq)]
-struct WrapperPlan {
+pub(crate) struct WrapperPlan {
     openssh_path: PathBuf,
     pipe_path: PathBuf,
     destination: String,
     destination_index: usize,
     ssh_args: Vec<String>,
     isekai: WrapperIsekaiOptions,
+}
+
+impl WrapperPlan {
+    /// Resolved `isekai-pipe` binary path (`default_pipe_path`/
+    /// `--isekai-pipe-path`) — `doctor.rs`'s only direct read of
+    /// `WrapperPlan`, to shell out to `isekai-pipe probe` with the same
+    /// binary the wrapper itself would use for `ProxyCommand`.
+    pub(crate) fn pipe_path(&self) -> &Path {
+        &self.pipe_path
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,9 +155,35 @@ enum InstallMode {
 }
 
 #[derive(Debug, Clone)]
-struct WrapperResolution {
+pub(crate) struct WrapperResolution {
     openssh: OpenSshEffectiveConfig,
     isekai: IsekaiConfig,
+}
+
+impl WrapperResolution {
+    /// The trust-store/`ConnectionIntent` profile name this destination
+    /// resolved to — the one piece of `WrapperResolution` `doctor.rs` needs
+    /// to read directly (everything else it does is via `wrapper.rs`'s own
+    /// `pub(crate)` functions, which already take `&WrapperResolution`).
+    pub(crate) fn profile(&self) -> &str {
+        &self.isekai.profile
+    }
+}
+
+/// Resolves `destination` (a bare host, no other `ssh` args) into the same
+/// `(WrapperPlan, WrapperResolution)` pair the ordinary connect path
+/// builds, for `doctor.rs` to reuse without duplicating the
+/// `~/.ssh/config`/`#@isekai` directive parser (`ISEKAI_PIPE_DESIGN.md` §8
+/// Epic N).
+pub(crate) async fn resolve_profile_for_destination(
+    destination: &str,
+    extra_isekai_args: Vec<String>,
+) -> Result<(WrapperPlan, WrapperResolution)> {
+    let mut args = extra_isekai_args;
+    args.push(destination.to_string());
+    let plan = parse_wrapper(args)?;
+    let resolution = resolve_wrapper(&plan).await?;
+    Ok((plan, resolution))
 }
 
 pub fn should_run_wrapper(args: &[String]) -> bool {
@@ -149,7 +191,7 @@ pub fn should_run_wrapper(args: &[String]) -> bool {
         return false;
     };
     !matches!(first, "-h" | "--help" | "help" | "-V" | "--version")
-        && !LEGACY_SUBCOMMANDS.contains(&first)
+        && !RESERVED_SUBCOMMANDS.contains(&first)
 }
 
 pub async fn run(args: Vec<String>) -> Result<u8> {
@@ -295,7 +337,7 @@ async fn run_openssh_direct(plan: &WrapperPlan) -> Result<u8> {
     Ok(status.code().unwrap_or(1) as u8)
 }
 
-fn build_connection_intent(resolution: &WrapperResolution) -> Result<ConnectionIntent> {
+pub(crate) fn build_connection_intent(resolution: &WrapperResolution) -> Result<ConnectionIntent> {
     let key = isekai_trust::normalize_host_port(&resolution.isekai.profile).map_err(|e| {
         anyhow!(
             "isekai-ssh: invalid profile {:?}: {e}",
@@ -393,7 +435,7 @@ fn select_transport(profile: &PersistentProfile, configured_stun_servers: &[Stri
 /// including inside a `ContextError<C, E>` a plain `dyn
 /// Error::downcast_ref` on a chain frame cannot see (that only matches a
 /// frame whose *concrete* type is exactly `C`, which `ContextError` never is).
-fn print_bootstrap_failure_guidance(err: &anyhow::Error) {
+pub(crate) fn print_bootstrap_failure_guidance(err: &anyhow::Error) {
     let Some(failure) = err.downcast_ref::<BootstrapFailure>() else {
         return;
     };
@@ -416,7 +458,7 @@ fn print_bootstrap_failure_guidance(err: &anyhow::Error) {
 /// `~/.ssh/known_hosts`, so this is a refresh of ephemeral material for a
 /// host already trusted once, not a new trust decision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TofuConfirmation {
+pub(crate) enum TofuConfirmation {
     AlwaysPrompt,
     Silent,
 }
@@ -443,7 +485,7 @@ enum TofuConfirmation {
 /// checks `init.rs` uses, then passed to `OpenSshBackend::install_and_start`
 /// as a single `ssh(1)` `-J host1,host2,...` invocation, not nested `ssh`
 /// executions per hop.
-async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution, confirmation: TofuConfirmation) -> Result<()> {
+pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution, confirmation: TofuConfirmation) -> Result<()> {
     let candidate = resolution
         .isekai
         .bootstrap_candidates
@@ -683,7 +725,7 @@ fn primary_service(config: &IsekaiConfig) -> &ServiceSpec {
         .expect("IsekaiConfig always has at least one service")
 }
 
-fn should_bootstrap(plan: &WrapperPlan, resolution: &WrapperResolution) -> bool {
+pub(crate) fn should_bootstrap(plan: &WrapperPlan, resolution: &WrapperResolution) -> bool {
     if plan.isekai.no_bootstrap
         || matches!(resolution.isekai.bootstrap_policy, BootstrapPolicy::Never)
     {

@@ -10,6 +10,7 @@
 //! populate/manage the trust store the wrapper reads from.
 
 mod cli;
+mod doctor;
 mod helper_download;
 mod init;
 mod login;
@@ -55,6 +56,7 @@ async fn main() {
             cli::Command::Init(args) => init::run(*args).await,
             cli::Command::Login(args) => login::run(args).await,
             cli::Command::Logout => login::run_logout().await,
+            cli::Command::Doctor(args) => doctor::run(args).await,
         };
 
         match result {
