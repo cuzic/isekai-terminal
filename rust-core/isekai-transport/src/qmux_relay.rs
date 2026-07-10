@@ -176,15 +176,29 @@ impl QuicConnection for QmuxQuicConnection {
     }
 
     async fn export_keying_material(&self, label: &[u8], context: &[u8]) -> Result<[u8; 32], TransportError> {
-        if label == self.exporter_label && context.is_empty() {
-            Ok(self.exporter)
-        } else {
-            Err(TransportError::Unsupported {
-                operation: "export_keying_material",
-                reason: "qmux_relay only supports the single (label, context) pair captured at connect time \
-                          (qmux::Session::connect takes ownership of the TLS stream, so no later export is possible)",
-            })
-        }
+        keying_material_for(self.exporter_label, self.exporter, label, context)
+    }
+}
+
+/// The fail-closed decision behind [`QmuxQuicConnection::export_keying_material`]:
+/// only the exact `(label, context)` pair captured at connect time can ever be
+/// served (see the module docs for why `qmux::Session::connect` makes any
+/// other export impossible after the fact). Split out from the trait method
+/// so it can be unit-tested without a live `qmux::Session`.
+fn keying_material_for(
+    captured_label: &'static [u8],
+    captured_material: [u8; 32],
+    requested_label: &[u8],
+    requested_context: &[u8],
+) -> Result<[u8; 32], TransportError> {
+    if requested_label == captured_label && requested_context.is_empty() {
+        Ok(captured_material)
+    } else {
+        Err(TransportError::Unsupported {
+            operation: "export_keying_material",
+            reason: "qmux_relay only supports the single (label, context) pair captured at connect time \
+                      (qmux::Session::connect takes ownership of the TLS stream, so no later export is possible)",
+        })
     }
 }
 
@@ -257,5 +271,40 @@ impl ByteStreamWriteHalf for QmuxByteStreamWriteHalf {
     async fn shutdown(&mut self) -> Result<(), TransportError> {
         use web_transport_trait::SendStream as _;
         self.send.finish().map_err(|e| TransportError::StreamIo(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CAPTURED_MATERIAL: [u8; 32] = [7u8; 32];
+
+    #[test]
+    fn returns_the_captured_material_for_the_exact_label_and_empty_context() {
+        let result = keying_material_for(EXPORTER_LABEL, CAPTURED_MATERIAL, EXPORTER_LABEL, b"");
+
+        assert_eq!(result.unwrap(), CAPTURED_MATERIAL);
+    }
+
+    #[test]
+    fn fails_closed_on_a_different_label() {
+        let result = keying_material_for(EXPORTER_LABEL, CAPTURED_MATERIAL, b"some-other-label", b"");
+
+        assert!(matches!(result, Err(TransportError::Unsupported { operation: "export_keying_material", .. })));
+    }
+
+    #[test]
+    fn fails_closed_on_a_non_empty_context() {
+        let result = keying_material_for(EXPORTER_LABEL, CAPTURED_MATERIAL, EXPORTER_LABEL, b"nonempty");
+
+        assert!(matches!(result, Err(TransportError::Unsupported { operation: "export_keying_material", .. })));
+    }
+
+    #[test]
+    fn fails_closed_on_both_a_different_label_and_a_non_empty_context() {
+        let result = keying_material_for(EXPORTER_LABEL, CAPTURED_MATERIAL, b"some-other-label", b"nonempty");
+
+        assert!(matches!(result, Err(TransportError::Unsupported { operation: "export_keying_material", .. })));
     }
 }
