@@ -9,8 +9,13 @@
 //!   observed address on it (`isekai_stun::query_stun`).
 //! - Send hole-punch probes to the peer's already-known observed address
 //!   (simultaneous open).
-//! - Reuse that *same* socket as a QUIC endpoint
-//!   (`system::quic_endpoint_from_std_socket`) and perform the
+//! - Reuse that *same* socket as a QUIC endpoint (via the caller-supplied
+//!   `QuicEndpointFactory::wrap_bound_socket` — isekai-terminal-core/
+//!   isekai-transport crate共有化 Phase 1c: which concrete `noq::AsyncUdpSocket`
+//!   wraps the already-STUN-queried/hole-punched socket is pluggable, so
+//!   this module never has to know whether it's running against a plain
+//!   `tokio::net::UdpSocket` (CLI, `system::SystemQuicEndpointFactory`) or a
+//!   fault-injectable one (Android's own factory)) and perform the
 //!   HELLO/proof/ACK handshake against the peer
 //!   (`relay::connect_and_handshake`, shared with `connect_via_relay`).
 //!
@@ -33,11 +38,12 @@ use log::info;
 use isekai_protocol::attach::ConnectionGeneration;
 use isekai_protocol::session_id::SessionId;
 
+use isekai_protocol::hello::Proof;
+
 use crate::attempt::AttemptFailure;
 use crate::error::TransportError;
 use crate::relay::{connect_and_handshake, random_session_id};
-use crate::system::quic_endpoint_from_std_socket;
-use crate::traits::ByteStream;
+use crate::traits::{ByteStream, QuicConnection, QuicEndpointFactory};
 use crate::types::{BindSpec, RemoteSpec};
 
 /// Number of hole-punch probe datagrams sent to the peer's observed address
@@ -98,13 +104,51 @@ pub struct StunP2pConnection {
 /// SSH-bootstrap step that exchanges observed addresses out-of-band is the
 /// caller's responsibility here, not this function's (see module docs).
 pub async fn connect_stun_p2p(
+    factory: &dyn QuicEndpointFactory,
     stun_server: SocketAddr,
     target: &StunP2pTarget,
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<StunP2pConnection, TransportError> {
-    connect_stun_p2p_with_round(stun_server, target, random_session_id(), ConnectionGeneration::INITIAL, identity)
+    connect_stun_p2p_with_round(factory, stun_server, target, random_session_id(), ConnectionGeneration::INITIAL, identity)
         .await
         .map_err(AttemptFailure::into_source)
+}
+
+/// Wraps an already-bound `socket` (which the caller must already have
+/// STUN-queried and used to send hole-punch probes to `target.peer_addr`
+/// on — the *punching* half of [`connect_stun_p2p_with_round`]'s work) as a
+/// QUIC endpoint and performs the HELLO/proof/ACK handshake. The other half
+/// this function does **not** do — binding a socket and querying STUN on it
+/// — for callers that must keep that *exact same* socket alive across an
+/// out-of-band step between "learn our own observed address" and "punch +
+/// connect": `isekai-terminal-core`'s Android transport must report its own
+/// observed address to the SSH bootstrap channel (so the peer starts
+/// punching toward it) *before* it can punch back or dial, so it cannot let
+/// this crate bind-query-punch-dial as one atomic unit the way
+/// `connect_stun_p2p`'s self-contained flow does (isekai-terminal-core/
+/// isekai-transport crate共有化 Phase 1c). Resume support for a connection
+/// established this way still goes through the plain [`crate::resume::reconnect_and_resume`]
+/// against a synthesized `RelayTarget{helper_addr: target.peer_addr, ..}` —
+/// see that Android transport's own module docs for why a bare redial (no
+/// re-STUN/re-punch) is this mode's accepted resume-capability ceiling.
+pub async fn connect_stun_p2p_on_socket(
+    factory: &dyn QuicEndpointFactory,
+    socket: tokio::net::UdpSocket,
+    target: &StunP2pTarget,
+    identity: crate::telemetry::CandidateIdentity<'_>,
+) -> Result<(Box<dyn QuicConnection>, Box<dyn ByteStream>, Proof), TransportError> {
+    let endpoint = factory.wrap_bound_socket(socket).await?;
+    let remote = RemoteSpec {
+        addr: target.peer_addr,
+        server_name: target.server_name.clone(),
+        cert_sha256_hex: target.cert_sha256_hex.clone(),
+    };
+    // No resume support on this path either (module docs) — `0` ("no preference").
+    let (conn, stream, proof, _effective_resume_grace_secs) = connect_and_handshake(
+        endpoint.as_ref(), remote, &target.session_secret, random_session_id(), ConnectionGeneration::INITIAL, 0, identity,
+    )
+    .await?;
+    Ok((conn, stream, proof))
 }
 
 /// Like [`connect_stun_p2p`], but takes an externally-provided
@@ -195,6 +239,7 @@ impl std::error::Error for SequentialStunConnectError {}
 /// can tell a fallback attempt to a different STUN server is still logically
 /// the same attach round, not a second concurrent session.
 pub async fn connect_stun_p2p_with_fallback(
+    factory: &dyn QuicEndpointFactory,
     target: &StunP2pTarget,
     candidates: &[SequentialStunCandidate],
 ) -> Result<(StunP2pConnection, SocketAddr), SequentialStunConnectError> {
@@ -212,8 +257,10 @@ pub async fn connect_stun_p2p_with_fallback(
             provider: "config-stun",
             id: &candidate.candidate_id,
         };
-        match connect_stun_p2p_with_round(candidate.stun_server, target, session_id, ConnectionGeneration::INITIAL, identity)
-            .await
+        match connect_stun_p2p_with_round(
+            factory, candidate.stun_server, target, session_id, ConnectionGeneration::INITIAL, identity,
+        )
+        .await
         {
             Ok(conn) => return Ok((conn, candidate.stun_server)),
             Err(failure) => {
@@ -230,6 +277,7 @@ pub async fn connect_stun_p2p_with_fallback(
 }
 
 pub(crate) async fn connect_stun_p2p_with_round(
+    factory: &dyn QuicEndpointFactory,
     stun_server: SocketAddr,
     target: &StunP2pTarget,
     session_id: SessionId,
@@ -256,10 +304,12 @@ pub(crate) async fn connect_stun_p2p_with_round(
         tokio::time::sleep(PUNCH_PROBE_INTERVAL).await;
     }
 
-    let std_socket = socket.into_std().map_err(|e| AttemptFailure::RetryablePreAttach {
-        source: TransportError::SocketSetup(e.to_string()),
-    })?;
-    let endpoint = quic_endpoint_from_std_socket(std_socket)
+    // どの具体的なnoq::AsyncUdpSocketでラップするか(素通しかフォルト注入可能か)は
+    // factory実装ごとに異なる(isekai-terminal-core/isekai-transport crate共有化
+    // Phase 1c、`QuicEndpointFactory::wrap_bound_socket`のdocコメント参照)。
+    let endpoint = factory
+        .wrap_bound_socket(socket)
+        .await
         .map_err(|source| AttemptFailure::RetryablePreAttach { source })?;
 
     let remote = RemoteSpec {

@@ -28,6 +28,20 @@ use crate::types::{BindSpec, RemoteSpec};
 #[async_trait]
 pub trait QuicEndpointFactory: Send + Sync {
     async fn create_endpoint(&self, bind: BindSpec) -> Result<Box<dyn QuicEndpoint>, TransportError>;
+
+    /// Wraps an already-bound `tokio::net::UdpSocket` as a QUIC endpoint,
+    /// instead of binding a fresh one via [`QuicEndpointFactory::create_endpoint`]
+    /// (isekai-terminal-core/isekai-transport crate共有化 Phase 1c). For
+    /// `stun_p2p::connect_stun_p2p`, which must do its own raw STUN-query/
+    /// hole-punch-probe I/O on a specific socket *before* handing it to
+    /// `noq` — that raw phase can't go through `create_endpoint`'s
+    /// bind-a-fresh-socket contract, but the *implementation-specific* part
+    /// (which concrete `noq::AsyncUdpSocket` wraps it — plain for
+    /// `system::SystemQuicEndpointFactory`, fault-injectable for
+    /// `isekai-terminal-core`'s own factory) still needs to be pluggable the
+    /// same way `create_endpoint` already is, so this crate's STUN P2P logic
+    /// never has to know which concrete socket type it's running against.
+    async fn wrap_bound_socket(&self, socket: tokio::net::UdpSocket) -> Result<Box<dyn QuicEndpoint>, TransportError>;
 }
 
 /// A bound QUIC endpoint, capable of initiating outbound connections.
@@ -60,14 +74,34 @@ pub trait QuicEndpoint: Send + Sync {
 /// trait rather than a method on `QuicEndpoint`/`QuicConnection` directly.
 #[async_trait]
 pub trait QuicEndpointRebinder: Send + Sync {
-    /// Binds a fresh local UDP socket at `bind` and switches the endpoint to
-    /// it. A successful return means the switch itself succeeded — it does
+    /// Switches the endpoint to `socket` directly, instead of binding a
+    /// fresh one itself — the primitive [`QuicEndpointRebinder::rebind`] is
+    /// built from. This is what a caller who needs to rebind onto a
+    /// *specific physical network interface* uses: bind `socket` themselves
+    /// first (e.g. via `quicsock::bind_udp` on the CLI/PC, or via Android's
+    /// `Network.bindSocket()` on the Kotlin/JNI side, then import the fd),
+    /// and hand the already-bound result here — this trait has no opinion
+    /// on how `socket` got bound, only that it's ready to use.
+    ///
+    /// A successful return means the switch itself succeeded — it does
     /// **not** mean the new socket can actually reach the peer (that can
     /// only be learned by observing whether the connection keeps working
     /// afterward). On failure, the endpoint keeps using its previous socket
     /// (whatever guarantee the underlying engine's own rebind operation
     /// gives here — `system::SystemQuicEndpointRebinder`'s docs cite noq's).
-    async fn rebind(&self, bind: BindSpec) -> Result<(), TransportError>;
+    async fn rebind_socket(&self, socket: std::net::UdpSocket) -> Result<(), TransportError>;
+
+    /// Binds a fresh local UDP socket at `bind` (an ordinary, OS-routed
+    /// bind — no specific physical interface) and switches to it via
+    /// [`QuicEndpointRebinder::rebind_socket`]. The common case (e.g.
+    /// reacting to an OS-reported IP change without caring which interface
+    /// it came from); reach for `rebind_socket` directly for the
+    /// physical-interface case.
+    async fn rebind(&self, bind: BindSpec) -> Result<(), TransportError> {
+        let socket = std::net::UdpSocket::bind(bind.local_addr)
+            .map_err(|source| TransportError::Bind { addr: bind.local_addr, source })?;
+        self.rebind_socket(socket).await
+    }
 }
 
 /// An established QUIC connection.

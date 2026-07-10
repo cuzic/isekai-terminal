@@ -16,7 +16,6 @@
 //! HELPER_PROTOCOL.mdのHELLO/ACK/proof契約・埋め込みヘルパーバイナリ・
 //! ブートストラップロジックはそちらの`pub(crate)`公開分をそのまま再利用する。
 
-use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr};
@@ -32,7 +31,7 @@ use log::{info, warn};
 use noq::udp::{RecvMeta, Transmit};
 use noq::{AsyncUdpSocket, UdpSender};
 
-use crate::isekai_pipe_quic_transport::{self, PinnedCertVerifier, ALPN, EXPORTER_LABEL};
+use crate::isekai_pipe_quic_transport::{self, ALPN, EXPORTER_LABEL};
 use isekai_protocol::attach::{
     attach_hello_proof_transcript, encode_attach_activate, encode_attach_hello, AttachActivate, AttachHello,
     AttachProof, AttachResponse, ConnectionGeneration,
@@ -41,6 +40,9 @@ use crate::transport::{run_ssh_channel_loop, TransportCommand, TransportEvent};
 use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 use base64::Engine as _;
+use isekai_transport::multipath::{connect_multipath_with_socket, MultipathConnection};
+use isekai_transport::path_health::{self, PathHealthEvent, PathHealthTracker, PathLabel, PathState};
+use isekai_transport::types::RemoteSpec;
 use russh::client;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -52,24 +54,6 @@ use sha2::Sha256;
 const OPEN_PATH_MAX_ATTEMPTS: u32 = 3;
 const OPEN_PATH_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
 const OPEN_PATH_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// Phase 9-5: ヘルスチェックの間隔。`path.ping()` を送ってから統計を読むまでの
-/// 猶予（PONG/ACK が返ってrttに反映されるまでの待ち時間）。
-const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(3);
-const PING_SETTLE_DELAY: Duration = Duration::from_millis(300);
-/// これを超えるRTTはDegradedとみなす。
-const DEGRADED_RTT_THRESHOLD: Duration = Duration::from_millis(800);
-/// 直近区間で送信datagramに対するlost_packets増分の比率がこれを超えたらDegraded。
-const DEGRADED_LOSS_RATIO: f64 = 0.2;
-/// Degraded状態からAvailableに戻すのに必要な連続健全チェック回数
-/// （1回の健全判定で即復帰させるとフラッピングしやすいため）。
-const RECOVERY_CONSECUTIVE_CHECKS: u32 = 2;
-/// `has_zero_response`（送ったのに一切受信していない）がNoViablePath通知の
-/// トリガーになるまでに要求する連続回数。実機検証で、実ネットワークのジッタ
-/// （1回だけ応答がPING_SETTLE_DELAY内に間に合わない等）だけでも単発では簡単に
-/// 真になることを確認したため、連続要求でノイズを除去する
-/// （HEALTH_CHECK_INTERVAL×この回数だけ本当に無応答が続くまでrebindを起こさない）。
-const NO_RESPONSE_CONSECUTIVE_CHECKS: u32 = 3;
 
 /// direct_host（Tailscaleを介さない外部到達アドレス）向けにisekai-helperを
 /// 待ち受けさせる固定UDPポート。物理Wi-Fi/セルラーpath候補も含め、direct_host宛の
@@ -244,78 +228,17 @@ impl MultipathIsekaiPipeQuicSession {
     }
 }
 
-// ── path broker（二値状態のみ、Phase 9-2 スコープ） ──────────
+// ── path health（`isekai_transport::path_health`、旧`PathBroker`）─────────
+//
+// `PathCandidateId`（固定4種）/`PathState`/`PathBroker`は、isekai-transport/
+// isekai-terminal-core crate共有化の一環でisekai_transport::path_healthへ
+// 一般化・移植した（`PathHealthTracker`/`PathLabel`/`PathState`）。以下の
+// ラベルは今までの`PathCandidateId`の4種にそれぞれ対応する。
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PathCandidateId {
-    /// path0。ブートストラップに使った `ssh_host`（通常 Tailscale 経由）。
-    Primary,
-    /// path1。`direct_host`（直接到達可能なアドレス）。
-    Secondary,
-    /// Phase 9-4: `Network.bindSocket()` でWi-Fi無線に明示的にバインドした path。
-    PhysicalWifi,
-    /// Phase 9-4: 同、セルラー無線。
-    PhysicalCellular,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PathState {
-    Unknown,
-    Validated,
-    /// Phase 9-5: 到達はしているがRTT/ロス/black hole検出が閾値を超えている状態。
-    /// `noq::Path::set_status(PathStatus::Backup)` で実際のスケジューリング優先度も
-    /// 下げてあるため、他に健全なpathがあればそちらが優先して使われる。
-    Degraded,
-    Failed,
-}
-
-/// 各 `PathCandidateId` の状態を追跡する薄い broker。
-/// 実際にどのpathでバイトを送るかは最終的に `noq::Connection` 自身が選ぶが、
-/// Phase 9-5からは `Path::set_status()` でこちらから優先度のヒントを与える
-/// （Available/Backupの切り替え）。`path_ids` は `noq::PathId` → 候補ID の
-/// 対応付けで、path確立時（`register_path`）に記録し、`PathEvent`/ヘルス
-/// チェックタスクが後から同じpathを引けるようにする。
-#[derive(Clone)]
-pub(crate) struct PathBroker {
-    states: Arc<StdMutex<HashMap<PathCandidateId, PathState>>>,
-    path_ids: Arc<StdMutex<HashMap<noq::PathId, PathCandidateId>>>,
-}
-
-impl PathBroker {
-    fn new() -> Self {
-        let mut states = HashMap::new();
-        states.insert(PathCandidateId::Primary, PathState::Unknown);
-        states.insert(PathCandidateId::Secondary, PathState::Unknown);
-        states.insert(PathCandidateId::PhysicalWifi, PathState::Unknown);
-        states.insert(PathCandidateId::PhysicalCellular, PathState::Unknown);
-        Self {
-            states: Arc::new(StdMutex::new(states)),
-            path_ids: Arc::new(StdMutex::new(HashMap::new())),
-        }
-    }
-
-    pub(crate) fn set(&self, id: PathCandidateId, state: PathState) {
-        self.states.lock().unwrap().insert(id, state);
-    }
-
-    pub(crate) fn get(&self, id: PathCandidateId) -> PathState {
-        *self.states.lock().unwrap().get(&id).unwrap_or(&PathState::Unknown)
-    }
-
-    pub(crate) fn any_validated(&self) -> bool {
-        self.states.lock().unwrap().values().any(|s| *s == PathState::Validated)
-    }
-
-    /// `open_path`/初回接続が成功した直後に、noqが割り振った`PathId`と
-    /// このモジュール内の候補IDを紐付ける。
-    pub(crate) fn register_path(&self, path_id: noq::PathId, candidate: PathCandidateId) {
-        self.path_ids.lock().unwrap().insert(path_id, candidate);
-    }
-
-    pub(crate) fn candidate_for(&self, path_id: noq::PathId) -> Option<PathCandidateId> {
-        self.path_ids.lock().unwrap().get(&path_id).copied()
-    }
-}
+const PRIMARY_LABEL: &str = isekai_transport::multipath::PRIMARY_PATH_LABEL;
+const SECONDARY_LABEL: &str = "secondary";
+const PHYSICAL_WIFI_LABEL: &str = "physical-wifi";
+const PHYSICAL_CELLULAR_LABEL: &str = "physical-cellular";
 
 // ── Phase 9-4: 物理Wi-Fi/セルラー無線を束ねる `MultiUdpSocket` ─────────
 //
@@ -492,33 +415,18 @@ fn udp_socket_from_raw_fd(fd: RawFd) -> Result<Arc<tokio::net::UdpSocket>, Strin
 }
 
 // ── QUIC 接続（noq、HELPER_PROTOCOL.md契約はisekai_pipe_quic_transport.rsと共通） ──
-
-fn build_pinned_client_config(cert_sha256_hex: &str) -> Result<noq::ClientConfig, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|_| "TLS config failed".to_string())?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier {
-            expected_sha256_hex: cert_sha256_hex.to_string(),
-            provider,
-        }))
-        .with_no_client_auth();
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
-    // 0-RTT はここでも使わない（HELPER_PROTOCOL.md契約、isekai_pipe_quic_transport.rsと同じ）。
-
-    let quic_crypto = noq::crypto::rustls::QuicClientConfig::try_from(crypto)
-        .map_err(|e| format!("QUIC crypto config failed: {e}"))?;
-    let mut client_config = noq::ClientConfig::new(Arc::new(quic_crypto));
-
-    let mut transport = noq::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(noq::VarInt::from_u32(2));
-    transport.max_concurrent_uni_streams(noq::VarInt::from_u32(0));
-    transport.max_concurrent_multipath_paths(8);
-    client_config.transport_config(Arc::new(transport));
-
-    Ok(client_config)
-}
+//
+// クライアント設定の構築(証明書pin・TLS/transportチューニング)は
+// `isekai_transport::multipath::connect_multipath_with_socket`が内部で
+// `isekai_transport::system::client_config_for(cert_sha256_hex, true)`を使って
+// 行うようになったため、ここにあった`build_pinned_client_config`は削除した
+// (isekai-terminal-core/isekai-transport crate共有化)。
+// 挙動差(旧: max_concurrent_bidi_streams=2・max_idle_timeout無し / 新:
+// max_concurrent_bidi_streams=1・max_idle_timeout=15s+keep_alive=5s)は、
+// このトランスポートが同時に2本目のstreamを開くことは無く(常に`hello_ack`が
+// 開く1本のみ)、かつ全pathが死んだ場合でもAndroid独自のNoViablePath検知
+// (health check間隔3秒×3回=9秒)がnoqのidle timeout(15秒)より先に発火するため、
+// 無害と判断した。
 
 /// `session_secret` と QUIC connection の exporter から proof を計算する
 /// （ATTACH の `extra` には proof transcript を渡す。`isekai_pipe_quic_transport::
@@ -574,7 +482,7 @@ async fn hello_ack(
 /// Phase 9-4: 物理無線に明示的にバインドされたpath候補1本分（`RawFd`は
 /// `MultiUdpSocket`構築時に消費され所有権が移る）。
 pub(crate) struct PhysicalPathCandidate {
-    pub(crate) candidate: PathCandidateId,
+    pub(crate) candidate: PathLabel,
     pub(crate) fd: RawFd,
     pub(crate) local_ip: IpAddr,
     /// この候補が接続を試みるリモートアドレス。通常は`direct_host`（path1と同じ）だが、
@@ -586,6 +494,17 @@ pub(crate) struct PhysicalPathCandidate {
 /// 物理path候補（`physical`、`Network.bindSocket()`済みのfdから構築）を追加で
 /// 開く。path1・物理pathいずれも確立に失敗して致命的エラーにはしない
 /// （path0 だけで従来通り動く）。
+///
+/// path0（primary）自体の接続確立・health monitor起動・path_eventsリスナーは
+/// `isekai_transport::multipath::connect_multipath_with_socket`へ委譲する
+/// (isekai-terminal-core/isekai-transport crate共有化)。path1・物理pathの
+/// 追加open_pathは意図的にこの関数から`connect_multipath_with_socket`の
+/// `secondaries`引数を経由せず、常に空を渡した上でこの関数自身が直列に開く——
+/// 複数の物理path候補が絡む場合の「同時に複数open_pathすると先頭以外が失敗する」
+/// 実機検証結果(下記コメント参照)による厳密な直列化保証を、2つの独立したタスクに
+/// 分割することなく維持するため。`isekai_transport::path_health`
+/// (`PathHealthTracker`/`PathState`/`spawn_health_monitor`/`notify_if_no_viable_path`)
+/// は共通で使う。
 async fn establish_multipath_connection(
     path0_addr: SocketAddr,
     path1_addr: Option<SocketAddr>,
@@ -593,13 +512,24 @@ async fn establish_multipath_connection(
     cert_sha256_hex: &str,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
     injector: crate::faulty_udp_socket::UdpFaultInjector,
-) -> Result<(noq::Connection, PathBroker, noq::Endpoint), String> {
-    let client_config = build_pinned_client_config(cert_sha256_hex)?;
+) -> Result<(noq::Connection, PathHealthTracker, noq::Endpoint), String> {
+    // isekai_transport::path_health::spawn_health_monitorは自分専用のイベント型
+    // (PathHealthEvent)を使うので、Androidの既存TransportEventチャンネルへ
+    // NoViablePathだけ橋渡しする小タスクを立てる。
+    let (health_tx, mut health_rx) = tokio::sync::mpsc::channel::<PathHealthEvent>(8);
+    {
+        let event_tx = event_tx.clone();
+        RUNTIME.spawn(async move {
+            while let Some(PathHealthEvent::NoViablePath) = health_rx.recv().await {
+                let _ = event_tx.send(TransportEvent::NoViablePath).await;
+            }
+        });
+    }
 
     // 物理path候補を開くのに使う (candidate, local_ip, target_addr) の対応は、fdの
     // 所有権をMultiUdpSocketへ渡す前に控えておく。
-    let physical_targets: Vec<(PathCandidateId, IpAddr, SocketAddr)> =
-        physical.iter().map(|p| (p.candidate, p.local_ip, p.target_addr)).collect();
+    let physical_targets: Vec<(PathLabel, IpAddr, SocketAddr)> =
+        physical.iter().map(|p| (p.candidate.clone(), p.local_ip, p.target_addr)).collect();
 
     // path0/path1のみ（物理候補なし）でもnoq::Endpoint::client(...)の素のソケットは
     // 使わず、常にMultiUdpSocketを通す（`named`が空なら`default`だけの薄いラッパー
@@ -618,70 +548,18 @@ async fn establish_multipath_connection(
         named.push(NamedUdpSocket { local_ip: p.local_ip, socket });
     }
     let multi = MultiUdpSocket { default: default_sock, named, injector };
-    let endpoint = noq::Endpoint::new_with_abstract_socket(
-        Default::default(),
-        None,
-        Box::new(multi),
-        Arc::new(noq::TokioRuntime),
-    )
-    .map_err(|e| format!("endpoint bind failed: {e}"))?;
-    endpoint.set_default_client_config(client_config);
 
+    let primary = RemoteSpec {
+        addr: path0_addr,
+        server_name: "isekai-pipe.local".to_string(),
+        cert_sha256_hex: cert_sha256_hex.to_string(),
+    };
     info!("multipath_quic: connecting path0 -> {path0_addr}");
-    let conn = endpoint
-        .connect(path0_addr, "isekai-pipe.local")
-        .map_err(|e| format!("connect setup failed: {e}"))?
-        .await
-        .map_err(|e| format!("QUIC handshake failed: {e}"))?;
+    let MultipathConnection { conn, tracker, endpoint } =
+        connect_multipath_with_socket(Box::new(multi), primary, Vec::new(), health_tx.clone())
+            .await
+            .map_err(|e| e.to_string())?;
     info!("multipath_quic: path0 established");
-
-    let broker = PathBroker::new();
-    broker.register_path(noq::PathId::ZERO, PathCandidateId::Primary);
-    broker.set(PathCandidateId::Primary, PathState::Validated);
-    spawn_health_monitor(
-        conn.clone(), noq::PathId::ZERO, PathCandidateId::Primary, broker.clone(), event_tx.clone(),
-    );
-
-    // path0/path1(以降)の生死をbrokerに反映し、確立したpathにはヘルスモニタを
-    // 起動する（Phase 9-5）。`register_path`していないid（このタスクが起動する
-    // 前にEstablishedが飛んだ場合等）は無視する——次のイベントか、path1側の
-    // `open_path`成功時点のregister_pathで追いつく。
-    {
-        let broker = broker.clone();
-        let conn_for_events = conn.clone();
-        let mut events = conn.path_events();
-        let event_tx = event_tx.clone();
-        RUNTIME.spawn(async move {
-            use tokio_stream::StreamExt;
-            while let Some(ev) = events.next().await {
-                match ev {
-                    Ok(noq::PathEvent::Established { id, .. }) => {
-                        if let Some(candidate) = broker.candidate_for(id) {
-                            broker.set(candidate, PathState::Validated);
-                            spawn_health_monitor(
-                                conn_for_events.clone(), id, candidate, broker.clone(), event_tx.clone(),
-                            );
-                        }
-                    }
-                    Ok(noq::PathEvent::Abandoned { id, reason, .. }) => {
-                        info!("multipath_quic: path {id:?} abandoned: {reason:?}");
-                        if let Some(candidate) = broker.candidate_for(id) {
-                            broker.set(candidate, PathState::Failed);
-                            notify_if_no_viable_path(&broker, &event_tx);
-                        }
-                    }
-                    Ok(noq::PathEvent::Discarded { id, .. }) => {
-                        if let Some(candidate) = broker.candidate_for(id) {
-                            broker.set(candidate, PathState::Failed);
-                            notify_if_no_viable_path(&broker, &event_tx);
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => break, // connection closed
-                }
-            }
-        });
-    }
 
     if let Some(path1_addr) = path1_addr {
         // Phase 9-4追加調査: 当初はSecondary/物理path候補を全て同時にspawnしていたが、
@@ -690,36 +568,39 @@ async fn establish_multipath_connection(
         // 原因ではない）。CID払い出しやanti-amplification制限が複数同時オープンで
         // 競合している可能性が高いとみて、1本ずつ確立を待ってから次を開く直列化に変更。
         let conn2 = conn.clone();
-        let broker2 = broker.clone();
-        let event_tx2 = event_tx.clone();
+        let tracker2 = tracker.clone();
+        let health_tx2 = health_tx.clone();
         RUNTIME.spawn(async move {
-            open_path_with_retry(&conn2, path1_addr, None, PathCandidateId::Secondary, &broker2, &event_tx2).await;
+            open_path_with_retry(&conn2, path1_addr, None, SECONDARY_LABEL.into(), &tracker2, &health_tx2).await;
 
             // Phase 9-4: 物理path候補は明示的にbindされたローカルIPから、それぞれの
             // target_addr（既定はdirect_host=path1_addrと同じ、cellular_remote_host
             // 指定時はセルラーのみ別アドレス）へ開く。Tailscale経由アドレス（path0）宛には
             // 送れない（bindSocket自体がVPN稼働中は失敗するため、そもそもここに来ない）。
             for (candidate, local_ip, target_addr) in physical_targets {
-                open_path_with_retry(&conn2, target_addr, Some(local_ip), candidate, &broker2, &event_tx2).await;
+                open_path_with_retry(&conn2, target_addr, Some(local_ip), candidate, &tracker2, &health_tx2).await;
             }
         });
     } else if !physical_targets.is_empty() {
         warn!("multipath_quic: physical path candidates given but direct_host is unset; skipping (no target address)");
     }
 
-    Ok((conn, broker, endpoint))
+    Ok((conn, tracker, endpoint))
 }
 
 /// path1（`local_ip=None`、OSデフォルトルーティング）・物理path候補
 /// （`local_ip=Some(..)`、`MultiUdpSocket`が送信元IPで振り分ける）共通の
-/// リトライ付きopen_path処理。
+/// リトライ付きopen_path処理。`isekai_transport::multipath`内の同名の
+/// 内部関数は`local_ip=None`専用のためAndroidでは再利用できず(物理path候補が
+/// `local_ip=Some(..)`を必要とする)、`isekai_transport::path_health`の型を
+/// 使いつつこの関数自体はAndroid側に残す。
 async fn open_path_with_retry(
     conn: &noq::Connection,
     target_addr: SocketAddr,
     local_ip: Option<IpAddr>,
-    candidate: PathCandidateId,
-    broker: &PathBroker,
-    event_tx: &tokio::sync::mpsc::Sender<TransportEvent>,
+    candidate: PathLabel,
+    tracker: &PathHealthTracker,
+    event_tx: &tokio::sync::mpsc::Sender<PathHealthEvent>,
 ) {
     let four_tuple = match local_ip {
         Some(ip) => noq::FourTuple::new(target_addr, Some(ip)),
@@ -733,9 +614,9 @@ async fn open_path_with_retry(
         match result {
             Ok(Ok(path)) => {
                 info!("multipath_quic: path {candidate:?} established: id={:?}", path.id());
-                broker.register_path(path.id(), candidate);
-                broker.set(candidate, PathState::Validated);
-                spawn_health_monitor(conn.clone(), path.id(), candidate, broker.clone(), event_tx.clone());
+                tracker.register_path(path.id(), candidate.clone());
+                tracker.set(candidate.clone(), PathState::Validated);
+                path_health::spawn_health_monitor(conn.clone(), path.id(), candidate, tracker.clone(), event_tx.clone());
                 return;
             }
             Ok(Err(e)) => warn!("multipath_quic: path {candidate:?} open_path failed (attempt {attempt}): {e}"),
@@ -743,145 +624,14 @@ async fn open_path_with_retry(
                 warn!("multipath_quic: path {candidate:?} open_path timed out after {OPEN_PATH_TIMEOUT:?} (attempt {attempt})")
             }
         }
-        broker.set(candidate, PathState::Failed);
+        tracker.set(candidate.clone(), PathState::Failed);
         if attempt < OPEN_PATH_MAX_ATTEMPTS {
             tokio::time::sleep(backoff).await;
             backoff *= 2;
         }
     }
     warn!("multipath_quic: giving up on path {candidate:?} after {OPEN_PATH_MAX_ATTEMPTS} attempts");
-    notify_if_no_viable_path(broker, event_tx);
-}
-
-// ── Phase 9-5: 能動的ヘルスチェック（Degraded検知） ────────────
-
-/// `path.ping()`（PING frame送出）→ 少し待つ → `path.stats()` を`noq`のAPIだけで
-/// 定期的に行い、閾値超過ならそのpathを`PathStatus::Backup`に格下げする
-/// （他に`Available`なpathがあればnoq自身がそちらを優先して使う）。
-/// 独自のping/pongワイヤープロトコルは作らない——`noq::Path`が既に持っている
-/// 機能をそのまま使うだけ。
-fn spawn_health_monitor(
-    conn: noq::Connection,
-    path_id: noq::PathId,
-    candidate: PathCandidateId,
-    broker: PathBroker,
-    event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
-) {
-    RUNTIME.spawn(async move {
-        let mut prev_stats: Option<noq::PathStats> = None;
-        let mut consecutive_healthy = 0u32;
-        // 実機検証で判明: `has_zero_response`は実ネットワークのジッタ（1回だけ
-        // 応答がPING_SETTLE_DELAY内に間に合わなかった等）でも単発では簡単に真になる
-        // （実際に245ms RTT——閾値800msの範囲内——でも1回だけ「この区間は受信0」に
-        // なるケースを実機で確認した）。そのため`classify_path_health`のRTT/ロス率/
-        // black hole判定（Backup降格用、単発判定のまま）とは別に、NoViablePath通知だけは
-        // 連続ミスを要求してノイズを除去する。
-        let mut consecutive_no_response = 0u32;
-        loop {
-            tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
-            let Some(path) = conn.path(path_id) else { break };
-            if path.ping().is_err() {
-                break; // path はもう閉じている
-            }
-            tokio::time::sleep(PING_SETTLE_DELAY).await;
-            let Some(path) = conn.path(path_id) else { break };
-            let stats = path.stats();
-            let zero_response = has_zero_response(prev_stats.as_ref(), &stats);
-            // `zero_response`をそのまま`healthy`にも反映させる。そうしないと、
-            // 完全な無応答下でもclassify_path_health（RTT/ロス率/black hole）だけは
-            // 「健全」と読み続けてしまい（実機検証で確認: statsが更新自体止まる）、
-            // 下のリカバリ判定が`zero_response`側のDegraded降格と競合して即座に
-            // Validatedへ戻してしまう（実機で実際に踏んだ不整合）。
-            let healthy = classify_path_health(prev_stats.as_ref(), &stats) && !zero_response;
-            prev_stats = Some(stats);
-
-            if zero_response {
-                consecutive_no_response = consecutive_no_response.saturating_add(1);
-                if consecutive_no_response >= NO_RESPONSE_CONSECUTIVE_CHECKS {
-                    warn!(
-                        "multipath_quic: path {candidate:?} got zero responses for \
-                         {consecutive_no_response} consecutive checks"
-                    );
-                    broker.set(candidate, PathState::Degraded);
-                    notify_if_no_viable_path(&broker, &event_tx);
-                }
-            } else {
-                consecutive_no_response = 0;
-            }
-
-            if healthy {
-                consecutive_healthy = consecutive_healthy.saturating_add(1);
-                if broker.get(candidate) == PathState::Degraded
-                    && consecutive_healthy >= RECOVERY_CONSECUTIVE_CHECKS
-                {
-                    info!("multipath_quic: path {candidate:?} recovered, marking Available");
-                    let _ = path.set_status(noq::PathStatus::Available);
-                    broker.set(candidate, PathState::Validated);
-                }
-            } else {
-                consecutive_healthy = 0;
-                if broker.get(candidate) != PathState::Degraded {
-                    warn!(
-                        "multipath_quic: path {candidate:?} degraded (rtt={:?}), demoting to Backup",
-                        stats.rtt
-                    );
-                    let _ = path.set_status(noq::PathStatus::Backup);
-                    broker.set(candidate, PathState::Degraded);
-                }
-            }
-        }
-    });
-}
-
-/// 現在Validatedなpathが1本も無くなった（＝手元のQUICコネクション視点で
-/// 「応答が一切返ってこない」）ことを検知したら`TransportEvent::NoViablePath`を送る。
-/// キャプティブポータル等はQUICから見れば100%ロスと区別が付かないため、Android OSの
-/// キャプティブポータル検知より先にこちらで直接検知できる（`debug_fault`のCUTでも
-/// 同じ経路を通るため実機無しでも検証可能）。Degraded/Abandoned遷移のたびに呼ばれる
-/// 想定だが、`any_validated()`がtrueのままなら何もしないので連呼にはならない。
-fn notify_if_no_viable_path(broker: &PathBroker, event_tx: &tokio::sync::mpsc::Sender<TransportEvent>) {
-    if broker.any_validated() {
-        return;
-    }
-    warn!("multipath_quic: no viable path left (all paths degraded/failed)");
-    let _ = event_tx.try_send(TransportEvent::NoViablePath);
-}
-
-/// 直近の統計から、そのpathが健全とみなせるかを判定する純粋関数
-/// （実ネットワーク不要でunit testできるようにここだけ切り出してある）。
-/// `prev` が `None`（初回チェック）の場合は差分ベースの判定（ロス率・black hole
-/// 増分）はスキップし、RTTのみで判定する。
-pub(crate) fn classify_path_health(prev: Option<&noq::PathStats>, curr: &noq::PathStats) -> bool {
-    if curr.rtt > DEGRADED_RTT_THRESHOLD {
-        return false;
-    }
-    if let Some(prev) = prev {
-        let sent_delta = curr.udp_tx.datagrams.saturating_sub(prev.udp_tx.datagrams);
-        let lost_delta = curr.lost_packets.saturating_sub(prev.lost_packets);
-        if sent_delta > 0 && (lost_delta as f64 / sent_delta as f64) > DEGRADED_LOSS_RATIO {
-            return false;
-        }
-        if curr.black_holes_detected > prev.black_holes_detected {
-            return false;
-        }
-    }
-    true
-}
-
-/// キャプティブポータル等の完全な無応答（100%ロス）検出用の純粋関数。実機/loopback
-/// 検証で判明した通り、noqの`lost_packets`/`black_holes_detected`はconnection全体が
-/// 輻輳制御的に送信を止めてしまうと増加が止まり、rtt推定も更新されず古い健全値の
-/// まま固まる（`classify_path_health`のping駆動チェックだけでは検知できない）。
-/// 一方`udp_rx.datagrams`（受信側カウンタ）は極めて直接的な信号——このチェック区間で
-/// 何か送った（sent_delta > 0）のに何も受信していなければ、それだけで応答が一切
-/// 無いことを意味する。ただし実ネットワークのジッタ（応答がPING_SETTLE_DELAY内に
-/// 間に合わないだけ）でも単発では容易に真になるため、呼び出し側
-/// （`spawn_health_monitor`）で連続回数を要求すること。
-pub(crate) fn has_zero_response(prev: Option<&noq::PathStats>, curr: &noq::PathStats) -> bool {
-    let Some(prev) = prev else { return false };
-    let sent_delta = curr.udp_tx.datagrams.saturating_sub(prev.udp_tx.datagrams);
-    let recv_delta = curr.udp_rx.datagrams.saturating_sub(prev.udp_rx.datagrams);
-    sent_delta > 0 && recv_delta == 0
+    path_health::notify_if_no_viable_path(tracker, event_tx);
 }
 
 /// `MultipathIsekaiPipeQuicConfig`のwifi_fd/wifi_local_ip・cellular_fd/cellular_local_ip
@@ -901,7 +651,7 @@ async fn physical_path_candidates(
     if let (Some(fd), Some(ip)) = (config.wifi_fd, &config.wifi_local_ip) {
         match ip.parse::<IpAddr>() {
             Ok(local_ip) => out.push(PhysicalPathCandidate {
-                candidate: PathCandidateId::PhysicalWifi,
+                candidate: PHYSICAL_WIFI_LABEL.into(),
                 fd,
                 local_ip,
                 target_addr: default_target,
@@ -923,7 +673,7 @@ async fn physical_path_candidates(
                     None => default_target,
                 };
                 out.push(PhysicalPathCandidate {
-                    candidate: PathCandidateId::PhysicalCellular,
+                    candidate: PHYSICAL_CELLULAR_LABEL.into(),
                     fd,
                     local_ip,
                     target_addr,
@@ -1073,14 +823,14 @@ mod tests {
     const PATH_VALIDATION_POLL_TIMEOUT: Duration = Duration::from_secs(20);
     const PATH_VALIDATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-    /// `broker.get(id)`が`want`になるまで`PATH_VALIDATION_POLL_TIMEOUT`を上限にポーリングする。
+    /// `tracker.get(id)`が`want`になるまで`PATH_VALIDATION_POLL_TIMEOUT`を上限にポーリングする。
     /// 上限に達した場合は最後に観測した状態を返す(呼び出し側でassert_eqのメッセージに使う)。
-    async fn poll_until_path_state(broker: &PathBroker, id: PathCandidateId, want: PathState) -> PathState {
-        let mut last = broker.get(id);
+    async fn poll_until_path_state(tracker: &PathHealthTracker, id: &PathLabel, want: PathState) -> PathState {
+        let mut last = tracker.get(id);
         let deadline = tokio::time::Instant::now() + PATH_VALIDATION_POLL_TIMEOUT;
         while last != want && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(PATH_VALIDATION_POLL_INTERVAL).await;
-            last = broker.get(id);
+            last = tracker.get(id);
         }
         last
     }
@@ -1192,17 +942,17 @@ mod tests {
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let path1: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
 
-        let (conn, broker, _endpoint) = establish_multipath_connection(path0, Some(path1), Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
-        assert_eq!(broker.get(PathCandidateId::Primary), PathState::Validated);
+        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, Some(path1), Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
+        assert_eq!(tracker.get(&PRIMARY_LABEL.into()), PathState::Validated);
 
         let (send, recv) = hello_ack(&conn, &secret).await.unwrap();
         drop(send);
         drop(recv);
 
         // path1 の確立はバックグラウンドタスクなので少し待つ。
-        let state = poll_until_path_state(&broker, PathCandidateId::Secondary, PathState::Validated).await;
+        let state = poll_until_path_state(&tracker, &SECONDARY_LABEL.into(), PathState::Validated).await;
         assert_eq!(state, PathState::Validated, "path1 should validate within timeout");
-        assert!(broker.any_validated());
+        assert!(tracker.any_validated());
 
         conn.close(0u32.into(), b"test done");
     }
@@ -1212,7 +962,7 @@ mod tests {
         let (port, cert_sha256_hex, secret) = start_test_server().await;
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-        let (conn, broker, _endpoint) = establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
+        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
         let (send, recv) = hello_ack(&conn, &secret).await.unwrap();
         drop(send);
         drop(recv);
@@ -1225,12 +975,12 @@ mod tests {
         // 開かれない」こととは無関係。Validated/Degradedのどちらでも「到達はしている」
         // ことに変わりは無いので、両方を許容する(Unknown/Failedなら本当に確立して
         // いないので、そちらは今まで通り失敗として扱う)。
-        let state = poll_until_path_state(&broker, PathCandidateId::Primary, PathState::Validated).await;
+        let state = poll_until_path_state(&tracker, &PRIMARY_LABEL.into(), PathState::Validated).await;
         assert!(
             matches!(state, PathState::Validated | PathState::Degraded),
             "path0 should have established (Validated or Degraded), got {state:?}"
         );
-        assert_eq!(broker.get(PathCandidateId::Secondary), PathState::Unknown);
+        assert_eq!(tracker.get(&SECONDARY_LABEL.into()), PathState::Unknown);
 
         conn.close(0u32.into(), b"test done");
     }
@@ -1247,9 +997,9 @@ mod tests {
         let (port, cert_sha256_hex, secret) = start_test_server().await;
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-        let (conn, broker, endpoint) =
+        let (conn, tracker, endpoint) =
             establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
-        assert_eq!(broker.get(PathCandidateId::Primary), PathState::Validated);
+        assert_eq!(tracker.get(&PRIMARY_LABEL.into()), PathState::Validated);
 
         // rebind前: 通常のecho往復が動くことを確認。
         {
@@ -1293,8 +1043,8 @@ mod tests {
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let path1: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
 
-        let (conn, broker, _endpoint) = establish_multipath_connection(path0, Some(path1), Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
-        let state = poll_until_path_state(&broker, PathCandidateId::Secondary, PathState::Validated).await;
+        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, Some(path1), Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
+        let state = poll_until_path_state(&tracker, &SECONDARY_LABEL.into(), PathState::Validated).await;
         assert_eq!(state, PathState::Validated, "path1 should validate within timeout");
 
         if let Some(p0) = conn.path(noq::PathId::ZERO) {
@@ -1349,15 +1099,15 @@ mod tests {
         let _ = std_sock.into_raw_fd();
 
         let physical = vec![PhysicalPathCandidate {
-            candidate: PathCandidateId::PhysicalWifi,
+            candidate: PHYSICAL_WIFI_LABEL.into(),
             fd,
             local_ip: physical_ip,
             target_addr: direct,
         }];
-        let (conn, broker, _endpoint) =
+        let (conn, tracker, _endpoint) =
             establish_multipath_connection(path0, Some(direct), physical, &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
 
-        let state = poll_until_path_state(&broker, PathCandidateId::PhysicalWifi, PathState::Validated).await;
+        let state = poll_until_path_state(&tracker, &PHYSICAL_WIFI_LABEL.into(), PathState::Validated).await;
         assert_eq!(
             state, PathState::Validated,
             "physical wifi path should validate within timeout",
@@ -1370,133 +1120,10 @@ mod tests {
         conn.close(0u32.into(), b"test done");
     }
 
-    // ── Phase 9-5: classify_path_health（synthetic PathStats、実ネットワーク不要） ──
-    //
-    // `noq::PathStats`/`UdpStats` は `#[non_exhaustive]` なので他クレートからは
-    // 構造体リテラル（`..Default::default()` 併用でも）で作れない。
-    // `Default::default()` してから pub フィールドへ代入する形にする。
-
-    fn stats_with_rtt(rtt: Duration) -> noq::PathStats {
-        let mut stats = noq::PathStats::default();
-        stats.rtt = rtt;
-        stats
-    }
-
-    /// `recvd_datagrams`は受信側カウンタ（`udp_rx.datagrams`）。「送ったのに何も
-    /// 受信していない」＝完全な無応答検出のテストに必要（Phase 9-4b追加調査）。
-    fn stats_with(
-        rtt: Duration, datagrams: u64, recvd_datagrams: u64, lost_packets: u64, black_holes_detected: u64,
-    ) -> noq::PathStats {
-        let mut udp_tx = noq::UdpStats::default();
-        udp_tx.datagrams = datagrams;
-        let mut udp_rx = noq::UdpStats::default();
-        udp_rx.datagrams = recvd_datagrams;
-        let mut stats = noq::PathStats::default();
-        stats.rtt = rtt;
-        stats.udp_tx = udp_tx;
-        stats.udp_rx = udp_rx;
-        stats.lost_packets = lost_packets;
-        stats.black_holes_detected = black_holes_detected;
-        stats
-    }
-
-    #[test]
-    fn low_rtt_first_check_is_healthy() {
-        assert!(classify_path_health(None, &stats_with_rtt(Duration::from_millis(50))));
-    }
-
-    #[test]
-    fn high_rtt_is_degraded() {
-        assert!(!classify_path_health(None, &stats_with_rtt(Duration::from_millis(900))));
-    }
-
-    #[test]
-    fn rtt_at_threshold_boundary_is_still_healthy() {
-        assert!(classify_path_health(None, &stats_with_rtt(DEGRADED_RTT_THRESHOLD)));
-    }
-
-    #[test]
-    fn high_loss_ratio_since_prev_check_is_degraded() {
-        let prev = stats_with(Duration::from_millis(50), 100, 100, 0, 0);
-        // 100 new datagrams sent, 30 lost => 30% loss ratio > 20% threshold
-        let curr = stats_with(Duration::from_millis(50), 200, 170, 30, 0);
-        assert!(!classify_path_health(Some(&prev), &curr));
-    }
-
-    #[test]
-    fn low_loss_ratio_since_prev_check_is_healthy() {
-        let prev = stats_with(Duration::from_millis(50), 100, 100, 0, 0);
-        let curr = stats_with(Duration::from_millis(50), 200, 198, 2, 0); // 2%
-        assert!(classify_path_health(Some(&prev), &curr));
-    }
-
-    #[test]
-    fn new_black_hole_detection_is_degraded() {
-        let prev = stats_with(Duration::from_millis(50), 0, 0, 0, 0);
-        let curr = stats_with(Duration::from_millis(50), 0, 0, 0, 1);
-        assert!(!classify_path_health(Some(&prev), &curr));
-    }
-
-    #[test]
-    fn no_new_datagrams_sent_skips_loss_ratio_check() {
-        // sent_delta == 0 (idle path) must not divide by zero / falsely flag as degraded.
-        let prev = stats_with(Duration::from_millis(50), 100, 100, 5, 0);
-        let curr = stats_with(Duration::from_millis(50), 100, 100, 5, 0);
-        assert!(classify_path_health(Some(&prev), &curr));
-    }
-
-    /// ユーザー提案の検証（synthetic版）: 送ったのに何も受信していなければ、
-    /// loss_ratio/black_holeがまだ増分に反映されていなくても即座にunhealthyと
-    /// 判定できる——captive portal等の「応答が一切返って来ない」状況の直接検出。
-    #[test]
-    fn sent_but_nothing_received_is_zero_response() {
-        let prev = stats_with(Duration::from_millis(50), 100, 100, 0, 0);
-        // sent 10 more datagrams, but udp_rx didn't move at all, and noq hasn't
-        // (yet) counted these as lost_packets/black_holes — that's the whole point.
-        let curr = stats_with(Duration::from_millis(50), 110, 100, 0, 0);
-        assert!(has_zero_response(Some(&prev), &curr));
-        // classify_path_health only looks at rtt/loss-ratio/black-holes, so on its
-        // own this same scenario still reads as "healthy" (that's why callers need
-        // has_zero_response as a separate, stricter signal — see spawn_health_monitor).
-        assert!(classify_path_health(Some(&prev), &curr));
-    }
-
-    #[test]
-    fn received_something_is_not_zero_response() {
-        let prev = stats_with(Duration::from_millis(50), 100, 100, 0, 0);
-        let curr = stats_with(Duration::from_millis(50), 110, 105, 0, 0);
-        assert!(!has_zero_response(Some(&prev), &curr));
-    }
-
-    #[test]
-    fn nothing_sent_is_not_zero_response() {
-        // idle path (sent_delta == 0) must not be flagged as zero-response.
-        let prev = stats_with(Duration::from_millis(50), 100, 100, 0, 0);
-        let curr = stats_with(Duration::from_millis(50), 100, 100, 0, 0);
-        assert!(!has_zero_response(Some(&prev), &curr));
-    }
-
-    #[test]
-    fn first_check_is_never_zero_response() {
-        assert!(!has_zero_response(None, &stats_with(Duration::from_millis(50), 5, 0, 0, 0)));
-    }
-
-    /// `PathBroker`のid⇔候補マッピングとDegraded状態遷移がbroker単体で
-    /// 正しく動くことを確認する（noq接続なしで検証できる部分）。
-    #[test]
-    fn broker_register_and_degraded_transition() {
-        let broker = PathBroker::new();
-        broker.register_path(noq::PathId::ZERO, PathCandidateId::Primary);
-        broker.set(PathCandidateId::Primary, PathState::Validated);
-
-        assert_eq!(broker.candidate_for(noq::PathId::ZERO), Some(PathCandidateId::Primary));
-        assert_eq!(broker.get(PathCandidateId::Primary), PathState::Validated);
-
-        broker.set(PathCandidateId::Primary, PathState::Degraded);
-        assert_eq!(broker.get(PathCandidateId::Primary), PathState::Degraded);
-        // Degraded はValidatedではないので any_validated には数えない。
-        assert!(!broker.any_validated());
-    }
+    // `classify_path_health`/`has_zero_response`のsynthetic PathStatsテスト、および
+    // `PathBroker`単体テスト(旧`broker_register_and_degraded_transition`)は
+    // isekai_transport::path_healthへ移植済み(そちらのunit testと重複するため削除、
+    // isekai-terminal-core/isekai-transport crate共有化)。
 
     /// Phase 9-5実機検証の前段: loopbackで実際に`debug_fault`（既存のフォルト注入
     /// インフラ、`isekai_pipe_quic_transport.rs`/`faulty_udp_socket.rs`と共有）を使って
@@ -1516,8 +1143,8 @@ mod tests {
         let (port, cert_sha256_hex, _secret) = start_test_server().await;
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-        let (conn, broker, _endpoint) = establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
-        assert_eq!(broker.get(PathCandidateId::Primary), PathState::Validated);
+        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
+        assert_eq!(tracker.get(&PRIMARY_LABEL.into()), PathState::Validated);
 
         // DEGRADED_RTT_THRESHOLD(800ms)を大きく超える片道遅延を注入する。
         // noqのRTT平滑化（RFC 9002 のEMA、smoothed_rtt = 7/8*old + 1/8*latest）は
@@ -1528,7 +1155,7 @@ mod tests {
 
         let became_degraded = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if broker.get(PathCandidateId::Primary) == PathState::Degraded {
+                if tracker.get(&PRIMARY_LABEL.into()) == PathState::Degraded {
                     return true;
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1544,7 +1171,7 @@ mod tests {
         crate::debug_fault::shared_injector().set_latency(Duration::ZERO);
         let recovered = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
-                if broker.get(PathCandidateId::Primary) == PathState::Validated {
+                if tracker.get(&PRIMARY_LABEL.into()) == PathState::Validated {
                     return true;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1574,11 +1201,11 @@ mod tests {
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
-        let (conn, broker, _endpoint) =
+        let (conn, tracker, _endpoint) =
             establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, event_tx, injector.clone())
                 .await
                 .unwrap();
-        assert_eq!(broker.get(PathCandidateId::Primary), PathState::Validated);
+        assert_eq!(tracker.get(&PRIMARY_LABEL.into()), PathState::Validated);
 
         // 「WiFiはあるがupstreamが死んでいる」相当: 応答が一切返ってこない状態にする。
         injector.cut();
@@ -1593,7 +1220,7 @@ mod tests {
         .await
         .unwrap_or(false);
         assert!(got_no_viable_path, "NoViablePath should fire once the only path goes fully unresponsive");
-        assert!(!broker.any_validated());
+        assert!(!tracker.any_validated());
 
         conn.close(0u32.into(), b"test done");
     }
@@ -1614,12 +1241,12 @@ mod tests {
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
-        let (conn, broker, endpoint) = establish_multipath_connection(
+        let (conn, tracker, endpoint) = establish_multipath_connection(
             path0, None, Vec::new(), &cert_sha256_hex, event_tx, wifi_injector.clone(),
         )
         .await
         .unwrap();
-        assert_eq!(broker.get(PathCandidateId::Primary), PathState::Validated);
+        assert_eq!(tracker.get(&PRIMARY_LABEL.into()), PathState::Validated);
 
         // rebind前: 通常のecho往復が動くことを確認。
         {

@@ -24,9 +24,7 @@ use russh::client;
 
 use crate::helper_bootstrap::{self, BootstrapError, IsekaiPipeBinaries, IsekaiPipeHandshake, IsekaiPipeP2pMode};
 use crate::isekai_pipe_quic_transport::{
-    self, attach_handshake, compute_proof, establish_quic_connection_with_socket, open_control_stream,
-    spawn_app_ack_tasks, spawn_bootstrap_host_key_forwarder, ISEKAI_PIPE_BIN_AARCH64, ISEKAI_PIPE_BIN_X86_64,
-    ISEKAI_PIPE_VERSION,
+    self, spawn_bootstrap_host_key_forwarder, ISEKAI_PIPE_BIN_AARCH64, ISEKAI_PIPE_BIN_X86_64, ISEKAI_PIPE_VERSION,
 };
 use crate::resume_client::{self, ClientResumeState};
 use crate::transport::{
@@ -216,6 +214,8 @@ async fn bootstrap_via_ssh_with_relay(
         relay_sni: config.relay_sni.clone(),
         relay_jwt: config.relay_jwt.clone(),
     };
+    // relay経路にはSTUNサーバー設定が無いため常に空スライス
+    // (isekai-terminal-core/isekai-ssh crate共有化 Phase 2c)。
     helper_bootstrap::ensure_helper_running(
         &mut established.handle,
         &binaries,
@@ -223,6 +223,7 @@ async fn bootstrap_via_ssh_with_relay(
         "127.0.0.1:22",
         None,
         &p2p_mode,
+        &[],
     )
     .await
     .map_err(|e: BootstrapError| format!("bootstrap failed: {e}"))
@@ -242,18 +243,16 @@ async fn connect_relay_stream(
         .decode(&handshake.session_secret)
         .map_err(|e| format!("invalid session_secret encoding: {e}"))?;
 
-    let socket = crate::faulty_udp_socket::bind_faulty_udp_socket(
-        "0.0.0.0:0".parse().unwrap(),
-        crate::debug_fault::shared_injector(),
-    )
-    .map_err(|e| format!("endpoint bind failed: {e}"))?;
-    let conn = establish_quic_connection_with_socket(socket, helper_addr, &cert_sha256_hex).await?;
-
-    // control stream の CONTROL_HELLO 用 plain proof（ATTACH の transcript 付き proof とは
-    // 別物、`isekai_pipe_quic_transport::attach_handshake` 参照）。
-    let proof = compute_proof(&conn, &session_secret, b"")?;
-
-    let (send, recv) = attach_handshake(&conn, &session_secret).await?;
+    let target = isekai_transport::RelayTarget {
+        helper_addr,
+        server_name: isekai_pipe_quic_transport::QUIC_SERVER_NAME.to_string(),
+        cert_sha256_hex,
+        session_secret,
+    };
+    let factory = crate::android_quic_endpoint::AndroidQuicEndpointFactory;
+    let (conn, data_stream, proof) = isekai_transport::connect_via_relay_with_connection(&factory, &target)
+        .await
+        .map_err(|e| e.to_string())?;
     info!("isekai_link_relay: ATTACH ok — handing off to SSH");
 
     let resume_state = Arc::new(std::sync::Mutex::new(ClientResumeState::new(
@@ -261,18 +260,24 @@ async fn connect_relay_stream(
     )));
 
     {
-        let conn = conn.clone();
-        let proof = proof.to_vec();
         let resume_state = resume_state.clone();
         RUNTIME.spawn(async move {
-            match tokio::time::timeout(CONTROL_STREAM_TIMEOUT, open_control_stream(&conn, &proof)).await {
-                Ok(Ok((csend, crecv, session_id))) => {
+            match tokio::time::timeout(
+                CONTROL_STREAM_TIMEOUT,
+                isekai_transport::resume::open_control_stream(conn.as_ref(), &proof),
+            )
+            .await
+            {
+                Ok(Ok(control)) => {
+                    let session_id = *control.session_id.as_bytes();
                     info!(
                         "isekai_link_relay: control stream established (resume support enabled), session_id={}",
                         session_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
                     );
                     resume_state.lock().unwrap().session_id = Some(session_id);
-                    spawn_app_ack_tasks(csend, crecv, resume_state);
+                    let counters = Arc::new(isekai_transport::resume::AppAckCounters::new());
+                    isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
+                    isekai_pipe_quic_transport::spawn_app_ack_bridge(resume_state, counters);
                 }
                 Ok(Err(e)) => {
                     info!("isekai_link_relay: control stream handshake failed ({e}), continuing without resume support");
@@ -289,43 +294,26 @@ async fn connect_relay_stream(
     // 「NATマッピングが失われて復旧不能」という制約は無い——relay自体への到達性が
     // 保たれている限り、何度でも同じアドレスへ繋ぎ直せる。
     let reattach_fn: resume_client::ReattachFn = Arc::new(move |session_id, client_sent_offset, client_delivered_offset| {
-        let cert_sha256_hex = cert_sha256_hex.clone();
-        let session_secret = session_secret.clone();
+        let factory = crate::android_quic_endpoint::AndroidQuicEndpointFactory;
+        let target = target.clone();
         Box::pin(async move {
-            let conn = isekai_pipe_quic_transport::establish_quic_connection_with_socket(
-                crate::faulty_udp_socket::bind_faulty_udp_socket(
-                    "0.0.0.0:0".parse().unwrap(),
-                    crate::debug_fault::shared_injector(),
-                )
-                .map_err(|e| format!("endpoint bind failed: {e}"))?,
-                helper_addr,
-                &cert_sha256_hex,
+            let outcome = isekai_transport::resume::reconnect_and_resume(
+                &factory,
+                &target,
+                isekai_transport::SessionId::from_bytes(session_id),
+                isekai_transport::C2hSentOffset::new(client_sent_offset),
+                isekai_transport::H2cClientDeliveredOffset::new(client_delivered_offset),
             )
-            .await?;
-            let resume_proof = compute_proof(&conn, &session_secret, &session_id)?;
-
-            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi (resume) failed: {e}"))?;
-            let mut frame = vec![resume_client::RESUME];
-            frame.extend_from_slice(&session_id);
-            frame.extend_from_slice(&resume_proof);
-            frame.extend_from_slice(&client_sent_offset.to_be_bytes());
-            frame.extend_from_slice(&client_delivered_offset.to_be_bytes());
-            send.write_all(&frame).await.map_err(|e| format!("RESUME write failed: {e}"))?;
-
-            let mut resp = [0u8; 1];
-            recv.read_exact(&mut resp).await.map_err(|e| format!("RESUME_ACK read failed: {e}"))?;
-            if resp[0] != resume_client::RESUME_ACK {
-                return Err(format!("isekai-helper rejected resume: {:#x}", resp[0]));
-            }
-            let mut rest = [0u8; 16];
-            recv.read_exact(&mut rest).await.map_err(|e| format!("RESUME_ACK body read failed: {e}"))?;
-            let helper_committed_offset = u64::from_be_bytes(rest[0..8].try_into().unwrap());
-            info!("isekai_link_relay: resume succeeded, helper_committed_offset={helper_committed_offset}");
-            Ok(resume_client::ReattachResult { send, recv, helper_committed_offset })
+            .await
+            .map_err(|e| e.to_string())?;
+            info!("isekai_link_relay: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
+            let (read, write) = outcome.data_stream.split();
+            Ok(resume_client::ReattachResult { read, write, helper_committed_offset: outcome.helper_committed_offset.get() })
         })
     });
 
-    Ok(resume_client::ReattachableStream::new(send, recv, resume_state, reattach_fn))
+    let (data_read, data_write) = data_stream.split();
+    Ok(resume_client::ReattachableStream::new(data_read, data_write, resume_state, reattach_fn))
 }
 
 async fn run_over_stream(

@@ -22,6 +22,7 @@ pub(crate) mod faulty_stream;
 pub(crate) mod faulty_udp_socket;
 pub mod debug_fault;
 pub(crate) mod resume_client;
+pub(crate) mod android_quic_endpoint;
 
 pub use quic_transport::{create_quic_session, QuicConfig, QuicSession};
 pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};

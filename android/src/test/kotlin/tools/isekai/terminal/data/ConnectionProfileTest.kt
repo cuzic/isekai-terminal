@@ -79,17 +79,23 @@ class ConnectionProfileTest {
 
     @Test fun `toIsekaiStunP2pConfig uses configured stunServer verbatim`() {
         val config = profile().copy(stunServer = "stun.example.com:3478").toIsekaiStunP2pConfig(auth)
-        assertEquals("stun.example.com:3478", config.stunServer)
+        assertEquals(listOf("stun.example.com:3478"), config.stunServers)
     }
 
     @Test fun `toIsekaiStunP2pConfig falls back to DEFAULT_STUN_SERVER when stunServer is null`() {
         val config = profile().toIsekaiStunP2pConfig(auth)
-        assertEquals(ConnectionProfile.DEFAULT_STUN_SERVER, config.stunServer)
+        assertEquals(listOf(ConnectionProfile.DEFAULT_STUN_SERVER), config.stunServers)
     }
 
     @Test fun `toIsekaiStunP2pConfig falls back to DEFAULT_STUN_SERVER when stunServer is blank`() {
         val config = profile().copy(stunServer = "   ").toIsekaiStunP2pConfig(auth)
-        assertEquals(ConnectionProfile.DEFAULT_STUN_SERVER, config.stunServer)
+        assertEquals(listOf(ConnectionProfile.DEFAULT_STUN_SERVER), config.stunServers)
+    }
+
+    @Test fun `toIsekaiStunP2pConfig splits comma-separated stunServer into multiple entries`() {
+        val config = profile().copy(stunServer = "stun.example.com:3478, stun2.example.com:3478")
+            .toIsekaiStunP2pConfig(auth)
+        assertEquals(listOf("stun.example.com:3478", "stun2.example.com:3478"), config.stunServers)
     }
 
     @Test fun `toIsekaiStunP2pConfig has no jump when jumpAuth is not supplied`() {

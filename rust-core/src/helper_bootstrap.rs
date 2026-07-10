@@ -14,7 +14,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use base64::Engine as _;
-use isekai_protocol::handshake::decode_handshake_json;
+use isekai_bootstrap::client_candidates::fresh_bootstrap_request_v2;
+use isekai_protocol::bootstrap_request::decode_bootstrap_report_v2;
 use log::{info, warn};
 use russh::{client, ChannelMsg};
 use sha2::{Digest, Sha256};
@@ -28,7 +29,8 @@ use crate::transport::RusshEventHandler;
 // `validate_relay_jwt`も同モジュール由来（セキュリティレビュー #57、同じ理由で
 // `isekai-bootstrap::openssh`と共有する）。
 use isekai_protocol::bootstrap::{
-    shell_single_quote, validate_relay_jwt, validate_relay_sni, HANDSHAKE_POLL_ATTEMPTS,
+    classify_launch_failure as classify_launch_failure_shared, remote_parent_dir, shell_single_quote,
+    upload_binary_command, validate_relay_jwt, validate_relay_sni, LaunchFailureClass, HANDSHAKE_POLL_ATTEMPTS,
     HANDSHAKE_POLL_INTERVAL_MS, ISEKAI_PIPE_BIN_NAME, ISEKAI_PIPE_INSTALL_DIR,
 };
 
@@ -71,31 +73,18 @@ pub enum BootstrapError {
 const NO_HANDSHAKE_MARKER: &str = "__ISEKAI_HELPER_NO_HANDSHAKE__";
 
 /// `NO_HANDSHAKE_MARKER`とともに返されたisekai-helperのstderrログを見て、
-/// `--bind`固定ポート指定時のUDP bind失敗かどうかを分類する。マッチする既知の
-/// パターンが無ければ(または`bind_port`が指定されていなければ)従来通り
-/// `HandshakeTimeout`のままにする(固定ポート指定と無関係なクラッシュまで
-/// bind失敗として誤分類しないため)。
-///
-/// `isekai-helper`は常にmusl静的リンクバイナリとして配布される(`build-isekai-helper-musl.sh`)。
-/// musl libcの`strerror()`はglibcと文言が異なる場合があり、実際`EADDRINUSE`はglibcでは
-/// "Address already in use"だがmuslでは"Address in use"("already"が無い)になることを
-/// 実機E2Eテストで確認した(開発機のglibc環境で書いた元のパターンは、実際に配布される
-/// muslバイナリの出力に一度もマッチしていなかった)。他の2パターン("Permission denied"/
-/// "Address not available")は偶然glibc/musl間で表記が一致していたため気づかれていなかった。
+/// `--bind`固定ポート指定時のUDP bind失敗かどうかを分類する。実際のパターン
+/// マッチング(musl/glibc `strerror()`文言差異への対応含む)は`isekai-bootstrap::openssh`
+/// と共有の`isekai_protocol::bootstrap::classify_launch_failure`に一本化されている。
 fn classify_launch_failure(log_text: &str, bind_port: Option<u16>) -> BootstrapError {
     let Some(port) = bind_port else {
         return BootstrapError::HandshakeTimeout;
     };
-    if log_text.contains("Address already in use") || log_text.contains("Address in use") {
-        BootstrapError::BindPortInUse(port)
-    } else if log_text.contains("Permission denied") {
-        BootstrapError::BindPermissionDenied(port)
-    } else if log_text.contains("Cannot assign requested address")
-        || log_text.contains("Address not available")
-    {
-        BootstrapError::BindAddressUnavailable(port)
-    } else {
-        BootstrapError::HandshakeTimeout
+    match classify_launch_failure_shared(log_text, true) {
+        LaunchFailureClass::BindPortInUse => BootstrapError::BindPortInUse(port),
+        LaunchFailureClass::BindPermissionDenied => BootstrapError::BindPermissionDenied(port),
+        LaunchFailureClass::BindAddressUnavailable => BootstrapError::BindAddressUnavailable(port),
+        LaunchFailureClass::Unknown => BootstrapError::HandshakeTimeout,
     }
 }
 
@@ -250,12 +239,8 @@ async fn upload_binary(
     binary: &[u8],
 ) -> Result<(), BootstrapError> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
-    let cmd = format!(
-        "umask 077 && mkdir -p {ISEKAI_PIPE_INSTALL_DIR} && \
-         base64 -d > {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}.tmp && \
-         chmod 0700 {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}.tmp && \
-         mv {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}.tmp {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}"
-    );
+    let remote_binary_path = format!("{ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME}");
+    let cmd = upload_binary_command(&remote_binary_path, remote_parent_dir(&remote_binary_path));
     let (stdout, exit_status) = run_exec(session, &cmd, Some(encoded.as_bytes())).await?;
     if exit_status != Some(0) {
         return Err(BootstrapError::Upload(format!(
@@ -275,6 +260,7 @@ async fn launch_and_capture_handshake(
     ssh_relay_target: &str,
     bind_port: Option<u16>,
     p2p_mode: &IsekaiPipeP2pMode,
+    stun_servers: &[SocketAddr],
 ) -> Result<IsekaiPipeHandshake, BootstrapError> {
     // ファイル権限は 0700(dir)/0600(handshake ファイル) を umask で保証する
     // （HELPER_PROTOCOL.md「Bootstrap file permissions」契約）。
@@ -357,9 +343,35 @@ async fn launch_and_capture_handshake(
             )
         }
     };
-    // relay_jwtがある場合のみ、起動前にexecチャネルのstdinから読み取って
-    // `$tmpdir/relay_jwt`へ保存する(0600、`umask 077`により保証)。
-    let write_jwt_step = if jwt_stdin.is_some() { "cat > $tmpdir/relay_jwt && " } else { "" };
+    // Phase 2c(isekai-terminal-core/isekai-ssh crate共有化): `isekai-bootstrap::openssh`の
+    // `#20a`/`#20b`と同じ`BootstrapRequestV2`封筒を常に送る。`stun_servers`(呼び出し元の
+    // `IsekaiPipeP2pMode::Stun`が使うSTUNサーバー一覧、Relay/None起動では空スライス)を
+    // 問い合わせて集めた`client_candidates`を載せることで、単一の`--punch-peer`だけでなく
+    // 複数STUNサーバー分の観測アドレスをサーバー側の穴あけprobe対象に加えられる
+    // (`isekai-pipe/src/engine/mod.rs`の`client_candidate_punch_targets`)。
+    let bootstrap_request = fresh_bootstrap_request_v2(stun_servers).await;
+    let request_bytes = serde_json::to_vec(&bootstrap_request).expect("BootstrapRequestV2 always serializes");
+    let request_len = request_bytes.len();
+
+    // relay_jwtがある場合は、リクエストJSONに続けて同じstdinから読み取り
+    // `$tmpdir/relay_jwt`へ保存する(0600、`umask 077`により保証)。`head -c`で
+    // それぞれの長さ分だけを切り出し、`wc -c`で切り詰められていないことを確認する
+    // (`isekai-bootstrap::openssh::launch_and_capture_handshake`と同じ手順、
+    // stdinが接続断で中断された場合に不完全なファイルのまま起動してしまうのを防ぐ)。
+    let write_jwt_step = match &jwt_stdin {
+        Some(jwt) => {
+            let jwt_len = jwt.len();
+            format!(
+                "head -c {jwt_len} > $tmpdir/relay_jwt && \
+                 [ \"$(wc -c < $tmpdir/relay_jwt)\" -eq {jwt_len} ] && "
+            )
+        }
+        None => String::new(),
+    };
+    let stdin_payload: Vec<u8> = match &jwt_stdin {
+        Some(jwt) => [request_bytes.as_slice(), jwt.as_slice()].concat(),
+        None => request_bytes.clone(),
+    };
     let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
     // ハンドシェイクが空のまま(=isekai-helperが起動直後にクラッシュした等)なら、
     // ハンドシェイクJSONの代わりにマーカー行+stderrログを返す。呼び出し側
@@ -367,8 +379,11 @@ async fn launch_and_capture_handshake(
     // ようにする(単なる`cat`の空出力だけでは原因が一切わからないため)。
     let launch_cmd = format!(
         "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
+         head -c {request_len} > $tmpdir/bootstrap-request.json && \
+         [ \"$(wc -c < $tmpdir/bootstrap-request.json)\" -eq {request_len} ] && \
          {write_jwt_step}\
-         ( setsid {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} serve {bind_arg}{p2p_arg}--target {quoted_target} \
+         ( setsid {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} serve {bind_arg}{p2p_arg}\
+         --bootstrap-request-file $tmpdir/bootstrap-request.json --target {quoted_target} \
          </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
          for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
            [ -s $tmpdir/handshake ] && break; \
@@ -378,7 +393,7 @@ async fn launch_and_capture_handshake(
          else echo {NO_HANDSHAKE_MARKER}; cat $tmpdir/log 2>/dev/null; fi"
     );
 
-    let (stdout, _exit_status) = run_exec(session, &launch_cmd, jwt_stdin.as_deref()).await?;
+    let (stdout, _exit_status) = run_exec(session, &launch_cmd, Some(&stdin_payload)).await?;
     let mut lines = stdout.split(|&b| b == b'\n').filter(|line| !line.is_empty());
     let first_line = lines.next().ok_or(BootstrapError::HandshakeTimeout)?;
 
@@ -390,12 +405,13 @@ async fn launch_and_capture_handshake(
         return Err(classify_launch_failure(&log_text, bind_port));
     }
 
-    // `decode_handshake_json` は素の `serde_json::from_slice` と違い、サイズ上限・
-    // `v`/`cert_sha256`/`session_secret`/`listen_port` のフォーマット検証も行う
-    // （isekai-protocol crate、`isekai_protocol::handshake` のdocコメント参照）。
-    // isekai-helper からの応答は SSH exec 経由の外部入力なので、この検証強化は
-    // 素直に恩恵がある。
-    decode_handshake_json(first_line).map_err(|e| BootstrapError::HandshakeParse(e.to_string()))
+    // 常に`BootstrapRequestV2`を送っているため、応答は必ず`BootstrapReportV2`封筒
+    // （`isekai-pipe/src/engine/mod.rs`、`#20a-4`）。内側の`handshake`を取り出す。
+    // `decode_bootstrap_report_v2`はサイズ上限・フォーマット検証を行う
+    // （SSH exec経由の外部入力に対する検証強化、isekai-protocol crate参照）。
+    decode_bootstrap_report_v2(first_line)
+        .map(|report| report.handshake)
+        .map_err(|e| BootstrapError::HandshakeParse(e.to_string()))
 }
 
 /// isekai-helper が起動していることを保証し、ハンドシェイクを返す。
@@ -407,6 +423,7 @@ pub async fn ensure_helper_running(
     ssh_relay_target: &str,
     bind_port: Option<u16>,
     p2p_mode: &IsekaiPipeP2pMode,
+    stun_servers: &[SocketAddr],
 ) -> Result<IsekaiPipeHandshake, BootstrapError> {
     // チェックサム検証(セキュリティレビュー #67)には、既存インストール確認より前に
     // アーキテクチャを知る必要がある(比較対象のバイナリを選ぶため)。以前は
@@ -426,7 +443,7 @@ pub async fn ensure_helper_running(
 
     match tokio::time::timeout(
         Duration::from_secs(10),
-        launch_and_capture_handshake(session, ssh_relay_target, bind_port, p2p_mode),
+        launch_and_capture_handshake(session, ssh_relay_target, bind_port, p2p_mode, stun_servers),
     )
     .await
     {
@@ -516,7 +533,7 @@ mod tests {
         };
 
         let handshake =
-            ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None, &IsekaiPipeP2pMode::None)
+            ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None, &IsekaiPipeP2pMode::None, &[])
                 .await
                 .expect("bootstrap failed");
         assert_eq!(handshake.v, 1);
@@ -526,7 +543,7 @@ mod tests {
         // 2回目呼び出し: バイナリは既にインストール済みのはずなので、
         // アップロードをスキップしても正常にハンドシェイクを取得できることを確認する。
         let handshake2 =
-            ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None, &IsekaiPipeP2pMode::None)
+            ensure_helper_running(&mut session, &binaries, "0.1.0", "127.0.0.1:22", None, &IsekaiPipeP2pMode::None, &[])
                 .await
                 .expect("second bootstrap call failed");
         assert_eq!(handshake2.v, 1);
@@ -552,7 +569,7 @@ mod tests {
         // OSに割り当てられたエフェメラルレンジと衝突しにくい高番ポートを使う。
         let fixed_port: u16 = 58123;
         let handshake = ensure_helper_running(
-            &mut session, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &IsekaiPipeP2pMode::None,
+            &mut session, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &IsekaiPipeP2pMode::None, &[],
         )
         .await
         .expect("bootstrap with fixed bind port failed");
@@ -578,7 +595,7 @@ mod tests {
 
         let fixed_port: u16 = 58124;
         let _handshake1 = ensure_helper_running(
-            &mut session1, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &IsekaiPipeP2pMode::None,
+            &mut session1, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &IsekaiPipeP2pMode::None, &[],
         )
         .await
         .expect("first session should bind the fixed port successfully");
@@ -588,7 +605,7 @@ mod tests {
         // のみ行い実行中プロセスの有無は見ないため、新しいisekai-helperプロセスが
         // 起動を試み、bindの時点で衝突するはず。
         let second_result = ensure_helper_running(
-            &mut session2, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &IsekaiPipeP2pMode::None,
+            &mut session2, &binaries, "0.1.0", "127.0.0.1:22", Some(fixed_port), &IsekaiPipeP2pMode::None, &[],
         )
         .await;
 

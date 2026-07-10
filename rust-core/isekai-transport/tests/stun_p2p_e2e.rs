@@ -24,7 +24,7 @@ use isekai_protocol::attach::{
     AttachRejectReason, AttachResponse, AttachToken, ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,
 };
 use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
-use isekai_transport::{connect_stun_p2p, CandidateIdentity, StunP2pTarget, TransportError};
+use isekai_transport::{connect_stun_p2p, CandidateIdentity, StunP2pTarget, SystemQuicEndpointFactory, TransportError};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
@@ -191,7 +191,10 @@ async fn connect_stun_p2p_completes_stun_probe_and_hello_ack_over_a_real_quic_co
         session_secret,
     };
 
-    let mut connection = tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p(stun_server, &target, TEST_IDENTITY))
+    let mut connection = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_stun_p2p(&SystemQuicEndpointFactory, stun_server, &target, TEST_IDENTITY),
+    )
         .await
         .expect("connect_stun_p2p should not hang")
         .expect("connect_stun_p2p should complete STUN + probes + HELLO/ACK over a real QUIC connection");
@@ -234,7 +237,12 @@ async fn connect_stun_p2p_surfaces_reject_auth_for_a_wrong_session_secret() {
         session_secret: b"client-side-secret-does-not-match".to_vec(),
     };
 
-    match tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p(stun_server, &target, TEST_IDENTITY)).await {
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_stun_p2p(&SystemQuicEndpointFactory, stun_server, &target, TEST_IDENTITY),
+    )
+    .await
+    {
         Ok(Ok(_conn)) => panic!("a mismatched session_secret must be rejected, but it succeeded"),
         Ok(Err(err)) => {
             assert!(matches!(err, TransportError::Rejected(AttachRejectReason::Auth)), "got: {err:?}")
@@ -261,7 +269,12 @@ async fn connect_stun_p2p_fails_fast_when_the_stun_server_is_unreachable() {
         session_secret: b"unused".to_vec(),
     };
 
-    match tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p(dead_stun_server, &target, TEST_IDENTITY)).await {
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_stun_p2p(&SystemQuicEndpointFactory, dead_stun_server, &target, TEST_IDENTITY),
+    )
+    .await
+    {
         Ok(Ok(_conn)) => panic!("an unreachable STUN server must fail the connection, but it succeeded"),
         Ok(Err(err)) => assert!(matches!(err, TransportError::Stun(_)), "got: {err:?}"),
         Err(_) => panic!("connect_stun_p2p should fail fast rather than hang forever"),

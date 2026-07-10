@@ -25,7 +25,18 @@ thiserror = "2.0.18"
 log = "0.4"
 # BackoffPolicyのジッター計算（呼び出し元がRNGを渡す設計、purityを保つ）。
 rand = "0.8"
+# 物理インタフェース列挙・束縛(physical_interface.rs、QuicEndpointRebinder::
+# rebind_socketのCLI/PC側実装)。`discovery` featureでnetdev経由のインタフェース
+# 列挙(`quicsock::discovery`)も使う。
+# quicsock-noq(ソケットfan-out)は依存に含めない — それが要るのは同一QUIC接続で
+# 複数の物理インタフェースを同時保持する方式(noq issue #738で断念済み、
+# path_health.rs/multipath.rsのdoc参照)だけで、今回採用したrebind方式には不要。
+quicsock = { path = "../quicsock", features = ["discovery"] }
+# `noq::Connection::path_events()`のStream実装をpollするために使う
+# (multipath.rs、isekai-terminal-coreのmultipath_transport.rsと同じ用途)。
+tokio-stream = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 rcgen = "0.13"
+env_logger = "0.11"

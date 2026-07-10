@@ -1,6 +1,20 @@
 [workspace]
-members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe"]
+members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "quicsock"]
 resolver = "2"
+
+# quicsock(/home/cuzic/quicsockからvendor。isekai-transportへのマルチパス移植の
+# うち、物理インタフェース束縛層 — `isekai-transport::physical_interface`)は
+# `*.workspace = true`でこれらを継承する。vendor元のCargo.tomlをそのまま保つ
+# ための最小限のセクションで、既存クレートはどれもこれを参照していない。
+# (quicsock-noqも同時にvendorしていたが、それが要る「同一QUIC接続で複数の
+# 物理インタフェースを同時保持する」方式はnoq issue #738で断念済みのため
+# 未使用のまま残さず削除した — isekai-transport/src/multipath.rsのdoc参照。)
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cuzic/quicsock"
 
 [package]
 name = "isekai-terminal-core"
@@ -53,6 +67,17 @@ isekai-stun = { path = "isekai-stun" }
 # Phase S-0f: HELLO/proof/ACK・handshake JSON の型は isekai-protocol (pure crate)
 # を SSOT にする。ISEKAI_SSH_DESIGN.md「共有ロジックの crate 分割」参照。
 isekai-protocol = { path = "isekai-protocol" }
+# Phase 2c(isekai-terminal-core/isekai-ssh crate共有化): クライアント側STUN candidate
+# 収集ロジック(client_candidates::fresh_bootstrap_request_v2)をisekai-ssh CLIと共有する。
+# isekai-bootstrapはisekai-terminal-core/UniFFI/Android専用型に一切依存しないpure寄りの
+# crateなので、この一方向依存は循環しない。
+isekai-bootstrap = { path = "isekai-bootstrap" }
+# Phase 1b(isekai-terminal-core/isekai-transport crate共有化): QUIC接続確立/resume
+# ロジックの共有先。android_quic_endpoint.rsがQuicEndpointFactory等のtraitを
+# FaultyUdpSocket向けに実装し、Phase 1cで実際の接続経路(quic/relay/stun_p2p)を
+# これ経由に置き換える。isekai-transportはisekai-terminal-core/UniFFI/Android専用型に
+# 一切依存しないpure寄りのcrateなので、この一方向依存は循環しない。
+isekai-transport = { path = "isekai-transport" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"

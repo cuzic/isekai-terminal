@@ -115,8 +115,9 @@ pub async fn race_direct_and_relay(
     let generation = ConnectionGeneration::INITIAL;
 
     let direct_identity = CandidateIdentity { kind: "stun-p2p", source: "race", provider: "race", id: "direct" };
-    let mut direct_fut =
-        Box::pin(connect_stun_p2p_with_round(targets.stun_server, &targets.direct, session_id, generation, direct_identity));
+    let mut direct_fut = Box::pin(connect_stun_p2p_with_round(
+        factory, targets.stun_server, &targets.direct, session_id, generation, direct_identity,
+    ));
 
     let relay_identity = CandidateIdentity { kind: "relay", source: "race", provider: "race", id: "relay" };
 

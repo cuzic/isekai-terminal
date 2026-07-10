@@ -111,7 +111,50 @@ impl ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-fn client_config_for(cert_sha256_hex: &str) -> Result<(noq::ClientConfig, Arc<Mutex<Option<(String, String)>>>), TransportError> {
+/// Builds a `noq::ClientConfig` pinned to `cert_sha256_hex` (see
+/// [`PinnedCertVerifier`]) with this crate's fixed idle-timeout/keepalive/
+/// stream-limit tuning. `pub` (not crate-private) so `isekai-terminal-core`'s
+/// own `QuicEndpoint` adapter (`rust-core/src/android_quic_endpoint.rs`) can
+/// reuse the exact same TLS/transport config instead of keeping its own
+/// near-identical copy (isekai-terminal-core/isekai-transport crate共有化
+/// Phase 1b) — this function has no Android-specific or CLI-specific
+/// dependency, only `noq`/`rustls`, so widening its visibility doesn't cross
+/// the "no Android/UniFFI types in this crate" boundary the module docs
+/// describe.
+///
+/// `multipath`: whether to advertise noq's multipath extension
+/// (`TransportConfig::max_concurrent_multipath_paths`) — required on *both*
+/// sides of a connection before `noq::Connection::open_path` will do
+/// anything but fail with "multipath extension not negotiated" (confirmed
+/// via `multipath::connect_multipath`'s own e2e test). This is *also* a
+/// prerequisite for `noq::Endpoint::rebind`'s own connection-migration
+/// (PATH_CHALLENGE/PATH_RESPONSE) validation to succeed rather than hang
+/// (confirmed via `rebind_e2e.rs` — without it, rebinding a live connection
+/// onto a new socket silently breaks it) — so `SystemQuicEndpoint::connect`
+/// passes `true` unconditionally: any connection it makes might later go
+/// through its own `rebinder()` (`isekai-pipe`'s `--experimental-network-
+/// rebind`), and `isekai-pipe serve`'s own server-side `TransportConfig`
+/// (`isekai-pipe/src/engine/mod.rs`) already negotiates this unconditionally
+/// too, for the identical reason ("既存clientはopen_path()を呼ばないため影響なし",
+/// Phase 9-1) — a client that doesn't negotiate it back was the one actual
+/// asymmetry, not a deliberate opt-in. `android_quic_endpoint.rs` is the one
+/// caller that still passes `false`: `AndroidQuicEndpoint::rebinder()` is
+/// unconditionally `None` (Android's own `multipath_transport.rs` handles
+/// physical-interface failover through its own mechanism, not this trait —
+/// see that type's docs), so there is nothing on the Android side that could
+/// ever call `rebind()` through this path to make multipath negotiation
+/// worth the (harmless, but non-zero) extra transport parameter.
+///
+/// Also returns a `mismatch` slot (`ISEKAI_PIPE_DESIGN.md` §8 Epic N):
+/// `PinnedCertVerifier` records `(expected, got)` there right before
+/// returning `Err` on a cert-pin mismatch, since `ServerCertVerifier`'s
+/// trait-fixed return type can't carry a typed `TransportError` directly —
+/// `SystemQuicEndpoint::connect` checks this slot after a handshake failure
+/// to recover `TransportError::CertPinMismatch`.
+pub fn client_config_for(
+    cert_sha256_hex: &str,
+    multipath: bool,
+) -> Result<(noq::ClientConfig, Arc<Mutex<Option<(String, String)>>>), TransportError> {
     let mismatch = Arc::new(Mutex::new(None));
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -140,6 +183,12 @@ fn client_config_for(cert_sha256_hex: &str) -> Result<(noq::ClientConfig, Arc<Mu
         noq::IdleTimeout::try_from(CLIENT_MAX_IDLE_TIMEOUT).expect("valid idle timeout"),
     ));
     transport.keep_alive_interval(Some(CLIENT_KEEP_ALIVE_INTERVAL));
+    if multipath {
+        // Matches `multipath_transport.rs::build_pinned_client_config`'s value —
+        // no product requirement drove "8" specifically, just "more than the
+        // 1 primary + a small number of secondaries this crate opens".
+        transport.max_concurrent_multipath_paths(8);
+    }
 
     let mut client_config = noq::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(transport));
@@ -187,6 +236,11 @@ impl QuicEndpointFactory for SystemQuicEndpointFactory {
 
         quic_endpoint_from_std_socket(std_socket)
     }
+
+    async fn wrap_bound_socket(&self, socket: tokio::net::UdpSocket) -> Result<Box<dyn QuicEndpoint>, TransportError> {
+        let std_socket = socket.into_std().map_err(|e| TransportError::SocketSetup(e.to_string()))?;
+        quic_endpoint_from_std_socket(std_socket)
+    }
 }
 
 struct SystemQuicEndpoint {
@@ -196,7 +250,7 @@ struct SystemQuicEndpoint {
 #[async_trait]
 impl QuicEndpoint for SystemQuicEndpoint {
     async fn connect(&self, remote: RemoteSpec) -> Result<Box<dyn QuicConnection>, TransportError> {
-        let (client_config, mismatch) = client_config_for(&remote.cert_sha256_hex)?;
+        let (client_config, mismatch) = client_config_for(&remote.cert_sha256_hex, true)?;
         info!("isekai-transport: connecting to {}", remote.addr);
         let conn = self
             .endpoint
@@ -229,25 +283,24 @@ impl QuicEndpoint for SystemQuicEndpoint {
 /// [`noq::Endpoint::rebind`], the same operation
 /// `multipath_transport.rs`'s Android code exercises (both on real hardware
 /// and in loopback tests) as `Endpoint::rebind_abstract()`. This uses the
-/// plain `rebind()` overload instead (a `std::net::UdpSocket`, not a custom
-/// `AsyncUdpSocket` impl) since all this needs is "hand it a fresh, plainly-
-/// bound socket" — there is no per-path fan-out logic to plug in here the
-/// way `quicsock-noq`'s `MultiPathSocket` has for Android's physical-
-/// interface case.
+/// plain `rebind()` overload (a `std::net::UdpSocket`, not a custom
+/// `AsyncUdpSocket` impl) since all this needs is "hand it an already-bound
+/// socket" — the caller (`QuicEndpointRebinder::rebind_socket`'s caller)
+/// decides how that socket got bound (a plain ephemeral port via
+/// [`QuicEndpointRebinder::rebind`]'s default impl, or a specific physical
+/// interface via `physical_interface::bind_physical_interface`).
 ///
 /// `noq::Endpoint::rebind`'s own doc comment: "On error, the old UDP socket
-/// is retained" — a failed [`QuicEndpointRebinder::rebind`] call through
-/// this type never leaves the endpoint in a half-switched state; the
-/// connection keeps using whatever socket it had before the attempt.
+/// is retained" — a failed [`QuicEndpointRebinder::rebind_socket`] call
+/// through this type never leaves the endpoint in a half-switched state;
+/// the connection keeps using whatever socket it had before the attempt.
 struct SystemQuicEndpointRebinder {
     endpoint: noq::Endpoint,
 }
 
 #[async_trait]
 impl QuicEndpointRebinder for SystemQuicEndpointRebinder {
-    async fn rebind(&self, bind: BindSpec) -> Result<(), TransportError> {
-        let socket = std::net::UdpSocket::bind(bind.local_addr)
-            .map_err(|source| TransportError::Bind { addr: bind.local_addr, source })?;
+    async fn rebind_socket(&self, socket: std::net::UdpSocket) -> Result<(), TransportError> {
         self.endpoint.rebind(socket).map_err(|e| TransportError::Rebind(e.to_string()))
     }
 }

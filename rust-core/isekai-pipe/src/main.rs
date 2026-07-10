@@ -456,6 +456,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
         .context("isekai-pipe connect: relay transport failed"),
         CandidateRoute::StunP2p { cert_pin, peer_addr, stun_server, server_name } => {
             let stun_result = connect_stun_p2p(
+                &SystemQuicEndpointFactory,
                 *stun_server,
                 &StunP2pTarget {
                     peer_addr: *peer_addr,
@@ -1113,7 +1114,7 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
             session_secret,
         };
         let candidates = vec![SequentialStunCandidate { stun_server, candidate_id: "probe".to_string() }];
-        let stun_result = connect_stun_p2p_with_fallback(&target, &candidates).await;
+        let stun_result = connect_stun_p2p_with_fallback(&SystemQuicEndpointFactory, &target, &candidates).await;
         let stale_trust_suspected = stun_result.as_ref().err().is_some_and(|e| e.is_stale_trust_signal());
         let (handshake, target_reachability) = match stun_result {
             Ok(_established) => (ProbeStageStatus::Ok { detail: None }, ProbeStageStatus::Ok { detail: None }),
@@ -1277,7 +1278,7 @@ async fn run_relay_resumable_with_fallback(
 /// straight into `relay_stdio`, exactly like the legacy single-candidate path
 /// already does.
 async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidates: &[SequentialStunCandidate]) -> Result<()> {
-    let (connection, _winning_stun_server) = connect_stun_p2p_with_fallback(target, candidates)
+    let (connection, _winning_stun_server) = connect_stun_p2p_with_fallback(&SystemQuicEndpointFactory, target, candidates)
         .await
         .map_err(attach_stale_trust_signal)?;
     relay_stdio(connection.stream).await
@@ -2495,7 +2496,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl QuicEndpointRebinder for MockRebinder {
-        async fn rebind(&self, _bind: BindSpec) -> Result<(), isekai_transport::TransportError> {
+        async fn rebind_socket(&self, _socket: std::net::UdpSocket) -> Result<(), isekai_transport::TransportError> {
             if self.should_succeed {
                 Ok(())
             } else {
