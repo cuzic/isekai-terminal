@@ -88,6 +88,15 @@ pub enum TransportError {
     /// directly) — see `system.rs`'s `client_config_for`/`SystemQuicEndpoint::connect`.
     #[error("isekai-helper cert pin mismatch: expected {expected} got {got}")]
     CertPinMismatch { expected: String, got: String },
+
+    /// The `QuicEndpointFactory`/`QuicEndpoint` implementation has no
+    /// meaningful way to perform this operation at all (as opposed to
+    /// attempting it and failing) — e.g.
+    /// `QuicEndpointFactory::wrap_bound_socket` on a QMux-over-TCP endpoint
+    /// (`qmux_relay::QmuxQuicEndpointFactory`), which has no UDP socket
+    /// concept to wrap in the first place.
+    #[error("{operation} is not supported by this QUIC engine: {reason}")]
+    Unsupported { operation: &'static str, reason: &'static str },
 }
 
 impl TransportError {

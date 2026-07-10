@@ -79,6 +79,8 @@ pub mod multipath;
 pub mod path_health;
 pub mod physical_interface;
 pub mod proof;
+#[cfg(feature = "qmux-relay")]
+pub mod qmux_relay;
 pub mod race;
 pub mod relay;
 pub mod resume;
@@ -107,6 +109,8 @@ pub use path_health::{
     PathHealthTracker, PathLabel, PathState,
 };
 pub use proof::compute_proof;
+#[cfg(feature = "qmux-relay")]
+pub use qmux_relay::{QmuxQuicEndpointFactory, QMUX_ALPN};
 pub use relay::{connect_via_relay, connect_via_relay_with_connection, RelayTarget};
 pub use resume::{
     connect_via_relay_resumable, connect_via_relay_resumable_with_fallback, open_control_stream,

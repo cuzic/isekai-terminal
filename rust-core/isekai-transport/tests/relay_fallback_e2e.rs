@@ -44,6 +44,13 @@ const SNI: &str = "isekai-pipe.local";
 const SESSION_SECRET: &[u8] = b"relay-fallback-test-session-secret";
 
 fn generate_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>, String) {
+    // The `qmux-relay` feature links `aws-lc-rs` alongside noq's own
+    // `ring`, so rustls can no longer auto-select a single process-wide
+    // crypto provider when this crate is built with that feature on —
+    // every test in this file calls `generate_cert` first, so fixing it
+    // once here covers all of them.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cert = rcgen::generate_simple_self_signed(vec![SNI.to_string()]).unwrap();
     let cert_der = CertificateDer::from(cert.cert);
     let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());

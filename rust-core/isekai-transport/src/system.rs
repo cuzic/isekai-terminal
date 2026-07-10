@@ -47,8 +47,13 @@ const CLIENT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// ephemeral self-signed cert, so ordinary CA validation cannot apply; the
 /// fingerprint itself is the trust root, delivered out-of-band over the
 /// bootstrap SSH channel (`HandshakeJson::cert_sha256`).
+/// `pub(crate)` (not private) so `qmux_relay.rs`'s manually-driven TLS
+/// handshake (`qmux::Session::connect` needs a raw `tokio_rustls::TlsStream`,
+/// not a `noq::ClientConfig`, so it can't go through [`client_config_for`])
+/// can reuse the exact same cert-pinning logic instead of duplicating a
+/// security-sensitive verifier.
 #[derive(Debug)]
-struct PinnedCertVerifier {
+pub(crate) struct PinnedCertVerifier {
     expected_sha256_hex: String,
     provider: Arc<rustls::crypto::CryptoProvider>,
     /// Set right before returning `Err` on a mismatch, since
@@ -59,6 +64,19 @@ struct PinnedCertVerifier {
     /// reason (`ISEKAI_PIPE_DESIGN.md` §8 Epic N) — the TLS behavior itself
     /// (still returning `Err`, aborting the handshake) is unchanged.
     mismatch: Arc<Mutex<Option<(String, String)>>>,
+}
+
+impl PinnedCertVerifier {
+    /// `pub(crate)` constructor — see the struct's own doc comment for why
+    /// `qmux_relay.rs` needs this instead of going through
+    /// [`client_config_for`].
+    pub(crate) fn new(
+        expected_sha256_hex: String,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+        mismatch: Arc<Mutex<Option<(String, String)>>>,
+    ) -> Self {
+        Self { expected_sha256_hex, provider, mismatch }
+    }
 }
 
 impl ServerCertVerifier for PinnedCertVerifier {

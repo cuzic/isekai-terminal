@@ -19,6 +19,15 @@ tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 # （ISEKAI_SSH_DESIGN.md「FaultyUdpSocket（Android専用フォルト注入ソケット）の扱い」節）。
 noq = { version = "1.0.1", features = ["rustls", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# `qmux-relay`(既定OFF、opt-in): UDP遮断環境向けのQMux-over-TLS-over-TCP経路
+# (`qmux_relay.rs`)。crates.io版qmux(0.3.1)はRFC 9221 datagram対応前の
+# スナップショットなので、`h3-qmux`/`isekai-link-masque`と同じcommitへgit pin
+# する(このcrateのleg 1はdatagramを使わないが、バージョン不整合を避けるため
+# 揃える)。qmux crateのpre-1.0な破壊的変更リスクをopt-inの外へ隔離するため
+# feature gate している。
+qmux = { git = "https://github.com/moq-dev/web-transport", rev = "f6107797d4a7301408964b22b6f3150967b95af3", optional = true }
+web-transport-trait = { git = "https://github.com/moq-dev/web-transport", rev = "f6107797d4a7301408964b22b6f3150967b95af3", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 hmac = "0.12"
 sha2 = "0.10"
 thiserror = "2.0.18"
@@ -35,6 +44,9 @@ quicsock = { path = "../quicsock", features = ["discovery"] }
 # `noq::Connection::path_events()`のStream実装をpollするために使う
 # (multipath.rs、isekai-terminal-coreのmultipath_transport.rsと同じ用途)。
 tokio-stream = "0.1"
+
+[features]
+qmux-relay = ["dep:qmux", "dep:web-transport-trait", "dep:tokio-rustls"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
