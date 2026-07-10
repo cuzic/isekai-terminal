@@ -371,6 +371,7 @@ pub(crate) async fn session_event_loop(
                             side_effects: Vec::new(),
                             pending_rows: Vec::new(),
                             screen_dirty: false,
+                            pending_clipboard_write: None,
                         }
                     }
                 }),
@@ -449,6 +450,15 @@ fn dispatch_result(
         debug!("screen: update {}x{} cursor=({},{})",
             upd.cols, upd.rows, upd.cursor_col, upd.cursor_row);
         callback.on_screen_update(upd);
+    }
+
+    // OSC 52 クリップボード書き込み(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。opt-inかどうかの
+    // 判断はKotlin側(`TerminalSession`)に委ねる——ここは「リモートがこう要求した」という
+    // 事実をそのまま伝えるだけで、適用するかどうかの分岐はRust側に持ち込まない
+    // (`.claude/rules/rust-ssot.md`が対象にしているのはセッション/プロトコル状態であり、
+    // これは単なるイベント通知)。
+    if let Some(text) = r.pending_clipboard_write {
+        callback.on_clipboard_write(text);
     }
 }
 
@@ -580,6 +590,7 @@ mod tests {
         fn on_no_viable_path(&self) {}
         fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _text: String) {}
     }
 
     #[test]
@@ -602,6 +613,7 @@ mod tests {
             side_effects: Vec::new(),
             pending_rows: vec![row('N', 1), row('N', 1), row('N', 1)], // 3行新規追加
             screen_dirty: false,
+            pending_clipboard_write: None,
         };
         dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, &terminal, &scrollback);
 

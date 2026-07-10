@@ -26,6 +26,9 @@ pub(crate) struct ProcessResult {
     /// Terminal からスクロールアウトした行（async 層が shared Arc に書き込む）
     pub(crate) pending_rows: Vec<Vec<TermCell>>,
     pub(crate) screen_dirty: bool,
+    /// このバッチでリモートが OSC 52 クリップボード書き込みを要求していれば、その
+    /// (デコード済み)テキスト(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。
+    pub(crate) pending_clipboard_write: Option<String>,
 }
 
 // ── SessionState ─────────────────────────────────────────
@@ -127,7 +130,8 @@ impl SessionState {
         }
 
         let pending_rows = self.terminal.take_scrollback();
-        ProcessResult { timer_cmds, side_effects, pending_rows, screen_dirty }
+        let pending_clipboard_write = self.terminal.take_pending_clipboard_write();
+        ProcessResult { timer_cmds, side_effects, pending_rows, screen_dirty, pending_clipboard_write }
     }
 }
 

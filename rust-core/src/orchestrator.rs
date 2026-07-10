@@ -332,6 +332,10 @@ impl SessionCallback for OrchestratorAdapter {
     fn on_agent_sign_request(&self, key_fingerprint: String) -> bool {
         self.shared.callback.on_agent_sign_request(key_fingerprint)
     }
+
+    fn on_clipboard_write(&self, text: String) {
+        self.shared.callback.on_clipboard_write(text);
+    }
 }
 
 // ── SessionOrchestrator ───────────────────────────────────
@@ -687,6 +691,7 @@ mod tests {
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool {
             true
         }
+        fn on_clipboard_write(&self, _text: String) {}
     }
 
     fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {

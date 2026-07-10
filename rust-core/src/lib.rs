@@ -652,6 +652,11 @@ pub trait OrchestratorCallback: Send + Sync {
     /// この実装は呼び出し元スレッドをブロックしてユーザー操作を待ってよい
     /// （実装例は `TerminalSession.kt` の `onAgentSignRequest` を参照）。
     fn on_agent_sign_request(&self, key_fingerprint: String) -> bool;
+    /// リモートが OSC 52 (`ESC]52;c;<base64>BEL`) でクリップボードへの書き込みを要求した
+    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。opt-in設定のチェック・実際にAndroid
+    /// `ClipboardManager` へ書くかどうかの判断はKotlin側の責務(単なるイベント通知であり、
+    /// セッション/プロトコル状態ではないため`.claude/rules/rust-ssot.md`の対象外)。
+    fn on_clipboard_write(&self, text: String);
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -671,6 +676,7 @@ pub trait SessionCallback: Send + Sync {
     fn on_no_viable_path(&self);
     fn on_forward_state_changed(&self, id: String, state: ForwardState);
     fn on_agent_sign_request(&self, key_fingerprint: String) -> bool;
+    fn on_clipboard_write(&self, text: String);
 }
 
 // ── SshSession ──────────────────────────────────────────

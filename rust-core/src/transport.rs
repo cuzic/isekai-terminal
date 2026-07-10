@@ -826,6 +826,7 @@ mod local_forward_e2e_tests {
             let _ = self.tx.send(TestEvent::Forward(id, state));
         }
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _text: String) {}
     }
 
     /// 受け取ったバイト列をそのまま返すだけのダミー TCP サーバ。
@@ -1475,6 +1476,7 @@ mod pooling_e2e_tests {
         fn on_no_viable_path(&self) {}
         fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _text: String) {}
     }
 
     /// 公開鍵認証を無条件で受け入れつつ認証回数を数え、シェルチャネルへ書き込まれた

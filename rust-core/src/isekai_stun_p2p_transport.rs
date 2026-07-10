@@ -474,6 +474,7 @@ mod tests {
         fn on_no_viable_path(&self) {}
         fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _text: String) {}
     }
 
     #[tokio::test]
