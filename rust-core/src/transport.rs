@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use log::{debug, info, warn};
@@ -10,6 +11,67 @@ use tokio::net::TcpListener;
 use crate::agent_forward;
 use crate::theme::Theme;
 use crate::{ForwardState, JumpConfig, SshAuth};
+
+// ── tmux 迂回 control-plane(Epic M)のグローバル opt-in ────
+//
+// プロファイル単位ではなくグローバル設定にした(ユーザーとの合意、`ISEKAI_PIPE_
+// DESIGN.md` §8 Epic M参照)。`set_terminal_theme`(`lib.rs`)と同じ「Kotlin起動時に
+// SharedPreferencesから読んで一度だけ反映する、プロセスグローバルなRust側状態」
+// というパターンを踏襲している。
+static CTL_SOCKET_FORWARD_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_ctl_socket_forward_enabled(enabled: bool) {
+    CTL_SOCKET_FORWARD_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+fn ctl_socket_forward_enabled() -> bool {
+    CTL_SOCKET_FORWARD_ENABLED.load(Ordering::Relaxed)
+}
+
+/// `/tmp/isekai-pipe-ctl-<32桁hex>.sock`。isekai-sshの`ctl_forward.rs`と同じ命名規約
+/// (128bitの乱数トークンで衝突・先取りに耐性を持たせる、`isekai_pipe_core::
+/// sweep_stale_sockets`のprefixスイープとも一致させる)。
+fn new_ctl_socket_path() -> String {
+    use rand::RngCore as _;
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(token, "{byte:02x}");
+    }
+    format!("/tmp/isekai-pipe-ctl-{token}.sock")
+}
+
+#[cfg(test)]
+mod ctl_socket_tests {
+    use super::*;
+
+    #[test]
+    fn ctl_socket_paths_match_isekai_ssh_naming_convention() {
+        let a = new_ctl_socket_path();
+        let b = new_ctl_socket_path();
+        assert!(a.starts_with("/tmp/isekai-pipe-ctl-"));
+        assert!(a.ends_with(".sock"));
+        let token = &a["/tmp/isekai-pipe-ctl-".len()..a.len() - ".sock".len()];
+        assert_eq!(token.len(), 32);
+        assert!(token.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(a, b, "each call must mint a fresh unguessable token");
+    }
+
+    #[test]
+    fn ctl_socket_forward_toggle_defaults_off_and_reflects_last_write() {
+        // Process-global state, so serialize against other tests touching the
+        // same flag (there's only this one today, but matches the project's
+        // `ENV_LOCK`-style convention for shared mutable test state).
+        set_ctl_socket_forward_enabled(false);
+        assert!(!ctl_socket_forward_enabled());
+        set_ctl_socket_forward_enabled(true);
+        assert!(ctl_socket_forward_enabled());
+        set_ctl_socket_forward_enabled(false);
+        assert!(!ctl_socket_forward_enabled());
+    }
+}
 
 // ── Transport command / event ────────────────────────────
 
@@ -65,6 +127,11 @@ pub(crate) enum TransportEvent {
         key_fingerprint: String,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
+    /// tmux 迂回 control-plane(`ISEKAI_PIPE_DESIGN.md` §8 Epic M、
+    /// `set_ctl_socket_forward_enabled`でopt-in)経由でリモートから届いた
+    /// `CtlMessage`。`isekai-pipe ctl`(isekai-ssh側)と同じワイヤーフォーマットを
+    /// SSHのstreamlocal forward経由でそのまま受け取る(PTY/tmuxを一切経由しない)。
+    CtlMessage(isekai_protocol::CtlMessage),
 }
 
 /// Kotlin → session_event_loop: trzsz 操作（transport を経由しない）
@@ -90,6 +157,13 @@ pub(crate) struct RusshEventHandler {
     /// `run_ssh_channel_loop` が登録し、`server_channel_open_forwarded_tcpip` が
     /// `connected_port` をキーに引いて中継先を決める。
     pub(crate) remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
+    /// tmux 迂回 control-plane(`ISEKAI_PIPE_DESIGN.md` §8 Epic M、
+    /// `set_ctl_socket_forward_enabled`でopt-in)の経路表: `streamlocal_forward`で
+    /// 要求したリモート socket パス → そのタブ専用の`CtlMessage`送り先。
+    /// `remote_forwards`と同じパターンで、パス自体がタブの識別子になる
+    /// (SSH接続プーリングで複数タブが同じ`Handle`を共有していても、パスがタブごとに
+    /// 一意なので誤配送しない)。
+    pub(crate) ctl_forwards: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<isekai_protocol::CtlMessage>>>>,
 }
 
 impl RusshEventHandler {
@@ -100,6 +174,7 @@ impl RusshEventHandler {
             event_tx,
             agent_key: Arc::new(Mutex::new(None)),
             remote_forwards: Arc::new(Mutex::new(HashMap::new())),
+            ctl_forwards: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -178,6 +253,42 @@ impl client::Handler for RusshEventHandler {
         });
         Ok(())
     }
+
+    /// tmux 迂回 control-plane(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)の streamlocal forward
+    /// 経由でサーバーが新規接続を通知してきた時に呼ばれる(こちらが
+    /// `streamlocal_forward(socket_path)` していた場合のみ発生する)。`socket_path`で
+    /// 経路表を引き、対応するタブへ`CtlMessage`をそのまま渡す。経路表に無いパス
+    /// (既にcancelされた等)の場合はチャネルをそのまま閉じる。1接続=1メッセージの
+    /// 契約(`isekai-pipe ctl`と同じ)なので、1行読んだら接続を閉じる。
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        socket_path: &str,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let Some(tx) = self.ctl_forwards.lock().get(socket_path).cloned() else {
+            warn!("ctl-socket: no route for socket_path={socket_path:?}, closing");
+            return Ok(());
+        };
+        let socket_path = socket_path.to_string();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt as _, BufReader};
+
+            let mut reader = BufReader::new(channel.into_stream());
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) => debug!("ctl-socket[{socket_path}]: connection closed without sending anything"),
+                Ok(_) => match isekai_protocol::decode_ctl_message(line.trim_end_matches('\n').as_bytes()) {
+                    Ok(msg) => {
+                        let _ = tx.send(msg);
+                    }
+                    Err(e) => warn!("ctl-socket[{socket_path}]: malformed ctl message: {e}"),
+                },
+                Err(e) => warn!("ctl-socket[{socket_path}]: read failed: {e}"),
+            }
+        });
+        Ok(())
+    }
 }
 
 // ── SSH 認証（TCP・QUIC・ProxyJump 共通）────────────────
@@ -237,6 +348,7 @@ pub(crate) struct EstablishedSession {
     pub(crate) handle: client::Handle<RusshEventHandler>,
     pub(crate) agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     pub(crate) remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
+    pub(crate) ctl_forwards: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<isekai_protocol::CtlMessage>>>>,
     /// 保持するだけで参照はしない(トンネルの接続を生かしておくためだけの目的)。
     _jump_handle: Option<client::Handle<RusshEventHandler>>,
 }
@@ -254,11 +366,12 @@ pub(crate) async fn connect_via_jump_or_direct(
         let handler = RusshEventHandler::new(event_tx);
         let agent_key = handler.agent_key.clone();
         let remote_forwards = handler.remote_forwards.clone();
+        let ctl_forwards = handler.ctl_forwards.clone();
         let handle = client::connect(russh_config, addr.as_str(), handler)
             .await
             .map_err(|e| format!("TCP connect to {addr} failed: {e}"))?;
         info!("ssh: TCP connected to {}", addr);
-        return Ok(EstablishedSession { handle, agent_key, remote_forwards, _jump_handle: None });
+        return Ok(EstablishedSession { handle, agent_key, remote_forwards, ctl_forwards, _jump_handle: None });
     };
 
     let jump_addr = format!("{}:{}", jump.host, jump.port);
@@ -283,12 +396,13 @@ pub(crate) async fn connect_via_jump_or_direct(
     let target_handler = RusshEventHandler::new(event_tx);
     let agent_key = target_handler.agent_key.clone();
     let remote_forwards = target_handler.remote_forwards.clone();
+    let ctl_forwards = target_handler.ctl_forwards.clone();
     let handle = client::connect_stream(russh_config, stream, target_handler)
         .await
         .map_err(|e| format!("SSH handshake over jump tunnel to {target_host}:{target_port} failed: {e}"))?;
     info!("ssh: connected to {}:{} via jump {}", target_host, target_port, jump_addr);
 
-    Ok(EstablishedSession { handle, agent_key, remote_forwards, _jump_handle: Some(jump_handle) })
+    Ok(EstablishedSession { handle, agent_key, remote_forwards, ctl_forwards, _jump_handle: Some(jump_handle) })
 }
 
 // ── SSH接続プーリング用: 認証済みHandleの確立とチャネルの追加 ──
@@ -306,6 +420,7 @@ pub(crate) struct PooledSshHandle {
     pub(crate) handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
+    pub(crate) ctl_forwards: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<isekai_protocol::CtlMessage>>>>,
     /// 踏み台経由の場合、対象への接続が続く限り保持し続ける必要がある
     /// (`EstablishedSession::_jump_handle`と同じ理由)。QUICネスト経由(踏み台なし)では`None`。
     _jump_handle: Option<client::Handle<RusshEventHandler>>,
@@ -319,6 +434,7 @@ async fn finish_establishing_handle(
     mut handle: client::Handle<RusshEventHandler>,
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
+    ctl_forwards: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<isekai_protocol::CtlMessage>>>>,
     jump_handle: Option<client::Handle<RusshEventHandler>>,
     username: &str,
     auth: &mut SshAuth,
@@ -353,6 +469,7 @@ async fn finish_establishing_handle(
         handle: Arc::new(tokio::sync::Mutex::new(handle)),
         agent_key,
         remote_forwards,
+        ctl_forwards,
         _jump_handle: jump_handle,
     })
 }
@@ -371,7 +488,7 @@ pub(crate) async fn establish_ssh_handle(
 ) -> Result<PooledSshHandle, String> {
     let established = connect_via_jump_or_direct(jump, russh_config, host, port, event_tx.clone()).await?;
     finish_establishing_handle(
-        established.handle, established.agent_key, established.remote_forwards,
+        established.handle, established.agent_key, established.remote_forwards, established.ctl_forwards,
         established._jump_handle, username, auth, agent_forward,
     ).await
 }
@@ -394,10 +511,11 @@ where
     let handler = RusshEventHandler::new(event_tx.clone());
     let agent_key = handler.agent_key.clone();
     let remote_forwards = handler.remote_forwards.clone();
+    let ctl_forwards = handler.ctl_forwards.clone();
     let handle = client::connect_stream(russh_config, stream, handler)
         .await
         .map_err(|e| e.to_string())?;
-    finish_establishing_handle(handle, agent_key, remote_forwards, None, username, auth, agent_forward).await
+    finish_establishing_handle(handle, agent_key, remote_forwards, ctl_forwards, None, username, auth, agent_forward).await
 }
 
 // ── SSH チャネルループ（TCP・QUIC 共通）─────────────────
@@ -441,6 +559,37 @@ pub(crate) async fn run_ssh_channel_loop(
     info!("ssh: shell started — entering I/O loop");
 
     event_tx.send(TransportEvent::Connected).await.ok();
+
+    // tmux 迂回 control-plane(Epic M、opt-in)。各タブ(=このループの1回の呼び出し)が
+    // 自分専用のリモート socket パスで`streamlocal_forward`を要求する——SSH接続
+    // プーリングで`pooled.handle`が複数タブから共有されていても、パス自体が
+    // タブごとに一意なので`RusshEventHandler::server_channel_open_forwarded_streamlocal`
+    // が誤配送しない(isekai-sshの`ctl_forward.rs`と同じ設計)。失敗しても接続自体は
+    // 継続する(opportunistic機能、`CLAUDE.md`)。
+    let ctl_socket_path: Option<String> = if ctl_socket_forward_enabled() {
+        let path = new_ctl_socket_path();
+        let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<isekai_protocol::CtlMessage>();
+        pooled.ctl_forwards.lock().insert(path.clone(), ctl_tx);
+        match pooled.handle.lock().await.streamlocal_forward(path.clone()).await {
+            Ok(()) => {
+                info!("ctl-socket: forwarding {} (Epic M)", path);
+                let forward_event_tx = event_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(msg) = ctl_rx.recv().await {
+                        forward_event_tx.send(TransportEvent::CtlMessage(msg)).await.ok();
+                    }
+                });
+                Some(path)
+            }
+            Err(e) => {
+                warn!("ctl-socket: streamlocal_forward {} failed: {}", path, e);
+                pooled.ctl_forwards.lock().remove(&path);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // シェル用チャネルの確立以降、認証等の `&mut self` operations は使わないが、
     // Phase 12 P2-2 で追加した `tcpip_forward`/`cancel_tcpip_forward`(リモート
@@ -571,6 +720,12 @@ pub(crate) async fn run_ssh_channel_loop(
     for (id, forward) in active_forwards.drain() {
         debug!("forward[{}]: tearing down on session teardown", id);
         teardown_forward(forward, session.clone(), remote_forwards.clone());
+    }
+    if let Some(path) = ctl_socket_path {
+        pooled.ctl_forwards.lock().remove(&path);
+        if let Err(e) = session.lock().await.cancel_streamlocal_forward(path.clone()).await {
+            debug!("ctl-socket: cancel_streamlocal_forward {} failed (best-effort): {}", path, e);
+        }
     }
     info!("ssh: I/O loop exited");
 }
@@ -826,6 +981,8 @@ mod local_forward_e2e_tests {
             let _ = self.tx.send(TestEvent::Forward(id, state));
         }
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _text: String) {}
+        fn on_clipboard_pull_request(&self) -> Option<String> { None }
     }
 
     /// 受け取ったバイト列をそのまま返すだけのダミー TCP サーバ。
@@ -1475,6 +1632,8 @@ mod pooling_e2e_tests {
         fn on_no_viable_path(&self) {}
         fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _text: String) {}
+        fn on_clipboard_pull_request(&self) -> Option<String> { None }
     }
 
     /// 公開鍵認証を無条件で受け入れつつ認証回数を数え、シェルチャネルへ書き込まれた

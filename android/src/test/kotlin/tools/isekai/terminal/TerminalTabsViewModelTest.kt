@@ -59,7 +59,7 @@ class TerminalTabsViewModelTest {
         val sessionFactory: () -> TerminalSession = {
             val fake = FakeOrchestrator()
             orchestrators.add(fake)
-            TerminalSession(FakeHostKeyChecker()) { cb -> fake.also { it.callback = cb } }
+            TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
         }
         vm = TerminalTabsViewModel(app, executor, sessionFactory)
     }

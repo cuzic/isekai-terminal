@@ -42,4 +42,13 @@ pub enum ProtocolError {
     /// (security review #57).
     #[error("invalid bootstrap argument {field}: {reason}")]
     InvalidBootstrapArg { field: &'static str, reason: String },
+
+    #[error("ctl message is {got} bytes, exceeding the {max} byte limit")]
+    CtlMessageTooLarge { got: usize, max: usize },
+
+    #[error("invalid ctl message JSON: {0}")]
+    CtlMessageJson(String),
+
+    #[error("invalid ctl message field {field}: {reason}")]
+    CtlMessageField { field: &'static str, reason: String },
 }

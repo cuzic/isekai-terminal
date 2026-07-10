@@ -1,3 +1,4 @@
+mod ctl;
 mod engine;
 
 use std::collections::VecDeque;
@@ -27,6 +28,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const EX_USAGE: u8 = 64;
 const EX_UNAVAILABLE: u8 = 69;
+
+/// Serializes tests (across `main.rs`/`ctl.rs`) that mutate process-global
+/// env vars (`ISEKAI_PIPE_PROFILES_DIR`/`ISEKAI_CTL_SOCK`). `cargo test`
+/// runs `#[test]` functions on multiple threads within the same process by
+/// default, and `std::env::set_var` has no thread-local scoping — without
+/// this, one test's mutation can be clobbered mid-flight by a concurrently
+/// running test in a different module (matches `isekai-ssh`'s
+/// `HOME_ENV_LOCK` for the same reason).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 const DEFAULT_RESUME_WINDOW: Duration = Duration::from_secs(120);
 const C2H_REPLAY_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
 const RESUME_BACKOFF: BackoffPolicy = BackoffPolicy {
@@ -47,6 +58,7 @@ fn print_help() {
     println!("    serve      remote service side");
     println!("    probe      connectivity probe (skeleton)");
     println!("    inspect    passive profile inspection (--profile, --json, --redact, --verbose)");
+    println!("    ctl        title/clipboard control-plane client (see `isekai-pipe ctl --help`)");
     println!("    version    print version");
     println!();
     println!(
@@ -1823,12 +1835,41 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
     }))
 }
 
+/// The `-R` remote path convention `isekai-ssh`'s `ctl_forward.rs` uses
+/// (`/tmp/isekai-pipe-ctl-<128bit hex>.sock`, opt-in `#@isekai ctl-socket
+/// yes`, `ISEKAI_PIPE_DESIGN.md` §8 Epic M). `sshd` owns cleaning up the
+/// actual streamlocal forward bind on a normal disconnect; this sweep only
+/// catches what's left behind by abnormal exits (crash, `kill -9`, a
+/// network drop that skipped `ssh -O cancel -R`).
+const CTL_SOCKET_REMOTE_PREFIX: &str = "isekai-pipe-ctl-";
+const CTL_SOCKET_STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Best-effort, non-fatal: a sweep failure (e.g. `/tmp` unreadable for
+/// some reason) should never block `serve` from starting.
+fn sweep_stale_ctl_sockets_on_remote() {
+    match isekai_pipe_core::sweep_stale_sockets(
+        std::path::Path::new("/tmp"),
+        CTL_SOCKET_REMOTE_PREFIX,
+        CTL_SOCKET_STALE_THRESHOLD,
+    ) {
+        Ok(removed) if !removed.is_empty() => {
+            log::info!("isekai-pipe serve: swept {} stale ctl-socket file(s) under /tmp", removed.len());
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("isekai-pipe serve: failed to sweep stale ctl-socket files under /tmp: {e}");
+        }
+    }
+}
+
 async fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
     let launch = match parse_serve(args) {
         Ok(Some(launch)) => launch,
         Ok(None) => return ExitCode::SUCCESS,
         Err(code) => return code,
     };
+
+    sweep_stale_ctl_sockets_on_remote();
 
     let mut helper_args = launch.helper_args;
     helper_args.push("--service-name".to_string());
@@ -2190,11 +2231,8 @@ mod tests {
         // `host:port` key, but `--profile myhost` (no explicit port) must
         // still resolve to it, matching every other command
         // (`connect`/`init`/wrapper) that normalizes before lookup.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        // Only test in this file that touches `ISEKAI_PIPE_PROFILES_DIR` —
-        // safe to mutate unguarded today, but the next one added here should
-        // serialize against this one (see `isekai-ssh`'s `HOME_ENV_LOCK` for
-        // the exact failure mode this would otherwise hit).
         let old = std::env::var_os("ISEKAI_PIPE_PROFILES_DIR");
         std::env::set_var("ISEKAI_PIPE_PROFILES_DIR", dir.path());
 
@@ -3012,6 +3050,7 @@ async fn main() -> ExitCode {
         Some("serve") => serve_command(args).await,
         Some("probe") => probe_command(args).await,
         Some("inspect") => inspect_command(args).await,
+        Some("ctl") => ctl::ctl_command(args).await,
         Some(other) => {
             eprintln!("isekai-pipe: unknown command: {other}");
             eprintln!("try `isekai-pipe --help`");

@@ -268,6 +268,7 @@ Host production
     #@isekai resume-grace 180s
     #@isekai candidate-race-delay 250ms
     #@isekai relay-delay 900ms
+    #@isekai ctl-socket yes
 ```
 
 これで `isekai-ssh production`(または `-L 5432:127.0.0.1:5432 production` で `service postgres`
@@ -294,10 +295,11 @@ Host production
 | `candidate-race-delay` | 同上の duration 表記 | `150ms` | 複数 candidate を同時に試す際の後発 candidate の遅延 |
 | `relay-delay` | 同上の duration 表記 | `750ms` | direct 系 candidate に対して relay を遅らせて追い掛けさせる遅延 |
 | `install-mode` | `user`\|`system` | `user` | `system` は sudo・所有権・rollback が未実装かつ実装予定も無いため、指定すると設定解決時点でエラーになる(fail closed)。将来必要になった場合もisekai-ssh本体には組み込まず、`curl ... \| sudo bash`的な別のインストーラースクリプト/ラッパーとして提供する想定 |
+| `ctl-socket` | `yes`\|`no` | `no` | `yes` にすると、リモートの対話シェルから `isekai-pipe ctl title "<text>"` / `isekai-pipe ctl clip push --mime <mime>` を実行することで、tmux を経由せず直接ローカルのタブ/ターミナルのタイトルやクリップボードへ反映できるよう per-タブの UNIX domain socket forward(`-R`)を張る(`ISEKAI_PIPE_DESIGN.md` §8 Epic M参照)。明示的なリモートコマンドを指定した呼び出し(`isekai-ssh host 'some command'`)や unix 系以外の OS では黙って無効化される(opportunistic fallback) |
 
 `bootstrap-candidate`/`link`/`rendezvous`/`stun`/`relay`/`service` は複数行書くと追記されていく。
 それ以外(`enabled`/`bootstrap-policy`/`profile`/`remote-path`/`resume-grace`/
-`candidate-race-delay`/`relay-delay`/`install-mode`)は最初に出てきた値が採用される
+`candidate-race-delay`/`relay-delay`/`install-mode`/`ctl-socket`)は最初に出てきた値が採用される
 (OpenSSH 本体の `Host`/`Match` と同じ first-value-wins 規則)。
 
 ### オプション: STUN による低遅延 P2P(`--mode stun`)

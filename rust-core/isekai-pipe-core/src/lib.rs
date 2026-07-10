@@ -29,6 +29,9 @@ pub use outcome::{
     claim_connect_outcome, write_connect_outcome, ConnectOutcome, ConnectOutcomeClass, CONNECT_OUTCOME_SCHEMA_VERSION,
 };
 
+mod ctl_gc;
+pub use ctl_gc::sweep_stale_sockets;
+
 pub const CONNECTION_INTENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_INTENT_TTL: Duration = Duration::from_secs(120);
 pub const DEFAULT_CANDIDATE_RACE_DELAY_MS: u64 = 150;

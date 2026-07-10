@@ -26,6 +26,13 @@ pub(crate) struct ProcessResult {
     /// Terminal からスクロールアウトした行（async 層が shared Arc に書き込む）
     pub(crate) pending_rows: Vec<Vec<TermCell>>,
     pub(crate) screen_dirty: bool,
+    /// このバッチでリモートが OSC 52 クリップボード書き込みを要求していれば、その
+    /// (デコード済み)テキスト(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。
+    pub(crate) pending_clipboard_write: Option<String>,
+    /// このバッチでリモートが OSC 52 query(クリップボード読み出し)を要求したか。
+    /// 実際の応答送出には非同期のKotlin往復が要るため、ここではフラグを立てるだけで
+    /// `session.rs`のevent loopが処理する(`dispatch_result`は同期関数のまま)。
+    pub(crate) clipboard_pull_requested: bool,
 }
 
 // ── SessionState ─────────────────────────────────────────
@@ -52,6 +59,21 @@ impl SessionState {
     /// このセッションのテーマを差し替える。以降にパースされるSGRの色解決にのみ反映される。
     pub(crate) fn set_theme(&mut self, theme: Theme) {
         self.terminal.set_theme(theme);
+    }
+
+    /// tmux 迂回 control-plane(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)経由でリモートから
+    /// 届いたタイトルを、OSC 0/2 のパースを経由せず直接反映する。次の`ScreenUpdate`に
+    /// 乗せて`onScreenUpdate`まで届くよう`screen_dirty`を立てる。
+    pub(crate) fn set_title_from_ctl(&mut self, title: String) -> ProcessResult {
+        self.terminal.set_title(title);
+        ProcessResult {
+            timer_cmds: Vec::new(),
+            side_effects: Vec::new(),
+            pending_rows: Vec::new(),
+            screen_dirty: true,
+            pending_clipboard_write: None,
+            clipboard_pull_requested: false,
+        }
     }
 
     /// リサイズ時にターミナル・パーサーをリセットする。現在のテーマは引き継ぐ
@@ -127,7 +149,16 @@ impl SessionState {
         }
 
         let pending_rows = self.terminal.take_scrollback();
-        ProcessResult { timer_cmds, side_effects, pending_rows, screen_dirty }
+        let pending_clipboard_write = self.terminal.take_pending_clipboard_write();
+        let clipboard_pull_requested = self.terminal.take_pending_clipboard_pull_request();
+        ProcessResult {
+            timer_cmds,
+            side_effects,
+            pending_rows,
+            screen_dirty,
+            pending_clipboard_write,
+            clipboard_pull_requested,
+        }
     }
 }
 

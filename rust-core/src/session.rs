@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use parking_lot::Mutex;
 use timed_fsm::TimerCommand;
 
@@ -301,6 +301,8 @@ fn handle_session_cmd(state: &mut SessionState, c: SessionCmd) -> ProcessResult 
                 side_effects: Vec::new(),
                 pending_rows: Vec::new(),
                 screen_dirty: false,
+                pending_clipboard_write: None,
+                clipboard_pull_requested: false,
             }
         }
     }
@@ -360,6 +362,36 @@ pub(crate) async fn session_event_loop(
                 Some(TransportEvent::ForwardStateChanged { id, state }) => {
                     callback.on_forward_state_changed(id, state); None
                 }
+                Some(TransportEvent::CtlMessage(msg)) => {
+                    match msg {
+                        isekai_protocol::CtlMessage::SetTitle { value } => {
+                            Some(state.set_title_from_ctl(value))
+                        }
+                        isekai_protocol::CtlMessage::ClipboardPush { data_b64, .. } => {
+                            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data_b64) {
+                                Ok(decoded) => match String::from_utf8(decoded) {
+                                    Ok(text) => {
+                                        let cb = Arc::clone(&callback);
+                                        tokio::task::spawn_blocking(move || cb.on_clipboard_write(text));
+                                    }
+                                    Err(e) => warn!("ctl-socket: clipboard push was not valid UTF-8: {e}"),
+                                },
+                                Err(e) => warn!("ctl-socket: clipboard push data_b64 was not valid base64: {e}"),
+                            }
+                            None
+                        }
+                        // device→host のクリップボード読み出し(pull)は、この新しい
+                        // チャネルでの応答書き込みが未実装(`ISEKAI_PIPE_DESIGN.md` §8
+                        // Epic M follow-up、タスク#84の既知の残作業)。OSC 52経由の
+                        // pull(`ClipboardPullRequest`をterminal.rsが検出するパス)は
+                        // 別に実装済み — こちらは無視するだけ。
+                        isekai_protocol::CtlMessage::ClipboardPullRequest {} => {
+                            debug!("ctl-socket: clipboard pull over ctl-socket is not yet implemented, ignoring");
+                            None
+                        }
+                        isekai_protocol::CtlMessage::ClipboardPullResponse { .. } => None,
+                    }
+                }
                 Some(TransportEvent::Disconnected { reason }) => {
                     info!("session: disconnected reason={:?}", reason);
                     connected.store(false, Ordering::SeqCst);
@@ -386,8 +418,26 @@ pub(crate) async fn session_event_loop(
         };
 
         if let Some(r) = result {
+            let clipboard_pull_requested = r.clipboard_pull_requested;
             dispatch_result(r, &mut timer_rt, &transport_cmd_tx, &callback,
                             state.terminal(), &scrollback);
+            if clipboard_pull_requested {
+                // Fetching the current Android clipboard text needs a Kotlin
+                // round trip (`on_host_key`/`on_agent_sign_request`'s same
+                // `spawn_blocking` pattern) that `dispatch_result` — a plain
+                // sync fn — can't perform. `None` means "opt-in disabled or
+                // no clipboard content": send nothing back rather than an
+                // explicit empty reply (`ISEKAI_PIPE_DESIGN.md` §8 Epic M).
+                let cb = Arc::clone(&callback);
+                let tx = transport_cmd_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(text) = cb.on_clipboard_pull_request() {
+                        let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text);
+                        let response = format!("\x1b]52;c;{data_b64}\x07").into_bytes();
+                        let _ = tx.blocking_send(TransportCommand::WriteStdin(response));
+                    }
+                });
+            }
         }
     }
 }
@@ -456,6 +506,15 @@ fn dispatch_result(
         debug!("screen: update {}x{} cursor=({},{})",
             upd.cols, upd.rows, upd.cursor_col, upd.cursor_row);
         callback.on_screen_update(upd);
+    }
+
+    // OSC 52 クリップボード書き込み(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。opt-inかどうかの
+    // 判断はKotlin側(`TerminalSession`)に委ねる——ここは「リモートがこう要求した」という
+    // 事実をそのまま伝えるだけで、適用するかどうかの分岐はRust側に持ち込まない
+    // (`.claude/rules/rust-ssot.md`が対象にしているのはセッション/プロトコル状態であり、
+    // これは単なるイベント通知)。
+    if let Some(text) = r.pending_clipboard_write {
+        callback.on_clipboard_write(text);
     }
 }
 
@@ -587,6 +646,8 @@ mod tests {
         fn on_no_viable_path(&self) {}
         fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _text: String) {}
+        fn on_clipboard_pull_request(&self) -> Option<String> { None }
     }
 
     #[test]
@@ -609,6 +670,8 @@ mod tests {
             side_effects: Vec::new(),
             pending_rows: vec![row('N', 1), row('N', 1), row('N', 1)], // 3行新規追加
             screen_dirty: false,
+            pending_clipboard_write: None,
+            clipboard_pull_requested: false,
         };
         dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, &terminal, &scrollback);
 

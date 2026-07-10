@@ -54,6 +54,7 @@ import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
+import uniffi.isekai_terminal_core.setCtlSocketForwardEnabled
 import uniffi.isekai_terminal_core.setTerminalTheme
 
 @Composable
@@ -94,6 +95,26 @@ fun ProfileListScreen(
         mutableStateOf(prefs.getBoolean(PREF_KEY_SCREEN_PROTECTION, false))
     }
 
+    // リモートからの OSC 52 クリップボード書き込み(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)も
+    // 画面の保護と同じくグローバル設定として永続化する。既定OFF(クリップボード
+    // ハイジャックのリスクがあるため)のオプトイン機能。
+    var remoteClipboardWriteEnabled by remember {
+        mutableStateOf(prefs.getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE, false))
+    }
+
+    // リモートからの OSC 52 query(クリップボード読み出し)応答も push とは別にopt-inする
+    // (デバイス側の機密情報がリモートへ流出するリスクがあるため、既定OFF)。
+    var remoteClipboardPullEnabled by remember {
+        mutableStateOf(prefs.getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL, false))
+    }
+
+    // tmux 迂回 control-plane(russh の streamlocal forward、`ISEKAI_PIPE_DESIGN.md`
+    // §8 Epic M)。既定OFF(常時ONにする理由が無いため)。トグル時にRust側の
+    // プロセスグローバル状態へ即座に反映する([MainActivity]の起動時復元と対になる)。
+    var ctlSocketForwardEnabled by remember {
+        mutableStateOf(prefs.getBoolean(PREF_KEY_ENABLE_CTL_SOCKET_FORWARD, false))
+    }
+
     Scaffold(
         topBar = {
             Row(
@@ -127,6 +148,37 @@ fun ProfileListScreen(
                                 screenProtectionEnabled = !screenProtectionEnabled
                                 prefs.edit().putBoolean(PREF_KEY_SCREEN_PROTECTION, screenProtectionEnabled).apply()
                                 (context as? Activity)?.let { applyScreenProtection(it, screenProtectionEnabled) }
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (remoteClipboardWriteEnabled) "リモートからのクリップボード書込: ON" else "リモートからのクリップボード書込: OFF") },
+                            onClick = {
+                                showMenu = false
+                                remoteClipboardWriteEnabled = !remoteClipboardWriteEnabled
+                                prefs.edit()
+                                    .putBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_WRITE, remoteClipboardWriteEnabled)
+                                    .apply()
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (remoteClipboardPullEnabled) "リモートへのクリップボード送信: ON" else "リモートへのクリップボード送信: OFF") },
+                            onClick = {
+                                showMenu = false
+                                remoteClipboardPullEnabled = !remoteClipboardPullEnabled
+                                prefs.edit()
+                                    .putBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL, remoteClipboardPullEnabled)
+                                    .apply()
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (ctlSocketForwardEnabled) "tmux迂回control-plane: ON" else "tmux迂回control-plane: OFF") },
+                            onClick = {
+                                showMenu = false
+                                ctlSocketForwardEnabled = !ctlSocketForwardEnabled
+                                prefs.edit()
+                                    .putBoolean(PREF_KEY_ENABLE_CTL_SOCKET_FORWARD, ctlSocketForwardEnabled)
+                                    .apply()
+                                setCtlSocketForwardEnabled(ctlSocketForwardEnabled)
                             },
                         )
                         DropdownMenuItem(

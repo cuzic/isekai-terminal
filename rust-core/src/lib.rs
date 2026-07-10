@@ -68,6 +68,15 @@ pub fn set_terminal_theme(ansi16: Vec<u32>, default_fg: u32, default_bg: u32) {
     theme::set(theme::from_raw(ansi16, default_fg, default_bg));
 }
 
+/// tmux 迂回 control-plane(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)を有効にするか
+/// (プロファイル毎ではなくグローバル設定、`set_terminal_theme`と同じ形)。有効な間、
+/// 新しく開くSSHチャネル(タブ)は接続直後にリモートへ`streamlocal_forward`を要求し、
+/// `isekai-pipe ctl title|clip push`をtmuxを経由せず直接受け取れるようにする。
+#[uniffi::export]
+pub fn set_ctl_socket_forward_enabled(enabled: bool) {
+    transport::set_ctl_socket_forward_enabled(enabled);
+}
+
 /// isekai-terminal-core の crate バージョン（`Cargo.toml` の `version`）を返す。
 ///
 /// iOS 対応 Phase 0 の技術検証スパイクで、UniFFI Swift バインディング経由の
@@ -653,6 +662,17 @@ pub trait OrchestratorCallback: Send + Sync {
     /// この実装は呼び出し元スレッドをブロックしてユーザー操作を待ってよい
     /// （実装例は `TerminalSession.kt` の `onAgentSignRequest` を参照）。
     fn on_agent_sign_request(&self, key_fingerprint: String) -> bool;
+    /// リモートが OSC 52 (`ESC]52;c;<base64>BEL`) でクリップボードへの書き込みを要求した
+    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。opt-in設定のチェック・実際にAndroid
+    /// `ClipboardManager` へ書くかどうかの判断はKotlin側の責務(単なるイベント通知であり、
+    /// セッション/プロトコル状態ではないため`.claude/rules/rust-ssot.md`の対象外)。
+    fn on_clipboard_write(&self, text: String);
+    /// リモートが OSC 52 query(`ESC]52;c;?BEL`)でクリップボードの読み出しを要求した。
+    /// `host_key`/`agent_sign_request`確認と同じ同期ブロッキング方式(Rust側の
+    /// `spawn_blocking`から呼ばれる)。opt-in設定が無効、またはクリップボードが
+    /// 空/取得不可なら`None`を返す(この場合デバイス側からは応答を一切送らない——
+    /// 何も返さない方が「機能の有無自体を教えない」という意味で安全なため)。
+    fn on_clipboard_pull_request(&self) -> Option<String>;
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -672,6 +692,8 @@ pub trait SessionCallback: Send + Sync {
     fn on_no_viable_path(&self);
     fn on_forward_state_changed(&self, id: String, state: ForwardState);
     fn on_agent_sign_request(&self, key_fingerprint: String) -> bool;
+    fn on_clipboard_write(&self, text: String);
+    fn on_clipboard_pull_request(&self) -> Option<String>;
 }
 
 // ── SshSession ──────────────────────────────────────────

@@ -51,6 +51,17 @@ pub(crate) struct Terminal {
     scroll_top: usize,
     scroll_bottom: usize,
     title: Option<String>,
+    /// リモートが OSC 52 (`ESC]52;c;<base64>BEL`) でクリップボードへの書き込みを要求した
+    /// 場合、次に`take_pending_clipboard_write()`が呼ばれるまで保持する
+    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic M: tmuxが`set-titles`/`allow-passthrough`を
+    /// 適切に設定していれば、control-plane機構を使わずこの標準OSC経路だけで動く)。
+    pending_clipboard_write: Option<String>,
+    /// リモートが OSC 52 query(`ESC]52;c;?BEL`)でクリップボードの読み出しを要求した
+    /// 場合に立つ。実際の応答(device→hostへの base64 OSC 52 フレーム送信)は
+    /// このモジュールの外(`session_state.rs`/`session.rs`)が担う——
+    /// Android のクリップボード内容を取得するには非同期の Kotlin 往復が要るため、
+    /// この同期的な VTE コールバックの中では完結できない。
+    pending_clipboard_pull_request: bool,
     pending_scrollback: Vec<Vec<TermCell>>,
     application_cursor_mode: bool,
     bracketed_paste_mode: bool,
@@ -75,6 +86,8 @@ impl Terminal {
             cur_fg: theme.default_fg, cur_bg: theme.default_bg, cur_bold: false,
             scroll_top: 0, scroll_bottom: rows - 1,
             title: None,
+            pending_clipboard_write: None,
+            pending_clipboard_pull_request: false,
             pending_scrollback: Vec::new(),
             application_cursor_mode: false,
             bracketed_paste_mode: false,
@@ -98,11 +111,29 @@ impl Terminal {
         std::mem::take(&mut self.pending_scrollback)
     }
 
+    /// 保留中の OSC 52 クリップボード書き込みを取り出す。呼び出し後は空になる
+    /// (`take_scrollback`と同じ「1バッチ分をここでフラッシュする」パターン)。
+    pub(crate) fn take_pending_clipboard_write(&mut self) -> Option<String> {
+        self.pending_clipboard_write.take()
+    }
+
+    /// 保留中の OSC 52 クリップボード読み出し要求を取り出す(1回きり、trueだった場合は
+    /// falseにリセットされる)。
+    pub(crate) fn take_pending_clipboard_pull_request(&mut self) -> bool {
+        std::mem::take(&mut self.pending_clipboard_pull_request)
+    }
+
     pub(crate) fn cols(&self) -> usize { self.cols }
     pub(crate) fn rows(&self) -> usize { self.rows }
     pub(crate) fn cursor_row(&self) -> usize { self.cursor_row }
     pub(crate) fn cursor_col(&self) -> usize { self.cursor_col }
     pub(crate) fn title(&self) -> Option<&str> { self.title.as_deref() }
+
+    /// OSC 0/2 のパース経由ではなく、外部(tmux迂回control-plane、`ISEKAI_PIPE_DESIGN.md`
+    /// §8 Epic M)から直接タイトルを設定する。
+    pub(crate) fn set_title(&mut self, title: String) {
+        self.title = Some(title);
+    }
     pub(crate) fn application_cursor_mode(&self) -> bool { self.application_cursor_mode }
     pub(crate) fn bracketed_paste_mode(&self) -> bool { self.bracketed_paste_mode }
     pub(crate) fn screen_cells(&self) -> &[TermCell] { self.cells() }
@@ -120,6 +151,8 @@ impl Terminal {
         self.cur_fg = theme.default_fg; self.cur_bg = theme.default_bg; self.cur_bold = false;
         self.scroll_top = 0; self.scroll_bottom = self.rows - 1;
         self.title = None;
+        self.pending_clipboard_write = None;
+        self.pending_clipboard_pull_request = false;
         self.application_cursor_mode = false;
         self.bracketed_paste_mode = false;
     }
@@ -390,6 +423,28 @@ impl Perform for Terminal {
                     self.title = Some(s.to_string());
                 }
             }
+            // OSC 52 (`ESC]52;<selection>;<base64|?>BEL`): clipboard set.
+            // `<selection>` (params[1], conventionally `c`/`p`/...) is not
+            // distinguished — this app only has one clipboard. `Pd == "?"`
+            // is a *query* (device→host read), not handled here (see the
+            // `pending_clipboard_write` field doc comment).
+            (Some(&b"52"), _) => {
+                if let Some(&payload) = params.get(2) {
+                    if payload == b"?" {
+                        // Query (device→host read). The actual reply (an OSC 52
+                        // response written back to the remote's stdin) needs an
+                        // async round trip to Kotlin for the current clipboard
+                        // text, which this synchronous VTE callback can't do —
+                        // it only flags the request; `session_state.rs`/`session.rs`
+                        // drain it and perform the round trip.
+                        self.pending_clipboard_pull_request = true;
+                    } else if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload) {
+                        if let Ok(text) = String::from_utf8(decoded) {
+                            self.pending_clipboard_write = Some(text);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -556,6 +611,62 @@ mod tests {
         let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b]0;My Title\x07");
         assert_eq!(t.title(), Some("My Title"));
+    }
+
+    #[test]
+    fn test_clipboard_write_osc_52() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // "hello" base64-encoded, selection "c" (clipboard).
+        feed(&mut t, b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(t.take_pending_clipboard_write(), Some("hello".to_string()));
+        // Consumed once — a second take returns None until the next OSC 52.
+        assert_eq!(t.take_pending_clipboard_write(), None);
+    }
+
+    #[test]
+    fn test_clipboard_query_is_not_treated_as_a_write() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]52;c;?\x07");
+        assert_eq!(t.take_pending_clipboard_write(), None);
+    }
+
+    #[test]
+    fn test_clipboard_query_sets_pending_pull_request() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]52;c;?\x07");
+        assert!(t.take_pending_clipboard_pull_request());
+        // Consumed once — a second take returns false until the next query.
+        assert!(!t.take_pending_clipboard_pull_request());
+    }
+
+    #[test]
+    fn test_clipboard_write_does_not_set_pending_pull_request() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(!t.take_pending_clipboard_pull_request());
+    }
+
+    #[test]
+    fn test_reset_clears_pending_clipboard_pull_request() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]52;c;?\x07");
+        feed(&mut t, b"\x1bc"); // RIS (full reset)
+        assert!(!t.take_pending_clipboard_pull_request());
+    }
+
+    #[test]
+    fn test_clipboard_write_ignores_invalid_base64() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]52;c;not-valid-base64!!\x07");
+        assert_eq!(t.take_pending_clipboard_write(), None);
+    }
+
+    #[test]
+    fn test_reset_clears_pending_clipboard_write() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]52;c;aGVsbG8=\x07");
+        feed(&mut t, b"\x1bc"); // RIS (full reset)
+        assert_eq!(t.take_pending_clipboard_write(), None);
     }
 
     #[test]
