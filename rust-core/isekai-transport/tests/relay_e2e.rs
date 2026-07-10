@@ -189,7 +189,21 @@ async fn connect_via_relay_fails_the_handshake_when_the_cert_pin_does_not_match(
     // explicitly instead.
     match tokio::time::timeout(Duration::from_secs(10), connect_via_relay(&factory, &target)).await {
         Ok(Ok(_stream)) => panic!("a mismatched cert pin must fail the QUIC handshake, but it succeeded"),
-        Ok(Err(err)) => assert!(matches!(err, TransportError::Handshake(_)), "got: {err:?}"),
+        // `ISEKAI_PIPE_DESIGN.md` §8 Epic N: cert pin mismatches are now
+        // classified precisely (`TransportError::CertPinMismatch`, recovered
+        // out-of-band from `PinnedCertVerifier`'s shared slot) rather than
+        // falling into the generic `Handshake(String)` bucket every other
+        // QUIC handshake failure still uses — this is exactly the signal
+        // `is_stale_trust_signal()` needs to distinguish "cached trust
+        // material went stale" from "peer unreachable".
+        Ok(Err(err)) => match &err {
+            TransportError::CertPinMismatch { expected, got } => {
+                assert_eq!(expected, "0".repeat(64).as_str());
+                assert_ne!(got, expected);
+                assert!(err.is_stale_trust_signal(), "got: {err:?}");
+            }
+            other => panic!("expected TransportError::CertPinMismatch, got: {other:?}"),
+        },
         Err(_) => panic!("connect_via_relay should fail fast rather than hang"),
     }
 
