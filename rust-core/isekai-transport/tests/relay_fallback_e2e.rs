@@ -33,7 +33,7 @@ use isekai_protocol::offset::{C2hHelperCommittedOffset, H2cSentOffset};
 use isekai_protocol::resume::{decode_resume, encode_resume_ack, ResumeAckFrame, ResumeProof, RESUME_FRAME_LEN};
 use isekai_transport::{
     connect_via_relay_resumable_with_fallback, RelayTarget, SequentialConnectError, SequentialRelayCandidate,
-    SystemQuicEndpointFactory,
+    system_quic_factory,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
@@ -214,7 +214,7 @@ async fn first_candidate_pre_attach_failure_falls_back_to_second() {
     let candidates =
         vec![candidate("relay-1", addr1, "0".repeat(64) /* wrong pin */), candidate("relay-2", addr2, cert2_hex)];
 
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     let (session, winning_target) = tokio::time::timeout(
         Duration::from_secs(10),
         connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
@@ -254,7 +254,7 @@ async fn first_candidate_ambiguous_failure_safely_falls_back_to_second_with_a_ne
 
     let candidates = vec![candidate("relay-1", addr1, cert1_hex), candidate("relay-2", addr2, cert2_hex)];
 
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     let (session, winning_target) = tokio::time::timeout(
         Duration::from_secs(10),
         connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
@@ -284,7 +284,7 @@ async fn first_candidate_terminal_rejection_stops_early_without_trying_second() 
 
     let candidates = vec![candidate("relay-1", addr1, cert1_hex), candidate("relay-2", addr2, cert2_hex)];
 
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
@@ -330,7 +330,7 @@ async fn all_candidates_pre_attach_failing_returns_all_candidates_failed() {
         candidate("relay-2", addr2, "1".repeat(64)),
     ];
 
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
@@ -437,7 +437,7 @@ async fn ambiguous_then_already_established_converges_on_resuming_the_ambiguous_
 
     let candidates = vec![candidate("relay-1", addr1, cert1_hex), candidate("relay-2", addr2, cert2_hex)];
 
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     let (session, winning_target) = tokio::time::timeout(
         Duration::from_secs(10),
         connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
@@ -482,7 +482,7 @@ async fn ambiguous_failures_on_two_consecutive_candidates_both_rotate_forward() 
         candidate("relay-3", addr3, cert3_hex),
     ];
 
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     let (session, winning_target) = tokio::time::timeout(
         Duration::from_secs(10),
         connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
@@ -516,7 +516,7 @@ async fn stale_generation_is_recovered_by_advancing_past_the_reported_floor() {
 
     let candidates = vec![candidate("relay-1", addr1, cert1_hex), candidate("relay-2", addr2, cert2_hex)];
 
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     let (session, winning_target) = tokio::time::timeout(
         Duration::from_secs(10),
         connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),
@@ -559,7 +559,7 @@ async fn generation_retry_budget_exhaustion_gives_up_deterministically() {
         candidate("relay-3", addr3, cert3_hex),
     ];
 
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         connect_via_relay_resumable_with_fallback(&factory, &candidates, 0),

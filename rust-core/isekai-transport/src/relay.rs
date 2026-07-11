@@ -16,14 +16,13 @@ use isekai_protocol::attach::{
 use isekai_protocol::hello::Proof;
 use isekai_protocol::session_id::{SessionId, SESSION_ID_LEN};
 use log::info;
+use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxEndpoint, AnyMuxFactory, RemoteSpec};
 use rand::RngCore;
 
 use crate::attempt::{ConnectAttemptError, ConnectAttemptStage, RejectReason};
 use crate::error::TransportError;
 use crate::proof::compute_proof;
 use crate::telemetry::{log_candidate_attempt, CandidateAttempt, CandidateIdentity, CandidateOutcome};
-use crate::traits::{ByteStream, QuicConnection, QuicEndpoint, QuicEndpointFactory};
-use crate::types::{BindSpec, RemoteSpec};
 
 /// Generates a fresh, random `SessionId` for a brand-new logical session
 /// (`#18-4`: the client picks `session_id` before ever connecting, rather
@@ -59,9 +58,9 @@ pub struct RelayTarget {
     /// (`archive/ISEKAI_SSH_DESIGN.md` "isekai-helper・isekai-sshの統合方針").
     pub helper_addr: SocketAddr,
     /// SNI presented during the QUIC handshake. isekai-helper ignores it
-    /// (see `RemoteSpec::server_name`'s docs); kept configurable rather than
-    /// hardcoded so a future non-isekai-helper QUIC endpoint could reuse this
-    /// function.
+    /// (see `quicmux::RemoteSpec::server_name`'s docs); kept configurable
+    /// rather than hardcoded so a future non-isekai-helper QUIC endpoint
+    /// could reuse this function.
     pub server_name: String,
     /// `HandshakeJson::cert_sha256` (already validated by
     /// `isekai_protocol::handshake::decode_handshake_json`).
@@ -79,15 +78,12 @@ pub struct RelayTarget {
 /// Deliberately does *not* open a control stream or return a resume-capable
 /// handle — `archive/ISEKAI_SSH_DESIGN.md`'s S-0d-1 scope is "HELLO/proof/ACKまでの
 /// 接続確立だけでよい"; resume support lands in S-4a.
-pub async fn connect_via_relay(
-    factory: &dyn QuicEndpointFactory,
-    target: &RelayTarget,
-) -> Result<Box<dyn ByteStream>, TransportError> {
-    let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await?;
+pub async fn connect_via_relay(factory: &AnyMuxFactory, target: &RelayTarget) -> Result<AnyByteStream, TransportError> {
+    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await?;
     // No resume support on this path (module docs), so there is no grace
     // period to request — `0` ("no preference").
     let (_conn, stream, _proof, _effective_resume_grace_secs) = connect_and_handshake(
-        endpoint.as_ref(),
+        &endpoint,
         RemoteSpec {
             addr: target.helper_addr,
             server_name: target.server_name.clone(),
@@ -118,15 +114,15 @@ pub async fn connect_via_relay(
 /// [`resume::open_control_stream`] on the returned connection whenever (and
 /// however) it wants.
 pub async fn connect_via_relay_with_connection(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     target: &RelayTarget,
-) -> Result<(Box<dyn QuicConnection>, Box<dyn ByteStream>, Proof), TransportError> {
-    let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await?;
+) -> Result<(AnyMuxConnection, AnyByteStream, Proof), TransportError> {
+    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await?;
     // No resume-grace preference from this entry point (module docs on
     // `connect_via_relay`) — the caller decides resume policy for itself via
     // whichever `resume::*` functions it calls afterward.
     let (conn, stream, proof, _effective_resume_grace_secs) = connect_and_handshake(
-        endpoint.as_ref(),
+        &endpoint,
         RemoteSpec {
             addr: target.helper_addr,
             server_name: target.server_name.clone(),
@@ -142,78 +138,133 @@ pub async fn connect_via_relay_with_connection(
     Ok((conn, stream, proof))
 }
 
-/// The HELLO/proof/ACK handshake itself (`archive/HELPER_PROTOCOL.md` §4), layered on
-/// top of an *already-created* `QuicEndpoint`. Shared by `connect_via_relay`
-/// (endpoint from a fresh `QuicEndpointFactory::create_endpoint` call),
-/// `stun_p2p::connect_stun_p2p` (endpoint wrapping a socket that already did
-/// a STUN query + hole-punch probes), and `resume::connect_via_relay_resumable`
-/// (Phase S-4c, which additionally needs the live connection and the HELLO
-/// proof afterward to open a control stream) — `archive/ISEKAI_SSH_DESIGN.md` calls
-/// out that "既存の`connect_via_relay`と同じロジックを再利用できるはず" for both,
-/// so this is the one place the handshake itself lives. Callers that don't
-/// need the connection/proof (`connect_via_relay`, `connect_stun_p2p`) simply
-/// drop them.
+/// The generic dial step, plus this crate's own attempt-id generation and
+/// `QuicConnect`-stage telemetry/failure-classification around it — split
+/// out of what used to be one `connect_and_handshake` function so the actual
+/// dial (`endpoint.connect`, now `quicmux::AnyMuxEndpoint::connect`) is
+/// visibly just a call into `quicmux`, with everything isekai-specific
+/// (ATTACH v2's HELLO/proof/ACK) layered on top by [`attach_handshake`].
+/// Kept as a thin wrapper — not two independently-callable public
+/// functions — because every current caller wants the combined behavior;
+/// splitting it further would just make every call site repeat the same
+/// four lines.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_and_handshake(
-    endpoint: &dyn QuicEndpoint,
+    endpoint: &AnyMuxEndpoint,
     remote: RemoteSpec,
     session_secret: &[u8],
     session_id: SessionId,
     generation: ConnectionGeneration,
     requested_resume_grace_secs: u32,
     identity: CandidateIdentity<'_>,
-) -> Result<(Box<dyn QuicConnection>, Box<dyn ByteStream>, Proof, u32), ConnectAttemptError> {
-    // No staggered/parallel candidate racing exists yet (`ISEKAI_PIPE_DESIGN.md`
-    // — every attempt today is dialed immediately, one at a time), so
-    // `start_delay` is always zero. Recorded now anyway so telemetry log
-    // consumers don't need a schema migration once that lands.
+) -> Result<(AnyMuxConnection, AnyByteStream, Proof, u32), ConnectAttemptError> {
+    // No staggered/parallel candidate racing exists at this layer (`#19`'s
+    // `race.rs` handles that one level up, by racing two whole
+    // `connect_and_handshake` calls against each other) — every attempt here
+    // is dialed immediately, so `start_delay` is always zero. Recorded now
+    // anyway so telemetry log consumers don't need a schema migration once
+    // that lands.
     let start_delay = Duration::ZERO;
     let attempt_start = Instant::now();
     // Generated up front (independent of the connection) so it's available
-    // to every `cancelled(..)` call below, including the earliest failure
-    // points (`#13a`: every attempt log line carries this attempt's id).
+    // to the earliest possible failure point (`#13a`: every attempt log line
+    // carries this attempt's id).
     let attempt_id = random_attempt_id();
-    let cancelled = |failure_stage: &str,
-                     quic_handshake_time: Option<Duration>,
-                     authenticated_ready_time: Option<Duration>| {
+
+    let conn = match endpoint.connect(remote).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            log_candidate_attempt(&CandidateAttempt {
+                identity,
+                session_id,
+                generation,
+                attempt_id,
+                start_delay,
+                quic_handshake_time: None,
+                authenticated_ready_time: None,
+                failure_stage: Some("quic-connect"),
+                outcome: CandidateOutcome::Cancelled,
+            });
+            return Err(ConnectAttemptError { stage: ConnectAttemptStage::QuicConnect, source: TransportError::Mux(e) });
+        }
+    };
+    let quic_handshake_time = attempt_start.elapsed();
+
+    attach_handshake(
+        conn,
+        session_secret,
+        session_id,
+        generation,
+        requested_resume_grace_secs,
+        identity,
+        attempt_id,
+        attempt_start,
+        start_delay,
+        quic_handshake_time,
+    )
+    .await
+}
+
+/// Everything after the dial: ATTACH v2's HELLO/proof/`AttachReadyV2`/
+/// `AttachActivate` handshake (`archive/HELPER_PROTOCOL.md` §4) on an
+/// *already-connected* [`AnyMuxConnection`]. Shared by `connect_via_relay`
+/// (connection from a fresh `AnyMuxFactory::create_endpoint` call, via
+/// [`connect_and_handshake`]), `stun_p2p::connect_stun_p2p` (connection from
+/// an endpoint that wrapped a socket that already did a STUN query +
+/// hole-punch probes), and `resume::connect_via_relay_resumable` (which
+/// additionally needs the live connection and the HELLO proof afterward to
+/// open a control stream) — this is the one place the handshake itself
+/// lives; callers that don't need the connection/proof simply drop them.
+///
+/// Takes the dial step's own telemetry context (`attempt_id`/`attempt_start`/
+/// `start_delay`/`quic_handshake_time`) rather than measuring its own, so
+/// every log line this function emits carries *exactly* the same attempt
+/// identity and dial timing [`connect_and_handshake`]'s dial step already
+/// established — splitting the dial out must not change what gets logged or
+/// when, only where the code that does it lives.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn attach_handshake(
+    conn: AnyMuxConnection,
+    session_secret: &[u8],
+    session_id: SessionId,
+    generation: ConnectionGeneration,
+    requested_resume_grace_secs: u32,
+    identity: CandidateIdentity<'_>,
+    attempt_id: AttemptId,
+    attempt_start: Instant,
+    start_delay: Duration,
+    quic_handshake_time: Duration,
+) -> Result<(AnyMuxConnection, AnyByteStream, Proof, u32), ConnectAttemptError> {
+    let cancelled = |failure_stage: String| {
         log_candidate_attempt(&CandidateAttempt {
             identity,
             session_id,
             generation,
             attempt_id,
             start_delay,
-            quic_handshake_time,
-            authenticated_ready_time,
-            failure_stage: Some(failure_stage),
+            quic_handshake_time: Some(quic_handshake_time),
+            authenticated_ready_time: None,
+            failure_stage: Some(&failure_stage),
             outcome: CandidateOutcome::Cancelled,
         });
     };
 
-    let conn = match endpoint.connect(remote).await {
-        Ok(conn) => conn,
-        Err(e) => {
-            cancelled("quic-connect", None, None);
-            return Err(ConnectAttemptError { stage: ConnectAttemptStage::QuicConnect, source: e });
-        }
-    };
-    let quic_handshake_time = attempt_start.elapsed();
-
     // The plain (non-ATTACH-specific) proof, reused as-is by the control
     // stream's `CONTROL_HELLO` (`resume::open_control_stream`) — unrelated to
     // ATTACH v2's own, separately domain-separated proof below.
-    let proof = match compute_proof(conn.as_ref(), session_secret, b"").await {
+    let proof = match compute_proof(&conn, session_secret, b"").await {
         Ok(proof) => proof,
         Err(e) => {
-            cancelled("compute-proof", Some(quic_handshake_time), None);
+            cancelled("compute-proof".to_string());
             return Err(ConnectAttemptError { stage: ConnectAttemptStage::ComputeProof, source: e });
         }
     };
 
     let transcript = attach_hello_proof_transcript(&session_id, generation, &attempt_id, requested_resume_grace_secs);
-    let attach_proof = match compute_proof(conn.as_ref(), session_secret, &transcript).await {
+    let attach_proof = match compute_proof(&conn, session_secret, &transcript).await {
         Ok(proof) => AttachProof::new(*proof.as_bytes()),
         Err(e) => {
-            cancelled("compute-proof", Some(quic_handshake_time), None);
+            cancelled("compute-proof".to_string());
             return Err(ConnectAttemptError { stage: ConnectAttemptStage::ComputeProof, source: e });
         }
     };
@@ -221,20 +272,20 @@ pub(crate) async fn connect_and_handshake(
     let mut stream = match conn.open_bi().await {
         Ok(stream) => stream,
         Err(e) => {
-            cancelled("open-stream", Some(quic_handshake_time), None);
-            return Err(ConnectAttemptError { stage: ConnectAttemptStage::OpenStream, source: e });
+            cancelled("open-stream".to_string());
+            return Err(ConnectAttemptError { stage: ConnectAttemptStage::OpenStream, source: TransportError::Mux(e) });
         }
     };
     let hello = AttachHello { session_id, generation, attempt_id, requested_resume_grace_secs, proof: attach_proof };
     if let Err(e) = stream.write_all(&encode_attach_hello(&hello)).await {
-        cancelled("hello-write", Some(quic_handshake_time), None);
-        return Err(ConnectAttemptError { stage: ConnectAttemptStage::HelloWrite, source: e });
+        cancelled("hello-write".to_string());
+        return Err(ConnectAttemptError { stage: ConnectAttemptStage::HelloWrite, source: TransportError::Mux(e) });
     }
 
-    let response = match read_attach_response(stream.as_mut()).await {
+    let response = match read_attach_response(&mut stream).await {
         Ok(response) => response,
         Err(e) => {
-            cancelled("ack-read", Some(quic_handshake_time), None);
+            cancelled("ack-read".to_string());
             return Err(ConnectAttemptError { stage: ConnectAttemptStage::AckRead, source: e });
         }
     };
@@ -242,8 +293,8 @@ pub(crate) async fn connect_and_handshake(
         AttachResponse::Ready { attach_token, negotiated_resume_grace_secs, .. } => {
             let activate = AttachActivate { session_id, generation, attempt_id, attach_token };
             if let Err(e) = stream.write_all(&encode_attach_activate(&activate)).await {
-                cancelled("activate-write", Some(quic_handshake_time), None);
-                return Err(ConnectAttemptError { stage: ConnectAttemptStage::ActivateWrite, source: e });
+                cancelled("activate-write".to_string());
+                return Err(ConnectAttemptError { stage: ConnectAttemptStage::ActivateWrite, source: TransportError::Mux(e) });
             }
             let authenticated_ready_time = attempt_start.elapsed();
             info!("isekai-transport: ATTACH_HELLO/AttachReadyV2/AttachActivate ok — stream ready for pass-through");
@@ -261,7 +312,7 @@ pub(crate) async fn connect_and_handshake(
             Ok((conn, stream, proof, negotiated_resume_grace_secs))
         }
         AttachResponse::Reject(reason) => {
-            cancelled(&format!("rejected:{reason:?}"), Some(quic_handshake_time), None);
+            cancelled(format!("rejected:{reason:?}"));
             Err(ConnectAttemptError {
                 stage: ConnectAttemptStage::Rejected(RejectReason::from_attach_reject(reason)),
                 source: TransportError::Rejected(reason),
@@ -275,7 +326,7 @@ pub(crate) async fn connect_and_handshake(
 /// `STALE_GENERATION_REJECT_FRAME_LEN - 1` for `STALE_GENERATION`, or nothing
 /// for every other known reject byte (`isekai_protocol::attach::decode_attach_response`'s
 /// docs — mirrors the old `read_ack_response`'s two-step read).
-async fn read_attach_response(stream: &mut dyn ByteStream) -> Result<AttachResponse, TransportError> {
+async fn read_attach_response(stream: &mut AnyByteStream) -> Result<AttachResponse, TransportError> {
     let mut type_byte = [0u8; 1];
     read_exact(stream, &mut type_byte).await?;
     let mut full = vec![type_byte[0]];
@@ -292,14 +343,14 @@ async fn read_attach_response(stream: &mut dyn ByteStream) -> Result<AttachRespo
     Ok(decode_attach_response(&full)?)
 }
 
-/// `ByteStream::read` only guarantees "at most `buf.len()` bytes, possibly
+/// `AnyByteStream::read` only guarantees "at most `buf.len()` bytes, possibly
 /// fewer"; the 1-byte ACK response needs the usual `read_exact` loop on top.
 /// `pub(crate)` so `resume.rs` (control stream / `RESUME_ACK` handshakes) can
 /// reuse it instead of re-implementing the same loop a third time.
-pub(crate) async fn read_exact(stream: &mut dyn ByteStream, buf: &mut [u8]) -> Result<(), TransportError> {
+pub(crate) async fn read_exact(stream: &mut AnyByteStream, buf: &mut [u8]) -> Result<(), TransportError> {
     let mut filled = 0;
     while filled < buf.len() {
-        let n = stream.read(&mut buf[filled..]).await?;
+        let n = stream.read(&mut buf[filled..]).await.map_err(TransportError::Mux)?;
         if n == 0 {
             return Err(TransportError::UnexpectedEof);
         }

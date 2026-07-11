@@ -1,5 +1,5 @@
 //! Binding a UDP socket to a specific physical network interface, for
-//! [`crate::traits::QuicEndpointRebinder::rebind_socket`] — the CLI/PC side
+//! [`quicmux::AnyMuxRebinder::rebind_socket`] — the CLI/PC side
 //! of the "rebind onto a warm-standby physical interface" mechanism
 //! (`multipath_transport.rs`'s Phase 9-4b `rebind_abstract()`, real-hardware
 //! verified on Android; see [`crate::path_health`]'s module docs for why
@@ -27,7 +27,7 @@ pub use quicsock;
 pub use quicsock::InterfaceIndex;
 
 /// Binds a UDP socket restricted to `interface` at `local_addr`, ready to
-/// pass to [`crate::traits::QuicEndpointRebinder::rebind_socket`]. `quicsock`
+/// pass to [`quicmux::AnyMuxRebinder::rebind_socket`]. `quicsock`
 /// itself returns a [`socket2::Socket`] (implementation-agnostic — see its
 /// own module docs); this converts it to the plain [`std::net::UdpSocket`]
 /// `rebind_socket` expects.

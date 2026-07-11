@@ -53,11 +53,11 @@ use isekai_protocol::resume::{
 use isekai_protocol::session_id::{decode_session_id, SessionId, SESSION_ID_LEN};
 use log::info;
 
+use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxFactory, AnyMuxRebinder, RemoteSpec};
+
 use crate::error::TransportError;
 use crate::proof::compute_proof;
 use crate::relay::{connect_and_handshake, random_session_id, read_exact, RelayTarget};
-use crate::traits::{ByteStream, QuicConnection, QuicEndpointFactory, QuicEndpointRebinder};
-use crate::types::{BindSpec, RemoteSpec};
 
 /// `archive/HELPER_PROTOCOL.md` §7.3 control-stream frame markers. `RESUME`/
 /// `RESUME_ACK` already live in `isekai_protocol::resume` (Phase S-4a); these
@@ -83,7 +83,7 @@ const CONTROL_ACK_FRAME_LEN: usize = 1 + SESSION_ID_LEN;
 /// and already sent it in `ATTACH_HELLO`; `CONTROL_ACK` merely confirms the
 /// server recorded the same one).
 pub struct ControlStream {
-    pub stream: Box<dyn ByteStream>,
+    pub stream: AnyByteStream,
     pub session_id: SessionId,
 }
 
@@ -93,19 +93,16 @@ pub struct ControlStream {
 /// computed from the same connection's exporter with an empty `extra`, so
 /// they are always equal; recomputing would just waste an HMAC call
 /// (`isekai_pipe_quic_transport.rs::open_control_stream`'s same shortcut).
-pub async fn open_control_stream(
-    conn: &dyn QuicConnection,
-    proof: &Proof,
-) -> Result<ControlStream, TransportError> {
-    let mut stream = conn.open_bi().await?;
+pub async fn open_control_stream(conn: &AnyMuxConnection, proof: &Proof) -> Result<ControlStream, TransportError> {
+    let mut stream = conn.open_bi().await.map_err(TransportError::Mux)?;
 
     let mut hello = Vec::with_capacity(CONTROL_HELLO_FRAME_LEN);
     hello.push(CONTROL_HELLO);
     hello.extend_from_slice(proof.as_bytes());
-    stream.write_all(&hello).await?;
+    stream.write_all(&hello).await.map_err(TransportError::Mux)?;
 
     let mut ack = [0u8; CONTROL_ACK_FRAME_LEN];
-    read_exact(stream.as_mut(), &mut ack).await?;
+    read_exact(&mut stream, &mut ack).await?;
     if ack[0] != CONTROL_ACK {
         return Err(TransportError::ControlHandshake(format!(
             "unexpected control response byte {:#x}",
@@ -127,9 +124,9 @@ pub async fn open_control_stream(
 /// this handle is dropped (mirrors `connect_via_relay`'s existing behavior of
 /// dropping its own connection handle immediately).
 pub struct ResumableRelaySession {
-    pub connection: Box<dyn QuicConnection>,
-    pub data_stream: Box<dyn ByteStream>,
-    pub control_stream: Box<dyn ByteStream>,
+    pub connection: AnyMuxConnection,
+    pub data_stream: AnyByteStream,
+    pub control_stream: AnyByteStream,
     pub session_id: SessionId,
     /// The resume-grace period the server actually granted
     /// (`min(requested_resume_grace_secs, server's own configured max)`, or
@@ -139,16 +136,16 @@ pub struct ResumableRelaySession {
     /// server will have already discarded the parked session past this point
     /// regardless (`ISEKAI_PIPE_DESIGN.md`).
     pub effective_resume_grace_secs: u32,
-    /// A handle to switch this session's underlying QUIC endpoint to a new
+    /// A handle to switch this session's underlying mux endpoint to a new
     /// local socket without a full RESUME reconnect, if the endpoint that
-    /// produced `connection` supports it (`QuicEndpoint::rebinder`) — `None`
-    /// for any `QuicEndpointFactory` implementation that doesn't (every one
-    /// today except `system::SystemQuicEndpointFactory`). Tied to *this*
-    /// connection's endpoint specifically: after a `reconnect_and_resume`
-    /// call replaces `connection`, the caller must take this field's fresh
-    /// value from that call's `ResumeAckOutcome`, not keep reusing an old one
-    /// pointing at an endpoint that may no longer be driving anything.
-    pub network_rebinder: Option<Box<dyn QuicEndpointRebinder>>,
+    /// produced `connection` supports it (`AnyMuxEndpoint::rebinder`) —
+    /// `None` for any backend that doesn't (every one today except `noq`,
+    /// see `quicmux::AnyMuxRebinder`'s docs). Tied to *this* connection's
+    /// endpoint specifically: after a `reconnect_and_resume` call replaces
+    /// `connection`, the caller must take this field's fresh value from that
+    /// call's `ResumeAckOutcome`, not keep reusing an old one pointing at an
+    /// endpoint that may no longer be driving anything.
+    pub network_rebinder: Option<AnyMuxRebinder>,
 }
 
 /// Like `relay::connect_via_relay`, but additionally opens the control stream
@@ -157,14 +154,14 @@ pub struct ResumableRelaySession {
 /// given isekai-helper instance; `reconnect_and_resume` is used for every
 /// subsequent reconnection after a disconnect.
 pub async fn connect_via_relay_resumable(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     target: &RelayTarget,
     requested_resume_grace_secs: u32,
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<ResumableRelaySession, TransportError> {
-    let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await?;
+    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await.map_err(TransportError::Mux)?;
     let (conn, data_stream, proof, effective_resume_grace_secs) = connect_and_handshake(
-        endpoint.as_ref(),
+        &endpoint,
         RemoteSpec {
             addr: target.helper_addr,
             server_name: target.server_name.clone(),
@@ -179,12 +176,12 @@ pub async fn connect_via_relay_resumable(
     .await?;
 
     // Taken before `endpoint` goes out of scope at the end of this function
-    // — `noq::Endpoint::rebinder()`'s returned handle clones the underlying
-    // `noq::Endpoint`, which stays independently usable afterward (see
-    // `SystemQuicEndpoint::rebinder`'s doc comment).
+    // — `AnyMuxEndpoint::rebinder()`'s returned handle clones the underlying
+    // engine endpoint (`noq::Endpoint` today), which stays independently
+    // usable afterward.
     let network_rebinder = endpoint.rebinder();
 
-    let control = open_control_stream(conn.as_ref(), &proof).await?;
+    let control = open_control_stream(&conn, &proof).await?;
     info!("isekai-transport: control stream established, session_id={}", control.session_id);
 
     Ok(ResumableRelaySession {
@@ -345,7 +342,7 @@ impl std::error::Error for SequentialConnectError {}
 /// (resume is scoped to one already-established `session_id` on one specific
 /// helper connection, not a fresh candidate search).
 pub async fn connect_via_relay_resumable_with_fallback(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     candidates: &[SequentialRelayCandidate],
     requested_resume_grace_secs: u32,
 ) -> Result<(ResumableRelaySession, RelayTarget), SequentialConnectError> {
@@ -383,21 +380,21 @@ pub async fn connect_via_relay_resumable_with_fallback(
                 id: &candidate.candidate_id,
             };
 
-            let endpoint = match factory.create_endpoint(BindSpec::any_ipv4()).await {
+            let endpoint = match factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await {
                 Ok(endpoint) => endpoint,
                 Err(source) => {
                     // Binding our own local socket never touches the remote
                     // server at all — unconditionally safe to move on.
                     failures.push(SequentialFailure {
                         candidate_id: candidate.candidate_id.clone(),
-                        failure: crate::attempt::AttemptFailure::RetryablePreAttach { source },
+                        failure: crate::attempt::AttemptFailure::RetryablePreAttach { source: TransportError::Mux(source) },
                     });
                     continue;
                 }
             };
 
             let attempt = connect_and_handshake(
-                endpoint.as_ref(),
+                &endpoint,
                 RemoteSpec {
                     addr: candidate.target.helper_addr,
                     server_name: candidate.target.server_name.clone(),
@@ -500,7 +497,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
             // comment on why that's safe.
             let network_rebinder = endpoint.rebinder();
 
-            let control = match open_control_stream(conn.as_ref(), &proof).await {
+            let control = match open_control_stream(&conn, &proof).await {
                 Ok(control) => control,
                 Err(source) => {
                     return Err(SequentialConnectError::AttachedButControlStreamFailed {
@@ -542,7 +539,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
 /// `ResumableRelaySession` is just as resume-capable as a freshly attached
 /// one going forward.
 async fn finish_via_resume(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     resume_target: &RelayTarget,
     session_id: SessionId,
     candidate_id: String,
@@ -551,10 +548,10 @@ async fn finish_via_resume(
         .await
         .map_err(|source| SequentialConnectError::MustResumeButResumeFailed { candidate_id: candidate_id.clone(), source })?;
 
-    let proof = compute_proof(resumed.connection.as_ref(), &resume_target.session_secret, b"")
+    let proof = compute_proof(&resumed.connection, &resume_target.session_secret, b"")
         .await
         .map_err(|source| SequentialConnectError::MustResumeButResumeFailed { candidate_id: candidate_id.clone(), source })?;
-    let control = open_control_stream(resumed.connection.as_ref(), &proof)
+    let control = open_control_stream(&resumed.connection, &proof)
         .await
         .map_err(|source| SequentialConnectError::MustResumeButResumeFailed { candidate_id, source })?;
 
@@ -588,14 +585,14 @@ async fn finish_via_resume(
 /// for diagnostics/consistency checking, how much it already sent
 /// (`helper_sent_offset`).
 pub struct ResumeAckOutcome {
-    pub connection: Box<dyn QuicConnection>,
-    pub data_stream: Box<dyn ByteStream>,
+    pub connection: AnyMuxConnection,
+    pub data_stream: AnyByteStream,
     pub helper_committed_offset: C2hHelperCommittedOffset,
     pub helper_sent_offset: H2cSentOffset,
     /// See `ResumableRelaySession::network_rebinder` — this reconnect made a
     /// brand-new endpoint, so this is a fresh handle onto *that* one, not a
     /// stale reference to whatever endpoint the previous connection used.
-    pub network_rebinder: Option<Box<dyn QuicEndpointRebinder>>,
+    pub network_rebinder: Option<AnyMuxRebinder>,
 }
 
 /// Dials a brand-new QUIC connection to `target.helper_addr` and sends
@@ -611,20 +608,21 @@ pub struct ResumeAckOutcome {
 /// naming) — the caller (`isekai-ssh`) owns that bookkeeping; this function
 /// only knows how to put them on the wire and parse the response.
 pub async fn reconnect_and_resume(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     target: &RelayTarget,
     session_id: SessionId,
     client_sent_offset: C2hSentOffset,
     client_delivered_offset: H2cClientDeliveredOffset,
 ) -> Result<ResumeAckOutcome, TransportError> {
-    let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await?;
+    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await.map_err(TransportError::Mux)?;
     let conn = endpoint
         .connect(RemoteSpec {
             addr: target.helper_addr,
             server_name: target.server_name.clone(),
             cert_sha256_hex: target.cert_sha256_hex.clone(),
         })
-        .await?;
+        .await
+        .map_err(TransportError::Mux)?;
     // Taken before `endpoint` goes out of scope at the end of this function
     // — see `connect_via_relay_resumable`'s identical comment.
     let network_rebinder = endpoint.rebinder();
@@ -637,23 +635,23 @@ pub async fn reconnect_and_resume(
     // (`isekai-helper/src/main.rs` uses one `EXPORTER_LABEL` throughout,
     // confirmed by reading that file directly rather than trusting
     // `archive/HELPER_PROTOCOL.md`'s prose, which names a different, unused label).
-    let resume_proof_bytes = compute_proof(conn.as_ref(), &target.session_secret, session_id.as_bytes()).await?;
+    let resume_proof_bytes = compute_proof(&conn, &target.session_secret, session_id.as_bytes()).await?;
     let resume_proof = ResumeProof::new(*resume_proof_bytes.as_bytes());
 
-    let mut stream = conn.open_bi().await?;
+    let mut stream = conn.open_bi().await.map_err(TransportError::Mux)?;
     let frame =
         ResumeFrame { session_id, resume_proof, client_sent_offset, client_delivered_offset };
-    stream.write_all(&encode_resume(&frame)).await?;
+    stream.write_all(&encode_resume(&frame)).await.map_err(TransportError::Mux)?;
 
     let mut type_byte = [0u8; 1];
-    read_exact(stream.as_mut(), &mut type_byte).await?;
+    read_exact(&mut stream, &mut type_byte).await?;
     if type_byte[0] != FRAME_RESUME_ACK {
         let reason = decode_resume_reject(type_byte[0])?;
         return Err(TransportError::ResumeRejected(reason));
     }
 
     let mut rest = [0u8; RESUME_ACK_FRAME_LEN - 1];
-    read_exact(stream.as_mut(), &mut rest).await?;
+    read_exact(&mut stream, &mut rest).await?;
     let mut full = [0u8; RESUME_ACK_FRAME_LEN];
     full[0] = FRAME_RESUME_ACK;
     full[1..].copy_from_slice(&rest);
@@ -727,7 +725,7 @@ mod tests {
     fn must_resume_but_resume_failed_delegates_to_source() {
         assert!(SequentialConnectError::MustResumeButResumeFailed {
             candidate_id: "c1".to_string(),
-            source: TransportError::CertPinMismatch { expected: "a".to_string(), got: "b".to_string() },
+            source: TransportError::Mux(quicmux::MuxError::CertPinMismatch { expected: "a".to_string(), got: "b".to_string() }),
         }
         .is_stale_trust_signal());
     }

@@ -20,7 +20,7 @@
 //!   `open_path` with `local_ip: None` (OS default routing) — Android's
 //!   path0/path1 (Tailscale⇔direct address), Phase 9-2/9-3.
 //! - Reactive physical-interface failover via
-//!   [`QuicEndpointRebinder::rebind`](crate::traits::QuicEndpointRebinder) —
+//!   [`quicmux::AnyMuxRebinder::rebind`] —
 //!   the same operation as `noq::Endpoint::rebind_abstract()`
 //!   (`multipath_transport.rs`'s Phase 9-4b), triggered by exactly the
 //!   health/zero-response signals this module classifies.

@@ -40,11 +40,11 @@ use isekai_protocol::session_id::SessionId;
 
 use isekai_protocol::hello::Proof;
 
+use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxFactory, RemoteSpec};
+
 use crate::attempt::AttemptFailure;
 use crate::error::TransportError;
 use crate::relay::{connect_and_handshake, random_session_id};
-use crate::traits::{ByteStream, QuicConnection, QuicEndpointFactory};
-use crate::types::{BindSpec, RemoteSpec};
 
 /// Number of hole-punch probe datagrams sent to the peer's observed address
 /// before attempting the QUIC handshake. Matches
@@ -88,7 +88,7 @@ pub struct StunP2pTarget {
 /// (`archive/ISEKAI_SSH_DESIGN.md` S-6).
 pub struct StunP2pConnection {
     pub our_observed_addr: SocketAddr,
-    pub stream: Box<dyn ByteStream>,
+    pub stream: AnyByteStream,
 }
 
 /// Binds a fresh UDP socket, queries `stun_server` for this socket's own
@@ -104,7 +104,7 @@ pub struct StunP2pConnection {
 /// SSH-bootstrap step that exchanges observed addresses out-of-band is the
 /// caller's responsibility here, not this function's (see module docs).
 pub async fn connect_stun_p2p(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     stun_server: SocketAddr,
     target: &StunP2pTarget,
     identity: crate::telemetry::CandidateIdentity<'_>,
@@ -132,12 +132,12 @@ pub async fn connect_stun_p2p(
 /// see that Android transport's own module docs for why a bare redial (no
 /// re-STUN/re-punch) is this mode's accepted resume-capability ceiling.
 pub async fn connect_stun_p2p_on_socket(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     socket: tokio::net::UdpSocket,
     target: &StunP2pTarget,
     identity: crate::telemetry::CandidateIdentity<'_>,
-) -> Result<(Box<dyn QuicConnection>, Box<dyn ByteStream>, Proof), TransportError> {
-    let endpoint = factory.wrap_bound_socket(socket).await?;
+) -> Result<(AnyMuxConnection, AnyByteStream, Proof), TransportError> {
+    let endpoint = factory.wrap_bound_socket(socket).await.map_err(TransportError::Mux)?;
     let remote = RemoteSpec {
         addr: target.peer_addr,
         server_name: target.server_name.clone(),
@@ -145,7 +145,7 @@ pub async fn connect_stun_p2p_on_socket(
     };
     // No resume support on this path either (module docs) — `0` ("no preference").
     let (conn, stream, proof, _effective_resume_grace_secs) = connect_and_handshake(
-        endpoint.as_ref(), remote, &target.session_secret, random_session_id(), ConnectionGeneration::INITIAL, 0, identity,
+        &endpoint, remote, &target.session_secret, random_session_id(), ConnectionGeneration::INITIAL, 0, identity,
     )
     .await?;
     Ok((conn, stream, proof))
@@ -239,7 +239,7 @@ impl std::error::Error for SequentialStunConnectError {}
 /// can tell a fallback attempt to a different STUN server is still logically
 /// the same attach round, not a second concurrent session.
 pub async fn connect_stun_p2p_with_fallback(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     target: &StunP2pTarget,
     candidates: &[SequentialStunCandidate],
 ) -> Result<(StunP2pConnection, SocketAddr), SequentialStunConnectError> {
@@ -277,16 +277,16 @@ pub async fn connect_stun_p2p_with_fallback(
 }
 
 pub(crate) async fn connect_stun_p2p_with_round(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     stun_server: SocketAddr,
     target: &StunP2pTarget,
     session_id: SessionId,
     generation: ConnectionGeneration,
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<StunP2pConnection, AttemptFailure> {
-    let bind_addr = BindSpec::any_ipv4().local_addr;
+    let bind_addr = quicmux::BindSpec::any_ipv4().local_addr;
     let socket = tokio::net::UdpSocket::bind(bind_addr).await.map_err(|source| AttemptFailure::RetryablePreAttach {
-        source: TransportError::Bind { addr: bind_addr, source },
+        source: TransportError::Mux(quicmux::MuxError::Bind { addr: bind_addr, source }),
     })?;
 
     let our_observed_addr = isekai_stun::query_stun(&socket, stun_server)
@@ -306,11 +306,15 @@ pub(crate) async fn connect_stun_p2p_with_round(
 
     // どの具体的なnoq::AsyncUdpSocketでラップするか(素通しかフォルト注入可能か)は
     // factory実装ごとに異なる(isekai-terminal-core/isekai-transport crate共有化
-    // Phase 1c、`QuicEndpointFactory::wrap_bound_socket`のdocコメント参照)。
+    // Phase 1c、`quicmux::AnyMuxFactory::wrap_bound_socket`のdocコメント参照)。
+    // `qmux`バックエンドではこの呼び出しは常に`MuxError::Unsupported`で失敗する
+    // (QMuxはTCP上で動くためbindされたUDPソケットをラップする概念自体が無い、
+    // `quicmux::qmux_backend`のdoc参照) — STUN P2Pが実質noqバックエンド限定に
+    // なるのはこの層のジェネリックさとは無関係な、backendそのものの制約。
     let endpoint = factory
         .wrap_bound_socket(socket)
         .await
-        .map_err(|source| AttemptFailure::RetryablePreAttach { source })?;
+        .map_err(|source| AttemptFailure::RetryablePreAttach { source: TransportError::Mux(source) })?;
 
     let remote = RemoteSpec {
         addr: target.peer_addr,
@@ -320,7 +324,7 @@ pub(crate) async fn connect_stun_p2p_with_round(
     // No resume support on this path (module docs), so there is no grace
     // period to request — `0` ("no preference").
     let (_conn, stream, _proof, _effective_resume_grace_secs) =
-        connect_and_handshake(endpoint.as_ref(), remote, &target.session_secret, session_id, generation, 0, identity)
+        connect_and_handshake(&endpoint, remote, &target.session_secret, session_id, generation, 0, identity)
             .await
             .map_err(AttemptFailure::from)?;
 

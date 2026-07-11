@@ -15,6 +15,14 @@
 //! `#25`'s retry behavior is deferred to `#13b`'s evaluation, once real
 //! telemetry says it's worth the complexity.
 //!
+//! The actual staggered-race mechanics (`tokio::select!` over two futures
+//! with a delayed second start) don't depend on QUIC/mux types or any
+//! isekai-specific type — that part moved to `quicmux::race_with_stagger`
+//! once it became clear it was a pure async combinator. This module keeps
+//! everything that *is* isekai-specific: the shared fencing identity
+//! (`session_id`/`generation`, `#18`), `AttemptFailure` classification, and
+//! `RaceWinner`/`RaceConnectError`.
+//!
 //! **Precondition this module cannot itself enforce**: both candidates
 //! passed to [`race_direct_and_relay`] must resolve to the *same* underlying
 //! `isekai-pipe serve` instance (the same `AttachArbiter`). If they don't,
@@ -29,13 +37,12 @@ use std::time::Duration;
 
 use isekai_protocol::attach::ConnectionGeneration;
 use isekai_protocol::session_id::SessionId;
+use quicmux::{AnyByteStream, AnyMuxFactory, RemoteSpec, Winner};
 
 use crate::attempt::AttemptFailure;
 use crate::relay::{connect_and_handshake, random_session_id};
 use crate::stun_p2p::{connect_stun_p2p_with_round, StunP2pTarget};
 use crate::telemetry::CandidateIdentity;
-use crate::traits::{ByteStream, QuicEndpointFactory};
-use crate::types::{BindSpec, RemoteSpec};
 use crate::RelayTarget;
 
 /// Default stagger before the relay candidate joins the race, if the direct
@@ -66,7 +73,7 @@ pub enum RaceWinner {
 /// `connect_stun_p2p` call — plus which one won, for logging/telemetry.
 pub struct RaceOutcome {
     pub winner: RaceWinner,
-    pub stream: Box<dyn ByteStream>,
+    pub stream: AnyByteStream,
 }
 
 /// Both candidates failed. `LostRace` (`ALREADY_ATTACHED`) is deliberately
@@ -99,15 +106,20 @@ impl std::error::Error for RaceConnectError {}
 /// whichever it authenticates first win (`ALREADY_ATTACHED` for the loser),
 /// exactly the guarantee `#18`'s fencing exists to provide.
 ///
-/// Whichever future is still in flight when the other one wins is simply
-/// dropped (cancelled in place) — no `CANCEL_ATTACH` is sent (this crate's
-/// candidates share one QUIC connection factory call per attempt, not a
-/// background task, so there is nothing left running to explicitly tell the
-/// server about; the loser's connection attempt just stops making progress
-/// once dropped, and the server's own `AttachArbiter` will eventually see
-/// nothing more arrive on that lease if it wasn't already accepted).
+/// The actual racing (staggered start, waiting on the other candidate if the
+/// first to finish failed) is [`quicmux::race_with_stagger`] — this function
+/// only supplies the two candidate futures and translates its
+/// backend-agnostic `Winner::A`/`Winner::B` back into this module's own
+/// `RaceWinner::Direct`/`RaceWinner::Relay`. Whichever future is still in
+/// flight when the other one wins is simply dropped (cancelled in place) —
+/// no `CANCEL_ATTACH` is sent (this crate's candidates share one QUIC
+/// connection factory call per attempt, not a background task, so there is
+/// nothing left running to explicitly tell the server about; the loser's
+/// connection attempt just stops making progress once dropped, and the
+/// server's own `AttachArbiter` will eventually see nothing more arrive on
+/// that lease if it wasn't already accepted).
 pub async fn race_direct_and_relay(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     targets: &DirectRelayRaceTargets,
     relay_delay: Duration,
 ) -> Result<RaceOutcome, RaceConnectError> {
@@ -115,68 +127,38 @@ pub async fn race_direct_and_relay(
     let generation = ConnectionGeneration::INITIAL;
 
     let direct_identity = CandidateIdentity { kind: "stun-p2p", source: "race", provider: "race", id: "direct" };
-    let mut direct_fut = Box::pin(connect_stun_p2p_with_round(
-        factory, targets.stun_server, &targets.direct, session_id, generation, direct_identity,
-    ));
+    let direct_fut = async {
+        connect_stun_p2p_with_round(factory, targets.stun_server, &targets.direct, session_id, generation, direct_identity)
+            .await
+            .map(|conn| conn.stream)
+    };
 
     let relay_identity = CandidateIdentity { kind: "relay", source: "race", provider: "race", id: "relay" };
+    let relay_fut = relay_attempt(factory, &targets.relay, session_id, generation, relay_identity);
 
-    // Phase 1: give direct a head start. If it finishes (either way) before
-    // `relay_delay` elapses, relay never even starts.
-    if let Ok(direct_result) = tokio::time::timeout(relay_delay, direct_fut.as_mut()).await {
-        return match direct_result {
-            Ok(conn) => Ok(RaceOutcome { winner: RaceWinner::Direct, stream: conn.stream }),
-            Err(direct_err) => match relay_attempt(factory, &targets.relay, session_id, generation, relay_identity).await {
-                Ok(stream) => Ok(RaceOutcome { winner: RaceWinner::Relay, stream }),
-                Err(relay_err) => Err(RaceConnectError { direct: direct_err, relay: relay_err }),
-            },
-        };
-    }
-
-    // Phase 2: direct is still running past the stagger window; relay joins
-    // the race. Whichever succeeds first wins; if the first to finish
-    // failed, keep waiting on the other one rather than giving up
-    // immediately (both must fail for this to be an error).
-    let mut relay_fut = Box::pin(relay_attempt(factory, &targets.relay, session_id, generation, relay_identity));
-
-    tokio::select! {
-        direct_result = direct_fut.as_mut() => {
-            match direct_result {
-                Ok(conn) => Ok(RaceOutcome { winner: RaceWinner::Direct, stream: conn.stream }),
-                Err(direct_err) => match relay_fut.await {
-                    Ok(stream) => Ok(RaceOutcome { winner: RaceWinner::Relay, stream }),
-                    Err(relay_err) => Err(RaceConnectError { direct: direct_err, relay: relay_err }),
-                },
-            }
-        }
-        relay_result = relay_fut.as_mut() => {
-            match relay_result {
-                Ok(stream) => Ok(RaceOutcome { winner: RaceWinner::Relay, stream }),
-                Err(relay_err) => match direct_fut.await {
-                    Ok(conn) => Ok(RaceOutcome { winner: RaceWinner::Direct, stream: conn.stream }),
-                    Err(direct_err) => Err(RaceConnectError { direct: direct_err, relay: relay_err }),
-                },
-            }
-        }
+    match quicmux::race_with_stagger(direct_fut, relay_fut, relay_delay).await {
+        Ok((Winner::A, stream)) => Ok(RaceOutcome { winner: RaceWinner::Direct, stream }),
+        Ok((Winner::B, stream)) => Ok(RaceOutcome { winner: RaceWinner::Relay, stream }),
+        Err((direct, relay)) => Err(RaceConnectError { direct, relay }),
     }
 }
 
 async fn relay_attempt(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     target: &RelayTarget,
     session_id: SessionId,
     generation: ConnectionGeneration,
     identity: CandidateIdentity<'_>,
-) -> Result<Box<dyn ByteStream>, AttemptFailure> {
+) -> Result<AnyByteStream, AttemptFailure> {
     let endpoint = factory
-        .create_endpoint(BindSpec::any_ipv4())
+        .create_endpoint(quicmux::BindSpec::any_ipv4())
         .await
-        .map_err(|source| AttemptFailure::RetryablePreAttach { source })?;
+        .map_err(|source| AttemptFailure::RetryablePreAttach { source: crate::error::TransportError::Mux(source) })?;
     let remote =
         RemoteSpec { addr: target.helper_addr, server_name: target.server_name.clone(), cert_sha256_hex: target.cert_sha256_hex.clone() };
     // No resume support in the race path yet (module docs: minimal scope) —
     // `0` means "no preference".
-    connect_and_handshake(endpoint.as_ref(), remote, &target.session_secret, session_id, generation, 0, identity)
+    connect_and_handshake(&endpoint, remote, &target.session_secret, session_id, generation, 0, identity)
         .await
         .map(|(_conn, stream, _proof, _grace)| stream)
         .map_err(AttemptFailure::from)

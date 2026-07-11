@@ -12,21 +12,28 @@
 //! **not** port (same-connection physical-interface multipath via
 //! `open_path(local_ip=Some(..))` — a confirmed dead end, noq issue #738).
 //! Reactive physical-interface failover belongs to
-//! [`crate::traits::QuicEndpointRebinder`] instead, driven by the same
+//! [`quicmux::AnyMuxRebinder`] instead, driven by the same
 //! [`crate::path_health`] classification this module also uses — that
 //! wiring is a separate piece of work, not part of this module.
+//!
+//! Noq-concrete on purpose (see [`crate::path_health`]'s docs on why this
+//! module isn't abstracted over `quicmux::AnyMuxConnection` the way
+//! `relay.rs`/`stun_p2p.rs`/`resume.rs` are) — but the client TLS/transport
+//! config it needs is still built through `quicmux::noq_client_config`
+//! rather than hand-rolled here, since that logic (cert pinning, ALPN,
+//! idle-timeout/keepalive/stream-limit tuning) is exactly what moved into
+//! `quicmux` for every other caller too.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use log::{info, warn};
+use quicmux::RemoteSpec;
 use tokio_stream::StreamExt;
 
 use crate::error::TransportError;
 use crate::path_health::{self, PathHealthEvent, PathHealthTracker, PathLabel};
-use crate::system::client_config_for;
-use crate::types::{BindSpec, RemoteSpec};
 
 /// Label [`connect_multipath`] registers the initial connection's path
 /// under (`noq::PathId::ZERO`, established as part of the QUIC handshake
@@ -62,7 +69,7 @@ pub struct MultipathConnection {
 /// `isekai-ssh`, no need to control the underlying socket type). See
 /// [`connect_multipath_with_socket`]'s docs for everything else.
 pub async fn connect_multipath(
-    bind: BindSpec,
+    bind: quicmux::BindSpec,
     primary: RemoteSpec,
     secondaries: Vec<SecondaryPath>,
     event_tx: tokio::sync::mpsc::Sender<PathHealthEvent>,
@@ -71,12 +78,13 @@ pub async fn connect_multipath(
 
     let socket = tokio::net::UdpSocket::bind(bind.local_addr)
         .await
-        .map_err(|source| TransportError::Bind { addr: bind.local_addr, source })?;
-    let std_socket =
-        socket.into_std().map_err(|source| TransportError::Bind { addr: bind.local_addr, source })?;
+        .map_err(|source| TransportError::Mux(quicmux::MuxError::Bind { addr: bind.local_addr, source }))?;
+    let std_socket = socket
+        .into_std()
+        .map_err(|source| TransportError::Mux(quicmux::MuxError::Bind { addr: bind.local_addr, source }))?;
     let async_socket = noq::TokioRuntime
         .wrap_udp_socket(std_socket)
-        .map_err(|e| TransportError::EndpointSetup(e.to_string()))?;
+        .map_err(|e| TransportError::Mux(quicmux::MuxError::EndpointSetup(e.to_string())))?;
 
     connect_multipath_with_socket(async_socket, primary, secondaries, event_tx).await
 }
@@ -99,7 +107,7 @@ pub async fn connect_multipath(
 /// injection test harness — can supply it. `noq::AsyncUdpSocket` is a plain
 /// `noq` trait, not an Android-specific type, so accepting it here doesn't
 /// cross this crate's "no Android/UniFFI types" boundary (mirrors
-/// `traits::QuicEndpointFactory::wrap_bound_socket`'s reason for existing
+/// `quicmux::AnyMuxFactory::wrap_bound_socket`'s reason for existing
 /// alongside `create_endpoint`).
 ///
 /// [`PathHealthEvent`]s (currently just [`PathHealthEvent::NoViablePath`])
@@ -113,12 +121,13 @@ pub async fn connect_multipath_with_socket(
     secondaries: Vec<SecondaryPath>,
     event_tx: tokio::sync::mpsc::Sender<PathHealthEvent>,
 ) -> Result<MultipathConnection, TransportError> {
-    let (client_config, _mismatch) = client_config_for(&primary.cert_sha256_hex, true)?;
+    let (client_config, _mismatch) =
+        quicmux::noq_client_config(&primary.cert_sha256_hex, &crate::system::isekai_mux_config(true)).map_err(TransportError::Mux)?;
 
     let endpoint = noq::Endpoint::new_with_abstract_socket(
         noq::EndpointConfig::default(), None, socket, Arc::new(noq::TokioRuntime),
     )
-    .map_err(|e| TransportError::EndpointSetup(e.to_string()))?;
+    .map_err(|e| TransportError::Mux(quicmux::MuxError::EndpointSetup(e.to_string())))?;
     // Paths opened later via `open_path` ride on the already-authenticated
     // connection (no fresh TLS handshake per path), so this is the only
     // place a client_config is needed — mirrors
@@ -128,9 +137,9 @@ pub async fn connect_multipath_with_socket(
     info!("isekai-transport::multipath: connecting primary -> {}", primary.addr);
     let conn = endpoint
         .connect(primary.addr, &primary.server_name)
-        .map_err(|e| TransportError::ConnectSetup(e.to_string()))?
+        .map_err(|e| TransportError::Mux(quicmux::MuxError::ConnectSetup(e.to_string())))?
         .await
-        .map_err(|e| TransportError::Handshake(e.to_string()))?;
+        .map_err(|e| TransportError::Mux(quicmux::MuxError::Handshake(e.to_string())))?;
     info!("isekai-transport::multipath: primary path established");
 
     let tracker = PathHealthTracker::new();

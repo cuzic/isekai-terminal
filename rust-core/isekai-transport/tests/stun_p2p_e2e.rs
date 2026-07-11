@@ -24,7 +24,7 @@ use isekai_protocol::attach::{
     AttachRejectReason, AttachResponse, AttachToken, ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,
 };
 use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
-use isekai_transport::{connect_stun_p2p, CandidateIdentity, StunP2pTarget, SystemQuicEndpointFactory, TransportError};
+use isekai_transport::{connect_stun_p2p, CandidateIdentity, StunP2pTarget, system_quic_factory, TransportError};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
@@ -200,7 +200,7 @@ async fn connect_stun_p2p_completes_stun_probe_and_hello_ack_over_a_real_quic_co
 
     let mut connection = tokio::time::timeout(
         Duration::from_secs(10),
-        connect_stun_p2p(&SystemQuicEndpointFactory, stun_server, &target, TEST_IDENTITY),
+        connect_stun_p2p(&system_quic_factory(), stun_server, &target, TEST_IDENTITY),
     )
         .await
         .expect("connect_stun_p2p should not hang")
@@ -246,7 +246,7 @@ async fn connect_stun_p2p_surfaces_reject_auth_for_a_wrong_session_secret() {
 
     match tokio::time::timeout(
         Duration::from_secs(10),
-        connect_stun_p2p(&SystemQuicEndpointFactory, stun_server, &target, TEST_IDENTITY),
+        connect_stun_p2p(&system_quic_factory(), stun_server, &target, TEST_IDENTITY),
     )
     .await
     {
@@ -278,7 +278,7 @@ async fn connect_stun_p2p_fails_fast_when_the_stun_server_is_unreachable() {
 
     match tokio::time::timeout(
         Duration::from_secs(10),
-        connect_stun_p2p(&SystemQuicEndpointFactory, dead_stun_server, &target, TEST_IDENTITY),
+        connect_stun_p2p(&system_quic_factory(), dead_stun_server, &target, TEST_IDENTITY),
     )
     .await
     {

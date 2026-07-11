@@ -1,7 +1,7 @@
 //! End-to-end test for `connect_via_relay` against a real local QUIC server
 //! standing in for isekai-helper's own noq server (the peer side of
 //! `isekai_pipe_quic_transport.rs::establish_quic_connection_with_socket`). This
-//! is not a type-checking-only mock: `SystemQuicEndpointFactory` binds an
+//! is not a type-checking-only mock: `system_quic_factory` binds an
 //! actual UDP socket, performs a real QUIC handshake pinned to the server's
 //! self-signed certificate fingerprint, opens a real bidirectional QUIC
 //! stream, and exchanges the real ATTACH v2 wire bytes
@@ -18,7 +18,7 @@ use isekai_protocol::attach::{
     AttachRejectReason, AttachResponse, AttachToken, ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,
 };
 use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
-use isekai_transport::{connect_via_relay, RelayTarget, SystemQuicEndpointFactory, TransportError};
+use isekai_transport::{connect_via_relay, system_quic_factory, MuxError, RelayTarget, TransportError};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
@@ -150,7 +150,7 @@ async fn connect_via_relay_completes_hello_ack_over_a_real_quic_connection() {
         cert_sha256_hex,
         session_secret,
     };
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     let mut stream = tokio::time::timeout(Duration::from_secs(10), connect_via_relay(&factory, &target))
         .await
         .expect("connect_via_relay should not hang")
@@ -190,7 +190,7 @@ async fn connect_via_relay_fails_the_handshake_when_the_cert_pin_does_not_match(
         cert_sha256_hex: wrong_fingerprint,
         session_secret: b"unused".to_vec(),
     };
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     // `Box<dyn ByteStream>` (the success type) isn't `Debug`, so this can't
     // use `.expect_err()`/`.unwrap_err()` (both require `T: Debug`) — match
     // explicitly instead.
@@ -204,7 +204,7 @@ async fn connect_via_relay_fails_the_handshake_when_the_cert_pin_does_not_match(
         // `is_stale_trust_signal()` needs to distinguish "cached trust
         // material went stale" from "peer unreachable".
         Ok(Err(err)) => match &err {
-            TransportError::CertPinMismatch { expected, got } => {
+            TransportError::Mux(MuxError::CertPinMismatch { expected, got }) => {
                 assert_eq!(expected, "0".repeat(64).as_str());
                 assert_ne!(got, expected);
                 assert!(err.is_stale_trust_signal(), "got: {err:?}");
@@ -233,7 +233,7 @@ async fn connect_via_relay_surfaces_reject_auth_for_a_wrong_session_secret() {
         cert_sha256_hex,
         session_secret: b"client-side-secret-does-not-match".to_vec(),
     };
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     match tokio::time::timeout(Duration::from_secs(10), connect_via_relay(&factory, &target)).await {
         Ok(Ok(_stream)) => panic!("a mismatched session_secret must be rejected, but it succeeded"),
         Ok(Err(err)) => {

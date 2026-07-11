@@ -7,7 +7,7 @@
 //! not just that `quicsock::bind_udp` succeeds in isolation
 //! (`physical_interface.rs`'s own unit tests only cover that part).
 //!
-//! Goes through `SystemQuicEndpointFactory` — the actual production
+//! Goes through `system_quic_factory` — the actual production
 //! single-path connection path `isekai-pipe`'s `--experimental-network-
 //! rebind` uses — rather than a hand-rolled connection. Earlier versions of
 //! this test could not do that: `noq::Endpoint::rebind`'s connection-
@@ -27,8 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use isekai_protocol::hello::ALPN;
-use isekai_transport::traits::QuicEndpointFactory as _;
-use isekai_transport::{bind_physical_interface, BindSpec, InterfaceIndex, RemoteSpec, SystemQuicEndpointFactory};
+use isekai_transport::{bind_physical_interface, BindSpec, InterfaceIndex, RemoteSpec, system_quic_factory};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
@@ -100,7 +99,7 @@ async fn rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable() {
     let (cert_der, key_der, cert_sha256_hex) = generate_cert();
     let server_addr = run_echo_server(cert_der, key_der).await;
 
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint should succeed");
     let conn = endpoint
         .connect(RemoteSpec { addr: server_addr, server_name: SNI.to_string(), cert_sha256_hex })

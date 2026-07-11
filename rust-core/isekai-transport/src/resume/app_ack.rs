@@ -11,9 +11,38 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::TransportError;
-use crate::traits::{ByteStream, ByteStreamReadHalf};
 
 use super::APP_ACK;
+
+/// Minimal async byte-stream-half interfaces this module's send/receive
+/// loops need — generic (implemented for a concrete type, not boxed as
+/// `dyn`) so both `quicmux::AnyByteStreamReadHalf`/`AnyByteStreamWriteHalf`
+/// and this module's own test-only in-memory duplex-pipe stand-in can
+/// satisfy them. `quicmux::AnyByteStream`'s enum design deliberately has no
+/// room for a third "test mock" variant (see that type's own docs on why:
+/// it enumerates real backends, not test doubles), so exercising this
+/// module's wire-framing/offset logic deterministically without a real
+/// QUIC/QMux round trip needs its own minimal seam instead of going through
+/// `quicmux` directly.
+trait HalfRead: Send {
+    fn read(&mut self, buf: &mut [u8]) -> impl std::future::Future<Output = Result<usize, TransportError>> + Send;
+}
+
+trait HalfWrite: Send {
+    fn write_all(&mut self, buf: &[u8]) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
+}
+
+impl HalfRead for quicmux::AnyByteStreamReadHalf {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        quicmux::AnyByteStreamReadHalf::read(self, buf).await.map_err(TransportError::Mux)
+    }
+}
+
+impl HalfWrite for quicmux::AnyByteStreamWriteHalf {
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportError> {
+        quicmux::AnyByteStreamWriteHalf::write_all(self, buf).await.map_err(TransportError::Mux)
+    }
+}
 
 const APP_ACK_FRAME_LEN: usize = 1 + 8;
 
@@ -113,14 +142,25 @@ impl AppAckTasks {
 /// notice the *data* stream has died and drive a reconnect, at which point it
 /// should `AppAckTasks::abort()` these (they'd otherwise keep spinning on a
 /// now-dead control stream).
-pub fn spawn_app_ack_tasks(control_stream: Box<dyn ByteStream>, counters: Arc<AppAckCounters>) -> AppAckTasks {
-    let (mut read_half, mut write_half) = control_stream.split();
+pub fn spawn_app_ack_tasks(control_stream: quicmux::AnyByteStream, counters: Arc<AppAckCounters>) -> AppAckTasks {
+    let (read_half, write_half) = control_stream.split();
+    spawn_app_ack_tasks_over(read_half, write_half, counters)
+}
 
+/// The actual send/receive loop logic, generic over [`HalfRead`]/
+/// [`HalfWrite`] so it can run against either a real
+/// `quicmux::AnyByteStream` half (via [`spawn_app_ack_tasks`]) or this
+/// module's test-only duplex-pipe stand-in (see this module's tests).
+fn spawn_app_ack_tasks_over(
+    mut read_half: impl HalfRead + 'static,
+    mut write_half: impl HalfWrite + 'static,
+    counters: Arc<AppAckCounters>,
+) -> AppAckTasks {
     let recv_counters = counters.clone();
     let recv = tokio::spawn(async move {
         loop {
             let mut frame = [0u8; APP_ACK_FRAME_LEN];
-            if read_exact_half(read_half.as_mut(), &mut frame).await.is_err() {
+            if read_exact_half(&mut read_half, &mut frame).await.is_err() {
                 break;
             }
             if frame[0] != APP_ACK {
@@ -153,10 +193,10 @@ pub fn spawn_app_ack_tasks(control_stream: Box<dyn ByteStream>, counters: Arc<Ap
     AppAckTasks { send, recv }
 }
 
-/// `ByteStreamReadHalf::read` only guarantees "at most `buf.len()` bytes,
-/// possibly fewer" — same `read_exact` loop as `relay::read_exact`, just over
-/// a split read half instead of a whole `ByteStream`.
-async fn read_exact_half(half: &mut dyn ByteStreamReadHalf, buf: &mut [u8]) -> Result<(), TransportError> {
+/// [`HalfRead::read`] only guarantees "at most `buf.len()` bytes, possibly
+/// fewer" — same `read_exact` loop as `relay::read_exact`, just over a split
+/// read half instead of a whole `quicmux::AnyByteStream`.
+async fn read_exact_half(half: &mut impl HalfRead, buf: &mut [u8]) -> Result<(), TransportError> {
     let mut filled = 0;
     while filled < buf.len() {
         let n = half.read(&mut buf[filled..]).await?;
@@ -171,48 +211,24 @@ async fn read_exact_half(half: &mut dyn ByteStreamReadHalf, buf: &mut [u8]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
-    /// A `ByteStream` backed by an in-memory `tokio::io::duplex` pair —
-    /// exercises `spawn_app_ack_tasks`'s wire framing/offset logic
-    /// deterministically and quickly, without needing a real QUIC connection
-    /// (that end-to-end path is already covered by `tests/resume_e2e.rs`).
-    struct DuplexByteStream(DuplexStream);
-
-    #[async_trait]
-    impl ByteStream for DuplexByteStream {
-        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
-            self.0.read(buf).await.map_err(|e| TransportError::StreamIo(e.to_string()))
-        }
-        async fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportError> {
-            self.0.write_all(buf).await.map_err(|e| TransportError::StreamIo(e.to_string()))
-        }
-        async fn shutdown(&mut self) -> Result<(), TransportError> {
-            self.0.shutdown().await.map_err(|e| TransportError::StreamIo(e.to_string()))
-        }
-        fn split(self: Box<Self>) -> (Box<dyn ByteStreamReadHalf>, Box<dyn crate::traits::ByteStreamWriteHalf>) {
-            let (read_half, write_half) = tokio::io::split(self.0);
-            (Box::new(DuplexReadHalf(read_half)), Box::new(DuplexWriteHalf(write_half)))
-        }
-    }
-
+    /// [`HalfRead`]/[`HalfWrite`] backed by an in-memory `tokio::io::duplex`
+    /// pair's halves — exercises [`spawn_app_ack_tasks_over`]'s wire
+    /// framing/offset logic deterministically and quickly, without needing a
+    /// real QUIC connection (that end-to-end path is already covered by
+    /// `tests/resume_e2e.rs`).
     struct DuplexReadHalf(tokio::io::ReadHalf<DuplexStream>);
-    #[async_trait]
-    impl ByteStreamReadHalf for DuplexReadHalf {
+    impl HalfRead for DuplexReadHalf {
         async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
-            self.0.read(buf).await.map_err(|e| TransportError::StreamIo(e.to_string()))
+            self.0.read(buf).await.map_err(|e| TransportError::Mux(quicmux::MuxError::StreamIo(e.to_string())))
         }
     }
 
     struct DuplexWriteHalf(tokio::io::WriteHalf<DuplexStream>);
-    #[async_trait]
-    impl crate::traits::ByteStreamWriteHalf for DuplexWriteHalf {
+    impl HalfWrite for DuplexWriteHalf {
         async fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportError> {
-            self.0.write_all(buf).await.map_err(|e| TransportError::StreamIo(e.to_string()))
-        }
-        async fn shutdown(&mut self) -> Result<(), TransportError> {
-            self.0.shutdown().await.map_err(|e| TransportError::StreamIo(e.to_string()))
+            self.0.write_all(buf).await.map_err(|e| TransportError::Mux(quicmux::MuxError::StreamIo(e.to_string())))
         }
     }
 
@@ -224,14 +240,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn app_ack_tasks_propagate_offsets_in_both_directions() {
         let (client_half, helper_half) = tokio::io::duplex(4096);
+        let (client_read, client_write) = tokio::io::split(client_half);
+        let (helper_read, helper_write) = tokio::io::split(helper_half);
 
         let client_counters = Arc::new(AppAckCounters::new());
-        let client_tasks =
-            spawn_app_ack_tasks(Box::new(DuplexByteStream(client_half)), client_counters.clone());
+        let client_tasks = spawn_app_ack_tasks_over(DuplexReadHalf(client_read), DuplexWriteHalf(client_write), client_counters.clone());
 
         let helper_counters = Arc::new(AppAckCounters::new());
-        let helper_tasks =
-            spawn_app_ack_tasks(Box::new(DuplexByteStream(helper_half)), helper_counters.clone());
+        let helper_tasks = spawn_app_ack_tasks_over(DuplexReadHalf(helper_read), DuplexWriteHalf(helper_write), helper_counters.clone());
 
         // Each side's send loop always advertises its own
         // `h2c_client_delivered_offset` field (`AppAckCounters` doesn't know

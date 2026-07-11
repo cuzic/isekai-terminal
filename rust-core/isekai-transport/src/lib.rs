@@ -7,12 +7,14 @@
 //! S-0d-2).
 //!
 //! Scope covered so far:
-//! - The `QuicEndpointFactory` / `QuicEndpoint` / `QuicConnection` /
-//!   `ByteStream` traits (`traits.rs`), so connection-establishment logic
-//!   never touches a concrete socket type.
-//! - `SystemQuicEndpointFactory` (`system.rs`): the CLI's concrete
-//!   implementation, built directly on `noq` + `rustls` + a plain
-//!   `tokio::net::UdpSocket`.
+//! - Connection establishment/backend selection itself (`AnyMuxFactory` /
+//!   `AnyMuxEndpoint` / `AnyMuxConnection` / `AnyByteStream`, cert pinning,
+//!   ALPN/exporter-label/transport tuning) now lives in the sibling
+//!   `quicmux` crate — a generic, backend-agnostic (`noq`/`qmux`) crate this
+//!   one depends on, so connection-establishment logic in this crate never
+//!   touches a concrete socket type. `system.rs`/`qmux_relay.rs` are just
+//!   this crate's own product-policy layer on top (which ALPN/timeouts to
+//!   use) plus a thin `quicmux::AnyMuxFactory` constructor.
 //! - `connect_via_relay` (`relay.rs`, S-0d-1): HELLO/proof/ACK against a
 //!   relay-assigned isekai-helper endpoint, reusing `isekai_protocol::hello`
 //!   for the wire format.
@@ -49,7 +51,7 @@
 //! - `physical_interface` (isekai-terminal-core/isekai-transport crate共有化):
 //!   binds a UDP socket to a specific physical network interface (via the
 //!   vendored `quicsock` crate) for
-//!   [`traits::QuicEndpointRebinder::rebind_socket`] — the CLI/PC side of
+//!   [`quicmux::AnyMuxRebinder::rebind_socket`] — the CLI/PC side of
 //!   the proven-working reactive physical-interface failover
 //!   (`rebind_abstract()`, Phase 9-4b). Android's own rebind path does not
 //!   go through this module — see its docs.
@@ -66,8 +68,9 @@
 //!   `archive/ISEKAI_SSH_DESIGN.md`'s "isekai-sshでのNAT越え方式の既定").
 //!
 //! This crate must never depend on UniFFI, Android-specific types, or
-//! `isekai-terminal-core` itself — see `traits.rs`'s module docs for why the trait
-//! boundary exists in the first place.
+//! `isekai-terminal-core` itself — see `quicmux`'s own module docs for the
+//! (stricter) boundary that crate holds to (no dependency on this crate,
+//! `isekai-protocol`, or anything isekai-specific at all).
 
 pub mod attempt;
 pub mod backoff;
@@ -87,8 +90,6 @@ pub mod resume;
 pub mod stun_p2p;
 pub mod system;
 pub mod telemetry;
-pub mod traits;
-pub mod types;
 
 pub use attempt::AttemptFailure;
 pub use backoff::BackoffPolicy;
@@ -110,7 +111,7 @@ pub use path_health::{
 };
 pub use proof::compute_proof;
 #[cfg(feature = "qmux-relay")]
-pub use qmux_relay::{QmuxQuicEndpointFactory, QMUX_ALPN};
+pub use qmux_relay::{qmux_relay_factory, QMUX_ALPN};
 pub use relay::{connect_via_relay, connect_via_relay_with_connection, RelayTarget};
 pub use resume::{
     connect_via_relay_resumable, connect_via_relay_resumable_with_fallback, open_control_stream,
@@ -121,13 +122,20 @@ pub use stun_p2p::{
     connect_stun_p2p, connect_stun_p2p_on_socket, connect_stun_p2p_with_fallback, SequentialStunCandidate,
     SequentialStunConnectError, StunP2pConnection, StunP2pTarget,
 };
-pub use system::SystemQuicEndpointFactory;
+pub use system::system_quic_factory;
 pub use telemetry::{CandidateAttempt, CandidateIdentity, CandidateOutcome};
-pub use traits::{
-    ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf, QuicConnection, QuicEndpoint, QuicEndpointFactory,
-    QuicEndpointRebinder,
+
+// Re-exported so downstream crates (e.g. `isekai-ssh`/`isekai-pipe`) that
+// only depend on `isekai-transport` don't also need a direct `quicmux`
+// dependency just to name the connection-establishment types this crate's
+// own public functions take/return (`AnyMuxFactory`, `BindSpec`/
+// `RemoteSpec`, ...). `traits.rs`/`types.rs` used to define isekai-
+// transport's own equivalents of these; they now live in `quicmux` and are
+// re-exported here under their new names instead.
+pub use quicmux::{
+    AnyByteStream, AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxConnection, AnyMuxEndpoint, AnyMuxFactory,
+    AnyMuxRebinder, BindSpec, MuxError, RemoteSpec,
 };
-pub use types::{BindSpec, RemoteSpec};
 
 // Re-exported so downstream crates (e.g. `isekai-ssh`) that only depend on
 // `isekai-transport` don't also need a direct `isekai-protocol` dependency

@@ -1,14 +1,13 @@
 //! HELLO/RESUME proof computation, extracted from
-//! `isekai_pipe_quic_transport.rs::compute_proof` and generalized to work behind
-//! the `QuicConnection` trait instead of a concrete `noq::Connection`
-//! (`archive/ISEKAI_SSH_DESIGN.md` "実装方針").
+//! `isekai_pipe_quic_transport.rs::compute_proof` and generalized to work
+//! behind `quicmux::AnyMuxConnection` instead of a concrete
+//! `noq::Connection` (`archive/ISEKAI_SSH_DESIGN.md` "実装方針").
 
 use hmac::{Hmac, Mac};
 use isekai_protocol::hello::{Proof, EXPORTER_LABEL, PROOF_LEN};
 use sha2::Sha256;
 
 use crate::error::TransportError;
-use crate::traits::QuicConnection;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -21,7 +20,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// phase S-4a), but this function already supports it so that phase doesn't
 /// need to duplicate the HMAC logic.
 pub async fn compute_proof(
-    conn: &dyn QuicConnection,
+    conn: &quicmux::AnyMuxConnection,
     session_secret: &[u8],
     extra: &[u8],
 ) -> Result<Proof, TransportError> {

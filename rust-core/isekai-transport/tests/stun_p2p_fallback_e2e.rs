@@ -16,7 +16,7 @@ use isekai_protocol::attach::{
     AttachRejectReason, AttachResponse, AttachToken, ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN,
 };
 use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
-use isekai_transport::{connect_stun_p2p_with_fallback, SequentialStunCandidate, SequentialStunConnectError, StunP2pTarget, SystemQuicEndpointFactory};
+use isekai_transport::{connect_stun_p2p_with_fallback, SequentialStunCandidate, SequentialStunConnectError, StunP2pTarget, system_quic_factory};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 
@@ -169,7 +169,7 @@ async fn first_candidate_unreachable_stun_falls_back_to_second_and_succeeds() {
     ];
 
     let (mut conn, winning_stun_server) =
-        tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p_with_fallback(&SystemQuicEndpointFactory, &target, &candidates))
+        tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p_with_fallback(&system_quic_factory(), &target, &candidates))
             .await
             .expect("connect_stun_p2p_with_fallback should not hang")
             .expect("should fall back past the dead STUN server to the real one");
@@ -210,7 +210,7 @@ async fn a_terminal_failure_on_the_first_candidate_stops_without_trying_the_seco
         SequentialStunCandidate { stun_server: second_stun, candidate_id: "stun-1".to_string() },
     ];
 
-    match tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p_with_fallback(&SystemQuicEndpointFactory, &target, &candidates)).await {
+    match tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p_with_fallback(&system_quic_factory(), &target, &candidates)).await {
         Ok(Err(SequentialStunConnectError::StoppedEarly { candidate_id, .. })) => {
             assert_eq!(candidate_id, "stun-0");
         }
@@ -239,7 +239,7 @@ async fn all_candidates_unreachable_reports_every_failure() {
         SequentialStunCandidate { stun_server: dead_2, candidate_id: "stun-1".to_string() },
     ];
 
-    match tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p_with_fallback(&SystemQuicEndpointFactory, &target, &candidates)).await {
+    match tokio::time::timeout(Duration::from_secs(10), connect_stun_p2p_with_fallback(&system_quic_factory(), &target, &candidates)).await {
         Ok(Err(SequentialStunConnectError::AllCandidatesFailed { failures })) => {
             assert_eq!(failures.len(), 2);
             assert_eq!(failures[0].candidate_id, "stun-0");
@@ -259,7 +259,7 @@ async fn no_candidates_is_a_caller_error() {
         cert_sha256_hex: "0".repeat(64),
         session_secret: b"unused".to_vec(),
     };
-    match connect_stun_p2p_with_fallback(&SystemQuicEndpointFactory, &target, &[]).await {
+    match connect_stun_p2p_with_fallback(&system_quic_factory(), &target, &[]).await {
         Err(SequentialStunConnectError::NoCandidates) => {}
         Ok(_) => panic!("an empty candidate list must not succeed"),
         Err(other) => panic!("expected NoCandidates, got: {other}"),

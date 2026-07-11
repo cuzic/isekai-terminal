@@ -6,33 +6,14 @@ use isekai_protocol::resume::ResumeRejectReason;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
-    #[error("failed to bind local UDP socket at {addr}: {source}")]
-    Bind {
-        addr: std::net::SocketAddr,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("failed to configure QUIC endpoint: {0}")]
-    EndpointSetup(String),
-
-    #[error("failed to configure TLS client config: {0}")]
-    TlsConfig(String),
-
-    #[error("QUIC connect setup failed: {0}")]
-    ConnectSetup(String),
-
-    #[error("QUIC handshake failed: {0}")]
-    Handshake(String),
-
-    #[error("failed to open a bidirectional QUIC stream: {0}")]
-    OpenStream(String),
-
-    #[error("QUIC stream I/O failed: {0}")]
-    StreamIo(String),
-
-    #[error("failed to export keying material from the QUIC connection: {0}")]
-    ExportKeyingMaterial(String),
+    /// Everything about dialing/maintaining the underlying mux connection
+    /// itself (bind/connect/handshake/cert-pin/stream-I/O/rebind failures)
+    /// is `quicmux`'s concern, not this crate's — see [`quicmux::MuxError`]
+    /// for the full breakdown. This variant is how those failures surface
+    /// through this crate's own error type without this crate re-declaring
+    /// the same set of cases under different names.
+    #[error(transparent)]
+    Mux(#[from] quicmux::MuxError),
 
     /// isekai-helper responded to `ATTACH_HELLO` with a reject rather than
     /// `AttachReadyV2` (`#18`, ATTACH v2).
@@ -54,20 +35,6 @@ pub enum TransportError {
     #[error("STUN query failed: {0}")]
     Stun(#[from] isekai_stun::StunError),
 
-    /// Failed to prepare an already-bound UDP socket for reuse as a QUIC
-    /// endpoint (e.g. `tokio::net::UdpSocket::into_std` failing) — distinct
-    /// from `Bind`, which is specifically about the initial `bind()` syscall.
-    #[error("failed to prepare UDP socket for QUIC use: {0}")]
-    SocketSetup(String),
-
-    /// `QuicEndpointRebinder::rebind` failed — either the replacement local
-    /// socket couldn't be bound (see `source`'s message for which), or the
-    /// underlying engine rejected the switch itself. Distinct from `Bind`,
-    /// which is specifically the *initial* endpoint creation, not a later
-    /// in-place rebind of an already-live one.
-    #[error("failed to rebind QUIC endpoint to a new local socket: {0}")]
-    Rebind(String),
-
     /// The control stream handshake (`CONTROL_HELLO`/`CONTROL_ACK`,
     /// `archive/HELPER_PROTOCOL.md` §7.3) got a response byte other than
     /// `CONTROL_ACK` (`resume::open_control_stream`).
@@ -80,23 +47,6 @@ pub enum TransportError {
     /// back to a fresh (non-resuming) connection.
     #[error("isekai-helper rejected RESUME: {0:?}")]
     ResumeRejected(ResumeRejectReason),
-
-    /// The peer's presented leaf certificate didn't match the pinned
-    /// `cert_sha256_hex` this attempt expected (`system::PinnedCertVerifier`).
-    /// Recovered out-of-band from a `rustls::Error::General` via a shared
-    /// slot (rustls's `ServerCertVerifier` trait can't return a typed error
-    /// directly) — see `system.rs`'s `client_config_for`/`SystemQuicEndpoint::connect`.
-    #[error("isekai-helper cert pin mismatch: expected {expected} got {got}")]
-    CertPinMismatch { expected: String, got: String },
-
-    /// The `QuicEndpointFactory`/`QuicEndpoint` implementation has no
-    /// meaningful way to perform this operation at all (as opposed to
-    /// attempting it and failing) — e.g.
-    /// `QuicEndpointFactory::wrap_bound_socket` on a QMux-over-TCP endpoint
-    /// (`qmux_relay::QmuxQuicEndpointFactory`), which has no UDP socket
-    /// concept to wrap in the first place.
-    #[error("{operation} is not supported by this QUIC engine: {reason}")]
-    Unsupported { operation: &'static str, reason: &'static str },
 }
 
 impl TransportError {
@@ -105,15 +55,15 @@ impl TransportError {
     /// pin) is stale — most commonly because the deployed `isekai-pipe
     /// serve` process restarted and regenerated both (`engine/mod.rs`
     /// generates fresh ephemeral values on every launch, never persisting
-    /// them). Deliberately narrow: only `CertPinMismatch` and an explicit
-    /// server-side auth reject qualify. Plain connectivity failures
-    /// (timeout, connection refused, DNS, etc.) do *not* — those are
-    /// indistinguishable from an ordinary transient network problem over a
-    /// single attempt, and treating them as "stale" would trigger a
-    /// wasted SSH re-deploy attempt on every blip (`ISEKAI_PIPE_DESIGN.md`
-    /// §8 Epic N).
+    /// them). Deliberately narrow: only a cert-pin mismatch (from
+    /// [`quicmux::MuxError::CertPinMismatch`]) and an explicit server-side
+    /// auth reject qualify. Plain connectivity failures (timeout, connection
+    /// refused, DNS, etc.) do *not* — those are indistinguishable from an
+    /// ordinary transient network problem over a single attempt, and
+    /// treating them as "stale" would trigger a wasted SSH re-deploy attempt
+    /// on every blip (`ISEKAI_PIPE_DESIGN.md` §8 Epic N).
     pub fn is_stale_trust_signal(&self) -> bool {
-        matches!(self, Self::CertPinMismatch { .. } | Self::Rejected(AttachRejectReason::Auth))
+        matches!(self, Self::Mux(quicmux::MuxError::CertPinMismatch { .. }) | Self::Rejected(AttachRejectReason::Auth))
     }
 }
 
@@ -142,7 +92,8 @@ mod tests {
 
     #[test]
     fn cert_pin_mismatch_is_a_stale_trust_signal() {
-        assert!(TransportError::CertPinMismatch { expected: "a".to_string(), got: "b".to_string() }.is_stale_trust_signal());
+        assert!(TransportError::Mux(quicmux::MuxError::CertPinMismatch { expected: "a".to_string(), got: "b".to_string() })
+            .is_stale_trust_signal());
     }
 
     #[test]
@@ -166,18 +117,18 @@ mod tests {
 
     #[test]
     fn plain_connectivity_failures_are_not_stale_trust_signals() {
-        assert!(!TransportError::Bind { addr: "127.0.0.1:0".parse().unwrap(), source: std::io::Error::other("x") }
+        assert!(!TransportError::Mux(quicmux::MuxError::Bind { addr: "127.0.0.1:0".parse().unwrap(), source: std::io::Error::other("x") })
             .is_stale_trust_signal());
-        assert!(!TransportError::EndpointSetup("x".to_string()).is_stale_trust_signal());
-        assert!(!TransportError::TlsConfig("x".to_string()).is_stale_trust_signal());
-        assert!(!TransportError::ConnectSetup("x".to_string()).is_stale_trust_signal());
-        assert!(!TransportError::Handshake("x".to_string()).is_stale_trust_signal());
-        assert!(!TransportError::OpenStream("x".to_string()).is_stale_trust_signal());
-        assert!(!TransportError::StreamIo("x".to_string()).is_stale_trust_signal());
-        assert!(!TransportError::ExportKeyingMaterial("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::Mux(quicmux::MuxError::EndpointSetup("x".to_string())).is_stale_trust_signal());
+        assert!(!TransportError::Mux(quicmux::MuxError::TlsConfig("x".to_string())).is_stale_trust_signal());
+        assert!(!TransportError::Mux(quicmux::MuxError::ConnectSetup("x".to_string())).is_stale_trust_signal());
+        assert!(!TransportError::Mux(quicmux::MuxError::Handshake("x".to_string())).is_stale_trust_signal());
+        assert!(!TransportError::Mux(quicmux::MuxError::OpenStream("x".to_string())).is_stale_trust_signal());
+        assert!(!TransportError::Mux(quicmux::MuxError::StreamIo("x".to_string())).is_stale_trust_signal());
+        assert!(!TransportError::Mux(quicmux::MuxError::ExportKeyingMaterial("x".to_string())).is_stale_trust_signal());
         assert!(!TransportError::UnexpectedEof.is_stale_trust_signal());
-        assert!(!TransportError::SocketSetup("x".to_string()).is_stale_trust_signal());
-        assert!(!TransportError::Rebind("x".to_string()).is_stale_trust_signal());
+        assert!(!TransportError::Mux(quicmux::MuxError::SocketSetup("x".to_string())).is_stale_trust_signal());
+        assert!(!TransportError::Mux(quicmux::MuxError::Rebind("x".to_string())).is_stale_trust_signal());
         assert!(!TransportError::ControlHandshake("x".to_string()).is_stale_trust_signal());
         assert!(!TransportError::ResumeRejected(ResumeRejectReason::UnknownSession).is_stale_trust_signal());
     }

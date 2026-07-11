@@ -5,7 +5,7 @@
 //! `rust-core/isekai-helper/src/main.rs`'s `handle_connection`/
 //! `handle_stream`/`handle_resume_stream`/`accept_control_stream`.
 //!
-//! This is not a type-checking-only mock: `SystemQuicEndpointFactory` binds
+//! This is not a type-checking-only mock: `system_quic_factory` binds
 //! real UDP sockets, performs real QUIC handshakes pinned to the mock
 //! server's self-signed certificate fingerprint, and exchanges the real
 //! `HELLO`/`ACK`, `CONTROL_HELLO`/`CONTROL_ACK`, and `RESUME`/`RESUME_ACK`
@@ -39,7 +39,7 @@ use isekai_protocol::resume::{decode_resume, encode_resume_ack, ResumeAckFrame};
 use isekai_protocol::session_id::{SessionId, SESSION_ID_LEN};
 use isekai_transport::{
     connect_via_relay_resumable, reconnect_and_resume, C2hHelperCommittedOffset, C2hSentOffset,
-    CandidateIdentity, H2cClientDeliveredOffset, H2cSentOffset, RelayTarget, SystemQuicEndpointFactory,
+    CandidateIdentity, H2cClientDeliveredOffset, H2cSentOffset, RelayTarget, system_quic_factory,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
@@ -327,7 +327,7 @@ async fn resume_survives_a_client_initiated_disconnect_and_relay_continues() {
         cert_sha256_hex,
         session_secret,
     };
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
 
     // 1. Establish the first (resumable) connection.
     let session = tokio::time::timeout(
@@ -405,7 +405,7 @@ async fn reconnect_and_resume_fails_for_an_unknown_session_id() {
     tokio::spawn(run_mock_helper(endpoint, session_secret.clone(), sessions));
 
     let target = RelayTarget { helper_addr, server_name: SNI.to_string(), cert_sha256_hex, session_secret };
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
 
     let bogus_session_id = SessionId::from_bytes([0xABu8; SESSION_ID_LEN]);
     // `ResumeAckOutcome` (the `Ok` payload) isn't `Debug` (it carries a

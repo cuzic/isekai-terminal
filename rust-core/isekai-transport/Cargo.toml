@@ -12,19 +12,27 @@ isekai-pipe-core = { path = "../isekai-pipe-core" }
 # STUN観測アドレス取得（`isekai_stun_p2p_transport.rs`相当の移植、
 # ISEKAI_SSH_DESIGN.md フェーズS-0d-2）。isekai-terminal-core・isekai-helperと共用のpure crate。
 isekai-stun = { path = "../isekai-stun" }
+# 接続確立(dial)・stream I/O・cert pinning・ALPN/exporter-label/tuning設定の
+# backend抽象(noq/qmux)は`quicmux`crateに一本化した(元`traits.rs`/`system.rs`/
+# `qmux_relay.rs`)。ATTACH v2ハンドシェイク・resume・fencingといったisekai固有
+# ロジックはこのcrateに残る。`quicmux`はisekai-protocol/isekai-transportに一切
+# 依存しないleaf crateなので、この一方向依存は循環しない。
+quicmux = { path = "../quicmux", features = ["noq"] }
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
-# QUIC実装は isekai-terminal-core と同じく noq（quinnのマルチパスフォーク）に一本化する。
-# `FaultyUdpSocket`等のAndroid専用型・UniFFIはこのcrateからは一切参照しない
+# `multipath.rs`/`path_health.rs`はnoq-concreteなまま残す設計判断
+# (noq issue #738、同モジュールのdoc参照)なので、`noq`はこのcrate自身の
+# 直接依存としても残す。`FaultyUdpSocket`等のAndroid専用型・UniFFIはこの
+# crateからは一切参照しない
 # （ISEKAI_SSH_DESIGN.md「FaultyUdpSocket（Android専用フォルト注入ソケット）の扱い」節）。
 noq = { version = "1.0.1", features = ["rustls", "ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-# `qmux-relay`(既定OFF、opt-in): UDP遮断環境向けのQMux-over-TLS-over-TCP経路
-# (`qmux_relay.rs`)。crates.io版qmux(0.3.1)はRFC 9221 datagram対応前の
-# スナップショットなので、`h3-qmux`/`isekai-link-masque`と同じcommitへgit pin
-# する(このcrateのleg 1はdatagramを使わないが、バージョン不整合を避けるため
-# 揃える)。qmux crateのpre-1.0な破壊的変更リスクをopt-inの外へ隔離するため
-# feature gate している。
+# `qmux-relay`(既定OFF、opt-in): UDP遮断環境向けのQMux-over-TLS-over-TCP経路。
+# backend実装自体は`quicmux`の`qmux`featureへ移動したので本体コード
+# (`src/`)からはこの3つを直接importしなくなったが、`tests/qmux_relay_e2e.rs`
+# 自体はATTACH v2サーバー側を素の`qmux::Session`で自作しており(実際の
+# `isekai-pipe serve`相当の応答側が無いテストのため)、そちら側の直接依存として
+# 引き続き必要。qmux crateのpre-1.0な破壊的変更リスクをopt-inの外へ隔離する
+# ため、このcrate自身でもfeature gateしている(`quicmux/qmux`と同じ理由)。
 qmux = { git = "https://github.com/moq-dev/web-transport", rev = "f6107797d4a7301408964b22b6f3150967b95af3", optional = true }
 web-transport-trait = { git = "https://github.com/moq-dev/web-transport", rev = "f6107797d4a7301408964b22b6f3150967b95af3", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
@@ -46,9 +54,15 @@ quicsock = { path = "../quicsock", features = ["discovery"] }
 tokio-stream = "0.1"
 
 [features]
-qmux-relay = ["dep:qmux", "dep:web-transport-trait", "dep:tokio-rustls"]
+qmux-relay = ["quicmux/qmux", "dep:qmux", "dep:web-transport-trait", "dep:tokio-rustls"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 rcgen = "0.13"
 env_logger = "0.11"
+# テスト自体がTLS server設定を組み立てるために直接使う(元々は`system.rs`/
+# `qmux_relay.rs`経由の間接依存だったが、両方とも`quicmux`へ移動したため
+# このcrateの本体コードはrustlsを直接importしなくなった)。sha2は既存の
+# `[dependencies]`エントリ(`proof.rs`/`candidate_pool.rs`等が使用)がテストにも
+# そのまま見えるので、ここで別途宣言する必要はない。
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

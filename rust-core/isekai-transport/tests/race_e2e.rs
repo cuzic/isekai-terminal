@@ -24,7 +24,7 @@ use isekai_protocol::attach::{
 };
 use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
 use isekai_transport::{
-    race_direct_and_relay, DirectRelayRaceTargets, RaceWinner, RelayTarget, StunP2pTarget, SystemQuicEndpointFactory,
+    race_direct_and_relay, DirectRelayRaceTargets, RaceWinner, RelayTarget, StunP2pTarget, system_quic_factory,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
@@ -180,7 +180,7 @@ async fn direct_wins_when_it_completes_within_the_stagger_window() {
         },
     };
 
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     // Generous stagger relative to how long the direct path actually takes
     // on loopback (STUN query + 5x150ms hole-punch probes + QUIC handshake,
     // well under a second) — this proves direct winning *within* the
@@ -240,7 +240,7 @@ async fn relay_wins_when_direct_keeps_failing() {
         },
     };
 
-    let factory = SystemQuicEndpointFactory;
+    let factory = system_quic_factory();
     let mut outcome = tokio::time::timeout(
         Duration::from_secs(15),
         race_direct_and_relay(&factory, &targets, Duration::from_millis(300)),
