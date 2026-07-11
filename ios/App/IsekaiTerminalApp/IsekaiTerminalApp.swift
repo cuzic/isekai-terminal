@@ -36,6 +36,10 @@ struct AppRootView: View {
 
     init() {
         _tabsModel = StateObject(wrappedValue: TerminalTabsModel())
+        // Android版`MainActivity.onCreate`の`restorePersistedCtlSocketForward()`に相当
+        // (前回設定した「tmux迂回control-plane」をRust側のプロセスグローバル状態へ
+        // 起動直後に一度反映する)。
+        CtlSocketForwardSettings.restore()
     }
 
     var body: some View {
@@ -92,5 +96,8 @@ struct AppRootView: View {
                 }
             }
         }
+        // Android版`applyScreenProtection`(`FLAG_SECURE`)相当。「最近使ったアプリ」の
+        // サムネイルへ実内容が写り込むのを防ぐ(`ScreenProtectionOverlay`参照)。
+        .screenProtected()
     }
 }
