@@ -156,6 +156,14 @@ pub struct ConnectionIntent {
     /// preference, use the server's own default/max".
     #[serde(default = "default_resume_grace_secs")]
     pub resume_grace_secs: u64,
+    /// `None` binds this connection's local QUIC socket to an OS-assigned
+    /// ephemeral port (the default); `Some((start, end))` narrows it to
+    /// that inclusive range instead — for a caller behind a restrictive
+    /// local firewall/NAT that only permits outbound UDP within a known
+    /// range (`#@isekai local-bind-port-range`). The client-side
+    /// counterpart of `isekai-helper --bind-port-range` on the remote side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_bind_port_range: Option<(u16, u16)>,
     pub punch_generation: PunchGeneration,
     pub created_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
@@ -190,6 +198,7 @@ impl ConnectionIntent {
             candidate_race_delay_ms: DEFAULT_CANDIDATE_RACE_DELAY_MS,
             relay_delay_ms: DEFAULT_RELAY_DELAY_MS,
             resume_grace_secs: DEFAULT_RESUME_GRACE_SECS,
+            local_bind_port_range: None,
             punch_generation: PunchGeneration(0),
             created_at_unix_ms: now,
             expires_at_unix_ms: expires,
