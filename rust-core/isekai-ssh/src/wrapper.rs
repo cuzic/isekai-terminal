@@ -1611,12 +1611,141 @@ fn default_pipe_path() -> PathBuf {
     PathBuf::from("isekai-pipe")
 }
 
+/// Builds the local `ssh(1)`'s `-o ProxyCommand=...` value.
+///
+/// On Windows this deliberately does *not* reuse `shell_quote`'s POSIX
+/// single-quote escaping unconditionally: real ssh(1) on Unix always execs
+/// `ProxyCommand` via `/bin/sh -c`, so POSIX quoting is unambiguously
+/// correct there, but Win32-OpenSSH does not go through a POSIX shell at
+/// all — its own internal `ProxyCommand` argument splitting is a separate,
+/// less-documented code path (its own GitHub issue tracker shows both
+/// single- and double-quoted paths misbehaving across different Win32-OpenSSH
+/// versions/builds — `CreateProcessW failed`/`posix_spawn` errors either
+/// way), and this repo has no Windows CI to pin an exact version against.
+/// Rather than guess which quoting convention today's Win32-OpenSSH build
+/// wants, `windows_arg_needs_no_quoting` below sidesteps the question: a
+/// short (8.3) filename never contains a space, so once resolved there is
+/// nothing left to quote — this is the same well-established workaround
+/// build tools like vcpkg use for the identical "external tool mishandles
+/// quoted Windows paths" class of problem. `profile` values are similarly
+/// emitted bare whenever they already match a safe charset (in practice
+/// always true — see `is_safe_bare_word`'s docs), which is the common case
+/// regardless of platform.
+///
+/// Falls back to the original POSIX-style single-quoting when a value isn't
+/// already safe to emit bare (e.g. 8.3 short names are disabled on that
+/// volume, or an unusual `#@isekai profile` value) — no worse than this
+/// function's previous unconditional behavior for that residual case.
 fn proxy_command(pipe_path: &Path, profile: &str) -> String {
     format!(
         "{} connect --profile {} --service ssh --stdio",
-        shell_quote(&pipe_path.display().to_string()),
-        shell_quote(profile)
+        quote_proxy_command_path(pipe_path),
+        quote_proxy_command_arg(profile),
     )
+}
+
+/// Characters that never need shell/argv escaping in *any* of the quoting
+/// conventions this module has to worry about (POSIX `/bin/sh -c`, and
+/// whatever Win32-OpenSSH's own `ProxyCommand` argument splitter does) — so
+/// a value built entirely from this charset can always be emitted bare,
+/// without picking a quoting convention at all. Deliberately excludes `'`/
+/// `"`/`$`/`` ` ``/`;`/`|`/`&`/`<`/`>`/`(`/`)`/`{`/`}`/`\` (and, of course,
+/// whitespace) — every character either convention treats specially.
+fn is_safe_bare_word(value: &str, extra_allowed: &[char]) -> bool {
+    !value.is_empty()
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '@' | '~') || extra_allowed.contains(&c))
+}
+
+/// `profile` values come from either the literal `ssh(1)` destination
+/// argument (a bare host/alias, essentially never containing whitespace or
+/// shell metacharacters) or a single whitespace-delimited `#@isekai profile`
+/// directive token (`apply_isekai_directive`'s `one_arg` already rejects
+/// anything with an embedded space) — so in practice this is always safe to
+/// emit bare. Falls back to POSIX single-quoting for the residual case of a
+/// directive value containing something outside that charset.
+fn quote_proxy_command_arg(value: &str) -> String {
+    if is_safe_bare_word(value, &[]) {
+        value.to_string()
+    } else {
+        shell_quote(value)
+    }
+}
+
+/// `pipe_path` almost always resolves to a path with no spaces on Unix
+/// (`/usr/local/bin/isekai-pipe`-shaped), but commonly *does* have one on
+/// Windows (`C:\Program Files\...`) — the one case this whole function
+/// exists for. See `windows_short_path`'s docs for the avoid-quoting-entirely
+/// strategy used there; every other platform/path shape falls through to
+/// the original POSIX single-quoting.
+fn quote_proxy_command_path(pipe_path: &Path) -> String {
+    let path_str = pipe_path.display().to_string();
+    if cfg!(windows) {
+        if let Some(short) = windows_short_path(&path_str) {
+            if is_safe_bare_word(&short, &['\\', '/']) {
+                return short;
+            }
+        }
+    }
+    if is_safe_bare_word(&path_str, &['\\', '/']) {
+        path_str
+    } else {
+        shell_quote(&path_str)
+    }
+}
+
+/// Resolves `path` to its 8.3 short filename (`C:\PROGRA~1\...`), which by
+/// construction never contains a space or any other character needing shell
+/// escaping — sidesteps needing to know Win32-OpenSSH's own `ProxyCommand`
+/// argument-splitting convention at all, rather than guessing it (see
+/// `proxy_command`'s docs). Requires the path to already exist on disk
+/// (`GetShortPathNameW` queries the real filesystem entry, which
+/// `default_pipe_path`'s own `sibling.exists()` check already guarantees
+/// for the common case) and that 8.3 name generation hasn't been disabled
+/// for that volume (an uncommon but real opt-out, mostly seen on some
+/// server SSD setups for a minor performance gain) — returns `None` in
+/// either case, and `quote_proxy_command_path` falls back to quoting the
+/// long path instead.
+#[cfg(windows)]
+fn windows_short_path(path: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect();
+    let mut buf = vec![0u16; 260];
+    // SAFETY: `wide` is a valid, NUL-terminated UTF-16 string for the
+    // duration of this call; `buf` is a valid, writable buffer of the given
+    // length. `GetShortPathNameW` never retains either pointer past return.
+    let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if len == 0 {
+        return None; // path doesn't exist, or some other failure.
+    }
+    if len as usize > buf.len() {
+        // Buffer was too small; `len` is the required size including the
+        // NUL terminator — retry once with exactly that much room.
+        buf = vec![0u16; len as usize];
+        let len2 = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        if len2 == 0 || len2 as usize > buf.len() {
+            return None;
+        }
+        buf.truncate(len2 as usize);
+    } else {
+        buf.truncate(len as usize);
+    }
+    String::from_utf16(&buf).ok()
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetShortPathNameW(lpszLongPath: *const u16, lpszShortPath: *mut u16, cchBuffer: u32) -> u32;
+}
+
+/// Never actually called (`quote_proxy_command_path` only calls
+/// `windows_short_path` inside `if cfg!(windows)`), but `cfg!(...)` is a
+/// runtime check, not conditional compilation — the call site still needs
+/// something to type-check against on non-Windows targets.
+#[cfg(not(windows))]
+fn windows_short_path(_path: &str) -> Option<String> {
+    None
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1903,6 +2032,43 @@ mod tests {
             proxy_command(Path::new("/opt/isekai pipe"), "prod'host"),
             "'/opt/isekai pipe' connect --profile 'prod'\\''host' --service ssh --stdio"
         );
+    }
+
+    /// A path/profile with no space or shell metacharacter is emitted bare
+    /// (no quoting at all) — safe on a POSIX shell either way, and sidesteps
+    /// ever needing to guess Win32-OpenSSH's own `ProxyCommand`
+    /// argument-splitting convention on Windows (see `proxy_command`'s
+    /// module docs for why quoting there is a real, version-dependent
+    /// minefield this avoids rather than picks a side on).
+    #[test]
+    fn proxy_command_emits_safe_path_and_profile_bare() {
+        assert_eq!(
+            proxy_command(Path::new("/usr/local/bin/isekai-pipe"), "prod-host:22"),
+            "/usr/local/bin/isekai-pipe connect --profile prod-host:22 --service ssh --stdio"
+        );
+    }
+
+    #[test]
+    fn is_safe_bare_word_accepts_typical_profile_and_path_charset() {
+        assert!(is_safe_bare_word("prod-host:22", &[]));
+        assert!(is_safe_bare_word("user@host.example.com", &[]));
+        assert!(is_safe_bare_word("/usr/local/bin/isekai-pipe", &['/']));
+        assert!(is_safe_bare_word(r"C:\PROGRA~1\isekai-pipe.exe", &['\\']));
+    }
+
+    #[test]
+    fn is_safe_bare_word_rejects_whitespace_and_shell_metacharacters() {
+        assert!(!is_safe_bare_word("has space", &[]));
+        assert!(!is_safe_bare_word("", &[]));
+        assert!(!is_safe_bare_word("prod'host", &[]));
+        assert!(!is_safe_bare_word("$(whoami)", &[]));
+        assert!(!is_safe_bare_word("a;rm -rf /", &[]));
+    }
+
+    #[test]
+    fn quote_proxy_command_arg_falls_back_to_shell_quote_when_unsafe() {
+        assert_eq!(quote_proxy_command_arg("prod host"), shell_quote("prod host"));
+        assert_eq!(quote_proxy_command_arg("safe-host"), "safe-host");
     }
 
     #[test]
