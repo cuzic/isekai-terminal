@@ -248,6 +248,9 @@ async fn connect_relay_stream(
         server_name: isekai_pipe_quic_transport::QUIC_SERVER_NAME.to_string(),
         cert_sha256_hex,
         session_secret,
+        // No local-port-range restriction on Android today (see
+        // `isekai_pipe_quic_transport.rs`'s equivalent site).
+        local_bind_port_range: None,
     };
     let factory = crate::android_quic_endpoint::factory();
     let (conn, data_stream, proof) = isekai_transport::connect_via_relay_with_connection(&factory, &target)

@@ -382,6 +382,9 @@ async fn connect_stun_p2p_stream(
             server_name: target.server_name.clone(),
             cert_sha256_hex: target.cert_sha256_hex.clone(),
             session_secret: target.session_secret.clone(),
+            // No local-port-range restriction on Android's STUN P2P path
+            // today (see `isekai_pipe_quic_transport.rs`'s equivalent site).
+            local_bind_port_range: None,
         };
         let factory = crate::android_quic_endpoint::factory();
         Box::pin(async move {
