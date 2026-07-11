@@ -127,11 +127,14 @@ struct IsekaiConfig {
     /// something more verbose, so debugging a stuck connection is an
     /// explicit opt-in per host, not a standing cost on every deployment.
     remote_log_level: String,
-    /// `#@isekai bind-port-range` (`isekai-helper --bind-port-range`).
+    /// `#@isekai remote-bind-port-range` (`isekai-helper --bind-port-range`).
     /// `None` leaves the deployed helper on its own default (an
     /// OS-assigned ephemeral UDP port). Lets an operator narrow which
-    /// inbound UDP range a host's firewall needs to allow.
-    bind_port_range: Option<(u16, u16)>,
+    /// inbound UDP range a host's firewall needs to allow. Named with an
+    /// explicit `remote_`/`remote-` prefix, distinct from any future
+    /// *local* port-range setting for `isekai-pipe connect`'s own outbound
+    /// bind on this machine.
+    remote_bind_port_range: Option<(u16, u16)>,
     /// `#@isekai ctl-socket yes` (`ISEKAI_PIPE_DESIGN.md` §8 Epic M):
     /// opt-in, default off. Requests a per-invocation `-R` UNIX domain
     /// socket forward carrying the title/clipboard control-plane, so it
@@ -702,7 +705,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         None => LaunchSpec::Direct {
             idle_lifetime_secs: DEFAULT_IDLE_LIFETIME_SECS,
             remote_log_level: resolution.isekai.remote_log_level.clone(),
-            bind_port_range: resolution.isekai.bind_port_range,
+            remote_bind_port_range: resolution.isekai.remote_bind_port_range,
         },
     };
 
@@ -1014,7 +1017,7 @@ fn resolve_isekai_config(
         bootstrap_relay: None,
         ctl_socket_enabled: None,
         remote_log_level: None,
-        bind_port_range: None,
+        remote_bind_port_range: None,
     };
     for directive in directives {
         apply_isekai_directive(&mut builder, directive)?;
@@ -1073,7 +1076,7 @@ fn resolve_isekai_config(
         bootstrap_relay: builder.bootstrap_relay,
         ctl_socket_enabled: builder.ctl_socket_enabled.unwrap_or(false),
         remote_log_level: builder.remote_log_level.unwrap_or_else(|| "info".to_string()),
-        bind_port_range: builder.bind_port_range,
+        remote_bind_port_range: builder.remote_bind_port_range,
     })
 }
 
@@ -1096,7 +1099,7 @@ struct IsekaiConfigBuilder {
     install_mode: Option<InstallMode>,
     ctl_socket_enabled: Option<bool>,
     remote_log_level: Option<String>,
-    bind_port_range: Option<(u16, u16)>,
+    remote_bind_port_range: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1209,10 +1212,10 @@ fn apply_isekai_directive(
             },
             "remote-log-level",
         ),
-        "bind-port-range" => set_once(
-            &mut builder.bind_port_range,
+        "remote-bind-port-range" => set_once(
+            &mut builder.remote_bind_port_range,
             parse_bind_port_range(one_arg(&directive)?)?,
-            "bind-port-range",
+            "remote-bind-port-range",
         ),
         other => Err(anyhow!("isekai-ssh: unknown #@isekai directive {other:?}")),
     }
@@ -1271,7 +1274,7 @@ fn parse_duration_ms(value: &str, field: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("isekai-ssh: #@isekai {field} duration is too large"))
 }
 
-/// Parses `#@isekai bind-port-range <START>-<END>` into an inclusive
+/// Parses `#@isekai remote-bind-port-range <START>-<END>` into an inclusive
 /// `(start, end)` pair, passed straight through to `isekai-helper
 /// --bind-port-range` (`engine::parse_bind_port_range` in `isekai-pipe`
 /// applies the identical `start <= end` validation server-side; this
@@ -1279,17 +1282,17 @@ fn parse_duration_ms(value: &str, field: &str) -> Result<u64> {
 /// resolution time instead of after an SSH round-trip).
 fn parse_bind_port_range(value: &str) -> Result<(u16, u16)> {
     let (start, end) = value.split_once('-').ok_or_else(|| {
-        anyhow!("isekai-ssh: invalid #@isekai bind-port-range {value:?} (expected <START>-<END>)")
+        anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range {value:?} (expected <START>-<END>)")
     })?;
     let start: u16 = start
         .parse()
-        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai bind-port-range start {start:?}"))?;
+        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range start {start:?}"))?;
     let end: u16 = end
         .parse()
-        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai bind-port-range end {end:?}"))?;
+        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range end {end:?}"))?;
     if start > end {
         return Err(anyhow!(
-            "isekai-ssh: invalid #@isekai bind-port-range {value:?}: start must be <= end"
+            "isekai-ssh: invalid #@isekai remote-bind-port-range {value:?}: start must be <= end"
         ));
     }
     Ok((start, end))
@@ -1724,7 +1727,7 @@ mod tests {
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
                 remote_log_level: "info".to_string(),
-                bind_port_range: None,
+                remote_bind_port_range: None,
             },
         };
 
@@ -1778,7 +1781,7 @@ mod tests {
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
                 remote_log_level: "info".to_string(),
-                bind_port_range: None,
+                remote_bind_port_range: None,
             },
         };
 
@@ -1933,7 +1936,7 @@ mod tests {
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
                 remote_log_level: "info".to_string(),
-                bind_port_range: None,
+                remote_bind_port_range: None,
             },
         };
         let intent = build_connection_intent(&resolution).unwrap();
@@ -1990,7 +1993,7 @@ mod tests {
         // | `relay-delay`          | (a) `intent.relay_delay_ms`                                                       |
         // | `install-mode`         | `resolve_isekai_config`'s fail-closed check for `system` (see `install_mode_system_is_rejected_at_config_resolution`); `user` needs no plumbing (already the only implemented behavior) |
         // | `remote-log-level`     | `bootstrap_and_register` (bootstrap-time only; `isekai-helper --log-level`, no `ConnectionIntent` field exists for it) |
-        // | `bind-port-range`      | `bootstrap_and_register` (bootstrap-time only; `isekai-helper --bind-port-range`, no `ConnectionIntent` field exists for it) |
+        // | `remote-bind-port-range` | `bootstrap_and_register` (bootstrap-time only; `isekai-helper --bind-port-range`, no `ConnectionIntent` field exists for it) |
         //
         // If a new directive is ever added to `apply_isekai_directive`
         // without a corresponding row above (and without extending whichever
@@ -2158,7 +2161,7 @@ mod tests {
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
                 remote_log_level: "info".to_string(),
-                bind_port_range: None,
+                remote_bind_port_range: None,
             },
         };
 

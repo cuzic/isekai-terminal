@@ -161,7 +161,12 @@ pub enum LaunchSpec {
         /// port, `/proc/sys/net/ipv4/ip_local_port_range` on Linux). Lets an
         /// operator narrow which inbound UDP port range a host's firewall
         /// needs to allow for `isekai-helper` to be reachable, instead of
-        /// opening the whole ephemeral range (`#@isekai bind-port-range`).
-        bind_port_range: Option<(u16, u16)>,
+        /// opening the whole ephemeral range (`#@isekai remote-bind-port-range`).
+        /// Named with an explicit `remote_` prefix (unlike this variant's
+        /// other fields) because a *local* counterpart — the port range
+        /// `isekai-pipe connect` itself binds from on this machine — is a
+        /// distinct, independently configurable setting, not implied by
+        /// this one.
+        remote_bind_port_range: Option<(u16, u16)>,
     },
 }

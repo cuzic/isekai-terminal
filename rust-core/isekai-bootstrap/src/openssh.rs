@@ -354,10 +354,10 @@ impl OpenSshBackend {
             // (`direct-by-bootstrap-host`, `archive/HELPER_PROTOCOL.md` §2).
             // Only the (non-secret-carrying) `BootstrapRequestV2` travels over
             // stdin here — nothing else to deliver out of band.
-            LaunchSpec::Direct { idle_lifetime_secs, remote_log_level, bind_port_range } => {
+            LaunchSpec::Direct { idle_lifetime_secs, remote_log_level, remote_bind_port_range } => {
                 let remote_log_level = validate_log_level(remote_log_level)
                     .map_err(|e| BootstrapError::InvalidRemoteLogLevel(e.to_string()))?;
-                let bind_port_range_arg = match bind_port_range {
+                let bind_port_range_arg = match remote_bind_port_range {
                     Some((start, end)) => format!(" --bind-port-range {start}-{end}"),
                     None => String::new(),
                 };
