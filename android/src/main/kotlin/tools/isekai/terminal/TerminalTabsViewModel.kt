@@ -93,25 +93,33 @@ class TerminalTabsViewModel(
                 writeToClipboard = { payload ->
                     val cm = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
                         as android.content.ClipboardManager
-                    val clip = if (payload.mime == ClipboardMimeKind.IMAGE_PNG) {
-                        RemoteClipboardImagePolicy.writeImageToClipData(app, payload.data)
-                    } else {
-                        android.content.ClipData.newPlainText(
+                    val clip = when (payload.mime) {
+                        ClipboardMimeKind.IMAGE_PNG ->
+                            RemoteClipboardImagePolicy.writeImageToClipData(app, payload.data)
+                        ClipboardMimeKind.TEXT_HTML -> {
+                            val html = String(payload.data, Charsets.UTF_8)
+                            android.content.ClipData.newHtmlText("isekai-terminal (remote)", html, html)
+                        }
+                        else -> android.content.ClipData.newPlainText(
                             "isekai-terminal (remote)",
                             String(payload.data, Charsets.UTF_8),
                         )
                     }
-                    cm.setPrimaryClip(clip)
+                    // 不正なPNGペイロード(署名不一致・サイズ超過)は[RemoteClipboardImagePolicy]が
+                    // `null`を返して弾く。クリップボードには何も反映しない。
+                    if (clip != null) cm.setPrimaryClip(clip)
                 },
                 readFromClipboard = {
                     val cm = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
                         as android.content.ClipboardManager
                     val clipData = cm.primaryClip
-                    if (RemoteClipboardImagePolicy.isImageClip(clipData)) {
-                        RemoteClipboardImagePolicy.readImageFromClipData(app.contentResolver, clipData)
-                    } else {
-                        clipData?.takeIf { it.itemCount > 0 }
-                            ?.getItemAt(0)?.coerceToText(app)?.toString()
+                    val item = clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)
+                    when {
+                        RemoteClipboardImagePolicy.isImageClip(clipData) ->
+                            RemoteClipboardImagePolicy.readImageFromClipData(app.contentResolver, clipData)
+                        item?.htmlText != null ->
+                            ClipboardPayload(ClipboardMimeKind.TEXT_HTML, item.htmlText.toByteArray(Charsets.UTF_8))
+                        else -> item?.coerceToText(app)?.toString()
                             ?.takeIf { it.isNotEmpty() }
                             ?.let { ClipboardPayload(ClipboardMimeKind.TEXT_PLAIN, it.toByteArray(Charsets.UTF_8)) }
                     }
