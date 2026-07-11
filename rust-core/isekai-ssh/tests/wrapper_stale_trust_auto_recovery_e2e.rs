@@ -461,8 +461,27 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     // `isekai-bootstrap/src/openssh.rs`'s module docs) — two `exec_request`
     // calls here means the re-bootstrap happened exactly once, not that it
     // was retried an extra time.
+    //
+    // `deploy_count` is incremented by `FakeShellHandler::exec_request` (a
+    // separate tokio task inside the mock ssh server) at the moment the
+    // *second* exec's request frame is handled, which is not guaranteed to
+    // happen-before the wrapper child process has fully unwound and this
+    // (killed-then-immediately-checked) assertion runs — seen as a rare
+    // `1` instead of `2` in CI (never locally) once this test actually
+    // started running there. Poll briefly instead of reading the counter
+    // exactly once.
+    let mut observed_deploy_count = deploy_count.load(std::sync::atomic::Ordering::SeqCst);
+    if observed_deploy_count != 2 {
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            observed_deploy_count = deploy_count.load(std::sync::atomic::Ordering::SeqCst);
+            if observed_deploy_count == 2 {
+                break;
+            }
+        }
+    }
     assert_eq!(
-        deploy_count.load(std::sync::atomic::Ordering::SeqCst),
+        observed_deploy_count,
         2,
         "expected exactly one re-bootstrap deploy (2 ssh exec calls: upload + launch)"
     );
