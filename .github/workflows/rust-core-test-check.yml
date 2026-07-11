@@ -30,10 +30,6 @@ concurrency:
 
 permissions:
   contents: read
-  # DEBUG(一時的): tmate接続文字列をPRコメントとして中継するために必要
-  # (GitHub Actionsは実行中ジョブの生ログをAPI経由で取得できないため)。
-  # 原因特定後にpermissionsごと元に戻すこと。
-  pull-requests: write
 
 jobs:
   test:
@@ -91,32 +87,22 @@ jobs:
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           bash rust-core/scripts/build-isekai-pipe-musl.sh
 
-      # DEBUG(一時的): real_sshd_multihop_bootstrap_e2e.rsの原因究明のため、
-      # 実行環境へ対話的にSSH接続できるようにする。GitHub Actionsは実行中ジョブの
-      # 生ログをAPI経由で読めない(`gh run view --log`は完了後のみ)ため、
-      # detachedモードにして接続文字列を後続ステップでPRコメントとして中継する。
-      # 原因特定後にこれらのステップは削除すること。
-      - name: DEBUG tmate session (detached)
-        uses: mxschmitt/action-tmate@v3
-        with:
-          detached: true
+      - name: Build isekai-pipe native debug binary (build prerequisite for real-sshd E2E tests)
+        # real_sshd_bootstrap_e2e.rs/real_sshd_multihop_bootstrap_e2e.rs/init_e2e.rs/
+        # wrapper_stale_trust_auto_recovery_e2e.rs(いずれもisekai-ssh/tests/)は、
+        # `target/debug/isekai-pipe`が存在しない場合、テスト本体の実行時に同期的に
+        # `cargo build -p isekai-pipe`を呼んでその場でビルドする(sibling_bin_path)。
+        # これはisekai-pipeの全依存クレート(rustls/noq/h3/aws-lc-rs/netdev等)を含む
+        # 重量級コンパイルで数十秒〜数分かかり、その間ワークスペース全体テストの
+        # 他の並行実行中のテスト(実sshd/ssh(1)サブプロセスを使うもの)からCPUを
+        # 奪ってタイミングを崩し、"jump host unreachable" / "Broken pipe"のような
+        # 断続的な失敗を引き起こしていた(tmateでCI実行環境へ対話的に入って特定、
+        # 4回連続で同一テスト・同一エラーが再現したうえ、ローカルでは
+        # isekai-pipeが既にビルド済みだったため一度も再現しなかったことと符合する)。
+        # ここで事前にビルドしておけば、テスト実行中の同期的コンパイルが発生しない。
+        working-directory: rust-core
+        run: cargo build -p isekai-pipe
 
-      - name: DEBUG relay tmate connection string via PR comment
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -x
-          CONN=""
-          for i in $(seq 1 15); do
-            CONN=$(/tmp/tmate/tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>&1 || true)
-            case "$CONN" in ssh\ *) break ;; esac
-            sleep 2
-          done
-          {
-            echo "DEBUG tmate connection:"
-            echo "\`$CONN\`"
-          } > /tmp/debug-tmate-body.md
-          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/debug-tmate-body.md
-
-      - name: DEBUG keep runner alive for interactive session
-        run: sleep 1200
+      - name: cargo test --workspace (excluding noq-multipath-spike)
+        working-directory: rust-core
+        run: cargo test --workspace --exclude noq-multipath-spike
