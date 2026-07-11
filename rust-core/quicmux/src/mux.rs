@@ -542,4 +542,19 @@ impl AnyByteStreamWriteHalf {
             Self::Qmux(half) => half.wait_for_close().await,
         }
     }
+
+    /// Abandons this send stream with an abrupt reset (`code`) instead of a
+    /// graceful finish — see `NoqByteStreamWriteHalf::reset`'s docs for why
+    /// this distinction matters to a peer deciding whether the stream just
+    /// finished cleanly or was abandoned outright. Infallible: both backends
+    /// treat "already finished/reset" as a no-op, not an error a caller
+    /// needs to react to.
+    pub fn reset(&mut self, code: u32) {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(half) => half.reset(code),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(half) => half.reset(code),
+        }
+    }
 }

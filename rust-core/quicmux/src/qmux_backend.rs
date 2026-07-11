@@ -469,6 +469,14 @@ impl QmuxByteStreamWriteHalf {
         self.send.finish().map_err(map_qmux_error)
     }
 
+    /// See `NoqByteStreamWriteHalf::reset`'s docs — same abandon-not-finish
+    /// distinction, backed by `web_transport_trait::SendStream::reset`
+    /// (infallible by signature).
+    pub(crate) fn reset(&mut self, code: u32) {
+        use web_transport_trait::SendStream as _;
+        self.send.reset(code);
+    }
+
     /// See [`QmuxByteStream::wait_for_close`].
     pub(crate) async fn wait_for_close(&mut self) -> Result<(), MuxError> {
         use web_transport_trait::SendStream as _;

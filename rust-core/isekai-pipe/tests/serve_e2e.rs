@@ -632,6 +632,175 @@ async fn resume_after_connection_loss_replays_and_continues() {
     send2.finish().unwrap();
 }
 
+/// Regression test for a bug found via live debugging (2026-07-11): when
+/// `isekai-pipe connect`'s resume loop abandons a connection to reconnect
+/// (a network-change signal, or its own data pump erroring), it used to
+/// just let the QUIC send stream's halves drop — and `noq`/`qmux`'s `Drop`
+/// for a send stream calls `finish()` (a clean FIN) by default, same as a
+/// legitimate app-level half-close (e.g. stdin EOF, where S→C must keep
+/// flowing). The server's `relay_buffered` cannot tell those two apart from
+/// a plain `Ok(0)` read, so it kept treating the session as `Established`
+/// on a connection that was actually already dead — never parking it — and
+/// every subsequent `RESUME` failed with `REJECT_UNKNOWN_TOKEN` forever
+/// (observed live as `isekai-helper rejected RESUME: UnknownSession`, on
+/// literally the very next reconnect attempt, well before any park-expiry
+/// window could even matter).
+///
+/// This test drives exactly the fix's contract at the wire level: reset
+/// (not gracefully finish) the C→S send stream while leaving the QUIC
+/// connection itself open, matching `run_resume_loop`'s own
+/// `quic_write.reset(0)` call in `isekai-pipe/src/main.rs` (added by the
+/// same fix). The server must classify this as `RelayOutcome::DataStreamDied`
+/// and park the session, so a `RESUME` on a fresh connection succeeds.
+#[tokio::test]
+async fn resume_succeeds_after_the_data_stream_is_reset_not_gracefully_finished() {
+    let echo_addr = spawn_echo_server().await;
+    let helper = spawn_helper(echo_addr, &[]);
+    let session_secret = base64::engine::general_purpose::STANDARD
+        .decode(&helper.handshake.session_secret)
+        .unwrap();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
+        .parse()
+        .unwrap();
+
+    let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn1 = endpoint1
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .unwrap();
+    let (sid1, gen1, aid1) = fresh_attach_ids();
+    let (mut send1, recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
+
+    let proof1 = compute_proof(&conn1, &session_secret);
+    let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
+    let mut chello1 = vec![CONTROL_HELLO];
+    chello1.extend_from_slice(&proof1);
+    csend1.write_all(&chello1).await.unwrap();
+    let mut cack1 = [0u8; 17];
+    tokio::time::timeout(Duration::from_secs(5), crecv1.read_exact(&mut cack1))
+        .await
+        .expect("timed out waiting for CONTROL_ACK")
+        .unwrap();
+    assert_eq!(cack1[0], CONTROL_ACK);
+    let session_id = cack1[1..17].to_vec();
+
+    // Abandon *only* the data stream's send side with an abrupt reset —
+    // deliberately not `conn1.close()` (that's connection-level teardown,
+    // already correctly handled; the bug is specifically about abandoning
+    // just a stream while the connection object itself was already
+    // relinquished earlier, exactly what `run_resume_loop` does).
+    send1.reset(quinn::VarInt::from_u32(0)).unwrap();
+    drop(recv1);
+    drop(csend1);
+    drop(crecv1);
+
+    // helper 側が data stream の切断を検知して session を park するまで少し待つ。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn2 = endpoint2
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .expect("second QUIC handshake failed");
+
+    let mut exporter2 = [0u8; 32];
+    conn2.export_keying_material(&mut exporter2, EXPORTER_LABEL, b"").unwrap();
+    let mut mac = HmacSha256::new_from_slice(&session_secret).unwrap();
+    mac.update(&exporter2);
+    mac.update(&session_id);
+    let resume_proof = mac.finalize().into_bytes();
+
+    let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
+    let resume_frame = encode_quicmux_resume_frame(&session_id, &resume_proof, 0, 0);
+    send2.write_all(&resume_frame).await.unwrap();
+
+    match read_quicmux_resume_response(&mut recv2).await {
+        QuicmuxResumeResponse::Ack { .. } => {}
+        QuicmuxResumeResponse::Reject(reason) => panic!(
+            "expected RESUME_ACK after a reset (not gracefully finished) data stream, got reject reason {reason:#x} \
+             -- the session was never parked, exactly the live-debugged bug this test guards against"
+        ),
+    }
+
+    endpoint1.close(0u32.into(), b"test done");
+    send2.finish().unwrap();
+}
+
+/// Companion to the reset-based test above: a *graceful* finish (or a plain
+/// drop, since `noq`/`qmux` finish on drop too) of the data stream's send
+/// side must **not** be treated as resumable — this is correct, existing
+/// behavior (a legitimate half-close, e.g. stdin EOF, has no reason to
+/// support resume) and this test exists so a future change can't
+/// accidentally widen "resumable" to cover this case too, which would be a
+/// content-integrity problem (the server would have no reliable signal left
+/// to distinguish "client is done" from "client got disconnected").
+#[tokio::test]
+async fn resume_is_still_rejected_after_a_graceful_finish_not_a_reset() {
+    let echo_addr = spawn_echo_server().await;
+    let helper = spawn_helper(echo_addr, &[]);
+    let session_secret = base64::engine::general_purpose::STANDARD
+        .decode(&helper.handshake.session_secret)
+        .unwrap();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
+        .parse()
+        .unwrap();
+
+    let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn1 = endpoint1
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .unwrap();
+    let (sid1, gen1, aid1) = fresh_attach_ids();
+    let (mut send1, recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
+
+    let proof1 = compute_proof(&conn1, &session_secret);
+    let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
+    let mut chello1 = vec![CONTROL_HELLO];
+    chello1.extend_from_slice(&proof1);
+    csend1.write_all(&chello1).await.unwrap();
+    let mut cack1 = [0u8; 17];
+    tokio::time::timeout(Duration::from_secs(5), crecv1.read_exact(&mut cack1))
+        .await
+        .expect("timed out waiting for CONTROL_ACK")
+        .unwrap();
+    assert_eq!(cack1[0], CONTROL_ACK);
+    let session_id = cack1[1..17].to_vec();
+
+    send1.finish().unwrap();
+    drop(recv1);
+    drop(csend1);
+    drop(crecv1);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn2 = endpoint2
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .expect("second QUIC handshake failed");
+
+    let mut exporter2 = [0u8; 32];
+    conn2.export_keying_material(&mut exporter2, EXPORTER_LABEL, b"").unwrap();
+    let mut mac = HmacSha256::new_from_slice(&session_secret).unwrap();
+    mac.update(&exporter2);
+    mac.update(&session_id);
+    let resume_proof = mac.finalize().into_bytes();
+
+    let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
+    let resume_frame = encode_quicmux_resume_frame(&session_id, &resume_proof, 0, 0);
+    send2.write_all(&resume_frame).await.unwrap();
+
+    let QuicmuxResumeResponse::Reject(_) = read_quicmux_resume_response(&mut recv2).await else {
+        panic!("a gracefully-finished (not reset) data stream must not be treated as resumable");
+    };
+
+    endpoint1.close(0u32.into(), b"test done");
+}
+
 /// Phase 8-4: 存在しない（あるいは既に sweep 済みの）session_id で `RESUME` を
 /// 送ると `REJECT_UNKNOWN_SESSION` が返ることを確認する。session_id 自体は
 /// でたらめだが proof はその connection の exporter から正しく計算するので、

@@ -541,6 +541,22 @@ impl NoqByteStreamWriteHalf {
         self.send.finish().map_err(|_| MuxError::StreamIo("stream already finished or reset".to_string()))
     }
 
+    /// Abruptly resets the send side with `code`, instead of the graceful
+    /// FIN `shutdown()`/plain `Drop` (`noq::SendStream::drop` calls
+    /// `finish()`, not `reset()`) send. Needed wherever a caller abandons a
+    /// stream mid-use rather than legitimately finishing it: a peer reading
+    /// the abandoned side sees a graceful EOF (`Ok(0)`) either way otherwise,
+    /// unable to distinguish "sender is done, still healthy" from "sender
+    /// gave up on this stream entirely" — `isekai-pipe serve`'s
+    /// `relay_buffered` relies on exactly that distinction to decide whether
+    /// a session is resumable (`DataStreamDied`, from a read error) or just
+    /// half-closed (`Ok(0)`, keep relaying the other direction). Infallible
+    /// in practice (`ClosedStream` only when the stream already finished or
+    /// reset, nothing left to abandon) — callers don't need to react to it.
+    pub(crate) fn reset(&mut self, code: u32) {
+        let _ = self.send.reset(noq::VarInt::from_u32(code));
+    }
+
     /// See [`NoqByteStream::wait_for_close`].
     pub(crate) async fn wait_for_close(&self) -> Result<(), MuxError> {
         self.send.stopped().await.map(|_| ()).map_err(|e| map_write_error(e.into()))

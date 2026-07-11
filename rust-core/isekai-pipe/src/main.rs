@@ -1861,9 +1861,9 @@ async fn run_resume_loop(
             target.local_bind_port_range,
         );
 
-        let (quic_read, quic_write) = data_stream.split();
+        let (mut quic_read, mut quic_write) = data_stream.split();
         let outcome = tokio::select! {
-            outcome = run_data_pump(&mut stdin, &mut stdout, quic_read, quic_write, &replay, &counters) => outcome,
+            outcome = run_data_pump(&mut stdin, &mut stdout, &mut quic_read, &mut quic_write, &replay, &counters) => outcome,
             Some(()) = reconnect_signal_rx.recv() => {
                 Err(anyhow::anyhow!("network change detected, reconnecting"))
             }
@@ -1877,6 +1877,22 @@ async fn run_resume_loop(
             }
             return Ok(());
         }
+
+        // Abandoning this connection (network change, or run_data_pump's own
+        // I/O failure) — explicitly reset the send side instead of letting
+        // it drop gracefully. `noq`/`qmux`'s `Drop` for a send stream calls
+        // `finish()` (a clean FIN) by default, which `isekai-pipe serve`'s
+        // `relay_buffered` cannot distinguish from a legitimate half-close
+        // (e.g. stdin EOF, where S→C must keep flowing) — so it leaves the
+        // session `Established`-but-never-parked on this now-dead
+        // connection instead of parking it for resume, and every subsequent
+        // RESUME then fails as "not resumable" (`UnknownSession`) forever
+        // (found via live debugging, 2026-07-11: the very next reconnect
+        // attempt after a network-change-triggered abandon got exactly this
+        // rejection). A reset instead makes the server's read return an
+        // error, correctly classified as `RelayOutcome::DataStreamDied` and
+        // parked.
+        quic_write.reset(0);
 
         // The resume window's clock starts here, at disconnect detection —
         // before the fast-path promote attempt below, not after it, so a
@@ -1991,8 +2007,8 @@ async fn run_resume_loop(
 async fn run_data_pump(
     stdin: &mut (impl AsyncRead + Unpin),
     stdout: &mut (impl AsyncWrite + Unpin),
-    quic_read: AnyByteStreamReadHalf,
-    quic_write: AnyByteStreamWriteHalf,
+    quic_read: &mut AnyByteStreamReadHalf,
+    quic_write: &mut AnyByteStreamWriteHalf,
     replay: &Arc<Mutex<C2hReplayBuffer>>,
     counters: &Arc<AppAckCounters>,
 ) -> Result<()> {
@@ -2022,7 +2038,7 @@ async fn run_data_pump(
 
 async fn pump_c2h(
     stdin: &mut (impl AsyncRead + Unpin),
-    mut quic_write: AnyByteStreamWriteHalf,
+    quic_write: &mut AnyByteStreamWriteHalf,
     replay: Arc<Mutex<C2hReplayBuffer>>,
     counters: Arc<AppAckCounters>,
 ) -> Result<()> {
@@ -2056,7 +2072,7 @@ async fn pump_c2h(
 }
 
 async fn pump_h2c(
-    mut quic_read: AnyByteStreamReadHalf,
+    quic_read: &mut AnyByteStreamReadHalf,
     stdout: &mut (impl AsyncWrite + Unpin),
     counters: Arc<AppAckCounters>,
 ) -> Result<()> {
