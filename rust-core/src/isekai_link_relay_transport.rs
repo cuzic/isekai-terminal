@@ -293,23 +293,33 @@ async fn connect_relay_stream(
     // relayは常時経路に残る(常にトンネルを維持している)ため、STUN版のような
     // 「NATマッピングが失われて復旧不能」という制約は無い——relay自体への到達性が
     // 保たれている限り、何度でも同じアドレスへ繋ぎ直せる。
-    let reattach_fn: resume_client::ReattachFn<quicmux::AnyByteStreamReadHalf, quicmux::AnyByteStreamWriteHalf> = Arc::new(move |session_id, client_sent_offset, client_delivered_offset| {
-        let factory = crate::android_quic_endpoint::factory();
-        let target = target.clone();
-        Box::pin(async move {
-            let outcome = isekai_transport::resume::reconnect_and_resume(
-                &factory,
-                &target,
-                isekai_transport::SessionId::from_bytes(session_id),
-                isekai_transport::C2hSentOffset::new(client_sent_offset),
-                isekai_transport::H2cClientDeliveredOffset::new(client_delivered_offset),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            info!("isekai_link_relay: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
-            let (read, write) = outcome.data_stream.split();
-            Ok(resume_client::ReattachResult { read, write, helper_committed_offset: outcome.helper_committed_offset.get() })
-        })
+    let reattach_fn: resume_client::ReattachFn<quicmux::AnyByteStreamReadHalf, quicmux::AnyByteStreamWriteHalf> = Arc::new({
+        let resume_state = resume_state.clone();
+        move |session_id, client_sent_offset, client_delivered_offset| {
+            let factory = crate::android_quic_endpoint::factory();
+            let target = target.clone();
+            let resume_state = resume_state.clone();
+            Box::pin(async move {
+                let outcome = isekai_transport::resume::reconnect_and_resume(
+                    &factory,
+                    &target,
+                    isekai_transport::SessionId::from_bytes(session_id),
+                    isekai_transport::C2hSentOffset::new(client_sent_offset),
+                    isekai_transport::H2cClientDeliveredOffset::new(client_delivered_offset),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                info!("isekai_link_relay: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
+                isekai_pipe_quic_transport::spawn_control_stream_reestablishment_after_resume(
+                    "isekai_link_relay",
+                    outcome.connection.clone(),
+                    target.session_secret.clone(),
+                    resume_state,
+                );
+                let (read, write) = outcome.data_stream.split();
+                Ok(resume_client::ReattachResult { read, write, helper_committed_offset: outcome.helper_committed_offset.get() })
+            })
+        }
     });
 
     let (data_read, data_write) = data_stream.split();

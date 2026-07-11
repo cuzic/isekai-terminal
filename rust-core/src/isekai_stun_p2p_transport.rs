@@ -376,28 +376,38 @@ async fn connect_stun_p2p_stream(
     // トレードオフ(PLAN.md Phase 10参照)。isekai-transportのSTUN P2Pにはresume概念自体が
     // 無いため(stun_p2p.rsのモジュールdoc参照)、reattachは`RelayTarget{helper_addr:
     // peer_addr, ..}`とみなしてreconnect_and_resume(直接dial+RESUME)を呼ぶだけにする。
-    let reattach_fn: resume_client::ReattachFn<quicmux::AnyByteStreamReadHalf, quicmux::AnyByteStreamWriteHalf> = Arc::new(move |session_id, client_sent_offset, client_delivered_offset| {
-        let target = isekai_transport::RelayTarget {
-            helper_addr: peer_addr,
-            server_name: target.server_name.clone(),
-            cert_sha256_hex: target.cert_sha256_hex.clone(),
-            session_secret: target.session_secret.clone(),
-        };
-        let factory = crate::android_quic_endpoint::factory();
-        Box::pin(async move {
-            let outcome = isekai_transport::resume::reconnect_and_resume(
-                &factory,
-                &target,
-                isekai_transport::SessionId::from_bytes(session_id),
-                isekai_transport::C2hSentOffset::new(client_sent_offset),
-                isekai_transport::H2cClientDeliveredOffset::new(client_delivered_offset),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            info!("isekai_stun_p2p: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
-            let (read, write) = outcome.data_stream.split();
-            Ok(resume_client::ReattachResult { read, write, helper_committed_offset: outcome.helper_committed_offset.get() })
-        })
+    let reattach_fn: resume_client::ReattachFn<quicmux::AnyByteStreamReadHalf, quicmux::AnyByteStreamWriteHalf> = Arc::new({
+        let resume_state = resume_state.clone();
+        move |session_id, client_sent_offset, client_delivered_offset| {
+            let target = isekai_transport::RelayTarget {
+                helper_addr: peer_addr,
+                server_name: target.server_name.clone(),
+                cert_sha256_hex: target.cert_sha256_hex.clone(),
+                session_secret: target.session_secret.clone(),
+            };
+            let factory = crate::android_quic_endpoint::factory();
+            let resume_state = resume_state.clone();
+            Box::pin(async move {
+                let outcome = isekai_transport::resume::reconnect_and_resume(
+                    &factory,
+                    &target,
+                    isekai_transport::SessionId::from_bytes(session_id),
+                    isekai_transport::C2hSentOffset::new(client_sent_offset),
+                    isekai_transport::H2cClientDeliveredOffset::new(client_delivered_offset),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                info!("isekai_stun_p2p: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
+                isekai_pipe_quic_transport::spawn_control_stream_reestablishment_after_resume(
+                    "isekai_stun_p2p",
+                    outcome.connection.clone(),
+                    target.session_secret.clone(),
+                    resume_state,
+                );
+                let (read, write) = outcome.data_stream.split();
+                Ok(resume_client::ReattachResult { read, write, helper_committed_offset: outcome.helper_committed_offset.get() })
+            })
+        }
     });
 
     let (data_read, data_write) = data_stream.split();
