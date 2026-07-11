@@ -128,9 +128,11 @@ jobs:
         run: cargo zigbuild --release -p ${{ matrix.bin }} --bin ${{ matrix.bin }} --target ${{ matrix.platform.target }}
 
       - name: Smoke test (--version)
-        # windows-gnuはubuntu-latestからのクロスビルドなので生成物を実行できない。
-        # 他の5組はビルドと同じホストで実行できる。
-        if: matrix.platform.toolchain != 'mingw'
+        # windows-gnu(ubuntu-latestからのmingwクロス)とaarch64-unknown-linux-musl
+        # (ubuntu-latest = x86_64ホストからのクロス)は、生成物をそのホスト上で
+        # 実行できない。x86_64-apple-darwinはmacos-26(Apple Silicon)ホストの
+        # Rosetta 2が透過的に実行してくれるため対象外にしなくてよい。
+        if: matrix.platform.toolchain != 'mingw' && matrix.platform.target != 'aarch64-unknown-linux-musl'
         shell: bash
         working-directory: rust-core
         run: ./target/${{ matrix.platform.target }}/release/${{ matrix.bin }}${{ matrix.platform.ext }} --version
