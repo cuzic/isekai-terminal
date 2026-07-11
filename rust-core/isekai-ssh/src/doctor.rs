@@ -1,10 +1,12 @@
 //! `isekai-ssh doctor <host> [--fix]`: manual diagnostic, never part of
 //! `isekai-ssh <host>`'s own connection path (`ISEKAI_PIPE_DESIGN.md` §8
-//! Epic N). That path already detects a stale-trust signal and silently
-//! recovers from it on its own (`wrapper.rs::run_ssh_with_stale_trust_recovery`)
-//! — `doctor` exists purely so a human can ask "what's the state of this
-//! host's trust right now?" on demand, without waiting for a real
-//! connection attempt to fail first.
+//! Epic N's "always-connects" principle). That path already detects any
+//! connect-layer failure — stale trust material *or* a plain unreachable/dead
+//! cached deployment — and silently recovers from it on its own
+//! (`wrapper.rs::run_ssh_with_connect_failure_recovery`) — `doctor` exists
+//! purely so a human can ask "what's the state of this host's trust right
+//! now?" on demand, without waiting for a real connection attempt to fail
+//! first.
 //!
 //! Reuses `wrapper.rs`'s own `~/.ssh/config`/`#@isekai` directive resolution
 //! (`wrapper::resolve_profile_for_destination`) and `bootstrap_and_register`

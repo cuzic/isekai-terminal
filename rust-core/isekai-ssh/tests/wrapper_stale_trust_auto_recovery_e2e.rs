@@ -1,12 +1,22 @@
-//! End-to-end test for the wrapper's stale-trust auto-recovery path
-//! (`wrapper.rs::run_ssh_with_stale_trust_recovery`, `ISEKAI_PIPE_DESIGN.md`
-//! §8 Epic N): an *already-trusted* destination whose cached
-//! `session_secret` no longer matches the real, currently-running
-//! `isekai-pipe serve` (the exact shape a helper restart produces in
-//! practice — see `isekai-pipe/src/engine/mod.rs`'s "起動のたびにランダム
-//! 生成する" comment) gets silently (no `[y/N]` prompt) re-bootstrapped and
-//! retried, without the user needing to notice or run `isekai-ssh init`
-//! manually.
+//! End-to-end test for the wrapper's connect-failure auto-recovery path
+//! (`wrapper.rs::run_ssh_with_connect_failure_recovery`, `ISEKAI_PIPE_DESIGN.md`
+//! §8 Epic N's "always-connects" principle): whatever state an
+//! *already-trusted* destination's cached deployment is in, `isekai-ssh
+//! <destination>` must self-heal (silently, no `[y/N]` prompt — this
+//! profile was already trusted once) rather than requiring the user to
+//! notice and run `isekai-ssh doctor --fix`/`init` manually. Two scenarios,
+//! both driving the same recovery code path with a different
+//! `ConnectOutcomeClass`:
+//!
+//! - `wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects`:
+//!   the cached `session_secret` no longer matches the real, currently-running
+//!   `isekai-pipe serve` (the exact shape a helper restart produces in
+//!   practice — see `isekai-pipe/src/engine/mod.rs`'s "起動のたびにランダム
+//!   生成する" comment) — `ConnectOutcomeClass::StaleTrust`.
+//! - `wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_reconnects`:
+//!   the cached endpoint simply has nothing listening any more (e.g. the
+//!   previously-deployed `isekai-pipe serve` process was killed) — a plain
+//!   QUIC-connect idle timeout, `ConnectOutcomeClass::Unreachable`.
 //!
 //! Combines two existing harness patterns from this crate's e2e tests: a
 //! *real* `isekai-pipe serve` process standing in for "the already-deployed,
@@ -536,4 +546,124 @@ async fn wrapper_does_not_auto_recover_when_no_bootstrap_is_set() {
     let unchanged = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), &key).unwrap().expect("profile should still exist, unmodified");
     let legacy_relay = unchanged.legacy_relay_transport.as_ref().unwrap();
     assert_eq!(legacy_relay.session_secret_b64, wrong_secret_b64, "the stale profile must be left untouched");
+}
+
+/// The "always-connects" principle's other half: the cached endpoint isn't
+/// rejecting us (that's the stale-trust scenario above) — it simply has
+/// nothing listening any more (the exact shape "the previously-deployed
+/// `isekai-pipe serve` process was killed" produces), so the first `ssh`
+/// attempt fails with a plain QUIC-connect idle timeout
+/// (`ConnectOutcomeClass::Unreachable`, not `StaleTrust`). The wrapper must
+/// still silently re-bootstrap and retry — this is the regression test for
+/// that generalization (previously, only `StaleTrust` triggered recovery,
+/// so this exact scenario required the user to manually run `isekai-ssh
+/// doctor --fix`/`init`).
+#[tokio::test(flavor = "multi_thread")]
+async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_reconnects() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1)/ssh-keygen(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let remote_home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&remote_home).unwrap();
+    let deploy_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mock_sshd_addr = spawn_fake_ssh_server(remote_home.clone(), client_pubkey, deploy_count.clone()).await;
+
+    let home = tmp.path().join("client-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let path_env = shim_ssh_with_bootstrap_config(tmp.path(), "unreachable-host", mock_sshd_addr, &key_path);
+
+    // A `helper_addr` with nothing listening: bind a UDP socket, note its
+    // port, then drop it immediately -- any QUIC dial to it gets no
+    // response at all (a plain idle timeout), unlike the stale-trust
+    // scenario's real-but-wrong-secret helper.
+    let dead_addr = {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        drop(socket);
+        addr
+    };
+    let bogus_cert_sha256 = "a".repeat(64);
+    let bogus_secret_b64 = base64::engine::general_purpose::STANDARD.encode([0x11u8; 32]);
+
+    let key = isekai_trust::normalize_host_port("unreachable-host").unwrap();
+    register_stale_profile(&profiles_dir_under(&home), &key, dead_addr, &bogus_cert_sha256, &bogus_secret_b64);
+
+    let refreshed_secret_b64 = base64::engine::general_purpose::STANDARD.encode([0x22u8; 32]);
+    let report = valid_bootstrap_report_json(&refreshed_secret_b64);
+    let helper_script_path = tmp.path().join("fake-isekai-helper-unreachable.sh");
+    std::fs::write(&helper_script_path, format!("#!/bin/sh\necho '{report}'\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper_script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .arg("--isekai-helper-binary")
+        .arg(&helper_script_path)
+        .arg("unreachable-host")
+        .env("HOME", &home)
+        .env("PATH", &path_env)
+        .env_remove("RUST_LOG")
+        .stdin(StdStdio::piped()) // deliberately never written to -- Silent mode must not read it
+        .stdout(StdStdio::piped())
+        .stderr(StdStdio::piped())
+        .spawn()
+        .expect("failed to spawn isekai-ssh");
+    drop(child.stdin.take());
+
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut stderr_log = String::new();
+    let mut saw_unreachable_notice = false;
+    let mut saw_second_registration = false;
+    let mut registered_count = 0;
+    // The dead endpoint's QUIC dial has to actually time out
+    // (`isekai-transport::system::CLIENT_MAX_IDLE_TIMEOUT`, 15s) before the
+    // first `ssh` attempt fails at all, so this loop's per-line timeout is
+    // generous.
+    for _ in 0..400 {
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_secs(25), stderr.read_line(&mut line)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(_)) => {
+                eprint!("[isekai-ssh stderr] {line}");
+                stderr_log.push_str(&line);
+                if line.contains("could not be reached") {
+                    saw_unreachable_notice = true;
+                }
+                if line.contains("Registered") {
+                    registered_count += 1;
+                    if registered_count >= 1 && saw_unreachable_notice {
+                        saw_second_registration = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+
+    assert!(
+        saw_unreachable_notice,
+        "expected wrapper stderr to report a detected connect-failure (unreachable) signal:\n{stderr_log}"
+    );
+    assert!(saw_second_registration, "expected the re-bootstrap to complete and register a refreshed profile:\n{stderr_log}");
+    assert!(!stderr_log.contains("[y/N]"), "the automatic re-bootstrap must never show the TOFU prompt:\n{stderr_log}");
+    assert!(
+        !stderr_log.contains("looks stale"),
+        "an Unreachable (not StaleTrust) signal must use the unreachable-specific message, not the stale-trust one:\n{stderr_log}"
+    );
+
+    let refreshed = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), &key).unwrap().expect("profile should still exist after refresh");
+    let legacy_relay = refreshed.legacy_relay_transport.as_ref().expect("expected a cached relay transport");
+    assert_ne!(
+        legacy_relay.session_secret_b64, bogus_secret_b64,
+        "the cached session_secret must have been replaced by the re-bootstrap"
+    );
 }

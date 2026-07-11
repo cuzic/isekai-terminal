@@ -451,37 +451,52 @@ async fn connect_command(args: impl Iterator<Item = String>) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e:?}");
-            if e.downcast_ref::<isekai_transport::StaleTrustSignal>().is_some() {
-                write_stale_trust_outcome(&profile_for_outcome, &e);
-            }
+            write_connect_outcome_for_wrapper(&profile_for_outcome, &e);
             ExitCode::from(EX_UNAVAILABLE)
         }
     }
 }
 
-/// Writes a `ConnectOutcome::StaleTrust` side-channel file for `isekai-ssh`'s
-/// wrapper to notice after `ssh` exits (`ISEKAI_PIPE_DESIGN.md` §8 Epic N).
+/// Writes a `ConnectOutcome` side-channel file for `isekai-ssh`'s wrapper to
+/// notice after `ssh` exits (`ISEKAI_PIPE_DESIGN.md` §8 Epic N) — for
+/// *every* `run_connect` failure, not just ones that look like stale trust
+/// material (the "always-connects" principle: a cached deployment being
+/// stale/dead in any way must not require the user to notice and manually
+/// run `isekai-ssh doctor --fix`/`init`). `StaleTrust` is used when `err`
+/// carries `isekai_transport::StaleTrustSignal` (the narrow, high-confidence
+/// cert-pin-mismatch/Auth-reject case); every other `run_connect` failure —
+/// including a plain QUIC-connect idle timeout because the cached endpoint
+/// is simply dead — is recorded as `Unreachable`. Both classes make
+/// `isekai-ssh`'s wrapper attempt one silent re-bootstrap + retry
+/// (`wrapper.rs::run_ssh_with_connect_failure_recovery`); only the log
+/// message differs.
+///
 /// Only does anything when `ISEKAI_INTENT_ID` is set — a manual, standalone
 /// `isekai-pipe connect` invocation has no wrapper watching, so there is
 /// nowhere useful to write to. Failure to write is logged and swallowed:
 /// this must never change `connect_command`'s own exit code or touch
 /// stdout (stdout purity is a separately-tested hard invariant elsewhere).
-fn write_stale_trust_outcome(profile: &str, err: &anyhow::Error) {
+fn write_connect_outcome_for_wrapper(profile: &str, err: &anyhow::Error) {
     let Some(intent_id) = std::env::var_os("ISEKAI_INTENT_ID") else { return };
     let intent_id = intent_id.to_string_lossy().into_owned();
     let Ok(runtime_dir) = default_runtime_dir() else {
-        log::warn!("isekai-pipe connect: could not determine runtime dir to record a stale-trust outcome");
+        log::warn!("isekai-pipe connect: could not determine runtime dir to record a connect outcome");
         return;
+    };
+    let class = if err.downcast_ref::<isekai_transport::StaleTrustSignal>().is_some() {
+        isekai_pipe_core::ConnectOutcomeClass::StaleTrust
+    } else {
+        isekai_pipe_core::ConnectOutcomeClass::Unreachable
     };
     let outcome = isekai_pipe_core::ConnectOutcome {
         schema_version: isekai_pipe_core::CONNECT_OUTCOME_SCHEMA_VERSION,
         intent_id,
         profile: profile.to_string(),
-        class: isekai_pipe_core::ConnectOutcomeClass::StaleTrust,
+        class,
         detail: format!("{err:#}"),
     };
     if let Err(e) = isekai_pipe_core::write_connect_outcome(&runtime_dir, &outcome) {
-        log::warn!("isekai-pipe connect: failed to record a stale-trust outcome: {e}");
+        log::warn!("isekai-pipe connect: failed to record a connect outcome: {e}");
     }
 }
 

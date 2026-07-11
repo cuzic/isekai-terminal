@@ -275,25 +275,31 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
         }
         Err(err) => return Err(err),
     };
-    run_ssh_with_stale_trust_recovery(&plan, &resolution, intent).await
+    run_ssh_with_connect_failure_recovery(&plan, &resolution, intent).await
 }
 
 /// Runs `ssh` once against `intent`; if it fails *and* `isekai-pipe connect`
-/// left behind a `ConnectOutcomeClass::StaleTrust` side-channel file for
-/// this exact attempt (`isekai-pipe-core::claim_connect_outcome`,
-/// `ISEKAI_PIPE_DESIGN.md` §8 Epic N), silently refreshes the trust store
-/// (no `[y/N]` prompt — confirmed product decision: this profile was
-/// already trusted once, and the underlying SSH re-deploy connection is
-/// still gated by the user's own `~/.ssh/known_hosts`, `OpenSshBackend`'s
-/// module docs) and retries exactly once more. Structurally at most two
-/// `ssh` invocations ever happen here — no loop, no recursion — so this
-/// cannot run away even if the retry's own attempt is *also* stale (e.g. a
-/// crash-looping helper): whatever the second attempt returns is final.
+/// left behind a `ConnectOutcome` side-channel file for this exact attempt
+/// (`isekai-pipe-core::claim_connect_outcome`, `ISEKAI_PIPE_DESIGN.md` §8
+/// Epic N's "always-connects" principle: whatever state the cached
+/// deployment is in — stale trust material, or the helper simply being
+/// dead/unreachable — `isekai-ssh <destination>` must self-heal rather than
+/// requiring the user to notice and run `isekai-ssh doctor --fix`/`init`
+/// manually), silently refreshes the trust store (no `[y/N]` prompt —
+/// confirmed product decision: this profile was already trusted once, and
+/// the underlying SSH re-deploy connection is still gated by the user's own
+/// `~/.ssh/known_hosts`, `OpenSshBackend`'s module docs) and retries exactly
+/// once more. Structurally at most two `ssh` invocations ever happen here —
+/// no loop, no recursion — so this cannot run away even if the retry's own
+/// attempt also fails (e.g. a crash-looping helper, or a genuinely
+/// unreachable network): whatever the second attempt returns is final for
+/// *this* invocation, though a subsequent manual `isekai-ssh <destination>`
+/// gets its own fresh two-attempt budget.
 ///
 /// Only reachable *after* `build_connection_intent` already succeeded once
 /// in `run()` — a brand-new (never-registered) profile's own, separately
 /// prompted bootstrap path is untouched by this function entirely.
-async fn run_ssh_with_stale_trust_recovery(
+async fn run_ssh_with_connect_failure_recovery(
     plan: &WrapperPlan,
     resolution: &WrapperResolution,
     intent: ConnectionIntent,
@@ -306,28 +312,28 @@ async fn run_ssh_with_stale_trust_recovery(
     let exit_code = status.code().unwrap_or(1) as u8;
 
     let outcome = claim_connect_outcome(&runtime_dir, &intent_id)
-        .map_err(|e| anyhow!("isekai-ssh: failed to check for a stale-trust signal: {e}"))?;
+        .map_err(|e| anyhow!("isekai-ssh: failed to check for a connect-failure signal: {e}"))?;
 
-    match decide_stale_trust_recovery(outcome.is_some(), should_bootstrap(plan, resolution)) {
-        StaleTrustRecoveryAction::NoStaleTrustSignal => Ok(exit_code),
-        StaleTrustRecoveryAction::AutoBootstrapDisabled => {
-            let outcome = outcome.expect("AutoBootstrapDisabled only returned when a stale-trust signal was found");
+    match decide_connect_failure_recovery(outcome.is_some(), should_bootstrap(plan, resolution)) {
+        ConnectFailureRecoveryAction::NoRecoverableSignal => Ok(exit_code),
+        ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
+            let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
             eprintln!(
-                "isekai-ssh: cached trust for {:?} looks stale ({}), but auto-bootstrap is disabled \
+                "isekai-ssh: {} for {:?} ({}), but auto-bootstrap is disabled \
                  (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
-                resolution.isekai.profile, outcome.detail
+                outcome_summary(&outcome.class), resolution.isekai.profile, outcome.detail
             );
             Ok(exit_code)
         }
-        StaleTrustRecoveryAction::RebootstrapAndRetry => {
-            let outcome = outcome.expect("RebootstrapAndRetry only returned when a stale-trust signal was found");
+        ConnectFailureRecoveryAction::RebootstrapAndRetry => {
+            let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
             eprintln!(
-                "isekai-ssh: cached trust for {:?} looks stale ({}); refreshing automatically...",
-                resolution.isekai.profile, outcome.detail
+                "isekai-ssh: {} for {:?} ({}); refreshing automatically...",
+                outcome_summary(&outcome.class), resolution.isekai.profile, outcome.detail
             );
             if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
                 print_bootstrap_failure_guidance(&bootstrap_err);
-                return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a stale-trust signal failed"));
+                return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
             }
             let intent2 = build_connection_intent(resolution)
                 .context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
@@ -337,16 +343,29 @@ async fn run_ssh_with_stale_trust_recovery(
     }
 }
 
+/// Human-readable lead-in for the two `eprintln!`s above, branching on
+/// `ConnectOutcomeClass` purely for message accuracy — both classes drive
+/// the exact same [`ConnectFailureRecoveryAction`].
+fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> &'static str {
+    match class {
+        isekai_pipe_core::ConnectOutcomeClass::StaleTrust => "cached trust looks stale",
+        isekai_pipe_core::ConnectOutcomeClass::Unreachable => "the cached deployment could not be reached",
+    }
+}
+
 /// The three ways a failed first `ssh` attempt in
-/// [`run_ssh_with_stale_trust_recovery`] can be handled, given whether
-/// `isekai-pipe connect` left behind a `ConnectOutcomeClass::StaleTrust`
-/// side-channel signal and whether auto-bootstrap is currently allowed. Pure
-/// decision, no I/O — split out from the surrounding async function so each
-/// branch is unit-testable without spawning a real `ssh`/bootstrap process.
+/// [`run_ssh_with_connect_failure_recovery`] can be handled, given whether
+/// `isekai-pipe connect` left behind a `ConnectOutcome` side-channel signal
+/// (of either class — see that type's docs) and whether auto-bootstrap is
+/// currently allowed. Pure decision, no I/O — split out from the
+/// surrounding async function so each branch is unit-testable without
+/// spawning a real `ssh`/bootstrap process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StaleTrustRecoveryAction {
-    /// No stale-trust signal for this attempt — return the exit code as-is.
-    NoStaleTrustSignal,
+enum ConnectFailureRecoveryAction {
+    /// No connect-failure signal for this attempt — return the exit code
+    /// as-is (e.g. the remote shell command itself exited non-zero; that
+    /// never touches `isekai-pipe connect`'s own error path at all).
+    NoRecoverableSignal,
     /// A signal was found, but auto-bootstrap is disabled
     /// (`--isekai-no-bootstrap` / `#@isekai bootstrap-policy never`) —
     /// return the exit code as-is, with guidance to run `isekai-ssh init`.
@@ -356,13 +375,13 @@ enum StaleTrustRecoveryAction {
     RebootstrapAndRetry,
 }
 
-fn decide_stale_trust_recovery(stale_trust_detected: bool, should_bootstrap: bool) -> StaleTrustRecoveryAction {
-    if !stale_trust_detected {
-        StaleTrustRecoveryAction::NoStaleTrustSignal
+fn decide_connect_failure_recovery(connect_failure_signaled: bool, should_bootstrap: bool) -> ConnectFailureRecoveryAction {
+    if !connect_failure_signaled {
+        ConnectFailureRecoveryAction::NoRecoverableSignal
     } else if !should_bootstrap {
-        StaleTrustRecoveryAction::AutoBootstrapDisabled
+        ConnectFailureRecoveryAction::AutoBootstrapDisabled
     } else {
-        StaleTrustRecoveryAction::RebootstrapAndRetry
+        ConnectFailureRecoveryAction::RebootstrapAndRetry
     }
 }
 
@@ -372,7 +391,7 @@ fn decide_stale_trust_recovery(stale_trust_detected: bool, should_bootstrap: boo
 /// `.output()`) still blocks until the whole process tree, including the
 /// `ProxyCommand` grandchild, has exited, which is what makes inspecting a
 /// side-channel file in `runtime_dir` immediately afterward both correct
-/// and zero-cost to this stdio wiring (`run_ssh_with_stale_trust_recovery`).
+/// and zero-cost to this stdio wiring (`run_ssh_with_connect_failure_recovery`).
 async fn run_ssh_once(
     plan: &WrapperPlan,
     resolution: &WrapperResolution,
@@ -566,7 +585,7 @@ pub(crate) fn print_bootstrap_failure_guidance(err: &anyhow::Error) {
 /// Whether `bootstrap_and_register` shows the interactive `[y/N]` TOFU
 /// prompt before registering. `AlwaysPrompt` is used for a genuinely new
 /// (never-before-registered) profile — this requirement is fixed and never
-/// changes. `Silent` is used only by `run_ssh_with_stale_trust_recovery`'s
+/// changes. `Silent` is used only by `run_ssh_with_connect_failure_recovery`'s
 /// automatic re-bootstrap of an *already-trusted* profile whose cached
 /// session_secret/cert pin just went stale (confirmed product decision:
 /// the redeploy SSH connection is still gated by the user's own
@@ -583,7 +602,7 @@ pub(crate) enum TofuConfirmation {
 /// confirmation or silently, registers it in the trust store
 /// `build_connection_intent` reads from. Mirrors `init.rs`'s
 /// deploy-then-confirm-then-register flow, but triggered automatically by
-/// `run()` on a trust-store miss (or by `run_ssh_with_stale_trust_recovery`
+/// `run()` on a trust-store miss (or by `run_ssh_with_connect_failure_recovery`
 /// on a detected stale-trust signal) instead of via the standalone `init`
 /// subcommand.
 ///
@@ -1906,20 +1925,20 @@ mod tests {
     }
 
     #[test]
-    fn decide_stale_trust_recovery_returns_no_signal_when_no_signal_was_found() {
-        assert_eq!(decide_stale_trust_recovery(false, true), StaleTrustRecoveryAction::NoStaleTrustSignal);
+    fn decide_connect_failure_recovery_returns_no_signal_when_no_signal_was_found() {
+        assert_eq!(decide_connect_failure_recovery(false, true), ConnectFailureRecoveryAction::NoRecoverableSignal);
         // Whether auto-bootstrap is allowed is irrelevant without a signal.
-        assert_eq!(decide_stale_trust_recovery(false, false), StaleTrustRecoveryAction::NoStaleTrustSignal);
+        assert_eq!(decide_connect_failure_recovery(false, false), ConnectFailureRecoveryAction::NoRecoverableSignal);
     }
 
     #[test]
-    fn decide_stale_trust_recovery_returns_disabled_when_signal_found_but_bootstrap_off() {
-        assert_eq!(decide_stale_trust_recovery(true, false), StaleTrustRecoveryAction::AutoBootstrapDisabled);
+    fn decide_connect_failure_recovery_returns_disabled_when_signal_found_but_bootstrap_off() {
+        assert_eq!(decide_connect_failure_recovery(true, false), ConnectFailureRecoveryAction::AutoBootstrapDisabled);
     }
 
     #[test]
-    fn decide_stale_trust_recovery_retries_when_signal_found_and_bootstrap_allowed() {
-        assert_eq!(decide_stale_trust_recovery(true, true), StaleTrustRecoveryAction::RebootstrapAndRetry);
+    fn decide_connect_failure_recovery_retries_when_signal_found_and_bootstrap_allowed() {
+        assert_eq!(decide_connect_failure_recovery(true, true), ConnectFailureRecoveryAction::RebootstrapAndRetry);
     }
 
     #[tokio::test]

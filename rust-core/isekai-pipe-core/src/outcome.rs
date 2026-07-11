@@ -1,6 +1,7 @@
 //! Side-channel "how did this `isekai-pipe connect` attempt end" signal for
 //! `isekai-ssh`'s wrapper to notice after `ssh` exits
-//! (`ISEKAI_PIPE_DESIGN.md` §8 Epic N).
+//! (`ISEKAI_PIPE_DESIGN.md` §8 Epic N; broadened by the "always-connects"
+//! principle, §8 Epic N's "connect-failure auto-recovery" addendum).
 //!
 //! `isekai-pipe connect` runs as `ssh`'s `ProxyCommand` child, not a direct
 //! child of the `isekai-ssh` wrapper process — the two share no pipe. The
@@ -10,9 +11,13 @@
 //! point it's free to inspect files in the same `runtime_dir` both
 //! processes already share via `ISEKAI_PIPE_RUNTIME_DIR`/`ISEKAI_INTENT_ID`
 //! (`write_connection_intent`/`claim_connection_intent`, this crate's
-//! `lib.rs`). This module adds a sibling side-channel file for exactly one
-//! purpose: telling the wrapper "the cached trust for this profile looks
-//! stale, a re-bootstrap is worth trying" without touching `isekai-pipe
+//! `lib.rs`). This module adds a sibling side-channel file, written for
+//! *every* `run_connect` failure (not just ones that look like stale trust
+//! material) — a `run_connect` failure only ever happens before any SSH byte
+//! ever flows (this is `ssh`'s `ProxyCommand`; a remote shell command that
+//! ran and exited non-zero never touches this path at all), which makes
+//! "did `run_connect` fail at all" a safe, general trigger for the wrapper
+//! to try one silent re-bootstrap + retry — without touching `isekai-pipe
 //! connect`'s stdout (whose purity — zero bytes until the QUIC bridge is
 //! genuinely live — is a hard, separately-tested invariant elsewhere).
 //!
@@ -31,13 +36,20 @@ use crate::{create_private_dir, validate_intent_id, IntentError};
 
 pub const CONNECT_OUTCOME_SCHEMA_VERSION: u32 = 1;
 
-/// The only classification that exists today. A separate enum (rather than
-/// a bare bool) leaves room to add other connect-outcome signals later
-/// without a breaking schema change.
+/// Why `isekai-pipe connect` failed, for the wrapper's own logging — both
+/// variants trigger the exact same recovery action (`isekai-ssh`'s
+/// `ConnectFailureRecoveryAction::RebootstrapAndRetry`); the distinction is
+/// purely for a more accurate message to the user, not a different code
+/// path. `StaleTrust` is the narrower, high-confidence case (cert-pin
+/// mismatch or an explicit `Auth` reject — `TransportError::is_stale_trust_signal`);
+/// `Unreachable` is everything else `run_connect` can fail with (a plain
+/// QUIC-connect idle timeout because the cached endpoint is dead, a fencing
+/// rejection, a resume failure, ...).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "kebab-case")]
 pub enum ConnectOutcomeClass {
     StaleTrust,
+    Unreachable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +110,19 @@ mod tests {
             class: ConnectOutcomeClass::StaleTrust,
             detail: "cert pin mismatch".to_string(),
         }
+    }
+
+    #[test]
+    fn unreachable_class_round_trips_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outcome = sample_outcome();
+        outcome.intent_id = "def456".to_string();
+        outcome.class = ConnectOutcomeClass::Unreachable;
+        outcome.detail = "transport lost: idle timeout".to_string();
+        write_connect_outcome(dir.path(), &outcome).unwrap();
+
+        let claimed = claim_connect_outcome(dir.path(), &outcome.intent_id).unwrap();
+        assert_eq!(claimed, Some(outcome));
     }
 
     #[test]

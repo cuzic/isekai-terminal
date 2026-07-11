@@ -120,8 +120,9 @@ pub enum Command {
     /// (`isekai-pipe probe`) to check whether it's reachable and whether
     /// the cached trust material (session_secret/cert pin) looks stale.
     /// Never part of `isekai-ssh <host>`'s own connection path — that
-    /// already detects and silently recovers from staleness on its own
-    /// (`wrapper.rs::run_ssh_with_stale_trust_recovery`); this is purely
+    /// already detects and silently recovers from a stale/unreachable
+    /// cached deployment on its own
+    /// (`wrapper.rs::run_ssh_with_connect_failure_recovery`); this is purely
     /// for a human to inspect on demand. See `doctor.rs`'s module docs.
     Doctor(DoctorArgs),
 }
