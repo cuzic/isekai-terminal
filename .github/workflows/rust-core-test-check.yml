@@ -30,7 +30,6 @@ concurrency:
 
 permissions:
   contents: read
-  pull-requests: write  # DEBUG(一時的、.github/CI_DEBUGGING.md参照)
 
 jobs:
   test:
@@ -93,41 +92,14 @@ jobs:
         # wrapper_stale_trust_auto_recovery_e2e.rs(いずれもisekai-ssh/tests/)は、
         # `target/debug/isekai-pipe`が存在しない場合、テスト本体の実行時に同期的に
         # `cargo build -p isekai-pipe`を呼んでその場でビルドする(sibling_bin_path)。
-        # これはisekai-pipeの全依存クレート(rustls/noq/h3/aws-lc-rs/netdev等)を含む
-        # 重量級コンパイルで数十秒〜数分かかり、その間ワークスペース全体テストの
-        # 他の並行実行中のテスト(実sshd/ssh(1)サブプロセスを使うもの)からCPUを
-        # 奪ってタイミングを崩し、"jump host unreachable" / "Broken pipe"のような
-        # 断続的な失敗を引き起こしていた(tmateでCI実行環境へ対話的に入って特定、
-        # 4回連続で同一テスト・同一エラーが再現したうえ、ローカルでは
-        # isekai-pipeが既にビルド済みだったため一度も再現しなかったことと符合する)。
-        # ここで事前にビルドしておけば、テスト実行中の同期的コンパイルが発生しない。
+        # これ自体は正すべき無駄(テスト実行時間に数十秒〜数分の同期的コンパイルが
+        # 混ざる)なので事前ビルドしておく。当初はこれがreal_sshd_multihop_bootstrap_e2e.rs
+        # の断続的な"Broken pipe"失敗の原因と考えたが、tmateでCI実行環境へ対話的に入り
+        # 深掘りした結果、それだけでは説明が付かないことが判明した(未解決、詳細は
+        # PR #5の議論参照)。
         working-directory: rust-core
         run: cargo build -p isekai-pipe
 
-      # DEBUG(一時的、.github/CI_DEBUGGING.md参照): isekai-pipe事前ビルド後も
-      # real_sshd_multihop_bootstrap_e2e.rsが同一症状で失敗し続けたため、
-      # CPU競合説を撤回し再調査する。
-      - name: DEBUG tmate session (detached)
-        uses: mxschmitt/action-tmate@v3
-        with:
-          detached: true
-
-      - name: DEBUG relay tmate connection string via PR comment
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -x
-          CONN=""
-          for i in $(seq 1 15); do
-            CONN=$(/tmp/tmate/tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>&1 || true)
-            case "$CONN" in ssh\ *) break ;; esac
-            sleep 2
-          done
-          {
-            echo "DEBUG tmate connection:"
-            echo "\`$CONN\`"
-          } > /tmp/debug-tmate-body.md
-          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/debug-tmate-body.md
-
-      - name: DEBUG keep runner alive for interactive session
-        run: sleep 1200
+      - name: cargo test --workspace (excluding noq-multipath-spike)
+        working-directory: rust-core
+        run: cargo test --workspace --exclude noq-multipath-spike
