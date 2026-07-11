@@ -10,8 +10,8 @@ import IsekaiTerminalCoreLogic
 /// 管理しているのと同じ「既定オプトアウト」方針を`UserDefaults`で踏襲する
 /// (`.claude/rules/rust-ssot.md`の対象外——セッション/プロトコル状態ではなく単なるUI設定のため)。
 enum RemoteClipboardSettings {
-    static let allowRemoteClipboardWriteKey = "allow_remote_clipboard_write"
-    static let allowRemoteClipboardPullKey = "allow_remote_clipboard_pull"
+    static let allowRemoteClipboardWriteKey = AppSettingsKeys.allowRemoteClipboardWrite
+    static let allowRemoteClipboardPullKey = AppSettingsKeys.allowRemoteClipboardPull
 
     static func isWriteAllowed(defaults: UserDefaults = .standard) -> Bool {
         defaults.bool(forKey: allowRemoteClipboardWriteKey)
