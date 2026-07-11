@@ -101,6 +101,22 @@ impl OutputBuffer {
     }
 }
 
+/// [`SessionTable::insert_existing`]'s result — see that method's docs for
+/// why `InsertedAfterEvicting` carries the evicted `SessionId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    Inserted,
+    InsertedAfterEvicting(SessionId),
+    Rejected,
+}
+
+impl InsertOutcome {
+    #[allow(dead_code)]
+    pub fn inserted(&self) -> bool {
+        !matches!(self, InsertOutcome::Rejected)
+    }
+}
+
 /// resume 可能な 1 セッション分の状態。
 pub struct Session {
     pub output_buffer: OutputBuffer,
@@ -193,12 +209,21 @@ impl SessionTable {
     ///   `parked_tcp` が `None`）場合は、新規登録自体を拒否する。アクティブな
     ///   セッションは進行中の中継そのものなので、決して立ち退き対象にしない。
     ///
-    /// 戻り値は登録できたかどうか。`false` の場合、この `id` はテーブルに
-    /// 存在しないため、以後この session に対する `RESUME` は自然に
-    /// `REJECT_UNKNOWN_SESSION` になる（＝このセッションは resume 不可のまま
-    /// 通常の中継は続く、という安全側のデグレード）。
-    pub async fn insert_existing(&self, id: SessionId, handle: Arc<Mutex<Session>>) -> bool {
+    /// 戻り値は [`InsertOutcome`] — 立ち退きが発生した場合はどの `SessionId` を
+    /// 立ち退かせたかを運ぶ。`sweep_expired_parked`のdocsと同じ理由で、この
+    /// `SessionTable`単体では立ち退かせたsessionの`AttachArbiter`側fencing
+    /// slotには触れられない(この型はそちらを知らない)ため、呼び出し元が
+    /// `InsertOutcome::InsertedAfterEvicting`を見て`AttachRuntime::
+    /// established_lease_for` → `relay_ended`を呼び、slotを解放する責務を持つ。
+    /// これを怠ると、立ち退かせたsessionの`AttachArbiter`側の`Established`
+    /// slotだけが残り続け、以後そのターゲットへの新規ATTACHが誰も使っていない
+    /// セッションのせいで`BUSY_OTHER_SESSION`のまま永久に拒否される
+    /// (`isekai-pipe serve`プロセスを再起動するまで回復しない) —
+    /// `sweep_expired_parked`が実際に一度この不具合を起こしていたのと
+    /// 全く同じ形。
+    pub async fn insert_existing(&self, id: SessionId, handle: Arc<Mutex<Session>>) -> InsertOutcome {
         let mut inner = self.inner.lock().await;
+        let mut evicted_id = None;
         if inner.len() >= self.max_sessions && !inner.contains_key(&id) {
             let mut oldest_parked: Option<(SessionId, std::time::Instant)> = None;
             for (candidate_id, candidate_handle) in inner.iter() {
@@ -224,6 +249,7 @@ impl SessionTable {
                             hex_lower(&evict_id),
                             hex_lower(&id)
                         );
+                        evicted_id = Some(evict_id);
                     }
                 }
                 None => {
@@ -232,12 +258,15 @@ impl SessionTable {
                         self.max_sessions,
                         hex_lower(&id)
                     );
-                    return false;
+                    return InsertOutcome::Rejected;
                 }
             }
         }
         inner.insert(id, handle);
-        true
+        match evicted_id {
+            Some(evict_id) => InsertOutcome::InsertedAfterEvicting(evict_id),
+            None => InsertOutcome::Inserted,
+        }
     }
 
     pub async fn get(&self, id: &SessionId) -> Option<Arc<Mutex<Session>>> {
@@ -469,11 +498,16 @@ mod tests {
         // テーブルは既に上限(2)に達している。3つ目の登録は最も古い parked
         // セッション(older_id)を立ち退かせた上で成功するはず。
         let new_id = SessionTable::generate_session_id();
-        let inserted = table
+        let outcome = table
             .insert_existing(new_id, Arc::new(Mutex::new(Session::new(1024))))
             .await;
 
-        assert!(inserted, "立ち退き後に新規セッションは登録できるはず");
+        assert_eq!(
+            outcome,
+            InsertOutcome::InsertedAfterEvicting(older_id),
+            "立ち退き後に新規セッションは登録でき、立ち退かせたsession_idを呼び出し元へ返すはず \
+             (呼び出し元がそのAttachArbiter leaseを解放できるように)"
+        );
         assert!(
             !table.contains(&older_id).await,
             "最も古い parked セッションは立ち退くはず"
@@ -502,12 +536,13 @@ mod tests {
             .await;
 
         let new_id = SessionTable::generate_session_id();
-        let inserted = table
+        let outcome = table
             .insert_existing(new_id, Arc::new(Mutex::new(Session::new(1024))))
             .await;
 
-        assert!(
-            !inserted,
+        assert_eq!(
+            outcome,
+            InsertOutcome::Rejected,
             "立ち退けるparkedセッションが無ければ新規登録は拒否されるはず"
         );
         assert!(
@@ -540,11 +575,11 @@ mod tests {
             .await;
 
         let new_id = SessionTable::generate_session_id();
-        let inserted = table
+        let outcome = table
             .insert_existing(new_id, Arc::new(Mutex::new(Session::new(1024))))
             .await;
 
-        assert!(inserted);
+        assert_eq!(outcome, InsertOutcome::InsertedAfterEvicting(parked_id));
         assert!(
             table.contains(&active_id).await,
             "アクティブなセッションは残るはず"

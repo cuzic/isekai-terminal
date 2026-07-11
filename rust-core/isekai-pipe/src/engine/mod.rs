@@ -1087,7 +1087,17 @@ async fn handle_attach_stream(
     let (tcp_read, tcp_write) = tcp.into_split();
     let handle = Arc::new(Mutex::new(Session::new(resume_buffer_size)));
     let session_id_bytes = *hello.session_id.as_bytes();
-    sessions.insert_existing(session_id_bytes, handle.clone()).await;
+    if let resume::InsertOutcome::InsertedAfterEvicting(evicted_id) =
+        sessions.insert_existing(session_id_bytes, handle.clone()).await
+    {
+        // See `SessionTable::insert_existing`'s docs: evicting a parked
+        // session from the table doesn't by itself free its matching
+        // `AttachArbiter` fencing slot — do that here, exactly like the
+        // `sweep_expired_parked` fix (`resume.rs`'s docs on that method).
+        if let Some(lease) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(evicted_id)).await {
+            attach_runtime.relay_ended(lease).await;
+        }
+    }
     log::info!("attach established, session_id={}", hex_lower(&session_id_bytes));
 
     // control stream(APP_ACK用)は既知のsession_idを再利用するだけで、新規
