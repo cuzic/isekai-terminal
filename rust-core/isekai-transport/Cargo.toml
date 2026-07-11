@@ -43,15 +43,28 @@ log = "0.4"
 # BackoffPolicyのジッター計算（呼び出し元がRNGを渡す設計、purityを保つ）。
 rand = "0.8"
 # 物理インタフェース列挙・束縛(physical_interface.rs、QuicEndpointRebinder::
-# rebind_socketのCLI/PC側実装)。`discovery` featureでnetdev経由のインタフェース
-# 列挙(`quicsock::discovery`)も使う。
+# rebind_socketのCLI/PC側実装)本体は全プラットフォーム共通で必要。
+# `discovery` feature(netdev経由の`quicsock::discovery`インタフェース列挙)は
+# 下のtarget別セクションでiOS以外にのみ有効化する。
 # quicsock-noq(ソケットfan-out)は依存に含めない — それが要るのは同一QUIC接続で
 # 複数の物理インタフェースを同時保持する方式(noq issue #738で断念済み、
 # path_health.rs/multipath.rsのdoc参照)だけで、今回採用したrebind方式には不要。
-quicsock = { path = "../quicsock", features = ["discovery"] }
 # `noq::Connection::path_events()`のStream実装をpollするために使う
 # (multipath.rs、isekai-terminal-coreのmultipath_transport.rsと同じ用途)。
 tokio-stream = "0.1"
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+# `discovery` featureはnetdev(macOS/iOS向けにSystemConfiguration.framework等の
+# Apple frameworkにリンクする)を持ち込む。物理Wi-Fi/セルラー同時マルチパスは
+# iOS v1スコープ外(PLAN.md「Phase Y」節、ios-port-plan相当の設計判断)なので、
+# iOSビルドではnetdevそのものを持ち込まない
+# (未リンクのframeworkシンボル参照で`isekai-terminal-core`のiOS向けリンクが
+# 壊れるため。discoveryはこのcrate自身のtest・isekai-pipe/isekai-ssh(PC/Android
+# 側CLI)が使う)。
+quicsock = { path = "../quicsock", features = ["discovery"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+quicsock = { path = "../quicsock" }
 
 [features]
 qmux-relay = ["quicmux/qmux", "dep:qmux", "dep:web-transport-trait", "dep:tokio-rustls"]
