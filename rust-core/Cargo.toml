@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "h3-qmux", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "quicsock"]
+members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "h3-qmux", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "quicsock", "quicmux"]
 resolver = "2"
 
 # quicsock(/home/cuzic/quicsockからvendor。isekai-transportへのマルチパス移植の
@@ -78,6 +78,12 @@ isekai-bootstrap = { path = "isekai-bootstrap" }
 # これ経由に置き換える。isekai-transportはisekai-terminal-core/UniFFI/Android専用型に
 # 一切依存しないpure寄りのcrateなので、この一方向依存は循環しない。
 isekai-transport = { path = "isekai-transport" }
+# quicmux抽出(isekai-transportからnoq/qmux backend抽象を切り出したleaf crate)後、
+# android_quic_endpoint.rsが自前でtrait実装するのではなく`quicmux::AnyMuxFactory`/
+# `AnyMuxConnection`のNoqバリアントを直接組み立てる形に置き換えた。isekai-transportと
+# 同じ理由でこの一方向依存は循環しない(quicmuxはisekai-terminal-core/isekai-transport/
+# isekai-protocolのいずれにも依存しない)。
+quicmux = { path = "quicmux", features = ["noq"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"
