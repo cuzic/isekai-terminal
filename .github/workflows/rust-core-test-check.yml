@@ -57,16 +57,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openssh-server
 
-      - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust-core/target
-          key: rust-core-test-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
-          restore-keys: |
-            rust-core-test-${{ runner.os }}-
+      # DEBUG(一時的): キャッシュ経由の古いビルド成果物再利用を疑い、
+      # このデバッグ実行ではキャッシュを完全に無効化する(原因特定後に復元)。
+      # - name: Cache cargo (rust-core)
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: |
+      #       ~/.cargo/registry
+      #       ~/.cargo/git
+      #       rust-core/target
+      #     key: rust-core-test-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+      #     restore-keys: |
+      #       rust-core-test-${{ runner.os }}-
 
       # DEBUG(一時的): init_e2e.rsの%3A化バグ原因究明のため、musl事前ビルドと
       # ワークスペース全体テストを一時的にスキップし、該当テスト1件だけを
