@@ -47,11 +47,14 @@ mod race;
 mod types;
 
 pub use cert::{CertMismatchSlot, PinnedCertVerifier};
-pub use config::MuxClientConfig;
+pub use config::{MuxClientConfig, MuxServerConfig};
 pub use error::MuxError;
-pub use mux::{AnyByteStream, AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxConnection, AnyMuxEndpoint, AnyMuxFactory, AnyMuxRebinder};
+pub use mux::{
+    AnyByteStream, AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxConnection, AnyMuxEndpoint, AnyMuxFactory, AnyMuxIncoming,
+    AnyMuxListener, AnyMuxRebinder,
+};
 pub use race::{race_with_stagger, Winner};
 pub use types::{BindSpec, RemoteSpec};
 
 #[cfg(feature = "noq")]
-pub use noq_backend::noq_client_config;
+pub use noq_backend::{noq_client_config, noq_server_config};

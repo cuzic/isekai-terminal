@@ -4,12 +4,13 @@
 //! `system::SystemQuicEndpoint`/`system::SystemQuicConnection`/
 //! `system::SystemByteStream` before they moved here.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use noq::crypto::rustls::QuicClientConfig;
+use noq::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 
 use crate::cert::{CertMismatchSlot, PinnedCertVerifier};
-use crate::config::MuxClientConfig;
+use crate::config::{MuxClientConfig, MuxServerConfig};
 use crate::error::MuxError;
 use crate::types::{BindSpec, RemoteSpec};
 
@@ -75,6 +76,45 @@ pub fn noq_client_config(cert_sha256_hex: &str, config: &MuxClientConfig) -> Res
     let mut client_config = noq::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(transport));
     Ok((client_config, mismatch))
+}
+
+/// Builds a `noq::ServerConfig` from `config`'s certificate/ALPN/idle-timeout/
+/// keepalive/stream-limit/multipath tuning — the server-side counterpart to
+/// [`noq_client_config`]. `pub` for the same reason: a caller driving its own
+/// `noq::Endpoint` directly (`isekai-pipe serve`'s STUN/relay-socket setup,
+/// which must construct the endpoint itself to get at the raw socket first)
+/// can still get the identical TLS/transport setup instead of keeping its
+/// own near-identical copy.
+pub fn noq_server_config(config: &MuxServerConfig) -> Result<noq::ServerConfig, MuxError> {
+    let mut server_crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(config.cert_chain.clone(), config.private_key.clone_key())
+        .map_err(|e| MuxError::TlsConfig(e.to_string()))?;
+    server_crypto.alpn_protocols = vec![config.alpn.clone()];
+    // 0-RTT / early data is never used by this crate on either side — see
+    // `MuxClientConfig`'s docs. Explicit here (not just "absence of opt-in")
+    // because `rustls::ServerConfig` otherwise leaves this at its own
+    // default, and a future rustls version changing that default should not
+    // silently change this crate's behavior.
+    server_crypto.max_early_data_size = 0;
+
+    let quic_crypto =
+        QuicServerConfig::try_from(server_crypto).map_err(|e| MuxError::TlsConfig(format!("QUIC server crypto config failed: {e}")))?;
+
+    let mut transport = noq::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(noq::VarInt::from_u32(config.max_concurrent_bidi_streams));
+    transport.max_concurrent_uni_streams(noq::VarInt::from_u32(config.max_concurrent_uni_streams));
+    transport.max_idle_timeout(Some(
+        noq::IdleTimeout::try_from(config.max_idle_timeout).map_err(|e| MuxError::TlsConfig(e.to_string()))?,
+    ));
+    transport.keep_alive_interval(Some(config.keep_alive_interval));
+    if config.multipath {
+        transport.max_concurrent_multipath_paths(8);
+    }
+
+    let mut server_config = noq::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    server_config.transport_config(Arc::new(transport));
+    Ok(server_config)
 }
 
 /// Maps a `noq::ConnectionError` (whole-connection failure) onto this
@@ -232,6 +272,91 @@ impl NoqRebinder {
     }
 }
 
+/// A `noq`-backed [`crate::AnyMuxListener`] variant — a bound endpoint
+/// accepting inbound connections, built from either a fresh local bind
+/// ([`NoqListener::bind`]) or an already-bound socket
+/// ([`NoqListener::wrap_bound_socket`], for a caller that must perform its
+/// own raw I/O on a specific socket — a STUN query and hole-punch probes, or
+/// an inbound relay tunnel socket — before handing it to this crate, exactly
+/// like [`NoqFactory::wrap_bound_socket`]'s client-side equivalent).
+pub struct NoqListener {
+    endpoint: noq::Endpoint,
+}
+
+impl NoqListener {
+    pub(crate) async fn bind(config: MuxServerConfig, bind: BindSpec) -> Result<Self, MuxError> {
+        let server_config = noq_server_config(&config)?;
+        let endpoint = noq::Endpoint::server(server_config, bind.local_addr).map_err(|e| MuxError::EndpointSetup(e.to_string()))?;
+        Ok(Self { endpoint })
+    }
+
+    pub(crate) async fn wrap_bound_socket(config: MuxServerConfig, socket: tokio::net::UdpSocket) -> Result<Self, MuxError> {
+        let server_config = noq_server_config(&config)?;
+        let std_socket = socket.into_std().map_err(|e| MuxError::SocketSetup(e.to_string()))?;
+        let async_socket = default_socket_adapter()(std_socket).map_err(|e| MuxError::SocketSetup(e.to_string()))?;
+        let endpoint = noq::Endpoint::new_with_abstract_socket(
+            noq::EndpointConfig::default(),
+            Some(server_config),
+            async_socket,
+            Arc::new(noq::TokioRuntime),
+        )
+        .map_err(|e| MuxError::EndpointSetup(e.to_string()))?;
+        Ok(Self { endpoint })
+    }
+
+    /// Waits for the next inbound connection candidate. Returns `None` once
+    /// the endpoint has been closed and has no more incoming connections to
+    /// deliver — the same "listener is done" signal `noq::Endpoint::accept`
+    /// itself returns.
+    ///
+    /// Deliberately returns [`NoqIncoming`] (a *pending* handshake) rather
+    /// than awaiting completion itself: `isekai-pipe serve`'s `--once` relies
+    /// on this split (`engine/mod.rs`'s `handle_incoming`/`once` handling) to
+    /// synchronously await the *specific* handshake it just decided to
+    /// accept before closing the listener — closing right after this method
+    /// returns, instead of after the caller awaits the returned
+    /// [`NoqIncoming`], would race the listener's own close against the
+    /// still-pending handshake and could drop the very connection `--once`
+    /// meant to serve.
+    pub(crate) async fn accept(&self) -> Option<NoqIncoming> {
+        self.endpoint.accept().await.map(|incoming| NoqIncoming { incoming })
+    }
+
+    pub(crate) fn local_addr(&self) -> Result<SocketAddr, MuxError> {
+        self.endpoint.local_addr().map_err(|e| MuxError::EndpointSetup(e.to_string()))
+    }
+
+    /// Requests that the listener (and every connection it produced) be
+    /// closed. Best-effort — does not wait for peers to acknowledge; see
+    /// [`NoqListener::wait_idle`] for that.
+    pub(crate) fn close(&self) {
+        self.endpoint.close(noq::VarInt::from_u32(0), b"shutdown");
+    }
+
+    /// Waits until every connection this listener produced has finished
+    /// closing (after a prior [`NoqListener::close`]) — `isekai-pipe serve`
+    /// calls this right before process exit so it doesn't tear down the
+    /// process out from under a connection that's still draining its close
+    /// handshake.
+    pub(crate) async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
+    }
+}
+
+/// A connection candidate [`NoqListener::accept`] received, whose handshake
+/// has not necessarily completed yet — see that method's docs for why this
+/// split (instead of awaiting completion inside `accept` itself) matters.
+pub struct NoqIncoming {
+    incoming: noq::Incoming,
+}
+
+impl NoqIncoming {
+    pub(crate) async fn accept(self) -> Result<NoqConnection, MuxError> {
+        let conn = self.incoming.await.map_err(map_connection_error)?;
+        Ok(NoqConnection { conn })
+    }
+}
+
 pub struct NoqConnection {
     conn: noq::Connection,
 }
@@ -242,8 +367,30 @@ impl NoqConnection {
         Ok(NoqByteStream { send, recv })
     }
 
+    /// Accepts a new bidirectional stream the peer opened. Server-side
+    /// counterpart to [`NoqConnection::open_bi`] — but symmetric, not
+    /// direction-restricted: a client-side `NoqConnection` can call this too
+    /// (e.g. to accept a control stream the server opened back), exactly
+    /// like `noq::Connection::accept_bi` itself has no client/server
+    /// distinction once the handshake is done.
+    pub(crate) async fn accept_bi(&self) -> Result<NoqByteStream, MuxError> {
+        let (send, recv) = self.conn.accept_bi().await.map_err(map_connection_error)?;
+        Ok(NoqByteStream { send, recv })
+    }
+
     pub(crate) async fn close(&self) {
         self.conn.close(noq::VarInt::from_u32(0), b"");
+    }
+
+    /// Best-effort remote address, read from path 0 (`noq::PathId::ZERO`,
+    /// which always exists — see `isekai-pipe/src/engine/mod.rs`'s identical
+    /// comment on why path 0 specifically is the right choice once
+    /// multipath may be in play: with multipath enabled, later paths can
+    /// each have their own distinct remote address, so there is no single
+    /// "the" remote address to report in general, but path 0 is always
+    /// present and is the one a log line or diagnostic wants).
+    pub(crate) fn remote_addr(&self) -> Option<SocketAddr> {
+        self.conn.path(noq::PathId::ZERO).and_then(|p| p.remote_address().ok())
     }
 
     pub(crate) async fn export_keying_material(&self, label: &[u8], context: &[u8]) -> Result<[u8; 32], MuxError> {
@@ -399,5 +546,146 @@ mod tests {
             Err(other) => panic!("expected CertPinMismatch, got {other:?}"),
             Ok(_) => panic!("expected CertPinMismatch, connect unexpectedly succeeded"),
         }
+    }
+
+    /// A fresh self-signed cert/key pair plus a [`MuxServerConfig`] built
+    /// from it, and the cert's SHA-256 fingerprint for the client side to
+    /// pin against — everything [`NoqListener`]-based tests need.
+    fn test_server_config() -> (MuxServerConfig, String) {
+        let cert = rcgen::generate_simple_self_signed(vec!["quicmux-test.local".to_string()]).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().clone());
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let cert_sha256_hex = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(cert_der.as_ref());
+            hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+
+        let config = MuxServerConfig {
+            alpn: test_config().alpn,
+            exporter_label: test_config().exporter_label,
+            max_idle_timeout: std::time::Duration::from_secs(15),
+            keep_alive_interval: std::time::Duration::from_secs(5),
+            max_concurrent_bidi_streams: 2,
+            max_concurrent_uni_streams: 0,
+            multipath: false,
+            cert_chain: vec![cert_der],
+            private_key: key_der,
+        };
+        (config, cert_sha256_hex)
+    }
+
+    /// Runs one accept→echo round on `listener` and then returns — mirrors
+    /// `isekai-pipe serve`'s `handle_incoming`/`accept_bi` loop shape closely
+    /// enough to exercise the same API surface (`accept`/`NoqIncoming::accept`/
+    /// `accept_bi`) without pulling in any isekai-specific framing.
+    async fn spawn_echo_once(listener: NoqListener) {
+        tokio::spawn(async move {
+            let Some(incoming) = listener.accept().await else { return };
+            let Ok(conn) = incoming.accept().await else { return };
+            let Ok(mut stream) = conn.accept_bi().await else { return };
+            let mut buf = [0u8; 64];
+            if let Ok(n) = stream.read(&mut buf).await {
+                let _ = stream.write_all(&buf[..n]).await;
+            }
+            let _ = stream.shutdown().await;
+            // Deliberately keep `conn` (and the `listener` this closure
+            // captured) alive until the client itself closes the
+            // connection, instead of dropping them the instant the echo is
+            // written: dropping the sole `noq::Connection` handle right
+            // after a stream `finish()` — before the peer has actually
+            // observed the data, only requested it — tears the whole
+            // connection down mid-flight and races the client's `read()`
+            // (confirmed by reproducing `PeerClosed` here without this
+            // loop). `isekai-pipe serve`'s real `handle_connection` never
+            // hits this because it holds `conn` in an `accept_bi()` loop for
+            // the connection's entire lifetime, exactly like this.
+            let _ = conn.accept_bi().await;
+        });
+    }
+
+    #[tokio::test]
+    async fn listener_bind_accept_bi_write_and_read_roundtrip() {
+        let (server_config, cert_sha256_hex) = test_server_config();
+        let listener = NoqListener::bind(server_config, BindSpec::any_ipv4()).await.expect("listener bind failed");
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
+        spawn_echo_once(listener).await;
+
+        let factory = NoqFactory::new(test_config());
+        let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint failed");
+        let conn = endpoint
+            .connect(RemoteSpec { addr: server_addr, server_name: "quicmux-test.local".to_string(), cert_sha256_hex })
+            .await
+            .expect("connect failed");
+
+        let mut stream = conn.open_bi().await.expect("open_bi failed");
+        stream.write_all(b"hello quicmux noq listener").await.expect("write failed");
+        stream.shutdown().await.expect("shutdown failed");
+
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.expect("read failed");
+        assert_eq!(&buf[..n], b"hello quicmux noq listener");
+
+        conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn listener_wrap_bound_socket_roundtrip() {
+        // Mirrors `isekai-pipe serve`'s STUN/hole-punch path: bind a raw
+        // `std::net::UdpSocket` first (where a caller would run its own I/O
+        // on it — a STUN query, punch probes — before this crate ever sees
+        // it), then hand it to the listener instead of letting it bind fresh.
+        let std_socket = std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).unwrap();
+        std_socket.set_nonblocking(true).unwrap();
+        let raw_socket = tokio::net::UdpSocket::from_std(std_socket).unwrap();
+
+        let (server_config, cert_sha256_hex) = test_server_config();
+        let listener = NoqListener::wrap_bound_socket(server_config, raw_socket).await.expect("wrap_bound_socket failed");
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
+        spawn_echo_once(listener).await;
+
+        let factory = NoqFactory::new(test_config());
+        let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint failed");
+        let conn = endpoint
+            .connect(RemoteSpec { addr: server_addr, server_name: "quicmux-test.local".to_string(), cert_sha256_hex })
+            .await
+            .expect("connect failed");
+
+        let mut stream = conn.open_bi().await.expect("open_bi failed");
+        stream.write_all(b"hello via wrapped socket").await.expect("write failed");
+        stream.shutdown().await.expect("shutdown failed");
+
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.expect("read failed");
+        assert_eq!(&buf[..n], b"hello via wrapped socket");
+
+        conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn connection_remote_addr_matches_client_local_addr() {
+        let (server_config, cert_sha256_hex) = test_server_config();
+        let listener = NoqListener::bind(server_config, BindSpec::any_ipv4()).await.expect("listener bind failed");
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
+
+        let (server_remote_addr_tx, server_remote_addr_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Some(incoming) = listener.accept().await else { return };
+            let Ok(conn) = incoming.accept().await else { return };
+            let _ = server_remote_addr_tx.send(conn.remote_addr());
+        });
+
+        let factory = NoqFactory::new(test_config());
+        let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint failed");
+        let client_local_port = endpoint.endpoint.local_addr().unwrap().port();
+        let conn = endpoint
+            .connect(RemoteSpec { addr: server_addr, server_name: "quicmux-test.local".to_string(), cert_sha256_hex })
+            .await
+            .expect("connect failed");
+
+        let server_observed = server_remote_addr_rx.await.expect("server task didn't report remote_addr").expect("remote_addr was None");
+        assert_eq!(server_observed.port(), client_local_port);
+        conn.close().await;
     }
 }

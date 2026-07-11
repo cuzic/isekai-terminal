@@ -55,3 +55,45 @@ pub struct MuxClientConfig {
     /// connection).
     pub multipath: bool,
 }
+
+/// Server-side connection tuning, supplied by the caller at listener
+/// construction time and applied to every connection this listener accepts.
+///
+/// Mirrors [`MuxClientConfig`]'s shape deliberately (same field names/types
+/// for the tuning knobs both sides need) — a caller that dials itself with
+/// [`MuxClientConfig`] and listens with this type is expected to keep the
+/// two in sync (e.g. `alpn`/`max_concurrent_bidi_streams` must agree for the
+/// handshake/stream limits to make sense), but `quicmux` itself never
+/// enforces that; it is product policy, not a transport-abstraction concern.
+/// Not `Clone`: `rustls::pki_types::PrivateKeyDer` deliberately isn't
+/// (it holds key material and avoids casual copies) — it exposes
+/// `clone_key()` for the rare caller that actually needs a duplicate, which
+/// [`crate::noq_backend::noq_server_config`] uses internally since it only
+/// borrows this config, not owns it.
+pub struct MuxServerConfig {
+    /// See [`MuxClientConfig::alpn`] — must match what a client dialing this
+    /// listener presents, or the handshake fails.
+    pub alpn: Vec<u8>,
+    /// See [`MuxClientConfig::exporter_label`].
+    pub exporter_label: Vec<u8>,
+    /// See [`MuxClientConfig::max_idle_timeout`].
+    pub max_idle_timeout: std::time::Duration,
+    /// See [`MuxClientConfig::keep_alive_interval`].
+    pub keep_alive_interval: std::time::Duration,
+    /// See [`MuxClientConfig::max_concurrent_bidi_streams`].
+    pub max_concurrent_bidi_streams: u32,
+    /// See [`MuxClientConfig::max_concurrent_uni_streams`].
+    pub max_concurrent_uni_streams: u32,
+    /// See [`MuxClientConfig::multipath`].
+    pub multipath: bool,
+    /// The server's certificate chain (leaf first), presented during the TLS
+    /// handshake. Every backend this crate supports authenticates the
+    /// *client* by pinned SHA-256 fingerprint rather than a CA chain (see
+    /// [`crate::PinnedCertVerifier`]), so this is typically a single
+    /// ephemeral self-signed certificate generated fresh per process — not a
+    /// CA-issued chain — but `quicmux` itself has no opinion on that; it is
+    /// the caller's policy.
+    pub cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    /// The private key matching `cert_chain`'s leaf certificate.
+    pub private_key: rustls::pki_types::PrivateKeyDer<'static>,
+}
