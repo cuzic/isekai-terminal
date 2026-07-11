@@ -25,11 +25,71 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+// This `long_about`/`after_long_help` pair only appears on `isekai-ssh --help`
+// (clap shows `about` for `-h`, `long_about` for `--help`), and only for a
+// *bare* `isekai-ssh --help`/`-h` invocation — `should_run_wrapper()` in
+// `wrapper.rs` routes every other invocation (including `isekai-ssh <host>
+// --help`, where `--help` is just another `ssh(1)` arg to pass through)
+// straight to wrapper mode without ever reaching this `clap::Parser`. Kept
+// deliberately comprehensive because this is the *only* place a user who
+// types `isekai-ssh --help` ever sees documentation for the day-to-day
+// wrapper mode: `clap`'s own subcommand listing below only covers
+// `init`/`login`/`logout`/`doctor`, none of which is how `isekai-ssh` is
+// actually used day to day (see `README.md`'s Quick Start).
+const LONG_ABOUT: &str = "\
+ssh(1) ProxyCommand wrapper reusing isekai-helper's QUIC connection resilience \
+(roaming, resume-from-full-disconnect, relay-based NAT traversal) — usable from \
+any local ssh(1), not just the isekai-terminal Android app.
+
+DAY-TO-DAY USE (no subcommand — this is the default, not one of the Commands below):
+    isekai-ssh <host> [ssh args...]
+        Connects like `ssh <host> ...`, but through the deployed isekai-pipe QUIC
+        transport instead of a plain TCP connection. An unregistered <host> is
+        auto-bootstrapped on first use when ~/.ssh/config has a matching
+        `#@isekai bootstrap-relay` directive (relay-based) or the host is directly
+        UDP/QUIC-reachable (`direct-by-bootstrap-host`, no relay/JWT needed).
+        See README.md's Quick Start for both paths end to end.
+
+WRAPPER-MODE FLAGS (day-to-day use only, not accepted by any subcommand below):
+    --isekai-bootstrap                          force auto-bootstrap regardless of
+                                                 the resolved bootstrap-policy
+    --isekai-no-bootstrap                       never auto-bootstrap this connection
+    --isekai-direct                             skip isekai-pipe entirely, exec plain
+                                                 ssh(1) as if isekai-ssh weren't there
+    --isekai-explain                            print the resolved ~/.ssh/config +
+                                                 #@isekai settings to stderr, then
+                                                 still connect
+    --isekai-dry-run                            like --isekai-explain, but exit
+                                                 without connecting
+    --isekai-ssh-path <PATH>                    ssh(1) binary to exec (default: `ssh`
+                                                 resolved via PATH)
+    --isekai-pipe-path <PATH>                   isekai-pipe binary to invoke as the
+                                                 injected ProxyCommand
+    --isekai-helper-binary <PATH>               isekai-pipe binary to auto-bootstrap
+                                                 onto an unregistered remote host
+    --isekai-helper-release-repo <OWNER/REPO>   GitHub repo auto-bootstrap downloads
+                                                 a helper binary from when
+                                                 --isekai-helper-binary is omitted
+                                                 (default: cuzic/isekai-terminal)
+    --isekai-helper-release-tag <TAG>           pin a specific release tag for the
+                                                 above (default: latest)
+
+Every ~/.ssh/config `#@isekai <directive> ...` line (profile/service/stun/relay/
+remote-log-level/bind-port-range/etc.) is documented in README.md's directive
+table, not repeated here since the full list is long and host-config-scoped
+rather than a CLI flag.
+
+SUBCOMMANDS below (init/login/logout/doctor) are the interactive, manual
+alternative to the auto-bootstrap path above — useful for one-off deploys via a
+jump host, relay JWT management, or diagnosing a specific host's trust state.
+Full design background: ISEKAI_PIPE_DESIGN.md.";
+
 #[derive(Parser)]
 #[command(
     name = "isekai-ssh",
     version,
-    about = "ssh(1) ProxyCommand wrapper reusing isekai-helper's QUIC connection resilience"
+    about = "ssh(1) ProxyCommand wrapper reusing isekai-helper's QUIC connection resilience",
+    long_about = LONG_ABOUT
 )]
 pub struct Cli {
     #[command(subcommand)]
