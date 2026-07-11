@@ -2,9 +2,10 @@
 //! actually accumulates *both* sources `log_file.rs`'s docs promise —
 //! `isekai-ssh`'s own status messages (`wrapper.rs`'s `log_line!` calls) and
 //! `ssh(1)`'s (here, standing in for its `isekai-pipe connect` `ProxyCommand`
-//! grandchild's `env_logger` output too) inherited-then-piped stderr — while
-//! the terminal (this test's own piped stdout/stderr, standing in for a real
-//! terminal) still gets everything unchanged.
+//! grandchild's `env_logger` output too) piped stderr — and that neither
+//! reaches the terminal (this test's own captured stderr, standing in for a
+//! real terminal) at all while `--isekai-log-file` is active: this is a
+//! redirect, not a tee.
 //!
 //! Reuses the "already-trusted destination whose cached `session_secret`
 //! doesn't match the real, currently-running `isekai-pipe serve`" shape
@@ -136,7 +137,7 @@ fn register_stale_profile(profiles_dir: &std::path::Path, key: &str, helper_addr
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn isekai_log_file_captures_both_the_wrappers_own_messages_and_the_ssh_childs_stderr() {
+async fn isekai_log_file_redirects_both_the_wrappers_own_messages_and_the_ssh_childs_stderr_away_from_the_terminal() {
     if !ssh_binary_available() {
         eprintln!("skipping: ssh(1) not available in this environment");
         return;
@@ -188,8 +189,9 @@ async fn isekai_log_file_captures_both_the_wrappers_own_messages_and_the_ssh_chi
 
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
-        stderr.contains("auto-bootstrap is disabled"),
-        "the terminal (this test's own captured stderr) must still see every message unchanged:\n{stderr}"
+        stderr.trim().is_empty(),
+        "the terminal (this test's own captured stderr) must see nothing at all while --isekai-log-file is \
+         active -- this is a redirect, not a tee -- got:\n{stderr}"
     );
 
     let log_contents = std::fs::read_to_string(&log_path)
@@ -204,11 +206,12 @@ async fn isekai_log_file_captures_both_the_wrappers_own_messages_and_the_ssh_chi
     // disabled" wrapper message's embedded error-chain text (which itself
     // contains the string "isekai-pipe connect" as a `.context()` prefix,
     // copied from the `ConnectOutcome` side-channel file -- *not* proof the
-    // child's live stderr was actually relayed). Only a genuinely-tee'd
-    // child stderr can produce this raw, timestamped `env_logger` line.
+    // child's live stderr was actually redirected). Only a genuinely
+    // redirected child stderr can produce this raw, timestamped `env_logger`
+    // line.
     assert!(
         log_contents.contains("quicmux::noq_backend"),
         "expected the real ssh(1) child's live stderr (carrying isekai-pipe connect's own env_logger output, not \
-         just the wrapper's own error-summary text) to have been relayed into the log file too, got:\n{log_contents}"
+         just the wrapper's own error-summary text) to have been redirected into the log file too, got:\n{log_contents}"
     );
 }

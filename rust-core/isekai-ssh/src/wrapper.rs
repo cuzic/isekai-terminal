@@ -454,10 +454,10 @@ async fn run_ssh_once(
     // stdin/stdout always stay `Stdio::inherit()`ed — piping either would
     // break `ssh(1)`'s own `isatty()`-based PTY/interactive-terminal
     // behavior (`log_file.rs`'s module docs). stderr is the one stream this
-    // feature can safely relay through itself: it carries only diagnostic
-    // output (this process's own, and `isekai-pipe connect`'s `env_logger`
-    // lines, both `log_file.rs`'s actual targets), never the interactive
-    // session's own content.
+    // feature can safely redirect: it carries only diagnostic output (this
+    // process's own, and `isekai-pipe connect`'s `env_logger` lines, both
+    // `log_file.rs`'s actual targets), never the interactive session's own
+    // content.
     command.stdin(Stdio::inherit()).stdout(Stdio::inherit());
     if crate::log_file::is_enabled() {
         command.stderr(Stdio::piped());
@@ -471,7 +471,7 @@ async fn run_ssh_once(
             plan.openssh_path.display()
         )
     })?;
-    let stderr_tee = child.stderr.take().map(|stderr| tokio::spawn(crate::log_file::tee_child_stderr(stderr)));
+    let stderr_redirect = child.stderr.take().map(|stderr| tokio::spawn(crate::log_file::redirect_child_stderr(stderr)));
 
     let status = child.wait().await.map_err(|e| {
         anyhow!(
@@ -479,11 +479,11 @@ async fn run_ssh_once(
             plan.openssh_path.display()
         )
     })?;
-    // ssh(1) exiting closes its stderr, which ends `tee_child_stderr`'s read
-    // loop on its own — this just makes sure that last batch of bytes has
-    // actually landed before returning (so a caller inspecting the log file
-    // right after doesn't race it).
-    if let Some(handle) = stderr_tee {
+    // ssh(1) exiting closes its stderr, which ends `redirect_child_stderr`'s
+    // read loop on its own — this just makes sure that last batch of bytes
+    // has actually landed before returning (so a caller inspecting the log
+    // file right after doesn't race it).
+    if let Some(handle) = stderr_redirect {
         let _ = handle.await;
     }
     Ok((status, intent.intent_id.clone()))

@@ -1,10 +1,11 @@
-//! `--isekai-log-file <PATH>`: opt-in, tees every byte of diagnostic output
-//! for this invocation into a plain file, in addition to (not instead of)
-//! the terminal — so a live debugging session survives past the terminal's
-//! own scrollback and isn't tangled up with the interactive SSH session's
-//! own stdout when read back later.
+//! `--isekai-log-file <PATH>`: opt-in, redirects every byte of diagnostic
+//! output for this invocation into a plain file *instead of* the terminal —
+//! so a live debugging session survives past the terminal's own scrollback
+//! and isn't tangled up with the interactive SSH session's own stdout, and
+//! the terminal itself shows only that interactive session, nothing else.
 //!
-//! Two distinct sources feed the same file:
+//! Two distinct sources feed the same file, neither reaching the terminal
+//! while this is active:
 //! - `isekai-ssh`'s own status messages (`wrapper.rs`'s `eprintln!` calls,
 //!   converted to [`log_line!`]) — bootstrap/re-deploy progress, stale-trust
 //!   notices, etc.
@@ -12,9 +13,10 @@
 //!   grandchild (`isekai-pipe connect`, `env_logger`-based) ends up writing
 //!   — captured by `wrapper.rs::run_ssh_once` piping (rather than
 //!   inheriting) just the child's stderr and relaying it through
-//!   [`tee_child_stderr`], deliberately leaving stdin/stdout `Stdio::inherit()`ed
-//!   untouched (piping *those* would break `ssh`'s own `isatty()`-based PTY/
-//!   interactive-terminal behavior — this module never touches them).
+//!   [`redirect_child_stderr`], deliberately leaving stdin/stdout
+//!   `Stdio::inherit()`ed untouched (piping *those* would break `ssh`'s own
+//!   `isatty()`-based PTY/interactive-terminal behavior — this module never
+//!   touches them).
 //!
 //! Global, process-wide, set at most once (`init`, from `run()` before
 //! anything else can log) — simpler than threading a handle through every
@@ -72,44 +74,43 @@ pub fn append_line(line: &str) {
     append_bytes(buf.as_bytes());
 }
 
-/// Drop-in replacement for `eprintln!` used throughout `wrapper.rs`: prints
-/// to stderr exactly as `eprintln!` would, and — only when
-/// `--isekai-log-file` is active — additionally appends the same line to
-/// the log file. A no-op-beyond-`eprintln!` cost when no log file is
-/// configured (`append_line` returns immediately via `is_enabled()`).
+/// Drop-in replacement for `eprintln!` used throughout `wrapper.rs`: when no
+/// log file is configured, behaves exactly like `eprintln!` (prints to
+/// stderr, nothing else). When `--isekai-log-file` *is* active, the line
+/// goes to the log file **instead of** stderr — nothing from this macro
+/// reaches the terminal while a log file is configured.
 macro_rules! log_line {
     () => {{
-        eprintln!();
-        $crate::log_file::append_line("");
+        if $crate::log_file::is_enabled() {
+            $crate::log_file::append_line("");
+        } else {
+            eprintln!();
+        }
     }};
     ($($arg:tt)*) => {{
-        // `eprintln!` first so the user sees output at the same latency as
-        // before this feature existed, even if formatting again for the
-        // file somehow panics.
-        eprintln!($($arg)*);
         if $crate::log_file::is_enabled() {
             $crate::log_file::append_line(&format!($($arg)*));
+        } else {
+            eprintln!($($arg)*);
         }
     }};
 }
 pub(crate) use log_line;
 
-/// Relays `child_stderr` to both this process's own stderr (so the user
-/// still sees it live, unchanged from before this feature existed) and the
-/// log file, until the child closes its stderr (normally, on exit).
+/// Relays `child_stderr` into the log file **instead of** this process's
+/// own stderr, until the child closes its stderr (normally, on exit) — the
+/// terminal shows none of it while `--isekai-log-file` is active.
 /// Deliberately only ever applied to `ssh(1)`'s *stderr* — see this
-/// module's docs for why stdin/stdout must stay untouched.
-pub async fn tee_child_stderr(mut child_stderr: tokio::process::ChildStderr) {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+/// module's docs for why stdin/stdout must stay untouched (and therefore
+/// still show the interactive SSH session on the terminal as normal).
+pub async fn redirect_child_stderr(mut child_stderr: tokio::process::ChildStderr) {
+    use tokio::io::AsyncReadExt as _;
     let mut buf = [0u8; 8192];
-    let mut stderr = tokio::io::stderr();
     loop {
         let n = match child_stderr.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        let _ = stderr.write_all(&buf[..n]).await;
-        let _ = stderr.flush().await;
         append_bytes(&buf[..n]);
     }
 }
