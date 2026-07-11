@@ -142,6 +142,20 @@ struct BootstrapCandidate {
     target: String,
     via: Vec<String>,
     priority: u32,
+    /// The original, un-resolved `ssh(1)` destination token (e.g. `vpsmart`,
+    /// not the `ssh -G`-resolved `HostName` in `target`) for the *default*
+    /// candidate only — `None` for candidates from an explicit `#@isekai
+    /// bootstrap-candidate target=...` directive, which are literal
+    /// addresses with no alias to speak of. `bootstrap_and_register` uses
+    /// this, when present, as the destination it actually hands to the
+    /// `ssh(1)` subprocess that deploys `isekai-pipe`, so that `Host
+    /// <alias>` blocks in the user's own `~/.ssh/config` (`IdentityFile`,
+    /// `ProxyCommand`, etc.) still match — matching them against the
+    /// resolved `HostName` instead (as this used to do) silently drops
+    /// every such directive, since `ssh_config(5)` `Host` patterns match
+    /// against the literal destination argument, not the resolved
+    /// `HostName`.
+    alias: Option<String>,
 }
 
 /// `#@isekai bootstrap-relay addr=<SocketAddr> sni=<name>` (`ISEKAI_PIPE_DESIGN.md`
@@ -580,7 +594,22 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
     let port: u16 = port
         .parse()
         .with_context(|| format!("bootstrap candidate target {:?} has an invalid port", candidate.target))?;
-    let target = HostSpec::new(host).with_port(port);
+    // Prefer the original alias (`candidate.alias`) over the `ssh -G`-resolved
+    // `host` as the destination handed to the `ssh(1)` subprocess: passing
+    // the resolved `HostName` instead would no longer match the user's own
+    // `Host <alias>` block in `~/.ssh/config`, silently dropping
+    // `IdentityFile`/`ProxyCommand`/etc. (see `BootstrapCandidate::alias`'s
+    // docs). `user` is threaded through the same way, since it's otherwise
+    // resolved via `ssh -G` and then never consulted again.
+    let target = match &candidate.alias {
+        Some(alias) => HostSpec::new(alias.clone()),
+        None => HostSpec::new(host),
+    }
+    .with_port(port);
+    let target = match &resolution.openssh.user {
+        Some(user) => target.with_user(user.clone()),
+        None => target,
+    };
 
     let via: Vec<JumpSpec> = candidate
         .via
@@ -982,6 +1011,7 @@ fn resolve_isekai_config(
                 .map(parse_jump_chain)
                 .unwrap_or_default(),
             priority: 100,
+            alias: Some(plan.destination.clone()),
         });
     }
     if builder.services.is_empty() {
@@ -1233,6 +1263,7 @@ fn parse_bootstrap_candidate(args: &[String]) -> Result<BootstrapCandidate> {
             .ok_or_else(|| anyhow!("isekai-ssh: bootstrap-candidate requires target=..."))?,
         via,
         priority,
+        alias: None,
     })
 }
 
@@ -1619,7 +1650,7 @@ mod tests {
                 // a real subprocess spawn (`plan.isekai.helper_binary` is
                 // `None`, so `resolve_helper_binary` no longer short-circuits
                 // before *some* I/O — see `helper_download::resolve_helper_binary`).
-                bootstrap_candidates: vec![BootstrapCandidate { target: "127.0.0.1:1".to_string(), via: Vec::new(), priority: 0 }],
+                bootstrap_candidates: vec![BootstrapCandidate { target: "127.0.0.1:1".to_string(), via: Vec::new(), priority: 0, alias: None }],
                 link_endpoints: Vec::new(),
                 rendezvous: Vec::new(),
                 stun_servers: Vec::new(),
@@ -1671,7 +1702,7 @@ mod tests {
                 profile: "production".to_string(),
                 remote_path: None,
                 services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
-                bootstrap_candidates: vec![BootstrapCandidate { target: "production:22".to_string(), via, priority: 0 }],
+                bootstrap_candidates: vec![BootstrapCandidate { target: "production:22".to_string(), via, priority: 0, alias: None }],
                 link_endpoints: Vec::new(),
                 rendezvous: Vec::new(),
                 stun_servers: Vec::new(),
@@ -2150,6 +2181,7 @@ Host *
                 target: "10.20.0.15:22".to_string(),
                 via: s(&["bastion", "edge"]),
                 priority: 120,
+                alias: None,
             }]
         );
         assert_eq!(resolved.link_endpoints, vec!["https://link.example.com"]);
@@ -2266,6 +2298,7 @@ Host *
                 target: "10.20.0.15:2200".to_string(),
                 via: s(&["bastion"]),
                 priority: 100,
+                alias: Some("production".to_string()),
             }]
         );
         assert_eq!(resolved.link_endpoints, Vec::<String>::new());

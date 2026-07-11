@@ -256,6 +256,64 @@ fn shim_ssh_with_bootstrap_config(
     (bin_dir, path_env)
 }
 
+/// Regression test fixture for the alias-vs-resolved-`HostName` bug
+/// (`wrapper.rs::BootstrapCandidate::alias`'s docs): unlike
+/// `shim_ssh_with_bootstrap_config`, this deliberately has **no** second
+/// `Host 127.0.0.1` block. Before the fix, `bootstrap_and_register` dialed
+/// the `ssh -G`-resolved `HostName` (`127.0.0.1`) directly, which would
+/// never match `Host {alias}` here — so `IdentityFile`/`User`/
+/// `StrictHostKeyChecking` would all be silently dropped for that deploy
+/// `ssh(1)` call, exactly the failure mode the real user hit with a custom
+/// `IdentityFile` under their `Host <alias>` block. If `bootstrap_and_register`
+/// regresses to dialing the resolved address again, this config gives it
+/// nothing to authenticate with and the test times out/fails instead of
+/// registering.
+fn shim_ssh_with_alias_only_bootstrap_config(
+    tmp: &std::path::Path,
+    alias: &str,
+    mock_sshd_addr: SocketAddr,
+    key_path: &std::path::Path,
+) -> (PathBuf, std::ffi::OsString) {
+    let config_path = tmp.join("ssh_config_bootstrap_alias_only");
+    let config = format!(
+        "Host {alias}\n\
+         \x20\x20\x20\x20HostName 127.0.0.1\n\
+         \x20\x20\x20\x20Port {port}\n\
+         \x20\x20\x20\x20User tester\n\
+         \x20\x20\x20\x20IdentityFile {key}\n\
+         \x20\x20\x20\x20IdentitiesOnly yes\n\
+         \x20\x20\x20\x20StrictHostKeyChecking no\n\
+         \x20\x20\x20\x20UserKnownHostsFile /dev/null\n",
+        port = mock_sshd_addr.port(),
+        key = key_path.display(),
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let bin_dir = tmp.join("bin-alias-only");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let shim_path = bin_dir.join("ssh");
+    let shim = format!(
+        "#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n",
+        real_ssh = real_ssh_path().display(),
+        config = config_path.display(),
+    );
+    std::fs::write(&shim_path, shim).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let path_env = {
+        let mut paths = vec![bin_dir.clone()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        std::env::join_paths(paths).unwrap()
+    };
+    (bin_dir, path_env)
+}
+
 fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
     home.join(".local").join("state").join("isekai").join("profiles")
 }
@@ -360,6 +418,85 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
     let handshake = decode_handshake_json(VALID_HANDSHAKE_JSON.as_bytes()).unwrap();
     assert_eq!(profile.server_identity.cert_sha256_hex, handshake.cert_sha256());
     assert_eq!(profile.update_policy, isekai_trust::UpdatePolicy::ExactDigestOnly);
+}
+
+/// Regression test for the bug reported in production use: a `~/.ssh/config`
+/// with a custom `IdentityFile` under `Host <alias>` only (no `Host *`
+/// fallback, no separate block for the resolved `HostName`) must still let
+/// auto-bootstrap authenticate, because `bootstrap_and_register` now dials
+/// the alias itself rather than the `ssh -G`-resolved `HostName`
+/// (`wrapper.rs::BootstrapCandidate::alias`'s docs). Uses
+/// `shim_ssh_with_alias_only_bootstrap_config` (no `Host 127.0.0.1` block)
+/// instead of `shim_ssh_with_bootstrap_config`.
+#[tokio::test(flavor = "multi_thread")]
+async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1)/ssh-keygen(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let remote_home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&remote_home).unwrap();
+
+    let mock_sshd_addr = spawn_fake_ssh_server(remote_home, client_pubkey).await;
+
+    let home = tmp.path().join("client-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let (_bin_dir, path_env) =
+        shim_ssh_with_alias_only_bootstrap_config(tmp.path(), "alias-only-host", mock_sshd_addr, &key_path);
+
+    let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
+    std::fs::write(&helper_script_path, format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper_script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let profile_path = profile_path_under(&home, "alias-only-host:22");
+    assert!(!profile_path.exists(), "profile must not exist before this test runs");
+
+    let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .arg("--isekai-helper-binary")
+        .arg(&helper_script_path)
+        .arg("alias-only-host")
+        .env("HOME", &home)
+        .env("PATH", &path_env)
+        .env_remove("RUST_LOG")
+        .stdin(StdStdio::piped())
+        .stdout(StdStdio::piped())
+        .stderr(StdStdio::piped())
+        .spawn()
+        .expect("failed to spawn isekai-ssh");
+
+    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut saw_registered = false;
+    for _ in 0..200 {
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(_)) => {
+                eprint!("[isekai-ssh stderr] {line}");
+                if line.contains("Registered") {
+                    saw_registered = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+
+    assert!(
+        saw_registered,
+        "expected wrapper stderr to report trust-store registration (alias-only IdentityFile must still be honored)"
+    );
+    assert!(profile_path.exists(), "expected profile to be written at {profile_path:?}");
 }
 
 /// `#@isekai remote-path` (`isekai-ssh/src/wrapper.rs::resolve_isekai_config`)
