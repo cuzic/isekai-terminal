@@ -106,26 +106,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -x
-          ps aux | grep -i tmate || true
           SOCK=""
           for i in $(seq 1 15); do
             SOCK=$(find /tmp /home/runner -iname "*tmate*.sock" -o -iname "*tmate*" -type s 2>/dev/null | head -1)
             [ -n "$SOCK" ] && break
             sleep 2
           done
-          echo "found socket: $SOCK"
           CONN_DEFAULT=$(tmate display -p '#{tmate_ssh}' 2>&1 || true)
           CONN_SOCK=""
           if [ -n "$SOCK" ]; then
             CONN_SOCK=$(tmate -S "$SOCK" display -p '#{tmate_ssh}' 2>&1 || true)
           fi
-          BODY="DEBUG tmate socket=\`$SOCK\`
-default-display: \`$CONN_DEFAULT\`
-socket-display: \`$CONN_SOCK\`
-ps: \`\`\`
-$(ps aux | grep -i tmate | grep -v grep)
-\`\`\`"
-          gh pr comment ${{ github.event.pull_request.number }} --body "$BODY"
+          {
+            echo "DEBUG tmate socket=\`$SOCK\`"
+            echo "default-display: \`$CONN_DEFAULT\`"
+            echo "socket-display: \`$CONN_SOCK\`"
+            echo 'ps:'
+            echo '```'
+            ps aux | grep -i tmate | grep -v grep
+            echo '```'
+          } > /tmp/debug-tmate-body.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/debug-tmate-body.md
 
       - name: DEBUG keep runner alive for interactive session
         run: sleep 1200
