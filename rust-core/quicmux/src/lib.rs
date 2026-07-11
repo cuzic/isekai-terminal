@@ -56,8 +56,9 @@ pub use mux::{
 };
 pub use race::{race_with_stagger, Winner};
 pub use resume::{
-    accept_resume, request_resume, ReplayBuffer, ResumeAcceptor, ResumeAckOutcome, ResumeDecision, ResumeRejectReason, ResumeRequest,
-    ResumeRequestError,
+    accept_resume, decode_resume_request, request_resume, respond_resume_accepted, respond_resume_rejected, ReplayBuffer, ResumeAcceptor,
+    ResumeAckOutcome, ResumeDecision, ResumeRejectReason, ResumeRequest, ResumeRequestError, FRAME_RESUME, FRAME_RESUME_ACK,
+    FRAME_RESUME_REJECT,
 };
 pub use types::{BindSpec, RemoteSpec};
 

@@ -50,9 +50,9 @@ use crate::mux::{AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxConnection
 /// migrates from its own hand-rolled resume protocol to this one on a
 /// connection that also carries other framing. Version byte first, in case
 /// this wire format ever needs a breaking change.
-const FRAME_RESUME: u8 = 0x01;
-const FRAME_RESUME_ACK: u8 = 0x02;
-const FRAME_RESUME_REJECT: u8 = 0x03;
+pub const FRAME_RESUME: u8 = 0x01;
+pub const FRAME_RESUME_ACK: u8 = 0x02;
+pub const FRAME_RESUME_REJECT: u8 = 0x03;
 
 /// Why [`ResumeAcceptor::try_resume`] declined to resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,7 +204,17 @@ async fn read_exact(recv: &mut AnyByteStreamReadHalf, buf: &mut [u8]) -> Result<
     Ok(())
 }
 
-async fn decode_resume_request(recv: &mut AnyByteStreamReadHalf, conn_exporter: [u8; 32]) -> Result<ResumeRequest, MuxError> {
+/// Decodes a [`ResumeRequest`]'s body from `recv` — **not including** the
+/// leading [`FRAME_RESUME`] type byte itself. `pub` (unlike this module's
+/// other frame-internals) for a caller whose own connection-dispatch
+/// already reads the first frame-type byte itself before it knows which
+/// kind of frame this is — e.g. `isekai-pipe serve`'s `handle_connection`,
+/// which reads one byte to choose between its own `ATTACH_HELLO`/
+/// `CancelAttach` frames and this module's `FRAME_RESUME`, so by the time it
+/// knows to call this function the type byte is already consumed. A caller
+/// that owns the whole exchange from scratch should use [`accept_resume`]
+/// instead of calling this directly.
+pub async fn decode_resume_request(recv: &mut AnyByteStreamReadHalf, conn_exporter: [u8; 32]) -> Result<ResumeRequest, MuxError> {
     let mut token_len = [0u8; 2];
     read_exact(recv, &mut token_len).await?;
     let mut token = vec![0u8; u16::from_be_bytes(token_len) as usize];
@@ -335,23 +345,43 @@ pub async fn accept_resume(conn: &AnyMuxConnection, acceptor: &dyn ResumeAccepto
 
     match acceptor.try_resume(request).await {
         ResumeDecision::Accepted { committed_offset, sent_offset, replay } => {
-            let mut ack = Vec::with_capacity(1 + 8 + 8 + 4 + replay.len());
-            ack.push(FRAME_RESUME_ACK);
-            ack.extend_from_slice(&committed_offset.to_be_bytes());
-            ack.extend_from_slice(&sent_offset.to_be_bytes());
-            ack.extend_from_slice(&(replay.len() as u32).to_be_bytes());
-            ack.extend_from_slice(&replay);
-            send.write_all(&ack).await.map_err(ResumeRequestError::Mux)?;
+            respond_resume_accepted(&mut send, committed_offset, sent_offset, &replay).await.map_err(ResumeRequestError::Mux)?;
             Ok((send, recv))
         }
         ResumeDecision::Rejected(reason) => {
-            let frame = [FRAME_RESUME_REJECT, reason.to_wire()];
-            if send.write_all(&frame).await.is_ok() {
-                let _ = send.shutdown().await;
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send.wait_for_close()).await;
-            }
+            respond_resume_rejected(&mut send, reason).await;
             Err(ResumeRequestError::Rejected(reason))
         }
+    }
+}
+
+/// Writes a [`FRAME_RESUME_ACK`] response. `pub` for the same reason as
+/// [`decode_resume_request`] — a caller integrating this into its own
+/// existing frame dispatch (rather than going through [`accept_resume`])
+/// still needs to send the response itself.
+pub async fn respond_resume_accepted(send: &mut AnyByteStreamWriteHalf, committed_offset: u64, sent_offset: u64, replay: &[u8]) -> Result<(), MuxError> {
+    let mut ack = Vec::with_capacity(1 + 8 + 8 + 4 + replay.len());
+    ack.push(FRAME_RESUME_ACK);
+    ack.extend_from_slice(&committed_offset.to_be_bytes());
+    ack.extend_from_slice(&sent_offset.to_be_bytes());
+    ack.extend_from_slice(&(replay.len() as u32).to_be_bytes());
+    ack.extend_from_slice(replay);
+    send.write_all(&ack).await
+}
+
+/// Writes a [`FRAME_RESUME_REJECT`] response and waits for the peer to
+/// observe it (see [`crate::AnyByteStream::wait_for_close`]'s docs for why:
+/// the same "peer never saw the response before the connection died" race
+/// `isekai-pipe`'s own `reject()` exists to close) before returning.
+/// Best-effort — a failure to write or observe close is not surfaced since
+/// the caller is already on its way to reporting [`ResumeRejectReason`] as
+/// the operative error; a secondary I/O failure while trying to tell the
+/// peer about it isn't more actionable than that.
+pub async fn respond_resume_rejected(send: &mut AnyByteStreamWriteHalf, reason: ResumeRejectReason) {
+    let frame = [FRAME_RESUME_REJECT, reason.to_wire()];
+    if send.write_all(&frame).await.is_ok() {
+        let _ = send.shutdown().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send.wait_for_close()).await;
     }
 }
 
