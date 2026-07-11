@@ -86,7 +86,16 @@ pub fn noq_client_config(cert_sha256_hex: &str, config: &MuxClientConfig) -> Res
 /// can still get the identical TLS/transport setup instead of keeping its
 /// own near-identical copy.
 pub fn noq_server_config(config: &MuxServerConfig) -> Result<noq::ServerConfig, MuxError> {
-    let mut server_crypto = rustls::ServerConfig::builder()
+    // Explicit provider — matches `noq_client_config`'s identical choice, so
+    // this function never depends on a process-wide default having been
+    // installed via `CryptoProvider::install_default()` somewhere else in
+    // the caller's binary (isekai-pipe's original `serve` command, which
+    // this was ported from, happened to rely on such an ambient install; a
+    // standalone caller of this function should not have to replicate that).
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| MuxError::TlsConfig(e.to_string()))?
         .with_no_client_auth()
         .with_single_cert(config.cert_chain.clone(), config.private_key.clone_key())
         .map_err(|e| MuxError::TlsConfig(e.to_string()))?;
@@ -470,36 +479,32 @@ mod tests {
         }
     }
 
+    /// Built on [`NoqListener`] (this crate's own production accept API,
+    /// not a hand-rolled `noq::Endpoint::server` copy) so this helper can't
+    /// drift from what real callers actually use. Previously duplicated the
+    /// setup with a bare `rustls::ServerConfig::builder()` (no explicit
+    /// provider) — harmless when only the `noq` feature was compiled in
+    /// (a single crypto provider is unambiguous), but panicked with
+    /// "Could not automatically determine the process-level CryptoProvider"
+    /// once `qmux`'s transitive deps (which pull in `aws-lc-rs` alongside
+    /// this crate's `ring`) were linked into the same test binary too
+    /// (`cargo test -p quicmux --features noq,qmux`) — reusing
+    /// [`test_server_config`]'s explicit-provider [`noq_server_config`] path
+    /// avoids that class of bug entirely, here and in any future caller.
     async fn start_echo_server() -> (SocketAddr, String) {
-        let cert = rcgen::generate_simple_self_signed(vec!["quicmux-test.local".to_string()]).unwrap();
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().clone());
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
-        let cert_sha256_hex = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(cert_der.as_ref());
-            hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
-        };
-
-        let mut server_crypto = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert_der], key_der).unwrap();
-        server_crypto.alpn_protocols = vec![test_config().alpn];
-        server_crypto.max_early_data_size = 0;
-        let quic_crypto = noq::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap();
-        let server_config = noq::ServerConfig::with_crypto(Arc::new(quic_crypto));
-
-        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let endpoint = noq::Endpoint::server(server_config, bind_addr).unwrap();
-        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), endpoint.local_addr().unwrap().port());
+        let (server_config, cert_sha256_hex) = test_server_config();
+        let listener = NoqListener::bind(server_config, BindSpec::any_ipv4()).await.unwrap();
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
 
         tokio::spawn(async move {
-            let Some(incoming) = endpoint.accept().await else { return };
-            let Ok(conn) = incoming.await else { return };
-            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+            let Some(incoming) = listener.accept().await else { return };
+            let Ok(conn) = incoming.accept().await else { return };
+            while let Ok(mut stream) = conn.accept_bi().await {
                 let mut buf = [0u8; 64];
-                if let Ok(Some(n)) = recv.read(&mut buf).await {
-                    let _ = send.write_all(&buf[..n]).await;
+                if let Ok(n) = stream.read(&mut buf).await {
+                    let _ = stream.write_all(&buf[..n]).await;
                 }
-                let _ = send.finish();
+                let _ = stream.shutdown().await;
             }
         });
 

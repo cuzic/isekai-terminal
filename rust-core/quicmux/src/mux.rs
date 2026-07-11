@@ -164,17 +164,11 @@ impl AnyMuxRebinder {
 
 /// A bound mux listener, capable of accepting inbound connections — the
 /// server-side counterpart to [`AnyMuxEndpoint`].
-///
-/// Only the `noq` backend has a variant today — this crate has no
-/// `qmux`-backed listener/accept implementation yet (see [`AnyMuxConnection::accept_bi`]'s
-/// docs), so `AnyMuxListener` is currently `noq`-only the same way
-/// [`AnyMuxRebinder`] is, and for the same structural reason (a build with
-/// only the `qmux` feature enabled has zero variants of this type; no value
-/// of it can exist, matching the exhaustiveness-checker pattern
-/// [`AnyMuxRebinder`]'s methods already use).
 pub enum AnyMuxListener {
     #[cfg(feature = "noq")]
     Noq(crate::noq_backend::NoqListener),
+    #[cfg(feature = "qmux")]
+    Qmux(crate::qmux_backend::QmuxListener),
 }
 
 impl AnyMuxListener {
@@ -196,6 +190,16 @@ impl AnyMuxListener {
         Ok(Self::Noq(crate::noq_backend::NoqListener::wrap_bound_socket(config, socket).await?))
     }
 
+    /// Binds a fresh local TCP socket at `bind` and listens for inbound
+    /// `qmux` connections. No `wrap_bound_socket`-style counterpart — unlike
+    /// `noq`'s UDP-socket-then-STUN-then-hand-off pattern, nothing in this
+    /// crate's callers needs to run raw I/O on the listening TCP socket
+    /// before this crate takes it over.
+    #[cfg(feature = "qmux")]
+    pub async fn bind_qmux(config: MuxServerConfig, bind: BindSpec) -> Result<Self, MuxError> {
+        Ok(Self::Qmux(crate::qmux_backend::QmuxListener::bind(config, bind).await?))
+    }
+
     /// Waits for the next inbound connection candidate. Returns `None` once
     /// the listener has been closed and has no more incoming connections to
     /// deliver.
@@ -203,6 +207,8 @@ impl AnyMuxListener {
         match self {
             #[cfg(feature = "noq")]
             Self::Noq(listener) => listener.accept().await.map(AnyMuxIncoming::Noq),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(listener) => listener.accept().await.map(AnyMuxIncoming::Qmux),
         }
     }
 
@@ -210,25 +216,36 @@ impl AnyMuxListener {
         match self {
             #[cfg(feature = "noq")]
             Self::Noq(listener) => listener.local_addr(),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(listener) => listener.local_addr(),
         }
     }
 
-    /// Requests that the listener (and every connection it produced) be
-    /// closed. Best-effort — does not wait for peers to acknowledge; see
-    /// [`AnyMuxListener::wait_idle`] for that.
+    /// Requests that the listener stop accepting new connections. Best-
+    /// effort, and backend-dependent in scope: the `noq` backend also closes
+    /// every connection it already produced (does not wait for peers to
+    /// acknowledge; see [`AnyMuxListener::wait_idle`] for that), while the
+    /// `qmux` backend only stops accepting new TCP connections — it has no
+    /// centralized tracking of connections it already produced to close (see
+    /// `qmux_backend`'s module docs).
     pub fn close(&self) {
         match self {
             #[cfg(feature = "noq")]
             Self::Noq(listener) => listener.close(),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(listener) => listener.close(),
         }
     }
 
     /// Waits until every connection this listener produced has finished
-    /// closing (after a prior [`AnyMuxListener::close`]).
+    /// closing (after a prior [`AnyMuxListener::close`]) — a no-op for the
+    /// `qmux` backend (see [`AnyMuxListener::close`]'s docs on why).
     pub async fn wait_idle(&self) {
         match self {
             #[cfg(feature = "noq")]
             Self::Noq(listener) => listener.wait_idle().await,
+            #[cfg(feature = "qmux")]
+            Self::Qmux(listener) => listener.wait_idle().await,
         }
     }
 }
@@ -245,6 +262,8 @@ impl AnyMuxListener {
 pub enum AnyMuxIncoming {
     #[cfg(feature = "noq")]
     Noq(crate::noq_backend::NoqIncoming),
+    #[cfg(feature = "qmux")]
+    Qmux(crate::qmux_backend::QmuxIncoming),
 }
 
 impl AnyMuxIncoming {
@@ -253,6 +272,8 @@ impl AnyMuxIncoming {
         match self {
             #[cfg(feature = "noq")]
             Self::Noq(incoming) => Ok(AnyMuxConnection::Noq(incoming.accept().await?)),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(incoming) => Ok(AnyMuxConnection::Qmux(incoming.accept().await?)),
         }
     }
 }
@@ -280,43 +301,30 @@ impl AnyMuxConnection {
     /// server-accepting-a-connection counterpart to [`AnyMuxConnection::open_bi`].
     /// Not restricted to server-produced connections: nothing about "which
     /// side dialed" stops either peer from accepting a stream the other
-    /// opened, once the connection itself is established.
-    ///
-    /// The `qmux` backend does not support this yet — a `Qmux` connection is
-    /// only ever produced today by [`AnyMuxEndpoint::connect`] (dialing out),
-    /// and this crate has no `qmux`-backed listener/accept path yet (tracked
-    /// separately from the `noq` listener support added alongside this
-    /// method) — so this fails with [`MuxError::Unsupported`] for that
-    /// backend rather than compiling out the method entirely, since a caller
-    /// generic over `AnyMuxConnection` should get a runtime error it can
-    /// react to, not a build failure that only shows up when `qmux` is the
-    /// enabled backend.
+    /// opened, once the connection itself is established — a `noq::Connection`
+    /// and a `qmux::Session` both work this way, so a client-dialed
+    /// [`AnyMuxConnection`] can call this too (e.g. to accept a control
+    /// stream the server opens back).
     pub async fn accept_bi(&self) -> Result<AnyByteStream, MuxError> {
         match self {
             #[cfg(feature = "noq")]
             Self::Noq(conn) => Ok(AnyByteStream::Noq(conn.accept_bi().await?)),
             #[cfg(feature = "qmux")]
-            Self::Qmux(_) => Err(MuxError::Unsupported {
-                operation: "accept_bi",
-                reason: "the qmux backend has no server/listener-side implementation yet",
-            }),
+            Self::Qmux(conn) => Ok(AnyByteStream::Qmux(conn.accept_bi().await?)),
         }
     }
 
     /// Best-effort remote address of the peer — `None` if the backend has no
-    /// stable single address to report. This covers two different cases: a
-    /// `noq` connection with multipath enabled may have a different address
-    /// per path (this reports path 0's, which always exists, but that is
-    /// still not necessarily "the" address once other paths are live), and
-    /// the `qmux` backend does not currently capture/retain the peer's TCP
-    /// address on [`AnyMuxConnection`] at all (nothing needs it yet — add it
-    /// if a caller does).
+    /// stable single address to report. A `noq` connection with multipath
+    /// enabled may have a different address per path (this reports path 0's,
+    /// which always exists, but that is still not necessarily "the" address
+    /// once other paths are live).
     pub fn remote_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
             #[cfg(feature = "noq")]
             Self::Noq(conn) => conn.remote_addr(),
             #[cfg(feature = "qmux")]
-            Self::Qmux(_) => None,
+            Self::Qmux(conn) => conn.remote_addr(),
         }
     }
 
