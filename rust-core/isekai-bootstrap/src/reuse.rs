@@ -48,6 +48,16 @@
 //! reused by all of them), so concurrent bootstraps of two different
 //! topologies must still serialize on that shared upload step, even though
 //! they no longer contend over which helper process gets to survive.
+//!
+//! Coexistence has its own minor cost: a topology nobody bootstraps against
+//! anymore still leaves its `.state`/`.pid` files sitting on the remote host
+//! once its helper process eventually self-exits (`--max-idle-lifetime`) —
+//! small text files, not a resource leak in the way the original orphaned
+//! *processes* were, but not nothing either over a long enough history of
+//! relay/config changes. `openssh.rs`'s install script opportunistically
+//! garbage-collects any *other* fingerprint's state/pid pair whose recorded
+//! pid is no longer alive on every bootstrap run, so this doesn't grow
+//! without bound — see that module's own docs for the exact mechanics.
 
 use sha2::{Digest, Sha256};
 

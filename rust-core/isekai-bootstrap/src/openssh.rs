@@ -31,6 +31,15 @@
 //!    it back over the same exec channel — and, on success, records
 //!    `{pid, fingerprint, handshake}` to the state file for a future
 //!    invocation to find.
+//! 4. Before returning, opportunistically garbage-collects every *other*
+//!    fingerprint's state/pid file pair for this same binary whose recorded
+//!    pid is no longer alive (`kill -0` fails) — coexisting topologies
+//!    (step 1) mean a topology nobody bootstraps anymore would otherwise
+//!    leave its small `.state`/`.pid` files behind forever once its helper
+//!    process eventually self-exits via `--max-idle-lifetime`. Never touches
+//!    a fingerprint whose pid is still alive (that's someone else's
+//!    still-active helper, exactly what step 1 exists to protect) or this
+//!    invocation's own state file.
 //!
 //! `relay_jwt` still travels to a file via this invocation's own stdin
 //! (`cat > $tmpdir/relay_jwt`, never argv — see below).
@@ -461,6 +470,14 @@ if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdi
       fi
     fi
   fi
+  for gc_state in {remote_binary_path}.*.state; do
+    [ -e "$gc_state" ] || continue
+    [ "$gc_state" = {state_path} ] && continue
+    gc_pid=$(sed -n '1p' "$gc_state" | cut -d' ' -f1)
+    if [ -z "$gc_pid" ] || ! kill -0 "$gc_pid" 2>/dev/null; then
+      rm -f "$gc_state" "${{gc_state%.state}}.pid"
+    fi
+  done
 fi
 "#
         );

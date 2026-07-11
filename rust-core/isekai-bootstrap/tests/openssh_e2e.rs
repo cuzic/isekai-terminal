@@ -758,6 +758,10 @@ fn pid_file_path(home: &Path, fingerprint: &str) -> PathBuf {
     home.join(format!(".local/bin/isekai-pipe.{fingerprint}.pid"))
 }
 
+fn state_file_path(home: &Path, fingerprint: &str) -> PathBuf {
+    home.join(format!(".local/bin/isekai-pipe.{fingerprint}.state"))
+}
+
 fn is_pid_alive(pid: u32) -> bool {
     // A `kill -0` against an already-dead pid is an expected outcome for one
     // of this file's own assertions (not a real error) — redirect its
@@ -933,6 +937,132 @@ async fn install_and_start_lets_a_different_topology_coexist_with_a_still_alive_
 
     kill_if_recorded(&home, &relay_fingerprint);
     kill_if_recorded(&home, &direct_fingerprint);
+}
+
+/// Coexistence (previous test) has a cost: a topology nobody bootstraps
+/// against anymore leaves its `.state`/`.pid` files behind once its helper
+/// eventually exits. A later bootstrap of a *different* topology must
+/// opportunistically clean up that dead topology's files — but never touch
+/// one whose pid is still alive (that would defeat the whole point of
+/// per-topology scoping).
+#[tokio::test]
+async fn install_and_start_garbage_collects_a_dead_topologys_leftover_state() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("fake-pipe-handshake.json"), VALID_BOOTSTRAP_REPORT_JSON).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+    let binary = fake_pipe_binary();
+
+    let relay_launch = LaunchSpec::Relay(dummy_relay_spec());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], &binary, &relay_launch, None, &[]),
+    )
+    .await
+    .expect("first install_and_start should not hang")
+    .expect("first install_and_start should succeed");
+
+    let relay_fingerprint = launch_fingerprint(&relay_launch);
+    let relay_pid_path = pid_file_path(&home, &relay_fingerprint);
+    let relay_state_path = state_file_path(&home, &relay_fingerprint);
+    let relay_pid: u32 = std::fs::read_to_string(&relay_pid_path).unwrap().trim().parse().unwrap();
+
+    // Simulate the relay topology's helper having already exited on its own
+    // (crash, or its own `--max-idle-lifetime` elapsing) — its `.state`/
+    // `.pid` files are left stranded, exactly the scenario the GC step
+    // exists for.
+    kill_if_recorded(&home, &relay_fingerprint);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!is_pid_alive(relay_pid), "test setup: the relay helper should be dead before continuing");
+    assert!(relay_state_path.exists(), "test setup: the dead topology's state file should still be lying around");
+
+    let direct_launch =
+        LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), remote_bind_port_range: None };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], &binary, &direct_launch, None, &[]),
+    )
+    .await
+    .expect("second install_and_start should not hang")
+    .expect("second install_and_start should succeed with a fresh launch");
+
+    assert!(!relay_state_path.exists(), "the dead relay topology's state file should have been garbage-collected");
+    assert!(!relay_pid_path.exists(), "the dead relay topology's pid file should have been garbage-collected too");
+
+    let direct_fingerprint = launch_fingerprint(&direct_launch);
+    assert!(
+        state_file_path(&home, &direct_fingerprint).exists(),
+        "the freshly-launched topology's own state file must not be swept up by the same GC pass"
+    );
+
+    kill_if_recorded(&home, &direct_fingerprint);
+}
+
+/// The GC step must never remove a topology's state/pid files while its
+/// helper is still alive, even though it's a different topology from the
+/// one being bootstrapped right now — this is the same "never touch an
+/// unrelated still-active helper" guarantee the coexistence fix itself
+/// provides, just re-checked from the GC step's own angle.
+#[tokio::test]
+async fn install_and_start_garbage_collection_never_touches_a_still_alive_topology() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("fake-pipe-handshake.json"), VALID_BOOTSTRAP_REPORT_JSON).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+    let binary = fake_pipe_binary();
+
+    let relay_launch = LaunchSpec::Relay(dummy_relay_spec());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], &binary, &relay_launch, None, &[]),
+    )
+    .await
+    .expect("first install_and_start should not hang")
+    .expect("first install_and_start should succeed");
+
+    let relay_fingerprint = launch_fingerprint(&relay_launch);
+    let relay_pid: u32 =
+        std::fs::read_to_string(pid_file_path(&home, &relay_fingerprint)).unwrap().trim().parse().unwrap();
+    assert!(is_pid_alive(relay_pid), "test setup: the relay helper should still be alive");
+
+    let direct_launch =
+        LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), remote_bind_port_range: None };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], &binary, &direct_launch, None, &[]),
+    )
+    .await
+    .expect("second install_and_start should not hang")
+    .expect("second install_and_start should succeed with a fresh launch");
+
+    assert!(
+        state_file_path(&home, &relay_fingerprint).exists(),
+        "a still-alive topology's state file must survive a GC pass triggered by an unrelated bootstrap"
+    );
+    assert!(is_pid_alive(relay_pid), "the still-alive relay helper must not have been killed by the GC pass");
+
+    kill_if_recorded(&home, &relay_fingerprint);
+    kill_if_recorded(&home, &launch_fingerprint(&direct_launch));
 }
 
 /// When a relaunch genuinely is needed (the previous helper already exited,
