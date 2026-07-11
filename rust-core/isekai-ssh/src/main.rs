@@ -32,8 +32,39 @@ use clap::Parser;
 
 const EXIT_OTHER_ERROR: u8 = 1;
 
-#[tokio::main]
-async fn main() {
+/// Larger than the OS-default *process* main thread stack, which is fixed
+/// at link time and cannot be grown at runtime -- notably 1 MiB on Windows
+/// (vs. ~8 MiB typical on Linux/macOS). `tokio::main`'s generated
+/// `block_on` runs the top-level future's synchronous work (e.g. the QUIC
+/// handshake in `quicmux`/`noq`, which is deep and un-inlined in debug
+/// builds) directly on the calling thread, so a small main-thread stack
+/// overflows there before this fix -- observed in practice as
+/// `thread 'main' has overflowed its stack` right after
+/// `quicmux::noq_backend` starts connecting on a debug build on Windows.
+/// Running the whole async body on a freshly spawned thread with an
+/// explicit stack size sidesteps the platform-fixed main-thread limit; the
+/// size chosen here is generous headroom rather than a tight bound.
+const MAIN_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+fn main() {
+    let exit_code = std::thread::Builder::new()
+        .name("isekai-ssh-main".to_string())
+        .stack_size(MAIN_WORKER_STACK_SIZE)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime")
+                .block_on(run())
+        })
+        .expect("failed to spawn isekai-ssh main worker thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+    std::process::exit(exit_code as i32);
+}
+
+async fn run() -> u8 {
     // stdout purity (see wrapper.rs's module docs) is why this is pinned to
     // stderr explicitly rather than relying on env_logger's default target,
     // which callers should not have to trust blindly to stay stderr-only
@@ -71,5 +102,5 @@ async fn main() {
         }
     };
 
-    std::process::exit(exit_code as i32);
+    exit_code
 }
