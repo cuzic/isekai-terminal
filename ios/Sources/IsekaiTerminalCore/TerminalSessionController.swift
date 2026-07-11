@@ -672,4 +672,19 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
 
         return waitResult == .success && resultBox.approved
     }
+
+    /// リモートがOSC 52またはtmux迂回チャンネル経由でクリップボードへの書き込みを要求した
+    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。opt-in設定のチェック・実際に`UIPasteboard`へ
+    /// 書くかどうかの判断は`RemoteClipboardBridge`(UI設定であり`.claude/rules/rust-ssot.md`
+    /// の対象外)に委譲する。Android版`TerminalSession.kt`の`onClipboardWrite`に相当。
+    public func onClipboardWrite(payload: ClipboardPayload) {
+        RemoteClipboardBridge.write(payload)
+    }
+
+    /// リモートがOSC 52 queryまたはtmux迂回チャンネルの`ClipboardPullRequest`で
+    /// クリップボードの読み出しを要求した。Android版`TerminalSession.kt`の
+    /// `onClipboardPullRequest`に相当。
+    public func onClipboardPullRequest() -> ClipboardPayload? {
+        RemoteClipboardBridge.pull()
+    }
 }
