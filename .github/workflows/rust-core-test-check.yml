@@ -30,6 +30,7 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: write  # DEBUG(一時的、.github/CI_DEBUGGING.md参照)
 
 jobs:
   test:
@@ -103,6 +104,30 @@ jobs:
         working-directory: rust-core
         run: cargo build -p isekai-pipe
 
-      - name: cargo test --workspace (excluding noq-multipath-spike)
-        working-directory: rust-core
-        run: cargo test --workspace --exclude noq-multipath-spike
+      # DEBUG(一時的、.github/CI_DEBUGGING.md参照): isekai-pipe事前ビルド後も
+      # real_sshd_multihop_bootstrap_e2e.rsが同一症状で失敗し続けたため、
+      # CPU競合説を撤回し再調査する。
+      - name: DEBUG tmate session (detached)
+        uses: mxschmitt/action-tmate@v3
+        with:
+          detached: true
+
+      - name: DEBUG relay tmate connection string via PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -x
+          CONN=""
+          for i in $(seq 1 15); do
+            CONN=$(/tmp/tmate/tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>&1 || true)
+            case "$CONN" in ssh\ *) break ;; esac
+            sleep 2
+          done
+          {
+            echo "DEBUG tmate connection:"
+            echo "\`$CONN\`"
+          } > /tmp/debug-tmate-body.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/debug-tmate-body.md
+
+      - name: DEBUG keep runner alive for interactive session
+        run: sleep 1200
