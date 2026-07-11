@@ -38,6 +38,8 @@ import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.CellData
+import uniffi.isekai_terminal_core.ClipboardMimeKind
+import uniffi.isekai_terminal_core.ClipboardPayload
 import uniffi.isekai_terminal_core.IsekaiPipeQuicConfig
 import uniffi.isekai_terminal_core.IsekaiLinkRelayConfig
 import uniffi.isekai_terminal_core.IsekaiStunP2pConfig
@@ -88,17 +90,31 @@ class TerminalTabsViewModel(
                     app.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE)
                         .getBoolean(PREF_KEY_ALLOW_REMOTE_CLIPBOARD_PULL, false)
                 },
-                writeToClipboard = { text ->
+                writeToClipboard = { payload ->
                     val cm = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
                         as android.content.ClipboardManager
-                    cm.setPrimaryClip(android.content.ClipData.newPlainText("isekai-terminal (remote)", text))
+                    val clip = if (payload.mime == ClipboardMimeKind.IMAGE_PNG) {
+                        RemoteClipboardImagePolicy.writeImageToClipData(app, payload.data)
+                    } else {
+                        android.content.ClipData.newPlainText(
+                            "isekai-terminal (remote)",
+                            String(payload.data, Charsets.UTF_8),
+                        )
+                    }
+                    cm.setPrimaryClip(clip)
                 },
                 readFromClipboard = {
                     val cm = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
                         as android.content.ClipboardManager
-                    cm.primaryClip?.takeIf { it.itemCount > 0 }
-                        ?.getItemAt(0)?.coerceToText(app)?.toString()
-                        ?.takeIf { it.isNotEmpty() }
+                    val clipData = cm.primaryClip
+                    if (RemoteClipboardImagePolicy.isImageClip(clipData)) {
+                        RemoteClipboardImagePolicy.readImageFromClipData(app.contentResolver, clipData)
+                    } else {
+                        clipData?.takeIf { it.itemCount > 0 }
+                            ?.getItemAt(0)?.coerceToText(app)?.toString()
+                            ?.takeIf { it.isNotEmpty() }
+                            ?.let { ClipboardPayload(ClipboardMimeKind.TEXT_PLAIN, it.toByteArray(Charsets.UTF_8)) }
+                    }
                 },
             )
             TerminalSession(

@@ -1,26 +1,40 @@
 package tools.isekai.terminal
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
+import uniffi.isekai_terminal_core.ClipboardMimeKind
+import uniffi.isekai_terminal_core.ClipboardPayload
 
 class RemoteClipboardPolicyTest {
+
+    private fun textPayload(text: String) =
+        ClipboardPayload(ClipboardMimeKind.TEXT_PLAIN, text.toByteArray(Charsets.UTF_8))
+
+    // `ClipboardPayload`はByteArrayプロパティを持つdata classで、Kotlinの自動生成
+    // equals()はByteArrayを参照比較する(内容比較にならない)ため、`assertEquals`を
+    // 直接使わずmime/data(文字列化)を個別に比較する。
+    private fun assertPayloadIsText(expected: String, actual: ClipboardPayload?) {
+        assertEquals(ClipboardMimeKind.TEXT_PLAIN, actual?.mime)
+        assertArrayEquals(expected.toByteArray(Charsets.UTF_8), actual?.data)
+    }
 
     // ── write ─────────────────────────────────────────────────────
 
     @Test
     fun `write is forwarded to the clipboard when opt-in is enabled`() {
-        var written: String? = null
+        var written: ClipboardPayload? = null
         val policy = RemoteClipboardPolicy(
             isWriteAllowed = { true },
             isPullAllowed = { false },
-            writeToClipboard = { text -> written = text },
+            writeToClipboard = { payload -> written = payload },
             readFromClipboard = { null },
         )
 
-        policy.onClipboardWriteRequested("hello from remote")
+        policy.onClipboardWriteRequested(textPayload("hello from remote"))
 
-        assertEquals("hello from remote", written)
+        assertPayloadIsText("hello from remote", written)
     }
 
     @Test
@@ -33,7 +47,7 @@ class RemoteClipboardPolicyTest {
             readFromClipboard = { null },
         )
 
-        policy.onClipboardWriteRequested("should not reach the clipboard")
+        policy.onClipboardWriteRequested(textPayload("should not reach the clipboard"))
 
         assertEquals(false, writeCalled)
     }
@@ -46,10 +60,10 @@ class RemoteClipboardPolicyTest {
             isWriteAllowed = { false },
             isPullAllowed = { true },
             writeToClipboard = {},
-            readFromClipboard = { "clipboard contents" },
+            readFromClipboard = { textPayload("clipboard contents") },
         )
 
-        assertEquals("clipboard contents", policy.onClipboardPullRequested())
+        assertPayloadIsText("clipboard contents", policy.onClipboardPullRequested())
     }
 
     @Test
@@ -59,7 +73,7 @@ class RemoteClipboardPolicyTest {
             isWriteAllowed = { false },
             isPullAllowed = { false },
             writeToClipboard = {},
-            readFromClipboard = { readCalled = true; "should not be returned" },
+            readFromClipboard = { readCalled = true; textPayload("should not be returned") },
         )
 
         assertNull(policy.onClipboardPullRequested())
