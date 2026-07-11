@@ -135,22 +135,37 @@ chatgpt.md §13相当の新schema(`peer_id`/`link_endpoints`/`stun_servers`/`rel
 `candidates`ベース)への変換関数(`migrate_trust_store`)のみ実装済み。旧ファイルは据え置きで、
 実際の読み書き経路(`wrapper.rs`/`isekai-pipe connect`)はまだ`known_helpers.toml`を直接使う。
 
-### 4.4 自動bootstrap(direct-by-bootstrap-hostモードのみ)
+### 4.4 自動bootstrap
 
-wrapperは未登録ホストに対し、`--isekai-helper-binary <path>`が与えられていれば
-**relay/STUNを使わない`direct-by-bootstrap-host`モードに限り**自動配布・登録できる
-(`wrapper.rs::bootstrap_and_register`)。
+wrapperは未登録ホストに対し、`--isekai-helper-binary <path>`が与えられていれば自動配布・登録できる
+(`wrapper.rs::bootstrap_and_register`)。launch modeは`#@isekai bootstrap-relay addr=... sni=...`
+directiveの有無で決まる(single evidence-gated選択、racingなし——`ISEKAI_PIPE_DESIGN.md` §8
+Epic H、2026-07-09完了):
 
 1. 優先度最上位のbootstrap candidateへ、指定されたローカルバイナリを
-   `isekai-bootstrap::OpenSshBackend::install_and_start`(`LaunchSpec::Direct`)経由でSSHアップロードする。
+   `isekai-bootstrap::OpenSshBackend::install_and_start`経由でSSHアップロードする。
+   `bootstrap-relay`が無ければ`LaunchSpec::Direct`(direct-by-bootstrap-host、relay無し)。
+   `bootstrap-relay`があれば`LaunchSpec::Relay`を選び、`isekai_auth::FileTokenProvider::
+   from_default_path()?.get_relay_jwt()`で取得したJWTを使う(トークン無し/読み込み失敗は
+   fail closed)。relay launchが失敗してもdirectへの自動フォールバックはしない(silent
+   fallbackはoperatorの意図を裏切るため——Epic H参照)。
+   candidateの`via`(`#@isekai bootstrap-candidate ... via=...`、複数指定可)は
+   `isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain`で循環検出・最大hop数検証した上で
+   `Vec<JumpSpec>`として渡され、`-J host1,host2,...`の単一`ssh(1)`呼び出しでmulti-hopに対応する
+   (Epic K、2026-07-09完了)。
 2. リモートで`isekai-pipe serve --target 127.0.0.1:22 --bind 0.0.0.0:0 --max-idle-lifetime <secs>`
    として起動し、handshake JSONを取得する。
 3. `init`と同じ`[y/N]`確認(TOFU)を表示・確認後、trust storeへ登録する。
-4. `build_connection_intent`を再試行して通常の接続フローへ進む。
+4. `build_connection_intent`を再試行して通常の接続フローへ進む。`select_transport`が
+   `#@isekai stun`解決とcached STUN観測実績の両方が揃った場合のみSTUN P2Pをprimaryに選び、
+   それ以外は従来通りRelay/Directを選ぶ(Epic G、single primary版で完了)。
 
-**スコープ外(引き続き`isekai-ssh init`が必要)**:
-- relay/STUN経由の自動bootstrap(JWT取得手段が未整備)。
-- 複数hopの`--via`チェーン(単一hopのみ対応、複数hopは明示的にエラーにして`init`へ誘導)。
+**スコープ外(引き続き`isekai-ssh init`が必要な場合が残る)**:
+- STUN P2P自体を「bootstrap時のアップロード経路」として使うこと(STUNはP2P到達性の実績を
+  接続transport選択に使うためのものであり、bootstrap payload自体をP2P経由で送る仕組みは無い)。
+- cross-family racing(direct/relay/STUNを同時並行で試す)。順序付きfallback
+  (`cross_family_fallback`、1つ失敗してから次を試す)は実装済みだが、真の同時racingは未着手
+  (下記「racing」参照)。
 
 ## 5. isekai-pipe
 
