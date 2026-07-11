@@ -4,20 +4,36 @@
 //! `IdentityFile`, `IdentityAgent`, `ProxyJump`, etc. is worth far more than
 //! anything a from-scratch client could offer here).
 //!
-//! Two ssh(1) invocations do the work, mirroring
-//! `rust-core/src/helper_bootstrap.rs`'s `upload_binary`/
-//! `launch_and_capture_handshake` almost verbatim, just executed as `ssh`
-//! subprocesses instead of over a `russh::client::Handle`:
+//! A single ssh(1) invocation (`install_and_launch`) does the work,
+//! mirroring `rust-core/src/helper_bootstrap.rs`'s `upload_binary`/
+//! `launch_and_capture_handshake` in spirit, just executed as one combined
+//! `ssh` subprocess script instead of over a `russh::client::Handle`:
 //!
-//! 1. `upload_binary`: `base64 -d > ...tmp && chmod 0700 ... && mv ...` with
-//!    the base64-encoded binary written to the ssh subprocess's stdin.
-//! 2. `launch_and_capture_handshake`: writes `relay_jwt` to a file via this
-//!    invocation's own stdin (`cat > $tmpdir/relay_jwt`, never argv — see
-//!    below), then launches `isekai-helper` detached (`setsid`, stdin from
-//!    `/dev/null`, wrapped in a subshell so the ssh exec channel's direct
-//!    child exits immediately — see the comment in `helper_bootstrap.rs` for
-//!    why that matters) and polls a handshake file until it's non-empty,
-//!    then `cat`s it back over the same exec channel.
+//! 1. Under a best-effort `flock(1)` on `crate::reuse::lock_file_path`, check
+//!    whether `crate::reuse::state_file_path` records a still-alive helper
+//!    (`kill -0`, `/proc/<pid>/exe` identity check to guard against PID
+//!    reuse) launched with a matching `crate::reuse::launch_fingerprint` — if
+//!    so, skip uploading/relaunching entirely and hand back the recorded
+//!    handshake (see `crate::reuse`'s module docs for why this is safe and
+//!    why `isekai-ssh`'s long-lived-helper model needs it, unlike
+//!    `helper_bootstrap.rs`'s intentionally-fresh-every-session Android
+//!    path).
+//! 2. Otherwise: `sha256sum` the existing binary (if any) and skip
+//!    re-uploading when it already matches the expected digest; kill a
+//!    fingerprint-mismatched but still-alive previous helper (superseded
+//!    config, not just a crashed one) before launching a new one;
+//!    `base64 -d > ...tmp && chmod 0700 ... && mv ...` otherwise, with the
+//!    base64-encoded binary written to the ssh subprocess's stdin.
+//! 3. Launches `isekai-helper` detached (`setsid`, stdin from `/dev/null`,
+//!    wrapped in a subshell so the ssh exec channel's direct child exits
+//!    immediately — see the comment in `helper_bootstrap.rs` for why that
+//!    matters) and polls a handshake file until it's non-empty, then `cat`s
+//!    it back over the same exec channel — and, on success, records
+//!    `{pid, fingerprint, handshake}` to the state file for a future
+//!    invocation to find.
+//!
+//! `relay_jwt` still travels to a file via this invocation's own stdin
+//! (`cat > $tmpdir/relay_jwt`, never argv — see below).
 //!
 //! **stdout purity is the whole point of this module.** The ssh(1)
 //! subprocess's stdout is captured via `Stdio::piped()` and is *never*
@@ -68,11 +84,20 @@ use crate::types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec};
 // just mirrored ones — security review #57/#58 applies to both call sites
 // identically).
 use isekai_protocol::bootstrap::{
-    remote_parent_dir, shell_single_quote, upload_binary_command, validate_log_level, validate_relay_jwt,
-    validate_relay_sni,
+    remote_parent_dir, shell_single_quote, validate_log_level, validate_relay_jwt, validate_relay_sni,
     validate_remote_path, HANDSHAKE_POLL_ATTEMPTS, HANDSHAKE_POLL_INTERVAL_MS, ISEKAI_PIPE_BIN_NAME,
     ISEKAI_PIPE_INSTALL_DIR,
 };
+
+use crate::reuse::{launch_fingerprint, lock_file_path, pid_file_path, state_file_path};
+
+/// Emitted by the install script in place of a handshake line when the
+/// upload chain (`base64 -d && chmod && mv`) itself fails — distinguished
+/// from a bare empty/missing handshake so callers still get
+/// `BootstrapError::UploadFailed` (and, via `isekai-bootstrap-plan`'s
+/// `classify_bootstrap_error`, `BootstrapFailure::RemoteBinaryMissing`)
+/// instead of a generic `HandshakeMissing`.
+const UPLOAD_FAILED_MARKER: &str = "ISEKAI_UPLOAD_FAILED";
 
 /// The CLI-default `BootstrapBackend`. Spawns the system `ssh(1)` binary.
 pub struct OpenSshBackend {
@@ -213,32 +238,25 @@ impl OpenSshBackend {
         Ok(SshOutput { status: status.code(), stdout, stderr })
     }
 
-    async fn upload_binary(
-        &self,
-        target: &HostSpec,
-        via: &[JumpSpec],
-        binary: &[u8],
-        remote_binary_path: &str,
-    ) -> Result<(), BootstrapError> {
-        let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
-        let cmd = upload_binary_command(remote_binary_path, remote_parent_dir(remote_binary_path));
-        let out = self.run_ssh_command(target, via, &cmd, Some(encoded.as_bytes())).await?;
-        if out.status != Some(0) {
-            return Err(BootstrapError::UploadFailed {
-                status: out.status,
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            });
-        }
-        Ok(())
-    }
-
-    async fn launch_and_capture_handshake(
+    /// Combined upload-check + reuse-check + (conditional upload) +
+    /// (conditional launch) in a single ssh(1) exec, so the whole decision
+    /// is made under one held `flock` — see this module's docs and
+    /// `crate::reuse`'s module docs for why splitting "decide" from "act"
+    /// across separate ssh(1) subprocesses would reopen exactly the race
+    /// this exists to close (two concurrent invocations both deciding to
+    /// relaunch). The base64-encoded `binary` always travels over this same
+    /// stdin regardless of whether it ends up used, so the remote script's
+    /// read position stays aligned across every branch — see the script's
+    /// own `head -c {encoded_len}` calls, every one of which consumes
+    /// exactly that many bytes whether it decodes them or discards them.
+    async fn install_and_launch(
         &self,
         target: &HostSpec,
         via: &[JumpSpec],
         launch: &LaunchSpec,
         remote_binary_path: &str,
         stun_servers: &[SocketAddr],
+        binary: &[u8],
     ) -> Result<isekai_protocol::HandshakeJson, BootstrapError> {
         let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
 
@@ -253,6 +271,7 @@ impl OpenSshBackend {
         // fencing identity the eventual QUIC connection will use.
         let bootstrap_request = fresh_bootstrap_request_v2(stun_servers).await;
         let request_bytes = serde_json::to_vec(&bootstrap_request).expect("BootstrapRequestV2 always serializes");
+        let request_len = request_bytes.len();
 
         // `#20b`: pass the first configured STUN server through to the
         // remote `isekai-pipe serve` too (`LaunchSpec::Direct` only —
@@ -272,7 +291,10 @@ impl OpenSshBackend {
             None => String::new(),
         };
 
-        let (cmd, stdin_payload) = match launch {
+        // Per-variant: the `isekai-pipe serve` argv tail, and any extra
+        // secret bytes (`relay_jwt` only) that must travel over this same
+        // stdin immediately after the `BootstrapRequestV2` JSON.
+        let (launch_args, jwt_bytes): (String, Vec<u8>) = match launch {
             LaunchSpec::Relay(relay) => {
                 // Security review #57: validate `relay_sni`/`relay_jwt` against a
                 // strict allow-list charset *before* interpolating either into a
@@ -297,57 +319,12 @@ impl OpenSshBackend {
                     crate::types::RelayTransportKind::Udp => String::new(),
                     crate::types::RelayTransportKind::Qmux => " --relay-transport qmux".to_string(),
                 };
-                // Security review #68: use the same per-invocation `mktemp -d` +
-                // `trap ... EXIT` pattern as `rust-core/src/helper_bootstrap.rs`
-                // (Android bootstrap path) instead of a fixed shared path. The fixed
-                // path (`~/.cache/isekai-terminal/helper.{handshake,log}`) that used
-                // to live here had the exact same class of bug that
-                // `helper_bootstrap.rs`'s doc comment describes in detail: two
-                // overlapping `isekai-ssh init` invocations against the same host
-                // would truncate/collide on the same files. `mktemp -d` makes that
-                // structurally impossible, matching `archive/HELPER_PROTOCOL.md`'s §2
-                // contract.
-                //
-                // Security review #58: `relay_jwt` (the MASQUE relay bearer token)
-                // is written to `$tmpdir/relay_jwt` via this ssh(1) subprocess's
-                // stdin rather than embedded in the command line, then passed to
-                // isekai-helper as `--relay-jwt-file` — argv would otherwise be
-                // readable by any other local user on the remote host via `ps
-                // aux`/`/proc/<pid>/cmdline`, exactly like `session_secret` already
-                // avoids that path.
-                //
-                // `#20a-2`: the `BootstrapRequestV2` JSON travels first on this
-                // same stdin, immediately followed by `relay_jwt` — both
-                // length-prefixed (the lengths themselves aren't secret, so
-                // they're safe to interpolate into the command string) and
-                // split with `head -c` (not `dd bs=1`, which reads one byte
-                // per syscall and would be needlessly slow for a JSON payload
-                // that can run to several KB once real candidates are wired
-                // in by `#20b`). Byte counts are verified with `wc -c` before
-                // launch so a truncated stdin (e.g. the ssh connection
-                // dropping mid-write) fails closed instead of launching
-                // `isekai-pipe serve` against a partially-written file.
-                let request_len = request_bytes.len();
-                let jwt_len = relay.relay_jwt.len();
-                let cmd = format!(
-                    "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
-                     head -c {request_len} > $tmpdir/bootstrap-request.json && \
-                     head -c {jwt_len} > $tmpdir/relay_jwt && \
-                     [ \"$(wc -c < $tmpdir/bootstrap-request.json)\" -eq {request_len} ] && \
-                     [ \"$(wc -c < $tmpdir/relay_jwt)\" -eq {jwt_len} ] && \
-                     ( setsid {remote_binary_path} serve --target 127.0.0.1:22 \
-                     --relay {relay_addr} --relay-sni {quoted_sni} --relay-jwt-file $tmpdir/relay_jwt \
-                     --bootstrap-request-file $tmpdir/bootstrap-request.json{relay_transport_arg} \
-                     --max-idle-lifetime {idle_lifetime_secs} --log-level {remote_log_level} \
-                     </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
-                     for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
-                       [ -s $tmpdir/handshake ] && break; \
-                       sleep {sleep_secs}; \
-                     done; \
-                     cat $tmpdir/handshake"
+                let args = format!(
+                    "--target 127.0.0.1:22 --relay {relay_addr} --relay-sni {quoted_sni} \
+                     --relay-jwt-file $tmpdir/relay_jwt --bootstrap-request-file $tmpdir/bootstrap-request.json\
+                     {relay_transport_arg} --max-idle-lifetime {idle_lifetime_secs} --log-level {remote_log_level}"
                 );
-                let stdin_payload = [request_bytes.as_slice(), relay.relay_jwt.as_bytes()].concat();
-                (cmd, Some(stdin_payload))
+                (args, relay.relay_jwt.clone().into_bytes())
             }
             // No relay, no STUN: the client dials this host's own SSH
             // bootstrap address at the port reported in `candidates`
@@ -361,26 +338,128 @@ impl OpenSshBackend {
                     Some((start, end)) => format!(" --bind-port-range {start}-{end}"),
                     None => String::new(),
                 };
-                let request_len = request_bytes.len();
-                let cmd = format!(
-                    "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
-                     head -c {request_len} > $tmpdir/bootstrap-request.json && \
-                     [ \"$(wc -c < $tmpdir/bootstrap-request.json)\" -eq {request_len} ] && \
-                     ( setsid {remote_binary_path} serve --target 127.0.0.1:22 \
-                     --bind 0.0.0.0:0 --bootstrap-request-file $tmpdir/bootstrap-request.json{stun_server_arg}{bind_port_range_arg} \
-                     --max-idle-lifetime {idle_lifetime_secs} --log-level {remote_log_level} \
-                     </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
-                     for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
-                       [ -s $tmpdir/handshake ] && break; \
-                       sleep {sleep_secs}; \
-                     done; \
-                     cat $tmpdir/handshake"
+                let args = format!(
+                    "--target 127.0.0.1:22 --bind 0.0.0.0:0 --bootstrap-request-file $tmpdir/bootstrap-request.json\
+                     {stun_server_arg}{bind_port_range_arg} --max-idle-lifetime {idle_lifetime_secs} --log-level {remote_log_level}"
                 );
-                (cmd, Some(request_bytes.clone()))
+                (args, Vec::new())
             }
         };
 
-        let out = self.run_ssh_command(target, via, &cmd, stdin_payload.as_deref()).await?;
+        // Security review #68: use the same per-invocation `mktemp -d` +
+        // `trap ... EXIT` pattern as `rust-core/src/helper_bootstrap.rs`
+        // (Android bootstrap path) instead of a fixed shared path — see
+        // that module's doc comment for the concurrent-session truncation
+        // bug a shared fixed path caused. `crate::reuse`'s state/lock/pid
+        // files are a *different*, deliberate exception to that principle:
+        // they are a shared, per-deployment singleton by design (that's the
+        // whole point — one canonical "the currently running helper for
+        // this remote-path"), protected by an flock instead of by being
+        // freshly named per invocation.
+        //
+        // Security review #58: `relay_jwt` (the MASQUE relay bearer token)
+        // is written to `$tmpdir/relay_jwt` via this ssh(1) subprocess's
+        // stdin rather than embedded in the command line, then passed to
+        // isekai-helper as `--relay-jwt-file` — argv would otherwise be
+        // readable by any other local user on the remote host via `ps
+        // aux`/`/proc/<pid>/cmdline`, exactly like `session_secret` already
+        // avoids that path.
+        //
+        // `#20a-2`: the `BootstrapRequestV2` JSON travels first on this same
+        // stdin, immediately followed by `relay_jwt` (if any) and then the
+        // base64-encoded binary — all length-prefixed (the lengths
+        // themselves aren't secret, so they're safe to interpolate into the
+        // command string) and split with `head -c` (not `dd bs=1`, which
+        // reads one byte per syscall and would be needlessly slow for a
+        // multi-MB binary). The request/jwt byte counts are verified with
+        // `wc -c` before anything else runs, so a truncated stdin (e.g. the
+        // ssh connection dropping mid-write) fails closed instead of
+        // launching `isekai-pipe serve` against a partially-written file.
+        let jwt_len = jwt_bytes.len();
+        let read_jwt_step = if jwt_len > 0 {
+            format!("head -c {jwt_len} > $tmpdir/relay_jwt && [ \"$(wc -c < $tmpdir/relay_jwt)\" -eq {jwt_len} ] && ")
+        } else {
+            String::new()
+        };
+
+        let remote_dir = remote_parent_dir(remote_binary_path);
+        let lock_path = lock_file_path(remote_binary_path);
+        let state_path = state_file_path(remote_binary_path);
+        let pid_path = pid_file_path(remote_binary_path);
+        let fingerprint = launch_fingerprint(launch);
+        let expected_sha256 = hex_sha256(binary);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
+        let encoded_len = encoded.len();
+        let upload_failed_marker = UPLOAD_FAILED_MARKER;
+
+        // `9>&-` right before `setsid` below matters: a plain `setsid cmd &`
+        // would otherwise inherit this shell's fd 9 (the `flock` below) into
+        // the detached, long-lived grandchild, which then holds that same
+        // open file description (and therefore the lock) open for its
+        // entire lifetime — a *second* invocation's own `flock -w 30 9`
+        // would then block for the full 30s waiting on a lock the first
+        // helper process never releases, found via a real hang in this
+        // module's own e2e tests before this fix.
+        let cmd = format!(
+            r#"umask 077
+mkdir -p {remote_dir} 2>/dev/null
+exec 9>>{lock_path} 2>/dev/null
+if command -v flock >/dev/null 2>&1; then flock -w 30 9 2>/dev/null || true; fi
+tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
+if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdir/bootstrap-request.json)" -eq {request_len} ] && {read_jwt_step}true; then
+  reuse_envelope=""
+  stale_pid=""
+  if [ -f {state_path} ]; then
+    existing_pid=$(sed -n '1p' {state_path} | cut -d' ' -f1)
+    existing_fp=$(sed -n '1p' {state_path} | cut -d' ' -f2)
+    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+      existing_exe=$(readlink -f /proc/$existing_pid/exe 2>/dev/null)
+      expected_exe=$(readlink -f {remote_binary_path} 2>/dev/null)
+      if [ -n "$existing_exe" ] && [ "$existing_exe" = "$expected_exe" ] && [ "$existing_fp" = "{fingerprint}" ]; then
+        reuse_envelope=$(sed -n '2p' {state_path})
+      else
+        stale_pid="$existing_pid"
+      fi
+    fi
+  fi
+  if [ -n "$reuse_envelope" ]; then
+    head -c {encoded_len} > /dev/null
+    printf '%s\n' "$reuse_envelope"
+  else
+    [ -n "$stale_pid" ] && kill "$stale_pid" 2>/dev/null
+    need_upload=1
+    if command -v sha256sum >/dev/null 2>&1 && [ -x {remote_binary_path} ]; then
+      current_sha=$(sha256sum {remote_binary_path} 2>/dev/null | cut -d' ' -f1)
+      [ "$current_sha" = "{expected_sha256}" ] && need_upload=0
+    fi
+    upload_ok=1
+    if [ "$need_upload" -eq 1 ]; then
+      head -c {encoded_len} | base64 -d > {remote_binary_path}.tmp && chmod 0700 {remote_binary_path}.tmp && mv {remote_binary_path}.tmp {remote_binary_path} || upload_ok=0
+    else
+      head -c {encoded_len} > /dev/null
+    fi
+    if [ "$upload_ok" -eq 0 ]; then
+      echo {upload_failed_marker}
+    else
+      ( setsid {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- & echo $! > {pid_path} )
+      for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do
+        [ -s $tmpdir/handshake ] && break
+        sleep {sleep_secs}
+      done
+      if [ -s $tmpdir/handshake ]; then
+        envelope=$(cat $tmpdir/handshake)
+        new_pid=$(cat {pid_path} 2>/dev/null)
+        ( printf '%s %s\n' "$new_pid" "{fingerprint}"; printf '%s\n' "$envelope" ) > {state_path}.tmp.$$ && mv {state_path}.tmp.$$ {state_path}
+        printf '%s\n' "$envelope"
+      fi
+    fi
+  fi
+fi
+"#
+        );
+
+        let stdin_payload = [request_bytes.as_slice(), jwt_bytes.as_slice(), encoded.as_bytes()].concat();
+        let out = self.run_ssh_command(target, via, &cmd, Some(&stdin_payload)).await?;
 
         let non_empty_lines: Vec<&[u8]> =
             out.stdout.split(|&b| b == b'\n').filter(|line| !line.is_empty()).collect();
@@ -390,14 +469,38 @@ impl OpenSshBackend {
                 status: out.status,
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             }),
+            [marker] if *marker == UPLOAD_FAILED_MARKER.as_bytes() => Err(BootstrapError::UploadFailed {
+                status: out.status,
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }),
             // `#20a-4`: every launch above sends a `BootstrapRequestV2`, so a
             // compliant `isekai-pipe serve` always echoes back a
             // `BootstrapReportV2` envelope (never a bare `HandshakeJson`) —
-            // decode accordingly and unwrap the inner handshake.
+            // decode accordingly and unwrap the inner handshake. The reuse
+            // path replays a *previously* captured envelope verbatim
+            // (including its now-stale `session_id`/`bootstrap_attempt_id`)
+            // rather than one matching *this* invocation's own
+            // `bootstrap_request` — safe because no code path here or in
+            // any caller ever compares those echoed ids against the request
+            // that produced them (they exist for other correlation
+            // purposes, per `isekai_protocol::bootstrap_request`'s module
+            // docs); only `.handshake` is ever consulted.
             [single] => Ok(isekai_protocol::bootstrap_request::decode_bootstrap_report_v2(single)?.handshake),
             _ => Err(BootstrapError::UnexpectedStdout { extra_lines: non_empty_lines.len() - 1 }),
         }
     }
+}
+
+/// Hex-encoded SHA-256 of `binary`'s bytes — matches (and is deliberately not
+/// deduplicated with) `isekai-ssh`'s own `hex_sha256` copies in `init.rs`/
+/// `wrapper.rs`, which hash the same bytes for a different purpose (the
+/// `HelperTrust`/`PersistentProfile` digest pin shown to the operator/stored
+/// in the trust store) — this one is purely an internal input to the reuse
+/// script's `sha256sum` comparison and never surfaces to the user.
+fn hex_sha256(binary: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(binary);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 struct SshOutput {
@@ -449,9 +552,8 @@ impl BootstrapBackend for OpenSshBackend {
         validate_remote_path(remote_binary_path)
             .map_err(|e| BootstrapError::InvalidRemotePath(e.to_string()))?;
 
-        self.upload_binary(target, via, helper_binary, remote_binary_path).await?;
         let handshake = self
-            .launch_and_capture_handshake(target, via, launch, remote_binary_path, stun_servers)
+            .install_and_launch(target, via, launch, remote_binary_path, stun_servers, helper_binary)
             .await?;
         Ok(BootstrapReport { handshake })
     }
