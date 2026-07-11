@@ -47,6 +47,15 @@ public struct ProfileListView: View {
     @AppStorage(TerminalThemes.prefKey) private var currentThemeName: String = TerminalThemes.defaultDark.name
     @State private var showThemePicker = false
 
+    /// Epic M以降にAndroid版`ProfileListScreen.kt`のメニューへ追加された4つの
+    /// オプトイン設定(既定OFF)。`@AppStorage`は`ScreenProtectionOverlay`/
+    /// `RemoteClipboardBridge`が読む`UserDefaults`キーと同じものを直接束縛するため、
+    /// ここでのトグルが即座にそれらへ反映される。
+    @AppStorage(AppSettingsKeys.screenProtectionEnabled) private var screenProtectionEnabled = false
+    @AppStorage(AppSettingsKeys.allowRemoteClipboardWrite) private var remoteClipboardWriteEnabled = false
+    @AppStorage(AppSettingsKeys.allowRemoteClipboardPull) private var remoteClipboardPullEnabled = false
+    @AppStorage(AppSettingsKeys.enableCtlSocketForward) private var ctlSocketForwardEnabled = false
+
     // `model`にデフォルト値を持たせると、そのデフォルト式`ProfileListModel()`は
     // (SwiftのStateObject(wrappedValue:)のautoclosureとは違い)呼び出し側の
     // 非isolatedなコンテキストで即座に評価されるため、`@MainActor`な
@@ -116,6 +125,24 @@ public struct ProfileListView: View {
                         Button("診断 (Phase 1A-1)", action: onShowDiagnostics)
                             .accessibilityIdentifier("diagnosticsMenuItem")
                     }
+                    Divider()
+                    Button(screenProtectionEnabled ? "画面の保護: ON" : "画面の保護: OFF") {
+                        screenProtectionEnabled.toggle()
+                    }
+                    .accessibilityIdentifier("screenProtectionMenuItem")
+                    Button(remoteClipboardWriteEnabled ? "リモートからのクリップボード書込: ON" : "リモートからのクリップボード書込: OFF") {
+                        remoteClipboardWriteEnabled.toggle()
+                    }
+                    .accessibilityIdentifier("remoteClipboardWriteMenuItem")
+                    Button(remoteClipboardPullEnabled ? "リモートへのクリップボード送信: ON" : "リモートへのクリップボード送信: OFF") {
+                        remoteClipboardPullEnabled.toggle()
+                    }
+                    .accessibilityIdentifier("remoteClipboardPullMenuItem")
+                    Button(ctlSocketForwardEnabled ? "tmux迂回control-plane: ON" : "tmux迂回control-plane: OFF") {
+                        ctlSocketForwardEnabled.toggle()
+                        CtlSocketForwardSettings.restore()
+                    }
+                    .accessibilityIdentifier("ctlSocketForwardMenuItem")
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }

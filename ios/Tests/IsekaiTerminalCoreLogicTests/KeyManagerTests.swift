@@ -88,4 +88,6 @@ private actor KeyManagerAuthRecorder: SessionCallback {
     nonisolated func onNoViablePath() {}
     nonisolated func onForwardStateChanged(id: String, state: ForwardState) {}
     nonisolated func onAgentSignRequest(keyFingerprint: String) -> Bool { false }
+    nonisolated func onClipboardWrite(payload: ClipboardPayload) {}
+    nonisolated func onClipboardPullRequest() -> ClipboardPayload? { nil }
 }

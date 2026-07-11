@@ -218,7 +218,7 @@ final class TerminalSessionControllerTests: XCTestCase {
 
         let config = controller.makeIsekaiStunP2pConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
 
-        XCTAssertEqual(config.stunServer, "stun.example.com:3478")
+        XCTAssertEqual(config.stunServers, ["stun.example.com:3478"])
     }
 
     func testMakeIsekaiStunP2pConfigFallsBackToDefaultWhenStunServerIsNilOrBlank() throws {
@@ -231,8 +231,20 @@ final class TerminalSessionControllerTests: XCTestCase {
 
             let config = controller.makeIsekaiStunP2pConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
 
-            XCTAssertEqual(config.stunServer, defaultStunServer)
+            XCTAssertEqual(config.stunServers, [defaultStunServer])
         }
+    }
+
+    func testMakeIsekaiStunP2pConfigSplitsCommaSeparatedStunServerIntoMultipleEntries() throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 22, username: "user",
+            stunServer: "stun.example.com:3478, stun2.example.com:3478"
+        )
+        let controller = try makeControllerWithProfile(profile)
+
+        let config = controller.makeIsekaiStunP2pConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+        XCTAssertEqual(config.stunServers, ["stun.example.com:3478", "stun2.example.com:3478"])
     }
 
     // MARK: - Phase 1E-6(#45): MASQUE relay P2P(config構築のみ、実接続なし)

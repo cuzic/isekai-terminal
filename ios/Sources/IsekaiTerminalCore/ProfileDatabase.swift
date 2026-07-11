@@ -160,6 +160,20 @@ public struct ConnectionProfile: Codable, Equatable, Hashable, FetchableRecord, 
         !(jumpHost?.isEmpty ?? true)
     }
 
+    /// `stunServer`をカンマ/空白区切りで複数値としてパースしたもの。Android版
+    /// `ConnectionProfile.stunServers`と同じ方針(DBスキーマ/UIは単一テキスト欄のまま、
+    /// カンマ区切り入力を複数STUNサーバーとして扱う)。空/未設定なら
+    /// `defaultStunServer`1件にフォールバックする。先頭の1件が実際のSTUN+SSH
+    /// ランデブー穴あけ機構に使われ、残りは冗長性向上のための追加bootstrap candidate
+    /// としてのみ使われる(`isekai_stun_p2p_transport.rs`の`IsekaiStunP2pConfig::stun_servers`参照)。
+    public var stunServers: [String] {
+        let parsed = (stunServer ?? "")
+            .split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\n" || $0 == "\t" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return parsed.isEmpty ? [defaultStunServer] : parsed
+    }
+
     public init(
         id: Int64? = nil,
         displayName: String,
