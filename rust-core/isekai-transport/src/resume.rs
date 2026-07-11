@@ -60,11 +60,12 @@ use crate::proof::compute_proof;
 use crate::relay::{connect_and_handshake, random_session_id, read_exact, RelayTarget};
 
 /// `archive/HELPER_PROTOCOL.md` §7.3 control-stream frame markers. `RESUME`/
-/// `RESUME_ACK` already live in `isekai_protocol::resume` (Phase S-4a); these
-/// three are only used on the control stream itself and never overlap with
-/// the data stream's HELLO/ACK vocabulary, so — unlike `RESUME`/`RESUME_ACK`
-/// — they didn't need a pure-crate home ahead of time and are defined here,
-/// matching `rust-core/src/resume_client.rs`'s `pub(crate)` constants of the
+/// `RESUME_ACK` themselves now live in `quicmux::resume`
+/// (`quicmux-server-resume` Stage B); these three are only used on the
+/// control stream itself and never overlap with the data stream's HELLO/ACK
+/// vocabulary, so — unlike `RESUME`/`RESUME_ACK` — they didn't need a
+/// pure-crate home ahead of time and are defined here, matching
+/// `rust-core/src/resume_client.rs`'s `pub(crate)` constants of the
 /// same names/values byte-for-byte.
 pub const CONTROL_HELLO: u8 = 0x10;
 pub const CONTROL_ACK: u8 = 0x11;
