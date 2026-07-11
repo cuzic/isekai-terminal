@@ -1,0 +1,150 @@
+name: isekai-ssh / isekai-pipe release build
+
+# isekai-ssh(ssh(1)のProxyCommandに差し込む単体CLIバイナリ)と isekai-pipe
+# (connect/serveを提供するデータプレーンCLIバイナリ)の両方を、対応する全プラット
+# フォーム向けにビルドし、GitHub Actionsのartifactとして出力する。
+#
+# 対象(matrix.platform × matrix.bin の12組):
+#   - x86_64-pc-windows-msvc  (windows-latestでネイティブビルド)
+#   - x86_64-pc-windows-gnu   (ubuntu-latestからmingw-w64でクロスビルド)
+#   - x86_64-unknown-linux-musl / aarch64-unknown-linux-musl
+#       (ubuntu-latestからcargo-zigbuildで静的リンクビルド。既存の
+#        scripts/build-isekai-{ssh,pipe}-musl.sh と同じ手法)
+#   - x86_64-apple-darwin / aarch64-apple-darwin
+#       (macos-26。aarch64はランナーのネイティブターゲット、x86_64はクロス)
+#
+# isekai-pipeはWindows向けに`isekai-pipe/src/ctl.rs`のUNIXドメインソケット
+# 依存部分を`#[cfg(unix)]`でgateして初めてビルドできるようにした
+# (ctl socket forward機能自体はisekai-sshのctl_forward.rsと同じ「非対応
+# プラットフォームでは黙ってno-op」方針、CLAUDE.md参照)。
+#
+# push/PR毎には走らせない。バージョンタグ(`isekai-ssh-v*`/`isekai-pipe-v*`)
+# を打った時とworkflow_dispatchでの手動実行のみ。
+
+on:
+  push:
+    tags:
+      - "isekai-ssh-v*"
+      - "isekai-pipe-v*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        bin: [isekai-ssh, isekai-pipe]
+        platform:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: ".exe"
+            toolchain: msvc
+            shasum: "sha256sum"
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            ext: ".exe"
+            toolchain: mingw
+            shasum: "sha256sum"
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            ext: ""
+            toolchain: zig
+            shasum: "sha256sum"
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            ext: ""
+            toolchain: zig
+            shasum: "sha256sum"
+          - target: x86_64-apple-darwin
+            os: macos-26
+            ext: ""
+            toolchain: native
+            shasum: "shasum -a 256"
+          - target: aarch64-apple-darwin
+            os: macos-26
+            ext: ""
+            toolchain: native
+            shasum: "shasum -a 256"
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Add rust target
+        run: rustup target add ${{ matrix.platform.target }}
+
+      - name: Install mingw-w64 (windows-gnu cross build)
+        if: matrix.platform.toolchain == 'mingw'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Install zig (mlugg/setup-zig)
+        if: matrix.platform.toolchain == 'zig'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: latest
+
+      - name: Install cargo-zigbuild
+        if: matrix.platform.toolchain == 'zig'
+        run: cargo install cargo-zigbuild
+
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: release-build-${{ matrix.platform.target }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            release-build-${{ matrix.platform.target }}-
+
+      - name: Build (cargo build)
+        if: matrix.platform.toolchain != 'zig'
+        shell: bash
+        working-directory: rust-core
+        run: cargo build --release -p ${{ matrix.bin }} --bin ${{ matrix.bin }} --target ${{ matrix.platform.target }}
+
+      - name: Build (cargo zigbuild)
+        if: matrix.platform.toolchain == 'zig'
+        shell: bash
+        working-directory: rust-core
+        run: cargo zigbuild --release -p ${{ matrix.bin }} --bin ${{ matrix.bin }} --target ${{ matrix.platform.target }}
+
+      - name: Smoke test (--version)
+        # windows-gnuはubuntu-latestからのクロスビルドなので生成物を実行できない。
+        # 他の5組はビルドと同じホストで実行できる。
+        if: matrix.platform.toolchain != 'mingw'
+        shell: bash
+        working-directory: rust-core
+        run: ./target/${{ matrix.platform.target }}/release/${{ matrix.bin }}${{ matrix.platform.ext }} --version
+
+      - name: sha256 sidecar
+        shell: bash
+        working-directory: rust-core/target/${{ matrix.platform.target }}/release
+        run: ${{ matrix.platform.shasum }} ${{ matrix.bin }}${{ matrix.platform.ext }} | awk '{print $1}' > ${{ matrix.bin }}${{ matrix.platform.ext }}.sha256
+
+      - name: Upload ${{ matrix.bin }} (${{ matrix.platform.target }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.bin }}-${{ matrix.platform.target }}
+          path: |
+            rust-core/target/${{ matrix.platform.target }}/release/${{ matrix.bin }}${{ matrix.platform.ext }}
+            rust-core/target/${{ matrix.platform.target }}/release/${{ matrix.bin }}${{ matrix.platform.ext }}.sha256
+          retention-days: 90
