@@ -30,6 +30,10 @@ concurrency:
 
 permissions:
   contents: read
+  # DEBUG(一時的): tmate接続文字列をPRコメントとして中継するために必要
+  # (GitHub Actionsは実行中ジョブの生ログをAPI経由で取得できないため)。
+  # 原因特定後にpermissionsごと元に戻すこと。
+  pull-requests: write
 
 jobs:
   test:
@@ -88,13 +92,27 @@ jobs:
           bash rust-core/scripts/build-isekai-pipe-musl.sh
 
       # DEBUG(一時的): real_sshd_multihop_bootstrap_e2e.rsの原因究明のため、
-      # 実行環境へ対話的にSSH接続できるようにする。接続文字列はこのステップの
-      # ログに出力される。接続を閉じれば以降のステップへ自動的に進む。
-      # 原因特定後にこのステップは削除すること。
-      - name: DEBUG tmate session
+      # 実行環境へ対話的にSSH接続できるようにする。GitHub Actionsは実行中ジョブの
+      # 生ログをAPI経由で読めない(`gh run view --log`は完了後のみ)ため、
+      # detachedモードにして接続文字列を後続ステップでPRコメントとして中継する。
+      # 原因特定後にこれらのステップは削除すること。
+      - name: DEBUG tmate session (detached)
         uses: mxschmitt/action-tmate@v3
-        timeout-minutes: 20
+        with:
+          detached: true
 
-      - name: cargo test --workspace (excluding noq-multipath-spike)
-        working-directory: rust-core
-        run: cargo test --workspace --exclude noq-multipath-spike
+      - name: DEBUG relay tmate connection string via PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -x
+          CONN=""
+          for i in $(seq 1 15); do
+            CONN=$(tmate display -p '#{tmate_ssh}' 2>/dev/null || true)
+            [ -n "$CONN" ] && break
+            sleep 2
+          done
+          gh pr comment ${{ github.event.pull_request.number }} --body "DEBUG tmate: \`$CONN\`"
+
+      - name: DEBUG keep runner alive for interactive session
+        run: sleep 1200
