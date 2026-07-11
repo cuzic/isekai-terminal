@@ -265,14 +265,15 @@ pub async fn request_resume(
             read_exact(&mut recv, &mut committed).await.map_err(ResumeRequestError::Mux)?;
             let mut sent_offset = [0u8; 8];
             read_exact(&mut recv, &mut sent_offset).await.map_err(ResumeRequestError::Mux)?;
-            let mut replay_len = [0u8; 4];
-            read_exact(&mut recv, &mut replay_len).await.map_err(ResumeRequestError::Mux)?;
-            let mut replay = vec![0u8; u32::from_be_bytes(replay_len) as usize];
-            read_exact(&mut recv, &mut replay).await.map_err(ResumeRequestError::Mux)?;
+            // Replay bytes are *not* part of this frame — see
+            // `respond_resume_accepted`'s docs for why: they follow as plain,
+            // unframed continuation of this same stream, so a caller reading
+            // `ResumeAckOutcome::stream` normally afterward just sees them as
+            // ordinary application data, exactly as if the connection had
+            // never dropped.
             Ok(ResumeAckOutcome {
                 committed_offset: u64::from_be_bytes(committed),
                 sent_offset: u64::from_be_bytes(sent_offset),
-                replay,
                 stream: AnyByteStream::unsplit(recv, send),
             })
         }
@@ -288,17 +289,23 @@ pub async fn request_resume(
 }
 
 /// The result of a successful [`request_resume`]: the offsets the acceptor
-/// reported, the replay bytes to treat as continuing the previous data
-/// stream, and the still-open stream (recombined via [`AnyByteStream::unsplit`]
+/// reported, and the still-open stream (recombined via [`AnyByteStream::unsplit`]
 /// — split only transiently during the request/response exchange itself) to
 /// keep driving application traffic on — exactly the same connection the
 /// resume request itself was sent on, now repurposed as the ongoing data
 /// stream (mirrors `isekai-pipe`'s own `reconnect_and_resume`, whose
 /// `RESUME` frame and subsequent application data share one stream).
+///
+/// Deliberately has **no** `replay: Vec<u8>` field: the acceptor's replay
+/// bytes are *not* part of the `RESUME_ACK` frame this type is decoded
+/// from — see [`respond_resume_accepted`]'s docs for why — they instead
+/// arrive as ordinary, unframed data on `stream` itself, indistinguishable
+/// to the caller from any other bytes the peer sends. A caller reading
+/// `stream` normally after a successful resume sees them automatically;
+/// there is nothing separate to consume.
 pub struct ResumeAckOutcome {
     pub committed_offset: u64,
     pub sent_offset: u64,
-    pub replay: Vec<u8>,
     pub stream: AnyByteStream,
 }
 
@@ -307,7 +314,6 @@ impl std::fmt::Debug for ResumeAckOutcome {
         f.debug_struct("ResumeAckOutcome")
             .field("committed_offset", &self.committed_offset)
             .field("sent_offset", &self.sent_offset)
-            .field("replay_len", &self.replay.len())
             .finish_non_exhaustive()
     }
 }
@@ -355,18 +361,29 @@ pub async fn accept_resume(conn: &AnyMuxConnection, acceptor: &dyn ResumeAccepto
     }
 }
 
-/// Writes a [`FRAME_RESUME_ACK`] response. `pub` for the same reason as
-/// [`decode_resume_request`] — a caller integrating this into its own
-/// existing frame dispatch (rather than going through [`accept_resume`])
-/// still needs to send the response itself.
+/// Writes a [`FRAME_RESUME_ACK`] response, followed by `replay` as plain,
+/// unframed continuation of the same stream — deliberately **not** a
+/// length-prefixed field inside the ACK frame itself. A caller resuming a
+/// raw pass-through relay (every real caller in this workspace) just keeps
+/// reading the stream after a successful resume exactly like it would any
+/// other connection; from its point of view there is no distinction between
+/// "replayed" and "newly arriving" bytes, only a running byte offset — so
+/// framing replay as a separate structured field would force every such
+/// caller to un-frame it again before feeding it back into the same plain
+/// byte-stream abstraction it already uses everywhere else. `pub` for the
+/// same reason as [`decode_resume_request`] — a caller integrating this into
+/// its own existing frame dispatch (rather than going through
+/// [`accept_resume`]) still needs to send the response itself.
 pub async fn respond_resume_accepted(send: &mut AnyByteStreamWriteHalf, committed_offset: u64, sent_offset: u64, replay: &[u8]) -> Result<(), MuxError> {
-    let mut ack = Vec::with_capacity(1 + 8 + 8 + 4 + replay.len());
+    let mut ack = Vec::with_capacity(1 + 8 + 8);
     ack.push(FRAME_RESUME_ACK);
     ack.extend_from_slice(&committed_offset.to_be_bytes());
     ack.extend_from_slice(&sent_offset.to_be_bytes());
-    ack.extend_from_slice(&(replay.len() as u32).to_be_bytes());
-    ack.extend_from_slice(replay);
-    send.write_all(&ack).await
+    send.write_all(&ack).await?;
+    if !replay.is_empty() {
+        send.write_all(replay).await?;
+    }
+    Ok(())
 }
 
 /// Writes a [`FRAME_RESUME_REJECT`] response and waits for the peer to
@@ -695,16 +712,23 @@ mod noq_e2e_tests {
         let outcome = request_resume(&client_conn, b"session-42", b"proof-bytes", 300, 190).await.expect("resume should be accepted");
         assert_eq!(outcome.committed_offset, 100);
         assert_eq!(outcome.sent_offset, 200);
-        assert_eq!(outcome.replay, b"tail bytes");
         assert_eq!(acceptor.call_count.load(Ordering::SeqCst), 1);
 
         let mut server_stream = server_task.await.expect("server task panicked").expect("accept_resume should succeed");
+        let mut client_stream = outcome.stream;
+
+        // `replay` isn't a separate field on `ResumeAckOutcome` — it arrives
+        // as plain, unframed data on `stream` itself (see
+        // `respond_resume_accepted`'s docs). Read it back exactly like any
+        // other application data to prove that.
+        let mut buf = [0u8; 32];
+        let n = client_stream.read(&mut buf).await.expect("replay read failed");
+        assert_eq!(&buf[..n], b"tail bytes", "replay bytes should arrive as ordinary stream data");
+
         // Both sides should still be able to drive the same stream as an
         // ongoing data stream after the resume handshake — prove it with one
         // more write from the server side.
         server_stream.write_all(b"post-resume").await.expect("post-resume write failed");
-        let mut client_stream = outcome.stream;
-        let mut buf = [0u8; 32];
         let n = client_stream.read(&mut buf).await.expect("post-resume read failed");
         assert_eq!(&buf[..n], b"post-resume");
     }
