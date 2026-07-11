@@ -312,7 +312,13 @@ async fn wrapper_auto_bootstraps_through_a_real_two_hop_via_chain() {
     let mut stderr_log = String::new();
     for _ in 0..200 {
         let mut line = String::new();
-        match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
+        // 90s — see `real_sshd_bootstrap_e2e.rs`'s identical comment:
+        // `OpenSshBackend::install_and_launch` now does upload+reuse-check+
+        // launch as a single combined ssh(1) exec, so no stderr line at all
+        // appears between "deploying..." and "Registered" while that whole
+        // exec (here, through a 2-hop `-J` chain, so even more latency than
+        // the single-hop fixture) is in flight.
+        match tokio::time::timeout(Duration::from_secs(90), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
                 eprint!("[isekai-ssh stderr] {line}");

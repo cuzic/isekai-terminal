@@ -328,7 +328,23 @@ async fn wrapper_auto_bootstraps_the_real_binary_over_a_real_sshd() {
     let mut saw_registered = false;
     for _ in 0..200 {
         let mut line = String::new();
-        match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
+        // 90s (not this file's previous 20s): `OpenSshBackend::install_and_launch`
+        // now does the upload+reuse-check+launch as a single combined ssh(1)
+        // exec (`crate::reuse`'s module docs in `isekai-bootstrap`), so no
+        // stderr line at all is emitted between "deploying..." and
+        // "Registered" while that whole exec is in flight — unlike the two
+        // separate ssh(1) round trips this used to be split across. Timed
+        // directly against this exact fixture (real sshd, this workspace's
+        // own ~180MB debug `isekai-pipe` binary): a bare `install_and_start`
+        // call reliably completes within ~25s, but this sandbox's own
+        // variable build/agent load (`Concurrent agents on main` — several
+        // other agents routinely run `cargo` here too) pushed the old 20s
+        // budget into consistent, reproducible failures even though nothing
+        // was actually wrong. 90s matches this project's own established
+        // convention for opt-in real e2e tests under load (generous
+        // polling/timeouts rather than tightening around a happy-path
+        // measurement).
+        match tokio::time::timeout(Duration::from_secs(90), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
                 eprint!("[isekai-ssh stderr] {line}");
