@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- RemoteClipboardImagePolicy が書き出すクリップボード画像の一時ファイル置き場。
+         cacheDir 配下のみを公開する(それ以外のアプリ内部ストレージは公開しない)。 -->
+    <cache-path name="clipboard_images" path="clipboard-images/" />
+</paths>
