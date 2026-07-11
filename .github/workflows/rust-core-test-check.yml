@@ -93,10 +93,9 @@ jobs:
         # `target/debug/isekai-pipe`が存在しない場合、テスト本体の実行時に同期的に
         # `cargo build -p isekai-pipe`を呼んでその場でビルドする(sibling_bin_path)。
         # これ自体は正すべき無駄(テスト実行時間に数十秒〜数分の同期的コンパイルが
-        # 混ざる)なので事前ビルドしておく。当初はこれがreal_sshd_multihop_bootstrap_e2e.rs
-        # の断続的な"Broken pipe"失敗の原因と考えたが、tmateでCI実行環境へ対話的に入り
-        # 深掘りした結果、それだけでは説明が付かないことが判明した(未解決、詳細は
-        # PR #5の議論参照)。
+        # 混ざる)なので事前ビルドしておく。real_sshd_multihop_bootstrap_e2e.rsの
+        # 断続的な"Broken pipe"失敗の真因はこれとは別で、テストのshim ssh_config
+        # 自体の不備だった(同ファイルのdocコメント参照)。
         working-directory: rust-core
         run: cargo build -p isekai-pipe
 
