@@ -153,4 +153,14 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), ("a failed", "b failed"));
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn both_failing_in_phase_two_returns_both_errors() {
+        let fut_a = err_after(100, "a failed");
+        let fut_b = err_after(10, "b failed");
+
+        let result = race_with_stagger(fut_a, fut_b, Duration::from_millis(50)).await;
+
+        assert_eq!(result.unwrap_err(), ("a failed", "b failed"));
+    }
 }

@@ -168,15 +168,65 @@ impl QmuxConnection {
     }
 
     pub(crate) async fn export_keying_material(&self, label: &[u8], context: &[u8]) -> Result<[u8; 32], MuxError> {
-        if label == self.exporter_label.as_slice() && context.is_empty() {
-            Ok(self.exporter)
-        } else {
-            Err(MuxError::Unsupported {
-                operation: "export_keying_material",
-                reason: "the qmux backend only supports the single (label, context) pair captured at connect time \
-                          (qmux::Session::connect takes ownership of the TLS stream, so no later export is possible)",
-            })
-        }
+        keying_material_for(&self.exporter_label, self.exporter, label, context)
+    }
+}
+
+/// The fail-closed decision behind [`QmuxConnection::export_keying_material`]:
+/// only the exact `(label, context)` pair captured at connect time can ever be
+/// served (see this module's docs for why `qmux::Session::connect` makes any
+/// other export impossible after the fact). Split out from the method so it
+/// can be unit-tested without a live `qmux::Session`.
+fn keying_material_for(
+    captured_label: &[u8],
+    captured_material: [u8; 32],
+    requested_label: &[u8],
+    requested_context: &[u8],
+) -> Result<[u8; 32], MuxError> {
+    if requested_label == captured_label && requested_context.is_empty() {
+        Ok(captured_material)
+    } else {
+        Err(MuxError::Unsupported {
+            operation: "export_keying_material",
+            reason: "the qmux backend only supports the single (label, context) pair captured at connect time \
+                      (qmux::Session::connect takes ownership of the TLS stream, so no later export is possible)",
+        })
+    }
+}
+
+#[cfg(test)]
+mod keying_material_tests {
+    use super::*;
+
+    const CAPTURED_MATERIAL: [u8; 32] = [7u8; 32];
+    const CAPTURED_LABEL: &[u8] = b"captured-label";
+
+    #[test]
+    fn returns_the_captured_material_for_the_exact_label_and_empty_context() {
+        let result = keying_material_for(CAPTURED_LABEL, CAPTURED_MATERIAL, CAPTURED_LABEL, b"");
+
+        assert_eq!(result.unwrap(), CAPTURED_MATERIAL);
+    }
+
+    #[test]
+    fn fails_closed_on_a_different_label() {
+        let result = keying_material_for(CAPTURED_LABEL, CAPTURED_MATERIAL, b"some-other-label", b"");
+
+        assert!(matches!(result, Err(MuxError::Unsupported { operation: "export_keying_material", .. })));
+    }
+
+    #[test]
+    fn fails_closed_on_a_non_empty_context() {
+        let result = keying_material_for(CAPTURED_LABEL, CAPTURED_MATERIAL, CAPTURED_LABEL, b"nonempty");
+
+        assert!(matches!(result, Err(MuxError::Unsupported { operation: "export_keying_material", .. })));
+    }
+
+    #[test]
+    fn fails_closed_on_both_a_different_label_and_a_non_empty_context() {
+        let result = keying_material_for(CAPTURED_LABEL, CAPTURED_MATERIAL, b"some-other-label", b"nonempty");
+
+        assert!(matches!(result, Err(MuxError::Unsupported { operation: "export_keying_material", .. })));
     }
 }
 

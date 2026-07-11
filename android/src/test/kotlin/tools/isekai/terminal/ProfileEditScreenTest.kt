@@ -291,14 +291,14 @@ class ProfileEditScreenTest {
     @Test fun stunChip_hiddenField_untilSelected() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
         composeTestRule.onNodeWithText("STUN P2P QUIC（実験的）").assertExists()
-        composeTestRule.onNodeWithText("STUNサーバー（任意）").assertDoesNotExist()
+        composeTestRule.onNodeWithText("STUNサーバー（任意、複数はカンマ区切り）").assertDoesNotExist()
     }
 
     @Test fun stunChip_selecting_showsStunServerField() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
         composeTestRule.onNodeWithText("STUN P2P QUIC（実験的）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithText("STUNサーバー（任意）").assertExists()
+        composeTestRule.onNodeWithText("STUNサーバー（任意、複数はカンマ区切り）").assertExists()
     }
 
     @Test fun stunServerField_isOptional_saveButtonStillEnabled() {
@@ -324,7 +324,7 @@ class ProfileEditScreenTest {
         fields[3].performTextInput("root")
         composeTestRule.onNodeWithText("STUN P2P QUIC（実験的）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithText("STUNサーバー（任意）").performTextInput("stun.example.com:3478")
+        composeTestRule.onNodeWithText("STUNサーバー（任意、複数はカンマ区切り）").performTextInput("stun.example.com:3478")
         composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
         composeTestRule.waitUntil(5000) {
             composeTestRule.waitForIdle()

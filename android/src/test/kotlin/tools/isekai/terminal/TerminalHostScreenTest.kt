@@ -28,6 +28,7 @@ import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.ui.TerminalThemes
+import uniffi.isekai_terminal_core.ScreenUpdate
 
 /**
  * 複数タブUI([TerminalHostScreen])のタブ切り替え・クローズ・per-tab配色テーマ変更を検証する。
@@ -78,6 +79,37 @@ class TerminalHostScreenTest {
         composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
         composeTestRule.onNodeWithText("alpha").assertExists()
         composeTestRule.onNodeWithText("beta").assertExists()
+    }
+
+    // ── タブラベルのOSCタイトル反映(`ISEKAI_PIPE_DESIGN.md` Epic M)────────────
+    // `tabBar_rendersOneLabelPerOpenTab`はOSCタイトル未送信(null)時のプロファイル名
+    // フォールバックを既に検証している。ここでは (1) OSCタイトルがあれば優先表示 (2) 空/空白
+    // 文字列のタイトルはプロファイル名にフォールバックする、の2ケースを追加でカバーする。
+
+    @Test fun tabLabel_prefersOscTitleOverProfileLabel() {
+        vm.openTab(profile("alpha"))
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.onNodeWithText("alpha").assertExists()
+
+        // onScreenUpdateはconnected状態でないと無視される(TerminalSession.onScreenUpdate)ため、
+        // 先にconnectedにしてからタイトル更新を送る。
+        orchestrators[0].simulateConnected()
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "Remote Title", false, false))
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("Remote Title").assertExists()
+        composeTestRule.onNodeWithText("alpha").assertDoesNotExist()
+    }
+
+    @Test fun tabLabel_fallsBackToProfileLabel_whenOscTitleIsBlank() {
+        vm.openTab(profile("alpha"))
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+
+        orchestrators[0].simulateConnected()
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "   ", false, false))
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("alpha").assertExists()
     }
 
     @Test fun clickingInactiveTab_switchesActiveTab() {

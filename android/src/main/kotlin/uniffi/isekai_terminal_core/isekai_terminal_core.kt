@@ -654,7 +654,7 @@ internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod8 : com.sun.
     fun callback(`uniffiHandle`: Long,`keyFingerprint`: RustBuffer.ByValue,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod9 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`payload`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod10 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
@@ -696,7 +696,7 @@ internal interface UniffiCallbackInterfaceSessionCallbackMethod11 : com.sun.jna.
     fun callback(`uniffiHandle`: Long,`keyFingerprint`: RustBuffer.ByValue,`uniffiOutReturn`: ByteByReference,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceSessionCallbackMethod12 : com.sun.jna.Callback {
-    fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+    fun callback(`uniffiHandle`: Long,`payload`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
 internal interface UniffiCallbackInterfaceSessionCallbackMethod13 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
@@ -2087,10 +2087,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_agent_sign_request() != 31857) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_write() != 56361) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_write() != 19463) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_pull_request() != 24281) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_pull_request() != 18572) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_data() != 62372) {
@@ -2129,10 +2129,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_agent_sign_request() != 536) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_write() != 3663) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_write() != 38325) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_pull_request() != 20969) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_pull_request() != 57726) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -7270,6 +7270,49 @@ public object FfiConverterTypeCellData: FfiConverterRustBuffer<CellData> {
 
 
 
+/**
+ * クリップボードの中身1件(push時はリモートから受け取った内容、pull時はデバイス側の
+ * 現在のクリップボード内容)。`text: String`だった旧シグネチャを置き換える
+ * (画像は任意バイト列で運ぶ必要があり、UTF-8前提の`String`では表現できないため)。
+ */
+data class ClipboardPayload (
+    var `mime`: ClipboardMimeKind
+    , 
+    var `data`: kotlin.ByteArray
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeClipboardPayload: FfiConverterRustBuffer<ClipboardPayload> {
+    override fun read(buf: ByteBuffer): ClipboardPayload {
+        return ClipboardPayload(
+            FfiConverterTypeClipboardMimeKind.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ClipboardPayload) = (
+            FfiConverterTypeClipboardMimeKind.allocationSize(value.`mime`) +
+            FfiConverterByteArray.allocationSize(value.`data`)
+    )
+
+    override fun write(value: ClipboardPayload, buf: ByteBuffer) {
+            FfiConverterTypeClipboardMimeKind.write(value.`mime`, buf)
+            FfiConverterByteArray.write(value.`data`, buf)
+    }
+}
+
+
+
 data class CursorState (
     var `row`: kotlin.UInt
     , 
@@ -8239,6 +8282,47 @@ public object FfiConverterTypeTerminalFrameBatch: FfiConverterRustBuffer<Termina
             FfiConverterBoolean.write(value.`bell`, buf)
     }
 }
+
+
+
+/**
+ * OSC 52テキストクリップボード(`ClipboardMime::TextPlain`のみ)とtmux迂回チャンネル
+ * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M、`isekai_protocol::ClipboardMime`全種)の両方が
+ * 運べるmime種別。`isekai_protocol::ClipboardMime`をUniFFI境界越しにそのまま公開できない
+ * (isekai-protocolはuniffiに依存しないpure crate)ため、ここに同型を用意する。
+ */
+
+enum class ClipboardMimeKind {
+    
+    TEXT_PLAIN,
+    TEXT_HTML,
+    IMAGE_PNG;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeClipboardMimeKind: FfiConverterRustBuffer<ClipboardMimeKind> {
+    override fun read(buf: ByteBuffer) = try {
+        ClipboardMimeKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: ClipboardMimeKind) = 4UL
+
+    override fun write(value: ClipboardMimeKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
 
 
 
@@ -9470,16 +9554,20 @@ public interface OrchestratorCallback {
      * `ClipboardManager` へ書くかどうかの判断はKotlin側の責務(単なるイベント通知であり、
      * セッション/プロトコル状態ではないため`.claude/rules/rust-ssot.md`の対象外)。
      */
-    fun `onClipboardWrite`(`text`: kotlin.String)
+    fun `onClipboardWrite`(`payload`: ClipboardPayload)
     
     /**
-     * リモートが OSC 52 query(`ESC]52;c;?BEL`)でクリップボードの読み出しを要求した。
+     * リモートが OSC 52 query(`ESC]52;c;?BEL`)またはtmux迂回チャンネルの
+     * `ClipboardPullRequest`でクリップボードの読み出しを要求した。
      * `host_key`/`agent_sign_request`確認と同じ同期ブロッキング方式(Rust側の
      * `spawn_blocking`から呼ばれる)。opt-in設定が無効、またはクリップボードが
      * 空/取得不可なら`None`を返す(この場合デバイス側からは応答を一切送らない——
      * 何も返さない方が「機能の有無自体を教えない」という意味で安全なため)。
+     * OSC 52はテキスト専用プロトコルなので、`mime`が`TextPlain`以外の場合にOSC 52へ
+     * 応答するかどうかの判断はRust側(`session.rs`)が行う——Kotlin側は「今デバイスの
+     * クリップボードに何が入っているか」だけを返せばよい。
      */
-    fun `onClipboardPullRequest`(): kotlin.String?
+    fun `onClipboardPullRequest`(): ClipboardPayload?
     
     companion object
 }
@@ -9600,11 +9688,11 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
         }
     }
     internal object `onClipboardWrite`: UniffiCallbackInterfaceOrchestratorCallbackMethod9 {
-        override fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+        override fun callback(`uniffiHandle`: Long,`payload`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
             val makeCall = { ->
                 uniffiObj.`onClipboardWrite`(
-                    FfiConverterString.lift(`text`),
+                    FfiConverterTypeClipboardPayload.lift(`payload`),
                 )
             }
             val writeReturn = { _: Unit -> Unit }
@@ -9618,7 +9706,7 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
                 uniffiObj.`onClipboardPullRequest`(
                 )
             }
-            val writeReturn = { value: kotlin.String? -> uniffiOutReturn.setValue(FfiConverterOptionalString.lower(value)) }
+            val writeReturn = { value: ClipboardPayload? -> uniffiOutReturn.setValue(FfiConverterOptionalTypeClipboardPayload.lower(value)) }
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
@@ -9695,9 +9783,9 @@ public interface SessionCallback {
     
     fun `onAgentSignRequest`(`keyFingerprint`: kotlin.String): kotlin.Boolean
     
-    fun `onClipboardWrite`(`text`: kotlin.String)
+    fun `onClipboardWrite`(`payload`: ClipboardPayload)
     
-    fun `onClipboardPullRequest`(): kotlin.String?
+    fun `onClipboardPullRequest`(): ClipboardPayload?
     
     companion object
 }
@@ -9859,11 +9947,11 @@ internal object uniffiCallbackInterfaceSessionCallback {
         }
     }
     internal object `onClipboardWrite`: UniffiCallbackInterfaceSessionCallbackMethod12 {
-        override fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+        override fun callback(`uniffiHandle`: Long,`payload`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
             val uniffiObj = FfiConverterTypeSessionCallback.handleMap.get(uniffiHandle)
             val makeCall = { ->
                 uniffiObj.`onClipboardWrite`(
-                    FfiConverterString.lift(`text`),
+                    FfiConverterTypeClipboardPayload.lift(`payload`),
                 )
             }
             val writeReturn = { _: Unit -> Unit }
@@ -9877,7 +9965,7 @@ internal object uniffiCallbackInterfaceSessionCallback {
                 uniffiObj.`onClipboardPullRequest`(
                 )
             }
-            val writeReturn = { value: kotlin.String? -> uniffiOutReturn.setValue(FfiConverterOptionalString.lower(value)) }
+            val writeReturn = { value: ClipboardPayload? -> uniffiOutReturn.setValue(FfiConverterOptionalTypeClipboardPayload.lower(value)) }
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
@@ -10115,6 +10203,38 @@ public object FfiConverterOptionalByteArray: FfiConverterRustBuffer<kotlin.ByteA
         } else {
             buf.put(1)
             FfiConverterByteArray.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeClipboardPayload: FfiConverterRustBuffer<ClipboardPayload?> {
+    override fun read(buf: ByteBuffer): ClipboardPayload? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeClipboardPayload.read(buf)
+    }
+
+    override fun allocationSize(value: ClipboardPayload?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeClipboardPayload.allocationSize(value)
+        }
+    }
+
+    override fun write(value: ClipboardPayload?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeClipboardPayload.write(value, buf)
         }
     }
 }

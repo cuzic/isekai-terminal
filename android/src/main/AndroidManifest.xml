@@ -32,6 +32,18 @@
             android:name=".TerminalSessionService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <!-- クリップボード画像同期(`ISEKAI_PIPE_DESIGN.md` §8 Epic M follow-up)用。
+             リモートから受け取ったPNGを一時ファイルとして書き出し、他アプリの
+             ペースト操作から読める content:// URI を発行するためだけに使う。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="tools.isekai.terminal.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>
