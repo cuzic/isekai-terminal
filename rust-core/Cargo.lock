@@ -1756,6 +1756,7 @@ dependencies = [
  "noq",
  "parking_lot",
  "proptest",
+ "quicmux",
  "rand 0.8.6",
  "rcgen 0.13.2",
  "russh",
@@ -1788,6 +1789,7 @@ dependencies = [
  "log",
  "noq",
  "qmux",
+ "quicmux",
  "quicsock",
  "rand 0.8.6",
  "rcgen 0.13.2",
@@ -2735,6 +2737,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "quicmux"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "log",
+ "noq",
+ "qmux",
+ "rcgen 0.13.2",
+ "rustls",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "web-transport-trait",
 ]
 
 [[package]]
