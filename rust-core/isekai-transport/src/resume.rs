@@ -159,7 +159,7 @@ pub async fn connect_via_relay_resumable(
     requested_resume_grace_secs: u32,
     identity: crate::telemetry::CandidateIdentity<'_>,
 ) -> Result<ResumableRelaySession, TransportError> {
-    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await.map_err(TransportError::Mux)?;
+    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range)).await.map_err(TransportError::Mux)?;
     let (conn, data_stream, proof, effective_resume_grace_secs) = connect_and_handshake(
         &endpoint,
         RemoteSpec {
@@ -380,7 +380,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
                 id: &candidate.candidate_id,
             };
 
-            let endpoint = match factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await {
+            let endpoint = match factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(candidate.target.local_bind_port_range)).await {
                 Ok(endpoint) => endpoint,
                 Err(source) => {
                     // Binding our own local socket never touches the remote
@@ -614,7 +614,7 @@ pub async fn reconnect_and_resume(
     client_sent_offset: C2hSentOffset,
     client_delivered_offset: H2cClientDeliveredOffset,
 ) -> Result<ResumeAckOutcome, TransportError> {
-    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await.map_err(TransportError::Mux)?;
+    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range)).await.map_err(TransportError::Mux)?;
     let conn = endpoint
         .connect(RemoteSpec {
             addr: target.helper_addr,

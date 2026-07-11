@@ -177,6 +177,7 @@ async fn direct_wins_when_it_completes_within_the_stagger_window() {
             server_name: SNI.to_string(),
             cert_sha256_hex: relay_cert_hex,
             session_secret: SESSION_SECRET.to_vec(),
+            local_bind_port_range: None,
         },
     };
 
@@ -237,6 +238,7 @@ async fn relay_wins_when_direct_keeps_failing() {
             server_name: SNI.to_string(),
             cert_sha256_hex: relay_cert_hex,
             session_secret: SESSION_SECRET.to_vec(),
+            local_bind_port_range: None,
         },
     };
 

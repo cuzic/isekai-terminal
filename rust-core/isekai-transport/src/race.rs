@@ -151,7 +151,7 @@ async fn relay_attempt(
     identity: CandidateIdentity<'_>,
 ) -> Result<AnyByteStream, AttemptFailure> {
     let endpoint = factory
-        .create_endpoint(quicmux::BindSpec::any_ipv4())
+        .create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range))
         .await
         .map_err(|source| AttemptFailure::RetryablePreAttach { source: crate::error::TransportError::Mux(source) })?;
     let remote =

@@ -67,6 +67,13 @@ pub struct RelayTarget {
     pub cert_sha256_hex: String,
     /// Already base64-decoded `HandshakeJson::session_secret`.
     pub session_secret: Vec<u8>,
+    /// `None` binds to an OS-assigned ephemeral local port (the common
+    /// case); `Some((start, end))` narrows the outbound UDP port to that
+    /// inclusive range instead, e.g. so a caller behind a restrictive local
+    /// firewall/NAT can make the range small enough to permit explicitly
+    /// (`quicmux::BindSpec::port_range`'s docs). The client-side counterpart
+    /// of `isekai-helper --bind-port-range` on the remote side.
+    pub local_bind_port_range: Option<(u16, u16)>,
 }
 
 /// Establishes a fresh QUIC connection to `target.helper_addr`, pinned to
@@ -79,7 +86,7 @@ pub struct RelayTarget {
 /// handle — `archive/ISEKAI_SSH_DESIGN.md`'s S-0d-1 scope is "HELLO/proof/ACKまでの
 /// 接続確立だけでよい"; resume support lands in S-4a.
 pub async fn connect_via_relay(factory: &AnyMuxFactory, target: &RelayTarget) -> Result<AnyByteStream, TransportError> {
-    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await?;
+    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range)).await?;
     // No resume support on this path (module docs), so there is no grace
     // period to request — `0` ("no preference").
     let (_conn, stream, _proof, _effective_resume_grace_secs) = connect_and_handshake(
@@ -117,7 +124,7 @@ pub async fn connect_via_relay_with_connection(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
 ) -> Result<(AnyMuxConnection, AnyByteStream, Proof), TransportError> {
-    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await?;
+    let endpoint = factory.create_endpoint(quicmux::BindSpec::any_ipv4().with_port_range(target.local_bind_port_range)).await?;
     // No resume-grace preference from this entry point (module docs on
     // `connect_via_relay`) — the caller decides resume policy for itself via
     // whichever `resume::*` functions it calls afterward.

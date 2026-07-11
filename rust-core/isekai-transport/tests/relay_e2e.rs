@@ -149,6 +149,7 @@ async fn connect_via_relay_completes_hello_ack_over_a_real_quic_connection() {
         server_name: SNI.to_string(),
         cert_sha256_hex,
         session_secret,
+        local_bind_port_range: None,
     };
     let factory = system_quic_factory();
     let mut stream = tokio::time::timeout(Duration::from_secs(10), connect_via_relay(&factory, &target))
@@ -189,6 +190,7 @@ async fn connect_via_relay_fails_the_handshake_when_the_cert_pin_does_not_match(
         server_name: SNI.to_string(),
         cert_sha256_hex: wrong_fingerprint,
         session_secret: b"unused".to_vec(),
+        local_bind_port_range: None,
     };
     let factory = system_quic_factory();
     // `Box<dyn ByteStream>` (the success type) isn't `Debug`, so this can't
@@ -232,6 +234,7 @@ async fn connect_via_relay_surfaces_reject_auth_for_a_wrong_session_secret() {
         server_name: SNI.to_string(),
         cert_sha256_hex,
         session_secret: b"client-side-secret-does-not-match".to_vec(),
+        local_bind_port_range: None,
     };
     let factory = system_quic_factory();
     match tokio::time::timeout(Duration::from_secs(10), connect_via_relay(&factory, &target)).await {

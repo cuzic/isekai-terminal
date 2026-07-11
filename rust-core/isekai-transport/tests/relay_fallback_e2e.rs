@@ -78,6 +78,7 @@ fn candidate(id: &str, helper_addr: SocketAddr, cert_sha256_hex: String) -> Sequ
             server_name: SNI.to_string(),
             cert_sha256_hex,
             session_secret: SESSION_SECRET.to_vec(),
+            local_bind_port_range: None,
         },
         candidate_id: id.to_string(),
     }

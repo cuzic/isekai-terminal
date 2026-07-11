@@ -154,7 +154,7 @@ async fn connect_via_relay_completes_hello_ack_over_a_real_qmux_connection() {
 
     let server_task = tokio::spawn(run_mock_helper(listener, tls_config, session_secret.clone(), client_done_rx));
 
-    let target = RelayTarget { helper_addr, server_name: SNI.to_string(), cert_sha256_hex, session_secret };
+    let target = RelayTarget { helper_addr, server_name: SNI.to_string(), cert_sha256_hex, session_secret, local_bind_port_range: None };
     let factory = qmux_relay_factory();
     let mut stream = tokio::time::timeout(Duration::from_secs(10), connect_via_relay(&factory, &target))
         .await
@@ -192,6 +192,7 @@ async fn connect_via_relay_fails_the_handshake_when_the_cert_pin_does_not_match(
         server_name: SNI.to_string(),
         cert_sha256_hex: wrong_fingerprint,
         session_secret: b"unused".to_vec(),
+        local_bind_port_range: None,
     };
     let factory = qmux_relay_factory();
     match tokio::time::timeout(Duration::from_secs(10), connect_via_relay(&factory, &target)).await {
@@ -228,6 +229,7 @@ async fn connect_via_relay_surfaces_reject_auth_for_a_wrong_session_secret() {
         server_name: SNI.to_string(),
         cert_sha256_hex,
         session_secret: b"client-side-secret-does-not-match".to_vec(),
+        local_bind_port_range: None,
     };
     let factory = qmux_relay_factory();
     match tokio::time::timeout(Duration::from_secs(10), connect_via_relay(&factory, &target)).await {

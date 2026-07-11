@@ -326,6 +326,7 @@ async fn resume_survives_a_client_initiated_disconnect_and_relay_continues() {
         server_name: SNI.to_string(),
         cert_sha256_hex,
         session_secret,
+        local_bind_port_range: None,
     };
     let factory = system_quic_factory();
 
@@ -404,7 +405,7 @@ async fn reconnect_and_resume_fails_for_an_unknown_session_id() {
 
     tokio::spawn(run_mock_helper(endpoint, session_secret.clone(), sessions));
 
-    let target = RelayTarget { helper_addr, server_name: SNI.to_string(), cert_sha256_hex, session_secret };
+    let target = RelayTarget { helper_addr, server_name: SNI.to_string(), cert_sha256_hex, session_secret, local_bind_port_range: None };
     let factory = system_quic_factory();
 
     let bogus_session_id = SessionId::from_bytes([0xABu8; SESSION_ID_LEN]);
