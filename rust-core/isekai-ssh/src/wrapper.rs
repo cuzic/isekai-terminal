@@ -135,6 +135,13 @@ struct IsekaiConfig {
     /// *local* port-range setting for `isekai-pipe connect`'s own outbound
     /// bind on this machine.
     remote_bind_port_range: Option<(u16, u16)>,
+    /// `#@isekai local-bind-port-range` (`ConnectionIntent::local_bind_port_range`,
+    /// `isekai-pipe connect`'s own outbound QUIC socket). `None` leaves this
+    /// side on an OS-assigned ephemeral UDP port. The client-side
+    /// counterpart of `remote_bind_port_range` — this machine's own
+    /// firewall/NAT is the thing being accommodated here, not the remote
+    /// host's.
+    local_bind_port_range: Option<(u16, u16)>,
     /// `#@isekai ctl-socket yes` (`ISEKAI_PIPE_DESIGN.md` §8 Epic M):
     /// opt-in, default off. Requests a per-invocation `-R` UNIX domain
     /// socket forward carrying the title/clipboard control-plane, so it
@@ -482,6 +489,7 @@ pub(crate) fn build_connection_intent(resolution: &WrapperResolution) -> Result<
     intent.candidate_race_delay_ms = resolution.isekai.candidate_race_delay_ms;
     intent.relay_delay_ms = resolution.isekai.relay_delay_ms;
     intent.resume_grace_secs = resolution.isekai.resume_grace_secs;
+    intent.local_bind_port_range = resolution.isekai.local_bind_port_range;
     Ok(intent)
 }
 
@@ -1018,6 +1026,7 @@ fn resolve_isekai_config(
         ctl_socket_enabled: None,
         remote_log_level: None,
         remote_bind_port_range: None,
+        local_bind_port_range: None,
     };
     for directive in directives {
         apply_isekai_directive(&mut builder, directive)?;
@@ -1077,6 +1086,7 @@ fn resolve_isekai_config(
         ctl_socket_enabled: builder.ctl_socket_enabled.unwrap_or(false),
         remote_log_level: builder.remote_log_level.unwrap_or_else(|| "info".to_string()),
         remote_bind_port_range: builder.remote_bind_port_range,
+        local_bind_port_range: builder.local_bind_port_range,
     })
 }
 
@@ -1100,6 +1110,7 @@ struct IsekaiConfigBuilder {
     ctl_socket_enabled: Option<bool>,
     remote_log_level: Option<String>,
     remote_bind_port_range: Option<(u16, u16)>,
+    local_bind_port_range: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1216,6 +1227,11 @@ fn apply_isekai_directive(
             &mut builder.remote_bind_port_range,
             parse_bind_port_range(one_arg(&directive)?)?,
             "remote-bind-port-range",
+        ),
+        "local-bind-port-range" => set_once(
+            &mut builder.local_bind_port_range,
+            parse_bind_port_range(one_arg(&directive)?)?,
+            "local-bind-port-range",
         ),
         other => Err(anyhow!("isekai-ssh: unknown #@isekai directive {other:?}")),
     }
@@ -1728,6 +1744,7 @@ mod tests {
                 ctl_socket_enabled: false,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
+                local_bind_port_range: None,
             },
         };
 
@@ -1782,6 +1799,7 @@ mod tests {
                 ctl_socket_enabled: false,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
+                local_bind_port_range: None,
             },
         };
 
@@ -1937,6 +1955,7 @@ mod tests {
                 ctl_socket_enabled: false,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
+                local_bind_port_range: None,
             },
         };
         let intent = build_connection_intent(&resolution).unwrap();
@@ -1994,6 +2013,7 @@ mod tests {
         // | `install-mode`         | `resolve_isekai_config`'s fail-closed check for `system` (see `install_mode_system_is_rejected_at_config_resolution`); `user` needs no plumbing (already the only implemented behavior) |
         // | `remote-log-level`     | `bootstrap_and_register` (bootstrap-time only; `isekai-helper --log-level`, no `ConnectionIntent` field exists for it) |
         // | `remote-bind-port-range` | `bootstrap_and_register` (bootstrap-time only; `isekai-helper --bind-port-range`, no `ConnectionIntent` field exists for it) |
+        // | `local-bind-port-range` | (a) `intent.local_bind_port_range`                                                |
         //
         // If a new directive is ever added to `apply_isekai_directive`
         // without a corresponding row above (and without extending whichever
@@ -2009,6 +2029,7 @@ mod tests {
             resume_grace_secs: 999,
             candidate_race_delay_ms: 987,
             relay_delay_ms: 8765,
+            local_bind_port_range: Some((40100, 40200)),
             ..resolution.isekai.clone()
         };
         let distinctive_intent = build_connection_intent(&WrapperResolution {
@@ -2032,6 +2053,10 @@ mod tests {
             "candidate-race-delay directive"
         );
         assert_ne!(intent.relay_delay_ms, distinctive_intent.relay_delay_ms, "relay-delay directive");
+        assert_ne!(
+            intent.local_bind_port_range, distinctive_intent.local_bind_port_range,
+            "local-bind-port-range directive"
+        );
 
         if let Some(old_home) = old_home {
             std::env::set_var("HOME", old_home);
@@ -2162,6 +2187,7 @@ mod tests {
                 ctl_socket_enabled: false,
                 remote_log_level: "info".to_string(),
                 remote_bind_port_range: None,
+                local_bind_port_range: None,
             },
         };
 

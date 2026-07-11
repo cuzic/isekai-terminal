@@ -298,11 +298,12 @@ Host production
 | `ctl-socket` | `yes`\|`no` | `no` | `yes` にすると、リモートの対話シェルから `isekai-pipe ctl title "<text>"` / `isekai-pipe ctl clip push --mime <mime>` を実行することで、tmux を経由せず直接ローカルのタブ/ターミナルのタイトルやクリップボードへ反映できるよう per-タブの UNIX domain socket forward(`-R`)を張る(`ISEKAI_PIPE_DESIGN.md` §8 Epic M参照)。明示的なリモートコマンドを指定した呼び出し(`isekai-ssh host 'some command'`)や unix 系以外の OS では黙って無効化される(opportunistic fallback) |
 | `remote-log-level` | `error`\|`warn`\|`info`\|`debug`\|`trace` | `info` | 自動 bootstrap で起動するリモート側 `isekai-pipe serve` の `--log-level`。接続不良の切り分け時だけ `debug`/`trace` に上げ、常用ホストでは既定(`info`)のままにしておくのが推奨(ホストごとに設定できる) |
 | `remote-bind-port-range` | `<START>-<END>`(例 `40000-40100`) | なし(OSが割り当てる ephemeral port) | 自動 bootstrap で起動するリモート側 `isekai-pipe serve --bind-port-range`。この範囲だけをホスト側ファイアウォールで許可すればよくなる(既定は Linux の ephemeral port range 全体を開ける必要がある) |
+| `local-bind-port-range` | `<START>-<END>`(例 `40000-40100`) | なし(OSが割り当てる ephemeral port) | `isekai-ssh`(`isekai-pipe connect`)自身がこのマシンで張るQUICソケットのbindポート範囲。手元のファイアウォール/NATが outbound UDP を特定範囲にしか通さない場合に使う。`remote-bind-port-range` とは独立した設定(片方だけ・両方同時に設定してよい) |
 
 `bootstrap-candidate`/`link`/`rendezvous`/`stun`/`relay`/`service` は複数行書くと追記されていく。
 それ以外(`enabled`/`bootstrap-policy`/`profile`/`remote-path`/`resume-grace`/
 `candidate-race-delay`/`relay-delay`/`install-mode`/`ctl-socket`/`remote-log-level`/
-`remote-bind-port-range`)は最初に出てきた値が採用される
+`remote-bind-port-range`/`local-bind-port-range`)は最初に出てきた値が採用される
 (OpenSSH 本体の `Host`/`Match` と同じ first-value-wins 規則)。
 
 ### オプション: STUN による低遅延 P2P(`--mode stun`)
