@@ -46,6 +46,15 @@ const RESUME_BACKOFF: BackoffPolicy = BackoffPolicy {
     jitter: 0.0,
 };
 const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How often `run_resume_loop`'s background task calls
+/// `WarmStandby::ensure_warm` while `--tethering-interface` is set. Matches
+/// the "~15-30s while the primary looks healthy" half of the
+/// `pc-tethering-warm-standby-design` memory's agreed tiering — the more
+/// aggressive "~1-3s once the primary looks like it's degrading" half is not
+/// implemented (this loop has no independent signal that the primary is
+/// degrading, only that it's already dead, at which point promotion is
+/// already being attempted).
+const WARM_STANDBY_PROBE_INTERVAL: Duration = Duration::from_secs(20);
 
 fn print_help() {
     println!("isekai-pipe - data plane for isekai-ssh");
@@ -106,6 +115,17 @@ struct ConnectLaunch {
     /// is chosen once up front — never retried automatically if the `Udp`
     /// path fails.
     relay_transport: RelayTransportKind,
+    /// `--tethering-interface <NAME>` (experimental, default off, relay mode
+    /// only): keeps a second, independent connection to the same relay
+    /// target warm on this specific physical interface
+    /// (`isekai_transport::WarmStandby`) and promotes it — no fresh dial, no
+    /// backoff wait — the instant the primary connection dies, before
+    /// falling back to the ordinary `reconnect_and_resume` retry loop. Meant
+    /// for PC Wi-Fi + USB/Bluetooth tethering failover (this session's
+    /// `pc-tethering-warm-standby-design` memory); has no effect in `--mode
+    /// stun` (STUN P2P has no resume/control-stream concept at all, see
+    /// `stun_p2p.rs`'s module docs).
+    tethering_interface: Option<String>,
 }
 
 /// See `ConnectLaunch::relay_transport`'s doc comment.
@@ -179,6 +199,7 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
     let mut resume_window = DEFAULT_RESUME_WINDOW;
     let mut experimental_network_rebind = false;
     let mut relay_transport = RelayTransportKind::default();
+    let mut tethering_interface: Option<String> = None;
     let mut iter = args.peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -209,6 +230,15 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 );
                 println!(
                     "                                   (EXPERIMENTAL, unverified wire compat with the deployed relay)"
+                );
+                println!(
+                    "    --tethering-interface <NAME>   keep a warm-standby connection on this physical interface,"
+                );
+                println!(
+                    "                                   promoted instantly on primary failure (relay mode only,"
+                );
+                println!(
+                    "                                   default off)"
                 );
                 return Ok(None);
             }
@@ -276,6 +306,16 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                     ExitCode::from(EX_USAGE)
                 })?;
             }
+            "--tethering-interface" => {
+                let value = next_arg("connect", &mut iter, &arg).map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                if tethering_interface.replace(value).is_some() {
+                    eprintln!("isekai-pipe connect: only one --tethering-interface is supported");
+                    return Err(ExitCode::from(EX_USAGE));
+                }
+            }
             "--listen" => {
                 eprintln!(
                     "isekai-pipe connect: --listen is not wired to the legacy connect runtime yet"
@@ -323,7 +363,30 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
         resume_window,
         experimental_network_rebind,
         relay_transport,
+        tethering_interface,
     }))
+}
+
+/// Resolves `--tethering-interface`'s raw interface name (e.g. `wlan1`,
+/// `en5`) to the `InterfaceIndex` `isekai_transport::WarmStandby` needs, via
+/// the same OS-level interface enumeration `physical_interface.rs`'s own
+/// tests use. A name that doesn't match any currently-visible interface is a
+/// user configuration error, not a runtime condition to fall back from
+/// silently (matches `WarmStandby::new_bound_to_interface`'s own "fail loud
+/// on backend/capability mismatch" stance) — reported once, up front, rather
+/// than surfacing later as an opaque `MuxError::Bind` deep inside the resume
+/// loop. Resolved lazily inside `run_connect` (rather than during
+/// `parse_connect`, which stays pure string parsing with no I/O, matching
+/// every other flag there) since it needs a real syscall to enumerate
+/// interfaces.
+fn resolve_tethering_interface(name: &str) -> Result<isekai_transport::InterfaceIndex> {
+    isekai_transport::physical_interface::quicsock::discovery::list_interfaces()
+        .into_iter()
+        .find(|(_, iface)| iface.name == name)
+        .map(|(index, _)| index)
+        .ok_or_else(|| {
+            anyhow::anyhow!("isekai-pipe connect: --tethering-interface {name:?} does not match any known network interface")
+        })
 }
 
 async fn connect_command(args: impl Iterator<Item = String>) -> ExitCode {
@@ -482,6 +545,11 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
     // `ISEKAI_PIPE_DESIGN.md` task #17) — decoded once here from the intent
     // and threaded alongside whichever candidate is selected.
     let session_secret = decode_secret(intent_session_secret_b64(&intent.transport))?;
+    let tethering_interface = launch
+        .tethering_interface
+        .as_deref()
+        .map(resolve_tethering_interface)
+        .transpose()?;
 
     match choose_connect_route(&intent) {
         ConnectRoute::RelayWithFallback => {
@@ -492,6 +560,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                 intent.resume_grace_secs,
                 launch.experimental_network_rebind,
                 launch.relay_transport,
+                tethering_interface,
             )
             .await
             .context("isekai-pipe connect: relay transport (with fallback) failed");
@@ -505,6 +574,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                 "STUN P2P transport (with fallback)",
                 launch.experimental_network_rebind,
                 launch.relay_transport,
+                tethering_interface,
             )
             .await;
         }
@@ -533,6 +603,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
             identity,
             launch.experimental_network_rebind,
             launch.relay_transport,
+            tethering_interface,
         )
         .await
         .context("isekai-pipe connect: relay transport failed"),
@@ -559,6 +630,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                         "STUN P2P transport",
                         launch.experimental_network_rebind,
                         launch.relay_transport,
+                        tethering_interface,
                     )
                     .await
                 }
@@ -581,6 +653,7 @@ async fn recover_via_cross_family_fallback(
     context_label: &str,
     experimental_network_rebind: bool,
     relay_transport: RelayTransportKind,
+    tethering_interface: Option<isekai_transport::InterfaceIndex>,
 ) -> Result<()> {
     let Err(primary_err) = result else { return Ok(()) };
     let Some(IntentTransport::Relay { helper_addr, server_name, session_secret_b64 }) = &intent.cross_family_fallback else {
@@ -610,6 +683,7 @@ async fn recover_via_cross_family_fallback(
         identity,
         experimental_network_rebind,
         relay_transport,
+        tethering_interface,
     )
     .await
     .with_context(|| format!("isekai-pipe connect: {context_label} failed ({primary_err:#}), and the cross-family relay fallback also failed"))
@@ -1326,13 +1400,14 @@ async fn run_relay_resumable(
     identity: isekai_transport::CandidateIdentity<'_>,
     experimental_network_rebind: bool,
     relay_transport: RelayTransportKind,
+    tethering_interface: Option<isekai_transport::InterfaceIndex>,
 ) -> Result<()> {
     let factory = relay_endpoint_factory(relay_transport);
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
     let established = connect_via_relay_resumable(&factory, target, requested, identity)
         .await
         .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(&factory, target, profile, established, experimental_network_rebind).await
+    run_resume_loop(&factory, target, profile, established, experimental_network_rebind, tethering_interface).await
 }
 
 /// Like `run_relay_resumable`, but tries `candidates` in priority order
@@ -1347,6 +1422,7 @@ async fn run_relay_resumable_with_fallback(
     requested_resume_grace_secs: u64,
     experimental_network_rebind: bool,
     relay_transport: RelayTransportKind,
+    tethering_interface: Option<isekai_transport::InterfaceIndex>,
 ) -> Result<()> {
     let factory = relay_endpoint_factory(relay_transport);
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
@@ -1354,7 +1430,7 @@ async fn run_relay_resumable_with_fallback(
         connect_via_relay_resumable_with_fallback(&factory, candidates, requested)
             .await
             .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind).await
+    run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind, tethering_interface).await
 }
 
 /// Like the single-candidate `CandidateRoute::StunP2p` path in `run_connect`,
@@ -1501,12 +1577,33 @@ fn spawn_reconnect_signal<R: Rebindable + 'static>(
     (handle, rx)
 }
 
+/// Writes `replay`'s buffered-but-unacknowledged bytes past `committed_offset`
+/// onto a freshly (re)established `stream`, then discards them from `replay`
+/// on success — shared by both `run_resume_loop`'s `WarmStandby::promote`
+/// fast path and its ordinary `reconnect_and_resume` retry loop below, since
+/// both hand back a resumed connection with the same "helper says it
+/// committed up to X" offset semantics. Returns `false` (leaving `replay`
+/// untouched past `committed_offset`) if the write itself fails, so the
+/// caller knows to discard `stream` and retry instead of treating it as
+/// live.
+async fn replay_and_advance(replay: &Mutex<C2hReplayBuffer>, committed_offset: u64, stream: &mut AnyByteStream) -> bool {
+    let to_replay = replay.lock().unwrap().replay_from(committed_offset);
+    if let Some(bytes) = to_replay {
+        if !bytes.is_empty() && stream.write_all(&bytes).await.is_err() {
+            return false;
+        }
+    }
+    replay.lock().unwrap().advance_start(committed_offset);
+    true
+}
+
 async fn run_resume_loop(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
     profile: &str,
     established: isekai_transport::ResumableRelaySession,
     experimental_network_rebind: bool,
+    tethering_interface: Option<isekai_transport::InterfaceIndex>,
 ) -> Result<()> {
     let session_id = established.session_id;
     drop(established.connection);
@@ -1528,6 +1625,27 @@ async fn run_resume_loop(
     let mut disconnected_since: Option<Instant> = None;
     let mut attempt: u32 = 0;
     let mut network_rebinder = established.network_rebinder;
+
+    // `--tethering-interface`: keeps a second connection warm on a specific
+    // physical interface and promotes it (no fresh dial, no backoff wait) as
+    // the first thing tried on disconnect, below — see `warm_standby.rs`'s
+    // module docs. `None` when the flag wasn't given; every use below is a
+    // no-op in that case, matching this codebase's "opportunistic,
+    // default-off" convention for experimental features.
+    let warm_standby = tethering_interface
+        .map(|iface| Arc::new(isekai_transport::WarmStandby::new_bound_to_interface(factory.clone(), target.clone(), session_id, iface)));
+    let warm_standby_task = warm_standby.clone().map(|ws| {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(WARM_STANDBY_PROBE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(e) = ws.ensure_warm().await {
+                    log::warn!("isekai-pipe connect: warm-standby ensure_warm failed: {e:#}");
+                }
+            }
+        })
+    });
 
     loop {
         // See `spawn_reconnect_signal`'s docs for the full design rationale
@@ -1555,65 +1673,100 @@ async fn run_resume_loop(
         app_ack_tasks.abort();
 
         if outcome.is_ok() {
+            if let Some(t) = &warm_standby_task {
+                t.abort();
+            }
             return Ok(());
         }
 
+        // The resume window's clock starts here, at disconnect detection —
+        // before the fast-path promote attempt below, not after it, so a
+        // slow-to-fail promote still counts against the deadline the same as
+        // a slow-to-fail `reconnect_and_resume` attempt would.
         let deadline = *disconnected_since.get_or_insert_with(Instant::now) + resume_window;
-        let new_stream = loop {
-            let now = Instant::now();
-            if now >= deadline {
-                let exceeded_by = now.saturating_duration_since(deadline);
-                eprintln!(
-                    "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
-                     the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}. \
-                     Closing stdin/stdout; ssh will treat this as a lost connection."
-                );
-                let _ = stdout.shutdown().await;
-                drop(stdin);
-                return Ok(());
-            }
 
-            let delay = RESUME_BACKOFF.base_delay(attempt).min(deadline - now);
-            attempt = attempt.saturating_add(1);
-            tokio::time::sleep(delay).await;
-
+        // Fast path: promote the already-warm standby connection instead of
+        // waiting through the backoff loop below — the entire point of
+        // keeping one warm (`warm_standby.rs`'s module docs). A missing
+        // standby, an in-flight promotion, or a transport failure all fall
+        // straight through to the ordinary `reconnect_and_resume` retry loop
+        // unchanged; this is a latency optimization, not a correctness
+        // dependency.
+        let mut promoted_stream = None;
+        if let Some(ws) = &warm_standby {
             let client_sent_offset = C2hSentOffset::new(replay.lock().unwrap().end_offset());
-            let client_delivered_offset =
-                H2cClientDeliveredOffset::new(counters.h2c_client_delivered_offset());
-            match reconnect_and_resume(
-                factory,
-                target,
-                session_id,
-                client_sent_offset,
-                client_delivered_offset,
-            )
-            .await
-            {
-                Ok(mut resumed) => {
-                    drop(resumed.connection);
-                    let to_replay = {
-                        replay
-                            .lock()
-                            .unwrap()
-                            .replay_from(resumed.helper_committed_offset.get())
-                    };
-                    if let Some(bytes) = to_replay {
-                        if !bytes.is_empty() && resumed.data_stream.write_all(&bytes).await.is_err()
-                        {
-                            continue;
-                        }
+            let client_delivered_offset = H2cClientDeliveredOffset::new(counters.h2c_client_delivered_offset());
+            match ws.promote(client_sent_offset, client_delivered_offset).await {
+                Ok(mut promoted) => {
+                    drop(promoted.connection);
+                    if replay_and_advance(&replay, promoted.helper_committed_offset.get(), &mut promoted.data_stream).await {
+                        log::info!("isekai-pipe connect: promoted warm-standby connection for session_id={session_id}");
+                        // The promoted connection was dialed directly by
+                        // `WarmStandby`, not via the endpoint this
+                        // generation's `network_rebinder` came from — no
+                        // rebinder to carry over; the next disconnect just
+                        // falls back to a full resume, same as any other
+                        // rebinder-less generation.
+                        network_rebinder = None;
+                        promoted_stream = Some(promoted.data_stream);
+                    } else {
+                        eprintln!("isekai-pipe connect: warm-standby promote succeeded but replay failed; falling back to full resume");
                     }
-                    replay
-                        .lock()
-                        .unwrap()
-                        .advance_start(resumed.helper_committed_offset.get());
-                    network_rebinder = resumed.network_rebinder;
-                    break resumed.data_stream;
                 }
                 Err(e) => {
-                    eprintln!("isekai-pipe connect: resume attempt {attempt} failed: {e:#}");
+                    log::info!("isekai-pipe connect: warm-standby promote unavailable ({e:#}); falling back to full resume");
                 }
             }
+        }
+
+        let new_stream = match promoted_stream {
+            Some(stream) => stream,
+            None => loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    let exceeded_by = now.saturating_duration_since(deadline);
+                    eprintln!(
+                        "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
+                         the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}. \
+                         Closing stdin/stdout; ssh will treat this as a lost connection."
+                    );
+                    let _ = stdout.shutdown().await;
+                    drop(stdin);
+                    if let Some(t) = &warm_standby_task {
+                        t.abort();
+                    }
+                    return Ok(());
+                }
+
+                let delay = RESUME_BACKOFF.base_delay(attempt).min(deadline - now);
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(delay).await;
+
+                let client_sent_offset = C2hSentOffset::new(replay.lock().unwrap().end_offset());
+                let client_delivered_offset =
+                    H2cClientDeliveredOffset::new(counters.h2c_client_delivered_offset());
+                match reconnect_and_resume(
+                    factory,
+                    target,
+                    session_id,
+                    client_sent_offset,
+                    client_delivered_offset,
+                )
+                .await
+                {
+                    Ok(mut resumed) => {
+                        drop(resumed.connection);
+                        if !replay_and_advance(&replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
+                            continue;
+                        }
+                        network_rebinder = resumed.network_rebinder;
+                        break resumed.data_stream;
+                    }
+                    Err(e) => {
+                        eprintln!("isekai-pipe connect: resume attempt {attempt} failed: {e:#}");
+                    }
+                }
+            },
         };
 
         data_stream = new_stream;
@@ -2495,6 +2648,50 @@ mod tests {
     }
 
     #[test]
+    fn connect_tethering_interface_defaults_to_none() {
+        let launch = parse_connect_args(&["production", "--service", "ssh", "--stdio"]);
+        assert_eq!(launch.tethering_interface, None);
+    }
+
+    #[test]
+    fn connect_tethering_interface_parses() {
+        let launch = parse_connect_args(&[
+            "production",
+            "--service",
+            "ssh",
+            "--stdio",
+            "--tethering-interface",
+            "wlan1",
+        ]);
+        assert_eq!(launch.tethering_interface.as_deref(), Some("wlan1"));
+    }
+
+    #[test]
+    fn connect_tethering_interface_rejects_a_second_occurrence() {
+        let result = parse_connect(
+            [
+                "production",
+                "--service",
+                "ssh",
+                "--stdio",
+                "--tethering-interface",
+                "wlan1",
+                "--tethering-interface",
+                "wlan2",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_tethering_interface_fails_loud_for_an_unknown_name() {
+        let err = resolve_tethering_interface("definitely-not-a-real-interface-name").unwrap_err();
+        assert!(format!("{err:#}").contains("does not match any known network interface"));
+    }
+
+    #[test]
     fn connect_accepts_positional_profile_for_compatibility() {
         let launch = parse_connect_args(&["production", "--service", "ssh", "--stdio"]);
 
@@ -3004,7 +3201,7 @@ mod tests {
     #[tokio::test]
     async fn recover_via_cross_family_fallback_passes_success_through_untouched() {
         let intent = sample_stun_primary_intent();
-        let result = recover_via_cross_family_fallback(Ok(()), &intent, "STUN P2P transport", false, RelayTransportKind::Udp).await;
+        let result = recover_via_cross_family_fallback(Ok(()), &intent, "STUN P2P transport", false, RelayTransportKind::Udp, None).await;
         assert!(result.is_ok(), "{result:?}");
     }
 
@@ -3019,6 +3216,7 @@ mod tests {
             "STUN P2P transport",
             false,
             RelayTransportKind::Udp,
+            None,
         )
         .await;
 
@@ -3044,6 +3242,7 @@ mod tests {
             "STUN P2P transport",
             false,
             RelayTransportKind::Udp,
+            None,
         )
         .await;
 
