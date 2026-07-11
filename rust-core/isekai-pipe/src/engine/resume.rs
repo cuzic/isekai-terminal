@@ -257,7 +257,17 @@ impl SessionTable {
     /// 破棄する（TCP 接続を close して session_id をテーブルから除く）。
     /// アクティブなセッション（`parked_tcp` が `None`）には触れない。
     /// HELPER_PROTOCOL.md §7.5「一定時間 resume が来なければ破棄する」の実装。
-    pub async fn sweep_expired_parked(&self, max_parked: std::time::Duration) {
+    ///
+    /// 破棄した `SessionId` を返す — この `SessionTable` だけでは
+    /// `AttachArbiter`(`engine/attach_arbiter.rs`)の fencing slot には触れられない
+    /// (この型はそちらを知らない、`engine/mod.rs`の呼び出し元だけが両方を持つ)ため、
+    /// 呼び出し元がこの戻り値で `AttachRuntime::established_lease_for` →
+    /// `relay_ended` を呼び、slot を解放する責務を持つ。これを怠ると、park
+    /// 期限切れで `SessionTable` からは消えた session の `AttachArbiter` 側の
+    /// `Established` slot だけが残り続け、以後そのターゲットへの新規ATTACHが
+    /// 実際には誰も使っていないセッションのせいで`BUSY_OTHER_SESSION`のまま
+    /// 永久に拒否される(`isekai-pipe serve`プロセスを再起動するまで回復しない)。
+    pub async fn sweep_expired_parked(&self, max_parked: std::time::Duration) -> Vec<SessionId> {
         let expired: Vec<SessionId> = {
             let inner = self.inner.lock().await;
             let mut expired = Vec::new();
@@ -271,13 +281,16 @@ impl SessionTable {
             }
             expired
         };
+        let mut discarded = Vec::with_capacity(expired.len());
         for id in expired {
             if let Some(handle) = self.remove(&id).await {
                 // parked_tcp を drop することで TCP 接続も close される。
                 drop(handle.lock().await.parked_tcp.take());
                 log::info!("session {} expired while parked, discarded", hex_lower(&id));
+                discarded.push(id);
             }
         }
+        discarded
     }
 }
 

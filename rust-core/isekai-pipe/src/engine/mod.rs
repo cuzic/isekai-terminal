@@ -775,11 +775,23 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
     // 十分長い既定値（90秒）にしてある。
     {
         let sessions = sessions.clone();
+        let attach_runtime = attach_runtime.clone();
         let max_parked = Duration::from_secs(args.resume_window);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                sessions.sweep_expired_parked(max_parked).await;
+                let expired = sessions.sweep_expired_parked(max_parked).await;
+                // `SessionTable::sweep_expired_parked`'s docs: discarding a
+                // parked session here doesn't by itself free the matching
+                // `AttachArbiter` fencing slot — do that here so a park
+                // timing out actually lets a fresh ATTACH for this target
+                // through again, instead of leaving it permanently rejected
+                // with `BUSY_OTHER_SESSION` until this process restarts.
+                for id in expired {
+                    if let Some(lease) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(id)).await {
+                        attach_runtime.relay_ended(lease).await;
+                    }
+                }
             }
         });
     }

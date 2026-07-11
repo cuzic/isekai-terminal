@@ -842,6 +842,91 @@ async fn resume_after_park_expiry_is_rejected_as_unknown_session() {
     );
 }
 
+/// 前のテストの続き: park 期限切れで `SessionTable` から破棄された session は、
+/// `AttachArbiter`(`engine/attach_arbiter.rs`)側の `Established` fencing slot も
+/// 一緒に解放されなければならない(`SessionTable::sweep_expired_parked`の
+/// docsが説明する、この2つのテーブルの同期不足という不具合クラスの回帰テスト)。
+/// これが壊れていると、park 期限切れ後に *新しい* session_id で fresh な
+/// ATTACH_HELLO を送っても、実際には誰も使っていない古い session のせいで
+/// 永久に `BusyOtherSession` を返し続け(`isekai-pipe serve` プロセスを
+/// 再起動するまで回復しない)、無線LAN切断→再接続のたびにこの状態へ陥る。
+#[tokio::test]
+async fn fresh_attach_after_park_expiry_succeeds_instead_of_staying_busy() {
+    let echo_addr = spawn_echo_server().await;
+    let helper = spawn_helper(echo_addr, &["--resume-window", "2"]);
+    let session_secret = base64::engine::general_purpose::STANDARD
+        .decode(&helper.handshake.session_secret)
+        .unwrap();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
+        .parse()
+        .unwrap();
+
+    // 1本目: attach して Established にした直後、データ交換なしですぐに
+    // 切断する(park させる)。
+    let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn1 = endpoint1
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .unwrap();
+    let (sid1, gen1, aid1) = fresh_attach_ids();
+    let (send1, recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
+
+    // control stream を開いて CONTROL_ACK を待つ — サーバーが
+    // `AttachActivate` を実際に処理して `Established` に遷移した後でしか
+    // control stream の accept は始まらない(`handle_connection`: control_task
+    // は `tcp`(=activate成功後)を得てから spawn される)ので、これが
+    // 「本当に Established まで到達した」ことの同期点になる。これを待たずに
+    // 即 `conn1.close()` すると、サーバーが `AttachActivate` を読み切る前に
+    // 接続が閉じて `PendingActivation` のままタイムアウトする(=このテストが
+    // 検証したい sweep_expired_parked のパスを一度も通らない)レースになる。
+    let proof1 = compute_proof(&conn1, &session_secret);
+    let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
+    let mut chello1 = vec![CONTROL_HELLO];
+    chello1.extend_from_slice(&proof1);
+    csend1.write_all(&chello1).await.unwrap();
+    let mut cack1 = [0u8; 17];
+    tokio::time::timeout(Duration::from_secs(5), crecv1.read_exact(&mut cack1))
+        .await
+        .expect("timed out waiting for CONTROL_ACK")
+        .unwrap();
+    assert_eq!(cack1[0], CONTROL_ACK);
+
+    conn1.close(0u32.into(), b"simulated long outage");
+    drop(send1);
+    drop(recv1);
+    drop(csend1);
+    drop(crecv1);
+    drop(endpoint1);
+
+    // sweep 間隔(5秒) + resume-window(2秒) を十分に超えるまで待つ —
+    // この時点で1本目の session は `SessionTable` から破棄されているはず。
+    tokio::time::sleep(Duration::from_secs(9)).await;
+
+    // 2本目: RESUME ではなく、*別の新しい* session_id での fresh な
+    // ATTACH_HELLO。1本目が正しく解放されていれば AttachReadyV2 が返る
+    // はず — BusyOtherSession のまま拒否され続けるなら、それは
+    // `SessionTable`の掃除が`AttachArbiter`のslotに反映されていない証拠。
+    let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn2 = endpoint2
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .expect("second QUIC handshake failed");
+    let (sid2, gen2, aid2) = fresh_attach_ids();
+    let proof2 = compute_attach_proof(&conn2, &session_secret, &sid2, gen2, &aid2, 0);
+    let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
+    send2.write_all(&attach_hello_frame(sid2, gen2, aid2, proof2)).await.unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(5), read_attach_response(&mut recv2))
+        .await
+        .expect("timed out waiting for a response to the fresh ATTACH_HELLO");
+    assert!(
+        matches!(response, AttachResponse::Ready { .. }),
+        "a fresh ATTACH_HELLO after the old session's park expired must succeed, got {response:?}"
+    );
+}
+
 // ── STUN(--stun-server)ハンドシェイク拡張 ─────────────────────────────
 
 /// 最小のモックSTUNサーバー(RFC 5389 Binding Request/Response)。
