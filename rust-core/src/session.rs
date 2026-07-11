@@ -7,7 +7,7 @@ use log::{debug, info, warn};
 use parking_lot::Mutex;
 use timed_fsm::TimerCommand;
 
-use crate::{CellData, ScreenUpdate, SessionCallback, RUNTIME};
+use crate::{CellData, ClipboardMimeKind, ClipboardPayload, ScreenUpdate, SessionCallback, RUNTIME};
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
 use crate::terminal::{TermCell, Terminal};
 use crate::theme::Theme;
@@ -308,13 +308,33 @@ fn handle_session_cmd(state: &mut SessionState, c: SessionCmd) -> ProcessResult 
     }
 }
 
-/// `CtlMessage::ClipboardPush`の`data_b64`をUTF-8テキストへデコードする。
-/// base64/UTF-8いずれかが不正なら`warn!`ログを出して`None`を返す(既存の
-/// 「不正な入力はドロップして継続する」opportunisticな方針を維持)。
-/// `session_event_loop`のselect!アームから切り出したもの — base64/UTF-8
-/// デコードという純粋な部分だけを、`spawn_blocking`によるコールバック分岐
-/// (非同期・I/O)から分離してユニットテスト可能にする。
-fn decode_clipboard_push(data_b64: &str) -> Option<String> {
+/// `isekai_protocol::ClipboardMime`(uniffiに依存しないpure crate側の型)と
+/// `crate::ClipboardMimeKind`(UniFFI境界を越える側の型)は同じ3種を表す別々の型
+/// (isekai-protocolはuniffiに依存できないため)なので、この2関数で変換する。
+fn clipboard_mime_kind_from_protocol(mime: isekai_protocol::ClipboardMime) -> ClipboardMimeKind {
+    match mime {
+        isekai_protocol::ClipboardMime::TextPlain => ClipboardMimeKind::TextPlain,
+        isekai_protocol::ClipboardMime::TextHtml => ClipboardMimeKind::TextHtml,
+        isekai_protocol::ClipboardMime::ImagePng => ClipboardMimeKind::ImagePng,
+    }
+}
+
+fn clipboard_mime_kind_to_protocol(mime: ClipboardMimeKind) -> isekai_protocol::ClipboardMime {
+    match mime {
+        ClipboardMimeKind::TextPlain => isekai_protocol::ClipboardMime::TextPlain,
+        ClipboardMimeKind::TextHtml => isekai_protocol::ClipboardMime::TextHtml,
+        ClipboardMimeKind::ImagePng => isekai_protocol::ClipboardMime::ImagePng,
+    }
+}
+
+/// `CtlMessage::ClipboardPush`の`data_b64`をデコードする。base64が不正なら`warn!`ログを
+/// 出して`None`を返す(既存の「不正な入力はドロップして継続する」opportunisticな方針を
+/// 維持)。テキスト系mime(`TextPlain`/`TextHtml`)はさらにUTF-8として妥当かも検証する
+/// (画像はUTF-8検証の対象外——任意バイト列をそのまま運ぶ)。`session_event_loop`の
+/// select!アームから切り出したもの — base64/UTF-8デコードという純粋な部分だけを、
+/// `spawn_blocking`によるコールバック分岐(非同期・I/O)から分離してユニットテスト
+/// 可能にする。
+fn decode_clipboard_push(mime: isekai_protocol::ClipboardMime, data_b64: &str) -> Option<ClipboardPayload> {
     let decoded = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64) {
         Ok(decoded) => decoded,
         Err(e) => {
@@ -322,13 +342,14 @@ fn decode_clipboard_push(data_b64: &str) -> Option<String> {
             return None;
         }
     };
-    match String::from_utf8(decoded) {
-        Ok(text) => Some(text),
-        Err(e) => {
+    let is_text = matches!(mime, isekai_protocol::ClipboardMime::TextPlain | isekai_protocol::ClipboardMime::TextHtml);
+    if is_text {
+        if let Err(e) = std::str::from_utf8(&decoded) {
             warn!("ctl-socket: clipboard push was not valid UTF-8: {e}");
-            None
+            return None;
         }
     }
+    Some(ClipboardPayload { mime: clipboard_mime_kind_from_protocol(mime), data: decoded })
 }
 
 // ── session event loop（薄い async ラッパー）──────────────
@@ -390,24 +411,37 @@ pub(crate) async fn session_event_loop(
                         isekai_protocol::CtlMessage::SetTitle { value } => {
                             Some(state.set_title_from_ctl(value))
                         }
-                        isekai_protocol::CtlMessage::ClipboardPush { data_b64, .. } => {
-                            if let Some(text) = decode_clipboard_push(&data_b64) {
+                        isekai_protocol::CtlMessage::ClipboardPush { mime, data_b64 } => {
+                            if let Some(payload) = decode_clipboard_push(mime, &data_b64) {
                                 let cb = Arc::clone(&callback);
-                                tokio::task::spawn_blocking(move || cb.on_clipboard_write(text));
+                                tokio::task::spawn_blocking(move || cb.on_clipboard_write(payload));
                             }
                             None
                         }
-                        // device→host のクリップボード読み出し(pull)は、この新しい
-                        // チャネルでの応答書き込みが未実装(`ISEKAI_PIPE_DESIGN.md` §8
-                        // Epic M follow-up、タスク#84の既知の残作業)。OSC 52経由の
-                        // pull(`ClipboardPullRequest`をterminal.rsが検出するパス)は
-                        // 別に実装済み — こちらは無視するだけ。
-                        isekai_protocol::CtlMessage::ClipboardPullRequest {} => {
-                            debug!("ctl-socket: clipboard pull over ctl-socket is not yet implemented, ignoring");
-                            None
-                        }
-                        isekai_protocol::CtlMessage::ClipboardPullResponse { .. } => None,
+                        // `ClipboardPullRequest`は`transport.rs`側で応答書き込みが
+                        // 必要と判定され`TransportEvent::ClipboardPullRequestOverCtl`
+                        // として別途届く(下記アーム参照)ので、ここには来ない。
+                        // `ClipboardPullResponse`はdevice→hostの応答そのものであり、
+                        // deviceがこれを受け取ることは無い。どちらも到達したら無視するだけ。
+                        isekai_protocol::CtlMessage::ClipboardPullRequest {}
+                        | isekai_protocol::CtlMessage::ClipboardPullResponse { .. } => None,
                     }
+                }
+                Some(TransportEvent::ClipboardPullRequestOverCtl(reply)) => {
+                    // tmux迂回チャンネル経由のpull要求(`ISEKAI_PIPE_DESIGN.md` §8 Epic M
+                    // follow-up)。Android`ClipboardManager`読み出しは同期I/Oなので
+                    // `on_host_key`/`on_agent_sign_request`と同じ`spawn_blocking`パターンで
+                    // 待つ。opt-in無効/クリップボード空(`None`)なら`reply`をdropするだけ
+                    // (`transport.rs`側が応答無しでチャネルを閉じる)。
+                    let cb = Arc::clone(&callback);
+                    tokio::task::spawn_blocking(move || {
+                        if let Some(payload) = cb.on_clipboard_pull_request() {
+                            let mime = clipboard_mime_kind_to_protocol(payload.mime);
+                            let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payload.data);
+                            let _ = reply.send(isekai_protocol::CtlMessage::ClipboardPullResponse { mime, data_b64 });
+                        }
+                    });
+                    None
                 }
                 Some(TransportEvent::Disconnected { reason }) => {
                     info!("session: disconnected reason={:?}", reason);
@@ -448,11 +482,17 @@ pub(crate) async fn session_event_loop(
                 let cb = Arc::clone(&callback);
                 let tx = transport_cmd_tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    if let Some(text) = cb.on_clipboard_pull_request() {
-                        let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text);
-                        let response = format!("\x1b]52;c;{data_b64}\x07").into_bytes();
-                        let _ = tx.blocking_send(TransportCommand::WriteStdin(response));
+                    let Some(payload) = cb.on_clipboard_pull_request() else { return };
+                    // OSC 52はテキスト専用プロトコル。デバイスのクリップボードが画像
+                    // だった場合、生バイト列をOSC 52応答として送っても端末シェル側で
+                    // 意味を成さないため、テキスト以外は「何も返さない」(機能の有無を
+                    // 教えない、既存のNone時と同じ扱い)。
+                    if payload.mime != ClipboardMimeKind::TextPlain {
+                        return;
                     }
+                    let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payload.data);
+                    let response = format!("\x1b]52;c;{data_b64}\x07").into_bytes();
+                    let _ = tx.blocking_send(TransportCommand::WriteStdin(response));
                 });
             }
         }
@@ -531,7 +571,7 @@ fn dispatch_result(
     // (`.claude/rules/rust-ssot.md`が対象にしているのはセッション/プロトコル状態であり、
     // これは単なるイベント通知)。
     if let Some(text) = r.pending_clipboard_write {
-        callback.on_clipboard_write(text);
+        callback.on_clipboard_write(ClipboardPayload { mime: ClipboardMimeKind::TextPlain, data: text.into_bytes() });
     }
 }
 
@@ -646,31 +686,49 @@ mod handle_session_cmd_tests {
 
 // ctl-socket forward(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)経由で届く
 // `CtlMessage::ClipboardPush`のdata_b64デコード。base64/UTF-8双方の不正入力を
-// dropして継続する(opportunisticな)方針をカバーする。
+// dropして継続する(opportunisticな)方針、およびmime別の扱い(テキストのみUTF-8検証、
+// 画像は任意バイト列をそのまま通す)をカバーする。
 #[cfg(test)]
 mod decode_clipboard_push_tests {
     use super::decode_clipboard_push;
+    use crate::{ClipboardMimeKind, ClipboardPayload};
+    use isekai_protocol::ClipboardMime;
 
     #[test]
     fn decodes_valid_base64_utf8_text() {
         // "hello" の標準base64
-        assert_eq!(decode_clipboard_push("aGVsbG8="), Some("hello".to_string()));
+        assert_eq!(
+            decode_clipboard_push(ClipboardMime::TextPlain, "aGVsbG8="),
+            Some(ClipboardPayload { mime: ClipboardMimeKind::TextPlain, data: b"hello".to_vec() })
+        );
     }
 
     #[test]
     fn returns_none_on_invalid_base64() {
-        assert_eq!(decode_clipboard_push("not valid base64!!"), None);
+        assert_eq!(decode_clipboard_push(ClipboardMime::TextPlain, "not valid base64!!"), None);
     }
 
     #[test]
-    fn returns_none_on_valid_base64_that_is_not_utf8() {
+    fn returns_none_on_valid_base64_text_that_is_not_utf8() {
         // 0xFF 0xFE は単独では不正なUTF-8シーケンス。base64エンコード済み("//4=")。
-        assert_eq!(decode_clipboard_push("//4="), None);
+        assert_eq!(decode_clipboard_push(ClipboardMime::TextPlain, "//4="), None);
     }
 
     #[test]
     fn decodes_empty_string_to_empty_text() {
-        assert_eq!(decode_clipboard_push(""), Some(String::new()));
+        assert_eq!(
+            decode_clipboard_push(ClipboardMime::TextPlain, ""),
+            Some(ClipboardPayload { mime: ClipboardMimeKind::TextPlain, data: Vec::new() })
+        );
+    }
+
+    #[test]
+    fn decodes_non_utf8_bytes_for_image_mime_without_utf8_validation() {
+        // 0xFF 0xFE はテキストとしては不正だが、画像mimeならバイト列としてそのまま通す。
+        assert_eq!(
+            decode_clipboard_push(ClipboardMime::ImagePng, "//4="),
+            Some(ClipboardPayload { mime: ClipboardMimeKind::ImagePng, data: vec![0xFF, 0xFE] })
+        );
     }
 }
 
@@ -770,8 +828,8 @@ mod tests {
         fn on_no_viable_path(&self) {}
         fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
-        fn on_clipboard_write(&self, _text: String) {}
-        fn on_clipboard_pull_request(&self) -> Option<String> { None }
+        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
+        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
     }
 
     #[test]

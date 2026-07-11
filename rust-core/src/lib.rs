@@ -610,6 +610,26 @@ pub enum TransportPreference {
     IsekaiLinkRelayQuic,
 }
 
+/// OSC 52テキストクリップボード(`ClipboardMime::TextPlain`のみ)とtmux迂回チャンネル
+/// (`ISEKAI_PIPE_DESIGN.md` §8 Epic M、`isekai_protocol::ClipboardMime`全種)の両方が
+/// 運べるmime種別。`isekai_protocol::ClipboardMime`をUniFFI境界越しにそのまま公開できない
+/// (isekai-protocolはuniffiに依存しないpure crate)ため、ここに同型を用意する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ClipboardMimeKind {
+    TextPlain,
+    TextHtml,
+    ImagePng,
+}
+
+/// クリップボードの中身1件(push時はリモートから受け取った内容、pull時はデバイス側の
+/// 現在のクリップボード内容)。`text: String`だった旧シグネチャを置き換える
+/// (画像は任意バイト列で運ぶ必要があり、UTF-8前提の`String`では表現できないため)。
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ClipboardPayload {
+    pub mime: ClipboardMimeKind,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum ConnectionPublicState {
     Disconnected { reason: Option<String> },
@@ -666,13 +686,17 @@ pub trait OrchestratorCallback: Send + Sync {
     /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。opt-in設定のチェック・実際にAndroid
     /// `ClipboardManager` へ書くかどうかの判断はKotlin側の責務(単なるイベント通知であり、
     /// セッション/プロトコル状態ではないため`.claude/rules/rust-ssot.md`の対象外)。
-    fn on_clipboard_write(&self, text: String);
-    /// リモートが OSC 52 query(`ESC]52;c;?BEL`)でクリップボードの読み出しを要求した。
+    fn on_clipboard_write(&self, payload: ClipboardPayload);
+    /// リモートが OSC 52 query(`ESC]52;c;?BEL`)またはtmux迂回チャンネルの
+    /// `ClipboardPullRequest`でクリップボードの読み出しを要求した。
     /// `host_key`/`agent_sign_request`確認と同じ同期ブロッキング方式(Rust側の
     /// `spawn_blocking`から呼ばれる)。opt-in設定が無効、またはクリップボードが
     /// 空/取得不可なら`None`を返す(この場合デバイス側からは応答を一切送らない——
     /// 何も返さない方が「機能の有無自体を教えない」という意味で安全なため)。
-    fn on_clipboard_pull_request(&self) -> Option<String>;
+    /// OSC 52はテキスト専用プロトコルなので、`mime`が`TextPlain`以外の場合にOSC 52へ
+    /// 応答するかどうかの判断はRust側(`session.rs`)が行う——Kotlin側は「今デバイスの
+    /// クリップボードに何が入っているか」だけを返せばよい。
+    fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload>;
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -692,8 +716,8 @@ pub trait SessionCallback: Send + Sync {
     fn on_no_viable_path(&self);
     fn on_forward_state_changed(&self, id: String, state: ForwardState);
     fn on_agent_sign_request(&self, key_fingerprint: String) -> bool;
-    fn on_clipboard_write(&self, text: String);
-    fn on_clipboard_pull_request(&self) -> Option<String>;
+    fn on_clipboard_write(&self, payload: ClipboardPayload);
+    fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload>;
 }
 
 // ── SshSession ──────────────────────────────────────────

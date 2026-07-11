@@ -2,7 +2,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::{
-    CellData, ConnectionPublicState, ForwardState, OrchestratorCallback, ScreenUpdate,
+    CellData, ClipboardPayload, ConnectionPublicState, ForwardState, OrchestratorCallback, ScreenUpdate,
     SessionCallback, SshConfig, SshError, TrzszPublicState,
 };
 use crate::quic_transport::{QuicConfig, QuicSession};
@@ -281,11 +281,11 @@ impl SessionCallback for OrchestratorAdapter {
         self.shared.callback.on_agent_sign_request(key_fingerprint)
     }
 
-    fn on_clipboard_write(&self, text: String) {
-        self.shared.callback.on_clipboard_write(text);
+    fn on_clipboard_write(&self, payload: ClipboardPayload) {
+        self.shared.callback.on_clipboard_write(payload);
     }
 
-    fn on_clipboard_pull_request(&self) -> Option<String> {
+    fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> {
         self.shared.callback.on_clipboard_pull_request()
     }
 }
@@ -604,8 +604,8 @@ mod tests {
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool {
             true
         }
-        fn on_clipboard_write(&self, _text: String) {}
-        fn on_clipboard_pull_request(&self) -> Option<String> { None }
+        fn on_clipboard_write(&self, _payload: ClipboardPayload) {}
+        fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> { None }
     }
 
     fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {

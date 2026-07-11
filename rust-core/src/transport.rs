@@ -109,6 +109,21 @@ pub(crate) enum TransportCommand {
     RemoveForward { id: String },
 }
 
+/// tmux迂回control-plane(Epic M)のSSH streamlocal forwardチャネル1本から届いた
+/// メッセージ。`ClipboardPullRequest`だけは応答(`ClipboardPullResponse`)を同じチャネルへ
+/// 書き戻す必要があるため、書き戻し用の`reply`を一緒に運ぶ(それ以外のメッセージは
+/// `reply: None`のfire-and-forget)。
+pub(crate) struct CtlInbound {
+    pub(crate) msg: isekai_protocol::CtlMessage,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<isekai_protocol::CtlMessage>>,
+}
+
+/// タブごとのtmux迂回control-plane経路表の値型。`RusshEventHandler`・
+/// `EstablishedSession`・`PooledConnection`いずれもこの同じ型を持ち回すだけなので、
+/// 型を毎回書き下すのを避けるための別名。
+pub(crate) type CtlForwardMap =
+    Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<CtlInbound>>>>;
+
 /// transport task → session_event_loop: SSH 状態通知
 pub(crate) enum TransportEvent {
     HostKey(String, tokio::sync::oneshot::Sender<bool>),
@@ -131,7 +146,14 @@ pub(crate) enum TransportEvent {
     /// `set_ctl_socket_forward_enabled`でopt-in)経由でリモートから届いた
     /// `CtlMessage`。`isekai-pipe ctl`(isekai-ssh側)と同じワイヤーフォーマットを
     /// SSHのstreamlocal forward経由でそのまま受け取る(PTY/tmuxを一切経由しない)。
+    /// 応答不要なもの(`SetTitle`/`ClipboardPush`)のみここに載る。
     CtlMessage(isekai_protocol::CtlMessage),
+    /// 同じtmux迂回チャンネル経由の`ClipboardPullRequest`。`HostKey`/`AgentSignRequest`と
+    /// 同じ「`spawn_blocking`でKotlin側のクリップボード読み出しを待ってから`reply`で
+    /// 返す」パターン。`reply`に`ClipboardPullResponse`を送るとそのままSSHチャネルへ
+    /// 書き戻される。dropすると(opt-in無効・クリップボード空など)応答無しでチャネルが
+    /// 閉じ、`isekai-pipe ctl clip pull`側は「応答前に接続が閉じられた」エラーになる。
+    ClipboardPullRequestOverCtl(tokio::sync::oneshot::Sender<isekai_protocol::CtlMessage>),
 }
 
 /// Kotlin → session_event_loop: trzsz 操作（transport を経由しない）
@@ -163,7 +185,7 @@ pub(crate) struct RusshEventHandler {
     /// `remote_forwards`と同じパターンで、パス自体がタブの識別子になる
     /// (SSH接続プーリングで複数タブが同じ`Handle`を共有していても、パスがタブごとに
     /// 一意なので誤配送しない)。
-    pub(crate) ctl_forwards: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<isekai_protocol::CtlMessage>>>>,
+    pub(crate) ctl_forwards: CtlForwardMap,
 }
 
 impl RusshEventHandler {
@@ -259,7 +281,10 @@ impl client::Handler for RusshEventHandler {
     /// `streamlocal_forward(socket_path)` していた場合のみ発生する)。`socket_path`で
     /// 経路表を引き、対応するタブへ`CtlMessage`をそのまま渡す。経路表に無いパス
     /// (既にcancelされた等)の場合はチャネルをそのまま閉じる。1接続=1メッセージの
-    /// 契約(`isekai-pipe ctl`と同じ)なので、1行読んだら接続を閉じる。
+    /// 契約(`isekai-pipe ctl`と同じ)なので、1行読んだら接続を閉じる——ただし
+    /// `ClipboardPullRequest`だけは例外で、応答(`ClipboardPullResponse`)を同じ接続へ
+    /// 書き戻してから閉じる(`isekai-pipe ctl clip pull`が
+    /// `send_ctl_message_and_read_response`で応答を待っているため)。
     async fn server_channel_open_forwarded_streamlocal(
         &mut self,
         channel: russh::Channel<client::Msg>,
@@ -272,15 +297,43 @@ impl client::Handler for RusshEventHandler {
         };
         let socket_path = socket_path.to_string();
         tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt as _, BufReader};
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-            let mut reader = BufReader::new(channel.into_stream());
+            let (read_half, mut write_half) = tokio::io::split(channel.into_stream());
+            let mut reader = BufReader::new(read_half);
             let mut line = String::new();
             match reader.read_line(&mut line).await {
                 Ok(0) => debug!("ctl-socket[{socket_path}]: connection closed without sending anything"),
                 Ok(_) => match isekai_protocol::decode_ctl_message(line.trim_end_matches('\n').as_bytes()) {
+                    Ok(msg @ isekai_protocol::CtlMessage::ClipboardPullRequest {}) => {
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        if tx.send(CtlInbound { msg, reply: Some(reply_tx) }).is_err() {
+                            return;
+                        }
+                        // `HostKey`/`AgentSignRequest`同様Kotlin側の同期I/Oを
+                        // `spawn_blocking`越しに待つため、応答が遅れる可能性がある。
+                        // タイムアウトすれば単に何も書かずチャネルを閉じる——
+                        // `isekai-pipe ctl clip pull`側は「応答前に接続が閉じられた」
+                        // エラーとして扱う既存の経路にそのまま落ちるので、専用の
+                        // エラー応答を新設する必要は無い。
+                        match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
+                            Ok(Ok(response)) => {
+                                let Ok(mut out) = serde_json::to_vec(&response) else {
+                                    warn!("ctl-socket[{socket_path}]: failed to encode clipboard pull response");
+                                    return;
+                                };
+                                out.push(b'\n');
+                                if let Err(e) = write_half.write_all(&out).await {
+                                    warn!("ctl-socket[{socket_path}]: failed to write clipboard pull response: {e}");
+                                }
+                                let _ = write_half.shutdown().await;
+                            }
+                            Ok(Err(_)) => debug!("ctl-socket[{socket_path}]: clipboard pull reply sender dropped without a response"),
+                            Err(_) => warn!("ctl-socket[{socket_path}]: clipboard pull response timed out"),
+                        }
+                    }
                     Ok(msg) => {
-                        let _ = tx.send(msg);
+                        let _ = tx.send(CtlInbound { msg, reply: None });
                     }
                     Err(e) => warn!("ctl-socket[{socket_path}]: malformed ctl message: {e}"),
                 },
@@ -348,7 +401,7 @@ pub(crate) struct EstablishedSession {
     pub(crate) handle: client::Handle<RusshEventHandler>,
     pub(crate) agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     pub(crate) remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
-    pub(crate) ctl_forwards: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<isekai_protocol::CtlMessage>>>>,
+    pub(crate) ctl_forwards: CtlForwardMap,
     /// 保持するだけで参照はしない(トンネルの接続を生かしておくためだけの目的)。
     _jump_handle: Option<client::Handle<RusshEventHandler>>,
 }
@@ -420,7 +473,7 @@ pub(crate) struct PooledSshHandle {
     pub(crate) handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
-    pub(crate) ctl_forwards: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<isekai_protocol::CtlMessage>>>>,
+    pub(crate) ctl_forwards: CtlForwardMap,
     /// 踏み台経由の場合、対象への接続が続く限り保持し続ける必要がある
     /// (`EstablishedSession::_jump_handle`と同じ理由)。QUICネスト経由(踏み台なし)では`None`。
     _jump_handle: Option<client::Handle<RusshEventHandler>>,
@@ -434,7 +487,7 @@ async fn finish_establishing_handle(
     mut handle: client::Handle<RusshEventHandler>,
     agent_key: Arc<Mutex<Option<Arc<PrivateKey>>>>,
     remote_forwards: Arc<Mutex<HashMap<u16, (String, u16)>>>,
-    ctl_forwards: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<isekai_protocol::CtlMessage>>>>,
+    ctl_forwards: CtlForwardMap,
     jump_handle: Option<client::Handle<RusshEventHandler>>,
     username: &str,
     auth: &mut SshAuth,
@@ -568,15 +621,19 @@ pub(crate) async fn run_ssh_channel_loop(
     // 継続する(opportunistic機能、`CLAUDE.md`)。
     let ctl_socket_path: Option<String> = if ctl_socket_forward_enabled() {
         let path = new_ctl_socket_path();
-        let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<isekai_protocol::CtlMessage>();
+        let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<CtlInbound>();
         pooled.ctl_forwards.lock().insert(path.clone(), ctl_tx);
         match pooled.handle.lock().await.streamlocal_forward(path.clone()).await {
             Ok(()) => {
                 info!("ctl-socket: forwarding {} (Epic M)", path);
                 let forward_event_tx = event_tx.clone();
                 tokio::spawn(async move {
-                    while let Some(msg) = ctl_rx.recv().await {
-                        forward_event_tx.send(TransportEvent::CtlMessage(msg)).await.ok();
+                    while let Some(CtlInbound { msg, reply }) = ctl_rx.recv().await {
+                        let event = match reply {
+                            Some(reply) => TransportEvent::ClipboardPullRequestOverCtl(reply),
+                            None => TransportEvent::CtlMessage(msg),
+                        };
+                        forward_event_tx.send(event).await.ok();
                     }
                 });
                 Some(path)
@@ -981,8 +1038,8 @@ mod local_forward_e2e_tests {
             let _ = self.tx.send(TestEvent::Forward(id, state));
         }
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
-        fn on_clipboard_write(&self, _text: String) {}
-        fn on_clipboard_pull_request(&self) -> Option<String> { None }
+        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
+        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
     }
 
     /// 受け取ったバイト列をそのまま返すだけのダミー TCP サーバ。
@@ -1632,8 +1689,8 @@ mod pooling_e2e_tests {
         fn on_no_viable_path(&self) {}
         fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
-        fn on_clipboard_write(&self, _text: String) {}
-        fn on_clipboard_pull_request(&self) -> Option<String> { None }
+        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
+        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
     }
 
     /// 公開鍵認証を無条件で受け入れつつ認証回数を数え、シェルチャネルへ書き込まれた
