@@ -192,14 +192,60 @@ pub fn migrate_trust_store(store: &TrustStore) -> Vec<PersistentProfile> {
 /// `chatgpt.md` §33's `state/profiles/` layout, rooted the same way
 /// `default_runtime_dir` roots `runtime/` (an env override, else a
 /// platform-conventional per-user directory).
+///
+/// On Windows, `LOCALAPPDATA` is checked *before* `HOME` even though `HOME`
+/// isn't Windows-native at all: MSYS2/Git-Bash/WSL-style shells set `HOME`
+/// on top of the very same Windows binary that a plain `cmd.exe`/PowerShell
+/// session runs with `HOME` unset, so ordering by "whichever shell happened
+/// to define it" makes a "trusted once" host land in a *different*
+/// `PersistentProfile` directory depending only on which shell the user
+/// happened to launch `isekai-ssh`/`isekai-pipe` from — invisible to the
+/// user and indistinguishable from the profile having been lost. Checking
+/// the OS (`cfg!(windows)`) rather than the environment makes the resolved
+/// directory a property of the binary, not of the invoking shell, so both
+/// shells agree. `LOCALAPPDATA` (not the roaming `APPDATA`) is deliberately
+/// used: this store's cached `session_secret`/cert pin are tied to a
+/// specific machine's bootstrap, and roaming them into a domain profile that
+/// syncs across machines would reintroduce the same "which copy is current"
+/// confusion this ordering fix removes. `HOME`-based resolution is left
+/// untouched for actual Unix targets (Linux/macOS), and remains the correct
+/// non-Windows-fallback branch for cross-compiled/unusual Windows-adjacent
+/// targets that don't set `LOCALAPPDATA` either.
 pub fn default_profiles_dir() -> io::Result<PathBuf> {
-    if let Some(path) = std::env::var_os("ISEKAI_PIPE_PROFILES_DIR") {
+    resolve_profiles_dir(
+        std::env::var_os("ISEKAI_PIPE_PROFILES_DIR"),
+        std::env::var_os("XDG_STATE_HOME"),
+        // Folded in here (rather than checked inside `resolve_profiles_dir`)
+        // so that function stays a pure, OS-agnostic priority list —
+        // `cfg!(windows)` is a compile-time constant per build target, which
+        // would make a Windows-only branch untestable on a non-Windows CI
+        // runner; passing `None` here for a non-Windows build has the exact
+        // same effect and needs no `cfg`-gating in the tests below.
+        cfg!(windows).then(|| std::env::var_os("LOCALAPPDATA")).flatten(),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Pure priority list behind [`default_profiles_dir`], split out so every
+/// branch (including the Windows-only `LOCALAPPDATA` one) is unit-testable
+/// without mutating this process's real environment variables or depending
+/// on which OS the test happens to run on.
+fn resolve_profiles_dir(
+    explicit_override: Option<std::ffi::OsString>,
+    xdg_state_home: Option<std::ffi::OsString>,
+    windows_local_app_data: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> io::Result<PathBuf> {
+    if let Some(path) = explicit_override {
         return Ok(PathBuf::from(path));
     }
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
+    if let Some(path) = xdg_state_home {
         return Ok(PathBuf::from(path).join("isekai").join("profiles"));
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(local_app_data) = windows_local_app_data {
+        return Ok(PathBuf::from(local_app_data).join("isekai").join("profiles"));
+    }
+    if let Some(home) = home {
         return Ok(PathBuf::from(home)
             .join(".local")
             .join("state")
@@ -567,6 +613,64 @@ mod tests {
 
         let loaded = load_persistent_profile(dir.path(), key).unwrap().unwrap();
         assert_eq!(loaded.remote_version.as_deref(), Some(UPDATERS.to_string().as_str()), "every updater's increment should have been preserved");
+    }
+
+    #[test]
+    fn resolve_profiles_dir_prefers_explicit_override_over_everything() {
+        let dir = resolve_profiles_dir(
+            Some("/explicit".into()),
+            Some("/xdg-state".into()),
+            Some(r"C:\Users\alice\AppData\Local".into()),
+            Some("/home/alice".into()),
+        )
+        .unwrap();
+        assert_eq!(dir, PathBuf::from("/explicit"));
+    }
+
+    #[test]
+    fn resolve_profiles_dir_prefers_xdg_state_home_over_windows_and_home() {
+        let dir = resolve_profiles_dir(
+            None,
+            Some("/xdg-state".into()),
+            Some(r"C:\Users\alice\AppData\Local".into()),
+            Some("/home/alice".into()),
+        )
+        .unwrap();
+        assert_eq!(dir, PathBuf::from("/xdg-state/isekai/profiles"));
+    }
+
+    #[test]
+    fn resolve_profiles_dir_prefers_windows_local_app_data_over_home() {
+        // The whole point of this ordering (see `default_profiles_dir`'s doc
+        // comment): MSYS2/Git-Bash sets `HOME` on top of the identical
+        // Windows binary a plain cmd.exe/PowerShell session runs with `HOME`
+        // unset, so `LOCALAPPDATA` must win regardless of whether `HOME`
+        // also happens to be set, or the very same host resolves to two
+        // different trust-store directories depending on which shell
+        // launched it.
+        let dir = resolve_profiles_dir(
+            None,
+            None,
+            Some(r"C:\Users\alice\AppData\Local".into()),
+            Some(r"C:\Users\alice".into()),
+        )
+        .unwrap();
+        assert_eq!(dir, PathBuf::from(r"C:\Users\alice\AppData\Local").join("isekai").join("profiles"));
+    }
+
+    #[test]
+    fn resolve_profiles_dir_falls_back_to_home_when_not_on_windows() {
+        // A non-Windows build always passes `None` for
+        // `windows_local_app_data` (`default_profiles_dir`'s `cfg!(windows)`
+        // guard) — this is the branch that build actually takes.
+        let dir = resolve_profiles_dir(None, None, None, Some("/home/alice".into())).unwrap();
+        assert_eq!(dir, PathBuf::from("/home/alice/.local/state/isekai/profiles"));
+    }
+
+    #[test]
+    fn resolve_profiles_dir_falls_back_to_temp_dir_when_nothing_is_set() {
+        let dir = resolve_profiles_dir(None, None, None, None).unwrap();
+        assert_eq!(dir, std::env::temp_dir().join("isekai-profiles"));
     }
 
     fn profile_test_nonce() -> u64 {
