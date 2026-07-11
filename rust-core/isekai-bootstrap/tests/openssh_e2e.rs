@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio as StdStdio;
 
-use isekai_bootstrap::{BootstrapBackend, BootstrapError, HostSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
+use isekai_bootstrap::{launch_fingerprint, BootstrapBackend, BootstrapError, HostSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
 use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
 use russh::{Channel as RusshChannel, ChannelId, CryptoVec};
 use russh_keys::ssh_key::private::Ed25519Keypair;
@@ -754,8 +754,8 @@ fn default_install_path(home: &Path) -> PathBuf {
     home.join(".local/bin/isekai-pipe")
 }
 
-fn pid_file_path(home: &Path) -> PathBuf {
-    home.join(".local/bin/isekai-pipe.pid")
+fn pid_file_path(home: &Path, fingerprint: &str) -> PathBuf {
+    home.join(format!(".local/bin/isekai-pipe.{fingerprint}.pid"))
 }
 
 fn is_pid_alive(pid: u32) -> bool {
@@ -787,8 +787,8 @@ fn fake_pipe_binary() -> Vec<u8> {
 /// left behind by a reuse test (it self-exits after 20s regardless — see
 /// its own module docs — this just avoids leaving it around for that whole
 /// window on a machine running these tests repeatedly).
-fn kill_if_recorded(home: &Path) {
-    if let Ok(pid_str) = std::fs::read_to_string(pid_file_path(home)) {
+fn kill_if_recorded(home: &Path, fingerprint: &str) {
+    if let Ok(pid_str) = std::fs::read_to_string(pid_file_path(home, fingerprint)) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             let _ = std::process::Command::new("kill")
                 .arg("-9")
@@ -856,17 +856,20 @@ async fn install_and_start_reuses_a_still_alive_helper_without_relaunching() {
         "the second install_and_start should have reused the still-alive helper, not relaunched it"
     );
 
-    kill_if_recorded(&home);
+    kill_if_recorded(&home, &launch_fingerprint(&launch));
 }
 
 /// A second `install_and_start` with a *different* `LaunchSpec` (a
-/// materially different deployment — different relay, or no relay at all —
-/// not just a settings tweak) must not mistake the still-alive previous
-/// helper for a reusable one, and must kill it before launching its
-/// replacement, so mismatched deployments don't pile up as orphaned
-/// processes either.
+/// materially different topology — Direct vs. Relay — not just a settings
+/// tweak) must *not* kill the still-alive first deployment's helper: a
+/// design review turned up that killing on fingerprint mismatch would also
+/// kill a helper some *other* still-active client (another terminal tab,
+/// another of the user's own machines) is mid-session on, with no way to
+/// tell the two situations apart from here. Each topology now tracks its
+/// own state/pid file (`crate::reuse`'s module docs), so both helpers must
+/// end up alive side by side.
 #[tokio::test]
-async fn install_and_start_kills_a_stale_helper_and_relaunches_on_fingerprint_change() {
+async fn install_and_start_lets_a_different_topology_coexist_with_a_still_alive_helper() {
     if !ssh_binary_available() {
         eprintln!("skipping: ssh(1) not available in this environment");
         return;
@@ -883,16 +886,21 @@ async fn install_and_start_kills_a_stale_helper_and_relaunches_on_fingerprint_ch
     let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
     let binary = fake_pipe_binary();
 
+    let relay_launch = LaunchSpec::Relay(dummy_relay_spec());
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        backend.install_and_start(&target, &[], &binary, &LaunchSpec::Relay(dummy_relay_spec()), None, &[]),
+        backend.install_and_start(&target, &[], &binary, &relay_launch, None, &[]),
     )
     .await
     .expect("first install_and_start should not hang")
     .expect("first install_and_start should succeed");
 
-    let first_pid: u32 =
-        std::fs::read_to_string(pid_file_path(&home)).unwrap().trim().parse().expect("pid file should hold a pid");
+    let relay_fingerprint = launch_fingerprint(&relay_launch);
+    let first_pid: u32 = std::fs::read_to_string(pid_file_path(&home, &relay_fingerprint))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("pid file should hold a pid");
     assert!(is_pid_alive(first_pid), "the first deployment's helper should still be running");
 
     let direct_launch =
@@ -906,13 +914,25 @@ async fn install_and_start_kills_a_stale_helper_and_relaunches_on_fingerprint_ch
     .expect("second install_and_start should succeed with a fresh launch");
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(!is_pid_alive(first_pid), "the fingerprint-mismatched stale helper should have been killed");
+    assert!(
+        is_pid_alive(first_pid),
+        "a different topology's bootstrap must not kill an unrelated, still-active helper"
+    );
 
-    let invocations =
-        std::fs::read_to_string(home.join("fake-pipe-invocations.log")).unwrap_or_default();
-    assert_eq!(invocations.lines().count(), 2, "a fingerprint change must force a real relaunch, not a reuse");
+    let direct_fingerprint = launch_fingerprint(&direct_launch);
+    let second_pid: u32 = std::fs::read_to_string(pid_file_path(&home, &direct_fingerprint))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("pid file should hold a pid");
+    assert_ne!(first_pid, second_pid, "each topology should get its own helper process");
+    assert!(is_pid_alive(second_pid), "the second deployment's helper should also be running");
 
-    kill_if_recorded(&home);
+    let invocations = std::fs::read_to_string(home.join("fake-pipe-invocations.log")).unwrap_or_default();
+    assert_eq!(invocations.lines().count(), 2, "a topology change must force a real launch, not a reuse");
+
+    kill_if_recorded(&home, &relay_fingerprint);
+    kill_if_recorded(&home, &direct_fingerprint);
 }
 
 /// When a relaunch genuinely is needed (the previous helper already exited,

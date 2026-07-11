@@ -10,20 +10,20 @@
 //! `ssh` subprocess script instead of over a `russh::client::Handle`:
 //!
 //! 1. Under a best-effort `flock(1)` on `crate::reuse::lock_file_path`, check
-//!    whether `crate::reuse::state_file_path` records a still-alive helper
-//!    (`kill -0`, `/proc/<pid>/exe` identity check to guard against PID
-//!    reuse) launched with a matching `crate::reuse::launch_fingerprint` — if
-//!    so, skip uploading/relaunching entirely and hand back the recorded
+//!    whether `crate::reuse::state_file_path` (scoped by both the binary path
+//!    *and* `crate::reuse::launch_fingerprint`, so each distinct topology —
+//!    Direct vs. Relay, different relays — tracks its own helper rather than
+//!    contending over one) records a still-alive helper (`kill -0`,
+//!    `/proc/<pid>/exe` identity check to guard against PID reuse) — if so,
+//!    skip uploading/relaunching entirely and hand back the recorded
 //!    handshake (see `crate::reuse`'s module docs for why this is safe and
 //!    why `isekai-ssh`'s long-lived-helper model needs it, unlike
 //!    `helper_bootstrap.rs`'s intentionally-fresh-every-session Android
 //!    path).
-//! 2. Otherwise: `sha256sum` the existing binary (if any) and skip
-//!    re-uploading when it already matches the expected digest; kill a
-//!    fingerprint-mismatched but still-alive previous helper (superseded
-//!    config, not just a crashed one) before launching a new one;
-//!    `base64 -d > ...tmp && chmod 0700 ... && mv ...` otherwise, with the
-//!    base64-encoded binary written to the ssh subprocess's stdin.
+//! 2. Otherwise: `sha256sum` the existing binary (if any, shared across every
+//!    topology) and skip re-uploading when it already matches the expected
+//!    digest; `base64 -d > ...tmp && chmod 0700 ... && mv ...` otherwise,
+//!    with the base64-encoded binary written to the ssh subprocess's stdin.
 //! 3. Launches `isekai-helper` detached (`setsid`, stdin from `/dev/null`,
 //!    wrapped in a subshell so the ssh exec channel's direct child exits
 //!    immediately — see the comment in `helper_bootstrap.rs` for why that
@@ -383,10 +383,16 @@ impl OpenSshBackend {
         };
 
         let remote_dir = remote_parent_dir(remote_binary_path);
-        let lock_path = lock_file_path(remote_binary_path);
-        let state_path = state_file_path(remote_binary_path);
-        let pid_path = pid_file_path(remote_binary_path);
         let fingerprint = launch_fingerprint(launch);
+        // `lock_path` stays scoped by `remote_binary_path` alone (shared
+        // across every topology — it guards the upload step below, which is
+        // a shared resource); `state_path`/`pid_path` are scoped by
+        // `fingerprint` too, so a different topology's still-alive helper is
+        // simply a different pair of files, never something this bootstrap
+        // needs to detect-and-kill (`crate::reuse`'s module docs).
+        let lock_path = lock_file_path(remote_binary_path);
+        let state_path = state_file_path(remote_binary_path, &fingerprint);
+        let pid_path = pid_file_path(remote_binary_path, &fingerprint);
         let expected_sha256 = hex_sha256(binary);
         let encoded = base64::engine::general_purpose::STANDARD.encode(binary);
         let encoded_len = encoded.len();
@@ -408,17 +414,19 @@ if command -v flock >/dev/null 2>&1; then flock -w 30 9 2>/dev/null || true; fi
 tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
 if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdir/bootstrap-request.json)" -eq {request_len} ] && {read_jwt_step}true; then
   reuse_envelope=""
-  stale_pid=""
   if [ -f {state_path} ]; then
     existing_pid=$(sed -n '1p' {state_path} | cut -d' ' -f1)
     existing_fp=$(sed -n '1p' {state_path} | cut -d' ' -f2)
     if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
       existing_exe=$(readlink -f /proc/$existing_pid/exe 2>/dev/null)
       expected_exe=$(readlink -f {remote_binary_path} 2>/dev/null)
+      # `existing_fp` should always equal `{fingerprint}` here (the file
+      # itself is fingerprint-scoped) — kept as a cheap defense-in-depth
+      # sanity check, not a decision point: this bootstrap never touches a
+      # *different* topology's state/pid file, so there is no "stale, kill
+      # it" case to handle here at all (`crate::reuse`'s module docs).
       if [ -n "$existing_exe" ] && [ "$existing_exe" = "$expected_exe" ] && [ "$existing_fp" = "{fingerprint}" ]; then
         reuse_envelope=$(sed -n '2p' {state_path})
-      else
-        stale_pid="$existing_pid"
       fi
     fi
   fi
@@ -426,7 +434,6 @@ if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdi
     head -c {encoded_len} > /dev/null
     printf '%s\n' "$reuse_envelope"
   else
-    [ -n "$stale_pid" ] && kill "$stale_pid" 2>/dev/null
     need_upload=1
     if command -v sha256sum >/dev/null 2>&1 && [ -x {remote_binary_path} ]; then
       current_sha=$(sha256sum {remote_binary_path} 2>/dev/null | cut -d' ' -f1)

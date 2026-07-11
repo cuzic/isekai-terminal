@@ -21,14 +21,33 @@
 //! binary, 0600, guarded by an flock on [`lock_file_path`]) every time it
 //! successfully launches a helper. A later invocation first checks whether
 //! that pid is still alive *and* is genuinely still running the expected
-//! binary (`/proc/<pid>/exe`, guarding against PID reuse) *and* was launched
-//! with a matching [`launch_fingerprint`] — only then does it trust the
-//! recorded handshake and skip uploading/relaunching entirely. This doesn't
-//! weaken the security review #57/#58 decision to never persist
+//! binary (`/proc/<pid>/exe`, guarding against PID reuse) — only then does it
+//! trust the recorded handshake and skip uploading/relaunching entirely.
+//! This doesn't weaken the security review #57/#58 decision to never persist
 //! `session_secret`/`relay_jwt` in a *shared* or *argv-visible* location: the
 //! state file is per-deploying-user (0600) and colocated with a binary path
 //! only that same user can already write to — identical to the trust
 //! boundary `~/.ssh/id_rsa` already relies on, not a new one.
+//!
+//! [`state_file_path`]/[`pid_file_path`] are scoped by [`launch_fingerprint`]
+//! (`<binary path>.<fingerprint>.state`/`.pid`), not just the binary path —
+//! deliberately, after a design review turned up a real problem with an
+//! earlier revision that scoped them by binary path alone: a *different*
+//! topology (e.g. switching a host from `LaunchSpec::Direct` to
+//! `LaunchSpec::Relay`, or between two different relays) would find the old
+//! helper's recorded pid, see the fingerprint didn't match, and `kill` it
+//! outright — with no check for whether some *other* still-active client
+//! (another terminal tab, another of the user's own machines dialing the
+//! same host) was mid-session on that exact helper. Scoping the tracked
+//! state per fingerprint means a topology change simply writes to a
+//! different file instead of colliding with — and killing — an unrelated
+//! one; multiple topologies can now coexist against the same deployed
+//! binary, each independently reused or relaunched on its own. `lock_file_path`
+//! deliberately stays scoped by binary path only (not fingerprint): the
+//! binary itself is a *shared* resource across every topology (one upload,
+//! reused by all of them), so concurrent bootstraps of two different
+//! topologies must still serialize on that shared upload step, even though
+//! they no longer contend over which helper process gets to survive.
 
 use sha2::{Digest, Sha256};
 
@@ -45,7 +64,7 @@ use crate::types::LaunchSpec;
 /// pick, so a bare settings tweak must not force an unnecessary relaunch
 /// (and thereby drop whatever peer is using the still-good existing
 /// connection).
-pub(crate) fn launch_fingerprint(launch: &LaunchSpec) -> String {
+pub fn launch_fingerprint(launch: &LaunchSpec) -> String {
     let discriminator = match launch {
         LaunchSpec::Direct { .. } => "direct".to_string(),
         LaunchSpec::Relay(relay) => {
@@ -60,17 +79,21 @@ pub(crate) fn launch_fingerprint(launch: &LaunchSpec) -> String {
 /// handshake envelope>}` after a successful launch — colocated with the
 /// binary itself (same directory, so it inherits that directory's
 /// permissions/ownership) rather than under a separate shared state tree,
-/// deliberately scoping reuse to "the currently-deployed binary at this
-/// exact path" (a caller-supplied `#@isekai remote-path`/`--isekai-helper-binary`
-/// pointing elsewhere is, correctly, a different deployment with no
-/// relationship to this one).
-pub(crate) fn state_file_path(remote_binary_path: &str) -> String {
-    format!("{remote_binary_path}.state")
+/// and named after both the binary path *and* `fingerprint` (see this
+/// module's own docs for why the fingerprint is part of the path, not just
+/// the file's contents: it's what lets two different topologies coexist
+/// instead of one superseding the other).
+pub(crate) fn state_file_path(remote_binary_path: &str, fingerprint: &str) -> String {
+    format!("{remote_binary_path}.{fingerprint}.state")
 }
 
-/// Advisory-lock path guarding read-modify-write access to
-/// [`state_file_path`] (best-effort `flock(1)` — see `openssh.rs`'s install
-/// script for what happens when `flock(1)` itself isn't available).
+/// Advisory-lock path guarding read-modify-write access to *every*
+/// topology's [`state_file_path`] for this binary (best-effort `flock(1)` —
+/// see `openssh.rs`'s install script for what happens when `flock(1)` itself
+/// isn't available). Deliberately scoped by `remote_binary_path` alone, not
+/// `fingerprint` — see this module's own docs for why the shared upload step
+/// still needs cross-topology mutual exclusion even though the tracked
+/// helper state itself no longer does.
 pub(crate) fn lock_file_path(remote_binary_path: &str) -> String {
     format!("{remote_binary_path}.lock")
 }
@@ -79,9 +102,10 @@ pub(crate) fn lock_file_path(remote_binary_path: &str) -> String {
 /// a separate small file (rather than smuggling it into the strictly
 /// one-line-of-JSON handshake stdout) purely so it survives outside the
 /// per-invocation `mktemp -d` scratch directory that gets `rm -rf`'d when
-/// the launching shell exits.
-pub(crate) fn pid_file_path(remote_binary_path: &str) -> String {
-    format!("{remote_binary_path}.pid")
+/// the launching shell exits. Scoped by `fingerprint` for the same reason as
+/// [`state_file_path`].
+pub(crate) fn pid_file_path(remote_binary_path: &str, fingerprint: &str) -> String {
+    format!("{remote_binary_path}.{fingerprint}.pid")
 }
 
 #[cfg(test)]
@@ -171,9 +195,25 @@ mod tests {
     }
 
     #[test]
-    fn state_lock_and_pid_paths_are_colocated_siblings_of_the_binary_path() {
-        assert_eq!(state_file_path("~/.local/bin/isekai-pipe"), "~/.local/bin/isekai-pipe.state");
+    fn state_and_pid_paths_are_scoped_by_both_binary_path_and_fingerprint() {
+        assert_eq!(state_file_path("~/.local/bin/isekai-pipe", "abc123"), "~/.local/bin/isekai-pipe.abc123.state");
+        assert_eq!(pid_file_path("~/.local/bin/isekai-pipe", "abc123"), "~/.local/bin/isekai-pipe.abc123.pid");
+    }
+
+    #[test]
+    fn different_fingerprints_get_different_state_and_pid_paths_for_the_same_binary() {
+        assert_ne!(
+            state_file_path("~/.local/bin/isekai-pipe", "fp-direct"),
+            state_file_path("~/.local/bin/isekai-pipe", "fp-relay"),
+        );
+        assert_ne!(
+            pid_file_path("~/.local/bin/isekai-pipe", "fp-direct"),
+            pid_file_path("~/.local/bin/isekai-pipe", "fp-relay"),
+        );
+    }
+
+    #[test]
+    fn lock_path_is_scoped_by_binary_path_only_shared_across_topologies() {
         assert_eq!(lock_file_path("~/.local/bin/isekai-pipe"), "~/.local/bin/isekai-pipe.lock");
-        assert_eq!(pid_file_path("~/.local/bin/isekai-pipe"), "~/.local/bin/isekai-pipe.pid");
     }
 }
