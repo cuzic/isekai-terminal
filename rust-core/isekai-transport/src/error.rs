@@ -65,6 +65,26 @@ impl TransportError {
     pub fn is_stale_trust_signal(&self) -> bool {
         matches!(self, Self::Mux(quicmux::MuxError::CertPinMismatch { .. }) | Self::Rejected(AttachRejectReason::Auth))
     }
+
+    /// Whether this failure is the server reporting `BUSY_OTHER_SESSION`:
+    /// its `AttachArbiter` (`isekai-pipe/src/engine/attach_arbiter.rs`)
+    /// already has a *different* session `Established` for this target.
+    /// Most often this is this same client's own previous session, still
+    /// parked there waiting out its own resume-grace window after an
+    /// ungraceful disconnect (e.g. the local process exited before its own
+    /// resume loop could recover from a Wi-Fi drop) — not a genuinely
+    /// different, live client. Callers that mint a fresh `session_id` for
+    /// every process invocation (`connect_via_relay_resumable`/
+    /// `_with_fallback`, both via `random_session_id()`) have no way to
+    /// resume that old session directly, so `isekai-pipe connect`'s initial
+    /// connect wraps them in a bounded retry keyed on this signal instead of
+    /// failing the whole attempt on the first rejection (`attempt.rs`
+    /// classifies `BusyOtherSession` as `AttemptFailure::Terminal`, which
+    /// remains correct for *candidate*-fallback purposes — trying a
+    /// different network path to the same helper cannot help either).
+    pub fn is_busy_other_session(&self) -> bool {
+        matches!(self, Self::Rejected(AttachRejectReason::BusyOtherSession))
+    }
 }
 
 /// Attached via `anyhow::Error::context` at the point a connect-time error
@@ -112,6 +132,25 @@ mod tests {
             AttachRejectReason::AttachAlreadyEstablished,
         ] {
             assert!(!TransportError::Rejected(reason).is_stale_trust_signal());
+        }
+    }
+
+    #[test]
+    fn busy_other_session_is_recognized() {
+        assert!(TransportError::Rejected(AttachRejectReason::BusyOtherSession).is_busy_other_session());
+    }
+
+    #[test]
+    fn other_rejected_reasons_are_not_busy_other_session() {
+        for reason in [
+            AttachRejectReason::Auth,
+            AttachRejectReason::Target,
+            AttachRejectReason::Unsupported,
+            AttachRejectReason::AlreadyAttached,
+            AttachRejectReason::StaleGeneration { current_generation: isekai_protocol::attach::ConnectionGeneration::INITIAL },
+            AttachRejectReason::AttachAlreadyEstablished,
+        ] {
+            assert!(!TransportError::Rejected(reason).is_busy_other_session());
         }
     }
 

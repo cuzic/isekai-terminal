@@ -283,6 +283,25 @@ impl SequentialConnectError {
             }
         }
     }
+
+    /// Whether this failure is exactly a `BUSY_OTHER_SESSION` rejection
+    /// (`TransportError::is_busy_other_session`'s docs) — the one shape a
+    /// `Terminal` `AttemptFailure` here can take, since every candidate in
+    /// one round shares the same `session_id` (module docs above): if the
+    /// helper is busy with a different one, every candidate reaching it
+    /// would fail identically, so this always surfaces as `StoppedEarly`
+    /// on the first candidate that reaches it, never `AllCandidatesFailed`.
+    /// `isekai-pipe connect`'s initial-connect entry points use this to
+    /// decide whether retrying the whole fallback scan (a fresh
+    /// `session_id`/round each time) is worth it.
+    pub fn is_busy_other_session(&self) -> bool {
+        match self {
+            Self::StoppedEarly { failure: crate::attempt::AttemptFailure::Terminal { source }, .. } => {
+                source.is_busy_other_session()
+            }
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for SequentialConnectError {
@@ -770,5 +789,29 @@ mod tests {
             budget: crate::generation_coordinator::AdvanceGenerationError::RetryBudgetExceeded { advances: 3, max: 3 },
         }
         .is_stale_trust_signal());
+    }
+
+    fn busy_other_session_failure() -> AttemptFailure {
+        AttemptFailure::Terminal { source: TransportError::Rejected(isekai_protocol::attach::AttachRejectReason::BusyOtherSession) }
+    }
+
+    #[test]
+    fn stopped_early_with_busy_other_session_is_recognized() {
+        assert!(SequentialConnectError::StoppedEarly { candidate_id: "c1".to_string(), failure: busy_other_session_failure() }
+            .is_busy_other_session());
+    }
+
+    #[test]
+    fn stopped_early_with_other_terminal_failures_is_not_busy_other_session() {
+        assert!(!SequentialConnectError::StoppedEarly { candidate_id: "c1".to_string(), failure: stale_failure().failure }
+            .is_busy_other_session());
+        assert!(!SequentialConnectError::StoppedEarly { candidate_id: "c2".to_string(), failure: not_stale_failure().failure }
+            .is_busy_other_session());
+    }
+
+    #[test]
+    fn non_stopped_early_variants_are_never_busy_other_session() {
+        assert!(!SequentialConnectError::NoCandidates.is_busy_other_session());
+        assert!(!SequentialConnectError::AllCandidatesFailed { failures: vec![stale_failure()] }.is_busy_other_session());
     }
 }
