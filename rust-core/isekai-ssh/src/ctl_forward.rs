@@ -1,8 +1,8 @@
-//! Per-tab UNIX domain socket forward for the remote→local title/clipboard
-//! control-plane (`ISEKAI_PIPE_DESIGN.md` §8 Epic M, `#@isekai ctl-socket
-//! yes`). Requests an SSH remote forward (`-R remote-sock:local-sock`) for
-//! every `isekai-ssh <destination>` invocation — this works whether or not
-//! the underlying connection is fresh or shared via ControlMaster/
+//! Per-tab remote→local title/clipboard control-plane
+//! (`ISEKAI_PIPE_DESIGN.md` §8 Epic M, `#@isekai ctl-socket yes`). Requests
+//! an SSH remote forward (`-R remote-sock:local-endpoint`) for every
+//! `isekai-ssh <destination>` invocation — this works whether or not the
+//! underlying connection is fresh or shared via ControlMaster/
 //! ControlPersist, because OpenSSH scopes `-R` forwards per client request
 //! rather than per underlying connection (unlike `isekai-transport`, which
 //! cannot distinguish tabs once a connection is shared, see the ADR above
@@ -32,18 +32,48 @@
 //!   do not control. This changes how the remote shell is invoked
 //!   (explicit exec rather than sshd's own implicit login-shell exec), a
 //!   deliberate, documented trade-off of an opt-in convenience feature.
-//! - UNIX domain sockets only (`#[cfg(unix)]`): `tokio::net::UnixListener`
-//!   has no Windows backend as of this writing. `ctl-socket yes` on a
-//!   non-unix build logs once to stderr and otherwise no-ops, rather than
-//!   failing the connection — the same "opportunistic, silent fallback"
-//!   policy as physical multipath (`CLAUDE.md`).
+//! - **The local endpoint is platform-specific: a UNIX domain socket on
+//!   unix, a loopback TCP port on everything else.** `tokio::net::
+//!   UnixListener` has no Windows backend, and Win32-OpenSSH's `-R`/`-L` do
+//!   not support forwarding to a Windows named pipe or a native Windows
+//!   `AF_UNIX` socket either (confirmed dead ends, not just an unexplored
+//!   option — see `PowerShell/openssh-portable#433`, closed unmerged, and
+//!   `PowerShell/Win32-OpenSSH#2321`, filed 2025-01 against OpenSSH 9.8p1,
+//!   still unresolved), so a loopback TCP port is the only thing `-R` can
+//!   target on a Windows client. Deliberately **not** unified onto TCP
+//!   everywhere: the UNIX socket path (Linux/macOS clients — the vast
+//!   majority of usage today) is unchanged, still relying on its `0700`
+//!   directory for access control, exactly as before this was ever a
+//!   concern for Windows.
+//! - **Every platform's connection now starts with a plaintext secret
+//!   preamble line** (the tab's `remote_path`, which [`isekai-pipe
+//!   ctl`][isekai-pipe] already has in hand — it's embedded in
+//!   `$ISEKAI_CTL_SOCK`'s filename, the same value it resolves the remote
+//!   UNIX socket path from), checked by [`handle_ctl_connection`] before
+//!   anything else. Not because the UNIX socket path needs it (its `0700`
+//!   directory already provides equivalent protection) — but because
+//!   `isekai-pipe ctl` has no way to know whether the client on the other
+//!   end of the tunnel is unix or not, so it always sends the same
+//!   preamble, and both platforms' listeners check it uniformly rather than
+//!   the wire protocol silently differing by platform. On the loopback TCP
+//!   path this preamble is the *only* access control (a bare port has no
+//!   filesystem-permission equivalent to a UNIX socket's `0700` directory)
+//!   — plaintext-over-loopback, not plaintext-over-network, since the real
+//!   SSH hop (remote UNIX socket → sshd → this local endpoint) is already
+//!   inside the SSH-encrypted tunnel; the preamble only needs to keep
+//!   *other local processes on this machine* from connecting to the port
+//!   directly and injecting messages, which 128 bits of randomness does
+//!   adequately.
+//!
+//!   [isekai-pipe]: ../../../isekai-pipe/src/ctl.rs
 
+use std::path::Path;
+#[cfg(unix)]
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-#[cfg(unix)]
+use anyhow::{bail, Context, Result};
 use isekai_protocol::CtlMessage;
-#[cfg(all(unix, test))]
+#[cfg(test)]
 use isekai_protocol::ClipboardMime;
 
 /// `/tmp/isekai-pipe-ctl-<32 hex chars>.sock` on the remote host.
@@ -51,7 +81,17 @@ const REMOTE_SOCK_PREFIX: &str = "/tmp/isekai-pipe-ctl-";
 
 pub(crate) struct CtlForward {
     pub(crate) remote_path: String,
+    #[cfg(unix)]
     pub(crate) local_path: PathBuf,
+    #[cfg(not(unix))]
+    pub(crate) local_port: u16,
+    /// Only populated on non-unix, where the port must be bound up front
+    /// (before the `-R` argument naming it is even constructed) rather than
+    /// lazily inside [`spawn_ctl_listener`] the way the unix path binds its
+    /// socket — [`spawn_ctl_listener`] takes ownership of it via
+    /// [`Option::take`]. Always `None` on unix.
+    #[cfg(not(unix))]
+    listener: Option<std::net::TcpListener>,
 }
 
 /// 128 bits of randomness as lowercase hex, matching
@@ -69,12 +109,6 @@ fn new_ctl_token() -> String {
     out
 }
 
-/// Whether this build can even attempt a ctl-socket forward at all
-/// (independent of whether the directive is enabled for this destination).
-pub(crate) fn is_supported() -> bool {
-    cfg!(unix)
-}
-
 /// Pure decision of whether to attempt a ctl-socket forward for this
 /// invocation, given the resolved directive and the parsed ssh args. Split
 /// out from `prepare_ctl_forward` so it's testable without touching the
@@ -84,17 +118,20 @@ pub(crate) fn should_attempt_ctl_forward(
     ssh_args_len: usize,
     destination_index: usize,
 ) -> bool {
-    ctl_socket_enabled && is_supported() && ssh_args_len == destination_index + 1
+    ctl_socket_enabled && ssh_args_len == destination_index + 1
 }
 
 /// The `-R` forward flag pair. Must be spliced in **before** the
 /// destination in the final `ssh(1)` argv — anything after the destination
 /// is the remote command, not an option, to `ssh(1)`.
+#[cfg(unix)]
 pub(crate) fn forward_option_args(forward: &CtlForward) -> [String; 2] {
-    [
-        "-R".to_string(),
-        format!("{}:{}", forward.remote_path, forward.local_path.display()),
-    ]
+    ["-R".to_string(), format!("{}:{}", forward.remote_path, forward.local_path.display())]
+}
+
+#[cfg(not(unix))]
+pub(crate) fn forward_option_args(forward: &CtlForward) -> [String; 2] {
+    ["-R".to_string(), format!("{}:127.0.0.1:{}", forward.remote_path, forward.local_port)]
 }
 
 /// The replacement remote command: since there is no pre-existing remote
@@ -113,11 +150,14 @@ pub(crate) fn remote_command_arg(forward: &CtlForward) -> String {
 /// No abnormal-exit cleanup runs continuously (`ISEKAI_PIPE_DESIGN.md` §8
 /// Epic M "stale UNIX domain socketのGC"): a crashed/`kill -9`'d tab's
 /// local socket only gets removed the next time some tab prepares a new
-/// one, which is what this constant bounds.
+/// one, which is what this constant bounds. Unix-only: the TCP path has no
+/// socket *file* to leak — the OS reclaims the port the moment the process
+/// exits.
+#[cfg(unix)]
 const LOCAL_SOCK_STALE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 #[cfg(unix)]
-pub(crate) fn prepare_ctl_forward(runtime_dir: &std::path::Path) -> Result<CtlForward> {
+pub(crate) fn prepare_ctl_forward(runtime_dir: &Path) -> Result<CtlForward> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let token = new_ctl_token();
@@ -141,53 +181,103 @@ pub(crate) fn prepare_ctl_forward(runtime_dir: &std::path::Path) -> Result<CtlFo
     })
 }
 
+/// Binds an OS-assigned loopback TCP port up front (so its number is known
+/// before `ssh(1)` is spawned with the `-R` argument that names it — there's
+/// no way to reserve a port number without actually binding it). The unix
+/// equivalent binds lazily inside [`spawn_ctl_listener`] instead, since a
+/// UNIX socket path (unlike a TCP port number) is chosen before binding, not
+/// assigned by the bind itself.
 #[cfg(not(unix))]
-pub(crate) fn prepare_ctl_forward(_runtime_dir: &std::path::Path) -> Result<CtlForward> {
-    anyhow::bail!("isekai-ssh: ctl-socket forwarding is only supported on unix targets")
+pub(crate) fn prepare_ctl_forward(_runtime_dir: &Path) -> Result<CtlForward> {
+    let token = new_ctl_token();
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).context("failed to bind a local ctl listener on 127.0.0.1")?;
+    let local_port = listener.local_addr().context("failed to read local ctl listener port")?.port();
+
+    Ok(CtlForward { remote_path: format!("{REMOTE_SOCK_PREFIX}{token}.sock"), local_port, listener: Some(listener) })
 }
 
-/// Binds `forward.local_path` and services incoming ctl connections until
-/// the process exits (killed together with the `ssh` child it was spawned
-/// alongside — see `wrapper::run`). Each connection carries exactly one
-/// `isekai_protocol::CtlMessage` line (`isekai-pipe ctl`'s wire contract).
+/// Binds `forward.local_path` (unix) / takes ownership of the already-bound
+/// listener (non-unix, see [`prepare_ctl_forward`]) and services incoming
+/// ctl connections until the process exits (killed together with the `ssh`
+/// child it was spawned alongside — see `wrapper::run`). Each connection
+/// carries a plaintext secret preamble line followed by exactly one
+/// `isekai_protocol::CtlMessage` line (`isekai-pipe ctl`'s wire contract,
+/// see module docs for both).
 #[cfg(unix)]
-pub(crate) async fn spawn_ctl_listener(local_path: PathBuf) {
+pub(crate) async fn spawn_ctl_listener(forward: &mut CtlForward) {
+    use tokio::net::UnixListener;
+
+    let local_path = forward.local_path.clone();
+    let secret = forward.remote_path.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_ctl_listener(&local_path).await {
+        let result: Result<()> = async {
+            let listener = UnixListener::bind(&local_path)
+                .with_context(|| format!("failed to bind ctl listener at {}", local_path.display()))?;
+            loop {
+                let (stream, _) = listener.accept().await.context("ctl listener accept failed")?;
+                let secret = secret.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_ctl_connection(stream, &secret).await {
+                        eprintln!("isekai-ssh: ctl connection error: {e:#}");
+                    }
+                });
+            }
+        }
+        .await;
+        if let Err(e) = result {
             eprintln!("isekai-ssh: ctl listener error: {e:#}");
         }
     });
 }
 
-/// Never actually reached at runtime (`prepare_ctl_forward` above always
-/// returns `Err` on non-unix, so `run()`'s `Ok` match arm calling this is
-/// dead code there) — exists only so that match arm still type-checks when
-/// cross-compiling for a non-unix target.
 #[cfg(not(unix))]
-pub(crate) async fn spawn_ctl_listener(_local_path: PathBuf) {}
-
-#[cfg(unix)]
-async fn run_ctl_listener(local_path: &std::path::Path) -> Result<()> {
-    use tokio::net::UnixListener;
-
-    let listener = UnixListener::bind(local_path)
-        .with_context(|| format!("failed to bind ctl listener at {}", local_path.display()))?;
-    loop {
-        let (stream, _) = listener.accept().await.context("ctl listener accept failed")?;
-        tokio::spawn(async move {
-            if let Err(e) = handle_ctl_connection(stream).await {
-                eprintln!("isekai-ssh: ctl connection error: {e:#}");
+pub(crate) async fn spawn_ctl_listener(forward: &mut CtlForward) {
+    let Some(listener) = forward.listener.take() else {
+        eprintln!("isekai-ssh: ctl listener was already taken (spawn_ctl_listener called twice?)");
+        return;
+    };
+    let secret = forward.remote_path.clone();
+    tokio::spawn(async move {
+        let result: Result<()> = async {
+            listener.set_nonblocking(true).context("failed to set ctl listener non-blocking")?;
+            let listener =
+                tokio::net::TcpListener::from_std(listener).context("failed to hand off ctl listener to tokio")?;
+            loop {
+                let (stream, _) = listener.accept().await.context("ctl listener accept failed")?;
+                let secret = secret.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_ctl_connection(stream, &secret).await {
+                        eprintln!("isekai-ssh: ctl connection error: {e:#}");
+                    }
+                });
             }
-        });
-    }
+        }
+        .await;
+        if let Err(e) = result {
+            eprintln!("isekai-ssh: ctl listener error: {e:#}");
+        }
+    });
 }
 
-#[cfg(unix)]
-async fn handle_ctl_connection(stream: tokio::net::UnixStream) -> Result<()> {
+/// Reads and checks the secret preamble line, then decodes exactly one
+/// `CtlMessage` line and acts on it. Generic over the stream type
+/// (`UnixStream` on unix, `TcpStream` elsewhere, see module docs) since
+/// nothing past that point differs by platform.
+async fn handle_ctl_connection(stream: impl tokio::io::AsyncRead + Unpin, expected_secret: &str) -> Result<()> {
     use isekai_protocol::decode_ctl_message;
     use tokio::io::{AsyncBufReadExt as _, BufReader};
 
     let mut reader = BufReader::new(stream);
+
+    // The preamble: whoever is on the other end of this connection must
+    // already know this tab's random remote-path token (see module docs).
+    let mut secret_line = String::new();
+    reader.read_line(&mut secret_line).await.context("failed to read ctl connection preamble")?;
+    if secret_line.trim_end_matches('\n') != expected_secret {
+        bail!("isekai-ssh: ctl connection preamble did not match this tab's expected secret");
+    }
+
     let mut line = String::new();
     reader
         .read_line(&mut line)
@@ -222,7 +312,6 @@ async fn handle_ctl_connection(stream: tokio::net::UnixStream) -> Result<()> {
 ///   remote's `isekai-pipe ctl clip pull` rather than hanging.
 /// - `ClipboardPullResponse` → we never issue `ClipboardPullRequest`
 ///   ourselves, so seeing this would only be a misbehaving peer; ignored.
-#[cfg(unix)]
 fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
     match msg {
         CtlMessage::SetTitle { value } => Some(format!("\x1b]0;{value}\x07")),
@@ -231,7 +320,6 @@ fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
     }
 }
 
-#[cfg(unix)]
 fn emit_osc(seq: &str) -> Result<()> {
     use std::io::Write as _;
     // A single `write_all` call (rather than `eprint!`, which may split
@@ -263,26 +351,33 @@ mod tests {
         assert!(!should_attempt_ctl_forward(true, 2, 0)); // `isekai-ssh host 'cmd'`
     }
 
-    #[test]
-    fn forward_option_args_precede_the_destination() {
-        let forward = CtlForward {
+    #[cfg(unix)]
+    fn fixture_forward() -> CtlForward {
+        CtlForward {
             remote_path: "/tmp/isekai-pipe-ctl-aaaa.sock".to_string(),
             local_path: PathBuf::from("/run/user/1000/isekai-ssh/ctl/aaaa.sock"),
-        };
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn fixture_forward() -> CtlForward {
+        CtlForward { remote_path: "/tmp/isekai-pipe-ctl-aaaa.sock".to_string(), local_port: 54321, listener: None }
+    }
+
+    #[test]
+    fn forward_option_args_precede_the_destination() {
+        let forward = fixture_forward();
         let args = forward_option_args(&forward);
         assert_eq!(args[0], "-R");
-        assert_eq!(
-            args[1],
-            "/tmp/isekai-pipe-ctl-aaaa.sock:/run/user/1000/isekai-ssh/ctl/aaaa.sock"
-        );
+        #[cfg(unix)]
+        assert_eq!(args[1], "/tmp/isekai-pipe-ctl-aaaa.sock:/run/user/1000/isekai-ssh/ctl/aaaa.sock");
+        #[cfg(not(unix))]
+        assert_eq!(args[1], "/tmp/isekai-pipe-ctl-aaaa.sock:127.0.0.1:54321");
     }
 
     #[test]
     fn remote_command_exports_the_remote_path_and_execs_a_login_shell() {
-        let forward = CtlForward {
-            remote_path: "/tmp/isekai-pipe-ctl-aaaa.sock".to_string(),
-            local_path: PathBuf::from("/run/user/1000/isekai-ssh/ctl/aaaa.sock"),
-        };
+        let forward = fixture_forward();
         let cmd = remote_command_arg(&forward);
         assert!(cmd.contains("ISEKAI_CTL_SOCK=\"/tmp/isekai-pipe-ctl-aaaa.sock\""));
         assert!(cmd.contains("exec \"${SHELL:-/bin/sh}\" -i -l"));
@@ -302,14 +397,21 @@ mod tests {
         assert_eq!(forward.local_path.parent().unwrap(), ctl_dir);
     }
 
-    #[cfg(unix)]
+    #[cfg(not(unix))]
+    #[test]
+    fn prepare_ctl_forward_binds_a_real_loopback_port() {
+        let forward = prepare_ctl_forward(Path::new(".")).unwrap();
+        assert!(forward.remote_path.starts_with(REMOTE_SOCK_PREFIX));
+        assert_ne!(forward.local_port, 0);
+        assert!(forward.listener.is_some());
+    }
+
     #[test]
     fn osc_sequence_for_set_title_is_osc_0() {
         let seq = osc_sequence_for(&CtlMessage::SetTitle { value: "hi".to_string() }).unwrap();
         assert_eq!(seq, "\x1b]0;hi\x07");
     }
 
-    #[cfg(unix)]
     #[test]
     fn osc_sequence_for_clipboard_push_is_osc_52_and_reuses_data_b64_verbatim() {
         let seq = osc_sequence_for(&CtlMessage::ClipboardPush {
@@ -320,7 +422,6 @@ mod tests {
         assert_eq!(seq, "\x1b]52;c;aGVsbG8=\x07");
     }
 
-    #[cfg(unix)]
     #[test]
     fn osc_sequence_for_pull_variants_is_none() {
         assert!(osc_sequence_for(&CtlMessage::ClipboardPullRequest {}).is_none());
@@ -332,26 +433,32 @@ mod tests {
     }
 
     /// Exercises the real socket read/decode path end-to-end (distinct from
-    /// the pure `osc_sequence_for` tests above) without touching this test
-    /// process's actual inherited stderr: a malformed line is the one case
-    /// `handle_ctl_connection` surfaces as an `Err` without going through
-    /// `emit_osc` at all, so it's observable without any stderr side effect.
-    #[cfg(unix)]
+    /// the pure `osc_sequence_for` tests above): a correct preamble followed
+    /// by a malformed message line is the one case `handle_ctl_connection`
+    /// surfaces as an `Err` without going through `emit_osc` at all, so it's
+    /// observable without any stderr side effect on this test process's own
+    /// inherited stderr.
     #[tokio::test]
-    async fn handle_ctl_connection_rejects_a_malformed_message() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("ctl.sock");
-        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handle_ctl_connection(stream).await
-        });
+    async fn handle_ctl_connection_rejects_a_malformed_message_after_a_correct_preamble() {
+        let (mut client, server_stream) = tokio::io::duplex(256);
+        let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t").await });
 
-        let mut client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         use tokio::io::AsyncWriteExt as _;
-        client.write_all(b"not json\n").await.unwrap();
+        client.write_all(b"s3cr3t\nnot json\n").await.unwrap();
         drop(client);
         let result = server.await.unwrap();
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_ctl_connection_rejects_a_mismatched_preamble() {
+        let (mut client, server_stream) = tokio::io::duplex(256);
+        let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t").await });
+
+        use tokio::io::AsyncWriteExt as _;
+        client.write_all(b"wrong-secret\n{}\n").await.unwrap();
+        drop(client);
+        let result = server.await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("preamble"));
     }
 }

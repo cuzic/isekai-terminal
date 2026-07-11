@@ -5,13 +5,22 @@
 //! sends/receives one `isekai_protocol::CtlMessage` per invocation. Never
 //! touches the pane's PTY, so tmux's OSC 0/2/52 interception is irrelevant.
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
+#[cfg(unix)]
+use anyhow::{bail, Context};
+#[cfg(unix)]
 use base64::Engine as _;
-use isekai_protocol::{decode_ctl_message, ClipboardMime, CtlMessage};
+use isekai_protocol::ClipboardMime;
+#[cfg(unix)]
+use isekai_protocol::{decode_ctl_message, CtlMessage};
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 use crate::{next_arg, EX_UNAVAILABLE, EX_USAGE};
@@ -162,6 +171,7 @@ fn resolve_ctl_socket_path(explicit: Option<String>) -> Result<PathBuf, ExitCode
     }
 }
 
+#[cfg(unix)]
 pub(crate) async fn ctl_command(args: impl Iterator<Item = String>) -> ExitCode {
     let launch = match parse_ctl(args) {
         Ok(Some(launch)) => launch,
@@ -190,6 +200,35 @@ pub(crate) async fn ctl_command(args: impl Iterator<Item = String>) -> ExitCode 
     }
 }
 
+/// Non-unix builds: still parse arguments (so `--help`/usage errors behave
+/// identically everywhere), but the actual transport — a UNIX domain socket
+/// forwarded in via `$ISEKAI_CTL_SOCK` — has no Windows backend as of this
+/// writing. Same "opportunistic, silent fallback" policy as
+/// `isekai-ssh::ctl_forward` (`CLAUDE.md`): log once, fail this one
+/// invocation, don't panic or refuse to build.
+#[cfg(not(unix))]
+pub(crate) async fn ctl_command(args: impl Iterator<Item = String>) -> ExitCode {
+    let launch = match parse_ctl(args) {
+        Ok(Some(launch)) => launch,
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(code) => return code,
+    };
+    // Still resolve `--sock`/`$ISEKAI_CTL_SOCK` so a misconfigured caller
+    // sees the same usage error on every platform — only the final "connect
+    // to it" step is unix-only.
+    let sock = match &launch {
+        CtlLaunch::Title { sock, .. } | CtlLaunch::ClipPush { sock, .. } | CtlLaunch::ClipPull { sock } => {
+            sock.clone()
+        }
+    };
+    if let Err(code) = resolve_ctl_socket_path(sock) {
+        return code;
+    }
+    eprintln!("isekai-pipe ctl: not supported on this platform (requires UNIX domain sockets)");
+    ExitCode::from(EX_UNAVAILABLE)
+}
+
+#[cfg(unix)]
 async fn run_ctl(sock_path: &Path, launch: CtlLaunch) -> Result<()> {
     match launch {
         CtlLaunch::Title { value, .. } => send_ctl_message(sock_path, CtlMessage::SetTitle { value }).await,
@@ -222,10 +261,30 @@ async fn run_ctl(sock_path: &Path, launch: CtlLaunch) -> Result<()> {
     }
 }
 
+/// The preamble line every ctl connection starts with: the remote UNIX
+/// socket path itself, which isekai-ssh's `ctl_forward` module already
+/// treats as this tab's shared secret (see that module's doc comment for
+/// why — in short, a loopback TCP port has no filesystem-permission
+/// equivalent to this socket's own `0700` directory, so both platforms'
+/// listeners check this preamble uniformly rather than the wire protocol
+/// silently differing by platform). `sock_path` is exactly `$ISEKAI_CTL_SOCK`
+/// (or `--sock`), i.e. the same value isekai-ssh generated it from.
+#[cfg(unix)]
+fn secret_preamble(sock_path: &Path) -> Vec<u8> {
+    let mut line = sock_path.to_string_lossy().into_owned().into_bytes();
+    line.push(b'\n');
+    line
+}
+
+#[cfg(unix)]
 async fn send_ctl_message(sock_path: &Path, msg: CtlMessage) -> Result<()> {
     let mut stream = UnixStream::connect(sock_path)
         .await
         .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;
+    stream
+        .write_all(&secret_preamble(sock_path))
+        .await
+        .context("isekai-pipe ctl: failed to write ctl connection preamble")?;
     let mut line = serde_json::to_vec(&msg).context("isekai-pipe ctl: failed to encode ctl message")?;
     line.push(b'\n');
     stream
@@ -239,11 +298,16 @@ async fn send_ctl_message(sock_path: &Path, msg: CtlMessage) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn send_ctl_message_and_read_response(sock_path: &Path, msg: CtlMessage) -> Result<CtlMessage> {
     let stream = UnixStream::connect(sock_path)
         .await
         .with_context(|| format!("isekai-pipe ctl: failed to connect to {}", sock_path.display()))?;
     let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(&secret_preamble(sock_path))
+        .await
+        .context("isekai-pipe ctl: failed to write ctl connection preamble")?;
     let mut line = serde_json::to_vec(&msg).context("isekai-pipe ctl: failed to encode ctl message")?;
     line.push(b'\n');
     write_half
@@ -269,6 +333,7 @@ async fn send_ctl_message_and_read_response(sock_path: &Path, msg: CtlMessage) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use tokio::net::UnixListener;
 
     fn args(strs: &[&str]) -> impl Iterator<Item = String> {
@@ -370,6 +435,7 @@ mod tests {
     /// of small hand-rolled mock servers per test file rather than a shared
     /// `tests/common`) that reads one line, asserts it decodes to the
     /// expected `CtlMessage`, and closes.
+    #[cfg(unix)]
     #[tokio::test]
     async fn send_ctl_message_delivers_set_title() {
         let dir = tempfile::tempdir().unwrap();
@@ -381,11 +447,13 @@ mod tests {
             async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut reader = BufReader::new(stream);
+                let mut preamble = String::new();
+                reader.read_line(&mut preamble).await.unwrap();
+                assert_eq!(preamble.trim_end(), sock_path.to_string_lossy());
                 let mut line = String::new();
                 reader.read_line(&mut line).await.unwrap();
                 let msg = decode_ctl_message(line.trim_end().as_bytes()).unwrap();
                 assert_eq!(msg, CtlMessage::SetTitle { value: "hello".to_string() });
-                drop(sock_path);
             }
         });
 
@@ -395,16 +463,22 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn send_ctl_message_and_read_response_round_trips_clip_pull() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("ctl.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
 
-        let server = tokio::spawn(async move {
+        let server = tokio::spawn({
+            let sock_path = sock_path.clone();
+            async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read_half, mut write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
+            let mut preamble = String::new();
+            reader.read_line(&mut preamble).await.unwrap();
+            assert_eq!(preamble.trim_end(), sock_path.to_string_lossy());
             let mut line = String::new();
             reader.read_line(&mut line).await.unwrap();
             let msg = decode_ctl_message(line.trim_end().as_bytes()).unwrap();
@@ -417,6 +491,7 @@ mod tests {
             let mut out = serde_json::to_vec(&response).unwrap();
             out.push(b'\n');
             write_half.write_all(&out).await.unwrap();
+            }
         });
 
         let response = send_ctl_message_and_read_response(&sock_path, CtlMessage::ClipboardPullRequest {})
@@ -432,6 +507,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn send_ctl_message_fails_cleanly_when_socket_is_missing() {
         let dir = tempfile::tempdir().unwrap();

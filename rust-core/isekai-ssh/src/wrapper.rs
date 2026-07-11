@@ -354,8 +354,8 @@ async fn run_ssh_once(
         plan.destination_index,
     ) {
         match crate::ctl_forward::prepare_ctl_forward(&runtime_dir) {
-            Ok(forward) => {
-                crate::ctl_forward::spawn_ctl_listener(forward.local_path.clone()).await;
+            Ok(mut forward) => {
+                crate::ctl_forward::spawn_ctl_listener(&mut forward).await;
                 Some(forward)
             }
             Err(e) => {
