@@ -16,13 +16,13 @@ use isekai_pipe_core::{
 #[cfg(test)]
 use isekai_pipe_core::ServerIdentity;
 use isekai_transport::{
-    connect_stun_p2p, connect_stun_p2p_with_fallback, connect_via_relay_resumable,
-    connect_via_relay_resumable_with_fallback, qmux_relay_factory, reconnect_and_resume, spawn_app_ack_tasks,
-    system_quic_factory, AnyByteStream, AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxFactory, AnyMuxRebinder,
-    AppAckCounters, AttemptFailure, BackoffPolicy, BindSpec, C2hSentOffset, CandidatePool, CandidateProvider,
-    ConfigRelayProvider, ConfigStunProvider, GatherContext, H2cClientDeliveredOffset, LegacyIntentProvider,
-    RelayTarget, SequentialConnectError, SequentialFailure, SequentialRelayCandidate, SequentialStunCandidate,
-    SequentialStunConnectError, StunP2pTarget,
+    compute_proof, connect_stun_p2p, connect_stun_p2p_with_fallback, connect_via_relay_resumable,
+    connect_via_relay_resumable_with_fallback, open_control_stream, qmux_relay_factory, reconnect_and_resume,
+    spawn_app_ack_tasks, system_quic_factory, AnyByteStream, AnyByteStreamReadHalf, AnyByteStreamWriteHalf,
+    AnyMuxConnection, AnyMuxFactory, AnyMuxRebinder, AppAckCounters, AppAckTasks, AttemptFailure, BackoffPolicy,
+    BindSpec, C2hSentOffset, CandidatePool, CandidateProvider, ConfigRelayProvider, ConfigStunProvider, GatherContext,
+    H2cClientDeliveredOffset, LegacyIntentProvider, RelayTarget, SequentialConnectError, SequentialFailure,
+    SequentialRelayCandidate, SequentialStunCandidate, SequentialStunConnectError, StunP2pTarget,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -1586,15 +1586,65 @@ fn spawn_reconnect_signal<R: Rebindable + 'static>(
 /// untouched past `committed_offset`) if the write itself fails, so the
 /// caller knows to discard `stream` and retry instead of treating it as
 /// live.
+///
+/// Also returns `false` — without touching `replay` at all — when
+/// `committed_offset` is outside `replay`'s buffered range
+/// (`ReplayBuffer::replay_from` returning `None`): either the helper's
+/// claimed offset is *behind* what this client already discarded as
+/// confirmed (bytes were dropped without ever actually being acknowledged —
+/// data loss), or *ahead* of everything this client has ever sent (the
+/// helper claims to have committed bytes that don't exist). Both are
+/// protocol inconsistencies, not "nothing to replay" — silently proceeding
+/// (as an earlier version of this function did) would desync this client's
+/// own offset bookkeeping from the helper's, corrupting every future
+/// `client_sent_offset` this session reports (codex review,
+/// quicmux-server-resume).
 async fn replay_and_advance(replay: &Mutex<C2hReplayBuffer>, committed_offset: u64, stream: &mut AnyByteStream) -> bool {
-    let to_replay = replay.lock().unwrap().replay_from(committed_offset);
-    if let Some(bytes) = to_replay {
-        if !bytes.is_empty() && stream.write_all(&bytes).await.is_err() {
-            return false;
-        }
+    let Some(bytes) = replay.lock().unwrap().replay_from(committed_offset) else {
+        eprintln!(
+            "isekai-pipe connect: helper's committed_offset={committed_offset} is outside the local \
+             replay buffer's range — treating this resumed connection as unusable and retrying"
+        );
+        return false;
+    };
+    if !bytes.is_empty() && stream.write_all(&bytes).await.is_err() {
+        return false;
     }
     replay.lock().unwrap().advance_start(committed_offset);
     true
+}
+
+/// Reestablishes the control stream on `conn` — a freshly resumed connection
+/// from either `reconnect_and_resume` or `WarmStandby::promote` — and
+/// resumes the `APP_ACK` background exchange against the *same* `counters`
+/// this whole `run_resume_loop` call already uses (not a fresh
+/// `AppAckCounters`: `pump_c2h`'s backpressure trim reads
+/// `counters.c2h_helper_committed_offset()` directly every iteration, so a
+/// new instance here would silently desync from what the data pump is
+/// actually watching). Without this, `counters.c2h_helper_committed_offset`
+/// would freeze at whatever it was when the *first* disconnect happened —
+/// `pump_c2h` would then never see it advance again, and the C2H replay
+/// buffer would fill to `C2H_REPLAY_BUFFER_CAPACITY` and stall stdin reads
+/// (codex review, quicmux-server-resume — the same class of gap already
+/// fixed for `isekai-terminal-core`'s three Android transports via
+/// `spawn_control_stream_reestablishment_after_resume`, just missed here
+/// since this is the separate CLI binary).
+///
+/// Synchronous (unlike the Android fix's fire-and-forget/timeout-bounded
+/// spawn) to match this function's own caller: `connect_via_relay_resumable`
+/// already treats the *initial* control stream as a required, synchronous
+/// step (`?`, not a best-effort background task) — Android's leniency is
+/// specifically about not delaying an SSH shell handoff for a possibly-slow
+/// legacy helper, which doesn't apply to reattaching an already-open resume
+/// loop against isekai's own server.
+async fn reestablish_control_stream(
+    conn: &AnyMuxConnection,
+    session_secret: &[u8],
+    counters: &Arc<AppAckCounters>,
+) -> Result<AppAckTasks> {
+    let proof = compute_proof(conn, session_secret, b"").await?;
+    let control = open_control_stream(conn, &proof).await?;
+    Ok(spawn_app_ack_tasks(control.stream, counters.clone()))
 }
 
 async fn run_resume_loop(
@@ -1616,7 +1666,7 @@ async fn run_resume_loop(
     let resume_window = Duration::from_secs(established.effective_resume_grace_secs.into());
 
     let counters = Arc::new(AppAckCounters::new());
-    let app_ack_tasks = spawn_app_ack_tasks(established.control_stream, counters.clone());
+    let mut app_ack_tasks = spawn_app_ack_tasks(established.control_stream, counters.clone());
     let replay = Arc::new(Mutex::new(C2hReplayBuffer::new(C2H_REPLAY_BUFFER_CAPACITY)));
 
     let mut stdin = tokio::io::stdin();
@@ -1698,9 +1748,16 @@ async fn run_resume_loop(
             let client_delivered_offset = H2cClientDeliveredOffset::new(counters.h2c_client_delivered_offset());
             match ws.promote(client_sent_offset, client_delivered_offset).await {
                 Ok(mut promoted) => {
-                    drop(promoted.connection);
                     if replay_and_advance(&replay, promoted.helper_committed_offset.get(), &mut promoted.data_stream).await {
                         log::info!("isekai-pipe connect: promoted warm-standby connection for session_id={session_id}");
+                        match reestablish_control_stream(&promoted.connection, &target.session_secret, &counters).await {
+                            Ok(new_tasks) => app_ack_tasks = new_tasks,
+                            Err(e) => eprintln!(
+                                "isekai-pipe connect: control stream re-establishment after promote failed ({e:#}), \
+                                 continuing without resume support until the next reattach"
+                            ),
+                        }
+                        drop(promoted.connection);
                         // The promoted connection was dialed directly by
                         // `WarmStandby`, not via the endpoint this
                         // generation's `network_rebinder` came from — no
@@ -1755,10 +1812,17 @@ async fn run_resume_loop(
                 .await
                 {
                     Ok(mut resumed) => {
-                        drop(resumed.connection);
                         if !replay_and_advance(&replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
                             continue;
                         }
+                        match reestablish_control_stream(&resumed.connection, &target.session_secret, &counters).await {
+                            Ok(new_tasks) => app_ack_tasks = new_tasks,
+                            Err(e) => eprintln!(
+                                "isekai-pipe connect: control stream re-establishment after resume failed ({e:#}), \
+                                 continuing without resume support until the next reattach"
+                            ),
+                        }
+                        drop(resumed.connection);
                         network_rebinder = resumed.network_rebinder;
                         break resumed.data_stream;
                     }
@@ -2740,6 +2804,18 @@ mod tests {
     }
 
     #[test]
+    fn replay_buffer_replay_from_beyond_end_offset_is_none() {
+        // The other boundary of `replay_from`'s range check (the "helper
+        // claims to have committed bytes this client never even sent" case
+        // `replay_and_advance` must treat as a protocol inconsistency, not
+        // "nothing to replay" — codex review, quicmux-server-resume).
+        let mut buffer = C2hReplayBuffer::new(16);
+        buffer.append(b"hello");
+        assert_eq!(buffer.end_offset(), 5);
+        assert!(buffer.replay_from(6).is_none());
+    }
+
+    #[test]
     fn replay_buffer_backpressures_at_capacity() {
         let mut buffer = C2hReplayBuffer::new(4);
         buffer.append(b"abcd");
@@ -3250,6 +3326,131 @@ mod tests {
         let rendered = format!("{err:#}");
         assert!(rendered.contains("simulated STUN failure"), "{rendered}");
         assert!(rendered.contains("cross-family relay fallback also failed"), "{rendered}");
+    }
+
+    /// Minimal real-QUIC fixture for `reestablish_control_stream`/
+    /// `replay_and_advance`'s new behavior (codex review,
+    /// quicmux-server-resume): a listener that accepts one connection and
+    /// speaks just enough of the control-stream wire format
+    /// (`CONTROL_HELLO`/`CONTROL_ACK`, `archive/HELPER_PROTOCOL.md` §7.3) to
+    /// let `open_control_stream` succeed — mirrors
+    /// `isekai-transport::warm_standby`'s own test listener, minus the
+    /// RESUME dispatch this doesn't need.
+    mod resume_control_stream_tests {
+        use super::*;
+        use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        const CONTROL_HELLO: u8 = 0x10;
+        const CONTROL_ACK: u8 = 0x11;
+        const CONTROL_HELLO_FRAME_LEN: usize = 1 + 32; // type byte + 32-byte proof
+        const CONTROL_ACK_FRAME_LEN: usize = 1 + 16; // type byte + 16-byte session_id
+
+        fn test_server_config() -> (quicmux::MuxServerConfig, String) {
+            let cert = rcgen::generate_simple_self_signed(vec!["isekai-pipe.local".to_string()]).unwrap();
+            let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().clone());
+            let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+            let cert_sha256_hex = {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(cert_der.as_ref());
+                hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+            };
+            let config = quicmux::MuxServerConfig {
+                alpn: ALPN.to_vec(),
+                exporter_label: EXPORTER_LABEL.to_vec(),
+                max_idle_timeout: Duration::from_secs(15),
+                keep_alive_interval: Duration::from_secs(5),
+                max_concurrent_bidi_streams: 4,
+                max_concurrent_uni_streams: 0,
+                multipath: false,
+                cert_chain: vec![cert_der],
+                private_key: key_der,
+            };
+            (config, cert_sha256_hex)
+        }
+
+        /// Accepts exactly one connection and, on its first bidi stream,
+        /// reads a `CONTROL_HELLO` frame (ignoring the proof — this fixture
+        /// isn't testing auth) and replies with `CONTROL_ACK` plus a fixed
+        /// session_id, then holds the connection open by looping
+        /// `accept_bi()` (matching `warm_standby.rs`'s own listener, which
+        /// documents why: dropping the connection right after the write can
+        /// race the client's read of that same write).
+        async fn spawn_control_hello_listener() -> (SocketAddr, String) {
+            let (server_config, cert_sha256_hex) = test_server_config();
+            let listener = quicmux::AnyMuxListener::bind_noq(server_config, quicmux::BindSpec::any_ipv4()).await.unwrap();
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
+            tokio::spawn(async move {
+                let Some(incoming) = listener.accept().await else { return };
+                let Ok(conn) = incoming.accept().await else { return };
+                loop {
+                    let Ok(stream) = conn.accept_bi().await else { break };
+                    let (mut recv, mut send) = stream.split();
+                    let mut hello = [0u8; CONTROL_HELLO_FRAME_LEN];
+                    if recv.read(&mut hello).await.unwrap_or(0) == 0 || hello[0] != CONTROL_HELLO {
+                        continue;
+                    }
+                    let mut ack = vec![CONTROL_ACK];
+                    ack.extend_from_slice(&[0x7Fu8; CONTROL_ACK_FRAME_LEN - 1]);
+                    let _ = send.write_all(&ack).await;
+                }
+            });
+            (addr, cert_sha256_hex)
+        }
+
+        async fn connect(addr: SocketAddr, cert_sha256_hex: String) -> quicmux::AnyMuxConnection {
+            let factory = system_quic_factory();
+            let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.unwrap();
+            endpoint
+                .connect(quicmux::RemoteSpec { addr, server_name: "isekai-pipe.local".to_string(), cert_sha256_hex })
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn reestablish_control_stream_succeeds_against_a_real_listener() {
+            let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
+            let conn = connect(addr, cert_sha256_hex).await;
+            let counters = Arc::new(AppAckCounters::new());
+
+            let tasks = reestablish_control_stream(&conn, b"any-session-secret", &counters).await;
+            assert!(tasks.is_ok(), "{:?}", tasks.err());
+            tasks.unwrap().abort();
+        }
+
+        #[tokio::test]
+        async fn replay_and_advance_rejects_a_committed_offset_beyond_what_was_ever_sent() {
+            let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
+            let conn = connect(addr, cert_sha256_hex).await;
+            let mut stream = conn.open_bi().await.unwrap();
+
+            let replay = Mutex::new(C2hReplayBuffer::new(1024));
+            replay.lock().unwrap().append(b"hello");
+
+            // The helper claims committed_offset=999, but this client never
+            // sent more than 5 bytes — a protocol inconsistency that must
+            // not be silently accepted (codex review).
+            let ok = replay_and_advance(&replay, 999, &mut stream).await;
+            assert!(!ok, "an out-of-range committed_offset must be rejected, not silently accepted");
+            assert_eq!(replay.lock().unwrap().end_offset(), 5, "the replay buffer must be untouched on rejection");
+        }
+
+        #[tokio::test]
+        async fn replay_and_advance_still_replays_a_valid_in_range_offset() {
+            // Regression check: the new out-of-range rejection above must
+            // not have broken the ordinary, already-tested in-range path.
+            let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
+            let conn = connect(addr, cert_sha256_hex).await;
+            let mut stream = conn.open_bi().await.unwrap();
+
+            let replay = Mutex::new(C2hReplayBuffer::new(1024));
+            replay.lock().unwrap().append(b"hello world");
+
+            let ok = replay_and_advance(&replay, 6, &mut stream).await;
+            assert!(ok);
+            assert_eq!(replay.lock().unwrap().end_offset(), 11);
+        }
     }
 }
 
