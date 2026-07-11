@@ -209,9 +209,31 @@ pub fn default_profiles_dir() -> io::Result<PathBuf> {
     Ok(std::env::temp_dir().join("isekai-profiles"))
 }
 
-/// Writes `profile` to `<dir>/<profile.profile>.json`, atomically (write to
-/// a sibling temp file, then rename) and with owner-only permissions,
-/// mirroring `write_connection_intent`'s approach in `lib.rs`.
+/// Escapes characters that are reserved in Windows filenames -- most
+/// notably `:`, which NTFS interprets as the Alternate Data Stream
+/// separator. Profile keys are `host:port` (`isekai_trust::normalize_host_port`),
+/// so writing `<key>.json` unescaped turns the on-disk name into
+/// `<host>:<port>.json`, i.e. a `<port>.json` *stream* on a `<host>` base
+/// file; `fs::rename`'s underlying `MoveFileEx` call then fails with
+/// `ERROR_INVALID_PARAMETER` (os error 87) because it can't rename across
+/// streams that way. Escaping keeps the on-disk name a single real
+/// filename on every platform; nothing reconstructs a key by parsing a
+/// filename back (callers always pass the key explicitly), so this only
+/// needs to be unambiguous, not reversible.
+fn sanitize_filename_component(key: &str) -> String {
+    key.chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => format!("%{:02X}", c as u32),
+            c if (c as u32) < 0x20 => format!("%{:02X}", c as u32),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+/// Writes `profile` to `<dir>/<profile.profile>.json` (filename-escaped via
+/// [`sanitize_filename_component`]), atomically (write to a sibling temp
+/// file, then rename) and with owner-only permissions, mirroring
+/// `write_connection_intent`'s approach in `lib.rs`.
 pub fn write_persistent_profile(dir: &Path, profile: &PersistentProfile) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -219,8 +241,9 @@ pub fn write_persistent_profile(dir: &Path, profile: &PersistentProfile) -> io::
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
-    let path = dir.join(format!("{}.json", profile.profile));
-    let tmp = dir.join(format!("{}.{}.tmp", profile.profile, std::process::id()));
+    let filename_key = sanitize_filename_component(&profile.profile);
+    let path = dir.join(format!("{filename_key}.json"));
+    let tmp = dir.join(format!("{filename_key}.{}.tmp", std::process::id()));
     let bytes = serde_json::to_vec_pretty(profile)?;
     fs::write(&tmp, &bytes)?;
     #[cfg(unix)]
@@ -301,7 +324,7 @@ where
 
 /// Loads a previously written persistent profile, if present.
 pub fn load_persistent_profile(dir: &Path, profile_name: &str) -> io::Result<Option<PersistentProfile>> {
-    let path = dir.join(format!("{profile_name}.json"));
+    let path = dir.join(format!("{}.json", sanitize_filename_component(profile_name)));
     match fs::read(&path) {
         Ok(bytes) => {
             let profile = serde_json::from_slice(&bytes)
@@ -450,6 +473,29 @@ mod tests {
         assert_eq!(loaded, Some(profile));
 
         assert_eq!(load_persistent_profile(&dir, "no-such-host").unwrap(), None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn host_port_key_does_not_reach_the_filesystem_as_a_raw_colon() {
+        // `host:port` keys written unescaped become `<host>:<port>.json` on
+        // disk, which NTFS parses as an Alternate Data Stream (`<port>.json`
+        // on a `<host>` base file) rather than a plain filename -- the
+        // `fs::rename` in `write_persistent_profile` then fails on Windows
+        // with `ERROR_INVALID_PARAMETER` (os error 87).
+        let dir = std::env::temp_dir().join(format!(
+            "isekai-pipe-profile-test-colon-{}-{}",
+            std::process::id(),
+            profile_test_nonce()
+        ));
+        let profile = PersistentProfile::migrate_legacy_helper_trust("myhost:22", &sample_trust());
+
+        let path = write_persistent_profile(&dir, &profile).unwrap();
+        assert!(
+            !path.file_name().unwrap().to_str().unwrap().contains(':'),
+            "on-disk filename must not contain a raw ':': {path:?}"
+        );
+        assert_eq!(load_persistent_profile(&dir, "myhost:22").unwrap(), Some(profile));
         let _ = fs::remove_dir_all(dir);
     }
 
