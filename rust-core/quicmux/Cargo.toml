@@ -12,6 +12,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 sha2 = "0.10"
 thiserror = "2.0.18"
 log = "0.4"
+rand = "0.8"
 
 # `noq` backend (quinn's multipath fork, UDP-based). Optional so a consumer
 # that only wants the `qmux` backend (or only the backend-agnostic

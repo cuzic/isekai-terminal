@@ -4,6 +4,7 @@
 //! `system::SystemQuicEndpoint`/`system::SystemQuicConnection`/
 //! `system::SystemByteStream` before they moved here.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use noq::crypto::rustls::QuicClientConfig;
@@ -12,6 +13,53 @@ use crate::cert::{CertMismatchSlot, PinnedCertVerifier};
 use crate::config::MuxClientConfig;
 use crate::error::MuxError;
 use crate::types::{BindSpec, RemoteSpec};
+
+/// The sequence of local ports [`bind_udp_socket_async`]/[`bind_udp_socket_sync`]
+/// should try binding to: `bind.local_addr`'s own port when no range is
+/// set, otherwise every port in `bind.port_range` (inclusive), starting
+/// from a random offset so many endpoints created in the same instant
+/// don't all race for the low end of the range.
+fn candidate_ports(bind: &BindSpec) -> Vec<u16> {
+    match bind.port_range {
+        None => vec![bind.local_addr.port()],
+        Some((start, end)) => {
+            use rand::Rng as _;
+            let span = u32::from(end) - u32::from(start) + 1;
+            let offset = rand::rngs::OsRng.gen_range(0..span);
+            (0..span).map(|i| start + ((offset + i) % span) as u16).collect()
+        }
+    }
+}
+
+async fn bind_udp_socket_async(bind: &BindSpec) -> Result<tokio::net::UdpSocket, MuxError> {
+    let mut last_err = None;
+    for port in candidate_ports(bind) {
+        match tokio::net::UdpSocket::bind(SocketAddr::new(bind.local_addr.ip(), port)).await {
+            Ok(socket) => return Ok(socket),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(MuxError::Bind {
+        addr: bind.local_addr,
+        source: last_err
+            .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty port range")),
+    })
+}
+
+fn bind_udp_socket_sync(bind: &BindSpec) -> Result<std::net::UdpSocket, MuxError> {
+    let mut last_err = None;
+    for port in candidate_ports(bind) {
+        match std::net::UdpSocket::bind(SocketAddr::new(bind.local_addr.ip(), port)) {
+            Ok(socket) => return Ok(socket),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(MuxError::Bind {
+        addr: bind.local_addr,
+        source: last_err
+            .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty port range")),
+    })
+}
 
 /// Adapts an already-bound `std::net::UdpSocket` into whatever concrete
 /// `noq::AsyncUdpSocket` a [`NoqFactory`] should actually hand to
@@ -150,9 +198,7 @@ impl NoqFactory {
     }
 
     pub(crate) async fn create_endpoint(&self, bind: BindSpec) -> Result<NoqEndpoint, MuxError> {
-        let socket = tokio::net::UdpSocket::bind(bind.local_addr)
-            .await
-            .map_err(|source| MuxError::Bind { addr: bind.local_addr, source })?;
+        let socket = bind_udp_socket_async(&bind).await?;
         let std_socket = socket.into_std().map_err(|source| MuxError::Bind { addr: bind.local_addr, source })?;
         self.endpoint_from_std_socket(std_socket)
     }
@@ -227,7 +273,7 @@ impl NoqRebinder {
     }
 
     pub(crate) async fn rebind(&self, bind: BindSpec) -> Result<(), MuxError> {
-        let socket = std::net::UdpSocket::bind(bind.local_addr).map_err(|source| MuxError::Bind { addr: bind.local_addr, source })?;
+        let socket = bind_udp_socket_sync(&bind)?;
         self.rebind_socket(socket).await
     }
 }
@@ -399,5 +445,43 @@ mod tests {
             Err(other) => panic!("expected CertPinMismatch, got {other:?}"),
             Ok(_) => panic!("expected CertPinMismatch, connect unexpectedly succeeded"),
         }
+    }
+
+    fn local_bind(port_range: Option<(u16, u16)>) -> BindSpec {
+        BindSpec { local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), port_range }
+    }
+
+    #[test]
+    fn candidate_ports_without_a_range_is_just_binds_own_port() {
+        let bind = BindSpec { local_addr: "127.0.0.1:5555".parse().unwrap(), port_range: None };
+        assert_eq!(candidate_ports(&bind), vec![5555]);
+    }
+
+    #[test]
+    fn candidate_ports_with_a_range_covers_every_port_exactly_once() {
+        let bind = BindSpec { local_addr: "127.0.0.1:0".parse().unwrap(), port_range: Some((40000, 40004)) };
+        let mut ports = candidate_ports(&bind);
+        ports.sort_unstable();
+        assert_eq!(ports, vec![40000, 40001, 40002, 40003, 40004]);
+    }
+
+    #[tokio::test]
+    async fn bind_udp_socket_async_without_a_range_uses_an_os_assigned_port() {
+        let socket = bind_udp_socket_async(&local_bind(None)).await.unwrap();
+        assert_ne!(socket.local_addr().unwrap().port(), 0);
+    }
+
+    #[tokio::test]
+    async fn bind_udp_socket_async_with_a_range_picks_a_port_inside_it() {
+        let socket = bind_udp_socket_async(&local_bind(Some((40100, 40200)))).await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        assert!((40100..=40200).contains(&port), "port {port} outside requested range");
+    }
+
+    #[test]
+    fn bind_udp_socket_sync_with_a_range_picks_a_port_inside_it() {
+        let socket = bind_udp_socket_sync(&local_bind(Some((40300, 40400)))).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        assert!((40300..=40400).contains(&port), "port {port} outside requested range");
     }
 }
