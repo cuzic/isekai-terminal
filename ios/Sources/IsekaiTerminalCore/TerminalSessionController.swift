@@ -257,12 +257,11 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     }
 
     /// Phase 1E-5(#44): STUN+SSHランデブーP2P。Android版
-    /// `ConnectionProfile.toIsekaiStunP2pConfig`相当。`profile.stunServer`が
-    /// 未設定/空文字なら`defaultStunServer`を使う(Android版`DEFAULT_STUN_SERVER`と同じ方針、
-    /// 双方が同じSTUNサーバーを使う必要は無いため単なるデフォルト値)。
+    /// `ConnectionProfile.toIsekaiStunP2pConfig`相当。`profile.stunServers`
+    /// (カンマ/空白区切りパース済み、空/未設定なら`defaultStunServer`1件、
+    /// `ProfileDatabase.swift`参照)をそのまま渡す。
     func makeIsekaiStunP2pConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> IsekaiStunP2pConfig {
-        let stunServer = profile.stunServer?.trimmingCharacters(in: .whitespaces)
-        return IsekaiStunP2pConfig(
+        IsekaiStunP2pConfig(
             sshHost: profile.host,
             sshPort: UInt16(profile.port),
             username: profile.username,
@@ -270,7 +269,7 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             cols: cols,
             rows: rows,
             jump: jump,
-            stunServer: (stunServer?.isEmpty ?? true) ? defaultStunServer : stunServer!
+            stunServers: profile.stunServers
         )
     }
 
