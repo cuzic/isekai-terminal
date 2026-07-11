@@ -106,6 +106,15 @@ struct ConnectLaunch {
     /// is chosen once up front — never retried automatically if the `Udp`
     /// path fails.
     relay_transport: RelayTransportKind,
+    /// `--bind-port-range <START>-<END>`: narrows this connection's local
+    /// QUIC socket to that inclusive UDP port range instead of an
+    /// OS-assigned ephemeral one (`isekai_pipe_core::ConnectionIntent::local_bind_port_range`'s
+    /// docs) — only takes effect on the manual `--profile`-driven path
+    /// (`intent_from_profile`); when `ISEKAI_INTENT_ID` is set, the claimed
+    /// `ConnectionIntent` (already written by `isekai-ssh`'s `#@isekai
+    /// local-bind-port-range`) wins instead, matching every other
+    /// intent-carried setting.
+    bind_port_range: Option<(u16, u16)>,
 }
 
 /// See `ConnectLaunch::relay_transport`'s doc comment.
@@ -179,6 +188,7 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
     let mut resume_window = DEFAULT_RESUME_WINDOW;
     let mut experimental_network_rebind = false;
     let mut relay_transport = RelayTransportKind::default();
+    let mut bind_port_range: Option<(u16, u16)> = None;
     let mut iter = args.peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -209,6 +219,15 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                 );
                 println!(
                     "                                   (EXPERIMENTAL, unverified wire compat with the deployed relay)"
+                );
+                println!(
+                    "    --bind-port-range <S>-<E>      pick this connection's local QUIC port from this range"
+                );
+                println!(
+                    "                                   instead of an OS-assigned one (ignored when ISEKAI_INTENT_ID"
+                );
+                println!(
+                    "                                   is set — the claimed ConnectionIntent's own value wins)"
                 );
                 return Ok(None);
             }
@@ -276,6 +295,28 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                     ExitCode::from(EX_USAGE)
                 })?;
             }
+            "--bind-port-range" => {
+                let value = next_arg("connect", &mut iter, &arg).map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                let (start, end) = value.split_once('-').ok_or_else(|| {
+                    eprintln!("isekai-pipe connect: invalid --bind-port-range value {value:?} (expected <START>-<END>)");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                let parse_port = |s: &str| -> Result<u16, ExitCode> {
+                    s.parse().map_err(|_| {
+                        eprintln!("isekai-pipe connect: invalid --bind-port-range bound {s:?}");
+                        ExitCode::from(EX_USAGE)
+                    })
+                };
+                let (start, end) = (parse_port(start)?, parse_port(end)?);
+                if start > end {
+                    eprintln!("isekai-pipe connect: invalid --bind-port-range {value:?}: start must be <= end");
+                    return Err(ExitCode::from(EX_USAGE));
+                }
+                bind_port_range = Some((start, end));
+            }
             "--listen" => {
                 eprintln!(
                     "isekai-pipe connect: --listen is not wired to the legacy connect runtime yet"
@@ -323,6 +364,7 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
         resume_window,
         experimental_network_rebind,
         relay_transport,
+        bind_port_range,
     }))
 }
 
@@ -527,6 +569,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
                 server_name: server_name.as_str().to_string(),
                 cert_sha256_hex: cert_pin.to_hex(),
                 session_secret,
+                local_bind_port_range: intent.local_bind_port_range,
             },
             &profile,
             intent.resume_grace_secs,
@@ -604,6 +647,7 @@ async fn recover_via_cross_family_fallback(
             server_name: server_name.clone(),
             cert_sha256_hex: intent.expected_server_identity.cert_sha256_hex.clone(),
             session_secret,
+            local_bind_port_range: intent.local_bind_port_range,
         },
         &intent.profile,
         intent.resume_grace_secs,
@@ -705,6 +749,7 @@ async fn resolve_relay_candidates(
                     server_name: server_name.as_str().to_string(),
                     cert_sha256_hex: cert_pin.to_hex(),
                     session_secret: session_secret.to_vec(),
+                    local_bind_port_range: intent.local_bind_port_range,
                 },
                 candidate_id: candidate.id.0.to_string(),
             })
@@ -840,6 +885,7 @@ fn intent_from_profile(
         BootstrapProvenance::TrustStore { key },
     );
     intent.resume_grace_secs = launch.resume_window.as_secs();
+    intent.local_bind_port_range = launch.bind_port_range;
     if launch.mode == ConnectMode::Stun {
         intent.stun_servers = launch.stun_servers.clone();
     }
@@ -1239,6 +1285,12 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
         server_name: "isekai-helper".to_string(),
         cert_sha256_hex: entry.server_identity.cert_sha256_hex.clone(),
         session_secret,
+        // `isekai-pipe probe` diagnoses reachability against a
+        // `PersistentProfile`, which doesn't carry a configured local
+        // bind-port-range (that lives on `ConnectionIntent`, the real
+        // connect path's input) — probing unrestricted is the closest
+        // available approximation.
+        local_bind_port_range: None,
     };
     let candidates = vec![SequentialRelayCandidate { target, candidate_id: "probe".to_string() }];
     // `requested_resume_grace_secs: 0` — a probe is a one-shot diagnostic
@@ -1388,14 +1440,14 @@ async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidates: &[Sequen
 /// just a fresh socket for the OS to route via its current default path,
 /// which is what actually helps after e.g. a Wi-Fi disconnect where the OS
 /// has since switched its default route to something else.
-fn remote_bind_spec(remote: std::net::SocketAddr) -> BindSpec {
+fn remote_bind_spec(remote: std::net::SocketAddr, local_bind_port_range: Option<(u16, u16)>) -> BindSpec {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     let local_addr = if remote.is_ipv4() {
         SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
     } else {
         SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
     };
-    BindSpec { local_addr }
+    BindSpec { local_addr, port_range: local_bind_port_range }
 }
 
 /// Spawns this connection generation's "the current connection should be
@@ -1464,13 +1516,14 @@ fn spawn_reconnect_signal<R: Rebindable + 'static>(
     rebinder: Option<R>,
     experimental_network_rebind: bool,
     helper_addr: std::net::SocketAddr,
+    local_bind_port_range: Option<(u16, u16)>,
 ) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<()>) {
     let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
     let handle = tokio::spawn(async move {
         let mut network_monitor = monitor;
         match (experimental_network_rebind, rebinder) {
             (true, Some(rebinder)) => {
-                let bind = remote_bind_spec(helper_addr);
+                let bind = remote_bind_spec(helper_addr, local_bind_port_range);
                 while network_monitor.next_change().await.is_some() {
                     log::info!("isekai-pipe connect: rebind_attempted");
                     match rebinder.rebind(bind).await {
@@ -1542,6 +1595,7 @@ async fn run_resume_loop(
             network_rebinder.take(),
             experimental_network_rebind,
             target.helper_addr,
+            target.local_bind_port_range,
         );
 
         let (quic_read, quic_write) = data_stream.split();
@@ -2673,7 +2727,7 @@ mod tests {
         let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
             Box::new(FireOnceNetworkChangeMonitor { fired: false });
         let (task, mut rx) =
-            spawn_reconnect_signal(monitor, None::<MockRebinder>, /* experimental */ false, TEST_HELPER_ADDR.parse().unwrap());
+            spawn_reconnect_signal(monitor, None::<MockRebinder>, /* experimental */ false, TEST_HELPER_ADDR.parse().unwrap(), None);
 
         assert!(rx.recv().await.is_some(), "a plain network change must be forwarded when experimental rebind is off");
         task.abort();
@@ -2687,7 +2741,7 @@ mod tests {
         let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
             Box::new(FireOnceNetworkChangeMonitor { fired: false });
         let (task, mut rx) =
-            spawn_reconnect_signal(monitor, None::<MockRebinder>, /* experimental */ true, TEST_HELPER_ADDR.parse().unwrap());
+            spawn_reconnect_signal(monitor, None::<MockRebinder>, /* experimental */ true, TEST_HELPER_ADDR.parse().unwrap(), None);
 
         assert!(rx.recv().await.is_some(), "with no rebinder available, a network change must still be forwarded");
         task.abort();
@@ -2703,6 +2757,7 @@ mod tests {
             Some(rebinder),
             /* experimental */ true,
             TEST_HELPER_ADDR.parse().unwrap(),
+            None,
         );
 
         let result = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
@@ -2723,6 +2778,7 @@ mod tests {
             Some(rebinder),
             /* experimental */ true,
             TEST_HELPER_ADDR.parse().unwrap(),
+            None,
         );
 
         assert!(rx.recv().await.is_some(), "a failed rebind attempt must fall back to the reconnect signal");
