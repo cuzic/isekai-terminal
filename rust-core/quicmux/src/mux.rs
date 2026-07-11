@@ -190,6 +190,16 @@ impl AnyMuxListener {
         Ok(Self::Noq(crate::noq_backend::NoqListener::wrap_bound_socket(config, socket).await?))
     }
 
+    /// Wraps an already-adapted `Box<dyn noq::AsyncUdpSocket>` as a listener
+    /// directly, for a caller whose socket isn't a plain
+    /// `tokio::net::UdpSocket` at all — see
+    /// [`crate::noq_backend::NoqListener::from_abstract_socket`]'s docs
+    /// (e.g. `isekai-pipe serve`'s `--relay` MASQUE-tunnel socket).
+    #[cfg(feature = "noq")]
+    pub fn from_abstract_socket_noq(config: MuxServerConfig, socket: Box<dyn noq::AsyncUdpSocket>) -> Result<Self, MuxError> {
+        Ok(Self::Noq(crate::noq_backend::NoqListener::from_abstract_socket(config, socket)?))
+    }
+
     /// Binds a fresh local TCP socket at `bind` and listens for inbound
     /// `qmux` connections. No `wrap_bound_socket`-style counterpart — unlike
     /// `noq`'s UDP-socket-then-STUN-then-hand-off pattern, nothing in this
@@ -223,15 +233,17 @@ impl AnyMuxListener {
 
     /// Requests that the listener stop accepting new connections. Best-
     /// effort, and backend-dependent in scope: the `noq` backend also closes
-    /// every connection it already produced (does not wait for peers to
+    /// every connection it already produced, sending `reason` as the
+    /// application-level close reason (does not wait for peers to
     /// acknowledge; see [`AnyMuxListener::wait_idle`] for that), while the
-    /// `qmux` backend only stops accepting new TCP connections — it has no
-    /// centralized tracking of connections it already produced to close (see
-    /// `qmux_backend`'s module docs).
-    pub fn close(&self) {
+    /// `qmux` backend only stops accepting new TCP connections (`reason` is
+    /// unused there — a bare TCP listener close has no application-level
+    /// close-reason concept) — it has no centralized tracking of connections
+    /// it already produced to close (see `qmux_backend`'s module docs).
+    pub fn close(&self, reason: &[u8]) {
         match self {
             #[cfg(feature = "noq")]
-            Self::Noq(listener) => listener.close(),
+            Self::Noq(listener) => listener.close(reason),
             #[cfg(feature = "qmux")]
             Self::Qmux(listener) => listener.close(),
         }
@@ -278,7 +290,14 @@ impl AnyMuxIncoming {
     }
 }
 
-/// An established mux connection.
+/// An established mux connection. `Clone` — both backing types
+/// (`noq::Connection`/`qmux::Session`) are themselves cheap `Clone` handles
+/// onto shared state, not owners of a background task that dies with one
+/// particular value (see each's own doc comment), so a caller that needs to
+/// hand a second handle to a spawned task (e.g. to open a control stream
+/// concurrently with driving the main data stream) can just clone this
+/// rather than needing an `Arc<AnyMuxConnection>` wrapper of its own.
+#[derive(Clone)]
 pub enum AnyMuxConnection {
     #[cfg(feature = "noq")]
     Noq(crate::noq_backend::NoqConnection),

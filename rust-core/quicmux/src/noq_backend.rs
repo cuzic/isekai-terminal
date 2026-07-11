@@ -300,13 +300,25 @@ impl NoqListener {
     }
 
     pub(crate) async fn wrap_bound_socket(config: MuxServerConfig, socket: tokio::net::UdpSocket) -> Result<Self, MuxError> {
-        let server_config = noq_server_config(&config)?;
         let std_socket = socket.into_std().map_err(|e| MuxError::SocketSetup(e.to_string()))?;
         let async_socket = default_socket_adapter()(std_socket).map_err(|e| MuxError::SocketSetup(e.to_string()))?;
+        Self::from_abstract_socket(config, async_socket)
+    }
+
+    /// Wraps an already-adapted `Box<dyn noq::AsyncUdpSocket>` as a listener
+    /// directly, bypassing the plain-`tokio::net::UdpSocket` path entirely —
+    /// the listener-side counterpart to
+    /// [`crate::noq_backend::endpoint_from_abstract_socket`] (client side),
+    /// for a caller whose socket isn't a plain UDP socket at all (e.g.
+    /// `isekai-pipe serve`'s `--relay` mode, which tunnels through a MASQUE
+    /// relay via its own custom `noq::AsyncUdpSocket` implementation — there
+    /// is no `tokio::net::UdpSocket` anywhere in that path to convert).
+    pub(crate) fn from_abstract_socket(config: MuxServerConfig, socket: Box<dyn noq::AsyncUdpSocket>) -> Result<Self, MuxError> {
+        let server_config = noq_server_config(&config)?;
         let endpoint = noq::Endpoint::new_with_abstract_socket(
             noq::EndpointConfig::default(),
             Some(server_config),
-            async_socket,
+            socket,
             Arc::new(noq::TokioRuntime),
         )
         .map_err(|e| MuxError::EndpointSetup(e.to_string()))?;
@@ -336,10 +348,11 @@ impl NoqListener {
     }
 
     /// Requests that the listener (and every connection it produced) be
-    /// closed. Best-effort — does not wait for peers to acknowledge; see
-    /// [`NoqListener::wait_idle`] for that.
-    pub(crate) fn close(&self) {
-        self.endpoint.close(noq::VarInt::from_u32(0), b"shutdown");
+    /// closed, with `reason` as the application-level close reason each
+    /// connected peer observes. Best-effort — does not wait for peers to
+    /// acknowledge; see [`NoqListener::wait_idle`] for that.
+    pub(crate) fn close(&self, reason: &[u8]) {
+        self.endpoint.close(noq::VarInt::from_u32(0), reason);
     }
 
     /// Waits until every connection this listener produced has finished
@@ -366,6 +379,7 @@ impl NoqIncoming {
     }
 }
 
+#[derive(Clone)]
 pub struct NoqConnection {
     conn: noq::Connection,
 }

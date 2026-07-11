@@ -272,6 +272,7 @@ impl QmuxIncoming {
     }
 }
 
+#[derive(Clone)]
 pub struct QmuxConnection {
     session: qmux::Session,
     /// The `label` `export_keying_material` was actually captured for — see
