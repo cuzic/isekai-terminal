@@ -23,6 +23,7 @@ pub mod backend;
 pub mod client_candidates;
 pub mod error;
 pub mod openssh;
+mod reuse;
 pub mod types;
 
 pub use backend::BootstrapBackend;
