@@ -106,25 +106,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -x
-          SOCK=""
+          CONN=""
           for i in $(seq 1 15); do
-            SOCK=$(find /tmp /home/runner -iname "*tmate*.sock" -o -iname "*tmate*" -type s 2>/dev/null | head -1)
-            [ -n "$SOCK" ] && break
+            CONN=$(/tmp/tmate/tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>&1 || true)
+            case "$CONN" in ssh\ *) break ;; esac
             sleep 2
           done
-          CONN_DEFAULT=$(tmate display -p '#{tmate_ssh}' 2>&1 || true)
-          CONN_SOCK=""
-          if [ -n "$SOCK" ]; then
-            CONN_SOCK=$(tmate -S "$SOCK" display -p '#{tmate_ssh}' 2>&1 || true)
-          fi
           {
-            echo "DEBUG tmate socket=\`$SOCK\`"
-            echo "default-display: \`$CONN_DEFAULT\`"
-            echo "socket-display: \`$CONN_SOCK\`"
-            echo 'ps:'
-            echo '```'
-            ps aux | grep -i tmate | grep -v grep
-            echo '```'
+            echo "DEBUG tmate connection:"
+            echo "\`$CONN\`"
           } > /tmp/debug-tmate-body.md
           gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/debug-tmate-body.md
 
