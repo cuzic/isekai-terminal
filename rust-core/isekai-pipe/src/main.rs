@@ -1647,6 +1647,30 @@ async fn reestablish_control_stream(
     Ok(spawn_app_ack_tasks(control.stream, counters.clone()))
 }
 
+/// The server clamps our request to its own configured max (or applies its
+/// own default when we requested `0`) and echoes back what it actually
+/// granted — that, not our own request, is the real deadline: the server
+/// will have already discarded the parked session past this point
+/// regardless of how long we keep retrying (`ISEKAI_PIPE_DESIGN.md`).
+///
+/// `0` itself is treated as "no real value was ever learned" rather than a
+/// literal zero-second window: `isekai-transport::resume::finish_via_resume`
+/// (the `MustResume` ambiguous-attach convergence path) has no ATTACH_HELLO
+/// exchange to learn the server's actual grant from, and — even after that
+/// function's own fix to fall back to the caller's originally *requested*
+/// grace period instead of hardcoding `0` — a caller that itself requested
+/// `0` (isekai-ssh/isekai-pipe connect's own "let the server pick its
+/// default" convention) still produces `0` here. Without this fallback, any
+/// session that ever passed through that convergence path would give up on
+/// its very first subsequent disconnect instead of resuming at all (codex
+/// review, quicmux-server-resume).
+fn resume_window_for(effective_resume_grace_secs: u32) -> Duration {
+    match effective_resume_grace_secs {
+        0 => DEFAULT_RESUME_WINDOW,
+        secs => Duration::from_secs(secs.into()),
+    }
+}
+
 async fn run_resume_loop(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -1658,12 +1682,7 @@ async fn run_resume_loop(
     let session_id = established.session_id;
     drop(established.connection);
 
-    // The server clamps our request to its own configured max (or applies
-    // its own default when we requested `0`) and echoes back what it
-    // actually granted — that, not our own request, is the real deadline: the
-    // server will have already discarded the parked session past this point
-    // regardless of how long we keep retrying (`ISEKAI_PIPE_DESIGN.md`).
-    let resume_window = Duration::from_secs(established.effective_resume_grace_secs.into());
+    let resume_window = resume_window_for(established.effective_resume_grace_secs);
 
     let counters = Arc::new(AppAckCounters::new());
     let mut app_ack_tasks = spawn_app_ack_tasks(established.control_stream, counters.clone());
@@ -2813,6 +2832,20 @@ mod tests {
         buffer.append(b"hello");
         assert_eq!(buffer.end_offset(), 5);
         assert!(buffer.replay_from(6).is_none());
+    }
+
+    #[test]
+    fn resume_window_for_zero_falls_back_to_the_default_window_instead_of_zero_seconds() {
+        // `0` means "no real value was ever learned" (the `MustResume`
+        // convergence path, or a caller that itself requested `0`), not a
+        // literal zero-second resume window that would give up on the very
+        // next disconnect (codex review, quicmux-server-resume).
+        assert_eq!(resume_window_for(0), DEFAULT_RESUME_WINDOW);
+    }
+
+    #[test]
+    fn resume_window_for_a_real_value_uses_it_verbatim() {
+        assert_eq!(resume_window_for(180), Duration::from_secs(180));
     }
 
     #[test]

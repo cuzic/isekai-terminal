@@ -471,6 +471,47 @@ async fn ambiguous_then_already_established_converges_on_resuming_the_ambiguous_
     server2_task.abort();
 }
 
+/// The `MustResume` convergence path (`finish_via_resume`) has no
+/// `ATTACH_HELLO` exchange to learn the server's actually-granted resume
+/// grace period from — it used to hardcode `effective_resume_grace_secs: 0`,
+/// which callers like `isekai-pipe connect`'s `run_resume_loop` treat as a
+/// literal zero-second resume window rather than "unknown" (codex review,
+/// quicmux-server-resume). Confirms the fix: a caller that requested a real,
+/// non-zero grace period sees that same value echoed back even after
+/// converging through this path, not `0`.
+#[tokio::test]
+async fn ambiguous_convergence_reports_the_originally_requested_grace_period_not_zero() {
+    let (cert1_der, key1_der, cert1_hex) = generate_cert();
+    let endpoint1 = mock_server(cert1_der, key1_der);
+    let addr1 = endpoint1.local_addr().unwrap();
+    let server1_task = tokio::spawn(run_silent_then_resumable_helper(endpoint1));
+
+    let (cert2_der, key2_der, cert2_hex) = generate_cert();
+    let endpoint2 = mock_server(cert2_der, key2_der);
+    let addr2 = endpoint2.local_addr().unwrap();
+    let server2_task = tokio::spawn(run_reject_already_established_helper(endpoint2));
+
+    let candidates = vec![candidate("relay-1", addr1, cert1_hex), candidate("relay-2", addr2, cert2_hex)];
+
+    let factory = system_quic_factory();
+    let (session, _winning_target) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_via_relay_resumable_with_fallback(&factory, &candidates, 180),
+    )
+    .await
+    .expect("should not hang")
+    .expect("ATTACH_ALREADY_ESTABLISHED after an ambiguous candidate should converge on resuming it");
+    assert_eq!(
+        session.effective_resume_grace_secs, 180,
+        "should fall back to the originally requested grace period, not report 0 \
+         (which downstream callers would treat as an immediate-give-up deadline)"
+    );
+
+    drop(session.connection);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server1_task).await;
+    server2_task.abort();
+}
+
 /// `#25-4`: an `ambiguous` failure on the first *two* candidates should
 /// each independently advance the generation and rotate forward — proving
 /// the round runner correctly handles more than one consecutive advance,

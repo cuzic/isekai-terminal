@@ -480,6 +480,7 @@ pub async fn connect_via_relay_resumable_with_fallback(
                                 &resume_target,
                                 round.session_id,
                                 candidate.candidate_id.clone(),
+                                requested_resume_grace_secs,
                             )
                             .await;
                         }
@@ -544,6 +545,7 @@ async fn finish_via_resume(
     resume_target: &RelayTarget,
     session_id: SessionId,
     candidate_id: String,
+    requested_resume_grace_secs: u32,
 ) -> Result<(ResumableRelaySession, RelayTarget), SequentialConnectError> {
     let resumed = reconnect_and_resume(factory, resume_target, session_id, C2hSentOffset::ZERO, H2cClientDeliveredOffset::ZERO)
         .await
@@ -567,11 +569,20 @@ async fn finish_via_resume(
         control_stream: control.stream,
         session_id: control.session_id,
         // No fresh negotiation happens on a bare RESUME/RESUME_ACK exchange
-        // (unlike the initial ATTACH_HELLO/AttachReadyV2) — `0` here means
-        // "unknown", matching this codebase's existing "no preference"
-        // convention elsewhere, since the server-granted value from the
-        // original (ambiguous) attach was never observed by this client.
-        effective_resume_grace_secs: 0,
+        // (unlike the initial ATTACH_HELLO/AttachReadyV2), so the server-
+        // granted value from the original (ambiguous) attach was never
+        // observed by this client — falling back to `requested_resume_grace_secs`
+        // (the caller's own original request) rather than `0`: callers like
+        // `isekai-pipe connect`'s `run_resume_loop` treat this field as a
+        // literal deadline in seconds, not a "0 means unknown" sentinel
+        // (`ISEKAI_PIPE_DESIGN.md`), so `0` here previously made any session
+        // that reached this convergence path give up on its very next
+        // disconnect instead of ever attempting to resume (codex review,
+        // quicmux-server-resume). The server may have actually granted less
+        // than what was requested (it clamps to its own configured max), so
+        // this is still only an approximation — but a strictly better one
+        // than a hardcoded `0`.
+        effective_resume_grace_secs: requested_resume_grace_secs,
         network_rebinder: resumed.network_rebinder,
     };
     Ok((session, resume_target.clone()))
