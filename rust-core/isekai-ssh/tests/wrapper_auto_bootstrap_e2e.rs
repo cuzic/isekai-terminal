@@ -318,8 +318,13 @@ fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
     home.join(".local").join("state").join("isekai").join("profiles")
 }
 
+/// Mirrors `isekai_pipe_core::profile::sanitize_filename_component`'s `:` ->
+/// `%3A` escaping (private to that crate) — every key this file uses is a
+/// plain `host:port` string, so replicating just that one substitution is
+/// enough to predict the on-disk filename `write_persistent_profile`
+/// actually produces.
 fn profile_path_under(home: &std::path::Path, key: &str) -> PathBuf {
-    profiles_dir_under(home).join(format!("{key}.json"))
+    profiles_dir_under(home).join(format!("{}.json", key.replace(':', "%3A")))
 }
 
 const VALID_HANDSHAKE_JSON: &str = r#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"}]}"#;

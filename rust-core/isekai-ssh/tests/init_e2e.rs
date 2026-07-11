@@ -382,8 +382,13 @@ fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
     home.join(".local").join("state").join("isekai").join("profiles")
 }
 
+/// Mirrors `isekai_pipe_core::profile::sanitize_filename_component`'s `:` ->
+/// `%3A` escaping (private to that crate) — every key this file uses is a
+/// plain `host:port` string, so replicating just that one substitution is
+/// enough to predict the on-disk filename `write_persistent_profile`
+/// actually produces.
 fn profile_path_under(home: &std::path::Path, key: &str) -> PathBuf {
-    profiles_dir_under(home).join(format!("{key}.json"))
+    profiles_dir_under(home).join(format!("{}.json", key.replace(':', "%3A")))
 }
 
 /// Builds the stand-in "isekai-helper" script `init --helper-binary` is
