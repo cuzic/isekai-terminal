@@ -600,8 +600,9 @@ pub struct ResumeAckOutcome {
 /// 使い続けている`isekai_protocol::resume::ResumeRejectReason`(3値とも
 /// 1:1で対応)に変換する。quicmux-server-resume Stage Bでワイヤフォーマット
 /// 自体はquicmux::resumeへ移行したが、呼び出し側(`isekai-ssh`等)から見た
-/// このcrateの公開エラー型は変えない。
-fn map_reject_reason(reason: quicmux::ResumeRejectReason) -> isekai_protocol::resume::ResumeRejectReason {
+/// このcrateの公開エラー型は変えない。`pub(crate)`: `warm_standby.rs`も
+/// standby連接の直接resumeで同じ変換が必要なため。
+pub(crate) fn map_reject_reason(reason: quicmux::ResumeRejectReason) -> isekai_protocol::resume::ResumeRejectReason {
     match reason {
         quicmux::ResumeRejectReason::Auth => isekai_protocol::resume::ResumeRejectReason::Auth,
         quicmux::ResumeRejectReason::UnknownToken => isekai_protocol::resume::ResumeRejectReason::UnknownSession,
