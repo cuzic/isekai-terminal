@@ -94,9 +94,9 @@ public enum StoredTransportPreference: String, Codable, Equatable, Hashable, Cas
         switch self {
         case .plainSsh: return .plainSsh
         case .tsshdQuic: return .tsshdQuic
-        case .isekaiHelperQuic: return .isekaiHelperQuic
+        case .isekaiHelperQuic: return .isekaiPipeQuic
         case .auto: return .auto
-        case .isekaiHelperQuicMultipath: return .isekaiHelperQuicMultipath
+        case .isekaiHelperQuicMultipath: return .isekaiPipeQuicMultipath
         case .isekaiStunP2pQuic: return .isekaiStunP2pQuic
         case .isekaiLinkRelayQuic: return .isekaiLinkRelayQuic
         }

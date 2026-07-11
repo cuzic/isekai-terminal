@@ -1072,264 +1072,6 @@ public func FfiConverterTypeDiagnosticHandle_lower(_ value: DiagnosticHandle) ->
 
 
 
-public protocol HelperQuicSessionProtocol: AnyObject, Sendable {
-    
-    /**
-     * 明示的にヘルパー経由 QUIC のみを試す（フォールバック無し）。
-     */
-    func connect(callback: SessionCallback) throws 
-    
-    /**
-     * `TransportPreference::Auto` 相当: ヘルパー経由 QUIC を試し、失敗したら
-     * 通常の TCP SSH（Phase 1-4）にフォールバックする。
-     */
-    func connectAuto(callback: SessionCallback) throws 
-    
-    func disconnect() 
-    
-    /**
-     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
-     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
-     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
-     * 何もしない。
-     */
-    func notifyNetworkLost() 
-    
-    func resize(cols: UInt32, rows: UInt32) 
-    
-    func scrollbackCells(offset: UInt32, rows: UInt32)  -> [CellData]
-    
-    func scrollbackLen()  -> UInt32
-    
-    func send(data: Data) 
-    
-    func trzszAcceptDownload(transferId: String) 
-    
-    func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32) 
-    
-    func trzszCancel(transferId: String) 
-    
-    func trzszSendChunk(transferId: String, data: Data, isLast: Bool) 
-    
-}
-open class HelperQuicSession: HelperQuicSessionProtocol, @unchecked Sendable {
-    fileprivate let handle: UInt64
-
-    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public struct NoHandle {
-        public init() {}
-    }
-
-    // TODO: We'd like this to be `private` but for Swifty reasons,
-    // we can't implement `FfiConverter` without making this `required` and we can't
-    // make it `required` without making it `public`.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    required public init(unsafeFromHandle handle: UInt64) {
-        self.handle = handle
-    }
-
-    // This constructor can be used to instantiate a fake object.
-    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
-    //
-    // - Warning:
-    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public init(noHandle: NoHandle) {
-        self.handle = 0
-    }
-
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_helperquicsession(self.handle, $0) }
-    }
-    // No primary constructor declared for this class.
-
-    deinit {
-        if handle == 0 {
-            // Mock objects have handle=0 don't try to free them
-            return
-        }
-
-        try! rustCall { uniffi_isekai_terminal_core_fn_free_helperquicsession(handle, $0) }
-    }
-
-    
-
-    
-    /**
-     * 明示的にヘルパー経由 QUIC のみを試す（フォールバック無し）。
-     */
-open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_connect(
-            self.uniffiCloneHandle(),
-        FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
-    )
-}
-}
-    
-    /**
-     * `TransportPreference::Auto` 相当: ヘルパー経由 QUIC を試し、失敗したら
-     * 通常の TCP SSH（Phase 1-4）にフォールバックする。
-     */
-open func connectAuto(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_connect_auto(
-            self.uniffiCloneHandle(),
-        FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
-    )
-}
-}
-    
-open func disconnect()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_disconnect(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-    /**
-     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
-     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
-     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
-     * 何もしない。
-     */
-open func notifyNetworkLost()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_notify_network_lost(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_resize(
-            self.uniffiCloneHandle(),
-        FfiConverterUInt32.lower(cols),
-        FfiConverterUInt32.lower(rows),$0
-    )
-}
-}
-    
-open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
-    return try!  FfiConverterSequenceTypeCellData.lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_cells(
-            self.uniffiCloneHandle(),
-        FfiConverterUInt32.lower(offset),
-        FfiConverterUInt32.lower(rows),$0
-    )
-})
-}
-    
-open func scrollbackLen() -> UInt32  {
-    return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_scrollback_len(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
-open func send(data: Data)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_send(
-            self.uniffiCloneHandle(),
-        FfiConverterData.lower(data),$0
-    )
-}
-}
-    
-open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_download(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(transferId),$0
-    )
-}
-}
-    
-open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_accept_upload(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(transferId),
-        FfiConverterString.lower(fileName),
-        FfiConverterUInt64.lower(fileSize),
-        FfiConverterUInt32.lower(mode),$0
-    )
-}
-}
-    
-open func trzszCancel(transferId: String)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_cancel(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(transferId),$0
-    )
-}
-}
-    
-open func trzszSendChunk(transferId: String, data: Data, isLast: Bool)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_helperquicsession_trzsz_send_chunk(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(transferId),
-        FfiConverterData.lower(data),
-        FfiConverterBool.lower(isLast),$0
-    )
-}
-}
-    
-
-    
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeHelperQuicSession: FfiConverter {
-    typealias FfiType = UInt64
-    typealias SwiftType = HelperQuicSession
-
-    public static func lift(_ handle: UInt64) throws -> HelperQuicSession {
-        return HelperQuicSession(unsafeFromHandle: handle)
-    }
-
-    public static func lower(_ value: HelperQuicSession) -> UInt64 {
-        return value.uniffiCloneHandle()
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HelperQuicSession {
-        let handle: UInt64 = try readInt(&buf)
-        return try lift(handle)
-    }
-
-    public static func write(_ value: HelperQuicSession, into buf: inout [UInt8]) {
-        writeInt(&buf, lower(value))
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeHelperQuicSession_lift(_ handle: UInt64) throws -> HelperQuicSession {
-    return try FfiConverterTypeHelperQuicSession.lift(handle)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeHelperQuicSession_lower(_ value: HelperQuicSession) -> UInt64 {
-    return FfiConverterTypeHelperQuicSession.lower(value)
-}
-
-
-
-
-
-
 public protocol IsekaiLinkRelaySessionProtocol: AnyObject, Sendable {
     
     /**
@@ -1565,6 +1307,274 @@ public func FfiConverterTypeIsekaiLinkRelaySession_lift(_ handle: UInt64) throws
 #endif
 public func FfiConverterTypeIsekaiLinkRelaySession_lower(_ value: IsekaiLinkRelaySession) -> UInt64 {
     return FfiConverterTypeIsekaiLinkRelaySession.lower(value)
+}
+
+
+
+
+
+
+public protocol IsekaiPipeQuicSessionProtocol: AnyObject, Sendable {
+    
+    /**
+     * 明示的にヘルパー経由 QUIC のみを試す（フォールバック無し）。SSH接続プーリング
+     * (`archive/ISEKAI_SSH_DESIGN.md`参照)により、同一ホスト/ユーザー/鍵/ブートストラップ
+     * パラメータへ既にプールされたHandleがあれば、ブートストラップSSH・ヘルパー起動・
+     * QUICハンドシェイク・ネストしたSSH認証を丸ごとスキップして新しいSSHチャネルだけ開く。
+     */
+    func connect(callback: SessionCallback) throws 
+    
+    /**
+     * `TransportPreference::Auto` 相当: ヘルパー経由 QUIC を試し、失敗したら
+     * 通常の TCP SSH（Phase 1-4）にフォールバックする。プーリングのプールヒット時、
+     * および他タブの確立待ち(waiter)がその後失敗を観測した場合はフォールバックしない
+     * (自分自身がダイヤルを試みて失敗した場合のみフォールバックする、既存の挙動を維持)。
+     */
+    func connectAuto(callback: SessionCallback) throws 
+    
+    func disconnect() 
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+    func notifyNetworkLost() 
+    
+    func resize(cols: UInt32, rows: UInt32) 
+    
+    func scrollbackCells(offset: UInt32, rows: UInt32)  -> [CellData]
+    
+    func scrollbackLen()  -> UInt32
+    
+    func send(data: Data) 
+    
+    func trzszAcceptDownload(transferId: String) 
+    
+    func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32) 
+    
+    func trzszCancel(transferId: String) 
+    
+    func trzszSendChunk(transferId: String, data: Data, isLast: Bool) 
+    
+}
+open class IsekaiPipeQuicSession: IsekaiPipeQuicSessionProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_isekaipipequicsession(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_isekai_terminal_core_fn_free_isekaipipequicsession(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * 明示的にヘルパー経由 QUIC のみを試す（フォールバック無し）。SSH接続プーリング
+     * (`archive/ISEKAI_SSH_DESIGN.md`参照)により、同一ホスト/ユーザー/鍵/ブートストラップ
+     * パラメータへ既にプールされたHandleがあれば、ブートストラップSSH・ヘルパー起動・
+     * QUICハンドシェイク・ネストしたSSH認証を丸ごとスキップして新しいSSHチャネルだけ開く。
+     */
+open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_connect(
+            self.uniffiCloneHandle(),
+        FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
+    )
+}
+}
+    
+    /**
+     * `TransportPreference::Auto` 相当: ヘルパー経由 QUIC を試し、失敗したら
+     * 通常の TCP SSH（Phase 1-4）にフォールバックする。プーリングのプールヒット時、
+     * および他タブの確立待ち(waiter)がその後失敗を観測した場合はフォールバックしない
+     * (自分自身がダイヤルを試みて失敗した場合のみフォールバックする、既存の挙動を維持)。
+     */
+open func connectAuto(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_connect_auto(
+            self.uniffiCloneHandle(),
+        FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
+    )
+}
+}
+    
+open func disconnect()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_disconnect(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
+     * 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
+     * `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
+     * 何もしない。
+     */
+open func notifyNetworkLost()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_notify_network_lost(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_resize(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(cols),
+        FfiConverterUInt32.lower(rows),$0
+    )
+}
+}
+    
+open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
+    return try!  FfiConverterSequenceTypeCellData.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_scrollback_cells(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(offset),
+        FfiConverterUInt32.lower(rows),$0
+    )
+})
+}
+    
+open func scrollbackLen() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_scrollback_len(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+open func send(data: Data)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_send(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(data),$0
+    )
+}
+}
+    
+open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_accept_download(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(transferId),$0
+    )
+}
+}
+    
+open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_accept_upload(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(transferId),
+        FfiConverterString.lower(fileName),
+        FfiConverterUInt64.lower(fileSize),
+        FfiConverterUInt32.lower(mode),$0
+    )
+}
+}
+    
+open func trzszCancel(transferId: String)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_cancel(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(transferId),$0
+    )
+}
+}
+    
+open func trzszSendChunk(transferId: String, data: Data, isLast: Bool)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_isekaipipequicsession_trzsz_send_chunk(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(transferId),
+        FfiConverterData.lower(data),
+        FfiConverterBool.lower(isLast),$0
+    )
+}
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIsekaiPipeQuicSession: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = IsekaiPipeQuicSession
+
+    public static func lift(_ handle: UInt64) throws -> IsekaiPipeQuicSession {
+        return IsekaiPipeQuicSession(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: IsekaiPipeQuicSession) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IsekaiPipeQuicSession {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: IsekaiPipeQuicSession, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIsekaiPipeQuicSession_lift(_ handle: UInt64) throws -> IsekaiPipeQuicSession {
+    return try FfiConverterTypeIsekaiPipeQuicSession.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIsekaiPipeQuicSession_lower(_ value: IsekaiPipeQuicSession) -> UInt64 {
+    return FfiConverterTypeIsekaiPipeQuicSession.lower(value)
 }
 
 
@@ -1814,11 +1824,11 @@ public func FfiConverterTypeIsekaiStunP2pSession_lower(_ value: IsekaiStunP2pSes
 
 
 
-public protocol MultipathHelperQuicSessionProtocol: AnyObject, Sendable {
+public protocol MultipathIsekaiPipeQuicSessionProtocol: AnyObject, Sendable {
     
     /**
      * フォールバック無し。path0/path1 のブートストラップ・QUIC 接続に失敗したら
-     * エラーを返す（`TransportPreference::IsekaiHelperQuicMultipath` 相当）。
+     * エラーを返す（`TransportPreference::IsekaiPipeQuicMultipath` 相当）。
      */
     func connect(callback: SessionCallback) throws 
     
@@ -1858,7 +1868,7 @@ public protocol MultipathHelperQuicSessionProtocol: AnyObject, Sendable {
     func trzszSendChunk(transferId: String, data: Data, isLast: Bool) 
     
 }
-open class MultipathHelperQuicSession: MultipathHelperQuicSessionProtocol, @unchecked Sendable {
+open class MultipathIsekaiPipeQuicSession: MultipathIsekaiPipeQuicSessionProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
 
     /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
@@ -1895,7 +1905,7 @@ open class MultipathHelperQuicSession: MultipathHelperQuicSessionProtocol, @unch
     @_documentation(visibility: private)
 #endif
     public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_multipathhelperquicsession(self.handle, $0) }
+        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_multipathisekaipipequicsession(self.handle, $0) }
     }
     // No primary constructor declared for this class.
 
@@ -1905,7 +1915,7 @@ open class MultipathHelperQuicSession: MultipathHelperQuicSessionProtocol, @unch
             return
         }
 
-        try! rustCall { uniffi_isekai_terminal_core_fn_free_multipathhelperquicsession(handle, $0) }
+        try! rustCall { uniffi_isekai_terminal_core_fn_free_multipathisekaipipequicsession(handle, $0) }
     }
 
     
@@ -1913,10 +1923,10 @@ open class MultipathHelperQuicSession: MultipathHelperQuicSessionProtocol, @unch
     
     /**
      * フォールバック無し。path0/path1 のブートストラップ・QUIC 接続に失敗したら
-     * エラーを返す（`TransportPreference::IsekaiHelperQuicMultipath` 相当）。
+     * エラーを返す（`TransportPreference::IsekaiPipeQuicMultipath` 相当）。
      */
 open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_connect(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_connect(
             self.uniffiCloneHandle(),
         FfiConverterCallbackInterfaceSessionCallback_lower(callback),$0
     )
@@ -1924,7 +1934,7 @@ open func connect(callback: SessionCallback)throws   {try rustCallWithError(FfiC
 }
     
 open func disconnect()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_disconnect(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_disconnect(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -1938,7 +1948,7 @@ open func disconnect()  {try! rustCall() {
      * `rebind_to_fd`参照)。
      */
 open func notifyNetworkLost()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_notify_network_lost(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_notify_network_lost(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -1951,7 +1961,7 @@ open func notifyNetworkLost()  {try! rustCall() {
      * （エラーにはしない——呼び出し側は日和見的に呼べばよい）。
      */
 open func rebindToFd(fd: Int32, localIp: String)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_rebind_to_fd(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_rebind_to_fd(
             self.uniffiCloneHandle(),
         FfiConverterInt32.lower(fd),
         FfiConverterString.lower(localIp),$0
@@ -1960,7 +1970,7 @@ open func rebindToFd(fd: Int32, localIp: String)  {try! rustCall() {
 }
     
 open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_resize(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_resize(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(cols),
         FfiConverterUInt32.lower(rows),$0
@@ -1970,7 +1980,7 @@ open func resize(cols: UInt32, rows: UInt32)  {try! rustCall() {
     
 open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     return try!  FfiConverterSequenceTypeCellData.lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_cells(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_scrollback_cells(
             self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(offset),
         FfiConverterUInt32.lower(rows),$0
@@ -1980,14 +1990,14 @@ open func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]  {
     
 open func scrollbackLen() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_scrollback_len(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_scrollback_len(
             self.uniffiCloneHandle(),$0
     )
 })
 }
     
 open func send(data: Data)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_send(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_send(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(data),$0
     )
@@ -1995,7 +2005,7 @@ open func send(data: Data)  {try! rustCall() {
 }
     
 open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_download(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_accept_download(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -2003,7 +2013,7 @@ open func trzszAcceptDownload(transferId: String)  {try! rustCall() {
 }
     
 open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_accept_upload(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_accept_upload(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterString.lower(fileName),
@@ -2014,7 +2024,7 @@ open func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt
 }
     
 open func trzszCancel(transferId: String)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_cancel(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_cancel(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),$0
     )
@@ -2022,7 +2032,7 @@ open func trzszCancel(transferId: String)  {try! rustCall() {
 }
     
 open func trzszSendChunk(transferId: String, data: Data, isLast: Bool)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_multipathhelperquicsession_trzsz_send_chunk(
+    uniffi_isekai_terminal_core_fn_method_multipathisekaipipequicsession_trzsz_send_chunk(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(transferId),
         FfiConverterData.lower(data),
@@ -2039,24 +2049,24 @@ open func trzszSendChunk(transferId: String, data: Data, isLast: Bool)  {try! ru
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeMultipathHelperQuicSession: FfiConverter {
+public struct FfiConverterTypeMultipathIsekaiPipeQuicSession: FfiConverter {
     typealias FfiType = UInt64
-    typealias SwiftType = MultipathHelperQuicSession
+    typealias SwiftType = MultipathIsekaiPipeQuicSession
 
-    public static func lift(_ handle: UInt64) throws -> MultipathHelperQuicSession {
-        return MultipathHelperQuicSession(unsafeFromHandle: handle)
+    public static func lift(_ handle: UInt64) throws -> MultipathIsekaiPipeQuicSession {
+        return MultipathIsekaiPipeQuicSession(unsafeFromHandle: handle)
     }
 
-    public static func lower(_ value: MultipathHelperQuicSession) -> UInt64 {
+    public static func lower(_ value: MultipathIsekaiPipeQuicSession) -> UInt64 {
         return value.uniffiCloneHandle()
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MultipathHelperQuicSession {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MultipathIsekaiPipeQuicSession {
         let handle: UInt64 = try readInt(&buf)
         return try lift(handle)
     }
 
-    public static func write(_ value: MultipathHelperQuicSession, into buf: inout [UInt8]) {
+    public static func write(_ value: MultipathIsekaiPipeQuicSession, into buf: inout [UInt8]) {
         writeInt(&buf, lower(value))
     }
 }
@@ -2065,15 +2075,15 @@ public struct FfiConverterTypeMultipathHelperQuicSession: FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeMultipathHelperQuicSession_lift(_ handle: UInt64) throws -> MultipathHelperQuicSession {
-    return try FfiConverterTypeMultipathHelperQuicSession.lift(handle)
+public func FfiConverterTypeMultipathIsekaiPipeQuicSession_lift(_ handle: UInt64) throws -> MultipathIsekaiPipeQuicSession {
+    return try FfiConverterTypeMultipathIsekaiPipeQuicSession.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeMultipathHelperQuicSession_lower(_ value: MultipathHelperQuicSession) -> UInt64 {
-    return FfiConverterTypeMultipathHelperQuicSession.lower(value)
+public func FfiConverterTypeMultipathIsekaiPipeQuicSession_lower(_ value: MultipathIsekaiPipeQuicSession) -> UInt64 {
+    return FfiConverterTypeMultipathIsekaiPipeQuicSession.lower(value)
 }
 
 
@@ -2306,22 +2316,22 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func connect(config: SshConfig) throws 
     
     /**
-     * Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
-     * （`TransportPreference::IsekaiHelperQuic` 相当、明示選択時に使う）。
+     * Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
+     * P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
      */
-    func connectHelperQuic(config: HelperQuicConfig) throws 
+    func connectIsekaiLinkRelay(config: IsekaiLinkRelayConfig) throws 
+    
+    /**
+     * Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
+     * （`TransportPreference::IsekaiPipeQuic` 相当、明示選択時に使う）。
+     */
+    func connectIsekaiPipeQuic(config: IsekaiPipeQuicConfig) throws 
     
     /**
      * Phase 7: `TransportPreference::Auto` 相当。自作ヘルパー経由 QUIC のブートストラップ/
      * 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
      */
-    func connectHelperQuicAuto(config: HelperQuicConfig) throws 
-    
-    /**
-     * Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
-     * P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
-     */
-    func connectIsekaiLinkRelay(config: IsekaiLinkRelayConfig) throws 
+    func connectIsekaiPipeQuicAuto(config: IsekaiPipeQuicConfig) throws 
     
     /**
      * Phase 10: `TransportPreference::IsekaiStunP2pQuic` 相当。relay 無し・
@@ -2331,11 +2341,11 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func connectIsekaiStunP2p(config: IsekaiStunP2pConfig) throws 
     
     /**
-     * Phase 9: `TransportPreference::IsekaiHelperQuicMultipath` 相当。フォールバック無し。
+     * Phase 9: `TransportPreference::IsekaiPipeQuicMultipath` 相当。フォールバック無し。
      * `config.direct_host` が設定されていれば path0（`ssh_host`）+ path1（`direct_host`）の
      * 受動的マルチパスで接続する。
      */
-    func connectMultipathHelperQuic(config: MultipathHelperQuicConfig) throws 
+    func connectMultipathIsekaiPipeQuic(config: MultipathIsekaiPipeQuicConfig) throws 
     
     func connectQuic(config: QuicConfig) throws 
     
@@ -2472,13 +2482,25 @@ open func connect(config: SshConfig)throws   {try rustCallWithError(FfiConverter
 }
     
     /**
-     * Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
-     * （`TransportPreference::IsekaiHelperQuic` 相当、明示選択時に使う）。
+     * Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
+     * P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
      */
-open func connectHelperQuic(config: HelperQuicConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic(
+open func connectIsekaiLinkRelay(config: IsekaiLinkRelayConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_link_relay(
             self.uniffiCloneHandle(),
-        FfiConverterTypeHelperQuicConfig_lower(config),$0
+        FfiConverterTypeIsekaiLinkRelayConfig_lower(config),$0
+    )
+}
+}
+    
+    /**
+     * Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
+     * （`TransportPreference::IsekaiPipeQuic` 相当、明示選択時に使う）。
+     */
+open func connectIsekaiPipeQuic(config: IsekaiPipeQuicConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_pipe_quic(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeIsekaiPipeQuicConfig_lower(config),$0
     )
 }
 }
@@ -2487,22 +2509,10 @@ open func connectHelperQuic(config: HelperQuicConfig)throws   {try rustCallWithE
      * Phase 7: `TransportPreference::Auto` 相当。自作ヘルパー経由 QUIC のブートストラップ/
      * 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
      */
-open func connectHelperQuicAuto(config: HelperQuicConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_helper_quic_auto(
+open func connectIsekaiPipeQuicAuto(config: IsekaiPipeQuicConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_pipe_quic_auto(
             self.uniffiCloneHandle(),
-        FfiConverterTypeHelperQuicConfig_lower(config),$0
-    )
-}
-}
-    
-    /**
-     * Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
-     * P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
-     */
-open func connectIsekaiLinkRelay(config: IsekaiLinkRelayConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_link_relay(
-            self.uniffiCloneHandle(),
-        FfiConverterTypeIsekaiLinkRelayConfig_lower(config),$0
+        FfiConverterTypeIsekaiPipeQuicConfig_lower(config),$0
     )
 }
 }
@@ -2521,14 +2531,14 @@ open func connectIsekaiStunP2p(config: IsekaiStunP2pConfig)throws   {try rustCal
 }
     
     /**
-     * Phase 9: `TransportPreference::IsekaiHelperQuicMultipath` 相当。フォールバック無し。
+     * Phase 9: `TransportPreference::IsekaiPipeQuicMultipath` 相当。フォールバック無し。
      * `config.direct_host` が設定されていれば path0（`ssh_host`）+ path1（`direct_host`）の
      * 受動的マルチパスで接続する。
      */
-open func connectMultipathHelperQuic(config: MultipathHelperQuicConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
-    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_multipath_helper_quic(
+open func connectMultipathIsekaiPipeQuic(config: MultipathIsekaiPipeQuicConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_multipath_isekai_pipe_quic(
             self.uniffiCloneHandle(),
-        FfiConverterTypeMultipathHelperQuicConfig_lower(config),$0
+        FfiConverterTypeMultipathIsekaiPipeQuicConfig_lower(config),$0
     )
 }
 }
@@ -2746,7 +2756,7 @@ public func FfiConverterTypeSessionOrchestrator_lower(_ value: SessionOrchestrat
 
 /**
  * `SessionState`×`ExecutionMode`の2軸FSMを保持する、判断ロジックのみのオブジェクト。
- * 意図的にどのtransport(`SshSession`/`HelperQuicSession`等)とも結び付けていない
+ * 意図的にどのtransport(`SshSession`/`IsekaiPipeQuicSession`等)とも結び付けていない
  * (`.claude/rules/rust-ssot.md`が要求する「状態と、それに基づく意思決定ロジックは
  * Rust側に置く」を満たす最小単位として切り出し、実際の接続開始/切断呼び出しは
  * 呼び出し側(Kotlin/Swift)が現在の状態を見て行う。既存`SessionOrchestrator`の
@@ -2827,7 +2837,7 @@ public protocol SessionSupervisorProtocol: AnyObject, Sendable {
 }
 /**
  * `SessionState`×`ExecutionMode`の2軸FSMを保持する、判断ロジックのみのオブジェクト。
- * 意図的にどのtransport(`SshSession`/`HelperQuicSession`等)とも結び付けていない
+ * 意図的にどのtransport(`SshSession`/`IsekaiPipeQuicSession`等)とも結び付けていない
  * (`.claude/rules/rust-ssot.md`が要求する「状態と、それに基づく意思決定ロジックは
  * Rust側に置く」を満たす最小単位として切り出し、実際の接続開始/切断呼び出しは
  * 呼び出し側(Kotlin/Swift)が現在の状態を見て行う。既存`SessionOrchestrator`の
@@ -3550,106 +3560,6 @@ public func FfiConverterTypeDiagnosticEventEnvelope_lower(_ value: DiagnosticEve
 }
 
 
-public struct HelperQuicConfig: Equatable, Hashable {
-    public var sshHost: String
-    public var sshPort: UInt16
-    public var username: String
-    public var auth: SshAuth
-    public var cols: UInt32
-    public var rows: UInt32
-    /**
-     * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
-     */
-    public var jump: JumpConfig?
-    /**
-     * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
-     * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
-     * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
-     * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
-     * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
-     * 確定した値だけを渡すこと。
-     */
-    public var bindPort: UInt16?
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(sshHost: String, sshPort: UInt16, username: String, auth: SshAuth, cols: UInt32, rows: UInt32, 
-        /**
-         * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
-         */jump: JumpConfig?, 
-        /**
-         * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
-         * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
-         * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
-         * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
-         * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
-         * 確定した値だけを渡すこと。
-         */bindPort: UInt16?) {
-        self.sshHost = sshHost
-        self.sshPort = sshPort
-        self.username = username
-        self.auth = auth
-        self.cols = cols
-        self.rows = rows
-        self.jump = jump
-        self.bindPort = bindPort
-    }
-
-    
-
-    
-}
-
-#if compiler(>=6)
-extension HelperQuicConfig: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeHelperQuicConfig: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HelperQuicConfig {
-        return
-            try HelperQuicConfig(
-                sshHost: FfiConverterString.read(from: &buf), 
-                sshPort: FfiConverterUInt16.read(from: &buf), 
-                username: FfiConverterString.read(from: &buf), 
-                auth: FfiConverterTypeSshAuth.read(from: &buf), 
-                cols: FfiConverterUInt32.read(from: &buf), 
-                rows: FfiConverterUInt32.read(from: &buf), 
-                jump: FfiConverterOptionTypeJumpConfig.read(from: &buf), 
-                bindPort: FfiConverterOptionUInt16.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: HelperQuicConfig, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.sshHost, into: &buf)
-        FfiConverterUInt16.write(value.sshPort, into: &buf)
-        FfiConverterString.write(value.username, into: &buf)
-        FfiConverterTypeSshAuth.write(value.auth, into: &buf)
-        FfiConverterUInt32.write(value.cols, into: &buf)
-        FfiConverterUInt32.write(value.rows, into: &buf)
-        FfiConverterOptionTypeJumpConfig.write(value.jump, into: &buf)
-        FfiConverterOptionUInt16.write(value.bindPort, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeHelperQuicConfig_lift(_ buf: RustBuffer) throws -> HelperQuicConfig {
-    return try FfiConverterTypeHelperQuicConfig.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeHelperQuicConfig_lower(_ value: HelperQuicConfig) -> RustBuffer {
-    return FfiConverterTypeHelperQuicConfig.lower(value)
-}
-
-
 public struct IsekaiLinkRelayConfig: Equatable, Hashable {
     public var sshHost: String
     public var sshPort: UInt16
@@ -3761,6 +3671,106 @@ public func FfiConverterTypeIsekaiLinkRelayConfig_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeIsekaiLinkRelayConfig_lower(_ value: IsekaiLinkRelayConfig) -> RustBuffer {
     return FfiConverterTypeIsekaiLinkRelayConfig.lower(value)
+}
+
+
+public struct IsekaiPipeQuicConfig: Equatable, Hashable {
+    public var sshHost: String
+    public var sshPort: UInt16
+    public var username: String
+    public var auth: SshAuth
+    public var cols: UInt32
+    public var rows: UInt32
+    /**
+     * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
+     */
+    public var jump: JumpConfig?
+    /**
+     * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
+     * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
+     * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
+     * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
+     * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
+     * 確定した値だけを渡すこと。
+     */
+    public var bindPort: UInt16?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sshHost: String, sshPort: UInt16, username: String, auth: SshAuth, cols: UInt32, rows: UInt32, 
+        /**
+         * ブートストラップ用SSH接続の踏み台(ProxyJump)。`SshConfig::jump`参照。
+         */jump: JumpConfig?, 
+        /**
+         * isekai-helperのQUIC待受ポートを固定する(`None`ならこれまで通りOS任せの
+         * エフェメラルポート)。`direct_address`など外部到達アドレス経由で接続する場合、
+         * サーバー側ファイアウォールに事前にこのポートだけ許可しておける
+         * (Phase 7-5/9-2の実機検証で判明した既知課題への対応)。値の解決(ユーザー指定/
+         * 既定値/エフェメラル)はKotlin側で1回だけ行い、ここにはFFI境界を越える前に
+         * 確定した値だけを渡すこと。
+         */bindPort: UInt16?) {
+        self.sshHost = sshHost
+        self.sshPort = sshPort
+        self.username = username
+        self.auth = auth
+        self.cols = cols
+        self.rows = rows
+        self.jump = jump
+        self.bindPort = bindPort
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension IsekaiPipeQuicConfig: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIsekaiPipeQuicConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IsekaiPipeQuicConfig {
+        return
+            try IsekaiPipeQuicConfig(
+                sshHost: FfiConverterString.read(from: &buf), 
+                sshPort: FfiConverterUInt16.read(from: &buf), 
+                username: FfiConverterString.read(from: &buf), 
+                auth: FfiConverterTypeSshAuth.read(from: &buf), 
+                cols: FfiConverterUInt32.read(from: &buf), 
+                rows: FfiConverterUInt32.read(from: &buf), 
+                jump: FfiConverterOptionTypeJumpConfig.read(from: &buf), 
+                bindPort: FfiConverterOptionUInt16.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IsekaiPipeQuicConfig, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.sshHost, into: &buf)
+        FfiConverterUInt16.write(value.sshPort, into: &buf)
+        FfiConverterString.write(value.username, into: &buf)
+        FfiConverterTypeSshAuth.write(value.auth, into: &buf)
+        FfiConverterUInt32.write(value.cols, into: &buf)
+        FfiConverterUInt32.write(value.rows, into: &buf)
+        FfiConverterOptionTypeJumpConfig.write(value.jump, into: &buf)
+        FfiConverterOptionUInt16.write(value.bindPort, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIsekaiPipeQuicConfig_lift(_ buf: RustBuffer) throws -> IsekaiPipeQuicConfig {
+    return try FfiConverterTypeIsekaiPipeQuicConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIsekaiPipeQuicConfig_lower(_ value: IsekaiPipeQuicConfig) -> RustBuffer {
+    return FfiConverterTypeIsekaiPipeQuicConfig.lower(value)
 }
 
 
@@ -3925,7 +3935,7 @@ public func FfiConverterTypeJumpConfig_lower(_ value: JumpConfig) -> RustBuffer 
 }
 
 
-public struct MultipathHelperQuicConfig: Equatable, Hashable {
+public struct MultipathIsekaiPipeQuicConfig: Equatable, Hashable {
     /**
      * ブートストラップに使う SSH ホスト。通常は Tailscale 経由アドレス（path0）。
      */
@@ -3977,7 +3987,7 @@ public struct MultipathHelperQuicConfig: Equatable, Hashable {
      * 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
      * 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
      * `None`の場合はRust側で従来通りの既定値フォールバックを維持する
-     * (`HelperQuicConfig.bind_port`のdocコメントも参照)。
+     * (`IsekaiPipeQuicConfig.bind_port`のdocコメントも参照)。
      */
     public var bindPort: UInt16?
 
@@ -4022,7 +4032,7 @@ public struct MultipathHelperQuicConfig: Equatable, Hashable {
          * 未設定ならエフェメラル)。値の解決はKotlin側(`ConnectionProfile.helperBindPort`)で
          * 行い、ここには既に解決済みの値だけを渡すのが本来の想定だが、後方互換のため
          * `None`の場合はRust側で従来通りの既定値フォールバックを維持する
-         * (`HelperQuicConfig.bind_port`のdocコメントも参照)。
+         * (`IsekaiPipeQuicConfig.bind_port`のdocコメントも参照)。
          */bindPort: UInt16?) {
         self.sshHost = sshHost
         self.sshPort = sshPort
@@ -4046,16 +4056,16 @@ public struct MultipathHelperQuicConfig: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension MultipathHelperQuicConfig: Sendable {}
+extension MultipathIsekaiPipeQuicConfig: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MultipathHelperQuicConfig {
+public struct FfiConverterTypeMultipathIsekaiPipeQuicConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MultipathIsekaiPipeQuicConfig {
         return
-            try MultipathHelperQuicConfig(
+            try MultipathIsekaiPipeQuicConfig(
                 sshHost: FfiConverterString.read(from: &buf), 
                 sshPort: FfiConverterUInt16.read(from: &buf), 
                 directHost: FfiConverterOptionString.read(from: &buf), 
@@ -4073,7 +4083,7 @@ public struct FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer 
         )
     }
 
-    public static func write(_ value: MultipathHelperQuicConfig, into buf: inout [UInt8]) {
+    public static func write(_ value: MultipathIsekaiPipeQuicConfig, into buf: inout [UInt8]) {
         FfiConverterString.write(value.sshHost, into: &buf)
         FfiConverterUInt16.write(value.sshPort, into: &buf)
         FfiConverterOptionString.write(value.directHost, into: &buf)
@@ -4095,15 +4105,15 @@ public struct FfiConverterTypeMultipathHelperQuicConfig: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeMultipathHelperQuicConfig_lift(_ buf: RustBuffer) throws -> MultipathHelperQuicConfig {
-    return try FfiConverterTypeMultipathHelperQuicConfig.lift(buf)
+public func FfiConverterTypeMultipathIsekaiPipeQuicConfig_lift(_ buf: RustBuffer) throws -> MultipathIsekaiPipeQuicConfig {
+    return try FfiConverterTypeMultipathIsekaiPipeQuicConfig.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeMultipathHelperQuicConfig_lower(_ value: MultipathHelperQuicConfig) -> RustBuffer {
-    return FfiConverterTypeMultipathHelperQuicConfig.lower(value)
+public func FfiConverterTypeMultipathIsekaiPipeQuicConfig_lower(_ value: MultipathIsekaiPipeQuicConfig) -> RustBuffer {
+    return FfiConverterTypeMultipathIsekaiPipeQuicConfig.lower(value)
 }
 
 
@@ -5474,7 +5484,7 @@ public func FfiConverterTypeTerminalSpecialKey_lower(_ value: TerminalSpecialKey
 /**
  * Phase 7-4: プロファイルが選択するトランスポート戦略。実際のディスパッチは
  * Kotlin 側でこの値に応じて `SessionOrchestrator::connect` /
- * `connect_quic`（tsshd） / `connect_helper_quic` / `connect_helper_quic_auto`
+ * `connect_quic`（tsshd） / `connect_isekai_pipe_quic` / `connect_isekai_pipe_quic_auto`
  * のいずれかを呼び分ける（設定の意図を表す列挙型であり、単一の万能 connect API
  * を意図したものではない。既存の transport ごとに別メソッドを持つ設計を踏襲する）。
  */
@@ -5493,7 +5503,7 @@ public enum TransportPreference: Equatable, Hashable {
     /**
      * 自作ヘルパー経由 QUIC、フォールバック無し（Phase 7、明示選択時）。
      */
-    case isekaiHelperQuic
+    case isekaiPipeQuic
     /**
      * 自作ヘルパー経由 QUIC を試し、失敗したら通常の TCP SSH にフォールバックする
      * （Phase 7、既定推奨）。
@@ -5502,9 +5512,9 @@ public enum TransportPreference: Equatable, Hashable {
     /**
      * 自作ヘルパー経由 QUIC + Tailscale⇔直接アドレスの受動的マルチパスフェイルオーバー
      * （Phase 9、オプトイン。フォールバック無し）。`direct_host` 未設定なら
-     * `IsekaiHelperQuic` と同等（path0 のみ）。
+     * `IsekaiPipeQuic` と同等（path0 のみ）。
      */
-    case isekaiHelperQuicMultipath
+    case isekaiPipeQuicMultipath
     /**
      * STUN+SSH rendezvous による直接 P2P QUIC（Phase 10、オプトイン。relay 無し・
      * 穴あけ不成立時のフォールバック無し）。`isekai_stun_p2p_transport.rs` 参照。
@@ -5542,11 +5552,11 @@ public struct FfiConverterTypeTransportPreference: FfiConverterRustBuffer {
         
         case 2: return .tsshdQuic
         
-        case 3: return .isekaiHelperQuic
+        case 3: return .isekaiPipeQuic
         
         case 4: return .auto
         
-        case 5: return .isekaiHelperQuicMultipath
+        case 5: return .isekaiPipeQuicMultipath
         
         case 6: return .isekaiStunP2pQuic
         
@@ -5568,7 +5578,7 @@ public struct FfiConverterTypeTransportPreference: FfiConverterRustBuffer {
             writeInt(&buf, Int32(2))
         
         
-        case .isekaiHelperQuic:
+        case .isekaiPipeQuic:
             writeInt(&buf, Int32(3))
         
         
@@ -5576,7 +5586,7 @@ public struct FfiConverterTypeTransportPreference: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
         
         
-        case .isekaiHelperQuicMultipath:
+        case .isekaiPipeQuicMultipath:
             writeInt(&buf, Int32(5))
         
         
@@ -7310,7 +7320,7 @@ public func debugRestoreUdpFault()  {try! rustCall() {
 }
 }
 /**
- * `helper_quic` の QUIC クライアントソケットの片道遅延をミリ秒で設定する。
+ * `isekai_pipe_quic` の QUIC クライアントソケットの片道遅延をミリ秒で設定する。
  */
 public func debugSetUdpFaultLatencyMs(ms: UInt32)  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_latency_ms(
@@ -7327,17 +7337,17 @@ public func debugSetUdpFaultLossPermille(permille: UInt32)  {try! rustCall() {
     )
 }
 }
-public func createHelperQuicSession(config: HelperQuicConfig) -> HelperQuicSession  {
-    return try!  FfiConverterTypeHelperQuicSession_lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_func_create_helper_quic_session(
-        FfiConverterTypeHelperQuicConfig_lower(config),$0
-    )
-})
-}
 public func createIsekaiLinkRelaySession(config: IsekaiLinkRelayConfig) -> IsekaiLinkRelaySession  {
     return try!  FfiConverterTypeIsekaiLinkRelaySession_lift(try! rustCall() {
     uniffi_isekai_terminal_core_fn_func_create_isekai_link_relay_session(
         FfiConverterTypeIsekaiLinkRelayConfig_lower(config),$0
+    )
+})
+}
+public func createIsekaiPipeQuicSession(config: IsekaiPipeQuicConfig) -> IsekaiPipeQuicSession  {
+    return try!  FfiConverterTypeIsekaiPipeQuicSession_lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_create_isekai_pipe_quic_session(
+        FfiConverterTypeIsekaiPipeQuicConfig_lower(config),$0
     )
 })
 }
@@ -7348,10 +7358,10 @@ public func createIsekaiStunP2pSession(config: IsekaiStunP2pConfig) -> IsekaiStu
     )
 })
 }
-public func createMultipathHelperQuicSession(config: MultipathHelperQuicConfig) -> MultipathHelperQuicSession  {
-    return try!  FfiConverterTypeMultipathHelperQuicSession_lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_func_create_multipath_helper_quic_session(
-        FfiConverterTypeMultipathHelperQuicConfig_lower(config),$0
+public func createMultipathIsekaiPipeQuicSession(config: MultipathIsekaiPipeQuicConfig) -> MultipathIsekaiPipeQuicSession  {
+    return try!  FfiConverterTypeMultipathIsekaiPipeQuicSession_lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_create_multipath_isekai_pipe_quic_session(
+        FfiConverterTypeMultipathIsekaiPipeQuicConfig_lower(config),$0
     )
 })
 }
@@ -7424,22 +7434,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_func_debug_restore_udp_fault() != 44289) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_latency_ms() != 6689) {
+    if (uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_latency_ms() != 5729) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_debug_set_udp_fault_loss_permille() != 50613) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_func_create_helper_quic_session() != 6597) {
+    if (uniffi_isekai_terminal_core_checksum_func_create_isekai_link_relay_session() != 13613) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_func_create_isekai_link_relay_session() != 13613) {
+    if (uniffi_isekai_terminal_core_checksum_func_create_isekai_pipe_quic_session() != 15061) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_create_isekai_stun_p2p_session() != 728) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_func_create_multipath_helper_quic_session() != 7205) {
+    if (uniffi_isekai_terminal_core_checksum_func_create_multipath_isekai_pipe_quic_session() != 27497) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator() != 38625) {
@@ -7505,42 +7515,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sshsession_trzsz_send_chunk() != 30024) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect() != 49117) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_connect_auto() != 17169) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_disconnect() != 11253) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_notify_network_lost() != 44050) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_resize() != 9464) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_cells() != 45509) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_scrollback_len() != 32376) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_send() != 15932) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_download() != 52142) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_accept_upload() != 11358) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_cancel() != 14424) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_helperquicsession_trzsz_send_chunk() != 22896) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_connect() != 50867) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7572,6 +7546,42 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_isekailinkrelaysession_trzsz_send_chunk() != 342) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_connect() != 48147) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_connect_auto() != 28091) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_disconnect() != 28535) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_notify_network_lost() != 7517) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_resize() != 44852) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_scrollback_cells() != 64205) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_scrollback_len() != 407) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_send() != 33120) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_accept_download() != 51833) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_accept_upload() != 31563) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_cancel() != 41151) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_isekaipipequicsession_trzsz_send_chunk() != 41275) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_connect() != 55857) {
@@ -7607,40 +7617,40 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_isekaistunp2psession_trzsz_send_chunk() != 59478) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_connect() != 15932) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_connect() != 33391) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_disconnect() != 13182) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_disconnect() != 21323) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_notify_network_lost() != 18872) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_notify_network_lost() != 65253) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_rebind_to_fd() != 51928) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_rebind_to_fd() != 62874) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_resize() != 65350) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_resize() != 19025) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_cells() != 35785) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_scrollback_cells() != 40510) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_scrollback_len() != 20977) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_scrollback_len() != 16811) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_send() != 18667) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_send() != 35009) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_download() != 41705) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_accept_download() != 11761) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_accept_upload() != 60661) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_accept_upload() != 9880) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_cancel() != 43237) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_cancel() != 44775) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_multipathhelperquicsession_trzsz_send_chunk() != 40204) {
+    if (uniffi_isekai_terminal_core_checksum_method_multipathisekaipipequicsession_trzsz_send_chunk() != 48046) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward() != 60755) {
@@ -7649,19 +7659,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect() != 45531) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic() != 14224) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_helper_quic_auto() != 34683) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_link_relay() != 63853) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_pipe_quic() != 26041) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_pipe_quic_auto() != 6919) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_stun_p2p() != 21296) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_multipath_helper_quic() != 28117) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_multipath_isekai_pipe_quic() != 28992) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic() != 50706) {
