@@ -335,7 +335,7 @@ impl OpenSshBackend {
                      ( setsid {remote_binary_path} serve --target 127.0.0.1:22 \
                      --relay {relay_addr} --relay-sni {quoted_sni} --relay-jwt-file $tmpdir/relay_jwt \
                      --bootstrap-request-file $tmpdir/bootstrap-request.json{relay_transport_arg} \
-                     --max-idle-lifetime {idle_lifetime_secs} \
+                     --max-idle-lifetime {idle_lifetime_secs} --log-level debug \
                      </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
                      for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
                        [ -s $tmpdir/handshake ] && break; \
@@ -359,7 +359,7 @@ impl OpenSshBackend {
                      [ \"$(wc -c < $tmpdir/bootstrap-request.json)\" -eq {request_len} ] && \
                      ( setsid {remote_binary_path} serve --target 127.0.0.1:22 \
                      --bind 0.0.0.0:0 --bootstrap-request-file $tmpdir/bootstrap-request.json{stun_server_arg} \
-                     --max-idle-lifetime {idle_lifetime_secs} \
+                     --max-idle-lifetime {idle_lifetime_secs} --log-level debug \
                      </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
                      for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
                        [ -s $tmpdir/handshake ] && break; \
