@@ -5,13 +5,14 @@
 //! no way to source a binary to upload without the user supplying one by
 //! hand on every invocation).
 //!
-//! **This project does not publish GitHub Releases yet**, so this module is
-//! honestly incomplete in practice today: the download will 404 until a real
-//! release matching the naming convention below exists. Callers
-//! (`wrapper.rs`/`init.rs`) treat a failure here as just one more reason to
-//! fall back to the pre-existing "pass `--helper-binary` explicitly, or run
-//! `isekai-ssh init`" error — no behavior regresses, this only adds a chance
-//! of success before that fallback.
+//! GitHub Releases are published by `.github/workflows/release-build.yml`
+//! (tags `isekai-ssh-v*`/`isekai-pipe-v*`) with assets matching the naming
+//! convention below. Callers (`wrapper.rs`/`init.rs`) still treat a failure
+//! here (network down, no release exists for a fork's repo, unsupported
+//! arch, ...) as just one more reason to fall back to the pre-existing
+//! "pass `--helper-binary` explicitly, or run `isekai-ssh init`" error — no
+//! behavior regresses, this only adds a chance of success before that
+//! fallback.
 //!
 //! Integrity checking is sha256-only (`.sha256` sidecar, below) — signed
 //! release manifests (`isekai-release-verify`) were tried in an earlier
@@ -46,7 +47,21 @@ use sha2::{Digest, Sha256};
 /// Pinned-tag caches (`ReleaseSource::tag = Some(_)`) never expire — a
 /// specific release tag's assets are immutable on GitHub, so there is
 /// nothing to revalidate.
-const DEFAULT_FRESHNESS_TTL_SECS: u64 = 24 * 60 * 60;
+///
+/// Short on purpose (previously 24 hours) — the "always-connects" principle
+/// (`ISEKAI_PIPE_DESIGN.md` §8 Epic N-2, `.claude/rules/always-connects.md`)
+/// means a release cut specifically to fix a live connectivity bug should
+/// reach clients promptly, not up to a day later. This is affordable now
+/// that a due check (`fetch_latest_tag`) is a single small JSON request
+/// against the GitHub REST API, not a full binary re-download compared
+/// byte-for-byte (`download_and_cache`'s old per-revalidation cost, found
+/// live 2026-07-11: a client kept redeploying a stale cached binary for
+/// hours after a fix had already been released, because the old 24h TTL
+/// never even asked GitHub whether anything had changed). GitHub's
+/// unauthenticated rate limit is 60 requests/hour/IP — even continuous
+/// `isekai-ssh` invocations back-to-back at this TTL stay an order of
+/// magnitude under that.
+const DEFAULT_FRESHNESS_TTL_SECS: u64 = 5 * 60;
 
 fn freshness_ttl() -> Duration {
     std::env::var("ISEKAI_SSH_HELPER_CACHE_TTL_SECS")
@@ -89,10 +104,67 @@ fn is_stale(cache_file: &Path) -> bool {
     }
 }
 
-/// Production GitHub base URL. Tests override this with a local mock HTTP
-/// server's address instead (`ensure_helper_binary_cached`'s `base_url`
-/// parameter) — this constant is only ever passed at the real call sites.
+/// Production GitHub base URL (asset downloads). Tests override this with a
+/// local mock HTTP server's address instead (`ensure_helper_binary_cached`'s
+/// `base_url` parameter) — this constant is only ever passed at the real
+/// call sites.
 pub const GITHUB_BASE_URL: &str = "https://github.com";
+
+/// Production GitHub REST API base URL (the cheap `tag_name`-only freshness
+/// check, `fetch_latest_tag`) — a genuinely different host from
+/// [`GITHUB_BASE_URL`] in production, unlike the asset-download path.
+/// `ISEKAI_SSH_HELPER_RELEASE_API_BASE_URL` overrides this for tests, the
+/// same way `ISEKAI_SSH_HELPER_RELEASE_BASE_URL` already overrides
+/// [`GITHUB_BASE_URL`].
+pub const GITHUB_API_BASE_URL: &str = "https://api.github.com";
+
+/// Sidecar path recording the `tag_name` GitHub's "latest" release resolved
+/// to as of the last successful [`fetch_latest_tag`] check — separate from
+/// `.last-checked` (which only records *when* that check last ran, not what
+/// it found). Lets a later invocation tell "latest is still the same
+/// release I already have cached" (skip the binary download entirely) apart
+/// from "latest changed, or I don't know yet" (re-download).
+fn cached_tag_path(cache_file: &Path) -> PathBuf {
+    let mut name = cache_file.as_os_str().to_os_string();
+    name.push(".release-tag");
+    PathBuf::from(name)
+}
+
+fn read_cached_tag(path: &Path) -> Option<String> {
+    let tag = std::fs::read_to_string(path).ok()?;
+    let tag = tag.trim();
+    (!tag.is_empty()).then(|| tag.to_string())
+}
+
+fn write_cached_tag(path: &Path, tag: &str) -> Result<()> {
+    std::fs::write(path, tag).with_context(|| format!("isekai-ssh: failed to write cached release tag marker {}", path.display()))
+}
+
+/// Fetches just the `tag_name` of `repo`'s current "latest" GitHub Release
+/// via the REST API — a small JSON response, unlike downloading the whole
+/// binary asset just to find out whether it's still the same one
+/// (`download_and_cache`'s old per-revalidation cost). GitHub requires a
+/// `User-Agent` header on API requests (a request without one is rejected).
+fn fetch_latest_tag(agent: &ureq::Agent, api_base: &str, repo: &str) -> Result<String> {
+    let url = format!("{}/repos/{repo}/releases/latest", api_base.trim_end_matches('/'));
+    let mut response = agent
+        .get(&url)
+        .header("User-Agent", "isekai-ssh")
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .with_context(|| format!("isekai-ssh: failed to query latest release metadata from {url}"))?;
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("isekai-ssh: failed to read release metadata body from {url}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).with_context(|| format!("isekai-ssh: failed to parse release metadata JSON from {url}"))?;
+    parsed
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("isekai-ssh: release metadata from {url} has no tag_name field"))
+}
 
 /// Duplicated from `init.rs`/`wrapper.rs`'s own `hex_sha256` per this
 /// crate's established convention of small private per-module helpers
@@ -207,15 +279,15 @@ fn verify_sha256_sidecar_if_present(agent: &ureq::Agent, sidecar_url: &str, byte
 /// cached — a specific release's assets never change on GitHub, so there is
 /// nothing to re-check. A `"latest"` cache (`source.tag = None`) is
 /// re-validated once `DEFAULT_FRESHNESS_TTL_SECS` has passed since the last
-/// check: this function re-downloads and compares against the cached bytes,
-/// replacing the cache only if the content actually changed
-/// (`download_and_cache`). Network failure during that re-check falls back
-/// to the existing (stale but still valid) cached binary with a warning,
-/// rather than failing the caller outright — matching this project's
-/// opportunistic-fallback design (`CLAUDE.md` 設計原則): a briefly
-/// unreachable GitHub shouldn't break an `isekai-ssh <host>` invocation that
-/// would otherwise have worked from cache alone.
-pub async fn ensure_helper_binary_cached(cache_dir: &Path, source: &ReleaseSource, arch: &str, base_url: &str) -> Result<PathBuf> {
+/// check, via `revalidate_and_cache`'s cheap `tag_name`-only comparison —
+/// the full asset only gets re-downloaded when that tag actually changed.
+/// Network failure during that re-check falls back to the existing (stale
+/// but still valid) cached binary with a warning, rather than failing the
+/// caller outright — matching this project's opportunistic-fallback design
+/// (`CLAUDE.md` 設計原則): a briefly unreachable GitHub shouldn't break an
+/// `isekai-ssh <host>` invocation that would otherwise have worked from
+/// cache alone.
+pub async fn ensure_helper_binary_cached(cache_dir: &Path, source: &ReleaseSource, arch: &str, base_url: &str, api_base_url: &str) -> Result<PathBuf> {
     let asset_name = asset_name_for_arch(arch)?;
     let path = cache_path(cache_dir, source, &asset_name);
     let cache_existed = path.exists();
@@ -225,12 +297,15 @@ pub async fn ensure_helper_binary_cached(cache_dir: &Path, source: &ReleaseSourc
     }
 
     let base_url = base_url.to_string();
+    let api_base_url = api_base_url.to_string();
     let source = source.clone();
     let cache_dir = cache_dir.to_path_buf();
     let asset_name_for_task = asset_name.clone();
-    let result = tokio::task::spawn_blocking(move || download_and_cache(&cache_dir, &source, &asset_name_for_task, &base_url))
-        .await
-        .context("isekai-ssh: helper binary download task panicked")?;
+    let result = tokio::task::spawn_blocking(move || {
+        revalidate_and_cache(&cache_dir, &source, &asset_name_for_task, &base_url, &api_base_url, cache_existed)
+    })
+    .await
+    .context("isekai-ssh: helper binary download task panicked")?;
 
     match result {
         Ok(path) => Ok(path),
@@ -261,21 +336,79 @@ pub async fn resolve_helper_binary(
         return std::fs::read(path).with_context(|| format!("failed to read helper binary at {}", path.display()));
     }
 
-    // Test-only override (real callers never set this) — points the
-    // download at a local mock HTTP server instead of real GitHub, the same
-    // way `ISEKAI_PIPE_PROFILES_DIR`/`ISEKAI_SSH_HELPER_CACHE_DIR` already
-    // let tests redirect other real paths.
+    // Test-only overrides (real callers never set these) — point the asset
+    // download and the cheap tag-check API at a local mock HTTP server
+    // instead of real GitHub, the same way `ISEKAI_PIPE_PROFILES_DIR`/
+    // `ISEKAI_SSH_HELPER_CACHE_DIR` already let tests redirect other real
+    // paths.
     let base_url = std::env::var("ISEKAI_SSH_HELPER_RELEASE_BASE_URL").unwrap_or_else(|_| GITHUB_BASE_URL.to_string());
+    let api_base_url = std::env::var("ISEKAI_SSH_HELPER_RELEASE_API_BASE_URL").unwrap_or_else(|_| GITHUB_API_BASE_URL.to_string());
 
     let arch = backend
         .detect_remote_arch(target, via)
         .await
         .context("failed to detect the remote architecture (uname -m) needed to auto-download a helper binary")?;
     let cache_dir = default_helper_cache_dir().context("could not determine the helper binary cache directory")?;
-    let path = ensure_helper_binary_cached(&cache_dir, source, &arch, &base_url)
+    let path = ensure_helper_binary_cached(&cache_dir, source, &arch, &base_url, &api_base_url)
         .await
         .with_context(|| format!("auto-downloading an isekai-pipe binary for architecture {arch:?} from {}/{} failed", source.repo, source.tag.as_deref().unwrap_or("latest")))?;
     std::fs::read(&path).with_context(|| format!("failed to read downloaded helper binary at {}", path.display()))
+}
+
+/// For a pinned tag, this is just [`download_and_cache`] (only ever reached
+/// when nothing is cached yet — a pinned, already-cached tag short-circuits
+/// in `ensure_helper_binary_cached` before this function is even called).
+/// For `"latest"`, first asks [`fetch_latest_tag`] which tag that currently
+/// resolves to and compares it against [`cached_tag_path`]'s stored value —
+/// the full asset download (and `download_and_cache`'s own byte-for-byte
+/// comparison) only happens when the tag actually changed, or nothing was
+/// cached yet (nothing to compare against). This is the change from the
+/// old design (full re-download on every revalidation) that makes a much
+/// shorter `DEFAULT_FRESHNESS_TTL_SECS` affordable.
+fn revalidate_and_cache(
+    cache_dir: &Path,
+    source: &ReleaseSource,
+    asset_name: &str,
+    base_url: &str,
+    api_base_url: &str,
+    cache_existed: bool,
+) -> Result<PathBuf> {
+    let path = cache_path(cache_dir, source, asset_name);
+    if source.tag.is_some() {
+        return download_and_cache(cache_dir, source, asset_name, base_url);
+    }
+
+    let agent: ureq::Agent = ureq::Agent::config_builder().build().into();
+    if cache_existed {
+        let latest_tag = fetch_latest_tag(&agent, api_base_url, &source.repo)?;
+        let tag_path = cached_tag_path(&path);
+        if read_cached_tag(&tag_path).as_deref() == Some(latest_tag.as_str()) {
+            log::debug!(
+                "isekai-ssh: latest release is still {latest_tag:?}; cached isekai-pipe binary at {} is up to date",
+                path.display()
+            );
+            write_last_checked(&last_checked_path(&path), SystemTime::now())?;
+            return Ok(path);
+        }
+        log::info!("isekai-ssh: latest release changed to {latest_tag:?}; re-downloading isekai-pipe binary");
+        let downloaded = download_and_cache(cache_dir, source, asset_name, base_url)?;
+        write_cached_tag(&tag_path, &latest_tag)?;
+        return Ok(downloaded);
+    }
+
+    // Nothing cached yet: no prior tag to compare against, so just
+    // download. Best-effort record the tag actually downloaded so the
+    // *next* check can take the cheap path above — a failure here doesn't
+    // fail the overall download, it just means the next check re-downloads
+    // once more before catching up.
+    let downloaded = download_and_cache(cache_dir, source, asset_name, base_url)?;
+    match fetch_latest_tag(&agent, api_base_url, &source.repo) {
+        Ok(latest_tag) => {
+            let _ = write_cached_tag(&cached_tag_path(&path), &latest_tag);
+        }
+        Err(e) => log::debug!("isekai-ssh: downloaded isekai-pipe binary, but could not also record its release tag ({e:#})"),
+    }
+    Ok(downloaded)
 }
 
 fn download_and_cache(cache_dir: &Path, source: &ReleaseSource, asset_name: &str, base_url: &str) -> Result<PathBuf> {
@@ -421,6 +554,14 @@ mod tests {
         addr
     }
 
+    /// Route entry for the cheap `tag_name`-only freshness check
+    /// (`fetch_latest_tag`) — real GitHub API path shape (`/repos/<repo>/releases/latest`,
+    /// distinct from the plain-github.com asset-download path shape the
+    /// other routes below use).
+    fn latest_tag_route(tag: &str) -> (String, Vec<u8>) {
+        ("/repos/cuzic/isekai-terminal/releases/latest".to_string(), format!(r#"{{"tag_name":"{tag}"}}"#).into_bytes())
+    }
+
     #[tokio::test]
     async fn ensure_helper_binary_cached_downloads_verifies_and_caches() {
         let binary_bytes = b"pretend-isekai-pipe-binary-bytes".to_vec();
@@ -440,14 +581,17 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let source = ReleaseSource::default_repo();
 
-        let path = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url).await.unwrap();
+        // No `/repos/.../releases/latest` route registered — the best-effort
+        // tag record after this first download simply fails silently
+        // (covered on its own by the "unchanged" test below).
+        let path = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url, &base_url).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), binary_bytes);
 
         // Second call must not need the network at all: shut down by
         // pointing at an address nothing listens on, and confirm it still
         // succeeds purely from the cache.
         let unreachable = "http://127.0.0.1:1";
-        let cached_path = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable).await.unwrap();
+        let cached_path = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable, unreachable).await.unwrap();
         assert_eq!(cached_path, path);
     }
 
@@ -480,12 +624,45 @@ mod tests {
             "/cuzic/isekai-terminal/releases/latest/download/isekai-pipe-x86_64-unknown-linux-musl.sha256".to_string(),
             sha256_line.into_bytes(),
         );
+        let (tag_path, tag_body) = latest_tag_route("isekai-pipe-v9.9.9");
+        routes.insert(tag_path, tag_body);
         let addr = spawn_mock_release_server(routes);
         let base_url = format!("http://{addr}");
 
-        let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url).await.unwrap();
+        // No stored `.release-tag` sidecar (seeded manually, without going
+        // through `revalidate_and_cache`) — so even though a `tag_name` is
+        // now available, it has nothing local to compare against and must
+        // be treated as "changed" (re-download), same as the pre-tag-check
+        // design's behavior for this case.
+        let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url, &base_url).await.unwrap();
         assert_eq!(returned, path);
         assert_eq!(std::fs::read(&path).unwrap(), new_bytes);
+        assert_eq!(read_cached_tag(&cached_tag_path(&path)).as_deref(), Some("isekai-pipe-v9.9.9"));
+    }
+
+    #[tokio::test]
+    async fn ensure_helper_binary_cached_skips_the_binary_download_entirely_when_the_tag_is_unchanged() {
+        let bytes = b"unchanged-by-tag-check-bytes".to_vec();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let source = ReleaseSource::default_repo();
+        let path = seed_stale_cache(cache_dir.path(), &source, &bytes, Duration::from_secs(25 * 60 * 60));
+        write_cached_tag(&cached_tag_path(&path), "isekai-pipe-v1.2.3").unwrap();
+
+        // Only the tag-check route is registered — no download/.sha256
+        // routes at all. If `ensure_helper_binary_cached` tried to download
+        // the asset anyway (the old design's behavior), this test would
+        // fail with a 404, not silently pass.
+        let mut routes = std::collections::HashMap::new();
+        let (tag_path, tag_body) = latest_tag_route("isekai-pipe-v1.2.3");
+        routes.insert(tag_path, tag_body);
+        let addr = spawn_mock_release_server(routes);
+        let base_url = format!("http://{addr}");
+
+        let unreachable_for_downloads = "http://127.0.0.1:1";
+        let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable_for_downloads, &base_url).await.unwrap();
+        assert_eq!(returned, path);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "the cached binary must be untouched");
+        assert!(!is_stale(&path), "the freshness marker must still be refreshed even on the cheap tag-check path");
     }
 
     #[tokio::test]
@@ -500,7 +677,7 @@ mod tests {
         std::fs::write(&path, &old_bytes).unwrap();
 
         let unreachable = "http://127.0.0.1:1";
-        let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable).await.unwrap();
+        let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable, unreachable).await.unwrap();
         assert_eq!(returned, path);
         assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
     }
@@ -513,7 +690,7 @@ mod tests {
         let path = seed_stale_cache(cache_dir.path(), &source, &old_bytes, Duration::from_secs(25 * 60 * 60));
 
         let unreachable = "http://127.0.0.1:1";
-        let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable).await.unwrap();
+        let returned = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", unreachable, unreachable).await.unwrap();
         assert_eq!(returned, path);
         assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
     }
@@ -535,10 +712,15 @@ mod tests {
             "/cuzic/isekai-terminal/releases/latest/download/isekai-pipe-x86_64-unknown-linux-musl.sha256".to_string(),
             sha256_line.into_bytes(),
         );
+        let (tag_path, tag_body) = latest_tag_route("isekai-pipe-v1.0.0");
+        routes.insert(tag_path, tag_body);
         let addr = spawn_mock_release_server(routes);
         let base_url = format!("http://{addr}");
 
-        ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url).await.unwrap();
+        // No stored tag sidecar, so this still exercises the "changed"
+        // (download) path, same as the redownload test above — this one's
+        // point is specifically that identical bytes don't get rewritten.
+        ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url, &base_url).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         // The marker must have been refreshed even though the bytes were
         // identical — otherwise every single invocation would re-check.
@@ -562,7 +744,7 @@ mod tests {
 
         let cache_dir = tempfile::tempdir().unwrap();
         let source = ReleaseSource::default_repo();
-        let err = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url).await.unwrap_err();
+        let err = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url, &base_url).await.unwrap_err();
         assert!(format!("{err:#}").contains("sha256"), "{err:#}");
     }
 
@@ -580,7 +762,7 @@ mod tests {
 
         let cache_dir = tempfile::tempdir().unwrap();
         let source = ReleaseSource::default_repo();
-        let path = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url).await.unwrap();
+        let path = ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url, &base_url).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), binary_bytes);
     }
 
@@ -592,7 +774,7 @@ mod tests {
 
         let cache_dir = tempfile::tempdir().unwrap();
         let source = ReleaseSource::default_repo();
-        assert!(ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url).await.is_err());
+        assert!(ensure_helper_binary_cached(cache_dir.path(), &source, "x86_64", &base_url, &base_url).await.is_err());
     }
 
     #[tokio::test]

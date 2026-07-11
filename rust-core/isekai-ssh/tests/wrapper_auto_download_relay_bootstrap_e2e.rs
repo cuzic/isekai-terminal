@@ -369,6 +369,14 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
         .env("HOME", &home)
         .env("PATH", &path_env)
         .env("ISEKAI_SSH_HELPER_RELEASE_BASE_URL", format!("http://{mock_release_addr}"))
+        // No `/repos/.../releases/latest` route registered on the mock
+        // server — `resolve_helper_binary`'s best-effort tag record after
+        // this (first-ever, nothing cached yet) download just fails
+        // silently, same as `helper_download.rs`'s own
+        // `ensure_helper_binary_cached_downloads_verifies_and_caches` test.
+        // Still points this at the mock (not the real GitHub API) so the
+        // test never makes a real network call.
+        .env("ISEKAI_SSH_HELPER_RELEASE_API_BASE_URL", format!("http://{mock_release_addr}"))
         .env("ISEKAI_SSH_HELPER_CACHE_DIR", &helper_cache_dir)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
