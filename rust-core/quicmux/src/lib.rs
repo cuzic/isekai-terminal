@@ -44,6 +44,7 @@ pub mod noq_backend;
 pub mod qmux_backend;
 mod mux;
 mod race;
+mod resume;
 mod types;
 
 pub use cert::{CertMismatchSlot, PinnedCertVerifier};
@@ -54,6 +55,10 @@ pub use mux::{
     AnyMuxListener, AnyMuxRebinder,
 };
 pub use race::{race_with_stagger, Winner};
+pub use resume::{
+    accept_resume, request_resume, ReplayBuffer, ResumeAcceptor, ResumeAckOutcome, ResumeDecision, ResumeRejectReason, ResumeRequest,
+    ResumeRequestError,
+};
 pub use types::{BindSpec, RemoteSpec};
 
 #[cfg(feature = "noq")]
