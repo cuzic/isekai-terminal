@@ -459,6 +459,15 @@ impl NoqByteStream {
     pub(crate) fn split(self) -> (NoqByteStreamReadHalf, NoqByteStreamWriteHalf) {
         (NoqByteStreamReadHalf { recv: self.recv }, NoqByteStreamWriteHalf { send: self.send })
     }
+
+    /// The inverse of [`NoqByteStream::split`] — recombines a previously
+    /// split pair. Trivial and infallible: `noq::Connection::open_bi`/
+    /// `accept_bi` already return the send/recv sides as a plain tuple, so
+    /// `NoqByteStream` itself is just those two fields held together; this
+    /// only re-pairs them, no I/O or validation involved.
+    pub(crate) fn unsplit(read: NoqByteStreamReadHalf, write: NoqByteStreamWriteHalf) -> Self {
+        Self { send: write.send, recv: read.recv }
+    }
 }
 
 pub struct NoqByteStreamReadHalf {

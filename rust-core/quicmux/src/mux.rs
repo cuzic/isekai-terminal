@@ -457,6 +457,31 @@ impl AnyByteStream {
             }
         }
     }
+
+    /// The inverse of [`AnyByteStream::split`] — recombines a previously
+    /// split pair back into one stream a caller can hand off to code that
+    /// expects the combined shape (e.g. a resume/reconnect flow that only
+    /// needed split halves transiently, to write a request and read a
+    /// response sequentially, but whose caller ultimately wants the same
+    /// `AnyByteStream` shape a fresh connection's `open_bi()` would have
+    /// produced). `read`/`write` must come from the same prior `split()`
+    /// call — mixing halves from two different streams, or from different
+    /// backends, panics rather than silently producing a stream that reads
+    /// from one connection and writes to another.
+    pub fn unsplit(read: AnyByteStreamReadHalf, write: AnyByteStreamWriteHalf) -> Self {
+        match (read, write) {
+            #[cfg(feature = "noq")]
+            (AnyByteStreamReadHalf::Noq(read), AnyByteStreamWriteHalf::Noq(write)) => {
+                Self::Noq(crate::noq_backend::NoqByteStream::unsplit(read, write))
+            }
+            #[cfg(feature = "qmux")]
+            (AnyByteStreamReadHalf::Qmux(read), AnyByteStreamWriteHalf::Qmux(write)) => {
+                Self::Qmux(crate::qmux_backend::QmuxByteStream::unsplit(read, write))
+            }
+            #[cfg(all(feature = "noq", feature = "qmux"))]
+            _ => panic!("AnyByteStream::unsplit: read and write halves came from different backends"),
+        }
+    }
 }
 
 /// The read half of an [`AnyByteStream`] after [`AnyByteStream::split`].

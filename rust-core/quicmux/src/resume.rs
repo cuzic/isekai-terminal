@@ -42,7 +42,7 @@
 use std::collections::VecDeque;
 
 use crate::error::MuxError;
-use crate::mux::{AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxConnection};
+use crate::mux::{AnyByteStream, AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxConnection};
 
 /// This module's own frame markers — deliberately distinct from any
 /// caller's own protocol frame bytes (e.g. isekai's `RESUME`=`0x03`,
@@ -273,8 +273,7 @@ pub async fn request_resume(
                 committed_offset: u64::from_be_bytes(committed),
                 sent_offset: u64::from_be_bytes(sent_offset),
                 replay,
-                send,
-                recv,
+                stream: AnyByteStream::unsplit(recv, send),
             })
         }
         FRAME_RESUME_REJECT => {
@@ -290,17 +289,17 @@ pub async fn request_resume(
 
 /// The result of a successful [`request_resume`]: the offsets the acceptor
 /// reported, the replay bytes to treat as continuing the previous data
-/// stream, and the still-open stream halves to keep driving application
-/// traffic on — exactly the same connection the resume request itself was
-/// sent on, now repurposed as the ongoing data stream (mirrors
-/// `isekai-pipe`'s own `reconnect_and_resume`, whose `RESUME` frame and
-/// subsequent application data share one stream).
+/// stream, and the still-open stream (recombined via [`AnyByteStream::unsplit`]
+/// — split only transiently during the request/response exchange itself) to
+/// keep driving application traffic on — exactly the same connection the
+/// resume request itself was sent on, now repurposed as the ongoing data
+/// stream (mirrors `isekai-pipe`'s own `reconnect_and_resume`, whose
+/// `RESUME` frame and subsequent application data share one stream).
 pub struct ResumeAckOutcome {
     pub committed_offset: u64,
     pub sent_offset: u64,
     pub replay: Vec<u8>,
-    pub send: AnyByteStreamWriteHalf,
-    pub recv: AnyByteStreamReadHalf,
+    pub stream: AnyByteStream,
 }
 
 impl std::fmt::Debug for ResumeAckOutcome {
@@ -324,14 +323,15 @@ pub enum ResumeRequestError {
 /// The server side of a resume exchange: accepts the stream the client's
 /// [`request_resume`] opened, decodes the request, asks `acceptor` to
 /// decide, and writes the response. On [`ResumeDecision::Accepted`],
-/// returns the still-open stream halves for the caller to keep relaying
-/// application traffic on (the same stream, now repurposed) — on
+/// returns the still-open stream (recombined via [`AnyByteStream::unsplit`])
+/// for the caller to keep relaying application traffic on (the same stream,
+/// now repurposed) — on
 /// [`ResumeDecision::Rejected`], waits for the peer to observe the reject
 /// frame (see [`crate::AnyByteStream::wait_for_close`]'s docs for why: the
 /// same "peer never saw the response before the connection died" race
 /// `isekai-pipe`'s own `reject()` exists to close) before returning the
 /// error.
-pub async fn accept_resume(conn: &AnyMuxConnection, acceptor: &dyn ResumeAcceptor) -> Result<(AnyByteStreamWriteHalf, AnyByteStreamReadHalf), ResumeRequestError> {
+pub async fn accept_resume(conn: &AnyMuxConnection, acceptor: &dyn ResumeAcceptor) -> Result<AnyByteStream, ResumeRequestError> {
     let conn_exporter = conn.export_keying_material(b"quicmux-resume-v1", b"").await.map_err(ResumeRequestError::Mux)?;
     let stream = conn.accept_bi().await.map_err(ResumeRequestError::Mux)?;
     let (mut recv, mut send) = stream.split();
@@ -346,7 +346,7 @@ pub async fn accept_resume(conn: &AnyMuxConnection, acceptor: &dyn ResumeAccepto
     match acceptor.try_resume(request).await {
         ResumeDecision::Accepted { committed_offset, sent_offset, replay } => {
             respond_resume_accepted(&mut send, committed_offset, sent_offset, &replay).await.map_err(ResumeRequestError::Mux)?;
-            Ok((send, recv))
+            Ok(AnyByteStream::unsplit(recv, send))
         }
         ResumeDecision::Rejected(reason) => {
             respond_resume_rejected(&mut send, reason).await;
@@ -698,14 +698,14 @@ mod noq_e2e_tests {
         assert_eq!(outcome.replay, b"tail bytes");
         assert_eq!(acceptor.call_count.load(Ordering::SeqCst), 1);
 
-        let (mut server_send, _server_recv) = server_task.await.expect("server task panicked").expect("accept_resume should succeed");
+        let mut server_stream = server_task.await.expect("server task panicked").expect("accept_resume should succeed");
         // Both sides should still be able to drive the same stream as an
         // ongoing data stream after the resume handshake — prove it with one
         // more write from the server side.
-        server_send.write_all(b"post-resume").await.expect("post-resume write failed");
-        let mut recv = outcome.recv;
+        server_stream.write_all(b"post-resume").await.expect("post-resume write failed");
+        let mut client_stream = outcome.stream;
         let mut buf = [0u8; 32];
-        let n = recv.read(&mut buf).await.expect("post-resume read failed");
+        let n = client_stream.read(&mut buf).await.expect("post-resume read failed");
         assert_eq!(&buf[..n], b"post-resume");
     }
 

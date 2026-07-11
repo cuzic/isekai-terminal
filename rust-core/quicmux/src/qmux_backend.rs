@@ -426,6 +426,14 @@ impl QmuxByteStream {
         let QmuxByteStream { send, recv, _session } = self;
         (QmuxByteStreamReadHalf { recv, _session: _session.clone() }, QmuxByteStreamWriteHalf { send, _session })
     }
+
+    /// The inverse of [`QmuxByteStream::split`] — recombines a previously
+    /// split pair. Both halves hold their own clone of the same
+    /// `qmux::Session` (see `split`'s own `.clone()`); only one is needed
+    /// once rejoined, so `read`'s clone is simply dropped.
+    pub(crate) fn unsplit(read: QmuxByteStreamReadHalf, write: QmuxByteStreamWriteHalf) -> Self {
+        Self { send: write.send, recv: read.recv, _session: write._session }
+    }
 }
 
 pub struct QmuxByteStreamReadHalf {
