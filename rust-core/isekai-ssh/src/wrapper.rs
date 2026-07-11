@@ -380,7 +380,7 @@ async fn run_ssh_once(
     runtime_dir: &Path,
 ) -> Result<(std::process::ExitStatus, String)> {
     write_connection_intent(runtime_dir, intent)?;
-    let proxy_command = proxy_command(&plan.pipe_path, &resolution.isekai.profile);
+    let proxy_command = proxy_command(&plan.pipe_path, &resolution.isekai.profile, &plan.openssh_path);
 
     let ctl_forward = if crate::ctl_forward::should_attempt_ctl_forward(
         resolution.isekai.ctl_socket_enabled,
@@ -1632,14 +1632,27 @@ fn default_pipe_path() -> PathBuf {
 /// always true — see `is_safe_bare_word`'s docs), which is the common case
 /// regardless of platform.
 ///
+/// That short-path-and-emit-bare trick only holds for genuine
+/// Win32-OpenSSH, though. An MSYS2- or Cygwin-hosted `ssh.exe` (this
+/// includes Git for Windows' bundled ssh) *does* exec `ProxyCommand` via
+/// `/bin/bash -c ...`, exactly like Unix OpenSSH — a bare short path handed
+/// to that bash strips every backslash (`\U`, `\c`, ... are bash escape
+/// sequences that just drop the backslash before an ordinary character),
+/// silently mangling the path instead of failing loudly. `openssh_path` is
+/// checked via `is_posix_shell_ssh` so that case forces the same POSIX
+/// single-quoting Unix always uses, bypassing the short-path optimization
+/// entirely (single quotes preserve backslashes literally in POSIX shells,
+/// so no further escaping is needed).
+///
 /// Falls back to the original POSIX-style single-quoting when a value isn't
 /// already safe to emit bare (e.g. 8.3 short names are disabled on that
 /// volume, or an unusual `#@isekai profile` value) — no worse than this
 /// function's previous unconditional behavior for that residual case.
-fn proxy_command(pipe_path: &Path, profile: &str) -> String {
+fn proxy_command(pipe_path: &Path, profile: &str, openssh_path: &Path) -> String {
+    let force_posix_quoting = cfg!(windows) && is_posix_shell_ssh(openssh_path);
     format!(
         "{} connect --profile {} --service ssh --stdio",
-        quote_proxy_command_path(pipe_path),
+        quote_proxy_command_path(pipe_path, force_posix_quoting),
         quote_proxy_command_arg(profile),
     )
 }
@@ -1677,20 +1690,27 @@ fn quote_proxy_command_arg(value: &str) -> String {
 /// exists for. See `windows_short_path`'s docs for the avoid-quoting-entirely
 /// strategy used there; every other platform/path shape falls through to
 /// the original POSIX single-quoting.
-fn quote_proxy_command_path(pipe_path: &Path) -> String {
+///
+/// `force_posix_quoting` (set by `proxy_command` when `openssh_path` is an
+/// MSYS2/Cygwin-hosted `ssh.exe`, see `is_posix_shell_ssh`) skips the
+/// Windows short-path branch entirely and always POSIX single-quotes —
+/// that `ssh` execs `ProxyCommand` via bash, not Win32-OpenSSH's own
+/// splitter, so the short-path-and-emit-bare trick is unsafe there.
+fn quote_proxy_command_path(pipe_path: &Path, force_posix_quoting: bool) -> String {
     let path_str = pipe_path.display().to_string();
-    if cfg!(windows) {
-        if let Some(short) = windows_short_path(&path_str) {
-            if is_safe_bare_word(&short, &['\\', '/']) {
-                return short;
+    if !force_posix_quoting {
+        if cfg!(windows) {
+            if let Some(short) = windows_short_path(&path_str) {
+                if is_safe_bare_word(&short, &['\\', '/']) {
+                    return short;
+                }
             }
         }
+        if is_safe_bare_word(&path_str, &['\\', '/']) {
+            return path_str;
+        }
     }
-    if is_safe_bare_word(&path_str, &['\\', '/']) {
-        path_str
-    } else {
-        shell_quote(&path_str)
-    }
+    shell_quote(&path_str)
 }
 
 /// Resolves `path` to its 8.3 short filename (`C:\PROGRA~1\...`), which by
@@ -1737,6 +1757,74 @@ fn windows_short_path(path: &str) -> Option<String> {
 #[link(name = "kernel32")]
 extern "system" {
     fn GetShortPathNameW(lpszLongPath: *const u16, lpszShortPath: *mut u16, cchBuffer: u32) -> u32;
+}
+
+/// Best-effort resolution of a `Command::new`-style program name (as stored
+/// in `WrapperPlan::openssh_path`) to the actual file it will exec — either
+/// already-qualified (absolute, or has a directory component: `--isekai-ssh-path`
+/// was passed explicitly) and returned as-is, or the bare default (`"ssh"`,
+/// see `parse_wrapper`) searched for across `%PATH%` using `%PATHEXT%`
+/// (falling back to the same default Windows uses, `.COM;.EXE;.BAT;.CMD`,
+/// when unset) the same way `CreateProcess` would. Deliberately does not
+/// search the current directory first — unlike a directly-typed shell
+/// command, `std::process::Command` never implicitly does that either.
+#[cfg(windows)]
+fn resolve_windows_executable(program: &Path) -> PathBuf {
+    if program.is_absolute() || program.parent().is_some_and(|p| !p.as_os_str().is_empty()) {
+        return program.to_path_buf();
+    }
+    let extensions: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_start_matches('.').to_string())
+        .collect();
+    let already_has_extension = program.extension().is_some();
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return program.to_path_buf();
+    };
+    for dir in std::env::split_paths(&path_var) {
+        if already_has_extension {
+            let candidate = dir.join(program);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        for ext in &extensions {
+            let candidate = dir.join(program).with_extension(ext);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    program.to_path_buf()
+}
+
+/// True when `ssh_path` resolves to an MSYS2- or Cygwin-hosted `ssh.exe`
+/// (this includes Git for Windows' bundled ssh, which also ships the MSYS2
+/// runtime) rather than genuine Win32-OpenSSH
+/// (`C:\Windows\System32\OpenSSH\ssh.exe`). Such builds exec `ProxyCommand`
+/// via `/bin/bash -c ...` just like Unix OpenSSH — see `proxy_command`'s
+/// docs for why that matters. Detected by checking for the runtime DLL next
+/// to the resolved binary rather than pattern-matching the path text, since
+/// MSYS2/Git-for-Windows can be installed under any prefix (the report that
+/// prompted this used a `scoop`-managed install, for example).
+#[cfg(windows)]
+fn is_posix_shell_ssh(ssh_path: &Path) -> bool {
+    let resolved = resolve_windows_executable(ssh_path);
+    let Some(dir) = resolved.parent() else {
+        return false;
+    };
+    dir.join("msys-2.0.dll").is_file() || dir.join("cygwin1.dll").is_file()
+}
+
+/// Never actually called (`proxy_command` only calls `is_posix_shell_ssh`
+/// inside `cfg!(windows) && ...`), but `cfg!(...)` is a runtime check, not
+/// conditional compilation — the call site still needs something to
+/// type-check against on non-Windows targets.
+#[cfg(not(windows))]
+fn is_posix_shell_ssh(_ssh_path: &Path) -> bool {
+    false
 }
 
 /// Never actually called (`quote_proxy_command_path` only calls
@@ -2029,7 +2117,7 @@ mod tests {
     #[test]
     fn proxy_command_quotes_path_and_profile_for_shell() {
         assert_eq!(
-            proxy_command(Path::new("/opt/isekai pipe"), "prod'host"),
+            proxy_command(Path::new("/opt/isekai pipe"), "prod'host", Path::new("/usr/bin/ssh")),
             "'/opt/isekai pipe' connect --profile 'prod'\\''host' --service ssh --stdio"
         );
     }
@@ -2043,9 +2131,30 @@ mod tests {
     #[test]
     fn proxy_command_emits_safe_path_and_profile_bare() {
         assert_eq!(
-            proxy_command(Path::new("/usr/local/bin/isekai-pipe"), "prod-host:22"),
+            proxy_command(Path::new("/usr/local/bin/isekai-pipe"), "prod-host:22", Path::new("/usr/bin/ssh")),
             "/usr/local/bin/isekai-pipe connect --profile prod-host:22 --service ssh --stdio"
         );
+    }
+
+    /// Regression test for the bug an MSYS2 user hit in practice: a
+    /// short-pathed Windows path emitted bare gets every backslash silently
+    /// eaten by bash's escape handling (`\U`, `\c`, ... before an ordinary
+    /// character just drop the backslash). `quote_proxy_command_path`'s
+    /// `force_posix_quoting` flag (set by `proxy_command` via
+    /// `is_posix_shell_ssh` whenever `openssh_path` is MSYS2/Cygwin-hosted)
+    /// must always POSIX single-quote in that case, regardless of platform
+    /// or whether the path would otherwise look "safe" to emit bare.
+    #[test]
+    fn quote_proxy_command_path_forces_posix_quoting_when_requested() {
+        assert_eq!(
+            quote_proxy_command_path(Path::new(r"C:\Users\cuzic\isekai-pipe.exe"), true),
+            r"'C:\Users\cuzic\isekai-pipe.exe'"
+        );
+    }
+
+    #[test]
+    fn quote_proxy_command_path_emits_bare_when_posix_quoting_not_forced() {
+        assert_eq!(quote_proxy_command_path(Path::new("/usr/local/bin/isekai-pipe"), false), "/usr/local/bin/isekai-pipe");
     }
 
     #[test]
