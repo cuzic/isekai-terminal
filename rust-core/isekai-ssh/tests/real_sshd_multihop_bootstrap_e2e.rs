@@ -190,12 +190,16 @@ fn spawn_real_sshd(workdir: &std::path::Path, label: &str, authorized_keys_pub: 
 /// `real_sshd_bootstrap_e2e.rs::shim_ssh_for_real_sshd`'s proven pattern.
 /// Unlike the single-hop version, this wires `ProxyJump` on the `<alias>`
 /// block so `ssh -G <alias>` (which `wrapper.rs::defaults_bootstrap_candidate_from_ssh_g`
-/// reads) reports it, and adds one generic `Host 127.0.0.1` block covering
-/// *both* the jump hop and the final target — both literally dial
-/// `127.0.0.1` (`wrapper.rs`'s bootstrap step dials the resolved address
-/// directly, never the alias), so a single block's `IdentityFile`/
-/// `StrictHostKeyChecking no`/`UserKnownHostsFile /dev/null` apply to
-/// either connection.
+/// reads) reports it. Both the `<alias>` block (final target, dialed by
+/// `wrapper.rs::bootstrap_and_register` using `candidate.alias` itself since
+/// commit 5b30163 — *not* the `ssh -G`-resolved `HostName`, precisely so a
+/// real user's own `Host <alias>` block keeps matching) and the generic
+/// `Host 127.0.0.1` block (jump hop, dialed literally as `127.0.0.1` via
+/// `-J`) need their own `IdentityFile`/`StrictHostKeyChecking no`/
+/// `UserKnownHostsFile /dev/null` — relying on only one of the two silently
+/// falls back to strict host-key checking for the other connection, which
+/// hangs/fails under `BatchMode=yes` (this was an actual bug here, found via
+/// interactive CI debugging after commit 5b30163 landed).
 fn shim_ssh_for_two_hop_real_sshd(
     tmp: &std::path::Path,
     alias: &str,
@@ -205,11 +209,24 @@ fn shim_ssh_for_two_hop_real_sshd(
     client_key_path: &std::path::Path,
 ) -> (PathBuf, std::ffi::OsString) {
     let config_path = tmp.join("ssh_config_bootstrap");
+    // `wrapper.rs::bootstrap_and_register`(コミット5b30163)は`ssh -G`解決後の
+    // `HostName`ではなく元の`candidate.alias`をssh(1)へ渡す(ユーザー自身の
+    // `~/.ssh/config`の`Host <alias>`ブロックにマッチさせ続けるための修正、
+    // 詳細はそちらのdocコメント参照)。そのため実際にターゲットホップへ接続する際の
+    // 宛先文字列は("127.0.0.1"ではなく)`alias`そのものであり、`IdentityFile`/
+    // `StrictHostKeyChecking`/`UserKnownHostsFile`は`Host {alias}`ブロック自身にも
+    // 必要(以前は`Host 127.0.0.1`ブロックだけに置いており、alias経由の接続では
+    // マッチせず既定の厳格なhost鍵検証にフォールバックしてBatchMode下で
+    // 即座に失敗していた — CI限定で再現していた"Broken pipe"の実体)。
     let config = format!(
         "Host {alias}\n\
          \x20\x20\x20\x20HostName 127.0.0.1\n\
          \x20\x20\x20\x20Port {target_port}\n\
          \x20\x20\x20\x20User {username}\n\
+         \x20\x20\x20\x20IdentityFile {key}\n\
+         \x20\x20\x20\x20IdentitiesOnly yes\n\
+         \x20\x20\x20\x20StrictHostKeyChecking no\n\
+         \x20\x20\x20\x20UserKnownHostsFile /dev/null\n\
          \x20\x20\x20\x20ProxyJump {username}@127.0.0.1:{bastion_port}\n\
          \n\
          Host 127.0.0.1\n\
