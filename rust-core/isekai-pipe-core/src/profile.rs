@@ -219,10 +219,7 @@ pub fn write_persistent_profile(dir: &Path, profile: &PersistentProfile) -> io::
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
-    let filename = format!("{}.json", profile.profile);
-    eprintln!("DEBUG(profile.rs): filename={filename:?} filename.bytes={:?}", filename.as_bytes());
-    let path = dir.join(&filename);
-    eprintln!("DEBUG(profile.rs): path immediately after join={path:?}");
+    let path = dir.join(format!("{}.json", profile.profile));
     let tmp = dir.join(format!("{}.{}.tmp", profile.profile, std::process::id()));
     let bytes = serde_json::to_vec_pretty(profile)?;
     fs::write(&tmp, &bytes)?;
@@ -232,7 +229,6 @@ pub fn write_persistent_profile(dir: &Path, profile: &PersistentProfile) -> io::
         fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
     }
     fs::rename(&tmp, &path)?;
-    eprintln!("DEBUG(profile.rs): path after rename={path:?}");
     Ok(path)
 }
 

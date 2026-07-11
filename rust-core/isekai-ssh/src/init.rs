@@ -130,16 +130,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
         cached_stun_observed_addr: handshake.stun_observed_addr().map(str::to_string),
     };
     let profile = PersistentProfile::migrate_legacy_helper_trust(&key, &trust);
-    eprintln!(
-        "DEBUG: key={key:?} key.bytes={:?} profile.profile={:?} profile.profile.bytes={:?} profiles_dir={:?}",
-        key.as_bytes(),
-        profile.profile,
-        profile.profile.as_bytes(),
-        profiles_dir,
-    );
     let path = write_persistent_profile(&profiles_dir, &profile)
         .with_context(|| format!("isekai-ssh: failed to write profile to {}", profiles_dir.display()))?;
-    eprintln!("DEBUG: path={path:?} path.display()={}", path.display());
 
     println!("Registered '{key}' in {}", path.display());
     Ok(())
