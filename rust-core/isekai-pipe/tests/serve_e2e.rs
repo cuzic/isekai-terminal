@@ -70,11 +70,16 @@ fn encode_quicmux_resume_frame(session_id: &[u8], resume_proof: &[u8], client_se
 }
 
 enum QuicmuxResumeResponse {
-    Ack { committed_offset: u64, sent_offset: u64, replay: Vec<u8> },
+    Ack { committed_offset: u64, sent_offset: u64 },
     Reject(u8),
 }
 
 /// Reads and decodes a `quicmux::resume` RESUME_ACK/RESUME_REJECT response.
+/// Replay bytes are deliberately **not** parsed here — per
+/// `quicmux::resume::respond_resume_accepted`'s docs, they are not part of
+/// this frame at all; they follow as plain, unframed continuation of the
+/// same stream, so a caller reads them via an ordinary subsequent
+/// `recv.read()`/`read_exact()`, exactly like any other application data.
 async fn read_quicmux_resume_response(recv: &mut quinn::RecvStream) -> QuicmuxResumeResponse {
     let mut frame_type = [0u8; 1];
     tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut frame_type))
@@ -87,11 +92,7 @@ async fn read_quicmux_resume_response(recv: &mut quinn::RecvStream) -> QuicmuxRe
             recv.read_exact(&mut committed).await.unwrap();
             let mut sent = [0u8; 8];
             recv.read_exact(&mut sent).await.unwrap();
-            let mut replay_len = [0u8; 4];
-            recv.read_exact(&mut replay_len).await.unwrap();
-            let mut replay = vec![0u8; u32::from_be_bytes(replay_len) as usize];
-            recv.read_exact(&mut replay).await.unwrap();
-            QuicmuxResumeResponse::Ack { committed_offset: u64::from_be_bytes(committed), sent_offset: u64::from_be_bytes(sent), replay }
+            QuicmuxResumeResponse::Ack { committed_offset: u64::from_be_bytes(committed), sent_offset: u64::from_be_bytes(sent) }
         }
         QUICMUX_FRAME_RESUME_REJECT => {
             let mut reason = [0u8; 1];
@@ -600,17 +601,23 @@ async fn resume_after_connection_loss_replays_and_continues() {
     let resume_frame = encode_quicmux_resume_frame(&session_id, &resume_proof, payload.len() as u64, 0);
     send2.write_all(&resume_frame).await.unwrap();
 
-    // quicmuxのRESUME_ACKはcommitted/sent offsetに続けてreplayバイト列も
-    // 同じフレーム内に長さ接頭辞つきで含む(旧isekai独自プロトコルは別書き込み
-    // だった)ので、未確認だった echo バイト列の再送もこの1回の応答で届く。
-    let QuicmuxResumeResponse::Ack { committed_offset: helper_committed_offset, sent_offset: helper_sent_offset, replay } =
+    let QuicmuxResumeResponse::Ack { committed_offset: helper_committed_offset, sent_offset: helper_sent_offset } =
         read_quicmux_resume_response(&mut recv2).await
     else {
         panic!("expected RESUME_ACK");
     };
     assert_eq!(helper_committed_offset, payload.len() as u64, "C->S は全部 committed 済みのはず");
     assert_eq!(helper_sent_offset, payload.len() as u64, "echo された分だけ S->C も進んでいるはず");
-    assert_eq!(&replay[..], payload, "reattach 後に未確認の echo データが再送されるはず");
+
+    // 未確認だった echo バイト列は、ACKフレームの一部としてではなく、
+    // 同じstreamの続きとして(生のapplication dataと区別なく)届く
+    // (quicmux::resume::respond_resume_acceptedのdocs参照)。
+    let mut replayed = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(5), recv2.read_exact(&mut replayed))
+        .await
+        .expect("timed out waiting for replayed bytes")
+        .unwrap();
+    assert_eq!(&replayed[..], payload, "reattach 後に未確認の echo データが再送されるはず");
 
     // reattach 後も同じ TCP 接続で中継が継続することを確認する。
     let more = b"after-resume";

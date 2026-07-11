@@ -3,11 +3,15 @@
 //! `rust-core/src/isekai_pipe_quic_transport.rs`'s `open_control_stream` /
 //! `spawn_app_ack_tasks` and `rust-core/src/isekai_link_relay_transport.rs`'s
 //! `reattach_fn` closure — minus anything that touches `noq` directly,
-//! `FaultyUdpSocket`, or `isekai-terminal-core`'s UniFFI types. The wire format matches
-//! `archive/HELPER_PROTOCOL.md` §7.3/§7.4 byte-for-byte (confirmed against the real
+//! `FaultyUdpSocket`, or `isekai-terminal-core`'s UniFFI types. The control
+//! stream's wire format (`CONTROL_HELLO`/`CONTROL_ACK`/`APP_ACK`) matches
+//! `archive/HELPER_PROTOCOL.md` §7.4 byte-for-byte (confirmed against the real
 //! `isekai-helper` implementation, `isekai-helper/src/main.rs` +
 //! `isekai-helper/src/resume.rs`, which is the actual interop target — not
-//! just the design doc's prose).
+//! just the design doc's prose). `RESUME` itself (`reconnect_and_resume`)
+//! moved onto `quicmux::resume`'s generic wire framing
+//! (quicmux-server-resume Stage B) — no longer the §7.3 byte layout; see
+//! that function's docs.
 //!
 //! Deliberately **not** ported from `isekai-terminal-core`: the `ReattachableStream`
 //! `AsyncRead`/`AsyncWrite` wrapper. That type exists on the Android side
@@ -46,10 +50,6 @@ pub use app_ack::{AppAckCounters, AppAckTasks, spawn_app_ack_tasks};
 use isekai_protocol::attach::ConnectionGeneration;
 use isekai_protocol::hello::Proof;
 use isekai_protocol::offset::{C2hHelperCommittedOffset, C2hSentOffset, H2cClientDeliveredOffset, H2cSentOffset};
-use isekai_protocol::resume::{
-    decode_resume_ack, decode_resume_reject, encode_resume, ResumeFrame, ResumeProof, FRAME_RESUME_ACK,
-    RESUME_ACK_FRAME_LEN,
-};
 use isekai_protocol::session_id::{decode_session_id, SessionId, SESSION_ID_LEN};
 use log::info;
 
@@ -595,13 +595,30 @@ pub struct ResumeAckOutcome {
     pub network_rebinder: Option<AnyMuxRebinder>,
 }
 
-/// Dials a brand-new QUIC connection to `target.helper_addr` and sends
-/// `RESUME` on its first bidirectional stream (`archive/HELPER_PROTOCOL.md` §7.3:
-/// "新しい QUIC connection の control stream 先頭" — despite the name, this is
+/// Maps `quicmux::ResumeRejectReason`(意味論としては解釈しない、ワイヤ上の
+/// 型でしかない)を、このcrate自身の`TransportError::ResumeRejected`が
+/// 使い続けている`isekai_protocol::resume::ResumeRejectReason`(3値とも
+/// 1:1で対応)に変換する。quicmux-server-resume Stage Bでワイヤフォーマット
+/// 自体はquicmux::resumeへ移行したが、呼び出し側(`isekai-ssh`等)から見た
+/// このcrateの公開エラー型は変えない。
+fn map_reject_reason(reason: quicmux::ResumeRejectReason) -> isekai_protocol::resume::ResumeRejectReason {
+    match reason {
+        quicmux::ResumeRejectReason::Auth => isekai_protocol::resume::ResumeRejectReason::Auth,
+        quicmux::ResumeRejectReason::UnknownToken => isekai_protocol::resume::ResumeRejectReason::UnknownSession,
+        quicmux::ResumeRejectReason::OffsetGone => isekai_protocol::resume::ResumeRejectReason::OffsetGone,
+    }
+}
+
+/// Dials a brand-new QUIC connection to `target.helper_addr` and issues a
+/// `quicmux::resume` RESUME request on its first bidirectional stream
+/// (quicmux-server-resume Stage B — previously isekai's own `archive/
+/// HELPER_PROTOCOL.md` §7.3 byte layout; see this module's docs). Despite
+/// the historical "control stream 先頭" naming in the design doc, this is
 /// the *first* stream opened on the new connection, not a stream opened
 /// alongside/after a fresh HELLO; the real `isekai-helper` implementation
 /// treats whichever frame type arrives first on the first stream as either a
-/// new-session `HELLO` or a `RESUME`, see `isekai-helper/src/main.rs::handle_connection`).
+/// new-session `ATTACH_HELLO` or a `quicmux::resume::FRAME_RESUME`, see
+/// `isekai-pipe`'s `engine/mod.rs::handle_connection`).
 ///
 /// `client_sent_offset`/`client_delivered_offset` must be the caller's
 /// current C2H-sent / H2C-delivered offsets (`archive/ISEKAI_SSH_DESIGN.md`'s
@@ -628,44 +645,37 @@ pub async fn reconnect_and_resume(
     let network_rebinder = endpoint.rebinder();
 
     // `resume_proof = HMAC-SHA256(session_secret, exporter || session_id)`
-    // (`archive/HELPER_PROTOCOL.md` §7.3). `compute_proof`'s `extra` parameter is
-    // exactly this: the real `isekai-helper` server computes its own expected
-    // value the same way — same exporter label, `session_id` bytes appended
-    // — for both the initial `HELLO` and `RESUME`/`CONTROL_HELLO`
-    // (`isekai-helper/src/main.rs` uses one `EXPORTER_LABEL` throughout,
-    // confirmed by reading that file directly rather than trusting
-    // `archive/HELPER_PROTOCOL.md`'s prose, which names a different, unused label).
+    // (`archive/HELPER_PROTOCOL.md` §7.3の計算式は不変 — 変わったのは
+    // これをquicmux::resumeの`token`/`auth_blob`という完全にopaqueな
+    // bytesに載せて送る、というワイヤ上の運び方だけ)。`compute_proof`の
+    // `extra`パラメータは、実際の`isekai-helper`(`isekai-pipe serve`)実装が
+    // 初回`HELLO`と`RESUME`/`CONTROL_HELLO`の両方で同じexporter labelを
+    // 使う(`isekai-pipe/src/engine/mod.rs`のEXPORTER_LABEL)ことに対称に
+    // 揃えたもの。
     let resume_proof_bytes = compute_proof(&conn, &target.session_secret, session_id.as_bytes()).await?;
-    let resume_proof = ResumeProof::new(*resume_proof_bytes.as_bytes());
 
-    let mut stream = conn.open_bi().await.map_err(TransportError::Mux)?;
-    let frame =
-        ResumeFrame { session_id, resume_proof, client_sent_offset, client_delivered_offset };
-    stream.write_all(&encode_resume(&frame)).await.map_err(TransportError::Mux)?;
-
-    let mut type_byte = [0u8; 1];
-    read_exact(&mut stream, &mut type_byte).await?;
-    if type_byte[0] != FRAME_RESUME_ACK {
-        let reason = decode_resume_reject(type_byte[0])?;
-        return Err(TransportError::ResumeRejected(reason));
-    }
-
-    let mut rest = [0u8; RESUME_ACK_FRAME_LEN - 1];
-    read_exact(&mut stream, &mut rest).await?;
-    let mut full = [0u8; RESUME_ACK_FRAME_LEN];
-    full[0] = FRAME_RESUME_ACK;
-    full[1..].copy_from_slice(&rest);
-    let ack = decode_resume_ack(&full)?;
+    let outcome = quicmux::request_resume(
+        &conn,
+        session_id.as_bytes(),
+        resume_proof_bytes.as_bytes(),
+        client_sent_offset.get(),
+        client_delivered_offset.get(),
+    )
+    .await
+    .map_err(|e| match e {
+        quicmux::ResumeRequestError::Mux(mux_err) => TransportError::Mux(mux_err),
+        quicmux::ResumeRequestError::Rejected(reason) => TransportError::ResumeRejected(map_reject_reason(reason)),
+    })?;
 
     info!(
         "isekai-transport: resume succeeded, session_id={session_id}, helper_committed_offset={}",
-        ack.helper_committed_offset
+        outcome.committed_offset
     );
     Ok(ResumeAckOutcome {
         connection: conn,
-        data_stream: stream,
-        helper_committed_offset: ack.helper_committed_offset,
-        helper_sent_offset: ack.helper_sent_offset,
+        data_stream: outcome.stream,
+        helper_committed_offset: C2hHelperCommittedOffset::new(outcome.committed_offset),
+        helper_sent_offset: H2cSentOffset::new(outcome.sent_offset),
         network_rebinder,
     })
 }
