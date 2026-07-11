@@ -200,6 +200,13 @@ pub struct InitArgs {
     /// disable STUN candidate exchange (today's pre-`#20b` behavior).
     #[arg(long = "stun-server", value_name = "ADDR:PORT")]
     pub stun_servers: Vec<SocketAddr>,
+
+    /// Passed straight through as `isekai-helper --log-level <LEVEL>`.
+    /// Defaults to isekai-helper's own built-in default (`info`) rather than
+    /// something more verbose, so debugging a stuck connection is an
+    /// explicit opt-in per deployment, not a standing cost on every host.
+    #[arg(long, value_name = "LEVEL", default_value = "info")]
+    pub remote_log_level: String,
 }
 
 #[derive(Args)]

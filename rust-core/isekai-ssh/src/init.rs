@@ -60,6 +60,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         relay_jwt,
         relay_transport: args.relay_transport.into(),
         idle_lifetime_secs: args.idle_lifetime,
+        remote_log_level: args.remote_log_level.clone(),
     };
 
     println!("Deploying isekai-helper to {}...", args.host);
@@ -319,6 +320,7 @@ mod tests {
             release_channel: None,
             idle_lifetime: 2_592_000,
             stun_servers: Vec::new(),
+            remote_log_level: "info".to_string(),
         }
     }
 
