@@ -17,12 +17,12 @@ use isekai_pipe_core::{
 use isekai_pipe_core::ServerIdentity;
 use isekai_transport::{
     connect_stun_p2p, connect_stun_p2p_with_fallback, connect_via_relay_resumable,
-    connect_via_relay_resumable_with_fallback, reconnect_and_resume, spawn_app_ack_tasks, AppAckCounters,
-    AttemptFailure, BackoffPolicy, BindSpec, ByteStream, ByteStreamReadHalf, ByteStreamWriteHalf, C2hSentOffset,
-    CandidatePool, CandidateProvider, ConfigRelayProvider, ConfigStunProvider, GatherContext,
-    H2cClientDeliveredOffset, LegacyIntentProvider, QmuxQuicEndpointFactory, QuicEndpointFactory,
-    QuicEndpointRebinder, RelayTarget, SequentialConnectError, SequentialFailure, SequentialRelayCandidate,
-    SequentialStunCandidate, SequentialStunConnectError, StunP2pTarget, SystemQuicEndpointFactory,
+    connect_via_relay_resumable_with_fallback, qmux_relay_factory, reconnect_and_resume, spawn_app_ack_tasks,
+    system_quic_factory, AnyByteStream, AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxFactory, AnyMuxRebinder,
+    AppAckCounters, AttemptFailure, BackoffPolicy, BindSpec, C2hSentOffset, CandidatePool, CandidateProvider,
+    ConfigRelayProvider, ConfigStunProvider, GatherContext, H2cClientDeliveredOffset, LegacyIntentProvider,
+    RelayTarget, SequentialConnectError, SequentialFailure, SequentialRelayCandidate, SequentialStunCandidate,
+    SequentialStunConnectError, StunP2pTarget,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -88,7 +88,7 @@ struct ConnectLaunch {
     resume_window: Duration,
     /// Experimental, default-off (`ISEKAI_PIPE_DESIGN.md`'s convention for
     /// opt-in features): on an OS-reported network change, try
-    /// `isekai_transport::QuicEndpointRebinder::rebind` (a fresh local
+    /// `isekai_transport::AnyMuxRebinder::rebind` (a fresh local
     /// socket, same QUIC endpoint/connection — no RESUME round trip) before
     /// falling back to today's "close and RESUME" reconnect. See
     /// `run_resume_loop`'s module-level comment on why this needed a
@@ -129,13 +129,14 @@ impl std::str::FromStr for RelayTransportKind {
 }
 
 /// `connect_via_relay_resumable`/`_with_fallback`/`reconnect_and_resume`
-/// (`isekai-transport`) already take `&dyn QuicEndpointFactory` — this just
-/// picks which concrete factory backs it, once, up front (never re-picked
-/// mid-connection, matching `ConnectLaunch::relay_transport`'s doc comment).
-fn relay_endpoint_factory(kind: RelayTransportKind) -> Box<dyn QuicEndpointFactory> {
+/// (`isekai-transport`) already take `&AnyMuxFactory` — this just picks
+/// which concrete backend it's built against, once, up front (never
+/// re-picked mid-connection, matching `ConnectLaunch::relay_transport`'s doc
+/// comment).
+fn relay_endpoint_factory(kind: RelayTransportKind) -> AnyMuxFactory {
     match kind {
-        RelayTransportKind::Udp => Box::new(SystemQuicEndpointFactory),
-        RelayTransportKind::Qmux => Box::new(QmuxQuicEndpointFactory),
+        RelayTransportKind::Udp => system_quic_factory(),
+        RelayTransportKind::Qmux => qmux_relay_factory(),
     }
 }
 
@@ -537,7 +538,7 @@ async fn run_connect(launch: ConnectLaunch) -> Result<()> {
         .context("isekai-pipe connect: relay transport failed"),
         CandidateRoute::StunP2p { cert_pin, peer_addr, stun_server, server_name } => {
             let stun_result = connect_stun_p2p(
-                &SystemQuicEndpointFactory,
+                &system_quic_factory(),
                 *stun_server,
                 &StunP2pTarget {
                     peer_addr: *peer_addr,
@@ -1198,7 +1199,7 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
             session_secret,
         };
         let candidates = vec![SequentialStunCandidate { stun_server, candidate_id: "probe".to_string() }];
-        let stun_result = connect_stun_p2p_with_fallback(&SystemQuicEndpointFactory, &target, &candidates).await;
+        let stun_result = connect_stun_p2p_with_fallback(&system_quic_factory(), &target, &candidates).await;
         let stale_trust_suspected = stun_result.as_ref().err().is_some_and(|e| e.is_stale_trust_signal());
         let (handshake, target_reachability) = match stun_result {
             Ok(_established) => (ProbeStageStatus::Ok { detail: None }, ProbeStageStatus::Ok { detail: None }),
@@ -1244,7 +1245,7 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
     // check, not a session to keep alive; dropping the returned session
     // immediately below closes the QUIC connection cleanly (the server sees
     // an ordinary disconnect, not a leak — no resume loop is ever started).
-    let relay_result = connect_via_relay_resumable_with_fallback(&SystemQuicEndpointFactory, &candidates, 0).await;
+    let relay_result = connect_via_relay_resumable_with_fallback(&system_quic_factory(), &candidates, 0).await;
     let stale_trust_suspected = relay_result.as_ref().err().is_some_and(|e| e.is_stale_trust_signal());
     let (handshake, target_reachability) = match relay_result {
         Ok((session, _winning_target)) => {
@@ -1266,7 +1267,7 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
     })
 }
 
-async fn relay_stdio(stream: Box<dyn ByteStream>) -> Result<()> {
+async fn relay_stdio(stream: AnyByteStream) -> Result<()> {
     let (mut quic_read, mut quic_write) = stream.split();
     let mut c2h = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
@@ -1328,10 +1329,10 @@ async fn run_relay_resumable(
 ) -> Result<()> {
     let factory = relay_endpoint_factory(relay_transport);
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
-    let established = connect_via_relay_resumable(factory.as_ref(), target, requested, identity)
+    let established = connect_via_relay_resumable(&factory, target, requested, identity)
         .await
         .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(factory.as_ref(), target, profile, established, experimental_network_rebind).await
+    run_resume_loop(&factory, target, profile, established, experimental_network_rebind).await
 }
 
 /// Like `run_relay_resumable`, but tries `candidates` in priority order
@@ -1350,10 +1351,10 @@ async fn run_relay_resumable_with_fallback(
     let factory = relay_endpoint_factory(relay_transport);
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
     let (established, winning_target) =
-        connect_via_relay_resumable_with_fallback(factory.as_ref(), candidates, requested)
+        connect_via_relay_resumable_with_fallback(&factory, candidates, requested)
             .await
             .map_err(attach_stale_trust_signal)?;
-    run_resume_loop(factory.as_ref(), &winning_target, profile, established, experimental_network_rebind).await
+    run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind).await
 }
 
 /// Like the single-candidate `CandidateRoute::StunP2p` path in `run_connect`,
@@ -1365,7 +1366,7 @@ async fn run_relay_resumable_with_fallback(
 /// straight into `relay_stdio`, exactly like the legacy single-candidate path
 /// already does.
 async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidates: &[SequentialStunCandidate]) -> Result<()> {
-    let (connection, _winning_stun_server) = connect_stun_p2p_with_fallback(&SystemQuicEndpointFactory, target, candidates)
+    let (connection, _winning_stun_server) = connect_stun_p2p_with_fallback(&system_quic_factory(), target, candidates)
         .await
         .map_err(attach_stale_trust_signal)?;
     relay_stdio(connection.stream).await
@@ -1382,8 +1383,8 @@ async fn run_stun_p2p_with_fallback(target: &StunP2pTarget, candidates: &[Sequen
 /// Picks an OS-assigned-ephemeral-port wildcard bind address matching
 /// `remote`'s address family — the same "let the OS pick a fresh source"
 /// approach `BindSpec::any_ipv4()` already uses for every *new* connection,
-/// reused here for `QuicEndpointRebinder::rebind`'s replacement socket. Not
-/// an explicit interface choice (see `QuicEndpointRebinder::rebind`'s docs):
+/// reused here for `AnyMuxRebinder::rebind`'s replacement socket. Not
+/// an explicit interface choice (see `AnyMuxRebinder::rebind`'s docs):
 /// just a fresh socket for the OS to route via its current default path,
 /// which is what actually helps after e.g. a Wi-Fi disconnect where the OS
 /// has since switched its default route to something else.
@@ -1408,13 +1409,13 @@ fn remote_bind_spec(remote: std::net::SocketAddr) -> BindSpec {
 /// `experimental_network_rebind` is set:
 ///
 /// - **Default** (`experimental_network_rebind` off, or this generation's
-///   `QuicEndpointFactory` doesn't support rebinding): every OS-reported
+///   `AnyMuxFactory` doesn't support rebinding): every OS-reported
 ///   network change (`isekai-netmon`; a no-op on platforms other than
 ///   Windows/macOS today) is forwarded immediately — this is exactly the
 ///   behavior this function replaced (`network_monitor.next_change()` raced
 ///   directly against `run_data_pump` in the same `select!`), just moved
 ///   into its own task so both shapes can feed the same channel.
-/// - **Experimental with a rebinder**: tries `QuicEndpointRebinder::rebind`
+/// - **Experimental with a rebinder**: tries `AnyMuxRebinder::rebind`
 ///   first on every change; only a *failed* rebind attempt is forwarded,
 ///   and this task then stops (that generation's endpoint is about to be
 ///   abandoned by the RESUME reconnect the failure triggers, so continuing
@@ -1440,9 +1441,27 @@ fn remote_bind_spec(remote: std::net::SocketAddr) -> BindSpec {
 /// a parameter rather than constructed inside this function so tests can
 /// inject a controllable mock instead of the real (on this development
 /// platform, Linux, always-`NoopNetworkChangeMonitor`) OS-backed one.
-fn spawn_reconnect_signal(
+/// Minimal async rebind interface this function needs — generic (not
+/// boxed as `dyn`) so both the real `isekai_transport::AnyMuxRebinder` and
+/// this module's own test-only mock can satisfy it. `AnyMuxRebinder` is a
+/// plain enum (see its own docs on why: exactly one real backend supports
+/// rebinding today, so a trait-object hierarchy would be overkill) with no
+/// public constructor for a fake value, so a test that wants to exercise
+/// "rebind succeeds"/"rebind fails" without a real `noq` endpoint needs its
+/// own minimal seam instead of constructing an `AnyMuxRebinder` directly.
+trait Rebindable: Send {
+    fn rebind(&self, bind: BindSpec) -> impl std::future::Future<Output = Result<(), isekai_transport::MuxError>> + Send;
+}
+
+impl Rebindable for AnyMuxRebinder {
+    fn rebind(&self, bind: BindSpec) -> impl std::future::Future<Output = Result<(), isekai_transport::MuxError>> + Send {
+        AnyMuxRebinder::rebind(self, bind)
+    }
+}
+
+fn spawn_reconnect_signal<R: Rebindable + 'static>(
     monitor: Box<dyn isekai_netmon::NetworkChangeMonitor>,
-    rebinder: Option<Box<dyn QuicEndpointRebinder>>,
+    rebinder: Option<R>,
     experimental_network_rebind: bool,
     helper_addr: std::net::SocketAddr,
 ) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<()>) {
@@ -1483,7 +1502,7 @@ fn spawn_reconnect_signal(
 }
 
 async fn run_resume_loop(
-    factory: &dyn QuicEndpointFactory,
+    factory: &AnyMuxFactory,
     target: &RelayTarget,
     profile: &str,
     established: isekai_transport::ResumableRelaySession,
@@ -1606,8 +1625,8 @@ async fn run_resume_loop(
 async fn run_data_pump(
     stdin: &mut (impl AsyncRead + Unpin),
     stdout: &mut (impl AsyncWrite + Unpin),
-    quic_read: Box<dyn ByteStreamReadHalf>,
-    quic_write: Box<dyn ByteStreamWriteHalf>,
+    quic_read: AnyByteStreamReadHalf,
+    quic_write: AnyByteStreamWriteHalf,
     replay: &Arc<Mutex<C2hReplayBuffer>>,
     counters: &Arc<AppAckCounters>,
 ) -> Result<()> {
@@ -1637,7 +1656,7 @@ async fn run_data_pump(
 
 async fn pump_c2h(
     stdin: &mut (impl AsyncRead + Unpin),
-    mut quic_write: Box<dyn ByteStreamWriteHalf>,
+    mut quic_write: AnyByteStreamWriteHalf,
     replay: Arc<Mutex<C2hReplayBuffer>>,
     counters: Arc<AppAckCounters>,
 ) -> Result<()> {
@@ -1671,7 +1690,7 @@ async fn pump_c2h(
 }
 
 async fn pump_h2c(
-    mut quic_read: Box<dyn ByteStreamReadHalf>,
+    mut quic_read: AnyByteStreamReadHalf,
     stdout: &mut (impl AsyncWrite + Unpin),
     counters: Arc<AppAckCounters>,
 ) -> Result<()> {
@@ -2637,13 +2656,12 @@ mod tests {
         should_succeed: bool,
     }
 
-    #[async_trait::async_trait]
-    impl QuicEndpointRebinder for MockRebinder {
-        async fn rebind_socket(&self, _socket: std::net::UdpSocket) -> Result<(), isekai_transport::TransportError> {
+    impl Rebindable for MockRebinder {
+        async fn rebind(&self, _bind: BindSpec) -> Result<(), isekai_transport::MuxError> {
             if self.should_succeed {
                 Ok(())
             } else {
-                Err(isekai_transport::TransportError::Rebind("mock failure".to_string()))
+                Err(isekai_transport::MuxError::Rebind("mock failure".to_string()))
             }
         }
     }
@@ -2654,7 +2672,8 @@ mod tests {
     async fn spawn_reconnect_signal_forwards_plain_network_change_when_not_experimental() {
         let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
             Box::new(FireOnceNetworkChangeMonitor { fired: false });
-        let (task, mut rx) = spawn_reconnect_signal(monitor, None, /* experimental */ false, TEST_HELPER_ADDR.parse().unwrap());
+        let (task, mut rx) =
+            spawn_reconnect_signal(monitor, None::<MockRebinder>, /* experimental */ false, TEST_HELPER_ADDR.parse().unwrap());
 
         assert!(rx.recv().await.is_some(), "a plain network change must be forwarded when experimental rebind is off");
         task.abort();
@@ -2667,7 +2686,8 @@ mod tests {
         // the non-experimental behavior, not silently drop the event.
         let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
             Box::new(FireOnceNetworkChangeMonitor { fired: false });
-        let (task, mut rx) = spawn_reconnect_signal(monitor, None, /* experimental */ true, TEST_HELPER_ADDR.parse().unwrap());
+        let (task, mut rx) =
+            spawn_reconnect_signal(monitor, None::<MockRebinder>, /* experimental */ true, TEST_HELPER_ADDR.parse().unwrap());
 
         assert!(rx.recv().await.is_some(), "with no rebinder available, a network change must still be forwarded");
         task.abort();
@@ -2677,7 +2697,7 @@ mod tests {
     async fn spawn_reconnect_signal_does_not_forward_after_a_successful_rebind() {
         let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
             Box::new(FireOnceNetworkChangeMonitor { fired: false });
-        let rebinder: Box<dyn QuicEndpointRebinder> = Box::new(MockRebinder { should_succeed: true });
+        let rebinder = MockRebinder { should_succeed: true };
         let (task, mut rx) = spawn_reconnect_signal(
             monitor,
             Some(rebinder),
@@ -2697,7 +2717,7 @@ mod tests {
     async fn spawn_reconnect_signal_forwards_after_a_failed_rebind() {
         let monitor: Box<dyn isekai_netmon::NetworkChangeMonitor> =
             Box::new(FireOnceNetworkChangeMonitor { fired: false });
-        let rebinder: Box<dyn QuicEndpointRebinder> = Box::new(MockRebinder { should_succeed: false });
+        let rebinder = MockRebinder { should_succeed: false };
         let (task, mut rx) = spawn_reconnect_signal(
             monitor,
             Some(rebinder),
@@ -2865,7 +2885,7 @@ mod tests {
     }
 
     fn sample_transport_error() -> isekai_transport::TransportError {
-        isekai_transport::TransportError::Handshake("simulated failure".to_string())
+        isekai_transport::TransportError::Mux(isekai_transport::MuxError::Handshake("simulated failure".to_string()))
     }
 
     #[test]
