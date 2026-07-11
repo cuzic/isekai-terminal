@@ -32,16 +32,21 @@
 //! waiting on the data stream alone, so the extra round trip is an
 //! acceptable, much simpler trade.
 //!
-//! Also deliberately **not** ported: reopening a control stream after a
-//! successful `RESUME`. `isekai_link_relay_transport.rs`'s `reattach_fn`
-//! doesn't do this either (isekai-helper's `handle_resume_stream` merely
-//! *offers* a `HELLO_TIMEOUT`-bounded window to reopen one, and silently
-//! continues without resume-refresh support if the client doesn't take it) —
-//! this module mirrors that reference behavior rather than adding new
-//! untested surface. `APP_ACK`-based buffer trimming simply stops after a
-//! resume; the C2H replay buffer's own bound still caps memory use (see
-//! `isekai-ssh`'s `resume` module), matching the existing implementation's
-//! trade-off exactly.
+//! Reopening a control stream after a successful `RESUME` is deliberately
+//! **not** this module's job: `reconnect_and_resume` performs a single
+//! resume attempt and hands back the resumed connection/data stream, but
+//! stays agnostic about anything past that — it's each caller's own
+//! responsibility to reopen a control stream on the returned connection
+//! (`compute_proof` + `open_control_stream` + `spawn_app_ack_tasks`) if it
+//! wants `APP_ACK`-based buffer trimming to keep working past the first
+//! resume. This used to be a real, previously-undiscovered gap in every
+//! caller (`isekai-pipe connect`'s `run_resume_loop`, and
+//! `isekai-terminal-core`'s three Android transports) — APP_ACK trimming
+//! silently stopped forever after the first resume in each of them — found
+//! and fixed in all four places (`quicmux-server-resume`, codex review).
+//! `finish_via_resume` below, in this same module, is the one caller that
+//! has always gotten this right, and is the reference implementation the
+//! other callers' fixes were modeled on.
 
 mod app_ack;
 
