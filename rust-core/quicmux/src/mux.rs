@@ -14,7 +14,7 @@
 //! corresponding backend feature, so a build with only one backend enabled
 //! never even compiles the other's variant — not just skips constructing it.
 
-use crate::config::MuxClientConfig;
+use crate::config::{MuxClientConfig, MuxServerConfig};
 use crate::error::MuxError;
 use crate::types::{BindSpec, RemoteSpec};
 
@@ -162,7 +162,142 @@ impl AnyMuxRebinder {
     }
 }
 
-/// An established mux connection.
+/// A bound mux listener, capable of accepting inbound connections — the
+/// server-side counterpart to [`AnyMuxEndpoint`].
+pub enum AnyMuxListener {
+    #[cfg(feature = "noq")]
+    Noq(crate::noq_backend::NoqListener),
+    #[cfg(feature = "qmux")]
+    Qmux(crate::qmux_backend::QmuxListener),
+}
+
+impl AnyMuxListener {
+    /// Binds a fresh local UDP socket at `bind` and listens for inbound
+    /// `noq` connections.
+    #[cfg(feature = "noq")]
+    pub async fn bind_noq(config: MuxServerConfig, bind: BindSpec) -> Result<Self, MuxError> {
+        Ok(Self::Noq(crate::noq_backend::NoqListener::bind(config, bind).await?))
+    }
+
+    /// Wraps an already-bound `tokio::net::UdpSocket` as a `noq`-backed
+    /// listener, instead of binding a fresh one via [`AnyMuxListener::bind_noq`]
+    /// — for a caller that must perform its own raw I/O on a specific socket
+    /// (a STUN query and hole-punch probes, or an inbound relay tunnel
+    /// socket) before handing it to this crate, mirroring
+    /// [`AnyMuxFactory::wrap_bound_socket`]'s client-side equivalent.
+    #[cfg(feature = "noq")]
+    pub async fn wrap_bound_socket_noq(config: MuxServerConfig, socket: tokio::net::UdpSocket) -> Result<Self, MuxError> {
+        Ok(Self::Noq(crate::noq_backend::NoqListener::wrap_bound_socket(config, socket).await?))
+    }
+
+    /// Wraps an already-adapted `Box<dyn noq::AsyncUdpSocket>` as a listener
+    /// directly, for a caller whose socket isn't a plain
+    /// `tokio::net::UdpSocket` at all — see
+    /// [`crate::noq_backend::NoqListener::from_abstract_socket`]'s docs
+    /// (e.g. `isekai-pipe serve`'s `--relay` MASQUE-tunnel socket).
+    #[cfg(feature = "noq")]
+    pub fn from_abstract_socket_noq(config: MuxServerConfig, socket: Box<dyn noq::AsyncUdpSocket>) -> Result<Self, MuxError> {
+        Ok(Self::Noq(crate::noq_backend::NoqListener::from_abstract_socket(config, socket)?))
+    }
+
+    /// Binds a fresh local TCP socket at `bind` and listens for inbound
+    /// `qmux` connections. No `wrap_bound_socket`-style counterpart — unlike
+    /// `noq`'s UDP-socket-then-STUN-then-hand-off pattern, nothing in this
+    /// crate's callers needs to run raw I/O on the listening TCP socket
+    /// before this crate takes it over.
+    #[cfg(feature = "qmux")]
+    pub async fn bind_qmux(config: MuxServerConfig, bind: BindSpec) -> Result<Self, MuxError> {
+        Ok(Self::Qmux(crate::qmux_backend::QmuxListener::bind(config, bind).await?))
+    }
+
+    /// Waits for the next inbound connection candidate. Returns `None` once
+    /// the listener has been closed and has no more incoming connections to
+    /// deliver.
+    pub async fn accept(&self) -> Option<AnyMuxIncoming> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(listener) => listener.accept().await.map(AnyMuxIncoming::Noq),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(listener) => listener.accept().await.map(AnyMuxIncoming::Qmux),
+        }
+    }
+
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr, MuxError> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(listener) => listener.local_addr(),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(listener) => listener.local_addr(),
+        }
+    }
+
+    /// Requests that the listener stop accepting new connections. Best-
+    /// effort, and backend-dependent in scope: the `noq` backend also closes
+    /// every connection it already produced, sending `reason` as the
+    /// application-level close reason (does not wait for peers to
+    /// acknowledge; see [`AnyMuxListener::wait_idle`] for that), while the
+    /// `qmux` backend only stops accepting new TCP connections (`reason` is
+    /// unused there — a bare TCP listener close has no application-level
+    /// close-reason concept) — it has no centralized tracking of connections
+    /// it already produced to close (see `qmux_backend`'s module docs).
+    pub fn close(&self, reason: &[u8]) {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(listener) => listener.close(reason),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(listener) => listener.close(),
+        }
+    }
+
+    /// Waits until every connection this listener produced has finished
+    /// closing (after a prior [`AnyMuxListener::close`]) — a no-op for the
+    /// `qmux` backend (see [`AnyMuxListener::close`]'s docs on why).
+    pub async fn wait_idle(&self) {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(listener) => listener.wait_idle().await,
+            #[cfg(feature = "qmux")]
+            Self::Qmux(listener) => listener.wait_idle().await,
+        }
+    }
+}
+
+/// A connection candidate [`AnyMuxListener::accept`] received, whose
+/// handshake has not necessarily completed yet — split out from `accept`
+/// itself (instead of `accept` awaiting completion directly) so a caller
+/// that needs to synchronously wait for one *specific* accepted candidate's
+/// handshake before doing anything else (e.g. `isekai-pipe serve`'s `--once`
+/// flag, which must not close the listener until the one connection it
+/// decided to accept has actually finished handshaking — closing right after
+/// `accept()` returns instead would race the listener's own shutdown against
+/// the still-pending handshake) can do so without an extra channel/task.
+pub enum AnyMuxIncoming {
+    #[cfg(feature = "noq")]
+    Noq(crate::noq_backend::NoqIncoming),
+    #[cfg(feature = "qmux")]
+    Qmux(crate::qmux_backend::QmuxIncoming),
+}
+
+impl AnyMuxIncoming {
+    /// Awaits handshake completion, yielding the established connection.
+    pub async fn accept(self) -> Result<AnyMuxConnection, MuxError> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(incoming) => Ok(AnyMuxConnection::Noq(incoming.accept().await?)),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(incoming) => Ok(AnyMuxConnection::Qmux(incoming.accept().await?)),
+        }
+    }
+}
+
+/// An established mux connection. `Clone` — both backing types
+/// (`noq::Connection`/`qmux::Session`) are themselves cheap `Clone` handles
+/// onto shared state, not owners of a background task that dies with one
+/// particular value (see each's own doc comment), so a caller that needs to
+/// hand a second handle to a spawned task (e.g. to open a control stream
+/// concurrently with driving the main data stream) can just clone this
+/// rather than needing an `Arc<AnyMuxConnection>` wrapper of its own.
+#[derive(Clone)]
 pub enum AnyMuxConnection {
     #[cfg(feature = "noq")]
     Noq(crate::noq_backend::NoqConnection),
@@ -178,6 +313,37 @@ impl AnyMuxConnection {
             Self::Noq(conn) => Ok(AnyByteStream::Noq(conn.open_bi().await?)),
             #[cfg(feature = "qmux")]
             Self::Qmux(conn) => Ok(AnyByteStream::Qmux(conn.open_bi().await?)),
+        }
+    }
+
+    /// Accepts a new bidirectional stream the peer opened — the
+    /// server-accepting-a-connection counterpart to [`AnyMuxConnection::open_bi`].
+    /// Not restricted to server-produced connections: nothing about "which
+    /// side dialed" stops either peer from accepting a stream the other
+    /// opened, once the connection itself is established — a `noq::Connection`
+    /// and a `qmux::Session` both work this way, so a client-dialed
+    /// [`AnyMuxConnection`] can call this too (e.g. to accept a control
+    /// stream the server opens back).
+    pub async fn accept_bi(&self) -> Result<AnyByteStream, MuxError> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(conn) => Ok(AnyByteStream::Noq(conn.accept_bi().await?)),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(conn) => Ok(AnyByteStream::Qmux(conn.accept_bi().await?)),
+        }
+    }
+
+    /// Best-effort remote address of the peer — `None` if the backend has no
+    /// stable single address to report. A `noq` connection with multipath
+    /// enabled may have a different address per path (this reports path 0's,
+    /// which always exists, but that is still not necessarily "the" address
+    /// once other paths are live).
+    pub fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(conn) => conn.remote_addr(),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(conn) => conn.remote_addr(),
         }
     }
 
@@ -249,6 +415,28 @@ impl AnyByteStream {
         }
     }
 
+    /// Waits until the peer has either received everything this stream sent
+    /// (acknowledged a prior [`AnyByteStream::shutdown`]) or explicitly
+    /// stopped reading it. A caller that writes a final message and then
+    /// immediately drops/closes the whole connection can race the peer
+    /// actually receiving that message — `isekai-pipe serve`'s `reject()`
+    /// hit exactly this (documented there as "実測で確認済みのバグ": the
+    /// QUIC connection closing before the reject reason reached the client)
+    /// and this crate's own listener tests independently reproduced the
+    /// same class of race (`noq_backend`/`qmux_backend`'s `PeerClosed`
+    /// gotcha in their listener echo tests) — call this after
+    /// [`AnyByteStream::shutdown`] and before closing the connection
+    /// whenever the caller needs the peer to have actually seen the last
+    /// write, not just that the local call to send it returned `Ok`.
+    pub async fn wait_for_close(&mut self) -> Result<(), MuxError> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(stream) => stream.wait_for_close().await,
+            #[cfg(feature = "qmux")]
+            Self::Qmux(stream) => stream.wait_for_close().await,
+        }
+    }
+
     /// Splits this stream into independently-owned read/write halves so a
     /// caller can drive "read from A, write to this stream" and "read from
     /// this stream, write to B" as two separately `tokio::spawn`ed tasks
@@ -267,6 +455,31 @@ impl AnyByteStream {
                 let (read, write) = stream.split();
                 (AnyByteStreamReadHalf::Qmux(read), AnyByteStreamWriteHalf::Qmux(write))
             }
+        }
+    }
+
+    /// The inverse of [`AnyByteStream::split`] — recombines a previously
+    /// split pair back into one stream a caller can hand off to code that
+    /// expects the combined shape (e.g. a resume/reconnect flow that only
+    /// needed split halves transiently, to write a request and read a
+    /// response sequentially, but whose caller ultimately wants the same
+    /// `AnyByteStream` shape a fresh connection's `open_bi()` would have
+    /// produced). `read`/`write` must come from the same prior `split()`
+    /// call — mixing halves from two different streams, or from different
+    /// backends, panics rather than silently producing a stream that reads
+    /// from one connection and writes to another.
+    pub fn unsplit(read: AnyByteStreamReadHalf, write: AnyByteStreamWriteHalf) -> Self {
+        match (read, write) {
+            #[cfg(feature = "noq")]
+            (AnyByteStreamReadHalf::Noq(read), AnyByteStreamWriteHalf::Noq(write)) => {
+                Self::Noq(crate::noq_backend::NoqByteStream::unsplit(read, write))
+            }
+            #[cfg(feature = "qmux")]
+            (AnyByteStreamReadHalf::Qmux(read), AnyByteStreamWriteHalf::Qmux(write)) => {
+                Self::Qmux(crate::qmux_backend::QmuxByteStream::unsplit(read, write))
+            }
+            #[cfg(all(feature = "noq", feature = "qmux"))]
+            _ => panic!("AnyByteStream::unsplit: read and write halves came from different backends"),
         }
     }
 }
@@ -317,6 +530,16 @@ impl AnyByteStreamWriteHalf {
             Self::Noq(half) => half.shutdown().await,
             #[cfg(feature = "qmux")]
             Self::Qmux(half) => half.shutdown().await,
+        }
+    }
+
+    /// Same contract as [`AnyByteStream::wait_for_close`].
+    pub async fn wait_for_close(&mut self) -> Result<(), MuxError> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(half) => half.wait_for_close().await,
+            #[cfg(feature = "qmux")]
+            Self::Qmux(half) => half.wait_for_close().await,
         }
     }
 }

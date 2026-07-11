@@ -29,8 +29,6 @@ use isekai_protocol::attach::{
     ATTACH_HELLO_FRAME_LEN,
 };
 use isekai_protocol::hello::{ALPN, EXPORTER_LABEL};
-use isekai_protocol::offset::{C2hHelperCommittedOffset, H2cSentOffset};
-use isekai_protocol::resume::{decode_resume, encode_resume_ack, ResumeAckFrame, ResumeProof, RESUME_FRAME_LEN};
 use isekai_transport::{
     connect_via_relay_resumable_with_fallback, RelayTarget, SequentialConnectError, SequentialRelayCandidate,
     system_quic_factory,
@@ -373,31 +371,49 @@ async fn run_silent_then_resumable_helper(endpoint: noq::Endpoint) {
     let incoming2 = endpoint.accept().await.unwrap();
     let conn2 = incoming2.await.unwrap();
     let (mut send2, mut recv2) = conn2.accept_bi().await.unwrap();
-    let mut resume_bytes = [0u8; RESUME_FRAME_LEN];
-    recv2.read_exact(&mut resume_bytes).await.unwrap();
-    let resume_frame = decode_resume(&resume_bytes).unwrap();
-    assert_eq!(resume_frame.session_id, hello.session_id, "resume must target the same session_id the ambiguous attach used");
+    // quicmux::resume's RESUME body (quicmux-server-resume Stage B):
+    // frame_type(1) + token_len(2)+token + auth_blob_len(2)+auth_blob +
+    // client_sent_offset(8) + client_delivered_offset(8) — see
+    // `isekai-pipe/src/engine/mod.rs::handle_resume_stream`'s identical
+    // decode for the real interop target.
+    let mut frame_type = [0u8; 1];
+    recv2.read_exact(&mut frame_type).await.unwrap();
+    assert_eq!(frame_type[0], 0x01, "expected quicmux::resume::FRAME_RESUME");
+    let mut token_len = [0u8; 2];
+    recv2.read_exact(&mut token_len).await.unwrap();
+    let mut token = vec![0u8; u16::from_be_bytes(token_len) as usize];
+    recv2.read_exact(&mut token).await.unwrap();
+    let mut auth_len = [0u8; 2];
+    recv2.read_exact(&mut auth_len).await.unwrap();
+    let mut auth_blob = vec![0u8; u16::from_be_bytes(auth_len) as usize];
+    recv2.read_exact(&mut auth_blob).await.unwrap();
+    let mut sent_offset_bytes = [0u8; 8];
+    recv2.read_exact(&mut sent_offset_bytes).await.unwrap();
+    let mut delivered_offset_bytes = [0u8; 8];
+    recv2.read_exact(&mut delivered_offset_bytes).await.unwrap();
+
+    assert_eq!(token.as_slice(), hello.session_id.as_bytes(), "resume must target the same session_id the ambiguous attach used");
 
     let mut exporter = [0u8; 32];
     conn2.export_keying_material(&mut exporter, EXPORTER_LABEL, b"").unwrap();
     let mut mac = HmacSha256::new_from_slice(SESSION_SECRET).unwrap();
     mac.update(&exporter);
-    mac.update(resume_frame.session_id.as_bytes());
-    let expected = ResumeProof::new(mac.finalize().into_bytes().into());
-    assert!(resume_frame.resume_proof.ct_eq(&expected), "test setup bug: resume proof mismatch");
+    mac.update(&token);
+    let expected: [u8; 32] = mac.finalize().into_bytes().into();
+    assert_eq!(auth_blob.as_slice(), &expected[..], "test setup bug: resume proof mismatch");
 
-    let ack = ResumeAckFrame {
-        helper_committed_offset: C2hHelperCommittedOffset::new(0),
-        helper_sent_offset: H2cSentOffset::new(0),
-    };
-    send2.write_all(&encode_resume_ack(&ack)).await.unwrap();
+    let mut ack = Vec::with_capacity(1 + 8 + 8);
+    ack.push(0x02u8); // quicmux::resume::FRAME_RESUME_ACK
+    ack.extend_from_slice(&0u64.to_be_bytes()); // helper_committed_offset
+    ack.extend_from_slice(&0u64.to_be_bytes()); // helper_sent_offset
+    send2.write_all(&ack).await.unwrap();
 
     let (mut csend2, mut crecv2) = conn2.accept_bi().await.unwrap();
     let mut chello = [0u8; 33];
     crecv2.read_exact(&mut chello).await.unwrap();
     assert_eq!(chello[0], 0x10, "expected CONTROL_HELLO");
     let mut cack = vec![0x11u8];
-    cack.extend_from_slice(resume_frame.session_id.as_bytes());
+    cack.extend_from_slice(&token);
     csend2.write_all(&cack).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -449,6 +465,47 @@ async fn ambiguous_then_already_established_converges_on_resuming_the_ambiguous_
     assert_eq!(
         winning_target.helper_addr, addr1,
         "the resumed session must be against candidate 1 (the one that went ambiguous), not candidate 2"
+    );
+
+    drop(session.connection);
+    let _ = tokio::time::timeout(Duration::from_secs(5), server1_task).await;
+    server2_task.abort();
+}
+
+/// The `MustResume` convergence path (`finish_via_resume`) has no
+/// `ATTACH_HELLO` exchange to learn the server's actually-granted resume
+/// grace period from — it used to hardcode `effective_resume_grace_secs: 0`,
+/// which callers like `isekai-pipe connect`'s `run_resume_loop` treat as a
+/// literal zero-second resume window rather than "unknown" (codex review,
+/// quicmux-server-resume). Confirms the fix: a caller that requested a real,
+/// non-zero grace period sees that same value echoed back even after
+/// converging through this path, not `0`.
+#[tokio::test]
+async fn ambiguous_convergence_reports_the_originally_requested_grace_period_not_zero() {
+    let (cert1_der, key1_der, cert1_hex) = generate_cert();
+    let endpoint1 = mock_server(cert1_der, key1_der);
+    let addr1 = endpoint1.local_addr().unwrap();
+    let server1_task = tokio::spawn(run_silent_then_resumable_helper(endpoint1));
+
+    let (cert2_der, key2_der, cert2_hex) = generate_cert();
+    let endpoint2 = mock_server(cert2_der, key2_der);
+    let addr2 = endpoint2.local_addr().unwrap();
+    let server2_task = tokio::spawn(run_reject_already_established_helper(endpoint2));
+
+    let candidates = vec![candidate("relay-1", addr1, cert1_hex), candidate("relay-2", addr2, cert2_hex)];
+
+    let factory = system_quic_factory();
+    let (session, _winning_target) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_via_relay_resumable_with_fallback(&factory, &candidates, 180),
+    )
+    .await
+    .expect("should not hang")
+    .expect("ATTACH_ALREADY_ESTABLISHED after an ambiguous candidate should converge on resuming it");
+    assert_eq!(
+        session.effective_resume_grace_secs, 180,
+        "should fall back to the originally requested grace period, not report 0 \
+         (which downstream callers would treat as an immediate-give-up deadline)"
     );
 
     drop(session.connection);

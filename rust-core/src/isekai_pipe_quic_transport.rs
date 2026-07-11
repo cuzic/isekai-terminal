@@ -498,23 +498,33 @@ async fn connect_isekai_pipe_quic_stream(
 
     // Phase 8-3: QUIC connection が失われても RESUME で reattach する
     // クロージャ。`target`を捕捉する。
-    let reattach_fn: resume_client::ReattachFn<quicmux::AnyByteStreamReadHalf, quicmux::AnyByteStreamWriteHalf> = Arc::new(move |session_id, client_sent_offset, client_delivered_offset| {
-        let factory = crate::android_quic_endpoint::factory();
-        let target = target.clone();
-        Box::pin(async move {
-            let outcome = isekai_transport::resume::reconnect_and_resume(
-                &factory,
-                &target,
-                isekai_transport::SessionId::from_bytes(session_id),
-                isekai_transport::C2hSentOffset::new(client_sent_offset),
-                isekai_transport::H2cClientDeliveredOffset::new(client_delivered_offset),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            info!("isekai_pipe_quic: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
-            let (read, write) = outcome.data_stream.split();
-            Ok(resume_client::ReattachResult { read, write, helper_committed_offset: outcome.helper_committed_offset.get() })
-        })
+    let reattach_fn: resume_client::ReattachFn<quicmux::AnyByteStreamReadHalf, quicmux::AnyByteStreamWriteHalf> = Arc::new({
+        let resume_state = resume_state.clone();
+        move |session_id, client_sent_offset, client_delivered_offset| {
+            let factory = crate::android_quic_endpoint::factory();
+            let target = target.clone();
+            let resume_state = resume_state.clone();
+            Box::pin(async move {
+                let outcome = isekai_transport::resume::reconnect_and_resume(
+                    &factory,
+                    &target,
+                    isekai_transport::SessionId::from_bytes(session_id),
+                    isekai_transport::C2hSentOffset::new(client_sent_offset),
+                    isekai_transport::H2cClientDeliveredOffset::new(client_delivered_offset),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                info!("isekai_pipe_quic: resume succeeded, helper_committed_offset={}", outcome.helper_committed_offset);
+                spawn_control_stream_reestablishment_after_resume(
+                    "isekai_pipe_quic",
+                    outcome.connection.clone(),
+                    target.session_secret.clone(),
+                    resume_state,
+                );
+                let (read, write) = outcome.data_stream.split();
+                Ok(resume_client::ReattachResult { read, write, helper_committed_offset: outcome.helper_committed_offset.get() })
+            })
+        }
     });
 
     let (data_read, data_write) = data_stream.split();
@@ -549,6 +559,50 @@ pub(crate) fn spawn_app_ack_bridge(
     });
 }
 
+/// RESUME成功後に`conn`(reconnect_and_resumeが返した新しいconnection)上で
+/// control streamを再確立し、成功すればAPP_ACKベースのバッファtrimming
+/// (`spawn_app_ack_tasks`+`spawn_app_ack_bridge`)を再開する — 初回ATTACH後の
+/// control stream確立(この関数の呼び出し元3ファイルそれぞれの
+/// `connect_*_stream`冒頭)の、reattach版。これが無いと最初の1回だけ
+/// resumeが効いて以降のreattachでは`ClientResumeState.replay_buffer`の
+/// trimming/`client_delivered_offset`同期が止まったままになる
+/// (isekai-transport側`resume::finish_via_resume`が同じ理由でRESUME後に
+/// control streamを再確立しているのと同じ問題、quicmux-server-resume
+/// Stage Bで発見)。初回接続時と同じくfire-and-forgetかつ
+/// `CONTROL_STREAM_TIMEOUT`で打ち切る — 旧verのhelper相手にcontrol stream
+/// が確立できない場合でも、resumeしたdata streamをSSHセッションへ渡すのを
+/// 遅らせてはいけない。
+pub(crate) fn spawn_control_stream_reestablishment_after_resume(
+    log_prefix: &'static str,
+    conn: quicmux::AnyMuxConnection,
+    session_secret: Vec<u8>,
+    resume_state: Arc<std::sync::Mutex<ClientResumeState>>,
+) {
+    RUNTIME.spawn(async move {
+        let established = async {
+            let proof = isekai_transport::compute_proof(&conn, &session_secret, b"")
+                .await
+                .map_err(|e| e.to_string())?;
+            isekai_transport::resume::open_control_stream(&conn, &proof)
+                .await
+                .map_err(|e| e.to_string())
+        };
+        match tokio::time::timeout(CONTROL_STREAM_TIMEOUT, established).await {
+            Ok(Ok(control)) => {
+                info!("{log_prefix}: control stream re-established after resume, session_id={}", control.session_id);
+                let counters = Arc::new(isekai_transport::resume::AppAckCounters::new());
+                isekai_transport::resume::spawn_app_ack_tasks(control.stream, counters.clone());
+                spawn_app_ack_bridge(resume_state, counters);
+            }
+            Ok(Err(e)) => {
+                info!("{log_prefix}: control stream re-establishment after resume failed ({e}), continuing without resume support until the next reattach");
+            }
+            Err(_) => {
+                info!("{log_prefix}: control stream re-establishment after resume timed out, continuing without resume support until the next reattach");
+            }
+        }
+    });
+}
 
 async fn try_connect_isekai_pipe_quic(
     config: &IsekaiPipeQuicConfig,

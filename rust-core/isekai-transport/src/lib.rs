@@ -90,6 +90,7 @@ pub mod resume;
 pub mod stun_p2p;
 pub mod system;
 pub mod telemetry;
+pub mod warm_standby;
 
 pub use attempt::AttemptFailure;
 pub use backoff::BackoffPolicy;
@@ -124,6 +125,7 @@ pub use stun_p2p::{
 };
 pub use system::system_quic_factory;
 pub use telemetry::{CandidateAttempt, CandidateIdentity, CandidateOutcome};
+pub use warm_standby::{PromotedConnection, WarmStandby, WarmStandbyError, PROBE_TIMEOUT};
 
 // Re-exported so downstream crates (e.g. `isekai-ssh`/`isekai-pipe`) that
 // only depend on `isekai-transport` don't also need a direct `quicmux`

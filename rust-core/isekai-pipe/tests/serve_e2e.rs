@@ -37,10 +37,71 @@ const FRAME_REJECT_AUTH: u8 = 0xFF;
 const FRAME_REJECT_BUSY_OTHER_SESSION: u8 = 0xF2;
 const CONTROL_HELLO: u8 = 0x10;
 const CONTROL_ACK: u8 = 0x11;
-const RESUME: u8 = 0x03;
-const RESUME_ACK: u8 = 0x13;
-const REJECT_UNKNOWN_SESSION: u8 = 0xF9;
-const REJECT_OFFSET_GONE: u8 = 0xF8;
+// RESUME itself moved to `quicmux::resume` (quicmux-server-resume Stage B) —
+// see `QUICMUX_FRAME_RESUME`/`encode_quicmux_resume_frame`/
+// `read_quicmux_resume_response` below. `CONTROL_HELLO`/`CONTROL_ACK` are
+// isekai's own control-stream sub-protocol and are unaffected (out of
+// `quicmux::resume`'s scope — see that module's docs).
+const QUICMUX_FRAME_RESUME: u8 = 0x01;
+const QUICMUX_FRAME_RESUME_ACK: u8 = 0x02;
+const QUICMUX_FRAME_RESUME_REJECT: u8 = 0x03;
+/// `quicmux::ResumeRejectReason::UnknownToken`'s wire value — see that
+/// enum's `to_wire`/`from_wire`.
+const QUICMUX_REJECT_UNKNOWN_TOKEN: u8 = 1;
+/// `quicmux::ResumeRejectReason::OffsetGone`'s wire value.
+const QUICMUX_REJECT_OFFSET_GONE: u8 = 2;
+
+/// Encodes a `quicmux::resume` RESUME frame body exactly like a real
+/// quicmux-based client would (`token`=session_id, `auth_blob`=resume_proof,
+/// both length-prefixed — see `quicmux::resume::encode_resume_request`,
+/// which this test deliberately does not call directly so this file keeps
+/// independently pinning down the actual wire bytes, the same reason it
+/// hand-rolls every other frame in this file rather than calling into
+/// `isekai-transport`/`quicmux`).
+fn encode_quicmux_resume_frame(session_id: &[u8], resume_proof: &[u8], client_sent_offset: u64, client_delivered_offset: u64) -> Vec<u8> {
+    let mut frame = vec![QUICMUX_FRAME_RESUME];
+    frame.extend_from_slice(&(session_id.len() as u16).to_be_bytes());
+    frame.extend_from_slice(session_id);
+    frame.extend_from_slice(&(resume_proof.len() as u16).to_be_bytes());
+    frame.extend_from_slice(resume_proof);
+    frame.extend_from_slice(&client_sent_offset.to_be_bytes());
+    frame.extend_from_slice(&client_delivered_offset.to_be_bytes());
+    frame
+}
+
+enum QuicmuxResumeResponse {
+    Ack { committed_offset: u64, sent_offset: u64 },
+    Reject(u8),
+}
+
+/// Reads and decodes a `quicmux::resume` RESUME_ACK/RESUME_REJECT response.
+/// Replay bytes are deliberately **not** parsed here — per
+/// `quicmux::resume::respond_resume_accepted`'s docs, they are not part of
+/// this frame at all; they follow as plain, unframed continuation of the
+/// same stream, so a caller reads them via an ordinary subsequent
+/// `recv.read()`/`read_exact()`, exactly like any other application data.
+async fn read_quicmux_resume_response(recv: &mut quinn::RecvStream) -> QuicmuxResumeResponse {
+    let mut frame_type = [0u8; 1];
+    tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut frame_type))
+        .await
+        .expect("timed out waiting for resume response")
+        .expect("connection closed before resume response type byte was delivered");
+    match frame_type[0] {
+        QUICMUX_FRAME_RESUME_ACK => {
+            let mut committed = [0u8; 8];
+            recv.read_exact(&mut committed).await.unwrap();
+            let mut sent = [0u8; 8];
+            recv.read_exact(&mut sent).await.unwrap();
+            QuicmuxResumeResponse::Ack { committed_offset: u64::from_be_bytes(committed), sent_offset: u64::from_be_bytes(sent) }
+        }
+        QUICMUX_FRAME_RESUME_REJECT => {
+            let mut reason = [0u8; 1];
+            recv.read_exact(&mut reason).await.unwrap();
+            QuicmuxResumeResponse::Reject(reason[0])
+        }
+        other => panic!("unexpected resume response frame type {other:#x}"),
+    }
+}
 
 /// One client-side attach identity: a fresh `SessionId`, the INITIAL
 /// generation, and a fresh `AttemptId` — everything the ATTACH v2 handshake
@@ -537,25 +598,20 @@ async fn resume_after_connection_loss_replays_and_continues() {
     let resume_proof = mac.finalize().into_bytes();
 
     let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
-    let mut resume_frame = vec![RESUME];
-    resume_frame.extend_from_slice(&session_id);
-    resume_frame.extend_from_slice(&resume_proof);
-    resume_frame.extend_from_slice(&(payload.len() as u64).to_be_bytes()); // client_sent_offset
-    resume_frame.extend_from_slice(&0u64.to_be_bytes()); // client_delivered_offset（何も受け取れていない）
+    let resume_frame = encode_quicmux_resume_frame(&session_id, &resume_proof, payload.len() as u64, 0);
     send2.write_all(&resume_frame).await.unwrap();
 
-    let mut resume_ack = [0u8; 17];
-    tokio::time::timeout(Duration::from_secs(5), recv2.read_exact(&mut resume_ack))
-        .await
-        .expect("timed out waiting for RESUME_ACK")
-        .expect("connection closed before RESUME_ACK was delivered");
-    assert_eq!(resume_ack[0], RESUME_ACK, "expected RESUME_ACK");
-    let helper_committed_offset = u64::from_be_bytes(resume_ack[1..9].try_into().unwrap());
-    let helper_sent_offset = u64::from_be_bytes(resume_ack[9..17].try_into().unwrap());
+    let QuicmuxResumeResponse::Ack { committed_offset: helper_committed_offset, sent_offset: helper_sent_offset } =
+        read_quicmux_resume_response(&mut recv2).await
+    else {
+        panic!("expected RESUME_ACK");
+    };
     assert_eq!(helper_committed_offset, payload.len() as u64, "C->S は全部 committed 済みのはず");
     assert_eq!(helper_sent_offset, payload.len() as u64, "echo された分だけ S->C も進んでいるはず");
 
-    // 未確認だった echo バイト列がそのまま再送されてくるはず。
+    // 未確認だった echo バイト列は、ACKフレームの一部としてではなく、
+    // 同じstreamの続きとして(生のapplication dataと区別なく)届く
+    // (quicmux::resume::respond_resume_acceptedのdocs参照)。
     let mut replayed = vec![0u8; payload.len()];
     tokio::time::timeout(Duration::from_secs(5), recv2.read_exact(&mut replayed))
         .await
@@ -609,19 +665,13 @@ async fn resume_with_unknown_session_id_is_rejected() {
     let resume_proof = mac.finalize().into_bytes();
 
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let mut resume_frame = vec![RESUME];
-    resume_frame.extend_from_slice(&bogus_session_id);
-    resume_frame.extend_from_slice(&resume_proof);
-    resume_frame.extend_from_slice(&0u64.to_be_bytes());
-    resume_frame.extend_from_slice(&0u64.to_be_bytes());
+    let resume_frame = encode_quicmux_resume_frame(&bogus_session_id, &resume_proof, 0, 0);
     send.write_all(&resume_frame).await.unwrap();
 
-    let mut resp = [0u8; 1];
-    tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut resp))
-        .await
-        .expect("timed out waiting for REJECT_UNKNOWN_SESSION")
-        .expect("connection closed before REJECT_UNKNOWN_SESSION byte was delivered");
-    assert_eq!(resp[0], REJECT_UNKNOWN_SESSION);
+    let QuicmuxResumeResponse::Reject(reason) = read_quicmux_resume_response(&mut recv).await else {
+        panic!("expected RESUME_REJECT");
+    };
+    assert_eq!(reason, QUICMUX_REJECT_UNKNOWN_TOKEN);
 }
 
 /// Phase 8-4: `RESUME` の `client_delivered_offset` が helper の output buffer に
@@ -701,19 +751,14 @@ async fn resume_with_offset_beyond_buffer_is_rejected() {
     let resume_proof = mac.finalize().into_bytes();
 
     let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
-    let mut resume_frame = vec![RESUME];
-    resume_frame.extend_from_slice(&session_id);
-    resume_frame.extend_from_slice(&resume_proof);
-    resume_frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    resume_frame.extend_from_slice(&1_000_000u64.to_be_bytes()); // 存在しない未来の offset
+    // 存在しない未来の offset (1_000_000) を要求する。
+    let resume_frame = encode_quicmux_resume_frame(&session_id, &resume_proof, payload.len() as u64, 1_000_000);
     send2.write_all(&resume_frame).await.unwrap();
 
-    let mut resp = [0u8; 1];
-    tokio::time::timeout(Duration::from_secs(5), recv2.read_exact(&mut resp))
-        .await
-        .expect("timed out waiting for REJECT_OFFSET_GONE")
-        .expect("connection closed before REJECT_OFFSET_GONE byte was delivered");
-    assert_eq!(resp[0], REJECT_OFFSET_GONE);
+    let QuicmuxResumeResponse::Reject(reason) = read_quicmux_resume_response(&mut recv2).await else {
+        panic!("expected RESUME_REJECT");
+    };
+    assert_eq!(reason, QUICMUX_REJECT_OFFSET_GONE);
 }
 
 /// Phase 8-4: 長時間圏外（`--resume-window` を超えて park されたまま）になった
@@ -785,20 +830,14 @@ async fn resume_after_park_expiry_is_rejected_as_unknown_session() {
     let resume_proof = mac.finalize().into_bytes();
 
     let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
-    let mut resume_frame = vec![RESUME];
-    resume_frame.extend_from_slice(&session_id);
-    resume_frame.extend_from_slice(&resume_proof);
-    resume_frame.extend_from_slice(&0u64.to_be_bytes());
-    resume_frame.extend_from_slice(&0u64.to_be_bytes());
+    let resume_frame = encode_quicmux_resume_frame(&session_id, &resume_proof, 0, 0);
     send2.write_all(&resume_frame).await.unwrap();
 
-    let mut resp = [0u8; 1];
-    tokio::time::timeout(Duration::from_secs(5), recv2.read_exact(&mut resp))
-        .await
-        .expect("timed out waiting for REJECT_UNKNOWN_SESSION")
-        .expect("connection closed before REJECT_UNKNOWN_SESSION byte was delivered");
+    let QuicmuxResumeResponse::Reject(reason) = read_quicmux_resume_response(&mut recv2).await else {
+        panic!("expected RESUME_REJECT");
+    };
     assert_eq!(
-        resp[0], REJECT_UNKNOWN_SESSION,
+        reason, QUICMUX_REJECT_UNKNOWN_TOKEN,
         "park 期限切れで sweep された session は unknown 扱いになるはず"
     );
 }

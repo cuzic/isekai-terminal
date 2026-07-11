@@ -20,8 +20,11 @@ isekai-protocol = { path = "../isekai-protocol" }
 isekai-transport = { path = "../isekai-transport", features = ["qmux-relay"] }
 isekai-trust = { path = "../isekai-trust" }
 # `engine` module (formerly the standalone `isekai-helper` crate,
-# `ISEKAI_PIPE_MIGRATION.md` P5): the `serve` engine noq/rustls stack.
-noq = { version = "1.0.1", features = ["rustls", "ring"] }
+# `ISEKAI_PIPE_MIGRATION.md` P5): the `serve` engine's transport is
+# `quicmux`'s noq-backed listener API (Stage A quicmux-server-resume
+# migration) — no direct `noq` dependency any more, matching the point of
+# extracting `quicmux` in the first place (see that crate's docs).
+quicmux = { path = "../quicmux", features = ["noq"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rcgen = "0.13"
 hmac = "0.12"

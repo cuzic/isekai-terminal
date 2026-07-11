@@ -26,13 +26,25 @@
 //!   this backend.
 //! - [`QmuxFactory::wrap_bound_socket`] structurally cannot succeed — `qmux`
 //!   runs over TCP, so there is no bound UDP socket for it to wrap.
+//! - [`QmuxListener`] has no `noq::Endpoint`-like centralized connection
+//!   tracking: every [`QmuxConnection`] it produces keeps itself alive
+//!   independently via its own `qmux::Session` clone (see
+//!   [`QmuxConnection::open_bi`]'s comment), with no shared owning structure
+//!   the listener could enumerate or wait on. [`QmuxListener::close`] only
+//!   stops *accepting new* connections; it does not touch already-accepted
+//!   ones. [`QmuxListener::wait_idle`] is a no-op for the same reason — there
+//!   is nothing for it to wait on; a caller that needs to know when a
+//!   specific accepted connection is done must track that connection's own
+//!   lifetime itself, not go through the listener.
 
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cert::PinnedCertVerifier;
-use crate::config::MuxClientConfig;
+use crate::config::{MuxClientConfig, MuxServerConfig};
 use crate::error::MuxError;
-use crate::types::RemoteSpec;
+use crate::types::{BindSpec, RemoteSpec};
 
 /// Maps a `qmux::Error` onto this crate's backend-agnostic [`MuxError`].
 fn map_qmux_error(e: qmux::Error) -> MuxError {
@@ -134,10 +146,133 @@ impl QmuxEndpoint {
         let transport = qmux::transport::Stream::new(tls_stream, config.version, config.max_record_size);
         let session = qmux::Session::connect(transport, config).await.map_err(|e| MuxError::Handshake(format!("QMux handshake failed: {e}")))?;
 
-        Ok(QmuxConnection { session, exporter_label: self.config.exporter_label.clone(), exporter })
+        Ok(QmuxConnection { session, exporter_label: self.config.exporter_label.clone(), exporter, remote_addr: Some(remote.addr) })
     }
 }
 
+/// A `qmux`-backed [`crate::AnyMuxListener`] variant — a bound TCP listener
+/// that TLS-accepts each inbound connection and establishes a `qmux::Session`
+/// over it. See this module's docs for what `close`/`wait_idle` can and
+/// cannot do here (no centralized connection tracking, unlike `noq`).
+pub struct QmuxListener {
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    exporter_label: Vec<u8>,
+    /// `accept()` checks this before/while waiting on the next TCP
+    /// connection — a `tokio::net::TcpListener` has no `close()`/`shutdown()`
+    /// of its own to call from a `&self` method, so this plus `close_notify`
+    /// (to wake a call already blocked in `accept()`) is this backend's
+    /// stand-in for that.
+    closed: Arc<AtomicBool>,
+    close_notify: Arc<tokio::sync::Notify>,
+}
+
+impl QmuxListener {
+    pub(crate) async fn bind(config: MuxServerConfig, bind: BindSpec) -> Result<Self, MuxError> {
+        let listener = tokio::net::TcpListener::bind(bind.local_addr).await.map_err(|source| MuxError::Bind { addr: bind.local_addr, source })?;
+
+        // Explicit provider (not the bare `rustls::ServerConfig::builder()`,
+        // which relies on a process-wide default having been installed via
+        // `CryptoProvider::install_default()` somewhere else) — matches
+        // `QmuxEndpoint::connect`'s identical choice on the client side, so
+        // this backend never depends on caller/process global state.
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| MuxError::TlsConfig(e.to_string()))?
+            .with_no_client_auth()
+            .with_single_cert(config.cert_chain.clone(), config.private_key.clone_key())
+            .map_err(|e| MuxError::TlsConfig(e.to_string()))?;
+        server_crypto.alpn_protocols = vec![config.alpn.clone()];
+        // See `MuxClientConfig`'s docs: 0-RTT is never used by this crate.
+        server_crypto.max_early_data_size = 0;
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_crypto));
+
+        Ok(Self {
+            listener,
+            acceptor,
+            exporter_label: config.exporter_label,
+            closed: Arc::new(AtomicBool::new(false)),
+            close_notify: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    /// Waits for the next inbound TCP connection. Unlike [`crate::noq_backend::NoqListener::accept`],
+    /// this does not separately expose "candidate received" vs. "handshake
+    /// complete" — a `noq::Incoming` distinguishes those because `noq`'s
+    /// QUIC handshake happens inside the transport itself before the
+    /// `Connection` is usable, whereas here the TLS+QMux handshake is this
+    /// module's own manually-driven code (same shape client-side, see
+    /// [`QmuxEndpoint::connect`]), so [`QmuxIncoming::accept`] is where all
+    /// of it happens, with no intermediate "accepted, not yet
+    /// handshaken" state worth exposing.
+    pub(crate) async fn accept(&self) -> Option<QmuxIncoming> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        tokio::select! {
+            _ = self.close_notify.notified() => None,
+            result = self.listener.accept() => match result {
+                Ok((tcp, peer_addr)) => Some(QmuxIncoming {
+                    tcp,
+                    peer_addr,
+                    acceptor: self.acceptor.clone(),
+                    exporter_label: self.exporter_label.clone(),
+                }),
+                Err(_) => None,
+            },
+        }
+    }
+
+    pub(crate) fn local_addr(&self) -> Result<SocketAddr, MuxError> {
+        self.listener.local_addr().map_err(|e| MuxError::EndpointSetup(e.to_string()))
+    }
+
+    /// Stops accepting new connections. Does **not** close any connection
+    /// already produced by a prior [`QmuxListener::accept`]/[`QmuxIncoming::accept`]
+    /// — see this module's docs.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.close_notify.notify_waiters();
+    }
+
+    /// No-op — see this module's docs for why this backend has nothing to
+    /// wait on here.
+    pub(crate) async fn wait_idle(&self) {}
+}
+
+/// A TCP connection [`QmuxListener::accept`] received, not yet TLS/QMux-
+/// handshaken.
+pub struct QmuxIncoming {
+    tcp: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    acceptor: tokio_rustls::TlsAcceptor,
+    exporter_label: Vec<u8>,
+}
+
+impl QmuxIncoming {
+    pub(crate) async fn accept(self) -> Result<QmuxConnection, MuxError> {
+        let mut tls_stream = self.acceptor.accept(self.tcp).await.map_err(|e| MuxError::Handshake(e.to_string()))?;
+
+        // Captured now, symmetric to the client side — see this module's
+        // docs for why this must happen before `qmux::Session::accept`
+        // takes ownership of `tls_stream`.
+        let mut exporter = [0u8; 32];
+        tls_stream
+            .get_mut()
+            .1
+            .export_keying_material(&mut exporter, &self.exporter_label, None)
+            .map_err(|e| MuxError::ExportKeyingMaterial(e.to_string()))?;
+
+        let config = qmux::Config::new(qmux::Version::QMux01);
+        let transport = qmux::transport::Stream::new(tls_stream, config.version, config.max_record_size);
+        let session = qmux::Session::accept(transport, config).await.map_err(|e| MuxError::Handshake(format!("QMux handshake failed: {e}")))?;
+
+        Ok(QmuxConnection { session, exporter_label: self.exporter_label, exporter, remote_addr: Some(self.peer_addr) })
+    }
+}
+
+#[derive(Clone)]
 pub struct QmuxConnection {
     session: qmux::Session,
     /// The `label` `export_keying_material` was actually captured for — see
@@ -149,6 +284,12 @@ pub struct QmuxConnection {
     /// any more.
     exporter_label: Vec<u8>,
     exporter: [u8; 32],
+    /// The peer's TCP address, known unconditionally at both connect time
+    /// (the caller-supplied [`RemoteSpec::addr`]) and accept time
+    /// (`TcpListener::accept`'s own return value) — always `Some` in
+    /// practice; `Option` only because a future construction path might not
+    /// have one to hand, not because either existing path can fail to.
+    remote_addr: Option<SocketAddr>,
 }
 
 impl QmuxConnection {
@@ -162,6 +303,16 @@ impl QmuxConnection {
         Ok(QmuxByteStream { send, recv, _session: self.session.clone() })
     }
 
+    /// Accepts a new bidirectional stream the peer opened. Symmetric with
+    /// [`QmuxConnection::open_bi`] — `qmux::Session` itself has no client/
+    /// server distinction once the handshake is done, matching
+    /// [`crate::noq_backend::NoqConnection::accept_bi`]'s identical framing.
+    pub(crate) async fn accept_bi(&self) -> Result<QmuxByteStream, MuxError> {
+        use web_transport_trait::Session as _;
+        let (send, recv) = self.session.accept_bi().await.map_err(map_qmux_error)?;
+        Ok(QmuxByteStream { send, recv, _session: self.session.clone() })
+    }
+
     pub(crate) async fn close(&self) {
         use web_transport_trait::Session as _;
         self.session.close(0, "");
@@ -169,6 +320,10 @@ impl QmuxConnection {
 
     pub(crate) async fn export_keying_material(&self, label: &[u8], context: &[u8]) -> Result<[u8; 32], MuxError> {
         keying_material_for(&self.exporter_label, self.exporter, label, context)
+    }
+
+    pub(crate) fn remote_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr
     }
 }
 
@@ -256,9 +411,28 @@ impl QmuxByteStream {
         self.send.finish().map_err(map_qmux_error)
     }
 
+    /// See [`crate::AnyByteStream::wait_for_close`]'s docs. `web_transport_trait::
+    /// SendStream::closed()` blocks until either side closed the stream (our
+    /// `finish()` acknowledged, our `reset()`, or the peer's `RecvStream::
+    /// stop()`) — coarser than `noq`'s `stopped()` (which distinguishes an
+    /// explicit peer stop from a plain finish-ack), but that distinction
+    /// isn't needed here; see the `noq` backend's identical comment.
+    pub(crate) async fn wait_for_close(&mut self) -> Result<(), MuxError> {
+        use web_transport_trait::SendStream as _;
+        self.send.closed().await.map_err(map_qmux_error)
+    }
+
     pub(crate) fn split(self) -> (QmuxByteStreamReadHalf, QmuxByteStreamWriteHalf) {
         let QmuxByteStream { send, recv, _session } = self;
         (QmuxByteStreamReadHalf { recv, _session: _session.clone() }, QmuxByteStreamWriteHalf { send, _session })
+    }
+
+    /// The inverse of [`QmuxByteStream::split`] — recombines a previously
+    /// split pair. Both halves hold their own clone of the same
+    /// `qmux::Session` (see `split`'s own `.clone()`); only one is needed
+    /// once rejoined, so `read`'s clone is simply dropped.
+    pub(crate) fn unsplit(read: QmuxByteStreamReadHalf, write: QmuxByteStreamWriteHalf) -> Self {
+        Self { send: write.send, recv: read.recv, _session: write._session }
     }
 }
 
@@ -293,5 +467,93 @@ impl QmuxByteStreamWriteHalf {
     pub(crate) async fn shutdown(&mut self) -> Result<(), MuxError> {
         use web_transport_trait::SendStream as _;
         self.send.finish().map_err(map_qmux_error)
+    }
+
+    /// See [`QmuxByteStream::wait_for_close`].
+    pub(crate) async fn wait_for_close(&mut self) -> Result<(), MuxError> {
+        use web_transport_trait::SendStream as _;
+        self.send.closed().await.map_err(map_qmux_error)
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+    use crate::types::BindSpec;
+
+    fn test_client_config() -> MuxClientConfig {
+        MuxClientConfig {
+            alpn: b"quicmux-test/1".to_vec(),
+            exporter_label: b"quicmux-test-exporter".to_vec(),
+            max_idle_timeout: std::time::Duration::from_secs(15),
+            keep_alive_interval: std::time::Duration::from_secs(5),
+            max_concurrent_bidi_streams: 2,
+            max_concurrent_uni_streams: 0,
+            multipath: false,
+        }
+    }
+
+    fn test_server_config() -> (MuxServerConfig, String) {
+        let cert = rcgen::generate_simple_self_signed(vec!["quicmux-test.local".to_string()]).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().clone());
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let cert_sha256_hex = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(cert_der.as_ref());
+            hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let config = MuxServerConfig {
+            alpn: test_client_config().alpn,
+            exporter_label: test_client_config().exporter_label,
+            max_idle_timeout: std::time::Duration::from_secs(15),
+            keep_alive_interval: std::time::Duration::from_secs(5),
+            max_concurrent_bidi_streams: 2,
+            max_concurrent_uni_streams: 0,
+            multipath: false,
+            cert_chain: vec![cert_der],
+            private_key: key_der,
+        };
+        (config, cert_sha256_hex)
+    }
+
+    #[tokio::test]
+    async fn listener_bind_accept_bi_write_and_read_roundtrip() {
+        let (server_config, cert_sha256_hex) = test_server_config();
+        let listener = QmuxListener::bind(server_config, BindSpec::any_ipv4()).await.expect("listener bind failed");
+        let server_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Some(incoming) = listener.accept().await else { return };
+            let Ok(conn) = incoming.accept().await else { return };
+            let Ok(mut stream) = conn.accept_bi().await else { return };
+            let mut buf = [0u8; 64];
+            if let Ok(n) = stream.read(&mut buf).await {
+                let _ = stream.write_all(&buf[..n]).await;
+            }
+            let _ = stream.shutdown().await;
+            // See `noq_backend`'s identical comment: `wait_for_close()` is
+            // this crate's real fix for dropping `stream`/`conn`/`listener`
+            // before the peer actually received the echoed data.
+            let _ = stream.wait_for_close().await;
+        });
+
+        let factory = QmuxFactory::new(test_client_config());
+        let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint failed");
+        let conn = endpoint
+            .connect(RemoteSpec { addr: server_addr, server_name: "quicmux-test.local".to_string(), cert_sha256_hex })
+            .await
+            .expect("connect failed");
+        assert_eq!(conn.remote_addr(), Some(server_addr));
+
+        let mut stream = conn.open_bi().await.expect("open_bi failed");
+        stream.write_all(b"hello quicmux qmux listener").await.expect("write failed");
+        stream.shutdown().await.expect("shutdown failed");
+
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.expect("read failed");
+        assert_eq!(&buf[..n], b"hello quicmux qmux listener");
+
+        conn.close().await;
     }
 }

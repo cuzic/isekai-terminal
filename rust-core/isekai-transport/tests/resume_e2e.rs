@@ -35,11 +35,10 @@ use isekai_protocol::attach::{
     FRAME_ATTACH_HELLO,
 };
 use isekai_protocol::hello::{Proof, ALPN, EXPORTER_LABEL};
-use isekai_protocol::resume::{decode_resume, encode_resume_ack, ResumeAckFrame};
 use isekai_protocol::session_id::{SessionId, SESSION_ID_LEN};
 use isekai_transport::{
-    connect_via_relay_resumable, reconnect_and_resume, C2hHelperCommittedOffset, C2hSentOffset,
-    CandidateIdentity, H2cClientDeliveredOffset, H2cSentOffset, RelayTarget, system_quic_factory,
+    connect_via_relay_resumable, reconnect_and_resume, C2hSentOffset, CandidateIdentity, H2cClientDeliveredOffset, RelayTarget,
+    system_quic_factory,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
@@ -52,6 +51,15 @@ const TEST_IDENTITY: CandidateIdentity<'static> =
 const SNI: &str = "isekai-pipe.local";
 const CONTROL_HELLO: u8 = 0x10;
 const CONTROL_ACK: u8 = 0x11;
+// `RESUME` itself moved to `quicmux::resume` (quicmux-server-resume Stage
+// B) — see that module's `FRAME_RESUME`/`FRAME_RESUME_ACK`/
+// `FRAME_RESUME_REJECT`. Duplicated here (not `use quicmux::...`)
+// deliberately, matching this file's existing convention of independently
+// pinning down the real wire bytes rather than depending on the crate under
+// test to get them right.
+const QUICMUX_FRAME_RESUME: u8 = 0x01;
+const QUICMUX_FRAME_RESUME_ACK: u8 = 0x02;
+const QUICMUX_FRAME_RESUME_REJECT: u8 = 0x03;
 
 fn generate_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>, String) {
     // The `qmux-relay` feature links `aws-lc-rs` alongside noq's own
@@ -118,14 +126,15 @@ async fn run_mock_helper(endpoint: noq::Endpoint, session_secret: Vec<u8>, sessi
     }
 }
 
-/// Writes a one-byte rejection and waits for the peer to actually receive it
-/// before returning (`isekai-helper/src/main.rs::reject`'s exact rationale:
-/// dropping `send`/`conn` immediately after `write_all` can close the QUIC
-/// connection before the single byte is actually delivered, so the client
-/// never sees the rejection and instead just gets a naked stream/connection
-/// error).
-async fn reject(send: &mut noq::SendStream, code: u8) {
-    if send.write_all(&[code]).await.is_ok() {
+/// Writes a `quicmux::resume` two-byte `[frame_type, reason]` rejection and
+/// waits for the peer to actually receive it before returning
+/// (`isekai-helper/src/main.rs::reject`'s exact rationale, matching
+/// `quicmux::resume::respond_resume_rejected`: dropping `send`/`conn`
+/// immediately after `write_all` can close the QUIC connection before the
+/// bytes are actually delivered, so the client never sees the rejection and
+/// instead just gets a naked stream/connection error).
+async fn reject(send: &mut noq::SendStream, frame_type: u8, reason: u8) {
+    if send.write_all(&[frame_type, reason]).await.is_ok() {
         let _ = send.finish();
         let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
     }
@@ -241,33 +250,48 @@ async fn handle_connection(conn: noq::Connection, session_secret: Vec<u8>, sessi
                 }
             }
         }
-        isekai_protocol::resume::FRAME_RESUME => {
-            let mut rest = vec![0u8; isekai_protocol::resume::RESUME_FRAME_LEN - 1];
-            recv.read_exact(&mut rest).await.unwrap();
-            let mut frame_bytes = vec![isekai_protocol::resume::FRAME_RESUME];
-            frame_bytes.extend_from_slice(&rest);
-            let resume_frame = decode_resume(&frame_bytes).unwrap();
+        QUICMUX_FRAME_RESUME => {
+            // quicmux::resume's RESUME body (quicmux-server-resume Stage B):
+            // token_len(u16)+token + auth_blob_len(u16)+auth_blob +
+            // client_sent_offset(u64) + client_delivered_offset(u64) — see
+            // `isekai-pipe/src/engine/mod.rs::handle_resume_stream`'s
+            // identical decode for the real interop target.
+            let mut token_len = [0u8; 2];
+            recv.read_exact(&mut token_len).await.unwrap();
+            let mut token = vec![0u8; u16::from_be_bytes(token_len) as usize];
+            recv.read_exact(&mut token).await.unwrap();
+            let mut auth_len = [0u8; 2];
+            recv.read_exact(&mut auth_len).await.unwrap();
+            let mut auth_blob = vec![0u8; u16::from_be_bytes(auth_len) as usize];
+            recv.read_exact(&mut auth_blob).await.unwrap();
+            let mut sent_offset_bytes = [0u8; 8];
+            recv.read_exact(&mut sent_offset_bytes).await.unwrap();
+            let mut delivered_offset_bytes = [0u8; 8];
+            recv.read_exact(&mut delivered_offset_bytes).await.unwrap();
+            let client_delivered_offset = u64::from_be_bytes(delivered_offset_bytes);
 
-            let expected =
-                compute_expected_proof(&conn, &session_secret, resume_frame.session_id.as_bytes());
-            if !expected.ct_eq(&Proof::new(*resume_frame.resume_proof.as_bytes())) {
-                reject(&mut send, 0xFFu8).await;
+            let expected = compute_expected_proof(&conn, &session_secret, &token);
+            if !expected.ct_eq(&Proof::new(auth_blob.as_slice().try_into().unwrap())) {
+                reject(&mut send, QUICMUX_FRAME_RESUME_REJECT, 0 /* Auth */).await;
                 return;
             }
 
-            let id = *resume_frame.session_id.as_bytes();
+            let id: [u8; SESSION_ID_LEN] = token.as_slice().try_into().unwrap();
             let Some((committed, output)) = sessions.lock().unwrap().get(&id).map(|s| (s.committed_offset, s.output.clone())) else {
-                reject(&mut send, 0xF9u8).await; // REJECT_UNKNOWN_SESSION
+                reject(&mut send, QUICMUX_FRAME_RESUME_REJECT, 1 /* UnknownToken */).await;
                 return;
             };
 
-            let ack = ResumeAckFrame {
-                helper_committed_offset: C2hHelperCommittedOffset::new(committed),
-                helper_sent_offset: H2cSentOffset::new(output.len() as u64),
-            };
-            send.write_all(&encode_resume_ack(&ack)).await.unwrap();
+            let mut ack = Vec::with_capacity(1 + 8 + 8);
+            ack.push(QUICMUX_FRAME_RESUME_ACK);
+            ack.extend_from_slice(&committed.to_be_bytes());
+            ack.extend_from_slice(&(output.len() as u64).to_be_bytes());
+            send.write_all(&ack).await.unwrap();
 
-            let replay_from = resume_frame.client_delivered_offset.get() as usize;
+            // Replay bytes follow as plain, unframed stream continuation —
+            // not part of the ACK frame itself (quicmux::resume's
+            // `respond_resume_accepted` docs).
+            let replay_from = client_delivered_offset as usize;
             if replay_from < output.len() {
                 send.write_all(&output[replay_from..]).await.unwrap();
             }

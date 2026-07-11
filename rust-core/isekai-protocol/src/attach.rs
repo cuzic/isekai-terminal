@@ -26,7 +26,7 @@
 //! safely fences the old one) share one mechanism.
 //!
 //! Proof computation itself (HMAC over the live QUIC connection's exporter,
-//! mirroring `hello::Proof`/`resume::ResumeProof`) stays out of this I/O-free
+//! mirroring `hello::Proof`) stays out of this I/O-free
 //! crate; [`attach_hello_proof_transcript`]/[`cancel_attach_proof_transcript`]
 //! only build the pure "extra" bytes that `isekai-transport::proof::compute_proof`
 //! feeds into the HMAC alongside the exporter, so that altering the frame
@@ -205,7 +205,7 @@ fn decode_attach_token(buf: &[u8]) -> Result<AttachToken, ProtocolError> {
 /// or `.. || cancel_attach_proof_transcript(..)` depending on frame kind —
 /// computed by `isekai-transport` (needs the live QUIC connection's
 /// exporter), never by this crate. Opaque and `Debug`-hidden like
-/// `hello::Proof`/`resume::ResumeProof`.
+/// `hello::Proof`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AttachProof([u8; ATTACH_PROOF_LEN]);
 
