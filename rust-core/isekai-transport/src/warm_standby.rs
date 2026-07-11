@@ -54,6 +54,7 @@
 //!   session fail closed (`UnknownToken`) even if this guard somehow didn't
 //!   exist, since a session can only be "claimed" once server-side.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -63,6 +64,8 @@ use tokio::sync::Mutex;
 use isekai_protocol::offset::{C2hHelperCommittedOffset, C2hSentOffset, H2cClientDeliveredOffset, H2cSentOffset};
 use isekai_protocol::session_id::SessionId;
 use quicmux::{AnyByteStream, AnyMuxConnection, AnyMuxFactory, MuxError, RemoteSpec};
+
+use crate::physical_interface::InterfaceIndex;
 
 use crate::error::TransportError;
 use crate::proof::compute_proof;
@@ -120,6 +123,10 @@ pub struct WarmStandby {
     factory: AnyMuxFactory,
     target: RelayTarget,
     session_id: SessionId,
+    /// When set, every standby connection is bound to this physical
+    /// interface specifically instead of OS-default routing — see
+    /// [`WarmStandby::new_bound_to_interface`]'s docs.
+    interface: Option<InterfaceIndex>,
     standby: Mutex<Option<AnyMuxConnection>>,
     /// `promote`'s single-flight guard — see this module's docs on why this
     /// is a client-side efficiency/clarity measure, not the sole
@@ -130,9 +137,39 @@ pub struct WarmStandby {
 impl WarmStandby {
     /// Builds a `WarmStandby` with no standby connection yet — call
     /// [`WarmStandby::ensure_warm`] at least once (and then periodically)
-    /// before relying on [`WarmStandby::promote`] to succeed.
+    /// before relying on [`WarmStandby::promote`] to succeed. Every standby
+    /// connection is dialed with OS-default routing (whichever interface the
+    /// OS picks) — for a warm-standby path that must specifically prove a
+    /// *particular* physical interface (e.g. a USB/Bluetooth tethering
+    /// adapter) is viable, use [`WarmStandby::new_bound_to_interface`]
+    /// instead.
     pub fn new(factory: AnyMuxFactory, target: RelayTarget, session_id: SessionId) -> Self {
-        Self { factory, target, session_id, standby: Mutex::new(None), promoting: AtomicBool::new(false) }
+        Self { factory, target, session_id, interface: None, standby: Mutex::new(None), promoting: AtomicBool::new(false) }
+    }
+
+    /// Same as [`WarmStandby::new`], but every standby connection
+    /// [`WarmStandby::ensure_warm`] establishes is bound to `interface`
+    /// specifically (via [`crate::physical_interface::bind_physical_interface`])
+    /// instead of OS-default routing — probing "any" interface doesn't prove
+    /// the specific tethering path is actually viable, which is the whole
+    /// point of keeping it warm.
+    ///
+    /// `noq`-only: `qmux` has no bound-UDP-socket concept to restrict this
+    /// way — [`AnyMuxFactory::wrap_bound_socket`] structurally cannot
+    /// succeed for it (see that method's docs). Using this constructor with
+    /// a `qmux`-backed `factory` means every [`WarmStandby::ensure_warm`]
+    /// call fails with [`quicmux::MuxError::Unsupported`] — this crate's
+    /// existing "fail loud, don't silently ignore the request" stance on
+    /// backend/capability mismatches (matches
+    /// [`quicmux::AnyMuxEndpoint::rebinder`] returning `None` rather than a
+    /// no-op for the same reason).
+    pub fn new_bound_to_interface(
+        factory: AnyMuxFactory,
+        target: RelayTarget,
+        session_id: SessionId,
+        interface: InterfaceIndex,
+    ) -> Self {
+        Self { factory, target, session_id, interface: Some(interface), standby: Mutex::new(None), promoting: AtomicBool::new(false) }
     }
 
     /// Whether a standby connection is currently held (does **not** re-probe
@@ -163,18 +200,39 @@ impl WarmStandby {
                 }
             }
         }
-        let endpoint = self.factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await.map_err(TransportError::Mux)?;
-        let conn = endpoint
+        let conn = self.dial().await?;
+        info!("warm_standby: standby connection established to {}", self.target.helper_addr);
+        *guard = Some(conn);
+        Ok(())
+    }
+
+    /// Binds (either OS-default or, if [`WarmStandby::new_bound_to_interface`]
+    /// was used, restricted to `self.interface`) a fresh local socket and
+    /// dials `self.target`. Split out of [`WarmStandby::ensure_warm`] purely
+    /// so that method's "probe, and only dial if the probe failed" flow
+    /// isn't tangled up with the two different ways of obtaining an
+    /// endpoint.
+    async fn dial(&self) -> Result<AnyMuxConnection, TransportError> {
+        let endpoint = match self.interface {
+            None => self.factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await.map_err(TransportError::Mux)?,
+            Some(interface) => {
+                let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                let std_socket = crate::physical_interface::bind_physical_interface(interface, local_addr)
+                    .map_err(|source| TransportError::Mux(MuxError::Bind { addr: local_addr, source }))?;
+                std_socket.set_nonblocking(true).map_err(|e| TransportError::Mux(MuxError::SocketSetup(e.to_string())))?;
+                let tokio_socket =
+                    tokio::net::UdpSocket::from_std(std_socket).map_err(|e| TransportError::Mux(MuxError::SocketSetup(e.to_string())))?;
+                self.factory.wrap_bound_socket(tokio_socket).await.map_err(TransportError::Mux)?
+            }
+        };
+        endpoint
             .connect(RemoteSpec {
                 addr: self.target.helper_addr,
                 server_name: self.target.server_name.clone(),
                 cert_sha256_hex: self.target.cert_sha256_hex.clone(),
             })
             .await
-            .map_err(TransportError::Mux)?;
-        info!("warm_standby: standby connection established to {}", self.target.helper_addr);
-        *guard = Some(conn);
-        Ok(())
+            .map_err(TransportError::Mux)
     }
 
     /// Promotes the standby connection: issues a `quicmux::resume` RESUME
@@ -357,6 +415,39 @@ mod tests {
 
         // The standby was consumed by promotion — nothing left to promote again.
         assert!(!standby.is_warm().await);
+    }
+
+    #[tokio::test]
+    async fn ensure_warm_binds_to_the_requested_interface() {
+        let loopback = quicsock::discovery::list_interfaces()
+            .into_iter()
+            .find(|(_, iface)| iface.is_loopback())
+            .map(|(index, _)| index)
+            .expect("this machine should have a loopback interface");
+
+        let (addr, cert_sha256_hex, session_secret, session_id) = spawn_resume_capable_listener().await;
+        let target = RelayTarget { helper_addr: addr, server_name: "isekai-pipe.local".to_string(), cert_sha256_hex, session_secret: session_secret.to_vec() };
+
+        let standby = WarmStandby::new_bound_to_interface(system_quic_factory(), target, session_id, loopback);
+        standby.ensure_warm().await.expect("ensure_warm should succeed when bound to the loopback interface");
+        assert!(standby.is_warm().await);
+
+        let promoted = standby.promote(C2hSentOffset::new(0), H2cClientDeliveredOffset::new(0)).await.expect("promote should succeed");
+        assert_eq!(promoted.helper_committed_offset.get(), 100);
+    }
+
+    #[tokio::test]
+    async fn ensure_warm_fails_on_a_bogus_interface_rather_than_silently_falling_back() {
+        let target = RelayTarget {
+            helper_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            server_name: "isekai-pipe.local".to_string(),
+            cert_sha256_hex: "0".repeat(64),
+            session_secret: vec![0u8; 32],
+        };
+        let standby =
+            WarmStandby::new_bound_to_interface(system_quic_factory(), target, SessionId::from_bytes([0u8; 16]), InterfaceIndex(u32::MAX));
+        let err = standby.ensure_warm().await.unwrap_err();
+        assert!(matches!(err, TransportError::Mux(MuxError::Bind { .. })), "expected a Bind error, got {err:?}");
     }
 
     #[tokio::test]
