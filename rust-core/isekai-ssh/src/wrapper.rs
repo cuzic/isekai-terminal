@@ -122,6 +122,19 @@ struct IsekaiConfig {
     relay_delay_ms: u64,
     install_mode: InstallMode,
     bootstrap_relay: Option<BootstrapRelayTarget>,
+    /// `#@isekai remote-log-level` (`isekai-helper --log-level`). Defaults
+    /// to isekai-helper's own built-in default (`info`) rather than
+    /// something more verbose, so debugging a stuck connection is an
+    /// explicit opt-in per host, not a standing cost on every deployment.
+    remote_log_level: String,
+    /// `#@isekai remote-bind-port-range` (`isekai-helper --bind-port-range`).
+    /// `None` leaves the deployed helper on its own default (an
+    /// OS-assigned ephemeral UDP port). Lets an operator narrow which
+    /// inbound UDP range a host's firewall needs to allow. Named with an
+    /// explicit `remote_`/`remote-` prefix, distinct from any future
+    /// *local* port-range setting for `isekai-pipe connect`'s own outbound
+    /// bind on this machine.
+    remote_bind_port_range: Option<(u16, u16)>,
     /// `#@isekai ctl-socket yes` (`ISEKAI_PIPE_DESIGN.md` §8 Epic M):
     /// opt-in, default off. Requests a per-invocation `-R` UNIX domain
     /// socket forward carrying the title/clipboard control-plane, so it
@@ -142,6 +155,20 @@ struct BootstrapCandidate {
     target: String,
     via: Vec<String>,
     priority: u32,
+    /// The original, un-resolved `ssh(1)` destination token (e.g. `vpsmart`,
+    /// not the `ssh -G`-resolved `HostName` in `target`) for the *default*
+    /// candidate only — `None` for candidates from an explicit `#@isekai
+    /// bootstrap-candidate target=...` directive, which are literal
+    /// addresses with no alias to speak of. `bootstrap_and_register` uses
+    /// this, when present, as the destination it actually hands to the
+    /// `ssh(1)` subprocess that deploys `isekai-pipe`, so that `Host
+    /// <alias>` blocks in the user's own `~/.ssh/config` (`IdentityFile`,
+    /// `ProxyCommand`, etc.) still match — matching them against the
+    /// resolved `HostName` instead (as this used to do) silently drops
+    /// every such directive, since `ssh_config(5)` `Host` patterns match
+    /// against the literal destination argument, not the resolved
+    /// `HostName`.
+    alias: Option<String>,
 }
 
 /// `#@isekai bootstrap-relay addr=<SocketAddr> sni=<name>` (`ISEKAI_PIPE_DESIGN.md`
@@ -580,7 +607,22 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
     let port: u16 = port
         .parse()
         .with_context(|| format!("bootstrap candidate target {:?} has an invalid port", candidate.target))?;
-    let target = HostSpec::new(host).with_port(port);
+    // Prefer the original alias (`candidate.alias`) over the `ssh -G`-resolved
+    // `host` as the destination handed to the `ssh(1)` subprocess: passing
+    // the resolved `HostName` instead would no longer match the user's own
+    // `Host <alias>` block in `~/.ssh/config`, silently dropping
+    // `IdentityFile`/`ProxyCommand`/etc. (see `BootstrapCandidate::alias`'s
+    // docs). `user` is threaded through the same way, since it's otherwise
+    // resolved via `ssh -G` and then never consulted again.
+    let target = match &candidate.alias {
+        Some(alias) => HostSpec::new(alias.clone()),
+        None => HostSpec::new(host),
+    }
+    .with_port(port);
+    let target = match &resolution.openssh.user {
+        Some(user) => target.with_user(user.clone()),
+        None => target,
+    };
 
     let via: Vec<JumpSpec> = candidate
         .via
@@ -657,9 +699,14 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
                 relay_jwt,
                 relay_transport: relay_target.relay_transport,
                 idle_lifetime_secs: DEFAULT_IDLE_LIFETIME_SECS,
+                remote_log_level: resolution.isekai.remote_log_level.clone(),
             })
         }
-        None => LaunchSpec::Direct { idle_lifetime_secs: DEFAULT_IDLE_LIFETIME_SECS },
+        None => LaunchSpec::Direct {
+            idle_lifetime_secs: DEFAULT_IDLE_LIFETIME_SECS,
+            remote_log_level: resolution.isekai.remote_log_level.clone(),
+            remote_bind_port_range: resolution.isekai.remote_bind_port_range,
+        },
     };
 
     eprintln!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
@@ -969,6 +1016,8 @@ fn resolve_isekai_config(
         install_mode: None,
         bootstrap_relay: None,
         ctl_socket_enabled: None,
+        remote_log_level: None,
+        remote_bind_port_range: None,
     };
     for directive in directives {
         apply_isekai_directive(&mut builder, directive)?;
@@ -982,6 +1031,7 @@ fn resolve_isekai_config(
                 .map(parse_jump_chain)
                 .unwrap_or_default(),
             priority: 100,
+            alias: Some(plan.destination.clone()),
         });
     }
     if builder.services.is_empty() {
@@ -1025,6 +1075,8 @@ fn resolve_isekai_config(
         install_mode: builder.install_mode.unwrap_or(InstallMode::User),
         bootstrap_relay: builder.bootstrap_relay,
         ctl_socket_enabled: builder.ctl_socket_enabled.unwrap_or(false),
+        remote_log_level: builder.remote_log_level.unwrap_or_else(|| "info".to_string()),
+        remote_bind_port_range: builder.remote_bind_port_range,
     })
 }
 
@@ -1046,6 +1098,8 @@ struct IsekaiConfigBuilder {
     relay_delay_ms: Option<u64>,
     install_mode: Option<InstallMode>,
     ctl_socket_enabled: Option<bool>,
+    remote_log_level: Option<String>,
+    remote_bind_port_range: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1146,6 +1200,23 @@ fn apply_isekai_directive(
             parse_yes_no(one_arg(&directive)?)?,
             "ctl-socket",
         ),
+        "remote-log-level" => set_once(
+            &mut builder.remote_log_level,
+            match one_arg(&directive)? {
+                level @ ("error" | "warn" | "info" | "debug" | "trace") => level.to_string(),
+                other => {
+                    return Err(anyhow!(
+                        "isekai-ssh: invalid #@isekai remote-log-level {other:?} (expected one of error|warn|info|debug|trace)"
+                    ))
+                }
+            },
+            "remote-log-level",
+        ),
+        "remote-bind-port-range" => set_once(
+            &mut builder.remote_bind_port_range,
+            parse_bind_port_range(one_arg(&directive)?)?,
+            "remote-bind-port-range",
+        ),
         other => Err(anyhow!("isekai-ssh: unknown #@isekai directive {other:?}")),
     }
 }
@@ -1203,6 +1274,30 @@ fn parse_duration_ms(value: &str, field: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("isekai-ssh: #@isekai {field} duration is too large"))
 }
 
+/// Parses `#@isekai remote-bind-port-range <START>-<END>` into an inclusive
+/// `(start, end)` pair, passed straight through to `isekai-helper
+/// --bind-port-range` (`engine::parse_bind_port_range` in `isekai-pipe`
+/// applies the identical `start <= end` validation server-side; this
+/// duplicate client-side check exists only to fail closed at config
+/// resolution time instead of after an SSH round-trip).
+fn parse_bind_port_range(value: &str) -> Result<(u16, u16)> {
+    let (start, end) = value.split_once('-').ok_or_else(|| {
+        anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range {value:?} (expected <START>-<END>)")
+    })?;
+    let start: u16 = start
+        .parse()
+        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range start {start:?}"))?;
+    let end: u16 = end
+        .parse()
+        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range end {end:?}"))?;
+    if start > end {
+        return Err(anyhow!(
+            "isekai-ssh: invalid #@isekai remote-bind-port-range {value:?}: start must be <= end"
+        ));
+    }
+    Ok((start, end))
+}
+
 fn parse_bootstrap_candidate(args: &[String]) -> Result<BootstrapCandidate> {
     let mut target = None;
     let mut via = Vec::new();
@@ -1233,6 +1328,7 @@ fn parse_bootstrap_candidate(args: &[String]) -> Result<BootstrapCandidate> {
             .ok_or_else(|| anyhow!("isekai-ssh: bootstrap-candidate requires target=..."))?,
         via,
         priority,
+        alias: None,
     })
 }
 
@@ -1619,7 +1715,7 @@ mod tests {
                 // a real subprocess spawn (`plan.isekai.helper_binary` is
                 // `None`, so `resolve_helper_binary` no longer short-circuits
                 // before *some* I/O — see `helper_download::resolve_helper_binary`).
-                bootstrap_candidates: vec![BootstrapCandidate { target: "127.0.0.1:1".to_string(), via: Vec::new(), priority: 0 }],
+                bootstrap_candidates: vec![BootstrapCandidate { target: "127.0.0.1:1".to_string(), via: Vec::new(), priority: 0, alias: None }],
                 link_endpoints: Vec::new(),
                 rendezvous: Vec::new(),
                 stun_servers: Vec::new(),
@@ -1630,6 +1726,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
             },
         };
 
@@ -1671,7 +1769,7 @@ mod tests {
                 profile: "production".to_string(),
                 remote_path: None,
                 services: vec![ServiceSpec::ssh_target("127.0.0.1:22").unwrap()],
-                bootstrap_candidates: vec![BootstrapCandidate { target: "production:22".to_string(), via, priority: 0 }],
+                bootstrap_candidates: vec![BootstrapCandidate { target: "production:22".to_string(), via, priority: 0, alias: None }],
                 link_endpoints: Vec::new(),
                 rendezvous: Vec::new(),
                 stun_servers: Vec::new(),
@@ -1682,6 +1780,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
             },
         };
 
@@ -1835,6 +1935,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
             },
         };
         let intent = build_connection_intent(&resolution).unwrap();
@@ -1890,6 +1992,8 @@ mod tests {
         // | `candidate-race-delay` | (a) `intent.candidate_race_delay_ms`                                              |
         // | `relay-delay`          | (a) `intent.relay_delay_ms`                                                       |
         // | `install-mode`         | `resolve_isekai_config`'s fail-closed check for `system` (see `install_mode_system_is_rejected_at_config_resolution`); `user` needs no plumbing (already the only implemented behavior) |
+        // | `remote-log-level`     | `bootstrap_and_register` (bootstrap-time only; `isekai-helper --log-level`, no `ConnectionIntent` field exists for it) |
+        // | `remote-bind-port-range` | `bootstrap_and_register` (bootstrap-time only; `isekai-helper --bind-port-range`, no `ConnectionIntent` field exists for it) |
         //
         // If a new directive is ever added to `apply_isekai_directive`
         // without a corresponding row above (and without extending whichever
@@ -2056,6 +2160,8 @@ mod tests {
                 install_mode: InstallMode::User,
                 bootstrap_relay: None,
                 ctl_socket_enabled: false,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
             },
         };
 
@@ -2150,6 +2256,7 @@ Host *
                 target: "10.20.0.15:22".to_string(),
                 via: s(&["bastion", "edge"]),
                 priority: 120,
+                alias: None,
             }]
         );
         assert_eq!(resolved.link_endpoints, vec!["https://link.example.com"]);
@@ -2266,6 +2373,7 @@ Host *
                 target: "10.20.0.15:2200".to_string(),
                 via: s(&["bastion"]),
                 priority: 100,
+                alias: Some("production".to_string()),
             }]
         );
         assert_eq!(resolved.link_endpoints, Vec::<String>::new());

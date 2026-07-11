@@ -141,11 +141,12 @@ impl BootstrapFailure {
 ///   routed around, matching the "don't execute what you can't validate"
 ///   contract those two error variants exist to enforce.
 ///
-/// Returns `None` for `InvalidRelayParam`/`InvalidRemotePath`: those are
-/// local argument-validation failures caught before ever contacting the
-/// remote host, i.e. a plan/config problem rather than a bootstrap *attempt*
-/// failure — the thing this classification exists to describe (honest gap,
-/// not silently mapped to the nearest variant).
+/// Returns `None` for `InvalidRelayParam`/`InvalidRemotePath`/
+/// `InvalidRemoteLogLevel`: those are local argument-validation failures
+/// caught before ever contacting the remote host, i.e. a plan/config problem
+/// rather than a bootstrap *attempt* failure — the thing this classification
+/// exists to describe (honest gap, not silently mapped to the nearest
+/// variant).
 pub fn classify_bootstrap_error(err: &isekai_bootstrap::BootstrapError) -> Option<BootstrapFailure> {
     use isekai_bootstrap::BootstrapError as E;
     match err {
@@ -162,7 +163,7 @@ pub fn classify_bootstrap_error(err: &isekai_bootstrap::BootstrapError) -> Optio
         // there is no upload step this plan can perform, matching
         // `RemoteBinaryMissing`'s own doc comment.
         E::UnsupportedArch(_) => Some(BootstrapFailure::RemoteBinaryMissing),
-        E::InvalidRelayParam(_) | E::InvalidRemotePath(_) => None,
+        E::InvalidRelayParam(_) | E::InvalidRemotePath(_) | E::InvalidRemoteLogLevel(_) => None,
     }
 }
 

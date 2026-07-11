@@ -93,6 +93,13 @@ struct Args {
     target: SocketAddr,
     service_name: String,
     bind: SocketAddr,
+    /// `--bind-port-range <START>-<END>`: narrows which UDP port `bind`
+    /// (when its own port is `0`, i.e. "OS-assigned") is chosen from, so an
+    /// operator can open a small, predictable range in a host firewall
+    /// instead of the whole ephemeral port range
+    /// (`/proc/sys/net/ipv4/ip_local_port_range` on Linux, which a fresh
+    /// `--bind 0.0.0.0:0` draws from by default).
+    bind_port_range: Option<(u16, u16)>,
     idle_timeout: u64,
     resume_window: u64,
     max_idle_lifetime: u64,
@@ -148,6 +155,48 @@ fn next_val(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
         .ok_or_else(|| anyhow!("{flag} requires a value"))
 }
 
+/// Parses `--bind-port-range <START>-<END>` into an inclusive `(start,
+/// end)` pair.
+fn parse_bind_port_range(value: &str) -> Result<(u16, u16)> {
+    let (start, end) = value
+        .split_once('-')
+        .ok_or_else(|| anyhow!("invalid --bind-port-range value {value:?} (expected <START>-<END>)"))?;
+    let start: u16 = start
+        .parse()
+        .map_err(|_| anyhow!("invalid --bind-port-range start {start:?}"))?;
+    let end: u16 = end.parse().map_err(|_| anyhow!("invalid --bind-port-range end {end:?}"))?;
+    if start > end {
+        return Err(anyhow!("invalid --bind-port-range {value:?}: start must be <= end"));
+    }
+    Ok((start, end))
+}
+
+/// Binds a UDP socket at `bind.ip()`, either at `bind`'s own port (the
+/// common case) or, when `port_range` is given, at some free port within
+/// that inclusive range — tried in a random order starting from a random
+/// offset (so many `isekai-helper` instances started in the same instant
+/// don't all race for the same low end of the range) rather than always the
+/// first free port found, up to one attempt per port in the range.
+fn bind_udp_socket(bind: SocketAddr, port_range: Option<(u16, u16)>) -> std::io::Result<std::net::UdpSocket> {
+    let Some((start, end)) = port_range else {
+        return std::net::UdpSocket::bind(bind);
+    };
+    use rand::Rng as _;
+    let span = u32::from(end) - u32::from(start) + 1;
+    let offset = rand::rngs::OsRng.gen_range(0..span);
+    let mut last_err = None;
+    for i in 0..span {
+        let port = start + ((offset + i) % span) as u16;
+        match std::net::UdpSocket::bind(SocketAddr::new(bind.ip(), port)) {
+            Ok(socket) => return Ok(socket),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("--bind-port-range {start}-{end} is empty"))
+    }))
+}
+
 fn print_help() {
     println!("isekai-pipe serve - authenticated QUIC-to-TCP relay (see ISEKAI_PIPE_DESIGN.md)");
     println!();
@@ -157,6 +206,8 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    --target <ADDR:PORT>          relay destination (default: 127.0.0.1:22)");
     println!("    --bind <ADDR:PORT>             QUIC bind address (default: 0.0.0.0:0)");
+    println!("    --bind-port-range <START>-<END> pick --bind's port from this range instead of");
+    println!("                                   an OS-assigned one (requires --bind's port to be 0)");
     println!("    --idle-timeout <SECS>          QUIC transport idle timeout (default: 15)");
     println!("    --resume-window <SECS>         how long a parked (disconnected) session stays resumable (default: 120)");
     println!("    --resume-buffer-size <BYTES>   S->C replay buffer size per session (default: {DEFAULT_RESUME_BUFFER_SIZE})");
@@ -215,6 +266,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut target: SocketAddr = "127.0.0.1:22".parse().unwrap();
     let mut service_name = "ssh".to_string();
     let mut bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let mut bind_port_range: Option<(u16, u16)> = None;
     let mut idle_timeout = 15u64;
     // 実機検証（Phase 8-4b）で、reattach が5回とも失敗する最悪ケースは
     // 「各試行の QUIC handshake タイムアウト（`--idle-timeout` と同じ 15秒）」×5回 +
@@ -248,6 +300,9 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
                 bind = next_val(&mut iter, "--bind")?
                     .parse()
                     .context("invalid --bind value")?;
+            }
+            "--bind-port-range" => {
+                bind_port_range = Some(parse_bind_port_range(&next_val(&mut iter, "--bind-port-range")?)?);
             }
             "--stun-server" => {
                 stun_server = Some(
@@ -357,10 +412,16 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     if service_name.is_empty() {
         return Err(anyhow!("--service-name must not be empty"));
     }
+    if bind_port_range.is_some() && bind.port() != 0 {
+        return Err(anyhow!(
+            "--bind-port-range cannot be combined with an explicit non-zero port in --bind"
+        ));
+    }
     Ok(Args {
         target,
         service_name,
         bind,
+        bind_port_range,
         idle_timeout,
         resume_window,
         resume_buffer_size,
@@ -555,7 +616,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         // （bind_faulty_udp_socket的なラップをする前の生ソケットとして扱う唯一の機会 ——
         // 一度 noq::Endpoint に渡すと、以後の recv は全て noq 自身の poll_recv が
         // 消費してしまい、こちらから直接 recv_from で読むと競合する）。
-        let std_socket = std::net::UdpSocket::bind(args.bind)?;
+        let std_socket = bind_udp_socket(args.bind, args.bind_port_range)?;
         std_socket.set_nonblocking(true)?;
         let raw_socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket)?);
 
@@ -1619,5 +1680,86 @@ mod relay_transport_tests {
         let args: Vec<String> = vec!["--relay-transport", "qmux"].into_iter().map(String::from).collect();
         let err = parse_args_from(args);
         assert!(err.is_err(), "--relay-transport without --relay should be rejected");
+    }
+}
+
+#[cfg(test)]
+mod bind_port_range_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_valid_range() {
+        assert_eq!(parse_bind_port_range("40000-40100").unwrap(), (40000, 40100));
+    }
+
+    #[test]
+    fn accepts_a_single_port_range() {
+        assert_eq!(parse_bind_port_range("40000-40000").unwrap(), (40000, 40000));
+    }
+
+    #[test]
+    fn rejects_start_greater_than_end() {
+        assert!(parse_bind_port_range("40100-40000").is_err());
+    }
+
+    #[test]
+    fn rejects_missing_separator() {
+        assert!(parse_bind_port_range("40000").is_err());
+    }
+
+    #[test]
+    fn rejects_non_numeric_bounds() {
+        assert!(parse_bind_port_range("abc-def").is_err());
+    }
+
+    #[test]
+    fn cli_flag_sets_bind_port_range() {
+        let args = parse_args_from(
+            ["--bind", "0.0.0.0:0", "--bind-port-range", "40000-40010"].into_iter().map(String::from),
+        )
+        .unwrap();
+        assert_eq!(args.bind_port_range, Some((40000, 40010)));
+    }
+
+    #[test]
+    fn cli_flag_rejects_an_explicit_nonzero_bind_port() {
+        let err = parse_args_from(
+            ["--bind", "0.0.0.0:2222", "--bind-port-range", "40000-40010"].into_iter().map(String::from),
+        );
+        assert!(err.is_err(), "--bind-port-range with a pinned --bind port should be rejected");
+    }
+
+    #[test]
+    fn bind_udp_socket_without_a_range_uses_binds_own_port() {
+        let socket = bind_udp_socket("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        assert_ne!(socket.local_addr().unwrap().port(), 0);
+    }
+
+    #[test]
+    fn bind_udp_socket_with_a_range_picks_a_port_inside_it() {
+        let socket = bind_udp_socket("127.0.0.1:0".parse().unwrap(), Some((40000, 40100))).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        assert!((40000..=40100).contains(&port), "port {port} outside requested range");
+    }
+
+    #[test]
+    fn bind_udp_socket_with_a_single_port_range_binds_exactly_that_port() {
+        // Bind once to grab a free ephemeral port, release it, then ask
+        // `bind_udp_socket` for that exact single-port range — proof the
+        // range is actually honored, not ignored (a bug that always fell
+        // through to an OS-assigned port would still pass a looser test).
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let free_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let socket = bind_udp_socket("127.0.0.1:0".parse().unwrap(), Some((free_port, free_port))).unwrap();
+        assert_eq!(socket.local_addr().unwrap().port(), free_port);
+    }
+
+    #[test]
+    fn bind_udp_socket_skips_an_already_bound_port_within_the_range() {
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let held_port = held.local_addr().unwrap().port();
+        let socket = bind_udp_socket("127.0.0.1:0".parse().unwrap(), Some((held_port, held_port + 1))).unwrap();
+        assert_ne!(socket.local_addr().unwrap().port(), held_port);
     }
 }

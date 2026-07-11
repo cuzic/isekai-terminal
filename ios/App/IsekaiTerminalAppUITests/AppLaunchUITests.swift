@@ -214,4 +214,39 @@ final class AppLaunchUITests: XCTestCase {
         app.navigationBars.buttons["キャンセル"].firstMatch.tap()
         XCTAssertFalse(passwordField.exists)
     }
+
+    /// Epic M以降に追加された4つのオプトイン設定トグル(画面の保護/リモートクリップボード
+    /// 書込・送信許可/tmux迂回control-plane)が、メニューから実際にON/OFFを切り替えられる
+    /// ことを確認する(`ScreenProtectionOverlay`/`RemoteClipboardBridge`/
+    /// `CtlSocketForwardSettings`が読む`@AppStorage`との配線確認)。
+    func testOptInSettingsMenuItemsToggleBetweenOnAndOff() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        let menuItems = [
+            "screenProtectionMenuItem",
+            "remoteClipboardWriteMenuItem",
+            "remoteClipboardPullMenuItem",
+            "ctlSocketForwardMenuItem",
+        ]
+
+        for identifier in menuItems {
+            XCTAssertTrue(app.buttons["profileListMenu"].waitForExistence(timeout: 10))
+            app.buttons["profileListMenu"].tap()
+
+            let item = app.buttons[identifier]
+            XCTAssertTrue(item.waitForExistence(timeout: 5))
+            let initiallyOff = item.label.hasSuffix("OFF")
+            item.tap()
+
+            app.buttons["profileListMenu"].tap()
+            let itemAfterToggle = app.buttons[identifier]
+            XCTAssertTrue(itemAfterToggle.waitForExistence(timeout: 5))
+            XCTAssertEqual(itemAfterToggle.label.hasSuffix("OFF"), !initiallyOff)
+
+            // 次のトグルの検証に影響しないよう、必ず元の状態(OFF)へ戻す
+            // (これによりメニューも閉じるので、次のループ先頭のtapで開き直す)。
+            itemAfterToggle.tap()
+        }
+    }
 }

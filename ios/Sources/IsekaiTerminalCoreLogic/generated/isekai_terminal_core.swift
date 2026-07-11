@@ -3444,6 +3444,65 @@ public func FfiConverterTypeCellData_lower(_ value: CellData) -> RustBuffer {
 }
 
 
+/**
+ * クリップボードの中身1件(push時はリモートから受け取った内容、pull時はデバイス側の
+ * 現在のクリップボード内容)。`text: String`だった旧シグネチャを置き換える
+ * (画像は任意バイト列で運ぶ必要があり、UTF-8前提の`String`では表現できないため)。
+ */
+public struct ClipboardPayload: Equatable, Hashable {
+    public var mime: ClipboardMimeKind
+    public var data: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(mime: ClipboardMimeKind, data: Data) {
+        self.mime = mime
+        self.data = data
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ClipboardPayload: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeClipboardPayload: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ClipboardPayload {
+        return
+            try ClipboardPayload(
+                mime: FfiConverterTypeClipboardMimeKind.read(from: &buf), 
+                data: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ClipboardPayload, into buf: inout [UInt8]) {
+        FfiConverterTypeClipboardMimeKind.write(value.mime, into: &buf)
+        FfiConverterData.write(value.data, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClipboardPayload_lift(_ buf: RustBuffer) throws -> ClipboardPayload {
+    return try FfiConverterTypeClipboardPayload.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClipboardPayload_lower(_ value: ClipboardPayload) -> RustBuffer {
+    return FfiConverterTypeClipboardPayload.lower(value)
+}
+
+
 public struct CursorState: Equatable, Hashable {
     public var row: UInt32
     public var col: UInt32
@@ -3787,11 +3846,17 @@ public struct IsekaiStunP2pConfig: Equatable, Hashable {
     public var jump: JumpConfig?
     /**
      * isekai-terminal・isekai-helper の双方が自分自身の観測アドレスを調べるのに使う
-     * STUN サーバー(`host:port`)。パブリックな STUN サーバー(例: Google の
+     * STUN サーバー(`host:port`)のリスト。パブリックな STUN サーバー(例: Google の
      * `stun.l.google.com:19302`)でよい—双方が同じサーバーを使う必要は無く、
-     * それぞれ自分にとって疎通できるものを指定すればよい。
+     * それぞれ自分にとって疎通できるものを指定すればよい。空であってはならない
+     * （呼び出し側が既定値にフォールバックすること）。先頭の1件が実際の
+     * STUN+SSHランデブー穴あけ機構（自分自身の観測アドレス取得・isekai-helper起動時の
+     * `--stun-server`/`--punch-peer`）に使われ、残りは`BootstrapRequestV2`の
+     * `client_candidates`（isekai-bootstrap crate共有化 Phase 2c、`#20b`と同じ仕組み）
+     * として追加の穴あけ候補をサーバー側へ渡すためだけに使われる（冗長性向上、
+     * 複数STUNサーバーの応答が異なるNATマッピングを示す場合の取りこぼし対策）。
      */
-    public var stunServer: String
+    public var stunServers: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3801,10 +3866,16 @@ public struct IsekaiStunP2pConfig: Equatable, Hashable {
          */jump: JumpConfig?, 
         /**
          * isekai-terminal・isekai-helper の双方が自分自身の観測アドレスを調べるのに使う
-         * STUN サーバー(`host:port`)。パブリックな STUN サーバー(例: Google の
+         * STUN サーバー(`host:port`)のリスト。パブリックな STUN サーバー(例: Google の
          * `stun.l.google.com:19302`)でよい—双方が同じサーバーを使う必要は無く、
-         * それぞれ自分にとって疎通できるものを指定すればよい。
-         */stunServer: String) {
+         * それぞれ自分にとって疎通できるものを指定すればよい。空であってはならない
+         * （呼び出し側が既定値にフォールバックすること）。先頭の1件が実際の
+         * STUN+SSHランデブー穴あけ機構（自分自身の観測アドレス取得・isekai-helper起動時の
+         * `--stun-server`/`--punch-peer`）に使われ、残りは`BootstrapRequestV2`の
+         * `client_candidates`（isekai-bootstrap crate共有化 Phase 2c、`#20b`と同じ仕組み）
+         * として追加の穴あけ候補をサーバー側へ渡すためだけに使われる（冗長性向上、
+         * 複数STUNサーバーの応答が異なるNATマッピングを示す場合の取りこぼし対策）。
+         */stunServers: [String]) {
         self.sshHost = sshHost
         self.sshPort = sshPort
         self.username = username
@@ -3812,7 +3883,7 @@ public struct IsekaiStunP2pConfig: Equatable, Hashable {
         self.cols = cols
         self.rows = rows
         self.jump = jump
-        self.stunServer = stunServer
+        self.stunServers = stunServers
     }
 
     
@@ -3838,7 +3909,7 @@ public struct FfiConverterTypeIsekaiStunP2pConfig: FfiConverterRustBuffer {
                 cols: FfiConverterUInt32.read(from: &buf), 
                 rows: FfiConverterUInt32.read(from: &buf), 
                 jump: FfiConverterOptionTypeJumpConfig.read(from: &buf), 
-                stunServer: FfiConverterString.read(from: &buf)
+                stunServers: FfiConverterSequenceString.read(from: &buf)
         )
     }
 
@@ -3850,7 +3921,7 @@ public struct FfiConverterTypeIsekaiStunP2pConfig: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.cols, into: &buf)
         FfiConverterUInt32.write(value.rows, into: &buf)
         FfiConverterOptionTypeJumpConfig.write(value.jump, into: &buf)
-        FfiConverterString.write(value.stunServer, into: &buf)
+        FfiConverterSequenceString.write(value.stunServers, into: &buf)
     }
 }
 
@@ -4670,6 +4741,86 @@ public func FfiConverterTypeTerminalFrameBatch_lift(_ buf: RustBuffer) throws ->
 public func FfiConverterTypeTerminalFrameBatch_lower(_ value: TerminalFrameBatch) -> RustBuffer {
     return FfiConverterTypeTerminalFrameBatch.lower(value)
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * OSC 52テキストクリップボード(`ClipboardMime::TextPlain`のみ)とtmux迂回チャンネル
+ * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M、`isekai_protocol::ClipboardMime`全種)の両方が
+ * 運べるmime種別。`isekai_protocol::ClipboardMime`をUniFFI境界越しにそのまま公開できない
+ * (isekai-protocolはuniffiに依存しないpure crate)ため、ここに同型を用意する。
+ */
+
+public enum ClipboardMimeKind: Equatable, Hashable {
+    
+    case textPlain
+    case textHtml
+    case imagePng
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ClipboardMimeKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeClipboardMimeKind: FfiConverterRustBuffer {
+    typealias SwiftType = ClipboardMimeKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ClipboardMimeKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .textPlain
+        
+        case 2: return .textHtml
+        
+        case 3: return .imagePng
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ClipboardMimeKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .textPlain:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .textHtml:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .imagePng:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClipboardMimeKind_lift(_ buf: RustBuffer) throws -> ClipboardMimeKind {
+    return try FfiConverterTypeClipboardMimeKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClipboardMimeKind_lower(_ value: ClipboardMimeKind) -> RustBuffer {
+    return FfiConverterTypeClipboardMimeKind.lower(value)
+}
+
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
@@ -6029,6 +6180,27 @@ public protocol OrchestratorCallback: AnyObject, Sendable {
      */
     func onAgentSignRequest(keyFingerprint: String)  -> Bool
     
+    /**
+     * リモートが OSC 52 (`ESC]52;c;<base64>BEL`) でクリップボードへの書き込みを要求した
+     * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。opt-in設定のチェック・実際にAndroid
+     * `ClipboardManager` へ書くかどうかの判断はKotlin側の責務(単なるイベント通知であり、
+     * セッション/プロトコル状態ではないため`.claude/rules/rust-ssot.md`の対象外)。
+     */
+    func onClipboardWrite(payload: ClipboardPayload) 
+    
+    /**
+     * リモートが OSC 52 query(`ESC]52;c;?BEL`)またはtmux迂回チャンネルの
+     * `ClipboardPullRequest`でクリップボードの読み出しを要求した。
+     * `host_key`/`agent_sign_request`確認と同じ同期ブロッキング方式(Rust側の
+     * `spawn_blocking`から呼ばれる)。opt-in設定が無効、またはクリップボードが
+     * 空/取得不可なら`None`を返す(この場合デバイス側からは応答を一切送らない——
+     * 何も返さない方が「機能の有無自体を教えない」という意味で安全なため)。
+     * OSC 52はテキスト専用プロトコルなので、`mime`が`TextPlain`以外の場合にOSC 52へ
+     * 応答するかどうかの判断はRust側(`session.rs`)が行う——Kotlin側は「今デバイスの
+     * クリップボードに何が入っているか」だけを返せばよい。
+     */
+    func onClipboardPullRequest()  -> ClipboardPayload?
+    
 }
 
 
@@ -6275,6 +6447,52 @@ fileprivate struct UniffiCallbackInterfaceOrchestratorCallback {
                 makeCall: makeCall,
                 writeReturn: writeReturn
             )
+        },
+        onClipboardWrite: { (
+            uniffiHandle: UInt64,
+            payload: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onClipboardWrite(
+                     payload: try FfiConverterTypeClipboardPayload_lift(payload)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onClipboardPullRequest: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> ClipboardPayload? in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onClipboardPullRequest(
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterOptionTypeClipboardPayload.lower($0) }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
         }
     )
 
@@ -6383,6 +6601,10 @@ public protocol SessionCallback: AnyObject, Sendable {
     func onForwardStateChanged(id: String, state: ForwardState) 
     
     func onAgentSignRequest(keyFingerprint: String)  -> Bool
+    
+    func onClipboardWrite(payload: ClipboardPayload) 
+    
+    func onClipboardPullRequest()  -> ClipboardPayload?
     
 }
 
@@ -6712,6 +6934,52 @@ fileprivate struct UniffiCallbackInterfaceSessionCallback {
                 makeCall: makeCall,
                 writeReturn: writeReturn
             )
+        },
+        onClipboardWrite: { (
+            uniffiHandle: UInt64,
+            payload: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceSessionCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onClipboardWrite(
+                     payload: try FfiConverterTypeClipboardPayload_lift(payload)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onClipboardPullRequest: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> ClipboardPayload? in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceSessionCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onClipboardPullRequest(
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterOptionTypeClipboardPayload.lower($0) }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
         }
     )
 
@@ -6939,6 +7207,30 @@ fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeClipboardPayload: FfiConverterRustBuffer {
+    typealias SwiftType = ClipboardPayload?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeClipboardPayload.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeClipboardPayload.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeJumpConfig: FfiConverterRustBuffer {
     typealias SwiftType = JumpConfig?
 
@@ -7004,6 +7296,31 @@ fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterUInt32.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
         }
         return seq
     }
@@ -7221,6 +7538,18 @@ public func createSshSession(config: SshConfig) -> SshSession  {
 })
 }
 /**
+ * tmux 迂回 control-plane(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)を有効にするか
+ * (プロファイル毎ではなくグローバル設定、`set_terminal_theme`と同じ形)。有効な間、
+ * 新しく開くSSHチャネル(タブ)は接続直後にリモートへ`streamlocal_forward`を要求し、
+ * `isekai-pipe ctl title|clip push`をtmuxを経由せず直接受け取れるようにする。
+ */
+public func setCtlSocketForwardEnabled(enabled: Bool)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_set_ctl_socket_forward_enabled(
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+/**
  * ターミナルの配色テーマを差し替える（プロファイル毎ではなくグローバル設定）。
  *
  * `ansi16` は SGR が参照する 16 色を ARGB（`0xAARRGGBB`）で `[normal 8色, bright 8色]`
@@ -7408,6 +7737,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_create_ssh_session() != 1917) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_set_ctl_socket_forward_enabled() != 57920) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_set_terminal_theme() != 46107) {
@@ -7833,6 +8165,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_agent_sign_request() != 31857) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_write() != 19463) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_pull_request() != 18572) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_data() != 62372) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7867,6 +8205,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_agent_sign_request() != 536) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_write() != 38325) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_pull_request() != 57726) {
         return InitializationResult.apiChecksumMismatch
     }
 

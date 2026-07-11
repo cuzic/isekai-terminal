@@ -3253,8 +3253,38 @@ mod tests {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// Larger than the OS-default *process* main thread stack, which is fixed
+/// at link time and cannot be grown at runtime -- notably 1 MiB on Windows
+/// (vs. ~8 MiB typical on Linux/macOS). `tokio::main`'s generated
+/// `block_on` runs the top-level future's synchronous work (e.g. the QUIC
+/// handshake in `isekai-transport`'s `quicmux`/`noq` backend, which is deep
+/// and un-inlined in debug builds) directly on the calling thread, so a
+/// small main-thread stack overflows there before this fix -- observed in
+/// practice as `thread 'main' has overflowed its stack` right after
+/// `quicmux::noq_backend` starts connecting, when `isekai-pipe connect` runs
+/// as an `isekai-ssh`-launched `ssh(1)` `ProxyCommand` on a debug build on
+/// Windows. Running the whole async body on a freshly spawned thread with
+/// an explicit stack size sidesteps the platform-fixed main-thread limit;
+/// the size chosen here is generous headroom rather than a tight bound.
+const MAIN_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+fn main() -> ExitCode {
+    std::thread::Builder::new()
+        .name("isekai-pipe-main".to_string())
+        .stack_size(MAIN_WORKER_STACK_SIZE)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime")
+                .block_on(run())
+        })
+        .expect("failed to spawn isekai-pipe main worker thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+async fn run() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         None | Some("-h") | Some("--help") | Some("help") => {

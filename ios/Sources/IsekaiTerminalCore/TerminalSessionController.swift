@@ -257,12 +257,11 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     }
 
     /// Phase 1E-5(#44): STUN+SSHランデブーP2P。Android版
-    /// `ConnectionProfile.toIsekaiStunP2pConfig`相当。`profile.stunServer`が
-    /// 未設定/空文字なら`defaultStunServer`を使う(Android版`DEFAULT_STUN_SERVER`と同じ方針、
-    /// 双方が同じSTUNサーバーを使う必要は無いため単なるデフォルト値)。
+    /// `ConnectionProfile.toIsekaiStunP2pConfig`相当。`profile.stunServers`
+    /// (カンマ/空白区切りパース済み、空/未設定なら`defaultStunServer`1件、
+    /// `ProfileDatabase.swift`参照)をそのまま渡す。
     func makeIsekaiStunP2pConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> IsekaiStunP2pConfig {
-        let stunServer = profile.stunServer?.trimmingCharacters(in: .whitespaces)
-        return IsekaiStunP2pConfig(
+        IsekaiStunP2pConfig(
             sshHost: profile.host,
             sshPort: UInt16(profile.port),
             username: profile.username,
@@ -270,7 +269,7 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             cols: cols,
             rows: rows,
             jump: jump,
-            stunServer: (stunServer?.isEmpty ?? true) ? defaultStunServer : stunServer!
+            stunServers: profile.stunServers
         )
     }
 
@@ -671,5 +670,20 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         }
 
         return waitResult == .success && resultBox.approved
+    }
+
+    /// リモートがOSC 52またはtmux迂回チャンネル経由でクリップボードへの書き込みを要求した
+    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。opt-in設定のチェック・実際に`UIPasteboard`へ
+    /// 書くかどうかの判断は`RemoteClipboardBridge`(UI設定であり`.claude/rules/rust-ssot.md`
+    /// の対象外)に委譲する。Android版`TerminalSession.kt`の`onClipboardWrite`に相当。
+    public func onClipboardWrite(payload: ClipboardPayload) {
+        RemoteClipboardBridge.write(payload)
+    }
+
+    /// リモートがOSC 52 queryまたはtmux迂回チャンネルの`ClipboardPullRequest`で
+    /// クリップボードの読み出しを要求した。Android版`TerminalSession.kt`の
+    /// `onClipboardPullRequest`に相当。
+    public func onClipboardPullRequest() -> ClipboardPayload? {
+        RemoteClipboardBridge.pull()
     }
 }

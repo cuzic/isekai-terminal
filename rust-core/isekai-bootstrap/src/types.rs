@@ -125,6 +125,12 @@ pub struct RelayLaunchSpec {
     /// inside this crate, keeping the policy decision in `isekai-ssh`
     /// itself and leaving `isekai-helper`'s own default untouched).
     pub idle_lifetime_secs: u64,
+    /// `isekai-helper --log-level <LEVEL>`. Threaded through explicitly
+    /// (rather than left to `isekai-helper`'s own built-in `info` default)
+    /// so a caller can dial verbosity up for one host without changing
+    /// every other deployment's log volume forever (`#@isekai
+    /// remote-log-level` in `isekai-ssh`, see `wrapper.rs`).
+    pub remote_log_level: String,
 }
 
 /// What a successful `BootstrapBackend::install_and_start` call yields: the
@@ -147,5 +153,20 @@ pub enum LaunchSpec {
     /// dial (the same SSH bootstrap host, at the port this launch reports).
     /// Scoped deliberately narrow for the wrapper's auto-bootstrap: no
     /// relay JWT sourcing exists there yet, and this mode needs none.
-    Direct { idle_lifetime_secs: u64 },
+    Direct {
+        idle_lifetime_secs: u64,
+        remote_log_level: String,
+        /// `isekai-helper --bind-port-range <START>-<END>`, `None` for
+        /// `isekai-helper`'s own default (a random OS-assigned ephemeral
+        /// port, `/proc/sys/net/ipv4/ip_local_port_range` on Linux). Lets an
+        /// operator narrow which inbound UDP port range a host's firewall
+        /// needs to allow for `isekai-helper` to be reachable, instead of
+        /// opening the whole ephemeral range (`#@isekai remote-bind-port-range`).
+        /// Named with an explicit `remote_` prefix (unlike this variant's
+        /// other fields) because a *local* counterpart — the port range
+        /// `isekai-pipe connect` itself binds from on this machine — is a
+        /// distinct, independently configurable setting, not implied by
+        /// this one.
+        remote_bind_port_range: Option<(u16, u16)>,
+    },
 }

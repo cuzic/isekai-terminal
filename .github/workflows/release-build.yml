@@ -20,6 +20,14 @@ name: isekai-ssh / isekai-pipe release build
 #
 # push/PR毎には走らせない。バージョンタグ(`isekai-ssh-v*`/`isekai-pipe-v*`)
 # を打った時とworkflow_dispatchでの手動実行のみ。
+#
+# タグpush時は最後にGitHub Releaseへasset添付まで行う(publish-releaseジョブ)。
+# `isekai-ssh`側の自動bootstrap(`isekai-ssh/src/helper_download.rs`)が
+# `{repo}/releases/latest/download/isekai-pipe-{arch}-unknown-linux-musl`を
+# そのまま叩く前提なので、ここでのasset名(`${{ matrix.bin }}-${{
+# matrix.platform.target }}${{ matrix.platform.ext }}`)がそれと一致している
+# 必要がある。workflow_dispatch(タグ無し実行)ではpublish-releaseは走らず、
+# ビルド確認用のartifactアップロードだけで終わる。
 
 on:
   push:
@@ -142,11 +150,50 @@ jobs:
         working-directory: rust-core/target/${{ matrix.platform.target }}/release
         run: ${{ matrix.platform.shasum }} ${{ matrix.bin }}${{ matrix.platform.ext }} | awk '{print $1}' > ${{ matrix.bin }}${{ matrix.platform.ext }}.sha256
 
+      # Renamed to embed the target triple before upload — `actions/
+      # upload-artifact`'s own `name:` field only namespaces the *artifact*,
+      # not the file inside it, so every (bin, platform) combination would
+      # otherwise produce an identically-named `isekai-pipe`/`isekai-ssh`
+      # file and collide once flattened together in a GitHub Release
+      # (`publish-release` below). This also happens to be exactly the
+      # asset-name convention `helper_download.rs::asset_name_for_arch`
+      # expects for the two Linux/musl `isekai-pipe` builds
+      # (`isekai-pipe-x86_64-unknown-linux-musl` / `-aarch64-...`).
+      - name: Rename for release
+        shell: bash
+        working-directory: rust-core/target/${{ matrix.platform.target }}/release
+        run: |
+          mv ${{ matrix.bin }}${{ matrix.platform.ext }} ${{ matrix.bin }}-${{ matrix.platform.target }}${{ matrix.platform.ext }}
+          mv ${{ matrix.bin }}${{ matrix.platform.ext }}.sha256 ${{ matrix.bin }}-${{ matrix.platform.target }}${{ matrix.platform.ext }}.sha256
+
       - name: Upload ${{ matrix.bin }} (${{ matrix.platform.target }})
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.bin }}-${{ matrix.platform.target }}
           path: |
-            rust-core/target/${{ matrix.platform.target }}/release/${{ matrix.bin }}${{ matrix.platform.ext }}
-            rust-core/target/${{ matrix.platform.target }}/release/${{ matrix.bin }}${{ matrix.platform.ext }}.sha256
+            rust-core/target/${{ matrix.platform.target }}/release/${{ matrix.bin }}-${{ matrix.platform.target }}${{ matrix.platform.ext }}
+            rust-core/target/${{ matrix.platform.target }}/release/${{ matrix.bin }}-${{ matrix.platform.target }}${{ matrix.platform.ext }}.sha256
           retention-days: 90
+
+  publish-release:
+    needs: build
+    # Only real tag pushes cut a Release — `workflow_dispatch` (no tag) is
+    # for "does this still build" checks and must never publish assets that
+    # look like a real numbered release.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

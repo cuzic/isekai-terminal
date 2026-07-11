@@ -320,6 +320,20 @@ typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod8)(uint64_t, Rus
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD9
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD9
+typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod9)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD10
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD10
+typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod10)(uint64_t, RustBuffer* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_SESSION_CALLBACK_METHOD0
 #define UNIFFI_FFIDEF_CALLBACK_INTERFACE_SESSION_CALLBACK_METHOD0
 typedef void (*UniffiCallbackInterfaceSessionCallbackMethod0)(uint64_t, RustBuffer, void* _Nonnull, 
@@ -404,6 +418,20 @@ typedef void (*UniffiCallbackInterfaceSessionCallbackMethod11)(uint64_t, RustBuf
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_SESSION_CALLBACK_METHOD12
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_SESSION_CALLBACK_METHOD12
+typedef void (*UniffiCallbackInterfaceSessionCallbackMethod12)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_SESSION_CALLBACK_METHOD13
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_SESSION_CALLBACK_METHOD13
+typedef void (*UniffiCallbackInterfaceSessionCallbackMethod13)(uint64_t, RustBuffer* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
 #define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
 typedef struct UniffiVTableCallbackInterfaceDiagnosticCallback {
@@ -436,6 +464,8 @@ typedef struct UniffiVTableCallbackInterfaceOrchestratorCallback {
     UniffiCallbackInterfaceOrchestratorCallbackMethod6 _Nonnull onNoViablePath;
     UniffiCallbackInterfaceOrchestratorCallbackMethod7 _Nonnull onForwardStateChanged;
     UniffiCallbackInterfaceOrchestratorCallbackMethod8 _Nonnull onAgentSignRequest;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod9 _Nonnull onClipboardWrite;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod10 _Nonnull onClipboardPullRequest;
 } UniffiVTableCallbackInterfaceOrchestratorCallback;
 
 #endif
@@ -456,6 +486,8 @@ typedef struct UniffiVTableCallbackInterfaceSessionCallback {
     UniffiCallbackInterfaceSessionCallbackMethod9 _Nonnull onNoViablePath;
     UniffiCallbackInterfaceSessionCallbackMethod10 _Nonnull onForwardStateChanged;
     UniffiCallbackInterfaceSessionCallbackMethod11 _Nonnull onAgentSignRequest;
+    UniffiCallbackInterfaceSessionCallbackMethod12 _Nonnull onClipboardWrite;
+    UniffiCallbackInterfaceSessionCallbackMethod13 _Nonnull onClipboardPullRequest;
 } UniffiVTableCallbackInterfaceSessionCallback;
 
 #endif
@@ -1174,6 +1206,11 @@ RustBuffer uniffi_isekai_terminal_core_fn_func_core_version(RustCallStatus *_Non
 uint64_t uniffi_isekai_terminal_core_fn_func_create_ssh_session(RustBuffer config, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_FUNC_SET_CTL_SOCKET_FORWARD_ENABLED
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_FUNC_SET_CTL_SOCKET_FORWARD_ENABLED
+void uniffi_isekai_terminal_core_fn_func_set_ctl_socket_forward_enabled(int8_t enabled, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_FUNC_SET_TERMINAL_THEME
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_FUNC_SET_TERMINAL_THEME
 void uniffi_isekai_terminal_core_fn_func_set_terminal_theme(RustBuffer ansi16, uint32_t default_fg, uint32_t default_bg, RustCallStatus *_Nonnull out_status
@@ -1538,6 +1575,12 @@ uint16_t uniffi_isekai_terminal_core_checksum_func_core_version(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_FUNC_CREATE_SSH_SESSION
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_FUNC_CREATE_SSH_SESSION
 uint16_t uniffi_isekai_terminal_core_checksum_func_create_ssh_session(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_FUNC_SET_CTL_SOCKET_FORWARD_ENABLED
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_FUNC_SET_CTL_SOCKET_FORWARD_ENABLED
+uint16_t uniffi_isekai_terminal_core_checksum_func_set_ctl_socket_forward_enabled(void
     
 );
 #endif
@@ -2387,6 +2430,18 @@ uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_age
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_CLIPBOARD_WRITE
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_CLIPBOARD_WRITE
+uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_write(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_CLIPBOARD_PULL_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_CLIPBOARD_PULL_REQUEST
+uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_pull_request(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONCALLBACK_ON_DATA
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONCALLBACK_ON_DATA
 uint16_t uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_data(void
@@ -2456,6 +2511,18 @@ uint16_t uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_forward_
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONCALLBACK_ON_AGENT_SIGN_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONCALLBACK_ON_AGENT_SIGN_REQUEST
 uint16_t uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_agent_sign_request(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONCALLBACK_ON_CLIPBOARD_WRITE
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONCALLBACK_ON_CLIPBOARD_WRITE
+uint16_t uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_write(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONCALLBACK_ON_CLIPBOARD_PULL_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONCALLBACK_ON_CLIPBOARD_PULL_REQUEST
+uint16_t uniffi_isekai_terminal_core_checksum_method_sessioncallback_on_clipboard_pull_request(void
     
 );
 #endif

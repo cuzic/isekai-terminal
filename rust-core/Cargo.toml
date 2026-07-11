@@ -90,3 +90,13 @@ android_logger = "0.15"
 
 [profile.release]
 panic = "abort"
+# isekai-ssh/isekai-pipeのリリースバイナリが想定より大きかった調査から追加
+# (このprofileはworkspace全体、`isekai-terminal-core`のcdylib/Androidビルドにも
+# 効く)。`strip`/`lto`/`codegen-units=1`は実行時挙動を変えない純粋なサイズ・
+# ビルド時間のトレードオフなのでここに含めるが、`opt-level`("s"/"z"でさらに
+# 縮む余地はある)はQUIC/VTE/crypto等のホットパスの実行速度を犠牲にする判断が
+# 要るため、`isekai-terminal-core`(Android実機のSSHセッション)にも及ぶこの
+# workspace共通profileでは意図的にここでは変更していない。
+strip = true
+lto = true
+codegen-units = 1
