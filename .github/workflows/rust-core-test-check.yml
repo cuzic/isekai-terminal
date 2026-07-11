@@ -89,4 +89,11 @@ jobs:
 
       - name: cargo test --workspace (excluding noq-multipath-spike)
         working-directory: rust-core
-        run: cargo test --workspace --exclude noq-multipath-spike
+        # `--test-threads=2`: real_sshd_multihop_bootstrap_e2e.rs等、実`/usr/sbin/sshd`
+        # プロセスを複数起動するE2Eテストが、既定の並列度(GitHub-hosted runnerの
+        # 4 vCPU分)でワークスペース全体を実行すると"jump host unreachable" /
+        # "Broken pipe (os error 32)"で断続的に失敗することが分かった(3回連続で
+        # 同一テスト・同一エラーで再現、単体実行では発生しない)。実プロセス/
+        # ソケットを大量に同時起動する既存のリソース制約であり、並列度を落として
+        # 競合を避ける(実行時間は伸びるが正確性を優先)。
+        run: cargo test --workspace --exclude noq-multipath-spike -- --test-threads=2
