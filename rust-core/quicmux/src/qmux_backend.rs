@@ -410,6 +410,17 @@ impl QmuxByteStream {
         self.send.finish().map_err(map_qmux_error)
     }
 
+    /// See [`crate::AnyByteStream::wait_for_close`]'s docs. `web_transport_trait::
+    /// SendStream::closed()` blocks until either side closed the stream (our
+    /// `finish()` acknowledged, our `reset()`, or the peer's `RecvStream::
+    /// stop()`) — coarser than `noq`'s `stopped()` (which distinguishes an
+    /// explicit peer stop from a plain finish-ack), but that distinction
+    /// isn't needed here; see the `noq` backend's identical comment.
+    pub(crate) async fn wait_for_close(&mut self) -> Result<(), MuxError> {
+        use web_transport_trait::SendStream as _;
+        self.send.closed().await.map_err(map_qmux_error)
+    }
+
     pub(crate) fn split(self) -> (QmuxByteStreamReadHalf, QmuxByteStreamWriteHalf) {
         let QmuxByteStream { send, recv, _session } = self;
         (QmuxByteStreamReadHalf { recv, _session: _session.clone() }, QmuxByteStreamWriteHalf { send, _session })
@@ -447,6 +458,12 @@ impl QmuxByteStreamWriteHalf {
     pub(crate) async fn shutdown(&mut self) -> Result<(), MuxError> {
         use web_transport_trait::SendStream as _;
         self.send.finish().map_err(map_qmux_error)
+    }
+
+    /// See [`QmuxByteStream::wait_for_close`].
+    pub(crate) async fn wait_for_close(&mut self) -> Result<(), MuxError> {
+        use web_transport_trait::SendStream as _;
+        self.send.closed().await.map_err(map_qmux_error)
     }
 }
 
@@ -506,10 +523,10 @@ mod listener_tests {
                 let _ = stream.write_all(&buf[..n]).await;
             }
             let _ = stream.shutdown().await;
-            // See `noq_backend`'s identical comment: keep `conn` alive until
-            // the client itself closes, instead of dropping it (and the
-            // whole listener) the instant the echo is written.
-            let _ = conn.accept_bi().await;
+            // See `noq_backend`'s identical comment: `wait_for_close()` is
+            // this crate's real fix for dropping `stream`/`conn`/`listener`
+            // before the peer actually received the echoed data.
+            let _ = stream.wait_for_close().await;
         });
 
         let factory = QmuxFactory::new(test_client_config());

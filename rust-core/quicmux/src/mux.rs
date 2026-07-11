@@ -396,6 +396,28 @@ impl AnyByteStream {
         }
     }
 
+    /// Waits until the peer has either received everything this stream sent
+    /// (acknowledged a prior [`AnyByteStream::shutdown`]) or explicitly
+    /// stopped reading it. A caller that writes a final message and then
+    /// immediately drops/closes the whole connection can race the peer
+    /// actually receiving that message — `isekai-pipe serve`'s `reject()`
+    /// hit exactly this (documented there as "実測で確認済みのバグ": the
+    /// QUIC connection closing before the reject reason reached the client)
+    /// and this crate's own listener tests independently reproduced the
+    /// same class of race (`noq_backend`/`qmux_backend`'s `PeerClosed`
+    /// gotcha in their listener echo tests) — call this after
+    /// [`AnyByteStream::shutdown`] and before closing the connection
+    /// whenever the caller needs the peer to have actually seen the last
+    /// write, not just that the local call to send it returned `Ok`.
+    pub async fn wait_for_close(&mut self) -> Result<(), MuxError> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(stream) => stream.wait_for_close().await,
+            #[cfg(feature = "qmux")]
+            Self::Qmux(stream) => stream.wait_for_close().await,
+        }
+    }
+
     /// Splits this stream into independently-owned read/write halves so a
     /// caller can drive "read from A, write to this stream" and "read from
     /// this stream, write to B" as two separately `tokio::spawn`ed tasks
@@ -464,6 +486,16 @@ impl AnyByteStreamWriteHalf {
             Self::Noq(half) => half.shutdown().await,
             #[cfg(feature = "qmux")]
             Self::Qmux(half) => half.shutdown().await,
+        }
+    }
+
+    /// Same contract as [`AnyByteStream::wait_for_close`].
+    pub async fn wait_for_close(&mut self) -> Result<(), MuxError> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(half) => half.wait_for_close().await,
+            #[cfg(feature = "qmux")]
+            Self::Qmux(half) => half.wait_for_close().await,
         }
     }
 }

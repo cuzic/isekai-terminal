@@ -430,6 +430,18 @@ impl NoqByteStream {
         self.send.finish().map_err(|_| MuxError::StreamIo("stream already finished or reset".to_string()))
     }
 
+    /// Waits until the peer has either fully received this stream's data
+    /// (acknowledged the `finish()`) or explicitly stopped reading it — see
+    /// [`crate::AnyByteStream::wait_for_close`]'s docs for why a caller needs
+    /// this. `noq::SendStream::stopped()` actually distinguishes those two
+    /// outcomes (`Some(code)` for an explicit stop, `None` for a plain
+    /// finish-ack) and callers of `isekai-pipe`'s original `reject()` never
+    /// used that distinction — collapsed to `()` here to match the coarser
+    /// guarantee `qmux`'s `SendStream::closed()` can actually make.
+    pub(crate) async fn wait_for_close(&self) -> Result<(), MuxError> {
+        self.send.stopped().await.map(|_| ()).map_err(|e| map_write_error(e.into()))
+    }
+
     pub(crate) fn split(self) -> (NoqByteStreamReadHalf, NoqByteStreamWriteHalf) {
         (NoqByteStreamReadHalf { recv: self.recv }, NoqByteStreamWriteHalf { send: self.send })
     }
@@ -459,6 +471,11 @@ impl NoqByteStreamWriteHalf {
 
     pub(crate) async fn shutdown(&mut self) -> Result<(), MuxError> {
         self.send.finish().map_err(|_| MuxError::StreamIo("stream already finished or reset".to_string()))
+    }
+
+    /// See [`NoqByteStream::wait_for_close`].
+    pub(crate) async fn wait_for_close(&self) -> Result<(), MuxError> {
+        self.send.stopped().await.map(|_| ()).map_err(|e| map_write_error(e.into()))
     }
 }
 
@@ -595,18 +612,17 @@ mod tests {
                 let _ = stream.write_all(&buf[..n]).await;
             }
             let _ = stream.shutdown().await;
-            // Deliberately keep `conn` (and the `listener` this closure
-            // captured) alive until the client itself closes the
-            // connection, instead of dropping them the instant the echo is
-            // written: dropping the sole `noq::Connection` handle right
-            // after a stream `finish()` — before the peer has actually
-            // observed the data, only requested it — tears the whole
-            // connection down mid-flight and races the client's `read()`
-            // (confirmed by reproducing `PeerClosed` here without this
-            // loop). `isekai-pipe serve`'s real `handle_connection` never
-            // hits this because it holds `conn` in an `accept_bi()` loop for
-            // the connection's entire lifetime, exactly like this.
-            let _ = conn.accept_bi().await;
+            // `wait_for_close()` — not an immediate drop of `stream`/`conn`/
+            // `listener` — is this crate's real fix for the race this test
+            // originally caught (see `AnyByteStream::wait_for_close`'s
+            // docs): dropping the sole `noq::Connection` handle right after
+            // a stream `finish()`, before the peer has actually *received*
+            // the data (only requested it), tears the whole connection down
+            // mid-flight and can race the client's `read()` into seeing
+            // `PeerClosed` instead of the echoed bytes (reproduced directly
+            // here before this call was added). `isekai-pipe serve`'s real
+            // `reject()` hits the identical race and fixes it the same way.
+            let _ = stream.wait_for_close().await;
         });
     }
 
