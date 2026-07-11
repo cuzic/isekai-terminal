@@ -1059,6 +1059,10 @@ async fn install_and_start_garbage_collection_never_touches_a_still_alive_topolo
         state_file_path(&home, &relay_fingerprint).exists(),
         "a still-alive topology's state file must survive a GC pass triggered by an unrelated bootstrap"
     );
+    assert!(
+        pid_file_path(&home, &relay_fingerprint).exists(),
+        "a still-alive topology's pid file must survive a GC pass triggered by an unrelated bootstrap"
+    );
     assert!(is_pid_alive(relay_pid), "the still-alive relay helper must not have been killed by the GC pass");
 
     kill_if_recorded(&home, &relay_fingerprint);
