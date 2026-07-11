@@ -64,6 +64,12 @@ cargo run -p uniffi-bindgen -- generate --library target/debug/libisekai_termina
 - **Rust を SSOT にする**: セッション/接続/トランスポートの状態と、それに基づく意思決定は
   Rust(`rust-core`)側に置く。Kotlin 側にミラー状態を作って分岐判断しない。
   詳細と実例は `.claude/rules/rust-ssot.md` を参照(このルールはセッション開始時に自動読込される)。
+- **「常に接続できる」原則**: `isekai-ssh <hostname>` は、ローカルのキャッシュ済みデプロイ
+  情報がどんな状態(古い・死んでいる・fingerprint不一致等)であっても、ネットワークと
+  SSHアクセス自体が生きている限り自動的に(サイレント再デプロイを挟んで)接続できなければ
+  ならない。ユーザーが `isekai-ssh doctor --fix`/`init` を手動実行しない限り復旧しない
+  接続失敗は原則バグ。詳細は `.claude/rules/always-connects.md`(自動読込される)と
+  `ISEKAI_PIPE_DESIGN.md` §8 Epic N-2 を参照。
 - 実験的・opt-in の機能(マルチパス、物理 Wi-Fi/セルラー同時利用など)は既定 OFF とし、
   使えない環境では黙ってフォールバックする「日和見的(opportunistic)」設計にする
   (`PLAN.md` Phase 7-7/9 の設計判断を参照)。
