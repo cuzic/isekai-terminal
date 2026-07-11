@@ -745,3 +745,233 @@ async fn install_and_start_delivers_real_stun_candidates_when_stun_servers_are_c
         "expected argv to contain '--stun-server {stun_server}', got: {argv:?}"
     );
 }
+
+/// Path `install_and_start` uploads/launches at when `remote_binary_path` is
+/// left at its default (`isekai_protocol::bootstrap::ISEKAI_PIPE_INSTALL_DIR`/
+/// `ISEKAI_PIPE_BIN_NAME`), resolved against a mock server's own `$HOME`
+/// scratch dir (real `~` shell expansion, exactly like a real deployment).
+fn default_install_path(home: &Path) -> PathBuf {
+    home.join(".local/bin/isekai-pipe")
+}
+
+fn pid_file_path(home: &Path) -> PathBuf {
+    home.join(".local/bin/isekai-pipe.pid")
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    // A `kill -0` against an already-dead pid is an expected outcome for one
+    // of this file's own assertions (not a real error) — redirect its
+    // stderr rather than let "No such process" leak into normal test
+    // output.
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(StdStdio::null())
+        .stderr(StdStdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Bytes of a *real* ELF stand-in for `isekai-pipe serve` (see
+/// `src/bin/fake_pipe.rs`'s own module docs for why the reuse tests below
+/// need a real executable rather than the shell-script stand-in every other
+/// test in this file uses: `/proc/<pid>/exe` for a shebang script resolves
+/// to the interpreter, not the script itself, which would defeat
+/// `OpenSshBackend::install_and_launch`'s PID-reuse guard).
+fn fake_pipe_binary() -> Vec<u8> {
+    std::fs::read(env!("CARGO_BIN_EXE_isekai-bootstrap-fake-pipe")).expect("fake-pipe test binary should be built")
+}
+
+/// Best-effort teardown for a still-sleeping `fake_pipe_binary()` instance
+/// left behind by a reuse test (it self-exits after 20s regardless — see
+/// its own module docs — this just avoids leaving it around for that whole
+/// window on a machine running these tests repeatedly).
+fn kill_if_recorded(home: &Path) {
+    if let Ok(pid_str) = std::fs::read_to_string(pid_file_path(home)) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .stdout(StdStdio::null())
+                .stderr(StdStdio::null())
+                .status();
+        }
+    }
+}
+
+/// The whole point of `crate::reuse`: a second `install_and_start` against
+/// the *same* `LaunchSpec` while the first deployment's helper is still
+/// alive must reuse its cached handshake outright — no re-upload, no
+/// relaunch — rather than piling up a second long-lived helper process next
+/// to the still-good first one (the concrete bug a lost/stale client-side
+/// trust store used to cause every time, since `OpenSshBackend` had no way
+/// to tell "already deployed and alive" apart from "never deployed").
+#[tokio::test]
+async fn install_and_start_reuses_a_still_alive_helper_without_relaunching() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("fake-pipe-handshake.json"), VALID_BOOTSTRAP_REPORT_JSON).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+    let binary = fake_pipe_binary();
+    let launch = LaunchSpec::Relay(dummy_relay_spec());
+
+    let report1 = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], &binary, &launch, None, &[]),
+    )
+    .await
+    .expect("first install_and_start should not hang")
+    .expect("first install_and_start should succeed");
+
+    let invocations_after_first =
+        std::fs::read_to_string(home.join("fake-pipe-invocations.log")).unwrap_or_default();
+    assert_eq!(invocations_after_first.lines().count(), 1, "expected exactly one real launch after the first call");
+
+    let report2 = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], &binary, &launch, None, &[]),
+    )
+    .await
+    .expect("second install_and_start should not hang")
+    .expect("second install_and_start should succeed via the reuse path");
+
+    assert_eq!(report2, report1, "a reused deployment must hand back the same handshake");
+
+    let invocations_after_second =
+        std::fs::read_to_string(home.join("fake-pipe-invocations.log")).unwrap_or_default();
+    assert_eq!(
+        invocations_after_second.lines().count(),
+        1,
+        "the second install_and_start should have reused the still-alive helper, not relaunched it"
+    );
+
+    kill_if_recorded(&home);
+}
+
+/// A second `install_and_start` with a *different* `LaunchSpec` (a
+/// materially different deployment — different relay, or no relay at all —
+/// not just a settings tweak) must not mistake the still-alive previous
+/// helper for a reusable one, and must kill it before launching its
+/// replacement, so mismatched deployments don't pile up as orphaned
+/// processes either.
+#[tokio::test]
+async fn install_and_start_kills_a_stale_helper_and_relaunches_on_fingerprint_change() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("fake-pipe-handshake.json"), VALID_BOOTSTRAP_REPORT_JSON).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+    let binary = fake_pipe_binary();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], &binary, &LaunchSpec::Relay(dummy_relay_spec()), None, &[]),
+    )
+    .await
+    .expect("first install_and_start should not hang")
+    .expect("first install_and_start should succeed");
+
+    let first_pid: u32 =
+        std::fs::read_to_string(pid_file_path(&home)).unwrap().trim().parse().expect("pid file should hold a pid");
+    assert!(is_pid_alive(first_pid), "the first deployment's helper should still be running");
+
+    let direct_launch =
+        LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), remote_bind_port_range: None };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], &binary, &direct_launch, None, &[]),
+    )
+    .await
+    .expect("second install_and_start should not hang")
+    .expect("second install_and_start should succeed with a fresh launch");
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!is_pid_alive(first_pid), "the fingerprint-mismatched stale helper should have been killed");
+
+    let invocations =
+        std::fs::read_to_string(home.join("fake-pipe-invocations.log")).unwrap_or_default();
+    assert_eq!(invocations.lines().count(), 2, "a fingerprint change must force a real relaunch, not a reuse");
+
+    kill_if_recorded(&home);
+}
+
+/// When a relaunch genuinely is needed (the previous helper already exited,
+/// unlike the two tests above) but the remote binary at the install path
+/// already has the exact bytes `install_and_start` was about to upload, the
+/// upload itself (not just the launch) should be skipped — mirrors
+/// `rust-core/src/helper_bootstrap.rs`'s `check_existing_version` (Android's
+/// own binary-reuse check), ported to the CLI's long-lived-helper model.
+#[tokio::test]
+async fn install_and_start_skips_reupload_when_the_remote_binary_already_matches() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+    let backend = test_backend(&key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+
+    // Deliberately the plain (short-lived) shell-script stand-in, not
+    // `fake_pipe_binary()`: it exits immediately after printing the
+    // handshake, so by the time the second call runs, the recorded pid is
+    // already dead and reuse cannot apply — exactly the scenario this test
+    // needs (a real relaunch, but with an unchanged binary).
+    let fake_helper_script = format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n");
+    let launch = LaunchSpec::Relay(dummy_relay_spec());
+
+    let report1 = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], fake_helper_script.as_bytes(), &launch, None, &[]),
+    )
+    .await
+    .expect("first install_and_start should not hang")
+    .expect("first install_and_start should succeed");
+
+    let uploaded_path = default_install_path(&home);
+    let mtime1 = std::fs::metadata(&uploaded_path).unwrap().modified().unwrap();
+
+    // Coarse mtime resolution safety margin — see this assertion's own
+    // comment below for why exact equality is what's being checked.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let report2 = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], fake_helper_script.as_bytes(), &launch, None, &[]),
+    )
+    .await
+    .expect("second install_and_start should not hang")
+    .expect("second install_and_start should succeed");
+
+    let mtime2 = std::fs::metadata(&uploaded_path).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime1, mtime2,
+        "a matching sha256 should have skipped re-uploading the binary (mtime would move otherwise)"
+    );
+    assert_eq!(report2, report1);
+}

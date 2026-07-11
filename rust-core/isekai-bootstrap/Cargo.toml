@@ -16,6 +16,16 @@ rand = "0.8"
 serde_json = "1"
 sha2 = "0.10"
 
+[[bin]]
+# Real-ELF stand-in for `isekai-pipe serve`, used only by
+# `tests/openssh_e2e.rs`'s helper-reuse tests (see its own doc comment for
+# why a real executable is needed there instead of the plain shell-script
+# stand-in every other test in that file uses). `cargo test -p
+# isekai-bootstrap` builds this automatically and exposes its path to
+# `tests/openssh_e2e.rs` via `CARGO_BIN_EXE_isekai-bootstrap-fake-pipe`.
+name = "isekai-bootstrap-fake-pipe"
+path = "src/bin/fake_pipe.rs"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 russh = "0.48"
