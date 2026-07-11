@@ -26,6 +26,8 @@ use isekai_trust::{HelperTrust, UpdatePolicy};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::log_file::log_line;
+
 /// Reserved words that `should_run_wrapper` never treats as an SSH
 /// destination — the interactive trust-store subcommands (`init`/`login`/
 /// `logout`, all pre-existing) plus `doctor` (manual diagnostic,
@@ -79,6 +81,11 @@ struct WrapperIsekaiOptions {
     /// see `helper_download::ReleaseSource`.
     helper_release_repo: String,
     helper_release_tag: Option<String>,
+    /// `--isekai-log-file <PATH>` (`log_file.rs`): tees this invocation's
+    /// diagnostic output (this process's own status messages, plus `ssh(1)`'s
+    /// — and by extension `isekai-pipe connect`'s — stderr) into a file, in
+    /// addition to the terminal.
+    log_file: Option<PathBuf>,
 }
 
 impl Default for WrapperIsekaiOptions {
@@ -92,6 +99,7 @@ impl Default for WrapperIsekaiOptions {
             helper_binary: None,
             helper_release_repo: crate::helper_download::ReleaseSource::DEFAULT_REPO.to_string(),
             helper_release_tag: None,
+            log_file: None,
         }
     }
 }
@@ -243,6 +251,10 @@ pub fn should_run_wrapper(args: &[String]) -> bool {
 
 pub async fn run(args: Vec<String>) -> Result<u8> {
     let plan = parse_wrapper(args)?;
+    if let Some(log_file) = &plan.isekai.log_file {
+        crate::log_file::init(log_file)
+            .with_context(|| format!("isekai-ssh: failed to open --isekai-log-file at {}", log_file.display()))?;
+    }
     if plan.isekai.direct {
         return run_openssh_direct(&plan).await;
     }
@@ -251,11 +263,11 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
         return run_openssh_direct(&plan).await;
     }
     if plan.isekai.explain || plan.isekai.dry_run {
-        eprintln!(
+        log_line!(
             "isekai-ssh: resolved OpenSSH config: {:?}",
             resolution.openssh
         );
-        eprintln!(
+        log_line!(
             "isekai-ssh: resolved isekai config: {:?}",
             resolution.isekai
         );
@@ -318,7 +330,7 @@ async fn run_ssh_with_connect_failure_recovery(
         ConnectFailureRecoveryAction::NoRecoverableSignal => Ok(exit_code),
         ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
             let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
-            eprintln!(
+            log_line!(
                 "isekai-ssh: {} for {:?} ({}), but auto-bootstrap is disabled \
                  (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
                 outcome_summary(&outcome.class), resolution.isekai.profile, outcome.detail
@@ -327,7 +339,7 @@ async fn run_ssh_with_connect_failure_recovery(
         }
         ConnectFailureRecoveryAction::RebootstrapAndRetry => {
             let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
-            eprintln!(
+            log_line!(
                 "isekai-ssh: {} for {:?} ({}); refreshing automatically...",
                 outcome_summary(&outcome.class), resolution.isekai.profile, outcome.detail
             );
@@ -414,7 +426,7 @@ async fn run_ssh_once(
             Err(e) => {
                 // Opportunistic feature (`ISEKAI_PIPE_DESIGN.md` Epic M):
                 // never fail the connection over this, just skip it.
-                eprintln!("isekai-ssh: ctl-socket forward unavailable, continuing without it: {e:#}");
+                log_line!("isekai-ssh: ctl-socket forward unavailable, continuing without it: {e:#}");
                 None
             }
         }
@@ -439,17 +451,41 @@ async fn run_ssh_once(
     if let Some(forward) = &ctl_forward {
         command.arg(crate::ctl_forward::remote_command_arg(forward));
     }
-    command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    // stdin/stdout always stay `Stdio::inherit()`ed — piping either would
+    // break `ssh(1)`'s own `isatty()`-based PTY/interactive-terminal
+    // behavior (`log_file.rs`'s module docs). stderr is the one stream this
+    // feature can safely relay through itself: it carries only diagnostic
+    // output (this process's own, and `isekai-pipe connect`'s `env_logger`
+    // lines, both `log_file.rs`'s actual targets), never the interactive
+    // session's own content.
+    command.stdin(Stdio::inherit()).stdout(Stdio::inherit());
+    if crate::log_file::is_enabled() {
+        command.stderr(Stdio::piped());
+    } else {
+        command.stderr(Stdio::inherit());
+    }
 
-    let status = command.status().await.map_err(|e| {
+    let mut child = command.spawn().map_err(|e| {
         anyhow!(
             "isekai-ssh: failed to execute OpenSSH at {}: {e}",
             plan.openssh_path.display()
         )
     })?;
+    let stderr_tee = child.stderr.take().map(|stderr| tokio::spawn(crate::log_file::tee_child_stderr(stderr)));
+
+    let status = child.wait().await.map_err(|e| {
+        anyhow!(
+            "isekai-ssh: failed while waiting for OpenSSH at {}: {e}",
+            plan.openssh_path.display()
+        )
+    })?;
+    // ssh(1) exiting closes its stderr, which ends `tee_child_stderr`'s read
+    // loop on its own — this just makes sure that last batch of bytes has
+    // actually landed before returning (so a caller inspecting the log file
+    // right after doesn't race it).
+    if let Some(handle) = stderr_tee {
+        let _ = handle.await;
+    }
     Ok((status, intent.intent_id.clone()))
 }
 
@@ -574,11 +610,11 @@ pub(crate) fn print_bootstrap_failure_guidance(err: &anyhow::Error) {
         return;
     };
     if failure.should_redirect_to_login() {
-        eprintln!("isekai-ssh: {failure} — run `isekai-ssh login` and try again.");
+        log_line!("isekai-ssh: {failure} — run `isekai-ssh login` and try again.");
     } else if failure.should_redirect_to_init() {
-        eprintln!("isekai-ssh: {failure} — run `isekai-ssh init` to set up trust/credentials for this host.");
+        log_line!("isekai-ssh: {failure} — run `isekai-ssh init` to set up trust/credentials for this host.");
     } else if failure.may_retry() {
-        eprintln!("isekai-ssh: {failure} — this looks transient; retrying may help.");
+        log_line!("isekai-ssh: {failure} — this looks transient; retrying may help.");
     }
 }
 
@@ -705,7 +741,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         .filter_map(|entry| match entry.parse::<SocketAddr>() {
             Ok(addr) => Some(addr),
             Err(e) => {
-                eprintln!("isekai-ssh: ignoring malformed #@isekai stun entry {entry:?}: {e}");
+                log_line!("isekai-ssh: ignoring malformed #@isekai stun entry {entry:?}: {e}");
                 None
             }
         })
@@ -736,7 +772,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         },
     };
 
-    eprintln!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
+    log_line!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
     let report = backend
         .install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
         .await
@@ -770,14 +806,14 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         }
     };
 
-    eprintln!();
-    eprintln!("Host:            {}", candidate.target);
+    log_line!();
+    log_line!("Host:            {}", candidate.target);
     if let Some(relay_target) = &resolution.isekai.bootstrap_relay {
-        eprintln!("Relay:           {}", relay_target.relay_addr);
+        log_line!("Relay:           {}", relay_target.relay_addr);
     }
-    eprintln!("Helper identity: {identity}");
-    eprintln!("Binary sha256:   {helper_sha256}");
-    eprintln!();
+    log_line!("Helper identity: {identity}");
+    log_line!("Binary sha256:   {helper_sha256}");
+    log_line!();
 
     match confirmation {
         TofuConfirmation::AlwaysPrompt => {
@@ -798,7 +834,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             }
         }
         TofuConfirmation::Silent => {
-            eprintln!(
+            log_line!(
                 "isekai-ssh: refreshing trust for {:?} automatically (already trusted; cached session material \
                  just went stale) — no confirmation needed.",
                 resolution.isekai.profile
@@ -831,7 +867,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             anyhow::Error::new(e)
                 .context(BootstrapFailure::PersistenceFailed(format!("failed to write profile to {}", profiles_dir.display())))
         })?;
-    eprintln!("Registered {key:?} in {}", path.display());
+    log_line!("Registered {key:?} in {}", path.display());
     Ok(())
 }
 
@@ -922,6 +958,9 @@ fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
             }
             "--isekai-helper-release-tag" => {
                 isekai.helper_release_tag = Some(next_value(&mut iter, "--isekai-helper-release-tag")?);
+            }
+            "--isekai-log-file" => {
+                isekai.log_file = Some(PathBuf::from(next_value(&mut iter, "--isekai-log-file")?));
             }
             _ => ssh_args.push(arg),
         }
@@ -2116,6 +2155,15 @@ mod tests {
         .unwrap();
         assert_eq!(plan.isekai.helper_release_repo, "someone/fork");
         assert_eq!(plan.isekai.helper_release_tag, Some("v1.2.3".to_string()));
+    }
+
+    #[test]
+    fn log_file_defaults_to_none_and_parses_when_given() {
+        let plan = parse_wrapper(s(&["production"])).unwrap();
+        assert_eq!(plan.isekai.log_file, None);
+
+        let plan = parse_wrapper(s(&["--isekai-log-file", "/tmp/isekai-ssh.log", "production"])).unwrap();
+        assert_eq!(plan.isekai.log_file, Some(PathBuf::from("/tmp/isekai-ssh.log")));
     }
 
     #[test]

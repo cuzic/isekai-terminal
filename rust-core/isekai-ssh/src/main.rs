@@ -14,6 +14,7 @@ mod ctl_forward;
 mod doctor;
 mod helper_download;
 mod init;
+mod log_file;
 mod login;
 mod wrapper;
 
@@ -78,7 +79,11 @@ async fn run() -> u8 {
         match wrapper::run(raw_args).await {
             Ok(code) => code,
             Err(err) => {
-                eprintln!("{err:?}");
+                // `wrapper::run` already opened `--isekai-log-file` (if given)
+                // before this point could be reached on any path that also
+                // parsed it, so a top-level wrapper-mode failure is exactly
+                // the kind of message `log_file.rs` exists to capture too.
+                log_file::log_line!("{err:?}");
                 EXIT_OTHER_ERROR
             }
         }

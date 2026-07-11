@@ -73,6 +73,11 @@ WRAPPER-MODE FLAGS (day-to-day use only, not accepted by any subcommand below):
                                                  (default: cuzic/isekai-terminal)
     --isekai-helper-release-tag <TAG>           pin a specific release tag for the
                                                  above (default: latest)
+    --isekai-log-file <PATH>                    also append this invocation's
+                                                 diagnostic output (this process's
+                                                 own messages + ssh(1)/isekai-pipe
+                                                 connect's stderr) to PATH, in
+                                                 addition to the terminal
 
 Every ~/.ssh/config `#@isekai <directive> ...` line (profile/service/stun/relay/
 remote-log-level/bind-port-range/etc.) is documented in README.md's directive
