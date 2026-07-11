@@ -10,10 +10,12 @@ use tokio::sync::{Mutex, Notify};
 pub const CONTROL_HELLO: u8 = 0x10;
 pub const CONTROL_ACK: u8 = 0x11;
 pub const APP_ACK: u8 = 0x12;
-pub const RESUME: u8 = 0x03;
-pub const RESUME_ACK: u8 = 0x13;
-pub const REJECT_UNKNOWN_SESSION: u8 = 0xF9;
-pub const REJECT_OFFSET_GONE: u8 = 0xF8;
+// `RESUME`/`RESUME_ACK`/`REJECT_UNKNOWN_SESSION`/`REJECT_OFFSET_GONE` used
+// to live here as isekai's own hand-rolled resume frame markers — replaced
+// by `quicmux::resume`'s `FRAME_RESUME`/`FRAME_RESUME_ACK`/`ResumeRejectReason`
+// (quicmux-server-resume Stage B). `CONTROL_HELLO`/`CONTROL_ACK`/`APP_ACK`
+// remain: that control-stream sub-protocol is isekai's own and stays out of
+// `quicmux::resume`'s scope (see that module's docs).
 
 pub type SessionId = [u8; 16];
 

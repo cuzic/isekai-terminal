@@ -61,12 +61,9 @@ const DEFAULT_MAX_SESSIONS: usize = 16;
 const EXPORTER_LABEL: &[u8] = b"isekai-pipe-auth-v1";
 const ALPN: &[u8] = b"isekai-pipe/1";
 
-/// `RESUME`(reattach)の拒否応答専用。データストリームの初回attach
-/// (`ATTACH_HELLO`)はもう`isekai_protocol::attach`のreject語彙(#18)を使うため、
-/// ここに残るのは`resume`フレームファミリー(このファイル・`resume`submoduleが
-/// 直接扱う`RESUME`/`CONTROL_HELLO`等)専用の値だけ。
-const FRAME_REJECT_AUTH: u8 = 0xFF;
-/// 完全に未知のフレーム種別(ATTACH_HELLOでもRESUMEでもない)を読んだ場合専用。
+/// 完全に未知のフレーム種別(ATTACH_HELLOでもquicmux::FRAME_RESUMEでもない)
+/// を読んだ場合専用。RESUME固有の拒否応答は`quicmux::ResumeRejectReason`
+/// (quicmux-server-resume Stage B)に移った。
 const FRAME_REJECT_UNSUPPORTED: u8 = 0xFD;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -828,7 +825,10 @@ async fn handle_connection(
         let rest_len = match type_byte[0] {
             FRAME_ATTACH_HELLO => ATTACH_HELLO_FRAME_LEN - 1,
             FRAME_ATTACH_CANCEL => CANCEL_ATTACH_FRAME_LEN - 1,
-            resume::RESUME => 64, // session_id(16) + proof(32) + offset(8) + offset(8)
+            // quicmux::FRAME_RESUME(0x01)のボディは可変長(token/auth_blobが
+            // それぞれ長さ接頭辞つき)なので、ここでは読まない —
+            // handle_resume_streamがquicmux::decode_resume_request経由で
+            // 自分で読む。
             _ => 0,
         };
         let mut rest = vec![0u8; rest_len];
@@ -861,8 +861,8 @@ async fn handle_connection(
             )
             .await
         }
-        resume::RESUME => {
-            handle_resume_stream(conn, send, recv, &rest, target, session_secret, attach_runtime, sessions).await
+        quicmux::FRAME_RESUME => {
+            handle_resume_stream(conn, send, recv, target, session_secret, attach_runtime, sessions).await
         }
         FRAME_ATTACH_CANCEL => {
             let mut cancel_bytes = [0u8; CANCEL_ATTACH_FRAME_LEN];
@@ -1056,26 +1056,27 @@ async fn handle_attach_stream(
     Ok(())
 }
 
-/// Phase 8-3: `RESUME` フレームを検証し、既存セッションに park された TCP
-/// 接続を取り戻して中継を再開する。`body` は type byte を除いた 64 byte
-/// （session_id(16) + proof(32) + client_sent_offset(8) + client_delivered_offset(8)）。
-#[allow(clippy::too_many_arguments)]
+/// Phase 8-3 / quicmux-server-resume Stage B: `quicmux::resume`のRESUMEフレーム
+/// (frame typeバイトは呼び出し元`handle_connection`が既に読み取り済み)を
+/// 検証し、既存セッションに park された TCP 接続を取り戻して中継を再開する。
+/// `token`=session_id・`auth_blob`=resume proof はquicmuxにとって完全に
+/// opaqueなbytesなので、その意味付け(HMAC検証・SessionTable/AttachRuntime
+/// との突き合わせ)はすべてこの関数(呼び出し側)の責務になる —
+/// `quicmux::resume`モジュールdocsの「ResumeAcceptorが担う一点」そのもの
+/// (ただしここでは`dyn ResumeAcceptor`を経由せず、`decode_resume_request`/
+/// `respond_resume_*`を直接呼んでいる。理由: `handle_connection`は既に
+/// ATTACH_HELLO/CancelAttachと同じ一本のstreamの先頭1byteで種別分岐して
+/// いるため、`accept_resume`のように新規`accept_bi()`を自前で行う版は
+/// 使えない)。
 async fn handle_resume_stream(
     conn: AnyMuxConnection,
     mut send: AnyByteStreamWriteHalf,
     mut recv: AnyByteStreamReadHalf,
-    body: &[u8],
     target: SocketAddr,
     session_secret: [u8; 32],
     attach_runtime: Arc<AttachRuntime>,
     sessions: SessionTable,
 ) -> Result<()> {
-    let mut session_id = [0u8; 16];
-    session_id.copy_from_slice(&body[0..16]);
-    let client_proof = &body[16..48];
-    let client_sent_offset = u64::from_be_bytes(body[48..56].try_into().unwrap());
-    let client_delivered_offset = u64::from_be_bytes(body[56..64].try_into().unwrap());
-
     // resume_proof = HMAC(session_secret, exporter(新connection) || session_id)
     // （HELPER_PROTOCOL.md §7.3。session_id を混ぜることで、同じ session_secret を
     // 使い回す複数セッションが互いの resume トークンを流用できないようにする）。
@@ -1083,17 +1084,25 @@ async fn handle_resume_stream(
         .export_keying_material(EXPORTER_LABEL, b"")
         .await
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
+    let request = quicmux::decode_resume_request(&mut recv, exporter).await.context("failed to decode RESUME frame")?;
+
+    let session_id: [u8; 16] = request.token.as_slice().try_into().map_err(|_| {
+        anyhow!("resume token has unexpected length {} (expected 16)", request.token.len())
+    })?;
+    // quicmuxはauth_blobの中身を一切解釈しない — このHMAC検証はisekai-pipe
+    // 独自のポリシーとしてここで行う(`quicmux::resume`モジュールdocs参照)。
     let mut mac = HmacSha256::new_from_slice(&session_secret).expect("HMAC accepts any key length");
     mac.update(&exporter);
     mac.update(&session_id);
     let expected = mac.finalize().into_bytes();
-    if client_proof.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
-        reject(&mut send, &[FRAME_REJECT_AUTH]).await;
+    if request.auth_blob.ct_eq(expected.as_slice()).unwrap_u8() != 1 {
+        quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::Auth).await;
         return Err(anyhow!("resume proof mismatch, rejecting"));
     }
+    let client_delivered_offset = request.client_delivered_offset;
 
     let Some(handle) = sessions.get(&session_id).await else {
-        reject(&mut send, &[resume::REJECT_UNKNOWN_SESSION]).await;
+        quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::UnknownToken).await;
         return Err(anyhow!(
             "unknown session_id for resume: {}",
             hex_lower(&session_id)
@@ -1106,7 +1115,7 @@ async fn handle_resume_stream(
         session.parked_tcp.take()
     };
     let Some((tcp_read, tcp_write)) = parked else {
-        reject(&mut send, &[resume::REJECT_UNKNOWN_SESSION]).await;
+        quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::UnknownToken).await;
         return Err(anyhow!(
             "session {} not resumable (no parked TCP connection)",
             hex_lower(&session_id)
@@ -1120,7 +1129,7 @@ async fn handle_resume_stream(
     let Some(lease) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(session_id)).await
     else {
         repark(&handle, tcp_read, tcp_write).await;
-        reject(&mut send, &[resume::REJECT_UNKNOWN_SESSION]).await;
+        quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::UnknownToken).await;
         return Err(anyhow!("no established attach slot for session {}", hex_lower(&session_id)));
     };
 
@@ -1135,7 +1144,7 @@ async fn handle_resume_stream(
     };
     let Some(replay_bytes) = replay_bytes else {
         repark(&handle, tcp_read, tcp_write).await;
-        reject(&mut send, &[resume::REJECT_OFFSET_GONE]).await;
+        quicmux::respond_resume_rejected(&mut send, quicmux::ResumeRejectReason::OffsetGone).await;
         return Err(anyhow!(
             "requested offset {client_delivered_offset} no longer in output buffer for session {}",
             hex_lower(&session_id)
@@ -1143,25 +1152,16 @@ async fn handle_resume_stream(
     };
 
     log::info!(
-        "resume: session_id={} client_sent_offset={client_sent_offset} client_delivered_offset={client_delivered_offset} \
+        "resume: session_id={} client_sent_offset={} client_delivered_offset={client_delivered_offset} \
          helper_committed_offset={helper_committed_offset} replaying {} bytes",
         hex_lower(&session_id),
+        request.client_sent_offset,
         replay_bytes.len()
     );
 
-    let mut ack = Vec::with_capacity(17);
-    ack.push(resume::RESUME_ACK);
-    ack.extend_from_slice(&helper_committed_offset.to_be_bytes());
-    ack.extend_from_slice(&helper_sent_offset.to_be_bytes());
-    if let Err(e) = send.write_all(&ack).await {
+    if let Err(e) = quicmux::respond_resume_accepted(&mut send, helper_committed_offset, helper_sent_offset, &replay_bytes).await {
         repark(&handle, tcp_read, tcp_write).await;
         return Err(anyhow!("failed to write RESUME_ACK: {e}"));
-    }
-    if !replay_bytes.is_empty() {
-        if let Err(e) = send.write_all(&replay_bytes).await {
-            repark(&handle, tcp_read, tcp_write).await;
-            return Err(anyhow!("failed to replay buffered output: {e}"));
-        }
     }
 
     // control stream も新しい connection 上で作り直す（元の control stream は
