@@ -240,6 +240,7 @@ fn dummy_relay_spec() -> RelayLaunchSpec {
         relay_jwt: "test-jwt-token".to_string(),
         relay_transport: isekai_bootstrap::RelayTransportKind::Udp,
         idle_lifetime_secs: 2_592_000,
+        remote_log_level: "info".to_string(),
     }
 }
 
@@ -358,6 +359,7 @@ async fn install_and_start_passes_idle_lifetime_to_the_launched_helper() {
         relay_jwt: "test-jwt-token".to_string(),
         relay_transport: isekai_bootstrap::RelayTransportKind::Udp,
         idle_lifetime_secs: 2_592_000,
+        remote_log_level: "info".to_string(),
     };
 
     tokio::time::timeout(
@@ -412,6 +414,7 @@ async fn install_and_start_relay_transport_qmux_adds_the_flag() {
         relay_jwt: "test-jwt-token".to_string(),
         relay_transport: isekai_bootstrap::RelayTransportKind::Qmux,
         idle_lifetime_secs: 2_592_000,
+        remote_log_level: "info".to_string(),
     };
 
     tokio::time::timeout(
@@ -460,7 +463,7 @@ async fn install_and_start_direct_never_passes_relay_args() {
             &target,
             &[],
             fake_helper_script.as_bytes(),
-            &LaunchSpec::Direct { idle_lifetime_secs: 86_400 },
+            &LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), bind_port_range: None },
             None,
             &[],
         ),
@@ -513,7 +516,7 @@ async fn install_and_start_uses_custom_remote_binary_path() {
             &target,
             &[],
             fake_helper_script.as_bytes(),
-            &LaunchSpec::Direct { idle_lifetime_secs: 86_400 },
+            &LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), bind_port_range: None },
             Some(custom_path),
             &[],
         ),
@@ -718,7 +721,7 @@ async fn install_and_start_delivers_real_stun_candidates_when_stun_servers_are_c
             &target,
             &[],
             fake_helper_script.as_bytes(),
-            &LaunchSpec::Direct { idle_lifetime_secs: 86_400 },
+            &LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), bind_port_range: None },
             None,
             &[stun_server],
         ),

@@ -126,6 +126,25 @@ pub fn validate_remote_path(path: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// Validates a `--log-level` value for the deployed `isekai-pipe serve`
+/// against `isekai-pipe`'s own accepted set, before it is interpolated into
+/// a remote bootstrap shell command string (same defense-in-depth rationale
+/// as `validate_relay_sni`/`validate_remote_path` — this value comes from
+/// the user's own `ssh_config` via `#@isekai remote-log-level`, but a
+/// corrupted or attacker-controlled config file must not be able to smuggle
+/// shell metacharacters into the remote command). An exact allow-list
+/// (rather than a charset check) is used because the accepted values are a
+/// small fixed set, not free text.
+pub fn validate_log_level(level: &str) -> Result<&str, ProtocolError> {
+    match level {
+        "error" | "warn" | "info" | "debug" | "trace" => Ok(level),
+        other => Err(ProtocolError::InvalidBootstrapArg {
+            field: "remote_log_level",
+            reason: format!("{other:?} is not one of error|warn|info|debug|trace"),
+        }),
+    }
+}
+
 /// The directory `mkdir -p` should create for `path` (a full remote binary
 /// path, e.g. `~/.local/bin/isekai-pipe` -> `~/.local/bin`). Falls back to
 /// `.` for a bare filename with no directory component (harmless: `mkdir -p

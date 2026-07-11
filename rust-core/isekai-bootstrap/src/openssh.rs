@@ -68,7 +68,8 @@ use crate::types::{BootstrapReport, HostSpec, JumpSpec, LaunchSpec};
 // just mirrored ones — security review #57/#58 applies to both call sites
 // identically).
 use isekai_protocol::bootstrap::{
-    remote_parent_dir, shell_single_quote, upload_binary_command, validate_relay_jwt, validate_relay_sni,
+    remote_parent_dir, shell_single_quote, upload_binary_command, validate_log_level, validate_relay_jwt,
+    validate_relay_sni,
     validate_remote_path, HANDSHAKE_POLL_ATTEMPTS, HANDSHAKE_POLL_INTERVAL_MS, ISEKAI_PIPE_BIN_NAME,
     ISEKAI_PIPE_INSTALL_DIR,
 };
@@ -283,6 +284,8 @@ impl OpenSshBackend {
                     .map_err(|e| BootstrapError::InvalidRelayParam(e.to_string()))?;
                 validate_relay_jwt(&relay.relay_jwt)
                     .map_err(|e| BootstrapError::InvalidRelayParam(e.to_string()))?;
+                let remote_log_level = validate_log_level(&relay.remote_log_level)
+                    .map_err(|e| BootstrapError::InvalidRemoteLogLevel(e.to_string()))?;
 
                 let relay_addr = relay.relay_addr;
                 let quoted_sni = shell_single_quote(&relay.relay_sni);
@@ -335,7 +338,7 @@ impl OpenSshBackend {
                      ( setsid {remote_binary_path} serve --target 127.0.0.1:22 \
                      --relay {relay_addr} --relay-sni {quoted_sni} --relay-jwt-file $tmpdir/relay_jwt \
                      --bootstrap-request-file $tmpdir/bootstrap-request.json{relay_transport_arg} \
-                     --max-idle-lifetime {idle_lifetime_secs} --log-level debug \
+                     --max-idle-lifetime {idle_lifetime_secs} --log-level {remote_log_level} \
                      </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
                      for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
                        [ -s $tmpdir/handshake ] && break; \
@@ -351,15 +354,21 @@ impl OpenSshBackend {
             // (`direct-by-bootstrap-host`, `archive/HELPER_PROTOCOL.md` §2).
             // Only the (non-secret-carrying) `BootstrapRequestV2` travels over
             // stdin here — nothing else to deliver out of band.
-            LaunchSpec::Direct { idle_lifetime_secs } => {
+            LaunchSpec::Direct { idle_lifetime_secs, remote_log_level, bind_port_range } => {
+                let remote_log_level = validate_log_level(remote_log_level)
+                    .map_err(|e| BootstrapError::InvalidRemoteLogLevel(e.to_string()))?;
+                let bind_port_range_arg = match bind_port_range {
+                    Some((start, end)) => format!(" --bind-port-range {start}-{end}"),
+                    None => String::new(),
+                };
                 let request_len = request_bytes.len();
                 let cmd = format!(
                     "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
                      head -c {request_len} > $tmpdir/bootstrap-request.json && \
                      [ \"$(wc -c < $tmpdir/bootstrap-request.json)\" -eq {request_len} ] && \
                      ( setsid {remote_binary_path} serve --target 127.0.0.1:22 \
-                     --bind 0.0.0.0:0 --bootstrap-request-file $tmpdir/bootstrap-request.json{stun_server_arg} \
-                     --max-idle-lifetime {idle_lifetime_secs} --log-level debug \
+                     --bind 0.0.0.0:0 --bootstrap-request-file $tmpdir/bootstrap-request.json{stun_server_arg}{bind_port_range_arg} \
+                     --max-idle-lifetime {idle_lifetime_secs} --log-level {remote_log_level} \
                      </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
                      for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
                        [ -s $tmpdir/handshake ] && break; \

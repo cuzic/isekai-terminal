@@ -53,6 +53,12 @@ pub enum BootstrapError {
     #[error("invalid remote path: {0}")]
     InvalidRemotePath(String),
 
+    /// A caller-supplied remote log level (`#@isekai remote-log-level`)
+    /// failed `isekai_protocol::bootstrap::validate_log_level`'s allow-list
+    /// check. Same defense-in-depth rationale as `InvalidRelayParam`.
+    #[error("invalid remote log level: {0}")]
+    InvalidRemoteLogLevel(String),
+
     /// A supporting one-off remote command (currently only `uname -m`, for
     /// [`crate::openssh::OpenSshBackend::detect_remote_arch`]) exited
     /// non-zero — distinct from [`Self::UploadFailed`]/[`Self::HandshakeMissing`],
