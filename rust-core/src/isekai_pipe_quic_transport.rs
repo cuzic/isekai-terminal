@@ -442,7 +442,7 @@ async fn connect_isekai_pipe_quic_stream(
         cert_sha256_hex,
         session_secret,
     };
-    let factory = crate::android_quic_endpoint::AndroidQuicEndpointFactory;
+    let factory = crate::android_quic_endpoint::factory();
     let (conn, data_stream, proof) = isekai_transport::connect_via_relay_with_connection(&factory, &target)
         .await
         .map_err(|e| e.to_string())?;
@@ -467,7 +467,7 @@ async fn connect_isekai_pipe_quic_stream(
         RUNTIME.spawn(async move {
             match tokio::time::timeout(
                 CONTROL_STREAM_TIMEOUT,
-                isekai_transport::resume::open_control_stream(conn.as_ref(), &proof),
+                isekai_transport::resume::open_control_stream(&conn, &proof),
             )
             .await
             {
@@ -494,8 +494,8 @@ async fn connect_isekai_pipe_quic_stream(
 
     // Phase 8-3: QUIC connection が失われても RESUME で reattach する
     // クロージャ。`target`を捕捉する。
-    let reattach_fn: resume_client::ReattachFn = Arc::new(move |session_id, client_sent_offset, client_delivered_offset| {
-        let factory = crate::android_quic_endpoint::AndroidQuicEndpointFactory;
+    let reattach_fn: resume_client::ReattachFn<quicmux::AnyByteStreamReadHalf, quicmux::AnyByteStreamWriteHalf> = Arc::new(move |session_id, client_sent_offset, client_delivered_offset| {
+        let factory = crate::android_quic_endpoint::factory();
         let target = target.clone();
         Box::pin(async move {
             let outcome = isekai_transport::resume::reconnect_and_resume(

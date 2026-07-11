@@ -9,8 +9,8 @@
 //!
 //! Phase 1d(isekai-terminal-core/isekai-transport crate共有化):
 //! `ReattachableStream`は生の`noq::SendStream`/`RecvStream`ではなく
-//! `isekai_transport::traits::{ByteStreamReadHalf, ByteStreamWriteHalf}`の上に
-//! 実装されている。async-trait由来の`async fn`ベースのtraitは、poll方式の
+//! `quicmux::{AnyByteStreamReadHalf, AnyByteStreamWriteHalf}`の上に
+//! 実装されている。これらの`async fn`ベースのメソッドは、poll方式の
 //! `AsyncRead`/`AsyncWrite`へ1回のpollごとに橋渡しするのが難しい
 //! （呼び出し元が渡す`buf`の生存期間がpollごとに変わるため、future自体を
 //! poll間で保持できない）。そのため`tokio::io::duplex`を挟んだ
@@ -26,7 +26,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use isekai_transport::traits::{ByteStreamReadHalf, ByteStreamWriteHalf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub(crate) type SessionId = [u8; 16];
@@ -175,10 +174,42 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ResumeAwareStream<S> {
 
 // ── Phase 8-3 / Phase 1d: reattach 対応ストリーム ──────────────────────
 
+/// このモジュールのpump/reattachロジックが必要とする最小限の非同期read/write
+/// インタフェース — 具体型に対して実装する(`dyn`化しない)ことで、本番の
+/// `quicmux::{AnyByteStreamReadHalf, AnyByteStreamWriteHalf}`とこのモジュール
+/// 専用のtest mockの両方が同じジェネリック関数群(`ReattachableStream::new`/
+/// `run_pump`/`attempt_reattach`等)を満たせるようにする。`quicmux::AnyByteStream`
+/// 系のenumはbackendの種類分しかvariantを持たない設計(そのドキュメント参照)
+/// なので、test mock用の3番目のvariantを増やす余地は無い — そのためこの
+/// モジュール独自の最小限のシームが必要。
+pub(crate) trait ByteHalfRead: Send {
+    fn read(&mut self, buf: &mut [u8]) -> impl std::future::Future<Output = Result<usize, String>> + Send;
+}
+
+pub(crate) trait ByteHalfWrite: Send {
+    fn write_all(&mut self, buf: &[u8]) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    fn shutdown(&mut self) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+impl ByteHalfRead for quicmux::AnyByteStreamReadHalf {
+    fn read(&mut self, buf: &mut [u8]) -> impl std::future::Future<Output = Result<usize, String>> + Send {
+        async move { quicmux::AnyByteStreamReadHalf::read(self, buf).await.map_err(|e| e.to_string()) }
+    }
+}
+
+impl ByteHalfWrite for quicmux::AnyByteStreamWriteHalf {
+    fn write_all(&mut self, buf: &[u8]) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async move { quicmux::AnyByteStreamWriteHalf::write_all(self, buf).await.map_err(|e| e.to_string()) }
+    }
+    fn shutdown(&mut self) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async move { quicmux::AnyByteStreamWriteHalf::shutdown(self).await.map_err(|e| e.to_string()) }
+    }
+}
+
 /// reattach（新しい QUIC connection への `RESUME` 送信）が成功した結果。
-pub(crate) struct ReattachResult {
-    pub(crate) read: Box<dyn ByteStreamReadHalf>,
-    pub(crate) write: Box<dyn ByteStreamWriteHalf>,
+pub(crate) struct ReattachResult<R, W> {
+    pub(crate) read: R,
+    pub(crate) write: W,
     /// helper が確認した C→S オフセット。これより前の replay_buffer は破棄してよい。
     pub(crate) helper_committed_offset: u64,
 }
@@ -186,8 +217,8 @@ pub(crate) struct ReattachResult {
 /// 1回の reattach 試行を行う関数の型。呼び出し元（`isekai_pipe_quic_transport.rs`等）が
 /// noq/rustls の具体的な接続手順を実装し、`ReattachableStream` はこれを
 /// 抽象的に呼び出すだけにする（層を分離する）。
-pub(crate) type ReattachFn = Arc<
-    dyn Fn(SessionId, u64, u64) -> Pin<Box<dyn std::future::Future<Output = Result<ReattachResult, String>> + Send>>
+pub(crate) type ReattachFn<R, W> = Arc<
+    dyn Fn(SessionId, u64, u64) -> Pin<Box<dyn std::future::Future<Output = Result<ReattachResult<R, W>, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -225,11 +256,17 @@ pub(crate) struct ReattachableStream {
 }
 
 impl ReattachableStream {
-    pub(crate) fn new(
-        read: Box<dyn ByteStreamReadHalf>,
-        write: Box<dyn ByteStreamWriteHalf>,
+    /// `R`/`W` はcallerが持つ具体的な read/write half の型(本番では
+    /// `quicmux::{AnyByteStreamReadHalf, AnyByteStreamWriteHalf}`)から型推論
+    /// されるので、呼び出し側で明示的に書く必要はない — `ReattachableStream`
+    /// 自身は非ジェネリックのまま(`R`/`W`は`run_pump`へspawnした時点で型消去
+    /// される)なので、この関数の戻り値型は3つの呼び出し元ファイル全てで
+    /// 共通の`resume_client::ReattachableStream`のまま変わらない。
+    pub(crate) fn new<R: ByteHalfRead + 'static, W: ByteHalfWrite + 'static>(
+        read: R,
+        write: W,
         resume_state: Arc<Mutex<ClientResumeState>>,
-        reattach_fn: ReattachFn,
+        reattach_fn: ReattachFn<R, W>,
     ) -> Self {
         let (caller_side, pump_side) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
         let terminal_error = Arc::new(Mutex::new(None));
@@ -293,7 +330,7 @@ enum PumpEvent {
 
 async fn next_pump_event(
     pump_read: &mut (impl AsyncRead + Unpin),
-    read: &mut dyn ByteStreamReadHalf,
+    read: &mut impl ByteHalfRead,
     send_buf: &mut [u8],
     recv_buf: &mut [u8],
     helper_read_done: bool,
@@ -321,10 +358,10 @@ async fn next_pump_event(
 /// 再送自体が失敗した場合もreattach全体の失敗として扱い、同じ試行回数の
 /// 予算内で`reattach_fn`をもう一度呼び直す(旧pollベース実装の
 /// `trigger_reattach`と同じ「reattach+replayを1回の試行として数える」設計)。
-async fn attempt_reattach(
+async fn attempt_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
     resume_state: &Arc<Mutex<ClientResumeState>>,
-    reattach_fn: &ReattachFn,
-) -> Result<(Box<dyn ByteStreamReadHalf>, Box<dyn ByteStreamWriteHalf>), String> {
+    reattach_fn: &ReattachFn<R, W>,
+) -> Result<(R, W), String> {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -375,12 +412,12 @@ async fn attempt_reattach(
 /// `attempt_reattach`を挟みながらリトライする — トップレベルの`write.write_all`
 /// が1回失敗しただけで即座にreattachへ移る(壊れたかもしれない同じ接続への
 /// 無条件リトライはしない、旧pollベース実装と同じ判断)。
-async fn write_with_reattach(
+async fn write_with_reattach<R: ByteHalfRead, W: ByteHalfWrite>(
     chunk: Vec<u8>,
-    read: &mut Box<dyn ByteStreamReadHalf>,
-    write: &mut Box<dyn ByteStreamWriteHalf>,
+    read: &mut R,
+    write: &mut W,
     resume_state: &Arc<Mutex<ClientResumeState>>,
-    reattach_fn: &ReattachFn,
+    reattach_fn: &ReattachFn<R, W>,
     helper_read_done: &mut bool,
 ) -> Result<(), String> {
     loop {
@@ -406,12 +443,12 @@ async fn write_with_reattach(
 /// 片方向が失敗したら`attempt_reattach`でreattachしてから転送を再開する。
 /// 両方向を同じタスク内の`tokio::select!`で扱うことで、reattachの起動が
 /// 自然に直列化される(2つのreattachが同時に走ることはない)。
-async fn run_pump(
+async fn run_pump<R: ByteHalfRead, W: ByteHalfWrite>(
     pump_side: tokio::io::DuplexStream,
-    mut read: Box<dyn ByteStreamReadHalf>,
-    mut write: Box<dyn ByteStreamWriteHalf>,
+    mut read: R,
+    mut write: W,
     resume_state: Arc<Mutex<ClientResumeState>>,
-    reattach_fn: ReattachFn,
+    reattach_fn: ReattachFn<R, W>,
     terminal_error: Arc<Mutex<Option<String>>>,
 ) {
     let (mut pump_read, mut pump_write) = tokio::io::split(pump_side);
@@ -420,7 +457,7 @@ async fn run_pump(
     let mut helper_read_done = false;
 
     loop {
-        match next_pump_event(&mut pump_read, read.as_mut(), &mut send_buf, &mut recv_buf, helper_read_done).await {
+        match next_pump_event(&mut pump_read, &mut read, &mut send_buf, &mut recv_buf, helper_read_done).await {
             PumpEvent::FromCaller(chunk) => {
                 if let Err(final_err) =
                     write_with_reattach(chunk, &mut read, &mut write, &resume_state, &reattach_fn, &mut helper_read_done)
@@ -466,8 +503,6 @@ async fn run_pump(
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use async_trait::async_trait;
-    use isekai_transport::error::TransportError;
     use tokio::sync::mpsc;
 
     use super::*;
@@ -537,16 +572,15 @@ mod tests {
         rx: mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
     }
 
-    #[async_trait]
-    impl ByteStreamReadHalf for MockReadHalf {
-        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+    impl ByteHalfRead for MockReadHalf {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, String> {
             match self.rx.recv().await {
                 Some(Ok(bytes)) => {
                     let n = bytes.len().min(buf.len());
                     buf[..n].copy_from_slice(&bytes[..n]);
                     Ok(n)
                 }
-                Some(Err(msg)) => Err(TransportError::StreamIo(msg)),
+                Some(Err(msg)) => Err(msg),
                 None => Ok(0), // channel closed -> EOF
             }
         }
@@ -557,17 +591,16 @@ mod tests {
         fail_write_once: Arc<AtomicBool>,
     }
 
-    #[async_trait]
-    impl ByteStreamWriteHalf for MockWriteHalf {
-        async fn write_all(&mut self, buf: &[u8]) -> Result<(), TransportError> {
+    impl ByteHalfWrite for MockWriteHalf {
+        async fn write_all(&mut self, buf: &[u8]) -> Result<(), String> {
             if self.fail_write_once.swap(false, Ordering::SeqCst) {
-                return Err(TransportError::StreamIo("mock write failure".to_string()));
+                return Err("mock write failure".to_string());
             }
             let _ = self.tx.send(buf.to_vec());
             Ok(())
         }
 
-        async fn shutdown(&mut self) -> Result<(), TransportError> {
+        async fn shutdown(&mut self) -> Result<(), String> {
             Ok(())
         }
     }
@@ -577,8 +610,8 @@ mod tests {
     /// 1回だけ失敗させるフラグ) を組で作る。
     #[allow(clippy::type_complexity)]
     fn mock_pair() -> (
-        Box<dyn ByteStreamReadHalf>,
-        Box<dyn ByteStreamWriteHalf>,
+        MockReadHalf,
+        MockWriteHalf,
         mpsc::UnboundedReceiver<Vec<u8>>,
         mpsc::UnboundedSender<Result<Vec<u8>, String>>,
         Arc<AtomicBool>,
@@ -586,9 +619,8 @@ mod tests {
         let (read_tx, read_rx) = mpsc::unbounded_channel::<Result<Vec<u8>, String>>();
         let (write_tx, write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let fail_write_once = Arc::new(AtomicBool::new(false));
-        let read: Box<dyn ByteStreamReadHalf> = Box::new(MockReadHalf { rx: read_rx });
-        let write: Box<dyn ByteStreamWriteHalf> =
-            Box::new(MockWriteHalf { tx: write_tx, fail_write_once: fail_write_once.clone() });
+        let read = MockReadHalf { rx: read_rx };
+        let write = MockWriteHalf { tx: write_tx, fail_write_once: fail_write_once.clone() };
         (read, write, write_rx, read_tx, fail_write_once)
     }
 
@@ -604,8 +636,10 @@ mod tests {
     async fn pass_through_read_and_write_both_directions() {
         let (read, write, mut helper_write_rx, helper_read_tx, _fail) = mock_pair();
         let resume_state = resume_state_with_session();
-        let reattach_fn: ReattachFn = Arc::new(|_id, _sent, _delivered| {
-            Box::pin(async { Err::<ReattachResult, String>("reattach should not be called in this test".to_string()) })
+        let reattach_fn: ReattachFn<MockReadHalf, MockWriteHalf> = Arc::new(|_id, _sent, _delivered| {
+            Box::pin(async {
+                Err::<ReattachResult<MockReadHalf, MockWriteHalf>, String>("reattach should not be called in this test".to_string())
+            })
         });
         let mut stream = ReattachableStream::new(read, write, resume_state.clone(), reattach_fn);
 
@@ -632,7 +666,7 @@ mod tests {
         let reattach_calls_for_closure = reattach_calls.clone();
         let read2 = Arc::new(Mutex::new(Some(read2)));
         let write2 = Arc::new(Mutex::new(Some(write2)));
-        let reattach_fn: ReattachFn = Arc::new(move |_id, _sent, _delivered| {
+        let reattach_fn: ReattachFn<MockReadHalf, MockWriteHalf> = Arc::new(move |_id, _sent, _delivered| {
             reattach_calls_for_closure.fetch_add(1, Ordering::SeqCst);
             let read2 = read2.clone();
             let write2 = write2.clone();
@@ -664,7 +698,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reattach_gives_up_after_max_retries_and_surfaces_error() {
         let (read, write, _write_rx, read_tx, _fail) = mock_pair();
-        let reattach_fn: ReattachFn =
+        let reattach_fn: ReattachFn<MockReadHalf, MockWriteHalf> =
             Arc::new(|_id, _sent, _delivered| Box::pin(async { Err("mock: helper unreachable".to_string()) }));
         let resume_state = resume_state_with_session();
         let mut stream = ReattachableStream::new(read, write, resume_state, reattach_fn);

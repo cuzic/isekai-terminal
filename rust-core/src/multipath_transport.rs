@@ -42,7 +42,7 @@ use crate::session::SessionCore;
 use base64::Engine as _;
 use isekai_transport::multipath::{connect_multipath_with_socket, MultipathConnection};
 use isekai_transport::path_health::{self, PathHealthEvent, PathHealthTracker, PathLabel, PathState};
-use isekai_transport::types::RemoteSpec;
+use isekai_transport::RemoteSpec;
 use russh::client;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -418,7 +418,7 @@ fn udp_socket_from_raw_fd(fd: RawFd) -> Result<Arc<tokio::net::UdpSocket>, Strin
 //
 // クライアント設定の構築(証明書pin・TLS/transportチューニング)は
 // `isekai_transport::multipath::connect_multipath_with_socket`が内部で
-// `isekai_transport::system::client_config_for(cert_sha256_hex, true)`を使って
+// `quicmux::noq_client_config(cert_sha256_hex, &isekai_transport::system::isekai_mux_config(true))`を使って
 // 行うようになったため、ここにあった`build_pinned_client_config`は削除した
 // (isekai-terminal-core/isekai-transport crate共有化)。
 // 挙動差(旧: max_concurrent_bidi_streams=2・max_idle_timeout無し / 新:

@@ -324,7 +324,7 @@ async fn connect_stun_p2p_stream(
         cert_sha256_hex,
         session_secret,
     };
-    let factory = crate::android_quic_endpoint::AndroidQuicEndpointFactory;
+    let factory = crate::android_quic_endpoint::factory();
     let identity =
         isekai_transport::CandidateIdentity { kind: "stun-p2p", source: "n/a", provider: "n/a", id: "isekai_stun_p2p" };
     let (conn, data_stream, proof) =
@@ -342,7 +342,7 @@ async fn connect_stun_p2p_stream(
         RUNTIME.spawn(async move {
             match tokio::time::timeout(
                 CONTROL_STREAM_TIMEOUT,
-                isekai_transport::resume::open_control_stream(conn.as_ref(), &proof),
+                isekai_transport::resume::open_control_stream(&conn, &proof),
             )
             .await
             {
@@ -376,14 +376,14 @@ async fn connect_stun_p2p_stream(
     // トレードオフ(PLAN.md Phase 10参照)。isekai-transportのSTUN P2Pにはresume概念自体が
     // 無いため(stun_p2p.rsのモジュールdoc参照)、reattachは`RelayTarget{helper_addr:
     // peer_addr, ..}`とみなしてreconnect_and_resume(直接dial+RESUME)を呼ぶだけにする。
-    let reattach_fn: resume_client::ReattachFn = Arc::new(move |session_id, client_sent_offset, client_delivered_offset| {
+    let reattach_fn: resume_client::ReattachFn<quicmux::AnyByteStreamReadHalf, quicmux::AnyByteStreamWriteHalf> = Arc::new(move |session_id, client_sent_offset, client_delivered_offset| {
         let target = isekai_transport::RelayTarget {
             helper_addr: peer_addr,
             server_name: target.server_name.clone(),
             cert_sha256_hex: target.cert_sha256_hex.clone(),
             session_secret: target.session_secret.clone(),
         };
-        let factory = crate::android_quic_endpoint::AndroidQuicEndpointFactory;
+        let factory = crate::android_quic_endpoint::factory();
         Box::pin(async move {
             let outcome = isekai_transport::resume::reconnect_and_resume(
                 &factory,
