@@ -1,6 +1,5 @@
 mod attach_arbiter;
 mod attach_runtime;
-mod plain_socket;
 mod resume;
 
 use std::io::Write as _;
@@ -18,7 +17,7 @@ use isekai_protocol::attach::{
     ATTACH_ACTIVATE_FRAME_LEN, ATTACH_HELLO_FRAME_LEN, CANCEL_ATTACH_FRAME_LEN, FRAME_ATTACH_CANCEL,
     FRAME_ATTACH_HELLO,
 };
-use noq::crypto::rustls::QuicServerConfig;
+use quicmux::{AnyByteStreamReadHalf, AnyByteStreamWriteHalf, AnyMuxConnection, AnyMuxListener, MuxServerConfig};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use resume::{Session, SessionTable};
 use sha2::{Digest, Sha256};
@@ -26,6 +25,24 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
+
+/// `AnyByteStreamReadHalf::read`'s guarantee ("at most `buf.len()`,
+/// possibly fewer, `0` on EOF") is weaker than this file's fixed-size frame
+/// decoding needs — mirrors `isekai-transport::relay`'s private `read_exact`
+/// helper (same project convention: `tests/*_e2e.rs`/crate-internal I/O
+/// helpers are deliberately duplicated per crate rather than shared, see
+/// that crate's module docs).
+async fn read_exact(recv: &mut AnyByteStreamReadHalf, buf: &mut [u8]) -> Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = recv.read(&mut buf[filled..]).await.context("stream read failed")?;
+        if n == 0 {
+            return Err(anyhow!("stream ended before {} bytes were read (got {filled})", buf.len()));
+        }
+        filled += n;
+    }
+    Ok(())
+}
 
 // isekai-helper: 認証付き QUIC↔TCP リレー。
 // 契約の詳細は /HELPER_PROTOCOL.md、ATTACH v2 の fencing 部分は `#18`
@@ -492,37 +509,27 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
     let key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
         .map_err(|e| anyhow!("failed to build private key: {e}"))?;
 
-    let mut server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)?;
-    server_crypto.alpn_protocols = vec![ALPN.to_vec()];
-    // 0-RTT / early data はクライアント・サーバー双方で無効化する契約（HELPER_PROTOCOL.md 参照）。
-    // rustls は max_early_data_size を明示的に増やさない限り 0-RTT を送出しないが、契約として明示する。
-    server_crypto.max_early_data_size = 0;
-
-    let idle_timeout_cfg = noq::IdleTimeout::try_from(Duration::from_secs(args.idle_timeout))
-        .map_err(|_| anyhow!("invalid --idle-timeout"))?;
-    let keep_alive = Duration::from_secs((args.idle_timeout / 3).max(1));
-
-    let mut transport = noq::TransportConfig::default();
-    transport.max_idle_timeout(Some(idle_timeout_cfg));
-    transport.keep_alive_interval(Some(keep_alive));
     // data stream（Phase 7）+ control stream（Phase 8、resume 用）の 2 本を許可する
     // （HELPER_PROTOCOL.md §7.1）。3 本目以降は Phase 7 と同様 reset される。
-    transport.max_concurrent_bidi_streams(noq::VarInt::from_u32(2));
-    transport.max_concurrent_uni_streams(noq::VarInt::from_u32(0));
-    transport.datagram_receive_buffer_size(None);
     // Phase 9-1: multipath 対応。既存 quinn クライアント（Phase 7/8）は
     // open_path() を呼ばないため path0 のみで従来通り動作し、後方互換に
-    // 影響しない（Phase 9-0 の compat_check.rs で実証済み）。
-    transport.max_concurrent_multipath_paths(8);
+    // 影響しない（Phase 9-0 の compat_check.rs で実証済み）。preferred_address は
+    // 明示的に設定しない（QUIC-Exfil 対策、既定で未使用、quicmuxのMuxServerConfigにも
+    // その概念がない）。0-RTT / early dataはクライアント・サーバー双方で無効化する契約
+    // （HELPER_PROTOCOL.md参照、quicmuxのnoq_server_config内で常に無効化される)。
+    let server_config = MuxServerConfig {
+        alpn: ALPN.to_vec(),
+        exporter_label: EXPORTER_LABEL.to_vec(),
+        max_idle_timeout: Duration::from_secs(args.idle_timeout),
+        keep_alive_interval: Duration::from_secs((args.idle_timeout / 3).max(1)),
+        max_concurrent_bidi_streams: 2,
+        max_concurrent_uni_streams: 0,
+        multipath: true,
+        cert_chain,
+        private_key: key,
+    };
 
-    let mut server_config =
-        noq::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-    server_config.transport_config(Arc::new(transport));
-    // preferred_address は明示的に設定しない（QUIC-Exfil 対策、既定で未使用）。
-
-    let (endpoint, stun_observed_addr, relay_public_addr) = if let Some(relay_addr) = args.relay {
+    let (listener, stun_observed_addr, relay_public_addr) = if let Some(relay_addr) = args.relay {
         // relay版P2P(TransportPreference::IsekaiLinkRelayQuic): 自前でbindする代わりに
         // MASQUE relayへCONNECT-UDP-bindトンネルを張り、relayが割り当てた公開アドレスを
         // isekai-terminal側へ(SSHブートストラップのハンドシェイクJSON経由で)伝える。
@@ -544,13 +551,8 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
             "relay: tunnel established via {:?}, proxy_public_address={proxy_public_address}",
             args.relay_transport
         );
-        let endpoint = noq::Endpoint::new_with_abstract_socket(
-            noq::EndpointConfig::default(),
-            Some(server_config),
-            Box::new(relay_socket),
-            Arc::new(noq::TokioRuntime),
-        )?;
-        (endpoint, None, Some(proxy_public_address))
+        let listener = AnyMuxListener::from_abstract_socket_noq(server_config, Box::new(relay_socket))?;
+        (listener, None, Some(proxy_public_address))
     } else {
         // 自前でbindしたソケットを、noqへ渡す前にSTUN問い合わせ・穴あけprobeへ使う
         // （bind_faulty_udp_socket的なラップをする前の生ソケットとして扱う唯一の機会 ——
@@ -603,15 +605,16 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
             }
         }
 
-        let endpoint = noq::Endpoint::new_with_abstract_socket(
-            noq::EndpointConfig::default(),
-            Some(server_config),
-            Box::new(plain_socket::PlainUdpSocket::new(raw_socket)),
-            Arc::new(noq::TokioRuntime),
-        )?;
-        (endpoint, stun_observed_addr, None)
+        // `raw_socket`のArc参照はSTUN問い合わせ・穴あけprobeの間ずっと`&raw_socket`で
+        // 借用しているだけ(別変数へclone/moveしていない)ため、ここに至った時点で
+        // 参照カウントは必ず1 — `wrap_bound_socket_noq`が受け取れる所有された
+        // `tokio::net::UdpSocket`を安全に取り戻せる。
+        let raw_socket = Arc::try_unwrap(raw_socket)
+            .map_err(|_| anyhow!("raw_socket unexpectedly has more than one owner"))?;
+        let listener = AnyMuxListener::wrap_bound_socket_noq(server_config, raw_socket).await?;
+        (listener, stun_observed_addr, None)
     };
-    let listen_port = endpoint.local_addr()?.port();
+    let listen_port = listener.local_addr()?.port();
     let session_secret_b64 = base64::engine::general_purpose::STANDARD.encode(session_secret);
     let stun_observed_addr_json = stun_observed_addr.map(|a| a.to_string());
     let relay_public_addr_json = relay_public_addr.map(|a| a.to_string());
@@ -689,7 +692,7 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
 
     log::info!(
         "isekai-helper listening on udp/{} (target={}, cert_sha256={})",
-        endpoint.local_addr()?,
+        listener.local_addr()?,
         args.target,
         cert_sha256
     );
@@ -751,15 +754,15 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 log::info!("shutdown requested, closing endpoint");
-                endpoint.close(0u32.into(), b"shutdown");
+                listener.close(b"shutdown");
                 break;
             }
             _ = idle_shutdown.notified() => {
                 log::info!("max-idle-lifetime reached, closing endpoint");
-                endpoint.close(0u32.into(), b"idle-timeout");
+                listener.close(b"idle-timeout");
                 break;
             }
-            incoming = endpoint.accept() => {
+            incoming = listener.accept() => {
                 let Some(incoming) = incoming else { break };
                 let target = args.target;
                 let secret = session_secret;
@@ -769,14 +772,9 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                 let resume_buffer_size = args.resume_buffer_size;
                 let max_resume_grace_secs = args.resume_window;
                 let handle_incoming = async move {
-                    match incoming.await {
+                    match incoming.accept().await {
                         Ok(conn) => {
-                            // noq: `remote_address()`はConnectingにしか無い（確立後はpath0/1...
-                            // それぞれに別アドレスがあり得るためmultipath化で無くなった）。
-                            // path0（PathId::ZERO）は常に存在するのでログ用途にはこれで十分。
-                            let remote = conn
-                                .path(noq::PathId::ZERO)
-                                .and_then(|p| p.remote_address().ok());
+                            let remote = conn.remote_addr();
                             log::info!("QUIC connection established from {remote:?}");
                             if let Err(e) = handle_connection(conn, target, secret, attach_runtime, sessions, resume_buffer_size, max_resume_grace_secs).await {
                                 log::warn!("connection from {remote:?} ended: {e:#}");
@@ -787,15 +785,15 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
                     *last_activity.lock().await = Instant::now();
                 };
                 if once {
-                    // `endpoint.accept()`はハンドシェイク未完了の`Connecting`しか返さない
-                    // (実際のハンドシェイク完了は`handle_incoming`内の`incoming.await`)。
-                    // 以前は`tokio::spawn`した直後にここで`endpoint.close()`していたため、
-                    // spawnされたタスクが最初にpollされる前にendpoint自体が閉じてしまい、
+                    // `listener.accept()`はハンドシェイク未完了の候補しか返さない
+                    // (実際のハンドシェイク完了は`handle_incoming`内の`incoming.accept()`)。
+                    // 以前は`tokio::spawn`した直後にここで`listener.close()`していたため、
+                    // spawnされたタスクが最初にpollされる前にlistener自体が閉じてしまい、
                     // `--once`が自分自身が処理するはずだった最初の接続を常に道連れに
                     // していた(netlab PoCで実netns越しに実バイナリを繋いで発見)。
                     // 1接続しか処理しない契約なので、ここでは同期的にawaitしてから閉じる。
                     handle_incoming.await;
-                    endpoint.close(0u32.into(), b"once");
+                    listener.close(b"once");
                     break;
                 }
                 tokio::spawn(handle_incoming);
@@ -803,12 +801,12 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         }
     }
 
-    endpoint.wait_idle().await;
+    listener.wait_idle().await;
     Ok(())
 }
 
 async fn handle_connection(
-    conn: noq::Connection,
+    conn: AnyMuxConnection,
     target: SocketAddr,
     session_secret: [u8; 32],
     attach_runtime: Arc<AttachRuntime>,
@@ -821,9 +819,10 @@ async fn handle_connection(
     // 届かなければ connection を close する（QUIC connection だけ張って
     // stream を開かない妨害を防ぐ）。
     let (send, recv, frame_type, rest) = tokio::time::timeout(HELLO_TIMEOUT, async {
-        let (send, mut recv) = conn.accept_bi().await.context("no stream opened")?;
+        let stream = conn.accept_bi().await.context("no stream opened")?;
+        let (mut recv, send) = stream.split();
         let mut type_byte = [0u8; 1];
-        recv.read_exact(&mut type_byte)
+        read_exact(&mut recv, &mut type_byte)
             .await
             .context("failed to read frame type")?;
         let rest_len = match type_byte[0] {
@@ -834,7 +833,7 @@ async fn handle_connection(
         };
         let mut rest = vec![0u8; rest_len];
         if rest_len > 0 {
-            recv.read_exact(&mut rest)
+            read_exact(&mut recv, &mut rest)
                 .await
                 .context("failed to read frame body")?;
         }
@@ -884,14 +883,14 @@ async fn handle_connection(
 /// `AttachRuntime`のpending-activationタイマー等が最終的に安全側へ収束する
 /// ため、応答フレームは送らないfire-and-forgetでよい。
 async fn handle_cancel_attach(
-    conn: noq::Connection,
+    conn: AnyMuxConnection,
     cancel_bytes: [u8; CANCEL_ATTACH_FRAME_LEN],
     session_secret: [u8; 32],
     attach_runtime: Arc<AttachRuntime>,
 ) -> Result<()> {
     let cancel = decode_cancel_attach(&cancel_bytes).context("failed to decode CancelAttach")?;
     let transcript = cancel_attach_proof_transcript(&cancel.session_id, cancel.generation, &cancel.attempt_id);
-    let expected = compute_attach_proof(&conn, &session_secret, &transcript)?;
+    let expected = compute_attach_proof(&conn, &session_secret, &transcript).await?;
     if !cancel.proof.ct_eq(&AttachProof::new(expected)) {
         return Err(anyhow!("CancelAttach proof mismatch, ignoring"));
     }
@@ -900,19 +899,20 @@ async fn handle_cancel_attach(
     Ok(())
 }
 
-/// 拒否フレームを送出し、`finish()` 後に `stopped()` で peer への到達を待ってから返す。
-/// これをせずに呼び出し元が即座に `conn` を drop すると、応答が飛ぶ前に
-/// QUIC connection が暗黙に閉じられ、client 側が payload を読めないことがある
-/// （実測で確認済みのバグ）。`ATTACH_HELLO`のreject語彙(#18)は`STALE_GENERATION`
-/// のように1byteを超える場合があるため、単一byteではなく`&[u8]`を受け取る。
-async fn reject(send: &mut noq::SendStream, bytes: &[u8]) {
+/// 拒否フレームを送出し、`shutdown()` 後に `wait_for_close()` で peer への到達を
+/// 待ってから返す。これをせずに呼び出し元が即座に `conn` を drop すると、応答が
+/// 飛ぶ前に QUIC connection が暗黙に閉じられ、client 側が payload を読めないことが
+/// ある（実測で確認済みのバグ、`quicmux::AnyByteStream::wait_for_close`のdocsに同種の
+/// 再現記録あり）。`ATTACH_HELLO`のreject語彙(#18)は`STALE_GENERATION`のように
+/// 1byteを超える場合があるため、単一byteではなく`&[u8]`を受け取る。
+async fn reject(send: &mut AnyByteStreamWriteHalf, bytes: &[u8]) {
     if send.write_all(bytes).await.is_ok() {
-        let _ = send.finish();
-        let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
+        let _ = send.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), send.wait_for_close()).await;
     }
 }
 
-async fn reject_attach(send: &mut noq::SendStream, reason: AttachRejectReason) {
+async fn reject_attach(send: &mut AnyByteStreamWriteHalf, reason: AttachRejectReason) {
     reject(send, &encode_attach_response(&AttachResponse::Reject(reason))).await;
 }
 
@@ -922,9 +922,9 @@ async fn reject_attach(send: &mut noq::SendStream, reason: AttachRejectReason) {
 /// 流さない — `#12`で見つかった曖昧区間の修正そのもの。
 #[allow(clippy::too_many_arguments)]
 async fn handle_attach_stream(
-    conn: noq::Connection,
-    mut send: noq::SendStream,
-    mut recv: noq::RecvStream,
+    conn: AnyMuxConnection,
+    mut send: AnyByteStreamWriteHalf,
+    mut recv: AnyByteStreamReadHalf,
     hello_bytes: [u8; ATTACH_HELLO_FRAME_LEN],
     target: SocketAddr,
     session_secret: [u8; 32],
@@ -947,7 +947,7 @@ async fn handle_attach_stream(
         &hello.attempt_id,
         hello.requested_resume_grace_secs,
     );
-    let expected = compute_attach_proof(&conn, &session_secret, &transcript)?;
+    let expected = compute_attach_proof(&conn, &session_secret, &transcript).await?;
     if !hello.proof.ct_eq(&AttachProof::new(expected)) {
         reject_attach(&mut send, AttachRejectReason::Auth).await;
         return Err(anyhow!("ATTACH_HELLO proof mismatch, rejecting"));
@@ -984,7 +984,7 @@ async fn handle_attach_stream(
     // 自身が諦めるタイミングを決めるだけで、正しさはそちらに依存しない。
     let activate = tokio::time::timeout(HELLO_TIMEOUT, async {
         let mut buf = [0u8; ATTACH_ACTIVATE_FRAME_LEN];
-        recv.read_exact(&mut buf).await.context("failed to read AttachActivate")?;
+        read_exact(&mut recv, &mut buf).await.context("failed to read AttachActivate")?;
         decode_attach_activate(&buf).context("failed to decode AttachActivate")
     })
     .await;
@@ -1061,9 +1061,9 @@ async fn handle_attach_stream(
 /// （session_id(16) + proof(32) + client_sent_offset(8) + client_delivered_offset(8)）。
 #[allow(clippy::too_many_arguments)]
 async fn handle_resume_stream(
-    conn: noq::Connection,
-    mut send: noq::SendStream,
-    mut recv: noq::RecvStream,
+    conn: AnyMuxConnection,
+    mut send: AnyByteStreamWriteHalf,
+    mut recv: AnyByteStreamReadHalf,
     body: &[u8],
     target: SocketAddr,
     session_secret: [u8; 32],
@@ -1079,8 +1079,9 @@ async fn handle_resume_stream(
     // resume_proof = HMAC(session_secret, exporter(新connection) || session_id)
     // （HELPER_PROTOCOL.md §7.3。session_id を混ぜることで、同じ session_secret を
     // 使い回す複数セッションが互いの resume トークンを流用できないようにする）。
-    let mut exporter = [0u8; 32];
-    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
+    let exporter = conn
+        .export_keying_material(EXPORTER_LABEL, b"")
+        .await
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
     let mut mac = HmacSha256::new_from_slice(&session_secret).expect("HMAC accepts any key length");
     mac.update(&exporter);
@@ -1227,14 +1228,18 @@ fn effective_resume_grace(requested_resume_grace_secs: u32, max_resume_grace_sec
 
 /// `session_secret` と QUIC connection の exporter から proof を計算する
 /// （data stream HELLO と control stream CONTROL_HELLO で共通のロジック）。
-fn compute_proof(
-    conn: &noq::Connection,
+/// `quicmux::AnyMuxConnection::export_keying_material`が非同期(qmuxバックエンドは
+/// 一度captureした値を返すだけだが、noqバックエンドは呼び出し毎に計算するため
+/// 将来的な非同期化に備えて両方ともasync)になったため、この関数もasyncにした。
+async fn compute_proof(
+    conn: &AnyMuxConnection,
     session_secret: &[u8; 32],
     label: &[u8],
     context: &[u8],
 ) -> Result<[u8; 32]> {
-    let mut exporter = [0u8; 32];
-    conn.export_keying_material(&mut exporter, label, context)
+    let exporter = conn
+        .export_keying_material(label, context)
+        .await
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
     let mut mac = HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
     mac.update(&exporter);
@@ -1245,9 +1250,10 @@ fn compute_proof(
 /// 同じexporterを使うが、`isekai_transport::proof::compute_proof`の`extra`
 /// パラメータと対称になるよう、`transcript`(`attach_hello_proof_transcript`
 /// 等が返すbyte列)をHMACに追加で混ぜ込む。
-fn compute_attach_proof(conn: &noq::Connection, session_secret: &[u8; 32], transcript: &[u8]) -> Result<[u8; 32]> {
-    let mut exporter = [0u8; 32];
-    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
+async fn compute_attach_proof(conn: &AnyMuxConnection, session_secret: &[u8; 32], transcript: &[u8]) -> Result<[u8; 32]> {
+    let exporter = conn
+        .export_keying_material(EXPORTER_LABEL, b"")
+        .await
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
     let mut mac = HmacSha256::new_from_slice(session_secret).expect("HMAC accepts any key length");
     mac.update(&exporter);
@@ -1261,20 +1267,20 @@ fn compute_attach_proof(conn: &noq::Connection, session_secret: &[u8; 32], trans
 /// client（control stream を開かない）向けに呼び出し側でタイムアウトを
 /// 掛けることを想定している。
 async fn accept_control_stream(
-    conn: &noq::Connection,
+    conn: &AnyMuxConnection,
     session_secret: [u8; 32],
     session_id: resume::SessionId,
-) -> Result<(noq::SendStream, noq::RecvStream)> {
-    let (mut csend, mut crecv) = conn.accept_bi().await.context("no control stream opened")?;
+) -> Result<(AnyByteStreamWriteHalf, AnyByteStreamReadHalf)> {
+    let stream = conn.accept_bi().await.context("no control stream opened")?;
+    let (mut crecv, mut csend) = stream.split();
     let mut hello = [0u8; 33];
-    crecv
-        .read_exact(&mut hello)
+    read_exact(&mut crecv, &mut hello)
         .await
         .context("failed to read CONTROL_HELLO")?;
     if hello[0] != resume::CONTROL_HELLO {
         return Err(anyhow!("unexpected control frame type: {:#x}", hello[0]));
     }
-    let expected = compute_proof(conn, &session_secret, EXPORTER_LABEL, b"")?;
+    let expected = compute_proof(conn, &session_secret, EXPORTER_LABEL, b"").await?;
     if hello[1..33].ct_eq(&expected).unwrap_u8() != 1 {
         return Err(anyhow!("CONTROL_HELLO proof mismatch"));
     }
@@ -1338,8 +1344,8 @@ async fn finish_or_park_session(
 /// `relay_with_resume` が呼び出し元の control_task を abort() すれば、
 /// control stream 側の read/write もいずれエラーになりループを抜ける。
 fn spawn_app_ack_tasks(
-    mut csend: noq::SendStream,
-    mut crecv: noq::RecvStream,
+    mut csend: AnyByteStreamWriteHalf,
+    mut crecv: AnyByteStreamReadHalf,
     session: Arc<Mutex<Session>>,
 ) {
     // APP_ACK 受信: client からの client_delivered_offset を受け取り、
@@ -1349,7 +1355,7 @@ fn spawn_app_ack_tasks(
         tokio::spawn(async move {
             loop {
                 let mut frame = [0u8; 9];
-                match crecv.read_exact(&mut frame).await {
+                match read_exact(&mut crecv, &mut frame).await {
                     Ok(()) if frame[0] == resume::APP_ACK => {
                         let offset = u64::from_be_bytes(frame[1..9].try_into().unwrap());
                         let notify = {
@@ -1419,8 +1425,8 @@ enum RelayOutcome {
 /// バグがあったため、単一の `tokio::select!` ループに書き直した。
 /// いずれかの方向が「これ以上続けられない」と判断した時点で即座に終了する。
 async fn relay_buffered(
-    send: &mut noq::SendStream,
-    recv: &mut noq::RecvStream,
+    send: &mut AnyByteStreamWriteHalf,
+    recv: &mut AnyByteStreamReadHalf,
     mut tcp_read: tokio::net::tcp::OwnedReadHalf,
     mut tcp_write: tokio::net::tcp::OwnedWriteHalf,
     session: Arc<Mutex<Session>>,
@@ -1440,16 +1446,20 @@ async fn relay_buffered(
                 .min(s2c_buf.len())
         };
         tokio::select! {
+            // `AnyByteStreamReadHalf::read`は`tokio::io::AsyncRead`と同じ規約
+            // (`Ok(0)` = EOF)であり、旧`noq::RecvStream::read`の`Ok(None)` = EOF
+            // (`Ok(Some(n))` = n>0バイト)とは異なるため、マッチの形を合わせて
+            // 移植した。
             result = recv.read(&mut c2s_buf), if !c2s_done => {
                 match result {
-                    Ok(Some(n)) => {
+                    Ok(n) if n > 0 => {
                         if let Err(e) = tcp_write.write_all(&c2s_buf[..n]).await {
                             log::warn!("relay to {target}: tcp write failed: {e}");
                             return RelayOutcome::TcpDied;
                         }
                         session.lock().await.helper_committed_offset += n as u64;
                     }
-                    Ok(None) => {
+                    Ok(_) => {
                         // client 側の half-close。S→C 方向はまだ継続する。
                         let _ = tcp_write.shutdown().await;
                         c2s_done = true;
@@ -1471,7 +1481,7 @@ async fn relay_buffered(
                     Ok(0) => {
                         // target（sshd）側が正常終了。resume する意味が無い。
                         log::info!("relay to {target}: tcp closed cleanly");
-                        let _ = send.finish();
+                        let _ = send.shutdown().await;
                         return RelayOutcome::TcpDied;
                     }
                     Ok(n) => {
