@@ -132,11 +132,20 @@ pub(crate) struct MultipathIsekaiPipeQuicSession {
     config: MultipathIsekaiPipeQuicConfig,
     core: SessionCore,
     rebind_tx: StdMutex<Option<tokio::sync::mpsc::Sender<RebindRequest>>>,
+    /// trzsz転送中(WaitingUser含む)かどうか。`RebindManager`(rebind_manager.rs)の
+    /// `RebindEvent::TrafficBusyDetected`/`TrafficQuietDetected`の判定材料の一つ
+    /// として#22のDriverが読み出す想定(#9時点ではDriver未実装のため書き込むだけ)。
+    interactive_busy: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) fn create_multipath_isekai_pipe_quic_session(config: MultipathIsekaiPipeQuicConfig) -> Arc<MultipathIsekaiPipeQuicSession> {
     init_logger();
-    Arc::new(MultipathIsekaiPipeQuicSession { config, core: SessionCore::new(), rebind_tx: StdMutex::new(None) })
+    Arc::new(MultipathIsekaiPipeQuicSession {
+        config,
+        core: SessionCore::new(),
+        rebind_tx: StdMutex::new(None),
+        interactive_busy: std::sync::atomic::AtomicBool::new(false),
+    })
 }
 
 impl MultipathIsekaiPipeQuicSession {
@@ -180,6 +189,16 @@ impl MultipathIsekaiPipeQuicSession {
         if tx.try_send(req).is_err() {
             warn!("multipath_quic: rebind_to_fd: request channel full or closed, dropping fd={fd}");
         }
+    }
+
+    /// `orchestrator.rs`のtrzsz転送イベント(`on_trzsz_request`/`on_trzsz_finished`/
+    /// `trzsz_cancel`/`trzsz_dismiss`)から呼ばれる。判断は一切せず記録するだけ。
+    pub(crate) fn set_interactive_busy(&self, busy: bool) {
+        self.interactive_busy.store(busy, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_interactive_busy(&self) -> bool {
+        self.interactive_busy.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
@@ -821,6 +840,37 @@ mod tests {
             last = tracker.get(id);
         }
         last
+    }
+
+    fn minimal_test_config() -> MultipathIsekaiPipeQuicConfig {
+        MultipathIsekaiPipeQuicConfig {
+            ssh_host: "127.0.0.1".to_string(),
+            ssh_port: 22,
+            direct_host: None,
+            cellular_remote_host: None,
+            wifi_fd: None,
+            wifi_local_ip: None,
+            cellular_fd: None,
+            cellular_local_ip: None,
+            username: "test".to_string(),
+            auth: crate::SshAuth::Password { password: "test".to_string() },
+            cols: 80,
+            rows: 24,
+            jump: None,
+            bind_port: None,
+        }
+    }
+
+    /// #9: `set_interactive_busy`/`is_interactive_busy`は接続の有無に関わらず
+    /// 単純にAtomicBoolを読み書きするだけであること(実接続不要で検証できる)。
+    #[test]
+    fn interactive_busy_flag_round_trips() {
+        let session = create_multipath_isekai_pipe_quic_session(minimal_test_config());
+        assert!(!session.is_interactive_busy(), "初期状態はbusyではない");
+        session.set_interactive_busy(true);
+        assert!(session.is_interactive_busy());
+        session.set_interactive_busy(false);
+        assert!(!session.is_interactive_busy());
     }
 
     async fn start_test_server() -> (u16, String, [u8; 32]) {

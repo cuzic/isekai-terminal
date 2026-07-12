@@ -59,6 +59,14 @@ impl ActiveSession {
             s.rebind_to_fd(fd, local_ip);
         }
     }
+    /// trzsz転送中(WaitingUser含む)かどうかをRebindManager(#22のDriver)の
+    /// 静けさ判定の補助シグナルとして伝える。マルチパス以外では意味を持たないため
+    /// `rebind_to_fd`と同じくno-op委譲。
+    fn set_interactive_busy(&self, busy: bool) {
+        if let Self::MultipathIsekaiPipeQuic(s) = self {
+            s.set_interactive_busy(busy);
+        }
+    }
     fn scrollback_len(&self) -> u32 {
         dispatch_all!(self, scrollback_len)
     }
@@ -203,6 +211,9 @@ impl SessionCallback for OrchestratorAdapter {
             s.download_buf.clear();
             s.size_limit_exceeded_for = None;
         }
+        if let Some(session) = self.shared.session.lock().as_ref() {
+            session.set_interactive_busy(true);
+        }
         self.shared.callback.on_trzsz_state_changed(
             TrzszPublicState::WaitingUser { transfer_id, mode, suggested_name, expected_size }
         );
@@ -265,6 +276,9 @@ impl SessionCallback for OrchestratorAdapter {
                 (data, is_download, success, message)
             }
         };
+        if let Some(session) = self.shared.session.lock().as_ref() {
+            session.set_interactive_busy(false);
+        }
         if success && is_download && !data.is_empty() {
             self.shared.callback.on_download_complete(None, data);
         }
@@ -497,6 +511,7 @@ impl SessionOrchestrator {
         if let Some(tid) = tid {
             if let Some(s) = self.shared.session.lock().as_ref() {
                 s.trzsz_cancel(tid);
+                s.set_interactive_busy(false);
             }
         }
     }
@@ -506,6 +521,9 @@ impl SessionOrchestrator {
         s.trzsz_mode = None;
         s.current_transfer_id = None;
         drop(s);
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.set_interactive_busy(false);
+        }
         self.shared.callback.on_trzsz_state_changed(TrzszPublicState::Idle);
     }
 
