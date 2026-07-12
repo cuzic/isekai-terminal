@@ -659,6 +659,15 @@ internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod9 : com.sun.
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod10 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod11 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod12 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod13 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 @Structure.FieldOrder("uniffiFree", "uniffiClone", "onDiagnosticEvent")
 internal open class UniffiVTableCallbackInterfaceDiagnosticCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -697,7 +706,7 @@ internal open class UniffiVTableCallbackInterfaceEventWakeListener(
     }
 
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest")
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged")
 internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -712,6 +721,9 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `onAgentSignRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod8? = null,
     @JvmField internal var `onClipboardWrite`: UniffiCallbackInterfaceOrchestratorCallbackMethod9? = null,
     @JvmField internal var `onClipboardPullRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod10? = null,
+    @JvmField internal var `onRequestWifiFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod11? = null,
+    @JvmField internal var `onRequestCellularFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod12? = null,
+    @JvmField internal var `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -727,7 +739,10 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onAgentSignRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod8? = null,
         `onClipboardWrite`: UniffiCallbackInterfaceOrchestratorCallbackMethod9? = null,
         `onClipboardPullRequest`: UniffiCallbackInterfaceOrchestratorCallbackMethod10? = null,
-    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,), Structure.ByValue
+        `onRequestWifiFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod11? = null,
+        `onRequestCellularFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod12? = null,
+        `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
+    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceOrchestratorCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -743,6 +758,9 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onAgentSignRequest` = other.`onAgentSignRequest`
         `onClipboardWrite` = other.`onClipboardWrite`
         `onClipboardPullRequest` = other.`onClipboardPullRequest`
+        `onRequestWifiFd` = other.`onRequestWifiFd`
+        `onRequestCellularFd` = other.`onRequestCellularFd`
+        `onRebindStateChanged` = other.`onRebindStateChanged`
     }
 
 }
@@ -916,6 +934,12 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_write(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_pull_request(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_request_wifi_fd(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_request_cellular_fd(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed(
     ): Int
     external fun ffi_isekai_terminal_core_uniffi_contract_version(
     ): Int
@@ -1425,6 +1449,15 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_pull_request() != 18572) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_request_wifi_fd() != 35263) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_request_cellular_fd() != 25671) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed() != 15707) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -4708,6 +4741,49 @@ public object FfiConverterTypePackedRow: FfiConverterRustBuffer<PackedRow> {
 
 
 
+/**
+ * #10/#22: WiFi/セルラーいずれかに明示的にバインドされたfd。`Network.bindSocket()`
+ * (Android)/`IP_BOUND_IF`(iOS、#15)済み・所有権はRust側に移った生fd。
+ * `crate::rebind_ports::PlatformFdSource`のUniFFI越しの実体。
+ */
+data class PlatformFd (
+    var `fd`: kotlin.Int
+    , 
+    var `localIp`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePlatformFd: FfiConverterRustBuffer<PlatformFd> {
+    override fun read(buf: ByteBuffer): PlatformFd {
+        return PlatformFd(
+            FfiConverterInt.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PlatformFd) = (
+            FfiConverterInt.allocationSize(value.`fd`) +
+            FfiConverterString.allocationSize(value.`localIp`)
+    )
+
+    override fun write(value: PlatformFd, buf: ByteBuffer) {
+            FfiConverterInt.write(value.`fd`, buf)
+            FfiConverterString.write(value.`localIp`, buf)
+    }
+}
+
+
+
 data class PortForward (
     var `forwardType`: ForwardType
     , 
@@ -5439,6 +5515,54 @@ public object FfiConverterTypeForwardType: FfiConverterRustBuffer<ForwardType> {
     override fun allocationSize(value: ForwardType) = 4UL
 
     override fun write(value: ForwardType, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * UI(Compose/SwiftUI)へ公開する簡略化された状態。
+ */
+
+enum class RebindPublicState {
+    
+    /**
+     * WiFi 上で通常運用中。
+     */
+    ON_WIFI,
+    /**
+     * セルラーへフェイルオーバー済み。WiFi 復活を探っている。
+     */
+    FAILED_OVER_TO_CELLULAR,
+    /**
+     * WiFi 復活の疎通確認・ヒステリシスを満たし、通信が静かになるのを
+     * 待っている(この間だけ手動即時切替の「今すぐ戻す」がより有効)。
+     */
+    WAITING_QUIET_TO_RETURN;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeRebindPublicState: FfiConverterRustBuffer<RebindPublicState> {
+    override fun read(buf: ByteBuffer) = try {
+        RebindPublicState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: RebindPublicState) = 4UL
+
+    override fun write(value: RebindPublicState, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -6388,6 +6512,26 @@ public interface OrchestratorCallback {
      */
     fun `onClipboardPullRequest`(): ClipboardPayload?
     
+    /**
+     * #10/#22: `RebindManager`(rebind_manager.rs)がWiFi-bound fdを要求する。
+     * 判断は一切せず、要求された種類のfdを取得して返すだけ(`rust-ssot.md`準拠)。
+     * 取得できなければ`None`(WiFi自体が使えない・権限が無い等)。`host_key`確認等と
+     * 同じ同期ブロッキング方式(Rust側の`spawn_blocking`から呼ばれる)。
+     * マルチパス以外のtransportでは呼ばれない。
+     */
+    fun `onRequestWifiFd`(): PlatformFd?
+    
+    /**
+     * 同、セルラー-bound fd版。
+     */
+    fun `onRequestCellularFd`(): PlatformFd?
+    
+    /**
+     * #19: `RebindManager`の状態が変化した(WiFi/セルラーフェイルオーバー/復帰待ち)。
+     * マルチパス以外のtransportでは呼ばれない。
+     */
+    fun `onRebindStateChanged`(`state`: RebindPublicState)
+    
     companion object
 }
 
@@ -6529,6 +6673,40 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+    internal object `onRequestWifiFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod11 {
+        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onRequestWifiFd`(
+                )
+            }
+            val writeReturn = { value: PlatformFd? -> uniffiOutReturn.setValue(FfiConverterOptionalTypePlatformFd.lower(value)) }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onRequestCellularFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod12 {
+        override fun callback(`uniffiHandle`: Long,`uniffiOutReturn`: RustBuffer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onRequestCellularFd`(
+                )
+            }
+            val writeReturn = { value: PlatformFd? -> uniffiOutReturn.setValue(FfiConverterOptionalTypePlatformFd.lower(value)) }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13 {
+        override fun callback(`uniffiHandle`: Long,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onRebindStateChanged`(
+                    FfiConverterTypeRebindPublicState.lift(`state`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
 
     internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
@@ -6556,6 +6734,9 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
         `onAgentSignRequest`,
         `onClipboardWrite`,
         `onClipboardPullRequest`,
+        `onRequestWifiFd`,
+        `onRequestCellularFd`,
+        `onRebindStateChanged`,
     )
 
     // Registers the foreign callback with the Rust side.
@@ -6824,6 +7005,38 @@ public object FfiConverterOptionalTypeJumpConfig: FfiConverterRustBuffer<JumpCon
         } else {
             buf.put(1)
             FfiConverterTypeJumpConfig.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypePlatformFd: FfiConverterRustBuffer<PlatformFd?> {
+    override fun read(buf: ByteBuffer): PlatformFd? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypePlatformFd.read(buf)
+    }
+
+    override fun allocationSize(value: PlatformFd?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypePlatformFd.allocationSize(value)
+        }
+    }
+
+    override fun write(value: PlatformFd?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypePlatformFd.write(value, buf)
         }
     }
 }
