@@ -1,10 +1,18 @@
 package tools.isekai.terminal
 
 import android.app.Application
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.util.RemoteLogger
 
-class IsekaiTerminalApplication : Application() {
+/**
+ * [TerminalTabsViewModel]をプロセス寿命(≒[TerminalSessionService]が生きている間)に
+ * スコープするための[ViewModelStoreOwner]。詳細は[TerminalTabsViewModel]のクラスdocを参照。
+ */
+class IsekaiTerminalApplication : Application(), ViewModelStoreOwner {
+    override val viewModelStore: ViewModelStore = ViewModelStore()
+
     override fun onCreate() {
         super.onCreate()
         Repositories.init(this)

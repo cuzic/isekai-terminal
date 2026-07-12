@@ -50,7 +50,16 @@ import uniffi.isekai_terminal_core.SshConfig
 import uniffi.isekai_terminal_core.TransportPreference
 
 /**
- * 複数タブ（複数 SSH/QUIC セッション）を横断する Activity/Application スコープの状態管理。
+ * 複数タブ（複数 SSH/QUIC セッション）を横断する Application スコープの状態管理。
+ *
+ * [MainActivity.AppRoot]は`viewModel(viewModelStoreOwner = application, ...)`で生成する
+ * ([IsekaiTerminalApplication]の[androidx.lifecycle.ViewModelStore]を使う)。Activityスコープに
+ * していた旧実装では、Activityが(バックグラウンド中のタスク破棄等で)正規のfinish経路を通らず
+ * 再生成されると[onCleared]が呼ばれずに古いインスタンスが破棄され、`session.close()`が
+ * 一度も実行されないままRust側のSSH接続だけがプロセス内に孤立し、新しいインスタンスからは
+ * それを発見・再アタッチする手段が無いというバグがあった(実機検証で発見、2026-07-12)。
+ * Applicationスコープならプロセスが生きている限り同一インスタンスが使われ続けるため、
+ * このクラスがそもそも「破棄されて再生成される」状況自体が起こらなくなる。
  *
  * 「タブ横断で1回だけ登録すればよい」責務——ネットワーク監視・ForegroundService の
  * 起動/停止・ネットワーク断の全セッションへのファンアウト——をここに集約する。
