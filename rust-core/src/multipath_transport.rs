@@ -44,6 +44,7 @@ use isekai_transport::multipath::{connect_multipath_with_socket, MultipathConnec
 use isekai_transport::path_health::{self, PathHealthEvent, PathHealthTracker, PathLabel, PathState};
 use isekai_transport::RemoteSpec;
 use russh::client;
+use crate::{rebind_driver, rebind_ports};
 
 type HmacSha256 = Hmac<Sha256>;
 use sha2::Sha256;
@@ -134,8 +135,15 @@ pub(crate) struct MultipathIsekaiPipeQuicSession {
     rebind_tx: StdMutex<Option<tokio::sync::mpsc::Sender<RebindRequest>>>,
     /// trzsz転送中(WaitingUser含む)かどうか。`RebindManager`(rebind_manager.rs)の
     /// `RebindEvent::TrafficBusyDetected`/`TrafficQuietDetected`の判定材料の一つ
-    /// として#22のDriverが読み出す想定(#9時点ではDriver未実装のため書き込むだけ)。
+    /// として#22のDriverが読み出す。
     interactive_busy: std::sync::atomic::AtomicBool,
+    /// #8: 通信静けさ判定。rebind(接続の張り直し)を跨いでも同じインスタンスを
+    /// 使い続ける(rebind直前直後の活動も「静けさ」判定にとって意味があるため、
+    /// rebindのたびにリセットしない)。
+    traffic_stats: TrafficStats,
+    /// #22: RebindManagerの実行ループへイベントを送るハンドル。接続確立後
+    /// (`try_connect_multipath`成功後)に格納される。`force_return_to_wifi`(#11)が使う。
+    rebind_driver: StdMutex<Option<rebind_driver::RebindDriverHandle>>,
 }
 
 pub(crate) fn create_multipath_isekai_pipe_quic_session(config: MultipathIsekaiPipeQuicConfig) -> Arc<MultipathIsekaiPipeQuicSession> {
@@ -145,23 +153,35 @@ pub(crate) fn create_multipath_isekai_pipe_quic_session(config: MultipathIsekaiP
         core: SessionCore::new(),
         rebind_tx: StdMutex::new(None),
         interactive_busy: std::sync::atomic::AtomicBool::new(false),
+        traffic_stats: TrafficStats::new(),
+        rebind_driver: StdMutex::new(None),
     })
 }
 
 impl MultipathIsekaiPipeQuicSession {
     /// フォールバック無し。path0/path1 のブートストラップ・QUIC 接続に失敗したら
     /// エラーを返す（`TransportPreference::IsekaiPipeQuicMultipath` 相当）。
-    pub(crate) fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
+    ///
+    /// `self: &Arc<Self>`にしているのは、接続確立(`try_connect_multipath`)は
+    /// `RemoteSpec`が揃うまでSSHブートストラップを待つ必要があり同期的に返せない
+    /// ため、spawnされた非同期タスクの中で`self.rebind_driver`へ結果を書き戻す
+    /// 必要があるため(`rebind_tx`のように同期的に組み立てられない)。
+    pub(crate) fn connect(self: &Arc<Self>, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         let (rebind_tx, rebind_rx) = tokio::sync::mpsc::channel(4);
-        *self.rebind_tx.lock().unwrap() = Some(rebind_tx);
+        *self.rebind_tx.lock().unwrap() = Some(rebind_tx.clone());
         // ブートストラップ用SSHのホスト鍵検証を本セッションのcallbackに委譲する
         // (`isekai_pipe_quic_transport::bootstrap_helper_via_ssh`のNOTE参照)。
         let host_key_callback = self.core.callback();
+        let session = self.clone();
+        let traffic_stats = self.traffic_stats.clone();
         RUNTIME.spawn(async move {
-            match try_connect_multipath(&config, rebind_rx, event_tx.clone(), host_key_callback).await {
-                Ok(stream) => run_over_stream(config, stream, cmd_rx, event_tx).await,
+            match try_connect_multipath(&config, rebind_tx, rebind_rx, event_tx.clone(), host_key_callback, traffic_stats).await {
+                Ok((stream, driver_handle)) => {
+                    *session.rebind_driver.lock().unwrap() = Some(driver_handle);
+                    run_over_stream(config, stream, cmd_rx, event_tx).await
+                }
                 Err(e) => {
                     warn!("multipath_quic: connect failed: {e}");
                     event_tx.send(TransportEvent::Disconnected { reason: Some(e) }).await.ok();
@@ -199,6 +219,20 @@ impl MultipathIsekaiPipeQuicSession {
 
     pub(crate) fn is_interactive_busy(&self) -> bool {
         self.interactive_busy.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #11: ユーザーが「今すぐWiFiに戻す」を要求した。`RebindManager`
+    /// (rebind_manager.rs)の`RebindEvent::ManualForceReturnRequested`として
+    /// #22のDriverへ渡す。静けさ待ち・セルラー最小滞在はバイパスされるが、
+    /// WiFi-bound一時Endpointでの疎通確認だけは省略されない
+    /// (`RebindManager::handle_manual_force_return`参照)。接続確立前
+    /// (Driver未起動)の場合は日和見的に無視する。
+    pub(crate) fn force_return_to_wifi(&self) {
+        let driver = self.rebind_driver.lock().unwrap().clone();
+        match driver {
+            Some(driver) => driver.send_event(crate::rebind_manager::RebindEvent::ManualForceReturnRequested),
+            None => warn!("multipath_quic: force_return_to_wifi called before RebindManager Driver started"),
+        }
     }
 
     pub(crate) fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
@@ -584,6 +618,121 @@ pub(crate) struct PhysicalPathCandidate {
     pub(crate) target_addr: SocketAddr,
 }
 
+// ── #22: rebind_ports::{PlatformFdSource,WifiProbeExecutor,RebindExecutor}の実実装 ──
+//
+// このセクションだけが実際のnoq/実fd/実UniFFI callbackに触れる
+// (`RebindManager`(rebind_manager.rs)自体は一切触れない、`rebind_driver.rs`の
+// モジュールdocも参照)。
+
+fn platform_fd_to_bound_fd(pf: crate::PlatformFd) -> Option<rebind_ports::BoundFd> {
+    pf.local_ip.parse::<IpAddr>().ok().map(|local_ip| rebind_ports::BoundFd { fd: pf.fd as RawFd, local_ip })
+}
+
+/// `SessionCallback::on_request_wifi_fd`/`on_request_cellular_fd`
+/// (`OrchestratorCallback`まで委譲される、lib.rs参照)をspawn_blocking越しに呼ぶ。
+/// callbackが無い(接続前等)場合は常に`None`を返す。
+struct RealPlatformFdSource {
+    callback: Option<Arc<dyn SessionCallback>>,
+}
+
+impl rebind_ports::PlatformFdSource for RealPlatformFdSource {
+    fn acquire_wifi_fd(&self) -> impl std::future::Future<Output = Option<rebind_ports::BoundFd>> + Send {
+        let cb = self.callback.clone();
+        async move {
+            let cb = cb?;
+            tokio::task::spawn_blocking(move || cb.on_request_wifi_fd()).await.ok().flatten().and_then(platform_fd_to_bound_fd)
+        }
+    }
+
+    fn acquire_cellular_fd(&self) -> impl std::future::Future<Output = Option<rebind_ports::BoundFd>> + Send {
+        let cb = self.callback.clone();
+        async move {
+            let cb = cb?;
+            tokio::task::spawn_blocking(move || cb.on_request_cellular_fd()).await.ok().flatten().and_then(platform_fd_to_bound_fd)
+        }
+    }
+}
+
+/// 既存の`rebind_to_fd`/`spawn_rebind_listener`と全く同じ経路
+/// (`RebindRequest`をチャネル送信するだけ)を再利用する。
+struct RealRebindExecutor {
+    rebind_tx: tokio::sync::mpsc::Sender<RebindRequest>,
+}
+
+impl rebind_ports::RebindExecutor for RealRebindExecutor {
+    fn rebind(&self, fd: rebind_ports::BoundFd) {
+        let dbg_fd = fd.fd;
+        let req = RebindRequest { fd: fd.fd, local_ip: fd.local_ip, injector: crate::debug_fault::shared_injector() };
+        if self.rebind_tx.try_send(req).is_err() {
+            warn!("rebind_driver: RealRebindExecutor: request channel full or closed, dropping fd={dbg_fd}");
+        }
+    }
+}
+
+/// WiFi-bound一時Endpointで、本番と同じ相手(`remote`)へ実際にQUICハンドシェイクを
+/// 試みる。成功したら疎通確認OK、`WIFI_PROBE_TIMEOUT`以内に終わらなければ/失敗したら
+/// NG。確立した接続はプローブ専用であり、成功・失敗いずれの場合も即座に破棄する
+/// (fd所有権ポリシー: 疎通確認用と本番rebind用は毎回別々に新規取得する、
+/// rebind_ports.rsのBoundFdのdoc参照)。
+struct RealWifiProbeExecutor {
+    remote: RemoteSpec,
+}
+
+const WIFI_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl rebind_ports::WifiProbeExecutor for RealWifiProbeExecutor {
+    fn probe(&self, fd: rebind_ports::BoundFd) -> impl std::future::Future<Output = bool> + Send {
+        let remote = self.remote.clone();
+        async move {
+            let Ok(socket) = udp_socket_from_raw_fd(fd.fd) else {
+                warn!("rebind_driver: probe: invalid fd {}", fd.fd);
+                return false;
+            };
+            let multi = MultiUdpSocket {
+                default: socket,
+                named: Vec::new(),
+                injector: crate::debug_fault::shared_injector(),
+                traffic_stats: TrafficStats::new(),
+            };
+            // NoViablePathは使い捨てのprobe接続からは要らないので、受信側は捨てる。
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
+            let result = tokio::time::timeout(
+                WIFI_PROBE_TIMEOUT,
+                connect_multipath_with_socket(Box::new(multi), remote, Vec::new(), event_tx),
+            )
+            .await;
+            match result {
+                Ok(Ok(MultipathConnection { conn, .. })) => {
+                    conn.close(0u32.into(), b"probe done");
+                    true
+                }
+                Ok(Err(e)) => {
+                    info!("rebind_driver: wifi probe failed: {e}");
+                    false
+                }
+                Err(_) => {
+                    info!("rebind_driver: wifi probe timed out after {WIFI_PROBE_TIMEOUT:?}");
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// `SessionCallback::on_rebind_state_changed`(`OrchestratorCallback`まで委譲される)
+/// へ状態変化を転送する。
+struct RealRebindObserver {
+    callback: Option<Arc<dyn SessionCallback>>,
+}
+
+impl rebind_driver::RebindStateObserver for RealRebindObserver {
+    fn on_state_changed(&self, state: crate::rebind_manager::RebindPublicState) {
+        if let Some(cb) = &self.callback {
+            cb.on_rebind_state_changed(state);
+        }
+    }
+}
+
 /// path0 に接続し、path1（`direct_host`が指定されていれば）と、Phase 9-4の
 /// 物理path候補（`physical`、`Network.bindSocket()`済みのfdから構築）を追加で
 /// 開く。path1・物理pathいずれも確立に失敗して致命的エラーにはしない
@@ -606,16 +755,23 @@ async fn establish_multipath_connection(
     cert_sha256_hex: &str,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
     injector: crate::faulty_udp_socket::UdpFaultInjector,
+    traffic_stats: TrafficStats,
+    // #22: `None`はテスト専用(RebindManagerを配線しない)。本番は常に`Some`。
+    rebind_driver: Option<rebind_driver::RebindDriverHandle>,
 ) -> Result<(noq::Connection, PathHealthTracker, noq::Endpoint), String> {
     // isekai_transport::path_health::spawn_health_monitorは自分専用のイベント型
     // (PathHealthEvent)を使うので、Androidの既存TransportEventチャンネルへ
-    // NoViablePathだけ橋渡しする小タスクを立てる。
+    // NoViablePathだけ橋渡しする小タスクを立てる。#22: 同時にRebindManager Driverへも
+    // RebindEvent::NoViablePathとして転送する(セルラーへの片方向フェイルオーバーの起点)。
     let (health_tx, mut health_rx) = tokio::sync::mpsc::channel::<PathHealthEvent>(8);
     {
         let event_tx = event_tx.clone();
         RUNTIME.spawn(async move {
             while let Some(PathHealthEvent::NoViablePath) = health_rx.recv().await {
                 let _ = event_tx.send(TransportEvent::NoViablePath).await;
+                if let Some(driver) = &rebind_driver {
+                    driver.send_event(crate::rebind_manager::RebindEvent::NoViablePath);
+                }
             }
         });
     }
@@ -641,7 +797,7 @@ async fn establish_multipath_connection(
         let socket = udp_socket_from_raw_fd(p.fd)?;
         named.push(NamedUdpSocket { local_ip: p.local_ip, socket });
     }
-    let multi = MultiUdpSocket { default: default_sock, named, injector, traffic_stats: TrafficStats::new() };
+    let multi = MultiUdpSocket { default: default_sock, named, injector, traffic_stats };
 
     let primary = RemoteSpec {
         addr: path0_addr,
@@ -781,14 +937,19 @@ async fn physical_path_candidates(
 
 async fn try_connect_multipath(
     config: &MultipathIsekaiPipeQuicConfig,
+    rebind_tx: tokio::sync::mpsc::Sender<RebindRequest>,
     rebind_rx: tokio::sync::mpsc::Receiver<RebindRequest>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
-) -> Result<(noq::SendStream, noq::RecvStream), String> {
+    traffic_stats: TrafficStats,
+) -> Result<((noq::SendStream, noq::RecvStream), rebind_driver::RebindDriverHandle), String> {
     // ユーザーが明示指定していればそれを優先し、無指定ならdirect_host使用時のみ
     // 既定の固定ポートにフォールバックする(後方互換)。
     let bind_port = config.bind_port
         .or_else(|| config.direct_host.is_some().then_some(DIRECT_MULTIPATH_BIND_PORT));
+    // #22: bootstrap_helper_via_sshへ渡すと所有権が移るため、RebindManager Driver用に
+    // 先に複製しておく(Arcなので複製は安価)。
+    let rebind_callback = host_key_callback.clone();
     let handshake = isekai_pipe_quic_transport::bootstrap_helper_via_ssh(
         &config.ssh_host, config.ssh_port, &config.username, &config.auth, &config.jump, bind_port,
         &crate::helper_bootstrap::IsekaiPipeP2pMode::None, host_key_callback,
@@ -822,21 +983,41 @@ async fn try_connect_multipath(
         Some(addr) => physical_path_candidates(config, addr, direct_by_bootstrap_host_port).await,
         None => Vec::new(),
     };
+
+    // #22: RemoteSpecが揃った時点でRebindManager Driverを組み立てる。
+    // `establish_multipath_connection`のNoViablePath検知(下)へ`Some(driver_handle)`
+    // として渡し、失敗検知が直接Driverへ届くようにする。
+    let primary_remote = RemoteSpec {
+        addr: path0_addr,
+        server_name: "isekai-pipe.local".to_string(),
+        cert_sha256_hex: cert_sha256_hex.clone(),
+    };
+    let fd_source = Arc::new(RealPlatformFdSource { callback: rebind_callback.clone() });
+    let probe = Arc::new(RealWifiProbeExecutor { remote: primary_remote });
+    let executor = Arc::new(RealRebindExecutor { rebind_tx });
+    let observer: Arc<dyn rebind_driver::RebindStateObserver> = Arc::new(RealRebindObserver { callback: rebind_callback });
+    let driver_handle = rebind_driver::spawn_rebind_driver(fd_source, probe, executor, observer);
+
     let (conn, _broker, endpoint) = establish_multipath_connection(
         path0_addr, path1_addr, physical, &cert_sha256_hex, event_tx, crate::debug_fault::shared_injector(),
+        traffic_stats.clone(), Some(driver_handle.clone()),
     )
     .await?;
     let (send, recv) = hello_ack(&conn, &session_secret).await?;
     info!("multipath_quic: HELLO/ACK ok — handing off to SSH");
-    spawn_rebind_listener(endpoint, rebind_rx);
-    Ok((send, recv))
+    spawn_rebind_listener(endpoint, rebind_rx, traffic_stats);
+    Ok(((send, recv), driver_handle))
 }
 
 /// `rebind_to_fd`からの要求を待ち受け、`Endpoint::rebind_abstract()`でendpointの
 /// ソケットを丸ごと差し替える。物理pathのopen_pathとは異なりnoq issue #738の
 /// バグを踏まない（新規pathの追加検証ではなく、既存endpoint全体のNATリバインド
 /// 相当の操作のため）。
-fn spawn_rebind_listener(endpoint: noq::Endpoint, mut rebind_rx: tokio::sync::mpsc::Receiver<RebindRequest>) {
+fn spawn_rebind_listener(
+    endpoint: noq::Endpoint,
+    mut rebind_rx: tokio::sync::mpsc::Receiver<RebindRequest>,
+    traffic_stats: TrafficStats,
+) {
     RUNTIME.spawn(async move {
         while let Some(req) = rebind_rx.recv().await {
             let socket = match udp_socket_from_raw_fd(req.fd) {
@@ -850,7 +1031,9 @@ fn spawn_rebind_listener(endpoint: noq::Endpoint, mut rebind_rx: tokio::sync::mp
                 default: socket,
                 named: Vec::new(),
                 injector: req.injector,
-                traffic_stats: TrafficStats::new(),
+                // rebindを跨いでも同じTrafficStatsを使い続ける(MultipathIsekaiPipeQuicSession
+                // 全体で1つ、#8参照)。
+                traffic_stats: traffic_stats.clone(),
             };
             match endpoint.rebind_abstract(Box::new(multi)) {
                 Ok(()) => info!("multipath_quic: rebind to local_ip={} succeeded", req.local_ip),
@@ -1139,7 +1322,7 @@ mod tests {
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let path1: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
 
-        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, Some(path1), Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
+        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, Some(path1), Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector(), TrafficStats::new(), None).await.unwrap();
         assert_eq!(tracker.get(&PRIMARY_LABEL.into()), PathState::Validated);
 
         let (send, recv) = hello_ack(&conn, &secret).await.unwrap();
@@ -1159,7 +1342,7 @@ mod tests {
         let (port, cert_sha256_hex, secret) = start_test_server().await;
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
+        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector(), TrafficStats::new(), None).await.unwrap();
         let (send, recv) = hello_ack(&conn, &secret).await.unwrap();
         drop(send);
         drop(recv);
@@ -1195,7 +1378,7 @@ mod tests {
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
         let (conn, tracker, endpoint) =
-            establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
+            establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector(), TrafficStats::new(), None).await.unwrap();
         assert_eq!(tracker.get(&PRIMARY_LABEL.into()), PathState::Validated);
 
         // rebind前: 通常のecho往復が動くことを確認。
@@ -1241,7 +1424,7 @@ mod tests {
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let path1: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
 
-        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, Some(path1), Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
+        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, Some(path1), Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector(), TrafficStats::new(), None).await.unwrap();
         let state = poll_until_path_state(&tracker, &SECONDARY_LABEL.into(), PathState::Validated).await;
         assert_eq!(state, PathState::Validated, "path1 should validate within timeout");
 
@@ -1303,7 +1486,7 @@ mod tests {
             target_addr: direct,
         }];
         let (conn, tracker, _endpoint) =
-            establish_multipath_connection(path0, Some(direct), physical, &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
+            establish_multipath_connection(path0, Some(direct), physical, &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector(), TrafficStats::new(), None).await.unwrap();
 
         let state = poll_until_path_state(&tracker, &PHYSICAL_WIFI_LABEL.into(), PathState::Validated).await;
         assert_eq!(
@@ -1341,7 +1524,7 @@ mod tests {
         let (port, cert_sha256_hex, _secret) = start_test_server().await;
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector()).await.unwrap();
+        let (conn, tracker, _endpoint) = establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, tokio::sync::mpsc::channel(8).0, crate::debug_fault::shared_injector(), TrafficStats::new(), None).await.unwrap();
         assert_eq!(tracker.get(&PRIMARY_LABEL.into()), PathState::Validated);
 
         // DEGRADED_RTT_THRESHOLD(800ms)を大きく超える片道遅延を注入する。
@@ -1400,7 +1583,7 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let (conn, tracker, _endpoint) =
-            establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, event_tx, injector.clone())
+            establish_multipath_connection(path0, None, Vec::new(), &cert_sha256_hex, event_tx, injector.clone(), TrafficStats::new(), None)
                 .await
                 .unwrap();
         assert_eq!(tracker.get(&PRIMARY_LABEL.into()), PathState::Validated);
@@ -1440,7 +1623,7 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let (conn, tracker, endpoint) = establish_multipath_connection(
-            path0, None, Vec::new(), &cert_sha256_hex, event_tx, wifi_injector.clone(),
+            path0, None, Vec::new(), &cert_sha256_hex, event_tx, wifi_injector.clone(), TrafficStats::new(), None,
         )
         .await
         .unwrap();
@@ -1477,7 +1660,7 @@ mod tests {
         let _ = std_sock.into_raw_fd(); // rebind先に所有権を渡す（detachFd相当）
 
         let (rebind_tx, rebind_rx) = tokio::sync::mpsc::channel(4);
-        spawn_rebind_listener(endpoint, rebind_rx);
+        spawn_rebind_listener(endpoint, rebind_rx, TrafficStats::new());
         rebind_tx
             .send(RebindRequest { fd, local_ip: cellular_ip, injector: cellular_injector })
             .await

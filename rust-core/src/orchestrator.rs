@@ -59,6 +59,13 @@ impl ActiveSession {
             s.rebind_to_fd(fd, local_ip);
         }
     }
+    /// #11: ユーザーが「今すぐWiFiに戻す」を要求した。マルチパス以外のtransportでは
+    /// 何もしない(rebind_to_fdと同じ理由)。
+    fn force_return_to_wifi(&self) {
+        if let Self::MultipathIsekaiPipeQuic(s) = self {
+            s.force_return_to_wifi();
+        }
+    }
     /// trzsz転送中(WaitingUser含む)かどうかをRebindManager(#22のDriver)の
     /// 静けさ判定の補助シグナルとして伝える。マルチパス以外では意味を持たないため
     /// `rebind_to_fd`と同じくno-op委譲。
@@ -467,6 +474,16 @@ impl SessionOrchestrator {
     pub fn rebind_to_fd(&self, fd: i32, local_ip: String) {
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.rebind_to_fd(fd, local_ip);
+        }
+    }
+
+    /// #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
+    /// ダウンロード中などで静けさ待ちを待たずに即座に戻したい場合)。疎通確認だけは
+    /// 省略されない(`RebindManager::handle_manual_force_return`参照)。マルチパス以外の
+    /// transportや未接続時は何もしない。
+    pub fn force_return_to_wifi(&self) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.force_return_to_wifi();
         }
     }
 
