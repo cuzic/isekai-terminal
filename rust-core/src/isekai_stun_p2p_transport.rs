@@ -80,23 +80,23 @@ pub struct IsekaiStunP2pConfig {
     pub stun_servers: Vec<String>,
 }
 
-#[derive(uniffi::Object)]
-pub struct IsekaiStunP2pSession {
+// `SessionOrchestrator`(orchestrator.rs)がActiveSession::IsekaiStunP2pとして
+// 内部的に使う実装。両OSともSessionOrchestrator/OrchestratorCallbackへ移行済みのため
+// (2026-07-11)、UniFFIへの公開はやめてクレート内部専用にした。
+pub(crate) struct IsekaiStunP2pSession {
     config: IsekaiStunP2pConfig,
     core: SessionCore,
 }
 
-#[uniffi::export]
-pub fn create_isekai_stun_p2p_session(config: IsekaiStunP2pConfig) -> Arc<IsekaiStunP2pSession> {
+pub(crate) fn create_isekai_stun_p2p_session(config: IsekaiStunP2pConfig) -> Arc<IsekaiStunP2pSession> {
     init_logger();
     Arc::new(IsekaiStunP2pSession { config, core: SessionCore::new() })
 }
 
-#[uniffi::export]
 impl IsekaiStunP2pSession {
     /// STUN+SSH rendezvous による直接 P2P QUIC のみを試す。フォールバック無し
     /// （穴あけが成立しなければ接続失敗として扱う。PLAN.md Phase 10 の設計判断参照）。
-    pub fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
+    pub(crate) fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         // ブートストラップ用SSHのホスト鍵検証を本セッションのcallbackに委譲する
@@ -128,46 +128,35 @@ impl IsekaiStunP2pSession {
         Ok(())
     }
 
-    pub fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
+    pub(crate) fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
 
-    pub fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
+    pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
     }
 
-    pub fn send(&self, data: Vec<u8>) { self.core.send(data); }
+    pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
 
-    pub fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
+    pub(crate) fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
 
-    pub fn disconnect(&self) { self.core.disconnect(); }
+    pub(crate) fn disconnect(&self) { self.core.disconnect(); }
 
-    pub fn trzsz_accept_upload(&self, transfer_id: String, file_name: String,
+    pub(crate) fn trzsz_accept_upload(&self, transfer_id: String, file_name: String,
                                file_size: u64, mode: u32) {
         self.core.trzsz_accept_upload(transfer_id, file_name, file_size, mode);
     }
 
-    pub fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
+    pub(crate) fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
         self.core.trzsz_send_chunk(transfer_id, data, is_last);
     }
 
-    pub fn trzsz_accept_download(&self, transfer_id: String) {
+    pub(crate) fn trzsz_accept_download(&self, transfer_id: String) {
         self.core.trzsz_accept_download(transfer_id);
     }
 
-    pub fn trzsz_cancel(&self, transfer_id: String) {
+    pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
     }
 
-    /// Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
-    /// 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
-    /// `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
-    /// 何もしない。
-    pub fn notify_network_lost(&self) {
-        self.core.notify_network_lost(true);
-    }
-}
-
-// SessionOrchestrator からのみ呼ばれる内部API(uniffi には直接は出さない)。
-impl IsekaiStunP2pSession {
     /// Phase 12: per-session theme。
     pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
         self.core.set_theme(theme);

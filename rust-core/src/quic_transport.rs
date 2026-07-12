@@ -39,21 +39,21 @@ pub struct QuicConfig {
     pub skip_cert_verify: bool,
 }
 
-#[derive(uniffi::Object)]
-pub struct QuicSession {
+// `SessionOrchestrator`(orchestrator.rs)がActiveSession::Quicとして内部的に使う
+// 実装。両OSともSessionOrchestrator/OrchestratorCallbackへ移行済みのため
+// (2026-07-11)、UniFFIへの公開はやめてクレート内部専用にした。
+pub(crate) struct QuicSession {
     config: QuicConfig,
     core: SessionCore,
 }
 
-#[uniffi::export]
-pub fn create_quic_session(config: QuicConfig) -> Arc<QuicSession> {
+pub(crate) fn create_quic_session(config: QuicConfig) -> Arc<QuicSession> {
     init_logger();
     Arc::new(QuicSession { config, core: SessionCore::new() })
 }
 
-#[uniffi::export]
 impl QuicSession {
-    pub fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
+    pub(crate) fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         RUNTIME.spawn(async move {
@@ -62,37 +62,35 @@ impl QuicSession {
         Ok(())
     }
 
-    pub fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
+    pub(crate) fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
 
-    pub fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
+    pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
     }
 
-    pub fn send(&self, data: Vec<u8>) { self.core.send(data); }
+    pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
 
-    pub fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
+    pub(crate) fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
 
-    pub fn disconnect(&self) { self.core.disconnect(); }
+    pub(crate) fn disconnect(&self) { self.core.disconnect(); }
 
-    pub fn trzsz_accept_upload(&self, transfer_id: String, file_name: String,
+    pub(crate) fn trzsz_accept_upload(&self, transfer_id: String, file_name: String,
                                file_size: u64, mode: u32) {
         self.core.trzsz_accept_upload(transfer_id, file_name, file_size, mode);
     }
 
-    pub fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
+    pub(crate) fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
         self.core.trzsz_send_chunk(transfer_id, data, is_last);
     }
 
-    pub fn trzsz_accept_download(&self, transfer_id: String) {
+    pub(crate) fn trzsz_accept_download(&self, transfer_id: String) {
         self.core.trzsz_accept_download(transfer_id);
     }
 
-    pub fn trzsz_cancel(&self, transfer_id: String) {
+    pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
     }
-}
 
-impl QuicSession {
     pub(crate) fn add_local_forward(
         &self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16,
     ) {

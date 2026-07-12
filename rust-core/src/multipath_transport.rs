@@ -125,24 +125,24 @@ struct RebindRequest {
     injector: crate::faulty_udp_socket::UdpFaultInjector,
 }
 
-#[derive(uniffi::Object)]
-pub struct MultipathIsekaiPipeQuicSession {
+// `SessionOrchestrator`(orchestrator.rs)がActiveSession::MultipathIsekaiPipeQuicとして
+// 内部的に使う実装。両OSともSessionOrchestrator/OrchestratorCallbackへ移行済みのため
+// (2026-07-11)、UniFFIへの公開はやめてクレート内部専用にした。
+pub(crate) struct MultipathIsekaiPipeQuicSession {
     config: MultipathIsekaiPipeQuicConfig,
     core: SessionCore,
     rebind_tx: StdMutex<Option<tokio::sync::mpsc::Sender<RebindRequest>>>,
 }
 
-#[uniffi::export]
-pub fn create_multipath_isekai_pipe_quic_session(config: MultipathIsekaiPipeQuicConfig) -> Arc<MultipathIsekaiPipeQuicSession> {
+pub(crate) fn create_multipath_isekai_pipe_quic_session(config: MultipathIsekaiPipeQuicConfig) -> Arc<MultipathIsekaiPipeQuicSession> {
     init_logger();
     Arc::new(MultipathIsekaiPipeQuicSession { config, core: SessionCore::new(), rebind_tx: StdMutex::new(None) })
 }
 
-#[uniffi::export]
 impl MultipathIsekaiPipeQuicSession {
     /// フォールバック無し。path0/path1 のブートストラップ・QUIC 接続に失敗したら
     /// エラーを返す（`TransportPreference::IsekaiPipeQuicMultipath` 相当）。
-    pub fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
+    pub(crate) fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         let (rebind_tx, rebind_rx) = tokio::sync::mpsc::channel(4);
@@ -166,7 +166,7 @@ impl MultipathIsekaiPipeQuicSession {
     /// `fd`は`Network.bindSocket()`済み・`ParcelFileDescriptor.detachFd()`済みの生fd
     /// （所有権はこちらに移る）。接続確立前や既にrebind中の場合は素通りする
     /// （エラーにはしない——呼び出し側は日和見的に呼べばよい）。
-    pub fn rebind_to_fd(&self, fd: i32, local_ip: String) {
+    pub(crate) fn rebind_to_fd(&self, fd: i32, local_ip: String) {
         let Ok(local_ip) = local_ip.parse::<IpAddr>() else {
             warn!("multipath_quic: rebind_to_fd: invalid local_ip {local_ip:?}");
             return;
@@ -182,46 +182,34 @@ impl MultipathIsekaiPipeQuicSession {
         }
     }
 
-    pub fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
+    pub(crate) fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
 
-    pub fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
+    pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
     }
 
-    pub fn send(&self, data: Vec<u8>) { self.core.send(data); }
+    pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
 
-    pub fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
+    pub(crate) fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
 
-    pub fn disconnect(&self) { self.core.disconnect(); }
+    pub(crate) fn disconnect(&self) { self.core.disconnect(); }
 
-    pub fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
+    pub(crate) fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
         self.core.trzsz_accept_upload(transfer_id, file_name, file_size, mode);
     }
 
-    pub fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
+    pub(crate) fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
         self.core.trzsz_send_chunk(transfer_id, data, is_last);
     }
 
-    pub fn trzsz_accept_download(&self, transfer_id: String) {
+    pub(crate) fn trzsz_accept_download(&self, transfer_id: String) {
         self.core.trzsz_accept_download(transfer_id);
     }
 
-    pub fn trzsz_cancel(&self, transfer_id: String) {
+    pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
     }
 
-    /// Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
-    /// 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。QUICは
-    /// `is_quic=true`固定 — 接続済みならtransport自身のtransparent resumeを信頼し
-    /// 何もしない(物理Wi-Fi/セルラー切替はpath0/path1のmultipath自体が別途担う、
-    /// `rebind_to_fd`参照)。
-    pub fn notify_network_lost(&self) {
-        self.core.notify_network_lost(true);
-    }
-}
-
-// SessionOrchestrator からのみ呼ばれる内部API(uniffi には直接は出さない)。
-impl MultipathIsekaiPipeQuicSession {
     /// Phase 12: per-session theme。
     pub(crate) fn set_theme(&self, theme: crate::theme::Theme) {
         self.core.set_theme(theme);

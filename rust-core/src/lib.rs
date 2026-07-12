@@ -25,7 +25,7 @@ pub mod debug_fault;
 pub(crate) mod resume_client;
 pub(crate) mod android_quic_endpoint;
 
-pub use quic_transport::{create_quic_session, QuicConfig, QuicSession};
+pub use quic_transport::QuicConfig;
 pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};
 pub use session_supervisor::{create_session_supervisor, ExecutionMode, SessionState, SessionSupervisor};
 
@@ -702,8 +702,7 @@ pub trait OrchestratorCallback: Send + Sync {
 
 // ── Old callback interface (kept for binary compatibility) ──
 
-#[uniffi::export(callback_interface)]
-pub trait SessionCallback: Send + Sync {
+pub(crate) trait SessionCallback: Send + Sync {
     fn on_data(&self, data: Vec<u8>);
     fn on_host_key(&self, fingerprint: String) -> bool;
     fn on_connected(&self);
@@ -722,22 +721,24 @@ pub trait SessionCallback: Send + Sync {
 }
 
 // ── SshSession ──────────────────────────────────────────
+//
+// `SessionOrchestrator`(orchestrator.rs)がActiveSession::Sshとして内部的に使う
+// 実装。かつてはKotlin/Swiftから`createSshSession`/`SessionCallback`経由で直接
+// 使われていたが、両OSともSessionOrchestrator/OrchestratorCallbackへ移行済みのため
+// (2026-07-11)、UniFFIへの公開はやめてクレート内部専用にした。
 
-#[derive(uniffi::Object)]
-pub struct SshSession {
+pub(crate) struct SshSession {
     config: SshConfig,
     core: SessionCore,
 }
 
-#[uniffi::export]
-pub fn create_ssh_session(config: SshConfig) -> Arc<SshSession> {
+pub(crate) fn create_ssh_session(config: SshConfig) -> Arc<SshSession> {
     init_logger();
     Arc::new(SshSession { config, core: SessionCore::new() })
 }
 
-#[uniffi::export]
 impl SshSession {
-    pub fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
+    pub(crate) fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         // config.forwards はコマンドチャネル経由で forward_type に応じたコマンドとして
@@ -779,48 +780,35 @@ impl SshSession {
         Ok(())
     }
 
-    pub fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
+    pub(crate) fn scrollback_len(&self) -> u32 { self.core.scrollback_len() }
 
-    pub fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
+    pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
     }
 
-    pub fn send(&self, data: Vec<u8>) { self.core.send(data); }
+    pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
 
-    pub fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
+    pub(crate) fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
 
-    pub fn disconnect(&self) { self.core.disconnect(); }
+    pub(crate) fn disconnect(&self) { self.core.disconnect(); }
 
-    pub fn trzsz_accept_upload(&self, transfer_id: String, file_name: String,
+    pub(crate) fn trzsz_accept_upload(&self, transfer_id: String, file_name: String,
                                file_size: u64, mode: u32) {
         self.core.trzsz_accept_upload(transfer_id, file_name, file_size, mode);
     }
 
-    pub fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
+    pub(crate) fn trzsz_send_chunk(&self, transfer_id: String, data: Vec<u8>, is_last: bool) {
         self.core.trzsz_send_chunk(transfer_id, data, is_last);
     }
 
-    pub fn trzsz_accept_download(&self, transfer_id: String) {
+    pub(crate) fn trzsz_accept_download(&self, transfer_id: String) {
         self.core.trzsz_accept_download(transfer_id);
     }
 
-    pub fn trzsz_cancel(&self, transfer_id: String) {
+    pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
     }
 
-    /// Phase 1C(#26): OSからネットワーク断を通知された時の対応(`SessionCore`が
-    /// 判断、詳細は`session.rs`の`should_abort_on_network_lost`参照)。プレーンSSH
-    /// (TCP)は`is_quic=false`固定 — 接続済みでも切断扱いにする。
-    pub fn notify_network_lost(&self) {
-        self.core.notify_network_lost(false);
-    }
-}
-
-// ── ポートフォワードの動的追加/削除 ───────────────────────
-// SessionOrchestrator からのみ呼ばれる内部 API(uniffi には直接は出さない)。
-// MVP の ProfileEditScreen は接続時に forwards をまとめて適用するだけだが、
-// 将来 Kotlin から接続中に動的に追加/削除する UI を足すときはここを export すればよい。
-impl SshSession {
     pub(crate) fn add_local_forward(
         &self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16,
     ) {
