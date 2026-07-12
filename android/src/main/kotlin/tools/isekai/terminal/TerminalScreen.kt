@@ -34,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.input.KeyboardLayoutMode
 import tools.isekai.terminal.input.TerminalInputView
 import tools.isekai.terminal.input.TerminalKeyEncoder
 import tools.isekai.terminal.ui.AgentSignConfirmDialog
@@ -240,6 +241,10 @@ fun TerminalScreenBody(
         // ここでは画面表示のたびに最新の永続化値を読み直すだけでよい。
         val terminalTheme = remember {
             TerminalThemes.byName(prefs.getString(TerminalThemes.PREF_KEY, null))
+        }
+        // JIS/US配列モードの選択も ProfileListScreen 側のメニューで行う（グローバル設定）。
+        val keyboardLayoutMode = remember {
+            KeyboardLayoutMode.fromPrefValue(prefs.getString(KeyboardLayoutMode.PREF_KEY, null))
         }
 
         val update = screenUpdate
@@ -504,6 +509,7 @@ fun TerminalScreenBody(
                     update = { view ->
                         view.applicationCursorMode = screenUpdate?.applicationCursorMode ?: false
                         view.bracketedPasteMode = screenUpdate?.bracketedPasteMode ?: false
+                        view.keyboardLayoutMode = keyboardLayoutMode
                         view.ctrlArmed = ctrlArmed
                         view.onCtrlConsumed = { ctrlArmed = false }
                         if (connected) {

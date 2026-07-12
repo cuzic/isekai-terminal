@@ -49,6 +49,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.HostKeySettings
+import tools.isekai.terminal.input.KeyboardLayoutMode
 import tools.isekai.terminal.ui.DeleteConfirmDialog
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
@@ -90,6 +91,13 @@ fun ProfileListScreen(
     var showThemeDialog by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
     var showSecurityDialog by remember { mutableStateOf(false) }
+    var showKeyboardLayoutDialog by remember { mutableStateOf(false) }
+
+    // 外部/BluetoothキーボードのJIS/US配列モード。テーマと同じく、どのホストに
+    // 接続していても使う物理キーボード側の特性なのでグローバル設定として永続化する。
+    var keyboardLayoutMode by remember {
+        mutableStateOf(KeyboardLayoutMode.fromPrefValue(prefs.getString(KeyboardLayoutMode.PREF_KEY, null)))
+    }
 
     // 画面の保護(FLAG_SECURE、#62)もプロファイル毎ではなくグローバル設定として永続化する。
     // 既定OFF(常時ONは一部ユーザに不便なため)のオプトイン機能。
@@ -134,6 +142,10 @@ fun ProfileListScreen(
                         DropdownMenuItem(
                             text = { Text("配色") },
                             onClick = { showMenu = false; showThemeDialog = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("キーボード配列: ${keyboardLayoutMode.label()}") },
+                            onClick = { showMenu = false; showKeyboardLayoutDialog = true },
                         )
                         DropdownMenuItem(
                             text = { Text("定型") },
@@ -278,6 +290,17 @@ fun ProfileListScreen(
             onDismiss = { showSecurityDialog = false },
         )
     }
+
+    if (showKeyboardLayoutDialog) {
+        KeyboardLayoutDialog(
+            current = keyboardLayoutMode,
+            onSelect = { mode ->
+                keyboardLayoutMode = mode
+                prefs.edit().putString(KeyboardLayoutMode.PREF_KEY, mode.name).apply()
+            },
+            onDismiss = { showKeyboardLayoutDialog = false },
+        )
+    }
 }
 
 /**
@@ -351,6 +374,53 @@ internal fun TerminalThemeDialog(
                         )
                         Spacer(Modifier.width(4.dp))
                         Text(theme.name)
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("閉じる") }
+        },
+    )
+}
+
+/**
+ * 外部/BluetoothキーボードのJIS/US配列モード選択ダイアログ。既定は「自動判定」
+ * ([KeyboardLayoutDetector]によるハードウェア構成からの推定)。推定が外れる端末向けに
+ * JIS/USへの手動固定を用意する。
+ */
+@Composable
+internal fun KeyboardLayoutDialog(
+    current: KeyboardLayoutMode,
+    onSelect: (KeyboardLayoutMode) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("キーボード配列") },
+        text = {
+            Column {
+                Text(
+                    "接続中の外部キーボードが¥キー/ろキーを備えているかで自動判定します。" +
+                        "うまく検出されない場合はここで固定してください。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(4.dp))
+                KeyboardLayoutMode.entries.forEach { mode ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onSelect(mode); onDismiss() }
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(
+                            selected = mode == current,
+                            onClick = { onSelect(mode); onDismiss() },
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(mode.label())
                     }
                 }
             }
