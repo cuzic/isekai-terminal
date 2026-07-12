@@ -4,7 +4,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Paint as AndroidPaint
-import android.graphics.Typeface
 import android.net.Uri
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.compose.BackHandler
@@ -47,6 +46,7 @@ import tools.isekai.terminal.ui.HostKeyChangedDialog
 import tools.isekai.terminal.ui.HostKeyUnknownDialog
 import tools.isekai.terminal.ui.SelectionRange
 import tools.isekai.terminal.ui.SshTerminalCanvas
+import tools.isekai.terminal.ui.TerminalFontSettings
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.offsetToCellPos
 import tools.isekai.terminal.ui.reconstructSelectionText
@@ -271,6 +271,11 @@ fun TerminalScreenBody(
         val terminalTheme = remember {
             TerminalThemes.byName(prefs.getString(TerminalThemes.PREF_KEY, null))
         }
+        // カスタムフォント([TerminalFontSettings])もテーマと同じくグローバル設定として
+        // ProfileListScreen 側で選択され、ここでは画面表示のたびに読み直すだけでよい。
+        // 未選択、または壊れたフォントファイルの場合は既定の Typeface.MONOSPACE のまま
+        // 動作する(TerminalFontSettings.loadTypeface 内でフォールバック済み)。
+        val terminalTypeface = remember { TerminalFontSettings.loadTypeface(context, prefs) }
 
         val update = screenUpdate
         if (isActive && update != null) {
@@ -283,9 +288,9 @@ fun TerminalScreenBody(
                 val widthPx = with(density) { maxWidth.toPx() }
                 val heightPx = with(density) { maxHeight.toPx() }
 
-                val cellDims = remember(density, fontScale) {
+                val cellDims = remember(density, fontScale, terminalTypeface) {
                     AndroidPaint().apply {
-                        typeface = Typeface.MONOSPACE
+                        typeface = terminalTypeface
                         textSize = 14f * density.density * fontScale
                     }.let { paint ->
                         val cellW = paint.measureText("M")
@@ -351,6 +356,7 @@ fun TerminalScreenBody(
                         update = displayUpdate,
                         selection = selection,
                         theme = terminalTheme,
+                        typeface = terminalTypeface,
                         modifier = Modifier
                             .fillMaxSize()
                             .pointerInput(Unit) {

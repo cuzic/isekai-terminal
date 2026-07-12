@@ -1,6 +1,10 @@
 package tools.isekai.terminal
 
 import android.app.Activity
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,6 +21,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -24,6 +29,7 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -34,6 +40,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -47,9 +54,13 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.HostKeySettings
 import tools.isekai.terminal.ui.DeleteConfirmDialog
+import tools.isekai.terminal.ui.TerminalFontSettings
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
@@ -90,6 +101,40 @@ fun ProfileListScreen(
     var showThemeDialog by remember { mutableStateOf(false) }
     var showMenu by remember { mutableStateOf(false) }
     var showSecurityDialog by remember { mutableStateOf(false) }
+
+    // カスタム端末フォント(TTF/OTF)もテーマと同じくグローバル設定として永続化するが、
+    // 「配色テーマ(TerminalTheme.kt)とは分離する」というスコープ済み方針により
+    // 独立した TerminalFontSettings(SharedPreferences のキーのみ分離)として扱う。
+    var showFontDialog by remember { mutableStateOf(false) }
+    var currentFontFileName by remember { mutableStateOf(prefs.getString(TerminalFontSettings.PREF_KEY, null)) }
+    var fontErrorMessage by remember { mutableStateOf<String?>(null) }
+    val coroutineScope = rememberCoroutineScope()
+    val fontPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val displayName = queryDisplayName(context, uri)
+            RemoteLogger.i("IsekaiTerminalFont", "font file selected via SAF: $displayName uri=$uri")
+            coroutineScope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    TerminalFontSettings.importFont(context, prefs, uri, displayName)
+                }
+                when (result) {
+                    is TerminalFontSettings.ImportResult.Success -> {
+                        RemoteLogger.i("IsekaiTerminalFont", "font import succeeded: ${result.fileName}")
+                        currentFontFileName = result.fileName
+                        fontErrorMessage = null
+                    }
+                    is TerminalFontSettings.ImportResult.Failure -> {
+                        RemoteLogger.e("IsekaiTerminalFont", "font import failed: ${result.message}")
+                        fontErrorMessage = result.message
+                    }
+                }
+            }
+        } else {
+            RemoteLogger.i("IsekaiTerminalFont", "SAF font picker cancelled")
+        }
+    }
 
     // 画面の保護(FLAG_SECURE、#62)もプロファイル毎ではなくグローバル設定として永続化する。
     // 既定OFF(常時ONは一部ユーザに不便なため)のオプトイン機能。
@@ -134,6 +179,10 @@ fun ProfileListScreen(
                         DropdownMenuItem(
                             text = { Text("配色") },
                             onClick = { showMenu = false; showThemeDialog = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("フォント") },
+                            onClick = { showMenu = false; fontErrorMessage = null; showFontDialog = true },
                         )
                         DropdownMenuItem(
                             text = { Text("定型") },
@@ -278,6 +327,36 @@ fun ProfileListScreen(
             onDismiss = { showSecurityDialog = false },
         )
     }
+
+    if (showFontDialog) {
+        FontSettingsDialog(
+            currentFontLabel = currentFontFileName ?: "デフォルト (Monospace)",
+            errorMessage = fontErrorMessage,
+            onPickFont = { fontPickerLauncher.launch(arrayOf("*/*")) },
+            onResetFont = {
+                TerminalFontSettings.clearStoredFont(context, prefs)
+                currentFontFileName = null
+                fontErrorMessage = null
+                RemoteLogger.i("IsekaiTerminalFont", "font reset to default (Typeface.MONOSPACE)")
+            },
+            onDismiss = { showFontDialog = false },
+        )
+    }
+}
+
+/** SAF の [Uri] の表示名(元ファイル名)を [OpenableColumns.DISPLAY_NAME] から取得する。
+ *  取得できない場合は [Uri.getLastPathSegment] にフォールバックする。 */
+private fun queryDisplayName(context: android.content.Context, uri: Uri): String? {
+    return try {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) cursor.getString(idx) else null
+            } else null
+        } ?: uri.lastPathSegment
+    } catch (e: Exception) {
+        uri.lastPathSegment
+    }
 }
 
 /**
@@ -318,6 +397,52 @@ private fun SecuritySettingsDialog(
                         },
                     )
                 }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("閉じる") }
+        },
+    )
+}
+
+/**
+ * カスタム端末フォント(TTF/OTF)の選択・削除ダイアログ。配色テーマ([TerminalThemeDialog])とは
+ * 独立した設定として、選択→内部ストレージへコピー→[Typeface][android.graphics.Typeface]としての
+ * 検証、というフローを [TerminalFontSettings.importFont] に委譲する(実際のI/Oはバックグラウンド
+ * スレッドで行われ、結果に応じて [errorMessage] が表示される)。
+ */
+@Composable
+internal fun FontSettingsDialog(
+    currentFontLabel: String,
+    errorMessage: String?,
+    onPickFont: () -> Unit,
+    onResetFont: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("フォント") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("現在のフォント: $currentFontLabel", fontSize = 13.sp)
+                Text(
+                    "端末上の TTF/OTF ファイル(Nerd Font 等)を選択してターミナルのフォントに" +
+                        "設定できます。読み込めないファイルを選んだ場合は既定のフォントのまま" +
+                        "変更されません。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                errorMessage?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                }
+                Button(
+                    onClick = onPickFont,
+                    modifier = Modifier.fillMaxWidth().testTag("fontPickButton"),
+                ) { Text("TTF/OTF ファイルを選択") }
+                OutlinedButton(
+                    onClick = onResetFont,
+                    modifier = Modifier.fillMaxWidth().testTag("fontResetButton"),
+                ) { Text("デフォルトに戻す") }
             }
         },
         confirmButton = {
