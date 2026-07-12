@@ -187,6 +187,9 @@ private fun TerminalTabScreen(
             onGetSessionLog = { tabsVm.getSessionLog(tabId) },
             onSendSnippet = { snippet -> tabsVm.sendSnippet(tabId, snippet) },
             onRespondAgentSignRequest = { approved -> tabsVm.respondAgentSignRequest(tabId, approved) },
+            // 物理キーボードの Ctrl+Tab / Ctrl+Shift+Tab によるタブ切替（TerminalInputView 経由）。
+            onNextTab = { tabsVm.nextTab() },
+            onPreviousTab = { tabsVm.previousTab() },
         ),
     )
 }

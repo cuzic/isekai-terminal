@@ -80,6 +80,17 @@ object TerminalKeyEncoder {
     }
 
     /**
+     * 物理 Alt(Meta)キー併用時: ESC プレフィックスを付与する。xterm 等の
+     * "Meta sends escape"(`altSendsEscape`)相当で、readline/vim 等の Alt+<key> ショートカット
+     * (Alt+b/Alt+f で単語単位移動、等)をターミナル側アプリへそのまま伝えるための標準的な変換。
+     * unicodeChar が 0 なら null。
+     */
+    fun altKeyBytes(unicodeChar: Int): ByteArray? {
+        val base = unicodeCharBytes(unicodeChar) ?: return null
+        return byteArrayOf(0x1B) + base
+    }
+
+    /**
      * IME 確定テキスト／クリップボードペーストのテキスト→バイト列。
      * 複数コードポイントかつ bracketedPasteMode が有効な場合のみブラケットペーストで囲む。
      * サロゲートペア（絵文字等）を正しく 1 コードポイントとして扱うため codePointCount を使用。
