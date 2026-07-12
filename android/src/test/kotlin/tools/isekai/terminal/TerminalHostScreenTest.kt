@@ -62,7 +62,7 @@ class TerminalHostScreenTest {
             orchestrators.add(fake)
             TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
         }
-        vm = TerminalTabsViewModel(app, executor, sessionFactory)
+        vm = TerminalTabsViewModel(app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler))
     }
 
     @After

@@ -14,7 +14,6 @@ import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
-import org.junit.Ignore
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -63,7 +62,10 @@ class TerminalTabsViewModelTest {
             orchestrators.add(fake)
             TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
         }
-        vm = TerminalTabsViewModel(app, executor, sessionFactory)
+        // ViewModel内部のviewModelScope.launch(ioDispatcher)にも同じtestScheduler駆動の
+        // ディスパッチャーを使わせ、テストの仮想時間と実スレッドの完了タイミングが競合して
+        // withTimeout()ポーリングが断続的にタイムアウトする問題(pre-existing flaky)を解消する。
+        vm = TerminalTabsViewModel(app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler))
     }
 
     @After
@@ -184,15 +186,14 @@ class TerminalTabsViewModelTest {
         )
     }
 
-    // openTab()が同期的にensureServiceRunning()を呼ぶ一方、非同期のconnect*()系関数(Dispatchers.IO)
-    // も独立してensureServiceRunning()を呼ぶため、後者がアサーション実行前に間に合うかどうかで
-    // 揺れる(pre-existing、split-pane等いずれのマージが原因でもないことをsplit-pane導入前の
-    // コミットで再現して確認済み)。
-    @Ignore("flaky: openTab()同期呼び出しと非同期connect()呼び出しのタイミング競合による既知の揺れ")
     @Test
     fun openTab_onlyEnsuresServiceRunning_doesNotStopIt() = runBlocking {
         vm.openTab(profile("a"), "pass")
-        assertEquals(1, executor.serviceRunCount)
+        // openTab()自身の同期呼び出しと、非同期connect*()系関数からの呼び出しの両方が
+        // executor.ensureServiceRunning()を呼ぶため2回になり得る(本番でも意図された挙動:
+        // ensureServiceRunningは冪等で、複数回呼んでも無害)。ここで検証すべき不変条件は
+        // 「少なくとも1回は呼ばれる」ことと「stopは呼ばれない」ことの2つ。
+        assertTrue(executor.serviceRunCount >= 1)
         assertEquals(0, executor.serviceStoppedCount)
     }
 
@@ -450,10 +451,6 @@ class TerminalTabsViewModelTest {
         assertTrue(orchestrators[0].sentBytes.isEmpty())
     }
 
-    // withTimeout(3000)のポーリングループがDispatchers.IO実スレッド側の非同期処理と
-    // 競合しTimeoutCancellationExceptionで落ちることがある(pre-existing、split-pane等いずれの
-    // マージが原因でもないことをsplit-pane導入前のコミットで再現して確認済み)。
-    @Ignore("flaky: 仮想時間(testScheduler)と実スレッド(Dispatchers.IO)混在によるタイミング競合による既知の揺れ")
     @Test
     fun postConnectCommands_internalResumeWithoutNewOpenTabCall_doesNotResend() = runBlocking {
         // セッション単位で1回だけ実行するフラグの検証:
@@ -480,9 +477,6 @@ class TerminalTabsViewModelTest {
         assertEquals(1, matching)
     }
 
-    // withTimeout(3000)のポーリングループがDispatchers.IO実スレッド側の非同期処理と
-    // 競合しTimeoutCancellationExceptionで落ちることがある(他の@Ignore済みテストと同じ既知の揺れ)。
-    @Ignore("flaky: 仮想時間(testScheduler)と実スレッド(Dispatchers.IO)混在によるタイミング競合による既知の揺れ")
     @Test
     fun reconnect_calledAgainAfterDisconnect_resendsPostConnectCommandsForNewSession() = runBlocking {
         // 明示的な再接続（新しい reconnect() 呼び出し）は新セッション扱いなので、

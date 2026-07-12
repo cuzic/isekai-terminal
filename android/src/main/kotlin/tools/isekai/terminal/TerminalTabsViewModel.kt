@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -129,6 +130,11 @@ class TerminalTabsViewModel(
     app: Application,
     private val executor: AppExecutor,
     private val sessionFactory: (AppExecutor) -> TerminalSession,
+    // テストがtestScheduler駆動のディスパッチャーを注入できるようにする(既定は本番同様
+    // Dispatchers.IO)。ハードコードしていた頃はテストの仮想時間(TestCoroutineScheduler)と
+    // ここで起動される実スレッドの完了タイミングが競合し、withTimeout()ポーリングが
+    // 断続的にタイムアウトする原因になっていた。
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : AndroidViewModel(app) {
 
     /** 本番用コンストラクタ。Compose の viewModel() から呼ばれる。
@@ -544,7 +550,7 @@ class TerminalTabsViewModel(
      */
     private fun onWifiUpstreamBroken(pane: PaneState) {
         if (!pane.rebindInFlight.compareAndSet(false, true)) return
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(ioDispatcher) {
             try {
                 val cellular = executor.acquireCellularFd()
                 if (cellular == null) {
@@ -589,7 +595,7 @@ class TerminalTabsViewModel(
                 "transport=${profile.transportPreference}" +
                 (if (profile.usesJumpHost) " via jump ${profile.jumpUsername}@${profile.jumpHost}:${profile.jumpPort}" else ""),
         )
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(ioDispatcher) {
             val auth = resolveAuth(pane, profile, password) ?: return@launch
             // 踏み台(jump host)は、SSHブートストラップを伴う全トランスポートで共通に使える
             // (TSSHD_QUICのみ旧Phase 5B経路でrust-core側が未対応、Phase 10--1c参照)。
@@ -758,7 +764,7 @@ class TerminalTabsViewModel(
     }
 
     private fun loadSnippetsForPane(pane: PaneState, profileId: Long?) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(ioDispatcher) {
             pane.snippets.value = Repositories.snippets.getForProfile(profileId)
         }
     }
@@ -869,7 +875,7 @@ class TerminalTabsViewModel(
         val pane = paneOrNull(tabId, paneId) ?: return
         if (pane.session.state.value.trzszState !is TrzszUiState.WaitingUser) return
         if (!pane.uploadInProgress.compareAndSet(false, true)) return
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(ioDispatcher) {
             try {
                 val file = executor.openUploadFile(uri) ?: return@launch
                 pane.session.trzszAcceptUpload(file.name, file.size.toULong(), 0u)
