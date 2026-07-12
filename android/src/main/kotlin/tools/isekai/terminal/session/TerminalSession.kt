@@ -51,6 +51,15 @@ class TerminalSession(
      * デバイス側から一切応答を送らない)。
      */
     private val onClipboardPullRequested: () -> ClipboardPayload? = { null },
+    /**
+     * #10/#22: RebindManager(Rust側)がWiFi-bound fdを要求した。判断は一切せず、
+     * 取得できたfdを返すだけ(`rust-ssot.md`準拠)。Rust側の`spawn_blocking`スレッドから
+     * 同期呼び出しされる(`onHostKey`/`onAgentSignRequest`と同じ方式)。既定はno-op
+     * (常に`null` — マルチパス以外のセッションでは呼ばれない)。
+     */
+    private val acquireWifiFd: () -> PlatformFd? = { null },
+    /** 同、セルラー-bound fd版。 */
+    private val acquireCellularFd: () -> PlatformFd? = { null },
 ) : AutoCloseable {
 
     companion object {
@@ -195,6 +204,14 @@ class TerminalSession(
 
         override fun onClipboardPullRequest(): ClipboardPayload? = onClipboardPullRequested()
 
+        override fun onRequestWifiFd(): PlatformFd? = acquireWifiFd()
+
+        override fun onRequestCellularFd(): PlatformFd? = acquireCellularFd()
+
+        override fun onRebindStateChanged(state: RebindPublicState) {
+            _state.update { it.copy(rebindState = state) }
+        }
+
         // SSH agent forwarding: Rust 側の spawn_blocking スレッドから同期呼び出しされる。
         // ユーザーが respondAgentSignRequest() を呼ぶまでこのスレッドをブロックして待つ。
         // タイムアウト（Rust 側の 30 秒より短い 25 秒）した場合も拒否扱いにする。
@@ -295,6 +312,11 @@ class TerminalSession(
     /** 「WiFiは繋がっているがupstreamが死んでいる」等を検知した際に呼ぶ。
      *  マルチパス以外のtransportや未接続時は Rust 側で無視される（日和見的に呼べばよい）。 */
     fun rebindToFd(fd: Int, localIp: String) = orchestrator.rebindToFd(fd, localIp)
+
+    /** #11: 「今すぐWiFiに戻す」。疎通確認だけは省略されないが、静けさ待ち・セルラー
+     *  最小滞在はバイパスされる(`RebindManager::handle_manual_force_return`参照)。
+     *  マルチパス以外のtransportや未接続時はRust側で無視される。 */
+    fun forceReturnToWifi() = orchestrator.forceReturnToWifi()
 
     // ── Host key ──────────────────────────────────────────────────────
 

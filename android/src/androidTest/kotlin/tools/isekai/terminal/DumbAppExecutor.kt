@@ -71,6 +71,8 @@ class DumbAppExecutor : AppExecutor {
 
     /** acquireCellularFd() が返す値。テストで上書きして使う。既定はnull（未取得）。 */
     var cellularFdForUpstreamFailover: Pair<Int, String>? = null
+    /** acquireWifiFd() が返す値。テストで上書きして使う。既定はnull（未取得）。 */
+    var wifiFdForRebind: Pair<Int, String>? = null
     var registerUpstreamFailoverMonitorCallCount = 0
     var unregisterUpstreamFailoverMonitorCalled = false
     private var _onWifiUpstreamBroken: (() -> Unit)? = null
@@ -84,6 +86,7 @@ class DumbAppExecutor : AppExecutor {
         _onWifiUpstreamBroken = null
     }
     override suspend fun acquireCellularFd(): Pair<Int, String>? = cellularFdForUpstreamFailover
+    override suspend fun acquireWifiFd(): Pair<Int, String>? = wifiFdForRebind
 
     /** ネットワーク切断をシミュレートする。 */
     fun simulateNetworkLost() = _onLost?.invoke()

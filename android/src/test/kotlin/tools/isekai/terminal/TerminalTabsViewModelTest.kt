@@ -21,6 +21,7 @@ import org.robolectric.annotation.Config
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.TerminalSession
 import uniffi.isekai_terminal_core.TransportPreference
 
@@ -56,7 +57,7 @@ class TerminalTabsViewModelTest {
             Repositories.snippets.getAll().forEach { Repositories.snippets.delete(it) }
         }
         executor = DumbAppExecutor()
-        val sessionFactory: () -> TerminalSession = {
+        val sessionFactory: (AppExecutor) -> TerminalSession = {
             val fake = FakeOrchestrator()
             orchestrators.add(fake)
             TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })

@@ -16,6 +16,9 @@ pub mod session_supervisor;
 pub(crate) mod helper_bootstrap;
 pub mod isekai_pipe_quic_transport;
 pub mod multipath_transport;
+pub(crate) mod rebind_manager;
+pub(crate) mod rebind_ports;
+pub(crate) mod rebind_driver;
 pub mod isekai_stun_p2p_transport;
 pub mod isekai_link_relay_transport;
 #[cfg(test)]
@@ -631,6 +634,15 @@ pub struct ClipboardPayload {
     pub data: Vec<u8>,
 }
 
+/// #10/#22: WiFi/セルラーいずれかに明示的にバインドされたfd。`Network.bindSocket()`
+/// (Android)/`IP_BOUND_IF`(iOS、#15)済み・所有権はRust側に移った生fd。
+/// `crate::rebind_ports::PlatformFdSource`のUniFFI越しの実体。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PlatformFd {
+    pub fd: i32,
+    pub local_ip: String,
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum ConnectionPublicState {
     Disconnected { reason: Option<String> },
@@ -698,6 +710,17 @@ pub trait OrchestratorCallback: Send + Sync {
     /// 応答するかどうかの判断はRust側(`session.rs`)が行う——Kotlin側は「今デバイスの
     /// クリップボードに何が入っているか」だけを返せばよい。
     fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload>;
+    /// #10/#22: `RebindManager`(rebind_manager.rs)がWiFi-bound fdを要求する。
+    /// 判断は一切せず、要求された種類のfdを取得して返すだけ(`rust-ssot.md`準拠)。
+    /// 取得できなければ`None`(WiFi自体が使えない・権限が無い等)。`host_key`確認等と
+    /// 同じ同期ブロッキング方式(Rust側の`spawn_blocking`から呼ばれる)。
+    /// マルチパス以外のtransportでは呼ばれない。
+    fn on_request_wifi_fd(&self) -> Option<PlatformFd>;
+    /// 同、セルラー-bound fd版。
+    fn on_request_cellular_fd(&self) -> Option<PlatformFd>;
+    /// #19: `RebindManager`の状態が変化した(WiFi/セルラーフェイルオーバー/復帰待ち)。
+    /// マルチパス以外のtransportでは呼ばれない。
+    fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState);
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -718,6 +741,11 @@ pub(crate) trait SessionCallback: Send + Sync {
     fn on_agent_sign_request(&self, key_fingerprint: String) -> bool;
     fn on_clipboard_write(&self, payload: ClipboardPayload);
     fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload>;
+    /// #10/#22: デフォルトはNone(マルチパス以外の実装は何もオーバーライドしなくてよい)。
+    /// `OrchestratorAdapter`だけが実際に`OrchestratorCallback::on_request_wifi_fd`へ委譲する。
+    fn on_request_wifi_fd(&self) -> Option<PlatformFd> { None }
+    fn on_request_cellular_fd(&self) -> Option<PlatformFd> { None }
+    fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
 }
 
 // ── SshSession ──────────────────────────────────────────
