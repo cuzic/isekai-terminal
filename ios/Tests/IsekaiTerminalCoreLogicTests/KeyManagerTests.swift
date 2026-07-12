@@ -60,31 +60,37 @@ final class KeyManagerTests: XCTestCase {
             allowNonLoopbackForwardBind: false
         )
 
-        let session = createSshSession(config: config)
         let recorder = KeyManagerAuthRecorder()
-        try session.connect(callback: recorder)
+        let orchestrator = createSessionOrchestrator(callback: recorder)
+        try orchestrator.connect(config: config)
 
         try await waitUntilFixtureCondition(timeout: 10) { await recorder.connected }
-        session.disconnect()
+        orchestrator.disconnect()
         try await waitUntilFixtureCondition(timeout: 10) { await recorder.disconnected }
     }
 }
 
-private actor KeyManagerAuthRecorder: SessionCallback {
+private actor KeyManagerAuthRecorder: OrchestratorCallback {
     private(set) var connected = false
     private(set) var disconnected = false
 
     nonisolated func onData(data: Data) {}
-    nonisolated func onHostKey(fingerprint: String) -> Bool { true }
-    nonisolated func onConnected() { Task { await self.markConnected() } }
+    nonisolated func onHostKey(host: String, port: UInt16, fingerprint: String) -> Bool { true }
+    nonisolated func onConnectionStateChanged(state: ConnectionPublicState) {
+        switch state {
+        case .connected:
+            Task { await self.markConnected() }
+        case .disconnected:
+            Task { await self.markDisconnected() }
+        default:
+            break
+        }
+    }
     private func markConnected() { connected = true }
-    nonisolated func onDisconnected(reason: String?) { Task { await self.markDisconnected() } }
     private func markDisconnected() { disconnected = true }
     nonisolated func onScreenUpdate(update: ScreenUpdate) {}
-    nonisolated func onTrzszRequest(transferId: String, mode: String, suggestedName: String?, expectedSize: UInt64?) {}
-    nonisolated func onTrzszDownloadChunk(transferId: String, data: Data, isLast: Bool) {}
-    nonisolated func onTrzszProgress(transferId: String, transferred: UInt64, total: UInt64?) {}
-    nonisolated func onTrzszFinished(transferId: String, success: Bool, message: String?) {}
+    nonisolated func onTrzszStateChanged(state: TrzszPublicState) {}
+    nonisolated func onDownloadComplete(fileName: String?, data: Data) {}
     nonisolated func onNoViablePath() {}
     nonisolated func onForwardStateChanged(id: String, state: ForwardState) {}
     nonisolated func onAgentSignRequest(keyFingerprint: String) -> Bool { false }

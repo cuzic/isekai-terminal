@@ -49,41 +49,19 @@ private final class AgentSignResultBox: @unchecked Sendable {
     var approved = false
 }
 
-/// Phase 1A-9(#30): `SshSession`/`IsekaiPipeQuicSession`など、生成される各セッション型は
-/// 個別の`XxxSessionProtocol`にしか準拠していない(共通の親プロトコルが無い)ため、
-/// `TerminalSessionController`が接続方式を問わず同じ`send`/`resize`/`disconnect`
-/// 呼び出しで扱えるよう、この最小限のプロトコルへ同一モジュール内で事後適合させる。
-private protocol ActiveTerminalSession: AnyObject {
-    func send(data: Data)
-    func resize(cols: UInt32, rows: UInt32)
-    func disconnect()
-    func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData]
-    func scrollbackLen() -> UInt32
-    func trzszAcceptUpload(transferId: String, fileName: String, fileSize: UInt64, mode: UInt32)
-    func trzszSendChunk(transferId: String, data: Data, isLast: Bool)
-    func trzszAcceptDownload(transferId: String)
-    func trzszCancel(transferId: String)
-    func notifyNetworkLost()
-}
-extension SshSession: ActiveTerminalSession {}
-extension IsekaiPipeQuicSession: ActiveTerminalSession {}
-extension IsekaiStunP2pSession: ActiveTerminalSession {}
-extension IsekaiLinkRelaySession: ActiveTerminalSession {}
-extension MultipathIsekaiPipeQuicSession: ActiveTerminalSession {}
-
 /// Android版`ConnectionProfile.DEFAULT_STUN_SERVER`と同じ既定STUNサーバー
 /// (双方が同じSTUNサーバーを使う必要は無いため、単なるデフォルト値)。
 let defaultStunServer = "stun.l.google.com:19302"
 
-/// Phase 1D: `ConnectionProfile`からSSH接続を開始し、`SessionCallback`を実装して
+/// Phase 1D: `ConnectionProfile`からSSH接続を開始し、`OrchestratorCallback`を実装して
 /// Rust側からのイベントを`TerminalUIState`へ橋渡しする。
 ///
-/// `SessionCallback`のメソッドはRustのtokioワーカースレッドから直接呼ばれるため、
+/// `OrchestratorCallback`のメソッドはRustのtokioワーカースレッドから直接呼ばれるため、
 /// このクラス自体は`@MainActor`にせず(`onHostKey`/`onAgentSignRequest`が同期的に
 /// Boolを返す必要があり、MainActorへのTask hopでは間に合わないため)、UIへ反映する
 /// `@Published`な状態は別クラス`TerminalUIState`(`@MainActor`)に分離し、
 /// `Task { @MainActor in }`で明示的に受け渡す。
-public final class TerminalSessionController: SessionCallback, @unchecked Sendable {
+public final class TerminalSessionController: OrchestratorCallback, @unchecked Sendable {
     public let uiState = TerminalUIState()
 
     private let profile: ConnectionProfile
@@ -93,7 +71,12 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     private let vault: CredentialVault
     private let relayVault: RelayCredentialVault
     private let trustStore: SshHostTrustStore
-    private var session: ActiveTerminalSession?
+    /// 全transport共通の単一セッションオブジェクト(Android版`TerminalSession.kt`と同じ
+    /// `SessionOrchestrator`を使う、Phase 1A-9当時の5つの個別transportセッション型からの
+    /// 移行)。`init()`の最後で`self`を渡して構築するため IUO にしてある(Swiftの
+    /// self参照初期化パターン、`self`が全ストアドプロパティの初期化完了後にしか
+    /// 使えない制約を満たすためのもの)。
+    private var orchestrator: SessionOrchestrator!
     /// Phase 1C(#14): `reconnect()`が最後に使ったcols/rowsで再接続できるように保持する。
     private var lastCols: UInt32 = 80
     private var lastRows: UInt32 = 24
@@ -103,23 +86,23 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     private var activeTrzszTransferId: String?
     private var activeTrzszMode: String?
     private var activeTrzszFileName: String?
-    /// Phase 1C(#25): ダウンロード中に書き込む一時ファイル。`trzszStartDownload()`で
-    /// 開き、`onTrzszDownloadChunk`(isLast)/`onTrzszFinished`のどちらか先に来た方で
-    /// 閉じる(両方から呼ばれても2回目はno-op、`FileHandle.closeFile()`は複数回呼んでも
-    /// 安全)。
-    private var downloadFileHandle: FileHandle?
+    /// Phase 1C(#25): ダウンロード完了時に一括で書き込む一時ファイル。`trzszStartDownload()`
+    /// で確保し、`onDownloadComplete`が到着したらそこへ書き込む(Rust側が全量を
+    /// バッファしてから`onDownloadComplete(fileName:data:)`で一括で渡す設計のため、
+    /// 以前のような逐次チャンク書き込みは不要になった)。`trzszStartDownload()`が空の
+    /// ファイルを既に作成しているため、0バイトの正常終了(Rust側`orchestrator.rs`の
+    /// `on_trzsz_finished`は`data.is_empty()`の場合`onDownloadComplete`自体を呼ばない)
+    /// でも有効なファイルとして扱える。
     private var downloadTempURL: URL?
-    /// Phase 1C(#26): OSの経路変化を検知するためのmonitor。実際にRustへ通知するか
-    /// どうかの判断(debounce/coalesce)は`networkPathObserver`(既存#23の判断層)に
-    /// 委ね、ここでは生イベントを橋渡しするだけにする(`.claude/rules/rust-ssot.md`)。
+    /// `onDownloadComplete`での書き込みが失敗した場合に`true`。転送完了時、成功扱いでも
+    /// `completedDownloadURL`を公開しない(存在しない/不完全なファイルをUIへ渡さない)
+    /// ためのガード。
+    private var downloadWriteFailed = false
+    /// Phase 1C(#26): OSの経路変化を検知するためのmonitor。生イベントをそのまま
+    /// `orchestrator.notifyNetworkPathChanged(isSatisfied:)`へ転送するだけで、
+    /// debounce/coalesceの判断自体はRust側([`crate::net_health_policy`])に集約されている
+    /// (`.claude/rules/rust-ssot.md`)。
     private let networkPathMonitor = NWPathMonitor()
-    private lazy var networkPathObserver = NetworkPathObserver { [weak self] _, isSatisfied in
-        // 復帰(isSatisfied == true)はRust側に対応するAPIが無い(`notify_network_lost`
-        // のみ)ため何もしない。復帰の検知は既存の transport 再試行/#14の
-        // フォアグラウンド復帰時reconnect()に委ねる。
-        guard !isSatisfied else { return }
-        self?.session?.notifyNetworkLost()
-    }
 
     public init(
         profile: ConnectionProfile,
@@ -137,6 +120,7 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         self.vault = vault
         self.relayVault = relayVault
         self.trustStore = trustStore
+        self.orchestrator = createSessionOrchestrator(callback: self)
         startNetworkPathMonitoring()
     }
 
@@ -144,17 +128,10 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         networkPathMonitor.cancel()
     }
 
-    /// Phase 1C(#26): `NWPathMonitor`の生イベントを`NetworkPathObserver`(既存#23の
-    /// debounce/coalesce判断層)へ橋渡しする。判断結果に応じたRustへの実際の通知は
-    /// `networkPathObserver`のonNotifyクロージャ(上記)が行う。
+    /// Phase 1C(#26): `NWPathMonitor`の生イベントをそのまま`orchestrator`へ転送する。
     private func startNetworkPathMonitoring() {
         networkPathMonitor.pathUpdateHandler = { [weak self] path in
-            guard let self else { return }
-            let isSatisfied = path.status == .satisfied
-            Task { @MainActor in
-                let health: ConnectionHealthHint = self.uiState.state == .connected ? .healthy : .degradedOrReconnecting
-                self.networkPathObserver.handlePathUpdate(isSatisfied: isSatisfied, health: health)
-            }
+            self?.orchestrator.notifyNetworkPathChanged(isSatisfied: path.status == .satisfied)
         }
         networkPathMonitor.start(queue: DispatchQueue(label: "tools.isekai.terminal.network-path-monitor"))
     }
@@ -214,9 +191,8 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     // MARK: - Config構築(ネットワークに触れない純粋なマッピング)
     //
     // Android版`ConnectionProfile.toSshConfig`/`toIsekaiPipeQuicConfig`相当。実際の
-    // セッション生成(`createSshSession`/`createIsekaiPipeQuicSession`、Rust FFI越しの
-    // ネットワーク処理)とは分離してあるため、`internal`スコープのままテストから
-    // 直接呼び出して(ネットワークに触れずに)検証できる。
+    // `orchestrator.connect`呼び出し(Rust FFI越しのネットワーク処理)とは分離してあるため、
+    // `internal`スコープのままテストから直接呼び出して(ネットワークに触れずに)検証できる。
 
     /// Android版`ConnectionProfile.toSshConfig`相当。
     func makeSshConfig(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) -> SshConfig {
@@ -325,10 +301,8 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     /// Android版`connect(tab, config)`相当。
     private func connectPlainSsh(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
         let config = makeSshConfig(auth: auth, jump: jump, cols: cols, rows: rows)
-        let newSession = createSshSession(config: config)
-        session = newSession
         do {
-            try newSession.connect(callback: self)
+            try orchestrator.connect(config: config)
         } catch {
             fail(message: "\(error)")
         }
@@ -337,13 +311,11 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     /// Android版`connectIsekaiPipeQuic(tab, config)`/`connectIsekaiPipeQuicAuto(tab, config)`相当。
     private func connectIsekaiPipeQuic(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32, allowFallback: Bool) {
         let config = makeIsekaiPipeQuicConfig(auth: auth, jump: jump, cols: cols, rows: rows)
-        let newSession = createIsekaiPipeQuicSession(config: config)
-        session = newSession
         do {
             if allowFallback {
-                try newSession.connectAuto(callback: self)
+                try orchestrator.connectIsekaiPipeQuicAuto(config: config)
             } else {
-                try newSession.connect(callback: self)
+                try orchestrator.connectIsekaiPipeQuic(config: config)
             }
         } catch {
             fail(message: "\(error)")
@@ -353,10 +325,8 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     /// Android版`connectIsekaiStunP2p(tab, config)`相当。
     private func connectIsekaiStunP2p(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
         let config = makeIsekaiStunP2pConfig(auth: auth, jump: jump, cols: cols, rows: rows)
-        let newSession = createIsekaiStunP2pSession(config: config)
-        session = newSession
         do {
-            try newSession.connect(callback: self)
+            try orchestrator.connectIsekaiStunP2p(config: config)
         } catch {
             fail(message: "\(error)")
         }
@@ -368,10 +338,8 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
             fail(message: "relay JWTの復号に失敗しました")
             return
         }
-        let newSession = createIsekaiLinkRelaySession(config: config)
-        session = newSession
         do {
-            try newSession.connect(callback: self)
+            try orchestrator.connectIsekaiLinkRelay(config: config)
         } catch {
             fail(message: "\(error)")
         }
@@ -380,10 +348,8 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     /// Android版`connectMultipathIsekaiPipeQuic(tab, config)`相当。
     private func connectMultipathIsekaiPipeQuic(auth: SshAuth, jump: JumpConfig?, cols: UInt32, rows: UInt32) {
         let config = makeMultipathIsekaiPipeQuicConfig(auth: auth, jump: jump, cols: cols, rows: rows)
-        let newSession = createMultipathIsekaiPipeQuicSession(config: config)
-        session = newSession
         do {
-            try newSession.connect(callback: self)
+            try orchestrator.connectMultipathIsekaiPipeQuic(config: config)
         } catch {
             fail(message: "\(error)")
         }
@@ -420,15 +386,15 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     }
 
     public func send(_ data: Data) {
-        session?.send(data: data)
+        orchestrator.send(data: data)
     }
 
     public func resize(cols: UInt32, rows: UInt32) {
-        session?.resize(cols: cols, rows: rows)
+        orchestrator.resize(cols: cols, rows: rows)
     }
 
     public func disconnect() {
-        session?.disconnect()
+        orchestrator.disconnect()
     }
 
     /// Phase 1C(#14): バックグラウンドからの復帰時や「再接続」ボタンから呼ぶ。
@@ -451,12 +417,12 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     /// Phase 1F-4(#51): スクロールバックのスワイプUI用。Android版
     /// `actions.onScrollbackCells`相当。セッション未確立時は空配列を返す。
     public func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData] {
-        session?.scrollbackCells(offset: offset, rows: rows) ?? []
+        orchestrator.scrollbackCells(offset: offset, rows: rows)
     }
 
     /// Android版`uiState.scrollbackLen`相当。セッション未確立時は0を返す。
     public func scrollbackLen() -> UInt32 {
-        session?.scrollbackLen() ?? 0
+        orchestrator.scrollbackLen()
     }
 
     /// 保留中のagent署名要求に応答する(UI、MainActorから呼ぶ)。
@@ -483,26 +449,25 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
                   let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
                   let fileSize = (attrs[.size] as? NSNumber)?.uint64Value
             else {
-                self.session?.trzszCancel(transferId: transferId)
+                self.orchestrator.trzszCancel()
                 return
             }
             defer { try? fileHandle.close() }
 
             self.activeTrzszFileName = url.lastPathComponent
-            self.session?.trzszAcceptUpload(
-                transferId: transferId, fileName: url.lastPathComponent, fileSize: fileSize, mode: 0
-            )
+            self.orchestrator.trzszAcceptUpload(fileName: url.lastPathComponent, fileSize: fileSize, mode: 0)
             Self.trzszSendChunked(
                 readNext: { fileHandle.readData(ofLength: Self.trzszChunkSize) },
                 send: { chunk, isLast in
-                    self.session?.trzszSendChunk(transferId: transferId, data: chunk, isLast: isLast)
+                    self.orchestrator.trzszSendChunk(data: chunk, isLast: isLast)
                 }
             )
         }
     }
 
-    /// ダウンロード開始。受信データを書き込む一時ファイルを開いてから
-    /// `trzszAcceptDownload`を呼ぶ(受信チャンクは`onTrzszDownloadChunk`で届く)。
+    /// ダウンロード開始。書き込み先の一時ファイルのURLだけ確保して
+    /// `trzszAcceptDownload`を呼ぶ(実際の書き込みは、Rust側が全量を貯めてから
+    /// 一括で渡してくる`onDownloadComplete`で行う)。
     public func trzszStartDownload() {
         guard let transferId = activeTrzszTransferId else { return }
         // transferIdでnamespaceしたディレクトリに置く(同じ`suggestedName`の別転送/別タブが
@@ -513,30 +478,31 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         )
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         let tempURL = tempDir.appendingPathComponent(activeTrzszFileName ?? UUID().uuidString)
-        FileManager.default.createFile(atPath: tempURL.path, contents: nil)
-        guard let handle = try? FileHandle(forWritingTo: tempURL) else {
-            session?.trzszCancel(transferId: transferId)
-            return
-        }
-        downloadFileHandle = handle
+        // 空で作っておく: 0バイトの正常終了はRust側が`onDownloadComplete`自体を呼ばない
+        // ため、これが無いと`completedDownloadURL`が存在しないファイルを指してしまう。
+        // データが実際に届けば`onDownloadComplete`が上書きする。作成自体に失敗した場合
+        // (ディレクトリ作成失敗を含む)は、成功扱いでも公開しないようフラグを立てる。
+        let created = FileManager.default.createFile(atPath: tempURL.path, contents: nil)
         downloadTempURL = tempURL
-        session?.trzszAcceptDownload(transferId: transferId)
+        downloadWriteFailed = !created
+        orchestrator.trzszAcceptDownload()
     }
 
     /// 進行中のtrzsz転送をキャンセルする。実際の`.done`遷移はRust側から
-    /// `onTrzszFinished(success: false, ...)`が来るのを待つ(Android版と同じ、
-    /// ここで即座にUI状態を書き換えない)。
+    /// `onTrzszStateChanged(.done(success: false, ...))`が来るのを待つ(Android版と
+    /// 同じ、ここで即座にUI状態を書き換えない)。
     public func trzszCancel() {
-        guard let transferId = activeTrzszTransferId else { return }
-        session?.trzszCancel(transferId: transferId)
+        orchestrator.trzszCancel()
     }
 
-    /// 転送完了シートを閉じる(クライアント側のみの状態リセット、Rust APIコールなし)。
-    /// ダウンロード完了後の一時ファイルは、`.fileMover`で書き出し済みかどうかに
+    /// 転送完了シートを閉じる。Rust側の`current_transfer_id`等もクリアする
+    /// (Android版`TerminalSession.kt`の`trzszDismiss()`と同じく`orchestrator.trzszDismiss()`
+    /// を呼ぶ)。ダウンロード完了後の一時ファイルは、`.fileMover`で書き出し済みかどうかに
     /// 関わらずここで削除する(書き出し済みなら既に宛先へコピーされているため
     /// 一時ファイル自体はもう不要)。
     @MainActor
     public func trzszDismiss() {
+        orchestrator.trzszDismiss()
         if let url = downloadTempURL {
             // 個々のファイルだけでなく、`trzszStartDownload()`が作った
             // transferId単位の一時ディレクトリごと削除する。
@@ -547,27 +513,27 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
         activeTrzszTransferId = nil
         activeTrzszMode = nil
         activeTrzszFileName = nil
-        downloadFileHandle = nil
         downloadTempURL = nil
-    }
-
-    private func closeDownloadHandleIfNeeded() {
-        try? downloadFileHandle?.close()
-        downloadFileHandle = nil
+        downloadWriteFailed = false
     }
 
     private func fail(message: String) {
         Task { @MainActor in self.uiState.state = .failed(message: message) }
     }
 
-    // MARK: - SessionCallback
+    // MARK: - OrchestratorCallback
 
-    public func onConnected() {
-        Task { @MainActor in self.uiState.state = .connected }
-    }
-
-    public func onDisconnected(reason: String?) {
-        Task { @MainActor in self.uiState.state = .disconnected(reason: reason) }
+    public func onConnectionStateChanged(state: ConnectionPublicState) {
+        switch state {
+        case .connecting:
+            Task { @MainActor in self.uiState.state = .connecting }
+        case .connected:
+            Task { @MainActor in self.uiState.state = .connected }
+        case .disconnected(let reason):
+            Task { @MainActor in self.uiState.state = .disconnected(reason: reason) }
+        case .error(let message):
+            fail(message: message)
+        }
     }
 
     public func onScreenUpdate(update: ScreenUpdate) {
@@ -581,9 +547,12 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
     /// 付いているが、このcallbackはRustスレッドから同期的にBoolを返す必要があり
     /// (接続処理をブロックしてまでUI確認を待つ設計は複雑さに見合わないため)、
     /// 最初の実装ではAndroidと同じ自動信頼方式を踏襲する。対話的な確認UIへの
-    /// 格上げは将来の改善候補(PLAN.md参照)。
-    public func onHostKey(fingerprint: String) -> Bool {
-        let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: profile.host, port: UInt16(profile.port))
+    /// 格上げは将来の改善候補(PLAN.md参照)。渡された`host`/`port`をそのまま使う
+    /// (`profile.host`ではなく)ことで、踏み台経由接続でホップ先のホスト鍵が届いた
+    /// 場合にも正しいホストで検証できる(Android版`TerminalSession.kt`の
+    /// `onHostKey(host, port, fingerprint)`と同じ方針)。
+    public func onHostKey(host: String, port: UInt16, fingerprint: String) -> Bool {
+        let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: host, port: port)
         switch trustStore.verify(identifier: identifier, keyType: "ssh", fingerprint: fingerprint) {
         case .trustedMatch:
             return true
@@ -598,47 +567,50 @@ public final class TerminalSessionController: SessionCallback, @unchecked Sendab
 
     public func onData(data: Data) {}
 
-    /// リモートからtrzsz転送要求が届いた。Android版`TerminalSession.kt`の
-    /// `onTrzszRequest`→`TrzszUiState.WaitingUser`と同じ、まずはユーザー確認待ちにする。
-    public func onTrzszRequest(transferId: String, mode: String, suggestedName: String?, expectedSize: UInt64?) {
-        activeTrzszTransferId = transferId
-        activeTrzszMode = mode
-        activeTrzszFileName = suggestedName
-        Task { @MainActor in
-            self.uiState.trzszState = .waitingUser(
-                transferId: transferId, mode: mode, suggestedName: suggestedName, expectedSize: expectedSize
-            )
+    public func onTrzszStateChanged(state: TrzszPublicState) {
+        switch state {
+        case .idle:
+            Task { @MainActor in self.uiState.trzszState = nil }
+        case .waitingUser(let transferId, let mode, let suggestedName, let expectedSize):
+            activeTrzszTransferId = transferId
+            activeTrzszMode = mode
+            activeTrzszFileName = suggestedName
+            Task { @MainActor in
+                self.uiState.trzszState = .waitingUser(
+                    transferId: transferId, mode: mode, suggestedName: suggestedName, expectedSize: expectedSize
+                )
+            }
+        case .inProgress(let transferId, let mode, let fileName, let transferred, let total):
+            Task { @MainActor in
+                self.uiState.trzszState = .inProgress(
+                    transferId: transferId, mode: mode, fileName: fileName, transferred: transferred, total: total
+                )
+            }
+        case .done(let transferId, let success, let message):
+            // ダウンロードが成功した場合、書き込み先のファイル自体は直前の
+            // `onDownloadComplete`(Rust側が同じスレッドから同期的にこちらより先に
+            // 呼ぶ、`orchestrator.rs::on_trzsz_finished`参照。ただし0バイトの場合は
+            // 呼ばれない — `trzszStartDownload()`が空ファイルを事前に作っているため
+            // それでも有効)で既に書き終わっている。実際の書き込みが失敗していた場合は
+            // `downloadWriteFailed`により公開しない。
+            let completedURL = (success && activeTrzszMode == "download" && !downloadWriteFailed) ? downloadTempURL : nil
+            Task { @MainActor in
+                self.uiState.trzszState = .done(transferId: transferId, success: success, message: message)
+                self.uiState.completedDownloadURL = completedURL
+            }
         }
     }
 
-    /// ダウンロード中のデータチャンク。`trzszStartDownload()`が開いた一時ファイルへ
-    /// 逐次書き込む(Rustスレッドから直接呼ばれるため、MainActorへはホップしない)。
-    public func onTrzszDownloadChunk(transferId: String, data: Data, isLast: Bool) {
-        downloadFileHandle?.write(data)
-        if isLast {
-            closeDownloadHandleIfNeeded()
-        }
-    }
-
-    public func onTrzszProgress(transferId: String, transferred: UInt64, total: UInt64?) {
-        let mode = activeTrzszMode ?? ""
-        let fileName = activeTrzszFileName
-        Task { @MainActor in
-            self.uiState.trzszState = .inProgress(
-                transferId: transferId, mode: mode, fileName: fileName, transferred: transferred, total: total
-            )
-        }
-    }
-
-    /// 転送完了。ダウンロードが成功した場合のみ、一時ファイルのURLをUIへ渡して
-    /// `.fileMover`での保存を可能にする(Android版がアプリのDL完了通知経由でSAF保存を
-    /// 促すのと同じ役割)。
-    public func onTrzszFinished(transferId: String, success: Bool, message: String?) {
-        closeDownloadHandleIfNeeded()
-        let completedURL = (success && activeTrzszMode == "download") ? downloadTempURL : nil
-        Task { @MainActor in
-            self.uiState.trzszState = .done(transferId: transferId, success: success, message: message)
-            self.uiState.completedDownloadURL = completedURL
+    /// ダウンロード完了。Rust側が全量を貯めてから一括で渡してくる(逐次チャンク書き込み
+    /// ではない)。`trzszStartDownload()`が確保した`downloadTempURL`へ書き込む
+    /// (`fileName`は常にnilで届くため使わない、`activeTrzszFileName`は既に
+    /// `onTrzszStateChanged(.waitingUser)`で捕捉済み)。
+    public func onDownloadComplete(fileName: String?, data: Data) {
+        guard let url = downloadTempURL else { return }
+        do {
+            try data.write(to: url)
+        } catch {
+            downloadWriteFailed = true
         }
     }
 

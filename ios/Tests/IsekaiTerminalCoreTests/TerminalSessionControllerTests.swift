@@ -21,7 +21,7 @@ final class TerminalSessionControllerTests: XCTestCase {
     func testFirstConnectionAutoTrustsAndAccepts() throws {
         let (controller, trustStore) = try makeController()
 
-        XCTAssertTrue(controller.onHostKey(fingerprint: "SHA256:aaaa"))
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
 
         let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: "127.0.0.1", port: 22)
         XCTAssertEqual(trustStore.record(for: identifier)?.fingerprint, "SHA256:aaaa")
@@ -30,15 +30,15 @@ final class TerminalSessionControllerTests: XCTestCase {
     func testSameFingerprintOnSecondConnectionIsAccepted() throws {
         let (controller, _) = try makeController()
 
-        XCTAssertTrue(controller.onHostKey(fingerprint: "SHA256:aaaa"))
-        XCTAssertTrue(controller.onHostKey(fingerprint: "SHA256:aaaa"))
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
     }
 
     func testChangedFingerprintIsRejectedAndSurfacesFailure() async throws {
         let (controller, _) = try makeController()
 
-        XCTAssertTrue(controller.onHostKey(fingerprint: "SHA256:aaaa"))
-        XCTAssertFalse(controller.onHostKey(fingerprint: "SHA256:bbbb"))
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:bbbb"))
 
         try await waitUntilFixtureCondition(timeout: 2) {
             await controller.uiState.state != .connecting
@@ -412,11 +412,13 @@ final class TerminalSessionControllerTests: XCTestCase {
 
     // MARK: - Phase 1C(#25): trzszファイル転送
 
-    func testOnTrzszRequestSetsWaitingUserState() async throws {
+    func testOnTrzszStateChangedWaitingUserSetsWaitingUserState() async throws {
         let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
         let controller = try makeControllerWithProfile(profile)
 
-        controller.onTrzszRequest(transferId: "t1", mode: "download", suggestedName: "report.txt", expectedSize: 1024)
+        controller.onTrzszStateChanged(
+            state: .waitingUser(transferId: "t1", mode: "download", suggestedName: "report.txt", expectedSize: 1024)
+        )
 
         try await waitUntilFixtureCondition(timeout: 2) {
             await controller.uiState.trzszState != nil
@@ -427,12 +429,16 @@ final class TerminalSessionControllerTests: XCTestCase {
         )
     }
 
-    func testOnTrzszProgressCarriesOverModeAndFileNameFromRequest() async throws {
+    func testOnTrzszStateChangedInProgressUpdatesTrzszState() async throws {
         let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
         let controller = try makeControllerWithProfile(profile)
 
-        controller.onTrzszRequest(transferId: "t1", mode: "download", suggestedName: "report.txt", expectedSize: 1024)
-        controller.onTrzszProgress(transferId: "t1", transferred: 512, total: 1024)
+        controller.onTrzszStateChanged(
+            state: .waitingUser(transferId: "t1", mode: "download", suggestedName: "report.txt", expectedSize: 1024)
+        )
+        controller.onTrzszStateChanged(
+            state: .inProgress(transferId: "t1", mode: "download", fileName: "report.txt", transferred: 512, total: 1024)
+        )
 
         try await waitUntilFixtureCondition(timeout: 2) {
             guard case .inProgress = await controller.uiState.trzszState else { return false }
@@ -444,12 +450,14 @@ final class TerminalSessionControllerTests: XCTestCase {
         )
     }
 
-    func testOnTrzszFinishedForUploadDoesNotSetCompletedDownloadURL() async throws {
+    func testOnTrzszStateChangedDoneForUploadDoesNotSetCompletedDownloadURL() async throws {
         let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
         let controller = try makeControllerWithProfile(profile)
 
-        controller.onTrzszRequest(transferId: "t1", mode: "upload", suggestedName: nil, expectedSize: nil)
-        controller.onTrzszFinished(transferId: "t1", success: true, message: nil)
+        controller.onTrzszStateChanged(
+            state: .waitingUser(transferId: "t1", mode: "upload", suggestedName: nil, expectedSize: nil)
+        )
+        controller.onTrzszStateChanged(state: .done(transferId: "t1", success: true, message: nil))
 
         try await waitUntilFixtureCondition(timeout: 2) {
             guard case .done = await controller.uiState.trzszState else { return false }
@@ -458,14 +466,16 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertNil(controller.uiState.completedDownloadURL)
     }
 
-    func testDownloadRequestWritesChunksToTempFileAndExposesURLOnFinish() async throws {
+    func testDownloadRequestWritesDataToTempFileAndExposesURLOnFinish() async throws {
         let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
         let controller = try makeControllerWithProfile(profile)
 
-        controller.onTrzszRequest(transferId: "t1", mode: "download", suggestedName: "hello.txt", expectedSize: 5)
+        controller.onTrzszStateChanged(
+            state: .waitingUser(transferId: "t1", mode: "download", suggestedName: "hello.txt", expectedSize: 5)
+        )
         controller.trzszStartDownload()
-        controller.onTrzszDownloadChunk(transferId: "t1", data: Data("hello".utf8), isLast: true)
-        controller.onTrzszFinished(transferId: "t1", success: true, message: nil)
+        controller.onDownloadComplete(fileName: nil, data: Data("hello".utf8))
+        controller.onTrzszStateChanged(state: .done(transferId: "t1", success: true, message: nil))
 
         try await waitUntilFixtureCondition(timeout: 2) {
             await controller.uiState.completedDownloadURL != nil
@@ -483,7 +493,9 @@ final class TerminalSessionControllerTests: XCTestCase {
         let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
         let controller = try makeControllerWithProfile(profile)
 
-        controller.onTrzszRequest(transferId: "t1", mode: "upload", suggestedName: nil, expectedSize: nil)
+        controller.onTrzszStateChanged(
+            state: .waitingUser(transferId: "t1", mode: "upload", suggestedName: nil, expectedSize: nil)
+        )
         try await waitUntilFixtureCondition(timeout: 2) {
             await controller.uiState.trzszState != nil
         }

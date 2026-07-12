@@ -22,7 +22,7 @@ enum RemoteClipboardSettings {
     }
 }
 
-/// `TerminalSessionController.onClipboardWrite`/`onClipboardPullRequest`(`SessionCallback`)の
+/// `TerminalSessionController.onClipboardWrite`/`onClipboardPullRequest`(`OrchestratorCallback`)の
 /// 実処理。Android版`RemoteClipboardPolicy`/`RemoteClipboardImagePolicy`のiOS版に相当する。
 /// Android版と異なりiOSの`UIPasteboard`は画像を直接扱えるため、`FileProvider`相当の
 /// 一時ファイル経由URI発行は不要(`.image`/`.string`への読み書きだけで完結する)。

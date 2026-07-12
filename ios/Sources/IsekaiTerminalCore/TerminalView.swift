@@ -7,7 +7,7 @@ import IsekaiTerminalCoreLogic
 /// 日本語IME統合・特殊キーのアクセサリバーを1画面にまとめる。
 ///
 /// cols/rowsは現時点では固定(80x24)。実際のview sizeやDynamic Type設定に応じた
-/// 動的リサイズ(`SshSession.resize(cols:rows:)`は既に存在する)は後続の改善候補。
+/// 動的リサイズ(`SessionOrchestrator.resize(cols:rows:)`は既に存在する)は後続の改善候補。
 ///
 /// Phase 1G-2(#54): 複数タブ対応のため、`controller`は外部(`TerminalTabsModel`)から
 /// 注入される(このView自身は構築しない)。接続開始(`connect()`)もタブモデル側の
