@@ -55,8 +55,9 @@ Rust(UniFFI 経由)の `rust-core`(crate 名 `isekai-terminal-core`)からなる
 cd rust-core
 cargo test -p isekai-terminal-core --lib     # コア(SSH/VTE/trzsz/resume/multipath)のユニット・e2eテスト
 cargo test -p isekai-pipe         # isekai-pipe(connect/serve)のユニット・e2eテスト
-cargo run -p uniffi-bindgen -- generate --library target/debug/libisekai_terminal_core.so --language kotlin
+cargo run -p uniffi-bindgen -- generate --library target/debug/libisekai_terminal_core.so --language kotlin --out-dir ../android/src/main/kotlin
                                    # Rust の public API を変更したら Kotlin バインディング再生成が必須
+                                   # (--out-dir 必須。省略するとuniffi-bindgenがpanicする)
 ```
 
 ## 設計原則
