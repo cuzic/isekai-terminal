@@ -17,6 +17,7 @@ pub(crate) mod helper_bootstrap;
 pub mod isekai_pipe_quic_transport;
 pub mod multipath_transport;
 pub(crate) mod rebind_manager;
+pub(crate) mod rebind_ports;
 pub mod isekai_stun_p2p_transport;
 pub mod isekai_link_relay_transport;
 #[cfg(test)]
