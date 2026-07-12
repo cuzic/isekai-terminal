@@ -849,6 +849,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error(
@@ -1015,6 +1017,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_m
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_force_return_to_wifi(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_is_quic(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
@@ -1320,6 +1324,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi() != 8683) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic() != 9641) {
@@ -2950,6 +2957,14 @@ public interface SessionOrchestratorInterface {
     
     fun `disconnect`()
     
+    /**
+     * #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
+     * ダウンロード中などで静けさ待ちを待たずに即座に戻したい場合)。疎通確認だけは
+     * 省略されない(`RebindManager::handle_manual_force_return`参照)。マルチパス以外の
+     * transportや未接続時は何もしない。
+     */
+    fun `forceReturnToWifi`()
+    
     fun `isQuic`(): kotlin.Boolean
     
     fun `notifyError`(`message`: kotlin.String)
@@ -3242,6 +3257,24 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     callWithHandle {
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(
+        it,
+        _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
+     * ダウンロード中などで静けさ待ちを待たずに即座に戻したい場合)。疎通確認だけは
+     * 省略されない(`RebindManager::handle_manual_force_return`参照)。マルチパス以外の
+     * transportや未接続時は何もしない。
+     */override fun `forceReturnToWifi`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_force_return_to_wifi(
         it,
         _status)
 }
