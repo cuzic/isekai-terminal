@@ -306,6 +306,18 @@ impl SessionCallback for OrchestratorAdapter {
     fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> {
         self.shared.callback.on_clipboard_pull_request()
     }
+
+    fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> {
+        self.shared.callback.on_request_wifi_fd()
+    }
+
+    fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> {
+        self.shared.callback.on_request_cellular_fd()
+    }
+
+    fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState) {
+        self.shared.callback.on_rebind_state_changed(state);
+    }
 }
 
 /// `notify_network_path_changed`の実際の切断処理。`&Arc<OrchestratorShared>`だけを
@@ -664,6 +676,9 @@ mod tests {
         }
         fn on_clipboard_write(&self, _payload: ClipboardPayload) {}
         fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> { None }
+        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
     }
 
     fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {

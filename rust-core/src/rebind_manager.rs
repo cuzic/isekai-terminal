@@ -58,7 +58,7 @@ pub enum RebindAction {
 }
 
 /// UI(Compose/SwiftUI)へ公開する簡略化された状態。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum RebindPublicState {
     /// WiFi 上で通常運用中。
     OnWifi,
