@@ -483,6 +483,25 @@ fun TerminalScreenBody(
                     CtrlBtn("定型") { showSnippetSheet = true }
                 }
 
+                // F1〜F12 行（横スクロール、Ctrl キー行を圧迫しないよう別行にする）
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                ) {
+                    CtrlBtn("F1") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F1)!!) }
+                    CtrlBtn("F2") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F2)!!) }
+                    CtrlBtn("F3") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F3)!!) }
+                    CtrlBtn("F4") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F4)!!) }
+                    CtrlBtn("F5") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F5)!!) }
+                    CtrlBtn("F6") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F6)!!) }
+                    CtrlBtn("F7") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F7)!!) }
+                    CtrlBtn("F8") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F8)!!) }
+                    CtrlBtn("F9") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F9)!!) }
+                    CtrlBtn("F10") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F10)!!) }
+                    CtrlBtn("F11") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F11)!!) }
+                    CtrlBtn("F12") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F12)!!) }
+                }
+
                 if (composingText.isNotEmpty()) {
                     Text(
                         "変換中: $composingText",
