@@ -334,6 +334,27 @@ typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod10)(uint64_t, Ru
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD11
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD11
+typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod11)(uint64_t, RustBuffer* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD12
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD12
+typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod12)(uint64_t, RustBuffer* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD13
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD13
+typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod13)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
 #define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
 typedef struct UniffiVTableCallbackInterfaceDiagnosticCallback {
@@ -368,6 +389,9 @@ typedef struct UniffiVTableCallbackInterfaceOrchestratorCallback {
     UniffiCallbackInterfaceOrchestratorCallbackMethod8 _Nonnull onAgentSignRequest;
     UniffiCallbackInterfaceOrchestratorCallbackMethod9 _Nonnull onClipboardWrite;
     UniffiCallbackInterfaceOrchestratorCallbackMethod10 _Nonnull onClipboardPullRequest;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod11 _Nonnull onRequestWifiFd;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod12 _Nonnull onRequestCellularFd;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod13 _Nonnull onRebindStateChanged;
 } UniffiVTableCallbackInterfaceOrchestratorCallback;
 
 #endif
@@ -507,6 +531,11 @@ void uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_quic(uint
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_METHOD_SESSIONORCHESTRATOR_DISCONNECT
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_METHOD_SESSIONORCHESTRATOR_DISCONNECT
 void uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_METHOD_SESSIONORCHESTRATOR_FORCE_RETURN_TO_WIFI
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_METHOD_SESSIONORCHESTRATOR_FORCE_RETURN_TO_WIFI
+void uniffi_isekai_terminal_core_fn_method_sessionorchestrator_force_return_to_wifi(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_METHOD_SESSIONORCHESTRATOR_IS_QUIC
@@ -1196,6 +1225,12 @@ uint16_t uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconn
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONORCHESTRATOR_FORCE_RETURN_TO_WIFI
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONORCHESTRATOR_FORCE_RETURN_TO_WIFI
+uint16_t uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONORCHESTRATOR_IS_QUIC
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_SESSIONORCHESTRATOR_IS_QUIC
 uint16_t uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic(void
@@ -1451,6 +1486,24 @@ uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_cli
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_CLIPBOARD_PULL_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_CLIPBOARD_PULL_REQUEST
 uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_pull_request(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_REQUEST_WIFI_FD
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_REQUEST_WIFI_FD
+uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_request_wifi_fd(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_REQUEST_CELLULAR_FD
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_REQUEST_CELLULAR_FD
+uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_request_cellular_fd(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_REBIND_STATE_CHANGED
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_REBIND_STATE_CHANGED
+uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed(void
     
 );
 #endif
