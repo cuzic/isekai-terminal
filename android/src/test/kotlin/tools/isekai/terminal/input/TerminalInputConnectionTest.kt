@@ -298,4 +298,60 @@ class TerminalInputConnectionTest {
         assertTrue(consumed)
         assertEquals(false, view.ctrlArmed)
     }
+
+    // --- JIS配列固有キー(¥/ろ) ---
+
+    private fun keyDownWithShift(keyCode: Int, shiftPressed: Boolean = false): Boolean {
+        val metaState = if (shiftPressed) KeyEvent.META_SHIFT_ON else 0
+        return connection.sendKeyEvent(
+            KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, keyCode, 0, metaState),
+        )
+    }
+
+    @Test
+    fun sendKeyEvent_yenKey_jisMode_unshifted_sendsBackslash() {
+        view.keyboardLayoutMode = KeyboardLayoutMode.JIS
+        keyDownWithShift(TerminalKeyEncoder.KC_YEN)
+        assertArrayEquals(byteArrayOf(0x5C), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_yenKey_jisMode_shifted_sendsPipe() {
+        view.keyboardLayoutMode = KeyboardLayoutMode.JIS
+        keyDownWithShift(TerminalKeyEncoder.KC_YEN, shiftPressed = true)
+        assertArrayEquals(byteArrayOf(0x7C), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_roKey_jisMode_unshifted_sendsBackslash() {
+        view.keyboardLayoutMode = KeyboardLayoutMode.JIS
+        keyDownWithShift(TerminalKeyEncoder.KC_RO)
+        assertArrayEquals(byteArrayOf(0x5C), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_roKey_jisMode_shifted_sendsUnderscore() {
+        view.keyboardLayoutMode = KeyboardLayoutMode.JIS
+        keyDownWithShift(TerminalKeyEncoder.KC_RO, shiftPressed = true)
+        assertArrayEquals(byteArrayOf(0x5F), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_yenKey_usMode_fallsThroughWithoutSending() {
+        view.keyboardLayoutMode = KeyboardLayoutMode.US
+        keyDownWithShift(TerminalKeyEncoder.KC_YEN)
+        // US配列モードでは明示マッピングを行わない。getUnicodeChar()も定義が無いため
+        // 何も送信されない(実機のUS配列キーボードにこのキー自体が存在しないのと同じ挙動)。
+        assertTrue(sentBytes.isEmpty())
+    }
+
+    @Test
+    fun sendKeyEvent_yenKey_autoMode_withoutDevice_defaultsToUsBehavior() {
+        // Robolectric上の合成KeyEvent(deviceId未指定)にはInputDeviceが紐付かないため、
+        // AUTO判定はJISキーボード「無し」に倒れる(実機での自動検出そのものはロボレクトリック環境では
+        // 検証できない。KeyboardLayoutDetectorTest参照)。
+        view.keyboardLayoutMode = KeyboardLayoutMode.AUTO
+        keyDownWithShift(TerminalKeyEncoder.KC_YEN)
+        assertTrue(sentBytes.isEmpty())
+    }
 }
