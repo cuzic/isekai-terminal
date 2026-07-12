@@ -33,6 +33,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     var trzszCancelCount = 0
     var trzszDismissCalled = false
     var rebindToFdCalls = mutableListOf<Pair<Int, String>>()
+    var forceReturnToWifiCallCount = 0
 
     @Throws(SshException::class)
     override fun connect(config: SshConfig) {
@@ -100,6 +101,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun trzszCancel() { trzszCancelCount++ }
     override fun notifyError(message: String) {}
     override fun rebindToFd(fd: Int, localIp: String) { rebindToFdCalls.add(fd to localIp) }
+    override fun forceReturnToWifi() { forceReturnToWifiCallCount++ }
 
     override fun isQuic(): Boolean = quic
 
