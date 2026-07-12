@@ -33,7 +33,7 @@ class TerminalSessionTest {
     fun setup() {
         fakeOrchestrator = FakeOrchestrator()
         fakeHostKeyChecker = FakeHostKeyChecker()
-        session = TerminalSession(fakeHostKeyChecker) { cb -> fakeOrchestrator.also { it.callback = cb } }
+        session = TerminalSession(fakeHostKeyChecker, orchestratorFactory = { cb -> fakeOrchestrator.also { it.callback = cb } })
     }
 
     @After
@@ -261,7 +261,7 @@ class TerminalSessionTest {
             )
         )
         val fakeOrc2 = FakeOrchestrator()
-        val s = TerminalSession(changedChecker) { cb -> fakeOrc2.also { it.callback = cb } }
+        val s = TerminalSession(changedChecker, orchestratorFactory = { cb -> fakeOrc2.also { it.callback = cb } })
         s.connect(testConfig())
         val result = fakeOrc2.simulateHostKey(fingerprint = "new-fp")
         assertFalse(result)
@@ -692,7 +692,7 @@ class TerminalSessionTest {
 
         // 再接続（新しいセッションインスタンスで）
         val newOrchestrator = FakeOrchestrator()
-        val s = TerminalSession(FakeHostKeyChecker()) { cb -> newOrchestrator.also { it.callback = cb } }
+        val s = TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> newOrchestrator.also { it.callback = cb } })
         s.connect(testConfig())
         newOrchestrator.simulateConnected()
         withTimeout(3000) { s.state.first { it.connected } }

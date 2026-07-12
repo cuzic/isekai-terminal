@@ -67,6 +67,14 @@ class PhysicalPathProvider(context: Context) {
     suspend fun acquireCellularOnly(timeoutMs: Long = 5000): Pair<Int, String>? =
         acquireOne("cellular", NetworkCapabilities.TRANSPORT_CELLULAR, timeoutMs)
 
+    /**
+     * WiFiだけをbindSocketして生fd+ローカルIPを取得する([acquire]のWiFi単体版)。
+     * RebindManager(Rust側)がWiFi復帰の疎通確認・実際の復帰rebindのために呼ぶたびに
+     * 毎回新規呼び出しする(fd所有権ポリシー: 疎通確認用と本番用は毎回別々に取得する)。
+     */
+    suspend fun acquireWifiOnly(timeoutMs: Long = 5000): Pair<Int, String>? =
+        acquireOne("wifi", NetworkCapabilities.TRANSPORT_WIFI, timeoutMs)
+
     private suspend fun acquireOne(label: String, transport: Int, timeoutMs: Long): Pair<Int, String>? {
         val network = awaitNetwork(transport, timeoutMs)
         if (network == null) {
