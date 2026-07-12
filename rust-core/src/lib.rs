@@ -10,6 +10,7 @@ pub(crate) mod pool;
 pub(crate) mod socks;
 pub(crate) mod session_state;
 pub(crate) mod session;
+pub(crate) mod net_health_policy;
 pub mod orchestrator;
 pub mod session_supervisor;
 pub(crate) mod helper_bootstrap;

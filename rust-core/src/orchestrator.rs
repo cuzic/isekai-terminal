@@ -3,8 +3,9 @@ use parking_lot::Mutex;
 
 use crate::{
     CellData, ClipboardPayload, ConnectionPublicState, ForwardState, OrchestratorCallback, ScreenUpdate,
-    SessionCallback, SshConfig, SshError, TrzszPublicState,
+    SessionCallback, SshConfig, SshError, TrzszPublicState, RUNTIME,
 };
+use crate::net_health_policy;
 use crate::quic_transport::{QuicConfig, QuicSession};
 use crate::isekai_pipe_quic_transport::{IsekaiPipeQuicConfig, IsekaiPipeQuicSession};
 use crate::multipath_transport::{MultipathIsekaiPipeQuicConfig, MultipathIsekaiPipeQuicSession};
@@ -106,7 +107,7 @@ impl ActiveSession {
 // ── Shared internal state ─────────────────────────────────
 
 /// 接続状態の SSOT。`ConnectionPublicState` の Connecting/Connected の別を
-/// Rust 側でも保持し、`notify_network_lost` がミラー無しで判断できるようにする。
+/// Rust 側でも保持し、`notify_network_path_changed` がミラー無しで判断できるようにする。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConnPhase {
     Idle,
@@ -144,6 +145,9 @@ pub(crate) struct OrchestratorShared {
     state: Mutex<OrchestratorState>,
     callback: Arc<dyn OrchestratorCallback>,
     session: Mutex<Option<ActiveSession>>,
+    /// `notify_network_path_changed`のdebounce/epoch状態。`Connected && !is_quic`の
+    /// ケースだけがこれを実際に使う([`crate::net_health_policy`]参照)。
+    path_observer: Mutex<crate::net_health_policy::PathObserver>,
 }
 
 // ── OrchestratorAdapter ───────────────────────────────────
@@ -290,6 +294,21 @@ impl SessionCallback for OrchestratorAdapter {
     }
 }
 
+/// `notify_network_path_changed`の実際の切断処理。`&Arc<OrchestratorShared>`だけを
+/// 取る自由関数にしてあるのは、debounce後の発火が`SessionOrchestrator`自身ではなく
+/// `RUNTIME.spawn`されたtokio task(`Arc<OrchestratorShared>`のcloneしか持たない)から
+/// 呼ばれるため — `SessionOrchestrator::disconnect`(セッションを切るだけの2行)と
+/// 中身は同じだが、`&self`経由ではなく`shared`に対して直接操作する。
+fn apply_network_lost(shared: &Arc<OrchestratorShared>) {
+    if let Some(s) = shared.session.lock().as_ref() {
+        s.disconnect();
+    }
+    shared.state.lock().phase = ConnPhase::Idle;
+    shared.callback.on_connection_state_changed(
+        ConnectionPublicState::Disconnected { reason: Some("network lost".to_string()) }
+    );
+}
+
 // ── SessionOrchestrator ───────────────────────────────────
 
 #[derive(uniffi::Object)]
@@ -313,6 +332,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
         }),
         callback: Arc::from(callback),
         session: Mutex::new(None),
+        path_observer: Mutex::new(crate::net_health_policy::PathObserver::default()),
     });
     Arc::new(SessionOrchestrator { shared })
 }
@@ -329,6 +349,11 @@ impl SessionOrchestrator {
             s.is_quic = is_quic;
             s.phase = ConnPhase::Connecting;
         }
+        // 新しい接続試行が始まった時点で、直前のセッションに対して保留中だった
+        // network-path debounceは無効化する。そうしないと、瞬断のdebounce待機中に
+        // 手動で切断/別transportへ再接続した場合、無関係な新しいセッションを
+        // 誤って切断してしまう(レビューで指摘された実際の不具合)。
+        self.shared.path_observer.lock().invalidate();
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
         OrchestratorAdapter { shared: self.shared.clone() }
     }
@@ -490,9 +515,16 @@ impl SessionOrchestrator {
 
     /// OS からネットワーク断（Wi-Fi/セルラー消失等）を通知された時の対応を決める。
     /// QUIC 接続はパス変更に自前で耐えられるため無視し、ハンドシェイク中や
-    /// プレーン TCP SSH 接続中は切断扱いにする（判断は Rust 側の SSOT で行う。
-    /// Kotlin 側はイベントをそのまま転送するだけ）。
-    pub fn notify_network_lost(&self) {
+    /// OS からのネットワークpath変化(`ConnectivityManager`/`NWPathMonitor`)をそのまま
+    /// 転送してもらい、判断はここ(Rust側のSSOT)で行う。Kotlin/Swift側はイベントを
+    /// そのまま転送するだけでよい。
+    ///
+    /// `Idle`/`Connecting`/`Connected && is_quic`は既存の即時判断ロジックのまま
+    /// (ハンドシェイク中は自前の耐性がまだ無いので即abort、QUIC系は自前で耐えるので
+    /// 何もしない)。`Connected && !is_quic`(プレーンTCP SSH)だけが新たに
+    /// [`crate::net_health_policy`]のdebounceの対象になる — OS通知の瞬断で
+    /// 即切断されていた実バグの唯一の発生源だったため。
+    pub fn notify_network_path_changed(&self, is_satisfied: bool) {
         let (phase, is_quic) = {
             let s = self.shared.state.lock();
             (s.phase, s.is_quic)
@@ -500,23 +532,31 @@ impl SessionOrchestrator {
         match phase {
             ConnPhase::Idle => {}
             ConnPhase::Connecting => {
-                log::warn!("orchestrator: network lost during handshake — aborting");
-                self.disconnect();
-                self.shared.state.lock().phase = ConnPhase::Idle;
-                self.shared.callback.on_connection_state_changed(
-                    ConnectionPublicState::Disconnected { reason: Some("network lost".to_string()) }
-                );
+                if !is_satisfied {
+                    log::warn!("orchestrator: network lost during handshake — aborting");
+                    apply_network_lost(&self.shared);
+                }
             }
-            ConnPhase::Connected if !is_quic => {
-                log::warn!("orchestrator: network lost while connected — disconnecting TCP session");
-                self.disconnect();
-                self.shared.state.lock().phase = ConnPhase::Idle;
-                self.shared.callback.on_connection_state_changed(
-                    ConnectionPublicState::Disconnected { reason: Some("network lost".to_string()) }
-                );
+            ConnPhase::Connected if is_quic => {
+                log::info!("orchestrator: network path changed — QUIC session, letting transport handle it");
             }
             ConnPhase::Connected => {
-                log::info!("orchestrator: network lost — QUIC session, letting transport handle it");
+                let (epoch, decision) = self.shared.path_observer.lock().handle_update(is_satisfied);
+                match decision {
+                    net_health_policy::Decision::Ignore => {}
+                    net_health_policy::Decision::NotifyAfterDebounce(dur) => {
+                        let shared = self.shared.clone();
+                        RUNTIME.spawn(async move {
+                            tokio::time::sleep(dur).await;
+                            if shared.path_observer.lock().is_current(epoch) {
+                                log::warn!(
+                                    "orchestrator: network still lost after debounce — disconnecting TCP session"
+                                );
+                                apply_network_lost(&shared);
+                            }
+                        });
+                    }
+                }
             }
         }
     }
@@ -623,6 +663,7 @@ mod tests {
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
+            path_observer: Mutex::new(net_health_policy::PathObserver::default()),
         });
         (shared, callback)
     }
@@ -632,20 +673,31 @@ mod tests {
         (SessionOrchestrator { shared }, callback)
     }
 
-    // ── notify_network_lost ──────────────────────────────────
+    /// `Connected && !is_quic`のdebounceを検証するテスト用に、debounce時間を短く
+    /// 差し替えたオーケストレータを作る。
+    fn orchestrator_connected_tcp_with_debounce(
+        debounce: std::time::Duration,
+    ) -> (SessionOrchestrator, Arc<RecordingCallback>) {
+        let (shared, callback) = shared_with_phase(ConnPhase::Connected, false);
+        *shared.path_observer.lock() =
+            net_health_policy::PathObserver::new(net_health_policy::NetPathPolicy { debounce });
+        (SessionOrchestrator { shared }, callback)
+    }
+
+    // ── notify_network_path_changed ──────────────────────────
 
     #[test]
-    fn notify_network_lost_does_nothing_when_idle() {
+    fn notify_network_path_changed_does_nothing_when_idle() {
         let (orch, cb) = orchestrator_with_phase(ConnPhase::Idle, false);
-        orch.notify_network_lost();
+        orch.notify_network_path_changed(false);
         assert!(cb.connection_states.lock().unwrap().is_empty());
         assert!(orch.shared.state.lock().phase == ConnPhase::Idle);
     }
 
     #[test]
-    fn notify_network_lost_aborts_and_reports_disconnected_during_handshake() {
+    fn notify_network_path_changed_aborts_and_reports_disconnected_during_handshake() {
         let (orch, cb) = orchestrator_with_phase(ConnPhase::Connecting, false);
-        orch.notify_network_lost();
+        orch.notify_network_path_changed(false);
         let events = cb.connection_states.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -656,9 +708,35 @@ mod tests {
     }
 
     #[test]
-    fn notify_network_lost_disconnects_plain_tcp_when_connected() {
-        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connected, false);
-        orch.notify_network_lost();
+    fn notify_network_path_changed_ignores_satisfied_updates_during_handshake() {
+        // Connecting中は瞬断debounceの対象外 — 既存の即時abort挙動を維持する一方、
+        // is_satisfied=trueはそもそも「断ではない」ので何もしないままで良い。
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connecting, false);
+        orch.notify_network_path_changed(true);
+        assert!(cb.connection_states.lock().unwrap().is_empty());
+        assert!(orch.shared.state.lock().phase == ConnPhase::Connecting);
+    }
+
+    #[test]
+    fn notify_network_path_changed_ignores_quic_when_connected() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connected, true);
+        orch.notify_network_path_changed(false);
+        // QUICは経路変更に自前で耐えるため、切断扱いにせずphaseもConnectedのまま維持する。
+        assert!(cb.connection_states.lock().unwrap().is_empty());
+        assert!(orch.shared.state.lock().phase == ConnPhase::Connected);
+    }
+
+    #[test]
+    fn notify_network_path_changed_disconnects_plain_tcp_after_debounce_elapses() {
+        let (orch, cb) = orchestrator_connected_tcp_with_debounce(std::time::Duration::from_millis(30));
+        orch.notify_network_path_changed(false);
+        assert!(
+            cb.connection_states.lock().unwrap().is_empty(),
+            "debounce前は即座に切断されないはず"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
         let events = cb.connection_states.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ConnectionPublicState::Disconnected { .. }));
@@ -666,12 +744,40 @@ mod tests {
     }
 
     #[test]
-    fn notify_network_lost_ignores_quic_when_connected() {
-        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connected, true);
-        orch.notify_network_lost();
-        // QUICは経路変更に自前で耐えるため、切断扱いにせずphaseもConnectedのまま維持する。
-        assert!(cb.connection_states.lock().unwrap().is_empty());
+    fn notify_network_path_changed_does_not_disconnect_plain_tcp_if_recovered_before_debounce_elapses() {
+        let (orch, cb) = orchestrator_connected_tcp_with_debounce(std::time::Duration::from_millis(30));
+        orch.notify_network_path_changed(false);
+        orch.notify_network_path_changed(true); // 瞬断から復旧 — 保留中のdebounceをキャンセルする
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(
+            cb.connection_states.lock().unwrap().is_empty(),
+            "debounce中に復旧したので切断されないはず"
+        );
         assert!(orch.shared.state.lock().phase == ConnPhase::Connected);
+    }
+
+    #[test]
+    fn notify_network_path_changed_pending_debounce_is_cancelled_by_a_new_connect_attempt() {
+        // レビューで指摘された不具合の再現: プレーンTCP接続中に瞬断でdebounceが
+        // 保留中の間、手動で別のセッションへ再接続しても、古いdebounceの発火で
+        // 新しいセッションを誤って切断してはいけない。
+        let (orch, cb) = orchestrator_connected_tcp_with_debounce(std::time::Duration::from_millis(30));
+        orch.notify_network_path_changed(false);
+        orch.begin_connect("other.example.com".to_string(), 22, false);
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let events = cb.connection_states.lock().unwrap();
+        assert!(
+            events.iter().all(|e| !matches!(e, ConnectionPublicState::Disconnected { .. })),
+            "新しい接続試行後は、古いdebounce発火由来のDisconnectedが飛んではいけない, got: {events:?}"
+        );
+        assert!(
+            orch.shared.state.lock().phase == ConnPhase::Connecting,
+            "古いdebounce発火でphaseがIdleへ巻き戻されてはいけない"
+        );
     }
 
     // ── OrchestratorAdapter (SessionCallback実装) ────────────
