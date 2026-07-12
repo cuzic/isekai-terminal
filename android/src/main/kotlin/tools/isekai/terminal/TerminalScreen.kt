@@ -8,6 +8,11 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -72,6 +77,8 @@ data class TerminalScreenActions(
     val onGetSessionLog: () -> String,
     val onSendSnippet: (Snippet) -> Unit,
     val onRespondAgentSignRequest: (Boolean) -> Unit,
+    /** #14: 「今すぐWiFiに戻す」。マルチパス以外のセッションでは呼んでもRust側で無視される。 */
+    val onForceReturnToWifi: () -> Unit = {},
 )
 
 /**
@@ -88,9 +95,16 @@ fun TerminalScreenBody(
     actions: TerminalScreenActions,
     snippets: List<Snippet> = emptyList(),
     isActive: Boolean = true,
+    chromeVisible: Boolean = true,
+    onUserActivity: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val connected = uiState.connected
+
+    // 未接続/切断中は再接続ボタンを隠したままにできないため、上部バーを強制的に再表示する。
+    LaunchedEffect(connected, isActive) {
+        if (isActive && !connected) onUserActivity()
+    }
     val statusMsg = uiState.statusMsg
     val screenUpdate = uiState.screenUpdate
     val scrollbackLen = uiState.scrollbackLen
@@ -186,47 +200,63 @@ fun TerminalScreenBody(
             .navigationBarsPadding()
             .imePadding(),
     ) {
-        // ステータスバー
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(AppColors.CardBackground)
-                .padding(horizontal = 8.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
+        // ステータスバー(ホスト名代わりの statusMsg・再接続/切断・ログ・戻る)。
+        // 普段は画面いっぱいにターミナルを見せたいという要望から、ドラッグ操作時だけ表示する。
+        AnimatedVisibility(
+            visible = chromeVisible,
+            enter = fadeIn() + slideInVertically(initialOffsetY = { -it }),
+            exit = fadeOut() + slideOutVertically(targetOffsetY = { -it }),
         ) {
-            Text(
-                statusMsg,
-                color = if (connected) AppColors.Success else Color.Yellow,
-                fontSize = 11.sp,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (!connected) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(AppColors.CardBackground)
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    statusMsg,
+                    color = if (connected) AppColors.Success else Color.Yellow,
+                    fontSize = 11.sp,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (!connected) {
+                        TextButton(
+                            onClick = {
+                                if (canReconnect) actions.onConnect()
+                            },
+                            contentPadding = PaddingValues(0.dp),
+                        ) { Text("再接続", color = Color.Cyan, fontSize = 11.sp) }
+                    } else {
+                        TextButton(
+                            onClick = { actions.onDisconnect() },
+                            contentPadding = PaddingValues(0.dp),
+                        ) { Text("切断", color = Color.Gray, fontSize = 11.sp) }
+                    }
+                    if (connected) {
+                        TextButton(
+                            onClick = {
+                                val log = actions.onGetSessionLog()
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                cm.setPrimaryClip(ClipData.newPlainText("isekai-terminal log", log))
+                            },
+                            contentPadding = PaddingValues(0.dp),
+                        ) { Text("ログ", color = AppColors.SecondaryText, fontSize = 11.sp) }
+                    }
+                    // #14: セルラーへフェイルオーバー中/WiFi復帰の静けさ待ち中だけ表示する。
+                    // 表示可否の判定はRebindPublicState(Rust側が発火するcallback経由)だけを
+                    // 見て行い、Kotlin側で推測状態は持たない(rust-ssot.md準拠)。
+                    if (connected && uiState.rebindState != null && uiState.rebindState != RebindPublicState.ON_WIFI) {
+                        TextButton(
+                            onClick = { actions.onForceReturnToWifi() },
+                            contentPadding = PaddingValues(0.dp),
+                        ) { Text("今すぐWiFiに戻す", color = Color.Cyan, fontSize = 11.sp) }
+                    }
                     TextButton(
-                        onClick = {
-                            if (canReconnect) actions.onConnect()
-                        },
+                        onClick = { actions.onBack() },
                         contentPadding = PaddingValues(0.dp),
-                    ) { Text("再接続", color = Color.Cyan, fontSize = 11.sp) }
-                } else {
-                    TextButton(
-                        onClick = { actions.onDisconnect() },
-                        contentPadding = PaddingValues(0.dp),
-                    ) { Text("切断", color = Color.Gray, fontSize = 11.sp) }
+                    ) { Text("戻る", color = Color.Gray, fontSize = 11.sp) }
                 }
-                if (connected) {
-                    TextButton(
-                        onClick = {
-                            val log = actions.onGetSessionLog()
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            cm.setPrimaryClip(ClipData.newPlainText("isekai-terminal log", log))
-                        },
-                        contentPadding = PaddingValues(0.dp),
-                    ) { Text("ログ", color = AppColors.SecondaryText, fontSize = 11.sp) }
-                }
-                TextButton(
-                    onClick = { actions.onBack() },
-                    contentPadding = PaddingValues(0.dp),
-                ) { Text("戻る", color = Color.Gray, fontSize = 11.sp) }
             }
         }
 
@@ -306,6 +336,16 @@ fun TerminalScreenBody(
                     }
                 }
 
+                // pointerInput の key に cellDims/cols/rows を直接使うと、ピンチで
+                // fontScale が変わる → cellDims/cols/rows が再計算される → key が変わり
+                // ジェスチャー検出コルーチン自体がキャンセル&再起動される、という
+                // 自己中断ループになってしまう(実機検証で確認: ピンチがほぼ常に
+                // 完了前に中断されていた不具合の原因)。rememberUpdatedState 経由で
+                // 最新値を読むことで、値が変わってもコルーチンを再起動せずに済ませる。
+                val latestCellDims = rememberUpdatedState(cellDims)
+                val latestCols = rememberUpdatedState(cols)
+                val latestRows = rememberUpdatedState(rows)
+
                 Box(modifier = Modifier.fillMaxSize()) {
                     SshTerminalCanvas(
                         update = displayUpdate,
@@ -313,13 +353,25 @@ fun TerminalScreenBody(
                         theme = terminalTheme,
                         modifier = Modifier
                             .fillMaxSize()
-                            .pointerInput(cellDims, cols, rows) {
-                                val cellW = cellDims.first
-                                val cellH = cellDims.second
+                            .pointerInput(Unit) {
                                 awaitEachGesture {
+                                    // ジェスチャー開始時点の最新値を1回だけ読む
+                                    // (ジェスチャー中は安定した値のまま扱えばよく、
+                                    // ピンチ自体がこれらを変化させても再起動はされない)。
+                                    val cellW = latestCellDims.value.first
+                                    val cellH = latestCellDims.value.second
+                                    val cols = latestCols.value
+                                    val rows = latestRows.value
                                     val down = awaitFirstDown(requireUnconsumed = false)
                                     val longPress = awaitLongPressOrCancellation(down.id)
-                                    if (longPress != null) {
+                                    // awaitLongPressOrCancellation は「指定した1本の指」の移動/リリースしか
+                                    // 見ておらず、2本指が同時に押され続けている(=ピンチ操作中)場合でも
+                                    // 長押しタイムアウト(既定 ~400ms)で非nullを返してしまう(実機ログで確認
+                                    // 済み: 自然なピンチはほぼ確実にこの時間を超える)。そのため、ここで
+                                    // 実際に押されている指の本数を見て、2本以上ならピンチ/パン優先で扱う
+                                    // (単一指の本物の長押しだけを選択モードにする)。
+                                    val pointerCount = currentEvent.changes.count { it.pressed }
+                                    if (longPress != null && pointerCount < 2) {
                                         // (1) 長押し成立 → 選択モード。選択中はスクロールに触れない
                                         // (= スクロール位置ロック)。以降のドラッグで head を更新する。
                                         val startCell = offsetToCellPos(
@@ -343,16 +395,20 @@ fun TerminalScreenBody(
                                         }
                                     } else {
                                         val stillDown = currentEvent.changes.firstOrNull { it.id == down.id }
-                                        if (stillDown == null || !stillDown.pressed) {
+                                        if (pointerCount < 2 && (stillDown == null || !stillDown.pressed)) {
                                             // (3) 単純タップ（長押し不成立かつ移動なしで指が離れた）→ IME フォーカス
                                             requestImeFocus()
                                         } else {
-                                            // (2) 長押し不成立で移動 → 従来のピンチ拡縮+縦パンスクロール相当
+                                            // (2) 2本指以上、または長押し不成立で移動 →
+                                            // ピンチ拡縮+縦パンスクロール
                                             while (true) {
                                                 val event = awaitPointerEvent()
                                                 val zoom = event.calculateZoom()
                                                 val pan = event.calculatePan()
                                                 if (zoom != 1f || pan != Offset.Zero) {
+                                                    // 上部バーを表示するトリガー(ドラッグ操作)。継続的にドラッグしている間は
+                                                    // 呼ばれ続けるので、離れた後の自動非表示タイマーもその都度リセットされる。
+                                                    onUserActivity()
                                                     val newScale = (fontScale * zoom).coerceIn(0.5f, 3.0f)
                                                     if (newScale != fontScale) { fontScale = newScale; saveFontScale(newScale) }
                                                     panAccumY += pan.y
@@ -455,6 +511,13 @@ fun TerminalScreenBody(
                 var composingText by remember { mutableStateOf("") }
                 // トグル式 Ctrl キーの武装状態。UI 表示に閉じたローカル状態（rust-ssot.md の例外）。
                 var ctrlArmed by remember { mutableStateOf(false) }
+                // 接続直後に1回だけソフトキーボードを自動表示するためのフラグ。この
+                // ブロック全体は connected が false になると composition から外れて
+                // remember 状態ごと破棄されるため、再接続のたびに自然に false へ戻る。
+                // (以前は AndroidView の update ラムダで毎回無条件に showSoftInput() して
+                // いたため、ターミナル出力がある(=screenUpdate が変わる)たびに再表示され、
+                // ユーザーが手動で隠しても数百ms後には勝手に出てくる不具合になっていた。)
+                var imeAutoShown by remember { mutableStateOf(false) }
 
                 // Ctrl キー行
                 Row(
@@ -501,12 +564,16 @@ fun TerminalScreenBody(
                     },
                     // update は view 生成後・recomposition のたびに呼ばれる。
                     // connected が true になった直後に呼ばれるので LaunchedEffect より確実。
+                    // ただし update 自体は screenUpdate 等が変わるたびに何度も呼ばれるため、
+                    // 自動表示は imeAutoShown で1回だけに制限する（手動で隠した後に
+                    // 勝手に再表示されないようにするため）。
                     update = { view ->
                         view.applicationCursorMode = screenUpdate?.applicationCursorMode ?: false
                         view.bracketedPasteMode = screenUpdate?.bracketedPasteMode ?: false
                         view.ctrlArmed = ctrlArmed
                         view.onCtrlConsumed = { ctrlArmed = false }
-                        if (connected) {
+                        if (connected && !imeAutoShown) {
+                            imeAutoShown = true
                             view.post {
                                 view.requestFocus()
                                 view.context.getSystemService(InputMethodManager::class.java)

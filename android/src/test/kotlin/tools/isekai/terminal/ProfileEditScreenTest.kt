@@ -47,6 +47,12 @@ class ProfileEditScreenTest {
         username = "deploy", authType = "password",
     )
 
+    /** 「詳細設定」に格納されたトランスポート選択チップを操作するテスト向けの共通手順。 */
+    private fun revealAdvancedTransportOptions() {
+        composeTestRule.onNodeWithText("詳細設定を表示（上級者向け）").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
+    }
+
     private fun insertKey(label: String) = runBlocking {
         Repositories.keys.save(
             KeyEntry(
@@ -290,12 +296,14 @@ class ProfileEditScreenTest {
 
     @Test fun stunChip_hiddenField_untilSelected() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        revealAdvancedTransportOptions()
         composeTestRule.onNodeWithText("STUN P2P QUIC（実験的）").assertExists()
         composeTestRule.onNodeWithText("STUNサーバー（任意、複数はカンマ区切り）").assertDoesNotExist()
     }
 
     @Test fun stunChip_selecting_showsStunServerField() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        revealAdvancedTransportOptions()
         composeTestRule.onNodeWithText("STUN P2P QUIC（実験的）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithText("STUNサーバー（任意、複数はカンマ区切り）").assertExists()
@@ -303,6 +311,7 @@ class ProfileEditScreenTest {
 
     @Test fun stunServerField_isOptional_saveButtonStillEnabled() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("StunHost")
         fields[1].performTextInput("host.example.com")
@@ -318,6 +327,7 @@ class ProfileEditScreenTest {
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
         }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("StunProfile")
         fields[1].performTextInput("host.example.com")
@@ -350,12 +360,14 @@ class ProfileEditScreenTest {
 
     @Test fun relayChip_hiddenFields_untilSelected() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        revealAdvancedTransportOptions()
         composeTestRule.onNodeWithText("relay P2P QUIC（実験的）").assertExists()
         composeTestRule.onNodeWithText("relayアドレス（host:port）").assertDoesNotExist()
     }
 
     @Test fun relayChip_selecting_showsRelayFields() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        revealAdvancedTransportOptions()
         composeTestRule.onNodeWithText("relay P2P QUIC（実験的）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithText("relayアドレス（host:port）").assertExists()
@@ -365,6 +377,7 @@ class ProfileEditScreenTest {
 
     @Test fun saveButton_disabledWhenRelaySelectedButIncomplete() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("WithRelay")
         fields[1].performTextInput("host.example.com")
@@ -396,6 +409,7 @@ class ProfileEditScreenTest {
                 decryptRelayJwt = { it },
             )
         }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("RelayProfile")
         fields[1].performTextInput("host.example.com")
@@ -501,12 +515,13 @@ class ProfileEditScreenTest {
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithText("Remote (-R)").assertIsSelected()
 
-        // フォワード追加後の新規テキストフィールド: [4]=接続後コマンド, [5]=待受アドレス
-        // (プリフィル済み), [6]=待受ポート, [7]=ローカルターゲットホスト, [8]=ローカルターゲットポート。
+        // フォワード追加後の新規テキストフィールド: [4]=ヘルパー待受ポート固定(既定のSmart SSH
+        // ではAUTOが選ばれておりこのフィールドも表示される), [5]=接続後コマンド, [6]=待受アドレス
+        // (プリフィル済み), [7]=待受ポート, [8]=ローカルターゲットホスト, [9]=ローカルターゲットポート。
         fields = composeTestRule.onAllNodes(hasSetTextAction())
-        fields[6].performTextInput("8080")
-        fields[7].performTextInput("192.168.1.5")
-        fields[8].performTextInput("9090")
+        fields[7].performTextInput("8080")
+        fields[8].performTextInput("192.168.1.5")
+        fields[9].performTextInput("9090")
         composeTestRule.onNodeWithText("Remote (-R)").assertIsSelected()
 
         composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
@@ -542,9 +557,10 @@ class ProfileEditScreenTest {
         composeTestRule.waitForIdle()
 
         // Dynamicは転送先ホスト/ポート欄が表示されないため、待受ポートのみ入力する。
-        // [4]=接続後コマンド, [5]=待受アドレス(プリフィル済み), [6]=待受ポート。
+        // [4]=ヘルパー待受ポート固定(既定のSmart SSHではAUTOが選ばれておりこのフィールドも
+        // 表示される), [5]=接続後コマンド, [6]=待受アドレス(プリフィル済み), [7]=待受ポート。
         fields = composeTestRule.onAllNodes(hasSetTextAction())
-        fields[6].performTextInput("1080")
+        fields[7].performTextInput("1080")
 
         composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
         composeTestRule.waitUntil(5000) {
@@ -630,7 +646,7 @@ class ProfileEditScreenTest {
     // STUN P2P / relay P2P は上のセクションで既にチップ選択+保存を検証済みなので、
     // ここでは残りの全チップ(既定のPLAIN_SSH含む)を網羅する。
 
-    @Test fun savingWithDefaultTransportChip_persistsPlainSsh() {
+    @Test fun savingWithDefaultTransportChip_persistsSmartSsh() {
         var saved = false
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
@@ -639,7 +655,7 @@ class ProfileEditScreenTest {
         fields[0].performTextInput("DefaultTransport")
         fields[1].performTextInput("host.example.com")
         fields[3].performTextInput("root")
-        composeTestRule.onNodeWithText("通常 SSH").assertIsSelected()
+        composeTestRule.onNodeWithText("Smart SSH（推奨）").assertIsSelected()
 
         composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
         composeTestRule.waitUntil(5000) {
@@ -648,7 +664,7 @@ class ProfileEditScreenTest {
         }
         runBlocking {
             val stored = Repositories.profiles.getAll().first { it.label == "DefaultTransport" }
-            assertEquals("PLAIN_SSH", stored.transportPreferenceName)
+            assertEquals("AUTO", stored.transportPreferenceName)
         }
     }
 
@@ -657,6 +673,7 @@ class ProfileEditScreenTest {
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
         }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("TsshdProfile")
         fields[1].performTextInput("host.example.com")
@@ -685,9 +702,9 @@ class ProfileEditScreenTest {
         fields[0].performTextInput("AutoProfile")
         fields[1].performTextInput("host.example.com")
         fields[3].performTextInput("root")
-        composeTestRule.onNodeWithText("Auto（推奨）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.onNodeWithText("Smart SSH（推奨）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithText("Auto（推奨）").assertIsSelected()
+        composeTestRule.onNodeWithText("Smart SSH（推奨）").assertIsSelected()
 
         composeTestRule.onNodeWithText("保存").performScrollTo().performClick()
         composeTestRule.waitUntil(5000) {
@@ -705,6 +722,7 @@ class ProfileEditScreenTest {
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
         }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("IsekaiPipeQuicProfile")
         fields[1].performTextInput("host.example.com")
@@ -728,6 +746,11 @@ class ProfileEditScreenTest {
 
     @Test fun helperBindPortField_hiddenForPlainSsh_shownForIsekaiPipeQuicChips() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        // 既定はSmart SSH(AUTO)で、これもヘルパーを使うためフィールドが最初から出ている。
+        // 「通常SSH」に切り替えると隠れることを確認する。
+        revealAdvancedTransportOptions()
+        composeTestRule.onNodeWithText("通常 SSH").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
+        composeTestRule.waitForIdle()
         composeTestRule.onNodeWithText("ヘルパー待受ポート固定（任意、1024〜65535）").assertDoesNotExist()
 
         composeTestRule.onNodeWithText("自作ヘルパー QUIC").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
@@ -740,6 +763,7 @@ class ProfileEditScreenTest {
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
         }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("FixedPortProfile")
         fields[1].performTextInput("host.example.com")
@@ -764,6 +788,7 @@ class ProfileEditScreenTest {
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
         }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("EphemeralPortProfile")
         fields[1].performTextInput("host.example.com")
@@ -786,6 +811,7 @@ class ProfileEditScreenTest {
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = {}, onCancel = {})
         }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("BadPortProfile")
         fields[1].performTextInput("host.example.com")
@@ -801,6 +827,7 @@ class ProfileEditScreenTest {
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = {}, onCancel = {})
         }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("TooHighPortProfile")
         fields[1].performTextInput("host.example.com")
@@ -819,6 +846,7 @@ class ProfileEditScreenTest {
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
         }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("BoundaryPortProfile")
         fields[1].performTextInput("host.example.com")
@@ -852,6 +880,7 @@ class ProfileEditScreenTest {
         composeTestRule.setContent {
             ProfileEditScreen(profile = null, onSave = { saved = true }, onCancel = {})
         }
+        revealAdvancedTransportOptions()
         val fields = composeTestRule.onAllNodes(hasSetTextAction())
         fields[0].performTextInput("IsekaiPipeQuicMultipathProfile")
         fields[1].performTextInput("host.example.com")
@@ -873,6 +902,7 @@ class ProfileEditScreenTest {
 
     @Test fun multipathWithDirectAddress_andBlankBindPort_showsDefaultPortNote() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        revealAdvancedTransportOptions()
         composeTestRule.onNodeWithText("自作ヘルパー QUIC（マルチパス）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
 

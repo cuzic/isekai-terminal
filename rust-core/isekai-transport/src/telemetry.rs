@@ -24,6 +24,18 @@
 //! - `candidate_source`: which provider discovered this candidate (e.g.
 //!   `"legacy-intent"`) — `CandidateOrigin::source`.
 //! - `candidate_provider`: that provider's id — `CandidateOrigin::provider_id`.
+//! - `direct`: `true` when this candidate came from [`LEGACY_INTENT_PROVIDER_ID`]
+//!   (the profile's own bootstrapped/observed address — today's only
+//!   "primary" transport, `IntentTransport::Relay`/`StunP2p` alike), `false`
+//!   when it came from `ConnectionIntent::relay_endpoints`
+//!   (`ConfigRelayProvider`, `#@isekai relay <url>` — an explicit fallback
+//!   address, possibly relay-assigned). Exists because `candidate_kind=relay`
+//!   alone is ambiguous to a human reader: that label names the *dialing
+//!   mechanism* (fixed-address ATTACH dial, `CandidateRoute::Relay`), not
+//!   whether the dialed address is actually the target's own vs. a
+//!   relay-assigned one — today's "direct" isekai-pipe-helper connections are
+//!   *also* `candidate_kind=relay` for that reason, which repeatedly reads as
+//!   "this went through a relay server" when it did not.
 //! - `candidate_id`: the pool-local `CandidateId` — lets repeated attempts
 //!   against the same candidate be correlated across log lines.
 //! - `start_delay`: how long this attempt was queued before it actually
@@ -48,6 +60,7 @@
 
 use std::time::Duration;
 
+use isekai_pipe_core::LEGACY_INTENT_PROVIDER_ID;
 use isekai_protocol::attach::{AttemptId, ConnectionGeneration};
 use isekai_protocol::session_id::SessionId;
 
@@ -129,9 +142,11 @@ pub fn log_candidate_attempt(attempt: &CandidateAttempt<'_>) {
     let quic_handshake_ms = format_duration_ms(attempt.quic_handshake_time);
     let authenticated_ready_ms = format_duration_ms(attempt.authenticated_ready_time);
     let failure_stage = attempt.failure_stage.unwrap_or("none");
+    let direct = is_direct_dial(attempt.identity.source);
 
     let line = format!(
         "candidate attempt: candidate_kind={} candidate_source={} candidate_provider={} candidate_id={} \
+         direct={direct} \
          session_id={} generation={} attempt_id={} \
          start_delay_ms={} quic_handshake_time_ms={quic_handshake_ms} \
          authenticated_ready_time_ms={authenticated_ready_ms} failure_stage={failure_stage} outcome={}",
@@ -189,6 +204,13 @@ fn format_duration_ms(d: Option<Duration>) -> String {
     }
 }
 
+/// The `direct` field's value — see this module's docs for why it exists
+/// (`candidate_kind=relay` alone does not tell a human reader whether the
+/// dialed address was the target's own or a relay-assigned fallback).
+fn is_direct_dial(source: &str) -> bool {
+    source == LEGACY_INTENT_PROVIDER_ID
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +225,18 @@ mod tests {
     fn format_duration_ms_renders_none_literally() {
         assert_eq!(format_duration_ms(None), "none");
         assert_eq!(format_duration_ms(Some(Duration::from_millis(42))), "42");
+    }
+
+    #[test]
+    fn is_direct_dial_is_true_only_for_the_legacy_intent_source() {
+        // legacy-intentは常にプロファイル自身のブートストラップ済み/観測済み
+        // アドレス(intent.transportの直接候補)を指す — kindがrelay/stun-p2p
+        // どちらでも「direct」である。
+        assert!(is_direct_dial(LEGACY_INTENT_PROVIDER_ID));
+        // config-relay(ConnectionIntent::relay_endpoints由来)は明示的な
+        // フォールバック先アドレスであり、directではない。
+        assert!(!is_direct_dial("config-relay"));
+        assert!(!is_direct_dial("unknown-provider"));
     }
 
     #[test]

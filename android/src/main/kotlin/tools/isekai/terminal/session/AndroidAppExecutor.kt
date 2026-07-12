@@ -125,6 +125,12 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
         return provider.acquireCellularOnly()
     }
 
+    override suspend fun acquireWifiFd(): Pair<Int, String>? {
+        val provider = PhysicalPathProvider(app)
+        upstreamFailoverPathProvider = provider
+        return provider.acquireWifiOnly()
+    }
+
     override suspend fun loadKeyPem(keyId: Long): ByteArray {
         val keyEntry = Repositories.keys.findById(keyId)
             ?: error("鍵が見つかりません (id=$keyId)")

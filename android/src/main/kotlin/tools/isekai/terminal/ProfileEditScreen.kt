@@ -1,5 +1,10 @@
 package tools.isekai.terminal
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,6 +32,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -125,7 +131,12 @@ fun ProfileEditScreen(
     var authType by remember { mutableStateOf(profile?.authType ?: "password") }
     var keyId by remember { mutableStateOf(profile?.keyId) }
     var keyMenuExpanded by remember { mutableStateOf(false) }
-    var transportPreference by remember { mutableStateOf(profile?.transportPreference ?: TransportPreference.PLAIN_SSH) }
+    var transportPreference by remember { mutableStateOf(profile?.transportPreference ?: TransportPreference.AUTO) }
+    // 「Smart SSH」以外(=詳細設定側)を既に使っているプロファイルを編集する場合は、
+    // 設定を見失わせないよう最初から詳細設定を展開しておく。
+    var showAdvancedTransport by remember {
+        mutableStateOf(profile != null && profile.transportPreference != TransportPreference.AUTO)
+    }
     var tsshdPort by remember { mutableStateOf((profile?.tsshdPort ?: ConnectionProfile.DEFAULT_TSSHD_PORT).toString()) }
     var directAddress by remember { mutableStateOf(profile?.directAddress ?: "") }
     var enablePhysicalMultipath by remember { mutableStateOf(profile?.enablePhysicalMultipath ?: false) }
@@ -371,40 +382,8 @@ fun ProfileEditScreen(
 
         Text("接続方式")
         Text(
-            text = "以下の3つは「失敗時どうなるか」が異なる接続ポリシーです。うまく繋がらない場合は" +
-                "上のポリシーへ切り替えてください。",
-            fontSize = 12.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-
-        Spacer(Modifier.height(4.dp))
-        Text("Plain SSH", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-        Text(
-            text = "NAT越え・P2Pは一切行わない従来のSSH接続。フォールバックという概念自体が無い基本方式です。",
-            fontSize = 12.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.horizontalScroll(rememberScrollState()),
-        ) {
-            FilterChip(
-                selected = transportPreference == TransportPreference.PLAIN_SSH,
-                onClick = { transportPreference = TransportPreference.PLAIN_SSH },
-                label = { Text("通常 SSH") },
-            )
-            FilterChip(
-                selected = transportPreference == TransportPreference.TSSHD_QUIC,
-                onClick = { transportPreference = TransportPreference.TSSHD_QUIC },
-                label = { Text("tsshd QUIC") },
-            )
-        }
-
-        Spacer(Modifier.height(8.dp))
-        Text("Smart Connect（推奨）", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-        Text(
             text = "自作ヘルパー経由QUICを試し、失敗したら自動的に通常SSHへフォールバックします。" +
-                "迷ったらこれを選んでください。",
+                "特に理由がなければこれを選んでください。",
             fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -415,43 +394,77 @@ fun ProfileEditScreen(
             FilterChip(
                 selected = transportPreference == TransportPreference.AUTO,
                 onClick = { transportPreference = TransportPreference.AUTO },
-                label = { Text("Auto（推奨）") },
+                label = { Text("Smart SSH（推奨）") },
             )
         }
 
-        Spacer(Modifier.height(8.dp))
-        Text("Strict Isekai Link（実験的・フォールバックなし）", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-        Text(
-            text = "指定した経路のみを使用します。穴あけ・ヘルパー起動などが失敗しても自動フォールバック" +
-                "せず、その場で接続エラーになります（経路そのものが信頼境界のため、意図せず別経路へ" +
-                "落ちないようにしています）。",
-            fontSize = 12.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.horizontalScroll(rememberScrollState()),
+        Spacer(Modifier.height(4.dp))
+        TextButton(onClick = { showAdvancedTransport = !showAdvancedTransport }) {
+            Text(if (showAdvancedTransport) "詳細設定を隠す" else "詳細設定を表示（上級者向け）")
+        }
+
+        AnimatedVisibility(
+            visible = showAdvancedTransport,
+            enter = fadeIn() + expandVertically(),
+            exit = fadeOut() + shrinkVertically(),
         ) {
-            FilterChip(
-                selected = transportPreference == TransportPreference.ISEKAI_PIPE_QUIC,
-                onClick = { transportPreference = TransportPreference.ISEKAI_PIPE_QUIC },
-                label = { Text("自作ヘルパー QUIC") },
-            )
-            FilterChip(
-                selected = transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH,
-                onClick = { transportPreference = TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH },
-                label = { Text("自作ヘルパー QUIC（マルチパス）") },
-            )
-            FilterChip(
-                selected = transportPreference == TransportPreference.ISEKAI_STUN_P2P_QUIC,
-                onClick = { transportPreference = TransportPreference.ISEKAI_STUN_P2P_QUIC },
-                label = { Text("STUN P2P QUIC（実験的）") },
-            )
-            FilterChip(
-                selected = transportPreference == TransportPreference.ISEKAI_LINK_RELAY_QUIC,
-                onClick = { transportPreference = TransportPreference.ISEKAI_LINK_RELAY_QUIC },
-                label = { Text("relay P2P QUIC（実験的）") },
-            )
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Plain SSH", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text(
+                    text = "NAT越え・P2Pは一切行わない従来のSSH接続。フォールバックという概念自体が無い基本方式です。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                ) {
+                    FilterChip(
+                        selected = transportPreference == TransportPreference.PLAIN_SSH,
+                        onClick = { transportPreference = TransportPreference.PLAIN_SSH },
+                        label = { Text("通常 SSH") },
+                    )
+                    FilterChip(
+                        selected = transportPreference == TransportPreference.TSSHD_QUIC,
+                        onClick = { transportPreference = TransportPreference.TSSHD_QUIC },
+                        label = { Text("tsshd QUIC") },
+                    )
+                }
+
+                Text("Strict Isekai Link（実験的・フォールバックなし）", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text(
+                    text = "指定した経路のみを使用します。穴あけ・ヘルパー起動などが失敗しても自動フォールバック" +
+                        "せず、その場で接続エラーになります（経路そのものが信頼境界のため、意図せず別経路へ" +
+                        "落ちないようにしています）。",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                ) {
+                    FilterChip(
+                        selected = transportPreference == TransportPreference.ISEKAI_PIPE_QUIC,
+                        onClick = { transportPreference = TransportPreference.ISEKAI_PIPE_QUIC },
+                        label = { Text("自作ヘルパー QUIC") },
+                    )
+                    FilterChip(
+                        selected = transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH,
+                        onClick = { transportPreference = TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH },
+                        label = { Text("自作ヘルパー QUIC（マルチパス）") },
+                    )
+                    FilterChip(
+                        selected = transportPreference == TransportPreference.ISEKAI_STUN_P2P_QUIC,
+                        onClick = { transportPreference = TransportPreference.ISEKAI_STUN_P2P_QUIC },
+                        label = { Text("STUN P2P QUIC（実験的）") },
+                    )
+                    FilterChip(
+                        selected = transportPreference == TransportPreference.ISEKAI_LINK_RELAY_QUIC,
+                        onClick = { transportPreference = TransportPreference.ISEKAI_LINK_RELAY_QUIC },
+                        label = { Text("relay P2P QUIC（実験的）") },
+                    )
+                }
+            }
         }
 
         if (transportPreference == TransportPreference.ISEKAI_PIPE_QUIC ||
