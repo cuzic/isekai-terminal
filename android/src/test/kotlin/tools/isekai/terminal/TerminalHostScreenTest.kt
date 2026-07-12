@@ -26,6 +26,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
+import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.ui.TerminalThemes
 import uniffi.isekai_terminal_core.ScreenUpdate
@@ -56,7 +57,7 @@ class TerminalHostScreenTest {
             Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) }
         }
         executor = DumbAppExecutor()
-        val sessionFactory: () -> TerminalSession = {
+        val sessionFactory: (AppExecutor) -> TerminalSession = {
             val fake = FakeOrchestrator()
             orchestrators.add(fake)
             TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })

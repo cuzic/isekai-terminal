@@ -59,6 +59,21 @@ impl ActiveSession {
             s.rebind_to_fd(fd, local_ip);
         }
     }
+    /// #11: ユーザーが「今すぐWiFiに戻す」を要求した。マルチパス以外のtransportでは
+    /// 何もしない(rebind_to_fdと同じ理由)。
+    fn force_return_to_wifi(&self) {
+        if let Self::MultipathIsekaiPipeQuic(s) = self {
+            s.force_return_to_wifi();
+        }
+    }
+    /// trzsz転送中(WaitingUser含む)かどうかをRebindManager(#22のDriver)の
+    /// 静けさ判定の補助シグナルとして伝える。マルチパス以外では意味を持たないため
+    /// `rebind_to_fd`と同じくno-op委譲。
+    fn set_interactive_busy(&self, busy: bool) {
+        if let Self::MultipathIsekaiPipeQuic(s) = self {
+            s.set_interactive_busy(busy);
+        }
+    }
     fn scrollback_len(&self) -> u32 {
         dispatch_all!(self, scrollback_len)
     }
@@ -203,6 +218,9 @@ impl SessionCallback for OrchestratorAdapter {
             s.download_buf.clear();
             s.size_limit_exceeded_for = None;
         }
+        if let Some(session) = self.shared.session.lock().as_ref() {
+            session.set_interactive_busy(true);
+        }
         self.shared.callback.on_trzsz_state_changed(
             TrzszPublicState::WaitingUser { transfer_id, mode, suggested_name, expected_size }
         );
@@ -265,6 +283,9 @@ impl SessionCallback for OrchestratorAdapter {
                 (data, is_download, success, message)
             }
         };
+        if let Some(session) = self.shared.session.lock().as_ref() {
+            session.set_interactive_busy(false);
+        }
         if success && is_download && !data.is_empty() {
             self.shared.callback.on_download_complete(None, data);
         }
@@ -291,6 +312,18 @@ impl SessionCallback for OrchestratorAdapter {
 
     fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> {
         self.shared.callback.on_clipboard_pull_request()
+    }
+
+    fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> {
+        self.shared.callback.on_request_wifi_fd()
+    }
+
+    fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> {
+        self.shared.callback.on_request_cellular_fd()
+    }
+
+    fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState) {
+        self.shared.callback.on_rebind_state_changed(state);
     }
 }
 
@@ -444,6 +477,16 @@ impl SessionOrchestrator {
         }
     }
 
+    /// #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
+    /// ダウンロード中などで静けさ待ちを待たずに即座に戻したい場合)。疎通確認だけは
+    /// 省略されない(`RebindManager::handle_manual_force_return`参照)。マルチパス以外の
+    /// transportや未接続時は何もしない。
+    pub fn force_return_to_wifi(&self) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.force_return_to_wifi();
+        }
+    }
+
     pub fn send(&self, data: Vec<u8>) {
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.send(data);
@@ -497,6 +540,7 @@ impl SessionOrchestrator {
         if let Some(tid) = tid {
             if let Some(s) = self.shared.session.lock().as_ref() {
                 s.trzsz_cancel(tid);
+                s.set_interactive_busy(false);
             }
         }
     }
@@ -506,6 +550,9 @@ impl SessionOrchestrator {
         s.trzsz_mode = None;
         s.current_transfer_id = None;
         drop(s);
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.set_interactive_busy(false);
+        }
         self.shared.callback.on_trzsz_state_changed(TrzszPublicState::Idle);
     }
 
@@ -646,6 +693,9 @@ mod tests {
         }
         fn on_clipboard_write(&self, _payload: ClipboardPayload) {}
         fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> { None }
+        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
     }
 
     fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {

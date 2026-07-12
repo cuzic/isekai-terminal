@@ -1040,6 +1040,9 @@ mod local_forward_e2e_tests {
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
         fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
         fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
+        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
     }
 
     /// 受け取ったバイト列をそのまま返すだけのダミー TCP サーバ。
@@ -1691,6 +1694,9 @@ mod pooling_e2e_tests {
         fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
         fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
         fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
+        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
     }
 
     /// 公開鍵認証を無条件で受け入れつつ認証回数を数え、シェルチャネルへ書き込まれた

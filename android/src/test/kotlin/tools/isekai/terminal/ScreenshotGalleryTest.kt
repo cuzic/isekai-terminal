@@ -172,6 +172,8 @@ class ScreenshotGalleryTest {
 
     @Test fun profileEdit_relay() {
         composeTestRule.setContent { ProfileEditScreen(profile = null, onSave = {}, onCancel = {}) }
+        composeTestRule.onNodeWithText("詳細設定を表示（上級者向け）").performScrollTo().performClick()
+        composeTestRule.waitForIdle()
         composeTestRule.onNodeWithText("relay P2P QUIC（実験的）").performScrollTo().performSemanticsAction(SemanticsActions.OnClick)
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithText("relayアドレス（host:port）").performScrollTo()
