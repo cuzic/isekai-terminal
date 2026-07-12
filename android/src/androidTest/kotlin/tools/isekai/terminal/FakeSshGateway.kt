@@ -103,9 +103,14 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     override fun isQuic(): Boolean = quic
 
-    // 実 Rust 側 (SessionOrchestrator::notify_network_lost) の判断を再現する:
-    // ハンドシェイク中/プレーン TCP 接続中は切断、QUIC 接続中は無視。
-    override fun notifyNetworkLost() {
+    // 実 Rust 側 (SessionOrchestrator::notify_network_path_changed) の判断を再現する:
+    // ハンドシェイク中/プレーン TCP 接続中は切断、QUIC 接続中は無視。実装側はプレーン TCP
+    // 接続中のみ 400ms debounce するが、この Fake が検証したいのはタブへの fanout など
+    // Kotlin 側の配線であって debounce のタイミング自体(Rust 側で別途ユニットテスト済み)
+    // ではないため、ここでは同期的に「最終的に切断されるかどうか」だけを再現する。
+    // isSatisfied=true は保留中の debounce をキャンセルする以外に意味を持たないため無視する。
+    override fun notifyNetworkPathChanged(isSatisfied: Boolean) {
+        if (isSatisfied) return
         when {
             phase == Phase.CONNECTING || (phase == Phase.CONNECTED && !quic) -> {
                 disconnectCalled = true

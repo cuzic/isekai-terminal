@@ -121,7 +121,7 @@ class TerminalTabsViewModelTest {
     // ── ネットワーク断は全セッションへファンアウトされる ──────────────────
 
     @Test
-    fun onNetworkLost_fansOutToAllConnectedTabs() = runBlocking {
+    fun onNetworkPathChanged_fansOutToAllConnectedTabs() = runBlocking {
         vm.openTab(profile("a"), "pass")
         vm.openTab(profile("b"), "pass")
         awaitConnectCalled(orchestrators[0])
@@ -136,8 +136,23 @@ class TerminalTabsViewModelTest {
     }
 
     @Test
-    fun onNetworkLost_withNoTabs_doesNotThrow() {
-        vm.onNetworkLost()
+    fun onNetworkPathChanged_withNoTabs_doesNotThrow() {
+        vm.onNetworkPathChanged(isSatisfied = false)
+    }
+
+    @Test
+    fun onNetworkPathChanged_availableFansOutToAllTabsWithoutDisconnecting() = runBlocking {
+        vm.openTab(profile("a"), "pass")
+        vm.openTab(profile("b"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        awaitConnectCalled(orchestrators[1])
+        orchestrators[0].simulateConnected("host-a")
+        orchestrators[1].simulateConnected("host-b")
+
+        executor.simulateNetworkAvailable()
+
+        assertFalse("tab a should not be disconnected on recovery", orchestrators[0].disconnectCalled)
+        assertFalse("tab b should not be disconnected on recovery", orchestrators[1].disconnectCalled)
     }
 
     // ── 最後のタブを閉じた時のみ FGS 停止 ────────────────────────────────

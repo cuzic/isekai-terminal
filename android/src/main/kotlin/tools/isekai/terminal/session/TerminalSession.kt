@@ -285,11 +285,12 @@ class TerminalSession(
 
     // ── Network ───────────────────────────────────────────────────────
 
-    /** ネットワーク断イベントをそのまま Rust 側に転送する。
-     *  切断するかどうか（ハンドシェイク中/TCP接続中は切断、QUIC接続中は無視）の
-     *  判断はセッション状態の SSOT を持つ Rust 側（`SessionOrchestrator::notify_network_lost`）が行う。
+    /** ネットワークpath変化イベントをそのまま Rust 側に転送する。
+     *  切断するかどうか（ハンドシェイク中/TCP接続中は切断、QUIC接続中は無視。TCP接続中は
+     *  瞬断で即切断しないよう debounce する）の判断はセッション状態の SSOT を持つ Rust 側
+     *  （`SessionOrchestrator::notify_network_path_changed`）が行う。
      *  結果は通常の `onConnectionStateChanged` コールバック経由で [_state] に反映される。 */
-    fun notifyNetworkLost() = orchestrator.notifyNetworkLost()
+    fun notifyNetworkPathChanged(isSatisfied: Boolean) = orchestrator.notifyNetworkPathChanged(isSatisfied)
 
     /** 「WiFiは繋がっているがupstreamが死んでいる」等を検知した際に呼ぶ。
      *  マルチパス以外のtransportや未接続時は Rust 側で無視される（日和見的に呼べばよい）。 */

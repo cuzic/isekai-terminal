@@ -537,12 +537,12 @@ class TerminalSessionTest {
     // ── NetworkLost edge cases ──────────────────────────────────────────
 
     @Test
-    fun notifyNetworkLost_duringConnecting_setsAbortedMsg() = runBlocking {
+    fun notifyNetworkPathChanged_duringConnecting_setsAbortedMsg() = runBlocking {
         session.connect(testConfig())
         // Connecting state is set synchronously by FakeOrchestrator.connect()
         assertTrue(session.state.value.isConnecting)
 
-        session.notifyNetworkLost()
+        session.notifyNetworkPathChanged(isSatisfied = false)
 
         assertFalse(session.state.value.connected)
         assertFalse(session.state.value.isConnecting)
@@ -550,22 +550,22 @@ class TerminalSessionTest {
     }
 
     @Test
-    fun notifyNetworkLost_whenIdle_isNoOp() = runBlocking {
-        session.notifyNetworkLost()
+    fun notifyNetworkPathChanged_whenIdle_isNoOp() = runBlocking {
+        session.notifyNetworkPathChanged(isSatisfied = false)
         delay(100)
         assertEquals("未接続", session.state.value.statusMsg)
         assertFalse(session.state.value.connected)
     }
 
     @Test
-    fun notifyNetworkLost_calledMultipleTimes_isIdempotent() = runBlocking {
+    fun notifyNetworkPathChanged_calledMultipleTimes_isIdempotent() = runBlocking {
         session.connect(testConfig())
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        session.notifyNetworkLost()
-        session.notifyNetworkLost()
-        session.notifyNetworkLost()
+        session.notifyNetworkPathChanged(isSatisfied = false)
+        session.notifyNetworkPathChanged(isSatisfied = false)
+        session.notifyNetworkPathChanged(isSatisfied = false)
 
         assertFalse(session.state.value.connected)
         // 1 回だけ disconnect が呼ばれる
@@ -723,7 +723,7 @@ class TerminalSessionTest {
     // ── ViewModel 相当カバレッジ（JVM で検証）────────────────────────
 
     @Test
-    fun notifyNetworkLost_whenQuicConnected_doesNotDisconnect() = runBlocking {
+    fun notifyNetworkPathChanged_whenQuicConnected_doesNotDisconnect() = runBlocking {
         val quicConfig = QuicConfig(tsshdHost = "test.host", tsshdPort = 2222u,
             sshHost = "test.host", sshPort = 22u,
             username = "user", auth = SshAuth.Password("pass"),
@@ -732,7 +732,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        session.notifyNetworkLost()
+        session.notifyNetworkPathChanged(isSatisfied = false)
         delay(200)
 
         assertTrue("QUIC 接続はネットワーク喪失で切断されない", session.state.value.connected)

@@ -196,16 +196,19 @@ class TerminalTabsViewModel(
     init {
         RemoteLogger.i("IsekaiTerminalTabsVM", "TerminalTabsViewModel created")
         executor.registerNetworkCallbacks(
-            onAvailable = { RemoteLogger.i("IsekaiTerminalSSH", "network available") },
-            onLost = { onNetworkLost() },
+            onAvailable = {
+                RemoteLogger.i("IsekaiTerminalSSH", "network available")
+                onNetworkPathChanged(isSatisfied = true)
+            },
+            onLost = { onNetworkPathChanged(isSatisfied = false) },
         )
     }
 
     // ── ネットワーク（全タブへファンアウト）───────────────────────────
 
     /** internal にすることでテストから直接呼べる。 */
-    internal fun onNetworkLost() {
-        _tabs.value.forEach { it.session.notifyNetworkLost() }
+    internal fun onNetworkPathChanged(isSatisfied: Boolean) {
+        _tabs.value.forEach { it.session.notifyNetworkPathChanged(isSatisfied) }
     }
 
     // ── タブのライフサイクル ────────────────────────────────────────
