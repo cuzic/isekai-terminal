@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.HostKeySettings
 import tools.isekai.terminal.data.Repositories
@@ -44,13 +45,23 @@ import uniffi.isekai_terminal_core.IsekaiPipeQuicConfig
 import uniffi.isekai_terminal_core.IsekaiLinkRelayConfig
 import uniffi.isekai_terminal_core.IsekaiStunP2pConfig
 import uniffi.isekai_terminal_core.MultipathIsekaiPipeQuicConfig
+import uniffi.isekai_terminal_core.PlatformFd
 import uniffi.isekai_terminal_core.QuicConfig
 import uniffi.isekai_terminal_core.SshAuth
 import uniffi.isekai_terminal_core.SshConfig
 import uniffi.isekai_terminal_core.TransportPreference
 
 /**
- * 複数タブ（複数 SSH/QUIC セッション）を横断する Activity/Application スコープの状態管理。
+ * 複数タブ（複数 SSH/QUIC セッション）を横断する Application スコープの状態管理。
+ *
+ * [MainActivity.AppRoot]は`viewModel(viewModelStoreOwner = application, ...)`で生成する
+ * ([IsekaiTerminalApplication]の[androidx.lifecycle.ViewModelStore]を使う)。Activityスコープに
+ * していた旧実装では、Activityが(バックグラウンド中のタスク破棄等で)正規のfinish経路を通らず
+ * 再生成されると[onCleared]が呼ばれずに古いインスタンスが破棄され、`session.close()`が
+ * 一度も実行されないままRust側のSSH接続だけがプロセス内に孤立し、新しいインスタンスからは
+ * それを発見・再アタッチする手段が無いというバグがあった(実機検証で発見、2026-07-12)。
+ * Applicationスコープならプロセスが生きている限り同一インスタンスが使われ続けるため、
+ * このクラスがそもそも「破棄されて再生成される」状況自体が起こらなくなる。
  *
  * 「タブ横断で1回だけ登録すればよい」責務——ネットワーク監視・ForegroundService の
  * 起動/停止・ネットワーク断の全セッションへのファンアウト——をここに集約する。
@@ -73,14 +84,18 @@ import uniffi.isekai_terminal_core.TransportPreference
 class TerminalTabsViewModel(
     app: Application,
     private val executor: AppExecutor,
-    private val sessionFactory: () -> TerminalSession,
+    private val sessionFactory: (AppExecutor) -> TerminalSession,
 ) : AndroidViewModel(app) {
 
-    /** 本番用コンストラクタ。Compose の viewModel() から呼ばれる。 */
+    /** 本番用コンストラクタ。Compose の viewModel() から呼ばれる。
+     *  [sessionFactory] は`executor`を引数で受け取る形にしている
+     *  ([acquireWifiFd]/[acquireCellularFd]で同じ`executor`インスタンスを再利用するため
+     *  ——セカンダリコンストラクタの`this(...)`委譲の中では`this.executor`(未初期化)を
+     *  参照できないので、`AndroidAppExecutor(app)`を二重生成せずに済むようにする)。 */
     constructor(app: Application) : this(
         app,
         AndroidAppExecutor(app),
-        {
+        { executor ->
             val clipboardPolicy = RemoteClipboardPolicy(
                 isWriteAllowed = {
                     app.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE)
@@ -131,6 +146,16 @@ class TerminalTabsViewModel(
                 },
                 onClipboardWriteRequested = clipboardPolicy::onClipboardWriteRequested,
                 onClipboardPullRequested = clipboardPolicy::onClipboardPullRequested,
+                // #10/#22: RebindManager(Rust側)がWiFi/セルラーのfdを要求してきたら、
+                // AppExecutor経由で取得して返すだけ(判断はしない、rust-ssot.md準拠)。
+                // Rust側のspawn_blockingスレッドから同期呼び出しされるためrunBlockingで
+                // suspend関数をブリッジする(onAgentSignRequest等と同じ方式)。
+                acquireWifiFd = {
+                    runBlocking { executor.acquireWifiFd() }?.let { (fd, ip) -> PlatformFd(fd, ip) }
+                },
+                acquireCellularFd = {
+                    runBlocking { executor.acquireCellularFd() }?.let { (fd, ip) -> PlatformFd(fd, ip) }
+                },
             )
         },
     )
@@ -227,7 +252,7 @@ class TerminalTabsViewModel(
     /** 新しいタブを開いて接続を開始し、そのタブをアクティブにする。生成した tabId を返す。 */
     fun openTab(profile: ConnectionProfile, password: String? = null, jumpPassword: String? = null): String {
         val tabId = UUID.randomUUID().toString()
-        val session = sessionFactory()
+        val session = sessionFactory(executor)
         // Phase 12 P2-1: Global default → Profile default の解決。プロファイルに明示的な
         // テーマ指定があれば、その時点で「上書き済み」タブとして扱う(以後グローバル変更に
         // 追従しない。ユーザーがそのプロファイル用に選んだ意図を尊重する)。
@@ -602,6 +627,9 @@ class TerminalTabsViewModel(
     fun resize(tabId: String, cols: UInt, rows: UInt) = tabOrNull(tabId)?.session?.resize(cols, rows)
 
     fun disconnect(tabId: String) = tabOrNull(tabId)?.session?.disconnect()
+
+    /** #14: ユーザーが「今すぐWiFiに戻す」を要求した。判断はRust側(RebindManager)が行う。 */
+    fun forceReturnToWifi(tabId: String) = tabOrNull(tabId)?.session?.forceReturnToWifi()
 
     fun scrollbackCells(tabId: String, offset: Int, rows: Int): List<CellData>? =
         tabOrNull(tabId)?.session?.scrollbackCells(offset, rows)

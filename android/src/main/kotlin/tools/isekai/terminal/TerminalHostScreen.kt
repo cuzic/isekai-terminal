@@ -1,5 +1,10 @@
 package tools.isekai.terminal
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,8 +18,10 @@ import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -27,13 +34,21 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.delay
+
+/**
+ * 上部バー(タブ行・[TerminalScreenBody]のステータス行)を、操作が無いまま自動で隠すまでの
+ * 待ち時間。モバイルブラウザのアドレスバーと同様、画面いっぱいにターミナルを表示したい
+ * という要望から導入 (ドラッグ操作で再表示 → この時間操作が無ければ再び隠れる)。
+ */
+private const val CHROME_AUTO_HIDE_DELAY_MS = 2500L
 
 /**
  * 複数タブ (複数 SSH/QUIC セッション) を上部の [ScrollableTabRow] で切り替えるホスト画面。
  *
- * [TerminalTabsViewModel] は Activity スコープで生成される想定 (呼び出し元の `viewModel()`
- * が Activity の ViewModelStoreOwner を使う限り、ナビゲーション遷移をまたいでも同一インスタンス
- * が使われ、バックグラウンドのタブは生き続ける)。
+ * [TerminalTabsViewModel] は Application スコープで生成される想定 ([MainActivity.AppRoot] が
+ * [IsekaiTerminalApplication] の ViewModelStoreOwner を使う限り、ナビゲーション遷移はもちろん
+ * Activity の再生成をまたいでも同一インスタンスが使われ、バックグラウンドのタブは生き続ける)。
  *
  * 全タブ分の本体を常に composition に載せておき（スクロール位置・フォントスケール等の
  * ローカル状態を保持するため）、非アクティブなタブは [TerminalScreenBody] の `isActive = false`
@@ -52,27 +67,50 @@ fun TerminalHostScreen(
         return
     }
 
+    // 上部バー(タブ行 + TerminalScreenBody のステータス行)の表示/非表示。「普段は画面いっぱいに
+    // ターミナルを表示し、ドラッグ操作で見えるモバイルブラウザのアドレスバー」的な挙動にする要望から導入。
+    // タブは常時コンポーズされている(非アクティブは0dpのプレースホルダ)ため、この状態はここで
+    // 一元管理して両方の場所(タブ行/ステータス行)へ配る。
+    var chromeVisible by remember { mutableStateOf(true) }
+    var chromeRevealNonce by remember { mutableIntStateOf(0) }
+    val revealChrome: () -> Unit = {
+        chromeVisible = true
+        chromeRevealNonce++
+    }
+    LaunchedEffect(chromeRevealNonce, chromeVisible) {
+        if (chromeVisible) {
+            delay(CHROME_AUTO_HIDE_DELAY_MS)
+            chromeVisible = false
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
             val selectedIndex = tabs.indexOfFirst { it.tabId == activeTabId }.coerceAtLeast(0)
-            ScrollableTabRow(
-                selectedTabIndex = selectedIndex,
-                containerColor = Color(0xFF1A1A2E),
-                contentColor = Color.White,
-                edgePadding = 4.dp,
+            AnimatedVisibility(
+                visible = chromeVisible,
+                enter = fadeIn() + slideInVertically(initialOffsetY = { -it }),
+                exit = fadeOut() + slideOutVertically(targetOffsetY = { -it }),
             ) {
-                tabs.forEachIndexed { index, tab ->
-                    Tab(
-                        selected = index == selectedIndex,
-                        onClick = { tabsVm.setActiveTab(tab.tabId) },
-                        text = {
-                            TabLabel(
-                                tabsVm = tabsVm,
-                                tab = tab,
-                                onClose = { tabsVm.closeTab(tab.tabId) },
-                            )
-                        },
-                    )
+                ScrollableTabRow(
+                    selectedTabIndex = selectedIndex,
+                    containerColor = Color(0xFF1A1A2E),
+                    contentColor = Color.White,
+                    edgePadding = 4.dp,
+                ) {
+                    tabs.forEachIndexed { index, tab ->
+                        Tab(
+                            selected = index == selectedIndex,
+                            onClick = { tabsVm.setActiveTab(tab.tabId) },
+                            text = {
+                                TabLabel(
+                                    tabsVm = tabsVm,
+                                    tab = tab,
+                                    onClose = { tabsVm.closeTab(tab.tabId) },
+                                )
+                            },
+                        )
+                    }
                 }
             }
 
@@ -88,6 +126,8 @@ fun TerminalHostScreen(
                                 tabsVm = tabsVm,
                                 isActive = isActive,
                                 onCloseTab = { tabsVm.closeTab(tab.tabId) },
+                                chromeVisible = chromeVisible,
+                                onUserActivity = revealChrome,
                             )
                         }
                     }
@@ -157,6 +197,8 @@ private fun TerminalTabScreen(
     tabsVm: TerminalTabsViewModel,
     isActive: Boolean,
     onCloseTab: () -> Unit,
+    chromeVisible: Boolean,
+    onUserActivity: () -> Unit,
 ) {
     val tabId = tab.tabId
     val uiState by tab.uiState.collectAsStateWithLifecycle(initialValue = TerminalUiState())
@@ -167,6 +209,8 @@ private fun TerminalTabScreen(
         canReconnect = tab.profile != null,
         isActive = isActive,
         snippets = snippets,
+        chromeVisible = chromeVisible,
+        onUserActivity = onUserActivity,
         actions = TerminalScreenActions(
             onConnect = { tabsVm.reconnect(tabId) },
             onDisconnect = { tabsVm.disconnect(tabId) },
@@ -190,6 +234,7 @@ private fun TerminalTabScreen(
             // 物理キーボードの Ctrl+Tab / Ctrl+Shift+Tab によるタブ切替（TerminalInputView 経由）。
             onNextTab = { tabsVm.nextTab() },
             onPreviousTab = { tabsVm.previousTab() },
+            onForceReturnToWifi = { tabsVm.forceReturnToWifi(tabId) },
         ),
     )
 }

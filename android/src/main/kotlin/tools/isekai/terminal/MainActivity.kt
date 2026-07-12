@@ -11,8 +11,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -145,12 +147,22 @@ class MainActivity : ComponentActivity() {
 fun AppRoot() {
     val navController = rememberNavController()
     val navVm: AppNavViewModel = viewModel()
-    // Activity スコープ: NavHost の遷移をまたいでも同一インスタンスが使われるため、
-    // ProfileList に一旦戻ってもバックグラウンドのタブ (共有 ForegroundService 上のセッション)
-    // は生き続ける。
-    val tabsVm: TerminalTabsViewModel = viewModel()
+    // Application(≒プロセス)スコープ: Activity が(バックグラウンド中のタスク破棄等で)
+    // 再生成されても同一インスタンスが使われるため、ForegroundService 上のセッションを
+    // 保持しているタブを見失わない。Activity スコープだと、Activity 再生成時に
+    // TerminalTabsViewModel.onCleared() を経由せず古いインスタンスが破棄され、サーバー側の
+    // SSH セッションだけが孤立して残るバグがあった(実機検証で発見、2026-07-12)。
+    val application = LocalContext.current.applicationContext as IsekaiTerminalApplication
+    val tabsVm: TerminalTabsViewModel = viewModel(
+        viewModelStoreOwner = application,
+        factory = ViewModelProvider.AndroidViewModelFactory.getInstance(application),
+    )
 
-    NavHost(navController = navController, startDestination = AppRoutes.PROFILE_LIST) {
+    // 既にタブがある(=プロセスが生きたままActivityだけ再生成された)場合は、ProfileListを
+    // 経由せず直接Terminalへ着地させる。
+    val startDestination = if (tabsVm.tabs.value.isNotEmpty()) AppRoutes.TERMINAL else AppRoutes.PROFILE_LIST
+
+    NavHost(navController = navController, startDestination = startDestination) {
 
         composable(AppRoutes.PROFILE_LIST) {
             RemoteLogger.i("IsekaiTerminalNav", "→ ProfileList")
@@ -171,7 +183,7 @@ fun AppRoot() {
                 onManageKeys = { navController.navigate(AppRoutes.KEY_LIST) },
                 onManageSnippets = { navController.navigate(AppRoutes.SNIPPET_LIST) },
                 // Phase 12 P2-1: アプリ全体の既定テーマ変更を、まだ個別上書きしていない
-                // (isThemeOverridden=false の)タブにも反映する。tabsVm は Activity スコープ
+                // (isThemeOverridden=false の)タブにも反映する。tabsVm は Application スコープ
                 // なので、まだ1つもタブが無い状態(list が空)でも安全に呼べる。
                 applyTerminalTheme = { theme ->
                     theme.applyTo(::setTerminalTheme)
@@ -184,7 +196,15 @@ fun AppRoot() {
             RemoteLogger.i("IsekaiTerminalNav", "→ Terminal (tabs=${tabsVm.tabs.value.size})")
             TerminalHostScreen(
                 tabsVm = tabsVm,
-                onAllTabsClosed = { navController.popBackStack() },
+                // popBackStack() だと、tabsVm復元によりTerminalがstartDestinationになっていた
+                // 場合(戻り先が無い)に詰まるため、明示的にProfileListへ遷移してTerminalを
+                // back stackから取り除く。
+                onAllTabsClosed = {
+                    navController.navigate(AppRoutes.PROFILE_LIST) {
+                        popUpTo(AppRoutes.TERMINAL) { inclusive = true }
+                        launchSingleTop = true
+                    }
+                },
             )
         }
 
