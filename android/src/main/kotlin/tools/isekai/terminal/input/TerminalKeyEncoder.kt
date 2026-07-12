@@ -25,10 +25,25 @@ object TerminalKeyEncoder {
     const val KC_PAGE_DOWN  = 93
     const val KC_MOVE_HOME  = 122
     const val KC_MOVE_END   = 123
+    // android.view.KeyEvent.KEYCODE_F1..KEYCODE_F12 と同値（変更不可の Android API 値）
+    const val KC_F1  = 131
+    const val KC_F2  = 132
+    const val KC_F3  = 133
+    const val KC_F4  = 134
+    const val KC_F5  = 135
+    const val KC_F6  = 136
+    const val KC_F7  = 137
+    const val KC_F8  = 138
+    const val KC_F9  = 139
+    const val KC_F10 = 140
+    const val KC_F11 = 141
+    const val KC_F12 = 142
 
     /**
      * 特殊キーのバイト列。未定義なら null。
      * applicationCursorMode=true のとき矢印キーは SS3 シーケンス（vim 等で必要）。
+     * F1〜F4 は常に SS3（`ESC O P`等）、F5〜F12 は CSI `~`形式（xterm 互換、`rust-core`の
+     * `terminal_function_key_bytes()`と同一シーケンス）。
      */
     fun specialKeyBytes(keyCode: Int, applicationCursorMode: Boolean = false): ByteArray? = when (keyCode) {
         KC_ENTER      -> byteArrayOf(0x0D)
@@ -43,6 +58,18 @@ object TerminalKeyEncoder {
         KC_PAGE_DOWN  -> byteArrayOf(0x1B, 0x5B, 0x36, 0x7E)
         KC_MOVE_HOME  -> byteArrayOf(0x1B, 0x5B, 0x48)
         KC_MOVE_END   -> byteArrayOf(0x1B, 0x5B, 0x46)
+        KC_F1         -> byteArrayOf(0x1B, 0x4F, 0x50)                         // ESC O P
+        KC_F2         -> byteArrayOf(0x1B, 0x4F, 0x51)                         // ESC O Q
+        KC_F3         -> byteArrayOf(0x1B, 0x4F, 0x52)                         // ESC O R
+        KC_F4         -> byteArrayOf(0x1B, 0x4F, 0x53)                         // ESC O S
+        KC_F5         -> byteArrayOf(0x1B, 0x5B, 0x31, 0x35, 0x7E)             // ESC[15~
+        KC_F6         -> byteArrayOf(0x1B, 0x5B, 0x31, 0x37, 0x7E)             // ESC[17~
+        KC_F7         -> byteArrayOf(0x1B, 0x5B, 0x31, 0x38, 0x7E)             // ESC[18~
+        KC_F8         -> byteArrayOf(0x1B, 0x5B, 0x31, 0x39, 0x7E)             // ESC[19~
+        KC_F9         -> byteArrayOf(0x1B, 0x5B, 0x32, 0x30, 0x7E)             // ESC[20~
+        KC_F10        -> byteArrayOf(0x1B, 0x5B, 0x32, 0x31, 0x7E)             // ESC[21~
+        KC_F11        -> byteArrayOf(0x1B, 0x5B, 0x32, 0x33, 0x7E)             // ESC[23~
+        KC_F12        -> byteArrayOf(0x1B, 0x5B, 0x32, 0x34, 0x7E)             // ESC[24~
         else          -> null
     }
 
