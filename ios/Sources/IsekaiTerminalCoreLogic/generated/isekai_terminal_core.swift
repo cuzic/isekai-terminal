@@ -1119,6 +1119,14 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     
     func disconnect() 
     
+    /**
+     * #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
+     * ダウンロード中などで静けさ待ちを待たずに即座に戻したい場合)。疎通確認だけは
+     * 省略されない(`RebindManager::handle_manual_force_return`参照)。マルチパス以外の
+     * transportや未接続時は何もしない。
+     */
+    func forceReturnToWifi() 
+    
     func isQuic()  -> Bool
     
     func notifyError(message: String) 
@@ -1328,6 +1336,19 @@ open func connectQuic(config: QuicConfig)throws   {try rustCallWithError(FfiConv
     
 open func disconnect()  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
+     * ダウンロード中などで静けさ待ちを待たずに即座に戻したい場合)。疎通確認だけは
+     * 省略されない(`RebindManager::handle_manual_force_return`参照)。マルチパス以外の
+     * transportや未接続時は何もしない。
+     */
+open func forceReturnToWifi()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_force_return_to_wifi(
             self.uniffiCloneHandle(),$0
     )
 }
@@ -2802,6 +2823,65 @@ public func FfiConverterTypePackedRow_lower(_ value: PackedRow) -> RustBuffer {
 }
 
 
+/**
+ * #10/#22: WiFi/セルラーいずれかに明示的にバインドされたfd。`Network.bindSocket()`
+ * (Android)/`IP_BOUND_IF`(iOS、#15)済み・所有権はRust側に移った生fd。
+ * `crate::rebind_ports::PlatformFdSource`のUniFFI越しの実体。
+ */
+public struct PlatformFd: Equatable, Hashable {
+    public var fd: Int32
+    public var localIp: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(fd: Int32, localIp: String) {
+        self.fd = fd
+        self.localIp = localIp
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PlatformFd: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePlatformFd: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PlatformFd {
+        return
+            try PlatformFd(
+                fd: FfiConverterInt32.read(from: &buf), 
+                localIp: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PlatformFd, into buf: inout [UInt8]) {
+        FfiConverterInt32.write(value.fd, into: &buf)
+        FfiConverterString.write(value.localIp, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePlatformFd_lift(_ buf: RustBuffer) throws -> PlatformFd {
+    return try FfiConverterTypePlatformFd.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePlatformFd_lower(_ value: PlatformFd) -> RustBuffer {
+    return FfiConverterTypePlatformFd.lower(value)
+}
+
+
 public struct PortForward: Equatable, Hashable {
     public var forwardType: ForwardType
     /**
@@ -3703,6 +3783,93 @@ public func FfiConverterTypeForwardType_lift(_ buf: RustBuffer) throws -> Forwar
 #endif
 public func FfiConverterTypeForwardType_lower(_ value: ForwardType) -> RustBuffer {
     return FfiConverterTypeForwardType.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * UI(Compose/SwiftUI)へ公開する簡略化された状態。
+ */
+
+public enum RebindPublicState: Equatable, Hashable {
+    
+    /**
+     * WiFi 上で通常運用中。
+     */
+    case onWifi
+    /**
+     * セルラーへフェイルオーバー済み。WiFi 復活を探っている。
+     */
+    case failedOverToCellular
+    /**
+     * WiFi 復活の疎通確認・ヒステリシスを満たし、通信が静かになるのを
+     * 待っている(この間だけ手動即時切替の「今すぐ戻す」がより有効)。
+     */
+    case waitingQuietToReturn
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension RebindPublicState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRebindPublicState: FfiConverterRustBuffer {
+    typealias SwiftType = RebindPublicState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RebindPublicState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .onWifi
+        
+        case 2: return .failedOverToCellular
+        
+        case 3: return .waitingQuietToReturn
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RebindPublicState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .onWifi:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .failedOverToCellular:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .waitingQuietToReturn:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRebindPublicState_lift(_ buf: RustBuffer) throws -> RebindPublicState {
+    return try FfiConverterTypeRebindPublicState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRebindPublicState_lower(_ value: RebindPublicState) -> RustBuffer {
+    return FfiConverterTypeRebindPublicState.lower(value)
 }
 
 
@@ -4752,6 +4919,26 @@ public protocol OrchestratorCallback: AnyObject, Sendable {
      */
     func onClipboardPullRequest()  -> ClipboardPayload?
     
+    /**
+     * #10/#22: `RebindManager`(rebind_manager.rs)がWiFi-bound fdを要求する。
+     * 判断は一切せず、要求された種類のfdを取得して返すだけ(`rust-ssot.md`準拠)。
+     * 取得できなければ`None`(WiFi自体が使えない・権限が無い等)。`host_key`確認等と
+     * 同じ同期ブロッキング方式(Rust側の`spawn_blocking`から呼ばれる)。
+     * マルチパス以外のtransportでは呼ばれない。
+     */
+    func onRequestWifiFd()  -> PlatformFd?
+    
+    /**
+     * 同、セルラー-bound fd版。
+     */
+    func onRequestCellularFd()  -> PlatformFd?
+    
+    /**
+     * #19: `RebindManager`の状態が変化した(WiFi/セルラーフェイルオーバー/復帰待ち)。
+     * マルチパス以外のtransportでは呼ばれない。
+     */
+    func onRebindStateChanged(state: RebindPublicState) 
+    
 }
 
 
@@ -5044,6 +5231,74 @@ fileprivate struct UniffiCallbackInterfaceOrchestratorCallback {
                 makeCall: makeCall,
                 writeReturn: writeReturn
             )
+        },
+        onRequestWifiFd: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> PlatformFd? in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onRequestWifiFd(
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterOptionTypePlatformFd.lower($0) }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onRequestCellularFd: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> PlatformFd? in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onRequestCellularFd(
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterOptionTypePlatformFd.lower($0) }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onRebindStateChanged: { (
+            uniffiHandle: UInt64,
+            state: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onRebindStateChanged(
+                     state: try FfiConverterTypeRebindPublicState_lift(state)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
         }
     )
 
@@ -5311,6 +5566,30 @@ fileprivate struct FfiConverterOptionTypeJumpConfig: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeJumpConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePlatformFd: FfiConverterRustBuffer {
+    typealias SwiftType = PlatformFd?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePlatformFd.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePlatformFd.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -5845,6 +6124,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi() != 8683) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic() != 9641) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5972,6 +6254,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_clipboard_pull_request() != 18572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_request_wifi_fd() != 35263) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_request_cellular_fd() != 25671) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed() != 15707) {
         return InitializationResult.apiChecksumMismatch
     }
 

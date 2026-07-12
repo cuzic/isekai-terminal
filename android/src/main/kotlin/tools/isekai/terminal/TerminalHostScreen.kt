@@ -231,6 +231,7 @@ private fun TerminalTabScreen(
             onGetSessionLog = { tabsVm.getSessionLog(tabId) },
             onSendSnippet = { snippet -> tabsVm.sendSnippet(tabId, snippet) },
             onRespondAgentSignRequest = { approved -> tabsVm.respondAgentSignRequest(tabId, approved) },
+            onForceReturnToWifi = { tabsVm.forceReturnToWifi(tabId) },
         ),
     )
 }

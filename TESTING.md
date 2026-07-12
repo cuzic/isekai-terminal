@@ -623,6 +623,57 @@ TCP SSH の遅延と切断耐性を実測する。
 
 ---
 
+## 16. WiFi⇔セルラー自動切替 (RebindManager, PLAN.md Phase 9-6) 実機確認
+
+### 前提
+- `enablePhysicalMultipath`/`enableUpstreamFailover` をONにしたプロファイルで、
+  Tailscale OFF・「直接通信」設定で接続していること(Phase 9-4/9-4bと同じ前提)。
+- `debug` ビルド(フォルト注入は release ビルドには含まれない)。
+
+### 16-A WiFi→セルラーへの片方向フェイルオーバー(既存動作の回帰確認)
+Phase 9-4bの手順と同じ:
+1. WiFi接続状態でSSHセッションを開始
+2. `adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.CUT` で全UDPを遮断
+3. logcatで `no viable path left` → `rebind to local_ip=... succeeded` を確認
+4. `adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.RESTORE` で復元
+
+### 16-B セルラー→WiFiへの自動復帰(新規)
+1. 16-Aの手順でセルラーへフェイルオーバーさせる
+2. `adb shell am broadcast -n tools.isekai.terminal/.debug.FaultInjectionReceiver -a tools.isekai.terminal.debug.RESTORE`
+   でWiFiの上流を復元する
+3. logcatで以下の一連の遷移を確認する:
+   - `rebind_driver: wifi probe` 関連のログ(疎通確認の試行、10秒間隔)
+   - 5回連続成功後の `RebindPublicState::WaitingQuietToReturn` への遷移
+   - ターミナルが静か(出力もキー入力も無い状態)になった後、`PerformRebindToWifi` が
+     実行されること
+4. アプリのステータスバーに「今すぐWiFiに戻す」ボタンが、セルラーへのフェイルオーバー中
+   〜静けさ待ち中の間だけ表示され、WiFiへ戻ったら消えることを確認する
+5. 最小滞在(60秒)・安定窓(15秒)・静けさ待ち(最大60〜120秒)があるため、16-Bの一連の確認には
+   合計で最短でも2〜3分程度かかる想定
+
+### 16-C 手動即時復帰
+1. 16-Aの手順でセルラーへフェイルオーバーさせる(WiFi上流はまだ復元しない)
+2. 大きめのファイルをtrzsz転送(`tsz`/`trz`)で開始する
+3. 転送中にWiFiの上流を復元し、すぐに「今すぐWiFiに戻す」ボタンを押す
+4. 疎通確認(WiFi-bound一時Endpointでの実際のQUICハンドシェイク)には成功するはずだが、
+   ヒステリシス(5回連続成功・15秒安定・60秒滞在)や静けさ待ちを待たずに即座に
+   `PerformRebindToWifi` が実行されることを確認する
+5. 転送中のrebindでtrzsz転送のFSMが破綻しない(進捗が引き続き進む、または妥当な
+   タイムアウト/再送で完了する)ことを確認する
+
+### NG 時の確認ポイント
+- WiFi復帰後も「今すぐWiFiに戻す」ボタンが出ない/消えない
+  → `RebindPublicState`(`onRebindStateChanged`経由)が正しくKotlin側の
+    `TerminalUiState.rebindState` に反映されているか確認(`rust-core/src/rebind_driver.rs`の
+    `RealRebindObserver`、`TerminalSession.kt`の`onRebindStateChanged`)
+- 静けさ待ちなのにいつまで経ってもWiFiへ戻らない
+  → `rust-core/src/multipath_transport.rs`の`TrafficStats`が実際のトラフィックを
+    捕捉できているか(`MultiUdpSocket::poll_recv`/`MultiUdpSender::poll_send`)、
+    trzsz転送中フラグ(`interactive_busy`)が転送終了後にちゃんと`false`へ戻っているか
+    (`orchestrator.rs`の`trzsz_cancel`/`trzsz_dismiss`/`on_trzsz_finished`)を確認
+
+---
+
 ## スクリプト一覧
 
 | スクリプト | 用途 |

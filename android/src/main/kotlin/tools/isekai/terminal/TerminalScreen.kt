@@ -77,6 +77,8 @@ data class TerminalScreenActions(
     val onGetSessionLog: () -> String,
     val onSendSnippet: (Snippet) -> Unit,
     val onRespondAgentSignRequest: (Boolean) -> Unit,
+    /** #14: 「今すぐWiFiに戻す」。マルチパス以外のセッションでは呼んでもRust側で無視される。 */
+    val onForceReturnToWifi: () -> Unit = {},
 )
 
 /**
@@ -240,6 +242,15 @@ fun TerminalScreenBody(
                             },
                             contentPadding = PaddingValues(0.dp),
                         ) { Text("ログ", color = AppColors.SecondaryText, fontSize = 11.sp) }
+                    }
+                    // #14: セルラーへフェイルオーバー中/WiFi復帰の静けさ待ち中だけ表示する。
+                    // 表示可否の判定はRebindPublicState(Rust側が発火するcallback経由)だけを
+                    // 見て行い、Kotlin側で推測状態は持たない(rust-ssot.md準拠)。
+                    if (connected && uiState.rebindState != null && uiState.rebindState != RebindPublicState.ON_WIFI) {
+                        TextButton(
+                            onClick = { actions.onForceReturnToWifi() },
+                            contentPadding = PaddingValues(0.dp),
+                        ) { Text("今すぐWiFiに戻す", color = Color.Cyan, fontSize = 11.sp) }
                     }
                     TextButton(
                         onClick = { actions.onBack() },
