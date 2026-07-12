@@ -16,12 +16,14 @@ fun SshTerminalCanvas(
     update: ScreenUpdate,
     selection: SelectionRange? = null,
     theme: TerminalTheme = TerminalThemes.DEFAULT_DARK,
+    // カスタムフォント([TerminalFontSettings])。未指定時は既定の [Typeface.MONOSPACE]。
+    typeface: Typeface = Typeface.MONOSPACE,
     modifier: Modifier = Modifier,
 ) {
-    val textPaint = remember {
+    val textPaint = remember(typeface) {
         Paint().apply {
             isAntiAlias = true
-            typeface = Typeface.MONOSPACE
+            this.typeface = typeface
         }
     }
     val bgPaint = remember { Paint() }
