@@ -31,6 +31,13 @@ class TerminalInputView @JvmOverloads constructor(
     /** Ctrl トグルが 1 文字を消費した（変換の成否に関わらず）ときに呼ばれる。UI 側で OFF 表示に戻す用。 */
     var onCtrlConsumed: (() -> Unit)? = null
 
+    /**
+     * 外部/Bluetoothキーボードの配列モード（表示専用の UI ローカル状態、既定 AUTO）。
+     * [TerminalInputConnection.sendKeyEvent] が JIS配列固有キー(¥/ろ)の判定に使う
+     * （[KeyboardLayoutDetector]参照）。
+     */
+    var keyboardLayoutMode: KeyboardLayoutMode = KeyboardLayoutMode.AUTO
+
     init {
         isFocusable = true
         isFocusableInTouchMode = true

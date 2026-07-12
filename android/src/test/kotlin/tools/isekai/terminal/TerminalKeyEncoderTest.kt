@@ -304,4 +304,32 @@ class TerminalKeyEncoderTest {
     fun `single line paste without bracketedPasteMode is unaffected by normalization`() {
         assertArrayEquals("no-newline-here".toByteArray(), TerminalKeyEncoder.commitTextBytes("no-newline-here"))
     }
+
+    // ── jisSpecialKeyBytes（JIS配列固有キー: ¥/ろ）─────────────────
+
+    @Test
+    fun `yen key unshifted maps to backslash`() {
+        assertArrayEquals(byteArrayOf(0x5C), TerminalKeyEncoder.jisSpecialKeyBytes(TerminalKeyEncoder.KC_YEN, shiftPressed = false))
+    }
+
+    @Test
+    fun `yen key shifted maps to pipe`() {
+        assertArrayEquals(byteArrayOf(0x7C), TerminalKeyEncoder.jisSpecialKeyBytes(TerminalKeyEncoder.KC_YEN, shiftPressed = true))
+    }
+
+    @Test
+    fun `ro key unshifted maps to backslash`() {
+        assertArrayEquals(byteArrayOf(0x5C), TerminalKeyEncoder.jisSpecialKeyBytes(TerminalKeyEncoder.KC_RO, shiftPressed = false))
+    }
+
+    @Test
+    fun `ro key shifted maps to underscore`() {
+        assertArrayEquals(byteArrayOf(0x5F), TerminalKeyEncoder.jisSpecialKeyBytes(TerminalKeyEncoder.KC_RO, shiftPressed = true))
+    }
+
+    @Test
+    fun `non-jis keycode returns null from jisSpecialKeyBytes`() {
+        assertNull(TerminalKeyEncoder.jisSpecialKeyBytes(TerminalKeyEncoder.KC_ENTER, shiftPressed = false))
+        assertNull(TerminalKeyEncoder.jisSpecialKeyBytes(9999, shiftPressed = true))
+    }
 }

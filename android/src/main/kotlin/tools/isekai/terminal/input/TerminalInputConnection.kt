@@ -68,6 +68,14 @@ class TerminalInputConnection(
                 view.onSendBytes?.invoke(it)
                 return true
             }
+            // JIS配列固有キー(¥/ろ)。これらのキーコードはJIS配列の物理キーボードでしか
+            // 生成され得ないため、US配列キーボードの通常入力を誤って横取りすることはない。
+            if (KeyboardLayoutDetector.resolveJisLayout(view.keyboardLayoutMode, event.device)) {
+                TerminalKeyEncoder.jisSpecialKeyBytes(event.keyCode, event.isShiftPressed)?.let {
+                    view.onSendBytes?.invoke(it)
+                    return true
+                }
+            }
             // 物理 Ctrl 併用時はトグルを消費せず素通し（二重変換防止）
             if (view.ctrlArmed && !event.isCtrlPressed) {
                 val ctrlBytes = TerminalKeyEncoder.ctrlByte(event.getUnicodeChar(0))

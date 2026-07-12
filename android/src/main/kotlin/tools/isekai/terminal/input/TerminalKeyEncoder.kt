@@ -39,6 +39,12 @@ object TerminalKeyEncoder {
     const val KC_F11 = 141
     const val KC_F12 = 142
 
+    // JIS配列固有キー(android.view.KeyEvent.KEYCODE_YEN / KEYCODE_RO と同値)。
+    // US配列キーボードにはこれらの物理キー自体が存在しないため、通常のキー入力を
+    // 誤って横取りすることはない([KeyboardLayoutDetector]参照)。
+    const val KC_YEN = 143
+    const val KC_RO  = 214
+
     /**
      * 特殊キーのバイト列。未定義なら null。
      * applicationCursorMode=true のとき矢印キーは SS3 シーケンス（vim 等で必要）。
@@ -71,6 +77,23 @@ object TerminalKeyEncoder {
         KC_F11        -> byteArrayOf(0x1B, 0x5B, 0x32, 0x33, 0x7E)             // ESC[23~
         KC_F12        -> byteArrayOf(0x1B, 0x5B, 0x32, 0x34, 0x7E)             // ESC[24~
         else          -> null
+    }
+
+    /**
+     * JIS配列固有キー(¥キー/ろキー)のバイト列。JIS配列と判定/選択されている場合のみ
+     * 呼び出し側（[KeyboardLayoutDetector.resolveJisLayout]）が使う。対象外のキーコードは null。
+     *
+     * Android標準の`KeyCharacterMap`はこの2キーにUnicode文字を割り当てていないことが多く
+     * （仮名入力の機能キー切替に使われる想定で、ASCII/直接入力モードでは
+     * `getUnicodeChar()`が0を返し無反応になる）、ASCII端末での慣習に合わせて明示的に
+     * バックスラッシュ位置へマッピングする:
+     * - ¥キー: 単独→`\`(0x5C)、Shift併用→`|`(0x7C)
+     * - ろキー: 単独→`\`(0x5C)、Shift併用→`_`(0x5F)
+     */
+    fun jisSpecialKeyBytes(keyCode: Int, shiftPressed: Boolean): ByteArray? = when (keyCode) {
+        KC_YEN -> byteArrayOf(if (shiftPressed) 0x7C else 0x5C)
+        KC_RO  -> byteArrayOf(if (shiftPressed) 0x5F else 0x5C)
+        else   -> null
     }
 
     /** Unicode コードポイント→バイト列。0 なら null。 */

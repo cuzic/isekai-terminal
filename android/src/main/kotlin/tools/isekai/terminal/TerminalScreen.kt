@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.input.KeyboardLayoutMode
 import tools.isekai.terminal.input.TerminalInputView
 import tools.isekai.terminal.input.TerminalKeyEncoder
 import tools.isekai.terminal.ui.AgentSignConfirmDialog
@@ -289,6 +290,10 @@ fun TerminalScreenBody(
         // 未選択、または壊れたフォントファイルの場合は既定の Typeface.MONOSPACE のまま
         // 動作する(TerminalFontSettings.loadTypeface 内でフォールバック済み)。
         val terminalTypeface = remember { TerminalFontSettings.loadTypeface(context, prefs) }
+        // JIS/US配列モードの選択も ProfileListScreen 側のメニューで行う（グローバル設定）。
+        val keyboardLayoutMode = remember {
+            KeyboardLayoutMode.fromPrefValue(prefs.getString(KeyboardLayoutMode.PREF_KEY, null))
+        }
 
         val update = screenUpdate
         if (isActive && update != null) {
@@ -614,6 +619,7 @@ fun TerminalScreenBody(
                     update = { view ->
                         view.applicationCursorMode = screenUpdate?.applicationCursorMode ?: false
                         view.bracketedPasteMode = screenUpdate?.bracketedPasteMode ?: false
+                        view.keyboardLayoutMode = keyboardLayoutMode
                         view.ctrlArmed = ctrlArmed
                         view.onCtrlConsumed = { ctrlArmed = false }
                         if (connected && !imeAutoShown) {
