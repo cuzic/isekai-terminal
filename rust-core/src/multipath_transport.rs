@@ -262,6 +262,83 @@ pub(crate) struct NamedUdpSocket {
     pub(crate) socket: Arc<tokio::net::UdpSocket>,
 }
 
+// ── #8: TrafficStats(通信静けさ判定) ─────────────────────
+//
+// `RebindManager`(rebind_manager.rs)の`RebindEvent::TrafficQuietDetected`/
+// `TrafficBusyDetected`判定に使う、UDP送受信の直近activity統計。QUIC内部API
+// (ストリームごとのバイト数等)には依存せず、`MultiUdpSocket::poll_recv`/
+// `MultiUdpSender::poll_send`を通る全datagramをそのまま捕捉するので、trzsz
+// 転送以外の大量stdout出力なども静けさ判定に反映される(#9のtrzsz busyフラグは
+// あくまで補助シグナル、これが主判定)。
+
+/// 直近`QUIET_ACTIVITY_WINDOW`の送受信量が小さいとみなす閾値(合計バイト数)。
+const QUIET_BYTES_THRESHOLD: usize = 4096;
+/// 送受信量を見る直近ウィンドウ。
+const QUIET_ACTIVITY_WINDOW: Duration = Duration::from_secs(3);
+/// 最終送信からこれだけ経っていないと「静か」とみなさない。
+const QUIET_MIN_IDLE_SINCE_LAST_TX: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct TrafficStatsState {
+    rx_events: std::collections::VecDeque<(std::time::Instant, usize)>,
+    tx_events: std::collections::VecDeque<(std::time::Instant, usize)>,
+    last_tx: Option<std::time::Instant>,
+}
+
+fn prune_older_than(events: &mut std::collections::VecDeque<(std::time::Instant, usize)>, now: std::time::Instant, window: Duration) {
+    while let Some(&(t, _)) = events.front() {
+        if now.saturating_duration_since(t) > window {
+            events.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// `MultiUdpSocket`(受信、`poll_recv`)と`MultiUdpSender`(送信、`poll_send`。
+/// `create_sender()`で作られる別インスタンス)の両方から同じインスタンスを
+/// 共有して更新する — Codexレビュー指摘: senderは別インスタンスになるため
+/// `Arc<Mutex<..>>`での共有が必須、遅延送信ブランチでも呼び出し直後(実送信の
+/// 完了を待たず)に記録する、両方に対応した。
+#[derive(Clone, Default)]
+pub(crate) struct TrafficStats(Arc<StdMutex<TrafficStatsState>>);
+
+impl TrafficStats {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn record_rx(&self, len: usize, now: std::time::Instant) {
+        let mut s = self.0.lock().unwrap();
+        s.rx_events.push_back((now, len));
+        prune_older_than(&mut s.rx_events, now, QUIET_ACTIVITY_WINDOW);
+    }
+
+    fn record_tx(&self, len: usize, now: std::time::Instant) {
+        let mut s = self.0.lock().unwrap();
+        s.tx_events.push_back((now, len));
+        s.last_tx = Some(now);
+        prune_older_than(&mut s.tx_events, now, QUIET_ACTIVITY_WINDOW);
+    }
+
+    /// 直近`QUIET_ACTIVITY_WINDOW`の送受信量が`QUIET_BYTES_THRESHOLD`以下、かつ
+    /// 最終送信から`QUIET_MIN_IDLE_SINCE_LAST_TX`以上経っていれば「静か」とみなす。
+    /// 一度も送信していなければ(接続直後等)静かとみなす。
+    pub(crate) fn is_quiet(&self, now: std::time::Instant) -> bool {
+        let mut s = self.0.lock().unwrap();
+        prune_older_than(&mut s.rx_events, now, QUIET_ACTIVITY_WINDOW);
+        prune_older_than(&mut s.tx_events, now, QUIET_ACTIVITY_WINDOW);
+        let window_bytes: usize = s.rx_events.iter().chain(s.tx_events.iter()).map(|(_, len)| len).sum();
+        if window_bytes > QUIET_BYTES_THRESHOLD {
+            return false;
+        }
+        match s.last_tx {
+            Some(t) => now.saturating_duration_since(t) >= QUIET_MIN_IDLE_SINCE_LAST_TX,
+            None => true,
+        }
+    }
+}
+
 /// Phase 9-5実機検証用: `isekai_pipe_quic_transport.rs`/`faulty_udp_socket.rs`が既に
 /// 使っている`debug_fault::shared_injector()`（`UdpFaultInjector`）をそのまま
 /// 再利用する。新しいフォルト注入state・adb broadcast・UniFFI関数は一切増やさない
@@ -273,6 +350,8 @@ pub(crate) struct MultiUdpSocket {
     pub(crate) default: Arc<tokio::net::UdpSocket>,
     pub(crate) named: Vec<NamedUdpSocket>,
     pub(crate) injector: crate::faulty_udp_socket::UdpFaultInjector,
+    /// #8: 通信静けさ判定用。`create_sender()`が返す`MultiUdpSender`と共有する。
+    pub(crate) traffic_stats: TrafficStats,
 }
 
 impl fmt::Debug for MultiUdpSocket {
@@ -289,6 +368,7 @@ impl AsyncUdpSocket for MultiUdpSocket {
             default: self.default.clone(),
             named: self.named.iter().map(|n| (n.local_ip, n.socket.clone())).collect(),
             injector: self.injector.clone(),
+            traffic_stats: self.traffic_stats.clone(),
         })
     }
 
@@ -328,6 +408,7 @@ impl AsyncUdpSocket for MultiUdpSocket {
                 // （faulty_udp_socket.rs と同じ方針、Phase 9-5実機検証用）。
                 continue;
             }
+            self.traffic_stats.record_rx(len, std::time::Instant::now());
             let mut m = RecvMeta::default();
             m.addr = addr;
             m.len = len;
@@ -355,6 +436,7 @@ struct MultiUdpSender {
     default: Arc<tokio::net::UdpSocket>,
     named: Vec<(IpAddr, Arc<tokio::net::UdpSocket>)>,
     injector: crate::faulty_udp_socket::UdpFaultInjector,
+    traffic_stats: TrafficStats,
 }
 
 impl fmt::Debug for MultiUdpSender {
@@ -376,6 +458,11 @@ impl MultiUdpSender {
 
 impl UdpSender for MultiUdpSender {
     fn poll_send(self: Pin<&mut Self>, transmit: &Transmit<'_>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        // #8: フォルト注入(cut/drop/delay)に関わらず、アプリ層が送信しようとした
+        // 時点で記録する(遅延送信ブランチでは実送信の完了を待たない) —
+        // 静けさ判定が見たいのは「実際にワイヤーへ乗ったか」ではなく「アプリが
+        // 通信しようとしているか」であるため。
+        self.traffic_stats.record_tx(transmit.contents.len(), std::time::Instant::now());
         if self.injector.is_cut() || self.injector.should_drop() {
             // 実ネットワークでも送信側はロスを検知できないのと同様、成功したふりをする。
             return Poll::Ready(Ok(()));
@@ -554,7 +641,7 @@ async fn establish_multipath_connection(
         let socket = udp_socket_from_raw_fd(p.fd)?;
         named.push(NamedUdpSocket { local_ip: p.local_ip, socket });
     }
-    let multi = MultiUdpSocket { default: default_sock, named, injector };
+    let multi = MultiUdpSocket { default: default_sock, named, injector, traffic_stats: TrafficStats::new() };
 
     let primary = RemoteSpec {
         addr: path0_addr,
@@ -759,7 +846,12 @@ fn spawn_rebind_listener(endpoint: noq::Endpoint, mut rebind_rx: tokio::sync::mp
                     continue;
                 }
             };
-            let multi = MultiUdpSocket { default: socket, named: Vec::new(), injector: req.injector };
+            let multi = MultiUdpSocket {
+                default: socket,
+                named: Vec::new(),
+                injector: req.injector,
+                traffic_stats: TrafficStats::new(),
+            };
             match endpoint.rebind_abstract(Box::new(multi)) {
                 Ok(()) => info!("multipath_quic: rebind to local_ip={} succeeded", req.local_ip),
                 Err(e) => warn!("multipath_quic: rebind to local_ip={} failed: {e}", req.local_ip),
@@ -871,6 +963,73 @@ mod tests {
         assert!(session.is_interactive_busy());
         session.set_interactive_busy(false);
         assert!(!session.is_interactive_busy());
+    }
+
+    // ── #8: TrafficStats ──────────────────────────────────
+
+    #[test]
+    fn traffic_stats_is_quiet_before_any_activity() {
+        let stats = TrafficStats::new();
+        assert!(stats.is_quiet(std::time::Instant::now()), "何も送受信していなければ静かとみなす");
+    }
+
+    #[test]
+    fn traffic_stats_not_quiet_immediately_after_large_send() {
+        let stats = TrafficStats::new();
+        let t0 = std::time::Instant::now();
+        stats.record_tx(QUIET_BYTES_THRESHOLD + 1, t0);
+        assert!(!stats.is_quiet(t0), "閾値超えの送信直後は静かではない");
+    }
+
+    #[test]
+    fn traffic_stats_not_quiet_within_idle_grace_period_even_if_bytes_are_small() {
+        let stats = TrafficStats::new();
+        let t0 = std::time::Instant::now();
+        stats.record_tx(1, t0);
+        // バイト数は小さいが、最終送信からQUIET_MIN_IDLE_SINCE_LAST_TX未満しか
+        // 経っていないのでまだ「静か」ではない。
+        assert!(!stats.is_quiet(t0 + QUIET_MIN_IDLE_SINCE_LAST_TX - Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn traffic_stats_quiet_after_idle_grace_period_with_small_bytes() {
+        let stats = TrafficStats::new();
+        let t0 = std::time::Instant::now();
+        stats.record_tx(1, t0);
+        assert!(stats.is_quiet(t0 + QUIET_MIN_IDLE_SINCE_LAST_TX));
+    }
+
+    #[test]
+    fn traffic_stats_activity_outside_window_is_pruned_and_ignored() {
+        let stats = TrafficStats::new();
+        let t0 = std::time::Instant::now();
+        stats.record_tx(QUIET_BYTES_THRESHOLD * 10, t0);
+        // ウィンドウ外まで進めれば、大量送信していた事実は静けさ判定に影響しない
+        // (ただしlast_txの経過時間条件は別途満たす必要がある——ここではウィンドウより
+        // 十分先まで進めているので両方満たす)。
+        let later = t0 + QUIET_ACTIVITY_WINDOW + Duration::from_secs(1);
+        assert!(stats.is_quiet(later));
+    }
+
+    #[test]
+    fn traffic_stats_rx_only_activity_also_counts_toward_busy() {
+        let stats = TrafficStats::new();
+        let t0 = std::time::Instant::now();
+        stats.record_rx(QUIET_BYTES_THRESHOLD + 1, t0);
+        // 受信のみ(送信していない)でも、直近ウィンドウの受信バイト数が閾値を
+        // 超えていれば静かとはみなさない(大量出力を垂れ流すサーバー等を想定)。
+        assert!(!stats.is_quiet(t0));
+    }
+
+    #[test]
+    fn traffic_stats_shared_between_socket_and_sender_via_clone() {
+        // MultiUdpSocket::create_sender()が返すMultiUdpSenderと同じ実体を
+        // 共有する想定(Codexレビュー指摘)を、Arc共有のclone越しに検証する。
+        let stats = TrafficStats::new();
+        let sender_side = stats.clone();
+        let t0 = std::time::Instant::now();
+        sender_side.record_tx(QUIET_BYTES_THRESHOLD + 1, t0);
+        assert!(!stats.is_quiet(t0), "cloneされた側からの記録がもう一方からも見えるべき");
     }
 
     async fn start_test_server() -> (u16, String, [u8; 32]) {
@@ -1057,6 +1216,7 @@ mod tests {
             default: new_tokio_sock,
             named: Vec::new(),
             injector: crate::debug_fault::shared_injector(),
+            traffic_stats: TrafficStats::new(),
         };
         endpoint.rebind_abstract(Box::new(multi)).unwrap();
 
