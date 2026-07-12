@@ -658,4 +658,20 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     public func onClipboardPullRequest() -> ClipboardPayload? {
         RemoteClipboardBridge.pull()
     }
+
+    // MARK: - RebindManager (PLAN.md Phase 9-6)
+    //
+    // iOS版のPhysicalPathProvider相当(IP_BOUND_IF/IPV6_BOUND_IFベースのWiFi/セルラー
+    // 個別バインド)は未実装(TODO、Android版`PhysicalPathProvider`を参照)。
+    // 判断は一切せずfdを取得して返すだけという契約(`rust-ssot.md`)なので、
+    // 未実装の間は常に`nil`を返す — RebindManager(Rust側)はfdが取れない場合を
+    // 正常系として扱う設計になっており、日和見的にセルラーへのフェイルオーバー/
+    // WiFiへの復帰が単に起きないだけで、既存のQUIC自身のローミング耐性
+    // (`notifyNetworkPathChanged`)には影響しない。
+
+    public func onRequestWifiFd() -> PlatformFd? { nil }
+
+    public func onRequestCellularFd() -> PlatformFd? { nil }
+
+    public func onRebindStateChanged(state: RebindPublicState) {}
 }

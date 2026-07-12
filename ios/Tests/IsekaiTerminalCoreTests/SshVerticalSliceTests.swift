@@ -101,4 +101,7 @@ private actor SshVerticalSliceRecorder: OrchestratorCallback {
     nonisolated func onAgentSignRequest(keyFingerprint: String) -> Bool { false }
     nonisolated func onClipboardWrite(payload: ClipboardPayload) {}
     nonisolated func onClipboardPullRequest() -> ClipboardPayload? { nil }
+    nonisolated func onRequestWifiFd() -> PlatformFd? { nil }
+    nonisolated func onRequestCellularFd() -> PlatformFd? { nil }
+    nonisolated func onRebindStateChanged(state: RebindPublicState) {}
 }
