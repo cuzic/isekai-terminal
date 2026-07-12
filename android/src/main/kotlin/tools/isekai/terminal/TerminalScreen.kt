@@ -82,6 +82,8 @@ data class TerminalScreenActions(
      *  切り替える(タブ横断の`TerminalTabsViewModel.setFocusedPane`への委譲)。分割していない
      *  単一ペインの場合は no-op のままでよい。 */
     val onRequestFocus: () -> Unit = {},
+    val onNextTab: () -> Unit = {},
+    val onPreviousTab: () -> Unit = {},
     /** #14: 「今すぐWiFiに戻す」。マルチパス以外のセッションでは呼んでもRust側で無視される。 */
     val onForceReturnToWifi: () -> Unit = {},
 )
@@ -460,8 +462,25 @@ fun TerminalScreenBody(
                             },
                     )
 
+                    // 選択範囲のコピー。フローティングツールバーの「コピー」ボタンと物理キーボードの
+                    // Ctrl+Shift+C / Meta+C ショートカット（下の inputView.onCopyRequested）の両方から
+                    // 呼ばれる共通実装。選択が無ければ何もしない。
+                    val performCopy: () -> Unit = copy@{
+                        val sel = selection ?: return@copy
+                        val text = reconstructSelectionText(displayUpdate, sel)
+                        if (text.isNotEmpty()) {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            cm.setPrimaryClip(ClipData.newPlainText("isekai-terminal selection", text))
+                        }
+                        selection = null
+                    }
+                    // 物理キーボードショートカットは BoxWithConstraints スコープの外（入力エリアの
+                    // AndroidView）から呼ばれるため、常に最新の performCopy クロージャ（selection/
+                    // displayUpdate の現在値を捕捉したもの）を inputView 側へ反映しておく。
+                    SideEffect { inputView?.onCopyRequested = performCopy }
+
                     // 選択中のフローティングツールバー（コピー／キャンセル）
-                    selection?.let { sel ->
+                    selection?.let {
                         Row(
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
@@ -470,14 +489,7 @@ fun TerminalScreenBody(
                                 .padding(horizontal = 8.dp, vertical = 4.dp),
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
                         ) {
-                            TextButton(onClick = {
-                                val text = reconstructSelectionText(displayUpdate, sel)
-                                if (text.isNotEmpty()) {
-                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    cm.setPrimaryClip(ClipData.newPlainText("isekai-terminal selection", text))
-                                }
-                                selection = null
-                            }) { Text("コピー", color = Color.Cyan, fontSize = 12.sp) }
+                            TextButton(onClick = performCopy) { Text("コピー", color = Color.Cyan, fontSize = 12.sp) }
                             TextButton(onClick = { selection = null }) {
                                 Text("キャンセル", color = Color.Gray, fontSize = 12.sp)
                             }
@@ -549,6 +561,17 @@ fun TerminalScreenBody(
                 // ユーザーが手動で隠しても数百ms後には勝手に出てくる不具合になっていた。)
                 var imeAutoShown by remember { mutableStateOf(false) }
 
+                // クリップボードからの貼り付け。「貼付」ボタンと物理キーボードの Ctrl+Shift+V /
+                // Meta+V ショートカット（下の inputView.onPasteRequested）の両方から呼ばれる。
+                val performPaste: () -> Unit = {
+                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    val text = cm.primaryClip?.takeIf { it.itemCount > 0 }
+                        ?.getItemAt(0)?.coerceToText(context)?.toString()
+                    if (!text.isNullOrEmpty()) {
+                        actions.onSend(TerminalKeyEncoder.commitTextBytes(text, screenUpdate?.bracketedPasteMode ?: false))
+                    }
+                }
+
                 // Ctrl キー行
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -565,14 +588,7 @@ fun TerminalScreenBody(
                     CtrlBtn("↓") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x42)) }
                     CtrlBtn("←") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x44)) }
                     CtrlBtn("→") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x43)) }
-                    CtrlBtn("貼付") {
-                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        val text = cm.primaryClip?.takeIf { it.itemCount > 0 }
-                            ?.getItemAt(0)?.coerceToText(context)?.toString()
-                        if (!text.isNullOrEmpty()) {
-                            actions.onSend(TerminalKeyEncoder.commitTextBytes(text, screenUpdate?.bracketedPasteMode ?: false))
-                        }
-                    }
+                    CtrlBtn("貼付", onClick = performPaste)
                     CtrlBtn("定型") { showSnippetSheet = true }
                 }
 
@@ -622,6 +638,13 @@ fun TerminalScreenBody(
                         view.keyboardLayoutMode = keyboardLayoutMode
                         view.ctrlArmed = ctrlArmed
                         view.onCtrlConsumed = { ctrlArmed = false }
+                        // コピー(onCopyRequested)は BoxWithConstraints 内の SideEffect が selection/
+                        // displayUpdate の最新値を捕捉した performCopy で常に上書きするため、ここでは
+                        // 配線しない(先に設定してしまうと BoxWithConstraints 側の SideEffect 実行前は
+                        // 空実装のままになり得るが、後続のコンポジションで確実に上書きされる)。
+                        view.onPasteRequested = performPaste
+                        view.onNextTabRequested = actions.onNextTab
+                        view.onPreviousTabRequested = actions.onPreviousTab
                         if (connected && !imeAutoShown) {
                             imeAutoShown = true
                             view.post {

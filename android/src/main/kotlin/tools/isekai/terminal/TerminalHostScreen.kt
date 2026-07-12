@@ -405,6 +405,11 @@ private fun TerminalPaneScreen(
                     onSendSnippet = { snippet -> tabsVm.sendSnippetToPane(tabId, paneId, snippet) },
                     onRespondAgentSignRequest = { approved -> tabsVm.respondAgentSignRequestForPane(tabId, paneId, approved) },
                     onRequestFocus = { tabsVm.setFocusedPane(tabId, paneId) },
+                    // 物理キーボードの Ctrl+Tab / Ctrl+Shift+Tab によるタブ切替（TerminalInputView 経由）。
+                    // 画面分割中でもタブ切替はタブ単位の操作なので、どちらのペインからでも同じ
+                    // tabsVm.nextTab()/previousTab() を呼ぶ(ペイン固有の版は不要)。
+                    onNextTab = { tabsVm.nextTab() },
+                    onPreviousTab = { tabsVm.previousTab() },
                     onForceReturnToWifi = { pane.session.forceReturnToWifi() },
                 ),
             )

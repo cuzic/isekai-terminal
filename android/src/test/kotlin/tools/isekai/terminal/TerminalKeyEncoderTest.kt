@@ -332,4 +332,26 @@ class TerminalKeyEncoderTest {
         assertNull(TerminalKeyEncoder.jisSpecialKeyBytes(TerminalKeyEncoder.KC_ENTER, shiftPressed = false))
         assertNull(TerminalKeyEncoder.jisSpecialKeyBytes(9999, shiftPressed = true))
     }
+
+    // ── altKeyBytes（物理 Alt/Meta 修飾キー: meta sends escape） ────
+
+    @Test
+    fun `alt plus lowercase b prefixes ESC`() {
+        assertArrayEquals(byteArrayOf(0x1B, 'b'.code.toByte()), TerminalKeyEncoder.altKeyBytes('b'.code))
+    }
+
+    @Test
+    fun `alt plus uppercase encodes as ESC plus UTF-8`() {
+        assertArrayEquals(byteArrayOf(0x1B) + "F".toByteArray(Charsets.UTF_8), TerminalKeyEncoder.altKeyBytes('F'.code))
+    }
+
+    @Test
+    fun `alt plus zero codepoint returns null`() {
+        assertNull(TerminalKeyEncoder.altKeyBytes(0))
+    }
+
+    @Test
+    fun `alt plus control char prefixes ESC before the raw control byte`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x03), TerminalKeyEncoder.altKeyBytes(0x03))
+    }
 }

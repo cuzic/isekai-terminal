@@ -383,6 +383,32 @@ class TerminalTabsViewModel(
         if (_tabs.value.any { it.tabId == tabId }) _activeTabId.value = tabId
     }
 
+    /**
+     * アクティブタブを次のタブへ切り替える（末尾なら先頭へ循環）。物理キーボードの
+     * Ctrl+Tab ショートカット用（[tools.isekai.terminal.input.TerminalInputView.onNextTabRequested]
+     * 経由で呼ばれる）。タブが1つ以下、またはアクティブタブが存在しない場合は何もしない。
+     */
+    fun nextTab() {
+        val list = _tabs.value
+        if (list.size < 2) return
+        val idx = list.indexOfFirst { it.tabId == _activeTabId.value }
+        if (idx < 0) return
+        _activeTabId.value = list[(idx + 1) % list.size].tabId
+    }
+
+    /**
+     * アクティブタブを前のタブへ切り替える（先頭なら末尾へ循環）。物理キーボードの
+     * Ctrl+Shift+Tab ショートカット用。タブが1つ以下、またはアクティブタブが存在しない場合は
+     * 何もしない。
+     */
+    fun previousTab() {
+        val list = _tabs.value
+        if (list.size < 2) return
+        val idx = list.indexOfFirst { it.tabId == _activeTabId.value }
+        if (idx < 0) return
+        _activeTabId.value = list[(idx - 1 + list.size) % list.size].tabId
+    }
+
     private fun tabOrNull(tabId: String): TabState? = _tabs.value.find { it.tabId == tabId }
 
     // ── 画面分割(split pane) ─────────────────────────────────────────

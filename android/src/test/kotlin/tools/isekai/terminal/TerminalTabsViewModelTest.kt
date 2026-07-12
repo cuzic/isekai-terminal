@@ -212,6 +212,52 @@ class TerminalTabsViewModelTest {
         assertEquals(idA, vm.activeTabId.value)
     }
 
+    // ── nextTab/previousTab（物理キーボード Ctrl+Tab / Ctrl+Shift+Tab 用） ─────
+
+    @Test
+    fun nextTab_cyclesThroughTabsInOpenOrder_andWrapsAround() {
+        val idA = vm.openTab(profile("a"), "pass")
+        val idB = vm.openTab(profile("b"), "pass")
+        val idC = vm.openTab(profile("c"), "pass")
+        vm.setActiveTab(idA)
+
+        vm.nextTab()
+        assertEquals(idB, vm.activeTabId.value)
+
+        vm.nextTab()
+        assertEquals(idC, vm.activeTabId.value)
+
+        vm.nextTab()
+        assertEquals("nextTab should wrap around to the first tab", idA, vm.activeTabId.value)
+    }
+
+    @Test
+    fun previousTab_cyclesBackwardThroughTabs_andWrapsAround() {
+        val idA = vm.openTab(profile("a"), "pass")
+        val idB = vm.openTab(profile("b"), "pass")
+        val idC = vm.openTab(profile("c"), "pass")
+        vm.setActiveTab(idA)
+
+        vm.previousTab()
+        assertEquals("previousTab from the first tab should wrap to the last tab", idC, vm.activeTabId.value)
+
+        vm.previousTab()
+        assertEquals(idB, vm.activeTabId.value)
+    }
+
+    @Test
+    fun nextTab_withSingleTab_isNoop() {
+        val idA = vm.openTab(profile("a"), "pass")
+        vm.nextTab()
+        assertEquals(idA, vm.activeTabId.value)
+    }
+
+    @Test
+    fun nextTab_withNoTabs_doesNotThrow() {
+        vm.nextTab()
+        assertNull(vm.activeTabId.value)
+    }
+
     @Test
     fun send_isRoutedToTheCorrectTabsOrchestratorOnly() = runBlocking {
         val idA = vm.openTab(profile("a"), "pass")
