@@ -70,6 +70,50 @@ import uniffi.isekai_terminal_core.TransportPreference
  * 後勝ちになる。単一セッション設計時点からの既存の制約であり、このタブ機能追加で新たに
  * 生まれたものではない。
  */
+/**
+ * タブ内の2分割方向。[HORIZONTAL] は左右に並べる(縦の仕切り線)、[VERTICAL] は上下に並べる
+ * (横の仕切り線)。画面分割(split pane)機能はまず2分割のみをサポートする(バイナリツリー式の
+ * 多段分割は将来の拡張余地としてスコープ外にする)。
+ */
+enum class SplitDirection { HORIZONTAL, VERTICAL }
+
+/**
+ * 1ペイン分の状態。画面分割(split pane)機能により、1タブの中に複数ペイン(まずは最大2つ)を
+ * 持てるようにするための単位。各ペインは完全に独立した [TerminalSession](ひいては独立した
+ * Rust側接続)を持つ(同一セッションを複数ペインで共有する設計はスコープ外、
+ * `.claude/rules/rust-ssot.md` の「UI表示だけに閉じた状態」の例外としてペインの存在自体・
+ * レイアウト・フォーカスはこの Kotlin 側の状態で管理する)。
+ *
+ * かつて [TerminalTabsViewModel.TabState] が直接持っていた「1タブ=1セッション」時代の
+ * 補助状態(接続前バリデーションエラー・アップロード中フラグ・スニペット一覧・接続後自動実行
+ * コマンド・upstreamフェイルオーバー)を、ペイン単位に切り出したもの。
+ */
+class PaneState internal constructor(
+    val paneId: String,
+    val session: TerminalSession,
+) {
+    // 接続前のバリデーションエラー。session.state (Rust 由来) には混入させず合成する。
+    internal val preConnectError = MutableStateFlow<String?>(null)
+    // trzsz アップロードの二重起動防止 (Bug 2 と同種のガード。ペインごとに独立させる)。
+    internal val uploadInProgress = AtomicBoolean(false)
+
+    // ── 定型コマンド（スニペット）─────────────────────────────
+    internal val snippets = MutableStateFlow<List<Snippet>>(emptyList())
+
+    // ── 接続後自動実行コマンド ────────────────────────────────
+    internal var pendingPostConnectBytes: ByteArray? = null
+    internal val postConnectSent = AtomicBoolean(true)
+
+    // ── upstream フェイルオーバー ────────────────────────────
+    internal var upstreamFailoverEnabledForCurrentSession = false
+    internal val rebindInFlight = AtomicBoolean(false)
+
+    /** UI が購読する合成済み状態。 */
+    val uiState: Flow<TerminalUiState> = session.state.combine(preConnectError) { s, err ->
+        if (err != null) s.copy(statusMsg = err) else s
+    }
+}
+
 class TerminalTabsViewModel(
     app: Application,
     private val executor: AppExecutor,
@@ -141,46 +185,85 @@ class TerminalTabsViewModel(
     }
 
     /**
-     * 1タブ分の状態。ドメイン状態の SSOT はあくまで [session]（ひいては Rust 側）であり、
-     * ここで保持するのは接続前バリデーションエラー・スニペット一覧・接続後自動実行コマンドの
-     * 送信フラグなど Kotlin ローカルの補助状態のみ。
+     * 1タブ分の状態。ドメイン状態の SSOT はあくまで各ペインの [TerminalSession]（ひいては
+     * Rust 側）であり、ここで保持するのはペイン構成(画面分割)・フォーカス・配色テーマなど
+     * Kotlin ローカルの補助状態のみ。
+     *
+     * 画面分割(split pane)導入前は「1タブ=1セッション」だったため、[session] 等の
+     * 旧APIプロパティは引き続き [primaryPane] への薄い委譲として残してある
+     * (未分割のタブでは [primaryPane] が唯一のペインであり、[focusedPane] も常にそれを指す
+     * ため、既存の呼び出し元・テストの挙動は変わらない)。
      */
     class TabState internal constructor(
         val tabId: String,
-        val session: TerminalSession,
+        internal val primaryPane: PaneState,
         val profile: ConnectionProfile?,
         val label: String,
         initialTheme: TerminalTheme,
         initialThemeIsOverridden: Boolean,
     ) {
-        // 接続前のバリデーションエラー。session.state (Rust 由来) には混入させず合成する。
-        internal val preConnectError = MutableStateFlow<String?>(null)
-        // trzsz アップロードの二重起動防止 (Bug 2 と同種のガード。タブごとに独立させる)。
-        internal val uploadInProgress = AtomicBoolean(false)
+        // ── 後方互換プロパティ(1タブ=1セッション時代のAPI表面。primaryPaneへの委譲)──
+        val session: TerminalSession get() = primaryPane.session
+        internal val preConnectError get() = primaryPane.preConnectError
+        internal val uploadInProgress get() = primaryPane.uploadInProgress
+        internal val snippets get() = primaryPane.snippets
+        internal var pendingPostConnectBytes: ByteArray?
+            get() = primaryPane.pendingPostConnectBytes
+            set(value) { primaryPane.pendingPostConnectBytes = value }
+        internal val postConnectSent get() = primaryPane.postConnectSent
+        internal var upstreamFailoverEnabledForCurrentSession: Boolean
+            get() = primaryPane.upstreamFailoverEnabledForCurrentSession
+            set(value) { primaryPane.upstreamFailoverEnabledForCurrentSession = value }
+        internal val rebindInFlight get() = primaryPane.rebindInFlight
 
-        // ── 定型コマンド（スニペット）─────────────────────────────
-        internal val snippets = MutableStateFlow<List<Snippet>>(emptyList())
-
-        // ── 接続後自動実行コマンド ────────────────────────────────
-        internal var pendingPostConnectBytes: ByteArray? = null
-        internal val postConnectSent = AtomicBoolean(true)
-
-        // ── upstream フェイルオーバー ────────────────────────────
-        internal var upstreamFailoverEnabledForCurrentSession = false
-        internal val rebindInFlight = AtomicBoolean(false)
+        /** UI が購読する合成済み状態(主ペインのもの)。 */
+        val uiState: Flow<TerminalUiState> get() = primaryPane.uiState
 
         // ── 配色テーマ（Phase 12 P2-1: per-session/per-host theme）───────
         // Global default → Profile default → Tab/session override の3段階のうち、
         // このタブが「今」使っているテーマの解決結果。isThemeOverridden が false の間は
         // アプリ全体のテーマ変更が [TerminalTabsViewModel.applyGlobalThemeToNonOverriddenTabs]
         // 経由でここへ反映され続ける。true になった後(このタブだけ個別に変更した後)は
-        // 以後グローバル変更の影響を受けない。
+        // 以後グローバル変更の影響を受けない。分割時は全ペインに同じテーマを適用する
+        // (ペインごとの配色分岐はスコープ外)。
         internal val currentTheme = MutableStateFlow(initialTheme)
         internal var isThemeOverridden: Boolean = initialThemeIsOverridden
 
-        /** UI が購読する合成済み状態。 */
-        val uiState: Flow<TerminalUiState> = session.state.combine(preConnectError) { s, err ->
-            if (err != null) s.copy(statusMsg = err) else s
+        // ── 画面分割(split pane) ────────────────────────────────
+        // まずは水平/垂直の2分割のみをサポートする(バイナリツリー式の多段分割はスコープ外)。
+        private val _splitPane = MutableStateFlow<PaneState?>(null)
+        val splitPane: StateFlow<PaneState?> = _splitPane.asStateFlow()
+        private val _splitDirection = MutableStateFlow<SplitDirection?>(null)
+        val splitDirection: StateFlow<SplitDirection?> = _splitDirection.asStateFlow()
+        private val _focusedPaneId = MutableStateFlow(primaryPane.paneId)
+        val focusedPaneId: StateFlow<String> = _focusedPaneId.asStateFlow()
+
+        /** 現在表示すべきペイン一覧。未分割なら [primaryPane] の1つだけ、分割時は2つ。 */
+        val panes: List<PaneState> get() = listOfNotNull(primaryPane, _splitPane.value)
+
+        fun paneOrNull(paneId: String): PaneState? = panes.find { it.paneId == paneId }
+
+        /** キーボード入力・trzsz/host key等のモーダルUIが紐づく「今アクティブな」ペイン。 */
+        internal val focusedPane: PaneState get() = paneOrNull(_focusedPaneId.value) ?: primaryPane
+
+        internal fun openSplit(pane: PaneState, direction: SplitDirection) {
+            _splitPane.value = pane
+            _splitDirection.value = direction
+            _focusedPaneId.value = pane.paneId
+        }
+
+        /** 分割ペインを閉じる。閉じた側の [PaneState] を返す(session の disconnect/close は
+         *  呼び出し元 [TerminalTabsViewModel] の責務)。分割していなければ null。 */
+        internal fun closeSplit(): PaneState? {
+            val closed = _splitPane.value ?: return null
+            _splitPane.value = null
+            _splitDirection.value = null
+            _focusedPaneId.value = primaryPane.paneId
+            return closed
+        }
+
+        internal fun setFocusedPane(paneId: String) {
+            if (panes.any { it.paneId == paneId }) _focusedPaneId.value = paneId
         }
     }
 
@@ -227,13 +310,13 @@ class TerminalTabsViewModel(
     /** 新しいタブを開いて接続を開始し、そのタブをアクティブにする。生成した tabId を返す。 */
     fun openTab(profile: ConnectionProfile, password: String? = null, jumpPassword: String? = null): String {
         val tabId = UUID.randomUUID().toString()
-        val session = sessionFactory()
+        val primaryPane = PaneState(UUID.randomUUID().toString(), sessionFactory())
         // Phase 12 P2-1: Global default → Profile default の解決。プロファイルに明示的な
         // テーマ指定があれば、その時点で「上書き済み」タブとして扱う(以後グローバル変更に
         // 追従しない。ユーザーがそのプロファイル用に選んだ意図を尊重する)。
         val profileTheme = profile.themeName?.let { TerminalThemes.byName(it) }
         val initialTheme = profileTheme ?: currentGlobalTheme()
-        val tab = TabState(tabId, session, profile, profile.label, initialTheme, initialThemeIsOverridden = profileTheme != null)
+        val tab = TabState(tabId, primaryPane, profile, profile.label, initialTheme, initialThemeIsOverridden = profileTheme != null)
 
         RemoteLogger.i("IsekaiTerminalTabsVM", "openTab '${profile.label}' id=$tabId")
         _tabs.update { it + tab }
@@ -241,23 +324,17 @@ class TerminalTabsViewModel(
 
         // 複数セッションを1つの FGS が共有する。初回タブで起動、以後は通知内容の更新のみ。
         executor.ensureServiceRunning()
-        watchTab(tab)
-        connectTab(tab, profile, password, jumpPassword)
+        watchPane(tab, primaryPane)
+        connectPane(tab, primaryPane, profile, password, jumpPassword)
         updateSessionsSummary()
         return tabId
     }
 
-    /** タブを切断＋破棄する。最後のタブが閉じられた場合のみ FGS を停止させる。 */
+    /** タブを切断＋破棄する。分割中なら全ペインを破棄する。最後のタブが閉じられた場合のみ FGS を停止させる。 */
     fun closeTab(tabId: String) {
         val tab = _tabs.value.find { it.tabId == tabId } ?: return
         RemoteLogger.i("IsekaiTerminalTabsVM", "closeTab id=$tabId")
-        tab.session.disconnect()
-        tab.session.close()
-        watchJobs.remove(tabId)?.cancel()
-        if (tab.upstreamFailoverEnabledForCurrentSession) {
-            executor.releasePhysicalMultipathFds()
-            executor.unregisterUpstreamFailoverMonitor()
-        }
+        tab.panes.forEach { pane -> closePaneSession(pane) }
 
         _tabs.update { list -> list.filterNot { it.tabId == tabId } }
         if (_activeTabId.value == tabId) {
@@ -266,68 +343,144 @@ class TerminalTabsViewModel(
         updateSessionsSummary()
     }
 
+    /** [pane] の監視コルーチンを止め、セッションを切断・破棄する（[closeTab]・[closeSplitPane] 共通）。 */
+    private fun closePaneSession(pane: PaneState) {
+        pane.session.disconnect()
+        pane.session.close()
+        watchJobs.remove(pane.paneId)?.cancel()
+        if (pane.upstreamFailoverEnabledForCurrentSession) {
+            executor.releasePhysicalMultipathFds()
+            executor.unregisterUpstreamFailoverMonitor()
+        }
+    }
+
     fun setActiveTab(tabId: String) {
         if (_tabs.value.any { it.tabId == tabId }) _activeTabId.value = tabId
     }
 
     private fun tabOrNull(tabId: String): TabState? = _tabs.value.find { it.tabId == tabId }
 
+    // ── 画面分割(split pane) ─────────────────────────────────────────
+
     /**
-     * タブ固有の監視: 通知集約の再計算・ダウンロード完了ファイルの保存・
+     * タブを2分割し、[tab.profile] と同じ接続プロファイルで新規に接続した独立セッションを
+     * 新しいペインとして追加する（「同じ接続プロファイルで新規接続する」側の選択肢）。
+     * 既に分割済み、またはプロファイルを持たないタブ（現状は必ずプロファイル付きだが将来の
+     * 保険）では何もしない。新しく作られたペインの paneId を返す（失敗時は null）。
+     */
+    fun splitPane(tabId: String, direction: SplitDirection, password: String? = null, jumpPassword: String? = null): String? {
+        val tab = tabOrNull(tabId) ?: return null
+        if (tab.splitPane.value != null) return null
+        val profile = tab.profile ?: return null
+        val pane = PaneState(UUID.randomUUID().toString(), sessionFactory())
+        RemoteLogger.i("IsekaiTerminalTabsVM", "splitPane[$tabId] new pane=${pane.paneId} direction=$direction")
+        tab.openSplit(pane, direction)
+        watchPane(tab, pane)
+        connectPane(tab, pane, profile, password, jumpPassword)
+        updateSessionsSummary()
+        return pane.paneId
+    }
+
+    /**
+     * 既存タブ [sourceTabId] のセッションを、[targetTabId] の分割ペインとして付け替える
+     * （「既存タブのセッションを付け替える」側の選択肢）。[sourceTabId] はタブ一覧から消える
+     * (セッション自体はdisconnectせず、新しい親タブの下で監視を再開する)。[targetTabId] が
+     * 既に分割済み、または [sourceTabId] 自体が既に分割済み（複数ペインの一括付け替えは
+     * スコープ外）の場合は何もせず false を返す。
+     */
+    fun splitPaneWithExistingTab(targetTabId: String, direction: SplitDirection, sourceTabId: String): Boolean {
+        if (targetTabId == sourceTabId) return false
+        val target = tabOrNull(targetTabId) ?: return false
+        if (target.splitPane.value != null) return false
+        val source = tabOrNull(sourceTabId) ?: return false
+        if (source.splitPane.value != null) return false
+
+        val pane = source.primaryPane
+        RemoteLogger.i(
+            "IsekaiTerminalTabsVM",
+            "splitPaneWithExistingTab: moving pane=${pane.paneId} from tab=$sourceTabId to tab=$targetTabId",
+        )
+        watchJobs.remove(pane.paneId)?.cancel()
+        _tabs.update { list -> list.filterNot { it.tabId == sourceTabId } }
+        if (_activeTabId.value == sourceTabId) _activeTabId.value = targetTabId
+
+        target.openSplit(pane, direction)
+        watchPane(target, pane)
+        updateSessionsSummary()
+        return true
+    }
+
+    /** 分割ペインを閉じる（未分割なら no-op）。閉じた後は主ペインのみの1ペイン表示に戻る。 */
+    fun closeSplitPane(tabId: String) {
+        val tab = tabOrNull(tabId) ?: return
+        val pane = tab.closeSplit() ?: return
+        closePaneSession(pane)
+        updateSessionsSummary()
+    }
+
+    /** タップ操作等でペインのフォーカス（キーボード入力・モーダルUIの宛先）を切り替える。 */
+    fun setFocusedPane(tabId: String, paneId: String) {
+        tabOrNull(tabId)?.setFocusedPane(paneId)
+    }
+
+    /**
+     * ペイン固有の監視: 通知集約の再計算・ダウンロード完了ファイルの保存・
      * 接続状態遷移(Connected 立ち上がりでの自動実行コマンド送信・切断時の後始末)・
      * upstream フェイルオーバーの `NoViablePath` 検知。非アクティブでも動き続ける。
+     * [watchJobs] は paneId(タブをまたいで一意)をキーにする — 分割ペインを付け替えても
+     * ジョブの追跡が壊れないようにするため。
      */
-    private fun watchTab(tab: TabState) {
-        watchJobs[tab.tabId] = viewModelScope.launch {
-            launch { observeSummary(tab) }
-            launch { observeDownloads(tab) }
-            launch { observeFailover(tab) }
-            launch { observeConnectionTransitions(tab) }
+    private fun watchPane(tab: TabState, pane: PaneState) {
+        watchJobs[pane.paneId] = viewModelScope.launch {
+            launch { observeSummary(pane) }
+            launch { observeDownloads(pane) }
+            launch { observeFailover(pane) }
+            launch { observeConnectionTransitions(pane) }
         }
     }
 
-    private suspend fun observeSummary(tab: TabState) {
-        tab.session.state.collect { updateSessionsSummary() }
+    private suspend fun observeSummary(pane: PaneState) {
+        pane.session.state.collect { updateSessionsSummary() }
     }
 
-    private suspend fun observeDownloads(tab: TabState) {
-        tab.session.pendingDownloadFile.collect { pending ->
+    private suspend fun observeDownloads(pane: PaneState) {
+        pane.session.pendingDownloadFile.collect { pending ->
             pending ?: return@collect
             executor.saveDownloadFile(pending.first, pending.second)
-            tab.session.consumeDownloadFile()
+            pane.session.consumeDownloadFile()
         }
     }
 
-    private suspend fun observeFailover(tab: TabState) {
-        tab.session.noViablePathEvent.collect {
-            if (tab.upstreamFailoverEnabledForCurrentSession) onWifiUpstreamBroken(tab)
+    private suspend fun observeFailover(pane: PaneState) {
+        pane.session.noViablePathEvent.collect {
+            if (pane.upstreamFailoverEnabledForCurrentSession) onWifiUpstreamBroken(pane)
         }
     }
 
-    private suspend fun observeConnectionTransitions(tab: TabState) {
+    private suspend fun observeConnectionTransitions(pane: PaneState) {
         var prevConnected = false
-        tab.uiState.collect { state ->
+        pane.uiState.collect { state ->
             val connected = state.connected
             if (connected && !prevConnected) {
                 executor.notifyConnected(state.currentHost ?: "")
-                if (tab.upstreamFailoverEnabledForCurrentSession) {
-                    executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(tab) }
+                if (pane.upstreamFailoverEnabledForCurrentSession) {
+                    executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
                 }
-                maybeSendPostConnectCommands(tab)
+                maybeSendPostConnectCommands(pane)
             } else if (!connected && prevConnected) {
                 executor.notifyDisconnected()
                 executor.releasePhysicalMultipathFds()
                 executor.unregisterUpstreamFailoverMonitor()
-                tab.upstreamFailoverEnabledForCurrentSession = false
+                pane.upstreamFailoverEnabledForCurrentSession = false
             }
             prevConnected = connected
         }
     }
 
     private fun updateSessionsSummary() {
-        val tabs = _tabs.value
-        val connected = tabs.count { it.session.state.value.connected }
-        executor.updateSessionsSummary(connected, tabs.size)
+        val panes = _tabs.value.flatMap { it.panes }
+        val connected = panes.count { it.session.state.value.connected }
+        executor.updateSessionsSummary(connected, panes.size)
     }
 
     // ── upstream フェイルオーバー ────────────────────────────────────
@@ -336,10 +489,10 @@ class TerminalTabsViewModel(
      * 「WiFiは繋がっているがupstreamが死んでいる」を検知した際の処理。
      * セルラーへの bindSocket 済み fd を取得できたら `rebindToFd` でendpointの
      * ソケットを丸ごと差し替える。取得できなければ何もしない（日和見的ポリシー）。
-     * [TabState.rebindInFlight] で多重発火（capabilities変化の連続通知等）を防ぐ。
+     * [PaneState.rebindInFlight] で多重発火（capabilities変化の連続通知等）を防ぐ。
      */
-    private fun onWifiUpstreamBroken(tab: TabState) {
-        if (!tab.rebindInFlight.compareAndSet(false, true)) return
+    private fun onWifiUpstreamBroken(pane: PaneState) {
+        if (!pane.rebindInFlight.compareAndSet(false, true)) return
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val cellular = executor.acquireCellularFd()
@@ -349,47 +502,56 @@ class TerminalTabsViewModel(
                 }
                 val (fd, localIp) = cellular
                 RemoteLogger.i("IsekaiTerminalSSH", "upstream failover: rebinding to cellular (localIp=$localIp)")
-                tab.session.rebindToFd(fd, localIp)
+                pane.session.rebindToFd(fd, localIp)
             } finally {
-                tab.rebindInFlight.set(false)
+                pane.rebindInFlight.set(false)
             }
         }
     }
 
     // ── 接続 ─────────────────────────────────────────────────────────
 
+    /** 未分割時は主ペイン、分割時はフォーカス中のペインを再接続する(後方互換。実体は[reconnectPane])。 */
     fun reconnect(tabId: String, password: String? = null, jumpPassword: String? = null) {
         val tab = tabOrNull(tabId) ?: return
-        val profile = tab.profile ?: return
-        connectTab(tab, profile, password, jumpPassword)
+        reconnectPane(tabId, tab.focusedPane.paneId, password, jumpPassword)
     }
 
-    private fun connectTab(tab: TabState, profile: ConnectionProfile, password: String?, jumpPassword: String? = null) {
-        val current = tab.session.state.value
+    /** ペインを明示指定して再接続する。画面分割時、各ペインは自分自身の「再接続」ボタンを
+     *  持つため(フォーカスに関わらず両ペインとも常に表示される)、こちらが実体。 */
+    fun reconnectPane(tabId: String, paneId: String, password: String? = null, jumpPassword: String? = null) {
+        val tab = tabOrNull(tabId) ?: return
+        val pane = tab.paneOrNull(paneId) ?: return
+        val profile = tab.profile ?: return
+        connectPane(tab, pane, profile, password, jumpPassword)
+    }
+
+    private fun connectPane(tab: TabState, pane: PaneState, profile: ConnectionProfile, password: String?, jumpPassword: String? = null) {
+        val current = pane.session.state.value
         if (current.connected || current.isConnecting) return
-        tab.preConnectError.value = null
-        armPostConnectCommands(tab, profile)
-        loadSnippets(tab.tabId, profile.id)
+        pane.preConnectError.value = null
+        armPostConnectCommands(pane, profile)
+        loadSnippetsForPane(pane, profile.id)
         RemoteLogger.i(
             "IsekaiTerminalSSH",
-            "connectTab[${tab.tabId}]: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} " +
+            "connectPane[${tab.tabId}/${pane.paneId}]: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} " +
                 "transport=${profile.transportPreference}" +
                 (if (profile.usesJumpHost) " via jump ${profile.jumpUsername}@${profile.jumpHost}:${profile.jumpPort}" else ""),
         )
         viewModelScope.launch(Dispatchers.IO) {
-            val auth = resolveAuth(tab, profile, password) ?: return@launch
+            val auth = resolveAuth(pane, profile, password) ?: return@launch
             // 踏み台(jump host)は、SSHブートストラップを伴う全トランスポートで共通に使える
             // (TSSHD_QUICのみ旧Phase 5B経路でrust-core側が未対応、Phase 10--1c参照)。
             val jumpAuth = if (profile.usesJumpHost) {
-                resolveJumpAuth(tab, profile, jumpPassword) ?: return@launch
+                resolveJumpAuth(pane, profile, jumpPassword) ?: return@launch
             } else {
                 null
             }
             when (profile.transportPreference) {
-                TransportPreference.PLAIN_SSH -> connect(tab, profile.toSshConfig(auth, jumpAuth))
-                TransportPreference.TSSHD_QUIC -> connectQuic(tab, profile.toQuicConfig(auth))
-                TransportPreference.ISEKAI_PIPE_QUIC -> connectIsekaiPipeQuic(tab, profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
-                TransportPreference.AUTO -> connectIsekaiPipeQuicAuto(tab, profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
+                TransportPreference.PLAIN_SSH -> connect(pane, profile.toSshConfig(auth, jumpAuth))
+                TransportPreference.TSSHD_QUIC -> connectQuic(pane, profile.toQuicConfig(auth))
+                TransportPreference.ISEKAI_PIPE_QUIC -> connectIsekaiPipeQuic(pane, profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
+                TransportPreference.AUTO -> connectIsekaiPipeQuicAuto(pane, profile.toIsekaiPipeQuicConfig(auth, jumpAuth))
                 TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH -> {
                     // Phase 9-4（実験的機能）: 有効化されていれば物理Wi-Fi/セルラーの
                     // fdも取得してから接続する。取得に失敗/未取得でも例外にはせず、
@@ -399,17 +561,17 @@ class TerminalTabsViewModel(
                     } else {
                         PhysicalMultipathFds()
                     }
-                    tab.upstreamFailoverEnabledForCurrentSession = profile.enableUpstreamFailover
-                    connectMultipathIsekaiPipeQuic(tab, profile.toMultipathIsekaiPipeQuicConfig(auth, physicalFds, jumpAuth))
+                    pane.upstreamFailoverEnabledForCurrentSession = profile.enableUpstreamFailover
+                    connectMultipathIsekaiPipeQuic(pane, profile.toMultipathIsekaiPipeQuicConfig(auth, physicalFds, jumpAuth))
                 }
                 TransportPreference.ISEKAI_STUN_P2P_QUIC ->
-                    connectIsekaiStunP2p(tab, profile.toIsekaiStunP2pConfig(auth, jumpAuth))
+                    connectIsekaiStunP2p(pane, profile.toIsekaiStunP2pConfig(auth, jumpAuth))
                 TransportPreference.ISEKAI_LINK_RELAY_QUIC -> {
                     // relayJwt は Room に RelayCredentialVault で暗号化して保存してあるため、
                     // 実際の接続直前に復号する(toIsekaiLinkRelayConfig 自体は暗号化を意識しない
                     // 純粋なマッピング関数のまま保つ)。
                     val decrypted = profile.copy(relayJwt = profile.relayJwt?.let { executor.decryptRelayJwt(it) })
-                    connectIsekaiLinkRelay(tab, decrypted.toIsekaiLinkRelayConfig(auth, jumpAuth))
+                    connectIsekaiLinkRelay(pane, decrypted.toIsekaiLinkRelayConfig(auth, jumpAuth))
                 }
             }
             // タスク#65: 復号済み秘密鍵PEMのベストエフォートなメモリ消去。
@@ -422,8 +584,9 @@ class TerminalTabsViewModel(
             wipeIfPublicKey(jumpAuth)
             // Phase 12 P2-1: このタブが解決したテーマ(Global default → Profile default)を
             // 接続直後に反映する。connect_* はRust側で同期的にActiveSessionを差し込むため、
-            // このタイミングで呼べば確実にセッションへ届く。
-            pushThemeToSession(tab, tab.currentTheme.value)
+            // このタイミングで呼べば確実にセッションへ届く。分割ペインも含め、タブ内の
+            // 全ペインに同じテーマを適用する(ペイン単位の配色分岐はスコープ外)。
+            pushThemeToSession(pane, tab.currentTheme.value)
         }
     }
 
@@ -436,80 +599,80 @@ class TerminalTabsViewModel(
         }
     }
 
-    private fun pushThemeToSession(tab: TabState, theme: TerminalTheme) {
-        theme.applyTo(tab.session::setTheme)
+    private fun pushThemeToSession(pane: PaneState, theme: TerminalTheme) {
+        theme.applyTo(pane.session::setTheme)
     }
 
     /**
-     * このタブだけの配色テーマを明示的に変更する(Tab/session override)。
-     * 以後このタブは[applyGlobalThemeToNonOverriddenTabs]の影響を受けなくなる。
+     * このタブだけの配色テーマを明示的に変更する(Tab/session override)。分割中なら全ペインに
+     * 反映する。以後このタブは[applyGlobalThemeToNonOverriddenTabs]の影響を受けなくなる。
      */
     fun setTabTheme(tabId: String, theme: TerminalTheme) {
         val tab = tabOrNull(tabId) ?: return
         tab.isThemeOverridden = true
         tab.currentTheme.value = theme
-        pushThemeToSession(tab, theme)
+        tab.panes.forEach { pushThemeToSession(it, theme) }
     }
 
     /**
      * アプリ全体の既定テーマが変更された時に呼ぶ。まだタブ固有の上書きをしていない
-     * ([TabState.isThemeOverridden] が false の)タブにだけそのまま反映する。
+     * ([TabState.isThemeOverridden] が false の)タブにだけそのまま反映する(分割中なら全ペインへ)。
      * MainActivity の ProfileListScreen 側テーマ変更コールバックから呼ばれる想定。
      */
     fun applyGlobalThemeToNonOverriddenTabs(theme: TerminalTheme) {
         _tabs.value.forEach { tab ->
             if (!tab.isThemeOverridden) {
                 tab.currentTheme.value = theme
-                pushThemeToSession(tab, theme)
+                tab.panes.forEach { pushThemeToSession(it, theme) }
             }
         }
     }
 
-    private fun connect(tab: TabState, config: SshConfig) {
+    private fun connect(pane: PaneState, config: SshConfig) {
         executor.ensureServiceRunning()
-        tab.session.connect(config)
+        pane.session.connect(config)
     }
 
-    private fun connectQuic(tab: TabState, config: QuicConfig) {
+    private fun connectQuic(pane: PaneState, config: QuicConfig) {
         executor.ensureServiceRunning()
-        tab.session.connectQuic(config)
+        pane.session.connectQuic(config)
     }
 
-    private fun connectIsekaiPipeQuic(tab: TabState, config: IsekaiPipeQuicConfig) {
+    private fun connectIsekaiPipeQuic(pane: PaneState, config: IsekaiPipeQuicConfig) {
         executor.ensureServiceRunning()
-        tab.session.connectIsekaiPipeQuic(config)
+        pane.session.connectIsekaiPipeQuic(config)
     }
 
-    private fun connectIsekaiPipeQuicAuto(tab: TabState, config: IsekaiPipeQuicConfig) {
+    private fun connectIsekaiPipeQuicAuto(pane: PaneState, config: IsekaiPipeQuicConfig) {
         executor.ensureServiceRunning()
-        tab.session.connectIsekaiPipeQuicAuto(config)
+        pane.session.connectIsekaiPipeQuicAuto(config)
     }
 
-    private fun connectMultipathIsekaiPipeQuic(tab: TabState, config: MultipathIsekaiPipeQuicConfig) {
+    private fun connectMultipathIsekaiPipeQuic(pane: PaneState, config: MultipathIsekaiPipeQuicConfig) {
         executor.ensureServiceRunning()
-        tab.session.connectMultipathIsekaiPipeQuic(config)
+        pane.session.connectMultipathIsekaiPipeQuic(config)
     }
 
-    private fun connectIsekaiStunP2p(tab: TabState, config: IsekaiStunP2pConfig) {
+    private fun connectIsekaiStunP2p(pane: PaneState, config: IsekaiStunP2pConfig) {
         executor.ensureServiceRunning()
-        tab.session.connectIsekaiStunP2p(config)
+        pane.session.connectIsekaiStunP2p(config)
     }
 
-    private fun connectIsekaiLinkRelay(tab: TabState, config: IsekaiLinkRelayConfig) {
+    private fun connectIsekaiLinkRelay(pane: PaneState, config: IsekaiLinkRelayConfig) {
         executor.ensureServiceRunning()
-        tab.session.connectIsekaiLinkRelay(config)
+        pane.session.connectIsekaiLinkRelay(config)
     }
 
-    private suspend fun resolveAuth(tab: TabState, profile: ConnectionProfile, password: String?): SshAuth? =
-        resolveAuthInternal(tab, profile.authType, password, profile.keyId, errorPrefix = "")
+    private suspend fun resolveAuth(pane: PaneState, profile: ConnectionProfile, password: String?): SshAuth? =
+        resolveAuthInternal(pane, profile.authType, password, profile.keyId, errorPrefix = "")
 
     /** 踏み台(jump host)側の認証情報を解決する。[resolveAuth] と同じ検証ロジックを
      *  jump_auth_type/jump_key_id に適用するだけの対の関数。 */
-    private suspend fun resolveJumpAuth(tab: TabState, profile: ConnectionProfile, jumpPassword: String?): SshAuth? =
-        resolveAuthInternal(tab, profile.jumpAuthType ?: "", jumpPassword, profile.jumpKeyId, errorPrefix = "踏み台: ")
+    private suspend fun resolveJumpAuth(pane: PaneState, profile: ConnectionProfile, jumpPassword: String?): SshAuth? =
+        resolveAuthInternal(pane, profile.jumpAuthType ?: "", jumpPassword, profile.jumpKeyId, errorPrefix = "踏み台: ")
 
     private suspend fun resolveAuthInternal(
-        tab: TabState,
+        pane: PaneState,
         authType: String,
         password: String?,
         keyId: Long?,
@@ -518,30 +681,40 @@ class TerminalTabsViewModel(
         return when (val v = AuthValidator.validate(authType, password, keyId)) {
             is AuthValidation.Error -> {
                 RemoteLogger.w("IsekaiTerminalSSH", "${errorPrefix}auth error: ${v.statusMsg}")
-                tab.preConnectError.value = "$errorPrefix${v.statusMsg}"
+                pane.preConnectError.value = "$errorPrefix${v.statusMsg}"
                 null
             }
             is AuthValidation.Password -> SshAuth.Password(v.value)
-            is AuthValidation.PublicKey -> loadPublicKeyAuth(tab, v.keyId)
+            is AuthValidation.PublicKey -> loadPublicKeyAuth(pane, v.keyId)
         }
     }
 
-    private suspend fun loadPublicKeyAuth(tab: TabState, keyId: Long): SshAuth? =
+    private suspend fun loadPublicKeyAuth(pane: PaneState, keyId: Long): SshAuth? =
         runCatching { SshAuth.PublicKey(executor.loadKeyPem(keyId)) }
             .getOrElse { e ->
                 RemoteLogger.e("IsekaiTerminalSSH", "key error: ${e.message}", e)
-                tab.preConnectError.value = "鍵エラー: ${e.message}"
+                pane.preConnectError.value = "鍵エラー: ${e.message}"
                 null
             }
 
     // ── 定型コマンド（スニペット）─────────────────────────────────
 
-    /** [profileId] が null なら全プロファイル共通のスニペットのみ、非nullなら共通＋専用をマージして読み込む。 */
+    /** [profileId] が null なら全プロファイル共通のスニペットのみ、非nullなら共通＋専用をマージして読み込む。
+     *  未分割時は主ペイン、分割時はフォーカス中のペインのスニペット一覧を差し替える。 */
     fun loadSnippets(tabId: String, profileId: Long?) {
         val tab = tabOrNull(tabId) ?: return
+        loadSnippetsForPane(tab.focusedPane, profileId)
+    }
+
+    private fun loadSnippetsForPane(pane: PaneState, profileId: Long?) {
         viewModelScope.launch(Dispatchers.IO) {
-            tab.snippets.value = Repositories.snippets.getForProfile(profileId)
+            pane.snippets.value = Repositories.snippets.getForProfile(profileId)
         }
+    }
+
+    fun sendSnippetToPane(tabId: String, paneId: String, snippet: Snippet) {
+        RemoteLogger.i("IsekaiTerminalSnippet", "send snippet '${snippet.label}' id=${snippet.id} tab=$tabId pane=$paneId")
+        sendToPane(tabId, paneId, SnippetCommands.toBytes(snippet))
     }
 
     fun sendSnippet(tabId: String, snippet: Snippet) {
@@ -552,89 +725,140 @@ class TerminalTabsViewModel(
     // ── 接続後自動実行コマンド ────────────────────────────────────
 
     /** 新しい接続試行のたびに呼び、この接続で送るべきコマンド（あれば）とフラグをリセットする。 */
-    private fun armPostConnectCommands(tab: TabState, profile: ConnectionProfile) {
+    private fun armPostConnectCommands(pane: PaneState, profile: ConnectionProfile) {
         val commands = profile.postConnectCommands?.takeIf { it.isNotBlank() }
-        tab.pendingPostConnectBytes = commands?.let { SnippetCommands.toBytes(it, appendNewline = true) }
-        tab.postConnectSent.set(tab.pendingPostConnectBytes == null)
+        pane.pendingPostConnectBytes = commands?.let { SnippetCommands.toBytes(it, appendNewline = true) }
+        pane.postConnectSent.set(pane.pendingPostConnectBytes == null)
     }
 
-    /** Connected 立ち上がりで1回だけ呼ばれる。CAS でセッション単位の二重発火を防ぐ。 */
-    private fun maybeSendPostConnectCommands(tab: TabState) {
-        if (!tab.postConnectSent.compareAndSet(false, true)) return
-        val bytes = tab.pendingPostConnectBytes ?: return
+    /** Connected 立ち上がりで1回だけ呼ばれる。CAS でセッション単位の二重発火を防ぐ。
+     *  常にこの[pane]自身のsessionへ直接送る(フォーカス中のペインへルーティングする[send]は
+     *  使わない — 分割ペインが接続完了した時にフォーカスが主ペイン側にあると誤配送するため)。 */
+    private fun maybeSendPostConnectCommands(pane: PaneState) {
+        if (!pane.postConnectSent.compareAndSet(false, true)) return
+        val bytes = pane.pendingPostConnectBytes ?: return
         viewModelScope.launch {
             delay(POST_CONNECT_DEBOUNCE_MS)
-            RemoteLogger.i("IsekaiTerminalSSH", "sending post-connect commands (${bytes.size} bytes) tab=${tab.tabId}")
-            send(tab.tabId, bytes)
+            RemoteLogger.i("IsekaiTerminalSSH", "sending post-connect commands (${bytes.size} bytes) pane=${pane.paneId}")
+            pane.session.send(bytes)
         }
     }
 
-    // ── セッション操作（タブ指定。すべて session への薄い委譲）──────────
+    private fun paneOrNull(tabId: String, paneId: String): PaneState? = tabOrNull(tabId)?.paneOrNull(paneId)
 
-    fun send(tabId: String, bytes: ByteArray) = tabOrNull(tabId)?.session?.send(bytes)
+    // ── セッション操作（ペイン指定が実体。タブ指定のものはフォーカス中のペインへの
+    //    薄い委譲で、後方互換のため残してある）─────────────────────────
+    // 画面分割時、両ペインは同時に見えるため「タブ指定」APIだけでは片方のペインの操作を
+    // 表現できない(ステータスバーの再接続/切断/ログボタン・リサイズ・scrollback・キャンバスの
+    // タップは常にそのペイン自身に向く)。そのためUI([TerminalHostScreen])は常にペイン指定
+    // APIを使う。一方 trzsz転送シート・host key確認ダイアログ等の「フォーカス中のペインに
+    // だけ表示する」モーダルUIも、実際にはフォーカスを持つペイン自身が自分のpaneIdを使って
+    // これらのペイン指定APIを直接呼ぶ(hasFocus=falseの間はそもそも描画されないため、
+    // 結果的にフォーカス中のペインだけが呼べる)。
+    // 未分割タブでは常に主ペイン = フォーカス中のペインなので、タブ指定APIは既存の
+    // 呼び出し元・テストと完全に同じ挙動になる。
 
-    fun resize(tabId: String, cols: UInt, rows: UInt) = tabOrNull(tabId)?.session?.resize(cols, rows)
+    fun sendToPane(tabId: String, paneId: String, bytes: ByteArray) = paneOrNull(tabId, paneId)?.session?.send(bytes)
 
-    fun disconnect(tabId: String) = tabOrNull(tabId)?.session?.disconnect()
+    fun send(tabId: String, bytes: ByteArray) = tabOrNull(tabId)?.let { sendToPane(tabId, it.focusedPane.paneId, bytes) }
 
-    fun scrollbackCells(tabId: String, offset: Int, rows: Int): List<CellData>? =
-        tabOrNull(tabId)?.session?.scrollbackCells(offset, rows)
+    fun disconnectPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.disconnect()
 
-    fun trustUpdatedHostKey(tabId: String) = tabOrNull(tabId)?.session?.trustUpdatedHostKey()
+    fun disconnect(tabId: String) = tabOrNull(tabId)?.let { disconnectPane(tabId, it.focusedPane.paneId) }
 
-    fun dismissHostKeyWarning(tabId: String) = tabOrNull(tabId)?.session?.dismissHostKeyWarning()
+    // ── リサイズ・scrollback(フォーカスに関わらずペインごとに独立して呼ぶ必要がある)──
 
-    fun trustNewHostKey(tabId: String) = tabOrNull(tabId)?.session?.trustNewHostKey()
+    fun resizePane(tabId: String, paneId: String, cols: UInt, rows: UInt) =
+        paneOrNull(tabId, paneId)?.session?.resize(cols, rows)
 
-    fun dismissNewHostKeyPrompt(tabId: String) = tabOrNull(tabId)?.session?.dismissNewHostKeyPrompt()
+    fun scrollbackCellsForPane(tabId: String, paneId: String, offset: Int, rows: Int): List<CellData>? =
+        paneOrNull(tabId, paneId)?.session?.scrollbackCells(offset, rows)
+
+    fun trustUpdatedHostKeyForPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.trustUpdatedHostKey()
+
+    fun trustUpdatedHostKey(tabId: String) = tabOrNull(tabId)?.let { trustUpdatedHostKeyForPane(tabId, it.focusedPane.paneId) }
+
+    fun dismissHostKeyWarningForPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.dismissHostKeyWarning()
+
+    fun dismissHostKeyWarning(tabId: String) = tabOrNull(tabId)?.let { dismissHostKeyWarningForPane(tabId, it.focusedPane.paneId) }
+
+    fun trustNewHostKeyForPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.trustNewHostKey()
+
+    fun trustNewHostKey(tabId: String) = tabOrNull(tabId)?.let { trustNewHostKeyForPane(tabId, it.focusedPane.paneId) }
+
+    fun dismissNewHostKeyPromptForPane(tabId: String, paneId: String) =
+        paneOrNull(tabId, paneId)?.session?.dismissNewHostKeyPrompt()
+
+    fun dismissNewHostKeyPrompt(tabId: String) =
+        tabOrNull(tabId)?.let { dismissNewHostKeyPromptForPane(tabId, it.focusedPane.paneId) }
+
+    fun respondAgentSignRequestForPane(tabId: String, paneId: String, approved: Boolean) =
+        paneOrNull(tabId, paneId)?.session?.respondAgentSignRequest(approved)
 
     fun respondAgentSignRequest(tabId: String, approved: Boolean) =
-        tabOrNull(tabId)?.session?.respondAgentSignRequest(approved)
+        tabOrNull(tabId)?.let { respondAgentSignRequestForPane(tabId, it.focusedPane.paneId, approved) }
 
-    fun getSessionLog(tabId: String): String = tabOrNull(tabId)?.session?.log?.value ?: ""
+    fun getSessionLogForPane(tabId: String, paneId: String): String = paneOrNull(tabId, paneId)?.session?.log?.value ?: ""
 
-    fun clearSessionLog(tabId: String) = tabOrNull(tabId)?.session?.clearLog()
+    fun getSessionLog(tabId: String): String =
+        tabOrNull(tabId)?.let { getSessionLogForPane(tabId, it.focusedPane.paneId) } ?: ""
 
-    // ── trzsz（Android ファイル I/O は executor 経由。タブごとに二重起動防止）───
+    fun clearSessionLog(tabId: String) = tabOrNull(tabId)?.focusedPane?.session?.clearLog()
 
-    fun trzszStartUpload(tabId: String, uri: Uri) {
-        val tab = tabOrNull(tabId) ?: return
-        if (tab.session.state.value.trzszState !is TrzszUiState.WaitingUser) return
-        if (!tab.uploadInProgress.compareAndSet(false, true)) return
+    // ── trzsz（Android ファイル I/O は executor 経由。ペインごとに二重起動防止）───
+
+    fun trzszStartUploadForPane(tabId: String, paneId: String, uri: Uri) {
+        val pane = paneOrNull(tabId, paneId) ?: return
+        if (pane.session.state.value.trzszState !is TrzszUiState.WaitingUser) return
+        if (!pane.uploadInProgress.compareAndSet(false, true)) return
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val file = executor.openUploadFile(uri) ?: return@launch
-                tab.session.trzszAcceptUpload(file.name, file.size.toULong(), 0u)
+                pane.session.trzszAcceptUpload(file.name, file.size.toULong(), 0u)
                 file.stream.use { inp ->
                     val buf = ByteArray(64 * 1024)
                     var pending: ByteArray? = null
                     while (true) {
                         val n = inp.read(buf)
                         if (n == -1) {
-                            tab.session.trzszSendChunk(pending ?: ByteArray(0), true)
+                            pane.session.trzszSendChunk(pending ?: ByteArray(0), true)
                             break
                         }
-                        pending?.let { tab.session.trzszSendChunk(it, false) }
+                        pending?.let { pane.session.trzszSendChunk(it, false) }
                         pending = buf.copyOf(n)
                     }
                 }
             } catch (e: Exception) {
                 RemoteLogger.e("TrzszUpload", "exception: $e")
             } finally {
-                tab.uploadInProgress.set(false)
+                pane.uploadInProgress.set(false)
             }
         }
     }
 
-    fun trzszStartDownload(tabId: String) {
+    fun trzszStartUpload(tabId: String, uri: Uri) {
         val tab = tabOrNull(tabId) ?: return
-        if (tab.session.state.value.trzszState !is TrzszUiState.WaitingUser) return
-        tab.session.trzszAcceptDownload()
+        trzszStartUploadForPane(tabId, tab.focusedPane.paneId, uri)
     }
 
-    fun trzszCancel(tabId: String) = tabOrNull(tabId)?.session?.trzszCancel()
+    fun trzszStartDownloadForPane(tabId: String, paneId: String) {
+        val pane = paneOrNull(tabId, paneId) ?: return
+        if (pane.session.state.value.trzszState !is TrzszUiState.WaitingUser) return
+        pane.session.trzszAcceptDownload()
+    }
 
-    fun trzszDismiss(tabId: String) = tabOrNull(tabId)?.session?.trzszDismiss()
+    fun trzszStartDownload(tabId: String) {
+        val tab = tabOrNull(tabId) ?: return
+        trzszStartDownloadForPane(tabId, tab.focusedPane.paneId)
+    }
+
+    fun trzszCancelForPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.trzszCancel()
+
+    fun trzszCancel(tabId: String) = tabOrNull(tabId)?.let { trzszCancelForPane(tabId, it.focusedPane.paneId) }
+
+    fun trzszDismissForPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.trzszDismiss()
+
+    fun trzszDismiss(tabId: String) = tabOrNull(tabId)?.let { trzszDismissForPane(tabId, it.focusedPane.paneId) }
 
     // ── ライフサイクル ──────────────────────────────────────────────
 
@@ -642,7 +866,7 @@ class TerminalTabsViewModel(
         super.onCleared()
         RemoteLogger.i("IsekaiTerminalTabsVM", "TerminalTabsViewModel cleared")
         watchJobs.values.forEach { it.cancel() }
-        _tabs.value.forEach { it.session.close() }
+        _tabs.value.forEach { tab -> tab.panes.forEach { it.session.close() } }
         executor.unregisterNetworkCallbacks()
         executor.release()
     }

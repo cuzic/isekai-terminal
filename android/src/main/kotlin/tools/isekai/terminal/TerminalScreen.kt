@@ -72,14 +72,26 @@ data class TerminalScreenActions(
     val onGetSessionLog: () -> String,
     val onSendSnippet: (Snippet) -> Unit,
     val onRespondAgentSignRequest: (Boolean) -> Unit,
+    /** 画面分割(split pane)でこのペインがタップされた時に呼ぶ。フォーカスをこのペインへ
+     *  切り替える(タブ横断の`TerminalTabsViewModel.setFocusedPane`への委譲)。分割していない
+     *  単一ペインの場合は no-op のままでよい。 */
+    val onRequestFocus: () -> Unit = {},
 )
 
 /**
- * ターミナル画面の本体。複数タブ UI の `TerminalTabScreen` から共有される。
+ * ターミナル画面の本体。複数タブ UI の `TerminalTabScreen`、および画面分割(split pane)時の
+ * 各ペイン(`TerminalPaneScreen`)から共有される。
  *
  * [isActive] が false の間は Canvas 描画・IME 入力欄を止める（Rust セッション自体は
  * 生きたまま）。スクロール位置・フォントスケール等のローカル状態は呼び出し側で
- * `key(tabId) { }` により分離すること。
+ * `key(tabId)`／`key(paneId)` により分離すること。
+ *
+ * [isActive] と [hasFocus] は別軸: 画面分割で両ペインが同時に見えている間は両方とも
+ * [isActive] = true（Canvas・ステータスバーはどちらも描画する）だが、ソフトキーボード入力欄・
+ * Ctrl キー行・trzsz転送シート・host key確認ダイアログ・定型コマンド一覧といった
+ * 「タブ/ペインを跨いで1つしか存在しない」UIは [hasFocus] が true の側にだけ表示する
+ * （「フォーカス中のペインに対して表示する」設計。未分割時は既定で isActive と同じ値になり、
+ * 既存の挙動と変わらない）。
  */
 @Composable
 fun TerminalScreenBody(
@@ -88,6 +100,7 @@ fun TerminalScreenBody(
     actions: TerminalScreenActions,
     snippets: List<Snippet> = emptyList(),
     isActive: Boolean = true,
+    hasFocus: Boolean = isActive,
 ) {
     val context = LocalContext.current
     val connected = uiState.connected
@@ -104,7 +117,7 @@ fun TerminalScreenBody(
     // 入力用 AndroidView への参照をここで保持する（入力欄自体は下部に描画）。
     var inputView by remember { mutableStateOf<tools.isekai.terminal.input.TerminalInputView?>(null) }
 
-    BackHandler(enabled = connected && isActive) { showDisconnectDialog = true }
+    BackHandler(enabled = connected && isActive && hasFocus) { showDisconnectDialog = true }
 
     if (showDisconnectDialog) {
         AlertDialog(
@@ -121,8 +134,8 @@ fun TerminalScreenBody(
         )
     }
 
-    // Host key changed warning dialog（非アクティブタブでは表示しない）
-    if (isActive) {
+    // Host key changed warning dialog（非アクティブ、またはフォーカス外のペインでは表示しない）
+    if (isActive && hasFocus) {
         uiState.hostKeyChangedWarning?.let { w ->
             HostKeyChangedDialog(
                 warning = w,
@@ -132,8 +145,8 @@ fun TerminalScreenBody(
         }
     }
 
-    // 初回接続(Unknown host key)確認ダイアログ（非アクティブタブでは表示しない）
-    if (isActive) {
+    // 初回接続(Unknown host key)確認ダイアログ（非アクティブ、またはフォーカス外のペインでは表示しない）
+    if (isActive && hasFocus) {
         uiState.newHostKeyPrompt?.let { prompt ->
             HostKeyUnknownDialog(
                 host = prompt.host,
@@ -157,7 +170,7 @@ fun TerminalScreenBody(
     // trzsz file transfer
     val trzszState = uiState.trzszState
     val transferActive = trzszState is TrzszUiState.WaitingUser || trzszState is TrzszUiState.InProgress
-    if (isActive && trzszState != null) {
+    if (isActive && hasFocus && trzszState != null) {
         TrzszTransferSheet(
             state = trzszState,
             onStartUpload = { uri -> actions.onTrzszStartUpload(uri) },
@@ -168,7 +181,7 @@ fun TerminalScreenBody(
     }
 
     // 定型コマンド（スニペット）一覧
-    if (isActive && showSnippetSheet) {
+    if (isActive && hasFocus && showSnippetSheet) {
         SnippetPickerSheet(
             snippets = snippets,
             onPick = { snippet ->
@@ -344,7 +357,13 @@ fun TerminalScreenBody(
                                     } else {
                                         val stillDown = currentEvent.changes.firstOrNull { it.id == down.id }
                                         if (stillDown == null || !stillDown.pressed) {
-                                            // (3) 単純タップ（長押し不成立かつ移動なしで指が離れた）→ IME フォーカス
+                                            // (3) 単純タップ（長押し不成立かつ移動なしで指が離れた）→
+                                            // 画面分割時はこのペインへフォーカスを切り替え、その上でIMEフォーカスを要求する
+                                            // (このペインがまだフォーカス外の場合、入力欄自体がこの呼び出し時点では
+                                            // 未生成[inputViewがnull]のため即時には効かないが、onRequestFocus()による
+                                            // 再コンポジションでinputViewが生成された時点でその生成側のAndroidView.update
+                                            // が改めてrequestFocus+showSoftInputを行う)。
+                                            actions.onRequestFocus()
                                             requestImeFocus()
                                         } else {
                                             // (2) 長押し不成立で移動 → 従来のピンチ拡縮+縦パンスクロール相当
@@ -440,9 +459,9 @@ fun TerminalScreenBody(
         }
 
         // 入力エリア（キーボードの上に表示される）。転送中はキー入力が
-        // trzsz バイナリストリームに混入するのを防ぐため無効化する。非アクティブタブでは
-        // ソフトキーボードを誤って呼び出さないよう表示しない。
-        if (isActive && connected && !transferActive) {
+        // trzsz バイナリストリームに混入するのを防ぐため無効化する。非アクティブタブ・
+        // フォーカス外のペインではソフトキーボードを誤って呼び出さないよう表示しない。
+        if (isActive && hasFocus && connected && !transferActive) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
