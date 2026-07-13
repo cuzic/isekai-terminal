@@ -131,6 +131,14 @@ jobs:
           restore-keys: |
             rust-core-test-macos-
 
+      # isekai-transport/tests/multipath_e2e.rsが127.0.0.2を「secondary path」の
+      # 疑似アドレスとして使う——Linuxは127.0.0.0/8全体をloへ無条件にルーティング
+      # するが、macOSは127.0.0.1しかlo0に既定で割り当てないため、明示的に
+      # aliasしないと127.0.0.2宛のパケットが疎通せずテストがタイムアウトする
+      # (実test-macos CI失敗で確認済み)。
+      - name: Alias 127.0.0.2 onto lo0 (multipath_e2e.rs needs it, macOS doesn't route 127.0.0.0/8 to lo automatically)
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
+
       # isekai-terminal-core(uniffi-bindgen生成物向けのUniFFI cdylib)は除外する:
       # isekai_pipe_quic_transport.rsがLinux musl静的バイナリをinclude_bytes!で
       # 無条件に埋め込むため、`test`ジョブと同じzig/cargo-zigbuildの前提ビルドが
