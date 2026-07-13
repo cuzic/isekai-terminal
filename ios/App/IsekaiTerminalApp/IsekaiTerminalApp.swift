@@ -24,6 +24,8 @@ private enum AppRoute: Hashable {
     case diagnostics
     case snippetList
     case snippetEdit(Snippet?)
+    case keySequenceList
+    case keySequenceEdit(KeySequence?)
 }
 
 struct AppRootView: View {
@@ -56,6 +58,7 @@ struct AppRootView: View {
                 onEditProfile: { profile in path.append(.profileEdit(profile)) },
                 onManageKeys: { path.append(.keyList) },
                 onManageSnippets: { path.append(.snippetList) },
+                onManageKeySequences: { path.append(.keySequenceList) },
                 onShowDiagnostics: { path.append(.diagnostics) }
             )
             .navigationDestination(for: AppRoute.self) { route in
@@ -90,6 +93,18 @@ struct AppRootView: View {
                 case .snippetEdit(let snippet):
                     SnippetEditView(
                         snippet: snippet,
+                        onSave: { path.removeLast() },
+                        onCancel: { path.removeLast() }
+                    )
+                case .keySequenceList:
+                    KeySequenceListView(
+                        model: KeySequenceListModel(),
+                        onAddKeySequence: { path.append(.keySequenceEdit(nil)) },
+                        onEditKeySequence: { keySequence in path.append(.keySequenceEdit(keySequence)) }
+                    )
+                case .keySequenceEdit(let keySequence):
+                    KeySequenceEditView(
+                        keySequence: keySequence,
                         onSave: { path.removeLast() },
                         onCancel: { path.removeLast() }
                     )

@@ -389,6 +389,18 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         orchestrator.send(data: data)
     }
 
+    /// 打鍵列(KeySequence)を送信する。`applicationCursorMode`は新しいミラー状態を作らず、
+    /// 既存のRust由来の状態(`uiState.latestScreenUpdate`、`TerminalView`が矢印キー描画等で
+    /// 参照しているのと同じ値)をそのまま読む(Android版`TerminalTabsViewModel.sendKeySequenceToPane`
+    /// と同じ方針)。`uiState`は`@MainActor`のため、このメソッド自身も`@MainActor`にする
+    /// (UI操作からの呼び出しのみを想定し、`OrchestratorCallback`のRustスレッド発火メソッドとは
+    /// 別に、このメソッドだけ`@MainActor`を明示できる)。
+    @MainActor
+    public func sendKeySequence(_ steps: [KeyStep]) {
+        let applicationCursorMode = uiState.latestScreenUpdate?.applicationCursorMode ?? false
+        send(KeySequenceCommands.toBytes(steps, applicationCursorMode: applicationCursorMode))
+    }
+
     public func resize(cols: UInt32, rows: UInt32) {
         orchestrator.resize(cols: cols, rows: rows)
     }

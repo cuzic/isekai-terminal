@@ -35,6 +35,10 @@ public struct TerminalView: View {
     /// Phase 1F-5(#52): 定型コマンドシート。Android版`showSnippetSheet`と対称。
     @State private var showSnippetSheet = false
     @State private var snippets: [Snippet] = []
+    /// 打鍵列(KeySequence)シート。Android版`showKeySequenceSheet`と対称。
+    @State private var showKeySequenceSheet = false
+    @State private var keySequences: [KeySequence] = []
+    @State private var installedPacks: [(pack: KeySequencePack, installation: KeySequencePackInstallation)] = []
     /// Phase 1C(#25): trzszアップロード時のファイル選択ピッカー表示フラグ。
     @State private var showTrzszFileImporter = false
     /// Phase 1C(#25): trzszダウンロード完了後、保存先を選ぶ`.fileMover`の表示フラグ。
@@ -66,7 +70,17 @@ public struct TerminalView: View {
             )
             .accessibilityIdentifier("terminalScreen")
 
-            TerminalInputRepresentable(controller: controller, uiState: uiState, isActive: isActive, onShowSnippets: { showSnippetSheet = true })
+            TerminalInputRepresentable(
+                controller: controller, uiState: uiState, isActive: isActive,
+                onShowSnippets: { showSnippetSheet = true },
+                onShowKeySequences: {
+                    // シートを開く直前に再読込する(codexレビュー指摘: .onAppear時の1回だけだと、
+                    // ターミナル画面を表示したまま別画面で打鍵列/パック設定を変更した場合に
+                    // シートが古い内容のままになる)。
+                    reloadKeySequenceSheetContent()
+                    showKeySequenceSheet = true
+                }
+            )
                 .frame(width: 1, height: 1)
                 .opacity(0.01) // 非表示にしつつfirstResponderにはなれる状態を保つ
 
@@ -88,6 +102,7 @@ public struct TerminalView: View {
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             snippets = (try? db.fetchSnippets(forProfileId: profileId)) ?? []
+            reloadKeySequenceSheetContent()
         }
         .onDisappear { controller.disconnect() }
         .sheet(isPresented: $showSnippetSheet) {
@@ -96,6 +111,16 @@ public struct TerminalView: View {
                 onPick: { snippet in
                     controller.send(SnippetCommands.toBytes(snippet: snippet))
                     showSnippetSheet = false
+                }
+            )
+        }
+        .sheet(isPresented: $showKeySequenceSheet) {
+            KeySequencePickerSheet(
+                keySequences: keySequences,
+                installedPacks: installedPacks,
+                onSendSteps: { steps in
+                    controller.sendKeySequence(steps)
+                    showKeySequenceSheet = false
                 }
             )
         }
@@ -137,6 +162,17 @@ public struct TerminalView: View {
             }
         }
         .fileMover(isPresented: $showTrzszFileMover, file: uiState.completedDownloadURL) { _ in }
+    }
+
+    /// 打鍵列一覧・有効化済みパックを読み直す。`.onAppear`(初回表示)と、打鍵列シートを
+    /// 開く直前(codexレビュー指摘: 表示中に別画面で設定変更された場合に古い内容のままに
+    /// ならないように)の両方から呼ぶ。
+    private func reloadKeySequenceSheetContent() {
+        keySequences = (try? db.fetchKeySequences(forProfileId: profileId)) ?? []
+        installedPacks = KeySequencePacks.all.compactMap { pack in
+            guard let installation = try? db.resolvePackInstallation(packId: pack.id, profileId: profileId) else { return nil }
+            return (pack, installation)
+        }
     }
 
     @ViewBuilder
@@ -277,11 +313,15 @@ private struct TerminalInputRepresentable: UIViewRepresentable {
     /// キーボード入力を受け取らない)。
     let isActive: Bool
     let onShowSnippets: () -> Void
+    let onShowKeySequences: () -> Void
 
     func makeUIView(context: Context) -> TerminalIMEInputView {
         let view = TerminalIMEInputView()
         view.onSendBytes = { [weak controller] data in controller?.send(data) }
-        view.inputAccessoryView = TerminalAccessoryBar(controller: controller, inputView: view, onShowSnippets: onShowSnippets)
+        view.inputAccessoryView = TerminalAccessoryBar(
+            controller: controller, inputView: view,
+            onShowSnippets: onShowSnippets, onShowKeySequences: onShowKeySequences
+        )
         if isActive {
             DispatchQueue.main.async {
                 view.becomeFirstResponder()
@@ -318,6 +358,7 @@ private final class TerminalAccessoryBar: UIView {
     private weak var imeInputView: TerminalIMEInputView?
     private var ctrlButton: UIButton?
     private let onShowSnippets: () -> Void
+    private let onShowKeySequences: () -> Void
 
     /// Phase 1F-5(#52): ^C/^D/^Zの制御バイト直接送信ボタン。Android版`TerminalScreen.kt`の
     /// `CtrlBtn("^C") { actions.onSend(byteArrayOf(0x03)) }`等と同じ(トグル式の「Ctrl」
@@ -326,10 +367,16 @@ private final class TerminalAccessoryBar: UIView {
         ("^C", 0x03), ("^D", 0x04), ("^Z", 0x1A),
     ]
 
-    init(controller: TerminalSessionController, inputView: TerminalIMEInputView, onShowSnippets: @escaping () -> Void = {}) {
+    init(
+        controller: TerminalSessionController,
+        inputView: TerminalIMEInputView,
+        onShowSnippets: @escaping () -> Void = {},
+        onShowKeySequences: @escaping () -> Void = {}
+    ) {
         self.controller = controller
         self.imeInputView = inputView
         self.onShowSnippets = onShowSnippets
+        self.onShowKeySequences = onShowKeySequences
         super.init(frame: CGRect(x: 0, y: 0, width: 0, height: 44))
         backgroundColor = .secondarySystemBackground
         autoresizingMask = [.flexibleWidth]
@@ -343,6 +390,9 @@ private final class TerminalAccessoryBar: UIView {
 
         let snippets = makeButton(title: "定型", tag: -3)
         snippets.addTarget(self, action: #selector(handleSnippetsTap), for: .touchUpInside)
+
+        let keySequences = makeButton(title: "打鍵", tag: -4)
+        keySequences.addTarget(self, action: #selector(handleKeySequencesTap), for: .touchUpInside)
 
         let controlButtons = controlByteButtons.enumerated().map { index, item in
             let button = makeButton(title: item.title, tag: -10 - index)
@@ -365,7 +415,7 @@ private final class TerminalAccessoryBar: UIView {
         self.keys = labels.map { $0.1 }
 
         let keyButtons = labels.enumerated().map { index, item in makeButton(title: item.0, tag: index) }
-        let stack = UIStackView(arrangedSubviews: [ctrl] + controlButtons + [paste, snippets] + keyButtons)
+        let stack = UIStackView(arrangedSubviews: [ctrl] + controlButtons + [paste, snippets, keySequences] + keyButtons)
         stack.axis = .horizontal
         stack.distribution = .fillEqually
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -429,6 +479,11 @@ private final class TerminalAccessoryBar: UIView {
     @objc private func handleSnippetsTap() {
         onShowSnippets()
     }
+
+    /// 打鍵列シートを開く(SwiftUI側、`TerminalView`が保持する)。
+    @objc private func handleKeySequencesTap() {
+        onShowKeySequences()
+    }
 }
 
 /// Phase 1F-5(#52): 定型コマンド選択シート。Android版`TerminalScreen.kt`の
@@ -472,5 +527,70 @@ private struct SnippetPickerSheet: View {
             }
         }
         .presentationDetents([.medium, .large])
+    }
+}
+
+/// 打鍵列選択シート。Android版`TerminalScreen.kt`の`KeySequencePickerSheet`と同じ役割。
+/// ユーザー定義の打鍵列に加えて、有効化済みの打鍵列セット(パック)をパック名で
+/// 見出しグルーピングして表示する。
+private struct KeySequencePickerSheet: View {
+    let keySequences: [KeySequence]
+    let installedPacks: [(pack: KeySequencePack, installation: KeySequencePackInstallation)]
+    let onSendSteps: ([KeyStep]) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if keySequences.isEmpty && installedPacks.isEmpty {
+                    Text("登録された打鍵列がありません。プロファイル一覧の「打鍵列」から追加できます。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .padding()
+                } else {
+                    List {
+                        if !keySequences.isEmpty {
+                            Section {
+                                ForEach(keySequences, id: \.id) { keySequence in
+                                    keySequenceRow(label: keySequence.label, steps: keySequence.steps)
+                                        .accessibilityIdentifier("keySequencePickerOption_\(keySequence.label)")
+                                }
+                            }
+                        }
+                        ForEach(installedPacks, id: \.pack.id) { entry in
+                            let resolved = KeySequencePackResolver.resolve(pack: entry.pack, paramValues: entry.installation.paramValues)
+                            Section(entry.pack.name) {
+                                ForEach(resolved, id: \.label) { seq in
+                                    keySequenceRow(label: seq.label, steps: seq.steps)
+                                        .accessibilityIdentifier("keySequencePickerOption_\(entry.pack.id)_\(seq.label)")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("打鍵列")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("閉じる") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private func keySequenceRow(label: String, steps: [KeyStep]) -> some View {
+        Button {
+            onSendSteps(steps)
+        } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .foregroundStyle(.primary)
+                Text(steps.previewText)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
     }
 }

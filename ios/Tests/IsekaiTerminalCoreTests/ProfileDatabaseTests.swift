@@ -301,4 +301,199 @@ final class ProfileDatabaseTests: XCTestCase {
 
         XCTAssertEqual(result.map(\.label), ["shared"])
     }
+
+    // MARK: - 打鍵列(KeySequence) CRUD
+
+    func testInsertAndFetchKeySequence() throws {
+        let db = try ProfileDatabase.inMemory()
+        var keySequence = KeySequence.create(label: "tmux new window", steps: [.ctrlChar("b"), .text("c")])
+
+        try db.insert(keySequence: &keySequence)
+
+        XCTAssertNotNil(keySequence.id)
+        let fetched = try db.fetchKeySequence(id: keySequence.id!)
+        XCTAssertEqual(fetched?.label, "tmux new window")
+        XCTAssertEqual(fetched?.steps, [.ctrlChar("b"), .text("c")])
+        XCTAssertNil(fetched?.profileId)
+    }
+
+    func testUpdateKeySequence() throws {
+        let db = try ProfileDatabase.inMemory()
+        var keySequence = KeySequence.create(label: "old", steps: [.text("old")])
+        try db.insert(keySequence: &keySequence)
+
+        var updated = keySequence
+        updated.label = "new"
+        updated.stepsJson = KeyStepJSON.encode([.text("new")])
+        try db.update(keySequence: updated)
+
+        let fetched = try db.fetchKeySequence(id: keySequence.id!)
+        XCTAssertEqual(fetched?.label, "new")
+        XCTAssertEqual(fetched?.steps, [.text("new")])
+    }
+
+    func testDeleteKeySequence() throws {
+        let db = try ProfileDatabase.inMemory()
+        var keySequence = KeySequence.create(label: "temp", steps: [.text("temp")])
+        try db.insert(keySequence: &keySequence)
+
+        try db.deleteKeySequence(id: keySequence.id!)
+
+        XCTAssertNil(try db.fetchKeySequence(id: keySequence.id!))
+    }
+
+    func testFetchAllKeySequencesOrderedBySortOrderThenLabel() throws {
+        let db = try ProfileDatabase.inMemory()
+        var b = KeySequence.create(label: "B", steps: [.text("b")], sortOrder: 1)
+        var a = KeySequence.create(label: "A", steps: [.text("a")], sortOrder: 0)
+        var c = KeySequence.create(label: "C", steps: [.text("c")], sortOrder: 1)
+        try db.insert(keySequence: &b)
+        try db.insert(keySequence: &a)
+        try db.insert(keySequence: &c)
+
+        let all = try db.fetchAllKeySequences()
+
+        XCTAssertEqual(all.map(\.label), ["A", "B", "C"])
+    }
+
+    func testKeySequenceWithProfileIdRoundTrips() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        try db.insert(profile: &profile)
+        var keySequence = KeySequence.create(label: "profile-specific", steps: [.text("hi")], profileId: profile.id)
+
+        try db.insert(keySequence: &keySequence)
+
+        let fetched = try db.fetchKeySequence(id: keySequence.id!)
+        XCTAssertEqual(fetched?.profileId, profile.id)
+    }
+
+    func testFetchKeySequencesForProfileIncludesSharedAndProfileSpecific() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profileA = ConnectionProfile(displayName: "A", host: "a.example.com", port: 22, username: "user")
+        var profileB = ConnectionProfile(displayName: "B", host: "b.example.com", port: 22, username: "user")
+        try db.insert(profile: &profileA)
+        try db.insert(profile: &profileB)
+        var shared = KeySequence.create(label: "shared", steps: [.text("shared")])
+        var forA = KeySequence.create(label: "for-a", steps: [.text("a")], profileId: profileA.id)
+        var forB = KeySequence.create(label: "for-b", steps: [.text("b")], profileId: profileB.id)
+        try db.insert(keySequence: &shared)
+        try db.insert(keySequence: &forA)
+        try db.insert(keySequence: &forB)
+
+        let forProfileA = try db.fetchKeySequences(forProfileId: profileA.id)
+
+        XCTAssertEqual(Set(forProfileA.map(\.label)), Set(["shared", "for-a"]))
+    }
+
+    func testFetchKeySequencesForNilProfileReturnsOnlySharedKeySequences() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        try db.insert(profile: &profile)
+        var shared = KeySequence.create(label: "shared", steps: [.text("shared")])
+        var specific = KeySequence.create(label: "specific", steps: [.text("specific")], profileId: profile.id)
+        try db.insert(keySequence: &shared)
+        try db.insert(keySequence: &specific)
+
+        let result = try db.fetchKeySequences(forProfileId: nil)
+
+        XCTAssertEqual(result.map(\.label), ["shared"])
+    }
+
+    func testCorruptedStepsJsonDoesNotThrow_stepsFallsBackToEmpty() throws {
+        let db = try ProfileDatabase.inMemory()
+        var keySequence = KeySequence(label: "broken", stepsJson: "{not valid json")
+        try db.insert(keySequence: &keySequence)
+
+        let fetched = try db.fetchKeySequence(id: keySequence.id!)
+        XCTAssertEqual(fetched?.steps, [])
+    }
+
+    func testKeySequenceCommandsToBytesOverloadDelegatesToStepsBasedOverload() throws {
+        let db = try ProfileDatabase.inMemory()
+        var keySequence = KeySequence.create(label: "tmux new window", steps: [.ctrlChar("b"), .text("c")])
+        try db.insert(keySequence: &keySequence)
+        let fetched = try db.fetchKeySequence(id: keySequence.id!)!
+
+        let bytes = KeySequenceCommands.toBytes(keySequence: fetched)
+
+        XCTAssertEqual(bytes, Data([0x02, UInt8(ascii: "c")]))
+    }
+
+    // MARK: - 打鍵列セット(パック)インストール状態
+
+    func testInstallPackThenFetchGlobalReturnsInstallation() throws {
+        let db = try ProfileDatabase.inMemory()
+        try db.installPack(packId: "tmux", version: 1, paramValues: ["prefix": .ctrlChar("b")])
+
+        let found = try db.fetchGlobalPackInstallation(packId: "tmux")
+        XCTAssertEqual(found?.packId, "tmux")
+        XCTAssertEqual(found?.paramValues, ["prefix": .ctrlChar("b")])
+    }
+
+    func testInstallPackCalledTwiceForSameGlobalPackReplacesRatherThanDuplicates() throws {
+        let db = try ProfileDatabase.inMemory()
+        try db.installPack(packId: "tmux", version: 1, paramValues: ["prefix": .ctrlChar("b")])
+        try db.installPack(packId: "tmux", version: 1, paramValues: ["prefix": .ctrlChar("a")])
+
+        let all = try db.dbQueue.read { db in try KeySequencePackInstallation.fetchAll(db) }
+        XCTAssertEqual(all.count, 1)
+        XCTAssertEqual(all.first?.paramValues, ["prefix": .ctrlChar("a")])
+    }
+
+    func testResolvePackInstallationProfileSpecificTakesPriorityOverGlobal() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profile = ConnectionProfile(displayName: "web", host: "h", port: 22, username: "u")
+        try db.insert(profile: &profile)
+        try db.installPack(packId: "tmux", version: 1, paramValues: ["prefix": .ctrlChar("b")])
+        try db.installPack(packId: "tmux", version: 1, paramValues: ["prefix": .ctrlChar("a")], profileId: profile.id)
+
+        let resolved = try db.resolvePackInstallation(packId: "tmux", profileId: profile.id)
+        XCTAssertEqual(resolved?.paramValues, ["prefix": .ctrlChar("a")])
+    }
+
+    func testResolvePackInstallationFallsBackToGlobalWhenNoProfileSpecificInstallation() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profile = ConnectionProfile(displayName: "web", host: "h", port: 22, username: "u")
+        try db.insert(profile: &profile)
+        try db.installPack(packId: "tmux", version: 1, paramValues: ["prefix": .ctrlChar("b")])
+
+        let resolved = try db.resolvePackInstallation(packId: "tmux", profileId: profile.id)
+        XCTAssertEqual(resolved?.paramValues, ["prefix": .ctrlChar("b")])
+    }
+
+    func testResolvePackInstallationReturnsNilWhenNotInstalledAnywhere() throws {
+        let db = try ProfileDatabase.inMemory()
+        XCTAssertNil(try db.resolvePackInstallation(packId: "tmux", profileId: nil))
+    }
+
+    func testDeletePackInstallationRemovesInstallation() throws {
+        let db = try ProfileDatabase.inMemory()
+        try db.installPack(packId: "tmux", version: 1, paramValues: [:])
+        let installed = try db.fetchGlobalPackInstallation(packId: "tmux")!
+
+        try db.deletePackInstallation(id: installed.id!)
+
+        XCTAssertNil(try db.fetchGlobalPackInstallation(packId: "tmux"))
+    }
+
+    func testInstallPackCalledConcurrentlyDoesNotCreateDuplicateGlobalRows() async throws {
+        // GRDBのDatabaseQueueはwriteを直列化するため、installPack内の「検索してから書き込む」
+        // トランザクションが同時に複数呼ばれても重複行を作らないことを確認する
+        // (Android版のMutexで防いでいるのと同じ問題への、GRDBに適した解決の検証)。
+        let db = try ProfileDatabase.inMemory()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for i in 0..<20 {
+                group.addTask {
+                    let c = Character(UnicodeScalar(UInt8(ascii: "a") + UInt8(i % 26)))
+                    try db.installPack(packId: "tmux", version: 1, paramValues: ["prefix": .ctrlChar(c)])
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let all = try db.dbQueue.read { db in try KeySequencePackInstallation.fetchAll(db) }
+        XCTAssertEqual(all.count, 1)
+    }
 }

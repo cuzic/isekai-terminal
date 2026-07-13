@@ -280,6 +280,114 @@ extension SnippetCommands {
     }
 }
 
+/// 打鍵列(KeySequence)。Android版`data.KeySequence`相当。`profileId`がnilなら全プロファイル共通、
+/// 非nilならそのプロファイル専用として表示される(Android版・[Snippet]と同じ運用)。
+/// `sourcePackId`列は持たない(パック機構はライブバインディング方式でDB行へマテリアライズしない
+/// ため不要、Android版と同じ判断)。
+///
+/// テーブル名は複数形`key_sequences`(Android版`key_sequences`と統一。GRDBの既定命名規則は
+/// 単数形`keySequence`になるため`databaseTableName`で明示的に上書きする)。
+public struct KeySequence: Codable, Equatable, Hashable, FetchableRecord, MutablePersistableRecord {
+    public var id: Int64?
+    public var label: String
+    public var stepsJson: String
+    public var sortOrder: Int
+    public var profileId: Int64?
+
+    public static let databaseTableName = "key_sequences"
+
+    public init(
+        id: Int64? = nil,
+        label: String,
+        stepsJson: String,
+        sortOrder: Int = 0,
+        profileId: Int64? = nil
+    ) {
+        self.id = id
+        self.label = label
+        self.stepsJson = stepsJson
+        self.sortOrder = sortOrder
+        self.profileId = profileId
+    }
+
+    /// [stepsJson]を復元した[KeyStep]のリスト。壊れたJSONは空リストにフォールバックする。
+    public var steps: [KeyStep] { KeyStepJSON.decode(stepsJson) }
+
+    public static func create(
+        label: String,
+        steps: [KeyStep],
+        sortOrder: Int = 0,
+        profileId: Int64? = nil,
+        id: Int64? = nil
+    ) -> KeySequence {
+        KeySequence(id: id, label: label, stepsJson: KeyStepJSON.encode(steps), sortOrder: sortOrder, profileId: profileId)
+    }
+
+    public mutating func didInsert(_ inserted: InsertionSuccess) {
+        id = inserted.rowID
+    }
+}
+
+/// `KeySequenceCommands.toBytes(_:applicationCursorMode:)`本体は`IsekaiTerminalCoreLogic`
+/// (`Sources/IsekaiTerminalCoreLogic/KeySequenceCommands.swift`)に切り出し済み(GRDBに依存しない
+/// 純粋関数)。ここではGRDBの[KeySequence]レコード型に依存するオーバーロードだけを追加する。
+extension KeySequenceCommands {
+    public static func toBytes(keySequence: KeySequence, applicationCursorMode: Bool = false) -> Data {
+        toBytes(keySequence.steps, applicationCursorMode: applicationCursorMode)
+    }
+}
+
+/// 打鍵列セット(パック)の有効化状態。パック定義自体([KeySequencePack])はDB行ではなく
+/// アプリ同梱の静的データであり、この行は「どのパックを、どのパラメータ値で有効化しているか」
+/// だけを持つ(ライブバインディング方式)。Android版`data.KeySequencePackInstallation`と対称。
+///
+/// `profileId`がnilならグローバル有効化。グローバル有効化は同一`packId`につき常に高々1行に
+/// なるよう、`ProfileDatabase.installPack`が単一の`dbQueue.write`トランザクション内で
+/// 「検索してから書き込む」ことで保証する(GRDBの`DatabaseQueue`はwriteを直列化するため、
+/// Android版のように明示的なMutexは不要 — 直列化されたトランザクション自体が競合を防ぐ)。
+public struct KeySequencePackInstallation: Codable, Equatable, Hashable, FetchableRecord, MutablePersistableRecord {
+    public var id: Int64?
+    public var packId: String
+    public var version: Int
+    public var paramValuesJson: String
+    public var profileId: Int64?
+
+    public static let databaseTableName = "key_sequence_pack_installations"
+
+    public init(
+        id: Int64? = nil,
+        packId: String,
+        version: Int,
+        paramValuesJson: String,
+        profileId: Int64? = nil
+    ) {
+        self.id = id
+        self.packId = packId
+        self.version = version
+        self.paramValuesJson = paramValuesJson
+        self.profileId = profileId
+    }
+
+    public var paramValues: [String: KeyStep] { PackParamValuesJSON.decode(paramValuesJson) }
+
+    public static func create(
+        packId: String,
+        version: Int,
+        paramValues: [String: KeyStep],
+        profileId: Int64? = nil,
+        id: Int64? = nil
+    ) -> KeySequencePackInstallation {
+        KeySequencePackInstallation(
+            id: id, packId: packId, version: version,
+            paramValuesJson: PackParamValuesJSON.encode(paramValues), profileId: profileId
+        )
+    }
+
+    public mutating func didInsert(_ inserted: InsertionSuccess) {
+        id = inserted.rowID
+    }
+}
+
 public final class ProfileDatabase {
     public let dbQueue: DatabaseQueue
 
@@ -349,6 +457,24 @@ public final class ProfileDatabase {
                 t.column("sortOrder", .integer).notNull().defaults(to: 0)
                 t.column("profileId", .integer)
                 t.column("appendNewline", .boolean).notNull().defaults(to: true)
+            }
+        }
+        migrator.registerMigration("v4_create_key_sequences") { db in
+            try db.create(table: "key_sequences") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("label", .text).notNull()
+                t.column("stepsJson", .text).notNull()
+                t.column("sortOrder", .integer).notNull().defaults(to: 0)
+                t.column("profileId", .integer)
+            }
+        }
+        migrator.registerMigration("v5_create_key_sequence_pack_installations") { db in
+            try db.create(table: "key_sequence_pack_installations") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("packId", .text).notNull()
+                t.column("version", .integer).notNull()
+                t.column("paramValuesJson", .text).notNull()
+                t.column("profileId", .integer)
             }
         }
         return migrator
@@ -428,5 +554,106 @@ public final class ProfileDatabase {
 
     public func fetchSnippet(id: Int64) throws -> Snippet? {
         try dbQueue.read { db in try Snippet.fetchOne(db, key: id) }
+    }
+
+    // MARK: - KeySequence CRUD
+
+    public func insert(keySequence: inout KeySequence) throws {
+        try dbQueue.write { db in try keySequence.insert(db) }
+    }
+
+    public func update(keySequence: KeySequence) throws {
+        try dbQueue.write { db in try keySequence.update(db) }
+    }
+
+    public func deleteKeySequence(id: Int64) throws {
+        _ = try dbQueue.write { db in try KeySequence.deleteOne(db, key: id) }
+    }
+
+    /// Android版`KeySequenceDao.getAll`と同じ並び順(sortOrder ASC, label ASC)。
+    public func fetchAllKeySequences() throws -> [KeySequence] {
+        try dbQueue.read { db in
+            try KeySequence.order(Column("sortOrder"), Column("label")).fetchAll(db)
+        }
+    }
+
+    /// Android版`KeySequenceDao.getForProfile`相当: 全プロファイル共通(`profileId == nil`)
+    /// の打鍵列と、指定した`profileId`専用の打鍵列の両方を返す。
+    public func fetchKeySequences(forProfileId profileId: Int64?) throws -> [KeySequence] {
+        try dbQueue.read { db in
+            try KeySequence
+                .filter(Column("profileId") == nil || Column("profileId") == profileId)
+                .order(Column("sortOrder"), Column("label"))
+                .fetchAll(db)
+        }
+    }
+
+    public func fetchKeySequence(id: Int64) throws -> KeySequence? {
+        try dbQueue.read { db in try KeySequence.fetchOne(db, key: id) }
+    }
+
+    // MARK: - KeySequencePackInstallation CRUD
+
+    public func fetchGlobalPackInstallation(packId: String) throws -> KeySequencePackInstallation? {
+        try dbQueue.read { db in
+            try KeySequencePackInstallation
+                .filter(Column("packId") == packId && Column("profileId") == nil)
+                .fetchOne(db)
+        }
+    }
+
+    public func fetchPackInstallation(packId: String, profileId: Int64) throws -> KeySequencePackInstallation? {
+        try dbQueue.read { db in
+            try KeySequencePackInstallation
+                .filter(Column("packId") == packId && Column("profileId") == profileId)
+                .fetchOne(db)
+        }
+    }
+
+    /// [profileId]向けの有効なインストールを解決する。プロファイル別installationがあれば
+    /// 優先し、なければグローバル(profileId=nil)installationを使う。両方無ければnil。
+    /// Android版`KeySequencePackInstallationRepository.resolveInstallation`と対称。
+    public func resolvePackInstallation(packId: String, profileId: Int64?) throws -> KeySequencePackInstallation? {
+        if let profileId, let specific = try fetchPackInstallation(packId: packId, profileId: profileId) {
+            return specific
+        }
+        return try fetchGlobalPackInstallation(packId: packId)
+    }
+
+    /// [packId]を[profileId]向けに有効化する(既存installationがあればパラメータを更新)。
+    /// 「既存行を検索してから書き込む」を単一の`dbQueue.write`トランザクション内で行うことで、
+    /// GRDBの`DatabaseQueue`のwrite直列化を利用して同時呼び出しによる重複行作成を防ぐ
+    /// (Android版がMutexで防いでいるのと同じ問題への、GRDBに適した解決)。
+    public func installPack(
+        packId: String,
+        version: Int,
+        paramValues: [String: KeyStep],
+        profileId: Int64? = nil
+    ) throws {
+        try dbQueue.write { db in
+            let existing: KeySequencePackInstallation?
+            if let profileId {
+                existing = try KeySequencePackInstallation
+                    .filter(Column("packId") == packId && Column("profileId") == profileId)
+                    .fetchOne(db)
+            } else {
+                existing = try KeySequencePackInstallation
+                    .filter(Column("packId") == packId && Column("profileId") == nil)
+                    .fetchOne(db)
+            }
+            var row = KeySequencePackInstallation.create(
+                packId: packId, version: version, paramValues: paramValues,
+                profileId: profileId, id: existing?.id
+            )
+            if existing != nil {
+                try row.update(db)
+            } else {
+                try row.insert(db)
+            }
+        }
+    }
+
+    public func deletePackInstallation(id: Int64) throws {
+        _ = try dbQueue.write { db in try KeySequencePackInstallation.deleteOne(db, key: id) }
     }
 }
