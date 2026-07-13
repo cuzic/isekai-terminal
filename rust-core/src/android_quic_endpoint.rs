@@ -124,6 +124,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_open_bi_write_and_read_roundtrip() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let (server_addr, cert_sha256_hex) = start_echo_server().await;
 
         let factory = factory();
@@ -153,6 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_fails_on_cert_pin_mismatch() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let (server_addr, _correct_cert_sha256_hex) = start_echo_server().await;
 
         let factory = factory();

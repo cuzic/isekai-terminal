@@ -61,3 +61,12 @@ pub(crate) trait WifiProbeExecutor: Send + Sync {
 pub(crate) trait RebindExecutor: Send + Sync {
     fn rebind(&self, fd: BoundFd);
 }
+
+/// #22: 現在の通信が「静か」かどうかを判定する。`RebindAction::StartQuietWatch`
+/// を受けた間だけDriverが一定間隔でポーリングし、結果を`RebindEvent::TrafficQuietDetected`/
+/// `TrafficBusyDetected`としてFSMへ送り返す。判定ロジック自体(通信量の閾値・
+/// trzsz busyフラグとの組み合わせ)は実装側(`multipath_transport.rs`)に閉じており、
+/// Driverはポーリングのタイミング制御だけを担う。
+pub(crate) trait QuietTrafficSource: Send + Sync {
+    fn is_quiet(&self) -> bool;
+}

@@ -186,10 +186,13 @@ public struct TerminalView: View {
             .accessibilityIdentifier("terminalConnectingOverlay")
         case .connected:
             EmptyView()
-        case .disconnected(let reason):
+        case .disconnected(let reason, let issueHint):
             VStack(spacing: 12) {
                 Text(reason.map { "切断されました: \($0)" } ?? "切断されました")
                     .foregroundStyle(.white)
+                if issueHint == .localNetworkPermissionPossiblyDenied {
+                    localNetworkPermissionHint
+                }
                 reconnectButton
             }
             .padding()
@@ -204,6 +207,18 @@ public struct TerminalView: View {
             .padding()
             .background(.black.opacity(0.7))
             .accessibilityIdentifier("terminalErrorOverlay")
+        case .reconnecting(let elapsedSecs, let timeoutSecs, let reason):
+            VStack(spacing: 12) {
+                ProgressView()
+                Text("再接続中… (\(elapsedSecs)/\(timeoutSecs)秒)\(reason.map { " [\($0)]" } ?? "")")
+                    .foregroundStyle(.yellow)
+                Button("中止") { controller.cancelReconnect() }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("cancelReconnectButton")
+            }
+            .padding()
+            .background(.black.opacity(0.7))
+            .accessibilityIdentifier("terminalReconnectingOverlay")
         }
     }
 
@@ -214,6 +229,23 @@ public struct TerminalView: View {
         Button("再接続") { controller.reconnect() }
             .buttonStyle(.borderedProminent)
             .accessibilityIdentifier("reconnectButton")
+    }
+
+    /// #19: 接続先がプライベート/リンクローカルアドレスで一度もConnectedに
+    /// 至らないまま切断された場合(Rust側`SessionOrchestrator`が判定、
+    /// `ConnectionIssueHint.localNetworkPermissionPossiblyDenied`)に表示する、
+    /// iOSのLocal Network Privacy設定への案内。判定ロジック自体はRust側に
+    /// 閉じており、このViewは届いたヒントに応じて表示するだけ(`rust-ssot.md`)。
+    private var localNetworkPermissionHint: some View {
+        VStack(spacing: 8) {
+            Text("ローカルネットワークへのアクセスが許可されていない可能性があります")
+                .font(.caption)
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+            Button("設定を開く") { LocalNetworkPermissionGuide.openAppSettings() }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("localNetworkPermissionSettingsButton")
+        }
     }
 
     /// Phase 1F-1(#48): 選択中のフローティングツールバー(コピー/キャンセル)。

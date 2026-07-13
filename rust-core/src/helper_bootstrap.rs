@@ -354,16 +354,22 @@ async fn launch_and_capture_handshake(
     let request_len = request_bytes.len();
 
     // relay_jwtがある場合は、リクエストJSONに続けて同じstdinから読み取り
-    // `$tmpdir/relay_jwt`へ保存する(0600、`umask 077`により保証)。`head -c`で
-    // それぞれの長さ分だけを切り出し、`wc -c`で切り詰められていないことを確認する
-    // (`isekai-bootstrap::openssh::launch_and_capture_handshake`と同じ手順、
-    // stdinが接続断で中断された場合に不完全なファイルのまま起動してしまうのを防ぐ)。
+    // `$tmpdir/relay_jwt`へ保存する(0600、`umask 077`により保証)。それぞれの
+    // 長さ分だけを`dd bs=1 count=N`で切り出し、`wc -c`で切り詰められていない
+    // ことを確認する(`isekai-bootstrap::openssh::launch_and_capture_handshake`
+    // と同じ手順・同じ理由——`head -c`ではなく`dd bs=1`を使うのは、macOSの
+    // `head -c`がパイプ入力に対して自身のstdioバッファ越しに読むため、要求した
+    // バイト数を超えて先読みし、直後に続く`relay_jwt`のバイト列を(headプロセス
+    // 終了時に破棄される内部バッファへ)飲み込んでしまうことがある、と実際の
+    // `test-macos`失敗で確認できたため。`dd bs=1`は必ず1バイトずつN回readする
+    // ので先読みが起きない。stdinが接続断で中断された場合に不完全なファイルの
+    // まま起動してしまうのを防ぐ)。
     let write_jwt_step = match &jwt_stdin {
         Some(jwt) => {
             let jwt_len = jwt.len();
             format!(
-                "head -c {jwt_len} > $tmpdir/relay_jwt && \
-                 [ \"$(wc -c < $tmpdir/relay_jwt)\" -eq {jwt_len} ] && "
+                "dd bs=1 count={jwt_len} > $tmpdir/relay_jwt 2>/dev/null && \
+                 [ \"$(wc -c < $tmpdir/relay_jwt | tr -d '[:space:]')\" -eq {jwt_len} ] && "
             )
         }
         None => String::new(),
@@ -379,12 +385,18 @@ async fn launch_and_capture_handshake(
     // ようにする(単なる`cat`の空出力だけでは原因が一切わからないため)。
     let launch_cmd = format!(
         "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
-         head -c {request_len} > $tmpdir/bootstrap-request.json && \
-         [ \"$(wc -c < $tmpdir/bootstrap-request.json)\" -eq {request_len} ] && \
+         dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && \
+         [ \"$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')\" -eq {request_len} ] && \
          {write_jwt_step}\
-         ( setsid {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} serve {bind_arg}{p2p_arg}\
-         --bootstrap-request-file $tmpdir/bootstrap-request.json --target {quoted_target} \
-         </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
+         if command -v setsid >/dev/null 2>&1; then \
+           ( setsid {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} serve {bind_arg}{p2p_arg}\
+           --bootstrap-request-file $tmpdir/bootstrap-request.json --target {quoted_target} \
+           </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
+         else \
+           ( ( trap '' HUP; exec {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} serve {bind_arg}{p2p_arg}\
+           --bootstrap-request-file $tmpdir/bootstrap-request.json --target {quoted_target} \
+           </dev/null >$tmpdir/handshake 2>$tmpdir/log ) & ); \
+         fi; \
          for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
            [ -s $tmpdir/handshake ] && break; \
            sleep {sleep_secs}; \

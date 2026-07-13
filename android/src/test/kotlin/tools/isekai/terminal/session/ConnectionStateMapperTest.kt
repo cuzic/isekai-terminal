@@ -45,7 +45,7 @@ class ConnectionStateMapperTest {
             screenUpdate = screenUpdate(),
             trzszState = TrzszUiState.WaitingUser("t1", "upload", null, null),
         )
-        val result = ConnectionStateMapper.apply(current, ConnectionPublicState.Disconnected("network lost"))
+        val result = ConnectionStateMapper.apply(current, ConnectionPublicState.Disconnected("network lost", null))
         assertEquals(false, result.connected)
         assertEquals(false, result.isConnecting)
         assertEquals(false, result.isReconnecting)
@@ -57,7 +57,7 @@ class ConnectionStateMapperTest {
 
     @Test
     fun `Disconnected with null reason uses a generic message`() {
-        val result = ConnectionStateMapper.apply(TerminalUiState(), ConnectionPublicState.Disconnected(null))
+        val result = ConnectionStateMapper.apply(TerminalUiState(), ConnectionPublicState.Disconnected(null, null))
         assertEquals("切断済み (不明)", result.statusMsg)
     }
 

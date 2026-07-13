@@ -42,6 +42,11 @@ struct AppRootView: View {
         // (前回設定した「tmux迂回control-plane」をRust側のプロセスグローバル状態へ
         // 起動直後に一度反映する)。
         CtlSocketForwardSettings.restore()
+        // 鍵レコード削除とVault blob削除が何らかの理由で不整合になった場合に残る
+        // 孤立blobを掃除する(ハウスキーピング、失敗しても起動は継続する)。
+        if let keyIds = try? AppServices.shared.db.fetchAllKeyEntries().map(\.id) {
+            try? AppServices.shared.vault.cleanupOrphanBlobs(knownKeyIds: Set(keyIds))
+        }
     }
 
     var body: some View {

@@ -55,6 +55,11 @@ pub enum RebindAction {
     PerformRebindToWifi,
     /// UI へ現在状態を公開せよ。
     PublishState(RebindPublicState),
+    /// #22: `QuietTrafficSource`の定期ポーリングを開始せよ(`WaitingQuietToReturn`に
+    /// 入った時)。`TrafficQuietDetected`/`TrafficBusyDetected`として結果が返ってくる。
+    StartQuietWatch,
+    /// 同、停止せよ(`WaitingQuietToReturn`を抜けた時。冪等 — 開始していなくても無害)。
+    StopQuietWatch,
 }
 
 /// UI(Compose/SwiftUI)へ公開する簡略化された状態。
@@ -238,6 +243,7 @@ impl RebindManager {
         self.phase = Phase::WaitingQuietToReturn;
         let mut actions = resp.actions;
         actions.push(RebindAction::PublishState(RebindPublicState::WaitingQuietToReturn));
+        actions.push(RebindAction::StartQuietWatch);
         let mut timers = resp.timers;
         timers.extend(
             Response::<RebindAction, RebindTimer>::consume()
@@ -261,6 +267,7 @@ impl RebindManager {
         Response::emit(vec![
             RebindAction::PerformRebindToWifi,
             RebindAction::PublishState(RebindPublicState::OnWifi),
+            RebindAction::StopQuietWatch,
         ])
         .with_kill_timer(RebindTimer::QuietWait)
         .with_kill_timer(RebindTimer::ProbeCadence)
@@ -284,7 +291,10 @@ impl RebindManager {
         self.reset_return_round();
         let backoff = self.current_backoff();
         self.advance_backoff_index();
-        Response::emit(vec![RebindAction::PublishState(RebindPublicState::FailedOverToCellular)])
+        Response::emit(vec![
+            RebindAction::PublishState(RebindPublicState::FailedOverToCellular),
+            RebindAction::StopQuietWatch,
+        ])
             .with_kill_timer(RebindTimer::QuietWait)
             .with_kill_timer(RebindTimer::ProbeCadence)
             .with_timer(RebindTimer::Backoff, backoff)
@@ -473,6 +483,7 @@ mod tests {
         // CellularMinDwellも満了 → ようやくWaitingQuietToReturnへ
         let r = m.on_timeout(RebindTimer::CellularMinDwell);
         assert!(has_action(&r, RebindAction::PublishState(RebindPublicState::WaitingQuietToReturn)));
+        assert!(has_action(&r, RebindAction::StartQuietWatch), "#22: WaitingQuietToReturnに入ったらQuietWatchを開始する");
         assert!(timer_set(&r, RebindTimer::QuietWait));
         assert_eq!(m.public_state(), RebindPublicState::WaitingQuietToReturn);
     }
@@ -485,6 +496,7 @@ mod tests {
         let r = m.on_event(RebindEvent::TrafficQuietDetected);
         assert!(has_action(&r, RebindAction::PerformRebindToWifi));
         assert!(has_action(&r, RebindAction::PublishState(RebindPublicState::OnWifi)));
+        assert!(has_action(&r, RebindAction::StopQuietWatch));
         assert!(timer_killed(&r, RebindTimer::QuietWait));
         assert!(timer_killed(&r, RebindTimer::ProbeCadence));
         assert_eq!(m.public_state(), RebindPublicState::OnWifi);
@@ -509,6 +521,7 @@ mod tests {
         let r = m.on_timeout(RebindTimer::QuietWait);
         assert!(!has_action(&r, RebindAction::PerformRebindToWifi), "静けさが来ないまま強制切替はしない");
         assert!(has_action(&r, RebindAction::PublishState(RebindPublicState::FailedOverToCellular)));
+        assert!(has_action(&r, RebindAction::StopQuietWatch));
         assert!(timer_set(&r, RebindTimer::Backoff));
         assert!(timer_killed(&r, RebindTimer::ProbeCadence));
         assert_eq!(m.public_state(), RebindPublicState::FailedOverToCellular);
@@ -521,6 +534,7 @@ mod tests {
 
         let r = m.on_event(RebindEvent::WifiProbeFailed);
         assert!(has_action(&r, RebindAction::PublishState(RebindPublicState::FailedOverToCellular)));
+        assert!(has_action(&r, RebindAction::StopQuietWatch));
         assert!(timer_set(&r, RebindTimer::Backoff));
         assert_eq!(m.public_state(), RebindPublicState::FailedOverToCellular);
     }

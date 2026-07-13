@@ -12,7 +12,12 @@ use std::time::Duration;
 use timed_fsm::{Response, TimedStateMachine, TimerCommand};
 
 use crate::rebind_manager::{RebindAction, RebindEvent, RebindManager, RebindPublicState, RebindTimer};
-use crate::rebind_ports::{BoundFd, PlatformFdSource, RebindExecutor, WifiProbeExecutor};
+use crate::rebind_ports::{BoundFd, PlatformFdSource, QuietTrafficSource, RebindExecutor, WifiProbeExecutor};
+
+/// #22: `QuietTrafficSource::is_quiet()`をポーリングする間隔。`TrafficStats`側の
+/// 最終送信からの最小アイドル時間(`QUIET_MIN_IDLE_SINCE_LAST_TX`、1秒)より
+/// 十分細かく、かつビジーループにならない粒度として1秒にしている。
+const QUIET_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// #19: `RebindManager`の状態変化をUI(Kotlin/Swift)へ伝えるcallback。
 /// `RebindAction::PublishState`をDriverが受け取るたびに呼ばれる。
@@ -64,6 +69,43 @@ enum FdKind {
     Cellular,
 }
 
+/// `RebindAction::StartQuietWatch`/`StopQuietWatch`を、`QuietTrafficSource`を
+/// 定期ポーリングするtokioタスクの起動/停止へ変換する。`RebindTimerRuntime`と
+/// 同じパターン(実行ループ本体をブロックしない、`stop`は冪等)。
+struct QuietWatchRuntime {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl QuietWatchRuntime {
+    fn new() -> Self {
+        QuietWatchRuntime { handle: None }
+    }
+
+    fn start<Q>(&mut self, quiet_source: Arc<Q>, input_tx: tokio::sync::mpsc::Sender<RebindEvent>)
+    where
+        Q: QuietTrafficSource + 'static,
+    {
+        self.stop();
+        self.handle = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(QUIET_POLL_INTERVAL);
+            loop {
+                interval.tick().await;
+                let event =
+                    if quiet_source.is_quiet() { RebindEvent::TrafficQuietDetected } else { RebindEvent::TrafficBusyDetected };
+                if input_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn stop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
+
 /// 呼び出し元(`orchestrator.rs`/`multipath_transport.rs`)がDriverへイベントを
 /// 送るためのハンドル。実行ループ自体は`spawn_rebind_driver`が所有するtokio
 /// タスクの中にある。
@@ -81,17 +123,19 @@ impl RebindDriverHandle {
 }
 
 /// `RebindManager`の実行ループを`tokio::spawn`し、外部からイベントを送れる
-/// ハンドルを返す。`F`/`W`/`R`は#10で定義したI/Oポート(trait)の実装。
-pub(crate) fn spawn_rebind_driver<F, W, R>(
+/// ハンドルを返す。`F`/`W`/`R`/`Q`は#10/#22で定義したI/Oポート(trait)の実装。
+pub(crate) fn spawn_rebind_driver<F, W, R, Q>(
     fd_source: Arc<F>,
     probe: Arc<W>,
     executor: Arc<R>,
+    quiet_source: Arc<Q>,
     observer: Arc<dyn RebindStateObserver>,
 ) -> RebindDriverHandle
 where
     F: PlatformFdSource + 'static,
     W: WifiProbeExecutor + 'static,
     R: RebindExecutor + 'static,
+    Q: QuietTrafficSource + 'static,
 {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<RebindEvent>(16);
     let (timeout_tx, mut timeout_rx) = tokio::sync::mpsc::channel::<RebindTimer>(8);
@@ -100,6 +144,7 @@ where
     tokio::spawn(async move {
         let mut manager = RebindManager::new();
         let mut timers = RebindTimerRuntime::new(timeout_tx);
+        let mut quiet_watch = QuietWatchRuntime::new();
         loop {
             let resp = tokio::select! {
                 maybe_event = input_rx.recv() => {
@@ -111,7 +156,17 @@ where
                     manager.on_timeout(timer_id)
                 }
             };
-            dispatch(&mut timers, resp, &fd_source, &probe, &executor, &observer, &loop_input_tx);
+            dispatch(
+                &mut timers,
+                &mut quiet_watch,
+                resp,
+                &fd_source,
+                &probe,
+                &executor,
+                &quiet_source,
+                &observer,
+                &loop_input_tx,
+            );
         }
     });
 
@@ -121,23 +176,32 @@ where
 /// `Response`のtimer commandsを`timers`へ即座に反映し、actionsはそれぞれ
 /// 個別のtokioタスクとして実行する(疎通確認/rebindの完了を待つ間、次の
 /// イベントの取りこぼしを防ぐため、`dispatch`自体はブロックしない)。
-fn dispatch<F, W, R>(
+fn dispatch<F, W, R, Q>(
     timers: &mut RebindTimerRuntime,
+    quiet_watch: &mut QuietWatchRuntime,
     resp: Response<RebindAction, RebindTimer>,
     fd_source: &Arc<F>,
     probe: &Arc<W>,
     executor: &Arc<R>,
+    quiet_source: &Arc<Q>,
     observer: &Arc<dyn RebindStateObserver>,
     input_tx: &tokio::sync::mpsc::Sender<RebindEvent>,
 ) where
     F: PlatformFdSource + 'static,
     W: WifiProbeExecutor + 'static,
     R: RebindExecutor + 'static,
+    Q: QuietTrafficSource + 'static,
 {
     timers.apply(&resp.timers);
     for action in resp.actions {
         match action {
             RebindAction::PublishState(state) => observer.on_state_changed(state),
+            RebindAction::StartQuietWatch => {
+                quiet_watch.start(quiet_source.clone(), input_tx.clone());
+            }
+            RebindAction::StopQuietWatch => {
+                quiet_watch.stop();
+            }
             RebindAction::PerformRebindToCellular => {
                 spawn_acquire_and_rebind(fd_source.clone(), executor.clone(), FdKind::Cellular);
             }
@@ -268,6 +332,22 @@ mod tests {
         }
     }
 
+    struct FakeQuietTrafficSource {
+        quiet: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeQuietTrafficSource {
+        fn new(quiet: bool) -> Self {
+            FakeQuietTrafficSource { quiet: std::sync::atomic::AtomicBool::new(quiet) }
+        }
+    }
+
+    impl QuietTrafficSource for FakeQuietTrafficSource {
+        fn is_quiet(&self) -> bool {
+            self.quiet.load(Ordering::SeqCst)
+        }
+    }
+
     /// `cond()`が真になるまで短い間隔でポーリングする(実I/O(fake含む)は
     /// 一瞬で終わるはずなので、上限は寛容だが待ち時間自体は短く保つ)。
     async fn wait_until(mut cond: impl FnMut() -> bool) {
@@ -287,7 +367,8 @@ mod tests {
         let executor = Arc::new(FakeExecutor::default());
         let observer = Arc::new(RecordingObserver::default());
 
-        let handle = spawn_rebind_driver(fd_source.clone(), probe.clone(), executor.clone(), observer.clone());
+        let quiet_source = Arc::new(FakeQuietTrafficSource::new(true));
+        let handle = spawn_rebind_driver(fd_source.clone(), probe.clone(), executor.clone(), quiet_source, observer.clone());
         handle.send_event(RebindEvent::NoViablePath);
 
         wait_until(|| !executor.rebinds.lock().unwrap().is_empty()).await;
@@ -302,7 +383,8 @@ mod tests {
         let executor = Arc::new(FakeExecutor::default());
         let observer = Arc::new(RecordingObserver::default());
 
-        let handle = spawn_rebind_driver(fd_source.clone(), probe.clone(), executor.clone(), observer.clone());
+        let quiet_source = Arc::new(FakeQuietTrafficSource::new(true));
+        let handle = spawn_rebind_driver(fd_source.clone(), probe.clone(), executor.clone(), quiet_source, observer.clone());
         handle.send_event(RebindEvent::NoViablePath);
         wait_until(|| !executor.rebinds.lock().unwrap().is_empty()).await;
         executor.rebinds.lock().unwrap().clear();
@@ -323,7 +405,8 @@ mod tests {
         let executor = Arc::new(FakeExecutor::default());
         let observer = Arc::new(RecordingObserver::default());
 
-        let handle = spawn_rebind_driver(fd_source.clone(), probe.clone(), executor.clone(), observer.clone());
+        let quiet_source = Arc::new(FakeQuietTrafficSource::new(true));
+        let handle = spawn_rebind_driver(fd_source.clone(), probe.clone(), executor.clone(), quiet_source, observer.clone());
         handle.send_event(RebindEvent::NoViablePath);
 
         // セルラーへのフェイルオーバーはfd取得に成功するので実行される。
@@ -350,7 +433,8 @@ mod tests {
         let executor = Arc::new(FakeExecutor::default());
         let observer = Arc::new(RecordingObserver::default());
 
-        let handle = spawn_rebind_driver(fd_source, probe, executor.clone(), observer.clone());
+        let quiet_source = Arc::new(FakeQuietTrafficSource::new(true));
+        let handle = spawn_rebind_driver(fd_source, probe, executor.clone(), quiet_source, observer.clone());
         handle.send_event(RebindEvent::NoViablePath);
 
         // PublishStateだけは同期的に発火するはずなので、それが届くまで待てば
@@ -358,5 +442,62 @@ mod tests {
         wait_until(|| observer.states.lock().unwrap().contains(&RebindPublicState::FailedOverToCellular)).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(executor.rebinds.lock().unwrap().is_empty(), "fdが取れないrebindは実行されないはず");
+    }
+
+    // ── #22: QuietWatchRuntime ──────────────────────────────
+    //
+    // `RebindManager`(rebind_manager.rs)自体は`WaitingQuietToReturn`が現実の
+    // dwell/stability タイマー(60秒+15秒)を経ないと到達できないため、
+    // `spawn_rebind_driver`をend-to-endで動かして検証するのは非現実的。
+    // ここでは`StartQuietWatch`/`StopQuietWatch`が実際にポーリングタスクの
+    // 起動/停止へ変換されることを`QuietWatchRuntime`単体で検証する。
+
+    #[tokio::test]
+    async fn quiet_watch_reports_quiet_and_busy_from_source() {
+        let quiet_source = Arc::new(FakeQuietTrafficSource::new(true));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut watch = QuietWatchRuntime::new();
+
+        watch.start(quiet_source.clone(), tx);
+        assert_eq!(rx.recv().await, Some(RebindEvent::TrafficQuietDetected));
+
+        quiet_source.quiet.store(false, Ordering::SeqCst);
+        wait_until(|| matches!(rx.try_recv(), Ok(RebindEvent::TrafficBusyDetected))).await;
+
+        watch.stop();
+    }
+
+    #[tokio::test]
+    async fn quiet_watch_stop_halts_further_polling() {
+        let quiet_source = Arc::new(FakeQuietTrafficSource::new(true));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut watch = QuietWatchRuntime::new();
+
+        watch.start(quiet_source.clone(), tx);
+        assert_eq!(rx.recv().await, Some(RebindEvent::TrafficQuietDetected));
+        watch.stop();
+
+        // stop後は少し待ってもそれ以上イベントが来ないはず(タスクがabortされている)。
+        tokio::time::sleep(QUIET_POLL_INTERVAL + Duration::from_millis(200)).await;
+        assert!(rx.try_recv().is_err(), "stop後もポーリングタスクが生き残っている");
+    }
+
+    #[tokio::test]
+    async fn quiet_watch_start_restarts_previous_watch() {
+        // 2回目の`start`が前回のポーリングタスクを確実に止めることを確認する
+        // (`RebindTimerRuntime::set`が`kill`してから再設定するのと同じ規約)。
+        let quiet_source = Arc::new(FakeQuietTrafficSource::new(true));
+        let (tx1, mut rx1) = tokio::sync::mpsc::channel(4);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(4);
+        let mut watch = QuietWatchRuntime::new();
+
+        watch.start(quiet_source.clone(), tx1);
+        assert_eq!(rx1.recv().await, Some(RebindEvent::TrafficQuietDetected));
+
+        watch.start(quiet_source.clone(), tx2);
+        assert_eq!(rx2.recv().await, Some(RebindEvent::TrafficQuietDetected));
+
+        tokio::time::sleep(QUIET_POLL_INTERVAL + Duration::from_millis(200)).await;
+        assert!(rx1.try_recv().is_err(), "古いchannelへはもう送られないはず");
     }
 }

@@ -20,14 +20,20 @@
 //!    why `isekai-ssh`'s long-lived-helper model needs it, unlike
 //!    `helper_bootstrap.rs`'s intentionally-fresh-every-session Android
 //!    path).
-//! 2. Otherwise: `sha256sum` the existing binary (if any, shared across every
-//!    topology) and skip re-uploading when it already matches the expected
-//!    digest; `base64 -d > ...tmp && chmod 0700 ... && mv ...` otherwise,
-//!    with the base64-encoded binary written to the ssh subprocess's stdin.
-//! 3. Launches `isekai-helper` detached (`setsid`, stdin from `/dev/null`,
-//!    wrapped in a subshell so the ssh exec channel's direct child exits
-//!    immediately — see the comment in `helper_bootstrap.rs` for why that
-//!    matters) and polls a handshake file until it's non-empty, then `cat`s
+//! 2. Otherwise: `sha256sum` (falling back to `shasum -a 256` on macOS
+//!    remotes, which don't ship GNU coreutils) the existing binary (if any,
+//!    shared across every topology) and skip re-uploading when it already
+//!    matches the expected digest; `base64 -d > ...tmp && chmod 0700 ... &&
+//!    mv ...` otherwise, with the base64-encoded binary written to the ssh
+//!    subprocess's stdin.
+//! 3. Launches `isekai-helper` detached (`setsid` where available — macOS
+//!    remotes don't ship a `setsid(1)` binary, so `install_and_launch` falls
+//!    back to `trap '' HUP` + `exec` in that case, which is sufficient since
+//!    the ssh exec channel never allocates a controlling tty in the first
+//!    place; stdin from `/dev/null`, wrapped in a subshell so the ssh exec
+//!    channel's direct child exits immediately — see the comment in
+//!    `helper_bootstrap.rs` for why that matters) and polls a handshake file
+//!    until it's non-empty, then `cat`s
 //!    it back over the same exec channel — and, on success, records
 //!    `{pid, fingerprint, handshake}` to the state file for a future
 //!    invocation to find.
@@ -378,15 +384,32 @@ impl OpenSshBackend {
         // stdin, immediately followed by `relay_jwt` (if any) and then the
         // base64-encoded binary — all length-prefixed (the lengths
         // themselves aren't secret, so they're safe to interpolate into the
-        // command string) and split with `head -c` (not `dd bs=1`, which
-        // reads one byte per syscall and would be needlessly slow for a
-        // multi-MB binary). The request/jwt byte counts are verified with
-        // `wc -c` before anything else runs, so a truncated stdin (e.g. the
-        // ssh connection dropping mid-write) fails closed instead of
-        // launching `isekai-pipe serve` against a partially-written file.
+        // command string). The request/jwt pieces are split off with
+        // `dd bs=1 count=N` rather than `head -c N`: confirmed via a real
+        // `test-macos` CI failure that macOS's `head -c` (unlike GNU's) reads
+        // through its own stdio buffer when the input is a pipe, so it can
+        // silently consume *more* than the requested N bytes from stdin —
+        // swallowing the immediately-following `relay_jwt` bytes into a
+        // buffer that's discarded once `head` exits, leaving the next read
+        // with 0 bytes. `dd bs=1` always issues exactly N single-byte reads,
+        // so it can never over-consume; this only matters for these two
+        // small, bounded-size pieces with more stdin data after them — the
+        // final (and only large, multi-MB) piece, the base64-encoded binary,
+        // is still read with `head -c`/`base64 -d` directly since being the
+        // last thing on stdin, over-reading there has no observable effect.
+        // The request/jwt byte counts are verified with `wc -c` (piped
+        // through `tr -d '[:space:]'` first — macOS's `wc -c` right-justifies
+        // its count with leading spaces even for a single stdin stream, e.g.
+        // `     136`, which made the `-eq` comparison itself unreliable
+        // there too, independently of the `head`-over-read issue above) so a
+        // truncated stdin (e.g. the ssh connection dropping mid-write) fails
+        // closed instead of launching `isekai-pipe serve` against a
+        // partially-written file.
         let jwt_len = jwt_bytes.len();
         let read_jwt_step = if jwt_len > 0 {
-            format!("head -c {jwt_len} > $tmpdir/relay_jwt && [ \"$(wc -c < $tmpdir/relay_jwt)\" -eq {jwt_len} ] && ")
+            format!(
+                "dd bs=1 count={jwt_len} > $tmpdir/relay_jwt 2>/dev/null && [ \"$(wc -c < $tmpdir/relay_jwt | tr -d '[:space:]')\" -eq {jwt_len} ] && "
+            )
         } else {
             String::new()
         };
@@ -421,14 +444,27 @@ mkdir -p {remote_dir} 2>/dev/null
 exec 9>>{lock_path} 2>/dev/null
 if command -v flock >/dev/null 2>&1; then flock -w 30 9 2>/dev/null || true; fi
 tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
-if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdir/bootstrap-request.json)" -eq {request_len} ] && {read_jwt_step}true; then
+if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [ "$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')" -eq {request_len} ] && {read_jwt_step}true; then
   reuse_envelope=""
   if [ -f {state_path} ]; then
     existing_pid=$(sed -n '1p' {state_path} | cut -d' ' -f1)
     existing_fp=$(sed -n '1p' {state_path} | cut -d' ' -f2)
     if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
-      existing_exe=$(readlink -f /proc/$existing_pid/exe 2>/dev/null)
-      expected_exe=$(readlink -f {remote_binary_path} 2>/dev/null)
+      # `/proc/<pid>/exe` doesn't exist on macOS remotes (no /proc at all) —
+      # skip this extra identity check there and trust `kill -0` + fingerprint
+      # match alone (confirmed via a real `test-macos` CI failure: without
+      # this `-d /proc` guard, `existing_exe` was always empty on macOS, so
+      # the still-alive helper was never reused, defeating the whole point
+      # of this reuse path there). Safe to skip: per the comment below,
+      # `existing_fp` already pins this state file to this exact fingerprint,
+      # so this check was already "defense-in-depth, not a decision point".
+      if [ -d /proc ]; then
+        existing_exe=$(readlink -f /proc/$existing_pid/exe 2>/dev/null)
+        expected_exe=$(readlink -f {remote_binary_path} 2>/dev/null)
+      else
+        existing_exe=ok
+        expected_exe=ok
+      fi
       # `existing_fp` should always equal `{fingerprint}` here (the file
       # itself is fingerprint-scoped) — kept as a cheap defense-in-depth
       # sanity check, not a decision point: this bootstrap never touches a
@@ -444,9 +480,13 @@ if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdi
     printf '%s\n' "$reuse_envelope"
   else
     need_upload=1
-    if command -v sha256sum >/dev/null 2>&1 && [ -x {remote_binary_path} ]; then
-      current_sha=$(sha256sum {remote_binary_path} 2>/dev/null | cut -d' ' -f1)
-      [ "$current_sha" = "{expected_sha256}" ] && need_upload=0
+    if [ -x {remote_binary_path} ]; then
+      if command -v sha256sum >/dev/null 2>&1; then
+        current_sha=$(sha256sum {remote_binary_path} 2>/dev/null | cut -d' ' -f1)
+      elif command -v shasum >/dev/null 2>&1; then
+        current_sha=$(shasum -a 256 {remote_binary_path} 2>/dev/null | cut -d' ' -f1)
+      fi
+      [ -n "$current_sha" ] && [ "$current_sha" = "{expected_sha256}" ] && need_upload=0
     fi
     upload_ok=1
     if [ "$need_upload" -eq 1 ]; then
@@ -457,7 +497,11 @@ if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdi
     if [ "$upload_ok" -eq 0 ]; then
       echo {upload_failed_marker}
     else
-      ( setsid {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- & echo $! > {pid_path} )
+      if command -v setsid >/dev/null 2>&1; then
+        ( setsid {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- & echo $! > {pid_path} )
+      else
+        ( ( trap '' HUP; exec {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- ) & echo $! > {pid_path} )
+      fi
       for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do
         [ -s $tmpdir/handshake ] && break
         sleep {sleep_secs}

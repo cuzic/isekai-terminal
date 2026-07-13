@@ -359,6 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn connects_and_exchanges_data_under_loss_and_latency() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let (server, cert_der) = server_endpoint();
         let server_addr = server.local_addr().unwrap();
 
@@ -397,6 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebind_to_new_faulty_socket_survives_as_network_switch() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         // noq 自身のテストスイートと同じ手法で、クライアント側エンドポイントを
         // 新しいローカルソケットに rebind する。noq-proto から見るとローカル
         // アドレスの変化であり、実機で Wi-Fi → 5G/Tailscale に切り替わった
@@ -474,6 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn cut_causes_connection_to_stall_then_recover_after_restore() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let (server, cert_der) = server_endpoint();
         let server_addr = server.local_addr().unwrap();
 

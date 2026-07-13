@@ -19,8 +19,15 @@ public final class TerminalUIState: ObservableObject {
     public enum State: Equatable {
         case connecting
         case connected
-        case disconnected(reason: String?)
+        /// `issueHint`はRust側(`SessionOrchestrator`)が判定した、切断理由の
+        /// ヒューリスティックなヒント(`rust-ssot.md`: 判断はRust側、Swiftは
+        /// 届いた値に応じて案内UIを出すだけ)。`nil`なら特に案内すべき理由がない。
+        case disconnected(reason: String?, issueHint: ConnectionIssueHint? = nil)
         case failed(message: String)
+        /// 一度`Connected`になったセッションが予期せず切断され、Rust側の自動
+        /// reconnectループが再接続を試みている間の状態(Android版`isReconnecting`
+        /// 相当)。`elapsedSecs`/`timeoutSecs`はRust側がライブ通知するSSOT値。
+        case reconnecting(elapsedSecs: UInt32, timeoutSecs: UInt32, reason: String?)
     }
 
     @Published public internal(set) var state: State = .connecting
@@ -409,6 +416,35 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         orchestrator.disconnect()
     }
 
+    /// `.reconnecting`中に「中止」操作から呼ぶ。Rust側の自動reconnectループを
+    /// 停止する(Android版`actions.onCancelReconnect()`と同じ、`cancelReconnect()`
+    /// 自体の要否判断はRust側が行う)。
+    public func cancelReconnect() {
+        orchestrator.cancelReconnect()
+    }
+
+    // MARK: - #20: バックグラウンド/フォアグラウンド遷移
+    //
+    // 生イベントをそのままRust側`SessionOrchestrator`へ転送するだけの薄いラッパー。
+    // 「猶予内復帰か再接続が必要か」の判断はRust側が行う(`rust-ssot.md`) —
+    // このクラス自身は分岐を持たない。呼び出し元は`TerminalTabsModel`。
+
+    public func notifyDidEnterBackground(budgetMs: UInt32) {
+        orchestrator.notifyDidEnterBackground(budgetMs: budgetMs)
+    }
+
+    public func notifyBackgroundBudgetExpired() {
+        orchestrator.notifyBackgroundBudgetExpired()
+    }
+
+    public func notifyMemoryWarning() {
+        orchestrator.notifyMemoryWarning()
+    }
+
+    public func notifyWillEnterForeground() {
+        orchestrator.notifyWillEnterForeground()
+    }
+
     /// Phase 1C(#14): バックグラウンドからの復帰時や「再接続」ボタンから呼ぶ。
     /// 接続中/接続済みの間は二重接続を避けるため無視する(background/foreground
     /// 通知と手動ボタンの両方から呼ばれ得るため)。`connect()`と同じ
@@ -417,7 +453,9 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     @MainActor
     public func reconnect() {
         switch uiState.state {
-        case .connecting, .connected:
+        case .connecting, .connected, .reconnecting:
+            // .reconnecting中はRust側の自動reconnectループが既に動作中なので、
+            // 手動での二重接続は行わない(中止したい場合はcancelReconnect()を使う)。
             return
         case .disconnected, .failed:
             uiState.state = .connecting
@@ -541,10 +579,14 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             Task { @MainActor in self.uiState.state = .connecting }
         case .connected:
             Task { @MainActor in self.uiState.state = .connected }
-        case .disconnected(let reason):
-            Task { @MainActor in self.uiState.state = .disconnected(reason: reason) }
+        case .disconnected(let reason, let issueHint):
+            Task { @MainActor in self.uiState.state = .disconnected(reason: reason, issueHint: issueHint) }
         case .error(let message):
             fail(message: message)
+        case .reconnecting(let elapsedSecs, let timeoutSecs, let reason):
+            Task { @MainActor in
+                self.uiState.state = .reconnecting(elapsedSecs: elapsedSecs, timeoutSecs: timeoutSecs, reason: reason)
+            }
         }
     }
 

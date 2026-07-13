@@ -452,6 +452,20 @@ enum BootstrapFailure {
     `rust-core-netlab-check.yml`が別途カバー)。ローカルで`cargo test --workspace --exclude
     noq-multipath-spike`を実行し55件全testsuiteがgreenであることを確認済み(所要時間
     合計約200秒)。
+  - **macOS/Windows CI追加、完了(2026-07-13)**: 上記は`ubuntu-24.04`のみだった。
+    isekai-ssh/isekai-pipeは公式にmacOS対応(`release-build.yml`が
+    x86_64/aarch64-apple-darwin向けにビルド)だが、実際のtest suiteをmacOSランナー
+    上で実行するCIが無く、macOS固有のバグはリリースタグ時の`--version`スモーク
+    テストまで発見されない状態だった。`rust-core-test-check.yml`に`test-macos`
+    job(`macos-26`、CLI/shared crateのみ、`isekai-terminal-core`/`uniffi-bindgen`は
+    Android/iOS専用ビルド前提が別なので除外)を追加した。Windowsは
+    `rust-core/isekai-ssh/README.md`で明記の通り公式サポート対象外のままだが、
+    `test-windows` job(`windows-latest`)で`cargo build`によるビルド回帰検出と
+    `cargo test --lib --bins`によるunit testのみ(Unix専用プロセス起動に依存する
+    e2e統合テストは意図的に対象外)を追加し、release-build.ymlのタグ時ビルドより
+    前にpush/PR時点で壊れを検出できるようにした。あわせて、isekai-pipeが依存する
+    `isekai-netmon`(Windows/macOS向けの実装を持つがworkspace membersから漏れており
+    どのCIでも一度もテストされていなかった)をworkspace membersに追加した。
 - Epic G/H/I/Kが自身のE2Eを追加する際は、このharnessのパターン(実sshd、`#@isekai
   remote-path`で`$HOME`非依存に保つ)を再利用できる。
 - staging環境(実STUN・実relay・異なるネットワーク・symmetric NAT相当・relay fallback・token

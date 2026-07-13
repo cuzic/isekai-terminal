@@ -448,7 +448,14 @@ mod tests {
         assert_eq!(promoted.helper_committed_offset.get(), 100);
     }
 
+    // Windows-only: confirmed on a real `test-windows` CI run that binding to
+    // a bogus interface index doesn't fail eagerly there (see
+    // `physical_interface::tests::bogus_interface_index_fails_rather_than_panicking`'s
+    // comment) — `ensure_warm` still fails overall, just later and as a QUIC
+    // idle-timeout `TransportError::Mux(TransportLost { .. })` once the
+    // handshake can't actually route, not as an immediate `MuxError::Bind`.
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn ensure_warm_fails_on_a_bogus_interface_rather_than_silently_falling_back() {
         let target = RelayTarget {
             helper_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),

@@ -12,7 +12,6 @@ pub(crate) mod session_state;
 pub(crate) mod session;
 pub(crate) mod net_health_policy;
 pub mod orchestrator;
-pub mod session_supervisor;
 pub(crate) mod helper_bootstrap;
 pub mod isekai_pipe_quic_transport;
 pub mod multipath_transport;
@@ -30,7 +29,6 @@ pub(crate) mod android_quic_endpoint;
 
 pub use quic_transport::QuicConfig;
 pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};
-pub use session_supervisor::{create_session_supervisor, ExecutionMode, SessionState, SessionSupervisor};
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -643,9 +641,21 @@ pub struct PlatformFd {
     pub local_ip: String,
 }
 
+/// #19: 接続失敗の原因をユーザーが自己解決しやすくするための追加ヒント。
+/// 判断材料(接続先アドレスの種別等)はRust側(`orchestrator.rs`)に閉じており、
+/// Kotlin/Swiftは届いたヒントに応じた案内UIを出すだけでよい(`rust-ssot.md`)。
+/// あくまでヒューリスティックなヒントであり、他の理由でも同じ判定になり得る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ConnectionIssueHint {
+    /// 接続先がプライベート/リンクローカルアドレス(ローカルLAN上のホスト)で、
+    /// 一度もConnectedに至らないまま切断された。iOSのLocal Network Privacyが
+    /// 拒否されていると、こうした接続がサイレントに失敗し続ける。
+    LocalNetworkPermissionPossiblyDenied,
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum ConnectionPublicState {
-    Disconnected { reason: Option<String> },
+    Disconnected { reason: Option<String>, issue_hint: Option<ConnectionIssueHint> },
     Connecting,
     Connected { host: String },
     Error { message: String },

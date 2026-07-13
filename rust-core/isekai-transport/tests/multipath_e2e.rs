@@ -38,9 +38,13 @@ fn generate_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>, Str
 /// Bound to the IPv4 wildcard address (not just `127.0.0.1`, unlike
 /// `relay_e2e.rs`'s `mock_helper_server`) so it also receives datagrams
 /// addressed to `127.0.0.2` — the secondary path's source/destination in
-/// this test (loopback's whole `127.0.0.0/8` range is routed to `lo`
-/// without needing an explicit second address assignment, the same
-/// assumption `quicsock-noq`'s own tests make).
+/// this test. Linux routes the whole `127.0.0.0/8` range to `lo`
+/// unconditionally (the same assumption `quicsock-noq`'s own tests make),
+/// but macOS only assigns `127.0.0.1` to `lo0` by default — confirmed via a
+/// real `test-macos` CI failure (the secondary path never validated,
+/// timing out) that this test needs `127.0.0.2` explicitly aliased there
+/// first (`sudo ifconfig lo0 alias 127.0.0.2 up`, done in
+/// `.github/workflows/rust-core-test-check.yml`'s `test-macos` job).
 fn mock_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs8KeyDer<'static>) -> noq::Endpoint {
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
