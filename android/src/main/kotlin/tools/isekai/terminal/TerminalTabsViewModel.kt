@@ -320,9 +320,9 @@ class TerminalTabsViewModel(
 
     // ── ネットワーク（全タブへファンアウト）───────────────────────────
 
-    /** internal にすることでテストから直接呼べる。 */
+    /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
     internal fun onNetworkPathChanged(isSatisfied: Boolean) {
-        _tabs.value.forEach { it.session.notifyNetworkPathChanged(isSatisfied) }
+        _tabs.value.flatMap { it.panes }.forEach { it.session.notifyNetworkPathChanged(isSatisfied) }
     }
 
     // ── タブのライフサイクル ────────────────────────────────────────
@@ -463,6 +463,9 @@ class TerminalTabsViewModel(
 
         target.openSplit(pane, direction)
         watchPane(target, pane)
+        // 「分割時は全ペインに同じテーマを適用する」原則(TabState.currentThemeのコメント参照)
+        // に合わせ、移動してきたペインにも移動先タブのテーマを揃える。
+        pushThemeToSession(pane, target.currentTheme.value)
         updateSessionsSummary()
         return true
     }

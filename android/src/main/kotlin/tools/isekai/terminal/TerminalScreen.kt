@@ -175,13 +175,15 @@ fun TerminalScreenBody(
         }
     }
 
-    // SSH agent forwarding: 署名要求ごとの確認ダイアログ
-    uiState.agentSignRequestFingerprint?.let { fingerprint ->
-        AgentSignConfirmDialog(
-            fingerprint = fingerprint,
-            onApprove = { actions.onRespondAgentSignRequest(true) },
-            onReject = { actions.onRespondAgentSignRequest(false) },
-        )
+    // SSH agent forwarding: 署名要求ごとの確認ダイアログ（非アクティブ、またはフォーカス外のペインでは表示しない）
+    if (isActive && hasFocus) {
+        uiState.agentSignRequestFingerprint?.let { fingerprint ->
+            AgentSignConfirmDialog(
+                fingerprint = fingerprint,
+                onApprove = { actions.onRespondAgentSignRequest(true) },
+                onReject = { actions.onRespondAgentSignRequest(false) },
+            )
+        }
     }
 
     // trzsz file transfer

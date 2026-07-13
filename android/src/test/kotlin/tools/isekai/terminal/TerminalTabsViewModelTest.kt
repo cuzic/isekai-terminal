@@ -157,6 +157,27 @@ class TerminalTabsViewModelTest {
 
         assertFalse("tab a should not be disconnected on recovery", orchestrators[0].disconnectCalled)
         assertFalse("tab b should not be disconnected on recovery", orchestrators[1].disconnectCalled)
+        assertTrue("tab a should still receive the available notification", orchestrators[0].notifyNetworkPathChangedCalls.contains(true))
+        assertTrue("tab b should still receive the available notification", orchestrators[1].notifyNetworkPathChangedCalls.contains(true))
+    }
+
+    @Test
+    fun onNetworkPathChanged_alsoFansOutToSplitPane() = runBlocking {
+        val tabId = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected("host-a")
+
+        vm.splitPane(tabId, SplitDirection.VERTICAL, "pass")
+        awaitConnectCalled(orchestrators[1])
+        orchestrators[1].simulateConnected("host-a-split")
+
+        executor.simulateNetworkLost()
+        assertTrue("primary pane should be disconnected on network loss", orchestrators[0].disconnectCalled)
+        assertTrue("split pane should be disconnected on network loss", orchestrators[1].disconnectCalled)
+
+        executor.simulateNetworkAvailable()
+        assertTrue("primary pane should receive the available notification", orchestrators[0].notifyNetworkPathChangedCalls.contains(true))
+        assertTrue("split pane should receive the available notification", orchestrators[1].notifyNetworkPathChangedCalls.contains(true))
     }
 
     // ── 最後のタブを閉じた時のみ FGS 停止 ────────────────────────────────
@@ -542,6 +563,28 @@ class TerminalTabsViewModelTest {
         assertTrue(tab(id).isThemeOverridden)
         assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD, tab(id).currentTheme.value)
         assertEquals(callsBefore + 1, orchestrators[0].setSessionThemeCalls.size)
+    }
+
+    @Test
+    fun splitPaneWithExistingTab_pushesTargetTabThemeToMovedPane() = runBlocking {
+        val targetId = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        awaitSetSessionThemeCalled(orchestrators[0])
+        vm.setTabTheme(targetId, tools.isekai.terminal.ui.TerminalThemes.NORD)
+
+        val sourceId = vm.openTab(profile("b"), "pass")
+        awaitConnectCalled(orchestrators[1])
+        awaitSetSessionThemeCalled(orchestrators[1])
+        val callsBefore = orchestrators[1].setSessionThemeCalls.size
+
+        val moved = vm.splitPaneWithExistingTab(targetId, SplitDirection.VERTICAL, sourceId)
+
+        assertTrue(moved)
+        assertEquals(callsBefore + 1, orchestrators[1].setSessionThemeCalls.size)
+        val (ansi16, fg, bg) = orchestrators[1].setSessionThemeCalls.last()
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD.ansi16Argb(), ansi16)
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD.foregroundArgb(), fg)
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD.backgroundArgb(), bg)
     }
 
     @Test

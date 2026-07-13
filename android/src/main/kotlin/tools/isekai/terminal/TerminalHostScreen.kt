@@ -163,6 +163,9 @@ private fun TabLabel(
     val splitPane by tab.splitPane.collectAsStateWithLifecycle()
     var showThemeDialog by remember { mutableStateOf(false) }
     var showSplitDialog by remember { mutableStateOf(false) }
+    // splitPaneの「新規接続（同じプロファイル）」がパスワード認証プロファイルの場合、
+    // SplitPaneDialogを閉じてこちらのpending方向を使ってPasswordDialogを表示する。
+    var pendingSplitNewDirection by remember { mutableStateOf<SplitDirection?>(null) }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
@@ -217,8 +220,15 @@ private fun TabLabel(
         SplitPaneDialog(
             otherTabs = otherTabs,
             onSplitNew = { direction ->
-                tabsVm.splitPane(tab.tabId, direction)
                 showSplitDialog = false
+                val profile = tab.profile
+                val needsPasswordPrompt = profile != null &&
+                    (profile.authType == "password" || (profile.usesJumpHost && profile.jumpAuthType == "password"))
+                if (needsPasswordPrompt) {
+                    pendingSplitNewDirection = direction
+                } else {
+                    tabsVm.splitPane(tab.tabId, direction)
+                }
             },
             onSplitExisting = { direction, sourceTabId ->
                 tabsVm.splitPaneWithExistingTab(tab.tabId, direction, sourceTabId)
@@ -226,6 +236,24 @@ private fun TabLabel(
             },
             onDismiss = { showSplitDialog = false },
         )
+    }
+
+    pendingSplitNewDirection?.let { direction ->
+        val profile = tab.profile
+        if (profile == null) {
+            pendingSplitNewDirection = null
+        } else {
+            PasswordDialog(
+                label = profile.label,
+                showMainField = profile.authType == "password",
+                jumpLabel = if (profile.usesJumpHost && profile.jumpAuthType == "password") profile.jumpHost else null,
+                onDismiss = { pendingSplitNewDirection = null },
+                onConfirm = { password, jumpPassword ->
+                    tabsVm.splitPane(tab.tabId, direction, password, jumpPassword)
+                    pendingSplitNewDirection = null
+                },
+            )
+        }
     }
 }
 
