@@ -422,12 +422,15 @@ impl OpenSshBackend {
         // helper process never releases, found via a real hang in this
         // module's own e2e tests before this fix.
         let cmd = format!(
-            r#"set -x
-umask 077
+            r#"umask 077
 mkdir -p {remote_dir} 2>/dev/null
 exec 9>>{lock_path} 2>/dev/null
 if command -v flock >/dev/null 2>&1; then flock -w 30 9 2>/dev/null || true; fi
 tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
+echo "DBG_TMPDIR=[$tmpdir]"
+head -c {request_len} > $tmpdir/bootstrap-request.json
+echo "DBG_HEAD1_RC=[$?]_WC=[$(wc -c < $tmpdir/bootstrap-request.json 2>&1)]"
+{read_jwt_step}echo "DBG_JWT_STEP_DONE"
 if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdir/bootstrap-request.json)" -eq {request_len} ] && {read_jwt_step}true; then
   reuse_envelope=""
   if [ -f {state_path} ]; then

@@ -1779,9 +1779,21 @@ mod bind_port_range_tests {
 
     #[test]
     fn bind_udp_socket_skips_an_already_bound_port_within_the_range() {
+        // A window of just `held_port..=held_port+1` is too narrow to be
+        // reliable under concurrent test execution: Windows's ephemeral port
+        // allocator hands out ports sequentially (unlike Linux's more
+        // randomized selection), so with many tests binding ephemeral ports
+        // concurrently in the same process, `held_port + 1` is itself
+        // frequently already taken by some unrelated concurrent bind,
+        // failing this test for a reason unrelated to what it's actually
+        // testing (found via a real `test-windows` CI failure). A wider
+        // window keeps the same intent (assert the returned port isn't the
+        // one we're holding) while giving `bind_udp_socket` many more chances
+        // to find a free port despite that noise.
         let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let held_port = held.local_addr().unwrap().port();
-        let socket = bind_udp_socket("127.0.0.1:0".parse().unwrap(), Some((held_port, held_port + 1))).unwrap();
+        let socket =
+            bind_udp_socket("127.0.0.1:0".parse().unwrap(), Some((held_port, held_port.saturating_add(31)))).unwrap();
         assert_ne!(socket.local_addr().unwrap().port(), held_port);
     }
 }
