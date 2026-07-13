@@ -261,6 +261,9 @@ fn map_fs_guard_err(path: &Path, err: isekai_fs_guard::FsGuardError) -> AuthErro
         FsGuardError::Stat(source) => AuthError::Stat { path: path.to_path_buf(), source },
         FsGuardError::SetPermissions(source) => AuthError::Write { path: path.to_path_buf(), source },
         FsGuardError::WorldWritable { mode } => AuthError::WorldWritable { path: path.to_path_buf(), mode },
+        FsGuardError::InsecureAcl { principal, rights } => {
+            AuthError::InsecureAcl { path: path.to_path_buf(), principal, rights }
+        }
     }
 }
 

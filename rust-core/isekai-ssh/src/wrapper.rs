@@ -1485,8 +1485,8 @@ fn config_roots(plan: &WrapperPlan) -> Vec<PathBuf> {
         }
     }
     if roots.is_empty() {
-        if let Some(home) = std::env::var_os("HOME") {
-            roots.push(PathBuf::from(home).join(".ssh").join("config"));
+        if let Some(home) = isekai_fs_guard::resolve_home_dir() {
+            roots.push(home.join(".ssh").join("config"));
         }
     }
     roots
@@ -1595,12 +1595,10 @@ fn expand_include_pattern(pattern: &str, base_dir: Option<&Path>) -> Result<Vec<
 
 fn expand_path(input: &str, base_dir: Option<&Path>) -> PathBuf {
     let expanded = if input == "~" {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(input))
+        isekai_fs_guard::resolve_home_dir().unwrap_or_else(|| PathBuf::from(input))
     } else if let Some(rest) = input.strip_prefix("~/") {
-        std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(rest))
+        isekai_fs_guard::resolve_home_dir()
+            .map(|home| home.join(rest))
             .unwrap_or_else(|| PathBuf::from(input))
     } else {
         PathBuf::from(input)

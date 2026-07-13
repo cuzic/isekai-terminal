@@ -10,6 +10,7 @@ name = "isekai-ssh"
 path = "src/main.rs"
 
 [dependencies]
+isekai-fs-guard = { path = "../isekai-fs-guard" }
 isekai-trust = { path = "../isekai-trust" }
 isekai-bootstrap = { path = "../isekai-bootstrap" }
 isekai-bootstrap-plan = { path = "../isekai-bootstrap-plan" }

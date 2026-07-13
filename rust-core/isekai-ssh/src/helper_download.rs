@@ -231,7 +231,12 @@ fn cache_path(cache_dir: &Path, source: &ReleaseSource, asset_name: &str) -> Pat
 /// shape `isekai_pipe_core::{default_profiles_dir, default_runtime_dir}`
 /// already use for their own state/runtime directories, applied to
 /// `XDG_CACHE_HOME` (the correct XDG category for a re-fetchable, safely
-/// deletable download cache, as opposed to state or runtime data).
+/// deletable download cache, as opposed to state or runtime data). The
+/// `$HOME` fallback goes through `isekai_fs_guard::resolve_home_dir`, so on
+/// native Windows (no `HOME`) this still resolves via `%USERPROFILE%`
+/// instead of silently falling through to the final `temp_dir()` fallback;
+/// the resulting path is XDG-shaped rather than `%LOCALAPPDATA%`-idiomatic,
+/// which is an accepted, documented simplification (README.md).
 pub fn default_helper_cache_dir() -> std::io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("ISEKAI_SSH_HELPER_CACHE_DIR") {
         return Ok(PathBuf::from(path));
@@ -239,8 +244,8 @@ pub fn default_helper_cache_dir() -> std::io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
         return Ok(PathBuf::from(path).join("isekai-ssh").join("helpers"));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return Ok(PathBuf::from(home).join(".cache").join("isekai-ssh").join("helpers"));
+    if let Some(home) = isekai_fs_guard::resolve_home_dir() {
+        return Ok(home.join(".cache").join("isekai-ssh").join("helpers"));
     }
     Ok(std::env::temp_dir().join("isekai-ssh-helpers"))
 }

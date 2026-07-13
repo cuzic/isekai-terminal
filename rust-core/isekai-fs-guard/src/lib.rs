@@ -2,37 +2,62 @@
 //!
 //! `isekai-trust`'s trust store (`known_helpers.toml`) and `isekai-auth`'s
 //! token file (`token.json`) both need the exact same invariant: the file
-//! and its parent directory must not be world-writable, new directories are
-//! created `0700`, and new files are created `0600`. Before this crate
-//! existed, each crate carried its own copy of this logic (`isekai-trust`'s
-//! `store.rs`, `isekai-auth`'s `file_provider.rs` — the latter explicitly
-//! documented as "mirroring" the former). This crate is now the single
-//! place that invariant is implemented; callers translate `FsGuardError`
-//! into their own richer, path-carrying error type (see
-//! `isekai-trust::store`/`isekai-auth::file_provider` for the mapping).
+//! and its parent directory must not be writable by anyone but the current
+//! user, new directories are created private, and new files are created
+//! private. Before this crate existed, each crate carried its own copy of
+//! this logic (`isekai-trust`'s `store.rs`, `isekai-auth`'s
+//! `file_provider.rs` — the latter explicitly documented as "mirroring" the
+//! former). This crate is now the single place that invariant is
+//! implemented; callers translate `FsGuardError` into their own richer,
+//! path-carrying error type (see `isekai-trust::store`/`isekai-auth::file_provider`
+//! for the mapping).
 //!
-//! Pure `std::fs`, no async/tokio — both callers only ever use this
+//! Two platform backends:
+//! - Unix: the classic owner/group/other mode bits (`0o700` dirs, `0o600`
+//!   files; `check_not_world_writable` only rejects the *others* bit,
+//!   `0o002` — a shared group is still allowed).
+//! - Windows (`windows_acl.rs`): no mode-bit equivalent exists, so this
+//!   operates on the file/directory's DACL directly and is deliberately
+//!   *stricter* than the Unix side — any grant to a principal other than
+//!   the current user is rejected, not just an "everyone" grant. This
+//!   asymmetry is intentional (new design surface for Windows support, not
+//!   a mechanical port of the Unix policy); see `windows_acl.rs`'s module
+//!   docs for what verification has (and hasn't) been done.
+//!
+//! Pure `std::fs`/Win32, no async/tokio — both callers only ever use this
 //! synchronously.
 
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+mod windows_acl;
+
 /// A permission-guard failure, deliberately without a `path` field: callers
 /// already know which path they passed in and attach it to their own error
 /// type (`TrustError`/`AuthError`), which also needs to distinguish this
-/// crate's three failure shapes from their other, unrelated error variants.
+/// crate's failure shapes from their other, unrelated error variants.
 #[derive(Debug)]
 pub enum FsGuardError {
     CreateDir(std::io::Error),
     Stat(std::io::Error),
     SetPermissions(std::io::Error),
+    /// Unix: `path` is writable by users other than its owner (`mode` is
+    /// the offending permission bits, masked to `0o777`).
     WorldWritable { mode: u32 },
+    /// Windows: `path`'s DACL grants write-ish rights to `principal` (a
+    /// SID, rendered as a string — see `windows_acl::sid_to_string`), other
+    /// than the current user. `rights` is the raw access-mask, formatted as
+    /// hex, for diagnostics.
+    InsecureAcl { principal: String, rights: String },
 }
 
-/// Fails closed if `path` is writable by users other than its owner (mode
-/// bit `0o002`). Unix-only; a no-op elsewhere (matching this project's
-/// Linux-only "配布対象プラットフォーム" scope, `archive/ISEKAI_SSH_DESIGN.md`).
+/// Fails closed if `path` is writable by anyone other than the current user.
+/// Unix: rejects the *others*-writable mode bit (`0o002`) only — a shared
+/// group is still allowed. Windows: rejects any DACL grant of write-ish
+/// rights to a principal other than the current user (see `windows_acl.rs`,
+/// stricter than the Unix policy by design). A no-op on any other platform.
 #[cfg(unix)]
 pub fn check_not_world_writable(path: &Path) -> Result<(), FsGuardError> {
     use std::os::unix::fs::PermissionsExt;
@@ -44,35 +69,65 @@ pub fn check_not_world_writable(path: &Path) -> Result<(), FsGuardError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn check_not_world_writable(path: &Path) -> Result<(), FsGuardError> {
+    windows_acl::check_not_world_writable(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn check_not_world_writable(_path: &Path) -> Result<(), FsGuardError> {
     Ok(())
 }
 
-/// Creates `dir` (as `0700`) if it doesn't exist yet; otherwise checks that
-/// it isn't world-writable and fails closed if it is.
+/// Creates `dir` privately (`0700` on Unix, an owner-only DACL on Windows)
+/// if it doesn't exist yet; otherwise checks that it isn't writable by
+/// anyone else and fails closed if it is.
 pub fn ensure_private_dir(dir: &Path) -> Result<(), FsGuardError> {
     if !dir.exists() {
         fs::create_dir_all(dir).map_err(FsGuardError::CreateDir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(FsGuardError::CreateDir)?;
-        }
-        Ok(())
+        set_private_dir_permissions(dir)
     } else {
         check_not_world_writable(dir)
     }
 }
 
-/// Sets `0600` permissions on `path`. Unix-only; a no-op elsewhere.
+/// Unconditionally (re)applies private permissions to an existing directory
+/// (`0700` on Unix, an owner-only DACL on Windows) — the directory
+/// counterpart of `set_private_file_permissions`, split out so callers that
+/// always (re-)apply permissions on every write (e.g.
+/// `isekai_pipe_core::profile::write_persistent_profile`, which doesn't use
+/// `ensure_private_dir`'s create-vs-check branching) don't have to
+/// reimplement the platform `cfg` split themselves.
+#[cfg(unix)]
+pub fn set_private_dir_permissions(dir: &Path) -> Result<(), FsGuardError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(FsGuardError::CreateDir)
+}
+
+#[cfg(windows)]
+pub fn set_private_dir_permissions(dir: &Path) -> Result<(), FsGuardError> {
+    windows_acl::set_private_acl(dir)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn set_private_dir_permissions(_dir: &Path) -> Result<(), FsGuardError> {
+    Ok(())
+}
+
+/// Sets private permissions on `path` (`0600` on Unix, an owner-only DACL
+/// on Windows). A no-op on any other platform.
 #[cfg(unix)]
 pub fn set_private_file_permissions(path: &Path) -> Result<(), FsGuardError> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(FsGuardError::SetPermissions)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn set_private_file_permissions(path: &Path) -> Result<(), FsGuardError> {
+    windows_acl::set_private_acl(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn set_private_file_permissions(_path: &Path) -> Result<(), FsGuardError> {
     Ok(())
 }

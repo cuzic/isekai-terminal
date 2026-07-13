@@ -11,12 +11,25 @@ isekai-pipe-protocol = { path = "../isekai-pipe-protocol" }
 # (`isekai_trust::schema::{TrustStore, HelperTrust}`) to the persistent
 # profile schema (`chatgpt.md` §13) -- see `profile.rs`.
 isekai-trust = { path = "../isekai-trust" }
+# Private file/dir permissions for `write_persistent_profile` (session
+# secrets, cert pins) -- same guard `isekai-trust`/`isekai-auth` use for
+# their own on-disk secrets.
+isekai-fs-guard = { path = "../isekai-fs-guard" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# ProfileLock's Windows backend (LockFileEx). Same crate+version
+# isekai-fs-guard/isekai-netmon/quicsock already use.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 [dev-dependencies]
 tempfile = "3"

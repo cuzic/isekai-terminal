@@ -1610,6 +1610,7 @@ name = "isekai-fs-guard"
 version = "0.1.0"
 dependencies = [
  "tempfile",
+ "windows",
 ]
 
 [[package]]
@@ -1679,6 +1680,7 @@ dependencies = [
 name = "isekai-pipe-core"
 version = "0.1.0"
 dependencies = [
+ "isekai-fs-guard",
  "isekai-pipe-protocol",
  "isekai-trust",
  "libc",
@@ -1686,6 +1688,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "windows",
 ]
 
 [[package]]
@@ -1715,6 +1718,7 @@ dependencies = [
  "isekai-auth",
  "isekai-bootstrap",
  "isekai-bootstrap-plan",
+ "isekai-fs-guard",
  "isekai-pipe-core",
  "isekai-protocol",
  "isekai-trust",
