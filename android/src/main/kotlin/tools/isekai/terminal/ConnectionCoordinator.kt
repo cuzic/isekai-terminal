@@ -31,7 +31,7 @@ import uniffi.isekai_terminal_core.TransportPreference
  * (Task #8 段階1: `resolveAuth*`とtoConfig呼び出し周辺だけを切り出す、codexレビューの
  * 段階分割案)。タブ/ペイン構造・通知・テーマの責務は引き続き[TerminalTabsViewModel]が持つ。
  *
- * テーマ反映([pushTheme])・スニペット読み込み([loadSnippets])は呼び出し元の責務のまま
+ * テーマ反映([pushTheme])・スニペット/打鍵列の読み込み([loadPaneContent])は呼び出し元の責務のまま
  * (このクラスはPaneState/TabStateの所有者ではない)、コールバックとして注入する。
  */
 internal class ConnectionCoordinator(
@@ -39,7 +39,7 @@ internal class ConnectionCoordinator(
     private val scope: CoroutineScope,
     private val ioDispatcher: CoroutineDispatcher,
     private val pushTheme: (PaneState, TerminalTheme) -> Unit,
-    private val loadSnippets: (PaneState, Long?) -> Unit,
+    private val loadPaneContent: (PaneState, Long?) -> Unit,
 ) {
     fun connectPane(
         tabId: String,
@@ -55,7 +55,7 @@ internal class ConnectionCoordinator(
         if (current.connected || current.isConnecting || current.isReconnecting) return
         pane.preConnectError.value = null
         armPostConnectCommands(pane, profile)
-        loadSnippets(pane, profile.id)
+        loadPaneContent(pane, profile.id)
         RemoteLogger.i(
             "IsekaiTerminalSSH",
             "connectPane[$tabId/${pane.paneId}]: '${profile.label}' ${profile.username}@${profile.host}:${profile.port} " +

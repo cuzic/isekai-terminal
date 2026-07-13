@@ -9,8 +9,11 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-    entities = [KnownHost::class, ConnectionProfile::class, KeyEntry::class, Snippet::class],
-    version = 17,
+    entities = [
+        KnownHost::class, ConnectionProfile::class, KeyEntry::class, Snippet::class, KeySequence::class,
+        KeySequencePackInstallation::class,
+    ],
+    version = 19,
     exportSchema = false,
 )
 @TypeConverters(PortForwardListConverter::class)
@@ -19,6 +22,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun connectionProfileDao(): ConnectionProfileDao
     abstract fun keyEntryDao(): KeyEntryDao
     abstract fun snippetDao(): SnippetDao
+    abstract fun keySequenceDao(): KeySequenceDao
+    abstract fun keySequencePackInstallationDao(): KeySequencePackInstallationDao
 
     companion object {
         @Volatile private var instance: AppDatabase? = null
@@ -197,6 +202,43 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        // 打鍵列(KeySequence)機能: Ctrlチョード・特殊キー・テキストを組み合わせた
+        // 打鍵列をボタン一つで送信できるようにする(Snippetのキーストローク版)。
+        // sourcePackId 列は持たない(パック機構はライブバインディング方式でマテリアライズしないため不要)。
+        internal val MIGRATION_17_18 = object : Migration(17, 18) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS key_sequences (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        label TEXT NOT NULL,
+                        steps_json TEXT NOT NULL,
+                        sort_order INTEGER NOT NULL DEFAULT 0,
+                        profile_id INTEGER
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
+        // 打鍵列セット(パック、例: tmux)の有効化状態。パック定義自体
+        // ([tools.isekai.terminal.pack.KeySequencePack])はDB行ではなくアプリ同梱の静的データ。
+        internal val MIGRATION_18_19 = object : Migration(18, 19) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS key_sequence_pack_installations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        pack_id TEXT NOT NULL,
+                        version INTEGER NOT NULL,
+                        param_values_json TEXT NOT NULL,
+                        profile_id INTEGER
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase =
             instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
@@ -208,6 +250,7 @@ abstract class AppDatabase : RoomDatabase() {
                     MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7,
                     MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12,
                     MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17,
+                    MIGRATION_17_18, MIGRATION_18_19,
                 )
                 .build().also { instance = it }
             }
