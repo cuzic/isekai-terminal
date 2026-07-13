@@ -112,7 +112,13 @@ async fn run_echo_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs
 // loopback) physical interface on macOS remains unknown. Needs either a
 // `quicsock` code fix (once the exact Darwin mechanism is understood) or a
 // deeper investigation of `noq`'s own send/recv path under `IP_BOUND_IF`.
-#[cfg(not(target_os = "macos"))]
+//
+// TEMPORARILY re-enabled on macOS (debug commit, see this file's other new
+// `#[cfg(target_os = "macos")]` diagnostic tests added alongside it) to
+// capture `noq_udp`'s `log_sendmsg_error` output for this specific failure
+// in the same CI run as the two new variants, for a controlled A/B/C
+// comparison. Revert this `#[cfg]` back to excluding macOS once that
+// evidence has been gathered.
 #[tokio::test]
 async fn rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable() {
     let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Debug).try_init();
@@ -152,6 +158,122 @@ async fn rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable() {
     // endpoint's new (quicsock-bound) socket — after the rebind. Before the
     // fix this described in this file's module docs, this step would hang
     // (the connection was silently broken by the rebind).
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+        .await
+        .expect("open_bi after rebind should not hang")
+        .expect("open_bi after rebind should succeed");
+    stream.write_all(b"after rebind").await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("read after rebind should not hang")
+        .unwrap();
+    assert_eq!(&buf[..n], b"after rebind", "connection must keep working after rebinding onto {physical_addr}");
+
+    conn.close().await;
+}
+
+/// Diagnostic (macOS-only): same scenario as
+/// `rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable`, but
+/// rebinds onto `lo0`'s *primary* address (`127.0.0.1`, always present, no
+/// `ifconfig lo0 alias` needed) instead of the secondary alias `127.0.0.4`
+/// that test uses to simulate a distinct path. Isolates one variable: is
+/// `IP_BOUND_IF` + `noq` path validation broken on macOS in general, or only
+/// when the bound address is a *secondary* loopback alias specifically (as
+/// the leading theory in this file's other test's doc comment suggests,
+/// citing Darwin's stricter interface-scoped route lookup under
+/// `IP_BOUND_IF`)? A real physical interface (Wi-Fi/cellular) never needs a
+/// secondary alias — it has exactly one natural address — so if this test
+/// passes while the alias one hangs, that's meaningful evidence the alias
+/// (not `IP_BOUND_IF` itself) is the actual culprit.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn rebind_onto_a_quicsock_bound_interface_using_the_primary_loopback_address() {
+    let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Debug).try_init();
+    let (cert_der, key_der, cert_sha256_hex) = generate_cert();
+    let server_addr = run_echo_server(cert_der, key_der).await;
+
+    let factory = system_quic_factory();
+    let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint should succeed");
+    let conn = endpoint
+        .connect(RemoteSpec { addr: server_addr, server_name: SNI.to_string(), cert_sha256_hex })
+        .await
+        .expect("initial connect should succeed");
+
+    let mut stream = conn.open_bi().await.unwrap();
+    stream.write_all(b"before rebind").await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"before rebind");
+
+    let physical_socket = bind_physical_interface(loopback_index(), SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .expect("quicsock should bind lo0's primary address");
+    let physical_addr = physical_socket.local_addr().unwrap();
+    let rebinder = endpoint.rebinder().expect("SystemQuicEndpoint should support rebinding");
+    tokio::time::timeout(Duration::from_secs(5), rebinder.rebind_socket(physical_socket))
+        .await
+        .expect("rebind_socket should not hang")
+        .expect("rebind onto the quicsock-bound socket should succeed");
+
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+        .await
+        .expect("open_bi after rebind should not hang")
+        .expect("open_bi after rebind should succeed");
+    stream.write_all(b"after rebind").await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("read after rebind should not hang")
+        .unwrap();
+    assert_eq!(&buf[..n], b"after rebind", "connection must keep working after rebinding onto {physical_addr}");
+
+    conn.close().await;
+}
+
+/// Diagnostic (macOS-only): same scenario again, but rebinds onto a
+/// *wildcard* (`0.0.0.0:0`) `IP_BOUND_IF`-restricted socket — the exact bind
+/// pattern `WarmStandby::dial` (`isekai-transport/src/warm_standby.rs`, the
+/// only real production caller of `bind_physical_interface`) actually uses,
+/// as opposed to this file's other tests, which bind a specific address to
+/// get an address distinguishable enough to prove the test is really
+/// exercising a different path. If this variant passes while the fixed-
+/// address alias test hangs, it's evidence that `WarmStandby`'s real usage
+/// on macOS is unaffected by the documented gap (which would then be a
+/// loopback-test-methodology artifact, not a bug in the shipped
+/// `--experimental-network-rebind` feature).
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn rebind_onto_a_quicsock_bound_interface_using_a_wildcard_bind() {
+    let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Debug).try_init();
+    let (cert_der, key_der, cert_sha256_hex) = generate_cert();
+    let server_addr = run_echo_server(cert_der, key_der).await;
+
+    let factory = system_quic_factory();
+    let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint should succeed");
+    let conn = endpoint
+        .connect(RemoteSpec { addr: server_addr, server_name: SNI.to_string(), cert_sha256_hex })
+        .await
+        .expect("initial connect should succeed");
+
+    let mut stream = conn.open_bi().await.unwrap();
+    stream.write_all(b"before rebind").await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"before rebind");
+
+    let physical_socket = bind_physical_interface(loopback_index(), SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        .expect("quicsock should bind a wildcard, interface-restricted socket");
+    let physical_addr = physical_socket.local_addr().unwrap();
+    let rebinder = endpoint.rebinder().expect("SystemQuicEndpoint should support rebinding");
+    tokio::time::timeout(Duration::from_secs(5), rebinder.rebind_socket(physical_socket))
+        .await
+        .expect("rebind_socket should not hang")
+        .expect("rebind onto the quicsock-bound socket should succeed");
+
     let mut stream = tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
         .await
         .expect("open_bi after rebind should not hang")
