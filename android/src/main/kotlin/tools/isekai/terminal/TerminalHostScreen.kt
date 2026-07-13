@@ -176,6 +176,7 @@ private fun TabLabel(
                     when {
                         uiState.connected -> Color(0xFF55FF55)
                         uiState.isConnecting -> Color.Yellow
+                        uiState.isReconnecting -> Color(0xFFFF9800)
                         else -> Color.Gray
                     },
                 ),
@@ -415,6 +416,7 @@ private fun TerminalPaneScreen(
                 actions = TerminalScreenActions(
                     onConnect = { tabsVm.reconnectPane(tabId, paneId) },
                     onDisconnect = { tabsVm.disconnectPane(tabId, paneId) },
+                    onCancelReconnect = { tabsVm.cancelReconnectPane(tabId, paneId) },
                     // タブ内の「戻る」/切断確認ダイアログはタブを閉じる（＝タブ行の × と同じ操作）。
                     // 全タブが閉じられると呼び出し側 (TerminalHostScreen) が自動でリストへ戻る。
                     onBack = onCloseTab,

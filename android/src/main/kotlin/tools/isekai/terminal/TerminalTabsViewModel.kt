@@ -588,7 +588,9 @@ class TerminalTabsViewModel(
 
     private fun connectPane(tab: TabState, pane: PaneState, profile: ConnectionProfile, password: String?, jumpPassword: String? = null) {
         val current = pane.session.state.value
-        if (current.connected || current.isConnecting) return
+        // isReconnecting中はRust側が自動再接続ループを動かしているので、手動での
+        // 二重接続を防ぐ(先に[cancelReconnectPane]でループを止めてから再接続すべき)。
+        if (current.connected || current.isConnecting || current.isReconnecting) return
         pane.preConnectError.value = null
         armPostConnectCommands(pane, profile)
         loadSnippetsForPane(pane, profile.id)
@@ -823,6 +825,11 @@ class TerminalTabsViewModel(
     fun send(tabId: String, bytes: ByteArray) = tabOrNull(tabId)?.let { sendToPane(tabId, it.focusedPane.paneId, bytes) }
 
     fun disconnectPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.disconnect()
+
+    /** 自動再接続ループ(isReconnecting中)を中止する。フォーカス中のペインに対して行う。 */
+    fun cancelReconnectPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.cancelReconnect()
+
+    fun cancelReconnect(tabId: String) = tabOrNull(tabId)?.let { cancelReconnectPane(tabId, it.focusedPane.paneId) }
 
     /** #14: ユーザーが「今すぐWiFiに戻す」を要求した。判断はRust側(RebindManager)が行う。フォーカス中のペインに対して行う。 */
     fun forceReturnToWifi(tabId: String) =

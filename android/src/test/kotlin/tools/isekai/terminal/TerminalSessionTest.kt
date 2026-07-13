@@ -119,6 +119,57 @@ class TerminalSessionTest {
         assertTrue(state.statusMsg.contains("不明"))
     }
 
+    // ── 自動再接続(Reconnecting) ──────────────────────────────────
+
+    @Test
+    fun onReconnecting_updatesStateWithLiveCountdown() = runBlocking {
+        session.connect(testConfig())
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+
+        fakeOrchestrator.simulateReconnecting(elapsedSecs = 3u, timeoutSecs = 60u, reason = "peer closed")
+        val state = awaitState { it.isReconnecting }
+        assertFalse(state.connected)
+        assertFalse(state.isConnecting)
+        assertTrue(state.statusMsg.contains("3"))
+        assertTrue(state.statusMsg.contains("60"))
+        assertTrue(state.statusMsg.contains("peer closed"))
+        assertNull(state.screenUpdate)
+        assertNull(state.currentHost)
+    }
+
+    @Test
+    fun onReconnecting_thenConnected_clearsIsReconnecting() = runBlocking {
+        session.connect(testConfig())
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+
+        fakeOrchestrator.simulateReconnecting(elapsedSecs = 3u, timeoutSecs = 60u)
+        awaitState { it.isReconnecting }
+
+        fakeOrchestrator.simulateConnected("test.host")
+        val state = awaitState { it.connected }
+        assertFalse(state.isReconnecting)
+    }
+
+    @Test
+    fun onDisconnected_afterConnect_neverSetsIsReconnecting() = runBlocking {
+        // 通常の切断(Reconnectingを経由しないケース)ではisReconnectingは立たない。
+        session.connect(testConfig())
+        fakeOrchestrator.simulateConnected()
+        awaitState { it.connected }
+
+        fakeOrchestrator.simulateDisconnected("server closed")
+        val state = awaitState { !it.connected }
+        assertFalse(state.isReconnecting)
+    }
+
+    @Test
+    fun cancelReconnect_delegatesToOrchestrator() {
+        session.cancelReconnect()
+        assertTrue(fakeOrchestrator.cancelReconnectCalled)
+    }
+
     @Test
     fun connect_whenAlreadyConnected_isNoOp() = runBlocking {
         session.connect(testConfig())

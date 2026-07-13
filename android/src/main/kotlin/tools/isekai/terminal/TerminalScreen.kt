@@ -63,6 +63,8 @@ import uniffi.isekai_terminal_core.*
 data class TerminalScreenActions(
     val onConnect: () -> Unit,
     val onDisconnect: () -> Unit,
+    /** 自動再接続ループ(isReconnecting中)を中止する。 */
+    val onCancelReconnect: () -> Unit = {},
     val onBack: () -> Unit,
     val onSend: (ByteArray) -> Unit,
     val onResize: (UInt, UInt) -> Unit,
@@ -116,8 +118,10 @@ fun TerminalScreenBody(
 ) {
     val context = LocalContext.current
     val connected = uiState.connected
+    val isReconnecting = uiState.isReconnecting
 
-    // 未接続/切断中は再接続ボタンを隠したままにできないため、上部バーを強制的に再表示する。
+    // 未接続/切断中(自動再接続中を含む)は再接続/中止ボタンを隠したままにできないため、
+    // 上部バーを強制的に再表示する。
     LaunchedEffect(connected, isActive) {
         if (isActive && !connected) onUserActivity()
     }
@@ -234,11 +238,24 @@ fun TerminalScreenBody(
             ) {
                 Text(
                     statusMsg,
-                    color = if (connected) AppColors.Success else Color.Yellow,
+                    color = when {
+                        connected -> AppColors.Success
+                        isReconnecting -> Color.Yellow
+                        else -> AppColors.SecondaryText
+                    },
                     fontSize = 11.sp,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (!connected) {
+                    if (isReconnecting) {
+                        // 自動再接続中(Rust側のreconnectループ)は「再接続」ではなく、
+                        // それを中止する操作を出す(手動での二重接続を避けるため
+                        // connectPane側でも既にガードしているが、UI上もループが
+                        // 動いている間は「接続する」ボタンではなく「中止する」ボタンを見せる)。
+                        TextButton(
+                            onClick = { actions.onCancelReconnect() },
+                            contentPadding = PaddingValues(0.dp),
+                        ) { Text("中止", color = Color.Yellow, fontSize = 11.sp) }
+                    } else if (!connected) {
                         TextButton(
                             onClick = {
                                 if (canReconnect) actions.onConnect()
@@ -527,7 +544,7 @@ fun TerminalScreenBody(
             ) {
                 Text(
                     statusMsg,
-                    color = Color.DarkGray,
+                    color = if (isReconnecting) Color.Yellow else Color.DarkGray,
                     fontSize = 12.sp,
                     modifier = Modifier.padding(16.dp),
                 )

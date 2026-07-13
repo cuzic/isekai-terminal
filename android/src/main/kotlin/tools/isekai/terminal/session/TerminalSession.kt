@@ -97,21 +97,36 @@ class TerminalSession(
         override fun onConnectionStateChanged(state: ConnectionPublicState) {
             when (state) {
                 ConnectionPublicState.Connecting ->
-                    _state.update { it.copy(isConnecting = true, connected = false, statusMsg = "接続中…") }
+                    _state.update { it.copy(isConnecting = true, connected = false,
+                        isReconnecting = false, statusMsg = "接続中…") }
                 is ConnectionPublicState.Connected -> {
                     RemoteLogger.i("IsekaiTerminalSSH", "✓ connected: ${state.host}")
                     _state.update { it.copy(isConnecting = false, connected = true,
+                        isReconnecting = false,
                         statusMsg = "接続済み: ${state.host}", currentHost = state.host) }
                 }
                 is ConnectionPublicState.Disconnected -> {
                     RemoteLogger.i("IsekaiTerminalSSH", "✗ disconnected: reason='${state.reason ?: "none"}'")
                     _state.update { it.copy(isConnecting = false, connected = false,
+                        isReconnecting = false,
                         statusMsg = state.reason?.let { r -> "切断: $r" } ?: "切断済み (不明)",
                         currentHost = null, screenUpdate = null, trzszState = null) }
                 }
                 is ConnectionPublicState.Error -> {
                     RemoteLogger.w("IsekaiTerminalSSH", "connection error: ${state.message}")
-                    _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${state.message}") }
+                    _state.update { it.copy(isConnecting = false, isReconnecting = false,
+                        statusMsg = "エラー: ${state.message}") }
+                }
+                is ConnectionPublicState.Reconnecting -> {
+                    RemoteLogger.i(
+                        "IsekaiTerminalSSH",
+                        "… reconnecting: ${state.elapsedSecs}/${state.timeoutSecs}s reason='${state.reason ?: "none"}'",
+                    )
+                    val suffix = state.reason?.let { r -> " [$r]" } ?: ""
+                    _state.update { it.copy(isConnecting = false, connected = false,
+                        isReconnecting = true,
+                        statusMsg = "再接続中… (${state.elapsedSecs}/${state.timeoutSecs}秒)$suffix",
+                        currentHost = null, screenUpdate = null, trzszState = null) }
                 }
             }
         }
@@ -291,6 +306,11 @@ class TerminalSession(
         _state.update { it.copy(connected = false, isConnecting = false, statusMsg = "切断済み") }
         orchestrator.disconnect()
     }
+
+    /** 自動再接続ループ([isReconnecting]中)を中止する。判断はRust側
+     *  (`SessionOrchestrator::cancelReconnect`)で行い、結果は通常の
+     *  `onConnectionStateChanged`経由で[_state]に反映される。 */
+    fun cancelReconnect() = orchestrator.cancelReconnect()
 
     fun scrollbackCells(offset: Int, rows: Int): List<CellData>? =
         orchestrator.scrollbackCells(offset.toUInt(), rows.toUInt())

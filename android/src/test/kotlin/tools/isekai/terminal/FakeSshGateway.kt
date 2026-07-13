@@ -34,6 +34,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     var trzszDismissCalled = false
     var rebindToFdCalls = mutableListOf<Pair<Int, String>>()
     var forceReturnToWifiCallCount = 0
+    var cancelReconnectCalled = false
 
     @Throws(SshException::class)
     override fun connect(config: SshConfig) {
@@ -91,6 +92,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     }
 
     override fun disconnect() { disconnectCalled = true }
+    override fun cancelReconnect() { cancelReconnectCalled = true }
     override fun send(data: ByteArray) { sentBytes.add(data) }
     override fun resize(cols: UInt, rows: UInt) { lastResizeCols = cols; lastResizeRows = rows }
     override fun scrollbackLen(): UInt = 0u
@@ -157,6 +159,11 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     fun simulateDisconnected(reason: String? = null): Unit {
         phase = Phase.IDLE
         callback!!.onConnectionStateChanged(ConnectionPublicState.Disconnected(reason))
+    }
+
+    fun simulateReconnecting(elapsedSecs: UInt = 0u, timeoutSecs: UInt = 60u, reason: String? = null): Unit {
+        phase = Phase.IDLE
+        callback!!.onConnectionStateChanged(ConnectionPublicState.Reconnecting(elapsedSecs, timeoutSecs, reason))
     }
 
     fun simulateError(message: String) =

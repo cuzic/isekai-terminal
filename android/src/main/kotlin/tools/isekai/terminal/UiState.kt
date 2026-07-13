@@ -6,6 +6,11 @@ import uniffi.isekai_terminal_core.ScreenUpdate
 data class TerminalUiState(
     val connected: Boolean = false,
     val isConnecting: Boolean = false,
+    // 一度Connectedになったセッションが予期せず切断され、orchestrator(Rust側)が
+    // 自動的に再接続を試みている間true(ConnectionPublicState.Reconnecting)。
+    // Rustから届いた状態をそのままミラーしているだけで、ここから新たな判断ロジックは
+    // 行わない(rust-ssot.md準拠、既存のconnected/isConnectingと同じ位置づけ)。
+    val isReconnecting: Boolean = false,
     val statusMsg: String = "未接続",
     val screenUpdate: ScreenUpdate? = null,
     val lastFingerprint: String? = null,
