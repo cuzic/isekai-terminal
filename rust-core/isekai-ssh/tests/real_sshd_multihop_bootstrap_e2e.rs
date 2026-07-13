@@ -190,12 +190,23 @@ fn spawn_real_sshd(workdir: &std::path::Path, label: &str, authorized_keys_pub: 
 /// `real_sshd_bootstrap_e2e.rs::shim_ssh_for_real_sshd`'s proven pattern.
 /// Unlike the single-hop version, this wires `ProxyJump` on the `<alias>`
 /// block so `ssh -G <alias>` (which `wrapper.rs::defaults_bootstrap_candidate_from_ssh_g`
-/// reads) reports it, and adds one generic `Host 127.0.0.1` block covering
-/// *both* the jump hop and the final target — both literally dial
-/// `127.0.0.1` (`wrapper.rs`'s bootstrap step dials the resolved address
-/// directly, never the alias), so a single block's `IdentityFile`/
-/// `StrictHostKeyChecking no`/`UserKnownHostsFile /dev/null` apply to
-/// either connection.
+/// reads) reports it.
+///
+/// The final destination the deploy step actually dials is the *alias*
+/// itself, not `127.0.0.1` — `wrapper.rs::bootstrap_and_register` (see its
+/// "prefer the original alias over the `ssh -G`-resolved host" comment)
+/// deliberately passes `candidate.alias` as the `ssh(1)` destination so a
+/// real user's own `Host <alias>` block (`IdentityFile`/`ProxyCommand`/etc.)
+/// still applies. Only the `-J` jump-hop argument (built from the parsed
+/// `ssh -G` `proxyjump` output) is the literal `127.0.0.1`. So the
+/// `IdentityFile`/`StrictHostKeyChecking no`/`UserKnownHostsFile /dev/null`
+/// bypass has to apply to *both* patterns — `Host {alias} 127.0.0.1` (one
+/// `Host` line, two patterns) rather than a `Host 127.0.0.1`-only block,
+/// otherwise the final-hop connection (destination = the alias) falls
+/// through to this process's real `~/.ssh/known_hosts` and `BatchMode=yes`
+/// aborts it with "Host key verification failed." (found via an actual
+/// repro: this previously read `Host 127.0.0.1` only, which does not match
+/// the literal string `{alias}` used as the destination argument).
 fn shim_ssh_for_two_hop_real_sshd(
     tmp: &std::path::Path,
     alias: &str,
@@ -212,7 +223,7 @@ fn shim_ssh_for_two_hop_real_sshd(
          \x20\x20\x20\x20User {username}\n\
          \x20\x20\x20\x20ProxyJump {username}@127.0.0.1:{bastion_port}\n\
          \n\
-         Host 127.0.0.1\n\
+         Host {alias} 127.0.0.1\n\
          \x20\x20\x20\x20User {username}\n\
          \x20\x20\x20\x20IdentityFile {key}\n\
          \x20\x20\x20\x20IdentitiesOnly yes\n\
