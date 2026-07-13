@@ -456,19 +456,11 @@ fun TerminalScreenBody(
 
                     // 選択中のフローティングツールバー（コピー／キャンセル）
                     selection?.let {
-                        Row(
-                            modifier = Modifier
-                                .align(Alignment.TopCenter)
-                                .padding(top = 8.dp)
-                                .background(Color(0xCC1A1A2E), shape = MaterialTheme.shapes.small)
-                                .padding(horizontal = 8.dp, vertical = 4.dp),
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        ) {
-                            TextButton(onClick = performCopy) { Text("コピー", color = Color.Cyan, fontSize = 12.sp) }
-                            TextButton(onClick = { selection = null }) {
-                                Text("キャンセル", color = Color.Gray, fontSize = 12.sp)
-                            }
-                        }
+                        SelectionToolbar(
+                            onCopy = performCopy,
+                            onCancel = { selection = null },
+                            modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp),
+                        )
                     }
 
                     // "Back to live" indicator when scrolled up
@@ -704,6 +696,20 @@ private fun TerminalModalHost(
             },
             onDismiss = onDismissSnippetSheet,
         )
+    }
+}
+
+/** 選択範囲がある間、コピー／キャンセル操作を出すフローティングツールバー。 */
+@Composable
+private fun SelectionToolbar(onCopy: () -> Unit, onCancel: () -> Unit, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .background(Color(0xCC1A1A2E), shape = MaterialTheme.shapes.small)
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        TextButton(onClick = onCopy) { Text("コピー", color = Color.Cyan, fontSize = 12.sp) }
+        TextButton(onClick = onCancel) { Text("キャンセル", color = Color.Gray, fontSize = 12.sp) }
     }
 }
 
