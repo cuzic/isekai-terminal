@@ -116,10 +116,16 @@ final class TerminalTabsModelTests: XCTestCase {
         XCTAssertEqual(model.tabs.map(\.id), [tabId])
     }
 
-    /// Phase 1C(#14): フォアグラウンド復帰通知を受けたら、失敗/切断済みのタブに対して
-    /// `reconnect()`が呼ばれることを検証する(実際のUIApplication lifecycle
-    /// 通知をそのままpostし、`TerminalTabsModel`が実際に購読していることを確かめる)。
-    func testWillEnterForegroundNotificationReconnectsFailedTab() async throws {
+    /// #20: フォアグラウンド復帰通知は`TerminalSessionController.notifyWillEnterForeground()`
+    /// (→Rust側`SessionOrchestrator.notify_will_enter_foreground()`)へそのまま転送する
+    /// だけで、「失敗/切断済みタブは無条件に`reconnect()`する」という判断はSwift側で
+    /// 行わない(`rust-ssot.md`)。このfixtureが起こす失敗(存在しない`keyEntryId`による
+    /// `resolveAuth`の即時失敗)はRust側`connect()`を一度も呼ばないまま`.failed`に
+    /// なるため、一度もバックグラウンド遷移していないこのタブは再接続対象と
+    /// 判定されず`.failed`のまま留まるはず(再接続要否の判断ロジックそのものの検証は
+    /// `rust-core/src/orchestrator.rs`の`notify_will_enter_foreground_*`系ユニット
+    /// テストが担う)。
+    func testWillEnterForegroundWithoutPriorBackgroundingDoesNotReconnectFailedTab() async throws {
         let model = try makeModel()
         let tabId = model.openTab(profile: makeProfile(displayName: "test"), password: nil)
 
@@ -130,13 +136,12 @@ final class TerminalTabsModelTests: XCTestCase {
 
         NotificationCenter.default.post(name: UIApplication.willEnterForegroundNotification, object: nil)
 
-        // 同じ(存在しない)keyEntryIdで再接続を試みるため、再び同期的に.failedへ戻る。
-        // ここでは「.connectingを経由した=reconnect()が実際に呼ばれた」ことを、
-        // 最終的に.failedへ戻っていることの確認をもって間接的に検証する。
-        try await waitUntilFixtureCondition(timeout: 2) {
-            guard let controller = await model.tabs.first(where: { $0.id == tabId })?.controller else { return false }
-            guard case .failed = await controller.uiState.state else { return false }
-            return true
+        // 自動再接続が(誤って)起きていれば.connectingを経由するはずなので、
+        // 通知処理が行き渡るのを待った後も.failedのままであることを確認する。
+        try await Task.sleep(nanoseconds: 200_000_000)
+        guard case .failed = await model.tabs.first(where: { $0.id == tabId })?.controller.uiState.state else {
+            XCTFail("バックグラウンド遷移を経ていないタブが誤って再接続されている")
+            return
         }
     }
 }

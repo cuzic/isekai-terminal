@@ -54,13 +54,12 @@ public final class TerminalTabsModel: ObservableObject {
         observeLifecycleNotifications()
     }
 
-    /// Phase 1C(#14): アプリのバックグラウンド遷移/復帰をそのまま受け取る。Android版
-    /// `TerminalTabsViewModel`は同種の判断をRust側の状態を見て行っているわけではなく、
-    /// UI表示に閉じないセッション生存の話ではあるが、iOS版では現時点でRust側に
-    /// バックグラウンド遷移専用のUniFFIメソッドが無い(#24でSessionSupervisor導入後に
-    /// 追加予定)ため、暫定的にSwift側で「フォアグラウンド復帰時に切断済みタブを
-    /// 再接続する」までを行う(生セッション状態の分岐はconnect()/reconnect()に閉じており、
-    /// ここではOSイベントの中継のみ)。
+    /// #20: アプリのバックグラウンド遷移/復帰/メモリ警告をそのまま各タブの
+    /// `TerminalSessionController`(→Rust側`SessionOrchestrator`)へ転送する。
+    /// 「猶予内復帰なら再接続不要、猶予切れなら再接続」という判断はRust側の
+    /// `notify_will_enter_foreground()`が行う(`rust-ssot.md`) — ここではOSイベントの
+    /// 中継と`beginBackgroundTask`の猶予トークン管理のみを行い、Swift側で
+    /// 「再接続すべきか」を判断したり全タブへ無条件に`reconnect()`したりしない。
     private func observeLifecycleNotifications() {
         NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
@@ -72,19 +71,50 @@ public final class TerminalTabsModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in self?.handleWillEnterForeground() }
         }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleMemoryWarning() }
+        }
     }
 
     private func handleDidEnterBackground() {
         endBackgroundTaskIfNeeded()
         backgroundTaskId = UIApplication.shared.beginBackgroundTask(withName: "isekai-terminal-sessions") { [weak self] in
-            Task { @MainActor in self?.endBackgroundTaskIfNeeded() }
+            Task { @MainActor in self?.handleBackgroundBudgetExpired() }
         }
+        // `beginBackgroundTask`の猶予見積もり(`backgroundTimeRemaining`)を`budget_ms`として
+        // 各タブへ渡す。実際の期限管理(タイマー)はこのクラスの責務のまま
+        // (Rust/Swiftで基準時計を共有していないため、Rust側は記録するだけで待たない)。
+        // `backgroundTimeRemaining`は猶予トークン未取得時等に`.greatestFiniteMagnitude`
+        // (isFiniteはtrueのまま)を返すことがあり、素朴な変換はUInt32のオーバーフローで
+        // trapするため、妥当な範囲(120秒未満)にクランプしてから渡す。
+        let remaining = UIApplication.shared.backgroundTimeRemaining
+        let budgetMs: UInt32 = (remaining.isFinite && remaining >= 0 && remaining < 120)
+            ? UInt32(remaining * 1000)
+            : 30_000
+        for tab in tabs {
+            tab.controller.notifyDidEnterBackground(budgetMs: budgetMs)
+        }
+    }
+
+    private func handleBackgroundBudgetExpired() {
+        for tab in tabs {
+            tab.controller.notifyBackgroundBudgetExpired()
+        }
+        endBackgroundTaskIfNeeded()
     }
 
     private func handleWillEnterForeground() {
         endBackgroundTaskIfNeeded()
         for tab in tabs {
-            tab.controller.reconnect()
+            tab.controller.notifyWillEnterForeground()
+        }
+    }
+
+    private func handleMemoryWarning() {
+        for tab in tabs {
+            tab.controller.notifyMemoryWarning()
         }
     }
 
