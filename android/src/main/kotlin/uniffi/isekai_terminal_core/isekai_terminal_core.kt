@@ -833,6 +833,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_link_relay(
@@ -1001,6 +1003,8 @@ external fun uniffi_isekai_terminal_core_fn_clone_sessionorchestrator(`handle`: 
 external fun uniffi_isekai_terminal_core_fn_free_sessionorchestrator(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_add_local_forward(`ptr`: Long,`id`: RustBuffer.ByValue,`bindAddress`: RustBuffer.ByValue,`bindPort`: Short,`remoteHost`: RustBuffer.ByValue,`remotePort`: Short,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_cancel_reconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1300,6 +1304,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward() != 60755) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect() != 53892) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect() != 45531) {
@@ -2919,6 +2926,13 @@ public interface SessionOrchestratorInterface {
      */
     fun `addLocalForward`(`id`: kotlin.String, `bindAddress`: kotlin.String, `bindPort`: kotlin.UShort, `remoteHost`: kotlin.String, `remotePort`: kotlin.UShort)
     
+    /**
+     * 自動再接続ループを中止する。ループが動作中だった場合のみ`Disconnected`を
+     * 通知する(動いていない時に呼ばれても無音、UIは`isReconnecting`の間だけ
+     * 「中止」操作を出す想定)。
+     */
+    fun `cancelReconnect`()
+    
     fun `connect`(`config`: SshConfig)
     
     /**
@@ -3134,6 +3148,23 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_add_local_forward(
         it,
         FfiConverterString.lower(`id`),FfiConverterString.lower(`bindAddress`),FfiConverterUShort.lower(`bindPort`),FfiConverterString.lower(`remoteHost`),FfiConverterUShort.lower(`remotePort`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * 自動再接続ループを中止する。ループが動作中だった場合のみ`Disconnected`を
+     * 通知する(動いていない時に呼ばれても無音、UIは`isReconnecting`の間だけ
+     * 「中止」操作を出す想定)。
+     */override fun `cancelReconnect`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_cancel_reconnect(
+        it,
+        _status)
 }
     }
     
@@ -5286,6 +5317,23 @@ sealed class ConnectionPublicState {
         companion object
     }
     
+    /**
+     * 一度`Connected`になったセッションが予期せず切断された際、orchestratorが
+     * 自動的に再接続を試みている間の状態(`orchestrator.rs`のreconnectループ参照)。
+     * `elapsed_secs`/`timeout_secs`はUIがライブなカウントダウンを描画するための
+     * SSOT値(Kotlin側でタイマーを持たない)。
+     */
+    data class Reconnecting(
+        val `elapsedSecs`: kotlin.UInt, 
+        val `timeoutSecs`: kotlin.UInt, 
+        val `reason`: kotlin.String?) : ConnectionPublicState()
+        
+    {
+        
+
+        companion object
+    }
+    
 
     
 
@@ -5311,6 +5359,11 @@ public object FfiConverterTypeConnectionPublicState : FfiConverterRustBuffer<Con
                 )
             4 -> ConnectionPublicState.Error(
                 FfiConverterString.read(buf),
+                )
+            5 -> ConnectionPublicState.Reconnecting(
+                FfiConverterUInt.read(buf),
+                FfiConverterUInt.read(buf),
+                FfiConverterOptionalString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
@@ -5344,6 +5397,15 @@ public object FfiConverterTypeConnectionPublicState : FfiConverterRustBuffer<Con
                 + FfiConverterString.allocationSize(value.`message`)
             )
         }
+        is ConnectionPublicState.Reconnecting -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterUInt.allocationSize(value.`elapsedSecs`)
+                + FfiConverterUInt.allocationSize(value.`timeoutSecs`)
+                + FfiConverterOptionalString.allocationSize(value.`reason`)
+            )
+        }
     }
 
     override fun write(value: ConnectionPublicState, buf: ByteBuffer) {
@@ -5365,6 +5427,13 @@ public object FfiConverterTypeConnectionPublicState : FfiConverterRustBuffer<Con
             is ConnectionPublicState.Error -> {
                 buf.putInt(4)
                 FfiConverterString.write(value.`message`, buf)
+                Unit
+            }
+            is ConnectionPublicState.Reconnecting -> {
+                buf.putInt(5)
+                FfiConverterUInt.write(value.`elapsedSecs`, buf)
+                FfiConverterUInt.write(value.`timeoutSecs`, buf)
+                FfiConverterOptionalString.write(value.`reason`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
