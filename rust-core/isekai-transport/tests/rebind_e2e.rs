@@ -114,6 +114,11 @@ async fn rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable() {
     let n = stream.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"before rebind");
 
+    // `127.0.0.4` needs to be explicitly aliased onto `lo0` on macOS (unlike
+    // Linux, which routes the whole `127.0.0.0/8` range to `lo`
+    // unconditionally) — confirmed via a real `test-macos` CI failure
+    // (`AddrNotAvailable`); done in
+    // `.github/workflows/rust-core-test-check.yml`'s `test-macos` job.
     let physical_socket = bind_physical_interface(loopback_index(), SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 4)), 0))
         .expect("quicsock should bind a loopback-restricted socket");
     let physical_addr = physical_socket.local_addr().unwrap();
