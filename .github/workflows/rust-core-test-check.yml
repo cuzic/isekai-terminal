@@ -9,6 +9,19 @@ name: rust-core test check
 #
 # ネットワークnamespace/tc netemを使うnetlabシナリオ(root権限が必要)は対象外
 # (rust-core-netlab-check.ymlが別途カバーする)。
+#
+# test-macos: isekai-ssh/isekai-pipeおよびそれが依存するプラットフォーム横断crate
+# (isekai-netmon等)は公式にmacOS対応(release-build.ymlがx86_64/aarch64-apple-darwin
+# 向けにビルドしている)だが、実際のtest suiteをmacOSランナー上で実行するCIが
+# これまで一つも無く、macOS固有のバグはリリースタグを打つ時(--versionスモーク
+# テストのみ)まで発見されなかった。isekai-terminal-core(Android/iOS向けUniFFI
+# crate。isekai_pipe_quic_transport.rsがLinux musl静的バイナリをinclude_bytes!で
+# 無条件に埋め込むため、別途zig/cargo-zigbuildの前提ビルドが要る)とuniffi-bindgen
+# (Android/iOS binding生成ツール、CLI/shared crateのテスト対象外)は除外し、
+# それ以外のCLI/shared crateのみをmacOSでも検証する。iOS側の別ビルド確認は
+# ios-rust-core-check.yml等が既にカバーしている。
+#
+# test-windows: 詳細は各ジョブのコメント参照。
 
 on:
   push:
@@ -89,3 +102,91 @@ jobs:
       - name: cargo test --workspace (excluding noq-multipath-spike)
         working-directory: rust-core
         run: cargo test --workspace --exclude noq-multipath-spike
+
+  test-macos:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_LOG: warn
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          ssh -V
+          /usr/sbin/sshd -V || true
+          ssh-keygen -V || true
+
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: rust-core-test-macos-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            rust-core-test-macos-
+
+      # isekai-terminal-core(uniffi-bindgen生成物向けのUniFFI cdylib)は除外する:
+      # isekai_pipe_quic_transport.rsがLinux musl静的バイナリをinclude_bytes!で
+      # 無条件に埋め込むため、`test`ジョブと同じzig/cargo-zigbuildの前提ビルドが
+      # 必要になってしまい、このジョブが検証したいCLI/shared crateの話と関係ない。
+      # iOS向けクロスビルドの検証はios-rust-core-check.ymlが別途カバー済み。
+      # uniffi-bindgenはAndroid/iOS binding生成専用のCLIツールで同様に対象外。
+      - name: cargo test --workspace (macOS, excluding Android/iOS-only crates)
+        working-directory: rust-core
+        run: cargo test --workspace --exclude noq-multipath-spike --exclude isekai-terminal-core --exclude uniffi-bindgen
+
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_LOG: warn
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: rust-core-test-windows-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            rust-core-test-windows-
+
+      # Windows(windows-msvc)はisekai-ssh/README.mdで明記の通り「公式サポート
+      # 対象外」——このジョブの目的はそれを覆すことではなく、release-build.yml
+      # (タグ/workflow_dispatch時のみ`--version`スモークテスト)がビルド確認する
+      # 前にpush/PRの時点でWindowsビルド自体の回帰を検出することだけ。
+      #
+      # `cargo test`ではなく`cargo build`のみに留める: real_sshd系のe2eテストは
+      # `/usr/sbin/sshd`の有無で自動skipするが(real_sshd_bootstrap_e2e.rs等)、
+      # isekai-bootstrap/tests/openssh_e2e.rs等は`ssh(1)`クライアントの有無だけで
+      # 判定しており、windows-latestランナーにはOpenSSHクライアント(ssh.exe)が
+      # プリインストールされているため実際に走ってしまう。これらは内部で
+      # `sh -c`/`chmod`/`setsid`によるUnix専用のプロセス起動を実際のヘルパー
+      # スタンドイン(shell script)経由で検証しており、Windows上での動作は
+      # 未検証・未サポート。ここでビルド回帰だけを見て、Unix依存のe2e統合
+      # テストは意図的に対象外にする(黙って壊れているのではなく、方針)。
+      - name: cargo build --workspace (Windows, build-only regression check)
+        shell: bash
+        working-directory: rust-core
+        run: cargo build --workspace --exclude noq-multipath-spike --exclude isekai-terminal-core --exclude uniffi-bindgen
+
+      - name: cargo test --lib --bins --workspace (Windows, unit tests only)
+        shell: bash
+        working-directory: rust-core
+        run: cargo test --workspace --exclude noq-multipath-spike --exclude isekai-terminal-core --exclude uniffi-bindgen --lib --bins
