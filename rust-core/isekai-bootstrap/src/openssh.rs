@@ -384,25 +384,31 @@ impl OpenSshBackend {
         // stdin, immediately followed by `relay_jwt` (if any) and then the
         // base64-encoded binary — all length-prefixed (the lengths
         // themselves aren't secret, so they're safe to interpolate into the
-        // command string) and split with `head -c` (not `dd bs=1`, which
-        // reads one byte per syscall and would be needlessly slow for a
-        // multi-MB binary). The request/jwt byte counts are verified with
-        // `wc -c` before anything else runs, so a truncated stdin (e.g. the
-        // ssh connection dropping mid-write) fails closed instead of
-        // launching `isekai-pipe serve` against a partially-written file.
-        // `wc -c`'s output is piped through `tr -d '[:space:]'` before the
-        // `-eq` comparison: macOS's `wc` right-justifies its count with
-        // leading spaces (e.g. `     136`) even when reading from a single
-        // stdin stream, which made every remote-bootstrap `[ -eq ]` check
-        // silently evaluate false there (confirmed via a real `test-macos`
-        // CI failure — the whole `if` block was skipped, silently producing
-        // no output at all, misleadingly surfacing as `HandshakeMissing`
-        // instead of a parse error). GNU `wc` never pads a single count, so
-        // stripping whitespace is a no-op there.
+        // command string). The request/jwt pieces are split off with
+        // `dd bs=1 count=N` rather than `head -c N`: confirmed via a real
+        // `test-macos` CI failure that macOS's `head -c` (unlike GNU's) reads
+        // through its own stdio buffer when the input is a pipe, so it can
+        // silently consume *more* than the requested N bytes from stdin —
+        // swallowing the immediately-following `relay_jwt` bytes into a
+        // buffer that's discarded once `head` exits, leaving the next read
+        // with 0 bytes. `dd bs=1` always issues exactly N single-byte reads,
+        // so it can never over-consume; this only matters for these two
+        // small, bounded-size pieces with more stdin data after them — the
+        // final (and only large, multi-MB) piece, the base64-encoded binary,
+        // is still read with `head -c`/`base64 -d` directly since being the
+        // last thing on stdin, over-reading there has no observable effect.
+        // The request/jwt byte counts are verified with `wc -c` (piped
+        // through `tr -d '[:space:]'` first — macOS's `wc -c` right-justifies
+        // its count with leading spaces even for a single stdin stream, e.g.
+        // `     136`, which made the `-eq` comparison itself unreliable
+        // there too, independently of the `head`-over-read issue above) so a
+        // truncated stdin (e.g. the ssh connection dropping mid-write) fails
+        // closed instead of launching `isekai-pipe serve` against a
+        // partially-written file.
         let jwt_len = jwt_bytes.len();
         let read_jwt_step = if jwt_len > 0 {
             format!(
-                "head -c {jwt_len} > $tmpdir/relay_jwt; _dbg_jwt_wc=$(wc -c < $tmpdir/relay_jwt | tr -d '[:space:]'); echo \"DBGV3 jwt_wc=[$_dbg_jwt_wc] want=[{jwt_len}]\"; [ \"$_dbg_jwt_wc\" -eq {jwt_len} ] 2>/dev/null && "
+                "dd bs=1 count={jwt_len} > $tmpdir/relay_jwt 2>/dev/null && [ \"$(wc -c < $tmpdir/relay_jwt | tr -d '[:space:]')\" -eq {jwt_len} ] && "
             )
         } else {
             String::new()
@@ -438,10 +444,7 @@ mkdir -p {remote_dir} 2>/dev/null
 exec 9>>{lock_path} 2>/dev/null
 if command -v flock >/dev/null 2>&1; then flock -w 30 9 2>/dev/null || true; fi
 tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
-head -c {request_len} > $tmpdir/bootstrap-request.json
-_dbg_req_wc=$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')
-echo "DBGV3 req_wc=[$_dbg_req_wc] want=[{request_len}]"
-if [ "$_dbg_req_wc" -eq {request_len} ] 2>/dev/null && {read_jwt_step}true; then
+if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [ "$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')" -eq {request_len} ] && {read_jwt_step}true; then
   reuse_envelope=""
   if [ -f {state_path} ]; then
     existing_pid=$(sed -n '1p' {state_path} | cut -d' ' -f1)
