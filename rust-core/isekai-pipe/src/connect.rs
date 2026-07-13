@@ -661,13 +661,20 @@ async fn recover_via_cross_family_fallback(
         provider: "cross-family-fallback",
         id: "cross-family-fallback",
     };
+    // Unlike `intent.transport`, `intent.cross_family_fallback` never passes
+    // through `TryFrom<&ConnectionIntent> for CandidateDraft` — it's read
+    // directly here, so it needs its own validation checkpoint rather than
+    // trusting the raw persisted strings.
+    let (cert_pin, server_name) =
+        isekai_pipe_core::validate_endpoint_identity(&intent.expected_server_identity.cert_sha256_hex, server_name)
+            .context("isekai-pipe connect: cross_family_fallback has an invalid identity")?;
     run_relay_resumable(
         &RelayTarget {
             helper_addr: helper_addr
                 .parse()
                 .with_context(|| format!("isekai-pipe connect: invalid cross_family_fallback helper_addr {helper_addr:?}"))?,
-            server_name: server_name.clone(),
-            cert_sha256_hex: intent.expected_server_identity.cert_sha256_hex.clone(),
+            server_name: server_name.as_str().to_string(),
+            cert_sha256_hex: cert_pin.to_hex(),
             session_secret,
             local_bind_port_range: intent.local_bind_port_range,
         },

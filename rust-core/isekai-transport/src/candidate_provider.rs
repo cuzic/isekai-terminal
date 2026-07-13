@@ -21,8 +21,7 @@
 
 use isekai_pipe_core::{
     CandidateConversionError, CandidateDraft, CandidateDraftBatch, CandidateGeneration, CandidateOrigin,
-    CandidateOriginKind, CandidatePriority, CandidateRoute, CandidateValidity, CertificatePinSha256,
-    ConnectionIntent, IntentTransport, NormalizedServerName,
+    CandidateOriginKind, CandidatePriority, CandidateRoute, CandidateValidity, ConnectionIntent, IntentTransport,
 };
 use tokio::time::Instant;
 
@@ -152,17 +151,14 @@ impl CandidateProvider for ConfigRelayProvider {
         let mut candidates = Vec::with_capacity(intent.relay_endpoints.len());
 
         for (index, entry) in intent.relay_endpoints.iter().enumerate() {
-            let cert_pin = CertificatePinSha256::from_hex(&intent.expected_server_identity.cert_sha256_hex)
-                .map_err(|e| CandidateProviderError::InvalidRelayEndpoint {
-                    entry: entry.clone(),
-                    reason: format!("invalid expected_server_identity.cert_sha256_hex: {e}"),
-                })?;
+            let (cert_pin, server_name) = isekai_pipe_core::validate_endpoint_identity(
+                &intent.expected_server_identity.cert_sha256_hex,
+                "isekai-helper",
+            )
+            .map_err(|e| CandidateProviderError::InvalidRelayEndpoint { entry: entry.clone(), reason: e.to_string() })?;
             let helper_addr = entry.parse().map_err(|_| CandidateProviderError::InvalidRelayEndpoint {
                 entry: entry.clone(),
                 reason: "not a valid socket address".to_string(),
-            })?;
-            let server_name = NormalizedServerName::new("isekai-helper").map_err(|e| {
-                CandidateProviderError::InvalidRelayEndpoint { entry: entry.clone(), reason: format!("invalid server_name: {e}") }
             })?;
 
             candidates.push(CandidateDraft {
@@ -225,11 +221,9 @@ impl CandidateProvider for ConfigStunProvider {
 
         let mut candidates = Vec::with_capacity(intent.stun_servers.len());
         for (index, entry) in intent.stun_servers.iter().enumerate() {
-            let cert_pin = CertificatePinSha256::from_hex(&intent.expected_server_identity.cert_sha256_hex)
-                .map_err(|e| CandidateProviderError::InvalidStunServer {
-                    entry: entry.clone(),
-                    reason: format!("invalid expected_server_identity.cert_sha256_hex: {e}"),
-                })?;
+            let (cert_pin, server_name) =
+                isekai_pipe_core::validate_endpoint_identity(&intent.expected_server_identity.cert_sha256_hex, server_name)
+                    .map_err(|e| CandidateProviderError::InvalidStunServer { entry: entry.clone(), reason: e.to_string() })?;
             let stun_server = entry.parse().map_err(|_| CandidateProviderError::InvalidStunServer {
                 entry: entry.clone(),
                 reason: "not a valid socket address".to_string(),
@@ -237,12 +231,6 @@ impl CandidateProvider for ConfigStunProvider {
             let peer_addr = peer_addr.parse().map_err(|_| CandidateProviderError::InvalidStunServer {
                 entry: entry.clone(),
                 reason: "intent.transport's peer_addr is not a valid socket address".to_string(),
-            })?;
-            let server_name = NormalizedServerName::new(server_name).map_err(|e| {
-                CandidateProviderError::InvalidStunServer {
-                    entry: entry.clone(),
-                    reason: format!("intent.transport's server_name is invalid: {e}"),
-                }
             })?;
 
             candidates.push(CandidateDraft {

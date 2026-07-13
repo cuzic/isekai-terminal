@@ -356,12 +356,18 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
         let session_secret = decode_secret(&legacy_relay.session_secret_b64)?;
         let stun_discovery = probe_stun_discovery(stun_server).await;
 
+        // Validates the cached identity before dialing rather than letting a
+        // corrupted `PersistentProfile` (e.g. a truncated cert_sha256_hex)
+        // surface as an opaque TLS/handshake failure deep inside quicmux.
+        let (cert_pin, server_name) =
+            isekai_pipe_core::validate_endpoint_identity(&entry.server_identity.cert_sha256_hex, "isekai-helper")
+                .with_context(|| format!("isekai-pipe probe: profile {:?} has an invalid cached identity", launch.profile))?;
         let target = StunP2pTarget {
             peer_addr: peer_addr
                 .parse()
                 .with_context(|| format!("isekai-pipe probe: invalid cached_stun_observed_addr {peer_addr:?}"))?,
-            server_name: "isekai-helper".to_string(),
-            cert_sha256_hex: entry.server_identity.cert_sha256_hex.clone(),
+            server_name: server_name.as_str().to_string(),
+            cert_sha256_hex: cert_pin.to_hex(),
             session_secret,
         };
         let candidates = vec![SequentialStunCandidate { stun_server, candidate_id: "probe".to_string() }];
@@ -397,13 +403,16 @@ async fn run_probe(launch: ProbeLaunch) -> Result<ProbeReport> {
             reason: "profile has no cached STUN evidence from bootstrap (cached_stun_observed_addr unset)".to_string(),
         }
     };
+    let (cert_pin, server_name) =
+        isekai_pipe_core::validate_endpoint_identity(&entry.server_identity.cert_sha256_hex, "isekai-helper")
+            .with_context(|| format!("isekai-pipe probe: profile {:?} has an invalid cached identity", launch.profile))?;
     let target = RelayTarget {
         helper_addr: legacy_relay
             .helper_addr
             .parse()
             .with_context(|| format!("isekai-pipe probe: invalid cached helper_addr {:?}", legacy_relay.helper_addr))?,
-        server_name: "isekai-helper".to_string(),
-        cert_sha256_hex: entry.server_identity.cert_sha256_hex.clone(),
+        server_name: server_name.as_str().to_string(),
+        cert_sha256_hex: cert_pin.to_hex(),
         session_secret,
         // `isekai-pipe probe` diagnoses reachability against a
         // `PersistentProfile`, which doesn't carry a configured local
