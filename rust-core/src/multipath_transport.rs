@@ -1341,6 +1341,7 @@ mod tests {
 
     #[tokio::test]
     async fn path0_and_path1_both_serve_hello_ack() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let (port, cert_sha256_hex, secret) = start_test_server().await;
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let path1: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
@@ -1362,6 +1363,7 @@ mod tests {
 
     #[tokio::test]
     async fn path0_only_when_direct_host_absent() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let (port, cert_sha256_hex, secret) = start_test_server().await;
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
@@ -1395,6 +1397,7 @@ mod tests {
     /// （「WiFiのupstreamが死んでいる」検知→セルラーへrebindのシナリオの土台）。
     #[tokio::test]
     async fn connection_survives_rebind_to_new_local_address() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         use std::net::Ipv4Addr;
 
         let (port, cert_sha256_hex, secret) = start_test_server().await;
@@ -1443,6 +1446,7 @@ mod tests {
     /// 往復に応答できることを確認する（受動的フェイルオーバーの核心）。
     #[tokio::test]
     async fn connection_survives_after_path0_closes() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let (port, cert_sha256_hex, secret) = start_test_server().await;
         let path0: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let path1: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
@@ -1484,6 +1488,7 @@ mod tests {
     /// 両方確立し、HELLO/ACKに応答できることを確認する。
     #[tokio::test]
     async fn physical_path_candidate_establishes_via_multi_udp_socket() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         use std::os::fd::{AsRawFd, IntoRawFd};
 
         let (port, cert_sha256_hex, secret) = start_test_server().await;
@@ -1540,6 +1545,7 @@ mod tests {
     /// のように単独実行する）。
     #[tokio::test]
     async fn path0_degrades_and_recovers_under_injected_latency() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         crate::debug_fault::shared_injector().restore();
         crate::debug_fault::shared_injector().set_latency(Duration::ZERO);
         crate::debug_fault::shared_injector().set_loss_rate(0.0);
@@ -1599,6 +1605,7 @@ mod tests {
     /// テストと並行実行しても安全。
     #[tokio::test]
     async fn no_viable_path_fires_when_udp_fully_cut() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let injector = crate::faulty_udp_socket::UdpFaultInjector::new();
 
         let (port, cert_sha256_hex, _secret) = start_test_server().await;
@@ -1636,6 +1643,7 @@ mod tests {
     /// ところまで、プロセスグローバル状態に頼らずloopbackだけで実証する。
     #[tokio::test]
     async fn session_survives_rebind_when_only_current_path_is_cut() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         use std::os::fd::{AsRawFd, IntoRawFd};
 
         let wifi_injector = crate::faulty_udp_socket::UdpFaultInjector::new();
