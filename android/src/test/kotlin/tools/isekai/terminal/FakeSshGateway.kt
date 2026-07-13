@@ -93,6 +93,12 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     override fun disconnect() { disconnectCalled = true }
     override fun cancelReconnect() { cancelReconnectCalled = true }
+    // iOSセッションライフサイクル用のRustコールバック(このファイルが対象とする複数タブ/pane
+    // まわりのテストでは未検証、no-opで足りる)。
+    override fun notifyDidEnterBackground(budgetMs: UInt) {}
+    override fun notifyWillEnterForeground() {}
+    override fun notifyBackgroundBudgetExpired() {}
+    override fun notifyMemoryWarning() {}
     override fun send(data: ByteArray) { sentBytes.add(data) }
     override fun resize(cols: UInt, rows: UInt) { lastResizeCols = cols; lastResizeRows = rows }
     override fun scrollbackLen(): UInt = 0u

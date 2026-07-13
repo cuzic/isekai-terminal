@@ -53,6 +53,11 @@ internal class ConnectionCoordinator(
         // isReconnecting中はRust側が自動再接続ループを動かしているので、手動での
         // 二重接続を防ぐ(先にcancelReconnectPaneでループを止めてから再接続すべき)。
         if (current.connected || current.isConnecting || current.isReconnecting) return
+        // Task #10: 前回の接続試行が一度もConnectedへ遷移しないまま再接続された場合、
+        // observeConnectionTransitionsのdisconnect分岐を経由しないため、ここで明示的に
+        // 古いhandleを閉じてから次の接続試行に入る(閉じ忘れによるリーク防止)。
+        pane.physicalMultipathHandle?.close()
+        pane.physicalMultipathHandle = null
         pane.preConnectError.value = null
         armPostConnectCommands(pane, profile)
         loadPaneContent(pane, profile.id)
@@ -81,7 +86,9 @@ internal class ConnectionCoordinator(
                     // fdも取得してから接続する。取得に失敗/未取得でも例外にはせず、
                     // path0/path1のみのマルチパスにフォールバックする（日和見的ポリシー）。
                     val physicalFds = if (profile.enablePhysicalMultipath) {
-                        executor.acquirePhysicalMultipathFds()
+                        val acquisition = executor.acquirePhysicalMultipathFds()
+                        pane.physicalMultipathHandle = acquisition.handle
+                        acquisition.fds
                     } else {
                         PhysicalMultipathFds()
                     }

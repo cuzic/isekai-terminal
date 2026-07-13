@@ -2,7 +2,9 @@ package tools.isekai.terminal
 
 import android.net.Uri
 import tools.isekai.terminal.session.AppExecutor
+import tools.isekai.terminal.session.PhysicalMultipathAcquisition
 import tools.isekai.terminal.session.PhysicalMultipathFds
+import tools.isekai.terminal.session.RebindFdSource
 import tools.isekai.terminal.session.UploadFile
 import java.io.ByteArrayInputStream
 
@@ -58,40 +60,69 @@ class DumbAppExecutor : AppExecutor {
     override suspend fun saveDownloadFile(fileName: String, data: ByteArray) {}
     override fun release() { released = true }
 
-    /** acquirePhysicalMultipathFds() が返す値。テストで上書きして使う。既定は全滅（未取得）。 */
+    /** [AppExecutor]が返すhandle/sourceのclose記録用フェイク。テストから`.closed`を検証する。 */
+    class TestHandle(val label: String) : AutoCloseable {
+        var closed = false
+        override fun close() { closed = true }
+    }
+
+    /** acquirePhysicalMultipathFds() が返すfds。テストで上書きして使う。既定は全滅（未取得）。 */
     var physicalMultipathFds: PhysicalMultipathFds = PhysicalMultipathFds()
-    var acquirePhysicalMultipathFdsCallCount = 0
-    var releasePhysicalMultipathFdsCalled = false
+    /** acquirePhysicalMultipathFds() が発行した順の全handle。個別に`.closed`を検証できる。 */
+    val physicalMultipathHandles = mutableListOf<TestHandle>()
 
-    override suspend fun acquirePhysicalMultipathFds(): PhysicalMultipathFds {
-        acquirePhysicalMultipathFdsCallCount++
-        return physicalMultipathFds
+    override suspend fun acquirePhysicalMultipathFds(): PhysicalMultipathAcquisition {
+        val handle = TestHandle("physical-multipath-${physicalMultipathHandles.size}")
+        physicalMultipathHandles += handle
+        return PhysicalMultipathAcquisition(physicalMultipathFds, handle)
     }
-    override fun releasePhysicalMultipathFds() { releasePhysicalMultipathFdsCalled = true }
 
-    /** acquireCellularFd() が返す値。テストで上書きして使う。既定はnull（未取得）。 */
-    var cellularFdForUpstreamFailover: Pair<Int, String>? = null
-    /** acquireWifiFd() が返す値。テストで上書きして使う。既定はnull（未取得）。 */
+    /** registerUpstreamFailoverMonitor() が発行した順の全handle。 */
+    val upstreamFailoverHandles = mutableListOf<TestHandle>()
+    private val onWifiUpstreamBrokenCallbacks = mutableListOf<() -> Unit>()
+
+    override fun registerUpstreamFailoverMonitor(onWifiUpstreamBroken: () -> Unit): AutoCloseable {
+        val handle = TestHandle("upstream-failover-${upstreamFailoverHandles.size}")
+        upstreamFailoverHandles += handle
+        onWifiUpstreamBrokenCallbacks += onWifiUpstreamBroken
+        return handle
+    }
+
+    /** [RebindFdSource]のフェイク。本番実装と同じくclose後は問い合わせがnullを返す契約を再現する。 */
+    class TestRebindFdSource(
+        var wifiFd: Pair<Int, String>?,
+        var cellularFd: Pair<Int, String>?,
+    ) : RebindFdSource {
+        var closed = false
+        var acquireWifiFdCallCount = 0
+        var acquireCellularFdCallCount = 0
+        override suspend fun acquireWifiFd(): Pair<Int, String>? {
+            acquireWifiFdCallCount++
+            return if (closed) null else wifiFd
+        }
+        override suspend fun acquireCellularFd(): Pair<Int, String>? {
+            acquireCellularFdCallCount++
+            return if (closed) null else cellularFd
+        }
+        override fun close() { closed = true }
+    }
+
+    /** createRebindFdSource() が発行するsourceの既定fd値。テストで上書きして使う。既定はnull（未取得）。 */
     var wifiFdForRebind: Pair<Int, String>? = null
-    var registerUpstreamFailoverMonitorCallCount = 0
-    var unregisterUpstreamFailoverMonitorCalled = false
-    private var _onWifiUpstreamBroken: (() -> Unit)? = null
+    var cellularFdForUpstreamFailover: Pair<Int, String>? = null
+    /** createRebindFdSource() が発行した順の全source。 */
+    val rebindFdSources = mutableListOf<TestRebindFdSource>()
 
-    override fun registerUpstreamFailoverMonitor(onWifiUpstreamBroken: () -> Unit) {
-        registerUpstreamFailoverMonitorCallCount++
-        _onWifiUpstreamBroken = onWifiUpstreamBroken
+    override fun createRebindFdSource(): RebindFdSource {
+        val source = TestRebindFdSource(wifiFdForRebind, cellularFdForUpstreamFailover)
+        rebindFdSources += source
+        return source
     }
-    override fun unregisterUpstreamFailoverMonitor() {
-        unregisterUpstreamFailoverMonitorCalled = true
-        _onWifiUpstreamBroken = null
-    }
-    override suspend fun acquireCellularFd(): Pair<Int, String>? = cellularFdForUpstreamFailover
-    override suspend fun acquireWifiFd(): Pair<Int, String>? = wifiFdForRebind
 
     /** ネットワーク切断をシミュレートする。 */
     fun simulateNetworkLost() = _onLost?.invoke()
     /** ネットワーク復帰をシミュレートする。 */
     fun simulateNetworkAvailable() = _onAvailable?.invoke()
-    /** WiFi upstream断をシミュレートする。 */
-    fun simulateWifiUpstreamBroken() = _onWifiUpstreamBroken?.invoke()
+    /** [index]番目(登録順)に登録されたupstream failover監視のコールバックを発火する。既定は先頭。 */
+    fun simulateWifiUpstreamBroken(index: Int = 0) = onWifiUpstreamBrokenCallbacks.getOrNull(index)?.invoke()
 }
