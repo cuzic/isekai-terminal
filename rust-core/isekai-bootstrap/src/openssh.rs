@@ -450,8 +450,21 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
     existing_pid=$(sed -n '1p' {state_path} | cut -d' ' -f1)
     existing_fp=$(sed -n '1p' {state_path} | cut -d' ' -f2)
     if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
-      existing_exe=$(readlink -f /proc/$existing_pid/exe 2>/dev/null)
-      expected_exe=$(readlink -f {remote_binary_path} 2>/dev/null)
+      # `/proc/<pid>/exe` doesn't exist on macOS remotes (no /proc at all) —
+      # skip this extra identity check there and trust `kill -0` + fingerprint
+      # match alone (confirmed via a real `test-macos` CI failure: without
+      # this `-d /proc` guard, `existing_exe` was always empty on macOS, so
+      # the still-alive helper was never reused, defeating the whole point
+      # of this reuse path there). Safe to skip: per the comment below,
+      # `existing_fp` already pins this state file to this exact fingerprint,
+      # so this check was already "defense-in-depth, not a decision point".
+      if [ -d /proc ]; then
+        existing_exe=$(readlink -f /proc/$existing_pid/exe 2>/dev/null)
+        expected_exe=$(readlink -f {remote_binary_path} 2>/dev/null)
+      else
+        existing_exe=ok
+        expected_exe=ok
+      fi
       # `existing_fp` should always equal `{fingerprint}` here (the file
       # itself is fingerprint-scoped) — kept as a cheap defense-in-depth
       # sanity check, not a decision point: this bootstrap never touches a
