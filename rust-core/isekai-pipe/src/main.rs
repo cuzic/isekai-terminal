@@ -2231,15 +2231,14 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
 /// actual streamlocal forward bind on a normal disconnect; this sweep only
 /// catches what's left behind by abnormal exits (crash, `kill -9`, a
 /// network drop that skipped `ssh -O cancel -R`).
-const CTL_SOCKET_REMOTE_PREFIX: &str = "isekai-pipe-ctl-";
 const CTL_SOCKET_STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Best-effort, non-fatal: a sweep failure (e.g. `/tmp` unreadable for
 /// some reason) should never block `serve` from starting.
 fn sweep_stale_ctl_sockets_on_remote() {
     match isekai_pipe_core::sweep_stale_sockets(
-        std::path::Path::new("/tmp"),
-        CTL_SOCKET_REMOTE_PREFIX,
+        std::path::Path::new(isekai_pipe_core::CTL_SOCKET_DIR),
+        isekai_pipe_core::CTL_SOCKET_FILENAME_PREFIX,
         CTL_SOCKET_STALE_THRESHOLD,
     ) {
         Ok(removed) if !removed.is_empty() => {

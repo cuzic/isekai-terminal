@@ -76,9 +76,6 @@ use isekai_protocol::CtlMessage;
 #[cfg(test)]
 use isekai_protocol::ClipboardMime;
 
-/// `/tmp/isekai-pipe-ctl-<32 hex chars>.sock` on the remote host.
-const REMOTE_SOCK_PREFIX: &str = "/tmp/isekai-pipe-ctl-";
-
 pub(crate) struct CtlForward {
     pub(crate) remote_path: String,
     #[cfg(unix)]
@@ -98,15 +95,7 @@ pub(crate) struct CtlForward {
 /// `isekai_pipe_core`'s `new_intent_id` convention (same entropy, same
 /// encoding) so a squatting attacker cannot feasibly pre-guess the path.
 fn new_ctl_token() -> String {
-    use rand::RngCore as _;
-    use std::fmt::Write as _;
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    isekai_pipe_core::new_hex_token_128()
 }
 
 /// Pure decision of whether to attempt a ctl-socket forward for this
@@ -176,7 +165,7 @@ pub(crate) fn prepare_ctl_forward(runtime_dir: &Path) -> Result<CtlForward> {
     }
 
     Ok(CtlForward {
-        remote_path: format!("{REMOTE_SOCK_PREFIX}{token}.sock"),
+        remote_path: isekai_pipe_core::ctl_socket_remote_path(&token),
         local_path: local_dir.join(format!("{token}.sock")),
     })
 }
@@ -194,7 +183,7 @@ pub(crate) fn prepare_ctl_forward(_runtime_dir: &Path) -> Result<CtlForward> {
         std::net::TcpListener::bind(("127.0.0.1", 0)).context("failed to bind a local ctl listener on 127.0.0.1")?;
     let local_port = listener.local_addr().context("failed to read local ctl listener port")?.port();
 
-    Ok(CtlForward { remote_path: format!("{REMOTE_SOCK_PREFIX}{token}.sock"), local_port, listener: Some(listener) })
+    Ok(CtlForward { remote_path: isekai_pipe_core::ctl_socket_remote_path(&token), local_port, listener: Some(listener) })
 }
 
 /// Binds `forward.local_path` (unix) / takes ownership of the already-bound
@@ -393,7 +382,7 @@ mod tests {
         let ctl_dir = dir.path().join("ctl");
         let mode = std::fs::metadata(&ctl_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
-        assert!(forward.remote_path.starts_with(REMOTE_SOCK_PREFIX));
+        assert!(forward.remote_path.starts_with(isekai_pipe_core::CTL_SOCKET_DIR));
         assert_eq!(forward.local_path.parent().unwrap(), ctl_dir);
     }
 
@@ -401,7 +390,7 @@ mod tests {
     #[test]
     fn prepare_ctl_forward_binds_a_real_loopback_port() {
         let forward = prepare_ctl_forward(Path::new(".")).unwrap();
-        assert!(forward.remote_path.starts_with(REMOTE_SOCK_PREFIX));
+        assert!(forward.remote_path.starts_with(isekai_pipe_core::CTL_SOCKET_DIR));
         assert_ne!(forward.local_port, 0);
         assert!(forward.listener.is_some());
     }

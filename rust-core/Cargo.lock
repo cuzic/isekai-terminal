@@ -1749,6 +1749,7 @@ dependencies = [
  "flate2",
  "hmac",
  "isekai-bootstrap",
+ "isekai-pipe-core",
  "isekai-protocol",
  "isekai-stun",
  "isekai-transport",
