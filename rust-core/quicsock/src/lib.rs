@@ -102,10 +102,19 @@ impl From<u32> for InterfaceIndex {
 ///
 /// # Errors
 ///
-/// Returns an error if the socket cannot be created, if `interface` does not
-/// name a currently-live interface, or if `local_addr`'s address family
-/// doesn't match an interface the OS will accept for it (e.g. binding an
-/// IPv6 address to an interface that only has IPv4 addresses).
+/// Returns an error if the socket cannot be created, if `local_addr`'s
+/// address family doesn't match an interface the OS will accept for it (e.g.
+/// binding an IPv6 address to an interface that only has IPv4 addresses),
+/// or — on Unix — if `interface` does not name a currently-live interface.
+///
+/// **Windows caveat** (confirmed on a real `test-windows` CI run, not just
+/// documentation): `IP_UNICAST_IF`/`IPV6_UNICAST_IF`'s underlying
+/// `setsockopt` call does not validate the interface index against a live
+/// adapter — passing an index that names no real interface still returns
+/// success here. The restriction is only (if at all) enforced later, when
+/// the OS actually routes packets through it. Callers on Windows that need
+/// to fail fast on a bogus index should validate it against
+/// [`discovery::list_interfaces`] themselves first.
 ///
 /// # Android
 ///
@@ -243,7 +252,14 @@ mod tests {
         assert!(result.is_err(), "binding to interface index 0 should fail, got {result:?}");
     }
 
+    // Windows-only exclusion: confirmed on a real `test-windows` CI run that
+    // `setsockopt(IP_UNICAST_IF/IPV6_UNICAST_IF, ...)` succeeds unconditionally
+    // there regardless of whether the index names a live interface — see
+    // `bind`'s doc comment's "Windows caveat" above. Unix's
+    // `SO_BINDTOIFINDEX`/`IP_BOUND_IF` reject a nonexistent index immediately,
+    // which is what these tests actually verify there.
     #[test]
+    #[cfg(not(windows))]
     fn nonexistent_interface_index_fails_rather_than_panicking() {
         // No portable way to name a real interface here (this crate must
         // build and test on any machine, real interfaces vary), so this
@@ -254,6 +270,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn bind_tcp_rejects_bogus_interface_the_same_way_as_bind_udp() {
         let result = bind_tcp(InterfaceIndex(u32::MAX), "127.0.0.1:0".parse().unwrap());
         assert!(result.is_err(), "binding TCP to a bogus interface index should fail, got {result:?}");
