@@ -135,8 +135,9 @@ pub(crate) struct MultipathIsekaiPipeQuicSession {
     rebind_tx: StdMutex<Option<tokio::sync::mpsc::Sender<RebindRequest>>>,
     /// trzsz転送中(WaitingUser含む)かどうか。`RebindManager`(rebind_manager.rs)の
     /// `RebindEvent::TrafficBusyDetected`/`TrafficQuietDetected`の判定材料の一つ
-    /// として#22のDriverが読み出す。
-    interactive_busy: std::sync::atomic::AtomicBool,
+    /// として#22のDriver(`RealQuietTrafficSource`)が読み出す。`try_connect_multipath`
+    /// へ複製を渡す必要があるため`Arc`で持つ。
+    interactive_busy: Arc<std::sync::atomic::AtomicBool>,
     /// #8: 通信静けさ判定。rebind(接続の張り直し)を跨いでも同じインスタンスを
     /// 使い続ける(rebind直前直後の活動も「静けさ」判定にとって意味があるため、
     /// rebindのたびにリセットしない)。
@@ -152,7 +153,7 @@ pub(crate) fn create_multipath_isekai_pipe_quic_session(config: MultipathIsekaiP
         config,
         core: SessionCore::new(),
         rebind_tx: StdMutex::new(None),
-        interactive_busy: std::sync::atomic::AtomicBool::new(false),
+        interactive_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         traffic_stats: TrafficStats::new(),
         rebind_driver: StdMutex::new(None),
     })
@@ -176,8 +177,13 @@ impl MultipathIsekaiPipeQuicSession {
         let host_key_callback = self.core.callback();
         let session = self.clone();
         let traffic_stats = self.traffic_stats.clone();
+        let interactive_busy = self.interactive_busy.clone();
         RUNTIME.spawn(async move {
-            match try_connect_multipath(&config, rebind_tx, rebind_rx, event_tx.clone(), host_key_callback, traffic_stats).await {
+            match try_connect_multipath(
+                &config, rebind_tx, rebind_rx, event_tx.clone(), host_key_callback, traffic_stats, interactive_busy,
+            )
+            .await
+            {
                 Ok((stream, driver_handle)) => {
                     *session.rebind_driver.lock().unwrap() = Some(driver_handle);
                     run_over_stream(config, stream, cmd_rx, event_tx).await
@@ -733,6 +739,21 @@ impl rebind_driver::RebindStateObserver for RealRebindObserver {
     }
 }
 
+/// #22: `RebindAction::StartQuietWatch`中、Driverが一定間隔で読み出す
+/// 「今静かか」の判定。trzsz busyフラグ(#9)をTrafficStats(#8)より優先する
+/// (転送中はバイト数が少ない瞬間があっても静かとみなさない)。
+struct RealQuietTrafficSource {
+    traffic_stats: TrafficStats,
+    interactive_busy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl rebind_ports::QuietTrafficSource for RealQuietTrafficSource {
+    fn is_quiet(&self) -> bool {
+        !self.interactive_busy.load(std::sync::atomic::Ordering::Relaxed)
+            && self.traffic_stats.is_quiet(std::time::Instant::now())
+    }
+}
+
 /// path0 に接続し、path1（`direct_host`が指定されていれば）と、Phase 9-4の
 /// 物理path候補（`physical`、`Network.bindSocket()`済みのfdから構築）を追加で
 /// 開く。path1・物理pathいずれも確立に失敗して致命的エラーにはしない
@@ -942,6 +963,7 @@ async fn try_connect_multipath(
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
     host_key_callback: Option<Arc<dyn SessionCallback>>,
     traffic_stats: TrafficStats,
+    interactive_busy: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<((noq::SendStream, noq::RecvStream), rebind_driver::RebindDriverHandle), String> {
     // ユーザーが明示指定していればそれを優先し、無指定ならdirect_host使用時のみ
     // 既定の固定ポートにフォールバックする(後方互換)。
@@ -995,8 +1017,9 @@ async fn try_connect_multipath(
     let fd_source = Arc::new(RealPlatformFdSource { callback: rebind_callback.clone() });
     let probe = Arc::new(RealWifiProbeExecutor { remote: primary_remote });
     let executor = Arc::new(RealRebindExecutor { rebind_tx });
+    let quiet_source = Arc::new(RealQuietTrafficSource { traffic_stats: traffic_stats.clone(), interactive_busy });
     let observer: Arc<dyn rebind_driver::RebindStateObserver> = Arc::new(RealRebindObserver { callback: rebind_callback });
-    let driver_handle = rebind_driver::spawn_rebind_driver(fd_source, probe, executor, observer);
+    let driver_handle = rebind_driver::spawn_rebind_driver(fd_source, probe, executor, quiet_source, observer);
 
     let (conn, _broker, endpoint) = establish_multipath_connection(
         path0_addr, path1_addr, physical, &cert_sha256_hex, event_tx, crate::debug_fault::shared_injector(),
