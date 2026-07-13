@@ -184,4 +184,31 @@ class ConnectionProfileTest {
     @Test fun `usesJumpHost is true when jumpHost is set`() {
         assertTrue(profile().copy(jumpHost = "bastion.example.com").usesJumpHost)
     }
+
+    // ── authTypeEnum / jumpAuthTypeEnum（typed model への変換）──────────────
+
+    @Test fun `authTypeEnum maps password string to AuthType PASSWORD`() {
+        assertEquals(AuthType.PASSWORD, profile().copy(authType = "password").authTypeEnum)
+    }
+
+    @Test fun `authTypeEnum maps key string to AuthType KEY`() {
+        assertEquals(AuthType.KEY, profile().copy(authType = "key").authTypeEnum)
+    }
+
+    @Test fun `authTypeEnum is null for an unknown authType string`() {
+        assertNull(profile().copy(authType = "agent").authTypeEnum)
+    }
+
+    @Test fun `jumpAuthTypeEnum is null when jumpAuthType is not set`() {
+        assertNull(profile().jumpAuthTypeEnum)
+    }
+
+    @Test fun `jumpAuthTypeEnum maps set jumpAuthType to the matching AuthType`() {
+        assertEquals(AuthType.KEY, profile().copy(jumpAuthType = "key").jumpAuthTypeEnum)
+        assertEquals(AuthType.PASSWORD, profile().copy(jumpAuthType = "password").jumpAuthTypeEnum)
+    }
+
+    @Test fun `jumpAuthTypeEnum is null for an unknown jumpAuthType string`() {
+        assertNull(profile().copy(jumpAuthType = "agent").jumpAuthTypeEnum)
+    }
 }
