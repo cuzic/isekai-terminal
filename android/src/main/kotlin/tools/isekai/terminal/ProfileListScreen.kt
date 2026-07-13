@@ -604,7 +604,7 @@ private fun ProfileCard(
  * ([jumpLabel] が non-null)がパスワード認証のため、踏み台分のフィールドだけを表示する。
  */
 @Composable
-private fun PasswordDialog(
+internal fun PasswordDialog(
     label: String,
     showMainField: Boolean,
     jumpLabel: String?,
