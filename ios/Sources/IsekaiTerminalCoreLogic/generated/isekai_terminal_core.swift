@@ -1081,6 +1081,13 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      */
     func addLocalForward(id: String, bindAddress: String, bindPort: UInt16, remoteHost: String, remotePort: UInt16) 
     
+    /**
+     * 自動再接続ループを中止する。ループが動作中だった場合のみ`Disconnected`を
+     * 通知する(動いていない時に呼ばれても無音、UIは`isReconnecting`の間だけ
+     * 「中止」操作を出す想定)。
+     */
+    func cancelReconnect() 
+    
     func connect(config: SshConfig) throws 
     
     /**
@@ -1129,7 +1136,31 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     
     func isQuic()  -> Bool
     
+    /**
+     * バックグラウンド猶予が尽きた(`beginBackgroundTask`失効等)ことを通知する。
+     * 猶予追跡中(`Quiescing`)の場合のみ、次のフォアグラウンド復帰時に再接続が
+     * 必要な状態(`Suspended`)へ遷移する。
+     */
+    func notifyBackgroundBudgetExpired() 
+    
+    /**
+     * アプリがバックグラウンドへ遷移した(iOSの`UIApplication.didEnterBackground`/
+     * Androidの`ProcessLifecycleOwner.onStop`相当)ことを通知する。`budget_ms`は
+     * `beginBackgroundTask`等が保証する猶予の目安として記録目的で受け取るが、
+     * 実際の期限管理(タイマー)はSwift/Kotlin側の責務のままにする(Rust/Swiftで
+     * 基準時計を共有していないため)。`Connected`中のみ猶予追跡を開始する
+     * (未接続/接続試行中のバックグラウンド化は維持すべきセッションが無いので無視)。
+     */
+    func notifyDidEnterBackground(budgetMs: UInt32) 
+    
     func notifyError(message: String) 
+    
+    /**
+     * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを終了
+     * される可能性が高まったとみなし、猶予を待たず保守的に`Suspended`扱いにする
+     * (無言で固まった画面をユーザーに見せるより、次回復帰時に再接続する方が安全)。
+     */
+    func notifyMemoryWarning() 
     
     /**
      * OS からネットワーク断（Wi-Fi/セルラー消失等）を通知された時の対応を決める。
@@ -1145,6 +1176,17 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      * 即切断されていた実バグの唯一の発生源だったため。
      */
     func notifyNetworkPathChanged(isSatisfied: Bool) 
+    
+    /**
+     * アプリがフォアグラウンドへ復帰した(iOSの`willEnterForeground`/Androidの
+     * `onStart`相当)ことを通知する。`Suspended`だった場合のみ、直前の接続設定
+     * (`last_connect_attempt`)で自動的に再接続を試みる(Kotlin/Swiftはこの生
+     * イベントを送るだけでよく、再接続要否の判断はしない)。既に自動再接続ループが
+     * 動作中、または他の接続試行が進行中の場合は二重に開始しない。`Quiescing`
+     * (猶予内復帰、接続は生きている前提)や`Foreground`(そもそも追跡対象外)では
+     * 何もしない。
+     */
+    func notifyWillEnterForeground() 
     
     /**
      * 「WiFiは繋がっているがupstreamが死んでいる」等をKotlin側で検知した際に呼ぶ。
@@ -1256,6 +1298,18 @@ open func addLocalForward(id: String, bindAddress: String, bindPort: UInt16, rem
 }
 }
     
+    /**
+     * 自動再接続ループを中止する。ループが動作中だった場合のみ`Disconnected`を
+     * 通知する(動いていない時に呼ばれても無音、UIは`isReconnecting`の間だけ
+     * 「中止」操作を出す想定)。
+     */
+open func cancelReconnect()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_cancel_reconnect(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
 open func connect(config: SshConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect(
             self.uniffiCloneHandle(),
@@ -1362,10 +1416,50 @@ open func isQuic() -> Bool  {
 })
 }
     
+    /**
+     * バックグラウンド猶予が尽きた(`beginBackgroundTask`失効等)ことを通知する。
+     * 猶予追跡中(`Quiescing`)の場合のみ、次のフォアグラウンド復帰時に再接続が
+     * 必要な状態(`Suspended`)へ遷移する。
+     */
+open func notifyBackgroundBudgetExpired()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_background_budget_expired(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * アプリがバックグラウンドへ遷移した(iOSの`UIApplication.didEnterBackground`/
+     * Androidの`ProcessLifecycleOwner.onStop`相当)ことを通知する。`budget_ms`は
+     * `beginBackgroundTask`等が保証する猶予の目安として記録目的で受け取るが、
+     * 実際の期限管理(タイマー)はSwift/Kotlin側の責務のままにする(Rust/Swiftで
+     * 基準時計を共有していないため)。`Connected`中のみ猶予追跡を開始する
+     * (未接続/接続試行中のバックグラウンド化は維持すべきセッションが無いので無視)。
+     */
+open func notifyDidEnterBackground(budgetMs: UInt32)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_did_enter_background(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(budgetMs),$0
+    )
+}
+}
+    
 open func notifyError(message: String)  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(message),$0
+    )
+}
+}
+    
+    /**
+     * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを終了
+     * される可能性が高まったとみなし、猶予を待たず保守的に`Suspended`扱いにする
+     * (無言で固まった画面をユーザーに見せるより、次回復帰時に再接続する方が安全)。
+     */
+open func notifyMemoryWarning()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_memory_warning(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
@@ -1387,6 +1481,22 @@ open func notifyNetworkPathChanged(isSatisfied: Bool)  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_network_path_changed(
             self.uniffiCloneHandle(),
         FfiConverterBool.lower(isSatisfied),$0
+    )
+}
+}
+    
+    /**
+     * アプリがフォアグラウンドへ復帰した(iOSの`willEnterForeground`/Androidの
+     * `onStart`相当)ことを通知する。`Suspended`だった場合のみ、直前の接続設定
+     * (`last_connect_attempt`)で自動的に再接続を試みる(Kotlin/Swiftはこの生
+     * イベントを送るだけでよく、再接続要否の判断はしない)。既に自動再接続ループが
+     * 動作中、または他の接続試行が進行中の場合は二重に開始しない。`Quiescing`
+     * (猶予内復帰、接続は生きている前提)や`Foreground`(そもそも追跡対象外)では
+     * 何もしない。
+     */
+open func notifyWillEnterForeground()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_will_enter_foreground(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
@@ -1551,331 +1661,6 @@ public func FfiConverterTypeSessionOrchestrator_lift(_ handle: UInt64) throws ->
 #endif
 public func FfiConverterTypeSessionOrchestrator_lower(_ value: SessionOrchestrator) -> UInt64 {
     return FfiConverterTypeSessionOrchestrator.lower(value)
-}
-
-
-
-
-
-
-/**
- * `SessionState`×`ExecutionMode`の2軸FSMを保持する、判断ロジックのみのオブジェクト。
- * 意図的にどのtransport(`SshSession`/`IsekaiPipeQuicSession`等)とも結び付けていない
- * (`.claude/rules/rust-ssot.md`が要求する「状態と、それに基づく意思決定ロジックは
- * Rust側に置く」を満たす最小単位として切り出し、実際の接続開始/切断呼び出しは
- * 呼び出し側(Kotlin/Swift)が現在の状態を見て行う。既存`SessionOrchestrator`の
- * `ConnPhase`(Idle/Connecting/Connected)を置き換えるかどうかは別途判断が必要な
- * 大きめの移行のため#24のスコープには含めず、まずはこの新しいFSM自体を
- * 単体テスト可能な形で実装することを優先した。PLAN.md「Phase 1C(#24)実装メモ」参照)。
- */
-public protocol SessionSupervisorProtocol: AnyObject, Sendable {
-    
-    /**
-     * アプリ終了(`applicationWillTerminate`相当)。以降の再利用は想定しない終端。
-     */
-    func applicationWillTerminate() 
-    
-    func executionMode()  -> ExecutionMode
-    
-    /**
-     * バックグラウンド猶予(`budget_ms`)が尽きた、またはOSにより実際に一時停止/
-     * 終了させられたことを通知する。`Quiescing`中のみ`Suspended`へ遷移する。
-     */
-    func markSuspended() 
-    
-    /**
-     * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを
-     * 終了される可能性が高まったとみなし、`Quiescing`中であれば猶予を待たず
-     * 保守的に`Suspended`扱いにする(実際に終了されるとは限らないが、次の
-     * フォアグラウンド復帰時に「再接続が必要」側へ倒しておく方が、ユーザーに
-     * 無言で固まった画面を見せるより安全という判断)。
-     */
-    func memoryWarning() 
-    
-    /**
-     * 接続試行が失敗したことを通知する(ハンドシェイク失敗・タイムアウト等)。
-     */
-    func onConnectFailed() 
-    
-    /**
-     * 接続試行を開始したことを通知する。
-     */
-    func onConnectRequested() 
-    
-    /**
-     * 接続確立(または再接続成功)を通知する。`Connecting`/`Resuming`のどちらからでも
-     * `Active`へ遷移できる(`Resuming`はフォアグラウンド復帰後の再接続が成功した場合)。
-     */
-    func onConnected() 
-    
-    /**
-     * 切断(意図的/エラー問わず)を通知する。
-     */
-    func onDisconnected() 
-    
-    /**
-     * `Closing`中の後始末(実トランスポートの切断)が完了したことを通知する。
-     */
-    func onTerminated() 
-    
-    /**
-     * アプリがバックグラウンドへ遷移したことを通知する。`budget_ms`は
-     * `UIApplication.beginBackgroundTask`等が保証する猶予の目安(実際の期限管理は
-     * 呼び出し側が持つ。PLAN.md外部レビュー論点10参照、Rust側では記録しない)。
-     * `Active`の場合のみ`Quiescing`へ遷移する(`Disconnected`/`Connecting`中に
-     * バックグラウンド化しても新規にセッションを維持し始めるわけではないため、
-     * `session_state`自体は変えない)。
-     */
-    func prepareForBackground(budgetMs: UInt32) 
-    
-    /**
-     * アプリがフォアグラウンドへ復帰したことを通知する。`Quiescing`は猶予内に
-     * 復帰できたとみなしそのまま`Active`へ戻す(接続は生きている前提)。
-     * `Suspended`は既に接続が失われている前提のため`Resuming`にし、呼び出し側が
-     * 実際に再接続してから`on_connected()`を呼ぶ必要がある。
-     */
-    func resumeFromForeground() 
-    
-    func sessionState()  -> SessionState
-    
-}
-/**
- * `SessionState`×`ExecutionMode`の2軸FSMを保持する、判断ロジックのみのオブジェクト。
- * 意図的にどのtransport(`SshSession`/`IsekaiPipeQuicSession`等)とも結び付けていない
- * (`.claude/rules/rust-ssot.md`が要求する「状態と、それに基づく意思決定ロジックは
- * Rust側に置く」を満たす最小単位として切り出し、実際の接続開始/切断呼び出しは
- * 呼び出し側(Kotlin/Swift)が現在の状態を見て行う。既存`SessionOrchestrator`の
- * `ConnPhase`(Idle/Connecting/Connected)を置き換えるかどうかは別途判断が必要な
- * 大きめの移行のため#24のスコープには含めず、まずはこの新しいFSM自体を
- * 単体テスト可能な形で実装することを優先した。PLAN.md「Phase 1C(#24)実装メモ」参照)。
- */
-open class SessionSupervisor: SessionSupervisorProtocol, @unchecked Sendable {
-    fileprivate let handle: UInt64
-
-    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public struct NoHandle {
-        public init() {}
-    }
-
-    // TODO: We'd like this to be `private` but for Swifty reasons,
-    // we can't implement `FfiConverter` without making this `required` and we can't
-    // make it `required` without making it `public`.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    required public init(unsafeFromHandle handle: UInt64) {
-        self.handle = handle
-    }
-
-    // This constructor can be used to instantiate a fake object.
-    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
-    //
-    // - Warning:
-    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public init(noHandle: NoHandle) {
-        self.handle = 0
-    }
-
-#if swift(>=5.8)
-    @_documentation(visibility: private)
-#endif
-    public func uniffiCloneHandle() -> UInt64 {
-        return try! rustCall { uniffi_isekai_terminal_core_fn_clone_sessionsupervisor(self.handle, $0) }
-    }
-    // No primary constructor declared for this class.
-
-    deinit {
-        if handle == 0 {
-            // Mock objects have handle=0 don't try to free them
-            return
-        }
-
-        try! rustCall { uniffi_isekai_terminal_core_fn_free_sessionsupervisor(handle, $0) }
-    }
-
-    
-
-    
-    /**
-     * アプリ終了(`applicationWillTerminate`相当)。以降の再利用は想定しない終端。
-     */
-open func applicationWillTerminate()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_application_will_terminate(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-open func executionMode() -> ExecutionMode  {
-    return try!  FfiConverterTypeExecutionMode_lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_execution_mode(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
-    /**
-     * バックグラウンド猶予(`budget_ms`)が尽きた、またはOSにより実際に一時停止/
-     * 終了させられたことを通知する。`Quiescing`中のみ`Suspended`へ遷移する。
-     */
-open func markSuspended()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_mark_suspended(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-    /**
-     * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを
-     * 終了される可能性が高まったとみなし、`Quiescing`中であれば猶予を待たず
-     * 保守的に`Suspended`扱いにする(実際に終了されるとは限らないが、次の
-     * フォアグラウンド復帰時に「再接続が必要」側へ倒しておく方が、ユーザーに
-     * 無言で固まった画面を見せるより安全という判断)。
-     */
-open func memoryWarning()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_memory_warning(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-    /**
-     * 接続試行が失敗したことを通知する(ハンドシェイク失敗・タイムアウト等)。
-     */
-open func onConnectFailed()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_connect_failed(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-    /**
-     * 接続試行を開始したことを通知する。
-     */
-open func onConnectRequested()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_connect_requested(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-    /**
-     * 接続確立(または再接続成功)を通知する。`Connecting`/`Resuming`のどちらからでも
-     * `Active`へ遷移できる(`Resuming`はフォアグラウンド復帰後の再接続が成功した場合)。
-     */
-open func onConnected()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_connected(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-    /**
-     * 切断(意図的/エラー問わず)を通知する。
-     */
-open func onDisconnected()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_disconnected(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-    /**
-     * `Closing`中の後始末(実トランスポートの切断)が完了したことを通知する。
-     */
-open func onTerminated()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_on_terminated(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-    /**
-     * アプリがバックグラウンドへ遷移したことを通知する。`budget_ms`は
-     * `UIApplication.beginBackgroundTask`等が保証する猶予の目安(実際の期限管理は
-     * 呼び出し側が持つ。PLAN.md外部レビュー論点10参照、Rust側では記録しない)。
-     * `Active`の場合のみ`Quiescing`へ遷移する(`Disconnected`/`Connecting`中に
-     * バックグラウンド化しても新規にセッションを維持し始めるわけではないため、
-     * `session_state`自体は変えない)。
-     */
-open func prepareForBackground(budgetMs: UInt32)  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_prepare_for_background(
-            self.uniffiCloneHandle(),
-        FfiConverterUInt32.lower(budgetMs),$0
-    )
-}
-}
-    
-    /**
-     * アプリがフォアグラウンドへ復帰したことを通知する。`Quiescing`は猶予内に
-     * 復帰できたとみなしそのまま`Active`へ戻す(接続は生きている前提)。
-     * `Suspended`は既に接続が失われている前提のため`Resuming`にし、呼び出し側が
-     * 実際に再接続してから`on_connected()`を呼ぶ必要がある。
-     */
-open func resumeFromForeground()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_resume_from_foreground(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-    
-open func sessionState() -> SessionState  {
-    return try!  FfiConverterTypeSessionState_lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionsupervisor_session_state(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-    
-
-    
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeSessionSupervisor: FfiConverter {
-    typealias FfiType = UInt64
-    typealias SwiftType = SessionSupervisor
-
-    public static func lift(_ handle: UInt64) throws -> SessionSupervisor {
-        return SessionSupervisor(unsafeFromHandle: handle)
-    }
-
-    public static func lower(_ value: SessionSupervisor) -> UInt64 {
-        return value.uniffiCloneHandle()
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionSupervisor {
-        let handle: UInt64 = try readInt(&buf)
-        return try lift(handle)
-    }
-
-    public static func write(_ value: SessionSupervisor, into buf: inout [UInt8]) {
-        writeInt(&buf, lower(value))
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeSessionSupervisor_lift(_ handle: UInt64) throws -> SessionSupervisor {
-    return try FfiConverterTypeSessionSupervisor.lift(handle)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeSessionSupervisor_lower(_ value: SessionSupervisor) -> UInt64 {
-    return FfiConverterTypeSessionSupervisor.lower(value)
 }
 
 
@@ -3455,15 +3240,94 @@ public func FfiConverterTypeClipboardMimeKind_lower(_ value: ClipboardMimeKind) 
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * #19: 接続失敗の原因をユーザーが自己解決しやすくするための追加ヒント。
+ * 判断材料(接続先アドレスの種別等)はRust側(`orchestrator.rs`)に閉じており、
+ * Kotlin/Swiftは届いたヒントに応じた案内UIを出すだけでよい(`rust-ssot.md`)。
+ * あくまでヒューリスティックなヒントであり、他の理由でも同じ判定になり得る。
+ */
+
+public enum ConnectionIssueHint: Equatable, Hashable {
+    
+    /**
+     * 接続先がプライベート/リンクローカルアドレス(ローカルLAN上のホスト)で、
+     * 一度もConnectedに至らないまま切断された。iOSのLocal Network Privacyが
+     * 拒否されていると、こうした接続がサイレントに失敗し続ける。
+     */
+    case localNetworkPermissionPossiblyDenied
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ConnectionIssueHint: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConnectionIssueHint: FfiConverterRustBuffer {
+    typealias SwiftType = ConnectionIssueHint
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConnectionIssueHint {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .localNetworkPermissionPossiblyDenied
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ConnectionIssueHint, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .localNetworkPermissionPossiblyDenied:
+            writeInt(&buf, Int32(1))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConnectionIssueHint_lift(_ buf: RustBuffer) throws -> ConnectionIssueHint {
+    return try FfiConverterTypeConnectionIssueHint.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConnectionIssueHint_lower(_ value: ConnectionIssueHint) -> RustBuffer {
+    return FfiConverterTypeConnectionIssueHint.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum ConnectionPublicState: Equatable, Hashable {
     
-    case disconnected(reason: String?
+    case disconnected(reason: String?, issueHint: ConnectionIssueHint?
     )
     case connecting
     case connected(host: String
     )
     case error(message: String
+    )
+    /**
+     * 一度`Connected`になったセッションが予期せず切断された際、orchestratorが
+     * 自動的に再接続を試みている間の状態(`orchestrator.rs`のreconnectループ参照)。
+     * `elapsed_secs`/`timeout_secs`はUIがライブなカウントダウンを描画するための
+     * SSOT値(Kotlin側でタイマーを持たない)。
+     */
+    case reconnecting(elapsedSecs: UInt32, timeoutSecs: UInt32, reason: String?
     )
 
 
@@ -3486,7 +3350,7 @@ public struct FfiConverterTypeConnectionPublicState: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .disconnected(reason: try FfiConverterOptionString.read(from: &buf)
+        case 1: return .disconnected(reason: try FfiConverterOptionString.read(from: &buf), issueHint: try FfiConverterOptionTypeConnectionIssueHint.read(from: &buf)
         )
         
         case 2: return .connecting
@@ -3497,6 +3361,9 @@ public struct FfiConverterTypeConnectionPublicState: FfiConverterRustBuffer {
         case 4: return .error(message: try FfiConverterString.read(from: &buf)
         )
         
+        case 5: return .reconnecting(elapsedSecs: try FfiConverterUInt32.read(from: &buf), timeoutSecs: try FfiConverterUInt32.read(from: &buf), reason: try FfiConverterOptionString.read(from: &buf)
+        )
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -3505,9 +3372,10 @@ public struct FfiConverterTypeConnectionPublicState: FfiConverterRustBuffer {
         switch value {
         
         
-        case let .disconnected(reason):
+        case let .disconnected(reason,issueHint):
             writeInt(&buf, Int32(1))
             FfiConverterOptionString.write(reason, into: &buf)
+            FfiConverterOptionTypeConnectionIssueHint.write(issueHint, into: &buf)
             
         
         case .connecting:
@@ -3522,6 +3390,13 @@ public struct FfiConverterTypeConnectionPublicState: FfiConverterRustBuffer {
         case let .error(message):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .reconnecting(elapsedSecs,timeoutSecs,reason):
+            writeInt(&buf, Int32(5))
+            FfiConverterUInt32.write(elapsedSecs, into: &buf)
+            FfiConverterUInt32.write(timeoutSecs, into: &buf)
+            FfiConverterOptionString.write(reason, into: &buf)
             
         }
     }
@@ -3540,79 +3415,6 @@ public func FfiConverterTypeConnectionPublicState_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeConnectionPublicState_lower(_ value: ConnectionPublicState) -> RustBuffer {
     return FfiConverterTypeConnectionPublicState.lower(value)
-}
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * アプリの実行モード。iOSの`UIApplication.didEnterBackground`/
- * `willEnterForeground`、Androidの同等のライフサイクルイベントを集約した結果を表す
- * (PLAN.md外部レビュー論点11の「SceneLifecycleReporter→AppExecutionCoordinator→
- * Rust SessionSupervisor」のうち、Rust側が受け取る最終形)。
- */
-
-public enum ExecutionMode: Equatable, Hashable {
-    
-    case foreground
-    case background
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension ExecutionMode: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeExecutionMode: FfiConverterRustBuffer {
-    typealias SwiftType = ExecutionMode
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ExecutionMode {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .foreground
-        
-        case 2: return .background
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: ExecutionMode, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .foreground:
-            writeInt(&buf, Int32(1))
-        
-        
-        case .background:
-            writeInt(&buf, Int32(2))
-        
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeExecutionMode_lift(_ buf: RustBuffer) throws -> ExecutionMode {
-    return try FfiConverterTypeExecutionMode.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeExecutionMode_lower(_ value: ExecutionMode) -> RustBuffer {
-    return FfiConverterTypeExecutionMode.lower(value)
 }
 
 
@@ -3870,154 +3672,6 @@ public func FfiConverterTypeRebindPublicState_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeRebindPublicState_lower(_ value: RebindPublicState) -> RustBuffer {
     return FfiConverterTypeRebindPublicState.lower(value)
-}
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * セッションの生存状態(接続状態 × バックグラウンド遷移の合成)。PLAN.md「Phase Y」の
- * 外部レビュー(2026-07-04)で提案された8状態FSMをそのまま採用している。
- *
- * **注意**: `crate::session_state::SessionState`(1セッション分のVTE/trzszパーサー状態、
- * `pub(crate)`でUniFFI越しには公開されない)とは名前が同じだが別物。こちらは
- * UniFFI越しにKotlin/Swift双方へ公開する「接続ライフサイクル」のFSMで、
- * 実際のターミナル描画状態は一切持たない。
- */
-
-public enum SessionState: Equatable, Hashable {
-    
-    /**
-     * 接続試行前、または完全に切断済み。
-     */
-    case disconnected
-    /**
-     * ハンドシェイク/認証中。
-     */
-    case connecting
-    /**
-     * 接続確立済みでフォアグラウンド相当の通常運用中。
-     */
-    case active
-    /**
-     * バックグラウンド遷移が通知され、`ExecutionMode::Background`の間の猶予
-     * (`prepare_for_background`の`budget_ms`)内で接続維持を試みている状態。
-     * 実際の猶予終了判断はSwift側の`beginBackgroundTask`失効コールバックが正
-     * (Rust/Swiftで基準時計を共有していないため、Rust側でタイマーは持たない。
-     * PLAN.md外部レビュー論点10の`budget_ms`化と同じ理由)。
-     */
-    case quiescing
-    /**
-     * バックグラウンド猶予が尽きた(呼び出し側が`mark_suspended`を呼んだ)、または
-     * OSにプロセスを一時停止/終了された後。実際のトランスポートは既に失われている
-     * 前提で、次にフォアグラウンド復帰した際は再接続(reconnect)が必要になる。
-     */
-    case suspended
-    /**
-     * フォアグラウンド復帰が通知され、再接続/セッション有効性確認を行っている状態。
-     */
-    case resuming
-    /**
-     * 意図的な切断処理が進行中(ユーザーによる切断・アプリ終了通知後の後始末等)。
-     */
-    case closing
-    /**
-     * 完全に終了した終端状態。
-     */
-    case closed
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension SessionState: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeSessionState: FfiConverterRustBuffer {
-    typealias SwiftType = SessionState
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionState {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .disconnected
-        
-        case 2: return .connecting
-        
-        case 3: return .active
-        
-        case 4: return .quiescing
-        
-        case 5: return .suspended
-        
-        case 6: return .resuming
-        
-        case 7: return .closing
-        
-        case 8: return .closed
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: SessionState, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .disconnected:
-            writeInt(&buf, Int32(1))
-        
-        
-        case .connecting:
-            writeInt(&buf, Int32(2))
-        
-        
-        case .active:
-            writeInt(&buf, Int32(3))
-        
-        
-        case .quiescing:
-            writeInt(&buf, Int32(4))
-        
-        
-        case .suspended:
-            writeInt(&buf, Int32(5))
-        
-        
-        case .resuming:
-            writeInt(&buf, Int32(6))
-        
-        
-        case .closing:
-            writeInt(&buf, Int32(7))
-        
-        
-        case .closed:
-            writeInt(&buf, Int32(8))
-        
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeSessionState_lift(_ buf: RustBuffer) throws -> SessionState {
-    return try FfiConverterTypeSessionState.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeSessionState_lower(_ value: SessionState) -> RustBuffer {
-    return FfiConverterTypeSessionState.lower(value)
 }
 
 
@@ -5622,6 +5276,30 @@ fileprivate struct FfiConverterOptionTypeTerminalFrameBatch: FfiConverterRustBuf
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeConnectionIssueHint: FfiConverterRustBuffer {
+    typealias SwiftType = ConnectionIssueHint?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeConnectionIssueHint.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeConnectionIssueHint.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
     typealias SwiftType = [UInt32]
 
@@ -6009,12 +5687,6 @@ public func createSessionOrchestrator(callback: OrchestratorCallback) -> Session
     )
 })
 }
-public func createSessionSupervisor() -> SessionSupervisor  {
-    return try!  FfiConverterTypeSessionSupervisor_lift(try! rustCall() {
-    uniffi_isekai_terminal_core_fn_func_create_session_supervisor($0
-    )
-})
-}
 
 private enum InitializationResult {
     case ok
@@ -6073,9 +5745,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator() != 38625) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_func_create_session_supervisor() != 8438) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_drain_events() != 5861) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6098,6 +5767,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward() != 60755) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect() != 53892) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect() != 45531) {
@@ -6130,10 +5802,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic() != 9641) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired() != 26224) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background() != 63526) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning() != 20700) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_network_path_changed() != 22300) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_will_enter_foreground() != 2009) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_rebind_to_fd() != 19723) {
@@ -6170,42 +5854,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_trzsz_send_chunk() != 51996) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_application_will_terminate() != 35024) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_execution_mode() != 53812) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_mark_suspended() != 32890) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_memory_warning() != 36916) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_connect_failed() != 57975) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_connect_requested() != 62659) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_connected() != 44409) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_disconnected() != 21436) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_on_terminated() != 14687) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_prepare_for_background() != 63099) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_resume_from_foreground() != 53912) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionsupervisor_session_state() != 64821) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_constructor_diagnosticeventqueue_new() != 33382) {
