@@ -14,7 +14,6 @@ use h3_datagram::quic_traits::{DatagramConnectionExt, RecvDatagram, SendDatagram
 use h3_datagram::ConnectionErrorIncoming;
 
 use bytes::{Buf, Bytes};
-use h3_datagram_error::convert_h3_error_to_datagram_error;
 use web_transport_trait::Session as _;
 
 use crate::{convert_connection_error, BoxStreamSync, Connection};
@@ -76,5 +75,18 @@ fn convert_send_datagram_error(error: qmux::Error) -> SendDatagramErrorIncoming 
         other => SendDatagramErrorIncoming::ConnectionError(convert_h3_error_to_datagram_error(
             convert_connection_error(other),
         )),
+    }
+}
+
+fn convert_h3_error_to_datagram_error(error: h3::quic::ConnectionErrorIncoming) -> h3_datagram::ConnectionErrorIncoming {
+    match error {
+        h3::quic::ConnectionErrorIncoming::ApplicationClose { error_code } => {
+            h3_datagram::ConnectionErrorIncoming::ApplicationClose { error_code }
+        }
+        h3::quic::ConnectionErrorIncoming::Timeout => h3_datagram::ConnectionErrorIncoming::Timeout,
+        h3::quic::ConnectionErrorIncoming::InternalError(err) => {
+            h3_datagram::ConnectionErrorIncoming::InternalError(err)
+        }
+        h3::quic::ConnectionErrorIncoming::Undefined(error) => h3_datagram::ConnectionErrorIncoming::Undefined(error),
     }
 }

@@ -11,7 +11,6 @@ categories = ["network-programming", "web-programming"]
 [dependencies]
 h3 = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
 h3-datagram = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40", optional = true }
-h3-datagram-error = { path = "../h3-datagram-error", optional = true }
 bytes = "1"
 noq = { version = "1.0.1", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 tokio-util = { version = "0.7.9" }
@@ -20,7 +19,7 @@ tracing = { version = "0.1.40", optional = true }
 
 [features]
 tracing = ["dep:tracing"]
-datagram = ["dep:h3-datagram", "dep:h3-datagram-error"]
+datagram = ["dep:h3-datagram"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

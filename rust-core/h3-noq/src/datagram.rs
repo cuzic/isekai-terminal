@@ -16,7 +16,6 @@ use h3_datagram::quic_traits::{
 use h3_datagram::ConnectionErrorIncoming;
 
 use bytes::{Buf, Bytes};
-use h3_datagram_error::convert_h3_error_to_datagram_error;
 use noq::{ReadDatagram, SendDatagramError};
 
 use crate::{convert_connection_error, BoxStreamSync, Connection};
@@ -85,5 +84,22 @@ fn convert_send_datagram_error(error: SendDatagramError) -> SendDatagramErrorInc
         SendDatagramError::ConnectionLost(e) => SendDatagramErrorIncoming::ConnectionError(
             convert_h3_error_to_datagram_error(convert_connection_error(e)),
         ),
+    }
+}
+
+fn convert_h3_error_to_datagram_error(
+    error: h3::quic::ConnectionErrorIncoming,
+) -> h3_datagram::ConnectionErrorIncoming {
+    match error {
+        ConnectionErrorIncoming::ApplicationClose { error_code } => {
+            h3_datagram::ConnectionErrorIncoming::ApplicationClose { error_code }
+        }
+        ConnectionErrorIncoming::Timeout => h3_datagram::ConnectionErrorIncoming::Timeout,
+        ConnectionErrorIncoming::InternalError(err) => {
+            h3_datagram::ConnectionErrorIncoming::InternalError(err)
+        }
+        ConnectionErrorIncoming::Undefined(error) => {
+            h3_datagram::ConnectionErrorIncoming::Undefined(error)
+        }
     }
 }
