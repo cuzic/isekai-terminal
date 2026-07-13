@@ -282,23 +282,32 @@ fn sanitize_filename_component(key: &str) -> String {
 /// `write_connection_intent`'s approach in `lib.rs`.
 pub fn write_persistent_profile(dir: &Path, profile: &PersistentProfile) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
+    isekai_fs_guard::set_private_dir_permissions(dir).map_err(fs_guard_err_to_io)?;
     let filename_key = sanitize_filename_component(&profile.profile);
     let path = dir.join(format!("{filename_key}.json"));
     let tmp = dir.join(format!("{filename_key}.{}.tmp", std::process::id()));
     let bytes = serde_json::to_vec_pretty(profile)?;
     fs::write(&tmp, &bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    }
+    isekai_fs_guard::set_private_file_permissions(&tmp).map_err(fs_guard_err_to_io)?;
     fs::rename(&tmp, &path)?;
     Ok(path)
+}
+
+/// `isekai_fs_guard::FsGuardError` is deliberately path-less (see its own
+/// docs); this module doesn't have a richer path-carrying error type of its
+/// own the way `isekai-trust`/`isekai-auth` do, so it's flattened straight
+/// into `io::Error` here instead.
+fn fs_guard_err_to_io(err: isekai_fs_guard::FsGuardError) -> io::Error {
+    use isekai_fs_guard::FsGuardError;
+    match err {
+        FsGuardError::CreateDir(e) | FsGuardError::Stat(e) | FsGuardError::SetPermissions(e) => e,
+        FsGuardError::WorldWritable { mode } => {
+            io::Error::other(format!("path is world-writable (mode {mode:o})"))
+        }
+        FsGuardError::InsecureAcl { principal, rights } => {
+            io::Error::other(format!("path grants write access to {principal} (rights {rights})"))
+        }
+    }
 }
 
 /// Holds an exclusive advisory lock (`flock(2)`, `LOCK_EX`) on
@@ -333,15 +342,57 @@ impl ProfileLock {
     }
 }
 
-/// Not unix: locking is a no-op (every current build target is unix — the
-/// Android app talks to `rust-core` through UniFFI, never this CLI-facing
-/// module; `isekai-ssh`/`isekai-pipe` themselves only ship for
-/// Linux/macOS). Kept so this module still compiles rather than gating the
-/// whole crate on `cfg(unix)`.
-#[cfg(not(unix))]
+/// Windows counterpart of the `flock(2)`-based lock above: `LockFileEx`
+/// with `LOCKFILE_EXCLUSIVE_LOCK` (and no `LOCKFILE_FAIL_IMMEDIATELY`, so it
+/// blocks until acquired, matching `LOCK_EX`'s semantics) on the same
+/// handle the file was opened with. The lock is released when the handle
+/// closes (`File`'s `Drop`) — even on a crash — the same "no separate
+/// cleanup step" property `flock` has.
+///
+/// **Not verified against a real Windows machine** — see
+/// `isekai-fs-guard`'s `windows_acl.rs` module docs for what verification
+/// (`cargo check --target x86_64-pc-windows-gnu`) has and hasn't been done;
+/// the same caveat applies here.
+#[cfg(windows)]
+struct ProfileLock {
+    _file: fs::File,
+}
+
+#[cfg(windows)]
+impl ProfileLock {
+    fn acquire(dir: &Path, key: &str) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+        use windows::Win32::System::IO::OVERLAPPED;
+
+        fs::create_dir_all(dir)?;
+        let lock_path = dir.join(format!("{key}.lock"));
+        let file = fs::OpenOptions::new().create(true).read(true).write(true).open(&lock_path)?;
+
+        let handle = HANDLE(file.as_raw_handle());
+        let mut overlapped = OVERLAPPED::default();
+        // SAFETY: `handle` is a valid, open file handle for the duration of
+        // this call (`file` outlives it); locking the whole file (`u32::MAX`
+        // bytes both halves) matches `flock`'s whole-file semantics above.
+        unsafe {
+            LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0, u32::MAX, u32::MAX, &mut overlapped)
+                .map_err(|e| io::Error::from_raw_os_error(e.code().0 as i32))?;
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// Neither unix nor windows: locking is a no-op. Kept so this module still
+/// compiles rather than gating the whole crate on `cfg(any(unix, windows))`
+/// (every current build target of `isekai-ssh`/`isekai-pipe` is one or the
+/// other — the Android app talks to `rust-core` through UniFFI, never this
+/// CLI-facing module).
+#[cfg(not(any(unix, windows)))]
 struct ProfileLock;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl ProfileLock {
     fn acquire(_dir: &Path, _key: &str) -> io::Result<Self> {
         Ok(Self)
