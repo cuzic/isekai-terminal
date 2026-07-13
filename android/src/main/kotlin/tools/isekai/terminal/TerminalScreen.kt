@@ -155,65 +155,21 @@ fun TerminalScreenBody(
         )
     }
 
-    // Host key changed warning dialog（非アクティブ、またはフォーカス外のペインでは表示しない）
-    if (isActive && hasFocus) {
-        uiState.hostKeyChangedWarning?.let { w ->
-            HostKeyChangedDialog(
-                warning = w,
-                onAccept = { actions.onTrustUpdatedHostKey() },
-                onReject = { actions.onDismissHostKeyWarning() },
-            )
-        }
-    }
+    // モーダルUI(host key/trzsz/agent forwarding/スニペット一覧確認)は「フォーカス中の
+    // ペインに対してだけ表示する」設計(このComposableのdocstring参照)。表示条件を
+    // TerminalModalHost 1箇所に集約し、個々のダイアログ呼び出し側でisActive/hasFocusの
+    // gatingを繰り返し書かない(繰り返しの一箇所が漏れてバグになった実例があったため)。
+    TerminalModalHost(
+        uiState = uiState,
+        actions = actions,
+        snippets = snippets,
+        showSnippetSheet = showSnippetSheet,
+        onDismissSnippetSheet = { showSnippetSheet = false },
+        visible = isActive && hasFocus,
+    )
 
-    // 初回接続(Unknown host key)確認ダイアログ（非アクティブ、またはフォーカス外のペインでは表示しない）
-    if (isActive && hasFocus) {
-        uiState.newHostKeyPrompt?.let { prompt ->
-            HostKeyUnknownDialog(
-                host = prompt.host,
-                port = prompt.port,
-                fingerprint = prompt.fingerprint,
-                onAccept = { actions.onTrustNewHostKey() },
-                onReject = { actions.onDismissNewHostKeyPrompt() },
-            )
-        }
-    }
-
-    // SSH agent forwarding: 署名要求ごとの確認ダイアログ（非アクティブ、またはフォーカス外のペインでは表示しない）
-    if (isActive && hasFocus) {
-        uiState.agentSignRequestFingerprint?.let { fingerprint ->
-            AgentSignConfirmDialog(
-                fingerprint = fingerprint,
-                onApprove = { actions.onRespondAgentSignRequest(true) },
-                onReject = { actions.onRespondAgentSignRequest(false) },
-            )
-        }
-    }
-
-    // trzsz file transfer
     val trzszState = uiState.trzszState
     val transferActive = trzszState is TrzszUiState.WaitingUser || trzszState is TrzszUiState.InProgress
-    if (isActive && hasFocus && trzszState != null) {
-        TrzszTransferSheet(
-            state = trzszState,
-            onStartUpload = { uri -> actions.onTrzszStartUpload(uri) },
-            onStartDownload = { actions.onTrzszStartDownload() },
-            onCancel = { actions.onTrzszCancel() },
-            onDismiss = { actions.onTrzszDismiss() },
-        )
-    }
-
-    // 定型コマンド（スニペット）一覧
-    if (isActive && hasFocus && showSnippetSheet) {
-        SnippetPickerSheet(
-            snippets = snippets,
-            onPick = { snippet ->
-                actions.onSendSnippet(snippet)
-                showSnippetSheet = false
-            },
-            onDismiss = { showSnippetSheet = false },
-        )
-    }
 
     Column(
         modifier = Modifier
@@ -679,6 +635,75 @@ fun TerminalScreenBody(
                 )
             }
         }
+    }
+}
+
+/**
+ * [TerminalScreenBody] の「タブ/ペインを跨いで1つしか存在しない」モーダルUI
+ * (host key変更警告・初回接続確認・agent forwarding署名確認・trzsz転送シート・
+ * 定型コマンド一覧)をまとめて表示するホスト。[visible] が false の間は何も表示しない
+ * ([TerminalScreenBody]の`isActive && hasFocus`をそのまま渡す想定)。
+ *
+ * 個々のダイアログ呼び出しごとに`if (isActive && hasFocus)`を繰り返し書かないための
+ * 抽出(繰り返しの一箇所が漏れて非フォーカス側ペインにダイアログが出るバグになった実例が
+ * あったため)。
+ */
+@Composable
+private fun TerminalModalHost(
+    uiState: TerminalUiState,
+    actions: TerminalScreenActions,
+    snippets: List<Snippet>,
+    showSnippetSheet: Boolean,
+    onDismissSnippetSheet: () -> Unit,
+    visible: Boolean,
+) {
+    if (!visible) return
+
+    uiState.hostKeyChangedWarning?.let { w ->
+        HostKeyChangedDialog(
+            warning = w,
+            onAccept = { actions.onTrustUpdatedHostKey() },
+            onReject = { actions.onDismissHostKeyWarning() },
+        )
+    }
+
+    uiState.newHostKeyPrompt?.let { prompt ->
+        HostKeyUnknownDialog(
+            host = prompt.host,
+            port = prompt.port,
+            fingerprint = prompt.fingerprint,
+            onAccept = { actions.onTrustNewHostKey() },
+            onReject = { actions.onDismissNewHostKeyPrompt() },
+        )
+    }
+
+    uiState.agentSignRequestFingerprint?.let { fingerprint ->
+        AgentSignConfirmDialog(
+            fingerprint = fingerprint,
+            onApprove = { actions.onRespondAgentSignRequest(true) },
+            onReject = { actions.onRespondAgentSignRequest(false) },
+        )
+    }
+
+    uiState.trzszState?.let { trzszState ->
+        TrzszTransferSheet(
+            state = trzszState,
+            onStartUpload = { uri -> actions.onTrzszStartUpload(uri) },
+            onStartDownload = { actions.onTrzszStartDownload() },
+            onCancel = { actions.onTrzszCancel() },
+            onDismiss = { actions.onTrzszDismiss() },
+        )
+    }
+
+    if (showSnippetSheet) {
+        SnippetPickerSheet(
+            snippets = snippets,
+            onPick = { snippet ->
+                actions.onSendSnippet(snippet)
+                onDismissSnippetSheet()
+            },
+            onDismiss = onDismissSnippetSheet,
+        )
     }
 }
 
