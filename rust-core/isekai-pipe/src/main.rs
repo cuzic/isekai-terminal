@@ -330,22 +330,11 @@ fn parse_connect(args: impl Iterator<Item = String>) -> Result<Option<ConnectLau
                     eprintln!("{e}");
                     ExitCode::from(EX_USAGE)
                 })?;
-                let (start, end) = value.split_once('-').ok_or_else(|| {
-                    eprintln!("isekai-pipe connect: invalid --bind-port-range value {value:?} (expected <START>-<END>)");
+                let range = isekai_pipe_core::parse_port_range(&value).map_err(|e| {
+                    eprintln!("isekai-pipe connect: {e} (from --bind-port-range)");
                     ExitCode::from(EX_USAGE)
                 })?;
-                let parse_port = |s: &str| -> Result<u16, ExitCode> {
-                    s.parse().map_err(|_| {
-                        eprintln!("isekai-pipe connect: invalid --bind-port-range bound {s:?}");
-                        ExitCode::from(EX_USAGE)
-                    })
-                };
-                let (start, end) = (parse_port(start)?, parse_port(end)?);
-                if start > end {
-                    eprintln!("isekai-pipe connect: invalid --bind-port-range {value:?}: start must be <= end");
-                    return Err(ExitCode::from(EX_USAGE));
-                }
-                bind_port_range = Some((start, end));
+                bind_port_range = Some(range);
             }
             "--tethering-interface" => {
                 let value = next_arg("connect", &mut iter, &arg).map_err(|e| {

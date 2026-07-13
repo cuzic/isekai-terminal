@@ -32,6 +32,9 @@ pub use outcome::{
 mod ctl_gc;
 pub use ctl_gc::sweep_stale_sockets;
 
+mod port_range;
+pub use port_range::parse_port_range;
+
 pub const CONNECTION_INTENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_INTENT_TTL: Duration = Duration::from_secs(120);
 pub const DEFAULT_CANDIDATE_RACE_DELAY_MS: u64 = 150;
