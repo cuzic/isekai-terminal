@@ -5,6 +5,22 @@
 //! (native) on Linux and `cargo check --target aarch64-apple-darwin`
 //! (type-check only, no Apple SDK available in this crate's development
 //! environment) on macOS.
+//!
+//! **Real-hardware update (macOS)**: a real `test-macos` CI run confirmed
+//! `bind_to_interface` itself works correctly there (the plain bind
+//! succeeds and `physical_interface.rs`'s own loopback-bind unit test
+//! passes) — but layering `noq`'s QUIC connection migration
+//! (PATH_CHALLENGE/PATH_RESPONSE) on top of an `IP_BOUND_IF`-restricted
+//! loopback socket does not currently work on macOS: path validation times
+//! out (see `isekai-transport/tests/rebind_e2e.rs`'s
+//! `rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable`,
+//! excluded there on macOS with a fuller writeup). Root cause unconfirmed —
+//! suspected to be Darwin's stricter (vs. Linux `SO_BINDTOIFINDEX`)
+//! interface-scoped route lookup under `IP_BOUND_IF` per XNU's
+//! `in_pcb.c`, conflicting with how a loopback alias's route is scoped —
+//! but this is not yet verified against a *real* (non-loopback) physical
+//! interface, so whether this backend works for its actual intended use
+//! (Wi-Fi/cellular rebind on a real Mac) remains genuinely unknown.
 
 use std::io;
 use std::num::NonZeroU32;
