@@ -529,7 +529,13 @@ mod listener_tests {
     async fn listener_bind_accept_bi_write_and_read_roundtrip() {
         let (server_config, cert_sha256_hex) = test_server_config();
         let listener = QmuxListener::bind(server_config, BindSpec::any_ipv4()).await.expect("listener bind failed");
-        let server_addr = listener.local_addr().unwrap();
+        // Substitute loopback for the wildcard bind address `local_addr()`
+        // reports (matching `noq_backend`'s sibling tests): connecting a
+        // socket to `0.0.0.0:PORT` happens to succeed on Linux (the kernel
+        // treats it as loopback) but fails on Windows with `WSAEADDRNOTAVAIL`
+        // ("address not valid in its context") — confirmed via a real
+        // `test-windows` CI failure.
+        let server_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
 
         tokio::spawn(async move {
             let Some(incoming) = listener.accept().await else { return };
