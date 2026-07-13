@@ -45,6 +45,10 @@ tokio = { version = "1", features = ["full"] }
 [dev-dependencies]
 tempfile = "3"
 async-trait = "0.1.89"
+# `sleep_with_live_status`のタイミングを`tokio::time::pause()`/`advance()`で
+# 実時間を待たずに決定的にテストするため(`[dependencies]`の`tokio`とは
+# feature unificationで1つのtokioクレートにまとまる)。
+tokio = { version = "1", features = ["test-util"] }
 # e2e tests exercise this crate's `serve` engine with the same quinn-based
 # client `isekai-helper`'s own e2e tests used (Phase 9-1's noq/quinn
 # backward-compat guarantee).

@@ -2,6 +2,7 @@ mod ctl;
 mod engine;
 
 use std::collections::VecDeque;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1800,6 +1801,80 @@ fn resume_window_for(effective_resume_grace_secs: u32) -> Duration {
     }
 }
 
+// ── tssh風のライブ再接続表示(`run_resume_loop`専用) ──────────────
+//
+// `isekai-pipe connect` は `ssh(1)` の ProxyCommand として起動され、OpenSSH の
+// 仕様上 stderr は通常 ssh 自身の stderr(＝ユーザーの実端末)にそのまま
+// 継承される。tssh(trzsz-ssh)本家のUDPモードreconnectと同じく、stderrに
+// 直接 `\r` + ANSI エスケープでその場書き換えするだけで、Android アプリ側
+// (`rust-core/src/orchestrator.rs`)のように新しいUI基盤を用意しなくても
+// ライブな状態表示ができる。
+//
+// ただし `isekai-ssh --log-file` 相当が有効な場合、`ssh` の stderr は
+// 端末ではなくログファイルへpipeされる(`isekai-ssh/src/wrapper.rs`の
+// `log_file::is_enabled()`)。この場合に `\r`/ANSI を出すとログファイルが
+// 読めない制御文字だらけになるため、`is_terminal()` で分岐し、非TTY時は
+// 改行区切りの平文へフォールバックする。
+
+/// 再接続中の状態メッセージを組み立てる。TTY時は`\r`+ANSI色でその場書き換え
+/// 用(呼び出し側で`eprint!`し、改行しない)、非TTY時はログファイル向けの
+/// 改行区切り平文(呼び出し側で`eprintln!`する)。副作用を持たない純粋関数
+/// として切り出してあり、単体テストしやすい。
+fn format_reconnect_status(is_tty: bool, elapsed_secs: u64, total_secs: u64) -> String {
+    if is_tty {
+        format!(
+            "\r\x1b[0;33misekai-pipe connect: connection lost, trying to reconnect... ({elapsed_secs}s/{total_secs}s)\x1b[0m\x1b[K"
+        )
+    } else {
+        format!(
+            "isekai-pipe connect: connection lost, trying to reconnect... ({elapsed_secs}s/{total_secs}s elapsed)"
+        )
+    }
+}
+
+fn print_reconnect_status(is_tty: bool, disconnected_at: Instant, resume_window: Duration) {
+    let elapsed_secs = Instant::now().saturating_duration_since(disconnected_at).as_secs();
+    let msg = format_reconnect_status(is_tty, elapsed_secs, resume_window.as_secs());
+    if is_tty {
+        eprint!("{msg}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
+fn print_reconnect_success(is_tty: bool) {
+    if is_tty {
+        eprintln!("\r\x1b[0;32misekai-pipe connect: reconnected.\x1b[0m\x1b[K");
+    } else {
+        eprintln!("isekai-pipe connect: reconnected.");
+    }
+}
+
+/// TTY時のみ呼ばれる: 1回のバックオフ待機(`delay`)を最大1秒刻みに分割し、
+/// 都度その場書き換えでカウントダウンを再描画する。`delay`全体を素通しで
+/// 待つのと合計の待ち時間は変わらない(`RESUME_BACKOFF`/`deadline`の意味は
+/// 変えない、表示だけの変更)。
+/// タイミング(何回・どれだけ待つか)と実際の描画処理(`on_tick`)を分離してある
+/// ―― `print_reconnect_status`が直接I/Oを行うため、タイミングだけを
+/// `tokio::time::pause()`で決定的にテストできるようにするため。
+async fn sleep_with_live_status(delay: Duration, mut on_tick: impl FnMut()) {
+    // `tokio::time::Instant`を使う(`std::time::Instant`ではない) —
+    // `tokio::time::pause()`/`advance()`が影響するのはtokio自身の時計だけで、
+    // OSの実時計(`std::time::Instant::now()`)は素通りする。混在させると
+    // テストでpause中に`remaining`がほぼ縮まらずビジーループする
+    // (実際にこの取り違えで発生した不具合、テストで検出)。
+    let wake_at = tokio::time::Instant::now() + delay;
+    loop {
+        let remaining = wake_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+        on_tick();
+    }
+}
+
 async fn run_resume_loop(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -1823,6 +1898,11 @@ async fn run_resume_loop(
     let mut disconnected_since: Option<Instant> = None;
     let mut attempt: u32 = 0;
     let mut network_rebinder = established.network_rebinder;
+    // tssh風のライブ再接続表示(このループ内でのみ使う、詳細は上のモジュール
+    // ドキュメント参照)。プロセスの生存期間中に変わることは無いのでループ
+    // 開始前に1回だけ判定する。
+    let is_tty = std::io::stderr().is_terminal();
+    let mut last_resume_error: Option<String> = None;
 
     // `--tethering-interface`: keeps a second connection warm on a specific
     // physical interface and promotes it (no fresh dial, no backoff wait) as
@@ -1898,7 +1978,11 @@ async fn run_resume_loop(
         // before the fast-path promote attempt below, not after it, so a
         // slow-to-fail promote still counts against the deadline the same as
         // a slow-to-fail `reconnect_and_resume` attempt would.
-        let deadline = *disconnected_since.get_or_insert_with(Instant::now) + resume_window;
+        let disconnected_at = *disconnected_since.get_or_insert_with(Instant::now);
+        let deadline = disconnected_at + resume_window;
+        // tssh風のライブ再接続表示: 切断検知の瞬間に即座に1回出す
+        // (これが無いと、最初の再接続試行が失敗するまで何も表示されない)。
+        print_reconnect_status(is_tty, disconnected_at, resume_window);
 
         // Fast path: promote the already-warm standby connection instead of
         // waiting through the backoff loop below — the entire point of
@@ -1915,6 +1999,7 @@ async fn run_resume_loop(
                 Ok(mut promoted) => {
                     if replay_and_advance(&replay, promoted.helper_committed_offset.get(), &mut promoted.data_stream).await {
                         log::info!("isekai-pipe connect: promoted warm-standby connection for session_id={session_id}");
+                        print_reconnect_success(is_tty);
                         match reestablish_control_stream(&promoted.connection, &target.session_secret, &counters).await {
                             Ok(new_tasks) => app_ack_tasks = new_tasks,
                             Err(e) => eprintln!(
@@ -1933,10 +2018,12 @@ async fn run_resume_loop(
                         promoted_stream = Some(promoted.data_stream);
                     } else {
                         eprintln!("isekai-pipe connect: warm-standby promote succeeded but replay failed; falling back to full resume");
+                        last_resume_error = Some("warm-standby promote succeeded but replay failed".to_string());
                     }
                 }
                 Err(e) => {
                     log::info!("isekai-pipe connect: warm-standby promote unavailable ({e:#}); falling back to full resume");
+                    last_resume_error = Some(format!("{e:#}"));
                 }
             }
         }
@@ -1947,9 +2034,18 @@ async fn run_resume_loop(
                 let now = Instant::now();
                 if now >= deadline {
                     let exceeded_by = now.saturating_duration_since(deadline);
+                    if is_tty {
+                        // その場書き換え中だったライブ表示行をクリアしてから
+                        // ギブアップメッセージを改行付きで出す。
+                        eprint!("\r\x1b[K");
+                    }
+                    let last_error_suffix = last_resume_error
+                        .as_deref()
+                        .map(|e| format!(" Last error: {e}."))
+                        .unwrap_or_default();
                     eprintln!(
                         "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
-                         the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}. \
+                         the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}.{last_error_suffix} \
                          Closing stdin/stdout; ssh will treat this as a lost connection."
                     );
                     let _ = stdout.shutdown().await;
@@ -1962,7 +2058,11 @@ async fn run_resume_loop(
 
                 let delay = RESUME_BACKOFF.base_delay(attempt).min(deadline - now);
                 attempt = attempt.saturating_add(1);
-                tokio::time::sleep(delay).await;
+                if is_tty {
+                    sleep_with_live_status(delay, || print_reconnect_status(true, disconnected_at, resume_window)).await;
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
 
                 let client_sent_offset = C2hSentOffset::new(replay.lock().unwrap().end_offset());
                 let client_delivered_offset =
@@ -1980,6 +2080,7 @@ async fn run_resume_loop(
                         if !replay_and_advance(&replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
                             continue;
                         }
+                        print_reconnect_success(is_tty);
                         match reestablish_control_stream(&resumed.connection, &target.session_secret, &counters).await {
                             Ok(new_tasks) => app_ack_tasks = new_tasks,
                             Err(e) => eprintln!(
@@ -1992,7 +2093,19 @@ async fn run_resume_loop(
                         break resumed.data_stream;
                     }
                     Err(e) => {
-                        eprintln!("isekai-pipe connect: resume attempt {attempt} failed: {e:#}");
+                        let msg = format!("{e:#}");
+                        // TTY時はその場書き換えのライブ表示とスクロール表示が
+                        // 混ざるとUXを壊すため、個々の失敗はdebugログへ格下げする
+                        // (既定の`info`フィルタでは表示されない、`RUST_LOG=debug`
+                        // で見られる)。非TTY(ログファイル等)では引き続き
+                        // eprintln!のまま残す — ログでは個々の失敗を追えることの
+                        // 方が重要なため。
+                        if is_tty {
+                            log::debug!("isekai-pipe connect: resume attempt {attempt} failed: {msg}");
+                        } else {
+                            eprintln!("isekai-pipe connect: resume attempt {attempt} failed: {msg}");
+                        }
+                        last_resume_error = Some(msg);
                     }
                 }
             },
@@ -2000,6 +2113,7 @@ async fn run_resume_loop(
 
         data_stream = new_stream;
         disconnected_since = None;
+        last_resume_error = None;
         attempt = 0;
     }
 }
@@ -3672,6 +3786,56 @@ mod tests {
             let ok = replay_and_advance(&replay, 6, &mut stream).await;
             assert!(ok);
             assert_eq!(replay.lock().unwrap().end_offset(), 11);
+        }
+    }
+
+    mod reconnect_status_tests {
+        use super::*;
+
+        #[test]
+        fn format_reconnect_status_tty_uses_in_place_ansi_redraw() {
+            let msg = format_reconnect_status(true, 3, 60);
+            assert!(msg.starts_with('\r'), "TTY表示はその場書き換え(\\r開始)のはず: {msg:?}");
+            assert!(msg.contains("\x1b[0;33m"), "黄色のANSIエスケープを含むはず: {msg:?}");
+            assert!(msg.ends_with("\x1b[K"), "行末までクリアするはず: {msg:?}");
+            assert!(msg.contains("3s/60s"), "経過/上限秒数を含むはず: {msg:?}");
+            assert!(!msg.contains('\n'), "改行を含んではいけない(呼び出し側がeprint!でその場書き換えする前提): {msg:?}");
+        }
+
+        #[test]
+        fn format_reconnect_status_non_tty_is_plain_text_without_ansi() {
+            let msg = format_reconnect_status(false, 3, 60);
+            assert!(!msg.contains('\r'), "非TTY時は\\rを含んではいけない: {msg:?}");
+            assert!(!msg.contains('\x1b'), "非TTY時はANSIエスケープを含んではいけない: {msg:?}");
+            assert!(msg.contains("3s"), "経過秒数を含むはず: {msg:?}");
+            assert!(msg.contains("60s"), "上限秒数を含むはず: {msg:?}");
+        }
+
+        // `sleep_with_live_status`本体はタイミングだけを担当し(実際の描画は
+        // `on_tick`コールバックに委譲)、`tokio::time::pause()`で仮想時間を
+        // 進めれば実時間を待たずに決定的に検証できる。
+        #[tokio::test(start_paused = true)]
+        async fn sleep_with_live_status_ticks_once_per_second_until_delay_elapses() {
+            // `#[tokio::test(start_paused = true)]`下では、他にやることが
+            // 無い間はtokioの仮想時計が次のタイマーまで自動的に早送りされる
+            // ため、手動で`tokio::time::advance`を挟まずそのまま`.await`
+            // すればよい(spawn+手動advanceは、spawnされたタスクが実際に
+            // 最初のtimer登録を終える前にadvanceが先に走ってしまう競合が
+            // あり不安定だった)。
+            // 2.5秒の待機は 1s + 1s + 0.5s の3チャンクに分かれ、3回tickするはず。
+            let mut tick_count = 0;
+            sleep_with_live_status(Duration::from_millis(2500), || tick_count += 1).await;
+            assert_eq!(tick_count, 3);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn sleep_with_live_status_ticks_once_for_a_sub_second_delay() {
+            let mut tick_count = 0;
+            sleep_with_live_status(Duration::from_millis(300), || tick_count += 1).await;
+            assert_eq!(
+                tick_count, 1,
+                "1秒未満の待機でも最低1回はtickして呼び出し元に経過を伝えるはず"
+            );
         }
     }
 }
