@@ -587,7 +587,12 @@ mod tests {
     /// Spawning real OS threads (not just calling the function serially) is
     /// the point: `flock(2)` must actually block a second opener of the same
     /// path, not merely look correct in single-threaded use.
+    ///
+    /// Unix-only: `ProfileLock` is a documented no-op on `cfg(not(unix))`
+    /// (see its doc comment above), so this race is expected to actually
+    /// lose updates there rather than indicating a regression.
     #[test]
+    #[cfg(unix)]
     fn update_persistent_profile_serializes_concurrent_updaters_without_lost_updates() {
         let dir = tempfile::tempdir().unwrap();
         let key = "myhost:22";
