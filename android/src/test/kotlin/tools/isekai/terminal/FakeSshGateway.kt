@@ -122,7 +122,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
             phase == Phase.CONNECTING || (phase == Phase.CONNECTED && !quic) -> {
                 disconnectCalled = true
                 phase = Phase.IDLE
-                callback!!.onConnectionStateChanged(ConnectionPublicState.Disconnected("network lost"))
+                callback!!.onConnectionStateChanged(ConnectionPublicState.Disconnected("network lost", null))
             }
             else -> {}
         }
@@ -158,7 +158,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     fun simulateDisconnected(reason: String? = null): Unit {
         phase = Phase.IDLE
-        callback!!.onConnectionStateChanged(ConnectionPublicState.Disconnected(reason))
+        callback!!.onConnectionStateChanged(ConnectionPublicState.Disconnected(reason, null))
     }
 
     fun simulateReconnecting(elapsedSecs: UInt = 0u, timeoutSecs: UInt = 60u, reason: String? = null): Unit {
