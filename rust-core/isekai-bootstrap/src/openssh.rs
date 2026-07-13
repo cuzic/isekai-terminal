@@ -401,7 +401,9 @@ impl OpenSshBackend {
         // stripping whitespace is a no-op there.
         let jwt_len = jwt_bytes.len();
         let read_jwt_step = if jwt_len > 0 {
-            format!("head -c {jwt_len} > $tmpdir/relay_jwt && [ \"$(wc -c < $tmpdir/relay_jwt | tr -d '[:space:]')\" -eq {jwt_len} ] && ")
+            format!(
+                "head -c {jwt_len} > $tmpdir/relay_jwt; _dbg_jwt_wc=$(wc -c < $tmpdir/relay_jwt | tr -d '[:space:]'); echo \"DBGV3 jwt_wc=[$_dbg_jwt_wc] want=[{jwt_len}]\"; [ \"$_dbg_jwt_wc\" -eq {jwt_len} ] 2>/dev/null && "
+            )
         } else {
             String::new()
         };
@@ -436,7 +438,10 @@ mkdir -p {remote_dir} 2>/dev/null
 exec 9>>{lock_path} 2>/dev/null
 if command -v flock >/dev/null 2>&1; then flock -w 30 9 2>/dev/null || true; fi
 tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
-if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')" -eq {request_len} ] && {read_jwt_step}true; then
+head -c {request_len} > $tmpdir/bootstrap-request.json
+_dbg_req_wc=$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')
+echo "DBGV3 req_wc=[$_dbg_req_wc] want=[{request_len}]"
+if [ "$_dbg_req_wc" -eq {request_len} ] 2>/dev/null && {read_jwt_step}true; then
   reuse_envelope=""
   if [ -f {state_path} ]; then
     existing_pid=$(sed -n '1p' {state_path} | cut -d' ' -f1)
