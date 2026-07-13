@@ -28,10 +28,10 @@ use isekai_auth::TokenProvider;
 use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec};
 use isekai_pipe_core::{default_profiles_dir, write_persistent_profile, PersistentProfile};
 use isekai_trust::{HelperTrust, UpdatePolicy};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::cli::InitArgs;
-use crate::time_fmt::{hex_sha256, now_rfc3339};
 
 pub async fn run(args: InitArgs) -> Result<()> {
     let target = parse_host_spec(&args.host)
@@ -157,6 +157,48 @@ fn resolve_relay_jwt(args: &InitArgs) -> Result<String> {
     }
 }
 
+fn hex_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Current UTC time formatted as RFC 3339 (`trusted_at`/`last_seen_at` are
+/// purely informational per `isekai-trust`'s schema docs, so a hand-rolled
+/// formatter — rather than pulling in a full datetime crate for this alone —
+/// is enough).
+fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format_rfc3339_utc(secs)
+}
+
+/// Minimal civil-calendar conversion from a Unix timestamp to
+/// `YYYY-MM-DDTHH:MM:SSZ`, good for any date this project will ever run at
+/// (proleptic Gregorian, UTC only — exactly what `trusted_at`/`last_seen_at`
+/// need and nothing more).
+fn format_rfc3339_utc(unix_secs: u64) -> String {
+    let days = unix_secs / 86_400;
+    let secs_of_day = unix_secs % 86_400;
+    let (hour, minute, second) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+
+    // Civil-from-days algorithm (Howard Hinnant's `civil_from_days`),
+    // proleptic Gregorian, days since 1970-01-01.
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 /// Parses a `[user@]host[:port]` spec into a `HostSpec`, reusing
 /// `isekai_trust::split_user_host_port`'s tokenization but keeping user/port
 /// as separate optional fields (as `HostSpec`/`ssh(1)` want them) instead of
@@ -248,9 +290,19 @@ mod tests {
         assert_eq!(js, JumpSpec::new("bastion.example.com").with_port(2200));
     }
 
-    // rfc3339_formats_a_known_timestamp / hex_sha256_matches_known_vector:
-    // moved to `time_fmt.rs`'s own test module alongside the functions
-    // themselves.
+    #[test]
+    fn rfc3339_formats_a_known_timestamp() {
+        // 2026-07-04T00:00:00Z, matching the fixtures used across
+        // isekai-trust's own tests.
+        let unix_secs = 1_783_123_200u64;
+        assert_eq!(format_rfc3339_utc(unix_secs), "2026-07-04T00:00:00Z");
+    }
+
+    #[test]
+    fn hex_sha256_matches_known_vector() {
+        // sha256("") — a standard test vector.
+        assert_eq!(hex_sha256(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
 
     fn sample_init_args() -> InitArgs {
         InitArgs {
