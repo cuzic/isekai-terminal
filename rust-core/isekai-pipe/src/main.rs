@@ -2017,13 +2017,23 @@ async fn run_resume_loop(
                         network_rebinder = None;
                         promoted_stream = Some(promoted.data_stream);
                     } else {
-                        eprintln!("isekai-pipe connect: warm-standby promote succeeded but replay failed; falling back to full resume");
-                        last_resume_error = Some("warm-standby promote succeeded but replay failed".to_string());
+                        let msg = "warm-standby promote succeeded but replay failed; falling back to full resume";
+                        // TTY時はその場書き換え中のライブ表示行を壊さないよう、
+                        // まず行をクリアしてから改行付きで出す(このメッセージ自体は
+                        // 1episodeにつき最大1回で、per-attempt的な連発ではないため
+                        // debugログへは落とさない)。
+                        if is_tty {
+                            eprintln!("\r\x1b[Kisekai-pipe connect: {msg}");
+                        } else {
+                            eprintln!("isekai-pipe connect: {msg}");
+                        }
+                        last_resume_error = Some(msg.to_string());
                     }
                 }
                 Err(e) => {
-                    log::info!("isekai-pipe connect: warm-standby promote unavailable ({e:#}); falling back to full resume");
-                    last_resume_error = Some(format!("{e:#}"));
+                    let msg = format!("{e:#}");
+                    log::info!("isekai-pipe connect: warm-standby promote unavailable ({msg}); falling back to full resume");
+                    last_resume_error = Some(msg);
                 }
             }
         }
@@ -2078,6 +2088,18 @@ async fn run_resume_loop(
                 {
                     Ok(mut resumed) => {
                         if !replay_and_advance(&replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
+                            // resume自体は成功したがreplayが不整合 —実質「この
+                            // 試行は失敗した」ので、既存のErr(e)アームと同じ
+                            // TTY/非TTY分岐・last_resume_error更新を行う
+                            // (Codexレビューで指摘: このcontinue経路だけ元々
+                            // 何も表示せず`last_resume_error`も更新していなかった)。
+                            let msg = "resume succeeded but replay failed".to_string();
+                            if is_tty {
+                                log::debug!("isekai-pipe connect: resume attempt {attempt} {msg}");
+                            } else {
+                                eprintln!("isekai-pipe connect: resume attempt {attempt} {msg}");
+                            }
+                            last_resume_error = Some(msg);
                             continue;
                         }
                         print_reconnect_success(is_tty);
