@@ -674,6 +674,45 @@ Phase 9-4bの手順と同じ:
 
 ---
 
+## 17. JISキーボード自動検出 (KeyboardLayoutDetector AUTO) 実機確認
+
+`KeyboardLayoutDetectorTest.kt`(Robolectric)は `InputDevice.hasKeys(KEYCODE_YEN, KEYCODE_RO)`
+に依存する AUTO 判定の実機での境界を再現できない(手動固定の JIS/US 設定のテストのみ
+カバー済み)。外付け/Bluetooth キーボード接続時の自動判定は実機で確認する。
+
+### 前提
+- キーボードレイアウト設定が「自動検出」(既定値)になっていること。
+- JIS配列の外付け/Bluetoothキーボード(¥キー・ろキーを持つもの)と、US配列の
+  外付け/Bluetoothキーボードの両方が用意できること。
+
+### 17-A JISキーボード接続時にJISと判定される
+1. JIS配列キーボードを接続する
+2. ターミナル画面でソフトキーボード設定 → キーボードレイアウトが「JIS」自動判定されることを確認
+3. ¥キーを押下し、`\`(バックスラッシュ)がターミナルへ送られることを確認
+4. ろキーを押下し、対応するバイト列が送られることを確認(ソフトキーバーの¥/ろキーとの
+   バイト列一致は `TerminalKeyEncoderTest.kt` で担保済みなので、ここでは「実機のキー入力から
+   同じ経路に到達すること」だけを見ればよい)
+
+### 17-B USキーボード接続時にUSと判定される(誤判定なし)
+1. US配列キーボードを接続する
+2. キーボードレイアウトが「US」と自動判定され、JISに誤判定されないことを確認
+3. US配列上で¥/ろに相当する位置のキーを押しても、JIS向けの特殊バイト列が送られないことを確認
+
+### 17-C キーボード切断時のフォールバック
+1. 17-A/17-Bのキーボードを取り外す
+2. ソフトキーボードのレイアウトが妥当な既定値(US、または直前の判定を保持)に戻り、
+   クラッシュや不正なキー入力が発生しないことを確認
+
+### NG 時の確認ポイント
+- JISキーボードなのにUSと判定される、または逆
+  → `android/src/main/kotlin/tools/isekai/terminal/input/KeyboardLayoutDetector.kt`の
+    `InputDevice.hasKeys(KEYCODE_YEN, KEYCODE_RO)` 判定と、実機の `InputDevice` が実際に
+    どのキーコードを保持しているか(`adb shell dumpsys input` 等)を突き合わせる
+- 手動固定(JIS/US)設定に切り替えても反映されない
+  → `KeyboardLayoutMode` の永続化(SharedPreferences)経路を確認
+
+---
+
 ## スクリプト一覧
 
 | スクリプト | 用途 |
