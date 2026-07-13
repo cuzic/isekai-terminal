@@ -126,7 +126,6 @@ impl server::Handler for FakeShellHandler {
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
         let command = String::from_utf8_lossy(data).into_owned();
-        eprintln!("DEBUGCMD>>>{command}<<<DEBUGCMD");
         let handle = session.handle();
         let home = self.home.clone();
 
@@ -166,18 +165,15 @@ impl server::Handler for FakeShellHandler {
                 tokio::join!(read_all(&mut child_stdout), read_all(&mut child_stderr), child.wait());
 
             if let Ok(out) = stdout_res {
-                eprintln!("DEBUGSTDOUT>>>{}<<<DEBUGSTDOUT", String::from_utf8_lossy(&out));
                 if !out.is_empty() {
                     let _ = handle.data(channel, CryptoVec::from(out)).await;
                 }
             }
             if let Ok(err) = stderr_res {
-                eprintln!("DEBUGSTDERR>>>{}<<<DEBUGSTDERR", String::from_utf8_lossy(&err));
                 if !err.is_empty() {
                     let _ = handle.extended_data(channel, 1, CryptoVec::from(err)).await;
                 }
             }
-            eprintln!("DEBUGEXIT>>>{:?}<<<DEBUGEXIT", wait_res.as_ref().ok().map(|s| s.code()));
             let code = wait_res.ok().and_then(|s| s.code()).unwrap_or(1) as u32;
             let _ = handle.exit_status_request(channel, code).await;
             let _ = handle.eof(channel).await;
