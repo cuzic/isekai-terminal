@@ -1081,13 +1081,6 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      */
     func addLocalForward(id: String, bindAddress: String, bindPort: UInt16, remoteHost: String, remotePort: UInt16) 
     
-    /**
-     * 自動再接続ループを中止する。ループが動作中だった場合のみ`Disconnected`を
-     * 通知する(動いていない時に呼ばれても無音、UIは`isReconnecting`の間だけ
-     * 「中止」操作を出す想定)。
-     */
-    func cancelReconnect() 
-    
     func connect(config: SshConfig) throws 
     
     /**
@@ -1259,18 +1252,6 @@ open func addLocalForward(id: String, bindAddress: String, bindPort: UInt16, rem
         FfiConverterUInt16.lower(bindPort),
         FfiConverterString.lower(remoteHost),
         FfiConverterUInt16.lower(remotePort),$0
-    )
-}
-}
-    
-    /**
-     * 自動再接続ループを中止する。ループが動作中だった場合のみ`Disconnected`を
-     * 通知する(動いていない時に呼ばれても無音、UIは`isReconnecting`の間だけ
-     * 「中止」操作を出す想定)。
-     */
-open func cancelReconnect()  {try! rustCall() {
-    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_cancel_reconnect(
-            self.uniffiCloneHandle(),$0
     )
 }
 }
@@ -3484,14 +3465,6 @@ public enum ConnectionPublicState: Equatable, Hashable {
     )
     case error(message: String
     )
-    /**
-     * 一度`Connected`になったセッションが予期せず切断された際、orchestratorが
-     * 自動的に再接続を試みている間の状態(`orchestrator.rs`のreconnectループ参照)。
-     * `elapsed_secs`/`timeout_secs`はUIがライブなカウントダウンを描画するための
-     * SSOT値(Kotlin側でタイマーを持たない)。
-     */
-    case reconnecting(elapsedSecs: UInt32, timeoutSecs: UInt32, reason: String?
-    )
 
 
 
@@ -3524,9 +3497,6 @@ public struct FfiConverterTypeConnectionPublicState: FfiConverterRustBuffer {
         case 4: return .error(message: try FfiConverterString.read(from: &buf)
         )
         
-        case 5: return .reconnecting(elapsedSecs: try FfiConverterUInt32.read(from: &buf), timeoutSecs: try FfiConverterUInt32.read(from: &buf), reason: try FfiConverterOptionString.read(from: &buf)
-        )
-        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -3552,13 +3522,6 @@ public struct FfiConverterTypeConnectionPublicState: FfiConverterRustBuffer {
         case let .error(message):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(message, into: &buf)
-            
-        
-        case let .reconnecting(elapsedSecs,timeoutSecs,reason):
-            writeInt(&buf, Int32(5))
-            FfiConverterUInt32.write(elapsedSecs, into: &buf)
-            FfiConverterUInt32.write(timeoutSecs, into: &buf)
-            FfiConverterOptionString.write(reason, into: &buf)
             
         }
     }
@@ -6135,9 +6098,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_add_local_forward() != 60755) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect() != 53892) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect() != 45531) {
