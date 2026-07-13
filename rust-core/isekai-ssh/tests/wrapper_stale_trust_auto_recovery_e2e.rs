@@ -466,15 +466,22 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     assert!(saw_stale_notice, "expected wrapper stderr to report a detected stale-trust signal:\n{stderr_log}");
     assert!(saw_second_registration, "expected the re-bootstrap to complete and register a refreshed profile:\n{stderr_log}");
     assert!(!stderr_log.contains("[y/N]"), "the automatic re-bootstrap must never show the TOFU prompt:\n{stderr_log}");
-    // `OpenSshBackend::install_and_start` performs exactly two `ssh(1)`
-    // invocations per deploy (upload_binary + launch_and_capture_handshake,
-    // `isekai-bootstrap/src/openssh.rs`'s module docs) — two `exec_request`
-    // calls here means the re-bootstrap happened exactly once, not that it
-    // was retried an extra time.
+    // `OpenSshBackend::install_and_launch` performs exactly one combined
+    // `ssh(1)` invocation per deploy (check + conditional-upload +
+    // conditional-launch under a single held `flock`, commit 3921a43 —
+    // this comment/assertion previously said "two ssh(1) invocations
+    // (upload_binary + launch_and_capture_handshake)", describing the
+    // pre-3921a43 design that no longer matches the code; that stale
+    // mismatch, not CI nondeterminism, was the actual cause of this test's
+    // long-standing CI-only failure, issue #6). `resolve_helper_binary`
+    // also makes zero `ssh(1)` calls here since `--isekai-helper-binary`
+    // is explicit (skips `detect_remote_arch`). So exactly one
+    // `exec_request` here means the re-bootstrap happened exactly once,
+    // not that it was retried an extra time.
     assert_eq!(
         deploy_count.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "expected exactly one re-bootstrap deploy (2 ssh exec calls: upload + launch)"
+        1,
+        "expected exactly one re-bootstrap deploy (1 combined ssh exec: install_and_launch)"
     );
 
     let refreshed = isekai_pipe_core::load_persistent_profile(&profiles_dir_under(&home), &key).unwrap().expect("profile should still exist after refresh");
