@@ -675,7 +675,14 @@ pub(crate) async fn run_ssh_channel_loop(
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         info!("ssh: remote exited status={}", exit_status);
-                        event_tx.send(TransportEvent::Disconnected { reason: None }).await.ok();
+                        // リモートプロセスの正常終了(ユーザーが`exit`した等)であり、
+                        // ネットワーク/トランスポート障害ではない。
+                        // `orchestrator.rs::is_graceful_remote_exit`がこの文言を見て
+                        // tssh風の自動再接続の対象から除外する(シェルが終了しただけの
+                        // タブを勝手に張り直すのは意図しない挙動のため)。
+                        event_tx.send(TransportEvent::Disconnected {
+                            reason: Some(format!("remote process exited (status {exit_status})")),
+                        }).await.ok();
                         break;
                     }
                     None => {

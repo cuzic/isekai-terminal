@@ -649,6 +649,11 @@ pub enum ConnectionPublicState {
     Connecting,
     Connected { host: String },
     Error { message: String },
+    /// 一度`Connected`になったセッションが予期せず切断された際、orchestratorが
+    /// 自動的に再接続を試みている間の状態(`orchestrator.rs`のreconnectループ参照)。
+    /// `elapsed_secs`/`timeout_secs`はUIがライブなカウントダウンを描画するための
+    /// SSOT値(Kotlin側でタイマーを持たない)。
+    Reconnecting { elapsed_secs: u32, timeout_secs: u32, reason: Option<String> },
 }
 
 #[derive(Debug, Clone, uniffi::Enum)]
