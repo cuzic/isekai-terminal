@@ -171,6 +171,18 @@ public struct TerminalView: View {
             .padding()
             .background(.black.opacity(0.7))
             .accessibilityIdentifier("terminalErrorOverlay")
+        case .reconnecting(let elapsedSecs, let timeoutSecs, let reason):
+            VStack(spacing: 12) {
+                ProgressView()
+                Text("再接続中… (\(elapsedSecs)/\(timeoutSecs)秒)\(reason.map { " [\($0)]" } ?? "")")
+                    .foregroundStyle(.yellow)
+                Button("中止") { controller.cancelReconnect() }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("cancelReconnectButton")
+            }
+            .padding()
+            .background(.black.opacity(0.7))
+            .accessibilityIdentifier("terminalReconnectingOverlay")
         }
     }
 

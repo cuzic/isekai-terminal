@@ -24,6 +24,10 @@ public final class TerminalUIState: ObservableObject {
         /// 届いた値に応じて案内UIを出すだけ)。`nil`なら特に案内すべき理由がない。
         case disconnected(reason: String?, issueHint: ConnectionIssueHint? = nil)
         case failed(message: String)
+        /// 一度`Connected`になったセッションが予期せず切断され、Rust側の自動
+        /// reconnectループが再接続を試みている間の状態(Android版`isReconnecting`
+        /// 相当)。`elapsedSecs`/`timeoutSecs`はRust側がライブ通知するSSOT値。
+        case reconnecting(elapsedSecs: UInt32, timeoutSecs: UInt32, reason: String?)
     }
 
     @Published public internal(set) var state: State = .connecting
@@ -400,6 +404,13 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         orchestrator.disconnect()
     }
 
+    /// `.reconnecting`中に「中止」操作から呼ぶ。Rust側の自動reconnectループを
+    /// 停止する(Android版`actions.onCancelReconnect()`と同じ、`cancelReconnect()`
+    /// 自体の要否判断はRust側が行う)。
+    public func cancelReconnect() {
+        orchestrator.cancelReconnect()
+    }
+
     // MARK: - #20: バックグラウンド/フォアグラウンド遷移
     //
     // 生イベントをそのままRust側`SessionOrchestrator`へ転送するだけの薄いラッパー。
@@ -430,7 +441,9 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     @MainActor
     public func reconnect() {
         switch uiState.state {
-        case .connecting, .connected:
+        case .connecting, .connected, .reconnecting:
+            // .reconnecting中はRust側の自動reconnectループが既に動作中なので、
+            // 手動での二重接続は行わない(中止したい場合はcancelReconnect()を使う)。
             return
         case .disconnected, .failed:
             uiState.state = .connecting
@@ -558,6 +571,10 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             Task { @MainActor in self.uiState.state = .disconnected(reason: reason, issueHint: issueHint) }
         case .error(let message):
             fail(message: message)
+        case .reconnecting(let elapsedSecs, let timeoutSecs, let reason):
+            Task { @MainActor in
+                self.uiState.state = .reconnecting(elapsedSecs: elapsedSecs, timeoutSecs: timeoutSecs, reason: reason)
+            }
         }
     }
 

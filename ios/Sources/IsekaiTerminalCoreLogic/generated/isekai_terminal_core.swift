@@ -1148,8 +1148,10 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      * Androidの`ProcessLifecycleOwner.onStop`相当)ことを通知する。`budget_ms`は
      * `beginBackgroundTask`等が保証する猶予の目安として記録目的で受け取るが、
      * 実際の期限管理(タイマー)はSwift/Kotlin側の責務のままにする(Rust/Swiftで
-     * 基準時計を共有していないため)。`Connected`中のみ猶予追跡を開始する
-     * (未接続/接続試行中のバックグラウンド化は維持すべきセッションが無いので無視)。
+     * 基準時計を共有していないため)。`Connected`または`Connecting`中のみ猶予追跡を
+     * 開始する(`Idle`は維持すべきセッションが無いので無視。`Connecting`中に
+     * バックグラウンド化し、その猶予中に接続が成立するケース(`on_connected()`
+     * 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
      */
     func notifyDidEnterBackground(budgetMs: UInt32) 
     
@@ -1433,8 +1435,10 @@ open func notifyBackgroundBudgetExpired()  {try! rustCall() {
      * Androidの`ProcessLifecycleOwner.onStop`相当)ことを通知する。`budget_ms`は
      * `beginBackgroundTask`等が保証する猶予の目安として記録目的で受け取るが、
      * 実際の期限管理(タイマー)はSwift/Kotlin側の責務のままにする(Rust/Swiftで
-     * 基準時計を共有していないため)。`Connected`中のみ猶予追跡を開始する
-     * (未接続/接続試行中のバックグラウンド化は維持すべきセッションが無いので無視)。
+     * 基準時計を共有していないため)。`Connected`または`Connecting`中のみ猶予追跡を
+     * 開始する(`Idle`は維持すべきセッションが無いので無視。`Connecting`中に
+     * バックグラウンド化し、その猶予中に接続が成立するケース(`on_connected()`
+     * 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
      */
 open func notifyDidEnterBackground(budgetMs: UInt32)  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_did_enter_background(
@@ -5805,7 +5809,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired() != 26224) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background() != 63526) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background() != 56561) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {

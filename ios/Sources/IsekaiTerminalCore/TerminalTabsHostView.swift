@@ -264,7 +264,7 @@ private struct TabChip: View {
     private var statusColor: Color {
         switch uiState.state {
         case .connected: return .green
-        case .connecting: return .yellow
+        case .connecting, .reconnecting: return .yellow
         case .disconnected, .failed: return .gray
         }
     }
