@@ -1296,6 +1296,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3-datagram-error"
+version = "0.1.0"
+dependencies = [
+ "h3",
+ "h3-datagram",
+]
+
+[[package]]
 name = "h3-noq"
 version = "0.1.0"
 dependencies = [
@@ -1303,6 +1311,7 @@ dependencies = [
  "futures-util",
  "h3",
  "h3-datagram",
+ "h3-datagram-error",
  "http",
  "noq",
  "rcgen 0.13.2",
@@ -1320,6 +1329,7 @@ dependencies = [
  "futures-util",
  "h3",
  "h3-datagram",
+ "h3-datagram-error",
  "http",
  "qmux",
  "rcgen 0.13.2",

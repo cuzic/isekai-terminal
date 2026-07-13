@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "h3-qmux", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "quicsock", "quicmux"]
+members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "h3-qmux", "h3-datagram-error", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "quicsock", "quicmux"]
 resolver = "2"
 
 # quicsock(/home/cuzic/quicsockからvendor。isekai-transportへのマルチパス移植の

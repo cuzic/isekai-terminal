@@ -1,0 +1,13 @@
+[package]
+name = "h3-datagram-error"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "Shared h3 <-> h3-datagram ConnectionErrorIncoming conversion, used identically by h3-noq and h3-qmux."
+keywords = ["http3", "quic", "h3"]
+categories = ["network-programming", "web-programming"]
+
+[dependencies]
+h3 = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
+h3-datagram = { git = "https://github.com/hyperium/h3", rev = "385da3ad93407ec8eed15172f63561f6fb2bca40" }
