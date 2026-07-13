@@ -222,8 +222,25 @@ impl CandidateProvider for ConfigStunProvider {
         let mut candidates = Vec::with_capacity(intent.stun_servers.len());
         for (index, entry) in intent.stun_servers.iter().enumerate() {
             let (cert_pin, server_name) =
-                isekai_pipe_core::validate_endpoint_identity(&intent.expected_server_identity.cert_sha256_hex, server_name)
-                    .map_err(|e| CandidateProviderError::InvalidStunServer { entry: entry.clone(), reason: e.to_string() })?;
+                isekai_pipe_core::validate_endpoint_identity(&intent.expected_server_identity.cert_sha256_hex, server_name).map_err(
+                    |e| {
+                        // `server_name` here comes from `intent.transport`, not
+                        // from `entry` (the current loop iteration's stun
+                        // server) — keep the pre-`validate_endpoint_identity`
+                        // wording for that case so the diagnostic still points
+                        // at the right source, rather than
+                        // `CandidateConversionError`'s generic "invalid
+                        // server_name: ..." (which reads as if `entry` itself
+                        // were the bad value).
+                        let reason = match &e {
+                            CandidateConversionError::ServerName(inner) => {
+                                format!("intent.transport's server_name is invalid: {inner}")
+                            }
+                            _ => e.to_string(),
+                        };
+                        CandidateProviderError::InvalidStunServer { entry: entry.clone(), reason }
+                    },
+                )?;
             let stun_server = entry.parse().map_err(|_| CandidateProviderError::InvalidStunServer {
                 entry: entry.clone(),
                 reason: "not a valid socket address".to_string(),

@@ -754,9 +754,19 @@ impl SessionOrchestrator {
     /// 各`connect_*`が共通で行う「state更新→Connecting通知→adapter生成」を
     /// 一箇所にまとめる。session生成・接続・`ActiveSession`格納は呼び出し側が
     /// トランスポートごとに行う（`connect`のエラー型/セッション型がそれぞれ違うため）。
-    fn begin_connect(&self, host: String, port: u16, is_quic: bool) -> OrchestratorAdapter {
+    ///
+    /// phaseが既に`Connecting`(=前の`connect_*`呼び出しがまだ実行中)の間の新規呼び出しは
+    /// 拒否する(真の二重start防止、Task #9)。`Connected`中の呼び出しは意図的に許可する
+    /// ——「保留中のnetwork-path debounceをキャンセルしつつ別セッションへ手動で切り替える」
+    /// 正当な経路であり(下記invalidate呼び出し、および
+    /// `notify_network_path_changed_pending_debounce_is_cancelled_by_a_new_connect_attempt`
+    /// テスト参照)、`Idle`と同様に受理してよい。
+    fn begin_connect(&self, host: String, port: u16, is_quic: bool) -> Result<OrchestratorAdapter, SshError> {
         {
             let mut s = self.shared.state.lock();
+            if s.phase == ConnPhase::Connecting {
+                return Err(SshError::ConnectionFailed);
+            }
             s.current_host = Some(host);
             s.current_port = port;
             s.is_quic = is_quic;
@@ -774,14 +784,14 @@ impl SessionOrchestrator {
         // 誤って切断してしまう(レビューで指摘された実際の不具合)。
         self.shared.path_observer.lock().invalidate();
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
-        OrchestratorAdapter::new(self.shared.clone())
+        Ok(OrchestratorAdapter::new(self.shared.clone()))
     }
 }
 
 #[uniffi::export]
 impl SessionOrchestrator {
     pub fn connect(&self, config: SshConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.host.clone(), config.port, false);
+        let adapter = self.begin_connect(config.host.clone(), config.port, false)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::Ssh(config.clone()));
         let session = crate::create_ssh_session(config);
         session.connect(Box::new(adapter))?;
@@ -790,7 +800,7 @@ impl SessionOrchestrator {
     }
 
     pub fn connect_quic(&self, config: QuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::Quic(config.clone()));
         let session = crate::quic_transport::create_quic_session(config);
         session.connect(Box::new(adapter))?;
@@ -801,7 +811,7 @@ impl SessionOrchestrator {
     /// Phase 7: 自作ヘルパー（isekai-helper）経由の QUIC 接続。フォールバック無し
     /// （`TransportPreference::IsekaiPipeQuic` 相当、明示選択時に使う）。
     pub fn connect_isekai_pipe_quic(&self, config: IsekaiPipeQuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiPipeQuic(config.clone()));
         let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
         session.connect(Box::new(adapter))?;
@@ -812,7 +822,7 @@ impl SessionOrchestrator {
     /// Phase 7: `TransportPreference::Auto` 相当。自作ヘルパー経由 QUIC のブートストラップ/
     /// 接続に失敗した場合、内部で自動的に通常の TCP SSH にフォールバックする。
     pub fn connect_isekai_pipe_quic_auto(&self, config: IsekaiPipeQuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiPipeQuicAuto(config.clone()));
         let session = crate::isekai_pipe_quic_transport::create_isekai_pipe_quic_session(config);
         session.connect_auto(Box::new(adapter))?;
@@ -824,7 +834,7 @@ impl SessionOrchestrator {
     /// `config.direct_host` が設定されていれば path0（`ssh_host`）+ path1（`direct_host`）の
     /// 受動的マルチパスで接続する。
     pub fn connect_multipath_isekai_pipe_quic(&self, config: MultipathIsekaiPipeQuicConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::MultipathIsekaiPipeQuic(config.clone()));
         let session = crate::multipath_transport::create_multipath_isekai_pipe_quic_session(config);
         session.connect(Box::new(adapter))?;
@@ -836,7 +846,7 @@ impl SessionOrchestrator {
     /// STUN+SSH rendezvousによる直接 P2P QUIC。フォールバック無し（穴あけ不成立時は
     /// 接続失敗として扱う。`isekai_stun_p2p_transport.rs` 参照）。
     pub fn connect_isekai_stun_p2p(&self, config: IsekaiStunP2pConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiStunP2p(config.clone()));
         let session = crate::isekai_stun_p2p_transport::create_isekai_stun_p2p_session(config);
         session.connect(Box::new(adapter))?;
@@ -847,7 +857,7 @@ impl SessionOrchestrator {
     /// Phase 10: `TransportPreference::IsekaiLinkRelayQuic` 相当。MASQUE relay 経由の
     /// P2P QUIC。フォールバック無し（`isekai_link_relay_transport.rs` 参照）。
     pub fn connect_isekai_link_relay(&self, config: IsekaiLinkRelayConfig) -> Result<(), SshError> {
-        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true);
+        let adapter = self.begin_connect(config.ssh_host.clone(), config.ssh_port, true)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::IsekaiLinkRelay(config.clone()));
         let session = crate::isekai_link_relay_transport::create_isekai_link_relay_session(config);
         session.connect(Box::new(adapter))?;
@@ -1325,7 +1335,8 @@ mod tests {
         // 新しいセッションを誤って切断してはいけない。
         let (orch, cb) = orchestrator_connected_tcp_with_debounce(std::time::Duration::from_millis(30));
         orch.notify_network_path_changed(false);
-        orch.begin_connect("other.example.com".to_string(), 22, false);
+        orch.begin_connect("other.example.com".to_string(), 22, false)
+            .expect("Connected中の新規connectは許可されるはず");
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -1338,6 +1349,40 @@ mod tests {
             orch.shared.state.lock().phase == ConnPhase::Connecting,
             "古いdebounce発火でphaseがIdleへ巻き戻されてはいけない"
         );
+    }
+
+    // ── begin_connect (Task #9: 真の二重start防止) ────────────
+
+    #[test]
+    fn begin_connect_rejects_a_second_call_while_already_connecting() {
+        // 前の connect_* 呼び出しがまだ Connecting のまま(=in-flight)の間に、別スレッド等から
+        // 新規 connect_* が呼ばれた場合の「真の二重start」を防ぐ。Kotlin側の
+        // TerminalSession.guardedConnect() の check-then-act は複数スレッドから並行に
+        // 呼ばれるとアトミックではないため、最終防衛はRust側のこのロックの中で行う。
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Connecting, false);
+        let result = orch.begin_connect("other.example.com".to_string(), 22, false);
+        assert!(matches!(result, Err(SshError::ConnectionFailed)));
+        // 拒否された呼び出しは進行中の接続の host/port を書き換えてはいけない。
+        assert_eq!(orch.shared.state.lock().current_host.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn begin_connect_allows_a_new_call_while_idle() {
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Idle, false);
+        let result = orch.begin_connect("other.example.com".to_string(), 22, false);
+        assert!(result.is_ok());
+        assert!(orch.shared.state.lock().phase == ConnPhase::Connecting);
+    }
+
+    #[test]
+    fn begin_connect_allows_replacing_a_connected_session() {
+        // Connected中の新規connectは「別セッションへの手動切り替え」として意図的に許可する
+        // (notify_network_path_changed_pending_debounce_is_cancelled_by_a_new_connect_attempt
+        // が検証する正当な経路)。
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Connected, false);
+        let result = orch.begin_connect("other.example.com".to_string(), 22, false);
+        assert!(result.is_ok());
+        assert_eq!(orch.shared.state.lock().current_host.as_deref(), Some("other.example.com"));
     }
 
     // ── OrchestratorAdapter (SessionCallback実装) ────────────
@@ -1695,7 +1740,8 @@ mod tests {
         assert!(orch.shared.state.lock().reconnect_loop_active);
 
         // 手動で新しい接続を開始(begin_connect相当)。
-        let _new_adapter = orch.begin_connect("other.example.com".to_string(), 22, false);
+        let _new_adapter = orch.begin_connect("other.example.com".to_string(), 22, false)
+            .expect("Idle中の新規connectは許可されるはず");
         assert!(!orch.shared.state.lock().reconnect_loop_active, "新しい手動接続でループは無効化されるはず");
 
         std::thread::sleep(Duration::from_millis(80));

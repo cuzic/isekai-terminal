@@ -57,6 +57,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import tools.isekai.terminal.data.AuthType
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.HostKeySettings
 import tools.isekai.terminal.input.KeyboardLayoutMode
@@ -280,8 +281,8 @@ fun ProfileListScreen(
                         ProfileCard(
                             profile = profile,
                             onTap = {
-                                val needsPasswordPrompt = profile.authType == "password" ||
-                                    (profile.usesJumpHost && profile.jumpAuthType == "password")
+                                val needsPasswordPrompt = profile.authTypeEnum == AuthType.PASSWORD ||
+                                    (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD)
                                 if (needsPasswordPrompt) {
                                     RemoteLogger.i("IsekaiTerminalProfile", "tap → password dialog: '${profile.label}' ${profile.username}@${profile.host}:${profile.port}")
                                     vm.requestPasswordConnect(profile)
@@ -302,8 +303,8 @@ fun ProfileListScreen(
     passwordTarget?.let { target ->
         PasswordDialog(
             label = target.label,
-            showMainField = target.authType == "password",
-            jumpLabel = if (target.usesJumpHost && target.jumpAuthType == "password") target.jumpHost else null,
+            showMainField = target.authTypeEnum == AuthType.PASSWORD,
+            jumpLabel = if (target.usesJumpHost && target.jumpAuthTypeEnum == AuthType.PASSWORD) target.jumpHost else null,
             onDismiss = { vm.dismissPassword() },
             onConfirm = { password, jumpPassword ->
                 vm.dismissPassword()
@@ -588,7 +589,7 @@ private fun ProfileCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    text = if (profile.authType == "key") "鍵認証" else "パスワード",
+                    text = if (profile.authTypeEnum == AuthType.KEY) "鍵認証" else "パスワード",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.primary,
                 )

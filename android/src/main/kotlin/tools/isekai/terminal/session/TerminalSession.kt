@@ -96,39 +96,20 @@ class TerminalSession(
     private val callback = object : OrchestratorCallback {
         override fun onConnectionStateChanged(state: ConnectionPublicState) {
             when (state) {
-                ConnectionPublicState.Connecting ->
-                    _state.update { it.copy(isConnecting = true, connected = false,
-                        isReconnecting = false, statusMsg = "接続中…") }
-                is ConnectionPublicState.Connected -> {
+                is ConnectionPublicState.Connected ->
                     RemoteLogger.i("IsekaiTerminalSSH", "✓ connected: ${state.host}")
-                    _state.update { it.copy(isConnecting = false, connected = true,
-                        isReconnecting = false,
-                        statusMsg = "接続済み: ${state.host}", currentHost = state.host) }
-                }
-                is ConnectionPublicState.Disconnected -> {
+                is ConnectionPublicState.Disconnected ->
                     RemoteLogger.i("IsekaiTerminalSSH", "✗ disconnected: reason='${state.reason ?: "none"}'")
-                    _state.update { it.copy(isConnecting = false, connected = false,
-                        isReconnecting = false,
-                        statusMsg = state.reason?.let { r -> "切断: $r" } ?: "切断済み (不明)",
-                        currentHost = null, screenUpdate = null, trzszState = null) }
-                }
-                is ConnectionPublicState.Error -> {
+                is ConnectionPublicState.Error ->
                     RemoteLogger.w("IsekaiTerminalSSH", "connection error: ${state.message}")
-                    _state.update { it.copy(isConnecting = false, isReconnecting = false,
-                        statusMsg = "エラー: ${state.message}") }
-                }
-                is ConnectionPublicState.Reconnecting -> {
+                is ConnectionPublicState.Reconnecting ->
                     RemoteLogger.i(
                         "IsekaiTerminalSSH",
                         "… reconnecting: ${state.elapsedSecs}/${state.timeoutSecs}s reason='${state.reason ?: "none"}'",
                     )
-                    val suffix = state.reason?.let { r -> " [$r]" } ?: ""
-                    _state.update { it.copy(isConnecting = false, connected = false,
-                        isReconnecting = true,
-                        statusMsg = "再接続中… (${state.elapsedSecs}/${state.timeoutSecs}秒)$suffix",
-                        currentHost = null, screenUpdate = null, trzszState = null) }
-                }
+                ConnectionPublicState.Connecting -> {}
             }
+            _state.update { ConnectionStateMapper.apply(it, state) }
         }
 
         override fun onScreenUpdate(update: ScreenUpdate) {
@@ -171,26 +152,11 @@ class TerminalSession(
         override fun onData(data: ByteArray) { appendLog(data) }
 
         override fun onTrzszStateChanged(state: TrzszPublicState) {
-            when (state) {
-                TrzszPublicState.Idle -> {
-                    transferAccepted.set(false)
-                    _state.update { it.copy(trzszState = null) }
-                }
-                is TrzszPublicState.WaitingUser -> {
-                    transferAccepted.set(false)
-                    _state.update { it.copy(trzszState = TrzszUiState.WaitingUser(
-                        state.transferId, state.mode, state.suggestedName, state.expectedSize)) }
-                }
-                is TrzszPublicState.InProgress -> {
-                    _state.update { it.copy(trzszState = TrzszUiState.InProgress(
-                        state.transferId, state.mode, state.fileName, state.transferred, state.total)) }
-                }
-                is TrzszPublicState.Done -> {
-                    transferAccepted.set(false)
-                    _state.update { it.copy(trzszState = TrzszUiState.Done(
-                        state.transferId, state.success, state.message)) }
-                }
-            }
+            // 転送が終端/中断状態(Idle・WaitingUser=新規要求・Done)に入るたびに
+            // 二重起動防止フラグをリセットする(UI表示状態ではない副作用のため
+            // TrzszStateMapper の対象外)。
+            if (state !is TrzszPublicState.InProgress) transferAccepted.set(false)
+            _state.update { it.copy(trzszState = TrzszStateMapper.toUiState(state)) }
         }
 
         override fun onDownloadComplete(fileName: String?, data: ByteArray) {

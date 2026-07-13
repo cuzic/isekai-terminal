@@ -47,6 +47,24 @@ private object PortForwardParceler : Parceler<PortForward> {
     }
 }
 
+/**
+ * [ConnectionProfile.authType]/[ConnectionProfile.jumpAuthType] (Room上は文字列)のtyped版。
+ * DB entity自体は後方互換のため文字列列のまま維持し、このenumはUI/接続層でのみ使う
+ * ([ConnectionProfile.authTypeEnum]/[ConnectionProfile.jumpAuthTypeEnum]、
+ * `session.AuthValidator`参照)。
+ */
+enum class AuthType {
+    PASSWORD, KEY;
+
+    companion object {
+        fun fromRaw(raw: String): AuthType? = when (raw) {
+            "password" -> PASSWORD
+            "key" -> KEY
+            else -> null
+        }
+    }
+}
+
 @TypeParceler<PortForward, PortForwardParceler>()
 @Parcelize
 @Entity(tableName = "connection_profiles")
@@ -134,6 +152,17 @@ data class ConnectionProfile(
         } catch (_: IllegalArgumentException) {
             TransportPreference.PLAIN_SSH
         }
+
+    /** [authType](生の文字列)のtyped版。未知の値は[transportPreference]と違いフォールバック
+     *  せずnullにする(認証方式の解釈を誤って別の認証方式として扱ってしまう方が、
+     *  接続不可より危険なため)。呼び出し側は既存の`AuthValidator.validate(String, ...)`と
+     *  同じく「未知の認証タイプはエラー」として扱うこと。 */
+    val authTypeEnum: AuthType?
+        get() = AuthType.fromRaw(authType)
+
+    /** [jumpAuthType]のtyped版。踏み台未設定、または値が未知の場合はnull。 */
+    val jumpAuthTypeEnum: AuthType?
+        get() = jumpAuthType?.let { AuthType.fromRaw(it) }
 
     /** 踏み台ホストが設定されているか(多段SSHを使うプロファイルか)。 */
     val usesJumpHost: Boolean
