@@ -57,6 +57,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openssh-server
 
+      - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
+        # rust-core/src/isekai_pipe_quic_transport.rs が include_bytes! で埋め込む
+        # isekai-pipe の x86_64/aarch64 musl静的バイナリ。iOS/Androidどちらのビルドにも
+        # 依らずisekai-terminal-coreを cargo test するだけでも常に必要な前提
+        # (ios-rust-core-check.yml/ios-app-build-check.yml/ios-ssh-vertical-slice-check.yml/
+        # ios-logic-linux-check.ymlは既に対応済みだったが、このワークフローだけ追従が漏れていた)。
+        run: |
+          set -euo pipefail
+          curl -fL -o /tmp/zig.tar.xz \
+            "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+          mkdir -p "$HOME/zig-toolchain"
+          tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
+          echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
+          export PATH="$HOME/zig-toolchain:$PATH"
+          cargo install cargo-zigbuild --locked
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          bash rust-core/scripts/build-isekai-pipe-musl.sh
+
       - name: Cache cargo (rust-core)
         uses: actions/cache@v4
         with:
