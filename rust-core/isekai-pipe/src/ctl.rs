@@ -23,7 +23,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-use crate::{next_arg, EX_UNAVAILABLE, EX_USAGE};
+use crate::connect::next_arg;
+use crate::{EX_UNAVAILABLE, EX_USAGE};
 
 const ENV_CTL_SOCK: &str = "ISEKAI_CTL_SOCK";
 

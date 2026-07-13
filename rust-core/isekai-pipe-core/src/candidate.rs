@@ -481,13 +481,13 @@ impl TryFrom<&ConnectionIntent> for CandidateDraft {
             IntentTransport::Relay { helper_addr, server_name, .. } => CandidateRoute::Relay {
                 cert_pin,
                 helper_addr: parse_socket_addr(helper_addr, "helper_addr")?,
-                server_name: NormalizedServerName::new(server_name).map_err(CandidateConversionError::ServerName)?,
+                server_name: parse_server_name(server_name)?,
             },
             IntentTransport::StunP2p { stun_server, peer_addr, server_name, .. } => CandidateRoute::StunP2p {
                 cert_pin,
                 peer_addr: parse_socket_addr(peer_addr, "peer_addr")?,
                 stun_server: parse_socket_addr(stun_server, "stun_server")?,
-                server_name: NormalizedServerName::new(server_name).map_err(CandidateConversionError::ServerName)?,
+                server_name: parse_server_name(server_name)?,
             },
         };
 
@@ -509,6 +509,28 @@ impl TryFrom<&ConnectionIntent> for CandidateDraft {
 
 fn parse_socket_addr(raw: &str, field: &'static str) -> Result<SocketAddr, CandidateConversionError> {
     raw.parse().map_err(|_| CandidateConversionError::InvalidSocketAddr { field, value: raw.to_string() })
+}
+
+fn parse_server_name(raw: &str) -> Result<NormalizedServerName, CandidateConversionError> {
+    NormalizedServerName::new(raw).map_err(CandidateConversionError::ServerName)
+}
+
+/// Validates a `(cert_sha256_hex, server_name)` pair — the same two checks
+/// [`TryFrom<&ConnectionIntent>`] runs on `ConnectionIntent`'s fields — for
+/// callers that build a `RelayTarget`/`StunP2pTarget`/`RemoteSpec` directly
+/// from a raw string source that never passes through a `ConnectionIntent`/
+/// `CandidateRoute` (e.g. a cached `PersistentProfile` read by `isekai-pipe
+/// probe`, or an Android transport reattaching from stored profile data).
+/// Centralizing this here means every construction site — whether or not it
+/// happens to go through the `Candidate` pipeline — validates identically,
+/// instead of re-implementing (or skipping) the same two checks ad hoc.
+pub fn validate_endpoint_identity(
+    cert_sha256_hex: &str,
+    server_name: &str,
+) -> Result<(CertificatePinSha256, NormalizedServerName), CandidateConversionError> {
+    let cert_pin = CertificatePinSha256::from_hex(cert_sha256_hex).map_err(CandidateConversionError::CertificatePin)?;
+    let server_name = parse_server_name(server_name)?;
+    Ok((cert_pin, server_name))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -122,6 +122,7 @@ class AppDatabaseMigrationTest {
                 AppDatabase.MIGRATION_8_9, AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11,
                 AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14,
                 AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17,
+                AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19,
             )
             .build()
 
@@ -236,6 +237,7 @@ class AppDatabaseMigrationTest {
             .addMigrations(
                 AppDatabase.MIGRATION_9_10, AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12,
                 AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17,
+                AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19,
             )
             .build()
         try {
@@ -349,7 +351,10 @@ class AppDatabaseMigrationTest {
 
         // Room 経由で開くと MIGRATION_14_15 が適用されるはず。
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17)
+            .addMigrations(
+                AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17,
+                AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19,
+            )
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -467,7 +472,7 @@ class AppDatabaseMigrationTest {
 
         // Room 経由で開くと MIGRATION_15_16 が適用されるはず。
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17)
+            .addMigrations(AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -582,7 +587,7 @@ class AppDatabaseMigrationTest {
 
         // Room 経由で開くと MIGRATION_16_17 が適用されるはず。
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_16_17)
+            .addMigrations(AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -592,6 +597,273 @@ class AppDatabaseMigrationTest {
                 "既存行の helperBindPort は null(これまで通りOSが選ぶエフェメラルポート)であるべき",
                 profiles[0].helperBindPort,
             )
+        } finally {
+            db.close()
+            ctx.deleteDatabase(dbName)
+        }
+    }
+
+    @Test
+    fun migrate17To18_createsKeySequencesTable() {
+        val dbName = "migration-test-17-18.db"
+        ctx.deleteDatabase(dbName)
+
+        // バージョン 17 のスキーマ(migration 1→17 適用後の最終形)を手で作る。
+        // key_sequences テーブルはまだ存在しない。
+        val factory = FrameworkSQLiteOpenHelperFactory()
+        val config = SupportSQLiteOpenHelper.Configuration.builder(ctx)
+            .name(dbName)
+            .callback(object : SupportSQLiteOpenHelper.Callback(17) {
+                override fun onCreate(db: SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE connection_profiles (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            host TEXT NOT NULL,
+                            port INTEGER NOT NULL DEFAULT 22,
+                            username TEXT NOT NULL,
+                            authType TEXT NOT NULL,
+                            keyId INTEGER,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            use_tsshd INTEGER NOT NULL DEFAULT 0,
+                            tsshd_port INTEGER NOT NULL DEFAULT 2222,
+                            transport_preference TEXT NOT NULL DEFAULT 'PLAIN_SSH',
+                            direct_address TEXT,
+                            enable_physical_multipath INTEGER NOT NULL DEFAULT 0,
+                            cellular_remote_address TEXT,
+                            enable_upstream_failover INTEGER NOT NULL DEFAULT 0,
+                            post_connect_commands TEXT,
+                            forwards TEXT NOT NULL DEFAULT '[]',
+                            enable_agent_forward INTEGER NOT NULL DEFAULT 0,
+                            jump_host TEXT,
+                            jump_port INTEGER NOT NULL DEFAULT 22,
+                            jump_username TEXT,
+                            jump_auth_type TEXT,
+                            jump_key_id INTEGER,
+                            stun_server TEXT,
+                            relay_addr TEXT,
+                            relay_sni TEXT,
+                            relay_jwt TEXT,
+                            allow_non_loopback_forward_bind INTEGER NOT NULL DEFAULT 0,
+                            theme_name TEXT,
+                            helper_bind_port INTEGER
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE known_hosts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            host TEXT NOT NULL,
+                            port INTEGER NOT NULL,
+                            keyType TEXT NOT NULL,
+                            fingerprintSha256 TEXT NOT NULL,
+                            firstSeenAt INTEGER NOT NULL,
+                            lastSeenAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        "CREATE UNIQUE INDEX index_known_hosts_host_port ON known_hosts (host, port)"
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE key_entries (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            publicKey TEXT NOT NULL,
+                            encryptedPrivateKeyPath TEXT NOT NULL,
+                            kekAlias TEXT NOT NULL,
+                            createdAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE snippets (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            command TEXT NOT NULL,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            profile_id INTEGER,
+                            append_newline INTEGER NOT NULL DEFAULT 1
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        "INSERT INTO connection_profiles (label, host, username, authType) " +
+                            "VALUES ('legacy', 'example.com', 'user', 'password')"
+                    )
+                }
+
+                override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+            })
+            .build()
+        val rawHelper = factory.create(config)
+        rawHelper.writableDatabase // force onCreate
+        rawHelper.close()
+
+        // Room 経由で開くと MIGRATION_17_18 が適用され、key_sequences テーブルが作られるはず。
+        val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19)
+            .build()
+        try {
+            // 既存の connection_profiles 行はそのまま残っていること。
+            val profiles = runBlocking { db.connectionProfileDao().getAll() }
+            assertEquals(1, profiles.size)
+            assertEquals("legacy", profiles[0].label)
+
+            // key_sequences テーブルが使えること(空のはず)。
+            val keySequences = runBlocking { db.keySequenceDao().getAll() }
+            assertEquals(0, keySequences.size)
+
+            // 新規行を書き込めること。
+            val id = runBlocking {
+                db.keySequenceDao().upsert(
+                    KeySequence.create(label = "tmux new window", steps = listOf())
+                )
+            }
+            val stored = runBlocking { db.keySequenceDao().findById(id) }
+            assertEquals("tmux new window", stored?.label)
+        } finally {
+            db.close()
+            ctx.deleteDatabase(dbName)
+        }
+    }
+
+    @Test
+    fun migrate18To19_createsKeySequencePackInstallationsTable() {
+        val dbName = "migration-test-18-19.db"
+        ctx.deleteDatabase(dbName)
+
+        // バージョン 18 のスキーマ(migration 1→18 適用後の最終形、key_sequences テーブル込み)を
+        // 手で作る。key_sequence_pack_installations テーブルはまだ存在しない。
+        val factory = FrameworkSQLiteOpenHelperFactory()
+        val config = SupportSQLiteOpenHelper.Configuration.builder(ctx)
+            .name(dbName)
+            .callback(object : SupportSQLiteOpenHelper.Callback(18) {
+                override fun onCreate(db: SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE connection_profiles (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            host TEXT NOT NULL,
+                            port INTEGER NOT NULL DEFAULT 22,
+                            username TEXT NOT NULL,
+                            authType TEXT NOT NULL,
+                            keyId INTEGER,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            use_tsshd INTEGER NOT NULL DEFAULT 0,
+                            tsshd_port INTEGER NOT NULL DEFAULT 2222,
+                            transport_preference TEXT NOT NULL DEFAULT 'PLAIN_SSH',
+                            direct_address TEXT,
+                            enable_physical_multipath INTEGER NOT NULL DEFAULT 0,
+                            cellular_remote_address TEXT,
+                            enable_upstream_failover INTEGER NOT NULL DEFAULT 0,
+                            post_connect_commands TEXT,
+                            forwards TEXT NOT NULL DEFAULT '[]',
+                            enable_agent_forward INTEGER NOT NULL DEFAULT 0,
+                            jump_host TEXT,
+                            jump_port INTEGER NOT NULL DEFAULT 22,
+                            jump_username TEXT,
+                            jump_auth_type TEXT,
+                            jump_key_id INTEGER,
+                            stun_server TEXT,
+                            relay_addr TEXT,
+                            relay_sni TEXT,
+                            relay_jwt TEXT,
+                            allow_non_loopback_forward_bind INTEGER NOT NULL DEFAULT 0,
+                            theme_name TEXT,
+                            helper_bind_port INTEGER
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE known_hosts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            host TEXT NOT NULL,
+                            port INTEGER NOT NULL,
+                            keyType TEXT NOT NULL,
+                            fingerprintSha256 TEXT NOT NULL,
+                            firstSeenAt INTEGER NOT NULL,
+                            lastSeenAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        "CREATE UNIQUE INDEX index_known_hosts_host_port ON known_hosts (host, port)"
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE key_entries (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            publicKey TEXT NOT NULL,
+                            encryptedPrivateKeyPath TEXT NOT NULL,
+                            kekAlias TEXT NOT NULL,
+                            createdAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE snippets (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            command TEXT NOT NULL,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            profile_id INTEGER,
+                            append_newline INTEGER NOT NULL DEFAULT 1
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE key_sequences (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            label TEXT NOT NULL,
+                            steps_json TEXT NOT NULL,
+                            sort_order INTEGER NOT NULL DEFAULT 0,
+                            profile_id INTEGER
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        "INSERT INTO connection_profiles (label, host, username, authType) " +
+                            "VALUES ('legacy', 'example.com', 'user', 'password')"
+                    )
+                }
+
+                override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+            })
+            .build()
+        val rawHelper = factory.create(config)
+        rawHelper.writableDatabase // force onCreate
+        rawHelper.close()
+
+        // Room 経由で開くと MIGRATION_18_19 が適用され、key_sequence_pack_installations
+        // テーブルが作られるはず。
+        val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
+            .addMigrations(AppDatabase.MIGRATION_18_19)
+            .build()
+        try {
+            val profiles = runBlocking { db.connectionProfileDao().getAll() }
+            assertEquals(1, profiles.size)
+            assertEquals("legacy", profiles[0].label)
+
+            val installations = runBlocking { db.keySequencePackInstallationDao().getAll() }
+            assertEquals(0, installations.size)
+
+            val id = runBlocking {
+                db.keySequencePackInstallationDao().upsert(
+                    KeySequencePackInstallation.create(packId = "tmux", version = 1, paramValues = emptyMap())
+                )
+            }
+            val stored = runBlocking { db.keySequencePackInstallationDao().findGlobal("tmux") }
+            assertEquals(id, stored?.id)
         } finally {
             db.close()
             ctx.deleteDatabase(dbName)

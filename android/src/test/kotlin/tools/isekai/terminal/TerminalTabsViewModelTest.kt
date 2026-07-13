@@ -21,7 +21,11 @@ import org.robolectric.annotation.Config
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.input.KeyStep
+import tools.isekai.terminal.input.TerminalKeyEncoder
+import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.TerminalSession
+import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.TransportPreference
 
 /**
@@ -54,14 +58,18 @@ class TerminalTabsViewModelTest {
         runBlocking {
             Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) }
             Repositories.snippets.getAll().forEach { Repositories.snippets.delete(it) }
+            Repositories.keySequences.getAll().forEach { Repositories.keySequences.delete(it) }
         }
         executor = DumbAppExecutor()
-        val sessionFactory: () -> TerminalSession = {
+        val sessionFactory: (AppExecutor) -> TerminalSession = {
             val fake = FakeOrchestrator()
             orchestrators.add(fake)
             TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
         }
-        vm = TerminalTabsViewModel(app, executor, sessionFactory)
+        // ViewModel内部のviewModelScope.launch(ioDispatcher)にも同じtestScheduler駆動の
+        // ディスパッチャーを使わせ、テストの仮想時間と実スレッドの完了タイミングが競合して
+        // withTimeout()ポーリングが断続的にタイムアウトする問題(pre-existing flaky)を解消する。
+        vm = TerminalTabsViewModel(app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler))
     }
 
     @After
@@ -153,6 +161,27 @@ class TerminalTabsViewModelTest {
 
         assertFalse("tab a should not be disconnected on recovery", orchestrators[0].disconnectCalled)
         assertFalse("tab b should not be disconnected on recovery", orchestrators[1].disconnectCalled)
+        assertTrue("tab a should still receive the available notification", orchestrators[0].notifyNetworkPathChangedCalls.contains(true))
+        assertTrue("tab b should still receive the available notification", orchestrators[1].notifyNetworkPathChangedCalls.contains(true))
+    }
+
+    @Test
+    fun onNetworkPathChanged_alsoFansOutToSplitPane() = runBlocking {
+        val tabId = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected("host-a")
+
+        vm.splitPane(tabId, SplitDirection.VERTICAL, "pass")
+        awaitConnectCalled(orchestrators[1])
+        orchestrators[1].simulateConnected("host-a-split")
+
+        executor.simulateNetworkLost()
+        assertTrue("primary pane should be disconnected on network loss", orchestrators[0].disconnectCalled)
+        assertTrue("split pane should be disconnected on network loss", orchestrators[1].disconnectCalled)
+
+        executor.simulateNetworkAvailable()
+        assertTrue("primary pane should receive the available notification", orchestrators[0].notifyNetworkPathChangedCalls.contains(true))
+        assertTrue("split pane should receive the available notification", orchestrators[1].notifyNetworkPathChangedCalls.contains(true))
     }
 
     // ── 最後のタブを閉じた時のみ FGS 停止 ────────────────────────────────
@@ -185,7 +214,11 @@ class TerminalTabsViewModelTest {
     @Test
     fun openTab_onlyEnsuresServiceRunning_doesNotStopIt() = runBlocking {
         vm.openTab(profile("a"), "pass")
-        assertEquals(1, executor.serviceRunCount)
+        // openTab()自身の同期呼び出しと、非同期connect*()系関数からの呼び出しの両方が
+        // executor.ensureServiceRunning()を呼ぶため2回になり得る(本番でも意図された挙動:
+        // ensureServiceRunningは冪等で、複数回呼んでも無害)。ここで検証すべき不変条件は
+        // 「少なくとも1回は呼ばれる」ことと「stopは呼ばれない」ことの2つ。
+        assertTrue(executor.serviceRunCount >= 1)
         assertEquals(0, executor.serviceStoppedCount)
     }
 
@@ -209,6 +242,52 @@ class TerminalTabsViewModelTest {
         assertTrue("tab a must remain connected regardless of active-tab switches", tabA.session.state.value.connected)
         assertFalse("tab b must not have been connected as a side effect", tabB.session.state.value.connected)
         assertEquals(idA, vm.activeTabId.value)
+    }
+
+    // ── nextTab/previousTab（物理キーボード Ctrl+Tab / Ctrl+Shift+Tab 用） ─────
+
+    @Test
+    fun nextTab_cyclesThroughTabsInOpenOrder_andWrapsAround() {
+        val idA = vm.openTab(profile("a"), "pass")
+        val idB = vm.openTab(profile("b"), "pass")
+        val idC = vm.openTab(profile("c"), "pass")
+        vm.setActiveTab(idA)
+
+        vm.nextTab()
+        assertEquals(idB, vm.activeTabId.value)
+
+        vm.nextTab()
+        assertEquals(idC, vm.activeTabId.value)
+
+        vm.nextTab()
+        assertEquals("nextTab should wrap around to the first tab", idA, vm.activeTabId.value)
+    }
+
+    @Test
+    fun previousTab_cyclesBackwardThroughTabs_andWrapsAround() {
+        val idA = vm.openTab(profile("a"), "pass")
+        val idB = vm.openTab(profile("b"), "pass")
+        val idC = vm.openTab(profile("c"), "pass")
+        vm.setActiveTab(idA)
+
+        vm.previousTab()
+        assertEquals("previousTab from the first tab should wrap to the last tab", idC, vm.activeTabId.value)
+
+        vm.previousTab()
+        assertEquals(idB, vm.activeTabId.value)
+    }
+
+    @Test
+    fun nextTab_withSingleTab_isNoop() {
+        val idA = vm.openTab(profile("a"), "pass")
+        vm.nextTab()
+        assertEquals(idA, vm.activeTabId.value)
+    }
+
+    @Test
+    fun nextTab_withNoTabs_doesNotThrow() {
+        vm.nextTab()
+        assertNull(vm.activeTabId.value)
     }
 
     @Test
@@ -356,6 +435,66 @@ class TerminalTabsViewModelTest {
         assertTrue(orchestrators[0].sentBytes.any { it.toString(Charsets.UTF_8) == "echo hi" })
     }
 
+    // ── 打鍵列（KeySequence）─────────────────────────────────────
+
+    private fun screenUpdate(applicationCursorMode: Boolean) =
+        ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, applicationCursorMode, false)
+
+    @Test
+    fun sendKeySequence_sendsResolvedStepsConcatenated() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+
+        // tmux 「新規ウィンドウ」相当: Ctrl+B に続けて 'c'。
+        vm.sendKeySequence(id, listOf(KeyStep.CtrlChar('b'), KeyStep.Text("c")))
+
+        assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x02, 'c'.code.toByte())) })
+    }
+
+    @Test
+    fun sendKeySequence_withoutApplicationCursorMode_usesCsiArrowForm() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        orchestrators[0].simulateScreenUpdate(screenUpdate(applicationCursorMode = false))
+        withTimeout(3000) { while (tab(id).session.state.value.screenUpdate == null) delay(10) }
+
+        vm.sendKeySequence(id, listOf(KeyStep.Special(TerminalKeyEncoder.KC_DPAD_UP)))
+
+        assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x1B, 0x5B, 0x41)) })
+    }
+
+    @Test
+    fun sendKeySequence_withApplicationCursorMode_usesSs3ArrowForm() = runBlocking {
+        // Rust 由来の screenUpdate.applicationCursorMode をそのまま読む(新しいミラー状態を
+        // Kotlin 側に作らない)ことを確認する。
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        orchestrators[0].simulateScreenUpdate(screenUpdate(applicationCursorMode = true))
+        withTimeout(3000) { while (tab(id).session.state.value.screenUpdate == null) delay(10) }
+
+        vm.sendKeySequence(id, listOf(KeyStep.Special(TerminalKeyEncoder.KC_DPAD_UP)))
+
+        assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x1B, 0x4F, 0x41)) })
+    }
+
+    @Test
+    fun sendKeySequenceToPane_unknownPane_doesNotThrow() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+
+        vm.sendKeySequenceToPane(id, "no-such-pane", listOf(KeyStep.Text("c")))
+
+        assertTrue(orchestrators[0].sentBytes.isEmpty())
+    }
+
     @Test
     fun connectTab_loadsSnippetsForThatProfile() = runBlocking {
         val profileId = Repositories.profiles.save(profile("web"))
@@ -366,6 +505,24 @@ class TerminalTabsViewModelTest {
 
         withTimeout(3000) { while (tab(id).snippets.value.isEmpty()) delay(10) }
         assertEquals(listOf("web-only"), tab(id).snippets.value.map { it.label })
+    }
+
+    @Test
+    fun connectTab_loadsKeySequencesForThatProfile() = runBlocking {
+        val profileId = Repositories.profiles.save(profile("web"))
+        Repositories.keySequences.save(
+            tools.isekai.terminal.data.KeySequence.create(
+                label = "web-only-seq",
+                steps = listOf(KeyStep.CtrlChar('b'), KeyStep.Text("c")),
+                profileId = profileId,
+            )
+        )
+        val savedProfile = Repositories.profiles.findById(profileId)!!
+
+        val id = vm.openTab(savedProfile, "pass")
+
+        withTimeout(3000) { while (tab(id).keySequences.value.isEmpty()) delay(10) }
+        assertEquals(listOf("web-only-seq"), tab(id).keySequences.value.map { it.label })
     }
 
     // ── 接続後自動実行コマンド ────────────────────────────────────
@@ -488,6 +645,28 @@ class TerminalTabsViewModelTest {
         assertTrue(tab(id).isThemeOverridden)
         assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD, tab(id).currentTheme.value)
         assertEquals(callsBefore + 1, orchestrators[0].setSessionThemeCalls.size)
+    }
+
+    @Test
+    fun splitPaneWithExistingTab_pushesTargetTabThemeToMovedPane() = runBlocking {
+        val targetId = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        awaitSetSessionThemeCalled(orchestrators[0])
+        vm.setTabTheme(targetId, tools.isekai.terminal.ui.TerminalThemes.NORD)
+
+        val sourceId = vm.openTab(profile("b"), "pass")
+        awaitConnectCalled(orchestrators[1])
+        awaitSetSessionThemeCalled(orchestrators[1])
+        val callsBefore = orchestrators[1].setSessionThemeCalls.size
+
+        val moved = vm.splitPaneWithExistingTab(targetId, SplitDirection.VERTICAL, sourceId)
+
+        assertTrue(moved)
+        assertEquals(callsBefore + 1, orchestrators[1].setSessionThemeCalls.size)
+        val (ansi16, fg, bg) = orchestrators[1].setSessionThemeCalls.last()
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD.ansi16Argb(), ansi16)
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD.foregroundArgb(), fg)
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD.backgroundArgb(), bg)
     }
 
     @Test

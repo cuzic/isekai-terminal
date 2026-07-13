@@ -9,14 +9,20 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -35,6 +41,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
+import tools.isekai.terminal.data.AuthType
 
 /**
  * 上部バー(タブ行・[TerminalScreenBody]のステータス行)を、操作が無いまま自動で隠すまでの
@@ -53,6 +60,13 @@ private const val CHROME_AUTO_HIDE_DELAY_MS = 2500L
  * 全タブ分の本体を常に composition に載せておき（スクロール位置・フォントスケール等の
  * ローカル状態を保持するため）、非アクティブなタブは [TerminalScreenBody] の `isActive = false`
  * で Canvas 描画をスキップする。
+ *
+ * 各タブは内部で画面分割(split pane)を持てる。1タブ=1ペインが既定で、`TerminalTabsViewModel`
+ * の `splitPane`/`splitPaneWithExistingTab` を通じて水平/垂直の2分割まで可能
+ * (バイナリツリー式の多段分割はスコープ外)。分割時、各ペインは完全に独立した
+ * `TerminalSession` を持ち([TerminalTabsViewModel.PaneState])、キーボード入力・trzsz転送
+ * シート・host key確認ダイアログ等の「1つしか存在しない」UIはフォーカス中のペインに対して
+ * 表示する([TerminalScreenBody] の `hasFocus` パラメータ)。
  */
 @Composable
 fun TerminalHostScreen(
@@ -106,6 +120,7 @@ fun TerminalHostScreen(
                                 TabLabel(
                                     tabsVm = tabsVm,
                                     tab = tab,
+                                    otherTabs = tabs.filterNot { it.tabId == tab.tabId },
                                     onClose = { tabsVm.closeTab(tab.tabId) },
                                 )
                             },
@@ -141,11 +156,17 @@ fun TerminalHostScreen(
 private fun TabLabel(
     tabsVm: TerminalTabsViewModel,
     tab: TerminalTabsViewModel.TabState,
+    otherTabs: List<TerminalTabsViewModel.TabState>,
     onClose: () -> Unit,
 ) {
     val uiState by tab.uiState.collectAsStateWithLifecycle(initialValue = TerminalUiState())
     val currentTheme by tab.currentTheme.collectAsStateWithLifecycle()
+    val splitPane by tab.splitPane.collectAsStateWithLifecycle()
     var showThemeDialog by remember { mutableStateOf(false) }
+    var showSplitDialog by remember { mutableStateOf(false) }
+    // splitPaneの「新規接続（同じプロファイル）」がパスワード認証プロファイルの場合、
+    // SplitPaneDialogを閉じてこちらのpending方向を使ってPasswordDialogを表示する。
+    var pendingSplitNewDirection by remember { mutableStateOf<SplitDirection?>(null) }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
@@ -156,6 +177,7 @@ private fun TabLabel(
                     when {
                         uiState.connected -> Color(0xFF55FF55)
                         uiState.isConnecting -> Color.Yellow
+                        uiState.isReconnecting -> Color(0xFFFF9800)
                         else -> Color.Gray
                     },
                 ),
@@ -170,6 +192,15 @@ private fun TabLabel(
             modifier = Modifier.padding(start = 6.dp, end = 4.dp),
             maxLines = 1,
         )
+        // 画面分割(split pane): 未分割なら分割メニューを開く、分割中なら解除する。
+        IconButton(
+            onClick = {
+                if (splitPane != null) tabsVm.closeSplitPane(tab.tabId) else showSplitDialog = true
+            },
+            modifier = Modifier.size(20.dp).testTag("splitPaneButton"),
+        ) {
+            Text(if (splitPane != null) "⊟" else "⊞", fontSize = 12.sp, color = Color(0xFFAAAAAA))
+        }
         // Phase 12 P2-1: このタブだけの配色テーマ変更(tab/session override)。
         IconButton(onClick = { showThemeDialog = true }, modifier = Modifier.size(20.dp)) {
             Text("🎨", fontSize = 12.sp)
@@ -186,10 +217,96 @@ private fun TabLabel(
             onDismiss = { showThemeDialog = false },
         )
     }
+
+    if (showSplitDialog) {
+        SplitPaneDialog(
+            otherTabs = otherTabs,
+            onSplitNew = { direction ->
+                showSplitDialog = false
+                val profile = tab.profile
+                val needsPasswordPrompt = profile != null &&
+                    (profile.authTypeEnum == AuthType.PASSWORD || (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD))
+                if (needsPasswordPrompt) {
+                    pendingSplitNewDirection = direction
+                } else {
+                    tabsVm.splitPane(tab.tabId, direction)
+                }
+            },
+            onSplitExisting = { direction, sourceTabId ->
+                tabsVm.splitPaneWithExistingTab(tab.tabId, direction, sourceTabId)
+                showSplitDialog = false
+            },
+            onDismiss = { showSplitDialog = false },
+        )
+    }
+
+    pendingSplitNewDirection?.let { direction ->
+        val profile = tab.profile
+        if (profile == null) {
+            pendingSplitNewDirection = null
+        } else {
+            PasswordDialog(
+                label = profile.label,
+                showMainField = profile.authTypeEnum == AuthType.PASSWORD,
+                jumpLabel = if (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD) profile.jumpHost else null,
+                onDismiss = { pendingSplitNewDirection = null },
+                onConfirm = { password, jumpPassword ->
+                    tabsVm.splitPane(tab.tabId, direction, password, jumpPassword)
+                    pendingSplitNewDirection = null
+                },
+            )
+        }
+    }
 }
 
 /**
- * 1タブ分の [TerminalScreenBody]。すべての操作は [TerminalTabsViewModel] にタブIDを添えて委譲する。
+ * 画面分割の方向・分割元(新規接続 or 既存タブの付け替え)を選ぶダイアログ。
+ * `TerminalTabsViewModel.splitPane`/`splitPaneWithExistingTab` の2つの選択肢に対応する
+ * (「同じ接続プロファイルで新規接続するか、既存タブのセッションを付け替えるか」)。
+ */
+@Composable
+private fun SplitPaneDialog(
+    otherTabs: List<TerminalTabsViewModel.TabState>,
+    onSplitNew: (SplitDirection) -> Unit,
+    onSplitExisting: (SplitDirection, String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var direction by remember { mutableStateOf<SplitDirection?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (direction == null) "画面分割" else "分割元を選択") },
+        text = {
+            Column {
+                val d = direction
+                if (d == null) {
+                    TextButton(onClick = { direction = SplitDirection.HORIZONTAL }) { Text("左右に分割") }
+                    TextButton(onClick = { direction = SplitDirection.VERTICAL }) { Text("上下に分割") }
+                } else {
+                    TextButton(onClick = { onSplitNew(d) }) { Text("新規接続（同じプロファイル）") }
+                    if (otherTabs.isNotEmpty()) {
+                        Text(
+                            "既存タブから移動",
+                            color = Color(0xFFAAAAAA),
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 8.dp, bottom = 2.dp),
+                        )
+                        otherTabs.forEach { t ->
+                            TextButton(onClick = { onSplitExisting(d, t.tabId) }) { Text(t.label) }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("キャンセル") } },
+    )
+}
+
+/**
+ * 1タブ分のペイン構成を描画する。未分割なら主ペイン1つ、分割中は
+ * [TerminalTabsViewModel.TabState.splitDirection] に従い左右(HORIZONTAL)/上下(VERTICAL)に
+ * 並べる。各ペインの操作はすべて [TerminalTabsViewModel] にタブID・paneIDを添えて委譲する。
  */
 @Composable
 private fun TerminalTabScreen(
@@ -200,37 +317,151 @@ private fun TerminalTabScreen(
     chromeVisible: Boolean,
     onUserActivity: () -> Unit,
 ) {
-    val tabId = tab.tabId
-    val uiState by tab.uiState.collectAsStateWithLifecycle(initialValue = TerminalUiState())
-    val snippets by tab.snippets.collectAsStateWithLifecycle()
+    val splitPane by tab.splitPane.collectAsStateWithLifecycle()
+    val splitDirection by tab.splitDirection.collectAsStateWithLifecycle()
+    val focusedPaneId by tab.focusedPaneId.collectAsStateWithLifecycle()
 
-    TerminalScreenBody(
-        uiState = uiState,
-        canReconnect = tab.profile != null,
-        isActive = isActive,
-        snippets = snippets,
-        chromeVisible = chromeVisible,
-        onUserActivity = onUserActivity,
-        actions = TerminalScreenActions(
-            onConnect = { tabsVm.reconnect(tabId) },
-            onDisconnect = { tabsVm.disconnect(tabId) },
-            // タブ内の「戻る」/切断確認ダイアログはタブを閉じる（＝タブ行の × と同じ操作）。
-            // 全タブが閉じられると呼び出し側 (TerminalHostScreen) が自動でリストへ戻る。
-            onBack = onCloseTab,
-            onSend = { bytes -> tabsVm.send(tabId, bytes) },
-            onResize = { cols, rows -> tabsVm.resize(tabId, cols, rows) },
-            onScrollbackCells = { offset, rows -> tabsVm.scrollbackCells(tabId, offset, rows) },
-            onTrustUpdatedHostKey = { tabsVm.trustUpdatedHostKey(tabId) },
-            onDismissHostKeyWarning = { tabsVm.dismissHostKeyWarning(tabId) },
-            onTrustNewHostKey = { tabsVm.trustNewHostKey(tabId) },
-            onDismissNewHostKeyPrompt = { tabsVm.dismissNewHostKeyPrompt(tabId) },
-            onTrzszStartUpload = { uri -> tabsVm.trzszStartUpload(tabId, uri) },
-            onTrzszStartDownload = { tabsVm.trzszStartDownload(tabId) },
-            onTrzszCancel = { tabsVm.trzszCancel(tabId) },
-            onTrzszDismiss = { tabsVm.trzszDismiss(tabId) },
-            onGetSessionLog = { tabsVm.getSessionLog(tabId) },
-            onSendSnippet = { snippet -> tabsVm.sendSnippet(tabId, snippet) },
-            onRespondAgentSignRequest = { approved -> tabsVm.respondAgentSignRequest(tabId, approved) },
-        ),
-    )
+    val split = splitPane
+    if (split == null) {
+        TerminalPaneScreen(
+            tab = tab,
+            pane = tab.primaryPane,
+            tabsVm = tabsVm,
+            isActive = isActive,
+            hasFocus = true,
+            onCloseTab = onCloseTab,
+            chromeVisible = chromeVisible,
+            onUserActivity = onUserActivity,
+        )
+        return
+    }
+
+    when (splitDirection) {
+        SplitDirection.VERTICAL ->
+            Column(modifier = Modifier.fillMaxSize()) {
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    TerminalPaneScreen(
+                        tab = tab, pane = tab.primaryPane, tabsVm = tabsVm, isActive = isActive,
+                        hasFocus = focusedPaneId == tab.primaryPane.paneId, onCloseTab = onCloseTab,
+                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
+                    )
+                }
+                Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(Color(0xFF444444)))
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    TerminalPaneScreen(
+                        tab = tab, pane = split, tabsVm = tabsVm, isActive = isActive,
+                        hasFocus = focusedPaneId == split.paneId, onCloseTab = onCloseTab,
+                        onCloseSplit = { tabsVm.closeSplitPane(tab.tabId) },
+                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
+                    )
+                }
+            }
+        else ->
+            Row(modifier = Modifier.fillMaxSize()) {
+                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                    TerminalPaneScreen(
+                        tab = tab, pane = tab.primaryPane, tabsVm = tabsVm, isActive = isActive,
+                        hasFocus = focusedPaneId == tab.primaryPane.paneId, onCloseTab = onCloseTab,
+                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
+                    )
+                }
+                Box(modifier = Modifier.width(2.dp).fillMaxHeight().background(Color(0xFF444444)))
+                Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                    TerminalPaneScreen(
+                        tab = tab, pane = split, tabsVm = tabsVm, isActive = isActive,
+                        hasFocus = focusedPaneId == split.paneId, onCloseTab = onCloseTab,
+                        onCloseSplit = { tabsVm.closeSplitPane(tab.tabId) },
+                        chromeVisible = chromeVisible, onUserActivity = onUserActivity,
+                    )
+                }
+            }
+    }
+}
+
+/**
+ * 1ペイン分の [TerminalScreenBody]。すべての操作は [TerminalTabsViewModel] にタブID・paneIDを
+ * 添えて委譲する。[hasFocus] が true の間だけキーボード入力・trzsz/host key等のモーダルUIを
+ * 表示する(「フォーカス中のペインに対して表示する」設計)。[onCloseSplit] が非nullなら
+ * (=このペインが分割側なら)ステータスバーに分割解除ボタンを出す。
+ */
+@Composable
+private fun TerminalPaneScreen(
+    tab: TerminalTabsViewModel.TabState,
+    pane: PaneState,
+    tabsVm: TerminalTabsViewModel,
+    isActive: Boolean,
+    hasFocus: Boolean,
+    onCloseTab: () -> Unit,
+    onCloseSplit: (() -> Unit)? = null,
+    chromeVisible: Boolean,
+    onUserActivity: () -> Unit,
+) {
+    val tabId = tab.tabId
+    val paneId = pane.paneId
+    val uiState by pane.uiState.collectAsStateWithLifecycle(initialValue = TerminalUiState())
+    val snippets by pane.snippets.collectAsStateWithLifecycle()
+    val keySequences by pane.keySequences.collectAsStateWithLifecycle()
+    val installedPacks by pane.installedPacks.collectAsStateWithLifecycle()
+
+    // スクロール位置・選択範囲・フォントスケール等のローカル状態(TerminalScreenBody内部の
+    // remember)は paneId ごとに key() で分離する必要がある(同一タブの2ペインが同じ
+    // remember スロットを共有してしまわないように)。
+    key(paneId) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            TerminalScreenBody(
+                uiState = uiState,
+                canReconnect = tab.profile != null,
+                isActive = isActive,
+                hasFocus = hasFocus,
+                snippets = snippets,
+                keySequences = keySequences,
+                installedPacks = installedPacks,
+                chromeVisible = chromeVisible,
+                onUserActivity = onUserActivity,
+                actions = TerminalScreenActions(
+                    onConnect = { tabsVm.reconnectPane(tabId, paneId) },
+                    onDisconnect = { tabsVm.disconnectPane(tabId, paneId) },
+                    onCancelReconnect = { tabsVm.cancelReconnectPane(tabId, paneId) },
+                    // タブ内の「戻る」/切断確認ダイアログはタブを閉じる（＝タブ行の × と同じ操作）。
+                    // 全タブが閉じられると呼び出し側 (TerminalHostScreen) が自動でリストへ戻る。
+                    onBack = onCloseTab,
+                    onSend = { bytes -> tabsVm.sendToPane(tabId, paneId, bytes) },
+                    onResize = { cols, rows -> tabsVm.resizePane(tabId, paneId, cols, rows) },
+                    onScrollbackCells = { offset, rows -> tabsVm.scrollbackCellsForPane(tabId, paneId, offset, rows) },
+                    onTrustUpdatedHostKey = { tabsVm.trustUpdatedHostKeyForPane(tabId, paneId) },
+                    onDismissHostKeyWarning = { tabsVm.dismissHostKeyWarningForPane(tabId, paneId) },
+                    onTrustNewHostKey = { tabsVm.trustNewHostKeyForPane(tabId, paneId) },
+                    onDismissNewHostKeyPrompt = { tabsVm.dismissNewHostKeyPromptForPane(tabId, paneId) },
+                    onTrzszStartUpload = { uri -> tabsVm.trzszStartUploadForPane(tabId, paneId, uri) },
+                    onTrzszStartDownload = { tabsVm.trzszStartDownloadForPane(tabId, paneId) },
+                    onTrzszCancel = { tabsVm.trzszCancelForPane(tabId, paneId) },
+                    onTrzszDismiss = { tabsVm.trzszDismissForPane(tabId, paneId) },
+                    onGetSessionLog = { tabsVm.getSessionLogForPane(tabId, paneId) },
+                    onSendSnippet = { snippet -> tabsVm.sendSnippetToPane(tabId, paneId, snippet) },
+                    onSendKeySequence = { steps -> tabsVm.sendKeySequenceToPane(tabId, paneId, steps) },
+                    onRespondAgentSignRequest = { approved -> tabsVm.respondAgentSignRequestForPane(tabId, paneId, approved) },
+                    onRequestFocus = { tabsVm.setFocusedPane(tabId, paneId) },
+                    // 物理キーボードの Ctrl+Tab / Ctrl+Shift+Tab によるタブ切替（TerminalInputView 経由）。
+                    // 画面分割中でもタブ切替はタブ単位の操作なので、どちらのペインからでも同じ
+                    // tabsVm.nextTab()/previousTab() を呼ぶ(ペイン固有の版は不要)。
+                    onNextTab = { tabsVm.nextTab() },
+                    onPreviousTab = { tabsVm.previousTab() },
+                    onForceReturnToWifi = { pane.session.forceReturnToWifi() },
+                ),
+            )
+
+            if (onCloseSplit != null) {
+                IconButton(
+                    onClick = onCloseSplit,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 28.dp, end = 4.dp)
+                        .size(20.dp)
+                        .testTag("closeSplitButton"),
+                ) {
+                    Text("✕", color = Color(0xFFAAAAAA), fontSize = 12.sp)
+                }
+            }
+        }
+    }
 }

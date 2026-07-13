@@ -12,10 +12,10 @@ pub use isekai_pipe_protocol::{LogicalHost, ServiceName};
 
 mod candidate;
 pub use candidate::{
-    Candidate, CandidateClass, CandidateConversionError, CandidateDraft, CandidateDraftBatch,
-    CandidateGeneration, CandidateId, CandidateKey, CandidateOrigin, CandidateOriginKind, CandidatePriority,
-    CandidateRoute, CandidateSnapshot, CandidateValidity, CertificatePinError, CertificatePinSha256,
-    NormalizedServerName, ServerNameError, LEGACY_INTENT_PROVIDER_ID,
+    validate_endpoint_identity, Candidate, CandidateClass, CandidateConversionError, CandidateDraft,
+    CandidateDraftBatch, CandidateGeneration, CandidateId, CandidateKey, CandidateOrigin, CandidateOriginKind,
+    CandidatePriority, CandidateRoute, CandidateSnapshot, CandidateValidity, CertificatePinError,
+    CertificatePinSha256, NormalizedServerName, ServerNameError, LEGACY_INTENT_PROVIDER_ID,
 };
 
 mod profile;

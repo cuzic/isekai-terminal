@@ -93,6 +93,68 @@ class TerminalKeyEncoderTest {
         assertNull(TerminalKeyEncoder.specialKeyBytes(9999))
     }
 
+    // ── F1〜F12（rust-core の terminal_function_key_bytes() と一致させる） ──
+
+    @Test
+    fun `F1 maps to SS3 P`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x4F, 0x50), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F1))
+    }
+
+    @Test
+    fun `F2 maps to SS3 Q`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x4F, 0x51), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F2))
+    }
+
+    @Test
+    fun `F3 maps to SS3 R`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x4F, 0x52), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F3))
+    }
+
+    @Test
+    fun `F4 maps to SS3 S`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x4F, 0x53), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F4))
+    }
+
+    @Test
+    fun `F5 maps to CSI 15 tilde`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x31, 0x35, 0x7E), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F5))
+    }
+
+    @Test
+    fun `F6 maps to CSI 17 tilde`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x31, 0x37, 0x7E), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F6))
+    }
+
+    @Test
+    fun `F7 maps to CSI 18 tilde`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x31, 0x38, 0x7E), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F7))
+    }
+
+    @Test
+    fun `F8 maps to CSI 19 tilde`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x31, 0x39, 0x7E), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F8))
+    }
+
+    @Test
+    fun `F9 maps to CSI 20 tilde`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x32, 0x30, 0x7E), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F9))
+    }
+
+    @Test
+    fun `F10 maps to CSI 21 tilde`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x32, 0x31, 0x7E), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F10))
+    }
+
+    @Test
+    fun `F11 maps to CSI 23 tilde`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x32, 0x33, 0x7E), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F11))
+    }
+
+    @Test
+    fun `F12 maps to CSI 24 tilde`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x32, 0x34, 0x7E), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F12))
+    }
+
     // ── unicodeCharBytes ───────────────────────────────────────────
 
     @Test
@@ -241,5 +303,55 @@ class TerminalKeyEncoderTest {
     @Test
     fun `single line paste without bracketedPasteMode is unaffected by normalization`() {
         assertArrayEquals("no-newline-here".toByteArray(), TerminalKeyEncoder.commitTextBytes("no-newline-here"))
+    }
+
+    // ── jisSpecialKeyBytes（JIS配列固有キー: ¥/ろ）─────────────────
+
+    @Test
+    fun `yen key unshifted maps to backslash`() {
+        assertArrayEquals(byteArrayOf(0x5C), TerminalKeyEncoder.jisSpecialKeyBytes(TerminalKeyEncoder.KC_YEN, shiftPressed = false))
+    }
+
+    @Test
+    fun `yen key shifted maps to pipe`() {
+        assertArrayEquals(byteArrayOf(0x7C), TerminalKeyEncoder.jisSpecialKeyBytes(TerminalKeyEncoder.KC_YEN, shiftPressed = true))
+    }
+
+    @Test
+    fun `ro key unshifted maps to backslash`() {
+        assertArrayEquals(byteArrayOf(0x5C), TerminalKeyEncoder.jisSpecialKeyBytes(TerminalKeyEncoder.KC_RO, shiftPressed = false))
+    }
+
+    @Test
+    fun `ro key shifted maps to underscore`() {
+        assertArrayEquals(byteArrayOf(0x5F), TerminalKeyEncoder.jisSpecialKeyBytes(TerminalKeyEncoder.KC_RO, shiftPressed = true))
+    }
+
+    @Test
+    fun `non-jis keycode returns null from jisSpecialKeyBytes`() {
+        assertNull(TerminalKeyEncoder.jisSpecialKeyBytes(TerminalKeyEncoder.KC_ENTER, shiftPressed = false))
+        assertNull(TerminalKeyEncoder.jisSpecialKeyBytes(9999, shiftPressed = true))
+    }
+
+    // ── altKeyBytes（物理 Alt/Meta 修飾キー: meta sends escape） ────
+
+    @Test
+    fun `alt plus lowercase b prefixes ESC`() {
+        assertArrayEquals(byteArrayOf(0x1B, 'b'.code.toByte()), TerminalKeyEncoder.altKeyBytes('b'.code))
+    }
+
+    @Test
+    fun `alt plus uppercase encodes as ESC plus UTF-8`() {
+        assertArrayEquals(byteArrayOf(0x1B) + "F".toByteArray(Charsets.UTF_8), TerminalKeyEncoder.altKeyBytes('F'.code))
+    }
+
+    @Test
+    fun `alt plus zero codepoint returns null`() {
+        assertNull(TerminalKeyEncoder.altKeyBytes(0))
+    }
+
+    @Test
+    fun `alt plus control char prefixes ESC before the raw control byte`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x03), TerminalKeyEncoder.altKeyBytes(0x03))
     }
 }

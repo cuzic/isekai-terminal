@@ -1,10 +1,16 @@
 package tools.isekai.terminal
 
+import uniffi.isekai_terminal_core.RebindPublicState
 import uniffi.isekai_terminal_core.ScreenUpdate
 
 data class TerminalUiState(
     val connected: Boolean = false,
     val isConnecting: Boolean = false,
+    // 一度Connectedになったセッションが予期せず切断され、orchestrator(Rust側)が
+    // 自動的に再接続を試みている間true(ConnectionPublicState.Reconnecting)。
+    // Rustから届いた状態をそのままミラーしているだけで、ここから新たな判断ロジックは
+    // 行わない(rust-ssot.md準拠、既存のconnected/isConnectingと同じ位置づけ)。
+    val isReconnecting: Boolean = false,
     val statusMsg: String = "未接続",
     val screenUpdate: ScreenUpdate? = null,
     val lastFingerprint: String? = null,
@@ -20,6 +26,10 @@ data class TerminalUiState(
     // Kotlin 側でどう見せるかという表示用のミラーであり、判断ロジック自体は
     // TerminalSession.respondAgentSignRequest() → Rust 側の oneshot で完結する。
     val agentSignRequestFingerprint: String? = null,
+    // #19: RebindManager(Rust側)の現在状態。物理マルチパスtransport以外では常にnull。
+    // 「今すぐWiFiに戻す」操作の表示可否判定に使う(UI側は推測せず、この値だけを見る、
+    // rust-ssot.md準拠)。
+    val rebindState: RebindPublicState? = null,
 )
 
 sealed class TrzszUiState {

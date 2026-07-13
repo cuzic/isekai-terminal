@@ -163,6 +163,10 @@ class TerminalInputConnectionTest {
         connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
     }
 
+    private fun keyDownMeta(keyCode: Int, metaState: Int) {
+        connection.sendKeyEvent(KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, keyCode, 0, metaState))
+    }
+
     @Test
     fun sendKeyEvent_enter_sendsCarriageReturn() {
         keyDown(KeyEvent.KEYCODE_ENTER)
@@ -297,5 +301,216 @@ class TerminalInputConnectionTest {
         assertArrayEquals(byteArrayOf(0x01), sentBytes[0])
         assertTrue(consumed)
         assertEquals(false, view.ctrlArmed)
+    }
+
+    // --- JIS配列固有キー(¥/ろ) ---
+
+    private fun keyDownWithShift(keyCode: Int, shiftPressed: Boolean = false): Boolean {
+        val metaState = if (shiftPressed) KeyEvent.META_SHIFT_ON else 0
+        return connection.sendKeyEvent(
+            KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, keyCode, 0, metaState),
+        )
+    }
+
+    @Test
+    fun sendKeyEvent_yenKey_jisMode_unshifted_sendsBackslash() {
+        view.keyboardLayoutMode = KeyboardLayoutMode.JIS
+        keyDownWithShift(TerminalKeyEncoder.KC_YEN)
+        assertArrayEquals(byteArrayOf(0x5C), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_yenKey_jisMode_shifted_sendsPipe() {
+        view.keyboardLayoutMode = KeyboardLayoutMode.JIS
+        keyDownWithShift(TerminalKeyEncoder.KC_YEN, shiftPressed = true)
+        assertArrayEquals(byteArrayOf(0x7C), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_roKey_jisMode_unshifted_sendsBackslash() {
+        view.keyboardLayoutMode = KeyboardLayoutMode.JIS
+        keyDownWithShift(TerminalKeyEncoder.KC_RO)
+        assertArrayEquals(byteArrayOf(0x5C), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_roKey_jisMode_shifted_sendsUnderscore() {
+        view.keyboardLayoutMode = KeyboardLayoutMode.JIS
+        keyDownWithShift(TerminalKeyEncoder.KC_RO, shiftPressed = true)
+        assertArrayEquals(byteArrayOf(0x5F), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_yenKey_usMode_fallsThroughWithoutSending() {
+        view.keyboardLayoutMode = KeyboardLayoutMode.US
+        keyDownWithShift(TerminalKeyEncoder.KC_YEN)
+        // US配列モードでは明示マッピングを行わない。getUnicodeChar()も定義が無いため
+        // 何も送信されない(実機のUS配列キーボードにこのキー自体が存在しないのと同じ挙動)。
+        assertTrue(sentBytes.isEmpty())
+    }
+
+    @Test
+    fun sendKeyEvent_yenKey_autoMode_withoutDevice_defaultsToUsBehavior() {
+        // Robolectric上の合成KeyEvent(deviceId未指定)にはInputDeviceが紐付かないため、
+        // AUTO判定はJISキーボード「無し」に倒れる(実機での自動検出そのものはロボレクトリック環境では
+        // 検証できない。KeyboardLayoutDetectorTest参照)。
+        view.keyboardLayoutMode = KeyboardLayoutMode.AUTO
+        keyDownWithShift(TerminalKeyEncoder.KC_YEN)
+        assertTrue(sentBytes.isEmpty())
+    }
+
+    // --- 物理 Ctrl/Alt 修飾キー（トグルではなく実キーボードの修飾キー） ---
+
+    @Test
+    fun sendKeyEvent_physicalCtrlPlusA_sendsCtrlByte() {
+        keyDownMeta(KeyEvent.KEYCODE_A, KeyEvent.META_CTRL_ON)
+        assertArrayEquals(byteArrayOf(0x01), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_physicalCtrlPlusA_doesNotArmOrConsumeToggle() {
+        var consumed = false
+        view.onCtrlConsumed = { consumed = true }
+        keyDownMeta(KeyEvent.KEYCODE_A, KeyEvent.META_CTRL_ON)
+        assertEquals(false, view.ctrlArmed)
+        assertEquals(false, consumed)
+    }
+
+    @Test
+    fun sendKeyEvent_physicalAltPlusB_sendsEscPrefixedByte() {
+        keyDownMeta(KeyEvent.KEYCODE_B, KeyEvent.META_ALT_ON)
+        assertArrayEquals(byteArrayOf(0x1B) + "b".toByteArray(Charsets.UTF_8), sentBytes[0])
+    }
+
+    // --- コピー / 貼り付けショートカット ---
+
+    @Test
+    fun sendKeyEvent_ctrlShiftC_invokesOnCopyRequested() {
+        var called = false
+        view.onCopyRequested = { called = true }
+        keyDownMeta(KeyEvent.KEYCODE_C, KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON)
+        assertTrue(called)
+        assertTrue(sentBytes.isEmpty())
+    }
+
+    @Test
+    fun sendKeyEvent_ctrlShiftV_invokesOnPasteRequested() {
+        var called = false
+        view.onPasteRequested = { called = true }
+        keyDownMeta(KeyEvent.KEYCODE_V, KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON)
+        assertTrue(called)
+        assertTrue(sentBytes.isEmpty())
+    }
+
+    @Test
+    fun sendKeyEvent_metaC_invokesOnCopyRequested() {
+        var called = false
+        view.onCopyRequested = { called = true }
+        keyDownMeta(KeyEvent.KEYCODE_C, KeyEvent.META_META_ON)
+        assertTrue(called)
+    }
+
+    @Test
+    fun sendKeyEvent_metaV_invokesOnPasteRequested() {
+        var called = false
+        view.onPasteRequested = { called = true }
+        keyDownMeta(KeyEvent.KEYCODE_V, KeyEvent.META_META_ON)
+        assertTrue(called)
+    }
+
+    @Test
+    fun sendKeyEvent_hardwareCopyKey_invokesOnCopyRequested() {
+        var called = false
+        view.onCopyRequested = { called = true }
+        keyDown(KeyEvent.KEYCODE_COPY)
+        assertTrue(called)
+    }
+
+    @Test
+    fun sendKeyEvent_hardwarePasteKey_invokesOnPasteRequested() {
+        var called = false
+        view.onPasteRequested = { called = true }
+        keyDown(KeyEvent.KEYCODE_PASTE)
+        assertTrue(called)
+    }
+
+    @Test
+    fun sendKeyEvent_ctrlShiftC_noCopyCallbackWired_fallsBackToCtrlC() {
+        // onCopyRequested 未配線: アプリショートカットとして扱われず、物理 Ctrl+文字 の
+        // 一般変換にフォールスルーする（Shift の有無は ctrlByte 側では区別しない）。
+        keyDownMeta(KeyEvent.KEYCODE_C, KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON)
+        assertArrayEquals(byteArrayOf(0x03), sentBytes[0])
+    }
+
+    // --- タブ切替ショートカット ---
+
+    @Test
+    fun sendKeyEvent_ctrlTab_invokesOnNextTabRequested_andDoesNotSendTabByte() {
+        var called = false
+        view.onNextTabRequested = { called = true }
+        keyDownMeta(KeyEvent.KEYCODE_TAB, KeyEvent.META_CTRL_ON)
+        assertTrue(called)
+        assertTrue(sentBytes.isEmpty())
+    }
+
+    @Test
+    fun sendKeyEvent_ctrlShiftTab_invokesOnPreviousTabRequested_andDoesNotSendTabByte() {
+        var called = false
+        view.onPreviousTabRequested = { called = true }
+        keyDownMeta(KeyEvent.KEYCODE_TAB, KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON)
+        assertTrue(called)
+        assertTrue(sentBytes.isEmpty())
+    }
+
+    @Test
+    fun sendKeyEvent_ctrlTab_noCallbackWired_fallsBackToTabByte() {
+        keyDownMeta(KeyEvent.KEYCODE_TAB, KeyEvent.META_CTRL_ON)
+        assertArrayEquals(byteArrayOf(0x09), sentBytes[0])
+    }
+
+    // --- IME 変換中はショートカットを誤発火させない（composingText 状態を参照） ---
+
+    @Test
+    fun sendKeyEvent_composing_physicalCtrlA_doesNotSendCtrlByte() {
+        connection.setComposingText("あ", 1)
+        sentBytes.clear()
+        keyDownMeta(KeyEvent.KEYCODE_A, KeyEvent.META_CTRL_ON)
+        assertTrue(sentBytes.none { it.contentEquals(byteArrayOf(0x01)) })
+    }
+
+    @Test
+    fun sendKeyEvent_composing_physicalAltB_doesNotSendEscPrefixedByte() {
+        connection.setComposingText("あ", 1)
+        sentBytes.clear()
+        val escB = byteArrayOf(0x1B) + "b".toByteArray(Charsets.UTF_8)
+        keyDownMeta(KeyEvent.KEYCODE_B, KeyEvent.META_ALT_ON)
+        assertTrue(sentBytes.none { it.contentEquals(escB) })
+    }
+
+    @Test
+    fun sendKeyEvent_composing_ctrlShiftC_doesNotInvokeOnCopyRequested() {
+        var called = false
+        view.onCopyRequested = { called = true }
+        connection.setComposingText("あ", 1)
+        keyDownMeta(KeyEvent.KEYCODE_C, KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON)
+        assertEquals(false, called)
+    }
+
+    @Test
+    fun sendKeyEvent_composing_ctrlTab_doesNotInvokeOnNextTabRequested() {
+        var called = false
+        view.onNextTabRequested = { called = true }
+        connection.setComposingText("あ", 1)
+        keyDownMeta(KeyEvent.KEYCODE_TAB, KeyEvent.META_CTRL_ON)
+        assertEquals(false, called)
+    }
+
+    @Test
+    fun sendKeyEvent_afterComposingFinished_physicalCtrlA_sendsCtrlByteAgain() {
+        connection.setComposingText("あ", 1)
+        connection.finishComposingText()
+        sentBytes.clear()
+        keyDownMeta(KeyEvent.KEYCODE_A, KeyEvent.META_CTRL_ON)
+        assertArrayEquals(byteArrayOf(0x01), sentBytes[0])
     }
 }

@@ -31,6 +31,32 @@ class TerminalInputView @JvmOverloads constructor(
     /** Ctrl トグルが 1 文字を消費した（変換の成否に関わらず）ときに呼ばれる。UI 側で OFF 表示に戻す用。 */
     var onCtrlConsumed: (() -> Unit)? = null
 
+    /**
+     * 外部/Bluetoothキーボードの配列モード（表示専用の UI ローカル状態、既定 AUTO）。
+     * [TerminalInputConnection.sendKeyEvent] が JIS配列固有キー(¥/ろ)の判定に使う
+     * （[KeyboardLayoutDetector]参照）。
+     */
+    var keyboardLayoutMode: KeyboardLayoutMode = KeyboardLayoutMode.AUTO
+
+    // ── 物理キーボードのアプリレベルショートカット ──────────────────────
+    // 対応するコールバックが null の間はショートカットとして扱わず、通常のキー処理へ
+    // フォールスルーする（[TerminalInputConnection.handleShortcut] 参照）。
+    // いずれも IME 変換中（composing テキストが残っている間）は
+    // [TerminalInputConnection.sendKeyEvent] 側で呼び出し自体をスキップする
+    // （日本語 IME 変換の誤中断防止。差別化ポイントである日本語 IME 対応を壊さないための措置）。
+
+    /** コピー: 物理 Ctrl+Shift+C / Meta(Cmd)+C / ハードウェア Copy キー。 */
+    var onCopyRequested: (() -> Unit)? = null
+
+    /** 貼り付け: 物理 Ctrl+Shift+V / Meta(Cmd)+V / ハードウェア Paste キー。 */
+    var onPasteRequested: (() -> Unit)? = null
+
+    /** 次のタブへ切り替え: 物理 Ctrl+Tab。 */
+    var onNextTabRequested: (() -> Unit)? = null
+
+    /** 前のタブへ切り替え: 物理 Ctrl+Shift+Tab。 */
+    var onPreviousTabRequested: (() -> Unit)? = null
+
     init {
         isFocusable = true
         isFocusableInTouchMode = true

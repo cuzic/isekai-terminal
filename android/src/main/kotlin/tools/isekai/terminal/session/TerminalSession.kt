@@ -51,6 +51,15 @@ class TerminalSession(
      * デバイス側から一切応答を送らない)。
      */
     private val onClipboardPullRequested: () -> ClipboardPayload? = { null },
+    /**
+     * #10/#22: RebindManager(Rust側)がWiFi-bound fdを要求した。判断は一切せず、
+     * 取得できたfdを返すだけ(`rust-ssot.md`準拠)。Rust側の`spawn_blocking`スレッドから
+     * 同期呼び出しされる(`onHostKey`/`onAgentSignRequest`と同じ方式)。既定はno-op
+     * (常に`null` — マルチパス以外のセッションでは呼ばれない)。
+     */
+    private val acquireWifiFd: () -> PlatformFd? = { null },
+    /** 同、セルラー-bound fd版。 */
+    private val acquireCellularFd: () -> PlatformFd? = { null },
 ) : AutoCloseable {
 
     companion object {
@@ -87,24 +96,20 @@ class TerminalSession(
     private val callback = object : OrchestratorCallback {
         override fun onConnectionStateChanged(state: ConnectionPublicState) {
             when (state) {
-                ConnectionPublicState.Connecting ->
-                    _state.update { it.copy(isConnecting = true, connected = false, statusMsg = "接続中…") }
-                is ConnectionPublicState.Connected -> {
+                is ConnectionPublicState.Connected ->
                     RemoteLogger.i("IsekaiTerminalSSH", "✓ connected: ${state.host}")
-                    _state.update { it.copy(isConnecting = false, connected = true,
-                        statusMsg = "接続済み: ${state.host}", currentHost = state.host) }
-                }
-                is ConnectionPublicState.Disconnected -> {
+                is ConnectionPublicState.Disconnected ->
                     RemoteLogger.i("IsekaiTerminalSSH", "✗ disconnected: reason='${state.reason ?: "none"}'")
-                    _state.update { it.copy(isConnecting = false, connected = false,
-                        statusMsg = state.reason?.let { r -> "切断: $r" } ?: "切断済み (不明)",
-                        currentHost = null, screenUpdate = null, trzszState = null) }
-                }
-                is ConnectionPublicState.Error -> {
+                is ConnectionPublicState.Error ->
                     RemoteLogger.w("IsekaiTerminalSSH", "connection error: ${state.message}")
-                    _state.update { it.copy(isConnecting = false, statusMsg = "エラー: ${state.message}") }
-                }
+                is ConnectionPublicState.Reconnecting ->
+                    RemoteLogger.i(
+                        "IsekaiTerminalSSH",
+                        "… reconnecting: ${state.elapsedSecs}/${state.timeoutSecs}s reason='${state.reason ?: "none"}'",
+                    )
+                ConnectionPublicState.Connecting -> {}
             }
+            _state.update { ConnectionStateMapper.apply(it, state) }
         }
 
         override fun onScreenUpdate(update: ScreenUpdate) {
@@ -147,26 +152,11 @@ class TerminalSession(
         override fun onData(data: ByteArray) { appendLog(data) }
 
         override fun onTrzszStateChanged(state: TrzszPublicState) {
-            when (state) {
-                TrzszPublicState.Idle -> {
-                    transferAccepted.set(false)
-                    _state.update { it.copy(trzszState = null) }
-                }
-                is TrzszPublicState.WaitingUser -> {
-                    transferAccepted.set(false)
-                    _state.update { it.copy(trzszState = TrzszUiState.WaitingUser(
-                        state.transferId, state.mode, state.suggestedName, state.expectedSize)) }
-                }
-                is TrzszPublicState.InProgress -> {
-                    _state.update { it.copy(trzszState = TrzszUiState.InProgress(
-                        state.transferId, state.mode, state.fileName, state.transferred, state.total)) }
-                }
-                is TrzszPublicState.Done -> {
-                    transferAccepted.set(false)
-                    _state.update { it.copy(trzszState = TrzszUiState.Done(
-                        state.transferId, state.success, state.message)) }
-                }
-            }
+            // 転送が終端/中断状態(Idle・WaitingUser=新規要求・Done)に入るたびに
+            // 二重起動防止フラグをリセットする(UI表示状態ではない副作用のため
+            // TrzszStateMapper の対象外)。
+            if (state !is TrzszPublicState.InProgress) transferAccepted.set(false)
+            _state.update { it.copy(trzszState = TrzszStateMapper.toUiState(state)) }
         }
 
         override fun onDownloadComplete(fileName: String?, data: ByteArray) {
@@ -194,6 +184,14 @@ class TerminalSession(
         }
 
         override fun onClipboardPullRequest(): ClipboardPayload? = onClipboardPullRequested()
+
+        override fun onRequestWifiFd(): PlatformFd? = acquireWifiFd()
+
+        override fun onRequestCellularFd(): PlatformFd? = acquireCellularFd()
+
+        override fun onRebindStateChanged(state: RebindPublicState) {
+            _state.update { it.copy(rebindState = state) }
+        }
 
         // SSH agent forwarding: Rust 側の spawn_blocking スレッドから同期呼び出しされる。
         // ユーザーが respondAgentSignRequest() を呼ぶまでこのスレッドをブロックして待つ。
@@ -275,6 +273,11 @@ class TerminalSession(
         orchestrator.disconnect()
     }
 
+    /** 自動再接続ループ([isReconnecting]中)を中止する。判断はRust側
+     *  (`SessionOrchestrator::cancelReconnect`)で行い、結果は通常の
+     *  `onConnectionStateChanged`経由で[_state]に反映される。 */
+    fun cancelReconnect() = orchestrator.cancelReconnect()
+
     fun scrollbackCells(offset: Int, rows: Int): List<CellData>? =
         orchestrator.scrollbackCells(offset.toUInt(), rows.toUInt())
 
@@ -295,6 +298,11 @@ class TerminalSession(
     /** 「WiFiは繋がっているがupstreamが死んでいる」等を検知した際に呼ぶ。
      *  マルチパス以外のtransportや未接続時は Rust 側で無視される（日和見的に呼べばよい）。 */
     fun rebindToFd(fd: Int, localIp: String) = orchestrator.rebindToFd(fd, localIp)
+
+    /** #11: 「今すぐWiFiに戻す」。疎通確認だけは省略されないが、静けさ待ち・セルラー
+     *  最小滞在はバイパスされる(`RebindManager::handle_manual_force_return`参照)。
+     *  マルチパス以外のtransportや未接続時はRust側で無視される。 */
+    fun forceReturnToWifi() = orchestrator.forceReturnToWifi()
 
     // ── Host key ──────────────────────────────────────────────────────
 

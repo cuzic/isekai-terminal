@@ -9,4 +9,6 @@ object AppRoutes {
     const val KEY_IMPORT    = "key_import"
     const val SNIPPET_LIST  = "snippet_list"
     const val SNIPPET_EDIT  = "snippet_edit"
+    const val KEY_SEQUENCE_LIST = "key_sequence_list"
+    const val KEY_SEQUENCE_EDIT = "key_sequence_edit"
 }

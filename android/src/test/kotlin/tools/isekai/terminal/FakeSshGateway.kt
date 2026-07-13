@@ -33,6 +33,8 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     var trzszCancelCount = 0
     var trzszDismissCalled = false
     var rebindToFdCalls = mutableListOf<Pair<Int, String>>()
+    var forceReturnToWifiCallCount = 0
+    var cancelReconnectCalled = false
 
     @Throws(SshException::class)
     override fun connect(config: SshConfig) {
@@ -90,6 +92,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     }
 
     override fun disconnect() { disconnectCalled = true }
+    override fun cancelReconnect() { cancelReconnectCalled = true }
     override fun send(data: ByteArray) { sentBytes.add(data) }
     override fun resize(cols: UInt, rows: UInt) { lastResizeCols = cols; lastResizeRows = rows }
     override fun scrollbackLen(): UInt = 0u
@@ -100,6 +103,7 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun trzszCancel() { trzszCancelCount++ }
     override fun notifyError(message: String) {}
     override fun rebindToFd(fd: Int, localIp: String) { rebindToFdCalls.add(fd to localIp) }
+    override fun forceReturnToWifi() { forceReturnToWifiCallCount++ }
 
     override fun isQuic(): Boolean = quic
 
@@ -108,8 +112,11 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     // 接続中のみ 400ms debounce するが、この Fake が検証したいのはタブへの fanout など
     // Kotlin 側の配線であって debounce のタイミング自体(Rust 側で別途ユニットテスト済み)
     // ではないため、ここでは同期的に「最終的に切断されるかどうか」だけを再現する。
-    // isSatisfied=true は保留中の debounce をキャンセルする以外に意味を持たないため無視する。
+    // isSatisfied=true は切断判断には寄与しないが、呼び出し自体がこのペインまで届いたことは
+    // notifyNetworkPathChangedCalls で検証できるようにする。
+    val notifyNetworkPathChangedCalls = mutableListOf<Boolean>()
     override fun notifyNetworkPathChanged(isSatisfied: Boolean) {
+        notifyNetworkPathChangedCalls.add(isSatisfied)
         if (isSatisfied) return
         when {
             phase == Phase.CONNECTING || (phase == Phase.CONNECTED && !quic) -> {
@@ -152,6 +159,11 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     fun simulateDisconnected(reason: String? = null): Unit {
         phase = Phase.IDLE
         callback!!.onConnectionStateChanged(ConnectionPublicState.Disconnected(reason))
+    }
+
+    fun simulateReconnecting(elapsedSecs: UInt = 0u, timeoutSecs: UInt = 60u, reason: String? = null): Unit {
+        phase = Phase.IDLE
+        callback!!.onConnectionStateChanged(ConnectionPublicState.Reconnecting(elapsedSecs, timeoutSecs, reason))
     }
 
     fun simulateError(message: String) =

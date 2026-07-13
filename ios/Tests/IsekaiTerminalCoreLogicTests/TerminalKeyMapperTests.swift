@@ -62,4 +62,27 @@ final class TerminalKeyMapperTests: XCTestCase {
         XCTAssertEqual(TerminalKeyMapper.bytes(for: .pageUp), Array("\u{1B}[5~".utf8))
         XCTAssertEqual(TerminalKeyMapper.bytes(for: .pageDown), Array("\u{1B}[6~".utf8))
     }
+
+    // ── 打鍵列(KeySequence)機能向けに追加した applicationCursorMode 対応オーバーロード ──
+
+    func testBytesForKeyWithoutApplicationCursorModeUsesCsiArrowForm() {
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .arrowUp, applicationCursorMode: false),
+            Array("\u{1B}[A".utf8)
+        )
+    }
+
+    func testBytesForKeyWithApplicationCursorModeUsesSs3ArrowForm() {
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .arrowUp, applicationCursorMode: true),
+            Array("\u{1B}OA".utf8)
+        )
+    }
+
+    func testModeLessOverloadStillMatchesExplicitFalseForBackwardCompatibility() {
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .arrowDown),
+            TerminalKeyMapper.bytes(for: .arrowDown, applicationCursorMode: false)
+        )
+    }
 }

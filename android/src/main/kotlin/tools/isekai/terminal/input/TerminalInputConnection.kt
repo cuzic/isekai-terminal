@@ -64,10 +64,46 @@ class TerminalInputConnection(
 
     override fun sendKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
+            // IME 変換中（日本語 henkan 中など、確定前の composing テキストが残っている間）は
+            // 以下の物理ショートカット判定（アプリレベルショートカット・Ctrl/Alt 明示送出）を
+            // すべてスキップし、通常のキー入力／IME への委譲に任せる。変換中に Ctrl+<key> 等を
+            // ターミナル制御コードとして送ってしまうと変換中の文字列や候補が壊れるため
+            // （日本語 IME 完全対応はこのプロジェクトの差別化ポイント、絶対に壊さない）。
+            val composing = composingText().isNotEmpty()
+
+            if (!composing && handleShortcut(event)) return true
+
             TerminalKeyEncoder.specialKeyBytes(event.keyCode, view.applicationCursorMode)?.let {
                 view.onSendBytes?.invoke(it)
                 return true
             }
+            // JIS配列固有キー(¥/ろ)。これらのキーコードはJIS配列の物理キーボードでしか
+            // 生成され得ないため、US配列キーボードの通常入力を誤って横取りすることはない。
+            if (KeyboardLayoutDetector.resolveJisLayout(view.keyboardLayoutMode, event.device)) {
+                TerminalKeyEncoder.jisSpecialKeyBytes(event.keyCode, event.isShiftPressed)?.let {
+                    view.onSendBytes?.invoke(it)
+                    return true
+                }
+            }
+
+            // 物理 Ctrl 押下（トグルではなく実キーボードの修飾キー）: Ctrl+A〜Z 等を制御コードと
+            // して明示的に送出する。Alt 併用時は下の Alt 分岐に譲る。IME 変換中は誤発火防止のため無効。
+            if (!composing && event.isCtrlPressed && !event.isAltPressed) {
+                TerminalKeyEncoder.ctrlByte(event.getUnicodeChar(0))?.let {
+                    view.onSendBytes?.invoke(it)
+                    return true
+                }
+            }
+
+            // 物理 Alt 押下: xterm の "meta sends escape" 相当（ESC プレフィックス）。
+            // IME 変換中は誤発火防止のため無効。
+            if (!composing && event.isAltPressed && !event.isCtrlPressed) {
+                TerminalKeyEncoder.altKeyBytes(event.getUnicodeChar(0))?.let {
+                    view.onSendBytes?.invoke(it)
+                    return true
+                }
+            }
+
             // 物理 Ctrl 併用時はトグルを消費せず素通し（二重変換防止）
             if (view.ctrlArmed && !event.isCtrlPressed) {
                 val ctrlBytes = TerminalKeyEncoder.ctrlByte(event.getUnicodeChar(0))
@@ -85,6 +121,36 @@ class TerminalInputConnection(
             }
         }
         return super.sendKeyEvent(event)
+    }
+
+    /**
+     * アプリレベルの物理キーボードショートカット（コピー／貼り付け／タブ切替）を判定して
+     * 対応する [view] のコールバックを呼ぶ。コールバックが設定されていない（呼び出し元が
+     * 配線していない）場合は何もせず false を返し、呼び出し元が通常のキー処理へ
+     * フォールスルーできるようにする（例: タブ機能が無い文脈で Ctrl+Tab を押しても
+     * 素の Tab 送出にフォールバックする）。
+     */
+    private fun handleShortcut(event: KeyEvent): Boolean {
+        val ctrl = event.isCtrlPressed
+        val shift = event.isShiftPressed
+        val meta = event.isMetaPressed
+        return when {
+            ctrl && !shift && event.keyCode == KeyEvent.KEYCODE_TAB -> invokeShortcut(view.onNextTabRequested)
+            ctrl && shift && event.keyCode == KeyEvent.KEYCODE_TAB -> invokeShortcut(view.onPreviousTabRequested)
+            event.keyCode == KeyEvent.KEYCODE_COPY -> invokeShortcut(view.onCopyRequested)
+            event.keyCode == KeyEvent.KEYCODE_PASTE -> invokeShortcut(view.onPasteRequested)
+            (ctrl && shift && event.keyCode == KeyEvent.KEYCODE_C) || (meta && event.keyCode == KeyEvent.KEYCODE_C) ->
+                invokeShortcut(view.onCopyRequested)
+            (ctrl && shift && event.keyCode == KeyEvent.KEYCODE_V) || (meta && event.keyCode == KeyEvent.KEYCODE_V) ->
+                invokeShortcut(view.onPasteRequested)
+            else -> false
+        }
+    }
+
+    private fun invokeShortcut(callback: (() -> Unit)?): Boolean {
+        callback ?: return false
+        callback.invoke()
+        return true
     }
 
     override fun getTextBeforeCursor(n: Int, flags: Int): CharSequence = ""

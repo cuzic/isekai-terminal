@@ -294,4 +294,52 @@ class ProfileListScreenTest {
         val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
         assertTrue(!prefs.getBoolean(PREF_KEY_ENABLE_CTL_SOCKET_FORWARD, false))
     }
+
+    // ── キーボード配列(JIS/US)手動切替 ────────────────────────────────
+
+    @Test fun keyboardLayout_defaultsToAuto() {
+        setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("キーボード配列: 自動判定").assertIsDisplayed()
+    }
+
+    @Test fun keyboardLayoutButton_opensDialog() {
+        setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("キーボード配列: 自動判定").performClick()
+        waitForText("キーボード配列")
+        composeTestRule.onNodeWithText("自動判定").assertIsDisplayed()
+        composeTestRule.onNodeWithText("JIS配列").assertIsDisplayed()
+        composeTestRule.onNodeWithText("US配列").assertIsDisplayed()
+    }
+
+    @Test fun selectingJis_persistsToPrefsAndUpdatesMenuLabel() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("キーボード配列: 自動判定").performClick()
+        waitForText("キーボード配列")
+        composeTestRule.onNodeWithText("JIS配列").performClick()
+
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
+        assertEquals(
+            tools.isekai.terminal.input.KeyboardLayoutMode.JIS.name,
+            prefs.getString(tools.isekai.terminal.input.KeyboardLayoutMode.PREF_KEY, null),
+        )
+
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("キーボード配列: JIS配列").assertIsDisplayed()
+    }
+
+    @Test fun keyboardLayoutDialog_dismissWithoutSelection_leavesPrefsUntouched() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        setScreen()
+        composeTestRule.onNodeWithContentDescription("メニュー").performClick()
+        composeTestRule.onNodeWithText("キーボード配列: 自動判定").performClick()
+        waitForText("キーボード配列")
+        composeTestRule.onNodeWithText("閉じる").performClick()
+
+        val prefs = ctx.getSharedPreferences("isekai_terminal_ui", Context.MODE_PRIVATE)
+        assertEquals(null, prefs.getString(tools.isekai.terminal.input.KeyboardLayoutMode.PREF_KEY, null))
+    }
 }

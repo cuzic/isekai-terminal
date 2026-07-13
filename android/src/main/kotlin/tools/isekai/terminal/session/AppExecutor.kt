@@ -58,6 +58,13 @@ interface AppExecutor {
      * （Tailscale稼働中でbindSocketが失敗する等、正常系として許容する）。
      */
     suspend fun acquireCellularFd(): Pair<Int, String>?
+    /**
+     * #10/#20: WiFiに明示的にバインドしたソケットの生fdとローカルIPを取得する
+     * ([acquireCellularFd]のWiFi版)。取得できなければnull。RebindManager(Rust側)の
+     * 疎通確認・復帰rebindが呼ぶたびに毎回新規取得する
+     * (疎通確認用と本番rebind用で同じfdを使い回さない、fd所有権ポリシー)。
+     */
+    suspend fun acquireWifiFd(): Pair<Int, String>?
 }
 
 data class UploadFile(val name: String, val size: Long, val stream: InputStream)

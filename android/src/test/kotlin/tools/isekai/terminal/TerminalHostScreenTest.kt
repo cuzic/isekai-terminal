@@ -2,11 +2,14 @@ package tools.isekai.terminal
 
 import android.app.Application
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.performTextInput
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -26,6 +29,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
+import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.ui.TerminalThemes
 import uniffi.isekai_terminal_core.ScreenUpdate
@@ -56,12 +60,12 @@ class TerminalHostScreenTest {
             Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) }
         }
         executor = DumbAppExecutor()
-        val sessionFactory: () -> TerminalSession = {
+        val sessionFactory: (AppExecutor) -> TerminalSession = {
             val fake = FakeOrchestrator()
             orchestrators.add(fake)
             TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
         }
-        vm = TerminalTabsViewModel(app, executor, sessionFactory)
+        vm = TerminalTabsViewModel(app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler))
     }
 
     @After
@@ -168,5 +172,29 @@ class TerminalHostScreenTest {
         val tab = vm.tabs.value.first()
         assertTrue("テーマを個別選択したタブはoverride扱いになるべき", tab.isThemeOverridden)
         assertEquals(TerminalThemes.DRACULA.name, tab.currentTheme.value.name)
+    }
+
+    // ── split pane「新規接続」もパスワード認証プロファイルではパスワード入力が必要 ──────
+
+    @Test fun splitPaneNewConnection_forPasswordAuthProfile_promptsForPasswordAndConnects() {
+        vm.openTab(profile("alpha"), "pass")
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("splitPaneButton").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("上下に分割").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("新規接続（同じプロファイル）").performClick()
+        composeTestRule.waitForIdle()
+
+        // password auth profileなので、split前にPasswordDialogが挟まるはず。
+        composeTestRule.onNodeWithText("パスワード入力").assertExists()
+        composeTestRule.onAllNodes(hasSetTextAction())[0].performTextInput("split-secret")
+        composeTestRule.onNodeWithText("接続").performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.waitUntil(3000) { orchestrators.size > 1 && orchestrators[1].connectCalled }
+        assertTrue("パスワード入力後はsplit pane側のセッションも接続を試みるべき", orchestrators[1].connectCalled)
     }
 }

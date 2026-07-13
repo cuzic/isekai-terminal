@@ -40,6 +40,7 @@ public struct ProfileListView: View {
     private let onEditProfile: (ConnectionProfile) -> Void
     private let onManageKeys: () -> Void
     private let onManageSnippets: () -> Void
+    private let onManageKeySequences: () -> Void
     private let onShowDiagnostics: (() -> Void)?
 
     /// Phase 1F-3(#50): アプリ全体の既定配色テーマ(Android版`SharedPreferences`の
@@ -68,6 +69,7 @@ public struct ProfileListView: View {
         onEditProfile: @escaping (ConnectionProfile) -> Void,
         onManageKeys: @escaping () -> Void,
         onManageSnippets: @escaping () -> Void = {},
+        onManageKeySequences: @escaping () -> Void = {},
         onShowDiagnostics: (() -> Void)? = nil
     ) {
         _model = StateObject(wrappedValue: model)
@@ -76,6 +78,7 @@ public struct ProfileListView: View {
         self.onEditProfile = onEditProfile
         self.onManageKeys = onManageKeys
         self.onManageSnippets = onManageSnippets
+        self.onManageKeySequences = onManageKeySequences
         self.onShowDiagnostics = onShowDiagnostics
     }
 
@@ -121,6 +124,8 @@ public struct ProfileListView: View {
                         .accessibilityIdentifier("themePickerMenuItem")
                     Button("定型コマンド", action: onManageSnippets)
                         .accessibilityIdentifier("manageSnippetsMenuItem")
+                    Button("打鍵列", action: onManageKeySequences)
+                        .accessibilityIdentifier("manageKeySequencesMenuItem")
                     if let onShowDiagnostics {
                         Button("診断 (Phase 1A-1)", action: onShowDiagnostics)
                             .accessibilityIdentifier("diagnosticsMenuItem")
