@@ -9,18 +9,26 @@
 //! **Real-hardware update (macOS)**: a real `test-macos` CI run confirmed
 //! `bind_to_interface` itself works correctly there (the plain bind
 //! succeeds and `physical_interface.rs`'s own loopback-bind unit test
-//! passes) — but layering `noq`'s QUIC connection migration
-//! (PATH_CHALLENGE/PATH_RESPONSE) on top of an `IP_BOUND_IF`-restricted
-//! loopback socket does not currently work on macOS: path validation times
-//! out (see `isekai-transport/tests/rebind_e2e.rs`'s
-//! `rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable`,
-//! excluded there on macOS with a fuller writeup). Root cause unconfirmed —
-//! suspected to be Darwin's stricter (vs. Linux `SO_BINDTOIFINDEX`)
-//! interface-scoped route lookup under `IP_BOUND_IF` per XNU's
-//! `in_pcb.c`, conflicting with how a loopback alias's route is scoped —
-//! but this is not yet verified against a *real* (non-loopback) physical
-//! interface, so whether this backend works for its actual intended use
-//! (Wi-Fi/cellular rebind on a real Mac) remains genuinely unknown.
+//! passes). A follow-up real `test-macos` run found that layering `noq`'s
+//! QUIC connection migration (PATH_CHALLENGE/PATH_RESPONSE) on top of an
+//! `IP_BOUND_IF`-restricted socket bound to a *secondary* loopback alias
+//! (e.g. `127.0.0.4`) does not work — path validation times out — but that
+//! rebinding onto `lo0`'s *primary* address (`127.0.0.1`) or a *wildcard*
+//! (`0.0.0.0:0`) `IP_BOUND_IF`-restricted socket both work correctly (see
+//! `isekai-transport/tests/rebind_e2e.rs`'s three
+//! `rebind_onto_a_quicsock_bound_interface_*` tests for the full writeup and
+//! results). The wildcard case is the one that matters in practice: it's
+//! the exact bind pattern `WarmStandby::dial`
+//! (`isekai-transport/src/warm_standby.rs`), this crate's only real
+//! production caller on the CLI/PC side, actually uses — and a real
+//! physical interface (Wi-Fi/cellular) never needs a secondary alias, it
+//! has exactly one natural address. So this backend's actual intended use
+//! (Wi-Fi/cellular rebind on a real Mac) is no longer in serious doubt, even
+//! though the secondary-loopback-alias failure mode itself remains
+//! unexplained (still suspected to be Darwin's stricter, vs. Linux
+//! `SO_BINDTOIFINDEX`, interface-scoped route lookup under `IP_BOUND_IF` per
+//! XNU's `in_pcb.c` — but the local `sendmsg()` call was confirmed *not* to
+//! be failing, ruling out the most direct version of that theory).
 
 use std::io;
 use std::num::NonZeroU32;

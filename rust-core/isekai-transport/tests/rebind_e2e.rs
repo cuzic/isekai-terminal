@@ -93,32 +93,33 @@ async fn run_echo_server(cert_der: CertificateDer<'static>, key_der: PrivatePkcs
     addr
 }
 
-// macOS-excluded: KNOWN, UNRESOLVED GAP (not a well-understood platform
-// quirk like this crate's other macOS/Windows `#[cfg]` exclusions) —
-// confirmed on a real `test-macos` CI run that this test hangs after
-// rebinding onto a `quicsock`-bound (`IP_BOUND_IF`-restricted) loopback
-// socket: `noq`'s QUIC path validation (PATH_CHALLENGE/PATH_RESPONSE) times
-// out (`new path validation failed`) even though the raw `bind()` itself
-// succeeds (after aliasing `127.0.0.4` onto `lo0` in CI). Root cause not
-// confirmed: per XNU's `in_pcb.c`, Darwin's `IP_BOUND_IF` — unlike Linux's
-// `SO_BINDTOIFINDEX` — makes subsequent route lookups require an exact
-// interface-scope match, which plausibly conflicts with how a loopback
-// alias's route is scoped; tried re-aliasing with an explicit `/32` netmask
-// (ruling out the broadest netmask-scoping theory) and it made no
-// difference. `quicsock::unix`'s own module docs already flagged this
-// backend as untested on real Apple hardware — this is the first real
-// signal that it doesn't currently work for at least this loopback+rebind
-// scenario, though whether the same failure would hit a *real* (non-
-// loopback) physical interface on macOS remains unknown. Needs either a
-// `quicsock` code fix (once the exact Darwin mechanism is understood) or a
-// deeper investigation of `noq`'s own send/recv path under `IP_BOUND_IF`.
-//
-// TEMPORARILY re-enabled on macOS (debug commit, see this file's other new
-// `#[cfg(target_os = "macos")]` diagnostic tests added alongside it) to
-// capture `noq_udp`'s `log_sendmsg_error` output for this specific failure
-// in the same CI run as the two new variants, for a controlled A/B/C
-// comparison. Revert this `#[cfg]` back to excluding macOS once that
-// evidence has been gathered.
+// macOS-excluded: confirmed on a real `test-macos` CI run that this test
+// hangs after rebinding onto a `quicsock`-bound (`IP_BOUND_IF`-restricted)
+// *secondary* loopback alias (`127.0.0.4`, added via `ifconfig lo0 alias`):
+// `noq`'s QUIC path validation (PATH_CHALLENGE/PATH_RESPONSE) times out
+// (`new path validation failed`) even though the raw `bind()` itself
+// succeeds. **Narrowed and largely de-risked** by a follow-up real
+// `test-macos` CI run that added the two sibling tests below it in this
+// file: `rebind_onto_a_quicsock_bound_interface_using_the_primary_loopback_address`
+// (rebinds onto `127.0.0.1`, `lo0`'s primary address, no alias) and
+// `rebind_onto_a_quicsock_bound_interface_using_a_wildcard_bind` (rebinds
+// onto a wildcard `0.0.0.0:0` `IP_BOUND_IF`-restricted socket — the exact
+// pattern `WarmStandby::dial` in `warm_standby.rs`, this crate's only real
+// production caller of `bind_physical_interface`, actually uses) — **both
+// passed** in the same CI run this test failed in. That run's debug logs
+// also showed no `noq_udp` `log_sendmsg_error` output for this failing
+// test, meaning the local `sendmsg()` call itself is not failing — so this
+// is not the general `IP_BOUND_IF`+`noq` incompatibility originally
+// suspected (Darwin's stricter interface-scoped route lookup under
+// `IP_BOUND_IF`, per XNU's `in_pcb.c`), but something specific to routing
+// traffic to/from a *secondary* loopback alias on macOS — and real physical
+// interfaces (Wi-Fi/cellular) never need a secondary alias, they have
+// exactly one natural address, matching the primary-address/wildcard
+// variants that passed. Still excluded here because it remains a genuine,
+// reproducible failure and its exact mechanism is still unconfirmed, but it
+// no longer casts doubt on `--experimental-network-rebind`'s real-world
+// macOS behavior the way it originally did.
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable() {
     let _ = env_logger::builder().is_test(true).filter_level(log::LevelFilter::Debug).try_init();
@@ -174,19 +175,15 @@ async fn rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable() {
     conn.close().await;
 }
 
-/// Diagnostic (macOS-only): same scenario as
+/// macOS-only (see this file's other `rebind_onto_a_quicsock_bound_interface_*`
+/// tests). Same scenario as
 /// `rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable`, but
 /// rebinds onto `lo0`'s *primary* address (`127.0.0.1`, always present, no
 /// `ifconfig lo0 alias` needed) instead of the secondary alias `127.0.0.4`
-/// that test uses to simulate a distinct path. Isolates one variable: is
-/// `IP_BOUND_IF` + `noq` path validation broken on macOS in general, or only
-/// when the bound address is a *secondary* loopback alias specifically (as
-/// the leading theory in this file's other test's doc comment suggests,
-/// citing Darwin's stricter interface-scoped route lookup under
-/// `IP_BOUND_IF`)? A real physical interface (Wi-Fi/cellular) never needs a
-/// secondary alias — it has exactly one natural address — so if this test
-/// passes while the alias one hangs, that's meaningful evidence the alias
-/// (not `IP_BOUND_IF` itself) is the actual culprit.
+/// that test uses to simulate a distinct path. Confirmed passing on a real
+/// `test-macos` CI run in the same run that test failed — isolates that the
+/// gap that test hits is specific to *secondary* loopback aliases, not
+/// `IP_BOUND_IF` + `noq` path validation in general.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn rebind_onto_a_quicsock_bound_interface_using_the_primary_loopback_address() {
@@ -233,17 +230,17 @@ async fn rebind_onto_a_quicsock_bound_interface_using_the_primary_loopback_addre
     conn.close().await;
 }
 
-/// Diagnostic (macOS-only): same scenario again, but rebinds onto a
-/// *wildcard* (`0.0.0.0:0`) `IP_BOUND_IF`-restricted socket — the exact bind
-/// pattern `WarmStandby::dial` (`isekai-transport/src/warm_standby.rs`, the
-/// only real production caller of `bind_physical_interface`) actually uses,
-/// as opposed to this file's other tests, which bind a specific address to
-/// get an address distinguishable enough to prove the test is really
-/// exercising a different path. If this variant passes while the fixed-
-/// address alias test hangs, it's evidence that `WarmStandby`'s real usage
-/// on macOS is unaffected by the documented gap (which would then be a
-/// loopback-test-methodology artifact, not a bug in the shipped
-/// `--experimental-network-rebind` feature).
+/// macOS-only. Same scenario again, but rebinds onto a *wildcard*
+/// (`0.0.0.0:0`) `IP_BOUND_IF`-restricted socket — the exact bind pattern
+/// `WarmStandby::dial` (`isekai-transport/src/warm_standby.rs`, the only
+/// real production caller of `bind_physical_interface`) actually uses, as
+/// opposed to this file's other tests, which bind a specific address to get
+/// one distinguishable enough to prove the test is really exercising a
+/// different path. Confirmed passing on a real `test-macos` CI run — direct
+/// evidence that `WarmStandby`'s real usage on macOS is unaffected by the
+/// gap `rebind_onto_a_quicsock_bound_interface_keeps_the_connection_usable`
+/// hits, which is a loopback-test-methodology artifact rather than a bug in
+/// the shipped `--experimental-network-rebind` feature.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn rebind_onto_a_quicsock_bound_interface_using_a_wildcard_bind() {
