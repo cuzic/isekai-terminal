@@ -134,7 +134,16 @@ object TerminalFontSettings {
 
             // 二次検証: マジックナンバーは正しくても内部構造が壊れているファイルは
             // Typeface.createFromFile が例外を投げることがあるため、引き続きここでも確認する。
-            Typeface.createFromFile(tmp)
+            // 一部端末/Robolectric環境では不正なフォントデータに対しErrorを投げることも
+            // あるため([loadTypeface]と同じ理由)、ここだけ狭くException/Error両方を拾う
+            // (このtry全体をcatch(Error)で覆うと、無関係なファイルI/O由来の深刻なErrorまで
+            // 握りつぶしてしまうため、検証呼び出しの直近だけに絞る)。
+            try {
+                Typeface.createFromFile(tmp)
+            } catch (e: Throwable) {
+                tmp.delete()
+                return ImportResult.Failure("フォントファイルとして読み込めませんでした（壊れているか非対応の形式です）")
+            }
 
             // 検証に成功したので確定パスへ差し替える(古いカスタムフォントファイルは削除)。
             val previousName = prefs.getString(PREF_KEY, null)
