@@ -469,26 +469,53 @@ impl SessionCallback for OrchestratorAdapter {
 /// 対象外になっていた)と同じ見落としを繰り返さないよう、`OrchestratorAdapter::
 /// on_disconnected`と同じ`handle_unexpected_disconnect`を経由させる —
 /// 個別に「phase=Idle + Disconnected通知」を書かない。
+/// `apply_network_lost`が`handle_unexpected_disconnect`へ渡す合成理由文字列。
+/// [`DisconnectKind::classify`]がこの定数を直接比較するので、二重に書かないよう
+/// 定数化してある。
+const NETWORK_LOST_REASON: &str = "network lost";
+
 fn apply_network_lost(shared: &Arc<OrchestratorShared>) {
     if let Some(s) = shared.session.lock().as_ref() {
         s.disconnect();
     }
-    handle_unexpected_disconnect(shared, Some("network lost".to_string()));
+    handle_unexpected_disconnect(shared, Some(NETWORK_LOST_REASON.to_string()));
 }
 
-/// `transport.rs::run_ssh_channel_loop`の`ChannelMsg::ExitStatus`(リモートプロセスの
-/// 正常終了、例: ユーザーがシェルで`exit`した)由来の切断かどうか。この場合は
-/// ネットワーク/トランスポート障害ではないので、tssh風の自動再接続の対象にしない
-/// (勝手に新しいシェルを張り直すのは意図しない挙動)。
+/// `handle_unexpected_disconnect`が受け取る`reason`文字列のRust内部用分類。
 ///
 /// `SessionCallback::on_disconnected(reason: Option<String>)`には現状「切断理由の
 /// 種別」を運ぶ専用フィールドが無く、`reason`文字列に頼っている ── この
 /// trait(`SessionCallback`)には本番用の`OrchestratorAdapter`以外にテスト専用の
-/// 実装が4箇所あり、シグネチャ変更はそれら全ての更新を要する大きめの変更になるため、
-/// 「正常終了」という単一のケースのためだけに今回は見送った(将来、切断理由の種別が
-/// 増えるようならtyped enumへの置き換えを検討する)。
-fn is_graceful_remote_exit(reason: &Option<String>) -> bool {
-    reason.as_deref().is_some_and(|r| r.starts_with("remote process exited"))
+/// 実装が4箇所あり、シグネチャ変更・UniFFI経由でKotlin側に公開される文字列の
+/// 変更はそれら全ての更新を要する大きめの変更になるため見送っている。この型は
+/// あくまで`reason`文字列を読んだ*後*にRustのプロセス内だけで使う分類であり、
+/// `on_disconnected`のシグネチャにも公開文字列そのものにも影響しない。
+/// 分類ロジックを`handle_unexpected_disconnect`一箇所に一元化することで、
+/// `starts_with`/文字列比較が呼び出し側に増殖するのを防ぐ(rust-ssot.mdの
+/// 「判断ロジックをRust側に一元化する」原則そのもの)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisconnectKind {
+    /// `transport::ssh_handler::run_ssh_channel_loop`の`ChannelMsg::ExitStatus`
+    /// (リモートプロセスの正常終了、例: ユーザーがシェルで`exit`した)由来の切断。
+    /// ネットワーク/トランスポート障害ではないので、tssh風の自動再接続の対象に
+    /// しない(勝手に新しいシェルを張り直すのは意図しない挙動)。
+    GracefulRemoteExit,
+    /// `apply_network_lost`が合成する、OS側のネットワークパス消失由来の切断。
+    /// トランスポート層自体は特に何も報告していない(自動再接続の対象)。
+    NetworkLost,
+    /// 上記以外 ── russh/QUICエラー・認証失敗・PTY/shellリクエスト失敗・
+    /// `reason: None`(ピア/ローカルからの切断)等。自動再接続の対象。
+    TransportError,
+}
+
+impl DisconnectKind {
+    fn classify(reason: &Option<String>) -> Self {
+        match reason.as_deref() {
+            Some(r) if r.starts_with("remote process exited") => Self::GracefulRemoteExit,
+            Some(r) if r == NETWORK_LOST_REASON => Self::NetworkLost,
+            _ => Self::TransportError,
+        }
+    }
 }
 
 /// 予期しない切断(`OrchestratorAdapter::on_disconnected`・`apply_network_lost`の
@@ -508,7 +535,7 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
         let mut s = shared.state.lock();
         let was_connected = s.phase == ConnPhase::Connected;
         let user_initiated = s.user_initiated_disconnect;
-        let graceful_exit = is_graceful_remote_exit(&reason);
+        let graceful_exit = DisconnectKind::classify(&reason) == DisconnectKind::GracefulRemoteExit;
         s.user_initiated_disconnect = false;
         s.phase = ConnPhase::Idle;
         s.retry_attempt_in_flight = false;
@@ -1053,6 +1080,35 @@ impl SessionOrchestrator {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn disconnect_kind_classifies_graceful_remote_exit_by_prefix() {
+        let reason = Some("remote process exited (status 0)".to_string());
+        assert_eq!(DisconnectKind::classify(&reason), DisconnectKind::GracefulRemoteExit);
+    }
+
+    #[test]
+    fn disconnect_kind_classifies_the_network_lost_literal() {
+        let reason = Some(NETWORK_LOST_REASON.to_string());
+        assert_eq!(DisconnectKind::classify(&reason), DisconnectKind::NetworkLost);
+    }
+
+    #[test]
+    fn disconnect_kind_defaults_to_transport_error_for_anything_else() {
+        assert_eq!(DisconnectKind::classify(&None), DisconnectKind::TransportError);
+        assert_eq!(
+            DisconnectKind::classify(&Some("PTY/shell request failed".to_string())),
+            DisconnectKind::TransportError
+        );
+        // A reason that merely mentions "network lost" mid-string (not the
+        // exact synthesized literal `apply_network_lost` sends) must not be
+        // misclassified — only the precise, orchestrator-synthesized value
+        // counts as `NetworkLost`.
+        assert_eq!(
+            DisconnectKind::classify(&Some("something about network lost here".to_string())),
+            DisconnectKind::TransportError
+        );
+    }
 
     #[derive(Default)]
     struct RecordingCallback {
