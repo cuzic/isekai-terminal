@@ -390,9 +390,18 @@ impl OpenSshBackend {
         // `wc -c` before anything else runs, so a truncated stdin (e.g. the
         // ssh connection dropping mid-write) fails closed instead of
         // launching `isekai-pipe serve` against a partially-written file.
+        // `wc -c`'s output is piped through `tr -d '[:space:]'` before the
+        // `-eq` comparison: macOS's `wc` right-justifies its count with
+        // leading spaces (e.g. `     136`) even when reading from a single
+        // stdin stream, which made every remote-bootstrap `[ -eq ]` check
+        // silently evaluate false there (confirmed via a real `test-macos`
+        // CI failure — the whole `if` block was skipped, silently producing
+        // no output at all, misleadingly surfacing as `HandshakeMissing`
+        // instead of a parse error). GNU `wc` never pads a single count, so
+        // stripping whitespace is a no-op there.
         let jwt_len = jwt_bytes.len();
         let read_jwt_step = if jwt_len > 0 {
-            format!("head -c {jwt_len} > $tmpdir/relay_jwt && [ \"$(wc -c < $tmpdir/relay_jwt)\" -eq {jwt_len} ] && ")
+            format!("head -c {jwt_len} > $tmpdir/relay_jwt && [ \"$(wc -c < $tmpdir/relay_jwt | tr -d '[:space:]')\" -eq {jwt_len} ] && ")
         } else {
             String::new()
         };
@@ -427,11 +436,7 @@ mkdir -p {remote_dir} 2>/dev/null
 exec 9>>{lock_path} 2>/dev/null
 if command -v flock >/dev/null 2>&1; then flock -w 30 9 2>/dev/null || true; fi
 tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
-echo "DBG_TMPDIR=[$tmpdir]"
-head -c {request_len} > $tmpdir/bootstrap-request.json
-echo "DBG_HEAD1_RC=[$?]_WC=[$(wc -c < $tmpdir/bootstrap-request.json 2>&1)]"
-{read_jwt_step}echo "DBG_JWT_STEP_DONE"
-if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdir/bootstrap-request.json)" -eq {request_len} ] && {read_jwt_step}true; then
+if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')" -eq {request_len} ] && {read_jwt_step}true; then
   reuse_envelope=""
   if [ -f {state_path} ]; then
     existing_pid=$(sed -n '1p' {state_path} | cut -d' ' -f1)

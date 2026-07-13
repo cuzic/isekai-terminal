@@ -363,7 +363,7 @@ async fn launch_and_capture_handshake(
             let jwt_len = jwt.len();
             format!(
                 "head -c {jwt_len} > $tmpdir/relay_jwt && \
-                 [ \"$(wc -c < $tmpdir/relay_jwt)\" -eq {jwt_len} ] && "
+                 [ \"$(wc -c < $tmpdir/relay_jwt | tr -d '[:space:]')\" -eq {jwt_len} ] && "
             )
         }
         None => String::new(),
@@ -380,11 +380,17 @@ async fn launch_and_capture_handshake(
     let launch_cmd = format!(
         "umask 077 && tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT && \
          head -c {request_len} > $tmpdir/bootstrap-request.json && \
-         [ \"$(wc -c < $tmpdir/bootstrap-request.json)\" -eq {request_len} ] && \
+         [ \"$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')\" -eq {request_len} ] && \
          {write_jwt_step}\
-         ( setsid {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} serve {bind_arg}{p2p_arg}\
-         --bootstrap-request-file $tmpdir/bootstrap-request.json --target {quoted_target} \
-         </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
+         if command -v setsid >/dev/null 2>&1; then \
+           ( setsid {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} serve {bind_arg}{p2p_arg}\
+           --bootstrap-request-file $tmpdir/bootstrap-request.json --target {quoted_target} \
+           </dev/null >$tmpdir/handshake 2>$tmpdir/log & ); \
+         else \
+           ( ( trap '' HUP; exec {ISEKAI_PIPE_INSTALL_DIR}/{ISEKAI_PIPE_BIN_NAME} serve {bind_arg}{p2p_arg}\
+           --bootstrap-request-file $tmpdir/bootstrap-request.json --target {quoted_target} \
+           </dev/null >$tmpdir/handshake 2>$tmpdir/log ) & ); \
+         fi; \
          for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do \
            [ -s $tmpdir/handshake ] && break; \
            sleep {sleep_secs}; \
