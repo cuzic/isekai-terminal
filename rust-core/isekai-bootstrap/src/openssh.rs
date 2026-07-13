@@ -20,14 +20,20 @@
 //!    why `isekai-ssh`'s long-lived-helper model needs it, unlike
 //!    `helper_bootstrap.rs`'s intentionally-fresh-every-session Android
 //!    path).
-//! 2. Otherwise: `sha256sum` the existing binary (if any, shared across every
-//!    topology) and skip re-uploading when it already matches the expected
-//!    digest; `base64 -d > ...tmp && chmod 0700 ... && mv ...` otherwise,
-//!    with the base64-encoded binary written to the ssh subprocess's stdin.
-//! 3. Launches `isekai-helper` detached (`setsid`, stdin from `/dev/null`,
-//!    wrapped in a subshell so the ssh exec channel's direct child exits
-//!    immediately — see the comment in `helper_bootstrap.rs` for why that
-//!    matters) and polls a handshake file until it's non-empty, then `cat`s
+//! 2. Otherwise: `sha256sum` (falling back to `shasum -a 256` on macOS
+//!    remotes, which don't ship GNU coreutils) the existing binary (if any,
+//!    shared across every topology) and skip re-uploading when it already
+//!    matches the expected digest; `base64 -d > ...tmp && chmod 0700 ... &&
+//!    mv ...` otherwise, with the base64-encoded binary written to the ssh
+//!    subprocess's stdin.
+//! 3. Launches `isekai-helper` detached (`setsid` where available — macOS
+//!    remotes don't ship a `setsid(1)` binary, so `install_and_launch` falls
+//!    back to `trap '' HUP` + `exec` in that case, which is sufficient since
+//!    the ssh exec channel never allocates a controlling tty in the first
+//!    place; stdin from `/dev/null`, wrapped in a subshell so the ssh exec
+//!    channel's direct child exits immediately — see the comment in
+//!    `helper_bootstrap.rs` for why that matters) and polls a handshake file
+//!    until it's non-empty, then `cat`s
 //!    it back over the same exec channel — and, on success, records
 //!    `{pid, fingerprint, handshake}` to the state file for a future
 //!    invocation to find.
@@ -444,9 +450,13 @@ if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdi
     printf '%s\n' "$reuse_envelope"
   else
     need_upload=1
-    if command -v sha256sum >/dev/null 2>&1 && [ -x {remote_binary_path} ]; then
-      current_sha=$(sha256sum {remote_binary_path} 2>/dev/null | cut -d' ' -f1)
-      [ "$current_sha" = "{expected_sha256}" ] && need_upload=0
+    if [ -x {remote_binary_path} ]; then
+      if command -v sha256sum >/dev/null 2>&1; then
+        current_sha=$(sha256sum {remote_binary_path} 2>/dev/null | cut -d' ' -f1)
+      elif command -v shasum >/dev/null 2>&1; then
+        current_sha=$(shasum -a 256 {remote_binary_path} 2>/dev/null | cut -d' ' -f1)
+      fi
+      [ -n "$current_sha" ] && [ "$current_sha" = "{expected_sha256}" ] && need_upload=0
     fi
     upload_ok=1
     if [ "$need_upload" -eq 1 ]; then
@@ -457,7 +467,11 @@ if head -c {request_len} > $tmpdir/bootstrap-request.json && [ "$(wc -c < $tmpdi
     if [ "$upload_ok" -eq 0 ]; then
       echo {upload_failed_marker}
     else
-      ( setsid {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- & echo $! > {pid_path} )
+      if command -v setsid >/dev/null 2>&1; then
+        ( setsid {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- & echo $! > {pid_path} )
+      else
+        ( ( trap '' HUP; exec {remote_binary_path} serve {launch_args} </dev/null >$tmpdir/handshake 2>$tmpdir/log 9>&- ) & echo $! > {pid_path} )
+      fi
       for i in $(seq 1 {HANDSHAKE_POLL_ATTEMPTS}); do
         [ -s $tmpdir/handshake ] && break
         sleep {sleep_secs}
