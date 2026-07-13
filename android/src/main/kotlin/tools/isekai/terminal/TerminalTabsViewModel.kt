@@ -25,6 +25,7 @@ import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.session.AndroidAppExecutor
 import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.RealHostKeyChecker
+import tools.isekai.terminal.session.RebindFdSource
 import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
@@ -58,12 +59,10 @@ import uniffi.isekai_terminal_core.PlatformFd
  * 接続後自動実行コマンド・upstream フェイルオーバー・agent forwarding 確認は、ここでは
  * タブ([TabState])単位の状態として複製する。
  *
- * 既知の制約: 物理マルチパス fd 取得(`acquirePhysicalMultipathFds`)・upstream フェイルオーバー
- * 監視(`registerUpstreamFailoverMonitor`)は [AppExecutor] 側がプロセス単位のグローバル API
- * （タブ単位に分離されていない）であるため、複数タブが同時に
- * `ISEKAI_PIPE_QUIC_MULTIPATH` + 物理マルチパス/upstream フェイルオーバーを有効にした場合は
- * 後勝ちになる。単一セッション設計時点からの既存の制約であり、このタブ機能追加で新たに
- * 生まれたものではない。
+ * 物理マルチパス fd 取得・upstream フェイルオーバー監視・WiFi/セルラー rebind fd 取得は、
+ * いずれも [AppExecutor] が返す [AutoCloseable] ハンドル/[tools.isekai.terminal.session.RebindFdSource]
+ * を [PaneState] が所有する設計にしており(Task #10)、複数タブ/split pane が同時に使っても
+ * 互いを上書き・誤解放しない。
  */
 /**
  * タブ内の2分割方向。[HORIZONTAL] は左右に並べる(縦の仕切り線)、[VERTICAL] は上下に並べる
@@ -86,6 +85,8 @@ enum class SplitDirection { HORIZONTAL, VERTICAL }
 class PaneState internal constructor(
     val paneId: String,
     val session: TerminalSession,
+    /** このpaneのセッションと同じ寿命を持つWiFi/セルラーfd取得元。session終了時に`close()`する。 */
+    internal val rebindFdSource: RebindFdSource,
 ) {
     // 接続前のバリデーションエラー。session.state (Rust 由来) には混入させず合成する。
     internal val preConnectError = MutableStateFlow<String?>(null)
@@ -103,6 +104,12 @@ class PaneState internal constructor(
     internal var upstreamFailoverEnabledForCurrentSession = false
     internal val rebindInFlight = AtomicBoolean(false)
 
+    // ── Task #10: per-pane handle所有権(後勝ちバグ修正) ─────────
+    /** 物理マルチパスfd取得のhandle。接続試行のたびに古いhandleを閉じてから発行し直す。 */
+    internal var physicalMultipathHandle: AutoCloseable? = null
+    /** upstream failover監視のhandle。 */
+    internal var upstreamFailoverMonitorHandle: AutoCloseable? = null
+
     /** UI が購読する合成済み状態。 */
     val uiState: Flow<TerminalUiState> = session.state.combine(preConnectError) { s, err ->
         if (err != null) s.copy(statusMsg = err) else s
@@ -112,7 +119,7 @@ class PaneState internal constructor(
 class TerminalTabsViewModel(
     app: Application,
     private val executor: AppExecutor,
-    private val sessionFactory: (AppExecutor) -> TerminalSession,
+    private val sessionFactory: (AppExecutor, RebindFdSource) -> TerminalSession,
     // テストがtestScheduler駆動のディスパッチャーを注入できるようにする(既定は本番同様
     // Dispatchers.IO)。ハードコードしていた頃はテストの仮想時間(TestCoroutineScheduler)と
     // ここで起動される実スレッドの完了タイミングが競合し、withTimeout()ポーリングが
@@ -128,7 +135,7 @@ class TerminalTabsViewModel(
     constructor(app: Application) : this(
         app,
         AndroidAppExecutor(app),
-        { executor ->
+        { executor, rebindFdSource ->
             val clipboardPolicy = RemoteClipboardPolicy(
                 isWriteAllowed = {
                     app.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE)
@@ -180,14 +187,14 @@ class TerminalTabsViewModel(
                 onClipboardWriteRequested = clipboardPolicy::onClipboardWriteRequested,
                 onClipboardPullRequested = clipboardPolicy::onClipboardPullRequested,
                 // #10/#22: RebindManager(Rust側)がWiFi/セルラーのfdを要求してきたら、
-                // AppExecutor経由で取得して返すだけ(判断はしない、rust-ssot.md準拠)。
+                // このpane用のRebindFdSource経由で取得して返すだけ(判断はしない、rust-ssot.md準拠)。
                 // Rust側のspawn_blockingスレッドから同期呼び出しされるためrunBlockingで
                 // suspend関数をブリッジする(onAgentSignRequest等と同じ方式)。
                 acquireWifiFd = {
-                    runBlocking { executor.acquireWifiFd() }?.let { (fd, ip) -> PlatformFd(fd, ip) }
+                    runBlocking { rebindFdSource.acquireWifiFd() }?.let { (fd, ip) -> PlatformFd(fd, ip) }
                 },
                 acquireCellularFd = {
-                    runBlocking { executor.acquireCellularFd() }?.let { (fd, ip) -> PlatformFd(fd, ip) }
+                    runBlocking { rebindFdSource.acquireCellularFd() }?.let { (fd, ip) -> PlatformFd(fd, ip) }
                 },
             )
         },
@@ -334,7 +341,8 @@ class TerminalTabsViewModel(
     /** 新しいタブを開いて接続を開始し、そのタブをアクティブにする。生成した tabId を返す。 */
     fun openTab(profile: ConnectionProfile, password: String? = null, jumpPassword: String? = null): String {
         val tabId = UUID.randomUUID().toString()
-        val primaryPane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor))
+        val rebindFdSource = executor.createRebindFdSource()
+        val primaryPane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource), rebindFdSource)
         // Phase 12 P2-1: Global default → Profile default の解決。プロファイルに明示的な
         // テーマ指定があれば、その時点で「上書き済み」タブとして扱う(以後グローバル変更に
         // 追従しない。ユーザーがそのプロファイル用に選んだ意図を尊重する)。
@@ -367,15 +375,17 @@ class TerminalTabsViewModel(
         updateSessionsSummary()
     }
 
-    /** [pane] の監視コルーチンを止め、セッションを切断・破棄する（[closeTab]・[closeSplitPane] 共通）。 */
+    /** [pane] の監視コルーチンを止め、セッションを切断・破棄し、保有する全handleを解放する
+     *  （[closeTab]・[closeSplitPane]・[onCleared] 共通）。 */
     private fun closePaneSession(pane: PaneState) {
         pane.session.disconnect()
         pane.session.close()
         watchJobs.remove(pane.paneId)?.cancel()
-        if (pane.upstreamFailoverEnabledForCurrentSession) {
-            executor.releasePhysicalMultipathFds()
-            executor.unregisterUpstreamFailoverMonitor()
-        }
+        pane.physicalMultipathHandle?.close()
+        pane.physicalMultipathHandle = null
+        pane.upstreamFailoverMonitorHandle?.close()
+        pane.upstreamFailoverMonitorHandle = null
+        pane.rebindFdSource.close()
     }
 
     fun setActiveTab(tabId: String) {
@@ -422,7 +432,8 @@ class TerminalTabsViewModel(
         val tab = tabOrNull(tabId) ?: return null
         if (tab.splitPane.value != null) return null
         val profile = tab.profile ?: return null
-        val pane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor))
+        val rebindFdSource = executor.createRebindFdSource()
+        val pane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource), rebindFdSource)
         RemoteLogger.i("IsekaiTerminalTabsVM", "splitPane[$tabId] new pane=${pane.paneId} direction=$direction")
         tab.openSplit(pane, direction)
         watchPane(tab, pane)
@@ -517,13 +528,15 @@ class TerminalTabsViewModel(
             if (connected && !prevConnected) {
                 executor.notifyConnected(state.currentHost ?: "")
                 if (pane.upstreamFailoverEnabledForCurrentSession) {
-                    executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
+                    pane.upstreamFailoverMonitorHandle = executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
                 }
                 maybeSendPostConnectCommands(pane)
             } else if (!connected && prevConnected) {
                 executor.notifyDisconnected()
-                executor.releasePhysicalMultipathFds()
-                executor.unregisterUpstreamFailoverMonitor()
+                pane.physicalMultipathHandle?.close()
+                pane.physicalMultipathHandle = null
+                pane.upstreamFailoverMonitorHandle?.close()
+                pane.upstreamFailoverMonitorHandle = null
                 pane.upstreamFailoverEnabledForCurrentSession = false
             }
             prevConnected = connected
@@ -548,7 +561,7 @@ class TerminalTabsViewModel(
         if (!pane.rebindInFlight.compareAndSet(false, true)) return
         viewModelScope.launch(ioDispatcher) {
             try {
-                val cellular = executor.acquireCellularFd()
+                val cellular = pane.rebindFdSource.acquireCellularFd()
                 if (cellular == null) {
                     RemoteLogger.w("IsekaiTerminalSSH", "upstream failover: cellular fd not available, staying on current path")
                     return@launch
@@ -784,8 +797,7 @@ class TerminalTabsViewModel(
     override fun onCleared() {
         super.onCleared()
         RemoteLogger.i("IsekaiTerminalTabsVM", "TerminalTabsViewModel cleared")
-        watchJobs.values.forEach { it.cancel() }
-        _tabs.value.forEach { tab -> tab.panes.forEach { it.session.close() } }
+        _tabs.value.forEach { tab -> tab.panes.forEach { closePaneSession(it) } }
         executor.unregisterNetworkCallbacks()
         executor.release()
     }

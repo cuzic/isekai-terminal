@@ -28,9 +28,6 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
     @Volatile private var isServiceBound = false
     @Volatile private var terminalService: TerminalSessionService? = null
     private var pathMonitor: NetworkPathMonitor? = null
-    private var physicalPathProvider: PhysicalPathProvider? = null
-    private var upstreamHealthMonitor: UpstreamHealthMonitor? = null
-    private var upstreamFailoverPathProvider: PhysicalPathProvider? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -92,43 +89,36 @@ class AndroidAppExecutor(private val app: Application) : AppExecutor {
         pathMonitor = null
     }
 
-    override suspend fun acquirePhysicalMultipathFds(): PhysicalMultipathFds {
+    override suspend fun acquirePhysicalMultipathFds(): PhysicalMultipathAcquisition {
         val provider = PhysicalPathProvider(app)
-        physicalPathProvider = provider
-        return provider.acquire()
+        val fds = provider.acquire()
+        return PhysicalMultipathAcquisition(fds, AutoCloseable { provider.release() })
     }
 
-    override fun releasePhysicalMultipathFds() {
-        physicalPathProvider?.release()
-        physicalPathProvider = null
-    }
-
-    override fun registerUpstreamFailoverMonitor(onWifiUpstreamBroken: () -> Unit) {
+    override fun registerUpstreamFailoverMonitor(onWifiUpstreamBroken: () -> Unit): AutoCloseable {
         val monitor = UpstreamHealthMonitor(app.getSystemService(ConnectivityManager::class.java))
-        upstreamHealthMonitor = monitor
         monitor.start(
             onWifiUpstreamBroken = onWifiUpstreamBroken,
             onWifiUpstreamRecovered = {},
         )
+        return AutoCloseable { monitor.stop() }
     }
 
-    override fun unregisterUpstreamFailoverMonitor() {
-        upstreamHealthMonitor?.stop()
-        upstreamHealthMonitor = null
-        upstreamFailoverPathProvider?.release()
-        upstreamFailoverPathProvider = null
-    }
-
-    override suspend fun acquireCellularFd(): Pair<Int, String>? {
+    override fun createRebindFdSource(): RebindFdSource {
         val provider = PhysicalPathProvider(app)
-        upstreamFailoverPathProvider = provider
-        return provider.acquireCellularOnly()
-    }
-
-    override suspend fun acquireWifiFd(): Pair<Int, String>? {
-        val provider = PhysicalPathProvider(app)
-        upstreamFailoverPathProvider = provider
-        return provider.acquireWifiOnly()
+        return object : RebindFdSource {
+            @Volatile private var closed = false
+            override suspend fun acquireWifiFd(): Pair<Int, String>? =
+                if (closed) null else provider.acquireWifiOnly()
+            override suspend fun acquireCellularFd(): Pair<Int, String>? =
+                if (closed) null else provider.acquireCellularOnly()
+            override fun close() {
+                // close後にRust側のRebindManagerからの遅延到達コールバックが新規NetworkRequestを
+                // 復活させないよう、release前にclosedを立てる(idempotent)。
+                closed = true
+                provider.release()
+            }
+        }
     }
 
     override suspend fun loadKeyPem(keyId: Long): ByteArray {

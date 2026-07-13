@@ -60,7 +60,7 @@ class TerminalHostScreenTest {
             Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) }
         }
         executor = DumbAppExecutor()
-        val sessionFactory: (AppExecutor) -> TerminalSession = {
+        val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource) -> TerminalSession = { _, _ ->
             val fake = FakeOrchestrator()
             orchestrators.add(fake)
             TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })

@@ -57,7 +57,7 @@ class TerminalTabsViewModelTest {
             Repositories.snippets.getAll().forEach { Repositories.snippets.delete(it) }
         }
         executor = DumbAppExecutor()
-        val sessionFactory: (AppExecutor) -> TerminalSession = {
+        val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource) -> TerminalSession = { _, _ ->
             val fake = FakeOrchestrator()
             orchestrators.add(fake)
             TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
@@ -331,33 +331,97 @@ class TerminalTabsViewModelTest {
 
     // ── Phase 9-4: 物理マルチパス（実験的機能）─────────────────────────
 
+    private fun multipathProfile(label: String, enablePhysicalMultipath: Boolean = true, enableUpstreamFailover: Boolean = false) =
+        profile(label).copy(
+            transportPreferenceName = TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH.name,
+            enablePhysicalMultipath = enablePhysicalMultipath,
+            enableUpstreamFailover = enableUpstreamFailover,
+        )
+
     @Test
     fun connectTab_multipathTransport_physicalMultipathEnabled_acquiresPhysicalFds() = runBlocking {
         executor.physicalMultipathFds = tools.isekai.terminal.session.PhysicalMultipathFds(
             wifiFd = 42, wifiLocalIp = "192.168.1.5",
         )
-        val p = profile("a").copy(
-            transportPreferenceName = TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH.name,
-            enablePhysicalMultipath = true,
-        )
-        vm.openTab(p, "pass")
+        vm.openTab(multipathProfile("a"), "pass")
 
         withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
 
-        assertEquals(1, executor.acquirePhysicalMultipathFdsCallCount)
+        assertEquals(1, executor.physicalMultipathHandles.size)
     }
 
     @Test
     fun connectTab_multipathTransport_physicalMultipathDisabled_doesNotAcquirePhysicalFds() = runBlocking {
-        val p = profile("a").copy(
-            transportPreferenceName = TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH.name,
-            enablePhysicalMultipath = false,
-        )
-        vm.openTab(p, "pass")
+        vm.openTab(multipathProfile("a", enablePhysicalMultipath = false), "pass")
 
         withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
 
-        assertEquals(0, executor.acquirePhysicalMultipathFdsCallCount)
+        assertEquals(0, executor.physicalMultipathHandles.size)
+    }
+
+    @Test
+    fun closeTab_withPhysicalMultipathEnabled_closesOnlyThatTabsHandle() = runBlocking {
+        val idA = vm.openTab(multipathProfile("a"), "pass")
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        vm.openTab(multipathProfile("b"), "pass")
+        withTimeout(3000) { while (!orchestrators[1].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        assertEquals(2, executor.physicalMultipathHandles.size)
+
+        vm.closeTab(idA)
+
+        assertTrue("closed tabのhandleだけ閉じるべき", executor.physicalMultipathHandles[0].closed)
+        assertFalse("他タブのhandleは影響を受けないべき", executor.physicalMultipathHandles[1].closed)
+    }
+
+    @Test
+    fun disconnect_withUpstreamFailoverEnabled_closesOnlyThatTabsMonitorHandle() = runBlocking {
+        val idA = vm.openTab(multipathProfile("a", enableUpstreamFailover = true), "pass")
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        orchestrators[0].simulateConnected("host-a")
+        withTimeout(3000) { while (!tab(idA).session.state.value.connected) delay(10) }
+
+        val idB = vm.openTab(multipathProfile("b", enableUpstreamFailover = true), "pass")
+        withTimeout(3000) { while (!orchestrators[1].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        orchestrators[1].simulateConnected("host-b")
+        withTimeout(3000) { while (!tab(idB).session.state.value.connected) delay(10) }
+        withTimeout(3000) { while (executor.upstreamFailoverHandles.size < 2) delay(10) }
+
+        orchestrators[0].simulateDisconnected("bye")
+        withTimeout(3000) { while (tab(idA).session.state.value.connected) delay(10) }
+
+        assertTrue("切断したタブのupstream監視handleだけ閉じるべき", executor.upstreamFailoverHandles[0].closed)
+        assertFalse("接続中の他タブのhandleは影響を受けないべき", executor.upstreamFailoverHandles[1].closed)
+    }
+
+    @Test
+    fun openTab_createsDistinctRebindFdSourcePerPane_closedOnlyOnThatTabsClose() = runBlocking {
+        val idA = vm.openTab(profile("a"), "pass")
+        vm.openTab(profile("b"), "pass")
+        assertEquals(2, executor.rebindFdSources.size)
+        assertNotSame(executor.rebindFdSources[0], executor.rebindFdSources[1])
+
+        vm.closeTab(idA)
+
+        assertTrue("closed tabのRebindFdSourceだけ閉じるべき", executor.rebindFdSources[0].closed)
+        assertFalse("他タブのRebindFdSourceは影響を受けないべき", executor.rebindFdSources[1].closed)
+    }
+
+    @Test
+    fun reconnectPane_beforeEverConnected_closesStalePhysicalMultipathHandle() = runBlocking {
+        val id = vm.openTab(multipathProfile("a"), "pass")
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
+        assertEquals(1, executor.physicalMultipathHandles.size)
+        // 一度もConnectedにならないまま(isConnecting/isReconnecting共にfalseへ)エラー遷移させ、
+        // 再接続を試みる。
+        orchestrators[0].simulateError("boom")
+        withTimeout(3000) { while (tab(id).session.state.value.isConnecting) delay(10) }
+
+        val paneId = tab(id).focusedPane.paneId
+        vm.reconnectPane(id, paneId, "pass")
+        withTimeout(3000) { while (executor.physicalMultipathHandles.size < 2) delay(10) }
+
+        assertTrue("Connected未達のまま再接続すると古いhandleを閉じるべき", executor.physicalMultipathHandles[0].closed)
+        assertFalse("新しいhandleはまだ開いたままのはず", executor.physicalMultipathHandles[1].closed)
     }
 
     // ── Phase 10: STUN+SSHランデブー方式・relay経由のP2P ─────────────────
@@ -394,15 +458,16 @@ class TerminalTabsViewModelTest {
 
     @Test
     fun disconnect_afterConnected_releasesPhysicalMultipathFds() = runBlocking {
-        val id = vm.openTab(profile("a"), "pass")
-        awaitConnectCalled(orchestrators[0])
+        val id = vm.openTab(multipathProfile("a"), "pass")
+        withTimeout(3000) { while (!orchestrators[0].connectMultipathIsekaiPipeQuicCalled) delay(10) }
         orchestrators[0].simulateConnected("host-a")
         withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        assertEquals(1, executor.physicalMultipathHandles.size)
 
         orchestrators[0].simulateDisconnected("bye")
         withTimeout(3000) { while (tab(id).session.state.value.connected) delay(10) }
 
-        assertTrue(executor.releasePhysicalMultipathFdsCalled)
+        assertTrue(executor.physicalMultipathHandles[0].closed)
     }
 
     // ── 定型コマンド（スニペット）─────────────────────────────────

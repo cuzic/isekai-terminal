@@ -40,31 +40,40 @@ interface AppExecutor {
     /**
      * Phase 9-4（実験的機能）: Wi-Fi/セルラー物理無線にそれぞれ明示的にバインドした
      * ソケットの fd を取得する。両方/片方が取得できないことは正常系（Tailscale稼働中
-     * 等）なので、呼び出し側は結果の null を許容すること。
+     * 等）なので、呼び出し側は結果の null を許容すること。返り値の[PhysicalMultipathAcquisition.handle]
+     * は呼び出し側(pane)が所有し、そのpaneの接続試行が終わったら必ず`close()`すること
+     * (Task #10: プロセス単位グローバル状態を廃し、per-pane handleに所有権を渡す設計)。
      */
-    suspend fun acquirePhysicalMultipathFds(): PhysicalMultipathFds
-    /** [acquirePhysicalMultipathFds] で保持したネットワークリクエストを解除する。 */
-    fun releasePhysicalMultipathFds()
+    suspend fun acquirePhysicalMultipathFds(): PhysicalMultipathAcquisition
     /**
      * 「WiFiは繋がっているがupstreamが死んでいる」検知の監視を開始する。
      * [onWifiUpstreamBroken] は検証失敗を検知した瞬間に呼ばれる（edge-triggered）。
+     * 返り値の[AutoCloseable]は呼び出し側(pane)が所有し、監視を止めたくなったら`close()`すること。
      */
-    fun registerUpstreamFailoverMonitor(onWifiUpstreamBroken: () -> Unit)
-    /** [registerUpstreamFailoverMonitor] の監視を解除する。 */
-    fun unregisterUpstreamFailoverMonitor()
+    fun registerUpstreamFailoverMonitor(onWifiUpstreamBroken: () -> Unit): AutoCloseable
     /**
-     * セルラーに明示的にバインドしたソケットの生fdとローカルIPを取得する
-     * （[acquirePhysicalMultipathFds] のセルラー単体版）。取得できなければnull
-     * （Tailscale稼働中でbindSocketが失敗する等、正常系として許容する）。
+     * WiFi/セルラーに明示的にバインドしたソケットの生fd取得を、1つのpane/session分だけ
+     * まとめて行うためのファクトリ。RebindManager(Rust側)がセッション中に何度も
+     * wifi/cellular fdを要求してくる(疎通確認用・本番rebind用で毎回別々に取得する、fd所有権
+     * ポリシー)ため、[RebindFdSource]はpaneのセッションと同じ寿命を持つ1インスタンスとして
+     * 呼び出し側が保持し、セッション終了時に`close()`すること。
      */
-    suspend fun acquireCellularFd(): Pair<Int, String>?
-    /**
-     * #10/#20: WiFiに明示的にバインドしたソケットの生fdとローカルIPを取得する
-     * ([acquireCellularFd]のWiFi版)。取得できなければnull。RebindManager(Rust側)の
-     * 疎通確認・復帰rebindが呼ぶたびに毎回新規取得する
-     * (疎通確認用と本番rebind用で同じfdを使い回さない、fd所有権ポリシー)。
-     */
-    suspend fun acquireWifiFd(): Pair<Int, String>?
+    fun createRebindFdSource(): RebindFdSource
 }
 
 data class UploadFile(val name: String, val size: Long, val stream: InputStream)
+
+/** [AppExecutor.acquirePhysicalMultipathFds] の返り値。[handle]は呼び出し側が所有・解放する。 */
+data class PhysicalMultipathAcquisition(val fds: PhysicalMultipathFds, val handle: AutoCloseable)
+
+/**
+ * 1つのpane/sessionに紐づくWiFi/セルラーfdの取得元。[close]を呼ぶまで何度でも
+ * [acquireWifiFd]/[acquireCellularFd]を呼んでよい(呼ぶたびに新規fdを取得する、fd所有権
+ * ポリシー)。[close]後の呼び出しはnullを返し、新規リソースを確保しない。
+ */
+interface RebindFdSource : AutoCloseable {
+    /** #10/#20: WiFiに明示的にバインドしたソケットの生fdとローカルIPを取得する。取得できなければnull。 */
+    suspend fun acquireWifiFd(): Pair<Int, String>?
+    /** セルラーに明示的にバインドしたソケットの生fdとローカルIPを取得する。取得できなければnull。 */
+    suspend fun acquireCellularFd(): Pair<Int, String>?
+}
