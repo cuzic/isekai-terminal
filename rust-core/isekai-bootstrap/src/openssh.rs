@@ -422,7 +422,8 @@ impl OpenSshBackend {
         // helper process never releases, found via a real hang in this
         // module's own e2e tests before this fix.
         let cmd = format!(
-            r#"umask 077
+            r#"set -x
+umask 077
 mkdir -p {remote_dir} 2>/dev/null
 exec 9>>{lock_path} 2>/dev/null
 if command -v flock >/dev/null 2>&1; then flock -w 30 9 2>/dev/null || true; fi
