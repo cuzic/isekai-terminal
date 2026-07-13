@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
+import tools.isekai.terminal.data.AuthType
 
 /**
  * 上部バー(タブ行・[TerminalScreenBody]のステータス行)を、操作が無いまま自動で隠すまでの
@@ -224,7 +225,7 @@ private fun TabLabel(
                 showSplitDialog = false
                 val profile = tab.profile
                 val needsPasswordPrompt = profile != null &&
-                    (profile.authType == "password" || (profile.usesJumpHost && profile.jumpAuthType == "password"))
+                    (profile.authTypeEnum == AuthType.PASSWORD || (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD))
                 if (needsPasswordPrompt) {
                     pendingSplitNewDirection = direction
                 } else {
@@ -246,8 +247,8 @@ private fun TabLabel(
         } else {
             PasswordDialog(
                 label = profile.label,
-                showMainField = profile.authType == "password",
-                jumpLabel = if (profile.usesJumpHost && profile.jumpAuthType == "password") profile.jumpHost else null,
+                showMainField = profile.authTypeEnum == AuthType.PASSWORD,
+                jumpLabel = if (profile.usesJumpHost && profile.jumpAuthTypeEnum == AuthType.PASSWORD) profile.jumpHost else null,
                 onDismiss = { pendingSplitNewDirection = null },
                 onConfirm = { password, jumpPassword ->
                     tabsVm.splitPane(tab.tabId, direction, password, jumpPassword)

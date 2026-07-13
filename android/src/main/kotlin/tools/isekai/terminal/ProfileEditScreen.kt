@@ -106,6 +106,56 @@ private fun ForwardDraft.toPortForwardOrNull(): PortForward? {
     }
 }
 
+/**
+ * [TransportPreference]ごとに、[ProfileEditScreen]でどの入力欄・注意書きを表示すべきかを
+ * まとめた純粋なデータ。以前は`transportPreference == TransportPreference.X`の羅列条件が
+ * 画面のあちこちに散らばっており、新しい[TransportPreference]を追加するたびに複数箇所を
+ * 見落とさず更新する必要があった。この構造体1箇所(`forPreference`)にまとめることで、
+ * 表示条件を横断的に確認・テストできるようにする。
+ */
+internal data class TransportUiSpec(
+    /** 自作ヘルパー(isekai-helper)自動配布の注意書きを表示するか。 */
+    val showsHelperAutoDeployNote: Boolean,
+    /** ヘルパーのQUIC待受ポート固定欄を表示するか(上記の一部)。 */
+    val showsHelperBindPortField: Boolean,
+    /** STUNサーバー欄を表示するか(ISEKAI_STUN_P2P_QUIC選択時のみ)。 */
+    val showsStunFields: Boolean,
+    /** relayアドレス/SNI/JWT欄を表示するか(ISEKAI_LINK_RELAY_QUIC選択時のみ)。
+     *  保存可否([ProfileEditScreen]の`canSave`)の判定にもこの値を使う
+     *  (これらのフィールドが必須になるのはこの場合だけのため)。 */
+    val showsRelayFields: Boolean,
+    /** 直接到達アドレス・物理マルチパス・upstream failover欄を表示するか
+     *  (ISEKAI_PIPE_QUIC_MULTIPATH選択時のみ)。 */
+    val showsMultipathFields: Boolean,
+    /** tsshdポート欄を表示するか(TSSHD_QUIC選択時のみ)。 */
+    val showsTsshdPortField: Boolean,
+    /** 保存時、後方互換の`ConnectionProfile.useTsshd`カラムに書き込む値。 */
+    val usesTsshdColumn: Boolean,
+) {
+    companion object {
+        fun forPreference(preference: TransportPreference): TransportUiSpec {
+            val usesHelper = preference == TransportPreference.ISEKAI_PIPE_QUIC ||
+                preference == TransportPreference.AUTO ||
+                preference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH ||
+                preference == TransportPreference.ISEKAI_STUN_P2P_QUIC ||
+                preference == TransportPreference.ISEKAI_LINK_RELAY_QUIC
+            val usesHelperBindPort = preference == TransportPreference.ISEKAI_PIPE_QUIC ||
+                preference == TransportPreference.AUTO ||
+                preference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH
+            val isTsshd = preference == TransportPreference.TSSHD_QUIC
+            return TransportUiSpec(
+                showsHelperAutoDeployNote = usesHelper,
+                showsHelperBindPortField = usesHelperBindPort,
+                showsStunFields = preference == TransportPreference.ISEKAI_STUN_P2P_QUIC,
+                showsRelayFields = preference == TransportPreference.ISEKAI_LINK_RELAY_QUIC,
+                showsMultipathFields = preference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH,
+                showsTsshdPortField = isTsshd,
+                usesTsshdColumn = isTsshd,
+            )
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileEditScreen(
@@ -132,6 +182,7 @@ fun ProfileEditScreen(
     var keyId by remember { mutableStateOf(profile?.keyId) }
     var keyMenuExpanded by remember { mutableStateOf(false) }
     var transportPreference by remember { mutableStateOf(profile?.transportPreference ?: TransportPreference.AUTO) }
+    val transportUiSpec = remember(transportPreference) { TransportUiSpec.forPreference(transportPreference) }
     // 「Smart SSH」以外(=詳細設定側)を既に使っているプロファイルを編集する場合は、
     // 設定を見失わせないよう最初から詳細設定を展開しておく。
     var showAdvancedTransport by remember {
@@ -174,7 +225,7 @@ fun ProfileEditScreen(
             jumpHost.isNotBlank() && jumpUsername.isNotBlank() &&
                 (jumpAuthType == "password" || jumpKeyId != null)
         )) &&
-        (transportPreference != TransportPreference.ISEKAI_LINK_RELAY_QUIC || (
+        (!transportUiSpec.showsRelayFields || (
             relayAddr.isNotBlank() && relaySni.isNotBlank() && relayJwt.isNotBlank()
         )) &&
         helperBindPortValid
@@ -467,12 +518,7 @@ fun ProfileEditScreen(
             }
         }
 
-        if (transportPreference == TransportPreference.ISEKAI_PIPE_QUIC ||
-            transportPreference == TransportPreference.AUTO ||
-            transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH ||
-            transportPreference == TransportPreference.ISEKAI_STUN_P2P_QUIC ||
-            transportPreference == TransportPreference.ISEKAI_LINK_RELAY_QUIC
-        ) {
+        if (transportUiSpec.showsHelperAutoDeployNote) {
             Text(
                 text = "初回接続時に SSH 経由で自作ヘルパー（isekai-helper）を自動配布・起動します" +
                     "（対応 OS: Linux x86_64 / aarch64）。",
@@ -481,10 +527,7 @@ fun ProfileEditScreen(
             )
         }
 
-        if (transportPreference == TransportPreference.ISEKAI_PIPE_QUIC ||
-            transportPreference == TransportPreference.AUTO ||
-            transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH
-        ) {
+        if (transportUiSpec.showsHelperBindPortField) {
             OutlinedTextField(
                 value = helperBindPort,
                 onValueChange = { new -> helperBindPort = new.filter { it.isDigit() }.take(5) },
@@ -503,7 +546,7 @@ fun ProfileEditScreen(
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            if (transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH &&
+            if (transportUiSpec.showsMultipathFields &&
                 directAddress.isNotBlank() && helperBindPort.isBlank()
             ) {
                 Text(
@@ -523,7 +566,7 @@ fun ProfileEditScreen(
             }
         }
 
-        if (transportPreference == TransportPreference.ISEKAI_STUN_P2P_QUIC) {
+        if (transportUiSpec.showsStunFields) {
             OutlinedTextField(
                 value = stunServer,
                 onValueChange = { stunServer = it },
@@ -545,7 +588,7 @@ fun ProfileEditScreen(
             )
         }
 
-        if (transportPreference == TransportPreference.ISEKAI_LINK_RELAY_QUIC) {
+        if (transportUiSpec.showsRelayFields) {
             OutlinedTextField(
                 value = relayAddr,
                 onValueChange = { relayAddr = it },
@@ -576,7 +619,7 @@ fun ProfileEditScreen(
             )
         }
 
-        if (transportPreference == TransportPreference.ISEKAI_PIPE_QUIC_MULTIPATH) {
+        if (transportUiSpec.showsMultipathFields) {
             OutlinedTextField(
                 value = directAddress,
                 onValueChange = { directAddress = it },
@@ -649,7 +692,7 @@ fun ProfileEditScreen(
             )
         }
 
-        if (transportPreference == TransportPreference.TSSHD_QUIC) {
+        if (transportUiSpec.showsTsshdPortField) {
             OutlinedTextField(
                 value = tsshdPort,
                 onValueChange = { new -> tsshdPort = new.filter { it.isDigit() }.take(5) },
@@ -870,7 +913,7 @@ fun ProfileEditScreen(
                         authType = authType,
                         keyId = if (authType == "key") keyId else null,
                         sortOrder = profile?.sortOrder ?: 0,
-                        useTsshd = transportPreference == TransportPreference.TSSHD_QUIC,
+                        useTsshd = transportUiSpec.usesTsshdColumn,
                         tsshdPort = tsshdPort.toIntOrNull() ?: ConnectionProfile.DEFAULT_TSSHD_PORT,
                         transportPreferenceName = transportPreference.name,
                         directAddress = directAddress.trim().takeIf { it.isNotBlank() },
