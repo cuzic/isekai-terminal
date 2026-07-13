@@ -163,7 +163,15 @@ mod tests {
     /// fallback in `sweep_stale_sockets` exists for rarer, genuinely
     /// ambiguous `connect()` outcomes (e.g. a permission error), not for
     /// this case.
-    #[cfg(unix)]
+    ///
+    /// Linux-only: confirmed on a real `test-macos` CI run that macOS's
+    /// kernel does *not* share this quirk (`connect()` to a non-socket path
+    /// there fails with something other than `ECONNREFUSED`), so
+    /// `is_abandoned` correctly falls through to `false` and this specific
+    /// case relies on the mtime fallback instead — exactly the "genuinely
+    /// ambiguous outcome" case this module's docs already describe, just
+    /// with a wider set of platforms hitting it than originally assumed.
+    #[cfg(target_os = "linux")]
     #[test]
     fn is_abandoned_is_true_for_a_plain_file_at_the_socket_path_too() {
         let dir = tempfile::tempdir().unwrap();
