@@ -165,6 +165,7 @@ impl server::Handler for FakeShellHandler {
                 tokio::join!(read_all(&mut child_stdout), read_all(&mut child_stderr), child.wait());
 
             if let Ok(out) = stdout_res {
+                eprintln!("DEBUGSTDOUT>>>{}<<<DEBUGSTDOUT", String::from_utf8_lossy(&out));
                 if !out.is_empty() {
                     let _ = handle.data(channel, CryptoVec::from(out)).await;
                 }
