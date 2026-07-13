@@ -457,6 +457,9 @@ class TerminalTabsViewModel(
 
         target.openSplit(pane, direction)
         watchPane(target, pane)
+        // 「分割時は全ペインに同じテーマを適用する」原則(TabState.currentThemeのコメント参照)
+        // に合わせ、移動してきたペインにも移動先タブのテーマを揃える。
+        pushThemeToSession(pane, target.currentTheme.value)
         updateSessionsSummary()
         return true
     }

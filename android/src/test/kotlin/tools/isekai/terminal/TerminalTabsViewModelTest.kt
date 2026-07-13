@@ -572,6 +572,28 @@ class TerminalTabsViewModelTest {
     }
 
     @Test
+    fun splitPaneWithExistingTab_pushesTargetTabThemeToMovedPane() = runBlocking {
+        val targetId = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        awaitSetSessionThemeCalled(orchestrators[0])
+        vm.setTabTheme(targetId, tools.isekai.terminal.ui.TerminalThemes.NORD)
+
+        val sourceId = vm.openTab(profile("b"), "pass")
+        awaitConnectCalled(orchestrators[1])
+        awaitSetSessionThemeCalled(orchestrators[1])
+        val callsBefore = orchestrators[1].setSessionThemeCalls.size
+
+        val moved = vm.splitPaneWithExistingTab(targetId, SplitDirection.VERTICAL, sourceId)
+
+        assertTrue(moved)
+        assertEquals(callsBefore + 1, orchestrators[1].setSessionThemeCalls.size)
+        val (ansi16, fg, bg) = orchestrators[1].setSessionThemeCalls.last()
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD.ansi16Argb(), ansi16)
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD.foregroundArgb(), fg)
+        assertEquals(tools.isekai.terminal.ui.TerminalThemes.NORD.backgroundArgb(), bg)
+    }
+
+    @Test
     fun applyGlobalThemeToNonOverriddenTabs_skipsOverriddenTabs() = runBlocking {
         val followingId = vm.openTab(profile("a"), "pass")
         awaitConnectCalled(orchestrators[0])
