@@ -71,6 +71,9 @@ import uniffi.isekai_terminal_core.PlatformFd
  */
 enum class SplitDirection { HORIZONTAL, VERTICAL }
 
+/** タブ横断で1つのペインを一意に指す座標(Task #13: tab-level/pane-level二重APIの統一)。 */
+data class PaneAddress(val tabId: String, val paneId: String)
+
 /**
  * 1ペイン分の状態。画面分割(split pane)機能により、1タブの中に複数ペイン(まずは最大2つ)を
  * 持てるようにするための単位。各ペインは完全に独立した [TerminalSession](ひいては独立した
@@ -483,8 +486,8 @@ class TerminalTabsViewModel(
     }
 
     /** タップ操作等でペインのフォーカス（キーボード入力・モーダルUIの宛先）を切り替える。 */
-    fun setFocusedPane(tabId: String, paneId: String) {
-        tabOrNull(tabId)?.setFocusedPane(paneId)
+    fun setFocusedPane(address: PaneAddress) {
+        tabOrNull(address.tabId)?.setFocusedPane(address.paneId)
     }
 
     /**
@@ -577,17 +580,11 @@ class TerminalTabsViewModel(
 
     // ── 接続 ─────────────────────────────────────────────────────────
 
-    /** 未分割時は主ペイン、分割時はフォーカス中のペインを再接続する(後方互換。実体は[reconnectPane])。 */
-    fun reconnect(tabId: String, password: String? = null, jumpPassword: String? = null) {
-        val tab = tabOrNull(tabId) ?: return
-        reconnectPane(tabId, tab.focusedPane.paneId, password, jumpPassword)
-    }
-
     /** ペインを明示指定して再接続する。画面分割時、各ペインは自分自身の「再接続」ボタンを
-     *  持つため(フォーカスに関わらず両ペインとも常に表示される)、こちらが実体。 */
-    fun reconnectPane(tabId: String, paneId: String, password: String? = null, jumpPassword: String? = null) {
-        val tab = tabOrNull(tabId) ?: return
-        val pane = tab.paneOrNull(paneId) ?: return
+     *  持つため(フォーカスに関わらず両ペインとも常に表示される)。 */
+    fun reconnectPane(address: PaneAddress, password: String? = null, jumpPassword: String? = null) {
+        val tab = tabOrNull(address.tabId) ?: return
+        val pane = tab.paneOrNull(address.paneId) ?: return
         val profile = tab.profile ?: return
         connectionCoordinator.connectPane(tab.tabId, tab.currentTheme.value, pane, profile, password, jumpPassword)
     }
@@ -623,27 +620,15 @@ class TerminalTabsViewModel(
 
     // ── 定型コマンド（スニペット）─────────────────────────────────
 
-    /** [profileId] が null なら全プロファイル共通のスニペットのみ、非nullなら共通＋専用をマージして読み込む。
-     *  未分割時は主ペイン、分割時はフォーカス中のペインのスニペット一覧を差し替える。 */
-    fun loadSnippets(tabId: String, profileId: Long?) {
-        val tab = tabOrNull(tabId) ?: return
-        loadSnippetsForPane(tab.focusedPane, profileId)
-    }
-
     private fun loadSnippetsForPane(pane: PaneState, profileId: Long?) {
         viewModelScope.launch(ioDispatcher) {
             pane.snippets.value = Repositories.snippets.getForProfile(profileId)
         }
     }
 
-    fun sendSnippetToPane(tabId: String, paneId: String, snippet: Snippet) {
-        RemoteLogger.i("IsekaiTerminalSnippet", "send snippet '${snippet.label}' id=${snippet.id} tab=$tabId pane=$paneId")
-        sendToPane(tabId, paneId, SnippetCommands.toBytes(snippet))
-    }
-
-    fun sendSnippet(tabId: String, snippet: Snippet) {
-        RemoteLogger.i("IsekaiTerminalSnippet", "send snippet '${snippet.label}' id=${snippet.id} tab=$tabId")
-        send(tabId, SnippetCommands.toBytes(snippet))
+    fun sendSnippetToPane(address: PaneAddress, snippet: Snippet) {
+        RemoteLogger.i("IsekaiTerminalSnippet", "send snippet '${snippet.label}' id=${snippet.id} tab=${address.tabId} pane=${address.paneId}")
+        sendToPane(address, SnippetCommands.toBytes(snippet))
     }
 
     // ── 接続後自動実行コマンド ────────────────────────────────────
@@ -664,83 +649,45 @@ class TerminalTabsViewModel(
         }
     }
 
-    private fun paneOrNull(tabId: String, paneId: String): PaneState? = tabOrNull(tabId)?.paneOrNull(paneId)
+    private fun paneOrNull(address: PaneAddress): PaneState? = tabOrNull(address.tabId)?.paneOrNull(address.paneId)
 
-    // ── セッション操作（ペイン指定が実体。タブ指定のものはフォーカス中のペインへの
-    //    薄い委譲で、後方互換のため残してある）─────────────────────────
-    // 画面分割時、両ペインは同時に見えるため「タブ指定」APIだけでは片方のペインの操作を
+    /** [address]が指すpaneが存在すれば[block]を実行してその結果を返す。存在しなければnull。 */
+    private fun <T> withPane(address: PaneAddress, block: (PaneState) -> T): T? = paneOrNull(address)?.let(block)
+
+    // ── セッション操作(すべてPaneAddress指定。Task #13でtab-level互換APIは削除した)──
+    // 画面分割時、両ペインは同時に見えるため「タブ指定」だけでは片方のペインの操作を
     // 表現できない(ステータスバーの再接続/切断/ログボタン・リサイズ・scrollback・キャンバスの
-    // タップは常にそのペイン自身に向く)。そのためUI([TerminalHostScreen])は常にペイン指定
-    // APIを使う。一方 trzsz転送シート・host key確認ダイアログ等の「フォーカス中のペインに
-    // だけ表示する」モーダルUIも、実際にはフォーカスを持つペイン自身が自分のpaneIdを使って
-    // これらのペイン指定APIを直接呼ぶ(hasFocus=falseの間はそもそも描画されないため、
-    // 結果的にフォーカス中のペインだけが呼べる)。
-    // 未分割タブでは常に主ペイン = フォーカス中のペインなので、タブ指定APIは既存の
-    // 呼び出し元・テストと完全に同じ挙動になる。
+    // タップは常にそのペイン自身に向く)。UI([TerminalHostScreen])は常にペイン指定APIを使う。
 
-    fun sendToPane(tabId: String, paneId: String, bytes: ByteArray) = paneOrNull(tabId, paneId)?.session?.send(bytes)
+    fun sendToPane(address: PaneAddress, bytes: ByteArray) = withPane(address) { it.session.send(bytes) }
 
-    fun send(tabId: String, bytes: ByteArray) = tabOrNull(tabId)?.let { sendToPane(tabId, it.focusedPane.paneId, bytes) }
+    fun disconnectPane(address: PaneAddress) = withPane(address) { it.session.disconnect() }
 
-    fun disconnectPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.disconnect()
+    /** 自動再接続ループ(isReconnecting中)を中止する。 */
+    fun cancelReconnectPane(address: PaneAddress) = withPane(address) { it.session.cancelReconnect() }
 
-    /** 自動再接続ループ(isReconnecting中)を中止する。フォーカス中のペインに対して行う。 */
-    fun cancelReconnectPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.cancelReconnect()
+    fun resizePane(address: PaneAddress, cols: UInt, rows: UInt) = withPane(address) { it.session.resize(cols, rows) }
 
-    fun cancelReconnect(tabId: String) = tabOrNull(tabId)?.let { cancelReconnectPane(tabId, it.focusedPane.paneId) }
+    fun scrollbackCellsForPane(address: PaneAddress, offset: Int, rows: Int): List<CellData>? =
+        withPane(address) { it.session.scrollbackCells(offset, rows) }
 
-    /** #14: ユーザーが「今すぐWiFiに戻す」を要求した。判断はRust側(RebindManager)が行う。フォーカス中のペインに対して行う。 */
-    fun forceReturnToWifi(tabId: String) =
-        tabOrNull(tabId)?.let { paneOrNull(tabId, it.focusedPane.paneId)?.session?.forceReturnToWifi() }
+    fun trustUpdatedHostKeyForPane(address: PaneAddress) = withPane(address) { it.session.trustUpdatedHostKey() }
 
-    fun scrollbackCells(tabId: String, offset: Int, rows: Int): List<CellData>? =
-        tabOrNull(tabId)?.let { scrollbackCellsForPane(tabId, it.focusedPane.paneId, offset, rows) }
+    fun dismissHostKeyWarningForPane(address: PaneAddress) = withPane(address) { it.session.dismissHostKeyWarning() }
 
-    fun disconnect(tabId: String) = tabOrNull(tabId)?.let { disconnectPane(tabId, it.focusedPane.paneId) }
+    fun trustNewHostKeyForPane(address: PaneAddress) = withPane(address) { it.session.trustNewHostKey() }
 
-    // ── リサイズ・scrollback(フォーカスに関わらずペインごとに独立して呼ぶ必要がある)──
+    fun dismissNewHostKeyPromptForPane(address: PaneAddress) = withPane(address) { it.session.dismissNewHostKeyPrompt() }
 
-    fun resizePane(tabId: String, paneId: String, cols: UInt, rows: UInt) =
-        paneOrNull(tabId, paneId)?.session?.resize(cols, rows)
+    fun respondAgentSignRequestForPane(address: PaneAddress, approved: Boolean) =
+        withPane(address) { it.session.respondAgentSignRequest(approved) }
 
-    fun scrollbackCellsForPane(tabId: String, paneId: String, offset: Int, rows: Int): List<CellData>? =
-        paneOrNull(tabId, paneId)?.session?.scrollbackCells(offset, rows)
-
-    fun trustUpdatedHostKeyForPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.trustUpdatedHostKey()
-
-    fun trustUpdatedHostKey(tabId: String) = tabOrNull(tabId)?.let { trustUpdatedHostKeyForPane(tabId, it.focusedPane.paneId) }
-
-    fun dismissHostKeyWarningForPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.dismissHostKeyWarning()
-
-    fun dismissHostKeyWarning(tabId: String) = tabOrNull(tabId)?.let { dismissHostKeyWarningForPane(tabId, it.focusedPane.paneId) }
-
-    fun trustNewHostKeyForPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.trustNewHostKey()
-
-    fun trustNewHostKey(tabId: String) = tabOrNull(tabId)?.let { trustNewHostKeyForPane(tabId, it.focusedPane.paneId) }
-
-    fun dismissNewHostKeyPromptForPane(tabId: String, paneId: String) =
-        paneOrNull(tabId, paneId)?.session?.dismissNewHostKeyPrompt()
-
-    fun dismissNewHostKeyPrompt(tabId: String) =
-        tabOrNull(tabId)?.let { dismissNewHostKeyPromptForPane(tabId, it.focusedPane.paneId) }
-
-    fun respondAgentSignRequestForPane(tabId: String, paneId: String, approved: Boolean) =
-        paneOrNull(tabId, paneId)?.session?.respondAgentSignRequest(approved)
-
-    fun respondAgentSignRequest(tabId: String, approved: Boolean) =
-        tabOrNull(tabId)?.let { respondAgentSignRequestForPane(tabId, it.focusedPane.paneId, approved) }
-
-    fun getSessionLogForPane(tabId: String, paneId: String): String = paneOrNull(tabId, paneId)?.session?.log?.value ?: ""
-
-    fun getSessionLog(tabId: String): String =
-        tabOrNull(tabId)?.let { getSessionLogForPane(tabId, it.focusedPane.paneId) } ?: ""
-
-    fun clearSessionLog(tabId: String) = tabOrNull(tabId)?.focusedPane?.session?.clearLog()
+    fun getSessionLogForPane(address: PaneAddress): String = withPane(address) { it.session.log.value } ?: ""
 
     // ── trzsz（Android ファイル I/O は executor 経由。ペインごとに二重起動防止）───
 
-    fun trzszStartUploadForPane(tabId: String, paneId: String, uri: Uri) {
-        val pane = paneOrNull(tabId, paneId) ?: return
+    fun trzszStartUploadForPane(address: PaneAddress, uri: Uri) {
+        val pane = paneOrNull(address) ?: return
         if (pane.session.state.value.trzszState !is TrzszUiState.WaitingUser) return
         if (!pane.uploadInProgress.compareAndSet(false, true)) return
         viewModelScope.launch(ioDispatcher) {
@@ -768,29 +715,15 @@ class TerminalTabsViewModel(
         }
     }
 
-    fun trzszStartUpload(tabId: String, uri: Uri) {
-        val tab = tabOrNull(tabId) ?: return
-        trzszStartUploadForPane(tabId, tab.focusedPane.paneId, uri)
-    }
-
-    fun trzszStartDownloadForPane(tabId: String, paneId: String) {
-        val pane = paneOrNull(tabId, paneId) ?: return
+    fun trzszStartDownloadForPane(address: PaneAddress) {
+        val pane = paneOrNull(address) ?: return
         if (pane.session.state.value.trzszState !is TrzszUiState.WaitingUser) return
         pane.session.trzszAcceptDownload()
     }
 
-    fun trzszStartDownload(tabId: String) {
-        val tab = tabOrNull(tabId) ?: return
-        trzszStartDownloadForPane(tabId, tab.focusedPane.paneId)
-    }
+    fun trzszCancelForPane(address: PaneAddress) = withPane(address) { it.session.trzszCancel() }
 
-    fun trzszCancelForPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.trzszCancel()
-
-    fun trzszCancel(tabId: String) = tabOrNull(tabId)?.let { trzszCancelForPane(tabId, it.focusedPane.paneId) }
-
-    fun trzszDismissForPane(tabId: String, paneId: String) = paneOrNull(tabId, paneId)?.session?.trzszDismiss()
-
-    fun trzszDismiss(tabId: String) = tabOrNull(tabId)?.let { trzszDismissForPane(tabId, it.focusedPane.paneId) }
+    fun trzszDismissForPane(address: PaneAddress) = withPane(address) { it.session.trzszDismiss() }
 
     // ── ライフサイクル ──────────────────────────────────────────────
 

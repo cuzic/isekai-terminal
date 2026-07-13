@@ -398,6 +398,7 @@ private fun TerminalPaneScreen(
 ) {
     val tabId = tab.tabId
     val paneId = pane.paneId
+    val address = PaneAddress(tabId, paneId)
     val uiState by pane.uiState.collectAsStateWithLifecycle(initialValue = TerminalUiState())
     val snippets by pane.snippets.collectAsStateWithLifecycle()
 
@@ -415,27 +416,27 @@ private fun TerminalPaneScreen(
                 chromeVisible = chromeVisible,
                 onUserActivity = onUserActivity,
                 actions = TerminalScreenActions(
-                    onConnect = { tabsVm.reconnectPane(tabId, paneId) },
-                    onDisconnect = { tabsVm.disconnectPane(tabId, paneId) },
-                    onCancelReconnect = { tabsVm.cancelReconnectPane(tabId, paneId) },
+                    onConnect = { tabsVm.reconnectPane(address) },
+                    onDisconnect = { tabsVm.disconnectPane(address) },
+                    onCancelReconnect = { tabsVm.cancelReconnectPane(address) },
                     // タブ内の「戻る」/切断確認ダイアログはタブを閉じる（＝タブ行の × と同じ操作）。
                     // 全タブが閉じられると呼び出し側 (TerminalHostScreen) が自動でリストへ戻る。
                     onBack = onCloseTab,
-                    onSend = { bytes -> tabsVm.sendToPane(tabId, paneId, bytes) },
-                    onResize = { cols, rows -> tabsVm.resizePane(tabId, paneId, cols, rows) },
-                    onScrollbackCells = { offset, rows -> tabsVm.scrollbackCellsForPane(tabId, paneId, offset, rows) },
-                    onTrustUpdatedHostKey = { tabsVm.trustUpdatedHostKeyForPane(tabId, paneId) },
-                    onDismissHostKeyWarning = { tabsVm.dismissHostKeyWarningForPane(tabId, paneId) },
-                    onTrustNewHostKey = { tabsVm.trustNewHostKeyForPane(tabId, paneId) },
-                    onDismissNewHostKeyPrompt = { tabsVm.dismissNewHostKeyPromptForPane(tabId, paneId) },
-                    onTrzszStartUpload = { uri -> tabsVm.trzszStartUploadForPane(tabId, paneId, uri) },
-                    onTrzszStartDownload = { tabsVm.trzszStartDownloadForPane(tabId, paneId) },
-                    onTrzszCancel = { tabsVm.trzszCancelForPane(tabId, paneId) },
-                    onTrzszDismiss = { tabsVm.trzszDismissForPane(tabId, paneId) },
-                    onGetSessionLog = { tabsVm.getSessionLogForPane(tabId, paneId) },
-                    onSendSnippet = { snippet -> tabsVm.sendSnippetToPane(tabId, paneId, snippet) },
-                    onRespondAgentSignRequest = { approved -> tabsVm.respondAgentSignRequestForPane(tabId, paneId, approved) },
-                    onRequestFocus = { tabsVm.setFocusedPane(tabId, paneId) },
+                    onSend = { bytes -> tabsVm.sendToPane(address, bytes) },
+                    onResize = { cols, rows -> tabsVm.resizePane(address, cols, rows) },
+                    onScrollbackCells = { offset, rows -> tabsVm.scrollbackCellsForPane(address, offset, rows) },
+                    onTrustUpdatedHostKey = { tabsVm.trustUpdatedHostKeyForPane(address) },
+                    onDismissHostKeyWarning = { tabsVm.dismissHostKeyWarningForPane(address) },
+                    onTrustNewHostKey = { tabsVm.trustNewHostKeyForPane(address) },
+                    onDismissNewHostKeyPrompt = { tabsVm.dismissNewHostKeyPromptForPane(address) },
+                    onTrzszStartUpload = { uri -> tabsVm.trzszStartUploadForPane(address, uri) },
+                    onTrzszStartDownload = { tabsVm.trzszStartDownloadForPane(address) },
+                    onTrzszCancel = { tabsVm.trzszCancelForPane(address) },
+                    onTrzszDismiss = { tabsVm.trzszDismissForPane(address) },
+                    onGetSessionLog = { tabsVm.getSessionLogForPane(address) },
+                    onSendSnippet = { snippet -> tabsVm.sendSnippetToPane(address, snippet) },
+                    onRespondAgentSignRequest = { approved -> tabsVm.respondAgentSignRequestForPane(address, approved) },
+                    onRequestFocus = { tabsVm.setFocusedPane(address) },
                     // 物理キーボードの Ctrl+Tab / Ctrl+Shift+Tab によるタブ切替（TerminalInputView 経由）。
                     // 画面分割中でもタブ切替はタブ単位の操作なので、どちらのペインからでも同じ
                     // tabsVm.nextTab()/previousTab() を呼ぶ(ペイン固有の版は不要)。

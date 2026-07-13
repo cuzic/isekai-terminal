@@ -295,7 +295,7 @@ class TerminalTabsViewModelTest {
         orchestrators[0].simulateConnected()
         orchestrators[1].simulateConnected()
 
-        vm.send(idA, byteArrayOf(0x41))
+        vm.sendToPane(PaneAddress(idA, tab(idA).focusedPane.paneId), byteArrayOf(0x41))
 
         assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x41)) })
         assertTrue("tab b's orchestrator must not receive tab a's bytes", orchestrators[1].sentBytes.isEmpty())
@@ -416,8 +416,7 @@ class TerminalTabsViewModelTest {
         orchestrators[0].simulateError("boom")
         withTimeout(3000) { while (tab(id).session.state.value.isConnecting) delay(10) }
 
-        val paneId = tab(id).focusedPane.paneId
-        vm.reconnectPane(id, paneId, "pass")
+        vm.reconnectPane(PaneAddress(id, tab(id).focusedPane.paneId), "pass")
         withTimeout(3000) { while (executor.physicalMultipathHandles.size < 2) delay(10) }
 
         assertTrue("Connected未達のまま再接続すると古いhandleを閉じるべき", executor.physicalMultipathHandles[0].closed)
@@ -479,7 +478,7 @@ class TerminalTabsViewModelTest {
         orchestrators[0].simulateConnected()
         withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
 
-        vm.sendSnippet(id, Snippet(label = "list", command = "ls -la", appendNewline = true))
+        vm.sendSnippetToPane(PaneAddress(id, tab(id).focusedPane.paneId), Snippet(label = "list", command = "ls -la", appendNewline = true))
 
         assertTrue(orchestrators[0].sentBytes.any { it.toString(Charsets.UTF_8) == "ls -la\r" })
     }
@@ -491,7 +490,7 @@ class TerminalTabsViewModelTest {
         orchestrators[0].simulateConnected()
         withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
 
-        vm.sendSnippet(id, Snippet(label = "partial", command = "echo hi", appendNewline = false))
+        vm.sendSnippetToPane(PaneAddress(id, tab(id).focusedPane.paneId), Snippet(label = "partial", command = "echo hi", appendNewline = false))
 
         assertTrue(orchestrators[0].sentBytes.any { it.toString(Charsets.UTF_8) == "echo hi" })
     }
@@ -577,10 +576,11 @@ class TerminalTabsViewModelTest {
             while (orchestrators[0].sentBytes.none { it.toString(Charsets.UTF_8) == "echo hi\r" }) delay(20)
         }
 
-        vm.disconnect(id)
+        val address = PaneAddress(id, tab(id).focusedPane.paneId)
+        vm.disconnectPane(address)
         withTimeout(3000) { while (tab(id).session.state.value.connected) delay(10) }
 
-        vm.reconnect(id, "pass")
+        vm.reconnectPane(address, "pass")
         orchestrators[0].simulateConnected()
         withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
         testScheduler.advanceUntilIdle()
