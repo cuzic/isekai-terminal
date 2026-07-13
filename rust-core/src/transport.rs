@@ -1824,7 +1824,7 @@ mod pooling_e2e_tests {
                 Ok(Some(TestEvent::Connection(ConnectionPublicState::Error { message }))) => {
                     panic!("connection reported Error before Connected: {message}");
                 }
-                Ok(Some(TestEvent::Connection(ConnectionPublicState::Disconnected { reason }))) => {
+                Ok(Some(TestEvent::Connection(ConnectionPublicState::Disconnected { reason, .. }))) => {
                     panic!("connection reported Disconnected before Connected: {reason:?}");
                 }
                 _ => continue,

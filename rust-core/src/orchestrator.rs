@@ -3,8 +3,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::{
-    CellData, ClipboardPayload, ConnectionPublicState, ForwardState, OrchestratorCallback, ScreenUpdate,
-    SessionCallback, SshConfig, SshError, TrzszPublicState, RUNTIME,
+    CellData, ClipboardPayload, ConnectionIssueHint, ConnectionPublicState, ForwardState, OrchestratorCallback,
+    ScreenUpdate, SessionCallback, SshConfig, SshError, TrzszPublicState, RUNTIME,
 };
 use crate::net_health_policy;
 use crate::quic_transport::{QuicConfig, QuicSession};
@@ -131,6 +131,26 @@ enum ConnPhase {
     Connected,
 }
 
+/// #20: アプリのバックグラウンド遷移とセッション再接続要否のSSOT。
+/// `session_supervisor.rs`が実装していた`SessionState`×`ExecutionMode`の8状態FSMを、
+/// `SessionOrchestrator`本体の`ConnPhase`/`last_connect_attempt`と統合する形で
+/// 必要最小限に絞り込んだもの(`Closing`/`Closed`はSwift/Kotlinの`disconnect()`と
+/// アプリ終了処理で十分カバーされるため持たない、`Connecting`/`Resuming`は既存の
+/// `ConnPhase`で表現済み)。UniFFIへは公開しない(Kotlin/Swiftは生イベントを送るだけで
+/// よく、この状態自体を読んで分岐してはいけない、`rust-ssot.md`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundState {
+    /// フォアグラウンド相当、またはバックグラウンド遷移がそもそも意味を持たない
+    /// (未接続・既に切断済み等)。
+    Foreground,
+    /// バックグラウンドへ遷移したが、まだ猶予(`budget_ms`)内。接続は生きている
+    /// 前提でそのまま維持を試みる。
+    Quiescing,
+    /// バックグラウンド猶予が尽きた、またはメモリ逼迫警告を受けた。次の
+    /// フォアグラウンド復帰時には接続が失われている前提で自動的に再接続する。
+    Suspended,
+}
+
 /// 直前に成功した(あるいは試みた)`connect_*`の種類とConfigを保持し、予期しない
 /// 切断時に同じ接続を自動的に張り直せるようにする(tssh のUDPモード reconnect相当)。
 /// 全Configは既に`Clone`実装済みなので、そのまま複製して再利用できる。
@@ -157,6 +177,47 @@ impl LastConnectAttempt {
             Self::MultipathIsekaiPipeQuic(c) => (c.ssh_host.clone(), c.ssh_port, true),
             Self::IsekaiStunP2p(c) => (c.ssh_host.clone(), c.ssh_port, true),
             Self::IsekaiLinkRelay(c) => (c.ssh_host.clone(), c.ssh_port, true),
+        }
+    }
+
+    /// #19: Local Network Privacyヒント判定の材料として使う、この接続試行が
+    /// 使ったプライベートLANアドレス候補。`MultipathIsekaiPipeQuic`は
+    /// `direct_host`(Tailscaleを介さない直接到達アドレス)こそが本来の狙い
+    /// なのでそちらを優先し、無ければ主ホストにフォールバックする。
+    fn local_network_candidate_host(&self) -> String {
+        if let Self::MultipathIsekaiPipeQuic(c) = self {
+            if let Some(direct) = &c.direct_host {
+                return direct.clone();
+            }
+        }
+        self.host_port_is_quic().0
+    }
+}
+
+/// #19: 接続失敗の原因がiOSのLocal Network Privacy拒否である可能性を示す
+/// ヒントを判定する。`attempt`が指すアドレスがプライベート/リンクローカル
+/// (またはBonjourの`.local`名)であればヒントを付ける。
+fn classify_disconnect_issue_hint(attempt: Option<&LastConnectAttempt>) -> Option<ConnectionIssueHint> {
+    let host = attempt?.local_network_candidate_host();
+    looks_like_local_network_target(&host).then_some(ConnectionIssueHint::LocalNetworkPermissionPossiblyDenied)
+}
+
+fn looks_like_local_network_target(host: &str) -> bool {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => is_private_or_link_local(ip),
+        // 大文字小文字を区別しないDNS名の性質上"MacBook.LOCAL"、末尾ドット付きの
+        // "host.local."(FQDN表記)も同じmDNS名として扱う(codexレビュー指摘)。
+        Err(_) => host.trim_end_matches('.').to_ascii_lowercase().ends_with(".local"),
+    }
+}
+
+fn is_private_or_link_local(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link local
         }
     }
 }
@@ -238,6 +299,8 @@ struct OrchestratorState {
     last_connect_attempt: Option<LastConnectAttempt>,
     /// 再接続ループのタイミング。テストでは短い値に差し替える。
     reconnect_policy: ReconnectPolicy,
+    /// #20: バックグラウンド遷移とセッション再接続要否のSSOT。
+    background_state: BackgroundState,
 }
 
 /// 1回の再接続試行を実行する処理の型。既定は`connect_via`(実際にセッションを
@@ -501,7 +564,7 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
     enum Action {
         Suppress,
         StartLoop(LastConnectAttempt, u64),
-        NotifyDisconnected,
+        NotifyDisconnected(Option<ConnectionIssueHint>),
     }
 
     let action = {
@@ -522,10 +585,26 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
                     s.reconnect_epoch += 1;
                     Action::StartLoop(attempt, s.reconnect_epoch)
                 }
-                None => Action::NotifyDisconnected,
+                None => {
+                    // #20: 自動ループが始まらない=以降フォアグラウンド復帰時の
+                    // 自動再接続もこの切断イベントの責務ではなくなる。
+                    s.background_state = BackgroundState::Foreground;
+                    Action::NotifyDisconnected(None)
+                }
             }
         } else {
-            Action::NotifyDisconnected
+            // #19: 一度もConnectedに至らず切断された(=接続試行そのものの失敗)場合
+            // だけLocal Network Privacyヒントの対象にする。Connected後の正常終了/
+            // ユーザー切断ではヒントを付けても意味がない。
+            let issue_hint = if !was_connected {
+                classify_disconnect_issue_hint(s.last_connect_attempt.as_ref())
+            } else {
+                None
+            };
+            // #20: 自動ループが始まらない切断は、バックグラウンド遷移の追跡対象外に戻す
+            // (ユーザー切断・正常終了・そもそも接続失敗だった場合を含む)。
+            s.background_state = BackgroundState::Foreground;
+            Action::NotifyDisconnected(issue_hint)
         }
     };
 
@@ -534,9 +613,9 @@ fn handle_unexpected_disconnect(shared: &Arc<OrchestratorShared>, reason: Option
         Action::StartLoop(attempt, epoch) => {
             spawn_reconnect_loop(shared.clone(), attempt, reason, epoch);
         }
-        Action::NotifyDisconnected => {
+        Action::NotifyDisconnected(issue_hint) => {
             shared.callback.on_connection_state_changed(
-                ConnectionPublicState::Disconnected { reason }
+                ConnectionPublicState::Disconnected { reason, issue_hint }
             );
         }
     }
@@ -654,6 +733,7 @@ fn spawn_reconnect_loop(
                         "reconnect timed out after {timeout_secs}s (last: {})",
                         reason.clone().unwrap_or_else(|| "unknown".to_string())
                     )),
+                    issue_hint: classify_disconnect_issue_hint(Some(&attempt)),
                 });
                 return;
             }
@@ -714,6 +794,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
             user_initiated_disconnect: false,
             last_connect_attempt: None,
             reconnect_policy: ReconnectPolicy::default(),
+            background_state: BackgroundState::Foreground,
         }),
         callback: Arc::from(callback),
         session: Mutex::new(None),
@@ -750,6 +831,9 @@ impl SessionOrchestrator {
             s.reconnect_epoch += 1;
             s.reconnect_loop_active = false;
             s.retry_attempt_in_flight = false;
+            // #20: 手動接続はフォアグラウンドの操作でしか起こり得ない。直前の
+            // バックグラウンド遷移状態は無関係になる。
+            s.background_state = BackgroundState::Foreground;
         }
         // 新しい接続試行が始まった時点で、直前のセッションに対して保留中だった
         // network-path debounceは無効化する。そうしないと、瞬断のdebounce待機中に
@@ -863,6 +947,7 @@ impl SessionOrchestrator {
             self.shared.callback.on_connection_state_changed(
                 ConnectionPublicState::Disconnected {
                     reason: Some("reconnect cancelled by user".to_string()),
+                    issue_hint: None,
                 }
             );
         }
@@ -874,6 +959,87 @@ impl SessionOrchestrator {
     pub fn rebind_to_fd(&self, fd: i32, local_ip: String) {
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.rebind_to_fd(fd, local_ip);
+        }
+    }
+
+    // ── #20: バックグラウンド/フォアグラウンド遷移 ─────────────
+    //
+    // Kotlin/Swiftはこの4メソッドへOS由来の生イベントをそのまま転送するだけでよい
+    // (`rust-ssot.md`)。「今すぐ再接続すべきか」の判断・実行は全てRust側(以下)が担う。
+
+    /// アプリがバックグラウンドへ遷移した(iOSの`UIApplication.didEnterBackground`/
+    /// Androidの`ProcessLifecycleOwner.onStop`相当)ことを通知する。`budget_ms`は
+    /// `beginBackgroundTask`等が保証する猶予の目安として記録目的で受け取るが、
+    /// 実際の期限管理(タイマー)はSwift/Kotlin側の責務のままにする(Rust/Swiftで
+    /// 基準時計を共有していないため)。`Connected`または`Connecting`中のみ猶予追跡を
+    /// 開始する(`Idle`は維持すべきセッションが無いので無視。`Connecting`中に
+    /// バックグラウンド化し、その猶予中に接続が成立するケース(`on_connected()`
+    /// 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
+    pub fn notify_did_enter_background(&self, _budget_ms: u32) {
+        let mut s = self.shared.state.lock();
+        // #20 codexレビュー指摘: `Connecting`中にバックグラウンド化し、その猶予中に
+        // 接続が成立するケース(`on_connected()`は`background_state`に触れない)も
+        // 追跡対象に含める。`Idle`(そもそも維持すべきセッションが無い)は対象外のまま。
+        if s.phase == ConnPhase::Connected || s.phase == ConnPhase::Connecting {
+            s.background_state = BackgroundState::Quiescing;
+        }
+    }
+
+    /// バックグラウンド猶予が尽きた(`beginBackgroundTask`失効等)ことを通知する。
+    /// 猶予追跡中(`Quiescing`)の場合のみ、次のフォアグラウンド復帰時に再接続が
+    /// 必要な状態(`Suspended`)へ遷移する。
+    pub fn notify_background_budget_expired(&self) {
+        let mut s = self.shared.state.lock();
+        if s.background_state == BackgroundState::Quiescing {
+            s.background_state = BackgroundState::Suspended;
+        }
+    }
+
+    /// メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを終了
+    /// される可能性が高まったとみなし、猶予を待たず保守的に`Suspended`扱いにする
+    /// (無言で固まった画面をユーザーに見せるより、次回復帰時に再接続する方が安全)。
+    pub fn notify_memory_warning(&self) {
+        let mut s = self.shared.state.lock();
+        if s.background_state == BackgroundState::Quiescing {
+            s.background_state = BackgroundState::Suspended;
+        }
+    }
+
+    /// アプリがフォアグラウンドへ復帰した(iOSの`willEnterForeground`/Androidの
+    /// `onStart`相当)ことを通知する。`Suspended`だった場合のみ、直前の接続設定
+    /// (`last_connect_attempt`)で自動的に再接続を試みる(Kotlin/Swiftはこの生
+    /// イベントを送るだけでよく、再接続要否の判断はしない)。既に自動再接続ループが
+    /// 動作中、または他の接続試行が進行中の場合は二重に開始しない。`Quiescing`
+    /// (猶予内復帰、接続は生きている前提)や`Foreground`(そもそも追跡対象外)では
+    /// 何もしない。
+    pub fn notify_will_enter_foreground(&self) {
+        let reconnect_with = {
+            let mut s = self.shared.state.lock();
+            let was_suspended = s.background_state == BackgroundState::Suspended;
+            s.background_state = BackgroundState::Foreground;
+            if was_suspended && !s.reconnect_loop_active && s.phase != ConnPhase::Connecting {
+                s.last_connect_attempt.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(attempt) = reconnect_with {
+            // #20 codexレビュー指摘: `reconnect_attempt`(`connect_via`)は`phase`を
+            // `Connecting`にしてから同期的に失敗し得る(ホスト鍵確認拒否・設定不備等)。
+            // 自動再接続ループ(`spawn_reconnect_loop`)内の失敗は次のtickで暗黙に
+            // リトライされるが、こちらは一回限りの呼び出しなので`Err`を握り潰すと
+            // `phase`が`Connecting`のまま固まり、UIが「接続中…」から進まなくなる。
+            // ループ経由の再試行に頼らず、この場で`Idle`へ戻し失敗を通知する。
+            if let Err(e) = (self.shared.reconnect_attempt)(&self.shared, attempt) {
+                log::warn!("orchestrator: foreground resume reconnect failed synchronously: {e:?}");
+                let mut s = self.shared.state.lock();
+                s.phase = ConnPhase::Idle;
+                drop(s);
+                self.shared.callback.on_connection_state_changed(ConnectionPublicState::Disconnected {
+                    reason: Some(format!("foreground resume reconnect failed: {e}")),
+                    issue_hint: None,
+                });
+            }
         }
     }
 
@@ -1117,6 +1283,7 @@ mod tests {
                 user_initiated_disconnect: false,
                 last_connect_attempt: None,
                 reconnect_policy: ReconnectPolicy::default(),
+                background_state: BackgroundState::Foreground,
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
@@ -1171,6 +1338,7 @@ mod tests {
                 user_initiated_disconnect: false,
                 last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
                 reconnect_policy: policy,
+                background_state: BackgroundState::Foreground,
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
@@ -1216,7 +1384,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            ConnectionPublicState::Disconnected { reason: Some(r) } if r == "network lost"
+            ConnectionPublicState::Disconnected { reason: Some(r), .. } if r == "network lost"
         ));
         assert!(orch.shared.state.lock().phase == ConnPhase::Idle);
     }
@@ -1357,8 +1525,134 @@ mod tests {
         let events = cb.connection_states.lock().unwrap();
         assert!(matches!(
             &events[0],
-            ConnectionPublicState::Disconnected { reason: Some(r) } if r == "peer closed"
+            ConnectionPublicState::Disconnected { reason: Some(r), .. } if r == "peer closed"
         ));
+    }
+
+    // ── #19: Local Network Privacyヒント ──────────────────────
+
+    fn test_multipath_config() -> MultipathIsekaiPipeQuicConfig {
+        MultipathIsekaiPipeQuicConfig {
+            ssh_host: "example.com".to_string(),
+            ssh_port: 22,
+            direct_host: None,
+            cellular_remote_host: None,
+            wifi_fd: None,
+            wifi_local_ip: None,
+            cellular_fd: None,
+            cellular_local_ip: None,
+            username: "tester".to_string(),
+            auth: crate::SshAuth::Password { password: "unused".to_string() },
+            cols: 80,
+            rows: 24,
+            jump: None,
+            bind_port: None,
+        }
+    }
+
+    #[test]
+    fn looks_like_local_network_target_matches_private_link_local_and_mdns() {
+        for host in [
+            "192.168.1.5", "10.0.0.5", "172.20.0.5", "169.254.1.1", "myhost.local", "fd12:3456::1", "fe80::1",
+            // codexレビュー指摘: 大文字小文字・末尾ドット(FQDN表記)の揺れも同じmDNS名として扱う。
+            "MacBook.LOCAL", "myhost.local.",
+        ] {
+            assert!(looks_like_local_network_target(host), "{host} should be classified as local");
+        }
+    }
+
+    #[test]
+    fn looks_like_local_network_target_excludes_public_and_tailscale_addresses() {
+        // 100.64.0.0/10(TailscaleのCGNAT範囲)はRFC1918プライベートではないため、
+        // Local Network Privacyの対象ではない(オーバーレイVPN経由でオンリンクの
+        // ブロードキャストドメインではない) — 誤検知しないことを確認する。
+        for host in ["example.com", "8.8.8.8", "100.64.1.2", "2001:db8::1"] {
+            assert!(!looks_like_local_network_target(host), "{host} should not be classified as local");
+        }
+    }
+
+    #[test]
+    fn classify_disconnect_issue_hint_is_none_without_attempt() {
+        assert_eq!(classify_disconnect_issue_hint(None), None);
+    }
+
+    #[test]
+    fn classify_disconnect_issue_hint_is_none_for_public_host() {
+        let attempt = LastConnectAttempt::Ssh(test_ssh_config());
+        assert_eq!(classify_disconnect_issue_hint(Some(&attempt)), None);
+    }
+
+    #[test]
+    fn classify_disconnect_issue_hint_uses_host_for_plain_ssh() {
+        let mut config = test_ssh_config();
+        config.host = "192.168.1.5".to_string();
+        let attempt = LastConnectAttempt::Ssh(config);
+        assert_eq!(
+            classify_disconnect_issue_hint(Some(&attempt)),
+            Some(ConnectionIssueHint::LocalNetworkPermissionPossiblyDenied)
+        );
+    }
+
+    #[test]
+    fn classify_disconnect_issue_hint_prefers_direct_host_for_multipath() {
+        let mut config = test_multipath_config();
+        config.ssh_host = "my-tailscale-host".to_string();
+        config.direct_host = Some("192.168.1.5".to_string());
+        let attempt = LastConnectAttempt::MultipathIsekaiPipeQuic(config);
+        assert_eq!(
+            classify_disconnect_issue_hint(Some(&attempt)),
+            Some(ConnectionIssueHint::LocalNetworkPermissionPossiblyDenied)
+        );
+    }
+
+    #[test]
+    fn classify_disconnect_issue_hint_falls_back_to_ssh_host_when_direct_host_absent() {
+        let mut config = test_multipath_config();
+        config.ssh_host = "192.168.1.5".to_string();
+        config.direct_host = None;
+        let attempt = LastConnectAttempt::MultipathIsekaiPipeQuic(config);
+        assert_eq!(
+            classify_disconnect_issue_hint(Some(&attempt)),
+            Some(ConnectionIssueHint::LocalNetworkPermissionPossiblyDenied)
+        );
+    }
+
+    #[test]
+    fn on_disconnected_before_ever_connected_carries_hint_for_local_target() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connecting, true);
+        let mut config = test_multipath_config();
+        config.direct_host = Some("192.168.1.5".to_string());
+        shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::MultipathIsekaiPipeQuic(config));
+
+        adapter.on_disconnected(Some("connect failed".to_string()));
+
+        let events = cb.connection_states.lock().unwrap();
+        assert!(matches!(
+            &events[0],
+            ConnectionPublicState::Disconnected {
+                issue_hint: Some(ConnectionIssueHint::LocalNetworkPermissionPossiblyDenied), ..
+            }
+        ));
+    }
+
+    #[test]
+    fn on_disconnected_after_being_connected_never_carries_hint_even_for_local_target() {
+        // 一度Connectedになった後の切断(ここではユーザー切断)は、たとえ接続先が
+        // プライベートアドレスでもLocal Network Privacy拒否とは無関係(既に許可が
+        // 下りていたはず)なのでヒント対象外。
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, true);
+        let mut config = test_multipath_config();
+        config.direct_host = Some("192.168.1.5".to_string());
+        {
+            let mut s = shared.state.lock();
+            s.last_connect_attempt = Some(LastConnectAttempt::MultipathIsekaiPipeQuic(config));
+            s.user_initiated_disconnect = true;
+        }
+
+        adapter.on_disconnected(Some("user disconnected".to_string()));
+
+        let events = cb.connection_states.lock().unwrap();
+        assert!(matches!(&events[0], ConnectionPublicState::Disconnected { issue_hint: None, .. }));
     }
 
     #[test]
@@ -1637,7 +1931,7 @@ mod tests {
         let events = cb.connection_states.lock().unwrap();
         assert!(matches!(
             events.last(),
-            Some(ConnectionPublicState::Disconnected { reason: Some(r) }) if r.contains("timed out")
+            Some(ConnectionPublicState::Disconnected { reason: Some(r), .. }) if r.contains("timed out")
         ), "ギブアップ後は理由付きでDisconnectedが通知されるはず, got: {events:?}");
     }
 
@@ -1659,7 +1953,7 @@ mod tests {
         let events = cb.connection_states.lock().unwrap();
         assert!(matches!(
             events.last(),
-            Some(ConnectionPublicState::Disconnected { reason: Some(r) }) if r.contains("cancelled")
+            Some(ConnectionPublicState::Disconnected { reason: Some(r), .. }) if r.contains("cancelled")
         ));
 
         // ループ自体もepoch不一致で自然終了するはず(次tickでretryが発火しない)。
@@ -1746,6 +2040,233 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(e, ConnectionPublicState::Disconnected { .. })),
             "成功後にギブアップのDisconnectedが飛んではいけない, got: {events:?}"
+        );
+    }
+
+    // ── #20: バックグラウンド/フォアグラウンド遷移 ─────────────
+
+    #[test]
+    fn notify_did_enter_background_quiesces_only_when_connected() {
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Connected, false);
+        orch.notify_did_enter_background(30_000);
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Quiescing);
+    }
+
+    #[test]
+    fn notify_did_enter_background_is_noop_when_idle() {
+        // Idle(そもそも維持すべきセッションが無い)はバックグラウンド化しても対象外。
+        // `Connecting`は対象に含める(`notify_did_enter_background_while_connecting_...`参照)。
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Idle, false);
+        orch.notify_did_enter_background(30_000);
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Foreground);
+    }
+
+    #[test]
+    fn notify_background_budget_expired_transitions_quiescing_to_suspended() {
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Connected, false);
+        orch.notify_did_enter_background(30_000);
+        orch.notify_background_budget_expired();
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Suspended);
+    }
+
+    #[test]
+    fn notify_background_budget_expired_is_noop_when_still_foreground() {
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Connected, false);
+        orch.notify_background_budget_expired();
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Foreground);
+    }
+
+    #[test]
+    fn notify_memory_warning_forces_suspended_while_quiescing() {
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Connected, false);
+        orch.notify_did_enter_background(30_000);
+        orch.notify_memory_warning();
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Suspended);
+    }
+
+    #[test]
+    fn notify_memory_warning_is_noop_while_foreground() {
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Connected, false);
+        orch.notify_memory_warning();
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Foreground);
+    }
+
+    #[test]
+    fn notify_will_enter_foreground_within_budget_resumes_without_reconnecting() {
+        let (orch, _cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        orch.notify_did_enter_background(30_000);
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Quiescing);
+
+        orch.notify_will_enter_foreground();
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Foreground);
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0,
+            "猶予内復帰(Quiescing)では再接続を試みてはいけない"
+        );
+    }
+
+    #[test]
+    fn notify_will_enter_foreground_after_budget_expired_triggers_reconnect() {
+        let (orch, _cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        orch.notify_did_enter_background(30_000);
+        orch.notify_background_budget_expired();
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Suspended);
+
+        orch.notify_will_enter_foreground();
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Foreground);
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "猶予切れ(Suspended)からの復帰では直前の接続設定で再接続を試みるはず"
+        );
+    }
+
+    #[test]
+    fn notify_will_enter_foreground_does_not_double_trigger_when_reconnect_loop_already_active() {
+        let (orch, _cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        orch.notify_did_enter_background(30_000);
+        orch.notify_background_budget_expired();
+
+        // 既に(別経路の)自動再接続ループが動作中だとして立てておく。
+        orch.shared.state.lock().reconnect_loop_active = true;
+
+        orch.notify_will_enter_foreground();
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0,
+            "既に自動再接続ループが動作中なら二重に接続を試みてはいけない"
+        );
+    }
+
+    #[test]
+    fn notify_will_enter_foreground_does_not_trigger_while_a_connect_is_already_in_flight() {
+        let (orch, _cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        orch.notify_did_enter_background(30_000);
+        orch.notify_background_budget_expired();
+
+        orch.shared.state.lock().phase = ConnPhase::Connecting;
+
+        orch.notify_will_enter_foreground();
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0,
+            "既に接続試行中なら二重に接続を試みてはいけない"
+        );
+    }
+
+    #[test]
+    fn notify_will_enter_foreground_is_noop_without_prior_backgrounding() {
+        let (orch, _cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        orch.notify_will_enter_foreground();
+        assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Foreground);
+    }
+
+    #[test]
+    fn begin_connect_resets_background_state_to_foreground() {
+        let (orch, _cb) = orchestrator_with_phase(ConnPhase::Idle, false);
+        orch.shared.state.lock().background_state = BackgroundState::Suspended;
+        let _ = orch.begin_connect("example.com".to_string(), 22, false);
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Foreground);
+    }
+
+    #[test]
+    fn handle_unexpected_disconnect_without_auto_reconnect_resets_background_state() {
+        // 自動再接続ループが始まらない切断(ここではuser_initiated)は、以降の
+        // notify_will_enter_foreground()が誤って再接続を試みないようbackground_stateを
+        // Foregroundへ戻す。
+        let (adapter, shared, _cb) = adapter_with_phase(ConnPhase::Connected, false);
+        {
+            let mut s = shared.state.lock();
+            s.background_state = BackgroundState::Suspended;
+            s.user_initiated_disconnect = true;
+        }
+        adapter.on_disconnected(Some("user disconnected".to_string()));
+        assert_eq!(shared.state.lock().background_state, BackgroundState::Foreground);
+    }
+
+    #[test]
+    fn notify_did_enter_background_while_connecting_survives_into_quiescing_after_connected() {
+        // codexレビュー指摘の再現: Connecting中にバックグラウンド化し、その猶予中に
+        // 接続が成立したケース。on_connected()自体はbackground_stateに触れないため、
+        // notify_did_enter_background()の時点でConnectingも対象に含めておく必要がある。
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Connecting, false);
+        orch.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::Ssh(test_ssh_config()));
+
+        orch.notify_did_enter_background(30_000);
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Quiescing);
+
+        let adapter = OrchestratorAdapter::new(orch.shared.clone());
+        adapter.on_connected();
+        assert_eq!(
+            orch.shared.state.lock().background_state, BackgroundState::Quiescing,
+            "on_connected()はbackground_stateに触れないので猶予追跡は続いているはず"
+        );
+
+        orch.notify_background_budget_expired();
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Suspended);
+        let _ = cb;
+    }
+
+    fn orchestrator_connected_with_failing_reconnect(
+    ) -> (SessionOrchestrator, Arc<RecordingCallback>, Arc<std::sync::atomic::AtomicUsize>) {
+        let callback = Arc::new(RecordingCallback::default());
+        let attempt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempt_count.clone();
+        let shared = Arc::new(OrchestratorShared {
+            state: Mutex::new(OrchestratorState {
+                current_host: Some("example.com".to_string()),
+                current_port: 22,
+                is_quic: false,
+                phase: ConnPhase::Connected,
+                current_transfer_id: None,
+                trzsz_mode: None,
+                download_buf: Vec::new(),
+                size_limit_exceeded_for: None,
+                session_generation: 0,
+                reconnect_epoch: 0,
+                reconnect_loop_active: false,
+                retry_attempt_in_flight: false,
+                user_initiated_disconnect: false,
+                last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
+                reconnect_policy: ReconnectPolicy::default(),
+                background_state: BackgroundState::Foreground,
+            }),
+            callback: callback.clone(),
+            session: Mutex::new(None),
+            path_observer: Mutex::new(net_health_policy::PathObserver::default()),
+            // codexレビュー指摘: 実際の`connect_via`は`phase = Connecting`にしてから
+            // 同期的に失敗し得るため、フェイクも同じ手順(先にConnectingへ変更してから
+            // Errを返す)を踏んで、`notify_will_enter_foreground`側の`phase`復旧処理が
+            // 本当に固着状態を解消しているかを検証できるようにする。
+            reconnect_attempt: Box::new(move |shared, _attempt| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                shared.state.lock().phase = ConnPhase::Connecting;
+                Err(SshError::ConnectionFailed)
+            }),
+        });
+        (SessionOrchestrator { shared }, callback, attempt_count)
+    }
+
+    #[test]
+    fn notify_will_enter_foreground_resets_phase_and_notifies_when_reconnect_fails_synchronously() {
+        // codexレビュー指摘の再現: フォアグラウンド復帰契機の再接続がホスト鍵拒否等で
+        // 同期的に失敗した場合、phaseがConnectingへ固まらずIdleへ戻り、UIへ
+        // Disconnectedが通知されることを確認する(自動再接続ループのように次tickでの
+        // 暗黙リトライが無い一回限りの呼び出しのため、Errを握り潰してはいけない)。
+        let (orch, cb, attempt_count) = orchestrator_connected_with_failing_reconnect();
+        orch.notify_did_enter_background(30_000);
+        orch.notify_background_budget_expired();
+        assert_eq!(orch.shared.state.lock().background_state, BackgroundState::Suspended);
+
+        orch.notify_will_enter_foreground();
+
+        assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            orch.shared.state.lock().phase == ConnPhase::Idle,
+            "同期失敗後にphaseがConnectingのまま固まってはいけない"
+        );
+        let events = cb.connection_states.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, ConnectionPublicState::Disconnected { .. })),
+            "同期失敗はDisconnectedとして通知されるはず, got: {events:?}"
         );
     }
 }
