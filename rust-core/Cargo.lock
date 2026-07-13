@@ -1715,6 +1715,7 @@ dependencies = [
  "isekai-auth",
  "isekai-bootstrap",
  "isekai-bootstrap-plan",
+ "isekai-fs-guard",
  "isekai-pipe-core",
  "isekai-protocol",
  "isekai-trust",
