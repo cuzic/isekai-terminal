@@ -432,6 +432,134 @@ fn resume_window_for(effective_resume_grace_secs: u32) -> Duration {
     }
 }
 
+/// The mutable, session-scoped state `run_resume_loop`'s two extracted
+/// helpers (`promote_warm_standby_once`/`resume_with_backoff_until_deadline`)
+/// both need to read and update across a disconnect — grouped here so the
+/// two helpers take one `&mut` parameter instead of five separate ones.
+struct ResumeLoopState {
+    session_id: isekai_transport::SessionId,
+    counters: Arc<AppAckCounters>,
+    replay: Arc<Mutex<C2hReplayBuffer>>,
+    app_ack_tasks: AppAckTasks,
+    network_rebinder: Option<AnyMuxRebinder>,
+}
+
+/// Fast path: promote the already-warm standby connection instead of
+/// waiting through `resume_with_backoff_until_deadline`'s backoff loop — the
+/// entire point of keeping one warm (`warm_standby.rs`'s module docs).
+/// Returns `Some(stream)` only once promotion, replay, and (best-effort)
+/// control-stream re-establishment have all been attempted; a missing
+/// standby, an in-flight promotion, a transport failure, or a replay
+/// mismatch all return `None`, and every `None` here falls straight through
+/// to the caller's ordinary `reconnect_and_resume` retry loop unchanged —
+/// this is a latency optimization, not a correctness dependency. On
+/// success, clears `state.network_rebinder`: the promoted connection was
+/// dialed directly by `WarmStandby`, not via the endpoint this generation's
+/// rebinder came from, so there is no rebinder to carry over — the next
+/// disconnect just falls back to a full resume, same as any other
+/// rebinder-less generation.
+async fn promote_warm_standby_once(
+    warm_standby: &isekai_transport::WarmStandby,
+    target: &RelayTarget,
+    state: &mut ResumeLoopState,
+) -> Option<AnyByteStream> {
+    let client_sent_offset = C2hSentOffset::new(state.replay.lock().unwrap().end_offset());
+    let client_delivered_offset = H2cClientDeliveredOffset::new(state.counters.h2c_client_delivered_offset());
+    let mut promoted = match warm_standby.promote(client_sent_offset, client_delivered_offset).await {
+        Ok(promoted) => promoted,
+        Err(e) => {
+            log::info!("isekai-pipe connect: warm-standby promote unavailable ({e:#}); falling back to full resume");
+            return None;
+        }
+    };
+    if !replay_and_advance(&state.replay, promoted.helper_committed_offset.get(), &mut promoted.data_stream).await {
+        eprintln!("isekai-pipe connect: warm-standby promote succeeded but replay failed; falling back to full resume");
+        return None;
+    }
+    log::info!("isekai-pipe connect: promoted warm-standby connection for session_id={}", state.session_id);
+    match reestablish_control_stream(&promoted.connection, &target.session_secret, &state.counters).await {
+        Ok(new_tasks) => state.app_ack_tasks = new_tasks,
+        Err(e) => eprintln!(
+            "isekai-pipe connect: control stream re-establishment after promote failed ({e:#}), \
+             continuing without resume support until the next reattach"
+        ),
+    }
+    drop(promoted.connection);
+    state.network_rebinder = None;
+    Some(promoted.data_stream)
+}
+
+/// The ordinary `reconnect_and_resume` retry loop, run until either a resume
+/// attempt succeeds or `deadline` passes. Returns `Some(stream)` on success
+/// (having also re-established the control stream and updated
+/// `state.network_rebinder`); returns `None` once `deadline` has passed,
+/// having already closed `stdout` and aborted `warm_standby_task` — the
+/// caller's only remaining step on `None` is to return `Ok(())`.
+async fn resume_with_backoff_until_deadline(
+    factory: &AnyMuxFactory,
+    target: &RelayTarget,
+    profile: &str,
+    resume_window: Duration,
+    deadline: Instant,
+    state: &mut ResumeLoopState,
+    stdout: &mut tokio::io::Stdout,
+    warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
+) -> Option<AnyByteStream> {
+    let mut attempt: u32 = 0;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            let exceeded_by = now.saturating_duration_since(deadline);
+            eprintln!(
+                "isekai-pipe connect: giving up on session_id={} for '{profile}' - \
+                 the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}. \
+                 Closing stdin/stdout; ssh will treat this as a lost connection.",
+                state.session_id
+            );
+            let _ = stdout.shutdown().await;
+            if let Some(t) = warm_standby_task {
+                t.abort();
+            }
+            return None;
+        }
+
+        let delay = RESUME_BACKOFF.base_delay(attempt).min(deadline - now);
+        attempt = attempt.saturating_add(1);
+        tokio::time::sleep(delay).await;
+
+        let client_sent_offset = C2hSentOffset::new(state.replay.lock().unwrap().end_offset());
+        let client_delivered_offset = H2cClientDeliveredOffset::new(state.counters.h2c_client_delivered_offset());
+        match reconnect_and_resume(
+            factory,
+            target,
+            state.session_id,
+            client_sent_offset,
+            client_delivered_offset,
+        )
+        .await
+        {
+            Ok(mut resumed) => {
+                if !replay_and_advance(&state.replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
+                    continue;
+                }
+                match reestablish_control_stream(&resumed.connection, &target.session_secret, &state.counters).await {
+                    Ok(new_tasks) => state.app_ack_tasks = new_tasks,
+                    Err(e) => eprintln!(
+                        "isekai-pipe connect: control stream re-establishment after resume failed ({e:#}), \
+                         continuing without resume support until the next reattach"
+                    ),
+                }
+                drop(resumed.connection);
+                state.network_rebinder = resumed.network_rebinder;
+                return Some(resumed.data_stream);
+            }
+            Err(e) => {
+                eprintln!("isekai-pipe connect: resume attempt {attempt} failed: {e:#}");
+            }
+        }
+    }
+}
+
 pub(crate) async fn run_resume_loop(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -446,15 +574,18 @@ pub(crate) async fn run_resume_loop(
     let resume_window = resume_window_for(established.effective_resume_grace_secs);
 
     let counters = Arc::new(AppAckCounters::new());
-    let mut app_ack_tasks = spawn_app_ack_tasks(established.control_stream, counters.clone());
-    let replay = Arc::new(Mutex::new(C2hReplayBuffer::new(C2H_REPLAY_BUFFER_CAPACITY)));
+    let mut state = ResumeLoopState {
+        session_id,
+        app_ack_tasks: spawn_app_ack_tasks(established.control_stream, counters.clone()),
+        counters,
+        replay: Arc::new(Mutex::new(C2hReplayBuffer::new(C2H_REPLAY_BUFFER_CAPACITY))),
+        network_rebinder: established.network_rebinder,
+    };
 
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut data_stream = established.data_stream;
     let mut disconnected_since: Option<Instant> = None;
-    let mut attempt: u32 = 0;
-    let mut network_rebinder = established.network_rebinder;
 
     // `--tethering-interface`: keeps a second connection warm on a specific
     // physical interface and promotes it (no fresh dial, no backoff wait) as
@@ -487,7 +618,7 @@ pub(crate) async fn run_resume_loop(
         // the stream first).
         let (reconnect_signal_task, mut reconnect_signal_rx) = spawn_reconnect_signal(
             isekai_netmon::system_monitor(),
-            network_rebinder.take(),
+            state.network_rebinder.take(),
             experimental_network_rebind,
             target.helper_addr,
             target.local_bind_port_range,
@@ -495,13 +626,13 @@ pub(crate) async fn run_resume_loop(
 
         let (mut quic_read, mut quic_write) = data_stream.split();
         let outcome = tokio::select! {
-            outcome = run_data_pump(&mut stdin, &mut stdout, &mut quic_read, &mut quic_write, &replay, &counters) => outcome,
+            outcome = run_data_pump(&mut stdin, &mut stdout, &mut quic_read, &mut quic_write, &state.replay, &state.counters) => outcome,
             Some(()) = reconnect_signal_rx.recv() => {
                 Err(anyhow::anyhow!("network change detected, reconnecting"))
             }
         };
         reconnect_signal_task.abort();
-        app_ack_tasks.abort();
+        state.app_ack_tasks.abort();
 
         if outcome.is_ok() {
             if let Some(t) = &warm_standby_task {
@@ -532,107 +663,34 @@ pub(crate) async fn run_resume_loop(
         // a slow-to-fail `reconnect_and_resume` attempt would.
         let deadline = *disconnected_since.get_or_insert_with(Instant::now) + resume_window;
 
-        // Fast path: promote the already-warm standby connection instead of
-        // waiting through the backoff loop below — the entire point of
-        // keeping one warm (`warm_standby.rs`'s module docs). A missing
-        // standby, an in-flight promotion, or a transport failure all fall
-        // straight through to the ordinary `reconnect_and_resume` retry loop
-        // unchanged; this is a latency optimization, not a correctness
-        // dependency.
-        let mut promoted_stream = None;
-        if let Some(ws) = &warm_standby {
-            let client_sent_offset = C2hSentOffset::new(replay.lock().unwrap().end_offset());
-            let client_delivered_offset = H2cClientDeliveredOffset::new(counters.h2c_client_delivered_offset());
-            match ws.promote(client_sent_offset, client_delivered_offset).await {
-                Ok(mut promoted) => {
-                    if replay_and_advance(&replay, promoted.helper_committed_offset.get(), &mut promoted.data_stream).await {
-                        log::info!("isekai-pipe connect: promoted warm-standby connection for session_id={session_id}");
-                        match reestablish_control_stream(&promoted.connection, &target.session_secret, &counters).await {
-                            Ok(new_tasks) => app_ack_tasks = new_tasks,
-                            Err(e) => eprintln!(
-                                "isekai-pipe connect: control stream re-establishment after promote failed ({e:#}), \
-                                 continuing without resume support until the next reattach"
-                            ),
-                        }
-                        drop(promoted.connection);
-                        // The promoted connection was dialed directly by
-                        // `WarmStandby`, not via the endpoint this
-                        // generation's `network_rebinder` came from — no
-                        // rebinder to carry over; the next disconnect just
-                        // falls back to a full resume, same as any other
-                        // rebinder-less generation.
-                        network_rebinder = None;
-                        promoted_stream = Some(promoted.data_stream);
-                    } else {
-                        eprintln!("isekai-pipe connect: warm-standby promote succeeded but replay failed; falling back to full resume");
-                    }
-                }
-                Err(e) => {
-                    log::info!("isekai-pipe connect: warm-standby promote unavailable ({e:#}); falling back to full resume");
-                }
-            }
-        }
+        let promoted_stream = match &warm_standby {
+            Some(ws) => promote_warm_standby_once(ws, target, &mut state).await,
+            None => None,
+        };
 
         let new_stream = match promoted_stream {
             Some(stream) => stream,
-            None => loop {
-                let now = Instant::now();
-                if now >= deadline {
-                    let exceeded_by = now.saturating_duration_since(deadline);
-                    eprintln!(
-                        "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
-                         the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}. \
-                         Closing stdin/stdout; ssh will treat this as a lost connection."
-                    );
-                    let _ = stdout.shutdown().await;
-                    drop(stdin);
-                    if let Some(t) = &warm_standby_task {
-                        t.abort();
-                    }
-                    return Ok(());
-                }
-
-                let delay = RESUME_BACKOFF.base_delay(attempt).min(deadline - now);
-                attempt = attempt.saturating_add(1);
-                tokio::time::sleep(delay).await;
-
-                let client_sent_offset = C2hSentOffset::new(replay.lock().unwrap().end_offset());
-                let client_delivered_offset =
-                    H2cClientDeliveredOffset::new(counters.h2c_client_delivered_offset());
-                match reconnect_and_resume(
+            None => {
+                match resume_with_backoff_until_deadline(
                     factory,
                     target,
-                    session_id,
-                    client_sent_offset,
-                    client_delivered_offset,
+                    profile,
+                    resume_window,
+                    deadline,
+                    &mut state,
+                    &mut stdout,
+                    &warm_standby_task,
                 )
                 .await
                 {
-                    Ok(mut resumed) => {
-                        if !replay_and_advance(&replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
-                            continue;
-                        }
-                        match reestablish_control_stream(&resumed.connection, &target.session_secret, &counters).await {
-                            Ok(new_tasks) => app_ack_tasks = new_tasks,
-                            Err(e) => eprintln!(
-                                "isekai-pipe connect: control stream re-establishment after resume failed ({e:#}), \
-                                 continuing without resume support until the next reattach"
-                            ),
-                        }
-                        drop(resumed.connection);
-                        network_rebinder = resumed.network_rebinder;
-                        break resumed.data_stream;
-                    }
-                    Err(e) => {
-                        eprintln!("isekai-pipe connect: resume attempt {attempt} failed: {e:#}");
-                    }
+                    Some(stream) => stream,
+                    None => return Ok(()),
                 }
-            },
+            }
         };
 
         data_stream = new_stream;
         disconnected_since = None;
-        attempt = 0;
     }
 }
 
