@@ -512,7 +512,7 @@ class TerminalTabsViewModelTest {
         withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
 
         // tmux 「新規ウィンドウ」相当: Ctrl+B に続けて 'c'。
-        vm.sendKeySequence(id, listOf(KeyStep.CtrlChar('b'), KeyStep.Text("c")))
+        vm.sendKeySequenceToPane(PaneAddress(id, tab(id).focusedPane.paneId), listOf(KeyStep.CtrlChar('b'), KeyStep.Text("c")))
 
         assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x02, 'c'.code.toByte())) })
     }
@@ -526,7 +526,7 @@ class TerminalTabsViewModelTest {
         orchestrators[0].simulateScreenUpdate(screenUpdate(applicationCursorMode = false))
         withTimeout(3000) { while (tab(id).session.state.value.screenUpdate == null) delay(10) }
 
-        vm.sendKeySequence(id, listOf(KeyStep.Special(TerminalKeyEncoder.KC_DPAD_UP)))
+        vm.sendKeySequenceToPane(PaneAddress(id, tab(id).focusedPane.paneId), listOf(KeyStep.Special(TerminalKeyEncoder.KC_DPAD_UP)))
 
         assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x1B, 0x5B, 0x41)) })
     }
@@ -542,7 +542,7 @@ class TerminalTabsViewModelTest {
         orchestrators[0].simulateScreenUpdate(screenUpdate(applicationCursorMode = true))
         withTimeout(3000) { while (tab(id).session.state.value.screenUpdate == null) delay(10) }
 
-        vm.sendKeySequence(id, listOf(KeyStep.Special(TerminalKeyEncoder.KC_DPAD_UP)))
+        vm.sendKeySequenceToPane(PaneAddress(id, tab(id).focusedPane.paneId), listOf(KeyStep.Special(TerminalKeyEncoder.KC_DPAD_UP)))
 
         assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x1B, 0x4F, 0x41)) })
     }
@@ -554,7 +554,7 @@ class TerminalTabsViewModelTest {
         orchestrators[0].simulateConnected()
         withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
 
-        vm.sendKeySequenceToPane(id, "no-such-pane", listOf(KeyStep.Text("c")))
+        vm.sendKeySequenceToPane(PaneAddress(id, "no-such-pane"), listOf(KeyStep.Text("c")))
 
         assertTrue(orchestrators[0].sentBytes.isEmpty())
     }
