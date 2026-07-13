@@ -314,9 +314,9 @@ class TerminalTabsViewModel(
 
     // ── ネットワーク（全タブへファンアウト）───────────────────────────
 
-    /** internal にすることでテストから直接呼べる。 */
+    /** internal にすることでテストから直接呼べる。split pane側にも同じ生イベントを転送する。 */
     internal fun onNetworkPathChanged(isSatisfied: Boolean) {
-        _tabs.value.forEach { it.session.notifyNetworkPathChanged(isSatisfied) }
+        _tabs.value.flatMap { it.panes }.forEach { it.session.notifyNetworkPathChanged(isSatisfied) }
     }
 
     // ── タブのライフサイクル ────────────────────────────────────────

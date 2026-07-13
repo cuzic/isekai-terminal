@@ -110,8 +110,11 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     // 接続中のみ 400ms debounce するが、この Fake が検証したいのはタブへの fanout など
     // Kotlin 側の配線であって debounce のタイミング自体(Rust 側で別途ユニットテスト済み)
     // ではないため、ここでは同期的に「最終的に切断されるかどうか」だけを再現する。
-    // isSatisfied=true は保留中の debounce をキャンセルする以外に意味を持たないため無視する。
+    // isSatisfied=true は切断判断には寄与しないが、呼び出し自体がこのペインまで届いたことは
+    // notifyNetworkPathChangedCalls で検証できるようにする。
+    val notifyNetworkPathChangedCalls = mutableListOf<Boolean>()
     override fun notifyNetworkPathChanged(isSatisfied: Boolean) {
+        notifyNetworkPathChangedCalls.add(isSatisfied)
         if (isSatisfied) return
         when {
             phase == Phase.CONNECTING || (phase == Phase.CONNECTED && !quic) -> {

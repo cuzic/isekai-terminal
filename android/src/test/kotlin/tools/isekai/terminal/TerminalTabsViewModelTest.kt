@@ -155,6 +155,27 @@ class TerminalTabsViewModelTest {
 
         assertFalse("tab a should not be disconnected on recovery", orchestrators[0].disconnectCalled)
         assertFalse("tab b should not be disconnected on recovery", orchestrators[1].disconnectCalled)
+        assertTrue("tab a should still receive the available notification", orchestrators[0].notifyNetworkPathChangedCalls.contains(true))
+        assertTrue("tab b should still receive the available notification", orchestrators[1].notifyNetworkPathChangedCalls.contains(true))
+    }
+
+    @Test
+    fun onNetworkPathChanged_alsoFansOutToSplitPane() = runBlocking {
+        val tabId = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected("host-a")
+
+        vm.splitPane(tabId, SplitDirection.VERTICAL, "pass")
+        awaitConnectCalled(orchestrators[1])
+        orchestrators[1].simulateConnected("host-a-split")
+
+        executor.simulateNetworkLost()
+        assertTrue("primary pane should be disconnected on network loss", orchestrators[0].disconnectCalled)
+        assertTrue("split pane should be disconnected on network loss", orchestrators[1].disconnectCalled)
+
+        executor.simulateNetworkAvailable()
+        assertTrue("primary pane should receive the available notification", orchestrators[0].notifyNetworkPathChangedCalls.contains(true))
+        assertTrue("split pane should receive the available notification", orchestrators[1].notifyNetworkPathChangedCalls.contains(true))
     }
 
     // ── 最後のタブを閉じた時のみ FGS 停止 ────────────────────────────────
