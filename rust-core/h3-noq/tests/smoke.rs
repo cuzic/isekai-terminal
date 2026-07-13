@@ -35,6 +35,7 @@ fn client_config(cert_der: &[u8]) -> noq::ClientConfig {
 
 #[tokio::test]
 async fn h3_over_noq_get_request_round_trips() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_der = CertificateDer::from(cert.cert);
     let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
@@ -138,6 +139,7 @@ async fn h3_over_noq_get_request_round_trips() {
 /// `h3-noq`'s `datagram` feature (`DatagramConnectionExt` impl).
 #[tokio::test]
 async fn h3_datagram_over_noq_round_trips() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     use h3_datagram::datagram_handler::HandleDatagramsExt;
 
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
