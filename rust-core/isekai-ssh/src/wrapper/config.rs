@@ -306,13 +306,26 @@ fn parse_duration_ms(value: &str, field: &str) -> Result<u64> {
 
 /// Parses `#@isekai remote-bind-port-range <START>-<END>` into an inclusive
 /// `(start, end)` pair, passed straight through to `isekai-helper
-/// --bind-port-range` (`isekai_pipe_core::parse_port_range` applies the
-/// identical `start <= end` validation server-side too; this duplicate
-/// client-side check exists only to fail closed at config resolution time
-/// instead of after an SSH round-trip).
+/// --bind-port-range` (`engine::parse_bind_port_range` in `isekai-pipe`
+/// applies the identical `start <= end` validation server-side; this
+/// duplicate client-side check exists only to fail closed at config
+/// resolution time instead of after an SSH round-trip).
 fn parse_bind_port_range(value: &str) -> Result<(u16, u16)> {
-    isekai_pipe_core::parse_port_range(value)
-        .map_err(|e| anyhow!("isekai-ssh: {e} (from #@isekai remote-bind-port-range)"))
+    let (start, end) = value.split_once('-').ok_or_else(|| {
+        anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range {value:?} (expected <START>-<END>)")
+    })?;
+    let start: u16 = start
+        .parse()
+        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range start {start:?}"))?;
+    let end: u16 = end
+        .parse()
+        .map_err(|_| anyhow!("isekai-ssh: invalid #@isekai remote-bind-port-range end {end:?}"))?;
+    if start > end {
+        return Err(anyhow!(
+            "isekai-ssh: invalid #@isekai remote-bind-port-range {value:?}: start must be <= end"
+        ));
+    }
+    Ok((start, end))
 }
 
 fn parse_bootstrap_candidate(args: &[String]) -> Result<BootstrapCandidate> {

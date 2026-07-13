@@ -158,7 +158,17 @@ fn next_val(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 /// Parses `--bind-port-range <START>-<END>` into an inclusive `(start,
 /// end)` pair.
 fn parse_bind_port_range(value: &str) -> Result<(u16, u16)> {
-    isekai_pipe_core::parse_port_range(value).map_err(|e| anyhow!("{e} (from --bind-port-range)"))
+    let (start, end) = value
+        .split_once('-')
+        .ok_or_else(|| anyhow!("invalid --bind-port-range value {value:?} (expected <START>-<END>)"))?;
+    let start: u16 = start
+        .parse()
+        .map_err(|_| anyhow!("invalid --bind-port-range start {start:?}"))?;
+    let end: u16 = end.parse().map_err(|_| anyhow!("invalid --bind-port-range end {end:?}"))?;
+    if start > end {
+        return Err(anyhow!("invalid --bind-port-range {value:?}: start must be <= end"));
+    }
+    Ok((start, end))
 }
 
 /// Binds a UDP socket at `bind.ip()`, either at `bind`'s own port (the
