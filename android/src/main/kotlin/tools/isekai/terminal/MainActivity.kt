@@ -182,6 +182,7 @@ fun AppRoot() {
                 },
                 onManageKeys = { navController.navigate(AppRoutes.KEY_LIST) },
                 onManageSnippets = { navController.navigate(AppRoutes.SNIPPET_LIST) },
+                onManageKeySequences = { navController.navigate(AppRoutes.KEY_SEQUENCE_LIST) },
                 // Phase 12 P2-1: アプリ全体の既定テーマ変更を、まだ個別上書きしていない
                 // (isThemeOverridden=false の)タブにも反映する。tabsVm は Application スコープ
                 // なので、まだ1つもタブが無い状態(list が空)でも安全に呼べる。
@@ -254,6 +255,31 @@ fun AppRoot() {
             RemoteLogger.i("IsekaiTerminalNav", "→ ${if (editing == null) "SnippetEdit(new)" else "SnippetEdit(id=${editing.id} '${editing.label}')"}")
             SnippetEditScreen(
                 snippet = editing,
+                onSave = { navController.popBackStack() },
+                onCancel = { navController.popBackStack() },
+            )
+        }
+
+        composable(AppRoutes.KEY_SEQUENCE_LIST) {
+            RemoteLogger.i("IsekaiTerminalNav", "→ KeySequenceList")
+            KeySequenceListScreen(
+                onAddKeySequence = {
+                    navVm.pendingEditKeySequence = null
+                    navController.navigate(AppRoutes.KEY_SEQUENCE_EDIT)
+                },
+                onEditKeySequence = { keySequence ->
+                    navVm.pendingEditKeySequence = keySequence
+                    navController.navigate(AppRoutes.KEY_SEQUENCE_EDIT)
+                },
+                onBack = { navController.popBackStack() },
+            )
+        }
+
+        composable(AppRoutes.KEY_SEQUENCE_EDIT) {
+            val editing = navVm.pendingEditKeySequence
+            RemoteLogger.i("IsekaiTerminalNav", "→ ${if (editing == null) "KeySequenceEdit(new)" else "KeySequenceEdit(id=${editing.id} '${editing.label}')"}")
+            KeySequenceEditScreen(
+                keySequence = editing,
                 onSave = { navController.popBackStack() },
                 onCancel = { navController.popBackStack() },
             )

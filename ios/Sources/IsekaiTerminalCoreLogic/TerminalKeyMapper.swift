@@ -19,7 +19,9 @@ public enum TerminalKeyMapper {
         return terminalCtrlByte(codePoint: UInt32(ascii))
     }
 
-    public enum SpecialKey: Equatable {
+    /// `Hashable`は打鍵列(KeySequence)編集UIの`Picker`選択値として使うために追加
+    /// (`functionKey(Int)`の連想値もHashableなので自動合成される)。
+    public enum SpecialKey: Equatable, Hashable {
         case escape
         case tab
         case backspace
@@ -34,8 +36,16 @@ public enum TerminalKeyMapper {
 
     /// 特殊キーに対応する、ターミナルへ送信するバイト列(xterm互換のANSI
     /// エスケープシーケンス)を返す。未対応のfunction key番号は空配列を返す。
+    /// `applicationCursorMode`(DECCKM)を意識しない、常にCSI形式を返す従来のAPI。
     public static func bytes(for key: SpecialKey) -> [UInt8] {
-        Array(terminalSpecialKeyBytes(key: key.rustKey, applicationCursorMode: false))
+        bytes(for: key, applicationCursorMode: false)
+    }
+
+    /// 打鍵列(KeySequence)機能向け: `applicationCursorMode`(DECCKM)を明示的に指定できる版。
+    /// 矢印キー等はtmux/vim等でDECCKMがオンの場合SS3形式になる(Android版
+    /// `TerminalKeyEncoder.specialKeyBytes(keyCode, applicationCursorMode)`と同じ挙動)。
+    public static func bytes(for key: SpecialKey, applicationCursorMode: Bool) -> [UInt8] {
+        Array(terminalSpecialKeyBytes(key: key.rustKey, applicationCursorMode: applicationCursorMode))
     }
 }
 

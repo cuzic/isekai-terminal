@@ -20,8 +20,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.HostKeySettings
+import tools.isekai.terminal.data.KeySequence
+import tools.isekai.terminal.data.KeySequencePackInstallation
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.input.KeyStep
 import tools.isekai.terminal.session.AndroidAppExecutor
 import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.RealHostKeyChecker
@@ -94,6 +97,14 @@ class PaneState internal constructor(
 
     // ── 定型コマンド（スニペット）─────────────────────────────
     internal val snippets = MutableStateFlow<List<Snippet>>(emptyList())
+
+    // ── 打鍵列（KeySequence）───────────────────────────────
+    internal val keySequences = MutableStateFlow<List<KeySequence>>(emptyList())
+
+    // ── 打鍵列セット(パック) ──────────────────────────────
+    // 有効化されているパックのみ(pack定義, 解決済みinstallation)のペアで保持する。
+    internal val installedPacks =
+        MutableStateFlow<List<Pair<tools.isekai.terminal.pack.KeySequencePack, KeySequencePackInstallation>>>(emptyList())
 
     // ── 接続後自動実行コマンド ────────────────────────────────
     internal var pendingPostConnectBytes: ByteArray? = null
@@ -221,6 +232,8 @@ class TerminalTabsViewModel(
         internal val preConnectError get() = primaryPane.preConnectError
         internal val uploadInProgress get() = primaryPane.uploadInProgress
         internal val snippets get() = primaryPane.snippets
+        internal val keySequences get() = primaryPane.keySequences
+        internal val installedPacks get() = primaryPane.installedPacks
         internal var pendingPostConnectBytes: ByteArray?
             get() = primaryPane.pendingPostConnectBytes
             set(value) { primaryPane.pendingPostConnectBytes = value }
@@ -297,7 +310,11 @@ class TerminalTabsViewModel(
         scope = viewModelScope,
         ioDispatcher = ioDispatcher,
         pushTheme = ::pushThemeToSession,
-        loadSnippets = ::loadSnippetsForPane,
+        loadPaneContent = { pane, profileId ->
+            loadSnippetsForPane(pane, profileId)
+            loadKeySequencesForPane(pane, profileId)
+            loadInstalledPacksForPane(pane, profileId)
+        },
     )
 
     init {
@@ -623,6 +640,36 @@ class TerminalTabsViewModel(
         }
     }
 
+    // ── 打鍵列（KeySequence）─────────────────────────────────────
+
+    /** [profileId] が null なら全プロファイル共通の打鍵列のみ、非nullなら共通＋専用をマージして読み込む
+     *  ([loadSnippets] と同じ運用)。未分割時は主ペイン、分割時はフォーカス中のペインの打鍵列一覧を差し替える。 */
+    fun loadKeySequences(tabId: String, profileId: Long?) {
+        val tab = tabOrNull(tabId) ?: return
+        loadKeySequencesForPane(tab.focusedPane, profileId)
+    }
+
+    private fun loadKeySequencesForPane(pane: PaneState, profileId: Long?) {
+        viewModelScope.launch(ioDispatcher) {
+            pane.keySequences.value = Repositories.keySequences.getForProfile(profileId)
+        }
+    }
+
+    // ── 打鍵列セット(パック) ──────────────────────────────
+
+    fun loadInstalledPacks(tabId: String, profileId: Long?) {
+        val tab = tabOrNull(tabId) ?: return
+        loadInstalledPacksForPane(tab.focusedPane, profileId)
+    }
+
+    private fun loadInstalledPacksForPane(pane: PaneState, profileId: Long?) {
+        viewModelScope.launch(ioDispatcher) {
+            pane.installedPacks.value = tools.isekai.terminal.pack.KeySequencePacks.ALL.mapNotNull { pack ->
+                Repositories.keySequencePackInstallations.resolveInstallation(pack.id, profileId)?.let { pack to it }
+            }
+        }
+    }
+
     fun sendSnippetToPane(tabId: String, paneId: String, snippet: Snippet) {
         RemoteLogger.i("IsekaiTerminalSnippet", "send snippet '${snippet.label}' id=${snippet.id} tab=$tabId pane=$paneId")
         sendToPane(tabId, paneId, SnippetCommands.toBytes(snippet))
@@ -632,6 +679,21 @@ class TerminalTabsViewModel(
         RemoteLogger.i("IsekaiTerminalSnippet", "send snippet '${snippet.label}' id=${snippet.id} tab=$tabId")
         send(tabId, SnippetCommands.toBytes(snippet))
     }
+
+    // ── 打鍵列(KeySequence) ────────────────────────────────────
+    // applicationCursorMode は新しいミラー状態を作らず、既存の Rust 由来の状態
+    // (pane.session.state.value.screenUpdate、TerminalScreen が矢印キー描画等で参照している
+    // のと同じ値)をそのまま読む。
+
+    fun sendKeySequenceToPane(tabId: String, paneId: String, steps: List<KeyStep>) {
+        val pane = paneOrNull(tabId, paneId) ?: return
+        val applicationCursorMode = pane.session.state.value.screenUpdate?.applicationCursorMode ?: false
+        RemoteLogger.i("IsekaiTerminalKeySequence", "send key sequence (${steps.size} steps) tab=$tabId pane=$paneId")
+        pane.session.send(KeySequenceCommands.toBytes(steps, applicationCursorMode))
+    }
+
+    fun sendKeySequence(tabId: String, steps: List<KeyStep>) =
+        tabOrNull(tabId)?.let { sendKeySequenceToPane(tabId, it.focusedPane.paneId, steps) }
 
     // ── 接続後自動実行コマンド ────────────────────────────────────
     // 発火(arm)は[ConnectionCoordinator.connectPane]側に移した(新しい接続試行のたびに

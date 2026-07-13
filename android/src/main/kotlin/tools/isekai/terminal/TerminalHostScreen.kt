@@ -400,6 +400,8 @@ private fun TerminalPaneScreen(
     val paneId = pane.paneId
     val uiState by pane.uiState.collectAsStateWithLifecycle(initialValue = TerminalUiState())
     val snippets by pane.snippets.collectAsStateWithLifecycle()
+    val keySequences by pane.keySequences.collectAsStateWithLifecycle()
+    val installedPacks by pane.installedPacks.collectAsStateWithLifecycle()
 
     // スクロール位置・選択範囲・フォントスケール等のローカル状態(TerminalScreenBody内部の
     // remember)は paneId ごとに key() で分離する必要がある(同一タブの2ペインが同じ
@@ -412,6 +414,8 @@ private fun TerminalPaneScreen(
                 isActive = isActive,
                 hasFocus = hasFocus,
                 snippets = snippets,
+                keySequences = keySequences,
+                installedPacks = installedPacks,
                 chromeVisible = chromeVisible,
                 onUserActivity = onUserActivity,
                 actions = TerminalScreenActions(
@@ -434,6 +438,7 @@ private fun TerminalPaneScreen(
                     onTrzszDismiss = { tabsVm.trzszDismissForPane(tabId, paneId) },
                     onGetSessionLog = { tabsVm.getSessionLogForPane(tabId, paneId) },
                     onSendSnippet = { snippet -> tabsVm.sendSnippetToPane(tabId, paneId, snippet) },
+                    onSendKeySequence = { steps -> tabsVm.sendKeySequenceToPane(tabId, paneId, steps) },
                     onRespondAgentSignRequest = { approved -> tabsVm.respondAgentSignRequestForPane(tabId, paneId, approved) },
                     onRequestFocus = { tabsVm.setFocusedPane(tabId, paneId) },
                     // 物理キーボードの Ctrl+Tab / Ctrl+Shift+Tab によるタブ切替（TerminalInputView 経由）。

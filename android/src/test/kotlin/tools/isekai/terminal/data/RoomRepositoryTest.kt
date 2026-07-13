@@ -6,6 +6,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.sqlite.db.SupportSQLiteOpenHelper
 import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -336,6 +339,213 @@ class SnippetRepositoryTest {
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
+class KeySequenceRepositoryTest {
+    private lateinit var db: AppDatabase
+    private lateinit var profileRepo: ConnectionProfileRepository
+    private lateinit var repo: KeySequenceRepository
+
+    @Before fun setup() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        db = Room.inMemoryDatabaseBuilder(ctx, AppDatabase::class.java)
+            .allowMainThreadQueries().build()
+        profileRepo = ConnectionProfileRepository(db.connectionProfileDao())
+        repo = KeySequenceRepository(db.keySequenceDao())
+    }
+
+    @After fun teardown() { db.close() }
+
+    private fun keySequence(label: String, profileId: Long? = null, sortOrder: Int = 0) =
+        tools.isekai.terminal.data.KeySequence.create(
+            label = label,
+            steps = listOf(
+                tools.isekai.terminal.input.KeyStep.CtrlChar('b'),
+                tools.isekai.terminal.input.KeyStep.Text("c"),
+            ),
+            profileId = profileId,
+            sortOrder = sortOrder,
+        )
+
+    @Test fun save_and_getAll_returnsKeySequence() = runBlocking {
+        repo.save(keySequence("tmux new window"))
+        val all = repo.getAll()
+        assertEquals(1, all.size)
+        assertEquals("tmux new window", all[0].label)
+    }
+
+    @Test fun save_and_findById_returnsKeySequence() = runBlocking {
+        val id = repo.save(keySequence("tmux new window"))
+        val found = repo.findById(id)
+        assertEquals("tmux new window", found?.label)
+        assertEquals(id, found?.id)
+    }
+
+    @Test fun findById_nonexistent_returnsNull() = runBlocking {
+        assertNull(repo.findById(999))
+    }
+
+    @Test fun steps_roundTripsThroughJson() = runBlocking {
+        val id = repo.save(keySequence("tmux new window"))
+        val found = repo.findById(id)!!
+        assertEquals(
+            listOf(
+                tools.isekai.terminal.input.KeyStep.CtrlChar('b'),
+                tools.isekai.terminal.input.KeyStep.Text("c"),
+            ),
+            found.steps,
+        )
+    }
+
+    @Test fun corruptedStepsJson_doesNotThrow_stepsFallsBackToEmpty() = runBlocking {
+        val id = db.keySequenceDao().upsert(
+            tools.isekai.terminal.data.KeySequence(label = "broken", stepsJson = "{not valid json")
+        )
+        val found = repo.findById(id)!!
+        assertEquals(emptyList<tools.isekai.terminal.input.KeyStep>(), found.steps)
+    }
+
+    @Test fun update_via_upsert_replacesExisting() = runBlocking {
+        val id = repo.save(keySequence("original"))
+        val stored = repo.findById(id)!!
+        repo.save(stored.copy(label = "renamed"))
+        val all = repo.getAll()
+        assertEquals(1, all.size)
+        assertEquals("renamed", all[0].label)
+        assertEquals(id, all[0].id)
+    }
+
+    @Test fun delete_removesFromDb() = runBlocking {
+        val id = repo.save(keySequence("tmux new window"))
+        repo.delete(repo.findById(id)!!)
+        assertTrue(repo.getAll().isEmpty())
+        assertNull(repo.findById(id))
+    }
+
+    @Test fun getAll_emptyDb_returnsEmpty() = runBlocking {
+        assertTrue(repo.getAll().isEmpty())
+    }
+
+    // ── merge ロジック（共通 + プロファイル専用、SnippetRepositoryTest と同じ観点）───
+
+    @Test fun getForProfile_mergesCommonAndProfileSpecific() = runBlocking {
+        val profileId = profileRepo.save(
+            ConnectionProfile(label = "web", host = "h", username = "u", authType = "password")
+        )
+        val otherProfileId = profileRepo.save(
+            ConnectionProfile(label = "db", host = "h2", username = "u", authType = "password")
+        )
+        repo.save(keySequence("common", profileId = null))
+        repo.save(keySequence("web-only", profileId = profileId))
+        repo.save(keySequence("db-only", profileId = otherProfileId))
+
+        val result = repo.getForProfile(profileId).map { it.label }.toSet()
+        assertEquals(setOf("common", "web-only"), result)
+    }
+
+    @Test fun getForProfile_nullProfileId_returnsOnlyCommonKeySequences() = runBlocking {
+        val profileId = profileRepo.save(
+            ConnectionProfile(label = "web", host = "h", username = "u", authType = "password")
+        )
+        repo.save(keySequence("common", profileId = null))
+        repo.save(keySequence("web-only", profileId = profileId))
+
+        val result = repo.getForProfile(null)
+        assertEquals(listOf("common"), result.map { it.label })
+    }
+
+    @Test fun getForProfile_orderedBySortOrderThenLabel() = runBlocking {
+        val profileId = profileRepo.save(
+            ConnectionProfile(label = "web", host = "h", username = "u", authType = "password")
+        )
+        repo.save(keySequence("charlie", profileId = profileId, sortOrder = 1))
+        repo.save(keySequence("alpha", profileId = profileId, sortOrder = 1))
+        repo.save(keySequence("bravo", profileId = profileId, sortOrder = 0))
+
+        val labels = repo.getForProfile(profileId).map { it.label }
+        assertEquals(listOf("bravo", "alpha", "charlie"), labels)
+    }
+}
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
+class KeySequencePackInstallationRepositoryTest {
+    private lateinit var db: AppDatabase
+    private lateinit var profileRepo: ConnectionProfileRepository
+    private lateinit var repo: KeySequencePackInstallationRepository
+
+    @Before fun setup() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        db = Room.inMemoryDatabaseBuilder(ctx, AppDatabase::class.java)
+            .allowMainThreadQueries().build()
+        profileRepo = ConnectionProfileRepository(db.connectionProfileDao())
+        repo = KeySequencePackInstallationRepository(db.keySequencePackInstallationDao())
+    }
+
+    @After fun teardown() { db.close() }
+
+    @Test fun install_thenFindGlobal_returnsInstallation() = runBlocking {
+        repo.install("tmux", version = 1, paramValues = mapOf("prefix" to tools.isekai.terminal.input.KeyStep.CtrlChar('b')))
+        val found = repo.findGlobal("tmux")
+        assertEquals("tmux", found?.packId)
+        assertEquals(mapOf("prefix" to tools.isekai.terminal.input.KeyStep.CtrlChar('b')), found?.paramValues)
+    }
+
+    @Test fun install_calledTwiceForSameGlobalPack_replacesRatherThanDuplicates() = runBlocking {
+        // グローバル有効化(profileId=null)は同一packIdにつき常に高々1行(codexレビュー指摘:
+        // SQLiteのUNIQUE制約はNULL列を重複除外対象外にするため、アプリ側ロジックで保証する)。
+        repo.install("tmux", version = 1, paramValues = mapOf("prefix" to tools.isekai.terminal.input.KeyStep.CtrlChar('b')))
+        repo.install("tmux", version = 1, paramValues = mapOf("prefix" to tools.isekai.terminal.input.KeyStep.CtrlChar('a')))
+
+        val all = repo.getAll()
+        assertEquals(1, all.size)
+        assertEquals(mapOf("prefix" to tools.isekai.terminal.input.KeyStep.CtrlChar('a')), all.single().paramValues)
+    }
+
+    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
+    @Test fun install_calledConcurrently_doesNotCreateDuplicateGlobalRows() = runBlocking {
+        // codexレビュー指摘: install()の「既存行を検索してから書き込む」が2つのDB操作にまたがるため、
+        // Mutexが無いと2つのコルーチンが同時に呼んだ場合に両方が existing == null を見て
+        // グローバル行を2件作りうる。kotlinx.coroutines.sync.Mutex で防いでいることを確認する。
+        val jobs = (1..20).map { i ->
+            GlobalScope.async(Dispatchers.Default) {
+                repo.install("tmux", version = 1, paramValues = mapOf("prefix" to tools.isekai.terminal.input.KeyStep.CtrlChar('a' + (i % 26))))
+            }
+        }
+        jobs.forEach { it.await() }
+
+        assertEquals(1, repo.getAll().size)
+    }
+
+    @Test fun resolveInstallation_profileSpecificTakesPriorityOverGlobal() = runBlocking {
+        val profileId = profileRepo.save(ConnectionProfile(label = "web", host = "h", username = "u", authType = "password"))
+        repo.install("tmux", version = 1, paramValues = mapOf("prefix" to tools.isekai.terminal.input.KeyStep.CtrlChar('b')))
+        repo.install("tmux", version = 1, paramValues = mapOf("prefix" to tools.isekai.terminal.input.KeyStep.CtrlChar('a')), profileId = profileId)
+
+        val resolved = repo.resolveInstallation("tmux", profileId)
+        assertEquals(mapOf("prefix" to tools.isekai.terminal.input.KeyStep.CtrlChar('a')), resolved?.paramValues)
+    }
+
+    @Test fun resolveInstallation_fallsBackToGlobalWhenNoProfileSpecificInstallation() = runBlocking {
+        val profileId = profileRepo.save(ConnectionProfile(label = "web", host = "h", username = "u", authType = "password"))
+        repo.install("tmux", version = 1, paramValues = mapOf("prefix" to tools.isekai.terminal.input.KeyStep.CtrlChar('b')))
+
+        val resolved = repo.resolveInstallation("tmux", profileId)
+        assertEquals(mapOf("prefix" to tools.isekai.terminal.input.KeyStep.CtrlChar('b')), resolved?.paramValues)
+    }
+
+    @Test fun resolveInstallation_returnsNullWhenNotInstalledAnywhere() = runBlocking {
+        assertNull(repo.resolveInstallation("tmux", null))
+    }
+
+    @Test fun uninstall_removesInstallation() = runBlocking {
+        repo.install("tmux", version = 1, paramValues = emptyMap())
+        val installed = repo.findGlobal("tmux")!!
+        repo.uninstall(installed)
+        assertNull(repo.findGlobal("tmux"))
+    }
+}
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
 class KnownHostRepositoryTest {
     private lateinit var db: AppDatabase
     private lateinit var repo: KnownHostRepository
@@ -431,7 +641,7 @@ class AppDatabaseMigration3To4Test {
                 // このコールバックの宣言バージョンは、直前の Room ビルドが作った実ファイルの
                 // user_version（＝AppDatabase の現行 version）と一致させること。ずれると
                 // SQLiteOpenHelper のデフォルト onDowngrade（例外送出）が発火してしまう。
-                .callback(object : SupportSQLiteOpenHelper.Callback(17) {
+                .callback(object : SupportSQLiteOpenHelper.Callback(19) {
                     override fun onCreate(db: SupportSQLiteDatabase) {}
                     override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
                 })
@@ -476,7 +686,7 @@ class AppDatabaseMigration3To4Test {
         createV10Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17)
+            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -493,7 +703,7 @@ class AppDatabaseMigration3To4Test {
         createV10Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17)
+            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19)
             .build()
         try {
             val dao = db.connectionProfileDao()
@@ -542,7 +752,7 @@ class AppDatabaseMigration12To14Test {
                 // このコールバックの宣言バージョンは、直前の Room ビルドが作った実ファイルの
                 // user_version（＝AppDatabase の現行 version）と一致させること。ずれると
                 // SQLiteOpenHelper のデフォルト onDowngrade（例外送出）が発火してしまう。
-                .callback(object : SupportSQLiteOpenHelper.Callback(17) {
+                .callback(object : SupportSQLiteOpenHelper.Callback(19) {
                     override fun onCreate(db: SupportSQLiteDatabase) {}
                     override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
                 })
@@ -593,7 +803,7 @@ class AppDatabaseMigration12To14Test {
         createV12Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17)
+            .addMigrations(AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -617,7 +827,7 @@ class AppDatabaseMigration12To14Test {
         val helper = FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(ctx)
                 .name(dbName)
-                .callback(object : SupportSQLiteOpenHelper.Callback(17) {
+                .callback(object : SupportSQLiteOpenHelper.Callback(19) {
                     override fun onCreate(db: SupportSQLiteDatabase) {}
                     override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
                 })
@@ -669,7 +879,7 @@ class AppDatabaseMigration12To14Test {
         createV13Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17)
+            .addMigrations(AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }

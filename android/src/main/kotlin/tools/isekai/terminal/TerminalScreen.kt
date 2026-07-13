@@ -37,10 +37,13 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import tools.isekai.terminal.data.KeySequence
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.input.KeyStep
 import tools.isekai.terminal.input.KeyboardLayoutMode
 import tools.isekai.terminal.input.TerminalInputView
 import tools.isekai.terminal.input.TerminalKeyEncoder
+import tools.isekai.terminal.input.previewText
 import tools.isekai.terminal.ui.AgentSignConfirmDialog
 import tools.isekai.terminal.ui.AppColors
 import tools.isekai.terminal.ui.HostKeyChangedDialog
@@ -79,6 +82,7 @@ data class TerminalScreenActions(
     val onTrzszDismiss: () -> Unit,
     val onGetSessionLog: () -> String,
     val onSendSnippet: (Snippet) -> Unit,
+    val onSendKeySequence: (List<KeyStep>) -> Unit = {},
     val onRespondAgentSignRequest: (Boolean) -> Unit,
     /** 画面分割(split pane)でこのペインがタップされた時に呼ぶ。フォーカスをこのペインへ
      *  切り替える(タブ横断の`TerminalTabsViewModel.setFocusedPane`への委譲)。分割していない
@@ -111,6 +115,8 @@ fun TerminalScreenBody(
     canReconnect: Boolean,
     actions: TerminalScreenActions,
     snippets: List<Snippet> = emptyList(),
+    keySequences: List<KeySequence> = emptyList(),
+    installedPacks: List<Pair<tools.isekai.terminal.pack.KeySequencePack, tools.isekai.terminal.data.KeySequencePackInstallation>> = emptyList(),
     isActive: Boolean = true,
     hasFocus: Boolean = isActive,
     chromeVisible: Boolean = true,
@@ -134,6 +140,7 @@ fun TerminalScreenBody(
     var showDisconnectDialog by remember { mutableStateOf(false) }
     var selection by remember { mutableStateOf<SelectionRange?>(null) }
     var showSnippetSheet by remember { mutableStateOf(false) }
+    var showKeySequenceSheet by remember { mutableStateOf(false) }
     // Canvas のタップジェスチャーから IME フォーカスを要求するために、
     // 入力用 AndroidView への参照をここで保持する（入力欄自体は下部に描画）。
     var inputView by remember { mutableStateOf<tools.isekai.terminal.input.TerminalInputView?>(null) }
@@ -163,8 +170,12 @@ fun TerminalScreenBody(
         uiState = uiState,
         actions = actions,
         snippets = snippets,
+        keySequences = keySequences,
+        installedPacks = installedPacks,
         showSnippetSheet = showSnippetSheet,
         onDismissSnippetSheet = { showSnippetSheet = false },
+        showKeySequenceSheet = showKeySequenceSheet,
+        onDismissKeySequenceSheet = { showKeySequenceSheet = false },
         visible = isActive && hasFocus,
     )
 
@@ -557,6 +568,7 @@ fun TerminalScreenBody(
                     CtrlBtn("→") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x43)) }
                     CtrlBtn("貼付", onClick = performPaste)
                     CtrlBtn("定型") { showSnippetSheet = true }
+                    CtrlBtn("打鍵") { showKeySequenceSheet = true }
                 }
 
                 // F1〜F12 行（横スクロール、Ctrl キー行を圧迫しないよう別行にする）
@@ -645,8 +657,12 @@ private fun TerminalModalHost(
     uiState: TerminalUiState,
     actions: TerminalScreenActions,
     snippets: List<Snippet>,
+    keySequences: List<KeySequence>,
+    installedPacks: List<Pair<tools.isekai.terminal.pack.KeySequencePack, tools.isekai.terminal.data.KeySequencePackInstallation>>,
     showSnippetSheet: Boolean,
     onDismissSnippetSheet: () -> Unit,
+    showKeySequenceSheet: Boolean,
+    onDismissKeySequenceSheet: () -> Unit,
     visible: Boolean,
 ) {
     if (!visible) return
@@ -695,6 +711,18 @@ private fun TerminalModalHost(
                 onDismissSnippetSheet()
             },
             onDismiss = onDismissSnippetSheet,
+        )
+    }
+
+    if (showKeySequenceSheet) {
+        KeySequencePickerSheet(
+            keySequences = keySequences,
+            installedPacks = installedPacks,
+            onSendSteps = { steps ->
+                actions.onSendKeySequence(steps)
+                onDismissKeySequenceSheet()
+            },
+            onDismiss = onDismissKeySequenceSheet,
         )
     }
 }
@@ -779,6 +807,83 @@ private fun SnippetPickerSheet(
                     }
                 }
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun KeySequencePickerSheet(
+    keySequences: List<KeySequence>,
+    installedPacks: List<Pair<tools.isekai.terminal.pack.KeySequencePack, tools.isekai.terminal.data.KeySequencePackInstallation>>,
+    onSendSteps: (List<KeyStep>) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .navigationBarsPadding()
+                .heightIn(max = 480.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text("打鍵列", style = MaterialTheme.typography.titleMedium)
+            if (keySequences.isEmpty() && installedPacks.isEmpty()) {
+                Text(
+                    "登録された打鍵列がありません。プロファイル一覧の「打鍵列」から追加できます。",
+                    color = Color(0xFFAAAAAA),
+                    fontSize = 13.sp,
+                    modifier = Modifier.padding(vertical = 12.dp),
+                )
+            } else {
+                keySequences.forEach { keySequence ->
+                    KeySequencePickerRow(
+                        label = keySequence.label,
+                        preview = keySequence.steps.previewText(),
+                        onClick = { onSendSteps(keySequence.steps) },
+                    )
+                }
+                installedPacks.forEach { (pack, installation) ->
+                    Text(
+                        pack.name,
+                        color = Color(0xFFAAAAAA),
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                    val resolved = tools.isekai.terminal.pack.KeySequencePackResolver.resolve(pack, installation.paramValues)
+                    resolved.forEach { seq ->
+                        KeySequencePickerRow(
+                            label = seq.label,
+                            preview = seq.steps.previewText(),
+                            onClick = { onSendSteps(seq.steps) },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun KeySequencePickerRow(label: String, preview: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(label, color = Color.White, fontSize = 15.sp)
+            Text(
+                preview,
+                color = Color(0xFF888888),
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+                maxLines = 1,
+            )
         }
     }
 }

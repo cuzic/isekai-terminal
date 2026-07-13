@@ -21,8 +21,11 @@ import org.robolectric.annotation.Config
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.Repositories
 import tools.isekai.terminal.data.Snippet
+import tools.isekai.terminal.input.KeyStep
+import tools.isekai.terminal.input.TerminalKeyEncoder
 import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.TerminalSession
+import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.TransportPreference
 
 /**
@@ -55,6 +58,7 @@ class TerminalTabsViewModelTest {
         runBlocking {
             Repositories.profiles.getAll().forEach { Repositories.profiles.delete(it) }
             Repositories.snippets.getAll().forEach { Repositories.snippets.delete(it) }
+            Repositories.keySequences.getAll().forEach { Repositories.keySequences.delete(it) }
         }
         executor = DumbAppExecutor()
         val sessionFactory: (AppExecutor) -> TerminalSession = {
@@ -431,6 +435,66 @@ class TerminalTabsViewModelTest {
         assertTrue(orchestrators[0].sentBytes.any { it.toString(Charsets.UTF_8) == "echo hi" })
     }
 
+    // ── 打鍵列（KeySequence）─────────────────────────────────────
+
+    private fun screenUpdate(applicationCursorMode: Boolean) =
+        ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, applicationCursorMode, false)
+
+    @Test
+    fun sendKeySequence_sendsResolvedStepsConcatenated() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+
+        // tmux 「新規ウィンドウ」相当: Ctrl+B に続けて 'c'。
+        vm.sendKeySequence(id, listOf(KeyStep.CtrlChar('b'), KeyStep.Text("c")))
+
+        assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x02, 'c'.code.toByte())) })
+    }
+
+    @Test
+    fun sendKeySequence_withoutApplicationCursorMode_usesCsiArrowForm() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        orchestrators[0].simulateScreenUpdate(screenUpdate(applicationCursorMode = false))
+        withTimeout(3000) { while (tab(id).session.state.value.screenUpdate == null) delay(10) }
+
+        vm.sendKeySequence(id, listOf(KeyStep.Special(TerminalKeyEncoder.KC_DPAD_UP)))
+
+        assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x1B, 0x5B, 0x41)) })
+    }
+
+    @Test
+    fun sendKeySequence_withApplicationCursorMode_usesSs3ArrowForm() = runBlocking {
+        // Rust 由来の screenUpdate.applicationCursorMode をそのまま読む(新しいミラー状態を
+        // Kotlin 側に作らない)ことを確認する。
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        orchestrators[0].simulateScreenUpdate(screenUpdate(applicationCursorMode = true))
+        withTimeout(3000) { while (tab(id).session.state.value.screenUpdate == null) delay(10) }
+
+        vm.sendKeySequence(id, listOf(KeyStep.Special(TerminalKeyEncoder.KC_DPAD_UP)))
+
+        assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x1B, 0x4F, 0x41)) })
+    }
+
+    @Test
+    fun sendKeySequenceToPane_unknownPane_doesNotThrow() = runBlocking {
+        val id = vm.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+
+        vm.sendKeySequenceToPane(id, "no-such-pane", listOf(KeyStep.Text("c")))
+
+        assertTrue(orchestrators[0].sentBytes.isEmpty())
+    }
+
     @Test
     fun connectTab_loadsSnippetsForThatProfile() = runBlocking {
         val profileId = Repositories.profiles.save(profile("web"))
@@ -441,6 +505,24 @@ class TerminalTabsViewModelTest {
 
         withTimeout(3000) { while (tab(id).snippets.value.isEmpty()) delay(10) }
         assertEquals(listOf("web-only"), tab(id).snippets.value.map { it.label })
+    }
+
+    @Test
+    fun connectTab_loadsKeySequencesForThatProfile() = runBlocking {
+        val profileId = Repositories.profiles.save(profile("web"))
+        Repositories.keySequences.save(
+            tools.isekai.terminal.data.KeySequence.create(
+                label = "web-only-seq",
+                steps = listOf(KeyStep.CtrlChar('b'), KeyStep.Text("c")),
+                profileId = profileId,
+            )
+        )
+        val savedProfile = Repositories.profiles.findById(profileId)!!
+
+        val id = vm.openTab(savedProfile, "pass")
+
+        withTimeout(3000) { while (tab(id).keySequences.value.isEmpty()) delay(10) }
+        assertEquals(listOf("web-only-seq"), tab(id).keySequences.value.map { it.label })
     }
 
     // ── 接続後自動実行コマンド ────────────────────────────────────
