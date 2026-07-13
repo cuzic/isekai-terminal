@@ -23,7 +23,15 @@ pub(super) fn ctl_socket_forward_enabled() -> bool {
 /// (128bitの乱数トークンで衝突・先取りに耐性を持たせる、`isekai_pipe_core::
 /// sweep_stale_sockets`のprefixスイープとも一致させる)。
 pub(super) fn new_ctl_socket_path() -> String {
-    isekai_pipe_core::ctl_socket_remote_path(&isekai_pipe_core::new_hex_token_128())
+    use rand::RngCore as _;
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(token, "{byte:02x}");
+    }
+    format!("/tmp/isekai-pipe-ctl-{token}.sock")
 }
 
 #[cfg(test)]

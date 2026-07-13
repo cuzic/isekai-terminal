@@ -72,9 +72,6 @@ isekai-protocol = { path = "isekai-protocol" }
 # isekai-bootstrapはisekai-terminal-core/UniFFI/Android専用型に一切依存しないpure寄りの
 # crateなので、この一方向依存は循環しない。
 isekai-bootstrap = { path = "isekai-bootstrap" }
-# ctl socketのパス・prefix生成規約(new_hex_token_128/ctl_socket_remote_path)を
-# isekai-ssh/isekai-pipeと共有するため(transport.rs参照)。
-isekai-pipe-core = { path = "isekai-pipe-core" }
 # Phase 1b(isekai-terminal-core/isekai-transport crate共有化): QUIC接続確立/resume
 # ロジックの共有先。android_quic_endpoint.rsがQuicEndpointFactory等のtraitを
 # FaultyUdpSocket向けに実装し、Phase 1cで実際の接続経路(quic/relay/stun_p2p)を

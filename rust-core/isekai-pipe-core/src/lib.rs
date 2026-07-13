@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 pub use isekai_pipe_protocol::{LogicalHost, ServiceName};
@@ -33,9 +34,6 @@ pub use ctl_gc::sweep_stale_sockets;
 
 mod port_range;
 pub use port_range::parse_port_range;
-
-mod ctl_socket;
-pub use ctl_socket::{ctl_socket_remote_path, new_hex_token_128, CTL_SOCKET_DIR, CTL_SOCKET_FILENAME_PREFIX};
 
 pub const CONNECTION_INTENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_INTENT_TTL: Duration = Duration::from_secs(120);
@@ -381,7 +379,14 @@ fn validate_intent_id(intent_id: &str) -> Result<(), IntentError> {
 }
 
 fn new_intent_id() -> String {
-    new_hex_token_128()
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn unix_ms(time: SystemTime) -> u64 {
