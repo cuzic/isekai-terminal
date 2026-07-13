@@ -103,6 +103,9 @@ fn map_fs_guard_err(path: &Path, err: isekai_fs_guard::FsGuardError) -> TrustErr
         FsGuardError::Stat(source) => TrustError::Stat { path: path.to_path_buf(), source },
         FsGuardError::SetPermissions(source) => TrustError::Write { path: path.to_path_buf(), source },
         FsGuardError::WorldWritable { mode } => TrustError::WorldWritable { path: path.to_path_buf(), mode },
+        FsGuardError::InsecureAcl { principal, rights } => {
+            TrustError::InsecureAcl { path: path.to_path_buf(), principal, rights }
+        }
     }
 }
 

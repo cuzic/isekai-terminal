@@ -33,6 +33,9 @@ pub enum TrustError {
     #[error("{path} is world-writable (mode {mode:o}); refusing to use it")]
     WorldWritable { path: PathBuf, mode: u32 },
 
+    #[error("{path} grants write access to {principal} (rights {rights}); refusing to use it")]
+    InsecureAcl { path: PathBuf, principal: String, rights: String },
+
     #[error("could not determine the home directory (HOME is not set)")]
     NoHomeDir,
 
