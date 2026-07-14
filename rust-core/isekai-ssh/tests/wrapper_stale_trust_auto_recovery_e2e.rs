@@ -239,14 +239,36 @@ fn generate_client_keypair(dir: &std::path::Path) -> (PathBuf, PublicKey) {
     (key_path, public_key)
 }
 
+#[cfg(unix)]
 fn real_ssh_path() -> PathBuf {
     let out = std::process::Command::new("sh").arg("-c").arg("command -v ssh").output().expect("failed to run `command -v ssh`");
     assert!(out.status.success(), "ssh(1) not found on PATH");
     PathBuf::from(String::from_utf8(out.stdout).unwrap().trim().to_string())
 }
 
+/// See `wrapper_auto_bootstrap_e2e.rs::real_ssh_path`'s Windows variant for
+/// why this needs a different implementation from the Unix one above.
+#[cfg(windows)]
+fn real_ssh_path() -> PathBuf {
+    let out = std::process::Command::new("where").arg("ssh.exe").output().expect("failed to run `where ssh.exe`");
+    assert!(out.status.success(), "ssh.exe not found on PATH");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let first = stdout.lines().next().expect("`where ssh.exe` produced no output");
+    PathBuf::from(first.trim())
+}
+
+/// Everything needed to point `isekai-ssh` at a stand-in `ssh(1)` — see
+/// `wrapper_auto_bootstrap_e2e.rs::SshShim` and `ssh_test_shim`'s module
+/// docs for why Windows needs a compiled `.exe` shim (not a `.cmd` batch
+/// file) and Unix a `#!/bin/sh` script.
+struct SshShim {
+    isekai_ssh_path_arg: PathBuf,
+    extra_env: Vec<(&'static str, PathBuf)>,
+    path_env: std::ffi::OsString,
+}
+
 /// Same shape as `wrapper_auto_bootstrap_e2e.rs::shim_ssh_with_bootstrap_config`.
-fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, alias: &str, mock_sshd_addr: SocketAddr, key_path: &std::path::Path) -> std::ffi::OsString {
+fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, alias: &str, mock_sshd_addr: SocketAddr, key_path: &std::path::Path) -> SshShim {
     let config_path = tmp.join("ssh_config_bootstrap");
     let config = format!(
         "Host {alias}\n\
@@ -272,20 +294,29 @@ fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, alias: &str, mock_sshd_
 
     let bin_dir = tmp.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim_path = bin_dir.join("ssh");
-    let shim = format!("#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n", real_ssh = real_ssh_path().display(), config = config_path.display());
-    std::fs::write(&shim_path, shim).unwrap();
+    let real_ssh = real_ssh_path();
+
     #[cfg(unix)]
-    {
+    let (isekai_ssh_path_arg, extra_env) = {
+        let shim_path = bin_dir.join("ssh");
+        let shim = format!("#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n", real_ssh = real_ssh.display(), config = config_path.display());
+        std::fs::write(&shim_path, shim).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+        (shim_path, Vec::new())
+    };
+    #[cfg(windows)]
+    let (isekai_ssh_path_arg, extra_env) = (
+        PathBuf::from(env!("CARGO_BIN_EXE_ssh_test_shim")),
+        vec![("ISEKAI_SSH_TEST_SHIM_REAL_SSH", real_ssh), ("ISEKAI_SSH_TEST_SHIM_CONFIG", config_path)],
+    );
 
     let mut paths = vec![bin_dir];
     if let Some(existing) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&existing));
     }
-    std::env::join_paths(paths).unwrap()
+    let path_env = std::env::join_paths(paths).unwrap();
+    SshShim { isekai_ssh_path_arg, extra_env, path_env }
 }
 
 fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
@@ -384,7 +415,7 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let path_env = shim_ssh_with_bootstrap_config(tmp.path(), "stale-trust-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "stale-trust-host", mock_sshd_addr, &key_path);
 
     // A real, currently-running isekai-pipe serve -- the "already deployed"
     // helper whose cached trust material has gone stale.
@@ -421,11 +452,15 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     }
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .arg("--isekai-ssh-path")
+        .arg(&shim.isekai_ssh_path_arg)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("stale-trust-host")
         .env("HOME", &home)
-        .env("PATH", &path_env)
+        .env("PATH", &shim.path_env)
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .envs(shim.extra_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped()) // deliberately never written to -- Silent mode must not read it
         .stdout(StdStdio::piped())
@@ -508,7 +543,7 @@ async fn wrapper_does_not_auto_recover_when_no_bootstrap_is_set() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let path_env = shim_ssh_with_bootstrap_config(tmp.path(), "stale-no-recover-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "stale-no-recover-host", mock_sshd_addr, &key_path);
 
     let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
@@ -529,10 +564,14 @@ async fn wrapper_does_not_auto_recover_when_no_bootstrap_is_set() {
     let output = tokio::time::timeout(
         Duration::from_secs(20),
         TokioCommand::new(isekai_ssh_bin_path())
+            .arg("--isekai-ssh-path")
+            .arg(&shim.isekai_ssh_path_arg)
             .arg("--isekai-no-bootstrap")
             .arg("stale-no-recover-host")
             .env("HOME", &home)
-            .env("PATH", &path_env)
+            .env("PATH", &shim.path_env)
+            .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+            .envs(shim.extra_env)
             .env_remove("RUST_LOG")
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
@@ -581,7 +620,7 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let path_env = shim_ssh_with_bootstrap_config(tmp.path(), "unreachable-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "unreachable-host", mock_sshd_addr, &key_path);
 
     // A `helper_addr` with nothing listening: bind a UDP socket, note its
     // port, then drop it immediately -- any QUIC dial to it gets no
@@ -610,11 +649,15 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
     }
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .arg("--isekai-ssh-path")
+        .arg(&shim.isekai_ssh_path_arg)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("unreachable-host")
         .env("HOME", &home)
-        .env("PATH", &path_env)
+        .env("PATH", &shim.path_env)
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .envs(shim.extra_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped()) // deliberately never written to -- Silent mode must not read it
         .stdout(StdStdio::piped())
