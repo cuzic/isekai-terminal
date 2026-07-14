@@ -366,13 +366,17 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
     // — proving the default applies to a host nobody configured by name.
     let ssh_dir = home.join(".ssh");
     std::fs::create_dir_all(&ssh_dir).unwrap();
-    let remote_path = remote_home.join("deployed-isekai-pipe");
+    // `~/deployed-isekai-pipe` (not an absolute local path): the mock sshd
+    // resolves `~` via the real `sh` it execs commands through (`HOME` set
+    // to `remote_home` by `FakeShellHandler`), the same technique
+    // `wrapper_auto_bootstrap_e2e.rs::wrapper_auto_bootstrap_honors_remote_path_directive`
+    // uses. An absolute Windows path here would embed a `:` (the drive
+    // letter separator), which `remote_path`'s own validation rejects
+    // outright as an invalid *remote* (always-POSIX, `ISEKAI_PIPE_DESIGN.md`)
+    // path — confirmed via a real `test-windows` CI failure.
     std::fs::write(
         ssh_dir.join("config"),
-        format!(
-            "Host *\n    #@isekai bootstrap-relay addr=203.0.113.10:443 sni=relay.example.com\n    #@isekai remote-path {}\n",
-            remote_path.display()
-        ),
+        "Host *\n    #@isekai bootstrap-relay addr=203.0.113.10:443 sni=relay.example.com\n    #@isekai remote-path ~/deployed-isekai-pipe\n",
     )
     .unwrap();
 
