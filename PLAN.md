@@ -1348,16 +1348,52 @@ Android側は`compileDebugKotlin`/`compileDebugUnitTestKotlin`/`compileDebugAndr
 とJVMユニットテスト全体の無回帰を確認済み。
 
 **既知の残作業**:
-- **iOS未実装**: `ios/Sources/IsekaiTerminalCore/TerminalSessionController.swift`は現状
-  `NWPathMonitor`の`satisfied`転送のみで、Android の`PhysicalPathProvider`
-  （`Network.bindSocket()`相当）に当たる、WiFi/セルラーを個別インターフェースに
-  バインドする仕組みが無い。iOSでは`IP_BOUND_IF`/`IPV6_BOUND_IF`ソケットオプションを
-  interface index経由で使う新規実装が必要（この開発環境にSwiftツールチェーンが
-  無くコンパイル確認ができないため、本Phaseでは着手していない。macOS/Xcode環境での
-  実装が必要）。
 - **実機検証未実施**: 本物のカフェWiFi等での「上流サイレント死→セルラー切替→WiFi復帰→
   静けさ待ち→自動復帰」の一気通貫は、Phase 9-4bと同様まだloopbackテストのみで、
   実機・実ネットワークでの最終検証が残っている。
+
+**Phase 9-6追記: iOS実装（Task #15/#16、macOS GitHub Actionsランナー上での実装）**
+
+この開発環境（Linuxサンドボックス、Swiftツールチェーン無し）から直接iOSコードを
+コンパイル確認することはできないため、Android版と1:1対応する構造で実装したうえで
+macOS GitHub Actionsランナー（`ios-app-build-check.yml`/`ios-rust-core-check.yml`、
+共に`macos-26`）でのビルド・テストに検証を委ねる方針にした。
+
+- 新規`ios/Sources/IsekaiTerminalCore/PhysicalPathProvider.swift`（#15）: Android版
+  `PhysicalPathProvider.acquireWifiOnly()`/`acquireCellularOnly()`のiOS版。
+  `NWPathMonitor.availableInterfaces`からWiFi/セルラーそれぞれの`NWInterface`
+  （`.index`/`.name`）を取得し、`setsockopt(IPPROTO_IP, IP_BOUND_IF)`でUDPソケットを
+  明示的にそのインターフェースへバインドしたうえで、`getifaddrs(3)`で取得した
+  実際のIPv4アドレスへ`bind(2)`する（Android版がワイルドカードbindを避けて
+  `LinkProperties`から実IPv4アドレスを取得するのと同じ理由）。Android版の
+  `ConnectivityManager.requestNetwork`のタイムアウト付き非同期待機と対称に、
+  呼び出しごとに使い捨ての`NWPathMonitor`をタイムアウト付きで待つ設計にした
+  （長命の監視状態を持ち回さない）。IPv4のみ対応（Android版と同じ制約、IPv6は
+  将来課題）。
+- `TerminalSessionController.swift`（#16）: `onRequestWifiFd`/`onRequestCellularFd`の
+  暫定スタブ（コミット`1513132`）を`physicalPathProvider`呼び出しに置き換え、
+  `onRebindStateChanged`を`TerminalUIState.rebindState`（新規`@Published`）へ反映する
+  実装に、`forceReturnToWifi()`（`orchestrator.forceReturnToWifi()`への薄い委譲）を
+  追加した。
+- `TerminalView.swift`: Android版`TerminalScreen.kt`の「今すぐWiFiに戻す」ボタンと
+  同じ表示条件（`connected && rebindState != nil && rebindState != .onWifi`、
+  `RebindPublicState`だけを見て判定しSwift側でミラー状態は持たない）で
+  `forceReturnToWifiButton`を追加。
+- `ios/Tests/IsekaiTerminalCoreTests/PhysicalPathProviderTests.swift`を新規追加。
+  Simulator環境では物理WiFi/セルラーインターフェースが実機と同じ形で存在するとは
+  限らない（特にセルラーはSimulatorに無いことが多い）ため、「取得できればfdが
+  有効であること」「取得できなければクラッシュせずnilを返すこと」の両方を許容する
+  設計にした。
+- **未検証（この環境の制約）**: 上記コードはこの開発環境でコンパイルされていない。
+  macOS GitHub Actionsランナーでの`ios-rust-core-check.yml`（`xcodebuild test -scheme
+  IsekaiTerminalCore-Package`、新規テストを含む）・`ios-app-build-check.yml`
+  （実機Simulatorアプリビルド）の実行結果で初めてコンパイル可否・テスト結果が
+  確定する。
+- **Simulator制約（Task #15のサブタスク）**: SimulatorはmacOSホストのネットワークを
+  仮想化しているため、`IP_BOUND_IF`によるインターフェース分離が実機と同じように
+  機能するとは限らない。特に物理セルラーインターフェースはSimulatorに存在しない
+  ことが多く、`acquireCellularFd()`はCI上では常に`nil`を返す可能性が高い
+  （設計上は正常系として許容される）。実機での動作確認は#17が担う。
 
 ---
 
