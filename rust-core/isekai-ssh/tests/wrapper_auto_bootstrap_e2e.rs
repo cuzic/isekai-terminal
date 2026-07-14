@@ -40,6 +40,22 @@ fn isekai_ssh_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_isekai-ssh"))
 }
 
+/// Renders `path` with forward slashes, safe to embed inside a `#!/bin/sh`
+/// script body that will be interpreted by `sh -c`/`sh <script>` (the
+/// stand-in "remote helper" scripts below, run inside the mock sshd's
+/// `exec_request` handler). Needed only on Windows: `Path::display()`
+/// there renders `\`-separated components, and an unquoted `\` inside a
+/// POSIX shell script is an escape character — embedding a raw Windows
+/// path like `echo "$@" > {path}` silently mangles it (confirmed via a
+/// real `test-windows` CI failure: the script ran, but wrote its argv log
+/// to a corrupted path, not the one the test later reads from). Windows'
+/// own filesystem APIs accept forward slashes exactly as well as
+/// backslashes, so this is a lossless substitution, not a real path
+/// translation. A no-op on Unix, where paths are already `/`-separated.
+fn posix_safe_path(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
 async fn read_all<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     r.read_to_end(&mut buf).await?;
@@ -94,6 +110,18 @@ impl server::Handler for FakeShellHandler {
             .arg("-c")
             .arg(&command)
             .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
             .stdin(StdStdio::piped())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::piped())
@@ -448,6 +476,18 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
         .arg(&helper_script_path)
         .arg("auto-bootstrap-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -542,6 +582,18 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
         .arg(&helper_script_path)
         .arg("alias-only-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -628,6 +680,18 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
         .arg(&helper_script_path)
         .arg("remote-path-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -717,7 +781,7 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
     std::fs::write(
         &helper_script_path,
-        format!("#!/bin/sh\necho \"$@\" > {}\necho '{report_with_stun}'\n", argv_log.display()),
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{report_with_stun}'\n", posix_safe_path(&argv_log)),
     )
     .unwrap();
     #[cfg(unix)]
@@ -733,6 +797,18 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
         .arg(&helper_script_path)
         .arg("stun-directive-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -833,7 +909,7 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
     std::fs::write(
         &helper_script_path,
-        format!("#!/bin/sh\necho \"$@\" > {}\necho '{report_with_relay}'\n", argv_log.display()),
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{report_with_relay}'\n", posix_safe_path(&argv_log)),
     )
     .unwrap();
     #[cfg(unix)]
@@ -849,6 +925,18 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
         .arg(&helper_script_path)
         .arg("bootstrap-relay-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -934,6 +1022,18 @@ async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
         .arg(&helper_script_path)
         .arg("declined-bootstrap-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
