@@ -1,4 +1,5 @@
 import Darwin
+import Foundation
 import Network
 
 /// Phase 9-6(#15): WiFi/セルラー物理インターフェースにそれぞれ`IP_BOUND_IF`で明示的に
