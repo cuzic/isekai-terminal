@@ -592,6 +592,16 @@ async fn init_then_connect_succeeds_for_a_freshly_deployed_host() {
             .arg("testuser@dummy-host")
             .arg("echo hello-from-init-then-connect")
             .env("HOME", &home)
+            // `isekai-pipe connect` (spawned as this `ssh`'s `ProxyCommand`
+            // child, inheriting this env) looks up the profile `init` just
+            // registered via `isekai_pipe_core::default_profiles_dir`,
+            // which checks `LOCALAPPDATA` before `HOME` on Windows -- see
+            // `wrapper_auto_bootstrap_e2e.rs`'s equivalent comment for why
+            // `HOME` alone doesn't redirect it there (confirmed via a real
+            // `test-windows` CI failure: without this, `connect` reported
+            // the fresh profile as untrusted, looking in the real CI
+            // runner's actual `%LOCALAPPDATA%` instead).
+            .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
             .output(),
     )
     .await
