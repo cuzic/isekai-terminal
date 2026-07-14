@@ -1384,11 +1384,16 @@ macOS GitHub Actionsランナー（`ios-app-build-check.yml`/`ios-rust-core-chec
   限らない（特にセルラーはSimulatorに無いことが多い）ため、「取得できればfdが
   有効であること」「取得できなければクラッシュせずnilを返すこと」の両方を許容する
   設計にした。
-- **未検証（この環境の制約）**: 上記コードはこの開発環境でコンパイルされていない。
-  macOS GitHub Actionsランナーでの`ios-rust-core-check.yml`（`xcodebuild test -scheme
-  IsekaiTerminalCore-Package`、新規テストを含む）・`ios-app-build-check.yml`
-  （実機Simulatorアプリビルド）の実行結果で初めてコンパイル可否・テスト結果が
-  確定する。
+- **macOS CIでの検証結果**: PR #11でmacOS GitHub Actionsランナー（`macos-26`）の
+  `ios-rust-core-check.yml`（`xcodebuild test -scheme IsekaiTerminalCore-Package`、
+  新規`PhysicalPathProviderTests`含む）・`ios-app-build-check.yml`（実機Simulator
+  アプリビルド+テスト）・`ios-ssh-vertical-slice-check.yml`が全てgreenであることを
+  確認した(2026-07-14)。初回pushでは`PhysicalPathProvider.swift`が`Foundation`の
+  import漏れで`TimeInterval`を解決できずビルド失敗していた（`Darwin`/`Network`だけ
+  ではFoundationは暗黙にimportされない）ため、`import Foundation`を追加して修正。
+  `ios-app-build-check.yml`は1回目の実行がちょうど`timeout-minutes: 30`の境界で
+  `cancelled`になった(全ステップは`success`表示で実質的な失敗ではなかった)ため
+  再実行してgreenを確認した。
 - **Simulator制約（Task #15のサブタスク）**: SimulatorはmacOSホストのネットワークを
   仮想化しているため、`IP_BOUND_IF`によるインターフェース分離が実機と同じように
   機能するとは限らない。特に物理セルラーインターフェースはSimulatorに存在しない
