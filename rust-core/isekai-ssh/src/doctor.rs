@@ -66,6 +66,10 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         extra_isekai_args.push("--isekai-helper-binary".to_string());
         extra_isekai_args.push(helper_binary.display().to_string());
     }
+    if let Some(ssh_path) = &args.ssh_path {
+        extra_isekai_args.push("--isekai-ssh-path".to_string());
+        extra_isekai_args.push(ssh_path.display().to_string());
+    }
     let (plan, resolution) = crate::wrapper::resolve_profile_for_destination(&args.host, extra_isekai_args)
         .await
         .with_context(|| format!("isekai-ssh doctor: failed to resolve {:?}", args.host))?;
