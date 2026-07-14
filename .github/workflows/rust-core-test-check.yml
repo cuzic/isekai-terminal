@@ -208,15 +208,23 @@ jobs:
         working-directory: rust-core
         run: cargo test --workspace --exclude noq-multipath-spike --exclude isekai-terminal-core --exclude uniffi-bindgen --lib --bins
 
-      # Windows公式サポート化(進行中)のパイロット: isekai-sshのmock sshdベース
-      # e2eテストのうち、`ssh.cmd`シム(`.bat`パススルー、`wrapper_auto_bootstrap_e2e.rs`の
-      # write_ssh_shim参照)にWindows対応したものだけ、ここで個別に明示実行する。
+      # Windows公式サポート化(進行中): isekai-sshのmock sshdベースe2eテストの
+      # うち、ssh_test_shim(コンパイル済み.exeパススルー、
+      # `wrapper_auto_bootstrap_e2e.rs::write_ssh_shim`/`src/bin/ssh_test_shim.rs`
+      # 参照)経由でWindows対応した5ファイルをここで個別に明示実行する。
       # 上のjobコメント(187-200行目)の「Unix依存のe2e統合テストは対象外」は
-      # 依然として大半のe2eテストに当てはまるが、この1本は実際にWindows動作を
-      # 検証済みにするための足がかり。green確認でき次第、他のe2eファイルにも
-      # 同じシム方式を展開し、このステップも`--tests`ベースの段階的な拡張へ
-      # 統合していく(isekai-ssh-windows-support一連の変更、進行中)。
-      - name: cargo test --test wrapper_auto_bootstrap_e2e -p isekai-ssh (Windows, ssh.cmd shim pilot)
+      # real_sshd_*系(接続先が常にLinuxである前提を検証するテスト、
+      # `setsid`等Unix専用のリモート挙動)や`isekai-bootstrap/tests/openssh_e2e.rs`
+      # には引き続き当てはまるが、この5本(isekai-sshクライアント自身の
+      # Windows上での挙動を検証するテスト)は実機で検証済み。green確認でき
+      # 次第、`--tests`ベースの段階的な拡張(残りのcrateへの展開)へ統合して
+      # いく(isekai-ssh-windows-support一連の変更、進行中)。
+      - name: cargo test -p isekai-ssh (Windows, ssh_test_shim対応e2eファイルのみ明示実行)
         shell: bash
         working-directory: rust-core
-        run: cargo test -p isekai-ssh --test wrapper_auto_bootstrap_e2e
+        run: |
+          cargo test -p isekai-ssh --test wrapper_auto_bootstrap_e2e
+          cargo test -p isekai-ssh --test doctor_e2e
+          cargo test -p isekai-ssh --test init_e2e
+          cargo test -p isekai-ssh --test wrapper_auto_download_relay_bootstrap_e2e
+          cargo test -p isekai-ssh --test wrapper_stale_trust_auto_recovery_e2e
