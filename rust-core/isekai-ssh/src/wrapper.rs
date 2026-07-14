@@ -711,7 +711,17 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
     isekai_bootstrap_plan::BootstrapPlan::validate_jump_chain(&target, &via)
         .with_context(|| format!("invalid --via chain {:?}", candidate.via))?;
 
-    let backend = OpenSshBackend::new();
+    // `plan.openssh_path` (defaults to bare `"ssh"`, PATH-resolved; overridable
+    // via `--isekai-ssh-path`) must be the same `ssh(1)` this backend's
+    // `uname -m` probe/deploy dial use as the one `run_ssh_once`/`resolve_openssh_effective_config`
+    // use for the final connection — `OpenSshBackend::new()`'s own default is
+    // also bare `"ssh"`, so this was previously silently consistent only by
+    // coincidence (whenever `--isekai-ssh-path` wasn't passed). On Windows
+    // this matters concretely: a `.cmd`/`.bat` shim on `%PATH%` is *not*
+    // found by `Command::new("ssh")`'s bare-name resolution (only `.exe` is
+    // implicit), so an explicit path is the only way either call site can
+    // ever reach it.
+    let backend = OpenSshBackend::new().with_ssh_program(plan.openssh_path.to_string_lossy().into_owned());
     let helper_binary_was_explicit = plan.isekai.helper_binary.is_some();
     let helper_binary = crate::helper_download::resolve_helper_binary(
         plan.isekai.helper_binary.as_deref(),

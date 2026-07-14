@@ -40,6 +40,22 @@ fn isekai_ssh_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_isekai-ssh"))
 }
 
+/// Renders `path` with forward slashes, safe to embed inside a `#!/bin/sh`
+/// script body that will be interpreted by `sh -c`/`sh <script>` (the
+/// stand-in "remote helper" scripts below, run inside the mock sshd's
+/// `exec_request` handler). Needed only on Windows: `Path::display()`
+/// there renders `\`-separated components, and an unquoted `\` inside a
+/// POSIX shell script is an escape character — embedding a raw Windows
+/// path like `echo "$@" > {path}` silently mangles it (confirmed via a
+/// real `test-windows` CI failure: the script ran, but wrote its argv log
+/// to a corrupted path, not the one the test later reads from). Windows'
+/// own filesystem APIs accept forward slashes exactly as well as
+/// backslashes, so this is a lossless substitution, not a real path
+/// translation. A no-op on Unix, where paths are already `/`-separated.
+fn posix_safe_path(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
 async fn read_all<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     r.read_to_end(&mut buf).await?;
@@ -94,6 +110,18 @@ impl server::Handler for FakeShellHandler {
             .arg("-c")
             .arg(&command)
             .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
             .stdin(StdStdio::piped())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::piped())
@@ -181,6 +209,7 @@ fn generate_client_keypair(dir: &std::path::Path) -> (PathBuf, PublicKey) {
     (key_path, public_key)
 }
 
+#[cfg(unix)]
 fn real_ssh_path() -> PathBuf {
     let out = std::process::Command::new("sh")
         .arg("-c")
@@ -189,6 +218,127 @@ fn real_ssh_path() -> PathBuf {
         .expect("failed to run `command -v ssh`");
     assert!(out.status.success(), "ssh(1) not found on PATH");
     PathBuf::from(String::from_utf8(out.stdout).unwrap().trim().to_string())
+}
+
+/// Windows counterpart of the `sh -c "command -v ssh"` above. Deliberately
+/// *not* the same implementation: under Git Bash/MSYS2, `command -v ssh`
+/// resolves to a POSIX-style path (e.g. `/usr/bin/ssh`), which
+/// `ssh_test_shim` (a real Win32 `Command`, not a shell) can't invoke
+/// directly. `where.exe` (a built-in Windows command, distinct from Git
+/// Bash's `which`) resolves via `%PATH%`/`%PATHEXT%` and returns a native
+/// `C:\...\ssh.exe`-shaped path instead.
+#[cfg(windows)]
+fn real_ssh_path() -> PathBuf {
+    let out = std::process::Command::new("where").arg("ssh.exe").output().expect("failed to run `where ssh.exe`");
+    assert!(out.status.success(), "ssh.exe not found on PATH");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let first = stdout.lines().next().expect("`where ssh.exe` produced no output");
+    PathBuf::from(first.trim())
+}
+
+/// Everything needed to point `isekai-ssh` (and everything it internally
+/// spawns — `wrapper.rs::run_ssh_once`/`resolve_openssh_effective_config`
+/// *and* `isekai-bootstrap::OpenSshBackend`'s own deploy dial) at a stand-in
+/// `ssh(1)` that always injects `-F <config_path>` ahead of whatever real
+/// `ssh(1)` arguments it's given, without touching the test runner's actual
+/// `~/.ssh/config`.
+struct SshShim {
+    /// Pass as `--isekai-ssh-path` when spawning `isekai-ssh`.
+    path: PathBuf,
+    /// Extra env vars to set on the spawned `isekai-ssh` process (empty on
+    /// Unix; see `ssh_test_shim`'s module docs for why Windows needs them).
+    extra_env: Vec<(&'static str, PathBuf)>,
+}
+
+/// Unix: a `#!/bin/sh` script written into `bin_dir` (needs `+x`, since
+/// `Command::new(&plan.openssh_path)` execs it directly, and the kernel's
+/// own `exec()` understands the shebang regardless of the file's
+/// extension). `--isekai-ssh-path` isn't strictly required here (PATH
+/// alone would find it), but is passed anyway so callers don't need a
+/// second, platform-specific code path — see the Windows variant below for
+/// why *it* genuinely can't rely on PATH-shadowing alone.
+#[cfg(unix)]
+fn write_ssh_shim(bin_dir: &std::path::Path, real_ssh: &std::path::Path, config_path: &std::path::Path) -> SshShim {
+    let shim_path = bin_dir.join("ssh");
+    let shim =
+        format!("#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n", real_ssh = real_ssh.display(), config = config_path.display());
+    std::fs::write(&shim_path, shim).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    SshShim { path: shim_path, extra_env: Vec::new() }
+}
+
+/// Windows: no file is written at all — the shim is `ssh_test_shim`, a real
+/// compiled `.exe` (`src/bin/ssh_test_shim.rs`, already built by `cargo
+/// test` itself, found via `CARGO_BIN_EXE_ssh_test_shim`). Two earlier
+/// approaches were tried and abandoned (real `test-windows` CI failures at
+/// each step, see git history and `ssh_test_shim`'s own module docs for the
+/// full story):
+/// 1. A bare POSIX shebang script named `ssh`: `Command::new`/`CreateProcessW`
+///    doesn't interpret shebangs, and doesn't even find an extension-less
+///    file from a bare name.
+/// 2. A `ssh.cmd` batch-file pass-through, invoked via `--isekai-ssh-path`
+///    (bare `Command::new("ssh")` only implicitly resolves `.exe`, not
+///    `.cmd`, so a `--isekai-ssh-path` pointing directly at the shim was
+///    also needed then, unlike Unix's PATH-shadowing): this got invoked
+///    correctly, but `std::process::Command`'s Windows batch-file
+///    argument-safety validation (CVE-2024-24576/"BatBadBut") rejects any
+///    argument containing `\r`/`\n` outright — and the real bootstrap
+///    deploy step's remote command is exactly such a multi-line string.
+///
+/// A genuine `.exe` sidesteps both problems: it's never treated as a batch
+/// file (no argument-safety special-casing applies), and ordinary Win32
+/// argv passing handles embedded newlines within a single argument fine.
+#[cfg(windows)]
+fn write_ssh_shim(_bin_dir: &std::path::Path, real_ssh: &std::path::Path, config_path: &std::path::Path) -> SshShim {
+    let shim_path = PathBuf::from(env!("CARGO_BIN_EXE_ssh_test_shim"));
+    expose_msys_dll_next_to(&shim_path, real_ssh);
+    SshShim {
+        path: shim_path,
+        extra_env: vec![
+            ("ISEKAI_SSH_TEST_SHIM_REAL_SSH", real_ssh.to_path_buf()),
+            ("ISEKAI_SSH_TEST_SHIM_CONFIG", config_path.to_path_buf()),
+        ],
+    }
+}
+
+/// `wrapper.rs::proxy_command` decides whether the *real* connect step's
+/// `ProxyCommand` needs POSIX single-quoting (`wrapper.rs::is_posix_shell_ssh`)
+/// by checking for `msys-2.0.dll`/`cygwin1.dll` next to the *resolved*
+/// `--isekai-ssh-path` binary. That binary is `ssh_test_shim.exe` here, not
+/// the real MSYS2-hosted `ssh.exe` it execs internally — so without this,
+/// the check incorrectly concludes "not POSIX-shell", skips the quoting
+/// that assumption requires, and the connect step's embedded Windows path
+/// gets its backslashes silently eaten when the real (POSIX-shell) ssh
+/// actually execs the `ProxyCommand` via its own `sh -c` (confirmed via a
+/// real `test-windows` CI failure on `wrapper_stale_trust_auto_recovery_e2e.rs`:
+/// `sh -c` reported `exec: <path with every `\` stripped>: not found`, the
+/// same class of bug `posix_safe_path` fixes for a different embedding
+/// site). Copying the same companion DLL next to the shim makes that
+/// detection see the same thing it would for the real `ssh.exe`. A no-op
+/// (and harmless to call repeatedly/concurrently across tests sharing this
+/// crate's `target/`) if neither DLL exists next to `real_ssh` at all.
+#[cfg(windows)]
+fn expose_msys_dll_next_to(shim_path: &std::path::Path, real_ssh: &std::path::Path) {
+    let Some(real_ssh_dir) = real_ssh.parent() else { return };
+    let Some(shim_dir) = shim_path.parent() else { return };
+    for dll in ["msys-2.0.dll", "cygwin1.dll"] {
+        let src = real_ssh_dir.join(dll);
+        if src.is_file() {
+            let _ = std::fs::copy(&src, shim_dir.join(dll));
+        }
+    }
+}
+
+/// `--isekai-ssh-path <shim.path>` plus `shim.extra_env` — see `SshShim`'s
+/// docs. `isekai-bootstrap::OpenSshBackend`'s deploy dial only honors
+/// `--isekai-ssh-path` because `wrapper.rs::bootstrap_and_register` now
+/// threads `plan.openssh_path` into `OpenSshBackend::with_ssh_program`
+/// (previously it silently used its own bare-`"ssh"` default regardless of
+/// this flag — a real, if previously harmless-on-Unix, inconsistency this
+/// Windows work surfaced; see that function's own doc comment).
+fn ssh_shim_args_and_env(shim: &SshShim) -> (Vec<std::ffi::OsString>, Vec<(&'static str, PathBuf)>) {
+    (vec!["--isekai-ssh-path".into(), shim.path.clone().into()], shim.extra_env.clone())
 }
 
 /// Same technique as `init_e2e.rs::shim_ssh_with_bootstrap_config`: a tiny
@@ -203,7 +353,7 @@ fn shim_ssh_with_bootstrap_config(
     alias: &str,
     mock_sshd_addr: SocketAddr,
     key_path: &std::path::Path,
-) -> (PathBuf, std::ffi::OsString) {
+) -> (PathBuf, std::ffi::OsString, SshShim) {
     let config_path = tmp.join("ssh_config_bootstrap");
     let config = format!(
         "Host {alias}\n\
@@ -233,18 +383,7 @@ fn shim_ssh_with_bootstrap_config(
 
     let bin_dir = tmp.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim_path = bin_dir.join("ssh");
-    let shim = format!(
-        "#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n",
-        real_ssh = real_ssh_path().display(),
-        config = config_path.display(),
-    );
-    std::fs::write(&shim_path, shim).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let shim = write_ssh_shim(&bin_dir, &real_ssh_path(), &config_path);
 
     let path_env = {
         let mut paths = vec![bin_dir.clone()];
@@ -253,7 +392,7 @@ fn shim_ssh_with_bootstrap_config(
         }
         std::env::join_paths(paths).unwrap()
     };
-    (bin_dir, path_env)
+    (bin_dir, path_env, shim)
 }
 
 /// Regression test fixture for the alias-vs-resolved-`HostName` bug
@@ -273,7 +412,7 @@ fn shim_ssh_with_alias_only_bootstrap_config(
     alias: &str,
     mock_sshd_addr: SocketAddr,
     key_path: &std::path::Path,
-) -> (PathBuf, std::ffi::OsString) {
+) -> (PathBuf, std::ffi::OsString, SshShim) {
     let config_path = tmp.join("ssh_config_bootstrap_alias_only");
     let config = format!(
         "Host {alias}\n\
@@ -291,18 +430,7 @@ fn shim_ssh_with_alias_only_bootstrap_config(
 
     let bin_dir = tmp.join("bin-alias-only");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim_path = bin_dir.join("ssh");
-    let shim = format!(
-        "#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n",
-        real_ssh = real_ssh_path().display(),
-        config = config_path.display(),
-    );
-    std::fs::write(&shim_path, shim).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let shim = write_ssh_shim(&bin_dir, &real_ssh_path(), &config_path);
 
     let path_env = {
         let mut paths = vec![bin_dir.clone()];
@@ -311,7 +439,7 @@ fn shim_ssh_with_alias_only_bootstrap_config(
         }
         std::env::join_paths(paths).unwrap()
     };
-    (bin_dir, path_env)
+    (bin_dir, path_env, shim)
 }
 
 fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
@@ -354,7 +482,7 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_bootstrap_config(tmp.path(), "auto-bootstrap-host", mock_sshd_addr, &key_path);
 
     // Stand-in for the isekai-helper binary: ignores its args, just emits
@@ -372,10 +500,24 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
     assert!(!profile_path.exists(), "profile must not exist before this test runs");
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("auto-bootstrap-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -449,7 +591,7 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_alias_only_bootstrap_config(tmp.path(), "alias-only-host", mock_sshd_addr, &key_path);
 
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
@@ -464,10 +606,24 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
     assert!(!profile_path.exists(), "profile must not exist before this test runs");
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("alias-only-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -524,7 +680,7 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_bootstrap_config(tmp.path(), "remote-path-host", mock_sshd_addr, &key_path);
 
     // The wrapper's own directive parsing falls back to `$HOME/.ssh/config`
@@ -548,10 +704,24 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
     }
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("remote-path-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -617,7 +787,7 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_bootstrap_config(tmp.path(), "stun-directive-host", mock_sshd_addr, &key_path);
 
     let ssh_dir = home.join(".ssh");
@@ -641,7 +811,7 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
     std::fs::write(
         &helper_script_path,
-        format!("#!/bin/sh\necho \"$@\" > {}\necho '{report_with_stun}'\n", argv_log.display()),
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{report_with_stun}'\n", posix_safe_path(&argv_log)),
     )
     .unwrap();
     #[cfg(unix)]
@@ -651,10 +821,24 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
     }
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("stun-directive-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -726,7 +910,7 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_bootstrap_config(tmp.path(), "bootstrap-relay-host", mock_sshd_addr, &key_path);
 
     let ssh_dir = home.join(".ssh");
@@ -755,7 +939,7 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
     std::fs::write(
         &helper_script_path,
-        format!("#!/bin/sh\necho \"$@\" > {}\necho '{report_with_relay}'\n", argv_log.display()),
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{report_with_relay}'\n", posix_safe_path(&argv_log)),
     )
     .unwrap();
     #[cfg(unix)]
@@ -765,10 +949,24 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
     }
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("bootstrap-relay-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -834,7 +1032,7 @@ async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_bootstrap_config(tmp.path(), "declined-bootstrap-host", mock_sshd_addr, &key_path);
 
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
@@ -848,10 +1046,24 @@ async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
     let profile_path = profile_path_under(&home, "declined-bootstrap-host:22");
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("declined-bootstrap-host")
         .env("HOME", &home)
+        // `isekai_pipe_core::profile::default_profiles_dir` checks
+        // `LOCALAPPDATA` *before* `HOME` on Windows (by design — see that
+        // function's own doc comment), so `.env("HOME", &home)` alone
+        // doesn't redirect the profile directory there the way it does on
+        // Unix; it would still resolve against the real CI runner's actual
+        // `%LOCALAPPDATA%` (confirmed via a real `test-windows` CI
+        // failure). `ISEKAI_PIPE_PROFILES_DIR` is that function's top
+        // priority override on every platform, and set to the exact same
+        // path its `HOME`-based branch already computes, so this is a
+        // no-op on Unix (byte-identical to today's implicit resolution)
+        // and the only thing that works on Windows.
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
