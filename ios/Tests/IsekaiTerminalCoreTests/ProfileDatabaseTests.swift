@@ -494,7 +494,7 @@ final class ProfileDatabaseTests: XCTestCase {
             try await group.waitForAll()
         }
 
-        let all = try db.dbQueue.read { db in try KeySequencePackInstallation.fetchAll(db) }
+        let all = try await db.dbQueue.read { db in try KeySequencePackInstallation.fetchAll(db) }
         XCTAssertEqual(all.count, 1)
     }
 }
