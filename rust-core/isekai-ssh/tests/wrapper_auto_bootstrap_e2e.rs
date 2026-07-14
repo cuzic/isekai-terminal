@@ -181,6 +181,7 @@ fn generate_client_keypair(dir: &std::path::Path) -> (PathBuf, PublicKey) {
     (key_path, public_key)
 }
 
+#[cfg(unix)]
 fn real_ssh_path() -> PathBuf {
     let out = std::process::Command::new("sh")
         .arg("-c")
@@ -189,6 +190,67 @@ fn real_ssh_path() -> PathBuf {
         .expect("failed to run `command -v ssh`");
     assert!(out.status.success(), "ssh(1) not found on PATH");
     PathBuf::from(String::from_utf8(out.stdout).unwrap().trim().to_string())
+}
+
+/// Windows counterpart of the `sh -c "command -v ssh"` above. Deliberately
+/// *not* the same implementation: under Git Bash/MSYS2, `command -v ssh`
+/// resolves to a POSIX-style path (e.g. `/usr/bin/ssh`), which the
+/// `ssh.cmd` shim (`write_ssh_shim`'s Windows branch) can't invoke — a
+/// `.cmd` file runs under native `cmd.exe`, which needs a native
+/// `C:\...\ssh.exe`-shaped path. `where.exe` (a built-in Windows command,
+/// distinct from Git Bash's `which`) resolves via `%PATH%`/`%PATHEXT%` and
+/// returns exactly that shape.
+#[cfg(windows)]
+fn real_ssh_path() -> PathBuf {
+    let out = std::process::Command::new("where").arg("ssh.exe").output().expect("failed to run `where ssh.exe`");
+    assert!(out.status.success(), "ssh.exe not found on PATH");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let first = stdout.lines().next().expect("`where ssh.exe` produced no output");
+    PathBuf::from(first.trim())
+}
+
+/// Writes a stand-in `ssh` executable in `bin_dir` that always injects `-F
+/// <config_path>` before forwarding to `real_ssh` — used both for the
+/// wrapper's own internal `ssh -G` call
+/// (`wrapper.rs::resolve_openssh_effective_config`) and the real `ssh` exec
+/// at the end of `run()`, so both see the same resolved config without
+/// touching the test runner's actual `~/.ssh/config`.
+///
+/// Unix: a `#!/bin/sh` script (needs `+x`, since `wrapper.rs::run_ssh_once`
+/// execs it directly via `Command::new(&plan.openssh_path)`).
+///
+/// Windows: `Command::new`/`CreateProcessW` doesn't interpret shebangs, and
+/// `wrapper.rs::resolve_windows_executable` only resolves names carrying a
+/// `%PATHEXT%` extension (`.COM`/`.EXE`/`.BAT`/`.CMD`) — a bare `ssh` file
+/// wouldn't even be found, let alone launched. So the Windows shim is
+/// `ssh.cmd`, a plain pass-through batch file instead. This is *not* a
+/// byte-for-byte-safe argument relay (cmd.exe's own metacharacters —
+/// `&`/`|`/`<`/`>`/`^`/`%` — aren't escaped by `%*`), which is fine for this
+/// test's own plain host/`-o`/path arguments but would need a more robust
+/// shim (e.g. a small compiled Rust passthrough) if a future test needed to
+/// relay arbitrary remote-command text through this path.
+fn write_ssh_shim(bin_dir: &std::path::Path, real_ssh: &std::path::Path, config_path: &std::path::Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        let shim_path = bin_dir.join("ssh");
+        let shim =
+            format!("#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n", real_ssh = real_ssh.display(), config = config_path.display());
+        std::fs::write(&shim_path, shim).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shim_path
+    }
+    #[cfg(windows)]
+    {
+        let shim_path = bin_dir.join("ssh.cmd");
+        let shim = format!(
+            "@echo off\r\n\"{real_ssh}\" -F \"{config}\" %*\r\nexit /b %ERRORLEVEL%\r\n",
+            real_ssh = real_ssh.display(),
+            config = config_path.display(),
+        );
+        std::fs::write(&shim_path, shim).unwrap();
+        shim_path
+    }
 }
 
 /// Same technique as `init_e2e.rs::shim_ssh_with_bootstrap_config`: a tiny
@@ -233,18 +295,7 @@ fn shim_ssh_with_bootstrap_config(
 
     let bin_dir = tmp.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim_path = bin_dir.join("ssh");
-    let shim = format!(
-        "#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n",
-        real_ssh = real_ssh_path().display(),
-        config = config_path.display(),
-    );
-    std::fs::write(&shim_path, shim).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    write_ssh_shim(&bin_dir, &real_ssh_path(), &config_path);
 
     let path_env = {
         let mut paths = vec![bin_dir.clone()];
@@ -291,18 +342,7 @@ fn shim_ssh_with_alias_only_bootstrap_config(
 
     let bin_dir = tmp.join("bin-alias-only");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim_path = bin_dir.join("ssh");
-    let shim = format!(
-        "#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n",
-        real_ssh = real_ssh_path().display(),
-        config = config_path.display(),
-    );
-    std::fs::write(&shim_path, shim).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    write_ssh_shim(&bin_dir, &real_ssh_path(), &config_path);
 
     let path_env = {
         let mut paths = vec![bin_dir.clone()];
