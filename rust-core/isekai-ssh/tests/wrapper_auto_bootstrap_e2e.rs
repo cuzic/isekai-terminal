@@ -194,12 +194,11 @@ fn real_ssh_path() -> PathBuf {
 
 /// Windows counterpart of the `sh -c "command -v ssh"` above. Deliberately
 /// *not* the same implementation: under Git Bash/MSYS2, `command -v ssh`
-/// resolves to a POSIX-style path (e.g. `/usr/bin/ssh`), which the
-/// `ssh.cmd` shim (`write_ssh_shim`'s Windows branch) can't invoke — a
-/// `.cmd` file runs under native `cmd.exe`, which needs a native
-/// `C:\...\ssh.exe`-shaped path. `where.exe` (a built-in Windows command,
-/// distinct from Git Bash's `which`) resolves via `%PATH%`/`%PATHEXT%` and
-/// returns exactly that shape.
+/// resolves to a POSIX-style path (e.g. `/usr/bin/ssh`), which
+/// `ssh_test_shim` (a real Win32 `Command`, not a shell) can't invoke
+/// directly. `where.exe` (a built-in Windows command, distinct from Git
+/// Bash's `which`) resolves via `%PATH%`/`%PATHEXT%` and returns a native
+/// `C:\...\ssh.exe`-shaped path instead.
 #[cfg(windows)]
 fn real_ssh_path() -> PathBuf {
     let out = std::process::Command::new("where").arg("ssh.exe").output().expect("failed to run `where ssh.exe`");
@@ -209,76 +208,79 @@ fn real_ssh_path() -> PathBuf {
     PathBuf::from(first.trim())
 }
 
-/// Writes a stand-in `ssh` executable in `bin_dir` that always injects `-F
-/// <config_path>` before forwarding to `real_ssh` — used both for the
-/// wrapper's own internal `ssh -G` call
-/// (`wrapper.rs::resolve_openssh_effective_config`) and the real `ssh` exec
-/// at the end of `run()`, so both see the same resolved config without
-/// touching the test runner's actual `~/.ssh/config`.
-///
-/// Unix: a `#!/bin/sh` script (needs `+x`, since `wrapper.rs::run_ssh_once`
-/// execs it directly via `Command::new(&plan.openssh_path)`, and the
-/// kernel's own `exec()` understands the shebang regardless of the file's
-/// extension — this is why the PATH-shadowing trick alone (`bin_dir` first
-/// on `$PATH`) is enough on this platform).
-///
-/// Windows: `Command::new`/`CreateProcessW` doesn't interpret shebangs at
-/// all, so the shim is `ssh.cmd` (a plain pass-through batch file) instead.
-/// But a bare-name `Command::new("ssh")` on Windows only implicitly
-/// resolves `.exe` (confirmed via a real `test-windows` CI failure — PATH
-/// order didn't matter, a genuine `ssh.exe` elsewhere on `%PATH%` ran
-/// instead of this shim, completely bypassing the injected `-F <config>`),
-/// so callers must also pass `--isekai-ssh-path <bin_dir>/ssh.cmd`
-/// explicitly (`ssh_shim_args`) rather than relying on PATH-shadowing like
-/// Unix does. `ssh.cmd` itself is also *not* a byte-for-byte-safe argument
-/// relay (cmd.exe's own metacharacters — `&`/`|`/`<`/`>`/`^`/`%` — aren't
-/// escaped by `%*`), which is fine for this test's own plain host/`-o`/path
-/// arguments but would need a more robust shim (e.g. a small compiled Rust
-/// passthrough) if a future test needed to relay arbitrary remote-command
-/// text through this path.
-fn write_ssh_shim(bin_dir: &std::path::Path, real_ssh: &std::path::Path, config_path: &std::path::Path) -> PathBuf {
-    #[cfg(unix)]
-    {
-        let shim_path = bin_dir.join("ssh");
-        let shim =
-            format!("#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n", real_ssh = real_ssh.display(), config = config_path.display());
-        std::fs::write(&shim_path, shim).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        shim_path
-    }
-    #[cfg(windows)]
-    {
-        let shim_path = bin_dir.join("ssh.cmd");
-        let shim = format!(
-            "@echo off\r\n\"{real_ssh}\" -F \"{config}\" %*\r\nexit /b %ERRORLEVEL%\r\n",
-            real_ssh = real_ssh.display(),
-            config = config_path.display(),
-        );
-        std::fs::write(&shim_path, shim).unwrap();
-        shim_path
-    }
+/// Everything needed to point `isekai-ssh` (and everything it internally
+/// spawns — `wrapper.rs::run_ssh_once`/`resolve_openssh_effective_config`
+/// *and* `isekai-bootstrap::OpenSshBackend`'s own deploy dial) at a stand-in
+/// `ssh(1)` that always injects `-F <config_path>` ahead of whatever real
+/// `ssh(1)` arguments it's given, without touching the test runner's actual
+/// `~/.ssh/config`.
+struct SshShim {
+    /// Pass as `--isekai-ssh-path` when spawning `isekai-ssh`.
+    path: PathBuf,
+    /// Extra env vars to set on the spawned `isekai-ssh` process (empty on
+    /// Unix; see `ssh_test_shim`'s module docs for why Windows needs them).
+    extra_env: Vec<(&'static str, PathBuf)>,
 }
 
-/// On Windows, points `isekai-ssh` at `write_ssh_shim`'s `ssh.cmd` via
-/// `--isekai-ssh-path` rather than relying on PATH-shadowing alone.
-/// `Command::new("ssh")` (this crate's own default absent that flag,
-/// `wrapper.rs::parse_wrapper`) only implicitly resolves `.exe` for a bare
-/// name on Windows — `.cmd` files are never found that way (confirmed via a
-/// real `test-windows` CI failure: the shim was silently bypassed, and a
-/// genuine `ssh.exe` elsewhere on `%PATH%` ran instead with none of the
-/// injected `-F <config>`). Unix doesn't need this: the kernel's own exec()
-/// understands the shim's `#!/bin/sh` shebang regardless of file extension,
-/// so PATH-shadowing alone (`bin_dir` first) is already enough there — a
-/// no-op on this platform to avoid touching that already-working path.
-#[cfg(windows)]
-fn ssh_shim_args(bin_dir: &std::path::Path) -> Vec<std::ffi::OsString> {
-    vec!["--isekai-ssh-path".into(), bin_dir.join("ssh.cmd").into()]
-}
-
+/// Unix: a `#!/bin/sh` script written into `bin_dir` (needs `+x`, since
+/// `Command::new(&plan.openssh_path)` execs it directly, and the kernel's
+/// own `exec()` understands the shebang regardless of the file's
+/// extension). `--isekai-ssh-path` isn't strictly required here (PATH
+/// alone would find it), but is passed anyway so callers don't need a
+/// second, platform-specific code path — see the Windows variant below for
+/// why *it* genuinely can't rely on PATH-shadowing alone.
 #[cfg(unix)]
-fn ssh_shim_args(_bin_dir: &std::path::Path) -> Vec<std::ffi::OsString> {
-    Vec::new()
+fn write_ssh_shim(bin_dir: &std::path::Path, real_ssh: &std::path::Path, config_path: &std::path::Path) -> SshShim {
+    let shim_path = bin_dir.join("ssh");
+    let shim =
+        format!("#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n", real_ssh = real_ssh.display(), config = config_path.display());
+    std::fs::write(&shim_path, shim).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    SshShim { path: shim_path, extra_env: Vec::new() }
+}
+
+/// Windows: no file is written at all — the shim is `ssh_test_shim`, a real
+/// compiled `.exe` (`src/bin/ssh_test_shim.rs`, already built by `cargo
+/// test` itself, found via `CARGO_BIN_EXE_ssh_test_shim`). Two earlier
+/// approaches were tried and abandoned (real `test-windows` CI failures at
+/// each step, see git history and `ssh_test_shim`'s own module docs for the
+/// full story):
+/// 1. A bare POSIX shebang script named `ssh`: `Command::new`/`CreateProcessW`
+///    doesn't interpret shebangs, and doesn't even find an extension-less
+///    file from a bare name.
+/// 2. A `ssh.cmd` batch-file pass-through, invoked via `--isekai-ssh-path`
+///    (bare `Command::new("ssh")` only implicitly resolves `.exe`, not
+///    `.cmd`, so a `--isekai-ssh-path` pointing directly at the shim was
+///    also needed then, unlike Unix's PATH-shadowing): this got invoked
+///    correctly, but `std::process::Command`'s Windows batch-file
+///    argument-safety validation (CVE-2024-24576/"BatBadBut") rejects any
+///    argument containing `\r`/`\n` outright — and the real bootstrap
+///    deploy step's remote command is exactly such a multi-line string.
+///
+/// A genuine `.exe` sidesteps both problems: it's never treated as a batch
+/// file (no argument-safety special-casing applies), and ordinary Win32
+/// argv passing handles embedded newlines within a single argument fine.
+#[cfg(windows)]
+fn write_ssh_shim(_bin_dir: &std::path::Path, real_ssh: &std::path::Path, config_path: &std::path::Path) -> SshShim {
+    SshShim {
+        path: PathBuf::from(env!("CARGO_BIN_EXE_ssh_test_shim")),
+        extra_env: vec![
+            ("ISEKAI_SSH_TEST_SHIM_REAL_SSH", real_ssh.to_path_buf()),
+            ("ISEKAI_SSH_TEST_SHIM_CONFIG", config_path.to_path_buf()),
+        ],
+    }
+}
+
+/// `--isekai-ssh-path <shim.path>` plus `shim.extra_env` — see `SshShim`'s
+/// docs. `isekai-bootstrap::OpenSshBackend`'s deploy dial only honors
+/// `--isekai-ssh-path` because `wrapper.rs::bootstrap_and_register` now
+/// threads `plan.openssh_path` into `OpenSshBackend::with_ssh_program`
+/// (previously it silently used its own bare-`"ssh"` default regardless of
+/// this flag — a real, if previously harmless-on-Unix, inconsistency this
+/// Windows work surfaced; see that function's own doc comment).
+fn ssh_shim_args_and_env(shim: &SshShim) -> (Vec<std::ffi::OsString>, Vec<(&'static str, PathBuf)>) {
+    (vec!["--isekai-ssh-path".into(), shim.path.clone().into()], shim.extra_env.clone())
 }
 
 /// Same technique as `init_e2e.rs::shim_ssh_with_bootstrap_config`: a tiny
@@ -293,7 +295,7 @@ fn shim_ssh_with_bootstrap_config(
     alias: &str,
     mock_sshd_addr: SocketAddr,
     key_path: &std::path::Path,
-) -> (PathBuf, std::ffi::OsString) {
+) -> (PathBuf, std::ffi::OsString, SshShim) {
     let config_path = tmp.join("ssh_config_bootstrap");
     let config = format!(
         "Host {alias}\n\
@@ -323,7 +325,7 @@ fn shim_ssh_with_bootstrap_config(
 
     let bin_dir = tmp.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    write_ssh_shim(&bin_dir, &real_ssh_path(), &config_path);
+    let shim = write_ssh_shim(&bin_dir, &real_ssh_path(), &config_path);
 
     let path_env = {
         let mut paths = vec![bin_dir.clone()];
@@ -332,7 +334,7 @@ fn shim_ssh_with_bootstrap_config(
         }
         std::env::join_paths(paths).unwrap()
     };
-    (bin_dir, path_env)
+    (bin_dir, path_env, shim)
 }
 
 /// Regression test fixture for the alias-vs-resolved-`HostName` bug
@@ -352,7 +354,7 @@ fn shim_ssh_with_alias_only_bootstrap_config(
     alias: &str,
     mock_sshd_addr: SocketAddr,
     key_path: &std::path::Path,
-) -> (PathBuf, std::ffi::OsString) {
+) -> (PathBuf, std::ffi::OsString, SshShim) {
     let config_path = tmp.join("ssh_config_bootstrap_alias_only");
     let config = format!(
         "Host {alias}\n\
@@ -370,7 +372,7 @@ fn shim_ssh_with_alias_only_bootstrap_config(
 
     let bin_dir = tmp.join("bin-alias-only");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    write_ssh_shim(&bin_dir, &real_ssh_path(), &config_path);
+    let shim = write_ssh_shim(&bin_dir, &real_ssh_path(), &config_path);
 
     let path_env = {
         let mut paths = vec![bin_dir.clone()];
@@ -379,7 +381,7 @@ fn shim_ssh_with_alias_only_bootstrap_config(
         }
         std::env::join_paths(paths).unwrap()
     };
-    (bin_dir, path_env)
+    (bin_dir, path_env, shim)
 }
 
 fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
@@ -422,7 +424,7 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_bootstrap_config(tmp.path(), "auto-bootstrap-host", mock_sshd_addr, &key_path);
 
     // Stand-in for the isekai-helper binary: ignores its args, just emits
@@ -440,7 +442,8 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
     assert!(!profile_path.exists(), "profile must not exist before this test runs");
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
-        .args(ssh_shim_args(&bin_dir))
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("auto-bootstrap-host")
@@ -518,7 +521,7 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_alias_only_bootstrap_config(tmp.path(), "alias-only-host", mock_sshd_addr, &key_path);
 
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
@@ -533,7 +536,8 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
     assert!(!profile_path.exists(), "profile must not exist before this test runs");
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
-        .args(ssh_shim_args(&bin_dir))
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("alias-only-host")
@@ -594,7 +598,7 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_bootstrap_config(tmp.path(), "remote-path-host", mock_sshd_addr, &key_path);
 
     // The wrapper's own directive parsing falls back to `$HOME/.ssh/config`
@@ -618,7 +622,8 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
     }
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
-        .args(ssh_shim_args(&bin_dir))
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("remote-path-host")
@@ -688,7 +693,7 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_bootstrap_config(tmp.path(), "stun-directive-host", mock_sshd_addr, &key_path);
 
     let ssh_dir = home.join(".ssh");
@@ -722,7 +727,8 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
     }
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
-        .args(ssh_shim_args(&bin_dir))
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("stun-directive-host")
@@ -798,7 +804,7 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_bootstrap_config(tmp.path(), "bootstrap-relay-host", mock_sshd_addr, &key_path);
 
     let ssh_dir = home.join(".ssh");
@@ -837,7 +843,8 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
     }
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
-        .args(ssh_shim_args(&bin_dir))
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("bootstrap-relay-host")
@@ -907,7 +914,7 @@ async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (bin_dir, path_env) =
+    let (_bin_dir, path_env, shim) =
         shim_ssh_with_bootstrap_config(tmp.path(), "declined-bootstrap-host", mock_sshd_addr, &key_path);
 
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
@@ -921,7 +928,8 @@ async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
     let profile_path = profile_path_under(&home, "declined-bootstrap-host:22");
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
-        .args(ssh_shim_args(&bin_dir))
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
         .arg("--isekai-helper-binary")
         .arg(&helper_script_path)
         .arg("declined-bootstrap-host")
