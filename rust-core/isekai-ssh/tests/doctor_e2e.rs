@@ -220,6 +220,20 @@ struct SshShim {
     path_env: std::ffi::OsString,
 }
 
+/// See `wrapper_stale_trust_auto_recovery_e2e.rs::expose_msys_dll_next_to`'s
+/// docs for why this is needed.
+#[cfg(windows)]
+fn expose_msys_dll_next_to(shim_path: &std::path::Path, real_ssh: &std::path::Path) {
+    let Some(real_ssh_dir) = real_ssh.parent() else { return };
+    let Some(shim_dir) = shim_path.parent() else { return };
+    for dll in ["msys-2.0.dll", "cygwin1.dll"] {
+        let src = real_ssh_dir.join(dll);
+        if src.is_file() {
+            let _ = std::fs::copy(&src, shim_dir.join(dll));
+        }
+    }
+}
+
 fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, alias: &str, mock_sshd_addr: SocketAddr, key_path: &std::path::Path) -> SshShim {
     let config_path = tmp.join("ssh_config_bootstrap");
     let config = format!(
@@ -263,10 +277,11 @@ fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, alias: &str, mock_sshd_
     // confirmed via a real `test-windows` CI failure on
     // `wrapper_auto_bootstrap_e2e.rs`, which this mirrors).
     #[cfg(windows)]
-    let (isekai_ssh_path_arg, extra_env) = (
-        PathBuf::from(env!("CARGO_BIN_EXE_ssh_test_shim")),
-        vec![("ISEKAI_SSH_TEST_SHIM_REAL_SSH", real_ssh), ("ISEKAI_SSH_TEST_SHIM_CONFIG", config_path)],
-    );
+    let (isekai_ssh_path_arg, extra_env) = {
+        let shim_path = PathBuf::from(env!("CARGO_BIN_EXE_ssh_test_shim"));
+        expose_msys_dll_next_to(&shim_path, &real_ssh);
+        (shim_path, vec![("ISEKAI_SSH_TEST_SHIM_REAL_SSH", real_ssh), ("ISEKAI_SSH_TEST_SHIM_CONFIG", config_path)])
+    };
 
     let mut paths = vec![bin_dir];
     if let Some(existing) = std::env::var_os("PATH") {

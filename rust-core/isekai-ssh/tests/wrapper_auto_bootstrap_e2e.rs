@@ -291,12 +291,42 @@ fn write_ssh_shim(bin_dir: &std::path::Path, real_ssh: &std::path::Path, config_
 /// argv passing handles embedded newlines within a single argument fine.
 #[cfg(windows)]
 fn write_ssh_shim(_bin_dir: &std::path::Path, real_ssh: &std::path::Path, config_path: &std::path::Path) -> SshShim {
+    let shim_path = PathBuf::from(env!("CARGO_BIN_EXE_ssh_test_shim"));
+    expose_msys_dll_next_to(&shim_path, real_ssh);
     SshShim {
-        path: PathBuf::from(env!("CARGO_BIN_EXE_ssh_test_shim")),
+        path: shim_path,
         extra_env: vec![
             ("ISEKAI_SSH_TEST_SHIM_REAL_SSH", real_ssh.to_path_buf()),
             ("ISEKAI_SSH_TEST_SHIM_CONFIG", config_path.to_path_buf()),
         ],
+    }
+}
+
+/// `wrapper.rs::proxy_command` decides whether the *real* connect step's
+/// `ProxyCommand` needs POSIX single-quoting (`wrapper.rs::is_posix_shell_ssh`)
+/// by checking for `msys-2.0.dll`/`cygwin1.dll` next to the *resolved*
+/// `--isekai-ssh-path` binary. That binary is `ssh_test_shim.exe` here, not
+/// the real MSYS2-hosted `ssh.exe` it execs internally — so without this,
+/// the check incorrectly concludes "not POSIX-shell", skips the quoting
+/// that assumption requires, and the connect step's embedded Windows path
+/// gets its backslashes silently eaten when the real (POSIX-shell) ssh
+/// actually execs the `ProxyCommand` via its own `sh -c` (confirmed via a
+/// real `test-windows` CI failure on `wrapper_stale_trust_auto_recovery_e2e.rs`:
+/// `sh -c` reported `exec: <path with every `\` stripped>: not found`, the
+/// same class of bug `posix_safe_path` fixes for a different embedding
+/// site). Copying the same companion DLL next to the shim makes that
+/// detection see the same thing it would for the real `ssh.exe`. A no-op
+/// (and harmless to call repeatedly/concurrently across tests sharing this
+/// crate's `target/`) if neither DLL exists next to `real_ssh` at all.
+#[cfg(windows)]
+fn expose_msys_dll_next_to(shim_path: &std::path::Path, real_ssh: &std::path::Path) {
+    let Some(real_ssh_dir) = real_ssh.parent() else { return };
+    let Some(shim_dir) = shim_path.parent() else { return };
+    for dll in ["msys-2.0.dll", "cygwin1.dll"] {
+        let src = real_ssh_dir.join(dll);
+        if src.is_file() {
+            let _ = std::fs::copy(&src, shim_dir.join(dll));
+        }
     }
 }
 
