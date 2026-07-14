@@ -1297,7 +1297,12 @@ Windows対応のみが対象。
   セキュリティギャップを、`windows`crateのDACL操作API(`GetNamedSecurityInfoW`/
   `SetNamedSecurityInfoW`/`SetEntriesInAclW`/`GetExplicitEntriesFromAclW`)で埋めた
   (`windows_acl.rs`)。Unix側は`0o002`(others書き込みビットのみ)を拒否するが、Windows側は
-  所有者以外への書き込み許可ACEを全て拒否する、意図的により厳格な新規ポリシーとした。
+  カレントユーザー・`SYSTEM`・`BUILTIN\Administrators`以外への書き込み系ACE
+  (`FILE_GENERIC_WRITE`に加え`WRITE_DAC`/`WRITE_OWNER`/`DELETE`——ACLを書き換えて後から
+  書き込み権を得られる権利も含む)を全て拒否し、**パスの所有者自体**もこの3者以外なら
+  拒否する(所有者はDACLの内容に関わらず自分のACLを書き換えられるため)、意図的により
+  厳格な新規ポリシーとした(Codex CLIによる実装レビューで、当初owner未検証・非SID
+  trusteeの誤ポインタキャスト・write判定マスクの狭さの3件を指摘され修正)。
   `isekai-pipe-core`の`PersistentProfile`(`write_persistent_profile`/`ProfileLock`)にも
   同じ穴があり、同様にWindows実装(`LockFileEx`によるロック含む)を追加した。
 - ✅ **`isekai-ssh`のmock sshdベースe2eテスト5本のWindows対応**
