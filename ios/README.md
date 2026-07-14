@@ -24,8 +24,9 @@ swift test
 `ios/Package.swift`はホストOSが Linux の場合、マニフェスト自体から `IsekaiTerminalCore`/`IsekaiTerminalCoreTests`
 (Apple専用、UIKit/GRDB/Keychainに依存)を除外するため、上記コマンドは`IsekaiTerminalCoreLogic`/
 `IsekaiTerminalCoreLogicTests`だけを解決・実行します。実iOSアプリ全体のビルド・シミュレータ実行は
-引き続き下記の macOS 手順(または `.github/workflows/ios-check.yml`)が必要です。CIでは
-`.github/workflows/ios-logic-linux-check.yml`(`ubuntu-24.04`ランナー)がこのレーンを担当します。
+引き続き下記の macOS 手順(または `.github/workflows/ios-rust-core-check.yml` /
+`ios-app-build-check.yml`)が必要です。CIでは `.github/workflows/ios-logic-linux-check.yml`
+(`ubuntu-24.04`ランナー)がこのレーンを担当します。
 
 ## 現状(Phase 0 の到達点)
 

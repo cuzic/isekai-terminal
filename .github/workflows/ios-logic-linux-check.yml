@@ -6,8 +6,8 @@ name: iOS IsekaiTerminalCoreLogic Linux check
 # マニフェストから除外するため、このジョブではIsekaiTerminalCoreLogic/IsekaiTerminalCoreLogicTestsだけが
 # 解決される。
 #
-# 実iOSアプリのSimulatorビルド・実機同等の検証は引き続き`ios-check.yml`
-# (macOSランナー)が担当する。このジョブはそれより
+# 実iOSアプリのSimulatorビルド・実機同等の検証は引き続き`ios-rust-core-check.yml`/
+# `ios-app-build-check.yml`(macOSランナー)が担当する。このジョブはそれらより
 # 大幅に安く速い(Xcode/Simulator不要)ため、ロジック層のリグレッションを
 # 素早く検出するための第一段のゲートとして位置づける
 # (PLAN.md「Phase Y」節、iOS Linux CI導入の記録参照)。
@@ -92,7 +92,8 @@ jobs:
         # rust-core/src/helper_quic_transport.rs が include_bytes! で埋め込む
         # isekai-pipe の x86_64/aarch64 musl静的バイナリ。iOS固有の話ではなく、
         # isekai-terminal-core をどのホスト/ターゲット向けにビルドするかによらず常に必要な前提
-        # (ios-check.ymlは既に対応済みだったが、このLinux版ジョブだけ追従が漏れていた)。
+        # (ios-rust-core-check.yml/ios-app-build-check.yml/ios-ssh-vertical-slice-check.ymlは
+        # 既に対応済みだったが、このLinux版ジョブだけ追従が漏れていた)。
         run: |
           set -euo pipefail
           curl -fL -o /tmp/zig.tar.xz \
