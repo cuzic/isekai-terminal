@@ -1,6 +1,7 @@
 import GRDB
 import XCTest
 @testable import IsekaiTerminalCore
+import IsekaiTerminalCoreLogic
 
 /// Phase 1B: 接続プロファイル管理DB(GRDB)の検証。ファイルI/Oのみで完結し
 /// entitlementを必要としないため、素のIsekaiTerminalCoreTestsでそのまま検証できる。
