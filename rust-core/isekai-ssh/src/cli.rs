@@ -274,6 +274,13 @@ pub struct InitArgs {
     /// explicit opt-in per deployment, not a standing cost on every host.
     #[arg(long, value_name = "LEVEL", default_value = "info")]
     pub remote_log_level: String,
+
+    /// `ssh(1)` binary `isekai-bootstrap::OpenSshBackend` execs for this
+    /// deployment — mirrors the wrapper's own `--isekai-ssh-path`. When
+    /// omitted, falls back to the same bare `"ssh"` (PATH-resolved) default
+    /// `OpenSshBackend` itself uses.
+    #[arg(long, value_name = "PATH")]
+    pub ssh_path: Option<PathBuf>,
 }
 
 #[derive(Args)]

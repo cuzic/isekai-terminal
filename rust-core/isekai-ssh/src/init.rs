@@ -37,7 +37,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let target = parse_host_spec(&args.host)
         .with_context(|| format!("isekai-ssh: invalid host spec '{}'", args.host))?;
     let via = parse_via_chain(&target, &args.via)?;
-    let backend = OpenSshBackend::new();
+    let backend = match &args.ssh_path {
+        Some(ssh_path) => OpenSshBackend::new().with_ssh_program(ssh_path.to_string_lossy().into_owned()),
+        None => OpenSshBackend::new(),
+    };
 
     let helper_binary = crate::helper_download::resolve_helper_binary(
         args.helper_binary.as_deref(),
@@ -321,6 +324,7 @@ mod tests {
             idle_lifetime: 2_592_000,
             stun_servers: Vec::new(),
             remote_log_level: "info".to_string(),
+            ssh_path: None,
         }
     }
 
