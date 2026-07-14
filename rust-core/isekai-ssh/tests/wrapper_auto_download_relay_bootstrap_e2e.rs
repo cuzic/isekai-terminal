@@ -192,10 +192,32 @@ fn generate_client_keypair(dir: &std::path::Path) -> (PathBuf, PublicKey) {
     (key_path, public_key)
 }
 
+#[cfg(unix)]
 fn real_ssh_path() -> PathBuf {
     let out = std::process::Command::new("sh").arg("-c").arg("command -v ssh").output().expect("failed to run `command -v ssh`");
     assert!(out.status.success(), "ssh(1) not found on PATH");
     PathBuf::from(String::from_utf8(out.stdout).unwrap().trim().to_string())
+}
+
+/// See `wrapper_auto_bootstrap_e2e.rs::real_ssh_path`'s Windows variant for
+/// why this needs a different implementation from the Unix one above.
+#[cfg(windows)]
+fn real_ssh_path() -> PathBuf {
+    let out = std::process::Command::new("where").arg("ssh.exe").output().expect("failed to run `where ssh.exe`");
+    assert!(out.status.success(), "ssh.exe not found on PATH");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let first = stdout.lines().next().expect("`where ssh.exe` produced no output");
+    PathBuf::from(first.trim())
+}
+
+/// Everything needed to point `isekai-ssh` at a stand-in `ssh(1)` — see
+/// `wrapper_auto_bootstrap_e2e.rs::SshShim` and `ssh_test_shim`'s module
+/// docs for why Windows needs a compiled `.exe` shim (not a `.cmd` batch
+/// file) and Unix a `#!/bin/sh` script.
+struct SshShim {
+    isekai_ssh_path_arg: PathBuf,
+    extra_env: Vec<(&'static str, PathBuf)>,
+    path_env: std::ffi::OsString,
 }
 
 /// Same technique as `wrapper_auto_bootstrap_e2e.rs::shim_ssh_with_bootstrap_config`,
@@ -208,7 +230,7 @@ fn shim_ssh_with_bootstrap_config(
     alias: &str,
     mock_sshd_addr: SocketAddr,
     key_path: &std::path::Path,
-) -> (PathBuf, std::ffi::OsString) {
+) -> SshShim {
     let config_path = tmp.join("ssh_config_bootstrap");
     let config = format!(
         "Host {alias}\n\
@@ -234,23 +256,31 @@ fn shim_ssh_with_bootstrap_config(
 
     let bin_dir = tmp.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim_path = bin_dir.join("ssh");
-    let shim = format!("#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n", real_ssh = real_ssh_path().display(), config = config_path.display());
-    std::fs::write(&shim_path, shim).unwrap();
+    let real_ssh = real_ssh_path();
+
     #[cfg(unix)]
-    {
+    let (isekai_ssh_path_arg, extra_env) = {
+        let shim_path = bin_dir.join("ssh");
+        let shim = format!("#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n", real_ssh = real_ssh.display(), config = config_path.display());
+        std::fs::write(&shim_path, shim).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+        (shim_path, Vec::new())
+    };
+    #[cfg(windows)]
+    let (isekai_ssh_path_arg, extra_env) = (
+        PathBuf::from(env!("CARGO_BIN_EXE_ssh_test_shim")),
+        vec![("ISEKAI_SSH_TEST_SHIM_REAL_SSH", real_ssh), ("ISEKAI_SSH_TEST_SHIM_CONFIG", config_path)],
+    );
 
     let path_env = {
-        let mut paths = vec![bin_dir.clone()];
+        let mut paths = vec![bin_dir];
         if let Some(existing) = std::env::var_os("PATH") {
             paths.extend(std::env::split_paths(&existing));
         }
         std::env::join_paths(paths).unwrap()
     };
-    (bin_dir, path_env)
+    SshShim { isekai_ssh_path_arg, extra_env, path_env }
 }
 
 fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
@@ -329,7 +359,7 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env) = shim_ssh_with_bootstrap_config(tmp.path(), "brand-new-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "brand-new-host", mock_sshd_addr, &key_path);
 
     // The *only* config this test relies on for bootstrap parameters: a
     // `Host *` catch-all, not a block matching `brand-new-host` specifically
@@ -365,9 +395,13 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
     let helper_cache_dir = tmp.path().join("helper-cache");
 
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .arg("--isekai-ssh-path")
+        .arg(&shim.isekai_ssh_path_arg)
         .arg("brand-new-host")
         .env("HOME", &home)
-        .env("PATH", &path_env)
+        .env("PATH", &shim.path_env)
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .envs(shim.extra_env)
         .env("ISEKAI_SSH_HELPER_RELEASE_BASE_URL", format!("http://{mock_release_addr}"))
         // No `/repos/.../releases/latest` route registered on the mock
         // server — `resolve_helper_binary`'s best-effort tag record after
