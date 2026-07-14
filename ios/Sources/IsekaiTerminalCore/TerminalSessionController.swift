@@ -40,6 +40,11 @@ public final class TerminalUIState: ObservableObject {
     /// 一時ファイルのURL。`trzszState`が`.done(success: true, ...)`かつダウンロード
     /// だった場合のみ設定される。
     @Published public internal(set) var completedDownloadURL: URL?
+    /// Phase 9-6(#16): マルチパスtransportの`RebindManager`状態(WiFi/セルラー
+    /// フェイルオーバー/復帰待ち)。マルチパス以外のtransportでは常にnil。表示可否の
+    /// 判定は`RebindPublicState`だけを見て行う(Android版`TerminalScreen.kt`と同じ、
+    /// rust-ssot.md準拠 — Swift側で独自のミラー状態は持たない)。
+    @Published public internal(set) var rebindState: RebindPublicState?
 
     // `TerminalSessionController`(非isolated)のstored property初期値として
     // 構築されるため、`nonisolated`にして呼び出し側のコンテキストを問わず
@@ -110,6 +115,10 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// debounce/coalesceの判断自体はRust側([`crate::net_health_policy`])に集約されている
     /// (`.claude/rules/rust-ssot.md`)。
     private let networkPathMonitor = NWPathMonitor()
+    /// Phase 9-6(#15/#16): `RebindManager`(Rust側)がWiFi/セルラーのfdを要求してきたら
+    /// 取得して返すだけの実装(判断はしない、rust-ssot.md準拠)。Android版
+    /// `PhysicalPathProvider`のiOS版。
+    private let physicalPathProvider = PhysicalPathProvider()
 
     public init(
         profile: ConnectionProfile,
@@ -423,6 +432,13 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         orchestrator.cancelReconnect()
     }
 
+    /// Phase 9-6(#16): 「今すぐWiFiに戻す」。マルチパス以外のセッションでは呼んでも
+    /// Rust側で無視される(Android版`TerminalSession.forceReturnToWifi()`と同じ、
+    /// 判断はRust側`RebindManager`に委ねる)。
+    public func forceReturnToWifi() {
+        orchestrator.forceReturnToWifi()
+    }
+
     // MARK: - #20: バックグラウンド/フォアグラウンド遷移
     //
     // 生イベントをそのままRust側`SessionOrchestrator`へ転送するだけの薄いラッパー。
@@ -715,17 +731,30 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
 
     // MARK: - RebindManager (PLAN.md Phase 9-6)
     //
-    // iOS版のPhysicalPathProvider相当(IP_BOUND_IF/IPV6_BOUND_IFベースのWiFi/セルラー
-    // 個別バインド)は未実装(TODO、Android版`PhysicalPathProvider`を参照)。
-    // 判断は一切せずfdを取得して返すだけという契約(`rust-ssot.md`)なので、
-    // 未実装の間は常に`nil`を返す — RebindManager(Rust側)はfdが取れない場合を
-    // 正常系として扱う設計になっており、日和見的にセルラーへのフェイルオーバー/
-    // WiFiへの復帰が単に起きないだけで、既存のQUIC自身のローミング耐性
+    // iOS版のPhysicalPathProvider相当(IP_BOUND_IFベースのWiFi/セルラー個別バインド、#15)を
+    // `physicalPathProvider`に実装済み。判断は一切せずfdを取得して返すだけという契約
+    // (`rust-ssot.md`)で、取得できなければ`nil`を返す — RebindManager(Rust側)はfdが
+    // 取れない場合を正常系として扱う設計になっており、日和見的にセルラーへの
+    // フェイルオーバー/WiFiへの復帰が単に起きないだけで、既存のQUIC自身のローミング耐性
     // (`notifyNetworkPathChanged`)には影響しない。
+    //
+    // これらのcallbackはRustのspawn_blockingスレッドから同期的に呼ばれる
+    // (`onHostKey`/`onAgentSignRequest`と同じ方式)。`physicalPathProvider`側も
+    // `DispatchSemaphore`で同期的にブロックして待つ実装になっているため、
+    // ここでは追加のスレッド橋渡しをせずそのまま返す。
 
-    public func onRequestWifiFd() -> PlatformFd? { nil }
+    public func onRequestWifiFd() -> PlatformFd? {
+        physicalPathProvider.acquireWifiFd().map { PlatformFd(fd: $0.fd, localIp: $0.localIp) }
+    }
 
-    public func onRequestCellularFd() -> PlatformFd? { nil }
+    public func onRequestCellularFd() -> PlatformFd? {
+        physicalPathProvider.acquireCellularFd().map { PlatformFd(fd: $0.fd, localIp: $0.localIp) }
+    }
 
-    public func onRebindStateChanged(state: RebindPublicState) {}
+    /// #19: `RebindManager`の状態が変化した。判定はこの値だけを見て行い(rust-ssot.md準拠)、
+    /// UI側で独自のミラー状態は持たない(Android版`TerminalSession.kt`の
+    /// `onRebindStateChanged`と同じ)。
+    public func onRebindStateChanged(state: RebindPublicState) {
+        Task { @MainActor in self.uiState.rebindState = state }
+    }
 }
