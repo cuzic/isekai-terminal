@@ -80,7 +80,11 @@ fn sibling_bin_path(package: &str, bin_name: &str) -> PathBuf {
         path.pop();
     }
     let is_release = path.file_name().map(|n| n == "release").unwrap_or(false);
-    path.push(bin_name);
+    // Windows binaries carry a `.exe` extension; a bare `bin_name` never
+    // exists there, so this would otherwise always fall through to the
+    // rebuild-and-recheck path below and still fail the same `path.exists()`
+    // check afterward (confirmed via a real `test-windows` CI failure).
+    path.push(if cfg!(windows) { format!("{bin_name}.exe") } else { bin_name.to_string() });
 
     if !path.exists() {
         eprintln!("{bin_name} binary not found at {path:?}; building it now");
