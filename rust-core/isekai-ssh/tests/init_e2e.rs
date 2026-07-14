@@ -304,6 +304,7 @@ fn spawn_helper_with_args(target_addr: SocketAddr, extra_args: &[&str]) -> Helpe
 
 /// Locates the real system `ssh(1)` via `PATH` (before this test starts
 /// shadowing `PATH` with the wrapper below).
+#[cfg(unix)]
 fn real_ssh_path() -> PathBuf {
     let out = std::process::Command::new("sh")
         .arg("-c")
@@ -312,6 +313,28 @@ fn real_ssh_path() -> PathBuf {
         .expect("failed to run `command -v ssh`");
     assert!(out.status.success(), "ssh(1) not found on PATH");
     PathBuf::from(String::from_utf8(out.stdout).unwrap().trim().to_string())
+}
+
+/// See `wrapper_auto_bootstrap_e2e.rs::real_ssh_path`'s Windows variant for
+/// why this needs a different implementation from the Unix one above.
+#[cfg(windows)]
+fn real_ssh_path() -> PathBuf {
+    let out = std::process::Command::new("where").arg("ssh.exe").output().expect("failed to run `where ssh.exe`");
+    assert!(out.status.success(), "ssh.exe not found on PATH");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let first = stdout.lines().next().expect("`where ssh.exe` produced no output");
+    PathBuf::from(first.trim())
+}
+
+/// Everything needed to point `isekai-ssh init` (and `isekai-bootstrap::OpenSshBackend`'s
+/// own deploy dial, via `init`'s `--ssh-path`) at a stand-in `ssh(1)` — see
+/// `wrapper_auto_bootstrap_e2e.rs::SshShim` and `ssh_test_shim`'s module
+/// docs for why Windows needs a compiled `.exe` shim (not a `.cmd` batch
+/// file) and Unix a `#!/bin/sh` script.
+struct SshShim {
+    isekai_ssh_path_arg: PathBuf,
+    extra_env: Vec<(&'static str, PathBuf)>,
+    path_env: std::ffi::OsString,
 }
 
 /// `isekai-bootstrap::OpenSshBackend` (as driven through `isekai-ssh init`'s
@@ -329,15 +352,14 @@ fn real_ssh_path() -> PathBuf {
 /// `~/.ssh/config` stanza), just injected without touching the test
 /// runner's actual home directory.
 ///
-/// Returns `(bin_dir, path_env)`: `bin_dir` must outlive the `isekai-ssh
-/// init` subprocess (it contains the shim), and `path_env` is the `PATH`
-/// value to set on that subprocess.
+/// Returns an [`SshShim`] describing how to point `isekai-ssh init` at it
+/// (`--ssh-path` + `PATH` + any extra env vars needed).
 fn shim_ssh_with_bootstrap_config(
     tmp: &std::path::Path,
     alias: &str,
     mock_sshd_addr: SocketAddr,
     key_path: &std::path::Path,
-) -> (PathBuf, std::ffi::OsString) {
+) -> SshShim {
     let config_path = tmp.join("ssh_config_bootstrap");
     let config = format!(
         "Host {alias}\n\
@@ -355,27 +377,31 @@ fn shim_ssh_with_bootstrap_config(
 
     let bin_dir = tmp.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim_path = bin_dir.join("ssh");
-    let shim = format!(
-        "#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n",
-        real_ssh = real_ssh_path().display(),
-        config = config_path.display(),
-    );
-    std::fs::write(&shim_path, shim).unwrap();
+    let real_ssh = real_ssh_path();
+
     #[cfg(unix)]
-    {
+    let (isekai_ssh_path_arg, extra_env) = {
+        let shim_path = bin_dir.join("ssh");
+        let shim = format!("#!/bin/sh\nexec {real_ssh} -F {config} \"$@\"\n", real_ssh = real_ssh.display(), config = config_path.display());
+        std::fs::write(&shim_path, shim).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+        (shim_path, Vec::new())
+    };
+    #[cfg(windows)]
+    let (isekai_ssh_path_arg, extra_env) = (
+        PathBuf::from(env!("CARGO_BIN_EXE_ssh_test_shim")),
+        vec![("ISEKAI_SSH_TEST_SHIM_REAL_SSH", real_ssh), ("ISEKAI_SSH_TEST_SHIM_CONFIG", config_path)],
+    );
 
     let path_env = {
-        let mut paths = vec![bin_dir.clone()];
+        let mut paths = vec![bin_dir];
         if let Some(existing) = std::env::var_os("PATH") {
             paths.extend(std::env::split_paths(&existing));
         }
         std::env::join_paths(paths).unwrap()
     };
-    (bin_dir, path_env)
+    SshShim { isekai_ssh_path_arg, extra_env, path_env }
 }
 
 fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
@@ -429,12 +455,14 @@ async fn spawn_init(
     home: &std::path::Path,
     host_alias: &str,
     helper_binary_path: &std::path::Path,
-    path_env: &std::ffi::OsStr,
+    shim: &SshShim,
     stdin_line: &str,
 ) -> std::process::Output {
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
         .arg("init")
         .arg(host_alias)
+        .arg("--ssh-path")
+        .arg(&shim.isekai_ssh_path_arg)
         .arg("--helper-binary")
         .arg(helper_binary_path)
         .arg("--relay-addr")
@@ -444,7 +472,9 @@ async fn spawn_init(
         .arg("--relay-jwt")
         .arg("test-jwt-token")
         .env("HOME", home)
-        .env("PATH", path_env)
+        .env("PATH", &shim.path_env)
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(home))
+        .envs(shim.extra_env.clone())
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
         .stdout(StdStdio::piped())
@@ -488,13 +518,13 @@ async fn init_then_connect_succeeds_for_a_freshly_deployed_host() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env) = shim_ssh_with_bootstrap_config(tmp.path(), "dummy-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "dummy-host", mock_sshd_addr, &key_path);
 
     let helper_script = stand_in_helper_script(real_helper_addr, &real_helper.handshake);
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
     std::fs::write(&helper_script_path, &helper_script).unwrap();
 
-    let output = spawn_init(&home, "dummy-host", &helper_script_path, &path_env, "y\n").await;
+    let output = spawn_init(&home, "dummy-host", &helper_script_path, &shim, "y\n").await;
     eprintln!("init stdout:\n{}", String::from_utf8_lossy(&output.stdout));
     eprintln!("init stderr:\n{}", String::from_utf8_lossy(&output.stderr));
     assert!(output.status.success(), "isekai-ssh init failed: {output:?}");
@@ -632,7 +662,7 @@ async fn init_with_stun_server_saves_the_observed_address_to_the_trust_store() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env) = shim_ssh_with_bootstrap_config(tmp.path(), "stun-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "stun-host", mock_sshd_addr, &key_path);
 
     let helper_script = stand_in_helper_script(real_helper_addr, &real_helper.handshake);
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
@@ -641,6 +671,8 @@ async fn init_with_stun_server_saves_the_observed_address_to_the_trust_store() {
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
         .arg("init")
         .arg("stun-host")
+        .arg("--ssh-path")
+        .arg(&shim.isekai_ssh_path_arg)
         .arg("--helper-binary")
         .arg(&helper_script_path)
         .arg("--relay-addr")
@@ -652,7 +684,9 @@ async fn init_with_stun_server_saves_the_observed_address_to_the_trust_store() {
         .arg("--stun-server")
         .arg(stun_server.to_string())
         .env("HOME", &home)
-        .env("PATH", &path_env)
+        .env("PATH", &shim.path_env)
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .envs(shim.extra_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
         .stdout(StdStdio::piped())
@@ -698,7 +732,7 @@ async fn init_writes_nothing_when_confirmation_is_declined() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env) = shim_ssh_with_bootstrap_config(tmp.path(), "dummy-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "dummy-host", mock_sshd_addr, &key_path);
 
     let helper_script = stand_in_helper_script(real_helper_addr, &real_helper.handshake);
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
@@ -707,7 +741,7 @@ async fn init_writes_nothing_when_confirmation_is_declined() {
     let profile_path = profile_path_under(&home, "dummy-host:22");
     assert!(!profile_path.exists(), "profile must not exist before this test runs");
 
-    let output = spawn_init(&home, "dummy-host", &helper_script_path, &path_env, "n\n").await;
+    let output = spawn_init(&home, "dummy-host", &helper_script_path, &shim, "n\n").await;
     eprintln!("init stdout:\n{}", String::from_utf8_lossy(&output.stdout));
     eprintln!("init stderr:\n{}", String::from_utf8_lossy(&output.stderr));
     assert!(output.status.success(), "declining the prompt should not itself be an error: {output:?}");
