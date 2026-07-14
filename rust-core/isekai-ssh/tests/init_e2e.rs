@@ -69,6 +69,23 @@ fn isekai_ssh_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_isekai-ssh"))
 }
 
+/// Renders `path` with forward slashes, safe to embed inside a hand-built
+/// `ProxyCommand=...` string that a POSIX-shell-hosted `ssh(1)` (Git for
+/// Windows' bundled one, which a bare `ssh` resolves to on the
+/// `test-windows` CI runner) execs via `sh -c`. Needed only on Windows:
+/// `Path::display()` there renders `\`-separated components, and an
+/// unquoted `\` inside a POSIX shell command string is an escape character
+/// — embedding a raw Windows path silently mangles it (confirmed via a real
+/// `test-windows` CI failure: `sh -c` reported `exec: <path with every `\`
+/// stripped>: not found`). Windows' own filesystem APIs accept forward
+/// slashes exactly as well as backslashes, so this is a lossless
+/// substitution, not a real path translation. A no-op on Unix, where paths
+/// are already `/`-separated (see `wrapper_auto_bootstrap_e2e.rs::posix_safe_path`,
+/// same idea, needed there for a different embedded-in-a-shell-script case).
+fn posix_safe_path(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "/")
+}
+
 /// Locates a sibling workspace package's binary by walking up from
 /// `current_exe()` rather than using a `CARGO_BIN_EXE_*` variable (that
 /// mechanism only covers binaries of the package currently being compiled,
@@ -555,10 +572,8 @@ async fn init_then_connect_succeeds_for_a_freshly_deployed_host() {
     // used to exercise directly has been removed now that the wrapper +
     // `isekai-pipe connect` cover the same ground, `archive/ISEKAI_PIPE_MIGRATION.md`
     // P5).
-    let proxy_command = format!(
-        "{} connect --profile dummy-host --service ssh --stdio",
-        isekai_pipe_bin_path().display()
-    );
+    let proxy_command =
+        format!("{} connect --profile dummy-host --service ssh --stdio", posix_safe_path(&isekai_pipe_bin_path()));
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         TokioCommand::new("ssh")
