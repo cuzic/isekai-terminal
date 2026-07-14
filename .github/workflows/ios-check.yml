@@ -1,0 +1,280 @@
+name: iOS checks
+
+# isekai-terminal-core (rust-core) の iOS 向けクロスビルド・UniFFI Swiftバインディング生成・
+# XCFramework化・iOS Simulatorでの各種テストを検証する(PLAN.md「Phase Y」節参照)。
+# コード署名は一切行わない(静的ライブラリのビルドとシミュレータテストのみのため不要)。
+#
+# 公開リポジトリなので標準GitHub-hostedのmacOSランナーは無課金で使える。
+# macos-14は2026-07-06から非推奨(2026-11-02にサポート終了)のためmacos-26を使う。
+#
+# 元々は ios-rust-core-check.yml / ios-app-build-check.yml /
+# ios-ssh-vertical-slice-check.yml の3つの独立ワークフローだったが、いずれも
+# 「isekai-pipeのmuslバイナリビルド → isekai-terminal-coreをiOS向けクロスビルドして
+# XCFramework化」という同じ重い前処理(macOSランナーで約15分、うちmuslビルド単体で
+# 約10分)を独立に繰り返しており、3ワークフロー合計で無駄が大きかった。実測ログで
+# さらに、この前処理のcargoキャッシュ復元ステップがmuslビルドより後に置かれていた
+# ため、キャッシュがmuslビルドに一切効かず毎回コールドビルドになっていたことも判明
+# (2026-07-14)。この2点を修正し、前処理を`build-xcframework`ジョブに1本化して
+# XCFrameworkをartifactとして後続3ジョブに配る構成に統合した。後続3ジョブはXcodeの
+# テスト実行のみを行い、Rustツールチェーンのセットアップを一切必要としない。
+#
+# build-xcframework: rust-core全体の前処理 + UniFFI Swiftバインディングのdrift検証
+#   (旧ios-rust-core-check.ymlが担っていた「生成物が最新か」のチェック)。
+# rust-core-check: IsekaiTerminalCore-Package(UniFFIラウンドトリップ)のテスト。
+# app-build-check: IsekaiTerminalApp(Xcodeアプリ雛形、Phase 1A-1)のシミュレータビルド+
+#   テスト。Phase 1D: TerminalSessionControllerE2ETests用にCI fixtureも起動する
+#   (ポート2298、rust-core-checkとは別ポート)。
+# ssh-vertical-slice-check: Phase 1A-8のSSH縦切りE2E(実sshd fixtureへの接続、
+#   ポート2299)。KeyManagerTests.testGeneratedKeyAuthenticatesAgainstRealSshdも
+#   同じfixtureを使うためここに含める。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust-core/**"
+      - "ios/**"
+      - ".github/workflows/ios-check.yml"
+  pull_request:
+    paths:
+      - "rust-core/**"
+      - "ios/**"
+      - ".github/workflows/ios-check.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-xcframework:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          rustc --version
+          cargo --version
+
+      - name: Install Rust iOS targets
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      # muslバイナリビルド(cargo-zigbuildのインストールも含む)より前に置く。
+      # 以前はキャッシュ復元がmuslビルドの後にあったため、cargoレジストリ/ビルド
+      # 成果物のキャッシュがこのステップに一切効かず、毎回コールドビルドで
+      # 10分以上かかっていた(2026-07-14に発覚・修正)。
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            rust-core/target
+          key: ios-xcframework-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            ios-xcframework-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
+        run: |
+          # GitHub-hostedのmacOSランナーには`aws/tap`が既にtapされているが、
+          # 最近のHomebrewはtap trust必須化により、無関係なbrew installでも
+          # 未trustのtapがあるだけで失敗するようになった。zig自体はこのtapと
+          # 無関係なので、先に外してしまう(存在しない/既に外れていてもよい)。
+          brew untap aws/tap || true
+          brew install zig
+          if ! command -v cargo-zigbuild >/dev/null; then
+            cargo install cargo-zigbuild --locked
+          fi
+          bash rust-core/scripts/build-isekai-pipe-musl.sh
+
+      - name: Generate Swift bindings and check for drift
+        run: |
+          bash rust-core/scripts/generate-swift-bindings.sh
+          git diff --exit-code -- ios/Sources/IsekaiTerminalCoreLogic/generated || {
+            echo "::error::ios/Sources/IsekaiTerminalCoreLogic/generated is stale. Run rust-core/scripts/generate-swift-bindings.sh and commit the result." >&2
+            exit 1
+          }
+
+      - name: Build XCFramework
+        run: bash rust-core/scripts/build-ios-xcframework.sh
+
+      - name: Inspect XCFramework slices
+        run: |
+          set -euo pipefail
+          XC=ios/Frameworks/IsekaiTerminalCoreFFI.xcframework
+          test -f "$XC/Info.plist"
+          plutil -lint "$XC/Info.plist"
+          find "$XC" -name libisekai_terminal_core.a | while read -r lib; do
+            echo "=== $lib ==="
+            lipo -archs "$lib"
+          done
+
+      - name: Upload XCFramework
+        uses: actions/upload-artifact@v4
+        with:
+          name: IsekaiTerminalCoreFFI-xcframework
+          path: ios/Frameworks/IsekaiTerminalCoreFFI.xcframework
+          retention-days: 7
+
+  rust-core-check:
+    needs: build-xcframework
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download XCFramework
+        uses: actions/download-artifact@v4
+        with:
+          name: IsekaiTerminalCoreFFI-xcframework
+          path: ios/Frameworks/IsekaiTerminalCoreFFI.xcframework
+
+      - name: Pick an available iOS Simulator device
+        id: sim
+        run: |
+          set -euo pipefail
+          DEVICE_NAME=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data["devices"].items():
+              if "iOS" not in runtime:
+                  continue
+              for d in devices:
+                  if d.get("isAvailable") and d.get("name", "").startswith("iPhone"):
+                      print(d["name"])
+                      sys.exit(0)
+          sys.exit(1)
+          ')
+          echo "device_name=$DEVICE_NAME" >> "$GITHUB_OUTPUT"
+          echo "picked simulator: $DEVICE_NAME"
+
+      - name: Run round-trip test on iOS Simulator
+        working-directory: ios
+        # CODE_SIGNING_ALLOWED=NOで署名を完全に無効化すると、Keychain APIが
+        # errSecMissingEntitlement(-34018)で失敗する(未署名プロセスはOSが
+        # どのアプリのKeychainか判定できないため)。CredentialVault(Phase 1B)の
+        # テスト追加で発覚。署名は無効化せず、Xcodeの自動ローカル署名
+        # (Apple Developerアカウント不要、Simulator向けなら成立する)に任せる。
+        run: |
+          xcodebuild -list
+          xcodebuild test \
+            -scheme IsekaiTerminalCore-Package \
+            -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}'
+
+  app-build-check:
+    needs: build-xcframework
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download XCFramework
+        uses: actions/download-artifact@v4
+        with:
+          name: IsekaiTerminalCoreFFI-xcframework
+          path: ios/Frameworks/IsekaiTerminalCoreFFI.xcframework
+
+      - name: Resolve Swift package dependencies
+        working-directory: ios/App
+        run: xcodebuild -resolvePackageDependencies -project IsekaiTerminalApp.xcodeproj -scheme IsekaiTerminalApp
+
+      - name: Start sshd fixture
+        run: bash rust-core/scripts/ios-fixture/start-sshd-fixture.sh /tmp/ios-fixture 2298
+
+      - name: Pick an available iOS Simulator device
+        id: sim
+        run: |
+          set -euo pipefail
+          DEVICE_NAME=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data["devices"].items():
+              if "iOS" not in runtime:
+                  continue
+              for d in devices:
+                  if d.get("isAvailable") and d.get("name", "").startswith("iPhone"):
+                      print(d["name"])
+                      sys.exit(0)
+          sys.exit(1)
+          ')
+          echo "device_name=$DEVICE_NAME" >> "$GITHUB_OUTPUT"
+          echo "picked simulator: $DEVICE_NAME"
+
+      - name: Build and test IsekaiTerminalApp on iOS Simulator
+        # CODE_SIGNING_ALLOWED=NOで署名を無効化すると、IsekaiTerminalAppTests
+        # (CredentialVaultのKeychainテストをホストする)がerrSecMissingEntitlement
+        # (-34018)で失敗する。署名はXcodeの自動ローカル署名に任せる。
+        working-directory: ios/App
+        run: |
+          xcodebuild -list -project IsekaiTerminalApp.xcodeproj
+          xcodebuild test \
+            -project IsekaiTerminalApp.xcodeproj \
+            -scheme IsekaiTerminalApp \
+            -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}'
+
+      - name: Stop sshd fixture
+        if: always()
+        run: bash rust-core/scripts/ios-fixture/stop-sshd-fixture.sh /tmp/ios-fixture
+
+  ssh-vertical-slice-check:
+    needs: build-xcframework
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download XCFramework
+        uses: actions/download-artifact@v4
+        with:
+          name: IsekaiTerminalCoreFFI-xcframework
+          path: ios/Frameworks/IsekaiTerminalCoreFFI.xcframework
+
+      - name: Start sshd fixture
+        run: bash rust-core/scripts/ios-fixture/start-sshd-fixture.sh /tmp/ios-fixture 2299
+
+      - name: Pick an available iOS Simulator device
+        id: sim
+        run: |
+          set -euo pipefail
+          DEVICE_NAME=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data["devices"].items():
+              if "iOS" not in runtime:
+                  continue
+              for d in devices:
+                  if d.get("isAvailable") and d.get("name", "").startswith("iPhone"):
+                      print(d["name"])
+                      sys.exit(0)
+          sys.exit(1)
+          ')
+          echo "device_name=$DEVICE_NAME" >> "$GITHUB_OUTPUT"
+          echo "picked simulator: $DEVICE_NAME"
+
+      - name: Run SSH vertical slice test on iOS Simulator
+        working-directory: ios
+        run: |
+          xcodebuild test \
+            -scheme IsekaiTerminalCore-Package \
+            -destination 'platform=iOS Simulator,name=${{ steps.sim.outputs.device_name }}' \
+            -only-testing:IsekaiTerminalCoreTests/SshVerticalSliceTests \
+            -only-testing:IsekaiTerminalCoreLogicTests/KeyManagerTests/testGeneratedKeyAuthenticatesAgainstRealSshd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Stop sshd fixture
+        if: always()
+        run: bash rust-core/scripts/ios-fixture/stop-sshd-fixture.sh /tmp/ios-fixture

@@ -19,7 +19,7 @@ name: rust-core test check
 # 無条件に埋め込むため、別途zig/cargo-zigbuildの前提ビルドが要る)とuniffi-bindgen
 # (Android/iOS binding生成ツール、CLI/shared crateのテスト対象外)は除外し、
 # それ以外のCLI/shared crateのみをmacOSでも検証する。iOS側の別ビルド確認は
-# ios-rust-core-check.yml等が既にカバーしている。
+# ios-check.yml等が既にカバーしている。
 #
 # test-windows: 詳細は各ジョブのコメント参照。
 
@@ -70,12 +70,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openssh-server
 
+      # musl バイナリビルド(cargo-zigbuildのインストールも含む)より前に置く。
+      # 以前はキャッシュ復元がmuslビルドの後にあったため、cargoレジストリ/ビルド
+      # 成果物のキャッシュがこのステップに一切効かず、毎回コールドビルドで
+      # 6分以上かかっていた(2026-07-14に発覚・修正)。
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            rust-core/target
+          key: rust-core-test-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            rust-core-test-${{ runner.os }}-
+
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
         # rust-core/src/isekai_pipe_quic_transport.rs が include_bytes! で埋め込む
         # isekai-pipe の x86_64/aarch64 musl静的バイナリ。iOS/Androidどちらのビルドにも
         # 依らずisekai-terminal-coreを cargo test するだけでも常に必要な前提
-        # (ios-rust-core-check.yml/ios-app-build-check.yml/ios-ssh-vertical-slice-check.yml/
-        # ios-logic-linux-check.ymlは既に対応済みだったが、このワークフローだけ追従が漏れていた)。
+        # (ios-check.yml/ios-logic-linux-check.ymlは既に対応済みだったが、
+        # このワークフローだけ追従が漏れていた)。
         run: |
           set -euo pipefail
           curl -fL -o /tmp/zig.tar.xz \
@@ -84,20 +100,11 @@ jobs:
           tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
           echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
           export PATH="$HOME/zig-toolchain:$PATH"
-          cargo install cargo-zigbuild --locked
+          if ! command -v cargo-zigbuild >/dev/null; then
+            cargo install cargo-zigbuild --locked
+          fi
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           bash rust-core/scripts/build-isekai-pipe-musl.sh
-
-      - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust-core/target
-          key: rust-core-test-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
-          restore-keys: |
-            rust-core-test-${{ runner.os }}-
 
       - name: cargo test --workspace (excluding noq-multipath-spike)
         working-directory: rust-core
@@ -152,7 +159,7 @@ jobs:
       # isekai_pipe_quic_transport.rsがLinux musl静的バイナリをinclude_bytes!で
       # 無条件に埋め込むため、`test`ジョブと同じzig/cargo-zigbuildの前提ビルドが
       # 必要になってしまい、このジョブが検証したいCLI/shared crateの話と関係ない。
-      # iOS向けクロスビルドの検証はios-rust-core-check.ymlが別途カバー済み。
+      # iOS向けクロスビルドの検証はios-check.ymlが別途カバー済み。
       # uniffi-bindgenはAndroid/iOS binding生成専用のCLIツールで同様に対象外。
       - name: cargo test --workspace (macOS, excluding Android/iOS-only crates)
         working-directory: rust-core
