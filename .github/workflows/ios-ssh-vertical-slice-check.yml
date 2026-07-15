@@ -48,6 +48,15 @@ jobs:
         run: |
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
+      # release-build.ymlのLinuxクロスビルドと同じmlugg/setup-zigを使う
+      # (以前はbrew install zigだったが、Homebrewのtap trust必須化で無関係な
+      # brew installまで失敗しうる問題があった。setup-zigはHomebrewを経由
+      # しないためこの問題自体が起きない。2026-07-14に統一)。
+      - name: Install zig (mlugg/setup-zig)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: latest
+
       # muslバイナリビルド(cargo-zigbuildのインストールも含む)より前に置く。
       # 以前はキャッシュ復元がmuslビルドの後にあったため、cargoレジストリ/ビルド
       # 成果物のキャッシュがこのステップに一切効かず、毎回コールドビルドで
@@ -66,12 +75,6 @@ jobs:
 
       - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
         run: |
-          # GitHub-hostedのmacOSランナーには`aws/tap`が既にtapされているが、
-          # 最近のHomebrewはtap trust必須化により、無関係なbrew installでも
-          # 未trustのtapがあるだけで失敗するようになった。zig自体はこのtapと
-          # 無関係なので、先に外してしまう(存在しない/既に外れていてもよい)。
-          brew untap aws/tap || true
-          brew install zig
           if ! command -v cargo-zigbuild >/dev/null; then
             cargo install cargo-zigbuild --locked
           fi
