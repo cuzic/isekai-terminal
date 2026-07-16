@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 import IsekaiTerminalCoreLogic
 
 /// SSH agentへの署名要求。ユーザーが承認/拒否した結果を`respond`で
@@ -82,6 +83,7 @@ let defaultStunServer = "stun.l.google.com:19302"
 /// `Task { @MainActor in }`で明示的に受け渡す。
 public final class TerminalSessionController: OrchestratorCallback, @unchecked Sendable {
     public let uiState = TerminalUIState()
+    private static let logger = Logger(subsystem: "tools.isekai.terminal", category: "ssh")
 
     private let profile: ConnectionProfile
     private let password: String?
@@ -710,8 +712,23 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         }
     }
 
+    /// 物理multipathのfd取得自体がiOSでは未実装のため(タスク#12参照)、Android版
+    /// `onNoViablePath`のようなupstream failover実装は対象外のまま(no-op)にしている。
     public func onNoViablePath() {}
-    public func onForwardStateChanged(id: String, state: ForwardState) {}
+
+    /// ポートフォワードの状態変化をログへ出力する(Android版`TerminalSession.kt`の
+    /// `onForwardStateChanged`と同じくログのみ、UI状態には反映しない)。以前はno-opで
+    /// Rustからの通知が失われていた(Codexアーキテクチャレビュー指摘)。
+    public func onForwardStateChanged(id: String, state: ForwardState) {
+        switch state {
+        case .listening:
+            Self.logger.info("port forward '\(id, privacy: .public)': listening")
+        case .failed(let reason):
+            Self.logger.warning("port forward '\(id, privacy: .public)': failed: \(reason, privacy: .public)")
+        case .stopped:
+            Self.logger.info("port forward '\(id, privacy: .public)': stopped")
+        }
+    }
 
     /// SSH agentへの署名要求。Android版`AgentSignConfirmDialog`と同じく、要求ごとに
     /// ユーザー確認を必須とする。このcallbackはRustスレッドから同期的にBoolを
