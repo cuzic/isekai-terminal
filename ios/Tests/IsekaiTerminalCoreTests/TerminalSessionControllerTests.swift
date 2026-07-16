@@ -2,8 +2,11 @@ import XCTest
 @testable import IsekaiTerminalCore
 import IsekaiTerminalCoreLogic
 
-/// Phase 1D(#18b): `TerminalSessionController.onHostKey`のTOFU(Trust On First Use)
-/// ロジックの検証。実際のSSH接続は行わず、ホスト鍵確認ロジックだけを直接呼び出す。
+/// Phase 1D(#18b): `TerminalSessionController.onHostKey`のホスト鍵確認ロジックの検証。
+/// 未知ホストは自動trustせず`uiState.newHostKeyPrompt`を立てて一旦拒否し、
+/// `trustNewHostKey()`経由の明示的な信頼後にのみ受理する(Android版`TerminalSession.kt`の
+/// 既定`autoTrustNewHostKeys=false`と同じ方針、Codexアーキテクチャレビュー指摘の反映)。
+/// 実際のSSH接続は行わず、ホスト鍵確認ロジックだけを直接呼び出す。
 @MainActor
 final class TerminalSessionControllerTests: XCTestCase {
     private func makeController(host: String = "127.0.0.1") throws -> (TerminalSessionController, SshHostTrustStore) {
@@ -18,26 +21,64 @@ final class TerminalSessionControllerTests: XCTestCase {
         return (controller, trustStore)
     }
 
-    func testFirstConnectionAutoTrustsAndAccepts() throws {
+    func testFirstConnectionShowsPromptAndRejectsUntilTrusted() async throws {
         let (controller, trustStore) = try makeController()
 
-        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.newHostKeyPrompt != nil
+        }
+        XCTAssertEqual(controller.uiState.newHostKeyPrompt, NewHostKeyPrompt(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
 
         let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: "127.0.0.1", port: 22)
+        XCTAssertNil(trustStore.record(for: identifier))
+
+        controller.trustNewHostKey()
+
+        XCTAssertNil(controller.uiState.newHostKeyPrompt)
         XCTAssertEqual(trustStore.record(for: identifier)?.fingerprint, "SHA256:aaaa")
-    }
-
-    func testSameFingerprintOnSecondConnectionIsAccepted() throws {
-        let (controller, _) = try makeController()
-
-        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
         XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
     }
 
-    func testChangedFingerprintIsRejectedAndSurfacesFailure() async throws {
+    func testDismissNewHostKeyPromptDisconnectsWithoutTrusting() async throws {
+        let (controller, trustStore) = try makeController()
+
+        XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.newHostKeyPrompt != nil
+        }
+
+        controller.dismissNewHostKeyPrompt()
+
+        XCTAssertNil(controller.uiState.newHostKeyPrompt)
+        let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: "127.0.0.1", port: 22)
+        XCTAssertNil(trustStore.record(for: identifier))
+    }
+
+    func testSameFingerprintIsAcceptedAfterTrust() async throws {
         let (controller, _) = try makeController()
 
+        XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.newHostKeyPrompt != nil
+        }
+        controller.trustNewHostKey()
+
         XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+    }
+
+    func testChangedFingerprintAfterTrustIsRejectedAndSurfacesFailure() async throws {
+        let (controller, _) = try makeController()
+
+        XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.newHostKeyPrompt != nil
+        }
+        controller.trustNewHostKey()
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+
         XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:bbbb"))
 
         try await waitUntilFixtureCondition(timeout: 2) {

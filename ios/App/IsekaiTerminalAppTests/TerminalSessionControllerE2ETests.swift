@@ -37,6 +37,14 @@ final class TerminalSessionControllerE2ETests: XCTestCase {
         let controller = TerminalSessionController(profile: profile, password: nil, db: db, vault: vault, trustStore: trustStore)
         controller.connect()
 
+        // 未知ホストは自動trustされないため(タスク#6、Codexアーキテクチャレビュー指摘の反映)、
+        // 一旦拒否されて確認ダイアログが立ってから、明示的にtrustして再接続する必要がある。
+        try await waitUntilE2ECondition(timeout: 10) {
+            await controller.uiState.newHostKeyPrompt != nil
+        }
+        controller.trustNewHostKey()
+        controller.reconnect()
+
         try await waitUntilE2ECondition(timeout: 10) {
             await controller.uiState.state == .connected
         }

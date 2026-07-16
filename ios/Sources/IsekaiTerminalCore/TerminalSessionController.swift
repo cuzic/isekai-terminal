@@ -11,6 +11,14 @@ public struct AgentSignRequest: Sendable {
     let respond: @Sendable (Bool) -> Void
 }
 
+/// 初回接続(未知ホスト)の確認待ち。Android版`NewHostKeyPrompt`(`UiState.kt`)と対称。
+/// 非nilの間、確認ダイアログを表示する(`TerminalView`の`.alert`参照)。
+public struct NewHostKeyPrompt: Equatable, Sendable {
+    public let host: String
+    public let port: UInt16
+    public let fingerprint: String
+}
+
 /// Phase 1D: ターミナル本画面のSSH接続状態。UI(`TerminalView`)はこれだけを見て
 /// 表示を切り替える(Rust SSOT原則: 接続状態の判断はここに集約し、UI側で
 /// 独自のミラー状態を作らない)。
@@ -34,6 +42,10 @@ public final class TerminalUIState: ObservableObject {
     @Published public internal(set) var latestScreenUpdate: ScreenUpdate?
     /// Phase 1E-4: SSH agentへの署名要求。非nilの間、確認ダイアログを表示する。
     @Published public internal(set) var pendingAgentSignRequest: AgentSignRequest?
+    /// 初回接続(未知ホスト)の確認待ち。非nilの間、確認ダイアログを表示する
+    /// (Android版`uiState.newHostKeyPrompt`と対称、`.claude/rules/rust-ssot.md`に
+    /// 沿い、未知ホストの自動trustはせずユーザー確認を必須にする)。
+    @Published public internal(set) var newHostKeyPrompt: NewHostKeyPrompt?
     /// Phase 1C(#25): trzszファイル転送の状態。非nilの間、転送シートを表示する。
     @Published public internal(set) var trzszState: TrzszUiState?
     /// Phase 1C(#25): ダウンロード完了後、ユーザーがFilesアプリ等へ保存できる
@@ -464,6 +476,27 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         }
     }
 
+    // MARK: - Host key
+
+    /// 初回接続確認ダイアログで「信頼して接続」を選んだ時に呼ぶ。trust storeを更新するのみで、
+    /// 接続自体は(Android版`TerminalSession.kt`の`trustNewHostKey()`と同様)ユーザーが手動で
+    /// 再接続する想定(`.failed`状態で表示される`reconnectButton`、`reconnect()`参照)。
+    @MainActor
+    public func trustNewHostKey() {
+        guard let prompt = uiState.newHostKeyPrompt else { return }
+        uiState.newHostKeyPrompt = nil
+        let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: prompt.host, port: prompt.port)
+        try? trustStore.trust(identifier: identifier, keyType: "ssh", fingerprint: prompt.fingerprint)
+    }
+
+    /// 初回接続確認ダイアログで「キャンセル」を選んだ時に呼ぶ。trust storeは更新せず切断する
+    /// (Android版`TerminalSession.kt`の`dismissNewHostKeyPrompt()`と同じ方針)。
+    @MainActor
+    public func dismissNewHostKeyPrompt() {
+        uiState.newHostKeyPrompt = nil
+        disconnect()
+    }
+
     /// Phase 1F-4(#51): スクロールバックのスワイプUI用。Android版
     /// `actions.onScrollbackCells`相当。セッション未確立時は空配列を返す。
     public func scrollbackCells(offset: UInt32, rows: UInt32) -> [CellData] {
@@ -594,16 +627,16 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         Task { @MainActor in self.uiState.latestScreenUpdate = update }
     }
 
-    /// ホスト鍵確認。iOS版は暫定的にTOFU(Trust On First Use)方式を採る
-    /// (Android版`TerminalSession.kt`の`onHostKey`と同じ方針): 初回接続は
-    /// 自動的に信頼して記録し、fingerprintが変化した場合のみ拒否する。
-    /// `SshHostTrustStore`自体は対話的な確認UIを前提にした設計コメントが
-    /// 付いているが、このcallbackはRustスレッドから同期的にBoolを返す必要があり
-    /// (接続処理をブロックしてまでUI確認を待つ設計は複雑さに見合わないため)、
-    /// 最初の実装ではAndroidと同じ自動信頼方式を踏襲する。対話的な確認UIへの
-    /// 格上げは将来の改善候補(PLAN.md参照)。渡された`host`/`port`をそのまま使う
-    /// (`profile.host`ではなく)ことで、踏み台経由接続でホップ先のホスト鍵が届いた
-    /// 場合にも正しいホストで検証できる(Android版`TerminalSession.kt`の
+    /// ホスト鍵確認。Android版`TerminalSession.kt`の`onHostKey`(既定設定
+    /// `autoTrustNewHostKeys=false`)と同じ方針: 初回接続(未知ホスト)は自動信頼せず、
+    /// `uiState.newHostKeyPrompt`を立てて一旦接続を失敗させ、ユーザーが`trustNewHostKey()`
+    /// で明示的に信頼した後の手動再接続に委ねる(未知ホストの自動trustは、悪性DNS/公衆Wi-Fi
+    /// 経由のMITMで攻撃者鍵をそのまま初回登録してしまう実害のあるセキュリティギャップだった
+    /// ——Codexアーキテクチャレビューで指摘、旧実装は自動trustしていた)。このcallbackは
+    /// Rustスレッドから同期的にBoolを返す必要があるため、確認ダイアログの表示自体は
+    /// `Task { @MainActor in }`経由でuiStateへ反映しつつ、戻り値はここで即座に`false`を返す。
+    /// 渡された`host`/`port`をそのまま使う(`profile.host`ではなく)ことで、踏み台経由接続で
+    /// ホップ先のホスト鍵が届いた場合にも正しいホストで検証できる(Android版`TerminalSession.kt`の
     /// `onHostKey(host, port, fingerprint)`と同じ方針)。
     public func onHostKey(host: String, port: UInt16, fingerprint: String) -> Bool {
         let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: host, port: port)
@@ -611,8 +644,10 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         case .trustedMatch:
             return true
         case .unknownHost:
-            try? trustStore.trust(identifier: identifier, keyType: "ssh", fingerprint: fingerprint)
-            return true
+            Task { @MainActor in
+                self.uiState.newHostKeyPrompt = NewHostKeyPrompt(host: host, port: port, fingerprint: fingerprint)
+            }
+            return false
         case .mismatch:
             fail(message: "ホスト鍵が変更されています(なりすましの可能性)。接続を中止しました。")
             return false
