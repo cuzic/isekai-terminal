@@ -41,6 +41,13 @@ public final class ProfileEditModel: ObservableObject {
     // 空ならAndroid版と同じ既定値(`defaultStunServer`)にフォールバックする。
     @Published public var stunServer: String
 
+    /// isekai-helper QUICの待受ポート固定(任意、1024〜65535)。空欄ならOSがエフェメラル
+    /// ポートを選ぶ(Android版`ProfileEditScreen.helperBindPort`と同じ方針)。isekaiHelperQuic/
+    /// auto/isekaiHelperQuicMultipath選択時のみ意味を持つ(`usesHelperBindPort`参照)。
+    /// 以前はUI自体が存在せず、`ConnectionProfile.helperBindPort`が保存経路を持たない
+    /// (常にnil)デッドフィールドになっていた(Codexアーキテクチャレビュー指摘)。
+    @Published public var helperBindPort: String
+
     // Phase 1E-6: MASQUE relay P2P選択時のみ使う。relayJwtはUI上は平文で編集するが、
     // 保存時に`relayVault`で暗号化してDBへ書き込む(Android版`encryptRelayJwt`/
     // `decryptRelayJwt`と同じ方針)。
@@ -88,6 +95,7 @@ public final class ProfileEditModel: ObservableObject {
 
         self.transportPreference = profile?.transportPreference ?? .plainSsh
         self.stunServer = profile?.stunServer ?? ""
+        self.helperBindPort = profile?.helperBindPort.map { String($0) } ?? ""
 
         self.relayAddr = profile?.relayAddr ?? ""
         self.relaySni = profile?.relaySni ?? ""
@@ -106,6 +114,14 @@ public final class ProfileEditModel: ObservableObject {
         if jumpUseKeyAuth && jumpSelectedKeyEntryId == nil {
             jumpSelectedKeyEntryId = availableKeys.first?.id
         }
+    }
+
+    /// Android版`TransportUiSpec.showsHelperBindPortField`と同じ判定
+    /// (isekai-helper QUICを実際に使う3方式のみ意味を持つ)。
+    public var usesHelperBindPort: Bool {
+        transportPreference == .isekaiHelperQuic ||
+            transportPreference == .auto ||
+            transportPreference == .isekaiHelperQuicMultipath
     }
 
     public func addForward(_ forward: StoredPortForward) {
@@ -167,6 +183,17 @@ public final class ProfileEditModel: ObservableObject {
             resolvedJumpKeyEntryId = jumpUseKeyAuth ? jumpSelectedKeyEntryId : nil
         }
 
+        // Android版`helperBindPortValid`と同じ範囲(1024〜65535)。空欄は許可(自動割り当て)。
+        var resolvedHelperBindPort: Int?
+        let trimmedHelperBindPort = helperBindPort.trimmingCharacters(in: .whitespaces)
+        if !trimmedHelperBindPort.isEmpty {
+            guard let portNumber = Int(trimmedHelperBindPort), (1024...65535).contains(portNumber) else {
+                errorMessage = "ヘルパー待受ポートは1024〜65535の範囲で指定してください"
+                return false
+            }
+            resolvedHelperBindPort = portNumber
+        }
+
         var resolvedRelayJwt: String?
         if transportPreference == .isekaiLinkRelayQuic {
             guard !relayAddr.trimmingCharacters(in: .whitespaces).isEmpty,
@@ -204,7 +231,8 @@ public final class ProfileEditModel: ObservableObject {
             relaySni: relaySni.trimmingCharacters(in: .whitespaces).isEmpty ? nil : relaySni,
             relayJwt: resolvedRelayJwt,
             allowNonLoopbackForwardBind: allowNonLoopbackForwardBind,
-            themeName: themeName
+            themeName: themeName,
+            helperBindPort: resolvedHelperBindPort
         )
         do {
             if existingId != nil {
@@ -278,6 +306,15 @@ public struct ProfileEditView: View {
                     Text("Tailscale⇔直接アドレスのマルチパス").tag(StoredTransportPreference.isekaiHelperQuicMultipath)
                 }
                 .accessibilityIdentifier("transportPreferencePicker")
+
+                if model.usesHelperBindPort {
+                    TextField("ヘルパー待受ポート固定(任意、1024〜65535)", text: $model.helperBindPort)
+                        .keyboardType(.numberPad)
+                        .accessibilityIdentifier("helperBindPortField")
+                    Text("自作ヘルパーのQUIC待受ポートを固定します。サーバーへ直接到達する経路(direct_address等)を使う場合、サーバー側ファイアウォールで事前にこのポートだけを開けておけます。未指定ならこれまで通り自動割り当てです。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 if model.transportPreference == .isekaiStunP2pQuic {
                     TextField("STUNサーバー(host:port)", text: $model.stunServer)

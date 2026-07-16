@@ -294,6 +294,21 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(config.cols, 100)
         XCTAssertEqual(config.rows, 40)
         XCTAssertEqual(config.jump, jump)
+        XCTAssertNil(config.bindPort)
+    }
+
+    // helperBindPortが以前は保存経路が無く常にnilになっていたバグの回帰テスト
+    // (Codexアーキテクチャレビュー指摘、ProfileEditView側の修正とセット)。
+    func testMakeIsekaiPipeQuicConfigMapsHelperBindPort() throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 2222, username: "user",
+            helperBindPort: 45823
+        )
+        let controller = try makeControllerWithProfile(profile)
+
+        let config = controller.makeIsekaiPipeQuicConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+        XCTAssertEqual(config.bindPort, 45823)
     }
 
     // MARK: - Phase 1E-5(#44): STUN+SSHランデブーP2P(config構築のみ、実接続なし)
@@ -391,6 +406,21 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertNil(config.wifiLocalIp)
         XCTAssertNil(config.cellularFd)
         XCTAssertNil(config.cellularLocalIp)
+        XCTAssertNil(config.bindPort)
+    }
+
+    // helperBindPortが以前は保存経路が無く常にnilになっていたバグの回帰テスト
+    // (Codexアーキテクチャレビュー指摘、ProfileEditView側の修正とセット)。
+    func testMakeMultipathIsekaiPipeQuicConfigMapsHelperBindPort() throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "tailscale.example.com", port: 22, username: "user",
+            helperBindPort: 45823
+        )
+        let controller = try makeControllerWithProfile(profile)
+
+        let config = controller.makeMultipathIsekaiPipeQuicConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+        XCTAssertEqual(config.bindPort, 45823)
     }
 
     func testMakeMultipathIsekaiPipeQuicConfigTreatsBlankDirectAddressAsNil() throws {

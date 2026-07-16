@@ -249,7 +249,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             cols: cols,
             rows: rows,
             jump: jump,
-            bindPort: nil
+            bindPort: profile.helperBindPort.flatMap { UInt16(exactly: $0) }
         )
     }
 
@@ -315,7 +315,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             cols: cols,
             rows: rows,
             jump: jump,
-            bindPort: nil
+            bindPort: profile.helperBindPort.flatMap { UInt16(exactly: $0) }
         )
     }
 
