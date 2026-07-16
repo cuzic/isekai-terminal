@@ -182,7 +182,13 @@ async fn isekai_log_file_redirects_both_the_wrappers_own_messages_and_the_ssh_ch
             .arg(&log_path)
             .arg("log-file-host")
             .env("HOME", &home)
-            .env_remove("RUST_LOG")
+            // `isekai-pipe connect`'s own default level is `warn` (a client-CLI
+            // noise-reduction default, unrelated to what this test checks) — set
+            // `RUST_LOG=info` explicitly so the `quicmux::noq_backend` line this
+            // test looks for below is guaranteed to fire regardless of that
+            // default, since what's under test here is the redirect plumbing,
+            // not the default log level.
+            .env("RUST_LOG", "info")
             .stdin(StdStdio::null())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::piped())
