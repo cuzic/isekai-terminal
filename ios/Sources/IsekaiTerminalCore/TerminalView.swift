@@ -146,6 +146,21 @@ public struct TerminalView: View {
         } message: {
             Text("サーバーが鍵(\(uiState.pendingAgentSignRequest?.fingerprint ?? ""))での署名を要求しています。許可しますか？")
         }
+        .alert(
+            "ホスト鍵の確認",
+            isPresented: Binding(
+                get: { uiState.newHostKeyPrompt != nil },
+                set: { if !$0 { controller.dismissNewHostKeyPrompt() } }
+            )
+        ) {
+            Button("キャンセル", role: .cancel) { controller.dismissNewHostKeyPrompt() }
+            Button("信頼して接続") { controller.trustNewHostKey() }
+                .accessibilityIdentifier("trustNewHostKeyButton")
+        } message: {
+            if let prompt = uiState.newHostKeyPrompt {
+                Text("初めて接続するホストです。\n\(prompt.host):\(prompt.port)\nFingerprint (SHA256):\n\(prompt.fingerprint)\nこのfingerprintを信頼して接続しますか？")
+            }
+        }
         .sheet(
             isPresented: Binding(
                 get: { uiState.trzszState != nil },
