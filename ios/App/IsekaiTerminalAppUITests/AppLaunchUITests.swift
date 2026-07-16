@@ -27,6 +27,10 @@ final class AppLaunchUITests: XCTestCase {
         field.tap()
         if !XCUIApplication().keyboards.element.waitForExistence(timeout: 3) {
             field.tap() // 最後にもう一度だけリトライする
+            // Codexレビュー指摘: リトライ後も再度キーボード出現を待たないと、
+            // typeText()がフォーカス未確定のまま呼ばれてしまいレース対策として
+            // 不十分だった。ここで明示的に失敗させる。
+            XCTAssertTrue(XCUIApplication().keyboards.element.waitForExistence(timeout: 3))
         }
     }
 
