@@ -16,9 +16,9 @@
 //! a phone that might have both Wi-Fi and cellular simultaneously), so full
 //! multipath racing isn't the goal here.
 //!
-//! Real backends exist for Windows (`NotifyIpInterfaceChange`, `windows.rs`)
-//! and macOS (`SCNetworkReachability`, `macos.rs`). Every other platform
-//! (including Linux, where `isekai-ssh` is most used today) gets
+//! Real backends exist for Windows (`NotifyIpInterfaceChange`, `windows.rs`),
+//! macOS (`SCNetworkReachability`, `macos.rs`), and Linux
+//! (`AF_NETLINK`/`NETLINK_ROUTE`, `linux.rs`). Every other platform gets
 //! [`NoopNetworkChangeMonitor`], which never fires — callers relying on
 //! [`system_monitor`] see exactly today's idle-timeout-only reconnect
 //! behavior on those platforms, unchanged.
@@ -28,6 +28,9 @@ mod windows;
 
 #[cfg(target_os = "macos")]
 mod macos;
+
+#[cfg(target_os = "linux")]
+mod linux;
 
 use async_trait::async_trait;
 
@@ -72,10 +75,11 @@ impl NetworkChangeMonitor for NoopNetworkChangeMonitor {
 }
 
 /// Returns the best available monitor for the current platform: a real
-/// OS-backed one on Windows/macOS if it can be set up, [`NoopNetworkChangeMonitor`]
-/// otherwise (including when the real backend's own OS registration call
-/// fails — this never returns an error, since "no early-reconnect signal" is
-/// always a safe, valid fallback, never a reason to fail startup).
+/// OS-backed one on Windows/macOS/Linux if it can be set up,
+/// [`NoopNetworkChangeMonitor`] otherwise (including when the real
+/// backend's own OS registration call fails — this never returns an error,
+/// since "no early-reconnect signal" is always a safe, valid fallback,
+/// never a reason to fail startup).
 pub fn system_monitor() -> Box<dyn NetworkChangeMonitor> {
     #[cfg(target_os = "windows")]
     {
@@ -92,6 +96,15 @@ pub fn system_monitor() -> Box<dyn NetworkChangeMonitor> {
             Ok(monitor) => return Box::new(monitor),
             Err(e) => {
                 log::warn!("isekai-netmon: failed to register for macOS network-change notifications, falling back to idle-timeout-only reconnect detection: {e}");
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match linux::LinuxNetworkChangeMonitor::new() {
+            Ok(monitor) => return Box::new(monitor),
+            Err(e) => {
+                log::warn!("isekai-netmon: failed to register for Linux network-change notifications, falling back to idle-timeout-only reconnect detection: {e}");
             }
         }
     }
