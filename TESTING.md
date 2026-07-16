@@ -672,6 +672,19 @@ Phase 9-4bの手順と同じ:
     trzsz転送中フラグ(`interactive_busy`)が転送終了後にちゃんと`false`へ戻っているか
     (`orchestrator.rs`の`trzsz_cancel`/`trzsz_dismiss`/`on_trzsz_finished`)を確認
 
+### 16-D iOS版の実装状況(Task #15/#16)
+
+iOS側にもAndroid版と同じ構造で`PhysicalPathProvider`(`ios/Sources/IsekaiTerminalCore/
+PhysicalPathProvider.swift`、`IP_BOUND_IF`ベース)・`onRequestWifiFd`/
+`onRequestCellularFd`/`onRebindStateChanged`の実装・「今すぐWiFiに戻す」ボタン
+(`TerminalView.swift`の`forceReturnToWifiButton`)を実装済み。ただしこの実装は
+Swiftツールチェーンの無い開発環境で書かれたため、macOS GitHub Actionsランナー
+(`ios-rust-core-check.yml`/`ios-app-build-check.yml`)でのビルド・テスト結果でしか
+コンパイル可否を確認できていない。また、iOS版にはAndroid版の
+`FaultInjectionReceiver`に相当するデバッグ用の意図的UDP遮断機構が無いため、16-A〜16-C
+と同じ手順は使えない——実機のWiFiをオフ/機内モード等で物理的に切ることでの代替検証が
+必要(Task #17でAndroid/iOS双方の実機検証を行う際に手順を確立する)。
+
 ---
 
 ## 17. JISキーボード自動検出 (KeyboardLayoutDetector AUTO) 実機確認
