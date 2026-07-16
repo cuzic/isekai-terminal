@@ -617,11 +617,16 @@ async fn promote_warm_standby_once(
 }
 
 /// The ordinary `reconnect_and_resume` retry loop, run until either a resume
-/// attempt succeeds or `deadline` passes. Returns `Some(stream)` on success
+/// attempt succeeds or `deadline` passes. Returns `Ok(stream)` on success
 /// (having also re-established the control stream and updated
-/// `state.network_rebinder`); returns `None` once `deadline` has passed,
+/// `state.network_rebinder`); returns `Err` once `deadline` has passed,
 /// having already closed `stdout` and aborted `warm_standby_task` — the
-/// caller's only remaining step on `None` is to return `Ok(())`.
+/// caller propagates this `Err` (e.g. via `?`) so it eventually reaches
+/// `connect_command`'s `Err` arm and `write_connect_outcome_for_wrapper`
+/// classifies it as `ConnectOutcomeClass::Unreachable`, letting `isekai-ssh`'s
+/// wrapper auto-retry (`.claude/rules/always-connects.md`) instead of the
+/// give-up silently looking like a clean exit to everything downstream of
+/// this function.
 ///
 /// Each backoff wait races against `network_monitor.next_change()`: unlike
 /// `spawn_reconnect_signal` (which only watches while a connection is
@@ -644,7 +649,7 @@ async fn resume_with_backoff_until_deadline(
     stdout: &mut tokio::io::Stdout,
     warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
     network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
-) -> Option<AnyByteStream> {
+) -> Result<AnyByteStream> {
     let mut attempt: u32 = 0;
     loop {
         let now = Instant::now();
@@ -660,17 +665,20 @@ async fn resume_with_backoff_until_deadline(
                 .as_deref()
                 .map(|e| format!(" Last error: {e}."))
                 .unwrap_or_default();
+            let session_id = state.session_id;
             eprintln!(
-                "isekai-pipe connect: giving up on session_id={} for '{profile}' - \
+                "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
                  the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}.{last_error_suffix} \
                  Closing stdin/stdout; ssh will treat this as a lost connection.",
-                state.session_id
             );
             let _ = stdout.shutdown().await;
             if let Some(t) = warm_standby_task {
                 t.abort();
             }
-            return None;
+            return Err(anyhow::anyhow!(
+                "resume window ({resume_window:?}) exceeded by {exceeded_by:?} for session_id={session_id}\
+                 for '{profile}'.{last_error_suffix}"
+            ));
         }
 
         let delay = RESUME_BACKOFF.base_delay(attempt).min(deadline - now);
@@ -720,7 +728,7 @@ async fn resume_with_backoff_until_deadline(
                 }
                 drop(resumed.connection);
                 state.network_rebinder = resumed.network_rebinder;
-                return Some(resumed.data_stream);
+                return Ok(resumed.data_stream);
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -865,7 +873,7 @@ pub(crate) async fn run_resume_loop(
                 // while already backing off, not the first one that got us
                 // here.
                 let mut backoff_network_monitor = isekai_netmon::system_monitor();
-                match resume_with_backoff_until_deadline(
+                resume_with_backoff_until_deadline(
                     factory,
                     target,
                     profile,
@@ -877,11 +885,7 @@ pub(crate) async fn run_resume_loop(
                     &warm_standby_task,
                     &mut *backoff_network_monitor,
                 )
-                .await
-                {
-                    Some(stream) => stream,
-                    None => return Ok(()),
-                }
+                .await?
             }
         };
 
@@ -1392,6 +1396,60 @@ mod tests {
             let ok = replay_and_advance(&replay, 6, &mut stream).await;
             assert!(ok);
             assert_eq!(replay.lock().unwrap().end_offset(), 11);
+        }
+
+        #[tokio::test]
+        async fn resume_with_backoff_until_deadline_returns_err_once_the_resume_window_is_exceeded() {
+            // Regression test for the bug reported 2026-07-16: this give-up
+            // path used to `return None`, and `run_resume_loop` turned that
+            // into `Ok(())` — a silent "clean exit" that never reached
+            // `connect_command`'s `Err` arm, so `write_connect_outcome_for_wrapper`
+            // never fired and `isekai-ssh`'s wrapper had no signal to
+            // auto-retry on (e.g. after a Windows sleep/wake outlasts the
+            // resume window). Must return `Err` so the "always-connects"
+            // auto-recovery in `wrapper.rs` actually engages.
+            let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
+            let conn = connect(addr, cert_sha256_hex.clone()).await;
+            let counters = Arc::new(AppAckCounters::new());
+            let app_ack_tasks = reestablish_control_stream(&conn, b"any-session-secret", &counters).await.unwrap();
+
+            let target = RelayTarget {
+                helper_addr: addr,
+                server_name: "isekai-pipe.local".to_string(),
+                cert_sha256_hex,
+                session_secret: b"any-session-secret".to_vec(),
+                local_bind_port_range: None,
+            };
+            let factory = system_quic_factory();
+            let mut state = ResumeLoopState {
+                session_id: isekai_transport::SessionId::from_bytes([0x7Fu8; 16]),
+                counters,
+                replay: Arc::new(Mutex::new(C2hReplayBuffer::new(1024))),
+                app_ack_tasks,
+                network_rebinder: None,
+                is_tty: false,
+                last_resume_error: Some("connection refused".to_string()),
+            };
+            let mut stdout = tokio::io::stdout();
+            let now = Instant::now();
+            let mut monitor = isekai_netmon::NoopNetworkChangeMonitor;
+
+            let result = resume_with_backoff_until_deadline(
+                &factory,
+                &target,
+                "test-profile",
+                Duration::from_secs(0),
+                now,
+                now, // deadline already reached: must give up on the first check
+                &mut state,
+                &mut stdout,
+                &None,
+                &mut monitor,
+            )
+            .await;
+
+            assert!(result.is_err(), "must return Err once the resume window is exceeded, not a silent Ok/None");
+            state.app_ack_tasks.abort();
         }
     }
 
