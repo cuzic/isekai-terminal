@@ -18,13 +18,14 @@ final class AppLaunchUITests: XCTestCase {
     /// `testPasswordAuthProfileTapShowsPasswordPrompt`で実際に発生・確認済み。
     /// 他の全テストも同じ`tap()`直後`typeText()`パターンを使っており、今回たまたま
     /// このテストで顕在化しただけで、いつ他のテストで再発してもおかしくない)。
-    /// フォーカスが付くまで待ってから再タップすることで安定させる。
+    /// `XCUIElement.hasKeyboardFocus`はこのプロジェクトのdeployment target(iOS 16)
+    /// 向けビルドでは使えない(`error: value of type 'XCUIElement' has no member
+    /// 'hasKeyboardFocus'`)ため、代わりにキーボード自体の出現をXCUITestの標準的な
+    /// 手法(`app.keyboards.element`)で待つ。
     private func ensureFocus(_ field: XCUIElement, timeout: TimeInterval = 5) {
         XCTAssertTrue(field.waitForExistence(timeout: timeout))
         field.tap()
-        guard !field.hasKeyboardFocus else { return }
-        let focused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hasKeyboardFocus == true"), object: field)
-        if XCTWaiter().wait(for: [focused], timeout: 3) != .completed {
+        if !XCUIApplication().keyboards.element.waitForExistence(timeout: 3) {
             field.tap() // 最後にもう一度だけリトライする
         }
     }
