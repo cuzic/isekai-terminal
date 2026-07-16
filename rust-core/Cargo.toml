@@ -1,6 +1,14 @@
 [workspace]
-members = [".", "uniffi-bindgen", "noq-multipath-spike", "h3-noq", "h3-qmux", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "isekai-netmon", "quicsock", "quicmux"]
+members = [".", "uniffi-bindgen", "h3-noq", "h3-qmux", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "isekai-netmon", "quicsock", "quicmux"]
 resolver = "2"
+
+# noq-multipath-spike(実機検証用の使い捨てコード、CLAUDE.md参照)は意図的に
+# workspace memberから外している。`.workspace = true`でどの依存も継承していない
+# 独立クレートのため、`cd noq-multipath-spike && cargo build`(または
+# `--manifest-path`指定)で単体ビルドできる。以前はmembersに含めたまま
+# `cargo build/test --workspace`側で個別に`--exclude noq-multipath-spike`する
+# 運用だったが、通常のworkspace操作の対象から外すこと自体が目的(Codex
+# アーキテクチャレビュー指摘)なので、member登録自体をやめて誤操作を防ぐ。
 
 # quicsock(/home/cuzic/quicsockからvendor。isekai-transportへのマルチパス移植の
 # うち、物理インタフェース束縛層 — `isekai-transport::physical_interface`)は

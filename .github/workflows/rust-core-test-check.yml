@@ -3,9 +3,11 @@ name: rust-core test check
 # rust-core全体のcargo testをCIで実行する(ISEKAI_PIPE_DESIGN.md §8 Epic Cで
 # 指摘されていたギャップ: 「rust-core全体のcargo testを実行するCIワークフローが
 # 一つも存在しない」への対応)。noq-multipath-spike(実機検証用の使い捨てコード、
-# CLAUDE.md参照)のみ除外する——それ以外は`real_sshd_bootstrap_e2e.rs`のような
-# opt-in E2Eテスト(実/usr/sbin/sshdを非特権ユーザーとして起動)を含め、
-# GitHub-hosted ubuntu runnerだけで完結する。
+# CLAUDE.md参照)はworkspace member自体から外してあるため`--workspace`の対象に
+# 含まれない(Codexアーキテクチャレビュー指摘、以前は member に含めたまま
+# `--exclude noq-multipath-spike`で個別に除外する運用だった)——それ以外は
+# `real_sshd_bootstrap_e2e.rs`のようなopt-in E2Eテスト(実/usr/sbin/sshdを
+# 非特権ユーザーとして起動)を含め、GitHub-hosted ubuntu runnerだけで完結する。
 #
 # ネットワークnamespace/tc netemを使うnetlabシナリオ(root権限が必要)は対象外
 # (rust-core-netlab-check.ymlが別途カバーする)。
@@ -99,9 +101,9 @@ jobs:
           restore-keys: |
             rust-core-test-${{ runner.os }}-
 
-      - name: cargo test --workspace (excluding noq-multipath-spike)
+      - name: cargo test --workspace
         working-directory: rust-core
-        run: cargo test --workspace --exclude noq-multipath-spike
+        run: cargo test --workspace
 
   test-macos:
     runs-on: macos-26
@@ -156,7 +158,7 @@ jobs:
       # uniffi-bindgenはAndroid/iOS binding生成専用のCLIツールで同様に対象外。
       - name: cargo test --workspace (macOS, excluding Android/iOS-only crates)
         working-directory: rust-core
-        run: cargo test --workspace --exclude noq-multipath-spike --exclude isekai-terminal-core --exclude uniffi-bindgen
+        run: cargo test --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen
 
   test-windows:
     runs-on: windows-latest
@@ -207,12 +209,12 @@ jobs:
       - name: cargo build --workspace (Windows, build-only regression check)
         shell: bash
         working-directory: rust-core
-        run: cargo build --workspace --exclude noq-multipath-spike --exclude isekai-terminal-core --exclude uniffi-bindgen
+        run: cargo build --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen
 
       - name: cargo test --lib --bins --workspace (Windows, unit tests only)
         shell: bash
         working-directory: rust-core
-        run: cargo test --workspace --exclude noq-multipath-spike --exclude isekai-terminal-core --exclude uniffi-bindgen --lib --bins
+        run: cargo test --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen --lib --bins
 
       # isekai-sshのmock sshdベースe2eテスト(isekai-sshクライアント自身の
       # Windows上での挙動を検証する5ファイル)。実ssh(1)をssh_test_shim
