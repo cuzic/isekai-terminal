@@ -7,6 +7,7 @@
 //! "always connects" (`.claude/rules/always-connects.md`) side-channel that
 //! lets `isekai-ssh`'s wrapper silently re-bootstrap on any failure here.
 
+use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -387,8 +388,30 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
     // e2e tests) — logs, including `isekai-transport`'s per-candidate-attempt
     // telemetry, must go to stderr only, exactly like `isekai-pipe serve`'s
     // own `env_logger` setup (`engine::run_from_args`).
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    //
+    // Default level is `warn` (louder than that needs `RUST_LOG`) because
+    // this is the *client-side* CLI a human watches interactively, unlike
+    // `serve`'s `info` default. `noq_udp` (the vendored `noq` multipath
+    // fork's UDP layer) is quieted further to `error`: its `sendmsg
+    // error(HostUnreachable)` warning fires routinely on ordinary network
+    // interface switches (the old route going stale mid-roam) and is
+    // already covered by `resume_loop`'s own `reconnected.`/`connection
+    // lost...` status line, so surfacing it as a top-level `WARN` is just
+    // noise, not a new signal. The format also clears `resume_loop`'s live
+    // `\r`-redrawn reconnect-status line before every record: that line
+    // and `log::*!` calls both write to the same stderr with no other
+    // coordination, so without this a log line emitted mid-redraw corrupts
+    // the terminal (garbled/overlapping text).
+    let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let default_format = env_logger::fmt::ConfigurableFormat::default();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,noq_udp=error"))
         .target(env_logger::Target::Stderr)
+        .format(move |buf, record| {
+            if stderr_is_tty {
+                write!(buf, "\r\x1b[K")?;
+            }
+            default_format.format(buf, record)
+        })
         .init();
 
     let profile_for_outcome = launch.profile.clone().unwrap_or_default();
