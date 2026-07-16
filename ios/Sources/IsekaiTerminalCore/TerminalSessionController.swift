@@ -471,6 +471,12 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// 通知と手動ボタンの両方から呼ばれ得るため)。`connect()`と同じ
     /// cols/rows・認証情報でセッションを最初から作り直す(Rust側にresumeできる
     /// 論理セッションの概念はまだ無いため、既存セッションはただ破棄する)。
+    /// Rust側`SessionOrchestrator::begin_connect`は`Connected`中の新規接続を
+    /// (pending debounceのキャンセル+別セッションへの切り替えという内部経路のため)
+    /// 意図的に許可しているが、ここでの`.connected`チェックはその判断を先取りしている
+    /// のではなく、「バックグラウンド復帰通知と手動ボタンの両方から呼ばれ得るこの
+    /// メソッド自身が誤って二重に走らないようにする」UI側の二重サブミット防止
+    /// (Codexアーキテクチャレビューで指摘・確認済み、Android版`guardedConnect`と同種)。
     @MainActor
     public func reconnect() {
         switch uiState.state {

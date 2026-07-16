@@ -231,7 +231,15 @@ class TerminalSession(
 
     // ── Connection ───────────────────────────────────────────────────
 
-    /** 各 connectXxx() 共通のガード(接続済み/接続中なら無視)とエラー処理。 */
+    /** 各 connectXxx() 共通のガード(接続済み/接続中なら無視)とエラー処理。
+     *  Rust側`SessionOrchestrator::begin_connect`が拒否するのは`Connecting`中の
+     *  真の二重startのみで、`Connected`中の新規接続は(pending debounceのキャンセル+
+     *  別セッションへの切り替えという内部経路のため)意図的に許可している
+     *  (`orchestrator.rs`のコメント参照、Codexアーキテクチャレビューで指摘・確認済み)。
+     *  ここでの`connected`チェックはRustの意思決定を先取りしているのではなく、
+     *  「接続中のタブに対してUIの接続アクションから誤って新規connect_*が呼ばれない
+     *  ようにする」UI側の二重サブミット防止であり、`ConnectionCoordinator.connectPane`の
+     *  同種チェックとあわせて意図的に残す。 */
     private inline fun guardedConnect(connect: () -> Unit) {
         if (_state.value.let { it.connected || it.isConnecting }) return
         try {
