@@ -12,6 +12,28 @@ final class AppLaunchUITests: XCTestCase {
         continueAfterFailure = false
     }
 
+    /// SwiftUIのTextField/SecureFieldは`.tap()`直後にまだキーボードフォーカスが
+    /// 確定していないことがあり、続けて`.typeText()`すると稀に「Neither element
+    /// nor any descendant has keyboard focus」で失敗する(CI実行時に
+    /// `testPasswordAuthProfileTapShowsPasswordPrompt`で実際に発生・確認済み。
+    /// 他の全テストも同じ`tap()`直後`typeText()`パターンを使っており、今回たまたま
+    /// このテストで顕在化しただけで、いつ他のテストで再発してもおかしくない)。
+    /// フォーカスが付くまで待ってから再タップすることで安定させる。
+    private func ensureFocus(_ field: XCUIElement, timeout: TimeInterval = 5) {
+        XCTAssertTrue(field.waitForExistence(timeout: timeout))
+        field.tap()
+        guard !field.hasKeyboardFocus else { return }
+        let focused = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hasKeyboardFocus == true"), object: field)
+        if XCTWaiter().wait(for: [focused], timeout: 3) != .completed {
+            field.tap() // 最後にもう一度だけリトライする
+        }
+    }
+
+    private func focusAndType(_ field: XCUIElement, _ text: String) {
+        ensureFocus(field)
+        field.typeText(text)
+    }
+
     func testAppLaunchesToProfileList() throws {
         let app = XCUIApplication()
         app.launch()
@@ -34,18 +56,9 @@ final class AppLaunchUITests: XCTestCase {
         XCTAssertTrue(app.buttons["addProfileButton"].waitForExistence(timeout: 10))
         app.buttons["addProfileButton"].tap()
 
-        let labelField = app.textFields["profileLabelField"]
-        XCTAssertTrue(labelField.waitForExistence(timeout: 5))
-        labelField.tap()
-        labelField.typeText(label)
-
-        let hostField = app.textFields["profileHostField"]
-        hostField.tap()
-        hostField.typeText("127.0.0.1")
-
-        let usernameField = app.textFields["profileUsernameField"]
-        usernameField.tap()
-        usernameField.typeText("tester")
+        focusAndType(app.textFields["profileLabelField"], label)
+        focusAndType(app.textFields["profileHostField"], "127.0.0.1")
+        focusAndType(app.textFields["profileUsernameField"], "tester")
 
         app.buttons["saveProfileButton"].tap()
 
@@ -62,12 +75,9 @@ final class AppLaunchUITests: XCTestCase {
         XCTAssertTrue(app.buttons["addProfileButton"].waitForExistence(timeout: 10))
         app.buttons["addProfileButton"].tap()
 
-        app.textFields["profileLabelField"].tap()
-        app.textFields["profileLabelField"].typeText(label)
-        app.textFields["profileHostField"].tap()
-        app.textFields["profileHostField"].typeText("127.0.0.1")
-        app.textFields["profileUsernameField"].tap()
-        app.textFields["profileUsernameField"].typeText("tester")
+        focusAndType(app.textFields["profileLabelField"], label)
+        focusAndType(app.textFields["profileHostField"], "127.0.0.1")
+        focusAndType(app.textFields["profileUsernameField"], "tester")
         app.buttons["saveProfileButton"].tap()
 
         let row = app.staticTexts[label]
@@ -101,10 +111,7 @@ final class AppLaunchUITests: XCTestCase {
         XCTAssertTrue(app.buttons["generateKeyButton"].waitForExistence(timeout: 5))
         app.buttons["generateKeyButton"].tap()
 
-        let generateLabelField = app.textFields["generateKeyLabelField"]
-        XCTAssertTrue(generateLabelField.waitForExistence(timeout: 5))
-        generateLabelField.tap()
-        generateLabelField.typeText(label)
+        focusAndType(app.textFields["generateKeyLabelField"], label)
 
         app.buttons["confirmGenerateKeyButton"].tap()
 
@@ -125,12 +132,9 @@ final class AppLaunchUITests: XCTestCase {
         let renamedLabel = "UITest-Edited-\(UUID().uuidString.prefix(8))"
 
         app.buttons["addProfileButton"].tap()
-        app.textFields["profileLabelField"].tap()
-        app.textFields["profileLabelField"].typeText(originalLabel)
-        app.textFields["profileHostField"].tap()
-        app.textFields["profileHostField"].typeText("127.0.0.1")
-        app.textFields["profileUsernameField"].tap()
-        app.textFields["profileUsernameField"].typeText("tester")
+        focusAndType(app.textFields["profileLabelField"], originalLabel)
+        focusAndType(app.textFields["profileHostField"], "127.0.0.1")
+        focusAndType(app.textFields["profileUsernameField"], "tester")
         app.buttons["saveProfileButton"].tap()
 
         let originalRow = app.staticTexts[originalLabel]
@@ -142,11 +146,10 @@ final class AppLaunchUITests: XCTestCase {
         editSwipeButton.tap()
 
         let labelField = app.textFields["profileLabelField"]
-        XCTAssertTrue(labelField.waitForExistence(timeout: 5))
         // 既存の値をクリアしてから新しいラベルを入力する
         // (タップ直後はカーソルが末尾付近にある前提でbackspaceを繰り返す、
         // XCUITestでテキストフィールドをクリアする定番の方法)。
-        labelField.tap()
+        ensureFocus(labelField)
         if let existing = labelField.value as? String {
             labelField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: existing.count))
         }
@@ -169,18 +172,13 @@ final class AppLaunchUITests: XCTestCase {
         XCTAssertTrue(app.buttons["importKeyButton"].waitForExistence(timeout: 5))
         app.buttons["importKeyButton"].tap()
 
-        let importLabelField = app.textFields["keyImportLabelField"]
-        XCTAssertTrue(importLabelField.waitForExistence(timeout: 5))
-        importLabelField.tap()
-        importLabelField.typeText(label)
+        focusAndType(app.textFields["keyImportLabelField"], label)
 
         // TextField(axis: .vertical)がtextFields/textViewsのどちらでアクセシビリティ
         // 公開されるか(iOSバージョンにより異なりうる)不確定なため、要素種別を問わない
         // クエリで探す。
         let pasteField = app.descendants(matching: .any)["keyImportPasteField"]
-        XCTAssertTrue(pasteField.waitForExistence(timeout: 5))
-        pasteField.tap()
-        pasteField.typeText("-----BEGIN OPENSSH PRIVATE KEY-----\ndummy-for-ui-test\n-----END OPENSSH PRIVATE KEY-----\n")
+        focusAndType(pasteField, "-----BEGIN OPENSSH PRIVATE KEY-----\ndummy-for-ui-test\n-----END OPENSSH PRIVATE KEY-----\n")
 
         app.buttons["saveImportedKeyButton"].tap()
 
@@ -194,12 +192,9 @@ final class AppLaunchUITests: XCTestCase {
         let label = "UITest-PwPrompt-\(UUID().uuidString.prefix(8))"
 
         app.buttons["addProfileButton"].tap()
-        app.textFields["profileLabelField"].tap()
-        app.textFields["profileLabelField"].typeText(label)
-        app.textFields["profileHostField"].tap()
-        app.textFields["profileHostField"].typeText("127.0.0.1")
-        app.textFields["profileUsernameField"].tap()
-        app.textFields["profileUsernameField"].typeText("tester")
+        focusAndType(app.textFields["profileLabelField"], label)
+        focusAndType(app.textFields["profileHostField"], "127.0.0.1")
+        focusAndType(app.textFields["profileUsernameField"], "tester")
         // 認証方式は既定でパスワード(鍵は選択しない)。
         app.buttons["saveProfileButton"].tap()
 
