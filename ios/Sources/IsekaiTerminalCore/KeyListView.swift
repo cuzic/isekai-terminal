@@ -67,6 +67,15 @@ public struct KeyListView: View {
 
     @State private var showGenerateSheet = false
     @State private var generateLabel = ""
+    /// 「鍵を生成しました」alertを表示するかどうか。`model.generatedPublicKey != nil`を
+    /// 直接alertのisPresentedへ結び付けていた旧実装は、生成ボタンの1アクション内で
+    /// `showGenerateSheet = false`(sheet dismiss)と`generatedPublicKey`セット(alert present
+    /// 条件成立)が同時に起き、SwiftUIが同一更新サイクル内でのsheet dismiss中の新規alert
+    /// 提示を安定して扱えず、CIのXCUITestで「Failed to get matching snapshot」のflaky失敗を
+    /// 起こしていた(Codexレビュー指摘、`AppLaunchUITests.testKeyGenerationFlowCreatesNewKeyRow`
+    /// で再現)。sheetの`onDismiss`完了後にこのフラグを立てることで、2つのpresentationが
+    /// 重ならないようにする。
+    @State private var showGeneratedAlert = false
 
     // `model`にデフォルト値を持たせられない理由は`ProfileListView.init`のコメント参照。
     public init(model: KeyListModel, onImportKey: @escaping () -> Void) {
@@ -125,7 +134,11 @@ public struct KeyListView: View {
         } message: {
             Text("「\(model.pendingDelete?.displayName ?? "")」を削除しますか？この操作は元に戻せません。")
         }
-        .sheet(isPresented: $showGenerateSheet) {
+        .sheet(isPresented: $showGenerateSheet, onDismiss: {
+            if model.generatedPublicKey != nil {
+                showGeneratedAlert = true
+            }
+        }) {
             NavigationStack {
                 Form {
                     TextField("ラベル", text: $generateLabel)
@@ -152,10 +165,7 @@ public struct KeyListView: View {
         }
         .alert(
             "鍵を生成しました",
-            isPresented: Binding(
-                get: { model.generatedPublicKey != nil },
-                set: { if !$0 { model.dismissGeneratedPublicKey() } }
-            )
+            isPresented: $showGeneratedAlert
         ) {
             Button("コピーして閉じる") {
                 if let pub = model.generatedPublicKey { UIPasteboard.general.string = pub }
