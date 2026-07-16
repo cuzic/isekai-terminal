@@ -388,9 +388,16 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// `keyEntryId`があればCredentialVaultから秘密鍵を復号して`.publicKey`認証を、
     /// 無ければ渡された`password`で`.password`認証を組み立てる。
     /// 失敗時は`fail(message:)`を呼びnilを返す。
+    /// Android版`AuthValidator.validate`と同じ方針: パスワード認証で`password`が
+    /// nil/空文字の場合はサーバーへ送らずここで拒否する(Codexアーキテクチャレビュー指摘:
+    /// 旧実装は`password ?? ""`で空文字のまま認証を組み立てていた)。
     private func resolveAuth(keyEntryId: String?, password: String?, label: String) -> SshAuth? {
         guard let keyEntryId else {
-            return .password(password: password ?? "")
+            guard let password, !password.isEmpty else {
+                fail(message: "\(label)のパスワードが必要です")
+                return nil
+            }
+            return .password(password: password)
         }
         guard let keyEntry = try? db.fetchKeyEntry(id: keyEntryId) else {
             fail(message: "\(label)の鍵情報が見つかりません")

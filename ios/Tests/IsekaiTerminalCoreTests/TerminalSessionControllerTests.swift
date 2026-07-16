@@ -115,7 +115,9 @@ final class TerminalSessionControllerTests: XCTestCase {
             jumpUsername: "jumpuser",
             jumpKeyEntryId: "does-not-exist"
         )
-        let controller = TerminalSessionController(profile: profile, password: nil, db: db, vault: vault, trustStore: trustStore)
+        // 接続先自体はパスワード認証で解決させ(空パスワードバリデーション、タスク#7の対象外)、
+        // 踏み台側の鍵未検出だけを検証する。
+        let controller = TerminalSessionController(profile: profile, password: "mainpw", db: db, vault: vault, trustStore: trustStore)
 
         controller.connect()
 
@@ -154,6 +156,52 @@ final class TerminalSessionControllerTests: XCTestCase {
             XCTFail("expected .failed state, got \(controller.uiState.state)")
             return
         }
+    }
+
+    // MARK: - 認証バリデーション(Android版`AuthValidator`と対称、Codexレビュー指摘の反映)
+
+    func testConnectFailsWhenPasswordIsNilAndNoKeyEntrySet() async throws {
+        let db = try ProfileDatabase.inMemory()
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let vault = try CredentialVault(blobDirectory: tempDir, keychainService: "test.terminalsession.emptypw.\(UUID().uuidString)")
+        let trustStore = try SshHostTrustStore(storeURL: tempDir.appendingPathComponent("trust.json"))
+
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = TerminalSessionController(profile: profile, password: nil, db: db, vault: vault, trustStore: trustStore)
+
+        controller.connect()
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.state != .connecting
+        }
+        guard case .failed(let message) = controller.uiState.state else {
+            XCTFail("expected .failed state, got \(controller.uiState.state)")
+            return
+        }
+        XCTAssertTrue(message.contains("パスワード"))
+    }
+
+    func testConnectFailsWhenPasswordIsEmptyStringAndNoKeyEntrySet() async throws {
+        let db = try ProfileDatabase.inMemory()
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let vault = try CredentialVault(blobDirectory: tempDir, keychainService: "test.terminalsession.emptypw2.\(UUID().uuidString)")
+        let trustStore = try SshHostTrustStore(storeURL: tempDir.appendingPathComponent("trust.json"))
+
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = TerminalSessionController(profile: profile, password: "", db: db, vault: vault, trustStore: trustStore)
+
+        controller.connect()
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.state != .connecting
+        }
+        guard case .failed(let message) = controller.uiState.state else {
+            XCTFail("expected .failed state, got \(controller.uiState.state)")
+            return
+        }
+        XCTAssertTrue(message.contains("パスワード"))
     }
 
     // MARK: - Phase 1E-4: SSH agent署名要求の確認フロー
