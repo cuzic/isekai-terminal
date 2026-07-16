@@ -405,37 +405,24 @@ mod tests {
     /// QUIC接続は一度idle timeoutすると恒久的に死ぬ(RFC 9000)ため、同じ
     /// `conn`へのリトライは無意味。かといってこのテストの`max_idle_timeout`
     /// だけを300秒より延ばすと、本番設定と意図的に揃えている値から乖離して
-    /// しまう(`generous_transport_config`のdoc参照)。そこで
-    /// `multipath_transport.rs`の同種のflaky対策(「本当に壊れていれば
-    /// 何度リトライしても同じく失敗する」)と同じ考え方で、シナリオ全体
-    /// (新規server/client/connection)を短いper-attemptタイムアウト付きで
-    /// 最大3回リトライする——`assert_eq!`(実際の相関チェック)はResultの
-    /// 外でpanicするため、本当のロジックバグは1回目で即座に検出される。
+    /// しまう(`generous_transport_config`のdoc参照)。
+    ///
+    /// リトライ自体はテスト本文に埋め込まず、CIランナー側(`cargo-nextest`の
+    /// per-test override、`rust-core/.config/nextest.toml`参照)に寄せてある
+    /// ——このモジュール(`faulty_udp_socket::tests::*`)は既知のCPU競合起因
+    /// flakyテスト群として`retries`が設定されているため、シナリオ全体
+    /// (新規server/client/connection)がnextestによって最初から作り直されて
+    /// 再試行される。各段階を短いタイムアウト(`REBIND_SURVIVAL_ROUND_TRIP_
+    /// TIMEOUT`)で区切ってあるのは、テスト本文の外でリトライしていても
+    /// 「どの段階で詰まったか」の診断性を保つため。
     #[tokio::test]
     async fn rebind_to_new_faulty_socket_survives_as_network_switch() {
-        let mut last_err = None;
-        for attempt in 1..=3 {
-            match run_rebind_survival_scenario().await {
-                Ok(()) => return,
-                Err(err) => {
-                    eprintln!(
-                        "rebind_to_new_faulty_socket_survives_as_network_switch: \
-                         attempt {attempt}/3 failed ({err}), retrying with a fresh connection"
-                    );
-                    last_err = Some(err);
-                }
-            }
-        }
-        panic!(
-            "rebind_to_new_faulty_socket_survives_as_network_switch: all 3 attempts failed, last error: {}",
-            last_err.unwrap()
-        );
+        run_rebind_survival_scenario().await.unwrap();
     }
 
-    /// per-attempt往復のタイムアウト上限。接続の`max_idle_timeout`(300秒)より
-    /// 大幅に短く取り、環境が重いだけの1回を早めに切り上げて次のフレッシュな
-    /// 接続へリトライできるようにする(通常時の往復は注入遅延込みでも数十ms
-    /// オーダーなので、実用上は誤検知しない余裕)。
+    /// 各往復のタイムアウト上限。接続の`max_idle_timeout`(300秒)より大幅に
+    /// 短く取り、詰まった箇所を早期に特定できるようにする(通常時の往復は
+    /// 注入遅延込みでも数十msオーダーなので、実用上は誤検知しない余裕)。
     const REBIND_SURVIVAL_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(30);
 
     async fn run_rebind_survival_scenario() -> Result<(), String> {
