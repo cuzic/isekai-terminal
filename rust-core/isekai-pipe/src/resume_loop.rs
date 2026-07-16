@@ -247,8 +247,8 @@ fn remote_bind_spec(remote: std::net::SocketAddr, local_bind_port_range: Option<
 ///
 /// - **Default** (`experimental_network_rebind` off, or this generation's
 ///   `AnyMuxFactory` doesn't support rebinding): every OS-reported
-///   network change (`isekai-netmon`; a no-op on platforms other than
-///   Windows/macOS today) is forwarded immediately — this is exactly the
+///   network change (`isekai-netmon`; real backends on Windows/macOS/Linux,
+///   a no-op elsewhere) is forwarded immediately — this is exactly the
 ///   behavior this function replaced (`network_monitor.next_change()` raced
 ///   directly against `run_data_pump` in the same `select!`), just moved
 ///   into its own task so both shapes can feed the same channel.
@@ -276,8 +276,9 @@ fn remote_bind_spec(remote: std::net::SocketAddr, local_bind_port_range: Option<
 /// connection generation gets its own task and its own OS registration
 /// rather than one shared across the whole `run_resume_loop` call. Taken as
 /// a parameter rather than constructed inside this function so tests can
-/// inject a controllable mock instead of the real (on this development
-/// platform, Linux, always-`NoopNetworkChangeMonitor`) OS-backed one.
+/// inject a controllable mock instead of the real OS-backed one (on this
+/// development platform, Linux, a real `AF_NETLINK`-based backend — see
+/// `isekai-netmon`'s own module docs).
 /// Minimal async rebind interface this function needs — generic (not
 /// boxed as `dyn`) so both the real `isekai_transport::AnyMuxRebinder` and
 /// this module's own test-only mock can satisfy it. `AnyMuxRebinder` is a
@@ -507,6 +508,38 @@ async fn sleep_with_live_status(delay: Duration, mut on_tick: impl FnMut()) {
     }
 }
 
+/// One backoff wait inside [`resume_with_backoff_until_deadline`]'s retry
+/// loop: sleeps out `delay` (via `sleep_with_live_status` when `is_tty`,
+/// ticking `on_tick`) — but returns early the moment `network_monitor`
+/// reports a fresh OS network-change event, since that's a concrete signal
+/// worth retrying on immediately rather than sitting out the rest of a
+/// blind backoff. `tokio::select!`'s pattern-match branch form leaves the
+/// monitor branch disabled (never fires again) for the rest of *this* call
+/// if the monitor ever yields `None` (permanently stopped) — that call just
+/// falls back to the plain timeout, no extra bookkeeping needed here.
+async fn wait_backoff_or_network_change(
+    delay: Duration,
+    is_tty: bool,
+    mut on_tick: impl FnMut(),
+    network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
+) {
+    tokio::select! {
+        _ = async {
+            if is_tty {
+                sleep_with_live_status(delay, &mut on_tick).await;
+            } else {
+                tokio::time::sleep(delay).await;
+            }
+        } => {}
+        Some(_) = network_monitor.next_change() => {
+            log::info!(
+                "isekai-pipe connect: OS reported another network change while backing off; \
+                 retrying immediately instead of waiting out the remaining backoff"
+            );
+        }
+    }
+}
+
 /// The mutable, session-scoped state `run_resume_loop`'s two extracted
 /// helpers (`promote_warm_standby_once`/`resume_with_backoff_until_deadline`)
 /// both need to read and update across a disconnect — grouped here so the
@@ -589,6 +622,17 @@ async fn promote_warm_standby_once(
 /// `state.network_rebinder`); returns `None` once `deadline` has passed,
 /// having already closed `stdout` and aborted `warm_standby_task` — the
 /// caller's only remaining step on `None` is to return `Ok(())`.
+///
+/// Each backoff wait races against `network_monitor.next_change()`: unlike
+/// `spawn_reconnect_signal` (which only watches while a connection is
+/// actually up, to detect the *first* disconnect early), this is watched
+/// while already disconnected and retrying, so a fresh OS network-change
+/// event (e.g. the new interface/route finishing DHCP after the earlier
+/// disconnect) cuts the remaining backoff short and retries immediately
+/// instead of blindly waiting out `RESUME_BACKOFF`. `network_monitor` is a
+/// fresh instance the caller creates per disconnect episode (mirroring
+/// `spawn_reconnect_signal`'s own one-per-generation rule) — passed in
+/// rather than constructed here so tests can inject a controllable mock.
 async fn resume_with_backoff_until_deadline(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -599,6 +643,7 @@ async fn resume_with_backoff_until_deadline(
     state: &mut ResumeLoopState,
     stdout: &mut tokio::io::Stdout,
     warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
+    network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
 ) -> Option<AnyByteStream> {
     let mut attempt: u32 = 0;
     loop {
@@ -630,11 +675,13 @@ async fn resume_with_backoff_until_deadline(
 
         let delay = RESUME_BACKOFF.base_delay(attempt).min(deadline - now);
         attempt = attempt.saturating_add(1);
-        if state.is_tty {
-            sleep_with_live_status(delay, || print_reconnect_status(true, disconnected_at, resume_window)).await;
-        } else {
-            tokio::time::sleep(delay).await;
-        }
+        wait_backoff_or_network_change(
+            delay,
+            state.is_tty,
+            || print_reconnect_status(true, disconnected_at, resume_window),
+            network_monitor,
+        )
+        .await;
 
         let client_sent_offset = C2hSentOffset::new(state.replay.lock().unwrap().end_offset());
         let client_delivered_offset = H2cClientDeliveredOffset::new(state.counters.h2c_client_delivered_offset());
@@ -812,6 +859,12 @@ pub(crate) async fn run_resume_loop(
         let new_stream = match promoted_stream {
             Some(stream) => stream,
             None => {
+                // Fresh per disconnect episode, same one-registration-per-
+                // generation rule as `spawn_reconnect_signal`'s own monitor
+                // — this one just watches for a *later* network change
+                // while already backing off, not the first one that got us
+                // here.
+                let mut backoff_network_monitor = isekai_netmon::system_monitor();
                 match resume_with_backoff_until_deadline(
                     factory,
                     target,
@@ -822,6 +875,7 @@ pub(crate) async fn run_resume_loop(
                     &mut state,
                     &mut stdout,
                     &warm_standby_task,
+                    &mut *backoff_network_monitor,
                 )
                 .await
                 {
@@ -1387,6 +1441,41 @@ mod tests {
             assert_eq!(
                 tick_count, 1,
                 "1秒未満の待機でも最低1回はtickして呼び出し元に経過を伝えるはず"
+            );
+        }
+    }
+
+    mod wait_backoff_or_network_change_tests {
+        use super::*;
+
+        // `wait_backoff_or_network_change`はバックオフ待機とOSネットワーク
+        // 変化通知を`tokio::select!`でレースさせるだけなので、
+        // `sleep_with_live_status`と同じ`tokio::time::pause()`パターンで
+        // 実時間を待たずに決定的に検証できる。
+
+        #[tokio::test(start_paused = true)]
+        async fn returns_early_when_the_network_monitor_fires_before_the_delay_elapses() {
+            let mut monitor = FireOnceNetworkChangeMonitor { fired: false };
+            let started = tokio::time::Instant::now();
+            let mut tick_count = 0;
+            wait_backoff_or_network_change(Duration::from_secs(10), true, || tick_count += 1, &mut monitor).await;
+            assert_eq!(
+                tokio::time::Instant::now(),
+                started,
+                "監視から即座にイベントが来た場合、10秒のdelayを一切待たずに返るはず"
+            );
+            assert_eq!(tick_count, 0, "早期リターンした場合はon_tick(ライブ再描画)も一切呼ばれないはず");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn waits_out_the_full_delay_when_the_network_monitor_never_fires() {
+            let mut monitor = isekai_netmon::NoopNetworkChangeMonitor;
+            let started = tokio::time::Instant::now();
+            wait_backoff_or_network_change(Duration::from_millis(2500), false, || (), &mut monitor).await;
+            assert_eq!(
+                tokio::time::Instant::now() - started,
+                Duration::from_millis(2500),
+                "監視が一度も発火しない場合は今まで通りdelay全体を待つはず"
             );
         }
     }

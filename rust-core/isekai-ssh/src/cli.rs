@@ -23,7 +23,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 // This `long_about`/`after_long_help` pair only appears on `isekai-ssh --help`
 // (clap shows `about` for `-h`, `long_about` for `--help`), and only for a
@@ -100,6 +100,43 @@ Full design background: ISEKAI_PIPE_DESIGN.md.";
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Prints the top-level `long_about` (wrapper-mode flags, prose) followed by
+/// every subcommand's own full `--help` output (its actual `Options:`
+/// list), so a bare `isekai-ssh --help`/`-h`/`help` is the single place that
+/// shows *every* flag this binary accepts — not just the one-line
+/// `Commands:` summary clap prints by default, which omits
+/// `init`/`doctor`/`login`'s own options entirely and forces a second
+/// `isekai-ssh <subcommand> --help` per subcommand to see them.
+/// `should_run_wrapper` in `wrapper.rs` routes bare `-h`/`--help`/`help`
+/// here instead of through `Cli::parse()` (see its module docs on why a
+/// *bare* invocation is the only one that reaches this parser at all).
+pub fn print_full_help() {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+
+    let mut cmd = Cli::command();
+    cmd.build();
+    let mut out = cmd.render_long_help().to_string();
+    for sub in cmd.get_subcommands() {
+        if sub.get_name() == "help" {
+            continue;
+        }
+        let separator = "-".repeat(80);
+        let _ = write!(
+            out,
+            "\n{separator}\nisekai-ssh {} --help\n{separator}\n\n{}",
+            sub.get_name(),
+            sub.clone().render_long_help()
+        );
+    }
+    // A single write (rather than the many separate print!/println! calls
+    // this replaced) so a reader that closes early — e.g. `isekai-ssh --help
+    // | head` — can't sever the pipe mid-stream and turn a later print! call
+    // into a broken-pipe panic; `let _ =` here matches that same
+    // don't-panic-on-a-closed-reader intent for this final write itself.
+    let _ = std::io::stdout().write_all(out.as_bytes());
 }
 
 #[derive(Subcommand)]

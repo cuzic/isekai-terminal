@@ -1578,6 +1578,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "core-foundation 0.9.4",
+ "libc",
  "log",
  "system-configuration",
  "tokio",

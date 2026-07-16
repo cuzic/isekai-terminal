@@ -318,6 +318,13 @@ pub(crate) struct OrchestratorShared {
     /// ケースだけがこれを実際に使う([`crate::net_health_policy`]参照)。
     path_observer: Mutex<crate::net_health_policy::PathObserver>,
     reconnect_attempt: Box<ReconnectAttemptFn>,
+    /// `spawn_reconnect_loop`の固定間隔ポーリング待機を、ネットワーク復帰通知で
+    /// 早期に打ち切るためのシグナル(isekai-pipe側`resume_loop::wait_backoff_or_network_change`
+    /// と同じ発想 — 詳細は`notify_network_path_changed`の`ConnPhase::Idle`分岐と
+    /// `spawn_reconnect_loop`のコメント参照)。`notify_one`は「まだ誰も待っていない
+    /// 状態で複数回呼ぶ」場合でも1許可分にしかならないため、フラッピングする
+    /// ネットワークで無限にウェイクし続ける心配は無い。
+    reconnect_wake: tokio::sync::Notify,
 }
 
 // ── OrchestratorAdapter ───────────────────────────────────
@@ -702,11 +709,31 @@ fn connect_via(shared: &Arc<OrchestratorShared>, attempt: LastConnectAttempt) ->
     Ok(())
 }
 
+/// `spawn_reconnect_loop`の1 tick分の待機。`tick`を素通しで待つのと、
+/// `wake`(`OrchestratorShared::reconnect_wake`)がネットワーク復帰通知で
+/// 起こされるのをレースさせる — 戻り値は「`wake`側で早期に起きたか」。
+/// 早期に起きた場合、呼び出し側は`elapsed`/`tick_count`の通常の会計には
+/// 一切触れずに「今すぐ1回試す」ボーナス試行だけ行い、次のループでまた
+/// 通常のtick待機に戻る(isekai-pipe側`resume_loop::wait_backoff_or_network_change`
+/// と同じ「バックオフ待機とOS通知をレースさせる」発想を、こちらは
+/// elapsed/timeoutの会計を一切歪めない形で移植したもの)。
+async fn sleep_tick_or_network_restored(tick: Duration, wake: &tokio::sync::Notify) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(tick) => false,
+        _ = wake.notified() => true,
+    }
+}
+
 /// 自動再接続ループ本体。`RUNTIME.spawn`されたtokio task。tsshのUDPモード
 /// reconnectと同じく、1秒ごとに`Reconnecting`をライブ通知しつつ、
 /// `retry_interval`ごとに実際の再接続(`connect_via`)を試みる。
 /// `retry_attempt_in_flight`により、1回の試行の結果(成功/失敗)が判明するまで
 /// 次の試行を重ねて発火しない(ホスト鍵確認プロンプトの多重発生を防ぐ)。
+///
+/// 通常のtickに加え、`shared.reconnect_wake`(`notify_network_path_changed`の
+/// `ConnPhase::Idle`分岐がネットワーク復帰時に鳴らす)で早期に起こされた場合は
+/// `retry_interval`のcadenceを待たず、その場で1回だけボーナス試行する
+/// (`sleep_tick_or_network_restored`参照)。
 fn spawn_reconnect_loop(
     shared: Arc<OrchestratorShared>,
     attempt: LastConnectAttempt,
@@ -737,15 +764,45 @@ fn spawn_reconnect_loop(
         });
 
         loop {
-            tokio::time::sleep(policy.tick).await;
-            elapsed = elapsed.saturating_add(policy.tick);
-            tick_count += 1;
+            let woke_early = sleep_tick_or_network_restored(policy.tick, &shared.reconnect_wake).await;
 
             if shared.state.lock().reconnect_epoch != epoch {
                 // 別の何か(新しい手動接続・cancel_reconnect・再接続成功)に
                 // 主導権が移った。静かに終了する。
                 return;
             }
+
+            if woke_early {
+                // ネットワーク復帰通知による早期起床: 通常のelapsed/tick_countの
+                // 会計には触れず、`retry_attempt_in_flight`が空いていれば
+                // 「今すぐ1回試す」ボーナス試行だけ行って、次のループでまた
+                // 通常のtick待機に戻る。
+                let should_attempt = {
+                    let mut s = shared.state.lock();
+                    if s.reconnect_epoch == epoch && !s.retry_attempt_in_flight {
+                        s.retry_attempt_in_flight = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_attempt {
+                    log::info!(
+                        "orchestrator: network path restored while reconnecting; retrying immediately instead of waiting out the rest of this tick"
+                    );
+                    if let Err(e) = (shared.reconnect_attempt)(&shared, attempt.clone()) {
+                        log::warn!("orchestrator: reconnect attempt failed synchronously: {e:?}");
+                        let mut s = shared.state.lock();
+                        if s.reconnect_epoch == epoch {
+                            s.retry_attempt_in_flight = false;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            elapsed = elapsed.saturating_add(policy.tick);
+            tick_count += 1;
 
             if elapsed >= policy.timeout {
                 let mut s = shared.state.lock();
@@ -827,6 +884,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
         session: Mutex::new(None),
         path_observer: Mutex::new(crate::net_health_policy::PathObserver::default()),
         reconnect_attempt: Box::new(connect_via),
+        reconnect_wake: tokio::sync::Notify::new(),
     });
     Arc::new(SessionOrchestrator { shared })
 }
@@ -1170,7 +1228,16 @@ impl SessionOrchestrator {
             (s.phase, s.is_quic)
         };
         match phase {
-            ConnPhase::Idle => {}
+            ConnPhase::Idle => {
+                // 自動再接続ループが動いている間の「ネットワーク復帰」通知は、
+                // 固定間隔ポーリング待機を早期に打ち切って今すぐ試すシグナルに
+                // 使う(`spawn_reconnect_loop`参照)。ループが動いていない・
+                // 単なる喪失通知(`is_satisfied=false`)は何もしない —
+                // 元々このphaseでは接続自体が無いので喪失に対して打てる手が無い。
+                if is_satisfied && self.shared.state.lock().reconnect_loop_active {
+                    self.shared.reconnect_wake.notify_one();
+                }
+            }
             ConnPhase::Connecting => {
                 if !is_satisfied {
                     log::warn!("orchestrator: network lost during handshake — aborting");
@@ -1345,6 +1412,7 @@ mod tests {
             session: Mutex::new(None),
             path_observer: Mutex::new(net_health_policy::PathObserver::default()),
             reconnect_attempt: Box::new(connect_via),
+            reconnect_wake: tokio::sync::Notify::new(),
         });
         (shared, callback)
     }
@@ -1403,6 +1471,7 @@ mod tests {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             }),
+            reconnect_wake: tokio::sync::Notify::new(),
         });
         (SessionOrchestrator { shared }, callback, attempt_count)
     }
@@ -1992,6 +2061,48 @@ mod tests {
     }
 
     #[test]
+    fn network_path_restored_while_idle_triggers_an_immediate_retry_bypassing_the_tick_cadence() {
+        // retry_intervalをこのテストのsleep幅よりずっと長くしておくことで、
+        // 通常のtick cadenceだけでは絶対に試行が発火しない状況を作る —
+        // それでも試行が観測されれば、`notify_network_path_changed(true)`の
+        // 早期ウェイクが実際に効いている証拠になる。
+        let policy = ReconnectPolicy {
+            tick: Duration::from_millis(10),
+            retry_interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(60),
+        };
+        let (orch, _cb, attempt_count) = orchestrator_connected_with_reconnect_policy(policy);
+        let adapter = OrchestratorAdapter::new(orch.shared.clone());
+        adapter.on_disconnected(Some("peer closed".to_string()));
+        assert!(orch.shared.state.lock().reconnect_loop_active);
+
+        // ループが最初のtick待機に入るのを少し待ってから、ネットワーク復帰を通知する。
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0,
+            "retry_intervalが60秒なので、通知前はまだ試行が発火していないはず"
+        );
+
+        orch.notify_network_path_changed(true);
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "ネットワーク復帰通知でtick cadenceを待たずに即座に再試行するはず"
+        );
+    }
+
+    #[test]
+    fn network_path_restored_while_idle_does_nothing_if_no_reconnect_loop_is_active() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Idle, false);
+        orch.notify_network_path_changed(true);
+        assert!(
+            cb.connection_states.lock().unwrap().is_empty(),
+            "再接続ループが動いていない状態でのネットワーク復帰通知は何もしないはず"
+        );
+    }
+
+    #[test]
     fn cancel_reconnect_stops_loop_and_notifies_disconnected() {
         let policy = ReconnectPolicy {
             tick: Duration::from_millis(10),
@@ -2297,6 +2408,7 @@ mod tests {
                 shared.state.lock().phase = ConnPhase::Connecting;
                 Err(SshError::ConnectionFailed)
             }),
+            reconnect_wake: tokio::sync::Notify::new(),
         });
         (SessionOrchestrator { shared }, callback, attempt_count)
     }

@@ -97,6 +97,15 @@ public struct TerminalView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .padding(.bottom, 8)
             }
+
+            // Phase 9-6(#16): セルラーへフェイルオーバー中/WiFi復帰の静けさ待ち中だけ表示する。
+            // 表示可否の判定はRebindPublicState(Rust側が発火するcallback経由)だけを見て行い、
+            // Swift側で推測状態は持たない(Android版`TerminalScreen.kt`と同じ、rust-ssot.md準拠)。
+            if case .connected = uiState.state, let rebindState = uiState.rebindState, rebindState != .onWifi {
+                forceReturnToWifiButton
+                    .frame(maxWidth: .infinity, alignment: .topTrailing)
+                    .padding([.top, .trailing], 8)
+            }
         }
         .background(Color.black)
         .navigationBarTitleDisplayMode(.inline)
@@ -311,6 +320,19 @@ public struct TerminalView: View {
                 .clipShape(Capsule())
         }
         .accessibilityIdentifier("backToLiveButton")
+    }
+
+    /// Phase 9-6(#16): セルラーへフェイルオーバー中/WiFi復帰の静けさ待ち中に表示する
+    /// 手動即時復帰ボタン。Android版`TerminalScreen.kt`の「今すぐWiFiに戻す」ボタンと対称。
+    private var forceReturnToWifiButton: some View {
+        Button("今すぐWiFiに戻す") { controller.forceReturnToWifi() }
+            .font(.caption)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.black.opacity(0.8))
+            .foregroundStyle(.cyan)
+            .clipShape(Capsule())
+            .accessibilityIdentifier("forceReturnToWifiButton")
     }
 }
 

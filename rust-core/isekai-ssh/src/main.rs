@@ -87,6 +87,13 @@ async fn run() -> u8 {
                 EXIT_OTHER_ERROR
             }
         }
+    } else if matches!(raw_args.first().map(String::as_str), Some("-h" | "--help" | "help")) {
+        // `--help`/`-h`/`help` bypass `Cli::parse()`'s default rendering
+        // (which only lists subcommand one-liners) so every subcommand's
+        // own options show up in a single `isekai-ssh --help` — see
+        // `cli::print_full_help`'s docs.
+        cli::print_full_help();
+        0
     } else {
         let cli = cli::Cli::parse();
         let result = match cli.command {

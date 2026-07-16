@@ -67,6 +67,24 @@ jobs:
           /usr/sbin/sshd -V || true
           ssh-keygen -V || true
 
+      # cargo-zigbuildのinstall・musl静的バイナリのビルド・`cargo nextest run`より前に
+      # 置く(以前はこのステップがそれらより後にあり、`rust-core/target`を含むキャッシュが
+      # 一切効かないままcargo-zigbuildの毎回のcompile-from-scratchとisekai-pipeの
+      # musl再ビルドが走っていた)。
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: rust-core-test-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            rust-core-test-${{ runner.os }}-
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Install openssh-server (opt-in real-sshd E2E tests need /usr/sbin/sshd)
         run: |
           sudo apt-get update
@@ -90,20 +108,21 @@ jobs:
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           bash rust-core/scripts/build-isekai-pipe-musl.sh
 
-      - name: Cache cargo (rust-core)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust-core/target
-          key: rust-core-test-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
-          restore-keys: |
-            rust-core-test-${{ runner.os }}-
-
-      - name: cargo test --workspace
+      # cargo-nextestへ移行(process-per-testで実行されるため、1つのlibtestプロセス内で
+      # 1000件超のテストが同時実行されていた従来の`cargo test`よりタイムアウト・隔離の
+      # 制御がしやすい)。rust-core/.config/nextest.toml の`ci`プロファイルで、既知の
+      # CPU競合起因flakyテスト群(faulty_udp_socket::tests::*/multipath_transport::tests::*、
+      # rust-quic-test-flakiness-under-loadのメモリ記録参照)にだけper-test retryを
+      # 設定している。nextestはdoctestを実行しないため別途`cargo test --doc`で補う。
+      # noq-multipath-spikeはworkspace member自体から外してあるため`--exclude`は不要
+      # (Codexアーキテクチャレビュー指摘、role-separation-fixesブランチで対応)。
+      - name: cargo nextest run --workspace
         working-directory: rust-core
-        run: cargo test --workspace
+        run: cargo nextest run --profile ci --workspace
+
+      - name: cargo test --doc --workspace
+        working-directory: rust-core
+        run: cargo test --doc --workspace
 
   test-macos:
     runs-on: macos-26
