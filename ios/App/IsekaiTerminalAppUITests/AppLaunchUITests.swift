@@ -39,6 +39,37 @@ final class AppLaunchUITests: XCTestCase {
         field.typeText(text)
     }
 
+    /// `waitForExistence`はアクセシビリティツリーに要素が現れたことしか保証せず、
+    /// sheet/alertの提示アニメーション中などまだタップを受け付けられない
+    /// (`isHittable == false`)状態でも真を返す。CIの`testKeyGenerationFlowCreatesNewKeyRow`
+    /// で「Failed to get matching snapshot」というトランジション中のスナップショット
+    /// 取得失敗が実際に起きたため(Codexレビュー指摘)、存在に加えてhittableになるまで
+    /// 待ってからタップする。
+    private func tapWhenHittable(_ element: XCUIElement, timeout: TimeInterval = 10) {
+        XCTAssertTrue(element.waitForExistence(timeout: timeout))
+        let hittable = NSPredicate(format: "isHittable == true")
+        wait(for: [expectation(for: hittable, evaluatedWith: element)], timeout: timeout)
+        element.tap()
+    }
+
+    /// 新規行の保存/生成直後、`AppServices.shared`が実DB(タスク間でリセットされない、
+    /// このファイル冒頭のコメント参照)を使い続けるため、テストを重ねるほどList内の
+    /// 行数が増え、`displayName`昇順ソート次第では新規行が画面外に留まり得る
+    /// (`ProfileDatabase.swift`の`.order(Column("displayName"))`参照)。SwiftUIの`List`は
+    /// 画面外のセルをアクセシビリティツリーへ出さないことがあるため、
+    /// `waitForExistence`だけでは検出できない(Codexレビュー指摘、
+    /// `testAddProfileFlowCreatesNewProfileRow`の実際の失敗)。見つかるまでスクロールする。
+    @discardableResult
+    private func waitForRowVisible(_ label: String, app: XCUIApplication, scrollContainer: XCUIElement, timeout: TimeInterval = 10) -> XCUIElement {
+        let row = app.staticTexts[label]
+        let deadline = Date().addingTimeInterval(timeout)
+        while !row.exists && Date() < deadline {
+            scrollContainer.swipeUp()
+        }
+        XCTAssertTrue(row.waitForExistence(timeout: 2), "row \(label) never became visible even after scrolling")
+        return row
+    }
+
     func testAppLaunchesToProfileList() throws {
         let app = XCUIApplication()
         app.launch()
@@ -67,8 +98,7 @@ final class AppLaunchUITests: XCTestCase {
 
         app.buttons["saveProfileButton"].tap()
 
-        let newRow = app.staticTexts[label]
-        XCTAssertTrue(newRow.waitForExistence(timeout: 5))
+        waitForRowVisible(label, app: app, scrollContainer: app.collectionViews["profileList"])
     }
 
     func testDeleteProfileRemovesRow() throws {
@@ -120,13 +150,13 @@ final class AppLaunchUITests: XCTestCase {
 
         app.buttons["confirmGenerateKeyButton"].tap()
 
-        // 生成後の「鍵を生成しました」アラートを閉じる。
+        // 生成後の「鍵を生成しました」アラートを閉じる。sheetのdismissアニメーションと
+        // このalertの提示が重ならないよう本番側(`KeyListView.swift`)を直したが、
+        // それでもテスト側はhittableになるまで待ってからタップする(`tapWhenHittable`参照)。
         let dismissButton = app.alerts["鍵を生成しました"].buttons["閉じる"]
-        XCTAssertTrue(dismissButton.waitForExistence(timeout: 5))
-        dismissButton.tap()
+        tapWhenHittable(dismissButton, timeout: 10)
 
-        let newKeyRow = app.staticTexts[label]
-        XCTAssertTrue(newKeyRow.waitForExistence(timeout: 5))
+        waitForRowVisible(label, app: app, scrollContainer: app.collectionViews["keyList"])
     }
 
     func testEditProfileFlowUpdatesRow() throws {
