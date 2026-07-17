@@ -39,19 +39,6 @@ final class AppLaunchUITests: XCTestCase {
         field.typeText(text)
     }
 
-    /// `waitForExistence`はアクセシビリティツリーに要素が現れたことしか保証せず、
-    /// sheet/alertの提示アニメーション中などまだタップを受け付けられない
-    /// (`isHittable == false`)状態でも真を返す。CIの`testKeyGenerationFlowCreatesNewKeyRow`
-    /// で「Failed to get matching snapshot」というトランジション中のスナップショット
-    /// 取得失敗が実際に起きたため(Codexレビュー指摘)、存在に加えてhittableになるまで
-    /// 待ってからタップする。
-    private func tapWhenHittable(_ element: XCUIElement, timeout: TimeInterval = 10) {
-        XCTAssertTrue(element.waitForExistence(timeout: timeout))
-        let hittable = NSPredicate(format: "isHittable == true")
-        wait(for: [expectation(for: hittable, evaluatedWith: element)], timeout: timeout)
-        element.tap()
-    }
-
     /// 新規行の保存/生成直後、`AppServices.shared`が実DB(タスク間でリセットされない、
     /// このファイル冒頭のコメント参照)を使い続けるため、テストを重ねるほどList内の
     /// 行数が増え、`displayName`昇順ソート次第では新規行が画面外に留まり得る
@@ -151,10 +138,15 @@ final class AppLaunchUITests: XCTestCase {
         app.buttons["confirmGenerateKeyButton"].tap()
 
         // 生成後の「鍵を生成しました」アラートを閉じる。sheetのdismissアニメーションと
-        // このalertの提示が重ならないよう本番側(`KeyListView.swift`)を直したが、
-        // それでもテスト側はhittableになるまで待ってからタップする(`tapWhenHittable`参照)。
+        // このalertの提示が重ならないよう本番側(`KeyListView.swift`)を直したので、単純な
+        // 存在待ち+tapで十分なはず。`isHittable`述語での追加待ち(`tapWhenHittable`)は
+        // 一度試したが、alertボタンに対して`isHittable`評価自体が「Failed to determine
+        // hittability ... Activation point invalid」という別の実際のCI失敗を起こしたため
+        // 撤回した(根本原因は本番側の修正で解消済みのはずで、この評価はむしろ余計な
+        // 失敗要因だった)。
         let dismissButton = app.alerts["鍵を生成しました"].buttons["閉じる"]
-        tapWhenHittable(dismissButton, timeout: 10)
+        XCTAssertTrue(dismissButton.waitForExistence(timeout: 10))
+        dismissButton.tap()
 
         waitForRowVisible(label, app: app, scrollContainer: app.collectionViews["keyList"])
     }
