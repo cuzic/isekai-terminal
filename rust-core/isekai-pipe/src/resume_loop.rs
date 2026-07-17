@@ -114,26 +114,54 @@ impl BusyOtherSessionSignal for isekai_transport::SequentialConnectError {
     }
 }
 
+/// Extra slack added on top of `resume_window_for(...)` for the
+/// `BUSY_OTHER_SESSION` retry loop specifically — found necessary 2026-07-17
+/// after a real Windows sleep/wake: this client's own retry loop starts
+/// counting down from the moment *it* first gets rejected, but the remote
+/// helper only starts *its* park-expiry countdown once its own QUIC
+/// `--idle-timeout` (15s by default, `engine/mod.rs`) notices the old
+/// connection is dead — which happens strictly later than this client's
+/// first rejection. Without this buffer the two windows are the same
+/// length but different start times, so this client's deadline always
+/// elapses first, by roughly the helper's idle-timeout detection latency
+/// (observed: gave up 16s before the helper actually freed the slot).
+/// `BUSY_OTHER_SESSION` is specifically a self-clearing condition (unlike
+/// a genuinely unreachable target), so erring generously here is safe.
+const BUSY_OTHER_SESSION_EXTRA_PATIENCE: Duration = Duration::from_secs(30);
+
 /// Retries `attempt` while — and only while — it fails with
 /// `BUSY_OTHER_SESSION`, for up to `resume_window_for(requested_resume_grace_secs)`
-/// (the same deadline a resume loop would use, since a `BUSY_OTHER_SESSION`
-/// reject on the very first connect most often means *this same client's*
-/// previous session is still parked on the remote helper, waiting out that
-/// exact window after an earlier ungraceful disconnect — see
-/// `TransportError::is_busy_other_session`'s docs). Every other failure is
-/// returned immediately on the first attempt, unchanged from before this
-/// wrapper existed: this only closes the gap where a fresh `isekai-pipe
-/// connect` process (a brand new `session_id` every time, since neither
-/// `connect_via_relay_resumable` nor `_with_fallback` persist one across
-/// invocations) would otherwise fail outright instead of waiting the same
-/// window a same-process resume would have.
-async fn retry_while_busy_other_session<T, E, F, Fut>(requested_resume_grace_secs: u32, mut attempt: F) -> Result<T, E>
+/// plus [`BUSY_OTHER_SESSION_EXTRA_PATIENCE`] (the same deadline a resume loop
+/// would use, since a `BUSY_OTHER_SESSION` reject on the very first connect
+/// most often means *this same client's* previous session is still parked on
+/// the remote helper, waiting out that exact window after an earlier
+/// ungraceful disconnect — see `TransportError::is_busy_other_session`'s
+/// docs). Every other failure is returned immediately on the first attempt,
+/// unchanged from before this wrapper existed: this only closes the gap
+/// where a fresh `isekai-pipe connect` process (a brand new `session_id`
+/// every time, since neither `connect_via_relay_resumable` nor `_with_fallback`
+/// persist one across invocations) would otherwise fail outright instead of
+/// waiting the same window a same-process resume would have.
+async fn retry_while_busy_other_session<T, E, F, Fut>(requested_resume_grace_secs: u32, attempt: F) -> Result<T, E>
 where
     E: BusyOtherSessionSignal,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
-    let deadline = Instant::now() + resume_window_for(requested_resume_grace_secs);
+    let deadline = Instant::now() + resume_window_for(requested_resume_grace_secs) + BUSY_OTHER_SESSION_EXTRA_PATIENCE;
+    retry_busy_other_session_until(deadline, attempt).await
+}
+
+/// The actual retry loop, parametrized directly over `deadline` so tests can
+/// exercise the give-up path without waiting out a real
+/// [`BUSY_OTHER_SESSION_EXTRA_PATIENCE`]-sized delay (`retry_while_busy_other_session`
+/// is the thin wrapper real callers use).
+async fn retry_busy_other_session_until<T, E, F, Fut>(deadline: Instant, mut attempt: F) -> Result<T, E>
+where
+    E: BusyOtherSessionSignal,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
     let mut attempt_no: u32 = 0;
     loop {
         let err = match attempt().await {
@@ -476,12 +504,28 @@ fn print_reconnect_status(is_tty: bool, disconnected_at: Instant, resume_window:
     }
 }
 
-fn print_reconnect_success(is_tty: bool) {
+fn print_reconnect_success(is_tty: bool, session_id: isekai_transport::SessionId) {
     if is_tty {
         eprintln!("\r\x1b[0;32misekai-pipe connect: reconnected.\x1b[0m\x1b[K");
     } else {
         eprintln!("isekai-pipe connect: reconnected.");
     }
+    notify_os("isekai-pipe connect", &format!("Reconnected (session_id={session_id})."));
+}
+
+/// Best-effort OS-level notification (Windows toast / Linux desktop
+/// notification via D-Bus / macOS notification) for the two reconnect
+/// events a user should notice even if they're not looking at the terminal
+/// right now: a successful reconnect, and giving up entirely. This is a
+/// lightweight stand-in for a full tssh-style in-terminal overlay (a
+/// separate, larger follow-up) — deliberately not called for every
+/// individual backoff retry or transient failure, which would just spam
+/// notifications for what's usually a self-healing blip. Any failure
+/// (no notification daemon, headless environment, ...) is silently
+/// ignored — exactly like `isekai-ssh/src/log_file.rs`'s own philosophy,
+/// this must never be able to affect the connection itself.
+fn notify_os(summary: &str, body: &str) {
+    let _ = notify_rust::Notification::new().summary(summary).body(body).show();
 }
 
 /// TTY時のみ呼ばれる: 1回のバックオフ待機(`delay`)を最大1秒刻みに分割し、
@@ -603,7 +647,7 @@ async fn promote_warm_standby_once(
         return None;
     }
     log::info!("isekai-pipe connect: promoted warm-standby connection for session_id={}", state.session_id);
-    print_reconnect_success(state.is_tty);
+    print_reconnect_success(state.is_tty, state.session_id);
     match reestablish_control_stream(&promoted.connection, &target.session_secret, &state.counters).await {
         Ok(new_tasks) => state.app_ack_tasks = new_tasks,
         Err(e) => eprintln!(
@@ -617,11 +661,16 @@ async fn promote_warm_standby_once(
 }
 
 /// The ordinary `reconnect_and_resume` retry loop, run until either a resume
-/// attempt succeeds or `deadline` passes. Returns `Some(stream)` on success
+/// attempt succeeds or `deadline` passes. Returns `Ok(stream)` on success
 /// (having also re-established the control stream and updated
-/// `state.network_rebinder`); returns `None` once `deadline` has passed,
+/// `state.network_rebinder`); returns `Err` once `deadline` has passed,
 /// having already closed `stdout` and aborted `warm_standby_task` — the
-/// caller's only remaining step on `None` is to return `Ok(())`.
+/// caller propagates this `Err` (e.g. via `?`) so it eventually reaches
+/// `connect_command`'s `Err` arm and `write_connect_outcome_for_wrapper`
+/// classifies it as `ConnectOutcomeClass::Unreachable`, letting `isekai-ssh`'s
+/// wrapper auto-retry (`.claude/rules/always-connects.md`) instead of the
+/// give-up silently looking like a clean exit to everything downstream of
+/// this function.
 ///
 /// Each backoff wait races against `network_monitor.next_change()`: unlike
 /// `spawn_reconnect_signal` (which only watches while a connection is
@@ -644,7 +693,7 @@ async fn resume_with_backoff_until_deadline(
     stdout: &mut tokio::io::Stdout,
     warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
     network_monitor: &mut dyn isekai_netmon::NetworkChangeMonitor,
-) -> Option<AnyByteStream> {
+) -> Result<AnyByteStream> {
     let mut attempt: u32 = 0;
     loop {
         let now = Instant::now();
@@ -660,17 +709,24 @@ async fn resume_with_backoff_until_deadline(
                 .as_deref()
                 .map(|e| format!(" Last error: {e}."))
                 .unwrap_or_default();
+            let session_id = state.session_id;
             eprintln!(
-                "isekai-pipe connect: giving up on session_id={} for '{profile}' - \
+                "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
                  the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}.{last_error_suffix} \
                  Closing stdin/stdout; ssh will treat this as a lost connection.",
-                state.session_id
+            );
+            notify_os(
+                "isekai-pipe connect",
+                &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
             );
             let _ = stdout.shutdown().await;
             if let Some(t) = warm_standby_task {
                 t.abort();
             }
-            return None;
+            return Err(anyhow::anyhow!(
+                "resume window ({resume_window:?}) exceeded by {exceeded_by:?} for session_id={session_id}\
+                 for '{profile}'.{last_error_suffix}"
+            ));
         }
 
         let delay = RESUME_BACKOFF.base_delay(attempt).min(deadline - now);
@@ -710,7 +766,7 @@ async fn resume_with_backoff_until_deadline(
                     state.last_resume_error = Some(msg);
                     continue;
                 }
-                print_reconnect_success(state.is_tty);
+                print_reconnect_success(state.is_tty, state.session_id);
                 match reestablish_control_stream(&resumed.connection, &target.session_secret, &state.counters).await {
                     Ok(new_tasks) => state.app_ack_tasks = new_tasks,
                     Err(e) => eprintln!(
@@ -720,7 +776,7 @@ async fn resume_with_backoff_until_deadline(
                 }
                 drop(resumed.connection);
                 state.network_rebinder = resumed.network_rebinder;
-                return Some(resumed.data_stream);
+                return Ok(resumed.data_stream);
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -865,7 +921,7 @@ pub(crate) async fn run_resume_loop(
                 // while already backing off, not the first one that got us
                 // here.
                 let mut backoff_network_monitor = isekai_netmon::system_monitor();
-                match resume_with_backoff_until_deadline(
+                resume_with_backoff_until_deadline(
                     factory,
                     target,
                     profile,
@@ -877,11 +933,7 @@ pub(crate) async fn run_resume_loop(
                     &warm_standby_task,
                     &mut *backoff_network_monitor,
                 )
-                .await
-                {
-                    Some(stream) => stream,
-                    None => return Ok(()),
-                }
+                .await?
             }
         };
 
@@ -1226,10 +1278,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_while_busy_other_session_gives_up_once_the_resume_window_elapses() {
-        let result: Result<(), FakeConnectError> =
-            retry_while_busy_other_session(1, || async { Err(FakeConnectError(true)) }).await;
-        assert!(result.is_err(), "must stop retrying once the resume window has elapsed");
+    async fn retry_busy_other_session_until_gives_up_once_its_deadline_elapses() {
+        // Exercises the give-up path directly against a short, explicit
+        // deadline (rather than through `retry_while_busy_other_session`,
+        // whose real deadline now includes `BUSY_OTHER_SESSION_EXTRA_PATIENCE`
+        // and would make this test wait ~30s for no reason).
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let result: Result<(), FakeConnectError> = retry_busy_other_session_until(deadline, || async { Err(FakeConnectError(true)) }).await;
+        assert!(result.is_err(), "must stop retrying once the deadline has elapsed");
+    }
+
+    #[test]
+    fn busy_other_session_retry_deadline_includes_extra_patience_beyond_the_resume_window() {
+        // Regression test for the 2026-07-17 incident: the remote helper's
+        // own park-expiry doesn't start counting until *its* idle-timeout
+        // notices the old connection is dead, which is always later than
+        // this client's first BUSY_OTHER_SESSION rejection. Without
+        // `BUSY_OTHER_SESSION_EXTRA_PATIENCE`, a client using the bare
+        // `resume_window_for(...)` deadline gives up before the helper ever
+        // frees the slot.
+        let requested_resume_grace_secs = 5;
+        let now = Instant::now();
+        let bare_window_deadline = now + resume_window_for(requested_resume_grace_secs);
+        let padded_deadline = now + resume_window_for(requested_resume_grace_secs) + BUSY_OTHER_SESSION_EXTRA_PATIENCE;
+        assert!(
+            padded_deadline > bare_window_deadline,
+            "the BUSY_OTHER_SESSION retry deadline must extend past the bare resume window"
+        );
     }
 
     #[tokio::test]
@@ -1392,6 +1467,60 @@ mod tests {
             let ok = replay_and_advance(&replay, 6, &mut stream).await;
             assert!(ok);
             assert_eq!(replay.lock().unwrap().end_offset(), 11);
+        }
+
+        #[tokio::test]
+        async fn resume_with_backoff_until_deadline_returns_err_once_the_resume_window_is_exceeded() {
+            // Regression test for the bug reported 2026-07-16: this give-up
+            // path used to `return None`, and `run_resume_loop` turned that
+            // into `Ok(())` — a silent "clean exit" that never reached
+            // `connect_command`'s `Err` arm, so `write_connect_outcome_for_wrapper`
+            // never fired and `isekai-ssh`'s wrapper had no signal to
+            // auto-retry on (e.g. after a Windows sleep/wake outlasts the
+            // resume window). Must return `Err` so the "always-connects"
+            // auto-recovery in `wrapper.rs` actually engages.
+            let (addr, cert_sha256_hex) = spawn_control_hello_listener().await;
+            let conn = connect(addr, cert_sha256_hex.clone()).await;
+            let counters = Arc::new(AppAckCounters::new());
+            let app_ack_tasks = reestablish_control_stream(&conn, b"any-session-secret", &counters).await.unwrap();
+
+            let target = RelayTarget {
+                helper_addr: addr,
+                server_name: "isekai-pipe.local".to_string(),
+                cert_sha256_hex,
+                session_secret: b"any-session-secret".to_vec(),
+                local_bind_port_range: None,
+            };
+            let factory = system_quic_factory();
+            let mut state = ResumeLoopState {
+                session_id: isekai_transport::SessionId::from_bytes([0x7Fu8; 16]),
+                counters,
+                replay: Arc::new(Mutex::new(C2hReplayBuffer::new(1024))),
+                app_ack_tasks,
+                network_rebinder: None,
+                is_tty: false,
+                last_resume_error: Some("connection refused".to_string()),
+            };
+            let mut stdout = tokio::io::stdout();
+            let now = Instant::now();
+            let mut monitor = isekai_netmon::NoopNetworkChangeMonitor;
+
+            let result = resume_with_backoff_until_deadline(
+                &factory,
+                &target,
+                "test-profile",
+                Duration::from_secs(0),
+                now,
+                now, // deadline already reached: must give up on the first check
+                &mut state,
+                &mut stdout,
+                &None,
+                &mut monitor,
+            )
+            .await;
+
+            assert!(result.is_err(), "must return Err once the resume window is exceeded, not a silent Ok/None");
+            state.app_ack_tasks.abort();
         }
     }
 

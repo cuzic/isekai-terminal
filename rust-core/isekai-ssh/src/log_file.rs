@@ -23,6 +23,16 @@
 //! call site that currently just does `eprintln!`, and there is exactly one
 //! `isekai-ssh` process per invocation, so nothing here needs to be
 //! per-connection scoped.
+//!
+//! A second, independent channel ([`append_verbose_line`]/[`log_line_verbose!`])
+//! backs the *default* (no flag needed) quiet behavior: verbose bootstrap/
+//! diagnostic detail always goes to `isekai_pipe_core::default_log_file()`
+//! instead of the terminal, without touching `is_enabled()` — which also
+//! gates whether `wrapper.rs` pipes `ssh(1)`'s child stderr (see
+//! `run_ssh_once`). Conflating the two would route `resume_loop.rs`'s
+//! human-facing reconnect status lines into a log file by default too,
+//! defeating the point (found during design review before implementing —
+//! see the plan for this change).
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
@@ -30,6 +40,56 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
+static VERBOSE_LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
+
+/// Truncated if larger than this when (re-)opened — a lightweight safety
+/// net against unbounded growth now that this file is written by default
+/// rather than only when a user explicitly opts into `--isekai-log-file`.
+/// Not a real rotation scheme (matches `--isekai-log-file`'s own
+/// append-forever behavior otherwise); just prevents an all-day flaky-WiFi
+/// session from growing this file without bound.
+const VERBOSE_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Opens (creating parent dirs + the file as needed) the default verbose
+/// log at `path` and installs it as the process-wide verbose-log target.
+/// Called at most once, from `run()`, only when `--isekai-log-file` was
+/// *not* given (that flag's own `init` above takes priority in
+/// `log_line_verbose!`). Truncates first if the existing file already
+/// exceeds [`VERBOSE_LOG_MAX_BYTES`]. Failure here (permissions, read-only
+/// filesystem, ...) is not fatal — `run()` simply proceeds without verbose
+/// logging enabled, same "never block the connection over a diagnostics
+/// nicety" philosophy as `append_bytes`.
+pub fn init_verbose(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > VERBOSE_LOG_MAX_BYTES {
+        let _ = std::fs::remove_file(path);
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    let _ = VERBOSE_LOG_FILE.set(Mutex::new(file));
+    Ok(())
+}
+
+/// Appends one already-formatted line to the default verbose log, silently
+/// doing nothing if `init_verbose` was never called or failed (same
+/// fail-open policy as [`append_line`]/[`append_bytes`]).
+pub fn append_verbose_line(line: &str) {
+    let Some(file) = VERBOSE_LOG_FILE.get() else { return };
+    let Ok(mut file) = file.lock() else { return };
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    let _ = file.write_all(buf.as_bytes());
+    let _ = file.flush();
+}
 
 /// Opens (creating if needed, always appending — repeated invocations
 /// during one debugging session accumulate a single history rather than
@@ -96,6 +156,32 @@ macro_rules! log_line {
     }};
 }
 pub(crate) use log_line;
+
+/// Verbose/detail counterpart to [`log_line!`] for bootstrap-progress-style
+/// messages that don't need to be on screen by default. When
+/// `--isekai-log-file` is active, behaves exactly like `log_line!` (goes
+/// into that one unified file, preserving its "everything in one place"
+/// contract). Otherwise, goes quietly to the always-on default verbose log
+/// (`init_verbose`/`append_verbose_line`) instead of the terminal —
+/// nothing from this macro reaches the screen in the default (no flags)
+/// case.
+macro_rules! log_line_verbose {
+    () => {{
+        if $crate::log_file::is_enabled() {
+            $crate::log_file::append_line("");
+        } else {
+            $crate::log_file::append_verbose_line("");
+        }
+    }};
+    ($($arg:tt)*) => {{
+        if $crate::log_file::is_enabled() {
+            $crate::log_file::append_line(&format!($($arg)*));
+        } else {
+            $crate::log_file::append_verbose_line(&format!($($arg)*));
+        }
+    }};
+}
+pub(crate) use log_line_verbose;
 
 /// Relays `child_stderr` into the log file **instead of** this process's
 /// own stderr, until the child closes its stderr (normally, on exit) — the

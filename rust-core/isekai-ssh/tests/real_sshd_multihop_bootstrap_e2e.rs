@@ -298,11 +298,18 @@ async fn wrapper_auto_bootstraps_through_a_real_two_hop_via_chain() {
     )
     .unwrap();
 
+    let verbose_log_path = client_home.join("isekai-ssh-verbose-test.log");
     let mut child = TokioCommand::new(isekai_ssh_bin_path())
         .arg("--isekai-helper-binary")
         .arg(isekai_pipe_bin_path())
         .arg("real-sshd-multihop-host")
         .env("HOME", &client_home)
+        // Verbose bootstrap-progress messages (including "Registered ...
+        // in ...", which this test watches for below) now default to
+        // `isekai-ssh`'s own log file (`log_file.rs::log_line_verbose!`)
+        // rather than stderr — see `real_sshd_bootstrap_e2e.rs`'s identical
+        // fix.
+        .env("ISEKAI_PIPE_LOG_FILE", &verbose_log_path)
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -334,7 +341,9 @@ async fn wrapper_auto_bootstraps_through_a_real_two_hop_via_chain() {
             Ok(Ok(_)) => {
                 eprint!("[isekai-ssh stderr] {line}");
                 stderr_log.push_str(&line);
-                if line.contains("Registered") {
+                let verbose_log_has_registered =
+                    std::fs::read_to_string(&verbose_log_path).map(|s| s.contains("Registered")).unwrap_or(false);
+                if line.contains("Registered") || verbose_log_has_registered {
                     saw_registered = true;
                     break;
                 }

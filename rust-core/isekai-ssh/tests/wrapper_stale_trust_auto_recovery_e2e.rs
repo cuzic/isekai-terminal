@@ -357,6 +357,18 @@ fn profiles_dir_under(home: &std::path::Path) -> PathBuf {
     home.join(".local").join("state").join("isekai").join("profiles")
 }
 
+/// Verbose bootstrap-progress messages (including "Registered ... in ...")
+/// now default to `isekai-ssh`'s own log file (`log_file.rs::log_line_verbose!`)
+/// rather than stderr — these tests point that log file at a known path
+/// under the test's own `home` and poll it instead of scanning stderr.
+fn verbose_log_path_under(home: &std::path::Path) -> PathBuf {
+    home.join("isekai-ssh-verbose-test.log")
+}
+
+fn verbose_log_registered_count(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path).map(|s| s.matches("Registered").count()).unwrap_or(0)
+}
+
 fn valid_bootstrap_report_json(refreshed_session_secret_b64: &str) -> String {
     format!(
         r#"{{"v":2,"session_id":"00000000000000000000000000000000","bootstrap_attempt_id":"11111111111111111111111111111111","handshake":{{"v":1,"session_secret":"{refreshed_session_secret_b64}","protocol":{{"name":"isekai-pipe","alpn":"isekai-pipe/1"}},"peer":{{"server_identity":{{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}}}},"candidates":[{{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"}}]}}}}"#
@@ -494,6 +506,13 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
         .env("HOME", &home)
         .env("PATH", &shim.path_env)
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        // Verbose bootstrap-progress messages (including "Registered ...
+        // in ...", which this test counts below) now default to
+        // `isekai-ssh`'s own log file (`log_file.rs::log_line_verbose!`)
+        // rather than stderr — "cached trust looks stale" (checked via
+        // `saw_stale_notice` below) stays on stderr unchanged, since it's
+        // one of the curated connect-failure/recovery summary lines.
+        .env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))
         .envs(shim.extra_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped()) // deliberately never written to -- Silent mode must not read it
@@ -507,7 +526,6 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     let mut stderr_log = String::new();
     let mut saw_stale_notice = false;
     let mut saw_second_registration = false;
-    let mut registered_count = 0;
     for _ in 0..400 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
@@ -518,12 +536,10 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
                 if line.contains("looks stale") {
                     saw_stale_notice = true;
                 }
-                if line.contains("Registered") {
-                    registered_count += 1;
-                    if registered_count >= 1 && saw_stale_notice {
-                        saw_second_registration = true;
-                        break;
-                    }
+                let registered_count = verbose_log_registered_count(&verbose_log_path_under(&home));
+                if registered_count >= 1 && saw_stale_notice {
+                    saw_second_registration = true;
+                    break;
                 }
             }
             _ => break,
@@ -691,6 +707,12 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
         .env("HOME", &home)
         .env("PATH", &shim.path_env)
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        // Verbose bootstrap-progress messages (including "Registered ...
+        // in ...", which this test counts below) now default to
+        // `isekai-ssh`'s own log file rather than stderr — "the cached
+        // deployment could not be reached" (checked via
+        // `saw_unreachable_notice` below) stays on stderr unchanged.
+        .env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))
         .envs(shim.extra_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped()) // deliberately never written to -- Silent mode must not read it
@@ -704,7 +726,6 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
     let mut stderr_log = String::new();
     let mut saw_unreachable_notice = false;
     let mut saw_second_registration = false;
-    let mut registered_count = 0;
     // The dead endpoint's QUIC dial has to actually time out
     // (`isekai-transport::system::CLIENT_MAX_IDLE_TIMEOUT`, 15s) before the
     // first `ssh` attempt fails at all, so this loop's per-line timeout is
@@ -719,12 +740,10 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
                 if line.contains("could not be reached") {
                     saw_unreachable_notice = true;
                 }
-                if line.contains("Registered") {
-                    registered_count += 1;
-                    if registered_count >= 1 && saw_unreachable_notice {
-                        saw_second_registration = true;
-                        break;
-                    }
+                let registered_count = verbose_log_registered_count(&verbose_log_path_under(&home));
+                if registered_count >= 1 && saw_unreachable_notice {
+                    saw_second_registration = true;
+                    break;
                 }
             }
             _ => break,
