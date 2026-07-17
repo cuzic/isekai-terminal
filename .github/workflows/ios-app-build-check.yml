@@ -36,7 +36,7 @@ permissions:
 jobs:
   build:
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -49,6 +49,23 @@ jobs:
           xcodebuild -version
           rustc --version
           cargo --version
+
+      # cargo-zigbuildのinstall・musl静的バイナリのビルド・XCFrameworkビルドより前に
+      # 置く(以前はこのステップがそれらより後にあり、rust-core/targetを含む
+      # キャッシュが一切効かないままcargo-zigbuildの毎回のcompile-from-scratchと
+      # isekai-pipeのmusl再ビルドが走っていた——rust-core-test-check.ymlで一度
+      # 発見・修正済みだった同じ問題がこのワークフローには反映されておらず、
+      # 3回連続でジョブ全体が30分タイムアウトする実際の原因になっていた)。
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ios-app-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            ios-app-build-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install Rust iOS targets
         run: |
@@ -65,17 +82,6 @@ jobs:
           cargo install cargo-zigbuild --locked
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           bash rust-core/scripts/build-isekai-pipe-musl.sh
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust-core/target
-          key: ios-app-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}
-          restore-keys: |
-            ios-app-build-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build XCFramework
         run: bash rust-core/scripts/build-ios-xcframework.sh

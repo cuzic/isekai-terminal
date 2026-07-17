@@ -44,6 +44,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # cargo-zigbuildのinstall・musl静的バイナリのビルド・XCFrameworkビルドより前に
+      # 置く(以前はこのステップがそれらより後にあり、rust-core/targetを含む
+      # キャッシュが一切効かないままcargo-zigbuildの毎回のcompile-from-scratchと
+      # isekai-pipeのmusl再ビルドが走っていた——rust-core-test-check.ymlで一度
+      # 発見・修正済みだった同じ問題がこのワークフローには反映されていなかった)。
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ios-ssh-slice-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            ios-ssh-slice-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Install Rust iOS targets
         run: |
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
@@ -59,17 +75,6 @@ jobs:
           cargo install cargo-zigbuild --locked
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
           bash rust-core/scripts/build-isekai-pipe-musl.sh
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust-core/target
-          key: ios-ssh-slice-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}
-          restore-keys: |
-            ios-ssh-slice-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build XCFramework
         run: bash rust-core/scripts/build-ios-xcframework.sh
