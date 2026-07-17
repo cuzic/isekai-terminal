@@ -377,6 +377,20 @@ fn resolve_tethering_interface(name: &str) -> Result<isekai_transport::Interface
         })
 }
 
+/// Opens `path` for this process's `env_logger` output (creating parent
+/// directories as needed, always appending — same "accumulate one history"
+/// convention as `isekai-ssh/src/log_file.rs::init_verbose`, which resolves
+/// to the same default path via `isekai_pipe_core::default_log_file()` when
+/// `ISEKAI_PIPE_LOG_FILE` wasn't explicitly overridden). Returns `None` on
+/// any I/O failure so the caller falls back to `stderr` rather than ever
+/// failing the connection over a logging nicety.
+fn open_log_file_target(path: &std::path::Path) -> Option<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
 pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitCode {
     let launch = match parse_connect(args) {
         Ok(Some(launch)) => launch,
@@ -384,10 +398,15 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
         Err(code) => return code,
     };
 
-    // stdout carries only the SSH byte stream (module docs/`stdout_purity.rs`
-    // e2e tests) — logs, including `isekai-transport`'s per-candidate-attempt
-    // telemetry, must go to stderr only, exactly like `isekai-pipe serve`'s
-    // own `env_logger` setup (`engine::run_from_args`).
+    // own `env_logger` setup (`engine::run_from_args`) — *unless*
+    // `isekai-ssh`'s wrapper set `ISEKAI_PIPE_LOG_FILE` (its default,
+    // no-flags-needed behavior: `wrapper.rs::run_ssh_once` sets this to
+    // keep this crate's own INFO/WARN diagnostic noise off the live
+    // interactive terminal by default, while `resume_loop.rs`'s hand-rolled
+    // `eprintln!`-based reconnect status stays on the real `stderr`
+    // regardless, since it never goes through `log`/`env_logger`). A
+    // missing/unwritable path just falls back to `stderr` — this must never
+    // block the connection over a logging nicety.
     //
     // Default level is `warn` (louder than that needs `RUST_LOG`) because
     // this is the *client-side* CLI a human watches interactively, unlike
@@ -397,22 +416,29 @@ pub(crate) async fn connect_command(args: impl Iterator<Item = String>) -> ExitC
     // interface switches (the old route going stale mid-roam) and is
     // already covered by `resume_loop`'s own `reconnected.`/`connection
     // lost...` status line, so surfacing it as a top-level `WARN` is just
-    // noise, not a new signal. The format also clears `resume_loop`'s live
-    // `\r`-redrawn reconnect-status line before every record: that line
-    // and `log::*!` calls both write to the same stderr with no other
-    // coordination, so without this a log line emitted mid-redraw corrupts
-    // the terminal (garbled/overlapping text).
-    let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    // noise, not a new signal. When actually writing to the real terminal
+    // (i.e. `ISEKAI_PIPE_LOG_FILE` wasn't set/openable), the format also
+    // clears `resume_loop`'s live `\r`-redrawn reconnect-status line before
+    // every record: that line and `log::*!` calls both write to the same
+    // stderr with no other coordination, so without this a log line emitted
+    // mid-redraw corrupts the terminal (garbled/overlapping text). Writing
+    // that same escape sequence into a log *file* would just fill it with
+    // control characters, so it's skipped whenever the target is a file.
+    let log_file_target = std::env::var_os("ISEKAI_PIPE_LOG_FILE").and_then(|path| open_log_file_target(std::path::Path::new(&path)));
+    let stderr_is_tty = log_file_target.is_none() && std::io::IsTerminal::is_terminal(&std::io::stderr());
     let default_format = env_logger::fmt::ConfigurableFormat::default();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,noq_udp=error"))
-        .target(env_logger::Target::Stderr)
-        .format(move |buf, record| {
-            if stderr_is_tty {
-                write!(buf, "\r\x1b[K")?;
-            }
-            default_format.format(buf, record)
-        })
-        .init();
+    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,noq_udp=error"));
+    builder.format(move |buf, record| {
+        if stderr_is_tty {
+            write!(buf, "\r\x1b[K")?;
+        }
+        default_format.format(buf, record)
+    });
+    match log_file_target {
+        Some(file) => builder.target(env_logger::Target::Pipe(Box::new(file))),
+        None => builder.target(env_logger::Target::Stderr),
+    };
+    builder.init();
 
     let profile_for_outcome = launch.profile.clone().unwrap_or_default();
     match run_connect(launch).await {
