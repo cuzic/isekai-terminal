@@ -504,12 +504,28 @@ fn print_reconnect_status(is_tty: bool, disconnected_at: Instant, resume_window:
     }
 }
 
-fn print_reconnect_success(is_tty: bool) {
+fn print_reconnect_success(is_tty: bool, session_id: isekai_transport::SessionId) {
     if is_tty {
         eprintln!("\r\x1b[0;32misekai-pipe connect: reconnected.\x1b[0m\x1b[K");
     } else {
         eprintln!("isekai-pipe connect: reconnected.");
     }
+    notify_os("isekai-pipe connect", &format!("Reconnected (session_id={session_id})."));
+}
+
+/// Best-effort OS-level notification (Windows toast / Linux desktop
+/// notification via D-Bus / macOS notification) for the two reconnect
+/// events a user should notice even if they're not looking at the terminal
+/// right now: a successful reconnect, and giving up entirely. This is a
+/// lightweight stand-in for a full tssh-style in-terminal overlay (a
+/// separate, larger follow-up) — deliberately not called for every
+/// individual backoff retry or transient failure, which would just spam
+/// notifications for what's usually a self-healing blip. Any failure
+/// (no notification daemon, headless environment, ...) is silently
+/// ignored — exactly like `isekai-ssh/src/log_file.rs`'s own philosophy,
+/// this must never be able to affect the connection itself.
+fn notify_os(summary: &str, body: &str) {
+    let _ = notify_rust::Notification::new().summary(summary).body(body).show();
 }
 
 /// TTY時のみ呼ばれる: 1回のバックオフ待機(`delay`)を最大1秒刻みに分割し、
@@ -631,7 +647,7 @@ async fn promote_warm_standby_once(
         return None;
     }
     log::info!("isekai-pipe connect: promoted warm-standby connection for session_id={}", state.session_id);
-    print_reconnect_success(state.is_tty);
+    print_reconnect_success(state.is_tty, state.session_id);
     match reestablish_control_stream(&promoted.connection, &target.session_secret, &state.counters).await {
         Ok(new_tasks) => state.app_ack_tasks = new_tasks,
         Err(e) => eprintln!(
@@ -699,6 +715,10 @@ async fn resume_with_backoff_until_deadline(
                  the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}.{last_error_suffix} \
                  Closing stdin/stdout; ssh will treat this as a lost connection.",
             );
+            notify_os(
+                "isekai-pipe connect",
+                &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
+            );
             let _ = stdout.shutdown().await;
             if let Some(t) = warm_standby_task {
                 t.abort();
@@ -746,7 +766,7 @@ async fn resume_with_backoff_until_deadline(
                     state.last_resume_error = Some(msg);
                     continue;
                 }
-                print_reconnect_success(state.is_tty);
+                print_reconnect_success(state.is_tty, state.session_id);
                 match reestablish_control_stream(&resumed.connection, &target.session_secret, &state.counters).await {
                     Ok(new_tasks) => state.app_ack_tasks = new_tasks,
                     Err(e) => eprintln!(
