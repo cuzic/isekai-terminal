@@ -20,7 +20,7 @@ pub use candidate::{
 
 mod profile;
 pub use profile::{
-    default_profiles_dir, load_persistent_profile, migrate_trust_store, update_persistent_profile,
+    default_log_file, default_profiles_dir, load_persistent_profile, migrate_trust_store, update_persistent_profile,
     write_persistent_profile, LegacyRelayTransport, PathHint, PersistentProfile, PERSISTENT_PROFILE_SCHEMA_VERSION,
 };
 

@@ -2,8 +2,11 @@ import XCTest
 @testable import IsekaiTerminalCore
 import IsekaiTerminalCoreLogic
 
-/// Phase 1D(#18b): `TerminalSessionController.onHostKey`のTOFU(Trust On First Use)
-/// ロジックの検証。実際のSSH接続は行わず、ホスト鍵確認ロジックだけを直接呼び出す。
+/// Phase 1D(#18b): `TerminalSessionController.onHostKey`のホスト鍵確認ロジックの検証。
+/// 未知ホストは自動trustせず`uiState.newHostKeyPrompt`を立てて一旦拒否し、
+/// `trustNewHostKey()`経由の明示的な信頼後にのみ受理する(Android版`TerminalSession.kt`の
+/// 既定`autoTrustNewHostKeys=false`と同じ方針、Codexアーキテクチャレビュー指摘の反映)。
+/// 実際のSSH接続は行わず、ホスト鍵確認ロジックだけを直接呼び出す。
 @MainActor
 final class TerminalSessionControllerTests: XCTestCase {
     private func makeController(host: String = "127.0.0.1") throws -> (TerminalSessionController, SshHostTrustStore) {
@@ -18,26 +21,64 @@ final class TerminalSessionControllerTests: XCTestCase {
         return (controller, trustStore)
     }
 
-    func testFirstConnectionAutoTrustsAndAccepts() throws {
+    func testFirstConnectionShowsPromptAndRejectsUntilTrusted() async throws {
         let (controller, trustStore) = try makeController()
 
-        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.newHostKeyPrompt != nil
+        }
+        XCTAssertEqual(controller.uiState.newHostKeyPrompt, NewHostKeyPrompt(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
 
         let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: "127.0.0.1", port: 22)
+        XCTAssertNil(trustStore.record(for: identifier))
+
+        controller.trustNewHostKey()
+
+        XCTAssertNil(controller.uiState.newHostKeyPrompt)
         XCTAssertEqual(trustStore.record(for: identifier)?.fingerprint, "SHA256:aaaa")
-    }
-
-    func testSameFingerprintOnSecondConnectionIsAccepted() throws {
-        let (controller, _) = try makeController()
-
-        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
         XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
     }
 
-    func testChangedFingerprintIsRejectedAndSurfacesFailure() async throws {
+    func testDismissNewHostKeyPromptDisconnectsWithoutTrusting() async throws {
+        let (controller, trustStore) = try makeController()
+
+        XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.newHostKeyPrompt != nil
+        }
+
+        controller.dismissNewHostKeyPrompt()
+
+        XCTAssertNil(controller.uiState.newHostKeyPrompt)
+        let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: "127.0.0.1", port: 22)
+        XCTAssertNil(trustStore.record(for: identifier))
+    }
+
+    func testSameFingerprintIsAcceptedAfterTrust() async throws {
         let (controller, _) = try makeController()
 
+        XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.newHostKeyPrompt != nil
+        }
+        controller.trustNewHostKey()
+
         XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+    }
+
+    func testChangedFingerprintAfterTrustIsRejectedAndSurfacesFailure() async throws {
+        let (controller, _) = try makeController()
+
+        XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.newHostKeyPrompt != nil
+        }
+        controller.trustNewHostKey()
+        XCTAssertTrue(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:aaaa"))
+
         XCTAssertFalse(controller.onHostKey(host: "127.0.0.1", port: 22, fingerprint: "SHA256:bbbb"))
 
         try await waitUntilFixtureCondition(timeout: 2) {
@@ -74,7 +115,9 @@ final class TerminalSessionControllerTests: XCTestCase {
             jumpUsername: "jumpuser",
             jumpKeyEntryId: "does-not-exist"
         )
-        let controller = TerminalSessionController(profile: profile, password: nil, db: db, vault: vault, trustStore: trustStore)
+        // 接続先自体はパスワード認証で解決させ(空パスワードバリデーション、タスク#7の対象外)、
+        // 踏み台側の鍵未検出だけを検証する。
+        let controller = TerminalSessionController(profile: profile, password: "mainpw", db: db, vault: vault, trustStore: trustStore)
 
         controller.connect()
 
@@ -113,6 +156,52 @@ final class TerminalSessionControllerTests: XCTestCase {
             XCTFail("expected .failed state, got \(controller.uiState.state)")
             return
         }
+    }
+
+    // MARK: - 認証バリデーション(Android版`AuthValidator`と対称、Codexレビュー指摘の反映)
+
+    func testConnectFailsWhenPasswordIsNilAndNoKeyEntrySet() async throws {
+        let db = try ProfileDatabase.inMemory()
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let vault = try CredentialVault(blobDirectory: tempDir, keychainService: "test.terminalsession.emptypw.\(UUID().uuidString)")
+        let trustStore = try SshHostTrustStore(storeURL: tempDir.appendingPathComponent("trust.json"))
+
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = TerminalSessionController(profile: profile, password: nil, db: db, vault: vault, trustStore: trustStore)
+
+        controller.connect()
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.state != .connecting
+        }
+        guard case .failed(let message) = controller.uiState.state else {
+            XCTFail("expected .failed state, got \(controller.uiState.state)")
+            return
+        }
+        XCTAssertTrue(message.contains("パスワード"))
+    }
+
+    func testConnectFailsWhenPasswordIsEmptyStringAndNoKeyEntrySet() async throws {
+        let db = try ProfileDatabase.inMemory()
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let vault = try CredentialVault(blobDirectory: tempDir, keychainService: "test.terminalsession.emptypw2.\(UUID().uuidString)")
+        let trustStore = try SshHostTrustStore(storeURL: tempDir.appendingPathComponent("trust.json"))
+
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = TerminalSessionController(profile: profile, password: "", db: db, vault: vault, trustStore: trustStore)
+
+        controller.connect()
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.state != .connecting
+        }
+        guard case .failed(let message) = controller.uiState.state else {
+            XCTFail("expected .failed state, got \(controller.uiState.state)")
+            return
+        }
+        XCTAssertTrue(message.contains("パスワード"))
     }
 
     // MARK: - Phase 1E-4: SSH agent署名要求の確認フロー
@@ -205,6 +294,21 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertEqual(config.cols, 100)
         XCTAssertEqual(config.rows, 40)
         XCTAssertEqual(config.jump, jump)
+        XCTAssertNil(config.bindPort)
+    }
+
+    // helperBindPortが以前は保存経路が無く常にnilになっていたバグの回帰テスト
+    // (Codexアーキテクチャレビュー指摘、ProfileEditView側の修正とセット)。
+    func testMakeIsekaiPipeQuicConfigMapsHelperBindPort() throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 2222, username: "user",
+            helperBindPort: 45823
+        )
+        let controller = try makeControllerWithProfile(profile)
+
+        let config = controller.makeIsekaiPipeQuicConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+        XCTAssertEqual(config.bindPort, 45823)
     }
 
     // MARK: - Phase 1E-5(#44): STUN+SSHランデブーP2P(config構築のみ、実接続なし)
@@ -302,6 +406,21 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertNil(config.wifiLocalIp)
         XCTAssertNil(config.cellularFd)
         XCTAssertNil(config.cellularLocalIp)
+        XCTAssertNil(config.bindPort)
+    }
+
+    // helperBindPortが以前は保存経路が無く常にnilになっていたバグの回帰テスト
+    // (Codexアーキテクチャレビュー指摘、ProfileEditView側の修正とセット)。
+    func testMakeMultipathIsekaiPipeQuicConfigMapsHelperBindPort() throws {
+        let profile = ConnectionProfile(
+            displayName: "test", host: "tailscale.example.com", port: 22, username: "user",
+            helperBindPort: 45823
+        )
+        let controller = try makeControllerWithProfile(profile)
+
+        let config = controller.makeMultipathIsekaiPipeQuicConfig(auth: .password(password: "pw"), jump: nil, cols: 80, rows: 24)
+
+        XCTAssertEqual(config.bindPort, 45823)
     }
 
     func testMakeMultipathIsekaiPipeQuicConfigTreatsBlankDirectAddressAsNil() throws {

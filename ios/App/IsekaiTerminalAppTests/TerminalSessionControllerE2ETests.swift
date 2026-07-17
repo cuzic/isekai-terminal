@@ -37,13 +37,38 @@ final class TerminalSessionControllerE2ETests: XCTestCase {
         let controller = TerminalSessionController(profile: profile, password: nil, db: db, vault: vault, trustStore: trustStore)
         controller.connect()
 
-        try await waitUntilE2ECondition(timeout: 10) {
+        // 未知ホストは自動trustされないため(タスク#6、Codexアーキテクチャレビュー指摘の反映)、
+        // 一旦拒否されて確認ダイアログが立ってから、明示的にtrustして再接続する必要がある。
+        try await waitUntilE2ECondition(timeout: 20) {
+            await controller.uiState.newHostKeyPrompt != nil
+        }
+        controller.trustNewHostKey()
+
+        // `onHostKey`が`newHostKeyPrompt`を立てるのと、その接続試行自体が失敗して
+        // `uiState.state`が`.failed`/`.disconnected`へ遷移するのは、どちらも別々の
+        // `Task { @MainActor in }`経由の非同期通知で順序保証が無い(`TerminalSessionController.swift`
+        // の`onHostKey`/`reconnect()`参照)。`newHostKeyPrompt`が立った直後にまだ`.connecting`の
+        // ままここで`reconnect()`を呼ぶと、`reconnect()`の二重接続防止ガードに無視されて
+        // 二度と再接続されないまま後続の`.connected`待ちがタイムアウトする実際のレースが
+        // あったため、`reconnect()`を許可する状態(`.failed`/`.disconnected`)へ遷移し終わるのを
+        // 先に待つ。
+        try await waitUntilE2ECondition(timeout: 20) {
+            switch await controller.uiState.state {
+            case .failed, .disconnected:
+                return true
+            default:
+                return false
+            }
+        }
+        controller.reconnect()
+
+        try await waitUntilE2ECondition(timeout: 20) {
             await controller.uiState.state == .connected
         }
 
         controller.send(Data("echo hello\n".utf8))
 
-        try await waitUntilE2ECondition(timeout: 10) {
+        try await waitUntilE2ECondition(timeout: 20) {
             await controller.uiState.latestScreenUpdate != nil
         }
 

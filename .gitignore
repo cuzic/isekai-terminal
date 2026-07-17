@@ -8,6 +8,9 @@
 
 # Rust build
 /rust-core/target/
+# noq-multipath-spikeは独立したworkspace root(rust-core/noq-multipath-spike/Cargo.toml
+# の空[workspace]テーブル参照)のため、自分専用のtarget/を持つ。
+/rust-core/noq-multipath-spike/target/
 # cargoBuildRustCore Gradle task regenerates this; do not commit prebuilt binaries.
 /android/src/main/jniLibs/
 # build-ios-xcframework.sh regenerates this; do not commit prebuilt binaries.

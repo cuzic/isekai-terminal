@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 import IsekaiTerminalCoreLogic
 
 /// SSH agentへの署名要求。ユーザーが承認/拒否した結果を`respond`で
@@ -9,6 +10,14 @@ public struct AgentSignRequest: Sendable {
     public let id = UUID()
     public let fingerprint: String
     let respond: @Sendable (Bool) -> Void
+}
+
+/// 初回接続(未知ホスト)の確認待ち。Android版`NewHostKeyPrompt`(`UiState.kt`)と対称。
+/// 非nilの間、確認ダイアログを表示する(`TerminalView`の`.alert`参照)。
+public struct NewHostKeyPrompt: Equatable, Sendable {
+    public let host: String
+    public let port: UInt16
+    public let fingerprint: String
 }
 
 /// Phase 1D: ターミナル本画面のSSH接続状態。UI(`TerminalView`)はこれだけを見て
@@ -34,12 +43,21 @@ public final class TerminalUIState: ObservableObject {
     @Published public internal(set) var latestScreenUpdate: ScreenUpdate?
     /// Phase 1E-4: SSH agentへの署名要求。非nilの間、確認ダイアログを表示する。
     @Published public internal(set) var pendingAgentSignRequest: AgentSignRequest?
+    /// 初回接続(未知ホスト)の確認待ち。非nilの間、確認ダイアログを表示する
+    /// (Android版`uiState.newHostKeyPrompt`と対称、`.claude/rules/rust-ssot.md`に
+    /// 沿い、未知ホストの自動trustはせずユーザー確認を必須にする)。
+    @Published public internal(set) var newHostKeyPrompt: NewHostKeyPrompt?
     /// Phase 1C(#25): trzszファイル転送の状態。非nilの間、転送シートを表示する。
     @Published public internal(set) var trzszState: TrzszUiState?
     /// Phase 1C(#25): ダウンロード完了後、ユーザーがFilesアプリ等へ保存できる
     /// 一時ファイルのURL。`trzszState`が`.done(success: true, ...)`かつダウンロード
     /// だった場合のみ設定される。
     @Published public internal(set) var completedDownloadURL: URL?
+    /// Phase 9-6(#16): マルチパスtransportの`RebindManager`状態(WiFi/セルラー
+    /// フェイルオーバー/復帰待ち)。マルチパス以外のtransportでは常にnil。表示可否の
+    /// 判定は`RebindPublicState`だけを見て行う(Android版`TerminalScreen.kt`と同じ、
+    /// rust-ssot.md準拠 — Swift側で独自のミラー状態は持たない)。
+    @Published public internal(set) var rebindState: RebindPublicState?
 
     // `TerminalSessionController`(非isolated)のstored property初期値として
     // 構築されるため、`nonisolated`にして呼び出し側のコンテキストを問わず
@@ -70,6 +88,7 @@ let defaultStunServer = "stun.l.google.com:19302"
 /// `Task { @MainActor in }`で明示的に受け渡す。
 public final class TerminalSessionController: OrchestratorCallback, @unchecked Sendable {
     public let uiState = TerminalUIState()
+    private static let logger = Logger(subsystem: "tools.isekai.terminal", category: "ssh")
 
     private let profile: ConnectionProfile
     private let password: String?
@@ -110,6 +129,10 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// debounce/coalesceの判断自体はRust側([`crate::net_health_policy`])に集約されている
     /// (`.claude/rules/rust-ssot.md`)。
     private let networkPathMonitor = NWPathMonitor()
+    /// Phase 9-6(#15/#16): `RebindManager`(Rust側)がWiFi/セルラーのfdを要求してきたら
+    /// 取得して返すだけの実装(判断はしない、rust-ssot.md準拠)。Android版
+    /// `PhysicalPathProvider`のiOS版。
+    private let physicalPathProvider = PhysicalPathProvider()
 
     public init(
         profile: ConnectionProfile,
@@ -235,7 +258,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             cols: cols,
             rows: rows,
             jump: jump,
-            bindPort: nil
+            bindPort: profile.helperBindPort.flatMap { UInt16(exactly: $0) }
         )
     }
 
@@ -301,7 +324,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             cols: cols,
             rows: rows,
             jump: jump,
-            bindPort: nil
+            bindPort: profile.helperBindPort.flatMap { UInt16(exactly: $0) }
         )
     }
 
@@ -376,9 +399,16 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// `keyEntryId`があればCredentialVaultから秘密鍵を復号して`.publicKey`認証を、
     /// 無ければ渡された`password`で`.password`認証を組み立てる。
     /// 失敗時は`fail(message:)`を呼びnilを返す。
+    /// Android版`AuthValidator.validate`と同じ方針: パスワード認証で`password`が
+    /// nil/空文字の場合はサーバーへ送らずここで拒否する(Codexアーキテクチャレビュー指摘:
+    /// 旧実装は`password ?? ""`で空文字のまま認証を組み立てていた)。
     private func resolveAuth(keyEntryId: String?, password: String?, label: String) -> SshAuth? {
         guard let keyEntryId else {
-            return .password(password: password ?? "")
+            guard let password, !password.isEmpty else {
+                fail(message: "\(label)のパスワードが必要です")
+                return nil
+            }
+            return .password(password: password)
         }
         guard let keyEntry = try? db.fetchKeyEntry(id: keyEntryId) else {
             fail(message: "\(label)の鍵情報が見つかりません")
@@ -423,6 +453,13 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         orchestrator.cancelReconnect()
     }
 
+    /// Phase 9-6(#16): 「今すぐWiFiに戻す」。マルチパス以外のセッションでは呼んでも
+    /// Rust側で無視される(Android版`TerminalSession.forceReturnToWifi()`と同じ、
+    /// 判断はRust側`RebindManager`に委ねる)。
+    public func forceReturnToWifi() {
+        orchestrator.forceReturnToWifi()
+    }
+
     // MARK: - #20: バックグラウンド/フォアグラウンド遷移
     //
     // 生イベントをそのままRust側`SessionOrchestrator`へ転送するだけの薄いラッパー。
@@ -450,6 +487,12 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// 通知と手動ボタンの両方から呼ばれ得るため)。`connect()`と同じ
     /// cols/rows・認証情報でセッションを最初から作り直す(Rust側にresumeできる
     /// 論理セッションの概念はまだ無いため、既存セッションはただ破棄する)。
+    /// Rust側`SessionOrchestrator::begin_connect`は`Connected`中の新規接続を
+    /// (pending debounceのキャンセル+別セッションへの切り替えという内部経路のため)
+    /// 意図的に許可しているが、ここでの`.connected`チェックはその判断を先取りしている
+    /// のではなく、「バックグラウンド復帰通知と手動ボタンの両方から呼ばれ得るこの
+    /// メソッド自身が誤って二重に走らないようにする」UI側の二重サブミット防止
+    /// (Codexアーキテクチャレビューで指摘・確認済み、Android版`guardedConnect`と同種)。
     @MainActor
     public func reconnect() {
         switch uiState.state {
@@ -462,6 +505,27 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
             uiState.latestScreenUpdate = nil
             connect(cols: lastCols, rows: lastRows)
         }
+    }
+
+    // MARK: - Host key
+
+    /// 初回接続確認ダイアログで「信頼して接続」を選んだ時に呼ぶ。trust storeを更新するのみで、
+    /// 接続自体は(Android版`TerminalSession.kt`の`trustNewHostKey()`と同様)ユーザーが手動で
+    /// 再接続する想定(`.failed`状態で表示される`reconnectButton`、`reconnect()`参照)。
+    @MainActor
+    public func trustNewHostKey() {
+        guard let prompt = uiState.newHostKeyPrompt else { return }
+        uiState.newHostKeyPrompt = nil
+        let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: prompt.host, port: prompt.port)
+        try? trustStore.trust(identifier: identifier, keyType: "ssh", fingerprint: prompt.fingerprint)
+    }
+
+    /// 初回接続確認ダイアログで「キャンセル」を選んだ時に呼ぶ。trust storeは更新せず切断する
+    /// (Android版`TerminalSession.kt`の`dismissNewHostKeyPrompt()`と同じ方針)。
+    @MainActor
+    public func dismissNewHostKeyPrompt() {
+        uiState.newHostKeyPrompt = nil
+        disconnect()
     }
 
     /// Phase 1F-4(#51): スクロールバックのスワイプUI用。Android版
@@ -594,16 +658,16 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         Task { @MainActor in self.uiState.latestScreenUpdate = update }
     }
 
-    /// ホスト鍵確認。iOS版は暫定的にTOFU(Trust On First Use)方式を採る
-    /// (Android版`TerminalSession.kt`の`onHostKey`と同じ方針): 初回接続は
-    /// 自動的に信頼して記録し、fingerprintが変化した場合のみ拒否する。
-    /// `SshHostTrustStore`自体は対話的な確認UIを前提にした設計コメントが
-    /// 付いているが、このcallbackはRustスレッドから同期的にBoolを返す必要があり
-    /// (接続処理をブロックしてまでUI確認を待つ設計は複雑さに見合わないため)、
-    /// 最初の実装ではAndroidと同じ自動信頼方式を踏襲する。対話的な確認UIへの
-    /// 格上げは将来の改善候補(PLAN.md参照)。渡された`host`/`port`をそのまま使う
-    /// (`profile.host`ではなく)ことで、踏み台経由接続でホップ先のホスト鍵が届いた
-    /// 場合にも正しいホストで検証できる(Android版`TerminalSession.kt`の
+    /// ホスト鍵確認。Android版`TerminalSession.kt`の`onHostKey`(既定設定
+    /// `autoTrustNewHostKeys=false`)と同じ方針: 初回接続(未知ホスト)は自動信頼せず、
+    /// `uiState.newHostKeyPrompt`を立てて一旦接続を失敗させ、ユーザーが`trustNewHostKey()`
+    /// で明示的に信頼した後の手動再接続に委ねる(未知ホストの自動trustは、悪性DNS/公衆Wi-Fi
+    /// 経由のMITMで攻撃者鍵をそのまま初回登録してしまう実害のあるセキュリティギャップだった
+    /// ——Codexアーキテクチャレビューで指摘、旧実装は自動trustしていた)。このcallbackは
+    /// Rustスレッドから同期的にBoolを返す必要があるため、確認ダイアログの表示自体は
+    /// `Task { @MainActor in }`経由でuiStateへ反映しつつ、戻り値はここで即座に`false`を返す。
+    /// 渡された`host`/`port`をそのまま使う(`profile.host`ではなく)ことで、踏み台経由接続で
+    /// ホップ先のホスト鍵が届いた場合にも正しいホストで検証できる(Android版`TerminalSession.kt`の
     /// `onHostKey(host, port, fingerprint)`と同じ方針)。
     public func onHostKey(host: String, port: UInt16, fingerprint: String) -> Bool {
         let identifier = SshHostTrustStore.makeIdentifier(kind: .sshHost, host: host, port: port)
@@ -611,8 +675,10 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         case .trustedMatch:
             return true
         case .unknownHost:
-            try? trustStore.trust(identifier: identifier, keyType: "ssh", fingerprint: fingerprint)
-            return true
+            Task { @MainActor in
+                self.uiState.newHostKeyPrompt = NewHostKeyPrompt(host: host, port: port, fingerprint: fingerprint)
+            }
+            return false
         case .mismatch:
             fail(message: "ホスト鍵が変更されています(なりすましの可能性)。接続を中止しました。")
             return false
@@ -668,8 +734,23 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         }
     }
 
+    /// 物理multipathのfd取得自体がiOSでは未実装のため(タスク#12参照)、Android版
+    /// `onNoViablePath`のようなupstream failover実装は対象外のまま(no-op)にしている。
     public func onNoViablePath() {}
-    public func onForwardStateChanged(id: String, state: ForwardState) {}
+
+    /// ポートフォワードの状態変化をログへ出力する(Android版`TerminalSession.kt`の
+    /// `onForwardStateChanged`と同じくログのみ、UI状態には反映しない)。以前はno-opで
+    /// Rustからの通知が失われていた(Codexアーキテクチャレビュー指摘)。
+    public func onForwardStateChanged(id: String, state: ForwardState) {
+        switch state {
+        case .listening:
+            Self.logger.info("port forward '\(id, privacy: .public)': listening")
+        case .failed(let reason):
+            Self.logger.warning("port forward '\(id, privacy: .public)': failed: \(reason, privacy: .public)")
+        case .stopped:
+            Self.logger.info("port forward '\(id, privacy: .public)': stopped")
+        }
+    }
 
     /// SSH agentへの署名要求。Android版`AgentSignConfirmDialog`と同じく、要求ごとに
     /// ユーザー確認を必須とする。このcallbackはRustスレッドから同期的にBoolを
@@ -715,17 +796,30 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
 
     // MARK: - RebindManager (PLAN.md Phase 9-6)
     //
-    // iOS版のPhysicalPathProvider相当(IP_BOUND_IF/IPV6_BOUND_IFベースのWiFi/セルラー
-    // 個別バインド)は未実装(TODO、Android版`PhysicalPathProvider`を参照)。
-    // 判断は一切せずfdを取得して返すだけという契約(`rust-ssot.md`)なので、
-    // 未実装の間は常に`nil`を返す — RebindManager(Rust側)はfdが取れない場合を
-    // 正常系として扱う設計になっており、日和見的にセルラーへのフェイルオーバー/
-    // WiFiへの復帰が単に起きないだけで、既存のQUIC自身のローミング耐性
+    // iOS版のPhysicalPathProvider相当(IP_BOUND_IFベースのWiFi/セルラー個別バインド、#15)を
+    // `physicalPathProvider`に実装済み。判断は一切せずfdを取得して返すだけという契約
+    // (`rust-ssot.md`)で、取得できなければ`nil`を返す — RebindManager(Rust側)はfdが
+    // 取れない場合を正常系として扱う設計になっており、日和見的にセルラーへの
+    // フェイルオーバー/WiFiへの復帰が単に起きないだけで、既存のQUIC自身のローミング耐性
     // (`notifyNetworkPathChanged`)には影響しない。
+    //
+    // これらのcallbackはRustのspawn_blockingスレッドから同期的に呼ばれる
+    // (`onHostKey`/`onAgentSignRequest`と同じ方式)。`physicalPathProvider`側も
+    // `DispatchSemaphore`で同期的にブロックして待つ実装になっているため、
+    // ここでは追加のスレッド橋渡しをせずそのまま返す。
 
-    public func onRequestWifiFd() -> PlatformFd? { nil }
+    public func onRequestWifiFd() -> PlatformFd? {
+        physicalPathProvider.acquireWifiFd().map { PlatformFd(fd: $0.fd, localIp: $0.localIp) }
+    }
 
-    public func onRequestCellularFd() -> PlatformFd? { nil }
+    public func onRequestCellularFd() -> PlatformFd? {
+        physicalPathProvider.acquireCellularFd().map { PlatformFd(fd: $0.fd, localIp: $0.localIp) }
+    }
 
-    public func onRebindStateChanged(state: RebindPublicState) {}
+    /// #19: `RebindManager`の状態が変化した。判定はこの値だけを見て行い(rust-ssot.md準拠)、
+    /// UI側で独自のミラー状態は持たない(Android版`TerminalSession.kt`の
+    /// `onRebindStateChanged`と同じ)。
+    public func onRebindStateChanged(state: RebindPublicState) {
+        Task { @MainActor in self.uiState.rebindState = state }
+    }
 }

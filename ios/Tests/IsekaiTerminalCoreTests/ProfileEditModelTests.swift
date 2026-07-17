@@ -340,6 +340,76 @@ final class ProfileEditModelTests: XCTestCase {
         XCTAssertEqual(model.directAddress, "203.0.113.5:4433")
     }
 
+    // MARK: - isekai-helper QUIC待受ポート固定(以前はUI自体が存在せず常にnilになっていた
+    // バグの回帰テスト、Codexアーキテクチャレビュー指摘)
+
+    func testUsesHelperBindPortForHelperQuicTransports() {
+        let model = ProfileEditModel(profile: nil, db: try! ProfileDatabase.inMemory())
+
+        for preference in [StoredTransportPreference.isekaiHelperQuic, .auto, .isekaiHelperQuicMultipath] {
+            model.transportPreference = preference
+            XCTAssertTrue(model.usesHelperBindPort, "\(preference) should show the helper bind port field")
+        }
+        for preference in [StoredTransportPreference.plainSsh, .isekaiStunP2pQuic, .isekaiLinkRelayQuic] {
+            model.transportPreference = preference
+            XCTAssertFalse(model.usesHelperBindPort, "\(preference) should not show the helper bind port field")
+        }
+    }
+
+    func testSavePersistsHelperBindPort() throws {
+        let db = try ProfileDatabase.inMemory()
+        let model = ProfileEditModel(profile: nil, db: db)
+        model.displayName = "dev box"
+        model.host = "127.0.0.1"
+        model.username = "tester"
+        model.transportPreference = .isekaiHelperQuic
+        model.helperBindPort = "45823"
+
+        XCTAssertTrue(model.save())
+
+        let saved = try XCTUnwrap(try db.fetchAllProfiles().first)
+        XCTAssertEqual(saved.helperBindPort, 45823)
+    }
+
+    func testSaveWithBlankHelperBindPortPersistsNil() throws {
+        let db = try ProfileDatabase.inMemory()
+        let model = ProfileEditModel(profile: nil, db: db)
+        model.displayName = "dev box"
+        model.host = "127.0.0.1"
+        model.username = "tester"
+        model.helperBindPort = "   "
+
+        XCTAssertTrue(model.save())
+
+        let saved = try XCTUnwrap(try db.fetchAllProfiles().first)
+        XCTAssertNil(saved.helperBindPort)
+    }
+
+    func testSaveFailsWithOutOfRangeHelperBindPort() throws {
+        let db = try ProfileDatabase.inMemory()
+        let model = ProfileEditModel(profile: nil, db: db)
+        model.displayName = "dev box"
+        model.host = "127.0.0.1"
+        model.username = "tester"
+        model.helperBindPort = "80"
+
+        XCTAssertFalse(model.save())
+        XCTAssertNotNil(model.errorMessage)
+    }
+
+    func testEditingExistingProfileRestoresHelperBindPort() throws {
+        let db = try ProfileDatabase.inMemory()
+        var profile = ConnectionProfile(
+            displayName: "existing", host: "example.com", port: 22, username: "user",
+            helperBindPort: 45823
+        )
+        try db.insert(profile: &profile)
+
+        let model = ProfileEditModel(profile: profile, db: db)
+
+        XCTAssertEqual(model.helperBindPort, "45823")
+    }
+
     // MARK: - Phase 1F-3(#50): 配色テーマ上書き
 
     func testDefaultThemeNameIsNil() {

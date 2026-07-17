@@ -12,6 +12,51 @@ final class AppLaunchUITests: XCTestCase {
         continueAfterFailure = false
     }
 
+    /// SwiftUIのTextField/SecureFieldは`.tap()`直後にまだキーボードフォーカスが
+    /// 確定していないことがあり、続けて`.typeText()`すると稀に「Neither element
+    /// nor any descendant has keyboard focus」で失敗する(CI実行時に
+    /// `testPasswordAuthProfileTapShowsPasswordPrompt`で実際に発生・確認済み。
+    /// 他の全テストも同じ`tap()`直後`typeText()`パターンを使っており、今回たまたま
+    /// このテストで顕在化しただけで、いつ他のテストで再発してもおかしくない)。
+    /// `XCUIElement.hasKeyboardFocus`はこのプロジェクトのdeployment target(iOS 16)
+    /// 向けビルドでは使えない(`error: value of type 'XCUIElement' has no member
+    /// 'hasKeyboardFocus'`)ため、代わりにキーボード自体の出現をXCUITestの標準的な
+    /// 手法(`app.keyboards.element`)で待つ。
+    private func ensureFocus(_ field: XCUIElement, timeout: TimeInterval = 5) {
+        XCTAssertTrue(field.waitForExistence(timeout: timeout))
+        field.tap()
+        if !XCUIApplication().keyboards.element.waitForExistence(timeout: 3) {
+            field.tap() // 最後にもう一度だけリトライする
+            // Codexレビュー指摘: リトライ後も再度キーボード出現を待たないと、
+            // typeText()がフォーカス未確定のまま呼ばれてしまいレース対策として
+            // 不十分だった。ここで明示的に失敗させる。
+            XCTAssertTrue(XCUIApplication().keyboards.element.waitForExistence(timeout: 3))
+        }
+    }
+
+    private func focusAndType(_ field: XCUIElement, _ text: String) {
+        ensureFocus(field)
+        field.typeText(text)
+    }
+
+    /// 新規行の保存/生成直後、`AppServices.shared`が実DB(タスク間でリセットされない、
+    /// このファイル冒頭のコメント参照)を使い続けるため、テストを重ねるほどList内の
+    /// 行数が増え、`displayName`昇順ソート次第では新規行が画面外に留まり得る
+    /// (`ProfileDatabase.swift`の`.order(Column("displayName"))`参照)。SwiftUIの`List`は
+    /// 画面外のセルをアクセシビリティツリーへ出さないことがあるため、
+    /// `waitForExistence`だけでは検出できない(Codexレビュー指摘、
+    /// `testAddProfileFlowCreatesNewProfileRow`の実際の失敗)。見つかるまでスクロールする。
+    @discardableResult
+    private func waitForRowVisible(_ label: String, app: XCUIApplication, scrollContainer: XCUIElement, timeout: TimeInterval = 10) -> XCUIElement {
+        let row = app.staticTexts[label]
+        let deadline = Date().addingTimeInterval(timeout)
+        while !row.exists && Date() < deadline {
+            scrollContainer.swipeUp()
+        }
+        XCTAssertTrue(row.waitForExistence(timeout: 2), "row \(label) never became visible even after scrolling")
+        return row
+    }
+
     func testAppLaunchesToProfileList() throws {
         let app = XCUIApplication()
         app.launch()
@@ -34,23 +79,13 @@ final class AppLaunchUITests: XCTestCase {
         XCTAssertTrue(app.buttons["addProfileButton"].waitForExistence(timeout: 10))
         app.buttons["addProfileButton"].tap()
 
-        let labelField = app.textFields["profileLabelField"]
-        XCTAssertTrue(labelField.waitForExistence(timeout: 5))
-        labelField.tap()
-        labelField.typeText(label)
-
-        let hostField = app.textFields["profileHostField"]
-        hostField.tap()
-        hostField.typeText("127.0.0.1")
-
-        let usernameField = app.textFields["profileUsernameField"]
-        usernameField.tap()
-        usernameField.typeText("tester")
+        focusAndType(app.textFields["profileLabelField"], label)
+        focusAndType(app.textFields["profileHostField"], "127.0.0.1")
+        focusAndType(app.textFields["profileUsernameField"], "tester")
 
         app.buttons["saveProfileButton"].tap()
 
-        let newRow = app.staticTexts[label]
-        XCTAssertTrue(newRow.waitForExistence(timeout: 5))
+        waitForRowVisible(label, app: app, scrollContainer: app.collectionViews["profileList"])
     }
 
     func testDeleteProfileRemovesRow() throws {
@@ -62,12 +97,9 @@ final class AppLaunchUITests: XCTestCase {
         XCTAssertTrue(app.buttons["addProfileButton"].waitForExistence(timeout: 10))
         app.buttons["addProfileButton"].tap()
 
-        app.textFields["profileLabelField"].tap()
-        app.textFields["profileLabelField"].typeText(label)
-        app.textFields["profileHostField"].tap()
-        app.textFields["profileHostField"].typeText("127.0.0.1")
-        app.textFields["profileUsernameField"].tap()
-        app.textFields["profileUsernameField"].typeText("tester")
+        focusAndType(app.textFields["profileLabelField"], label)
+        focusAndType(app.textFields["profileHostField"], "127.0.0.1")
+        focusAndType(app.textFields["profileUsernameField"], "tester")
         app.buttons["saveProfileButton"].tap()
 
         let row = app.staticTexts[label]
@@ -101,20 +133,22 @@ final class AppLaunchUITests: XCTestCase {
         XCTAssertTrue(app.buttons["generateKeyButton"].waitForExistence(timeout: 5))
         app.buttons["generateKeyButton"].tap()
 
-        let generateLabelField = app.textFields["generateKeyLabelField"]
-        XCTAssertTrue(generateLabelField.waitForExistence(timeout: 5))
-        generateLabelField.tap()
-        generateLabelField.typeText(label)
+        focusAndType(app.textFields["generateKeyLabelField"], label)
 
         app.buttons["confirmGenerateKeyButton"].tap()
 
-        // 生成後の「鍵を生成しました」アラートを閉じる。
+        // 生成後の「鍵を生成しました」アラートを閉じる。sheetのdismissアニメーションと
+        // このalertの提示が重ならないよう本番側(`KeyListView.swift`)を直したので、単純な
+        // 存在待ち+tapで十分なはず。`isHittable`述語での追加待ち(`tapWhenHittable`)は
+        // 一度試したが、alertボタンに対して`isHittable`評価自体が「Failed to determine
+        // hittability ... Activation point invalid」という別の実際のCI失敗を起こしたため
+        // 撤回した(根本原因は本番側の修正で解消済みのはずで、この評価はむしろ余計な
+        // 失敗要因だった)。
         let dismissButton = app.alerts["鍵を生成しました"].buttons["閉じる"]
-        XCTAssertTrue(dismissButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(dismissButton.waitForExistence(timeout: 10))
         dismissButton.tap()
 
-        let newKeyRow = app.staticTexts[label]
-        XCTAssertTrue(newKeyRow.waitForExistence(timeout: 5))
+        waitForRowVisible(label, app: app, scrollContainer: app.collectionViews["keyList"])
     }
 
     func testEditProfileFlowUpdatesRow() throws {
@@ -125,12 +159,9 @@ final class AppLaunchUITests: XCTestCase {
         let renamedLabel = "UITest-Edited-\(UUID().uuidString.prefix(8))"
 
         app.buttons["addProfileButton"].tap()
-        app.textFields["profileLabelField"].tap()
-        app.textFields["profileLabelField"].typeText(originalLabel)
-        app.textFields["profileHostField"].tap()
-        app.textFields["profileHostField"].typeText("127.0.0.1")
-        app.textFields["profileUsernameField"].tap()
-        app.textFields["profileUsernameField"].typeText("tester")
+        focusAndType(app.textFields["profileLabelField"], originalLabel)
+        focusAndType(app.textFields["profileHostField"], "127.0.0.1")
+        focusAndType(app.textFields["profileUsernameField"], "tester")
         app.buttons["saveProfileButton"].tap()
 
         let originalRow = app.staticTexts[originalLabel]
@@ -142,11 +173,10 @@ final class AppLaunchUITests: XCTestCase {
         editSwipeButton.tap()
 
         let labelField = app.textFields["profileLabelField"]
-        XCTAssertTrue(labelField.waitForExistence(timeout: 5))
         // 既存の値をクリアしてから新しいラベルを入力する
         // (タップ直後はカーソルが末尾付近にある前提でbackspaceを繰り返す、
         // XCUITestでテキストフィールドをクリアする定番の方法)。
-        labelField.tap()
+        ensureFocus(labelField)
         if let existing = labelField.value as? String {
             labelField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: existing.count))
         }
@@ -169,18 +199,13 @@ final class AppLaunchUITests: XCTestCase {
         XCTAssertTrue(app.buttons["importKeyButton"].waitForExistence(timeout: 5))
         app.buttons["importKeyButton"].tap()
 
-        let importLabelField = app.textFields["keyImportLabelField"]
-        XCTAssertTrue(importLabelField.waitForExistence(timeout: 5))
-        importLabelField.tap()
-        importLabelField.typeText(label)
+        focusAndType(app.textFields["keyImportLabelField"], label)
 
         // TextField(axis: .vertical)がtextFields/textViewsのどちらでアクセシビリティ
         // 公開されるか(iOSバージョンにより異なりうる)不確定なため、要素種別を問わない
         // クエリで探す。
         let pasteField = app.descendants(matching: .any)["keyImportPasteField"]
-        XCTAssertTrue(pasteField.waitForExistence(timeout: 5))
-        pasteField.tap()
-        pasteField.typeText("-----BEGIN OPENSSH PRIVATE KEY-----\ndummy-for-ui-test\n-----END OPENSSH PRIVATE KEY-----\n")
+        focusAndType(pasteField, "-----BEGIN OPENSSH PRIVATE KEY-----\ndummy-for-ui-test\n-----END OPENSSH PRIVATE KEY-----\n")
 
         app.buttons["saveImportedKeyButton"].tap()
 
@@ -194,12 +219,9 @@ final class AppLaunchUITests: XCTestCase {
         let label = "UITest-PwPrompt-\(UUID().uuidString.prefix(8))"
 
         app.buttons["addProfileButton"].tap()
-        app.textFields["profileLabelField"].tap()
-        app.textFields["profileLabelField"].typeText(label)
-        app.textFields["profileHostField"].tap()
-        app.textFields["profileHostField"].typeText("127.0.0.1")
-        app.textFields["profileUsernameField"].tap()
-        app.textFields["profileUsernameField"].typeText("tester")
+        focusAndType(app.textFields["profileLabelField"], label)
+        focusAndType(app.textFields["profileHostField"], "127.0.0.1")
+        focusAndType(app.textFields["profileUsernameField"], "tester")
         // 認証方式は既定でパスワード(鍵は選択しない)。
         app.buttons["saveProfileButton"].tap()
 

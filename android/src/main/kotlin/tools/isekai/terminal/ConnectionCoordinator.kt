@@ -52,6 +52,11 @@ internal class ConnectionCoordinator(
         val current = pane.session.state.value
         // isReconnecting中はRust側が自動再接続ループを動かしているので、手動での
         // 二重接続を防ぐ(先にcancelReconnectPaneでループを止めてから再接続すべき)。
+        // connected/isConnectingのチェックは、Rust側`begin_connect`が`Connected`中の
+        // 新規接続を(内部的なtransport切り替え経路として)意図的に許可しているのとは別の
+        // 目的で、「タブが接続済み/接続中の間はUIの接続アクションを無視する」という
+        // UI側の二重サブミット防止(Codexアーキテクチャレビューで指摘・確認済み、
+        // `TerminalSession.guardedConnect`と同種)。
         if (current.connected || current.isConnecting || current.isReconnecting) return
         // Task #10: 前回の接続試行が一度もConnectedへ遷移しないまま再接続された場合、
         // observeConnectionTransitionsのdisconnect分岐を経由しないため、ここで明示的に
