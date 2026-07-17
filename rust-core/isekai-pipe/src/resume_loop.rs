@@ -114,26 +114,54 @@ impl BusyOtherSessionSignal for isekai_transport::SequentialConnectError {
     }
 }
 
+/// Extra slack added on top of `resume_window_for(...)` for the
+/// `BUSY_OTHER_SESSION` retry loop specifically — found necessary 2026-07-17
+/// after a real Windows sleep/wake: this client's own retry loop starts
+/// counting down from the moment *it* first gets rejected, but the remote
+/// helper only starts *its* park-expiry countdown once its own QUIC
+/// `--idle-timeout` (15s by default, `engine/mod.rs`) notices the old
+/// connection is dead — which happens strictly later than this client's
+/// first rejection. Without this buffer the two windows are the same
+/// length but different start times, so this client's deadline always
+/// elapses first, by roughly the helper's idle-timeout detection latency
+/// (observed: gave up 16s before the helper actually freed the slot).
+/// `BUSY_OTHER_SESSION` is specifically a self-clearing condition (unlike
+/// a genuinely unreachable target), so erring generously here is safe.
+const BUSY_OTHER_SESSION_EXTRA_PATIENCE: Duration = Duration::from_secs(30);
+
 /// Retries `attempt` while — and only while — it fails with
 /// `BUSY_OTHER_SESSION`, for up to `resume_window_for(requested_resume_grace_secs)`
-/// (the same deadline a resume loop would use, since a `BUSY_OTHER_SESSION`
-/// reject on the very first connect most often means *this same client's*
-/// previous session is still parked on the remote helper, waiting out that
-/// exact window after an earlier ungraceful disconnect — see
-/// `TransportError::is_busy_other_session`'s docs). Every other failure is
-/// returned immediately on the first attempt, unchanged from before this
-/// wrapper existed: this only closes the gap where a fresh `isekai-pipe
-/// connect` process (a brand new `session_id` every time, since neither
-/// `connect_via_relay_resumable` nor `_with_fallback` persist one across
-/// invocations) would otherwise fail outright instead of waiting the same
-/// window a same-process resume would have.
-async fn retry_while_busy_other_session<T, E, F, Fut>(requested_resume_grace_secs: u32, mut attempt: F) -> Result<T, E>
+/// plus [`BUSY_OTHER_SESSION_EXTRA_PATIENCE`] (the same deadline a resume loop
+/// would use, since a `BUSY_OTHER_SESSION` reject on the very first connect
+/// most often means *this same client's* previous session is still parked on
+/// the remote helper, waiting out that exact window after an earlier
+/// ungraceful disconnect — see `TransportError::is_busy_other_session`'s
+/// docs). Every other failure is returned immediately on the first attempt,
+/// unchanged from before this wrapper existed: this only closes the gap
+/// where a fresh `isekai-pipe connect` process (a brand new `session_id`
+/// every time, since neither `connect_via_relay_resumable` nor `_with_fallback`
+/// persist one across invocations) would otherwise fail outright instead of
+/// waiting the same window a same-process resume would have.
+async fn retry_while_busy_other_session<T, E, F, Fut>(requested_resume_grace_secs: u32, attempt: F) -> Result<T, E>
 where
     E: BusyOtherSessionSignal,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
-    let deadline = Instant::now() + resume_window_for(requested_resume_grace_secs);
+    let deadline = Instant::now() + resume_window_for(requested_resume_grace_secs) + BUSY_OTHER_SESSION_EXTRA_PATIENCE;
+    retry_busy_other_session_until(deadline, attempt).await
+}
+
+/// The actual retry loop, parametrized directly over `deadline` so tests can
+/// exercise the give-up path without waiting out a real
+/// [`BUSY_OTHER_SESSION_EXTRA_PATIENCE`]-sized delay (`retry_while_busy_other_session`
+/// is the thin wrapper real callers use).
+async fn retry_busy_other_session_until<T, E, F, Fut>(deadline: Instant, mut attempt: F) -> Result<T, E>
+where
+    E: BusyOtherSessionSignal,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
     let mut attempt_no: u32 = 0;
     loop {
         let err = match attempt().await {
@@ -1230,10 +1258,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_while_busy_other_session_gives_up_once_the_resume_window_elapses() {
-        let result: Result<(), FakeConnectError> =
-            retry_while_busy_other_session(1, || async { Err(FakeConnectError(true)) }).await;
-        assert!(result.is_err(), "must stop retrying once the resume window has elapsed");
+    async fn retry_busy_other_session_until_gives_up_once_its_deadline_elapses() {
+        // Exercises the give-up path directly against a short, explicit
+        // deadline (rather than through `retry_while_busy_other_session`,
+        // whose real deadline now includes `BUSY_OTHER_SESSION_EXTRA_PATIENCE`
+        // and would make this test wait ~30s for no reason).
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let result: Result<(), FakeConnectError> = retry_busy_other_session_until(deadline, || async { Err(FakeConnectError(true)) }).await;
+        assert!(result.is_err(), "must stop retrying once the deadline has elapsed");
+    }
+
+    #[test]
+    fn busy_other_session_retry_deadline_includes_extra_patience_beyond_the_resume_window() {
+        // Regression test for the 2026-07-17 incident: the remote helper's
+        // own park-expiry doesn't start counting until *its* idle-timeout
+        // notices the old connection is dead, which is always later than
+        // this client's first BUSY_OTHER_SESSION rejection. Without
+        // `BUSY_OTHER_SESSION_EXTRA_PATIENCE`, a client using the bare
+        // `resume_window_for(...)` deadline gives up before the helper ever
+        // frees the slot.
+        let requested_resume_grace_secs = 5;
+        let now = Instant::now();
+        let bare_window_deadline = now + resume_window_for(requested_resume_grace_secs);
+        let padded_deadline = now + resume_window_for(requested_resume_grace_secs) + BUSY_OTHER_SESSION_EXTRA_PATIENCE;
+        assert!(
+            padded_deadline > bare_window_deadline,
+            "the BUSY_OTHER_SESSION retry deadline must extend past the bare resume window"
+        );
     }
 
     #[tokio::test]
