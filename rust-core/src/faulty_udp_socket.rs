@@ -422,8 +422,13 @@ mod tests {
 
     /// 各往復のタイムアウト上限。接続の`max_idle_timeout`(300秒)より大幅に
     /// 短く取り、詰まった箇所を早期に特定できるようにする(通常時の往復は
-    /// 注入遅延込みでも数十msオーダーなので、実用上は誤検知しない余裕)。
-    const REBIND_SURVIVAL_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(30);
+    /// 注入遅延込みでも数十msオーダー)。ただし元は30秒だったが、CI/開発機が
+    /// CPU競合下にある時この程度の余裕でも稀に`read (B, post-rebind) timed out`で
+    /// 落ちることを実際に確認した(単体実行でも1/3試行で発生、`nextest.toml`の
+    /// retries=2で拾いきれない場合があった)。`multipath_transport.rs`の同種の
+    /// rebind回復テストが60秒を使っているのに合わせる
+    /// (メモリ記録`rust-quic-test-flakiness-under-load`と同種のflaky)。
+    const REBIND_SURVIVAL_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(60);
 
     async fn run_rebind_survival_scenario() -> Result<(), String> {
         let _ = rustls::crypto::ring::default_provider().install_default();

@@ -1389,8 +1389,13 @@ mod pooling_e2e_tests {
         (cmd_tx, event_rx)
     }
 
+    // 5秒だとCI/開発機がCPU競合下にある時、fault injection後のイベント伝播が
+    // スケジューリング遅延だけで間に合わずtimed outすることが実際にあった
+    // (メモリ記録`rust-quic-test-flakiness-under-load`と同種の、高負荷下でのみ
+    // 顕在化するflaky。`multipath_transport.rs`の同種テストが20〜60秒の
+    // generousなtimeoutを使っているのに合わせる)。
     async fn expect_disconnected(rx: &mut tokio::sync::mpsc::Receiver<TransportEvent>, context: &str) {
-        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+        match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
             Ok(Some(TransportEvent::Disconnected { .. })) => {}
             Ok(Some(_)) => panic!("{context}: expected Disconnected, got a different event"),
             Ok(None) => {} // チャネル終了(送信端drop)も「切断された」の一種として許容する。

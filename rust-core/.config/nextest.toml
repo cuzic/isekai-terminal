@@ -8,6 +8,11 @@ retries = 0
 # メモリ記録`rust-quic-test-flakiness-under-load`参照。本当に壊れていれば
 # (新規server/client/connectionを都度作り直しても)毎回同じく失敗するため、
 # リトライで実バグを見逃すリスクは低い。
+#
+# `ssh_handler::pooling_e2e_tests::underlying_connection_loss_disconnects_all_sharing_tabs`
+# も同種(`FaultyStream`で基盤TCPを切断しイベント伝播を待つ)で、開発機の高負荷下で
+# 実際に`expect_disconnected`のtimeoutが間に合わず落ちるのを確認したため同じ扱いにする
+# (該当timeoutは`Duration::from_secs(20)`まで既に緩めた上での追加保険)。
 [[profile.ci.overrides]]
-filter = 'package(isekai-terminal-core) and (test(/^faulty_udp_socket::tests::/) or test(/^multipath_transport::tests::/))'
+filter = 'package(isekai-terminal-core) and (test(/^faulty_udp_socket::tests::/) or test(/^multipath_transport::tests::/) or test(/^transport::ssh_handler::pooling_e2e_tests::underlying_connection_loss_disconnects_all_sharing_tabs$/))'
 retries = 2
