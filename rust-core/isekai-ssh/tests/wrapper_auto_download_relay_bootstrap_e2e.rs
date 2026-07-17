@@ -420,6 +420,11 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
         .env("HOME", &home)
         .env("PATH", &shim.path_env)
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        // Verbose bootstrap-progress messages (including "Registered ...
+        // in ...", which this test watches for below) now default to
+        // `isekai-ssh`'s own log file (`log_file.rs::log_line_verbose!`)
+        // rather than stderr.
+        .env("ISEKAI_PIPE_LOG_FILE", home.join("isekai-ssh-verbose-test.log"))
         .envs(shim.extra_env)
         .env("ISEKAI_SSH_HELPER_RELEASE_BASE_URL", format!("http://{mock_release_addr}"))
         // No `/repos/.../releases/latest` route registered on the mock
@@ -450,7 +455,10 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
             Ok(Ok(_)) => {
                 eprint!("[isekai-ssh stderr] {line}");
                 stderr_text.push_str(&line);
-                if line.contains("Registered") {
+                let verbose_log_has_registered = std::fs::read_to_string(home.join("isekai-ssh-verbose-test.log"))
+                    .map(|s| s.contains("Registered"))
+                    .unwrap_or(false);
+                if line.contains("Registered") || verbose_log_has_registered {
                     saw_registered = true;
                     break;
                 }
