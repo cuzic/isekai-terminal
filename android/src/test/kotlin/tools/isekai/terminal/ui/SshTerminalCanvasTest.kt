@@ -3,6 +3,7 @@ package tools.isekai.terminal.ui
 import android.graphics.Typeface
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -12,6 +13,7 @@ import uniffi.isekai_terminal_core.CellData
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.ScreenUpdate
+import uniffi.isekai_terminal_core.ScrollbackSearchMatch
 
 /**
  * [computeBgRuns] は背景描画のバッチ化(セルごとの `drawRect` を連続区間ごとの
@@ -149,6 +151,39 @@ class SshTerminalCanvasTest {
     fun `computeCursorRect for bar uses proportional thickness when cell is wide`() {
         val rect = computeCursorRect(cx = 0f, cy = 0f, cellW = 100f, cellH = 16f, shape = CursorShape.BAR)
         assertEquals(15f, rect.right - rect.left, 0.01f) // 100 * 0.15 (Float丸め誤差を許容)
+    }
+
+    // ── computeSearchHighlightRect: スクロールバック検索(タスク#66)のハイライト矩形計算 ──
+
+    @Test
+    fun `computeSearchHighlightRect places the highlight on the last row`() {
+        val match = ScrollbackSearchMatch(row = 3u, col = 2u, len = 4u)
+        val rect = computeSearchHighlightRect(match, rows = 24, cols = 80, cellW = 8f, cellH = 16f)
+        assertEquals(CursorRect(16f, 23 * 16f, 48f, 24 * 16f), rect)
+    }
+
+    @Test
+    fun `computeSearchHighlightRect clamps a match that overflows past the right edge`() {
+        // colを超えてはみ出すマッチ(col + len > cols)——クランプされるだけでクラッシュしない
+        // ことを確認する(iOS版TerminalScreenViewTestsの
+        // testDrawWithSearchHighlightMatchingScrollOffsetDoesNotCrashと同種のケース)。
+        val match = ScrollbackSearchMatch(row = 0u, col = 3u, len = 10u)
+        val rect = computeSearchHighlightRect(match, rows = 2, cols = 4, cellW = 8f, cellH = 16f)
+        assertEquals(CursorRect(24f, 16f, 32f, 32f), rect)
+    }
+
+    @Test
+    fun `computeSearchHighlightRect returns null when the match starts past the last column`() {
+        val match = ScrollbackSearchMatch(row = 0u, col = 10u, len = 1u)
+        val rect = computeSearchHighlightRect(match, rows = 2, cols = 4, cellW = 8f, cellH = 16f)
+        assertNull("画面外のマッチは描画対象なし(null)を返すこと", rect)
+    }
+
+    @Test
+    fun `computeSearchHighlightRect returns null for a zero-length match`() {
+        val match = ScrollbackSearchMatch(row = 0u, col = 1u, len = 0u)
+        val rect = computeSearchHighlightRect(match, rows = 2, cols = 4, cellW = 8f, cellH = 16f)
+        assertNull(rect)
     }
 
     // ── FontFitCache: セル寸法/typefaceが変わったときだけ再計測が必要 ──────────

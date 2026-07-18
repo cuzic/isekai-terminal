@@ -339,6 +339,15 @@ class TerminalSession(
     fun scrollbackCells(offset: Int, rows: Int): List<CellData>? =
         orchestrator.scrollbackCells(offset.toUInt(), rows.toUInt())
 
+    /** タスク#66: スクロールバック検索バーUI用。マッチ計算(部分一致検索・combining
+     *  character境界処理・大小文字無視)は全て`SessionOrchestrator::search_scrollback`
+     *  (Rust側`SessionCore::search_scrollback`、タスク#37)に委譲し、このメソッドは
+     *  呼び出しをそのまま中継するだけ(rust-ssot: Kotlin側にマッチ計算ロジックを
+     *  複製しない)。未接続時は空リストを返す。返る`ScrollbackSearchMatch.row`は
+     *  [scrollbackCells]と同じ規約(タスク#37のドキュメント参照)。 */
+    fun searchScrollback(query: String, caseSensitive: Boolean): List<ScrollbackSearchMatch> =
+        orchestrator.searchScrollback(query, caseSensitive)
+
     /** Phase 12: このタブだけの配色テーマを差し替える(per-session theme)。
      *  アプリ全体の既定テーマとは独立しており、以降このタブが解決するSGRにのみ反映される。 */
     fun setTheme(ansi16: List<UInt>, defaultFg: UInt, defaultBg: UInt) =

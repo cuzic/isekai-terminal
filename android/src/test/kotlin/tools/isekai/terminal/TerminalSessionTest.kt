@@ -16,6 +16,7 @@ import uniffi.isekai_terminal_core.QuicConfig
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.ScreenUpdate
+import uniffi.isekai_terminal_core.ScrollbackSearchMatch
 import uniffi.isekai_terminal_core.SshAuth
 import uniffi.isekai_terminal_core.SshConfig
 
@@ -948,5 +949,32 @@ class TerminalSessionTest {
 
         assertEquals(2, bellCount.get())
         s.close()
+    }
+
+    // ── #66: スクロールバック検索(search_scrollback)の中継 ──────────────
+
+    /** マッチ計算そのものは`SessionCore::search_scrollback`(Rust側、#37)で既にテスト済み
+     *  (`session.rs`の`search_scrollback_*`群)。ここでは[TerminalSession.searchScrollback]が
+     *  その呼び出しをそのまま中継しているだけであること(クエリ・大小文字区別の引数と
+     *  戻り値の両方)を確認する(iOS版`TerminalSessionControllerTests.swift`の
+     *  `testSearchScrollbackReturnsEmptyBeforeConnecting`と対称)。 */
+    @Test
+    fun searchScrollback_delegatesQueryAndResultToOrchestrator() {
+        val expected = listOf(ScrollbackSearchMatch(row = 1u, col = 2u, len = 3u))
+        fakeOrchestrator.searchScrollbackResult = expected
+
+        val result = session.searchScrollback("needle", caseSensitive = true)
+
+        assertEquals("needle", fakeOrchestrator.lastSearchScrollbackQuery)
+        assertEquals(true, fakeOrchestrator.lastSearchScrollbackCaseSensitive)
+        assertEquals(expected, result)
+    }
+
+    /** 未接続時でもクラッシュせず、フェイクが返した値(既定では空リスト)をそのまま
+     *  返すこと——[scrollbackCells]と同じ「未接続ガードはRust側([FakeOrchestrator]が
+     *  模す)の責務」という契約。 */
+    @Test
+    fun searchScrollback_beforeConnecting_returnsEmptyList() {
+        assertEquals(emptyList<ScrollbackSearchMatch>(), session.searchScrollback("abc", caseSensitive = false))
     }
 }
