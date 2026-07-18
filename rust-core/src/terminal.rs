@@ -282,6 +282,15 @@ pub(crate) struct Terminal {
     /// 既定はxterm同様`true`(on)。offの場合、右端到達後の`print()`は次行へ
     /// 折り返さず、右端の最終列を上書きし続ける(タスク#56)。
     autowrap_mode: bool,
+    /// DECOM(`CSI ?6h`/`CSI ?6l`、origin mode)。既定は`false`(off)。onの間、
+    /// 絶対カーソル位置指定(CUP/HVP `H`/`f`、VPA `d`)とCPR(`CSI 6n`)応答の行座標、
+    /// および相対カーソル移動(CUU/CUD/CNL/CPL `A`/`B`/`E`/`F`)の可動範囲は、画面全体
+    /// ではなく現在のscroll region([scroll_top, scroll_bottom])基準になる(タスク#59)。
+    /// 左右マージン(DECLRMM)はこのコードベースに未実装なので列方向は影響を受けない
+    /// (`CSI s`のコメント参照)。モード切り替え自体(`h`/`l`どちらでも)でカーソルを
+    /// home位置(on: `scroll_top`行、off: 0行目。いずれも列0)へ移動する——実端末
+    /// (xterm含む)の挙動に倣う。
+    origin_mode: bool,
     /// REP(`CSI Ps b`)が繰り返す対象——`print()`が実際にセルへ書き込んだ最後の
     /// graphic文字と、その時点の(reverse適用前の論理)SGR属性のペア(結合文字・幅0の
     /// 文字は対象外、[Perform::print]の幅0分岐を参照)。`None`は「直前にgraphic文字が
@@ -411,6 +420,7 @@ impl Terminal {
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
             autowrap_mode: true,
+            origin_mode: false,
             last_graphic_cell: None,
             g0_charset: Charset::Ascii,
             g1_charset: Charset::Ascii,
@@ -476,6 +486,19 @@ impl Terminal {
     pub(crate) fn cursor_blink(&self) -> bool { self.cursor_blink }
     /// DECAWM(`CSI ?7h`/`CSI ?7l`)の現在値。テスト・`print()`から参照する。
     pub(crate) fn autowrap_mode(&self) -> bool { self.autowrap_mode }
+    /// DECOM(`CSI ?6h`/`CSI ?6l`)の現在値。テストから参照する。
+    pub(crate) fn origin_mode(&self) -> bool { self.origin_mode }
+
+    /// origin modeが有効な間、絶対/相対カーソル移動の座標基準として使う行範囲
+    /// `[top, bottom]`(0-indexed、画面全体の座標系)。offの場合は画面全体
+    /// (`0..=rows-1`)。
+    fn origin_row_bounds(&self) -> (usize, usize) {
+        if self.origin_mode {
+            (self.scroll_top, self.scroll_bottom)
+        } else {
+            (0, self.rows.saturating_sub(1))
+        }
+    }
     pub(crate) fn screen_cells(&self) -> &[TermCell] { self.cells() }
 
     fn reset_all(&mut self) {
@@ -500,6 +523,7 @@ impl Terminal {
         self.cursor_shape = CursorShape::Block;
         self.cursor_blink = true;
         self.autowrap_mode = true;
+        self.origin_mode = false;
         self.last_graphic_cell = None;
         self.g0_charset = Charset::Ascii;
         self.g1_charset = Charset::Ascii;
@@ -1385,6 +1409,19 @@ impl Perform for Terminal {
                 // DECAWM(`CSI ?7h`/`CSI ?7l`): 自動折り返しon/off(タスク#56)。
                 ('h', 7) => { self.autowrap_mode = true; }
                 ('l', 7) => { self.autowrap_mode = false; }
+                // DECOM(`CSI ?6h`/`CSI ?6l`、origin mode、タスク#59)。実端末(xterm含む)
+                // に倣い、on/offどちらの切り替えでもカーソルをhome位置へ移動する
+                // (on: scroll_top行、off: 0行目。列は常に0)。
+                ('h', 6) => {
+                    self.origin_mode = true;
+                    self.cursor_row = self.scroll_top;
+                    self.cursor_col = 0;
+                }
+                ('l', 6) => {
+                    self.origin_mode = false;
+                    self.cursor_row = 0;
+                    self.cursor_col = 0;
+                }
                 ('h', 2004) => { self.bracketed_paste_mode = true; }
                 ('l', 2004) => { self.bracketed_paste_mode = false; }
                 _ => {}
@@ -1432,7 +1469,11 @@ impl Perform for Terminal {
                     // `cols`(範囲外)になり得る。CPRは可視上のカーソル位置(最終列)を
                     // 報告すべきなので`cols - 1`にクランプする(Codexレビュー指摘)。
                     let visible_col = self.cursor_col.min(self.cols.saturating_sub(1));
-                    let resp = format!("\x1b[{};{}R", self.cursor_row + 1, visible_col + 1);
+                    // origin modeが有効な間、CPRが報告する行はCUP/HVPと同じ座標系
+                    // (scroll_top基準の相対値)になる(タスク#59、実端末の挙動)。
+                    let (floor, _) = self.origin_row_bounds();
+                    let reported_row = self.cursor_row.saturating_sub(floor);
+                    let resp = format!("\x1b[{};{}R", reported_row + 1, visible_col + 1);
                     self.pending_terminal_responses.push(resp.into_bytes());
                 }
                 _ => {}
@@ -1441,15 +1482,42 @@ impl Perform for Terminal {
         }
 
         match action {
-            'A' => { let n = p0.max(1) as usize; self.cursor_row = self.cursor_row.saturating_sub(n); }
-            'B' => { let n = p0.max(1) as usize; self.cursor_row = (self.cursor_row + n).min(self.rows - 1); }
+            // CUU/CUD/CNL/CPL(`A`/`B`/`E`/`F`): origin modeが有効な間は画面全体ではなく
+            // scroll regionの上下端([scroll_top, scroll_bottom])が可動範囲になる
+            // (タスク#59)。`origin_row_bounds()`はoffの場合`(0, rows-1)`を返すので
+            // 既存(origin mode無し)の挙動はそのまま保たれる。
+            'A' => {
+                let n = p0.max(1) as usize;
+                let (floor, _) = self.origin_row_bounds();
+                self.cursor_row = self.cursor_row.saturating_sub(n).max(floor);
+            }
+            'B' => {
+                let n = p0.max(1) as usize;
+                let (_, ceil) = self.origin_row_bounds();
+                self.cursor_row = (self.cursor_row + n).min(ceil);
+            }
             'C' => { let n = p0.max(1) as usize; self.cursor_col = (self.cursor_col + n).min(self.cols - 1); }
             'D' => { let n = p0.max(1) as usize; self.cursor_col = self.cursor_col.saturating_sub(n); }
-            'E' => { let n = p0.max(1) as usize; self.cursor_row = (self.cursor_row + n).min(self.rows - 1); self.cursor_col = 0; }
-            'F' => { let n = p0.max(1) as usize; self.cursor_row = self.cursor_row.saturating_sub(n); self.cursor_col = 0; }
+            'E' => {
+                let n = p0.max(1) as usize;
+                let (_, ceil) = self.origin_row_bounds();
+                self.cursor_row = (self.cursor_row + n).min(ceil);
+                self.cursor_col = 0;
+            }
+            'F' => {
+                let n = p0.max(1) as usize;
+                let (floor, _) = self.origin_row_bounds();
+                self.cursor_row = self.cursor_row.saturating_sub(n).max(floor);
+                self.cursor_col = 0;
+            }
             'G' => { self.cursor_col = (p0.max(1) as usize - 1).min(self.cols - 1); }
+            // CUP/HVP(`H`/`f`): origin modeが有効な間、行番号はscroll region上端
+            // (`scroll_top`)を基準とした相対値になり、可動範囲も region内に
+            // クランプされる(タスク#59)。列は左右マージン未実装のため既存通り
+            // 画面全体基準のまま。
             'H' | 'f' => {
-                self.cursor_row = (p0.max(1) as usize - 1).min(self.rows - 1);
+                let (floor, ceil) = self.origin_row_bounds();
+                self.cursor_row = (floor + p0.max(1) as usize - 1).clamp(floor, ceil);
                 self.cursor_col = (p1.max(1) as usize - 1).min(self.cols - 1);
             }
             'J' => {
@@ -1520,12 +1588,29 @@ impl Perform for Terminal {
                     self.cur_attrs = restore_attrs;
                 }
             }
-            'd' => { self.cursor_row = (p0.max(1) as usize - 1).min(self.rows - 1); }
+            // VPA(`CSI Ps d`): CUP/HVPと同様、origin modeが有効な間は行番号が
+            // scroll region上端基準になる(タスク#59)。
+            'd' => {
+                let (floor, ceil) = self.origin_row_bounds();
+                self.cursor_row = (floor + p0.max(1) as usize - 1).clamp(floor, ceil);
+            }
             'm' => { self.handle_sgr(&ps); }
             'r' => {
                 let top = (p0.max(1) as usize - 1).min(self.rows - 1);
                 let bot = (p1.max(1) as usize - 1).min(self.rows - 1);
-                if top < bot { self.scroll_top = top; self.scroll_bottom = bot; }
+                if top < bot {
+                    self.scroll_top = top;
+                    self.scroll_bottom = bot;
+                    // DECSTBM(タスク#59、codexレビュー指摘): 実端末(xterm含む)は
+                    // scroll region変更のたびカーソルをhome位置(origin mode on:
+                    // 新しい scroll_top行、off: 画面0行目。いずれも列0)へ移動する。
+                    // これを怠ると、DECOM on中に狭いregionを設定した直後、カーソルが
+                    // 新region外に取り残された状態になり得る(CUU/CUDのregion内
+                    // clamp・CPRのregion相対報告という他のDECOM挙動の前提が崩れる)。
+                    let (home_row, _) = self.origin_row_bounds();
+                    self.cursor_row = home_row;
+                    self.cursor_col = 0;
+                }
             }
             // CSI s / CSI u(ANSI.SYS方言のsave/restore cursor、タスク#57)。
             // `CSI s`は本来DECSLRM(左右マージン設定、DECLRMM `?69h`有効時のみ)と
@@ -2376,6 +2461,135 @@ mod tests {
         feed(&mut t, b"\x1b[0J");
         assert_eq!(cell(&t, 0, 9), " ", "ED0 at wrap-pending must clear the last column too");
         assert_eq!(cell(&t, 0, 0), "0", "earlier columns untouched");
+    }
+
+    // ── DECOM(`CSI ?6h`/`CSI ?6l`、origin mode、タスク#59) ─────────────
+
+    #[test]
+    fn test_decom_default_is_off() {
+        let t = Terminal::new(80, 24, Theme::default());
+        assert!(!t.origin_mode(), "DECOM should default to off (xterm既定)");
+    }
+
+    #[test]
+    fn test_decom_6h_6l_toggles_and_homes_cursor() {
+        let mut t = Terminal::new(10, 10, Theme::default());
+        feed(&mut t, b"\x1b[3;7r"); // scroll region = 行2..6(0-indexed)
+        feed(&mut t, b"\x1b[5;5H"); // 適当な位置へ移動しておく
+        feed(&mut t, b"\x1b[?6h");
+        assert!(t.origin_mode());
+        // onへの切り替え自体がカーソルをscroll region上端(行2)・列0へhomeする。
+        assert_eq!((t.cursor_row(), t.cursor_col()), (2, 0));
+
+        feed(&mut t, b"\x1b[5;5H"); // origin mode有効中に再度動かしておく(offへの遷移確認用)
+        feed(&mut t, b"\x1b[?6l");
+        assert!(!t.origin_mode());
+        // offへの切り替えは画面全体の原点(行0)・列0へhomeする。
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 0));
+    }
+
+    #[test]
+    fn test_decom_cup_is_relative_to_scroll_region_and_clamped() {
+        let mut t = Terminal::new(10, 10, Theme::default());
+        feed(&mut t, b"\x1b[3;7r"); // scroll region = 行2..6(0-indexed)
+        feed(&mut t, b"\x1b[?6h");
+        // CUP(1;1) は origin mode下ではscroll region左上、つまり画面座標(2,0)。
+        feed(&mut t, b"\x1b[1;1H");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (2, 0));
+        // region高さ(5行)を超える行を指定してもregion下端(行6)にクランプされる。
+        feed(&mut t, b"\x1b[99;1H");
+        assert_eq!(t.cursor_row(), 6, "must clamp to scroll_bottom, not screen bottom");
+    }
+
+    #[test]
+    fn test_decom_off_cup_is_absolute_screen_coordinates() {
+        let mut t = Terminal::new(10, 10, Theme::default());
+        feed(&mut t, b"\x1b[3;7r"); // scroll region = 行2..6(0-indexed)
+        // origin mode off(既定)のままなら、scroll regionが設定されていてもCUPは
+        // 画面全体の絶対座標のまま。
+        feed(&mut t, b"\x1b[1;1H");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 0));
+    }
+
+    #[test]
+    fn test_decom_vpa_is_relative_to_scroll_region() {
+        let mut t = Terminal::new(10, 10, Theme::default());
+        feed(&mut t, b"\x1b[3;7r"); // scroll region = 行2..6(0-indexed)
+        feed(&mut t, b"\x1b[?6h");
+        feed(&mut t, b"\x1b[3d"); // VPA(3) → region上端(行2)から2行分オフセット = 行4
+        assert_eq!(t.cursor_row(), 4);
+    }
+
+    #[test]
+    fn test_decom_cuu_cud_confined_to_scroll_region() {
+        let mut t = Terminal::new(10, 10, Theme::default());
+        feed(&mut t, b"\x1b[3;7r"); // scroll region = 行2..6(0-indexed)
+        feed(&mut t, b"\x1b[?6h"); // カーソルは行2へhome
+        feed(&mut t, b"\x1b[99A"); // 大きくCUUしてもregion上端(行2)より上へは出ない
+        assert_eq!(t.cursor_row(), 2);
+        feed(&mut t, b"\x1b[99B"); // 大きくCUDしてもregion下端(行6)より下へは出ない
+        assert_eq!(t.cursor_row(), 6);
+    }
+
+    #[test]
+    fn test_decom_off_cuu_cud_still_confined_to_full_screen() {
+        // origin mode offの間は、scroll regionが設定されていてもCUU/CUDは
+        // 画面全体(0..rows-1)が可動範囲のまま(既存の挙動を壊さない)。
+        let mut t = Terminal::new(10, 10, Theme::default());
+        feed(&mut t, b"\x1b[3;7r"); // scroll region = 行2..6(0-indexed)
+        feed(&mut t, b"\x1b[1;1H");
+        feed(&mut t, b"\x1b[99A");
+        assert_eq!(t.cursor_row(), 0);
+        feed(&mut t, b"\x1b[99B");
+        assert_eq!(t.cursor_row(), 9, "画面最下行(9)まで動けるべき");
+    }
+
+    #[test]
+    fn test_decom_cpr_reports_scroll_region_relative_row() {
+        let mut t = Terminal::new(10, 10, Theme::default());
+        feed(&mut t, b"\x1b[3;7r"); // scroll region = 行2..6(0-indexed)
+        feed(&mut t, b"\x1b[?6h"); // カーソルは行2(region上端)へhome
+        t.take_pending_terminal_responses();
+        feed(&mut t, b"\x1b[6n");
+        let resp = t.take_pending_terminal_responses();
+        assert_eq!(
+            resp,
+            vec![b"\x1b[1;1R".to_vec()],
+            "origin mode下ではCPRの行番号もregion上端基準の相対値になる"
+        );
+    }
+
+    #[test]
+    fn test_decstbm_homes_cursor_to_screen_origin_when_decom_off() {
+        // codexレビュー指摘: DECSTBM(`CSI r`)はscroll region変更時、実端末同様
+        // カーソルをhome位置へ移動する。DECOM offの間のhomeは画面左上(0,0)。
+        let mut t = Terminal::new(10, 10, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4"); // カーソルを行4付近へ動かしておく
+        feed(&mut t, b"\x1b[3;7r"); // scroll region = 行2..6(0-indexed)
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 0));
+    }
+
+    #[test]
+    fn test_decstbm_homes_cursor_to_scroll_top_when_decom_on() {
+        // 同上、DECOM onの間のhomeは新しいscroll_top行(列は常に0)。
+        let mut t = Terminal::new(10, 10, Theme::default());
+        feed(&mut t, b"\x1b[?6h"); // origin mode on
+        feed(&mut t, b"\x1b[8;9H"); // カーソルを適当な位置へ動かしておく
+        feed(&mut t, b"\x1b[3;7r"); // scroll region = 行2..6(0-indexed)
+        assert_eq!(
+            (t.cursor_row(), t.cursor_col()),
+            (2, 0),
+            "origin mode onの間、DECSTBM後のhomeは新しいscroll_top(行2)"
+        );
+    }
+
+    #[test]
+    fn test_decom_reset_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?6h");
+        assert!(t.origin_mode());
+        feed(&mut t, b"\x1bc"); // RIS
+        assert!(!t.origin_mode(), "RISで既定(off)に戻る");
     }
 
     // ── resize_preserving_state ─────────────────────────
