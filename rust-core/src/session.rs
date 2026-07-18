@@ -18,7 +18,18 @@ const SCROLLBACK_LIMIT: usize = 1000;
 // ── TermCell → 公開型変換（session 層の責務）────────────
 
 fn to_cell_data(c: &TermCell) -> CellData {
-    CellData { ch: c.ch.to_string(), fg: c.fg, bg: c.bg, bold: c.bold }
+    CellData {
+        ch: c.ch.to_string(),
+        fg: c.fg,
+        bg: c.bg,
+        bold: c.bold,
+        dim: c.dim,
+        italic: c.italic,
+        underline: c.underline,
+        strikethrough: c.strikethrough,
+        blink: c.blink,
+        invisible: c.invisible,
+    }
 }
 
 fn make_screen_update(t: &Terminal) -> ScreenUpdate {
@@ -141,7 +152,18 @@ impl SessionCore {
         let theme = *self.current_theme.lock();
         let cols = *self.screen_cols.lock() as usize;
         let sb = self.scrollback.lock();
-        let blank = CellData { ch: " ".into(), fg: theme.default_fg, bg: theme.default_bg, bold: false };
+        let blank = CellData {
+            ch: " ".into(),
+            fg: theme.default_fg,
+            bg: theme.default_bg,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            blink: false,
+            invisible: false,
+        };
         let mut result = vec![blank; rows as usize * cols];
         for r in 0..rows as usize {
             let sb_idx = offset as usize + (rows as usize - 1 - r);
@@ -652,7 +674,18 @@ mod tests {
     use super::*;
 
     fn cell(label: char) -> TermCell {
-        TermCell { ch: smol_str::SmolStr::new(label.to_string()), fg: 0xFF010101, bg: 0xFF020202, bold: false }
+        TermCell {
+            ch: smol_str::SmolStr::new(label.to_string()),
+            fg: 0xFF010101,
+            bg: 0xFF020202,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            blink: false,
+            invisible: false,
+        }
     }
 
     fn row(label: char, len: usize) -> Vec<TermCell> {

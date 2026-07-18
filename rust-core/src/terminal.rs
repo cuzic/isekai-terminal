@@ -26,6 +26,88 @@ pub(crate) struct TermCell {
     pub(crate) fg: u32,
     pub(crate) bg: u32,
     pub(crate) bold: bool,
+    pub(crate) dim: bool,
+    pub(crate) italic: bool,
+    pub(crate) underline: bool,
+    pub(crate) strikethrough: bool,
+    pub(crate) blink: bool,
+    pub(crate) invisible: bool,
+}
+
+/// 現在のカーソル位置に適用されている SGR 属性一式(色は「論理色」——`reverse`が
+/// 立っている場合でも fg/bg 自体はスワップしない)。SGR 27 で reverse を解除した
+/// 時に元の色へ戻せるようにするため。実際にセルへ書き込む時([TermAttrs::to_cell])
+/// にのみ reverse を適用した実効色を計算する——このコードベースは色を SGR パース時
+/// に ARGB へ解決し、以後遡って再着色しない方針(`ansi256_to_argb`・テーマ切り替えの
+/// 既存テスト参照)に一貫させるため、セルに書き込む瞬間が「解決するタイミング」となる。
+#[derive(Clone, Copy)]
+pub(crate) struct TermAttrs {
+    pub(crate) fg: u32,
+    pub(crate) bg: u32,
+    pub(crate) bold: bool,
+    pub(crate) dim: bool,
+    pub(crate) italic: bool,
+    pub(crate) underline: bool,
+    pub(crate) strikethrough: bool,
+    pub(crate) blink: bool,
+    pub(crate) invisible: bool,
+    pub(crate) reverse: bool,
+}
+
+impl TermAttrs {
+    fn default_for(theme: &Theme) -> Self {
+        TermAttrs {
+            fg: theme.default_fg,
+            bg: theme.default_bg,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            blink: false,
+            invisible: false,
+            reverse: false,
+        }
+    }
+
+    /// `reverse` を適用した実効 (fg, bg)。`reverse` が立っていなければ論理色そのまま。
+    fn effective_colors(&self) -> (u32, u32) {
+        if self.reverse { (self.bg, self.fg) } else { (self.fg, self.bg) }
+    }
+
+    fn to_cell(&self, ch: smol_str::SmolStr) -> TermCell {
+        let (fg, bg) = self.effective_colors();
+        TermCell {
+            ch,
+            fg,
+            bg,
+            bold: self.bold,
+            dim: self.dim,
+            italic: self.italic,
+            underline: self.underline,
+            strikethrough: self.strikethrough,
+            blink: self.blink,
+            invisible: self.invisible,
+        }
+    }
+}
+
+/// 画面全体をリセットする時(初期化・`RIS`・alt screen切り替え時の新画面)に使う、
+/// SGR属性を一切持たない空白セル。カーソル位置の現在SGR属性を引き継ぐ通常の
+/// erase/blank ([Terminal::blank]) とは意図的に区別する。
+fn blank_cell_for_theme(theme: &Theme) -> TermCell {
+    TermCell {
+        ch: smol_str::SmolStr::new_inline(" "),
+        fg: theme.default_fg,
+        bg: theme.default_bg,
+        bold: false,
+        dim: false,
+        italic: false,
+        underline: false,
+        strikethrough: false,
+        blink: false,
+        invisible: false,
+    }
 }
 
 /// 純粋な VTE 端末状態機械。外部の Arc/Mutex を一切持たない。
@@ -41,13 +123,11 @@ pub(crate) struct Terminal {
     main_cells: Vec<TermCell>,
     alt_cells: Vec<TermCell>,
     alt_active: bool,
-    saved_cursor_main: Option<(usize, usize, u32, u32, bool)>,
-    saved_cursor_alt: Option<(usize, usize, u32, u32, bool)>,
+    saved_cursor_main: Option<(usize, usize, TermAttrs)>,
+    saved_cursor_alt: Option<(usize, usize, TermAttrs)>,
     cursor_row: usize,
     cursor_col: usize,
-    cur_fg: u32,
-    cur_bg: u32,
-    cur_bold: bool,
+    cur_attrs: TermAttrs,
     scroll_top: usize,
     scroll_bottom: usize,
     title: Option<String>,
@@ -72,7 +152,7 @@ impl Terminal {
     /// (`SessionState`/`SessionCore`)が「グローバル既定を使うか、プロファイル/タブ固有の
     /// 上書きを使うか」を解決した結果をそのまま渡す。
     pub(crate) fn new(cols: usize, rows: usize, theme: Theme) -> Self {
-        let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: theme.default_fg, bg: theme.default_bg, bold: false };
+        let blank = blank_cell_for_theme(&theme);
         let cells = vec![blank.clone(); cols * rows];
         Terminal {
             theme,
@@ -83,7 +163,7 @@ impl Terminal {
             saved_cursor_main: None,
             saved_cursor_alt: None,
             cursor_row: 0, cursor_col: 0,
-            cur_fg: theme.default_fg, cur_bg: theme.default_bg, cur_bold: false,
+            cur_attrs: TermAttrs::default_for(&theme),
             scroll_top: 0, scroll_bottom: rows - 1,
             title: None,
             pending_clipboard_write: None,
@@ -139,7 +219,7 @@ impl Terminal {
 
     fn reset_all(&mut self) {
         let theme = self.theme;
-        let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: theme.default_fg, bg: theme.default_bg, bold: false };
+        let blank = blank_cell_for_theme(&theme);
         let cells = vec![blank; self.cols * self.rows];
         self.main_cells = cells.clone();
         self.alt_cells = cells;
@@ -147,7 +227,7 @@ impl Terminal {
         self.saved_cursor_main = None;
         self.saved_cursor_alt = None;
         self.cursor_row = 0; self.cursor_col = 0;
-        self.cur_fg = theme.default_fg; self.cur_bg = theme.default_bg; self.cur_bold = false;
+        self.cur_attrs = TermAttrs::default_for(&theme);
         self.scroll_top = 0; self.scroll_bottom = self.rows - 1;
         self.title = None;
         self.pending_clipboard_write = None;
@@ -164,8 +244,10 @@ impl Terminal {
         if self.alt_active { &mut self.alt_cells } else { &mut self.main_cells }
     }
 
+    /// erase/scroll/リサイズパディング用の空白セル。現在の SGR 属性(色・reverse等)
+    /// を引き継ぐ — `blank_cell_for_theme` (画面全体リセット用、属性なし)とは別物。
     fn blank(&self) -> TermCell {
-        TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: self.cur_fg, bg: self.cur_bg, bold: false }
+        self.cur_attrs.to_cell(smol_str::SmolStr::new_inline(" "))
     }
 
     fn cell_mut(&mut self, row: usize, col: usize) -> &mut TermCell {
@@ -271,11 +353,11 @@ impl Terminal {
         };
         self.cursor_col = clamp_col(self.cursor_col);
 
-        if let Some((row, col, fg, bg, bold)) = self.saved_cursor_main.take() {
-            self.saved_cursor_main = Some((shift_row(row, main_removed), clamp_col(col), fg, bg, bold));
+        if let Some((row, col, attrs)) = self.saved_cursor_main.take() {
+            self.saved_cursor_main = Some((shift_row(row, main_removed), clamp_col(col), attrs));
         }
-        if let Some((row, col, fg, bg, bold)) = self.saved_cursor_alt.take() {
-            self.saved_cursor_alt = Some((shift_row(row, alt_removed), clamp_col(col), fg, bg, bold));
+        if let Some((row, col, attrs)) = self.saved_cursor_alt.take() {
+            self.saved_cursor_alt = Some((shift_row(row, alt_removed), clamp_col(col), attrs));
         }
 
         if had_full_scroll_region {
@@ -334,22 +416,17 @@ impl Terminal {
 
     fn switch_to_alt(&mut self, save_cursor: bool) {
         if save_cursor {
-            self.saved_cursor_main = Some((
-                self.cursor_row, self.cursor_col,
-                self.cur_fg, self.cur_bg, self.cur_bold,
-            ));
+            self.saved_cursor_main = Some((self.cursor_row, self.cursor_col, self.cur_attrs));
         }
         let theme = self.theme;
         self.main_cells = self.cells().clone();
-        let blank = TermCell { ch: smol_str::SmolStr::new_inline(" "), fg: theme.default_fg, bg: theme.default_bg, bold: false };
+        let blank = blank_cell_for_theme(&theme);
         self.alt_cells = vec![blank; self.cols * self.rows];
         self.alt_active = true;
         if save_cursor {
             self.cursor_row = 0;
             self.cursor_col = 0;
-            self.cur_fg = theme.default_fg;
-            self.cur_bg = theme.default_bg;
-            self.cur_bold = false;
+            self.cur_attrs = TermAttrs::default_for(&theme);
         }
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
@@ -359,12 +436,10 @@ impl Terminal {
         if !self.alt_active { return; }
         self.alt_active = false;
         if restore_cursor {
-            if let Some((row, col, fg, bg, bold)) = self.saved_cursor_main.take() {
+            if let Some((row, col, attrs)) = self.saved_cursor_main.take() {
                 self.cursor_row = row;
                 self.cursor_col = col;
-                self.cur_fg = fg;
-                self.cur_bg = bg;
-                self.cur_bold = bold;
+                self.cur_attrs = attrs;
             }
         }
     }
@@ -418,35 +493,52 @@ impl Terminal {
         // （`set_terminal_theme` で差し替え可能。以前に解決済みのセルは遡って再着色されない）。
         let theme = self.theme;
         if ps.is_empty() {
-            self.cur_fg = theme.default_fg;
-            self.cur_bg = theme.default_bg;
-            self.cur_bold = false;
+            // `ESC[m`(パラメータ無し)は`ESC[0m`と同義 — 色だけでなく
+            // bold/dim/italic/underline/blink/reverse/invisible/strikethrough も
+            // 全てリセットする(SGR 0 と同じ扱いにしないと空psを送るリモートだけ
+            // 装飾が残留するバグになる)。
+            self.cur_attrs = TermAttrs::default_for(&theme);
             return;
         }
         let mut i = 0;
         while i < ps.len() {
             match ps[i] {
-                0  => { self.cur_fg = theme.default_fg; self.cur_bg = theme.default_bg; self.cur_bold = false; }
-                1  => { self.cur_bold = true; }
-                22 => { self.cur_bold = false; }
-                30..=37 => { self.cur_fg = theme.ansi16[(ps[i] - 30) as usize]; }
+                0  => { self.cur_attrs = TermAttrs::default_for(&theme); }
+                1  => { self.cur_attrs.bold = true; }
+                2  => { self.cur_attrs.dim = true; }
+                3  => { self.cur_attrs.italic = true; }
+                4  => { self.cur_attrs.underline = true; }
+                5  => { self.cur_attrs.blink = true; }
+                7  => { self.cur_attrs.reverse = true; }
+                8  => { self.cur_attrs.invisible = true; }
+                9  => { self.cur_attrs.strikethrough = true; }
+                // 22 は bold(1) と dim(2) の両方を同時にリセットする(SGR仕様通り;
+                // 個別に取り消すコードは存在しない)。
+                22 => { self.cur_attrs.bold = false; self.cur_attrs.dim = false; }
+                23 => { self.cur_attrs.italic = false; }
+                24 => { self.cur_attrs.underline = false; }
+                25 => { self.cur_attrs.blink = false; }
+                27 => { self.cur_attrs.reverse = false; }
+                28 => { self.cur_attrs.invisible = false; }
+                29 => { self.cur_attrs.strikethrough = false; }
+                30..=37 => { self.cur_attrs.fg = theme.ansi16[(ps[i] - 30) as usize]; }
                 38 => {
                     if let Some((color, advance)) = parse_extended_color(&theme, ps, i) {
-                        self.cur_fg = color;
+                        self.cur_attrs.fg = color;
                         i += advance;
                     }
                 }
-                39 => { self.cur_fg = theme.default_fg; }
-                40..=47 => { self.cur_bg = theme.ansi16[(ps[i] - 40) as usize]; }
+                39 => { self.cur_attrs.fg = theme.default_fg; }
+                40..=47 => { self.cur_attrs.bg = theme.ansi16[(ps[i] - 40) as usize]; }
                 48 => {
                     if let Some((color, advance)) = parse_extended_color(&theme, ps, i) {
-                        self.cur_bg = color;
+                        self.cur_attrs.bg = color;
                         i += advance;
                     }
                 }
-                49  => { self.cur_bg = theme.default_bg; }
-                90..=97  => { self.cur_fg = theme.ansi16[8 + (ps[i] - 90) as usize]; }
-                100..=107 => { self.cur_bg = theme.ansi16[8 + (ps[i] - 100) as usize]; }
+                49  => { self.cur_attrs.bg = theme.default_bg; }
+                90..=97  => { self.cur_attrs.fg = theme.ansi16[8 + (ps[i] - 90) as usize]; }
+                100..=107 => { self.cur_attrs.bg = theme.ansi16[8 + (ps[i] - 100) as usize]; }
                 _ => {}
             }
             i += 1;
@@ -480,20 +572,15 @@ impl Perform for Terminal {
             self.newline();
         }
         if self.cursor_row < self.rows {
-            *self.cell_mut(self.cursor_row, self.cursor_col) = TermCell {
-                ch: smol_str::SmolStr::new(c.encode_utf8(&mut [0u8; 4])),
-                fg: self.cur_fg,
-                bg: self.cur_bg,
-                bold: self.cur_bold,
-            };
+            let attrs = self.cur_attrs;
+            *self.cell_mut(self.cursor_row, self.cursor_col) =
+                attrs.to_cell(smol_str::SmolStr::new(c.encode_utf8(&mut [0u8; 4])));
             self.cursor_col += 1;
             if width == 2 && self.cursor_col < self.cols {
-                *self.cell_mut(self.cursor_row, self.cursor_col) = TermCell {
-                    ch: smol_str::SmolStr::new_inline(" "),
-                    fg: self.cur_fg,
-                    bg: self.cur_bg,
-                    bold: false,
-                };
+                // wide文字の2セル目(placeholder)も現在の属性(reverse等も含め)を
+                // 正しく引き継ぐ — 以前は bold だけ無条件で false になっていた。
+                *self.cell_mut(self.cursor_row, self.cursor_col) =
+                    attrs.to_cell(smol_str::SmolStr::new_inline(" "));
                 self.cursor_col += 1;
             }
         }
@@ -713,6 +800,121 @@ mod tests {
         let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b[31m\x1b[0mB");
         assert_eq!(t.screen_cells()[0].fg, Theme::default().default_fg);
+    }
+
+    #[test]
+    fn test_sgr_underline_italic_strikethrough_blink_dim_invisible() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[4;3;9;5;2;8mA");
+        let c = &t.screen_cells()[0];
+        assert!(c.underline, "SGR 4 should set underline");
+        assert!(c.italic, "SGR 3 should set italic");
+        assert!(c.strikethrough, "SGR 9 should set strikethrough");
+        assert!(c.blink, "SGR 5 should set blink");
+        assert!(c.dim, "SGR 2 should set dim");
+        assert!(c.invisible, "SGR 8 should set invisible");
+    }
+
+    #[test]
+    fn test_sgr_individual_attribute_resets() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // 全部立てた上で、それぞれの reset コードだけを送り個別に消せることを確認する。
+        feed(&mut t, b"\x1b[4;3;9;5;2;8m\x1b[24;23;29;25;22;28mA");
+        let c = &t.screen_cells()[0];
+        assert!(!c.underline, "SGR 24 should reset underline");
+        assert!(!c.italic, "SGR 23 should reset italic");
+        assert!(!c.strikethrough, "SGR 29 should reset strikethrough");
+        assert!(!c.blink, "SGR 25 should reset blink");
+        assert!(!c.dim, "SGR 22 should reset dim");
+        assert!(!c.invisible, "SGR 28 should reset invisible");
+    }
+
+    #[test]
+    fn test_sgr_22_resets_both_bold_and_dim() {
+        // SGR 22 は「bold/dim いずれかを解除する」共通のリセットコードであり、
+        // bold(1)/dim(2) どちらが立っていても両方消す(SGR仕様通り、個別コードは無い)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[1;2m\x1b[22mA");
+        let c = &t.screen_cells()[0];
+        assert!(!c.bold, "SGR 22 should reset bold");
+        assert!(!c.dim, "SGR 22 should reset dim");
+    }
+
+    #[test]
+    fn test_sgr_reverse_swaps_effective_colors_at_write_time() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[31;44;7mA"); // fg=red, bg=blue, reverse
+        let c = &t.screen_cells()[0];
+        // 実効色は書込み時に fg/bg が入れ替わって解決されている
+        // (このコードベースの「SGRパース時にARGBへ解決する」既存方針に合わせる)。
+        assert_eq!(c.fg, Theme::default().ansi16[4], "reverse: effective fg should be the logical bg (blue)");
+        assert_eq!(c.bg, Theme::default().ansi16[1], "reverse: effective bg should be the logical fg (red)");
+    }
+
+    #[test]
+    fn test_sgr_27_reverse_reset_restores_original_colors() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // reverse を解除(SGR 27)した後に書いた文字は元の論理色(fg=red,bg=blue)のまま。
+        feed(&mut t, b"\x1b[31;44;7m\x1b[27mA");
+        let c = &t.screen_cells()[0];
+        assert_eq!(c.fg, Theme::default().ansi16[1]);
+        assert_eq!(c.bg, Theme::default().ansi16[4]);
+    }
+
+    #[test]
+    fn test_sgr_0_and_empty_ps_clear_all_new_attributes() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[1;2;3;4;5;7;8;9m\x1b[0mA");
+        let c = &t.screen_cells()[0];
+        assert!(!c.bold && !c.dim && !c.italic && !c.underline && !c.blink && !c.invisible && !c.strikethrough);
+        assert_eq!(c.fg, Theme::default().default_fg);
+        assert_eq!(c.bg, Theme::default().default_bg);
+
+        // 空パラメータ(`ESC[m`)も SGR 0 と同義であるべき(Fableレビュー指摘)。
+        let mut t2 = Terminal::new(80, 24, Theme::default());
+        feed(&mut t2, b"\x1b[1;2;3;4;5;7;8;9m\x1b[mB");
+        let c2 = &t2.screen_cells()[0];
+        assert!(!c2.bold && !c2.dim && !c2.italic && !c2.underline && !c2.blink && !c2.invisible && !c2.strikethrough);
+        assert_eq!(c2.fg, Theme::default().default_fg);
+        assert_eq!(c2.bg, Theme::default().default_bg);
+    }
+
+    #[test]
+    fn test_blank_and_wide_char_placeholder_inherit_current_attributes() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // wide文字(全角)の2セル目(placeholder)も現在のSGR属性を引き継ぐこと。
+        feed(&mut t, b"\x1b[1;4m\xE3\x81\x82"); // bold+underline, "あ"(全角、UTF-8: E3 81 82)
+        assert_eq!(t.screen_cells()[1].ch.as_str(), " ");
+        assert!(t.screen_cells()[1].bold, "wide-char placeholder should inherit bold");
+        assert!(t.screen_cells()[1].underline, "wide-char placeholder should inherit underline");
+
+        // erase(`blank()`経由)で作られる空白セルも現在のSGR属性を引き継ぐこと。
+        feed(&mut t, b"\x1b[2J");
+        let c = &t.screen_cells()[0];
+        assert!(c.bold, "erased blank cells should inherit bold");
+        assert!(c.underline, "erased blank cells should inherit underline");
+    }
+
+    #[test]
+    fn test_alt_screen_roundtrip_preserves_sgr_attributes() {
+        // vim起動→終了のような alt screen 往復で、SGR属性(新規属性含む)が
+        // main側のカーソル状態として保存/復元されることを確認する
+        // (Fableレビュー: saved_cursor タプルへの属性追加漏れの回帰防止)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[1;4;3;9;5;7mmain"); // bold+underline+italic+strike+blink+reverse
+        feed(&mut t, b"\x1b[?1049h"); // alt へ(カーソル保存、alt側は属性リセットされる)
+        assert!(!t.screen_cells()[0].bold, "alt screen should start with reset attributes");
+        feed(&mut t, b"\x1b[?1049l"); // main へ復帰(保存した属性が復元される)
+        feed(&mut t, b"X"); // 復元された属性で1文字書く
+        let c = &t.screen_cells()[4]; // "main" の後ろ
+        assert!(c.bold, "restored cursor attrs after alt roundtrip should keep bold");
+        assert!(c.underline, "restored cursor attrs after alt roundtrip should keep underline");
+        assert!(c.italic, "restored cursor attrs after alt roundtrip should keep italic");
+        assert!(c.strikethrough, "restored cursor attrs after alt roundtrip should keep strikethrough");
+        assert!(c.blink, "restored cursor attrs after alt roundtrip should keep blink");
+        // reverse で fg=default_bg / bg=default_fg に実効色解決されているはず
+        assert_eq!(c.fg, Theme::default().default_bg);
+        assert_eq!(c.bg, Theme::default().default_fg);
     }
 
     #[test]

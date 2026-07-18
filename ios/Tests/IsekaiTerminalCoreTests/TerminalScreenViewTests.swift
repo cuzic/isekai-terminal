@@ -9,7 +9,11 @@ final class TerminalScreenViewTests: XCTestCase {
         let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
 
         let cells = (0..<(4 * 2)).map { i in
-            CellData(ch: i % 2 == 0 ? "A" : " ", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false)
+            CellData(
+                ch: i % 2 == 0 ? "A" : " ", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
+                dim: false, italic: false, underline: false,
+                strikethrough: false, blink: false, invisible: false
+            )
         }
         let update = ScreenUpdate(
             cols: 4, rows: 2, cells: cells,

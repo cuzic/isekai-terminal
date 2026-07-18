@@ -5,7 +5,11 @@ import XCTest
 /// Android版`TerminalScreen.kt`の`displayUpdate`と対称。
 final class TerminalScrollbackTests: XCTestCase {
     private func makeCell(_ ch: Character) -> CellData {
-        CellData(ch: String(ch), fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false)
+        CellData(
+            ch: String(ch), fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
+            dim: false, italic: false, underline: false,
+            strikethrough: false, blink: false, invisible: false
+        )
     }
 
     private func makeUpdate(rows: [String], cols: Int, cursorRow: UInt32 = 0, cursorCol: UInt32 = 0) -> ScreenUpdate {

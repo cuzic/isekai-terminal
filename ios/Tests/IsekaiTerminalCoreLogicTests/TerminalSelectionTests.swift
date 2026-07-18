@@ -5,7 +5,11 @@ import XCTest
 /// `reconstructSelectionText`)を検証する。Android版`TerminalSelectionTest.kt`相当。
 final class TerminalSelectionTests: XCTestCase {
     private func makeCell(_ ch: Character) -> CellData {
-        CellData(ch: String(ch), fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false)
+        CellData(
+            ch: String(ch), fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
+            dim: false, italic: false, underline: false,
+            strikethrough: false, blink: false, invisible: false
+        )
     }
 
     private func makeUpdate(rows: [String], cols: Int) -> ScreenUpdate {
