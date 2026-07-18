@@ -108,20 +108,28 @@ jobs:
         with:
           version: latest
 
-      - name: Install cargo-zigbuild
-        if: matrix.platform.toolchain == 'zig'
-        run: cargo install cargo-zigbuild
-
+      # cargo-zigbuildのインストールより前に置く。以前は逆順だったため、
+      # ~/.cargo/binがキャッシュ対象でも常に再インストールになっていた
+      # (ios-*-check.yml/rust-core-test-check.ymlで発覚した同種のバグ、
+      # 2026-07-14に発覚・修正)。
       - name: Cache cargo (rust-core)
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin
             rust-core/target
           key: release-build-${{ matrix.platform.target }}-${{ hashFiles('rust-core/Cargo.lock') }}
           restore-keys: |
             release-build-${{ matrix.platform.target }}-
+
+      - name: Install cargo-zigbuild
+        if: matrix.platform.toolchain == 'zig'
+        run: |
+          if ! command -v cargo-zigbuild >/dev/null; then
+            cargo install cargo-zigbuild
+          fi
 
       - name: Build (cargo build)
         if: matrix.platform.toolchain != 'zig'
