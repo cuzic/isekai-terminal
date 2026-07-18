@@ -3080,6 +3080,37 @@ Sixel対応（タスク#42）とは独立に検討したが、**現行の `vte` 
 - 上記理由により、Kitty graphics対応は実装せず対象外(won't do)としてタスク#53を完了扱いとする。
   将来vteの置き換え（別parser crateへの移行、または独自fork）を行う機会があれば再検討する。
 
+### alt-screenでのwheel→矢印キー変換（xterm `?1007` Alternate Scroll Mode相当、タスク#50の範囲外）
+
+タスク#50（Android側マウスレポーティング配線）のFableレビュー2次で、「マウスレポーティングが
+Offの間、alt-screen（pager/vim等）表示中のホイールスクロールを上下矢印キーへ変換して送るか
+（xterm `?1007` Alternate Scroll Mode相当）」を明示するよう求められた。検討の上、**この
+サブ機能はタスク#50の範囲に含めず対象外(won't do、ただし将来のrust-core側タスクで再検討可能)**
+と判断した。
+
+**確認した制約**: `rust-core`（タスク#36）は`?1000`/`?1002`/`?1003`（マウスレポーティング
+モード）と`?1006`（SGR拡張）は`Terminal`に状態として保持し`ScreenUpdate::mouse_reporting_mode`/
+`sgr_mouse_mode`経由で公開しているが、**`?1007`自体の状態は一切保持しておらず、
+`ScreenUpdate`は「現在alt screenかどうか」も公開していない**（`rust-core/src/lib.rs`の
+`ScreenUpdate`定義、`grep -n "1007\|alt_screen" rust-core/src/lib.rs rust-core/src/terminal.rs`
+で確認済み、ヒット無し）。
+
+**判断根拠**:
+
+- `.claude/rules/rust-ssot.md`の原則により、「今alt screenかどうか」「`?1007`が有効かどうか」
+  というターミナル状態の判断ロジックはRust側（`Terminal`/`ScreenUpdate`）に置くべきで、
+  Kotlin側で代替判定（例えばESCシーケンスの目視パースや別経路の状態推測）を持つのは
+  避けるべきである。
+- 上記の通りRust側に必要な状態（`?1007`保持・alt screen可視性の公開）が無いため、正しく
+  実装するにはまず rust-core 側の変更（新しいタスク）が必要であり、UI配線のみを対象とする
+  タスク#50の範囲を超える。
+- 実利は「マウスレポーティングOffのままpager/vim等でホイールスクロールしたい」という
+  限定的なケースであり、マウスレポーティング自体が有効な間のホイール処理（wheel up/down、
+  タスク#50で実装済み）で大半のユースケース（アプリ側が明示的にマウスを要求している場合）
+  はカバーされる。
+- 将来 rust-core 側に`?1007`状態保持とalt screen可視性の`ScreenUpdate`公開を追加する機会が
+  あれば、Android/iOS双方のUI配線を別タスクとして起票し再検討する。
+
 ---
 
 ## 実装順序
