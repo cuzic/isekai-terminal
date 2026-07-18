@@ -113,17 +113,21 @@ fn bind_physical_interface_with_port_range(
 /// OS-assigned ephemeral port, as before.
 ///
 /// **Known gap, environment-dependent (not Windows-wide)**: a
-/// `test-windows` CI run once failed here with
+/// `test-windows` CI run twice failed here with
 /// `MuxError::EndpointSetup("...os error 10022...")` (`WSAEINVAL`) —
 /// `noq::Endpoint::new_with_abstract_socket` itself rejected an IPv6-bound
 /// socket, even though the plain UDP bind one step earlier (this function's
-/// own family-selection logic) already succeeded. A real Windows machine
-/// running the same check (see this module's `ipv6_endpoint_setup_is_available`
-/// test helper) does *not* reproduce this — it looks like a quirk specific
-/// to that CI runner's own IPv6 stack, not a genuine Windows or `noq`
-/// limitation. Not fixed here (nothing to fix without reproducing on a real
-/// machine first); this crate's own tests probe for it at runtime and skip
-/// gracefully rather than assuming it affects Windows in general.
+/// own family-selection logic) already succeeded (the same error also hits
+/// `noq::Endpoint::server()`, the listener-side equivalent used by
+/// `quicmux::AnyMuxListener::bind_noq`). A real Windows machine running the
+/// same operations (confirmed directly by a user on their own machine, not
+/// just in theory) does *not* reproduce either failure — this looks like a
+/// quirk specific to that CI runner's own IPv6 stack, not a genuine Windows
+/// or `noq` limitation. Not fixed here (nothing to fix without reproducing
+/// on a real machine first); this crate's own tests catch the exact
+/// `EndpointSetup` error at the point of use and skip gracefully rather than
+/// assuming it affects Windows in general (see
+/// `physical_interface::tests::try_spawn_listener`).
 pub async fn connect_via_interface(
     factory: &quicmux::AnyMuxFactory,
     interface: Option<InterfaceIndex>,
@@ -152,7 +156,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
-    use quicmux::{AnyMuxFactory, AnyMuxListener, MuxClientConfig, MuxServerConfig};
+    use quicmux::{AnyMuxFactory, AnyMuxListener, MuxClientConfig, MuxError, MuxServerConfig};
 
     use super::*;
 
@@ -269,61 +273,67 @@ mod tests {
         (addr, cert_sha256_hex)
     }
 
-    /// Probes whether this environment's `noq::Endpoint::new_with_abstract_socket`
-    /// actually works for an IPv6-bound socket, independent of any QUIC
-    /// handshake. Some CI environments' IPv6 stack is broken in a way real
-    /// end-user machines are not: a `test-windows` CI run once failed here
-    /// with `MuxError::EndpointSetup("...os error 10022...")` (`WSAEINVAL`)
-    /// even though the plain `std::net::UdpSocket::bind` one line earlier
-    /// already succeeded (so IPv6 itself isn't unavailable — something more
-    /// specific inside `noq`'s own endpoint setup is), while a real Windows
-    /// machine running the exact same check succeeds cleanly. Since this
-    /// looks like a CI-runner-environment quirk rather than a genuine
-    /// Windows/`noq` limitation, tests that need IPv6 probe for it and skip
-    /// gracefully instead of a blanket `#[cfg(not(windows))]` — a real
-    /// Windows machine should still get full coverage.
-    async fn ipv6_endpoint_setup_is_available() -> bool {
-        use noq::Runtime as _;
-
-        let Ok(std_socket) = std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)) else {
-            return false;
+    /// Like [`spawn_listener`], but returns `None` (instead of panicking)
+    /// specifically when the bind fails with `MuxError::EndpointSetup` — the
+    /// exact error a `test-windows` CI run once hit for an IPv6-bound
+    /// `noq::Endpoint::server()` (`"...os error 10022..."`, `WSAEINVAL`),
+    /// which a real Windows machine running the same call does *not*
+    /// reproduce (see [`connect_via_interface_dials_an_ipv6_remote`]'s doc
+    /// comment). Any *other* error still panics — this is deliberately
+    /// narrow so a genuine regression in this crate's own logic isn't
+    /// silently swallowed as if it were the known CI-runner quirk.
+    async fn try_spawn_listener(bind_addr: SocketAddr) -> Option<(SocketAddr, String)> {
+        let (server_config, cert_sha256_hex) = build_server_config();
+        let listener = match AnyMuxListener::bind_noq(server_config, quicmux::BindSpec { local_addr: bind_addr, port_range: None }).await {
+            Ok(listener) => listener,
+            Err(MuxError::EndpointSetup(msg)) => {
+                eprintln!("try_spawn_listener({bind_addr}): noq::Endpoint::server setup rejected this bind ({msg}), skipping");
+                return None;
+            }
+            Err(e) => panic!("unexpected listener bind failure for {bind_addr}: {e}"),
         };
-        let Ok(async_socket) = noq::TokioRuntime.wrap_udp_socket(std_socket) else {
-            return false;
-        };
-        noq::Endpoint::new_with_abstract_socket(
-            noq::EndpointConfig::default(),
-            None,
-            async_socket,
-            std::sync::Arc::new(noq::TokioRuntime),
-        )
-        .is_ok()
+        let addr = SocketAddr::new(bind_addr.ip(), listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            if let Some(incoming) = listener.accept().await {
+                let _ = incoming.accept().await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        Some((addr, cert_sha256_hex))
     }
 
     /// Regression test for the IPv4-only bind this crate used to have:
     /// `connect_via_interface` must bind an address matching the remote's
     /// own family, not always IPv4 — otherwise an IPv6-only remote (e.g. a
     /// 464XLAT/NAT64 cellular interface, this crate's own motivating case
-    /// for `dual_path.rs`) could never be dialed at all. Skips itself (see
-    /// [`ipv6_endpoint_setup_is_available`]) rather than asserting on
-    /// environments where `noq`'s own IPv6 endpoint setup doesn't work.
+    /// for `dual_path.rs`) could never be dialed at all.
+    ///
+    /// A `test-windows` CI run once failed here with
+    /// `MuxError::EndpointSetup("...os error 10022...")` (`WSAEINVAL`), on
+    /// both the listener's `noq::Endpoint::server()` and (separately) the
+    /// client's `noq::Endpoint::new_with_abstract_socket()` — but a real
+    /// Windows machine running the exact same operations does not reproduce
+    /// either failure. This looks like a quirk specific to that CI runner's
+    /// own IPv6 stack rather than a genuine Windows/`noq` limitation, so
+    /// this test tries both real operations and skips gracefully only on
+    /// that exact known error (see [`try_spawn_listener`]) rather than
+    /// assuming IPv6 is broken on Windows in general via a blanket
+    /// `#[cfg(not(windows))]`.
     #[tokio::test]
     async fn connect_via_interface_dials_an_ipv6_remote() {
-        if !ipv6_endpoint_setup_is_available().await {
-            eprintln!(
-                "skipping connect_via_interface_dials_an_ipv6_remote: \
-                 this environment's noq::Endpoint setup doesn't support IPv6 \
-                 (confirmed CI-runner-specific, not a real Windows limitation — see this test's doc comment)"
-            );
+        let Some((addr, cert_sha256_hex)) = try_spawn_listener(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await else {
             return;
-        }
-
-        let (addr, cert_sha256_hex) = spawn_listener(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).await;
+        };
         let factory = AnyMuxFactory::noq(build_client_config());
         let remote = quicmux::RemoteSpec { addr, server_name: SNI.to_string(), cert_sha256_hex };
 
-        let conn = connect_via_interface(&factory, None, remote, None).await.expect("dialing an IPv6 remote should succeed");
-        assert!(conn.remote_addr().is_some());
+        match connect_via_interface(&factory, None, remote, None).await {
+            Ok(conn) => assert!(conn.remote_addr().is_some()),
+            Err(TransportError::Mux(MuxError::EndpointSetup(msg))) => {
+                eprintln!("connect_via_interface_dials_an_ipv6_remote: client-side noq::Endpoint setup rejected this bind ({msg}), skipping");
+            }
+            Err(e) => panic!("dialing an IPv6 remote failed unexpectedly: {e}"),
+        }
     }
 
     /// Regression test for the `port_range` this crate's other dial paths
