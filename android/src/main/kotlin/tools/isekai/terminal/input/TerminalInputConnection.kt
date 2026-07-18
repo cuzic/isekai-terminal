@@ -78,13 +78,19 @@ class TerminalInputConnection(
             // xterm互換の修飾子付きシーケンス(`ESC[1;5A`等)を反映するため、specialKeyBytesへ
             // そのまま渡す(rust-core`terminal_special_key_bytes`(タスク#29)と同一golden表)。
             // ソフトキーボードのトグル式Ctrl(view.ctrlArmed)とは独立で、実キーボードの修飾キーのみを見る。
+            //
+            // NumLock(event.isNumLockOn)がOFFの外付けキーボードでは、テンキーの数字キーは
+            // 矢印/Home/End/PageUp/Down相当のナビゲーションクラスタとして扱われるのが実キーボードの
+            // 標準的な挙動。この判定はKeyEvent(物理イベント)を必要とするため、KeyEventを持たない
+            // 純粋関数のTerminalKeyEncoderではなくここで行う(タスク#83、codexレビュー指摘)。
             val modifiers = TerminalKeyModifiers(
                 shift = event.isShiftPressed,
                 alt = event.isAltPressed,
                 ctrl = event.isCtrlPressed,
                 meta = event.isMetaPressed,
             )
-            TerminalKeyEncoder.specialKeyBytes(event.keyCode, view.applicationCursorMode, view.applicationKeypadMode, modifiers)?.let {
+            val effectiveKeyCode = numpadKeyCodeRespectingNumLock(event.keyCode, event.isNumLockOn)
+            TerminalKeyEncoder.specialKeyBytes(effectiveKeyCode, view.applicationCursorMode, view.applicationKeypadMode, modifiers)?.let {
                 view.onSendBytes?.invoke(it)
                 return true
             }
@@ -155,6 +161,36 @@ class TerminalInputConnection(
             (ctrl && shift && event.keyCode == KeyEvent.KEYCODE_V) || (meta && event.keyCode == KeyEvent.KEYCODE_V) ->
                 invokeShortcut(view.onPasteRequested)
             else -> false
+        }
+    }
+
+    /**
+     * NumLockがOFFの物理外付けキーボードでのテンキー数字キーを、対応するナビゲーション
+     * クラスタのキーコードに置き換える(タスク#83)。NumLock ONの場合、またはナビゲーション
+     * 相当が無いキー(中央の5・四則演算子・Enter)はそのまま返す(四則演算子/EnterはNumLockの
+     * 影響を受けないのが実キーボードの慣習)。`0`→Insert、小数点→前方Delete
+     * (`KC_INSERT`/`KC_FORWARD_DEL`、`ESC[2~`/`ESC[3~`、rust-coreの`TerminalSpecialKey::ForwardDelete`
+     * と同一シーケンス)。
+     *
+     * [TerminalKeyEncoder]自体は物理[KeyEvent]を持たない純粋関数として保つため、この判定は
+     * KeyEventを保持している呼び出し元([sendKeyEvent])側で行う。マクロ/打鍵列経由の仮想キー
+     * 送信([tools.isekai.terminal.KeySequenceCommands])は物理KeyEventを経由せず
+     * `TerminalKeyEncoder.specialKeyBytes`を直接呼ぶため、この変換の影響を受けない。
+     */
+    private fun numpadKeyCodeRespectingNumLock(keyCode: Int, numLockOn: Boolean): Int {
+        if (numLockOn) return keyCode
+        return when (keyCode) {
+            TerminalKeyEncoder.KC_NUMPAD_7 -> TerminalKeyEncoder.KC_MOVE_HOME
+            TerminalKeyEncoder.KC_NUMPAD_8 -> TerminalKeyEncoder.KC_DPAD_UP
+            TerminalKeyEncoder.KC_NUMPAD_9 -> TerminalKeyEncoder.KC_PAGE_UP
+            TerminalKeyEncoder.KC_NUMPAD_4 -> TerminalKeyEncoder.KC_DPAD_LEFT
+            TerminalKeyEncoder.KC_NUMPAD_6 -> TerminalKeyEncoder.KC_DPAD_RIGHT
+            TerminalKeyEncoder.KC_NUMPAD_1 -> TerminalKeyEncoder.KC_MOVE_END
+            TerminalKeyEncoder.KC_NUMPAD_2 -> TerminalKeyEncoder.KC_DPAD_DOWN
+            TerminalKeyEncoder.KC_NUMPAD_3 -> TerminalKeyEncoder.KC_PAGE_DOWN
+            TerminalKeyEncoder.KC_NUMPAD_0   -> TerminalKeyEncoder.KC_INSERT
+            TerminalKeyEncoder.KC_NUMPAD_DOT -> TerminalKeyEncoder.KC_FORWARD_DEL
+            else -> keyCode
         }
     }
 
