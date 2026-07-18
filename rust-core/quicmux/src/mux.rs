@@ -306,6 +306,21 @@ pub enum AnyMuxConnection {
 }
 
 impl AnyMuxConnection {
+    /// Wraps an already-established `noq::Connection` a caller obtained
+    /// through its own connect/accept path — e.g. one that drove
+    /// `noq::Endpoint`/`noq::Connection::open_path` directly instead of
+    /// going through this crate's [`AnyMuxFactory`]/[`AnyMuxEndpoint`]/
+    /// [`AnyMuxListener`] (see
+    /// [`crate::noq_backend::NoqConnection::from_connection`]'s docs for a
+    /// concrete example). Lets that connection be driven the same way as any
+    /// other [`AnyMuxConnection`] — including its datagram plane
+    /// (`send_datagram`/`recv_datagram`/etc.) — without the caller needing
+    /// two separate APIs depending on where the connection came from.
+    #[cfg(feature = "noq")]
+    pub fn from_noq_connection(conn: noq::Connection) -> Self {
+        Self::Noq(crate::noq_backend::NoqConnection::from_connection(conn))
+    }
+
     /// Opens a new bidirectional stream on this connection.
     pub async fn open_bi(&self) -> Result<AnyByteStream, MuxError> {
         match self {

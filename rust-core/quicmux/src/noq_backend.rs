@@ -473,6 +473,23 @@ pub struct NoqConnection {
 }
 
 impl NoqConnection {
+    /// Wraps an already-established `noq::Connection` obtained outside this
+    /// crate's own `NoqFactory`/`NoqEndpoint`/`NoqListener` connect/accept
+    /// path, so a caller holding such a connection can still reach this
+    /// crate's datagram API (`AnyMuxConnection::send_datagram` et al.)
+    /// without re-implementing it against the raw `noq` type itself.
+    ///
+    /// Concrete example: `isekai_transport::MultipathConnection::conn`,
+    /// which `isekai-transport::multipath` builds by driving
+    /// `noq::Endpoint`/`noq::Connection::open_path` directly (deliberately
+    /// "noq-concrete", not built through this crate — see that module's own
+    /// docs on why).
+    pub fn from_connection(conn: noq::Connection) -> Self {
+        Self { conn }
+    }
+}
+
+impl NoqConnection {
     pub(crate) async fn open_bi(&self) -> Result<NoqByteStream, MuxError> {
         let (send, recv) = self.conn.open_bi().await.map_err(map_connection_error)?;
         Ok(NoqByteStream { send, recv })

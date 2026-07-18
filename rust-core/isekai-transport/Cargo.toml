@@ -76,3 +76,6 @@ env_logger = "0.11"
 # `[dependencies]`エントリ(`proof.rs`/`candidate_pool.rs`等が使用)がテストにも
 # そのまま見えるので、ここで別途宣言する必要はない。
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# tests/multipath_datagram_e2e.rsがAnyMuxConnection::send_datagram(Bytes)を
+# 直接呼ぶために使う。
+bytes = "1"

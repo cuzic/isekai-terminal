@@ -1949,6 +1949,7 @@ name = "isekai-transport"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "env_logger",
  "hmac",
  "isekai-protocol",
