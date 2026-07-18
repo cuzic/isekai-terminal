@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use vte::Perform;
 use crate::sixel::{SixelDecoder, SixelImage};
 use crate::theme::Theme;
-use crate::{CursorShape, ImagePlacement, MouseReportingMode, TerminalKeyModifiers};
+use crate::{CursorShape, ImagePlacement, MouseButton, MouseEventKind, MouseReportingMode, TerminalKeyModifiers};
 
 /// Sixel(タスク#42)の名目セルサイズ(ピクセル)。実フォントのピクセルサイズは
 /// このRustコアには分からない(Android/iOSの実描画レイヤーのみが知っている)ため、
@@ -443,32 +443,6 @@ fn default_tab_stops(cols: usize) -> Vec<bool> {
     (0..cols).map(|c| c % 8 == 0).collect()
 }
 
-/// マウスレポーティング(タスク#36)対象のボタン。左/中/右クリックに加え、
-/// モバイルでの主なユースケースであるホイール(縦スクロールジェスチャ)を含める
-/// (Fableレビュー指摘: wheelボタン64/65のエンコードを範囲に含める)。
-/// 横スクロールホイール(button 6/7)・追加ボタン(button 8以降)は現状使う予定が
-/// ないため未対応(必要になったタスクで追加する)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MouseButton {
-    Left,
-    Middle,
-    Right,
-    WheelUp,
-    WheelDown,
-}
-
-/// マウスレポーティング(タスク#36)対象のイベント種別。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MouseEventKind {
-    /// ボタン押下(ホイールは常にこの種別で表す — ホイールにはreleaseの概念が無い)。
-    Press,
-    /// ボタン解放。
-    Release,
-    /// ポインタ移動。`button`が`Some`ならドラッグ(ボタンを押したまま移動)、
-    /// `None`なら単純なホバー移動。
-    Motion,
-}
-
 /// UI層(#50/#51)からRustへ渡す、座標付きの生ポインタイベント(rust-ssot:
 /// 「今どのマウスモードか」「このイベントを報告すべきか」の判断はUI層に持たせず、
 /// Rust側の[Terminal::encode_pointer_event]が[MouseReportingMode]/SGRモードを
@@ -504,6 +478,91 @@ fn mouse_button_base_code(button: Option<MouseButton>) -> u8 {
 /// (xterm自身の実装がAltキーをこのビットに使っているのに倣う)。
 fn mouse_modifier_bits(m: TerminalKeyModifiers) -> u8 {
     (if m.shift { 4 } else { 0 }) | (if m.alt { 8 } else { 0 }) | (if m.ctrl { 16 } else { 0 })
+}
+
+/// [PointerEvent]を、`cols`/`rows`(端末の実サイズ)・`mode`([MouseReportingMode])・
+/// `sgr`(`?1006`有効か)に従ってターミナルへ送るべきバイト列にエンコードする
+/// (タスク#36)。[Terminal::encode_pointer_event]から`self`の対応フィールドを渡して
+/// 呼ばれるほか、`lib.rs::terminal_pointer_event_bytes`(タスク#51、UI層が
+/// `ScreenUpdate`から読んだ`mouse_reporting_mode`/`sgr_mouse_mode`/`cols`/`rows`を
+/// そのまま渡す`#[uniffi::export]`関数)からも直接呼ばれる——`Terminal`インスタンス
+/// (実行中セッション)を経由せずにこのエンコードロジックだけをUI層から使いたい
+/// (rust-ssot: 「今どのマウスモードか」の判断はここに一元化し、UI層にミラーしない)
+/// ため、状態を持たない自由関数として切り出してある。報告すべきでないイベント
+/// (モードがOff、またはモードが対象外のイベント種別)は`None`を返す——
+/// 呼び出し元はこれを「何も送らない」の合図として扱えばよい。
+///
+/// # モードごとの報告対象(xterm互換)
+/// - `Off`: 何も報告しない。
+/// - `Normal`(`?1000`): press/releaseのみ(移動は報告しない)。
+/// - `ButtonEvent`(`?1002`): 上記に加え、ボタンを押したままの移動(drag、
+///   `button.is_some()`)のみ報告する。ボタン無しの単純な移動は無視する。
+/// - `AnyEvent`(`?1003`): ボタン状態に関係なく全ての移動を報告する。
+///
+/// ホイール(`WheelUp`/`WheelDown`)は常に`Press`種別として渡される前提
+/// (releaseの概念が無いため)で、`Normal`を含む全モードで報告される
+/// (press/release扱いの分岐に乗るため)。
+///
+/// # エンコード形式
+/// - `?1006`(SGR)有効時: `ESC [ < Cb ; Cx ; Cy M`(press/drag)または
+///   `ESC [ < Cb ; Cx ; Cy m`(release)。座標は1-based・10進数で桁数の
+///   制限が無い。releaseでもどのボタンが離されたかを`Cb`にそのまま残せる
+///   (`M`/`m`の違いだけでpress/releaseを区別する)。
+/// - `?1006`無効時(レガシーX10形式): `ESC [ M Cb Cx Cy`(3バイトとも
+///   `値+32`の単一バイト)。仕様上1バイトにしかエンコードできないため、
+///   座標は`223`(`255 - 32`)で頭打ちにクランプする——`1000`だけ有効で
+///   `1006`を送らないアプリ(古いtmux等)向けの互換性を意図的に実装する
+///   判断(Fableレビュー指摘: 割り切って未実装にするのではなくクランプして
+///   実装する)。また、レガシー形式は「どのボタンが離されたか」を表現できず
+///   仕様上常に`3`(no button)を報告する(SGRとの意図的な差)。
+pub(crate) fn encode_pointer_event_bytes(
+    event: PointerEvent,
+    cols: usize,
+    rows: usize,
+    mode: MouseReportingMode,
+    sgr: bool,
+) -> Option<Vec<u8>> {
+    let reportable = match event.kind {
+        MouseEventKind::Press | MouseEventKind::Release => mode != MouseReportingMode::Off,
+        MouseEventKind::Motion => match mode {
+            MouseReportingMode::Off | MouseReportingMode::Normal => false,
+            MouseReportingMode::ButtonEvent => event.button.is_some(),
+            MouseReportingMode::AnyEvent => true,
+        },
+    };
+    if !reportable {
+        return None;
+    }
+
+    let base = mouse_button_base_code(event.button);
+    let modifier_bits = mouse_modifier_bits(event.modifiers);
+    // motionビット(32)はドラッグ/ホバー移動のみ。ホイールは移動ではない
+    // (常にPress扱い)ためbaseが既に64/65であり、このビットは付与しない
+    // (xterm実装も同様——wheelイベントにmotionビットは立たない)。
+    let motion_bit = if event.kind == MouseEventKind::Motion { 0x20 } else { 0 };
+    // 呼び出し元が実際の画面外の座標を渡してきても、この端末の実サイズ
+    // (`cols`/`rows`)内へクランプしてからエンコードする——[PointerEvent]の
+    // docコメントで約束している通り、範囲チェックの責務はここに閉じる
+    // (codexレビュー指摘: SGR側が無クランプだと、例えば80列の端末でも
+    // ドラッグ中に列1001のような存在しない座標を報告できてしまっていた)。
+    let col = event.col.min(cols.saturating_sub(1));
+    let row = event.row.min(rows.saturating_sub(1));
+
+    if sgr {
+        let cb = base as u32 + modifier_bits as u32 + motion_bit as u32;
+        let terminator = if event.kind == MouseEventKind::Release { 'm' } else { 'M' };
+        Some(format!("\x1b[<{};{};{}{}", cb, col + 1, row + 1, terminator).into_bytes())
+    } else {
+        // レガシーX10形式: releaseはどのボタンだったか表現できないため
+        // 仕様上常に`3`(no button)を使う。
+        let legacy_base = if event.kind == MouseEventKind::Release { 3 } else { base };
+        let cb = (legacy_base as u32 + modifier_bits as u32 + motion_bit as u32).min(255 - 32) as u8;
+        // 1バイトにしかエンコードできないため、端末サイズへのクランプに加えて
+        // プロトコル上の上限223(`255 - 32`)でも頭打ちにする(端末自体が223列/行を
+        // 超える場合の保険。Fableレビュー指摘の設計判断)。
+        let clamp_coord = |v: usize| -> u8 { (v.min(223 - 1) as u8) + 1 + 32 };
+        Some(vec![0x1B, b'[', b'M', 32 + cb, clamp_coord(col), clamp_coord(row)])
+    }
 }
 
 impl Terminal {
@@ -1411,77 +1470,13 @@ impl Terminal {
 
     /// 座標付きの生ポインタイベント([PointerEvent])を、現在の
     /// [MouseReportingMode]/SGRモード(`?1006`)に従ってターミナルへ送るべき
-    /// バイト列にエンコードする(タスク#36)。報告すべきでないイベント
-    /// (モードがOff、またはモードが対象外のイベント種別)は`None`を返す——
-    /// 呼び出し元はこれを「何も送らない」の合図として扱えばよい。
-    ///
-    /// # モードごとの報告対象(xterm互換)
-    /// - `Off`: 何も報告しない。
-    /// - `Normal`(`?1000`): press/releaseのみ(移動は報告しない)。
-    /// - `ButtonEvent`(`?1002`): 上記に加え、ボタンを押したままの移動(drag、
-    ///   `button.is_some()`)のみ報告する。ボタン無しの単純な移動は無視する。
-    /// - `AnyEvent`(`?1003`): ボタン状態に関係なく全ての移動を報告する。
-    ///
-    /// ホイール(`WheelUp`/`WheelDown`)は常に`Press`種別として渡される前提
-    /// (releaseの概念が無いため)で、`Normal`を含む全モードで報告される
-    /// (press/release扱いの分岐に乗るため)。
-    ///
-    /// # エンコード形式
-    /// - `?1006`(SGR)有効時: `ESC [ < Cb ; Cx ; Cy M`(press/drag)または
-    ///   `ESC [ < Cb ; Cx ; Cy m`(release)。座標は1-based・10進数で桁数の
-    ///   制限が無い。releaseでもどのボタンが離されたかを`Cb`にそのまま残せる
-    ///   (`M`/`m`の違いだけでpress/releaseを区別する)。
-    /// - `?1006`無効時(レガシーX10形式): `ESC [ M Cb Cx Cy`(3バイトとも
-    ///   `値+32`の単一バイト)。仕様上1バイトにしかエンコードできないため、
-    ///   座標は`223`(`255 - 32`)で頭打ちにクランプする——`1000`だけ有効で
-    ///   `1006`を送らないアプリ(古いtmux等)向けの互換性を意図的に実装する
-    ///   判断(Fableレビュー指摘: 割り切って未実装にするのではなくクランプして
-    ///   実装する)。また、レガシー形式は「どのボタンが離されたか」を表現できず
-    ///   仕様上常に`3`(no button)を報告する(SGRとの意図的な差)。
+    /// バイト列にエンコードする(タスク#36)。実体は[encode_pointer_event_bytes]
+    /// (この`Terminal`インスタンスの状態を持たない自由関数)へ委譲する——
+    /// 同じエンコードロジックを、UI層(#50/#51)がRust側セッション状態を経由せず
+    /// 直接呼べる`#[uniffi::export]`関数(`lib.rs::terminal_pointer_event_bytes`)
+    /// からも再利用するため(タスク#51)。
     pub(crate) fn encode_pointer_event(&self, event: PointerEvent) -> Option<Vec<u8>> {
-        let reportable = match event.kind {
-            MouseEventKind::Press | MouseEventKind::Release => {
-                self.mouse_reporting_mode != MouseReportingMode::Off
-            }
-            MouseEventKind::Motion => match self.mouse_reporting_mode {
-                MouseReportingMode::Off | MouseReportingMode::Normal => false,
-                MouseReportingMode::ButtonEvent => event.button.is_some(),
-                MouseReportingMode::AnyEvent => true,
-            },
-        };
-        if !reportable {
-            return None;
-        }
-
-        let base = mouse_button_base_code(event.button);
-        let modifier_bits = mouse_modifier_bits(event.modifiers);
-        // motionビット(32)はドラッグ/ホバー移動のみ。ホイールは移動ではない
-        // (常にPress扱い)ためbaseが既に64/65であり、このビットは付与しない
-        // (xterm実装も同様——wheelイベントにmotionビットは立たない)。
-        let motion_bit = if event.kind == MouseEventKind::Motion { 0x20 } else { 0 };
-        // 呼び出し元(将来のUI層)が実際の画面外の座標を渡してきても、この端末の
-        // 実サイズ(`cols`/`rows`)内へクランプしてからエンコードする——[PointerEvent]
-        // のdocコメントで約束している通り、範囲チェックの責務はここに閉じる
-        // (codexレビュー指摘: SGR側が無クランプだと、例えば80列の端末でも
-        // ドラッグ中に列1001のような存在しない座標を報告できてしまっていた)。
-        let col = event.col.min(self.cols.saturating_sub(1));
-        let row = event.row.min(self.rows.saturating_sub(1));
-
-        if self.sgr_mouse_mode {
-            let cb = base as u32 + modifier_bits as u32 + motion_bit as u32;
-            let terminator = if event.kind == MouseEventKind::Release { 'm' } else { 'M' };
-            Some(format!("\x1b[<{};{};{}{}", cb, col + 1, row + 1, terminator).into_bytes())
-        } else {
-            // レガシーX10形式: releaseはどのボタンだったか表現できないため
-            // 仕様上常に`3`(no button)を使う。
-            let legacy_base = if event.kind == MouseEventKind::Release { 3 } else { base };
-            let cb = (legacy_base as u32 + modifier_bits as u32 + motion_bit as u32).min(255 - 32) as u8;
-            // 1バイトにしかエンコードできないため、端末サイズへのクランプに加えて
-            // プロトコル上の上限223(`255 - 32`)でも頭打ちにする(端末自体が223列/行を
-            // 超える場合の保険。Fableレビュー指摘の設計判断)。
-            let clamp_coord = |v: usize| -> u8 { (v.min(223 - 1) as u8) + 1 + 32 };
-            Some(vec![0x1B, b'[', b'M', 32 + cb, clamp_coord(col), clamp_coord(row)])
-        }
+        encode_pointer_event_bytes(event, self.cols, self.rows, self.mouse_reporting_mode, self.sgr_mouse_mode)
     }
 
     /// フォーカスレポーティング(`?1004`、タスク#60)が有効な場合のみ、OS由来のフォーカス
