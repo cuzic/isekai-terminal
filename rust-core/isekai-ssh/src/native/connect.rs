@@ -7,13 +7,19 @@
 //! + terminal size) into one working `isekai-ssh <destination>` path that
 //! never shells out to `ssh(1)`.
 //!
-//! **Scope note**: the `ConnectOutcome`-driven silent re-bootstrap retry
+//! **Scope note**: the `ConnectOutcome`-driven re-bootstrap retry
 //! (`always-connects.md`) *is* implemented here, mirroring
 //! `wrapper.rs::run_ssh_with_connect_failure_recovery` — an already-trusted
 //! destination whose cached deployment went stale/unreachable self-heals
 //! without the user running `isekai-ssh init`/`doctor --fix` manually (the
 //! re-deploy goes through `bootstrap_and_register`, which dispatches to M3's
-//! `RusshBackend` on Windows, so it no longer shells out to `ssh(1)`). What
+//! `RusshBackend` on Windows, so it no longer shells out to `ssh(1)`). The
+//! helper re-deploy itself is silent (no `[y/N]` trust confirmation — the
+//! profile was already trusted once), but this is not "zero prompts": if the
+//! bootstrap host's own SSH host key isn't trusted yet, `RusshBackend`'s
+//! host-key TOFU still confirms it — a separate, orthogonal prompt that is
+//! `always-connects.md`'s stated first-time-TOFU exception (see
+//! [`run_native_connect_with_recovery`]). What
 //! this path still does *not* do is auto-bootstrap a *brand-new*
 //! (never-registered) destination on first contact: a trust-store miss still
 //! fails with guidance to run `isekai-ssh init` manually (the initial TOFU
@@ -28,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use isekai_pipe_core::{claim_connect_outcome, default_runtime_dir, ConnectionIntent};
 use russh::client;
 use russh_stream_session::{authenticate_session, establish_over_stream, open_channel, verifying_handler, SessionError, SessionKind};
@@ -84,28 +91,40 @@ pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
 /// Windows-native path (`always-connects.md`): runs one connect attempt; if
 /// it fails *and* the `isekai-pipe connect` child left behind a
 /// `ConnectOutcome` side-channel signal for this exact attempt
-/// (`isekai_pipe_core::claim_connect_outcome`), silently re-bootstraps the
+/// (`isekai_pipe_core::claim_connect_outcome`), re-deploys the helper for the
 /// (already-trusted) profile and retries exactly once more. Structurally at
 /// most two connect attempts ever happen — no loop, no recursion — matching
 /// that function's own "at most two attempts" property, so it cannot run
 /// away even if the retry also fails.
 ///
+/// "Silent" here means the *helper re-deploy* takes no `[y/N]` trust
+/// confirmation (`TofuConfirmation::Silent`) — the profile was already
+/// trusted once. It does **not** mean zero prompts ever: the re-deploy dials
+/// the bootstrap host over SSH, and if that host's own SSH host key isn't yet
+/// in the trust store, `RusshBackend`'s host-key TOFU
+/// (`isekai_trust::FileBackedHostKeyVerifier`) still asks the user to confirm
+/// it. That's a separate, orthogonal first-time-TOFU prompt, and it's the
+/// stated exception in `always-connects.md` (a genuinely new host key needs a
+/// human), not a violation of the "always-connects" principle.
+///
 /// The connect-failure *decision* is single-sourced with the Unix path via
-/// `crate::wrapper::decide_connect_failure_recovery` (unit-tested there) —
-/// keeping the "always-connects" policy from drifting between the two paths.
+/// `crate::wrapper::decide_connect_failure_recovery` (unit-tested there), and
+/// the *sequencing* (attempt → claim → maybe re-bootstrap → retry once) is
+/// factored into [`drive_connect_recovery`] over the [`ConnectRecoveryOps`]
+/// trait so it's unit-tested here against a fake, apart from the full e2e
+/// flow — keeping the policy from drifting between the two paths.
 ///
 /// Only reachable *after* `build_connection_intent` already succeeded once
 /// in [`run`] — a brand-new (never-registered) profile's own interactive
 /// bootstrap is out of scope for this path (see the module docs).
 ///
-/// **Not covered by an automated test on the native side**: the full
-/// spawn→outcome→silent-rebootstrap→retry loop needs a real `isekai-pipe
-/// connect` child, a mock `sshd` deploy target, and a planted
-/// `ConnectOutcome` — the heavy harness
-/// `tests/wrapper_stale_trust_auto_recovery_e2e.rs` already builds for the
-/// Unix path, whose `bootstrap_and_register`/`claim_connect_outcome` this
-/// path shares verbatim. The cheap, reliable branch (a connect failure with
-/// no outcome signal propagating unchanged) is unit-tested below.
+/// **What stays e2e-untested on the native side**: only the real
+/// [`ConnectRecoveryOps`] implementation ([`NativeConnectOps`]) — i.e. that a
+/// *real* `isekai-pipe connect` child + mock `sshd` deploy actually wire
+/// through — is left to the harness `tests/wrapper_stale_trust_auto_recovery_e2e.rs`
+/// already builds for the Unix path, whose `bootstrap_and_register`/
+/// `claim_connect_outcome` this path shares verbatim. The sequencing logic
+/// itself is fully unit-tested below via a fake.
 async fn run_native_connect_with_recovery(
     plan: &WrapperPlan,
     resolution: &WrapperResolution,
@@ -113,15 +132,48 @@ async fn run_native_connect_with_recovery(
     intent: ConnectionIntent,
     runtime_dir: &Path,
 ) -> Result<u8> {
-    let first_error = match connect_attempt(plan, resolution, host_config, &intent, runtime_dir).await {
+    let mut ops = NativeConnectOps { plan, resolution, host_config, runtime_dir };
+    drive_connect_recovery(&mut ops, intent).await
+}
+
+/// The I/O-bound operations [`drive_connect_recovery`] sequences, factored
+/// into a trait so the recovery *sequencing* is unit-testable against a fake
+/// that records calls, without a real `isekai-pipe connect` child or a mock
+/// `sshd` deploy target — mirroring how `wrapper.rs::decide_connect_failure_recovery`
+/// is unit-tested apart from the full e2e flow. `?Send` because the real
+/// attempt future holds non-`Send` terminal state (a `RawModeGuard`) across
+/// await points and is only ever `block_on`'d, never `spawn`ed.
+#[async_trait(?Send)]
+trait ConnectRecoveryOps {
+    /// One full connect attempt against `intent` (spawn + auth + shell + I/O
+    /// loop). `Err` means the connection could never be established — the
+    /// failure mode a `ConnectOutcome` signal accompanies.
+    async fn attempt(&mut self, intent: &ConnectionIntent) -> Result<u8>;
+    /// Claims the `ConnectOutcome` signal `isekai-pipe connect` may have left
+    /// behind for this exact attempt, if any.
+    fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>>;
+    /// Whether auto-bootstrap is currently allowed (`--isekai-no-bootstrap` /
+    /// `#@isekai bootstrap-policy never` turn it off).
+    fn should_bootstrap(&self) -> bool;
+    /// Re-deploys the helper for the already-trusted profile (no `[y/N]` trust
+    /// confirmation — see [`run_native_connect_with_recovery`]'s docs on the
+    /// separate host-key TOFU prompt), then rebuilds the intent from the
+    /// refreshed trust material.
+    async fn rebootstrap_and_rebuild_intent(&mut self) -> Result<ConnectionIntent>;
+}
+
+/// Pure sequencing of the "always-connects" recovery, generic over
+/// [`ConnectRecoveryOps`] so the retry path is testable without real I/O.
+/// At most two `attempt`s ever happen (see [`run_native_connect_with_recovery`]).
+async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: ConnectionIntent) -> Result<u8> {
+    let first_error = match ops.attempt(&intent).await {
         Ok(exit_code) => return Ok(exit_code),
         Err(e) => e,
     };
 
-    let outcome = claim_connect_outcome(runtime_dir, &intent.intent_id)
-        .map_err(|e| anyhow!("isekai-ssh: failed to check for a connect-failure signal: {e}"))?;
+    let outcome = ops.claim_outcome(&intent.intent_id)?;
 
-    match decide_connect_failure_recovery(outcome.is_some(), should_bootstrap(plan, resolution)) {
+    match decide_connect_failure_recovery(outcome.is_some(), ops.should_bootstrap()) {
         ConnectFailureRecoveryAction::NoRecoverableSignal => Err(first_error),
         ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
             let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
@@ -129,7 +181,7 @@ async fn run_native_connect_with_recovery(
                 "isekai-ssh: {} for {:?} ({}), but auto-bootstrap is disabled \
                  (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
                 outcome_summary(&outcome.class),
-                resolution.profile(),
+                outcome.profile,
                 outcome.detail
             );
             Err(first_error)
@@ -137,19 +189,51 @@ async fn run_native_connect_with_recovery(
         ConnectFailureRecoveryAction::RebootstrapAndRetry => {
             let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
             log_line!(
-                "isekai-ssh: {} for {:?} ({}); refreshing automatically...",
+                "isekai-ssh: {} for {:?} ({}); re-deploying the helper automatically \
+                 (if the SSH host key isn't trusted yet, host-key confirmation is a separate prompt)...",
                 outcome_summary(&outcome.class),
-                resolution.profile(),
+                outcome.profile,
                 outcome.detail
             );
-            if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
-                print_bootstrap_failure_guidance(&bootstrap_err);
-                return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
-            }
-            let intent2 = build_connection_intent(resolution)
-                .context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
-            connect_attempt(plan, resolution, host_config, &intent2, runtime_dir).await
+            let intent2 = ops.rebootstrap_and_rebuild_intent().await?;
+            ops.attempt(&intent2).await
         }
+    }
+}
+
+/// The real [`ConnectRecoveryOps`] backed by an actual `isekai-pipe connect`
+/// child, the on-disk `ConnectOutcome` side channel, and
+/// `bootstrap_and_register`.
+struct NativeConnectOps<'a> {
+    plan: &'a WrapperPlan,
+    resolution: &'a WrapperResolution,
+    host_config: &'a openssh_config::HostConfig,
+    runtime_dir: &'a Path,
+}
+
+#[async_trait(?Send)]
+impl ConnectRecoveryOps for NativeConnectOps<'_> {
+    async fn attempt(&mut self, intent: &ConnectionIntent) -> Result<u8> {
+        connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir).await
+    }
+
+    fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
+        claim_connect_outcome(self.runtime_dir, intent_id)
+            .map_err(|e| anyhow!("isekai-ssh: failed to check for a connect-failure signal: {e}"))
+    }
+
+    fn should_bootstrap(&self) -> bool {
+        should_bootstrap(self.plan, self.resolution)
+    }
+
+    async fn rebootstrap_and_rebuild_intent(&mut self) -> Result<ConnectionIntent> {
+        bootstrap_and_register(self.plan, self.resolution, TofuConfirmation::Silent)
+            .await
+            .map_err(|e| {
+                print_bootstrap_failure_guidance(&e);
+                e.context("isekai-ssh: automatic re-bootstrap after a connect failure failed")
+            })?;
+        build_connection_intent(self.resolution).context("isekai-ssh: still not trusted after automatic re-bootstrap")
     }
 }
 
@@ -847,5 +931,151 @@ mod tests {
 
         let without_flag = crate::wrapper::parse_wrapper(vec!["somehost".to_string()]).unwrap();
         assert_eq!(without_flag.log_file(), None);
+    }
+
+    // -----------------------------------------------------------------
+    // always-connects recovery *sequencing* tests (Finding 3): drive
+    // `drive_connect_recovery` against a fake `ConnectRecoveryOps` so the
+    // attempt→claim→(maybe re-bootstrap)→retry-once wiring is covered without
+    // a real isekai-pipe child or a mock sshd deploy. The real
+    // `NativeConnectOps` wiring is covered by the Unix e2e harness this path
+    // shares (`wrapper_stale_trust_auto_recovery_e2e.rs`).
+    // -----------------------------------------------------------------
+
+    /// A fake [`ConnectRecoveryOps`] that returns queued `attempt` results and
+    /// records how many times `attempt`/`rebootstrap_and_rebuild_intent` ran.
+    struct FakeRecoveryOps {
+        attempt_results: std::collections::VecDeque<std::result::Result<u8, String>>,
+        attempt_calls: usize,
+        outcome: Option<isekai_pipe_core::ConnectOutcome>,
+        should_bootstrap: bool,
+        rebootstrap_calls: usize,
+        rebootstrap_ok: bool,
+    }
+
+    fn fake_outcome(class: isekai_pipe_core::ConnectOutcomeClass) -> isekai_pipe_core::ConnectOutcome {
+        isekai_pipe_core::ConnectOutcome {
+            schema_version: 1,
+            intent_id: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            profile: "prod".to_string(),
+            class,
+            detail: "test detail".to_string(),
+        }
+    }
+
+    fn fake_intent() -> ConnectionIntent {
+        use isekai_pipe_core::{BootstrapProvenance, IntentTransport, ServerIdentity};
+        ConnectionIntent::new(
+            "prod",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::Relay {
+                helper_addr: "203.0.113.5:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "example.com:22".to_string() },
+        )
+    }
+
+    #[async_trait(?Send)]
+    impl ConnectRecoveryOps for FakeRecoveryOps {
+        async fn attempt(&mut self, _intent: &ConnectionIntent) -> Result<u8> {
+            self.attempt_calls += 1;
+            match self.attempt_results.pop_front().expect("attempt called more times than the test queued results for") {
+                Ok(code) => Ok(code),
+                Err(msg) => Err(anyhow!(msg)),
+            }
+        }
+        fn claim_outcome(&self, _intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
+            Ok(self.outcome.clone())
+        }
+        fn should_bootstrap(&self) -> bool {
+            self.should_bootstrap
+        }
+        async fn rebootstrap_and_rebuild_intent(&mut self) -> Result<ConnectionIntent> {
+            self.rebootstrap_calls += 1;
+            if self.rebootstrap_ok {
+                Ok(fake_intent())
+            } else {
+                Err(anyhow!("re-bootstrap failed"))
+            }
+        }
+    }
+
+    /// The important path Codex flagged as untested: a first attempt fails, a
+    /// `ConnectOutcome` signal is present, auto-bootstrap is allowed → the
+    /// helper is re-deployed exactly once and the connection is retried
+    /// exactly once, returning the retry's success.
+    #[tokio::test]
+    async fn recovery_rebootstraps_once_and_retries_once_on_a_signal() {
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("first attempt failed".to_string()), Ok(7)].into_iter().collect(),
+            attempt_calls: 0,
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable)),
+            should_bootstrap: true,
+            rebootstrap_calls: 0,
+            rebootstrap_ok: true,
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert_eq!(result.unwrap(), 7, "the retry's exit code must be returned");
+        assert_eq!(ops.attempt_calls, 2, "exactly one retry after the first failure");
+        assert_eq!(ops.rebootstrap_calls, 1, "the helper must be re-deployed exactly once");
+    }
+
+    /// If the automatic re-bootstrap itself fails, its error propagates and
+    /// there is no second connect attempt (structurally ≤2 attempts, and the
+    /// retry is gated on a successful re-bootstrap).
+    #[tokio::test]
+    async fn recovery_propagates_a_failed_rebootstrap_without_retrying() {
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("first attempt failed".to_string())].into_iter().collect(),
+            attempt_calls: 0,
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::StaleTrust)),
+            should_bootstrap: true,
+            rebootstrap_calls: 0,
+            rebootstrap_ok: false,
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert!(result.is_err(), "a failed re-bootstrap must surface as an error");
+        assert_eq!(ops.rebootstrap_calls, 1, "re-bootstrap was attempted once");
+        assert_eq!(ops.attempt_calls, 1, "no retry happens when the re-bootstrap failed");
+    }
+
+    /// A signal is present but auto-bootstrap is disabled → the original
+    /// connect error propagates, no re-bootstrap, no retry.
+    #[tokio::test]
+    async fn recovery_does_not_rebootstrap_when_auto_bootstrap_is_disabled() {
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("first attempt failed".to_string())].into_iter().collect(),
+            attempt_calls: 0,
+            outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable)),
+            should_bootstrap: false,
+            rebootstrap_calls: 0,
+            rebootstrap_ok: true,
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert!(result.is_err(), "with auto-bootstrap disabled the original error must propagate");
+        assert_eq!(ops.rebootstrap_calls, 0, "auto-bootstrap disabled means no re-deploy");
+        assert_eq!(ops.attempt_calls, 1, "no retry when auto-bootstrap is disabled");
+    }
+
+    /// No signal at all → the original error propagates unchanged, no
+    /// re-bootstrap, no retry (a remote command that merely exited non-zero,
+    /// or a failure `isekai-pipe connect` didn't classify).
+    #[tokio::test]
+    async fn recovery_propagates_original_error_without_a_signal() {
+        let mut ops = FakeRecoveryOps {
+            attempt_results: [Err("first attempt failed".to_string())].into_iter().collect(),
+            attempt_calls: 0,
+            outcome: None,
+            should_bootstrap: true,
+            rebootstrap_calls: 0,
+            rebootstrap_ok: true,
+        };
+        let result = drive_connect_recovery(&mut ops, fake_intent()).await;
+        assert!(result.is_err(), "no signal means the original error propagates");
+        assert_eq!(ops.rebootstrap_calls, 0, "no signal means no re-deploy");
+        assert_eq!(ops.attempt_calls, 1, "no signal means no retry");
     }
 }
