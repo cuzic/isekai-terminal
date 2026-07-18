@@ -21,6 +21,14 @@ fn ansi256_to_argb(theme: &Theme, n: u8) -> u32 {
     }
 }
 
+/// セルが表示する文字の見た目上の幅(1 または 2)。`is_wide_placeholder` セル自体は
+/// 常に `" "`(幅1)を保持するため、このヘルパーは「そのセルの `ch` 自体が全角文字の
+/// 本体か」を判定するのに使う([Terminal::sanitize_wide_row] 参照)。
+fn cell_display_width(cell: &TermCell) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    cell.ch.chars().next().and_then(|c| c.width()).unwrap_or(1)
+}
+
 #[derive(Clone)]
 pub(crate) struct TermCell {
     pub(crate) ch: smol_str::SmolStr,
@@ -608,6 +616,112 @@ impl Terminal {
         }
     }
 
+    /// [insert_chars]/[delete_chars] が行内で全角(wide)文字の片割れを分断してしまった
+    /// 場合の後始末(タスク#47)。「本体セル(ch の表示幅==2)の右隣が
+    /// `is_wide_placeholder` である」「プレースホルダセルの左隣が本体セルである」の
+    /// 対応関係が崩れた片割れを、それぞれ通常の空白セルへ変換する——挿入/削除で
+    /// 本体とプレースホルダの間に別セルが割り込んだ、または片方だけが行の反対側へ
+    /// シフトされて対応が消えた状態を放置すると、以後の描画で幅の合わない孤立した
+    /// 全角文字グリフや、本体を持たない浮いたプレースホルダが残る。
+    fn sanitize_wide_row(&mut self, row: usize) {
+        let cols = self.cols;
+        let row_base = row * cols;
+        for c in 0..cols {
+            if self.cells()[row_base + c].is_wide_placeholder {
+                let left_is_wide_head =
+                    c > 0 && cell_display_width(&self.cells()[row_base + c - 1]) == 2;
+                if !left_is_wide_head {
+                    self.cells_mut()[row_base + c].is_wide_placeholder = false;
+                }
+            } else if cell_display_width(&self.cells()[row_base + c]) == 2 {
+                let right_is_placeholder =
+                    c + 1 < cols && self.cells()[row_base + c + 1].is_wide_placeholder;
+                if !right_is_placeholder {
+                    // 片割れを失った本体を空白へ変換する。色・装飾等の他の属性は
+                    // (壊れた復旧時の見た目として無難なので)そのまま残す。
+                    self.cells_mut()[row_base + c].ch = smol_str::SmolStr::new_inline(" ");
+                }
+            }
+        }
+    }
+
+    /// ICH(`CSI Ps @`)。カーソル位置に`n`個の空白セルを挿入し、カーソル位置〜行末の
+    /// 内容を右へ押し出す(行末を超えて溢れたセルは破棄)。操作は現在行に閉じており、
+    /// scroll region や他の行には一切影響しない。カーソル位置は変更しない
+    /// (xterm/VT102 仕様)。
+    ///
+    /// `cursor_col`が折り返し待ち(`== cols`)の場合は[erase_cells]等の他のCSIハンドラ
+    /// と同様、見えている最終列(`cols - 1`)にクランプしてから計算する。
+    fn insert_chars(&mut self, n: usize) {
+        if self.cursor_row >= self.rows { return; }
+        let row = self.cursor_row;
+        let cols = self.cols;
+        let col = self.cursor_col.min(cols.saturating_sub(1));
+        let region_size = cols - col;
+        let n = n.min(region_size);
+        if n == 0 { return; }
+        let row_base = row * cols;
+        if n < region_size {
+            // insert_lines と同じ理由(書き込み先がまだ読んでいない元データを上書き
+            // しないようにするため)で、右から左(列番号の大きい方から)コピーする。
+            for c in (col..=(cols - 1 - n)).rev() {
+                let src = self.cells_mut()[row_base + c].clone();
+                self.cells_mut()[row_base + c + n] = src;
+            }
+        }
+        let blank = self.blank();
+        for c in col..(col + n) {
+            self.cells_mut()[row_base + c] = blank.clone();
+        }
+        self.sanitize_wide_row(row);
+    }
+
+    /// DCH(`CSI Ps P`)。カーソル位置から`n`個のセルを削除し、それより右の内容を
+    /// 左へ詰める。押し出された分(行末)は現在のSGR属性の空白で埋める。
+    ///
+    /// [insert_chars] と対になる実装 — 制約([sanitize_wide_row]による片割れ処理、
+    /// 現在行に閉じる、カーソル位置不変)は同じ。アンダーフロー回避のため、空白で
+    /// 埋める開始列を`delete_lines`と同様`col + (region_size - n)`として計算する。
+    fn delete_chars(&mut self, n: usize) {
+        if self.cursor_row >= self.rows { return; }
+        let row = self.cursor_row;
+        let cols = self.cols;
+        let col = self.cursor_col.min(cols.saturating_sub(1));
+        let region_size = cols - col;
+        let n = n.min(region_size);
+        if n == 0 { return; }
+        let row_base = row * cols;
+        if n < region_size {
+            for c in col..=(cols - 1 - n) {
+                let src = self.cells_mut()[row_base + c + n].clone();
+                self.cells_mut()[row_base + c] = src;
+            }
+        }
+        let blank = self.blank();
+        let blank_start = col + (region_size - n);
+        for c in blank_start..cols {
+            self.cells_mut()[row_base + c] = blank.clone();
+        }
+        self.sanitize_wide_row(row);
+    }
+
+    /// ECH(`CSI Ps X`)。カーソル位置から`n`個のセルを、シフトを伴わずその場で
+    /// 現在のSGR属性の空白に置き換える(ICH/DCHと異なり右側の内容は動かない)。
+    fn erase_chars(&mut self, n: usize) {
+        if self.cursor_row >= self.rows { return; }
+        let row = self.cursor_row;
+        let cols = self.cols;
+        let col = self.cursor_col.min(cols.saturating_sub(1));
+        let n = n.min(cols - col);
+        if n == 0 { return; }
+        let row_base = row * cols;
+        let blank = self.blank();
+        for c in col..(col + n) {
+            self.cells_mut()[row_base + c] = blank.clone();
+        }
+        self.sanitize_wide_row(row);
+    }
+
     fn newline(&mut self) {
         if self.cursor_row == self.scroll_bottom {
             self.scroll_up_region(1);
@@ -944,6 +1058,11 @@ impl Perform for Terminal {
             }
             'L' => { self.insert_lines(p0.max(1) as usize); }
             'M' => { self.delete_lines(p0.max(1) as usize); }
+            // ICH/DCH/ECH(タスク#47): 文字単位の挿入・削除・消去。IL/DL(行単位、'L'/'M')
+            // とは異なり現在行に閉じる(scroll region非依存)。
+            '@' => { self.insert_chars(p0.max(1) as usize); }
+            'P' => { self.delete_chars(p0.max(1) as usize); }
+            'X' => { self.erase_chars(p0.max(1) as usize); }
             'S' => { self.scroll_up_region(p0.max(1) as usize); }
             'd' => { self.cursor_row = (p0.max(1) as usize - 1).min(self.rows - 1); }
             'm' => { self.handle_sgr(&ps); }
@@ -2174,6 +2293,220 @@ mod tests {
         assert_eq!(cell(&t, 3, 3), "4", "旧row4がカーソル行(3)へ詰められる");
         assert_eq!(cell(&t, 4, 0), " ", "region下端(scroll_bottom=4)が空行で埋まる");
         assert_eq!(cell(&t, 5, 0), "r", "scroll_bottomを超えた行5(region外)はDLの影響を受けない");
+    }
+
+    #[test]
+    fn test_ich_inserts_blanks_and_shifts_right_within_row() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"abcdefg");
+        feed(&mut t, b"\x1b[1;3H\x1b[2@"); // カーソルを行0・列2(0-indexed)へ、2セル挿入
+        assert_eq!(cell(&t, 0, 0), "a", "カーソルより左は不変");
+        assert_eq!(cell(&t, 0, 1), "b", "カーソルより左は不変");
+        assert_eq!(cell(&t, 0, 2), " ", "挿入された空白");
+        assert_eq!(cell(&t, 0, 3), " ", "挿入された空白");
+        assert_eq!(cell(&t, 0, 4), "c", "旧列2以降が2列右へ押し出される");
+        assert_eq!(cell(&t, 0, 8), "g", "行末近くまで押し出される");
+        // 元々列7,8,9は空白だったので、押し出されて溢れた分は破棄されるだけで見た目には
+        // 表れない(行の幅は10のまま)。
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 2), "ICHはカーソル位置を変えない");
+    }
+
+    #[test]
+    fn test_dch_deletes_and_shifts_left_within_row() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"abcdefg");
+        feed(&mut t, b"\x1b[1;3H\x1b[2P"); // カーソルを行0・列2(0-indexed)へ、2セル削除
+        assert_eq!(cell(&t, 0, 0), "a", "カーソルより左は不変");
+        assert_eq!(cell(&t, 0, 1), "b", "カーソルより左は不変");
+        assert_eq!(cell(&t, 0, 2), "e", "旧列4('e')が2列左へ詰められる");
+        assert_eq!(cell(&t, 0, 3), "f", "旧列5('f')が2列左へ詰められる");
+        assert_eq!(cell(&t, 0, 4), "g", "旧列6('g')が2列左へ詰められる");
+        assert_eq!(cell(&t, 0, 5), " ", "行末は空白で埋められる");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 2), "DCHはカーソル位置を変えない");
+    }
+
+    #[test]
+    fn test_ech_erases_in_place_without_shifting() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"abcdefg");
+        feed(&mut t, b"\x1b[1;3H\x1b[2X"); // カーソルを行0・列2(0-indexed)へ、2セル消去
+        assert_eq!(cell(&t, 0, 0), "a", "カーソルより左は不変");
+        assert_eq!(cell(&t, 0, 1), "b", "カーソルより左は不変");
+        assert_eq!(cell(&t, 0, 2), " ", "消去された");
+        assert_eq!(cell(&t, 0, 3), " ", "消去された");
+        assert_eq!(cell(&t, 0, 4), "e", "ECHはシフトしない — 消去範囲より右はそのまま");
+        assert_eq!(cell(&t, 0, 5), "f", "ECHはシフトしない — 消去範囲より右はそのまま");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (0, 2), "ECHはカーソル位置を変えない");
+    }
+
+    #[test]
+    fn test_ich_dch_ech_default_count_is_one() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"abc");
+        feed(&mut t, b"\x1b[1;2H\x1b[@"); // Ps省略 == CSI 1@、列1(0-indexed)へ挿入
+        assert_eq!(cell(&t, 0, 0), "a");
+        assert_eq!(cell(&t, 0, 1), " ", "1セルだけ挿入される");
+        assert_eq!(cell(&t, 0, 2), "b", "旧列1('b')が1列だけ右へ押し出される");
+
+        let mut t2 = Terminal::new(10, 3, Theme::default());
+        feed(&mut t2, b"abc");
+        feed(&mut t2, b"\x1b[1;2H\x1b[P"); // Ps省略 == CSI 1P
+        assert_eq!(cell(&t2, 0, 1), "c", "旧列2('c')が1列だけ左へ詰められる");
+
+        let mut t3 = Terminal::new(10, 3, Theme::default());
+        feed(&mut t3, b"abc");
+        feed(&mut t3, b"\x1b[1;2H\x1b[X"); // Ps省略 == CSI 1X
+        assert_eq!(cell(&t3, 0, 1), " ", "1セルだけ消去される");
+        assert_eq!(cell(&t3, 0, 2), "c", "ECHはシフトしないので列2はそのまま");
+    }
+
+    #[test]
+    fn test_ich_dch_ech_confined_to_current_row() {
+        // Fableレビュー観点: 「行内完結の確認」——scroll regionや他の行に一切影響しない。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2");
+        feed(&mut t, b"\x1b[2;2H\x1b[3@"); // 行1・列1(0-indexed)へ、3セル挿入
+        assert_eq!(cell(&t, 0, 0), "r", "行0はICHの影響を受けない");
+        assert_eq!(cell(&t, 2, 0), "r", "行2はICHの影響を受けない");
+        assert_eq!(cell(&t, 1, 0), "r", "行1のカーソルより左は不変");
+
+        let mut t2 = Terminal::new(10, 3, Theme::default());
+        feed(&mut t2, b"row0\r\nrow1\r\nrow2");
+        feed(&mut t2, b"\x1b[2;2H\x1b[3P");
+        assert_eq!(cell(&t2, 0, 0), "r", "行0はDCHの影響を受けない");
+        assert_eq!(cell(&t2, 2, 0), "r", "行2はDCHの影響を受けない");
+
+        let mut t3 = Terminal::new(10, 3, Theme::default());
+        feed(&mut t3, b"row0\r\nrow1\r\nrow2");
+        feed(&mut t3, b"\x1b[2;2H\x1b[3X");
+        assert_eq!(cell(&t3, 0, 0), "r", "行0はECHの影響を受けない");
+        assert_eq!(cell(&t3, 2, 0), "r", "行2はECHの影響を受けない");
+    }
+
+    #[test]
+    fn test_ich_dch_ech_clamp_count_beyond_row_width_without_panic() {
+        // n が行の残り幅を超える場合、usizeアンダーフローでpanicせず、残り幅に
+        // クランプして行末まで埋まる/詰まることを確認する(IL/DLの同種テストに倣う)。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"abcdefghij");
+        feed(&mut t, b"\x1b[1;3H\x1b[100@");
+        for col in 2..10 {
+            assert_eq!(cell(&t, 0, col), " ", "col {col} should be blank after over-sized ICH");
+        }
+
+        let mut t2 = Terminal::new(10, 3, Theme::default());
+        feed(&mut t2, b"abcdefghij");
+        feed(&mut t2, b"\x1b[1;3H\x1b[100P");
+        for col in 2..10 {
+            assert_eq!(cell(&t2, 0, col), " ", "col {col} should be blank after over-sized DCH");
+        }
+
+        let mut t3 = Terminal::new(10, 3, Theme::default());
+        feed(&mut t3, b"abcdefghij");
+        feed(&mut t3, b"\x1b[1;3H\x1b[100X");
+        for col in 2..10 {
+            assert_eq!(cell(&t3, 0, col), " ", "col {col} should be blank after over-sized ECH");
+        }
+    }
+
+    #[test]
+    fn test_ich_dch_ech_blank_uses_current_sgr_bg() {
+        let red_bg = Theme::default().ansi16[1];
+
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"abc");
+        feed(&mut t, b"\x1b[41m"); // 赤背景
+        feed(&mut t, b"\x1b[1;1H\x1b[1@");
+        assert_eq!(t.screen_cells()[0].bg, red_bg, "ICHで挿入された空白は現在のSGR背景色を引き継ぐ");
+
+        let mut t2 = Terminal::new(10, 3, Theme::default());
+        feed(&mut t2, b"abcdefghij");
+        feed(&mut t2, b"\x1b[41m");
+        feed(&mut t2, b"\x1b[1;1H\x1b[1P"); // 先頭1セル削除 → 行末が空白で埋まる
+        assert_eq!(t2.screen_cells()[9].bg, red_bg, "DCHで行末に埋められた空白も現在のSGR背景色を引き継ぐ");
+
+        let mut t3 = Terminal::new(10, 3, Theme::default());
+        feed(&mut t3, b"abc");
+        feed(&mut t3, b"\x1b[41m");
+        feed(&mut t3, b"\x1b[1;1H\x1b[1X");
+        assert_eq!(t3.screen_cells()[0].bg, red_bg, "ECHで消去された空白も現在のSGR背景色を引き継ぐ");
+    }
+
+    #[test]
+    fn test_ich_splits_wide_char_pair_into_blanks() {
+        // Fableレビュー観点: 「全角文字の片割れが分断される場合の扱い」。
+        // 行 "ab全cd"(全角文字は列2・3の2セルを占有)の、プレースホルダ(列3)へ
+        // カーソルを置いて1セル挿入すると、本体(列2)とプレースホルダ(移動後は列4)の
+        // 対応が崩れる — 両方とも孤立せず、通常の空白セルへ変換されることを確認する。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, "ab全cd".as_bytes());
+        assert_eq!(cell(&t, 0, 2), "全", "前提: 全角文字は列2に本体を持つ");
+        assert!(t.screen_cells()[3].is_wide_placeholder, "前提: 列3はプレースホルダ");
+
+        feed(&mut t, b"\x1b[1;4H\x1b[1@"); // 列3(0-indexed、プレースホルダ)へ、1セル挿入
+        assert_eq!(cell(&t, 0, 0), "a");
+        assert_eq!(cell(&t, 0, 1), "b");
+        assert_eq!(cell(&t, 0, 2), " ", "片割れを失った全角本体は空白へ変換される");
+        assert_eq!(cell(&t, 0, 3), " ", "挿入された空白");
+        assert_eq!(cell(&t, 0, 4), " ", "片割れを失ったプレースホルダも通常の空白になる");
+        assert!(!t.screen_cells()[4].is_wide_placeholder, "孤立したプレースホルダフラグは解除される");
+        assert_eq!(cell(&t, 0, 5), "c", "旧列4('c')が1列右へ押し出される");
+        assert_eq!(cell(&t, 0, 6), "d", "旧列5('d')が1列右へ押し出される");
+    }
+
+    #[test]
+    fn test_dch_splits_wide_char_pair_into_blanks() {
+        // [test_ich_splits_wide_char_pair_into_blanks] と対になるDCH版。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, "ab全cd".as_bytes());
+        feed(&mut t, b"\x1b[1;4H\x1b[1P"); // 列3(0-indexed、プレースホルダ)を1セル削除
+        assert_eq!(cell(&t, 0, 0), "a");
+        assert_eq!(cell(&t, 0, 1), "b");
+        assert_eq!(cell(&t, 0, 2), " ", "片割れを失った全角本体は空白へ変換される");
+        assert_eq!(cell(&t, 0, 3), "c", "旧列4('c')が1列左へ詰められる");
+        assert_eq!(cell(&t, 0, 4), "d", "旧列5('d')が1列左へ詰められる");
+    }
+
+    #[test]
+    fn test_ech_splits_wide_char_pair_into_blanks() {
+        // [test_ich_splits_wide_char_pair_into_blanks] と同じ観点をECH(シフト無し)でも
+        // 固定する。ECHは片割れの片方だけ(本体のみ、またはプレースホルダのみ)を
+        // 消去範囲に含めるケースがあり得る点がICH/DCHと異なる(codexレビュー: 非
+        // blockingのテスト補強候補として指摘)。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, "ab全cd".as_bytes());
+        // 本体(列2)のみを消去 → プレースホルダ(列3)が孤立する。
+        feed(&mut t, b"\x1b[1;3H\x1b[1X"); // 列2(0-indexed)を1セル消去
+        assert_eq!(cell(&t, 0, 2), " ", "消去された本体");
+        assert_eq!(cell(&t, 0, 3), " ", "孤立したプレースホルダは通常の空白になる");
+        assert!(!t.screen_cells()[3].is_wide_placeholder, "孤立したプレースホルダフラグは解除される");
+        assert_eq!(cell(&t, 0, 4), "c", "ECHはシフトしないので列4は不変");
+
+        let mut t2 = Terminal::new(10, 3, Theme::default());
+        feed(&mut t2, "ab全cd".as_bytes());
+        // プレースホルダ(列3)のみを消去 → 本体(列2)が孤立する。
+        feed(&mut t2, b"\x1b[1;4H\x1b[1X"); // 列3(0-indexed)を1セル消去
+        assert_eq!(cell(&t2, 0, 2), " ", "片割れを失った本体は空白へ変換される");
+        assert_eq!(cell(&t2, 0, 3), " ", "消去されたプレースホルダ");
+        assert_eq!(cell(&t2, 0, 4), "c", "ECHはシフトしないので列4は不変");
+    }
+
+    #[test]
+    fn test_ich_dch_ech_unaffected_by_scroll_region() {
+        // タスク要件: 「行内完結の確認」——IL/DLと異なり、ICH/DCH/ECHはscroll region
+        // (`CSI r`)の制約を一切受けない(xterm/VT102仕様上、行編集はscroll regionの
+        // 外側のカーソル行でも常に効く)。scroll regionをわざと狭く設定した状態で、
+        // regionの外にあるカーソル行に対しても正常に動作することを固定する。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t, b"\x1b[2;4r"); // scroll region = 行1..3(0-indexed)、行0・4はregion外
+        feed(&mut t, b"\x1b[1;3H\x1b[2@"); // 行0(region外)・列2で2セル挿入
+        assert_eq!(cell(&t, 0, 2), " ", "region外の行0でもICHは効く");
+        assert_eq!(cell(&t, 0, 3), " ", "region外の行0でもICHは効く");
+        assert_eq!(cell(&t, 0, 4), "w", "旧列2('w')が2列右へ押し出される");
+
+        feed(&mut t, b"\x1b[5;3H\x1b[1P"); // 行4(region外)・列2で1セル削除
+        assert_eq!(cell(&t, 4, 2), "4", "旧列3('4')が1列左へ詰められる — region外の行4でもDCHは効く");
     }
 
     // ── Proptest: 不変量 ────────────────────────────────
