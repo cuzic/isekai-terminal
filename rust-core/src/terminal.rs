@@ -83,6 +83,35 @@ fn cell_display_width(cell: &TermCell) -> usize {
     cell.ch.chars().next().and_then(|c| c.width()).unwrap_or(1)
 }
 
+/// 行内で全角(wide)文字の「本体セル(表示幅==2) + 直後の`is_wide_placeholder`セル」
+/// という対応関係が崩れている箇所を修復する共通ロジック(タスク#47/#85)。
+/// [`Terminal::sanitize_wide_row`](挿入/削除経路)に加え、リサイズによる列数縮小時の
+/// 右端クリップ(`Terminal::resize_grid`)・DECAWM off時に全角文字を最終列へ書き込んだ
+/// 場合(`Terminal::print_mapped`)でも、placeholderを伴わない幅2本体セルが孤立して
+/// 残り得るため、それらから共通で呼び出す。
+///
+/// - `is_wide_placeholder`セルの左隣が幅2本体でなければ、浮いたplaceholderフラグを
+///   解除する。
+/// - 表示幅2の本体セルの右隣が`is_wide_placeholder`でなければ(行末で切り落とされた・
+///   placeholderを置く列が無かった等)、片割れを失った本体を空白へ変換する。色・装飾等
+///   の他の属性は(壊れた復旧時の見た目として無難なので)そのまま残す。
+fn sanitize_wide_cells(row: &mut [TermCell]) {
+    let cols = row.len();
+    for c in 0..cols {
+        if row[c].is_wide_placeholder {
+            let left_is_wide_head = c > 0 && cell_display_width(&row[c - 1]) == 2;
+            if !left_is_wide_head {
+                row[c].is_wide_placeholder = false;
+            }
+        } else if cell_display_width(&row[c]) == 2 {
+            let right_is_placeholder = c + 1 < cols && row[c + 1].is_wide_placeholder;
+            if !right_is_placeholder {
+                row[c].ch = smol_str::SmolStr::new_inline(" ");
+            }
+        }
+    }
+}
+
 /// G0/G1文字セット指定(`ESC ( <final>`/`ESC ) <final>`、タスク#41)。ASCII以外は
 /// DEC Special Graphics(罫線・記号セット、最終バイト`0`)のみ対応する — UK(`A`)等の
 /// 他の国別セットはグラフィック文字の写像を持たない(ASCIIとほぼ同一の文字集合)ため
@@ -1080,6 +1109,18 @@ impl Terminal {
         let mut new_cells = Vec::with_capacity(new_cols * new_rows);
         for mut row in rows {
             row.resize(new_cols, blank.clone());
+            if new_cols < old_cols {
+                // 列数を縮小した場合のみ、単純な`Vec::resize`による末尾切り捨てが
+                // 全角文字ペアの右半分(placeholder)だけを切り落とし得る。孤立した
+                // プレースホルダ無し幅2本体セルを残さないよう、他の経路と同じ
+                // ロジックで後始末する(タスク#85)。
+                //
+                // 列数が変わらない(行数のみ変更)・列数を拡大する場合は無条件に
+                // 呼んではいけない——`cols == 1`端末が意図的に保持しているplaceholder
+                // 無しの幅2本体セル(タスク#56の既存挙動)まで、列を全く縮めていない
+                // resizeのついでに空白化してしまう回帰をCodexレビューで指摘された。
+                sanitize_wide_cells(&mut row);
+            }
             new_cells.extend(row);
         }
         new_cells
@@ -1340,26 +1381,14 @@ impl Terminal {
     /// 本体とプレースホルダの間に別セルが割り込んだ、または片方だけが行の反対側へ
     /// シフトされて対応が消えた状態を放置すると、以後の描画で幅の合わない孤立した
     /// 全角文字グリフや、本体を持たない浮いたプレースホルダが残る。
+    ///
+    /// 実体は[sanitize_wide_cells]に委譲する——リサイズによる列数縮小時の右端クリップ
+    /// (`resize_grid`)・DECAWM off時の右端書き込み(`print_mapped`)も同じ不変量崩れを
+    /// 起こし得るため、それらとロジックを共有する(タスク#85)。
     fn sanitize_wide_row(&mut self, row: usize) {
         let cols = self.cols;
         let row_base = row * cols;
-        for c in 0..cols {
-            if self.cells()[row_base + c].is_wide_placeholder {
-                let left_is_wide_head =
-                    c > 0 && cell_display_width(&self.cells()[row_base + c - 1]) == 2;
-                if !left_is_wide_head {
-                    self.cells_mut()[row_base + c].is_wide_placeholder = false;
-                }
-            } else if cell_display_width(&self.cells()[row_base + c]) == 2 {
-                let right_is_placeholder =
-                    c + 1 < cols && self.cells()[row_base + c + 1].is_wide_placeholder;
-                if !right_is_placeholder {
-                    // 片割れを失った本体を空白へ変換する。色・装飾等の他の属性は
-                    // (壊れた復旧時の見た目として無難なので)そのまま残す。
-                    self.cells_mut()[row_base + c].ch = smol_str::SmolStr::new_inline(" ");
-                }
-            }
-        }
+        sanitize_wide_cells(&mut self.cells_mut()[row_base..row_base + cols]);
     }
 
     /// ICH(`CSI Ps @`)。カーソル位置に`n`個の空白セルを挿入し、カーソル位置〜行末の
@@ -1836,7 +1865,8 @@ impl Terminal {
             let mut cell = attrs.to_cell(smol_str::SmolStr::new(c.encode_utf8(&mut [0u8; 4])));
             cell.link_id = link_id;
             *self.cell_mut(self.cursor_row, self.cursor_col) = cell;
-            let advance = if width == 2 && self.cursor_col + 1 < self.cols {
+            let has_room_for_placeholder = width == 2 && self.cursor_col + 1 < self.cols;
+            let advance = if has_room_for_placeholder {
                 // wide文字の2セル目(placeholder)も現在の属性(reverse等も含め)を
                 // 正しく引き継ぐ — 以前は bold だけ無条件で false になっていた。
                 let mut placeholder = attrs.to_cell(smol_str::SmolStr::new_inline(" "));
@@ -1847,6 +1877,19 @@ impl Terminal {
             } else {
                 1
             };
+            if !self.autowrap_mode && width == 2 && !has_room_for_placeholder {
+                // DECAWM off時、全角文字を最終列(`cols - 1`)へ書いたためplaceholder
+                // を置く列が無かったケース(`needs_wrap`の`else`枝、上のコメント参照)。
+                // このまま放置すると「表示幅2だがplaceholderを伴わない孤立した本体
+                // セル」が残ってしまう(タスク#85)。ICH/DCH/ECH(`sanitize_wide_row`)
+                // と同じ規約で、片割れを持てなかった本体を空白セルへ変換する。
+                //
+                // `cols == 1` の端末(全角文字が絶対に収まらない、タスク#56)は対象外
+                // ——`!self.autowrap_mode`条件により、DECAWM on時のこのケース
+                // (test_wide_char_in_one_column_terminal_does_not_waste_a_blank_row_first)
+                // では発火しない。
+                self.sanitize_wide_row(self.cursor_row);
+            }
             if self.autowrap_mode {
                 self.cursor_col += advance;
             } else {
@@ -3691,6 +3734,31 @@ mod tests {
     }
 
     #[test]
+    fn test_decawm_off_wide_char_at_last_column_does_not_leave_orphaned_wide_body() {
+        // タスク#85: DECAWM off の状態で右端(最終列)に全角文字を書くと、
+        // placeholderを置く列が無いため「表示幅2だがplaceholderを伴わない孤立した
+        // 本体セル」が残ってしまっていた。sanitize_wide_row と同じ規約で、
+        // 片割れを持てなかった本体は空白へ変換されるべき。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b[?7l"); // DECAWM off
+        feed(&mut t, b"012345678"); // 9文字書いて残り1列(col=9、最終列)
+        assert_eq!(t.cursor_col(), 9);
+        feed(&mut t, "\u{3042}".as_bytes()); // "あ"(全角)を最終列へ
+        assert_eq!(t.cursor_row(), 0, "DECAWM off なので折り返さない");
+        assert_eq!(t.cursor_col(), 9, "カーソルは最終列にクランプされたまま");
+        assert_eq!(
+            cell(&t, 0, 9),
+            " ",
+            "placeholderを持てない全角本体は孤立させず空白へ変換する"
+        );
+        assert!(
+            !t.screen_cells()[9].is_wide_placeholder,
+            "空白化されたセル自体はplaceholderでもない"
+        );
+        assert_eq!(cell(&t, 0, 0), "0", "それ以前の列は無傷");
+    }
+
+    #[test]
     fn test_wide_char_that_does_not_fit_wraps_whole_char_to_next_row() {
         // 全角文字が最終列1つしか残っていない場合、半分だけ現在行に置くのではなく
         // 丸ごと次行へ折り返す(xterm仕様、以前は本体セルだけ書かれ半分に切れていた)。
@@ -3994,6 +4062,46 @@ mod tests {
         assert_eq!(cell(&t, 0, 0), "0");
         assert_eq!(cell(&t, 0, 4), "4");
         assert_eq!(t.screen_cells().len(), 5 * 3);
+    }
+
+    #[test]
+    fn test_resize_preserving_state_shrinking_cols_sanitizes_clipped_wide_pair() {
+        // タスク#85: 列数を縮小すると `resize_grid` の単純な `Vec::resize` による
+        // 末尾切り捨てが、行末にあった全角(wide)文字ペアの右半分(placeholder)
+        // だけを切り落とし、本体(表示幅2)がplaceholder無しで孤立して残ることが
+        // あった。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, "1234\u{3042}".as_bytes()); // 列4-5に全角"あ"(本体+placeholder)
+        assert_eq!(cell(&t, 0, 4), "\u{3042}");
+        assert!(t.screen_cells()[5].is_wide_placeholder);
+        // 新しい幅を5列にし、ちょうど全角ペアの本体だけが残る(placeholderの列が
+        // 切り落とされる)ようにする。
+        t.resize_preserving_state(5, 3);
+        assert_eq!(t.screen_cells().len(), 5 * 3);
+        assert_eq!(
+            cell(&t, 0, 4),
+            " ",
+            "placeholderを失った全角本体は孤立させず空白へ変換する"
+        );
+        assert_eq!(cell(&t, 0, 0), "1", "それ以前の列は無傷");
+    }
+
+    #[test]
+    fn test_resize_preserving_state_rows_only_resize_does_not_blank_one_column_wide_body() {
+        // タスク#85修正のcodexレビュー指摘: `resize_grid`の全角ペア後始末を無条件に
+        // 呼ぶと、列数を全く縮めていない(行数のみ変更する)resizeでも毎回発火し、
+        // `cols == 1`端末が意図的に保持しているplaceholder無しの幅2本体セル
+        // (タスク#56)まで空白化してしまう回帰があった。列を縮小しない限り
+        // sanitizeは発火してはならない。
+        let mut t = Terminal::new(1, 3, Theme::default());
+        feed(&mut t, "\u{3042}".as_bytes()); // "あ"(全角) — cols==1なのでplaceholder無し
+        assert_eq!(cell(&t, 0, 0), "\u{3042}");
+        t.resize_preserving_state(1, 5); // 列数は変えず行数だけ増やす
+        assert_eq!(
+            cell(&t, 0, 0),
+            "\u{3042}",
+            "列数を縮めていないresizeで既存の全角本体を空白化してはいけない"
+        );
     }
 
     #[test]
