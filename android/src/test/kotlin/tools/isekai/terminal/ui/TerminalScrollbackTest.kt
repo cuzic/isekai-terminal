@@ -38,6 +38,7 @@ class TerminalScrollbackTest {
             cursorCol = cursorCol,
             title = "session",
             applicationCursorMode = true,
+            applicationKeypadMode = true,
             bracketedPasteMode = true,
             mouseReportingMode = MouseReportingMode.OFF,
             sgrMouseMode = false,
@@ -72,6 +73,7 @@ class TerminalScrollbackTest {
         assertEquals(live.rows, result.rows)
         assertEquals(live.title, result.title)
         assertEquals(live.applicationCursorMode, result.applicationCursorMode)
+        assertEquals(live.applicationKeypadMode, result.applicationKeypadMode)
         assertEquals(live.bracketedPasteMode, result.bracketedPasteMode)
         assertEquals(live.cursorVisible, result.cursorVisible)
         assertEquals(live.bellGeneration, result.bellGeneration)

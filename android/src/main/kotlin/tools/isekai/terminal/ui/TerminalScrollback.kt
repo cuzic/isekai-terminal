@@ -50,6 +50,7 @@ fun synthesizeDisplayUpdate(
         cursorCol = 0u,
         title = live.title,
         applicationCursorMode = live.applicationCursorMode,
+        applicationKeypadMode = live.applicationKeypadMode,
         bracketedPasteMode = live.bracketedPasteMode,
         mouseReportingMode = live.mouseReportingMode,
         sgrMouseMode = live.sgrMouseMode,

@@ -285,6 +285,13 @@ pub(crate) struct Terminal {
     pending_terminal_responses: Vec<Vec<u8>>,
     pending_scrollback: Vec<Vec<TermCell>>,
     application_cursor_mode: bool,
+    /// DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)によるアプリケーションキーパッド
+    /// モード。既定は`false`(numeric keypad mode)。`application_cursor_mode`
+    /// (DECCKM)とは独立したモードで、テンキー(0-9・`,`・`-`・`.`・Enter・`+`・`*`・
+    /// `/`・`=`)がSS3形式(`ESC O <letter>`)を送るかリテラル文字を送るかを切り替える
+    /// (実際のキーイベントのエンコードはUI層のキーエンコーダーが担う——
+    /// `application_cursor_mode`と同じ役割分担、`ScreenUpdate`経由でUI層へ公開する)。
+    application_keypad_mode: bool,
     bracketed_paste_mode: bool,
     /// フォーカスレポーティング(`CSI ?1004h`/`l`、タスク#60)。vim/tmuxが`FocusGained`/
     /// `FocusLost` autocmdの発火に使う。有効時のみ[encode_focus_event]がOS由来の
@@ -590,6 +597,7 @@ impl Terminal {
             pending_terminal_responses: Vec::new(),
             pending_scrollback: Vec::new(),
             application_cursor_mode: false,
+            application_keypad_mode: false,
             bracketed_paste_mode: false,
             focus_reporting_mode: false,
             cursor_visible: true,
@@ -663,6 +671,7 @@ impl Terminal {
         self.title = Some(title);
     }
     pub(crate) fn application_cursor_mode(&self) -> bool { self.application_cursor_mode }
+    pub(crate) fn application_keypad_mode(&self) -> bool { self.application_keypad_mode }
     pub(crate) fn bracketed_paste_mode(&self) -> bool { self.bracketed_paste_mode }
     /// フォーカスレポーティング(`?1004`、タスク#60)の現在値。テストから参照する
     /// (`ScreenUpdate`へは公開しない——`encode_focus_event`がRust側で完結して判断する
@@ -795,6 +804,7 @@ impl Terminal {
         self.pending_clipboard_pull_request = false;
         self.pending_terminal_responses.clear();
         self.application_cursor_mode = false;
+        self.application_keypad_mode = false;
         self.bracketed_paste_mode = false;
         self.focus_reporting_mode = false;
         self.cursor_visible = true;
@@ -2328,6 +2338,11 @@ impl Perform for Terminal {
             _ if ints == [b'('] => { self.g0_charset = Charset::Ascii; }
             b'0' if ints == [b')'] => { self.g1_charset = Charset::DecSpecialGraphics; }
             _ if ints == [b')'] => { self.g1_charset = Charset::Ascii; }
+            // DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)。intermediateが空の場合のみ
+            // 扱う(`ESC 7`/`ESC 8`/`ESC H`と同じ理由——中間バイト付きの別シーケンスと
+            // 最終バイトが衝突しないことを明示する)。
+            b'=' if ints.is_empty() => { self.application_keypad_mode = true; }
+            b'>' if ints.is_empty() => { self.application_keypad_mode = false; }
             _ => {}
         }
     }
@@ -3796,6 +3811,26 @@ mod tests {
         assert!(!t.cursor_visible());
         feed(&mut t, b"\x1b[?25h"); // DECTCEM: カーソル表示
         assert!(t.cursor_visible());
+    }
+
+    #[test]
+    fn test_deckpam_deckpnm_toggle_application_keypad_mode() {
+        // タスク#43: DECKPAM(`ESC =`)/DECKPNM(`ESC >`)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert!(!t.application_keypad_mode(), "既定はnumeric keypad mode");
+        feed(&mut t, b"\x1b="); // DECKPAM
+        assert!(t.application_keypad_mode());
+        feed(&mut t, b"\x1b>"); // DECKPNM
+        assert!(!t.application_keypad_mode());
+    }
+
+    #[test]
+    fn test_ris_resets_application_keypad_mode() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b=");
+        assert!(t.application_keypad_mode());
+        feed(&mut t, b"\x1bc"); // RIS
+        assert!(!t.application_keypad_mode());
     }
 
     #[test]

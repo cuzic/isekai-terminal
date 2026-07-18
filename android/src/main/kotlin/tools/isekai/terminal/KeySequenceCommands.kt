@@ -27,12 +27,18 @@ object KeySequenceCommands {
      * - [KeyStep.PlaceholderRef] → 何も出力しない(呼び出し側が事前に具体的な [KeyStep] へ
      *   解決しておくべきものであり、正常系では到達しない)。
      */
-    fun toBytes(steps: List<KeyStep>, applicationCursorMode: Boolean = false): ByteArray {
+    fun toBytes(
+        steps: List<KeyStep>,
+        applicationCursorMode: Boolean = false,
+        // DECKPAM/DECKPNM(タスク#43)。KeyStep.Specialにテンキー(KC_NUMPAD_*)のkeyCodeが
+        // 含まれる場合に必要(TerminalKeyEncoder.specialKeyBytesへそのまま伝播するだけ)。
+        applicationKeypadMode: Boolean = false,
+    ): ByteArray {
         val out = ByteArrayOutputStream()
         for (step in steps) {
             when (step) {
                 is KeyStep.CtrlChar -> TerminalKeyEncoder.ctrlByte(step.char.code)?.let(out::write)
-                is KeyStep.Special -> TerminalKeyEncoder.specialKeyBytes(step.keyCode, applicationCursorMode)?.let(out::write)
+                is KeyStep.Special -> TerminalKeyEncoder.specialKeyBytes(step.keyCode, applicationCursorMode, applicationKeypadMode)?.let(out::write)
                 is KeyStep.Text -> out.write(TerminalKeyEncoder.commitTextBytes(step.text, bracketedPasteMode = false))
                 is KeyStep.PlaceholderRef -> Unit
             }

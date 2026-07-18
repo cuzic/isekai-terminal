@@ -799,6 +799,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes(
@@ -1072,6 +1074,8 @@ external fun uniffi_isekai_terminal_core_fn_func_terminal_commit_text_bytes(`tex
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_ctrl_byte(`codePoint`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+external fun uniffi_isekai_terminal_core_fn_func_terminal_numpad_key_bytes(`key`: RustBuffer.ByValue,`applicationKeypadMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(`kind`: RustBuffer.ByValue,`button`: RustBuffer.ByValue,`row`: Int,`col`: Int,`modifiers`: RustBuffer.ByValue,`cols`: Int,`rows`: Int,`mouseReportingMode`: RustBuffer.ByValue,`sgrMouseMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(`key`: RustBuffer.ByValue,`applicationCursorMode`: Byte,`modifiers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1225,6 +1229,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte() != 39410) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes() != 1311) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 25125) {
@@ -4763,6 +4770,14 @@ data class ScreenUpdate (
     , 
     var `applicationCursorMode`: kotlin.Boolean
     , 
+    /**
+     * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
+     * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
+     * 実際のテンキーイベントのエンコード(`terminal_numpad_key_bytes`をどう呼ぶか)は
+     * このRustコアではなくUI層のキーエンコーダーが行う。
+     */
+    var `applicationKeypadMode`: kotlin.Boolean
+    , 
     var `bracketedPasteMode`: kotlin.Boolean
     , 
     /**
@@ -4870,6 +4885,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterTypeMouseReportingMode.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
@@ -4890,6 +4906,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.allocationSize(value.`cursorCol`) +
             FfiConverterOptionalString.allocationSize(value.`title`) +
             FfiConverterBoolean.allocationSize(value.`applicationCursorMode`) +
+            FfiConverterBoolean.allocationSize(value.`applicationKeypadMode`) +
             FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`) +
             FfiConverterTypeMouseReportingMode.allocationSize(value.`mouseReportingMode`) +
             FfiConverterBoolean.allocationSize(value.`sgrMouseMode`) +
@@ -4910,6 +4927,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.write(value.`cursorCol`, buf)
             FfiConverterOptionalString.write(value.`title`, buf)
             FfiConverterBoolean.write(value.`applicationCursorMode`, buf)
+            FfiConverterBoolean.write(value.`applicationKeypadMode`, buf)
             FfiConverterBoolean.write(value.`bracketedPasteMode`, buf)
             FfiConverterTypeMouseReportingMode.write(value.`mouseReportingMode`, buf)
             FfiConverterBoolean.write(value.`sgrMouseMode`, buf)
@@ -6050,6 +6068,66 @@ public object FfiConverterTypeSshError : FfiConverterRustBuffer<SshException> {
     }
 
 }
+
+
+
+/**
+ * アプリケーションキーパッドモード(DECKPAM/DECKPNM、タスク#43)対応が必要な
+ * テンキー(numeric keypad)キー。VT220の物理keypadにある0〜9・`,`・`-`(Subtract)・
+ * `.`(Decimal)・Enterに加え、xterm/主要ターミナルエミュレータが同じ`ESC O <letter>`
+ * テーブルへ拡張している`+`(Add)・`*`(Multiply)・`/`(Divide)・`=`(Equals)を含む。
+ * 左右カッコ(Android `KEYCODE_NUMPAD_LEFT_PAREN`/`KEYCODE_NUMPAD_RIGHT_PAREN`)は
+ * このテーブルに存在せず両モードで常に同じリテラル文字を送るため対象外——
+ * 呼び出し側は通常のUnicode文字経路([terminal_unicode_char_bytes])にフォール
+ * バックすること。
+ */
+
+enum class TerminalNumpadKey {
+    
+    DIGIT0,
+    DIGIT1,
+    DIGIT2,
+    DIGIT3,
+    DIGIT4,
+    DIGIT5,
+    DIGIT6,
+    DIGIT7,
+    DIGIT8,
+    DIGIT9,
+    DECIMAL,
+    COMMA,
+    ADD,
+    SUBTRACT,
+    MULTIPLY,
+    DIVIDE,
+    ENTER,
+    EQUALS;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTerminalNumpadKey: FfiConverterRustBuffer<TerminalNumpadKey> {
+    override fun read(buf: ByteBuffer) = try {
+        TerminalNumpadKey.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: TerminalNumpadKey) = 4UL
+
+    override fun write(value: TerminalNumpadKey, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
 
 
 
@@ -7732,6 +7810,25 @@ public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuf
     UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_ctrl_byte(
     
         FfiConverterUInt.lower(`codePoint`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * テンキーのバイト列。`application_keypad_mode`(DECKPAM、`Terminal`が`ESC =`/
+         * `ESC >`で切り替える、`ScreenUpdate::application_keypad_mode`経由で公開)が
+         * `true`ならSS3形式(`ESC O <letter>`、xterm/VT220のapplication keypadテーブルに
+         * 準拠)、`false`なら通常のリテラル文字(Enterのみ`0x0D`、`TerminalSpecialKey::Enter`
+         * と同じ)を返す。`application_cursor_mode`(#29)と同じ「Rust側は変換ロジックのみ、
+         * どのキーコードがどの[TerminalNumpadKey]に対応するかの判定はUI層が行う」という
+         * 役割分担。
+         */ fun `terminalNumpadKeyBytes`(`key`: TerminalNumpadKey, `applicationKeypadMode`: kotlin.Boolean): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_numpad_key_bytes(
+    
+        FfiConverterTypeTerminalNumpadKey.lower(`key`),FfiConverterBoolean.lower(`applicationKeypadMode`),_status)
 }
     )
     }

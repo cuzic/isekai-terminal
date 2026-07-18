@@ -686,9 +686,14 @@ class TerminalTabsViewModel(
 
     fun sendKeySequenceToPane(address: PaneAddress, steps: List<KeyStep>) {
         val pane = paneOrNull(address) ?: return
-        val applicationCursorMode = pane.session.state.value.screenUpdate?.applicationCursorMode ?: false
+        val screenUpdate = pane.session.state.value.screenUpdate
+        val applicationCursorMode = screenUpdate?.applicationCursorMode ?: false
+        // DECKPAM/DECKPNM(タスク#43)。テンキーのKeyStep.Specialを含む打鍵列でも、物理
+        // キーボード経由と同じくRust由来の現在のkeypad modeに従わせる(codexレビュー指摘:
+        // 未伝播だとテンキーを含む打鍵列が常にnumeric modeとして送信されてしまっていた)。
+        val applicationKeypadMode = screenUpdate?.applicationKeypadMode ?: false
         RemoteLogger.i("IsekaiTerminalKeySequence", "send key sequence (${steps.size} steps) tab=${address.tabId} pane=${address.paneId}")
-        pane.session.send(KeySequenceCommands.toBytes(steps, applicationCursorMode))
+        pane.session.send(KeySequenceCommands.toBytes(steps, applicationCursorMode, applicationKeypadMode))
     }
 
     // ── 接続後自動実行コマンド ────────────────────────────────────

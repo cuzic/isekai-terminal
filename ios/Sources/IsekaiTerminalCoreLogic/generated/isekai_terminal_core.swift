@@ -3078,6 +3078,13 @@ public struct ScreenUpdate: Equatable, Hashable {
     public var cursorCol: UInt32
     public var title: String?
     public var applicationCursorMode: Bool
+    /**
+     * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
+     * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
+     * 実際のテンキーイベントのエンコード(`terminal_numpad_key_bytes`をどう呼ぶか)は
+     * このRustコアではなくUI層のキーエンコーダーが行う。
+     */
+    public var applicationKeypadMode: Bool
     public var bracketedPasteMode: Bool
     /**
      * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)の現在値。既定は`Off`。
@@ -3155,7 +3162,13 @@ public struct ScreenUpdate: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, bracketedPasteMode: Bool, 
+    public init(cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, 
+        /**
+         * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
+         * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
+         * 実際のテンキーイベントのエンコード(`terminal_numpad_key_bytes`をどう呼ぶか)は
+         * このRustコアではなくUI層のキーエンコーダーが行う。
+         */applicationKeypadMode: Bool, bracketedPasteMode: Bool, 
         /**
          * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)の現在値。既定は`Off`。
          * UI層(#50/#51)はこれを見て、タッチ/ジェスチャイベントをマウスレポートとして
@@ -3227,6 +3240,7 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.cursorCol = cursorCol
         self.title = title
         self.applicationCursorMode = applicationCursorMode
+        self.applicationKeypadMode = applicationKeypadMode
         self.bracketedPasteMode = bracketedPasteMode
         self.mouseReportingMode = mouseReportingMode
         self.sgrMouseMode = sgrMouseMode
@@ -3262,6 +3276,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 cursorCol: FfiConverterUInt32.read(from: &buf), 
                 title: FfiConverterOptionString.read(from: &buf), 
                 applicationCursorMode: FfiConverterBool.read(from: &buf), 
+                applicationKeypadMode: FfiConverterBool.read(from: &buf), 
                 bracketedPasteMode: FfiConverterBool.read(from: &buf), 
                 mouseReportingMode: FfiConverterTypeMouseReportingMode.read(from: &buf), 
                 sgrMouseMode: FfiConverterBool.read(from: &buf), 
@@ -3283,6 +3298,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.cursorCol, into: &buf)
         FfiConverterOptionString.write(value.title, into: &buf)
         FfiConverterBool.write(value.applicationCursorMode, into: &buf)
+        FfiConverterBool.write(value.applicationKeypadMode, into: &buf)
         FfiConverterBool.write(value.bracketedPasteMode, into: &buf)
         FfiConverterTypeMouseReportingMode.write(value.mouseReportingMode, into: &buf)
         FfiConverterBool.write(value.sgrMouseMode, into: &buf)
@@ -4728,6 +4744,195 @@ public func FfiConverterTypeSshError_lift(_ buf: RustBuffer) throws -> SshError 
 public func FfiConverterTypeSshError_lower(_ value: SshError) -> RustBuffer {
     return FfiConverterTypeSshError.lower(value)
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * アプリケーションキーパッドモード(DECKPAM/DECKPNM、タスク#43)対応が必要な
+ * テンキー(numeric keypad)キー。VT220の物理keypadにある0〜9・`,`・`-`(Subtract)・
+ * `.`(Decimal)・Enterに加え、xterm/主要ターミナルエミュレータが同じ`ESC O <letter>`
+ * テーブルへ拡張している`+`(Add)・`*`(Multiply)・`/`(Divide)・`=`(Equals)を含む。
+ * 左右カッコ(Android `KEYCODE_NUMPAD_LEFT_PAREN`/`KEYCODE_NUMPAD_RIGHT_PAREN`)は
+ * このテーブルに存在せず両モードで常に同じリテラル文字を送るため対象外——
+ * 呼び出し側は通常のUnicode文字経路([terminal_unicode_char_bytes])にフォール
+ * バックすること。
+ */
+
+public enum TerminalNumpadKey: Equatable, Hashable {
+    
+    case digit0
+    case digit1
+    case digit2
+    case digit3
+    case digit4
+    case digit5
+    case digit6
+    case digit7
+    case digit8
+    case digit9
+    case decimal
+    case comma
+    case add
+    case subtract
+    case multiply
+    case divide
+    case enter
+    case equals
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TerminalNumpadKey: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTerminalNumpadKey: FfiConverterRustBuffer {
+    typealias SwiftType = TerminalNumpadKey
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TerminalNumpadKey {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .digit0
+        
+        case 2: return .digit1
+        
+        case 3: return .digit2
+        
+        case 4: return .digit3
+        
+        case 5: return .digit4
+        
+        case 6: return .digit5
+        
+        case 7: return .digit6
+        
+        case 8: return .digit7
+        
+        case 9: return .digit8
+        
+        case 10: return .digit9
+        
+        case 11: return .decimal
+        
+        case 12: return .comma
+        
+        case 13: return .add
+        
+        case 14: return .subtract
+        
+        case 15: return .multiply
+        
+        case 16: return .divide
+        
+        case 17: return .enter
+        
+        case 18: return .equals
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TerminalNumpadKey, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .digit0:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .digit1:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .digit2:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .digit3:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .digit4:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .digit5:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .digit6:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .digit7:
+            writeInt(&buf, Int32(8))
+        
+        
+        case .digit8:
+            writeInt(&buf, Int32(9))
+        
+        
+        case .digit9:
+            writeInt(&buf, Int32(10))
+        
+        
+        case .decimal:
+            writeInt(&buf, Int32(11))
+        
+        
+        case .comma:
+            writeInt(&buf, Int32(12))
+        
+        
+        case .add:
+            writeInt(&buf, Int32(13))
+        
+        
+        case .subtract:
+            writeInt(&buf, Int32(14))
+        
+        
+        case .multiply:
+            writeInt(&buf, Int32(15))
+        
+        
+        case .divide:
+            writeInt(&buf, Int32(16))
+        
+        
+        case .enter:
+            writeInt(&buf, Int32(17))
+        
+        
+        case .equals:
+            writeInt(&buf, Int32(18))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalNumpadKey_lift(_ buf: RustBuffer) throws -> TerminalNumpadKey {
+    return try FfiConverterTypeTerminalNumpadKey.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalNumpadKey_lower(_ value: TerminalNumpadKey) -> RustBuffer {
+    return FfiConverterTypeTerminalNumpadKey.lower(value)
+}
+
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
@@ -6598,6 +6803,23 @@ public func terminalCtrlByte(codePoint: UInt32) -> UInt8?  {
 })
 }
 /**
+ * テンキーのバイト列。`application_keypad_mode`(DECKPAM、`Terminal`が`ESC =`/
+ * `ESC >`で切り替える、`ScreenUpdate::application_keypad_mode`経由で公開)が
+ * `true`ならSS3形式(`ESC O <letter>`、xterm/VT220のapplication keypadテーブルに
+ * 準拠)、`false`なら通常のリテラル文字(Enterのみ`0x0D`、`TerminalSpecialKey::Enter`
+ * と同じ)を返す。`application_cursor_mode`(#29)と同じ「Rust側は変換ロジックのみ、
+ * どのキーコードがどの[TerminalNumpadKey]に対応するかの判定はUI層が行う」という
+ * 役割分担。
+ */
+public func terminalNumpadKeyBytes(key: TerminalNumpadKey, applicationKeypadMode: Bool) -> Data  {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_terminal_numpad_key_bytes(
+        FfiConverterTypeTerminalNumpadKey_lower(key),
+        FfiConverterBool.lower(applicationKeypadMode),$0
+    )
+})
+}
+/**
  * タスク#51: UI層(Android/iOSのジェスチャハンドラ)が座標付きの生ポインタ
  * イベントを、現在のマウスレポーティング状態に従ってターミナルへ送るべき
  * バイト列にエンコードする。`Terminal::encode_pointer_event`(タスク#36)と
@@ -6754,6 +6976,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte() != 39410) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes() != 1311) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 25125) {

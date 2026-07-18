@@ -633,7 +633,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         ScreenUpdate(
             cols: 1, rows: 1, cells: [],
             cursorRow: 0, cursorCol: 0,
-            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: bellGeneration,
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
@@ -674,7 +674,7 @@ final class TerminalSessionControllerTests: XCTestCase {
         controller.onScreenUpdate(update: ScreenUpdate(
             cols: 2, rows: 1, cells: [],
             cursorRow: 0, cursorCol: 0,
-            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 3,
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
