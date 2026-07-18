@@ -19,9 +19,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use russh_stream_session::Credential;
 
-/// `ssh(1)`'s own default `IdentityFile` probe order (`ssh_config(5)`),
-/// tried in this order when the config specifies none explicitly.
-const DEFAULT_IDENTITY_FILE_NAMES: &[&str] = &["id_ed25519", "id_ecdsa", "id_rsa"];
+/// Default `IdentityFile` probe order tried when the config specifies none
+/// explicitly, per the plan's M1 design (`id_ed25519` → `id_rsa` →
+/// `id_ecdsa`) — this had drifted out of order in an earlier revision of
+/// this file (Codex review finding), swapping `id_rsa`/`id_ecdsa`.
+const DEFAULT_IDENTITY_FILE_NAMES: &[&str] = &["id_ed25519", "id_rsa", "id_ecdsa"];
 
 /// Returns the `IdentityFile` candidates to try, in order: `configured` if
 /// non-empty (as resolved by `openssh_config::resolve`/`resolve_default`),
@@ -40,12 +42,20 @@ pub(crate) fn identity_file_candidates(configured: &[PathBuf], home: &Path) -> V
 /// valid/decryptable OpenSSH private key still gets picked here and only
 /// fails later, at the authentication attempt itself (surfaced as
 /// `SessionError::InvalidPrivateKey`, not from this function).
+///
+/// Reads each candidate directly rather than `exists()`-checking first
+/// (Codex review finding): a separate `exists()` call before `read()` is
+/// both an extra filesystem round-trip for every candidate that *is*
+/// present, and a TOCTOU gap (the file could vanish between the check and
+/// the read) — treating a `NotFound` read error as "try the next candidate"
+/// gets the same skip-if-missing behavior from a single syscall per
+/// candidate instead of up to two.
 pub(crate) fn load_first_existing(candidates: &[PathBuf]) -> Result<Credential> {
     for path in candidates {
-        if path.exists() {
-            let private_key_pem = std::fs::read(path)
-                .with_context(|| format!("failed to read identity file {}", path.display()))?;
-            return Ok(Credential::PublicKey { private_key_pem });
+        match std::fs::read(path) {
+            Ok(private_key_pem) => return Ok(Credential::PublicKey { private_key_pem }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("failed to read identity file {}", path.display())),
         }
     }
     anyhow::bail!(
@@ -73,8 +83,8 @@ mod tests {
             candidates,
             vec![
                 PathBuf::from("/home/alice/.ssh/id_ed25519"),
-                PathBuf::from("/home/alice/.ssh/id_ecdsa"),
                 PathBuf::from("/home/alice/.ssh/id_rsa"),
+                PathBuf::from("/home/alice/.ssh/id_ecdsa"),
             ]
         );
     }

@@ -125,8 +125,19 @@ pub fn with_locked_ssh_host_key_trust_store<T>(
     ensure_private_dir(dir)?;
     let outcome = isekai_fs_guard::with_exclusive_lock(dir, SSH_HOST_KEY_TRUST_STORE_LOCK_KEY, || -> Result<T, TrustError> {
         let mut store = load_toml_store::<SshHostKeyTrustStore>(path)?;
+        let before = store.clone();
         let result = f(&mut store)?;
-        save_toml_store(path, &store)?;
+        // Skip the write entirely when `f` didn't actually change anything
+        // (Codex review finding) — e.g. `FileBackedHostKeyVerifier` calling
+        // this to reject an unknown or mismatched host key still runs `f`
+        // (and must, to make the correct decision), but a rejection never
+        // mutates `store`. Without this check, every rejection would still
+        // do a full tempfile-create/permission-set/write/flush/rename cycle
+        // for no reason — and could even conjure an empty `known_ssh_hosts.toml`
+        // into existence purely from declining a single new host.
+        if store != before {
+            save_toml_store(path, &store)?;
+        }
         Ok(result)
     });
     match outcome {

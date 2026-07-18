@@ -171,7 +171,22 @@ fn apply_keyword(config: &mut HostConfig, keyword: &str, value: &str) {
             config.identity_file.push(expand_tilde(value));
         }
         "proxyjump" => {
-            if config.proxy_jump.is_none() {
+            // `ProxyJump none` (ssh_config(5)) explicitly disables jumping —
+            // it is not a real destination named "none" — so it must
+            // resolve to `None`, not `Some("none".to_string())`, or a
+            // consumer (M2's ProxyJump chaining) would try to connect
+            // through a literal jump host called "none" and fail.
+            //
+            // Known simplification: like every other keyword here,
+            // first-obtained-value-wins — but because "none" resolves to
+            // the same `None` state as "never configured", an explicit
+            // `ProxyJump none` in an earlier matching block does not, unlike
+            // real `ssh_config(5)`, block a *later* matching block's real
+            // `ProxyJump <host>` from taking effect. Getting that ordering
+            // nuance exactly right would need extra state this struct
+            // doesn't otherwise carry; not worth it for what `ssh_config(5)`
+            // itself calls a rarely-used override escape hatch.
+            if config.proxy_jump.is_none() && !value.eq_ignore_ascii_case("none") {
                 config.proxy_jump = Some(value.to_string());
             }
         }
@@ -535,6 +550,29 @@ Host foo bar baz
         assert_eq!(resolve(&path, "bar").unwrap().user.as_deref(), Some("alice"));
         assert_eq!(resolve(&path, "baz").unwrap().user.as_deref(), Some("alice"));
         assert_eq!(resolve(&path, "qux").unwrap().user, None);
+    }
+
+    #[test]
+    fn proxy_jump_none_resolves_to_no_jump_not_a_literal_host_named_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host internal
+    ProxyJump none
+");
+        assert_eq!(
+            resolve(&path, "internal").unwrap().proxy_jump, None,
+            "\"ProxyJump none\" must disable jumping, not resolve to a host literally named \"none\""
+        );
+    }
+
+    #[test]
+    fn proxy_jump_real_value_is_unaffected_by_the_none_special_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host internal
+    ProxyJump jump-host.example.com
+");
+        assert_eq!(resolve(&path, "internal").unwrap().proxy_jump.as_deref(), Some("jump-host.example.com"));
     }
 
     #[test]
