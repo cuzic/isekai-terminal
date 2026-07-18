@@ -1205,6 +1205,12 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     
     func scrollbackLen()  -> UInt32
     
+    /**
+     * scrollbackを対象にした部分一致検索(タスク#37)。マッチ位置は
+     * [ScrollbackSearchMatch]のドキュメント参照。未接続時は空Vecを返す。
+     */
+    func searchScrollback(query: String, caseSensitive: Bool)  -> [ScrollbackSearchMatch]
+    
     func send(data: Data) 
     
     /**
@@ -1550,6 +1556,20 @@ open func scrollbackLen() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_len(
             self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * scrollbackを対象にした部分一致検索(タスク#37)。マッチ位置は
+     * [ScrollbackSearchMatch]のドキュメント参照。未接続時は空Vecを返す。
+     */
+open func searchScrollback(query: String, caseSensitive: Bool) -> [ScrollbackSearchMatch]  {
+    return try!  FfiConverterSequenceTypeScrollbackSearchMatch.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_search_scrollback(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(query),
+        FfiConverterBool.lower(caseSensitive),$0
     )
 })
 }
@@ -3056,6 +3076,81 @@ public func FfiConverterTypeScreenUpdate_lift(_ buf: RustBuffer) throws -> Scree
 #endif
 public func FfiConverterTypeScreenUpdate_lower(_ value: ScreenUpdate) -> RustBuffer {
     return FfiConverterTypeScreenUpdate.lower(value)
+}
+
+
+/**
+ * [SessionOrchestrator::search_scrollback]が返す1件のマッチ位置(タスク#37)。
+ *
+ * - `row`: [SessionOrchestrator::scrollback_cells]と同じ規約——0がライブ画面に
+ * 一番近い最新のscrollback行、値が大きいほど過去。マッチした行を表示するには
+ * そのまま`scrollback_cells(row, ...)`系のoffsetとして使える。
+ * - `col`: マッチ開始セルの0-based列。
+ * - `len`: マッチが占める表示列数(セル単位)。全角文字を含む場合は文字数より
+ * 大きくなりうる。
+ *
+ * スコープ外(Fableレビュー2次): scrollbackは折り返しで分割された物理行の
+ * `VecDeque`であり、折り返しをまたいだ論理行単位のマッチ(行末と次行先頭に
+ * またがる文字列)は検出できない。また、scrollbackは上限(`SCROLLBACK_LIMIT`)を
+ * 超えると古い行から追い出されるため、この`row`は呼び出し時点のスナップショットに
+ * 対してのみ有効——新しい出力がscrollbackへ積まれる前に使うこと(呼び出し側は
+ * `row`を長期キャッシュせず、ジャンプ操作のたびに検索し直す運用を想定する)。
+ */
+public struct ScrollbackSearchMatch: Equatable, Hashable {
+    public var row: UInt32
+    public var col: UInt32
+    public var len: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(row: UInt32, col: UInt32, len: UInt32) {
+        self.row = row
+        self.col = col
+        self.len = len
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ScrollbackSearchMatch: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeScrollbackSearchMatch: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ScrollbackSearchMatch {
+        return
+            try ScrollbackSearchMatch(
+                row: FfiConverterUInt32.read(from: &buf), 
+                col: FfiConverterUInt32.read(from: &buf), 
+                len: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ScrollbackSearchMatch, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.row, into: &buf)
+        FfiConverterUInt32.write(value.col, into: &buf)
+        FfiConverterUInt32.write(value.len, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeScrollbackSearchMatch_lift(_ buf: RustBuffer) throws -> ScrollbackSearchMatch {
+    return try FfiConverterTypeScrollbackSearchMatch.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeScrollbackSearchMatch_lower(_ value: ScrollbackSearchMatch) -> RustBuffer {
+    return FfiConverterTypeScrollbackSearchMatch.lower(value)
 }
 
 
@@ -5845,6 +5940,31 @@ fileprivate struct FfiConverterSequenceTypePortForward: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuffer {
+    typealias SwiftType = [ScrollbackSearchMatch]
+
+    public static func write(_ value: [ScrollbackSearchMatch], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeScrollbackSearchMatch.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ScrollbackSearchMatch] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ScrollbackSearchMatch]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeScrollbackSearchMatch.read(from: &buf))
+        }
+        return seq
+    }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
@@ -6222,6 +6342,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_len() != 48916) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_search_scrollback() != 27310) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send() != 59935) {

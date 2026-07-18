@@ -13,7 +13,7 @@ use russh::client;
 use tokio::io::AsyncReadExt;
 
 use crate::{
-    init_logger, CellData, SessionCallback, SshAuth, SshError, RUNTIME,
+    init_logger, CellData, ScrollbackSearchMatch, SessionCallback, SshAuth, SshError, RUNTIME,
 };
 use crate::session::SessionCore;
 use crate::transport::{TransportCommand, TransportEvent, run_ssh_channel_loop};
@@ -66,6 +66,10 @@ impl QuicSession {
 
     pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
+    }
+
+    pub(crate) fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
+        self.core.search_scrollback(&query, case_sensitive)
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }

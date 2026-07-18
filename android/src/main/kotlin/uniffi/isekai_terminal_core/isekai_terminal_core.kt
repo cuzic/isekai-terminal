@@ -875,6 +875,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_len(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_search_scrollback(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_set_session_theme(
@@ -1030,6 +1032,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollbac
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_search_scrollback(`ptr`: Long,`query`: RustBuffer.ByValue,`caseSensitive`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_set_session_theme(`ptr`: Long,`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1327,6 +1331,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_len() != 48916) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_search_scrollback() != 27310) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send() != 59935) {
@@ -2983,6 +2990,12 @@ public interface SessionOrchestratorInterface {
     
     fun `scrollbackLen`(): kotlin.UInt
     
+    /**
+     * scrollbackを対象にした部分一致検索(タスク#37)。マッチ位置は
+     * [ScrollbackSearchMatch]のドキュメント参照。未接続時は空Vecを返す。
+     */
+    fun `searchScrollback`(`query`: kotlin.String, `caseSensitive`: kotlin.Boolean): List<ScrollbackSearchMatch>
+    
     fun `send`(`data`: kotlin.ByteArray)
     
     /**
@@ -3471,6 +3484,23 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_len(
         it,
         _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * scrollbackを対象にした部分一致検索(タスク#37)。マッチ位置は
+     * [ScrollbackSearchMatch]のドキュメント参照。未接続時は空Vecを返す。
+     */override fun `searchScrollback`(`query`: kotlin.String, `caseSensitive`: kotlin.Boolean): List<ScrollbackSearchMatch> {
+            return FfiConverterSequenceTypeScrollbackSearchMatch.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_search_scrollback(
+        it,
+        FfiConverterString.lower(`query`),FfiConverterBoolean.lower(`caseSensitive`),_status)
 }
     }
     )
@@ -4688,6 +4718,66 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterULong.write(value.`bellGeneration`, buf)
             FfiConverterTypeCursorShape.write(value.`cursorShape`, buf)
             FfiConverterBoolean.write(value.`cursorBlink`, buf)
+    }
+}
+
+
+
+/**
+ * [SessionOrchestrator::search_scrollback]が返す1件のマッチ位置(タスク#37)。
+ *
+ * - `row`: [SessionOrchestrator::scrollback_cells]と同じ規約——0がライブ画面に
+ * 一番近い最新のscrollback行、値が大きいほど過去。マッチした行を表示するには
+ * そのまま`scrollback_cells(row, ...)`系のoffsetとして使える。
+ * - `col`: マッチ開始セルの0-based列。
+ * - `len`: マッチが占める表示列数(セル単位)。全角文字を含む場合は文字数より
+ * 大きくなりうる。
+ *
+ * スコープ外(Fableレビュー2次): scrollbackは折り返しで分割された物理行の
+ * `VecDeque`であり、折り返しをまたいだ論理行単位のマッチ(行末と次行先頭に
+ * またがる文字列)は検出できない。また、scrollbackは上限(`SCROLLBACK_LIMIT`)を
+ * 超えると古い行から追い出されるため、この`row`は呼び出し時点のスナップショットに
+ * 対してのみ有効——新しい出力がscrollbackへ積まれる前に使うこと(呼び出し側は
+ * `row`を長期キャッシュせず、ジャンプ操作のたびに検索し直す運用を想定する)。
+ */
+data class ScrollbackSearchMatch (
+    var `row`: kotlin.UInt
+    , 
+    var `col`: kotlin.UInt
+    , 
+    var `len`: kotlin.UInt
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeScrollbackSearchMatch: FfiConverterRustBuffer<ScrollbackSearchMatch> {
+    override fun read(buf: ByteBuffer): ScrollbackSearchMatch {
+        return ScrollbackSearchMatch(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ScrollbackSearchMatch) = (
+            FfiConverterUInt.allocationSize(value.`row`) +
+            FfiConverterUInt.allocationSize(value.`col`) +
+            FfiConverterUInt.allocationSize(value.`len`)
+    )
+
+    override fun write(value: ScrollbackSearchMatch, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`row`, buf)
+            FfiConverterUInt.write(value.`col`, buf)
+            FfiConverterUInt.write(value.`len`, buf)
     }
 }
 
@@ -7114,6 +7204,34 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypePortForward.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuffer<List<ScrollbackSearchMatch>> {
+    override fun read(buf: ByteBuffer): List<ScrollbackSearchMatch> {
+        val len = buf.getInt()
+        return List<ScrollbackSearchMatch>(len) {
+            FfiConverterTypeScrollbackSearchMatch.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<ScrollbackSearchMatch>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeScrollbackSearchMatch.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<ScrollbackSearchMatch>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeScrollbackSearchMatch.write(it, buf)
         }
     }
 }

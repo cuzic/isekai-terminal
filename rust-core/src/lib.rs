@@ -663,6 +663,28 @@ pub struct CellData {
     pub invisible: bool,
 }
 
+/// [SessionOrchestrator::search_scrollback]が返す1件のマッチ位置(タスク#37)。
+///
+/// - `row`: [SessionOrchestrator::scrollback_cells]と同じ規約——0がライブ画面に
+///   一番近い最新のscrollback行、値が大きいほど過去。マッチした行を表示するには
+///   そのまま`scrollback_cells(row, ...)`系のoffsetとして使える。
+/// - `col`: マッチ開始セルの0-based列。
+/// - `len`: マッチが占める表示列数(セル単位)。全角文字を含む場合は文字数より
+///   大きくなりうる。
+///
+/// スコープ外(Fableレビュー2次): scrollbackは折り返しで分割された物理行の
+/// `VecDeque`であり、折り返しをまたいだ論理行単位のマッチ(行末と次行先頭に
+/// またがる文字列)は検出できない。また、scrollbackは上限(`SCROLLBACK_LIMIT`)を
+/// 超えると古い行から追い出されるため、この`row`は呼び出し時点のスナップショットに
+/// 対してのみ有効——新しい出力がscrollbackへ積まれる前に使うこと(呼び出し側は
+/// `row`を長期キャッシュせず、ジャンプ操作のたびに検索し直す運用を想定する)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct ScrollbackSearchMatch {
+    pub row: u32,
+    pub col: u32,
+    pub len: u32,
+}
+
 /// DECSCUSR(`CSI Ps SP q`)が選択するカーソル形状。`Terminal`が状態として保持し
 /// (rust-ssot: Kotlin/Swift側にミラー状態を作らず、この値をそのまま描画に使う)、
 /// `ScreenUpdate::cursor_shape`として公開する。点滅の有無は別フィールド
@@ -986,6 +1008,10 @@ impl SshSession {
 
     pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
+    }
+
+    pub(crate) fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
+        self.core.search_scrollback(&query, case_sensitive)
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }

@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use timed_fsm::tokio_support::TokioTimerRuntime;
 use timed_fsm::{TimerCommand, TimerRuntime};
 
-use crate::{CellData, ClipboardMimeKind, ClipboardPayload, ScreenUpdate, SessionCallback, RUNTIME};
+use crate::{CellData, ClipboardMimeKind, ClipboardPayload, ScreenUpdate, ScrollbackSearchMatch, SessionCallback, RUNTIME};
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
 use crate::terminal::{TermCell, Terminal};
 use crate::theme::Theme;
@@ -186,6 +186,89 @@ impl SessionCore {
             }
         }
         result
+    }
+
+    /// scrollbackを対象にした部分一致検索(タスク#37)。`query`が空文字列なら
+    /// (空文字列は「全セルにマッチ」という無意味な結果になるため)空Vecを返す。
+    ///
+    /// 各行を「全角文字のプレースホルダセルを除いた1セル=1文字単位」の列として
+    /// 展開してから素朴な部分文字列探索を行う。プレースホルダを除くのは、
+    /// プレースホルダの`ch`(常に半角スペース)が実在しない文字として検索文字列に
+    /// 混入し、隣接セルをまたぐマッチを誤って分断/接続してしまうのを防ぐため。
+    ///
+    /// combining character(タスク#39)によりセルの`ch`が複数コードポイントを
+    /// 持つ場合、そのセルの全コードポイントに同じ「セル通し番号」を振り、マッチの
+    /// 開始/終了がその通し番号の境界(=セルの先頭/末尾)以外では成立しないよう
+    /// 制約する。これにより例えば"e"+結合アクセントの1セルに対し、"e"や結合
+    /// アクセント単体だけがそのセルの内部で部分マッチすることはない(Codexレビュー:
+    /// 当初の実装はcharの列をそのまま探索しておりこの制約が無かった)。
+    ///
+    /// `case_sensitive=false`の大文字小文字比較はASCIIの範囲のみ
+    /// (`char::to_ascii_lowercase`)。非ASCII文字のUnicodeケースフォールディングは
+    /// 対象外(文字数が変わりうるcaseがあり、列インデックスとの対応が崩れるため)。
+    ///
+    /// スコープ外については[crate::ScrollbackSearchMatch]のドキュメントを参照。
+    pub(crate) fn search_scrollback(&self, query: &str, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
+        let needle: Vec<char> = if case_sensitive {
+            query.chars().collect()
+        } else {
+            query.chars().map(|c| c.to_ascii_lowercase()).collect()
+        };
+        if needle.is_empty() {
+            return Vec::new();
+        }
+
+        let sb = self.scrollback.lock();
+        let mut matches = Vec::new();
+        for (row_idx, row) in sb.iter().enumerate() {
+            // 行を「プレースホルダを除いたcharごとに、由来するセルの(列, 表示幅,
+            // セル通し番号)」の列へ展開する。同一セル由来のcharは同じ
+            // `cell_seq_of`値を持つ。
+            let mut haystack: Vec<char> = Vec::with_capacity(row.len());
+            let mut col_of: Vec<u32> = Vec::with_capacity(row.len());
+            let mut width_of: Vec<u32> = Vec::with_capacity(row.len());
+            let mut cell_seq_of: Vec<u32> = Vec::with_capacity(row.len());
+            let mut cell_seq: u32 = 0;
+            for (col, cell) in row.iter().enumerate() {
+                if cell.is_wide_placeholder {
+                    continue;
+                }
+                let width = if row.get(col + 1).is_some_and(|next| next.is_wide_placeholder) { 2 } else { 1 };
+                for ch in cell.ch.chars() {
+                    haystack.push(if case_sensitive { ch } else { ch.to_ascii_lowercase() });
+                    col_of.push(col as u32);
+                    width_of.push(width);
+                    cell_seq_of.push(cell_seq);
+                }
+                cell_seq += 1;
+            }
+
+            if haystack.len() < needle.len() {
+                continue;
+            }
+            for start in 0..=haystack.len() - needle.len() {
+                let end = start + needle.len() - 1; // マッチ末尾のindex(含む)
+                // マッチの開始/終了はどちらもセルの境界でなければならない
+                // (combining characterセルの途中から始まる/終わるマッチは無効)。
+                let starts_at_cell_boundary =
+                    start == 0 || cell_seq_of[start - 1] != cell_seq_of[start];
+                let ends_at_cell_boundary =
+                    end + 1 == haystack.len() || cell_seq_of[end] != cell_seq_of[end + 1];
+                if !starts_at_cell_boundary || !ends_at_cell_boundary {
+                    continue;
+                }
+                if haystack[start..start + needle.len()] == needle[..] {
+                    let col_start = col_of[start];
+                    let col_end = col_of[end] + width_of[end];
+                    matches.push(ScrollbackSearchMatch {
+                        row: row_idx as u32,
+                        col: col_start,
+                        len: col_end - col_start,
+                    });
+                }
+            }
+        }
+        matches
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) {
@@ -704,6 +787,11 @@ mod tests {
         vec![cell(label); len]
     }
 
+    /// 文字列`s`の各charを1セルずつに割り当てた行を組み立てる(検索テスト用)。
+    fn text_row(s: &str) -> Vec<TermCell> {
+        s.chars().map(cell).collect()
+    }
+
     #[test]
     fn make_screen_update_clamps_cursor_col_during_delayed_wrap() {
         // `Terminal::cursor_col()`は遅延折り返し(delayed wrap)中`cols`(範囲外)を
@@ -782,6 +870,125 @@ mod tests {
         assert_eq!(cells[2].ch, " ");
         assert_eq!(cells[3].ch, " ");
         assert_eq!(cells[4].ch, " ");
+    }
+
+    // ── search_scrollback(タスク#37) ────────────────────────
+
+    #[test]
+    fn search_scrollback_returns_empty_for_empty_query() {
+        let core = core_with_scrollback(20, vec![text_row("hello world")]);
+        assert!(core.search_scrollback("", true).is_empty());
+    }
+
+    #[test]
+    fn search_scrollback_finds_match_with_row_col_len() {
+        // index0 = 最新行。"hello"はcol0開始・5セル分。
+        let core = core_with_scrollback(20, vec![text_row("hello world")]);
+        let matches = core.search_scrollback("hello", true);
+        assert_eq!(matches, vec![ScrollbackSearchMatch { row: 0, col: 0, len: 5 }]);
+    }
+
+    #[test]
+    fn search_scrollback_reports_row_using_newest_first_convention() {
+        // scrollback_cellsと同じ規約(index0=最新)を`row`でもそのまま使う。
+        let core = core_with_scrollback(20, vec![
+            text_row("newest line"), // row 0
+            text_row("older line"),  // row 1
+        ]);
+        let matches = core.search_scrollback("line", true);
+        assert_eq!(matches.len(), 2);
+        assert!(matches.contains(&ScrollbackSearchMatch { row: 0, col: 7, len: 4 }));
+        assert!(matches.contains(&ScrollbackSearchMatch { row: 1, col: 6, len: 4 }));
+    }
+
+    #[test]
+    fn search_scrollback_case_sensitive_true_requires_exact_case() {
+        let core = core_with_scrollback(20, vec![text_row("Hello World")]);
+        assert!(core.search_scrollback("hello", true).is_empty());
+        assert_eq!(core.search_scrollback("Hello", true), vec![
+            ScrollbackSearchMatch { row: 0, col: 0, len: 5 },
+        ]);
+    }
+
+    #[test]
+    fn search_scrollback_case_sensitive_false_ignores_ascii_case() {
+        let core = core_with_scrollback(20, vec![text_row("Hello World")]);
+        assert_eq!(core.search_scrollback("hello", false), vec![
+            ScrollbackSearchMatch { row: 0, col: 0, len: 5 },
+        ]);
+        assert_eq!(core.search_scrollback("WORLD", false), vec![
+            ScrollbackSearchMatch { row: 0, col: 6, len: 5 },
+        ]);
+    }
+
+    #[test]
+    fn search_scrollback_finds_multiple_matches_in_same_row() {
+        let core = core_with_scrollback(20, vec![text_row("abcabc")]);
+        let matches = core.search_scrollback("abc", true);
+        assert_eq!(matches, vec![
+            ScrollbackSearchMatch { row: 0, col: 0, len: 3 },
+            ScrollbackSearchMatch { row: 0, col: 3, len: 3 },
+        ]);
+    }
+
+    #[test]
+    fn search_scrollback_returns_no_match_when_absent() {
+        let core = core_with_scrollback(20, vec![text_row("hello world")]);
+        assert!(core.search_scrollback("xyz", true).is_empty());
+    }
+
+    #[test]
+    fn search_scrollback_match_spanning_wide_char_reports_display_width_as_len() {
+        // col0='a', col1='あ'(表示幅2、col2はそのプレースホルダ), col3='b'。
+        let mut wide = cell('あ');
+        wide.is_wide_placeholder = false;
+        let mut placeholder = cell(' ');
+        placeholder.is_wide_placeholder = true;
+        let row_cells = vec![cell('a'), wide, placeholder, cell('b')];
+        let core = core_with_scrollback(20, vec![row_cells]);
+
+        // プレースホルダは検索対象文字列から除外されるため、"あb"は連続した
+        // 2文字としてマッチし、幅は全角文字の2セル分を含めて3になる。
+        let matches = core.search_scrollback("あb", true);
+        assert_eq!(matches, vec![ScrollbackSearchMatch { row: 0, col: 1, len: 3 }]);
+
+        // 全角文字単体の検索では、その表示幅(2)がそのままlenになる。
+        let matches = core.search_scrollback("あ", true);
+        assert_eq!(matches, vec![ScrollbackSearchMatch { row: 0, col: 1, len: 2 }]);
+    }
+
+    #[test]
+    fn search_scrollback_treats_combining_character_cell_as_one_unit() {
+        // タスク#39: 結合文字は基底文字と同じセルの`ch`へ複数コードポイントとして
+        // 格納される(例: "e" + COMBINING ACUTE ACCENT)。このセルの一部だけに
+        // マッチが掛かることはない。
+        let mut combined = cell('e');
+        combined.ch = smol_str::SmolStr::new("e\u{0301}"); // "é"(結合文字表現)
+        let row_cells = vec![cell('x'), combined, cell('y')];
+        let core = core_with_scrollback(20, vec![row_cells]);
+
+        // 結合文字の片方(基底文字のみ)を検索しても、そのセル全体にしかマッチしない
+        // ("y"を含めた"e\u{0301}y"全体で検索すればマッチする)。
+        let matches = core.search_scrollback("e\u{0301}y", true);
+        assert_eq!(matches, vec![ScrollbackSearchMatch { row: 0, col: 1, len: 2 }]);
+    }
+
+    #[test]
+    fn search_scrollback_does_not_match_inside_a_combining_character_cell() {
+        // Codexレビュー(タスク#37): 結合文字セルの一部だけを検索語にした場合、
+        // そのセルの内部で部分マッチしてはいけない(基底文字だけの"e"や結合
+        // アクセント単体の検索が、"é"を表示しているセルにヒットしてはいけない)。
+        let mut combined = cell('e');
+        combined.ch = smol_str::SmolStr::new("e\u{0301}"); // "é"(結合文字表現)
+        let row_cells = vec![cell('x'), combined, cell('y')];
+        let core = core_with_scrollback(20, vec![row_cells]);
+
+        assert!(core.search_scrollback("e", true).is_empty(), "base charだけの部分マッチは無効");
+        assert!(core.search_scrollback("\u{0301}", true).is_empty(), "結合アクセント単体の部分マッチは無効");
+        // セル全体("e\u{0301}")を丸ごと検索語にすればマッチする。
+        assert_eq!(core.search_scrollback("e\u{0301}", true), vec![
+            ScrollbackSearchMatch { row: 0, col: 1, len: 1 },
+        ]);
     }
 
     // ── resize: 同一値dedupe(#62) ────────────────────────────
