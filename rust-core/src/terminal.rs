@@ -564,6 +564,40 @@ impl Terminal {
         }
     }
 
+    /// SD(`CSI Ps T`)。scroll region([scroll_top, scroll_bottom])の内容を`n`行分
+    /// 下方向へシフトし、上端(`scroll_top`側)を空行で埋める。[scroll_up_region]
+    /// (SU、`CSI Ps S`)の対になる操作 — 構造は上下反転しただけで同じ:
+    /// カーソル位置は変更せず、region外の行には触れない。SUと異なり、下端から
+    /// 押し出された行はどこにも保存せず単に破棄する(scrollbackは「上に消えた行の
+    /// 履歴」であり、下方向スクロールで失われる行はその対象ではない — xtermも
+    /// SDでscrollbackを変更しない)。
+    ///
+    /// [insert_lines]/[delete_lines]と同じ理由で、シフト対象が0行になる
+    /// (`n == region_size`)場合はシフトループ自体をスキップする — `bot - n`を
+    /// `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため。
+    fn scroll_down_region(&mut self, n: usize) {
+        let top = self.scroll_top;
+        let bot = self.scroll_bottom;
+        let region_size = bot - top + 1;
+        let n = n.min(region_size);
+        let cols = self.cols;
+
+        if n < region_size {
+            for row in (top..=(bot - n)).rev() {
+                for col in 0..cols {
+                    let src = self.cells_mut()[row * cols + col].clone();
+                    self.cells_mut()[(row + n) * cols + col] = src;
+                }
+            }
+        }
+        let blank = self.blank();
+        for row in top..(top + n) {
+            for col in 0..cols {
+                self.cells_mut()[row * cols + col] = blank.clone();
+            }
+        }
+    }
+
     /// IL(`CSI Ps L`)。カーソル行に`n`個の空行を挿入し、カーソル行〜scroll_bottomの
     /// 内容を下方向へ押し出す(scroll_bottomを超えて溢れた行は破棄)。
     ///
@@ -1090,6 +1124,18 @@ impl Perform for Terminal {
             'P' => { self.delete_chars(p0.max(1) as usize); }
             'X' => { self.erase_chars(p0.max(1) as usize); }
             'S' => { self.scroll_up_region(p0.max(1) as usize); }
+            // SD(`CSI Ps T`、タスク#49)。SU('S')の対。ただしxtermでは`CSI T`は
+            // パラメータ数によって別機能に化ける多重定義シーケンスなので、ここで
+            // 明示的にガードする(Fableレビュー指摘):
+            // - パラメータ5個(`CSI Ps;Ps;Ps;Ps;Ps T`)は highlight mouse tracking 開始
+            //   (未実装・no-opのままにする — 誤ってSDとして解釈すると画面が壊れる)。
+            // - `CSI > Ps;Ps T`(intermediateに`>`)はタイトルモードリセット(未実装)で、
+            //   SDとは無関係。intermediates非空の`CSI T`は一律SDとして扱わない。
+            // SDとして処理してよいのは「パラメータ0〜1個、かつintermediate無し」の
+            // 場合のみ。
+            'T' if intermediates.is_empty() && params.len() <= 1 => {
+                self.scroll_down_region(p0.max(1) as usize);
+            }
             // REP(`CSI Ps b`、タスク#48): 直前に画面へ書かれたgraphic文字を、その
             // 文字が書かれた時点のSGR属性のまま`Ps`回繰り返す(既定1回)。
             // `last_graphic_cell`が`None`(画面先頭・RIS直後など直前文字が存在しない
@@ -2459,6 +2505,100 @@ mod tests {
         assert_eq!(cell(&t, 3, 3), "4", "旧row4がカーソル行(3)へ詰められる");
         assert_eq!(cell(&t, 4, 0), " ", "region下端(scroll_bottom=4)が空行で埋まる");
         assert_eq!(cell(&t, 5, 0), "r", "scroll_bottomを超えた行5(region外)はDLの影響を受けない");
+    }
+
+    #[test]
+    fn test_sd_scrolls_content_down_and_blanks_top() {
+        // SU(`CSI S`)の対 — SD(`CSI T`)はscroll region全体を下へn行シフトし、
+        // 上端をn行分の空行で埋める。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t, b"\x1b[2T"); // 2行分下へスクロール
+        assert_eq!(cell(&t, 0, 0), " ", "上端は空行で埋まる");
+        assert_eq!(cell(&t, 1, 0), " ", "上端は空行で埋まる");
+        assert_eq!(cell(&t, 2, 3), "0", "旧row0が2行下へ押し出される");
+        assert_eq!(cell(&t, 3, 3), "1", "旧row1が2行下へ押し出される");
+        assert_eq!(cell(&t, 4, 3), "2", "旧row2が2行下へ押し出される");
+        // 旧row3・旧row4はscroll_bottomを超えて溢れ、破棄される。
+    }
+
+    #[test]
+    fn test_sd_default_count_is_one() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1");
+        feed(&mut t, b"\x1b[1;1H\x1b[T"); // Ps省略 == CSI 1T
+        assert_eq!(cell(&t, 0, 0), " ", "空行が1行だけ挿入される");
+        assert_eq!(cell(&t, 1, 0), "r", "旧row0が1行だけ下へ押し出される");
+    }
+
+    #[test]
+    fn test_sd_confined_to_scroll_region() {
+        let mut t = Terminal::new(10, 6, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4\r\nrow5");
+        feed(&mut t, b"\x1b[3;5r"); // scroll region = 行2..4(0-indexed)
+        feed(&mut t, b"\x1b[1T"); // regionを1行下へスクロール
+        assert_eq!(cell(&t, 0, 0), "r", "region上端より上の行0はSDの影響を受けない");
+        assert_eq!(cell(&t, 1, 0), "r", "scroll_top未満の行1(region外)はSDの影響を受けない");
+        assert_eq!(cell(&t, 2, 0), " ", "region上端(scroll_top=2)は空行で埋まる");
+        assert_eq!(cell(&t, 3, 3), "2", "旧row2がregion内で1行下へ押し出される");
+        assert_eq!(cell(&t, 4, 3), "3", "旧row3がregion内で1行下へ押し出される");
+        assert_eq!(cell(&t, 5, 0), "r", "scroll_bottomを超えた行5(region外)はSDの影響を受けない");
+    }
+
+    #[test]
+    fn test_sd_clamp_count_beyond_region_size_without_panic() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t, b"\x1b[100T");
+        for row in 0..5 {
+            assert_eq!(cell(&t, row, 0), " ", "row {row} should be blank after over-sized SD");
+        }
+    }
+
+    #[test]
+    fn test_sd_does_not_move_cursor() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2");
+        feed(&mut t, b"\x1b[2;3H"); // 行1・列2(0-indexed)
+        assert_eq!((t.cursor_row(), t.cursor_col()), (1, 2));
+        feed(&mut t, b"\x1b[2T");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (1, 2), "SDはカーソル位置を変えない");
+    }
+
+    #[test]
+    fn test_sd_never_touches_pending_scrollback() {
+        // SDで下端から押し出されて消える行は、SUの押し出し行(scrollback行)とは
+        // 意味が異なるため、pending_scrollbackへは一切積まれない。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        assert!(t.take_scrollback().is_empty());
+        feed(&mut t, b"\x1b[2T");
+        assert!(
+            t.take_scrollback().is_empty(),
+            "SDで下端から押し出されて消える行はpending_scrollbackへ積んではならない"
+        );
+    }
+
+    #[test]
+    fn test_csi_t_multi_param_is_not_treated_as_sd() {
+        // Fableレビュー(2次)指摘: xtermでは5パラメータの`CSI T`はhighlight mouse
+        // tracking開始という別機能。誤ってSDとして解釈すると画面が壊れるため、
+        // パラメータが2個以上ある`CSI T`はno-opのままであることを固定する。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t, b"\x1b[1;2;3;4;5T");
+        assert_eq!(cell(&t, 0, 0), "r", "5パラメータのCSI TはSDとして扱われない(no-op)");
+        assert_eq!(cell(&t, 0, 3), "0", "画面内容は変化しない");
+    }
+
+    #[test]
+    fn test_csi_gt_t_is_not_treated_as_sd() {
+        // `CSI > Ps;Ps T`(intermediateに`>`)はタイトルモードリセットで、SDとは無関係。
+        // intermediates非空の`CSI T`は一律SDとして扱わない。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t, b"\x1b[>1T");
+        assert_eq!(cell(&t, 0, 0), "r", "intermediate付きCSI TはSDとして扱われない(no-op)");
     }
 
     #[test]
