@@ -17,11 +17,13 @@
 //!
 //! [`russh`]: https://docs.rs/russh
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use russh::client;
 use russh_keys::{HashAlg, PrivateKey, PublicKey};
+use tokio::sync::mpsc;
 
 /// Errors that can occur while connecting, authenticating, or opening a
 /// channel. None of these variants carry credential material.
@@ -115,14 +117,92 @@ pub struct JumpHost {
     pub credential: Credential,
 }
 
-/// A minimal `client::Handler` that does nothing but delegate host-key
-/// verification to a [`HostKeyVerifier`]. All other `client::Handler`
-/// methods use russh's defaults (reject/no-op), so this handler is only
-/// suitable for sessions that don't need agent forwarding, remote port
-/// forwards, or other server-initiated channel requests — callers that need
-/// those should implement their own `client::Handler`.
+/// A registry of *forwarded-streamlocal* routes: maps a remote socket path
+/// (the routing key a caller passed to
+/// [`russh::client::Handle::streamlocal_forward`]) to a sink that receives
+/// each server-initiated `forwarded-streamlocal@openssh.com` channel opened
+/// for that path.
+///
+/// This is how a caller consumes remote UNIX-domain-socket forwards
+/// (`ssh -R <remote-sock>:...`) *in-process*, without this crate taking any
+/// opinion on what the forwarded bytes mean. The usual sequence is:
+///
+/// 1. build [`ForwardRoutes::new`],
+/// 2. [`register`](ForwardRoutes::register) each remote socket path (keeping
+///    the returned receiver),
+/// 3. install the routes on the handler with [`verifying_handler_with_routes`],
+/// 4. request the forward with `handle.streamlocal_forward(path)`.
+///
+/// Each incoming channel for a registered path is delivered to that path's
+/// receiver; a channel whose path has no live route is dropped (which closes
+/// it), matching what an `ssh -R` peer would see for a cancelled forward.
+///
+/// Cloning shares the same underlying table (it is `Arc`-backed), so the copy
+/// held inside the handler and the copy a caller keeps for registration stay
+/// in sync.
+#[derive(Clone, Default)]
+pub struct ForwardRoutes {
+    inner: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<russh::Channel<client::Msg>>>>>,
+}
+
+impl ForwardRoutes {
+    /// An empty route table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers `key` (a remote socket path) and returns the receiving end
+    /// for channels routed to it. Any previously-registered sender for the
+    /// same key is replaced.
+    pub fn register(&self, key: impl Into<String>) -> mpsc::UnboundedReceiver<russh::Channel<client::Msg>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.lock().insert(key.into(), tx);
+        rx
+    }
+
+    /// Removes `key`'s route, if any. Call this after
+    /// `handle.cancel_streamlocal_forward(key)` so a channel that races in for
+    /// an already-cancelled forward is dropped (closed) rather than routed.
+    pub fn unregister(&self, key: &str) {
+        self.lock().remove(key);
+    }
+
+    /// Routes `channel` to `key`'s registered sink. Returns `true` if a live
+    /// route consumed it; `false` (the channel is dropped, and thus closed) if
+    /// there was no route or its receiver had already been dropped — in which
+    /// case the stale entry is pruned.
+    fn dispatch(&self, key: &str, channel: russh::Channel<client::Msg>) -> bool {
+        let mut guard = self.lock();
+        let Some(tx) = guard.get(key) else {
+            return false;
+        };
+        if tx.send(channel).is_ok() {
+            true
+        } else {
+            guard.remove(key);
+            false
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<russh::Channel<client::Msg>>>> {
+        // A poisoned lock means a caller panicked mid-registration; the map is
+        // still structurally intact, so recover the guard rather than
+        // cascading the panic into every later route operation.
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// A minimal `client::Handler` that delegates host-key verification to a
+/// [`HostKeyVerifier`] and, optionally, routes server-initiated
+/// `forwarded-streamlocal@openssh.com` channels to a caller-supplied
+/// [`ForwardRoutes`]. All other `client::Handler` methods use russh's defaults
+/// (reject/no-op), so this handler is suitable for sessions that need only
+/// host-key verification and (optionally) remote UNIX-socket forwards —
+/// callers that need agent forwarding or other server-initiated channel
+/// requests should implement their own `client::Handler`.
 pub struct VerifyingHandler<V> {
     verifier: Arc<V>,
+    forward_routes: Option<ForwardRoutes>,
 }
 
 #[async_trait]
@@ -132,6 +212,25 @@ impl<V: HostKeyVerifier + 'static> client::Handler for VerifyingHandler<V> {
     async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
         let fingerprint = server_public_key.fingerprint(HashAlg::Sha256).to_string();
         Ok(self.verifier.verify(&fingerprint).await)
+    }
+
+    /// The server opened a channel for a new connection to a remote socket
+    /// this session had requested via `streamlocal_forward` (`ssh -R` over a
+    /// UNIX domain socket). If a [`ForwardRoutes`] was installed and has a
+    /// live route for `socket_path`, the channel is handed to that route's
+    /// receiver (fire-and-forget); otherwise the channel is dropped, which
+    /// closes it — the same thing the peer sees for a forward that was never
+    /// requested or has since been cancelled.
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        socket_path: &str,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(routes) = &self.forward_routes {
+            let _ = routes.dispatch(socket_path, channel);
+        }
+        Ok(())
     }
 }
 
@@ -227,7 +326,20 @@ where
 /// (no agent forwarding, no remote forwards). `verifier` is cloned once per
 /// call (cheap: it's an `Arc`).
 pub fn verifying_handler<V: HostKeyVerifier + 'static>(verifier: &Arc<V>) -> VerifyingHandler<V> {
-    VerifyingHandler { verifier: verifier.clone() }
+    VerifyingHandler { verifier: verifier.clone(), forward_routes: None }
+}
+
+/// Like [`verifying_handler`], but also installs `routes` so that
+/// server-initiated `forwarded-streamlocal@openssh.com` channels (from an
+/// `ssh -R <remote-sock>:...` this session requests via
+/// `handle.streamlocal_forward(...)`) are delivered in-process to the matching
+/// [`ForwardRoutes`] receiver instead of being dropped. Both `verifier` and
+/// `routes` are cloned once (each is `Arc`-backed and cheap to clone).
+pub fn verifying_handler_with_routes<V: HostKeyVerifier + 'static>(
+    verifier: &Arc<V>,
+    routes: &ForwardRoutes,
+) -> VerifyingHandler<V> {
+    VerifyingHandler { verifier: verifier.clone(), forward_routes: Some(routes.clone()) }
 }
 
 /// Authenticates `session` as `username` using `credential`. `Ok(false)`
@@ -683,6 +795,125 @@ mod tests {
             *legs.lock().unwrap(),
             vec![ConnectionLeg::Target],
             "a direct connection must build exactly one handler, for the target leg"
+        );
+    }
+
+    /// A server that accepts any password and, when a `streamlocal_forward`
+    /// (`ssh -R <sock>`) is requested, immediately opens a
+    /// `forwarded-streamlocal@openssh.com` channel back for that exact socket
+    /// path, writes a fixed payload, and closes it — standing in for a real
+    /// sshd delivering a remote-forward connection to the client.
+    #[derive(Clone)]
+    struct StreamlocalForwardServer;
+
+    impl server::Server for StreamlocalForwardServer {
+        type Handler = StreamlocalForwardHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> StreamlocalForwardHandler {
+            StreamlocalForwardHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct StreamlocalForwardHandler;
+
+    #[async_trait]
+    impl server::Handler for StreamlocalForwardHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn streamlocal_forward(&mut self, socket_path: &str, session: &mut ServerSession) -> Result<bool, Self::Error> {
+            let handle = session.handle();
+            let path = socket_path.to_string();
+            // Open the forwarded channel off-thread: doing it inline would
+            // deadlock, since the client is still awaiting this request's
+            // reply and can't process the channel-open until it arrives.
+            tokio::spawn(async move {
+                if let Ok(channel) = handle.channel_open_forwarded_streamlocal(path).await {
+                    let _ = channel.data(&b"ctl-payload\n"[..]).await;
+                    let _ = channel.eof().await;
+                }
+            });
+            Ok(true)
+        }
+    }
+
+    /// A `streamlocal_forward` request must round-trip: the server opens a
+    /// `forwarded-streamlocal` channel back for that socket path, and a
+    /// [`ForwardRoutes`] installed via [`verifying_handler_with_routes`] must
+    /// deliver that channel to the matching receiver so the caller can read
+    /// the forwarded bytes in-process.
+    #[tokio::test]
+    async fn streamlocal_forward_delivers_channels_to_registered_routes() {
+        use tokio::time::{timeout, Duration};
+
+        let addr = spawn_server(StreamlocalForwardServer, 12).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let routes = ForwardRoutes::new();
+        let remote_path = "/tmp/isekai-pipe-ctl-roundtrip.sock";
+        let mut rx = routes.register(remote_path);
+
+        let mut handle = establish_over_stream(
+            Arc::new(client::Config::default()),
+            tokio::net::TcpStream::connect(addr).await.unwrap(),
+            verifying_handler_with_routes(&verifier, &routes),
+        )
+        .await
+        .expect("handshake should succeed");
+        let authed = authenticate_session(&mut handle, "tester", &Credential::Password("x".into())).await.unwrap();
+        assert!(authed, "the forward server accepts any password");
+
+        handle.streamlocal_forward(remote_path).await.expect("streamlocal_forward should be accepted");
+
+        let mut channel = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a forwarded channel should arrive before the timeout")
+            .expect("the route sender must not have been dropped");
+
+        let mut got = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => got.extend_from_slice(&data),
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        assert_eq!(got, b"ctl-payload\n", "the forwarded channel's bytes must reach the registered route");
+    }
+
+    /// A forwarded channel whose socket path has no registered route is simply
+    /// dropped (closed): [`ForwardRoutes::dispatch`] returns `false`, and the
+    /// handler's default is to close the channel rather than error the session.
+    /// Registering a *different* path proves the un-routed one never arrives.
+    #[tokio::test]
+    async fn streamlocal_forward_without_a_matching_route_is_dropped() {
+        use tokio::time::{timeout, Duration};
+
+        let addr = spawn_server(StreamlocalForwardServer, 13).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let routes = ForwardRoutes::new();
+        // Register some *other* path; the server will forward for the path we
+        // actually request, which has no route.
+        let mut rx = routes.register("/tmp/some-other-path.sock");
+
+        let mut handle = establish_over_stream(
+            Arc::new(client::Config::default()),
+            tokio::net::TcpStream::connect(addr).await.unwrap(),
+            verifying_handler_with_routes(&verifier, &routes),
+        )
+        .await
+        .expect("handshake should succeed");
+        assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".into())).await.unwrap());
+
+        handle.streamlocal_forward("/tmp/isekai-pipe-ctl-unrouted.sock").await.expect("forward accepted");
+
+        // The unrouted channel must not be misdelivered to the other path's
+        // receiver; a short wait that times out is the expected outcome.
+        assert!(
+            timeout(Duration::from_millis(300), rx.recv()).await.is_err(),
+            "a forwarded channel for an unregistered path must not reach an unrelated route"
         );
     }
 
