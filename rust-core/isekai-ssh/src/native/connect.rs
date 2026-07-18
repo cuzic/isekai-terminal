@@ -7,29 +7,38 @@
 //! + terminal size) into one working `isekai-ssh <destination>` path that
 //! never shells out to `ssh(1)`.
 //!
-//! **Scope note**: unlike `wrapper::run`, this path does not attempt
-//! auto-bootstrap or the `ConnectOutcome`-driven silent re-bootstrap retry
-//! (`always-connects.md`) yet. Both currently go through
-//! `isekai_bootstrap::OpenSshBackend`, which itself shells out to a real
-//! `ssh(1)` to deploy `isekai-pipe serve` on first contact — reusing it here
-//! would defeat the point of this module. Closing that gap is M3's
-//! `RusshBackend` (`fancy-humming-pnueli.md` M3); until then, a
-//! not-yet-trusted destination fails with guidance to run `isekai-ssh init`
-//! manually instead of silently falling back to `ssh(1)`. Likewise, a
-//! destination with `#@isekai enabled no` (direct, non-isekai SSH) isn't
-//! supported by this path yet — that's a plain `connect_via_jump_or_direct`
-//! call away, but is left for a follow-up since every destination this
-//! project's users actually run through `isekai-ssh` has isekai routing
-//! enabled.
+//! **Scope note**: the `ConnectOutcome`-driven silent re-bootstrap retry
+//! (`always-connects.md`) *is* implemented here, mirroring
+//! `wrapper.rs::run_ssh_with_connect_failure_recovery` — an already-trusted
+//! destination whose cached deployment went stale/unreachable self-heals
+//! without the user running `isekai-ssh init`/`doctor --fix` manually (the
+//! re-deploy goes through `bootstrap_and_register`, which dispatches to M3's
+//! `RusshBackend` on Windows, so it no longer shells out to `ssh(1)`). What
+//! this path still does *not* do is auto-bootstrap a *brand-new*
+//! (never-registered) destination on first contact: a trust-store miss still
+//! fails with guidance to run `isekai-ssh init` manually (the initial TOFU
+//! confirmation is inherently interactive — `always-connects.md`'s stated
+//! exception). Likewise, a destination with `#@isekai enabled no` (direct,
+//! non-isekai SSH) isn't supported by this path yet — that's a plain
+//! `connect_via_jump_or_direct` call away, but is left for a follow-up since
+//! every destination this project's users actually run through `isekai-ssh`
+//! has isekai routing enabled.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use isekai_pipe_core::default_runtime_dir;
+use isekai_pipe_core::{claim_connect_outcome, default_runtime_dir, ConnectionIntent};
 use russh::client;
-use russh_stream_session::{authenticate_session, establish_over_stream, open_channel, verifying_handler, SessionKind};
+use russh_stream_session::{authenticate_session, establish_over_stream, open_channel, verifying_handler, SessionError, SessionKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::log_file::log_line;
+use crate::wrapper::{
+    bootstrap_and_register, build_connection_intent, decide_connect_failure_recovery, outcome_summary,
+    print_bootstrap_failure_guidance, should_bootstrap, ConnectFailureRecoveryAction, TofuConfirmation, WrapperPlan,
+    WrapperResolution,
+};
 
 #[cfg(windows)]
 use super::agent_auth;
@@ -43,6 +52,14 @@ use super::private_key;
 /// `wrapper::run`. Takes the same raw argv `wrapper::run` does.
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
     let plan = crate::wrapper::parse_wrapper(args)?;
+    // `--isekai-log-file` must be honored on the native path too — the Unix
+    // path opens it at the top of `wrapper::run`; without this the flag was
+    // silently ignored on Windows (Codex review finding). Opened before any
+    // connection attempt so every diagnostic line below is captured.
+    if let Some(log_file) = plan.log_file() {
+        crate::log_file::init(log_file)
+            .with_context(|| format!("isekai-ssh: failed to open --isekai-log-file at {}", log_file.display()))?;
+    }
     let (resolution, host_config) = crate::wrapper::resolve_for_native(&plan)?;
     if !resolution.isekai_enabled() {
         return Err(anyhow!(
@@ -60,7 +77,98 @@ pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
     })?;
 
     let runtime_dir = default_runtime_dir()?;
-    let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), &runtime_dir, &intent)?;
+    run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, &runtime_dir).await
+}
+
+/// Mirrors `wrapper.rs::run_ssh_with_connect_failure_recovery` for the
+/// Windows-native path (`always-connects.md`): runs one connect attempt; if
+/// it fails *and* the `isekai-pipe connect` child left behind a
+/// `ConnectOutcome` side-channel signal for this exact attempt
+/// (`isekai_pipe_core::claim_connect_outcome`), silently re-bootstraps the
+/// (already-trusted) profile and retries exactly once more. Structurally at
+/// most two connect attempts ever happen — no loop, no recursion — matching
+/// that function's own "at most two attempts" property, so it cannot run
+/// away even if the retry also fails.
+///
+/// The connect-failure *decision* is single-sourced with the Unix path via
+/// `crate::wrapper::decide_connect_failure_recovery` (unit-tested there) —
+/// keeping the "always-connects" policy from drifting between the two paths.
+///
+/// Only reachable *after* `build_connection_intent` already succeeded once
+/// in [`run`] — a brand-new (never-registered) profile's own interactive
+/// bootstrap is out of scope for this path (see the module docs).
+///
+/// **Not covered by an automated test on the native side**: the full
+/// spawn→outcome→silent-rebootstrap→retry loop needs a real `isekai-pipe
+/// connect` child, a mock `sshd` deploy target, and a planted
+/// `ConnectOutcome` — the heavy harness
+/// `tests/wrapper_stale_trust_auto_recovery_e2e.rs` already builds for the
+/// Unix path, whose `bootstrap_and_register`/`claim_connect_outcome` this
+/// path shares verbatim. The cheap, reliable branch (a connect failure with
+/// no outcome signal propagating unchanged) is unit-tested below.
+async fn run_native_connect_with_recovery(
+    plan: &WrapperPlan,
+    resolution: &WrapperResolution,
+    host_config: &openssh_config::HostConfig,
+    intent: ConnectionIntent,
+    runtime_dir: &Path,
+) -> Result<u8> {
+    let first_error = match connect_attempt(plan, resolution, host_config, &intent, runtime_dir).await {
+        Ok(exit_code) => return Ok(exit_code),
+        Err(e) => e,
+    };
+
+    let outcome = claim_connect_outcome(runtime_dir, &intent.intent_id)
+        .map_err(|e| anyhow!("isekai-ssh: failed to check for a connect-failure signal: {e}"))?;
+
+    match decide_connect_failure_recovery(outcome.is_some(), should_bootstrap(plan, resolution)) {
+        ConnectFailureRecoveryAction::NoRecoverableSignal => Err(first_error),
+        ConnectFailureRecoveryAction::AutoBootstrapDisabled => {
+            let outcome = outcome.expect("AutoBootstrapDisabled only returned when a connect-failure signal was found");
+            log_line!(
+                "isekai-ssh: {} for {:?} ({}), but auto-bootstrap is disabled \
+                 (--isekai-no-bootstrap / #@isekai bootstrap-policy never) — run `isekai-ssh init` manually.",
+                outcome_summary(&outcome.class),
+                resolution.profile(),
+                outcome.detail
+            );
+            Err(first_error)
+        }
+        ConnectFailureRecoveryAction::RebootstrapAndRetry => {
+            let outcome = outcome.expect("RebootstrapAndRetry only returned when a connect-failure signal was found");
+            log_line!(
+                "isekai-ssh: {} for {:?} ({}); refreshing automatically...",
+                outcome_summary(&outcome.class),
+                resolution.profile(),
+                outcome.detail
+            );
+            if let Err(bootstrap_err) = bootstrap_and_register(plan, resolution, TofuConfirmation::Silent).await {
+                print_bootstrap_failure_guidance(&bootstrap_err);
+                return Err(bootstrap_err.context("isekai-ssh: automatic re-bootstrap after a connect failure failed"));
+            }
+            let intent2 = build_connection_intent(resolution)
+                .context("isekai-ssh: still not trusted after automatic re-bootstrap")?;
+            connect_attempt(plan, resolution, host_config, &intent2, runtime_dir).await
+        }
+    }
+}
+
+/// One full connect attempt against `intent`: spawn `isekai-pipe connect
+/// --stdio`, run the SSH handshake + authentication over its stdio, open an
+/// interactive shell channel, and relay bytes until the session ends —
+/// returning the remote exit code. An `Err` here means the connection could
+/// never be established (the failure mode
+/// [`run_native_connect_with_recovery`] inspects for a `ConnectOutcome`
+/// signal). Called at most twice by that function, mirroring
+/// `wrapper.rs::run_ssh_once`'s role.
+async fn connect_attempt(
+    plan: &WrapperPlan,
+    resolution: &WrapperResolution,
+    host_config: &openssh_config::HostConfig,
+    intent: &ConnectionIntent,
+    runtime_dir: &Path,
+) -> Result<u8> {
+    let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), runtime_dir, intent)?;
     let stdio = ChildStdio::take_from(&mut child)
         .ok_or_else(|| anyhow!("isekai-ssh: spawned isekai-pipe connect without piped stdin/stdout (internal bug)"))?;
 
@@ -80,7 +188,7 @@ pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
     });
     let verifier = Arc::new(FileBackedHostKeyVerifier::new(store_path, host_port.clone(), confirm_new_host));
 
-    let handle = connect_and_authenticate(stdio, &username, &host_config, &verifier)
+    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier)
         .await
         .with_context(|| format!("isekai-ssh: failed to connect to {username}@{host_port}"))?;
 
@@ -129,14 +237,27 @@ fn prompt_new_host_confirmation(host_port: &str, fingerprint: &str) -> bool {
 }
 
 /// Establishes the SSH handshake over `stream` and authenticates as
-/// `username`, trying (in order) a private key from `host_config
-/// ::identity_file`/the default `id_ed25519`→`id_rsa`→`id_ecdsa` probe, then
-/// an SSH agent (Windows-only — see [`agent_auth::connect_agent`]).
+/// `username`, trying (in order) *every* configured/default private key from
+/// `host_config::identity_file`/the default `id_ed25519`→`id_rsa`→`id_ecdsa`
+/// probe, then an SSH agent (Windows-only — see [`agent_auth::connect_agent`]).
+///
+/// Like real `ssh(1)`, each configured identity is offered in turn: a key
+/// the server *rejects* (`Ok(false)`) or one that fails to *parse*
+/// (`SessionError::InvalidPrivateKey`, e.g. a passphrase-protected key —
+/// M1's documented non-compat case) just moves on to the next candidate, and
+/// then to the SSH-agent fallback, rather than aborting the whole
+/// authentication (Codex review finding: the old code tried only the first
+/// *existing* file, and a parse failure there propagated straight out,
+/// skipping both the remaining keys and the agent entirely). Only a genuine
+/// transport/protocol error (any other `SessionError`) aborts — those are not
+/// "try the next key" situations.
+///
 /// Deliberately generic over `stream`/`verifier` so it's testable against an
 /// in-process mock SSH server without a real `isekai-pipe connect`
 /// subprocess or trust store — the same technique every other `native/*.rs`
-/// module in this crate uses. Everything in [`run`] above this call (real
-/// subprocess, real trust store, real terminal I/O) is not unit-tested.
+/// module in this crate uses. Everything in [`connect_attempt`] above this
+/// call (real subprocess, real trust store, real terminal I/O) is not
+/// unit-tested.
 async fn connect_and_authenticate<S, V>(
     stream: S,
     username: &str,
@@ -153,9 +274,12 @@ where
 
     let home = isekai_fs_guard::resolve_home_dir().unwrap_or_else(|| PathBuf::from("."));
     let candidates = private_key::identity_file_candidates(&host_config.identity_file, &home);
-    if let Ok(credential) = private_key::load_first_existing(&candidates) {
-        if authenticate_session(&mut handle, username, &credential).await? {
-            return Ok(handle);
+    for credential in private_key::readable_credentials(&candidates)? {
+        match authenticate_session(&mut handle, username, &credential).await {
+            Ok(true) => return Ok(handle),
+            Ok(false) => continue,
+            Err(SessionError::InvalidPrivateKey(_)) => continue,
+            Err(e) => return Err(anyhow::Error::new(e).context("SSH authentication request failed")),
         }
     }
 
@@ -197,7 +321,7 @@ async fn try_agent_auth<H: client::Handler>(
 }
 
 /// Relays bytes between the local terminal (raw mode, already enabled by
-/// the caller) and the remote shell channel until either side closes,
+/// the caller) and the remote shell channel until the channel closes,
 /// returning the remote exit status as this process's own exit code (`ssh(1)`'s
 /// own convention) — or **255** if the channel closed without ever sending
 /// one (Codex review finding: an abnormal disconnect — network loss, the
@@ -211,18 +335,34 @@ async fn try_agent_auth<H: client::Handler>(
 /// **Known limitation**: does not yet propagate local terminal resize
 /// events to the remote PTY (`channel.window_change`) — the channel is
 /// opened with the size at connect time and stays fixed for the session.
-/// Not covered by any test in this crate: driving a real local
-/// stdin/stdout pair isn't practical in a unit test; `russh-stream-session`'s
-/// own tests already cover the underlying `Channel`/`ChannelMsg` plumbing
-/// this loop drives.
+/// Delegates to [`run_shell_io_loop_inner`] (which the tests drive against
+/// in-memory buffers) with the real local `stdin`/`stdout`/`stderr`; driving
+/// a real terminal stdin/stdout pair isn't practical in a unit test.
 async fn run_shell_io_loop(channel: &mut russh::Channel<client::Msg>) -> Result<u8> {
+    run_shell_io_loop_inner(channel, tokio::io::stdin(), tokio::io::stdout(), tokio::io::stderr()).await
+}
+
+/// The body of [`run_shell_io_loop`] with the three local streams injected,
+/// so tests can substitute in-memory buffers for a real terminal. `stdin`
+/// feeds the remote channel; remote `Data` goes to `stdout` and remote
+/// `ExtendedData` (stderr) goes to `stderr` — real `ssh(1)` keeps the two
+/// separate (Codex review finding: they were both written to `stdout`).
+async fn run_shell_io_loop_inner<I, O, E>(
+    channel: &mut russh::Channel<client::Msg>,
+    mut stdin: I,
+    mut stdout: O,
+    mut stderr: E,
+) -> Result<u8>
+where
+    I: tokio::io::AsyncRead + Unpin,
+    O: tokio::io::AsyncWrite + Unpin,
+    E: tokio::io::AsyncWrite + Unpin,
+{
     /// `ssh(1)`'s own exit code for "the connection was lost, or the remote
     /// command couldn't be run" — used here when the channel closes without
     /// ever delivering a `ChannelMsg::ExitStatus`.
     const NO_EXIT_STATUS_RECEIVED: u8 = 255;
 
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
     let mut buf = [0u8; 8192];
     let mut exit_code: Option<u8> = None;
     let mut stdin_open = true;
@@ -253,16 +393,21 @@ async fn run_shell_io_loop(channel: &mut russh::Channel<client::Msg>) -> Result<
                         let _ = stdout.flush().await;
                     }
                     Some(russh::ChannelMsg::ExtendedData { data, .. }) => {
-                        let _ = stdout.write_all(&data).await;
-                        let _ = stdout.flush().await;
+                        let _ = stderr.write_all(&data).await;
+                        let _ = stderr.flush().await;
                     }
                     Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
                         exit_code = Some(exit_status as u8);
                     }
-                    Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close) => {
-                        break;
-                    }
-                    None => break,
+                    // A server may legally send `CHANNEL_EOF` *before* the
+                    // `exit-status` channel request — RFC 4254 doesn't mandate
+                    // the order (Codex review finding). Breaking on `Eof` here
+                    // would drop a still-pending `ExitStatus` and mis-report a
+                    // successful command as 255, so `Eof` is a no-op (via the
+                    // catch-all below): data never arrives after it, but
+                    // `ExitStatus` still can. Only `Close`/`None` — the channel
+                    // truly ending — break the loop.
+                    Some(russh::ChannelMsg::Close) | None => break,
                     _ => {}
                 }
             }
@@ -277,9 +422,10 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
-    use russh::Channel as RusshChannel;
+    use russh::{Channel as RusshChannel, CryptoVec};
     use russh_keys::ssh_key::private::{Ed25519Keypair, PrivateKey as SshPrivateKey};
-    use russh_stream_session::HostKeyVerifier;
+    use russh_keys::ssh_key::{LineEnding, PublicKey as SshPublicKey};
+    use russh_stream_session::{Credential, HostKeyVerifier};
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
@@ -328,6 +474,104 @@ mod tests {
             &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
         ) -> Result<bool, Self::Error> {
             Ok(true)
+        }
+    }
+
+    /// Writes a fresh ed25519 OpenSSH private key (deterministic from `seed`)
+    /// to `dir/name` and returns its path plus the matching public key — so a
+    /// test can point `HostConfig::identity_file` at a real key file and
+    /// configure a server to accept (only) that key.
+    fn write_ed25519_identity(dir: &Path, name: &str, seed: u8) -> (PathBuf, SshPublicKey) {
+        let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let private = SshPrivateKey::from(keypair);
+        let pem = private.to_openssh(LineEnding::LF).expect("serialize ed25519 key to OpenSSH PEM");
+        let path = dir.join(name);
+        std::fs::write(&path, pem.as_bytes()).unwrap();
+        (path, private.public_key().clone())
+    }
+
+    /// Accepts publickey auth for exactly one configured public key (rejecting
+    /// every other key), and accepts session-channel opens. Lets a test prove
+    /// `connect_and_authenticate` offers each configured identity in turn: a
+    /// first key this server rejects must not stop the (accepted) second one.
+    #[derive(Clone)]
+    struct AcceptOneKeyServer {
+        accepted: SshPublicKey,
+    }
+
+    impl server::Server for AcceptOneKeyServer {
+        type Handler = AcceptOneKeyHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> AcceptOneKeyHandler {
+            AcceptOneKeyHandler { accepted: self.accepted.clone() }
+        }
+    }
+
+    #[derive(Clone)]
+    struct AcceptOneKeyHandler {
+        accepted: SshPublicKey,
+    }
+
+    #[async_trait]
+    impl server::Handler for AcceptOneKeyHandler {
+        type Error = russh::Error;
+
+        async fn auth_publickey(&mut self, _user: &str, public_key: &SshPublicKey) -> Result<Auth, Self::Error> {
+            Ok(if public_key.key_data() == self.accepted.key_data() {
+                Auth::Accept
+            } else {
+                Auth::Reject { proceed_with_methods: None }
+            })
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// On a shell request, sends stdout data, then stderr (extended) data,
+    /// then `CHANNEL_EOF`, then the `exit-status` request, then `close` — in
+    /// that exact order. Exercises two Codex review findings at once: (1) the
+    /// client must not break on `Eof` and lose the `exit-status` that legally
+    /// follows it (RFC 4254 leaves their order unspecified), and (2) extended
+    /// (stderr) data must be routed to local stderr, not stdout. Sends
+    /// synchronously from `shell_request` (like `russh-stream-session`'s own
+    /// `EchoExecServer`) so the on-wire ordering is deterministic.
+    #[derive(Clone)]
+    struct EofThenExitStatusServer;
+
+    impl server::Server for EofThenExitStatusServer {
+        type Handler = EofThenExitStatusHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> EofThenExitStatusHandler {
+            EofThenExitStatusHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct EofThenExitStatusHandler;
+
+    #[async_trait]
+    impl server::Handler for EofThenExitStatusHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn shell_request(&mut self, channel: russh::ChannelId, session: &mut ServerSession) -> Result<(), Self::Error> {
+            session.data(channel, CryptoVec::from(b"hello-stdout".to_vec()))?;
+            session.extended_data(channel, 1, CryptoVec::from(b"hello-stderr".to_vec()))?;
+            session.eof(channel)?;
+            session.exit_status_request(channel, 42)?;
+            session.close(channel)?;
+            Ok(())
         }
     }
 
@@ -431,8 +675,6 @@ mod tests {
     /// ever sent, standing in for exactly that scenario.
     #[tokio::test]
     async fn run_shell_io_loop_reports_255_when_the_channel_closes_without_an_exit_status() {
-        use russh_stream_session::Credential;
-
         let addr = spawn_server(CloseWithoutExitStatusServer, 202).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -450,5 +692,160 @@ mod tests {
 
         let exit_code = run_shell_io_loop(&mut channel).await.unwrap();
         assert_eq!(exit_code, 255, "an abnormal disconnect must not be reported as a successful (0) exit");
+    }
+
+    /// Connects to `addr`, accepts its host key, authenticates with a
+    /// throwaway password (the shell-request test servers accept any), and
+    /// opens a shell channel. Returns the `handle` *and* the channel — the
+    /// caller must keep `handle` alive for the duration of the I/O loop, else
+    /// dropping it tears the session down mid-test.
+    async fn open_authed_shell(
+        addr: SocketAddr,
+    ) -> (client::Handle<russh_stream_session::VerifyingHandler<AcceptAllHostKeys>>, russh::Channel<client::Msg>) {
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let handler = verifying_handler(&verifier);
+        let mut handle = establish_over_stream(config, stream, handler).await.unwrap();
+        let authed = authenticate_session(&mut handle, "tester", &Credential::Password("unused".to_string())).await.unwrap();
+        assert!(authed, "the shell-request test server accepts any password");
+        let channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24 })
+            .await
+            .unwrap();
+        (handle, channel)
+    }
+
+    /// Codex review finding: a server may legally send `CHANNEL_EOF` before
+    /// the `exit-status` request (RFC 4254 doesn't fix the order). The loop
+    /// used to break on `Eof`, so it never saw the `ExitStatus` that followed
+    /// and returned its 255 "no exit status" fallback even though the command
+    /// actually exited 42. `EofThenExitStatusServer` sends eof *then*
+    /// exit-status; the loop must report 42.
+    #[tokio::test]
+    async fn run_shell_io_loop_honors_exit_status_sent_after_eof() {
+        let addr = spawn_server(EofThenExitStatusServer, 203).await;
+        let (_handle, mut channel) = open_authed_shell(addr).await;
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr).await.unwrap();
+        assert_eq!(exit_code, 42, "an exit-status arriving after CHANNEL_EOF must still be honored, not reported as 255");
+    }
+
+    /// Codex review finding: remote stderr (`ChannelMsg::ExtendedData`) was
+    /// being written to local stdout — real `ssh(1)` keeps the two streams
+    /// separate. `EofThenExitStatusServer` sends `hello-stdout` as data and
+    /// `hello-stderr` as extended data; each must land on its own stream.
+    #[tokio::test]
+    async fn run_shell_io_loop_routes_extended_data_to_stderr_not_stdout() {
+        let addr = spawn_server(EofThenExitStatusServer, 204).await;
+        let (_handle, mut channel) = open_authed_shell(addr).await;
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let _ = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr).await.unwrap();
+        assert_eq!(stdout, b"hello-stdout", "remote stdout (Data) must land on local stdout");
+        assert_eq!(stderr, b"hello-stderr", "remote stderr (ExtendedData) must land on local stderr, not stdout");
+    }
+
+    /// Codex review finding: only the first *existing* `IdentityFile` was ever
+    /// tried, so a first key the server *rejects* blocked every later
+    /// configured identity. Here the first key is present but unauthorized and
+    /// the second is accepted — the connection must still succeed.
+    #[tokio::test]
+    async fn connect_and_authenticate_tries_the_next_identity_when_the_first_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first_key, _first_pub) = write_ed25519_identity(dir.path(), "id_first", 71);
+        let (second_key, second_pub) = write_ed25519_identity(dir.path(), "id_second", 72);
+        let addr = spawn_server(AcceptOneKeyServer { accepted: second_pub }, 205).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![first_key, second_key], ..Default::default() };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
+        assert!(
+            result.is_ok(),
+            "the second configured identity is accepted, so the connection must succeed despite the first being rejected"
+        );
+    }
+
+    /// Codex review finding: a first `IdentityFile` that fails to *parse*
+    /// (e.g. a passphrase-protected or corrupt key —
+    /// `SessionError::InvalidPrivateKey`) used to propagate straight out,
+    /// skipping both the remaining keys and the SSH-agent fallback. Here the
+    /// first file is unparseable garbage and the second is a valid, accepted
+    /// key — the parse failure must be treated like a rejection and the
+    /// connection must still succeed.
+    #[tokio::test]
+    async fn connect_and_authenticate_skips_an_unparseable_identity_and_tries_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let garbage = dir.path().join("id_garbage");
+        std::fs::write(&garbage, b"this is not a valid OpenSSH private key\n").unwrap();
+        let (valid_key, valid_pub) = write_ed25519_identity(dir.path(), "id_valid", 73);
+        let addr = spawn_server(AcceptOneKeyServer { accepted: valid_pub }, 206).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![garbage, valid_key], ..Default::default() };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
+        assert!(result.is_ok(), "an unparseable first identity (InvalidPrivateKey) must not block the valid second one");
+    }
+
+    /// The cheap, reliable branch of the "always-connects" recovery
+    /// orchestration (`run_native_connect_with_recovery`): when the connect
+    /// attempt fails but `isekai-pipe connect` left *no* `ConnectOutcome`
+    /// signal behind (here it never even ran — the pipe binary path is
+    /// bogus), the original error must propagate rather than being swallowed
+    /// or triggering a spurious re-bootstrap. The full
+    /// spawn→outcome→rebootstrap→retry path is exercised e2e for the Unix
+    /// path in `tests/wrapper_stale_trust_auto_recovery_e2e.rs`, whose
+    /// `bootstrap_and_register`/`claim_connect_outcome` this path reuses
+    /// verbatim (see the function's own docs for why the native side stops
+    /// short of that heavy harness).
+    #[tokio::test]
+    async fn native_connect_recovery_propagates_error_when_no_outcome_signal_is_present() {
+        use isekai_pipe_core::{BootstrapProvenance, IntentTransport, ServerIdentity};
+
+        let bogus_pipe = std::env::temp_dir().join("isekai-native-test-nonexistent-pipe-binary");
+        let plan = crate::wrapper::parse_wrapper(vec![
+            "--isekai-pipe-path".to_string(),
+            bogus_pipe.display().to_string(),
+            "isekai-native-recovery-test-host".to_string(),
+        ])
+        .expect("parse_wrapper");
+        let (resolution, host_config) = crate::wrapper::resolve_for_native(&plan).expect("resolve_for_native");
+        let intent = ConnectionIntent::new(
+            "isekai-native-recovery-test-host",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::Relay {
+                helper_addr: "203.0.113.5:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "example.com:22".to_string() },
+        );
+        let runtime_dir = tempfile::tempdir().unwrap();
+
+        let result = run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, runtime_dir.path()).await;
+        assert!(result.is_err(), "a connect failure with no ConnectOutcome signal must propagate, not be swallowed");
+    }
+
+    /// Regression for the "--isekai-log-file silently ignored on Windows"
+    /// finding: `run` reads `WrapperPlan::log_file()` to call
+    /// `crate::log_file::init`, so the getter must faithfully surface the
+    /// parsed flag (and `None` when it's absent).
+    #[test]
+    fn wrapper_plan_exposes_isekai_log_file_for_the_native_path() {
+        let with_flag = crate::wrapper::parse_wrapper(vec![
+            "--isekai-log-file".to_string(),
+            "/tmp/isekai-native.log".to_string(),
+            "somehost".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(with_flag.log_file(), Some(Path::new("/tmp/isekai-native.log")));
+
+        let without_flag = crate::wrapper::parse_wrapper(vec!["somehost".to_string()]).unwrap();
+        assert_eq!(without_flag.log_file(), None);
     }
 }
