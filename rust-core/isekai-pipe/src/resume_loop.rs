@@ -682,6 +682,48 @@ async fn promote_warm_standby_once(
 /// fresh instance the caller creates per disconnect episode (mirroring
 /// `spawn_reconnect_signal`'s own one-per-generation rule) — passed in
 /// rather than constructed here so tests can inject a controllable mock.
+/// `UnknownSession` is the only `ResumeRejectReason` that means "the server
+/// doesn't have this `session_id` in its table at all" — evicted by
+/// capacity pressure, reclaimed by the resume-window backstop, or the
+/// server process itself restarted with an empty table. Retrying the exact
+/// same `session_id` again can never succeed once this comes back, so
+/// `resume_with_backoff_until_deadline` gives up immediately instead of
+/// waiting out the (now days-long) deadline. `Auth`/`OffsetGone` and any
+/// non-rejection `TransportError` (network/mux failures) are left to the
+/// existing deadline-bound retry loop unchanged — those are rejections of a
+/// *specific attempt* against a session the server still knows about (or
+/// transient dial failures), not proof the session itself is gone, so this
+/// function deliberately doesn't guess at their retriability.
+fn is_terminal_resume_rejection(e: &isekai_transport::TransportError) -> bool {
+    matches!(
+        e,
+        isekai_transport::TransportError::ResumeRejected(isekai_transport::ResumeRejectReason::UnknownSession)
+    )
+}
+
+/// Shared give-up cleanup for `resume_with_backoff_until_deadline`'s two
+/// terminal paths (deadline exceeded, or a definitive `UnknownSession`
+/// rejection): clears the live TTY status line, prints one final message,
+/// closes stdout so `ssh` treats this as a lost connection, and stops the
+/// warm-standby probe task.
+async fn give_up(
+    is_tty: bool,
+    stdout: &mut tokio::io::Stdout,
+    warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
+    message: &str,
+) {
+    if is_tty {
+        // その場書き換え中だったライブ表示行をクリアしてから
+        // ギブアップメッセージを改行付きで出す。
+        eprint!("\r\x1b[K");
+    }
+    eprintln!("{message}");
+    let _ = stdout.shutdown().await;
+    if let Some(t) = warm_standby_task {
+        t.abort();
+    }
+}
+
 async fn resume_with_backoff_until_deadline(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -699,30 +741,27 @@ async fn resume_with_backoff_until_deadline(
         let now = Instant::now();
         if now >= deadline {
             let exceeded_by = now.saturating_duration_since(deadline);
-            if state.is_tty {
-                // その場書き換え中だったライブ表示行をクリアしてから
-                // ギブアップメッセージを改行付きで出す。
-                eprint!("\r\x1b[K");
-            }
             let last_error_suffix = state
                 .last_resume_error
                 .as_deref()
                 .map(|e| format!(" Last error: {e}."))
                 .unwrap_or_default();
             let session_id = state.session_id;
-            eprintln!(
-                "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
-                 the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}.{last_error_suffix} \
-                 Closing stdin/stdout; ssh will treat this as a lost connection.",
-            );
+            give_up(
+                state.is_tty,
+                stdout,
+                warm_standby_task,
+                &format!(
+                    "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
+                     the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}.{last_error_suffix} \
+                     Closing stdin/stdout; ssh will treat this as a lost connection.",
+                ),
+            )
+            .await;
             notify_os(
                 "isekai-pipe connect",
                 &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
             );
-            let _ = stdout.shutdown().await;
-            if let Some(t) = warm_standby_task {
-                t.abort();
-            }
             return Err(anyhow::anyhow!(
                 "resume window ({resume_window:?}) exceeded by {exceeded_by:?} for session_id={session_id}\
                  for '{profile}'.{last_error_suffix}"
@@ -779,6 +818,30 @@ async fn resume_with_backoff_until_deadline(
                 return Ok(resumed.data_stream);
             }
             Err(e) => {
+                // See `is_terminal_resume_rejection`'s docs.
+                if is_terminal_resume_rejection(&e) {
+                    let session_id = state.session_id;
+                    give_up(
+                        state.is_tty,
+                        stdout,
+                        warm_standby_task,
+                        &format!(
+                            "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
+                             the server no longer knows this session (reclaimed, or the server \
+                             itself restarted); retrying would never succeed. Closing stdin/stdout; \
+                             ssh will treat this as a lost connection.",
+                        ),
+                    )
+                    .await;
+                    notify_os(
+                        "isekai-pipe connect",
+                        &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): server no longer knows this session."),
+                    );
+                    return Err(anyhow::anyhow!(
+                        "server no longer recognizes session_id={session_id} for '{profile}' (UnknownSession); \
+                         retrying would never succeed."
+                    ));
+                }
                 let msg = format!("{e:#}");
                 // TTY時はその場書き換えのライブ表示とスクロール表示が混ざると
                 // UXを壊すため、個々の失敗はdebugログへ格下げする(既定の
@@ -1275,6 +1338,19 @@ mod tests {
         .await;
         assert!(result.is_ok(), "a BUSY_OTHER_SESSION failure must be retried until it succeeds");
         assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn is_terminal_resume_rejection_is_true_only_for_unknown_session() {
+        assert!(is_terminal_resume_rejection(&isekai_transport::TransportError::ResumeRejected(
+            isekai_transport::ResumeRejectReason::UnknownSession
+        )));
+        assert!(!is_terminal_resume_rejection(&isekai_transport::TransportError::ResumeRejected(
+            isekai_transport::ResumeRejectReason::Auth
+        )));
+        assert!(!is_terminal_resume_rejection(&isekai_transport::TransportError::ResumeRejected(
+            isekai_transport::ResumeRejectReason::OffsetGone
+        )));
     }
 
     #[tokio::test]
