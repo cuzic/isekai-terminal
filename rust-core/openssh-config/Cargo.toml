@@ -1,0 +1,16 @@
+[package]
+name = "openssh-config"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Resolve a deliberate subset of OpenSSH ~/.ssh/config keywords (HostName/User/Port/IdentityFile/ProxyJump/ForwardAgent/IdentityAgent) for a destination host, with Host/Include semantics matching ssh(1). Match-block conditions are recognized structurally but never evaluated."
+readme = "README.md"
+keywords = ["ssh", "openssh", "config", "ssh-config"]
+categories = ["config", "network-programming"]
+
+[dependencies]
+glob = "0.3"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+tempfile = "3"
