@@ -21,11 +21,18 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+
 use crate::error::TrustError;
-use crate::schema::TrustStore;
+use crate::schema::{SshHostKeyTrustStore, TrustStore};
 
 pub const CONFIG_DIR_NAME: &str = "isekai-ssh";
 pub const TRUST_STORE_FILE_NAME: &str = "known_helpers.toml";
+/// Deliberately a different file from [`TRUST_STORE_FILE_NAME`] — see
+/// [`crate::schema::SshHostKeyTrustStore`]'s docs for why this is kept
+/// separate rather than a new table in the same file.
+pub const SSH_HOST_KEY_TRUST_STORE_FILE_NAME: &str = "known_ssh_hosts.toml";
 
 /// `~/.config/isekai-ssh` (XDG Base Directory convention, per
 /// `archive/ISEKAI_SSH_DESIGN.md`). Resolves the home directory via
@@ -49,6 +56,11 @@ pub fn default_trust_store_path() -> Result<PathBuf, TrustError> {
     Ok(default_config_dir()?.join(TRUST_STORE_FILE_NAME))
 }
 
+/// `~/.config/isekai-ssh/known_ssh_hosts.toml`.
+pub fn default_ssh_host_key_trust_store_path() -> Result<PathBuf, TrustError> {
+    Ok(default_config_dir()?.join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME))
+}
+
 /// Loads the trust store from `path`.
 ///
 /// Returns an empty (default) store if `path` does not exist yet — that is
@@ -56,6 +68,33 @@ pub fn default_trust_store_path() -> Result<PathBuf, TrustError> {
 /// else (bad permissions, malformed TOML, an unknown `update_policy`) fails
 /// closed as a `TrustError`.
 pub fn load_trust_store(path: &Path) -> Result<TrustStore, TrustError> {
+    load_toml_store(path)
+}
+
+/// Writes `store` to `path` atomically (temp file + rename) with `0600`
+/// permissions. Creates the parent directory (as `0700`) if it does not
+/// exist yet.
+pub fn save_trust_store(path: &Path, store: &TrustStore) -> Result<(), TrustError> {
+    save_toml_store(path, store)
+}
+
+/// Same load semantics as [`load_trust_store`], for [`SshHostKeyTrustStore`].
+pub fn load_ssh_host_key_trust_store(path: &Path) -> Result<SshHostKeyTrustStore, TrustError> {
+    load_toml_store(path)
+}
+
+/// Same save semantics as [`save_trust_store`], for [`SshHostKeyTrustStore`].
+pub fn save_ssh_host_key_trust_store(path: &Path, store: &SshHostKeyTrustStore) -> Result<(), TrustError> {
+    save_toml_store(path, store)
+}
+
+/// Generic load shared by [`load_trust_store`]/[`load_ssh_host_key_trust_store`]
+/// — same permission-checking and fail-closed-on-malformed-TOML behavior
+/// regardless of which store type `T` is, since both are separate files
+/// under the same `~/.config/isekai-ssh` directory with the same threat
+/// model (a world-writable file/dir means someone other than the owner
+/// could plant trust entries).
+fn load_toml_store<T: Default + DeserializeOwned>(path: &Path) -> Result<T, TrustError> {
     if let Some(parent) = path.parent() {
         if parent.exists() {
             check_not_world_writable(parent)?;
@@ -63,21 +102,19 @@ pub fn load_trust_store(path: &Path) -> Result<TrustStore, TrustError> {
     }
 
     if !path.exists() {
-        return Ok(TrustStore::default());
+        return Ok(T::default());
     }
     check_not_world_writable(path)?;
 
     let content =
         fs::read_to_string(path).map_err(|e| TrustError::Read { path: path.to_path_buf(), source: e })?;
-    let store: TrustStore = toml::from_str(&content)
+    let store: T = toml::from_str(&content)
         .map_err(|e| TrustError::Parse { path: path.to_path_buf(), source: Box::new(e) })?;
     Ok(store)
 }
 
-/// Writes `store` to `path` atomically (temp file + rename) with `0600`
-/// permissions. Creates the parent directory (as `0700`) if it does not
-/// exist yet.
-pub fn save_trust_store(path: &Path, store: &TrustStore) -> Result<(), TrustError> {
+/// Generic save shared by [`save_trust_store`]/[`save_ssh_host_key_trust_store`].
+fn save_toml_store<T: Serialize>(path: &Path, store: &T) -> Result<(), TrustError> {
     let parent = path.parent().ok_or_else(|| TrustError::NoParentDir { path: path.to_path_buf() })?;
     ensure_private_dir(parent)?;
 
@@ -284,5 +321,60 @@ last_seen_at = "2026-07-04T00:00:00Z"
     fn config_dir_is_joined_under_home() {
         let home = Path::new("/home/example-user");
         assert_eq!(config_dir_from_home(home), home.join(".config").join("isekai-ssh"));
+    }
+
+    #[test]
+    fn ssh_host_key_trust_store_round_trips_through_save_and_load() {
+        use crate::schema::{SshHostKeyTrust, SshHostKeyTrustStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME);
+
+        let mut store = SshHostKeyTrustStore::default();
+        store.insert(
+            "example.com:22".to_string(),
+            SshHostKeyTrust {
+                fingerprint: "SHA256:abcdef".to_string(),
+                trusted_at: "2026-07-17T00:00:00Z".to_string(),
+                last_seen_at: "2026-07-17T00:00:00Z".to_string(),
+            },
+        );
+        save_ssh_host_key_trust_store(&path, &store).unwrap();
+
+        let loaded = load_ssh_host_key_trust_store(&path).unwrap();
+        assert_eq!(loaded, store);
+    }
+
+    #[test]
+    fn ssh_host_key_trust_store_missing_file_loads_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME);
+        let store = load_ssh_host_key_trust_store(&path).unwrap();
+        assert!(store.hosts.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_host_key_trust_store_save_writes_file_with_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME);
+        save_ssh_host_key_trust_store(&path, &SshHostKeyTrustStore::default()).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn ssh_host_key_and_helper_trust_stores_use_different_file_names() {
+        // The two store types must never collide on the same path even
+        // when rooted at the same config directory — that's the whole
+        // point of keeping them as separate files (schema.rs docs).
+        assert_ne!(TRUST_STORE_FILE_NAME, SSH_HOST_KEY_TRUST_STORE_FILE_NAME);
+        let home = Path::new("/home/example-user");
+        let config_dir = config_dir_from_home(home);
+        assert_ne!(
+            config_dir.join(TRUST_STORE_FILE_NAME),
+            config_dir.join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME)
+        );
     }
 }
