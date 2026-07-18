@@ -112,6 +112,17 @@ public struct TerminalView: View {
         .onAppear {
             snippets = (try? db.fetchSnippets(forProfileId: profileId)) ?? []
             reloadKeySequenceSheetContent()
+            // #60: 初回表示時点の実効フォーカス状態も転送する(以降の変化は
+            // 下の.onChange(of: isActive)が担う)。
+            controller.notifyFocusChange(focused: isActive)
+        }
+        // #60: フォーカスレポーティング(`CSI ?1004`)。「このタブが今まさにアクティブタブ
+        // (=入力を受け付けている状態)」の変化(タブ切替のたびに発火)をそのままRust側へ
+        // 転送する。フォーカスレポーティングが有効かどうか・実際に`CSI I`/`CSI O`を送るか
+        // どうかの判断はRust側(`Terminal`)が持つ(rust-ssot)ので、ここでは生の値を渡す
+        // だけでよい。
+        .onChange(of: isActive) { newValue in
+            controller.notifyFocusChange(focused: newValue)
         }
         .onDisappear { controller.disconnect() }
         .sheet(isPresented: $showSnippetSheet) {
