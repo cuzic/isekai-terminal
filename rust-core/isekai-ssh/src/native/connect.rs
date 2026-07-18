@@ -436,17 +436,31 @@ async fn run_authenticated_session(
     // leaves `ctl` as `None` and the shell opens without it.
     let ctl = if ctl_enabled { ctl_forward::request(&handle, &forward_routes).await } else { None };
 
-    let mut channel = {
+    let open_result = {
         // Held only for the open; released before the I/O loop so sibling
         // channels and forwards aren't blocked behind this session's traffic.
+        // The guard is dropped at the end of this block, before any
+        // `ctl_forward` cleanup below re-locks the handle.
         let guard = handle.lock().await;
         match &ctl {
             Some(fwd) => ctl_forward::open_login_shell(&guard, &term, cols, rows, &fwd.remote_path)
                 .await
-                .context("isekai-ssh: failed to open a ctl-socket login shell")?,
-            None => open_channel(&guard, &SessionKind::Shell { term, cols, rows })
-                .await
-                .context("isekai-ssh: failed to open a shell channel")?,
+                .context("isekai-ssh: failed to open a ctl-socket login shell"),
+            None => open_channel(&guard, &SessionKind::Shell { term, cols, rows }).await.context("isekai-ssh: failed to open a shell channel"),
+        }
+    };
+    let mut channel = match open_result {
+        Ok(channel) => channel,
+        Err(e) => {
+            // The channel open failed *after* we'd already requested this
+            // tab's private ctl-socket forward (mirrors `owner.rs::relay_client`'s
+            // identical cleanup) — tear it down before bailing so it doesn't
+            // leak on the remote (and its route entry linger locally). Every
+            // exit path must release a requested forward.
+            if let Some(fwd) = &ctl {
+                ctl_forward::cancel(&handle, &forward_routes, &fwd.remote_path).await;
+            }
+            return Err(e);
         }
     };
 
