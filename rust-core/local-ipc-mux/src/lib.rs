@@ -105,10 +105,16 @@ pub trait ExclusiveChannel: Sized + Send {
     async fn connect(name: &str) -> Result<Self::Connection, ConnectError>;
 }
 
+// Compiled on all platforms so its pure error-classification/retry logic can
+// be unit-tested here on Linux; only actually *used* by the Windows named-pipe
+// implementation.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod pipe_classify;
+
 #[cfg(windows)]
 mod windows_named_pipe;
 #[cfg(windows)]
-pub use windows_named_pipe::WindowsNamedPipeChannel;
+pub use windows_named_pipe::{PipeConnection, WindowsNamedPipeChannel};
 
 pub mod in_memory;
 pub use in_memory::InMemoryChannel;
