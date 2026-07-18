@@ -472,6 +472,16 @@ last_seen_at = "2026-07-04T00:00:00Z"
         // (it uses umask-dependent, typically world-readable `0755`
         // permissions) — `with_locked_ssh_host_key_trust_store` must apply
         // `ensure_private_dir` first so a fresh directory ends up `0700`.
+        //
+        // Known limitation (Codex review, not fixed): this assertion only
+        // actually exercises the bug this guards against under a typical
+        // `022` umask (the near-universal default on real dev machines and
+        // CI runners) — under an unusual `077` umask, `create_dir_all`
+        // alone would already produce `0700`, so a regression here could
+        // slip past this test undetected in that specific environment. A
+        // fully deterministic version would force the umask in an isolated
+        // child process; not done here as disproportionate for that edge
+        // case.
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
