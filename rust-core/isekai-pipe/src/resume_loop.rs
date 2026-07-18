@@ -114,26 +114,46 @@ impl BusyOtherSessionSignal for isekai_transport::SequentialConnectError {
     }
 }
 
+/// Deliberately **not** derived from `resume_window_for`/`resume-grace`
+/// (unlike a same-process resume loop's own deadline) — even though a
+/// `BUSY_OTHER_SESSION` reject on the very first connect most often means
+/// *this same client's* previous session is still parked on the remote
+/// helper (see `TransportError::is_busy_other_session`'s docs), waiting for
+/// that park to clear on its own is no longer a sound thing to size against
+/// `resume-grace`, now that the value is days long by default
+/// (`isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`'s docs). A fixed, short
+/// window here is defense-in-depth for `isekai-pipe serve` deployments that
+/// predate `ISEKAI_PIPE_DESIGN.md` §8's parked-session-preemption fix
+/// (`engine/mod.rs::hello_with_parked_preemption`) — helper reuse
+/// deliberately doesn't force those to redeploy (`reuse.rs`'s fingerprint
+/// exclusion), so they can keep running the old, un-preempting behavior for
+/// up to `--max-idle-lifetime` (30 days) after this fix ships. Against a
+/// server that *does* have the fix, a legitimate retry here succeeds almost
+/// immediately (the preemption is atomic, no real waiting involved), so
+/// this window is never the limiting factor in the common case; against one
+/// that doesn't, it turns what would otherwise be a silent multi-day hang
+/// into a fast, visible failure instead.
+const BUSY_OTHER_SESSION_RETRY_WINDOW: Duration = Duration::from_secs(180);
+
 /// Retries `attempt` while — and only while — it fails with
-/// `BUSY_OTHER_SESSION`, for up to `resume_window_for(requested_resume_grace_secs)`
-/// (the same deadline a resume loop would use, since a `BUSY_OTHER_SESSION`
-/// reject on the very first connect most often means *this same client's*
-/// previous session is still parked on the remote helper, waiting out that
-/// exact window after an earlier ungraceful disconnect — see
-/// `TransportError::is_busy_other_session`'s docs). Every other failure is
-/// returned immediately on the first attempt, unchanged from before this
-/// wrapper existed: this only closes the gap where a fresh `isekai-pipe
-/// connect` process (a brand new `session_id` every time, since neither
-/// `connect_via_relay_resumable` nor `_with_fallback` persist one across
-/// invocations) would otherwise fail outright instead of waiting the same
-/// window a same-process resume would have.
-async fn retry_while_busy_other_session<T, E, F, Fut>(requested_resume_grace_secs: u32, mut attempt: F) -> Result<T, E>
+/// `BUSY_OTHER_SESSION`, for up to `window` (production call sites always
+/// pass `BUSY_OTHER_SESSION_RETRY_WINDOW` — see that constant's docs for why
+/// it's a short fixed window rather than `resume-grace`-derived; `window`
+/// is a parameter rather than the constant used directly only so tests can
+/// inject a short one instead of a real 180-second wait). Every other
+/// failure is returned immediately on the first attempt, unchanged from
+/// before this wrapper existed: this only closes the gap where a fresh
+/// `isekai-pipe connect` process (a brand new `session_id` every time,
+/// since neither `connect_via_relay_resumable` nor `_with_fallback` persist
+/// one across invocations) would otherwise fail outright instead of waiting
+/// the same window a same-process resume would have.
+async fn retry_while_busy_other_session<T, E, F, Fut>(window: Duration, mut attempt: F) -> Result<T, E>
 where
     E: BusyOtherSessionSignal,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
-    let deadline = Instant::now() + resume_window_for(requested_resume_grace_secs);
+    let deadline = Instant::now() + window;
     let mut attempt_no: u32 = 0;
     loop {
         let err = match attempt().await {
@@ -165,7 +185,7 @@ pub(crate) async fn run_relay_resumable(
 ) -> Result<()> {
     let factory = relay_endpoint_factory(relay_transport);
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
-    let established = retry_while_busy_other_session(requested, || connect_via_relay_resumable(&factory, target, requested, identity))
+    let established = retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_via_relay_resumable(&factory, target, requested, identity))
         .await
         .map_err(attach_stale_trust_signal)?;
     run_resume_loop(&factory, target, profile, established, experimental_network_rebind, tethering_interface).await
@@ -188,7 +208,7 @@ pub(crate) async fn run_relay_resumable_with_fallback(
     let factory = relay_endpoint_factory(relay_transport);
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
     let (established, winning_target) =
-        retry_while_busy_other_session(requested, || connect_via_relay_resumable_with_fallback(&factory, candidates, requested))
+        retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_via_relay_resumable_with_fallback(&factory, candidates, requested))
             .await
             .map_err(attach_stale_trust_signal)?;
     run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind, tethering_interface).await
@@ -1346,7 +1366,7 @@ mod tests {
     #[tokio::test]
     async fn retry_while_busy_other_session_does_not_retry_other_failures() {
         let mut calls = 0u32;
-        let result: Result<(), FakeConnectError> = retry_while_busy_other_session(1, || {
+        let result: Result<(), FakeConnectError> = retry_while_busy_other_session(Duration::from_secs(1), || {
             calls += 1;
             async { Err(FakeConnectError(false)) }
         })
@@ -1358,7 +1378,7 @@ mod tests {
     #[tokio::test]
     async fn retry_while_busy_other_session_retries_until_a_later_attempt_succeeds() {
         let calls = std::cell::Cell::new(0u32);
-        let result = retry_while_busy_other_session(1, || {
+        let result = retry_while_busy_other_session(Duration::from_secs(1), || {
             let n = calls.get();
             calls.set(n + 1);
             async move { if n == 0 { Err(FakeConnectError(true)) } else { Ok::<(), FakeConnectError>(()) } }
@@ -1450,10 +1470,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_while_busy_other_session_gives_up_once_the_resume_window_elapses() {
+    async fn retry_while_busy_other_session_gives_up_once_the_window_elapses() {
         let result: Result<(), FakeConnectError> =
-            retry_while_busy_other_session(1, || async { Err(FakeConnectError(true)) }).await;
-        assert!(result.is_err(), "must stop retrying once the resume window has elapsed");
+            retry_while_busy_other_session(Duration::from_secs(1), || async { Err(FakeConnectError(true)) }).await;
+        assert!(result.is_err(), "must stop retrying once the window has elapsed");
     }
 
     #[tokio::test]
