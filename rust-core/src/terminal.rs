@@ -163,8 +163,9 @@ pub(crate) struct Terminal {
     /// DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
     cursor_shape: CursorShape,
     /// カーソルが点滅すべきか。DECSCUSRのパラメータ(奇数=blink/偶数=steady、
-    /// 0はblinking blockと同義)から導出する。既定は`true`。将来のDECSET `?12`
-    /// (タスク#55)もこのフィールドを更新する想定(`CursorShape`とは独立)。
+    /// 0はblinking blockと同義)、およびDECSET/DECRST `?12`(`CSI ?12h`/`CSI ?12l`、
+    /// タスク#55、形状は変えず点滅の有無だけを切り替える)の両方がこのフィールドを
+    /// 更新する(`CursorShape`とは独立)。
     cursor_blink: bool,
 }
 
@@ -667,6 +668,12 @@ impl Perform for Terminal {
                 ('l', 1049) => { self.switch_to_main(true); }
                 ('h', 25) => { self.cursor_visible = true; }
                 ('l', 25) => { self.cursor_visible = false; }
+                // DECSET/DECRST ?12(`CSI ?12h`/`CSI ?12l`): カーソル点滅on/off単体。
+                // `CursorShape`(DECSCUSR、`CSI Ps SP q`)とは独立したフィールドを
+                // 更新する——DECSCUSRのパラメータでも`cursor_blink`は変わるが、
+                // こちらは形状を変えずに点滅の有無だけを切り替える(タスク#55)。
+                ('h', 12) => { self.cursor_blink = true; }
+                ('l', 12) => { self.cursor_blink = false; }
                 ('h', 1) => { self.application_cursor_mode = true; }
                 ('l', 1) => { self.application_cursor_mode = false; }
                 ('h', 2004) => { self.bracketed_paste_mode = true; }
@@ -1316,6 +1323,35 @@ mod tests {
         assert!(!t.cursor_blink());
         feed(&mut t, b"\x1bc"); // RIS (full reset)
         assert_eq!(t.cursor_shape(), CursorShape::Block, "RISで既定のblockに戻る");
+        assert!(t.cursor_blink(), "RISで既定の点滅状態に戻る");
+    }
+
+    #[test]
+    fn test_decset_12_toggles_cursor_blink_independent_of_shape() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert!(t.cursor_blink(), "既定は点滅");
+        feed(&mut t, b"\x1b[?12l"); // 点滅off
+        assert!(!t.cursor_blink());
+        assert_eq!(t.cursor_shape(), CursorShape::Block, "?12は形状を変えない");
+        feed(&mut t, b"\x1b[?12h"); // 点滅on
+        assert!(t.cursor_blink());
+        assert_eq!(t.cursor_shape(), CursorShape::Block, "?12は形状を変えない");
+
+        // DECSCUSRで形状+点滅を設定した後でも、?12単体で点滅状態だけ上書きできる。
+        feed(&mut t, b"\x1b[3 q"); // Ps=3: blinking underline
+        assert_eq!(t.cursor_shape(), CursorShape::Underline);
+        assert!(t.cursor_blink());
+        feed(&mut t, b"\x1b[?12l"); // 点滅off。形状(Underline)は維持される。
+        assert!(!t.cursor_blink());
+        assert_eq!(t.cursor_shape(), CursorShape::Underline, "?12はDECSCUSRの形状を変えない");
+    }
+
+    #[test]
+    fn test_decset_12_reset_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?12l");
+        assert!(!t.cursor_blink());
+        feed(&mut t, b"\x1bc"); // RIS
         assert!(t.cursor_blink(), "RISで既定の点滅状態に戻る");
     }
 
