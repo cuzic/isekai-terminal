@@ -29,8 +29,14 @@ pub enum SessionError {
     JumpAuthFailed { username: String, addr: String },
     #[error("jump host direct-tcpip tunnel to {host}:{port} failed: {source}")]
     JumpTunnel { host: String, port: u16, #[source] source: russh::Error },
+    #[error("SSH handshake over jump tunnel to {host}:{port} failed: {source}")]
+    JumpHandshake { host: String, port: u16, #[source] source: russh::Error },
     #[error("channel operation failed: {0}")]
     Channel(russh::Error),
+    #[error("private key could not be parsed as OpenSSH format: {0}")]
+    InvalidPrivateKey(russh_keys::ssh_key::Error),
+    #[error("authentication request failed: {0}")]
+    Auth(russh::Error),
 }
 
 /// Verifies a server's host-key fingerprint (SHA-256, as produced by
@@ -128,7 +134,7 @@ where
         .await
         .map_err(|source| SessionError::Connect { addr: jump_addr.clone(), source })?;
 
-    let authenticated = authenticate_session(&mut jump_handle, &jump.username, &jump.credential).await;
+    let authenticated = authenticate_session(&mut jump_handle, &jump.username, &jump.credential).await?;
     if !authenticated {
         return Err(SessionError::JumpAuthFailed { username: jump.username.clone(), addr: jump_addr });
     }
@@ -142,16 +148,16 @@ where
     let target_handler = VerifyingHandler { verifier };
     let handle = client::connect_stream(russh_config, stream, target_handler)
         .await
-        .map_err(SessionError::Handshake)?;
+        .map_err(|source| SessionError::JumpHandshake { host: target_host.to_string(), port: target_port, source })?;
 
     Ok(Session { handle, _jump_handle: Some(jump_handle) })
 }
 
 /// Runs the SSH handshake directly over an already-established byte stream
-/// (e.g. a QUIC stream, or any other tunnel a caller has already set up) —
-/// the "isekai-pipe QUIC transport" case, where the caller has its own way
-/// of reaching the target and just needs SSH layered on top. Not yet
-/// authenticated — call [`authenticate_session`] next.
+/// (e.g. a QUIC stream, or any other application-provided tunnel) — for
+/// callers that have their own way of reaching the target and just need SSH
+/// layered on top. Not yet authenticated — call [`authenticate_session`]
+/// next.
 pub async fn establish_over_stream<S, V>(
     russh_config: Arc<client::Config>,
     stream: S,
@@ -165,22 +171,25 @@ where
     client::connect_stream(russh_config, stream, handler).await.map_err(SessionError::Handshake)
 }
 
-/// Authenticates `session` as `username` using `credential`. Returns whether
-/// authentication succeeded. Does not zeroize `credential` — call
-/// [`Credential::zeroize`] once you're done with it.
+/// Authenticates `session` as `username` using `credential`. `Ok(false)`
+/// means the server declined the credential (wrong password, unauthorized
+/// key); `Err` means authentication couldn't even be attempted (malformed
+/// private key) or the underlying SSH request itself failed (transport
+/// error). Does not zeroize `credential` — call [`Credential::zeroize`]
+/// once you're done with it.
 pub async fn authenticate_session<H: client::Handler>(
     session: &mut client::Handle<H>,
     username: &str,
     credential: &Credential,
-) -> bool {
+) -> Result<bool, SessionError> {
     match credential {
         Credential::Password(password) => {
-            session.authenticate_password(username, password).await.ok().unwrap_or(false)
+            session.authenticate_password(username, password).await.map_err(SessionError::Auth)
         }
-        Credential::PublicKey { private_key_pem } => match PrivateKey::from_openssh(private_key_pem) {
-            Ok(key) => session.authenticate_publickey(username, Arc::new(key)).await.ok().unwrap_or(false),
-            Err(_) => false,
-        },
+        Credential::PublicKey { private_key_pem } => {
+            let key = PrivateKey::from_openssh(private_key_pem).map_err(SessionError::InvalidPrivateKey)?;
+            session.authenticate_publickey(username, Arc::new(key)).await.map_err(SessionError::Auth)
+        }
     }
 }
 
@@ -230,10 +239,13 @@ mod tests {
         }
     }
 
-    /// Minimal server: accepts any password, accepts session-channel opens,
+    /// Minimal server: accepts password `"correct-password"` (rejects any
+    /// other password) and any public key, accepts session-channel opens,
     /// and echoes exec commands back as a single line of output followed by
     /// exit status 0. Enough to prove `open_channel`'s `Exec` path actually
-    /// round-trips data through a real (in-process) SSH server.
+    /// round-trips data through a real (in-process) SSH server, and that
+    /// `authenticate_session` actually distinguishes accepted vs rejected
+    /// credentials rather than always succeeding.
     #[derive(Clone)]
     struct EchoExecServer;
 
@@ -251,7 +263,17 @@ mod tests {
     impl server::Handler for EchoExecHandler {
         type Error = russh::Error;
 
-        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+        async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
+            Ok(if password == "correct-password" {
+                Auth::Accept
+            } else {
+                Auth::Reject { proceed_with_methods: None }
+            })
+        }
+
+        async fn auth_publickey(
+            &mut self, _user: &str, _public_key: &russh_keys::ssh_key::PublicKey,
+        ) -> Result<Auth, Self::Error> {
             Ok(Auth::Accept)
         }
 
@@ -342,10 +364,11 @@ mod tests {
         .expect("direct connect should succeed");
 
         let authed = authenticate_session(
-            &mut session.handle, "tester", &Credential::Password("anything".into()),
+            &mut session.handle, "tester", &Credential::Password("correct-password".into()),
         )
-        .await;
-        assert!(authed, "password auth should succeed against a server that accepts any password");
+        .await
+        .expect("authenticate_session should not error for a well-formed password credential");
+        assert!(authed, "password auth should succeed with the password the server accepts");
 
         let mut channel = open_channel(
             &session.handle, &SessionKind::Exec { command: "echo hi".into() },
@@ -379,7 +402,7 @@ mod tests {
             host: jump_addr.ip().to_string(),
             port: jump_addr.port(),
             username: "jumper".into(),
-            credential: Credential::Password("anything".into()),
+            credential: Credential::Password("correct-password".into()),
         };
 
         let verifier = Arc::new(AcceptAllHostKeys);
@@ -390,13 +413,98 @@ mod tests {
         .expect("jump connect should succeed");
 
         let authed = authenticate_session(
-            &mut session.handle, "tester", &Credential::Password("anything".into()),
+            &mut session.handle, "tester", &Credential::Password("correct-password".into()),
         )
-        .await;
+        .await
+        .expect("authenticate_session should not error over a jump-tunneled session");
         assert!(authed, "authentication over the jump-tunneled session should succeed");
 
         // Confirm the tunneled session behaves like an ordinary connection
         // beyond just authenticating: open a real channel through it.
         session.handle.channel_open_session().await.expect("opening a channel through the jump tunnel should succeed");
+    }
+
+    #[tokio::test]
+    async fn public_key_authentication_succeeds() {
+        let addr = spawn_server(EchoExecServer, 4).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let keypair = Ed25519Keypair::from_seed(&[99u8; 32]);
+        let key = PrivateKey::from(keypair);
+        let pem = key.to_openssh(Default::default()).unwrap().as_bytes().to_vec();
+
+        let authed = authenticate_session(
+            &mut session.handle, "tester", &Credential::PublicKey { private_key_pem: pem },
+        )
+        .await
+        .expect("authenticate_session should not error for a well-formed key");
+        assert!(authed, "the server accepts any public key");
+    }
+
+    #[tokio::test]
+    async fn wrong_password_is_rejected_not_an_error() {
+        let addr = spawn_server(EchoExecServer, 5).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let authed = authenticate_session(
+            &mut session.handle, "tester", &Credential::Password("wrong-password".into()),
+        )
+        .await
+        .expect("a rejected credential is Ok(false), not an error");
+        assert!(!authed, "the server should have rejected this password");
+    }
+
+    #[tokio::test]
+    async fn malformed_private_key_returns_invalid_private_key_error() {
+        let addr = spawn_server(EchoExecServer, 6).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let result = authenticate_session(
+            &mut session.handle, "tester",
+            &Credential::PublicKey { private_key_pem: b"not a real openssh private key".to_vec() },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SessionError::InvalidPrivateKey(_))),
+            "malformed key material should surface as InvalidPrivateKey, not a silent false: {result:?}"
+        );
+    }
+
+    struct RejectAllHostKeys;
+
+    #[async_trait]
+    impl HostKeyVerifier for RejectAllHostKeys {
+        async fn verify(&self, _fingerprint: &str) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn rejecting_host_key_aborts_the_handshake() {
+        let addr = spawn_server(EchoExecServer, 7).await;
+        let verifier = Arc::new(RejectAllHostKeys);
+        let result = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a HostKeyVerifier that always returns false must abort the connection, not silently proceed"
+        );
     }
 }
