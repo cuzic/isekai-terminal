@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import os
+import UIKit
 import IsekaiTerminalCoreLogic
 
 /// SSH agentへの署名要求。ユーザーが承認/拒否した結果を`respond`で
@@ -58,6 +59,21 @@ public final class TerminalUIState: ObservableObject {
     /// 判定は`RebindPublicState`だけを見て行う(Android版`TerminalScreen.kt`と同じ、
     /// rust-ssot.md準拠 — Swift側で独自のミラー状態は持たない)。
     @Published public internal(set) var rebindState: RebindPublicState?
+    /// タスク#26: 直近フィードバック(触覚)を発火した`ScreenUpdate.bellGeneration`。
+    /// `bell_generation`はTerminalごとに(rust-core `Terminal`)0始まりで単調増加する
+    /// カウンタ(#24)なので、これより大きい値を受け取った時だけ1回発火させる
+    /// dedupe用の記憶。Fableレビュー指摘: このセッション/タブに束縛された
+    /// `TerminalUIState`インスタンス単位で保持し、かつ`TerminalSessionController.reconnect()`が
+    /// 新しい論理セッションを開始する直前に0へ同期的にリセットする(同一タブのまま手動
+    /// `reconnect()`すると、Rust側で新しいTerminalが作られ`bell_generation`が0から
+    /// 再スタートするため、リセットしないと「新セッションのgen 1 < 旧セッションで
+    /// 記憶した値」で最初のBELを取りこぼす。`connect()`側でTask経由の非同期リセットに
+    /// すると、新セッション最初の`onScreenUpdate`コールバックの方が先にMainActorキューで
+    /// 処理されうる競合を生むため、`reconnect()`の`uiState.latestScreenUpdate = nil`と
+    /// 同じ同期文脈でリセットする、Codexレビュー指摘)。初回接続(`connect()`が
+    /// `reconnect()`を経由せず直接呼ばれる場合)は`TerminalUIState`の既定値0のままで
+    /// 問題ない。UIに直接反映する値ではないため`@Published`にはしない。
+    public internal(set) var lastFiredBellGeneration: UInt64 = 0
 
     // `TerminalSessionController`(非isolated)のstored property初期値として
     // 構築されるため、`nonisolated`にして呼び出し側のコンテキストを問わず
@@ -522,6 +538,15 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         case .disconnected, .failed:
             uiState.state = .connecting
             uiState.latestScreenUpdate = nil
+            // タスク#26: 新しい論理セッションを開始する前に、直近発火済みBEL世代の記憶を
+            // 同期的にリセットする(`uiState.lastFiredBellGeneration`のdocコメント参照)。
+            // `connect()`(この直後に呼ぶ)からの`orchestrator.connect...`呼び出しは新しい
+            // Terminalでの`onScreenUpdate`コールバックを即座に(Rustのバックグラウンド
+            // スレッドから)引き起こし得るため、Task経由の非同期リセットだと、新セッション
+            // 最初のBEL通知を処理するTaskの方が先にMainActorキューで実行され「取りこぼす」
+            // 競合を作りかねない(Codexレビュー指摘)。ここで`uiState.latestScreenUpdate = nil`
+            // と同じ@MainActor同期文脈でリセットすることで、そのような競合を作らない。
+            uiState.lastFiredBellGeneration = 0
             connect(cols: lastCols, rows: lastRows)
         }
     }
@@ -674,7 +699,31 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     }
 
     public func onScreenUpdate(update: ScreenUpdate) {
-        Task { @MainActor in self.uiState.latestScreenUpdate = update }
+        Task { @MainActor in
+            self.uiState.latestScreenUpdate = update
+            // タスク#26: `bellGeneration`が直近発火済みの値より進んでいれば端末ベルの
+            // 触覚フィードバックを1回だけ発火する。`bellGeneration`はTerminalごとに
+            // 単調増加する(#24)ため`>`比較で十分であり、`reconnect()`が新しい論理
+            // セッションを開始する直前に`lastFiredBellGeneration`を0へ同期的にリセットする
+            // (`uiState.lastFiredBellGeneration`のdocコメント参照)ため、手動
+            // `reconnect()`後の新セッションでも最初のBELを取りこぼさない。
+            if update.bellGeneration > self.uiState.lastFiredBellGeneration {
+                self.uiState.lastFiredBellGeneration = update.bellGeneration
+                Self.fireBellFeedback()
+            }
+        }
+    }
+
+    /// タスク#26: BEL(端末ベル)受信時の触覚フィードバック。Android版に対応する
+    /// 実装(#25)はまだ無いため、iOS固有の`UIImpactFeedbackGenerator`のみで実装する
+    /// (Codexアーキテクチャレビュー指摘の実装例に準拠)。呼び出し元(`onScreenUpdate`)が
+    /// 既に`Task { @MainActor in }`の中から呼ぶため、ここでも`@MainActor`にして
+    /// メインスレッドでの発火を保証する。
+    @MainActor
+    private static func fireBellFeedback() {
+        let generator = UIImpactFeedbackGenerator(style: .heavy)
+        generator.prepare()
+        generator.impactOccurred()
     }
 
     /// ホスト鍵確認。Android版`TerminalSession.kt`の`onHostKey`(既定設定
