@@ -20,6 +20,7 @@ isekai-protocol = { path = "../isekai-protocol" }
 russh-stream-session = { path = "../russh-stream-session" }
 russh = "0.48"
 russh-keys = "0.48"
+crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "signal", "net", "process"] }
 log = "0.4"
