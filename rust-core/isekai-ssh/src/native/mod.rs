@@ -6,6 +6,7 @@
 //! keeps shelling out to real `ssh(1)` via [`super::wrapper`] unchanged.
 
 pub(crate) mod agent_auth;
+pub(crate) mod bootstrap_backend;
 pub(crate) mod child_stdio;
 pub(crate) mod connect;
 pub(crate) mod console;

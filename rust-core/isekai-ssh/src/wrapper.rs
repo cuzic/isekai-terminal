@@ -12,9 +12,7 @@ use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
 use isekai_auth::TokenProvider;
-use isekai_bootstrap::{
-    BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, OpenSshBackend, RelayLaunchSpec, RelayTransportKind,
-};
+use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec, RelayTransportKind};
 use isekai_bootstrap_plan::{classify_bootstrap_error, BootstrapFailure};
 use isekai_pipe_core::{
     claim_connect_outcome, default_profiles_dir, default_runtime_dir, load_persistent_profile,
@@ -746,11 +744,11 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
     // found by `Command::new("ssh")`'s bare-name resolution (only `.exe` is
     // implicit), so an explicit path is the only way either call site can
     // ever reach it.
-    let backend = OpenSshBackend::new().with_ssh_program(plan.openssh_path.to_string_lossy().into_owned());
+    let backend = crate::native::bootstrap_backend::default_bootstrap_backend(Some(&plan.openssh_path))?;
     let helper_binary_was_explicit = plan.isekai.helper_binary.is_some();
     let helper_binary = crate::helper_download::resolve_helper_binary(
         plan.isekai.helper_binary.as_deref(),
-        &backend,
+        backend.as_ref(),
         &target,
         &via,
         &crate::helper_download::ReleaseSource { repo: plan.isekai.helper_release_repo.clone(), tag: plan.isekai.helper_release_tag.clone() },

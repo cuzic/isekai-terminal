@@ -38,8 +38,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use isekai_bootstrap::{HostSpec, JumpSpec, OpenSshBackend};
+use isekai_bootstrap::{HostSpec, JumpSpec};
 use sha2::{Digest, Sha256};
+
+#[cfg(test)]
+use isekai_bootstrap::OpenSshBackend;
+
+use crate::native::bootstrap_backend::NativeBootstrapBackend;
 
 /// How long a cached "latest" binary is trusted before
 /// `ensure_helper_binary_cached` re-checks GitHub for a newer release
@@ -332,7 +337,7 @@ pub async fn ensure_helper_binary_cached(cache_dir: &Path, source: &ReleaseSourc
 /// remote's architecture and fall through to the download+cache path.
 pub async fn resolve_helper_binary(
     explicit_path: Option<&Path>,
-    backend: &OpenSshBackend,
+    backend: &dyn NativeBootstrapBackend,
     target: &HostSpec,
     via: &[JumpSpec],
     source: &ReleaseSource,
