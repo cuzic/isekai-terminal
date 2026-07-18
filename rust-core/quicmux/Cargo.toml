@@ -13,6 +13,10 @@ sha2 = "0.10"
 thiserror = "2.0.18"
 log = "0.4"
 rand = "0.8"
+# `AnyMuxConnection::send_datagram`/`recv_datagram` pass `Bytes` directly
+# (matching `noq`'s own datagram API), regardless of which backend feature
+# is compiled in — so this is a required, not optional, dependency.
+bytes = "1"
 
 # `noq` backend (quinn's multipath fork, UDP-based). Optional so a consumer
 # that only wants the `qmux` backend (or only the backend-agnostic
@@ -22,11 +26,12 @@ noq = { version = "1.0.1", features = ["rustls", "ring"], optional = true }
 
 # `qmux` backend (draft-ietf-quic-qmux, QUIC's stream API polyfilled over
 # TLS-over-TCP) — pre-1.0, opt-in. crates.io's published qmux (0.3.1) predates
-# real RFC 9221 datagram support, so this is pinned to the same commit
-# `h3-qmux`/`isekai-link-masque` already pin to, to avoid an API mismatch
-# between crates that must interoperate in the same dependency graph (this
-# backend's own leg does not use datagrams, but staying on one commit avoids
-# two different `qmux`/`web-transport-trait` versions coexisting).
+# real RFC 9221 datagram support (which this backend's `send_datagram`/
+# `recv_datagram`/`max_datagram_size` *do* use — see `qmux_backend`'s module
+# docs), so this is pinned to the same post-0.3.1 commit `h3-qmux`/
+# `isekai-link-masque` already pin to, to avoid an API mismatch between
+# crates that must interoperate in the same dependency graph, and to avoid
+# two different `qmux`/`web-transport-trait` versions coexisting.
 qmux = { git = "https://github.com/moq-dev/web-transport", rev = "f6107797d4a7301408964b22b6f3150967b95af3", optional = true }
 web-transport-trait = { git = "https://github.com/moq-dev/web-transport", rev = "f6107797d4a7301408964b22b6f3150967b95af3", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }

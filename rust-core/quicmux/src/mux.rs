@@ -368,6 +368,90 @@ impl AnyMuxConnection {
             Self::Qmux(conn) => conn.export_keying_material(label, context).await,
         }
     }
+
+    /// Sends one datagram (RFC 9221 — unreliable, unordered, never
+    /// retransmitted by this crate; see [`crate::MuxClientConfig::datagram_send_buffer_size`]
+    /// to enable/tune this per connection). Non-blocking: if the outbound
+    /// buffer is full, this crate does not fail the call, but *which*
+    /// datagram gets shed differs by backend — `noq` drops its own oldest
+    /// still-unsent datagram to make room for this one (newest-wins), while
+    /// `qmux` instead drops *this* call's payload and still returns `Ok(())`
+    /// (drop-newest). Both are legitimate under RFC 9221 (no datagram is
+    /// guaranteed delivery regardless of which one got shed), but a caller
+    /// that cares which policy it gets should not assume they match across
+    /// backends. Use [`AnyMuxConnection::send_datagram_wait`] for traffic
+    /// that must never be silently shed this way.
+    pub fn send_datagram(&self, data: bytes::Bytes) -> Result<(), MuxError> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(conn) => conn.send_datagram(data),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(conn) => conn.send_datagram(data),
+        }
+    }
+
+    /// Backpressure-aware version of [`AnyMuxConnection::send_datagram`]:
+    /// waits for outbound buffer space instead of shedding an older datagram
+    /// to make room. Only the `noq` backend can actually wait this way —
+    /// `qmux`'s underlying `web_transport_trait::Session` has no equivalent
+    /// API (see `qmux_backend`'s module docs). On the `qmux` backend this
+    /// falls back to the same non-waiting [`AnyMuxConnection::send_datagram`]
+    /// and returns immediately, inheriting `qmux`'s drop-newest behavior
+    /// instead of ever blocking — a caller whose traffic class truly cannot
+    /// tolerate that on `qmux` needs its own higher-level ack/retry, not this
+    /// method (see this crate's design notes on datagram resume semantics:
+    /// datagrams are never replayed across a resume/reconnect either).
+    pub async fn send_datagram_wait(&self, data: bytes::Bytes) -> Result<(), MuxError> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(conn) => conn.send_datagram_wait(data).await,
+            #[cfg(feature = "qmux")]
+            Self::Qmux(conn) => conn.send_datagram(data),
+        }
+    }
+
+    /// Receives one datagram, waiting for the next one to arrive.
+    pub async fn recv_datagram(&self) -> Result<bytes::Bytes, MuxError> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(conn) => conn.recv_datagram().await,
+            #[cfg(feature = "qmux")]
+            Self::Qmux(conn) => conn.recv_datagram().await,
+        }
+    }
+
+    /// The largest single datagram payload this connection can currently
+    /// send, or `None` if datagrams are disabled for this connection
+    /// (locally, via [`crate::MuxClientConfig::datagram_send_buffer_size`]
+    /// being `None`) or the peer hasn't negotiated willingness to receive
+    /// them. Can shrink over the connection's lifetime (path MTU
+    /// re-estimation on the `noq` backend) — check before every send rather
+    /// than caching.
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(conn) => conn.max_datagram_size(),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(conn) => conn.max_datagram_size(),
+        }
+    }
+
+    /// Local outbound datagram buffer space currently free, in bytes. Not a
+    /// general network-congestion signal — it only reflects this backend's
+    /// own send queue, which can have room even while the path itself is
+    /// congested (see this crate's design notes). Always `0` on the `qmux`
+    /// backend, which has no equivalent byte-sized buffer of its own (its
+    /// outbound queue is bounded by frame count internally — see
+    /// `qmux_backend`'s module docs) — not a signal that `qmux`'s buffer is
+    /// full, just that it has nothing comparable to report.
+    pub fn datagram_send_buffer_space(&self) -> usize {
+        match self {
+            #[cfg(feature = "noq")]
+            Self::Noq(conn) => conn.datagram_send_buffer_space(),
+            #[cfg(feature = "qmux")]
+            Self::Qmux(conn) => conn.datagram_send_buffer_space(),
+        }
+    }
 }
 
 /// One direction-agnostic byte stream — a mux bidirectional stream, from the

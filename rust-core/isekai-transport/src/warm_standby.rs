@@ -336,6 +336,7 @@ mod tests {
             max_concurrent_bidi_streams: 4,
             max_concurrent_uni_streams: 0,
             multipath: false,
+            datagram_send_buffer_size: None,
             cert_chain: vec![cert_der],
             private_key: key_der,
         };

@@ -75,6 +75,42 @@ fn map_qmux_error(e: qmux::Error) -> MuxError {
     }
 }
 
+/// Maps a `qmux::Error` from a datagram-specific operation
+/// (`send_datagram`/`recv_datagram`) onto [`MuxError`] — distinct from
+/// [`map_qmux_error`] because [`qmux::Error::DatagramsUnsupported`]/
+/// [`qmux::Error::FrameTooLarge`] deserve their own [`MuxError`] variants
+/// here ([`MuxError::Unsupported`]/[`MuxError::DatagramTooLarge`]) instead of
+/// the generic `StreamIo`/`ProtocolViolation` buckets `map_qmux_error` would
+/// otherwise put them in. Anything else (e.g. the connection dying mid-await)
+/// falls back to [`map_qmux_error`].
+fn map_qmux_datagram_send_error(e: qmux::Error, payload_len: usize, max: usize) -> MuxError {
+    match e {
+        qmux::Error::DatagramsUnsupported => MuxError::Unsupported {
+            operation: "send_datagram",
+            reason: "datagrams are disabled on this connection (max_datagram_frame_size negotiated to 0 — \
+                      see MuxClientConfig::datagram_send_buffer_size)",
+        },
+        qmux::Error::FrameTooLarge => MuxError::DatagramTooLarge { size: payload_len, max },
+        other => map_qmux_error(other),
+    }
+}
+
+/// Applies [`MuxClientConfig::datagram_send_buffer_size`]/
+/// [`MuxServerConfig::datagram_send_buffer_size`] to a `qmux::Config` being
+/// built for either side. `qmux` has no byte-sized buffer knob of its own
+/// (see this module's docs on the fixed internal queue sizes) — only the
+/// `Some`/`None` distinction matters, mapped onto whether
+/// `max_datagram_frame_size` is advertised at all. `None` sets it to `0`
+/// (qmux's own "datagrams disabled" convention — see
+/// `qmux::Config::max_datagram_frame_size`'s docs); `Some` leaves `qmux::
+/// Config::new`'s own default (`DEFAULT_MAX_RECORD_SIZE`) rather than this
+/// crate inventing a different one.
+fn apply_datagram_config(config: &mut qmux::Config, datagram_send_buffer_size: Option<usize>) {
+    if datagram_send_buffer_size.is_none() {
+        config.max_datagram_frame_size = 0;
+    }
+}
+
 /// A `qmux`-backed [`crate::AnyMuxFactory`] variant. Stateless — every
 /// [`QmuxFactory::create_endpoint`] call just records the requested local
 /// bind address; the actual TCP connect + TLS handshake + QMux session
@@ -142,7 +178,8 @@ impl QmuxEndpoint {
             .export_keying_material(&mut exporter, &self.config.exporter_label, None)
             .map_err(|e| MuxError::ExportKeyingMaterial(e.to_string()))?;
 
-        let config = qmux::Config::new(qmux::Version::QMux01);
+        let mut config = qmux::Config::new(qmux::Version::QMux01);
+        apply_datagram_config(&mut config, self.config.datagram_send_buffer_size);
         let transport = qmux::transport::Stream::new(tls_stream, config.version, config.max_record_size);
         let session = qmux::Session::connect(transport, config).await.map_err(|e| MuxError::Handshake(format!("QMux handshake failed: {e}")))?;
 
@@ -158,6 +195,7 @@ pub struct QmuxListener {
     listener: tokio::net::TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
     exporter_label: Vec<u8>,
+    datagram_send_buffer_size: Option<usize>,
     /// `accept()` checks this before/while waiting on the next TCP
     /// connection — a `tokio::net::TcpListener` has no `close()`/`shutdown()`
     /// of its own to call from a `&self` method, so this plus `close_notify`
@@ -192,6 +230,7 @@ impl QmuxListener {
             listener,
             acceptor,
             exporter_label: config.exporter_label,
+            datagram_send_buffer_size: config.datagram_send_buffer_size,
             closed: Arc::new(AtomicBool::new(false)),
             close_notify: Arc::new(tokio::sync::Notify::new()),
         })
@@ -218,6 +257,7 @@ impl QmuxListener {
                     peer_addr,
                     acceptor: self.acceptor.clone(),
                     exporter_label: self.exporter_label.clone(),
+                    datagram_send_buffer_size: self.datagram_send_buffer_size,
                 }),
                 Err(_) => None,
             },
@@ -248,6 +288,7 @@ pub struct QmuxIncoming {
     peer_addr: SocketAddr,
     acceptor: tokio_rustls::TlsAcceptor,
     exporter_label: Vec<u8>,
+    datagram_send_buffer_size: Option<usize>,
 }
 
 impl QmuxIncoming {
@@ -264,7 +305,8 @@ impl QmuxIncoming {
             .export_keying_material(&mut exporter, &self.exporter_label, None)
             .map_err(|e| MuxError::ExportKeyingMaterial(e.to_string()))?;
 
-        let config = qmux::Config::new(qmux::Version::QMux01);
+        let mut config = qmux::Config::new(qmux::Version::QMux01);
+        apply_datagram_config(&mut config, self.datagram_send_buffer_size);
         let transport = qmux::transport::Stream::new(tls_stream, config.version, config.max_record_size);
         let session = qmux::Session::accept(transport, config).await.map_err(|e| MuxError::Handshake(format!("QMux handshake failed: {e}")))?;
 
@@ -324,6 +366,43 @@ impl QmuxConnection {
 
     pub(crate) fn remote_addr(&self) -> Option<SocketAddr> {
         self.remote_addr
+    }
+
+    /// See [`crate::AnyMuxConnection::send_datagram`]. Non-blocking:
+    /// `qmux::Session::send_datagram` sheds *this* payload (not an older
+    /// queued one) when its bounded outbound lane is full, still returning
+    /// `Ok(())` — drop-newest, the opposite of the `noq` backend's
+    /// newest-wins policy (see this module's docs and this crate's design
+    /// notes).
+    pub(crate) fn send_datagram(&self, data: bytes::Bytes) -> Result<(), MuxError> {
+        use web_transport_trait::Session as _;
+        let len = data.len();
+        let max = self.session.max_datagram_size();
+        self.session.send_datagram(data).map_err(|e| map_qmux_datagram_send_error(e, len, max))
+    }
+
+    /// See [`crate::AnyMuxConnection::recv_datagram`].
+    pub(crate) async fn recv_datagram(&self) -> Result<bytes::Bytes, MuxError> {
+        use web_transport_trait::Session as _;
+        self.session.recv_datagram().await.map_err(map_qmux_error)
+    }
+
+    /// See [`crate::AnyMuxConnection::max_datagram_size`]. `qmux`'s own
+    /// `max_datagram_size()` returns `0` (not `Option`) for "disabled";
+    /// mapped to `None` here so callers only ever see one convention.
+    pub(crate) fn max_datagram_size(&self) -> Option<usize> {
+        use web_transport_trait::Session as _;
+        match self.session.max_datagram_size() {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// See [`crate::AnyMuxConnection::datagram_send_buffer_space`]. Always
+    /// `0` — `qmux` has no equivalent byte-sized buffer of its own (see this
+    /// module's docs).
+    pub(crate) fn datagram_send_buffer_space(&self) -> usize {
+        0
     }
 }
 
@@ -498,6 +577,7 @@ mod listener_tests {
             max_concurrent_bidi_streams: 2,
             max_concurrent_uni_streams: 0,
             multipath: false,
+            datagram_send_buffer_size: None,
         }
     }
 
@@ -519,6 +599,7 @@ mod listener_tests {
             max_concurrent_bidi_streams: 2,
             max_concurrent_uni_streams: 0,
             multipath: false,
+            datagram_send_buffer_size: None,
             cert_chain: vec![cert_der],
             private_key: key_der,
         };
@@ -567,6 +648,86 @@ mod listener_tests {
         let mut buf = [0u8; 64];
         let n = stream.read(&mut buf).await.expect("read failed");
         assert_eq!(&buf[..n], b"hello quicmux qmux listener");
+
+        conn.close().await;
+    }
+
+    fn test_client_config_with_datagrams() -> MuxClientConfig {
+        MuxClientConfig { datagram_send_buffer_size: Some(64 * 1024), ..test_client_config() }
+    }
+
+    fn test_server_config_with_datagrams() -> (MuxServerConfig, String) {
+        let (mut config, cert_sha256_hex) = test_server_config();
+        config.datagram_send_buffer_size = Some(64 * 1024);
+        (config, cert_sha256_hex)
+    }
+
+    /// Confirms the fix for the bug this crate's design doc originally got
+    /// backwards (see `qmux_backend`'s module docs and `map_qmux_datagram_send_error`'s
+    /// docs): the git-pinned `qmux` this workspace actually depends on has a
+    /// real datagram implementation, not the crates.io-published 0.3.1's
+    /// unconditional-`DatagramsUnsupported` stub.
+    #[tokio::test]
+    async fn send_datagram_and_recv_datagram_roundtrip() {
+        let (server_config, cert_sha256_hex) = test_server_config_with_datagrams();
+        let listener = QmuxListener::bind(server_config, BindSpec::any_ipv4()).await.expect("listener bind failed");
+        let server_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
+
+        tokio::spawn(async move {
+            let Some(incoming) = listener.accept().await else { return };
+            let Ok(conn) = incoming.accept().await else { return };
+            while let Ok(datagram) = conn.recv_datagram().await {
+                let _ = conn.send_datagram(datagram);
+            }
+        });
+
+        let factory = QmuxFactory::new(test_client_config_with_datagrams());
+        let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint failed");
+        let conn = endpoint
+            .connect(RemoteSpec { addr: server_addr, server_name: "quicmux-test.local".to_string(), cert_sha256_hex })
+            .await
+            .expect("connect failed");
+
+        assert!(conn.max_datagram_size().is_some(), "datagrams should be enabled on both sides");
+
+        conn.send_datagram(bytes::Bytes::from_static(b"hello qmux datagram")).expect("send_datagram failed");
+        // Codexレビュー(2026-07-17): a lost/dropped echo would otherwise hang
+        // this test forever instead of failing it.
+        let echoed = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv_datagram())
+            .await
+            .expect("timed out waiting for the echoed datagram")
+            .expect("recv_datagram failed");
+        assert_eq!(&echoed[..], b"hello qmux datagram");
+
+        conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn max_datagram_size_is_none_when_datagrams_disabled_by_config() {
+        // Both sides use `test_client_config()`/`test_server_config()` —
+        // datagrams disabled by default (`datagram_send_buffer_size: None`).
+        let (server_config, cert_sha256_hex) = test_server_config();
+        let listener = QmuxListener::bind(server_config, BindSpec::any_ipv4()).await.expect("listener bind failed");
+        let server_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
+
+        tokio::spawn(async move {
+            let Some(incoming) = listener.accept().await else { return };
+            let _ = incoming.accept().await;
+        });
+
+        let factory = QmuxFactory::new(test_client_config());
+        let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint failed");
+        let conn = endpoint
+            .connect(RemoteSpec { addr: server_addr, server_name: "quicmux-test.local".to_string(), cert_sha256_hex })
+            .await
+            .expect("connect failed");
+
+        assert_eq!(conn.max_datagram_size(), None);
+
+        match conn.send_datagram(bytes::Bytes::from_static(b"should not be deliverable")) {
+            Err(MuxError::Unsupported { .. }) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
 
         conn.close().await;
     }

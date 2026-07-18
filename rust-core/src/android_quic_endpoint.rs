@@ -52,6 +52,9 @@ pub(crate) fn factory() -> AnyMuxFactory {
         // that could ever make multipath negotiation worth the (harmless,
         // but non-zero) extra transport parameter.
         multipath: false,
+        // The Android app never sends QUIC datagrams today — see
+        // `quicmux`'s `MuxClientConfig::datagram_send_buffer_size` docs.
+        datagram_send_buffer_size: None,
     };
 
     AnyMuxFactory::noq_with_socket_adapter(
