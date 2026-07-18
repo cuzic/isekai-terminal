@@ -51,10 +51,13 @@ import tools.isekai.terminal.ui.AppColors
 import tools.isekai.terminal.ui.HostKeyChangedDialog
 import tools.isekai.terminal.ui.HostKeyUnknownDialog
 import tools.isekai.terminal.ui.HyperlinkConfirmDialog
+import tools.isekai.terminal.ui.ResizeStabilityState
 import tools.isekai.terminal.ui.SelectionRange
 import tools.isekai.terminal.ui.SshTerminalCanvas
 import tools.isekai.terminal.ui.TerminalFontSettings
 import tools.isekai.terminal.ui.TerminalThemes
+import tools.isekai.terminal.ui.advanceResizeStability
+import tools.isekai.terminal.ui.computeResizeTargetColsRows
 import tools.isekai.terminal.ui.isOpenableHyperlinkScheme
 import tools.isekai.terminal.ui.linkUrlAtCell
 import tools.isekai.terminal.ui.offsetToCellPos
@@ -119,6 +122,7 @@ data class TerminalScreenActions(
  * （「フォーカス中のペインに対して表示する」設計。未分割時は既定で isActive と同じ値になり、
  * 既存の挙動と変わらない）。
  */
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
 fun TerminalScreenBody(
     uiState: TerminalUiState,
@@ -311,6 +315,19 @@ fun TerminalScreenBody(
                 val density = LocalDensity.current
                 val widthPx = with(density) { maxWidth.toPx() }
                 val heightPx = with(density) { maxHeight.toPx() }
+                // ソフトキーボード(IME)表示中は親Columnの`.imePadding()`がこの分だけ
+                // `heightPx`(=ここのBoxWithConstraintsの実測高さ)を圧縮する。IME開閉
+                // そのものはtty実サイズを変える理由にしたくない(タスク#19: IME開閉・回転・
+                // ピンチズームのたびに不要なresize=SIGWINCH相当がvim等の実行中プログラムへ
+                // 飛ぶのを防ぐ)ため、resize先のcols/rowsには「IMEが非表示だった直近の
+                // 高さ」を凍結して使う(生のIME insetを足し戻して補正しない理由・初回
+                // composition時の扱いは advanceResizeStability のdoc参照)。
+                val isImeVisible = WindowInsets.isImeVisible
+                var resizeStability by remember {
+                    mutableStateOf(ResizeStabilityState(hasObservedImeClosed = !isImeVisible, stableHeightPx = heightPx))
+                }
+                resizeStability = advanceResizeStability(resizeStability, isImeVisible, heightPx)
+                val stableHeightPx = resizeStability.stableHeightPx
 
                 val cellDims = remember(density, fontScale, terminalTypeface) {
                     AndroidPaint().apply {
@@ -324,8 +341,12 @@ fun TerminalScreenBody(
                     }
                 }
 
-                val cols = (widthPx / cellDims.first).toInt().coerceAtLeast(10)
-                val rows = (heightPx / cellDims.second).toInt().coerceAtLeast(5)
+                val (cols, rows) = computeResizeTargetColsRows(
+                    widthPx = widthPx,
+                    heightPx = stableHeightPx,
+                    cellW = cellDims.first,
+                    cellH = cellDims.second,
+                )
 
                 // タブがアクティブ化された直後にも、このタブの実際のビューポート寸法で
                 // 確実に resize() が送られる（cols/rows は非アクティブ中は計算されないため）。
@@ -360,15 +381,28 @@ fun TerminalScreenBody(
                     }
                 }
 
-                // pointerInput の key に cellDims/cols/rows を直接使うと、ピンチで
-                // fontScale が変わる → cellDims/cols/rows が再計算される → key が変わり
+                // ジェスチャーのヒットテスト(タップ/選択/ピンチ)に使うセル寸法・cols/rows
+                // は、SshTerminalCanvas が実際の描画に使う値(実ピクセル領域を
+                // displayUpdate.cols/rows へ均等割りしたセルサイズ)に厳密に合わせる。
+                // 上の cellDims(フォント計測ベース)・cols/rows(resize要求用、IME非表示時
+                // 想定の"安定"サイズ)をそのまま使うと、IME表示中(タスク#19の変更でtty側
+                // cols/rowsを据え置くため、実ビューポート寸法と一致しなくなる)や
+                // resize飛行中にタップ位置が実際のセルとズレる(Codexレビュー指摘:
+                // TerminalScreen.kt既存の不整合。#46でのdisplayUpdate合成側の修正と同種)。
+                val renderCols = displayUpdate.cols.toInt().coerceAtLeast(1)
+                val renderRows = displayUpdate.rows.toInt().coerceAtLeast(1)
+                val renderCellDims = Pair(widthPx / renderCols, heightPx / renderRows)
+
+                // pointerInput の key に renderCellDims/renderCols/renderRows を直接使うと、
+                // ピンチで fontScale が変わる → resize要求 → 新しい displayUpdate が届く →
+                // renderCellDims/renderCols/renderRows が再計算される → key が変わり
                 // ジェスチャー検出コルーチン自体がキャンセル&再起動される、という
                 // 自己中断ループになってしまう(実機検証で確認: ピンチがほぼ常に
                 // 完了前に中断されていた不具合の原因)。rememberUpdatedState 経由で
                 // 最新値を読むことで、値が変わってもコルーチンを再起動せずに済ませる。
-                val latestCellDims = rememberUpdatedState(cellDims)
-                val latestCols = rememberUpdatedState(cols)
-                val latestRows = rememberUpdatedState(rows)
+                val latestCellDims = rememberUpdatedState(renderCellDims)
+                val latestCols = rememberUpdatedState(renderCols)
+                val latestRows = rememberUpdatedState(renderRows)
                 // タップ判定(OSC 8リンクのhit-test、タスク#52)は毎フレーム変わる画面内容を
                 // 見る必要があるため、上と同じ理由でrememberUpdatedState経由で読む
                 // (pointerInput(Unit)はkeyが変わらない限りコルーチンを再起動しないため、
