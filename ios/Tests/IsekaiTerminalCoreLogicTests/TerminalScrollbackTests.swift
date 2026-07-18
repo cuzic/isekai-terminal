@@ -2,7 +2,8 @@ import XCTest
 @testable import IsekaiTerminalCoreLogic
 
 /// Phase 1F-4(#51): スクロールバック表示用の`ScreenUpdate`合成ロジックを検証する。
-/// Android版`TerminalScreen.kt`の`displayUpdate`と対称。
+/// Android版`tools.isekai.terminal.ui.synthesizeDisplayUpdate`(`TerminalScrollback.kt`)と対称
+/// (タスク#46)。
 final class TerminalScrollbackTests: XCTestCase {
     private func makeCell(_ ch: Character) -> CellData {
         CellData(

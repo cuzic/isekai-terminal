@@ -1,9 +1,11 @@
 import Foundation
 
 /// Phase 1F-4(#51): ライブの`update`とスクロールバックの行から表示用の`ScreenUpdate`を
-/// 合成する。Android版`TerminalScreen.kt`の`displayUpdate`(`remember(scrollOffset, rows,
-/// update)`)と対称。`scrollOffset == 0`ならライブをそのまま返す。`scrollbackCells`の件数が
-/// `cols * rows`と一致しない場合(未取得・セッション未確立等)もライブへフォールバックする。
+/// 合成する。Android版`tools.isekai.terminal.ui.synthesizeDisplayUpdate`
+/// (`TerminalScrollback.kt`、`TerminalScreen.kt`の`displayUpdate`から呼ばれる)と対称
+/// (タスク#46でAndroid側もこの合成ロジックを独立関数へ抽出した)。`scrollOffset == 0`なら
+/// ライブをそのまま返す。`scrollbackCells`の件数が`cols * rows`と一致しない場合
+/// (未取得・セッション未確立等)もライブへフォールバックする。
 ///
 /// スクロールバック表示中はカーソルを画面外(`cursorRow = update.rows`)に隠す
 /// (Android版と同じ、ライブでない行にカーソルを描くのは意味がないため)。
@@ -25,9 +27,9 @@ public func synthesizeDisplayUpdate(live update: ScreenUpdate, scrollOffset: UIn
         cursorShape: update.cursorShape,
         cursorBlink: update.cursorBlink,
         linkTable: update.linkTable,
-        // Sixel(タスク#42): scrollback表示中はライブ画面の画像配置を引き継がない
-        // (scrollbackセル自体は画像を保持しないテキストのみのスナップショットのため、
-        // Android版`TerminalScreen.kt`の`displayUpdate`合成と同じ判断)。
+        // Sixel(タスク#42)/Kitty graphics(タスク#53): scrollback表示中はライブ画面の画像
+        // 配置を引き継がない(scrollbackセル自体は画像を保持しないテキストのみの
+        // スナップショットのため、Android版`synthesizeDisplayUpdate`と同じ判断)。
         images: [],
         kittyKeyboardFlags: update.kittyKeyboardFlags
     )

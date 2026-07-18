@@ -54,6 +54,7 @@ import tools.isekai.terminal.ui.TerminalFontSettings
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.offsetToCellPos
 import tools.isekai.terminal.ui.reconstructSelectionText
+import tools.isekai.terminal.ui.synthesizeDisplayUpdate
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.*
 
@@ -327,35 +328,17 @@ fun TerminalScreenBody(
                     if (connected) actions.onResize(cols.toUInt(), rows.toUInt())
                 }
 
-                // When scrolled into scrollback, synthesize a ScreenUpdate from the buffer
+                // When scrolled into scrollback, synthesize a ScreenUpdate from the buffer.
+                // 合成ロジック本体は tools.isekai.terminal.ui.synthesizeDisplayUpdate へ抽出済み
+                // (タスク#46: iOS版`TerminalScrollback.swift`と対称にし、ユニットテスト可能にする)。
+                // スクロールバック行の要求は必ず update.rows(ライブの行数)で行う——Compose層が
+                // 独自計算したビューポート由来の rows/cols を使うと、リサイズ中の過渡状態で
+                // Rust側の実際の行幅とズレて displayUpdate の cols/rows と cells 件数が
+                // 食い違いうる(Codexレビュー: タスク#46、synthesizeDisplayUpdate側のdocを参照)。
                 val displayUpdate = remember(scrollOffset, rows, update) {
                     if (scrollOffset > 0) {
-                        val sbCells = actions.onScrollbackCells(scrollOffset, rows)
-                        if (sbCells != null && sbCells.size == rows * cols) {
-                            ScreenUpdate(
-                                cols = update.cols,
-                                rows = update.rows,
-                                cells = sbCells,
-                                cursorRow = update.rows,  // hide cursor (off-screen)
-                                cursorCol = 0u,
-                                title = update.title,
-                                applicationCursorMode = update.applicationCursorMode,
-                                bracketedPasteMode = update.bracketedPasteMode,
-                                mouseReportingMode = update.mouseReportingMode,
-                                sgrMouseMode = update.sgrMouseMode,
-                                cursorVisible = update.cursorVisible,
-                                bellGeneration = update.bellGeneration,
-                                cursorShape = update.cursorShape,
-                                cursorBlink = update.cursorBlink,
-                                linkTable = update.linkTable,
-                                // Sixel(タスク#42): scrollback表示中はライブ画面の画像配置を
-                                // 引き継がない(scrollbackセル自体は画像を保持しないテキスト
-                                // のみのスナップショットのため、cursorVisible相当の考え方で
-                                // 画像も非表示にする)。
-                                images = emptyList(),
-                                kittyKeyboardFlags = update.kittyKeyboardFlags,
-                            )
-                        } else update
+                        val sbCells = actions.onScrollbackCells(scrollOffset, update.rows.toInt())
+                        synthesizeDisplayUpdate(update, scrollOffset, sbCells)
                     } else update
                 }
 
