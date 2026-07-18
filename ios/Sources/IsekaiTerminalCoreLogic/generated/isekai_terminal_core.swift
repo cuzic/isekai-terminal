@@ -2916,6 +2916,16 @@ public struct ScreenUpdate: Equatable, Hashable {
      * (`ESC]0;title BEL`)はカウントされない。
      */
     public var bellGeneration: UInt64
+    /**
+     * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
+     */
+    public var cursorShape: CursorShape
+    /**
+     * カーソルが点滅すべきかどうか。DECSCUSRの偶数/奇数パラメータ
+     * (block/underline/bar それぞれの steady/blinking)から導出される。既定は`true`
+     * (xtermの既定である「blinking block」に合わせる)。
+     */
+    public var cursorBlink: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2931,7 +2941,15 @@ public struct ScreenUpdate: Equatable, Hashable {
          * 発火するのを避けられるため。呼び出し側は前回値と比較し、進んでいれば
          * フィードバックを1回発火させること。OSC のターミネータとして使われた BEL
          * (`ESC]0;title BEL`)はカウントされない。
-         */bellGeneration: UInt64) {
+         */bellGeneration: UInt64, 
+        /**
+         * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
+         */cursorShape: CursorShape, 
+        /**
+         * カーソルが点滅すべきかどうか。DECSCUSRの偶数/奇数パラメータ
+         * (block/underline/bar それぞれの steady/blinking)から導出される。既定は`true`
+         * (xtermの既定である「blinking block」に合わせる)。
+         */cursorBlink: Bool) {
         self.cols = cols
         self.rows = rows
         self.cells = cells
@@ -2942,6 +2960,8 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.bracketedPasteMode = bracketedPasteMode
         self.cursorVisible = cursorVisible
         self.bellGeneration = bellGeneration
+        self.cursorShape = cursorShape
+        self.cursorBlink = cursorBlink
     }
 
     
@@ -2969,7 +2989,9 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 applicationCursorMode: FfiConverterBool.read(from: &buf), 
                 bracketedPasteMode: FfiConverterBool.read(from: &buf), 
                 cursorVisible: FfiConverterBool.read(from: &buf), 
-                bellGeneration: FfiConverterUInt64.read(from: &buf)
+                bellGeneration: FfiConverterUInt64.read(from: &buf), 
+                cursorShape: FfiConverterTypeCursorShape.read(from: &buf), 
+                cursorBlink: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -2984,6 +3006,8 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterBool.write(value.bracketedPasteMode, into: &buf)
         FfiConverterBool.write(value.cursorVisible, into: &buf)
         FfiConverterUInt64.write(value.bellGeneration, into: &buf)
+        FfiConverterTypeCursorShape.write(value.cursorShape, into: &buf)
+        FfiConverterBool.write(value.cursorBlink, into: &buf)
     }
 }
 
@@ -3475,6 +3499,88 @@ public func FfiConverterTypeConnectionPublicState_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeConnectionPublicState_lower(_ value: ConnectionPublicState) -> RustBuffer {
     return FfiConverterTypeConnectionPublicState.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * DECSCUSR(`CSI Ps SP q`)が選択するカーソル形状。`Terminal`が状態として保持し
+ * (rust-ssot: Kotlin/Swift側にミラー状態を作らず、この値をそのまま描画に使う)、
+ * `ScreenUpdate::cursor_shape`として公開する。点滅の有無は別フィールド
+ * (`ScreenUpdate::cursor_blink`)で表現する——将来のDECSET `?12`(タスク#55、
+ * 点滅on/offのみを切り替えるレガシー制御)がDECSCUSRとは独立に同じ
+ * `cursor_blink`フィールドを更新できるよう、形状と点滅を分離してある。
+ */
+
+public enum CursorShape: Equatable, Hashable {
+    
+    case block
+    case underline
+    case bar
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension CursorShape: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCursorShape: FfiConverterRustBuffer {
+    typealias SwiftType = CursorShape
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CursorShape {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .block
+        
+        case 2: return .underline
+        
+        case 3: return .bar
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CursorShape, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .block:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .underline:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .bar:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCursorShape_lift(_ buf: RustBuffer) throws -> CursorShape {
+    return try FfiConverterTypeCursorShape.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCursorShape_lower(_ value: CursorShape) -> RustBuffer {
+    return FfiConverterTypeCursorShape.lower(value)
 }
 
 

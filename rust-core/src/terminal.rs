@@ -1,5 +1,6 @@
 use vte::Perform;
 use crate::theme::Theme;
+use crate::CursorShape;
 
 /// `38;5;n` / `48;5;n`（indexed color）を ARGB へ解決する。
 /// `0..=15` は現在のテーマの ANSI 16色テーブルを参照する（それ以外は固定の 216色/グレースケール）。
@@ -159,6 +160,12 @@ pub(crate) struct Terminal {
     /// ターミネータとして消費し `execute` には渡らないため、ここではカウントされない
     /// (この仕様はテストで明記する)。
     bell_generation: u64,
+    /// DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
+    cursor_shape: CursorShape,
+    /// カーソルが点滅すべきか。DECSCUSRのパラメータ(奇数=blink/偶数=steady、
+    /// 0はblinking blockと同義)から導出する。既定は`true`。将来のDECSET `?12`
+    /// (タスク#55)もこのフィールドを更新する想定(`CursorShape`とは独立)。
+    cursor_blink: bool,
 }
 
 impl Terminal {
@@ -187,6 +194,8 @@ impl Terminal {
             bracketed_paste_mode: false,
             cursor_visible: true,
             bell_generation: 0,
+            cursor_shape: CursorShape::Block,
+            cursor_blink: true,
         }
     }
 
@@ -233,6 +242,8 @@ impl Terminal {
     pub(crate) fn bracketed_paste_mode(&self) -> bool { self.bracketed_paste_mode }
     pub(crate) fn cursor_visible(&self) -> bool { self.cursor_visible }
     pub(crate) fn bell_generation(&self) -> u64 { self.bell_generation }
+    pub(crate) fn cursor_shape(&self) -> CursorShape { self.cursor_shape }
+    pub(crate) fn cursor_blink(&self) -> bool { self.cursor_blink }
     pub(crate) fn screen_cells(&self) -> &[TermCell] { self.cells() }
 
     fn reset_all(&mut self) {
@@ -253,6 +264,8 @@ impl Terminal {
         self.application_cursor_mode = false;
         self.bracketed_paste_mode = false;
         self.cursor_visible = true;
+        self.cursor_shape = CursorShape::Block;
+        self.cursor_blink = true;
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -563,6 +576,23 @@ impl Terminal {
             i += 1;
         }
     }
+
+    /// DECSCUSR(`CSI Ps SP q`)のパラメータ表: 0/1=blinking block(既定)、2=steady
+    /// block、3=blinking underline、4=steady underline、5=blinking bar、
+    /// 6=steady bar。未知のパラメータ(xterm仕様上は無いが、将来拡張分)は無視する。
+    fn set_cursor_shape_from_decscusr(&mut self, ps: u16) {
+        let (shape, blink) = match ps {
+            0 | 1 => (CursorShape::Block, true),
+            2 => (CursorShape::Block, false),
+            3 => (CursorShape::Underline, true),
+            4 => (CursorShape::Underline, false),
+            5 => (CursorShape::Bar, true),
+            6 => (CursorShape::Bar, false),
+            _ => return,
+        };
+        self.cursor_shape = shape;
+        self.cursor_blink = blink;
+    }
 }
 
 /// SGR `38`(前景色)/`48`(背景色)ケースが共通で使う拡張色パース。
@@ -643,6 +673,15 @@ impl Perform for Terminal {
                 ('l', 2004) => { self.bracketed_paste_mode = false; }
                 _ => {}
             }
+            return;
+        }
+
+        // DECSCUSR(`CSI Ps SP q`): 中間バイトが SP(0x20)単体の場合のみ扱う。
+        // 中間バイト無しの `CSI Ps q`(DECLL、別機能・未実装)と区別するため、
+        // action(`q`)だけでなく intermediates を明示的に確認する——ここを見落とすと
+        // DECLL を誤ってカーソル形状変更として処理してしまう(Fableレビュー指摘)。
+        if action == 'q' && intermediates == [b' '] {
+            self.set_cursor_shape_from_decscusr(p0);
             return;
         }
 
@@ -1218,6 +1257,66 @@ mod tests {
         assert!(!t.cursor_visible());
         feed(&mut t, b"\x1bc"); // RIS (full reset)
         assert!(t.cursor_visible(), "RISで既定の表示状態に戻る");
+    }
+
+    #[test]
+    fn test_decscusr_default_shape() {
+        let t = Terminal::new(80, 24, Theme::default());
+        assert_eq!(t.cursor_shape(), CursorShape::Block, "既定はblock");
+        assert!(t.cursor_blink(), "既定は点滅");
+    }
+
+    #[test]
+    fn test_decscusr_all_params() {
+        let cases: &[(u16, CursorShape, bool)] = &[
+            (0, CursorShape::Block, true),
+            (1, CursorShape::Block, true),
+            (2, CursorShape::Block, false),
+            (3, CursorShape::Underline, true),
+            (4, CursorShape::Underline, false),
+            (5, CursorShape::Bar, true),
+            (6, CursorShape::Bar, false),
+        ];
+        for &(ps, shape, blink) in cases {
+            let mut t = Terminal::new(80, 24, Theme::default());
+            feed(&mut t, format!("\x1b[{} q", ps).as_bytes());
+            assert_eq!(t.cursor_shape(), shape, "Ps={ps}");
+            assert_eq!(t.cursor_blink(), blink, "Ps={ps}");
+        }
+    }
+
+    #[test]
+    fn test_decscusr_unknown_param_ignored() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[5 q"); // bar, blinking
+        assert_eq!(t.cursor_shape(), CursorShape::Bar);
+        feed(&mut t, b"\x1b[99 q"); // 未知のパラメータ: 直前の状態を維持
+        assert_eq!(t.cursor_shape(), CursorShape::Bar, "未知パラメータは無視される");
+        assert!(t.cursor_blink());
+    }
+
+    /// Fableレビュー(タスク#32・2次)で指摘された罠: 中間バイト無しの `CSI Ps q`
+    /// (DECLL、未実装)を DECSCUSR として誤処理してはいけない。csi_dispatch は
+    /// intermediates == [b' '] の場合のみ DECSCUSR として扱うことを保証する。
+    #[test]
+    fn test_csi_q_without_intermediate_is_not_decscusr() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[5 q"); // まず bar/blinking にしておく
+        assert_eq!(t.cursor_shape(), CursorShape::Bar);
+        feed(&mut t, b"\x1b[2q"); // 中間バイト無し = DECLL(未実装、no-op)であるべき
+        assert_eq!(t.cursor_shape(), CursorShape::Bar, "DECLLはカーソル形状を変えてはいけない");
+        assert!(t.cursor_blink());
+    }
+
+    #[test]
+    fn test_decscusr_reset_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[4 q"); // steady underline
+        assert_eq!(t.cursor_shape(), CursorShape::Underline);
+        assert!(!t.cursor_blink());
+        feed(&mut t, b"\x1bc"); // RIS (full reset)
+        assert_eq!(t.cursor_shape(), CursorShape::Block, "RISで既定のblockに戻る");
+        assert!(t.cursor_blink(), "RISで既定の点滅状態に戻る");
     }
 
     #[test]

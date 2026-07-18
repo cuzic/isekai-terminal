@@ -9,6 +9,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import uniffi.isekai_terminal_core.CellData
+import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.ScreenUpdate
 
 /**
@@ -86,7 +87,7 @@ class SshTerminalCanvasTest {
         assertEquals(listOf(BgRun(0, 3, blue)), runsRow1)
     }
 
-    private fun screenUpdate() = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, false, false, true, 0uL)
+    private fun screenUpdate() = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, false, false, true, 0uL, CursorShape.BLOCK, true)
 
     // ── FontFitCache: セル寸法/typefaceが変わったときだけ再計測が必要 ──────────
 

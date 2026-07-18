@@ -44,6 +44,8 @@ fn make_screen_update(t: &Terminal) -> ScreenUpdate {
         bracketed_paste_mode: t.bracketed_paste_mode(),
         cursor_visible: t.cursor_visible(),
         bell_generation: t.bell_generation(),
+        cursor_shape: t.cursor_shape(),
+        cursor_blink: t.cursor_blink(),
     }
 }
 

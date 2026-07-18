@@ -331,6 +331,8 @@ fun TerminalScreenBody(
                                 bracketedPasteMode = update.bracketedPasteMode,
                                 cursorVisible = update.cursorVisible,
                                 bellGeneration = update.bellGeneration,
+                                cursorShape = update.cursorShape,
+                                cursorBlink = update.cursorBlink,
                             )
                         } else update
                     } else update

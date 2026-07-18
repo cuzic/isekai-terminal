@@ -25,7 +25,8 @@ final class TerminalSelectionTests: XCTestCase {
             cols: UInt32(cols), rows: UInt32(rows.count), cells: cells,
             cursorRow: 0, cursorCol: 0, title: nil,
             applicationCursorMode: false, bracketedPasteMode: false,
-            cursorVisible: true, bellGeneration: 0
+            cursorVisible: true, bellGeneration: 0,
+            cursorShape: .block, cursorBlink: true
         )
     }
 
@@ -78,7 +79,7 @@ final class TerminalSelectionTests: XCTestCase {
     }
 
     func testReconstructSelectionTextReturnsEmptyForInvalidDimensions() {
-        let update = ScreenUpdate(cols: 0, rows: 0, cells: [], cursorRow: 0, cursorCol: 0, title: nil, applicationCursorMode: false, bracketedPasteMode: false, cursorVisible: true, bellGeneration: 0)
+        let update = ScreenUpdate(cols: 0, rows: 0, cells: [], cursorRow: 0, cursorCol: 0, title: nil, applicationCursorMode: false, bracketedPasteMode: false, cursorVisible: true, bellGeneration: 0, cursorShape: .block, cursorBlink: true)
         let selection = SelectionRange(anchor: CellPos(row: 0, col: 0), head: CellPos(row: 0, col: 0))
 
         XCTAssertEqual(reconstructSelectionText(update: update, selection: selection), "")
