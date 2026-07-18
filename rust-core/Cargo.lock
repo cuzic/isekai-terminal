@@ -1700,6 +1700,7 @@ dependencies = [
  "isekai-protocol",
  "isekai-trust",
  "log",
+ "openssh-config",
  "rand 0.8.6",
  "russh",
  "russh-keys",

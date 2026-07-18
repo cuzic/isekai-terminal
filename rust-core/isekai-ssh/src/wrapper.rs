@@ -65,6 +65,13 @@ impl WrapperPlan {
     pub(crate) fn pipe_path(&self) -> &Path {
         &self.pipe_path
     }
+
+    /// The `ssh(1)`-style destination token (e.g. `production`, not the
+    /// `ssh -G`/`openssh-config`-resolved `HostName`) — `native/connect.rs`'s
+    /// only other direct read of `WrapperPlan` besides `pipe_path()`.
+    pub(crate) fn destination(&self) -> &str {
+        &self.destination
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +234,24 @@ impl WrapperResolution {
     /// `pub(crate)` functions, which already take `&WrapperResolution`).
     pub(crate) fn profile(&self) -> &str {
         &self.isekai.profile
+    }
+
+    /// Whether `#@isekai` routing applies to this destination at all — the
+    /// native connect path (`native/connect.rs`) needs this to decide
+    /// between routing through `isekai-pipe connect --stdio` and a plain
+    /// direct connect, the same branch `run()` makes via `run_openssh_direct`.
+    pub(crate) fn isekai_enabled(&self) -> bool {
+        self.isekai.enabled
+    }
+
+    /// `{hostname}:{port}` for this destination, using the same
+    /// `HostName`/`port` fallback `resolve_isekai_config`'s own
+    /// `default_target` uses (destination literal, port 22) — the native
+    /// path's SSH TCP target and `HostKeyVerifier` trust-store key.
+    pub(crate) fn native_host_port(&self, destination: &str) -> (String, u16) {
+        let host = self.openssh.hostname.clone().unwrap_or_else(|| destination.to_string());
+        let port = self.openssh.port.unwrap_or(22);
+        (host, port)
     }
 }
 
@@ -944,7 +969,7 @@ pub(crate) fn should_bootstrap(plan: &WrapperPlan, resolution: &WrapperResolutio
         )
 }
 
-fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
+pub(crate) fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
     let mut openssh_path = PathBuf::from("ssh");
     let mut pipe_path = default_pipe_path();
     let mut ssh_args = Vec::new();
@@ -1004,6 +1029,39 @@ async fn resolve_wrapper(plan: &WrapperPlan) -> Result<WrapperResolution> {
     let openssh = resolve_openssh_effective_config(plan).await?;
     let isekai = resolve_isekai_config(plan, &openssh)?;
     Ok(WrapperResolution { openssh, isekai })
+}
+
+/// The `native/` module's equivalent of [`resolve_wrapper`]: resolves
+/// `~/.ssh/config` via the dependency-free `openssh-config` crate (M1)
+/// instead of shelling out to `ssh -G` (`resolve_openssh_effective_config`),
+/// since the native path exists specifically for machines that may not have
+/// `ssh.exe` at all. `#@isekai` directive resolution (`resolve_isekai_config`)
+/// is unchanged and shared verbatim with the Unix wrapper path — it only
+/// ever reads `openssh.hostname`/`openssh.port` (see its own doc comment),
+/// both of which `openssh_config::HostConfig` provides just as well as
+/// `ssh -G` did.
+///
+/// Returns the full `openssh_config::HostConfig` alongside `WrapperResolution`
+/// because the native path needs fields (`identity_file`, `identity_agent`,
+/// `forward_agent`) that `OpenSshEffectiveConfig` deliberately doesn't carry
+/// (the Unix wrapper path never needs them — real `ssh(1)` resolves those
+/// itself from the same config file).
+pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolution, openssh_config::HostConfig)> {
+    let host_config = openssh_config::resolve_default(&plan.destination).map_err(|e| {
+        anyhow!(
+            "isekai-ssh: failed to resolve {:?} from ~/.ssh/config: {e}",
+            plan.destination
+        )
+    })?;
+    let openssh = OpenSshEffectiveConfig {
+        hostname: host_config.host_name.clone(),
+        user: host_config.user.clone(),
+        port: host_config.port,
+        proxy_jump: host_config.proxy_jump.clone(),
+        proxy_command: None,
+    };
+    let isekai = resolve_isekai_config(plan, &openssh)?;
+    Ok((WrapperResolution { openssh, isekai }, host_config))
 }
 
 async fn resolve_openssh_effective_config(plan: &WrapperPlan) -> Result<OpenSshEffectiveConfig> {

@@ -7,6 +7,7 @@
 
 pub(crate) mod agent_auth;
 pub(crate) mod child_stdio;
+pub(crate) mod connect;
 pub(crate) mod console;
 pub(crate) mod host_key_trust;
 pub(crate) mod private_key;

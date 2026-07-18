@@ -77,7 +77,17 @@ async fn run() -> u8 {
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let exit_code: u8 = if wrapper::should_run_wrapper(&raw_args) {
-        match wrapper::run(raw_args).await {
+        // Windows never shells out to a real `ssh(1)` — `native::connect::run`
+        // is a from-scratch `russh`-based client that never spawns
+        // Win32-OpenSSH. Unix/macOS keep the original `ssh(1)` ProxyCommand
+        // wrapper unchanged (`native/mod.rs`'s module docs: this module is
+        // built and unit-tested everywhere, but only ever *invoked* here).
+        #[cfg(windows)]
+        let result = native::connect::run(raw_args).await;
+        #[cfg(not(windows))]
+        let result = wrapper::run(raw_args).await;
+
+        match result {
             Ok(code) => code,
             Err(err) => {
                 // `wrapper::run` already opened `--isekai-log-file` (if given)
