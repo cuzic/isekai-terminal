@@ -29,6 +29,65 @@ fn cell_display_width(cell: &TermCell) -> usize {
     cell.ch.chars().next().and_then(|c| c.width()).unwrap_or(1)
 }
 
+/// G0/G1文字セット指定(`ESC ( <final>`/`ESC ) <final>`、タスク#41)。ASCII以外は
+/// DEC Special Graphics(罫線・記号セット、最終バイト`0`)のみ対応する — UK(`A`)等の
+/// 他の国別セットはグラフィック文字の写像を持たない(ASCIIとほぼ同一の文字集合)ため
+/// 区別せずASCIIとして扱う(未知の最終バイトは`esc_dispatch`側でASCII指定として
+/// フォールバックする——codexレビュー指摘: 「区別せずASCIIとして扱う」というこの
+/// コメント自体の意図と、以前の実装が未知の最終バイトを単に無視していた挙動が
+/// 食い違っていたため、意図通りASCIIへ倒すよう修正した)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Charset {
+    Ascii,
+    DecSpecialGraphics,
+}
+
+/// DEC Special Graphics and Line Drawing Set(`ESC ( 0`/`ESC ) 0`)における、ASCII
+/// `_`(0x5f)・`` ` ``(0x60)〜`~`(0x7e)のUnicode写像。非UTF-8ロケールのncurses/dialog/mc等が
+/// 罫線描画にこのモードを使うため、翻訳しないとレンダラー側に生ASCII(`q`/`x`等)が
+/// 渡り「lqqqk」のように文字化けする(タスク#41、Fableレビュー2次で実害を指摘)。
+/// `_`(0x5f)はVT100仕様上blank(空白)に写像される(VT100 User Guide Table 3-9、
+/// codexレビュー指摘: 当初0x60〜0x7eのみ扱っており0x5fが未対応だった)。
+/// この範囲外の文字(0x5f未満・0x7f以上)はASCIIと同一のためそのまま返す。
+/// マッピングは xterm/alacritty 等主要実装が使う標準VT100テーブルに準拠する。
+fn dec_special_graphics(c: char) -> char {
+    match c {
+        '_' => ' ',
+        '`' => '◆',
+        'a' => '▒',
+        'b' => '\u{2409}', // SYMBOL FOR HORIZONTAL TABULATION
+        'c' => '\u{240c}', // SYMBOL FOR FORM FEED
+        'd' => '\u{240d}', // SYMBOL FOR CARRIAGE RETURN
+        'e' => '\u{240a}', // SYMBOL FOR LINE FEED
+        'f' => '°',
+        'g' => '±',
+        'h' => '\u{2424}', // SYMBOL FOR NEWLINE
+        'i' => '\u{240b}', // SYMBOL FOR VERTICAL TABULATION
+        'j' => '┘',
+        'k' => '┐',
+        'l' => '┌',
+        'm' => '└',
+        'n' => '┼',
+        'o' => '⎺',
+        'p' => '⎻',
+        'q' => '─',
+        'r' => '⎼',
+        's' => '⎽',
+        't' => '├',
+        'u' => '┤',
+        'v' => '┴',
+        'w' => '┬',
+        'x' => '│',
+        'y' => '≤',
+        'z' => '≥',
+        '{' => 'π',
+        '|' => '≠',
+        '}' => '£',
+        '~' => '·',
+        other => other,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct TermCell {
     pub(crate) ch: smol_str::SmolStr,
@@ -126,6 +185,21 @@ fn blank_cell_for_theme(theme: &Theme) -> TermCell {
     }
 }
 
+/// DECSC(`ESC 7`)・CSI `s`・DECSET `?1047`/`?1049`が保存するカーソル状態一式。
+/// ECMA-48/DECSC仕様上の保存対象(カーソル位置・SGR属性・文字セット状態)を1つに
+/// まとめた struct(タスク#41で`(usize, usize, TermAttrs)`タプルから拡張。
+/// [Terminal]の`saved_cursor_main`フィールドdocコメント参照)。
+#[derive(Clone, Copy)]
+struct SavedCursor {
+    row: usize,
+    col: usize,
+    attrs: TermAttrs,
+    g0: Charset,
+    g1: Charset,
+    /// SI/SOによるGL(現在印字に使われる文字集合)の選択状態。`false`=G0、`true`=G1。
+    gl_is_g1: bool,
+}
+
 /// 純粋な VTE 端末状態機械。外部の Arc/Mutex を一切持たない。
 /// スクロールアウトした行は `pending_scrollback` に積み、
 /// 呼び出し元が `take_scrollback()` でフラッシュする。
@@ -152,13 +226,10 @@ pub(crate) struct Terminal {
     ///    (`alt_active`)に応じてどちらのスロットを使うか選ぶ。alt画面上で明示的に
     ///    `ESC 7`/`ESC 8`する場合はこちらが専ら`saved_cursor_alt`を使う経路になる。
     ///
-    /// 文字セット状態(G0/G1、タスク#41)は現時点で未実装のため保存対象に含まれていない。
-    /// #41実装時はこのタプルを拡張(またはstruct化)し、`save_cursor_decsc`/
-    /// `restore_cursor_decrc`・`switch_to_alt`/`switch_to_main`の両方の保存/復元経路を
-    /// 揃えて更新すること(DECSCは仕様上カーソル位置・SGR属性・文字セット状態の
-    /// 3つを保存対象とする)。
-    saved_cursor_main: Option<(usize, usize, TermAttrs)>,
-    saved_cursor_alt: Option<(usize, usize, TermAttrs)>,
+    /// 文字セット状態(G0/G1、タスク#41)も[SavedCursor]の一部として保存/復元される
+    /// (DECSCは仕様上カーソル位置・SGR属性・文字セット状態の3つを保存対象とする)。
+    saved_cursor_main: Option<SavedCursor>,
+    saved_cursor_alt: Option<SavedCursor>,
     cursor_row: usize,
     cursor_col: usize,
     cur_attrs: TermAttrs,
@@ -229,6 +300,14 @@ pub(crate) struct Terminal {
     /// 制御機能はそれを消さない)に合わせる。この値を書き込むのは`print()`の
     /// 非結合文字分岐のみ。
     last_graphic_cell: Option<(char, TermAttrs)>,
+    /// `ESC ( <final>`で指定されたG0文字セット。既定はASCII(タスク#41)。
+    g0_charset: Charset,
+    /// `ESC ) <final>`で指定されたG1文字セット。既定はASCII(タスク#41)。
+    g1_charset: Charset,
+    /// SI(0x0F)/SO(0x0E)によるGL(印字時に実際に使われる文字集合)の選択状態。
+    /// `false`=G0(既定、SI相当)、`true`=G1(SO相当)。`print()`はこのフラグで
+    /// `g0_charset`/`g1_charset`のどちらを適用するか決める(タスク#41)。
+    gl_is_g1: bool,
 }
 
 impl Terminal {
@@ -262,6 +341,9 @@ impl Terminal {
             cursor_blink: true,
             autowrap_mode: true,
             last_graphic_cell: None,
+            g0_charset: Charset::Ascii,
+            g1_charset: Charset::Ascii,
+            gl_is_g1: false,
         }
     }
 
@@ -344,6 +426,9 @@ impl Terminal {
         self.cursor_blink = true;
         self.autowrap_mode = true;
         self.last_graphic_cell = None;
+        self.g0_charset = Charset::Ascii;
+        self.g1_charset = Charset::Ascii;
+        self.gl_is_g1 = false;
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -420,14 +505,14 @@ impl Terminal {
             (reference_row + 1).saturating_sub(new_rows).min(total_removed)
         };
         let main_reference_row = if self.alt_active {
-            self.saved_cursor_main.map(|c| c.0).unwrap_or(0)
+            self.saved_cursor_main.map(|c| c.row).unwrap_or(0)
         } else {
             self.cursor_row
         };
         let alt_reference_row = if self.alt_active {
             self.cursor_row
         } else {
-            self.saved_cursor_alt.map(|c| c.0).unwrap_or(0)
+            self.saved_cursor_alt.map(|c| c.row).unwrap_or(0)
         };
         let main_removed = top_removed_for(main_reference_row);
         let alt_removed = top_removed_for(alt_reference_row);
@@ -463,11 +548,19 @@ impl Terminal {
         };
         self.cursor_col = clamp_col(self.cursor_col);
 
-        if let Some((row, col, attrs)) = self.saved_cursor_main.take() {
-            self.saved_cursor_main = Some((shift_row(row, main_removed), clamp_col(col), attrs));
+        if let Some(saved) = self.saved_cursor_main.take() {
+            self.saved_cursor_main = Some(SavedCursor {
+                row: shift_row(saved.row, main_removed),
+                col: clamp_col(saved.col),
+                ..saved
+            });
         }
-        if let Some((row, col, attrs)) = self.saved_cursor_alt.take() {
-            self.saved_cursor_alt = Some((shift_row(row, alt_removed), clamp_col(col), attrs));
+        if let Some(saved) = self.saved_cursor_alt.take() {
+            self.saved_cursor_alt = Some(SavedCursor {
+                row: shift_row(saved.row, alt_removed),
+                col: clamp_col(saved.col),
+                ..saved
+            });
         }
 
         if had_full_scroll_region {
@@ -526,7 +619,14 @@ impl Terminal {
 
     fn switch_to_alt(&mut self, save_cursor: bool) {
         if save_cursor {
-            self.saved_cursor_main = Some((self.cursor_row, self.cursor_col, self.cur_attrs));
+            self.saved_cursor_main = Some(SavedCursor {
+                row: self.cursor_row,
+                col: self.cursor_col,
+                attrs: self.cur_attrs,
+                g0: self.g0_charset,
+                g1: self.g1_charset,
+                gl_is_g1: self.gl_is_g1,
+            });
         }
         let theme = self.theme;
         self.main_cells = self.cells().clone();
@@ -537,6 +637,12 @@ impl Terminal {
             self.cursor_row = 0;
             self.cursor_col = 0;
             self.cur_attrs = TermAttrs::default_for(&theme);
+            // カーソル位置・SGR属性と同様、alt画面への切替は文字セット状態も
+            // フレッシュな既定(G0=ASCII、GL=G0)に戻す(タスク#41)。main画面復帰時
+            // には下の`switch_to_main`が`saved_cursor_main`からこの状態を復元する。
+            self.g0_charset = Charset::Ascii;
+            self.g1_charset = Charset::Ascii;
+            self.gl_is_g1 = false;
         }
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
@@ -546,10 +652,13 @@ impl Terminal {
         if !self.alt_active { return; }
         self.alt_active = false;
         if restore_cursor {
-            if let Some((row, col, attrs)) = self.saved_cursor_main.take() {
-                self.cursor_row = row;
-                self.cursor_col = col;
-                self.cur_attrs = attrs;
+            if let Some(saved) = self.saved_cursor_main.take() {
+                self.cursor_row = saved.row;
+                self.cursor_col = saved.col;
+                self.cur_attrs = saved.attrs;
+                self.g0_charset = saved.g0;
+                self.g1_charset = saved.g1;
+                self.gl_is_g1 = saved.gl_is_g1;
             }
         }
     }
@@ -561,7 +670,14 @@ impl Terminal {
     /// スロットを共有する設計の理由は[Terminal]の`saved_cursor_main`フィールド
     /// docコメント参照。
     fn save_cursor_decsc(&mut self) {
-        let saved = Some((self.cursor_row, self.cursor_col, self.cur_attrs));
+        let saved = Some(SavedCursor {
+            row: self.cursor_row,
+            col: self.cursor_col,
+            attrs: self.cur_attrs,
+            g0: self.g0_charset,
+            g1: self.g1_charset,
+            gl_is_g1: self.gl_is_g1,
+        });
         if self.alt_active {
             self.saved_cursor_alt = saved;
         } else {
@@ -574,15 +690,18 @@ impl Terminal {
     /// 安全側に倒して何もしない(カーソルを勝手に原点等へ移動させない)。
     fn restore_cursor_decrc(&mut self) {
         let saved = if self.alt_active { self.saved_cursor_alt } else { self.saved_cursor_main };
-        if let Some((row, col, attrs)) = saved {
+        if let Some(saved) = saved {
             // 保存後にresizeで画面が縮んでいる可能性を考慮し、現在のcols/rowsへ
             // クランプする。`resize_preserving_state`は`saved_cursor_*`自体を
             // resize時に追従更新するが(念のため多重に安全側でもクランプする)、
             // colはprintの遅延折り返し状態(`== cols`)を許容する必要があるため
             // `cols`ちょうどまでは許容し、それを超える場合のみ切り詰める。
-            self.cursor_row = row.min(self.rows.saturating_sub(1));
-            self.cursor_col = col.min(self.cols);
-            self.cur_attrs = attrs;
+            self.cursor_row = saved.row.min(self.rows.saturating_sub(1));
+            self.cursor_col = saved.col.min(self.cols);
+            self.cur_attrs = saved.attrs;
+            self.g0_charset = saved.g0;
+            self.g1_charset = saved.g1;
+            self.gl_is_g1 = saved.gl_is_g1;
         }
     }
 
@@ -936,6 +1055,16 @@ fn parse_extended_color(theme: &Theme, ps: &[u16], i: usize) -> Option<(u32, usi
 impl Perform for Terminal {
     fn print(&mut self, c: char) {
         use unicode_width::UnicodeWidthChar;
+        // SI/SO(`execute`)・`ESC ( `/`ESC ) `(`esc_dispatch`)で選択された文字集合が
+        // DEC Special Graphicsの場合、ASCII範囲の文字をUnicode罫線/記号文字へ書き換えて
+        // からセルへ書き込む(タスク#41)。結合文字判定([UnicodeWidthChar::width])より
+        // 前に行う必要がある — 写像先の罫線文字はいずれも幅1(結合文字になり得ない)。
+        let active_charset = if self.gl_is_g1 { self.g1_charset } else { self.g0_charset };
+        let c = if active_charset == Charset::DecSpecialGraphics {
+            dec_special_graphics(c)
+        } else {
+            c
+        };
         let width = c.width().unwrap_or(1);
 
         if width == 0 {
@@ -1038,6 +1167,12 @@ impl Perform for Terminal {
             0x0D => { self.cursor_col = 0; }
             0x0A | 0x0B | 0x0C => { self.newline(); }
             0x08 => { if self.cursor_col > 0 { self.cursor_col -= 1; } }
+            // SO(Shift Out)/SI(Shift In、タスク#41): GL(印字に使われる文字集合)を
+            // G1/G0へ切り替える。実際の写像先(ASCIIかDEC Special Graphicsか)は
+            // `g0_charset`/`g1_charset`(`esc_dispatch`の`ESC ( `/`ESC ) `で設定)を
+            // `print()`が参照する。
+            0x0E => { self.gl_is_g1 = true; }  // SO
+            0x0F => { self.gl_is_g1 = false; } // SI
             0x09 => {
                 self.cursor_col = ((self.cursor_col / 8) + 1) * 8;
                 if self.cursor_col >= self.cols { self.cursor_col = self.cols - 1; }
@@ -1289,6 +1424,18 @@ impl Perform for Terminal {
             // DECALNまで誤ってDECRCとして処理してしまう(codexレビュー指摘)。
             b'7' if ints.is_empty() => { self.save_cursor_decsc(); }
             b'8' if ints.is_empty() => { self.restore_cursor_decrc(); }
+            // G0/G1文字セット指定(`ESC ( <final>`/`ESC ) <final>`、タスク#41)。
+            // `byte`は最終バイト(vteが`ints`と`byte`を分離して渡す——中間バイト
+            // `(`/`)`自体は`byte`には現れない)。`0`(DEC Special Graphics)だけ
+            // マッピングテーブルを持ち、それ以外の最終バイト(`B`=US ASCII、
+            // UK `A`等の他の国別セット)は全てASCIIとして扱う([Charset]の
+            // docコメント参照——codexレビュー指摘: 以前は`B`以外の未知の最終
+            // バイトを無視しており、DEC Special Graphics指定中に`ESC ( A`等が
+            // 来てもASCIIへ戻せなかった)。
+            b'0' if ints == [b'('] => { self.g0_charset = Charset::DecSpecialGraphics; }
+            _ if ints == [b'('] => { self.g0_charset = Charset::Ascii; }
+            b'0' if ints == [b')'] => { self.g1_charset = Charset::DecSpecialGraphics; }
+            _ if ints == [b')'] => { self.g1_charset = Charset::Ascii; }
             _ => {}
         }
     }
@@ -2996,6 +3143,118 @@ mod tests {
 
     fn cell_bold(t: &Terminal, row: usize, col: usize) -> bool {
         t.screen_cells()[row * t.cols() + col].bold
+    }
+
+    // ── G0/G1文字セット・DEC Special Graphics(タスク#41) ─────────
+
+    #[test]
+    fn test_dec_special_graphics_maps_line_drawing_chars() {
+        // `ESC ( 0`でG0をDEC Special Graphicsに指定すると、以降のASCII 'q'/'x'/'l'等が
+        // 罫線文字(non-UTF-8ロケールのncurses/mc等が出力する典型パターン)に写像される。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b(0lqqqk\r\nx   x\r\nmqqqj\x1b(B");
+        assert_eq!(cell(&t, 0, 0), "┌");
+        assert_eq!(cell(&t, 0, 1), "─");
+        assert_eq!(cell(&t, 0, 4), "┐");
+        assert_eq!(cell(&t, 1, 0), "│");
+        assert_eq!(cell(&t, 1, 4), "│");
+        assert_eq!(cell(&t, 2, 0), "└");
+        assert_eq!(cell(&t, 2, 4), "┘");
+    }
+
+    #[test]
+    fn test_esc_paren_b_reverts_to_ascii() {
+        // `ESC ( B`(US ASCII)へ戻すと、以降は通常のASCIIとして印字される。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b(0q\x1b(Bq");
+        assert_eq!(cell(&t, 0, 0), "─", "DEC Special Graphics指定中の'q'は罫線に写像される");
+        assert_eq!(cell(&t, 0, 1), "q", "ASCIIへ戻した後の'q'はそのまま");
+    }
+
+    #[test]
+    fn test_si_so_switches_between_g0_and_g1() {
+        // SO(0x0E)でG1を、SI(0x0F)でG0をGLへ呼び出す。G1だけをDEC Special Graphicsに
+        // 指定し、G0はASCIIのまま残しておくことでSI/SOの切替自体を検証する。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b)0"); // G1 = DEC Special Graphics(G0はASCIIのまま)
+        feed(&mut t, b"q"); // GL=G0(既定) → 素のASCII 'q'
+        feed(&mut t, b"\x0e"); // SO: GL=G1
+        feed(&mut t, b"q"); // → 罫線に写像
+        feed(&mut t, b"\x0f"); // SI: GL=G0
+        feed(&mut t, b"q"); // → 再びASCII
+        assert_eq!(cell(&t, 0, 0), "q");
+        assert_eq!(cell(&t, 0, 1), "─");
+        assert_eq!(cell(&t, 0, 2), "q");
+    }
+
+    #[test]
+    fn test_charset_unknown_final_byte_falls_back_to_ascii() {
+        // 未対応の最終バイト(例: UK国別セット`A`)はASCIIとして扱う([Charset]の
+        // docコメント参照——`0`(DEC Special Graphics)以外はグラフィック写像を
+        // 持たないASCII相当の文字集合という設計方針をそのまま反映する。
+        // codexレビュー: 以前は無視して直前の指定を保持していたが、コメントの
+        // 意図(「区別せずASCIIとして扱う」)と食い違っていたため修正)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b(0"); // G0 = DEC Special Graphics
+        feed(&mut t, b"\x1b(A"); // 未対応の最終バイト → ASCIIへフォールバック
+        feed(&mut t, b"q");
+        assert_eq!(cell(&t, 0, 0), "q", "未対応の指定はASCII相当として扱われる");
+    }
+
+    #[test]
+    fn test_dec_special_graphics_underscore_maps_to_blank() {
+        // VT100 User Guide Table 3-9: DEC Special Graphics上の`_`(0x5f)はblank
+        // (空白)に写像される(codexレビュー指摘: 当初0x60〜0x7eのみ対応しており
+        // 0x5fが漏れていた)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b(0_");
+        assert_eq!(cell(&t, 0, 0), " ");
+    }
+
+    #[test]
+    fn test_alt_screen_switch_saves_and_restores_charset_state() {
+        // `?1049h`/`?1049l`(alt画面切替)もDECSC/DECRCと同じスロットを共有するため、
+        // 文字セット状態も保存/復元対象になる(タスク#41、`switch_to_alt`/
+        // `switch_to_main`のコメント参照。codexレビュー: alt画面切替経路の
+        // charsetカバレッジが薄いという指摘への対応)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b(0"); // main: G0 = DEC Special Graphics
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ(main側の文字セット状態を暗黙保存)
+        // alt画面に入った直後はフレッシュな既定(G0=ASCII)にリセットされている。
+        feed(&mut t, b"q");
+        assert_eq!(cell(&t, 0, 0), "q", "alt画面入場直後はG0=ASCIIにリセットされる");
+        feed(&mut t, b"\x1b(0"); // alt側でG0をDEC Special Graphicsに変更
+        feed(&mut t, b"\r"); // 行頭へ戻す
+        feed(&mut t, b"q");
+        assert_eq!(cell(&t, 0, 0), "─", "alt画面上でも独立してDEC Special Graphicsを指定できる");
+        feed(&mut t, b"\x1b[?1049l"); // main画面へ復帰(保存されたG0=DEC Special Graphicsが復元される)
+        feed(&mut t, b"q");
+        assert_eq!(cell(&t, 0, 0), "─", "main画面復帰後は\\x1b(0直後に保存したDEC Special Graphics指定が復元される");
+    }
+
+    #[test]
+    fn test_decsc_decrc_save_restore_charset_state() {
+        // DECSC(`ESC 7`)/DECRC(`ESC 8`)は仕様上カーソル位置・SGR属性に加え文字セット
+        // 状態も保存/復元対象(タスク#41、[Terminal]の`saved_cursor_main`docコメント参照)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b(0"); // G0 = DEC Special Graphics
+        feed(&mut t, b"\x1b7"); // 保存(G0=DEC Special Graphicsを含む)
+        feed(&mut t, b"\x1b(B"); // G0をASCIIへ変更
+        feed(&mut t, b"q");
+        assert_eq!(cell(&t, 0, 0), "q", "ESC 7後にASCIIへ変更した直後はASCIIのまま");
+        feed(&mut t, b"\x1b8"); // 復元 → カーソルも(0,0)へ戻り、G0はDEC Special Graphicsへ戻る
+        feed(&mut t, b"q");
+        assert_eq!(cell(&t, 0, 0), "─", "ESC 8でDEC Special Graphics指定が復元される");
+    }
+
+    #[test]
+    fn test_ris_resets_charset_state() {
+        // RIS(`ESC c`)はG0/G1指定・GL選択をすべて既定(G0=G1=ASCII、GL=G0)へ戻す。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b(0\x0e"); // G0=DEC Special Graphics、GL=G1(SO)
+        feed(&mut t, b"\x1bc"); // RIS
+        feed(&mut t, b"q");
+        assert_eq!(cell(&t, 0, 0), "q", "RIS後はASCII/G0既定に戻っている");
     }
 
     // ── Proptest: 不変量 ────────────────────────────────
