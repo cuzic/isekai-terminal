@@ -80,6 +80,22 @@ impl WrapperPlan {
     pub(crate) fn log_file(&self) -> Option<&Path> {
         self.isekai.log_file.as_deref()
     }
+
+    /// Number of parsed `ssh(1)`-style args (options + destination + any
+    /// trailing remote command). The native ctl-socket path
+    /// (`native/mux/ctl_forward.rs`) feeds this to
+    /// [`crate::ctl_forward::should_attempt_ctl_forward`] to skip the forward
+    /// for a one-shot remote command, exactly as the Unix path does.
+    pub(crate) fn ssh_args_len(&self) -> usize {
+        self.ssh_args.len()
+    }
+
+    /// Index of the destination token within the parsed ssh args — anything
+    /// *after* it is a remote command. Paired with [`Self::ssh_args_len`] for
+    /// the native ctl-socket interactive-session check.
+    pub(crate) fn destination_index(&self) -> usize {
+        self.destination_index
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +266,15 @@ impl WrapperResolution {
     /// direct connect, the same branch `run()` makes via `run_openssh_direct`.
     pub(crate) fn isekai_enabled(&self) -> bool {
         self.isekai.enabled
+    }
+
+    /// `#@isekai ctl-socket yes` (Epic M): whether the per-tab title/clipboard
+    /// control-plane forward is opted in. The native path
+    /// (`native/mux/ctl_forward.rs`) reads this to decide whether to request a
+    /// streamlocal forward on its `russh` handle; the Unix path reads the
+    /// private field directly (same module).
+    pub(crate) fn ctl_socket_enabled(&self) -> bool {
+        self.isekai.ctl_socket_enabled
     }
 
     /// `{hostname}:{port}` for this destination, using the same

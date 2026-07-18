@@ -25,13 +25,14 @@
 use anyhow::{anyhow, Context, Result};
 use local_ipc_mux::ExclusiveChannel;
 use russh::client;
-use russh_stream_session::{open_channel, SessionKind};
+use russh_stream_session::{open_channel, ForwardRoutes, SessionKind};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::log_file::log_line;
 
+use super::ctl_forward;
 use super::protocol::{read_frame, token_eq, write_frame, Frame, MUX_PROTOCOL_VERSION};
 
 /// Accepts clients on `channel` for the life of the owner process, spawning an
@@ -43,7 +44,12 @@ use super::protocol::{read_frame, token_eq, write_frame, Frame, MUX_PROTOCOL_VER
 /// concurrently. Returns only if `accept` itself fails (the underlying IPC
 /// channel died) — a single client's relay error is logged and contained,
 /// never propagated to sibling clients or the owner's own session.
-pub(crate) async fn serve_clients<C, H>(mut channel: C, handle: Arc<Mutex<client::Handle<H>>>, token: Arc<Vec<u8>>) -> Result<()>
+pub(crate) async fn serve_clients<C, H>(
+    mut channel: C,
+    handle: Arc<Mutex<client::Handle<H>>>,
+    token: Arc<Vec<u8>>,
+    ctl_routes: Option<ForwardRoutes>,
+) -> Result<()>
 where
     C: ExclusiveChannel,
     H: client::Handler + 'static,
@@ -52,8 +58,11 @@ where
         let conn = channel.accept().await.context("isekai-ssh mux owner: accepting a client connection failed")?;
         let handle = handle.clone();
         let token = token.clone();
+        // `Some` iff `#@isekai ctl-socket` is on — each client then gets its
+        // own private per-tab forward (see [`relay_client`]).
+        let ctl_routes = ctl_routes.clone();
         tokio::spawn(async move {
-            if let Err(e) = relay_client(conn, &handle, token.as_slice()).await {
+            if let Err(e) = relay_client(conn, &handle, token.as_slice(), ctl_routes.as_ref()).await {
                 // One client's session ending badly must not disturb the
                 // owner or its other clients (session isolation).
                 log_line!("isekai-ssh mux owner: a client session ended with an error: {e:#}");
@@ -65,7 +74,16 @@ where
 /// Serves exactly one client: reads its [`Frame::Hello`] (validating the
 /// protocol version and auth token), opens a private remote shell channel with
 /// the client's requested PTY geometry, then relays until either side ends.
-pub(crate) async fn relay_client<Conn, H>(conn: Conn, handle: &Mutex<client::Handle<H>>, expected_token: &[u8]) -> Result<()>
+/// When `ctl_routes` is `Some` (`#@isekai ctl-socket` on), also requests a
+/// *private* per-tab streamlocal forward for this client, opens the shell with
+/// `$ISEKAI_CTL_SOCK` exported, and relays each incoming ctl message to the
+/// client as a [`Frame::Ctl`] so it lands on *that* client's own terminal.
+pub(crate) async fn relay_client<Conn, H>(
+    conn: Conn,
+    handle: &Mutex<client::Handle<H>>,
+    expected_token: &[u8],
+    ctl_routes: Option<&ForwardRoutes>,
+) -> Result<()>
 where
     Conn: AsyncRead + AsyncWrite + Unpin + Send,
     H: client::Handler,
@@ -97,23 +115,57 @@ where
         .await
         .context("isekai-ssh mux owner: sending HelloAck failed")?;
 
+    // This client's own private ctl-socket forward (opportunistic: a failed
+    // setup just leaves `ctl` as `None`).
+    let ctl = match ctl_routes {
+        Some(routes) => ctl_forward::request(handle, routes).await,
+        None => None,
+    };
+
     let mut channel = {
         // Lock held only for the open; the relay below runs lock-free so one
         // client's traffic never blocks another's channel open or forward.
         let guard = handle.lock().await;
-        open_channel(&guard, &SessionKind::Shell { term, cols: cols as u32, rows: rows as u32 })
-            .await
-            .context("isekai-ssh mux owner: failed to open a shell channel for the client")?
+        match &ctl {
+            Some(fwd) => ctl_forward::open_login_shell(&guard, &term, cols as u32, rows as u32, &fwd.remote_path)
+                .await
+                .context("isekai-ssh mux owner: failed to open a ctl-socket login shell for the client")?,
+            None => open_channel(&guard, &SessionKind::Shell { term, cols: cols as u32, rows: rows as u32 })
+                .await
+                .context("isekai-ssh mux owner: failed to open a shell channel for the client")?,
+        }
     };
 
-    relay_loop(&mut reader, &mut writer, &mut channel).await
+    // Pump this client's forwarded ctl channels into an mpsc the relay loop
+    // drains and wraps in `Frame::Ctl` (so all owner→client writes stay on the
+    // single relay-loop writer).
+    let ctl_remote_path = ctl.as_ref().map(|fwd| fwd.remote_path.clone());
+    let ctl_frame_rx = ctl.map(|fwd| {
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(ctl_forward::pump_to_frames(fwd.channels, tx));
+        rx
+    });
+
+    let result = relay_loop(&mut reader, &mut writer, &mut channel, ctl_frame_rx).await;
+
+    // Best-effort teardown of this client's forward.
+    if let (Some(path), Some(routes)) = (&ctl_remote_path, ctl_routes) {
+        ctl_forward::cancel(handle, routes, path).await;
+    }
+
+    result
 }
 
 /// The core owner-side relay: client frames drive the remote channel, and
 /// remote channel messages become owner→client frames. See the module docs on
 /// ordering and backpressure — both properties come from this being one
 /// `select!` loop with a single sequential branch per direction.
-async fn relay_loop<R, W>(reader: &mut R, writer: &mut W, channel: &mut russh::Channel<client::Msg>) -> Result<()>
+async fn relay_loop<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    channel: &mut russh::Channel<client::Msg>,
+    mut ctl_frame_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -178,6 +230,22 @@ where
                     _ => {}
                 }
             }
+            ctl = recv_ctl_bytes(&mut ctl_frame_rx) => {
+                match ctl {
+                    // A ctl message this client received over its private
+                    // forward: relay it as a `Frame::Ctl` on the same writer as
+                    // stdout/stderr (so all owner→client writes stay ordered on
+                    // one stream).
+                    Some(bytes) => {
+                        if write_frame(writer, &Frame::Ctl(bytes)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // The ctl pump ended (forward cancelled / all senders gone):
+                    // stop selecting this branch so it doesn't busy-loop.
+                    None => ctl_frame_rx = None,
+                }
+            }
         }
     }
 
@@ -187,6 +255,16 @@ where
     // client already vanished, there's no one to tell.
     let _ = write_frame(writer, &Frame::Exit(exit_code.unwrap_or(255))).await;
     Ok(())
+}
+
+/// `recv` on the optional ctl-frame channel, or a future that never resolves
+/// when there is no ctl forward (so the `select!` branch is simply inert rather
+/// than needing to be conditionally present).
+async fn recv_ctl_bytes(rx: &mut Option<mpsc::UnboundedReceiver<Vec<u8>>>) -> Option<Vec<u8>> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]
@@ -285,7 +363,7 @@ mod tests {
         let token = b"correct-horse-battery-staple".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
 
         // Client sends Hello, then some stdin, then Shutdown.
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"correct-horse-battery-staple".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
@@ -327,7 +405,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION + 1, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
 
@@ -345,7 +423,7 @@ mod tests {
         let token = b"the-real-token".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
 
         write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"a-wrong-token".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
 
@@ -365,7 +443,7 @@ mod tests {
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
-        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token).await });
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, None).await });
 
         write_frame(&mut client, &Frame::Stdin(b"no hello".to_vec())).await.unwrap();
         assert!(relay.await.unwrap().is_err(), "a missing Hello must fail the client relay");

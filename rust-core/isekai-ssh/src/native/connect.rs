@@ -37,8 +37,13 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use isekai_pipe_core::{claim_connect_outcome, default_runtime_dir, ConnectionIntent};
 use russh::client;
-use russh_stream_session::{authenticate_session, establish_over_stream, open_channel, verifying_handler, SessionError, SessionKind};
+use russh_stream_session::{
+    authenticate_session, establish_over_stream, open_channel, verifying_handler_with_routes, ForwardRoutes, SessionError,
+    SessionKind,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use super::mux::ctl_forward;
 
 use crate::log_file::log_line;
 use crate::wrapper::{
@@ -73,7 +78,12 @@ pub(crate) type NativeHandle = client::Handle<russh_stream_session::VerifyingHan
 /// intact for the re-bootstrap retry). Boxed `FnOnce` + `Send` because it
 /// typically `tokio::spawn`s the accept loop.
 pub(crate) type SharedHandle = Arc<tokio::sync::Mutex<NativeHandle>>;
-pub(crate) type OwnerHook = Box<dyn FnOnce(SharedHandle) + Send>;
+/// Receives the shared handle plus, when `#@isekai ctl-socket` is enabled for
+/// this invocation, the [`ForwardRoutes`] the connection's handler dispatches
+/// forwarded-streamlocal channels through — so the owner can set up a *private*
+/// per-tab ctl forward for each mux client (M5). `None` means ctl-socket is off
+/// and no per-client forward should be requested.
+pub(crate) type OwnerHook = Box<dyn FnOnce(SharedHandle, Option<ForwardRoutes>) + Send>;
 
 /// Everything [`run_prepared`] needs, resolved once up front so the mux
 /// dispatch ([`super::mux::run`]) can compute the channel name from the same
@@ -345,7 +355,12 @@ async fn connect_attempt(
     });
     let verifier = Arc::new(FileBackedHostKeyVerifier::new(store_path, host_port.clone(), confirm_new_host));
 
-    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier)
+    // The ctl-socket route table the handler dispatches forwarded-streamlocal
+    // channels through — one per connection, shared by this process's own
+    // foreground shell and (via the owner hook) every mux client's per-tab
+    // forward. Built before the handshake so it can be installed on the handler.
+    let forward_routes = ForwardRoutes::new();
+    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier, &forward_routes)
         .await
         .with_context(|| format!("isekai-ssh: failed to connect to {username}@{host_port}"))?;
 
@@ -355,29 +370,55 @@ async fn connect_attempt(
     // be called for the ctl-socket forward (M5).
     let handle: SharedHandle = Arc::new(tokio::sync::Mutex::new(handle));
 
+    let ctl_enabled = ctl_forward::should_forward(plan, resolution);
+
     // The SSH session is now authenticated. If this is the mux owner path,
     // hand a shared clone of the handle to the accept loop so sibling tabs can
     // start opening their own channels while this process also drives its own
-    // foreground shell below. Reached only on success, so a failed attempt
-    // (which returns above) never consumes the hook — it stays available for
-    // the always-connects re-bootstrap retry.
+    // foreground shell below. When ctl-socket is enabled, also hand over the
+    // route table so each client gets its own private forward. Reached only on
+    // success, so a failed attempt (which returns above) never consumes the
+    // hook — it stays available for the always-connects re-bootstrap retry.
     if let Some(hook) = owner_hook {
-        hook(handle.clone());
+        hook(handle.clone(), ctl_enabled.then(|| forward_routes.clone()));
     }
 
     let (cols, rows) = console::terminal_size();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+
+    // This process's own foreground shell's ctl-socket forward (owner or
+    // single-process). Opportunistic: a forward that fails to set up just
+    // leaves `ctl` as `None` and the shell opens without it.
+    let ctl = if ctl_enabled { ctl_forward::request(&handle, &forward_routes).await } else { None };
+
     let mut channel = {
         // Held only for the open; released before the I/O loop so sibling
         // channels and forwards aren't blocked behind this session's traffic.
         let guard = handle.lock().await;
-        open_channel(&guard, &SessionKind::Shell { term, cols, rows })
-            .await
-            .context("isekai-ssh: failed to open a shell channel")?
+        match &ctl {
+            Some(fwd) => ctl_forward::open_login_shell(&guard, &term, cols, rows, &fwd.remote_path)
+                .await
+                .context("isekai-ssh: failed to open a ctl-socket login shell")?,
+            None => open_channel(&guard, &SessionKind::Shell { term, cols, rows })
+                .await
+                .context("isekai-ssh: failed to open a shell channel")?,
+        }
     };
+
+    // Apply ctl messages this tab receives over its forward directly to the
+    // local terminal (OSC title/clipboard on stderr).
+    let ctl_remote_path = ctl.as_ref().map(|fwd| fwd.remote_path.clone());
+    if let Some(fwd) = ctl {
+        tokio::spawn(ctl_forward::pump_to_stderr(fwd.channels));
+    }
 
     let _raw_mode = console::RawModeGuard::enable().context("isekai-ssh: failed to enable raw terminal mode")?;
     let exit_code = run_shell_io_loop(&mut channel).await?;
+
+    // Best-effort teardown of this tab's forward before the handle is dropped.
+    if let Some(path) = &ctl_remote_path {
+        ctl_forward::cancel(&handle, &forward_routes, path).await;
+    }
 
     // Keeps the compiler from complaining that `handle`/`child` are unused
     // past this point — both must stay alive for the duration of the I/O loop
@@ -441,13 +482,18 @@ async fn connect_and_authenticate<S, V>(
     username: &str,
     host_config: &openssh_config::HostConfig,
     verifier: &Arc<V>,
+    forward_routes: &ForwardRoutes,
 ) -> Result<client::Handle<russh_stream_session::VerifyingHandler<V>>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     V: russh_stream_session::HostKeyVerifier + 'static,
 {
     let config = Arc::new(client::Config::default());
-    let handler = verifying_handler(verifier);
+    // Install the ctl-socket route table on the handler so server-initiated
+    // `forwarded-streamlocal` channels (from `streamlocal_forward` below) are
+    // delivered in-process. Harmless (and unused) when ctl-socket is off — no
+    // forward is ever requested, so no channel is ever routed.
+    let handler = verifying_handler_with_routes(verifier, forward_routes);
     let mut handle = establish_over_stream(config, stream, handler).await?;
 
     let home = isekai_fs_guard::resolve_home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -611,7 +657,7 @@ mod tests {
     use russh::{Channel as RusshChannel, CryptoVec};
     use russh_keys::ssh_key::private::{Ed25519Keypair, PrivateKey as SshPrivateKey};
     use russh_keys::ssh_key::{LineEnding, PublicKey as SshPublicKey};
-    use russh_stream_session::{Credential, HostKeyVerifier};
+    use russh_stream_session::{verifying_handler, Credential, HostKeyVerifier};
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
@@ -837,7 +883,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
         assert!(result.is_err(), "no identity file and no agent means nothing to authenticate with");
     }
 
@@ -848,7 +894,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
         assert!(result.is_err(), "a rejected host key must fail the connection before any auth attempt");
     }
 
@@ -948,7 +994,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, second_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
         assert!(
             result.is_ok(),
             "the second configured identity is accepted, so the connection must succeed despite the first being rejected"
@@ -973,7 +1019,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![garbage, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
         assert!(result.is_ok(), "an unparseable first identity (InvalidPrivateKey) must not block the valid second one");
     }
 
@@ -996,7 +1042,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, unreadable], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
         assert!(
             result.is_ok(),
             "a readable, accepted first key must authenticate; an unreadable *later* candidate must not abort the attempt"
@@ -1017,7 +1063,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![unreadable, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
         assert!(result.is_ok(), "an unreadable first candidate must be skipped, then the valid second one authenticates");
     }
 

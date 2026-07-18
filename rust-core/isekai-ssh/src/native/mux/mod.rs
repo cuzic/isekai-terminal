@@ -63,6 +63,7 @@
 //! left as follow-up work.
 
 pub(crate) mod client;
+pub(crate) mod ctl_forward;
 pub(crate) mod naming;
 pub(crate) mod owner;
 pub(crate) mod protocol;
@@ -123,9 +124,9 @@ where
 {
     let token = Arc::new(write_owner_token(token_path)?);
     let cleanup_path = token_path.to_path_buf();
-    let hook: OwnerHook = Box::new(move |handle| {
+    let hook: OwnerHook = Box::new(move |handle, ctl_routes| {
         tokio::spawn(async move {
-            if let Err(e) = owner::serve_clients(owner_channel, handle, token).await {
+            if let Err(e) = owner::serve_clients(owner_channel, handle, token, ctl_routes).await {
                 log_line!("isekai-ssh mux owner: the client accept loop ended: {e:#}");
             }
         });
@@ -282,7 +283,7 @@ mod tests {
         let owner_channel = InMemoryChannel::try_claim(name).await.unwrap();
         let serve_token = token.clone();
         tokio::spawn(async move {
-            let _ = owner::serve_clients(owner_channel, Arc::new(tokio::sync::Mutex::new(handle)), serve_token).await;
+            let _ = owner::serve_clients(owner_channel, Arc::new(tokio::sync::Mutex::new(handle)), serve_token, None).await;
         });
 
         // A second try_claim must fail (owner exists) — the real dispatch's
