@@ -469,21 +469,25 @@ pub(crate) fn decide_connect_failure_recovery(connect_failure_signaled: bool, sh
 /// `ProxyCommand` grandchild, has exited, which is what makes inspecting a
 /// side-channel file in `runtime_dir` immediately afterward both correct
 /// and zero-cost to this stdio wiring (`run_ssh_with_connect_failure_recovery`).
-async fn run_ssh_once(
+/// Prepares the opportunistic `#@isekai ctl-socket` `-R` forward (if enabled
+/// and the session is interactive) and appends the ssh(1) args in the right
+/// order: any `-R` option *before* the destination, then the destination and
+/// its args, then the `export ISEKAI_CTL_SOCK=...` remote command *after* it.
+/// Unix-only — this is the `ssh(1)` ProxyCommand path; the Windows-native path
+/// handles ctl-socket on its own `russh` handle (`native/mux/ctl_forward.rs`).
+#[cfg(unix)]
+async fn apply_ctl_socket_forward(
+    command: &mut Command,
     plan: &WrapperPlan,
     resolution: &WrapperResolution,
-    intent: &ConnectionIntent,
     runtime_dir: &Path,
-) -> Result<(std::process::ExitStatus, String)> {
-    write_connection_intent(runtime_dir, intent)?;
-    let proxy_command = proxy_command(&plan.pipe_path, &resolution.isekai.profile, &plan.openssh_path);
-
+) {
     let ctl_forward = if crate::ctl_forward::should_attempt_ctl_forward(
         resolution.isekai.ctl_socket_enabled,
         plan.ssh_args.len(),
         plan.destination_index,
     ) {
-        match crate::ctl_forward::prepare_ctl_forward(&runtime_dir) {
+        match crate::ctl_forward::prepare_ctl_forward(runtime_dir) {
             Ok(mut forward) => {
                 crate::ctl_forward::spawn_ctl_listener(&mut forward).await;
                 Some(forward)
@@ -499,23 +503,43 @@ async fn run_ssh_once(
         None
     };
 
+    if let Some(forward) = &ctl_forward {
+        // `-R` is an ssh(1) option, so it must precede the destination
+        // (`plan.ssh_args`'s last element, per `should_attempt_ctl_forward`).
+        command.args(crate::ctl_forward::forward_option_args(forward));
+    }
+    command.args(&plan.ssh_args);
+    if let Some(forward) = &ctl_forward {
+        // Anything appended after the destination is the remote command, not
+        // an option, to ssh(1).
+        command.arg(crate::ctl_forward::remote_command_arg(forward));
+    }
+}
+
+async fn run_ssh_once(
+    plan: &WrapperPlan,
+    resolution: &WrapperResolution,
+    intent: &ConnectionIntent,
+    runtime_dir: &Path,
+) -> Result<(std::process::ExitStatus, String)> {
+    write_connection_intent(runtime_dir, intent)?;
+    let proxy_command = proxy_command(&plan.pipe_path, &resolution.isekai.profile, &plan.openssh_path);
+
     let mut command = Command::new(&plan.openssh_path);
     command
         .env("ISEKAI_INTENT_ID", &intent.intent_id)
         .env("ISEKAI_PIPE_RUNTIME_DIR", runtime_dir)
         .arg("-o")
         .arg(format!("ProxyCommand={proxy_command}"));
-    if let Some(forward) = &ctl_forward {
-        // `-R` is an ssh(1) option, so it must precede the destination
-        // (`plan.ssh_args`'s last element, per `should_attempt_ctl_forward`)
-        // — anything appended after the destination is the remote command,
-        // not an option, to ssh(1).
-        command.args(crate::ctl_forward::forward_option_args(forward));
-    }
+    // The `#@isekai ctl-socket` `-R` forward needs a real local UNIX-socket
+    // listener bound before the destination arg, so it is Unix-only. The
+    // Windows-native path never reaches this function — it's `russh`-based and
+    // forwards streamlocal in-process (see `ctl_forward.rs`'s module docs and
+    // `native/mux/ctl_forward.rs`).
+    #[cfg(unix)]
+    apply_ctl_socket_forward(&mut command, plan, resolution, runtime_dir).await;
+    #[cfg(not(unix))]
     command.args(&plan.ssh_args);
-    if let Some(forward) = &ctl_forward {
-        command.arg(crate::ctl_forward::remote_command_arg(forward));
-    }
     // stdin/stdout always stay `Stdio::inherit()`ed — piping either would
     // break `ssh(1)`'s own `isatty()`-based PTY/interactive-terminal
     // behavior (`log_file.rs`'s module docs). stderr is the one stream this
