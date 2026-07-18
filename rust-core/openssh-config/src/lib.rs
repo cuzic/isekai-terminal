@@ -123,6 +123,7 @@ fn resolve_from_file(
             continue;
         }
         let (keyword, rest) = split_keyword(line);
+        let rest = strip_inline_comment(rest);
         let lower = keyword.to_ascii_lowercase();
         match lower.as_str() {
             // Include splices the referenced file's lines in at this exact
@@ -229,6 +230,32 @@ fn split_keyword(line: &str) -> (&str, &str) {
 
 fn split_words(input: &str) -> impl Iterator<Item = String> + '_ {
     input.split_whitespace().map(str::to_string)
+}
+
+/// Strips a trailing inline comment from a value and trims the result.
+/// Matches OpenSSH's tokenizer, which only starts a comment at a `#` that
+/// begins outside any quoted span and sits at a token boundary (i.e. is
+/// preceded by whitespace or the start of the value) — so `#` embedded in a
+/// bare token (`/path/with#hash`) or inside quotes (`"/path/with #hash"`) is
+/// preserved as a literal.
+fn strip_inline_comment(value: &str) -> &str {
+    let mut quote: Option<u8> = None;
+    let mut prev_ws = true;
+    for (i, &b) in value.as_bytes().iter().enumerate() {
+        match b {
+            b'\'' | b'"' => {
+                match quote {
+                    Some(q) if q == b => quote = None,
+                    Some(_) => {}
+                    None => quote = Some(b),
+                }
+                prev_ws = false;
+            }
+            b'#' if quote.is_none() && prev_ws => return value[..i].trim_end(),
+            _ => prev_ws = b.is_ascii_whitespace(),
+        }
+    }
+    value
 }
 
 fn strip_quotes(value: &str) -> &str {
@@ -612,6 +639,36 @@ Host example
         let config = resolve(&path, "example").unwrap();
         assert_eq!(config.user.as_deref(), Some("alice"));
         assert_eq!(config.port, Some(2222));
+    }
+
+    #[test]
+    fn inline_comments_are_stripped_from_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host example
+    Port 2222 # bastion override
+    User alice # work note
+    HostName example.com#not-a-comment
+    IdentityFile \"/path/with #hash/id_ed25519\"
+");
+        let config = resolve(&path, "example").unwrap();
+        // A `#` after whitespace ends the value (would otherwise leave Port
+        // unparseable and silently None, and User a broken string).
+        assert_eq!(config.port, Some(2222));
+        assert_eq!(config.user.as_deref(), Some("alice"));
+        // A `#` mid-token (no preceding whitespace) is a literal, not a comment.
+        assert_eq!(config.host_name.as_deref(), Some("example.com#not-a-comment"));
+        // A `#` inside quotes is a literal and the quotes are still stripped.
+        assert_eq!(config.identity_file, vec![PathBuf::from("/path/with #hash/id_ed25519")]);
+    }
+
+    #[test]
+    fn strip_inline_comment_edge_cases() {
+        assert_eq!(strip_inline_comment("2222 # comment"), "2222");
+        assert_eq!(strip_inline_comment("alice"), "alice");
+        assert_eq!(strip_inline_comment("a#b"), "a#b");
+        assert_eq!(strip_inline_comment("'quoted # hash'"), "'quoted # hash'");
+        assert_eq!(strip_inline_comment("value\t#tab-before-comment"), "value");
     }
 
     #[test]
