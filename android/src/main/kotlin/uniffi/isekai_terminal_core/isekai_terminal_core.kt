@@ -1299,7 +1299,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired() != 26224) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background() != 63526) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background() != 56561) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
@@ -2926,8 +2926,10 @@ public interface SessionOrchestratorInterface {
      * Androidの`ProcessLifecycleOwner.onStop`相当)ことを通知する。`budget_ms`は
      * `beginBackgroundTask`等が保証する猶予の目安として記録目的で受け取るが、
      * 実際の期限管理(タイマー)はSwift/Kotlin側の責務のままにする(Rust/Swiftで
-     * 基準時計を共有していないため)。`Connected`中のみ猶予追跡を開始する
-     * (未接続/接続試行中のバックグラウンド化は維持すべきセッションが無いので無視)。
+     * 基準時計を共有していないため)。`Connected`または`Connecting`中のみ猶予追跡を
+     * 開始する(`Idle`は維持すべきセッションが無いので無視。`Connecting`中に
+     * バックグラウンド化し、その猶予中に接続が成立するケース(`on_connected()`
+     * 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
      */
     fun `notifyDidEnterBackground`(`budgetMs`: kotlin.UInt)
     
@@ -3317,8 +3319,10 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
      * Androidの`ProcessLifecycleOwner.onStop`相当)ことを通知する。`budget_ms`は
      * `beginBackgroundTask`等が保証する猶予の目安として記録目的で受け取るが、
      * 実際の期限管理(タイマー)はSwift/Kotlin側の責務のままにする(Rust/Swiftで
-     * 基準時計を共有していないため)。`Connected`中のみ猶予追跡を開始する
-     * (未接続/接続試行中のバックグラウンド化は維持すべきセッションが無いので無視)。
+     * 基準時計を共有していないため)。`Connected`または`Connecting`中のみ猶予追跡を
+     * 開始する(`Idle`は維持すべきセッションが無いので無視。`Connecting`中に
+     * バックグラウンド化し、その猶予中に接続が成立するケース(`on_connected()`
+     * 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
      */override fun `notifyDidEnterBackground`(`budgetMs`: kotlin.UInt)
         = 
     callWithHandle {
@@ -3676,6 +3680,18 @@ data class CellData (
     var `bg`: kotlin.UInt
     , 
     var `bold`: kotlin.Boolean
+    , 
+    var `dim`: kotlin.Boolean
+    , 
+    var `italic`: kotlin.Boolean
+    , 
+    var `underline`: kotlin.Boolean
+    , 
+    var `strikethrough`: kotlin.Boolean
+    , 
+    var `blink`: kotlin.Boolean
+    , 
+    var `invisible`: kotlin.Boolean
     
 ){
     
@@ -3696,6 +3712,12 @@ public object FfiConverterTypeCellData: FfiConverterRustBuffer<CellData> {
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -3703,7 +3725,13 @@ public object FfiConverterTypeCellData: FfiConverterRustBuffer<CellData> {
             FfiConverterString.allocationSize(value.`ch`) +
             FfiConverterUInt.allocationSize(value.`fg`) +
             FfiConverterUInt.allocationSize(value.`bg`) +
-            FfiConverterBoolean.allocationSize(value.`bold`)
+            FfiConverterBoolean.allocationSize(value.`bold`) +
+            FfiConverterBoolean.allocationSize(value.`dim`) +
+            FfiConverterBoolean.allocationSize(value.`italic`) +
+            FfiConverterBoolean.allocationSize(value.`underline`) +
+            FfiConverterBoolean.allocationSize(value.`strikethrough`) +
+            FfiConverterBoolean.allocationSize(value.`blink`) +
+            FfiConverterBoolean.allocationSize(value.`invisible`)
     )
 
     override fun write(value: CellData, buf: ByteBuffer) {
@@ -3711,6 +3739,12 @@ public object FfiConverterTypeCellData: FfiConverterRustBuffer<CellData> {
             FfiConverterUInt.write(value.`fg`, buf)
             FfiConverterUInt.write(value.`bg`, buf)
             FfiConverterBoolean.write(value.`bold`, buf)
+            FfiConverterBoolean.write(value.`dim`, buf)
+            FfiConverterBoolean.write(value.`italic`, buf)
+            FfiConverterBoolean.write(value.`underline`, buf)
+            FfiConverterBoolean.write(value.`strikethrough`, buf)
+            FfiConverterBoolean.write(value.`blink`, buf)
+            FfiConverterBoolean.write(value.`invisible`, buf)
     }
 }
 

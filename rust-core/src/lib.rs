@@ -565,6 +565,12 @@ pub struct CellData {
     pub fg: u32,
     pub bg: u32,
     pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+    pub blink: bool,
+    pub invisible: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]

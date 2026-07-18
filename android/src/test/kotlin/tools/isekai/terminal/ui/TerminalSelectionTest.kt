@@ -13,7 +13,11 @@ class TerminalSelectionTest {
         val chars = text.toList()
         return (0 until cols).map { i ->
             val ch = chars.getOrNull(i)?.toString() ?: " "
-            CellData(ch = ch, fg = 0xFFFFFFFFu, bg = 0xFF000000u, bold = false)
+            CellData(
+                ch = ch, fg = 0xFFFFFFFFu, bg = 0xFF000000u, bold = false,
+                dim = false, italic = false, underline = false,
+                strikethrough = false, blink = false, invisible = false,
+            )
         }
     }
 

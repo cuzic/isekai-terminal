@@ -1748,14 +1748,26 @@ public struct CellData: Equatable, Hashable {
     public var fg: UInt32
     public var bg: UInt32
     public var bold: Bool
+    public var dim: Bool
+    public var italic: Bool
+    public var underline: Bool
+    public var strikethrough: Bool
+    public var blink: Bool
+    public var invisible: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(ch: String, fg: UInt32, bg: UInt32, bold: Bool) {
+    public init(ch: String, fg: UInt32, bg: UInt32, bold: Bool, dim: Bool, italic: Bool, underline: Bool, strikethrough: Bool, blink: Bool, invisible: Bool) {
         self.ch = ch
         self.fg = fg
         self.bg = bg
         self.bold = bold
+        self.dim = dim
+        self.italic = italic
+        self.underline = underline
+        self.strikethrough = strikethrough
+        self.blink = blink
+        self.invisible = invisible
     }
 
     
@@ -1777,7 +1789,13 @@ public struct FfiConverterTypeCellData: FfiConverterRustBuffer {
                 ch: FfiConverterString.read(from: &buf), 
                 fg: FfiConverterUInt32.read(from: &buf), 
                 bg: FfiConverterUInt32.read(from: &buf), 
-                bold: FfiConverterBool.read(from: &buf)
+                bold: FfiConverterBool.read(from: &buf), 
+                dim: FfiConverterBool.read(from: &buf), 
+                italic: FfiConverterBool.read(from: &buf), 
+                underline: FfiConverterBool.read(from: &buf), 
+                strikethrough: FfiConverterBool.read(from: &buf), 
+                blink: FfiConverterBool.read(from: &buf), 
+                invisible: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -1786,6 +1804,12 @@ public struct FfiConverterTypeCellData: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.fg, into: &buf)
         FfiConverterUInt32.write(value.bg, into: &buf)
         FfiConverterBool.write(value.bold, into: &buf)
+        FfiConverterBool.write(value.dim, into: &buf)
+        FfiConverterBool.write(value.italic, into: &buf)
+        FfiConverterBool.write(value.underline, into: &buf)
+        FfiConverterBool.write(value.strikethrough, into: &buf)
+        FfiConverterBool.write(value.blink, into: &buf)
+        FfiConverterBool.write(value.invisible, into: &buf)
     }
 }
 

@@ -28,7 +28,11 @@ class SshTerminalCanvasTest {
 
     private val defaultBg = 0xFF000000.toInt()
 
-    private fun cell(bg: Int) = CellData(ch = " ", fg = 0xFFFFFFFFu, bg = bg.toUInt(), bold = false)
+    private fun cell(bg: Int) = CellData(
+        ch = " ", fg = 0xFFFFFFFFu, bg = bg.toUInt(), bold = false,
+        dim = false, italic = false, underline = false,
+        strikethrough = false, blink = false, invisible = false,
+    )
 
     @Test
     fun `all default background produces no runs`() {
