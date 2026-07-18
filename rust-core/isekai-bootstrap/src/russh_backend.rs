@@ -47,9 +47,10 @@ use isekai_protocol::bootstrap::{
     validate_remote_path, HANDSHAKE_POLL_ATTEMPTS, HANDSHAKE_POLL_INTERVAL_MS, ISEKAI_PIPE_BIN_NAME,
     ISEKAI_PIPE_INSTALL_DIR,
 };
+use isekai_trust::FileBackedHostKeyVerifier;
 use russh::client;
 use russh_stream_session::{
-    authenticate_session, connect_via_jump_or_direct, open_channel, verifying_handler, Credential, HostKeyVerifier,
+    authenticate_session, connect_via_jump_or_direct, open_channel, verifying_handler, ConnectionLeg, Credential,
     JumpHost, Session, SessionKind, VerifyingHandler,
 };
 
@@ -126,6 +127,33 @@ impl RusshBackend {
     /// caller with no explicit `--helper-binary` pick which pre-built
     /// `isekai-pipe` variant to fetch before ever calling
     /// `install_and_start`).
+    ///
+    /// Known redundancy (deferred follow-up, Codex review finding 5): on the
+    /// auto-download path, `helper_download::resolve_helper_binary` calls this
+    /// (connection #1) and then, *after downloading the matching binary from
+    /// GitHub*, the caller (`wrapper::bootstrap_and_register`/`init::run`)
+    /// calls `install_and_start` (connection #2) — two full TCP+KEX+user-auth
+    /// (+jump-tunnel) round-trips against the same target for one bootstrap.
+    /// This was left as-is deliberately, not overlooked, for three reasons.
+    /// First, it is not a `RusshBackend` defect but the shape of the whole
+    /// detect-arch → download → install sequence: the already-hardened
+    /// `OpenSshBackend` does exactly the same thing (two independent `ssh`
+    /// subprocesses, `openssh.rs`'s `detect_remote_arch` vs.
+    /// `install_and_launch`), so collapsing it in `RusshBackend` alone would
+    /// make the two backends' connection models diverge. Second, the two
+    /// connections straddle a potentially long GitHub asset download; caching
+    /// a live authenticated session across that window (behind a `Mutex` in
+    /// `self`) would turn a stateless backend into one holding a connection
+    /// that can silently die mid-download, needing a liveness-check +
+    /// reconnect fallback anyway — extra state and a new failure mode for
+    /// modest gain. Third, the gain really is modest: no *double* host-key
+    /// TOFU prompt occurs (connection #1 persists trust, so connection #2
+    /// sees a known host and never prompts), so the only saving is one extra
+    /// handshake.
+    /// The clean fix — download first, then a single connection that does both
+    /// `uname -m` and the install — belongs in `resolve_helper_binary` and its
+    /// callers (`wrapper.rs`/`init.rs`), and would fix both backends at once;
+    /// it is out of scope for this `russh_backend.rs`-local change set.
     pub async fn detect_remote_arch(&self, target: &HostSpec, via: &[JumpSpec]) -> Result<String, BootstrapError> {
         let session = self.connect_and_authenticate(target, via).await?;
         let out = run_russh_command(&session.handle, "uname -m", &[]).await?;
@@ -169,6 +197,7 @@ impl RusshBackend {
             self.store_path.clone(),
             target_host_port,
             self.confirm_new_host.clone(),
+            "isekai-bootstrap",
         ));
 
         let jump = match via.first() {
@@ -180,6 +209,7 @@ impl RusshBackend {
                     self.store_path.clone(),
                     jump_host_port,
                     self.confirm_new_host.clone(),
+                    "isekai-bootstrap",
                 ));
                 Some((
                     JumpHost {
@@ -194,19 +224,20 @@ impl RusshBackend {
             None => None,
         };
 
-        // `new_handler` is called once per connection leg by
-        // `connect_via_jump_or_direct`: the *first* call is always the jump
-        // leg when `jump` is `Some` (never the direct/no-jump case, which
-        // makes exactly one call for the target itself) — see that
-        // function's own body/docs.
-        let mut leg = 0u8;
+        // `connect_via_jump_or_direct` tells us explicitly which leg it's
+        // building a handler for, so we pick the matching per-host verifier
+        // from the `ConnectionLeg` value rather than counting calls — a
+        // future change to that function's internal connection sequence
+        // (a retry, a probe) can't silently pair a host with the wrong
+        // trust-store entry.
         let jump_verifier_for_closure = jump.as_ref().map(|(_, v)| v.clone());
         let target_verifier_for_closure = target_verifier.clone();
-        let new_handler = move || {
-            leg += 1;
-            let verifier = match (&jump_verifier_for_closure, leg) {
-                (Some(jump_verifier), 1) => jump_verifier.clone(),
-                _ => target_verifier_for_closure.clone(),
+        let new_handler = move |leg| {
+            let verifier = match leg {
+                ConnectionLeg::Jump => jump_verifier_for_closure
+                    .clone()
+                    .expect("connect_via_jump_or_direct only builds a Jump leg when a JumpHost was passed"),
+                ConnectionLeg::Target => target_verifier_for_closure.clone(),
             };
             verifying_handler(&verifier)
         };
@@ -281,7 +312,7 @@ async fn resolve_hop(
         Some(path) => vec![path.to_path_buf()],
         None => {
             let home = isekai_fs_guard::resolve_home_dir().ok_or(BootstrapError::NoHomeDir)?;
-            identity_file_candidates(&host_config.identity_file, &home)
+            isekai_fs_guard::identity_file_candidates(&host_config.identity_file, &home)
         }
     };
     let credential = load_first_existing(&candidates)
@@ -294,18 +325,13 @@ fn local_username() -> Option<String> {
     std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok())
 }
 
-/// Default `IdentityFile` probe order tried when the config specifies none
-/// explicitly — mirrors `isekai-ssh::native::private_key`'s identically
-/// named constant (`id_ed25519` → `id_rsa` → `id_ecdsa`).
-const DEFAULT_IDENTITY_FILE_NAMES: &[&str] = &["id_ed25519", "id_rsa", "id_ecdsa"];
-
-fn identity_file_candidates(configured: &[PathBuf], home: &Path) -> Vec<PathBuf> {
-    if !configured.is_empty() {
-        return configured.to_vec();
-    }
-    DEFAULT_IDENTITY_FILE_NAMES.iter().map(|name| home.join(".ssh").join(name)).collect()
-}
-
+/// Reads the first candidate in `candidates` that exists on disk and wraps
+/// it in a [`Credential::PublicKey`] — the ~10-line thin loader half of
+/// `IdentityFile` handling. The candidate *ordering* it consumes comes from
+/// the shared [`isekai_fs_guard::identity_file_candidates`]; only this
+/// `std::fs::read` + `Credential` wrapping stays here (and, identically, in
+/// `isekai-ssh::native::private_key`), since `isekai-fs-guard` deliberately
+/// doesn't depend on `russh-stream-session`/`Credential`.
 fn load_first_existing(candidates: &[PathBuf]) -> Result<Credential, String> {
     for path in candidates {
         match std::fs::read(path) {
@@ -338,144 +364,6 @@ fn prompt_new_host_confirmation(fingerprint: &str) -> bool {
         return false;
     }
     matches!(line.trim(), "yes" | "y" | "Y")
-}
-
-// ── Host-key TOFU (duplicated from `isekai-ssh::native::host_key_trust`) ──
-
-/// Implements `russh_stream_session::HostKeyVerifier` backed by
-/// `isekai_trust::SshHostKeyTrustStore` — TOFU semantics deliberately mirror
-/// `ssh(1)`, not a simpler "always trust" shortcut. See
-/// `isekai-ssh::native::host_key_trust`'s module docs for the full
-/// rationale (known/matching → silently accept+refresh; known/mismatched →
-/// silently reject, no prompt; unknown → `confirm_new_host` decides) — this
-/// is a verbatim duplicate of that logic (see this module's own docs for
-/// why it isn't shared instead).
-struct FileBackedHostKeyVerifier {
-    store_path: PathBuf,
-    host_port: String,
-    confirm_new_host: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-}
-
-impl FileBackedHostKeyVerifier {
-    fn new(store_path: PathBuf, host_port: String, confirm_new_host: Arc<dyn Fn(&str) -> bool + Send + Sync>) -> Self {
-        Self { store_path, host_port, confirm_new_host }
-    }
-}
-
-enum Resolved {
-    Decided(bool),
-    NeedsConfirmation,
-    Failed,
-}
-
-#[async_trait]
-impl HostKeyVerifier for FileBackedHostKeyVerifier {
-    async fn verify(&self, fingerprint: &str) -> bool {
-        match self.resolve_locked(fingerprint, false).await {
-            Resolved::Decided(accepted) => return accepted,
-            Resolved::NeedsConfirmation => {}
-            Resolved::Failed => return false,
-        }
-
-        let confirm_new_host = self.confirm_new_host.clone();
-        let fingerprint_owned = fingerprint.to_string();
-        let confirmed = match tokio::task::spawn_blocking(move || confirm_new_host(&fingerprint_owned)).await {
-            Ok(confirmed) => confirmed,
-            Err(join_error) => {
-                log::error!("isekai-bootstrap: SSH host key confirmation task panicked, rejecting connection: {join_error}");
-                return false;
-            }
-        };
-        if !confirmed {
-            return false;
-        }
-
-        match self.resolve_locked(fingerprint, true).await {
-            Resolved::Decided(accepted) => accepted,
-            Resolved::NeedsConfirmation => unreachable!("insert_if_unknown: true never returns NeedsConfirmation"),
-            Resolved::Failed => false,
-        }
-    }
-}
-
-impl FileBackedHostKeyVerifier {
-    async fn resolve_locked(&self, fingerprint: &str, insert_if_unknown: bool) -> Resolved {
-        let store_path = self.store_path.clone();
-        let host_port = self.host_port.clone();
-        let fingerprint = fingerprint.to_string();
-
-        let outcome = tokio::task::spawn_blocking(move || {
-            isekai_trust::with_locked_ssh_host_key_trust_store(&store_path, |store| {
-                match store.get(&host_port) {
-                    Some(known) if known.fingerprint == fingerprint => {
-                        let mut updated = known.clone();
-                        updated.last_seen_at = now_rfc3339();
-                        store.insert(host_port.clone(), updated);
-                        Ok(Resolved::Decided(true))
-                    }
-                    Some(known) => {
-                        log::error!(
-                            "isekai-bootstrap: host key for {host_port} changed (trusted {}, saw {fingerprint}) \
-                             — refusing to connect. If this change is expected (e.g. you redeployed), \
-                             remove the \"{host_port}\" entry from {} and reconnect.",
-                            known.fingerprint,
-                            store_path.display(),
-                        );
-                        Ok(Resolved::Decided(false))
-                    }
-                    None if insert_if_unknown => {
-                        let now = now_rfc3339();
-                        store.insert(
-                            host_port.clone(),
-                            isekai_trust::SshHostKeyTrust { fingerprint: fingerprint.clone(), trusted_at: now.clone(), last_seen_at: now },
-                        );
-                        Ok(Resolved::Decided(true))
-                    }
-                    None => Ok(Resolved::NeedsConfirmation),
-                }
-            })
-        })
-        .await;
-
-        match outcome {
-            Ok(Ok(resolved)) => resolved,
-            Ok(Err(e)) => {
-                log::warn!("isekai-bootstrap: SSH host key trust store operation failed, rejecting connection: {e}");
-                Resolved::Failed
-            }
-            Err(join_error) => {
-                log::error!("isekai-bootstrap: SSH host key trust check task panicked, rejecting connection: {join_error}");
-                Resolved::Failed
-            }
-        }
-    }
-}
-
-fn now_rfc3339() -> String {
-    // A fourth copy of the same tiny RFC3339 formatter this codebase
-    // deliberately keeps duplicated per module rather than shared — see
-    // `isekai-ssh::wrapper.rs:895-897`'s doc comment for the established
-    // rationale this follows.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let days = secs / 86_400;
-    let time_of_day = secs % 86_400;
-    let (h, m, s) = (time_of_day / 3600, (time_of_day % 3600) / 60, time_of_day % 60);
-    let (y, mo, d) = civil_from_days(days as i64);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
-}
-
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 // ── exec-channel command runner ────────────────────────────────────────
@@ -529,7 +417,14 @@ async fn run_russh_command<H: client::Handler>(
             // trusted (see this function's own docs).
             russh::ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
             russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status as i32),
-            russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+            // Only `Close` (or the loop naturally ending when `wait()`
+            // returns `None`) terminates the receive loop — deliberately
+            // NOT `Eof`. A server is free to send `CHANNEL_EOF` before the
+            // `exit-status` channel request, and breaking on `Eof` would
+            // drop that later `ExitStatus`, spuriously reporting `status:
+            // None` for a command whose stdout already arrived correctly
+            // (e.g. `detect_remote_arch`'s `uname -m` probe).
+            russh::ChannelMsg::Close => break,
             _ => {}
         }
     }
@@ -758,25 +653,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_file_candidates_uses_configured_when_non_empty() {
-        let configured = vec![PathBuf::from("/custom/key")];
-        assert_eq!(identity_file_candidates(&configured, Path::new("/home/alice")), configured);
-    }
-
-    #[test]
-    fn identity_file_candidates_falls_back_to_default_probe_order() {
-        let candidates = identity_file_candidates(&[], Path::new("/home/alice"));
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/home/alice/.ssh/id_ed25519"),
-                PathBuf::from("/home/alice/.ssh/id_rsa"),
-                PathBuf::from("/home/alice/.ssh/id_ecdsa"),
-            ]
-        );
-    }
-
-    #[test]
     fn load_first_existing_skips_missing_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
@@ -813,5 +689,116 @@ mod tests {
     fn normalize_uname_arch_rejects_unknown_architectures() {
         let err = normalize_uname_arch("riscv64\n").unwrap_err();
         assert!(matches!(err, BootstrapError::UnsupportedArch(ref a) if a == "riscv64"));
+    }
+
+    // ── Finding 1 regression: `Eof` before `exit-status` ────────────────
+
+    use russh::server::{self, Auth, Msg as ServerMsg, Server as _, Session as ServerSession};
+    use russh::{Channel as RusshChannel, ChannelId, CryptoVec};
+    use russh_keys::ssh_key::private::Ed25519Keypair;
+    use russh_keys::PrivateKey;
+    use russh_stream_session::HostKeyVerifier;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    struct AcceptAllHostKeys;
+
+    #[async_trait]
+    impl HostKeyVerifier for AcceptAllHostKeys {
+        async fn verify(&self, _fingerprint: &str) -> bool {
+            true
+        }
+    }
+
+    /// Sends its exec output, then `CHANNEL_EOF`, and only *after that* the
+    /// `exit-status` request (then closes) — the exact ordering a real
+    /// server is free to use but which `run_russh_command` previously
+    /// mishandled by breaking its receive loop on `Eof` and dropping the
+    /// later `ExitStatus`.
+    #[derive(Clone)]
+    struct EofBeforeExitStatusServer;
+
+    impl server::Server for EofBeforeExitStatusServer {
+        type Handler = EofBeforeExitStatusHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> EofBeforeExitStatusHandler {
+            EofBeforeExitStatusHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct EofBeforeExitStatusHandler;
+
+    #[async_trait]
+    impl server::Handler for EofBeforeExitStatusHandler {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self, _user: &str, _public_key: &russh_keys::ssh_key::PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn exec_request(
+            &mut self, channel: ChannelId, _data: &[u8], session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            // Deliberate order: stdout, THEN eof, THEN exit-status, THEN
+            // close. A loop that breaks on `Eof` would never observe the
+            // exit status sent afterward.
+            session.data(channel, CryptoVec::from(b"x86_64\n".to_vec()))?;
+            session.eof(channel)?;
+            session.exit_status_request(channel, 0)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    async fn spawn_eof_before_exit_server() -> SocketAddr {
+        let host_key = PrivateKey::from(Ed25519Keypair::from_seed(&[7u8; 32]));
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut srv = EofBeforeExitStatusServer;
+        tokio::spawn(async move {
+            let _ = srv.run_on_socket(config, &listener).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn run_russh_command_captures_exit_status_sent_after_eof() {
+        let addr = spawn_eof_before_exit_server().await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None,
+            Arc::new(client::Config::default()),
+            &addr.ip().to_string(),
+            addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        // Any public key is accepted by the server.
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[8u8; 32]));
+        let pem = key.to_openssh(Default::default()).unwrap().as_bytes().to_vec();
+        let authed = authenticate_session(&mut session.handle, "tester", &Credential::PublicKey { private_key_pem: pem })
+            .await
+            .expect("authenticate_session should not error for a well-formed key");
+        assert!(authed, "the server accepts any public key");
+
+        let out = run_russh_command(&session.handle, "uname -m", &[]).await.expect("run_russh_command should succeed");
+
+        assert_eq!(
+            out.status,
+            Some(0),
+            "an exit status sent AFTER eof must still be captured, not dropped by breaking on eof"
+        );
+        assert_eq!(out.stdout, b"x86_64\n", "stdout sent before eof must be preserved");
     }
 }
