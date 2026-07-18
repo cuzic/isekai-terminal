@@ -33,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -409,6 +410,50 @@ fun TerminalScreenBody(
                 // 素の val をそのままクロージャに捕まえると古いスクリーン内容のまま固定される)。
                 val latestDisplayUpdate = rememberUpdatedState(displayUpdate)
 
+                // タスク#50: マウスレポーティング(`?1000`/`?1002`/`?1003`、rust-core タスク#36)
+                // 有効時にポインタイベントをエンコードして送る共通処理。エンコード自体は
+                // `terminalPointerEventBytes`(rust-core `terminal_pointer_event_bytes`、タスク#36/#51)
+                // がRust側で行い、ここでは座標とジェスチャ種別を生のまま渡すだけ(rust-ssot: 「今
+                // どのマウスモードか」「このイベントを報告すべきか」の判断はRust側の値
+                // [latestDisplayUpdate.value.mouseReportingMode/sgrMouseMode]をそのまま見るだけで、
+                // Kotlin側にミラー状態を作らない — iOS版TerminalScreenView.swift`sendMouseEvent`と対称)。
+                // 報告対象外のイベント種別(モードOff・Normalモードでのmotion等)は
+                // `terminalPointerEventBytes`が`null`を返すので、その判断もRust側に委ねてよい。
+                //
+                // (codexレビュー指摘: 修飾キー無しの`TerminalKeyModifiers`をドラッグ/ホイールの
+                // たびに毎回アロケートしていたのを1つのremember済みインスタンスに統一)
+                val noPointerModifiers = remember {
+                    TerminalKeyModifiers(shift = false, alt = false, ctrl = false, meta = false)
+                }
+                // (codexレビュー指摘: タッチ経路・ホイール経路の両方で「マウスレポーティングが
+                // 実際に有効か」の判定[scrollOffset==0 && mode!=Off]が重複していたのを1箇所へ
+                // 集約。iOS版`isPointerReportingActive`と同じ役割)
+                val isPointerReportingActive: () -> Boolean = {
+                    scrollOffset == 0 && latestDisplayUpdate.value.mouseReportingMode != MouseReportingMode.OFF
+                }
+                val sendPointerEvent: (MouseEventKind, MouseButton?, Int, Int) -> Unit = { kind, button, row, col ->
+                    val u = latestDisplayUpdate.value
+                    val bytes = terminalPointerEventBytes(
+                        kind = kind,
+                        button = button,
+                        row = row.toUInt(),
+                        col = col.toUInt(),
+                        modifiers = noPointerModifiers,
+                        cols = u.cols,
+                        rows = u.rows,
+                        mouseReportingMode = u.mouseReportingMode,
+                        sgrMouseMode = u.sgrMouseMode,
+                    )
+                    if (bytes != null) actions.onSend(bytes)
+                }
+                // (codexレビュー指摘: 座標→セル変換[offsetToCellPos]+送出が press/motion/release/
+                // wheelの4箇所で重複していたのを1つのヘルパーへ集約)
+                val sendPointerEventAt: (MouseEventKind, MouseButton?, Float, Float, Float, Float, Int, Int) -> Unit =
+                    { kind, button, x, y, cellW, cellH, cols, rows ->
+                        val cell = offsetToCellPos(x, y, cellW, cellH, cols, rows)
+                        sendPointerEvent(kind, button, cell.row, cell.col)
+                    }
+
                 // タップされたセルがOSC 8リンクを指していた場合の確認待ちURL(タスク#52)。
                 // 「UI表示だけに閉じた状態」としてComposeローカルで保持する
                 // (選択範囲・スクロール位置と同じ扱い。rust-ssot原則の対象外)。
@@ -432,6 +477,43 @@ fun TerminalScreenBody(
                                     val cols = latestCols.value
                                     val rows = latestRows.value
                                     val down = awaitFirstDown(requireUnconsumed = false)
+                                    // タスク#50: マウスレポーティング有効(かつスクロールバック表示中でない
+                                    // ——scrollOffset==0)の間は、単一指のタッチを選択(longPress)・スクロール
+                                    // バックパン(pinch/pan)へ渡さず、代わりにマウスのpress/drag/releaseとして
+                                    // Rustへ送る。scrollOffset>0を除外するのは、表示しているのが過去ログの
+                                    // 合成表示である一方でライブ側のモードに従ってポインタイベントを送ると、
+                                    // 表示対象(スクロールバック)と入力対象(ライブセッション)が食い違う
+                                    // ため(iOS版`isPointerReportingActive`と同じ理由・同じ判断)。
+                                    val initialPointerCount = currentEvent.changes.count { it.pressed }
+                                    val mouseModeActive = isPointerReportingActive() && initialPointerCount <= 1
+                                    if (mouseModeActive) {
+                                        down.consume()
+                                        onUserActivity()
+                                        // codexレビュー指摘: 画面分割時、他ペインがフォーカス中のまま
+                                        // このペインへマウスpress/dragを送ってしまうと、送信先(このペイン)と
+                                        // 実際にフォーカス(=IME/物理キーボード入力・focus reportingの宛先)が
+                                        // 食い違う。下のタップ分岐(単純タップ)と同じくペインフォーカスを
+                                        // 切り替える(IMEは要求しない — 長押し選択と同じく、マウスモードの
+                                        // タッチはソフトキーボードを呼び出す操作ではないため)。
+                                        actions.onRequestFocus()
+                                        sendPointerEventAt(MouseEventKind.PRESS, MouseButton.LEFT, down.position.x, down.position.y, cellW, cellH, cols, rows)
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                            change.consume()
+                                            // 2本目以降の指が触れてきた場合、単一指ドラッグとしては扱えないため
+                                            // 直前のpressに対応するreleaseを送って打ち切る(iOS版`touchesBegan`の
+                                            // 「2本目の指が触れたら追跡中のタッチのreleaseを送る」処理と同じ理由
+                                            // ——releaseを送らないとリモート側でボタンが押されっぱなしに見える)。
+                                            val pointerCount = event.changes.count { it.pressed }
+                                            if (!change.pressed || pointerCount > 1) {
+                                                sendPointerEventAt(MouseEventKind.RELEASE, MouseButton.LEFT, change.position.x, change.position.y, cellW, cellH, cols, rows)
+                                                break
+                                            }
+                                            sendPointerEventAt(MouseEventKind.MOTION, MouseButton.LEFT, change.position.x, change.position.y, cellW, cellH, cols, rows)
+                                        }
+                                        return@awaitEachGesture
+                                    }
                                     val longPress = awaitLongPressOrCancellation(down.id)
                                     // awaitLongPressOrCancellation は「指定した1本の指」の移動/リリースしか
                                     // 見ておらず、2本指が同時に押され続けている(=ピンチ操作中)場合でも
@@ -519,6 +601,45 @@ fun TerminalScreenBody(
                                                 if (event.changes.all { !it.pressed }) break
                                             }
                                         }
+                                    }
+                                }
+                            }
+                            // タスク#50(Fableレビュー2次: 「scrollOffset==0かつmouse mode時のwheel→
+                            // Rust送出」の裁定): 外付けマウス/トラックパッドのホイールスクロール
+                            // (`PointerEventType.Scroll`、Android実機ではBluetoothマウス・Chromebook等
+                            // 経由でのみ発生し、通常のタッチスクロールは別経路)を、マウスレポーティング
+                            // 有効かつscrollOffset==0の間はscrollback移動ではなくRustへのwheel
+                            // up/downイベントとして送る。上のタッチジェスチャ用pointerInputとは
+                            // イベント系統が異なる(ホイールはボタン押下を伴わない`Scroll`型イベントで
+                            // 届くため`awaitFirstDown`では捕捉できない)ため、別のpointerInputで待ち受ける。
+                            //
+                            // 対象外(Fableレビューで明示を求められたスコープ判断): alt-screenでの
+                            // wheel→矢印キー変換(xterm `?1007` Alternate Scroll Mode相当)は実装しない。
+                            // rust-core(タスク#36)は`?1007`のモード状態を保持しておらず、`ScreenUpdate`も
+                            // 「現在alt screenかどうか」を公開していない — この判断はターミナル状態の
+                            // SSOTであるRust側に持たせるべきで(rust-ssot)、Kotlin側で代替の判定
+                            // (例えばESCシーケンスの目視パース)を持つのは避ける。実装するならまず
+                            // rust-core側に`?1007`状態とalt-screen可視性を追加する別タスクが必要。
+                            .pointerInput(Unit) {
+                                awaitPointerEventScope {
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        if (event.type != PointerEventType.Scroll) continue
+                                        if (!isPointerReportingActive()) continue
+                                        val change = event.changes.firstOrNull() ?: continue
+                                        val deltaY = change.scrollDelta.y
+                                        if (deltaY == 0f) continue
+                                        change.consume()
+                                        // Composeのスクロール系API(Modifier.scrollable等)と同じ符号規約:
+                                        // 正のdeltaY = コンテンツを上へ送る(=下方向へスクロール、xtermの
+                                        // wheel down/button 65)。実機(Bluetoothマウス等)未検証のため、
+                                        // 符号が逆であれば実機確認時に反転させる。
+                                        val button = if (deltaY > 0f) MouseButton.WHEEL_DOWN else MouseButton.WHEEL_UP
+                                        sendPointerEventAt(
+                                            MouseEventKind.PRESS, button, change.position.x, change.position.y,
+                                            latestCellDims.value.first, latestCellDims.value.second,
+                                            latestCols.value, latestRows.value,
+                                        )
                                     }
                                 }
                             },
