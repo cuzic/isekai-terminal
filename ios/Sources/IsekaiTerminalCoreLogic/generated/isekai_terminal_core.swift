@@ -1158,6 +1158,14 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func notifyError(message: String) 
     
     /**
+     * #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
+     * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
+     * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
+     * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     */
+    func notifyFocusChange(focused: Bool) 
+    
+    /**
      * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを終了
      * される可能性が高まったとみなし、猶予を待たず保守的に`Suspended`扱いにする
      * (無言で固まった画面をユーザーに見せるより、次回復帰時に再接続する方が安全)。
@@ -1458,6 +1466,20 @@ open func notifyError(message: String)  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(message),$0
+    )
+}
+}
+    
+    /**
+     * #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
+     * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
+     * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
+     * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     */
+open func notifyFocusChange(focused: Bool)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_focus_change(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(focused),$0
     )
 }
 }
@@ -6384,6 +6406,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 47947) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning() != 20700) {

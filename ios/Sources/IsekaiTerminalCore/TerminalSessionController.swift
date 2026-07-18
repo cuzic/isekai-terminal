@@ -482,6 +482,17 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         orchestrator.notifyWillEnterForeground()
     }
 
+    // MARK: - #60: フォーカスレポーティング(`CSI ?1004`)
+    //
+    // OSのフォーカス変化(このタブがアクティブタブになった/でなくなった)をそのまま
+    // Rust側`SessionOrchestrator`へ転送する薄いラッパー。フォーカスレポーティングが
+    // 有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの判断はRust側(`Terminal`)が
+    // 一元的に持つ(rust-ssot)。呼び出し元は`TerminalView`(`isActive`の変化)。
+
+    public func notifyFocusChange(focused: Bool) {
+        orchestrator.notifyFocusChange(focused: focused)
+    }
+
     /// Phase 1C(#14): バックグラウンドからの復帰時や「再接続」ボタンから呼ぶ。
     /// 接続中/接続済みの間は二重接続を避けるため無視する(background/foreground
     /// 通知と手動ボタンの両方から呼ばれ得るため)。`connect()`と同じ
