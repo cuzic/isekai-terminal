@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
 
 use log::{debug, info, warn};
 use parking_lot::Mutex;
-use timed_fsm::TimerCommand;
+use timed_fsm::tokio_support::TokioTimerRuntime;
+use timed_fsm::{TimerCommand, TimerRuntime};
 
 use crate::{CellData, ClipboardMimeKind, ClipboardPayload, ScreenUpdate, ScrollbackSearchMatch, SessionCallback, RUNTIME};
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
@@ -58,41 +58,6 @@ fn make_screen_update(t: &Terminal) -> ScreenUpdate {
         link_table: t.link_table().to_vec(),
         images: t.images().to_vec(),
         kitty_keyboard_flags: t.kitty_keyboard_flags(),
-    }
-}
-
-// ── TokioTimerRuntime ────────────────────────────────────
-
-struct TokioTimerRuntime {
-    handle: Option<tokio::task::JoinHandle<()>>,
-    timeout_tx: tokio::sync::mpsc::Sender<TrzszTimer>,
-}
-
-impl TokioTimerRuntime {
-    fn new(timeout_tx: tokio::sync::mpsc::Sender<TrzszTimer>) -> Self {
-        TokioTimerRuntime { handle: None, timeout_tx }
-    }
-
-    fn set(&mut self, id: TrzszTimer, dur: Duration) {
-        if self.handle.is_some() {
-            debug!("trzsz timer: replace {:?} dur={:?}", id, dur);
-        } else {
-            debug!("trzsz timer: set {:?} dur={:?}", id, dur);
-        }
-        self.kill(id);
-        let tx = self.timeout_tx.clone();
-        self.handle = Some(tokio::spawn(async move {
-            tokio::time::sleep(dur).await;
-            debug!("trzsz timer: fired {:?}", id);
-            let _ = tx.send(id).await;
-        }));
-    }
-
-    fn kill(&mut self, id: TrzszTimer) {
-        if let Some(h) = self.handle.take() {
-            debug!("trzsz timer: killed {:?}", id);
-            h.abort();
-        }
     }
 }
 
@@ -481,8 +446,7 @@ pub(crate) async fn session_event_loop(
 ) {
     info!("session: event loop start {}x{}", init_cols, init_rows);
     let mut state = SessionState::new(init_cols as usize, init_rows as usize, initial_theme);
-    let (timeout_tx, mut timeout_rx) = tokio::sync::mpsc::channel::<TrzszTimer>(16);
-    let mut timer_rt = TokioTimerRuntime::new(timeout_tx);
+    let mut timer_rt = TokioTimerRuntime::<TrzszTimer>::new();
 
     'outer: loop {
         let result: Option<ProcessResult> = tokio::select! {
@@ -567,7 +531,7 @@ pub(crate) async fn session_event_loop(
                     callback.on_disconnected(None); break 'outer;
                 }
             },
-            timer_id = timeout_rx.recv() => match timer_id {
+            timer_id = timer_rt.recv() => match timer_id {
                 Some(id) => Some(state.on_timeout(id)),
                 None => None,
             },
@@ -611,7 +575,7 @@ pub(crate) async fn session_event_loop(
 /// ProcessResult をすべて処理する（タイマー・scrollback・副作用・画面更新）
 fn dispatch_result(
     r: ProcessResult,
-    timer_rt: &mut TokioTimerRuntime,
+    timer_rt: &mut TokioTimerRuntime<TrzszTimer>,
     transport_cmd_tx: &tokio::sync::mpsc::Sender<TransportCommand>,
     callback: &Arc<dyn SessionCallback>,
     terminal: &Terminal,
@@ -619,8 +583,8 @@ fn dispatch_result(
 ) {
     for cmd in r.timer_cmds {
         match cmd {
-            TimerCommand::Set { id, duration } => timer_rt.set(id, duration),
-            TimerCommand::Kill { id }           => timer_rt.kill(id),
+            TimerCommand::Set { id, duration } => timer_rt.set_timer(id, duration),
+            TimerCommand::Kill { id }           => timer_rt.kill_timer(id),
         }
     }
 
@@ -859,6 +823,30 @@ mod tests {
     /// 文字列`s`の各charを1セルずつに割り当てた行を組み立てる(検索テスト用)。
     fn text_row(s: &str) -> Vec<TermCell> {
         s.chars().map(cell).collect()
+    }
+
+    #[test]
+    fn make_screen_update_link_table_stays_bounded_when_remote_floods_distinct_urls() {
+        // タスク#70: `make_screen_update`は`Terminal::link_table()`を`to_vec()`で
+        // 丸ごと複製して`ScreenUpdate`へ載せる。リモートが相異なるOSC8 URLを
+        // 上限を超えて大量に流しても、UniFFI境界を越えて公開される
+        // `ScreenUpdate.link_table`が`crate::terminal::MAX_LINK_TABLE`件で
+        // 頭打ちになる(=毎フレームのFFIコピーコストも無界には悪化しない)ことを
+        // 確認する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut p = vte::Parser::new();
+        let flood = crate::terminal::MAX_LINK_TABLE + 500;
+        for i in 0..flood {
+            let seq = format!("\x1b]8;;https://flood.example/{i}\x07");
+            for &b in seq.as_bytes() { p.advance(&mut t, b); }
+        }
+
+        let upd = make_screen_update(&t);
+        assert_eq!(
+            upd.link_table.len(),
+            crate::terminal::MAX_LINK_TABLE,
+            "ScreenUpdate.link_tableは上限件数で頭打ちになり無界には増えない"
+        );
     }
 
     #[test]
@@ -1167,8 +1155,7 @@ mod tests {
         let scrollback = Arc::new(Mutex::new(initial));
 
         let (transport_cmd_tx, _transport_cmd_rx) = tokio::sync::mpsc::channel(8);
-        let (timeout_tx, _timeout_rx) = tokio::sync::mpsc::channel(1);
-        let mut timer_rt = TokioTimerRuntime::new(timeout_tx);
+        let mut timer_rt = TokioTimerRuntime::<TrzszTimer>::new();
         let callback: Arc<dyn SessionCallback> = Arc::new(NoopSessionCallback);
         let terminal = Terminal::new(80, 24, Theme::default());
 

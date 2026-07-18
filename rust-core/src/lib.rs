@@ -959,10 +959,12 @@ pub struct ScreenUpdate {
     /// OSC 8(タスク#40)ハイパーリンクのURL intern表。`CellData::link_id`はこの
     /// `Vec`のindex(0-indexed)。同一URLは重複排除されて同じindexを指す。
     /// このterminalセッションが一度でも見たURLを(現在アクティブでなくなった後も、
-    /// RISされた後も)ずっと保持する——scrollback上の過去セルの`link_id`がこの表の
-    /// indexを指し続けるため、indexを再利用したり表自体をクリアしたりすると
-    /// 過去セルが別のURLを指す破損になる(`terminal.rs`の`link_table`フィールド
-    /// docコメント参照)。
+    /// RISされた後も)登録上限(`MAX_LINK_TABLE`、タスク#70)まで保持する——
+    /// scrollback上の過去セルの`link_id`がこの表のindexを指し続けるため、
+    /// indexを再利用したり表自体をクリアしたりすると過去セルが別のURLを指す
+    /// 破損になる(`terminal.rs`の`link_table`フィールドdocコメント参照)。上限
+    /// 到達後に見た新規URLはインターンされず、そのURLで開かれたリンクはリンク
+    /// 無し扱いにフォールバックする(既存セルの`link_id`参照には影響しない)。
     pub link_table: Vec<String>,
     /// Sixel(タスク#42)で現在アクティブな画像配置の一覧。詳細は[ImagePlacement]参照。
     pub images: Vec<ImagePlacement>,
