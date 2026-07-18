@@ -104,6 +104,17 @@ func decideMouseTouchBeganAction(
     return .ignore
 }
 
+/// タスク#88(fableレビュー・グループD指摘): xtermは同一セル内でのマウス移動を
+/// 重複報告しないが、`touchesMoved`は端末のタッチサンプリングレート(最大120Hz程度)で
+/// 発火しうるため、ドラッグ中に指がわずかに揺れただけでも同じセルへ何度もMOTION
+/// イベントを送ってしまっていた。呼び出し側(`TerminalScreenView`の`lastMotionCell`)が
+/// 直近に実際に送信したセル座標を保持し、新しいセル座標([newCell])と比較する。
+/// 座標が変わった場合のみ`true`(送信すべき)を返す。Android版
+/// `MouseGestureArbiter.kt`の`shouldReportMouseMotion`と対称。
+func shouldReportMouseMotion(lastReportedCell: CellPos, newCell: CellPos) -> Bool {
+    newCell != lastReportedCell
+}
+
 /// Sixel(タスク#42)の`ImagePlacement.rgba`(RGBA8888、row-major)から`UIImage`を作って
 /// idでキャッシュする。`ScreenUpdate.images`はTerminal(rust-core)側で寿命管理された
 /// 「現在アクティブな画像の全リスト」がそのまま渡ってくる(rust-ssot: どの画像が
@@ -587,6 +598,14 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     /// 押されっぱなしに見えるバグになっていた)。
     private weak var activeMouseTouch: UITouch?
 
+    /// タスク#88(fableレビュー・グループD指摘): ドラッグ中に直近実際に送信した
+    /// セル座標。`touchesBegan`でpressを送った時点のセルへ初期化し、
+    /// `touchesMoved`でセルが実際に変化した場合のみ更新+MOTIONを送信する
+    /// (`shouldReportMouseMotion`。Android版`TerminalScreen.kt`の
+    /// `lastMotionCell`ローカル変数と対称——`touchesMoved`は最大120Hz程度で
+    /// 発火しうるが、xtermは同一セル内での移動を重複報告しない)。
+    private var lastMotionCell: CellPos?
+
     /// マウスレポーティング(`?1000`/`?1002`/`?1003`)が有効かつスクロールバック表示中
     /// (`scrollOffset > 0`)でない間、選択(`longPress`)・スクロールバックスワイプ
     /// (`pan`)・OSC 8タップ(`tap`)へタッチを渡さないようにする。これらは全て単一指の
@@ -664,9 +683,15 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
                 sendMouseEvent(for: active, update: update, kind: .release)
             }
             activeMouseTouch = nil
+            lastMotionCell = nil
         case .startTracking:
             guard let touch = touches.first else { return }
             activeMouseTouch = touch
+            lastMotionCell = offsetToCellPos(
+                x: Double(touch.location(in: self).x), y: Double(touch.location(in: self).y),
+                cellWidth: Double(cellSize.width), cellHeight: Double(cellSize.height),
+                cols: Int(update.cols), rows: Int(update.rows)
+            )
             sendMouseEvent(for: touch, update: update, kind: .press)
         case .ignore:
             break
@@ -676,6 +701,17 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     public override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesMoved(touches, with: event)
         guard let update = latestUpdate, let active = activeMouseTouch, touches.contains(active) else { return }
+        // タスク#88: セル座標が直近送信した`lastMotionCell`から実際に変わった場合のみ
+        // MOTIONを送る(`shouldReportMouseMotion`のdocコメント参照)。
+        let cell = offsetToCellPos(
+            x: Double(active.location(in: self).x), y: Double(active.location(in: self).y),
+            cellWidth: Double(cellSize.width), cellHeight: Double(cellSize.height),
+            cols: Int(update.cols), rows: Int(update.rows)
+        )
+        if let last = lastMotionCell, !shouldReportMouseMotion(lastReportedCell: last, newCell: cell) {
+            return
+        }
+        lastMotionCell = cell
         sendMouseEvent(for: active, update: update, kind: .motion)
     }
 
@@ -684,6 +720,7 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         guard let update = latestUpdate, let active = activeMouseTouch, touches.contains(active) else { return }
         sendMouseEvent(for: active, update: update, kind: .release)
         activeMouseTouch = nil
+        lastMotionCell = nil
     }
 
     public override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -691,6 +728,7 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         guard let update = latestUpdate, let active = activeMouseTouch, touches.contains(active) else { return }
         sendMouseEvent(for: active, update: update, kind: .release)
         activeMouseTouch = nil
+        lastMotionCell = nil
     }
 
     public override func draw(_ rect: CGRect) {

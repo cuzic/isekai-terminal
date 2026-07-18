@@ -70,6 +70,7 @@ import tools.isekai.terminal.ui.isOpenableHyperlinkScheme
 import tools.isekai.terminal.ui.isPointerReportingActive as arbiterIsPointerReportingActive
 import tools.isekai.terminal.ui.linkUrlAtCell
 import tools.isekai.terminal.ui.offsetToCellPos
+import tools.isekai.terminal.ui.shouldReportMouseMotion
 import tools.isekai.terminal.ui.shouldUseMouseTouch
 import tools.isekai.terminal.ui.wheelButtonForDelta
 import tools.isekai.terminal.ui.reconstructSelectionText
@@ -666,7 +667,14 @@ fun TerminalScreenBody(
                                         // 切り替える(IMEは要求しない — 長押し選択と同じく、マウスモードの
                                         // タッチはソフトキーボードを呼び出す操作ではないため)。
                                         actions.onRequestFocus()
-                                        sendPointerEventAt(MouseEventKind.PRESS, MouseButton.LEFT, down.position.x, down.position.y, cellW, cellH, cols, rows)
+                                        val pressCell = offsetToCellPos(down.position.x, down.position.y, cellW, cellH, cols, rows)
+                                        sendPointerEvent(MouseEventKind.PRESS, MouseButton.LEFT, pressCell.row, pressCell.col)
+                                        // タスク#88(fableレビュー・グループD指摘): xtermは同一セル内での
+                                        // マウス移動を重複報告しないが、`awaitPointerEvent`は最大120Hz程度で
+                                        // 発火しうるため、直近に実際に送信したセル座標をここで保持し、
+                                        // 新しいセル座標と一致する間はMOTIONの送信自体をスキップする
+                                        // (`shouldReportMouseMotion`、`MouseGestureArbiter.kt`)。
+                                        var lastMotionCell = pressCell
                                         var handoffToPinch = false
                                         while (true) {
                                             val event = awaitPointerEvent()
@@ -683,8 +691,13 @@ fun TerminalScreenBody(
                                             // 検証する。
                                             val pointerCount = event.changes.count { it.pressed }
                                             when (decideMouseTouchStep(trackedFingerPressed = change.pressed, pointerCount = pointerCount)) {
-                                                MouseTouchStep.CONTINUE ->
-                                                    sendPointerEventAt(MouseEventKind.MOTION, MouseButton.LEFT, change.position.x, change.position.y, cellW, cellH, cols, rows)
+                                                MouseTouchStep.CONTINUE -> {
+                                                    val cell = offsetToCellPos(change.position.x, change.position.y, cellW, cellH, cols, rows)
+                                                    if (shouldReportMouseMotion(lastMotionCell, cell)) {
+                                                        lastMotionCell = cell
+                                                        sendPointerEvent(MouseEventKind.MOTION, MouseButton.LEFT, cell.row, cell.col)
+                                                    }
+                                                }
                                                 MouseTouchStep.RELEASE_ONLY -> {
                                                     sendPointerEventAt(MouseEventKind.RELEASE, MouseButton.LEFT, change.position.x, change.position.y, cellW, cellH, cols, rows)
                                                     handoffToPinch = false
@@ -983,7 +996,18 @@ fun TerminalScreenBody(
                     CtrlBtn("Ctrl", active = ctrlArmed) { ctrlArmed = !ctrlArmed }
                     CtrlBtn("↵") { inputView?.commitComposing(); actions.onSend(byteArrayOf(0x0D)) }
                     CtrlBtn("Tab") { actions.onSend(byteArrayOf(0x09)) }
-                    CtrlBtn("Esc") { actions.onSend(byteArrayOf(0x1B)) }
+                    // Kitty keyboard protocol(タスク#54)のdisambiguate escape codes(bit0)が
+                    // negotiateされている場合はCSI u形式(`ESC[27u`)を送る必要があるため、固定
+                    // バイト列ではなくspecialKeyBytes経由にする(タスク#72、以前は交渉された
+                    // flagsが一切反映されない既存バグだった)。
+                    CtrlBtn("Esc") {
+                        actions.onSend(
+                            TerminalKeyEncoder.specialKeyBytes(
+                                TerminalKeyEncoder.KC_ESCAPE,
+                                kittyFlags = screenUpdate?.kittyKeyboardFlags ?: 0u,
+                            )!!,
+                        )
+                    }
                     CtrlBtn("^C") { actions.onSend(byteArrayOf(0x03)) }
                     CtrlBtn("^D") { actions.onSend(byteArrayOf(0x04)) }
                     CtrlBtn("^Z") { actions.onSend(byteArrayOf(0x1A)) }
@@ -1046,6 +1070,7 @@ fun TerminalScreenBody(
                         view.applicationCursorMode = screenUpdate?.applicationCursorMode ?: false
                         view.applicationKeypadMode = screenUpdate?.applicationKeypadMode ?: false
                         view.bracketedPasteMode = screenUpdate?.bracketedPasteMode ?: false
+                        view.kittyKeyboardFlags = screenUpdate?.kittyKeyboardFlags ?: 0u
                         view.keyboardLayoutMode = keyboardLayoutMode
                         view.ctrlArmed = ctrlArmed
                         view.onCtrlConsumed = { ctrlArmed = false }
