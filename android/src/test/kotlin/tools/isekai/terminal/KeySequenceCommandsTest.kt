@@ -35,6 +35,28 @@ class KeySequenceCommandsTest {
         assertEquals(0, bytes.size)
     }
 
+    // ── applicationKeypadMode(DECKPAM/DECKPNM、タスク#43)がテンキーへ伝播すること ──
+
+    @Test
+    fun `Special with a numpad keyCode uses literal digit when applicationKeypadMode is false`() {
+        val bytes = KeySequenceCommands.toBytes(
+            listOf(KeyStep.Special(TerminalKeyEncoder.KC_NUMPAD_5)),
+            applicationCursorMode = false,
+            applicationKeypadMode = false,
+        )
+        assertArrayEquals("5".toByteArray(Charsets.UTF_8), bytes)
+    }
+
+    @Test
+    fun `Special with a numpad keyCode uses SS3 sequence when applicationKeypadMode is true`() {
+        val bytes = KeySequenceCommands.toBytes(
+            listOf(KeyStep.Special(TerminalKeyEncoder.KC_NUMPAD_5)),
+            applicationCursorMode = false,
+            applicationKeypadMode = true,
+        )
+        assertArrayEquals(byteArrayOf(0x1B, 0x4F, 0x75), bytes) // ESC O u
+    }
+
     // ── 委譲元が null を返す場合はスキップされる ─────────────────
 
     @Test

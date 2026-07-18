@@ -18,7 +18,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
-            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
@@ -71,7 +71,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             cols: UInt32(cells.count), rows: 1, cells: cells,
             cursorRow: 0, cursorCol: 0,
-            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
@@ -90,7 +90,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             cols: 10, rows: 10, cells: [],
             cursorRow: 0, cursorCol: 0,
-            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
@@ -118,7 +118,7 @@ final class TerminalScreenViewTests: XCTestCase {
             let update = ScreenUpdate(
                 cols: 1, rows: 1, cells: cells,
                 cursorRow: 0, cursorCol: 0,
-                title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+                title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
                 mouseReportingMode: .off, sgrMouseMode: false,
                 cursorVisible: true, bellGeneration: 0,
                 cursorShape: shape, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
@@ -142,7 +142,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             cols: 1, rows: 1, cells: cells,
             cursorRow: 0, cursorCol: 0,
-            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .bar, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
@@ -173,7 +173,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 1,
-            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .bar, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
@@ -208,7 +208,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 1,
-            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
@@ -241,7 +241,7 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
-            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0

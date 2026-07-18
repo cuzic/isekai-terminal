@@ -29,7 +29,7 @@ final class TerminalScrollbackTests: XCTestCase {
         return ScreenUpdate(
             cols: UInt32(cols), rows: UInt32(rows.count), cells: cells,
             cursorRow: cursorRow, cursorCol: cursorCol, title: "session",
-            applicationCursorMode: true, bracketedPasteMode: true,
+            applicationCursorMode: true, applicationKeypadMode: true, bracketedPasteMode: true,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: cursorVisible, bellGeneration: bellGeneration,
             cursorShape: cursorShape, cursorBlink: cursorBlink, linkTable: [], images: [], kittyKeyboardFlags: 0

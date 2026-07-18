@@ -47,6 +47,7 @@ fn make_screen_update(t: &Terminal) -> ScreenUpdate {
         cursor_col: t.cursor_col().min(t.cols().saturating_sub(1)) as u32,
         title: t.title().map(str::to_owned),
         application_cursor_mode: t.application_cursor_mode(),
+        application_keypad_mode: t.application_keypad_mode(),
         bracketed_paste_mode: t.bracketed_paste_mode(),
         mouse_reporting_mode: t.mouse_reporting_mode(),
         sgr_mouse_mode: t.sgr_mouse_mode(),

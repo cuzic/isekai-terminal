@@ -482,6 +482,75 @@ fn terminal_function_key_bytes(n: u8, modifiers: TerminalKeyModifiers) -> Vec<u8
     }
 }
 
+/// アプリケーションキーパッドモード(DECKPAM/DECKPNM、タスク#43)対応が必要な
+/// テンキー(numeric keypad)キー。VT220の物理keypadにある0〜9・`,`・`-`(Subtract)・
+/// `.`(Decimal)・Enterに加え、xterm/主要ターミナルエミュレータが同じ`ESC O <letter>`
+/// テーブルへ拡張している`+`(Add)・`*`(Multiply)・`/`(Divide)・`=`(Equals)を含む。
+/// 左右カッコ(Android `KEYCODE_NUMPAD_LEFT_PAREN`/`KEYCODE_NUMPAD_RIGHT_PAREN`)は
+/// このテーブルに存在せず両モードで常に同じリテラル文字を送るため対象外——
+/// 呼び出し側は通常のUnicode文字経路([terminal_unicode_char_bytes])にフォール
+/// バックすること。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TerminalNumpadKey {
+    Digit0,
+    Digit1,
+    Digit2,
+    Digit3,
+    Digit4,
+    Digit5,
+    Digit6,
+    Digit7,
+    Digit8,
+    Digit9,
+    Decimal,
+    Comma,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Enter,
+    Equals,
+}
+
+/// テンキーのバイト列。`application_keypad_mode`(DECKPAM、`Terminal`が`ESC =`/
+/// `ESC >`で切り替える、`ScreenUpdate::application_keypad_mode`経由で公開)が
+/// `true`ならSS3形式(`ESC O <letter>`、xterm/VT220のapplication keypadテーブルに
+/// 準拠)、`false`なら通常のリテラル文字(Enterのみ`0x0D`、`TerminalSpecialKey::Enter`
+/// と同じ)を返す。`application_cursor_mode`(#29)と同じ「Rust側は変換ロジックのみ、
+/// どのキーコードがどの[TerminalNumpadKey]に対応するかの判定はUI層が行う」という
+/// 役割分担。
+#[uniffi::export]
+pub fn terminal_numpad_key_bytes(key: TerminalNumpadKey, application_keypad_mode: bool) -> Vec<u8> {
+    if key == TerminalNumpadKey::Enter {
+        return if application_keypad_mode { vec![0x1B, 0x4F, b'M'] } else { vec![0x0D] };
+    }
+    let (letter, normal): (u8, u8) = match key {
+        TerminalNumpadKey::Digit0 => (b'p', b'0'),
+        TerminalNumpadKey::Digit1 => (b'q', b'1'),
+        TerminalNumpadKey::Digit2 => (b'r', b'2'),
+        TerminalNumpadKey::Digit3 => (b's', b'3'),
+        TerminalNumpadKey::Digit4 => (b't', b'4'),
+        TerminalNumpadKey::Digit5 => (b'u', b'5'),
+        TerminalNumpadKey::Digit6 => (b'v', b'6'),
+        TerminalNumpadKey::Digit7 => (b'w', b'7'),
+        TerminalNumpadKey::Digit8 => (b'x', b'8'),
+        TerminalNumpadKey::Digit9 => (b'y', b'9'),
+        TerminalNumpadKey::Decimal => (b'n', b'.'),
+        TerminalNumpadKey::Comma => (b'l', b','),
+        TerminalNumpadKey::Add => (b'k', b'+'),
+        TerminalNumpadKey::Subtract => (b'm', b'-'),
+        TerminalNumpadKey::Multiply => (b'j', b'*'),
+        TerminalNumpadKey::Divide => (b'o', b'/'),
+        TerminalNumpadKey::Equals => (b'X', b'='),
+        TerminalNumpadKey::Enter => unreachable!("handled above"),
+    };
+    if application_keypad_mode {
+        vec![0x1B, 0x4F, letter]
+    } else {
+        vec![normal]
+    }
+}
+
 /// Unicodeコードポイント→バイト列。0(未入力)なら`None`。0x20未満または0x7Fは
 /// 単一の制御バイトとして、それ以外はUTF-8としてエンコードする。
 /// (Android版`TerminalKeyEncoder.unicodeCharBytes()`のRust移植)
@@ -855,6 +924,11 @@ pub struct ScreenUpdate {
     pub cursor_col: u32,
     pub title: Option<String>,
     pub application_cursor_mode: bool,
+    /// DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
+    /// (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
+    /// 実際のテンキーイベントのエンコード(`terminal_numpad_key_bytes`をどう呼ぶか)は
+    /// このRustコアではなくUI層のキーエンコーダーが行う。
+    pub application_keypad_mode: bool,
     pub bracketed_paste_mode: bool,
     /// DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)の現在値。既定は`Off`。
     /// UI層(#50/#51)はこれを見て、タッチ/ジェスチャイベントをマウスレポートとして
@@ -1600,6 +1674,37 @@ mod terminal_key_mapping_tests {
         assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Delete, false, ctrl), vec![0x7F]);
         assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Escape, false, ctrl), vec![0x1B]);
         assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ForwardDelete, false, ctrl), b"\x1B[3~".to_vec());
+    }
+
+    // ── アプリケーションキーパッドモード(DECKPAM/DECKPNM、タスク#43) ──────────
+
+    #[test]
+    fn numpad_digits_are_literal_in_numeric_mode() {
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Digit0, false), b"0".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Digit9, false), b"9".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Decimal, false), b".".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Comma, false), b",".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Add, false), b"+".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Subtract, false), b"-".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Multiply, false), b"*".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Divide, false), b"/".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Equals, false), b"=".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Enter, false), vec![0x0D]);
+    }
+
+    #[test]
+    fn numpad_digits_map_to_ss3_in_application_keypad_mode() {
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Digit0, true), b"\x1BOp".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Digit1, true), b"\x1BOq".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Digit9, true), b"\x1BOy".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Decimal, true), b"\x1BOn".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Comma, true), b"\x1BOl".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Add, true), b"\x1BOk".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Subtract, true), b"\x1BOm".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Multiply, true), b"\x1BOj".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Divide, true), b"\x1BOo".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Equals, true), b"\x1BOX".to_vec());
+        assert_eq!(terminal_numpad_key_bytes(TerminalNumpadKey::Enter, true), b"\x1BOM".to_vec());
     }
 
     #[test]

@@ -20,6 +20,9 @@ class TerminalInputView @JvmOverloads constructor(
     var onComposingText: ((String) -> Unit)? = null
 
     var applicationCursorMode: Boolean = false
+
+    /** DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)。テンキー(KC_NUMPAD_*)のエンコードに使う。 */
+    var applicationKeypadMode: Boolean = false
     var bracketedPasteMode: Boolean = false
 
     /**
