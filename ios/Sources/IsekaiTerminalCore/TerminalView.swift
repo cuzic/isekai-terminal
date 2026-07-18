@@ -32,6 +32,10 @@ public struct TerminalView: View {
     /// `TerminalScreenView`(UIKit側)からの通知で更新され、「ライブへ戻る」ボタンからも
     /// 0を書き戻す(`selection`/`fontScale`と同じ双方向バインディング)。
     @State private var scrollOffset: UInt32 = 0
+    /// タスク#52: タップされたOSC 8リンクの確認待ちURL。「UI表示だけに閉じた状態」
+    /// (`.claude/rules/rust-ssot.md`の例外)として`selection`/`scrollOffset`と同じく
+    /// SwiftUI側の`@State`で保持する(Android版`pendingHyperlinkUrl`と対称)。
+    @State private var pendingHyperlinkURL: String?
     /// Phase 1F-5(#52): 定型コマンドシート。Android版`showSnippetSheet`と対称。
     @State private var showSnippetSheet = false
     @State private var snippets: [Snippet] = []
@@ -66,7 +70,8 @@ public struct TerminalView: View {
         ZStack(alignment: .topLeading) {
             TerminalScreenRepresentable(
                 uiState: uiState, controller: controller,
-                selection: $selection, fontScale: $fontScale, scrollOffset: $scrollOffset
+                selection: $selection, fontScale: $fontScale, scrollOffset: $scrollOffset,
+                pendingHyperlinkURL: $pendingHyperlinkURL
             )
             .accessibilityIdentifier("terminalScreen")
 
@@ -171,6 +176,28 @@ public struct TerminalView: View {
             if let prompt = uiState.newHostKeyPrompt {
                 Text("初めて接続するホストです。\n\(prompt.host):\(prompt.port)\nFingerprint (SHA256):\n\(prompt.fingerprint)\nこのfingerprintを信頼して接続しますか？")
             }
+        }
+        // タスク#52: OSC 8リンクのタップ確認。URLはリモート(信頼できないホスト出力)
+        // 由来のため、`isOpenableHyperlinkScheme`でhttp/httpsに絞り込んだ上で、
+        // 開く前に必ずURL全文をここで見せる(Fableレビュー2次、Android版
+        // `HyperlinkConfirmDialog`と対称)。
+        .alert(
+            "リンクを開きますか？",
+            isPresented: Binding(
+                get: { pendingHyperlinkURL != nil },
+                set: { if !$0 { pendingHyperlinkURL = nil } }
+            )
+        ) {
+            Button("キャンセル", role: .cancel) { pendingHyperlinkURL = nil }
+            Button("開く") {
+                if let url = pendingHyperlinkURL.flatMap(URL.init(string:)) {
+                    UIApplication.shared.open(url)
+                }
+                pendingHyperlinkURL = nil
+            }
+            .accessibilityIdentifier("openHyperlinkButton")
+        } message: {
+            Text("接続先ホストが出力したリンクです。信頼できる場合のみ開いてください。\n\(pendingHyperlinkURL ?? "")")
         }
         .sheet(
             isPresented: Binding(
@@ -353,6 +380,7 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
     @Binding var selection: SelectionRange?
     @Binding var fontScale: Double
     @Binding var scrollOffset: UInt32
+    @Binding var pendingHyperlinkURL: String?
 
     func makeUIView(context: Context) -> TerminalScreenView {
         let view = TerminalScreenView()
@@ -371,6 +399,9 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
         }
         view.onScrollOffsetChanged = { newValue in
             scrollOffset = newValue
+        }
+        view.onHyperlinkTapped = { url in
+            pendingHyperlinkURL = url
         }
         return view
     }

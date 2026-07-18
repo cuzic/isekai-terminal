@@ -122,6 +122,13 @@ public final class TerminalScreenView: UIView {
     public var onScrollOffsetChanged: ((UInt32) -> Void)?
     private var panAccumY: CGFloat = 0
 
+    /// タスク#52: OSC 8リンクをタップした時に呼ばれる(hit-testで有効なURLが見つかった
+    /// 場合のみ)。SwiftUI側(`TerminalView`)がこれを受けて確認ダイアログを表示し、
+    /// ユーザーが「開く」を選んだ場合のみ`UIApplication.open`を呼ぶ。URLは既に
+    /// `isOpenableHyperlinkScheme`でhttp/httpsのみに絞り込み済み(Android版
+    /// `pendingHyperlinkUrl`と対称)。
+    public var onHyperlinkTapped: ((String) -> Void)?
+
     public override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
@@ -139,6 +146,12 @@ public final class TerminalScreenView: UIView {
         let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
         pan.maximumNumberOfTouches = 1
         addGestureRecognizer(pan)
+
+        // タスク#52: OSC 8リンクのタップhit-test用。素早いタップは
+        // `UILongPressGestureRecognizer`の`minimumPressDuration`(0.4秒)未満で
+        // 指が離れるため長押し認識には至らず、互いに競合しない。
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        addGestureRecognizer(tap)
     }
 
     public required init?(coder: NSCoder) {
@@ -228,6 +241,22 @@ public final class TerminalScreenView: UIView {
         default:
             break
         }
+    }
+
+    /// タスク#52: OSC 8リンクのタップhit-test。hit-test自体は表示中のセル配列を
+    /// 読むだけのUI表示に閉じた判断であり、rust-ssot原則の対象外(`linkId`/
+    /// `linkTable`は既にRust側がintern済みで公開している、Android版
+    /// `TerminalScreen.kt`の`linkUrlAtCell`呼び出しと対称)。リンクが無い、または
+    /// スキームがhttp/https以外の場合は何もしない(`isOpenableHyperlinkScheme`で
+    /// `intent://`等を無条件で開かないようにする、タスク#52 Fableレビュー2次)。
+    @objc private func handleTap(_ recognizer: UITapGestureRecognizer) {
+        guard let update = computeDisplayUpdate() else { return }
+        let cols = Int(update.cols)
+        let rows = Int(update.rows)
+        let point = recognizer.location(in: self)
+        let cell = offsetToCellPos(x: Double(point.x), y: Double(point.y), cellWidth: Double(cellSize.width), cellHeight: Double(cellSize.height), cols: cols, rows: rows)
+        guard let url = linkURL(at: update, row: cell.row, col: cell.col), isOpenableHyperlinkScheme(url) else { return }
+        onHyperlinkTapped?(url)
     }
 
     public override func draw(_ rect: CGRect) {

@@ -81,3 +81,39 @@ fun HostKeyChangedDialog(
         },
     )
 }
+
+/**
+ * OSC 8ハイパーリンク(タスク#52)のタップ確認ダイアログ。URLはリモート(信頼できない
+ * ホスト出力)由来のため、[tools.isekai.terminal.ui.isOpenableHyperlinkScheme]で
+ * http/httpsスキームのみに絞った上で、開く前に必ずURL全文をここで見せる
+ * (Fableレビュー2次: 表示テキストとリンク先が一致しない偽装や、意図しない
+ * アプリ起動に気づけるようにする)。
+ */
+@Composable
+fun HyperlinkConfirmDialog(
+    url: String,
+    onOpen: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("リンクを開きますか？") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("接続先ホストが出力したリンクです。信頼できる場合のみ開いてください。")
+                Text(
+                    url,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onOpen) { Text("開く") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("キャンセル") }
+        },
+    )
+}
