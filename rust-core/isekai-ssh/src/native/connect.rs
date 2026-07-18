@@ -64,14 +64,16 @@ pub(crate) type NativeHandle = client::Handle<russh_stream_session::VerifyingHan
 /// shared SSH session is authenticated, it can start accepting local IPC
 /// clients on the shared handle — without the connect+auth+recovery machinery
 /// here having to know anything about `local-ipc-mux`. It receives an
-/// [`Arc`]-shared handle (`russh`'s `client::Handle` is not `Clone`, but
-/// `channel_open_session` takes `&self`, so an `Arc` lets the owner's own
-/// foreground shell and every relayed client open independent channels through
-/// the same connection). It runs at most once, on the *successful* connect
+/// [`Arc`]-shared, [`Mutex`](tokio::sync::Mutex)-guarded handle: `channel_open_session`
+/// only needs `&self`, but `streamlocal_forward` (the `#@isekai ctl-socket`
+/// remote forward, M5) needs `&mut self`, so the shared handle is behind a
+/// mutex that is held only for the brief open/forward calls and never across
+/// the per-channel I/O loop. It runs at most once, on the *successful* connect
 /// attempt (a failed attempt errors before the handle exists, leaving the hook
 /// intact for the re-bootstrap retry). Boxed `FnOnce` + `Send` because it
 /// typically `tokio::spawn`s the accept loop.
-pub(crate) type OwnerHook = Box<dyn FnOnce(Arc<NativeHandle>) + Send>;
+pub(crate) type SharedHandle = Arc<tokio::sync::Mutex<NativeHandle>>;
+pub(crate) type OwnerHook = Box<dyn FnOnce(SharedHandle) + Send>;
 
 /// Everything [`run_prepared`] needs, resolved once up front so the mux
 /// dispatch ([`super::mux::run`]) can compute the channel name from the same
@@ -347,9 +349,11 @@ async fn connect_attempt(
         .await
         .with_context(|| format!("isekai-ssh: failed to connect to {username}@{host_port}"))?;
 
-    // Shared so the mux accept loop (below) and this process's own foreground
-    // shell can each open independent channels on the one connection.
-    let handle = Arc::new(handle);
+    // Shared behind a mutex so the mux accept loop (below) and this process's
+    // own foreground shell can each open independent channels on the one
+    // connection, and so `streamlocal_forward` (which needs `&mut self`) can
+    // be called for the ctl-socket forward (M5).
+    let handle: SharedHandle = Arc::new(tokio::sync::Mutex::new(handle));
 
     // The SSH session is now authenticated. If this is the mux owner path,
     // hand a shared clone of the handle to the accept loop so sibling tabs can
@@ -363,9 +367,14 @@ async fn connect_attempt(
 
     let (cols, rows) = console::terminal_size();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
-    let mut channel = open_channel(&handle, &SessionKind::Shell { term, cols, rows })
-        .await
-        .context("isekai-ssh: failed to open a shell channel")?;
+    let mut channel = {
+        // Held only for the open; released before the I/O loop so sibling
+        // channels and forwards aren't blocked behind this session's traffic.
+        let guard = handle.lock().await;
+        open_channel(&guard, &SessionKind::Shell { term, cols, rows })
+            .await
+            .context("isekai-ssh: failed to open a shell channel")?
+    };
 
     let _raw_mode = console::RawModeGuard::enable().context("isekai-ssh: failed to enable raw terminal mode")?;
     let exit_code = run_shell_io_loop(&mut channel).await?;

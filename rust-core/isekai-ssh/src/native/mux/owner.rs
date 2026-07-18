@@ -28,6 +28,7 @@ use russh::client;
 use russh_stream_session::{open_channel, SessionKind};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Mutex;
 
 use crate::log_file::log_line;
 
@@ -35,13 +36,14 @@ use super::protocol::{read_frame, token_eq, write_frame, Frame, MUX_PROTOCOL_VER
 
 /// Accepts clients on `channel` for the life of the owner process, spawning an
 /// independent relay task per client (each opening its own shell channel on the
-/// shared `handle`). The handle is shared via `Arc` because `russh`'s
-/// `client::Handle` is not `Clone` — but `channel_open_session` takes `&self`,
-/// so many tasks can open independent channels concurrently through a shared
-/// reference. Returns only if `accept` itself fails (the underlying IPC channel
-/// died) — a single client's relay error is logged and contained, never
-/// propagated to sibling clients or the owner's own session.
-pub(crate) async fn serve_clients<C, H>(mut channel: C, handle: Arc<client::Handle<H>>, token: Arc<Vec<u8>>) -> Result<()>
+/// shared `handle`). The handle is shared via `Arc<Mutex<_>>` because `russh`'s
+/// `client::Handle` is not `Clone`; the mutex is held only for the brief
+/// `channel_open_session`/`streamlocal_forward` calls (the latter needs
+/// `&mut self`), never across a client's relay loop, so clients still stream
+/// concurrently. Returns only if `accept` itself fails (the underlying IPC
+/// channel died) — a single client's relay error is logged and contained,
+/// never propagated to sibling clients or the owner's own session.
+pub(crate) async fn serve_clients<C, H>(mut channel: C, handle: Arc<Mutex<client::Handle<H>>>, token: Arc<Vec<u8>>) -> Result<()>
 where
     C: ExclusiveChannel,
     H: client::Handler + 'static,
@@ -63,7 +65,7 @@ where
 /// Serves exactly one client: reads its [`Frame::Hello`] (validating the
 /// protocol version and auth token), opens a private remote shell channel with
 /// the client's requested PTY geometry, then relays until either side ends.
-pub(crate) async fn relay_client<Conn, H>(conn: Conn, handle: &client::Handle<H>, expected_token: &[u8]) -> Result<()>
+pub(crate) async fn relay_client<Conn, H>(conn: Conn, handle: &Mutex<client::Handle<H>>, expected_token: &[u8]) -> Result<()>
 where
     Conn: AsyncRead + AsyncWrite + Unpin + Send,
     H: client::Handler,
@@ -95,9 +97,14 @@ where
         .await
         .context("isekai-ssh mux owner: sending HelloAck failed")?;
 
-    let mut channel = open_channel(handle, &SessionKind::Shell { term, cols: cols as u32, rows: rows as u32 })
-        .await
-        .context("isekai-ssh mux owner: failed to open a shell channel for the client")?;
+    let mut channel = {
+        // Lock held only for the open; the relay below runs lock-free so one
+        // client's traffic never blocks another's channel open or forward.
+        let guard = handle.lock().await;
+        open_channel(&guard, &SessionKind::Shell { term, cols: cols as u32, rows: rows as u32 })
+            .await
+            .context("isekai-ssh mux owner: failed to open a shell channel for the client")?
+    };
 
     relay_loop(&mut reader, &mut writer, &mut channel).await
 }
@@ -274,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn relay_client_opens_a_shell_and_relays_stdin_and_stdout() {
         let addr = spawn_echo_server(120).await;
-        let handle = authed_handle(addr).await;
+        let handle = Mutex::new(authed_handle(addr).await);
         let token = b"correct-horse-battery-staple".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
@@ -316,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn relay_client_rejects_a_version_mismatch() {
         let addr = spawn_echo_server(121).await;
-        let handle = authed_handle(addr).await;
+        let handle = Mutex::new(authed_handle(addr).await);
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
@@ -334,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn relay_client_rejects_a_bad_token() {
         let addr = spawn_echo_server(122).await;
-        let handle = authed_handle(addr).await;
+        let handle = Mutex::new(authed_handle(addr).await);
         let token = b"the-real-token".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);
@@ -354,7 +361,7 @@ mod tests {
     #[tokio::test]
     async fn relay_client_requires_hello_first() {
         let addr = spawn_echo_server(123).await;
-        let handle = authed_handle(addr).await;
+        let handle = Mutex::new(authed_handle(addr).await);
         let token = b"tok".to_vec();
 
         let (mut client, owner_side) = tokio::io::duplex(4096);

@@ -282,7 +282,7 @@ mod tests {
         let owner_channel = InMemoryChannel::try_claim(name).await.unwrap();
         let serve_token = token.clone();
         tokio::spawn(async move {
-            let _ = owner::serve_clients(owner_channel, Arc::new(handle), serve_token).await;
+            let _ = owner::serve_clients(owner_channel, Arc::new(tokio::sync::Mutex::new(handle)), serve_token).await;
         });
 
         // A second try_claim must fail (owner exists) — the real dispatch's
