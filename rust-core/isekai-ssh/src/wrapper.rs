@@ -70,6 +70,16 @@ impl WrapperPlan {
     pub(crate) fn destination(&self) -> &str {
         &self.destination
     }
+
+    /// `--isekai-log-file <PATH>` (`log_file.rs`), if given. The native
+    /// connect path (`native/connect.rs::run`) reads this to call
+    /// `crate::log_file::init` itself, mirroring the `crate::log_file::init`
+    /// call `wrapper::run` (the Unix path) already makes — without this the
+    /// flag was silently ignored on Windows. Mirrors the existing
+    /// `destination()`/`pipe_path()` getters.
+    pub(crate) fn log_file(&self) -> Option<&Path> {
+        self.isekai.log_file.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,8 +395,10 @@ async fn run_ssh_with_connect_failure_recovery(
 
 /// Human-readable lead-in for the two `eprintln!`s above, branching on
 /// `ConnectOutcomeClass` purely for message accuracy — both classes drive
-/// the exact same [`ConnectFailureRecoveryAction`].
-fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> &'static str {
+/// the exact same [`ConnectFailureRecoveryAction`]. `pub(crate)` so the
+/// Windows-native connect path (`native/connect.rs`) can reuse the exact
+/// same message wording for its own mirror of this recovery flow.
+pub(crate) fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> &'static str {
     match class {
         isekai_pipe_core::ConnectOutcomeClass::StaleTrust => "cached trust looks stale",
         isekai_pipe_core::ConnectOutcomeClass::Unreachable => "the cached deployment could not be reached",
@@ -400,8 +412,13 @@ fn outcome_summary(class: &isekai_pipe_core::ConnectOutcomeClass) -> &'static st
 /// currently allowed. Pure decision, no I/O — split out from the
 /// surrounding async function so each branch is unit-testable without
 /// spawning a real `ssh`/bootstrap process.
+///
+/// `pub(crate)` so the Windows-native connect path (`native/connect.rs`)
+/// drives its own connect-failure recovery through the exact same decision
+/// (rather than duplicating the two-condition branch), keeping the
+/// "always-connects" policy single-sourced across the Unix and native paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectFailureRecoveryAction {
+pub(crate) enum ConnectFailureRecoveryAction {
     /// No connect-failure signal for this attempt — return the exit code
     /// as-is (e.g. the remote shell command itself exited non-zero; that
     /// never touches `isekai-pipe connect`'s own error path at all).
@@ -415,7 +432,7 @@ enum ConnectFailureRecoveryAction {
     RebootstrapAndRetry,
 }
 
-fn decide_connect_failure_recovery(connect_failure_signaled: bool, should_bootstrap: bool) -> ConnectFailureRecoveryAction {
+pub(crate) fn decide_connect_failure_recovery(connect_failure_signaled: bool, should_bootstrap: bool) -> ConnectFailureRecoveryAction {
     if !connect_failure_signaled {
         ConnectFailureRecoveryAction::NoRecoverableSignal
     } else if !should_bootstrap {
