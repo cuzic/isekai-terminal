@@ -17,6 +17,10 @@ use isekai_pipe_core::ServiceSpec;
 pub(crate) const EX_USAGE: u8 = 64;
 pub(crate) const EX_UNAVAILABLE: u8 = 69;
 
+/// Shares `isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS` (see its docs for
+/// why this must move in lockstep with `isekai-pipe serve --resume-window`'s
+/// own default) rather than a separately-tracked literal.
+
 /// Serializes tests (across `main.rs`/`ctl.rs`) that mutate process-global
 /// env vars (`ISEKAI_PIPE_PROFILES_DIR`/`ISEKAI_CTL_SOCK`). `cargo test`
 /// runs `#[test]` functions on multiple threads within the same process by
@@ -26,7 +30,7 @@ pub(crate) const EX_UNAVAILABLE: u8 = 69;
 /// `HOME_ENV_LOCK` for the same reason).
 #[cfg(test)]
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
-pub(crate) const DEFAULT_RESUME_WINDOW: Duration = Duration::from_secs(120);
+pub(crate) const DEFAULT_RESUME_WINDOW: Duration = Duration::from_secs(isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS);
 
 fn print_help() {
     println!("isekai-pipe - data plane for isekai-ssh");

@@ -209,7 +209,10 @@ fn print_help() {
     println!("    --bind-port-range <START>-<END> pick --bind's port from this range instead of");
     println!("                                   an OS-assigned one (requires --bind's port to be 0)");
     println!("    --idle-timeout <SECS>          QUIC transport idle timeout (default: 15)");
-    println!("    --resume-window <SECS>         how long a parked (disconnected) session stays resumable (default: 120)");
+    println!("    --resume-window <SECS>         backstop: how long a parked (disconnected) session stays");
+    println!("                                   resumable before being reclaimed, once capacity-based LRU");
+    println!("                                   eviction (--max-sessions) hasn't already reclaimed it sooner");
+    println!("                                   (default: {})", isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS);
     println!("    --resume-buffer-size <BYTES>   S->C replay buffer size per session (default: {DEFAULT_RESUME_BUFFER_SIZE})");
     println!("    --max-idle-lifetime <SECS>     self-exit after this many seconds with no active connection (default: 600)");
     println!("    --max-sessions <N>             max number of concurrently tracked resume sessions (default: {DEFAULT_MAX_SESSIONS});");
@@ -268,11 +271,19 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let mut bind_port_range: Option<(u16, u16)> = None;
     let mut idle_timeout = 15u64;
-    // 実機検証（Phase 8-4b）で、reattach が5回とも失敗する最悪ケースは
-    // 「各試行の QUIC handshake タイムアウト（`--idle-timeout` と同じ 15秒）」×5回 +
-    // 指数バックオフ合計15秒 で実測 約90秒かかることを確認した。90秒ちょうどだと
-    // ギリギリなので余裕を持たせて120秒にしてある。
-    let mut resume_window = 120u64;
+    // 元々は「reattach 5回の最悪ケース実測90秒+余裕」から逆算した120秒だった
+    // (実機検証Phase 8-4b、各試行のQUIC handshakeタイムアウト15秒×5回+バックオフ
+    // 合計15秒)が、これはネットワーク瞬断の検知+再試行予算としては妥当でも、
+    // ノートPC/スマホのスリープのような分〜時間オーダーの中断には短すぎた
+    // (実機で1時間48分のスリープ後、resumeが即座にUnknownSessionで失敗する
+    // 不具合として顕在化)。実際の資源保護は容量ベースのLRU立ち退き
+    // (`SessionTable::insert_existing`が`--max-sessions`超過時に最古のparked
+    // sessionを立ち退かせる、既存実装)が一次防御として機能しているため、この
+    // 値は「本当に誰も戻ってこないセッションを最終的に回収するバックストップ」
+    // という位置づけに変更し、trzsz-ssh/tsshd(同種のUDP常駐resumeデーモン)の
+    // `UdpAliveTimeout`既定(10日間)に倣った`isekai_pipe_core::
+    // DEFAULT_RESUME_GRACE_SECS`をそのまま既定値に使う。
+    let mut resume_window = isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS;
     let mut resume_buffer_size = DEFAULT_RESUME_BUFFER_SIZE;
     let mut max_idle_lifetime = 600u64;
     let mut max_sessions = DEFAULT_MAX_SESSIONS;
@@ -775,7 +786,13 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
     // park セッションが破棄済み」というタイミング不整合が起き、reattach が
     // 必ず REJECT_UNKNOWN_SESSION になる致命的な不具合を確認した。resume-window は
     // 検知にかかる時間 + reattach のリトライ予算（指数バックオフ計15秒）より
-    // 十分長い既定値（90秒）にしてある。
+    // 十分長くなければならない、という下限の理屈は変わらないが、この掃除自体は
+    // もはや一次防御ではない——`SessionTable::insert_existing`の容量ベースLRU
+    // 立ち退き（`--max-sessions`超過時に最古のparked sessionを立ち退かせる）が
+    // 資源圧迫時にはこちらより先に効く。この掃除は「容量に余裕があるままいつまでも
+    // 戻ってこないセッション」を最終的に回収するためだけのバックストップなので、
+    // 既定値は`isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`（trzsz-ssh/tsshdの
+    // `UdpAliveTimeout`に倣った10日間）まで伸ばしてある。
     {
         let sessions = sessions.clone();
         let attach_runtime = attach_runtime.clone();
