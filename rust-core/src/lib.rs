@@ -730,6 +730,80 @@ pub enum MouseReportingMode {
     AnyEvent,
 }
 
+/// マウスレポーティング(タスク#36)対象のボタン。左/中/右クリックに加え、
+/// モバイルでの主なユースケースであるホイール(縦スクロールジェスチャ)を含める
+/// (Fableレビュー指摘: wheelボタン64/65のエンコードを範囲に含める)。
+/// 横スクロールホイール(button 6/7)・追加ボタン(button 8以降)は現状使う予定が
+/// ないため未対応(必要になったタスクで追加する)。UI層(#50/#51)が生ポインタ
+/// イベントを`terminal_pointer_event_bytes`(タスク#51)へ渡す際にも使うため
+/// `uniffi::Enum`として公開する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+}
+
+/// マウスレポーティング(タスク#36)対象のイベント種別。`MouseButton`と同じ理由で
+/// `uniffi::Enum`として公開する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MouseEventKind {
+    /// ボタン押下(ホイールは常にこの種別で表す — ホイールにはreleaseの概念が無い)。
+    Press,
+    /// ボタン解放。
+    Release,
+    /// ポインタ移動。`button`が`Some`ならドラッグ(ボタンを押したまま移動)、
+    /// `None`なら単純なホバー移動。
+    Motion,
+}
+
+/// タスク#51: UI層(Android/iOSのジェスチャハンドラ)が座標付きの生ポインタ
+/// イベントを、現在のマウスレポーティング状態に従ってターミナルへ送るべき
+/// バイト列にエンコードする。`Terminal::encode_pointer_event`(タスク#36)と
+/// 同じロジック(`terminal::encode_pointer_event_bytes`)を、実行中のセッション
+/// (`SessionOrchestrator`)を経由せずに直接呼べる純粋関数として公開する
+/// (`terminal_special_key_bytes`/`terminal_commit_text_bytes`と同じ設計: UI層は
+/// 直近の`ScreenUpdate`から読んだ`mouse_reporting_mode`/`sgr_mouse_mode`/`cols`/
+/// `rows`をそのまま引数として渡すだけでよく、「今どのマウスモードか」の判断
+/// ロジック自体はここに一元化されたまま——rust-ssot: Kotlin/Swift側に判断ロジックの
+/// ミラーを作らない)。
+///
+/// 報告すべきでないイベント(`mouse_reporting_mode`がOff、またはモードが対象外の
+/// イベント種別)は`None`を返す。呼び出し元はこれを「何も送らない」の合図として
+/// 扱い、代わりに通常のタッチ処理(テキスト選択・スクロールバックスワイプ等)に
+/// フォールバックすればよい。
+///
+/// `row`/`col`は0-basedのセル座標(画面外の値は端末サイズ`cols`/`rows`へ
+/// クランプされる、`terminal::encode_pointer_event_bytes`のdocコメント参照)。
+#[uniffi::export]
+pub fn terminal_pointer_event_bytes(
+    kind: MouseEventKind,
+    button: Option<MouseButton>,
+    row: u32,
+    col: u32,
+    modifiers: TerminalKeyModifiers,
+    cols: u32,
+    rows: u32,
+    mouse_reporting_mode: MouseReportingMode,
+    sgr_mouse_mode: bool,
+) -> Option<Vec<u8>> {
+    terminal::encode_pointer_event_bytes(
+        terminal::PointerEvent {
+            row: row as usize,
+            col: col as usize,
+            kind,
+            button,
+            modifiers,
+        },
+        cols as usize,
+        rows as usize,
+        mouse_reporting_mode,
+        sgr_mouse_mode,
+    )
+}
+
 /// Sixel(`DCS Pa;Pb;Ph q ... ST`、タスク#42)でデコードされた画像1枚の配置情報。
 /// `Terminal`(rust-core)がデコード・配置・寿命管理を一元的に行う(rust-ssot:
 /// Android/iOSはこの構造体が指す矩形へ`rgba`をそのままビットマップ描画するだけで
@@ -1640,5 +1714,75 @@ mod terminal_key_mapping_tests {
         assert!(!text.contains("\r\n"));
         assert_eq!(bytes[0], 0x1B);
         assert_eq!(*bytes.last().unwrap(), 0x7E);
+    }
+}
+
+/// タスク#51: `terminal_pointer_event_bytes`(UI層がRustセッションを経由せず直接
+/// 呼べる、生ポインタイベント→バイト列のエンコード関数)の単体テスト。実際の
+/// エンコードロジック自体(モード別の報告可否・SGR/レガシー形式・クランプ)は
+/// `terminal.rs`の`encode_pointer_event_bytes`テスト群で既にカバー済みのため、
+/// ここでは「引数がそのまま委譲先へ届いているか」の配線だけを検証する。
+#[cfg(test)]
+mod terminal_pointer_event_bytes_tests {
+    use super::*;
+
+    const NO_MODS: TerminalKeyModifiers = TerminalKeyModifiers { shift: false, alt: false, ctrl: false, meta: false };
+
+    #[test]
+    fn off_mode_reports_nothing() {
+        assert_eq!(
+            terminal_pointer_event_bytes(
+                MouseEventKind::Press, Some(MouseButton::Left), 0, 0, NO_MODS,
+                80, 24, MouseReportingMode::Off, false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sgr_press_matches_terminal_encode_pointer_event() {
+        let bytes = terminal_pointer_event_bytes(
+            MouseEventKind::Press, Some(MouseButton::Left), 4, 9, NO_MODS,
+            80, 24, MouseReportingMode::Normal, true,
+        );
+        assert_eq!(bytes, Some(b"\x1b[<0;10;5M".to_vec()));
+    }
+
+    #[test]
+    fn legacy_x10_release_always_reports_no_button() {
+        let bytes = terminal_pointer_event_bytes(
+            MouseEventKind::Release, Some(MouseButton::Left), 4, 9, NO_MODS,
+            80, 24, MouseReportingMode::Normal, false,
+        );
+        assert_eq!(bytes, Some(vec![0x1B, b'[', b'M', 32 + 3, 32 + 10, 32 + 5]));
+    }
+
+    #[test]
+    fn out_of_bounds_coordinates_clamp_to_terminal_size() {
+        let bytes = terminal_pointer_event_bytes(
+            MouseEventKind::Press, Some(MouseButton::Left), 1000, 1000, NO_MODS,
+            80, 24, MouseReportingMode::Normal, true,
+        );
+        assert_eq!(bytes, Some(b"\x1b[<0;80;24M".to_vec()));
+    }
+
+    #[test]
+    fn motion_without_button_is_suppressed_in_button_event_mode() {
+        assert_eq!(
+            terminal_pointer_event_bytes(
+                MouseEventKind::Motion, None, 1, 1, NO_MODS,
+                80, 24, MouseReportingMode::ButtonEvent, true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn motion_without_button_is_reported_in_any_event_mode() {
+        let bytes = terminal_pointer_event_bytes(
+            MouseEventKind::Motion, None, 2, 2, NO_MODS,
+            80, 24, MouseReportingMode::AnyEvent, true,
+        );
+        assert_eq!(bytes, Some(b"\x1b[<35;3;3M".to_vec()));
     }
 }
