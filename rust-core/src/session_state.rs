@@ -99,6 +99,26 @@ impl SessionState {
         }
     }
 
+    /// OSのフォーカス変化(タスク#60: タブ/split pane切替・アプリのbackground/foreground等)
+    /// をそのまま受け取り、フォーカスレポーティング(`?1004`)が有効な場合のみ
+    /// `SideEffect::SendStdin`としてエンコード済みのシーケンスを返す
+    /// ([Terminal::encode_focus_event]参照)。無効時は`ProcessResult`が空のまま返る
+    /// (画面には影響しないため`screen_dirty`も立てない)。
+    pub(crate) fn notify_focus_change(&mut self, focused: bool) -> ProcessResult {
+        let mut side_effects = Vec::new();
+        if let Some(bytes) = self.terminal.encode_focus_event(focused) {
+            side_effects.push(SideEffect::SendStdin(bytes));
+        }
+        ProcessResult {
+            timer_cmds: Vec::new(),
+            side_effects,
+            pending_rows: Vec::new(),
+            screen_dirty: false,
+            pending_clipboard_write: None,
+            clipboard_pull_requested: false,
+        }
+    }
+
     pub(crate) fn on_stdout(&mut self, bytes: Vec<u8>) -> ProcessResult {
         let resp = self.fsm.on_event(TrzszEvent::StdoutBytes(bytes));
         self.apply(resp)
@@ -236,6 +256,35 @@ mod tests {
         assert_eq!(r.side_effects.len(), 1);
         match &r.side_effects[0] {
             SideEffect::SendStdin(bytes) => assert_eq!(bytes, b"\x1b[1;1R"),
+            other => panic!("expected SideEffect::SendStdin, got a different variant: {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_notify_focus_change_noop_when_mode_off() {
+        // タスク#60: `?1004`が有効化されていなければ何も送らない。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let r = state.notify_focus_change(true);
+        assert!(r.side_effects.is_empty());
+        assert!(!r.screen_dirty);
+    }
+
+    #[test]
+    fn test_notify_focus_change_produces_send_stdin_when_mode_on() {
+        // タスク#60: `?1004`有効時、OS由来のフォーカス変化がCSI I/CSI Oとして
+        // 既存のSideEffect::SendStdin経路にそのまま乗る。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        state.on_stdout(b"\x1b[?1004h".to_vec());
+        let gained = state.notify_focus_change(true);
+        assert_eq!(gained.side_effects.len(), 1);
+        match &gained.side_effects[0] {
+            SideEffect::SendStdin(bytes) => assert_eq!(bytes, b"\x1b[I"),
+            other => panic!("expected SideEffect::SendStdin, got a different variant: {:?}", std::mem::discriminant(other)),
+        }
+        let lost = state.notify_focus_change(false);
+        assert_eq!(lost.side_effects.len(), 1);
+        match &lost.side_effects[0] {
+            SideEffect::SendStdin(bytes) => assert_eq!(bytes, b"\x1b[O"),
             other => panic!("expected SideEffect::SendStdin, got a different variant: {:?}", std::mem::discriminant(other)),
         }
     }

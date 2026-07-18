@@ -255,6 +255,9 @@ impl MultipathIsekaiPipeQuicSession {
 
     pub(crate) fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
 
+    /// タスク#60: OSのフォーカス変化をそのまま`SessionCore`へ転送する。
+    pub(crate) fn notify_focus_change(&self, focused: bool) { self.core.notify_focus_change(focused); }
+
     pub(crate) fn disconnect(&self) { self.core.disconnect(); }
 
     pub(crate) fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
