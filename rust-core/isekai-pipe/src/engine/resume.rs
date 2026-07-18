@@ -157,6 +157,16 @@ pub struct Session {
     pub parked_since: Option<std::time::Instant>,
     /// S→C output buffer に空きが戻ったことを relay loop へ伝える通知。
     pub output_space_available: Arc<Notify>,
+    /// `ATTACH_HELLO`のACK(`AttachResponse::Ready::negotiated_resume_grace_secs`、
+    /// `engine/mod.rs::effective_resume_grace`)でこのクライアントに約束した
+    /// 実効resume-grace。`None`はこのフィールドを気にしないテスト用の構築
+    /// (`Session::new`の既定)を表し、`sweep_expired_parked`はグローバルな
+    /// `--resume-window`をそのまま使う。`Some`の場合、`sweep_expired_parked`
+    /// はグローバルな窓とこの値の**短い方**を使う——ACKで「あなたのセッションは
+    /// N秒だけparkされ続けます」と約束しておきながら、実際には(グローバルな
+    /// `--resume-window`が伸びるたびに)無条件でそれより長く保持し続けるのは、
+    /// クライアントへの約束を破っている(Fableレビュー指摘)。
+    pub negotiated_resume_grace_secs: Option<u32>,
 }
 
 impl Session {
@@ -167,6 +177,7 @@ impl Session {
             parked_tcp: None,
             parked_since: None,
             output_space_available: Arc::new(Notify::new()),
+            negotiated_resume_grace_secs: None,
         }
     }
 }
@@ -312,6 +323,13 @@ impl SessionTable {
     /// アクティブなセッション（`parked_tcp` が `None`）には触れない。
     /// HELPER_PROTOCOL.md §7.5「一定時間 resume が来なければ破棄する」の実装。
     ///
+    /// 各セッションの実際の締切は `max_parked`(サーバー全体の
+    /// `--resume-window`)と `Session::negotiated_resume_grace_secs`(その
+    /// セッションのACKで実際に約束した値、`Some`の場合のみ)の**短い方**——
+    /// クライアントが希望してACKで確認された値より長く保持し続けることは、
+    /// (グローバルな`--resume-window`が伸びるたびに)ACKでの約束を無条件に
+    /// 破ることになるため(Fableレビュー指摘)。
+    ///
     /// 破棄した `SessionId` を返す — この `SessionTable` だけでは
     /// `AttachArbiter`(`engine/attach_arbiter.rs`)の fencing slot には触れられない
     /// (この型はそちらを知らない、`engine/mod.rs`の呼び出し元だけが両方を持つ)ため、
@@ -368,7 +386,11 @@ impl SessionTable {
             for (id, handle) in inner.iter() {
                 let session = handle.lock().await;
                 if let Some(since) = session.parked_since {
-                    if since.elapsed() >= max_parked {
+                    let deadline = match session.negotiated_resume_grace_secs {
+                        Some(secs) => max_parked.min(std::time::Duration::from_secs(secs as u64)),
+                        None => max_parked,
+                    };
+                    if since.elapsed() >= deadline {
                         expired.push(*id);
                     }
                 }
@@ -535,6 +557,52 @@ mod tests {
             table.contains(&active_id).await,
             "アクティブな session には触れないはず"
         );
+    }
+
+    /// Fableレビュー指摘の回帰テスト: グローバルな`--resume-window`が長くても、
+    /// ACKで短い`negotiated_resume_grace_secs`を約束したセッションは、
+    /// その短い方の締切で破棄される(=ACKでの約束が実際に守られる)。
+    #[tokio::test]
+    async fn sweep_expired_parked_honors_a_shorter_negotiated_grace_than_the_global_window() {
+        let table = SessionTable::new();
+        // グローバルな窓は長い(10日相当を模して1時間)が、このセッションは
+        // ACKで短い猶予(5秒)しか約束していない想定。
+        let max_parked = std::time::Duration::from_secs(3600);
+
+        let id = SessionTable::generate_session_id();
+        let mut session = Session::new(1024);
+        session.parked_tcp = Some(dummy_parked_tcp().await);
+        session.parked_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        session.negotiated_resume_grace_secs = Some(5);
+        table.insert(id, session).await;
+
+        table.sweep_expired_parked(max_parked).await;
+
+        assert!(
+            !table.contains(&id).await,
+            "negotiated_resume_grace_secsで約束した短い猶予を過ぎていれば、\
+             グローバルな窓がまだ残っていても破棄されるはず"
+        );
+    }
+
+    /// `negotiated_resume_grace_secs`が`None`(通常は使わない、テスト用の
+    /// 素の`Session::new`のみ)の場合は、これまで通りグローバルな窓だけを
+    /// 使う後方互換の挙動。
+    #[tokio::test]
+    async fn sweep_expired_parked_falls_back_to_the_global_window_without_a_negotiated_grace() {
+        let table = SessionTable::new();
+        let max_parked = std::time::Duration::from_secs(30);
+
+        let id = SessionTable::generate_session_id();
+        let mut session = Session::new(1024);
+        session.parked_tcp = Some(dummy_parked_tcp().await);
+        session.parked_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        assert_eq!(session.negotiated_resume_grace_secs, None);
+        table.insert(id, session).await;
+
+        table.sweep_expired_parked(max_parked).await;
+
+        assert!(table.contains(&id).await, "グローバルな窓(30秒)内なので破棄されないはず");
     }
 
     /// `claim_parked`の3分岐: parkされたsessionは`Claimed`で実際にtableから

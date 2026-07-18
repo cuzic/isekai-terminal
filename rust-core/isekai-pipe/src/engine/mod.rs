@@ -1165,7 +1165,12 @@ async fn handle_attach_stream(
     };
 
     let (tcp_read, tcp_write) = tcp.into_split();
-    let handle = Arc::new(Mutex::new(Session::new(resume_buffer_size)));
+    let mut new_session = Session::new(resume_buffer_size);
+    // ACKで実際に約束した値をセッションに刻んでおく — `sweep_expired_parked`
+    // がグローバルな`--resume-window`だけでなくこれも尊重できるようにする
+    // (`Session::negotiated_resume_grace_secs`のdocs参照)。
+    new_session.negotiated_resume_grace_secs = Some(negotiated_resume_grace_secs);
+    let handle = Arc::new(Mutex::new(new_session));
     let session_id_bytes = *hello.session_id.as_bytes();
     if let resume::InsertOutcome::InsertedAfterEvicting(evicted_id) =
         sessions.insert_existing(session_id_bytes, handle.clone()).await
