@@ -576,9 +576,9 @@ pub struct CellData {
 /// DECSCUSR(`CSI Ps SP q`)が選択するカーソル形状。`Terminal`が状態として保持し
 /// (rust-ssot: Kotlin/Swift側にミラー状態を作らず、この値をそのまま描画に使う)、
 /// `ScreenUpdate::cursor_shape`として公開する。点滅の有無は別フィールド
-/// (`ScreenUpdate::cursor_blink`)で表現する——将来のDECSET `?12`(タスク#55、
-/// 点滅on/offのみを切り替えるレガシー制御)がDECSCUSRとは独立に同じ
-/// `cursor_blink`フィールドを更新できるよう、形状と点滅を分離してある。
+/// (`ScreenUpdate::cursor_blink`)で表現する——DECSET/DECRST `?12`(`CSI ?12h`/
+/// `CSI ?12l`、点滅on/offのみを切り替えるレガシー制御、タスク#55)がDECSCUSRとは
+/// 独立に同じ`cursor_blink`フィールドを更新できるよう、形状と点滅を分離してある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum CursorShape {
     Block,
