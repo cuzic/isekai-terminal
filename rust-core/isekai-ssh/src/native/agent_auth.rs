@@ -41,10 +41,39 @@ pub(crate) enum AgentTarget {
 /// `PathBuf` that may hold a real path or the sentinel `"none"`/
 /// `"SSH_AUTH_SOCK"` — see that crate's docs) into an [`AgentTarget`].
 pub(crate) fn resolve_agent_target(identity_agent: Option<&std::path::Path>) -> AgentTarget {
+    resolve_agent_target_from(identity_agent, |key| std::env::var(key).ok())
+}
+
+/// Pure helper split out of [`resolve_agent_target`] purely so the
+/// `SSH_AUTH_SOCK` sentinel can be unit-tested with an injected environment
+/// lookup instead of mutating the real process environment
+/// (`std::env::set_var` is process-global and races against
+/// concurrently-running tests — same rationale as
+/// `isekai-fs-guard::resolve_home_dir_from`/`openssh_config::expand_tilde_with`).
+///
+/// Codex review finding: `IdentityAgent SSH_AUTH_SOCK` is a documented
+/// `ssh_config(5)` sentinel meaning "use whatever the `SSH_AUTH_SOCK`
+/// environment variable currently holds" — it is not a literal named pipe
+/// called `SSH_AUTH_SOCK`. The first version of this function treated it as
+/// a literal path, which would have tried (and failed) to connect to a pipe
+/// that doesn't exist instead of resolving the env var.
+fn resolve_agent_target_from(
+    identity_agent: Option<&std::path::Path>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> AgentTarget {
     match identity_agent {
         None => AgentTarget::Default,
         Some(path) => match path.to_str() {
             Some(s) if s.eq_ignore_ascii_case("none") => AgentTarget::None,
+            Some(s) if s.eq_ignore_ascii_case("SSH_AUTH_SOCK") => match env_lookup("SSH_AUTH_SOCK") {
+                Some(value) if !value.is_empty() => AgentTarget::Path(value),
+                // The env var this sentinel explicitly points at isn't
+                // set — there's nothing to connect to. Deliberately not
+                // AgentTarget::Default: the user asked for this specific
+                // env var, not "fall back to whatever the platform
+                // default would have been".
+                _ => AgentTarget::None,
+            },
             _ => AgentTarget::Path(path.display().to_string()),
         },
     }
@@ -130,6 +159,33 @@ mod tests {
         assert_eq!(
             resolve_agent_target(Some(&PathBuf::from(r"\\.\pipe\my-custom-agent"))),
             AgentTarget::Path(r"\\.\pipe\my-custom-agent".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_agent_target_ssh_auth_sock_sentinel_reads_the_env_var() {
+        let target = resolve_agent_target_from(
+            Some(&PathBuf::from("SSH_AUTH_SOCK")),
+            |key| if key == "SSH_AUTH_SOCK" { Some(r"\\.\pipe\from-env".to_string()) } else { None },
+        );
+        assert_eq!(target, AgentTarget::Path(r"\\.\pipe\from-env".to_string()));
+    }
+
+    #[test]
+    fn resolve_agent_target_ssh_auth_sock_sentinel_is_case_insensitive() {
+        let target = resolve_agent_target_from(
+            Some(&PathBuf::from("ssh_auth_sock")),
+            |_| Some(r"\\.\pipe\from-env".to_string()),
+        );
+        assert_eq!(target, AgentTarget::Path(r"\\.\pipe\from-env".to_string()));
+    }
+
+    #[test]
+    fn resolve_agent_target_ssh_auth_sock_sentinel_with_unset_env_disables_agent() {
+        let target = resolve_agent_target_from(Some(&PathBuf::from("SSH_AUTH_SOCK")), |_| None);
+        assert_eq!(
+            target, AgentTarget::None,
+            "an explicit SSH_AUTH_SOCK sentinel with the env var unset must not silently fall back to the platform default"
         );
     }
 
