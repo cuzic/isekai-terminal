@@ -513,4 +513,35 @@ class TerminalInputConnectionTest {
         keyDownMeta(KeyEvent.KEYCODE_A, KeyEvent.META_CTRL_ON)
         assertArrayEquals(byteArrayOf(0x01), sentBytes[0])
     }
+
+    // --- 物理修飾キー付き特殊キー(タスク#30、Codexレビュー指摘: Ctrl+矢印が通常矢印として
+    //     扱われてしまうバグの修正確認) ---
+
+    @Test
+    fun sendKeyEvent_physicalCtrlPlusArrowUp_sendsModifiedCsiSequence() {
+        keyDownMeta(KeyEvent.KEYCODE_DPAD_UP, KeyEvent.META_CTRL_ON)
+        // ESC[1;5A（xterm互換のCtrl修飾子付きCSI、rust-core `terminal_special_key_bytes`(#29)と同一）
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x41), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_physicalCtrlPlusArrowUp_ignoresApplicationCursorMode() {
+        view.applicationCursorMode = true
+        keyDownMeta(KeyEvent.KEYCODE_DPAD_UP, KeyEvent.META_CTRL_ON)
+        // 修飾子付きは常にCSI形式(DECCKMが有効でもSS3にはならない)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x41), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_physicalShiftPlusTab_sendsCbt() {
+        keyDownMeta(KeyEvent.KEYCODE_TAB, KeyEvent.META_SHIFT_ON)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x5A), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_plainArrowUp_stillUnaffectedByModifierChange() {
+        // 修飾なしの場合の既存挙動(applicationCursorMode=false → CSI)に回帰が無いことを確認
+        keyDown(KeyEvent.KEYCODE_DPAD_UP)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x41), sentBytes[0])
+    }
 }

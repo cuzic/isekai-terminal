@@ -3,6 +3,7 @@ package tools.isekai.terminal
 import tools.isekai.terminal.input.TerminalKeyEncoder
 import org.junit.Assert.*
 import org.junit.Test
+import uniffi.isekai_terminal_core.TerminalKeyModifiers
 
 class TerminalKeyEncoderTest {
 
@@ -353,5 +354,115 @@ class TerminalKeyEncoderTest {
     @Test
     fun `alt plus control char prefixes ESC before the raw control byte`() {
         assertArrayEquals(byteArrayOf(0x1B, 0x03), TerminalKeyEncoder.altKeyBytes(0x03))
+    }
+
+    // ── specialKeyBytes with modifiers（rust-core `terminal_special_key_bytes`(タスク#29)
+    //    と同一golden表。rust-core/src/lib.rs のテストと1対1で対応させている） ──────
+
+    private val ctrlMod = TerminalKeyModifiers(shift = false, alt = false, ctrl = true, meta = false)
+    private val shiftMod = TerminalKeyModifiers(shift = true, alt = false, ctrl = false, meta = false)
+    private val shiftCtrlMod = TerminalKeyModifiers(shift = true, alt = false, ctrl = true, meta = false)
+
+    @Test
+    fun `ctrl plus arrow keys always use CSI form regardless of DECCKM`() {
+        // DECCKM無効時
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x41),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_UP, applicationCursorMode = false, modifiers = ctrlMod),
+        )
+        // DECCKM有効時でも修飾子付きはSS3にならずCSI形式のまま
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x41),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_UP, applicationCursorMode = true, modifiers = ctrlMod),
+        )
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x42),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_DOWN, applicationCursorMode = true, modifiers = ctrlMod),
+        )
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x43),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_RIGHT, applicationCursorMode = true, modifiers = ctrlMod),
+        )
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x44),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_LEFT, applicationCursorMode = true, modifiers = ctrlMod),
+        )
+    }
+
+    @Test
+    fun `shift plus arrow up uses xterm modifier 2`() {
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x32, 0x41),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_UP, applicationCursorMode = false, modifiers = shiftMod),
+        )
+    }
+
+    @Test
+    fun `home end with modifiers use parameterized CSI`() {
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x48),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_MOVE_HOME, modifiers = ctrlMod),
+        )
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x46),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_MOVE_END, modifiers = ctrlMod),
+        )
+    }
+
+    @Test
+    fun `page up down with modifiers use parameterized tilde`() {
+        assertArrayEquals(
+            "\u001B[5;5~".toByteArray(Charsets.US_ASCII),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_UP, modifiers = ctrlMod),
+        )
+        assertArrayEquals(
+            "\u001B[6;5~".toByteArray(Charsets.US_ASCII),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_DOWN, modifiers = ctrlMod),
+        )
+    }
+
+    @Test
+    fun `F1 to F4 switch from SS3 to CSI when modified`() {
+        assertArrayEquals(
+            "\u001B[1;5P".toByteArray(Charsets.US_ASCII),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F1, modifiers = ctrlMod),
+        )
+        assertArrayEquals(
+            "\u001B[1;5S".toByteArray(Charsets.US_ASCII),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F4, modifiers = ctrlMod),
+        )
+    }
+
+    @Test
+    fun `F5 to F12 use parameterized tilde when modified`() {
+        assertArrayEquals(
+            "\u001B[15;5~".toByteArray(Charsets.US_ASCII),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F5, modifiers = ctrlMod),
+        )
+        assertArrayEquals(
+            "\u001B[24;5~".toByteArray(Charsets.US_ASCII),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F12, modifiers = ctrlMod),
+        )
+    }
+
+    @Test
+    fun `shift tab maps to CBT`() {
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x5A),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_TAB, modifiers = shiftMod),
+        )
+    }
+
+    @Test
+    fun `tab with non-shift modifiers falls back to plain tab`() {
+        assertArrayEquals(byteArrayOf(0x09), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_TAB, modifiers = ctrlMod))
+        assertArrayEquals(byteArrayOf(0x09), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_TAB, modifiers = shiftCtrlMod))
+    }
+
+    @Test
+    fun `keys unaffected by modifiers stay the same`() {
+        assertArrayEquals(byteArrayOf(0x0D), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_ENTER, modifiers = ctrlMod))
+        assertArrayEquals(byteArrayOf(0x7F), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DEL, modifiers = ctrlMod))
+        assertArrayEquals(byteArrayOf(0x1B), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_ESCAPE, modifiers = ctrlMod))
     }
 }

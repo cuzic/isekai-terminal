@@ -661,10 +661,14 @@ fun TerminalScreenBody(
                     CtrlBtn("^C") { actions.onSend(byteArrayOf(0x03)) }
                     CtrlBtn("^D") { actions.onSend(byteArrayOf(0x04)) }
                     CtrlBtn("^Z") { actions.onSend(byteArrayOf(0x1A)) }
-                    CtrlBtn("↑") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x41)) }
-                    CtrlBtn("↓") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x42)) }
-                    CtrlBtn("←") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x44)) }
-                    CtrlBtn("→") { actions.onSend(byteArrayOf(0x1B, 0x5B, 0x43)) }
+                    // 矢印ボタンはDECCKM(applicationCursorMode)に従ってSS3/CSI形式を切り替える
+                    // 必要があるため、固定バイト列ではなくspecialKeyBytes経由にする(タスク#30、
+                    // 以前はDECCKMを無視する既存バグだった。vim等のアプリケーションカーソルモード
+                    // 中でもこのボタンから正しいシーケンスが送られるようにする)。
+                    CtrlBtn("↑") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_UP, screenUpdate?.applicationCursorMode ?: false)!!) }
+                    CtrlBtn("↓") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_DOWN, screenUpdate?.applicationCursorMode ?: false)!!) }
+                    CtrlBtn("←") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_LEFT, screenUpdate?.applicationCursorMode ?: false)!!) }
+                    CtrlBtn("→") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_RIGHT, screenUpdate?.applicationCursorMode ?: false)!!) }
                     CtrlBtn("貼付", onClick = performPaste)
                     CtrlBtn("定型") { showSnippetSheet = true }
                     CtrlBtn("打鍵") { showKeySequenceSheet = true }
