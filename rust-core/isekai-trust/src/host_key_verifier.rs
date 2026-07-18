@@ -171,7 +171,7 @@ impl FileBackedHostKeyVerifier {
         match outcome {
             Ok(Ok(resolved)) => resolved,
             Ok(Err(e)) => {
-                log::warn!("{log_context}: SSH host key trust store operation failed, rejecting connection: {e}");
+                log::error!("{log_context}: SSH host key trust store operation failed, rejecting connection: {e}");
                 Resolved::Failed
             }
             Err(join_error) => {
