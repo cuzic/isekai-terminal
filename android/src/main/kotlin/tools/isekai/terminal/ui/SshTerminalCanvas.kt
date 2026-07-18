@@ -13,8 +13,10 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
+import java.nio.ByteBuffer
 import kotlin.math.ceil
 import uniffi.isekai_terminal_core.CellData
+import uniffi.isekai_terminal_core.ImagePlacement
 import uniffi.isekai_terminal_core.ScreenUpdate
 
 /**
@@ -128,6 +130,52 @@ internal class GridRenderCache {
     }
 }
 
+/**
+ * Sixel(タスク#42)の`ImagePlacement.rgba`から作った`Bitmap`をid単位でキャッシュする。
+ * `ScreenUpdate.images`はTerminal(rust-core)側で寿命管理された「現在アクティブな
+ * 画像の全リスト」がそのまま渡ってくる(rust-ssot: どの画像がまだ生きているかの
+ * 判断はRust側で完結している)ため、この層は判断ロジックを持たず「今回のリストに
+ * 無いidのBitmapを捨て、まだキャッシュに無いidだけ新規デコードする」宣言的な
+ * 反映のみを行う。
+ */
+internal class SixelBitmapCache {
+    private val cache = mutableMapOf<ULong, Bitmap>()
+
+    /**
+     * Rust側`sixel.rs`の`MAX_SIXEL_DIM`/`MAX_SIXEL_AREA`と同じ上限をここでも二重に
+     * 適用する。通常経路ではRust側で既に弾かれているはずだが、将来別の画像プロトコル
+     * (#53等)が同じ`ImagePlacement`を再利用した場合や、寸法とバッファ長が矛盾する
+     * 壊れたデータが来た場合に、巨大`Bitmap`確保やクラッシュへ直結させないための
+     * 防御(codexレビュー指摘)。
+     */
+    private fun isSane(img: ImagePlacement, w: Int, h: Int): Boolean {
+        if (w <= 0 || h <= 0) return false
+        if (w > 4096 || h > 4096) return false
+        if (w.toLong() * h.toLong() > 4_000_000L) return false
+        return img.rgba.size.toLong() == w.toLong() * h.toLong() * 4L
+    }
+
+    fun bitmapsFor(images: List<ImagePlacement>): Map<ULong, Bitmap> {
+        // 画像が0件になった場合(Rust側でclear_images()された等)も必ず呼ばれる想定。
+        // liveIdsが空集合になり、retainAllで古いBitmapが全て解放される(codexレビュー指摘:
+        // 呼び出し側がisNotEmpty()で早期returnしていると、寿命が尽きた画像のBitmapが
+        // 解放されずに残り続けてしまう)。
+        val liveIds = images.map { it.id }.toSet()
+        cache.keys.retainAll(liveIds)
+        for (img in images) {
+            if (img.id !in cache) {
+                val w = img.widthPx.toInt()
+                val h = img.heightPx.toInt()
+                if (!isSane(img, w, h)) continue
+                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                bmp.copyPixelsFromBuffer(ByteBuffer.wrap(img.rgba))
+                cache[img.id] = bmp
+            }
+        }
+        return cache
+    }
+}
+
 @Composable
 fun SshTerminalCanvas(
     update: ScreenUpdate,
@@ -150,6 +198,7 @@ fun SshTerminalCanvas(
     }
     val fontFit = remember { FontFitCache() }
     val gridCache = remember { GridRenderCache() }
+    val sixelCache = remember { SixelBitmapCache() }
 
     Canvas(modifier = modifier.background(theme.background)) {
         val cols = update.cols.toInt()
@@ -221,6 +270,31 @@ fun SshTerminalCanvas(
             dstOffset = IntOffset.Zero,
             dstSize = IntSize(pixelW, pixelH),
         )
+
+        // Sixel画像(タスク#42)。テキストグリッドの上・カーソル/選択ハイライトの下に
+        // 重ねる(実端末でも画像の上にカーソルが乗ることがあるのと同じ描画順)。
+        // 配置(row/col/rows_span/cols_span)の判断は一切ここでは行わず、Rust側が
+        // 決めた矩形へ`rgba`を引き伸ばして描くだけ(rust-ssot)。
+        // update.imagesが空でも必ずbitmapsForを呼ぶ(寿命が尽きた画像のBitmapを
+        // キャッシュから解放するため。isNotEmpty()で早期returnしていた旧実装は
+        // 画像が0件になった後もBitmapを保持し続けるリークがあった。codexレビュー指摘)。
+        run {
+            val bitmaps = sixelCache.bitmapsFor(update.images)
+            for (placement in update.images) {
+                val src = bitmaps[placement.id] ?: continue
+                drawImage(
+                    image = src.asImageBitmap(),
+                    dstOffset = IntOffset(
+                        (placement.col.toInt() * cellW).toInt(),
+                        (placement.row.toInt() * cellH).toInt(),
+                    ),
+                    dstSize = IntSize(
+                        (placement.colsSpan.toInt() * cellW).toInt().coerceAtLeast(1),
+                        (placement.rowsSpan.toInt() * cellH).toInt().coerceAtLeast(1),
+                    ),
+                )
+            }
+        }
 
         // カーソル(Bitmap キャッシュ対象外。テーマのカーソル色が変わってもキャッシュキーを
         // 増やす必要がないよう、選択ハイライトと同様に毎フレーム軽量に描画し直す)
