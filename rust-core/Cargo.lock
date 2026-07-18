@@ -3106,6 +3106,8 @@ dependencies = [
  "async-trait",
  "russh",
  "russh-keys",
+ "signature",
+ "ssh-encoding",
  "thiserror 2.0.18",
  "tokio",
  "zeroize",

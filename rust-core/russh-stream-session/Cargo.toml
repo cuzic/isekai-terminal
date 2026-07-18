@@ -18,3 +18,9 @@ zeroize = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# Only for the authenticate_with_signer test's FakeSigner, which needs to
+# produce a real SSH signature blob (same versions russh-keys' own `ssh-key`
+# dependency pins, so there's no risk of a duplicate/mismatched version in
+# the dependency graph).
+ssh-encoding = "0.2"
+signature = "2"

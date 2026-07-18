@@ -43,6 +43,8 @@ pub enum SessionError {
     InvalidPrivateKey(russh_keys::ssh_key::Error),
     #[error("authentication request failed: {0}")]
     Auth(russh::Error),
+    #[error("agent-backed authentication failed: {0}")]
+    AgentAuth(russh::AgentAuthError),
 }
 
 /// Verifies a server's host-key fingerprint (SHA-256, as produced by
@@ -211,6 +213,31 @@ pub async fn authenticate_session<H: client::Handler>(
             session.authenticate_publickey(username, Arc::new(key)).await.map_err(SessionError::Auth)
         }
     }
+}
+
+/// Authenticates `session` as `username` by asking `signer` — typically a
+/// [`russh_keys::agent::client::AgentClient`] (russh provides a blanket
+/// [`russh::Signer`] impl for it, over any `AsyncRead + AsyncWrite`
+/// transport: a Unix socket, a Windows named pipe, or Pageant) — to sign the
+/// server's challenge for `public_key`, instead of holding private key
+/// material in this process at all. `Ok(false)` means the server declined
+/// (`public_key` isn't authorized); `Err` means the signer itself failed
+/// (agent connection dropped mid-request, agent declined to sign, ...).
+///
+/// Callers are responsible for choosing *which* `public_key` to try (e.g.
+/// via the agent's own `request_identities()`) — this function attempts
+/// exactly one.
+pub async fn authenticate_with_signer<H, S>(
+    session: &mut client::Handle<H>,
+    username: &str,
+    public_key: PublicKey,
+    signer: &mut S,
+) -> Result<bool, SessionError>
+where
+    H: client::Handler,
+    S: russh::Signer<Error = russh::AgentAuthError>,
+{
+    session.authenticate_publickey_with(username, public_key, signer).await.map_err(SessionError::AgentAuth)
 }
 
 /// What kind of session channel to open: an interactive PTY+shell, or a
@@ -532,5 +559,70 @@ mod tests {
             result.is_err(),
             "a HostKeyVerifier that always returns false must abort the connection, not silently proceed"
         );
+    }
+
+    /// A `russh::Signer` that signs locally with an in-memory key instead of
+    /// talking to a real external agent process — this test's whole point is
+    /// to prove `authenticate_with_signer` correctly drives russh's
+    /// `authenticate_publickey_with`/`Signer` flow, which is identical
+    /// whether the signer on the other end is a real
+    /// `russh_keys::agent::client::AgentClient` (Unix socket, Windows named
+    /// pipe, or Pageant — russh provides the `Signer` impl for all of them)
+    /// or, as here, anything else implementing the same trait. No real OS
+    /// agent process needed to exercise this.
+    struct FakeSigner {
+        key: PrivateKey,
+    }
+
+    #[async_trait]
+    impl russh::Signer for FakeSigner {
+        type Error = russh::AgentAuthError;
+
+        async fn auth_publickey_sign(
+            &mut self,
+            _key: &PublicKey,
+            mut to_sign: russh::CryptoVec,
+        ) -> Result<russh::CryptoVec, Self::Error> {
+            use signature::Signer as _;
+            use ssh_encoding::Encode;
+
+            // Reproduces exactly the wire format a real agent's
+            // `SIGN_RESPONSE` produces (russh-keys'
+            // `AgentClient::write_signature`): the original challenge bytes,
+            // followed by a 4-byte length prefix, followed by the
+            // signature blob (`Signature`'s own `Encode` impl already
+            // writes `[string algorithm][string raw_bytes]`, which is that
+            // same blob).
+            let signature = self.key.try_sign(&to_sign).expect("signing with a known-good in-memory test key must not fail");
+            let mut sig_bytes = Vec::new();
+            signature.encode(&mut sig_bytes).expect("encoding a signature must not fail");
+            (sig_bytes.len() as u32).encode(&mut to_sign).expect("encoding a length prefix must not fail");
+            for byte in sig_bytes {
+                to_sign.push(byte);
+            }
+            Ok(to_sign)
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticate_with_signer_succeeds_against_a_real_server() {
+        let addr = spawn_server(EchoExecServer, 8).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            || verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let keypair = Ed25519Keypair::from_seed(&[42u8; 32]);
+        let private_key = PrivateKey::from(keypair);
+        let public_key = private_key.public_key().clone();
+        let mut signer = FakeSigner { key: private_key };
+
+        let authed = authenticate_with_signer(&mut session.handle, "tester", public_key, &mut signer)
+            .await
+            .expect("authenticate_with_signer should not error against a server that accepts any public key");
+        assert!(authed, "the server accepts any public key, so a correctly-signed challenge must succeed");
     }
 }
