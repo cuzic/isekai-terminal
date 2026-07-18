@@ -27,14 +27,36 @@ pub(crate) enum ClientOutcome {
     /// The owner connection dropped without a clean `Exit` — the owner process
     /// died. Maps to [`crate::EXIT_MUX_OWNER_LOST`] at the call site.
     OwnerLost,
+    /// The owner rejected the connection during the initial handshake
+    /// (protocol version mismatch, a stale auth token from an owner-turnover
+    /// race, or an unexpected first frame) — no shell session was ever
+    /// established. Unlike `OwnerLost`, there is nothing in flight to lose,
+    /// so the caller can always safely fall back to an unmultiplexed direct
+    /// connect instead of treating this as fatal (`always-connects.md`: a mux
+    /// hiccup must never block connecting).
+    Rejected { reason: String },
+}
+
+/// What [`run`] did with an established owner connection.
+pub(crate) enum ClientRunResult {
+    /// The session ran to some conclusion; this is this process's own exit
+    /// code (either the remote shell's real exit code, or
+    /// [`crate::EXIT_MUX_OWNER_LOST`] if the owner was lost mid-session).
+    ExitCode(u8),
+    /// The owner rejected the connection before any shell session started
+    /// (see [`ClientOutcome::Rejected`]) — the caller should fall back to an
+    /// unmultiplexed direct connect rather than treat this as fatal.
+    Rejected { reason: String },
 }
 
 /// Drives a client session against `conn` (an established owner connection),
 /// wiring the real local terminal (raw mode + current size) as the I/O. On a
-/// lost owner it prints the reconnect guidance and returns
-/// [`crate::EXIT_MUX_OWNER_LOST`]; otherwise it returns the remote shell's
-/// exit code.
-pub(crate) async fn run<Conn>(conn: Conn, token: &[u8]) -> Result<u8>
+/// lost owner (after a shell session was already established) it prints the
+/// reconnect guidance and returns [`crate::EXIT_MUX_OWNER_LOST`] as an exit
+/// code — there is nothing left to fall back to at that point. On a rejection
+/// during the handshake (before any shell existed), it instead returns
+/// [`ClientRunResult::Rejected`] so the caller can retry unmultiplexed.
+pub(crate) async fn run<Conn>(conn: Conn, token: &[u8]) -> Result<ClientRunResult>
 where
     Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -57,14 +79,15 @@ where
     .await?;
 
     match outcome {
-        ClientOutcome::Exited(code) => Ok(code),
+        ClientOutcome::Exited(code) => Ok(ClientRunResult::ExitCode(code)),
         ClientOutcome::OwnerLost => {
             log_line!(
                 "isekai-ssh: connection to the isekai-ssh owner process was lost — \
                  reconnect with `isekai-ssh <host>`."
             );
-            Ok(crate::EXIT_MUX_OWNER_LOST)
+            Ok(ClientRunResult::ExitCode(crate::EXIT_MUX_OWNER_LOST))
         }
+        ClientOutcome::Rejected { reason } => Ok(ClientRunResult::Rejected { reason }),
     }
 }
 
@@ -108,13 +131,15 @@ where
     match frame_rx.recv().await {
         Some(Ok(Some(Frame::HelloAck { version }))) => {
             if version != MUX_PROTOCOL_VERSION {
-                return Err(anyhow!("isekai-ssh: owner acknowledged with protocol version {version}, expected {MUX_PROTOCOL_VERSION}"));
+                return Ok(ClientOutcome::Rejected {
+                    reason: format!("owner speaks mux protocol version {version}, we speak {MUX_PROTOCOL_VERSION}"),
+                });
             }
         }
-        Some(Ok(Some(Frame::Rejected { reason }))) => {
-            return Err(anyhow!("isekai-ssh: the owner process rejected this connection: {reason}"));
+        Some(Ok(Some(Frame::Rejected { reason }))) => return Ok(ClientOutcome::Rejected { reason }),
+        Some(Ok(Some(other))) => {
+            return Ok(ClientOutcome::Rejected { reason: format!("expected HelloAck from the owner, got {other:?}") })
         }
-        Some(Ok(Some(other))) => return Err(anyhow!("isekai-ssh: expected HelloAck from the owner, got {other:?}")),
         // Owner vanished during the handshake — treat as owner-lost so the
         // user gets the reconnect guidance rather than an opaque error.
         Some(Ok(None)) | Some(Err(_)) | None => return Ok(ClientOutcome::OwnerLost),
@@ -292,8 +317,11 @@ mod tests {
         assert!(stderr.is_empty(), "a malformed ctl message must produce no OSC output");
     }
 
-    /// The owner refuses the Hello (e.g. version/token mismatch) — surfaced as
-    /// an error carrying the owner's reason, not OwnerLost.
+    /// The owner refuses the Hello (e.g. a stale token from an owner-turnover
+    /// race) — surfaced as `ClientOutcome::Rejected` carrying the owner's
+    /// reason, not an `Err` and not `OwnerLost`. Nothing was lost (no shell
+    /// session ever started), so `run_as_client` can safely fall back to an
+    /// unmultiplexed direct connect instead of failing the invocation.
     #[tokio::test]
     async fn client_surfaces_a_rejection_reason() {
         let (outcome, _out, _err) = drive_client(b"", |owner_conn| {
@@ -305,8 +333,35 @@ mod tests {
         })
         .await;
 
-        let err = outcome.unwrap_err();
-        assert!(format!("{err:#}").contains("token mismatch"), "the owner's reject reason must reach the user, got {err:#}");
+        match outcome.unwrap() {
+            ClientOutcome::Rejected { reason } => {
+                assert!(reason.contains("token mismatch"), "the owner's reject reason must reach the caller, got {reason:?}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    /// A protocol-version mismatch (e.g. an old owner and a freshly-upgraded
+    /// client binary) is also `Rejected`, not a hard `Err` — the version
+    /// field exists specifically so this degrades gracefully to a direct
+    /// connect instead of blocking the client from connecting at all.
+    #[tokio::test]
+    async fn client_treats_a_version_mismatch_as_rejected_not_an_error() {
+        let (outcome, _out, _err) = drive_client(b"", |owner_conn| {
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(owner_conn);
+                let _ = read_frame(&mut r).await;
+                write_frame(&mut w, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION + 1 }).await.unwrap();
+            })
+        })
+        .await;
+
+        match outcome.unwrap() {
+            ClientOutcome::Rejected { reason } => {
+                assert!(reason.contains("version"), "the reason should mention the version mismatch, got {reason:?}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     /// Local stdin is relayed to the owner as `Stdin` frames, and local EOF

@@ -68,7 +68,7 @@ pub(crate) mod naming;
 pub(crate) mod owner;
 pub(crate) mod protocol;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -153,13 +153,33 @@ where
         ClientToken::FallBack => return connect::run_prepared(prepared, None).await,
     };
     match C::connect(channel_name).await {
-        Ok(conn) => client::run(conn, &token).await,
+        Ok(conn) => match client::run(conn, &token).await? {
+            client::ClientRunResult::ExitCode(code) => Ok(code),
+            // The owner rejected us before any shell session existed
+            // (protocol version mismatch, or a stale token read in the
+            // window before a new owner rewrote it — see `ClientOutcome::
+            // Rejected`'s docs). Nothing was lost, so it's always safe to
+            // fall back to a fresh unmultiplexed connect rather than fail
+            // this invocation outright.
+            client::ClientRunResult::Rejected { reason } => {
+                log_line!("isekai-ssh: the mux owner rejected this connection ({reason}); connecting directly");
+                connect::run_prepared(prepared, None).await
+            }
+        },
         Err(ConnectError::NotFound { .. }) => {
             log_line!("isekai-ssh: the mux owner released its claim mid-handshake; connecting directly");
             connect::run_prepared(prepared, None).await
         }
+        // A transient local-pipe I/O error reaching an owner that (per
+        // `ClaimError::AlreadyClaimed` above) does exist — e.g. `ERROR_PIPE_
+        // BUSY` retries exhausted while the owner hasn't yet re-armed its
+        // next accepting instance. Per the always-connects principle a mux
+        // hiccup must never block connecting, so fall back exactly like the
+        // sibling failure branches above, rather than hard-failing this
+        // invocation.
         Err(ConnectError::Io { source, .. }) => {
-            Err(anyhow!("isekai-ssh: failed to connect to the mux owner process: {source}"))
+            log_line!("isekai-ssh: failed to connect to the mux owner process ({source}); connecting directly");
+            connect::run_prepared(prepared, None).await
         }
     }
 }
