@@ -799,6 +799,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes(
@@ -1070,6 +1072,8 @@ external fun uniffi_isekai_terminal_core_fn_func_terminal_commit_text_bytes(`tex
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_ctrl_byte(`codePoint`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+external fun uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(`kind`: RustBuffer.ByValue,`button`: RustBuffer.ByValue,`row`: Int,`col`: Int,`modifiers`: RustBuffer.ByValue,`cols`: Int,`rows`: Int,`mouseReportingMode`: RustBuffer.ByValue,`sgrMouseMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(`key`: RustBuffer.ByValue,`applicationCursorMode`: Byte,`modifiers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_unicode_char_bytes(`unicodeChar`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1221,6 +1225,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte() != 39410) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 25125) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 25965) {
@@ -5643,6 +5650,101 @@ public object FfiConverterTypeForwardType: FfiConverterRustBuffer<ForwardType> {
 
 
 /**
+ * マウスレポーティング(タスク#36)対象のボタン。左/中/右クリックに加え、
+ * モバイルでの主なユースケースであるホイール(縦スクロールジェスチャ)を含める
+ * (Fableレビュー指摘: wheelボタン64/65のエンコードを範囲に含める)。
+ * 横スクロールホイール(button 6/7)・追加ボタン(button 8以降)は現状使う予定が
+ * ないため未対応(必要になったタスクで追加する)。UI層(#50/#51)が生ポインタ
+ * イベントを`terminal_pointer_event_bytes`(タスク#51)へ渡す際にも使うため
+ * `uniffi::Enum`として公開する。
+ */
+
+enum class MouseButton {
+    
+    LEFT,
+    MIDDLE,
+    RIGHT,
+    WHEEL_UP,
+    WHEEL_DOWN;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMouseButton: FfiConverterRustBuffer<MouseButton> {
+    override fun read(buf: ByteBuffer) = try {
+        MouseButton.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MouseButton) = 4UL
+
+    override fun write(value: MouseButton, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * マウスレポーティング(タスク#36)対象のイベント種別。`MouseButton`と同じ理由で
+ * `uniffi::Enum`として公開する。
+ */
+
+enum class MouseEventKind {
+    
+    /**
+     * ボタン押下(ホイールは常にこの種別で表す — ホイールにはreleaseの概念が無い)。
+     */
+    PRESS,
+    /**
+     * ボタン解放。
+     */
+    RELEASE,
+    /**
+     * ポインタ移動。`button`が`Some`ならドラッグ(ボタンを押したまま移動)、
+     * `None`なら単純なホバー移動。
+     */
+    MOTION;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMouseEventKind: FfiConverterRustBuffer<MouseEventKind> {
+    override fun read(buf: ByteBuffer) = try {
+        MouseEventKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MouseEventKind) = 4UL
+
+    override fun write(value: MouseEventKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
  * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)が切り替えるマウスレポーティング
  * モード。`Terminal`が状態として保持し(rust-ssot: Kotlin/Swift側にミラー状態を
  * 作らず、この値をそのまま`ScreenUpdate`経由でUI層のジェスチャ裁定に使う——
@@ -7245,6 +7347,38 @@ public object FfiConverterOptionalTypeConnectionIssueHint: FfiConverterRustBuffe
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeMouseButton: FfiConverterRustBuffer<MouseButton?> {
+    override fun read(buf: ByteBuffer): MouseButton? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeMouseButton.read(buf)
+    }
+
+    override fun allocationSize(value: MouseButton?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeMouseButton.allocationSize(value)
+        }
+    }
+
+    override fun write(value: MouseButton?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeMouseButton.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceUInt: FfiConverterRustBuffer<List<kotlin.UInt>> {
     override fun read(buf: ByteBuffer): List<kotlin.UInt> {
         val len = buf.getInt()
@@ -7598,6 +7732,36 @@ public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuf
     UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_ctrl_byte(
     
         FfiConverterUInt.lower(`codePoint`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * タスク#51: UI層(Android/iOSのジェスチャハンドラ)が座標付きの生ポインタ
+         * イベントを、現在のマウスレポーティング状態に従ってターミナルへ送るべき
+         * バイト列にエンコードする。`Terminal::encode_pointer_event`(タスク#36)と
+         * 同じロジック(`terminal::encode_pointer_event_bytes`)を、実行中のセッション
+         * (`SessionOrchestrator`)を経由せずに直接呼べる純粋関数として公開する
+         * (`terminal_special_key_bytes`/`terminal_commit_text_bytes`と同じ設計: UI層は
+         * 直近の`ScreenUpdate`から読んだ`mouse_reporting_mode`/`sgr_mouse_mode`/`cols`/
+         * `rows`をそのまま引数として渡すだけでよく、「今どのマウスモードか」の判断
+         * ロジック自体はここに一元化されたまま——rust-ssot: Kotlin/Swift側に判断ロジックの
+         * ミラーを作らない)。
+         *
+         * 報告すべきでないイベント(`mouse_reporting_mode`がOff、またはモードが対象外の
+         * イベント種別)は`None`を返す。呼び出し元はこれを「何も送らない」の合図として
+         * 扱い、代わりに通常のタッチ処理(テキスト選択・スクロールバックスワイプ等)に
+         * フォールバックすればよい。
+         *
+         * `row`/`col`は0-basedのセル座標(画面外の値は端末サイズ`cols`/`rows`へ
+         * クランプされる、`terminal::encode_pointer_event_bytes`のdocコメント参照)。
+         */ fun `terminalPointerEventBytes`(`kind`: MouseEventKind, `button`: MouseButton?, `row`: kotlin.UInt, `col`: kotlin.UInt, `modifiers`: TerminalKeyModifiers, `cols`: kotlin.UInt, `rows`: kotlin.UInt, `mouseReportingMode`: MouseReportingMode, `sgrMouseMode`: kotlin.Boolean): kotlin.ByteArray? {
+            return FfiConverterOptionalByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(
+    
+        FfiConverterTypeMouseEventKind.lower(`kind`),FfiConverterOptionalTypeMouseButton.lower(`button`),FfiConverterUInt.lower(`row`),FfiConverterUInt.lower(`col`),FfiConverterTypeTerminalKeyModifiers.lower(`modifiers`),FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),FfiConverterTypeMouseReportingMode.lower(`mouseReportingMode`),FfiConverterBoolean.lower(`sgrMouseMode`),_status)
 }
     )
     }
