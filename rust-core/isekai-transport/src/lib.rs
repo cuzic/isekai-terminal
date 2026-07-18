@@ -74,6 +74,7 @@
 
 pub mod attempt;
 pub mod backoff;
+pub mod candidate;
 pub mod candidate_pool;
 pub mod candidate_provider;
 pub mod error;
@@ -94,6 +95,13 @@ pub mod warm_standby;
 
 pub use attempt::AttemptFailure;
 pub use backoff::BackoffPolicy;
+pub use candidate::{
+    validate_endpoint_identity, Candidate, CandidateClass, CandidateConversionError, CandidateDraft,
+    CandidateDraftBatch, CandidateGeneration, CandidateId, CandidateKey, CandidateOrigin, CandidateOriginKind,
+    CandidatePriority, CandidateRoute, CandidateSnapshot, CandidateValidity, CertificatePinError,
+    CertificatePinSha256, NormalizedServerName, ServerNameError, TransportIntent, TransportRoute,
+    LEGACY_INTENT_PROVIDER_ID,
+};
 pub use candidate_pool::{CandidatePool, Clock, StaleGeneration, SystemClock};
 pub use generation_coordinator::{
     AdvanceGenerationError, GenerationCoordinator, RoundContext, DEFAULT_MAX_GENERATION_ADVANCES,
