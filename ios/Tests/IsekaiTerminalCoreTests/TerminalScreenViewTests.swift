@@ -461,4 +461,156 @@ final class TerminalScreenViewTests: XCTestCase {
         view.resendSizeOnConnectionEstablished()
         XCTAssertEqual(callCount, 2)
     }
+
+    // MARK: - タスク#89: SixelBitmapCache
+
+    /// Android版`SshTerminalCanvasTest.kt`(`SixelBitmapCache decodes a bitmap for each
+    /// distinct id`)と対称。1x1 RGBAの`ImagePlacement`を作る共通ヘルパー。
+    private func sixelImagePlacement(id: UInt64, width: Int = 1, height: Int = 1, rgbaByte: UInt8 = 0xFF) -> ImagePlacement {
+        ImagePlacement(
+            id: id, row: 0, col: 0, rowsSpan: 1, colsSpan: 1,
+            widthPx: UInt32(width), heightPx: UInt32(height),
+            rgba: Data(repeating: rgbaByte, count: width * height * 4)
+        )
+    }
+
+    /// `image`の左上ピクセルをARGB8888(`0xAARRGGBB`)として読み出す(既存の
+    /// `testUnderlineAndStrikethroughOnBlankCellAffectRenderedPixels`と同じ
+    /// `CGContext`読み出し手法)。
+    private func topLeftPixelArgb(of image: UIImage) -> UInt32? {
+        guard let cgImage = image.cgImage else { return nil }
+        var pixel: [UInt8] = [0, 0, 0, 0]
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: &pixel, width: 1, height: 1, bitsPerComponent: 8,
+            bytesPerRow: 4, space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        let r = UInt32(pixel[0])
+        let g = UInt32(pixel[1])
+        let b = UInt32(pixel[2])
+        let a = UInt32(pixel[3])
+        return (a << 24) | (r << 16) | (g << 8) | b
+    }
+
+    func testSixelBitmapCacheDecodesAnImageForEachDistinctId() {
+        let cache = SixelBitmapCache()
+        let first = cache.image(for: sixelImagePlacement(id: 1))
+        let second = cache.image(for: sixelImagePlacement(id: 2))
+        XCTAssertNotNil(first)
+        XCTAssertNotNil(second)
+    }
+
+    func testSixelBitmapCacheReusesSameImageInstanceForIdSeenAgain() {
+        let cache = SixelBitmapCache()
+        let placement = sixelImagePlacement(id: 1)
+        let first = cache.image(for: placement)
+        let second = cache.image(for: placement)
+        XCTAssertNotNil(first)
+        XCTAssertTrue(first === second, "同じidなら再デコードせず同一UIImageインスタンスを返すこと")
+    }
+
+    /// Android版`SixelBitmapCache drops entries whose id is no longer live`と対称。
+    /// `prune(liveIds:)`後に同じidを再度`image(for:)`すると、キャッシュから捨てられた分
+    /// 新たにデコードし直された(＝以前と異なるインスタンスの)`UIImage`が返ることで
+    /// 「捨てられたこと」を間接的に確認する(このクラスは内部辞書を公開しないため)。
+    func testSixelBitmapCacheDropsEntriesWhoseIdIsNoLongerLive() {
+        let cache = SixelBitmapCache()
+        let placement1 = sixelImagePlacement(id: 1)
+        let placement2 = sixelImagePlacement(id: 2)
+        let firstImageForId1 = cache.image(for: placement1)
+        _ = cache.image(for: placement2)
+
+        // idが2のものだけが「生きている」とみなし、id=1はキャッシュから捨てられるはず。
+        cache.prune(liveIds: [2])
+
+        let secondImageForId1 = cache.image(for: placement1)
+        XCTAssertNotNil(firstImageForId1)
+        XCTAssertNotNil(secondImageForId1)
+        XCTAssertFalse(
+            firstImageForId1 === secondImageForId1,
+            "liveIdsに含まれないidはpruneでキャッシュから捨てられ、再度image(for:)すると新規デコードされること"
+        )
+    }
+
+    /// Android版`SixelBitmapCache decodes red and blue pixels without channel swap`と対称。
+    /// `sixel.rs`が詰めるRGBA8888バイト順から作った`CGImage`が(`premultipliedLast`解釈で)
+    /// 赤/青チャンネルを入れ替えずに描画できることを確認する。
+    func testSixelBitmapCacheDecodesRedAndBluePixelsWithoutChannelSwap() {
+        let cache = SixelBitmapCache()
+        // R=0xFF,G=0x00,B=0x00,A=0xFF(赤、不透明)
+        let red = ImagePlacement(
+            id: 1, row: 0, col: 0, rowsSpan: 1, colsSpan: 1,
+            widthPx: 1, heightPx: 1,
+            rgba: Data([0xFF, 0x00, 0x00, 0xFF])
+        )
+        // R=0x00,G=0x00,B=0xFF,A=0xFF(青、不透明)
+        let blue = ImagePlacement(
+            id: 2, row: 0, col: 0, rowsSpan: 1, colsSpan: 1,
+            widthPx: 1, heightPx: 1,
+            rgba: Data([0x00, 0x00, 0xFF, 0xFF])
+        )
+
+        guard let redImage = cache.image(for: red), let blueImage = cache.image(for: blue) else {
+            XCTFail("expected both placements to decode")
+            return
+        }
+        XCTAssertEqual(topLeftPixelArgb(of: redImage), 0xFFFF0000)
+        XCTAssertEqual(topLeftPixelArgb(of: blueImage), 0xFF0000FF)
+    }
+
+    /// `decode(_:)`の`width * height * 4`境界チェック(codexレビュー指摘、Android版
+    /// `SixelBitmapCache.isSane`と対称)。寸法とバッファ長が矛盾する`ImagePlacement`は
+    /// クラッシュせず`nil`を返すこと。
+    func testSixelBitmapCacheRejectsMismatchedBufferLength() {
+        let cache = SixelBitmapCache()
+        let malformed = ImagePlacement(
+            id: 1, row: 0, col: 0, rowsSpan: 1, colsSpan: 1,
+            widthPx: 4, heightPx: 4,
+            rgba: Data(repeating: 0xFF, count: 10) // 4*4*4 = 64バイト必要なのに10バイトしかない
+        )
+        XCTAssertNil(cache.image(for: malformed))
+    }
+
+    /// 幅・高さのいずれかが0の`ImagePlacement`はクラッシュせず`nil`を返すこと
+    /// (Android版`isSane`の`w <= 0 || h <= 0`ガードと対称)。
+    func testSixelBitmapCacheRejectsZeroDimensions() {
+        let cache = SixelBitmapCache()
+        let zeroWidth = ImagePlacement(
+            id: 1, row: 0, col: 0, rowsSpan: 1, colsSpan: 1,
+            widthPx: 0, heightPx: 4, rgba: Data()
+        )
+        XCTAssertNil(cache.image(for: zeroWidth))
+    }
+
+    /// `MAX_SIXEL_DIM`(4096)を超える単一辺は、バッファ長自体は矛盾していなくても
+    /// 拒否されること(Android版`isSane`の`w > 4096 || h > 4096`ガードと対称、
+    /// codexレビュー指摘)。
+    func testSixelBitmapCacheRejectsDimensionExceedingMaxDimension() {
+        let cache = SixelBitmapCache()
+        let width = 5000
+        let height = 1
+        let tooWide = ImagePlacement(
+            id: 1, row: 0, col: 0, rowsSpan: 1, colsSpan: 1,
+            widthPx: UInt32(width), heightPx: UInt32(height),
+            rgba: Data(repeating: 0xFF, count: width * height * 4)
+        )
+        XCTAssertNil(cache.image(for: tooWide))
+    }
+
+    /// 各辺は`MAX_SIXEL_DIM`以下でも、面積が`MAX_SIXEL_AREA`(4,000,000)を超えれば
+    /// 拒否されること(Android版`isSane`の`w.toLong() * h.toLong() > 4_000_000L`
+    /// ガードと対称)。
+    func testSixelBitmapCacheRejectsAreaExceedingMaxArea() {
+        let cache = SixelBitmapCache()
+        let width = 2001
+        let height = 2000 // 面積 4,002,000 > 4,000,000(各辺は4096以下)
+        let tooLarge = ImagePlacement(
+            id: 1, row: 0, col: 0, rowsSpan: 1, colsSpan: 1,
+            widthPx: UInt32(width), heightPx: UInt32(height),
+            rgba: Data(repeating: 0xFF, count: width * height * 4)
+        )
+        XCTAssertNil(cache.image(for: tooLarge))
+    }
 }
