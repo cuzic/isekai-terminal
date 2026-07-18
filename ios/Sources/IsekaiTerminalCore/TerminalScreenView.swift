@@ -77,7 +77,29 @@ public final class TerminalScreenView: UIView {
     private static let baseFontSize: CGFloat = 14
     private var font = UIFont.monospacedSystemFont(ofSize: baseFontSize, weight: .regular)
     private var boldFont = UIFont.monospacedSystemFont(ofSize: baseFontSize, weight: .bold)
+    /// タスク#23: SGR 3(italic)/SGR 1+3(bold+italic)用のフォントバリアント。
+    /// `monospacedSystemFont`にitalicウェイトは無いため、`font`/`boldFont`の
+    /// `fontDescriptor`へ`.traitItalic`を合成して作る(等幅フォントファミリの
+    /// 斜体グリフを使う。Android版`Typeface.create(base, Typeface.ITALIC)`と対称)。
+    private var italicFont = UIFont.monospacedSystemFont(ofSize: baseFontSize, weight: .regular)
+    private var boldItalicFont = UIFont.monospacedSystemFont(ofSize: baseFontSize, weight: .bold)
     private var cellSize: CGSize = .zero
+    /// タスク#23: SGR 5(blink)属性が立っているセルの点滅位相。セッション状態の
+    /// 一部ではなく純粋にUI表示上のアニメーションフェーズ(rust-ssot対象外——
+    /// `CellData.blink`自体はRustが決定した値をそのまま見るだけで、「今どちらの
+    /// 位相か」は表示にしか関わらない)。Android版も同種のタイマーをCanvas側で
+    /// 持つ想定(タスク#22 Fableレビュー2次)。
+    private var blinkPhaseVisible = true
+    private var blinkTimer: Timer?
+    /// 直近`draw(_:)`で実際に画面へ出したセル(`computeDisplayUpdate()`の結果、
+    /// スクロールバック表示中はライブの`latestUpdate`とは異なる)にblink属性が
+    /// 1つでもあったかどうか。blinkタイマーはこのキャッシュ値を見て`setNeedsDisplay()`
+    /// を呼ぶかどうか決める——`latestUpdate`(常にライブ画面)を直接見てしまうと、
+    /// スクロールバックを表示中(`scrollOffset > 0`)はライブ側にblinkが無ければ
+    /// 点滅が止まり、逆にライブ側にだけblinkがあると無駄な再描画が走る
+    /// (codexレビュー指摘)。`onScrollbackRequest`をタイマー刻みごとに呼ばずに済むよう
+    /// `draw(_:)`実行時点の結果を保存するだけに留める。
+    private var lastDisplayHasBlink = false
     /// Sixel(タスク#42)の`ImagePlacement.rgba`から作った`UIImage`をidでキャッシュする
     /// (Android版`SixelBitmapCache`と対称)。
     private let sixelBitmapCache = SixelBitmapCache()
@@ -167,10 +189,31 @@ public final class TerminalScreenView: UIView {
         // 指が離れるため長押し認識には至らず、互いに競合しない。
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
         addGestureRecognizer(tap)
+
+        startBlinkTimerIfNeeded()
     }
 
     public required init?(coder: NSCoder) {
         super.init(coder: coder)
+        startBlinkTimerIfNeeded()
+    }
+
+    deinit {
+        blinkTimer?.invalidate()
+    }
+
+    /// タスク#23: 点滅位相を一定間隔(xterm既定に近い0.53秒)でトグルする。
+    /// 現在の画面に実際にblink属性のセルが無ければ`setNeedsDisplay()`を呼ばない
+    /// (無駄な再描画でバッテリーを消費しない)。
+    private func startBlinkTimerIfNeeded() {
+        guard blinkTimer == nil else { return }
+        blinkTimer = Timer.scheduledTimer(withTimeInterval: 0.53, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.blinkPhaseVisible.toggle()
+            if self.lastDisplayHasBlink {
+                self.setNeedsDisplay()
+            }
+        }
     }
 
     /// 最新の画面状態を反映する。`MainActor`から呼ぶこと。
@@ -183,6 +226,8 @@ public final class TerminalScreenView: UIView {
         let size = Self.baseFontSize * fontScale
         font = UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
         boldFont = UIFont.monospacedSystemFont(ofSize: size, weight: .bold)
+        italicFont = Self.italicVariant(of: font)
+        boldItalicFont = Self.italicVariant(of: boldFont)
         let measured = ("M" as NSString).size(withAttributes: [.font: font])
         cellSize = CGSize(width: measured.width, height: font.lineHeight)
         // タスク#20: ピンチズームでcellSizeが変わればcols/rowsも変わりうる
@@ -322,6 +367,7 @@ public final class TerminalScreenView: UIView {
         let cols = Int(update.cols)
         let rows = Int(update.rows)
         guard cols > 0, rows > 0, update.cells.count == cols * rows else { return }
+        lastDisplayHasBlink = update.cells.contains(where: { $0.blink })
 
         let cellWidth = cellSize.width
         let cellHeight = cellSize.height
@@ -333,16 +379,48 @@ public final class TerminalScreenView: UIView {
                 let y = CGFloat(row) * cellHeight
                 let cellRect = CGRect(x: x, y: y, width: cellWidth, height: cellHeight)
 
+                // reverse(SGR 7)は`terminal.rs`のSGRパース時点で`fg`/`bg`へ実効色として
+                // 解決済み(このコードベースの一貫した方針、#21 Fableレビュー2次)なので、
+                // ここでは`cell.fg`/`cell.bg`をそのまま使うだけでよく、reverse自体を
+                // 見て入れ替える必要は無い。
                 let bg = Self.colorFromPackedArgb(cell.bg)
                 bg.setFill()
                 UIRectFill(cellRect)
 
                 guard !cell.ch.isEmpty, cell.ch != " " else { continue }
-                let fg = Self.colorFromPackedArgb(cell.fg)
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: cell.bold ? boldFont : font,
+                // invisible(SGR 8)は背景だけ塗ってグリフを描かない。blink(SGR 5)は
+                // 点滅位相が「消灯」側の間だけ同様にグリフを省く(背景・選択範囲・
+                // カーソルの重なりは通常通り)。
+                guard !cell.invisible, !(cell.blink && !blinkPhaseVisible) else { continue }
+
+                var fg = Self.colorFromPackedArgb(cell.fg)
+                if cell.dim {
+                    // dim(SGR 2)は色そのものを再計算するのではなく、不透明度を下げて
+                    // 背景と混ぜることで暗く見せる(Rust側は色をパース時にARGB解決する
+                    // 方針のため、dimによる減光は表示側の責務)。
+                    fg = fg.withAlphaComponent(0.6)
+                }
+
+                let resolvedFont: UIFont
+                switch (cell.bold, cell.italic) {
+                case (true, true): resolvedFont = boldItalicFont
+                case (true, false): resolvedFont = boldFont
+                case (false, true): resolvedFont = italicFont
+                case (false, false): resolvedFont = font
+                }
+
+                var attrs: [NSAttributedString.Key: Any] = [
+                    .font: resolvedFont,
                     .foregroundColor: fg,
                 ]
+                if cell.underline {
+                    attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                    attrs[.underlineColor] = fg
+                }
+                if cell.strikethrough {
+                    attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+                    attrs[.strikethroughColor] = fg
+                }
                 (cell.ch as NSString).draw(at: CGPoint(x: x, y: y), withAttributes: attrs)
             }
         }
@@ -390,6 +468,15 @@ public final class TerminalScreenView: UIView {
             UIColor.white.withAlphaComponent(0.5).setFill()
             UIRectFill(CGRect(x: x, y: y, width: cellWidth, height: cellHeight))
         }
+    }
+
+    /// `baseFont`のフォントファミリの斜体バリアントを返す(見つからなければ
+    /// `baseFont`自体を返す——太字斜体が用意されていないシステムフォントでも
+    /// クラッシュせず、フォールバックとして非斜体のまま描画される)。
+    private static func italicVariant(of baseFont: UIFont) -> UIFont {
+        let traits = baseFont.fontDescriptor.symbolicTraits.union(.traitItalic)
+        guard let descriptor = baseFont.fontDescriptor.withSymbolicTraits(traits) else { return baseFont }
+        return UIFont(descriptor: descriptor, size: baseFont.pointSize)
     }
 
     /// Android版`CellData.fg`/`bg`と同じARGBパック形式(0xAARRGGBB)として解釈する

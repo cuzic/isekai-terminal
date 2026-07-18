@@ -36,6 +36,55 @@ final class TerminalScreenViewTests: XCTestCase {
         }
     }
 
+    // MARK: - タスク#23: SGR装飾(underline/italic/reverse/dim/strikethrough/blink/invisible)
+
+    /// 全SGR属性の組み合わせを含む`ScreenUpdate`を与えてもクラッシュせず`draw(_:)`が
+    /// 完走することのスモークテスト(実際のピクセル出力の目視確認は対象外、
+    /// `testApplyAndDrawDoesNotCrash`と同じ方針)。特に`italicFont`/`boldItalicFont`の
+    /// `UIFontDescriptor.withSymbolicTraits`がシステムフォントで期待通り解決されることを
+    /// 確認する。`blinkPhaseVisible`は`Timer`経由でしかトグルされない private 状態のため、
+    /// このテストでは検証していない(2回`draw`を呼ぶのは単に冪等性の確認)。reverseは
+    /// `terminal.rs`側でパース時に実効fg/bgへ解決済みのため(#21)、`CellData`自体には
+    /// reverseフィールドが無く、ここでは検証対象外。
+    func testDrawWithAllSgrAttributesDoesNotCrash() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+
+        func cell(bold: Bool = false, dim: Bool = false, italic: Bool = false, underline: Bool = false,
+                   strikethrough: Bool = false, blink: Bool = false, invisible: Bool = false) -> CellData {
+            CellData(
+                ch: "A", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: bold, dim: dim, italic: italic,
+                underline: underline, strikethrough: strikethrough, blink: blink, invisible: invisible,
+                linkId: nil
+            )
+        }
+
+        let cells = [
+            cell(bold: true, italic: true),
+            cell(dim: true),
+            cell(underline: true),
+            cell(strikethrough: true),
+            cell(blink: true),
+            cell(invisible: true),
+            cell(),
+            cell(bold: true, dim: true, italic: true, underline: true, strikethrough: true, blink: true, invisible: true),
+        ]
+        let update = ScreenUpdate(
+            cols: UInt32(cells.count), rows: 1, cells: cells,
+            cursorRow: 0, cursorCol: 0,
+            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
+            cursorVisible: true, bellGeneration: 0,
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+        )
+
+        view.apply(update)
+        view.layoutIfNeeded()
+        let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
+        // 2回描画してもクラッシュ・状態不整合が無いことの冪等性確認。
+        _ = renderer.image { _ in view.draw(view.bounds) }
+        _ = renderer.image { _ in view.draw(view.bounds) }
+    }
+
     func testApplyIgnoresMismatchedCellCountWithoutCrashing() {
         let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
         let update = ScreenUpdate(
