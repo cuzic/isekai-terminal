@@ -85,6 +85,78 @@ final class TerminalScreenViewTests: XCTestCase {
         _ = renderer.image { _ in view.draw(view.bounds) }
     }
 
+    // MARK: - タスク#71: 空白セルのunderline/strikethrough
+
+    /// `draw(_:)`は`guard !cell.ch.isEmpty, cell.ch != " " else { continue }`で
+    /// 装飾判定より前に空白セルを早期スキップしていたため、`underline`/`strikethrough`
+    /// が立っていても空白セルには何も描かれない不具合があった(Android版
+    /// `SshTerminalCanvas.kt`の`hasLineDecoration`と同じ問題)。他のSGRテストは
+    /// 「クラッシュしない」ことしか確認していないが、この不具合はクラッシュせず無音で
+    /// 装飾だけが欠落するため、実際に`draw(_:)`が生成したビットマップの生ピクセルを
+    /// 読み、装飾の有無でピクセルが変わることを直接検証する。修正前のコードでは
+    /// `plainSpace == underlinedSpace`(どちらも早期continueで何も描かれない)となり
+    /// このテストは失敗する。
+    func testUnderlineAndStrikethroughOnBlankCellAffectRenderedPixels() {
+        func renderedPixels(underline: Bool, strikethrough: Bool) -> [UInt8] {
+            let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 40, height: 40))
+            let cell = CellData(
+                ch: " ", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false, dim: false, italic: false,
+                underline: underline, strikethrough: strikethrough, blink: false, invisible: false,
+                linkId: nil
+            )
+            let update = ScreenUpdate(
+                cols: 1, rows: 1, cells: [cell],
+                cursorRow: 0, cursorCol: 0,
+                title: nil, applicationCursorMode: false, applicationKeypadMode: false,
+                bracketedPasteMode: false,
+                mouseReportingMode: .off, sgrMouseMode: false,
+                cursorVisible: false, bellGeneration: 0,
+                cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
+            )
+            view.apply(update)
+            view.layoutIfNeeded()
+            let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
+            let image = renderer.image { _ in view.draw(view.bounds) }
+            guard let cgImage = image.cgImage else {
+                XCTFail("failed to obtain cgImage from rendered view")
+                return []
+            }
+            let width = cgImage.width
+            let height = cgImage.height
+            var pixels = [UInt8](repeating: 0, count: width * height * 4)
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            guard let context = CGContext(
+                data: &pixels, width: width, height: height, bitsPerComponent: 8,
+                bytesPerRow: width * 4, space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                XCTFail("failed to create bitmap context for pixel inspection")
+                return []
+            }
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return pixels
+        }
+
+        let plainSpace = renderedPixels(underline: false, strikethrough: false)
+        let underlinedSpace = renderedPixels(underline: true, strikethrough: false)
+        let strikethroughSpace = renderedPixels(underline: false, strikethrough: true)
+
+        XCTAssertFalse(plainSpace.isEmpty)
+        XCTAssertNotEqual(
+            plainSpace, underlinedSpace,
+            "underline付きの空白セルは装飾なしの空白セルと異なるピクセルになるはず(タスク#71)"
+        )
+        XCTAssertNotEqual(
+            plainSpace, strikethroughSpace,
+            "strikethrough付きの空白セルも装飾なしの空白セルと異なるピクセルになるはず(タスク#71)"
+        )
+
+        // このテストが「常にピクセルが変わる」という緩いテストに劣化していないことの
+        // サニティチェック(同一入力なら描画結果は決定的であるべき)。
+        let plainSpaceAgain = renderedPixels(underline: false, strikethrough: false)
+        XCTAssertEqual(plainSpace, plainSpaceAgain, "同一入力の描画結果は決定的であるべき")
+    }
+
     func testApplyIgnoresMismatchedCellCountWithoutCrashing() {
         let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
         let update = ScreenUpdate(
