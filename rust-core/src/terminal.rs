@@ -17,6 +17,17 @@ const SIXEL_CELL_HEIGHT_PX: usize = 20;
 /// 続ける)でメモリが無制限に増えるのを防ぐ——上限に達したら最も古いものを
 /// 1つ捨てる(`SCROLLBACK_LIMIT`と同種の素朴なキャップ、`session.rs`参照)。
 const MAX_LIVE_IMAGES: usize = 32;
+/// OSC 8(タスク#40)のURL intern表(`Terminal::link_table`)に登録できるURLの
+/// 上限件数。`link_table`は(scrollback中の過去セルの`link_id`がindexとして
+/// 指し続けるため)RISでもクリアせず単調増加する設計(`link_table`フィールドの
+/// docコメント参照)なので、上限が無いと相異なるOSC8 URLを大量に流すリモートに
+/// よってメモリが際限なく増え、かつ`make_screen_update`が毎フレーム`to_vec()`で
+/// 表全体を複製するFFIコピーコストも線形に悪化する(タスク#70)。上限到達後の
+/// 新規URLは`intern_link`がインターンせず`None`を返し、呼び出し元
+/// (`handle_osc8_hyperlink`)はリンク無し(`active_link_id = None`)にフォールバック
+/// する——既存id(=既存セルの`link_id`参照)はscrollback保護のため削除・再利用
+/// しない。
+pub(crate) const MAX_LINK_TABLE: usize = 4096;
 
 /// `38;5;n` / `48;5;n`（indexed color）を ARGB へ解決する。
 /// `0..=15` は現在のテーマの ANSI 16色テーブルを参照する（それ以外は固定の 216色/グレースケール）。
@@ -1576,7 +1587,9 @@ impl Terminal {
         };
         match uri {
             Some(s) if !s.is_empty() => {
-                self.active_link_id = Some(self.intern_link(s));
+                // 上限到達後の新規URLは`intern_link`が`None`を返す——その場合は
+                // リンク無し扱いにフォールバックする(タスク#70)。
+                self.active_link_id = self.intern_link(s);
             }
             _ => {
                 self.active_link_id = None;
@@ -1585,15 +1598,21 @@ impl Terminal {
     }
 
     /// URL文字列をintern表へ登録し、そのid(`link_table`のindex)を返す。同じURLは
-    /// 既存のidを再利用する(`link_ids`による重複排除)。
-    fn intern_link(&mut self, uri: String) -> u32 {
+    /// 既存のidを再利用する(`link_ids`による重複排除)。表が`MAX_LINK_TABLE`件に
+    /// 達した後の未登録URLはインターンせず`None`を返す(タスク#70) ——
+    /// 呼び出し元はこれをリンク無しへフォールバックさせる。既存id(=既存セルの
+    /// `link_id`参照)には影響しない。
+    fn intern_link(&mut self, uri: String) -> Option<u32> {
         if let Some(&id) = self.link_ids.get(&uri) {
-            return id;
+            return Some(id);
+        }
+        if self.link_table.len() >= MAX_LINK_TABLE {
+            return None;
         }
         let id = self.link_table.len() as u32;
         self.link_table.push(uri.clone());
         self.link_ids.insert(uri, id);
-        id
+        Some(id)
     }
 }
 
@@ -3004,6 +3023,46 @@ mod tests {
             assert!(interned.len() < long_url.len(), "1024バイトのOSCバッファで切り詰められているはず");
             assert!(long_url.starts_with(interned.as_str()), "切り詰め後も先頭は元のURLのprefixのまま");
         }
+    }
+
+    #[test]
+    fn test_osc8_link_table_is_capped_and_falls_back_to_no_link_past_the_cap() {
+        // タスク#70: リモートが相異なるOSC8 URLを大量に流しても`link_table`は
+        // 無制限には増えない。上限到達後の新規URLはインターンされず、
+        // アクティブリンクは「リンク無し」にフォールバックする。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // 上限ちょうどまでは各URLが順番にインターンされる。
+        for i in 0..MAX_LINK_TABLE {
+            feed(&mut t, format!("\x1b]8;;https://example.com/{i}\x07").as_bytes());
+        }
+        assert_eq!(t.link_table().len(), MAX_LINK_TABLE, "上限件数まではすべてインターンされる");
+
+        // 上限を超えて新規URLを大量に流しても表はこれ以上増えない。
+        for i in 0..1000 {
+            feed(&mut t, format!("\x1b]8;;https://overflow.example/{i}\x07").as_bytes());
+        }
+        assert_eq!(
+            t.link_table().len(),
+            MAX_LINK_TABLE,
+            "上限到達後は新規URLをインターンせず表のサイズは頭打ちになる"
+        );
+
+        // 上限到達後の新規URLで書いたセルはリンク無し(`link_id: None`)にフォール
+        // バックする——既存idの再利用や誤った既存リンクへの化けは起きない。
+        feed(&mut t, b"x");
+        assert_eq!(
+            t.screen_cells()[0].link_id, None,
+            "上限超過後の新規URLはリンク無しにフォールバックする"
+        );
+
+        // 上限到達後でも既にインターン済みのURLは引き続き同じidを再利用できる
+        // (重複排除ロジック自体は上限到達後も生きている)。
+        feed(&mut t, b"\x1b]8;;https://example.com/0\x07y");
+        assert_eq!(
+            t.screen_cells()[1].link_id,
+            Some(0),
+            "上限到達後も既存URLの再利用(重複排除)は引き続き機能する"
+        );
     }
 
     #[test]

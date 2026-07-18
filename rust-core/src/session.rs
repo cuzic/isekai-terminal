@@ -826,6 +826,30 @@ mod tests {
     }
 
     #[test]
+    fn make_screen_update_link_table_stays_bounded_when_remote_floods_distinct_urls() {
+        // タスク#70: `make_screen_update`は`Terminal::link_table()`を`to_vec()`で
+        // 丸ごと複製して`ScreenUpdate`へ載せる。リモートが相異なるOSC8 URLを
+        // 上限を超えて大量に流しても、UniFFI境界を越えて公開される
+        // `ScreenUpdate.link_table`が`crate::terminal::MAX_LINK_TABLE`件で
+        // 頭打ちになる(=毎フレームのFFIコピーコストも無界には悪化しない)ことを
+        // 確認する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let mut p = vte::Parser::new();
+        let flood = crate::terminal::MAX_LINK_TABLE + 500;
+        for i in 0..flood {
+            let seq = format!("\x1b]8;;https://flood.example/{i}\x07");
+            for &b in seq.as_bytes() { p.advance(&mut t, b); }
+        }
+
+        let upd = make_screen_update(&t);
+        assert_eq!(
+            upd.link_table.len(),
+            crate::terminal::MAX_LINK_TABLE,
+            "ScreenUpdate.link_tableは上限件数で頭打ちになり無界には増えない"
+        );
+    }
+
+    #[test]
     fn make_screen_update_clamps_cursor_col_during_delayed_wrap() {
         // `Terminal::cursor_col()`は遅延折り返し(delayed wrap)中`cols`(範囲外)を
         // 返しうる内部表現をそのまま公開する。`ScreenUpdate.cursor_col`はUIが
