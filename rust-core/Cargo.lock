@@ -3088,6 +3088,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "russh-stream-session"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "russh",
+ "russh-keys",
+ "thiserror 2.0.18",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "russh-util"
 version = "0.48.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
