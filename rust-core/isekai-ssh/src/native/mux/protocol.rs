@@ -239,7 +239,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Fr
     // Any EOF *now* is mid-header truncation — a genuine error.
     r.read_exact(&mut len_buf[1..]).await?;
     let frame_len = u32::from_be_bytes(len_buf) as usize;
-    if frame_len < 1 || frame_len > MAX_FRAME_LEN {
+    if !(1..=MAX_FRAME_LEN).contains(&frame_len) {
         return Err(malformed(&format!("declared frame length {frame_len} is out of range (1..={MAX_FRAME_LEN})")));
     }
     let mut body = vec![0u8; frame_len];
