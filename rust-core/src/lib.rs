@@ -676,6 +676,30 @@ pub enum CursorShape {
     Bar,
 }
 
+/// DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)が切り替えるマウスレポーティング
+/// モード。`Terminal`が状態として保持し(rust-ssot: Kotlin/Swift側にミラー状態を
+/// 作らず、この値をそのまま`ScreenUpdate`経由でUI層のジェスチャ裁定に使う——
+/// `application_cursor_mode`/`bracketed_paste_mode`と同じ確立済みパターン)、
+/// タッチ/ジェスチャイベントをRustへ送るかどうか・どう解釈するかをUI層(#50/#51)が
+/// 決める材料にする。実際のエンコード判断(どのイベント種別を報告するか)自体は
+/// `Terminal::encode_pointer_event`がこの値を見て行うため、UI層はこの値を
+/// 「テキスト選択ジェスチャに倒すかマウスレポートに倒すか」の判断にのみ使えばよい。
+///
+/// xterm実装に倣い、`?1000`/`?1002`/`?1003`は同一の内部状態を共有する——
+/// 複数を続けてset(`h`)した場合は最後にsetしたモードが有効になり、いずれかを
+/// reset(`l`)すると番号に関わらずOffへ戻る(`terminal.rs::csi_dispatch`参照)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MouseReportingMode {
+    /// マウスレポーティング無効(既定)。
+    Off,
+    /// `?1000`: ボタンのpress/releaseのみ報告する(移動は報告しない)。
+    Normal,
+    /// `?1002`: 上記に加え、ボタンを押したままのドラッグ移動も報告する。
+    ButtonEvent,
+    /// `?1003`: ボタン状態に関係なく全ての移動を報告する(any-event tracking)。
+    AnyEvent,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ScreenUpdate {
     pub cols: u32,
@@ -686,6 +710,16 @@ pub struct ScreenUpdate {
     pub title: Option<String>,
     pub application_cursor_mode: bool,
     pub bracketed_paste_mode: bool,
+    /// DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)の現在値。既定は`Off`。
+    /// UI層(#50/#51)はこれを見て、タッチ/ジェスチャイベントをマウスレポートとして
+    /// Rustへ送るべきか(＝アプリがマウス報告を要求しているか)を判断できる。
+    pub mouse_reporting_mode: MouseReportingMode,
+    /// DECSET/DECRST `?1006`(SGR拡張マウスレポーティング、タスク#36)の現在値。
+    /// `mouse_reporting_mode`が`Off`でなくても、この値によって
+    /// `Terminal::encode_pointer_event`が生成するバイト列の形式(SGR形式か
+    /// レガシーX10形式か)が変わる。UI層は直接使わなくてよいが、デバッグ表示や
+    /// 将来のプロトコル分岐のために公開しておく。
+    pub sgr_mouse_mode: bool,
     /// DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
     pub cursor_visible: bool,
     /// BEL(0x07)受信のたびに単調増加する世代カウンタ。`bool`ではなくカウンタにして

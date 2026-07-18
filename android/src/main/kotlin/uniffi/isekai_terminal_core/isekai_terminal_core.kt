@@ -4581,6 +4581,22 @@ data class ScreenUpdate (
     var `bracketedPasteMode`: kotlin.Boolean
     , 
     /**
+     * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)の現在値。既定は`Off`。
+     * UI層(#50/#51)はこれを見て、タッチ/ジェスチャイベントをマウスレポートとして
+     * Rustへ送るべきか(＝アプリがマウス報告を要求しているか)を判断できる。
+     */
+    var `mouseReportingMode`: MouseReportingMode
+    , 
+    /**
+     * DECSET/DECRST `?1006`(SGR拡張マウスレポーティング、タスク#36)の現在値。
+     * `mouse_reporting_mode`が`Off`でなくても、この値によって
+     * `Terminal::encode_pointer_event`が生成するバイト列の形式(SGR形式か
+     * レガシーX10形式か)が変わる。UI層は直接使わなくてよいが、デバッグ表示や
+     * 将来のプロトコル分岐のために公開しておく。
+     */
+    var `sgrMouseMode`: kotlin.Boolean
+    , 
+    /**
      * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
      */
     var `cursorVisible`: kotlin.Boolean
@@ -4631,6 +4647,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterTypeMouseReportingMode.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterTypeCursorShape.read(buf),
@@ -4647,6 +4665,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterOptionalString.allocationSize(value.`title`) +
             FfiConverterBoolean.allocationSize(value.`applicationCursorMode`) +
             FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`) +
+            FfiConverterTypeMouseReportingMode.allocationSize(value.`mouseReportingMode`) +
+            FfiConverterBoolean.allocationSize(value.`sgrMouseMode`) +
             FfiConverterBoolean.allocationSize(value.`cursorVisible`) +
             FfiConverterULong.allocationSize(value.`bellGeneration`) +
             FfiConverterTypeCursorShape.allocationSize(value.`cursorShape`) +
@@ -4662,6 +4682,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterOptionalString.write(value.`title`, buf)
             FfiConverterBoolean.write(value.`applicationCursorMode`, buf)
             FfiConverterBoolean.write(value.`bracketedPasteMode`, buf)
+            FfiConverterTypeMouseReportingMode.write(value.`mouseReportingMode`, buf)
+            FfiConverterBoolean.write(value.`sgrMouseMode`, buf)
             FfiConverterBoolean.write(value.`cursorVisible`, buf)
             FfiConverterULong.write(value.`bellGeneration`, buf)
             FfiConverterTypeCursorShape.write(value.`cursorShape`, buf)
@@ -5327,6 +5349,68 @@ public object FfiConverterTypeForwardType: FfiConverterRustBuffer<ForwardType> {
     override fun allocationSize(value: ForwardType) = 4UL
 
     override fun write(value: ForwardType, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)が切り替えるマウスレポーティング
+ * モード。`Terminal`が状態として保持し(rust-ssot: Kotlin/Swift側にミラー状態を
+ * 作らず、この値をそのまま`ScreenUpdate`経由でUI層のジェスチャ裁定に使う——
+ * `application_cursor_mode`/`bracketed_paste_mode`と同じ確立済みパターン)、
+ * タッチ/ジェスチャイベントをRustへ送るかどうか・どう解釈するかをUI層(#50/#51)が
+ * 決める材料にする。実際のエンコード判断(どのイベント種別を報告するか)自体は
+ * `Terminal::encode_pointer_event`がこの値を見て行うため、UI層はこの値を
+ * 「テキスト選択ジェスチャに倒すかマウスレポートに倒すか」の判断にのみ使えばよい。
+ *
+ * xterm実装に倣い、`?1000`/`?1002`/`?1003`は同一の内部状態を共有する——
+ * 複数を続けてset(`h`)した場合は最後にsetしたモードが有効になり、いずれかを
+ * reset(`l`)すると番号に関わらずOffへ戻る(`terminal.rs::csi_dispatch`参照)。
+ */
+
+enum class MouseReportingMode {
+    
+    /**
+     * マウスレポーティング無効(既定)。
+     */
+    OFF,
+    /**
+     * `?1000`: ボタンのpress/releaseのみ報告する(移動は報告しない)。
+     */
+    NORMAL,
+    /**
+     * `?1002`: 上記に加え、ボタンを押したままのドラッグ移動も報告する。
+     */
+    BUTTON_EVENT,
+    /**
+     * `?1003`: ボタン状態に関係なく全ての移動を報告する(any-event tracking)。
+     */
+    ANY_EVENT;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMouseReportingMode: FfiConverterRustBuffer<MouseReportingMode> {
+    override fun read(buf: ByteBuffer) = try {
+        MouseReportingMode.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MouseReportingMode) = 4UL
+
+    override fun write(value: MouseReportingMode, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
