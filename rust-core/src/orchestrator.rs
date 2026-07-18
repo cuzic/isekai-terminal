@@ -49,6 +49,12 @@ impl ActiveSession {
     fn resize(&self, cols: u32, rows: u32) {
         dispatch_all!(self, resize, cols, rows)
     }
+    /// タスク#60: OSのフォーカス変化を全トランスポート共通で`SessionCore`まで委譲する
+    /// (`Terminal`/`SessionCore`はトランスポート非依存のため`add_local_forward`と違い
+    /// 対象外の分岐は無い)。
+    fn notify_focus_change(&self, focused: bool) {
+        dispatch_all!(self, notify_focus_change, focused)
+    }
     fn disconnect(&self) {
         dispatch_all!(self, disconnect)
     }
@@ -1150,6 +1156,16 @@ impl SessionOrchestrator {
     pub fn resize(&self, cols: u32, rows: u32) {
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.resize(cols, rows);
+        }
+    }
+
+    /// #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
+    /// そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
+    /// レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
+    /// 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+    pub fn notify_focus_change(&self, focused: bool) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.notify_focus_change(focused);
         }
     }
 

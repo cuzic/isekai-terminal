@@ -271,6 +271,12 @@ pub(crate) struct Terminal {
     pending_scrollback: Vec<Vec<TermCell>>,
     application_cursor_mode: bool,
     bracketed_paste_mode: bool,
+    /// フォーカスレポーティング(`CSI ?1004h`/`l`、タスク#60)。vim/tmuxが`FocusGained`/
+    /// `FocusLost` autocmdの発火に使う。有効時のみ[encode_focus_event]がOS由来の
+    /// フォーカス変化イベントを`CSI I`/`CSI O`へエンコードする(無効時は`None`を返し
+    /// 何も送らない)。既定はoff——`bracketed_paste_mode`/`mouse_reporting_mode`と同じ
+    /// DECモード保持基盤(#36)のパターンに倣う。
+    focus_reporting_mode: bool,
     /// DECTCEM(`CSI ?25h`/`CSI ?25l`)によるカーソル表示/非表示状態。既定は表示(`true`)。
     /// vim/lessなどがカーソルを隠す指示を送るケースに対応するため、`ScreenUpdate`へ
     /// そのまま伝播する(`session.rs::make_screen_update`参照)。
@@ -452,6 +458,7 @@ impl Terminal {
             pending_scrollback: Vec::new(),
             application_cursor_mode: false,
             bracketed_paste_mode: false,
+            focus_reporting_mode: false,
             cursor_visible: true,
             bell_generation: 0,
             cursor_shape: CursorShape::Block,
@@ -518,6 +525,10 @@ impl Terminal {
     }
     pub(crate) fn application_cursor_mode(&self) -> bool { self.application_cursor_mode }
     pub(crate) fn bracketed_paste_mode(&self) -> bool { self.bracketed_paste_mode }
+    /// フォーカスレポーティング(`?1004`、タスク#60)の現在値。テストから参照する
+    /// (`ScreenUpdate`へは公開しない——`encode_focus_event`がRust側で完結して判断する
+    /// ため、UI層がこの値自体を必要としない)。
+    pub(crate) fn focus_reporting_mode(&self) -> bool { self.focus_reporting_mode }
     pub(crate) fn mouse_reporting_mode(&self) -> MouseReportingMode { self.mouse_reporting_mode }
     pub(crate) fn sgr_mouse_mode(&self) -> bool { self.sgr_mouse_mode }
     pub(crate) fn cursor_visible(&self) -> bool { self.cursor_visible }
@@ -563,6 +574,7 @@ impl Terminal {
         self.pending_terminal_responses.clear();
         self.application_cursor_mode = false;
         self.bracketed_paste_mode = false;
+        self.focus_reporting_mode = false;
         self.cursor_visible = true;
         self.cursor_shape = CursorShape::Block;
         self.cursor_blink = true;
@@ -1263,6 +1275,19 @@ impl Terminal {
         }
     }
 
+    /// フォーカスレポーティング(`?1004`、タスク#60)が有効な場合のみ、OS由来のフォーカス
+    /// 変化イベント(`focused`)をxterm互換のシーケンスへエンコードする。無効時は`None`を
+    /// 返す——呼び出し元([crate::session_state::SessionState::notify_focus_change])は
+    /// これを「何も送らない」の合図として扱う。vim/tmuxの`FocusGained`/`FocusLost`
+    /// autocmdはこのシーケンスの有無だけを見て座標や修飾キーを持たないため、
+    /// [encode_pointer_event]と違いエンコードに分岐は無い。
+    pub(crate) fn encode_focus_event(&self, focused: bool) -> Option<Vec<u8>> {
+        if !self.focus_reporting_mode {
+            return None;
+        }
+        Some(if focused { b"\x1b[I".to_vec() } else { b"\x1b[O".to_vec() })
+    }
+
     /// OSC 10(`is_fg == true`)/OSC 11(`is_fg == false`)の set/query 共通処理(タスク#58)。
     /// `spec == "?"`はquery——現在のtheme既定色を`rgb:RRRR/GGGG/BBBB`形式で
     /// `pending_terminal_responses`に積む(応答経路はDA/DSRと同じ、タスク#38)。
@@ -1557,9 +1582,10 @@ impl Perform for Terminal {
             // `CSI ?1000;1006h`のようにトラッキングモードとSGR拡張を1つのシーケンスに
             // まとめて送ることが珍しくなく、`p0`しか見ないと後続の`1006`が無視されて
             // 「SGRを要求したのにlegacy X10形式で返す」座標破損バグになる
-            // (codexレビュー指摘)。他のDECモード(`1047`/`1049`/`25`/`12`/`1`/`7`/`2004`)は
-            // 複数パラメータ(Pm)を1シーケンスにまとめて送られるケースが実用上ほぼ無く、
-            // 汎用的なPm対応は既存の別タスク(#68)のスコープなのでここでは広げない。
+            // (codexレビュー指摘)。他のDECモード(`1047`/`1049`/`25`/`12`/`1`/`7`/`2004`/
+            // `1004`、タスク#60でも同様にcodexレビューで指摘済み)は複数パラメータ(Pm)を
+            // 1シーケンスにまとめて送られるケースが実用上ほぼ無く、汎用的なPm対応は
+            // 既存の別タスク(#68)のスコープなのでここでは広げない。
             for &p in &ps {
                 match (action, p) {
                     ('h', 1000) => { self.mouse_reporting_mode = MouseReportingMode::Normal; }
@@ -1612,6 +1638,11 @@ impl Perform for Terminal {
                 }
                 ('h', 2004) => { self.bracketed_paste_mode = true; }
                 ('l', 2004) => { self.bracketed_paste_mode = false; }
+                // フォーカスレポーティング(`CSI ?1004h`/`l`、タスク#60)。有効な間だけ
+                // [encode_focus_event]がOS由来のフォーカス変化を`CSI I`/`CSI O`へ
+                // エンコードして送るようになる。
+                ('h', 1004) => { self.focus_reporting_mode = true; }
+                ('l', 1004) => { self.focus_reporting_mode = false; }
                 _ => {}
             }
             return;
@@ -4514,6 +4545,55 @@ mod tests {
             button: Some(MouseButton::WheelUp), modifiers: no_mods(),
         });
         assert!(up.is_some());
+    }
+
+    // ── フォーカスレポーティング(`?1004`、タスク#60) ─────────
+
+    #[test]
+    fn test_focus_reporting_mode_default_off() {
+        let t = Terminal::new(80, 24, Theme::default());
+        assert!(!t.focus_reporting_mode());
+    }
+
+    #[test]
+    fn test_focus_reporting_mode_decset_decrst_1004() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1004h");
+        assert!(t.focus_reporting_mode());
+        feed(&mut t, b"\x1b[?1004l");
+        assert!(!t.focus_reporting_mode());
+    }
+
+    #[test]
+    fn test_focus_reporting_mode_reset_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1004h");
+        assert!(t.focus_reporting_mode());
+        feed(&mut t, b"\x1bc"); // RIS
+        assert!(!t.focus_reporting_mode(), "RISで既定のoffに戻る");
+    }
+
+    #[test]
+    fn test_focus_reporting_mode_preserved_across_resize() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1004h");
+        t.resize_preserving_state(40, 12);
+        assert!(t.focus_reporting_mode());
+    }
+
+    #[test]
+    fn test_encode_focus_event_off_mode_reports_nothing() {
+        let t = Terminal::new(80, 24, Theme::default());
+        assert_eq!(t.encode_focus_event(true), None);
+        assert_eq!(t.encode_focus_event(false), None);
+    }
+
+    #[test]
+    fn test_encode_focus_event_gained_and_lost() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1004h");
+        assert_eq!(t.encode_focus_event(true), Some(b"\x1b[I".to_vec()));
+        assert_eq!(t.encode_focus_event(false), Some(b"\x1b[O".to_vec()));
     }
 
     // ── Proptest: 不変量 ────────────────────────────────

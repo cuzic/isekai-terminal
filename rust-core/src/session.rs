@@ -343,6 +343,14 @@ impl SessionCore {
         self.send_session_cmd(SessionCmd::TrzszCancel { transfer_id });
     }
 
+    /// OSのフォーカス変化(タスク#60: タブ/split pane切替・アプリのbackground/foreground等)
+    /// をそのまま`session_event_loop`へ転送する。フォーカスレポーティング(`?1004`)が
+    /// 無効、または未接続/切断済みの場合は`session_state::notify_focus_change`/
+    /// `send_session_cmd`がそれぞれ無音で無視する(rust-ssot: 有効/無効の判断は
+    /// Rust側のみが持ち、Kotlin/Swift側は生イベントを転送するだけでよい)。
+    pub(crate) fn notify_focus_change(&self, focused: bool) {
+        self.send_session_cmd(SessionCmd::FocusChanged(focused));
+    }
 }
 
 /// Kotlin/Swift側から送られてきた`SessionCmd`を`SessionState`に適用する。
@@ -373,6 +381,7 @@ fn handle_session_cmd(state: &mut SessionState, c: SessionCmd) -> ProcessResult 
                 clipboard_pull_requested: false,
             }
         }
+        SessionCmd::FocusChanged(focused) => state.notify_focus_change(focused),
     }
 }
 
@@ -668,6 +677,23 @@ mod handle_session_cmd_tests {
 
         assert_eq!(state.terminal().theme(), custom);
         assert_is_noop(&result);
+    }
+
+    #[test]
+    fn focus_changed_routes_to_session_state_notify_focus_change() {
+        // タスク#60: `?1004`有効時のみCSI I/CSI OがSideEffect::SendStdinとして返る
+        // ことを、`handle_session_cmd`経由で確認する(未有効時はno-op)。
+        let mut state = fresh_state();
+        let noop = handle_session_cmd(&mut state, SessionCmd::FocusChanged(true));
+        assert_is_noop(&noop);
+
+        state.on_stdout(b"\x1b[?1004h".to_vec());
+        let result = handle_session_cmd(&mut state, SessionCmd::FocusChanged(true));
+        assert_eq!(result.side_effects.len(), 1);
+        match &result.side_effects[0] {
+            SideEffect::SendStdin(bytes) => assert_eq!(bytes, b"\x1b[I"),
+            other => panic!("expected SideEffect::SendStdin, got a different variant: {:?}", std::mem::discriminant(other)),
+        }
     }
 
     #[test]
