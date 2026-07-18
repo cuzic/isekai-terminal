@@ -661,6 +661,13 @@ pub struct CellData {
     pub strikethrough: bool,
     pub blink: bool,
     pub invisible: bool,
+    /// OSC 8(`ESC]8;params;URIST`、タスク#40)ハイパーリンクのintern id。`Some`なら
+    /// `ScreenUpdate::link_table[id]`(0-indexed)にこのセルが指すURLが入っている。
+    /// セルごとに`Option<String>`のURLを直接持たせない——`CellData`は`ScreenUpdate`
+    /// として毎フレーム全セル分FFIコピーされるため、コストの大きい`String`は
+    /// 一度だけ`link_table`に置き、セル側は軽量な`Option<u32>`のみ持つintern方式
+    /// にしている(Fableレビュー2次)。
+    pub link_id: Option<u32>,
 }
 
 /// [SessionOrchestrator::search_scrollback]が返す1件のマッチ位置(タスク#37)。
@@ -758,6 +765,14 @@ pub struct ScreenUpdate {
     /// (block/underline/bar それぞれの steady/blinking)から導出される。既定は`true`
     /// (xtermの既定である「blinking block」に合わせる)。
     pub cursor_blink: bool,
+    /// OSC 8(タスク#40)ハイパーリンクのURL intern表。`CellData::link_id`はこの
+    /// `Vec`のindex(0-indexed)。同一URLは重複排除されて同じindexを指す。
+    /// このterminalセッションが一度でも見たURLを(現在アクティブでなくなった後も、
+    /// RISされた後も)ずっと保持する——scrollback上の過去セルの`link_id`がこの表の
+    /// indexを指し続けるため、indexを再利用したり表自体をクリアしたりすると
+    /// 過去セルが別のURLを指す破損になる(`terminal.rs`の`link_table`フィールド
+    /// docコメント参照)。
+    pub link_table: Vec<String>,
 }
 
 // ── New orchestrator public types ────────────────────────

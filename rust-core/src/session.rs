@@ -29,6 +29,7 @@ fn to_cell_data(c: &TermCell) -> CellData {
         strikethrough: c.strikethrough,
         blink: c.blink,
         invisible: c.invisible,
+        link_id: c.link_id,
     }
 }
 
@@ -53,6 +54,7 @@ fn make_screen_update(t: &Terminal) -> ScreenUpdate {
         bell_generation: t.bell_generation(),
         cursor_shape: t.cursor_shape(),
         cursor_blink: t.cursor_blink(),
+        link_table: t.link_table().to_vec(),
     }
 }
 
@@ -174,6 +176,7 @@ impl SessionCore {
             strikethrough: false,
             blink: false,
             invisible: false,
+            link_id: None,
         };
         let mut result = vec![blank; rows as usize * cols];
         for r in 0..rows as usize {
@@ -780,6 +783,7 @@ mod tests {
             blink: false,
             invisible: false,
             is_wide_placeholder: false,
+            link_id: None,
         }
     }
 

@@ -1774,10 +1774,27 @@ public struct CellData: Equatable, Hashable {
     public var strikethrough: Bool
     public var blink: Bool
     public var invisible: Bool
+    /**
+     * OSC 8(`ESC]8;params;URIST`、タスク#40)ハイパーリンクのintern id。`Some`なら
+     * `ScreenUpdate::link_table[id]`(0-indexed)にこのセルが指すURLが入っている。
+     * セルごとに`Option<String>`のURLを直接持たせない——`CellData`は`ScreenUpdate`
+     * として毎フレーム全セル分FFIコピーされるため、コストの大きい`String`は
+     * 一度だけ`link_table`に置き、セル側は軽量な`Option<u32>`のみ持つintern方式
+     * にしている(Fableレビュー2次)。
+     */
+    public var linkId: UInt32?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(ch: String, fg: UInt32, bg: UInt32, bold: Bool, dim: Bool, italic: Bool, underline: Bool, strikethrough: Bool, blink: Bool, invisible: Bool) {
+    public init(ch: String, fg: UInt32, bg: UInt32, bold: Bool, dim: Bool, italic: Bool, underline: Bool, strikethrough: Bool, blink: Bool, invisible: Bool, 
+        /**
+         * OSC 8(`ESC]8;params;URIST`、タスク#40)ハイパーリンクのintern id。`Some`なら
+         * `ScreenUpdate::link_table[id]`(0-indexed)にこのセルが指すURLが入っている。
+         * セルごとに`Option<String>`のURLを直接持たせない——`CellData`は`ScreenUpdate`
+         * として毎フレーム全セル分FFIコピーされるため、コストの大きい`String`は
+         * 一度だけ`link_table`に置き、セル側は軽量な`Option<u32>`のみ持つintern方式
+         * にしている(Fableレビュー2次)。
+         */linkId: UInt32?) {
         self.ch = ch
         self.fg = fg
         self.bg = bg
@@ -1788,6 +1805,7 @@ public struct CellData: Equatable, Hashable {
         self.strikethrough = strikethrough
         self.blink = blink
         self.invisible = invisible
+        self.linkId = linkId
     }
 
     
@@ -1815,7 +1833,8 @@ public struct FfiConverterTypeCellData: FfiConverterRustBuffer {
                 underline: FfiConverterBool.read(from: &buf), 
                 strikethrough: FfiConverterBool.read(from: &buf), 
                 blink: FfiConverterBool.read(from: &buf), 
-                invisible: FfiConverterBool.read(from: &buf)
+                invisible: FfiConverterBool.read(from: &buf), 
+                linkId: FfiConverterOptionUInt32.read(from: &buf)
         )
     }
 
@@ -1830,6 +1849,7 @@ public struct FfiConverterTypeCellData: FfiConverterRustBuffer {
         FfiConverterBool.write(value.strikethrough, into: &buf)
         FfiConverterBool.write(value.blink, into: &buf)
         FfiConverterBool.write(value.invisible, into: &buf)
+        FfiConverterOptionUInt32.write(value.linkId, into: &buf)
     }
 }
 
@@ -2960,6 +2980,16 @@ public struct ScreenUpdate: Equatable, Hashable {
      * (xtermの既定である「blinking block」に合わせる)。
      */
     public var cursorBlink: Bool
+    /**
+     * OSC 8(タスク#40)ハイパーリンクのURL intern表。`CellData::link_id`はこの
+     * `Vec`のindex(0-indexed)。同一URLは重複排除されて同じindexを指す。
+     * このterminalセッションが一度でも見たURLを(現在アクティブでなくなった後も、
+     * RISされた後も)ずっと保持する——scrollback上の過去セルの`link_id`がこの表の
+     * indexを指し続けるため、indexを再利用したり表自体をクリアしたりすると
+     * 過去セルが別のURLを指す破損になる(`terminal.rs`の`link_table`フィールド
+     * docコメント参照)。
+     */
+    public var linkTable: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2995,7 +3025,16 @@ public struct ScreenUpdate: Equatable, Hashable {
          * カーソルが点滅すべきかどうか。DECSCUSRの偶数/奇数パラメータ
          * (block/underline/bar それぞれの steady/blinking)から導出される。既定は`true`
          * (xtermの既定である「blinking block」に合わせる)。
-         */cursorBlink: Bool) {
+         */cursorBlink: Bool, 
+        /**
+         * OSC 8(タスク#40)ハイパーリンクのURL intern表。`CellData::link_id`はこの
+         * `Vec`のindex(0-indexed)。同一URLは重複排除されて同じindexを指す。
+         * このterminalセッションが一度でも見たURLを(現在アクティブでなくなった後も、
+         * RISされた後も)ずっと保持する——scrollback上の過去セルの`link_id`がこの表の
+         * indexを指し続けるため、indexを再利用したり表自体をクリアしたりすると
+         * 過去セルが別のURLを指す破損になる(`terminal.rs`の`link_table`フィールド
+         * docコメント参照)。
+         */linkTable: [String]) {
         self.cols = cols
         self.rows = rows
         self.cells = cells
@@ -3010,6 +3049,7 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.bellGeneration = bellGeneration
         self.cursorShape = cursorShape
         self.cursorBlink = cursorBlink
+        self.linkTable = linkTable
     }
 
     
@@ -3041,7 +3081,8 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 cursorVisible: FfiConverterBool.read(from: &buf), 
                 bellGeneration: FfiConverterUInt64.read(from: &buf), 
                 cursorShape: FfiConverterTypeCursorShape.read(from: &buf), 
-                cursorBlink: FfiConverterBool.read(from: &buf)
+                cursorBlink: FfiConverterBool.read(from: &buf), 
+                linkTable: FfiConverterSequenceString.read(from: &buf)
         )
     }
 
@@ -3060,6 +3101,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.bellGeneration, into: &buf)
         FfiConverterTypeCursorShape.write(value.cursorShape, into: &buf)
         FfiConverterBool.write(value.cursorBlink, into: &buf)
+        FfiConverterSequenceString.write(value.linkTable, into: &buf)
     }
 }
 
@@ -5545,6 +5587,30 @@ fileprivate struct FfiConverterOptionUInt16: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterUInt16.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = UInt32?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt32.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt32.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }

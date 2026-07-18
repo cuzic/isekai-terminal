@@ -12,15 +12,16 @@ final class TerminalScreenViewTests: XCTestCase {
             CellData(
                 ch: i % 2 == 0 ? "A" : " ", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
                 dim: false, italic: false, underline: false,
-                strikethrough: false, blink: false, invisible: false
+                strikethrough: false, blink: false, invisible: false, linkId: nil
             )
         }
         let update = ScreenUpdate(
             cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: true
+            cursorShape: .block, cursorBlink: true, linkTable: []
         )
 
         view.apply(update)
@@ -41,8 +42,9 @@ final class TerminalScreenViewTests: XCTestCase {
             cols: 10, rows: 10, cells: [],
             cursorRow: 0, cursorCol: 0,
             title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: true
+            cursorShape: .block, cursorBlink: true, linkTable: []
         )
         view.apply(update)
         view.layoutIfNeeded()

@@ -8,7 +8,7 @@ final class TerminalSelectionTests: XCTestCase {
         CellData(
             ch: String(ch), fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
             dim: false, italic: false, underline: false,
-            strikethrough: false, blink: false, invisible: false
+            strikethrough: false, blink: false, invisible: false, linkId: nil
         )
     }
 
@@ -25,8 +25,9 @@ final class TerminalSelectionTests: XCTestCase {
             cols: UInt32(cols), rows: UInt32(rows.count), cells: cells,
             cursorRow: 0, cursorCol: 0, title: nil,
             applicationCursorMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: true
+            cursorShape: .block, cursorBlink: true, linkTable: []
         )
     }
 
@@ -79,7 +80,7 @@ final class TerminalSelectionTests: XCTestCase {
     }
 
     func testReconstructSelectionTextReturnsEmptyForInvalidDimensions() {
-        let update = ScreenUpdate(cols: 0, rows: 0, cells: [], cursorRow: 0, cursorCol: 0, title: nil, applicationCursorMode: false, bracketedPasteMode: false, cursorVisible: true, bellGeneration: 0, cursorShape: .block, cursorBlink: true)
+        let update = ScreenUpdate(cols: 0, rows: 0, cells: [], cursorRow: 0, cursorCol: 0, title: nil, applicationCursorMode: false, bracketedPasteMode: false, mouseReportingMode: .off, sgrMouseMode: false, cursorVisible: true, bellGeneration: 0, cursorShape: .block, cursorBlink: true, linkTable: [])
         let selection = SelectionRange(anchor: CellPos(row: 0, col: 0), head: CellPos(row: 0, col: 0))
 
         XCTAssertEqual(reconstructSelectionText(update: update, selection: selection), "")
