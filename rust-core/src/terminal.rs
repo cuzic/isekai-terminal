@@ -143,6 +143,13 @@ pub(crate) struct Terminal {
     /// Android のクリップボード内容を取得するには非同期の Kotlin 往復が要るため、
     /// この同期的な VTE コールバックの中では完結できない。
     pending_clipboard_pull_request: bool,
+    /// DA(`CSI c`/`CSI > c`)・DSR/CPR(`CSI 5n`/`CSI 6n`)への応答として、次に
+    /// `take_pending_terminal_responses()`が呼ばれるまで蓄積される生バイト列のキュー
+    /// (`pending_clipboard_write`と同型のパターン。タスク#38)。`SessionState::apply()`が
+    /// これを既存の`SideEffect::SendStdin`に変換して送り返す——新しいtransport経路は
+    /// 追加しない(`session_state.rs:10`の`SideEffect::SendStdin`→
+    /// `transport/ssh_handler.rs`の`TransportCommand::WriteStdin`が既存の応答送信経路)。
+    pending_terminal_responses: Vec<Vec<u8>>,
     pending_scrollback: Vec<Vec<TermCell>>,
     application_cursor_mode: bool,
     bracketed_paste_mode: bool,
@@ -190,6 +197,7 @@ impl Terminal {
             title: None,
             pending_clipboard_write: None,
             pending_clipboard_pull_request: false,
+            pending_terminal_responses: Vec::new(),
             pending_scrollback: Vec::new(),
             application_cursor_mode: false,
             bracketed_paste_mode: false,
@@ -228,6 +236,13 @@ impl Terminal {
         std::mem::take(&mut self.pending_clipboard_pull_request)
     }
 
+    /// 保留中の端末応答(DA/DSR/CPR等)を取り出す。呼び出し後は空になる
+    /// (`take_scrollback`/`take_pending_clipboard_write`と同じ「1バッチ分をここで
+    /// フラッシュする」パターン)。
+    pub(crate) fn take_pending_terminal_responses(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending_terminal_responses)
+    }
+
     pub(crate) fn cols(&self) -> usize { self.cols }
     pub(crate) fn rows(&self) -> usize { self.rows }
     pub(crate) fn cursor_row(&self) -> usize { self.cursor_row }
@@ -262,6 +277,7 @@ impl Terminal {
         self.title = None;
         self.pending_clipboard_write = None;
         self.pending_clipboard_pull_request = false;
+        self.pending_terminal_responses.clear();
         self.application_cursor_mode = false;
         self.bracketed_paste_mode = false;
         self.cursor_visible = true;
@@ -692,6 +708,45 @@ impl Perform for Terminal {
             return;
         }
 
+        // Primary DA(`CSI c`/`CSI 0 c`)と Secondary DA(`CSI > c`)は同じ action('c')だが、
+        // vte は `>` を intermediates に入れて渡すため、DECSCUSR と同様ここで
+        // intermediates を見て明示的に分岐してから return する(タスク#38、Fableレビュー
+        // 指摘: `is_dec`の`?`判定と混同しないこと)。応答は新しいtransport経路を作らず、
+        // 既存の `SideEffect::SendStdin` 経路(`SessionState::apply()`が
+        // `take_pending_terminal_responses()`を変換する)にそのまま乗せる。
+        // `Ps`(p0)は仕様上0のみが有効な識別要求で、vte自身のANSIハンドラも
+        // `next_param_or(0) == 0` を条件にしている(Codexレビュー指摘)ため、それ以外の
+        // `Ps`(例: `CSI 1c`)には応答しない。
+        if action == 'c' && intermediates.is_empty() && p0 == 0 {
+            // Primary DA: VT100 with AVO を名乗る、広く使われる最小応答。
+            self.pending_terminal_responses.push(b"\x1b[?1;2c".to_vec());
+            return;
+        }
+        if action == 'c' && intermediates == [b'>'] && p0 == 0 {
+            // Secondary DA: `CSI > Pp ; Pv ; Pc c`(端末種別;ファームウェア版;cartridge)。
+            self.pending_terminal_responses.push(b"\x1b[>0;100;0c".to_vec());
+            return;
+        }
+        // DSR(`CSI 5n`: device status, `CSI 6n`: CPR/cursor position report)。
+        // fish のプロンプト位置検出や neovim の DA1/DA2 起動時タイムアウトが CPR 未応答に
+        // 実際に依存しているため(タスク#38、Fable 2次レビューでP1へ昇格)、両方に応答する。
+        if action == 'n' && intermediates.is_empty() {
+            match p0 {
+                5 => { self.pending_terminal_responses.push(b"\x1b[0n".to_vec()); }
+                6 => {
+                    // `print()`は右端に書いた直後、実際に折り返すのは次のprintable文字を
+                    // 受けた時まで遅延させるため(delayed wrap)、その間`cursor_col`は
+                    // `cols`(範囲外)になり得る。CPRは可視上のカーソル位置(最終列)を
+                    // 報告すべきなので`cols - 1`にクランプする(Codexレビュー指摘)。
+                    let visible_col = self.cursor_col.min(self.cols.saturating_sub(1));
+                    let resp = format!("\x1b[{};{}R", self.cursor_row + 1, visible_col + 1);
+                    self.pending_terminal_responses.push(resp.into_bytes());
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match action {
             'A' => { let n = p0.max(1) as usize; self.cursor_row = self.cursor_row.saturating_sub(n); }
             'B' => { let n = p0.max(1) as usize; self.cursor_row = (self.cursor_row + n).min(self.rows - 1); }
@@ -1098,6 +1153,92 @@ mod tests {
         feed(&mut t, b"\x1b]52;c;aGVsbG8=\x07");
         feed(&mut t, b"\x1bc"); // RIS (full reset)
         assert_eq!(t.take_pending_clipboard_write(), None);
+    }
+
+    // ── DA/DSR/CPR応答(タスク#38) ────────────────────────
+
+    #[test]
+    fn test_primary_da_queues_response() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[c"); // Primary DA
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[?1;2c".to_vec()]);
+        // Consumed once.
+        assert!(t.take_pending_terminal_responses().is_empty());
+    }
+
+    #[test]
+    fn test_primary_da_with_explicit_zero_param_queues_response() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[0c"); // Primary DA、明示的に Ps=0
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[?1;2c".to_vec()]);
+    }
+
+    #[test]
+    fn test_secondary_da_queues_response_distinct_from_primary() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>c"); // Secondary DA(vteは`>`をintermediatesに入れる)
+        let resp = t.take_pending_terminal_responses();
+        assert_eq!(resp, vec![b"\x1b[>0;100;0c".to_vec()]);
+        assert_ne!(resp, vec![b"\x1b[?1;2c".to_vec()], "Primary DAと取り違えていないこと");
+    }
+
+    #[test]
+    fn test_dsr_5n_queues_ok_response() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[5n"); // DSR: device status report
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[0n".to_vec()]);
+    }
+
+    #[test]
+    fn test_dsr_6n_cpr_reports_current_cursor_position_1indexed() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[6;11H"); // カーソルを row=6, col=11 (1-indexed) へ移動
+        feed(&mut t, b"\x1b[6n"); // DSR: cursor position report (CPR)
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[6;11R".to_vec()]);
+    }
+
+    #[test]
+    fn test_dsr_unhandled_ps_queues_nothing() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[9n"); // 未対応のDSR種別
+        assert!(t.take_pending_terminal_responses().is_empty());
+    }
+
+    #[test]
+    fn test_dsr_6n_cpr_clamps_to_last_column_during_delayed_wrap() {
+        // 右端に書いた直後は`print()`が実際の折り返しを次のprintable文字まで遅延させる
+        // ("delayed wrap")ため、この間`cursor_col`は`cols`(範囲外)になり得る。CPRは
+        // 可視上の位置(最終列 = cols)を報告すべきで、`cols + 1`のような範囲外の列を
+        // 返してはいけない(Codexレビュー指摘)。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"0123456789"); // ちょうど10文字で右端に到達、delayed wrap状態に入る
+        feed(&mut t, b"\x1b[6n");
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[1;10R".to_vec()]);
+    }
+
+    #[test]
+    fn test_primary_da_with_nonzero_ps_is_ignored() {
+        // Primary DA(識別要求)は`Ps`が省略時解釈込みで0の場合のみ有効(vte自身のANSI
+        // ハンドラも`next_param_or(0) == 0`を条件にしている、Codexレビュー指摘)。
+        // `CSI 1c`のような非0の`Ps`には応答しない。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[1c");
+        assert!(t.take_pending_terminal_responses().is_empty());
+    }
+
+    #[test]
+    fn test_secondary_da_with_nonzero_ps_is_ignored() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>1c");
+        assert!(t.take_pending_terminal_responses().is_empty());
+    }
+
+    #[test]
+    fn test_reset_clears_pending_terminal_responses() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[6n"); // CPR要求をpendingにする
+        feed(&mut t, b"\x1bc"); // RIS (full reset)
+        assert!(t.take_pending_terminal_responses().is_empty());
     }
 
     #[test]
