@@ -139,6 +139,24 @@ pub(crate) struct Terminal {
     main_cells: Vec<TermCell>,
     alt_cells: Vec<TermCell>,
     alt_active: bool,
+    /// カーソル位置 + SGR属性一式の保存スロット(それぞれの画面ごとに1つ)。
+    /// 2つの独立した経路から書き込まれる:
+    /// 1. DECSET/DECRST `?1047`/`?1049`(`switch_to_alt`/`switch_to_main`)—— alt画面への
+    ///    切り替え時に暗黙的にmain側のカーソルを保存/復元する(仕様上`?1049`は
+    ///    「DECSCとして保存 → alt切替 → 画面消去」「main復帰 → DECRCとして復元」を兼ねる
+    ///    ため、下記2.のDECSC/DECRCと同じスロットを共有するのが正しい——実際、
+    ///    アプリがalt画面へ入る前に明示`ESC 7`していた場合、`?1049h`の暗黙保存が
+    ///    それを上書きするのが仕様通りの挙動)。
+    /// 2. DECSC/DECRC(`ESC 7`/`ESC 8`)・CSI `s`/`u`(ANSI.SYS方言、タスク#57)——
+    ///    `save_cursor_decsc`/`restore_cursor_decrc`が、その時点でアクティブな画面
+    ///    (`alt_active`)に応じてどちらのスロットを使うか選ぶ。alt画面上で明示的に
+    ///    `ESC 7`/`ESC 8`する場合はこちらが専ら`saved_cursor_alt`を使う経路になる。
+    ///
+    /// 文字セット状態(G0/G1、タスク#41)は現時点で未実装のため保存対象に含まれていない。
+    /// #41実装時はこのタプルを拡張(またはstruct化)し、`save_cursor_decsc`/
+    /// `restore_cursor_decrc`・`switch_to_alt`/`switch_to_main`の両方の保存/復元経路を
+    /// 揃えて更新すること(DECSCは仕様上カーソル位置・SGR属性・文字セット状態の
+    /// 3つを保存対象とする)。
     saved_cursor_main: Option<(usize, usize, TermAttrs)>,
     saved_cursor_alt: Option<(usize, usize, TermAttrs)>,
     cursor_row: usize,
@@ -533,6 +551,38 @@ impl Terminal {
                 self.cursor_col = col;
                 self.cur_attrs = attrs;
             }
+        }
+    }
+
+    /// DECSC(`ESC 7`)およびCSI `s`(ANSI.SYS方言、DECLRMM未実装のためintermediate無しの
+    /// `CSI s`は常にこちらとして扱ってよい——`fn csi_dispatch`呼び出し元のコメント参照)。
+    /// 現在アクティブな画面(`alt_active`)に応じて`saved_cursor_main`/`saved_cursor_alt`の
+    /// どちらか一方だけを更新する(タスク#57)。`switch_to_alt`(`?1047`/`?1049`)と同じ
+    /// スロットを共有する設計の理由は[Terminal]の`saved_cursor_main`フィールド
+    /// docコメント参照。
+    fn save_cursor_decsc(&mut self) {
+        let saved = Some((self.cursor_row, self.cursor_col, self.cur_attrs));
+        if self.alt_active {
+            self.saved_cursor_alt = saved;
+        } else {
+            self.saved_cursor_main = saved;
+        }
+    }
+
+    /// DECRC(`ESC 8`)およびCSI `u`。対応する`save_cursor_decsc`が一度も呼ばれていない
+    /// (スロットが`None`)場合、VT100系の挙動が実装依存で割れる仕様のため、この実装では
+    /// 安全側に倒して何もしない(カーソルを勝手に原点等へ移動させない)。
+    fn restore_cursor_decrc(&mut self) {
+        let saved = if self.alt_active { self.saved_cursor_alt } else { self.saved_cursor_main };
+        if let Some((row, col, attrs)) = saved {
+            // 保存後にresizeで画面が縮んでいる可能性を考慮し、現在のcols/rowsへ
+            // クランプする。`resize_preserving_state`は`saved_cursor_*`自体を
+            // resize時に追従更新するが(念のため多重に安全側でもクランプする)、
+            // colはprintの遅延折り返し状態(`== cols`)を許容する必要があるため
+            // `cols`ちょうどまでは許容し、それを超える場合のみ切り詰める。
+            self.cursor_row = row.min(self.rows.saturating_sub(1));
+            self.cursor_col = col.min(self.cols);
+            self.cur_attrs = attrs;
         }
     }
 
@@ -1163,6 +1213,13 @@ impl Perform for Terminal {
                 let bot = (p1.max(1) as usize - 1).min(self.rows - 1);
                 if top < bot { self.scroll_top = top; self.scroll_bottom = bot; }
             }
+            // CSI s / CSI u(ANSI.SYS方言のsave/restore cursor、タスク#57)。
+            // `CSI s`は本来DECSLRM(左右マージン設定、DECLRMM `?69h`有効時のみ)と
+            // 曖昧だが、DECLRMM/左右マージン自体がこのコードベースに未実装
+            // (scroll_top/scroll_bottomの上下marginのみ対応)なので、常にDECSCと
+            // 同義の save cursor として扱ってよい。
+            's' => { self.save_cursor_decsc(); }
+            'u' => { self.restore_cursor_decrc(); }
             _ => {}
         }
     }
@@ -1203,7 +1260,7 @@ impl Perform for Terminal {
     fn hook(&mut self, _params: &vte::Params, _ints: &[u8], _ignore: bool, _c: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
-    fn esc_dispatch(&mut self, _ints: &[u8], _ignore: bool, byte: u8) {
+    fn esc_dispatch(&mut self, ints: &[u8], _ignore: bool, byte: u8) {
         match byte {
             b'M' => {
                 if self.cursor_row == self.scroll_top {
@@ -1225,6 +1282,13 @@ impl Perform for Terminal {
                 }
             }
             b'c' => { self.reset_all(); }
+            // DECSC/DECRC(タスク#57)。`b'7'`/`b'8'`はASCII '7'/'8'(0x37/0x38)。
+            // intermediateが空の場合のみDECSC/DECRCとして扱う——`ESC # 8`(DECALN、
+            // screen alignment test、未実装につきno-op)がintermediate `#`付きの
+            // 別シーケンスとして同じ最終バイト`8`を使うため、`ints`を無視すると
+            // DECALNまで誤ってDECRCとして処理してしまう(codexレビュー指摘)。
+            b'7' if ints.is_empty() => { self.save_cursor_decsc(); }
+            b'8' if ints.is_empty() => { self.restore_cursor_decrc(); }
             _ => {}
         }
     }
@@ -2813,6 +2877,125 @@ mod tests {
 
         feed(&mut t, b"\x1b[5;3H\x1b[1P"); // 行4(region外)・列2で1セル削除
         assert_eq!(cell(&t, 4, 2), "4", "旧列3('4')が1列左へ詰められる — region外の行4でもDCHは効く");
+    }
+
+    // ── DECSC/DECRC(`ESC 7`/`ESC 8`)・CSI s/u(タスク#57) ─────────────
+
+    #[test]
+    fn test_esc_7_8_saves_and_restores_cursor_position_and_sgr() {
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H"); // row=2, col=4 (0-indexed)
+        feed(&mut t, b"\x1b[1m"); // bold on
+        feed(&mut t, b"\x1b7"); // DECSC: 位置(2,4)・bold=trueを保存
+        feed(&mut t, b"\x1b[1;1H"); // カーソル移動
+        feed(&mut t, b"\x1b[0m"); // bold off
+        feed(&mut t, b"\x1b8"); // DECRC: 復元
+        assert_eq!(t.cursor_row(), 2);
+        assert_eq!(t.cursor_col(), 4);
+        feed(&mut t, b"x");
+        assert!(cell_bold(&t, 2, 4), "DECRC後、保存時のbold属性で描画される");
+    }
+
+    #[test]
+    fn test_csi_s_u_ansi_sys_saves_and_restores_cursor() {
+        // CSI s / CSI u は ESC 7 / ESC 8 と同義(ANSI.SYS方言、DECLRMM未実装なので曖昧さ無し)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H\x1b[s"); // 位置(2,4)を保存
+        feed(&mut t, b"\x1b[1;1H"); // カーソル移動
+        feed(&mut t, b"\x1b[u"); // 復元
+        assert_eq!(t.cursor_row(), 2);
+        assert_eq!(t.cursor_col(), 4);
+    }
+
+    #[test]
+    fn test_decrc_without_prior_decsc_is_noop() {
+        // 事前の保存が無い状態でのDECRCは、カーソルを勝手に移動させない(安全側no-op)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H");
+        feed(&mut t, b"\x1b8"); // 保存なしのDECRC
+        assert_eq!(t.cursor_row(), 2);
+        assert_eq!(t.cursor_col(), 4);
+    }
+
+    #[test]
+    fn test_decsc_alt_screen_slot_independent_from_main() {
+        // alt画面上の明示ESC7/ESC8は、main画面のDECSCスロットと独立している
+        // ([Terminal]の`saved_cursor_main`フィールドdocコメント参照)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[2;3H"); // main: row=1, col=2
+        feed(&mut t, b"\x1b7"); // main側スロットに保存
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ(暗黙的にmain側スロットを上書き保存)
+        feed(&mut t, b"\x1b[4;4H"); // alt: row=3, col=3
+        feed(&mut t, b"\x1b7"); // alt側スロットに保存
+        feed(&mut t, b"\x1b[1;1H"); // alt画面上でカーソル移動
+        feed(&mut t, b"\x1b8"); // alt側スロットから復元
+        assert_eq!(t.cursor_row(), 3);
+        assert_eq!(t.cursor_col(), 3);
+        feed(&mut t, b"\x1b[?1049l"); // main画面へ復帰(?1049hが上書き保存した位置に復元)
+        assert_eq!(t.cursor_row(), 1);
+        assert_eq!(t.cursor_col(), 2);
+    }
+
+    #[test]
+    fn test_ris_clears_saved_decsc_cursor() {
+        // RIS(`ESC c`)は保存済みDECSCスロットもクリアする——リセット後のDECRCが
+        // リセット前の古い位置へ復元してしまう回帰を防ぐ。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H\x1b7"); // 位置(2,4)を保存
+        feed(&mut t, b"\x1bc"); // RIS
+        feed(&mut t, b"\x1b8"); // 保存済みスロットは無いはず → no-op
+        assert_eq!(t.cursor_row(), 0);
+        assert_eq!(t.cursor_col(), 0);
+    }
+
+    #[test]
+    fn test_esc_hash_8_decaln_is_not_mistaken_for_decrc() {
+        // codexレビュー指摘: `ESC # 8`(DECALN、intermediate `#`付き)は最終バイトが
+        // DECRC(`ESC 8`)と同じ`8`だが別シーケンス。DECALN自体は未実装(no-op)なので、
+        // 保存済みカーソルへ誤って復元(DECRCとして処理)されないことを固定する。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H\x1b7"); // 位置(2,4)を保存
+        feed(&mut t, b"\x1b[1;1H"); // カーソル移動
+        feed(&mut t, b"\x1b#8"); // DECALN(未実装・no-op) — DECRCとして誤処理しないこと
+        assert_eq!(t.cursor_row(), 0, "DECALNはDECRCとして扱われず、カーソルは動かない");
+        assert_eq!(t.cursor_col(), 0);
+    }
+
+    #[test]
+    fn test_naked_decrc_after_1049_exit_without_new_decsc_is_noop() {
+        // `switch_to_main`(`?1047l`/`?1049l`)は復元後に保存スロットを消費(take)する
+        // 既存挙動(タスク#57の変更対象外)。これにより、alt画面を抜けた後に新たな
+        // `ESC 7`無しで単独の`ESC 8`が来ても、古い1049復元位置へ再度ジャンプしたり
+        // せず安全にno-opになることを固定する(codexレビュー: `restore_cursor_decrc`が
+        // 非消費であることとの整合性に対する指摘への対応)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[2;3H"); // main: row=1, col=2
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ(main側スロットへ暗黙保存)
+        feed(&mut t, b"\x1b[?1049l"); // main画面へ復帰(スロットを消費して復元)
+        assert_eq!(t.cursor_row(), 1);
+        assert_eq!(t.cursor_col(), 2);
+        feed(&mut t, b"\x1b[5;5H"); // 別の位置へ移動
+        feed(&mut t, b"\x1b8"); // 新たなDECSC無しの単独DECRC → no-op
+        assert_eq!(t.cursor_row(), 4, "スロットは1049l復帰時に消費済みなのでno-op");
+        assert_eq!(t.cursor_col(), 4);
+    }
+
+    #[test]
+    fn test_csi_s_two_param_form_still_saves_cursor_position_not_margins() {
+        // `CSI Pl;Pr s`はDECLRMM(左右マージンモード)有効時はDECSLRM(マージン設定)に
+        // 化けるが、このコードベースはDECLRMM/左右マージン自体を実装していないため、
+        // パラメータの有無・個数によらず常にDECSCと同義のsave cursorとして扱う
+        // (`csi_dispatch`のコメント参照、codexレビュー指摘への対応として明示的に固定)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"\x1b[3;5H\x1b[7;12s"); // 位置(2,4)、パラメータ2個付きのCSI s
+        feed(&mut t, b"\x1b[1;1H");
+        feed(&mut t, b"\x1b[u");
+        assert_eq!(t.cursor_row(), 2, "パラメータはマージン設定ではなく無視され、保存時のカーソル位置が使われる");
+        assert_eq!(t.cursor_col(), 4);
+    }
+
+    fn cell_bold(t: &Terminal, row: usize, col: usize) -> bool {
+        t.screen_cells()[row * t.cols() + col].bold
     }
 
     // ── Proptest: 不変量 ────────────────────────────────
