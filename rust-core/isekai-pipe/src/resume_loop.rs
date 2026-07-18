@@ -601,6 +601,21 @@ struct ResumeLoopState {
     /// メッセージに"Last error: ..."として付け足す。再接続成功のたびに
     /// `None`へリセットされる。
     last_resume_error: Option<String>,
+    /// `UnknownSession`が何回連続で返ってきたか。サーバ側`RESUME`ハンドラ
+    /// (`isekai-pipe serve`側`engine/mod.rs::handle_resume`相当)は、
+    /// 「session_idがテーブルに無い」(本当に消滅)だけでなく「テーブルには
+    /// あるがまだparkされていない」(直前のdata streamのresetをまだ処理し
+    /// 終えていない一時的な状態、`parked_tcp == None`)や「fencing slotが
+    /// 一致しない」場合も同じ`UnknownToken`/`UnknownSession`を返す
+    /// (ワイヤに複数の意味を1値へ潰しているため区別できない)。1回だけで
+    /// 即terminal扱いすると、この一時的なraceを本当に消滅したものと誤認して
+    /// 本来resumeできたはずのセッションを早まって諦めてしまう
+    /// (Codexレビューで指摘、実際に`engine/mod.rs`の該当箇所を確認して
+    /// 再現条件を特定した)。`resume_with_backoff_until_deadline`はこの
+    /// カウンタが`UNKNOWN_SESSION_CONFIRM_THRESHOLD`に達したときだけ
+    /// give upする——「毎回同じ確定的signalが返り続けている」ことでしか
+    /// 本物の消滅とは区別できないため。
+    consecutive_unknown_session: u32,
 }
 
 /// Fast path: promote the already-warm standby connection instead of
@@ -682,23 +697,54 @@ async fn promote_warm_standby_once(
 /// fresh instance the caller creates per disconnect episode (mirroring
 /// `spawn_reconnect_signal`'s own one-per-generation rule) — passed in
 /// rather than constructed here so tests can inject a controllable mock.
-/// `UnknownSession` is the only `ResumeRejectReason` that means "the server
-/// doesn't have this `session_id` in its table at all" — evicted by
-/// capacity pressure, reclaimed by the resume-window backstop, or the
-/// server process itself restarted with an empty table. Retrying the exact
-/// same `session_id` again can never succeed once this comes back, so
-/// `resume_with_backoff_until_deadline` gives up immediately instead of
-/// waiting out the (now days-long) deadline. `Auth`/`OffsetGone` and any
-/// non-rejection `TransportError` (network/mux failures) are left to the
-/// existing deadline-bound retry loop unchanged — those are rejections of a
-/// *specific attempt* against a session the server still knows about (or
-/// transient dial failures), not proof the session itself is gone, so this
-/// function deliberately doesn't guess at their retriability.
-fn is_terminal_resume_rejection(e: &isekai_transport::TransportError) -> bool {
+/// How many *consecutive* `UnknownSession` rejections
+/// `resume_with_backoff_until_deadline` requires before treating the
+/// session as genuinely, permanently gone — see `is_unknown_session_rejection`'s
+/// docs for why a single occurrence isn't proof enough. At the backoff
+/// schedule's minimum (500ms, 1s, 2s, ...) this costs a few seconds at most
+/// before giving up on a truly-dead session, which is negligible next to the
+/// (now days-long) deadline it replaces for that case.
+const UNKNOWN_SESSION_CONFIRM_THRESHOLD: u32 = 3;
+
+/// `UnknownSession` is the wire reason for three different server-side
+/// situations that `isekai-pipe serve`'s `RESUME` handler
+/// (`engine/mod.rs`, roughly `sessions.get()` returning `None`, *or*
+/// `parked_tcp` still being `None`, *or* the `AttachArbiter` established
+/// lease not matching) all collapse into the same
+/// `quicmux::ResumeRejectReason::UnknownToken` value — only the first of
+/// those means "this session_id will never resume again"; the other two are
+/// transient races (the old data stream's reset hasn't finished being
+/// processed and parked yet) that a subsequent attempt, moments later, can
+/// still recover from. Since the wire protocol can't currently tell these
+/// apart, a *single* `UnknownSession` is not reliable proof of permanent
+/// loss (confirmed by reading `engine/mod.rs`'s `RESUME` handler directly,
+/// per a Codex review finding) — only `UNKNOWN_SESSION_CONFIRM_THRESHOLD`
+/// consecutive occurrences are treated as such by the caller.
+/// `Auth`/`OffsetGone` and any non-rejection `TransportError` (network/mux
+/// failures) are left to the existing deadline-bound retry loop unchanged —
+/// those are rejections of a *specific attempt*, not proof the session
+/// itself is gone, so this function deliberately doesn't guess at their
+/// retriability.
+fn is_unknown_session_rejection(e: &isekai_transport::TransportError) -> bool {
     matches!(
         e,
         isekai_transport::TransportError::ResumeRejected(isekai_transport::ResumeRejectReason::UnknownSession)
     )
+}
+
+/// Pure decision core of the `UnknownSession` streak-tracking described on
+/// `ResumeLoopState::consecutive_unknown_session`'s docs, factored out so it
+/// can be unit-tested without a real `AnyMuxFactory`/network dial (unlike
+/// `resume_with_backoff_until_deadline` itself). Given the streak length
+/// going into this attempt and whether this attempt's error was an
+/// `UnknownSession` rejection, returns the streak length coming out of it
+/// and whether the caller should give up now.
+fn update_unknown_session_streak(previous_streak: u32, is_unknown_session: bool) -> (u32, bool) {
+    if !is_unknown_session {
+        return (0, false);
+    }
+    let streak = previous_streak.saturating_add(1);
+    (streak, streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD)
 }
 
 /// Shared give-up cleanup for `resume_with_backoff_until_deadline`'s two
@@ -790,6 +836,11 @@ async fn resume_with_backoff_until_deadline(
         .await
         {
             Ok(mut resumed) => {
+                // A successful RESUME_ACK is proof the session was known and
+                // parked — whatever streak of `UnknownSession` preceded it
+                // (if any) was the transient not-yet-parked race, not
+                // genuine loss.
+                state.consecutive_unknown_session = 0;
                 if !replay_and_advance(&state.replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
                     // resume自体は成功したがreplayが不整合 —実質「この試行は
                     // 失敗した」ので、既存のErr(e)アームと同じTTY/非TTY分岐・
@@ -818,8 +869,17 @@ async fn resume_with_backoff_until_deadline(
                 return Ok(resumed.data_stream);
             }
             Err(e) => {
-                // See `is_terminal_resume_rejection`'s docs.
-                if is_terminal_resume_rejection(&e) {
+                // See `is_unknown_session_rejection`'s docs: a single
+                // occurrence isn't reliable proof the session is gone for
+                // good (it's also what a transient not-yet-parked race on
+                // the server looks like), so only give up once it's been
+                // confirmed `UNKNOWN_SESSION_CONFIRM_THRESHOLD` times in a
+                // row. Any other outcome (success, or a *different* error)
+                // resets the streak elsewhere in this loop.
+                let (streak, should_give_up) =
+                    update_unknown_session_streak(state.consecutive_unknown_session, is_unknown_session_rejection(&e));
+                state.consecutive_unknown_session = streak;
+                if should_give_up {
                     let session_id = state.session_id;
                     give_up(
                         state.is_tty,
@@ -827,9 +887,10 @@ async fn resume_with_backoff_until_deadline(
                         warm_standby_task,
                         &format!(
                             "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
-                             the server no longer knows this session (reclaimed, or the server \
-                             itself restarted); retrying would never succeed. Closing stdin/stdout; \
-                             ssh will treat this as a lost connection.",
+                             the server no longer knows this session ({UNKNOWN_SESSION_CONFIRM_THRESHOLD} \
+                             consecutive UnknownSession rejections; reclaimed, or the server itself \
+                             restarted), retrying would never succeed. Closing stdin/stdout; ssh will \
+                             treat this as a lost connection.",
                         ),
                     )
                     .await;
@@ -883,6 +944,7 @@ pub(crate) async fn run_resume_loop(
         // `format_reconnect_status`周辺のモジュールドキュメント参照)。
         is_tty: std::io::stderr().is_terminal(),
         last_resume_error: None,
+        consecutive_unknown_session: 0,
     };
 
     let mut stdin = tokio::io::stdin();
@@ -1341,16 +1403,61 @@ mod tests {
     }
 
     #[test]
-    fn is_terminal_resume_rejection_is_true_only_for_unknown_session() {
-        assert!(is_terminal_resume_rejection(&isekai_transport::TransportError::ResumeRejected(
+    fn is_unknown_session_rejection_is_true_only_for_unknown_session() {
+        assert!(is_unknown_session_rejection(&isekai_transport::TransportError::ResumeRejected(
             isekai_transport::ResumeRejectReason::UnknownSession
         )));
-        assert!(!is_terminal_resume_rejection(&isekai_transport::TransportError::ResumeRejected(
+        assert!(!is_unknown_session_rejection(&isekai_transport::TransportError::ResumeRejected(
             isekai_transport::ResumeRejectReason::Auth
         )));
-        assert!(!is_terminal_resume_rejection(&isekai_transport::TransportError::ResumeRejected(
+        assert!(!is_unknown_session_rejection(&isekai_transport::TransportError::ResumeRejected(
             isekai_transport::ResumeRejectReason::OffsetGone
         )));
+    }
+
+    /// Regression test for the Codex-review finding: `isekai-pipe serve`'s
+    /// `RESUME` handler returns the exact same `UnknownSession` wire reason
+    /// both for "this session_id never existed / was evicted" and for "this
+    /// session exists but the server hasn't finished parking it yet" (a
+    /// transient race right after a reset). A single `UnknownSession` must
+    /// not be enough to give up — only `UNKNOWN_SESSION_CONFIRM_THRESHOLD`
+    /// in a row should.
+    #[test]
+    fn update_unknown_session_streak_does_not_give_up_below_the_threshold() {
+        let mut streak = 0;
+        for _ in 0..(UNKNOWN_SESSION_CONFIRM_THRESHOLD - 1) {
+            let should_give_up;
+            (streak, should_give_up) = update_unknown_session_streak(streak, true);
+            assert!(!should_give_up, "must not give up before the threshold is reached");
+        }
+        assert_eq!(streak, UNKNOWN_SESSION_CONFIRM_THRESHOLD - 1);
+    }
+
+    #[test]
+    fn update_unknown_session_streak_gives_up_once_the_threshold_is_reached() {
+        let mut streak = 0;
+        let mut should_give_up = false;
+        for _ in 0..UNKNOWN_SESSION_CONFIRM_THRESHOLD {
+            (streak, should_give_up) = update_unknown_session_streak(streak, true);
+        }
+        assert!(should_give_up, "must give up once the streak reaches the threshold");
+        assert_eq!(streak, UNKNOWN_SESSION_CONFIRM_THRESHOLD);
+    }
+
+    /// The scenario this whole streak exists to tolerate: the server's
+    /// not-yet-parked race resolves after a couple of attempts (a later
+    /// attempt returns something other than `UnknownSession` — e.g. this
+    /// models a successful resume, which the real caller represents by
+    /// simply never calling this function again for that episode; here we
+    /// model it as a non-`UnknownSession` outcome to prove the streak itself
+    /// resets rather than staying "primed" to give up early on the next
+    /// disconnect episode).
+    #[test]
+    fn update_unknown_session_streak_resets_on_a_non_unknown_session_outcome() {
+        let (streak, _) = update_unknown_session_streak(0, true);
+        let (streak, should_give_up) = update_unknown_session_streak(streak, false);
+        assert_eq!(streak, 0, "a non-UnknownSession outcome must reset the streak");
+        assert!(!should_give_up);
     }
 
     #[tokio::test]
