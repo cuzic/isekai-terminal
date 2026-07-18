@@ -16,6 +16,7 @@ mod helper_download;
 mod init;
 mod log_file;
 mod login;
+mod native;
 mod wrapper;
 
 /// Serializes tests (across `init.rs`/`wrapper.rs`) that mutate the
