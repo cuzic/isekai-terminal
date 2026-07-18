@@ -55,6 +55,17 @@
 //!   the proven-working reactive physical-interface failover
 //!   (`rebind_abstract()`, Phase 9-4b). Android's own rebind path does not
 //!   go through this module — see its docs.
+//! - `dual_path` (UAV C2 OSS企画向け下準備): two independently-dialed,
+//!   simultaneously-held [`AnyMuxConnection`]s to the same peer — one for
+//!   reliable (stream-based) traffic, one for unreliable (datagram-based)
+//!   traffic — each optionally bound to its own physical interface, so an
+//!   app can spread traffic classes across separate physical links and pick
+//!   explicitly which connection to use. Reuses `warm_standby.rs`'s
+//!   "two independent QUIC connections" dial pattern (factored out to
+//!   `physical_interface::connect_via_interface`) for a different purpose:
+//!   both connections stay actively in use, not primary/standby failover.
+//!   See that module's docs for why this doesn't fork `noq` or attempt
+//!   per-frame path selection within one connection.
 //!
 //! Explicitly **out of scope** for this phase (left for later phases per
 //! `archive/ISEKAI_SSH_DESIGN.md`'s フェーズ分割案):
@@ -77,6 +88,7 @@ pub mod backoff;
 pub mod candidate;
 pub mod candidate_pool;
 pub mod candidate_provider;
+pub mod dual_path;
 pub mod error;
 pub mod generation_coordinator;
 pub mod multipath;
@@ -103,6 +115,7 @@ pub use candidate::{
     LEGACY_INTENT_PROVIDER_ID,
 };
 pub use candidate_pool::{CandidatePool, Clock, StaleGeneration, SystemClock};
+pub use dual_path::{connect_dual_path, connect_dual_path_best_effort, DualPathConnections, DualPathEndpoint};
 pub use generation_coordinator::{
     AdvanceGenerationError, GenerationCoordinator, RoundContext, DEFAULT_MAX_GENERATION_ADVANCES,
 };

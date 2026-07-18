@@ -49,6 +49,9 @@ rand = "0.8"
 # `noq::Connection::path_events()`のStream実装をpollするために使う
 # (multipath.rs、isekai-terminal-coreのmultipath_transport.rsと同じ用途)。
 tokio-stream = "0.1"
+# dual_path.rsがAnyMuxConnection::send_datagram/recv_datagram(bytes::Bytes)を
+# 公開APIの型として直接使うため(devではなく本体コードの依存)。
+bytes = "1"
 
 [target.'cfg(not(target_os = "ios"))'.dependencies]
 # `discovery` featureはnetdev(macOS/iOS向けにSystemConfiguration.framework等の
@@ -76,6 +79,3 @@ env_logger = "0.11"
 # `[dependencies]`エントリ(`proof.rs`/`candidate_pool.rs`等が使用)がテストにも
 # そのまま見えるので、ここで別途宣言する必要はない。
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-# tests/multipath_datagram_e2e.rsがAnyMuxConnection::send_datagram(Bytes)を
-# 直接呼ぶために使う。
-bytes = "1"
