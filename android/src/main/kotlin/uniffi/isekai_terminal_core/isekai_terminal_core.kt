@@ -3722,6 +3722,16 @@ data class CellData (
     var `blink`: kotlin.Boolean
     , 
     var `invisible`: kotlin.Boolean
+    , 
+    /**
+     * OSC 8(`ESC]8;params;URIST`、タスク#40)ハイパーリンクのintern id。`Some`なら
+     * `ScreenUpdate::link_table[id]`(0-indexed)にこのセルが指すURLが入っている。
+     * セルごとに`Option<String>`のURLを直接持たせない——`CellData`は`ScreenUpdate`
+     * として毎フレーム全セル分FFIコピーされるため、コストの大きい`String`は
+     * 一度だけ`link_table`に置き、セル側は軽量な`Option<u32>`のみ持つintern方式
+     * にしている(Fableレビュー2次)。
+     */
+    var `linkId`: kotlin.UInt?
     
 ){
     
@@ -3748,6 +3758,7 @@ public object FfiConverterTypeCellData: FfiConverterRustBuffer<CellData> {
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterOptionalUInt.read(buf),
         )
     }
 
@@ -3761,7 +3772,8 @@ public object FfiConverterTypeCellData: FfiConverterRustBuffer<CellData> {
             FfiConverterBoolean.allocationSize(value.`underline`) +
             FfiConverterBoolean.allocationSize(value.`strikethrough`) +
             FfiConverterBoolean.allocationSize(value.`blink`) +
-            FfiConverterBoolean.allocationSize(value.`invisible`)
+            FfiConverterBoolean.allocationSize(value.`invisible`) +
+            FfiConverterOptionalUInt.allocationSize(value.`linkId`)
     )
 
     override fun write(value: CellData, buf: ByteBuffer) {
@@ -3775,6 +3787,7 @@ public object FfiConverterTypeCellData: FfiConverterRustBuffer<CellData> {
             FfiConverterBoolean.write(value.`strikethrough`, buf)
             FfiConverterBoolean.write(value.`blink`, buf)
             FfiConverterBoolean.write(value.`invisible`, buf)
+            FfiConverterOptionalUInt.write(value.`linkId`, buf)
     }
 }
 
@@ -4653,6 +4666,17 @@ data class ScreenUpdate (
      * (xtermの既定である「blinking block」に合わせる)。
      */
     var `cursorBlink`: kotlin.Boolean
+    , 
+    /**
+     * OSC 8(タスク#40)ハイパーリンクのURL intern表。`CellData::link_id`はこの
+     * `Vec`のindex(0-indexed)。同一URLは重複排除されて同じindexを指す。
+     * このterminalセッションが一度でも見たURLを(現在アクティブでなくなった後も、
+     * RISされた後も)ずっと保持する——scrollback上の過去セルの`link_id`がこの表の
+     * indexを指し続けるため、indexを再利用したり表自体をクリアしたりすると
+     * 過去セルが別のURLを指す破損になる(`terminal.rs`の`link_table`フィールド
+     * docコメント参照)。
+     */
+    var `linkTable`: List<kotlin.String>
     
 ){
     
@@ -4683,6 +4707,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterULong.read(buf),
             FfiConverterTypeCursorShape.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterSequenceString.read(buf),
         )
     }
 
@@ -4700,7 +4725,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.allocationSize(value.`cursorVisible`) +
             FfiConverterULong.allocationSize(value.`bellGeneration`) +
             FfiConverterTypeCursorShape.allocationSize(value.`cursorShape`) +
-            FfiConverterBoolean.allocationSize(value.`cursorBlink`)
+            FfiConverterBoolean.allocationSize(value.`cursorBlink`) +
+            FfiConverterSequenceString.allocationSize(value.`linkTable`)
     )
 
     override fun write(value: ScreenUpdate, buf: ByteBuffer) {
@@ -4718,6 +4744,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterULong.write(value.`bellGeneration`, buf)
             FfiConverterTypeCursorShape.write(value.`cursorShape`, buf)
             FfiConverterBoolean.write(value.`cursorBlink`, buf)
+            FfiConverterSequenceString.write(value.`linkTable`, buf)
     }
 }
 
@@ -6720,6 +6747,38 @@ public object FfiConverterOptionalUShort: FfiConverterRustBuffer<kotlin.UShort?>
         } else {
             buf.put(1)
             FfiConverterUShort.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalUInt: FfiConverterRustBuffer<kotlin.UInt?> {
+    override fun read(buf: ByteBuffer): kotlin.UInt? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUInt.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UInt?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUInt.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UInt?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUInt.write(value, buf)
         }
     }
 }

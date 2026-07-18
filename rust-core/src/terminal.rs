@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use vte::Perform;
 use crate::theme::Theme;
 use crate::{CursorShape, MouseReportingMode, TerminalKeyModifiers};
@@ -105,6 +106,14 @@ pub(crate) struct TermCell {
     /// 落とす。幅0の結合文字([Terminal::print]参照)を、プレースホルダではなく
     /// 全角文字自身の本体セルへ付加するために使う(Fableレビュー: タスク#39)。
     pub(crate) is_wide_placeholder: bool,
+    /// OSC 8(`ESC]8;params;URIST`、タスク#40)で開かれているハイパーリンクの
+    /// intern id。`Some`ならこのセルは`Terminal::link_table()`の同indexのURL文字列を
+    /// 指す。セル自体には`String`を持たせない——`CellData`は`ScreenUpdate`として
+    /// 毎フレーム全セル分FFIコピーされるため(Fableレビュー2次: `Option<String>`を
+    /// セルへ直接持たせるとコストが跳ね上がる)。かわりに`ScreenUpdate`に
+    /// id→URLの`link_table`を1つ持たせ、セルは軽量な`Option<u32>`のみ持つ
+    /// intern方式にする。
+    pub(crate) link_id: Option<u32>,
 }
 
 /// 現在のカーソル位置に適用されている SGR 属性一式(色は「論理色」——`reverse`が
@@ -148,6 +157,9 @@ impl TermAttrs {
         if self.reverse { (self.bg, self.fg) } else { (self.fg, self.bg) }
     }
 
+    /// `link_id`は含めない——ハイパーリンク状態(OSC 8)はSGR属性(この構造体)とは
+    /// 独立で、`ESC[0m`のようなSGRリセットでは閉じない(呼び出し元([Terminal::print]
+    /// 等)が`Terminal::active_link_id`を別途セルへ付加する)。
     fn to_cell(&self, ch: smol_str::SmolStr) -> TermCell {
         let (fg, bg) = self.effective_colors();
         TermCell {
@@ -162,6 +174,7 @@ impl TermAttrs {
             blink: self.blink,
             invisible: self.invisible,
             is_wide_placeholder: false,
+            link_id: None,
         }
     }
 }
@@ -182,6 +195,7 @@ fn blank_cell_for_theme(theme: &Theme) -> TermCell {
         blink: false,
         invisible: false,
         is_wide_placeholder: false,
+        link_id: None,
     }
 }
 
@@ -308,7 +322,12 @@ pub(crate) struct Terminal {
     /// 一般的な挙動(REPは「最後に画面へ書かれたgraphic文字」を覚え続け、CR/LF等の
     /// 制御機能はそれを消さない)に合わせる。この値を書き込むのは`print()`の
     /// 非結合文字分岐のみ。
-    last_graphic_cell: Option<(char, TermAttrs)>,
+    ///
+    /// 3つ目の要素(`Option<u32>`)は記録時点の`active_link_id`(タスク#40)。SGR属性と
+    /// 同様、REPは「その文字が実際に画面に描かれた見た目」を再現すべきなので、
+    /// REP実行時点で偶然開いている/閉じているハイパーリンク状態ではなく記録時点の
+    /// ものを使う。
+    last_graphic_cell: Option<(char, TermAttrs, Option<u32>)>,
     /// `ESC ( <final>`で指定されたG0文字セット。既定はASCII(タスク#41)。
     g0_charset: Charset,
     /// `ESC ) <final>`で指定されたG1文字セット。既定はASCII(タスク#41)。
@@ -325,6 +344,24 @@ pub(crate) struct Terminal {
     /// DECSET/DECRST `?1006`(SGR拡張マウスレポーティング、タスク#36)。既定は`false`
     /// (レガシーX10形式)。`encode_pointer_event`がこの値でエンコード形式を切り替える。
     sgr_mouse_mode: bool,
+    /// OSC 8(`ESC]8;params;URIST`、タスク#40)で現在開いているハイパーリンクの
+    /// intern id(`link_table`の index)。`None`はリンクなし。`print()`が書き込む
+    /// 全セルへそのまま付与する——SGR属性(`cur_attrs`)とは独立な状態であり、
+    /// `ESC[0m`等のSGRリセットでは閉じない。閉じるのは(1) 空URIのOSC 8
+    /// (`ESC]8;;ST`)、(2) `reset_all`(RIS)、(3) alt screenへの切替/復帰
+    /// (`switch_to_alt`/`switch_to_main`)のいずれか。
+    active_link_id: Option<u32>,
+    /// OSC 8で見たURL文字列のintern表。index(=`u32`)が`TermCell::link_id`/
+    /// `active_link_id`の値そのもの。同じURLは`intern_link`で重複排除して
+    /// 同じidを再利用する。`reset_all`(RIS)でもクリアしない——scrollbackへ
+    /// 既に流れた過去のセルの`link_id`がこの表のindexを指し続けているため、
+    /// RIS後にindexを再利用してしまうと過去セルが別URLを指す破損が起きる
+    /// (Fableレビュー2次の設計方針: アクティブリンク状態のみクリアし、表自体は
+    /// セッション生存期間中インデックスの安定性を保つ)。
+    link_table: Vec<String>,
+    /// `link_table`への逆引き(URL文字列→既存id)。`intern_link`の重複排除にのみ
+    /// 使う内部キャッシュで、`link_table`と要素数・内容が常に対応する。
+    link_ids: HashMap<String, u32>,
 }
 
 /// マウスレポーティング(タスク#36)対象のボタン。左/中/右クリックに加え、
@@ -427,6 +464,9 @@ impl Terminal {
             gl_is_g1: false,
             mouse_reporting_mode: MouseReportingMode::Off,
             sgr_mouse_mode: false,
+            active_link_id: None,
+            link_table: Vec::new(),
+            link_ids: HashMap::new(),
         }
     }
 
@@ -488,6 +528,10 @@ impl Terminal {
     pub(crate) fn autowrap_mode(&self) -> bool { self.autowrap_mode }
     /// DECOM(`CSI ?6h`/`CSI ?6l`)の現在値。テストから参照する。
     pub(crate) fn origin_mode(&self) -> bool { self.origin_mode }
+    /// OSC 8(タスク#40)のURL intern表。`TermCell::link_id`/`Terminal::active_link_id`
+    /// の値はこのスライスのindex。`session.rs::make_screen_update`が
+    /// `ScreenUpdate::link_table`として丸ごと公開する。
+    pub(crate) fn link_table(&self) -> &[String] { &self.link_table }
 
     /// origin modeが有効な間、絶対/相対カーソル移動の座標基準として使う行範囲
     /// `[top, bottom]`(0-indexed、画面全体の座標系)。offの場合は画面全体
@@ -530,6 +574,9 @@ impl Terminal {
         self.gl_is_g1 = false;
         self.mouse_reporting_mode = MouseReportingMode::Off;
         self.sgr_mouse_mode = false;
+        // アクティブなハイパーリンク状態のみクリアする。`link_table`自体は
+        // クリアしない([Terminal]の`link_table`フィールドdocコメント参照)。
+        self.active_link_id = None;
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -747,6 +794,10 @@ impl Terminal {
         }
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
+        // OSC 8(タスク#40): アクティブなハイパーリンクはalt画面の裏表切り替えを
+        // またいで持ち越さない(`SavedCursor`の保存対象にも含めない——xterm等の
+        // 実装がリンクの下線状態を画面切替で引き継がないのに倣う)。
+        self.active_link_id = None;
     }
 
     fn switch_to_main(&mut self, restore_cursor: bool) {
@@ -762,6 +813,7 @@ impl Terminal {
                 self.gl_is_g1 = saved.gl_is_g1;
             }
         }
+        self.active_link_id = None;
     }
 
     /// DECSC(`ESC 7`)およびCSI `s`(ANSI.SYS方言、DECLRMM未実装のためintermediate無しの
@@ -1254,6 +1306,56 @@ impl Terminal {
             }
         }
     }
+
+    /// OSC 8(`ESC]8;params;URIST`、タスク#40)。vteはOSCペイロードを`;`ごとに
+    /// `params`へ分割して渡すため、`params[0]`が`b"8"`、`params[1]`が`id=...`等の
+    /// パラメータ列(未使用——複数行にまたがる同一リンクの同定には現状使わない、
+    /// スコープ外)、`params[2]`以降がURI本体になる。URI自体が(エスケープされない)
+    /// `;`を含む実装は稀にあるため、`params[2]`単独ではなく`params[2..]`を`;`で
+    /// 再結合してURIとして扱う(Fableレビュー2次指摘)。
+    ///
+    /// URIが空(`ESC]8;;ST`、またはURI相当のparamsが無い)ならアクティブリンクを
+    /// 閉じる。空でなければ`intern_link`でid化してアクティブリンクにする——以降の
+    /// `print()`が書き込む全セルへこのidが付与される。
+    ///
+    /// vteの既定ビルド(`no_std`フィーチャ、`Cargo.toml`の`vte = "0.13"`はデフォルト
+    /// フィーチャ込み)はOSCペイロードのraw byteバッファが`MAX_OSC_RAW`(1024バイト)の
+    /// 固定長`ArrayVec`で、バッファが埋まると以降のバイト(`;`区切り自体を含む)は
+    /// 静かに捨てられる。1024バイトを超える長いURLは`osc_dispatch`に丸ごとは届かず
+    /// 途中で切り詰められたバイト列になる(`test_osc8_extremely_long_url_is_truncated_by_vte_osc_buffer`
+    /// で明示)。
+    fn handle_osc8_hyperlink(&mut self, params: &[&[u8]]) {
+        let uri: Option<String> = if params.len() >= 3 {
+            let mut buf = Vec::new();
+            for (i, part) in params[2..].iter().enumerate() {
+                if i > 0 { buf.push(b';'); }
+                buf.extend_from_slice(part);
+            }
+            String::from_utf8(buf).ok()
+        } else {
+            None
+        };
+        match uri {
+            Some(s) if !s.is_empty() => {
+                self.active_link_id = Some(self.intern_link(s));
+            }
+            _ => {
+                self.active_link_id = None;
+            }
+        }
+    }
+
+    /// URL文字列をintern表へ登録し、そのid(`link_table`のindex)を返す。同じURLは
+    /// 既存のidを再利用する(`link_ids`による重複排除)。
+    fn intern_link(&mut self, uri: String) -> u32 {
+        if let Some(&id) = self.link_ids.get(&uri) {
+            return id;
+        }
+        let id = self.link_table.len() as u32;
+        self.link_table.push(uri.clone());
+        self.link_ids.insert(uri, id);
+        id
+    }
 }
 
 /// OSC 10/11などが使う`Pt`のcolor spec(`rgb:R.../G.../B...`または`#RRGGBB`系)を
@@ -1385,19 +1487,24 @@ impl Perform for Terminal {
 
         if self.cursor_row < self.rows {
             let attrs = self.cur_attrs;
-            // REP(`CSI Ps b`、タスク#48)が繰り返す対象として、文字と現在の属性の
-            // ペアを凍結して記録する。実際にセルへ書き込む直前(このif内)でのみ
-            // 更新することで、画面外(このブロックに入らない場合)に対する`print()`
-            // 呼び出しでは更新しない——「実際に画面へ書かれた最後のgraphic文字」
-            // という定義を保つ。
-            self.last_graphic_cell = Some((c, attrs));
-            *self.cell_mut(self.cursor_row, self.cursor_col) =
-                attrs.to_cell(smol_str::SmolStr::new(c.encode_utf8(&mut [0u8; 4])));
+            // OSC 8(タスク#40): ハイパーリンク状態はSGR属性(`cur_attrs`)とは別に
+            // `active_link_id`として持っており、実際に書くセルへここで付与する。
+            let link_id = self.active_link_id;
+            // REP(`CSI Ps b`、タスク#48)が繰り返す対象として、文字・属性・その時点の
+            // アクティブリンクの組を凍結して記録する。実際にセルへ書き込む直前
+            // (このif内)でのみ更新することで、画面外(このブロックに入らない場合)に
+            // 対する`print()`呼び出しでは更新しない——「実際に画面へ書かれた最後の
+            // graphic文字」という定義を保つ。
+            self.last_graphic_cell = Some((c, attrs, link_id));
+            let mut cell = attrs.to_cell(smol_str::SmolStr::new(c.encode_utf8(&mut [0u8; 4])));
+            cell.link_id = link_id;
+            *self.cell_mut(self.cursor_row, self.cursor_col) = cell;
             let advance = if width == 2 && self.cursor_col + 1 < self.cols {
                 // wide文字の2セル目(placeholder)も現在の属性(reverse等も含め)を
                 // 正しく引き継ぐ — 以前は bold だけ無条件で false になっていた。
                 let mut placeholder = attrs.to_cell(smol_str::SmolStr::new_inline(" "));
                 placeholder.is_wide_placeholder = true;
+                placeholder.link_id = link_id;
                 *self.cell_mut(self.cursor_row, self.cursor_col + 1) = placeholder;
                 2
             } else {
@@ -1697,14 +1804,17 @@ impl Perform for Terminal {
             // 描画させるにはループの間だけ`cur_attrs`を差し替え、終わったら元に戻す
             // (REP自体はカーソル位置のSGR状態を変更しない副作用のない操作であるべき)。
             'b' => {
-                if let Some((c, attrs)) = self.last_graphic_cell {
+                if let Some((c, attrs, link_id)) = self.last_graphic_cell {
                     let n = p0.max(1) as usize;
                     let restore_attrs = self.cur_attrs;
+                    let restore_link_id = self.active_link_id;
                     self.cur_attrs = attrs;
+                    self.active_link_id = link_id;
                     for _ in 0..n {
                         self.print(c);
                     }
                     self.cur_attrs = restore_attrs;
+                    self.active_link_id = restore_link_id;
                 }
             }
             // VPA(`CSI Ps d`): CUP/HVPと同様、origin modeが有効な間は行番号が
@@ -1772,6 +1882,14 @@ impl Perform for Terminal {
             }
             (Some(&b"11"), Some(&spec)) => {
                 self.handle_osc_default_color(false, spec, bell_terminated);
+            }
+            // OSC 8(`ESC]8;params;URIST`): ハイパーリンク(タスク#40)。詳細は
+            // `handle_osc8_hyperlink`のdocコメント参照。`params.get(1)`が`None`
+            // (`ESC]8ST`のようなパラメータ自体が無い形)も含めて丸ごと委譲する
+            // (`handle_osc8_hyperlink`側で`params.len()`を見て安全にno-op/close
+            // として扱う)。
+            (Some(&b"8"), _) => {
+                self.handle_osc8_hyperlink(params);
             }
             // OSC 52 (`ESC]52;<selection>;<base64|?>BEL`): clipboard set.
             // `<selection>` (params[1], conventionally `c`/`p`/...) is not
@@ -2324,6 +2442,154 @@ mod tests {
         let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b]52;c;aGVsbG8=\x07");
         assert!(!t.take_pending_clipboard_pull_request());
+    }
+
+    // ── OSC 8 ハイパーリンク(タスク#40) ────────────────────
+
+    #[test]
+    fn test_osc8_open_link_attaches_link_id_to_printed_cells() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8;;https://example.com\x07hi");
+        assert_eq!(t.screen_cells()[0].link_id, Some(0));
+        assert_eq!(t.screen_cells()[1].link_id, Some(0));
+        assert_eq!(t.link_table(), &["https://example.com".to_string()]);
+    }
+
+    #[test]
+    fn test_osc8_text_before_link_and_after_close_has_no_link_id() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"a");
+        feed(&mut t, b"\x1b]8;;https://example.com\x07b");
+        feed(&mut t, b"\x1b]8;;\x07c"); // 空URIで閉じる
+        assert_eq!(t.screen_cells()[0].link_id, None, "リンク開始前のセルはリンク無し");
+        assert_eq!(t.screen_cells()[1].link_id, Some(0), "リンク中のセルはリンクid付き");
+        assert_eq!(t.screen_cells()[2].link_id, None, "リンクを閉じた後のセルはリンク無し");
+    }
+
+    #[test]
+    fn test_osc8_same_url_is_interned_to_the_same_id() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8;;https://example.com\x07a\x1b]8;;\x07");
+        feed(&mut t, b"\x1b]8;;https://example.com\x07b\x1b]8;;\x07");
+        assert_eq!(t.screen_cells()[0].link_id, t.screen_cells()[1].link_id);
+        assert_eq!(t.link_table().len(), 1, "同一URLは重複してinternされない");
+    }
+
+    #[test]
+    fn test_osc8_different_urls_get_different_ids() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8;;https://a.example\x07a\x1b]8;;\x07");
+        feed(&mut t, b"\x1b]8;;https://b.example\x07b\x1b]8;;\x07");
+        assert_ne!(t.screen_cells()[0].link_id, t.screen_cells()[1].link_id);
+        assert_eq!(t.link_table(), &["https://a.example".to_string(), "https://b.example".to_string()]);
+    }
+
+    #[test]
+    fn test_osc8_id_param_is_rejoined_with_semicolon_from_uri_only() {
+        // vteはOSCペイロードを`;`ごとにparamsへ分割して渡す——URIはparams[2]単独では
+        // なくparams[2..]を`;`で再結合しなければならない(Fableレビュー2次指摘)。
+        // このテストではURI自体に`;`を含むケースを再現する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8;;https://example.com/?a=1;b=2\x07x");
+        assert_eq!(t.link_table(), &["https://example.com/?a=1;b=2".to_string()]);
+    }
+
+    #[test]
+    fn test_osc8_id_param_itself_is_not_carried_into_the_url() {
+        // `id=`パラメータ(params[1])は行折り返しをまたぐ同一リンク同定用だが、この
+        // 実装ではURL自体のみをintern対象にする——id=部分がURLへ混入しないことを
+        // 確認する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8;id=42;https://example.com\x07x");
+        assert_eq!(t.link_table(), &["https://example.com".to_string()]);
+    }
+
+    #[test]
+    fn test_osc8_malformed_sequence_without_params_is_a_noop() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8\x07x"); // "8"だけでid/URIパートが無い
+        assert_eq!(t.screen_cells()[0].link_id, None);
+        assert!(t.link_table().is_empty());
+    }
+
+    #[test]
+    fn test_osc8_active_link_cleared_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8;;https://example.com\x07");
+        feed(&mut t, b"\x1bc"); // RIS(`ESC c`、フルリセット)
+        feed(&mut t, b"x");
+        assert_eq!(t.screen_cells()[0].link_id, None, "RIS後はアクティブリンクがクリアされている");
+    }
+
+    #[test]
+    fn test_osc8_link_table_survives_ris_so_scrollback_ids_stay_valid() {
+        // RISはアクティブリンク状態だけをクリアし、intern表自体はクリアしない
+        // ——既にscrollbackへ流れた過去セルのlink_idがこの表のindexを指し続けて
+        // いるため、RIS後にindexを再利用すると過去セルが別URLを指す破損になる。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8;;https://example.com\x07x\x1b]8;;\x07");
+        assert_eq!(t.link_table(), &["https://example.com".to_string()]);
+        feed(&mut t, b"\x1bc"); // RIS
+        assert_eq!(t.link_table(), &["https://example.com".to_string()], "link_table自体はRISでクリアされない");
+    }
+
+    #[test]
+    fn test_osc8_active_link_cleared_on_switch_to_alt_screen() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8;;https://example.com\x07");
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ切替
+        feed(&mut t, b"x");
+        assert_eq!(t.screen_cells()[0].link_id, None, "alt画面切替でアクティブリンクはクリアされる");
+    }
+
+    #[test]
+    fn test_osc8_active_link_cleared_on_switch_back_to_main_screen() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ切替
+        feed(&mut t, b"\x1b]8;;https://example.com\x07");
+        feed(&mut t, b"\x1b[?1049l"); // mainへ復帰
+        feed(&mut t, b"x");
+        assert_eq!(t.screen_cells()[0].link_id, None, "main画面復帰でもアクティブリンクはクリアされる");
+    }
+
+    #[test]
+    fn test_osc8_rep_replays_the_link_id_active_at_original_print_time() {
+        // REP(`CSI Ps b`、タスク#48)は「文字が実際に書かれた時点の見た目」を
+        // 繰り返す設計(SGR属性と同じ扱い)。ここではその時点でアクティブだった
+        // リンクを再現し、REP実行時点(既にリンクを閉じた後)のリンク状態には
+        // 化けないことを確認する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8;;https://example.com\x07a\x1b]8;;\x07");
+        feed(&mut t, b"\x1b[3b"); // REP: 直前文字'a'を3回繰り返す
+        for i in 0..4 {
+            assert_eq!(t.screen_cells()[i].link_id, Some(0), "col {i}: REPで複製されたセルもリンクidを引き継ぐ");
+        }
+    }
+
+    #[test]
+    fn test_osc8_extremely_long_url_is_truncated_by_vte_osc_buffer() {
+        // vteの既定ビルド(`no_std`フィーチャ有効、`vte = "0.13"`はデフォルト
+        // フィーチャ込みでこれを含む)はOSC生バイトバッファが`MAX_OSC_RAW`
+        // (1024バイト)固定長の`ArrayVec`で、溢れた分は静かに捨てられる。
+        // 1024バイトを大幅に超えるURLは`osc_dispatch`に丸ごとは届かず、
+        // 途中で切り詰められたバイト列として渡ってくる——ここではその挙動を
+        // 明示する(切り詰められても`osc_dispatch`自体は呼ばれ、パニックしない
+        // ことも合わせて確認する)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let long_suffix = "x".repeat(2000);
+        let long_url = format!("https://example.com/{long_suffix}");
+        assert!(long_url.len() > 1024, "テストの前提として2000バイト超のURLを使う");
+        let mut seq = Vec::new();
+        seq.extend_from_slice(b"\x1b]8;;");
+        seq.extend_from_slice(long_url.as_bytes());
+        seq.extend_from_slice(b"\x07x");
+        feed(&mut t, &seq);
+        // パニックせず、かつ実際にintern表へ入ったURL(もしあれば)は元のURLより
+        // 短く切り詰められている。
+        if let Some(interned) = t.link_table().first() {
+            assert!(interned.len() < long_url.len(), "1024バイトのOSCバッファで切り詰められているはず");
+            assert!(long_url.starts_with(interned.as_str()), "切り詰め後も先頭は元のURLのprefixのまま");
+        }
     }
 
     #[test]

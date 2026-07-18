@@ -329,10 +329,13 @@ fun TerminalScreenBody(
                                 title = update.title,
                                 applicationCursorMode = update.applicationCursorMode,
                                 bracketedPasteMode = update.bracketedPasteMode,
+                                mouseReportingMode = update.mouseReportingMode,
+                                sgrMouseMode = update.sgrMouseMode,
                                 cursorVisible = update.cursorVisible,
                                 bellGeneration = update.bellGeneration,
                                 cursorShape = update.cursorShape,
                                 cursorBlink = update.cursorBlink,
+                                linkTable = update.linkTable,
                             )
                         } else update
                     } else update

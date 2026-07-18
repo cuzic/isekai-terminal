@@ -8,7 +8,7 @@ final class TerminalScrollbackTests: XCTestCase {
         CellData(
             ch: String(ch), fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
             dim: false, italic: false, underline: false,
-            strikethrough: false, blink: false, invisible: false
+            strikethrough: false, blink: false, invisible: false, linkId: nil
         )
     }
 
@@ -29,8 +29,9 @@ final class TerminalScrollbackTests: XCTestCase {
             cols: UInt32(cols), rows: UInt32(rows.count), cells: cells,
             cursorRow: cursorRow, cursorCol: cursorCol, title: "session",
             applicationCursorMode: true, bracketedPasteMode: true,
+            mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: cursorVisible, bellGeneration: bellGeneration,
-            cursorShape: cursorShape, cursorBlink: cursorBlink
+            cursorShape: cursorShape, cursorBlink: cursorBlink, linkTable: []
         )
     }
 

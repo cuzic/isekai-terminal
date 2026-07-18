@@ -33,6 +33,7 @@ import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.ui.TerminalThemes
 import uniffi.isekai_terminal_core.CursorShape
+import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.ScreenUpdate
 
 /**
@@ -99,7 +100,7 @@ class TerminalHostScreenTest {
         // onScreenUpdateはconnected状態でないと無視される(TerminalSession.onScreenUpdate)ため、
         // 先にconnectedにしてからタイトル更新を送る。
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "Remote Title", false, false, true, 0uL, CursorShape.BLOCK, true))
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "Remote Title", false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList()))
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithText("Remote Title").assertExists()
@@ -111,7 +112,7 @@ class TerminalHostScreenTest {
         composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
 
         orchestrators[0].simulateConnected()
-        orchestrators[0].simulateScreenUpdate(ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "   ", false, false, true, 0uL, CursorShape.BLOCK, true))
+        orchestrators[0].simulateScreenUpdate(ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "   ", false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList()))
         composeTestRule.waitForIdle()
 
         composeTestRule.onNodeWithText("alpha").assertExists()
