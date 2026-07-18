@@ -473,6 +473,10 @@ private struct TerminalInputRepresentable: UIViewRepresentable {
 
     func updateUIView(_ uiView: TerminalIMEInputView, context: Context) {
         uiView.bracketedPasteMode = uiState.latestScreenUpdate?.bracketedPasteMode ?? false
+        // タスク#63: ハードウェアキーボードの矢印キー(`pressesBegan`経由)がDECCKMに
+        // 従ってSS3/CSIを切り替えられるよう、新しいミラー状態を作らずRust由来の値を
+        // そのまま反映する。
+        uiView.applicationCursorMode = uiState.latestScreenUpdate?.applicationCursorMode ?? false
         if isActive {
             if !uiView.isFirstResponder {
                 DispatchQueue.main.async { uiView.becomeFirstResponder() }
@@ -484,10 +488,10 @@ private struct TerminalInputRepresentable: UIViewRepresentable {
 }
 
 /// 特殊キー(Ctrl/Esc/Tab/矢印/Home/End/PageUp/PageDown)用のキーボードアクセサリバー。
-/// 矢印以外は`TerminalKeyMapper`(rust-core委譲、Android版と共通のバイト列)を使う。
-/// `applicationCursorMode`切り替えはSwift版`TerminalKeyMapper`のAPIには無いため
-/// (常にCSI形式)、矢印キーはこのアクセサリバーではapplication cursor modeを
-/// 考慮しない(既知の制約、PLAN.md参照)。
+/// `TerminalKeyMapper`(rust-core委譲、Android版と共通のバイト列)を使う。矢印キーは
+/// タスク#63で`controller.uiState.latestScreenUpdate?.applicationCursorMode`
+/// (DECCKM)をそのまま読み、新しいミラー状態を作らずにSS3/CSIを切り替える
+/// (`TerminalSessionController.sendKeySequence`が打鍵列機能で同じパターンを使う)。
 ///
 /// 「Ctrl」ボタンはトグル式: ONにした状態で次にソフトウェアキーボードで入力された
 /// 1文字を、`TerminalIMEInputView.ctrlArmed`経由でCtrl制御バイトに変換して送信する。
@@ -603,9 +607,15 @@ private final class TerminalAccessoryBar: UIView {
         controller?.send(terminalCommitTextBytes(text: text, bracketedPasteMode: bracketedPasteMode))
     }
 
+    /// タスク#63: `applicationCursorMode`(DECCKM)は`TerminalUIState`(`@MainActor`)を
+    /// 直接読むため、このメソッド自身も`@MainActor`にする(`TerminalSessionController
+    /// .sendKeySequence`と同じ理由)。ボタンのtouch upは常にmain threadから届くため
+    /// 実害はない。
+    @MainActor
     @objc private func handleTap(_ sender: UIButton) {
         guard keys.indices.contains(sender.tag) else { return }
-        let bytes = TerminalKeyMapper.bytes(for: keys[sender.tag])
+        let applicationCursorMode = controller?.uiState.latestScreenUpdate?.applicationCursorMode ?? false
+        let bytes = TerminalKeyMapper.bytes(for: keys[sender.tag], applicationCursorMode: applicationCursorMode)
         controller?.send(Data(bytes))
     }
 
