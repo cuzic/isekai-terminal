@@ -4,11 +4,14 @@
 //! remote shell over that shared connection.
 //!
 //! Per the M4 design, this is `ControlMaster`, not screen sharing: for each
-//! accepted client the owner opens a brand-new SSH shell channel
-//! ([`open_channel`] with [`SessionKind::Shell`]) on the shared handle and
-//! relays *that one channel's* traffic to *that one client*. Clients never see
-//! each other's terminals; only the authenticated connection (and the auth/TOFU
-//! work behind it) is shared.
+//! accepted client the owner opens a brand-new SSH shell channel on the shared
+//! handle ([`open_channel`] with [`SessionKind::Shell`], or a
+//! `$ISEKAI_CTL_SOCK`-exporting login shell when `#@isekai ctl-socket` is on,
+//! see [`relay_client`]) and relays *that one channel's* traffic to *that one
+//! client*. Clients never see each other's terminals; only the authenticated
+//! connection (and the auth/TOFU work behind it) is shared. When ctl-socket is
+//! on, each client also gets its own *private* remote-forward whose messages
+//! are relayed to it as [`Frame::Ctl`], never crossing between clients.
 //!
 //! **Ordering**: [`relay_loop`] pumps the client→remote direction in a single
 //! sequential branch — each [`Frame::Stdin`]/[`Frame::Resize`] is applied to
@@ -274,7 +277,9 @@ mod tests {
     use russh::server::{self, Auth, Msg as ServerMsg, Server as _, Session as ServerSession};
     use russh::{Channel as RusshChannel, CryptoVec};
     use russh_keys::ssh_key::private::{Ed25519Keypair, PrivateKey as SshPrivateKey};
-    use russh_stream_session::{authenticate_session, establish_over_stream, verifying_handler, Credential, HostKeyVerifier};
+    use russh_stream_session::{
+        authenticate_session, establish_over_stream, verifying_handler, verifying_handler_with_routes, Credential, HostKeyVerifier,
+    };
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
@@ -447,5 +452,106 @@ mod tests {
 
         write_frame(&mut client, &Frame::Stdin(b"no hello".to_vec())).await.unwrap();
         assert!(relay.await.unwrap().is_err(), "a missing Hello must fail the client relay");
+    }
+
+    /// A mock sshd that, when a client's per-tab `streamlocal_forward` is
+    /// requested, pushes one ctl message (`SetTitle`) back over a
+    /// `forwarded-streamlocal` channel — and answers the login-shell `exec`
+    /// (ctl-socket opens the shell via pty+exec, not `shell_request`) with a
+    /// banner. Lets the owner→client ctl relay be tested end-to-end.
+    #[derive(Clone)]
+    struct CtlPushShellServer;
+    impl server::Server for CtlPushShellServer {
+        type Handler = CtlPushShellHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> CtlPushShellHandler {
+            CtlPushShellHandler
+        }
+    }
+    #[derive(Clone)]
+    struct CtlPushShellHandler;
+    #[async_trait]
+    impl server::Handler for CtlPushShellHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, _p: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+        async fn channel_open_session(&mut self, _c: RusshChannel<ServerMsg>, _s: &mut ServerSession) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut ServerSession) -> Result<(), Self::Error> {
+            session.data(channel, CryptoVec::from(b"login-ready\n".to_vec()))?;
+            Ok(())
+        }
+        async fn streamlocal_forward(&mut self, socket_path: &str, session: &mut ServerSession) -> Result<bool, Self::Error> {
+            let handle = session.handle();
+            let path = socket_path.to_string();
+            tokio::spawn(async move {
+                if let Ok(channel) = handle.channel_open_forwarded_streamlocal(path).await {
+                    let _ = channel.data(&br#"{"op":"title","value":"tab-title"}"#[..]).await;
+                    let _ = channel.data(&b"\n"[..]).await;
+                    let _ = channel.eof().await;
+                }
+            });
+            Ok(true)
+        }
+    }
+
+    /// End-to-end for the mux-client ctl relay: with `ctl_routes` set, the owner
+    /// requests a private forward for the client, the mock sshd pushes a
+    /// `SetTitle` over it, and the owner must relay it to *this* client as a
+    /// `Frame::Ctl` carrying the message's bytes (never onto stdout).
+    #[tokio::test]
+    async fn relay_client_relays_a_ctl_message_to_the_client_as_a_ctl_frame() {
+        let keypair = Ed25519Keypair::from_seed(&[131; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = CtlPushShellServer;
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+
+        // The handler must carry the same route table the owner registers the
+        // client's forward into, so the pushed channel is delivered in-process.
+        let routes = ForwardRoutes::new();
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let handler = verifying_handler_with_routes(&verifier, &routes);
+        let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
+        assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
+        let handle = Mutex::new(handle);
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
+            .await
+            .unwrap();
+        match read_frame(&mut client).await.unwrap().unwrap() {
+            Frame::HelloAck { .. } => {}
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        // Read frames until the relayed ctl message arrives; its bytes must
+        // decode to the SetTitle the mock sshd pushed, and it must never come
+        // through as stdout.
+        let ctl_bytes = loop {
+            match read_frame(&mut client).await.unwrap() {
+                Some(Frame::Ctl(bytes)) => break bytes,
+                Some(Frame::Stdout(data)) => assert!(
+                    !data.windows(3).any(|w| w == b"tab"),
+                    "a ctl message must never be relayed as stdout"
+                ),
+                Some(_) => {}
+                None => panic!("the owner closed before relaying the ctl message"),
+            }
+        };
+        let msg = isekai_protocol::decode_ctl_message(&ctl_bytes).expect("the relayed ctl bytes must decode");
+        assert_eq!(msg, isekai_protocol::CtlMessage::SetTitle { value: "tab-title".to_string() });
+
+        drop(client);
+        let _ = relay.await.unwrap();
     }
 }
