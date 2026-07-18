@@ -12,7 +12,7 @@ use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
 use isekai_auth::TokenProvider;
-use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec, RelayTransportKind};
+use isekai_bootstrap::{HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec, RelayTransportKind};
 use isekai_bootstrap_plan::{classify_bootstrap_error, BootstrapFailure};
 use isekai_pipe_core::{
     claim_connect_outcome, default_profiles_dir, default_runtime_dir, load_persistent_profile,

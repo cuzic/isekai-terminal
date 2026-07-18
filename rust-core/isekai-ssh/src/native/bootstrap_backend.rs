@@ -5,6 +5,19 @@
 //! M1 already covers the day-to-day connect path, this covers
 //! `isekai-ssh init`/auto-bootstrap.
 //!
+//! **Cross-cutting consequence of this dispatch (Codex review finding)**:
+//! `isekai-ssh init dest --via a --via b` (a 2+-hop `--via` chain) is
+//! accepted by CLI parsing (`init.rs::parse_via_chain`) on every platform,
+//! but on Windows it now reaches `RusshBackend`, which rejects any chain
+//! longer than one hop with `BootstrapError::UnsupportedViaChain` (a clear,
+//! actionable error — see `russh_backend.rs`'s own module docs for why
+//! multi-hop chaining is deferred, not silently truncated). This is not a
+//! regression introduced here: it's the same already-reviewed, already-
+//! tested scope limitation `RusshBackend` shipped with, simply reachable
+//! from this call site now that Windows routes here at all. A future
+//! `russh_stream_session` extension to support genuine N-hop chains would
+//! close this gap for both platforms at once.
+//!
 //! [`NativeBootstrapBackend`] exists purely so callers that need *both*
 //! `install_and_start` (the `BootstrapBackend` trait proper) *and*
 //! `detect_remote_arch` (an inherent method on each concrete backend type,

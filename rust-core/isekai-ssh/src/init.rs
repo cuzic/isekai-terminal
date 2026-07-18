@@ -25,7 +25,7 @@ use std::io::Write as _;
 
 use anyhow::{anyhow, Context, Result};
 use isekai_auth::TokenProvider;
-use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec};
+use isekai_bootstrap::{HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec};
 use isekai_pipe_core::{default_profiles_dir, write_persistent_profile, PersistentProfile};
 use isekai_trust::{HelperTrust, UpdatePolicy};
 use sha2::{Digest, Sha256};
