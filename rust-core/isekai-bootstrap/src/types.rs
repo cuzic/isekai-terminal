@@ -131,6 +131,20 @@ pub struct RelayLaunchSpec {
     /// every other deployment's log volume forever (`#@isekai
     /// remote-log-level` in `isekai-ssh`, see `wrapper.rs`).
     pub remote_log_level: String,
+    /// `isekai-helper --resume-window <SECS>`: how long a parked
+    /// (disconnected) session stays resumable server-side, before
+    /// capacity-based LRU eviction hasn't already reclaimed it sooner. Must
+    /// match whatever the caller resolved as its own local resume-grace
+    /// (`isekai-ssh`'s `#@isekai resume-grace`/`resolution.isekai
+    /// .resume_grace_secs`) — a client requesting a longer resume-grace than
+    /// the server is willing to hold gets silently clamped down to the
+    /// server's shorter window, which is exactly the bug this field exists
+    /// to close (previously `isekai-helper` was always launched with its own
+    /// unrelated 120s default, regardless of what the client had configured).
+    /// Deliberately excluded from `reuse::launch_fingerprint` — see that
+    /// function's doc comment — so changing this alone never forces an
+    /// already-running helper to restart and drop an active peer.
+    pub resume_window_secs: u64,
 }
 
 /// What a successful `BootstrapBackend::install_and_start` call yields: the
@@ -168,5 +182,8 @@ pub enum LaunchSpec {
         /// distinct, independently configurable setting, not implied by
         /// this one.
         remote_bind_port_range: Option<(u16, u16)>,
+        /// See [`RelayLaunchSpec::resume_window_secs`]'s docs — same field,
+        /// same rationale, same fingerprint exclusion.
+        resume_window_secs: u64,
     },
 }
