@@ -346,6 +346,60 @@ final class TerminalScreenViewTests: XCTestCase {
         XCTAssertEqual(clampedFontScale(current: 2.9, zoomDelta: 2.0), 3.0, accuracy: 0.0001)
     }
 
+    // MARK: - タスク#81: wheelEvents(トラックパッド/マウスホイールのwheel up/down送出)
+    //
+    // codexレビュー(グループD)指摘: iOS側のマウスレポーティング配線は`UITouch`を常に
+    // `.left`ボタンとして送るだけで、Android版`PointerEventType.Scroll`に相当する
+    // ホイール/トラックパッドスクロールの`WheelUp`/`WheelDown`送信経路が無かった。
+    // `handlePan`自体(`UIPanGestureRecognizer`依存)はテストしづらいため、`clampedFontScale`
+    // と同様にUIKit非依存の純粋関数へロジックを切り出してここで直接検証する。
+
+    func testWheelEventsAccumulatesBelowThresholdWithoutFiring() {
+        let result = wheelEvents(deltaY: 4, carry: 0, cellHeight: 10)
+        XCTAssertTrue(result.buttons.isEmpty)
+        XCTAssertEqual(result.carry, 4, accuracy: 0.0001)
+    }
+
+    func testWheelEventsFiresWheelUpForNegativeDeltaPastThreshold() {
+        // 負方向(コンテンツが上へ動く=履歴を遡る)は`scrollOffset`を増やす操作と同じ向き
+        // なので、xtermの"wheel up"(button 64)に対応する。
+        let result = wheelEvents(deltaY: -12, carry: 0, cellHeight: 10)
+        XCTAssertEqual(result.buttons, [.wheelUp])
+        XCTAssertEqual(result.carry, -2, accuracy: 0.0001)
+    }
+
+    func testWheelEventsFiresWheelDownForPositiveDeltaPastThreshold() {
+        let result = wheelEvents(deltaY: 12, carry: 0, cellHeight: 10)
+        XCTAssertEqual(result.buttons, [.wheelDown])
+        XCTAssertEqual(result.carry, 2, accuracy: 0.0001)
+    }
+
+    func testWheelEventsFiresMultipleEventsForLargeDelta() {
+        // トラックパッドの速いフリックのように、1回の`.changed`で複数セル分のtranslationが
+        // 一度に届く場合でも、セル数分のwheelイベントに分割して送る(1notchずつ)。
+        let result = wheelEvents(deltaY: -35, carry: 0, cellHeight: 10)
+        XCTAssertEqual(result.buttons, [.wheelUp, .wheelUp, .wheelUp])
+        XCTAssertEqual(result.carry, -5, accuracy: 0.0001)
+    }
+
+    func testWheelEventsCarriesFractionalAccumulationAcrossCalls() {
+        // 小刻みなtranslation(トラックパッドの連続scroll)が複数回の`.changed`にまたがって
+        // 届いても、`carry`を次呼び出しへ持ち越すことで合計が閾値を超えた時点で発火する。
+        let first = wheelEvents(deltaY: -6, carry: 0, cellHeight: 10)
+        XCTAssertTrue(first.buttons.isEmpty)
+        let second = wheelEvents(deltaY: -6, carry: first.carry, cellHeight: 10)
+        XCTAssertEqual(second.buttons, [.wheelUp])
+        XCTAssertEqual(second.carry, -2, accuracy: 0.0001)
+    }
+
+    func testWheelEventsWithZeroCellHeightReturnsEmptyWithoutCrashing() {
+        // フォントメトリクス確定前(初回layout前)に間接scrollが届いても0除算/無限ループに
+        // ならないことの回帰確認。
+        let result = wheelEvents(deltaY: -50, carry: 3, cellHeight: 0)
+        XCTAssertTrue(result.buttons.isEmpty)
+        XCTAssertEqual(result.carry, 3, accuracy: 0.0001)
+    }
+
     // MARK: - タスク#20: 動的resize(view bounds→cols/rows→onSizeChanged)
 
     func testOnSizeChangedFiresWithComputedColsAndRowsOnLayout() {

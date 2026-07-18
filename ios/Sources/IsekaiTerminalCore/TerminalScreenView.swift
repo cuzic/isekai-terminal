@@ -8,6 +8,33 @@ func clampedFontScale(current: CGFloat, zoomDelta: CGFloat) -> CGFloat {
     min(max(current * zoomDelta, 0.5), 3.0)
 }
 
+/// タスク#81: トラックパッド/マウスホイールの間接スクロール(`UIPanGestureRecognizer`が
+/// `numberOfTouches == 0`で報告する連続的な`translation`)から、送出すべき
+/// `MouseButton`(`.wheelUp`/`.wheelDown`)の並びと次回呼び出しへ持ち越す端数(`carry`)を
+/// 求める純粋関数。Android版`PointerEventType.Scroll`経路(タスク#50)は1イベント=1notchで
+/// 届くのに対し、iOSの間接scrollは指のタッチスワイプと同じ連続translationとして届くため、
+/// セル1行分の移動量が溜まるたびに1回ホイールイベントとして切り出す(タッチスワイプでの
+/// `scrollOffset`蓄積ループ`handlePan`と同じ考え方)。UIKit依存を持たない純粋関数として
+/// 切り出してあるためユニットテストで直接検証できる(`clampedFontScale`と同様の方針)。
+func wheelEvents(deltaY: CGFloat, carry: CGFloat, cellHeight: CGFloat) -> (buttons: [MouseButton], carry: CGFloat) {
+    guard cellHeight > 0 else { return ([], carry) }
+    var accum = carry + deltaY
+    var buttons: [MouseButton] = []
+    // Android版と同じ符号規約(既存`handlePan`のscrollOffset蓄積ループを参照): 負方向
+    // (画面/コンテンツが上へ動く=履歴を遡る)は`scrollOffset`を増やす操作と同じ向きなので
+    // xtermの"wheel up"(button 64、古い内容を見せる方向)に対応させる。正方向はその逆で
+    // "wheel down"(button 65)。
+    while accum < -cellHeight {
+        buttons.append(.wheelUp)
+        accum += cellHeight
+    }
+    while accum > cellHeight {
+        buttons.append(.wheelDown)
+        accum -= cellHeight
+    }
+    return (buttons, accum)
+}
+
 /// Sixel(タスク#42)の`ImagePlacement.rgba`(RGBA8888、row-major)から`UIImage`を作って
 /// idでキャッシュする。`ScreenUpdate.images`はTerminal(rust-core)側で寿命管理された
 /// 「現在アクティブな画像の全リスト」がそのまま渡ってくる(rust-ssot: どの画像が
@@ -160,6 +187,10 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     /// スクロールオフセットが変化する度に呼ばれる(SwiftUI側の状態同期に使う)。
     public var onScrollOffsetChanged: ((UInt32) -> Void)?
     private var panAccumY: CGFloat = 0
+    /// タスク#81: `wheelEvents(deltaY:carry:cellHeight:)`が返す「次回へ持ち越す端数」の
+    /// 保持先。`panAccumY`とは別の蓄積系統(マウスモード有効時の間接scrollはローカルの
+    /// `scrollOffset`を一切動かさずリモートへwheel up/downとして転送するだけのため)。
+    private var wheelAccumY: CGFloat = 0
 
     /// タスク#52: OSC 8リンクをタップした時に呼ばれる(hit-testで有効なURLが見つかった
     /// 場合のみ)。SwiftUI側(`TerminalView`)がこれを受けて確認ダイアログを表示し、
@@ -219,6 +250,11 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
         pan.maximumNumberOfTouches = 1
         pan.delegate = self
+        // タスク#81: `allowedScrollTypesMask`の既定値(`.continuous`)はトラックパッドの
+        // 連続スクロールのみを含み、外付けマウスのホイール(`.discrete`)を含まない
+        // ——既定のままだと`isekai-ssh`側でマウスホイールを回してもこのgesture
+        // recognizerが一切反応せず、`handlePan`のwheel経路にも到達できない。
+        pan.allowedScrollTypesMask = [.discrete, .continuous]
         addGestureRecognizer(pan)
         panGestureRecognizer = pan
 
@@ -332,10 +368,41 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     /// 溜まる度に`scrollOffset`を1ずつ増減する。長押し(選択)が既に認識されている間は
     /// UIKitの既定動作(同一ビュー上の複数ジェスチャの同時認識は既定でOFF)により
     /// このpanは発火しない。
+    ///
+    /// タスク#81: `recognizer.numberOfTouches == 0`は、この`.changed`がスクリーン上の
+    /// 指のドラッグではなくトラックパッド/マウスホイールの間接scrollによって発火した
+    /// ことを示す(画面に実際に触れている指が無いのに`UIPanGestureRecognizer`が反応
+    /// するのは間接入力の場合のみ)。マウスレポーティングが有効(`isPointerReportingActive`)
+    /// な間は、この間接scrollをローカルの`scrollOffset`ではなくxterm wheel up/down
+    /// (button 64/65)としてリモートへ転送する(Android版`PointerEventType.Scroll`経路
+    /// [`TerminalScreen.kt`]と対称)。指によるタッチスワイプ(`numberOfTouches > 0`)は
+    /// マウスモード中は`gestureRecognizer(_:shouldReceive:)`でそもそもこのrecognizer自体に
+    /// 渡らない(既存挙動のまま)。
+    ///
+    /// codexレビュー指摘: 一連のジェスチャ(`.ended`/`.cancelled`/`.failed`)が終わった時点で
+    /// `wheelAccumY`の端数を持ち越すと、無関係な次のスクロール操作(あるいはマウスモードが
+    /// 一旦OFFになって再度ONになった後)で「本来はまだセル1行分溜まっていないのに」早すぎる
+    /// `WheelUp`/`WheelDown`が出てしまう。ジェスチャの区切りごとにリセットする。
     @objc private func handlePan(_ recognizer: UIPanGestureRecognizer) {
+        if recognizer.state == .ended || recognizer.state == .cancelled || recognizer.state == .failed {
+            wheelAccumY = 0
+            return
+        }
         guard recognizer.state == .changed, cellSize.height > 0 else { return }
         let translation = recognizer.translation(in: self)
         recognizer.setTranslation(.zero, in: self)
+
+        if recognizer.numberOfTouches == 0, isPointerReportingActive, let update = latestUpdate {
+            let (buttons, carry) = wheelEvents(deltaY: translation.y, carry: wheelAccumY, cellHeight: cellSize.height)
+            wheelAccumY = carry
+            guard !buttons.isEmpty else { return }
+            let point = recognizer.location(in: self)
+            for button in buttons {
+                sendPointerEvent(at: point, update: update, kind: .press, button: button)
+            }
+            return
+        }
+
         panAccumY += translation.y
 
         let scrollbackLen = onScrollbackLenRequest?() ?? 0
@@ -440,14 +507,23 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         return update.mouseReportingMode != .off
     }
 
-    /// `touch`の現在位置を`terminalPointerEventBytes`(rust-core、タスク#36/#51)へ
-    /// 渡して結果を`onPointerBytes`で送出する。
+    /// `touch`の現在位置をLeftボタンのイベントとして`sendPointerEvent(at:update:kind:button:)`
+    /// へ渡す(iOS側のタッチにはボタン無しの単純なホバー移動の概念が無いため、タッチしている
+    /// 間は常にLeftボタンを押しているとみなす)。
     private func sendMouseEvent(for touch: UITouch, update: ScreenUpdate, kind: MouseEventKind) {
-        let point = touch.location(in: self)
+        sendPointerEvent(at: touch.location(in: self), update: update, kind: kind, button: .left)
+    }
+
+    /// view座標(`point`)を`terminalPointerEventBytes`(rust-core、タスク#36/#51)へ
+    /// 渡して結果を`onPointerBytes`で送出する共通処理。タッチ由来のLeftボタンイベント
+    /// (`sendMouseEvent`)とトラックパッド/マウスホイール由来のwheel up/downイベント
+    /// (タスク#81、`handlePan`)の両方から使う(座標→セル変換+送出の重複を避ける、
+    /// Android版`sendPointerEventAt`と対称)。
+    private func sendPointerEvent(at point: CGPoint, update: ScreenUpdate, kind: MouseEventKind, button: MouseButton?) {
         let cell = offsetToCellPos(x: Double(point.x), y: Double(point.y), cellWidth: Double(cellSize.width), cellHeight: Double(cellSize.height), cols: Int(update.cols), rows: Int(update.rows))
         guard let bytes = terminalPointerEventBytes(
             kind: kind,
-            button: .left,
+            button: button,
             row: UInt32(cell.row),
             col: UInt32(cell.col),
             modifiers: TerminalKeyModifiers(shift: false, alt: false, ctrl: false, meta: false),
