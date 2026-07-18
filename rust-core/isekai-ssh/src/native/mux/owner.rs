@@ -125,17 +125,32 @@ where
         None => None,
     };
 
-    let mut channel = {
+    let open_result = {
         // Lock held only for the open; the relay below runs lock-free so one
-        // client's traffic never blocks another's channel open or forward.
+        // client's traffic never blocks another's channel open or forward. The
+        // guard is dropped at the end of this block, before any `ctl_forward`
+        // cleanup below re-locks the handle.
         let guard = handle.lock().await;
         match &ctl {
             Some(fwd) => ctl_forward::open_login_shell(&guard, &term, cols as u32, rows as u32, &fwd.remote_path)
                 .await
-                .context("isekai-ssh mux owner: failed to open a ctl-socket login shell for the client")?,
+                .context("isekai-ssh mux owner: failed to open a ctl-socket login shell for the client"),
             None => open_channel(&guard, &SessionKind::Shell { term, cols: cols as u32, rows: rows as u32 })
                 .await
-                .context("isekai-ssh mux owner: failed to open a shell channel for the client")?,
+                .context("isekai-ssh mux owner: failed to open a shell channel for the client"),
+        }
+    };
+    let mut channel = match open_result {
+        Ok(channel) => channel,
+        Err(e) => {
+            // The channel open failed *after* we'd already requested this
+            // client's private ctl-socket forward. Tear that forward down before
+            // bailing so it doesn't leak on the remote (and its route entry
+            // linger locally) — every exit path must release a requested forward.
+            if let (Some(fwd), Some(routes)) = (&ctl, ctl_routes) {
+                ctl_forward::cancel(handle, routes, &fwd.remote_path).await;
+            }
+            return Err(e);
         }
     };
 
@@ -565,5 +580,100 @@ mod tests {
 
         drop(client);
         let _ = relay.await.unwrap();
+    }
+
+    /// A mock sshd that accepts a `streamlocal_forward` (so the owner's per-tab
+    /// ctl forward is successfully requested) but *rejects every session channel
+    /// open* (so opening the ctl-socket login shell fails afterwards). It records
+    /// each `cancel_streamlocal_forward` it receives, letting the test assert the
+    /// owner tears the forward down on the failed-open path (no leak).
+    #[derive(Clone)]
+    struct RejectShellServer {
+        cancelled_tx: mpsc::UnboundedSender<String>,
+    }
+    impl server::Server for RejectShellServer {
+        type Handler = RejectShellHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> RejectShellHandler {
+            RejectShellHandler { cancelled_tx: self.cancelled_tx.clone() }
+        }
+    }
+    #[derive(Clone)]
+    struct RejectShellHandler {
+        cancelled_tx: mpsc::UnboundedSender<String>,
+    }
+    #[async_trait]
+    impl server::Handler for RejectShellHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, _p: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+        // Reject every session channel open, so the ctl-socket login shell the
+        // owner tries to open (after the forward is already set up) fails.
+        async fn channel_open_session(&mut self, _c: RusshChannel<ServerMsg>, _s: &mut ServerSession) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+        async fn streamlocal_forward(&mut self, _socket_path: &str, _session: &mut ServerSession) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn cancel_streamlocal_forward(&mut self, socket_path: &str, _session: &mut ServerSession) -> Result<bool, Self::Error> {
+            let _ = self.cancelled_tx.send(socket_path.to_string());
+            Ok(true)
+        }
+    }
+
+    /// Regression for the ctl-forward leak: when the ctl-socket login shell fails
+    /// to open *after* the per-tab forward was already requested, the owner must
+    /// cancel that forward before returning the error — otherwise the remote
+    /// streamlocal forward (and its local route) leak for the life of the owner.
+    #[tokio::test]
+    async fn relay_client_cancels_the_ctl_forward_when_the_login_shell_fails_to_open() {
+        use tokio::time::{timeout, Duration};
+
+        let (cancelled_tx, mut cancelled_rx) = mpsc::unbounded_channel::<String>();
+
+        let keypair = Ed25519Keypair::from_seed(&[140; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = RejectShellServer { cancelled_tx };
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+
+        // The handler must share the owner's route table so the requested
+        // forward is registered/cancelled against the same map.
+        let routes = ForwardRoutes::new();
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let handler = verifying_handler_with_routes(&verifier, &routes);
+        let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
+        assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
+        let handle = Mutex::new(handle);
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
+            .await
+            .unwrap();
+        match read_frame(&mut client).await.unwrap().unwrap() {
+            Frame::HelloAck { .. } => {}
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        // The forward the owner requested must be cancelled once the login-shell
+        // open fails — the server observes a cancel for this client's ctl path.
+        let cancelled_path = timeout(Duration::from_secs(5), cancelled_rx.recv())
+            .await
+            .expect("the ctl forward must be cancelled after the failed login-shell open (no leak)")
+            .expect("the cancel sender must still be live");
+        assert!(
+            cancelled_path.starts_with(crate::ctl_forward::REMOTE_SOCK_PREFIX),
+            "the cancelled forward must be this client's own ctl socket, got {cancelled_path:?}"
+        );
+
+        assert!(relay.await.unwrap().is_err(), "a failed ctl-socket login-shell open must fail the client relay");
     }
 }
