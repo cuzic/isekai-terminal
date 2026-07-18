@@ -1,6 +1,6 @@
 use vte::Perform;
 use crate::theme::Theme;
-use crate::CursorShape;
+use crate::{CursorShape, MouseReportingMode, TerminalKeyModifiers};
 
 /// `38;5;n` / `48;5;n`（indexed color）を ARGB へ解決する。
 /// `0..=15` は現在のテーマの ANSI 16色テーブルを参照する（それ以外は固定の 216色/グレースケール）。
@@ -308,6 +308,77 @@ pub(crate) struct Terminal {
     /// `false`=G0(既定、SI相当)、`true`=G1(SO相当)。`print()`はこのフラグで
     /// `g0_charset`/`g1_charset`のどちらを適用するか決める(タスク#41)。
     gl_is_g1: bool,
+    /// DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)。既定は`Off`。
+    /// `csi_dispatch`の`is_dec`分岐で更新され、`ScreenUpdate::mouse_reporting_mode`
+    /// としてそのまま公開する(rust-ssot: どのタッチ/ジェスチャイベントを
+    /// マウスレポートとして送るべきかの判断材料はRust側が保持する)。
+    mouse_reporting_mode: MouseReportingMode,
+    /// DECSET/DECRST `?1006`(SGR拡張マウスレポーティング、タスク#36)。既定は`false`
+    /// (レガシーX10形式)。`encode_pointer_event`がこの値でエンコード形式を切り替える。
+    sgr_mouse_mode: bool,
+}
+
+/// マウスレポーティング(タスク#36)対象のボタン。左/中/右クリックに加え、
+/// モバイルでの主なユースケースであるホイール(縦スクロールジェスチャ)を含める
+/// (Fableレビュー指摘: wheelボタン64/65のエンコードを範囲に含める)。
+/// 横スクロールホイール(button 6/7)・追加ボタン(button 8以降)は現状使う予定が
+/// ないため未対応(必要になったタスクで追加する)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+}
+
+/// マウスレポーティング(タスク#36)対象のイベント種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MouseEventKind {
+    /// ボタン押下(ホイールは常にこの種別で表す — ホイールにはreleaseの概念が無い)。
+    Press,
+    /// ボタン解放。
+    Release,
+    /// ポインタ移動。`button`が`Some`ならドラッグ(ボタンを押したまま移動)、
+    /// `None`なら単純なホバー移動。
+    Motion,
+}
+
+/// UI層(#50/#51)からRustへ渡す、座標付きの生ポインタイベント(rust-ssot:
+/// 「今どのマウスモードか」「このイベントを報告すべきか」の判断はUI層に持たせず、
+/// Rust側の[Terminal::encode_pointer_event]が[MouseReportingMode]/SGRモードを
+/// 見て一元的に行う)。`row`/`col`は0-basedのセル座標(画面外の値は
+/// `encode_pointer_event`側でクランプする)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PointerEvent {
+    pub(crate) row: usize,
+    pub(crate) col: usize,
+    pub(crate) kind: MouseEventKind,
+    /// `Motion`かつボタンを押していない単純な移動の場合のみ`None`。
+    pub(crate) button: Option<MouseButton>,
+    pub(crate) modifiers: TerminalKeyModifiers,
+}
+
+/// [MouseButton]をxterm mouse protocolの「ボタン番号」フィールド(0〜3、または
+/// wheel用の64/65)へ変換する。`None`(ボタン無しの移動、またはレガシー形式での
+/// release)は`3`(xterm仕様上「no button」を表す予約値)。
+fn mouse_button_base_code(button: Option<MouseButton>) -> u8 {
+    match button {
+        Some(MouseButton::Left) => 0,
+        Some(MouseButton::Middle) => 1,
+        Some(MouseButton::Right) => 2,
+        None => 3,
+        Some(MouseButton::WheelUp) => 64,
+        Some(MouseButton::WheelDown) => 65,
+    }
+}
+
+/// xterm mouse protocolの修飾子ビット: Shift(4) / Meta(8) / Ctrl(16)。
+/// `TerminalKeyModifiers::meta`(Windows/Cmdキー)はxterm mouse protocolに
+/// 対応するビットが無いため使わない——`alt`をxterm用語の"Meta"ビットに割り当てる
+/// (xterm自身の実装がAltキーをこのビットに使っているのに倣う)。
+fn mouse_modifier_bits(m: TerminalKeyModifiers) -> u8 {
+    (if m.shift { 4 } else { 0 }) | (if m.alt { 8 } else { 0 }) | (if m.ctrl { 16 } else { 0 })
 }
 
 impl Terminal {
@@ -344,6 +415,8 @@ impl Terminal {
             g0_charset: Charset::Ascii,
             g1_charset: Charset::Ascii,
             gl_is_g1: false,
+            mouse_reporting_mode: MouseReportingMode::Off,
+            sgr_mouse_mode: false,
         }
     }
 
@@ -395,6 +468,8 @@ impl Terminal {
     }
     pub(crate) fn application_cursor_mode(&self) -> bool { self.application_cursor_mode }
     pub(crate) fn bracketed_paste_mode(&self) -> bool { self.bracketed_paste_mode }
+    pub(crate) fn mouse_reporting_mode(&self) -> MouseReportingMode { self.mouse_reporting_mode }
+    pub(crate) fn sgr_mouse_mode(&self) -> bool { self.sgr_mouse_mode }
     pub(crate) fn cursor_visible(&self) -> bool { self.cursor_visible }
     pub(crate) fn bell_generation(&self) -> u64 { self.bell_generation }
     pub(crate) fn cursor_shape(&self) -> CursorShape { self.cursor_shape }
@@ -429,6 +504,8 @@ impl Terminal {
         self.g0_charset = Charset::Ascii;
         self.g1_charset = Charset::Ascii;
         self.gl_is_g1 = false;
+        self.mouse_reporting_mode = MouseReportingMode::Off;
+        self.sgr_mouse_mode = false;
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -1034,6 +1111,81 @@ impl Terminal {
         self.cursor_shape = shape;
         self.cursor_blink = blink;
     }
+
+    /// 座標付きの生ポインタイベント([PointerEvent])を、現在の
+    /// [MouseReportingMode]/SGRモード(`?1006`)に従ってターミナルへ送るべき
+    /// バイト列にエンコードする(タスク#36)。報告すべきでないイベント
+    /// (モードがOff、またはモードが対象外のイベント種別)は`None`を返す——
+    /// 呼び出し元はこれを「何も送らない」の合図として扱えばよい。
+    ///
+    /// # モードごとの報告対象(xterm互換)
+    /// - `Off`: 何も報告しない。
+    /// - `Normal`(`?1000`): press/releaseのみ(移動は報告しない)。
+    /// - `ButtonEvent`(`?1002`): 上記に加え、ボタンを押したままの移動(drag、
+    ///   `button.is_some()`)のみ報告する。ボタン無しの単純な移動は無視する。
+    /// - `AnyEvent`(`?1003`): ボタン状態に関係なく全ての移動を報告する。
+    ///
+    /// ホイール(`WheelUp`/`WheelDown`)は常に`Press`種別として渡される前提
+    /// (releaseの概念が無いため)で、`Normal`を含む全モードで報告される
+    /// (press/release扱いの分岐に乗るため)。
+    ///
+    /// # エンコード形式
+    /// - `?1006`(SGR)有効時: `ESC [ < Cb ; Cx ; Cy M`(press/drag)または
+    ///   `ESC [ < Cb ; Cx ; Cy m`(release)。座標は1-based・10進数で桁数の
+    ///   制限が無い。releaseでもどのボタンが離されたかを`Cb`にそのまま残せる
+    ///   (`M`/`m`の違いだけでpress/releaseを区別する)。
+    /// - `?1006`無効時(レガシーX10形式): `ESC [ M Cb Cx Cy`(3バイトとも
+    ///   `値+32`の単一バイト)。仕様上1バイトにしかエンコードできないため、
+    ///   座標は`223`(`255 - 32`)で頭打ちにクランプする——`1000`だけ有効で
+    ///   `1006`を送らないアプリ(古いtmux等)向けの互換性を意図的に実装する
+    ///   判断(Fableレビュー指摘: 割り切って未実装にするのではなくクランプして
+    ///   実装する)。また、レガシー形式は「どのボタンが離されたか」を表現できず
+    ///   仕様上常に`3`(no button)を報告する(SGRとの意図的な差)。
+    pub(crate) fn encode_pointer_event(&self, event: PointerEvent) -> Option<Vec<u8>> {
+        let reportable = match event.kind {
+            MouseEventKind::Press | MouseEventKind::Release => {
+                self.mouse_reporting_mode != MouseReportingMode::Off
+            }
+            MouseEventKind::Motion => match self.mouse_reporting_mode {
+                MouseReportingMode::Off | MouseReportingMode::Normal => false,
+                MouseReportingMode::ButtonEvent => event.button.is_some(),
+                MouseReportingMode::AnyEvent => true,
+            },
+        };
+        if !reportable {
+            return None;
+        }
+
+        let base = mouse_button_base_code(event.button);
+        let modifier_bits = mouse_modifier_bits(event.modifiers);
+        // motionビット(32)はドラッグ/ホバー移動のみ。ホイールは移動ではない
+        // (常にPress扱い)ためbaseが既に64/65であり、このビットは付与しない
+        // (xterm実装も同様——wheelイベントにmotionビットは立たない)。
+        let motion_bit = if event.kind == MouseEventKind::Motion { 0x20 } else { 0 };
+        // 呼び出し元(将来のUI層)が実際の画面外の座標を渡してきても、この端末の
+        // 実サイズ(`cols`/`rows`)内へクランプしてからエンコードする——[PointerEvent]
+        // のdocコメントで約束している通り、範囲チェックの責務はここに閉じる
+        // (codexレビュー指摘: SGR側が無クランプだと、例えば80列の端末でも
+        // ドラッグ中に列1001のような存在しない座標を報告できてしまっていた)。
+        let col = event.col.min(self.cols.saturating_sub(1));
+        let row = event.row.min(self.rows.saturating_sub(1));
+
+        if self.sgr_mouse_mode {
+            let cb = base as u32 + modifier_bits as u32 + motion_bit as u32;
+            let terminator = if event.kind == MouseEventKind::Release { 'm' } else { 'M' };
+            Some(format!("\x1b[<{};{};{}{}", cb, col + 1, row + 1, terminator).into_bytes())
+        } else {
+            // レガシーX10形式: releaseはどのボタンだったか表現できないため
+            // 仕様上常に`3`(no button)を使う。
+            let legacy_base = if event.kind == MouseEventKind::Release { 3 } else { base };
+            let cb = (legacy_base as u32 + modifier_bits as u32 + motion_bit as u32).min(255 - 32) as u8;
+            // 1バイトにしかエンコードできないため、端末サイズへのクランプに加えて
+            // プロトコル上の上限223(`255 - 32`)でも頭打ちにする(端末自体が223列/行を
+            // 超える場合の保険。Fableレビュー指摘の設計判断)。
+            let clamp_coord = |v: usize| -> u8 { (v.min(223 - 1) as u8) + 1 + 32 };
+            Some(vec![0x1B, b'[', b'M', 32 + cb, clamp_coord(col), clamp_coord(row)])
+        }
+    }
 }
 
 /// SGR `38`(前景色)/`48`(背景色)ケースが共通で使う拡張色パース。
@@ -1188,6 +1340,33 @@ impl Perform for Terminal {
         let p1 = ps.get(1).copied().unwrap_or(0);
 
         if is_dec {
+            // マウスレポーティング関連(`?1000`/`?1002`/`?1003`/`?1006`、タスク#36)は
+            // 先頭パラメータ(`p0`)だけでなく`ps`全体を見る。実アプリ(vim/tmux等)は
+            // `CSI ?1000;1006h`のようにトラッキングモードとSGR拡張を1つのシーケンスに
+            // まとめて送ることが珍しくなく、`p0`しか見ないと後続の`1006`が無視されて
+            // 「SGRを要求したのにlegacy X10形式で返す」座標破損バグになる
+            // (codexレビュー指摘)。他のDECモード(`1047`/`1049`/`25`/`12`/`1`/`7`/`2004`)は
+            // 複数パラメータ(Pm)を1シーケンスにまとめて送られるケースが実用上ほぼ無く、
+            // 汎用的なPm対応は既存の別タスク(#68)のスコープなのでここでは広げない。
+            for &p in &ps {
+                match (action, p) {
+                    ('h', 1000) => { self.mouse_reporting_mode = MouseReportingMode::Normal; }
+                    ('h', 1002) => { self.mouse_reporting_mode = MouseReportingMode::ButtonEvent; }
+                    ('h', 1003) => { self.mouse_reporting_mode = MouseReportingMode::AnyEvent; }
+                    // `?1000`/`?1002`/`?1003`は実xtermと同様に単一の内部モード変数を
+                    // 共有する——後からsetしたものが有効になり、いずれかをreset(`l`)
+                    // すると番号に関わらず無効(`Off`)に戻る(どのモード番号でreset
+                    // 要求されたかは区別しない、xterm実装に合わせた挙動)。
+                    ('l', 1000) | ('l', 1002) | ('l', 1003) => { self.mouse_reporting_mode = MouseReportingMode::Off; }
+                    // SGR拡張マウスレポーティング(`?1006`)。マウスモード自体
+                    // (`?1000`/`?1002`/`?1003`)とは独立に有効/無効を切り替えられる
+                    // (xterm互換: SGRだけ先にonにしておいて後からトラッキングモードを
+                    // 選ぶ、という順序も許容する必要があるため)。
+                    ('h', 1006) => { self.sgr_mouse_mode = true; }
+                    ('l', 1006) => { self.sgr_mouse_mode = false; }
+                    _ => {}
+                }
+            }
             match (action, p0) {
                 ('h', 47) | ('h', 1047) => { self.switch_to_alt(false); }
                 ('h', 1049) => { self.switch_to_alt(true); }
@@ -3255,6 +3434,248 @@ mod tests {
         feed(&mut t, b"\x1bc"); // RIS
         feed(&mut t, b"q");
         assert_eq!(cell(&t, 0, 0), "q", "RIS後はASCII/G0既定に戻っている");
+    }
+
+    // ── マウスレポーティング(タスク#36)────────────────────
+
+    fn no_mods() -> TerminalKeyModifiers { TerminalKeyModifiers::default() }
+
+    #[test]
+    fn test_mouse_mode_default_off() {
+        let t = Terminal::new(80, 24, Theme::default());
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Off);
+        assert!(!t.sgr_mouse_mode());
+    }
+
+    #[test]
+    fn test_mouse_mode_decset_1000_1002_1003() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h");
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Normal);
+        feed(&mut t, b"\x1b[?1002h");
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::ButtonEvent);
+        feed(&mut t, b"\x1b[?1003h");
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::AnyEvent);
+    }
+
+    #[test]
+    fn test_mouse_mode_decrst_any_number_turns_off() {
+        // xterm互換: `?1000`/`?1002`/`?1003`は同一の内部モードを共有するため、
+        // どの番号でreset(`l`)しても番号に関わらずOffに戻る。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1003h");
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::AnyEvent);
+        feed(&mut t, b"\x1b[?1000l");
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Off);
+    }
+
+    #[test]
+    fn test_mouse_mode_sgr_1006_independent_toggle() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1006h");
+        assert!(t.sgr_mouse_mode());
+        // SGRを先にonにしても、マウストラッキング自体は別モードのまま(Off)。
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Off);
+        feed(&mut t, b"\x1b[?1006l");
+        assert!(!t.sgr_mouse_mode());
+    }
+
+    #[test]
+    fn test_mouse_mode_reset_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1003h\x1b[?1006h");
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::AnyEvent);
+        assert!(t.sgr_mouse_mode());
+        feed(&mut t, b"\x1bc"); // RIS
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Off, "RISで既定のOffに戻る");
+        assert!(!t.sgr_mouse_mode(), "RISで既定のfalseに戻る");
+    }
+
+    #[test]
+    fn test_mouse_mode_preserved_across_resize() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1002h\x1b[?1006h");
+        t.resize_preserving_state(40, 12);
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::ButtonEvent);
+        assert!(t.sgr_mouse_mode());
+    }
+
+    #[test]
+    fn test_mouse_mode_decset_combined_pm_sets_tracking_and_sgr_together() {
+        // vim/tmux等はトラッキングモードとSGR拡張を`CSI ?1000;1006h`のように
+        // 1シーケンスにまとめて送ることが珍しくない(codexレビュー指摘: 先頭
+        // パラメータしか見ないと後続の1006が無視され、SGRを要求したのにlegacy
+        // X10形式のまま返してしまうバグになる)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000;1006h");
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Normal);
+        assert!(t.sgr_mouse_mode());
+        feed(&mut t, b"\x1b[?1000;1006l");
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Off);
+        assert!(!t.sgr_mouse_mode());
+    }
+
+    #[test]
+    fn test_encode_pointer_event_off_mode_reports_nothing() {
+        let t = Terminal::new(80, 24, Theme::default());
+        let event = PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        };
+        assert_eq!(t.encode_pointer_event(event), None);
+    }
+
+    #[test]
+    fn test_encode_pointer_event_sgr_press_and_release() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 4, col: 9, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(press, b"\x1b[<0;10;5M");
+        let release = t.encode_pointer_event(PointerEvent {
+            row: 4, col: 9, kind: MouseEventKind::Release,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        // releaseは同じボタン番号のまま、終端が小文字'm'になる(SGRはreleaseでも
+        // どのボタンが離されたか表現できる)。
+        assert_eq!(release, b"\x1b[<0;10;5m");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_sgr_with_modifiers() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
+        let mods = TerminalKeyModifiers { shift: true, ctrl: true, ..Default::default() };
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Right), modifiers: mods,
+        }).unwrap();
+        // Right=2, Shift(4)+Ctrl(16)=20 → Cb=22。
+        assert_eq!(press, b"\x1b[<22;1;1M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_sgr_wheel() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
+        let up = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelUp), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(up, b"\x1b[<64;1;1M");
+        let down = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelDown), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(down, b"\x1b[<65;1;1M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_legacy_x10_press_and_release() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h"); // 1006無し(レガシー)
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 4, col: 9, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(press, vec![0x1B, b'[', b'M', 32, 32 + 10, 32 + 5]);
+        // レガシー形式のreleaseは仕様上どのボタンだったか表現できず常に3(no button)。
+        let release = t.encode_pointer_event(PointerEvent {
+            row: 4, col: 9, kind: MouseEventKind::Release,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(release, vec![0x1B, b'[', b'M', 32 + 3, 32 + 10, 32 + 5]);
+    }
+
+    #[test]
+    fn test_encode_pointer_event_legacy_x10_clamps_coordinates_at_223() {
+        // 1バイトにしかエンコードできないレガシー形式は、座標を223で頭打ちに
+        // クランプする(Fableレビュー指摘: 割り切って未実装にせず実装する判断)。
+        let mut t = Terminal::new(300, 300, Theme::default());
+        feed(&mut t, b"\x1b[?1000h");
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 299, col: 299, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(press, vec![0x1B, b'[', b'M', 32, 32 + 223, 32 + 223]);
+    }
+
+    #[test]
+    fn test_encode_pointer_event_clamps_out_of_bounds_coordinates_to_terminal_size() {
+        // 呼び出し元が誤って画面外の座標(例: リサイズ直後の古い座標)を渡してきても、
+        // この端末の実サイズへクランプしてから送る(codexレビュー指摘: SGRが
+        // 無クランプだと、80列の端末でも列1001のような存在しない座標を報告できて
+        // しまっていた)。80x24の端末なので有効な最終セルは(23, 79)(0-based)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
+        let sgr = t.encode_pointer_event(PointerEvent {
+            row: 1000, col: 1000, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(sgr, b"\x1b[<0;80;24M", "SGRも端末の最終列/行にクランプされる");
+
+        feed(&mut t, b"\x1b[?1006l"); // legacy形式に切り替え
+        let legacy = t.encode_pointer_event(PointerEvent {
+            row: 1000, col: 1000, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        // 80/24とも223未満なので、プロトコル上限ではなく端末サイズでクランプされる。
+        assert_eq!(legacy, vec![0x1B, b'[', b'M', 32, 32 + 80, 32 + 24]);
+    }
+
+    #[test]
+    fn test_encode_pointer_event_motion_suppressed_in_normal_mode() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h"); // Normal: press/releaseのみ
+        let motion = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Motion,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        });
+        assert_eq!(motion, None, "Normalモードではドラッグ移動も報告しない");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_drag_reported_in_button_event_mode() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1002h\x1b[?1006h"); // ButtonEvent
+        let drag = t.encode_pointer_event(PointerEvent {
+            row: 1, col: 1, kind: MouseEventKind::Motion,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        // motionビット(32)がCbに加算される: 0(Left) + 32 = 32。
+        assert_eq!(drag, b"\x1b[<32;2;2M");
+        // ボタン無しの単純な移動はButtonEventモードでは報告しない。
+        let hover = t.encode_pointer_event(PointerEvent {
+            row: 1, col: 1, kind: MouseEventKind::Motion,
+            button: None, modifiers: no_mods(),
+        });
+        assert_eq!(hover, None, "ButtonEventモードはボタン無しの移動を報告しない");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_hover_reported_in_any_event_mode() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1003h\x1b[?1006h"); // AnyEvent
+        let hover = t.encode_pointer_event(PointerEvent {
+            row: 2, col: 2, kind: MouseEventKind::Motion,
+            button: None, modifiers: no_mods(),
+        }).unwrap();
+        // ボタン無し移動のbaseは3("no button")+ motionビット(32) = 35。
+        assert_eq!(hover, b"\x1b[<35;3;3M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_wheel_reported_even_in_normal_mode() {
+        // ホイールは移動ではなくPress扱いなので、Normal(?1000)でも報告される。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
+        let up = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelUp), modifiers: no_mods(),
+        });
+        assert!(up.is_some());
     }
 
     // ── Proptest: 不変量 ────────────────────────────────

@@ -47,6 +47,8 @@ fn make_screen_update(t: &Terminal) -> ScreenUpdate {
         title: t.title().map(str::to_owned),
         application_cursor_mode: t.application_cursor_mode(),
         bracketed_paste_mode: t.bracketed_paste_mode(),
+        mouse_reporting_mode: t.mouse_reporting_mode(),
+        sgr_mouse_mode: t.sgr_mouse_mode(),
         cursor_visible: t.cursor_visible(),
         bell_generation: t.bell_generation(),
         cursor_shape: t.cursor_shape(),
