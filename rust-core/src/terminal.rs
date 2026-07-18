@@ -2286,7 +2286,11 @@ impl Perform for Terminal {
     }
     fn esc_dispatch(&mut self, ints: &[u8], _ignore: bool, byte: u8) {
         match byte {
-            b'M' => {
+            // RI(Reverse Index、`ESC M`)。intermediateが空の場合のみ扱う——`ESC ( M`/
+            // `ESC ) M`(G0/G1文字セット指定の最終バイトとして`M`が来るケース)を
+            // このガード無しに先に捕まえてしまい、G0/G1フォールバック(下記)より前に
+            // 画面をスクロールしてしまう誤動作があったため(タスク#75、fable/codex指摘)。
+            b'M' if ints.is_empty() => {
                 if self.cursor_row == self.scroll_top {
                     let top = self.scroll_top;
                     let bot = self.scroll_bottom;
@@ -2305,7 +2309,11 @@ impl Perform for Terminal {
                     self.cursor_row -= 1;
                 }
             }
-            b'c' => { self.reset_all(); }
+            // RIS(Reset to Initial State、`ESC c`)。intermediateが空の場合のみ扱う
+            // ——`ESC ( c`(G0文字セット指定の最終バイトとして`c`が来るケース)を
+            // このガード無しに先に捕まえてしまい、G0/G1フォールバック(下記)より前に
+            // 全画面リセットしてしまう誤動作があったため(タスク#75、fable/codex指摘)。
+            b'c' if ints.is_empty() => { self.reset_all(); }
             // DECSC/DECRC(タスク#57)。`b'7'`/`b'8'`はASCII '7'/'8'(0x37/0x38)。
             // intermediateが空の場合のみDECSC/DECRCとして扱う——`ESC # 8`(DECALN、
             // screen alignment test、未実装につきno-op)がintermediate `#`付きの
@@ -4904,6 +4912,72 @@ mod tests {
         feed(&mut t, b"\x1b(A"); // 未対応の最終バイト → ASCIIへフォールバック
         feed(&mut t, b"q");
         assert_eq!(cell(&t, 0, 0), "q", "未対応の指定はASCII相当として扱われる");
+    }
+
+    #[test]
+    fn test_esc_paren_c_is_g0_charset_fallback_not_ris() {
+        // タスク#75回帰テスト: `ESC ( c`は中間バイト`(`付きのG0文字セット指定
+        // (未対応の最終バイト`c` → ASCIIフォールバック)であり、intermediate無しの
+        // `ESC c`(RIS)とは全く別のシーケンス。`b'c'`アームにガードが無いと
+        // `ints`を無視して`reset_all()`(全画面消去+カーソルホーム等)が誤発動する。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"hello");
+        feed(&mut t, b"\x1b(c"); // G0文字セット指定(未対応の最終バイト) であり RIS ではない
+        assert_eq!(cell(&t, 0, 0), "h", "ESC ( c で画面がリセットされてはいけない");
+        assert_eq!(t.cursor_col(), 5, "ESC ( c でカーソルがホームへ戻ってはいけない");
+    }
+
+    #[test]
+    fn test_esc_c_without_intermediate_is_still_ris() {
+        // 上のガード追加が`ESC c`(intermediate無し、本来のRIS)自体を壊していない
+        // ことの確認。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"hello");
+        feed(&mut t, b"\x1bc"); // RIS
+        assert_eq!(cell(&t, 0, 0), " ", "ESC c(RIS)は画面をリセットする");
+        assert_eq!(t.cursor_col(), 0, "ESC c(RIS)はカーソルをホームへ戻す");
+    }
+
+    #[test]
+    fn test_esc_paren_m_is_g0_charset_fallback_not_ri() {
+        // タスク#75回帰テスト: `ESC ( M`は中間バイト付きのG0文字セット指定
+        // (未対応の最終バイト`M` → ASCIIフォールバック)であり、intermediate
+        // 無しの`ESC M`(RI/Reverse Index、カーソル上移動またはスクロール)とは別
+        // シーケンス。`b'M'`アームにガードが無いと`ints`を無視してRI相当の画面
+        // 移動が誤発動する(codexレビュー指摘: `ESC ) M`と1テストに同居させると
+        // 旧実装で`ESC ( M`側の失敗で先に落ちて`ESC ) M`側の再現性が検証されない
+        // ため、独立したテストに分離)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"hello\r\n");
+        assert_eq!(t.cursor_row(), 1);
+        feed(&mut t, b"\x1b(M"); // G0文字セット指定(未対応の最終バイト)であり RI ではない
+        assert_eq!(t.cursor_row(), 1, "ESC ( M でカーソルが上に移動してはいけない");
+        assert_eq!(cell(&t, 0, 0), "h", "ESC ( M で画面がスクロールしてはいけない");
+    }
+
+    #[test]
+    fn test_esc_close_paren_m_is_g1_charset_fallback_not_ri() {
+        // タスク#75回帰テスト: `ESC ) M`は中間バイト付きのG1文字セット指定
+        // (未対応の最終バイト`M` → ASCIIフォールバック)であり、`ESC M`(RI)とは
+        // 別シーケンス。上の`ESC ( M`テストと同じ理由で独立したテストとして
+        // 再現条件を検証する(codexレビュー指摘)。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"hello\r\n");
+        assert_eq!(t.cursor_row(), 1);
+        feed(&mut t, b"\x1b)M"); // G1文字セット指定(未対応の最終バイト)であり RI ではない
+        assert_eq!(t.cursor_row(), 1, "ESC ) M でカーソルが上に移動してはいけない");
+        assert_eq!(cell(&t, 0, 0), "h", "ESC ) M で画面がスクロールしてはいけない");
+    }
+
+    #[test]
+    fn test_esc_m_without_intermediate_is_still_reverse_index() {
+        // 上のガード追加が`ESC M`(intermediate無し、本来のRI)自体を壊していない
+        // ことの確認。
+        let mut t = Terminal::new(20, 5, Theme::default());
+        feed(&mut t, b"hello\r\n");
+        assert_eq!(t.cursor_row(), 1);
+        feed(&mut t, b"\x1bM"); // RI: カーソルが1行上へ
+        assert_eq!(t.cursor_row(), 0, "ESC M(RI)はカーソルを上に移動する");
     }
 
     #[test]
