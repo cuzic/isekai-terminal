@@ -859,6 +859,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_network_path_changed(
@@ -1015,6 +1017,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_ba
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_did_enter_background(`ptr`: Long,`budgetMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(`ptr`: Long,`message`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_focus_change(`ptr`: Long,`focused`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_memory_warning(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1307,6 +1311,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 47947) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning() != 20700) {
@@ -2943,6 +2950,14 @@ public interface SessionOrchestratorInterface {
     fun `notifyError`(`message`: kotlin.String)
     
     /**
+     * #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
+     * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
+     * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
+     * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     */
+    fun `notifyFocusChange`(`focused`: kotlin.Boolean)
+    
+    /**
      * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを終了
      * される可能性が高まったとみなし、猶予を待たず保守的に`Suspended`扱いにする
      * (無言で固まった画面をユーザーに見せるより、次回復帰時に再接続する方が安全)。
@@ -3355,6 +3370,24 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(
         it,
         FfiConverterString.lower(`message`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
+     * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
+     * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
+     * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     */override fun `notifyFocusChange`(`focused`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_focus_change(
+        it,
+        FfiConverterBoolean.lower(`focused`),_status)
 }
     }
     
