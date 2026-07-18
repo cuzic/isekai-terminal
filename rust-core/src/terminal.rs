@@ -536,6 +536,78 @@ impl Terminal {
         }
     }
 
+    /// IL(`CSI Ps L`)。カーソル行に`n`個の空行を挿入し、カーソル行〜scroll_bottomの
+    /// 内容を下方向へ押し出す(scroll_bottomを超えて溢れた行は破棄)。
+    ///
+    /// - カーソルが現在のscroll region([scroll_top, scroll_bottom])の外にある場合は
+    ///   no-op(xterm/VT102 同様、IL/DLはscroll region内でのみ効く)。
+    /// - `n`をregionサイズ(`scroll_bottom - cursor_row + 1`)にクランプすることで、
+    ///   [scroll_up_region]に存在する「n == region幅」時の`usize`アンダーフローを
+    ///   同じ形では踏まない(縮めた領域を経由せず、シフト対象が0行の時はシフト
+    ///   ループ自体をスキップする)。
+    /// - カーソル位置(行・列とも)は変更しない。挿入で押し出された行は
+    ///   [pending_scrollback] に一切積まない(Fableレビュー: `scroll_up_region`は
+    ///   `top==0 && !alt`の場合のみscrollbackへpushするため、IL/DLを安直に
+    ///   `scroll_up_region`経由で実装するとカーソルが0行目にある時の押し出し行が
+    ///   誤って履歴に混入するバグを生む——このメソッドは常にscrollbackへ触れない)。
+    fn insert_lines(&mut self, n: usize) {
+        let top = self.cursor_row;
+        let bot = self.scroll_bottom;
+        if top < self.scroll_top || top > bot { return; }
+        let region_size = bot - top + 1;
+        let n = n.min(region_size);
+        let cols = self.cols;
+        if n < region_size {
+            // 下から上へ(行番号の大きい方から)コピーすることで、書き込み先
+            // (row + n)がまだ読んでいない元データを上書きしないようにする。
+            for row in (top..=(bot - n)).rev() {
+                for col in 0..cols {
+                    let src = self.cells_mut()[row * cols + col].clone();
+                    self.cells_mut()[(row + n) * cols + col] = src;
+                }
+            }
+        }
+        let blank = self.blank();
+        for row in top..(top + n) {
+            for col in 0..cols {
+                self.cells_mut()[row * cols + col] = blank.clone();
+            }
+        }
+    }
+
+    /// DL(`CSI Ps M`)。カーソル行から`n`行を削除し、それより下(〜scroll_bottom)の
+    /// 内容を上方向へ詰める。押し出された分(下端)は空行で埋める。
+    ///
+    /// [insert_lines] と対になる実装 — 制約・不変条件([pending_scrollback]に
+    /// 一切触れない、カーソル位置不変、scroll region外ではno-op)は同じ。
+    /// アンダーフロー回避のため、空行で埋める開始行を`bot - n + 1`ではなく
+    /// `top + (region_size - n)`として計算する(`n == region_size`の時
+    /// `bot - n + 1`は`usize`の直接減算だと桁あふれし得るが、こちらは
+    /// `region_size - n >= 0`が`n`のクランプにより保証されているため安全)。
+    fn delete_lines(&mut self, n: usize) {
+        let top = self.cursor_row;
+        let bot = self.scroll_bottom;
+        if top < self.scroll_top || top > bot { return; }
+        let region_size = bot - top + 1;
+        let n = n.min(region_size);
+        let cols = self.cols;
+        if n < region_size {
+            for row in top..=(bot - n) {
+                for col in 0..cols {
+                    let src = self.cells_mut()[(row + n) * cols + col].clone();
+                    self.cells_mut()[row * cols + col] = src;
+                }
+            }
+        }
+        let blank = self.blank();
+        let blank_start = top + (region_size - n);
+        for row in blank_start..=bot {
+            for col in 0..cols {
+                self.cells_mut()[row * cols + col] = blank.clone();
+            }
+        }
+    }
+
     fn newline(&mut self) {
         if self.cursor_row == self.scroll_bottom {
             self.scroll_up_region(1);
@@ -870,6 +942,8 @@ impl Perform for Terminal {
                     _ => {}
                 }
             }
+            'L' => { self.insert_lines(p0.max(1) as usize); }
+            'M' => { self.delete_lines(p0.max(1) as usize); }
             'S' => { self.scroll_up_region(p0.max(1) as usize); }
             'd' => { self.cursor_row = (p0.max(1) as usize - 1).min(self.rows - 1); }
             'm' => { self.handle_sgr(&ps); }
@@ -1941,6 +2015,165 @@ mod tests {
         assert_eq!(t.screen_cells().len(), 1);
         assert!(t.cursor_row() < t.rows());
         assert!(t.cursor_col() <= t.cols());
+    }
+
+    // ── IL/DL(`CSI Ps L`/`CSI Ps M`、タスク#35) ─────────────
+
+    #[test]
+    fn test_il_inserts_blank_lines_and_shifts_rest_down() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t, b"\x1b[2;1H\x1b[2L"); // カーソルを行1(0-indexed)へ、2行挿入
+        assert_eq!(cell(&t, 0, 0), "r", "row0はIL対象外(カーソルより上)なので不変");
+        assert_eq!(cell(&t, 1, 0), " ", "挿入された空行");
+        assert_eq!(cell(&t, 2, 0), " ", "挿入された空行");
+        assert_eq!(cell(&t, 3, 0), "r", "旧row1が2行下へ押し出される");
+        assert_eq!(cell(&t, 3, 3), "1", "旧row1(\"row1\")の内容がそのまま");
+        assert_eq!(cell(&t, 4, 3), "2", "旧row2(\"row2\")の内容がそのまま");
+        // 旧row3・旧row4はscroll_bottomを超えて溢れ、破棄される。
+    }
+
+    #[test]
+    fn test_dl_deletes_lines_and_shifts_rest_up() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t, b"\x1b[2;1H\x1b[2M"); // カーソルを行1(0-indexed)へ、2行削除
+        assert_eq!(cell(&t, 0, 0), "r", "row0はDL対象外(カーソルより上)なので不変");
+        assert_eq!(cell(&t, 1, 3), "3", "旧row3が2行上へ詰められる");
+        assert_eq!(cell(&t, 2, 3), "4", "旧row4が2行上へ詰められる");
+        assert_eq!(cell(&t, 3, 0), " ", "下端は空行で埋められる");
+        assert_eq!(cell(&t, 4, 0), " ", "下端は空行で埋められる");
+    }
+
+    #[test]
+    fn test_il_default_count_is_one() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1");
+        feed(&mut t, b"\x1b[1;1H\x1b[L"); // Ps省略 == CSI 1L
+        assert_eq!(cell(&t, 0, 0), " ", "空行が1行だけ挿入される");
+        assert_eq!(cell(&t, 1, 0), "r", "旧row0が1行だけ下へ押し出される");
+    }
+
+    #[test]
+    fn test_dl_default_count_is_one() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1");
+        feed(&mut t, b"\x1b[1;1H\x1b[M"); // Ps省略 == CSI 1M
+        assert_eq!(cell(&t, 0, 3), "1", "旧row1が1行だけ上へ詰められる");
+    }
+
+    #[test]
+    fn test_il_dl_noop_when_cursor_outside_scroll_region() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t, b"\x1b[2;4r"); // scroll region = 行1..3(0-indexed)
+        // カーソルをregion上端より上(行0)に置いてIL/DLを試みる → no-op。
+        feed(&mut t, b"\x1b[1;1H\x1b[2L");
+        assert_eq!(cell(&t, 0, 0), "r", "region外のIL: 行0は不変のまま");
+        assert_eq!(cell(&t, 1, 0), "r", "region外のIL: 行1も不変のまま");
+        feed(&mut t, b"\x1b[1;1H\x1b[2M");
+        assert_eq!(cell(&t, 0, 0), "r", "region外のDL: 行0は不変のまま");
+        assert_eq!(cell(&t, 1, 0), "r", "region外のDL: 行1も不変のまま");
+        // カーソルをregion下端より下(行4)に置いても同様にno-op。
+        feed(&mut t, b"\x1b[5;1H\x1b[1L");
+        assert_eq!(cell(&t, 4, 0), "r", "region外のIL: 行4は不変のまま");
+    }
+
+    #[test]
+    fn test_il_dl_never_touch_pending_scrollback() {
+        // Fableレビュー(2次): scroll_up_regionは`top==0 && !alt`の場合、押し出された行を
+        // pending_scrollbackへpushする。IL/DLをこれ経由で安直に実装すると、カーソルが
+        // 0行目にある状態でのDL/ILが削除/押し出しされた行を誤ってscrollback履歴へ
+        // 混入させてしまう。IL/DLはこのバグを踏んでいないことをここで固定する
+        // (カーソルが画面最上行にある――scroll_up_regionなら確実にscrollbackへ積む
+        // 条件――状態で、DL/ILどちらも試す)。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        assert!(t.take_scrollback().is_empty(), "折り返しなしの5行埋めではまだ何もスクロールアウトしていない");
+
+        feed(&mut t, b"\x1b[1;1H\x1b[1M"); // カーソルは行0、DLで行0を削除
+        assert!(
+            t.take_scrollback().is_empty(),
+            "DLで押し出された行はpending_scrollbackへ積んではならない"
+        );
+
+        feed(&mut t, b"\x1b[1;1H\x1b[1L"); // カーソルは行0、ILで空行を挿入(下端の行が溢れて破棄される)
+        assert!(
+            t.take_scrollback().is_empty(),
+            "ILで画面外に溢れた行もpending_scrollbackへ積んではならない"
+        );
+    }
+
+    #[test]
+    fn test_il_dl_do_not_move_cursor() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2");
+        feed(&mut t, b"\x1b[2;3H"); // 行1・列2(0-indexed)
+        assert_eq!((t.cursor_row(), t.cursor_col()), (1, 2));
+        feed(&mut t, b"\x1b[2L");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (1, 2), "ILはカーソル位置を変えない");
+        feed(&mut t, b"\x1b[2M");
+        assert_eq!((t.cursor_row(), t.cursor_col()), (1, 2), "DLはカーソル位置を変えない");
+    }
+
+    #[test]
+    fn test_il_dl_clamp_count_beyond_region_size_without_panic() {
+        // n がregionサイズを超える(=画面全体を押し出す/削除する)場合、
+        // usizeアンダーフローでpanicせず、regionサイズにクランプして全行が
+        // 空行になることを確認する。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t, b"\x1b[1;1H\x1b[100L");
+        for row in 0..5 {
+            assert_eq!(cell(&t, row, 0), " ", "row {row} should be blank after over-sized IL");
+        }
+
+        let mut t2 = Terminal::new(10, 5, Theme::default());
+        feed(&mut t2, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t2, b"\x1b[1;1H\x1b[100M");
+        for row in 0..5 {
+            assert_eq!(cell(&t2, row, 0), " ", "row {row} should be blank after over-sized DL");
+        }
+    }
+
+    #[test]
+    fn test_il_dl_blank_uses_current_sgr_bg() {
+        // blank() は現在のSGR属性(色等)を引き継ぐ仕様(erase系と同じ) — IL/DLの
+        // 空白セルもそれに倣うことを固定する(IL: 挿入された空行、DL: 下端の
+        // 埋め合わせ行の両方をチェックする——codexレビュー指摘)。
+        let red_bg = Theme::default().ansi16[1];
+
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1");
+        feed(&mut t, b"\x1b[41m"); // 赤背景
+        feed(&mut t, b"\x1b[1;1H\x1b[1L");
+        assert_eq!(t.screen_cells()[0].bg, red_bg, "ILで挿入された空行は現在のSGR背景色を引き継ぐ");
+
+        let mut t2 = Terminal::new(10, 5, Theme::default());
+        feed(&mut t2, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t2, b"\x1b[41m"); // 赤背景
+        feed(&mut t2, b"\x1b[1;1H\x1b[1M"); // 行0削除 → 下端(行4)が空行で埋まる
+        assert_eq!(cell(&t2, 4, 0), " ");
+        assert_eq!(t2.screen_cells()[4 * 10].bg, red_bg, "DLで下端に埋められた空行も現在のSGR背景色を引き継ぐ");
+    }
+
+    #[test]
+    fn test_il_dl_confined_to_cursor_row_through_scroll_bottom_within_region() {
+        // タスク要件: 「scroll regionと現在行の制約」——非全画面scroll region内で
+        // IL/DLがcursor_row..scroll_bottomの範囲だけを動かし、scroll_top未満・
+        // scroll_bottom超過(regionの外側)の行には一切触れないことを固定する
+        // (codexレビュー指摘: no-opケースだけでなく、region内部での「効く」
+        // 範囲そのものも固定すべき)。
+        let mut t = Terminal::new(10, 6, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4\r\nrow5");
+        feed(&mut t, b"\x1b[3;5r"); // scroll region = 行2..4(0-indexed)
+        feed(&mut t, b"\x1b[4;1H\x1b[1M"); // カーソルは行3(region内)、DLで1行削除
+        assert_eq!(cell(&t, 0, 0), "r", "region上端より上の行0はDLの影響を受けない");
+        assert_eq!(cell(&t, 1, 0), "r", "scroll_top未満の行1(region外)はDLの影響を受けない");
+        assert_eq!(cell(&t, 2, 0), "r", "region内だがカーソル行(3)より上の行2は不変");
+        assert_eq!(cell(&t, 3, 3), "4", "旧row4がカーソル行(3)へ詰められる");
+        assert_eq!(cell(&t, 4, 0), " ", "region下端(scroll_bottom=4)が空行で埋まる");
+        assert_eq!(cell(&t, 5, 0), "r", "scroll_bottomを超えた行5(region外)はDLの影響を受けない");
     }
 
     // ── Proptest: 不変量 ────────────────────────────────
