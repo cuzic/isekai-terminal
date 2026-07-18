@@ -286,7 +286,7 @@ mod tests {
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = russh_stream_session::connect_via_jump_or_direct(
             None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
-            || verifying_handler(&verifier),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -311,7 +311,7 @@ mod tests {
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = russh_stream_session::connect_via_jump_or_direct(
             None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
-            || verifying_handler(&verifier),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");

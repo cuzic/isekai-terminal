@@ -89,6 +89,23 @@ impl Drop for Credential {
     }
 }
 
+/// Which leg of a connection [`connect_via_jump_or_direct`] is asking a
+/// caller's handler factory to build a `client::Handler` for. Passed
+/// explicitly (rather than left for the caller to infer from call order) so
+/// that a caller that needs a *different* handler per leg — e.g. a distinct
+/// host-key trust-store entry for the jump host vs. the target — can never
+/// silently desync if this function's internal connection sequence ever
+/// changes (adds a retry, a probe, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionLeg {
+    /// The jump host itself (only ever constructed when a `JumpHost` is
+    /// passed).
+    Jump,
+    /// The final target — the only leg in a direct (no-jump) connection, and
+    /// the second leg when tunneling through a jump host.
+    Target,
+}
+
 /// A single-hop jump host (`ssh -J` equivalent) to tunnel through before
 /// reaching the real target.
 pub struct JumpHost {
@@ -136,9 +153,14 @@ pub struct Session<H: client::Handler + 'static> {
 /// Generic over the `client::Handler` type `H` so callers that need more
 /// than host-key verification (agent forwarding, remote port forwards,
 /// other server-initiated channel requests) can plug in their own handler —
-/// `new_handler` is called once per connection attempt (twice total when a
-/// jump host is used: once for the jump leg, once for the target). Callers
-/// that only need host-key verification can use [`VerifyingHandler`] via
+/// `new_handler` is called once per connection leg (twice total when a jump
+/// host is used: once with [`ConnectionLeg::Jump`], then once with
+/// [`ConnectionLeg::Target`]; exactly once with [`ConnectionLeg::Target`]
+/// for a direct connection). The leg is passed explicitly so a caller that
+/// needs a per-leg handler (e.g. a distinct host-key verifier for the jump
+/// host vs. the target) selects it from the `ConnectionLeg` argument rather
+/// than counting calls — see [`ConnectionLeg`]'s own docs. Callers that only
+/// need host-key verification can use [`VerifyingHandler`] via
 /// [`verifying_handler`] instead of writing their own `client::Handler`.
 pub async fn connect_via_jump_or_direct<H, F>(
     jump: Option<&JumpHost>,
@@ -149,18 +171,18 @@ pub async fn connect_via_jump_or_direct<H, F>(
 ) -> Result<Session<H>, SessionError>
 where
     H: client::Handler<Error = russh::Error> + Send + 'static,
-    F: FnMut() -> H,
+    F: FnMut(ConnectionLeg) -> H,
 {
     let Some(jump) = jump else {
         let addr = format!("{target_host}:{target_port}");
-        let handle = client::connect(russh_config, addr.as_str(), new_handler())
+        let handle = client::connect(russh_config, addr.as_str(), new_handler(ConnectionLeg::Target))
             .await
             .map_err(|source| SessionError::Connect { addr, source })?;
         return Ok(Session { handle, _jump_handle: None });
     };
 
     let jump_addr = format!("{}:{}", jump.host, jump.port);
-    let mut jump_handle = client::connect(russh_config.clone(), jump_addr.as_str(), new_handler())
+    let mut jump_handle = client::connect(russh_config.clone(), jump_addr.as_str(), new_handler(ConnectionLeg::Jump))
         .await
         .map_err(|source| SessionError::Connect { addr: jump_addr.clone(), source })?;
 
@@ -175,7 +197,7 @@ where
         .map_err(|source| SessionError::JumpTunnel { host: target_host.to_string(), port: target_port, source })?;
     let stream = channel.into_stream();
 
-    let handle = client::connect_stream(russh_config, stream, new_handler())
+    let handle = client::connect_stream(russh_config, stream, new_handler(ConnectionLeg::Target))
         .await
         .map_err(|source| SessionError::JumpHandshake { host: target_host.to_string(), port: target_port, source })?;
 
@@ -421,7 +443,7 @@ mod tests {
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
             None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
-            || verifying_handler(&verifier),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -471,7 +493,7 @@ mod tests {
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
             Some(&jump), Arc::new(client::Config::default()), &target_addr.ip().to_string(), target_addr.port(),
-            || verifying_handler(&verifier),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("jump connect should succeed");
@@ -494,7 +516,7 @@ mod tests {
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
             None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
-            || verifying_handler(&verifier),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -517,7 +539,7 @@ mod tests {
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
             None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
-            || verifying_handler(&verifier),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -536,7 +558,7 @@ mod tests {
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
             None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
-            || verifying_handler(&verifier),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -567,7 +589,7 @@ mod tests {
         let verifier = Arc::new(RejectAllHostKeys);
         let result = connect_via_jump_or_direct(
             None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
-            || verifying_handler(&verifier),
+            |_leg| verifying_handler(&verifier),
         )
         .await;
         assert!(
@@ -625,7 +647,7 @@ mod tests {
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
             None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
-            || verifying_handler(&verifier),
+            |_leg| verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -639,5 +661,60 @@ mod tests {
             .await
             .expect("authenticate_with_signer should not error against a server that accepts any public key");
         assert!(authed, "the server accepts any public key, so a correctly-signed challenge must succeed");
+    }
+
+    #[tokio::test]
+    async fn direct_connection_constructs_exactly_one_target_leg_handler() {
+        let addr = spawn_server(EchoExecServer, 9).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let legs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let legs_recorder = legs.clone();
+        let _session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            move |leg| {
+                legs_recorder.lock().unwrap().push(leg);
+                verifying_handler(&verifier)
+            },
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        assert_eq!(
+            *legs.lock().unwrap(),
+            vec![ConnectionLeg::Target],
+            "a direct connection must build exactly one handler, for the target leg"
+        );
+    }
+
+    #[tokio::test]
+    async fn jump_connection_constructs_jump_then_target_legs_in_order() {
+        let target_addr = spawn_server(EchoExecServer, 10).await;
+        let jump_addr = spawn_server(JumpServer, 11).await;
+
+        let jump = JumpHost {
+            host: jump_addr.ip().to_string(),
+            port: jump_addr.port(),
+            username: "jumper".into(),
+            credential: Credential::Password("correct-password".into()),
+        };
+
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let legs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let legs_recorder = legs.clone();
+        let _session = connect_via_jump_or_direct(
+            Some(&jump), Arc::new(client::Config::default()), &target_addr.ip().to_string(), target_addr.port(),
+            move |leg| {
+                legs_recorder.lock().unwrap().push(leg);
+                verifying_handler(&verifier)
+            },
+        )
+        .await
+        .expect("jump connect should succeed");
+
+        assert_eq!(
+            *legs.lock().unwrap(),
+            vec![ConnectionLeg::Jump, ConnectionLeg::Target],
+            "a jump connection must build the jump-leg handler first, then the target-leg handler"
+        );
     }
 }

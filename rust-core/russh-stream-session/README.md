@@ -33,7 +33,7 @@ let verifier = Arc::new(AcceptAll);
 let config = Arc::new(russh::client::Config::default());
 let mut session = russh_stream_session::connect_via_jump_or_direct(
     None, config, "example.com", 22,
-    || russh_stream_session::verifying_handler(&verifier),
+    |_leg| russh_stream_session::verifying_handler(&verifier),
 ).await?;
 
 let authed = russh_stream_session::authenticate_session(
@@ -73,7 +73,7 @@ the private key material:
 # let config = Arc::new(russh::client::Config::default());
 let mut session = russh_stream_session::connect_via_jump_or_direct(
     None, config, "example.com", 22,
-    || russh_stream_session::verifying_handler(&verifier),
+    |_leg| russh_stream_session::verifying_handler(&verifier),
 ).await?;
 
 let mut agent = russh_keys::agent::client::AgentClient::connect_env().await?;
