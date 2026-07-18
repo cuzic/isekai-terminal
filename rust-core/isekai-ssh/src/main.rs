@@ -64,11 +64,23 @@ fn main() {
         .name("isekai-ssh-main".to_string())
         .stack_size(MAIN_WORKER_STACK_SIZE)
         .spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
+            let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .expect("failed to build tokio runtime")
-                .block_on(run())
+                .expect("failed to build tokio runtime");
+            let exit_code = runtime.block_on(run());
+            // A dropped-but-still-pending `tokio::io::stdin()` read (the shell
+            // I/O loop's stdin branch loses the race against the remote
+            // channel closing — see `native/connect.rs::run_shell_io_loop`'s
+            // module docs) keeps running on tokio's blocking pool even after
+            // this future returns. The ordinary (implicit) `Drop` for
+            // `Runtime` blocks until every outstanding blocking-pool task
+            // finishes, which for a real terminal stdin means "until the user
+            // presses another key" — exactly the hang this sidesteps.
+            // `shutdown_background()` tears the runtime down without waiting,
+            // matching `ssh(1)`'s own immediate-exit behavior.
+            runtime.shutdown_background();
+            exit_code
         })
         .expect("failed to spawn isekai-ssh main worker thread")
         .join()
