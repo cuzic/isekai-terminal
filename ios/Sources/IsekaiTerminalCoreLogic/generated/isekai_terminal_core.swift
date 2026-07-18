@@ -3242,6 +3242,75 @@ public func FfiConverterTypeTerminalFrameBatch_lower(_ value: TerminalFrameBatch
     return FfiConverterTypeTerminalFrameBatch.lower(value)
 }
 
+
+/**
+ * xterm互換の修飾キー状態。`terminal_special_key_bytes`へ渡し、矢印・Home/End・
+ * PageUp/Down・F1〜F12のシーケンスに修飾子パラメータを付与するために使う
+ * (Ctrl+矢印でreadline/tmuxのワード単位移動等を機能させるため、`TERM=xterm-256color`
+ * が広告する修飾子付きシーケンスをこちら側でも生成する必要がある)。
+ * 全フィールドfalse(修飾なし)は`Default`で表す。
+ */
+public struct TerminalKeyModifiers: Equatable, Hashable {
+    public var shift: Bool
+    public var alt: Bool
+    public var ctrl: Bool
+    public var meta: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(shift: Bool, alt: Bool, ctrl: Bool, meta: Bool) {
+        self.shift = shift
+        self.alt = alt
+        self.ctrl = ctrl
+        self.meta = meta
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TerminalKeyModifiers: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTerminalKeyModifiers: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TerminalKeyModifiers {
+        return
+            try TerminalKeyModifiers(
+                shift: FfiConverterBool.read(from: &buf), 
+                alt: FfiConverterBool.read(from: &buf), 
+                ctrl: FfiConverterBool.read(from: &buf), 
+                meta: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TerminalKeyModifiers, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.shift, into: &buf)
+        FfiConverterBool.write(value.alt, into: &buf)
+        FfiConverterBool.write(value.ctrl, into: &buf)
+        FfiConverterBool.write(value.meta, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalKeyModifiers_lift(_ buf: RustBuffer) throws -> TerminalKeyModifiers {
+    return try FfiConverterTypeTerminalKeyModifiers.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalKeyModifiers_lower(_ value: TerminalKeyModifiers) -> RustBuffer {
+    return FfiConverterTypeTerminalKeyModifiers.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -3508,9 +3577,9 @@ public func FfiConverterTypeConnectionPublicState_lower(_ value: ConnectionPubli
  * DECSCUSR(`CSI Ps SP q`)が選択するカーソル形状。`Terminal`が状態として保持し
  * (rust-ssot: Kotlin/Swift側にミラー状態を作らず、この値をそのまま描画に使う)、
  * `ScreenUpdate::cursor_shape`として公開する。点滅の有無は別フィールド
- * (`ScreenUpdate::cursor_blink`)で表現する——将来のDECSET `?12`(タスク#55、
- * 点滅on/offのみを切り替えるレガシー制御)がDECSCUSRとは独立に同じ
- * `cursor_blink`フィールドを更新できるよう、形状と点滅を分離してある。
+ * (`ScreenUpdate::cursor_blink`)で表現する——DECSET/DECRST `?12`(`CSI ?12h`/
+ * `CSI ?12l`、点滅on/offのみを切り替えるレガシー制御、タスク#55)がDECSCUSRとは
+ * 独立に同じ`cursor_blink`フィールドを更新できるよう、形状と点滅を分離してある。
  */
 
 public enum CursorShape: Equatable, Hashable {
@@ -5780,15 +5849,30 @@ public func terminalCtrlByte(codePoint: UInt32) -> UInt8?  {
 }
 /**
  * 特殊キーを、ターミナルへ送信するバイト列(ANSI/xtermエスケープシーケンス)に
- * 変換する。矢印キーは`application_cursor_mode`が有効ならSS3形式(`ESC O A`等、
- * DECCKM)、無効ならCSI形式(`ESC[A`等)を返す。F1〜F4はSS3形式、F5〜F12は
- * CSI `~`形式(xterm互換)。未対応のfunction key番号は空配列を返す。
+ * 変換する。
+ *
+ * - 矢印キーは、修飾子が一切無い場合のみ`application_cursor_mode`(DECCKM)に従い
+ * SS3形式(`ESC O A`等)/CSI形式(`ESC[A`等)を切り替える。**修飾子が1つでも
+ * 付いている場合はDECCKMの値に関わらず常にCSI形式**(`ESC[1;5A`等、xterm互換)
+ * になる(DECCKMはSS3/CSIの切替のみを制御し、修飾子パラメータ付きシーケンスは
+ * 元々CSI形式でしか表現できないため)。
+ * - Home/End/PageUp/PageDownも同様に、修飾子が無ければ従来通りの無パラメータ形式
+ * (`ESC[H`/`ESC[5~`等)、修飾子があればパラメータ付き(`ESC[1;5H`/`ESC[5;5~`等)。
+ * - F1〜F4は修飾子が無ければSS3形式(`ESC O P`等)だが、修飾子が付くと
+ * SS3では修飾子パラメータを表現できないため**CSI形式に切り替わる**
+ * (`ESC[1;5P`等)。F5〜F12はどちらの場合もCSI `~`形式(修飾子有りなら
+ * `ESC[15;5~`等)。未対応のfunction key番号は空配列を返す。
+ * - Tabは修飾子無しなら`0x09`だが、Shift単独の場合はCBT(Cursor Backward Tab、
+ * `ESC[Z`)を返す(readline/tmux等の「戻りタブ補完」に必要。xterm互換で
+ * パラメータは付かない)。Shift以外の修飾子(Ctrl+Tab等)はターミナル制御
+ * シーケンスとして標準化されていないため無視し、無修飾のTabとして扱う。
  */
-public func terminalSpecialKeyBytes(key: TerminalSpecialKey, applicationCursorMode: Bool) -> Data  {
+public func terminalSpecialKeyBytes(key: TerminalSpecialKey, applicationCursorMode: Bool, modifiers: TerminalKeyModifiers) -> Data  {
     return try!  FfiConverterData.lift(try! rustCall() {
     uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(
         FfiConverterTypeTerminalSpecialKey_lower(key),
-        FfiConverterBool.lower(applicationCursorMode),$0
+        FfiConverterBool.lower(applicationCursorMode),
+        FfiConverterTypeTerminalKeyModifiers_lower(modifiers),$0
     )
 })
 }
@@ -5887,7 +5971,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte() != 39410) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 46056) {
+    if (uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 25965) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes() != 52901) {

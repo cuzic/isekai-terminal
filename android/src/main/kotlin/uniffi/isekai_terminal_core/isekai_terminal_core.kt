@@ -1062,7 +1062,7 @@ external fun uniffi_isekai_terminal_core_fn_func_terminal_commit_text_bytes(`tex
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_ctrl_byte(`codePoint`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(`key`: RustBuffer.ByValue,`applicationCursorMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(`key`: RustBuffer.ByValue,`applicationCursorMode`: Byte,`modifiers`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_unicode_char_bytes(`unicodeChar`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1215,7 +1215,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte() != 39410) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 46056) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 25965) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes() != 52901) {
@@ -4849,6 +4849,61 @@ public object FfiConverterTypeTerminalFrameBatch: FfiConverterRustBuffer<Termina
 
 
 /**
+ * xterm互換の修飾キー状態。`terminal_special_key_bytes`へ渡し、矢印・Home/End・
+ * PageUp/Down・F1〜F12のシーケンスに修飾子パラメータを付与するために使う
+ * (Ctrl+矢印でreadline/tmuxのワード単位移動等を機能させるため、`TERM=xterm-256color`
+ * が広告する修飾子付きシーケンスをこちら側でも生成する必要がある)。
+ * 全フィールドfalse(修飾なし)は`Default`で表す。
+ */
+data class TerminalKeyModifiers (
+    var `shift`: kotlin.Boolean
+    , 
+    var `alt`: kotlin.Boolean
+    , 
+    var `ctrl`: kotlin.Boolean
+    , 
+    var `meta`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTerminalKeyModifiers: FfiConverterRustBuffer<TerminalKeyModifiers> {
+    override fun read(buf: ByteBuffer): TerminalKeyModifiers {
+        return TerminalKeyModifiers(
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: TerminalKeyModifiers) = (
+            FfiConverterBoolean.allocationSize(value.`shift`) +
+            FfiConverterBoolean.allocationSize(value.`alt`) +
+            FfiConverterBoolean.allocationSize(value.`ctrl`) +
+            FfiConverterBoolean.allocationSize(value.`meta`)
+    )
+
+    override fun write(value: TerminalKeyModifiers, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`shift`, buf)
+            FfiConverterBoolean.write(value.`alt`, buf)
+            FfiConverterBoolean.write(value.`ctrl`, buf)
+            FfiConverterBoolean.write(value.`meta`, buf)
+    }
+}
+
+
+
+/**
  * OSC 52テキストクリップボード(`ClipboardMime::TextPlain`のみ)とtmux迂回チャンネル
  * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M、`isekai_protocol::ClipboardMime`全種)の両方が
  * 運べるmime種別。`isekai_protocol::ClipboardMime`をUniFFI境界越しにそのまま公開できない
@@ -5100,9 +5155,9 @@ public object FfiConverterTypeConnectionPublicState : FfiConverterRustBuffer<Con
  * DECSCUSR(`CSI Ps SP q`)が選択するカーソル形状。`Terminal`が状態として保持し
  * (rust-ssot: Kotlin/Swift側にミラー状態を作らず、この値をそのまま描画に使う)、
  * `ScreenUpdate::cursor_shape`として公開する。点滅の有無は別フィールド
- * (`ScreenUpdate::cursor_blink`)で表現する——将来のDECSET `?12`(タスク#55、
- * 点滅on/offのみを切り替えるレガシー制御)がDECSCUSRとは独立に同じ
- * `cursor_blink`フィールドを更新できるよう、形状と点滅を分離してある。
+ * (`ScreenUpdate::cursor_blink`)で表現する——DECSET/DECRST `?12`(`CSI ?12h`/
+ * `CSI ?12l`、点滅on/offのみを切り替えるレガシー制御、タスク#55)がDECSCUSRとは
+ * 独立に同じ`cursor_blink`フィールドを更新できるよう、形状と点滅を分離してある。
  */
 
 enum class CursorShape {
@@ -7093,15 +7148,29 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
 
         /**
          * 特殊キーを、ターミナルへ送信するバイト列(ANSI/xtermエスケープシーケンス)に
-         * 変換する。矢印キーは`application_cursor_mode`が有効ならSS3形式(`ESC O A`等、
-         * DECCKM)、無効ならCSI形式(`ESC[A`等)を返す。F1〜F4はSS3形式、F5〜F12は
-         * CSI `~`形式(xterm互換)。未対応のfunction key番号は空配列を返す。
-         */ fun `terminalSpecialKeyBytes`(`key`: TerminalSpecialKey, `applicationCursorMode`: kotlin.Boolean): kotlin.ByteArray {
+         * 変換する。
+         *
+         * - 矢印キーは、修飾子が一切無い場合のみ`application_cursor_mode`(DECCKM)に従い
+         * SS3形式(`ESC O A`等)/CSI形式(`ESC[A`等)を切り替える。**修飾子が1つでも
+         * 付いている場合はDECCKMの値に関わらず常にCSI形式**(`ESC[1;5A`等、xterm互換)
+         * になる(DECCKMはSS3/CSIの切替のみを制御し、修飾子パラメータ付きシーケンスは
+         * 元々CSI形式でしか表現できないため)。
+         * - Home/End/PageUp/PageDownも同様に、修飾子が無ければ従来通りの無パラメータ形式
+         * (`ESC[H`/`ESC[5~`等)、修飾子があればパラメータ付き(`ESC[1;5H`/`ESC[5;5~`等)。
+         * - F1〜F4は修飾子が無ければSS3形式(`ESC O P`等)だが、修飾子が付くと
+         * SS3では修飾子パラメータを表現できないため**CSI形式に切り替わる**
+         * (`ESC[1;5P`等)。F5〜F12はどちらの場合もCSI `~`形式(修飾子有りなら
+         * `ESC[15;5~`等)。未対応のfunction key番号は空配列を返す。
+         * - Tabは修飾子無しなら`0x09`だが、Shift単独の場合はCBT(Cursor Backward Tab、
+         * `ESC[Z`)を返す(readline/tmux等の「戻りタブ補完」に必要。xterm互換で
+         * パラメータは付かない)。Shift以外の修飾子(Ctrl+Tab等)はターミナル制御
+         * シーケンスとして標準化されていないため無視し、無修飾のTabとして扱う。
+         */ fun `terminalSpecialKeyBytes`(`key`: TerminalSpecialKey, `applicationCursorMode`: kotlin.Boolean, `modifiers`: TerminalKeyModifiers): kotlin.ByteArray {
             return FfiConverterByteArray.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(
     
-        FfiConverterTypeTerminalSpecialKey.lower(`key`),FfiConverterBoolean.lower(`applicationCursorMode`),_status)
+        FfiConverterTypeTerminalSpecialKey.lower(`key`),FfiConverterBoolean.lower(`applicationCursorMode`),FfiConverterTypeTerminalKeyModifiers.lower(`modifiers`),_status)
 }
     )
     }
