@@ -314,10 +314,8 @@ pub(crate) async fn session_event_loop(
                     Some(state.on_stdout(bytes))
                 }
                 Some(TransportEvent::Resized { cols, rows }) => {
-                    info!("session: terminal resize {}x{}, scrollback cleared", cols, rows);
-                    state.reset_for_resize(cols as usize, rows as usize);
-                    scrollback.lock().clear();
-                    None
+                    info!("session: terminal resize {}x{}", cols, rows);
+                    Some(state.resize(cols as usize, rows as usize))
                 }
                 Some(TransportEvent::ForwardStateChanged { id, state }) => {
                     callback.on_forward_state_changed(id, state); None
