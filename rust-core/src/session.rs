@@ -38,7 +38,12 @@ fn make_screen_update(t: &Terminal) -> ScreenUpdate {
         rows: t.rows() as u32,
         cells: t.screen_cells().iter().map(to_cell_data).collect(),
         cursor_row: t.cursor_row() as u32,
-        cursor_col: t.cursor_col() as u32,
+        // `Terminal::cursor_col()`は遅延折り返し(delayed wrap)状態を`cols`
+        // (範囲外)で表す内部表現をそのまま返す(`terminal.rs`のCPR/EL/ED実装
+        // 参照)。UniFFI越しにAndroid/iOSへ渡す`ScreenUpdate.cursor_col`は
+        // 常に`0..cols`の描画可能な列を指すべきなので、可視上の最終列
+        // (`cols - 1`)にクランプしてから公開する(Fableレビュー: タスク#56)。
+        cursor_col: t.cursor_col().min(t.cols().saturating_sub(1)) as u32,
         title: t.title().map(str::to_owned),
         application_cursor_mode: t.application_cursor_mode(),
         bracketed_paste_mode: t.bracketed_paste_mode(),
@@ -695,6 +700,21 @@ mod tests {
 
     fn row(label: char, len: usize) -> Vec<TermCell> {
         vec![cell(label); len]
+    }
+
+    #[test]
+    fn make_screen_update_clamps_cursor_col_during_delayed_wrap() {
+        // `Terminal::cursor_col()`は遅延折り返し(delayed wrap)中`cols`(範囲外)を
+        // 返しうる内部表現をそのまま公開する。`ScreenUpdate.cursor_col`はUIが
+        // 直接セルインデックスとして使う描画可能な列であるべきなので、UniFFI境界を
+        // 越える前にここでクランプする(タスク#56)。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        let mut p = vte::Parser::new();
+        for &b in b"0123456789" { p.advance(&mut t, b); } // ちょうど10文字でwrap-pending
+        assert_eq!(t.cursor_col(), 10, "precondition: terminal is in delayed-wrap state");
+
+        let upd = make_screen_update(&t);
+        assert_eq!(upd.cursor_col, 9, "ScreenUpdate.cursor_col must be clamped to the last visible column");
     }
 
     fn core_with_scrollback(cols: u32, rows_by_index: Vec<Vec<TermCell>>) -> SessionCore {
