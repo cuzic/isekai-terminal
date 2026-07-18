@@ -188,6 +188,73 @@ final class TerminalScreenViewTests: XCTestCase {
         _ = renderer.image { _ in view.draw(view.bounds) }
     }
 
+    // MARK: - タスク#67: 検索バーの現在マッチハイライト(searchHighlight)
+
+    /// `scrollOffset`が`searchHighlight.row`と一致する間はクラッシュせず描画できることの
+    /// スモークテスト(実際のピクセル出力の目視確認は対象外、他の`testDraw*DoesNotCrash`と
+    /// 同じ方針)。`col + len`が`cols`を超える(はみ出す)マッチでもクランプされ、
+    /// はみ出し自体はクラッシュしないことも合わせて確認する。
+    func testDrawWithSearchHighlightMatchingScrollOffsetDoesNotCrash() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let cols = 4
+        let rows = 2
+        let cells = (0..<(cols * rows)).map { i in
+            CellData(
+                ch: i % 2 == 0 ? "A" : " ", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
+                dim: false, italic: false, underline: false,
+                strikethrough: false, blink: false, invisible: false, linkId: nil
+            )
+        }
+        let update = ScreenUpdate(
+            cols: UInt32(cols), rows: UInt32(rows), cells: cells,
+            cursorRow: 0, cursorCol: 1,
+            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
+            cursorVisible: true, bellGeneration: 0,
+            cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
+        )
+        view.apply(update)
+        view.onScrollbackLenRequest = { 10 }
+        view.onScrollbackRequest = { _, _ in cells }
+        view.scrollOffset = 3
+        // colsを超えてはみ出すマッチ(col + len > cols)——クランプされるだけでクラッシュしない
+        // ことを確認する。
+        view.searchHighlight = ScrollbackSearchMatch(row: 3, col: UInt32(cols - 1), len: 10)
+
+        view.layoutIfNeeded()
+        let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
+        _ = renderer.image { _ in view.draw(view.bounds) }
+    }
+
+    /// `scrollOffset`が`searchHighlight.row`と一致していない間(ジャンプ直後で
+    /// まだ`scrollOffset`が届いていない・ライブ画面表示中等)はハイライトを描かない
+    /// ガード自体がクラッシュしないことの確認。
+    func testDrawWithSearchHighlightNotMatchingScrollOffsetDoesNotCrash() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let cells = (0..<(4 * 2)).map { i in
+            CellData(
+                ch: i % 2 == 0 ? "A" : " ", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
+                dim: false, italic: false, underline: false,
+                strikethrough: false, blink: false, invisible: false, linkId: nil
+            )
+        }
+        let update = ScreenUpdate(
+            cols: 4, rows: 2, cells: cells,
+            cursorRow: 0, cursorCol: 1,
+            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
+            cursorVisible: true, bellGeneration: 0,
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+        )
+        view.apply(update)
+        // scrollOffsetは既定の0(ライブ)のまま、row=5のマッチを持たせる(不一致)。
+        view.searchHighlight = ScrollbackSearchMatch(row: 5, col: 0, len: 1)
+
+        view.layoutIfNeeded()
+        let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
+        _ = renderer.image { _ in view.draw(view.bounds) }
+    }
+
     // MARK: - Phase 1F-2(#49): clampedFontScale
     //
     // `CGFloat`を使うため`IsekaiTerminalCoreLogic`(Linuxでも`swift test`可能な純ロジック層)には

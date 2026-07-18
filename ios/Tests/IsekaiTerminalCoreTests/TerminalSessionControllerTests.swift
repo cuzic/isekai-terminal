@@ -719,4 +719,16 @@ final class TerminalSessionControllerTests: XCTestCase {
             await controller.uiState.lastFiredBellGeneration == 0
         }
     }
+
+    // MARK: - タスク#67: スクロールバック検索(search_scrollback)
+
+    /// マッチ計算そのものは`SessionCore::search_scrollback`(Rust、#37)側で既にテスト済み
+    /// (`session.rs`の`search_scrollback_*`群)。ここでは`TerminalSessionController
+    /// .searchScrollback`がその呼び出しを中継しているだけであること(セッション未確立時に
+    /// クラッシュせず空配列を返すこと)を確認する——`scrollbackCells`/`scrollbackLen`と
+    /// 同じ「未接続ガード」の契約。
+    func testSearchScrollbackReturnsEmptyBeforeConnecting() throws {
+        let (controller, _) = try makeController()
+        XCTAssertEqual(controller.searchScrollback(query: "abc", caseSensitive: false), [])
+    }
 }

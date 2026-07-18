@@ -119,6 +119,16 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     /// 選択範囲が変化する度に呼ばれる(SwiftUI側のフローティングツールバー表示に使う)。
     public var onSelectionChanged: ((SelectionRange?) -> Void)?
 
+    /// タスク#67: 検索バーで現在選択中のマッチ位置(`SessionCore::search_scrollback`、
+    /// #37が返した`ScrollbackSearchMatch`をそのまま保持するだけ——マッチ計算自体は
+    /// 一切行わない、rust-ssot)。非nilかつ`scrollOffset`がその`row`と一致している間
+    /// だけ`draw(_:)`でハイライトを描く(SwiftUI側`TerminalView`が検索バーの開閉・
+    /// クエリ・「今何件目を見ているか」を保持し、ジャンプ時に`scrollOffset`を
+    /// `match.row`へ合わせる設計、`TerminalView.swift`参照)。
+    public var searchHighlight: ScrollbackSearchMatch? {
+        didSet { setNeedsDisplay() }
+    }
+
     /// Phase 1F-2(#49): フォントサイズの拡縮率(Android版`fontScale`、0.5〜3.0に
     /// クランプ、既定1.0)。SwiftUI側で`UserDefaults`(キー`"font_scale"`、Android版
     /// `SharedPreferences`の`"font_scale"`キーと対称)へ永続化する。
@@ -580,6 +590,29 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
                     let y = CGFloat(row) * cellHeight
                     UIRectFill(CGRect(x: 0, y: y, width: CGFloat(cols) * cellWidth, height: cellHeight))
                 }
+            }
+        }
+
+        // タスク#67: 検索バーの現在マッチのハイライト。`ScrollbackSearchMatch.row`は
+        // `scrollback_cells`と同じ規約("offset"がそのまま`row`)なので、`scrollOffset`が
+        // その値と一致する場合に限り、その行は`computeDisplayUpdate()`が返す表示グリッド
+        // の最終行(row = rows - 1)に現れる(`scrollback_cells`の`sb_idx = offset +
+        // (rows-1-r)`で`r = rows-1`のとき`sb_idx == offset`になることから導ける、
+        // `session.rs`の`scrollback_cells_orders_oldest_to_newest_top_to_bottom`テスト
+        // 参照)。`scrollOffset`がまだ追従していない(ジャンプ直後の再描画が来る前)・
+        // ライブ画面表示中(`scrollOffset == 0`)は描画しない。マッチの位置計算は
+        // 一切ここでは行わず、Rust側`search_scrollback`が返した座標をそのまま
+        // 描くだけ(rust-ssot)。
+        if let searchHighlight, scrollOffset == searchHighlight.row {
+            let highlightRow = rows - 1
+            let startCol = min(Int(searchHighlight.col), cols)
+            let endCol = min(startCol + Int(searchHighlight.len), cols)
+            if startCol < endCol {
+                UIColor.systemYellow.withAlphaComponent(0.55).setFill()
+                let y = CGFloat(highlightRow) * cellHeight
+                let x = CGFloat(startCol) * cellWidth
+                let width = CGFloat(endCol - startCol) * cellWidth
+                UIRectFill(CGRect(x: x, y: y, width: width, height: cellHeight))
             }
         }
 
