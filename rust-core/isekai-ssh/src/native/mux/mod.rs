@@ -144,7 +144,14 @@ async fn run_as_client<C>(prepared: Prepared, channel_name: &str, token_path: &P
 where
     C: ExclusiveChannel + Send + 'static,
 {
-    let token = read_owner_token(token_path).context("isekai-ssh: could not read the mux owner's auth token")?;
+    let token = match read_owner_token_or_fall_back(token_path) {
+        ClientToken::Ready(token) => token,
+        // The owner released its claim (or hadn't finished writing the token
+        // file) in the race between our failed claim and now. A mux hiccup must
+        // never block connecting (the always-connects principle) — dial SSH
+        // ourselves, unmultiplexed, exactly as the mid-handshake case below.
+        ClientToken::FallBack => return connect::run_prepared(prepared, None).await,
+    };
     match C::connect(channel_name).await {
         Ok(conn) => client::run(conn, &token).await,
         Err(ConnectError::NotFound { .. }) => {
@@ -177,6 +184,31 @@ fn write_owner_token(path: &Path) -> Result<Vec<u8>> {
             .with_context(|| format!("restricting permissions on mux token file {}", path.display()))?;
     }
     Ok(token)
+}
+
+/// Whether a would-be client obtained the owner's token, or must fall back to a
+/// plain single-process connect.
+enum ClientToken {
+    /// The token was read — connect to the owner and relay to it.
+    Ready(Vec<u8>),
+    /// The token couldn't be read (the owner released its claim, or hadn't
+    /// finished writing the token file, in the claim race). Per the
+    /// always-connects principle a mux hiccup must never block connecting, so
+    /// the caller connects directly (unmultiplexed) instead of failing.
+    FallBack,
+}
+
+/// Reads the owner's token, degrading to [`ClientToken::FallBack`] (logging the
+/// cause) rather than erroring when it can't be read — so a lost/racing owner
+/// never turns a would-be client into a hard connect failure.
+fn read_owner_token_or_fall_back(path: &Path) -> ClientToken {
+    match read_owner_token(path) {
+        Ok(token) => ClientToken::Ready(token),
+        Err(e) => {
+            log_line!("isekai-ssh: could not read the mux owner's auth token ({e:#}); connecting directly");
+            ClientToken::FallBack
+        }
+    }
 }
 
 /// Reads the owner's token, retrying briefly to cover the small window where a
@@ -291,7 +323,7 @@ mod tests {
         assert!(matches!(InMemoryChannel::try_claim(name).await, Err(ClaimError::AlreadyClaimed { .. })));
 
         let conn = InMemoryChannel::connect(name).await.unwrap();
-        let (mut cr, mut cw) = tokio::io::split(conn);
+        let (cr, mut cw) = tokio::io::split(conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         // Drive the real client relay: it sends Hello, streams "hello\n" then
@@ -300,7 +332,7 @@ mod tests {
         // session deterministically after echoing.
         // `super::client` (the mux client module), not `russh::client` which
         // is imported as `client` above for `client::Handle`.
-        let outcome = super::client::run_inner(&mut cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr)
+        let outcome = super::client::run_inner(cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr)
             .await
             .unwrap();
 
@@ -315,6 +347,33 @@ mod tests {
             "the client's stdin must be echoed back through the remote shell, saw {:?}",
             String::from_utf8_lossy(&stdout)
         );
+    }
+
+    /// A missing owner token (the owner released its claim / hadn't written the
+    /// file in the claim race) must degrade to a fall-back single-process
+    /// connect, not a hard error — the always-connects principle for a mux
+    /// hiccup. Guards `run_as_client`'s token-read step.
+    #[test]
+    fn a_missing_owner_token_falls_back_instead_of_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such.token");
+        assert!(
+            matches!(read_owner_token_or_fall_back(&missing), ClientToken::FallBack),
+            "a token that can't be read must fall back to a direct connect, never fail"
+        );
+    }
+
+    /// The happy path still yields the real token so a client relays to the
+    /// owner rather than needlessly falling back.
+    #[test]
+    fn a_present_owner_token_is_used_rather_than_falling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mux.token");
+        let written = write_owner_token(&path).unwrap();
+        match read_owner_token_or_fall_back(&path) {
+            ClientToken::Ready(token) => assert_eq!(token, written, "the token used must be the one on disk"),
+            ClientToken::FallBack => panic!("a readable token must be used, not fall back to a direct connect"),
+        }
     }
 
     #[test]
