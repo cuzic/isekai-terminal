@@ -24,6 +24,7 @@ import uniffi.isekai_terminal_core.CellData
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.ImagePlacement
 import uniffi.isekai_terminal_core.ScreenUpdate
+import uniffi.isekai_terminal_core.ScrollbackSearchMatch
 
 /**
  * 1行内で背景色が [themeBgArgb](既定背景)以外の値で連続しているセル区間。
@@ -60,6 +61,29 @@ internal fun computeCursorRect(cx: Float, cy: Float, cellW: Float, cellH: Float,
             CursorRect(cx, cy, cx + thickness, cy + cellH)
         }
     }
+
+/**
+ * タスク#66: 検索バーの現在マッチ([match])の描画矩形をピュアに計算する。呼び出し元
+ * ([SshTerminalCanvas])は`scrollOffset`が`match.row`と一致する場合にのみ[match]を渡す
+ * (=表示中のscrollback合成画面の最終行(`row = rows - 1`)に必ず現れる、`scrollbackCells`
+ * の`sb_idx = offset + (rows-1-r)`で`r = rows-1`のとき`sb_idx == offset`になることから
+ * 導ける、`session.rs`の`scrollback_cells_orders_oldest_to_newest_top_to_bottom`テスト参照)
+ * ため、この関数自体は行位置の判断を行わず矩形計算のみを担う。
+ *
+ * `match.col`/`match.len`は呼び出し時点のscrollbackスナップショットに基づく値([rows]/[cols]
+ * が変化した後の古いマッチ等)であり得るため、`[0, cols]`へクランプする(iOS版
+ * `TerminalScreenView.swift`の`min(...)`クランプと対称)。クランプ後に幅が0以下になる
+ * (=マッチが完全に画面外にはみ出している)場合は`null`を返し、呼び出し元は描画を
+ * スキップしてよい。
+ */
+internal fun computeSearchHighlightRect(match: ScrollbackSearchMatch, rows: Int, cols: Int, cellW: Float, cellH: Float): CursorRect? {
+    val highlightRow = rows - 1
+    val startCol = match.col.toInt().coerceIn(0, cols)
+    val endCol = (startCol + match.len.toInt()).coerceIn(startCol, cols)
+    if (startCol >= endCol) return null
+    val y = highlightRow * cellH
+    return CursorRect(startCol * cellW, y, endCol * cellW, y + cellH)
+}
 
 /**
  * SGR 2(dim)セルの前景色。色そのものを別値へ再計算するのではなく、ARGB の alpha
@@ -248,6 +272,12 @@ internal class SixelBitmapCache {
 fun SshTerminalCanvas(
     update: ScreenUpdate,
     selection: SelectionRange? = null,
+    // タスク#66: 検索バーで現在選択中のマッチ位置(`SessionCore::search_scrollback`、
+    // #37が返した`ScrollbackSearchMatch`をそのまま受け取るだけ——マッチ計算自体は
+    // 一切行わない、rust-ssot)。呼び出し元([TerminalScreen.kt])が`scrollOffset`と
+    // マッチの`row`が一致している間だけ非nullを渡す設計(iOS版
+    // `TerminalScreenRepresentable.searchHighlight`と対称)。
+    searchHighlight: ScrollbackSearchMatch? = null,
     theme: TerminalTheme = TerminalThemes.DEFAULT_DARK,
     // カスタムフォント([TerminalFontSettings])。未指定時は既定の [Typeface.MONOSPACE]。
     typeface: Typeface = Typeface.MONOSPACE,
@@ -267,6 +297,11 @@ fun SshTerminalCanvas(
     val cursorPaint = remember { Paint() }
     val selectionPaint = remember {
         Paint().apply { color = android.graphics.Color.argb(120, 255, 255, 255) }
+    }
+    // タスク#66: 検索マッチのハイライト(黄系、選択範囲の白系と混同しないよう別色にする。
+    // iOS版`TerminalScreenView.swift`の`UIColor.systemYellow.withAlphaComponent(0.55)`と対称)。
+    val searchHighlightPaint = remember {
+        Paint().apply { color = android.graphics.Color.argb(140, 255, 213, 0) }
     }
     val fontFit = remember { FontFitCache() }
     val gridCache = remember { GridRenderCache() }
@@ -464,6 +499,17 @@ fun SshTerminalCanvas(
                     val y = row * cellH
                     nCanvas.drawRect(0f, y, size.width, y + cellH, selectionPaint)
                 }
+            }
+        }
+
+        // タスク#66: 検索バーの現在マッチのハイライト。呼び出し元(`TerminalScreen.kt`)は
+        // `scrollOffset`が`searchHighlight.row`と一致するときだけこの値を渡す(rust-ssot:
+        // マッチの位置計算自体は一切ここでは行わず、Rust側が返した座標をそのまま描くだけ)。
+        // 矩形計算は[computeSearchHighlightRect]にピュア関数として抽出済み。
+        searchHighlight?.let { match ->
+            computeSearchHighlightRect(match, rows, cols, cellW, cellH)?.let { rect ->
+                val nCanvas = drawContext.canvas.nativeCanvas
+                nCanvas.drawRect(rect.left, rect.top, rect.right, rect.bottom, searchHighlightPaint)
             }
         }
     }

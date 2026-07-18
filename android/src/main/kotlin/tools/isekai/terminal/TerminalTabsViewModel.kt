@@ -40,6 +40,7 @@ import uniffi.isekai_terminal_core.CellData
 import uniffi.isekai_terminal_core.ClipboardMimeKind
 import uniffi.isekai_terminal_core.ClipboardPayload
 import uniffi.isekai_terminal_core.PlatformFd
+import uniffi.isekai_terminal_core.ScrollbackSearchMatch
 
 /**
  * 複数タブ（複数 SSH/QUIC セッション）を横断する Application スコープの状態管理。
@@ -729,6 +730,12 @@ class TerminalTabsViewModel(
 
     fun scrollbackCellsForPane(address: PaneAddress, offset: Int, rows: Int): List<CellData>? =
         withPane(address) { it.session.scrollbackCells(offset, rows) }
+
+    /** タスク#66: スクロールバック検索。対象ペインが無ければ(withPaneがnullを返す
+     *  場合)空リストを返す——[TerminalSession.searchScrollback]自体の「未接続時は空
+     *  リスト」という契約と揃える。 */
+    fun searchScrollbackForPane(address: PaneAddress, query: String, caseSensitive: Boolean): List<ScrollbackSearchMatch> =
+        withPane(address) { it.session.searchScrollback(query, caseSensitive) } ?: emptyList()
 
     fun trustUpdatedHostKeyForPane(address: PaneAddress) = withPane(address) { it.session.trustUpdatedHostKey() }
 

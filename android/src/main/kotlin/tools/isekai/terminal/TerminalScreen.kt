@@ -30,6 +30,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
@@ -82,6 +84,9 @@ data class TerminalScreenActions(
     val onSend: (ByteArray) -> Unit,
     val onResize: (UInt, UInt) -> Unit,
     val onScrollbackCells: (Int, Int) -> List<CellData>?,
+    /** タスク#66: スクロールバック検索。マッチ計算は一切Kotlin側で行わず、Rust側
+     *  `SessionCore::search_scrollback`(#37)の結果をそのまま返すだけ(rust-ssot)。 */
+    val onSearchScrollback: (String, Boolean) -> List<ScrollbackSearchMatch> = { _, _ -> emptyList() },
     val onTrustUpdatedHostKey: () -> Unit,
     val onDismissHostKeyWarning: () -> Unit,
     val onTrustNewHostKey: () -> Unit,
@@ -107,6 +112,22 @@ data class TerminalScreenActions(
      *  Rust側が持つため、ここでは生の値を渡すだけでよい。 */
     val onFocusChanged: (Boolean) -> Unit = {},
 )
+
+/**
+ * タスク#66: 検索バーの現在マッチ([match])のうち、実際に[scrollOffset]の位置へ
+ * ハイライトとして描画してよいものだけを返すピュア関数。
+ *
+ * `ScrollbackSearchMatch.row`は`scrollbackCells`と同じ規約("offset"がそのまま`row`)なので、
+ * `scrollOffset`がその値と一致している間だけ実際に画面へ表示される。ただし`row == 0u`
+ * (scrollback最新行)は`jumpToCurrentSearchMatch`(呼び出し元[TerminalScreenBody])の
+ * ドキュメント通りこの`scrollOffset`の仕組み経由では原理的に到達不能で、
+ * `scrollOffset == 0`は常に「ライブ画面表示」を指す既存規約([synthesizeDisplayUpdate])と
+ * 衝突するため明示的に除外する(codexレビュー指摘: これを除外しないとライブ画面表示中
+ * [scrollOffset == 0]にrow=0のマッチが誤ってハイライトされてしまう。iOS版
+ * `TerminalView.swift`の`currentSearchMatch.flatMap { $0.row == 0 ? nil : $0 }`と対称)。
+ */
+internal fun searchHighlightMatch(match: ScrollbackSearchMatch?, scrollOffset: Int): ScrollbackSearchMatch? =
+    match?.takeIf { it.row != 0u && scrollOffset == it.row.toInt() }
 
 /**
  * ターミナル画面の本体。複数タブ UI の `TerminalTabScreen`、および画面分割(split pane)時の
@@ -164,6 +185,74 @@ fun TerminalScreenBody(
     var selection by remember { mutableStateOf<SelectionRange?>(null) }
     var showSnippetSheet by remember { mutableStateOf(false) }
     var showKeySequenceSheet by remember { mutableStateOf(false) }
+    // タスク#66: スクロールバック検索バーの開閉・クエリ・大小文字区別・マッチ結果一覧・
+    // 「今何件目を見ているか」。いずれも「UI表示だけに閉じた状態」(rust-ssot.mdの例外、
+    // scrollOffset/selectionと同じ扱い)であり、マッチの計算自体(部分一致検索・combining
+    // character境界・大小文字無視)は一切ここでは行わず、actions.onSearchScrollback経由で
+    // Rust側search_scrollback(#37)に全面委譲する。iOS版`TerminalView.swift`の
+    // `showSearchBar`等と対称(タスク#67)。
+    var showSearchBar by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+    var searchCaseSensitive by remember { mutableStateOf(false) }
+    var searchMatches by remember { mutableStateOf<List<ScrollbackSearchMatch>>(emptyList()) }
+    var currentSearchMatchIndex by remember { mutableIntStateOf(0) }
+
+    /** `searchMatches`を`actions.onSearchScrollback`で最新化する。`ScrollbackSearchMatch.row`は
+     *  「呼び出し時点のスナップショットに対してのみ有効」で長期キャッシュしない運用を前提
+     *  とするドキュメント([ScrollbackSearchMatch]、Fableレビュー2次指摘(b)、iOS版
+     *  `TerminalView.swift`の`refreshMatches()`と対称)のため、ジャンプ操作(次/前)の
+     *  たびに必ず再検索してから移動する。空クエリの場合は呼び出し自体を省く。 */
+    val refreshSearchMatches: () -> Boolean = refresh@{
+        if (searchQuery.isEmpty()) {
+            searchMatches = emptyList()
+            currentSearchMatchIndex = 0
+            return@refresh false
+        }
+        searchMatches = actions.onSearchScrollback(searchQuery, searchCaseSensitive)
+        if (currentSearchMatchIndex !in searchMatches.indices) currentSearchMatchIndex = 0
+        searchMatches.isNotEmpty()
+    }
+    // `scrollOffset`を現在のマッチの`row`へ合わせ、そのマッチが画面に映るようにする。
+    //
+    // 既知の境界(iOS版タスク#67実装時にcodexレビューで指摘済みの制約をそのまま踏襲):
+    // scrollback最新行(`row == 0u`)は、`scrollOffset == 0`が「ライブ画面表示」を兼ねる
+    // 既存の規約([synthesizeDisplayUpdate])と衝突するため、この`scrollOffset`の
+    // 仕組み経由では原理的に表示不可能(`scrollbackCells`の`sb_idx = offset + (rows-1-r)`は
+    // どの`offset >= 1`を選んでも最小値が`offset`自体になり、`sb_idx == 0`には到達できない
+    // ——`offset == 0`は既存規約でライブ表示に横取りされる)。この場合`scrollOffset`は
+    // 変更せず、ハイライトも描かない(下の`searchHighlight`計算で`row == 0u`を除外する)。
+    // 件数表示(n/m)自体はこのマッチを含めたまま数える。
+    val jumpToCurrentSearchMatch: () -> Unit = {
+        searchMatches.getOrNull(currentSearchMatchIndex)?.let { match ->
+            if (match.row != 0u) scrollOffset = match.row.toInt()
+        }
+    }
+    val runSearch: () -> Unit = {
+        currentSearchMatchIndex = 0
+        if (refreshSearchMatches()) jumpToCurrentSearchMatch()
+    }
+    val goToNextSearchMatch: () -> Unit = {
+        if (refreshSearchMatches()) {
+            currentSearchMatchIndex = (currentSearchMatchIndex + 1) % searchMatches.size
+            jumpToCurrentSearchMatch()
+        }
+    }
+    val goToPreviousSearchMatch: () -> Unit = {
+        if (refreshSearchMatches()) {
+            currentSearchMatchIndex = (currentSearchMatchIndex - 1 + searchMatches.size) % searchMatches.size
+            jumpToCurrentSearchMatch()
+        }
+    }
+    // 検索バーを閉じる。「ライブへ戻る」ボタンとは独立に扱う(検索結果を見ながら手動で
+    // スクロールしている場合、バーを閉じただけでライブへ戻す挙動は驚きが大きいため
+    // scrollOffset自体は変更しない——iOS版`closeSearchBar()`と対称)。
+    val closeSearchBar: () -> Unit = {
+        showSearchBar = false
+        searchQuery = ""
+        searchCaseSensitive = false
+        searchMatches = emptyList()
+        currentSearchMatchIndex = 0
+    }
     // Canvas のタップジェスチャーから IME フォーカスを要求するために、
     // 入力用 AndroidView への参照をここで保持する（入力欄自体は下部に描画）。
     var inputView by remember { mutableStateOf<tools.isekai.terminal.input.TerminalInputView?>(null) }
@@ -459,10 +548,19 @@ fun TerminalScreenBody(
                 // (選択範囲・スクロール位置と同じ扱い。rust-ssot原則の対象外)。
                 var pendingHyperlinkUrl by remember { mutableStateOf<String?>(null) }
 
+                // タスク#66: 検索バーの現在マッチのハイライト。行位置の判断自体は
+                // [searchHighlightMatch]にピュア関数として抽出済み(このComposable本体は
+                // 現在マッチと現在のscrollOffsetをそのまま渡すだけ)。マッチの位置計算
+                // (col/len)は一切ここでは行わず、Rust側`search_scrollback`が返した座標を
+                // そのまま`SshTerminalCanvas`へ渡すだけ(rust-ssot)。
+                val currentSearchMatch = searchMatches.getOrNull(currentSearchMatchIndex)
+                val searchHighlight = searchHighlightMatch(currentSearchMatch, scrollOffset)
+
                 Box(modifier = Modifier.fillMaxSize()) {
                     SshTerminalCanvas(
                         update = displayUpdate,
                         selection = selection,
+                        searchHighlight = searchHighlight,
                         theme = terminalTheme,
                         typeface = terminalTypeface,
                         modifier = Modifier
@@ -671,6 +769,24 @@ fun TerminalScreenBody(
                         )
                     }
 
+                    // タスク#66: スクロールバック検索バー。開いている間は常に画面上部に表示する
+                    // (選択ツールバーと同じ`Alignment.TopCenter`だが、選択中と検索中が同時に
+                    // 起きることは操作上想定していないため重なりは考慮していない)。
+                    if (showSearchBar) {
+                        ScrollbackSearchBar(
+                            query = searchQuery,
+                            onQueryChange = { searchQuery = it; runSearch() },
+                            caseSensitive = searchCaseSensitive,
+                            onToggleCaseSensitive = { searchCaseSensitive = !searchCaseSensitive; runSearch() },
+                            matchCount = searchMatches.size,
+                            currentIndex = currentSearchMatchIndex,
+                            onPrevious = goToPreviousSearchMatch,
+                            onNext = goToNextSearchMatch,
+                            onClose = closeSearchBar,
+                            modifier = Modifier.align(Alignment.TopCenter),
+                        )
+                    }
+
                     // "Back to live" indicator when scrolled up
                     if (scrollOffset > 0) {
                         Button(
@@ -793,6 +909,8 @@ fun TerminalScreenBody(
                     CtrlBtn("貼付", onClick = performPaste)
                     CtrlBtn("定型") { showSnippetSheet = true }
                     CtrlBtn("打鍵") { showKeySequenceSheet = true }
+                    // タスク#66: スクロールバック検索バーを開く。
+                    CtrlBtn("検索") { showSearchBar = true }
                 }
 
                 // F1〜F12 行（横スクロール、Ctrl キー行を圧迫しないよう別行にする）
@@ -963,6 +1081,65 @@ private fun SelectionToolbar(onCopy: () -> Unit, onCancel: () -> Unit, modifier:
     ) {
         TextButton(onClick = onCopy) { Text("コピー", color = Color.Cyan, fontSize = 12.sp) }
         TextButton(onClick = onCancel) { Text("キャンセル", color = Color.Gray, fontSize = 12.sp) }
+    }
+}
+
+/**
+ * タスク#66: スクロールバック検索バー。クエリ入力・大小文字区別トグル・前後マッチへの
+ * ジャンプ・件数表示・閉じるボタンをまとめる。マッチの計算(部分一致・combining character
+ * 境界・大小文字無視)は一切ここでは行わず、呼び出し元([TerminalScreenBody])が
+ * `actions.onSearchScrollback`(Rust側`search_scrollback`、#37)経由で計算した結果を
+ * そのまま受け取って表示するだけ(rust-ssot)。iOS版`TerminalView.swift`の`searchBar`と対称。
+ */
+@Composable
+private fun ScrollbackSearchBar(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    caseSensitive: Boolean,
+    onToggleCaseSensitive: () -> Unit,
+    matchCount: Int,
+    currentIndex: Int,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val focusRequester = remember { FocusRequester() }
+    // バーが開いた直後にクエリ欄へフォーカスし、ソフトキーボードを自動表示する。
+    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(Color(0xE6000000))
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        TextField(
+            value = query,
+            onValueChange = onQueryChange,
+            modifier = Modifier
+                .weight(1f)
+                .focusRequester(focusRequester),
+            singleLine = true,
+            placeholder = { Text("検索", fontSize = 13.sp) },
+            colors = TextFieldDefaults.colors(
+                focusedContainerColor = Color(0xFF1A1A1A),
+                unfocusedContainerColor = Color(0xFF1A1A1A),
+                focusedTextColor = Color.White,
+                unfocusedTextColor = Color.White,
+            ),
+        )
+        Text(
+            if (matchCount == 0) "0/0" else "${currentIndex + 1}/$matchCount",
+            color = Color.White,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(horizontal = 2.dp),
+        )
+        CtrlBtn("Aa", active = caseSensitive, onClick = onToggleCaseSensitive)
+        CtrlBtn("▲", onClick = onPrevious)
+        CtrlBtn("▼", onClick = onNext)
+        CtrlBtn("✕", onClick = onClose)
     }
 }
 
