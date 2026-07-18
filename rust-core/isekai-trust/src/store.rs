@@ -33,6 +33,9 @@ pub const TRUST_STORE_FILE_NAME: &str = "known_helpers.toml";
 /// [`crate::schema::SshHostKeyTrustStore`]'s docs for why this is kept
 /// separate rather than a new table in the same file.
 pub const SSH_HOST_KEY_TRUST_STORE_FILE_NAME: &str = "known_ssh_hosts.toml";
+/// Lock key (`isekai_fs_guard::with_exclusive_lock`'s `key`, becomes
+/// `<config_dir>/<key>.lock`) for [`with_locked_ssh_host_key_trust_store`].
+const SSH_HOST_KEY_TRUST_STORE_LOCK_KEY: &str = "known_ssh_hosts";
 
 /// `~/.config/isekai-ssh` (XDG Base Directory convention, per
 /// `archive/ISEKAI_SSH_DESIGN.md`). Resolves the home directory via
@@ -86,6 +89,40 @@ pub fn load_ssh_host_key_trust_store(path: &Path) -> Result<SshHostKeyTrustStore
 /// Same save semantics as [`save_trust_store`], for [`SshHostKeyTrustStore`].
 pub fn save_ssh_host_key_trust_store(path: &Path, store: &SshHostKeyTrustStore) -> Result<(), TrustError> {
     save_toml_store(path, store)
+}
+
+/// Runs `f` against the current [`SshHostKeyTrustStore`] at `path` (loading
+/// it fresh first) and, if `f` succeeds, persists whatever `f` left the
+/// store as — all while holding an exclusive cross-process lock scoped to
+/// `path`'s parent directory, so the whole load → decide → save cycle is
+/// atomic across concurrently-running `isekai-ssh` processes (e.g. two tabs
+/// racing to trust the same brand-new host key). Without this, plain
+/// sequential `load_ssh_host_key_trust_store`/`save_ssh_host_key_trust_store`
+/// calls have a TOCTOU window: two processes could both load, both decide
+/// to trust (possibly *different* fingerprints, if a MITM is actively
+/// intercepting one of them), and the later save would silently discard the
+/// other's decision — unacceptable for a TOFU pinning mechanism
+/// specifically (Codex review finding on `isekai-ssh`'s
+/// `FileBackedHostKeyVerifier`).
+///
+/// `f` receives `&mut SshHostKeyTrustStore` to mutate in place (rather than
+/// returning a new store) so partial updates read naturally; returning
+/// `Err` aborts without writing anything back.
+pub fn with_locked_ssh_host_key_trust_store<T>(
+    path: &Path,
+    f: impl FnOnce(&mut SshHostKeyTrustStore) -> Result<T, TrustError>,
+) -> Result<T, TrustError> {
+    let dir = path.parent().ok_or_else(|| TrustError::NoParentDir { path: path.to_path_buf() })?;
+    let outcome = isekai_fs_guard::with_exclusive_lock(dir, SSH_HOST_KEY_TRUST_STORE_LOCK_KEY, || -> Result<T, TrustError> {
+        let mut store = load_toml_store::<SshHostKeyTrustStore>(path)?;
+        let result = f(&mut store)?;
+        save_toml_store(path, &store)?;
+        Ok(result)
+    });
+    match outcome {
+        Ok(inner) => inner,
+        Err(source) => Err(TrustError::Lock { path: path.to_path_buf(), source }),
+    }
 }
 
 /// Generic load shared by [`load_trust_store`]/[`load_ssh_host_key_trust_store`]
@@ -391,5 +428,87 @@ last_seen_at = "2026-07-04T00:00:00Z"
             config_dir.join(TRUST_STORE_FILE_NAME),
             config_dir.join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME)
         );
+    }
+
+    #[test]
+    fn with_locked_store_round_trips_an_insert() {
+        use crate::schema::SshHostKeyTrust;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME);
+
+        with_locked_ssh_host_key_trust_store(&path, |store| {
+            store.insert(
+                "example.com:22".to_string(),
+                SshHostKeyTrust {
+                    fingerprint: "SHA256:abc".to_string(),
+                    trusted_at: "2026-07-17T00:00:00Z".to_string(),
+                    last_seen_at: "2026-07-17T00:00:00Z".to_string(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = load_ssh_host_key_trust_store(&path).unwrap();
+        assert_eq!(loaded.get("example.com:22").unwrap().fingerprint, "SHA256:abc");
+    }
+
+    #[test]
+    fn with_locked_store_does_not_persist_when_f_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME);
+
+        let result: Result<(), TrustError> =
+            with_locked_ssh_host_key_trust_store(&path, |_store| Err(TrustError::EmptyHost));
+        assert!(result.is_err());
+        assert!(!path.exists(), "an aborted update must not create/modify the store file");
+    }
+
+    #[test]
+    fn with_locked_store_serializes_concurrent_writers_without_losing_updates() {
+        // The exact race the Codex review on `isekai-ssh`'s
+        // `FileBackedHostKeyVerifier` caught: N threads each inserting a
+        // *distinct* host key concurrently, with plain sequential
+        // load-then-save, would race and silently drop all but the last
+        // writer's insert. With the lock held across the whole
+        // load→modify→save cycle, every insert must survive.
+        use crate::schema::SshHostKeyTrust;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME));
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    with_locked_ssh_host_key_trust_store(&path, |store| {
+                        store.insert(
+                            format!("host-{i}.example.com:22"),
+                            SshHostKeyTrust {
+                                fingerprint: format!("SHA256:{i}"),
+                                trusted_at: "2026-07-17T00:00:00Z".to_string(),
+                                last_seen_at: "2026-07-17T00:00:00Z".to_string(),
+                            },
+                        );
+                        Ok::<(), TrustError>(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let loaded = load_ssh_host_key_trust_store(&path).unwrap();
+        for i in 0..8 {
+            assert_eq!(
+                loaded.get(&format!("host-{i}.example.com:22")).unwrap().fingerprint,
+                format!("SHA256:{i}"),
+                "insert from thread {i} must not have been lost to a race"
+            );
+        }
     }
 }

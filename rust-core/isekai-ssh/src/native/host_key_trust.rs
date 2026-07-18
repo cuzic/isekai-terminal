@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use isekai_trust::{SshHostKeyTrust, SshHostKeyTrustStore};
+use isekai_trust::SshHostKeyTrust;
 use russh_stream_session::HostKeyVerifier;
 
 pub(crate) struct FileBackedHostKeyVerifier {
@@ -51,59 +51,61 @@ impl FileBackedHostKeyVerifier {
 #[async_trait]
 impl HostKeyVerifier for FileBackedHostKeyVerifier {
     async fn verify(&self, fingerprint: &str) -> bool {
-        let mut store = match isekai_trust::load_ssh_host_key_trust_store(&self.store_path) {
-            Ok(store) => store,
-            Err(e) => {
-                log::warn!("isekai-ssh: failed to load SSH host key trust store, rejecting connection: {e}");
-                return false;
-            }
-        };
+        let store_path = self.store_path.clone();
+        let host_port = self.host_port.clone();
+        let fingerprint = fingerprint.to_string();
+        let confirm_new_host = self.confirm_new_host.clone();
 
-        let now = now_rfc3339();
-        match store.get(&self.host_port) {
-            Some(known) if known.fingerprint == fingerprint => {
-                let mut updated = known.clone();
-                updated.last_seen_at = now;
-                store.insert(self.host_port.clone(), updated);
-                save_or_reject(&self.store_path, &store)
-            }
-            Some(known) => {
-                log::error!(
-                    "isekai-ssh: host key for {} changed (trusted {}, saw {}) — refusing to connect. \
-                     Remove the stale entry from the SSH host key trust store if this change is expected.",
-                    self.host_port, known.fingerprint, fingerprint,
-                );
+        // `with_locked_ssh_host_key_trust_store` does blocking file I/O and
+        // can block for an arbitrary time on the cross-process lock (e.g.
+        // another `isekai-ssh` tab is mid-prompt on a brand-new host right
+        // now) — run it on a blocking-pool thread so it never stalls this
+        // tokio runtime's async workers.
+        let outcome = tokio::task::spawn_blocking(move || {
+            isekai_trust::with_locked_ssh_host_key_trust_store(&store_path, |store| {
+                let now = now_rfc3339();
+                match store.get(&host_port) {
+                    Some(known) if known.fingerprint == fingerprint => {
+                        let mut updated = known.clone();
+                        updated.last_seen_at = now;
+                        store.insert(host_port.clone(), updated);
+                        Ok(true)
+                    }
+                    Some(known) => {
+                        log::error!(
+                            "isekai-ssh: host key for {host_port} changed (trusted {}, saw {fingerprint}) \
+                             — refusing to connect. If this change is expected (e.g. you redeployed), \
+                             remove the \"{host_port}\" entry from {} and reconnect.",
+                            known.fingerprint,
+                            store_path.display(),
+                        );
+                        Ok(false)
+                    }
+                    None => {
+                        if !confirm_new_host(&fingerprint) {
+                            return Ok(false);
+                        }
+                        store.insert(
+                            host_port.clone(),
+                            SshHostKeyTrust { fingerprint: fingerprint.clone(), trusted_at: now.clone(), last_seen_at: now },
+                        );
+                        Ok(true)
+                    }
+                }
+            })
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(accepted)) => accepted,
+            Ok(Err(e)) => {
+                log::warn!("isekai-ssh: SSH host key trust store operation failed, rejecting connection: {e}");
                 false
             }
-            None => {
-                if !(self.confirm_new_host)(fingerprint) {
-                    return false;
-                }
-                store.insert(
-                    self.host_port.clone(),
-                    SshHostKeyTrust {
-                        fingerprint: fingerprint.to_string(),
-                        trusted_at: now.clone(),
-                        last_seen_at: now,
-                    },
-                );
-                save_or_reject(&self.store_path, &store)
+            Err(join_error) => {
+                log::error!("isekai-ssh: SSH host key trust check task panicked, rejecting connection: {join_error}");
+                false
             }
-        }
-    }
-}
-
-/// Saving is expected to succeed (the store loaded fine, so its directory
-/// exists and is writable) — but a failure here (disk full, permissions
-/// changed mid-run) must still fail the connection rather than silently
-/// proceed with an unpersisted trust decision that a concurrent/later
-/// connection wouldn't see.
-fn save_or_reject(store_path: &std::path::Path, store: &SshHostKeyTrustStore) -> bool {
-    match isekai_trust::save_ssh_host_key_trust_store(store_path, store) {
-        Ok(()) => true,
-        Err(e) => {
-            log::warn!("isekai-ssh: failed to persist SSH host key trust store, rejecting connection: {e}");
-            false
         }
     }
 }
@@ -144,6 +146,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use isekai_trust::SshHostKeyTrustStore;
 
     fn verifier_with_answer(store_path: PathBuf, host_port: &str, answer: bool) -> FileBackedHostKeyVerifier {
         FileBackedHostKeyVerifier::new(store_path, host_port.to_string(), Arc::new(move |_fp| answer))

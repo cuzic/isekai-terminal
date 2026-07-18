@@ -36,4 +36,5 @@ pub use schema::{HelperTrust, SshHostKeyTrust, SshHostKeyTrustStore, TrustStore,
 pub use store::{
     default_config_dir, default_ssh_host_key_trust_store_path, default_trust_store_path,
     load_ssh_host_key_trust_store, load_trust_store, save_ssh_host_key_trust_store, save_trust_store,
+    with_locked_ssh_host_key_trust_store,
 };
