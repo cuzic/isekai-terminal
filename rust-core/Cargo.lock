@@ -1798,10 +1798,14 @@ dependencies = [
 name = "isekai-trust"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "isekai-fs-guard",
+ "log",
+ "russh-stream-session",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "toml 0.8.23",
 ]
 

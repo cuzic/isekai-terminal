@@ -3,9 +3,13 @@
 //! (`archive/ISEKAI_SSH_DESIGN.md` "trust store のファイル形式").
 //!
 //! Unlike `isekai-protocol`, this crate performs real filesystem I/O
-//! (reading/writing `~/.config/isekai-ssh/known_helpers.toml`), but it is
-//! otherwise self-contained: no dependency on tokio/quinn/russh/uniffi/
-//! isekai-protocol.
+//! (reading/writing `~/.config/isekai-ssh/known_helpers.toml`). Its core
+//! (store schema + locked read/write) depends on no async runtime; the
+//! [`host_key_verifier`] module additionally pulls in `russh-stream-session`
+//! and `tokio` (`spawn_blocking`) to implement
+//! `russh_stream_session::HostKeyVerifier` — shared by every native SSH path
+//! (`isekai-ssh`'s connect path and `isekai-bootstrap`'s `RusshBackend`) so
+//! the TOFU logic lives in exactly one place.
 //!
 //! Design invariants enforced here (all required by the design doc and by
 //! this crate's task acceptance criteria):
@@ -26,11 +30,13 @@
 //! key.
 
 pub mod error;
+pub mod host_key_verifier;
 pub mod normalize;
 pub mod schema;
 pub mod store;
 
 pub use error::TrustError;
+pub use host_key_verifier::FileBackedHostKeyVerifier;
 pub use normalize::{normalize_host_port, split_user_host_port};
 pub use schema::{HelperTrust, SshHostKeyTrust, SshHostKeyTrustStore, TrustStore, UpdatePolicy};
 pub use store::{
