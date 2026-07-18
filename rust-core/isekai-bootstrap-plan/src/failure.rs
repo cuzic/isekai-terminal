@@ -188,6 +188,17 @@ pub fn classify_bootstrap_error(err: &isekai_bootstrap::BootstrapError) -> Optio
 fn classify_session_error(err: &russh_stream_session::SessionError) -> Option<BootstrapFailure> {
     use russh_stream_session::SessionError as S;
     match err {
+        // `FileBackedHostKeyVerifier::verify` returning `false` (an unknown
+        // key the user declined, or a mismatched/changed key) makes russh
+        // fail the handshake with `Error::UnknownKey`, which surfaces here
+        // wrapped in `Connect` (direct) or `JumpHandshake` (via a jump host).
+        // That is a trust decision (potential MITM, or a legitimate
+        // redeploy), not a connectivity blip: route it to `HostKeyRejected`
+        // (`may_retry=false`, → `isekai-ssh init`) instead of blindly
+        // auto-retrying it as an unreachable host.
+        S::Connect { source, .. } | S::JumpHandshake { source, .. } if matches!(source, russh::Error::UnknownKey) => {
+            Some(BootstrapFailure::HostKeyRejected)
+        }
         S::Connect { .. } | S::JumpTunnel { .. } | S::JumpHandshake { .. } | S::Handshake(_) | S::Channel(_) => {
             Some(BootstrapFailure::JumpHostUnreachable)
         }
@@ -296,6 +307,32 @@ mod tests {
 
         let unsupported_arch = BootstrapError::UnsupportedArch("riscv64".to_string());
         assert!(matches!(classify_bootstrap_error(&unsupported_arch), Some(BootstrapFailure::RemoteBinaryMissing)));
+    }
+
+    #[test]
+    fn host_key_rejection_is_classified_as_host_key_rejected_not_unreachable() {
+        use russh_stream_session::SessionError;
+
+        // A host-key rejection on the direct path (russh raises
+        // `Error::UnknownKey` when the verifier returns false) must be a
+        // trust failure routed to `isekai-ssh init`, never an auto-retried
+        // "unreachable jump host".
+        let direct = SessionError::Connect { addr: "example.com:22".to_string(), source: russh::Error::UnknownKey };
+        assert!(matches!(classify_session_error(&direct), Some(BootstrapFailure::HostKeyRejected)));
+
+        // Same rejection reached via a jump host surfaces as `JumpHandshake`.
+        let via_jump =
+            SessionError::JumpHandshake { host: "example.com".to_string(), port: 22, source: russh::Error::UnknownKey };
+        assert!(matches!(classify_session_error(&via_jump), Some(BootstrapFailure::HostKeyRejected)));
+
+        // A genuine connectivity failure (not a host-key rejection) on the
+        // same variants stays `JumpHostUnreachable` — it may be auto-retried.
+        let unreachable = SessionError::Connect { addr: "example.com:22".to_string(), source: russh::Error::Disconnect };
+        assert!(matches!(classify_session_error(&unreachable), Some(BootstrapFailure::JumpHostUnreachable)));
+
+        let jump_unreachable =
+            SessionError::JumpHandshake { host: "example.com".to_string(), port: 22, source: russh::Error::Disconnect };
+        assert!(matches!(classify_session_error(&jump_unreachable), Some(BootstrapFailure::JumpHostUnreachable)));
     }
 
     #[test]
