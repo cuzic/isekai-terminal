@@ -28,6 +28,18 @@ const MAX_LIVE_IMAGES: usize = 32;
 /// する——既存id(=既存セルの`link_id`参照)はscrollback保護のため削除・再利用
 /// しない。
 pub(crate) const MAX_LINK_TABLE: usize = 4096;
+/// 1セルへ結合文字(combining character、幅0文字)として追記できるUTF-8バイト数の
+/// 上限(タスク#78)。`print()`のwidth==0分岐(タスク#39)は結合文字を直前セルの
+/// `cell.ch`へ無条件で連結する実装だったため、`a` + `U+0301`(2バイト)を大量に
+/// 送り続けるリモートに対して1セルの文字列長がNに比例して際限なく増え続ける
+/// (`make_screen_update`が毎フレーム複製する分のコストも線形に悪化する)。
+/// 正当な結合文字列(例: ベトナム語・デーヴァナーガリー文字等の複数記号併用)は
+/// 実用上せいぜい数個程度で収まるため、32バイト程度では既存の正当な用途を
+/// 誤って切り詰めかねない一方(codexレビュー指摘)、上限自体は必須
+/// ——base文字(最大4バイト)+ 結合文字数十個分の余裕を見て128バイトとする。
+/// 上限に達した以降の結合文字は黙って捨てる(`MAX_LINK_TABLE`と同種の素朴な
+/// キャップ)。
+const MAX_COMBINING_BYTES_PER_CELL: usize = 128;
 
 /// `38;5;n` / `48;5;n`（indexed color）を ARGB へ解決する。
 /// `0..=15` は現在のテーマの ANSI 16色テーブルを参照する（それ以外は固定の 216色/グレースケール）。
@@ -1751,6 +1763,11 @@ impl Perform for Terminal {
                 attach_col -= 1;
             }
             let cell = self.cell_mut(attach_row, attach_col);
+            if cell.ch.len() + c.len_utf8() > MAX_COMBINING_BYTES_PER_CELL {
+                // 上限超過分は黙って捨てる(タスク#78) — 大量の結合文字を送りつけて
+                // 1セルの文字列を際限なく成長させるリモートに対するメモリガード。
+                return;
+            }
             let mut combined = String::with_capacity(cell.ch.len() + c.len_utf8());
             combined.push_str(&cell.ch);
             combined.push(c);
@@ -2683,6 +2700,30 @@ mod tests {
         feed(&mut t, "\u{0301}".as_bytes());
         assert_eq!(cell(&t, 0, 0), " ", "no base char to attach to: cell must remain blank");
         assert_eq!(t.cursor_col(), 0, "no cell was written, cursor must not move");
+    }
+
+    #[test]
+    fn test_combining_char_bytes_are_capped_per_cell() {
+        // `a` + U+0301(2バイト)を大量に送っても、1セルの`ch`は
+        // `MAX_COMBINING_BYTES_PER_CELL`を超えて際限なく成長しない(タスク#78)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"a");
+        // 十分大きいN(1000個)を送り、上限超過分が黙って捨てられることを確認する。
+        for _ in 0..1000 {
+            feed(&mut t, "\u{0301}".as_bytes());
+        }
+        let ch = &t.screen_cells()[0].ch;
+        assert!(
+            ch.len() <= MAX_COMBINING_BYTES_PER_CELL,
+            "combining chars must be capped at MAX_COMBINING_BYTES_PER_CELL bytes, got {} bytes",
+            ch.len()
+        );
+        // "a"(1バイト)+ U+0301(2バイト)ずつ、上限(128バイト)を超えない最大個数
+        // (63個 = 126バイト)まで実際に追加され、それ以降は捨てられたことを厳密に検証する。
+        assert_eq!(ch.len(), 1 + 63 * 2, "expected exactly 63 combining chars to fit before the cap kicks in");
+        assert!(ch.starts_with('a'), "base char must be preserved");
+        // カーソルは結合文字によって一切進まない(上限超過後も既存の仕様通り)。
+        assert_eq!(t.cursor_col(), 1);
     }
 
     // ── REP(`CSI Ps b`、直前文字繰り返し、タスク#48) ─────────────
