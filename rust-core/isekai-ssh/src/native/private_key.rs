@@ -1,12 +1,13 @@
 //! Resolves which private key file to use for pubkey authentication on the
 //! native path, and loads it into a `russh_stream_session::Credential`.
 //!
-//! `openssh-config::HostConfig::identity_file` only reflects explicit
-//! `IdentityFile` lines in the config file — matching that crate's own
-//! documented scope, it does not apply `ssh(1)`'s own built-in default
-//! probe order when no `IdentityFile` is configured at all. That probing is
-//! `ssh(1)` client behavior, not `ssh_config(5)` file syntax, so it lives
-//! here instead.
+//! The candidate *ordering* (`identity_file_candidates`) now lives in the
+//! shared `isekai_fs_guard` crate and is re-exported below, so this crate's
+//! connect path and `isekai-bootstrap`'s `RusshBackend` can't drift on the
+//! `ssh(1)` default probe order again. What stays here is the *loading* half
+//! (`readable_credentials`) — reading each candidate off disk into a
+//! `russh_stream_session::Credential`, which the shared crate deliberately
+//! doesn't depend on.
 //!
 //! **Deliberately out of scope** (matches the plan's M1 non-compat list):
 //! passphrase-protected keys, `IdentitiesOnly`, `CertificateFile`. A key
@@ -14,26 +15,17 @@
 //! observable failure `russh_stream_session::SessionError::InvalidPrivateKey`
 //! already produces for any other malformed key.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use russh_stream_session::Credential;
 
-/// Default `IdentityFile` probe order tried when the config specifies none
-/// explicitly, per the plan's M1 design (`id_ed25519` → `id_rsa` →
-/// `id_ecdsa`) — this had drifted out of order in an earlier revision of
-/// this file (Codex review finding), swapping `id_rsa`/`id_ecdsa`.
-const DEFAULT_IDENTITY_FILE_NAMES: &[&str] = &["id_ed25519", "id_rsa", "id_ecdsa"];
-
-/// Returns the `IdentityFile` candidates to try, in order: `configured` if
-/// non-empty (as resolved by `openssh_config::resolve`/`resolve_default`),
-/// else `ssh(1)`'s own default probe order rooted at `home/.ssh/`.
-pub(crate) fn identity_file_candidates(configured: &[PathBuf], home: &Path) -> Vec<PathBuf> {
-    if !configured.is_empty() {
-        return configured.to_vec();
-    }
-    DEFAULT_IDENTITY_FILE_NAMES.iter().map(|name| home.join(".ssh").join(name)).collect()
-}
+/// The `IdentityFile` candidate ordering — the pure path-selection half of
+/// `ssh(1)`'s `IdentityFile` handling, shared with `isekai-bootstrap`'s
+/// `RusshBackend` (see the crate's own docs for why the default probe order
+/// lives there). `connect.rs` calls it as `private_key::identity_file_candidates`
+/// through this re-export.
+pub(crate) use isekai_fs_guard::identity_file_candidates;
 
 /// Reads *every* candidate in `candidates` that exists on disk, in order,
 /// returning each as a [`Credential::PublicKey`]. The caller
@@ -75,27 +67,6 @@ pub(crate) fn readable_credentials(candidates: &[PathBuf]) -> Result<Vec<Credent
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn configured_candidates_are_used_verbatim_when_non_empty() {
-        let configured = vec![PathBuf::from("/custom/key1"), PathBuf::from("/custom/key2")];
-        let home = PathBuf::from("/home/alice");
-        assert_eq!(identity_file_candidates(&configured, &home), configured);
-    }
-
-    #[test]
-    fn empty_configured_falls_back_to_default_probe_order_under_home() {
-        let home = PathBuf::from("/home/alice");
-        let candidates = identity_file_candidates(&[], &home);
-        assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("/home/alice/.ssh/id_ed25519"),
-                PathBuf::from("/home/alice/.ssh/id_rsa"),
-                PathBuf::from("/home/alice/.ssh/id_ecdsa"),
-            ]
-        );
-    }
 
     #[test]
     fn readable_credentials_skips_missing_candidates() {
