@@ -513,7 +513,12 @@ mod tests {
             let handle = session.handle();
             let path = socket_path.to_string();
             tokio::spawn(async move {
-                if let Ok(channel) = handle.channel_open_forwarded_streamlocal(path).await {
+                if let Ok(channel) = handle.channel_open_forwarded_streamlocal(path.clone()).await {
+                    // The real `isekai-pipe ctl` always sends the secret-preamble
+                    // line (the socket path) before the message — see
+                    // `ctl_forward.rs`'s `CtlPushServer` mock docs for why this
+                    // matters (a preamble-less mock previously hid a real bug).
+                    let _ = channel.data(format!("{path}\n").as_bytes()).await;
                     let _ = channel.data(&br#"{"op":"title","value":"tab-title"}"#[..]).await;
                     let _ = channel.data(&b"\n"[..]).await;
                     let _ = channel.eof().await;

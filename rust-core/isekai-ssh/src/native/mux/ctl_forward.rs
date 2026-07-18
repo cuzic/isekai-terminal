@@ -145,21 +145,47 @@ pub(crate) async fn pump_to_frames(
     }
 }
 
-/// Reads exactly one line (the single `CtlMessage`, per the
-/// one-connection-one-message `isekai-pipe ctl` contract) off a forwarded
-/// streamlocal channel, returning its bytes without the trailing newline.
-/// `None` if the channel closes without any data.
+/// Reads the two-line `isekai-pipe ctl` wire format off a forwarded
+/// streamlocal channel — the secret-preamble line (the remote socket path;
+/// see `isekai-pipe/src/ctl.rs`'s `secret_preamble`/`send_ctl_message`, which
+/// unconditionally send it first, unix-only source but every remote host is
+/// Linux per this project's design) followed by the actual `CtlMessage`
+/// line — and returns only the `CtlMessage` line's bytes, without its
+/// trailing newline. There is nothing to validate the preamble against here
+/// (unlike the Unix `ssh(1)` path's `handle_ctl_connection`, which checks it
+/// against a shared secret because a bare loopback TCP port has no other
+/// access control): each per-tab forward is already exclusively scoped by
+/// its own unique remote path, so the preamble is simply consumed and
+/// discarded. `None` if the channel closes before a complete `CtlMessage`
+/// line arrives (including if it closes mid-preamble).
+///
+/// Both lines can arrive in the same `Data` chunk (or split across several),
+/// so this carries any bytes read past the preamble's newline forward into
+/// the second line's search rather than discarding them.
 async fn read_ctl_line(channel: &mut russh::Channel<client::Msg>) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
+    // The preamble line: read and discard it.
     loop {
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            buf.drain(..=pos);
+            break;
+        }
         match channel.wait().await {
-            Some(russh::ChannelMsg::Data { data }) => {
-                buf.extend_from_slice(&data);
-                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    buf.truncate(pos);
-                    return Some(buf);
-                }
-            }
+            Some(russh::ChannelMsg::Data { data }) => buf.extend_from_slice(&data),
+            // Closed before the preamble even completed — nothing usable.
+            Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close) | None => return None,
+            _ => {}
+        }
+    }
+    // The actual CtlMessage line, continuing from any bytes already buffered
+    // past the preamble's newline.
+    loop {
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            buf.truncate(pos);
+            return Some(buf);
+        }
+        match channel.wait().await {
+            Some(russh::ChannelMsg::Data { data }) => buf.extend_from_slice(&data),
             // No newline arrived, but the peer closed: treat whatever we have
             // as the message (a message without a trailing newline is still
             // valid), or `None` if nothing came at all.
@@ -192,9 +218,17 @@ mod tests {
     }
 
     /// A mock sshd that, on a `streamlocal_forward` request, opens a
-    /// `forwarded-streamlocal` channel back for that path and writes one ctl
-    /// message line (a `SetTitle`) — standing in for a remote `isekai-pipe ctl`
-    /// pushing a title through the tab's forward.
+    /// `forwarded-streamlocal` channel back for that path and writes the real
+    /// two-line `isekai-pipe ctl` wire format — the secret-preamble line (the
+    /// socket path itself, exactly as the real `isekai-pipe ctl` binary always
+    /// sends first; see `isekai-pipe/src/ctl.rs`'s `secret_preamble`) followed
+    /// by one ctl message line (a `SetTitle`) — standing in for a remote
+    /// `isekai-pipe ctl` pushing a title through the tab's forward. Omitting
+    /// the preamble here previously let a real bug slip past this test: an
+    /// earlier `read_ctl_line` read only the *first* line off the channel and
+    /// treated it as the message, so it would have silently misread the real
+    /// preamble as (invalid, discarded) JSON in production while this
+    /// preamble-less mock kept passing.
     #[derive(Clone)]
     struct CtlPushServer;
     impl server::Server for CtlPushServer {
@@ -218,7 +252,8 @@ mod tests {
             let handle = session.handle();
             let path = socket_path.to_string();
             tokio::spawn(async move {
-                if let Ok(channel) = handle.channel_open_forwarded_streamlocal(path).await {
+                if let Ok(channel) = handle.channel_open_forwarded_streamlocal(path.clone()).await {
+                    let _ = channel.data(format!("{path}\n").as_bytes()).await;
                     let _ = channel.data(&br#"{"op":"title","value":"hello-ctl"}"#[..]).await;
                     let _ = channel.data(&b"\n"[..]).await;
                     let _ = channel.eof().await;
