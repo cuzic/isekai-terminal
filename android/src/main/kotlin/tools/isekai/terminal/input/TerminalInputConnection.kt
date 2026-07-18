@@ -3,6 +3,7 @@ package tools.isekai.terminal.input
 import android.view.KeyEvent
 import android.view.inputmethod.BaseInputConnection
 import tools.isekai.terminal.util.RemoteLogger
+import uniffi.isekai_terminal_core.TerminalKeyModifiers
 
 class TerminalInputConnection(
     private val view: TerminalInputView,
@@ -73,7 +74,17 @@ class TerminalInputConnection(
 
             if (!composing && handleShortcut(event)) return true
 
-            TerminalKeyEncoder.specialKeyBytes(event.keyCode, view.applicationCursorMode)?.let {
+            // 物理修飾キー(Shift/Alt/Ctrl/Meta)の現在状態。矢印・Home/End・PageUp/Down・F1〜F12に
+            // xterm互換の修飾子付きシーケンス(`ESC[1;5A`等)を反映するため、specialKeyBytesへ
+            // そのまま渡す(rust-core`terminal_special_key_bytes`(タスク#29)と同一golden表)。
+            // ソフトキーボードのトグル式Ctrl(view.ctrlArmed)とは独立で、実キーボードの修飾キーのみを見る。
+            val modifiers = TerminalKeyModifiers(
+                shift = event.isShiftPressed,
+                alt = event.isAltPressed,
+                ctrl = event.isCtrlPressed,
+                meta = event.isMetaPressed,
+            )
+            TerminalKeyEncoder.specialKeyBytes(event.keyCode, view.applicationCursorMode, view.applicationKeypadMode, modifiers)?.let {
                 view.onSendBytes?.invoke(it)
                 return true
             }
