@@ -1748,19 +1748,14 @@ fn parse_extended_color(theme: &Theme, ps: &[u16], i: usize) -> Option<(u32, usi
     None
 }
 
-impl Perform for Terminal {
-    fn print(&mut self, c: char) {
+impl Terminal {
+    /// 文字集合(charset)写像を適用**した後**の文字をそのままセルへ書き込む。
+    /// `print()`本体はここへ委譲する。REP(`CSI Ps b`、タスク#48)は
+    /// `last_graphic_cell`に写像後の文字を保存しているため、こちらを直接
+    /// 呼ぶことで「保存時と異なる文字集合がその後選択されていた場合に
+    /// 再写像されて別の文字が繰り返されてしまう」バグ(タスク#84)を避ける。
+    fn print_mapped(&mut self, c: char) {
         use unicode_width::UnicodeWidthChar;
-        // SI/SO(`execute`)・`ESC ( `/`ESC ) `(`esc_dispatch`)で選択された文字集合が
-        // DEC Special Graphicsの場合、ASCII範囲の文字をUnicode罫線/記号文字へ書き換えて
-        // からセルへ書き込む(タスク#41)。結合文字判定([UnicodeWidthChar::width])より
-        // 前に行う必要がある — 写像先の罫線文字はいずれも幅1(結合文字になり得ない)。
-        let active_charset = if self.gl_is_g1 { self.g1_charset } else { self.g0_charset };
-        let c = if active_charset == Charset::DecSpecialGraphics {
-            dec_special_graphics(c)
-        } else {
-            c
-        };
         let width = c.width().unwrap_or(1);
 
         if width == 0 {
@@ -1861,6 +1856,22 @@ impl Perform for Terminal {
                 self.cursor_col = (self.cursor_col + advance).min(self.cols.saturating_sub(1));
             }
         }
+    }
+}
+
+impl Perform for Terminal {
+    fn print(&mut self, c: char) {
+        // SI/SO(`execute`)・`ESC ( `/`ESC ) `(`esc_dispatch`)で選択された文字集合が
+        // DEC Special Graphicsの場合、ASCII範囲の文字をUnicode罫線/記号文字へ書き換えて
+        // からセルへ書き込む(タスク#41)。結合文字判定(`print_mapped`内)より前に行う
+        // 必要がある — 写像先の罫線文字はいずれも幅1(結合文字になり得ない)。
+        let active_charset = if self.gl_is_g1 { self.g1_charset } else { self.g0_charset };
+        let c = if active_charset == Charset::DecSpecialGraphics {
+            dec_special_graphics(c)
+        } else {
+            c
+        };
+        self.print_mapped(c);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -2230,9 +2241,15 @@ impl Perform for Terminal {
             // 場合)はno-op。`self.print()`を再呼び出しして実現する(ICH/DCH等と異なり
             // 専用の書き込みロジックを持たない)——折り返し・全角文字・DECAWM off等の
             // 挙動を`print()`本体と完全に一致させ二重実装によるズレを防ぐため。
-            // `print()`は常に`self.cur_attrs`(現在値)を参照するため、記録済みの属性で
-            // 描画させるにはループの間だけ`cur_attrs`を差し替え、終わったら元に戻す
+            // `print_mapped()`は常に`self.cur_attrs`(現在値)を参照するため、記録済みの
+            // 属性で描画させるにはループの間だけ`cur_attrs`を差し替え、終わったら元に戻す
             // (REP自体はカーソル位置のSGR状態を変更しない副作用のない操作であるべき)。
+            // `last_graphic_cell`は写像**後**の文字を保存している(2237行目付近参照)ため、
+            // ここでは`print()`ではなく`print_mapped()`を直接呼ぶ——`print()`だと現在の
+            // charsetで再度写像されてしまい、保存後にcharsetが切り替わっていた場合
+            // (例: ASCIIで'q'を印字→`ESC(0`でDEC Special Graphicsへ切替→REP)に、
+            // 記録した文字とは別の文字(この例では'q'ではなく'─')が繰り返されてしまう
+            // (タスク#84)。
             'b' => {
                 if let Some((c, attrs, link_id)) = self.last_graphic_cell {
                     let n = p0.max(1) as usize;
@@ -2241,7 +2258,7 @@ impl Perform for Terminal {
                     self.cur_attrs = attrs;
                     self.active_link_id = link_id;
                     for _ in 0..n {
-                        self.print(c);
+                        self.print_mapped(c);
                     }
                     self.cur_attrs = restore_attrs;
                     self.active_link_id = restore_link_id;
@@ -2846,8 +2863,9 @@ mod tests {
 
     #[test]
     fn test_rep_repeats_wide_char_occupying_two_cells_per_repetition() {
-        // 全角文字のREPは、通常の`print()`と同じ折り返し・プレースホルダロジックを
-        // 再利用するため、1回の繰り返しごとに2セルずつ消費する(タスク#48)。
+        // 全角文字のREPは、通常の`print_mapped()`(タスク#84で`print()`から分離)と
+        // 同じ折り返し・プレースホルダロジックを再利用するため、1回の繰り返しごとに
+        // 2セルずつ消費する(タスク#48)。
         let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, "\u{3042}".as_bytes()); // "あ"(全角) が col0-1 を占める
         feed(&mut t, b"\x1b[2b"); // さらに2回繰り返す -> col2-3, col4-5
@@ -2862,8 +2880,8 @@ mod tests {
 
     #[test]
     fn test_rep_wraps_to_next_line_when_repeating_past_right_edge() {
-        // REPは`print()`をそのまま再利用するので、右端に到達すれば通常の折り返し
-        // (autowrap on)がそのまま働く(タスク#48)。
+        // REPは`print_mapped()`(タスク#84で`print()`から分離)をそのまま再利用する
+        // ので、右端に到達すれば通常の折り返し(autowrap on)がそのまま働く(タスク#48)。
         let mut t = Terminal::new(5, 3, Theme::default());
         feed(&mut t, b"ABCD"); // col0-3を埋める(col4が残り1マス)
         feed(&mut t, b"\x1b[3b"); // "D"をさらに3回 -> col4(行0)、col0-1(行1、折り返し後)
@@ -2872,6 +2890,25 @@ mod tests {
         assert_eq!(cell(&t, 1, 0), "D");
         assert_eq!(cell(&t, 1, 1), "D");
         assert_eq!(t.cursor_col(), 2);
+    }
+
+    #[test]
+    fn test_rep_repeats_the_char_originally_printed_even_after_charset_switch() {
+        // タスク#84: `last_graphic_cell`は写像**後**の文字を保存する。REPが
+        // `print()`(charsetを現在値で再適用する経路)を再利用すると、記録後に
+        // charsetが切り替わっていた場合に別の文字が再写像されて繰り返されてしまう。
+        // 再現: ASCII下で'q'を印字 → `ESC(0`でG0をDEC Special Graphicsへ切替
+        // (この文字集合では'q'は罫線文字'─'へ写像される) → REP。
+        // 正しい挙動は、charset切り替え前に実際に画面へ書かれた'q'を繰り返すこと
+        // であり、切り替え後のcharsetで'q'を再写像した'─'ではない。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"q\x1b(0\x1b[b");
+        assert_eq!(cell(&t, 0, 0), "q", "original 'q' printed under ASCII charset is untouched");
+        assert_eq!(
+            cell(&t, 0, 1),
+            "q",
+            "REP must repeat the char as it was actually drawn ('q'), not re-map it through the charset now active"
+        );
     }
 
     #[test]
