@@ -129,6 +129,21 @@ public final class TerminalScreenView: UIView {
     /// `pendingHyperlinkUrl`と対称)。
     public var onHyperlinkTapped: ((String) -> Void)?
 
+    /// タスク#20: view bounds(実サイズ)とフォントのセルサイズから求めたcols/rowsが
+    /// 変化する度に呼ばれる。Android版`TerminalScreen.kt`の
+    /// `cols = (widthPx / cellDims.first).toInt().coerceAtLeast(10)` /
+    /// `rows = (heightPx / cellDims.second).toInt().coerceAtLeast(5)` +
+    /// `LaunchedEffect(cols, rows, connected)`と対称の計算(下限も同じ10/5)。
+    /// 実際にRust側の`resize(cols:rows:)`へ転送するかどうかの判断・同一値の
+    /// dedupeは呼び出し側(`TerminalScreenRepresentable`)/Rust側(`SessionCore::resize`、
+    /// #62)に委ねる — ここでは「view sizeから求めたcols/rowsが変わった」という
+    /// 生のジオメトリ計算結果を渡すだけ(rust-ssot: セッション状態の判断はしない)。
+    public var onSizeChanged: ((UInt32, UInt32) -> Void)?
+    private var lastReportedCols: UInt32?
+    private var lastReportedRows: UInt32?
+    private static let minCols: UInt32 = 10
+    private static let minRows: UInt32 = 5
+
     public override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
@@ -170,6 +185,49 @@ public final class TerminalScreenView: UIView {
         boldFont = UIFont.monospacedSystemFont(ofSize: size, weight: .bold)
         let measured = ("M" as NSString).size(withAttributes: [.font: font])
         cellSize = CGSize(width: measured.width, height: font.lineHeight)
+        // タスク#20: ピンチズームでcellSizeが変わればcols/rowsも変わりうる
+        // (Android版`cellDims`が`fontScale`込みの`remember`キーになっているのと対称)。
+        reportSizeIfNeeded()
+    }
+
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        // タスク#20: 画面回転・SplitView/Slide Overサイズ変更等でboundsが変わった度に
+        // cols/rowsを再計算する(Android版`BoxWithConstraints`が`maxWidth`/`maxHeight`の
+        // 変化を検知するのと対称)。
+        //
+        // 既知の制約(タスク#19のAndroid版`computeResizeTargetColsRows`の`imeBottomPx`
+        // 補正に相当する処理は未実装): ソフトキーボード表示中にSwiftUI側の既定の
+        // キーボード回避レイアウトでこのviewのboundsが実際に縮む場合、その分も
+        // 通常のリサイズとしてそのまま転送してしまう(IME開閉自体をtty実サイズ変更の
+        // 理由にしたくないというAndroid版#19の方針とは未整合)。iOS側でのSwiftUI-UIKit
+        // 間のキーボード回避挙動はOSバージョンや実機検証なしには正確に補正できないと
+        // 判断し、このタスク(#20)の対象範囲(動的resize自体の実装)からは切り出した。
+        // Rust側`SessionCore::resize`の同一値dedupe(#62)により永続的な状態不整合には
+        // ならない(キーボードを閉じれば実サイズへ戻る)。
+        reportSizeIfNeeded()
+    }
+
+    /// タスク#20: `TerminalSessionController.connect()`は実際のview sizeが判明する前に
+    /// 既定の80x24でセッションを開始する。接続確立(再接続含む)直後に、既知のview実
+    /// サイズへ確実に一度合わせ直すためのフック(Android版`LaunchedEffect(cols, rows,
+    /// connected)`が`connected`もキーに含めることで、cols/rowsの値自体は変わらなくても
+    /// 「接続状態が変わった」場合に確実に再発火するのと同じ理由)。
+    /// `TerminalScreenRepresentable.updateUIView`から接続状態の遷移を検知して呼ばれる。
+    public func resendSizeOnConnectionEstablished() {
+        lastReportedCols = nil
+        lastReportedRows = nil
+        reportSizeIfNeeded()
+    }
+
+    private func reportSizeIfNeeded() {
+        guard cellSize.width > 0, cellSize.height > 0, bounds.width > 0, bounds.height > 0 else { return }
+        let cols = max(UInt32(bounds.width / cellSize.width), Self.minCols)
+        let rows = max(UInt32(bounds.height / cellSize.height), Self.minRows)
+        guard cols != lastReportedCols || rows != lastReportedRows else { return }
+        lastReportedCols = cols
+        lastReportedRows = rows
+        onSizeChanged?(cols, rows)
     }
 
     /// ピンチズームでのフォントサイズ調整(Android版`TerminalScreen.kt`の

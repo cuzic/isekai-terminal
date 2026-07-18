@@ -70,4 +70,66 @@ final class TerminalScreenViewTests: XCTestCase {
     func testClampedFontScaleClampsToMaximum() {
         XCTAssertEqual(clampedFontScale(current: 2.9, zoomDelta: 2.0), 3.0, accuracy: 0.0001)
     }
+
+    // MARK: - タスク#20: 動的resize(view bounds→cols/rows→onSizeChanged)
+
+    func testOnSizeChangedFiresWithComputedColsAndRowsOnLayout() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        var reported: (cols: UInt32, rows: UInt32)?
+        view.onSizeChanged = { cols, rows in reported = (cols, rows) }
+
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+
+        XCTAssertNotNil(reported)
+        XCTAssertGreaterThanOrEqual(reported?.cols ?? 0, 10)
+        XCTAssertGreaterThanOrEqual(reported?.rows ?? 0, 5)
+    }
+
+    func testOnSizeChangedClampsToMinimumForTinyFrame() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        var reported: (cols: UInt32, rows: UInt32)?
+        view.onSizeChanged = { cols, rows in reported = (cols, rows) }
+
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+
+        // Android版`coerceAtLeast(10)`/`coerceAtLeast(5)`と対称の下限。
+        XCTAssertEqual(reported?.cols, 10)
+        XCTAssertEqual(reported?.rows, 5)
+    }
+
+    func testOnSizeChangedDoesNotRefireForUnchangedComputedSize() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        var callCount = 0
+        view.onSizeChanged = { _, _ in callCount += 1 }
+
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertEqual(callCount, 1)
+
+        // boundsが変わらないままlayoutが再度発火しても、算出されたcols/rowsが同じなら
+        // 再送しない(Android版`LaunchedEffect(cols, rows, connected)`が値の変化でしか
+        // 再発火しないのと対称)。
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertEqual(callCount, 1)
+    }
+
+    func testResendSizeOnConnectionEstablishedForcesRefireEvenIfUnchanged() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        var callCount = 0
+        view.onSizeChanged = { _, _ in callCount += 1 }
+
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertEqual(callCount, 1)
+
+        // タスク#20: `connect()`は既定の80x24でセッションを開始するため、接続確立の
+        // 度に(cols/rowsの値自体が変わっていなくても)実サイズへ確実に一度合わせ直す
+        // 必要がある(Android版`LaunchedEffect(cols, rows, connected)`の`connected`
+        // キーと対称)。
+        view.resendSizeOnConnectionEstablished()
+        XCTAssertEqual(callCount, 2)
+    }
 }
