@@ -4579,6 +4579,11 @@ data class ScreenUpdate (
     var `applicationCursorMode`: kotlin.Boolean
     , 
     var `bracketedPasteMode`: kotlin.Boolean
+    , 
+    /**
+     * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
+     */
+    var `cursorVisible`: kotlin.Boolean
     
 ){
     
@@ -4603,6 +4608,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -4614,7 +4620,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.allocationSize(value.`cursorCol`) +
             FfiConverterOptionalString.allocationSize(value.`title`) +
             FfiConverterBoolean.allocationSize(value.`applicationCursorMode`) +
-            FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`)
+            FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`) +
+            FfiConverterBoolean.allocationSize(value.`cursorVisible`)
     )
 
     override fun write(value: ScreenUpdate, buf: ByteBuffer) {
@@ -4626,6 +4633,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterOptionalString.write(value.`title`, buf)
             FfiConverterBoolean.write(value.`applicationCursorMode`, buf)
             FfiConverterBoolean.write(value.`bracketedPasteMode`, buf)
+            FfiConverterBoolean.write(value.`cursorVisible`, buf)
     }
 }
 

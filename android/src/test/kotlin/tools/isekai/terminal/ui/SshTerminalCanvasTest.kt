@@ -86,7 +86,7 @@ class SshTerminalCanvasTest {
         assertEquals(listOf(BgRun(0, 3, blue)), runsRow1)
     }
 
-    private fun screenUpdate() = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, false, false)
+    private fun screenUpdate() = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, false, false, true)
 
     // ── FontFitCache: セル寸法/typefaceが変わったときだけ再計測が必要 ──────────
 

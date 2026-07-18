@@ -18,7 +18,8 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
-            title: nil, applicationCursorMode: false, bracketedPasteMode: false
+            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            cursorVisible: true
         )
 
         view.apply(update)
@@ -38,7 +39,8 @@ final class TerminalScreenViewTests: XCTestCase {
         let update = ScreenUpdate(
             cols: 10, rows: 10, cells: [],
             cursorRow: 0, cursorCol: 0,
-            title: nil, applicationCursorMode: false, bracketedPasteMode: false
+            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            cursorVisible: true
         )
         view.apply(update)
         view.layoutIfNeeded()
