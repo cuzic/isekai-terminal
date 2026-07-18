@@ -700,11 +700,27 @@ async fn promote_warm_standby_once(
 /// How many *consecutive* `UnknownSession` rejections
 /// `resume_with_backoff_until_deadline` requires before treating the
 /// session as genuinely, permanently gone — see `is_unknown_session_rejection`'s
-/// docs for why a single occurrence isn't proof enough. At the backoff
-/// schedule's minimum (500ms, 1s, 2s, ...) this costs a few seconds at most
-/// before giving up on a truly-dead session, which is negligible next to the
-/// (now days-long) deadline it replaces for that case.
+/// docs for why a single occurrence isn't proof enough.
 const UNKNOWN_SESSION_CONFIRM_THRESHOLD: u32 = 3;
+
+/// Minimum time since disconnect that must have elapsed before
+/// `UNKNOWN_SESSION_CONFIRM_THRESHOLD` consecutive rejections are trusted as
+/// proof of permanent loss, required *in addition to* the streak count
+/// above. At `RESUME_BACKOFF`'s schedule (500ms, 1s, 2s, ...) 3 consecutive
+/// attempts land around t≈3.5s — comfortably inside `isekai-pipe serve
+/// --idle-timeout`'s default (15s) worst case for the "not-yet-parked"
+/// race `is_unknown_session_rejection` describes: a "break-before-make"
+/// roam (Wi-Fi drop, AP switch, airplane mode) means the client's
+/// `quic_write.reset(0)` on the *old* path never reaches the server, so the
+/// server can only notice the old connection died via its own QUIC idle
+/// timeout, not the explicit reset — the fast path this streak was tuned
+/// around. Without this floor, `UNKNOWN_SESSION_CONFIRM_THRESHOLD` alone
+/// would misfire and kill exactly the roaming reconnects this project's
+/// resumable transport exists to survive (`CLAUDE.md`'s differentiator:
+/// "QUIC接続耐性(ローミング...)"). 30s is double the idle-timeout default,
+/// leaving margin without meaningfully eating into the (now days-long)
+/// deadline a truly-dead session would otherwise be retried against.
+const UNKNOWN_SESSION_MIN_ELAPSED_FLOOR: Duration = Duration::from_secs(30);
 
 /// `UnknownSession` is the wire reason for three different server-side
 /// situations that `isekai-pipe serve`'s `RESUME` handler
@@ -736,15 +752,19 @@ fn is_unknown_session_rejection(e: &isekai_transport::TransportError) -> bool {
 /// `ResumeLoopState::consecutive_unknown_session`'s docs, factored out so it
 /// can be unit-tested without a real `AnyMuxFactory`/network dial (unlike
 /// `resume_with_backoff_until_deadline` itself). Given the streak length
-/// going into this attempt and whether this attempt's error was an
-/// `UnknownSession` rejection, returns the streak length coming out of it
-/// and whether the caller should give up now.
-fn update_unknown_session_streak(previous_streak: u32, is_unknown_session: bool) -> (u32, bool) {
+/// going into this attempt, whether this attempt's error was an
+/// `UnknownSession` rejection, and how long it's been since the disconnect
+/// that started this episode, returns the streak length coming out of it
+/// and whether the caller should give up now — both the streak count *and*
+/// `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR` must be satisfied (see that
+/// constant's docs for why the streak alone isn't enough).
+fn update_unknown_session_streak(previous_streak: u32, is_unknown_session: bool, elapsed_since_disconnect: Duration) -> (u32, bool) {
     if !is_unknown_session {
         return (0, false);
     }
     let streak = previous_streak.saturating_add(1);
-    (streak, streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD)
+    let should_give_up = streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD && elapsed_since_disconnect >= UNKNOWN_SESSION_MIN_ELAPSED_FLOOR;
+    (streak, should_give_up)
 }
 
 /// Shared give-up cleanup for `resume_with_backoff_until_deadline`'s two
@@ -874,10 +894,16 @@ async fn resume_with_backoff_until_deadline(
                 // good (it's also what a transient not-yet-parked race on
                 // the server looks like), so only give up once it's been
                 // confirmed `UNKNOWN_SESSION_CONFIRM_THRESHOLD` times in a
-                // row. Any other outcome (success, or a *different* error)
-                // resets the streak elsewhere in this loop.
-                let (streak, should_give_up) =
-                    update_unknown_session_streak(state.consecutive_unknown_session, is_unknown_session_rejection(&e));
+                // row *and* `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR` has passed
+                // (see that constant's docs — the streak alone misfires
+                // during break-before-make roaming). Any other outcome
+                // (success, or a *different* error) resets the streak
+                // elsewhere in this loop.
+                let (streak, should_give_up) = update_unknown_session_streak(
+                    state.consecutive_unknown_session,
+                    is_unknown_session_rejection(&e),
+                    Instant::now().saturating_duration_since(disconnected_at),
+                );
                 state.consecutive_unknown_session = streak;
                 if should_give_up {
                     let session_id = state.session_id;
@@ -1421,27 +1447,49 @@ mod tests {
     /// session exists but the server hasn't finished parking it yet" (a
     /// transient race right after a reset). A single `UnknownSession` must
     /// not be enough to give up — only `UNKNOWN_SESSION_CONFIRM_THRESHOLD`
-    /// in a row should.
+    /// in a row (past `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR`) should.
     #[test]
     fn update_unknown_session_streak_does_not_give_up_below_the_threshold() {
         let mut streak = 0;
+        let elapsed = UNKNOWN_SESSION_MIN_ELAPSED_FLOOR + Duration::from_secs(1);
         for _ in 0..(UNKNOWN_SESSION_CONFIRM_THRESHOLD - 1) {
             let should_give_up;
-            (streak, should_give_up) = update_unknown_session_streak(streak, true);
+            (streak, should_give_up) = update_unknown_session_streak(streak, true, elapsed);
             assert!(!should_give_up, "must not give up before the threshold is reached");
         }
         assert_eq!(streak, UNKNOWN_SESSION_CONFIRM_THRESHOLD - 1);
     }
 
     #[test]
-    fn update_unknown_session_streak_gives_up_once_the_threshold_is_reached() {
+    fn update_unknown_session_streak_gives_up_once_the_threshold_and_floor_are_both_reached() {
         let mut streak = 0;
         let mut should_give_up = false;
+        let elapsed = UNKNOWN_SESSION_MIN_ELAPSED_FLOOR + Duration::from_secs(1);
         for _ in 0..UNKNOWN_SESSION_CONFIRM_THRESHOLD {
-            (streak, should_give_up) = update_unknown_session_streak(streak, true);
+            (streak, should_give_up) = update_unknown_session_streak(streak, true, elapsed);
         }
-        assert!(should_give_up, "must give up once the streak reaches the threshold");
+        assert!(should_give_up, "must give up once both the streak and the elapsed floor are reached");
         assert_eq!(streak, UNKNOWN_SESSION_CONFIRM_THRESHOLD);
+    }
+
+    /// Regression test for the Fable-review finding: at `RESUME_BACKOFF`'s
+    /// schedule, `UNKNOWN_SESSION_CONFIRM_THRESHOLD` consecutive attempts
+    /// land around t≈3.5s — well before `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR`
+    /// (30s). Reaching the streak alone must not be enough during a
+    /// break-before-make roam, where the server can take up to its
+    /// `--idle-timeout` (15s default) to notice the old connection died.
+    #[test]
+    fn update_unknown_session_streak_does_not_give_up_before_the_elapsed_floor_even_at_threshold() {
+        let mut streak = 0;
+        for _ in 0..(UNKNOWN_SESSION_CONFIRM_THRESHOLD + 5) {
+            // Realistic early-episode elapsed time (a few seconds), well
+            // under the floor, even though the streak count alone would
+            // already be well past the threshold.
+            let should_give_up;
+            (streak, should_give_up) = update_unknown_session_streak(streak, true, Duration::from_secs(4));
+            assert!(!should_give_up, "must not give up before the elapsed floor is reached, regardless of streak length");
+        }
+        assert!(streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD, "sanity check: the streak itself did clear the threshold");
     }
 
     /// The scenario this whole streak exists to tolerate: the server's
@@ -1454,8 +1502,9 @@ mod tests {
     /// disconnect episode).
     #[test]
     fn update_unknown_session_streak_resets_on_a_non_unknown_session_outcome() {
-        let (streak, _) = update_unknown_session_streak(0, true);
-        let (streak, should_give_up) = update_unknown_session_streak(streak, false);
+        let elapsed = UNKNOWN_SESSION_MIN_ELAPSED_FLOOR + Duration::from_secs(1);
+        let (streak, _) = update_unknown_session_streak(0, true, elapsed);
+        let (streak, should_give_up) = update_unknown_session_streak(streak, false, elapsed);
         assert_eq!(streak, 0, "a non-UnknownSession outcome must reset the streak");
         assert!(!should_give_up);
     }
