@@ -233,8 +233,43 @@ fn split_keyword(line: &str) -> (&str, &str) {
     (keyword, rest)
 }
 
-fn split_words(input: &str) -> impl Iterator<Item = String> + '_ {
-    input.split_whitespace().map(str::to_string)
+/// Splits `input` on whitespace into words, honoring a single matching pair
+/// of `'...'`/`"..."` quotes around a word as one token that may itself
+/// contain whitespace (`ssh_config(5)`'s quoting rules) — used for
+/// `Include`'s space-separated pattern list, where a quoted path containing a
+/// space (e.g. a Windows home directory `Include "C:\Users\First Last\.ssh\
+/// extra"`) must survive as one pattern rather than being split into two
+/// bogus, non-matching ones by a naive `split_whitespace`.
+fn split_words(input: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut word = String::new();
+        if c == '\'' || c == '"' {
+            let quote = c;
+            chars.next();
+            for ch in chars.by_ref() {
+                if ch == quote {
+                    break;
+                }
+                word.push(ch);
+            }
+        } else {
+            while let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() {
+                    break;
+                }
+                word.push(ch);
+                chars.next();
+            }
+        }
+        words.push(word);
+    }
+    words
 }
 
 /// Strips a trailing inline comment from a value and trims the result.
@@ -263,7 +298,11 @@ fn strip_inline_comment(value: &str) -> &str {
     value
 }
 
-fn strip_quotes(value: &str) -> &str {
+/// Strips a single matching pair of surrounding `'...'`/`"..."` quotes from
+/// `value`, the same unquoting config-file values get. Public for the same
+/// reason as [`expand_tilde`] — a command-line override resolving the same
+/// keyword should unquote identically.
+pub fn strip_quotes(value: &str) -> &str {
     if value.len() > 1
         && ((value.starts_with('\'') && value.ends_with('\''))
             || (value.starts_with('"') && value.ends_with('"')))
@@ -307,7 +346,12 @@ fn expand_path(input: &str, base_dir: Option<&Path>) -> PathBuf {
     }
 }
 
-fn expand_tilde(input: &str) -> PathBuf {
+/// Expands a leading `~` or `~/...` in `input` against `$HOME`/`%USERPROFILE%`,
+/// the same expansion `IdentityFile`/`IdentityAgent` config-file values get.
+/// Public so callers resolving the same keywords from another source (e.g. a
+/// command-line `-i`/`-o IdentityFile=` override) can apply identical
+/// expansion instead of leaving `~` unexpanded.
+pub fn expand_tilde(input: &str) -> PathBuf {
     expand_tilde_with(input, home_dir())
 }
 
@@ -694,6 +738,24 @@ Host example
 ", dir.path().display()));
         let config = resolve(&path, "example").unwrap();
         assert_eq!(config.user.as_deref(), Some("alice"));
+    }
+
+    /// Regression (ultrareview): `split_words` used `split_whitespace`, so a
+    /// quoted `Include` path containing a space (common on Windows, e.g. a
+    /// home directory under `C:\Users\First Last\`) was split into two bogus
+    /// patterns instead of surviving as one quoted token, and the include
+    /// silently matched nothing.
+    #[test]
+    fn a_quoted_include_path_containing_a_space_is_not_split() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("First Last");
+        std::fs::create_dir(&sub).unwrap();
+        write_config(&dir, "First Last/extra.conf", "Host example\n    User alice\n");
+        let quoted = format!("\"{}\"", sub.join("extra.conf").display());
+        let path = write_config(&dir, "config", &format!("Include {quoted}\n"));
+
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.user.as_deref(), Some("alice"), "the quoted, space-containing Include path must resolve as one pattern");
     }
 
     #[test]

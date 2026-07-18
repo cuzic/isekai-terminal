@@ -1248,6 +1248,9 @@ fn collect_cli_overrides(ssh_args: &[String]) -> Result<CliOverrides> {
             ("-J", Some(v)) => {
                 overrides.proxy_jump.get_or_insert_with(|| v.to_string());
             }
+            ("-i", Some(v)) => {
+                overrides.identity_file.push(openssh_config::expand_tilde(v));
+            }
             ("-o", Some(v)) => {
                 apply_dash_o_override(&mut overrides, v)?;
             }
@@ -1258,14 +1261,27 @@ fn collect_cli_overrides(ssh_args: &[String]) -> Result<CliOverrides> {
     Ok(overrides)
 }
 
-/// Applies one `-o Key=Value` (or `-o "Key Value"`) token to `overrides`.
-/// Keyword matching is case-insensitive, following `ssh_config(5)`. Keywords
-/// outside `openssh_config::HostConfig`'s modeled subset are silently ignored.
+/// Applies one `-o Key=Value` (or `-o "Key Value"`, or `-o "Key = Value"`)
+/// token to `overrides`. Keyword matching is case-insensitive, following
+/// `ssh_config(5)`. Keywords outside `openssh_config::HostConfig`'s modeled
+/// subset are silently ignored.
 fn apply_dash_o_override(overrides: &mut CliOverrides, token: &str) -> Result<()> {
-    let Some((key, val)) = token.split_once(|c: char| c == '=' || c.is_whitespace()) else {
+    // Split at the first delimiter (whitespace or `=`), then strip a leading
+    // `=` (plus any whitespace after it) from what remains — matching
+    // `openssh_config::split_keyword`'s own two-step approach, so
+    // `Key=Value`, `"Key Value"`, and `"Key = Value"` (spaces *around* the
+    // `=`) all parse the same way a naive single `split_once` on `[=\s]`
+    // doesn't (that would leave a stray leading `=` in `val` for the
+    // spaced-`=` form and fail e.g. `Port`'s `u16` parse).
+    let Some(end) = token.find(|c: char| c == '=' || c.is_whitespace()) else {
         return Ok(());
     };
-    let val = val.trim();
+    let key = &token[..end];
+    let mut val = token[end..].trim_start();
+    if let Some(stripped) = val.strip_prefix('=') {
+        val = stripped.trim_start();
+    }
+    let val = openssh_config::strip_quotes(val.trim());
     match key.trim().to_ascii_lowercase().as_str() {
         "hostname" => {
             overrides.host_name.get_or_insert_with(|| val.to_string());
@@ -1283,10 +1299,10 @@ fn apply_dash_o_override(overrides: &mut CliOverrides, token: &str) -> Result<()
             overrides.proxy_jump.get_or_insert_with(|| val.to_string());
         }
         "identityfile" => {
-            overrides.identity_file.push(PathBuf::from(val));
+            overrides.identity_file.push(openssh_config::expand_tilde(val));
         }
         "identityagent" => {
-            overrides.identity_agent.get_or_insert_with(|| PathBuf::from(val));
+            overrides.identity_agent.get_or_insert_with(|| openssh_config::expand_tilde(val));
         }
         "forwardagent" => {
             overrides.forward_agent.get_or_insert_with(|| match val.to_ascii_lowercase().as_str() {
@@ -2499,6 +2515,59 @@ Host *
         assert_eq!(host_config.user.as_deref(), Some("admin"));
         assert_eq!(host_config.host_name.as_deref(), Some("192.0.2.7"));
         assert_eq!(resolution.native_host_port("production"), ("192.0.2.7".to_string(), 2200));
+    }
+
+    /// Regression (ultrareview): `-i <keyfile>` was silently dropped on the
+    /// native path (no arm in `collect_cli_overrides`'s match), even though
+    /// `ssh_option_width` already knew it takes a value — the Unix path
+    /// forwards `-i` to real `ssh(1)` and it worked there, making this a
+    /// native-only regression for a very common flag. Tilde must also expand.
+    #[test]
+    fn resolve_for_native_applies_dash_i_identity_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(&config, "Host production\n    HostName 10.20.0.15\n").unwrap();
+        let plan = parse_wrapper(s(&["-F", config.to_str().unwrap(), "-i", "~/.ssh/deploy_key", "production"])).unwrap();
+
+        let (_resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        let home = isekai_fs_guard::resolve_home_dir().unwrap();
+        assert_eq!(host_config.identity_file, vec![home.join(".ssh/deploy_key")], "-i must be tilde-expanded and added as a candidate");
+    }
+
+    /// Regression (ultrareview): `apply_dash_o_override` split on the first
+    /// `=` *or* whitespace, so `-o "Port = 2222"` (spaces around `=`) split
+    /// into key="Port", val="= 2222" — the stray leading `=` then failed
+    /// `Port`'s `u16` parse. Must match `openssh_config::split_keyword`'s
+    /// two-step handling (split, then strip a leading `=`).
+    #[test]
+    fn resolve_for_native_dash_o_tolerates_spaces_around_equals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(&config, "Host production\n    HostName 10.20.0.15\n").unwrap();
+        let plan = parse_wrapper(s(&["-F", config.to_str().unwrap(), "-o", "Port = 2222", "production"])).unwrap();
+
+        let (_resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        assert_eq!(host_config.port, Some(2222));
+    }
+
+    /// Regression (ultrareview): `-o IdentityFile=~/...` was pushed verbatim
+    /// (including a literal leading `~`), so `read_credential`'s `fs::read`
+    /// on a path beginning with `~` always failed — unlike the config-file
+    /// path, which does expand `~` via `openssh_config`'s own resolver.
+    #[test]
+    fn resolve_for_native_dash_o_identity_file_expands_tilde() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(&config, "Host production\n    HostName 10.20.0.15\n").unwrap();
+        let plan =
+            parse_wrapper(s(&["-F", config.to_str().unwrap(), "-o", "IdentityFile=~/.ssh/deploy_key", "production"])).unwrap();
+
+        let (_resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        let home = isekai_fs_guard::resolve_home_dir().unwrap();
+        assert_eq!(host_config.identity_file, vec![home.join(".ssh/deploy_key")]);
     }
 
     // parse_bootstrap_relay_*: moved to `wrapper/config.rs`'s own test
