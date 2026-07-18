@@ -1154,6 +1154,13 @@ pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolutio
             )
         })?,
     };
+    let mut host_config = host_config;
+    // Command-line overrides (`-p`/`-l`/`-J`/`-o Key=Value`) beat the config
+    // file, matching real `ssh(1)` precedence. The Unix path gets this for
+    // free by forwarding every arg to `ssh -G`; the native path resolves the
+    // config file directly, so it has to re-apply the overrides itself or it
+    // would silently connect to the config-file (or default) host/port/user.
+    apply_cli_overrides(&mut host_config, &plan.ssh_args)?;
     let openssh = OpenSshEffectiveConfig {
         hostname: host_config.host_name.clone(),
         user: host_config.user.clone(),
@@ -1163,6 +1170,134 @@ pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolutio
     };
     let isekai = resolve_isekai_config(plan, &openssh)?;
     Ok((WrapperResolution { openssh, isekai }, host_config))
+}
+
+/// Command-line overrides collected from `ssh_args` (the portion before the
+/// destination), to be layered on top of a config-file-resolved `HostConfig`.
+/// First value wins per keyword — mirroring `ssh(1)`, where the earliest
+/// command-line occurrence of an option takes precedence.
+#[derive(Default)]
+struct CliOverrides {
+    host_name: Option<String>,
+    user: Option<String>,
+    port: Option<u16>,
+    proxy_jump: Option<String>,
+    identity_file: Vec<PathBuf>,
+    forward_agent: Option<openssh_config::ForwardAgent>,
+    identity_agent: Option<PathBuf>,
+}
+
+/// Applies command-line overrides (`-p`/`-l`/`-J`/`-o Key=Value`) from
+/// `ssh_args` onto `host_config`, so they win over the resolved config file —
+/// the ordering real `ssh(1)` uses (command-line options beat matched
+/// `Host`/`Match` blocks). Only the keywords `openssh_config::HostConfig`
+/// already models are handled; every other `-o Key` is ignored, exactly as
+/// `openssh-config` ignores config-file keywords outside its subset.
+fn apply_cli_overrides(host_config: &mut openssh_config::HostConfig, ssh_args: &[String]) -> Result<()> {
+    let overrides = collect_cli_overrides(ssh_args)?;
+    if let Some(host_name) = overrides.host_name {
+        host_config.host_name = Some(host_name);
+    }
+    if let Some(user) = overrides.user {
+        host_config.user = Some(user);
+    }
+    if let Some(port) = overrides.port {
+        host_config.port = Some(port);
+    }
+    if let Some(proxy_jump) = overrides.proxy_jump {
+        host_config.proxy_jump = Some(proxy_jump);
+    }
+    if let Some(forward_agent) = overrides.forward_agent {
+        host_config.forward_agent = Some(forward_agent);
+    }
+    if let Some(identity_agent) = overrides.identity_agent {
+        host_config.identity_agent = Some(identity_agent);
+    }
+    if !overrides.identity_file.is_empty() {
+        // `IdentityFile` accumulates in `ssh(1)`, with command-line entries
+        // taking priority — prepend so they're tried first.
+        let mut merged = overrides.identity_file;
+        merged.append(&mut host_config.identity_file);
+        host_config.identity_file = merged;
+    }
+    Ok(())
+}
+
+/// Walks `ssh_args` up to the destination (same scope and option-width logic
+/// as `dash_f_config_path`) collecting the overrides expressible through
+/// `openssh_config::HostConfig`. First occurrence wins per keyword.
+fn collect_cli_overrides(ssh_args: &[String]) -> Result<CliOverrides> {
+    let mut overrides = CliOverrides::default();
+    let mut i = 0;
+    while i < ssh_args.len() {
+        let arg = ssh_args[i].as_str();
+        if arg == "--" || (!arg.starts_with('-') || arg == "-") {
+            break;
+        }
+        let value = ssh_args.get(i + 1).map(String::as_str);
+        match (arg, value) {
+            ("-p", Some(v)) => {
+                let port = v
+                    .parse::<u16>()
+                    .with_context(|| format!("isekai-ssh: invalid -p port: {v}"))?;
+                overrides.port.get_or_insert(port);
+            }
+            ("-l", Some(v)) => {
+                overrides.user.get_or_insert_with(|| v.to_string());
+            }
+            ("-J", Some(v)) => {
+                overrides.proxy_jump.get_or_insert_with(|| v.to_string());
+            }
+            ("-o", Some(v)) => {
+                apply_dash_o_override(&mut overrides, v)?;
+            }
+            _ => {}
+        }
+        i += ssh_option_width(arg);
+    }
+    Ok(overrides)
+}
+
+/// Applies one `-o Key=Value` (or `-o "Key Value"`) token to `overrides`.
+/// Keyword matching is case-insensitive, following `ssh_config(5)`. Keywords
+/// outside `openssh_config::HostConfig`'s modeled subset are silently ignored.
+fn apply_dash_o_override(overrides: &mut CliOverrides, token: &str) -> Result<()> {
+    let Some((key, val)) = token.split_once(|c: char| c == '=' || c.is_whitespace()) else {
+        return Ok(());
+    };
+    let val = val.trim();
+    match key.trim().to_ascii_lowercase().as_str() {
+        "hostname" => {
+            overrides.host_name.get_or_insert_with(|| val.to_string());
+        }
+        "user" => {
+            overrides.user.get_or_insert_with(|| val.to_string());
+        }
+        "port" => {
+            let port = val
+                .parse::<u16>()
+                .with_context(|| format!("isekai-ssh: invalid -o Port: {val}"))?;
+            overrides.port.get_or_insert(port);
+        }
+        "proxyjump" => {
+            overrides.proxy_jump.get_or_insert_with(|| val.to_string());
+        }
+        "identityfile" => {
+            overrides.identity_file.push(PathBuf::from(val));
+        }
+        "identityagent" => {
+            overrides.identity_agent.get_or_insert_with(|| PathBuf::from(val));
+        }
+        "forwardagent" => {
+            overrides.forward_agent.get_or_insert_with(|| match val.to_ascii_lowercase().as_str() {
+                "yes" => openssh_config::ForwardAgent::Yes,
+                "no" => openssh_config::ForwardAgent::No,
+                _ => openssh_config::ForwardAgent::Socket(val.to_string()),
+            });
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Finds an explicit `-F <path>` in `ssh_args` (the portion before the
@@ -2291,6 +2426,79 @@ Host *
         assert_eq!(host_config.user.as_deref(), Some("deploy"));
         assert_eq!(host_config.port, Some(2222));
         assert_eq!(resolution.native_host_port("production"), ("10.20.0.15".to_string(), 2222));
+    }
+
+    /// Codex review finding: `resolve_for_native` used to ignore every
+    /// command-line override except `-F` — `-p`/`-l`/`-J`/`-o` were silently
+    /// dropped, so `isekai-ssh -p 2222 host` on the native path connected to
+    /// the config-file (or default) port instead. Command-line options must
+    /// beat the config file, matching real `ssh(1)` precedence.
+    #[test]
+    fn resolve_for_native_applies_command_line_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(
+            &config,
+            "Host production\n    HostName 10.20.0.15\n    User deploy\n    Port 2222\n    ProxyJump bastion\n",
+        )
+        .unwrap();
+        let plan = parse_wrapper(s(&[
+            "-F",
+            config.to_str().unwrap(),
+            "-p",
+            "2200",
+            "-l",
+            "root",
+            "-J",
+            "gateway",
+            "production",
+        ]))
+        .unwrap();
+
+        let (resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        // Config file supplies HostName; -p/-l/-J win over Port/User/ProxyJump.
+        assert_eq!(host_config.host_name.as_deref(), Some("10.20.0.15"));
+        assert_eq!(host_config.port, Some(2200));
+        assert_eq!(host_config.user.as_deref(), Some("root"));
+        assert_eq!(host_config.proxy_jump.as_deref(), Some("gateway"));
+        assert_eq!(resolution.native_host_port("production"), ("10.20.0.15".to_string(), 2200));
+    }
+
+    /// `-o Key=Value` overrides the matched config-file keyword too, and
+    /// command-line entries win when both name the same key (`-p` set first
+    /// beats a later `-o Port=`, following `ssh(1)`'s first-wins ordering).
+    #[test]
+    fn resolve_for_native_applies_dash_o_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(
+            &config,
+            "Host production\n    HostName 10.20.0.15\n    Port 22\n",
+        )
+        .unwrap();
+        let plan = parse_wrapper(s(&[
+            "-F",
+            config.to_str().unwrap(),
+            "-p",
+            "2200",
+            "-o",
+            "Port=3300",
+            "-o",
+            "User=admin",
+            "-o",
+            "HostName=192.0.2.7",
+            "production",
+        ]))
+        .unwrap();
+
+        let (resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        // -p 2200 was seen before -o Port=3300, so it wins (first occurrence).
+        assert_eq!(host_config.port, Some(2200));
+        assert_eq!(host_config.user.as_deref(), Some("admin"));
+        assert_eq!(host_config.host_name.as_deref(), Some("192.0.2.7"));
+        assert_eq!(resolution.native_host_port("production"), ("192.0.2.7".to_string(), 2200));
     }
 
     // parse_bootstrap_relay_*: moved to `wrapper/config.rs`'s own test
