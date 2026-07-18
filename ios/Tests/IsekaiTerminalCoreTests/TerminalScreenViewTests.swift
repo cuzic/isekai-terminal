@@ -327,6 +327,72 @@ final class TerminalScreenViewTests: XCTestCase {
         _ = renderer.image { _ in view.draw(view.bounds) }
     }
 
+    /// タスク#79: `scrollOffset == 0`のまま`showingScrollback`が真の場合(検索結果の
+    /// scrollback最新行[row=0]へジャンプした状態)に`computeDisplayUpdate()`/`draw(_:)`が
+    /// クラッシュしないことのスモークテスト(他の`testDraw*DoesNotCrash`と同じ方針、
+    /// 実際のピクセル出力の目視確認は対象外)。この状態を実際に到達可能にした判断
+    /// ロジック自体の回帰検出は`IsekaiTerminalCoreLogicTests/TerminalScreenSearchHighlightTests`
+    /// (`searchHighlightMatch`、Linux上でも`swift test`可能なピュア関数)を参照。
+    func testDrawWithSearchHighlightAtRowZeroWhileShowingScrollbackDoesNotCrash() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let cols = 4
+        let rows = 2
+        let cells = (0..<(cols * rows)).map { i in
+            CellData(
+                ch: i % 2 == 0 ? "A" : " ", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
+                dim: false, italic: false, underline: false,
+                strikethrough: false, blink: false, invisible: false, linkId: nil
+            )
+        }
+        let update = ScreenUpdate(
+            cols: UInt32(cols), rows: UInt32(rows), cells: cells,
+            cursorRow: 0, cursorCol: 1,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
+            cursorVisible: true, bellGeneration: 0,
+            cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
+        )
+        view.apply(update)
+        view.onScrollbackLenRequest = { 10 }
+        view.onScrollbackRequest = { _, _ in cells }
+        // scrollOffsetは既定の0(ライブと数値上は同じ)のまま、showingScrollbackだけを
+        // 真にする——これがタスク#79で新しく到達可能になった状態。
+        view.showingScrollback = true
+        view.searchHighlight = ScrollbackSearchMatch(row: 0, col: 0, len: 1)
+
+        view.layoutIfNeeded()
+        let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
+        _ = renderer.image { _ in view.draw(view.bounds) }
+    }
+
+    /// `scrollOffset == 0`かつ`showingScrollback == false`(通常のライブ画面表示)の間、
+    /// row=0のマッチがあっても`draw(_:)`のガードがクラッシュしないことのスモークテスト
+    /// (判断ロジック自体の回帰検出は`TerminalScreenSearchHighlightTests`参照、上と同じ方針)。
+    func testDrawWithSearchHighlightAtRowZeroWhileLiveDoesNotCrash() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let cells = (0..<(4 * 2)).map { i in
+            CellData(
+                ch: i % 2 == 0 ? "A" : " ", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
+                dim: false, italic: false, underline: false,
+                strikethrough: false, blink: false, invisible: false, linkId: nil
+            )
+        }
+        let update = ScreenUpdate(
+            cols: 4, rows: 2, cells: cells,
+            cursorRow: 0, cursorCol: 1,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
+            cursorVisible: true, bellGeneration: 0,
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+        )
+        view.apply(update)
+        view.searchHighlight = ScrollbackSearchMatch(row: 0, col: 0, len: 1)
+
+        view.layoutIfNeeded()
+        let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
+        _ = renderer.image { _ in view.draw(view.bounds) }
+    }
+
     // MARK: - Phase 1F-2(#49): clampedFontScale
     //
     // `CGFloat`を使うため`IsekaiTerminalCoreLogic`(Linuxでも`swift test`可能な純ロジック層)には

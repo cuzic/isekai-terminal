@@ -35,6 +35,14 @@ public struct TerminalView: View {
     /// `TerminalScreenView`(UIKit側)からの通知で更新され、「ライブへ戻る」ボタンからも
     /// 0を書き戻す(`selection`/`fontScale`と同じ双方向バインディング)。
     @State private var scrollOffset: UInt32 = 0
+    /// タスク#79: `scrollOffset == 0`は従来「ライブ画面表示」を意味する唯一の条件として
+    /// 使われてきたが、これだと検索結果の`row == 0`(scrollbackの最新履歴行)へジャンプする
+    /// 際、`scrollOffset`を0にしてもライブ表示に横取りされて到達不能になっていた。
+    /// 「ユーザーが明示的にscrollback表示へ入っているか」を`scrollOffset`の値そのものとは
+    /// 独立したフラグとして持つことで、`scrollOffset == 0`のままscrollback最新行を表示
+    /// できるようにする(`scrollOffset`と同じく`TerminalScreenView`との双方向バインディング、
+    /// Android版`TerminalScreen.kt`の`showingScrollback`と対称)。
+    @State private var showingScrollback = false
     /// タスク#52: タップされたOSC 8リンクの確認待ちURL。「UI表示だけに閉じた状態」
     /// (`.claude/rules/rust-ssot.md`の例外)として`selection`/`scrollOffset`と同じく
     /// SwiftUI側の`@State`で保持する(Android版`pendingHyperlinkUrl`と対称)。
@@ -85,11 +93,15 @@ public struct TerminalView: View {
             TerminalScreenRepresentable(
                 uiState: uiState, controller: controller,
                 selection: $selection, fontScale: $fontScale, scrollOffset: $scrollOffset,
+                showingScrollback: $showingScrollback,
                 pendingHyperlinkURL: $pendingHyperlinkURL,
-                // タスク#67 codexレビュー指摘: `row == 0`(scrollback最新行)は
-                // `jumpToCurrentMatch()`のドキュメント参照の通り、この`scrollOffset`の
-                // 仕組みでは表示不可能なので、ハイライト自体を渡さない(誤った行を
-                // ハイライトして見せない)。
+                // タスク#79: `row == 0`(scrollback最新行)のマッチは`showingScrollback`が
+                // 真(=`jumpToCurrentMatch()`で実際にジャンプ済み)の間だけハイライトを渡す。
+                // それ以外(ライブ画面表示中)にrow=0のマッチを誤ってハイライトしないための
+                // ガード(元はcodexレビュー指摘によりrow=0を常に除外していたが、これだと
+                // 検索結果に出るのにジャンプもハイライトも到達できなくなっていた)。判断
+                // ロジック自体は`searchHighlightMatch`(`IsekaiTerminalCoreLogic/TerminalScrollback.swift`、
+                // Android版`searchHighlightMatch`と対称)へ抽出済みでユニットテスト可能。
                 //
                 // 既知の残存境界(codexレビュー2次指摘、意図的に未対応): `searchMatches`は
                 // クエリ変更・大小文字トグル・`next`/`prev`の度に再検索するが(`refreshMatches()`)、
@@ -105,7 +117,7 @@ public struct TerminalView: View {
                 // `ScrollbackSearchMatch`のドキュメント(#37)自体が明記して受け入れている
                 // 前提であり、完全に解消するにはRust側にscrollback世代カウンタ等の
                 // 新しいAPI面が要る(このタスク[#67、iOS UI実装のみ]の範囲外)。
-                searchHighlight: currentSearchMatch.flatMap { $0.row == 0 ? nil : $0 }
+                searchHighlight: searchHighlightMatch(currentSearchMatch, scrollOffset: scrollOffset, showingScrollback: showingScrollback)
             )
             .accessibilityIdentifier("terminalScreen")
 
@@ -146,7 +158,9 @@ public struct TerminalView: View {
                     .frame(maxWidth: .infinity, alignment: .top)
             }
 
-            if scrollOffset > 0 {
+            // タスク#79: `showingScrollback`が真の間(scrollOffset==0のscrollback最新行表示)も
+            // 表示する — このボタン以外にライブへ戻る手段が無いため。
+            if scrollOffset > 0 || showingScrollback {
                 backToLiveButton
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .padding(.bottom, 8)
@@ -368,9 +382,13 @@ public struct TerminalView: View {
                 if let update = uiState.latestScreenUpdate {
                     // Phase 1F-4(#51): スクロールバック表示中はスクロールバックの内容から
                     // コピーする(Android版`reconstructSelectionText(displayUpdate, sel)`と
-                    // 同じ、ライブの内容が誤ってコピーされないようにする)。
-                    let cells = scrollOffset > 0 ? controller.scrollbackCells(offset: scrollOffset, rows: update.rows) : []
-                    let displayUpdate = synthesizeDisplayUpdate(live: update, scrollOffset: scrollOffset, scrollbackCells: cells)
+                    // 同じ、ライブの内容が誤ってコピーされないようにする)。タスク#79:
+                    // `showingScrollback`(scrollOffset==0のscrollback最新行表示)中も同様。
+                    let cells = (scrollOffset > 0 || showingScrollback)
+                        ? controller.scrollbackCells(offset: scrollOffset, rows: update.rows) : []
+                    let displayUpdate = synthesizeDisplayUpdate(
+                        live: update, scrollOffset: scrollOffset, scrollbackCells: cells, showingScrollback: showingScrollback
+                    )
                     let text = reconstructSelectionText(update: displayUpdate, selection: selection)
                     if !text.isEmpty {
                         UIPasteboard.general.string = text
@@ -480,24 +498,19 @@ public struct TerminalView: View {
 
     /// `scrollOffset`を現在のマッチの`row`へ合わせ、そのマッチが画面に映るようにする。
     ///
-    /// 既知の境界(タスク#67実装時に判明、codexレビューで実際に誤りだと指摘された):
-    /// scrollback最新行(`row == 0`)は、`scrollOffset == 0`が「ライブ画面表示」を兼ねる
-    /// 既存の規約(`TerminalScreenView.computeDisplayUpdate()`)と衝突するため、
-    /// この`TerminalScreenView`/`scrollOffset`の仕組み経由では原理的に表示不可能
-    /// (`scrollback_cells`の`sb_idx = offset + (rows-1-r)`はどの`offset >= 1`を
-    /// 選んでも最小値が`offset`自体になり、`sb_idx == 0`には到達できない——
-    /// `offset == 0`は既存規約でライブ表示に横取りされる)。近似のつもりで
-    /// `scrollOffset`を1などにずらすと、無関係な内容を「ジャンプできた」かのように
-    /// 見せてしまう(初版のcodexレビュー指摘)ため、この場合は`scrollOffset`を
-    /// 変更せず、ハイライトも描かない(呼び出し元`searchHighlight`計算で`row == 0`を
-    /// 除外する)。件数表示(n/m)自体はこのマッチを含めたまま数えるが、画面上の
-    /// ジャンプ・ハイライトだけは行わない——誤った位置を正しいかのように示すより
-    /// 安全側の選択。
+    /// タスク#79: scrollback最新行(`row == 0`)は、`scrollOffset == 0`が「ライブ画面表示」を
+    /// 兼ねる既存の規約(`TerminalScreenView.computeDisplayUpdate()`)と衝突するため、
+    /// `scrollOffset`の値だけでは表示できない(`scrollback_cells`の
+    /// `sb_idx = offset + (rows-1-r)`は`offset == 0`のとき`sb_idx == 0`[=scrollback最新行]に
+    /// 一致するが、この`offset == 0`は従来ライブ表示に横取りされていた)。
+    /// `showingScrollback`を真にすることで`scrollOffset == 0`のままscrollback最新行の
+    /// 合成表示へ切り替える(`TerminalScreenView.computeDisplayUpdate`・`searchHighlight`
+    /// 計算・`backToLiveButton`の表示条件も同じフラグを見る)。
     private func jumpToCurrentMatch() {
         guard searchMatches.indices.contains(currentMatchIndex) else { return }
         let match = searchMatches[currentMatchIndex]
-        guard match.row != 0 else { return }
         scrollOffset = match.row
+        showingScrollback = true
     }
 
     private func goToNextMatch() {
@@ -528,6 +541,7 @@ public struct TerminalView: View {
     private var backToLiveButton: some View {
         Button {
             scrollOffset = 0
+            showingScrollback = false
         } label: {
             Text("↓ ライブへ戻る (\(scrollOffset) / \(controller.scrollbackLen()))")
                 .font(.caption)
@@ -560,6 +574,10 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
     @Binding var selection: SelectionRange?
     @Binding var fontScale: Double
     @Binding var scrollOffset: UInt32
+    /// タスク#79: `scrollOffset`と同じ双方向バインディング。`scrollOffset == 0`のまま
+    /// scrollback最新行(row=0)を表示するかどうかを`scrollOffset`の値そのものとは
+    /// 独立に持つ(`TerminalView.showingScrollback`参照)。
+    @Binding var showingScrollback: Bool
     @Binding var pendingHyperlinkURL: String?
     /// タスク#67: 検索バーの現在マッチ(非Binding——`TerminalView`側の`searchMatches`/
     /// `currentMatchIndex`から都度導出した読み取り専用の値を渡すだけで、
@@ -583,6 +601,11 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
         }
         view.onScrollOffsetChanged = { newValue in
             scrollOffset = newValue
+        }
+        // タスク#79: `handlePan`が手動でライブ方向へ戻し切った際、SwiftUI側の
+        // `showingScrollback`も解除する(`onScrollOffsetChanged`と同じ双方向バインディング)。
+        view.onShowingScrollbackChanged = { newValue in
+            showingScrollback = newValue
         }
         view.onHyperlinkTapped = { url in
             pendingHyperlinkURL = url
@@ -608,6 +631,7 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
         uiView.selection = selection
         uiView.fontScale = CGFloat(fontScale)
         uiView.scrollOffset = scrollOffset
+        uiView.showingScrollback = showingScrollback
         uiView.searchHighlight = searchHighlight
 
         // タスク#20: `connect()`は実際のview sizeが判明する前に既定の80x24でセッションを
@@ -670,6 +694,11 @@ private struct TerminalInputRepresentable: UIViewRepresentable {
         // handleHardwareKeyPress`経由)がDECKPAMに従ってSS3/リテラル文字を切り替え
         // られるよう、`applicationCursorMode`と同じパターンでRust由来の値を反映する。
         uiView.applicationKeypadMode = uiState.latestScreenUpdate?.applicationKeypadMode ?? false
+        // タスク#72: ハードウェアキーボードのEscapeキーがKitty keyboard protocol(タスク#54)の
+        // disambiguate escape codes(bit0)を反映できるよう、`applicationCursorMode`と同じ
+        // パターンでRust由来の値を反映する(以前は交渉されたflagsが一切反映されない既存バグ
+        // だった)。
+        uiView.kittyKeyboardFlags = uiState.latestScreenUpdate?.kittyKeyboardFlags ?? 0
         if isActive {
             if !uiView.isFirstResponder {
                 DispatchQueue.main.async { uiView.becomeFirstResponder() }
@@ -816,7 +845,11 @@ private final class TerminalAccessoryBar: UIView {
     @objc private func handleTap(_ sender: UIButton) {
         guard keys.indices.contains(sender.tag) else { return }
         let applicationCursorMode = controller?.uiState.latestScreenUpdate?.applicationCursorMode ?? false
-        let bytes = TerminalKeyMapper.bytes(for: keys[sender.tag], applicationCursorMode: applicationCursorMode)
+        // タスク#72: 「Esc」ボタンがKitty keyboard protocol(タスク#54)のdisambiguate
+        // escape codes(bit0)をハードウェアキーボード経路と同じく反映できるよう、
+        // 交渉済みflagsをそのまま渡す(以前は反映されない既存バグだった)。
+        let kittyFlags = controller?.uiState.latestScreenUpdate?.kittyKeyboardFlags ?? 0
+        let bytes = TerminalKeyMapper.bytes(for: keys[sender.tag], applicationCursorMode: applicationCursorMode, kittyFlags: kittyFlags)
         controller?.send(Data(bytes))
     }
 

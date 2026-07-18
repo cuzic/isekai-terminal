@@ -62,6 +62,45 @@ class TerminalScrollbackTest {
     }
 
     @Test
+    fun `returns live update when scroll offset is zero even with scrollback cells present but showingScrollback is false`() {
+        val live = update(rows = listOf("live line"), cols = 20, cursorCol = 3u)
+        val scrollbackCells = List(20) { cell('x') }
+
+        val result = synthesizeDisplayUpdate(live, scrollOffset = 0, scrollbackCells = scrollbackCells)
+
+        assertEquals(live, result)
+    }
+
+    @Test
+    fun `synthesizes scrollback update when offset is zero and showingScrollback is true`() {
+        // タスク#79: 検索結果のscrollback最新行(row=0)へジャンプする際、`scrollOffset`は
+        // 0のままだが`showingScrollback`を真にすることで合成表示へ切り替わることを確認する
+        // (以前は`scrollOffset <= 0`だけを見ていたため、この場合も常にライブへフォール
+        // バックしてしまい、row=0の結果に到達できなかった)。
+        val live = update(rows = listOf("live line"), cols = 20, cursorCol = 3u)
+        val scrollbackCells = List(20) { cell('x') }
+
+        val result = synthesizeDisplayUpdate(
+            live, scrollOffset = 0, scrollbackCells = scrollbackCells, showingScrollback = true,
+        )
+
+        assertEquals(scrollbackCells, result.cells)
+        assertEquals(live.rows, result.cursorRow)
+        assertEquals(0u, result.cursorCol)
+    }
+
+    @Test
+    fun `falls back to live when showingScrollback is true but offset is zero and cells are null`() {
+        val live = update(rows = listOf("live line"), cols = 20)
+
+        val result = synthesizeDisplayUpdate(
+            live, scrollOffset = 0, scrollbackCells = null, showingScrollback = true,
+        )
+
+        assertEquals(live, result)
+    }
+
+    @Test
     fun `synthesizes scrollback update when offset is positive`() {
         val live = update(rows = listOf("live line"), cols = 20, cursorCol = 3u)
         val scrollbackCells = List(20) { cell('x') } // live.cols(20) * live.rows(1)

@@ -6,9 +6,13 @@ import uniffi.isekai_terminal_core.ScreenUpdate
 /**
  * タスク#46: ライブの[live]とスクロールバックの行([scrollbackCells])から表示用の
  * [ScreenUpdate]を合成する。iOS版`TerminalScrollback.swift`の`synthesizeDisplayUpdate`と
- * 対称(このファイルはその移植元)。`scrollOffset <= 0`ならライブをそのまま返す。
- * [scrollbackCells]の件数が`live.cols * live.rows`と一致しない場合(未取得・セッション未確立・
- * リサイズ中の過渡状態等)もライブへフォールバックする。
+ * 対称(このファイルはその移植元)。`scrollOffset <= 0`かつ[showingScrollback]が偽の
+ * ときだけライブをそのまま返す——`scrollOffset == 0`は「ライブ画面表示」と
+ * 「scrollback最新行(row=0)表示」の両方を指しうるため、[showingScrollback]で明示的に
+ * 区別する(タスク#79: 検索結果のrow=0へジャンプする際、`scrollOffset`を変えずに
+ * scrollback最新行を合成表示させるために追加。呼び出し元`TerminalScreen.kt`の
+ * `showingScrollback`参照)。[scrollbackCells]の件数が`live.cols * live.rows`と一致しない
+ * 場合(未取得・セッション未確立・リサイズ中の過渡状態等)もライブへフォールバックする。
  *
  * 検証対象の寸法は必ず[live]自身の`cols`/`rows`から導出すること(呼び出し側でCompose層が
  * 独自に計算したビューポート由来のcols/rowsを渡してはいけない)。`actions.onScrollbackCells`
@@ -33,8 +37,9 @@ fun synthesizeDisplayUpdate(
     live: ScreenUpdate,
     scrollOffset: Int,
     scrollbackCells: List<CellData>?,
+    showingScrollback: Boolean = false,
 ): ScreenUpdate {
-    if (scrollOffset <= 0) return live
+    if (scrollOffset < 0 || (scrollOffset == 0 && !showingScrollback)) return live
     val cols = live.cols.toInt()
     val rows = live.rows.toInt()
     // iOS版と同じくcols/rowsが0(未初期化画面等)の縮退ケースも明示的にライブへ
