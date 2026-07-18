@@ -801,16 +801,8 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let expired = sessions.sweep_expired_parked(max_parked).await;
-                // `SessionTable::sweep_expired_parked`'s docs: discarding a
-                // parked session here doesn't by itself free the matching
-                // `AttachArbiter` fencing slot — do that here so a park
-                // timing out actually lets a fresh ATTACH for this target
-                // through again, instead of leaving it permanently rejected
-                // with `BUSY_OTHER_SESSION` until this process restarts.
                 for id in expired {
-                    if let Some(lease) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(id)).await {
-                        attach_runtime.relay_ended(lease).await;
-                    }
+                    release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(id)).await;
                 }
             }
         });
@@ -1009,6 +1001,74 @@ async fn reject_attach(send: &mut AnyByteStreamWriteHalf, reason: AttachRejectRe
     reject(send, &encode_attach_response(&AttachResponse::Reject(reason))).await;
 }
 
+/// Frees `session_id`'s `AttachArbiter` fencing slot if it's still holding
+/// it. Shared by every path that discards a session's `SessionTable` entry
+/// out from under a live `Established` slot (`sweep_expired_parked`'s park
+/// timeout, `insert_existing`'s `--max-sessions` LRU eviction, and
+/// `handle_attach_stream`'s fresh-ATTACH preemption of a merely-parked
+/// session, below) — `SessionTable` alone can never do this itself, since
+/// it has no handle to `AttachArbiter` (`resume.rs`'s module docs). Calling
+/// this exactly once per discard is correctness-critical: skipping it
+/// leaves the slot `Established`-but-orphaned, permanently rejecting every
+/// future ATTACH for this target with `BUSY_OTHER_SESSION` until the
+/// process restarts — `.claude/rules/always-connects.md` records two prior
+/// bugs (`sweep_expired_parked` and `insert_existing`, before either called
+/// this) where exactly that happened.
+async fn release_slot_for(attach_runtime: &Arc<AttachRuntime>, session_id: isekai_protocol::SessionId) {
+    if let Some(lease) = attach_runtime.established_lease_for(session_id).await {
+        attach_runtime.relay_ended(lease).await;
+    }
+}
+
+/// Wraps `AttachRuntime::hello` with one retry: if the fencing race is lost
+/// to `BusyOtherSession`, attempts to preempt whatever is occupying the
+/// slot — but only succeeds in doing so if that occupant turns out to be
+/// merely parked (`SessionTable::claim_parked`'s docs), never one that's
+/// actively relaying. Without this, a client that never comes back to
+/// `RESUME` its own parked session (laptop never reopened, process killed,
+/// host rebooted) locks *every* future connection attempt to this target
+/// out with `BUSY_OTHER_SESSION` until `sweep_expired_parked`'s park
+/// backstop — now days-long, `isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`'s
+/// docs — finally reclaims it, which directly violates this project's
+/// "always connects" principle (`.claude/rules/always-connects.md`) for
+/// exactly the scenario this whole resume-window redesign exists to
+/// support. See `ISEKAI_PIPE_DESIGN.md` §8's parked-session-preemption Epic
+/// for the incident this fixes.
+///
+/// Whether the preemption actually happens is decided entirely by
+/// `SessionTable::claim_parked`'s atomic `parked_tcp.take()` — this
+/// function never reasons about parked-ness itself, so a `RESUME` for the
+/// same holder racing in concurrently is resolved fairly (whichever of the
+/// two takes `parked_tcp` first wins outright; see that method's docs).
+async fn hello_with_parked_preemption(attach_runtime: &Arc<AttachRuntime>, sessions: &SessionTable, key: AttachKey) -> HelloOutcome {
+    let first = attach_runtime.hello(key).await;
+    if !matches!(first, HelloOutcome::Reject(AttachRejectReason::BusyOtherSession)) {
+        return first;
+    }
+    let Some((holder_id, _lease)) = attach_runtime.current_established().await else {
+        // The slot has already moved on since the rejection above (e.g. the
+        // holder's own relay just ended for good) — retry once and use
+        // whatever's true right now rather than guessing.
+        return attach_runtime.hello(key).await;
+    };
+    let holder_bytes = *holder_id.as_bytes();
+    let preempted = match sessions.claim_parked(&holder_bytes).await {
+        // `Missing` self-heals a `SessionTable`/`AttachArbiter` desync that
+        // should never happen by construction but has occurred twice
+        // before (`.claude/rules/always-connects.md`) — nothing left to
+        // close, so just free the slot the same as a genuine claim.
+        resume::ClaimParkedOutcome::Claimed | resume::ClaimParkedOutcome::Missing => true,
+        // Actively relaying, or a concurrent RESUME already won the race —
+        // in both cases the holder is legitimately still using the slot.
+        resume::ClaimParkedOutcome::NotParked => false,
+    };
+    if !preempted {
+        return first;
+    }
+    release_slot_for(attach_runtime, holder_id).await;
+    attach_runtime.hello(key).await
+}
+
 /// helper 側の `ATTACH_HELLO` 検証・fencing判定([`AttachRuntime::hello`])・
 /// `AttachActivate`待ち・中継を行う(`#18`)。`PendingActivation`(ACK送信後
 /// `AttachActivate`受信前)の間は、まだtargetへのSSHユーザーデータを一切
@@ -1047,7 +1107,7 @@ async fn handle_attach_stream(
     }
 
     let key = AttachKey { session_id: hello.session_id, generation: hello.generation, attempt_id: hello.attempt_id };
-    let (lease, attach_token) = match attach_runtime.hello(key).await {
+    let (lease, attach_token) = match hello_with_parked_preemption(&attach_runtime, &sessions, key).await {
         HelloOutcome::Reject(reason) => {
             reject_attach(&mut send, reason).await;
             return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));
@@ -1110,13 +1170,7 @@ async fn handle_attach_stream(
     if let resume::InsertOutcome::InsertedAfterEvicting(evicted_id) =
         sessions.insert_existing(session_id_bytes, handle.clone()).await
     {
-        // See `SessionTable::insert_existing`'s docs: evicting a parked
-        // session from the table doesn't by itself free its matching
-        // `AttachArbiter` fencing slot — do that here, exactly like the
-        // `sweep_expired_parked` fix (`resume.rs`'s docs on that method).
-        if let Some(lease) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(evicted_id)).await {
-            attach_runtime.relay_ended(lease).await;
-        }
+        release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(evicted_id)).await;
     }
     log::info!("attach established, session_id={}", hex_lower(&session_id_bytes));
 
