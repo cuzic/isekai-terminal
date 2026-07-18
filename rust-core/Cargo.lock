@@ -1665,6 +1665,7 @@ dependencies = [
  "rand 0.8.6",
  "russh",
  "russh-keys",
+ "russh-stream-session",
  "serde",
  "serde_json",
  "sha2",

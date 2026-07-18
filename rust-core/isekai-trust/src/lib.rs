@@ -32,5 +32,8 @@ pub mod store;
 
 pub use error::TrustError;
 pub use normalize::{normalize_host_port, split_user_host_port};
-pub use schema::{HelperTrust, TrustStore, UpdatePolicy};
-pub use store::{default_config_dir, default_trust_store_path, load_trust_store, save_trust_store};
+pub use schema::{HelperTrust, SshHostKeyTrust, SshHostKeyTrustStore, TrustStore, UpdatePolicy};
+pub use store::{
+    default_config_dir, default_ssh_host_key_trust_store_path, default_trust_store_path,
+    load_ssh_host_key_trust_store, load_trust_store, save_ssh_host_key_trust_store, save_trust_store,
+};
