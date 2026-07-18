@@ -8,6 +8,66 @@ func clampedFontScale(current: CGFloat, zoomDelta: CGFloat) -> CGFloat {
     min(max(current * zoomDelta, 0.5), 3.0)
 }
 
+/// Sixel(タスク#42)の`ImagePlacement.rgba`(RGBA8888、row-major)から`UIImage`を作って
+/// idでキャッシュする。`ScreenUpdate.images`はTerminal(rust-core)側で寿命管理された
+/// 「現在アクティブな画像の全リスト」がそのまま渡ってくる(rust-ssot: どの画像が
+/// まだ生きているかの判断はRust側で完結している)ため、このクラスは判断ロジックを
+/// 持たず「今回のリストに無いidの`UIImage`を捨て、まだキャッシュに無いidだけ新規
+/// デコードする」宣言的な反映のみを行う(Android版`SixelBitmapCache`と対称)。
+final class SixelBitmapCache {
+    private var cache: [UInt64: UIImage] = [:]
+
+    /// `placement`に対応する`UIImage`を返す(未キャッシュならデコードして格納する)。
+    /// `draw(_:)`が`update.images`を毎回丸ごと走査し、そのidをそのまま渡す設計
+    /// (呼び出し側が差分を判断する必要はない)。
+    func image(for placement: ImagePlacement) -> UIImage? {
+        if let cached = cache[placement.id] { return cached }
+        guard let image = Self.decode(placement) else { return nil }
+        cache[placement.id] = image
+        return image
+    }
+
+    /// `liveIds`に無いエントリを捨てる。`ScreenUpdate.images`にもう出てこなくなった
+    /// (＝Rust側で寿命が尽きた)画像のキャッシュを溜め込まないために呼ぶ。
+    func prune(liveIds: Set<UInt64>) {
+        cache = cache.filter { liveIds.contains($0.key) }
+    }
+
+    /// Rust側`sixel.rs`の`MAX_SIXEL_DIM`/`MAX_SIXEL_AREA`と同じ上限をここでも二重に
+    /// 適用する。通常経路ではRust側で既に弾かれているはずだが、寸法とバッファ長が
+    /// 矛盾する壊れた`ImagePlacement`が来た場合、`width * height * 4`のオーバーフロー
+    /// トラップや巨大`CGImage`確保に直結させないための防御(codexレビュー指摘、
+    /// Android版`SixelBitmapCache.isSane`と対称)。
+    private static let maxDimension = 4096
+    private static let maxArea = 4_000_000
+
+    private static func decode(_ placement: ImagePlacement) -> UIImage? {
+        let width = Int(placement.widthPx)
+        let height = Int(placement.heightPx)
+        guard width > 0, height > 0, width <= maxDimension, height <= maxDimension,
+              width * height <= maxArea,
+              placement.rgba.count == width * height * 4 else { return nil }
+        guard let provider = CGDataProvider(data: placement.rgba as CFData) else { return nil }
+        // 我々のデコーダ(`sixel.rs`)はalphaを常に0か255のいずれかでしか出力しない
+        // (部分透過は生成しない)ため、premultiplied/straightどちらの解釈でも
+        // 結果は同じになる——`premultipliedLast`を使う。
+        guard let cgImage = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ) else { return nil }
+        return UIImage(cgImage: cgImage)
+    }
+}
+
 /// Phase 1D: ターミナル本画面の描画。Rust→Kotlin間で既に使われている
 /// `ScreenUpdate`/`CellData`(ARGBパックの32bit色)を直接消費する
 /// (Phase 1A-6の`TerminalFrameBatch`/`PackedRow`は診断用の並行表現であり、
@@ -18,6 +78,9 @@ public final class TerminalScreenView: UIView {
     private var font = UIFont.monospacedSystemFont(ofSize: baseFontSize, weight: .regular)
     private var boldFont = UIFont.monospacedSystemFont(ofSize: baseFontSize, weight: .bold)
     private var cellSize: CGSize = .zero
+    /// Sixel(タスク#42)の`ImagePlacement.rgba`から作った`UIImage`をidでキャッシュする
+    /// (Android版`SixelBitmapCache`と対称)。
+    private let sixelBitmapCache = SixelBitmapCache()
 
     /// Phase 1F-1(#48): 現在の選択範囲(行単位)。Android版`SelectionRange`と対称。
     /// 非nilの間`draw(_:)`でハイライトを描画する。
@@ -196,6 +259,24 @@ public final class TerminalScreenView: UIView {
                 (cell.ch as NSString).draw(at: CGPoint(x: x, y: y), withAttributes: attrs)
             }
         }
+
+        // Sixel画像(タスク#42)。テキストグリッドの上・カーソル/選択ハイライトの下に
+        // 重ねる(Android版`SshTerminalCanvas.kt`と同じ描画順)。配置(row/col/
+        // rows_span/cols_span)の判断は一切ここでは行わず、Rust側が決めた矩形へ
+        // `rgba`を引き伸ばして描くだけ(rust-ssot)。ビットマップ自体はidをキーに
+        // キャッシュし(Android版`SixelBitmapCache`と対称)、同じ画像を毎フレーム
+        // デコードし直さない。
+        for placement in update.images {
+            guard let image = sixelBitmapCache.image(for: placement) else { continue }
+            let dstRect = CGRect(
+                x: CGFloat(placement.col) * cellWidth,
+                y: CGFloat(placement.row) * cellHeight,
+                width: CGFloat(placement.colsSpan) * cellWidth,
+                height: CGFloat(placement.rowsSpan) * cellHeight
+            )
+            image.draw(in: dstRect)
+        }
+        sixelBitmapCache.prune(liveIds: Set(update.images.map(\.id)))
 
         // 選択範囲のハイライト(行単位)。Android版`SshTerminalCanvas.kt`はセル背景の
         // 前(下)に半透明色を敷くが、iOS版は各セルの背景を無条件に不透明で塗るため
