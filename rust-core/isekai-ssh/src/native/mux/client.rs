@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::log_file::log_line;
 
-use super::protocol::{read_frame, write_frame, Frame, MUX_PROTOCOL_VERSION};
+use super::protocol::{spawn_frame_reader, write_frame, Frame, MUX_PROTOCOL_VERSION};
 
 /// How a client session ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -36,15 +36,15 @@ pub(crate) enum ClientOutcome {
 /// exit code.
 pub(crate) async fn run<Conn>(conn: Conn, token: &[u8]) -> Result<u8>
 where
-    Conn: AsyncRead + AsyncWrite + Unpin + Send,
+    Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut reader, mut writer) = tokio::io::split(conn);
+    let (reader, mut writer) = tokio::io::split(conn);
     let (cols, rows) = super::super::console::terminal_size();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
     let _raw_mode = super::super::console::RawModeGuard::enable().map_err(|e| anyhow!("isekai-ssh: failed to enable raw terminal mode: {e}"))?;
     let outcome = run_inner(
-        &mut reader,
+        reader,
         &mut writer,
         token,
         term,
@@ -74,9 +74,15 @@ where
 /// frames (and a final [`Frame::Shutdown`] on local EOF) while writing the
 /// owner's `Stdout`/`Stderr` frames to the local streams until an [`Frame::Exit`]
 /// (clean end) or a dropped connection (owner lost).
+///
+/// The owner connection's read half is owned by a dedicated frame-reader task
+/// (see [`spawn_frame_reader`]) so the `select!` loop can await frames on a
+/// cancel-safe `recv()`; reading `read_frame` directly in the `select!` arm
+/// would drop a half-read frame whenever the stdin branch won the race and
+/// desync the stream.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_inner<CR, CW, I, O, E>(
-    conn_read: &mut CR,
+    conn_read: CR,
     conn_write: &mut CW,
     token: &[u8],
     term: String,
@@ -87,7 +93,7 @@ pub(crate) async fn run_inner<CR, CW, I, O, E>(
     mut stderr: E,
 ) -> Result<ClientOutcome>
 where
-    CR: AsyncRead + Unpin,
+    CR: AsyncRead + Unpin + Send + 'static,
     CW: AsyncWrite + Unpin,
     I: AsyncRead + Unpin,
     O: AsyncWrite + Unpin,
@@ -97,19 +103,21 @@ where
         .await
         .map_err(|e| anyhow!("isekai-ssh: failed to send Hello to the owner: {e}"))?;
 
-    match read_frame(conn_read).await {
-        Ok(Some(Frame::HelloAck { version })) => {
+    let mut frame_rx = spawn_frame_reader(conn_read);
+
+    match frame_rx.recv().await {
+        Some(Ok(Some(Frame::HelloAck { version }))) => {
             if version != MUX_PROTOCOL_VERSION {
                 return Err(anyhow!("isekai-ssh: owner acknowledged with protocol version {version}, expected {MUX_PROTOCOL_VERSION}"));
             }
         }
-        Ok(Some(Frame::Rejected { reason })) => {
+        Some(Ok(Some(Frame::Rejected { reason }))) => {
             return Err(anyhow!("isekai-ssh: the owner process rejected this connection: {reason}"));
         }
-        Ok(Some(other)) => return Err(anyhow!("isekai-ssh: expected HelloAck from the owner, got {other:?}")),
+        Some(Ok(Some(other))) => return Err(anyhow!("isekai-ssh: expected HelloAck from the owner, got {other:?}")),
         // Owner vanished during the handshake — treat as owner-lost so the
         // user gets the reconnect guidance rather than an opaque error.
-        Ok(None) | Err(_) => return Ok(ClientOutcome::OwnerLost),
+        Some(Ok(None)) | Some(Err(_)) | None => return Ok(ClientOutcome::OwnerLost),
     }
 
     let mut buf = [0u8; 8192];
@@ -132,17 +140,17 @@ where
                     }
                 }
             }
-            frame = read_frame(conn_read) => {
+            frame = frame_rx.recv() => {
                 match frame {
-                    Ok(Some(Frame::Stdout(data))) => {
+                    Some(Ok(Some(Frame::Stdout(data)))) => {
                         let _ = stdout.write_all(&data).await;
                         let _ = stdout.flush().await;
                     }
-                    Ok(Some(Frame::Stderr(data))) => {
+                    Some(Ok(Some(Frame::Stderr(data)))) => {
                         let _ = stderr.write_all(&data).await;
                         let _ = stderr.flush().await;
                     }
-                    Ok(Some(Frame::Ctl(data))) => {
+                    Some(Ok(Some(Frame::Ctl(data)))) => {
                         // A control-plane message (`#@isekai ctl-socket`) the
                         // owner relayed from this tab's remote forward. Decode
                         // and apply it to *this* client's own terminal (OSC
@@ -155,11 +163,12 @@ where
                             }
                         }
                     }
-                    Ok(Some(Frame::Exit(code))) => return Ok(ClientOutcome::Exited(code)),
-                    Ok(Some(other)) => return Err(anyhow!("isekai-ssh: unexpected frame from the owner: {other:?}")),
-                    // A clean close without an Exit, or any read error (a reset
-                    // pipe), both mean the owner died mid-session.
-                    Ok(None) | Err(_) => return Ok(ClientOutcome::OwnerLost),
+                    Some(Ok(Some(Frame::Exit(code)))) => return Ok(ClientOutcome::Exited(code)),
+                    Some(Ok(Some(other))) => return Err(anyhow!("isekai-ssh: unexpected frame from the owner: {other:?}")),
+                    // A clean close without an Exit, any read error (a reset
+                    // pipe), or the reader task ending all mean the owner died
+                    // mid-session.
+                    Some(Ok(None)) | Some(Err(_)) | None => return Ok(ClientOutcome::OwnerLost),
                 }
             }
         }
@@ -169,6 +178,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::protocol::read_frame;
     use tokio::io::duplex;
 
     /// Runs `run_inner` against an in-memory owner connection whose behavior a
@@ -180,11 +190,11 @@ mod tests {
     ) -> (Result<ClientOutcome>, Vec<u8>, Vec<u8>) {
         let (client_conn, owner_conn) = duplex(64 * 1024);
         let _owner_task = owner(owner_conn);
-        let (mut cr, mut cw) = tokio::io::split(client_conn);
+        let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let outcome = run_inner(
-            &mut cr,
+            cr,
             &mut cw,
             b"tok",
             "xterm".to_string(),
@@ -328,15 +338,79 @@ mod tests {
             got_stdin
         });
 
-        let (mut cr, mut cw) = tokio::io::split(client_conn);
+        let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let outcome = run_inner(&mut cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b"echo hi\n"[..], &mut stdout, &mut stderr)
+        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b"echo hi\n"[..], &mut stdout, &mut stderr)
             .await
             .unwrap();
 
         assert_eq!(outcome, ClientOutcome::Exited(0));
         let got_stdin = owner.await.unwrap();
         assert_eq!(got_stdin, b"echo hi\n", "local stdin must be relayed to the owner verbatim");
+    }
+
+    /// Regression for the frame-reader cancel-safety fix: the owner streams many
+    /// distinct `Stdout` frames while local stdin trickles bytes, so the stdin
+    /// `select!` branch repeatedly wins the race against an in-flight frame read.
+    /// Every stdout payload must still arrive intact and in order — with the old
+    /// design (calling the non-cancel-safe `read_frame` directly in the `select!`
+    /// arm) a half-read frame would be dropped and desync the stream.
+    #[tokio::test]
+    async fn frames_are_not_lost_when_the_stdin_branch_keeps_winning() {
+        const N: usize = 64;
+        let payload_of = |i: usize| format!("frame-{i:04}\n").into_bytes();
+
+        let (client_conn, owner_conn) = duplex(64 * 1024);
+        // The owner keeps its read half alive for the whole test (draining the
+        // client's small stdin→owner writes so they never fail) and is aborted
+        // at the end. It deliberately does not try to end on the client's EOF:
+        // `tokio::io::split`'s WriteHalf drop does not shut the DuplexStream
+        // while the client's orphaned frame-reader task still holds its read
+        // half, so an EOF-driven owner would never terminate.
+        let owner = tokio::spawn(async move {
+            let (mut r, mut w) = tokio::io::split(owner_conn);
+            let _ = read_frame(&mut r).await; // consume Hello
+            write_frame(&mut w, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await.unwrap();
+            for i in 0..N {
+                write_frame(&mut w, &Frame::Stdout(format!("frame-{i:04}\n").into_bytes())).await.unwrap();
+                // Yield so the client often observes a frame mid-arrival, keeping
+                // the stdin branch racing an in-flight frame read.
+                tokio::task::yield_now().await;
+            }
+            write_frame(&mut w, &Frame::Exit(0)).await.unwrap();
+            while let Ok(Some(_)) = read_frame(&mut r).await {}
+        });
+
+        // Trickle stdin one byte at a time with a yield between, keeping the
+        // stdin branch hot while frame reads are pending.
+        let (mut stdin_w, stdin_r) = duplex(64 * 1024);
+        let feeder = tokio::spawn(async move {
+            for _ in 0..N {
+                if stdin_w.write_all(b"x").await.is_err() {
+                    break;
+                }
+                let _ = stdin_w.flush().await;
+                tokio::task::yield_now().await;
+            }
+            drop(stdin_w); // stdin EOF → client sends Shutdown
+        });
+
+        let (cr, mut cw) = tokio::io::split(client_conn);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, stdin_r, &mut stdout, &mut stderr)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ClientOutcome::Exited(0), "a clean remote exit must be reported even under stdin-branch pressure");
+        let mut expected = Vec::new();
+        for i in 0..N {
+            expected.extend_from_slice(&payload_of(i));
+        }
+        assert_eq!(stdout, expected, "no stdout frame may be lost, corrupted, or reordered when the stdin branch keeps winning the select");
+
+        let _ = feeder.await;
+        owner.abort();
     }
 }

@@ -38,6 +38,7 @@
 use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 /// Bumped only on an *incompatible* change to this frame protocol. The owner
 /// refuses a client whose `Hello` carries a different version (loud failure,
@@ -259,6 +260,42 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Fr
     let mut body = vec![0u8; frame_len];
     r.read_exact(&mut body).await?;
     Frame::decode(body[0], &body[1..]).map(Some)
+}
+
+/// Spawns a task that exclusively owns `reader`, decodes frames off it, and
+/// forwards each [`read_frame`] result over an unbounded channel. Callers await
+/// frames on the returned [`mpsc::UnboundedReceiver`] via its `recv()`, which
+/// **is** cancel-safe, instead of polling [`read_frame`] directly inside a
+/// `tokio::select!` arm.
+///
+/// This indirection exists because [`read_frame`] itself is **not** cancel-safe:
+/// it `.await`s several times while reassembling one frame (the length header,
+/// then the body), so if it were a `select!` branch and a sibling branch
+/// completed first, `select!` would drop the half-read `read_frame` future —
+/// silently discarding the bytes it had already consumed from the stream (an
+/// `AsyncRead` can't be rewound). The next `read_frame` would then reinterpret
+/// mid-frame bytes as a fresh length header and desynchronize the whole stream.
+/// A dedicated task owns the read side, so its in-progress read is never
+/// dropped; the main loop only ever touches the cancel-safe `recv()`.
+///
+/// The task forwards frames until the first terminal result — `Ok(None)` (the
+/// peer closed cleanly) or an `Err` — which it also forwards, then exits (so the
+/// receiver observes exactly one terminal result and then the channel closes).
+pub fn spawn_frame_reader<R>(mut reader: R) -> mpsc::UnboundedReceiver<io::Result<Option<Frame>>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let result = read_frame(&mut reader).await;
+            let is_terminal = !matches!(result, Ok(Some(_)));
+            if tx.send(result).is_err() || is_terminal {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 /// Constant-time equality for the auth token — compares every byte regardless

@@ -36,7 +36,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::log_file::log_line;
 
 use super::ctl_forward;
-use super::protocol::{read_frame, token_eq, write_frame, Frame, MUX_PROTOCOL_VERSION};
+use super::protocol::{read_frame, spawn_frame_reader, token_eq, write_frame, Frame, MUX_PROTOCOL_VERSION};
 
 /// Accepts clients on `channel` for the life of the owner process, spawning an
 /// independent relay task per client (each opening its own shell channel on the
@@ -88,7 +88,7 @@ pub(crate) async fn relay_client<Conn, H>(
     ctl_routes: Option<&ForwardRoutes>,
 ) -> Result<()>
 where
-    Conn: AsyncRead + AsyncWrite + Unpin + Send,
+    Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     H: client::Handler,
 {
     let (mut reader, mut writer) = tokio::io::split(conn);
@@ -149,7 +149,7 @@ where
         rx
     });
 
-    let result = relay_loop(&mut reader, &mut writer, &mut channel, ctl_frame_rx).await;
+    let result = relay_loop(reader, &mut writer, &mut channel, ctl_frame_rx).await;
 
     // Best-effort teardown of this client's forward.
     if let (Some(path), Some(routes)) = (&ctl_remote_path, ctl_routes) {
@@ -163,16 +163,25 @@ where
 /// remote channel messages become owner→client frames. See the module docs on
 /// ordering and backpressure — both properties come from this being one
 /// `select!` loop with a single sequential branch per direction.
+///
+/// The client connection's read half is owned by a dedicated frame-reader task
+/// ([`spawn_frame_reader`]) and delivered over a cancel-safe `recv()`, rather
+/// than calling the non-cancel-safe `read_frame` directly in the `select!` arm
+/// (which would drop a half-read frame whenever another branch won the race and
+/// desync the client's frame stream). Ordering is unaffected: the mpsc is FIFO
+/// and each frame is fully applied to the remote channel before the next is
+/// received.
 async fn relay_loop<R, W>(
-    reader: &mut R,
+    reader: R,
     writer: &mut W,
     channel: &mut russh::Channel<client::Msg>,
     mut ctl_frame_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
 ) -> Result<()>
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
+    let mut frame_rx = spawn_frame_reader(reader);
     let mut exit_code: Option<u8> = None;
     // After the client sends `Shutdown` (its local stdin hit EOF) we stop
     // *forwarding* its input, but keep reading the connection so a subsequent
@@ -184,14 +193,14 @@ where
 
     loop {
         tokio::select! {
-            frame = read_frame(reader) => {
-                match frame? {
-                    Some(Frame::Stdin(data)) if !stdin_done => {
+            frame = frame_rx.recv() => {
+                match frame {
+                    Some(Ok(Some(Frame::Stdin(data)))) if !stdin_done => {
                         if channel.data(&data[..]).await.is_err() {
                             break;
                         }
                     }
-                    Some(Frame::Resize { cols, rows }) if !stdin_done => {
+                    Some(Ok(Some(Frame::Resize { cols, rows }))) if !stdin_done => {
                         // Applied in receive order relative to the Stdin above
                         // (the ordering guarantee); pixel dims are 0 like the
                         // rest of this client (character-cell terminals).
@@ -200,19 +209,22 @@ where
                     // A well-behaved client sends nothing after Shutdown; ignore
                     // any stray input/resize rather than reopening the closed
                     // remote stdin.
-                    Some(Frame::Stdin(_)) | Some(Frame::Resize { .. }) => {}
-                    Some(Frame::Shutdown) => {
+                    Some(Ok(Some(Frame::Stdin(_)))) | Some(Ok(Some(Frame::Resize { .. }))) => {}
+                    Some(Ok(Some(Frame::Shutdown))) => {
                         if !stdin_done {
                             let _ = channel.eof().await;
                             stdin_done = true;
                         }
                     }
-                    // A clean client close, an unexpected drop, or a truncated
-                    // frame all mean the client is gone: tear down its remote
-                    // shell (dropping `channel` on return closes it) rather
-                    // than leaking a session (session cleanup).
-                    None => break,
-                    Some(other) => return Err(anyhow!("isekai-ssh mux owner: unexpected frame from client: {other:?}")),
+                    // A clean client close (`Ok(None)`) or the reader task ending
+                    // (`None`) both mean the client is gone: tear down its remote
+                    // shell (dropping `channel` on return closes it) rather than
+                    // leaking a session (session cleanup).
+                    Some(Ok(None)) | None => break,
+                    // A truncated or malformed frame is a hard error, surfaced to
+                    // `serve_clients` (which logs and contains it per-client).
+                    Some(Err(e)) => return Err(anyhow!("isekai-ssh mux owner: reading a client frame failed: {e}")),
+                    Some(Ok(Some(other))) => return Err(anyhow!("isekai-ssh mux owner: unexpected frame from client: {other:?}")),
                 }
             }
             msg = channel.wait() => {
