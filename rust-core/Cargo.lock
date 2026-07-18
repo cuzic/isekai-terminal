@@ -1704,6 +1704,7 @@ dependencies = [
  "isekai-pipe-core",
  "isekai-protocol",
  "isekai-trust",
+ "local-ipc-mux",
  "log",
  "openssh-config",
  "rand 0.8.6",

@@ -19,6 +19,7 @@ isekai-pipe-core = { path = "../isekai-pipe-core" }
 isekai-protocol = { path = "../isekai-protocol" }
 russh-stream-session = { path = "../russh-stream-session" }
 openssh-config = { path = "../openssh-config" }
+local-ipc-mux = { path = "../local-ipc-mux" }
 russh = "0.48"
 russh-keys = "0.48"
 crossterm = "0.29"

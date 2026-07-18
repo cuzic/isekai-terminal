@@ -261,6 +261,26 @@ impl WrapperResolution {
         let port = self.openssh.port.unwrap_or(22);
         (host, port)
     }
+
+    /// A canonical string of the connection-relevant `#@isekai` directives,
+    /// hashed into the mux channel name (`native/mux/naming.rs`) alongside the
+    /// OpenSSH-resolved fields so two tabs whose isekai routing differs (a
+    /// different profile, relay set, bootstrap policy, …) never share an
+    /// owner.
+    ///
+    /// This is deliberately the `Debug` rendering of the whole resolved
+    /// `IsekaiConfig`: every field is connection-relevant, and folding them
+    /// through `Debug` means a *newly added* field is automatically included
+    /// rather than silently forgotten (a missed field would be a
+    /// wrong-sharing bug). `Debug` output is deterministic within one binary
+    /// build, which is all the channel-naming hash needs; if two differing
+    /// binary versions ever rendered it differently they would simply compute
+    /// different names and not share (over-isolation, always safe — see
+    /// `naming.rs`'s "fail-safe direction" note), with the protocol version
+    /// handshake as the final backstop.
+    pub(crate) fn mux_identity_material(&self) -> String {
+        format!("{:?}", self.isekai)
+    }
 }
 
 /// Resolves `destination` (a bare host, no other `ssh` args) into the same
