@@ -327,9 +327,12 @@ pub(crate) async fn authenticate_session(
     match result {
         Ok(true) => {
             let key = match auth {
-                SshAuth::PublicKey { private_key_pem } => {
-                    PrivateKey::from_openssh(private_key_pem).ok().map(Arc::new)
-                }
+                SshAuth::PublicKey { private_key_pem } => PrivateKey::from_openssh(private_key_pem)
+                    .map(Arc::new)
+                    .map_err(|e| {
+                        warn!("ssh: agent-forwarding key re-parse failed after successful auth (should be unreachable): {e}")
+                    })
+                    .ok(),
                 SshAuth::Password { .. } => None,
             };
             (true, key)
