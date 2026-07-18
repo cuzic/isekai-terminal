@@ -52,6 +52,58 @@ func shouldResetBlinkPhase(
     (newHasBlink || newCursorBlinks) && !(previousHasBlink || previousCursorBlinks)
 }
 
+// MARK: - タスク#87: マウスUI裁定ロジックの純粋関数抽出
+//
+// fableレビュー(グループD)指摘: マウスレポーティングのpress/drag/releaseライフサイクル・
+// 2本指中断・scrollOffsetゲートの判断ロジックが`TerminalScreenView`のインスタンス状態
+// (`scrollOffset`/`showingScrollback`/`activeMouseTouch`等)に直接依存する形で
+// `isPointerReportingActive`/`touchesBegan`へ直書きされており、単体テストが無かった。
+// `clampedFontScale`/`wheelEvents`/`shouldResetBlinkPhase`と同じ方針で、UIKit
+// (`UITouch`/`UIEvent`)に依存しない純粋関数として切り出す(Android版
+// `MouseGestureArbiter.kt`と対称)。
+
+/// マウスレポーティング(`?1000`/`?1002`/`?1003`)が実際に有効か。モードが`.off`で
+/// ないことに加え、スクロールバック表示中(`scrollOffset > 0`、またはタスク#79の
+/// `showingScrollback`)は対象外とする(`draw(_:)`はスクロールバックの合成表示を
+/// 見せている一方でライブ側のモードに従ってポインタイベントを送ると、ユーザーは
+/// 過去ログを見ているのにライブセッションへclick/dragが飛んでしまい、表示対象と
+/// 入力対象が食い違う)。Android版`MouseGestureArbiter.kt`の`isPointerReportingActive`
+/// と対称。
+func mouseReportingActive(
+    scrollOffset: Int, showingScrollback: Bool, mouseReportingMode: MouseReportingMode
+) -> Bool {
+    guard scrollOffset == 0, !showingScrollback else { return false }
+    return mouseReportingMode != .off
+}
+
+/// `touchesBegan`が新しく届いたタッチをどう扱うべきかの裁定結果。
+enum MouseTouchBeganAction: Equatable {
+    /// 新規タッチの追跡を開始し、pressを送る。
+    case startTracking
+    /// 既に追跡中のタッチがある間に2本目以降の指が触れた: これ以上単一指のドラッグ
+    /// としては扱えないため、追跡中のタッチにreleaseを送って打ち切る(以降はpinch等の
+    /// 通常の複数指ジェスチャに譲り、この一連のタッチは無視する)。
+    case releaseActiveAndStopTracking
+    /// 追跡中のタッチが無く、かつこの時点で既に複数指が同時に触れている
+    /// (`touchesBegan`が最初から複数指として発火した) → 何もしない。
+    case ignore
+}
+
+/// [hasActiveTrackedTouch]: `activeMouseTouch`が現在non-nilか(既に単一指の
+/// マウスタッチを追跡中か)。[totalTouchCount]: このイベント時点で画面に触れている
+/// 指の総数(`event?.allTouches?.count ?? touches.count`)。
+func decideMouseTouchBeganAction(
+    hasActiveTrackedTouch: Bool, totalTouchCount: Int
+) -> MouseTouchBeganAction {
+    if hasActiveTrackedTouch {
+        return .releaseActiveAndStopTracking
+    }
+    if totalTouchCount == 1 {
+        return .startTracking
+    }
+    return .ignore
+}
+
 /// Sixel(タスク#42)の`ImagePlacement.rgba`(RGBA8888、row-major)から`UIImage`を作って
 /// idでキャッシュする。`ScreenUpdate.images`はTerminal(rust-core)側で寿命管理された
 /// 「現在アクティブな画像の全リスト」がそのまま渡ってくる(rust-ssot: どの画像が
@@ -552,15 +604,17 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         return !isPointerReportingActive
     }
 
-    /// マウスレポーティングが実際に有効か。モードが`.off`でないことに加え、
-    /// スクロールバック表示中(`scrollOffset > 0`、またはタスク#79の`showingScrollback`)は
-    /// 対象外とする(codexレビュー指摘: `draw(_:)`はスクロールバックの合成表示を見せている
-    /// 一方でライブ側のモードに従ってポインタイベントを送ると、ユーザーは過去ログを
-    /// 見ているのにライブセッションへclick/dragが飛んでしまい、表示対象と入力対象が
-    /// 食い違う)。
+    /// マウスレポーティングが実際に有効か。判断ロジック自体はタスク#87で
+    /// UIKit非依存の純粋関数`mouseReportingActive`へ抽出済み(codexレビュー指摘:
+    /// `draw(_:)`はスクロールバックの合成表示を見せている一方でライブ側のモードに
+    /// 従ってポインタイベントを送ると、ユーザーは過去ログを見ているのにライブ
+    /// セッションへclick/dragが飛んでしまい、表示対象と入力対象が食い違う)。
     private var isPointerReportingActive: Bool {
-        guard scrollOffset == 0, !showingScrollback, let update = latestUpdate else { return false }
-        return update.mouseReportingMode != .off
+        guard let update = latestUpdate else { return false }
+        return mouseReportingActive(
+            scrollOffset: scrollOffset, showingScrollback: showingScrollback,
+            mouseReportingMode: update.mouseReportingMode
+        )
     }
 
     /// `touch`の現在位置をLeftボタンのイベントとして`sendPointerEvent(at:update:kind:button:)`
@@ -596,17 +650,27 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     public override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesBegan(touches, with: event)
         guard isPointerReportingActive, let update = latestUpdate else { return }
-        if let active = activeMouseTouch {
+        // タスク#87: この裁定自体は`decideMouseTouchBeganAction`(UIKit非依存の純粋関数)
+        // へ抽出済み。ここでは判断結果に応じた副作用(pressの送出・追跡開始/終了)のみを行う。
+        let totalTouchCount = event?.allTouches?.count ?? touches.count
+        switch decideMouseTouchBeganAction(
+            hasActiveTrackedTouch: activeMouseTouch != nil, totalTouchCount: totalTouchCount
+        ) {
+        case .releaseActiveAndStopTracking:
             // 追跡中に2本目以降の指が触れた: これ以上単一指のドラッグとしては扱えない
             // ため、既に送ったpressに対応するreleaseを送って打ち切る(以降はpinch等の
             // 通常の複数指ジェスチャに譲り、この一連のタッチは無視する)。
-            sendMouseEvent(for: active, update: update, kind: .release)
+            if let active = activeMouseTouch {
+                sendMouseEvent(for: active, update: update, kind: .release)
+            }
             activeMouseTouch = nil
-            return
+        case .startTracking:
+            guard let touch = touches.first else { return }
+            activeMouseTouch = touch
+            sendMouseEvent(for: touch, update: update, kind: .press)
+        case .ignore:
+            break
         }
-        guard (event?.allTouches?.count ?? touches.count) == 1, let touch = touches.first else { return }
-        activeMouseTouch = touch
-        sendMouseEvent(for: touch, update: update, kind: .press)
     }
 
     public override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {

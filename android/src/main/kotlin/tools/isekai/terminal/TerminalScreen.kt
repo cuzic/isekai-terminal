@@ -60,11 +60,18 @@ import tools.isekai.terminal.ui.SelectionRange
 import tools.isekai.terminal.ui.SshTerminalCanvas
 import tools.isekai.terminal.ui.TerminalFontSettings
 import tools.isekai.terminal.ui.TerminalThemes
+import tools.isekai.terminal.ui.NormalGestureOutcome
+import tools.isekai.terminal.ui.MouseTouchStep
 import tools.isekai.terminal.ui.advanceResizeStability
+import tools.isekai.terminal.ui.classifyNormalGesture
 import tools.isekai.terminal.ui.computeResizeTargetColsRows
+import tools.isekai.terminal.ui.decideMouseTouchStep
 import tools.isekai.terminal.ui.isOpenableHyperlinkScheme
+import tools.isekai.terminal.ui.isPointerReportingActive as arbiterIsPointerReportingActive
 import tools.isekai.terminal.ui.linkUrlAtCell
 import tools.isekai.terminal.ui.offsetToCellPos
+import tools.isekai.terminal.ui.shouldUseMouseTouch
+import tools.isekai.terminal.ui.wheelButtonForDelta
 import tools.isekai.terminal.ui.reconstructSelectionText
 import tools.isekai.terminal.ui.synthesizeDisplayUpdate
 import tools.isekai.terminal.util.RemoteLogger
@@ -533,13 +540,21 @@ fun TerminalScreenBody(
                 // (codexレビュー指摘: タッチ経路・ホイール経路の両方で「マウスレポーティングが
                 // 実際に有効か」の判定[scrollOffset==0 && mode!=Off]が重複していたのを1箇所へ
                 // 集約。iOS版`isPointerReportingActive`と同じ役割)
+                //
+                // タスク#87: 判断ロジック自体は`MouseGestureArbiter.kt`のピュア関数
+                // (`arbiterIsPointerReportingActive`としてimport)へ抽出済み。ここでは
+                // 現在のComposable状態(scrollOffset/showingScrollback/mouseReportingMode)を
+                // そのまま渡すだけ。
                 val isPointerReportingActive: () -> Boolean = {
                     // タスク#79: `showingScrollback`が真の間(scrollback最新行への検索
                     // ジャンプ中)は`scrollOffset == 0`でもライブ表示ではないため、
                     // タッチ/ホイールをRustへ渡さない(表示対象と入力対象の食い違いを
                     // 避ける、下の`runPinchAndPan`のコメントと同じ理由)。
-                    scrollOffset == 0 && !showingScrollback &&
-                        latestDisplayUpdate.value.mouseReportingMode != MouseReportingMode.OFF
+                    arbiterIsPointerReportingActive(
+                        scrollOffset = scrollOffset,
+                        showingScrollback = showingScrollback,
+                        mouseReportingMode = latestDisplayUpdate.value.mouseReportingMode,
+                    )
                 }
                 val sendPointerEvent: (MouseEventKind, MouseButton?, Int, Int) -> Unit = { kind, button, row, col ->
                     val u = latestDisplayUpdate.value
@@ -604,7 +619,7 @@ fun TerminalScreenBody(
                                     // 表示対象(スクロールバック)と入力対象(ライブセッション)が食い違う
                                     // ため(iOS版`isPointerReportingActive`と同じ理由・同じ判断)。
                                     val initialPointerCount = currentEvent.changes.count { it.pressed }
-                                    val mouseModeActive = isPointerReportingActive() && initialPointerCount <= 1
+                                    val mouseModeActive = shouldUseMouseTouch(isPointerReportingActive(), initialPointerCount)
                                     // タスク#80(codexレビュー指摘): ピンチ拡縮+縦パンスクロールの
                                     // イベントループ本体を、下の(2)通常経路とマウスモード経由の両方から
                                     // 呼べるよう共通化しておく(マウスモード時に2本目の指が検出された
@@ -661,16 +676,29 @@ fun TerminalScreenBody(
                                             // 直前のpressに対応するreleaseを送って打ち切る(iOS版`touchesBegan`の
                                             // 「2本目の指が触れたら追跡中のタッチのreleaseを送る」処理と同じ理由
                                             // ——releaseを送らないとリモート側でボタンが押されっぱなしに見える)。
+                                            //
+                                            // タスク#87: このステップの裁定自体は`decideMouseTouchStep`
+                                            // (`MouseGestureArbiter.kt`)へ抽出済み。2本指中断+ピンチ引き継ぎ
+                                            // (タスク#80)の回帰は`MouseGestureArbiterTest`でCompose非依存に
+                                            // 検証する。
                                             val pointerCount = event.changes.count { it.pressed }
-                                            if (!change.pressed || pointerCount > 1) {
-                                                sendPointerEventAt(MouseEventKind.RELEASE, MouseButton.LEFT, change.position.x, change.position.y, cellW, cellH, cols, rows)
-                                                // タスク#80: releaseの原因が「2本目の指が触れた」ことによる
-                                                // ものであれば、同じジェスチャをそのままピンチ/パン処理へ
-                                                // 引き継ぐ(単に指が離れただけ[2本目なし]の場合は継続しない)。
-                                                handoffToPinch = pointerCount > 1
-                                                break
+                                            when (decideMouseTouchStep(trackedFingerPressed = change.pressed, pointerCount = pointerCount)) {
+                                                MouseTouchStep.CONTINUE ->
+                                                    sendPointerEventAt(MouseEventKind.MOTION, MouseButton.LEFT, change.position.x, change.position.y, cellW, cellH, cols, rows)
+                                                MouseTouchStep.RELEASE_ONLY -> {
+                                                    sendPointerEventAt(MouseEventKind.RELEASE, MouseButton.LEFT, change.position.x, change.position.y, cellW, cellH, cols, rows)
+                                                    handoffToPinch = false
+                                                    break
+                                                }
+                                                MouseTouchStep.RELEASE_AND_HANDOFF_TO_PINCH -> {
+                                                    sendPointerEventAt(MouseEventKind.RELEASE, MouseButton.LEFT, change.position.x, change.position.y, cellW, cellH, cols, rows)
+                                                    // タスク#80: releaseの原因が「2本目の指が触れた」ことによる
+                                                    // ものであれば、同じジェスチャをそのままピンチ/パン処理へ
+                                                    // 引き継ぐ(単に指が離れただけ[2本目なし]の場合は継続しない)。
+                                                    handoffToPinch = true
+                                                    break
+                                                }
                                             }
-                                            sendPointerEventAt(MouseEventKind.MOTION, MouseButton.LEFT, change.position.x, change.position.y, cellW, cellH, cols, rows)
                                         }
                                         if (handoffToPinch) {
                                             runPinchAndPan()
@@ -685,31 +713,44 @@ fun TerminalScreenBody(
                                     // 実際に押されている指の本数を見て、2本以上ならピンチ/パン優先で扱う
                                     // (単一指の本物の長押しだけを選択モードにする)。
                                     val pointerCount = currentEvent.changes.count { it.pressed }
-                                    if (longPress != null && pointerCount < 2) {
-                                        // (1) 長押し成立 → 選択モード。選択中はスクロールに触れない
-                                        // (= スクロール位置ロック)。以降のドラッグで head を更新する。
-                                        val startCell = offsetToCellPos(
-                                            longPress.position.x, longPress.position.y,
-                                            cellW, cellH, cols, rows,
+                                    val stillDown = currentEvent.changes.firstOrNull { it.id == down.id }
+                                    // タスク#87: 長押し/タップ/ピンチの3択の裁定自体は`classifyNormalGesture`
+                                    // (`MouseGestureArbiter.kt`)へ抽出済み。以下の3分岐は判断結果に応じた
+                                    // 副作用(選択ループ・hit-test・ピンチ委譲)のみを行う。
+                                    when (
+                                        classifyNormalGesture(
+                                            longPressSucceeded = longPress != null,
+                                            pointerCount = pointerCount,
+                                            trackedFingerStillPressed = stillDown?.pressed == true,
                                         )
-                                        selection = SelectionRange(startCell, startCell)
-                                        while (true) {
-                                            val event = awaitPointerEvent()
-                                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                                            if (!change.pressed) {
-                                                change.consume()
-                                                break
-                                            }
-                                            change.consume()
-                                            val cell = offsetToCellPos(
-                                                change.position.x, change.position.y,
+                                    ) {
+                                        NormalGestureOutcome.SELECTION -> {
+                                            // (1) 長押し成立 → 選択モード。選択中はスクロールに触れない
+                                            // (= スクロール位置ロック)。以降のドラッグで head を更新する。
+                                            // (`classifyNormalGesture`がSELECTIONを返すのは
+                                            // longPressSucceeded[= longPress != null]が真の場合のみ)。
+                                            val longPressResult = requireNotNull(longPress)
+                                            val startCell = offsetToCellPos(
+                                                longPressResult.position.x, longPressResult.position.y,
                                                 cellW, cellH, cols, rows,
                                             )
-                                            selection = selection?.copy(head = cell)
+                                            selection = SelectionRange(startCell, startCell)
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                if (!change.pressed) {
+                                                    change.consume()
+                                                    break
+                                                }
+                                                change.consume()
+                                                val cell = offsetToCellPos(
+                                                    change.position.x, change.position.y,
+                                                    cellW, cellH, cols, rows,
+                                                )
+                                                selection = selection?.copy(head = cell)
+                                            }
                                         }
-                                    } else {
-                                        val stillDown = currentEvent.changes.firstOrNull { it.id == down.id }
-                                        if (pointerCount < 2 && (stillDown == null || !stillDown.pressed)) {
+                                        NormalGestureOutcome.TAP -> {
                                             // (3) 単純タップ（長押し不成立かつ移動なしで指が離れた）→
                                             // まずタップ位置がOSC 8リンク(タスク#52)を指しているか
                                             // hit-testする。hit-test自体は表示中のセル配列を読むだけの
@@ -737,7 +778,8 @@ fun TerminalScreenBody(
                                                 actions.onRequestFocus()
                                                 requestImeFocus()
                                             }
-                                        } else {
+                                        }
+                                        NormalGestureOutcome.PINCH_PAN -> {
                                             // (2) 2本指以上、または長押し不成立で移動 →
                                             // ピンチ拡縮+縦パンスクロール(ループ本体はマウスモード
                                             // 経由のピンチ引き継ぎ[タスク#80]と共通の`runPinchAndPan`)
@@ -770,13 +812,14 @@ fun TerminalScreenBody(
                                         if (!isPointerReportingActive()) continue
                                         val change = event.changes.firstOrNull() ?: continue
                                         val deltaY = change.scrollDelta.y
-                                        if (deltaY == 0f) continue
-                                        change.consume()
                                         // Composeのスクロール系API(Modifier.scrollable等)と同じ符号規約:
                                         // 正のdeltaY = コンテンツを上へ送る(=下方向へスクロール、xtermの
                                         // wheel down/button 65)。実機(Bluetoothマウス等)未検証のため、
-                                        // 符号が逆であれば実機確認時に反転させる。
-                                        val button = if (deltaY > 0f) MouseButton.WHEEL_DOWN else MouseButton.WHEEL_UP
+                                        // 符号が逆であれば実機確認時に反転させる。判定自体は
+                                        // `wheelButtonForDelta`(タスク#87、`MouseGestureArbiter.kt`)へ抽出済み
+                                        // ——`deltaY == 0f`の場合は`null`が返るのでcontinueする。
+                                        val button = wheelButtonForDelta(deltaY) ?: continue
+                                        change.consume()
                                         sendPointerEventAt(
                                             MouseEventKind.PRESS, button, change.position.x, change.position.y,
                                             latestCellDims.value.first, latestCellDims.value.second,
