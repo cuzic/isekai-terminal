@@ -327,6 +327,7 @@ impl OpenSshBackend {
                 let relay_addr = relay.relay_addr;
                 let quoted_sni = shell_single_quote(&relay.relay_sni);
                 let idle_lifetime_secs = relay.idle_lifetime_secs;
+                let resume_window_secs = relay.resume_window_secs;
                 // `#qmux-leg2`: evidence-gated static choice (`ISEKAI_PIPE_DESIGN.md`
                 // Epic G/H) — the deployed helper is told once, up front, which
                 // transport to use to reach the relay; never a runtime fallback.
@@ -337,7 +338,8 @@ impl OpenSshBackend {
                 let args = format!(
                     "--target 127.0.0.1:22 --relay {relay_addr} --relay-sni {quoted_sni} \
                      --relay-jwt-file $tmpdir/relay_jwt --bootstrap-request-file $tmpdir/bootstrap-request.json\
-                     {relay_transport_arg} --max-idle-lifetime {idle_lifetime_secs} --log-level {remote_log_level}"
+                     {relay_transport_arg} --max-idle-lifetime {idle_lifetime_secs} \
+                     --resume-window {resume_window_secs} --log-level {remote_log_level}"
                 );
                 (args, relay.relay_jwt.clone().into_bytes())
             }
@@ -346,7 +348,7 @@ impl OpenSshBackend {
             // (`direct-by-bootstrap-host`, `archive/HELPER_PROTOCOL.md` §2).
             // Only the (non-secret-carrying) `BootstrapRequestV2` travels over
             // stdin here — nothing else to deliver out of band.
-            LaunchSpec::Direct { idle_lifetime_secs, remote_log_level, remote_bind_port_range } => {
+            LaunchSpec::Direct { idle_lifetime_secs, remote_log_level, remote_bind_port_range, resume_window_secs } => {
                 let remote_log_level = validate_log_level(remote_log_level)
                     .map_err(|e| BootstrapError::InvalidRemoteLogLevel(e.to_string()))?;
                 let bind_port_range_arg = match remote_bind_port_range {
@@ -355,7 +357,8 @@ impl OpenSshBackend {
                 };
                 let args = format!(
                     "--target 127.0.0.1:22 --bind 0.0.0.0:0 --bootstrap-request-file $tmpdir/bootstrap-request.json\
-                     {stun_server_arg}{bind_port_range_arg} --max-idle-lifetime {idle_lifetime_secs} --log-level {remote_log_level}"
+                     {stun_server_arg}{bind_port_range_arg} --max-idle-lifetime {idle_lifetime_secs} \
+                     --resume-window {resume_window_secs} --log-level {remote_log_level}"
                 );
                 (args, Vec::new())
             }

@@ -914,12 +914,20 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
                 relay_transport: relay_target.relay_transport,
                 idle_lifetime_secs: DEFAULT_IDLE_LIFETIME_SECS,
                 remote_log_level: resolution.isekai.remote_log_level.clone(),
+                // Same resolved value `intent.resume_grace_secs` uses below —
+                // keeping the remote helper's own `--resume-window` in sync
+                // with what this client will actually request is the fix for
+                // the bug where a client-only `#@isekai resume-grace` bump
+                // was silently clamped back down to the server's unrelated
+                // default.
+                resume_window_secs: resolution.isekai.resume_grace_secs,
             })
         }
         None => LaunchSpec::Direct {
             idle_lifetime_secs: DEFAULT_IDLE_LIFETIME_SECS,
             remote_log_level: resolution.isekai.remote_log_level.clone(),
             remote_bind_port_range: resolution.isekai.remote_bind_port_range,
+            resume_window_secs: resolution.isekai.resume_grace_secs,
         },
     };
 

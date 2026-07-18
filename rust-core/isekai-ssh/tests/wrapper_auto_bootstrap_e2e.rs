@@ -971,6 +971,98 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
     );
 }
 
+/// `ISEKAI_PIPE_DESIGN.md` §8 Epic N-3: `#@isekai resume-grace <n>` must reach
+/// the remote launch command's argv as `isekai-pipe serve --resume-window
+/// <n>` (same technique as `wrapper_auto_bootstrap_honors_stun_directive`) —
+/// this is the regression test for the bug where a client-only resume-grace
+/// override was silently clamped back down to the server's own unrelated
+/// default because it never reached the deploy argv at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn wrapper_auto_bootstrap_honors_resume_grace_directive() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1)/ssh-keygen(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let remote_home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&remote_home).unwrap();
+
+    let mock_sshd_addr = spawn_fake_ssh_server(remote_home.clone(), client_pubkey).await;
+
+    let home = tmp.path().join("client-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let (_bin_dir, path_env, shim) =
+        shim_ssh_with_bootstrap_config(tmp.path(), "resume-grace-directive-host", mock_sshd_addr, &key_path);
+
+    let ssh_dir = home.join(".ssh");
+    std::fs::create_dir_all(&ssh_dir).unwrap();
+    std::fs::write(
+        ssh_dir.join("config"),
+        "Host resume-grace-directive-host\n    #@isekai resume-grace 42s\n",
+    )
+    .unwrap();
+
+    let argv_log = remote_home.join("argv.log");
+    let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
+    std::fs::write(
+        &helper_script_path,
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n", posix_safe_path(&argv_log)),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper_script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
+        .arg("--isekai-helper-binary")
+        .arg(&helper_script_path)
+        .arg("resume-grace-directive-host")
+        .env("HOME", &home)
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .env("PATH", &path_env)
+        .env_remove("RUST_LOG")
+        .stdin(StdStdio::piped())
+        .stdout(StdStdio::piped())
+        .stderr(StdStdio::piped())
+        .spawn()
+        .expect("failed to spawn isekai-ssh");
+
+    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut saw_registered = false;
+    for _ in 0..200 {
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(_)) => {
+                eprint!("[isekai-ssh stderr] {line}");
+                if line.contains("Registered") {
+                    saw_registered = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+
+    assert!(saw_registered, "expected wrapper stderr to report trust-store registration");
+
+    let argv = std::fs::read_to_string(&argv_log).expect("stand-in script should have recorded its argv");
+    assert!(
+        argv.contains("--resume-window 42"),
+        "expected #@isekai resume-grace to reach the remote launch command's argv, got: {argv:?}"
+    );
+}
+
 /// `ISEKAI_PIPE_DESIGN.md` §8 Epic H: `#@isekai bootstrap-relay addr=... sni=...`
 /// must make auto-bootstrap deploy via `LaunchSpec::Relay` (verified via the
 /// stand-in script's captured argv, same technique as
