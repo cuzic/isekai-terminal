@@ -35,6 +35,23 @@ func wheelEvents(deltaY: CGFloat, carry: CGFloat, cellHeight: CGFloat) -> (butto
     return (buttons, accum)
 }
 
+/// タスク#86: blink位相(`blinkPhaseVisible`)をリセットすべきかどうかの純粋な判定。
+/// `blinkTimer`は`init`から常時走り続けており、SGR blinkセル/点滅カーソルが1つも
+/// 無い画面が続いている間も位相は経過時間依存でトグルされ続ける。そのため
+/// 「blink無し→blink有り」へ新規遷移する瞬間(前回の描画ではSGR blinkセルも点滅
+/// カーソルも無かったが、今回はどちらか一方が有る)に単純にトグル済みの位相を
+/// そのまま使うと、新しく現れたblinkが最初から「消灯」側で最大0.53秒不可視のまま
+/// 表示されてしまう(fable/codexレビュー指摘、Android版`SshTerminalCanvas.kt`の
+/// `LaunchedEffect(hasActiveBlink)`起動時リセットと対称)。`UIKit`/`Timer`に
+/// 依存しない純粋関数として切り出してあるため`clampedFontScale`/`wheelEvents`と
+/// 同様にユニットテストで直接検証できる。
+func shouldResetBlinkPhase(
+    newHasBlink: Bool, newCursorBlinks: Bool,
+    previousHasBlink: Bool, previousCursorBlinks: Bool
+) -> Bool {
+    (newHasBlink || newCursorBlinks) && !(previousHasBlink || previousCursorBlinks)
+}
+
 /// Sixel(タスク#42)の`ImagePlacement.rgba`(RGBA8888、row-major)から`UIImage`を作って
 /// idでキャッシュする。`ScreenUpdate.images`はTerminal(rust-core)側で寿命管理された
 /// 「現在アクティブな画像の全リスト」がそのまま渡ってくる(rust-ssot: どの画像が
@@ -308,6 +325,19 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
                 self.setNeedsDisplay()
             }
         }
+    }
+
+    /// タスク#86 codexレビュー2次指摘: `blinkPhaseVisible`をtrueへ戻すだけでは、
+    /// `blinkTimer`自体は`init`以来の古いスケジュールのまま動き続けている。新規blink
+    /// 出現の直後にたまたま次のtickが目前だと、「一瞬だけ見えてすぐ消灯」という
+    /// 短いflickerになりかねない(Android版`LaunchedEffect(hasActiveBlink)`は
+    /// コルーチン自体を再起動し`delay(530)`から数え直すため、新規blinkは必ず満額
+    /// 0.53秒の可視区間を得る——iOS側もタイマーのスケジュールを起点からやり直すことで
+    /// 同じ保証を揃える)。
+    private func restartBlinkTimer() {
+        blinkTimer?.invalidate()
+        blinkTimer = nil
+        startBlinkTimerIfNeeded()
     }
 
     /// 最新の画面状態を反映する。`MainActor`から呼ぶこと。
@@ -604,7 +634,17 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         let cols = Int(update.cols)
         let rows = Int(update.rows)
         guard cols > 0, rows > 0, update.cells.count == cols * rows else { return }
-        lastDisplayHasBlink = update.cells.contains(where: { $0.blink })
+        let newHasBlink = update.cells.contains(where: { $0.blink })
+        let cursorInBounds = Int(update.cursorRow) < rows && Int(update.cursorCol) < cols
+        let newCursorBlinks = update.cursorVisible && update.cursorBlink && cursorInBounds
+        if shouldResetBlinkPhase(
+            newHasBlink: newHasBlink, newCursorBlinks: newCursorBlinks,
+            previousHasBlink: lastDisplayHasBlink, previousCursorBlinks: lastDisplayCursorBlinks
+        ) {
+            blinkPhaseVisible = true
+            restartBlinkTimer()
+        }
+        lastDisplayHasBlink = newHasBlink
 
         let cellWidth = cellSize.width
         let cellHeight = cellSize.height
@@ -741,8 +781,7 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         // `cursorInBounds`がfalseになり、実際には描画されないカーソルの点滅のために
         // blinkタイマーが毎tick`setNeedsDisplay()`する無駄を避ける(`lastDisplayHasBlink`が
         // 「実際に画面へ出した表示」を基準にしているのと同じ方針)。
-        let cursorInBounds = Int(update.cursorRow) < rows && Int(update.cursorCol) < cols
-        lastDisplayCursorBlinks = update.cursorVisible && update.cursorBlink && cursorInBounds
+        lastDisplayCursorBlinks = newCursorBlinks
         if update.cursorVisible, cursorInBounds,
            !(update.cursorBlink && !blinkPhaseVisible) {
             let x = CGFloat(update.cursorCol) * cellWidth
