@@ -16,6 +16,12 @@ public enum KeySequenceCommands {
     ///   関数を直接使用。末尾への改行の強制付与はしない)。
     /// - `.placeholderRef` → 何も出力しない(呼び出し側が事前に具体的な[KeyStep]へ解決して
     ///   おくべきものであり、正常系では到達しない)。
+    ///
+    /// タスク#82の見落としタスク(codexレビュー指摘)についての方針: `KeyStep`/`SpecialKey`には
+    /// テンキー(numpad)を表すケースが無いため、この経路は`applicationKeypadMode`
+    /// (DECKPAM)を一切扱わない。`SpecialKey`にnumpadケースが追加されるまでは
+    /// バグではなく、打鍵列(KeySequence)機能でテンキーを表現したくなった時点で
+    /// `applicationCursorMode`と同じパターン(引数として伝播)を追加すること。
     public static func toBytes(_ steps: [KeyStep], applicationCursorMode: Bool = false) -> Data {
         var out = Data()
         for step in steps {

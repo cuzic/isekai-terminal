@@ -666,6 +666,10 @@ private struct TerminalInputRepresentable: UIViewRepresentable {
         // 従ってSS3/CSIを切り替えられるよう、新しいミラー状態を作らずRust由来の値を
         // そのまま反映する。
         uiView.applicationCursorMode = uiState.latestScreenUpdate?.applicationCursorMode ?? false
+        // タスク#82: ハードウェアキーボードのテンキー(`TerminalIMEInputView.
+        // handleHardwareKeyPress`経由)がDECKPAMに従ってSS3/リテラル文字を切り替え
+        // られるよう、`applicationCursorMode`と同じパターンでRust由来の値を反映する。
+        uiView.applicationKeypadMode = uiState.latestScreenUpdate?.applicationKeypadMode ?? false
         if isActive {
             if !uiView.isFirstResponder {
                 DispatchQueue.main.async { uiView.becomeFirstResponder() }

@@ -56,6 +56,36 @@ enum TerminalHardwareKeyMapper {
         }
     }
 
+    /// タスク#82: テンキー(numpad)の物理キー→rust-core側`TerminalNumpadKey`。
+    /// `specialKey(for:)`と同じく、マッチしない(=通常の文字キー等)場合は`nil`を返し
+    /// 既存の`UITextInput`経路にフォールスルーさせる。Android版`TerminalKeyEncoder.kt`の
+    /// `KC_NUMPAD_*`定数と対になる表。`.keypadNumLock`(タスク#83、NumLock状態自体を
+    /// 扱う別課題)と`.keypadEqualSignAS400`(AS/400キーボード固有、`TerminalNumpadKey`に
+    /// 対応ケースが無い)は意図的に含めない。
+    static func numpadKey(for hidUsage: UIKeyboardHIDUsage) -> TerminalNumpadKey? {
+        switch hidUsage {
+        case .keypad0: return .digit0
+        case .keypad1: return .digit1
+        case .keypad2: return .digit2
+        case .keypad3: return .digit3
+        case .keypad4: return .digit4
+        case .keypad5: return .digit5
+        case .keypad6: return .digit6
+        case .keypad7: return .digit7
+        case .keypad8: return .digit8
+        case .keypad9: return .digit9
+        case .keypadPeriod: return .decimal
+        case .keypadComma: return .comma
+        case .keypadPlus: return .add
+        case .keypadHyphen: return .subtract
+        case .keypadAsterisk: return .multiply
+        case .keypadSlash: return .divide
+        case .keypadEqualSign: return .equals
+        case .keypadEnter: return .enter
+        default: return nil
+        }
+    }
+
     /// `UIKeyModifierFlags`→rust-core側`TerminalKeyModifiers`。
     static func modifiers(for flags: UIKeyModifierFlags) -> TerminalKeyModifiers {
         TerminalKeyModifiers(
