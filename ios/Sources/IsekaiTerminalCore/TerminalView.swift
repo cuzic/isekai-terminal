@@ -406,6 +406,10 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
         view.onHyperlinkTapped = { url in
             pendingHyperlinkURL = url
         }
+        // タスク#51: マウスレポーティング有効時、`TerminalScreenView`が
+        // `terminalPointerEventBytes`(rust-core)でエンコードしたバイト列を
+        // そのままセッションへ送る(`TerminalInputRepresentable.onSendBytes`と対称)。
+        view.onPointerBytes = { [weak controller] data in controller?.send(data) }
         // タスク#20: view bounds/フォントセルサイズから求めたcols/rowsをそのまま
         // Rust側へ転送する。無駄な送信を避けるかどうかの判断は`SessionCore::resize`側の
         // 同一値dedupe(#62)に委ねる(Fableレビュー2次: dedupeがRust側に入ったので
