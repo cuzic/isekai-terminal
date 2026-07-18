@@ -19,7 +19,7 @@ final class TerminalScreenViewTests: XCTestCase {
             cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, bracketedPasteMode: false,
-            cursorVisible: true
+            cursorVisible: true, bellGeneration: 0
         )
 
         view.apply(update)
@@ -40,7 +40,7 @@ final class TerminalScreenViewTests: XCTestCase {
             cols: 10, rows: 10, cells: [],
             cursorRow: 0, cursorCol: 0,
             title: nil, applicationCursorMode: false, bracketedPasteMode: false,
-            cursorVisible: true
+            cursorVisible: true, bellGeneration: 0
         )
         view.apply(update)
         view.layoutIfNeeded()

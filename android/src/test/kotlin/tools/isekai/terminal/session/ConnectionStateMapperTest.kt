@@ -15,7 +15,7 @@ import uniffi.isekai_terminal_core.ScreenUpdate
  */
 class ConnectionStateMapperTest {
 
-    private fun screenUpdate() = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, false, false, true)
+    private fun screenUpdate() = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, false, false, true, 0uL)
 
     @Test
     fun `Connecting sets isConnecting and clears connected reconnecting`() {

@@ -2906,13 +2906,32 @@ public struct ScreenUpdate: Equatable, Hashable {
      * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
      */
     public var cursorVisible: Bool
+    /**
+     * BEL(0x07)受信のたびに単調増加する世代カウンタ。`bool`ではなくカウンタにして
+     * あるのは、conflated チャネル越しに複数回の BEL が1つの`ScreenUpdate`にまとめ
+     * られても呼び出し側が「前回より進んだか」で取りこぼしを検知でき、かつ同一
+     * `ScreenUpdate`の再適用で二重にフィードバック(バイブ/フラッシュ)が
+     * 発火するのを避けられるため。呼び出し側は前回値と比較し、進んでいれば
+     * フィードバックを1回発火させること。OSC のターミネータとして使われた BEL
+     * (`ESC]0;title BEL`)はカウントされない。
+     */
+    public var bellGeneration: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, bracketedPasteMode: Bool, 
         /**
          * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
-         */cursorVisible: Bool) {
+         */cursorVisible: Bool, 
+        /**
+         * BEL(0x07)受信のたびに単調増加する世代カウンタ。`bool`ではなくカウンタにして
+         * あるのは、conflated チャネル越しに複数回の BEL が1つの`ScreenUpdate`にまとめ
+         * られても呼び出し側が「前回より進んだか」で取りこぼしを検知でき、かつ同一
+         * `ScreenUpdate`の再適用で二重にフィードバック(バイブ/フラッシュ)が
+         * 発火するのを避けられるため。呼び出し側は前回値と比較し、進んでいれば
+         * フィードバックを1回発火させること。OSC のターミネータとして使われた BEL
+         * (`ESC]0;title BEL`)はカウントされない。
+         */bellGeneration: UInt64) {
         self.cols = cols
         self.rows = rows
         self.cells = cells
@@ -2922,6 +2941,7 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.applicationCursorMode = applicationCursorMode
         self.bracketedPasteMode = bracketedPasteMode
         self.cursorVisible = cursorVisible
+        self.bellGeneration = bellGeneration
     }
 
     
@@ -2948,7 +2968,8 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 title: FfiConverterOptionString.read(from: &buf), 
                 applicationCursorMode: FfiConverterBool.read(from: &buf), 
                 bracketedPasteMode: FfiConverterBool.read(from: &buf), 
-                cursorVisible: FfiConverterBool.read(from: &buf)
+                cursorVisible: FfiConverterBool.read(from: &buf), 
+                bellGeneration: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -2962,6 +2983,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterBool.write(value.applicationCursorMode, into: &buf)
         FfiConverterBool.write(value.bracketedPasteMode, into: &buf)
         FfiConverterBool.write(value.cursorVisible, into: &buf)
+        FfiConverterUInt64.write(value.bellGeneration, into: &buf)
     }
 }
 
