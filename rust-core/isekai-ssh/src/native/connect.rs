@@ -286,17 +286,21 @@ struct NativeConnectOps<'a> {
     resolution: &'a WrapperResolution,
     host_config: &'a openssh_config::HostConfig,
     runtime_dir: &'a Path,
-    /// Consumed (via `take`) on the first attempt whose SSH session actually
-    /// authenticates — a failed attempt errors before the handle exists, so
-    /// the hook survives for the re-bootstrap retry. `None` for the
-    /// single-process path.
+    /// Consumed (via `take`) only on the attempt whose SSH session actually
+    /// authenticates — `connect_attempt` takes it out of this `Option` at the
+    /// moment it invokes the hook (right after auth succeeds), so a failed
+    /// attempt (which errors before that point) leaves it intact for the
+    /// re-bootstrap retry. Passed by `&mut` for exactly that reason: a plain
+    /// `take()` here would consume the hook on *every* attempt, dropping the
+    /// mux owner role the moment the first attempt failed even though the
+    /// retry is what actually succeeds. `None` for the single-process path.
     owner_hook: Option<OwnerHook>,
 }
 
 #[async_trait(?Send)]
 impl ConnectRecoveryOps for NativeConnectOps<'_> {
     async fn attempt(&mut self, intent: &ConnectionIntent) -> Result<u8> {
-        connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir, self.owner_hook.take()).await
+        connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir, &mut self.owner_hook).await
     }
 
     fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
@@ -333,12 +337,52 @@ async fn connect_attempt(
     host_config: &openssh_config::HostConfig,
     intent: &ConnectionIntent,
     runtime_dir: &Path,
-    owner_hook: Option<OwnerHook>,
+    owner_hook: &mut Option<OwnerHook>,
 ) -> Result<u8> {
     let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), runtime_dir, intent)?;
     let stdio = ChildStdio::take_from(&mut child)
         .ok_or_else(|| anyhow!("isekai-ssh: spawned isekai-pipe connect without piped stdin/stdout (internal bug)"))?;
 
+    let result = run_authenticated_session(stdio, plan, resolution, host_config, owner_hook).await;
+
+    if result.is_err() {
+        // The `isekai-pipe connect` child writes its `ConnectOutcome`
+        // side-channel (`always-connects.md`) as it fails and exits — the
+        // exact signal `drive_connect_recovery` reads back via
+        // `claim_connect_outcome` (which does *not* retry) to decide whether to
+        // auto re-bootstrap. `spawn_isekai_pipe_connect` sets `kill_on_drop`,
+        // so dropping `child` the instant the SSH layer errors here can cut the
+        // child off *mid-write*, leaving no outcome to claim and turning a
+        // recoverable stale-trust/unreachable failure into an unrecoverable
+        // one. Give the child a brief, best-effort window to exit on its own
+        // (finishing that write) before `kill_on_drop` takes over. Timing out
+        // is fine — we fall through to the kill regardless; the point is only
+        // to *let* a nearly-done child finish, never to wait on a hung one.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+    }
+
+    // On success `child` (the isekai-pipe connect process) was kept alive for
+    // the whole session by this binding; dropping it here tears the subprocess
+    // down via `kill_on_drop` (per `spawn_isekai_pipe_connect`'s docs).
+    drop(child);
+    result
+}
+
+/// The authenticated-session half of [`connect_attempt`], split out so
+/// [`connect_attempt`] can retain the `isekai-pipe connect` `Child` and, on an
+/// error, give it a brief best-effort window to finish writing its
+/// `ConnectOutcome` side channel before `kill_on_drop` tears it down. Owns
+/// `stdio` (the child's piped stdin/stdout) for the whole session and, on
+/// success, runs the shell I/O loop to completion, returning the remote exit
+/// code. Takes `owner_hook` by `&mut` so a failure here (which returns before
+/// the hook is `take`n) leaves it intact for the always-connects retry.
+async fn run_authenticated_session(
+    stdio: ChildStdio,
+    plan: &WrapperPlan,
+    resolution: &WrapperResolution,
+    host_config: &openssh_config::HostConfig,
+    owner_hook: &mut Option<OwnerHook>,
+) -> Result<u8> {
     let (host, port) = resolution.native_host_port(plan.destination());
     let host_port = format!("{host}:{port}");
     let username = host_config
@@ -377,9 +421,10 @@ async fn connect_attempt(
     // start opening their own channels while this process also drives its own
     // foreground shell below. When ctl-socket is enabled, also hand over the
     // route table so each client gets its own private forward. Reached only on
-    // success, so a failed attempt (which returns above) never consumes the
-    // hook — it stays available for the always-connects re-bootstrap retry.
-    if let Some(hook) = owner_hook {
+    // success, so a failed attempt (which returns above) never `take`s the
+    // hook out of the caller's `Option` — it stays available for the
+    // always-connects re-bootstrap retry.
+    if let Some(hook) = owner_hook.take() {
         hook(handle.clone(), ctl_enabled.then(|| forward_routes.clone()));
     }
 
@@ -420,14 +465,14 @@ async fn connect_attempt(
         ctl_forward::cancel(&handle, &forward_routes, path).await;
     }
 
-    // Keeps the compiler from complaining that `handle`/`child` are unused
-    // past this point — both must stay alive for the duration of the I/O loop
-    // above. Dropping this `Arc<handle>` only tears the SSH session down once
-    // every clone is gone (a mux accept loop, if any, holds another), and
-    // dropping `child` kills the `isekai-pipe connect` subprocess (per
-    // `ChildStdio`'s own docs) — a deliberate keep-alive, not a no-op.
+    // Keeps the compiler from complaining that `handle` is unused past this
+    // point — it must stay alive for the duration of the I/O loop above.
+    // Dropping this `Arc<handle>` only tears the SSH session down once every
+    // clone is gone (a mux accept loop, if any, holds another) — a deliberate
+    // keep-alive, not a no-op. The `isekai-pipe connect` `Child` is held (and
+    // torn down) by the caller [`connect_attempt`], which needs it on the
+    // error path to let a failing child finish writing its `ConnectOutcome`.
     drop(handle);
-    drop(child);
 
     Ok(exit_code)
 }
@@ -1105,6 +1150,57 @@ mod tests {
 
         let result = run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, runtime_dir.path(), None).await;
         assert!(result.is_err(), "a connect failure with no ConnectOutcome signal must propagate, not be swallowed");
+    }
+
+    /// Regression for the owner-hook consumption bug: a *failed* connect
+    /// attempt must not consume the `owner_hook` — it has to survive so the
+    /// always-connects re-bootstrap retry can still become the mux owner. The
+    /// old code did `connect_attempt(..., self.owner_hook.take())`, taking the
+    /// hook out of the `Option` the moment `attempt` was *called*, regardless
+    /// of whether the attempt then succeeded; a failed first attempt therefore
+    /// dropped the hook and the (successful) retry never started `serve_clients`.
+    /// Here a bogus pipe binary path makes the attempt fail before any handle
+    /// exists; the hook must be left `Some` and never invoked. (The mirror
+    /// case — the hook *is* invoked on success — is covered end-to-end by the
+    /// mux owner path; a real success needs a live `isekai-pipe connect` child
+    /// and sshd, out of scope for a unit test.)
+    #[tokio::test]
+    async fn connect_attempt_leaves_the_owner_hook_intact_when_the_attempt_fails() {
+        use isekai_pipe_core::{BootstrapProvenance, IntentTransport, ServerIdentity};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let bogus_pipe = std::env::temp_dir().join("isekai-native-owner-hook-test-nonexistent-pipe-binary");
+        let plan = crate::wrapper::parse_wrapper(vec![
+            "--isekai-pipe-path".to_string(),
+            bogus_pipe.display().to_string(),
+            "isekai-native-owner-hook-test-host".to_string(),
+        ])
+        .expect("parse_wrapper");
+        let (resolution, host_config) = crate::wrapper::resolve_for_native(&plan).expect("resolve_for_native");
+        let intent = ConnectionIntent::new(
+            "isekai-native-owner-hook-test-host",
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::Relay {
+                helper_addr: "203.0.113.5:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "example.com:22".to_string() },
+        );
+        let runtime_dir = tempfile::tempdir().unwrap();
+
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let fired_in_hook = fired.clone();
+        let mut owner_hook: Option<OwnerHook> =
+            Some(Box::new(move |_handle, _routes| fired_in_hook.store(true, Ordering::SeqCst)));
+
+        let result =
+            connect_attempt(&plan, &resolution, &host_config, &intent, runtime_dir.path(), &mut owner_hook).await;
+
+        assert!(result.is_err(), "a bogus pipe binary path must make the connect attempt fail");
+        assert!(owner_hook.is_some(), "a failed attempt must leave the owner hook intact for the re-bootstrap retry");
+        assert!(!fired.load(Ordering::SeqCst), "the owner hook must not be invoked on a failed attempt");
     }
 
     /// Regression for the "--isekai-log-file silently ignored on Windows"
