@@ -35,6 +35,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -584,6 +585,38 @@ fun TerminalScreenBody(
                                     // ため(iOS版`isPointerReportingActive`と同じ理由・同じ判断)。
                                     val initialPointerCount = currentEvent.changes.count { it.pressed }
                                     val mouseModeActive = isPointerReportingActive() && initialPointerCount <= 1
+                                    // タスク#80(codexレビュー指摘): ピンチ拡縮+縦パンスクロールの
+                                    // イベントループ本体を、下の(2)通常経路とマウスモード経由の両方から
+                                    // 呼べるよう共通化しておく(マウスモード時に2本目の指が検出された
+                                    // 場合、以前はreleaseを送って`return@awaitEachGesture`するだけで
+                                    // 同じジェスチャをピンチへ継続できず、マウスモード有効時はピンチが
+                                    // 実質使えなかった — iOS版はpinch recognizerをマウスモード時も
+                                    // 抑止対象にしていないため、Android側だけの不整合だった)。
+                                    val runPinchAndPan: suspend AwaitPointerEventScope.() -> Unit = {
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val zoom = event.calculateZoom()
+                                            val pan = event.calculatePan()
+                                            if (zoom != 1f || pan != Offset.Zero) {
+                                                // 上部バーを表示するトリガー(ドラッグ操作)。継続的にドラッグしている間は
+                                                // 呼ばれ続けるので、離れた後の自動非表示タイマーもその都度リセットされる。
+                                                onUserActivity()
+                                                val newScale = (fontScale * zoom).coerceIn(0.5f, 3.0f)
+                                                if (newScale != fontScale) { fontScale = newScale; saveFontScale(newScale) }
+                                                panAccumY += pan.y
+                                                while (panAccumY < -cellH) {
+                                                    scrollOffset = (scrollOffset + 1).coerceIn(0, scrollbackLen)
+                                                    panAccumY += cellH
+                                                }
+                                                while (panAccumY > cellH) {
+                                                    scrollOffset = (scrollOffset - 1).coerceIn(0, scrollbackLen)
+                                                    panAccumY -= cellH
+                                                }
+                                                event.changes.forEach { it.consume() }
+                                            }
+                                            if (event.changes.all { !it.pressed }) break
+                                        }
+                                    }
                                     if (mouseModeActive) {
                                         down.consume()
                                         onUserActivity()
@@ -595,6 +628,7 @@ fun TerminalScreenBody(
                                         // タッチはソフトキーボードを呼び出す操作ではないため)。
                                         actions.onRequestFocus()
                                         sendPointerEventAt(MouseEventKind.PRESS, MouseButton.LEFT, down.position.x, down.position.y, cellW, cellH, cols, rows)
+                                        var handoffToPinch = false
                                         while (true) {
                                             val event = awaitPointerEvent()
                                             val change = event.changes.firstOrNull { it.id == down.id } ?: break
@@ -606,9 +640,16 @@ fun TerminalScreenBody(
                                             val pointerCount = event.changes.count { it.pressed }
                                             if (!change.pressed || pointerCount > 1) {
                                                 sendPointerEventAt(MouseEventKind.RELEASE, MouseButton.LEFT, change.position.x, change.position.y, cellW, cellH, cols, rows)
+                                                // タスク#80: releaseの原因が「2本目の指が触れた」ことによる
+                                                // ものであれば、同じジェスチャをそのままピンチ/パン処理へ
+                                                // 引き継ぐ(単に指が離れただけ[2本目なし]の場合は継続しない)。
+                                                handoffToPinch = pointerCount > 1
                                                 break
                                             }
                                             sendPointerEventAt(MouseEventKind.MOTION, MouseButton.LEFT, change.position.x, change.position.y, cellW, cellH, cols, rows)
+                                        }
+                                        if (handoffToPinch) {
+                                            runPinchAndPan()
                                         }
                                         return@awaitEachGesture
                                     }
@@ -674,30 +715,9 @@ fun TerminalScreenBody(
                                             }
                                         } else {
                                             // (2) 2本指以上、または長押し不成立で移動 →
-                                            // ピンチ拡縮+縦パンスクロール
-                                            while (true) {
-                                                val event = awaitPointerEvent()
-                                                val zoom = event.calculateZoom()
-                                                val pan = event.calculatePan()
-                                                if (zoom != 1f || pan != Offset.Zero) {
-                                                    // 上部バーを表示するトリガー(ドラッグ操作)。継続的にドラッグしている間は
-                                                    // 呼ばれ続けるので、離れた後の自動非表示タイマーもその都度リセットされる。
-                                                    onUserActivity()
-                                                    val newScale = (fontScale * zoom).coerceIn(0.5f, 3.0f)
-                                                    if (newScale != fontScale) { fontScale = newScale; saveFontScale(newScale) }
-                                                    panAccumY += pan.y
-                                                    while (panAccumY < -cellH) {
-                                                        scrollOffset = (scrollOffset + 1).coerceIn(0, scrollbackLen)
-                                                        panAccumY += cellH
-                                                    }
-                                                    while (panAccumY > cellH) {
-                                                        scrollOffset = (scrollOffset - 1).coerceIn(0, scrollbackLen)
-                                                        panAccumY -= cellH
-                                                    }
-                                                    event.changes.forEach { it.consume() }
-                                                }
-                                                if (event.changes.all { !it.pressed }) break
-                                            }
+                                            // ピンチ拡縮+縦パンスクロール(ループ本体はマウスモード
+                                            // 経由のピンチ引き継ぎ[タスク#80]と共通の`runPinchAndPan`)
+                                            runPinchAndPan()
                                         }
                                     }
                                 }
