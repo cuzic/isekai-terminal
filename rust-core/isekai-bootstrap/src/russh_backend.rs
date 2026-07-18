@@ -39,6 +39,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -443,6 +444,41 @@ struct SshOutput {
     stderr: Vec<u8>,
 }
 
+/// Maximum time `run_russh_command` will wait with **no forward progress at
+/// all** — neither a stdin byte accepted by the remote's flow-control window
+/// nor a channel message received — before giving up and returning whatever
+/// it has collected so far. This is an *idle* bound (reset on every completed
+/// sub-write and every received message), **not** a total-runtime bound, so a
+/// legitimately slow-but-progressing multi-MB helper upload over a slow link
+/// never trips it; only a genuinely wedged channel does. Bounding the wait is
+/// what turns an otherwise-infinite hang into a normal recoverable failure,
+/// as the `always-connects` principle requires (a bootstrap that hangs can't
+/// enter the silent re-deploy/retry cycle at all).
+///
+/// Why this is needed: `install_and_launch` feeds the base64-encoded helper
+/// binary (tens of MB) as stdin, far larger than SSH's initial flow-control
+/// window. Writing past the window requires the remote to actually consume
+/// the data and send `WINDOW_ADJUST` back. If the remote script dies early
+/// (disk full, parse failure, ...) and sends `CHANNEL_CLOSE` before consuming
+/// all of stdin, russh 0.48.2's close handling (`client/encrypted.rs`) just
+/// removes the channel from its routing map — it does **not** wake a
+/// `ChannelTx` (`channels/io/tx.rs`) parked waiting for window space (unlike
+/// `WINDOW_ADJUST`, which does). So a plain "write all of stdin, then read"
+/// loop parks forever. This function instead reads the channel *concurrently*
+/// with writing, so it observes the `Close`/`Eof`/`None` and abandons the
+/// doomed write; the idle timeout is a backstop for the rarer case of a
+/// remote that neither consumes stdin nor closes the channel.
+const NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Granularity (in bytes) at which stdin is handed to `write_all` between
+/// progress checkpoints. Each completed sub-write pokes the idle timer, so a
+/// slow-but-moving upload keeps resetting [`NO_PROGRESS_TIMEOUT`] instead of
+/// racing a single giant `write_all` against it. 32 KiB matches russh's
+/// default `maximum_packet_size`, so a sub-write is at most a couple of window
+/// grants — small enough that even a slow remote clears one well inside the
+/// idle bound, large enough to keep per-write overhead negligible.
+const STDIN_WRITE_CHUNK: usize = 32 * 1024;
+
 /// Runs `remote_command` as a single SSH `exec` request over `handle`,
 /// optionally feeding `stdin_chunks` to it in order (sent as separate
 /// `channel.data()` writes rather than pre-concatenated into one buffer —
@@ -457,44 +493,128 @@ struct SshOutput {
 /// SSH_EXTENDED_DATA_STDERR`) so the "stdout purity" contract
 /// (`BootstrapBackend::install_and_start`'s docs) holds exactly as it does
 /// for the real `ssh(1)` subprocess case.
+///
+/// Writing stdin and reading the channel happen **concurrently** (see
+/// [`NO_PROGRESS_TIMEOUT`] for the full rationale): a remote that closes the
+/// channel before consuming all of stdin must not deadlock the writer. If the
+/// channel closes (or idles out) mid-write, the write is abandoned and
+/// whatever output arrived so far is returned — an empty/status-less result
+/// then becomes a proper recoverable `BootstrapError` in the caller
+/// (`HandshakeMissing`/`RemoteCommandFailed`), never an infinite hang.
 async fn run_russh_command<H: client::Handler>(
     handle: &client::Handle<H>,
     remote_command: &str,
     stdin_chunks: &[&[u8]],
 ) -> Result<SshOutput, BootstrapError> {
+    run_russh_command_inner(handle, remote_command, stdin_chunks, NO_PROGRESS_TIMEOUT).await
+}
+
+/// Body of [`run_russh_command`], parameterized on the idle timeout so tests
+/// can exercise the "remote never responds" path in milliseconds instead of
+/// [`NO_PROGRESS_TIMEOUT`]'s production value.
+async fn run_russh_command_inner<H: client::Handler>(
+    handle: &client::Handle<H>,
+    remote_command: &str,
+    stdin_chunks: &[&[u8]],
+    no_progress_timeout: Duration,
+) -> Result<SshOutput, BootstrapError> {
+    use tokio::io::AsyncWriteExt as _;
+
     let mut channel = open_channel(handle, &SessionKind::Exec { command: remote_command.to_string() })
         .await
         .map_err(BootstrapError::Session)?;
 
-    for chunk in stdin_chunks {
-        channel.data(*chunk).await.map_err(|e| BootstrapError::Session(russh_stream_session::SessionError::Channel(e)))?;
-    }
-    channel.eof().await.map_err(|e| BootstrapError::Session(russh_stream_session::SessionError::Channel(e)))?;
+    // `make_writer()` borrows the channel only for this call: the `impl
+    // AsyncWrite` it returns clones the sender + window handle and owns them
+    // (russh is edition 2018, so this RPIT does not capture `&self`'s
+    // lifetime), leaving `channel` free for the concurrent `channel.wait()`
+    // below. That independence is the whole point — it is what lets us write
+    // stdin and read the channel at the same time.
+    let mut writer = channel.make_writer();
+
+    // Poked after each completed sub-write so the idle timer can distinguish
+    // "slow but moving" from "wedged". A `Notify` collapses bursts to a single
+    // wake, which is exactly what we want here (any progress at all resets the
+    // timer).
+    let progress = Arc::new(tokio::sync::Notify::new());
+    let write_progress = progress.clone();
+
+    // One future for the entire stdin stream + EOF. We only ever *abandon*
+    // (drop) it — never resume it after the read side has seen the channel
+    // close — so the cancel-safety hazard of re-sending a partially-written
+    // buffer cannot arise: on any loop iteration where another `select!` arm
+    // wins, this future is merely left un-polled (its internal write cursor is
+    // preserved for the next iteration, since it is pinned across the loop);
+    // it is dropped for good only when we `break`, at which point we never
+    // write again.
+    let write_fut = async move {
+        for chunk in stdin_chunks {
+            for sub in chunk.chunks(STDIN_WRITE_CHUNK) {
+                writer.write_all(sub).await?;
+                write_progress.notify_one();
+            }
+        }
+        writer.shutdown().await?; // sends CHANNEL_EOF
+        write_progress.notify_one();
+        Ok::<(), std::io::Error>(())
+    };
+    tokio::pin!(write_fut);
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut status = None;
+    let mut writing_done = false;
 
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            russh::ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-            russh::ChannelMsg::ExtendedData { data, ext } if ext == SSH_EXTENDED_DATA_STDERR => {
-                stderr.extend_from_slice(&data);
+    let idle = tokio::time::sleep(no_progress_timeout);
+    tokio::pin!(idle);
+
+    loop {
+        tokio::select! {
+            // Drive stdin writing to completion. A write error here almost
+            // always means the remote already closed the channel; we do NOT
+            // propagate it — we stop writing and keep draining so the exit
+            // status / stderr explaining *why* are still collected (the caller
+            // turns an empty/failed result into a proper recoverable error).
+            // The `if !writing_done` guard stops the completed future from
+            // being polled again (which would panic).
+            res = &mut write_fut, if !writing_done => {
+                writing_done = true;
+                let _ = res; // benign write errors are intentionally swallowed (see above)
+                idle.as_mut().reset(tokio::time::Instant::now() + no_progress_timeout);
             }
-            // Any other `ext` value is not stdout by definition — never let
-            // it leak into the buffer the stdout-purity contract treats as
-            // trusted (see this function's own docs).
-            russh::ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
-            russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status as i32),
-            // Only `Close` (or the loop naturally ending when `wait()`
-            // returns `None`) terminates the receive loop — deliberately
-            // NOT `Eof`. A server is free to send `CHANNEL_EOF` before the
-            // `exit-status` channel request, and breaking on `Eof` would
-            // drop that later `ExitStatus`, spuriously reporting `status:
-            // None` for a command whose stdout already arrived correctly
-            // (e.g. `detect_remote_arch`'s `uname -m` probe).
-            russh::ChannelMsg::Close => break,
-            _ => {}
+            // A completed sub-write: forward progress, so reset the idle bound
+            // and keep waiting for the (legitimately slow) upload to finish.
+            _ = progress.notified() => {
+                idle.as_mut().reset(tokio::time::Instant::now() + no_progress_timeout);
+            }
+            msg = channel.wait() => {
+                idle.as_mut().reset(tokio::time::Instant::now() + no_progress_timeout);
+                match msg {
+                    Some(russh::ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
+                    Some(russh::ChannelMsg::ExtendedData { data, ext }) if ext == SSH_EXTENDED_DATA_STDERR => {
+                        stderr.extend_from_slice(&data);
+                    }
+                    // Any other `ext` value is not stdout by definition — never
+                    // let it leak into the buffer the stdout-purity contract
+                    // treats as trusted (see this function's own docs).
+                    Some(russh::ChannelMsg::ExtendedData { data, .. }) => stderr.extend_from_slice(&data),
+                    Some(russh::ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status as i32),
+                    // Only `Close` (or `wait()` returning `None`) terminates the
+                    // receive loop — deliberately NOT `Eof`. A server is free to
+                    // send `CHANNEL_EOF` before the `exit-status` channel
+                    // request, and breaking on `Eof` would drop that later
+                    // `ExitStatus`, spuriously reporting `status: None` for a
+                    // command whose stdout already arrived correctly (e.g.
+                    // `detect_remote_arch`'s `uname -m` probe).
+                    Some(russh::ChannelMsg::Close) | None => break,
+                    Some(_) => {}
+                }
+            }
+            // No progress at all for `no_progress_timeout`: the channel is
+            // wedged (remote neither consuming stdin nor closing). Give up with
+            // whatever we have — a bounded failure the caller can recover from,
+            // never a hang.
+            _ = &mut idle => break,
         }
     }
 
@@ -893,5 +1013,182 @@ mod tests {
             "an exit status sent AFTER eof must still be captured, not dropped by breaking on eof"
         );
         assert_eq!(out.stdout, b"x86_64\n", "stdout sent before eof must be preserved");
+    }
+
+    // ── run_russh_command must not hang on early close / a wedged channel ──
+    //
+    // The bug: `install_and_launch` feeds tens of MB of stdin, far past SSH's
+    // flow-control window. The old "write ALL stdin, then read" loop parked in
+    // `channel.data()` forever if the remote closed the channel before draining
+    // stdin, because russh 0.48.2's CHANNEL_CLOSE path never wakes a
+    // window-blocked `ChannelTx`. The fix reads concurrently with writing and
+    // bounds the total idle wait, so both an early close and a silently
+    // non-responsive server terminate in finite time.
+
+    /// Connects to `addr` accepting any host key, authenticates with any key
+    /// (the test servers below accept all), and returns the live session —
+    /// the shared preamble for the two hang-regression tests.
+    async fn connect_and_auth_accept_all(addr: SocketAddr) -> Session<VerifyingHandler<AcceptAllHostKeys>> {
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None,
+            Arc::new(client::Config::default()),
+            &addr.ip().to_string(),
+            addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[8u8; 32]));
+        let pem = key.to_openssh(Default::default()).unwrap().as_bytes().to_vec();
+        let authed = authenticate_session(&mut session.handle, "tester", &Credential::PublicKey { private_key_pem: pem })
+            .await
+            .expect("authenticate_session should not error for a well-formed key");
+        assert!(authed, "the server accepts any public key");
+        session
+    }
+
+    /// Spawns a server advertising only a tiny (`4 KiB`) flow-control window,
+    /// so a client sending far more stdin than that blocks almost immediately —
+    /// the precondition for reproducing the window-blocked-writer hang.
+    async fn spawn_small_window_server<S>(mut srv: S) -> SocketAddr
+    where
+        S: server::Server + Send + 'static,
+        S::Handler: Send + 'static,
+    {
+        let host_key = PrivateKey::from(Ed25519Keypair::from_seed(&[7u8; 32]));
+        let config = Arc::new(server::Config { keys: vec![host_key], window_size: 4096, ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = srv.run_on_socket(config, &listener).await;
+        });
+        addr
+    }
+
+    /// Sends a line of stdout then immediately closes the channel, WITHOUT ever
+    /// reading stdin. A client that writes all of stdin before reading would
+    /// block forever (russh 0.48.2 doesn't wake a window-blocked writer on
+    /// CHANNEL_CLOSE); reading concurrently, `run_russh_command` sees the close.
+    #[derive(Clone)]
+    struct CloseWithoutReadingStdinServer;
+
+    impl server::Server for CloseWithoutReadingStdinServer {
+        type Handler = CloseWithoutReadingStdinHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> CloseWithoutReadingStdinHandler {
+            CloseWithoutReadingStdinHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct CloseWithoutReadingStdinHandler;
+
+    #[async_trait]
+    impl server::Handler for CloseWithoutReadingStdinHandler {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self, _user: &str, _public_key: &russh_keys::ssh_key::PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn exec_request(
+            &mut self, channel: ChannelId, _data: &[u8], session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            // Emit some stdout, then close — never touching stdin.
+            session.data(channel, CryptoVec::from(b"partial-output\n".to_vec()))?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    /// Accepts the exec but then does nothing at all: never reads stdin, never
+    /// sends output, never closes. A client sending more stdin than the window
+    /// parks with no forward progress — the case the idle timeout backstops.
+    #[derive(Clone)]
+    struct WedgedServer;
+
+    impl server::Server for WedgedServer {
+        type Handler = WedgedHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> WedgedHandler {
+            WedgedHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct WedgedHandler;
+
+    #[async_trait]
+    impl server::Handler for WedgedHandler {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self, _user: &str, _public_key: &russh_keys::ssh_key::PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn exec_request(
+            &mut self, _channel: ChannelId, _data: &[u8], _session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_russh_command_returns_when_remote_closes_before_consuming_stdin() {
+        let addr = spawn_small_window_server(CloseWithoutReadingStdinServer).await;
+        let session = connect_and_auth_accept_all(addr).await;
+
+        // 512 KiB of stdin against a 4 KiB window: the old write-all-then-read
+        // loop would block in `channel.data()` forever here.
+        let big = vec![b'x'; 512 * 1024];
+        let stdin_chunks: [&[u8]; 1] = [big.as_slice()];
+
+        // The outer `timeout` is the actual regression guard: if the fix
+        // regresses, this fails with "did not return" instead of hanging CI.
+        let out = tokio::time::timeout(Duration::from_secs(10), run_russh_command(&session.handle, "cat", &stdin_chunks))
+            .await
+            .expect("run_russh_command must return, not hang, when the remote closes before draining stdin")
+            .expect("a partial run still yields Ok with whatever output arrived");
+
+        assert_eq!(out.stdout, b"partial-output\n", "stdout sent before the early close must be captured");
+    }
+
+    #[tokio::test]
+    async fn run_russh_command_inner_gives_up_on_a_wedged_channel() {
+        let addr = spawn_small_window_server(WedgedServer).await;
+        let session = connect_and_auth_accept_all(addr).await;
+
+        let big = vec![b'x'; 512 * 1024];
+        let stdin_chunks: [&[u8]; 1] = [big.as_slice()];
+
+        // A short idle timeout so the "remote never responds" path is exercised
+        // in milliseconds instead of NO_PROGRESS_TIMEOUT's 30 s. The outer
+        // wall-clock timeout is far longer, so a *hang* (rather than the idle
+        // bound firing) is what fails the test.
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_russh_command_inner(&session.handle, "cat", &stdin_chunks, Duration::from_millis(200)),
+        )
+        .await
+        .expect("the idle timeout must bound a wedged channel, not hang")
+        .expect("giving up on a wedged channel is Ok(partial), which the caller turns into a recoverable error");
+
+        assert!(out.stdout.is_empty(), "a server that never responds produces no stdout");
+        assert_eq!(out.status, None, "no exit status ever arrives from a wedged channel");
     }
 }
