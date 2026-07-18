@@ -151,6 +151,33 @@ impl WindowsNamedPipeChannel {
     }
 }
 
+/// Yields the server instance to serve the next `accept` with: the pre-created
+/// `pending` instance if present, otherwise a freshly created one via `create`.
+///
+/// `pending` is normally `Some` between accepts, but a previous accept that
+/// served its client yet failed to create the following instance leaves it as
+/// `None` (see [`store_next_pending`]); this retries the creation and surfaces
+/// its error as a plain `Err` — it must never panic on a `None` slot, since the
+/// caller may reasonably retry `accept` after an earlier deferred failure.
+fn take_or_create_pending<S>(
+    pending: &mut Option<S>,
+    create: impl FnOnce() -> io::Result<S>,
+) -> io::Result<S> {
+    match pending.take() {
+        Some(server) => Ok(server),
+        None => create(),
+    }
+}
+
+/// Re-arms `pending` with the next accepting instance produced by `create`. On
+/// success the slot holds that instance; on failure the slot is left `None` and
+/// the error is intentionally swallowed here, deferring it to the next
+/// `take_or_create_pending`. This is what guarantees a failure to prepare the
+/// *following* instance never discards the client that was just connected.
+fn store_next_pending<S>(pending: &mut Option<S>, create: impl FnOnce() -> io::Result<S>) {
+    *pending = create().ok();
+}
+
 #[async_trait]
 impl ExclusiveChannel for WindowsNamedPipeChannel {
     type Connection = PipeConnection;
@@ -166,21 +193,25 @@ impl ExclusiveChannel for WindowsNamedPipeChannel {
     }
 
     async fn accept(&mut self) -> io::Result<Self::Connection> {
-        // The pending instance is always present between accepts (set by
-        // `try_claim`, and re-set below before every return).
-        let server = self
-            .pending
-            .take()
-            .expect("WindowsNamedPipeChannel::pending is always Some between accepts");
+        // Obtain the instance to serve this client with. Normally `pending`
+        // holds a pre-created instance (set by `try_claim`, and re-armed after
+        // every accept). If a previous accept served its client but then failed
+        // to create the following instance, it left `pending` as `None` and
+        // deferred that error to here — so create the instance now, surfacing
+        // any failure as a normal `Err` rather than panicking.
+        let server = take_or_create_pending(&mut self.pending, || {
+            Self::create_server_instance(&self.name, false)
+        })?;
         server.connect().await?;
-        // Prepare the next accepting instance immediately, so a client that
+        // Re-arm the next accepting instance immediately, so a client that
         // connects right after this one is served rather than seeing the pipe
-        // as momentarily gone. A failure to create it must not lose the
-        // just-connected client: report it only if the *next* accept is
-        // attempted (leave `pending` as None; the expect above would then
-        // fire — but `create_server_instance` failing here is the same class
-        // of genuine channel failure `accept` is documented to surface).
-        self.pending = Some(Self::create_server_instance(&self.name, false)?);
+        // as momentarily gone. Creating it must NEVER cost us the client we
+        // just connected: on failure we leave `pending` as `None` and swallow
+        // the error here, deferring it to the next accept (which retries the
+        // creation above). The just-connected `server` is returned regardless.
+        store_next_pending(&mut self.pending, || {
+            Self::create_server_instance(&self.name, false)
+        });
         Ok(PipeConnection::Server(server))
     }
 
@@ -332,4 +363,78 @@ fn sid_in_token_buf(buf: &[u8]) -> PSID {
     // SAFETY: `buf` was sized and filled by `GetTokenInformation(TokenUser,
     // ...)`, which guarantees a valid `TOKEN_USER` at its start.
     unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid }
+}
+
+// These tests only compile on Windows (the whole module is `#[cfg(windows)]`),
+// so CI verifies them by `cargo check`/`clippy --target x86_64-pc-windows-gnu`
+// rather than by running them; a Windows dev box runs them via `cargo test`.
+// They exercise the host-independent pending-slot state machine of `accept`
+// through a fake server type, since the real `NamedPipeServer` needs Windows.
+#[cfg(test)]
+mod tests {
+    use super::{store_next_pending, take_or_create_pending};
+    use std::cell::Cell;
+    use std::io;
+
+    // Stand-in for `NamedPipeServer`, identified by a number so tests can assert
+    // exactly which instance `accept` chose to serve with.
+    #[derive(Debug, PartialEq)]
+    struct FakeServer(u32);
+
+    #[test]
+    fn take_or_create_serves_the_pending_instance_and_consumes_the_slot() {
+        let mut pending = Some(FakeServer(1));
+        let created = Cell::new(false);
+        let server = take_or_create_pending(&mut pending, || {
+            created.set(true);
+            Ok(FakeServer(99))
+        })
+        .expect("serving a present pending instance never fails");
+        assert_eq!(server, FakeServer(1), "must serve the already-waiting instance");
+        assert!(!created.get(), "must not create a fresh instance when one is pending");
+        assert!(pending.is_none(), "the served instance is taken out of the slot");
+    }
+
+    #[test]
+    fn take_or_create_recreates_when_the_slot_was_left_empty() {
+        // Models the state a prior accept leaves after it served its client but
+        // failed to arm the following instance: `pending` is `None`.
+        let mut pending: Option<FakeServer> = None;
+        let server = take_or_create_pending(&mut pending, || Ok(FakeServer(7)))
+            .expect("re-created instance is served");
+        assert_eq!(server, FakeServer(7));
+    }
+
+    #[test]
+    fn take_or_create_returns_err_instead_of_panicking_on_empty_slot() {
+        // The regression guard: the old code did `.expect(...)` on a `None`
+        // slot and panicked (taking the owner process down) if the caller
+        // retried `accept` after a deferred creation failure. Now the retried
+        // creation's error is returned as an ordinary `Err`.
+        let mut pending: Option<FakeServer> = None;
+        let err = take_or_create_pending(&mut pending, || Err(io::Error::other("create failed")))
+            .expect_err("a failed re-creation must surface as Err, not panic");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn store_next_pending_arms_the_slot_on_success() {
+        let mut pending: Option<FakeServer> = None;
+        store_next_pending(&mut pending, || Ok(FakeServer(2)));
+        assert_eq!(pending, Some(FakeServer(2)), "the next instance is stored for reuse");
+    }
+
+    #[test]
+    fn store_next_pending_leaves_slot_empty_on_failure_deferring_the_error() {
+        // The heart of the bug: when creating the *next* instance fails, the
+        // client that `accept` just connected (returned separately) must not be
+        // affected. `store_next_pending` swallows the error and leaves the slot
+        // `None`, deferring the failure to the next `take_or_create_pending`
+        // instead of propagating it now and dropping the connected client.
+        let mut pending: Option<FakeServer> = None;
+        store_next_pending(&mut pending, || {
+            Err(io::Error::other("next-instance create failed"))
+        });
+        assert!(pending.is_none(), "slot stays empty so the error is deferred, not surfaced now");
+    }
 }
