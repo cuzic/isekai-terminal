@@ -14,6 +14,7 @@ import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.SshAuth
 import uniffi.isekai_terminal_core.SshConfig
@@ -315,7 +316,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "title1", false, false, true, 0uL)
+        val update = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "title1", false, false, true, 0uL, CursorShape.BLOCK, true)
         fakeOrchestrator.simulateScreenUpdate(update)
         awaitState { it.screenUpdate != null }
         assertEquals("title1", session.state.value.screenUpdate?.title)
@@ -327,9 +328,9 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update1 = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "title1", false, false, true, 0uL)
-        val update2 = ScreenUpdate(80u, 24u, emptyList(), 0u, 5u, "title2", false, false, true, 0uL)
-        val update3 = ScreenUpdate(80u, 24u, emptyList(), 0u, 10u, "title3", false, false, true, 0uL)
+        val update1 = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "title1", false, false, true, 0uL, CursorShape.BLOCK, true)
+        val update2 = ScreenUpdate(80u, 24u, emptyList(), 0u, 5u, "title2", false, false, true, 0uL, CursorShape.BLOCK, true)
+        val update3 = ScreenUpdate(80u, 24u, emptyList(), 0u, 10u, "title3", false, false, true, 0uL, CursorShape.BLOCK, true)
 
         fakeOrchestrator.simulateScreenUpdate(update1)
         fakeOrchestrator.simulateScreenUpdate(update2)
@@ -345,7 +346,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "before-disconnect", false, false, true, 0uL)
+        val update = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "before-disconnect", false, false, true, 0uL, CursorShape.BLOCK, true)
         fakeOrchestrator.simulateScreenUpdate(update)
         awaitState { it.screenUpdate != null }
 
@@ -354,7 +355,7 @@ class TerminalSessionTest {
         assertNull("screenUpdate should be cleared on disconnect", session.state.value.screenUpdate)
 
         // 切断後に simulateScreenUpdate が来ても無視される
-        val staleUpdate = ScreenUpdate(80u, 24u, emptyList(), 0u, 5u, "after-disconnect", false, false, true, 0uL)
+        val staleUpdate = ScreenUpdate(80u, 24u, emptyList(), 0u, 5u, "after-disconnect", false, false, true, 0uL, CursorShape.BLOCK, true)
         fakeOrchestrator.simulateScreenUpdate(staleUpdate)
         delay(200)
         assertNull("stale screen update should not be applied after disconnect", session.state.value.screenUpdate)
@@ -368,7 +369,7 @@ class TerminalSessionTest {
 
         repeat(50) { i ->
             fakeOrchestrator.simulateScreenUpdate(
-                ScreenUpdate(80u, 24u, emptyList(), 0u, i.toUInt(), "frame-$i", false, false, true, 0uL)
+                ScreenUpdate(80u, 24u, emptyList(), 0u, i.toUInt(), "frame-$i", false, false, true, 0uL, CursorShape.BLOCK, true)
             )
         }
 

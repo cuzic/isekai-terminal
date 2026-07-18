@@ -25,6 +25,7 @@ import tools.isekai.terminal.input.KeyStep
 import tools.isekai.terminal.input.TerminalKeyEncoder
 import tools.isekai.terminal.session.AppExecutor
 import tools.isekai.terminal.session.TerminalSession
+import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.TransportPreference
 
@@ -502,7 +503,7 @@ class TerminalTabsViewModelTest {
     // ── 打鍵列（KeySequence）─────────────────────────────────────
 
     private fun screenUpdate(applicationCursorMode: Boolean) =
-        ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, applicationCursorMode, false, true, 0uL)
+        ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, applicationCursorMode, false, true, 0uL, CursorShape.BLOCK, true)
 
     @Test
     fun sendKeySequence_sendsResolvedStepsConcatenated() = runBlocking {

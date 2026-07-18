@@ -4595,6 +4595,18 @@ data class ScreenUpdate (
      * (`ESC]0;title BEL`)はカウントされない。
      */
     var `bellGeneration`: kotlin.ULong
+    , 
+    /**
+     * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
+     */
+    var `cursorShape`: CursorShape
+    , 
+    /**
+     * カーソルが点滅すべきかどうか。DECSCUSRの偶数/奇数パラメータ
+     * (block/underline/bar それぞれの steady/blinking)から導出される。既定は`true`
+     * (xtermの既定である「blinking block」に合わせる)。
+     */
+    var `cursorBlink`: kotlin.Boolean
     
 ){
     
@@ -4621,6 +4633,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterULong.read(buf),
+            FfiConverterTypeCursorShape.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -4634,7 +4648,9 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.allocationSize(value.`applicationCursorMode`) +
             FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`) +
             FfiConverterBoolean.allocationSize(value.`cursorVisible`) +
-            FfiConverterULong.allocationSize(value.`bellGeneration`)
+            FfiConverterULong.allocationSize(value.`bellGeneration`) +
+            FfiConverterTypeCursorShape.allocationSize(value.`cursorShape`) +
+            FfiConverterBoolean.allocationSize(value.`cursorBlink`)
     )
 
     override fun write(value: ScreenUpdate, buf: ByteBuffer) {
@@ -4648,6 +4664,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.write(value.`bracketedPasteMode`, buf)
             FfiConverterBoolean.write(value.`cursorVisible`, buf)
             FfiConverterULong.write(value.`bellGeneration`, buf)
+            FfiConverterTypeCursorShape.write(value.`cursorShape`, buf)
+            FfiConverterBoolean.write(value.`cursorBlink`, buf)
     }
 }
 
@@ -5071,6 +5089,49 @@ public object FfiConverterTypeConnectionPublicState : FfiConverterRustBuffer<Con
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
+ * DECSCUSR(`CSI Ps SP q`)が選択するカーソル形状。`Terminal`が状態として保持し
+ * (rust-ssot: Kotlin/Swift側にミラー状態を作らず、この値をそのまま描画に使う)、
+ * `ScreenUpdate::cursor_shape`として公開する。点滅の有無は別フィールド
+ * (`ScreenUpdate::cursor_blink`)で表現する——将来のDECSET `?12`(タスク#55、
+ * 点滅on/offのみを切り替えるレガシー制御)がDECSCUSRとは独立に同じ
+ * `cursor_blink`フィールドを更新できるよう、形状と点滅を分離してある。
+ */
+
+enum class CursorShape {
+    
+    BLOCK,
+    UNDERLINE,
+    BAR;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCursorShape: FfiConverterRustBuffer<CursorShape> {
+    override fun read(buf: ByteBuffer) = try {
+        CursorShape.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: CursorShape) = 4UL
+
+    override fun write(value: CursorShape, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 

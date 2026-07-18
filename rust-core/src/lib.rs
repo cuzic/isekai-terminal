@@ -573,6 +573,19 @@ pub struct CellData {
     pub invisible: bool,
 }
 
+/// DECSCUSR(`CSI Ps SP q`)が選択するカーソル形状。`Terminal`が状態として保持し
+/// (rust-ssot: Kotlin/Swift側にミラー状態を作らず、この値をそのまま描画に使う)、
+/// `ScreenUpdate::cursor_shape`として公開する。点滅の有無は別フィールド
+/// (`ScreenUpdate::cursor_blink`)で表現する——将来のDECSET `?12`(タスク#55、
+/// 点滅on/offのみを切り替えるレガシー制御)がDECSCUSRとは独立に同じ
+/// `cursor_blink`フィールドを更新できるよう、形状と点滅を分離してある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum CursorShape {
+    Block,
+    Underline,
+    Bar,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ScreenUpdate {
     pub cols: u32,
@@ -593,6 +606,12 @@ pub struct ScreenUpdate {
     /// フィードバックを1回発火させること。OSC のターミネータとして使われた BEL
     /// (`ESC]0;title BEL`)はカウントされない。
     pub bell_generation: u64,
+    /// DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
+    pub cursor_shape: CursorShape,
+    /// カーソルが点滅すべきかどうか。DECSCUSRの偶数/奇数パラメータ
+    /// (block/underline/bar それぞれの steady/blinking)から導出される。既定は`true`
+    /// (xtermの既定である「blinking block」に合わせる)。
+    pub cursor_blink: bool,
 }
 
 // ── New orchestrator public types ────────────────────────

@@ -14,7 +14,8 @@ final class TerminalScrollbackTests: XCTestCase {
 
     private func makeUpdate(
         rows: [String], cols: Int, cursorRow: UInt32 = 0, cursorCol: UInt32 = 0,
-        cursorVisible: Bool = true, bellGeneration: UInt64 = 0
+        cursorVisible: Bool = true, bellGeneration: UInt64 = 0,
+        cursorShape: CursorShape = .block, cursorBlink: Bool = true
     ) -> ScreenUpdate {
         var cells: [CellData] = []
         for line in rows {
@@ -28,7 +29,8 @@ final class TerminalScrollbackTests: XCTestCase {
             cols: UInt32(cols), rows: UInt32(rows.count), cells: cells,
             cursorRow: cursorRow, cursorCol: cursorCol, title: "session",
             applicationCursorMode: true, bracketedPasteMode: true,
-            cursorVisible: cursorVisible, bellGeneration: bellGeneration
+            cursorVisible: cursorVisible, bellGeneration: bellGeneration,
+            cursorShape: cursorShape, cursorBlink: cursorBlink
         )
     }
 
