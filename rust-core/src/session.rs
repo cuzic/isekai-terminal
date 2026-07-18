@@ -725,6 +725,7 @@ mod tests {
             strikethrough: false,
             blink: false,
             invisible: false,
+            is_wide_placeholder: false,
         }
     }
 
