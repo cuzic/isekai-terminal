@@ -309,7 +309,7 @@ Host production
 | `rendezvous` | URL(複数可) | なし | rendezvous エンドポイント |
 | `stun` | `addr:port`(複数可) | なし | STUN サーバー。省略すると STUN 候補収集を行わない |
 | `relay` | URL(複数可) | なし | isekai-link relay エンドポイント(`masque://...`) |
-| `resume-grace` | `<n>ms` / `<n>s` / `<n>`(単位省略時は秒) | `10d`(864,000秒) | QUIC 接続が切れてから resume を試み続ける猶予時間。自動 bootstrap 先の `isekai-pipe serve --resume-window` にも同じ値がそのまま伝わる(常に両者一致、片方だけ変えても無効になることはない) |
+| `resume-grace` | `<n>ms` / `<n>s` / `<n>`(単位省略時は秒) | `10d`(864,000秒) | QUIC 接続が切れてから resume を試み続ける猶予時間。**新規に** auto bootstrap する時だけ、この値がそのまま `isekai-pipe serve --resume-window` に渡る。既に稼働中の helper がある場合は helper 再利用の仕組み(fingerprint に `resume-window` を含めない、アクティブな接続を巻き込んで強制再起動しないため)により、その helper が寿命切れ(既定 `--max-idle-lifetime` 30日)になるか手動で再デプロイを誘発するまで、helper 起動時点の値のまま変わらない |
 | `candidate-race-delay` | 同上の duration 表記 | `150ms` | 複数 candidate を同時に試す際の後発 candidate の遅延 |
 | `relay-delay` | 同上の duration 表記 | `750ms` | direct 系 candidate に対して relay を遅らせて追い掛けさせる遅延 |
 | `install-mode` | `user`\|`system` | `user` | `system` は sudo・所有権・rollback が未実装かつ実装予定も無いため、指定すると設定解決時点でエラーになる(fail closed)。将来必要になった場合もisekai-ssh本体には組み込まず、`curl ... \| sudo bash`的な別のインストーラースクリプト/ラッパーとして提供する想定 |
