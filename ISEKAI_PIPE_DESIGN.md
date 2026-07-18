@@ -302,9 +302,19 @@ DoSガード(`--max-sessions`/`--resume-buffer-size`)は`archive/HELPER_PROTOCOL
 resume window超過時、および`RESUME`が`UnknownSession`で`UNKNOWN_SESSION_CONFIRM_THRESHOLD`
 (既定3)回連続で拒否された時点で、クライアントは諦める——後者はresume windowの
 `deadline`を待たない(`isekai-pipe/src/resume_loop.rs::resume_with_backoff_until_deadline`)。
-resume windowが数日オーダーになった今、サーバプロセス再起動のような「絶対に成功しない」
-ケースをdeadlineまで機械的にリトライし続けると、即座に診断できたはずの失敗が数日間の
-ハングになってしまうため。
+resume windowが数日オーダーになった今、「そのsession_idを`isekai-pipe serve`が
+同一プロセス内でparkし続けているが、sweep/LRU/新規接続によるpreemptionで既に
+回収済み」のような、絶対に成功しないケースをdeadlineまで機械的にリトライし続けると、
+即座に診断できたはずの失敗が数日間のハングになってしまうため。
+
+この即時give-upが効くのは「`isekai-pipe serve`プロセス自体は生きていて、確定的に
+`UnknownSession`を返答してくる」場合に限られる点に注意(Fableレビュー指摘)。
+プロセス自体が再起動・ホストが再起動した場合は、証明書・`session_secret`ごと
+入れ替わるためQUICハンドシェイク自体が失敗し(または応答無しでタイムアウトし)、
+`UnknownSession`という明確な拒否には決して到達しない——この場合は`isekai-ssh`側の
+「常に接続できる」原則(`.claude/rules/always-connects.md`、Epic N-2)による
+サイレント再bootstrapの対象であり、resume-grace(10日)いっぱいまでリトライし
+続けてしまう(即時give-upの恩恵を受けない)。
 
 `UnknownSession`を1回だけで即座にterminal扱いしなかったのは、`isekai-pipe serve`の
 `RESUME`ハンドラ(`engine/mod.rs`)が同じワイヤ値を3つの異なる状況——(a) session_idが
