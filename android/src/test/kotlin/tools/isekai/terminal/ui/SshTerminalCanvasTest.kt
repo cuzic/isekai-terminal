@@ -113,6 +113,44 @@ class SshTerminalCanvasTest {
         emptyList(), 0u,
     )
 
+    // ── computeCursorRect: DECSCUSR(タスク#33)のblock/underline/bar描画分岐 ──────
+
+    @Test
+    fun `computeCursorRect for block fills the entire cell`() {
+        val rect = computeCursorRect(cx = 10f, cy = 20f, cellW = 8f, cellH = 16f, shape = CursorShape.BLOCK)
+        assertEquals(CursorRect(10f, 20f, 18f, 36f), rect)
+    }
+
+    @Test
+    fun `computeCursorRect for underline is a thin strip at the cell bottom`() {
+        val rect = computeCursorRect(cx = 10f, cy = 20f, cellW = 8f, cellH = 16f, shape = CursorShape.UNDERLINE)
+        // cellH * 0.12 = 1.92 < 2px の下限にクランプされる
+        assertEquals(CursorRect(10f, 34f, 18f, 36f), rect)
+        assertEquals("横幅はセル幅いっぱい", 8f, rect.right - rect.left)
+        assertEquals("太さは2px下限でクランプされる", 2f, rect.bottom - rect.top)
+    }
+
+    @Test
+    fun `computeCursorRect for underline uses proportional thickness when cell is tall`() {
+        val rect = computeCursorRect(cx = 0f, cy = 0f, cellW = 8f, cellH = 100f, shape = CursorShape.UNDERLINE)
+        assertEquals(12f, rect.bottom - rect.top, 0.01f) // 100 * 0.12 (Float丸め誤差を許容)
+    }
+
+    @Test
+    fun `computeCursorRect for bar is a thin strip at the cell left edge`() {
+        val rect = computeCursorRect(cx = 10f, cy = 20f, cellW = 8f, cellH = 16f, shape = CursorShape.BAR)
+        // cellW * 0.15 = 1.2 < 2px の下限にクランプされる
+        assertEquals(CursorRect(10f, 20f, 12f, 36f), rect)
+        assertEquals("縦幅はセル高さいっぱい", 16f, rect.bottom - rect.top)
+        assertEquals("太さは2px下限でクランプされる", 2f, rect.right - rect.left)
+    }
+
+    @Test
+    fun `computeCursorRect for bar uses proportional thickness when cell is wide`() {
+        val rect = computeCursorRect(cx = 0f, cy = 0f, cellW = 100f, cellH = 16f, shape = CursorShape.BAR)
+        assertEquals(15f, rect.right - rect.left, 0.01f) // 100 * 0.15 (Float丸め誤差を許容)
+    }
+
     // ── FontFitCache: セル寸法/typefaceが変わったときだけ再計測が必要 ──────────
 
     @Test
