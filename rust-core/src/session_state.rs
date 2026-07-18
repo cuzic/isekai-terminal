@@ -165,6 +165,12 @@ impl SessionState {
         let pending_rows = self.terminal.take_scrollback();
         let pending_clipboard_write = self.terminal.take_pending_clipboard_write();
         let clipboard_pull_requested = self.terminal.take_pending_clipboard_pull_request();
+        // DA/DSR/CPR応答(タスク#38)。新しいtransport経路は追加せず、既存の
+        // `SideEffect::SendStdin`にそのまま乗せる(`terminal.rs`の
+        // `pending_terminal_responses`フィールドdoc comment参照)。
+        for resp in self.terminal.take_pending_terminal_responses() {
+            side_effects.push(SideEffect::SendStdin(resp));
+        }
         ProcessResult {
             timer_cmds,
             side_effects,
@@ -218,6 +224,20 @@ mod tests {
         assert!(r.side_effects.is_empty());
         assert!(r.timer_cmds.is_empty());
         assert!(r.pending_rows.is_empty());
+    }
+
+    #[test]
+    fn test_cpr_request_produces_send_stdin_side_effect() {
+        // タスク#38: CSI 6n(CPR)が SessionState::on_stdout 経由で
+        // SideEffect::SendStdin に変換され、既存の応答送信経路にそのまま乗ることを
+        // 確認する(新しいtransport経路を追加しない設計)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let r = state.on_stdout(b"\x1b[6n".to_vec());
+        assert_eq!(r.side_effects.len(), 1);
+        match &r.side_effects[0] {
+            SideEffect::SendStdin(bytes) => assert_eq!(bytes, b"\x1b[1;1R"),
+            other => panic!("expected SideEffect::SendStdin, got a different variant: {:?}", std::mem::discriminant(other)),
+        }
     }
 
     #[test]
