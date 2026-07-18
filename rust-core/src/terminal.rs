@@ -1596,8 +1596,17 @@ impl Perform for Terminal {
             }
             'm' => { self.handle_sgr(&ps); }
             'r' => {
-                let top = (p0.max(1) as usize - 1).min(self.rows - 1);
-                let bot = (p1.max(1) as usize - 1).min(self.rows - 1);
+                // タスク#64: パラメータ省略(`CSI r`、p0==p1==0)は「画面全体を
+                // scroll regionにリセット」であって、xtermも含め実端末はこれを
+                // `CSI 1;<rows>r`と等価に扱う。だが`p0.max(1)`/`p1.max(1)`で
+                // どちらも1にフォールバックしていたため、省略時top=bot=0となり
+                // `top < bot`が偽になって何もしない(vim/less終了直後などscroll
+                // regionが元に戻らない表示破壊バグ)になっていた。省略された
+                // パラメータだけをデフォルト値(top→画面最上行、bot→画面最下行)
+                // に補うことで、`CSI Ntr`(bot省略)のような片側省略も含め
+                // 仕様通りの挙動にする。
+                let top = if p0 == 0 { 0 } else { (p0 as usize - 1).min(self.rows - 1) };
+                let bot = if p1 == 0 { self.rows - 1 } else { (p1 as usize - 1).min(self.rows - 1) };
                 if top < bot {
                     self.scroll_top = top;
                     self.scroll_bottom = bot;
@@ -2581,6 +2590,46 @@ mod tests {
             (2, 0),
             "origin mode onの間、DECSTBM後のhomeは新しいscroll_top(行2)"
         );
+    }
+
+    #[test]
+    fn test_decstbm_no_params_resets_to_full_screen_and_homes_cursor() {
+        // タスク#64(Fableレビュー指摘): パラメータ省略の`CSI r`(p0==p1==0)は
+        // 画面全体(top=0, bot=rows-1)へscroll regionをリセットしなければ
+        // ならない。旧実装は`p0.max(1)`/`p1.max(1)`で両方1にフォールバック
+        // していたため top=bot=0 になり `top < bot` が偽になって何もしない
+        // (region維持・カーソルもhomeしない)バグになっていた
+        // (vim/less終了直後にスクロール異常が残る原因)。
+        let mut t = Terminal::new(10, 6, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4\r\nrow5");
+        feed(&mut t, b"\x1b[3;5r"); // scroll region = 行2..4(0-indexed)に絞る
+        feed(&mut t, b"\x1b[4;4H"); // regionの内側の適当な位置へカーソルを動かす
+        feed(&mut t, b"\x1b[r"); // パラメータ省略のDECSTBM
+        assert_eq!(
+            (t.cursor_row(), t.cursor_col()),
+            (0, 0),
+            "パラメータ省略のCSI rも画面全体へのリセットとしてカーソルをhomeへ移動しなければならない"
+        );
+        // regionが画面全体(0..rows-1)へ戻ったことを、SDが画面全域に効くかで確認する。
+        feed(&mut t, b"\x1b[1T"); // 1行下スクロール。regionが画面全体なら行0が空行になる
+        assert_eq!(cell(&t, 0, 0), " ", "regionが画面全体に戻っていればSDで行0が空行になる");
+        assert_eq!(cell(&t, 1, 0), "r", "旧行0がregion内(画面全体)で1行下へ押し出される");
+        assert_eq!(cell(&t, 5, 0), "r", "旧行4がregion内(画面全体)で1行下へ押し出される");
+    }
+
+    #[test]
+    fn test_decstbm_omitted_bottom_defaults_to_last_row() {
+        // タスク#64: `CSI Ps r`(下端パラメータのみ省略、p1==0)はxterm等の実端末
+        // 同様、下端を画面最下行として扱う(`p0.max(1)`のロジックのままだと
+        // bot=0になり top<bot が常に偽になってしまう)。
+        let mut t = Terminal::new(10, 6, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4\r\nrow5");
+        feed(&mut t, b"\x1b[3r"); // 上端のみ行2(0-indexed)指定、下端は省略
+        feed(&mut t, b"\x1b[1T"); // regionを1行下へスクロール
+        assert_eq!(cell(&t, 0, 0), "r", "region上端より上の行0はSDの影響を受けない");
+        assert_eq!(cell(&t, 1, 0), "r", "scroll_top未満の行1(region外)はSDの影響を受けない");
+        assert_eq!(cell(&t, 2, 0), " ", "region上端(scroll_top=2)は空行で埋まる");
+        assert_eq!(cell(&t, 5, 3), "4", "下端省略時は画面最下行までがregionになる");
     }
 
     #[test]
