@@ -119,16 +119,19 @@ data class TerminalScreenActions(
  * ハイライトとして描画してよいものだけを返すピュア関数。
  *
  * `ScrollbackSearchMatch.row`は`scrollbackCells`と同じ規約("offset"がそのまま`row`)なので、
- * `scrollOffset`がその値と一致している間だけ実際に画面へ表示される。ただし`row == 0u`
- * (scrollback最新行)は`jumpToCurrentSearchMatch`(呼び出し元[TerminalScreenBody])の
- * ドキュメント通りこの`scrollOffset`の仕組み経由では原理的に到達不能で、
- * `scrollOffset == 0`は常に「ライブ画面表示」を指す既存規約([synthesizeDisplayUpdate])と
- * 衝突するため明示的に除外する(codexレビュー指摘: これを除外しないとライブ画面表示中
- * [scrollOffset == 0]にrow=0のマッチが誤ってハイライトされてしまう。iOS版
- * `TerminalView.swift`の`currentSearchMatch.flatMap { $0.row == 0 ? nil : $0 }`と対称)。
+ * `scrollOffset`がその値と一致している間だけ実際に画面へ表示される。`scrollOffset == 0`は
+ * 「ライブ画面表示」と「scrollback最新行(row=0)表示」の両方を指しうる(既存規約
+ * [synthesizeDisplayUpdate]と[showingScrollback]参照)ため、`row == 0u`のマッチは
+ * [showingScrollback]が真の間(=実際にscrollback最新行を表示中)だけハイライトを許可する
+ * (タスク#79: それ以外[ライブ画面表示中]にrow=0のマッチを誤ってハイライトしないための
+ * ガード。iOS版`TerminalView.swift`の`searchHighlight`計算と対称)。
  */
-internal fun searchHighlightMatch(match: ScrollbackSearchMatch?, scrollOffset: Int): ScrollbackSearchMatch? =
-    match?.takeIf { it.row != 0u && scrollOffset == it.row.toInt() }
+internal fun searchHighlightMatch(
+    match: ScrollbackSearchMatch?,
+    scrollOffset: Int,
+    showingScrollback: Boolean,
+): ScrollbackSearchMatch? =
+    match?.takeIf { scrollOffset == it.row.toInt() && (it.row != 0u || showingScrollback) }
 
 /**
  * ターミナル画面の本体。複数タブ UI の `TerminalTabScreen`、および画面分割(split pane)時の
@@ -182,6 +185,16 @@ fun TerminalScreenBody(
     // スクロール位置・選択範囲は Compose local state — ViewModel を経由しない
     // (.claude/rules/rust-ssot.md の「UI 表示だけに閉じた状態」の例外)
     var scrollOffset by remember { mutableIntStateOf(0) }
+    // タスク#79: `scrollOffset == 0`は従来「ライブ画面表示」を意味する唯一の条件として
+    // 使われてきたが、これだと検索結果の`row == 0`(scrollbackの最新履歴行)へジャンプする
+    // 際、`scrollOffset`を0にしてもライブ表示に横取りされて到達不能になっていた
+    // (旧実装は`jumpToCurrentSearchMatch`でこの理由からrow=0へのジャンプ自体を明示的に
+    // 諦めていた)。「ユーザーが明示的にscrollback表示へ入っているか」を`scrollOffset`の
+    // 値そのものとは独立したフラグとして持つことで、`scrollOffset == 0`のまま
+    // scrollback最新行を表示できるようにする(iOS版`TerminalView.swift`の
+    // `showingScrollback`と対称。「UI表示だけに閉じた状態」として`scrollOffset`と
+    // 同じくrust-ssot.mdの例外)。
+    var showingScrollback by remember { mutableStateOf(false) }
     var showDisconnectDialog by remember { mutableStateOf(false) }
     var selection by remember { mutableStateOf<SelectionRange?>(null) }
     var showSnippetSheet by remember { mutableStateOf(false) }
@@ -215,17 +228,17 @@ fun TerminalScreenBody(
     }
     // `scrollOffset`を現在のマッチの`row`へ合わせ、そのマッチが画面に映るようにする。
     //
-    // 既知の境界(iOS版タスク#67実装時にcodexレビューで指摘済みの制約をそのまま踏襲):
-    // scrollback最新行(`row == 0u`)は、`scrollOffset == 0`が「ライブ画面表示」を兼ねる
-    // 既存の規約([synthesizeDisplayUpdate])と衝突するため、この`scrollOffset`の
-    // 仕組み経由では原理的に表示不可能(`scrollbackCells`の`sb_idx = offset + (rows-1-r)`は
-    // どの`offset >= 1`を選んでも最小値が`offset`自体になり、`sb_idx == 0`には到達できない
-    // ——`offset == 0`は既存規約でライブ表示に横取りされる)。この場合`scrollOffset`は
-    // 変更せず、ハイライトも描かない(下の`searchHighlight`計算で`row == 0u`を除外する)。
-    // 件数表示(n/m)自体はこのマッチを含めたまま数える。
+    // タスク#79: scrollback最新行(`row == 0u`)は、`scrollOffset == 0`が「ライブ画面表示」を
+    // 兼ねる既存の規約([synthesizeDisplayUpdate])と衝突するため、`scrollOffset`の値
+    // だけでは表示できない(`scrollbackCells`の`sb_idx = offset + (rows-1-r)`は
+    // `offset == 0`のとき`sb_idx == 0`[=scrollback最新行]に一致するが、この`offset == 0`は
+    // 従来ライブ表示に横取りされていた)。[showingScrollback]を真にすることで
+    // `scrollOffset == 0`のままscrollback最新行の合成表示へ切り替える(下の`displayUpdate`
+    // 計算・[searchHighlightMatch]・「ライブへ戻る」ボタンの表示条件も同じフラグを見る)。
     val jumpToCurrentSearchMatch: () -> Unit = {
         searchMatches.getOrNull(currentSearchMatchIndex)?.let { match ->
-            if (match.row != 0u) scrollOffset = match.row.toInt()
+            scrollOffset = match.row.toInt()
+            showingScrollback = true
         }
     }
     val runSearch: () -> Unit = {
@@ -452,10 +465,12 @@ fun TerminalScreenBody(
                 // 独自計算したビューポート由来の rows/cols を使うと、リサイズ中の過渡状態で
                 // Rust側の実際の行幅とズレて displayUpdate の cols/rows と cells 件数が
                 // 食い違いうる(Codexレビュー: タスク#46、synthesizeDisplayUpdate側のdocを参照)。
-                val displayUpdate = remember(scrollOffset, rows, update) {
-                    if (scrollOffset > 0) {
+                // タスク#79: `scrollOffset > 0`だけでなく、scrollback最新行(row=0)への
+                // 検索ジャンプで`showingScrollback`が真の場合も合成表示へ切り替える。
+                val displayUpdate = remember(scrollOffset, showingScrollback, rows, update) {
+                    if (scrollOffset > 0 || showingScrollback) {
                         val sbCells = actions.onScrollbackCells(scrollOffset, update.rows.toInt())
-                        synthesizeDisplayUpdate(update, scrollOffset, sbCells)
+                        synthesizeDisplayUpdate(update, scrollOffset, sbCells, showingScrollback)
                     } else update
                 }
 
@@ -519,7 +534,12 @@ fun TerminalScreenBody(
                 // 実際に有効か」の判定[scrollOffset==0 && mode!=Off]が重複していたのを1箇所へ
                 // 集約。iOS版`isPointerReportingActive`と同じ役割)
                 val isPointerReportingActive: () -> Boolean = {
-                    scrollOffset == 0 && latestDisplayUpdate.value.mouseReportingMode != MouseReportingMode.OFF
+                    // タスク#79: `showingScrollback`が真の間(scrollback最新行への検索
+                    // ジャンプ中)は`scrollOffset == 0`でもライブ表示ではないため、
+                    // タッチ/ホイールをRustへ渡さない(表示対象と入力対象の食い違いを
+                    // 避ける、下の`runPinchAndPan`のコメントと同じ理由)。
+                    scrollOffset == 0 && !showingScrollback &&
+                        latestDisplayUpdate.value.mouseReportingMode != MouseReportingMode.OFF
                 }
                 val sendPointerEvent: (MouseEventKind, MouseButton?, Int, Int) -> Unit = { kind, button, row, col ->
                     val u = latestDisplayUpdate.value
@@ -555,7 +575,7 @@ fun TerminalScreenBody(
                 // (col/len)は一切ここでは行わず、Rust側`search_scrollback`が返した座標を
                 // そのまま`SshTerminalCanvas`へ渡すだけ(rust-ssot)。
                 val currentSearchMatch = searchMatches.getOrNull(currentSearchMatchIndex)
-                val searchHighlight = searchHighlightMatch(currentSearchMatch, scrollOffset)
+                val searchHighlight = searchHighlightMatch(currentSearchMatch, scrollOffset, showingScrollback)
 
                 Box(modifier = Modifier.fillMaxSize()) {
                     SshTerminalCanvas(
@@ -610,6 +630,10 @@ fun TerminalScreenBody(
                                                 }
                                                 while (panAccumY > cellH) {
                                                     scrollOffset = (scrollOffset - 1).coerceIn(0, scrollbackLen)
+                                                    // タスク#79: 手動でライブ方向へパンし0まで戻したら、
+                                                    // 検索ジャンプ由来の`showingScrollback`も解除する
+                                                    // (「ライブへ戻る」ボタンと同じ扱い)。
+                                                    if (scrollOffset == 0) showingScrollback = false
                                                     panAccumY -= cellH
                                                 }
                                                 event.changes.forEach { it.consume() }
@@ -807,10 +831,12 @@ fun TerminalScreenBody(
                         )
                     }
 
-                    // "Back to live" indicator when scrolled up
-                    if (scrollOffset > 0) {
+                    // "Back to live" indicator when scrolled up (タスク#79:
+                    // `showingScrollback`が真の間[scrollOffset==0のscrollback最新行表示]も
+                    // 表示する — このボタン以外にライブへ戻る手段が無いため)
+                    if (scrollOffset > 0 || showingScrollback) {
                         Button(
-                            onClick = { scrollOffset = 0; panAccumY = 0f },
+                            onClick = { scrollOffset = 0; showingScrollback = false; panAccumY = 0f },
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
                                 .padding(bottom = 8.dp),
@@ -914,7 +940,18 @@ fun TerminalScreenBody(
                     CtrlBtn("Ctrl", active = ctrlArmed) { ctrlArmed = !ctrlArmed }
                     CtrlBtn("↵") { inputView?.commitComposing(); actions.onSend(byteArrayOf(0x0D)) }
                     CtrlBtn("Tab") { actions.onSend(byteArrayOf(0x09)) }
-                    CtrlBtn("Esc") { actions.onSend(byteArrayOf(0x1B)) }
+                    // Kitty keyboard protocol(タスク#54)のdisambiguate escape codes(bit0)が
+                    // negotiateされている場合はCSI u形式(`ESC[27u`)を送る必要があるため、固定
+                    // バイト列ではなくspecialKeyBytes経由にする(タスク#72、以前は交渉された
+                    // flagsが一切反映されない既存バグだった)。
+                    CtrlBtn("Esc") {
+                        actions.onSend(
+                            TerminalKeyEncoder.specialKeyBytes(
+                                TerminalKeyEncoder.KC_ESCAPE,
+                                kittyFlags = screenUpdate?.kittyKeyboardFlags ?: 0u,
+                            )!!,
+                        )
+                    }
                     CtrlBtn("^C") { actions.onSend(byteArrayOf(0x03)) }
                     CtrlBtn("^D") { actions.onSend(byteArrayOf(0x04)) }
                     CtrlBtn("^Z") { actions.onSend(byteArrayOf(0x1A)) }
@@ -977,6 +1014,7 @@ fun TerminalScreenBody(
                         view.applicationCursorMode = screenUpdate?.applicationCursorMode ?: false
                         view.applicationKeypadMode = screenUpdate?.applicationKeypadMode ?: false
                         view.bracketedPasteMode = screenUpdate?.bracketedPasteMode ?: false
+                        view.kittyKeyboardFlags = screenUpdate?.kittyKeyboardFlags ?: 0u
                         view.keyboardLayoutMode = keyboardLayoutMode
                         view.ctrlArmed = ctrlArmed
                         view.onCtrlConsumed = { ctrlArmed = false }

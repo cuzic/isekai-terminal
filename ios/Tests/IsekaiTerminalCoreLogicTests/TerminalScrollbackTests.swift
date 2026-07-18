@@ -44,6 +44,43 @@ final class TerminalScrollbackTests: XCTestCase {
         XCTAssertEqual(result, live)
     }
 
+    func testReturnsLiveUpdateWhenScrollOffsetIsZeroAndNotShowingScrollbackEvenWithCells() {
+        let live = makeUpdate(rows: ["live line"], cols: 20, cursorRow: 0, cursorCol: 3)
+        let scrollbackCells = Array(repeating: makeCell("x"), count: 20)
+
+        let result = synthesizeDisplayUpdate(live: live, scrollOffset: 0, scrollbackCells: scrollbackCells)
+
+        XCTAssertEqual(result, live)
+    }
+
+    /// タスク#79: 検索結果のscrollback最新行(row=0)へジャンプする際、`scrollOffset`は
+    /// 0のままだが`showingScrollback`を真にすることで合成表示へ切り替わることを確認する
+    /// (以前は`scrollOffset > 0`だけを見ていたため、この場合も常にライブへフォール
+    /// バックしてしまい、row=0の結果に到達できなかった。Android版
+    /// `TerminalScrollbackTest.kt`の同名テストと対称)。
+    func testSynthesizesScrollbackUpdateWhenOffsetIsZeroAndShowingScrollback() {
+        let live = makeUpdate(rows: ["live line"], cols: 20, cursorRow: 0, cursorCol: 3)
+        let scrollbackCells = Array(repeating: makeCell("x"), count: 20)
+
+        let result = synthesizeDisplayUpdate(
+            live: live, scrollOffset: 0, scrollbackCells: scrollbackCells, showingScrollback: true
+        )
+
+        XCTAssertEqual(result.cells, scrollbackCells)
+        XCTAssertEqual(result.cursorRow, live.rows)
+        XCTAssertEqual(result.cursorCol, 0)
+    }
+
+    func testFallsBackToLiveWhenShowingScrollbackButOffsetIsZeroAndCellsMismatch() {
+        let live = makeUpdate(rows: ["live line"], cols: 20)
+
+        let result = synthesizeDisplayUpdate(
+            live: live, scrollOffset: 0, scrollbackCells: [], showingScrollback: true
+        )
+
+        XCTAssertEqual(result, live)
+    }
+
     func testSynthesizesScrollbackUpdateWhenOffsetIsPositive() {
         let live = makeUpdate(rows: ["live line"], cols: 20, cursorRow: 0, cursorCol: 3)
         let scrollbackCells = Array(repeating: makeCell("x"), count: 20)

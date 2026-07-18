@@ -3,14 +3,24 @@ import Foundation
 /// Phase 1F-4(#51): ライブの`update`とスクロールバックの行から表示用の`ScreenUpdate`を
 /// 合成する。Android版`tools.isekai.terminal.ui.synthesizeDisplayUpdate`
 /// (`TerminalScrollback.kt`、`TerminalScreen.kt`の`displayUpdate`から呼ばれる)と対称
-/// (タスク#46でAndroid側もこの合成ロジックを独立関数へ抽出した)。`scrollOffset == 0`なら
-/// ライブをそのまま返す。`scrollbackCells`の件数が`cols * rows`と一致しない場合
-/// (未取得・セッション未確立等)もライブへフォールバックする。
+/// (タスク#46でAndroid側もこの合成ロジックを独立関数へ抽出した)。`scrollOffset == 0`かつ
+/// `showingScrollback`が`false`のときだけライブをそのまま返す——`scrollOffset == 0`は
+/// 「ライブ画面表示」と「scrollback最新行(row=0)表示」の両方を指しうるため、
+/// `showingScrollback`で明示的に区別する(タスク#79: 検索結果のrow=0へジャンプする際、
+/// `scrollOffset`を変えずにscrollback最新行を合成表示させるために追加。呼び出し元
+/// `TerminalView.swift`の`showingScrollback`参照、Android版`TerminalScreen.kt`と対称)。
+/// `scrollbackCells`の件数が`cols * rows`と一致しない場合(未取得・セッション未確立等)も
+/// ライブへフォールバックする。
 ///
 /// スクロールバック表示中はカーソルを画面外(`cursorRow = update.rows`)に隠す
 /// (Android版と同じ、ライブでない行にカーソルを描くのは意味がないため)。
-public func synthesizeDisplayUpdate(live update: ScreenUpdate, scrollOffset: UInt32, scrollbackCells: [CellData]) -> ScreenUpdate {
-    guard scrollOffset > 0 else { return update }
+public func synthesizeDisplayUpdate(
+    live update: ScreenUpdate,
+    scrollOffset: UInt32,
+    scrollbackCells: [CellData],
+    showingScrollback: Bool = false
+) -> ScreenUpdate {
+    guard scrollOffset > 0 || showingScrollback else { return update }
     let cols = Int(update.cols)
     let rows = Int(update.rows)
     guard cols > 0, rows > 0, scrollbackCells.count == rows * cols else { return update }
@@ -34,4 +44,28 @@ public func synthesizeDisplayUpdate(live update: ScreenUpdate, scrollOffset: UIn
         images: [],
         kittyKeyboardFlags: update.kittyKeyboardFlags
     )
+}
+
+/// タスク#66/#67: 検索バーの現在マッチ(`match`)のうち、実際に`scrollOffset`の位置へ
+/// ハイライトとして描画してよいものだけを返すピュア関数。Android版
+/// `tools.isekai.terminal.searchHighlightMatch`(`TerminalScreen.kt`)と対称
+/// (タスク#79でAndroid側に続きiOS側もこの判断ロジックを独立関数へ抽出し、UIKit非依存の
+/// `IsekaiTerminalCoreLogic`層でユニットテスト可能にした——以前は`TerminalView.swift`の
+/// `body`内にインライン記述されていたため、`TerminalScreenViewTests`のクラッシュ確認
+/// スモークテストでしか間接的にしか検証できなかった)。
+///
+/// `ScrollbackSearchMatch.row`は`scrollbackCells`と同じ規約("offset"がそのまま`row`)なので、
+/// `scrollOffset`がその値と一致している間だけ実際に画面へ表示される。`scrollOffset == 0`は
+/// 「ライブ画面表示」と「scrollback最新行(row=0)表示」の両方を指しうる(既存規約
+/// `synthesizeDisplayUpdate`と`showingScrollback`参照)ため、`row == 0`のマッチは
+/// `showingScrollback`が真の間(=実際にscrollback最新行を表示中)だけハイライトを許可する
+/// (タスク#79: それ以外[ライブ画面表示中]にrow=0のマッチを誤ってハイライトしないための
+/// ガード)。
+public func searchHighlightMatch(
+    _ match: ScrollbackSearchMatch?,
+    scrollOffset: UInt32,
+    showingScrollback: Bool
+) -> ScrollbackSearchMatch? {
+    guard let match, scrollOffset == match.row, match.row != 0 || showingScrollback else { return nil }
+    return match
 }

@@ -180,12 +180,29 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
             setNeedsDisplay()
         }
     }
+    /// タスク#79: `scrollOffset == 0`は従来「ライブ画面表示」を意味する唯一の条件として
+    /// 使われてきたが、これだと検索結果の`row == 0`(scrollbackの最新履歴行)へジャンプする
+    /// 際、`scrollOffset`を0にしてもライブ表示に横取りされて到達不能になっていた。
+    /// 「ユーザーが明示的にscrollback表示へ入っているか」を`scrollOffset`の値そのものとは
+    /// 独立したフラグとして持つことで、`scrollOffset == 0`のままscrollback最新行を表示
+    /// できるようにする(`TerminalView.swift`の`showingScrollback`から`Binding`経由で
+    /// 渡される、Android版`TerminalScreen.kt`の`showingScrollback`と対称)。
+    public var showingScrollback: Bool = false {
+        didSet {
+            guard showingScrollback != oldValue else { return }
+            setNeedsDisplay()
+        }
+    }
     /// スクロールバックの行を取得するクロージャ(Android版`actions.onScrollbackCells`相当)。
     public var onScrollbackRequest: ((_ offset: UInt32, _ rows: UInt32) -> [CellData])?
     /// スクロールバックの総行数を取得するクロージャ(Android版`uiState.scrollbackLen`相当)。
     public var onScrollbackLenRequest: (() -> UInt32)?
     /// スクロールオフセットが変化する度に呼ばれる(SwiftUI側の状態同期に使う)。
     public var onScrollOffsetChanged: ((UInt32) -> Void)?
+    /// タスク#79: `handlePan`が手動でライブ方向へ戻し切った(`scrollOffset`が0に達した)
+    /// 際、SwiftUI側の`showingScrollback`も解除するために呼ばれる(「ライブへ戻る」
+    /// ボタンと同じ扱い)。
+    public var onShowingScrollbackChanged: ((Bool) -> Void)?
     private var panAccumY: CGFloat = 0
     /// タスク#81: `wheelEvents(deltaY:carry:cellHeight:)`が返す「次回へ持ち越す端数」の
     /// 保持先。`panAccumY`とは別の蓄積系統(マウスモード有効時の間接scrollはローカルの
@@ -413,19 +430,27 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         }
         while panAccumY > cellHeight {
             if scrollOffset > 0 { scrollOffset -= 1 }
+            // タスク#79: 手動でライブ方向へパンし0まで戻したら、検索ジャンプ由来の
+            // `showingScrollback`も解除する(「ライブへ戻る」ボタンと同じ扱い)。
+            if scrollOffset == 0, showingScrollback {
+                showingScrollback = false
+                onShowingScrollbackChanged?(false)
+            }
             panAccumY -= cellHeight
         }
     }
 
-    /// `scrollOffset`が0ならライブの`latestUpdate`をそのまま、それ以外は
-    /// `onScrollbackRequest`でスクロールバックの行を取得してカーソルを画面外に隠した
-    /// `ScreenUpdate`を合成する(Android版`displayUpdate`の`remember(scrollOffset, ...)`と
-    /// 同じ役割)。
+    /// `scrollOffset`が0かつ`showingScrollback`が偽ならライブの`latestUpdate`をそのまま、
+    /// それ以外は`onScrollbackRequest`でスクロールバックの行を取得してカーソルを画面外に
+    /// 隠した`ScreenUpdate`を合成する(Android版`displayUpdate`の
+    /// `remember(scrollOffset, showingScrollback, ...)`と同じ役割。タスク#79)。
     private func computeDisplayUpdate() -> ScreenUpdate? {
         guard let update = latestUpdate else { return nil }
-        guard scrollOffset > 0 else { return update }
+        guard scrollOffset > 0 || showingScrollback else { return update }
         let cells = onScrollbackRequest?(scrollOffset, update.rows) ?? []
-        return synthesizeDisplayUpdate(live: update, scrollOffset: scrollOffset, scrollbackCells: cells)
+        return synthesizeDisplayUpdate(
+            live: update, scrollOffset: scrollOffset, scrollbackCells: cells, showingScrollback: showingScrollback
+        )
     }
 
     /// 長押し+ドラッグでの行単位テキスト選択(Android版`TerminalScreen.kt`の
@@ -498,12 +523,13 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     }
 
     /// マウスレポーティングが実際に有効か。モードが`.off`でないことに加え、
-    /// スクロールバック表示中(`scrollOffset > 0`)は対象外とする(codexレビュー指摘:
-    /// `draw(_:)`はスクロールバックの合成表示を見せている一方でライブ側のモードに
-    /// 従ってポインタイベントを送ると、ユーザーは過去ログを見ているのにライブ
-    /// セッションへclick/dragが飛んでしまい、表示対象と入力対象が食い違う)。
+    /// スクロールバック表示中(`scrollOffset > 0`、またはタスク#79の`showingScrollback`)は
+    /// 対象外とする(codexレビュー指摘: `draw(_:)`はスクロールバックの合成表示を見せている
+    /// 一方でライブ側のモードに従ってポインタイベントを送ると、ユーザーは過去ログを
+    /// 見ているのにライブセッションへclick/dragが飛んでしまい、表示対象と入力対象が
+    /// 食い違う)。
     private var isPointerReportingActive: Bool {
-        guard scrollOffset == 0, let update = latestUpdate else { return false }
+        guard scrollOffset == 0, !showingScrollback, let update = latestUpdate else { return false }
         return update.mouseReportingMode != .off
     }
 
@@ -681,11 +707,14 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         // の最終行(row = rows - 1)に現れる(`scrollback_cells`の`sb_idx = offset +
         // (rows-1-r)`で`r = rows-1`のとき`sb_idx == offset`になることから導ける、
         // `session.rs`の`scrollback_cells_orders_oldest_to_newest_top_to_bottom`テスト
-        // 参照)。`scrollOffset`がまだ追従していない(ジャンプ直後の再描画が来る前)・
-        // ライブ画面表示中(`scrollOffset == 0`)は描画しない。マッチの位置計算は
-        // 一切ここでは行わず、Rust側`search_scrollback`が返した座標をそのまま
-        // 描くだけ(rust-ssot)。
-        if let searchHighlight, scrollOffset == searchHighlight.row {
+        // 参照)。`scrollOffset`がまだ追従していない(ジャンプ直後の再描画が来る前)場合は
+        // 描画しない。タスク#79: `row == 0`(scrollback最新行)は`scrollOffset == 0`が
+        // 「ライブ画面表示」を兼ねる既存規約と衝突するため、`showingScrollback`が真の間
+        // (=実際にscrollback最新行を表示中)だけ許可する——ライブ画面表示中
+        // (`scrollOffset == 0 && !showingScrollback`)にrow=0のマッチを誤ってハイライト
+        // しない。マッチの位置計算は一切ここでは行わず、Rust側`search_scrollback`が
+        // 返した座標をそのまま描くだけ(rust-ssot)。
+        if let searchHighlight, scrollOffset == searchHighlight.row, searchHighlight.row != 0 || showingScrollback {
             let highlightRow = rows - 1
             let startCol = min(Int(searchHighlight.col), cols)
             let endCol = min(startCol + Int(searchHighlight.len), cols)
