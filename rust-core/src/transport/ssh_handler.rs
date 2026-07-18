@@ -301,27 +301,44 @@ impl client::Handler for RusshEventHandler {
 /// `session` に対して `auth` で認証する。公開鍵認証が成功した場合はその鍵も返す
 /// （agent forwarding で転送先の署名要求に同じ鍵を使い回すため。鍵の追加受け渡しは
 /// 不要という設計）。
+///
+/// 実際の認証ロジック(パスワード/公開鍵の分岐・エラー処理)は
+/// `russh-stream-session`(M0で切り出した汎用クレート、`isekai-terminal-core`非依存)
+/// の`authenticate_session`に委譲する。ここでは (1) UniFFI公開型`SshAuth`から
+/// クレート側の`Credential`への変換、(2) 呼び出し後の`Credential`即時ゼロ化
+/// (タスク#65と同じ理由、クレート呼び出しのために新たに生じたコピー分)、
+/// (3) 認証成功時のagent forwarding用鍵の再構築(クレート側APIは鍵を返さない設計の
+/// ため、同じPEMをもう一度パースするだけ——鍵自体は既にネットワーク上で使用済みで
+/// 秘匿性の要はもう無い)だけを行う。
 pub(crate) async fn authenticate_session(
     session: &mut client::Handle<RusshEventHandler>,
     username: &str,
     auth: &SshAuth,
 ) -> (bool, Option<Arc<PrivateKey>>) {
-    match auth {
-        SshAuth::Password { password } => {
-            let ok = session.authenticate_password(username, password).await.ok().unwrap_or(false);
-            (ok, None)
+    let mut credential = match auth {
+        SshAuth::Password { password } => russh_stream_session::Credential::Password(password.clone()),
+        SshAuth::PublicKey { private_key_pem } => {
+            russh_stream_session::Credential::PublicKey { private_key_pem: private_key_pem.clone() }
         }
-        SshAuth::PublicKey { private_key_pem } => match PrivateKey::from_openssh(private_key_pem) {
-            Ok(key) => {
-                let key = Arc::new(key);
-                let ok = session.authenticate_publickey(username, key.clone()).await.ok().unwrap_or(false);
-                (ok, ok.then_some(key))
-            }
-            Err(e) => {
-                warn!("ssh: private key parse failed: {}", e);
-                (false, None)
-            }
-        },
+    };
+    let result = russh_stream_session::authenticate_session(session, username, &credential).await;
+    credential.zeroize();
+
+    match result {
+        Ok(true) => {
+            let key = match auth {
+                SshAuth::PublicKey { private_key_pem } => {
+                    PrivateKey::from_openssh(private_key_pem).ok().map(Arc::new)
+                }
+                SshAuth::Password { .. } => None,
+            };
+            (true, key)
+        }
+        Ok(false) => (false, None),
+        Err(e) => {
+            warn!("ssh: authenticate_session failed: {}", e);
+            (false, None)
+        }
     }
 }
 

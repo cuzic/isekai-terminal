@@ -1705,6 +1705,7 @@ dependencies = [
  "rcgen",
  "russh",
  "russh-keys",
+ "russh-stream-session",
  "rustls",
  "serde",
  "serde_json",

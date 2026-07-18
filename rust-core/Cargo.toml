@@ -45,6 +45,7 @@ uniffi = { version = "0.31", features = ["tokio"] }
 timed-fsm = "0.3.0"
 russh = "0.48"
 russh-keys = "0.48"
+russh-stream-session = { path = "russh-stream-session" }
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
 parking_lot = "0.12"
