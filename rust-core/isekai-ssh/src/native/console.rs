@@ -26,11 +26,23 @@ use anyhow::{Context, Result};
 /// Falls back to `(80, 24)` (the same default `ssh(1)`/most terminal
 /// emulators use) when the size can't be determined — e.g. stdout isn't a
 /// real terminal at all (piped/redirected), which shouldn't itself prevent
-/// starting a session.
+/// starting a session — **or when it's reported successfully as `0x0`**
+/// (Codex review finding: some PTYs return a successful `TIOCGWINSZ` with
+/// zero dimensions, e.g. before any resize event has ever landed; a `0x0`
+/// remote PTY request is just as unusable as a missing one, so this is
+/// treated the same as an error rather than propagated).
 pub(crate) fn terminal_size() -> (u32, u32) {
-    match crossterm::terminal::size() {
-        Ok((cols, rows)) => (cols as u32, rows as u32),
-        Err(_) => (80, 24),
+    terminal_size_from(crossterm::terminal::size)
+}
+
+/// Pure helper split out of [`terminal_size`] purely so the `0x0` fallback
+/// case can be unit-tested with an injected size lookup — `crossterm`
+/// itself has no way to fake what `TIOCGWINSZ` reports (same rationale as
+/// `agent_auth::resolve_agent_target_from`'s injected env lookup).
+fn terminal_size_from(size_lookup: impl Fn() -> std::io::Result<(u16, u16)>) -> (u32, u32) {
+    match size_lookup() {
+        Ok((cols, rows)) if cols > 0 && rows > 0 => (cols as u32, rows as u32),
+        _ => (80, 24),
     }
 }
 
@@ -70,5 +82,26 @@ mod tests {
         // it can't verify the real-terminal path at all.
         let (cols, rows) = terminal_size();
         assert!(cols > 0 && rows > 0);
+    }
+
+    #[test]
+    fn terminal_size_from_falls_back_when_the_lookup_reports_a_successful_0x0() {
+        // A PTY can report a successful `TIOCGWINSZ` with zero dimensions
+        // (e.g. before any resize event has ever landed) — this must be
+        // treated the same as "size unknown", not propagated verbatim.
+        assert_eq!(terminal_size_from(|| Ok((0, 0))), (80, 24));
+    }
+
+    #[test]
+    fn terminal_size_from_falls_back_on_error() {
+        assert_eq!(
+            terminal_size_from(|| Err(std::io::Error::other("no tty"))),
+            (80, 24)
+        );
+    }
+
+    #[test]
+    fn terminal_size_from_passes_through_a_real_size() {
+        assert_eq!(terminal_size_from(|| Ok((120, 40))), (120, 40));
     }
 }
