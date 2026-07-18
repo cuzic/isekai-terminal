@@ -4186,6 +4186,191 @@ public func FfiConverterTypeForwardType_lower(_ value: ForwardType) -> RustBuffe
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * マウスレポーティング(タスク#36)対象のボタン。左/中/右クリックに加え、
+ * モバイルでの主なユースケースであるホイール(縦スクロールジェスチャ)を含める
+ * (Fableレビュー指摘: wheelボタン64/65のエンコードを範囲に含める)。
+ * 横スクロールホイール(button 6/7)・追加ボタン(button 8以降)は現状使う予定が
+ * ないため未対応(必要になったタスクで追加する)。UI層(#50/#51)が生ポインタ
+ * イベントを`terminal_pointer_event_bytes`(タスク#51)へ渡す際にも使うため
+ * `uniffi::Enum`として公開する。
+ */
+
+public enum MouseButton: Equatable, Hashable {
+    
+    case left
+    case middle
+    case right
+    case wheelUp
+    case wheelDown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MouseButton: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMouseButton: FfiConverterRustBuffer {
+    typealias SwiftType = MouseButton
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MouseButton {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .left
+        
+        case 2: return .middle
+        
+        case 3: return .right
+        
+        case 4: return .wheelUp
+        
+        case 5: return .wheelDown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MouseButton, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .left:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .middle:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .right:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .wheelUp:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .wheelDown:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMouseButton_lift(_ buf: RustBuffer) throws -> MouseButton {
+    return try FfiConverterTypeMouseButton.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMouseButton_lower(_ value: MouseButton) -> RustBuffer {
+    return FfiConverterTypeMouseButton.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * マウスレポーティング(タスク#36)対象のイベント種別。`MouseButton`と同じ理由で
+ * `uniffi::Enum`として公開する。
+ */
+
+public enum MouseEventKind: Equatable, Hashable {
+    
+    /**
+     * ボタン押下(ホイールは常にこの種別で表す — ホイールにはreleaseの概念が無い)。
+     */
+    case press
+    /**
+     * ボタン解放。
+     */
+    case release
+    /**
+     * ポインタ移動。`button`が`Some`ならドラッグ(ボタンを押したまま移動)、
+     * `None`なら単純なホバー移動。
+     */
+    case motion
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MouseEventKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMouseEventKind: FfiConverterRustBuffer {
+    typealias SwiftType = MouseEventKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MouseEventKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .press
+        
+        case 2: return .release
+        
+        case 3: return .motion
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MouseEventKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .press:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .release:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .motion:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMouseEventKind_lift(_ buf: RustBuffer) throws -> MouseEventKind {
+    return try FfiConverterTypeMouseEventKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMouseEventKind_lower(_ value: MouseEventKind) -> RustBuffer {
+    return FfiConverterTypeMouseEventKind.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)が切り替えるマウスレポーティング
  * モード。`Terminal`が状態として保持し(rust-ssot: Kotlin/Swift側にミラー状態を
  * 作らず、この値をそのまま`ScreenUpdate`経由でUI層のジェスチャ裁定に使う——
@@ -6026,6 +6211,30 @@ fileprivate struct FfiConverterOptionTypeConnectionIssueHint: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeMouseButton: FfiConverterRustBuffer {
+    typealias SwiftType = MouseButton?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMouseButton.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMouseButton.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
     typealias SwiftType = [UInt32]
 
@@ -6389,6 +6598,41 @@ public func terminalCtrlByte(codePoint: UInt32) -> UInt8?  {
 })
 }
 /**
+ * タスク#51: UI層(Android/iOSのジェスチャハンドラ)が座標付きの生ポインタ
+ * イベントを、現在のマウスレポーティング状態に従ってターミナルへ送るべき
+ * バイト列にエンコードする。`Terminal::encode_pointer_event`(タスク#36)と
+ * 同じロジック(`terminal::encode_pointer_event_bytes`)を、実行中のセッション
+ * (`SessionOrchestrator`)を経由せずに直接呼べる純粋関数として公開する
+ * (`terminal_special_key_bytes`/`terminal_commit_text_bytes`と同じ設計: UI層は
+ * 直近の`ScreenUpdate`から読んだ`mouse_reporting_mode`/`sgr_mouse_mode`/`cols`/
+ * `rows`をそのまま引数として渡すだけでよく、「今どのマウスモードか」の判断
+ * ロジック自体はここに一元化されたまま——rust-ssot: Kotlin/Swift側に判断ロジックの
+ * ミラーを作らない)。
+ *
+ * 報告すべきでないイベント(`mouse_reporting_mode`がOff、またはモードが対象外の
+ * イベント種別)は`None`を返す。呼び出し元はこれを「何も送らない」の合図として
+ * 扱い、代わりに通常のタッチ処理(テキスト選択・スクロールバックスワイプ等)に
+ * フォールバックすればよい。
+ *
+ * `row`/`col`は0-basedのセル座標(画面外の値は端末サイズ`cols`/`rows`へ
+ * クランプされる、`terminal::encode_pointer_event_bytes`のdocコメント参照)。
+ */
+public func terminalPointerEventBytes(kind: MouseEventKind, button: MouseButton?, row: UInt32, col: UInt32, modifiers: TerminalKeyModifiers, cols: UInt32, rows: UInt32, mouseReportingMode: MouseReportingMode, sgrMouseMode: Bool) -> Data?  {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(
+        FfiConverterTypeMouseEventKind_lower(kind),
+        FfiConverterOptionTypeMouseButton.lower(button),
+        FfiConverterUInt32.lower(row),
+        FfiConverterUInt32.lower(col),
+        FfiConverterTypeTerminalKeyModifiers_lower(modifiers),
+        FfiConverterUInt32.lower(cols),
+        FfiConverterUInt32.lower(rows),
+        FfiConverterTypeMouseReportingMode_lower(mouseReportingMode),
+        FfiConverterBool.lower(sgrMouseMode),$0
+    )
+})
+}
+/**
  * 特殊キーを、ターミナルへ送信するバイト列(ANSI/xtermエスケープシーケンス)に
  * 変換する。
  *
@@ -6510,6 +6754,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte() != 39410) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 25125) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 25965) {
