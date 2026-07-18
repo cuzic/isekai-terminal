@@ -39,6 +39,17 @@ public struct TerminalView: View {
     /// (`.claude/rules/rust-ssot.md`の例外)として`selection`/`scrollOffset`と同じく
     /// SwiftUI側の`@State`で保持する(Android版`pendingHyperlinkUrl`と対称)。
     @State private var pendingHyperlinkURL: String?
+    /// タスク#67: 検索バーの開閉・クエリ・大小文字区別・マッチ結果一覧・「今何件目を
+    /// 見ているか」。いずれも「UI表示だけに閉じた状態」(`.claude/rules/rust-ssot.md`の
+    /// 例外、`selection`/`scrollOffset`と同じ扱い)であり、マッチの計算自体
+    /// (部分一致検索・combining character境界・大小文字無視)は一切ここでは行わず、
+    /// `TerminalSessionController.searchScrollback`経由でRust側`search_scrollback`
+    /// (#37)に全面委譲する。
+    @State private var showSearchBar = false
+    @State private var searchQuery = ""
+    @State private var searchCaseSensitive = false
+    @State private var searchMatches: [ScrollbackSearchMatch] = []
+    @State private var currentMatchIndex = 0
     /// Phase 1F-5(#52): 定型コマンドシート。Android版`showSnippetSheet`と対称。
     @State private var showSnippetSheet = false
     @State private var snippets: [Snippet] = []
@@ -74,12 +85,41 @@ public struct TerminalView: View {
             TerminalScreenRepresentable(
                 uiState: uiState, controller: controller,
                 selection: $selection, fontScale: $fontScale, scrollOffset: $scrollOffset,
-                pendingHyperlinkURL: $pendingHyperlinkURL
+                pendingHyperlinkURL: $pendingHyperlinkURL,
+                // タスク#67 codexレビュー指摘: `row == 0`(scrollback最新行)は
+                // `jumpToCurrentMatch()`のドキュメント参照の通り、この`scrollOffset`の
+                // 仕組みでは表示不可能なので、ハイライト自体を渡さない(誤った行を
+                // ハイライトして見せない)。
+                //
+                // 既知の残存境界(codexレビュー2次指摘、意図的に未対応): `searchMatches`は
+                // クエリ変更・大小文字トグル・`next`/`prev`の度に再検索するが(`refreshMatches()`)、
+                // 検索バーを開いたまま何も操作せずに新しい端末出力が届いてscrollbackが
+                // 積まれた場合、直近の再検索結果の`row`がその間にズレていても
+                // 自動では追従しない(次に`next`/`prev`かクエリ変更を行った時点で
+                // 再検索されるまでの間、表示中のハイライトが指す内容が実際とズレうる)。
+                // `uiState.latestScreenUpdate`の変化ごとに再検索する案も検討したが、
+                // 大きな`ScreenUpdate`(全セル配列)のEquatable比較+`search_scrollback`の
+                // 全scrollback走査を毎フレーム走らせることになり、ライブ描画のホット
+                // パスに新たな負荷を持ち込む方が実害が大きいと判断した。`row`が
+                // 「呼び出し時点のスナップショットにのみ有効」であることは
+                // `ScrollbackSearchMatch`のドキュメント(#37)自体が明記して受け入れている
+                // 前提であり、完全に解消するにはRust側にscrollback世代カウンタ等の
+                // 新しいAPI面が要る(このタスク[#67、iOS UI実装のみ]の範囲外)。
+                searchHighlight: currentSearchMatch.flatMap { $0.row == 0 ? nil : $0 }
             )
             .accessibilityIdentifier("terminalScreen")
 
             TerminalInputRepresentable(
-                controller: controller, uiState: uiState, isActive: isActive,
+                controller: controller, uiState: uiState,
+                // タスク#67: 検索バー表示中はIME(隠しinput view)からfirst responderを
+                // 明け渡し、下の検索バーの`TextField`がソフトウェアキーボードを受け取れる
+                // ようにする(`TerminalInputRepresentable.updateUIView`はisActiveの間
+                // 毎回`becomeFirstResponder()`を再主張するため、これをfalseにしないと
+                // 検索欄をタップしても即座にフォーカスを奪い返されてしまう)。タブ自体の
+                // フォーカスレポーティング(`notifyFocusChange`、下の`.onChange(of: isActive)`)
+                // は影響を受けない——あくまでローカルなIME first responderの主張のみを
+                // 抑止する。
+                isActive: isActive && !showSearchBar,
                 onShowSnippets: { showSnippetSheet = true },
                 onShowKeySequences: {
                     // シートを開く直前に再読込する(codexレビュー指摘: .onAppear時の1回だけだと、
@@ -87,7 +127,8 @@ public struct TerminalView: View {
                     // シートが古い内容のままになる)。
                     reloadKeySequenceSheetContent()
                     showKeySequenceSheet = true
-                }
+                },
+                onShowSearch: { showSearchBar = true }
             )
                 .frame(width: 1, height: 1)
                 .opacity(0.01) // 非表示にしつつfirstResponderにはなれる状態を保つ
@@ -98,6 +139,11 @@ public struct TerminalView: View {
                 selectionToolbar(selection)
                     .frame(maxWidth: .infinity, alignment: .top)
                     .padding(.top, 8)
+            }
+
+            if showSearchBar {
+                searchBar
+                    .frame(maxWidth: .infinity, alignment: .top)
             }
 
             if scrollOffset > 0 {
@@ -346,6 +392,137 @@ public struct TerminalView: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
+    // MARK: - スクロールバック検索(#67)
+
+    /// `searchMatches[currentMatchIndex]`の範囲外アクセスを避けるためのヘルパー。
+    private var currentSearchMatch: ScrollbackSearchMatch? {
+        searchMatches.indices.contains(currentMatchIndex) ? searchMatches[currentMatchIndex] : nil
+    }
+
+    /// タスク#67: 検索バー。クエリ入力・大小文字区別トグル・前後マッチへのジャンプ・
+    /// 件数表示・閉じるボタンをまとめる。マッチの計算(部分一致・combining character
+    /// 境界・大小文字無視)は一切ここでは行わず、`runSearch()`経由で
+    /// `TerminalSessionController.searchScrollback`(Rust側`search_scrollback`、#37)に
+    /// 全面委譲する(rust-ssot)。Android版は#66で追加予定(Fableレビュー2次分割)。
+    private var searchBar: some View {
+        HStack(spacing: 8) {
+            TextField("検索", text: $searchQuery)
+                .textFieldStyle(.roundedBorder)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .accessibilityIdentifier("scrollbackSearchField")
+                .onChange(of: searchQuery) { _ in runSearch() }
+
+            Text(searchMatches.isEmpty ? "0/0" : "\(currentMatchIndex + 1)/\(searchMatches.count)")
+                .font(.caption)
+                .foregroundStyle(.white)
+                .monospacedDigit()
+                .accessibilityIdentifier("scrollbackSearchMatchCount")
+
+            Button {
+                searchCaseSensitive.toggle()
+                runSearch()
+            } label: {
+                Text("Aa").fontWeight(searchCaseSensitive ? .bold : .regular)
+            }
+            .foregroundStyle(searchCaseSensitive ? .cyan : .gray)
+            .accessibilityIdentifier("scrollbackSearchCaseSensitiveToggle")
+
+            Button { goToPreviousMatch() } label: { Image(systemName: "chevron.up") }
+                .disabled(searchMatches.isEmpty)
+                .accessibilityIdentifier("scrollbackSearchPreviousButton")
+
+            Button { goToNextMatch() } label: { Image(systemName: "chevron.down") }
+                .disabled(searchMatches.isEmpty)
+                .accessibilityIdentifier("scrollbackSearchNextButton")
+
+            Button { closeSearchBar() } label: { Image(systemName: "xmark") }
+                .foregroundStyle(.gray)
+                .accessibilityIdentifier("scrollbackSearchCloseButton")
+        }
+        .font(.body)
+        .foregroundStyle(.white)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.black.opacity(0.85))
+    }
+
+    /// クエリ・大小文字区別トグルが変わる度に呼ぶ。空クエリはマッチなし扱いにする
+    /// (Rust側`search_scrollback`も空クエリには空配列を返すが、呼び出し自体を省く)。
+    private func runSearch() {
+        currentMatchIndex = 0
+        guard refreshMatches() else { return }
+        jumpToCurrentMatch()
+    }
+
+    /// `TerminalSessionController.searchScrollback`を呼び直して`searchMatches`を
+    /// 最新化する。`ScrollbackSearchMatch.row`は「呼び出し時点のスナップショットに
+    /// 対してのみ有効」で長期キャッシュしない運用を前提とするドキュメント
+    /// (`rust-core/src/lib.rs`の`ScrollbackSearchMatch`参照、Fableレビュー2次
+    /// 指摘(b))のため、ジャンプ操作(`next`/`prev`)のたびに必ず再検索してから
+    /// 移動する——検索バーを開いたまま端末出力が進んでscrollbackの行番号が
+    /// ずれた状態で、古い`row`のままジャンプしてしまわないようにする
+    /// (codexレビュー指摘)。マッチが無くなった/クエリが空になった場合は
+    /// `false`を返す。
+    @discardableResult
+    private func refreshMatches() -> Bool {
+        guard !searchQuery.isEmpty else {
+            searchMatches = []
+            currentMatchIndex = 0
+            return false
+        }
+        searchMatches = controller.searchScrollback(query: searchQuery, caseSensitive: searchCaseSensitive)
+        if !searchMatches.indices.contains(currentMatchIndex) {
+            currentMatchIndex = 0
+        }
+        return !searchMatches.isEmpty
+    }
+
+    /// `scrollOffset`を現在のマッチの`row`へ合わせ、そのマッチが画面に映るようにする。
+    ///
+    /// 既知の境界(タスク#67実装時に判明、codexレビューで実際に誤りだと指摘された):
+    /// scrollback最新行(`row == 0`)は、`scrollOffset == 0`が「ライブ画面表示」を兼ねる
+    /// 既存の規約(`TerminalScreenView.computeDisplayUpdate()`)と衝突するため、
+    /// この`TerminalScreenView`/`scrollOffset`の仕組み経由では原理的に表示不可能
+    /// (`scrollback_cells`の`sb_idx = offset + (rows-1-r)`はどの`offset >= 1`を
+    /// 選んでも最小値が`offset`自体になり、`sb_idx == 0`には到達できない——
+    /// `offset == 0`は既存規約でライブ表示に横取りされる)。近似のつもりで
+    /// `scrollOffset`を1などにずらすと、無関係な内容を「ジャンプできた」かのように
+    /// 見せてしまう(初版のcodexレビュー指摘)ため、この場合は`scrollOffset`を
+    /// 変更せず、ハイライトも描かない(呼び出し元`searchHighlight`計算で`row == 0`を
+    /// 除外する)。件数表示(n/m)自体はこのマッチを含めたまま数えるが、画面上の
+    /// ジャンプ・ハイライトだけは行わない——誤った位置を正しいかのように示すより
+    /// 安全側の選択。
+    private func jumpToCurrentMatch() {
+        guard searchMatches.indices.contains(currentMatchIndex) else { return }
+        let match = searchMatches[currentMatchIndex]
+        guard match.row != 0 else { return }
+        scrollOffset = match.row
+    }
+
+    private func goToNextMatch() {
+        guard refreshMatches() else { return }
+        currentMatchIndex = (currentMatchIndex + 1) % searchMatches.count
+        jumpToCurrentMatch()
+    }
+
+    private func goToPreviousMatch() {
+        guard refreshMatches() else { return }
+        currentMatchIndex = (currentMatchIndex - 1 + searchMatches.count) % searchMatches.count
+        jumpToCurrentMatch()
+    }
+
+    /// 検索バーを閉じる。「ライブへ戻る」ボタンとは独立に扱う(検索結果を見ながら
+    /// 手動でスクロールしている場合、バーを閉じただけでライブへ戻す挙動は驚きが
+    /// 大きいため`scrollOffset`自体は変更しない)。
+    private func closeSearchBar() {
+        showSearchBar = false
+        searchQuery = ""
+        searchCaseSensitive = false
+        searchMatches = []
+        currentMatchIndex = 0
+    }
+
     /// Phase 1F-4(#51): スクロールバック中に表示する「ライブへ戻る」ボタン。Android版
     /// `TerminalScreen.kt`の"↓ ライブへ戻る ($scrollOffset / $scrollbackLen)"ボタンと対称。
     private var backToLiveButton: some View {
@@ -384,6 +561,10 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
     @Binding var fontScale: Double
     @Binding var scrollOffset: UInt32
     @Binding var pendingHyperlinkURL: String?
+    /// タスク#67: 検索バーの現在マッチ(非Binding——`TerminalView`側の`searchMatches`/
+    /// `currentMatchIndex`から都度導出した読み取り専用の値を渡すだけで、
+    /// `TerminalScreenView`側からこの値を書き戻すことはない)。
+    let searchHighlight: ScrollbackSearchMatch?
 
     func makeUIView(context: Context) -> TerminalScreenView {
         let view = TerminalScreenView()
@@ -427,6 +608,7 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
         uiView.selection = selection
         uiView.fontScale = CGFloat(fontScale)
         uiView.scrollOffset = scrollOffset
+        uiView.searchHighlight = searchHighlight
 
         // タスク#20: `connect()`は実際のview sizeが判明する前に既定の80x24でセッションを
         // 開始するため、接続確立(再接続含む)の度に実際のview sizeへ確実に一度合わせ直す
@@ -459,13 +641,16 @@ private struct TerminalInputRepresentable: UIViewRepresentable {
     let isActive: Bool
     let onShowSnippets: () -> Void
     let onShowKeySequences: () -> Void
+    /// タスク#67: アクセサリバーの「検索」ボタンから検索バーを開く(`TerminalView`が保持)。
+    let onShowSearch: () -> Void
 
     func makeUIView(context: Context) -> TerminalIMEInputView {
         let view = TerminalIMEInputView()
         view.onSendBytes = { [weak controller] data in controller?.send(data) }
         view.inputAccessoryView = TerminalAccessoryBar(
             controller: controller, inputView: view,
-            onShowSnippets: onShowSnippets, onShowKeySequences: onShowKeySequences
+            onShowSnippets: onShowSnippets, onShowKeySequences: onShowKeySequences,
+            onShowSearch: onShowSearch
         )
         if isActive {
             DispatchQueue.main.async {
@@ -508,6 +693,8 @@ private final class TerminalAccessoryBar: UIView {
     private var ctrlButton: UIButton?
     private let onShowSnippets: () -> Void
     private let onShowKeySequences: () -> Void
+    /// タスク#67: 検索バーを開く(SwiftUI側、`TerminalView`が保持する)。
+    private let onShowSearch: () -> Void
 
     /// Phase 1F-5(#52): ^C/^D/^Zの制御バイト直接送信ボタン。Android版`TerminalScreen.kt`の
     /// `CtrlBtn("^C") { actions.onSend(byteArrayOf(0x03)) }`等と同じ(トグル式の「Ctrl」
@@ -520,12 +707,14 @@ private final class TerminalAccessoryBar: UIView {
         controller: TerminalSessionController,
         inputView: TerminalIMEInputView,
         onShowSnippets: @escaping () -> Void = {},
-        onShowKeySequences: @escaping () -> Void = {}
+        onShowKeySequences: @escaping () -> Void = {},
+        onShowSearch: @escaping () -> Void = {}
     ) {
         self.controller = controller
         self.imeInputView = inputView
         self.onShowSnippets = onShowSnippets
         self.onShowKeySequences = onShowKeySequences
+        self.onShowSearch = onShowSearch
         super.init(frame: CGRect(x: 0, y: 0, width: 0, height: 44))
         backgroundColor = .secondarySystemBackground
         autoresizingMask = [.flexibleWidth]
@@ -542,6 +731,10 @@ private final class TerminalAccessoryBar: UIView {
 
         let keySequences = makeButton(title: "打鍵", tag: -4)
         keySequences.addTarget(self, action: #selector(handleKeySequencesTap), for: .touchUpInside)
+
+        // タスク#67: スクロールバック検索バーを開く。
+        let search = makeButton(title: "検索", tag: -5)
+        search.addTarget(self, action: #selector(handleSearchTap), for: .touchUpInside)
 
         let controlButtons = controlByteButtons.enumerated().map { index, item in
             let button = makeButton(title: item.title, tag: -10 - index)
@@ -564,7 +757,7 @@ private final class TerminalAccessoryBar: UIView {
         self.keys = labels.map { $0.1 }
 
         let keyButtons = labels.enumerated().map { index, item in makeButton(title: item.0, tag: index) }
-        let stack = UIStackView(arrangedSubviews: [ctrl] + controlButtons + [paste, snippets, keySequences] + keyButtons)
+        let stack = UIStackView(arrangedSubviews: [ctrl] + controlButtons + [paste, snippets, keySequences, search] + keyButtons)
         stack.axis = .horizontal
         stack.distribution = .fillEqually
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -638,6 +831,11 @@ private final class TerminalAccessoryBar: UIView {
     /// 打鍵列シートを開く(SwiftUI側、`TerminalView`が保持する)。
     @objc private func handleKeySequencesTap() {
         onShowKeySequences()
+    }
+
+    /// タスク#67: 検索バーを開く(SwiftUI側、`TerminalView`が保持する)。
+    @objc private func handleSearchTap() {
+        onShowSearch()
     }
 }
 

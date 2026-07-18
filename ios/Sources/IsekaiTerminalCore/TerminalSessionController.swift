@@ -583,6 +583,16 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         orchestrator.scrollbackLen()
     }
 
+    /// タスク#67: スクロールバック検索バーUI用。マッチ計算(部分一致検索・
+    /// combining character境界処理・大小文字無視)は全て`SessionCore::search_scrollback`
+    /// (Rust側、#37)に委譲し、このメソッドは呼び出しをそのまま中継するだけ
+    /// (rust-ssot: Swift側にマッチ計算ロジックを複製しない)。セッション未確立時は
+    /// 空配列を返す。返る`ScrollbackSearchMatch.row`は`scrollbackCells(offset:rows:)`と
+    /// 同じ規約(#37のドキュメント参照)。
+    public func searchScrollback(query: String, caseSensitive: Bool) -> [ScrollbackSearchMatch] {
+        orchestrator.searchScrollback(query: query, caseSensitive: caseSensitive)
+    }
+
     /// 保留中のagent署名要求に応答する(UI、MainActorから呼ぶ)。
     @MainActor
     public func respondToAgentSignRequest(approved: Bool) {
