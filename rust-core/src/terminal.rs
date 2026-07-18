@@ -193,6 +193,24 @@ pub(crate) struct Terminal {
     /// 既定はxterm同様`true`(on)。offの場合、右端到達後の`print()`は次行へ
     /// 折り返さず、右端の最終列を上書きし続ける(タスク#56)。
     autowrap_mode: bool,
+    /// REP(`CSI Ps b`)が繰り返す対象——`print()`が実際にセルへ書き込んだ最後の
+    /// graphic文字と、その時点の(reverse適用前の論理)SGR属性のペア(結合文字・幅0の
+    /// 文字は対象外、[Perform::print]の幅0分岐を参照)。`None`は「直前にgraphic文字が
+    /// 一度も書かれていない」状態(初期化直後・RIS直後)を表し、その状態でのREPは
+    /// no-opにする(ECMA-48の「直前のgraphic文字を繰り返す」という定義上、対象が
+    /// 存在しない場合の自然なフォールバックとして採用。タスク#48)。
+    ///
+    /// 属性も一緒に凍結して保持する(現在の`cur_attrs`ではなく、記録時点のものを
+    /// REP実行時に使う)——元の文字を書いた後にSGRが変わっていても、REPは
+    /// 「その文字が実際に画面に描かれた見た目」をそのまま繰り返すべきであり、
+    /// REPを実行した時点で偶然有効なSGRに化けてはいけないため(タスク#48要件:
+    /// 「直前に描画した文字・属性」を保持する)。
+    ///
+    /// 改行・カーソル移動・SGR等の制御機能を挟んでもクリアしない — xterm/VTE系実装の
+    /// 一般的な挙動(REPは「最後に画面へ書かれたgraphic文字」を覚え続け、CR/LF等の
+    /// 制御機能はそれを消さない)に合わせる。この値を書き込むのは`print()`の
+    /// 非結合文字分岐のみ。
+    last_graphic_cell: Option<(char, TermAttrs)>,
 }
 
 impl Terminal {
@@ -225,6 +243,7 @@ impl Terminal {
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
             autowrap_mode: true,
+            last_graphic_cell: None,
         }
     }
 
@@ -306,6 +325,7 @@ impl Terminal {
         self.cursor_shape = CursorShape::Block;
         self.cursor_blink = true;
         self.autowrap_mode = true;
+        self.last_graphic_cell = None;
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -895,6 +915,12 @@ impl Perform for Terminal {
 
         if self.cursor_row < self.rows {
             let attrs = self.cur_attrs;
+            // REP(`CSI Ps b`、タスク#48)が繰り返す対象として、文字と現在の属性の
+            // ペアを凍結して記録する。実際にセルへ書き込む直前(このif内)でのみ
+            // 更新することで、画面外(このブロックに入らない場合)に対する`print()`
+            // 呼び出しでは更新しない——「実際に画面へ書かれた最後のgraphic文字」
+            // という定義を保つ。
+            self.last_graphic_cell = Some((c, attrs));
             *self.cell_mut(self.cursor_row, self.cursor_col) =
                 attrs.to_cell(smol_str::SmolStr::new(c.encode_utf8(&mut [0u8; 4])));
             let advance = if width == 2 && self.cursor_col + 1 < self.cols {
@@ -1064,6 +1090,26 @@ impl Perform for Terminal {
             'P' => { self.delete_chars(p0.max(1) as usize); }
             'X' => { self.erase_chars(p0.max(1) as usize); }
             'S' => { self.scroll_up_region(p0.max(1) as usize); }
+            // REP(`CSI Ps b`、タスク#48): 直前に画面へ書かれたgraphic文字を、その
+            // 文字が書かれた時点のSGR属性のまま`Ps`回繰り返す(既定1回)。
+            // `last_graphic_cell`が`None`(画面先頭・RIS直後など直前文字が存在しない
+            // 場合)はno-op。`self.print()`を再呼び出しして実現する(ICH/DCH等と異なり
+            // 専用の書き込みロジックを持たない)——折り返し・全角文字・DECAWM off等の
+            // 挙動を`print()`本体と完全に一致させ二重実装によるズレを防ぐため。
+            // `print()`は常に`self.cur_attrs`(現在値)を参照するため、記録済みの属性で
+            // 描画させるにはループの間だけ`cur_attrs`を差し替え、終わったら元に戻す
+            // (REP自体はカーソル位置のSGR状態を変更しない副作用のない操作であるべき)。
+            'b' => {
+                if let Some((c, attrs)) = self.last_graphic_cell {
+                    let n = p0.max(1) as usize;
+                    let restore_attrs = self.cur_attrs;
+                    self.cur_attrs = attrs;
+                    for _ in 0..n {
+                        self.print(c);
+                    }
+                    self.cur_attrs = restore_attrs;
+                }
+            }
             'd' => { self.cursor_row = (p0.max(1) as usize - 1).min(self.rows - 1); }
             'm' => { self.handle_sgr(&ps); }
             'r' => {
@@ -1383,6 +1429,126 @@ mod tests {
         feed(&mut t, "\u{0301}".as_bytes());
         assert_eq!(cell(&t, 0, 0), " ", "no base char to attach to: cell must remain blank");
         assert_eq!(t.cursor_col(), 0, "no cell was written, cursor must not move");
+    }
+
+    // ── REP(`CSI Ps b`、直前文字繰り返し、タスク#48) ─────────────
+
+    #[test]
+    fn test_rep_repeats_last_printed_char_with_explicit_count() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"A\x1b[3b"); // "A" の後にREPで3回追加繰り返し
+        assert_eq!(cell(&t, 0, 0), "A");
+        assert_eq!(cell(&t, 0, 1), "A");
+        assert_eq!(cell(&t, 0, 2), "A");
+        assert_eq!(cell(&t, 0, 3), "A");
+        assert_eq!(cell(&t, 0, 4), " ", "only 1(original) + 3(REP) = 4 cells should be filled");
+        assert_eq!(t.cursor_col(), 4);
+    }
+
+    #[test]
+    fn test_rep_default_count_is_one_when_param_omitted() {
+        // `CSI b`(パラメータ省略)は`CSI 1b`と同義(他のCSIパラメータの既定値と同じ扱い)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"A\x1b[b");
+        assert_eq!(cell(&t, 0, 0), "A");
+        assert_eq!(cell(&t, 0, 1), "A");
+        assert_eq!(cell(&t, 0, 2), " ");
+        assert_eq!(t.cursor_col(), 2);
+    }
+
+    #[test]
+    fn test_rep_is_noop_when_no_prior_graphic_char() {
+        // 画面先頭など「直前に一度もgraphic文字が書かれていない」状態でのREPはno-op
+        // (タスク#48の要求事項: 「直前文字が無い」状態の扱いを決めてテストする)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[5b");
+        assert_eq!(cell(&t, 0, 0), " ");
+        assert_eq!(t.cursor_col(), 0, "REP with no prior char must not move the cursor or write anything");
+    }
+
+    #[test]
+    fn test_rep_is_noop_immediately_after_ris_even_if_something_was_printed_before() {
+        // RIS(`ESC c`)は「直前のgraphic文字」の記憶自体もリセットする(画面全体を
+        // 消去する以上、繰り返す対象も存在しないと扱うのが自然、タスク#48)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"A\x1bc\x1b[3b");
+        assert_eq!(cell(&t, 0, 0), " ", "RIS must clear the screen and REP must stay a no-op afterward");
+    }
+
+    #[test]
+    fn test_rep_survives_intervening_newline_and_writes_at_new_cursor_position() {
+        // 改行等の制御機能を挟んでも「直前のgraphic文字」の記憶はクリアしない
+        // (xterm/VTE系実装の一般的挙動に合わせる、タスク#48)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"A\r\n\x1b[2b");
+        assert_eq!(cell(&t, 0, 0), "A");
+        assert_eq!(cell(&t, 1, 0), "A", "REP after a newline should still repeat the last printed char");
+        assert_eq!(cell(&t, 1, 1), "A");
+        assert_eq!(t.cursor_row(), 1);
+        assert_eq!(t.cursor_col(), 2);
+    }
+
+    #[test]
+    fn test_rep_uses_the_attrs_the_char_was_originally_drawn_with_not_current_attrs() {
+        // REPは「直前に描画した文字・属性」を繰り返す(タスク#48要件)——文字を最初に
+        // 書いた時点のSGR属性を凍結して使い、その後SGRが変わっていても(REPを実行する
+        // 時点で偶然有効な)現在の属性には影響されない。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[31mA\x1b[0m\x1b[2b"); // 赤字で"A"、その後SGRリセットしてからREP
+        let theme = Theme::default();
+        assert_eq!(t.screen_cells()[0].fg, theme.ansi16[1], "the originally-printed 'A' keeps its red color");
+        assert_eq!(t.screen_cells()[1].fg, theme.ansi16[1], "REP-written copies must reuse the attrs frozen at print time (red), not the now-reset current attrs");
+        assert_eq!(t.screen_cells()[2].fg, theme.ansi16[1]);
+        assert_eq!(cell(&t, 0, 1), "A");
+        assert_eq!(cell(&t, 0, 2), "A");
+
+        // REP自身はカーソル位置の現在SGR状態を変更しない(副作用のない操作) —
+        // REP直後に書いた通常文字は、REP前にリセットされていた属性(赤ではない)を使う。
+        feed(&mut t, b"B");
+        assert_eq!(t.screen_cells()[3].fg, theme.default_fg, "SGR state after REP must be whatever was current before REP ran, unaffected by the frozen repeat attrs");
+        assert_eq!(cell(&t, 0, 3), "B");
+    }
+
+    #[test]
+    fn test_rep_after_combining_char_repeats_the_base_char_not_the_combining_mark() {
+        // 幅0の結合文字は`last_graphic_cell`を更新しない(`print()`の幅0分岐は別経路)。
+        // "e" + COMBINING ACUTE ACCENT の後のREPは、結合済みの「é」ではなく
+        // 素の"e"を繰り返す(タスク#48)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, "e\u{0301}".as_bytes());
+        feed(&mut t, b"\x1b[b");
+        assert_eq!(cell(&t, 0, 0), "e\u{0301}", "original combined cell is untouched");
+        assert_eq!(cell(&t, 0, 1), "e", "REP repeats the plain base char, not the combined grapheme");
+    }
+
+    #[test]
+    fn test_rep_repeats_wide_char_occupying_two_cells_per_repetition() {
+        // 全角文字のREPは、通常の`print()`と同じ折り返し・プレースホルダロジックを
+        // 再利用するため、1回の繰り返しごとに2セルずつ消費する(タスク#48)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, "\u{3042}".as_bytes()); // "あ"(全角) が col0-1 を占める
+        feed(&mut t, b"\x1b[2b"); // さらに2回繰り返す -> col2-3, col4-5
+        assert_eq!(cell(&t, 0, 0), "\u{3042}");
+        assert_eq!(cell(&t, 0, 1), " ");
+        assert_eq!(cell(&t, 0, 2), "\u{3042}");
+        assert_eq!(cell(&t, 0, 3), " ");
+        assert_eq!(cell(&t, 0, 4), "\u{3042}");
+        assert_eq!(cell(&t, 0, 5), " ");
+        assert_eq!(t.cursor_col(), 6);
+    }
+
+    #[test]
+    fn test_rep_wraps_to_next_line_when_repeating_past_right_edge() {
+        // REPは`print()`をそのまま再利用するので、右端に到達すれば通常の折り返し
+        // (autowrap on)がそのまま働く(タスク#48)。
+        let mut t = Terminal::new(5, 3, Theme::default());
+        feed(&mut t, b"ABCD"); // col0-3を埋める(col4が残り1マス)
+        feed(&mut t, b"\x1b[3b"); // "D"をさらに3回 -> col4(行0)、col0-1(行1、折り返し後)
+        assert_eq!(cell(&t, 0, 4), "D");
+        assert_eq!(t.cursor_row(), 1);
+        assert_eq!(cell(&t, 1, 0), "D");
+        assert_eq!(cell(&t, 1, 1), "D");
+        assert_eq!(t.cursor_col(), 2);
     }
 
     #[test]
