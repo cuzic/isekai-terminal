@@ -1813,6 +1813,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "bytes",
  "env_logger",
  "hmac",
  "isekai-link-masque",
@@ -1843,6 +1844,7 @@ version = "0.1.0"
 dependencies = [
  "isekai-fs-guard",
  "isekai-pipe-protocol",
+ "isekai-transport",
  "isekai-trust",
  "libc",
  "rand 0.8.6",
@@ -1949,7 +1951,6 @@ dependencies = [
  "async-trait",
  "env_logger",
  "hmac",
- "isekai-pipe-core",
  "isekai-protocol",
  "isekai-stun",
  "log",
@@ -2951,6 +2952,7 @@ name = "quicmux"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "log",
  "noq",
  "qmux",
