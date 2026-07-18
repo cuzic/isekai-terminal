@@ -123,7 +123,11 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
     private func handleHardwareKeyPress(_ key: UIKey) -> Bool {
         let modifiers = TerminalHardwareKeyMapper.modifiers(for: key.modifierFlags)
 
-        if let specialKey = TerminalHardwareKeyMapper.specialKey(for: key.keyCode) {
+        // 矢印/Escape/Tab等の特殊キーは、日本語IME変換中(marked textが残っている間)は
+        // 候補選択・変換取消・フォーカス移動としてUIKit/IMEに委ねるためフォールスルー
+        // する(タスク#73、Android版`TerminalInputConnection.sendKeyEvent`の
+        // `!composing`ガードと同じ方針)。
+        if let specialKey = TerminalHardwareKeyMapper.specialKey(for: key.keyCode), markedTextRange == nil {
             let bytes = TerminalKeyMapper.bytes(for: specialKey, applicationCursorMode: applicationCursorMode, modifiers: modifiers)
             guard !bytes.isEmpty else { return false }
             onSendBytes?(Data(bytes))
