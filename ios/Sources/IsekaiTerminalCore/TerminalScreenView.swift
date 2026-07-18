@@ -100,6 +100,13 @@ public final class TerminalScreenView: UIView {
     /// (codexレビュー指摘)。`onScrollbackRequest`をタイマー刻みごとに呼ばずに済むよう
     /// `draw(_:)`実行時点の結果を保存するだけに留める。
     private var lastDisplayHasBlink = false
+    /// タスク#34: 直近`draw(_:)`で実際にカーソルを点滅させる必要があったかどうか
+    /// (`update.cursorVisible && update.cursorBlink`から導出、`cursorBlink`自体は
+    /// DECSCUSR/`?12`でRustが決定した真値——rust-ssot:形状・点滅モードの判断は
+    /// Rust側にあり、ここでは点滅の位相[`blinkPhaseVisible`]というUI表示専用状態を
+    /// 管理するだけ)。`lastDisplayHasBlink`と同じ理由でキャッシュしておき、blink
+    /// タイマーが無駄な再描画を避けられるようにする。
+    private var lastDisplayCursorBlinks = false
     /// Sixel(タスク#42)の`ImagePlacement.rgba`から作った`UIImage`をidでキャッシュする
     /// (Android版`SixelBitmapCache`と対称)。
     private let sixelBitmapCache = SixelBitmapCache()
@@ -202,15 +209,16 @@ public final class TerminalScreenView: UIView {
         blinkTimer?.invalidate()
     }
 
-    /// タスク#23: 点滅位相を一定間隔(xterm既定に近い0.53秒)でトグルする。
-    /// 現在の画面に実際にblink属性のセルが無ければ`setNeedsDisplay()`を呼ばない
-    /// (無駄な再描画でバッテリーを消費しない)。
+    /// タスク#23/#34: 点滅位相を一定間隔(xterm既定に近い0.53秒)でトグルする。
+    /// 現在の画面に実際にblink属性のセルも点滅カーソルも無ければ`setNeedsDisplay()`を
+    /// 呼ばない(無駄な再描画でバッテリーを消費しない)。同じ`blinkPhaseVisible`位相を
+    /// SGR 5(blink属性)と点滅カーソルの両方で共有する(xtermも同じ位相を共有する)。
     private func startBlinkTimerIfNeeded() {
         guard blinkTimer == nil else { return }
         blinkTimer = Timer.scheduledTimer(withTimeInterval: 0.53, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.blinkPhaseVisible.toggle()
-            if self.lastDisplayHasBlink {
+            if self.lastDisplayHasBlink || self.lastDisplayCursorBlinks {
                 self.setNeedsDisplay()
             }
         }
@@ -461,12 +469,36 @@ public final class TerminalScreenView: UIView {
         // DECTCEM(CSI ?25l/h)でカーソルが非表示状態のときはRust側が`cursorVisible = false`を
         // 立てるので、描画自体をスキップする(rust-ssot: 可視判定はRust側で行い、Swift側は
         // フラグをそのまま反映するだけ。Android版`SshTerminalCanvas.kt`の`update.cursorVisible`
-        // ガードと対称)。
-        if update.cursorVisible, Int(update.cursorRow) < rows, Int(update.cursorCol) < cols {
+        // ガードと対称)。タスク#34: DECSCUSR(`CSI Ps SP q`)が選択した形状は
+        // `update.cursorShape`(Rust側`Terminal`が真値を保持、rust-ssot)からそのまま読み、
+        // block/underline/barを描き分ける。点滅そのもの(`blinkPhaseVisible`という位相)は
+        // UIローカル状態(タスク#23のSGR blinkと同じ`Timer`を共有)だが、「点滅させるべきか
+        // どうか」は`update.cursorBlink`(DECSCUSRの偶数/奇数パラメータ、DECSET `?12`の
+        // どちらもRust側`Terminal`が解決済み)をそのまま見るだけで、Swift側では判断しない。
+        // タスク#34 codexレビュー指摘: スクロールバック表示中は`synthesizeDisplayUpdate`が
+        // `cursorRow = update.rows`(画面外)にしてカーソルを隠すため、その場合は
+        // `cursorInBounds`がfalseになり、実際には描画されないカーソルの点滅のために
+        // blinkタイマーが毎tick`setNeedsDisplay()`する無駄を避ける(`lastDisplayHasBlink`が
+        // 「実際に画面へ出した表示」を基準にしているのと同じ方針)。
+        let cursorInBounds = Int(update.cursorRow) < rows && Int(update.cursorCol) < cols
+        lastDisplayCursorBlinks = update.cursorVisible && update.cursorBlink && cursorInBounds
+        if update.cursorVisible, cursorInBounds,
+           !(update.cursorBlink && !blinkPhaseVisible) {
             let x = CGFloat(update.cursorCol) * cellWidth
             let y = CGFloat(update.cursorRow) * cellHeight
             UIColor.white.withAlphaComponent(0.5).setFill()
-            UIRectFill(CGRect(x: x, y: y, width: cellWidth, height: cellHeight))
+            let cursorRect: CGRect
+            switch update.cursorShape {
+            case .block:
+                cursorRect = CGRect(x: x, y: y, width: cellWidth, height: cellHeight)
+            case .underline:
+                let thickness = max(2.0, cellHeight * 0.12)
+                cursorRect = CGRect(x: x, y: y + cellHeight - thickness, width: cellWidth, height: thickness)
+            case .bar:
+                let thickness = max(2.0, cellWidth * 0.15)
+                cursorRect = CGRect(x: x, y: y, width: thickness, height: cellHeight)
+            }
+            UIRectFill(cursorRect)
         }
     }
 

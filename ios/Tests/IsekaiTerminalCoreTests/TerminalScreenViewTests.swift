@@ -101,6 +101,93 @@ final class TerminalScreenViewTests: XCTestCase {
         _ = renderer.image { _ in view.draw(view.bounds) }
     }
 
+    // MARK: - タスク#34: DECSCUSRカーソル形状の描画
+
+    /// `cursorShape`の3値(block/underline/bar)いずれでも`draw(_:)`がクラッシュせず
+    /// 完走することのスモークテスト(実ピクセルの目視確認は対象外、既存方針と同じ)。
+    /// 形状ごとの矩形計算(`TerminalScreenView.draw(_:)`の`switch update.cursorShape`)を
+    /// 一通り実行させる意味がある。
+    func testDrawWithEachCursorShapeDoesNotCrash() {
+        for shape: CursorShape in [.block, .underline, .bar] {
+            let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+            let cells = [CellData(
+                ch: "A", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
+                dim: false, italic: false, underline: false,
+                strikethrough: false, blink: false, invisible: false, linkId: nil
+            )]
+            let update = ScreenUpdate(
+                cols: 1, rows: 1, cells: cells,
+                cursorRow: 0, cursorCol: 0,
+                title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+                mouseReportingMode: .off, sgrMouseMode: false,
+                cursorVisible: true, bellGeneration: 0,
+                cursorShape: shape, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+            )
+            view.apply(update)
+            view.layoutIfNeeded()
+            let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
+            _ = renderer.image { _ in view.draw(view.bounds) }
+        }
+    }
+
+    /// `cursorBlink == false`(DECSCUSRのsteadyバリアント、またはDECSET `?12l`)の場合は
+    /// 点滅位相に関わらず常にカーソルを描く経路をクラッシュなく通ることを確認する。
+    func testDrawWithSteadyCursorDoesNotCrash() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let cells = [CellData(
+            ch: "A", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
+            dim: false, italic: false, underline: false,
+            strikethrough: false, blink: false, invisible: false, linkId: nil
+        )]
+        let update = ScreenUpdate(
+            cols: 1, rows: 1, cells: cells,
+            cursorRow: 0, cursorCol: 0,
+            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
+            cursorVisible: true, bellGeneration: 0,
+            cursorShape: .bar, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
+        )
+        view.apply(update)
+        view.layoutIfNeeded()
+        let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
+        _ = renderer.image { _ in view.draw(view.bounds) }
+    }
+
+    /// タスク#34 codexレビュー指摘の回帰確認: スクロールバック表示中
+    /// (`synthesizeDisplayUpdate`が`cursorRow = update.rows`でカーソルを画面外に隠す状態)で
+    /// 点滅カーソルを持つライブ`update`を`draw(_:)`してもクラッシュしないこと、および
+    /// `computeDisplayUpdate()`経由で合成された`ScreenUpdate`のカーソルが実際に画面外に
+    /// なっていることを確認する(`lastDisplayCursorBlinks`自体はprivateで直接検証できない
+    /// ため、既存方針通りスモークテストに留める)。
+    func testDrawDuringScrollbackWithBlinkingCursorDoesNotCrash() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let cols = 4
+        let rows = 2
+        let cells = (0..<(cols * rows)).map { i in
+            CellData(
+                ch: i % 2 == 0 ? "A" : " ", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false,
+                dim: false, italic: false, underline: false,
+                strikethrough: false, blink: false, invisible: false, linkId: nil
+            )
+        }
+        let update = ScreenUpdate(
+            cols: UInt32(cols), rows: UInt32(rows), cells: cells,
+            cursorRow: 0, cursorCol: 1,
+            title: nil, applicationCursorMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
+            cursorVisible: true, bellGeneration: 0,
+            cursorShape: .bar, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+        )
+        view.apply(update)
+        view.onScrollbackLenRequest = { 10 }
+        view.onScrollbackRequest = { _, _ in cells }
+        view.scrollOffset = 1
+
+        view.layoutIfNeeded()
+        let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
+        _ = renderer.image { _ in view.draw(view.bounds) }
+    }
+
     // MARK: - Phase 1F-2(#49): clampedFontScale
     //
     // `CGFloat`を使うため`IsekaiTerminalCoreLogic`(Linuxでも`swift test`可能な純ロジック層)には
