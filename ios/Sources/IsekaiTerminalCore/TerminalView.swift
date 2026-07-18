@@ -6,8 +6,11 @@ import IsekaiTerminalCoreLogic
 /// Phase 1D(#18b): ターミナル本画面。SSH接続・VTE画面(`ScreenUpdate`)描画・
 /// 日本語IME統合・特殊キーのアクセサリバーを1画面にまとめる。
 ///
-/// cols/rowsは現時点では固定(80x24)。実際のview sizeやDynamic Type設定に応じた
-/// 動的リサイズ(`SessionOrchestrator.resize(cols:rows:)`は既に存在する)は後続の改善候補。
+/// cols/rowsは接続直後こそ既定(80x24)だが、`TerminalScreenView`が実際のview sizeと
+/// フォントのセルサイズから動的に計算し、`TerminalScreenRepresentable`経由で
+/// `TerminalSessionController.resize(cols:rows:)`(`SessionOrchestrator.resize`)へ
+/// 転送する(タスク#20、Android版`TerminalScreen.kt`の`BoxWithConstraints`+
+/// `LaunchedEffect(cols, rows, connected)`と対称)。
 ///
 /// Phase 1G-2(#54): 複数タブ対応のため、`controller`は外部(`TerminalTabsModel`)から
 /// 注入される(このView自身は構築しない)。接続開始(`connect()`)もタブモデル側の
@@ -403,6 +406,13 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
         view.onHyperlinkTapped = { url in
             pendingHyperlinkURL = url
         }
+        // タスク#20: view bounds/フォントセルサイズから求めたcols/rowsをそのまま
+        // Rust側へ転送する。無駄な送信を避けるかどうかの判断は`SessionCore::resize`側の
+        // 同一値dedupe(#62)に委ねる(Fableレビュー2次: dedupeがRust側に入ったので
+        // Swift側で個別に抑止ロジックを持つ必要はない)。
+        view.onSizeChanged = { [weak controller] cols, rows in
+            controller?.resize(cols: cols, rows: rows)
+        }
         return view
     }
 
@@ -413,6 +423,26 @@ private struct TerminalScreenRepresentable: UIViewRepresentable {
         uiView.selection = selection
         uiView.fontScale = CGFloat(fontScale)
         uiView.scrollOffset = scrollOffset
+
+        // タスク#20: `connect()`は実際のview sizeが判明する前に既定の80x24でセッションを
+        // 開始するため、接続確立(再接続含む)の度に実際のview sizeへ確実に一度合わせ直す
+        // (Android版`LaunchedEffect(cols, rows, connected)`が`connected`もキーに含める
+        // のと同じ理由)。
+        let isConnected: Bool
+        if case .connected = uiState.state { isConnected = true } else { isConnected = false }
+        if isConnected, !context.coordinator.wasConnected {
+            uiView.resendSizeOnConnectionEstablished()
+        }
+        context.coordinator.wasConnected = isConnected
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// `updateUIView`は呼ばれる度に新しいstructとして評価されるため、「直前の
+    /// 接続状態」を跨いで保持するには`UIViewRepresentable.Coordinator`が必要
+    /// (`isConnected`の立ち上がりエッジ検出用、UI表示だけに閉じた状態でrust-ssotの対象外)。
+    final class Coordinator {
+        var wasConnected = false
     }
 }
 

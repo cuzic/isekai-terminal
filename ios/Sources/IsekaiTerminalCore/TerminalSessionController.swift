@@ -438,7 +438,15 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         send(KeySequenceCommands.toBytes(steps, applicationCursorMode: applicationCursorMode))
     }
 
+    /// タスク#20: 動的resize(`TerminalScreenView`がview実サイズから算出したcols/rows)を
+    /// Rust側へ転送する。`lastCols`/`lastRows`もここで更新しておくことで、以後
+    /// `reconnect()`(手動再接続・バックグラウンド復帰)が接続直後の既定値(80x24)ではなく
+    /// 直近の実サイズで再接続できる(codexレビュー指摘: 更新しないと再接続直後だけ
+    /// 一瞬80x24に戻り、`resendSizeOnConnectionEstablished()`で補正されるまで
+    /// 初期プロンプト等が誤った幅で折り返される)。
     public func resize(cols: UInt32, rows: UInt32) {
+        lastCols = cols
+        lastRows = rows
         orchestrator.resize(cols: cols, rows: rows)
     }
 
