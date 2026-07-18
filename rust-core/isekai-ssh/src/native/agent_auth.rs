@@ -122,10 +122,29 @@ pub(crate) async fn connect_agent(
 /// Tries each of `identities` in order against `session` (matching `ssh(1)`
 /// itself: on a per-agent-offered-identity basis, not "give up after the
 /// first"), returning `true` as soon as one is accepted. `Ok(false)` if the
-/// server rejected every identity; `Err` only if `signer` itself failed
-/// (e.g. the agent connection dropped mid-request) — a per-identity
-/// rejection from the *server* is not an error, since trying the next
-/// identity is the whole point.
+/// *server* rejected every identity (each cleanly declined at query time, so
+/// the session stays usable for the next one). `Err` if the *signer/agent*
+/// itself fails on a key — including a per-key refusal
+/// (`AgentAuthError::Key(russh_keys::Error::AgentFailure)`, e.g. a declined
+/// hardware-token touch) as well as the agent connection dropping
+/// (`AgentAuthError::Send`).
+///
+/// **Why a signer error must abort and cannot "try the next key"** (this is
+/// the counter-intuitive part, so don't "fix" it into a `continue`): russh
+/// 0.48.2's session task, once the server answers a key query with `PK_OK`,
+/// blocks in an inner loop that consumes messages until it sees `Msg::Signed`
+/// (`russh/src/client/encrypted.rs`, the `FuturePublicKey` arm). If the signer
+/// returns an error, `authenticate_publickey_with` returns without ever sending
+/// `Msg::Signed`, leaving that task **permanently wedged** on the aborted key —
+/// it silently discards every later message, including the `Msg::Authenticate`
+/// a subsequent `authenticate_with_signer` call would send. Continuing to the
+/// next identity on the same `session` therefore *hangs* rather than moving on
+/// (observed directly: a mock agent that refuses one key deadlocked the whole
+/// test). Recovering a declined key would require a fresh SSH connection, which
+/// is out of this function's scope; a declined agent touch is also the kind of
+/// inherently-interactive case `always-connects.md` exempts. So the honest
+/// behavior is to surface the error and let the connection fail, not to hang
+/// pretending we can offer the next key.
 pub(crate) async fn try_each_identity<H, S>(
     session: &mut client::Handle<H>,
     username: &str,
