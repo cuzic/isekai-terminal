@@ -39,6 +39,11 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
     /// 通常のテキスト確定ではなくCtrl制御バイト(`terminal_ctrl_byte`)として送信する。
     /// 該当する1文字を処理し終えたら自動的にfalseへ戻る(トグル式)。
     public var ctrlArmed: Bool = false
+    /// タスク#63: ハードウェアキーボードの矢印キーが`applicationCursorMode`
+    /// (DECCKM、`ScreenUpdate.applicationCursorMode`)に従ってSS3/CSIを切り替える
+    /// ために必要。`bracketedPasteMode`と同じく、Rust側の状態をそのまま反映する
+    /// だけで新しいミラー状態は作らない(`TerminalView`の`updateUIView`参照)。
+    public var applicationCursorMode: Bool = false
 
     public override init(frame: CGRect) {
         super.init(frame: frame)
@@ -93,6 +98,50 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
             committedText = buffer
         }
         onSendBytes?(Data([0x7F]))
+    }
+
+    // MARK: - タスク#63: ハードウェアキーボードの特殊キー入力経路
+
+    /// `UITextInput`(`insertText`/`deleteBackward`)ではハードウェアキーボードから
+    /// 届かない特殊キー(矢印/Home/End/PageUp/PageDown/Escape/Tab/前方削除/F1〜F12)と、
+    /// 物理Ctrl併用の制御コード送出をここで処理する。認識できなかった/意図的に
+    /// 対象外にしたキー(通常の文字入力・Backspace・IME組成用のOption併用等)は
+    /// `super.pressesBegan`へフォールスルーし、既存の`UITextInput`経路(このview自身の
+    /// `insertText`/`deleteBackward`)にそのまま委ねる(Appleが推奨する「未処理分だけ
+    /// superに渡す」パターン)。
+    public override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandledPresses = presses
+        for press in presses {
+            guard let key = press.key, handleHardwareKeyPress(key) else { continue }
+            unhandledPresses.remove(press)
+        }
+        guard !unhandledPresses.isEmpty else { return }
+        super.pressesBegan(unhandledPresses, with: event)
+    }
+
+    /// 1つの`UIKey`を処理できたら`true`(呼び出し元は該当`UIPress`を消費済み扱いにする)。
+    private func handleHardwareKeyPress(_ key: UIKey) -> Bool {
+        let modifiers = TerminalHardwareKeyMapper.modifiers(for: key.modifierFlags)
+
+        if let specialKey = TerminalHardwareKeyMapper.specialKey(for: key.keyCode) {
+            let bytes = TerminalKeyMapper.bytes(for: specialKey, applicationCursorMode: applicationCursorMode, modifiers: modifiers)
+            guard !bytes.isEmpty else { return false }
+            onSendBytes?(Data(bytes))
+            return true
+        }
+
+        // 物理Ctrl押下(Alt/Cmd併用は除く、二重変換防止)。日本語IME変換中(marked text
+        // が残っている間)は誤発火防止のためフォールスルーする(Android版
+        // `TerminalInputConnection.sendKeyEvent`の`!composing`ガードと同じ方針、
+        // 日本語IME完全対応を壊さないための措置)。
+        if modifiers.ctrl, !modifiers.alt, !modifiers.meta, markedTextRange == nil,
+           let scalar = key.charactersIgnoringModifiers.unicodeScalars.first,
+           let ctrlByte = terminalCtrlByte(codePoint: scalar.value) {
+            onSendBytes?(Data([ctrlByte]))
+            return true
+        }
+
+        return false
     }
 
     // MARK: - UITextInput: marked text

@@ -2340,9 +2340,12 @@ Phase 1D最後の主要ピース。SSH接続・VTE画面描画・日本語IME統
   独立しているため、元の「bufferが空ならBackspaceを無視する」ガードは
   実運用では誤りだった)。
 - **アクセサリバー**: Ctrl(トグル式、次の1文字をCtrl制御バイトに変換)・
-  Esc・Tab・矢印・Home/End/PageUp/PageDownを実装。矢印キーは`TerminalKeyMapper`
-  (Swift版)に`applicationCursorMode`切り替えのAPIが無いため常にCSI形式
-  (既知の制約、将来DECCKM対応する場合はRust関数を直接呼ぶ形へ拡張が必要)。
+  Esc・Tab・矢印・Home/End/PageUp/PageDownを実装。矢印キーは当初`TerminalKeyMapper`
+  (Swift版)に`applicationCursorMode`切り替えのAPIが無いため常にCSI形式だったが、
+  タスク#63(#31で`TerminalKeyMapper.bytes`にmodifiers/applicationCursorMode引数が
+  追加された後)で`controller.uiState.latestScreenUpdate?.applicationCursorMode`
+  (新しいミラー状態を作らずRust側の値をそのまま読む、`TerminalSessionController
+  .sendKeySequence`と同じパターン)を配線し、DECCKMを考慮するよう解消した。
 - **cols/rowsは固定(80x24)**: 実際のview sizeに応じた動的リサイズ
   (`SshSession.resize(cols:rows:)`は既に存在する)は後続の改善候補。
 - **テスト**: `TerminalSessionControllerTests`(TOFUロジックを実接続なしで検証)・
