@@ -5,7 +5,7 @@
 //! shared `isekai_fs_guard` crate and is re-exported below, so this crate's
 //! connect path and `isekai-bootstrap`'s `RusshBackend` can't drift on the
 //! `ssh(1)` default probe order again. What stays here is the *loading* half
-//! (`readable_credentials`) — reading each candidate off disk into a
+//! (`read_credential`) — reading a single candidate off disk into a
 //! `russh_stream_session::Credential`, which the shared crate deliberately
 //! doesn't depend on.
 //!
@@ -15,10 +15,11 @@
 //! observable failure `russh_stream_session::SessionError::InvalidPrivateKey`
 //! already produces for any other malformed key.
 
-use std::path::PathBuf;
+use std::path::Path;
 
-use anyhow::{Context, Result};
 use russh_stream_session::Credential;
+
+use crate::log_file::log_line;
 
 /// The `IdentityFile` candidate ordering — the pure path-selection half of
 /// `ssh(1)`'s `IdentityFile` handling, shared with `isekai-bootstrap`'s
@@ -27,41 +28,40 @@ use russh_stream_session::Credential;
 /// through this re-export.
 pub(crate) use isekai_fs_guard::identity_file_candidates;
 
-/// Reads *every* candidate in `candidates` that exists on disk, in order,
-/// returning each as a [`Credential::PublicKey`]. The caller
-/// (`connect_and_authenticate` → `russh_stream_session::authenticate_session`)
-/// is what actually parses and validates the key material, so a candidate
-/// that exists but isn't a valid/decryptable OpenSSH private key is still
-/// returned here and only fails later, at its own authentication attempt
-/// (surfaced as `SessionError::InvalidPrivateKey`, not from this function).
+/// Reads one candidate identity file into a [`Credential::PublicKey`], or
+/// returns `None` if it can't be read. **Never fatal, and never eager**: the
+/// caller (`connect_and_authenticate`) reads candidates one at a time,
+/// interleaved with the authentication attempt, and on `None` simply falls
+/// through to the next candidate — and then the SSH agent. A missing file
+/// (`NotFound`, the common "this default probe path doesn't exist" case) is
+/// skipped silently; any other read error (a permissions problem, or the path
+/// not being a regular file) is skipped with a warning, matching `ssh(1)`'s
+/// own tolerance of an unreadable `IdentityFile` — it warns and moves on
+/// rather than aborting.
 ///
-/// Returns all readable candidates rather than just the first (Codex review
-/// finding): `ssh(1)` offers every configured `IdentityFile` to the server
-/// in turn, so a first identity that exists but is *rejected* by the server
-/// (unauthorized) or fails to *parse* (e.g. passphrase-protected) must not
-/// block the remaining configured identities — nor the SSH-agent fallback.
-/// The previous "first existing file wins" behavior silently dropped every
-/// identity after the first one present on disk.
+/// Codex review finding: an earlier version eagerly read *all* candidates up
+/// front and propagated any non-`NotFound` read error, so a permissions
+/// problem on a *later* configured `IdentityFile` aborted the whole
+/// authentication before the perfectly-readable *first* one was ever tried.
+/// Reading lazily, one candidate at a time, and skipping *every* read error
+/// removes that failure mode (and the `NotFound`-vs-other special-casing).
 ///
-/// Reads each candidate directly rather than `exists()`-checking first
-/// (Codex review finding): a separate `exists()` call before `read()` is
-/// both an extra filesystem round-trip for every candidate that *is*
-/// present, and a TOCTOU gap (the file could vanish between the check and
-/// the read) — treating a `NotFound` read error as "skip this candidate"
-/// gets the same skip-if-missing behavior from a single syscall per
-/// candidate instead of up to two. A non-`NotFound` read error on a file
-/// that *does* exist (e.g. a permissions problem) is surfaced rather than
-/// silently skipped.
-pub(crate) fn readable_credentials(candidates: &[PathBuf]) -> Result<Vec<Credential>> {
-    let mut credentials = Vec::new();
-    for path in candidates {
-        match std::fs::read(path) {
-            Ok(private_key_pem) => credentials.push(Credential::PublicKey { private_key_pem }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("failed to read identity file {}", path.display())),
+/// Reads directly rather than `exists()`-checking first: a separate `exists()`
+/// call is both an extra filesystem round-trip and a TOCTOU gap — a single
+/// `read()` whose error is treated as "skip" gets the same behavior in one
+/// syscall. Parsing/validating the key material is the caller's job
+/// (`authenticate_session`), so a file that reads fine but isn't a
+/// valid/decryptable OpenSSH key is still returned here and only fails later,
+/// at its own auth attempt (`SessionError::InvalidPrivateKey`).
+pub(crate) fn read_credential(path: &Path) -> Option<Credential> {
+    match std::fs::read(path) {
+        Ok(private_key_pem) => Some(Credential::PublicKey { private_key_pem }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            log_line!("isekai-ssh: skipping unreadable identity file {}: {e}", path.display());
+            None
         }
     }
-    Ok(credentials)
 }
 
 #[cfg(test)]
@@ -69,52 +69,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn readable_credentials_skips_missing_candidates() {
+    fn read_credential_reads_an_existing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does-not-exist");
         let present = dir.path().join("id_ed25519");
         std::fs::write(&present, b"fake key bytes\n").unwrap();
 
-        let credentials = readable_credentials(&[missing, present.clone()]).unwrap();
-        assert_eq!(credentials.len(), 1, "the one missing candidate must be skipped, the present one kept");
-        match &credentials[0] {
+        // `Credential` implements `Drop` (zeroizes), so match by reference
+        // rather than moving `private_key_pem` out of it.
+        let credential = read_credential(&present).expect("a readable file must yield Some(Credential)");
+        match &credential {
             Credential::PublicKey { private_key_pem } => {
                 assert_eq!(*private_key_pem, std::fs::read(&present).unwrap());
             }
-            _ => panic!("expected Credential::PublicKey"),
+            _ => panic!("expected Credential::PublicKey for a readable file"),
         }
     }
 
     #[test]
-    fn readable_credentials_returns_empty_when_nothing_exists() {
+    fn read_credential_returns_none_for_a_missing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let candidates = vec![dir.path().join("a"), dir.path().join("b")];
-        let credentials = readable_credentials(&candidates).unwrap();
-        assert!(credentials.is_empty(), "no existing candidate means no credentials to offer");
+        assert!(read_credential(&dir.path().join("does-not-exist")).is_none());
     }
 
     #[test]
-    fn readable_credentials_returns_all_present_candidates_in_order() {
-        // Regression for the "only the first IdentityFile is ever tried" bug:
-        // every existing candidate must be returned, in the configured order,
-        // so `connect_and_authenticate` can offer each in turn (a rejected or
-        // unparseable first key no longer blocks the rest).
+    fn read_credential_returns_none_for_an_unreadable_non_file() {
+        // A directory reliably produces a non-`NotFound` read error regardless
+        // of the test's uid (a chmod-000 file is still readable as root, which
+        // CI often runs as), standing in for "exists but can't be read as a
+        // key". Must be skipped, not fatal (Codex review finding).
         let dir = tempfile::tempdir().unwrap();
-        let first = dir.path().join("id_ed25519");
-        let second = dir.path().join("id_rsa");
-        std::fs::write(&first, b"ed25519 bytes\n").unwrap();
-        std::fs::write(&second, b"rsa bytes\n").unwrap();
-
-        let credentials = readable_credentials(&[first.clone(), second.clone()]).unwrap();
-        assert_eq!(credentials.len(), 2, "both present candidates must be returned");
-        let pems: Vec<&Vec<u8>> = credentials
-            .iter()
-            .map(|c| match c {
-                Credential::PublicKey { private_key_pem } => private_key_pem,
-                _ => panic!("expected Credential::PublicKey"),
-            })
-            .collect();
-        assert_eq!(*pems[0], std::fs::read(&first).unwrap(), "first candidate must come first");
-        assert_eq!(*pems[1], std::fs::read(&second).unwrap(), "second candidate must come second");
+        let not_a_file = dir.path().join("id_is_a_dir");
+        std::fs::create_dir(&not_a_file).unwrap();
+        assert!(read_credential(&not_a_file).is_none(), "an unreadable candidate must be skipped, not fatal");
     }
 }

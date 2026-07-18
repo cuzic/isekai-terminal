@@ -358,7 +358,15 @@ where
 
     let home = isekai_fs_guard::resolve_home_dir().unwrap_or_else(|| PathBuf::from("."));
     let candidates = private_key::identity_file_candidates(&host_config.identity_file, &home);
-    for credential in private_key::readable_credentials(&candidates)? {
+    // Read + authenticate one candidate at a time, lazily (Codex review
+    // finding): an unreadable/unusable candidate — missing, permission-denied,
+    // or unparseable — is skipped, never fatal, so it can't block a
+    // perfectly-good candidate listed before *or* after it, nor the SSH-agent
+    // fallback below. Only a genuine transport/protocol error aborts.
+    for candidate in &candidates {
+        let Some(credential) = private_key::read_credential(candidate) else {
+            continue;
+        };
         match authenticate_session(&mut handle, username, &credential).await {
             Ok(true) => return Ok(handle),
             Ok(false) => continue,
@@ -873,6 +881,50 @@ mod tests {
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
         assert!(result.is_ok(), "an unparseable first identity (InvalidPrivateKey) must not block the valid second one");
+    }
+
+    /// Codex review finding (regression in the first-cut #11 fix): an
+    /// *unreadable* candidate — here a directory, which reliably fails to
+    /// `read()` as a non-`NotFound` error regardless of uid — used to be read
+    /// eagerly and its error propagated, aborting the whole attempt. Listed
+    /// *after* a readable, accepted key it must never even be reached, so this
+    /// must authenticate via the first key. (A directory stands in for a
+    /// permission-denied file because CI often runs as root, where a chmod-000
+    /// file is still readable.)
+    #[tokio::test]
+    async fn connect_and_authenticate_succeeds_via_first_key_when_a_later_candidate_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first_key, first_pub) = write_ed25519_identity(dir.path(), "id_first", 74);
+        let unreadable = dir.path().join("id_unreadable");
+        std::fs::create_dir(&unreadable).unwrap();
+        let addr = spawn_server(AcceptOneKeyServer { accepted: first_pub }, 207).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![first_key, unreadable], ..Default::default() };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
+        assert!(
+            result.is_ok(),
+            "a readable, accepted first key must authenticate; an unreadable *later* candidate must not abort the attempt"
+        );
+    }
+
+    /// The mirror case: an unreadable *first* candidate must be skipped so a
+    /// readable, accepted second candidate still authenticates — the lazy
+    /// read+auth loop tolerates an unreadable identity in any position.
+    #[tokio::test]
+    async fn connect_and_authenticate_skips_an_unreadable_first_candidate_and_tries_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("id_unreadable");
+        std::fs::create_dir(&unreadable).unwrap();
+        let (valid_key, valid_pub) = write_ed25519_identity(dir.path(), "id_valid", 75);
+        let addr = spawn_server(AcceptOneKeyServer { accepted: valid_pub }, 208).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![unreadable, valid_key], ..Default::default() };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
+        assert!(result.is_ok(), "an unreadable first candidate must be skipped, then the valid second one authenticates");
     }
 
     /// The cheap, reliable branch of the "always-connects" recovery
