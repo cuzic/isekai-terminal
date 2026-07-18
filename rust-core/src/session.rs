@@ -55,6 +55,8 @@ fn make_screen_update(t: &Terminal) -> ScreenUpdate {
         cursor_shape: t.cursor_shape(),
         cursor_blink: t.cursor_blink(),
         link_table: t.link_table().to_vec(),
+        images: t.images().to_vec(),
+        kitty_keyboard_flags: t.kitty_keyboard_flags(),
     }
 }
 

@@ -4,6 +4,7 @@ pub mod trzsz;
 pub mod quic_transport;
 pub(crate) mod agent_forward;
 pub(crate) mod terminal;
+pub(crate) mod sixel;
 pub(crate) mod theme;
 pub(crate) mod transport;
 pub(crate) mod pool;
@@ -729,6 +730,48 @@ pub enum MouseReportingMode {
     AnyEvent,
 }
 
+/// Sixel(`DCS Pa;Pb;Ph q ... ST`、タスク#42)でデコードされた画像1枚の配置情報。
+/// `Terminal`(rust-core)がデコード・配置・寿命管理を一元的に行う(rust-ssot:
+/// Android/iOSはこの構造体が指す矩形へ`rgba`をそのままビットマップ描画するだけで
+/// よく、「どこに何ピクセルの画像が乗っているか」を判断するロジックをKotlin/Swift
+/// 側にミラーしない)。
+///
+/// `row`/`col`は画像の左上が乗っている`ScreenUpdate.cells`上のセル座標
+/// (0-indexed)。`rows_span`/`cols_span`は画像が占めるセル数——実ピクセルサイズ
+/// (`width_px`/`height_px`)を、VT340由来の名目セルサイズ(`terminal.rs`の
+/// `SIXEL_CELL_WIDTH_PX`/`SIXEL_CELL_HEIGHT_PX`、実フォントのピクセルサイズを
+/// このRustコアは知らないため固定値で近似)で割って算出した近似値。呼び出し側は
+/// 実際のフォントの`cols_span`×`rows_span`分のセル矩形へ`rgba`(実ピクセルサイズ
+/// `width_px`×`height_px`)を引き伸ばして描画すればよい。
+///
+/// `id`はこの`Terminal`インスタンス内でのみ一意な単調増加id(`u64`が尽きるまで
+/// 再利用しない、RIS後もカウンタ自体はリセットしない——過去にキャッシュされた
+/// idと衝突させないため)。呼び出し側は前回の`ScreenUpdate.images`との差分を
+/// 自前で判断する必要はなく、常に「今回のリストが現在アクティブな画像の全て」
+/// として扱い、そのまま描画すればよい(rust-ssot: 消去・スクロールによる立ち退き
+/// 等の寿命管理判断はTerminal側で完結しており、UI層は宣言的にリストを反映する
+/// だけでよい)。
+///
+/// スコープ外(実装時点の既知の簡略化、Sixel対応の初版):
+/// - 画像は現在の画面(main/alt)全体のスクロール・IL/DL・リサイズ・alt画面切替・
+///   全画面消去(ED、`CSI 2J`/`CSI 3J`)のいずれかが起きると無条件に消去される
+///   (誤った位置に取り残されるより、消える方が安全側という判断)。部分消去
+///   (ED0/ED1、EL、ECH等)では画像は消えない。
+/// - Sixel描画によって画面が下端を超えて自動スクロールすることはない(画像は
+///   画面下端でクリップされる)。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ImagePlacement {
+    pub id: u64,
+    pub row: u32,
+    pub col: u32,
+    pub rows_span: u32,
+    pub cols_span: u32,
+    pub width_px: u32,
+    pub height_px: u32,
+    /// RGBA8888、row-major、左上原点。`width_px * height_px * 4`バイト。
+    pub rgba: Vec<u8>,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ScreenUpdate {
     pub cols: u32,
@@ -773,6 +816,27 @@ pub struct ScreenUpdate {
     /// 過去セルが別のURLを指す破損になる(`terminal.rs`の`link_table`フィールド
     /// docコメント参照)。
     pub link_table: Vec<String>,
+    /// Sixel(タスク#42)で現在アクティブな画像配置の一覧。詳細は[ImagePlacement]参照。
+    pub images: Vec<ImagePlacement>,
+    /// Kitty keyboard protocol(タスク#54、
+    /// <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>)でnegotiateされた
+    /// 現在有効なprogressive enhancement flagsのビットマスク。既定は`0`
+    /// (legacy mode、拡張無効)。ビットの意味:
+    /// `0b00001`=disambiguate escape codes、`0b00010`=report event types
+    /// (press/repeat/release)、`0b00100`=report alternate keys(shifted/base
+    /// layout)、`0b01000`=report all keys as escape codes、`0b10000`=report
+    /// associated text。
+    ///
+    /// この`Terminal`(rust-core)が担うのはリモートが送ってくる`CSI > flags u`
+    /// (push)/`CSI < Pn u`(pop)/`CSI = flags ; mode u`(set)/`CSI ? u`(query、
+    /// 応答も自動で行う)を解釈してこの値を保持・公開するところまで(main/alt画面
+    /// ごとに独立したflagsスタックを持つ、仕様通りの挙動)。**実際のキーイベントの
+    /// エンコード(この値に応じてCSI `u`形式で送るかレガシー形式で送るか)は
+    /// このRustコアではなくUI層(Kotlin/Swift)のキーエンコーダーが行う**——
+    /// `application_cursor_mode`(#29の修飾キーCSIエンコード)と同じ役割分担で、
+    /// rust-ssot上「今どのflagsがnegotiateされているか」の判断・保持だけをRust側
+    /// に一元化する(Kotlin/Swift側にミラー状態は作らない)。
+    pub kitty_keyboard_flags: u16,
 }
 
 // ── New orchestrator public types ────────────────────────

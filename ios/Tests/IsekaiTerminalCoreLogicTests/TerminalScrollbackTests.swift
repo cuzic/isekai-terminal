@@ -31,7 +31,7 @@ final class TerminalScrollbackTests: XCTestCase {
             applicationCursorMode: true, bracketedPasteMode: true,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: cursorVisible, bellGeneration: bellGeneration,
-            cursorShape: cursorShape, cursorBlink: cursorBlink, linkTable: []
+            cursorShape: cursorShape, cursorBlink: cursorBlink, linkTable: [], images: [], kittyKeyboardFlags: 0
         )
     }
 

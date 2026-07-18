@@ -92,6 +92,7 @@ class SshTerminalCanvasTest {
     private fun screenUpdate() = ScreenUpdate(
         80u, 24u, emptyList(), 0u, 0u, null, false, false,
         MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(),
+        emptyList(), 0u,
     )
 
     // ── FontFitCache: セル寸法/typefaceが変わったときだけ再計測が必要 ──────────
@@ -164,5 +165,44 @@ class SshTerminalCanvasTest {
         cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE)
         cache.invalidate()
         assertTrue(cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE))
+    }
+
+    // ── SixelBitmapCache(タスク#42) ──────────────────────────────
+
+    private fun imagePlacement(id: ULong, w: Int = 1, h: Int = 1) = uniffi.isekai_terminal_core.ImagePlacement(
+        id = id, row = 0u, col = 0u, rowsSpan = 1u, colsSpan = 1u,
+        widthPx = w.toUInt(), heightPx = h.toUInt(),
+        rgba = ByteArray(w * h * 4) { 0xFF.toByte() },
+    )
+
+    @Test
+    fun `SixelBitmapCache decodes a bitmap for each distinct id`() {
+        val cache = SixelBitmapCache()
+        val images = listOf(imagePlacement(1u), imagePlacement(2u))
+        val bitmaps = cache.bitmapsFor(images)
+        assertEquals(2, bitmaps.size)
+        assertTrue(bitmaps.containsKey(1u.toULong()))
+        assertTrue(bitmaps.containsKey(2u.toULong()))
+    }
+
+    @Test
+    fun `SixelBitmapCache reuses the same Bitmap instance for an id seen again`() {
+        val cache = SixelBitmapCache()
+        val placement = imagePlacement(1u)
+        val first = cache.bitmapsFor(listOf(placement))[1u.toULong()]
+        val second = cache.bitmapsFor(listOf(placement))[1u.toULong()]
+        assertTrue("同じidなら再デコードせず同一Bitmapインスタンスを返すこと", first === second)
+    }
+
+    @Test
+    fun `SixelBitmapCache drops entries whose id is no longer live`() {
+        val cache = SixelBitmapCache()
+        cache.bitmapsFor(listOf(imagePlacement(1u), imagePlacement(2u)))
+        val after = cache.bitmapsFor(listOf(imagePlacement(2u)))
+        assertEquals(
+            "Rust側のScreenUpdate.imagesに出てこなくなったidはキャッシュから捨てられること",
+            setOf(2u.toULong()),
+            after.keys,
+        )
     }
 }

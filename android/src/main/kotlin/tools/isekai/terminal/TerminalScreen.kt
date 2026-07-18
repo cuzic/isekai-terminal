@@ -348,6 +348,12 @@ fun TerminalScreenBody(
                                 cursorShape = update.cursorShape,
                                 cursorBlink = update.cursorBlink,
                                 linkTable = update.linkTable,
+                                // Sixel(タスク#42): scrollback表示中はライブ画面の画像配置を
+                                // 引き継がない(scrollbackセル自体は画像を保持しないテキスト
+                                // のみのスナップショットのため、cursorVisible相当の考え方で
+                                // 画像も非表示にする)。
+                                images = emptyList(),
+                                kittyKeyboardFlags = update.kittyKeyboardFlags,
                             )
                         } else update
                     } else update

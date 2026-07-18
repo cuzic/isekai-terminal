@@ -1,7 +1,22 @@
 use std::collections::HashMap;
 use vte::Perform;
+use crate::sixel::{SixelDecoder, SixelImage};
 use crate::theme::Theme;
-use crate::{CursorShape, MouseReportingMode, TerminalKeyModifiers};
+use crate::{CursorShape, ImagePlacement, MouseReportingMode, TerminalKeyModifiers};
+
+/// Sixel(タスク#42)の名目セルサイズ(ピクセル)。実フォントのピクセルサイズは
+/// このRustコアには分からない(Android/iOSの実描画レイヤーのみが知っている)ため、
+/// VT340由来の名目値で近似する——アスペクト比(1:2)は一般的なmonospaceフォントの
+/// セル比に近く、`ImagePlacement::rows_span`/`cols_span`の見た目上の破綻を避ける
+/// 目的で選んだ固定値であり、実ピクセル座標としては使わない(`ImagePlacement`の
+/// docコメント参照)。
+const SIXEL_CELL_WIDTH_PX: usize = 10;
+const SIXEL_CELL_HEIGHT_PX: usize = 20;
+/// 同時にライブな(まだ寿命が尽きていない)Sixel画像の上限。スクロール等が起きず
+/// 同じ場所へ画像を上書きし続けるだけのストリーム(dedupeせず`images`へpushし
+/// 続ける)でメモリが無制限に増えるのを防ぐ——上限に達したら最も古いものを
+/// 1つ捨てる(`SCROLLBACK_LIMIT`と同種の素朴なキャップ、`session.rs`参照)。
+const MAX_LIVE_IMAGES: usize = 32;
 
 /// `38;5;n` / `48;5;n`（indexed color）を ARGB へ解決する。
 /// `0..=15` は現在のテーマの ANSI 16色テーブルを参照する（それ以外は固定の 216色/グレースケール）。
@@ -376,7 +391,50 @@ pub(crate) struct Terminal {
     /// 飛び越さないという既存挙動には影響しない)。HT(0x09)/CHT(`CSI Ps I`)/
     /// CBT(`CSI Ps Z`)は`next_tab_stop`/`prev_tab_stop`経由でこの状態を参照する。
     tab_stops: Vec<bool>,
+    /// Sixel(`DCS Pa;Pb;Ph q ... ST`、タスク#42)を`hook`〜`unhook`の間デコード中の
+    /// 状態。`hook`で`c == 'q'`の時のみ`Some`になり、`unhook`で`take()`されて
+    /// 消費される(sixel以外のDCS、例えば将来のReGIS等は無視するため`None`のまま)。
+    sixel_decoder: Option<SixelDecoder>,
+    /// 現在アクティブな画像配置。`ScreenUpdate::images`としてそのまま公開する
+    /// (`session.rs::make_screen_update`参照)。寿命管理の詳細は
+    /// [Terminal::clear_images]・[Terminal::place_sixel_image]参照。
+    images: Vec<ImagePlacement>,
+    /// 次に発行する画像id。RIS(`reset_all`)でも**リセットしない**——`link_table`と
+    /// 同じ理由で、過去に呼び出し側へ渡したidを再利用すると別画像との衝突が
+    /// 起こりうるため単調増加を保つ。
+    next_image_id: u64,
+    /// Kitty keyboard protocol(タスク#54、
+    /// <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>)の progressive
+    /// enhancement flags スタック(main画面用)。各要素はその時点でpushされた
+    /// flagsのビットマスク(bit0=disambiguate escape codes、bit1=report event
+    /// types、bit2=report alternate keys、bit3=report all keys as escape
+    /// codes、bit4=report associated text)。「現在有効なflags」はスタック最上段
+    /// (空なら0=legacy mode)——実際のキーエンコード(どのCSI `u`形式で送るか)は
+    /// このRustコアではなくKotlin/Swift側のUIエンコーダーが行う(#29の修飾キー
+    /// CSIエンコードと同じ役割分担)。このコアが担うのは、リモートが送ってくる
+    /// push/pop/set/queryシーケンス(`csi_dispatch`の`u`分岐参照)を解釈して
+    /// 現在のnegotiated flagsを`ScreenUpdate::kitty_keyboard_flags`として公開する
+    /// ところまで(rust-ssot: 「どのflagsが有効か」の判断・保持はRust側に一元化し、
+    /// Kotlin/Swift側にミラー状態は作らない)。
+    ///
+    /// mainとaltで**独立したスタック**を持つ(仕様: "The main and alternate
+    /// screens in the terminal emulator must maintain their own, independent,
+    /// keyboard mode stacks"、Fable 2次レビュー指摘)。`switch_to_alt`/
+    /// `switch_to_main`は`cells()`/`cells_mut()`と同様`alt_active`で参照先を
+    /// 切り替えるだけでよく、切替自体で中身を保存/復元する必要はない
+    /// (`main_cells`/`alt_cells`と同型のパターン)。
+    main_kitty_flags_stack: Vec<u16>,
+    /// [Terminal::main_kitty_flags_stack]のalt画面版。
+    alt_kitty_flags_stack: Vec<u16>,
 }
+
+/// Kitty keyboard protocolのflagsスタック(タスク#54)の最大深さ。仕様は
+/// 具体的な上限値を規定していない("Terminals should limit the size of the
+/// stack as appropriate")ため、他の主要実装が採用する保守的な値に倣う。
+/// 上限を超えるpushは最も古いエントリ(index 0)を追い出す(仕様: "If a push
+/// request is received and the stack is full, the oldest entry from the
+/// stack must be evicted")。
+const KITTY_KEYBOARD_STACK_MAX: usize = 8;
 
 /// 既定のタブストップパターン(8列おき、列0を含む)を`cols`幅分生成する。
 /// `Terminal::new`・`reset_all`(RIS)・`resize_preserving_state`(新しく増えた列分)
@@ -491,6 +549,11 @@ impl Terminal {
             link_table: Vec::new(),
             link_ids: HashMap::new(),
             tab_stops,
+            sixel_decoder: None,
+            images: Vec::new(),
+            next_image_id: 0,
+            main_kitty_flags_stack: Vec::new(),
+            alt_kitty_flags_stack: Vec::new(),
         }
     }
 
@@ -560,6 +623,72 @@ impl Terminal {
     /// の値はこのスライスのindex。`session.rs::make_screen_update`が
     /// `ScreenUpdate::link_table`として丸ごと公開する。
     pub(crate) fn link_table(&self) -> &[String] { &self.link_table }
+    /// Sixel(タスク#42)で現在アクティブな画像配置の一覧。`session.rs::make_screen_update`
+    /// が`ScreenUpdate::images`としてそのまま公開する。
+    pub(crate) fn images(&self) -> &[ImagePlacement] { &self.images }
+
+    /// 現在アクティブな画面(main/alt)のKitty keyboard flagsスタック(タスク#54)。
+    /// `cells()`/`cells_mut()`と同じ「`alt_active`でどちらのスロットを使うか選ぶ」
+    /// パターン。
+    fn kitty_flags_stack(&self) -> &Vec<u16> {
+        if self.alt_active { &self.alt_kitty_flags_stack } else { &self.main_kitty_flags_stack }
+    }
+
+    fn kitty_flags_stack_mut(&mut self) -> &mut Vec<u16> {
+        if self.alt_active { &mut self.alt_kitty_flags_stack } else { &mut self.main_kitty_flags_stack }
+    }
+
+    /// Kitty keyboard protocol(タスク#54)の現在有効なnegotiated flags(スタック
+    /// 最上段、空なら0=legacy mode)。`session.rs::make_screen_update`が
+    /// `ScreenUpdate::kitty_keyboard_flags`としてそのまま公開する——実際のキー
+    /// エンコード判断はUI層(Kotlin/Swift)がこの値を見て行う([Terminal]の
+    /// `main_kitty_flags_stack`フィールドdocコメント参照)。
+    pub(crate) fn kitty_keyboard_flags(&self) -> u16 {
+        self.kitty_flags_stack().last().copied().unwrap_or(0)
+    }
+
+    /// 現在アクティブな画像配置を全て消去する。呼び出し元は「画面内容が大きく
+    /// 変わり、既存の画像配置がもはや正しい位置を指しているとは言えなくなる
+    /// 操作」の直後に呼ぶ(RIS・スクロール・IL/DL・リサイズ・alt画面切替。
+    /// `ImagePlacement`のdocコメントの「スコープ外」参照——誤った位置に画像が
+    /// 取り残されるより消える方が安全側という判断)。
+    fn clear_images(&mut self) {
+        self.images.clear();
+    }
+
+    /// デコードが完了したSixelビットマップを、現在のカーソル位置を左上として
+    /// グリッドへ配置する(タスク#42)。行・列方向とも画面の残りサイズへクランプする
+    /// (`ImagePlacement`のdocコメント「実装範囲」参照——画像による自動スクロールは
+    /// 発生させず、画面下端でクリップする)。
+    fn place_sixel_image(&mut self, img: SixelImage) {
+        let col = self.cursor_col.min(self.cols.saturating_sub(1));
+        let row = self.cursor_row.min(self.rows.saturating_sub(1));
+        let cols_span = (img.width + SIXEL_CELL_WIDTH_PX - 1) / SIXEL_CELL_WIDTH_PX;
+        let rows_span = (img.height + SIXEL_CELL_HEIGHT_PX - 1) / SIXEL_CELL_HEIGHT_PX;
+        let cols_span = cols_span.max(1).min(self.cols - col);
+        let rows_span = rows_span.max(1).min(self.rows - row);
+
+        let id = self.next_image_id;
+        self.next_image_id = self.next_image_id.wrapping_add(1);
+        self.images.push(ImagePlacement {
+            id,
+            row: row as u32,
+            col: col as u32,
+            rows_span: rows_span as u32,
+            cols_span: cols_span as u32,
+            width_px: img.width as u32,
+            height_px: img.height as u32,
+            rgba: img.rgba,
+        });
+        if self.images.len() > MAX_LIVE_IMAGES {
+            self.images.remove(0);
+        }
+
+        // カーソルは画像の左下(次行の先頭)へ移動する(近似——実端末実装は分かれる
+        // が、xterm等広く使われる実装の挙動に合わせる)。
+        self.cursor_row = (row + rows_span).min(self.rows.saturating_sub(1));
+        self.cursor_col = 0;
+    }
 
     /// HT(0x09)/CHT(`CSI Ps I`、タスク#61)共通: `col`より右にある最も近いタブストップを
     /// 返す。存在しなければ最終列(`cols - 1`)。`col`が`cols`(delayed wrapによる
@@ -625,6 +754,15 @@ impl Terminal {
         self.active_link_id = None;
         // RIS(`ESC c`)はタブストップも既定(8列おき)へ戻す(実端末の挙動、タスク#61)。
         self.tab_stops = default_tab_stops(self.cols);
+        // Sixel(タスク#42): RISは画面内容自体を全消去するため、画像配置も道連れに
+        // 消す(`next_image_id`自体はリセットしない、[Terminal]のdocコメント参照)。
+        self.clear_images();
+        // Kitty keyboard protocol(タスク#54): RISはmain/alt両方のflagsスタックを
+        // 空(legacy mode)へ戻す。他のDECモード([mouse_reporting_mode]等)と同じく
+        // RISはセッション全体の状態を初期化する操作なので、main/alt独立という
+        // 仕様上の制約とは矛盾しない(両方を初期化するだけ)。
+        self.main_kitty_flags_stack.clear();
+        self.alt_kitty_flags_stack.clear();
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -783,6 +921,10 @@ impl Terminal {
 
         self.cols = new_cols;
         self.rows = new_rows;
+        // Sixel(タスク#42): 実際にサイズが変わった場合のみ到達する(直前の早期returnで
+        // 同一サイズは弾かれている)ため、行の入れ替え・切り詰めで既存の画像配置の
+        // row/colが指す内容が変わり得る——`clear_images`docコメントの理由で単純に消す。
+        self.clear_images();
     }
 
     /// [resize_preserving_state] のグリッド(cols×rows のセル配列)1つ分のリサイズを行う。
@@ -856,6 +998,9 @@ impl Terminal {
         // またいで持ち越さない(`SavedCursor`の保存対象にも含めない——xterm等の
         // 実装がリンクの下線状態を画面切替で引き継がないのに倣う)。
         self.active_link_id = None;
+        // Sixel(タスク#42): 画像はmain/alt画面ごとに別々に管理しない(スコープ外、
+        // [Terminal::clear_images]docコメント参照)——切替のたびに単純に消去する。
+        self.clear_images();
     }
 
     fn switch_to_main(&mut self, restore_cursor: bool) {
@@ -872,6 +1017,7 @@ impl Terminal {
             }
         }
         self.active_link_id = None;
+        self.clear_images();
     }
 
     /// DECSC(`ESC 7`)およびCSI `s`(ANSI.SYS方言、DECLRMM未実装のためintermediate無しの
@@ -917,6 +1063,10 @@ impl Terminal {
     }
 
     fn scroll_up_region(&mut self, n: usize) {
+        // Sixel(タスク#42): スクロールは画像が乗っていたグリッド位置の内容を
+        // 別の内容へ置き換えるため、既存の画像配置は無条件に消す(`clear_images`
+        // docコメント参照)。
+        self.clear_images();
         let top = self.scroll_top;
         let bot = self.scroll_bottom;
         let n = n.min(bot - top + 1);
@@ -956,6 +1106,7 @@ impl Terminal {
     /// (`n == region_size`)場合はシフトループ自体をスキップする — `bot - n`を
     /// `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため。
     fn scroll_down_region(&mut self, n: usize) {
+        self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
         let top = self.scroll_top;
         let bot = self.scroll_bottom;
         let region_size = bot - top + 1;
@@ -996,6 +1147,7 @@ impl Terminal {
         let top = self.cursor_row;
         let bot = self.scroll_bottom;
         if top < self.scroll_top || top > bot { return; }
+        self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
         let region_size = bot - top + 1;
         let n = n.min(region_size);
         let cols = self.cols;
@@ -1030,6 +1182,7 @@ impl Terminal {
         let top = self.cursor_row;
         let bot = self.scroll_bottom;
         if top < self.scroll_top || top > bot { return; }
+        self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
         let region_size = bot - top + 1;
         let n = n.min(region_size);
         let cols = self.cols;
@@ -1622,6 +1775,74 @@ impl Perform for Terminal {
         let p0 = ps.get(0).copied().unwrap_or(0);
         let p1 = ps.get(1).copied().unwrap_or(0);
 
+        // Kitty keyboard protocol(タスク#54、`CSI > flags u`push/`CSI < Pn u`pop/
+        // `CSI = flags ; mode u`set/`CSI ? u`query)。DECSCUSR/DA/DSRと同様、
+        // action(`u`)だけでなくintermediatesを明示的に見て`is_dec`分岐より前に
+        // 横取りする必要がある——理由は2つ:
+        // 1. `CSI ? u`は`intermediates == [b'?']`なので、これより後にある`is_dec`
+        //    分岐(`?`のみを見る)に先に捕まると無条件`return`(1788行目付近)で
+        //    無応答のまま握りつぶされる(DECモードクエリと誤認、Fableレビュー
+        //    指摘と同種の中間バイト分岐漏れ)。
+        // 2. intermediatesを見ない既存の`match action { 'u' => restore_cursor_decrc() }`
+        //    (下の総合`match action`ブロック内)は、`>`/`<`/`=`付きの`u`もCSI u
+        //    (ANSI.SYS方言のrestore cursor、タスク#57)として誤処理してしまう。
+        //
+        // フラグスタックはmain/alt画面ごとに独立して保持する(仕様: "The main and
+        // alternate screens...must maintain their own, independent, keyboard mode
+        // stacks"、`kitty_flags_stack`/`kitty_flags_stack_mut`が`alt_active`で
+        // 参照先を切り替える)。
+        if action == 'u' && intermediates == [b'>'] {
+            // Push: 新しいエントリ(既定flags=0)をスタック最上段に積む。上限に
+            // 達している場合は最も古いエントリ(index 0)を追い出す(仕様通り)。
+            let flags = p0;
+            let stack = self.kitty_flags_stack_mut();
+            if stack.len() >= KITTY_KEYBOARD_STACK_MAX {
+                stack.remove(0);
+            }
+            stack.push(flags);
+            return;
+        }
+        if action == 'u' && intermediates == [b'<'] {
+            // Pop: 既定1エントリ。要求数がスタックの深さを超えてもpanicせず、
+            // 空になるだけ(仕様: 空になれば有効flagsは0=legacy modeへ戻る、
+            // `kitty_keyboard_flags`のフォールバックがそのまま実現する)。
+            let n = (p0.max(1) as usize).min(self.kitty_flags_stack().len());
+            let stack = self.kitty_flags_stack_mut();
+            let new_len = stack.len() - n;
+            stack.truncate(new_len);
+            return;
+        }
+        if action == 'u' && intermediates == [b'='] {
+            // Set: 現在のトップエントリのflagsを`mode`(既定1)に応じて更新する。
+            // 1=丸ごと置換、2=指定ビットをOR(セット)、3=指定ビットをAND NOT
+            // (クリア)。仕様は「スタックが空の状態でSetされた場合」を明記して
+            // いないため、pushと同様に新しいエントリを1つ作る(=現在flagsを
+            // 更新するという利用者の意図に最も自然に合致する実装判断)。
+            let flags = p0;
+            let mode = if p1 == 0 { 1 } else { p1 };
+            let stack = self.kitty_flags_stack_mut();
+            let current = stack.last().copied().unwrap_or(0);
+            let new_flags = match mode {
+                2 => current | flags,
+                3 => current & !flags,
+                _ => flags, // mode 1(既定)およびその他未定義値
+            };
+            if let Some(top) = stack.last_mut() {
+                *top = new_flags;
+            } else {
+                stack.push(new_flags);
+            }
+            return;
+        }
+        if action == 'u' && intermediates == [b'?'] {
+            // Query: 現在有効なflags(スタック最上段、空なら0)を`CSI ? flags u`で
+            // 返す。応答経路はDA/DSR(タスク#38)と同じ`pending_terminal_responses`。
+            let flags = self.kitty_keyboard_flags();
+            let resp = format!("\x1b[?{}u", flags);
+            self.pending_terminal_responses.push(resp.into_bytes());
+            return;
+        }
+
         if is_dec {
             // マウスレポーティング関連(`?1000`/`?1002`/`?1003`/`?1006`、タスク#36)は
             // 先頭パラメータ(`p0`)だけでなく`ps`全体を見る。実アプリ(vim/tmux等)は
@@ -1713,8 +1934,13 @@ impl Perform for Terminal {
         // `next_param_or(0) == 0` を条件にしている(Codexレビュー指摘)ため、それ以外の
         // `Ps`(例: `CSI 1c`)には応答しない。
         if action == 'c' && intermediates.is_empty() && p0 == 0 {
-            // Primary DA: VT100 with AVO を名乗る、広く使われる最小応答。
-            self.pending_terminal_responses.push(b"\x1b[?1;2c".to_vec());
+            // Primary DA: VT100 with AVO を名乗る、広く使われる最小応答に`;4`
+            // (Sixelグラフィックス対応、タスク#42)を追加する。多くのアプリは
+            // DA1応答に"4"が含まれるかだけを見てSixelを送るかどうか判断するため、
+            // 既存の分類("VT100 with AVO")自体は変えずに属性だけ追加する
+            // (Fable 2次レビュー: #38をこのタスクのblockedByにした理由そのもの——
+            // これを広告しない限り多くのアプリはそもそもSixelを送ってこない)。
+            self.pending_terminal_responses.push(b"\x1b[?1;2;4c".to_vec());
             return;
         }
         if action == 'c' && intermediates == [b'>'] && p0 == 0 {
@@ -1835,7 +2061,18 @@ impl Perform for Terminal {
                 match p0 {
                     0 => { let s = self.cursor_row * self.cols + col; self.erase_cells(s, self.cols * self.rows); }
                     1 => { let e = self.cursor_row * self.cols + col + 1; self.erase_cells(0, e); }
-                    2 | 3 => { self.erase_cells(0, self.cols * self.rows); self.cursor_row = 0; self.cursor_col = 0; }
+                    2 | 3 => {
+                        self.erase_cells(0, self.cols * self.rows);
+                        self.cursor_row = 0; self.cursor_col = 0;
+                        // Sixel(タスク#42、codexレビュー指摘): `CSI 2J`/`CSI 3J`は画面
+                        // 全体をテキストとして消去する操作であり、`clear(1)`実行時に
+                        // 頻繁に送られる。ここで画像配置を消さないと、テキストは
+                        // 消えたのに古いSixel画像だけ画面に残り続ける(部分消去の
+                        // ED0/ED1・ELはスコープ外のままだが、全画面消去は十分に
+                        // 一般的なケースのため対応する、`ImagePlacement`のdocコメント
+                        // 参照)。
+                        self.clear_images();
+                    }
                     _ => {}
                 }
             }
@@ -2012,9 +2249,30 @@ impl Perform for Terminal {
         }
     }
 
-    fn hook(&mut self, _params: &vte::Params, _ints: &[u8], _ignore: bool, _c: char) {}
-    fn put(&mut self, _byte: u8) {}
-    fn unhook(&mut self) {}
+    /// DCS(`ESC P ... <final>`)開始。タスク#42: 最終バイトが`q`のものだけSixelとして
+    /// デコード対象にする(`Pa;Pb;Ph`は`sixel.rs`のモジュールdoc「実装範囲」参照 —
+    /// 使わない)。それ以外の最終バイト(未対応のDCSサブプロトコル)は`sixel_decoder`を
+    /// `None`のままにし、後続の`put`/`unhook`が単に無視するようにする(従来通り
+    /// 黙って破棄)。
+    fn hook(&mut self, _params: &vte::Params, _ints: &[u8], _ignore: bool, c: char) {
+        if c == 'q' {
+            self.sixel_decoder = Some(SixelDecoder::new());
+        } else {
+            self.sixel_decoder = None;
+        }
+    }
+    fn put(&mut self, byte: u8) {
+        if let Some(dec) = self.sixel_decoder.as_mut() {
+            dec.feed(byte);
+        }
+    }
+    fn unhook(&mut self) {
+        if let Some(dec) = self.sixel_decoder.take() {
+            if let Some(img) = dec.finish() {
+                self.place_sixel_image(img);
+            }
+        }
+    }
     fn esc_dispatch(&mut self, ints: &[u8], _ignore: bool, byte: u8) {
         match byte {
             b'M' => {
@@ -2725,7 +2983,7 @@ mod tests {
     fn test_primary_da_queues_response() {
         let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b[c"); // Primary DA
-        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[?1;2c".to_vec()]);
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[?1;2;4c".to_vec()]);
         // Consumed once.
         assert!(t.take_pending_terminal_responses().is_empty());
     }
@@ -2734,7 +2992,7 @@ mod tests {
     fn test_primary_da_with_explicit_zero_param_queues_response() {
         let mut t = Terminal::new(80, 24, Theme::default());
         feed(&mut t, b"\x1b[0c"); // Primary DA、明示的に Ps=0
-        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[?1;2c".to_vec()]);
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[?1;2;4c".to_vec()]);
     }
 
     #[test]
@@ -2743,7 +3001,7 @@ mod tests {
         feed(&mut t, b"\x1b[>c"); // Secondary DA(vteは`>`をintermediatesに入れる)
         let resp = t.take_pending_terminal_responses();
         assert_eq!(resp, vec![b"\x1b[>0;100;0c".to_vec()]);
-        assert_ne!(resp, vec![b"\x1b[?1;2c".to_vec()], "Primary DAと取り違えていないこと");
+        assert_ne!(resp, vec![b"\x1b[?1;2;4c".to_vec()], "Primary DAと取り違えていないこと");
     }
 
     #[test]
@@ -2803,6 +3061,158 @@ mod tests {
         feed(&mut t, b"\x1b[6n"); // CPR要求をpendingにする
         feed(&mut t, b"\x1bc"); // RIS (full reset)
         assert!(t.take_pending_terminal_responses().is_empty());
+    }
+
+    // ── Kitty keyboard protocol(タスク#54) ────────────────────────
+
+    #[test]
+    fn test_kitty_query_default_flags_is_zero_legacy_mode() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        feed(&mut t, b"\x1b[?u"); // CSI ? u: query
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[?0u".to_vec()]);
+    }
+
+    #[test]
+    fn test_kitty_push_sets_flags_and_query_reports_them() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>5u"); // push flags=5 (disambiguate + report alternate keys)
+        assert_eq!(t.kitty_keyboard_flags(), 5);
+        feed(&mut t, b"\x1b[?u");
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b[?5u".to_vec()]);
+    }
+
+    #[test]
+    fn test_kitty_push_without_param_defaults_to_zero() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>1u");
+        feed(&mut t, b"\x1b[>u"); // 省略時0をpush
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn test_kitty_pop_default_pops_one_entry_restoring_previous() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>1u");
+        feed(&mut t, b"\x1b[>31u");
+        assert_eq!(t.kitty_keyboard_flags(), 31);
+        feed(&mut t, b"\x1b[<u"); // CSI < u: 既定1エントリpop
+        assert_eq!(t.kitty_keyboard_flags(), 1, "popした後は1つ前のflagsに戻る");
+    }
+
+    #[test]
+    fn test_kitty_pop_explicit_count_pops_multiple() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>1u");
+        feed(&mut t, b"\x1b[>2u");
+        feed(&mut t, b"\x1b[>3u");
+        feed(&mut t, b"\x1b[<2u"); // 2エントリpop
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+    }
+
+    #[test]
+    fn test_kitty_pop_more_than_stack_depth_empties_without_panic() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>5u");
+        feed(&mut t, b"\x1b[<100u"); // スタックの深さ(1)を大きく超えるpop要求
+        assert_eq!(t.kitty_keyboard_flags(), 0, "空になった後は0(legacy mode)に戻る");
+        // 続けてpopしてもpanicしない。
+        feed(&mut t, b"\x1b[<u");
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn test_kitty_set_mode1_default_replaces_flags() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>31u");
+        feed(&mut t, b"\x1b[=1u"); // mode省略(既定1) → 丸ごと1へ置換
+        assert_eq!(t.kitty_keyboard_flags(), 1);
+    }
+
+    #[test]
+    fn test_kitty_set_mode2_ors_bits_into_current_flags() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>1u"); // flags=1
+        feed(&mut t, b"\x1b[=4;2u"); // mode2: 4をOR
+        assert_eq!(t.kitty_keyboard_flags(), 5);
+    }
+
+    #[test]
+    fn test_kitty_set_mode3_clears_bits_from_current_flags() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>31u"); // flags=31(全ビット)
+        feed(&mut t, b"\x1b[=5;3u"); // mode3: bit0とbit2をクリア
+        assert_eq!(t.kitty_keyboard_flags(), 26); // 31 & !5 == 26
+    }
+
+    #[test]
+    fn test_kitty_set_on_empty_stack_creates_entry() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        feed(&mut t, b"\x1b[=3u"); // pushせずいきなりset
+        assert_eq!(t.kitty_keyboard_flags(), 3);
+    }
+
+    #[test]
+    fn test_kitty_push_beyond_stack_limit_evicts_oldest_entry() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // KITTY_KEYBOARD_STACK_MAX(8)を超えてpushする。
+        for i in 1..=9u16 {
+            feed(&mut t, format!("\x1b[>{i}u").as_bytes());
+        }
+        assert_eq!(t.kitty_keyboard_flags(), 9, "最新のpushが有効");
+        // 8回popしても最初にpushした`1`は既に追い出されているので残らない
+        // (2番目にpushした`2`が最も古い生存エントリになっているはず)。
+        for _ in 0..7 {
+            feed(&mut t, b"\x1b[<u");
+        }
+        assert_eq!(t.kitty_keyboard_flags(), 2);
+    }
+
+    #[test]
+    fn test_kitty_flags_stack_independent_between_main_and_alt_screen() {
+        // 仕様: "The main and alternate screens...must maintain their own,
+        // independent, keyboard mode stacks"。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>5u"); // main画面でpush
+        assert_eq!(t.kitty_keyboard_flags(), 5);
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ切替
+        assert_eq!(t.kitty_keyboard_flags(), 0, "alt画面は独立した空スタックを持つ");
+        feed(&mut t, b"\x1b[>9u"); // alt画面でpush
+        assert_eq!(t.kitty_keyboard_flags(), 9);
+        feed(&mut t, b"\x1b[?1049l"); // main画面へ復帰
+        assert_eq!(t.kitty_keyboard_flags(), 5, "main画面のスタックはalt切替をまたいで保持される");
+    }
+
+    #[test]
+    fn test_kitty_bare_csi_u_without_intermediates_still_restores_cursor() {
+        // 既存のCSI u(ANSI.SYS方言、タスク#57)はintermediates無しの`u`のみを
+        // 対象とする。Kitty分岐(`>`/`<`/`=`/`?`付き)を追加してもこの既存挙動を
+        // 壊してはいけない。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[10;5H"); // カーソルを移動
+        feed(&mut t, b"\x1b[s"); // CSI s: save cursor
+        feed(&mut t, b"\x1b[1;1H"); // 別の位置へ移動
+        feed(&mut t, b"\x1b[u"); // CSI u(intermediates無し): restore cursor
+        assert_eq!(t.cursor_row(), 9);
+        assert_eq!(t.cursor_col(), 4);
+        // Kitty側の状態には一切影響しない。
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        assert!(t.take_pending_terminal_responses().is_empty());
+    }
+
+    #[test]
+    fn test_reset_clears_kitty_keyboard_flags_stack_on_both_screens() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[>5u");
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ
+        feed(&mut t, b"\x1b[>9u");
+        feed(&mut t, b"\x1bc"); // RIS(alt画面上でもfull resetはmain画面に戻す)
+        assert_eq!(t.kitty_keyboard_flags(), 0);
+        // main画面側も空になっていることを確認する(alt→main往復では検証できない
+        // ため、いったんmainでpushしてから確かめる)。
+        feed(&mut t, b"\x1b[>7u");
+        assert_eq!(t.kitty_keyboard_flags(), 7, "RIS後は素のmain画面スタックとして機能する");
     }
 
     // ── OSC 10/11 default fg/bg のset/query(タスク#58) ────────────────────────
@@ -4735,6 +5145,132 @@ mod tests {
         feed(&mut t, b"\x1b[?1004h");
         assert_eq!(t.encode_focus_event(true), Some(b"\x1b[I".to_vec()));
         assert_eq!(t.encode_focus_event(false), Some(b"\x1b[O".to_vec()));
+    }
+
+    // ── Sixel(`DCS Pa;Pb;Ph q ... ST`、タスク#42) ─────────────
+
+    #[test]
+    fn test_sixel_places_image_at_cursor_and_advances_cursor_below_it() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[3;5H"); // カーソルを(row=2,col=4)へ(1-indexed入力)
+        // 色0を赤で定義し、1ピクセルだけ描くsixel(1x1画像)。
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
+        let images = t.images();
+        assert_eq!(images.len(), 1);
+        let img = &images[0];
+        assert_eq!(img.row, 2);
+        assert_eq!(img.col, 4);
+        assert_eq!(img.width_px, 1);
+        assert_eq!(img.height_px, 1);
+        assert_eq!(img.rgba, vec![255, 0, 0, 255]);
+        assert_eq!(img.rows_span, 1);
+        assert_eq!(img.cols_span, 1);
+        // 画像の下・左端へカーソルが移動する(実装ノート参照)。
+        assert_eq!(t.cursor_row(), 3);
+        assert_eq!(t.cursor_col(), 0);
+    }
+
+    #[test]
+    fn test_sixel_image_gets_monotonically_increasing_ids() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
+        let ids: Vec<u64> = t.images().iter().map(|i| i.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[1] > ids[0]);
+    }
+
+    #[test]
+    fn test_sixel_image_span_clamped_to_remaining_screen_width() {
+        // 名目セルサイズ(10px/col)換算で画面幅を大きく超える画像でも、
+        // `cols_span`は画面の残り列数を超えない(スコープ外: 自動スクロールしない、
+        // 画面右端でクリップする)。
+        let mut t = Terminal::new(5, 24, Theme::default());
+        feed(&mut t, b"\x1bPq#0;2;100;0;0!500@\x1b\\"); // 幅500pxの1バンド画像
+        let images = t.images();
+        assert_eq!(images.len(), 1);
+        let img = &images[0];
+        assert_eq!(img.width_px, 500);
+        assert_eq!(img.cols_span, 5, "画面の残り列数(5)にクランプされること");
+    }
+
+    #[test]
+    fn test_reset_clears_sixel_images() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
+        assert_eq!(t.images().len(), 1);
+        feed(&mut t, b"\x1bc"); // RIS
+        assert!(t.images().is_empty());
+    }
+
+    #[test]
+    fn test_scroll_clears_sixel_images() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
+        assert_eq!(t.images().len(), 1);
+        // 画面全体を埋めて自然にスクロールさせる(24行分の改行)。
+        for _ in 0..24 {
+            feed(&mut t, b"\r\n");
+        }
+        assert!(t.images().is_empty(), "スクロールで既存の画像配置は消去される");
+    }
+
+    #[test]
+    fn test_alt_screen_switch_clears_sixel_images() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
+        assert_eq!(t.images().len(), 1);
+        feed(&mut t, b"\x1b[?1049h"); // alt screenへ
+        assert!(t.images().is_empty());
+    }
+
+    #[test]
+    fn test_resize_clears_sixel_images() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
+        assert_eq!(t.images().len(), 1);
+        t.resize_preserving_state(40, 12);
+        assert!(t.images().is_empty());
+    }
+
+    #[test]
+    fn test_full_screen_erase_clears_sixel_images() {
+        // codexレビュー指摘: `CSI 2J`/`CSI 3J`(全画面消去、`clear(1)`が送る)は
+        // テキストと一緒に画像配置も消えるべき。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
+        assert_eq!(t.images().len(), 1);
+        feed(&mut t, b"\x1b[2J");
+        assert!(t.images().is_empty());
+    }
+
+    #[test]
+    fn test_partial_erase_does_not_clear_sixel_images() {
+        // ED0/ED1・EL等の部分消去はスコープ外(`ImagePlacement`のdocコメント参照)
+        // であることを明示的に固定する回帰テスト。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1bPq#0;2;100;0;0@\x1b\\");
+        assert_eq!(t.images().len(), 1);
+        feed(&mut t, b"\x1b[0J"); // ED0
+        feed(&mut t, b"\x1b[K");  // EL0
+        assert_eq!(t.images().len(), 1, "部分消去では画像は消えない(スコープ外)");
+    }
+
+    #[test]
+    fn test_non_sixel_dcs_is_ignored() {
+        // 最終バイトが`q`以外のDCS(未対応のサブプロトコル)は無視され、画像は
+        // 作られない(黙って破棄する従来通りの挙動)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1bP1$tsomething\x1b\\");
+        assert!(t.images().is_empty());
+    }
+
+    #[test]
+    fn test_primary_da_advertises_sixel_support() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[c");
+        let resp = t.take_pending_terminal_responses();
+        assert_eq!(resp, vec![b"\x1b[?1;2;4c".to_vec()], "DA1応答に';4'(Sixel対応)が含まれること");
     }
 
     // ── Proptest: 不変量 ────────────────────────────────

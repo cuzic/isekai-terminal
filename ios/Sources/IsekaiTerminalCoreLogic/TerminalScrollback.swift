@@ -24,6 +24,11 @@ public func synthesizeDisplayUpdate(live update: ScreenUpdate, scrollOffset: UIn
         bellGeneration: update.bellGeneration,
         cursorShape: update.cursorShape,
         cursorBlink: update.cursorBlink,
-        linkTable: update.linkTable
+        linkTable: update.linkTable,
+        // Sixel(タスク#42): scrollback表示中はライブ画面の画像配置を引き継がない
+        // (scrollbackセル自体は画像を保持しないテキストのみのスナップショットのため、
+        // Android版`TerminalScreen.kt`の`displayUpdate`合成と同じ判断)。
+        images: [],
+        kittyKeyboardFlags: update.kittyKeyboardFlags
     )
 }
