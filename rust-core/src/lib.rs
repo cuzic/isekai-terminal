@@ -341,52 +341,142 @@ pub enum TerminalSpecialKey {
     FunctionKey { number: u8 },
 }
 
+/// xterm互換の修飾キー状態。`terminal_special_key_bytes`へ渡し、矢印・Home/End・
+/// PageUp/Down・F1〜F12のシーケンスに修飾子パラメータを付与するために使う
+/// (Ctrl+矢印でreadline/tmuxのワード単位移動等を機能させるため、`TERM=xterm-256color`
+/// が広告する修飾子付きシーケンスをこちら側でも生成する必要がある)。
+/// 全フィールドfalse(修飾なし)は`Default`で表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, uniffi::Record)]
+pub struct TerminalKeyModifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+    pub meta: bool,
+}
+
+impl TerminalKeyModifiers {
+    fn is_none(&self) -> bool {
+        !self.shift && !self.alt && !self.ctrl && !self.meta
+    }
+
+    /// xterm互換の修飾子パラメータ値: `1 + Shift(1) + Alt(2) + Ctrl(4) + Meta(8)`。
+    /// 修飾なしの場合は呼び出し側で`is_none()`により別扱い(このメソッドは呼ばれない)。
+    fn xterm_param(&self) -> u8 {
+        1 + (self.shift as u8) + (self.alt as u8) * 2 + (self.ctrl as u8) * 4 + (self.meta as u8) * 8
+    }
+}
+
 /// 特殊キーを、ターミナルへ送信するバイト列(ANSI/xtermエスケープシーケンス)に
-/// 変換する。矢印キーは`application_cursor_mode`が有効ならSS3形式(`ESC O A`等、
-/// DECCKM)、無効ならCSI形式(`ESC[A`等)を返す。F1〜F4はSS3形式、F5〜F12は
-/// CSI `~`形式(xterm互換)。未対応のfunction key番号は空配列を返す。
+/// 変換する。
+///
+/// - 矢印キーは、修飾子が一切無い場合のみ`application_cursor_mode`(DECCKM)に従い
+///   SS3形式(`ESC O A`等)/CSI形式(`ESC[A`等)を切り替える。**修飾子が1つでも
+///   付いている場合はDECCKMの値に関わらず常にCSI形式**(`ESC[1;5A`等、xterm互換)
+///   になる(DECCKMはSS3/CSIの切替のみを制御し、修飾子パラメータ付きシーケンスは
+///   元々CSI形式でしか表現できないため)。
+/// - Home/End/PageUp/PageDownも同様に、修飾子が無ければ従来通りの無パラメータ形式
+///   (`ESC[H`/`ESC[5~`等)、修飾子があればパラメータ付き(`ESC[1;5H`/`ESC[5;5~`等)。
+/// - F1〜F4は修飾子が無ければSS3形式(`ESC O P`等)だが、修飾子が付くと
+///   SS3では修飾子パラメータを表現できないため**CSI形式に切り替わる**
+///   (`ESC[1;5P`等)。F5〜F12はどちらの場合もCSI `~`形式(修飾子有りなら
+///   `ESC[15;5~`等)。未対応のfunction key番号は空配列を返す。
+/// - Tabは修飾子無しなら`0x09`だが、Shift単独の場合はCBT(Cursor Backward Tab、
+///   `ESC[Z`)を返す(readline/tmux等の「戻りタブ補完」に必要。xterm互換で
+///   パラメータは付かない)。Shift以外の修飾子(Ctrl+Tab等)はターミナル制御
+///   シーケンスとして標準化されていないため無視し、無修飾のTabとして扱う。
 #[uniffi::export]
-pub fn terminal_special_key_bytes(key: TerminalSpecialKey, application_cursor_mode: bool) -> Vec<u8> {
+pub fn terminal_special_key_bytes(
+    key: TerminalSpecialKey,
+    application_cursor_mode: bool,
+    modifiers: TerminalKeyModifiers,
+) -> Vec<u8> {
     match key {
         TerminalSpecialKey::Enter => vec![0x0D],
         TerminalSpecialKey::Delete => vec![0x7F],
         TerminalSpecialKey::ForwardDelete => b"\x1B[3~".to_vec(),
-        TerminalSpecialKey::Tab => vec![0x09],
+        TerminalSpecialKey::Tab => terminal_tab_bytes(modifiers),
         TerminalSpecialKey::Escape => vec![0x1B],
-        TerminalSpecialKey::ArrowUp => terminal_arrow_bytes(b'A', application_cursor_mode),
-        TerminalSpecialKey::ArrowDown => terminal_arrow_bytes(b'B', application_cursor_mode),
-        TerminalSpecialKey::ArrowRight => terminal_arrow_bytes(b'C', application_cursor_mode),
-        TerminalSpecialKey::ArrowLeft => terminal_arrow_bytes(b'D', application_cursor_mode),
-        TerminalSpecialKey::PageUp => b"\x1B[5~".to_vec(),
-        TerminalSpecialKey::PageDown => b"\x1B[6~".to_vec(),
-        TerminalSpecialKey::Home => b"\x1B[H".to_vec(),
-        TerminalSpecialKey::End => b"\x1B[F".to_vec(),
-        TerminalSpecialKey::FunctionKey { number } => terminal_function_key_bytes(number),
+        TerminalSpecialKey::ArrowUp => terminal_arrow_bytes(b'A', application_cursor_mode, modifiers),
+        TerminalSpecialKey::ArrowDown => terminal_arrow_bytes(b'B', application_cursor_mode, modifiers),
+        TerminalSpecialKey::ArrowRight => terminal_arrow_bytes(b'C', application_cursor_mode, modifiers),
+        TerminalSpecialKey::ArrowLeft => terminal_arrow_bytes(b'D', application_cursor_mode, modifiers),
+        TerminalSpecialKey::PageUp => terminal_tilde_bytes(5, modifiers),
+        TerminalSpecialKey::PageDown => terminal_tilde_bytes(6, modifiers),
+        TerminalSpecialKey::Home => terminal_home_end_bytes(b'H', modifiers),
+        TerminalSpecialKey::End => terminal_home_end_bytes(b'F', modifiers),
+        TerminalSpecialKey::FunctionKey { number } => terminal_function_key_bytes(number, modifiers),
     }
 }
 
-fn terminal_arrow_bytes(letter: u8, application_cursor_mode: bool) -> Vec<u8> {
-    if application_cursor_mode {
-        vec![0x1B, 0x4F, letter] // ESC O <letter> (SS3)
+fn terminal_arrow_bytes(letter: u8, application_cursor_mode: bool, modifiers: TerminalKeyModifiers) -> Vec<u8> {
+    if modifiers.is_none() {
+        if application_cursor_mode {
+            vec![0x1B, 0x4F, letter] // ESC O <letter> (SS3)
+        } else {
+            vec![0x1B, 0x5B, letter] // ESC [ <letter> (CSI)
+        }
     } else {
-        vec![0x1B, 0x5B, letter] // ESC [ <letter> (CSI)
+        terminal_csi_modified(letter, modifiers)
     }
 }
 
-fn terminal_function_key_bytes(n: u8) -> Vec<u8> {
+fn terminal_home_end_bytes(letter: u8, modifiers: TerminalKeyModifiers) -> Vec<u8> {
+    if modifiers.is_none() {
+        vec![0x1B, 0x5B, letter] // ESC [ <letter>
+    } else {
+        terminal_csi_modified(letter, modifiers)
+    }
+}
+
+/// `ESC [ 1 ; <mod> <letter>`(xterm互換の修飾子付きCSI形式)。
+fn terminal_csi_modified(letter: u8, modifiers: TerminalKeyModifiers) -> Vec<u8> {
+    let mut out = b"\x1B[1;".to_vec();
+    out.extend_from_slice(modifiers.xterm_param().to_string().as_bytes());
+    out.push(letter);
+    out
+}
+
+/// `ESC [ <n> ~`(修飾子無し)、または`ESC [ <n> ; <mod> ~`(修飾子有り)。
+fn terminal_tilde_bytes(n: u8, modifiers: TerminalKeyModifiers) -> Vec<u8> {
+    if modifiers.is_none() {
+        format!("\x1B[{n}~").into_bytes()
+    } else {
+        format!("\x1B[{n};{}~", modifiers.xterm_param()).into_bytes()
+    }
+}
+
+fn terminal_tab_bytes(modifiers: TerminalKeyModifiers) -> Vec<u8> {
+    if modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.meta {
+        b"\x1B[Z".to_vec() // CBT (Cursor Backward Tab / Shift+Tab)
+    } else {
+        vec![0x09]
+    }
+}
+
+fn terminal_function_key_bytes(n: u8, modifiers: TerminalKeyModifiers) -> Vec<u8> {
     match n {
-        1 => b"\x1BOP".to_vec(),
-        2 => b"\x1BOQ".to_vec(),
-        3 => b"\x1BOR".to_vec(),
-        4 => b"\x1BOS".to_vec(),
-        5 => b"\x1B[15~".to_vec(),
-        6 => b"\x1B[17~".to_vec(),
-        7 => b"\x1B[18~".to_vec(),
-        8 => b"\x1B[19~".to_vec(),
-        9 => b"\x1B[20~".to_vec(),
-        10 => b"\x1B[21~".to_vec(),
-        11 => b"\x1B[23~".to_vec(),
-        12 => b"\x1B[24~".to_vec(),
+        1..=4 => {
+            let letter = b"PQRS"[(n - 1) as usize];
+            if modifiers.is_none() {
+                vec![0x1B, 0x4F, letter] // ESC O <letter> (SS3)
+            } else {
+                terminal_csi_modified(letter, modifiers) // SS3では修飾子を表現できないためCSI形式へ切替
+            }
+        }
+        5..=12 => {
+            let code: u8 = match n {
+                5 => 15,
+                6 => 17,
+                7 => 18,
+                8 => 19,
+                9 => 20,
+                10 => 21,
+                11 => 23,
+                12 => 24,
+                _ => unreachable!(),
+            };
+            terminal_tilde_bytes(code, modifiers)
+        }
         _ => Vec::new(),
     }
 }
@@ -1128,70 +1218,172 @@ mod terminal_key_mapping_tests {
     // 「Rust側へ統合しても既存の挙動が一切変わっていない」ことを両言語で
     // 相互検証する意図。
 
+    // 修飾なし(全フィールドfalse)。既存(#29以前)の挙動を検証する回帰テスト群で使う。
+    const NO_MODS: TerminalKeyModifiers = TerminalKeyModifiers { shift: false, alt: false, ctrl: false, meta: false };
+
     #[test]
     fn enter_maps_to_cr() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Enter, false), vec![0x0D]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Enter, false, NO_MODS), vec![0x0D]);
     }
 
     #[test]
     fn del_maps_to_0x7f() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Delete, false), vec![0x7F]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Delete, false, NO_MODS), vec![0x7F]);
     }
 
     #[test]
     fn forward_delete_maps_to_csi_tilde() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ForwardDelete, false), b"\x1B[3~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ForwardDelete, false, NO_MODS), b"\x1B[3~".to_vec());
     }
 
     #[test]
     fn tab_maps_to_0x09() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false), vec![0x09]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, NO_MODS), vec![0x09]);
     }
 
     #[test]
     fn escape_maps_to_0x1b() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Escape, false), vec![0x1B]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Escape, false, NO_MODS), vec![0x1B]);
     }
 
     #[test]
     fn arrow_keys_map_to_csi() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false), vec![0x1B, 0x5B, 0x41]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, false), vec![0x1B, 0x5B, 0x42]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, false), vec![0x1B, 0x5B, 0x43]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, false), vec![0x1B, 0x5B, 0x44]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, NO_MODS), vec![0x1B, 0x5B, 0x41]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, false, NO_MODS), vec![0x1B, 0x5B, 0x42]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, false, NO_MODS), vec![0x1B, 0x5B, 0x43]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, false, NO_MODS), vec![0x1B, 0x5B, 0x44]);
     }
 
     #[test]
     fn arrow_keys_map_to_ss3_in_application_cursor_mode() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, true), vec![0x1B, 0x4F, 0x41]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, true), vec![0x1B, 0x4F, 0x42]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, true), vec![0x1B, 0x4F, 0x43]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, true), vec![0x1B, 0x4F, 0x44]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, true, NO_MODS), vec![0x1B, 0x4F, 0x41]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, true, NO_MODS), vec![0x1B, 0x4F, 0x42]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, true, NO_MODS), vec![0x1B, 0x4F, 0x43]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, true, NO_MODS), vec![0x1B, 0x4F, 0x44]);
     }
 
     #[test]
     fn page_up_down_and_home_end() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageUp, false), b"\x1B[5~".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageDown, false), b"\x1B[6~".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Home, false), b"\x1B[H".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::End, false), b"\x1B[F".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageUp, false, NO_MODS), b"\x1B[5~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageDown, false, NO_MODS), b"\x1B[6~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Home, false, NO_MODS), b"\x1B[H".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::End, false, NO_MODS), b"\x1B[F".to_vec());
     }
 
     #[test]
     fn function_keys_f1_to_f4_use_ss3() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false), b"\x1BOP".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 4 }, false), b"\x1BOS".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false, NO_MODS), b"\x1BOP".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 4 }, false, NO_MODS), b"\x1BOS".to_vec());
     }
 
     #[test]
     fn function_keys_f5_to_f12_use_csi_tilde() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 5 }, false), b"\x1B[15~".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 12 }, false), b"\x1B[24~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 5 }, false, NO_MODS), b"\x1B[15~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 12 }, false, NO_MODS), b"\x1B[24~".to_vec());
     }
 
     #[test]
     fn unsupported_function_key_returns_empty() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 99 }, false), Vec::<u8>::new());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 99 }, false, NO_MODS), Vec::<u8>::new());
+    }
+
+    // ── 修飾キー付きシーケンス(#29) ──────────────────────────
+
+    #[test]
+    fn xterm_param_matches_1_plus_shift_alt_ctrl_meta_bitmask() {
+        assert_eq!(TerminalKeyModifiers { shift: true, ..Default::default() }.xterm_param(), 2);
+        assert_eq!(TerminalKeyModifiers { alt: true, ..Default::default() }.xterm_param(), 3);
+        assert_eq!(TerminalKeyModifiers { ctrl: true, ..Default::default() }.xterm_param(), 5);
+        assert_eq!(TerminalKeyModifiers { meta: true, ..Default::default() }.xterm_param(), 9);
+        assert_eq!(
+            TerminalKeyModifiers { shift: true, ctrl: true, ..Default::default() }.xterm_param(),
+            6
+        );
+        assert_eq!(
+            TerminalKeyModifiers { shift: true, alt: true, ctrl: true, meta: true }.xterm_param(),
+            16
+        );
+    }
+
+    #[test]
+    fn arrow_keys_with_modifiers_always_use_csi_form_regardless_of_decckm() {
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        // DECCKM無効時
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, ctrl), b"\x1B[1;5A".to_vec());
+        // DECCKM有効時でも修飾子付きはSS3にならずCSI形式のまま
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, true, ctrl), b"\x1B[1;5A".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, true, ctrl), b"\x1B[1;5B".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, true, ctrl), b"\x1B[1;5C".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, true, ctrl), b"\x1B[1;5D".to_vec());
+    }
+
+    #[test]
+    fn arrow_key_shift_uses_modifier_2() {
+        let shift = TerminalKeyModifiers { shift: true, ..Default::default() };
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, shift), b"\x1B[1;2A".to_vec());
+    }
+
+    #[test]
+    fn home_end_with_modifiers_use_parameterized_csi() {
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Home, false, ctrl), b"\x1B[1;5H".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::End, false, ctrl), b"\x1B[1;5F".to_vec());
+    }
+
+    #[test]
+    fn page_up_down_with_modifiers_use_parameterized_tilde() {
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageUp, false, ctrl), b"\x1B[5;5~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageDown, false, ctrl), b"\x1B[6;5~".to_vec());
+    }
+
+    #[test]
+    fn function_keys_f1_to_f4_switch_from_ss3_to_csi_when_modified() {
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false, ctrl),
+            b"\x1B[1;5P".to_vec()
+        );
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 4 }, false, ctrl),
+            b"\x1B[1;5S".to_vec()
+        );
+    }
+
+    #[test]
+    fn function_keys_f5_to_f12_use_parameterized_tilde_when_modified() {
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 5 }, false, ctrl),
+            b"\x1B[15;5~".to_vec()
+        );
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 12 }, false, ctrl),
+            b"\x1B[24;5~".to_vec()
+        );
+    }
+
+    #[test]
+    fn shift_tab_maps_to_cbt() {
+        let shift = TerminalKeyModifiers { shift: true, ..Default::default() };
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, shift), b"\x1B[Z".to_vec());
+    }
+
+    #[test]
+    fn tab_with_non_shift_modifiers_falls_back_to_plain_tab() {
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, ctrl), vec![0x09]);
+        let shift_ctrl = TerminalKeyModifiers { shift: true, ctrl: true, ..Default::default() };
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, shift_ctrl), vec![0x09]);
+    }
+
+    #[test]
+    fn keys_unaffected_by_modifiers_stay_the_same() {
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Enter, false, ctrl), vec![0x0D]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Delete, false, ctrl), vec![0x7F]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Escape, false, ctrl), vec![0x1B]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ForwardDelete, false, ctrl), b"\x1B[3~".to_vec());
     }
 
     #[test]
