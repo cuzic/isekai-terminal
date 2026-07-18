@@ -21,6 +21,7 @@ import java.nio.ByteBuffer
 import kotlin.math.ceil
 import kotlinx.coroutines.delay
 import uniffi.isekai_terminal_core.CellData
+import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.ImagePlacement
 import uniffi.isekai_terminal_core.ScreenUpdate
 
@@ -36,6 +37,29 @@ import uniffi.isekai_terminal_core.ScreenUpdate
  * `drawText` している。
  */
 internal data class BgRun(val startCol: Int, val endColExclusive: Int, val argb: Int)
+
+/** カーソル描画矩形(ピクセル座標)。[computeCursorRect] の戻り値。 */
+internal data class CursorRect(val left: Float, val top: Float, val right: Float, val bottom: Float)
+
+/**
+ * タスク#33: DECSCUSR(`CSI Ps SP q`)が選択したカーソル形状([shape]、Rust側`Terminal`
+ * が真値を保持、rust-ssot)に応じたカーソル描画矩形をピュアに計算する。`(cx, cy)`は
+ * カーソルセル左上のピクセル座標、`cellW`/`cellH`はセル寸法。block はセル全体、
+ * underline/bar は最小太さ2px(iOS版`TerminalScreenView.swift`の`switch update.cursorShape`
+ * と対称の太さ計算: underlineは`cellH * 0.12`、barは`cellW * 0.15`)を下限に描く。
+ */
+internal fun computeCursorRect(cx: Float, cy: Float, cellW: Float, cellH: Float, shape: CursorShape): CursorRect =
+    when (shape) {
+        CursorShape.BLOCK -> CursorRect(cx, cy, cx + cellW, cy + cellH)
+        CursorShape.UNDERLINE -> {
+            val thickness = (cellH * 0.12f).coerceAtLeast(2f)
+            CursorRect(cx, cy + cellH - thickness, cx + cellW, cy + cellH)
+        }
+        CursorShape.BAR -> {
+            val thickness = (cellW * 0.15f).coerceAtLeast(2f)
+            CursorRect(cx, cy, cx + thickness, cy + cellH)
+        }
+    }
 
 /**
  * SGR 2(dim)セルの前景色。色そのものを別値へ再計算するのではなく、ARGB の alpha
@@ -255,13 +279,25 @@ fun SshTerminalCanvas(
     // `lastDisplayHasBlink`と対称)。
     val hasBlink = remember(update) { update.cells.any { it.blink } }
 
+    // タスク#33: 点滅カーソル(DECSCUSRの偶数パラメータ、あるいはDECSET `?12`)を
+    // 実際に点滅させる必要があるかどうか。「点滅させるべきかどうか」自体は
+    // `update.cursorBlink`(Rust側`Terminal`が決定した真値、rust-ssot)をそのまま
+    // 見るだけ——ここではその値と`cursorVisible`/画面範囲内かどうかを組み合わせて
+    // 「点滅タイマーを回す必要があるか」というUI表示専用の判断のみ行う
+    // (iOS版`TerminalScreenView.swift`の`lastDisplayCursorBlinks`/`cursorInBounds`と対称)。
+    val cursorBlinks = remember(update) {
+        update.cursorVisible && update.cursorBlink &&
+            update.cursorRow < update.rows && update.cursorCol < update.cols
+    }
+
     // SGR 5(blink)の点滅位相。UI表示にのみ閉じたアニメーション状態であり
     // rust-ssot の対象外(「blink属性が立っているかどうか」自体は`CellData.blink`
     // としてRustが決定した値をそのまま見るだけ、iOS版`TerminalScreenView.swift`の
     // `blinkPhaseVisible`と対称)。xterm既定に近い0.53秒間隔でトグルする。
+    // 点滅カーソルもこの同じ位相を共有する(xtermも同じ位相を共有する、iOS版と対称)。
     var blinkPhaseVisible by remember { mutableStateOf(true) }
-    LaunchedEffect(hasBlink) {
-        if (!hasBlink) return@LaunchedEffect
+    LaunchedEffect(hasBlink, cursorBlinks) {
+        if (!hasBlink && !cursorBlinks) return@LaunchedEffect
         while (true) {
             delay(530)
             blinkPhaseVisible = !blinkPhaseVisible
@@ -398,14 +434,22 @@ fun SshTerminalCanvas(
         // 増やす必要がないよう、選択ハイライトと同様に毎フレーム軽量に描画し直す)
         // DECTCEM(CSI ?25l/h)でカーソルが非表示状態のときはRust側がcursorVisible=falseを
         // 立てるので、描画自体をスキップする(rust-ssot: 可視判定はRust側で行い、Kotlin側は
-        // フラグをそのまま反映するだけ)。
-        if (update.cursorVisible) {
+        // フラグをそのまま反映するだけ)。タスク#33: DECSCUSR(`CSI Ps SP q`)が選択した
+        // 形状は`update.cursorShape`(Rust側`Terminal`が真値を保持、rust-ssot)からそのまま
+        // 読み、block/underline/barを描き分ける。点滅そのもの(`blinkPhaseVisible`という
+        // 位相)はUIローカル状態(SGR blinkと同じタイマーを共有)だが、「点滅させるべきか
+        // どうか」は`update.cursorBlink`(DECSCUSRの偶数/奇数パラメータ、DECSET `?12`の
+        // どちらもRust側`Terminal`が解決済み)をそのまま見るだけで、Kotlin側では判断しない
+        // (iOS版`TerminalScreenView.swift`の同名分岐と対称)。
+        val cursorHidden = update.cursorBlink && !blinkPhaseVisible
+        if (update.cursorVisible && !cursorHidden) {
             val cx = update.cursorCol.toInt() * cellW
             val cy = update.cursorRow.toInt() * cellH
             if (cx < size.width && cy < size.height) {
                 cursorPaint.color = theme.cursor.copy(alpha = 0.7f).toArgb()
                 val nCanvas = drawContext.canvas.nativeCanvas
-                nCanvas.drawRect(cx, cy, cx + cellW, cy + cellH, cursorPaint)
+                val rect = computeCursorRect(cx, cy, cellW, cellH, update.cursorShape)
+                nCanvas.drawRect(rect.left, rect.top, rect.right, rect.bottom, cursorPaint)
             }
         }
 
