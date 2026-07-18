@@ -537,6 +537,51 @@ final class TerminalScreenViewTests: XCTestCase {
         )
     }
 
+    // MARK: - タスク#88: shouldReportMouseMotion(ドラッグ中のセル単位dedup)
+
+    func testShouldReportMouseMotionFalseWhenCellUnchanged() {
+        // xtermは同一セル内でのマウス移動を重複報告しない。
+        XCTAssertFalse(shouldReportMouseMotion(
+            lastReportedCell: CellPos(row: 3, col: 5), newCell: CellPos(row: 3, col: 5)
+        ))
+    }
+
+    func testShouldReportMouseMotionTrueWhenRowChanges() {
+        XCTAssertTrue(shouldReportMouseMotion(
+            lastReportedCell: CellPos(row: 3, col: 5), newCell: CellPos(row: 4, col: 5)
+        ))
+    }
+
+    func testShouldReportMouseMotionTrueWhenColChanges() {
+        XCTAssertTrue(shouldReportMouseMotion(
+            lastReportedCell: CellPos(row: 3, col: 5), newCell: CellPos(row: 3, col: 6)
+        ))
+    }
+
+    /// codexレビュー指摘: タスク#88の再現条件そのもの——`touchesMoved`が
+    /// `lastMotionCell`を更新しながら抑止する逐次処理をここで模倣し、120Hz相当で
+    /// 同じセル内へ複数回飛んできたMOTIONが1回も送信されず、実際にセルが変わった
+    /// 時だけ送信されることを検証する(Android版
+    /// `MouseGestureArbiterTest.testABurstOfSameCellMotionEventsAfterPressCollapsesToASingleReport`
+    /// と対称)。
+    func testShouldReportMouseMotionCollapsesABurstOfSameCellEventsAfterPress() {
+        let pressCell = CellPos(row: 3, col: 5)
+        let incomingMotionEvents = [
+            CellPos(row: 3, col: 5), CellPos(row: 3, col: 5), CellPos(row: 3, col: 5),
+            CellPos(row: 4, col: 5),
+            CellPos(row: 4, col: 5), CellPos(row: 4, col: 5),
+        ]
+        var lastMotionCell = pressCell
+        var reportedCells: [CellPos] = []
+        for cell in incomingMotionEvents {
+            if shouldReportMouseMotion(lastReportedCell: lastMotionCell, newCell: cell) {
+                lastMotionCell = cell
+                reportedCells.append(cell)
+            }
+        }
+        XCTAssertEqual(reportedCells, [CellPos(row: 4, col: 5)])
+    }
+
     // MARK: - タスク#86: shouldResetBlinkPhase(blink初期表示位相の安定化)
 
     /// blink無し→blink有りへ新規遷移した場合はリセットが必要(SGR blinkセルの出現)。

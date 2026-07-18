@@ -163,6 +163,48 @@ class MouseGestureArbiterTest {
         )
     }
 
+    // ── shouldReportMouseMotion(タスク#88のセル単位dedup) ─────────────
+
+    @Test
+    fun `does not report motion when the new cell equals the last reported cell`() {
+        // xtermは同一セル内でのマウス移動を重複報告しない。ドラッグ中に指がわずかに
+        // 揺れて同じセル内へ戻ってきただけの場合は送信をスキップする。
+        assertFalse(shouldReportMouseMotion(CellPos(3, 5), CellPos(3, 5)))
+    }
+
+    @Test
+    fun `reports motion when the row changes`() {
+        assertTrue(shouldReportMouseMotion(CellPos(3, 5), CellPos(4, 5)))
+    }
+
+    @Test
+    fun `reports motion when the column changes`() {
+        assertTrue(shouldReportMouseMotion(CellPos(3, 5), CellPos(3, 6)))
+    }
+
+    @Test
+    fun `a burst of same-cell motion events after press collapses to a single report`() {
+        // codexレビュー指摘: タスク#88の再現条件そのもの——`TerminalScreen.kt`の
+        // ドラッグループが実際に行う「lastMotionCellを更新しながら抑止する」逐次処理を
+        // ここで模倣し、120Hz相当で同じセル内へ複数回飛んできたMOTIONが1回も送信されず、
+        // 実際にセルが変わった時だけ送信されることを検証する。
+        val pressCell = CellPos(3, 5)
+        val incomingMotionEvents = listOf(
+            CellPos(3, 5), CellPos(3, 5), CellPos(3, 5), // pressと同じセル内での揺れ
+            CellPos(4, 5), // 実際にセルが変わった
+            CellPos(4, 5), CellPos(4, 5), // 新セル内でまた揺れる
+        )
+        var lastMotionCell = pressCell
+        val reportedCells = mutableListOf<CellPos>()
+        for (cell in incomingMotionEvents) {
+            if (shouldReportMouseMotion(lastMotionCell, cell)) {
+                lastMotionCell = cell
+                reportedCells.add(cell)
+            }
+        }
+        assertEquals(listOf(CellPos(4, 5)), reportedCells)
+    }
+
     // ── wheelButtonForDelta ──────────────────────────────────────────
 
     @Test

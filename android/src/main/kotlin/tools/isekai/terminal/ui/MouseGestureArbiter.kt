@@ -95,6 +95,18 @@ fun classifyNormalGesture(
 }
 
 /**
+ * タスク#88(fableレビュー・グループD指摘): xtermは同一セル内でのマウス移動を
+ * 重複報告しないが、Composeの`awaitPointerEvent`は最大120Hz程度で発火しうるため、
+ * ドラッグ中は指がわずかに揺れただけでも同じセルへ何度もMOTIONイベントを
+ * SSHへ送ってしまっていた。呼び出し側([TerminalScreen.kt]のドラッグループ)が
+ * 直近に実際に送信したセル座標(`lastReportedCell`)を1変数として保持し、新しい
+ * セル座標([newCell])と比較する。座標が変わった場合のみ`true`(送信すべき)を返す。
+ * iOS版`TerminalScreenView.swift`の`shouldReportMouseMotion`と対称。
+ */
+fun shouldReportMouseMotion(lastReportedCell: CellPos, newCell: CellPos): Boolean =
+    newCell != lastReportedCell
+
+/**
  * トラックパッド/マウスホイールの`PointerEventType.Scroll`の縦方向delta量から、
  * 送出すべきxtermホイールボタンを決める。`deltaY == 0f`(スクロール量なし)は
  * 対象外として`null`を返す。符号規約はComposeのスクロール系APIと同じ:
