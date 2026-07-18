@@ -365,6 +365,21 @@ last_seen_at = "2026-07-04T00:00:00Z"
     }
 
     #[test]
+    fn ssh_host_key_trust_store_rejects_malformed_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME);
+        fs::write(&path, "this is not valid toml [[[").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let err = load_ssh_host_key_trust_store(&path).unwrap_err();
+        assert!(matches!(err, TrustError::Parse { .. }));
+    }
+
+    #[test]
     fn ssh_host_key_and_helper_trust_stores_use_different_file_names() {
         // The two store types must never collide on the same path even
         // when rooted at the same config directory — that's the whole
