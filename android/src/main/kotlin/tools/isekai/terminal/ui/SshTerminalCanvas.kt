@@ -356,9 +356,28 @@ fun SshTerminalCanvas(
     // としてRustが決定した値をそのまま見るだけ、iOS版`TerminalScreenView.swift`の
     // `blinkPhaseVisible`と対称)。xterm既定に近い0.53秒間隔でトグルする。
     // 点滅カーソルもこの同じ位相を共有する(xtermも同じ位相を共有する、iOS版と対称)。
+    //
+    // タスク#86: `LaunchedEffect`のキーは`hasBlink`/`cursorBlinks`を別々に渡さず
+    // `hasActiveBlink = hasBlink || cursorBlinks`という1つの値へ合成する(codexレビュー
+    // 2次指摘)。別々のキーのままだと、既にSGR blinkが点滅中の状態へ点滅カーソルが
+    // 追加された場合(`(true, false) → (true, true)`)のような「実質的には点滅状態が
+    // 継続しているだけ」の遷移でもEffectが再起動され、下記のリセット処理が既存の
+    // 点滅位相を不必要に巻き戻してしまう(iOS版`shouldResetBlinkPhase`が「既に
+    // 点滅中なら新規遷移ではない」として区別しているのと不整合になる)。1つの
+    // boolean値へ合成しておけば、Composeの`LaunchedEffect`キー比較自体が「無→有」
+    // 遷移かどうかを自動的に判定してくれるため、iOS側のような明示的な状態比較なしに
+    // 同じ意味論を実現できる。
+    val hasActiveBlink = hasBlink || cursorBlinks
     var blinkPhaseVisible by remember { mutableStateOf(true) }
-    LaunchedEffect(hasBlink, cursorBlinks) {
-        if (!hasBlink && !cursorBlinks) return@LaunchedEffect
+    LaunchedEffect(hasActiveBlink) {
+        if (!hasActiveBlink) return@LaunchedEffect
+        // このEffectが(再)起動される瞬間(=`hasActiveBlink`がfalse→trueへ新規遷移した
+        // 瞬間)に`blinkPhaseVisible`を必ずtrueへ戻す。リセットしないと、前回のEffect
+        // 実行が「消灯」側(false)で終わっていた場合、新しいblinkテキスト/点滅カーソルが
+        // 最初から最大530ms不可視のまま表示されてしまう(fable/codexレビュー指摘、
+        // iOS版`TerminalScreenView.swift`の`draw(_:)`内blink有無の新規遷移検知による
+        // リセットと対称)。
+        blinkPhaseVisible = true
         while (true) {
             delay(530)
             blinkPhaseVisible = !blinkPhaseVisible

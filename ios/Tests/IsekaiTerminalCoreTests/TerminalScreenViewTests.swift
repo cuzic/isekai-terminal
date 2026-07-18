@@ -466,6 +466,93 @@ final class TerminalScreenViewTests: XCTestCase {
         XCTAssertEqual(result.carry, 3, accuracy: 0.0001)
     }
 
+    // MARK: - タスク#86: shouldResetBlinkPhase(blink初期表示位相の安定化)
+
+    /// blink無し→blink有りへ新規遷移した場合はリセットが必要(SGR blinkセルの出現)。
+    func testShouldResetBlinkPhaseWhenBlinkCellFirstAppears() {
+        XCTAssertTrue(shouldResetBlinkPhase(
+            newHasBlink: true, newCursorBlinks: false,
+            previousHasBlink: false, previousCursorBlinks: false
+        ))
+    }
+
+    /// blink無し→blink有りへ新規遷移した場合はリセットが必要(点滅カーソルの出現)。
+    func testShouldResetBlinkPhaseWhenCursorBlinkFirstAppears() {
+        XCTAssertTrue(shouldResetBlinkPhase(
+            newHasBlink: false, newCursorBlinks: true,
+            previousHasBlink: false, previousCursorBlinks: false
+        ))
+    }
+
+    /// 既にSGR blinkセルが表示されている状態で点滅カーソルが追加されても、
+    /// (どちらか一方は既に有った以上)新規遷移ではないためリセット不要
+    /// ——位相が既に「点灯」側にあるとは限らないが、その位相自体は既存の
+    /// blinkセルにとっては正しく継続中であるべきで、勝手に巻き戻さない。
+    func testShouldResetBlinkPhaseNotNeededWhenAlreadyBlinkingBeforehand() {
+        XCTAssertFalse(shouldResetBlinkPhase(
+            newHasBlink: true, newCursorBlinks: true,
+            previousHasBlink: true, previousCursorBlinks: false
+        ))
+    }
+
+    /// blink有りの状態が継続しているだけ(前回も今回もSGR blinkセルが有る)ならリセット不要。
+    func testShouldResetBlinkPhaseNotNeededWhenBlinkContinues() {
+        XCTAssertFalse(shouldResetBlinkPhase(
+            newHasBlink: true, newCursorBlinks: false,
+            previousHasBlink: true, previousCursorBlinks: false
+        ))
+    }
+
+    /// blinkが無い状態が続いているだけならリセット不要(トグルは走っていても無関係)。
+    func testShouldResetBlinkPhaseNotNeededWhenNoBlinkAtAll() {
+        XCTAssertFalse(shouldResetBlinkPhase(
+            newHasBlink: false, newCursorBlinks: false,
+            previousHasBlink: false, previousCursorBlinks: false
+        ))
+    }
+
+    /// blink有り→blink無しへ遷移する場合もリセット不要(新規出現ではなく消滅なので、
+    /// 次に何か出現するまで位相を動かす理由が無い)。
+    func testShouldResetBlinkPhaseNotNeededWhenBlinkDisappears() {
+        XCTAssertFalse(shouldResetBlinkPhase(
+            newHasBlink: false, newCursorBlinks: false,
+            previousHasBlink: true, previousCursorBlinks: false
+        ))
+    }
+
+    /// `draw(_:)`自体の回帰確認: blink無し→blink有りへ新規遷移する`ScreenUpdate`の連続適用が
+    /// クラッシュせず完走すること(他の`testDraw*DoesNotCrash`と同じ方針。`blinkPhaseVisible`は
+    /// privateで直接検証できないため、実際のリセットはユニットテスト側の
+    /// `shouldResetBlinkPhase`で検証する)。
+    func testDrawAfterBlinkCellNewlyAppearsDoesNotCrash() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        func cell(blink: Bool) -> CellData {
+            CellData(
+                ch: "A", fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false, dim: false, italic: false,
+                underline: false, strikethrough: false, blink: blink, invisible: false, linkId: nil
+            )
+        }
+        func update(blink: Bool) -> ScreenUpdate {
+            ScreenUpdate(
+                cols: 1, rows: 1, cells: [cell(blink: blink)],
+                cursorRow: 0, cursorCol: 0,
+                title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+                mouseReportingMode: .off, sgrMouseMode: false,
+                cursorVisible: false, bellGeneration: 0,
+                cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
+            )
+        }
+
+        view.apply(update(blink: false))
+        view.layoutIfNeeded()
+        let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
+        _ = renderer.image { _ in view.draw(view.bounds) }
+
+        // blink無し→blink有りへ新規遷移。
+        view.apply(update(blink: true))
+        _ = renderer.image { _ in view.draw(view.bounds) }
+    }
+
     // MARK: - タスク#20: 動的resize(view bounds→cols/rows→onSizeChanged)
 
     func testOnSizeChangedFiresWithComputedColsAndRowsOnLayout() {
