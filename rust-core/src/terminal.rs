@@ -1210,6 +1210,87 @@ impl Terminal {
             Some(vec![0x1B, b'[', b'M', 32 + cb, clamp_coord(col), clamp_coord(row)])
         }
     }
+
+    /// OSC 10(`is_fg == true`)/OSC 11(`is_fg == false`)の set/query 共通処理(タスク#58)。
+    /// `spec == "?"`はquery——現在のtheme既定色を`rgb:RRRR/GGGG/BBBB`形式で
+    /// `pending_terminal_responses`に積む(応答経路はDA/DSRと同じ、タスク#38)。
+    /// それ以外はsetとして解釈を試み、パースできた場合のみ`self.theme`を更新する
+    /// (`set_theme()`のdoc commentの通り、既に解決済みのセルは遡って再着色されない
+    /// ——このOSCによるsetも同じ制約を継承する)。パースできない`spec`は無視する
+    /// (実端末も未知のcolor specは無視して応答もしない)。
+    fn handle_osc_default_color(&mut self, is_fg: bool, spec: &[u8], bell_terminated: bool) {
+        if spec == b"?" {
+            let color = if is_fg { self.theme.default_fg } else { self.theme.default_bg };
+            let r = ((color >> 16) & 0xFF) as u8;
+            let g = ((color >> 8) & 0xFF) as u8;
+            let b = (color & 0xFF) as u8;
+            let terminator: &[u8] = if bell_terminated { b"\x07" } else { b"\x1b\\" };
+            let osc_num: &[u8] = if is_fg { b"10" } else { b"11" };
+            let mut resp = Vec::with_capacity(32);
+            resp.extend_from_slice(b"\x1b]");
+            resp.extend_from_slice(osc_num);
+            resp.extend_from_slice(format!(";rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}", r, r, g, g, b, b).as_bytes());
+            resp.extend_from_slice(terminator);
+            self.pending_terminal_responses.push(resp);
+            return;
+        }
+        if let Some(argb) = parse_osc_color_spec(spec) {
+            if is_fg {
+                // `cur_attrs.fg`はSGR実行時点で`theme.default_fg`から具体値へ解決済み
+                // (`default_for`/SGR `39`)なので、その値が「今の」既定色と一致している
+                // 間はまだ明示的な色指定を受けていない=論理的に"default"を指しているとみなし、
+                // 新しい既定色へ追従させる(codexレビュー指摘: これをしないと、OSC 10/11
+                // set直後SGRリセットを挟まず印字した文字が旧既定色のまま描かれてしまう)。
+                // 既に別の色をSGRで明示指定済みのcur_attrsには影響しない。
+                if self.cur_attrs.fg == self.theme.default_fg {
+                    self.cur_attrs.fg = argb;
+                }
+                self.theme.default_fg = argb;
+            } else {
+                if self.cur_attrs.bg == self.theme.default_bg {
+                    self.cur_attrs.bg = argb;
+                }
+                self.theme.default_bg = argb;
+            }
+        }
+    }
+}
+
+/// OSC 10/11などが使う`Pt`のcolor spec(`rgb:R.../G.../B...`または`#RRGGBB`系)を
+/// ARGB(`0xFFRRGGBB`)へパースする(タスク#58)。xtermの実装同様、各成分は1〜4桁の
+/// 16進数(`rgb:`形式)または、3つの等長16進成分(`#`形式、3/6/9/12桁)を許す。
+/// 桁数がその成分の表現できる最大値未満のスケールで表現されている場合は
+/// 8bitへ丸めてスケールする(例: `rgb:f/0/0`は`0xFFFF0000`相当の赤)。
+fn parse_osc_color_spec(spec: &[u8]) -> Option<u32> {
+    let s = std::str::from_utf8(spec).ok()?;
+    let scale = |hex: &str| -> Option<u8> {
+        if hex.is_empty() || hex.len() > 4 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        let max = (1u32 << (hex.len() as u32 * 4)) - 1;
+        Some(((v * 255 + max / 2) / max) as u8)
+    };
+    if let Some(rest) = s.strip_prefix("rgb:") {
+        let mut parts = rest.split('/');
+        let (r, g, b) = (parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        let (r, g, b) = (scale(r)?, scale(g)?, scale(b)?);
+        return Some(0xFF000000 | (r as u32) << 16 | (g as u32) << 8 | b as u32);
+    }
+    if let Some(rest) = s.strip_prefix('#') {
+        let n = rest.len();
+        if n == 0 || n % 3 != 0 || n > 12 || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let per = n / 3;
+        let comp = |idx: usize| -> Option<u8> { scale(&rest[idx * per..(idx + 1) * per]) };
+        let (r, g, b) = (comp(0)?, comp(1)?, comp(2)?);
+        return Some(0xFF000000 | (r as u32) << 16 | (g as u32) << 8 | b as u32);
+    }
+    None
 }
 
 /// SGR `38`(前景色)/`48`(背景色)ケースが共通で使う拡張色パース。
@@ -1670,12 +1751,27 @@ impl Perform for Terminal {
         }
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         match (params.get(0), params.get(1)) {
             (Some(&b"0"), Some(title)) | (Some(&b"2"), Some(title)) => {
                 if let Ok(s) = std::str::from_utf8(title) {
                     self.title = Some(s.to_string());
                 }
+            }
+            // OSC 10/11(`ESC]10;<spec>ST`/`ESC]11;<spec>ST`): default
+            // foreground/background色のset・query(タスク#58)。vim/neovimは
+            // 起動時に`ESC]11;?`をqueryして背景の明暗を判定し
+            // `background`オプション(termguicolors連携)を自動設定するため、
+            // 特にqueryへの応答実装が実利が大きい(Fableレビュー指摘)。
+            // `Pt == "?"`はquery(host→remoteへ現在値を返す)、それ以外は
+            // set(このセッションのtheme既定色を更新する)。応答は新しい
+            // transport経路を作らず、DA/DSR(タスク#38)と同じ
+            // `pending_terminal_responses`→`SideEffect::SendStdin`経路に乗せる。
+            (Some(&b"10"), Some(&spec)) => {
+                self.handle_osc_default_color(true, spec, bell_terminated);
+            }
+            (Some(&b"11"), Some(&spec)) => {
+                self.handle_osc_default_color(false, spec, bell_terminated);
             }
             // OSC 52 (`ESC]52;<selection>;<base64|?>BEL`): clipboard set.
             // `<selection>` (params[1], conventionally `c`/`p`/...) is not
@@ -2337,6 +2433,87 @@ mod tests {
         feed(&mut t, b"\x1b[6n"); // CPR要求をpendingにする
         feed(&mut t, b"\x1bc"); // RIS (full reset)
         assert!(t.take_pending_terminal_responses().is_empty());
+    }
+
+    // ── OSC 10/11 default fg/bg のset/query(タスク#58) ────────────────────────
+
+    #[test]
+    fn test_osc10_query_reports_default_fg_bell_terminated() {
+        let mut t = Terminal::new(80, 24, Theme::default()); // default_fg = 0xFFCCCCCC
+        feed(&mut t, b"\x1b]10;?\x07"); // BEL終端でquery
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]10;rgb:cccc/cccc/cccc\x07".to_vec()]);
+    }
+
+    #[test]
+    fn test_osc11_query_reports_default_bg_st_terminated() {
+        let mut t = Terminal::new(80, 24, Theme::default()); // default_bg = 0xFF000000
+        feed(&mut t, b"\x1b]11;?\x1b\\"); // ST(ESC \\)終端でquery — 応答も同じ終端子を使うべき
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec()]);
+    }
+
+    #[test]
+    fn test_osc10_query_reports_custom_session_theme() {
+        let mut theme = Theme::default();
+        theme.default_fg = 0xFF112233;
+        let mut t = Terminal::new(80, 24, theme);
+        feed(&mut t, b"\x1b]10;?\x07");
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]10;rgb:1111/2222/3333\x07".to_vec()]);
+    }
+
+    #[test]
+    fn test_osc10_set_rgb_form_updates_theme_for_subsequent_query() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]10;rgb:ff/00/00\x07"); // fgを赤に設定(2桁hex成分)
+        feed(&mut t, b"\x1b]10;?\x07");
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]10;rgb:ffff/0000/0000\x07".to_vec()]);
+    }
+
+    #[test]
+    fn test_osc11_set_hash_form_updates_theme_for_subsequent_query() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]11;#112233\x07"); // `#RRGGBB`形式
+        feed(&mut t, b"\x1b]11;?\x07");
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]11;rgb:1111/2222/3333\x07".to_vec()]);
+    }
+
+    #[test]
+    fn test_osc10_set_invalid_spec_is_ignored() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]10;not-a-color\x07");
+        feed(&mut t, b"\x1b]10;?\x07");
+        // 既定値のまま変わっていないこと
+        assert_eq!(t.take_pending_terminal_responses(), vec![b"\x1b]10;rgb:cccc/cccc/cccc\x07".to_vec()]);
+    }
+
+    #[test]
+    fn test_osc10_set_does_not_queue_a_response() {
+        // set(query以外)は何も送り返さない——実端末もsetそのものには応答しない。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]10;rgb:ff/00/00\x07");
+        assert!(t.take_pending_terminal_responses().is_empty());
+    }
+
+    #[test]
+    fn test_osc10_set_immediately_affects_text_printed_without_intervening_sgr() {
+        // codexレビュー指摘: cur_attrs.fgはSGR実行時点で既定色から具体値へ解決済みのため、
+        // OSC 10 set直後にSGRリセットを挟まず印字すると、`self.theme`だけ更新しても
+        // 旧既定色のまま描かれてしまう。setがまだ明示色指定を受けていないcur_attrsを
+        // 新しい既定色へ追従させることを確認する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]10;rgb:ff/00/00\x07"); // fgを赤に設定
+        feed(&mut t, b"x"); // SGRリセットを挟まず印字
+        assert_eq!(t.screen_cells()[0].fg, 0xFFFF0000);
+    }
+
+    #[test]
+    fn test_osc10_set_does_not_override_explicitly_colored_sgr() {
+        // 既にSGRで明示的に色指定済みのcur_attrsは、OSC 10 setで既定色が変わっても
+        // 追従してはいけない(まだ"default"を指していない)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[32m"); // fgを緑(SGR 32)に明示指定
+        feed(&mut t, b"\x1b]10;rgb:ff/00/00\x07"); // 既定fgを赤に変更
+        feed(&mut t, b"x");
+        assert_eq!(t.screen_cells()[0].fg, Theme::default().ansi16[2], "明示指定した緑のまま変わらないこと");
     }
 
     #[test]
