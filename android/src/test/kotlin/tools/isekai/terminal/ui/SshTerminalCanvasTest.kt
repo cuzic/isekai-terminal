@@ -77,6 +77,24 @@ class SshTerminalCanvasTest {
         assertEquals(listOf(BgRun(2, 4, red)), runs)
     }
 
+    // ── dimmedArgb: SGR 2(dim)の前景色alpha計算(タスク#22) ──────────────
+
+    @Test
+    fun `dimmedArgb scales down the alpha channel while keeping rgb unchanged`() {
+        val opaqueWhite = 0xFFFFFFFF.toInt()
+        val dimmed = dimmedArgb(opaqueWhite)
+        assertEquals(0x00FFFFFF, dimmed and 0x00FFFFFF)
+        val dimmedAlpha = (dimmed ushr 24) and 0xFF
+        assertEquals(153, dimmedAlpha) // 255 * 0.6 = 153
+    }
+
+    @Test
+    fun `dimmedArgb never overflows into a negative alpha`() {
+        val transparent = 0x00112233
+        val dimmed = dimmedArgb(transparent)
+        assertEquals(0, (dimmed ushr 24) and 0xFF)
+    }
+
     @Test
     fun `rowStart offset is respected so other rows are ignored`() {
         val red = 0xFFFF0000.toInt()
@@ -90,7 +108,7 @@ class SshTerminalCanvasTest {
     }
 
     private fun screenUpdate() = ScreenUpdate(
-        80u, 24u, emptyList(), 0u, 0u, null, false, false,
+        80u, 24u, emptyList(), 0u, 0u, null, false, false, false,
         MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(),
         emptyList(), 0u,
     )
@@ -129,42 +147,56 @@ class SshTerminalCanvasTest {
     @Test
     fun `GridRenderCache requires rerender on first use`() {
         val cache = GridRenderCache()
-        assertTrue(cache.needsRerender(screenUpdate(), 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE))
+        assertTrue(cache.needsRerender(screenUpdate(), 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false))
     }
 
     @Test
     fun `GridRenderCache does not require rerender when nothing changed`() {
         val cache = GridRenderCache()
         val update = screenUpdate()
-        cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE)
-        assertFalse(cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE))
+        cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false)
+        assertFalse(cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false))
     }
 
     @Test
     fun `GridRenderCache requires rerender when only typeface changes`() {
         val cache = GridRenderCache()
         val update = screenUpdate()
-        cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE)
+        cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false)
         assertTrue(
             "フォント変更後も同じScreenUpdate/サイズなら古いフォントで描いたBitmapが再利用されてしまう",
-            cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.SERIF),
+            cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.SERIF, false),
         )
     }
 
     @Test
     fun `GridRenderCache requires rerender when a new ScreenUpdate instance arrives`() {
         val cache = GridRenderCache()
-        cache.markRendered(screenUpdate(), 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE)
-        assertTrue(cache.needsRerender(screenUpdate(), 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE))
+        cache.markRendered(screenUpdate(), 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false)
+        assertTrue(cache.needsRerender(screenUpdate(), 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false))
     }
 
     @Test
     fun `GridRenderCache invalidate forces rerender even if nothing else changed`() {
         val cache = GridRenderCache()
         val update = screenUpdate()
-        cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE)
+        cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false)
         cache.invalidate()
-        assertTrue(cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE))
+        assertTrue(cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false))
+    }
+
+    @Test
+    fun `GridRenderCache requires rerender when only blink phase changes`() {
+        // Fableレビュー2次で指摘された罠: ScreenUpdate自体は変わらずblink位相だけが
+        // 反転するケースでも、キャッシュキーにblinkPhaseを含めていないと再描画されず
+        // 「一度描かれたきり点滅しない」バグになる。
+        val cache = GridRenderCache()
+        val update = screenUpdate()
+        cache.markRendered(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, blinkPhase = false)
+        assertTrue(
+            "blink位相の反転だけでは他のキーが変わらないため、blinkPhaseをキーに含めないと再描画がスキップされてしまう",
+            cache.needsRerender(update, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, blinkPhase = true),
+        )
     }
 
     // ── SixelBitmapCache(タスク#42) ──────────────────────────────
