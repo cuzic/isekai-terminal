@@ -1062,6 +1062,13 @@ impl Terminal {
         }
     }
 
+    /// SU(`CSI Ps S`)。scroll region内を`n`行分上方向へシフトし、下端を空行で
+    /// 埋める。[scroll_down_region](SD)と同じ理由で、シフト対象が0行になる
+    /// (`n == region_size`)場合はシフトループ自体をスキップする — `bot - n`を
+    /// `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため
+    /// (タスク#69: `Ps`がフルスクロール領域幅以上のときに実際に踏んでいた既存
+    /// バグの修正。空行埋めの範囲も`bot - n + 1`ではなく`bot + 1 - n`の順序で
+    /// 計算し同じ理由のアンダーフローを避ける)。
     fn scroll_up_region(&mut self, n: usize) {
         // Sixel(タスク#42): スクロールは画像が乗っていたグリッド位置の内容を
         // 別の内容へ置き換えるため、既存の画像配置は無条件に消す(`clear_images`
@@ -1069,7 +1076,8 @@ impl Terminal {
         self.clear_images();
         let top = self.scroll_top;
         let bot = self.scroll_bottom;
-        let n = n.min(bot - top + 1);
+        let region_size = bot - top + 1;
+        let n = n.min(region_size);
         let cols = self.cols;
 
         if top == 0 && !self.alt_active {
@@ -1080,14 +1088,16 @@ impl Terminal {
             }
         }
 
-        for row in top..=(bot - n) {
-            for col in 0..cols {
-                let src = self.cells_mut()[(row + n) * cols + col].clone();
-                self.cells_mut()[row * cols + col] = src;
+        if n < region_size {
+            for row in top..=(bot - n) {
+                for col in 0..cols {
+                    let src = self.cells_mut()[(row + n) * cols + col].clone();
+                    self.cells_mut()[row * cols + col] = src;
+                }
             }
         }
-        for row in (bot - n + 1)..=bot {
-            let blank = self.blank();
+        let blank = self.blank();
+        for row in (bot + 1 - n)..=bot {
             for col in 0..cols {
                 self.cells_mut()[row * cols + col] = blank.clone();
             }
@@ -2371,6 +2381,34 @@ mod tests {
         let pending = t.take_scrollback();
         assert!(!pending.is_empty());
         assert!(t.take_scrollback().is_empty());  // 2 回目は空
+    }
+
+    #[test]
+    fn test_su_clamp_count_beyond_region_size_without_panic() {
+        // タスク#69: `n`がフルスクロール領域幅(ここでは5)以上のとき、
+        // `scroll_up_region`が`bot - n`で`usize`アンダーフローしてpanicしていた
+        // 既存バグの回帰テスト(`test_sd_clamp_count_beyond_region_size_without_panic`
+        // と対称)。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t, b"\x1b[100S");
+        for row in 0..5 {
+            assert_eq!(cell(&t, row, 0), " ", "row {row} should be blank after over-sized SU");
+        }
+    }
+
+    #[test]
+    fn test_su_full_region_scroll_pushes_all_rows_to_pending_scrollback() {
+        // `n == region_size`(regionが画面全体、top==0)のとき、押し出された全行が
+        // pending_scrollbackへ積まれ、かつpanicしないことを確認する。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        feed(&mut t, b"\x1b[5S");
+        let pending = t.take_scrollback();
+        assert_eq!(pending.len(), 5);
+        for row in 0..5 {
+            assert_eq!(cell(&t, row, 0), " ", "row {row} should be blank after full-region SU");
+        }
     }
 
     #[test]
