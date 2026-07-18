@@ -312,6 +312,14 @@ class TerminalSession(
      *  マルチパス以外のtransportや未接続時はRust側で無視される。 */
     fun forceReturnToWifi() = orchestrator.forceReturnToWifi()
 
+    /** #60: このペインがOS/UI上でフォーカスを得た(=タブ切替やsplit pane切替で
+     *  「アクティブなタブかつフォーカス中のペイン」になった)/失ったことをそのまま
+     *  Rust側へ転送する。フォーカスレポーティング(`CSI ?1004`)が有効な場合にのみ
+     *  `CSI I`/`CSI O`がリモートへ送られるかどうかの判断はRust側(`Terminal`)が持つ
+     *  (rust-ssot)。呼び出し元([TerminalScreenBody]の`isActive && hasFocus`)は
+     *  生の可視性/フォーカス状態を渡すだけでよい。 */
+    fun notifyFocusChange(focused: Boolean) = orchestrator.notifyFocusChange(focused)
+
     // ── Host key ──────────────────────────────────────────────────────
 
     fun trustUpdatedHostKey() {

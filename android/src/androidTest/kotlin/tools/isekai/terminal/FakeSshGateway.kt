@@ -103,6 +103,9 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun resize(cols: UInt, rows: UInt) { lastResizeCols = cols; lastResizeRows = rows }
     override fun scrollbackLen(): UInt = 0u
     override fun scrollbackCells(offset: UInt, rows: UInt): List<CellData> = emptyList()
+    override fun searchScrollback(query: String, caseSensitive: Boolean): List<ScrollbackSearchMatch> = emptyList()
+    var notifyFocusChangeCalls = mutableListOf<Boolean>()
+    override fun notifyFocusChange(focused: Boolean) { notifyFocusChangeCalls.add(focused) }
     override fun trzszAcceptDownload() { trzszAcceptDownloadCount++ }
     override fun trzszAcceptUpload(fileName: String, fileSize: ULong, mode: UInt) { trzszAcceptUploadCount++ }
     override fun trzszSendChunk(data: ByteArray, isLast: Boolean) {}

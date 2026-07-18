@@ -92,6 +92,10 @@ data class TerminalScreenActions(
     val onPreviousTab: () -> Unit = {},
     /** #14: 「今すぐWiFiに戻す」。マルチパス以外のセッションでは呼んでもRust側で無視される。 */
     val onForceReturnToWifi: () -> Unit = {},
+    /** #60: このペインの実効フォーカス状態(`isActive && hasFocus`)が変化するたびに
+     *  そのまま呼ばれる。フォーカスレポーティング(`CSI ?1004`)が有効かどうかの判断は
+     *  Rust側が持つため、ここでは生の値を渡すだけでよい。 */
+    val onFocusChanged: (Boolean) -> Unit = {},
 )
 
 /**
@@ -130,6 +134,14 @@ fun TerminalScreenBody(
     // 上部バーを強制的に再表示する。
     LaunchedEffect(connected, isActive) {
         if (isActive && !connected) onUserActivity()
+    }
+    // #60: フォーカスレポーティング(`CSI ?1004`)。「タブ/split paneを跨いでこのペインが
+    // 今まさに入力を受け付けている状態」(isActive && hasFocus)の変化をそのままRust側へ
+    // 転送する(モバイル版の「ターミナルウィンドウのフォーカス」の実効的な定義 —
+    // タブ切替・split pane切替のたびに発火する)。有効/無効の判断はRust側が持つ
+    // (rust-ssot)ので、ここでは生の可視性/フォーカス状態を渡すだけでよい。
+    LaunchedEffect(isActive, hasFocus) {
+        actions.onFocusChanged(isActive && hasFocus)
     }
     val statusMsg = uiState.statusMsg
     val screenUpdate = uiState.screenUpdate

@@ -448,6 +448,7 @@ private fun TerminalPaneScreen(
                     onNextTab = { tabsVm.nextTab() },
                     onPreviousTab = { tabsVm.previousTab() },
                     onForceReturnToWifi = { pane.session.forceReturnToWifi() },
+                    onFocusChanged = { focused -> pane.session.notifyFocusChange(focused) },
                 ),
             )
 
