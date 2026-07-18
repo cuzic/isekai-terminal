@@ -7,3 +7,4 @@
 
 pub(crate) mod child_stdio;
 pub(crate) mod host_key_trust;
+pub(crate) mod private_key;
