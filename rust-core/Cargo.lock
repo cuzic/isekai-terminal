@@ -1670,6 +1670,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "signature",
+ "ssh-encoding",
  "tempfile",
  "tokio",
  "ureq",

@@ -18,6 +18,8 @@ isekai-auth = { path = "../isekai-auth" }
 isekai-pipe-core = { path = "../isekai-pipe-core" }
 isekai-protocol = { path = "../isekai-protocol" }
 russh-stream-session = { path = "../russh-stream-session" }
+russh = "0.48"
+russh-keys = "0.48"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "signal", "net", "process"] }
 log = "0.4"
@@ -34,6 +36,10 @@ async-trait = "0.1.89"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-russh = "0.48"
-russh-keys = "0.48"
 tempfile = "3"
+# Only for native/agent_auth.rs's FakeMultiKeySigner test double, which
+# needs to produce a real SSH signature blob (same versions russh-keys' own
+# ssh-key dependency pins — see russh-stream-session/Cargo.toml's identical
+# comment, this mirrors that).
+ssh-encoding = "0.2"
+signature = "2"

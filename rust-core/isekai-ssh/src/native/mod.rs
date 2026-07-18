@@ -5,6 +5,7 @@
 //! Windows), but only ever *invoked* on `cfg(windows)` — the Unix path
 //! keeps shelling out to real `ssh(1)` via [`super::wrapper`] unchanged.
 
+pub(crate) mod agent_auth;
 pub(crate) mod child_stdio;
 pub(crate) mod host_key_trust;
 pub(crate) mod private_key;
