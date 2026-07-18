@@ -58,9 +58,23 @@ pub struct HostConfig {
     /// `"host1,host2"` for a multi-hop chain) — parsing this into hops is
     /// the caller's job.
     pub proxy_jump: Option<String>,
-    pub forward_agent: Option<bool>,
-    /// Raw value: a socket/pipe path, `"SSH_AUTH_SOCK"`, or `"none"`.
-    pub identity_agent: Option<String>,
+    pub forward_agent: Option<ForwardAgent>,
+    /// Tilde-expanded, like `IdentityFile` (`ssh -G` expands `~` here too).
+    /// May still be a sentinel rather than a real path (`"SSH_AUTH_SOCK"`
+    /// meaning "use the env var", or `"none"` meaning "disabled") — this
+    /// crate doesn't try to distinguish those from real paths.
+    pub identity_agent: Option<PathBuf>,
+}
+
+/// `ssh_config(5)` `ForwardAgent` accepts `yes`/`no` or an explicit agent
+/// socket path/env-var reference to forward instead of the default one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardAgent {
+    Yes,
+    No,
+    /// Raw value (a path or `$ENV_VAR`-style reference) — not tilde-expanded
+    /// since it may not be a literal path (e.g. an env var name).
+    Socket(String),
 }
 
 /// Resolves `HostConfig` for `destination` from `~/.ssh/config` (`HOME` on
@@ -111,7 +125,13 @@ fn resolve_from_file(
         let (keyword, rest) = split_keyword(line);
         let lower = keyword.to_ascii_lowercase();
         match lower.as_str() {
-            "include" => {
+            // Include splices the referenced file's lines in at this exact
+            // point (ssh_config(5)) — if we're currently inside a
+            // non-matching Host/Match block, the spliced-in content
+            // inherits that inactivity too, so skip the include entirely
+            // rather than let it unconditionally re-activate at the top of
+            // the included file.
+            "include" if active => {
                 for pattern in split_words(rest) {
                     for include in expand_include_pattern(&pattern, base_dir)? {
                         resolve_from_file(&include, destination, visited, config)?;
@@ -157,31 +177,39 @@ fn apply_keyword(config: &mut HostConfig, keyword: &str, value: &str) {
         }
         "forwardagent" => {
             if config.forward_agent.is_none() {
-                config.forward_agent = parse_yes_no(value);
+                config.forward_agent = Some(parse_forward_agent(value));
             }
         }
         "identityagent" => {
             if config.identity_agent.is_none() {
-                config.identity_agent = Some(value.to_string());
+                config.identity_agent = Some(expand_tilde(value));
             }
         }
         _ => {}
     }
 }
 
-fn parse_yes_no(value: &str) -> Option<bool> {
+fn parse_forward_agent(value: &str) -> ForwardAgent {
     match value.to_ascii_lowercase().as_str() {
-        "yes" => Some(true),
-        "no" => Some(false),
-        _ => None,
+        "yes" => ForwardAgent::Yes,
+        "no" => ForwardAgent::No,
+        _ => ForwardAgent::Socket(value.to_string()),
     }
 }
 
+/// `ssh_config(5)` allows `Keyword value` (whitespace-separated) or
+/// `Keyword=value` (`=`, optionally surrounded by whitespace on either
+/// side) — both forms are in real-world use. Matches OpenSSH's own
+/// `strdelim`, which treats both whitespace and a single `=` as the
+/// keyword/value delimiter.
 fn split_keyword(line: &str) -> (&str, &str) {
-    match line.find(char::is_whitespace) {
-        Some(index) => (&line[..index], line[index..].trim()),
-        None => (line, ""),
+    let end = line.find(|c: char| c.is_whitespace() || c == '=').unwrap_or(line.len());
+    let keyword = &line[..end];
+    let mut rest = line[end..].trim_start();
+    if let Some(stripped) = rest.strip_prefix('=') {
+        rest = stripped.trim_start();
     }
+    (keyword, rest)
 }
 
 fn split_words(input: &str) -> impl Iterator<Item = String> + '_ {
@@ -309,8 +337,8 @@ Host example
         assert_eq!(config.port, Some(2222));
         assert_eq!(config.identity_file, vec![PathBuf::from("/home/alice/.ssh/id_ed25519")]);
         assert_eq!(config.proxy_jump.as_deref(), Some("jump-host"));
-        assert_eq!(config.forward_agent, Some(true));
-        assert_eq!(config.identity_agent.as_deref(), Some("/run/user/1000/ssh-agent"));
+        assert_eq!(config.forward_agent, Some(ForwardAgent::Yes));
+        assert_eq!(config.identity_agent.as_deref(), Some(Path::new("/run/user/1000/ssh-agent")));
     }
 
     #[test]
@@ -422,5 +450,103 @@ Host example
         assert_eq!(expand_tilde_with("~/.ssh/id_ed25519", home), PathBuf::from("/home/alice/.ssh/id_ed25519"));
         assert_eq!(expand_tilde_with("~", None), PathBuf::from("~"));
         assert_eq!(expand_tilde_with("/absolute/path", Some(PathBuf::from("/home/alice"))), PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn include_inside_a_non_matching_host_block_is_not_applied() {
+        // Codex review finding: Include splices the referenced file's lines
+        // in at that exact point (ssh_config(5)) — if the enclosing Host
+        // block doesn't match, the spliced-in content must inherit that
+        // inactivity too, even if the included file's own top-level lines
+        // have no Host block of their own.
+        let dir = tempfile::tempdir().unwrap();
+        write_config(&dir, "extra.conf", "User from-include\n");
+        let main = write_config(&dir, "config", &format!("
+Host does-not-match
+    Include {}/extra.conf
+", dir.path().display()));
+        let config = resolve(&main, "example").unwrap();
+        assert_eq!(config.user, None, "Include under a non-matching Host block must not apply");
+    }
+
+    #[test]
+    fn forward_agent_socket_path_is_preserved_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host example
+    ForwardAgent /tmp/custom-agent.sock
+");
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.forward_agent, Some(ForwardAgent::Socket("/tmp/custom-agent.sock".to_string())));
+    }
+
+    #[test]
+    fn identity_agent_is_tilde_expanded_like_identity_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host example
+    IdentityAgent ~/.ssh/agent.sock
+");
+        // Uses the real home_dir() (HOME/USERPROFILE) since IdentityAgent
+        // resolution goes through expand_tilde (not expand_tilde_with) —
+        // just assert it's an absolute path under whatever HOME actually is,
+        // without asserting a specific value (avoids mutating env vars).
+        let config = resolve(&path, "example").unwrap();
+        let identity_agent = config.identity_agent.expect("IdentityAgent should resolve");
+        assert!(identity_agent.is_absolute() || !identity_agent.to_string_lossy().starts_with('~'));
+    }
+
+    #[test]
+    fn duplicate_keyword_within_same_host_block_first_line_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host example
+    User first
+    User second
+");
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.user.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn include_cycle_does_not_infinite_loop() {
+        // The self-include itself is a no-op (already-visited path is
+        // skipped, preventing infinite recursion) — but that only skips
+        // *re-entering* the same file, not the rest of the current file's
+        // lines, so "User after-cycle" (which comes after the Include line,
+        // in the same file, still executing in the outer call frame) must
+        // still apply. The thing under test is "doesn't hang or error", not
+        // that the include has no effect on anything.
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("config");
+        std::fs::write(&main_path, format!("Include {}\nUser after-cycle\n", main_path.display())).unwrap();
+        let config = resolve(&main_path, "example").unwrap();
+        assert_eq!(config.user.as_deref(), Some("after-cycle"));
+    }
+
+    #[test]
+    fn multiple_positive_host_patterns_on_one_line_all_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host foo bar baz
+    User alice
+");
+        assert_eq!(resolve(&path, "foo").unwrap().user.as_deref(), Some("alice"));
+        assert_eq!(resolve(&path, "bar").unwrap().user.as_deref(), Some("alice"));
+        assert_eq!(resolve(&path, "baz").unwrap().user.as_deref(), Some("alice"));
+        assert_eq!(resolve(&path, "qux").unwrap().user, None);
+    }
+
+    #[test]
+    fn key_equals_value_syntax_is_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host example
+    User=alice
+    Port = 2222
+");
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.user.as_deref(), Some("alice"));
+        assert_eq!(config.port, Some(2222));
     }
 }

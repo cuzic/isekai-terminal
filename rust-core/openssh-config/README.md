@@ -13,6 +13,13 @@ Resolves a deliberate subset of OpenSSH `ssh_config(5)` keywords —
   (cyclic includes) is silently skipped on repeat.
 - `Host` patterns support `*`/`?` wildcards and `!negation`, same as
   `ssh_config(5)`.
+- Both `Keyword value` and `Keyword=value` (with optional whitespace around
+  `=`) syntax are accepted, same as `ssh_config(5)`.
+- `ForwardAgent` resolves to `Yes`/`No`/`Socket(<raw value>)` (`ssh_config(5)`
+  allows an explicit agent socket path or env-var reference here, not just
+  `yes`/`no`). `IdentityAgent` is tilde-expanded like `IdentityFile`, but may
+  still hold a sentinel rather than a real path (`"SSH_AUTH_SOCK"`, `"none"`)
+  — this crate doesn't try to distinguish those from real paths.
 
 ## What this crate deliberately does not do
 
