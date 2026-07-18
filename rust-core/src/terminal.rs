@@ -1510,7 +1510,45 @@ impl Perform for Terminal {
                 self.cursor_row = self.cursor_row.saturating_sub(n).max(floor);
                 self.cursor_col = 0;
             }
-            'G' => { self.cursor_col = (p0.max(1) as usize - 1).min(self.cols - 1); }
+            // CHA(`CSI Ps G`)/HPA(`CSI Ps `` `、タスク#65)。どちらも「列を`Ps`
+            // (既定1、1-indexed)へ絶対移動する」で完全に同じ挙動(xterm含む実端末も
+            // 区別しない)なので同じ腕で処理する。`TERM=xterm-256color`(ssh_handler.rs)
+            // が広告するterminfoに`hpa`があり、ncurses/readlineが実際にHPAを発行し
+            // 得るがこれまで未対応だった(Fableレビュー指摘)。
+            'G' | '`' => { self.cursor_col = (p0.max(1) as usize - 1).min(self.cols - 1); }
+            // CHT(`CSI Ps I`、タスク#65)。カーソルを右方向へ`Ps`個(既定1)先の
+            // タブストップまで移動する。可変タブストップ(HTS/`ESC H`・TBC/`CSI g`)は
+            // 別タスク#61の対象で未実装のため、HT(0x09、`execute`)と同じ固定8桁
+            // ストップを前提にする。行末(`cols - 1`)に達したらそれ以上進まない
+            // (HTの`execute`ハンドラと同じクランプ挙動)。
+            //
+            // `execute`のHTと全く同じ「計算してからクランプ」の順序にする——事前に
+            // `cursor_col >= cols - 1`で早期breakするガードを入れると、直前の
+            // `print()`による折り返し待ち状態(`cursor_col == cols`、まだ改行して
+            // いない)を「既に行末にいる」と誤認してカーソルを一切動かさず、
+            // `cursor_col == cols`という画面外の値のまま放置してしまう
+            // (codexレビュー指摘)。HTと同じ順序なら、折り返し待ち状態からでも
+            // 最終列(`cols - 1`)へ正しく正規化される。
+            'I' => {
+                let n = p0.max(1) as usize;
+                for _ in 0..n {
+                    self.cursor_col = ((self.cursor_col / 8) + 1) * 8;
+                    if self.cursor_col >= self.cols {
+                        self.cursor_col = self.cols - 1;
+                        break;
+                    }
+                }
+            }
+            // CBT(`CSI Ps Z`、タスク#65)。CHT('I')と対称: カーソルを左方向へ
+            // `Ps`個(既定1)前のタブストップまで移動する。固定8桁ストップ前提は
+            // CHTと同じ(#61未実装)。列0に達したらそれ以上戻らない。
+            'Z' => {
+                let n = p0.max(1) as usize;
+                for _ in 0..n {
+                    if self.cursor_col == 0 { break; }
+                    self.cursor_col = ((self.cursor_col - 1) / 8) * 8;
+                }
+            }
             // CUP/HVP(`H`/`f`): origin modeが有効な間、行番号はscroll region上端
             // (`scroll_top`)を基準とした相対値になり、可動範囲も region内に
             // クランプされる(タスク#59)。列は左右マージン未実装のため既存通り
@@ -3466,6 +3504,100 @@ mod tests {
 
         feed(&mut t, b"\x1b[5;3H\x1b[1P"); // 行4(region外)・列2で1セル削除
         assert_eq!(cell(&t, 4, 2), "4", "旧列3('4')が1列左へ詰められる — region外の行4でもDCHは効く");
+    }
+
+    // ── HPA(CSI Ps `)/CHT(CSI Ps I)/CBT(CSI Ps Z)(タスク#65) ─────────
+
+    #[test]
+    fn test_hpa_moves_cursor_to_absolute_column_same_as_cha() {
+        let mut t = Terminal::new(20, 3, Theme::default());
+        feed(&mut t, b"\x1b[2;5H"); // row=1, col=4(0-indexed)へ移動しておく
+        feed(&mut t, b"\x1b[10`"); // HPA: 列10(1-indexed)へ絶対移動
+        assert_eq!((t.cursor_row(), t.cursor_col()), (1, 9), "HPAは行を変えず列だけ絶対移動する(CHA/'G'と同一挙動)");
+    }
+
+    #[test]
+    fn test_hpa_default_param_is_column_one() {
+        let mut t = Terminal::new(20, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;5H\x1b[`"); // Ps省略 == CSI 1`
+        assert_eq!(t.cursor_col(), 0, "Ps省略時は既定値1(列0、0-indexed)");
+    }
+
+    #[test]
+    fn test_hpa_clamps_to_last_column() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b[100`"); // 画面幅(10)を超える列指定
+        assert_eq!(t.cursor_col(), 9, "画面幅を超える場合は最終列にクランプされる");
+    }
+
+    #[test]
+    fn test_cht_advances_to_next_fixed_tab_stop() {
+        let mut t = Terminal::new(40, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;3H"); // 列2(0-indexed)へ移動
+        feed(&mut t, b"\x1b[I"); // CHT、Ps省略==1
+        assert_eq!(t.cursor_col(), 8, "HT(固定8桁ストップ)と同じ次のタブストップへ進む");
+    }
+
+    #[test]
+    fn test_cht_with_count_advances_multiple_tab_stops() {
+        let mut t = Terminal::new(40, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;3H"); // 列2(0-indexed)へ移動
+        feed(&mut t, b"\x1b[3I"); // 3個先のタブストップ(8, 16, 24)
+        assert_eq!(t.cursor_col(), 24);
+    }
+
+    #[test]
+    fn test_cht_normalizes_delayed_wrap_pending_cursor_to_last_column() {
+        // codexレビュー指摘: `print()`で行末まで書いた直後は折り返し待ち状態
+        // (`cursor_col == cols`、まだ改行はしていない)になる。CHTがこの状態を
+        // 「既に行末」と誤認して何もしないと`cursor_col`が画面外(`cols`)の
+        // ままになってしまう——HT(0x09)と同じ「計算してからクランプ」の順序で
+        // 最終列(`cols - 1`)へ正規化されることを固定する。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"0123456789"); // 画面幅ぴったり書いて折り返し待ち状態にする
+        assert_eq!(t.cursor_col(), 10, "前提: 折り返し待ち状態(cols)になっている");
+        feed(&mut t, b"\x1b[I");
+        assert_eq!(t.cursor_col(), 9, "折り返し待ち状態からでも最終列へ正規化される");
+    }
+
+    #[test]
+    fn test_cht_clamps_at_last_column_without_overshoot() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;3H"); // 列2(0-indexed)へ移動、次のタブストップ(8)は画面内
+        feed(&mut t, b"\x1b[5I"); // 画面幅(10)を大きく超える回数を要求
+        assert_eq!(t.cursor_col(), 9, "行末を超えて進まず最終列にクランプされる");
+    }
+
+    #[test]
+    fn test_cbt_moves_back_to_previous_fixed_tab_stop() {
+        let mut t = Terminal::new(40, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;20H"); // 列19(0-indexed)へ移動
+        feed(&mut t, b"\x1b[Z"); // CBT、Ps省略==1
+        assert_eq!(t.cursor_col(), 16, "直前のタブストップ(16)へ戻る");
+    }
+
+    #[test]
+    fn test_cbt_exactly_on_tab_stop_moves_to_previous_one() {
+        let mut t = Terminal::new(40, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;17H"); // 列16(0-indexed、タブストップ上)へ移動
+        feed(&mut t, b"\x1b[Z");
+        assert_eq!(t.cursor_col(), 8, "ちょうどタブストップ上にいる場合はその1つ前へ戻る(その場に留まらない)");
+    }
+
+    #[test]
+    fn test_cbt_with_count_moves_back_multiple_tab_stops() {
+        let mut t = Terminal::new(40, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;20H"); // 列19(0-indexed)へ移動
+        feed(&mut t, b"\x1b[2Z"); // 2個前のタブストップ(16, 8)
+        assert_eq!(t.cursor_col(), 8);
+    }
+
+    #[test]
+    fn test_cbt_clamps_at_column_zero_without_underflow() {
+        let mut t = Terminal::new(40, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;5H"); // 列4(0-indexed)へ移動
+        feed(&mut t, b"\x1b[10Z"); // 大きく超える回数を要求
+        assert_eq!(t.cursor_col(), 0, "列0を下回らずクランプされる(panicもしない)");
     }
 
     // ── DECSC/DECRC(`ESC 7`/`ESC 8`)・CSI s/u(タスク#57) ─────────────
