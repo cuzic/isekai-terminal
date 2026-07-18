@@ -100,8 +100,7 @@ impl Terminal {
         self.theme = theme;
     }
 
-    /// 現在のテーマのスナップショット([SessionState::reset_for_resize]がリサイズ時に
-    /// 新しい`Terminal`へ引き継ぐために使う)。
+    /// 現在のテーマのスナップショット([resize_preserving_state]後も変わらない)。
     pub(crate) fn theme(&self) -> Theme {
         self.theme
     }
@@ -172,6 +171,165 @@ impl Terminal {
     fn cell_mut(&mut self, row: usize, col: usize) -> &mut TermCell {
         let cols = self.cols;
         &mut self.cells_mut()[row * cols + col]
+    }
+
+    /// リサイズ時に画面内容(main/alt screen とも)・カーソル位置・保存カーソル・現在の
+    /// SGR属性・scroll region・application cursor mode・bracketed paste mode・title・
+    /// 保留中のクリップボード状態を保持しつつ、新しい `new_cols`×`new_rows` にリサイズ
+    /// する(tty の通常の resize は画面内容を消去すべきイベントではない)。
+    ///
+    /// - 列(cols)方向は reflow しない: `TermCell` は「その行が直前行から折り返された
+    ///   結果か、独立した論理行か」を記録していないため、安全に re-wrap できない。
+    ///   縮む場合は各行の右側をクリップし、広がる場合は右側を現在の空白色でパディングする。
+    /// - 行(rows)方向、縮む場合: 各画面(main/alt)は「その画面のカーソル行がちょうど
+    ///   新しい最終行に収まる分だけ」上端から行を取り除く(xterm がウィンドウを縦に
+    ///   縮めた時、カーソルの行を可視範囲に保ったまま内容を上へ押し出す挙動と同じ)。
+    ///   カーソルが画面の上の方にあり新サイズにそもそも収まるなら、上端からは何も
+    ///   取り除かない(単純に古い内容を先頭から`new_rows`行だけ残す — top-left
+    ///   アンカー)。取り除いた分だけでは`new_rows`に届かない場合、余った下端の行は
+    ///   (カーソルより下の空白であることが通常なので) scrollback を経由せず単に破棄
+    ///   する。上端から取り除いた行のうち main screen(`main_cells`)分だけは(xterm
+    ///   挙動に合わせ) `pending_scrollback` へ push する(呼び出し元が
+    ///   `take_scrollback()` で回収する)。これは現在 alt screen を表示中
+    ///   (`alt_active`)でも行う — main screen 自体は裏で保持され続けており、alt から
+    ///   抜けた時に見えるべき履歴を失わないようにするため。alt screen(`alt_cells`)
+    ///   自体は実端末同様 scrollback を持たないため、alt 側で取り除いた行は単に破棄
+    ///   する。広がる場合は下端を空白行でパディングする(カーソル位置は不変)。
+    ///
+    /// VTE パーサー(`vte::Parser`)の状態はこのメソッドの外(呼び出し元)で保持される —
+    /// 通常の tty resize はエスケープシーケンスの読み取り途中を打ち切るべきイベントでは
+    /// ないため、`Parser` を作り直さないこと。
+    pub(crate) fn resize_preserving_state(&mut self, new_cols: usize, new_rows: usize) {
+        // 呼び出し元(Android/iOS)は現状もっと大きい下限(例: 10x5)を強制しているが、
+        // Terminal 自身の不変量(`cursor_row < rows`等)を呼び出し元の実装に依存させない
+        // よう、ここでも最低 1x1 を保証する(0を渡されると `self.rows - 1` 等で
+        // underflow する)。
+        let new_cols = new_cols.max(1);
+        let new_rows = new_rows.max(1);
+
+        if new_cols == self.cols && new_rows == self.rows {
+            return;
+        }
+
+        let old_cols = self.cols;
+        let old_rows = self.rows;
+        let total_removed = old_rows.saturating_sub(new_rows);
+        let blank = self.blank();
+        // 全画面がデフォルトのscroll region(`0..old_rows-1`)だった場合、リサイズ後も
+        // 全画面region(`0..new_rows-1`)であるべき(単純に`min(max_row)`すると、
+        // 行が増えた時に新しく増えた下端がscroll regionの外のままになるバグを生む)。
+        let had_full_scroll_region = self.scroll_top == 0 && self.scroll_bottom == old_rows.saturating_sub(1);
+
+        // 各画面(main/alt)につき、「その画面のカーソルがいた行」を基準に、上端から
+        // 何行取り除けばカーソル行が新しい可視範囲に収まるかを個別に計算する。
+        // 非アクティブ側の画面のカーソルは、直近の切り替え時に保存された
+        // saved_cursor_{main,alt} を参照する(無ければ 0 行目とみなす)。
+        let top_removed_for = |reference_row: usize| -> usize {
+            (reference_row + 1).saturating_sub(new_rows).min(total_removed)
+        };
+        let main_reference_row = if self.alt_active {
+            self.saved_cursor_main.map(|c| c.0).unwrap_or(0)
+        } else {
+            self.cursor_row
+        };
+        let alt_reference_row = if self.alt_active {
+            self.cursor_row
+        } else {
+            self.saved_cursor_alt.map(|c| c.0).unwrap_or(0)
+        };
+        let main_removed = top_removed_for(main_reference_row);
+        let alt_removed = top_removed_for(alt_reference_row);
+
+        self.main_cells = Self::resize_grid(
+            &self.main_cells, old_cols, old_rows, new_cols, new_rows, main_removed, &blank,
+            Some(&mut self.pending_scrollback),
+        );
+        self.alt_cells = Self::resize_grid(
+            &self.alt_cells, old_cols, old_rows, new_cols, new_rows, alt_removed, &blank,
+            None,
+        );
+
+        let max_row = new_rows.saturating_sub(1);
+        let shift_row = |row: usize, removed: usize| -> usize {
+            if row < removed { 0 } else { (row - removed).min(max_row) }
+        };
+        let active_removed = if self.alt_active { alt_removed } else { main_removed };
+        self.cursor_row = shift_row(self.cursor_row, active_removed);
+        // cursor_col の有効範囲は 0..=cols (== cols は「次の print() で折り返す」
+        // 保留状態を表す。`print()`/`prop_cursor_in_bounds` 参照)。単純に
+        // `min(new_cols)` すると、折り返し待ちでない通常の位置(例: 旧80列中の70列目)
+        // が新しい `new_cols`(例: 40) を超えていても「40 = ちょうど右端で折り返し待ち」
+        // に化けてしまう。折り返し待ちだった場合(`col == old_cols`)のみ新しい
+        // `new_cols` に対応する折り返し待ちへ写し、それ以外は `new_cols - 1`
+        // (見えている最後の列)にクランプする。
+        let clamp_col = |col: usize| -> usize {
+            if col >= old_cols {
+                new_cols
+            } else {
+                col.min(new_cols.saturating_sub(1))
+            }
+        };
+        self.cursor_col = clamp_col(self.cursor_col);
+
+        if let Some((row, col, fg, bg, bold)) = self.saved_cursor_main.take() {
+            self.saved_cursor_main = Some((shift_row(row, main_removed), clamp_col(col), fg, bg, bold));
+        }
+        if let Some((row, col, fg, bg, bold)) = self.saved_cursor_alt.take() {
+            self.saved_cursor_alt = Some((shift_row(row, alt_removed), clamp_col(col), fg, bg, bold));
+        }
+
+        if had_full_scroll_region {
+            self.scroll_top = 0;
+            self.scroll_bottom = max_row;
+        } else {
+            self.scroll_top = self.scroll_top.min(max_row);
+            self.scroll_bottom = self.scroll_bottom.min(max_row);
+            if self.scroll_bottom <= self.scroll_top {
+                self.scroll_top = 0;
+                self.scroll_bottom = max_row;
+            }
+        }
+
+        self.cols = new_cols;
+        self.rows = new_rows;
+    }
+
+    /// [resize_preserving_state] のグリッド(cols×rows のセル配列)1つ分のリサイズを行う。
+    /// 行(rows)が縮む場合、まず上端`top_removed`行を取り除き(`overflow_sink`が`Some`
+    /// ならそこへ積む。`None`なら単に破棄 — alt screen 用)、それでも`new_rows`に
+    /// 収まりきらない残りは下端から破棄する(scrollbackには積まない)。
+    fn resize_grid(
+        old_cells: &[TermCell],
+        old_cols: usize,
+        old_rows: usize,
+        new_cols: usize,
+        new_rows: usize,
+        top_removed: usize,
+        blank: &TermCell,
+        overflow_sink: Option<&mut Vec<Vec<TermCell>>>,
+    ) -> Vec<TermCell> {
+        let mut rows: Vec<Vec<TermCell>> = (0..old_rows)
+            .map(|r| old_cells[r * old_cols..(r + 1) * old_cols].to_vec())
+            .collect();
+
+        if new_rows < old_rows {
+            let removed: Vec<Vec<TermCell>> = rows.drain(0..top_removed).collect();
+            if let Some(sink) = overflow_sink {
+                sink.extend(removed);
+            }
+            rows.truncate(new_rows);
+        } else if new_rows > old_rows {
+            for _ in 0..(new_rows - old_rows) {
+                rows.push(vec![blank.clone(); old_cols]);
+            }
+        }
+
+        let mut new_cells = Vec::with_capacity(new_cols * new_rows);
+        for mut row in rows {
+            row.resize(new_cols, blank.clone());
+            new_cells.extend(row);
+        }
+        new_cells
     }
 
     fn switch_to_alt(&mut self, save_cursor: bool) {
@@ -697,6 +855,210 @@ mod tests {
         }
     }
 
+    // ── resize_preserving_state ─────────────────────────
+
+    #[test]
+    fn test_resize_preserving_state_updates_dimensions() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.resize_preserving_state(40, 12);
+        assert_eq!(t.cols(), 40);
+        assert_eq!(t.rows(), 12);
+        assert_eq!(t.screen_cells().len(), 40 * 12);
+    }
+
+    #[test]
+    fn test_resize_preserving_state_keeps_existing_content() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"hello");
+        t.resize_preserving_state(40, 12);
+        assert_eq!(cell(&t, 0, 0), "h");
+        assert_eq!(cell(&t, 0, 4), "o");
+    }
+
+    #[test]
+    fn test_resize_preserving_state_growing_cols_pads_with_blank() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"hi");
+        t.resize_preserving_state(20, 3);
+        assert_eq!(cell(&t, 0, 0), "h");
+        assert_eq!(cell(&t, 0, 1), "i");
+        for col in 2..20 {
+            assert_eq!(cell(&t, 0, col), " ", "col {}", col);
+        }
+    }
+
+    #[test]
+    fn test_resize_preserving_state_shrinking_cols_clips_content() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"0123456789");
+        t.resize_preserving_state(5, 3);
+        assert_eq!(cell(&t, 0, 0), "0");
+        assert_eq!(cell(&t, 0, 4), "4");
+        assert_eq!(t.screen_cells().len(), 5 * 3);
+    }
+
+    #[test]
+    fn test_resize_preserving_state_growing_rows_pads_bottom() {
+        let mut t = Terminal::new(10, 2, Theme::default());
+        feed(&mut t, b"top");
+        t.resize_preserving_state(10, 5);
+        assert_eq!(cell(&t, 0, 0), "t");
+        for col in 0..10 {
+            assert_eq!(cell(&t, 4, col), " ");
+        }
+    }
+
+    #[test]
+    fn test_resize_preserving_state_shrinking_rows_pushes_top_overflow_to_scrollback() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4");
+        t.resize_preserving_state(10, 2);
+        let pending = t.take_scrollback();
+        // 5行→2行なので上端3行がscrollbackへ押し出される
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[0][0].ch.as_str(), "r"); // row0 が最も古い(先頭)
+    }
+
+    #[test]
+    fn test_resize_preserving_state_only_pushes_main_screen_overflow_to_scrollback() {
+        // main/alt 両方のグリッドが同時にリサイズされる(alt表示中でもmain_cellsは裏で
+        // 保持されている)が、scrollbackに積まれるのはmain screenの内容のみ。altの
+        // 内容は実端末同様破棄され、混入しない。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"m0\r\nm1\r\nm2\r\nm3\r\nm4"); // 主画面に5行(ちょうど収まる)
+        feed(&mut t, b"\x1b[?1049h"); // altへ切り替え
+        feed(&mut t, b"a0\r\na1\r\na2\r\na3\r\na4"); // altにも5行
+
+        t.resize_preserving_state(10, 2);
+        let pending = t.take_scrollback();
+
+        assert_eq!(pending.len(), 3);
+        for (i, row) in pending.iter().enumerate() {
+            let text: String = row.iter().map(|c| c.ch.as_str()).collect();
+            assert!(text.starts_with(&format!("m{}", i)), "row {} = {:?}", i, text);
+        }
+
+        feed(&mut t, b"\x1b[?1049l"); // main に戻る
+        assert_eq!(cell(&t, 0, 0), "m");
+        assert_eq!(cell(&t, 0, 1), "3"); // あふれた3行分、row0はm3の内容になる
+    }
+
+    #[test]
+    fn test_resize_preserving_state_preserves_sgr_and_cursor_within_bounds() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[31mA"); // 赤, cursor_col=1
+        t.resize_preserving_state(40, 12);
+        feed(&mut t, b"B");
+        assert_eq!(cell(&t, 0, 1), "B");
+        assert_eq!(t.screen_cells()[1].fg, Theme::default().ansi16[1]); // 赤が引き継がれた
+    }
+
+    #[test]
+    fn test_resize_preserving_state_clips_cursor_when_shrinking() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[20;70H"); // row=20,col=70(0-indexed 19,69)
+        t.resize_preserving_state(40, 10);
+        assert!(t.cursor_row() < 10);
+        assert!(t.cursor_col() <= 40);
+    }
+
+    #[test]
+    fn test_resize_preserving_state_preserves_title_and_modes() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]0;My Title\x07");
+        feed(&mut t, b"\x1b[?1h");    // application cursor mode on
+        feed(&mut t, b"\x1b[?2004h"); // bracketed paste on
+        t.resize_preserving_state(40, 12);
+        assert_eq!(t.title(), Some("My Title"));
+        assert!(t.application_cursor_mode());
+        assert!(t.bracketed_paste_mode());
+    }
+
+    #[test]
+    fn test_resize_preserving_state_noop_when_size_unchanged() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"hello");
+        t.resize_preserving_state(80, 24);
+        assert_eq!(cell(&t, 0, 0), "h");
+        assert_eq!(t.cols(), 80);
+        assert_eq!(t.rows(), 24);
+    }
+
+    #[test]
+    fn test_resize_preserving_state_default_scroll_region_grows_with_screen() {
+        // Codexレビュー(#18)で発見されたバグの回帰テスト: 全画面がデフォルトの
+        // scroll region(0..old_rows-1)だった場合、行が増えるリサイズ後も
+        // scroll regionが全画面(0..new_rows-1)を覆っていなければならない。
+        // 単純にmin(max_row)するだけだと、増えた下端がscroll regionの外に
+        // 取り残され、newlineでのスクロールが画面の上半分だけで起きてしまう。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.resize_preserving_state(80, 40);
+        // 24行目(0-indexed)より下までnewlineでスクロールできることを確認する:
+        // scroll regionが0..23のまま壊れていれば、この時点でcursor_rowは23で
+        // 頭打ちになる。newlineを新しい行数分(40回)より多く送り、最終的に
+        // 新しい最終行(39)まで到達することを確認する。
+        for _ in 0..45 {
+            feed(&mut t, b"x\r\n");
+        }
+        assert_eq!(t.cursor_row(), 39, "scroll region did not grow to cover the new rows");
+    }
+
+    #[test]
+    fn test_resize_preserving_state_explicit_scroll_region_is_clamped_not_reset() {
+        // 全画面でない明示的なscroll region(DECSTBM)が設定されていた場合は、
+        // (全画面だった場合と違って)新サイズにclampするだけで、勝手に全画面へは
+        // リセットしない。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[3;10r"); // scroll region = rows 3..10 (1-indexed) = 2..9 (0-indexed)
+        t.resize_preserving_state(80, 12);
+        // scroll_top/bottomの直接getterは無いため、scroll region下端(0-indexed 9)を
+        // 超えてnewlineしてもcursor_rowが10へ進まない(regionの外に出ない)ことで
+        // 間接的に検証する。
+        feed(&mut t, b"\x1b[10;1H"); // カーソルをregion下端(0-indexed row9)へ
+        feed(&mut t, b"\r\nA");
+        assert_eq!(t.cursor_row(), 9, "explicit scroll region should not be reset to full-screen");
+    }
+
+    #[test]
+    fn test_resize_preserving_state_shrinking_cols_does_not_create_spurious_wrap_pending() {
+        // Codexレビュー(#18)で発見されたバグの回帰テスト: 折り返し待ち状態でない
+        // 通常のカーソル位置(旧cols内の途中の列)が、単純に`min(new_cols)`されると
+        // 「ちょうど新しいnew_colsで折り返し待ち」に化けてしまい、次に出力した文字が
+        // 同じ行の右端ではなく次行の先頭に出てしまうバグがあった。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[1;70H"); // row=1,col=70(1-indexed) → cursor_col=69(0-indexed)
+        t.resize_preserving_state(40, 24); // cols: 80→40, 69 は新しい幅を超える
+        feed(&mut t, b"Z");
+        // 折り返し待ちに化けていれば "Z" は次の行(row 1)の先頭に出てしまう。
+        // 正しくは同じ行(row 0)の右端(col 39)に出る。
+        assert_eq!(t.cursor_row(), 0, "cursor should not have wrapped to the next row");
+        assert_eq!(cell(&t, 0, 39), "Z");
+    }
+
+    #[test]
+    fn test_resize_preserving_state_preserves_wrap_pending_state() {
+        // 折り返し待ち状態(cursor_col == cols)だった場合は、リサイズ後も
+        // 折り返し待ちのまま(新しいcolsの値)引き継がれる。
+        let mut t = Terminal::new(10, 24, Theme::default());
+        feed(&mut t, b"0123456789"); // ちょうど10文字 → cursor_col=10(==cols, 折り返し待ち)
+        assert_eq!(t.cursor_col(), 10);
+        t.resize_preserving_state(20, 24);
+        assert_eq!(t.cursor_col(), 20);
+    }
+
+    #[test]
+    fn test_resize_preserving_state_clamps_zero_size_to_minimum() {
+        // Terminal自身の不変量(cursor_row < rows等)を、呼び出し元がどんな値を渡しても
+        // 保つため、0を渡されても最低1x1にclampする(Codexレビュー(#18)指摘のP2)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.resize_preserving_state(0, 0);
+        assert_eq!(t.cols(), 1);
+        assert_eq!(t.rows(), 1);
+        assert_eq!(t.screen_cells().len(), 1);
+        assert!(t.cursor_row() < t.rows());
+        assert!(t.cursor_col() <= t.cols());
+    }
+
     // ── Proptest: 不変量 ────────────────────────────────
 
     proptest! {
@@ -742,6 +1104,28 @@ mod tests {
             for row in t.take_scrollback() {
                 prop_assert_eq!(row.len(), cols);
             }
+        }
+
+        /// resize_preserving_state 前後でサイズ・カーソル不変量が保たれる
+        #[test]
+        fn prop_resize_preserving_state_invariants(
+            before in proptest::collection::vec(any::<u8>(), 0..256),
+            new_cols in 10usize..120,
+            new_rows in 4usize..40,
+            after in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let mut t = Terminal::new(80, 24, Theme::default());
+            feed(&mut t, &before);
+            t.resize_preserving_state(new_cols, new_rows);
+            prop_assert_eq!(t.cols(), new_cols);
+            prop_assert_eq!(t.rows(), new_rows);
+            prop_assert_eq!(t.screen_cells().len(), new_cols * new_rows);
+            prop_assert!(t.cursor_row() < t.rows());
+            prop_assert!(t.cursor_col() <= t.cols());
+            feed(&mut t, &after);
+            prop_assert_eq!(t.screen_cells().len(), new_cols * new_rows);
+            prop_assert!(t.cursor_row() < t.rows());
+            prop_assert!(t.cursor_col() <= t.cols());
         }
     }
 }

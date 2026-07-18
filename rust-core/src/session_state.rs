@@ -76,13 +76,27 @@ impl SessionState {
         }
     }
 
-    /// リサイズ時にターミナル・パーサーをリセットする。現在のテーマは引き継ぐ
-    /// (リサイズのついでにテーマがグローバル既定へ戻ってしまわないようにする)。
-    pub(crate) fn reset_for_resize(&mut self, cols: usize, rows: usize) {
-        let theme = self.terminal.theme();
-        self.terminal.take_scrollback();  // 旧サイズの pending 行を破棄
-        self.terminal = Terminal::new(cols, rows, theme);
-        self.parser = Parser::new();
+    /// リサイズ時に画面内容・scrollback・カーソル位置・SGR属性・scroll region等の
+    /// ターミナル状態を保持したまま新しいサイズへ合わせる
+    /// (`Terminal::resize_preserving_state`参照)。通常の tty resize はエスケープ
+    /// シーケンスの読み取り途中を打ち切るべきイベントではないため、`self.parser`
+    /// (`vte::Parser`)も作り直さず、そのまま使い続ける。
+    ///
+    /// rows が縮んで画面上端からはみ出た行は `pending_rows` として返す(呼び出し元が
+    /// 既存の stdout scrollback フラッシュ経路にそのまま乗せられる)。`screen_dirty:
+    /// true` を返すため、呼び出し元は次の stdout 受信を待たずに新サイズ・保持内容を
+    /// 反映した `ScreenUpdate` を発行できる(#44)。
+    pub(crate) fn resize(&mut self, cols: usize, rows: usize) -> ProcessResult {
+        self.terminal.resize_preserving_state(cols, rows);
+        let pending_rows = self.terminal.take_scrollback();
+        ProcessResult {
+            timer_cmds: Vec::new(),
+            side_effects: Vec::new(),
+            pending_rows,
+            screen_dirty: true,
+            pending_clipboard_write: None,
+            clipboard_pull_requested: false,
+        }
     }
 
     pub(crate) fn on_stdout(&mut self, bytes: Vec<u8>) -> ProcessResult {
@@ -216,14 +230,62 @@ mod tests {
     }
 
     #[test]
-    fn test_resize_clears_terminal() {
+    fn test_resize_preserves_screen_content() {
         let mut state = SessionState::new(80, 24, Theme::default());
         let _ = state.on_stdout(b"hello".to_vec());
         assert_eq!(state.terminal().screen_cells()[0].ch.as_str(), "h");
-        state.reset_for_resize(40, 12);
+        state.resize(40, 12);
         assert_eq!(state.terminal().cols(), 40);
         assert_eq!(state.terminal().rows(), 12);
-        assert_eq!(state.terminal().screen_cells()[0].ch.as_str(), " ");
+        // リサイズ後も画面内容は保持される("消去"されない)。
+        assert_eq!(state.terminal().screen_cells()[0].ch.as_str(), "h");
+    }
+
+    #[test]
+    fn test_resize_returns_screen_dirty_process_result() {
+        // #44: resize直後にScreenUpdateを発行できるよう、resize()自体が
+        // screen_dirty: true な ProcessResult を返す。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let r = state.resize(40, 12);
+        assert!(r.screen_dirty);
+        assert!(r.side_effects.is_empty());
+        assert!(r.timer_cmds.is_empty());
+    }
+
+    #[test]
+    fn test_resize_shrinking_rows_pushes_overflow_to_pending_rows() {
+        // rows が縮んで画面上端からはみ出た行は pending_rows(→呼び出し元がscrollbackへ
+        // 積む)として返る(xterm挙動)。
+        let mut state = SessionState::new(10, 5, Theme::default());
+        for i in 0..5u8 {
+            let _ = state.on_stdout(format!("line{}\r\n", i).into_bytes());
+        }
+        let r = state.resize(10, 2);
+        assert!(!r.pending_rows.is_empty());
+    }
+
+    #[test]
+    fn test_resize_preserves_sgr_attributes() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.on_stdout(b"\x1b[31mred".to_vec());
+        let red_fg = state.terminal().screen_cells()[0].fg;
+        state.resize(40, 12);
+        let _ = state.on_stdout(b"\rmore".to_vec());
+        // resize前に設定したSGR(赤字)が、resize後の新規出力にも引き継がれている。
+        assert_eq!(state.terminal().screen_cells()[0].fg, red_fg);
+    }
+
+    #[test]
+    fn test_resize_does_not_reset_in_progress_escape_sequence() {
+        // VTEパーサーの状態(パーサーを作り直していないこと)の検証: エスケープ
+        // シーケンスを2つのバッチに分割して送り、間でresizeを挟んでも正しく解釈される。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.on_stdout(b"\x1b[3".to_vec()); // "\x1b[31m" の途中で中断
+        state.resize(40, 12);
+        let _ = state.on_stdout(b"1mA".to_vec()); // 残りを送る
+        let c = &state.terminal().screen_cells()[0];
+        assert_eq!(c.ch.as_str(), "A");
+        assert_eq!(c.fg, Theme::default().ansi16[1]); // 赤 = SGR 31 が正しく解釈された
     }
 
     // ── Proptest: 不変量 ────────────────────────────────
@@ -265,7 +327,8 @@ mod tests {
             prop_assert!(t.cursor_row() < t.rows());
         }
 
-        /// reset_for_resize 後もサイズ不変量が成立する
+        /// resize 後もサイズ・カーソル不変量が成立する(画面内容・パーサー状態を
+        /// 保持しつつリサイズする新仕様)
         #[test]
         fn prop_resize_then_invariants(
             before in proptest::collection::vec(any::<u8>(), 0..256),
@@ -275,12 +338,18 @@ mod tests {
         ) {
             let mut state = SessionState::new(80, 24, Theme::default());
             let _ = state.on_stdout(before);
-            state.reset_for_resize(cols, rows);
+            let r = state.resize(cols, rows);
+            prop_assert!(r.screen_dirty);
             let _ = state.on_stdout(after);
             let t = state.terminal();
             prop_assert_eq!(t.cols(), cols);
             prop_assert_eq!(t.rows(), rows);
             prop_assert_eq!(t.screen_cells().len(), cols * rows);
+            prop_assert!(t.cursor_row() < t.rows());
+            prop_assert!(t.cursor_col() <= t.cols());
+            // resize由来のpending_rowsは旧cols幅のまま(scrollback_cellsが
+            // row.len().min(cols)でclip+padして吸収する設計 — session.rs参照)なので、
+            // ここでは新colsとの一致は assert しない。
         }
     }
 }
