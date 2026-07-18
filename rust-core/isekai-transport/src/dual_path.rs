@@ -449,16 +449,48 @@ mod tests {
         assert!(dual.unreliable.remote_addr().is_some());
     }
 
+    /// Probes whether this environment's `noq::Endpoint::new_with_abstract_socket`
+    /// works for an IPv6-bound socket — see
+    /// `physical_interface::connect_via_interface`'s doc comment: a
+    /// `test-windows` CI run once failed here, but a real Windows machine
+    /// running the same check does not, so this is a CI-runner-specific
+    /// quirk rather than a genuine Windows/`noq` limitation. Duplicated from
+    /// `physical_interface.rs`'s own identical helper rather than shared,
+    /// matching this crate's existing per-module test self-containment.
+    async fn ipv6_endpoint_setup_is_available() -> bool {
+        use noq::Runtime as _;
+
+        let Ok(std_socket) = std::net::UdpSocket::bind("[::]:0".parse::<SocketAddr>().unwrap()) else {
+            return false;
+        };
+        let Ok(async_socket) = noq::TokioRuntime.wrap_udp_socket(std_socket) else {
+            return false;
+        };
+        noq::Endpoint::new_with_abstract_socket(
+            noq::EndpointConfig::default(),
+            None,
+            async_socket,
+            std::sync::Arc::new(noq::TokioRuntime),
+        )
+        .is_ok()
+    }
+
     /// Regression test: an IPv6-only remote (this module's own motivating
     /// case — a cellular interface via 464XLAT/NAT64) must be dialable, not
     /// silently impossible because the dial always bound an IPv4 socket.
-    ///
-    /// Windows-only: see `physical_interface::connect_via_interface`'s doc
-    /// comment on the confirmed (`test-windows` CI) `noq` IPv6 limitation —
-    /// this is the same gap, one level up.
+    /// Skips itself (see [`ipv6_endpoint_setup_is_available`]) rather than
+    /// asserting on environments where `noq`'s own IPv6 endpoint setup
+    /// doesn't work.
     #[tokio::test]
-    #[cfg(not(windows))]
     async fn connect_dual_path_dials_an_ipv6_remote() {
+        if !ipv6_endpoint_setup_is_available().await {
+            eprintln!(
+                "skipping connect_dual_path_dials_an_ipv6_remote: \
+                 this environment's noq::Endpoint setup doesn't support IPv6"
+            );
+            return;
+        }
+
         let (server_config, cert_sha256_hex) = build_server_config(None);
         let listener =
             AnyMuxListener::bind_noq(server_config, quicmux::BindSpec { local_addr: "[::1]:0".parse().unwrap(), port_range: None })
