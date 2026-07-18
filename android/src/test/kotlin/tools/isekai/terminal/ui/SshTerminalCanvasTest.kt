@@ -310,4 +310,45 @@ class SshTerminalCanvasTest {
             after.keys,
         )
     }
+
+    // タスク#76: Rust側`ImagePlacement.rgba`はRGBA8888バイト順で詰められているが、
+    // `Bitmap.copyPixelsFromBuffer`で生コピーすると内部バイトレイアウト次第で赤/青
+    // チャンネルが入れ替わりうる(codex/Fableレビュー指摘)。赤1px・青1pxのRGBAバイト列を
+    // デコードし、`getPixel`が正しいARGB値(チャンネル入れ替わり無し)を返すことを検証する。
+    @Test
+    fun `SixelBitmapCache decodes red and blue pixels without channel swap`() {
+        val cache = SixelBitmapCache()
+        // R=0xFF,G=0x00,B=0x00,A=0xFF(赤、不透明)
+        val red = uniffi.isekai_terminal_core.ImagePlacement(
+            id = 1u, row = 0u, col = 0u, rowsSpan = 1u, colsSpan = 1u,
+            widthPx = 1u, heightPx = 1u,
+            rgba = byteArrayOf(0xFF.toByte(), 0x00, 0x00, 0xFF.toByte()),
+        )
+        // R=0x00,G=0x00,B=0xFF,A=0xFF(青、不透明)
+        val blue = uniffi.isekai_terminal_core.ImagePlacement(
+            id = 2u, row = 0u, col = 0u, rowsSpan = 1u, colsSpan = 1u,
+            widthPx = 1u, heightPx = 1u,
+            rgba = byteArrayOf(0x00, 0x00, 0xFF.toByte(), 0xFF.toByte()),
+        )
+        val bitmaps = cache.bitmapsFor(listOf(red, blue))
+
+        val redPixel = bitmaps.getValue(1u.toULong()).getPixel(0, 0)
+        assertEquals(0xFFFF0000.toInt(), redPixel)
+
+        val bluePixel = bitmaps.getValue(2u.toULong()).getPixel(0, 0)
+        assertEquals(0xFF0000FF.toInt(), bluePixel)
+    }
+
+    // `setPixels`変換ヘルパー単体でも、複数ピクセル・半透明を含めた変換が正しいことを検証する。
+    @Test
+    fun `rgbaBytesToArgbInts converts multiple pixels including alpha`() {
+        val rgba = byteArrayOf(
+            0xFF.toByte(), 0x00, 0x00, 0xFF.toByte(), // 赤、不透明
+            0x00, 0xFF.toByte(), 0x00, 0x80.toByte(), // 緑、半透明
+        )
+        val pixels = rgbaBytesToArgbInts(rgba)
+        assertEquals(2, pixels.size)
+        assertEquals(0xFFFF0000.toInt(), pixels[0])
+        assertEquals(0x8000FF00.toInt(), pixels[1])
+    }
 }

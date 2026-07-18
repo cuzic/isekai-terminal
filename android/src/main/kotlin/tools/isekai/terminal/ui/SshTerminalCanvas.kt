@@ -17,7 +17,6 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
-import java.nio.ByteBuffer
 import kotlin.math.ceil
 import kotlinx.coroutines.delay
 import uniffi.isekai_terminal_core.CellData
@@ -223,6 +222,25 @@ internal class GridRenderCache {
 }
 
 /**
+ * Rust側`ImagePlacement.rgba`(RGBA8888、row-major)のバイト列を、Android
+ * `Bitmap.setPixels`が要求するパックド`Int`(`0xAARRGGBB`、Android公式契約)の
+ * 配列へ変換する。`copyPixelsFromBuffer`のような生バイトコピーとは違い、
+ * チャンネル順を明示的に組み立てるため内部バイトレイアウトに依存しない。
+ */
+internal fun rgbaBytesToArgbInts(rgba: ByteArray): IntArray {
+    val pixels = IntArray(rgba.size / 4)
+    for (i in pixels.indices) {
+        val o = i * 4
+        val r = rgba[o].toInt() and 0xFF
+        val g = rgba[o + 1].toInt() and 0xFF
+        val b = rgba[o + 2].toInt() and 0xFF
+        val a = rgba[o + 3].toInt() and 0xFF
+        pixels[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
+    }
+    return pixels
+}
+
+/**
  * Sixel(タスク#42)の`ImagePlacement.rgba`から作った`Bitmap`をid単位でキャッシュする。
  * `ScreenUpdate.images`はTerminal(rust-core)側で寿命管理された「現在アクティブな
  * 画像の全リスト」がそのまま渡ってくる(rust-ssot: どの画像がまだ生きているかの
@@ -259,8 +277,16 @@ internal class SixelBitmapCache {
                 val w = img.widthPx.toInt()
                 val h = img.heightPx.toInt()
                 if (!isSane(img, w, h)) continue
+                // `img.rgba`はRust側(lib.rs `ImagePlacement.rgba`)がRGBA8888バイト順で
+                // 詰めたバッファ。`Bitmap.copyPixelsFromBuffer`はバイト順の変換を一切せず
+                // 生コピーするだけなので、`Config.ARGB_8888`の内部バイトレイアウトが実機・
+                // OSバージョンによってRGBA順と一致しない場合(あるいはRobolectric等の
+                // テスト環境)、赤/青チャンネルが入れ替わって描画されてしまう
+                // (codex/Fableレビュー指摘)。`setPixels(IntArray, ...)`はAndroidが公式に
+                // 契約している`0xAARRGGBB`のパックド`Int`表現を受け取るAPIなので、
+                // 内部バイトレイアウトに依存せず正しい色で描画できる。
                 val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                bmp.copyPixelsFromBuffer(ByteBuffer.wrap(img.rgba))
+                bmp.setPixels(rgbaBytesToArgbInts(img.rgba), 0, w, 0, 0, w, h)
                 cache[img.id] = bmp
             }
         }
