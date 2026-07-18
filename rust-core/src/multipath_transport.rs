@@ -37,7 +37,7 @@ use isekai_protocol::attach::{
     AttachProof, AttachResponse, ConnectionGeneration,
 };
 use crate::transport::{run_ssh_channel_loop, TransportCommand, TransportEvent};
-use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
+use crate::{init_logger, CellData, JumpConfig, ScrollbackSearchMatch, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 use base64::Engine as _;
 use isekai_transport::multipath::{connect_multipath_with_socket, MultipathConnection};
@@ -245,6 +245,10 @@ impl MultipathIsekaiPipeQuicSession {
 
     pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
+    }
+
+    pub(crate) fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
+        self.core.search_scrollback(&query, case_sensitive)
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
