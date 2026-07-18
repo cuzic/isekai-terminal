@@ -298,12 +298,17 @@ fun SshTerminalCanvas(
 
         // カーソル(Bitmap キャッシュ対象外。テーマのカーソル色が変わってもキャッシュキーを
         // 増やす必要がないよう、選択ハイライトと同様に毎フレーム軽量に描画し直す)
-        val cx = update.cursorCol.toInt() * cellW
-        val cy = update.cursorRow.toInt() * cellH
-        if (cx < size.width && cy < size.height) {
-            cursorPaint.color = theme.cursor.copy(alpha = 0.7f).toArgb()
-            val nCanvas = drawContext.canvas.nativeCanvas
-            nCanvas.drawRect(cx, cy, cx + cellW, cy + cellH, cursorPaint)
+        // DECTCEM(CSI ?25l/h)でカーソルが非表示状態のときはRust側がcursorVisible=falseを
+        // 立てるので、描画自体をスキップする(rust-ssot: 可視判定はRust側で行い、Kotlin側は
+        // フラグをそのまま反映するだけ)。
+        if (update.cursorVisible) {
+            val cx = update.cursorCol.toInt() * cellW
+            val cy = update.cursorRow.toInt() * cellH
+            if (cx < size.width && cy < size.height) {
+                cursorPaint.color = theme.cursor.copy(alpha = 0.7f).toArgb()
+                val nCanvas = drawContext.canvas.nativeCanvas
+                nCanvas.drawRect(cx, cy, cx + cellW, cy + cellH, cursorPaint)
+            }
         }
 
         // 選択範囲のハイライト(行単位。Bitmap キャッシュとは独立に毎フレーム描画するので、
