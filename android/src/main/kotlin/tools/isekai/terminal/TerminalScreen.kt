@@ -1,8 +1,10 @@
 package tools.isekai.terminal
 
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Paint as AndroidPaint
 import android.net.Uri
 import android.view.inputmethod.InputMethodManager
@@ -48,10 +50,13 @@ import tools.isekai.terminal.ui.AgentSignConfirmDialog
 import tools.isekai.terminal.ui.AppColors
 import tools.isekai.terminal.ui.HostKeyChangedDialog
 import tools.isekai.terminal.ui.HostKeyUnknownDialog
+import tools.isekai.terminal.ui.HyperlinkConfirmDialog
 import tools.isekai.terminal.ui.SelectionRange
 import tools.isekai.terminal.ui.SshTerminalCanvas
 import tools.isekai.terminal.ui.TerminalFontSettings
 import tools.isekai.terminal.ui.TerminalThemes
+import tools.isekai.terminal.ui.isOpenableHyperlinkScheme
+import tools.isekai.terminal.ui.linkUrlAtCell
 import tools.isekai.terminal.ui.offsetToCellPos
 import tools.isekai.terminal.ui.reconstructSelectionText
 import tools.isekai.terminal.ui.synthesizeDisplayUpdate
@@ -364,6 +369,16 @@ fun TerminalScreenBody(
                 val latestCellDims = rememberUpdatedState(cellDims)
                 val latestCols = rememberUpdatedState(cols)
                 val latestRows = rememberUpdatedState(rows)
+                // タップ判定(OSC 8リンクのhit-test、タスク#52)は毎フレーム変わる画面内容を
+                // 見る必要があるため、上と同じ理由でrememberUpdatedState経由で読む
+                // (pointerInput(Unit)はkeyが変わらない限りコルーチンを再起動しないため、
+                // 素の val をそのままクロージャに捕まえると古いスクリーン内容のまま固定される)。
+                val latestDisplayUpdate = rememberUpdatedState(displayUpdate)
+
+                // タップされたセルがOSC 8リンクを指していた場合の確認待ちURL(タスク#52)。
+                // 「UI表示だけに閉じた状態」としてComposeローカルで保持する
+                // (選択範囲・スクロール位置と同じ扱い。rust-ssot原則の対象外)。
+                var pendingHyperlinkUrl by remember { mutableStateOf<String?>(null) }
 
                 Box(modifier = Modifier.fillMaxSize()) {
                     SshTerminalCanvas(
@@ -417,13 +432,32 @@ fun TerminalScreenBody(
                                         val stillDown = currentEvent.changes.firstOrNull { it.id == down.id }
                                         if (pointerCount < 2 && (stillDown == null || !stillDown.pressed)) {
                                             // (3) 単純タップ（長押し不成立かつ移動なしで指が離れた）→
-                                            // 画面分割時はこのペインへフォーカスを切り替え、その上でIMEフォーカスを要求する
-                                            // (このペインがまだフォーカス外の場合、入力欄自体がこの呼び出し時点では
-                                            // 未生成[inputViewがnull]のため即時には効かないが、onRequestFocus()による
-                                            // 再コンポジションでinputViewが生成された時点でその生成側のAndroidView.update
-                                            // が改めてrequestFocus+showSoftInputを行う)。
-                                            actions.onRequestFocus()
-                                            requestImeFocus()
+                                            // まずタップ位置がOSC 8リンク(タスク#52)を指しているか
+                                            // hit-testする。hit-test自体は表示中のセル配列を読むだけの
+                                            // UI表示に閉じた判断であり、rust-ssot原則の対象外
+                                            // (linkId/linkTableは既にRust側がintern済みで公開している)。
+                                            // リンクがあり、かつスキームがhttp/httpsの場合のみ確認
+                                            // ダイアログへ回す(intent://等を無条件でACTION_VIEWへ渡さない
+                                            // ——タスク#52 Fableレビュー2次のセキュリティ要件)。IMEを
+                                            // 誤って開かないよう、この場合はrequestImeFocusを呼ばない。
+                                            val tapCell = offsetToCellPos(
+                                                down.position.x, down.position.y,
+                                                cellW, cellH, cols, rows,
+                                            )
+                                            val tappedUrl = linkUrlAtCell(
+                                                latestDisplayUpdate.value, tapCell.row, tapCell.col,
+                                            )
+                                            if (tappedUrl != null && isOpenableHyperlinkScheme(tappedUrl)) {
+                                                pendingHyperlinkUrl = tappedUrl
+                                            } else {
+                                                // 画面分割時はこのペインへフォーカスを切り替え、その上でIMEフォーカスを要求する
+                                                // (このペインがまだフォーカス外の場合、入力欄自体がこの呼び出し時点では
+                                                // 未生成[inputViewがnull]のため即時には効かないが、onRequestFocus()による
+                                                // 再コンポジションでinputViewが生成された時点でその生成側のAndroidView.update
+                                                // が改めてrequestFocus+showSoftInputを行う)。
+                                                actions.onRequestFocus()
+                                                requestImeFocus()
+                                            }
                                         } else {
                                             // (2) 2本指以上、または長押し不成立で移動 →
                                             // ピンチ拡縮+縦パンスクロール
@@ -499,6 +533,29 @@ fun TerminalScreenBody(
                                 fontSize = 11.sp,
                             )
                         }
+                    }
+
+                    // OSC 8リンク(タスク#52)タップ確認ダイアログ。URLはリモートホスト出力
+                    // 由来の信頼できない入力のため、ここで全文を見せてユーザーが明示的に
+                    // 「開く」を押した場合のみACTION_VIEWへ渡す。スキームは
+                    // isOpenableHyperlinkScheme(http/httpsのみ)でタップ時点で既に
+                    // 絞り込み済み。
+                    pendingHyperlinkUrl?.let { url ->
+                        HyperlinkConfirmDialog(
+                            url = url,
+                            onOpen = {
+                                pendingHyperlinkUrl = null
+                                // リモートホスト出力由来のURLなので、開けるアプリが無い端末・
+                                // 制限プロファイル等でも例外でクラッシュしないようにする
+                                // (codexレビュー指摘、タスク#52)。
+                                try {
+                                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                                } catch (e: ActivityNotFoundException) {
+                                    RemoteLogger.w("Hyperlink", "no activity found to open $url", e)
+                                }
+                            },
+                            onDismiss = { pendingHyperlinkUrl = null },
+                        )
                     }
                 }
             }
@@ -621,6 +678,7 @@ fun TerminalScreenBody(
                     // 勝手に再表示されないようにするため）。
                     update = { view ->
                         view.applicationCursorMode = screenUpdate?.applicationCursorMode ?: false
+                        view.applicationKeypadMode = screenUpdate?.applicationKeypadMode ?: false
                         view.bracketedPasteMode = screenUpdate?.bracketedPasteMode ?: false
                         view.keyboardLayoutMode = keyboardLayoutMode
                         view.ctrlArmed = ctrlArmed
