@@ -281,7 +281,14 @@ fn expand_include_pattern(pattern: &str, base_dir: Option<&Path>) -> Result<Vec<
         }
         paths.sort();
     } else {
-        paths.push(PathBuf::from(pattern_str));
+        // A non-glob Include of a missing file is silently ignored by
+        // ssh(1) (same as a glob matching zero files) — only push it if it
+        // actually exists, so a stale/absent Include path doesn't fail the
+        // whole resolution via Error::Read in the recursive call.
+        let path = PathBuf::from(pattern_str);
+        if path.exists() {
+            paths.push(path);
+        }
     }
     Ok(paths)
 }
@@ -639,6 +646,21 @@ Host example
         let config = resolve(&path, "example").unwrap();
         assert_eq!(config.user.as_deref(), Some("alice"));
         assert_eq!(config.port, Some(2222));
+    }
+
+    #[test]
+    fn missing_non_glob_include_is_silently_ignored() {
+        // A non-glob Include path that doesn't exist must be ignored (like a
+        // glob matching zero files), not fail the whole resolution — the
+        // rest of the config must still resolve.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", &format!("
+Include {}/does-not-exist.conf
+Host example
+    User alice
+", dir.path().display()));
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.user.as_deref(), Some("alice"));
     }
 
     #[test]
