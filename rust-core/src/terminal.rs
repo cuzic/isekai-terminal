@@ -368,6 +368,21 @@ pub(crate) struct Terminal {
     /// `link_table`への逆引き(URL文字列→既存id)。`intern_link`の重複排除にのみ
     /// 使う内部キャッシュで、`link_table`と要素数・内容が常に対応する。
     link_ids: HashMap<String, u32>,
+    /// HTS(`ESC H`)/TBC(`CSI g`)による可変タブストップ(タスク#61)。
+    /// `tab_stops[col] == true`はその列がタブストップであることを示す。長さは
+    /// 常に`cols`と一致する。既定は8列おきの固定タブ(`col % 8 == 0`、以前の
+    /// HT/CHT/CBTの固定8桁計算——`(col/8+1)*8`——と等価なパターン。alacritty等の
+    /// 実装同様、列0も既定でタブストップに含める。CBTが列0まで戻れる/HTが列0を
+    /// 飛び越さないという既存挙動には影響しない)。HT(0x09)/CHT(`CSI Ps I`)/
+    /// CBT(`CSI Ps Z`)は`next_tab_stop`/`prev_tab_stop`経由でこの状態を参照する。
+    tab_stops: Vec<bool>,
+}
+
+/// 既定のタブストップパターン(8列おき、列0を含む)を`cols`幅分生成する。
+/// `Terminal::new`・`reset_all`(RIS)・`resize_preserving_state`(新しく増えた列分)
+/// で使う。
+fn default_tab_stops(cols: usize) -> Vec<bool> {
+    (0..cols).map(|c| c % 8 == 0).collect()
 }
 
 /// マウスレポーティング(タスク#36)対象のボタン。左/中/右クリックに加え、
@@ -440,6 +455,7 @@ impl Terminal {
     pub(crate) fn new(cols: usize, rows: usize, theme: Theme) -> Self {
         let blank = blank_cell_for_theme(&theme);
         let cells = vec![blank.clone(); cols * rows];
+        let tab_stops = default_tab_stops(cols);
         Terminal {
             theme,
             cols, rows,
@@ -474,6 +490,7 @@ impl Terminal {
             active_link_id: None,
             link_table: Vec::new(),
             link_ids: HashMap::new(),
+            tab_stops,
         }
     }
 
@@ -544,6 +561,23 @@ impl Terminal {
     /// `ScreenUpdate::link_table`として丸ごと公開する。
     pub(crate) fn link_table(&self) -> &[String] { &self.link_table }
 
+    /// HT(0x09)/CHT(`CSI Ps I`、タスク#61)共通: `col`より右にある最も近いタブストップを
+    /// 返す。存在しなければ最終列(`cols - 1`)。`col`が`cols`(delayed wrapによる
+    /// 画面外の折り返し待ち位置)でも、探索範囲`(col+1)..cols`が空になり自然に
+    /// `cols - 1`へ正規化される——HT/CHTの旧固定8桁実装が持っていた「計算してから
+    /// クランプ」の順序と同じ挙動になる。
+    fn next_tab_stop(&self, col: usize) -> usize {
+        ((col + 1)..self.cols)
+            .find(|&c| self.tab_stops[c])
+            .unwrap_or_else(|| self.cols.saturating_sub(1))
+    }
+
+    /// CBT(`CSI Ps Z`、タスク#61)用: `col`より左にある最も近いタブストップを返す。
+    /// 存在しなければ列0。
+    fn prev_tab_stop(&self, col: usize) -> usize {
+        (0..col).rev().find(|&c| self.tab_stops[c]).unwrap_or(0)
+    }
+
     /// origin modeが有効な間、絶対/相対カーソル移動の座標基準として使う行範囲
     /// `[top, bottom]`(0-indexed、画面全体の座標系)。offの場合は画面全体
     /// (`0..=rows-1`)。
@@ -589,6 +623,8 @@ impl Terminal {
         // アクティブなハイパーリンク状態のみクリアする。`link_table`自体は
         // クリアしない([Terminal]の`link_table`フィールドdocコメント参照)。
         self.active_link_id = None;
+        // RIS(`ESC c`)はタブストップも既定(8列おき)へ戻す(実端末の挙動、タスク#61)。
+        self.tab_stops = default_tab_stops(self.cols);
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -733,6 +769,16 @@ impl Terminal {
                 self.scroll_top = 0;
                 self.scroll_bottom = max_row;
             }
+        }
+
+        // タブストップ(タスク#61)は列方向の状態なので行のリサイズとは独立に扱う:
+        // 既存列(0..min(old_cols, new_cols))のHTS/TBCによる変更はそのまま保持し、
+        // 新しく増えた列(new_cols > old_colsの場合)だけ既定パターンで埋める
+        // (alacrittyの`TabStops::resize`と同じ方針)。縮む場合は単に切り詰める——
+        // 失われた列のタブストップ状態を覚えておく意味は無い。
+        self.tab_stops.resize(new_cols, false);
+        for c in old_cols..new_cols {
+            self.tab_stops[c] = c % 8 == 0;
         }
 
         self.cols = new_cols;
@@ -1562,10 +1608,10 @@ impl Perform for Terminal {
             // `print()`が参照する。
             0x0E => { self.gl_is_g1 = true; }  // SO
             0x0F => { self.gl_is_g1 = false; } // SI
-            0x09 => {
-                self.cursor_col = ((self.cursor_col / 8) + 1) * 8;
-                if self.cursor_col >= self.cols { self.cursor_col = self.cols - 1; }
-            }
+            // HT(タブ、タスク#61): 現在位置より右にある最も近いタブストップへ進む
+            // (HTS/`ESC H`・TBC/`CSI g`で変更可能な[Terminal::tab_stops]を参照。
+            // 未設定なら既定の8列おき)。
+            0x09 => { self.cursor_col = self.next_tab_stop(self.cursor_col); }
             _ => {}
         }
     }
@@ -1736,36 +1782,38 @@ impl Perform for Terminal {
             // 得るがこれまで未対応だった(Fableレビュー指摘)。
             'G' | '`' => { self.cursor_col = (p0.max(1) as usize - 1).min(self.cols - 1); }
             // CHT(`CSI Ps I`、タスク#65)。カーソルを右方向へ`Ps`個(既定1)先の
-            // タブストップまで移動する。可変タブストップ(HTS/`ESC H`・TBC/`CSI g`)は
-            // 別タスク#61の対象で未実装のため、HT(0x09、`execute`)と同じ固定8桁
-            // ストップを前提にする。行末(`cols - 1`)に達したらそれ以上進まない
-            // (HTの`execute`ハンドラと同じクランプ挙動)。
+            // タブストップまで移動する。`next_tab_stop`はHTS/`ESC H`・TBC/`CSI g`
+            // (タスク#61)で変更された[Terminal::tab_stops]を参照するため、可変
+            // タブストップにも対応する。行末(`cols - 1`)に達したらそれ以上進まない
+            // (`next_tab_stop`自体がそこでクランプする)。
             //
-            // `execute`のHTと全く同じ「計算してからクランプ」の順序にする——事前に
-            // `cursor_col >= cols - 1`で早期breakするガードを入れると、直前の
-            // `print()`による折り返し待ち状態(`cursor_col == cols`、まだ改行して
-            // いない)を「既に行末にいる」と誤認してカーソルを一切動かさず、
-            // `cursor_col == cols`という画面外の値のまま放置してしまう
+            // `execute`のHTと全く同じ「`next_tab_stop`で計算してからクランプ」の
+            // 順序にする——事前に`cursor_col >= cols - 1`で早期breakするガードを
+            // 入れると、直前の`print()`による折り返し待ち状態(`cursor_col == cols`、
+            // まだ改行していない)を「既に行末にいる」と誤認してカーソルを一切
+            // 動かさず、`cursor_col == cols`という画面外の値のまま放置してしまう
             // (codexレビュー指摘)。HTと同じ順序なら、折り返し待ち状態からでも
             // 最終列(`cols - 1`)へ正しく正規化される。
             'I' => {
                 let n = p0.max(1) as usize;
                 for _ in 0..n {
-                    self.cursor_col = ((self.cursor_col / 8) + 1) * 8;
-                    if self.cursor_col >= self.cols {
-                        self.cursor_col = self.cols - 1;
+                    let next = self.next_tab_stop(self.cursor_col);
+                    if next == self.cursor_col {
+                        // 既に最終列(`next_tab_stop`のフォールバック)に達している。
                         break;
                     }
+                    self.cursor_col = next;
                 }
             }
             // CBT(`CSI Ps Z`、タスク#65)。CHT('I')と対称: カーソルを左方向へ
-            // `Ps`個(既定1)前のタブストップまで移動する。固定8桁ストップ前提は
-            // CHTと同じ(#61未実装)。列0に達したらそれ以上戻らない。
+            // `Ps`個(既定1)前のタブストップまで移動する。`prev_tab_stop`が
+            // 可変タブストップ(タスク#61)を参照する点もCHTと同じ。列0に達したら
+            // それ以上戻らない。
             'Z' => {
                 let n = p0.max(1) as usize;
                 for _ in 0..n {
                     if self.cursor_col == 0 { break; }
-                    self.cursor_col = ((self.cursor_col - 1) / 8) * 8;
+                    self.cursor_col = self.prev_tab_stop(self.cursor_col);
                 }
             }
             // CUP/HVP(`H`/`f`): origin modeが有効な間、行番号はscroll region上端
@@ -1853,6 +1901,22 @@ impl Perform for Terminal {
             'd' => {
                 let (floor, ceil) = self.origin_row_bounds();
                 self.cursor_row = (floor + p0.max(1) as usize - 1).clamp(floor, ceil);
+            }
+            // TBC(`CSI Ps g`、タスク#61)。`Ps`省略/0: 現在のカーソル列のタブストップを
+            // 解除する。`Ps`3: 全タブストップを解除する(vim/tmux等がリサイズ後や
+            // 端末初期化時に送る、より一般的なケース)。他の`Ps`値(1/2/4/5、行単位の
+            // タブ機構等)はこの実装が対応していない機能に対する要求なのでno-op。
+            'g' => {
+                match p0 {
+                    0 => {
+                        let col = self.cursor_col.min(self.cols.saturating_sub(1));
+                        self.tab_stops[col] = false;
+                    }
+                    3 => {
+                        for stop in self.tab_stops.iter_mut() { *stop = false; }
+                    }
+                    _ => {}
+                }
             }
             'm' => { self.handle_sgr(&ps); }
             'r' => {
@@ -1980,6 +2044,15 @@ impl Perform for Terminal {
             // DECALNまで誤ってDECRCとして処理してしまう(codexレビュー指摘)。
             b'7' if ints.is_empty() => { self.save_cursor_decsc(); }
             b'8' if ints.is_empty() => { self.restore_cursor_decrc(); }
+            // HTS(`ESC H`、タスク#61): 現在のカーソル列にタブストップを設定する。
+            // `print()`の遅延折り返し中(`cursor_col == cols`)は他のカーソル位置参照
+            // 箇所(CPR/EL/ED等)と同様、可視上の最終列(`cols - 1`)にクランプしてから
+            // 設定する。intermediateが空の場合のみ扱う(`ESC 7`/`ESC 8`と同じ理由で、
+            // 中間バイト付きの別シーケンスと最終バイトが衝突しないことを明示する)。
+            b'H' if ints.is_empty() => {
+                let col = self.cursor_col.min(self.cols.saturating_sub(1));
+                self.tab_stops[col] = true;
+            }
             // G0/G1文字セット指定(`ESC ( <final>`/`ESC ) <final>`、タスク#41)。
             // `byte`は最終バイト(vteが`ints`と`byte`を分離して渡す——中間バイト
             // `(`/`)`自体は`byte`には現れない)。`0`(DEC Special Graphics)だけ
@@ -4072,6 +4145,74 @@ mod tests {
         feed(&mut t, b"\x1b[1;5H"); // 列4(0-indexed)へ移動
         feed(&mut t, b"\x1b[10Z"); // 大きく超える回数を要求
         assert_eq!(t.cursor_col(), 0, "列0を下回らずクランプされる(panicもしない)");
+    }
+
+    // ── HTS(`ESC H`)/TBC(`CSI g`、可変タブストップ、タスク#61) ─────────
+
+    #[test]
+    fn test_hts_adds_custom_tab_stop_that_ht_stops_at() {
+        let mut t = Terminal::new(40, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;6H"); // 列5(0-indexed)へ移動
+        feed(&mut t, b"\x1bH"); // HTS: 列5にタブストップを追加
+        feed(&mut t, b"\x1b[1;1H"); // 行頭へ戻る
+        feed(&mut t, b"\t"); // HT
+        assert_eq!(t.cursor_col(), 5, "既定の8桁ストップより先に、HTSで追加したストップで止まる");
+    }
+
+    #[test]
+    fn test_tbc_ps0_clears_only_tab_stop_at_cursor_column() {
+        let mut t = Terminal::new(40, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;9H"); // 列8(0-indexed、既定のタブストップ上)へ移動
+        feed(&mut t, b"\x1b[g"); // TBC Ps省略==0: この列のストップだけ解除
+        feed(&mut t, b"\x1b[1;1H");
+        feed(&mut t, b"\t"); // HT: 列8はもう止まらず次の16へ
+        assert_eq!(t.cursor_col(), 16, "TBC(Ps=0)で解除した列は飛び越し、次のストップへ進む");
+    }
+
+    #[test]
+    fn test_tbc_ps3_clears_all_tab_stops_so_ht_goes_to_last_column() {
+        let mut t = Terminal::new(40, 3, Theme::default());
+        feed(&mut t, b"\x1b[3g"); // TBC Ps=3: 全ストップ解除
+        feed(&mut t, b"\t"); // HT: ストップが無いので最終列へ
+        assert_eq!(t.cursor_col(), 39, "全ストップ解除後のHTは最終列まで進む");
+    }
+
+    #[test]
+    fn test_cht_cbt_use_custom_tab_stops() {
+        let mut t = Terminal::new(40, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;11H"); // 列10(0-indexed)へ移動
+        feed(&mut t, b"\x1bH"); // HTS: 列10にカスタムストップ
+        feed(&mut t, b"\x1b[1;1H");
+        feed(&mut t, b"\x1b[I"); // CHT: 既定の8ではなく、まず既定の8に止まる
+        assert_eq!(t.cursor_col(), 8, "既定の8桁ストップは維持されたまま");
+        feed(&mut t, b"\x1b[I"); // 次は列10のカスタムストップへ
+        assert_eq!(t.cursor_col(), 10, "HTSで追加したカスタムストップにもCHTが止まる");
+        feed(&mut t, b"\x1b[Z"); // CBT: カスタムストップ(10)から既定の8へ戻る
+        assert_eq!(t.cursor_col(), 8);
+    }
+
+    #[test]
+    fn test_tab_stops_survive_resize_within_old_width_but_new_columns_get_default_pattern() {
+        let mut t = Terminal::new(20, 3, Theme::default());
+        feed(&mut t, b"\x1b[1;9H"); // 列8(既定のストップ上)へ移動
+        feed(&mut t, b"\x1b[g"); // TBC Ps=0: 列8のストップを解除
+        t.resize_preserving_state(40, 3); // 幅を広げる(既存タブストップ状態は保持されるべき)
+        feed(&mut t, b"\x1b[1;1H");
+        feed(&mut t, b"\t"); // HT: 列8は解除済みなので飛び越して次の16へ
+        assert_eq!(t.cursor_col(), 16, "リサイズ前に解除した列8のストップは保持されたまま(復活しない)");
+        // 新しく増えた列(20..40)は既定の8桁パターンで初期化されている。
+        feed(&mut t, b"\x1b[1;25H"); // 列24(0-indexed、新しい領域内の既定ストップ)へ移動
+        feed(&mut t, b"\t");
+        assert_eq!(t.cursor_col(), 32, "新しく増えた列は既定の8桁パターンで初期化される");
+    }
+
+    #[test]
+    fn test_ris_restores_default_tab_stops() {
+        let mut t = Terminal::new(40, 3, Theme::default());
+        feed(&mut t, b"\x1b[3g"); // 全ストップ解除
+        feed(&mut t, b"\x1bc"); // RIS
+        feed(&mut t, b"\t"); // HT: 既定の8桁パターンに戻っているはず
+        assert_eq!(t.cursor_col(), 8, "RISでタブストップは既定(8桁おき)に戻る");
     }
 
     // ── DECSC/DECRC(`ESC 7`/`ESC 8`)・CSI s/u(タスク#57) ─────────────
