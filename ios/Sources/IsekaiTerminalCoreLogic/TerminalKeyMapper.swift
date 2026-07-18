@@ -44,8 +44,18 @@ public enum TerminalKeyMapper {
     /// 打鍵列(KeySequence)機能向け: `applicationCursorMode`(DECCKM)を明示的に指定できる版。
     /// 矢印キー等はtmux/vim等でDECCKMがオンの場合SS3形式になる(Android版
     /// `TerminalKeyEncoder.specialKeyBytes(keyCode, applicationCursorMode)`と同じ挙動)。
-    public static func bytes(for key: SpecialKey, applicationCursorMode: Bool) -> [UInt8] {
-        Array(terminalSpecialKeyBytes(key: key.rustKey, applicationCursorMode: applicationCursorMode))
+    ///
+    /// `modifiers`(Shift/Alt/Ctrl/Meta)はRust側の`terminal_special_key_bytes`(#29)へ
+    /// そのまま委譲する(ハードウェアキーボード接続時のUI配線本体は#63)。UniFFIが生成した
+    /// `TerminalKeyModifiers`をこの層で複製したSwift型にラップし直さず直接受け渡すのは、
+    /// 修飾キーの意味づけロジックをRust側だけに置く(rust-ssot)ため。省略時は修飾なし
+    /// (既存呼び出し元との後方互換)。
+    public static func bytes(
+        for key: SpecialKey,
+        applicationCursorMode: Bool,
+        modifiers: TerminalKeyModifiers = TerminalKeyModifiers(shift: false, alt: false, ctrl: false, meta: false)
+    ) -> [UInt8] {
+        Array(terminalSpecialKeyBytes(key: key.rustKey, applicationCursorMode: applicationCursorMode, modifiers: modifiers))
     }
 }
 
