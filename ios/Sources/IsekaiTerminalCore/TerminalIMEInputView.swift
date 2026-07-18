@@ -44,6 +44,11 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
     /// ために必要。`bracketedPasteMode`と同じく、Rust側の状態をそのまま反映する
     /// だけで新しいミラー状態は作らない(`TerminalView`の`updateUIView`参照)。
     public var applicationCursorMode: Bool = false
+    /// タスク#82: ハードウェアキーボードのテンキー(numpad)が`applicationKeypadMode`
+    /// (DECKPAM、`ScreenUpdate.applicationKeypadMode`)に従ってSS3/リテラル文字を
+    /// 切り替えるために必要。`applicationCursorMode`と同じく、Rust側の状態をそのまま
+    /// 反映するだけで新しいミラー状態は作らない(`TerminalView`の`updateUIView`参照)。
+    public var applicationKeypadMode: Bool = false
 
     public override init(frame: CGRect) {
         super.init(frame: frame)
@@ -131,6 +136,17 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
             let bytes = TerminalKeyMapper.bytes(for: specialKey, applicationCursorMode: applicationCursorMode, modifiers: modifiers)
             guard !bytes.isEmpty else { return false }
             onSendBytes?(Data(bytes))
+            return true
+        }
+
+        // タスク#82: テンキー(numpad)は`applicationKeypadMode`(DECKPAM)に従って
+        // SS3シーケンス/リテラル文字を切り替える(Android版`TerminalKeyEncoder`の
+        // `KC_NUMPAD_*`分岐と同じ方針)。矢印等と同様、日本語IME変換中は候補選択に
+        // 委ねるためフォールスルーする。
+        if let numpadKey = TerminalHardwareKeyMapper.numpadKey(for: key.keyCode), markedTextRange == nil {
+            let bytes = terminalNumpadKeyBytes(key: numpadKey, applicationKeypadMode: applicationKeypadMode)
+            guard !bytes.isEmpty else { return false }
+            onSendBytes?(bytes)
             return true
         }
 

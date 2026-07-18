@@ -49,6 +49,40 @@ final class TerminalHardwareKeyMapperTests: XCTestCase {
         XCTAssertNil(TerminalHardwareKeyMapper.specialKey(for: .keyboardA))
     }
 
+    /// タスク#82: テンキー(numpad)のHID usage→`TerminalNumpadKey`。
+    /// Android版`TerminalKeyEncoder`の`KC_NUMPAD_*`表と対になる。
+    func testNumpadDigitsMapToNumpadKeys() {
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypad0), .digit0)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypad1), .digit1)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypad2), .digit2)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypad3), .digit3)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypad4), .digit4)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypad5), .digit5)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypad6), .digit6)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypad7), .digit7)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypad8), .digit8)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypad9), .digit9)
+    }
+
+    func testNumpadOperatorsAndEnterMapToNumpadKeys() {
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypadPeriod), .decimal)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypadComma), .comma)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypadPlus), .add)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypadHyphen), .subtract)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypadAsterisk), .multiply)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypadSlash), .divide)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypadEqualSign), .equals)
+        XCTAssertEqual(TerminalHardwareKeyMapper.numpadKey(for: .keypadEnter), .enter)
+    }
+
+    /// NumLock(タスク#83で扱う別課題)とAS/400キーボード固有の`=`
+    /// (`TerminalNumpadKey`に対応ケースが無い)は意図的に対象外(nil)。通常の
+    /// 文字キー同様、既存の`UITextInput`経路にフォールスルーする。
+    func testNumLockAndAs400EqualsAreNotMappedToNumpadKey() {
+        XCTAssertNil(TerminalHardwareKeyMapper.numpadKey(for: .keypadNumLock))
+        XCTAssertNil(TerminalHardwareKeyMapper.numpadKey(for: .keypadEqualSignAS400))
+    }
+
     func testModifiersMapAllFourFlagsIndependently() {
         XCTAssertEqual(
             TerminalHardwareKeyMapper.modifiers(for: []),
