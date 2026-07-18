@@ -20,6 +20,7 @@ class ConnectionStateMapperTest {
     private fun screenUpdate() = ScreenUpdate(
         80u, 24u, emptyList(), 0u, 0u, null, false, false,
         MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(),
+        emptyList(), 0u,
     )
 
     @Test

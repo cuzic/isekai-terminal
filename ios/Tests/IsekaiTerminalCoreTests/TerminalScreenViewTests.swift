@@ -21,7 +21,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: true, linkTable: []
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
         )
 
         view.apply(update)
@@ -44,7 +44,7 @@ final class TerminalScreenViewTests: XCTestCase {
             title: nil, applicationCursorMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: true, linkTable: []
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
         )
         view.apply(update)
         view.layoutIfNeeded()

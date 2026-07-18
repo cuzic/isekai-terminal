@@ -42,6 +42,8 @@ class TerminalSelectionTest {
             cursorShape = CursorShape.BLOCK,
             cursorBlink = true,
             linkTable = emptyList(),
+            images = emptyList(),
+            kittyKeyboardFlags = 0u,
         )
     }
 
@@ -108,6 +110,7 @@ class TerminalSelectionTest {
             mouseReportingMode = MouseReportingMode.OFF, sgrMouseMode = false,
             cursorVisible = true, bellGeneration = 0uL,
             cursorShape = CursorShape.BLOCK, cursorBlink = true, linkTable = emptyList(),
+            images = emptyList(), kittyKeyboardFlags = 0u,
         )
         val sel = SelectionRange(CellPos(0, 0), CellPos(1, 0))
         assertEquals("", reconstructSelectionText(update, sel))
@@ -122,6 +125,7 @@ class TerminalSelectionTest {
             mouseReportingMode = MouseReportingMode.OFF, sgrMouseMode = false,
             cursorVisible = true, bellGeneration = 0uL,
             cursorShape = CursorShape.BLOCK, cursorBlink = true, linkTable = emptyList(),
+            images = emptyList(), kittyKeyboardFlags = 0u,
         )
         val sel = SelectionRange(CellPos(0, 0), CellPos(0, 0))
         assertEquals("", reconstructSelectionText(update, sel))
