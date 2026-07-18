@@ -33,6 +33,11 @@ pub(crate) struct TermCell {
     pub(crate) strikethrough: bool,
     pub(crate) blink: bool,
     pub(crate) invisible: bool,
+    /// 全角(wide)文字が占める2セル目(プレースホルダ)であることを示す内部専用フラグ。
+    /// `CellData`(UniFFI公開型)には出さない——`session.rs::to_cell_data`が変換時に
+    /// 落とす。幅0の結合文字([Terminal::print]参照)を、プレースホルダではなく
+    /// 全角文字自身の本体セルへ付加するために使う(Fableレビュー: タスク#39)。
+    pub(crate) is_wide_placeholder: bool,
 }
 
 /// 現在のカーソル位置に適用されている SGR 属性一式(色は「論理色」——`reverse`が
@@ -89,6 +94,7 @@ impl TermAttrs {
             strikethrough: self.strikethrough,
             blink: self.blink,
             invisible: self.invisible,
+            is_wide_placeholder: false,
         }
     }
 }
@@ -108,6 +114,7 @@ fn blank_cell_for_theme(theme: &Theme) -> TermCell {
         strikethrough: false,
         blink: false,
         invisible: false,
+        is_wide_placeholder: false,
     }
 }
 
@@ -633,6 +640,41 @@ impl Perform for Terminal {
         use unicode_width::UnicodeWidthChar;
         let width = c.width().unwrap_or(1);
 
+        if width == 0 {
+            // 幅0の結合文字(combining character、例: U+0301 COMBINING ACUTE ACCENT)。
+            // 独立したセルとして書き込んでカーソルを進めてしまうと、以後の文字が
+            // 全て1桁ずつ右へずれてしまう。直前に印字した文字のセルへグラフェムとして
+            // 追加し、カーソルは進めない(Fableレビュー: タスク#39)。
+            //
+            // `cursor_col` の有効範囲は 0..=cols(== cols は「次の print() で折り返す」
+            // wrap-pending状態、388行目付近のコメント参照)。wrap-pending中に結合文字が
+            // 来た場合も改行させず、`cursor_col - 1 == cols - 1`(現在行の最終セル)へ
+            // 付加するのが正しい — 折り返しを先に実行すると結合文字が次行の先頭に
+            // 単独で置かれてしまう(Fableレビュー: タスク#39)。
+            if self.cursor_col == 0 {
+                // 行頭で、結合させる直前の文字が無い(RIS直後・行クリア直後等)。
+                // グラフェムクラスタリング(ZWJ絵文字等)は対象外(Fableレビューでスコープ外
+                // と明記済み) — 単純に無視する。
+                return;
+            }
+            if self.cursor_row >= self.rows {
+                return;
+            }
+            let attach_row = self.cursor_row;
+            let mut attach_col = self.cursor_col - 1;
+            // 全角(wide)文字のプレースホルダセル(2セル目)に結合文字が来た場合は、
+            // プレースホルダ自体ではなくその前の全角文字本体セルへ付加する。
+            if attach_col > 0 && self.cell_mut(attach_row, attach_col).is_wide_placeholder {
+                attach_col -= 1;
+            }
+            let cell = self.cell_mut(attach_row, attach_col);
+            let mut combined = String::with_capacity(cell.ch.len() + c.len_utf8());
+            combined.push_str(&cell.ch);
+            combined.push(c);
+            cell.ch = smol_str::SmolStr::new(combined);
+            return;
+        }
+
         if self.cursor_col >= self.cols {
             self.cursor_col = 0;
             self.newline();
@@ -645,8 +687,9 @@ impl Perform for Terminal {
             if width == 2 && self.cursor_col < self.cols {
                 // wide文字の2セル目(placeholder)も現在の属性(reverse等も含め)を
                 // 正しく引き継ぐ — 以前は bold だけ無条件で false になっていた。
-                *self.cell_mut(self.cursor_row, self.cursor_col) =
-                    attrs.to_cell(smol_str::SmolStr::new_inline(" "));
+                let mut placeholder = attrs.to_cell(smol_str::SmolStr::new_inline(" "));
+                placeholder.is_wide_placeholder = true;
+                *self.cell_mut(self.cursor_row, self.cursor_col) = placeholder;
                 self.cursor_col += 1;
             }
         }
@@ -1019,6 +1062,82 @@ mod tests {
         let c = &t.screen_cells()[0];
         assert!(c.bold, "erased blank cells should inherit bold");
         assert!(c.underline, "erased blank cells should inherit underline");
+    }
+
+    #[test]
+    fn test_combining_char_appends_to_previous_cell_without_advancing_cursor() {
+        // 幅0の結合文字(U+0301 COMBINING ACUTE ACCENT)は、独立したセルとして
+        // カーソル位置に置かれるのではなく、直前のセルへグラフェムとして付加され、
+        // カーソルは進まない(Fableレビュー: タスク#39)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, "e\u{0301}".as_bytes());
+        assert_eq!(cell(&t, 0, 0), "e\u{0301}");
+        assert_eq!(t.cursor_col(), 1, "combining char must not advance the cursor");
+        // 続けて通常文字を書くと、結合文字の直後の(進んでいない)セルに書かれる。
+        feed(&mut t, b"f");
+        assert_eq!(cell(&t, 0, 1), "f");
+        assert_eq!(t.cursor_col(), 2);
+    }
+
+    #[test]
+    fn test_combining_char_after_wide_char_attaches_to_wide_char_main_cell() {
+        // 全角文字の直後に結合文字が来た場合、2セル目のプレースホルダではなく
+        // 全角文字自身の本体セル(1セル目)へ付加するのが正解(Fableレビュー: タスク#39)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, "\u{3042}\u{0301}".as_bytes()); // "あ" + COMBINING ACUTE ACCENT
+        assert_eq!(cell(&t, 0, 0), "\u{3042}\u{0301}", "combining char should attach to the wide char's main cell");
+        assert_eq!(cell(&t, 0, 1), " ", "wide char placeholder cell must stay untouched");
+        assert_eq!(t.cursor_col(), 2, "cursor must stay right after the wide char (unchanged by the combining char)");
+    }
+
+    #[test]
+    fn test_combining_char_at_wrap_pending_attaches_to_last_column_without_wrapping() {
+        // wrap-pending状態(cursor_col == cols、次のprintで折り返す)で結合文字が来た場合、
+        // 折り返しを実行せず現在行の最終セル(cols-1)へ付加する
+        // (Fableレビュー: タスク#39 — 折り返しを先にやると次行の先頭に単独で置かれてしまう)。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"0123456789"); // ちょうど10文字でcols(10)埋まり、wrap-pending状態になる
+        assert_eq!(t.cursor_col(), 10);
+        assert_eq!(t.cursor_row(), 0);
+
+        feed(&mut t, "\u{0301}".as_bytes());
+        assert_eq!(cell(&t, 0, 9), "9\u{0301}", "combining char at wrap-pending should attach to the last column of the current row");
+        assert_eq!(t.cursor_row(), 0, "combining char at wrap-pending must not trigger a wrap");
+        assert_eq!(t.cursor_col(), 10, "wrap-pending state itself must be left untouched by the combining char");
+
+        // 直後に通常文字を書くと、初めてそこで折り返しが発生する(既存のwrap挙動に影響しない)。
+        feed(&mut t, b"X");
+        assert_eq!(t.cursor_row(), 1);
+        assert_eq!(cell(&t, 1, 0), "X");
+    }
+
+    #[test]
+    fn test_combining_char_at_wrap_pending_after_wide_char_attaches_to_wide_main_cell() {
+        // 全角文字がちょうど最終2セル(cols-2, cols-1)を占めてwrap-pending状態になった
+        // 直後に結合文字が来た場合、全角文字のプレースホルダ(cols-1)にではなく
+        // 本体セル(cols-2)へ付加する(codexレビュー: タスク#39、wrap-pendingと全角直後の
+        // 2条件が重なるケースの回帰防止)。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"01234567"); // col0..7を埋める(8セル)
+        feed(&mut t, "\u{3042}".as_bytes()); // "あ"(全角)がcol8-9を占め、cursor_col==10(wrap-pending)になる
+        assert_eq!(t.cursor_col(), 10);
+        assert_eq!(t.cursor_row(), 0);
+
+        feed(&mut t, "\u{0301}".as_bytes());
+        assert_eq!(cell(&t, 0, 8), "\u{3042}\u{0301}", "combining char should attach to the wide char's main cell, not its placeholder");
+        assert_eq!(cell(&t, 0, 9), " ", "wide char placeholder cell must stay untouched");
+        assert_eq!(t.cursor_row(), 0, "must not trigger a wrap");
+        assert_eq!(t.cursor_col(), 10, "wrap-pending state must be left untouched");
+    }
+
+    #[test]
+    fn test_combining_char_at_start_of_line_with_no_prior_char_is_ignored() {
+        // 行頭で付加対象の文字が存在しない場合(RIS直後・クリア直後等)は無視する。
+        // グラフェムクラスタリング(ZWJ絵文字等)は対象外(Fableレビューでスコープ外と明記)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, "\u{0301}".as_bytes());
+        assert_eq!(cell(&t, 0, 0), " ", "no base char to attach to: cell must remain blank");
+        assert_eq!(t.cursor_col(), 0, "no cell was written, cursor must not move");
     }
 
     #[test]
