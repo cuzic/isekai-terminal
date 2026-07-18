@@ -1587,8 +1587,9 @@ impl Terminal {
         };
         match uri {
             Some(s) if !s.is_empty() => {
-                // 上限到達後の新規URLは`intern_link`が`None`を返す——その場合は
-                // リンク無し扱いにフォールバックする(タスク#70)。
+                // 上限到達後の新規URL(タスク#70)、bidi format controls/制御文字を
+                // 含むURL(タスク#77)は`intern_link`が`None`を返す——その場合は
+                // リンク無し扱いにフォールバックする。
                 self.active_link_id = self.intern_link(s);
             }
             _ => {
@@ -1602,7 +1603,15 @@ impl Terminal {
     /// 達した後の未登録URLはインターンせず`None`を返す(タスク#70) ——
     /// 呼び出し元はこれをリンク無しへフォールバックさせる。既存id(=既存セルの
     /// `link_id`参照)には影響しない。
+    ///
+    /// bidi format controls/C0・C1制御文字を含むURLもインターンせず`None`を返す
+    /// (タスク#77)。Android/iOSのOSC8確認ダイアログは`link_table`の文字列をそのまま
+    /// 表示するため、これらを許すとbidi override等で表示文字列を偽装できてしまう
+    /// (`contains_disallowed_hyperlink_chars`参照)。
     fn intern_link(&mut self, uri: String) -> Option<u32> {
+        if contains_disallowed_hyperlink_chars(&uri) {
+            return None;
+        }
         if let Some(&id) = self.link_ids.get(&uri) {
             return Some(id);
         }
@@ -1614,6 +1623,36 @@ impl Terminal {
         self.link_ids.insert(uri, id);
         Some(id)
     }
+}
+
+/// OSC8のURLとして許さない文字が含まれているかを判定する(タスク#77)。
+///
+/// Android/iOSのOSC8確認ダイアログ(`isOpenableHyperlinkScheme`によるスキーム
+/// 制限とは別の層)は`link_table`の文字列をそのままユーザーに提示する。この
+/// 文字列にUnicode双方向書式制御文字(bidi format controls)が混じっていると、
+/// 実際のリンク先とは異なる文字列に見えるよう表示順序を偽装できてしまう
+/// (例: `\u{202E}`で末尾の拡張子を先頭にひっくり返して見せる、いわゆる
+/// "RTLO spoofing")。
+///
+/// 「Unicode Cf/Ccカテゴリを丸ごと拒否」は正当なIRI(パーセントエンコード
+/// されていない非ASCII文字を含むURL等)まで広く巻き込みすぎるため
+/// (codexレビュー済み)、対象は次の2種類のみに絞る:
+/// - bidi format controls: `U+202A..=U+202E`(LRE/RLE/PDF/LRO/RLO)、
+///   `U+2066..=U+2069`(LRI/RLI/FSI/PDI)
+/// - C0/C1制御文字: `U+0000..=U+001F`、`U+007F`(DEL)、`U+0080..=U+009F`
+///   (vteのOSC文字列パーサはC0の大半を`osc_dispatch`に渡す前に静かに捨てる
+///   ため実際には主にC1側・DEL側が到達経路になるが、将来の実装変更に
+///   備えて両方を対象にする)
+fn contains_disallowed_hyperlink_chars(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c,
+            '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{0000}'..='\u{001F}'
+                | '\u{007F}'
+                | '\u{0080}'..='\u{009F}'
+        )
+    })
 }
 
 /// OSC 10/11などが使う`Pt`のcolor spec(`rgb:R.../G.../B...`または`#RRGGBB`系)を
@@ -3063,6 +3102,68 @@ mod tests {
             Some(0),
             "上限到達後も既存URLの再利用(重複排除)は引き続き機能する"
         );
+    }
+
+    #[test]
+    fn test_osc8_url_with_bidi_rlo_is_rejected_and_falls_back_to_no_link() {
+        // タスク#77: U+202E(RIGHT-TO-LEFT OVERRIDE)を含むURLは、Android/iOSの
+        // OSC8確認ダイアログに表示される文字列を偽装できてしまう(RTLO spoofing、
+        // 例: 拡張子を先頭にひっくり返して見せる)ため、intern表に登録せずリンク
+        // 無しへフォールバックしなければならない。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let malicious = "https://evil.example/\u{202e}gpj.exe";
+        feed(&mut t, format!("\x1b]8;;{malicious}\x07x").as_bytes());
+        assert_eq!(
+            t.screen_cells()[0].link_id, None,
+            "bidi override文字を含むURLはリンク無しにフォールバックする"
+        );
+        assert!(
+            t.link_table().is_empty(),
+            "bidi override文字を含むURLはintern表に登録されない"
+        );
+    }
+
+    #[test]
+    fn test_osc8_url_with_bidi_isolate_is_rejected() {
+        // タスク#77: LRE/RLE/PDF/LRO/RLOだけでなく、bidi isolate(U+2066..=U+2069)
+        // も同じ理由で拒否対象。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let malicious = "https://evil.example/\u{2066}x\u{2069}";
+        feed(&mut t, format!("\x1b]8;;{malicious}\x07x").as_bytes());
+        assert_eq!(t.screen_cells()[0].link_id, None);
+        assert!(t.link_table().is_empty());
+    }
+
+    #[test]
+    fn test_osc8_url_with_c1_control_char_is_rejected() {
+        // タスク#77: C1制御文字(例: U+0085 NEL)はUTF-8では2バイトのマルチバイト
+        // シーケンスとしてvteのOSC文字列パーサをそのまま通過する(C0と違い静かに
+        // 捨てられない)ため、Rust側でのフィルタが必要な実際の到達経路になる。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let malicious = "https://example.com/\u{0085}evil";
+        feed(&mut t, format!("\x1b]8;;{malicious}\x07x").as_bytes());
+        assert_eq!(t.screen_cells()[0].link_id, None);
+        assert!(t.link_table().is_empty());
+    }
+
+    #[test]
+    fn test_osc8_url_with_del_char_is_rejected() {
+        // タスク#77: DEL(0x7F)はvteのOSC文字列パーサが無視するC0範囲
+        // (0x00-0x06/0x08-0x17/0x19/0x1C-0x1F)に含まれず素通りするため、
+        // 実際に`osc_dispatch`まで到達しうる制御文字。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8;;https://example.com/\x7fevil\x07x");
+        assert_eq!(t.screen_cells()[0].link_id, None);
+        assert!(t.link_table().is_empty());
+    }
+
+    #[test]
+    fn test_osc8_url_without_disallowed_chars_is_unaffected_by_task77_filter() {
+        // タスク#77のフィルタが正当なURLまで巻き込んでいないことの回帰確認。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]8;;https://example.com/normal-path?x=1\x07x");
+        assert_eq!(t.screen_cells()[0].link_id, Some(0));
+        assert_eq!(t.link_table(), &["https://example.com/normal-path?x=1".to_string()]);
     }
 
     #[test]
