@@ -90,6 +90,16 @@ class TerminalKeyEncoderTest {
     }
 
     @Test
+    fun `insert maps to CSI 2 tilde`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x32, 0x7E), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_INSERT))
+    }
+
+    @Test
+    fun `forward delete maps to CSI 3 tilde`() {
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x33, 0x7E), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_FORWARD_DEL))
+    }
+
+    @Test
     fun `unknown keycode returns null`() {
         assertNull(TerminalKeyEncoder.specialKeyBytes(9999))
     }

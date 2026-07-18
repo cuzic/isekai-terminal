@@ -30,6 +30,12 @@ object TerminalKeyEncoder {
     const val KC_PAGE_DOWN  = 93
     const val KC_MOVE_HOME  = 122
     const val KC_MOVE_END   = 123
+    // android.view.KeyEvent.KEYCODE_FORWARD_DEL / KEYCODE_INSERT と同値（変更不可の Android API 値）。
+    // KC_DELは実質バックスペース(0x7F)であり、こちらの前方削除キー(forward delete)とは別物
+    // (rust-core `TerminalSpecialKey::Delete` / `::ForwardDelete`の使い分けと同一、タスク#83で
+    // テンキーNumLock OFF時の`0`/`.`用に追加)。
+    const val KC_FORWARD_DEL = 112
+    const val KC_INSERT      = 124
     // android.view.KeyEvent.KEYCODE_F1..KEYCODE_F12 と同値（変更不可の Android API 値）
     const val KC_F1  = 131
     const val KC_F2  = 132
@@ -144,6 +150,8 @@ object TerminalKeyEncoder {
      * `modifiers`(Shift/Alt/Ctrl/Meta)は矢印・Home/End・PageUp/Down・F1〜F12・Tabの
      * シーケンスに反映される（`rust-core`の`terminal_special_key_bytes`(タスク#29)と
      * 同一golden表、テンキーには影響しない）。省略時は修飾なし（既存呼び出し元との後方互換）。
+     * KC_INSERT/KC_FORWARD_DELは常に`ESC[2~`/`ESC[3~`(rust-coreの`TerminalSpecialKey::ForwardDelete`
+     * と同一シーケンス、タスク#83でテンキーNumLock OFF時の`0`/`.`用に追加)。
      */
     fun specialKeyBytes(
         keyCode: Int,
@@ -166,6 +174,8 @@ object TerminalKeyEncoder {
         KC_PAGE_DOWN  -> tildeBytes(6, modifiers)
         KC_MOVE_HOME  -> homeEndBytes(0x48, modifiers)
         KC_MOVE_END   -> homeEndBytes(0x46, modifiers)
+        KC_INSERT      -> tildeBytes(2, modifiers)                             // ESC[2~
+        KC_FORWARD_DEL -> tildeBytes(3, modifiers)                             // ESC[3~（rust-core `TerminalSpecialKey::ForwardDelete`と同一）
         KC_F1         -> functionKey1to4Bytes(0x50, modifiers)                 // ESC O P
         KC_F2         -> functionKey1to4Bytes(0x51, modifiers)                 // ESC O Q
         KC_F3         -> functionKey1to4Bytes(0x52, modifiers)                 // ESC O R
