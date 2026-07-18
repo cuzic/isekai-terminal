@@ -6,7 +6,11 @@ import android.graphics.Typeface
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.nativeCanvas
@@ -15,6 +19,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import java.nio.ByteBuffer
 import kotlin.math.ceil
+import kotlinx.coroutines.delay
 import uniffi.isekai_terminal_core.CellData
 import uniffi.isekai_terminal_core.ImagePlacement
 import uniffi.isekai_terminal_core.ScreenUpdate
@@ -31,6 +36,18 @@ import uniffi.isekai_terminal_core.ScreenUpdate
  * `drawText` している。
  */
 internal data class BgRun(val startCol: Int, val endColExclusive: Int, val argb: Int)
+
+/**
+ * SGR 2(dim)セルの前景色。色そのものを別値へ再計算するのではなく、ARGB の alpha
+ * チャンネルを 0.6 倍に下げるだけに留める(iOS版`TerminalScreenView.swift`の
+ * `withAlphaComponent(0.6)`と対称)。実際の減光は同じ Bitmap 上に既に描画済みの
+ * 背景色との合成で表現される——`bg`側で別の実効色を計算し直す必要は無い。
+ */
+internal fun dimmedArgb(argb: Int): Int {
+    val alpha = ((argb ushr 24) and 0xFF)
+    val dimmedAlpha = (alpha * 0.6f).toInt().coerceIn(0, 255)
+    return (argb and 0x00FFFFFF) or (dimmedAlpha shl 24)
+}
 
 /** [cells] のうち [rowStart] から始まる1行分(長さ [cols])を背景色の連続区間へ分割する。 */
 internal fun computeBgRuns(cells: List<CellData>, rowStart: Int, cols: Int, themeBgArgb: Int): List<BgRun> {
@@ -107,21 +124,48 @@ internal class GridRenderCache {
     private var renderedCellH = -1f
     private var renderedThemeBg = 0
     private var renderedTypeface: Typeface? = null
+    private var renderedBlinkPhase = false
 
-    /** グリッド全走査(背景+文字)の再描画が必要かどうか。 */
-    fun needsRerender(update: ScreenUpdate, cellW: Float, cellH: Float, themeBgArgb: Int, typeface: Typeface): Boolean =
+    /**
+     * グリッド全走査(背景+文字)の再描画が必要かどうか。
+     *
+     * [blinkPhase] は SGR 5(blink)セルの点滅位相(タスク#22)。`update` 自体は
+     * Rust 側が「blink属性が立っているかどうか」を変えない限り同一インスタンスの
+     * ままなので、位相の反転(表示⇔非表示の切り替え)だけでは他のキーが変化せず
+     * Bitmap キャッシュが再利用され続けてしまう(Fableレビュー2次で指摘された罠:
+     * 一度描かれたきり点滅しなくなるバグ)。呼び出し側([SshTerminalCanvas])は
+     * 実際にblink属性を持つセルが1つも無いときは常に同じ値(`false`)を渡すことで、
+     * blinkが無い画面では位相トグルのたびに無駄な全走査が走らないようにする。
+     */
+    fun needsRerender(
+        update: ScreenUpdate,
+        cellW: Float,
+        cellH: Float,
+        themeBgArgb: Int,
+        typeface: Typeface,
+        blinkPhase: Boolean,
+    ): Boolean =
         renderedUpdate !== update ||
             renderedCellW != cellW ||
             renderedCellH != cellH ||
             renderedThemeBg != themeBgArgb ||
-            renderedTypeface !== typeface
+            renderedTypeface !== typeface ||
+            renderedBlinkPhase != blinkPhase
 
-    fun markRendered(update: ScreenUpdate, cellW: Float, cellH: Float, themeBgArgb: Int, typeface: Typeface) {
+    fun markRendered(
+        update: ScreenUpdate,
+        cellW: Float,
+        cellH: Float,
+        themeBgArgb: Int,
+        typeface: Typeface,
+        blinkPhase: Boolean,
+    ) {
         renderedUpdate = update
         renderedCellW = cellW
         renderedCellH = cellH
         renderedThemeBg = themeBgArgb
         renderedTypeface = typeface
+        renderedBlinkPhase = blinkPhase
     }
 
     /** 次回の [needsRerender] を強制的に true にする(Bitmap を再確保したときに使う)。 */
@@ -191,6 +235,10 @@ fun SshTerminalCanvas(
             this.typeface = typeface
         }
     }
+    // SGR 3(italic)用のフォントバリアント。ボールドは既存の isFakeBoldText を
+    // 引き続き使う(実 Typeface を4種類持つより単純で、iOS版のような
+    // BOLD_ITALIC バリアント確保が不要)。typeface が変わったときだけ作り直す。
+    val italicTypeface = remember(typeface) { Typeface.create(typeface, Typeface.ITALIC) }
     val bgPaint = remember { Paint() }
     val cursorPaint = remember { Paint() }
     val selectionPaint = remember {
@@ -200,6 +248,26 @@ fun SshTerminalCanvas(
     val gridCache = remember { GridRenderCache() }
     val sixelCache = remember { SixelBitmapCache() }
 
+    // blink属性(SGR 5)を持つセルが1つも無ければタイマー自体を回さない(codexレビュー
+    // 指摘: 画面にblinkが無くても永続的に再コンポーズ/全セル走査が走っていた)。
+    // `update`の参照が変わったときだけ再計算すればよいので、Canvas描画スコープの
+    // 外側でremember(update)しておく(iOS版`TerminalScreenView.swift`の
+    // `lastDisplayHasBlink`と対称)。
+    val hasBlink = remember(update) { update.cells.any { it.blink } }
+
+    // SGR 5(blink)の点滅位相。UI表示にのみ閉じたアニメーション状態であり
+    // rust-ssot の対象外(「blink属性が立っているかどうか」自体は`CellData.blink`
+    // としてRustが決定した値をそのまま見るだけ、iOS版`TerminalScreenView.swift`の
+    // `blinkPhaseVisible`と対称)。xterm既定に近い0.53秒間隔でトグルする。
+    var blinkPhaseVisible by remember { mutableStateOf(true) }
+    LaunchedEffect(hasBlink) {
+        if (!hasBlink) return@LaunchedEffect
+        while (true) {
+            delay(530)
+            blinkPhaseVisible = !blinkPhaseVisible
+        }
+    }
+
     Canvas(modifier = modifier.background(theme.background)) {
         val cols = update.cols.toInt()
         val rows = update.rows.toInt()
@@ -208,6 +276,13 @@ fun SshTerminalCanvas(
         val cellW = size.width / cols
         val cellH = size.height / rows
         val themeBgArgb = theme.background.toArgb()
+
+        // blink属性(SGR 5)を持つセルが1つも無ければ、位相トグルのたびに
+        // Bitmap キャッシュキーを変えて無駄な全走査を発生させない
+        // (Fableレビュー2次: blink位相をキャッシュキーに含める対応。ただし
+        // blinkが無い画面ではキーを固定値のままにしてキャッシュヒットを保つ)。
+        // hasBlink自体はCanvas描画スコープの外(composable本体)で計算済み。
+        val effectiveBlinkPhase = hasBlink && blinkPhaseVisible
 
         // フォントサイズをセル幅に収まるよう実測で調整
         // まず cellH ベースで設定し、M の実測幅が cellW を超えたら縮小
@@ -234,7 +309,7 @@ fun SshTerminalCanvas(
             gridCache.invalidate()
         }
 
-        if (gridCache.needsRerender(update, cellW, cellH, themeBgArgb, typeface)) {
+        if (gridCache.needsRerender(update, cellW, cellH, themeBgArgb, typeface, effectiveBlinkPhase)) {
             // 前回描画分をクリア(既定背景色以外を描いたセルが今回は既定背景に戻る
             // ケースがあるため、単純な上書きでは古いピクセルが残ってしまう)
             bmp.eraseColor(android.graphics.Color.TRANSPARENT)
@@ -253,16 +328,39 @@ fun SshTerminalCanvas(
                 // 文字
                 for (col in 0 until cols) {
                     val cell = update.cells[rowStart + col]
-                    if (cell.ch.isNotBlank()) {
+                    // invisible(SGR 8)はグリフを描かない。blink(SGR 5)は点滅位相が
+                    // 「消灯」側の間だけ同様にグリフを省く(背景は通常通り描く)。
+                    // reverse(SGR 7)はterminal.rs側でパース時にfg/bgへ実効色として
+                    // 解決済み(#21)なので、ここではcell.fg/bg をそのまま使うだけでよい。
+                    // 空白文字自体は本来 drawText 不要だが、underline/strikethrough
+                    // (SGR 4/9)が立っている空白セルは装飾線だけ描く必要があるため
+                    // isNotBlank() の早期スキップから除外する(codexレビュー指摘:
+                    // 装飾のみの空白セルが描かれないと下線/取り消し線が消えてしまう)。
+                    val blinkHidden = cell.blink && !effectiveBlinkPhase
+                    val hasLineDecoration = cell.underline || cell.strikethrough
+                    if (cell.ch.isNotEmpty() && (cell.ch.isNotBlank() || hasLineDecoration) &&
+                        !cell.invisible && !blinkHidden
+                    ) {
                         val x = col * cellW
-                        textPaint.color = cell.fg.toInt()
+                        val fgArgb = cell.fg.toInt()
+                        textPaint.color = if (cell.dim) dimmedArgb(fgArgb) else fgArgb
                         textPaint.isFakeBoldText = cell.bold
+                        textPaint.typeface = if (cell.italic) italicTypeface else typeface
+                        textPaint.isUnderlineText = cell.underline
+                        textPaint.isStrikeThruText = cell.strikethrough
                         bitmapCanvas.drawText(cell.ch, x, y + baseline, textPaint)
                     }
                 }
             }
 
-            gridCache.markRendered(update, cellW, cellH, themeBgArgb, typeface)
+            // 次回の描画で typeface/isUnderlineText 等のPaint状態を汚さないよう
+            // 既定値へ戻す(このPaintはグリッド以外(カーソル等)では使わないが、
+            // remember で使い回されるインスタンスなので明示的にリセットしておく)。
+            textPaint.typeface = typeface
+            textPaint.isUnderlineText = false
+            textPaint.isStrikeThruText = false
+
+            gridCache.markRendered(update, cellW, cellH, themeBgArgb, typeface, effectiveBlinkPhase)
         }
 
         drawImage(
