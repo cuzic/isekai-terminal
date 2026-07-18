@@ -41,6 +41,10 @@ pub(crate) struct SessionCore {
     session_tx: Mutex<Option<tokio::sync::mpsc::Sender<SessionCmd>>>,
     scrollback: Arc<Mutex<VecDeque<Vec<TermCell>>>>,
     screen_cols: Mutex<u32>,
+    /// [resize]に直近渡された(cols, rows)。同一値の連続呼び出し(#62: IME開閉・回転・
+    /// ピンチズームでKotlin/Swift側から不要に連発されるresize)をここで一元的に無視する
+    /// ためだけに使う(rust-ssot: 判定ロジックをKotlin/Swift側にミラーしない)。
+    last_resize_dims: Mutex<(u32, u32)>,
     /// Phase 12: per-session theme。このセッション(タブ)が現在使っているテーマの
     /// スナップショット。[scrollback_cells]の空白パディング色にもここから使う。
     current_theme: Mutex<Theme>,
@@ -62,6 +66,7 @@ impl SessionCore {
             session_tx: Mutex::new(None),
             scrollback: Arc::new(Mutex::new(VecDeque::new())),
             screen_cols: Mutex::new(80),
+            last_resize_dims: Mutex::new((80, 24)),
             current_theme: Mutex::new(Theme::default()),
             callback: Mutex::new(None),
         }
@@ -80,6 +85,7 @@ impl SessionCore {
         *self.handle_tx.lock() = Some(cmd_tx.clone());
         *self.session_tx.lock() = Some(session_cmd_tx);
         *self.screen_cols.lock() = cols;
+        *self.last_resize_dims.lock() = (cols, rows);
         self.scrollback.lock().clear();
         // 接続(タブ作成)時点のグローバル既定テーマをスナップショットする。呼び出し側
         // (Kotlin)がプロファイル固有のテーマを使いたい場合は、この直後に[set_theme]を
@@ -157,12 +163,36 @@ impl SessionCore {
         }
     }
 
+    /// (cols, rows)が直前の呼び出しと同一なら何もしない(#62)。Android/iOS双方でIME
+    /// キーボードの開閉・端末回転・ピンチズームのたびに同じサイズでresizeが連発され
+    /// 得るが、その判定・抑止をここ1箇所(Rust側)に置くことで、Kotlin/Swift側に
+    /// 同種のミラー判定を重複実装しなくて済む(rust-ssot原則)。
+    ///
+    /// dedupeキャッシュ(`last_resize_dims`)は、実際に`TransportCommand::Resize`の
+    /// 送出に成功した場合にのみ更新する。送出前に更新してしまうと、チャネルが
+    /// フル(`try_send`失敗)で今回のリサイズが実際には配送されなかった場合、次に
+    /// 同じ(cols, rows)でリサイズ要求が来ても「前回と同一だから」という理由で
+    /// 永久にスキップされてしまい、リモートPTYのサイズが実際の画面サイズと
+    /// 食い違ったまま復旧できなくなる。
     pub(crate) fn resize(&self, cols: u32, rows: u32) {
+        if *self.last_resize_dims.lock() == (cols, rows) {
+            return;
+        }
         *self.screen_cols.lock() = cols;
-        if let Some(tx) = self.handle_tx.lock().as_ref() {
-            if tx.try_send(TransportCommand::Resize { cols, rows }).is_err() {
-                log::warn!("ssh: resize command dropped (channel full)");
-            }
+        let sent = match self.handle_tx.lock().as_ref() {
+            Some(tx) => match tx.try_send(TransportCommand::Resize { cols, rows }) {
+                Ok(()) => true,
+                Err(_) => {
+                    log::warn!("ssh: resize command dropped (channel full)");
+                    false
+                }
+            },
+            // まだ`start()`前(transportハンドル未確立)。実際には何も送っていないので
+            // dedupeキャッシュは更新しない(`start()`が改めて初期サイズで初期化する)。
+            None => false,
+        };
+        if sent {
+            *self.last_resize_dims.lock() = (cols, rows);
         }
     }
 
@@ -692,6 +722,83 @@ mod tests {
         assert_eq!(cells[2].ch, " ");
         assert_eq!(cells[3].ch, " ");
         assert_eq!(cells[4].ch, " ");
+    }
+
+    // ── resize: 同一値dedupe(#62) ────────────────────────────
+
+    /// [SessionCore::resize]が`TransportCommand::Resize`を実際に送るかどうかだけを
+    /// 見るための最小セットアップ。`start()`はTokioランタイム上のevent loopを
+    /// spawnしてしまう(このテストの対象外)ため使わず、`handle_tx`だけを直接張る。
+    fn core_with_command_channel() -> (SessionCore, tokio::sync::mpsc::Receiver<TransportCommand>) {
+        let core = SessionCore::new();
+        let (tx, rx) = tokio::sync::mpsc::channel::<TransportCommand>(8);
+        *core.handle_tx.lock() = Some(tx);
+        (core, rx)
+    }
+
+    #[test]
+    fn resize_sends_command_on_first_call() {
+        let (core, mut rx) = core_with_command_channel();
+        core.resize(100, 40);
+        match rx.try_recv().expect("should have sent a resize command") {
+            TransportCommand::Resize { cols, rows } => assert_eq!((cols, rows), (100, 40)),
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn resize_is_noop_when_dims_unchanged() {
+        let (core, mut rx) = core_with_command_channel();
+        core.resize(100, 40);
+        rx.try_recv().expect("first call should send");
+        core.resize(100, 40); // 同一値の連続呼び出し(#62: IME開閉・回転等を想定)
+        assert!(rx.try_recv().is_err(), "duplicate resize with identical dims must not be sent");
+    }
+
+    #[test]
+    fn resize_sends_again_when_dims_change() {
+        let (core, mut rx) = core_with_command_channel();
+        core.resize(100, 40);
+        rx.try_recv().expect("first call should send");
+        core.resize(100, 41); // rowsだけ変化
+        match rx.try_recv().expect("changed dims should send again") {
+            TransportCommand::Resize { cols, rows } => assert_eq!((cols, rows), (100, 41)),
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn resize_matching_initial_start_dims_is_noop() {
+        // start()呼び出し直後に、Kotlin/Swift側がそのまま同じサイズでresize()を
+        // 呼んでも(初期レイアウト確定直後の再通知等)、変化が無いので送るべきではない。
+        let core = SessionCore::new();
+        *core.last_resize_dims.lock() = (100, 40); // start()相当の初期化を模倣
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportCommand>(8);
+        *core.handle_tx.lock() = Some(tx);
+        core.resize(100, 40);
+        assert!(rx.try_recv().is_err(), "resize matching the dims set at start() must be a no-op");
+    }
+
+    #[test]
+    fn resize_that_fails_to_send_does_not_poison_dedupe_cache() {
+        // チャネルが埋まっていて`try_send`が失敗した場合、実際にはリモートへ何も
+        // 配送されていないので、dedupeキャッシュを更新してはいけない。更新して
+        // しまうと、次に同じ(cols, rows)でresizeが来たときに「前回と同一」と
+        // 誤判定されて永久にスキップされ、リモートPTYのサイズが実画面と
+        // 食い違ったまま復旧できなくなる。
+        let core = SessionCore::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportCommand>(1);
+        tx.try_send(TransportCommand::WriteStdin(Vec::new())).expect("fill the only slot");
+        *core.handle_tx.lock() = Some(tx);
+
+        core.resize(100, 40); // channel full → 送出失敗、dedupeキャッシュは更新されないはず
+
+        rx.try_recv().expect("drain the filler command"); // 空きを作る
+        core.resize(100, 40); // 同一値だが、前回は届いていないので今度こそ送るべき
+        match rx.try_recv().expect("resize must be retried once space is available") {
+            TransportCommand::Resize { cols, rows } => assert_eq!((cols, rows), (100, 40)),
+            _ => panic!("unexpected command variant"),
+        }
     }
 
     // ── dispatch_result: scrollback上限トリミング ────────────
