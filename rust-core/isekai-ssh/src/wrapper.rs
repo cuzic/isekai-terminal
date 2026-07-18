@@ -1047,12 +1047,29 @@ async fn resolve_wrapper(plan: &WrapperPlan) -> Result<WrapperResolution> {
 /// (the Unix wrapper path never needs them — real `ssh(1)` resolves those
 /// itself from the same config file).
 pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolution, openssh_config::HostConfig)> {
-    let host_config = openssh_config::resolve_default(&plan.destination).map_err(|e| {
-        anyhow!(
-            "isekai-ssh: failed to resolve {:?} from ~/.ssh/config: {e}",
-            plan.destination
-        )
-    })?;
+    let host_config = match dash_f_config_path(&plan.ssh_args) {
+        // Codex review finding: an explicit `-F <path>` (already understood
+        // by `find_destination_index`/`ssh_option_width` above, and already
+        // honored by the Unix path via `ssh_args_through_destination`'s `-G`
+        // invocation) must not be silently ignored here in favor of
+        // `~/.ssh/config` — that would authenticate against the wrong
+        // config file with no error, just a confusing connection failure
+        // (or worse, a connection to the wrong host under a stale trust
+        // entry).
+        Some(config_path) => openssh_config::resolve(&config_path, &plan.destination).map_err(|e| {
+            anyhow!(
+                "isekai-ssh: failed to resolve {:?} from {}: {e}",
+                plan.destination,
+                config_path.display()
+            )
+        })?,
+        None => openssh_config::resolve_default(&plan.destination).map_err(|e| {
+            anyhow!(
+                "isekai-ssh: failed to resolve {:?} from ~/.ssh/config: {e}",
+                plan.destination
+            )
+        })?,
+    };
     let openssh = OpenSshEffectiveConfig {
         hostname: host_config.host_name.clone(),
         user: host_config.user.clone(),
@@ -1062,6 +1079,30 @@ pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolutio
     };
     let isekai = resolve_isekai_config(plan, &openssh)?;
     Ok((WrapperResolution { openssh, isekai }, host_config))
+}
+
+/// Finds an explicit `-F <path>` in `ssh_args` (the portion before the
+/// destination — mirroring `ssh_args_through_destination`'s scope, since a
+/// `-F` appearing *after* the destination is a remote command argument, not
+/// an option). Walks option widths the same way `find_destination_index`
+/// does so this stays in sync with `ssh_option_width` if that list of
+/// value-taking flags ever changes. Only recognizes the spaced `-F value`
+/// form (matching this function's only two callers/tests) — a concatenated
+/// `-Fvalue` isn't handled by `find_destination_index` either, so this is
+/// consistent with the wrapper's existing `-F` support, not a new gap.
+fn dash_f_config_path(ssh_args: &[String]) -> Option<PathBuf> {
+    let mut i = 0;
+    while i < ssh_args.len() {
+        let arg = ssh_args[i].as_str();
+        if arg == "--" || (!arg.starts_with('-') || arg == "-") {
+            return None;
+        }
+        if arg == "-F" {
+            return ssh_args.get(i + 1).map(PathBuf::from);
+        }
+        i += ssh_option_width(arg);
+    }
+    None
 }
 
 async fn resolve_openssh_effective_config(plan: &WrapperPlan) -> Result<OpenSshEffectiveConfig> {
@@ -2119,6 +2160,53 @@ Host *
         assert_eq!(resolved.candidate_race_delay_ms, 250);
         assert_eq!(resolved.relay_delay_ms, 900);
         assert_eq!(resolved.install_mode, InstallMode::User);
+    }
+
+    #[test]
+    fn dash_f_config_path_finds_an_explicit_dash_f_before_the_destination() {
+        assert_eq!(
+            dash_f_config_path(&s(&["-F", "/tmp/cfg", "production"])),
+            Some(PathBuf::from("/tmp/cfg"))
+        );
+    }
+
+    #[test]
+    fn dash_f_config_path_skips_over_other_value_taking_flags() {
+        assert_eq!(
+            dash_f_config_path(&s(&["-p", "2222", "-F", "/tmp/cfg", "production"])),
+            Some(PathBuf::from("/tmp/cfg"))
+        );
+    }
+
+    #[test]
+    fn dash_f_config_path_returns_none_without_dash_f() {
+        assert_eq!(dash_f_config_path(&s(&["-p", "2222", "production"])), None);
+    }
+
+    /// Codex review finding: `resolve_for_native` used to always read
+    /// `~/.ssh/config`, silently ignoring an explicit `-F <path>` — the same
+    /// flag `resolve_openssh_effective_config` already forwards to real
+    /// `ssh -G` on the Unix path. This never touches the real `$HOME` (the
+    /// `-F` branch calls `openssh_config::resolve` directly on the given
+    /// path), so it's deterministic regardless of what's in the sandbox's
+    /// own `~/.ssh/config`.
+    #[test]
+    fn resolve_for_native_honors_an_explicit_dash_f_config_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("prod_ssh_config");
+        std::fs::write(
+            &config,
+            "Host production\n    HostName 10.20.0.15\n    User deploy\n    Port 2222\n",
+        )
+        .unwrap();
+        let plan = parse_wrapper(s(&["-F", config.to_str().unwrap(), "production"])).unwrap();
+
+        let (resolution, host_config) = resolve_for_native(&plan).unwrap();
+
+        assert_eq!(host_config.host_name.as_deref(), Some("10.20.0.15"));
+        assert_eq!(host_config.user.as_deref(), Some("deploy"));
+        assert_eq!(host_config.port, Some(2222));
+        assert_eq!(resolution.native_host_port("production"), ("10.20.0.15".to_string(), 2222));
     }
 
     // parse_bootstrap_relay_*: moved to `wrapper/config.rs`'s own test

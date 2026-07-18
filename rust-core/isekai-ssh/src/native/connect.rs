@@ -31,6 +31,7 @@ use russh::client;
 use russh_stream_session::{authenticate_session, establish_over_stream, open_channel, verifying_handler, SessionKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[cfg(windows)]
 use super::agent_auth;
 use super::child_stdio::{spawn_isekai_pipe_connect, ChildStdio};
 use super::console;
@@ -79,7 +80,7 @@ pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
     });
     let verifier = Arc::new(FileBackedHostKeyVerifier::new(store_path, host_port.clone(), confirm_new_host));
 
-    let mut handle = connect_and_authenticate(stdio, &username, &host_config, &verifier)
+    let handle = connect_and_authenticate(stdio, &username, &host_config, &verifier)
         .await
         .with_context(|| format!("isekai-ssh: failed to connect to {username}@{host_port}"))?;
 
@@ -198,8 +199,13 @@ async fn try_agent_auth<H: client::Handler>(
 /// Relays bytes between the local terminal (raw mode, already enabled by
 /// the caller) and the remote shell channel until either side closes,
 /// returning the remote exit status as this process's own exit code (`ssh(1)`'s
-/// own convention). Local stdin EOF (Ctrl-D redirected from a non-tty, or a
-/// real EOF) sends a channel EOF rather than closing the channel outright,
+/// own convention) — or **255** if the channel closed without ever sending
+/// one (Codex review finding: an abnormal disconnect — network loss, the
+/// `isekai-pipe connect` child dying — must not be reported as a successful
+/// exit just because `exit_code`'s initial value happened to be `0`; `255`
+/// matches real `ssh(1)`'s own exit code for "connection lost/could not
+/// execute command"). Local stdin EOF (Ctrl-D redirected from a non-tty, or
+/// a real EOF) sends a channel EOF rather than closing the channel outright,
 /// so any buffered remote output still in flight is not lost.
 ///
 /// **Known limitation**: does not yet propagate local terminal resize
@@ -210,10 +216,15 @@ async fn try_agent_auth<H: client::Handler>(
 /// own tests already cover the underlying `Channel`/`ChannelMsg` plumbing
 /// this loop drives.
 async fn run_shell_io_loop(channel: &mut russh::Channel<client::Msg>) -> Result<u8> {
+    /// `ssh(1)`'s own exit code for "the connection was lost, or the remote
+    /// command couldn't be run" — used here when the channel closes without
+    /// ever delivering a `ChannelMsg::ExitStatus`.
+    const NO_EXIT_STATUS_RECEIVED: u8 = 255;
+
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut buf = [0u8; 8192];
-    let mut exit_code: u8 = 0;
+    let mut exit_code: Option<u8> = None;
     let mut stdin_open = true;
 
     loop {
@@ -246,7 +257,7 @@ async fn run_shell_io_loop(channel: &mut russh::Channel<client::Msg>) -> Result<
                         let _ = stdout.flush().await;
                     }
                     Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
-                        exit_code = exit_status as u8;
+                        exit_code = Some(exit_status as u8);
                     }
                     Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close) => {
                         break;
@@ -258,7 +269,7 @@ async fn run_shell_io_loop(channel: &mut russh::Channel<client::Msg>) -> Result<
         }
     }
 
-    Ok(exit_code)
+    Ok(exit_code.unwrap_or(NO_EXIT_STATUS_RECEIVED))
 }
 
 #[cfg(test)]
@@ -320,6 +331,52 @@ mod tests {
         }
     }
 
+    /// Accepts any password and any channel open, then closes the channel
+    /// the moment a shell is requested — without ever sending
+    /// `ChannelMsg::ExitStatus` first — standing in for an abnormal
+    /// disconnect (network loss, the `isekai-pipe connect` child dying
+    /// mid-session) rather than a clean remote shell exit. Deliberately does
+    /// **not** close from `channel_open_session` itself: that runs before
+    /// russh has sent the channel-open confirmation back to the client, so a
+    /// close issued there races the confirmation and the client can hang
+    /// waiting for a channel it never learns is open (this was tried first
+    /// and produced exactly that hang) — `shell_request` only fires after
+    /// the channel is genuinely established, matching how
+    /// `russh-stream-session`'s own `EchoExecServer` test closes from
+    /// `exec_request`, not `channel_open_session`.
+    #[derive(Clone)]
+    struct CloseWithoutExitStatusServer;
+
+    impl server::Server for CloseWithoutExitStatusServer {
+        type Handler = CloseWithoutExitStatusHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> CloseWithoutExitStatusHandler {
+            CloseWithoutExitStatusHandler
+        }
+    }
+
+    #[derive(Clone)]
+    struct CloseWithoutExitStatusHandler;
+
+    #[async_trait]
+    impl server::Handler for CloseWithoutExitStatusHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+
+        async fn shell_request(&mut self, channel: russh::ChannelId, session: &mut ServerSession) -> Result<(), Self::Error> {
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
     async fn spawn_server<S, H>(mut server: S, seed: u8) -> SocketAddr
     where
         S: server::Server<Handler = H> + Send + 'static,
@@ -363,5 +420,35 @@ mod tests {
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier).await;
         assert!(result.is_err(), "a rejected host key must fail the connection before any auth attempt");
+    }
+
+    /// Codex review finding: `run_shell_io_loop` used to initialize
+    /// `exit_code` to `0` and only ever overwrite it on
+    /// `ChannelMsg::ExitStatus` — a channel that closes abnormally (network
+    /// loss, the `isekai-pipe connect` child dying) without ever sending one
+    /// would silently report success. `CloseWithoutExitStatusServer` closes
+    /// the channel immediately after opening it, before any exit status is
+    /// ever sent, standing in for exactly that scenario.
+    #[tokio::test]
+    async fn run_shell_io_loop_reports_255_when_the_channel_closes_without_an_exit_status() {
+        use russh_stream_session::Credential;
+
+        let addr = spawn_server(CloseWithoutExitStatusServer, 202).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let handler = verifying_handler(&verifier);
+        let mut handle = establish_over_stream(config, stream, handler).await.unwrap();
+        let authed = authenticate_session(&mut handle, "tester", &Credential::Password("unused".to_string()))
+            .await
+            .unwrap();
+        assert!(authed, "CloseWithoutExitStatusServer accepts any password");
+
+        let mut channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24 })
+            .await
+            .unwrap();
+
+        let exit_code = run_shell_io_loop(&mut channel).await.unwrap();
+        assert_eq!(exit_code, 255, "an abnormal disconnect must not be reported as a successful (0) exit");
     }
 }
