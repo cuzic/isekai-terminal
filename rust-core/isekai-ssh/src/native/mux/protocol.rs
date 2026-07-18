@@ -71,11 +71,12 @@ const TAG_SHUTDOWN: u8 = 0x12;
 const TAG_STDOUT: u8 = 0x20;
 const TAG_STDERR: u8 = 0x21;
 const TAG_EXIT: u8 = 0x22;
+const TAG_CTL: u8 = 0x23;
 
 /// One decoded protocol message. Client→owner: [`Frame::Hello`],
 /// [`Frame::Stdin`], [`Frame::Resize`], [`Frame::Shutdown`]. Owner→client:
 /// [`Frame::HelloAck`], [`Frame::Rejected`], [`Frame::Stdout`],
-/// [`Frame::Stderr`], [`Frame::Exit`].
+/// [`Frame::Stderr`], [`Frame::Exit`], [`Frame::Ctl`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     /// First frame a client sends. `cols`/`rows`/`term` let the owner open
@@ -103,6 +104,14 @@ pub enum Frame {
     Stderr(Vec<u8>),
     /// Owner→client remote exit status; the session has ended cleanly.
     Exit(u8),
+    /// Owner→client control-plane message (`#@isekai ctl-socket`, Epic M):
+    /// the raw encoded `isekai_protocol::CtlMessage` bytes (one JSON line,
+    /// the same wire form `isekai-pipe ctl` sends over the remote forward)
+    /// that the owner received on *this client's* per-tab streamlocal forward.
+    /// The client decodes and applies it (OSC title/clipboard) to its own
+    /// terminal. Kept opaque (`Vec<u8>`) here so this codec stays independent
+    /// of `isekai_protocol`'s concrete message shape.
+    Ctl(Vec<u8>),
 }
 
 impl Frame {
@@ -151,6 +160,10 @@ impl Frame {
                 out.push(TAG_EXIT);
                 out.push(*code);
             }
+            Frame::Ctl(data) => {
+                out.push(TAG_CTL);
+                out.extend_from_slice(data);
+            }
         }
         out
     }
@@ -195,6 +208,7 @@ impl Frame {
                 let code = *payload.first().ok_or_else(|| malformed("Exit frame missing its status byte"))?;
                 Ok(Frame::Exit(code))
             }
+            TAG_CTL => Ok(Frame::Ctl(payload.to_vec())),
             other => Err(malformed(&format!("unknown frame tag {other:#04x}"))),
         }
     }
@@ -278,6 +292,7 @@ mod tests {
             Frame::Stdout(b"total 0\n".to_vec()),
             Frame::Stderr(b"bash: nope: command not found\n".to_vec()),
             Frame::Exit(42),
+            Frame::Ctl(br#"{"op":"title","value":"hi"}"#.to_vec()),
         ]
     }
 

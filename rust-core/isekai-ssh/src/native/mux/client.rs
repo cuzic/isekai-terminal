@@ -142,6 +142,19 @@ where
                         let _ = stderr.write_all(&data).await;
                         let _ = stderr.flush().await;
                     }
+                    Ok(Some(Frame::Ctl(data))) => {
+                        // A control-plane message (`#@isekai ctl-socket`) the
+                        // owner relayed from this tab's remote forward. Decode
+                        // and apply it to *this* client's own terminal (OSC
+                        // title/clipboard); a malformed or no-op message is
+                        // silently ignored (opportunistic feature).
+                        if let Ok(msg) = isekai_protocol::decode_ctl_message(&data) {
+                            if let Some(seq) = crate::ctl_forward::osc_sequence_for(&msg) {
+                                let _ = stderr.write_all(seq.as_bytes()).await;
+                                let _ = stderr.flush().await;
+                            }
+                        }
+                    }
                     Ok(Some(Frame::Exit(code))) => return Ok(ClientOutcome::Exited(code)),
                     Ok(Some(other)) => return Err(anyhow!("isekai-ssh: unexpected frame from the owner: {other:?}")),
                     // A clean close without an Exit, or any read error (a reset
@@ -226,6 +239,47 @@ mod tests {
         .await;
 
         assert_eq!(outcome.unwrap(), ClientOutcome::OwnerLost, "an owner that drops without Exit must be OwnerLost");
+    }
+
+    /// A `Ctl` frame (relayed `#@isekai ctl-socket` message) is decoded and
+    /// applied to the client's own terminal as an OSC sequence on stderr — a
+    /// `SetTitle` becomes OSC 0. Proves the owner→client control-plane relay
+    /// reaches this process's terminal, not the owner's.
+    #[tokio::test]
+    async fn client_applies_a_ctl_frame_as_an_osc_sequence_on_stderr() {
+        let (outcome, stdout, stderr) = drive_client(b"", |owner_conn| {
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(owner_conn);
+                let _ = read_frame(&mut r).await;
+                write_frame(&mut w, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await.unwrap();
+                write_frame(&mut w, &Frame::Ctl(br#"{"op":"title","value":"hi"}"#.to_vec())).await.unwrap();
+                write_frame(&mut w, &Frame::Exit(0)).await.unwrap();
+            })
+        })
+        .await;
+
+        assert_eq!(outcome.unwrap(), ClientOutcome::Exited(0));
+        assert!(stdout.is_empty(), "a ctl message must never leak onto the client's stdout");
+        assert_eq!(stderr, b"\x1b]0;hi\x07", "a SetTitle ctl message must become an OSC 0 sequence on the client's stderr");
+    }
+
+    /// A malformed `Ctl` payload is ignored (opportunistic feature): no OSC is
+    /// emitted and the session continues to a clean Exit rather than erroring.
+    #[tokio::test]
+    async fn client_ignores_a_malformed_ctl_frame() {
+        let (outcome, _stdout, stderr) = drive_client(b"", |owner_conn| {
+            tokio::spawn(async move {
+                let (mut r, mut w) = tokio::io::split(owner_conn);
+                let _ = read_frame(&mut r).await;
+                write_frame(&mut w, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await.unwrap();
+                write_frame(&mut w, &Frame::Ctl(b"not valid ctl json".to_vec())).await.unwrap();
+                write_frame(&mut w, &Frame::Exit(0)).await.unwrap();
+            })
+        })
+        .await;
+
+        assert_eq!(outcome.unwrap(), ClientOutcome::Exited(0), "a malformed ctl message must not fail the session");
+        assert!(stderr.is_empty(), "a malformed ctl message must produce no OSC output");
     }
 
     /// The owner refuses the Hello (e.g. version/token mismatch) — surfaced as
