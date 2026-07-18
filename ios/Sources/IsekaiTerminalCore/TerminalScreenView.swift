@@ -72,7 +72,7 @@ final class SixelBitmapCache {
 /// `ScreenUpdate`/`CellData`(ARGBパックの32bit色)を直接消費する
 /// (Phase 1A-6の`TerminalFrameBatch`/`PackedRow`は診断用の並行表現であり、
 /// 実際のレンダリング統合では使わないというPLAN.md記載の方針に従う)。
-public final class TerminalScreenView: UIView {
+public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     private var latestUpdate: ScreenUpdate?
     private static let baseFontSize: CGFloat = 14
     private var font = UIFont.monospacedSystemFont(ofSize: baseFontSize, weight: .regular)
@@ -158,6 +158,23 @@ public final class TerminalScreenView: UIView {
     /// `pendingHyperlinkUrl`と対称)。
     public var onHyperlinkTapped: ((String) -> Void)?
 
+    /// タスク#51: マウスレポーティング(`?1000`/`?1002`/`?1003`、SGR拡張`?1006`)が
+    /// 有効な間、タッチをRust側でエンコードした生バイト列として送るためのフック
+    /// (`onSendBytes`と同じ形——SwiftUI側が`controller.send(bytes)`に接続する)。
+    /// エンコード自体は`terminalPointerEventBytes`(rust-core `terminal_pointer_event_bytes`、
+    /// タスク#36/#51)がRust側で行い、このクラスは座標とジェスチャ種別を生のまま渡すだけ
+    /// (rust-ssot: 「今どのマウスモードか」「このイベントを報告すべきか」の判断は
+    /// Rust側の値をそのまま見るだけで、Swift側にミラー状態を作らない)。
+    public var onPointerBytes: ((Data) -> Void)?
+
+    /// タスク#51: 選択(`longPress`)・スクロールバックスワイプ(`pan`)・OSC 8タップ
+    /// (`tap`)の各`UIGestureRecognizer`。マウスレポーティングが有効な間、これらに
+    /// 単一指のタッチを渡さないようにする(`gestureRecognizer(_:shouldReceive:)`)ための
+    /// 参照保持——`init`のローカル変数のままだと delegate 判定から参照できない。
+    private var longPressGestureRecognizer: UILongPressGestureRecognizer?
+    private var panGestureRecognizer: UIPanGestureRecognizer?
+    private var tapGestureRecognizer: UITapGestureRecognizer?
+
     /// タスク#20: view bounds(実サイズ)とフォントのセルサイズから求めたcols/rowsが
     /// 変化する度に呼ばれる。Android版`TerminalScreen.kt`の
     /// `cols = (widthPx / cellDims.first).toInt().coerceAtLeast(10)` /
@@ -182,20 +199,26 @@ public final class TerminalScreenView: UIView {
 
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
         longPress.minimumPressDuration = 0.4
+        longPress.delegate = self
         addGestureRecognizer(longPress)
+        longPressGestureRecognizer = longPress
 
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
         addGestureRecognizer(pinch)
 
         let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
         pan.maximumNumberOfTouches = 1
+        pan.delegate = self
         addGestureRecognizer(pan)
+        panGestureRecognizer = pan
 
         // タスク#52: OSC 8リンクのタップhit-test用。素早いタップは
         // `UILongPressGestureRecognizer`の`minimumPressDuration`(0.4秒)未満で
         // 指が離れるため長押し認識には至らず、互いに競合しない。
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        tap.delegate = self
         addGestureRecognizer(tap)
+        tapGestureRecognizer = tap
 
         startBlinkTimerIfNeeded()
     }
@@ -368,6 +391,100 @@ public final class TerminalScreenView: UIView {
         let cell = offsetToCellPos(x: Double(point.x), y: Double(point.y), cellWidth: Double(cellSize.width), cellHeight: Double(cellSize.height), cols: cols, rows: rows)
         guard let url = linkURL(at: update, row: cell.row, col: cell.col), isOpenableHyperlinkScheme(url) else { return }
         onHyperlinkTapped?(url)
+    }
+
+    // ── マウスレポーティング(タスク#36/#51) ──────────────────────────
+
+    /// 現在マウスイベントとして追跡中のタッチ。`touchesBegan`で単一指のタッチが
+    /// 始まった時にpressを送って設定し、そのタッチが離れる/取り消される、または
+    /// 2本目の指が触れて複数指になった時点でreleaseを送って`nil`に戻す
+    /// (codexレビュー指摘: 2本目の指が触れた後の`moved`/`ended`を単純に無視すると、
+    /// 直前に送ったpressに対応するreleaseが送られず、リモート側でボタンが
+    /// 押されっぱなしに見えるバグになっていた)。
+    private weak var activeMouseTouch: UITouch?
+
+    /// マウスレポーティング(`?1000`/`?1002`/`?1003`)が有効かつスクロールバック表示中
+    /// (`scrollOffset > 0`)でない間、選択(`longPress`)・スクロールバックスワイプ
+    /// (`pan`)・OSC 8タップ(`tap`)へタッチを渡さないようにする。これらは全て単一指の
+    /// ジェスチャで、有効な間は代わりに`touchesBegan`/`touchesMoved`/`touchesEnded`
+    /// (下記)がマウスのpress/drag/releaseとして同じタッチを処理する。ピンチ
+    /// (2本指ズーム)はマウスレポートと衝突しないため対象外のまま残す。
+    ///
+    /// `latestUpdate?.mouseReportingMode`(rust-core `Terminal`が保持する真値、
+    /// `ScreenUpdate`経由でそのまま読むだけ)を毎回見て判断するだけで、「今マウス
+    /// モードか」をこのクラス側の別状態としてミラーしない(rust-ssot、タスク#51)。
+    public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        guard gestureRecognizer === longPressGestureRecognizer
+            || gestureRecognizer === panGestureRecognizer
+            || gestureRecognizer === tapGestureRecognizer else { return true }
+        return !isPointerReportingActive
+    }
+
+    /// マウスレポーティングが実際に有効か。モードが`.off`でないことに加え、
+    /// スクロールバック表示中(`scrollOffset > 0`)は対象外とする(codexレビュー指摘:
+    /// `draw(_:)`はスクロールバックの合成表示を見せている一方でライブ側のモードに
+    /// 従ってポインタイベントを送ると、ユーザーは過去ログを見ているのにライブ
+    /// セッションへclick/dragが飛んでしまい、表示対象と入力対象が食い違う)。
+    private var isPointerReportingActive: Bool {
+        guard scrollOffset == 0, let update = latestUpdate else { return false }
+        return update.mouseReportingMode != .off
+    }
+
+    /// `touch`の現在位置を`terminalPointerEventBytes`(rust-core、タスク#36/#51)へ
+    /// 渡して結果を`onPointerBytes`で送出する。
+    private func sendMouseEvent(for touch: UITouch, update: ScreenUpdate, kind: MouseEventKind) {
+        let point = touch.location(in: self)
+        let cell = offsetToCellPos(x: Double(point.x), y: Double(point.y), cellWidth: Double(cellSize.width), cellHeight: Double(cellSize.height), cols: Int(update.cols), rows: Int(update.rows))
+        guard let bytes = terminalPointerEventBytes(
+            kind: kind,
+            button: .left,
+            row: UInt32(cell.row),
+            col: UInt32(cell.col),
+            modifiers: TerminalKeyModifiers(shift: false, alt: false, ctrl: false, meta: false),
+            cols: update.cols,
+            rows: update.rows,
+            mouseReportingMode: update.mouseReportingMode,
+            sgrMouseMode: update.sgrMouseMode
+        ) else { return }
+        onPointerBytes?(bytes)
+    }
+
+    /// iOS側のタッチにはボタン無しの単純なホバー移動の概念が無いため、タッチしている
+    /// 間は常にLeftボタンを押しているとみなす(`button`は常に`.left`)。
+    public override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesBegan(touches, with: event)
+        guard isPointerReportingActive, let update = latestUpdate else { return }
+        if let active = activeMouseTouch {
+            // 追跡中に2本目以降の指が触れた: これ以上単一指のドラッグとしては扱えない
+            // ため、既に送ったpressに対応するreleaseを送って打ち切る(以降はpinch等の
+            // 通常の複数指ジェスチャに譲り、この一連のタッチは無視する)。
+            sendMouseEvent(for: active, update: update, kind: .release)
+            activeMouseTouch = nil
+            return
+        }
+        guard (event?.allTouches?.count ?? touches.count) == 1, let touch = touches.first else { return }
+        activeMouseTouch = touch
+        sendMouseEvent(for: touch, update: update, kind: .press)
+    }
+
+    public override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesMoved(touches, with: event)
+        guard let update = latestUpdate, let active = activeMouseTouch, touches.contains(active) else { return }
+        sendMouseEvent(for: active, update: update, kind: .motion)
+    }
+
+    public override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesEnded(touches, with: event)
+        guard let update = latestUpdate, let active = activeMouseTouch, touches.contains(active) else { return }
+        sendMouseEvent(for: active, update: update, kind: .release)
+        activeMouseTouch = nil
+    }
+
+    public override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesCancelled(touches, with: event)
+        guard let update = latestUpdate, let active = activeMouseTouch, touches.contains(active) else { return }
+        sendMouseEvent(for: active, update: update, kind: .release)
+        activeMouseTouch = nil
     }
 
     public override func draw(_ rect: CGRect) {
