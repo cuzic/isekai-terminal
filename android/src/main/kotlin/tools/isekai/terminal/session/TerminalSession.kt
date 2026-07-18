@@ -23,6 +23,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import uniffi.isekai_terminal_core.*
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -60,6 +61,15 @@ class TerminalSession(
     private val acquireWifiFd: () -> PlatformFd? = { null },
     /** 同、セルラー-bound fd版。 */
     private val acquireCellularFd: () -> PlatformFd? = { null },
+    /**
+     * #25: 端末ベル(BEL, 0x07)受信時に呼ばれる(可視/触覚フィードバック用)。呼び出し元は
+     * [ioScope] のコルーチン上から呼ばれる(メインスレッド保証は無い)。判断ロジック
+     * (取りこぼし無く1回だけ発火させる `bell_generation` の単調増加チェック)はこのクラス
+     * 内で完結させ、ここでは実際にバイブレーション等を鳴らすだけの副作用注入とする
+     * (`onClipboardWriteRequested` と同じ構成 — `Context` を持たないこのクラス自体には
+     * 持ち込まない)。既定は no-op。
+     */
+    private val onBell: () -> Unit = {},
 ) : AutoCloseable {
 
     companion object {
@@ -86,6 +96,32 @@ class TerminalSession(
     private val screenUpdateChannel = Channel<ScreenUpdate>(Channel.CONFLATED)
 
     private val transferAccepted = AtomicBoolean(false)
+
+    /**
+     * #25: 直近フィードバック(振動等)を発火した`ScreenUpdate.bellGeneration`。
+     * `bellGeneration`はRust側`Terminal`ごとに(#24)0始まりで単調増加するカウンタなので、
+     * これより大きい値を受け取った時だけ1回発火させるdedupe用の記憶として使う。
+     * この[TerminalSession]インスタンス自体が1ペイン=1セッションにひも付く(`PaneState`参照)
+     * ため、フィールドとして持つだけでセッション/タブ単位のキーイングになる。ただし
+     * 同一ペインのまま手動`connect*()`(=[guardedConnect])が再度呼ばれる「再接続」では
+     * Rust側で新しい`Terminal`が作られ`bellGeneration`が0から再スタートする(#24)ため、
+     * [guardedConnect]内で新しい接続を開始する直前に同期的に0へリセットする
+     * (iOS版`TerminalSessionController.reconnect()`(#26)と同じ対処、Fableレビュー指摘)。
+     * ULongのビットパターンをそのまま保持するだけなので`AtomicLong`で問題ない
+     * (`ULong.toLong()`/`Long.toULong()`はビット再解釈であり、full u64レンジで可逆)。
+     */
+    private val lastFiredBellGeneration = AtomicLong(0)
+
+    /** [onScreenUpdate]の消費ループから呼ぶ。`bellGeneration`が進んでいれば[onBell]を1回だけ
+     *  発火する(同一世代の`ScreenUpdate`がconflatedチャネル経由で再適用されても二重発火
+     *  しない)。 */
+    private fun maybeFireBell(update: ScreenUpdate) {
+        val prev = lastFiredBellGeneration.get()
+        if (update.bellGeneration > prev.toULong()) {
+            lastFiredBellGeneration.set(update.bellGeneration.toLong())
+            onBell()
+        }
+    }
 
     // SSH agent forwarding: 署名要求ごとにユーザー確認を待つための橋渡し。
     // Rust 側の spawn_blocking スレッドから onAgentSignRequest() が同期呼び出しされるため、
@@ -224,6 +260,7 @@ class TerminalSession(
             for (update in screenUpdateChannel) {
                 if (_state.value.connected) {
                     _state.update { it.copy(screenUpdate = update, scrollbackLen = orchestrator.scrollbackLen().toInt()) }
+                    maybeFireBell(update)
                 }
             }
         }
@@ -242,6 +279,19 @@ class TerminalSession(
      *  同種チェックとあわせて意図的に残す。 */
     private inline fun guardedConnect(connect: () -> Unit) {
         if (_state.value.let { it.connected || it.isConnecting }) return
+        // #25: 新しい論理セッションを開始する直前に、直近発火済みBEL世代の記憶を
+        // 同期的にリセットする([lastFiredBellGeneration]のdocコメント参照)。ここで
+        // リセットすることで、この直後の`connect()`が(ハンドシェイクを経て)新しい
+        // `Terminal`での最初の`ScreenUpdate`を届け始めるより確実に先行させる。
+        lastFiredBellGeneration.set(0)
+        // CONFLATEDチャネルに旧セッションの`ScreenUpdate`(高い`bellGeneration`)が
+        // まだ未消費のまま残っている稀なケース(旧`onScreenUpdate`が切断直後の一瞬
+        // `_state.value.connected`の古い読み取りで滑り込んだ場合)に備え、ここで
+        // 明示的にドレインしておく。ドレインしないと、新セッション接続後にこの
+        // 古いフレームが消費コルーチンでconnected判定に引っかかって適用され、
+        // 新セッションの低い世代の初回BELがそれより小さいとして再び取りこぼされ得る
+        // (Codexレビュー指摘)。`tryReceive()`は非suspendで、空なら何もしない。
+        screenUpdateChannel.tryReceive()
         try {
             connect()
         } catch (e: SshException) {

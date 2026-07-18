@@ -57,6 +57,13 @@ class TerminalSessionTest {
     private suspend fun awaitState(condition: (TerminalUiState) -> Boolean): TerminalUiState =
         withTimeout(3000) { session.state.first { condition(it) } }
 
+    /** #25: `bellGeneration`だけを可変にした最小の`ScreenUpdate`。他フィールドは
+     *  既存テストと同じ最小値で埋める。 */
+    private fun bellUpdate(bellGeneration: ULong, cursorCol: UInt = 0u) = ScreenUpdate(
+        80u, 24u, emptyList(), 0u, cursorCol, "title", false, false, false,
+        MouseReportingMode.OFF, false, true, bellGeneration, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u,
+    )
+
     // ── 初期状態 ──────────────────────────────────────────────────
 
     @Test
@@ -370,7 +377,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "title1", false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
+        val update = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
         fakeOrchestrator.simulateScreenUpdate(update)
         awaitState { it.screenUpdate != null }
         assertEquals("title1", session.state.value.screenUpdate?.title)
@@ -382,9 +389,9 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update1 = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "title1", false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
-        val update2 = ScreenUpdate(80u, 24u, emptyList(), 0u, 5u, "title2", false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
-        val update3 = ScreenUpdate(80u, 24u, emptyList(), 0u, 10u, "title3", false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
+        val update1 = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "title1", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
+        val update2 = ScreenUpdate(80u, 24u, emptyList(), 0u, 5u, "title2", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
+        val update3 = ScreenUpdate(80u, 24u, emptyList(), 0u, 10u, "title3", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
 
         fakeOrchestrator.simulateScreenUpdate(update1)
         fakeOrchestrator.simulateScreenUpdate(update2)
@@ -400,7 +407,7 @@ class TerminalSessionTest {
         fakeOrchestrator.simulateConnected()
         awaitState { it.connected }
 
-        val update = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "before-disconnect", false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
+        val update = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, "before-disconnect", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
         fakeOrchestrator.simulateScreenUpdate(update)
         awaitState { it.screenUpdate != null }
 
@@ -409,7 +416,7 @@ class TerminalSessionTest {
         assertNull("screenUpdate should be cleared on disconnect", session.state.value.screenUpdate)
 
         // 切断後に simulateScreenUpdate が来ても無視される
-        val staleUpdate = ScreenUpdate(80u, 24u, emptyList(), 0u, 5u, "after-disconnect", false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
+        val staleUpdate = ScreenUpdate(80u, 24u, emptyList(), 0u, 5u, "after-disconnect", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
         fakeOrchestrator.simulateScreenUpdate(staleUpdate)
         delay(200)
         assertNull("stale screen update should not be applied after disconnect", session.state.value.screenUpdate)
@@ -423,7 +430,7 @@ class TerminalSessionTest {
 
         repeat(50) { i ->
             fakeOrchestrator.simulateScreenUpdate(
-                ScreenUpdate(80u, 24u, emptyList(), 0u, i.toUInt(), "frame-$i", false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
+                ScreenUpdate(80u, 24u, emptyList(), 0u, i.toUInt(), "frame-$i", false, false, false, MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(), emptyList(), 0u)
             )
         }
 
@@ -798,5 +805,148 @@ class TerminalSessionTest {
         session.disconnect()
         assertEquals("切断済み", session.state.value.statusMsg)
         assertFalse(session.state.value.isConnecting)
+    }
+
+    // ── #25: BEL(端末ベル)受信時のフィードバック ────────────────────────
+
+    @Test
+    fun onScreenUpdate_bellGenerationAdvances_firesOnBellOnce() = runBlocking {
+        val bellCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(
+            FakeHostKeyChecker(),
+            orchestratorFactory = { cb -> orch.also { it.callback = cb } },
+            onBell = { bellCount.incrementAndGet() },
+        )
+        s.connect(testConfig())
+        orch.simulateConnected()
+        withTimeout(3000) { s.state.first { it.connected } }
+
+        orch.simulateScreenUpdate(bellUpdate(bellGeneration = 1uL))
+        withTimeout(3000) { s.state.first { it.screenUpdate?.bellGeneration == 1uL } }
+        delay(50)
+
+        assertEquals(1, bellCount.get())
+        s.close()
+    }
+
+    @Test
+    fun onScreenUpdate_sameBellGenerationReapplied_doesNotFireAgain() = runBlocking {
+        val bellCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(
+            FakeHostKeyChecker(),
+            orchestratorFactory = { cb -> orch.also { it.callback = cb } },
+            onBell = { bellCount.incrementAndGet() },
+        )
+        s.connect(testConfig())
+        orch.simulateConnected()
+        withTimeout(3000) { s.state.first { it.connected } }
+
+        orch.simulateScreenUpdate(bellUpdate(bellGeneration = 2uL))
+        withTimeout(3000) { s.state.first { it.screenUpdate?.bellGeneration == 2uL } }
+        delay(50)
+        assertEquals(1, bellCount.get())
+
+        // 同じ bellGeneration の ScreenUpdate が(conflated チャネル越しの重複配送等で)
+        // 再適用されても二重発火しない(cursorCol だけ変えて、再適用が実際に消費された
+        // ことを検証可能にする)。
+        orch.simulateScreenUpdate(bellUpdate(bellGeneration = 2uL, cursorCol = 5u))
+        withTimeout(3000) { s.state.first { it.screenUpdate?.cursorCol == 5u } }
+        delay(50)
+
+        assertEquals(1, bellCount.get())
+        s.close()
+    }
+
+    @Test
+    fun onScreenUpdate_multipleIncreasingBellGenerations_firesForEach() = runBlocking {
+        val bellCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(
+            FakeHostKeyChecker(),
+            orchestratorFactory = { cb -> orch.also { it.callback = cb } },
+            onBell = { bellCount.incrementAndGet() },
+        )
+        s.connect(testConfig())
+        orch.simulateConnected()
+        withTimeout(3000) { s.state.first { it.connected } }
+
+        orch.simulateScreenUpdate(bellUpdate(bellGeneration = 1uL))
+        withTimeout(3000) { s.state.first { it.screenUpdate?.bellGeneration == 1uL } }
+        orch.simulateScreenUpdate(bellUpdate(bellGeneration = 2uL))
+        withTimeout(3000) { s.state.first { it.screenUpdate?.bellGeneration == 2uL } }
+        orch.simulateScreenUpdate(bellUpdate(bellGeneration = 3uL))
+        withTimeout(3000) { s.state.first { it.screenUpdate?.bellGeneration == 3uL } }
+        delay(50)
+
+        assertEquals(3, bellCount.get())
+        s.close()
+    }
+
+    @Test
+    fun onScreenUpdate_whileDisconnected_doesNotFireBell() = runBlocking {
+        val bellCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(
+            FakeHostKeyChecker(),
+            orchestratorFactory = { cb -> orch.also { it.callback = cb } },
+            onBell = { bellCount.incrementAndGet() },
+        )
+        s.connect(testConfig())
+        orch.simulateConnected()
+        withTimeout(3000) { s.state.first { it.connected } }
+
+        orch.simulateDisconnected("server closed")
+        withTimeout(3000) { s.state.first { !it.connected } }
+
+        orch.simulateScreenUpdate(bellUpdate(bellGeneration = 1uL))
+        delay(200)
+
+        assertEquals(0, bellCount.get())
+        s.close()
+    }
+
+    /** Fableレビュー指摘: 同一ペイン(同一[TerminalSession]インスタンス)のまま手動で
+     *  再接続すると、Rust側で新しい`Terminal`が作られ`bellGeneration`は0から
+     *  再スタートする(#24)。ここでは[guardedConnect]が新しい接続開始直前に
+     *  `lastFiredBellGeneration`をリセットすることを、「旧セッションで高い世代の
+     *  BELを記憶した後、新セッションの低い世代(1)のBELでも取りこぼさず発火する」
+     *  という観測可能な振る舞いで検証する(iOS版#26のreconnectテストと同じ観点)。 */
+    @Test
+    fun reconnect_resetsLastFiredBellGeneration_newSessionLowGenerationStillFires() = runBlocking {
+        val bellCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(
+            FakeHostKeyChecker(),
+            orchestratorFactory = { cb -> orch.also { it.callback = cb } },
+            onBell = { bellCount.incrementAndGet() },
+        )
+        s.connect(testConfig())
+        orch.simulateConnected()
+        withTimeout(3000) { s.state.first { it.connected } }
+
+        // 旧セッションで高い世代(5)のBELを既に記憶した状態を模す。
+        orch.simulateScreenUpdate(bellUpdate(bellGeneration = 5uL))
+        withTimeout(3000) { s.state.first { it.screenUpdate?.bellGeneration == 5uL } }
+        delay(50)
+        assertEquals(1, bellCount.get())
+
+        orch.simulateDisconnected("server closed")
+        withTimeout(3000) { s.state.first { !it.connected } }
+
+        // 再接続(同一 TerminalSession インスタンス、新しい論理セッション)。
+        s.connect(testConfig())
+        orch.simulateConnected()
+        withTimeout(3000) { s.state.first { it.connected } }
+
+        // 新セッションの bellGeneration は 1 から再スタートする(旧セッションの
+        // 記憶値 5 より小さいが、リセットされているので取りこぼさず発火する)。
+        orch.simulateScreenUpdate(bellUpdate(bellGeneration = 1uL))
+        withTimeout(3000) { s.state.first { it.screenUpdate?.bellGeneration == 1uL } }
+        delay(50)
+
+        assertEquals(2, bellCount.get())
+        s.close()
     }
 }

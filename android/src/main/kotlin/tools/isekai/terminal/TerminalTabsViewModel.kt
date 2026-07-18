@@ -2,6 +2,8 @@ package tools.isekai.terminal
 
 import android.app.Application
 import android.net.Uri
+import android.os.VibrationEffect
+import android.os.Vibrator
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import java.util.UUID
@@ -209,6 +211,16 @@ class TerminalTabsViewModel(
                 },
                 acquireCellularFd = {
                     runBlocking { rebindFdSource.acquireCellularFd() }?.let { (fd, ip) -> PlatformFd(fd, ip) }
+                },
+                // #25: 端末ベル(BEL)受信時の触覚フィードバック。判断(取りこぼし無く1回だけ
+                // 発火させる`bell_generation`の単調増加チェック)は[TerminalSession]側で
+                // 完結しており、ここでは実際にバイブレーションを鳴らすだけ(rust-ssot.md、
+                // `onClipboardWriteRequested`と同じ構成)。振動できないデバイス/権限が
+                // 無い場合は`vibrator`が非nullでも`hasVibrator()`がfalseになりうるが、
+                // `vibrate()`自体は黙って無視されるだけなので個別ハンドリング不要。
+                onBell = {
+                    val vibrator = app.getSystemService(Vibrator::class.java)
+                    vibrator?.vibrate(VibrationEffect.createOneShot(150, VibrationEffect.DEFAULT_AMPLITUDE))
                 },
             )
         },
