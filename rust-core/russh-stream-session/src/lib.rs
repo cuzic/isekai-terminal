@@ -1,13 +1,19 @@
 //! Establish and authenticate an SSH client session (built on [`russh`]) over
 //! any `AsyncRead + AsyncWrite` byte stream — not just a raw TCP socket.
 //!
-//! Host-key verification is delegated to [`HostKeyVerifier`], so this crate
-//! has no opinion on how (or whether) a caller persists a trust-on-first-use
-//! store. Port forwarding, SSH agent forwarding, and any other
-//! application-specific channel protocol are deliberately out of scope —
-//! this crate covers exactly "authenticate a `russh::client::Handle` and
-//! open one session channel (shell or exec)"; the I/O loop past that point
-//! is left to the caller.
+//! The connect/handshake functions are generic over the `russh`
+//! `client::Handler` a caller supplies, so callers that need more than
+//! host-key verification (agent forwarding, remote port forwards, other
+//! server-initiated channel requests) can plug in their own handler.
+//! Callers that only need host-key verification can use the bundled
+//! [`VerifyingHandler`] (via [`verifying_handler`]) instead of writing one —
+//! it delegates to a small [`HostKeyVerifier`] trait, so this crate has no
+//! opinion on how (or whether) a caller persists a trust-on-first-use store.
+//! Port forwarding, SSH agent forwarding, and any other
+//! application-specific channel protocol are otherwise deliberately out of
+//! scope — this crate covers exactly "authenticate a `russh::client::Handle`
+//! and open one session channel (shell or exec)"; the I/O loop past that
+//! point is left to the caller.
 //!
 //! [`russh`]: https://docs.rs/russh
 
@@ -99,9 +105,9 @@ impl<V: HostKeyVerifier + 'static> client::Handler for VerifyingHandler<V> {
 /// through a jump host. The jump host's own `client::Handle` (if any) is
 /// kept alive internally for as long as this session is in use — dropping
 /// [`Session`] tears down the tunnel too.
-pub struct Session<V: HostKeyVerifier + 'static> {
-    pub handle: client::Handle<VerifyingHandler<V>>,
-    _jump_handle: Option<client::Handle<VerifyingHandler<V>>>,
+pub struct Session<H: client::Handler + 'static> {
+    pub handle: client::Handle<H>,
+    _jump_handle: Option<client::Handle<H>>,
 }
 
 /// Connects to `target_host:target_port`, either directly or (if `jump` is
@@ -109,28 +115,35 @@ pub struct Session<V: HostKeyVerifier + 'static> {
 /// `direct-tcpip` channel (`ssh -J` equivalent, single hop). The returned
 /// [`Session`] is connected but not yet authenticated to the target —
 /// call [`authenticate_session`] next.
-pub async fn connect_via_jump_or_direct<V>(
+///
+/// Generic over the `client::Handler` type `H` so callers that need more
+/// than host-key verification (agent forwarding, remote port forwards,
+/// other server-initiated channel requests) can plug in their own handler —
+/// `new_handler` is called once per connection attempt (twice total when a
+/// jump host is used: once for the jump leg, once for the target). Callers
+/// that only need host-key verification can use [`VerifyingHandler`] via
+/// [`verifying_handler`] instead of writing their own `client::Handler`.
+pub async fn connect_via_jump_or_direct<H, F>(
     jump: Option<&JumpHost>,
     russh_config: Arc<client::Config>,
     target_host: &str,
     target_port: u16,
-    verifier: Arc<V>,
-) -> Result<Session<V>, SessionError>
+    mut new_handler: F,
+) -> Result<Session<H>, SessionError>
 where
-    V: HostKeyVerifier + 'static,
+    H: client::Handler<Error = russh::Error> + Send + 'static,
+    F: FnMut() -> H,
 {
     let Some(jump) = jump else {
         let addr = format!("{target_host}:{target_port}");
-        let handler = VerifyingHandler { verifier };
-        let handle = client::connect(russh_config, addr.as_str(), handler)
+        let handle = client::connect(russh_config, addr.as_str(), new_handler())
             .await
             .map_err(|source| SessionError::Connect { addr, source })?;
         return Ok(Session { handle, _jump_handle: None });
     };
 
     let jump_addr = format!("{}:{}", jump.host, jump.port);
-    let jump_handler = VerifyingHandler { verifier: verifier.clone() };
-    let mut jump_handle = client::connect(russh_config.clone(), jump_addr.as_str(), jump_handler)
+    let mut jump_handle = client::connect(russh_config.clone(), jump_addr.as_str(), new_handler())
         .await
         .map_err(|source| SessionError::Connect { addr: jump_addr.clone(), source })?;
 
@@ -145,8 +158,7 @@ where
         .map_err(|source| SessionError::JumpTunnel { host: target_host.to_string(), port: target_port, source })?;
     let stream = channel.into_stream();
 
-    let target_handler = VerifyingHandler { verifier };
-    let handle = client::connect_stream(russh_config, stream, target_handler)
+    let handle = client::connect_stream(russh_config, stream, new_handler())
         .await
         .map_err(|source| SessionError::JumpHandshake { host: target_host.to_string(), port: target_port, source })?;
 
@@ -158,17 +170,25 @@ where
 /// callers that have their own way of reaching the target and just need SSH
 /// layered on top. Not yet authenticated — call [`authenticate_session`]
 /// next.
-pub async fn establish_over_stream<S, V>(
+pub async fn establish_over_stream<S, H>(
     russh_config: Arc<client::Config>,
     stream: S,
-    verifier: Arc<V>,
-) -> Result<client::Handle<VerifyingHandler<V>>, SessionError>
+    handler: H,
+) -> Result<client::Handle<H>, SessionError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    V: HostKeyVerifier + 'static,
+    H: client::Handler<Error = russh::Error> + Send + 'static,
 {
-    let handler = VerifyingHandler { verifier };
     client::connect_stream(russh_config, stream, handler).await.map_err(SessionError::Handshake)
+}
+
+/// Builds a [`VerifyingHandler`] for `verifier` — a convenience for the
+/// common case of [`connect_via_jump_or_direct`]'s `new_handler` argument
+/// when a caller only needs host-key verification and nothing else
+/// (no agent forwarding, no remote forwards). `verifier` is cloned once per
+/// call (cheap: it's an `Arc`).
+pub fn verifying_handler<V: HostKeyVerifier + 'static>(verifier: &Arc<V>) -> VerifyingHandler<V> {
+    VerifyingHandler { verifier: verifier.clone() }
 }
 
 /// Authenticates `session` as `username` using `credential`. `Ok(false)`
@@ -358,7 +378,8 @@ mod tests {
         let addr = spawn_server(EchoExecServer, 1).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
-            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            || verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -407,7 +428,8 @@ mod tests {
 
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
-            Some(&jump), Arc::new(client::Config::default()), &target_addr.ip().to_string(), target_addr.port(), verifier,
+            Some(&jump), Arc::new(client::Config::default()), &target_addr.ip().to_string(), target_addr.port(),
+            || verifying_handler(&verifier),
         )
         .await
         .expect("jump connect should succeed");
@@ -429,7 +451,8 @@ mod tests {
         let addr = spawn_server(EchoExecServer, 4).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
-            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            || verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -451,7 +474,8 @@ mod tests {
         let addr = spawn_server(EchoExecServer, 5).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
-            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            || verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -469,7 +493,8 @@ mod tests {
         let addr = spawn_server(EchoExecServer, 6).await;
         let verifier = Arc::new(AcceptAllHostKeys);
         let mut session = connect_via_jump_or_direct(
-            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            || verifying_handler(&verifier),
         )
         .await
         .expect("direct connect should succeed");
@@ -499,7 +524,8 @@ mod tests {
         let addr = spawn_server(EchoExecServer, 7).await;
         let verifier = Arc::new(RejectAllHostKeys);
         let result = connect_via_jump_or_direct(
-            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(), verifier,
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            || verifying_handler(&verifier),
         )
         .await;
         assert!(

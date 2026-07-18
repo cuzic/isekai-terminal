@@ -1,15 +1,21 @@
 # russh-stream-session
 
 Establish and authenticate an SSH client session (built on [`russh`]) over
-any `AsyncRead + AsyncWrite` byte stream — not just a raw TCP socket. Host-key
-verification is delegated to a small [`HostKeyVerifier`] trait, so this crate
-has no opinion on how (or whether) you persist a trust-on-first-use store.
+any `AsyncRead + AsyncWrite` byte stream — not just a raw TCP socket. The
+connect/handshake functions are generic over the `russh` `client::Handler`
+you supply, so callers that need more than host-key verification (agent
+forwarding, remote port forwards, other server-initiated channel requests)
+can plug in their own handler. If you only need host-key verification, use
+the bundled [`VerifyingHandler`] (via [`verifying_handler`]) instead of
+writing one — it delegates to a small [`HostKeyVerifier`] trait, so this
+crate has no opinion on how (or whether) you persist a trust-on-first-use
+store.
 
 This crate deliberately does **not** implement port forwarding, SSH agent
-forwarding, or any application-specific channel protocol — it covers exactly
-the "get me an authenticated `russh::client::Handle` and a session channel"
-part. Everything past that (the actual I/O loop, resize handling, forwards)
-is left to the caller, since those tend to be application-specific.
+forwarding, or any application-specific channel protocol itself — it covers
+exactly the "get me an authenticated `russh::client::Handle` and a session
+channel" part. Everything past that (the actual I/O loop, resize handling,
+forwards) is left to the caller, since those tend to be application-specific.
 
 ## Example
 
@@ -26,12 +32,13 @@ impl HostKeyVerifier for AcceptAll {
 let verifier = Arc::new(AcceptAll);
 let config = Arc::new(russh::client::Config::default());
 let mut session = russh_stream_session::connect_via_jump_or_direct(
-    None, config, "example.com", 22, verifier,
+    None, config, "example.com", 22,
+    || russh_stream_session::verifying_handler(&verifier),
 ).await?;
 
 let authed = russh_stream_session::authenticate_session(
     &mut session.handle, "alice", &Credential::Password("hunter2".into()),
-).await;
+).await?;
 assert!(authed);
 
 let mut channel = russh_stream_session::open_channel(
@@ -40,6 +47,10 @@ let mut channel = russh_stream_session::open_channel(
 # Ok(())
 # }
 ```
+
+Callers that need agent forwarding, remote port forwards, or other
+server-initiated channel requests implement their own `client::Handler` and
+pass a closure constructing it instead of `verifying_handler`.
 
 ## Jump hosts
 
