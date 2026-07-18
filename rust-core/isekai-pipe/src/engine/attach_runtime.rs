@@ -91,6 +91,24 @@ impl AttachRuntime {
         }
     }
 
+    /// The `(session_id, lease)` currently occupying the `Established` slot,
+    /// if any — used by a fresh `ATTACH_HELLO` that just lost the fencing
+    /// race with `BusyOtherSession` to find out *whose* session is in the
+    /// way, so the caller (which alone has access to `SessionTable`, this
+    /// runtime deliberately doesn't) can attempt to preempt it if — and only
+    /// if — it turns out to be merely parked rather than actively relaying
+    /// (`engine/mod.rs`'s `handle_attach_stream`, per `ISEKAI_PIPE_DESIGN.md`
+    /// §8's parked-session-preemption design). A plain read: taking no lock
+    /// beyond the snapshot itself, so the answer can be stale by the time
+    /// the caller acts on it — that's fine, the actual eviction decision is
+    /// made atomically by `SessionTable::claim_parked`, not here.
+    pub async fn current_established(&self) -> Option<(isekai_protocol::SessionId, LeaseId)> {
+        match self.arbiter.lock().await.state() {
+            AttachState::Established { key, lease } => Some((key.session_id, *lease)),
+            _ => None,
+        }
+    }
+
     /// Entry point for a data-stream `ATTACH_HELLO`: registers a waiter for
     /// `key`, applies the event, executes whatever effects come back
     /// immediately, then waits (possibly across further effects executed by

@@ -1096,6 +1096,116 @@ async fn fresh_attach_after_park_expiry_succeeds_instead_of_staying_busy() {
     );
 }
 
+/// `ISEKAI_PIPE_DESIGN.md` §8 の parked-session-preemption Epic の本命回帰
+/// テスト: `--resume-window`が長い(=park保持のバックストップがまだ全く
+/// 発火しない)場合でも、別の新しい`session_id`でのfreshな`ATTACH_HELLO`は
+/// *即座に* parkされた古いセッションを立ち退かせて`AttachReadyV2`を得られる
+/// ——`sweep_expired_parked`が発火するまでの間ずっと`BusyOtherSession`を
+/// 返し続ける(以前は最大`--resume-window`=10日間ブロックしていた)回帰の
+/// 確認。加えて、立ち退かせた後は古い`session_id`でのRESUMEが確定的に
+/// `UnknownToken`(実際には`SessionTable`から除去済み)になることも確認する。
+#[tokio::test]
+async fn fresh_attach_preempts_a_parked_session_immediately_without_waiting_for_resume_window() {
+    let echo_addr = spawn_echo_server().await;
+    // 十分長いresume-window(1時間) — sweepが絶対に発火し得ない時間内で
+    // テストを完了させることで、「即座の立ち退き」経路だけを検証する。
+    let helper = spawn_helper(echo_addr, &["--resume-window", "3600"]);
+    let session_secret = base64::engine::general_purpose::STANDARD
+        .decode(&helper.handshake.session_secret)
+        .unwrap();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
+        .parse()
+        .unwrap();
+
+    // 1本目: attach して Established にした直後、データ交換なしですぐに
+    // 切断する(park させる)。`fresh_attach_after_park_expiry_succeeds_
+    // instead_of_staying_busy`と同じCONTROL_ACK同期パターン。
+    let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn1 = endpoint1
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .unwrap();
+    let (sid1, gen1, aid1) = fresh_attach_ids();
+    let (send1, recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
+
+    let proof1 = compute_proof(&conn1, &session_secret);
+    let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
+    let mut chello1 = vec![CONTROL_HELLO];
+    chello1.extend_from_slice(&proof1);
+    csend1.write_all(&chello1).await.unwrap();
+    let mut cack1 = [0u8; 17];
+    tokio::time::timeout(Duration::from_secs(5), crecv1.read_exact(&mut cack1))
+        .await
+        .expect("timed out waiting for CONTROL_ACK")
+        .unwrap();
+    assert_eq!(cack1[0], CONTROL_ACK);
+
+    conn1.close(0u32.into(), b"simulated abandoned client");
+    drop(send1);
+    drop(recv1);
+    drop(csend1);
+    drop(crecv1);
+    drop(endpoint1);
+
+    // サーバーが実際にparkするまで少し待つ(QUIC切断検知の最短時間程度)。
+    // sweep間隔(5秒)やresume-window(3600秒)を待つ必要は一切無い —
+    // これがこのテストの主張そのもの。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 2本目: RESUMEではなく、*別の新しい* session_idでのfreshなATTACH_HELLO。
+    // 即座にAttachReadyV2が返るはず — 立ち退きが効いていなければ、
+    // resume-windowが3600秒なので確実にタイムアウトする。
+    let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn2 = endpoint2
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .expect("second QUIC handshake failed");
+    let (sid2, gen2, aid2) = fresh_attach_ids();
+    let proof2 = compute_attach_proof(&conn2, &session_secret, &sid2, gen2, &aid2, 0);
+    let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
+    send2.write_all(&attach_hello_frame(sid2, gen2, aid2, proof2)).await.unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(5), read_attach_response(&mut recv2))
+        .await
+        .expect("timed out waiting for a response to the fresh ATTACH_HELLO");
+    assert!(
+        matches!(response, AttachResponse::Ready { .. }),
+        "a fresh ATTACH_HELLO must immediately preempt a merely-parked session rather than \
+         waiting out --resume-window, got {response:?}"
+    );
+
+    // 古いsession_id(sid1)でのRESUMEは、立ち退きでSessionTableから確実に
+    // 除去されているので UnknownToken になるはず。
+    let conn3 = make_client_endpoint(helper.handshake.cert_sha256())
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .expect("third QUIC handshake failed");
+    let mut exporter3 = [0u8; 32];
+    conn3.export_keying_material(&mut exporter3, EXPORTER_LABEL, b"").unwrap();
+    let mut mac3 = HmacSha256::new_from_slice(&session_secret).unwrap();
+    mac3.update(&exporter3);
+    mac3.update(sid1.as_bytes());
+    let resume_proof = mac3.finalize().into_bytes();
+    let (mut rsend, mut rrecv) = conn3.open_bi().await.unwrap();
+    rsend
+        .write_all(&encode_quicmux_resume_frame(sid1.as_bytes(), &resume_proof, 0, 0))
+        .await
+        .unwrap();
+    let resume_response = tokio::time::timeout(Duration::from_secs(5), read_quicmux_resume_response(&mut rrecv))
+        .await
+        .expect("timed out waiting for a RESUME response for the preempted session");
+    let QuicmuxResumeResponse::Reject(reason) = resume_response else {
+        panic!("expected RESUME_REJECT for the preempted session");
+    };
+    assert_eq!(
+        reason, QUICMUX_REJECT_UNKNOWN_TOKEN,
+        "the preempted session's own RESUME must now be rejected as unknown"
+    );
+}
+
 // ── STUN(--stun-server)ハンドシェイク拡張 ─────────────────────────────
 
 /// 最小のモックSTUNサーバー(RFC 5389 Binding Request/Response)。
