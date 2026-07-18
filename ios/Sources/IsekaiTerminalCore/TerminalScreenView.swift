@@ -293,7 +293,11 @@ public final class TerminalScreenView: UIView {
             }
         }
 
-        if Int(update.cursorRow) < rows, Int(update.cursorCol) < cols {
+        // DECTCEM(CSI ?25l/h)でカーソルが非表示状態のときはRust側が`cursorVisible = false`を
+        // 立てるので、描画自体をスキップする(rust-ssot: 可視判定はRust側で行い、Swift側は
+        // フラグをそのまま反映するだけ。Android版`SshTerminalCanvas.kt`の`update.cursorVisible`
+        // ガードと対称)。
+        if update.cursorVisible, Int(update.cursorRow) < rows, Int(update.cursorCol) < cols {
             let x = CGFloat(update.cursorCol) * cellWidth
             let y = CGFloat(update.cursorRow) * cellHeight
             UIColor.white.withAlphaComponent(0.5).setFill()
