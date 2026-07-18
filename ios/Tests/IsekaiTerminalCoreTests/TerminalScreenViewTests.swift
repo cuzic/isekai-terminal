@@ -466,6 +466,77 @@ final class TerminalScreenViewTests: XCTestCase {
         XCTAssertEqual(result.carry, 3, accuracy: 0.0001)
     }
 
+    // MARK: - タスク#87: マウスUI裁定ロジック(mouseReportingActive/decideMouseTouchBeganAction)
+    //
+    // fableレビュー(グループD)指摘: マウスレポーティングのpress/drag/releaseライフサイクル・
+    // 2本指中断・scrollOffsetゲートの裁定ロジックに単体テストが無かった。`clampedFontScale`/
+    // `wheelEvents`と同様、UIKit非依存の純粋関数へ抽出した上で直接検証する。
+
+    func testMouseReportingActiveWhenModeIsNotOffAndLiveAndNotShowingScrollback() {
+        XCTAssertTrue(mouseReportingActive(
+            scrollOffset: 0, showingScrollback: false, mouseReportingMode: .normal
+        ))
+    }
+
+    func testMouseReportingInactiveWhenModeIsOff() {
+        XCTAssertFalse(mouseReportingActive(
+            scrollOffset: 0, showingScrollback: false, mouseReportingMode: .off
+        ))
+    }
+
+    func testMouseReportingInactiveWhenScrolledIntoScrollback() {
+        // 過去ログを表示中にライブ側のモードへ従ってポインタイベントを送ると、
+        // 表示対象(スクロールバック)と入力対象(ライブセッション)が食い違う。
+        XCTAssertFalse(mouseReportingActive(
+            scrollOffset: 3, showingScrollback: false, mouseReportingMode: .normal
+        ))
+    }
+
+    func testMouseReportingInactiveWhileShowingScrollbackEvenIfScrollOffsetIsZero() {
+        // タスク#79: 検索ジャンプでscrollback最新行(row=0)を表示中は、
+        // scrollOffset == 0のままでもライブ表示ではない。
+        XCTAssertFalse(mouseReportingActive(
+            scrollOffset: 0, showingScrollback: true, mouseReportingMode: .normal
+        ))
+    }
+
+    func testDecideMouseTouchBeganActionStartsTrackingForFirstSingleFingerTouch() {
+        XCTAssertEqual(
+            decideMouseTouchBeganAction(hasActiveTrackedTouch: false, totalTouchCount: 1),
+            .startTracking
+        )
+    }
+
+    func testDecideMouseTouchBeganActionReleasesActiveWhenASecondFingerTouchesDown() {
+        // 追跡中のタッチがある間に2本目以降の指が触れた場合、直前のpressに対応する
+        // releaseを送って打ち切る(releaseを送らないとリモート側でボタンが
+        // 押されっぱなしに見える、Android版`decideMouseTouchStep`のRELEASE_AND_HANDOFF_TO_PINCHと
+        // 同じ理由でトリガーされる)。
+        XCTAssertEqual(
+            decideMouseTouchBeganAction(hasActiveTrackedTouch: true, totalTouchCount: 2),
+            .releaseActiveAndStopTracking
+        )
+    }
+
+    func testDecideMouseTouchBeganActionReleasesActiveRegardlessOfTotalTouchCount() {
+        // 追跡中のタッチがある限り、totalTouchCountの値に関わらず(既に離れて0になって
+        // いても)releaseして打ち切る(元実装の`if let active = activeMouseTouch { ... }`が
+        // totalTouchCountを見ずに先に判定していたのと対称)。
+        XCTAssertEqual(
+            decideMouseTouchBeganAction(hasActiveTrackedTouch: true, totalTouchCount: 1),
+            .releaseActiveAndStopTracking
+        )
+    }
+
+    func testDecideMouseTouchBeganActionIgnoresWhenNoActiveTouchAndAlreadyMultiFinger() {
+        // 追跡中のタッチが無い状態でこの`touchesBegan`自体が最初から複数指として
+        // 発火した場合は、マウスタッチとしては追跡を開始しない(pinch等に譲る)。
+        XCTAssertEqual(
+            decideMouseTouchBeganAction(hasActiveTrackedTouch: false, totalTouchCount: 2),
+            .ignore
+        )
+    }
+
     // MARK: - タスク#86: shouldResetBlinkPhase(blink初期表示位相の安定化)
 
     /// blink無し→blink有りへ新規遷移した場合はリセットが必要(SGR blinkセルの出現)。
