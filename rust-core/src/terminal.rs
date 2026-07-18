@@ -1859,15 +1859,14 @@ impl Perform for Terminal {
         }
 
         if is_dec {
-            // マウスレポーティング関連(`?1000`/`?1002`/`?1003`/`?1006`、タスク#36)は
-            // 先頭パラメータ(`p0`)だけでなく`ps`全体を見る。実アプリ(vim/tmux等)は
-            // `CSI ?1000;1006h`のようにトラッキングモードとSGR拡張を1つのシーケンスに
-            // まとめて送ることが珍しくなく、`p0`しか見ないと後続の`1006`が無視されて
-            // 「SGRを要求したのにlegacy X10形式で返す」座標破損バグになる
-            // (codexレビュー指摘)。他のDECモード(`1047`/`1049`/`25`/`12`/`1`/`7`/`2004`/
-            // `1004`、タスク#60でも同様にcodexレビューで指摘済み)は複数パラメータ(Pm)を
-            // 1シーケンスにまとめて送られるケースが実用上ほぼ無く、汎用的なPm対応は
-            // 既存の別タスク(#68)のスコープなのでここでは広げない。
+            // 全DECモード(`?1000`等)を`p0`(先頭パラメータ)だけでなく`ps`全体を
+            // ループして処理する(タスク#68)。実アプリ(vim/tmux等)は`CSI ?1049;25h`
+            // (alt screen切替+カーソル表示、DECTCEMは`h`=表示/`l`=非表示)や
+            // `CSI ?1000;1006h`(マウストラッキング+
+            // SGR拡張)のように複数モードを1シーケンスにまとめて送ることが珍しくなく、
+            // `p0`しか見ないと後続のパラメータが無視される(元々マウス関連のみ
+            // `for &p in &ps`ループで対応済みだったが、他のモードは`match (action, p0)`
+            // で先頭だけしか見ておらずcodexレビュー指摘の残課題だった——1つのループへ統合)。
             for &p in &ps {
                 match (action, p) {
                     ('h', 1000) => { self.mouse_reporting_mode = MouseReportingMode::Normal; }
@@ -1884,48 +1883,45 @@ impl Perform for Terminal {
                     // 選ぶ、という順序も許容する必要があるため)。
                     ('h', 1006) => { self.sgr_mouse_mode = true; }
                     ('l', 1006) => { self.sgr_mouse_mode = false; }
+                    ('h', 47) | ('h', 1047) => { self.switch_to_alt(false); }
+                    ('h', 1049) => { self.switch_to_alt(true); }
+                    ('l', 47) | ('l', 1047) => { self.switch_to_main(false); }
+                    ('l', 1049) => { self.switch_to_main(true); }
+                    ('h', 25) => { self.cursor_visible = true; }
+                    ('l', 25) => { self.cursor_visible = false; }
+                    // DECSET/DECRST ?12(`CSI ?12h`/`CSI ?12l`): カーソル点滅on/off単体。
+                    // `CursorShape`(DECSCUSR、`CSI Ps SP q`)とは独立したフィールドを
+                    // 更新する——DECSCUSRのパラメータでも`cursor_blink`は変わるが、
+                    // こちらは形状を変えずに点滅の有無だけを切り替える(タスク#55)。
+                    ('h', 12) => { self.cursor_blink = true; }
+                    ('l', 12) => { self.cursor_blink = false; }
+                    ('h', 1) => { self.application_cursor_mode = true; }
+                    ('l', 1) => { self.application_cursor_mode = false; }
+                    // DECAWM(`CSI ?7h`/`CSI ?7l`): 自動折り返しon/off(タスク#56)。
+                    ('h', 7) => { self.autowrap_mode = true; }
+                    ('l', 7) => { self.autowrap_mode = false; }
+                    // DECOM(`CSI ?6h`/`CSI ?6l`、origin mode、タスク#59)。実端末(xterm含む)
+                    // に倣い、on/offどちらの切り替えでもカーソルをhome位置へ移動する
+                    // (on: scroll_top行、off: 0行目。列は常に0)。
+                    ('h', 6) => {
+                        self.origin_mode = true;
+                        self.cursor_row = self.scroll_top;
+                        self.cursor_col = 0;
+                    }
+                    ('l', 6) => {
+                        self.origin_mode = false;
+                        self.cursor_row = 0;
+                        self.cursor_col = 0;
+                    }
+                    ('h', 2004) => { self.bracketed_paste_mode = true; }
+                    ('l', 2004) => { self.bracketed_paste_mode = false; }
+                    // フォーカスレポーティング(`CSI ?1004h`/`l`、タスク#60)。有効な間だけ
+                    // [encode_focus_event]がOS由来のフォーカス変化を`CSI I`/`CSI O`へ
+                    // エンコードして送るようになる。
+                    ('h', 1004) => { self.focus_reporting_mode = true; }
+                    ('l', 1004) => { self.focus_reporting_mode = false; }
                     _ => {}
                 }
-            }
-            match (action, p0) {
-                ('h', 47) | ('h', 1047) => { self.switch_to_alt(false); }
-                ('h', 1049) => { self.switch_to_alt(true); }
-                ('l', 47) | ('l', 1047) => { self.switch_to_main(false); }
-                ('l', 1049) => { self.switch_to_main(true); }
-                ('h', 25) => { self.cursor_visible = true; }
-                ('l', 25) => { self.cursor_visible = false; }
-                // DECSET/DECRST ?12(`CSI ?12h`/`CSI ?12l`): カーソル点滅on/off単体。
-                // `CursorShape`(DECSCUSR、`CSI Ps SP q`)とは独立したフィールドを
-                // 更新する——DECSCUSRのパラメータでも`cursor_blink`は変わるが、
-                // こちらは形状を変えずに点滅の有無だけを切り替える(タスク#55)。
-                ('h', 12) => { self.cursor_blink = true; }
-                ('l', 12) => { self.cursor_blink = false; }
-                ('h', 1) => { self.application_cursor_mode = true; }
-                ('l', 1) => { self.application_cursor_mode = false; }
-                // DECAWM(`CSI ?7h`/`CSI ?7l`): 自動折り返しon/off(タスク#56)。
-                ('h', 7) => { self.autowrap_mode = true; }
-                ('l', 7) => { self.autowrap_mode = false; }
-                // DECOM(`CSI ?6h`/`CSI ?6l`、origin mode、タスク#59)。実端末(xterm含む)
-                // に倣い、on/offどちらの切り替えでもカーソルをhome位置へ移動する
-                // (on: scroll_top行、off: 0行目。列は常に0)。
-                ('h', 6) => {
-                    self.origin_mode = true;
-                    self.cursor_row = self.scroll_top;
-                    self.cursor_col = 0;
-                }
-                ('l', 6) => {
-                    self.origin_mode = false;
-                    self.cursor_row = 0;
-                    self.cursor_col = 0;
-                }
-                ('h', 2004) => { self.bracketed_paste_mode = true; }
-                ('l', 2004) => { self.bracketed_paste_mode = false; }
-                // フォーカスレポーティング(`CSI ?1004h`/`l`、タスク#60)。有効な間だけ
-                // [encode_focus_event]がOS由来のフォーカス変化を`CSI I`/`CSI O`へ
-                // エンコードして送るようになる。
-                ('h', 1004) => { self.focus_reporting_mode = true; }
-                ('l', 1004) => { self.focus_reporting_mode = false; }
-                _ => {}
             }
             return;
         }
@@ -4691,6 +4687,48 @@ mod tests {
         feed(&mut t, b"\x1bc"); // RIS
         feed(&mut t, b"\t"); // HT: 既定の8桁パターンに戻っているはず
         assert_eq!(t.cursor_col(), 8, "RISでタブストップは既定(8桁おき)に戻る");
+    }
+
+    // ── DEC private modeの複数パラメータ(Pm)対応(タスク#68) ─────────────
+
+    #[test]
+    fn test_dec_private_mode_multi_param_applies_all_of_them() {
+        // `CSI ?25l`でカーソルを隠した状態から、`CSI ?1049;25h`(alt screenへ切替
+        // + カーソル再表示、DECTCEMは`h`=表示/`l`=非表示)を1シーケンスで送る。
+        // 修正前は先頭パラメータ(1049)しか見ておらず、25(カーソル再表示)が
+        // 無視されていた。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"main");
+        feed(&mut t, b"\x1b[?25l");
+        assert!(!t.cursor_visible());
+        feed(&mut t, b"\x1b[?1049;25h");
+        assert_eq!(cell(&t, 0, 0), " ", "1049によりalt screen(空白)へ切り替わっていること");
+        assert!(t.cursor_visible(), "25も同一シーケンス内で処理されカーソルが再表示されること");
+    }
+
+    #[test]
+    fn test_dec_private_mode_multi_param_reset_applies_all_of_them() {
+        // 逆方向(`CSI ?1049;25l`): alt screenからmainへ戻る + カーソル非表示、を
+        // 1シーケンスで送る。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"main");
+        feed(&mut t, b"\x1b[?1049h"); // alt画面へ(この時点ではcursor_visibleはtrueのまま)
+        feed(&mut t, b"\x1b[?1049;25l");
+        assert_eq!(cell(&t, 0, 0), "m", "1049によりmain screen(内容復元)へ戻っていること");
+        assert!(!t.cursor_visible(), "25も同一シーケンス内で処理されカーソルが隠れていること");
+    }
+
+    #[test]
+    fn test_dec_private_mode_multi_param_mixes_mouse_and_other_modes() {
+        // マウス関連(既存対応済み)と他のモードが同一シーケンスに混在するケースも
+        // 全パラメータが処理されることを確認する。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b[?1000;1006;7l"); // マウスOFF(既定と同じだが明示) + DECAWM off
+        assert!(!t.autowrap_mode());
+        feed(&mut t, b"\x1b[?1000;1006;7h");
+        assert_eq!(t.mouse_reporting_mode(), MouseReportingMode::Normal);
+        assert!(t.sgr_mouse_mode());
+        assert!(t.autowrap_mode());
     }
 
     // ── DECSC/DECRC(`ESC 7`/`ESC 8`)・CSI s/u(タスク#57) ─────────────
