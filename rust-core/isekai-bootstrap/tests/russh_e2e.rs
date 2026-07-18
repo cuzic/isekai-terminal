@@ -1,0 +1,337 @@
+//! End-to-end tests for `RusshBackend` against an in-process mock SSH
+//! server, mirroring `openssh_e2e.rs`'s `FakeShellServer` pattern (this
+//! project's `tests/*_e2e.rs` self-containment convention — see that file's
+//! own module docs, and `isekai-ssh-e2e-test-self-containment-convention` —
+//! duplicated here rather than shared, deliberately).
+//!
+//! Unlike `openssh_e2e.rs`, this file never shells out to a real `ssh(1)`/
+//! `ssh-keygen` binary at all: `RusshBackend` connects via `russh` directly,
+//! and the test keypair is generated in-process via `russh_keys::ssh_key`.
+//! So, unlike `openssh_e2e.rs`, these tests never skip themselves for a
+//! missing `ssh(1)`.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::Stdio as StdStdio;
+
+use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec, RusshBackend};
+use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
+use russh::{Channel as RusshChannel, ChannelId, CryptoVec};
+use russh_keys::ssh_key::private::Ed25519Keypair;
+use russh_keys::ssh_key::LineEnding;
+use russh_keys::{PrivateKey, PublicKey};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener as TokioTcpListener;
+use tokio::process::Command as TokioCommand;
+use tokio::sync::mpsc;
+
+/// Generates a fresh in-process ed25519 keypair (no `ssh-keygen` needed —
+/// unlike `openssh_e2e.rs`, this crate's `RusshBackend` client never shells
+/// out to a real `ssh(1)`, so there's no reason to mirror what a real user's
+/// key file looks like beyond "a valid OpenSSH-format private key `russh`
+/// can parse"). Returns (private key file path, loaded public key).
+fn generate_client_keypair(dir: &Path) -> (PathBuf, PublicKey) {
+    let private_key = PrivateKey::random(&mut rand_core_from_rand08(), russh_keys::ssh_key::Algorithm::Ed25519)
+        .expect("generating a random ed25519 key must not fail");
+    let pem = private_key.to_openssh(LineEnding::LF).expect("encoding a freshly generated key must not fail");
+    let key_path = dir.join("client_id_ed25519");
+    std::fs::write(&key_path, pem.as_bytes()).unwrap();
+    (key_path, private_key.public_key().clone())
+}
+
+/// `ssh_key::PrivateKey::random` wants a `rand_core` (0.6-generation) RNG;
+/// this workspace's `rand` dependency is the matching 0.8 line, whose
+/// `rand::rngs::OsRng` already implements that trait — no extra dependency
+/// needed, just naming the type this bluntly to make the version bridge
+/// obvious at the call site above.
+fn rand_core_from_rand08() -> rand::rngs::OsRng {
+    rand::rngs::OsRng
+}
+
+async fn read_all<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
+/// The "remote host"'s SSH server. Accepts only the one test client pubkey,
+/// and runs whatever command the client execs via a real `sh -c` subprocess
+/// with `HOME` pinned to a scratch temp dir — standing in for a real sshd +
+/// real remote filesystem, without touching the test runner's actual home
+/// directory. Verbatim copy of `openssh_e2e.rs`'s `FakeShellServer` (see
+/// this file's module docs for why it's duplicated, not shared): this
+/// server-side logic is entirely transport-agnostic — it doesn't care
+/// whether the connecting client is a real `ssh(1)` or `RusshBackend`.
+#[derive(Clone)]
+struct FakeShellServer {
+    home: PathBuf,
+    accepted_client_key: PublicKey,
+}
+
+impl server::Server for FakeShellServer {
+    type Handler = FakeShellHandler;
+    fn new_client(&mut self, _: Option<SocketAddr>) -> FakeShellHandler {
+        FakeShellHandler { home: self.home.clone(), accepted_client_key: self.accepted_client_key.clone(), stdin_senders: HashMap::new() }
+    }
+}
+
+struct FakeShellHandler {
+    home: PathBuf,
+    accepted_client_key: PublicKey,
+    stdin_senders: HashMap<ChannelId, mpsc::UnboundedSender<Vec<u8>>>,
+}
+
+#[async_trait::async_trait]
+impl server::Handler for FakeShellHandler {
+    type Error = russh::Error;
+
+    async fn auth_publickey(&mut self, _user: &str, public_key: &PublicKey) -> Result<Auth, Self::Error> {
+        if public_key.key_data() == self.accepted_client_key.key_data() {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::Reject { proceed_with_methods: None })
+        }
+    }
+
+    async fn channel_open_session(
+        &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    async fn exec_request(&mut self, channel: ChannelId, data: &[u8], session: &mut ServerSession) -> Result<(), Self::Error> {
+        let command = String::from_utf8_lossy(data).into_owned();
+        let handle = session.handle();
+        let home = self.home.clone();
+
+        let mut child = TokioCommand::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .env("HOME", &home)
+            .stdin(StdStdio::piped())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped())
+            .spawn()
+            .expect("mock server failed to spawn sh -c for exec_request");
+
+        let mut child_stdin = child.stdin.take().expect("stdin piped");
+        let mut child_stdout = child.stdout.take().expect("stdout piped");
+        let mut child_stderr = child.stderr.take().expect("stderr piped");
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        self.stdin_senders.insert(channel, tx);
+
+        tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if child_stdin.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            let _ = child_stdin.shutdown().await;
+        });
+
+        tokio::spawn(async move {
+            let (stdout_res, stderr_res, wait_res) =
+                tokio::join!(read_all(&mut child_stdout), read_all(&mut child_stderr), child.wait());
+
+            if let Ok(out) = stdout_res {
+                if !out.is_empty() {
+                    let _ = handle.data(channel, CryptoVec::from(out)).await;
+                }
+            }
+            if let Ok(err) = stderr_res {
+                if !err.is_empty() {
+                    let _ = handle.extended_data(channel, 1, CryptoVec::from(err)).await;
+                }
+            }
+            let code = wait_res.ok().and_then(|s| s.code()).unwrap_or(1) as u32;
+            let _ = handle.exit_status_request(channel, code).await;
+            let _ = handle.eof(channel).await;
+            let _ = handle.close(channel).await;
+        });
+
+        session.channel_success(channel)?;
+        Ok(())
+    }
+
+    async fn data(&mut self, channel: ChannelId, data: &[u8], _session: &mut ServerSession) -> Result<(), Self::Error> {
+        if let Some(tx) = self.stdin_senders.get(&channel) {
+            let _ = tx.send(data.to_vec());
+        }
+        Ok(())
+    }
+
+    async fn channel_eof(&mut self, channel: ChannelId, _session: &mut ServerSession) -> Result<(), Self::Error> {
+        self.stdin_senders.remove(&channel);
+        Ok(())
+    }
+}
+
+async fn spawn_fake_ssh_server(home: PathBuf, accepted_client_key: PublicKey) -> SocketAddr {
+    let keypair = Ed25519Keypair::from_seed(&[42u8; 32]);
+    let host_key = PrivateKey::from(keypair);
+    let config = std::sync::Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+    let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut sh = FakeShellServer { home, accepted_client_key };
+    tokio::spawn(async move {
+        use server::Server as _;
+        let _ = sh.run_on_socket(config, &listener).await;
+    });
+    addr
+}
+
+/// Builds a `RusshBackend` wired to talk to the test server using the
+/// generated test identity and a throwaway trust store, always accepting
+/// the (never-before-seen, by construction) host key — test-only, mirrors
+/// `openssh_e2e.rs::test_backend`'s `-o StrictHostKeyChecking=no`.
+fn test_backend(tmp: &Path, key_path: &Path) -> RusshBackend {
+    RusshBackend::new()
+        .expect("RusshBackend::new should succeed (only fails if the real trust store path can't be determined)")
+        .with_store_path(tmp.join("known_ssh_hosts.toml"))
+        .with_confirm_new_host(std::sync::Arc::new(|_fingerprint| true))
+        .with_identity_file(key_path.to_path_buf())
+}
+
+fn dummy_relay_spec() -> RelayLaunchSpec {
+    RelayLaunchSpec {
+        relay_addr: "127.0.0.1:1".parse().unwrap(),
+        relay_sni: "relay.isekai-ssh.test".to_string(),
+        relay_jwt: "test-jwt-token".to_string(),
+        relay_transport: isekai_bootstrap::RelayTransportKind::Udp,
+        idle_lifetime_secs: 2_592_000,
+        remote_log_level: "info".to_string(),
+    }
+}
+
+const VALID_BOOTSTRAP_REPORT_JSON: &str = r#"{"v":2,"session_id":"00000000000000000000000000000000","bootstrap_attempt_id":"11111111111111111111111111111111","handshake":{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"}]}}"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn install_and_start_gets_a_real_handshake_over_russh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home, client_pubkey).await;
+
+    let fake_helper_script = format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n");
+
+    let backend = test_backend(tmp.path(), &key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None, &[]),
+    )
+    .await
+    .expect("install_and_start should not hang")
+    .expect("install_and_start should succeed against the mock server");
+
+    assert_eq!(report.handshake.v, 1);
+    assert_eq!(report.handshake.direct_by_bootstrap_host_port(), Some(45231));
+    assert_eq!(report.handshake.cert_sha256().len(), 64);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn install_and_start_reuses_an_already_running_helper_on_a_second_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home, client_pubkey).await;
+    // A real (long-running) helper stand-in: writes its own handshake once,
+    // then sleeps, matching real `isekai-pipe serve`'s "print handshake,
+    // then keep running" shape closely enough for the reuse-detection path
+    // (still-alive pid + matching sha256 + matching fingerprint) to kick in
+    // on the second `install_and_start` call.
+    let fake_helper_script = format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\nsleep 30\n");
+
+    let backend = test_backend(tmp.path(), &key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+    let launch = LaunchSpec::Relay(dummy_relay_spec());
+
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], fake_helper_script.as_bytes(), &launch, None, &[]),
+    )
+    .await
+    .expect("first install_and_start should not hang")
+    .expect("first install_and_start should succeed");
+
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], fake_helper_script.as_bytes(), &launch, None, &[]),
+    )
+    .await
+    .expect("second install_and_start should not hang")
+    .expect("second install_and_start should succeed (reuse path)");
+
+    assert_eq!(first.handshake, second.handshake, "the second call should reuse the still-running helper, not relaunch it");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn install_and_start_rejects_a_multi_hop_via_chain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let server_addr = spawn_fake_ssh_server(home, client_pubkey).await;
+
+    let backend = test_backend(tmp.path(), &key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+    let via = [JumpSpec::new("bastion-a"), JumpSpec::new("bastion-b")];
+
+    let err = backend
+        .install_and_start(&target, &via, b"unused", &LaunchSpec::Relay(dummy_relay_spec()), None, &[])
+        .await
+        .expect_err("a 2-hop via chain must be rejected, not silently truncated to one hop");
+    assert!(matches!(err, isekai_bootstrap::BootstrapError::UnsupportedViaChain { hops: 2 }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detect_remote_arch_normalizes_this_machines_own_uname_m() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home, client_pubkey).await;
+    let backend = test_backend(tmp.path(), &key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+
+    let arch = tokio::time::timeout(std::time::Duration::from_secs(20), backend.detect_remote_arch(&target, &[]))
+        .await
+        .expect("detect_remote_arch should not hang")
+        .expect("detect_remote_arch should succeed against the mock server");
+
+    let expected = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => panic!("this test machine's own arch {other:?} isn't one this test can assert against"),
+    };
+    assert_eq!(arch, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn install_and_start_fails_with_a_wrong_client_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_accepted_key_path, accepted_pubkey) = generate_client_keypair(tmp.path());
+    let (wrong_key_path, _wrong_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home, accepted_pubkey).await;
+    let backend = test_backend(tmp.path(), &wrong_key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], b"unused", &LaunchSpec::Relay(dummy_relay_spec()), None, &[]),
+    )
+    .await
+    .expect("install_and_start should not hang even on auth failure");
+    assert!(result.is_err(), "a key the server never accepted must fail authentication, not silently proceed");
+}

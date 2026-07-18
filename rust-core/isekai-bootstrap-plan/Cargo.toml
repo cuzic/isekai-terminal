@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 isekai-bootstrap = { path = "../isekai-bootstrap" }
+russh-stream-session = { path = "../russh-stream-session" }
 thiserror = "2.0.18"
 
 [dev-dependencies]

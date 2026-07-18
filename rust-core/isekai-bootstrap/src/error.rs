@@ -73,4 +73,53 @@ pub enum BootstrapError {
     /// architectures, same `"aarch64"`/`"arm64"` aliasing.
     #[error("unsupported remote architecture {0:?} (uname -m)")]
     UnsupportedArch(String),
+
+    // ── `RusshBackend`-only variants below (`fancy-humming-pnueli.md` M3) ──
+    /// `RusshBackend`'s `via` chain had more than one hop. Only 0-hop
+    /// (direct) and single-hop chains are supported so far —
+    /// `russh_stream_session::connect_via_jump_or_direct`'s `JumpHost` is
+    /// itself single-hop (`OpenSshBackend`, by contrast, hands an arbitrary
+    /// chain straight to `ssh(1)`'s own multi-hop `-J host1,host2,...`
+    /// support, which has no native-path equivalent yet).
+    #[error("RusshBackend does not yet support a multi-hop via chain ({hops} hops given, only 0 or 1 supported)")]
+    UnsupportedViaChain { hops: usize },
+
+    /// No username was available for `host` — no explicit `HostSpec`/
+    /// `JumpSpec::user`, no `ssh_config(5)` `User` for that host, and
+    /// neither `$USER` nor `%USERNAME%` is set. `ssh(1)` would fall back to
+    /// the local account name via the OS user database in this situation;
+    /// `RusshBackend` doesn't have an equivalent OS-level lookup wired in
+    /// (matches `isekai-ssh`'s own native connect path's same limitation).
+    #[error("no username available for {host:?} (no ssh_config User, $USER, or %USERNAME%)")]
+    NoUsername { host: String },
+
+    /// No usable `IdentityFile` was found for `host` (checked `ssh_config(5)`
+    /// `IdentityFile` entries, then the default `id_ed25519`→`id_rsa`→
+    /// `id_ecdsa` probe order) — SSH agent authentication is not yet wired
+    /// into `RusshBackend` (documented follow-up), so a missing private key
+    /// file means there is nothing left to authenticate with.
+    #[error("no usable private key found for {host:?}: {detail}")]
+    NoCredential { host: String, detail: String },
+
+    /// Resolving `~/.ssh/config` for `host` via the `openssh-config` crate
+    /// failed (e.g. the file exists but isn't readable).
+    #[error("failed to resolve ssh config for {host:?}: {detail}")]
+    ConfigResolve { host: String, detail: String },
+
+    /// Connecting, authenticating, or opening a channel over `russh` failed
+    /// — wraps `russh_stream_session::SessionError` (host-key rejection,
+    /// handshake failure, auth failure, jump-host tunnel failure, etc.).
+    #[error("russh session error: {0}")]
+    Session(#[from] russh_stream_session::SessionError),
+
+    /// Determining the current user's home directory (for the default
+    /// `IdentityFile` probe order, and for the SSH host-key trust store
+    /// path) failed.
+    #[error("could not determine the home directory")]
+    NoHomeDir,
+
+    /// Determining or creating the SSH host-key trust store path
+    /// (`isekai_trust::default_ssh_host_key_trust_store_path`) failed.
+    #[error("could not determine the SSH host key trust store path: {0}")]
+    TrustStorePath(String),
 }

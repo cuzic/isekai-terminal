@@ -1557,12 +1557,16 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "isekai-fs-guard",
  "isekai-protocol",
  "isekai-stun",
+ "isekai-trust",
  "log",
+ "openssh-config",
  "rand 0.8.6",
  "russh",
  "russh-keys",
+ "russh-stream-session",
  "serde_json",
  "sha2",
  "tempfile",
@@ -1576,6 +1580,7 @@ version = "0.1.0"
 dependencies = [
  "isekai-bootstrap",
  "isekai-protocol",
+ "russh-stream-session",
  "thiserror 2.0.18",
 ]
 
