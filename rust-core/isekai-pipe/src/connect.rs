@@ -722,9 +722,9 @@ async fn recover_via_cross_family_fallback(
         id: "cross-family-fallback",
     };
     // Unlike `intent.transport`, `intent.cross_family_fallback` never passes
-    // through `TryFrom<&ConnectionIntent> for CandidateDraft` — it's read
-    // directly here, so it needs its own validation checkpoint rather than
-    // trusting the raw persisted strings.
+    // through `TryFrom<&isekai_transport::TransportIntent> for CandidateDraft`
+    // — it's read directly here, so it needs its own validation checkpoint
+    // rather than trusting the raw persisted strings.
     let (cert_pin, server_name) =
         isekai_pipe_core::validate_endpoint_identity(&intent.expected_server_identity.cert_sha256_hex, server_name)
             .context("isekai-pipe connect: cross_family_fallback has an invalid identity")?;
@@ -766,10 +766,15 @@ fn intent_session_secret_b64(transport: &IntentTransport) -> &str {
 /// point (including which transport variant to dial) reads `candidate.route`,
 /// not `intent.transport`, directly.
 async fn resolve_single_candidate(intent: &ConnectionIntent) -> Result<Candidate> {
+    // `isekai_transport::candidate_provider` reads a `TransportIntent`
+    // (`#31`), not this crate's SSH-specific `ConnectionIntent` — convert at
+    // this boundary so `isekai-transport` never needs to depend on
+    // `isekai-pipe-core`.
+    let transport_intent = intent.to_transport_intent();
     let ctx = GatherContext {
         generation: CandidateGeneration::INITIAL,
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
-        intent,
+        intent: &transport_intent,
     };
     let batch = isekai_transport::LegacyIntentProvider
         .gather(&ctx)
@@ -803,10 +808,11 @@ async fn resolve_relay_candidates(
     intent: &ConnectionIntent,
     session_secret: &[u8],
 ) -> Result<Vec<SequentialRelayCandidate>> {
+    let transport_intent = intent.to_transport_intent();
     let ctx = GatherContext {
         generation: CandidateGeneration::INITIAL,
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
-        intent,
+        intent: &transport_intent,
     };
     let batch = ConfigRelayProvider
         .gather(&ctx)
@@ -865,10 +871,11 @@ async fn resolve_stun_candidates(
         anyhow::bail!("isekai-pipe connect: resolve_stun_candidates requires an IntentTransport::StunP2p intent (bug)");
     };
 
+    let transport_intent = intent.to_transport_intent();
     let ctx = GatherContext {
         generation: CandidateGeneration::INITIAL,
         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
-        intent,
+        intent: &transport_intent,
     };
     let batch = ConfigStunProvider
         .gather(&ctx)

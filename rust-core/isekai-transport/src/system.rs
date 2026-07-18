@@ -65,6 +65,11 @@ pub fn isekai_mux_config(multipath: bool) -> MuxClientConfig {
         max_concurrent_bidi_streams: MAX_CONCURRENT_BIDI_STREAMS,
         max_concurrent_uni_streams: MAX_CONCURRENT_UNI_STREAMS,
         multipath,
+        // isekai-ssh/isekai-pipe's SSH tunnel never sends QUIC datagrams
+        // today — this is plumbing for a future, currently-unrelated
+        // consumer (see `quicmux`'s `MuxClientConfig::datagram_send_buffer_size`
+        // docs), not a product feature this crate uses yet.
+        datagram_send_buffer_size: None,
     }
 }
 

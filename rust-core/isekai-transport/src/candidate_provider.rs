@@ -1,8 +1,11 @@
 //! `CandidateProvider`: the async I/O boundary that discovers candidates
 //! (`ISEKAI_PIPE_DESIGN.md`, ChatGPT second-opinion consultations
-//! 2026-07-08). Pure candidate value types live in
-//! `isekai_pipe_core::candidate` — this module only adds the runtime trait
-//! and its first (legacy) implementation.
+//! 2026-07-08). Pure candidate value types live in `crate::candidate` — this
+//! module only adds the runtime trait and its first (legacy) implementation.
+//! Reads a [`TransportIntent`] (not `isekai-pipe-core`'s SSH-specific
+//! `ConnectionIntent`, `#31`) — a caller that has a `ConnectionIntent`
+//! converts it via `isekai_pipe_core::ConnectionIntent::to_transport_intent`
+//! before calling `gather`.
 //!
 //! v1 is deliberately a one-shot async batch fetch, not a stream:
 //!
@@ -19,9 +22,9 @@
 //! plane that pushes new endpoints mid-session), add a separate
 //! `TrickleCandidateProvider` trait rather than reshaping this one.
 
-use isekai_pipe_core::{
+use crate::candidate::{
     CandidateConversionError, CandidateDraft, CandidateDraftBatch, CandidateGeneration, CandidateOrigin,
-    CandidateOriginKind, CandidatePriority, CandidateRoute, CandidateValidity, ConnectionIntent, IntentTransport,
+    CandidateOriginKind, CandidatePriority, CandidateRoute, CandidateValidity, TransportIntent, TransportRoute,
 };
 use tokio::time::Instant;
 
@@ -35,27 +38,27 @@ pub struct GatherContext<'a> {
     /// relay control plane) need a budget to bound how long they'll wait
     /// before returning whatever they've found so far.
     pub deadline: Instant,
-    pub intent: &'a ConnectionIntent,
+    pub intent: &'a TransportIntent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CandidateProviderError {
-    /// `IntentTransport` → `CandidateDraft` conversion failed (malformed
-    /// `ConnectionIntent` data — see `CandidateConversionError`'s variants).
+    /// `TransportRoute` → `CandidateDraft` conversion failed (malformed
+    /// `TransportIntent` data — see `CandidateConversionError`'s variants).
     Conversion(CandidateConversionError),
-    /// An entry in `ConnectionIntent::relay_endpoints` (`ConfigRelayProvider`)
+    /// An entry in `TransportIntent::relay_endpoints` (`ConfigRelayProvider`)
     /// could not be turned into a relay candidate — either it did not parse as
     /// a `SocketAddr`, or the shared cert pin / server name was itself
     /// malformed. `entry` names the offending endpoint string so a
     /// misconfiguration points at the exact input.
     InvalidRelayEndpoint { entry: String, reason: String },
-    /// An entry in `ConnectionIntent::stun_servers` (`ConfigStunProvider`,
+    /// An entry in `TransportIntent::stun_servers` (`ConfigStunProvider`,
     /// `#11`) could not be turned into a STUN-P2P candidate — either it did
     /// not parse as a `SocketAddr`, or the shared cert pin / peer address /
-    /// server name (from `IntentTransport::StunP2p`) was itself malformed.
+    /// server name (from `TransportRoute::StunP2p`) was itself malformed.
     InvalidStunServer { entry: String, reason: String },
-    /// `ConnectionIntent::stun_servers` was non-empty, but `intent.transport`
-    /// was not `IntentTransport::StunP2p` — there is no `peer_addr`/
+    /// `TransportIntent::stun_servers` was non-empty, but `intent.transport`
+    /// was not `TransportRoute::StunP2p` — there is no `peer_addr`/
     /// `server_name` to pair the configured STUN servers with. Today's only
     /// producer of `stun_servers` (`isekai-ssh/src/wrapper.rs`'s `#@isekai
     /// stun` directive) always builds a `Relay` transport, so this is
@@ -78,7 +81,7 @@ impl std::fmt::Display for CandidateProviderError {
                 write!(f, "invalid stun server {entry:?}: {reason}")
             }
             Self::StunServersWithoutStunP2pTransport => {
-                write!(f, "ConnectionIntent.stun_servers is non-empty but intent.transport is not StunP2p")
+                write!(f, "TransportIntent.stun_servers is non-empty but intent.transport is not StunP2p")
             }
         }
     }
@@ -101,9 +104,9 @@ pub trait CandidateProvider: Send + Sync {
     async fn gather(&self, ctx: &GatherContext<'_>) -> Result<CandidateDraftBatch, CandidateProviderError>;
 }
 
-/// Converts the legacy single-transport `ConnectionIntent` into exactly one
-/// `CandidateDraft` (`isekai_pipe_core::candidate`'s `TryFrom` impl does the
-/// actual pure conversion; this type just exposes it through the async
+/// Converts the legacy single-transport `TransportIntent` into exactly one
+/// `CandidateDraft` (`crate::candidate`'s `TryFrom` impl does the actual pure
+/// conversion; this type just exposes it through the async
 /// `CandidateProvider` trait boundary). Does not change any connection
 /// behavior by itself — it exists so the rest of the candidate pipeline
 /// (`CandidatePool`, the connection entry point) can be built and tested
@@ -125,7 +128,7 @@ impl CandidateProvider for LegacyIntentProvider {
 /// `helper_addr`/priority rank, not by `provider_id`.
 pub const CONFIG_RELAY_PROVIDER_ID: &str = "config-relay";
 
-/// Expands `ConnectionIntent::relay_endpoints` — a list of alternate
+/// Expands `TransportIntent::relay_endpoints` — a list of alternate
 /// already-resolved relay-assigned addresses for the *same* isekai-helper
 /// instance (same cert pin, session secret, and server name) — into one relay
 /// [`CandidateDraft`] per entry, for relay-endpoint fallback (`#12`).
@@ -133,7 +136,7 @@ pub const CONFIG_RELAY_PROVIDER_ID: &str = "config-relay";
 /// Vec order is preference order: entry index becomes the
 /// [`CandidatePriority`] rank (index 0 = rank 0 = most preferred), so a caller
 /// can list its primary relay address first and its fallbacks after. Every
-/// entry shares `ConnectionIntent::expected_server_identity.cert_sha256_hex`
+/// entry shares `TransportIntent::expected_server_identity_cert_sha256_hex`
 /// as its cert pin and the literal `"isekai-helper"` server name, matching the
 /// hardcoded relay-mode convention used elsewhere (`isekai-ssh/src/wrapper.rs`,
 /// `isekai-pipe`'s `intent_from_profile`).
@@ -151,8 +154,8 @@ impl CandidateProvider for ConfigRelayProvider {
         let mut candidates = Vec::with_capacity(intent.relay_endpoints.len());
 
         for (index, entry) in intent.relay_endpoints.iter().enumerate() {
-            let (cert_pin, server_name) = isekai_pipe_core::validate_endpoint_identity(
-                &intent.expected_server_identity.cert_sha256_hex,
+            let (cert_pin, server_name) = crate::candidate::validate_endpoint_identity(
+                &intent.expected_server_identity_cert_sha256_hex,
                 "isekai-helper",
             )
             .map_err(|e| CandidateProviderError::InvalidRelayEndpoint { entry: entry.clone(), reason: e.to_string() })?;
@@ -182,13 +185,13 @@ impl CandidateProvider for ConfigRelayProvider {
 /// `stun_server` field / priority rank, not by `provider_id`.
 pub const CONFIG_STUN_PROVIDER_ID: &str = "config-stun";
 
-/// Expands `ConnectionIntent::stun_servers` — a list of alternate STUN
+/// Expands `TransportIntent::stun_servers` — a list of alternate STUN
 /// servers to use when learning this side's own observed address before
 /// hole-punching toward the *same* peer (`#11`) — into one STUN-P2P
 /// [`CandidateDraft`] per entry.
 ///
 /// `peer_addr`/`server_name` come from `intent.transport`
-/// (`IntentTransport::StunP2p`'s own fields, shared by every candidate this
+/// (`TransportRoute::StunP2p`'s own fields, shared by every candidate this
 /// provider produces — only `stun_server` varies per entry, matching
 /// `CandidateRoute::StunP2p`'s dedup-identity docs). If `intent.transport` is
 /// not `StunP2p` while `stun_servers` is non-empty, there is no `peer_addr`
@@ -215,14 +218,14 @@ impl CandidateProvider for ConfigStunProvider {
             return Ok(CandidateDraftBatch { generation: ctx.generation, candidates: Vec::new() });
         }
 
-        let IntentTransport::StunP2p { peer_addr, server_name, .. } = &intent.transport else {
+        let TransportRoute::StunP2p { peer_addr, server_name, .. } = &intent.transport else {
             return Err(CandidateProviderError::StunServersWithoutStunP2pTransport);
         };
 
         let mut candidates = Vec::with_capacity(intent.stun_servers.len());
         for (index, entry) in intent.stun_servers.iter().enumerate() {
             let (cert_pin, server_name) =
-                isekai_pipe_core::validate_endpoint_identity(&intent.expected_server_identity.cert_sha256_hex, server_name).map_err(
+                crate::candidate::validate_endpoint_identity(&intent.expected_server_identity_cert_sha256_hex, server_name).map_err(
                     |e| {
                         // `server_name` here comes from `intent.transport`, not
                         // from `entry` (the current loop iteration's stun
@@ -268,20 +271,17 @@ impl CandidateProvider for ConfigStunProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use isekai_pipe_core::{BootstrapProvenance, IntentTransport, ServerIdentity};
 
-    fn sample_intent() -> ConnectionIntent {
-        ConnectionIntent::new(
-            "production",
-            "ssh",
-            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
-            IntentTransport::Relay {
+    fn sample_intent() -> TransportIntent {
+        TransportIntent {
+            expected_server_identity_cert_sha256_hex: "ab".repeat(32),
+            transport: TransportRoute::Relay {
                 helper_addr: "203.0.113.5:45231".to_string(),
                 server_name: "isekai-helper".to_string(),
-                session_secret_b64: "c2VjcmV0".to_string(),
             },
-            BootstrapProvenance::TrustStore { key: "production:22".to_string() },
-        )
+            relay_endpoints: Vec::new(),
+            stun_servers: Vec::new(),
+        }
     }
 
     #[tokio::test]
@@ -298,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_intent_provider_surfaces_conversion_errors() {
         let mut intent = sample_intent();
-        intent.expected_server_identity.cert_sha256_hex = "not-hex".to_string();
+        intent.expected_server_identity_cert_sha256_hex = "not-hex".to_string();
         let ctx = GatherContext { generation: CandidateGeneration::INITIAL, deadline: Instant::now(), intent: &intent };
 
         let err = LegacyIntentProvider.gather(&ctx).await.unwrap_err();
@@ -387,19 +387,17 @@ mod tests {
         }
     }
 
-    fn sample_stun_intent() -> ConnectionIntent {
-        ConnectionIntent::new(
-            "production",
-            "ssh",
-            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
-            IntentTransport::StunP2p {
+    fn sample_stun_intent() -> TransportIntent {
+        TransportIntent {
+            expected_server_identity_cert_sha256_hex: "ab".repeat(32),
+            transport: TransportRoute::StunP2p {
                 stun_server: "192.0.2.1:3478".to_string(),
                 peer_addr: "203.0.113.5:45231".to_string(),
                 server_name: "isekai-helper".to_string(),
-                session_secret_b64: "c2VjcmV0".to_string(),
             },
-            BootstrapProvenance::TrustStore { key: "production:22".to_string() },
-        )
+            relay_endpoints: Vec::new(),
+            stun_servers: Vec::new(),
+        }
     }
 
     fn stun_route(batch: &CandidateDraftBatch, index: usize) -> &CandidateRoute {

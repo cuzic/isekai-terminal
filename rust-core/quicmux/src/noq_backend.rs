@@ -119,6 +119,7 @@ pub fn noq_client_config(cert_sha256_hex: &str, config: &MuxClientConfig) -> Res
         // number of secondaries a typical caller opens".
         transport.max_concurrent_multipath_paths(8);
     }
+    apply_datagram_config(&mut transport, config.datagram_send_buffer_size);
 
     let mut client_config = noq::ClientConfig::new(Arc::new(quic_crypto));
     client_config.transport_config(Arc::new(transport));
@@ -167,10 +168,52 @@ pub fn noq_server_config(config: &MuxServerConfig) -> Result<noq::ServerConfig, 
     if config.multipath {
         transport.max_concurrent_multipath_paths(8);
     }
+    apply_datagram_config(&mut transport, config.datagram_send_buffer_size);
 
     let mut server_config = noq::ServerConfig::with_crypto(Arc::new(quic_crypto));
     server_config.transport_config(Arc::new(transport));
     Ok(server_config)
+}
+
+/// Applies [`MuxClientConfig::datagram_send_buffer_size`]/
+/// [`MuxServerConfig::datagram_send_buffer_size`] to a `noq::TransportConfig`
+/// being built for either side — shared by [`noq_client_config`] and
+/// [`noq_server_config`] so the two can't drift. `None` disables incoming
+/// datagrams outright (`datagram_receive_buffer_size(None)`, `noq`/quinn's
+/// own convention for "refuse them"); `Some(bytes)` sets the outbound send
+/// buffer to `bytes` and leaves the receive buffer at `noq`'s own default
+/// (`Some(STREAM_RWND)`) rather than this crate inventing its own default —
+/// see [`crate::MuxClientConfig::datagram_send_buffer_size`]'s docs for why
+/// only the send side is caller-tunable today.
+fn apply_datagram_config(transport: &mut noq::TransportConfig, datagram_send_buffer_size: Option<usize>) {
+    match datagram_send_buffer_size {
+        Some(send_buffer_size) => {
+            transport.datagram_send_buffer_size(send_buffer_size);
+        }
+        None => {
+            transport.datagram_receive_buffer_size(None);
+        }
+    }
+}
+
+/// Maps a `noq::SendDatagramError` (from `send_datagram`/`send_datagram_wait`)
+/// onto this crate's backend-agnostic [`MuxError`]. Takes the payload's
+/// length and the connection's `max_datagram_size()` at call time so
+/// [`MuxError::DatagramTooLarge`] can report concrete sizes — `noq`'s own
+/// error variant carries neither (see [`noq::SendDatagramError::TooLarge`]'s
+/// docs).
+fn map_send_datagram_error(e: noq::SendDatagramError, payload_len: usize, max: Option<usize>) -> MuxError {
+    match e {
+        noq::SendDatagramError::UnsupportedByPeer => {
+            MuxError::Unsupported { operation: "send_datagram", reason: "peer does not support receiving datagrams" }
+        }
+        noq::SendDatagramError::Disabled => MuxError::Unsupported {
+            operation: "send_datagram",
+            reason: "datagram support is disabled locally (MuxClientConfig::datagram_send_buffer_size was None)",
+        },
+        noq::SendDatagramError::TooLarge => MuxError::DatagramTooLarge { size: payload_len, max: max.unwrap_or(0) },
+        noq::SendDatagramError::ConnectionLost(e) => map_connection_error(e),
+    }
 }
 
 /// Maps a `noq::ConnectionError` (whole-connection failure) onto this
@@ -430,6 +473,23 @@ pub struct NoqConnection {
 }
 
 impl NoqConnection {
+    /// Wraps an already-established `noq::Connection` obtained outside this
+    /// crate's own `NoqFactory`/`NoqEndpoint`/`NoqListener` connect/accept
+    /// path, so a caller holding such a connection can still reach this
+    /// crate's datagram API (`AnyMuxConnection::send_datagram` et al.)
+    /// without re-implementing it against the raw `noq` type itself.
+    ///
+    /// Concrete example: `isekai_transport::MultipathConnection::conn`,
+    /// which `isekai-transport::multipath` builds by driving
+    /// `noq::Endpoint`/`noq::Connection::open_path` directly (deliberately
+    /// "noq-concrete", not built through this crate — see that module's own
+    /// docs on why).
+    pub fn from_connection(conn: noq::Connection) -> Self {
+        Self { conn }
+    }
+}
+
+impl NoqConnection {
     pub(crate) async fn open_bi(&self) -> Result<NoqByteStream, MuxError> {
         let (send, recv) = self.conn.open_bi().await.map_err(map_connection_error)?;
         Ok(NoqByteStream { send, recv })
@@ -465,6 +525,37 @@ impl NoqConnection {
         let mut out = [0u8; 32];
         self.conn.export_keying_material(&mut out, label, context).map_err(|e| MuxError::ExportKeyingMaterial(format!("{e:?}")))?;
         Ok(out)
+    }
+
+    /// See [`crate::AnyMuxConnection::send_datagram`]. Non-blocking:
+    /// `noq::Connection::send_datagram` sheds its own oldest still-unsent
+    /// datagram to make room when the send buffer is full (newest-wins).
+    pub(crate) fn send_datagram(&self, data: bytes::Bytes) -> Result<(), MuxError> {
+        let len = data.len();
+        let max = self.conn.max_datagram_size();
+        self.conn.send_datagram(data).map_err(|e| map_send_datagram_error(e, len, max))
+    }
+
+    /// See [`crate::AnyMuxConnection::send_datagram_wait`].
+    pub(crate) async fn send_datagram_wait(&self, data: bytes::Bytes) -> Result<(), MuxError> {
+        let len = data.len();
+        let max = self.conn.max_datagram_size();
+        self.conn.send_datagram_wait(data).await.map_err(|e| map_send_datagram_error(e, len, max))
+    }
+
+    /// See [`crate::AnyMuxConnection::recv_datagram`].
+    pub(crate) async fn recv_datagram(&self) -> Result<bytes::Bytes, MuxError> {
+        self.conn.read_datagram().await.map_err(map_connection_error)
+    }
+
+    /// See [`crate::AnyMuxConnection::max_datagram_size`].
+    pub(crate) fn max_datagram_size(&self) -> Option<usize> {
+        self.conn.max_datagram_size()
+    }
+
+    /// See [`crate::AnyMuxConnection::datagram_send_buffer_space`].
+    pub(crate) fn datagram_send_buffer_space(&self) -> usize {
+        self.conn.datagram_send_buffer_space()
     }
 }
 
@@ -577,6 +668,7 @@ mod tests {
             max_concurrent_bidi_streams: 1,
             max_concurrent_uni_streams: 0,
             multipath: false,
+            datagram_send_buffer_size: None,
         }
     }
 
@@ -633,6 +725,109 @@ mod tests {
 
         let keying = conn.export_keying_material(b"test-label", b"").await.expect("export_keying_material failed");
         assert_eq!(keying.len(), 32);
+
+        conn.close().await;
+    }
+
+    fn test_config_with_datagrams() -> MuxClientConfig {
+        MuxClientConfig { datagram_send_buffer_size: Some(64 * 1024), ..test_config() }
+    }
+
+    /// Like [`start_echo_server`], but echoes datagrams instead of stream
+    /// bytes — and enables datagrams on the listener side via
+    /// [`test_server_config_with_datagrams`].
+    async fn start_datagram_echo_server() -> (SocketAddr, String) {
+        let (server_config, cert_sha256_hex) = test_server_config_with_datagrams();
+        let listener = NoqListener::bind(server_config, BindSpec::any_ipv4()).await.unwrap();
+        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
+
+        tokio::spawn(async move {
+            let Some(incoming) = listener.accept().await else { return };
+            let Ok(conn) = incoming.accept().await else { return };
+            while let Ok(datagram) = conn.recv_datagram().await {
+                let _ = conn.send_datagram(datagram);
+            }
+        });
+
+        (local_addr, cert_sha256_hex)
+    }
+
+    fn test_server_config_with_datagrams() -> (MuxServerConfig, String) {
+        let (mut config, cert_sha256_hex) = test_server_config();
+        config.datagram_send_buffer_size = Some(64 * 1024);
+        (config, cert_sha256_hex)
+    }
+
+    #[tokio::test]
+    async fn send_datagram_and_recv_datagram_roundtrip() {
+        let (server_addr, cert_sha256_hex) = start_datagram_echo_server().await;
+
+        let factory = NoqFactory::new(test_config_with_datagrams());
+        let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint failed");
+        let conn = endpoint
+            .connect(RemoteSpec { addr: server_addr, server_name: "quicmux-test.local".to_string(), cert_sha256_hex })
+            .await
+            .expect("connect failed");
+
+        assert!(conn.max_datagram_size().is_some(), "datagrams should be enabled on both sides");
+
+        conn.send_datagram(bytes::Bytes::from_static(b"hello datagram")).expect("send_datagram failed");
+        // Codexレビュー(2026-07-17): a lost/dropped echo would otherwise hang
+        // this test forever instead of failing it.
+        let echoed = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv_datagram())
+            .await
+            .expect("timed out waiting for the echoed datagram")
+            .expect("recv_datagram failed");
+        assert_eq!(&echoed[..], b"hello datagram");
+
+        conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn max_datagram_size_is_none_when_datagrams_disabled_by_config() {
+        // Both sides use `test_config()`/`test_server_config()` — datagrams
+        // disabled by default (`datagram_send_buffer_size: None`) — so
+        // neither side should be able to negotiate them.
+        let (server_addr, cert_sha256_hex) = start_echo_server().await;
+
+        let factory = NoqFactory::new(test_config());
+        let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint failed");
+        let conn = endpoint
+            .connect(RemoteSpec { addr: server_addr, server_name: "quicmux-test.local".to_string(), cert_sha256_hex })
+            .await
+            .expect("connect failed");
+
+        assert_eq!(conn.max_datagram_size(), None);
+
+        match conn.send_datagram(bytes::Bytes::from_static(b"should not be deliverable")) {
+            Err(MuxError::Unsupported { .. }) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+
+        conn.close().await;
+    }
+
+    #[tokio::test]
+    async fn send_datagram_larger_than_max_size_is_rejected() {
+        let (server_addr, cert_sha256_hex) = start_datagram_echo_server().await;
+
+        let factory = NoqFactory::new(test_config_with_datagrams());
+        let endpoint = factory.create_endpoint(BindSpec::any_ipv4()).await.expect("create_endpoint failed");
+        let conn = endpoint
+            .connect(RemoteSpec { addr: server_addr, server_name: "quicmux-test.local".to_string(), cert_sha256_hex })
+            .await
+            .expect("connect failed");
+
+        let max = conn.max_datagram_size().expect("datagrams should be enabled");
+        let oversized = bytes::Bytes::from(vec![0u8; max + 1]);
+
+        match conn.send_datagram(oversized) {
+            Err(MuxError::DatagramTooLarge { size, max: reported_max }) => {
+                assert_eq!(size, max + 1);
+                assert_eq!(reported_max, max);
+            }
+            other => panic!("expected DatagramTooLarge, got {other:?}"),
+        }
 
         conn.close().await;
     }
@@ -714,6 +909,7 @@ mod tests {
             max_concurrent_bidi_streams: 2,
             max_concurrent_uni_streams: 0,
             multipath: false,
+            datagram_send_buffer_size: None,
             cert_chain: vec![cert_der],
             private_key: key_der,
         };

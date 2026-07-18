@@ -7,6 +7,12 @@ description = "Core library skeleton for the future isekai-pipe data plane."
 
 [dependencies]
 isekai-pipe-protocol = { path = "../isekai-pipe-protocol" }
+# Candidateモデルのpure値型(CandidateDraft/CandidateDraftBatch等)は
+# isekai-transport側に移設した(`#31`、UAV OSS企画でisekai-transportを
+# 独立して切り出す際にこのcrateのSSH固有コード[デプロイ済みプロファイル
+# キャッシュ・ブートストラップ方針]を道連れにしないため)。一方向依存
+# (isekai-transportはisekai-pipe-coreに依存しない)。
+isekai-transport = { path = "../isekai-transport" }
 # Migration path from the legacy `known_helpers.toml` trust store
 # (`isekai_trust::schema::{TrustStore, HelperTrust}`) to the persistent
 # profile schema (`chatgpt.md` §13) -- see `profile.rs`.

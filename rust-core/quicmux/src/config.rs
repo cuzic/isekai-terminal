@@ -54,6 +54,32 @@ pub struct MuxClientConfig {
     /// which has no path/multipath concept (it runs over one TCP
     /// connection).
     pub multipath: bool,
+    /// Datagram (RFC 9221 — unreliable, unordered, no retransmission)
+    /// support. `None` disables datagrams for connections made through this
+    /// config: neither sending nor receiving is expected to work (`noq` maps
+    /// this to `TransportConfig::datagram_receive_buffer_size(None)`, the
+    /// `noq`/quinn convention for "refuse incoming datagrams" — see
+    /// `noq_backend`'s wiring). `Some(bytes)` enables datagrams, with `bytes`
+    /// as the local outbound send-buffer size (`noq`'s own
+    /// `TransportConfig::datagram_send_buffer_size`; the receive buffer
+    /// stays at `noq`'s own default). The `qmux` backend has no equivalent
+    /// byte-sized buffer of its own (its outbound/inbound queues are bounded
+    /// by frame count internally — see `qmux_backend`'s module docs) and
+    /// only uses the `Some`/`None` distinction to decide whether to
+    /// advertise `max_datagram_frame_size` at all. A caller must set this
+    /// explicitly, like every other field here — there is no crate default
+    /// (see this module's docs).
+    ///
+    /// This crate has no way to enforce it, but a caller dialing/listening
+    /// with the same product policy on both sides should keep this in sync
+    /// between its [`MuxClientConfig`] and [`MuxServerConfig`] (mirroring the
+    /// existing convention for e.g. `alpn`/`max_concurrent_bidi_streams` —
+    /// see [`MuxServerConfig`]'s docs): [`crate::AnyMuxConnection::max_datagram_size`]
+    /// reflects what the *peer* is willing to receive, not this side's own
+    /// setting, so a caller that only disables datagrams on one side still
+    /// sees asymmetric (one-directional) datagram capability rather than the
+    /// clean "on" or "off" a matched pair gives.
+    pub datagram_send_buffer_size: Option<usize>,
 }
 
 /// Server-side connection tuning, supplied by the caller at listener
@@ -86,6 +112,8 @@ pub struct MuxServerConfig {
     pub max_concurrent_uni_streams: u32,
     /// See [`MuxClientConfig::multipath`].
     pub multipath: bool,
+    /// See [`MuxClientConfig::datagram_send_buffer_size`].
+    pub datagram_send_buffer_size: Option<usize>,
     /// The server's certificate chain (leaf first), presented during the TLS
     /// handshake. Every backend this crate supports authenticates the
     /// *client* by pinned SHA-256 fingerprint rather than a CA chain (see

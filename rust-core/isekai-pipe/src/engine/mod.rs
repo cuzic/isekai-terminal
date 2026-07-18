@@ -583,6 +583,9 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
         max_concurrent_bidi_streams: 2,
         max_concurrent_uni_streams: 0,
         multipath: true,
+        // `isekai-pipe serve`'s SSH tunnel never sends QUIC datagrams today
+        // — see `quicmux`'s `MuxClientConfig::datagram_send_buffer_size` docs.
+        datagram_send_buffer_size: None,
         cert_chain,
         private_key: key,
     };

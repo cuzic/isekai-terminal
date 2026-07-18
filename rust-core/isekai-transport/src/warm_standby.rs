@@ -54,7 +54,6 @@
 //!   session fail closed (`UnknownToken`) even if this guard somehow didn't
 //!   exist, since a session can only be "claimed" once server-side.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -208,31 +207,20 @@ impl WarmStandby {
 
     /// Binds (either OS-default or, if [`WarmStandby::new_bound_to_interface`]
     /// was used, restricted to `self.interface`) a fresh local socket and
-    /// dials `self.target`. Split out of [`WarmStandby::ensure_warm`] purely
-    /// so that method's "probe, and only dial if the probe failed" flow
-    /// isn't tangled up with the two different ways of obtaining an
-    /// endpoint.
+    /// dials `self.target`, via [`crate::physical_interface::connect_via_interface`]
+    /// (shared with [`crate::dual_path::connect_dual_path`], which needs the
+    /// exact same "maybe-interface-bound dial" step for its own two
+    /// connections). Also applies `self.target.local_bind_port_range`, the
+    /// same narrowed-outbound-port-range knob `relay.rs`/`race.rs`/
+    /// `resume.rs` already honor for their own dials — previously silently
+    /// ignored here.
     async fn dial(&self) -> Result<AnyMuxConnection, TransportError> {
-        let endpoint = match self.interface {
-            None => self.factory.create_endpoint(quicmux::BindSpec::any_ipv4()).await.map_err(TransportError::Mux)?,
-            Some(interface) => {
-                let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-                let std_socket = crate::physical_interface::bind_physical_interface(interface, local_addr)
-                    .map_err(|source| TransportError::Mux(MuxError::Bind { addr: local_addr, source }))?;
-                std_socket.set_nonblocking(true).map_err(|e| TransportError::Mux(MuxError::SocketSetup(e.to_string())))?;
-                let tokio_socket =
-                    tokio::net::UdpSocket::from_std(std_socket).map_err(|e| TransportError::Mux(MuxError::SocketSetup(e.to_string())))?;
-                self.factory.wrap_bound_socket(tokio_socket).await.map_err(TransportError::Mux)?
-            }
+        let remote = RemoteSpec {
+            addr: self.target.helper_addr,
+            server_name: self.target.server_name.clone(),
+            cert_sha256_hex: self.target.cert_sha256_hex.clone(),
         };
-        endpoint
-            .connect(RemoteSpec {
-                addr: self.target.helper_addr,
-                server_name: self.target.server_name.clone(),
-                cert_sha256_hex: self.target.cert_sha256_hex.clone(),
-            })
-            .await
-            .map_err(TransportError::Mux)
+        crate::physical_interface::connect_via_interface(&self.factory, self.interface, remote, self.target.local_bind_port_range).await
     }
 
     /// Promotes the standby connection: issues a `quicmux::resume` RESUME
@@ -336,6 +324,7 @@ mod tests {
             max_concurrent_bidi_streams: 4,
             max_concurrent_uni_streams: 0,
             multipath: false,
+            datagram_send_buffer_size: None,
             cert_chain: vec![cert_der],
             private_key: key_der,
         };

@@ -1,9 +1,15 @@
 //! Pure value types for the Candidate model (`ISEKAI_PIPE_DESIGN.md`,
 //! ChatGPT second-opinion consultations 2026-07-08). This module only
 //! defines *what a candidate is* — nothing here touches I/O, `tokio`, or
-//! `noq`. The runtime pieces (`CandidateProvider`, `CandidatePool`,
-//! connection establishment) live in `isekai-transport`, which depends on
-//! this crate rather than the other way around.
+//! `noq`. Originally lived in `isekai-pipe-core` (`isekai-pipe-core` used to
+//! depend on nothing, and `isekai-transport` depended on it); moved here
+//! (`#31`) because a hypothetical non-SSH consumer of `isekai-transport`
+//! (e.g. a UAV C2 OSS side-project reusing this crate's QUIC transport)
+//! should not have to drag in `isekai-pipe-core`'s SSH-specific
+//! deploy-profile-cache/bootstrap-plan/filesystem-intent-handoff code just to
+//! get these pure types. `isekai-pipe-core` now re-exports everything here
+//! under the same names, so existing `isekai_pipe_core::Candidate` etc.
+//! import paths keep working unchanged.
 //!
 //! # Design summary
 //!
@@ -30,14 +36,44 @@
 //! Likewise, session-level secrets (`session_secret` et al.) never appear on
 //! `Candidate`/`CandidateKey` — the connection-establishment layer threads
 //! those through separately (`ConnectContext`, a later task), since every
-//! candidate drawn from one `ConnectionIntent`/`CandidatePool` shares the
+//! candidate drawn from one [`TransportIntent`]/`CandidatePool` shares the
 //! same session secret today.
 
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::{ConnectionIntent, IntentTransport};
+/// A minimal, `isekai-pipe`-agnostic description of one connection's expected
+/// identity + how to reach it (`#31`) — everything
+/// [`TryFrom<&TransportIntent> for CandidateDraft`](CandidateDraft) needs,
+/// without pulling in `isekai-pipe-core`'s SSH-specific `ConnectionIntent`
+/// (intent-id/profile/relay_policy/filesystem intent-file handoff — see that
+/// type's own docs). A caller that already has a `ConnectionIntent` (e.g.
+/// `isekai-pipe`/`isekai-ssh`) builds one of these from it at the boundary
+/// (`isekai_pipe_core::ConnectionIntent::to_transport_intent`); this crate
+/// never needs to know `ConnectionIntent` exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportIntent {
+    pub expected_server_identity_cert_sha256_hex: String,
+    pub transport: TransportRoute,
+    /// See `isekai_pipe_core::ConnectionIntent::relay_endpoints`'s docs
+    /// (`ConfigRelayProvider` fallback, `#12`).
+    pub relay_endpoints: Vec<String>,
+    /// See `isekai_pipe_core::ConnectionIntent::stun_servers`'s docs
+    /// (`ConfigStunProvider` fallback, `#11`).
+    pub stun_servers: Vec<String>,
+}
+
+/// The transport-selection half of a [`TransportIntent`] — mirrors
+/// `isekai-pipe-core`'s `IntentTransport` shape but omits
+/// `session_secret_b64` (candidate gathering/dialing never needs the session
+/// secret — see this module's docs on why `Candidate`/`CandidateKey` never
+/// carry it either).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportRoute {
+    Relay { helper_addr: String, server_name: String },
+    StunP2p { stun_server: String, peer_addr: String, server_name: String },
+}
 
 /// A validated, canonical SHA-256 certificate fingerprint (32 bytes).
 ///
@@ -52,8 +88,8 @@ pub struct CertificatePinSha256([u8; 32]);
 
 /// Matches `isekai_protocol::handshake`'s existing `cert_sha256` contract
 /// (lowercase hex, exactly this many characters) — kept as a local literal
-/// rather than a cross-crate dependency since `isekai-pipe-core` has no
-/// other reason to depend on `isekai-protocol` yet.
+/// rather than a cross-crate dependency since this crate has no other reason
+/// to need `isekai_protocol::handshake` specifically for this.
 const CERT_SHA256_HEX_LEN: usize = 64;
 
 impl CertificatePinSha256 {
@@ -185,9 +221,9 @@ pub struct CandidateId(pub u64);
 /// A candidate-collection round. Belongs to a *batch* of candidates
 /// ([`CandidateDraftBatch`]/`CandidateSnapshot`), not to an individual
 /// candidate — a `CandidatePool` uses this to reject stale results from a
-/// superseded collection round, distinct from [`PunchGeneration`] (STUN
-/// hole-punch retry counter) and any future `ConnectionGeneration` (attach
-/// generation, `#18`).
+/// superseded collection round, distinct from `PunchGeneration` (STUN
+/// hole-punch retry counter, `isekai-pipe-core`) and any future
+/// `ConnectionGeneration` (attach generation, `#18`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CandidateGeneration(pub u64);
 
@@ -313,21 +349,21 @@ pub enum CandidateKey {
 /// should be labeled rather than silently falling through a wildcard match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CandidateOriginKind {
-    /// Converted directly from the legacy single-transport `ConnectionIntent`
+    /// Converted directly from the legacy single-transport [`TransportIntent`]
     /// (`LegacyIntentProvider`).
     LegacyIntent,
     /// One of the alternate relay-assigned addresses listed in
-    /// `ConnectionIntent::relay_endpoints` (`ConfigRelayProvider`, `#12`) —
+    /// [`TransportIntent::relay_endpoints`] (`ConfigRelayProvider`, `#12`) —
     /// all pointing at the same isekai-helper instance (same cert pin,
     /// session secret, and server name) for relay-endpoint fallback.
     ConfigRelay,
     /// One of the alternate STUN servers listed in
-    /// `ConnectionIntent::stun_servers` (`ConfigStunProvider`, `#11`) — every
-    /// candidate targets the *same* peer (`IntentTransport::StunP2p`'s own
-    /// `peer_addr`/`server_name`), only the STUN server used to learn this
-    /// side's own observed address before hole-punching differs
-    /// (`CandidateRoute::StunP2p`'s own docs on why that's a distinct
-    /// candidate, not a duplicate).
+    /// [`TransportIntent::stun_servers`] (`ConfigStunProvider`, `#11`) —
+    /// every candidate targets the *same* peer
+    /// ([`TransportRoute::StunP2p`]'s own `peer_addr`/`server_name`), only
+    /// the STUN server used to learn this side's own observed address before
+    /// hole-punching differs (`CandidateRoute::StunP2p`'s own docs on why
+    /// that's a distinct candidate, not a duplicate).
     ConfigStun,
 }
 
@@ -458,32 +494,33 @@ pub struct CandidateSnapshot {
 /// distinguish *which* configured STUN server produced a given candidate).
 pub const LEGACY_INTENT_PROVIDER_ID: &str = "legacy-intent";
 
-/// Converts the legacy single-transport `ConnectionIntent` (today's only
-/// connection-intent shape — see `IntentTransport`'s own docs) into exactly
+/// Converts the legacy single-transport [`TransportIntent`] (today's only
+/// connection-intent shape — see [`TransportRoute`]'s own docs) into exactly
 /// one [`CandidateDraft`]. Pure and infallible-in-practice except for
-/// malformed data that should never occur in a `ConnectionIntent` a trust
-/// store actually produced (kept fallible anyway rather than panicking,
-/// since this crate must never trust its own serialized state
+/// malformed data that should never occur in a `TransportIntent` built from a
+/// trust store's `ConnectionIntent` (kept fallible anyway rather than
+/// panicking, since this crate must never trust its caller's data
 /// unconditionally).
 ///
-/// Takes the whole `ConnectionIntent` (not just `IntentTransport`) because
-/// the certificate pin lives on `ConnectionIntent::expected_server_identity`,
-/// a sibling field of `transport` — the route and its expected identity are
-/// only paired together at this level.
-impl TryFrom<&ConnectionIntent> for CandidateDraft {
+/// Takes the whole `TransportIntent` (not just `TransportRoute`) because the
+/// certificate pin lives on
+/// `TransportIntent::expected_server_identity_cert_sha256_hex`, a sibling
+/// field of `transport` — the route and its expected identity are only
+/// paired together at this level.
+impl TryFrom<&TransportIntent> for CandidateDraft {
     type Error = CandidateConversionError;
 
-    fn try_from(intent: &ConnectionIntent) -> Result<Self, Self::Error> {
-        let cert_pin = CertificatePinSha256::from_hex(&intent.expected_server_identity.cert_sha256_hex)
+    fn try_from(intent: &TransportIntent) -> Result<Self, Self::Error> {
+        let cert_pin = CertificatePinSha256::from_hex(&intent.expected_server_identity_cert_sha256_hex)
             .map_err(CandidateConversionError::CertificatePin)?;
 
         let route = match &intent.transport {
-            IntentTransport::Relay { helper_addr, server_name, .. } => CandidateRoute::Relay {
+            TransportRoute::Relay { helper_addr, server_name } => CandidateRoute::Relay {
                 cert_pin,
                 helper_addr: parse_socket_addr(helper_addr, "helper_addr")?,
                 server_name: parse_server_name(server_name)?,
             },
-            IntentTransport::StunP2p { stun_server, peer_addr, server_name, .. } => CandidateRoute::StunP2p {
+            TransportRoute::StunP2p { stun_server, peer_addr, server_name } => CandidateRoute::StunP2p {
                 cert_pin,
                 peer_addr: parse_socket_addr(peer_addr, "peer_addr")?,
                 stun_server: parse_socket_addr(stun_server, "stun_server")?,
@@ -516,9 +553,9 @@ fn parse_server_name(raw: &str) -> Result<NormalizedServerName, CandidateConvers
 }
 
 /// Validates a `(cert_sha256_hex, server_name)` pair — the same two checks
-/// [`TryFrom<&ConnectionIntent>`] runs on `ConnectionIntent`'s fields — for
+/// [`TryFrom<&TransportIntent>`] runs on `TransportIntent`'s fields — for
 /// callers that build a `RelayTarget`/`StunP2pTarget`/`RemoteSpec` directly
-/// from a raw string source that never passes through a `ConnectionIntent`/
+/// from a raw string source that never passes through a `TransportIntent`/
 /// `CandidateRoute` (e.g. a cached `PersistentProfile` read by `isekai-pipe
 /// probe`, or an Android transport reattaching from stored profile data).
 /// Centralizing this here means every construction site — whether or not it
@@ -543,7 +580,7 @@ pub enum CandidateConversionError {
 impl fmt::Display for CandidateConversionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CertificatePin(e) => write!(f, "invalid expected_server_identity.cert_sha256_hex: {e}"),
+            Self::CertificatePin(e) => write!(f, "invalid expected_server_identity_cert_sha256_hex: {e}"),
             Self::ServerName(e) => write!(f, "invalid server_name: {e}"),
             Self::InvalidSocketAddr { field, value } => write!(f, "invalid {field}: {value:?}"),
         }
@@ -695,22 +732,20 @@ mod tests {
         assert_eq!(gen.next().next(), CandidateGeneration(2));
     }
 
-    fn sample_intent(transport: IntentTransport) -> ConnectionIntent {
-        crate::ConnectionIntent::new(
-            "production",
-            "ssh",
-            crate::ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+    fn sample_intent(transport: TransportRoute) -> TransportIntent {
+        TransportIntent {
+            expected_server_identity_cert_sha256_hex: "ab".repeat(32),
             transport,
-            crate::BootstrapProvenance::TrustStore { key: "production:22".to_string() },
-        )
+            relay_endpoints: Vec::new(),
+            stun_servers: Vec::new(),
+        }
     }
 
     #[test]
     fn candidate_draft_from_relay_intent() {
-        let intent = sample_intent(IntentTransport::Relay {
+        let intent = sample_intent(TransportRoute::Relay {
             helper_addr: "203.0.113.5:45231".to_string(),
             server_name: "isekai-helper".to_string(),
-            session_secret_b64: "c2VjcmV0".to_string(),
         });
         let draft = CandidateDraft::try_from(&intent).unwrap();
         assert_eq!(
@@ -728,11 +763,10 @@ mod tests {
 
     #[test]
     fn candidate_draft_from_stun_p2p_intent() {
-        let intent = sample_intent(IntentTransport::StunP2p {
+        let intent = sample_intent(TransportRoute::StunP2p {
             stun_server: "203.0.113.9:3478".to_string(),
             peer_addr: "203.0.113.5:45231".to_string(),
             server_name: "isekai-helper".to_string(),
-            session_secret_b64: "c2VjcmV0".to_string(),
         });
         let draft = CandidateDraft::try_from(&intent).unwrap();
         assert_eq!(
@@ -748,27 +782,11 @@ mod tests {
 
     #[test]
     fn candidate_draft_rejects_invalid_helper_addr() {
-        let intent = sample_intent(IntentTransport::Relay {
+        let intent = sample_intent(TransportRoute::Relay {
             helper_addr: "not-an-address".to_string(),
             server_name: "isekai-helper".to_string(),
-            session_secret_b64: "c2VjcmV0".to_string(),
         });
         let err = CandidateDraft::try_from(&intent).unwrap_err();
         assert!(matches!(err, CandidateConversionError::InvalidSocketAddr { field: "helper_addr", .. }));
-    }
-
-    #[test]
-    fn candidate_draft_never_carries_the_session_secret() {
-        // The whole point of separating Candidate from session auth material
-        // (`ConnectContext`, a later task): confirm the conversion has no
-        // path that could smuggle `session_secret_b64` into the draft.
-        let intent = sample_intent(IntentTransport::Relay {
-            helper_addr: "203.0.113.5:45231".to_string(),
-            server_name: "isekai-helper".to_string(),
-            session_secret_b64: "top-secret-value".to_string(),
-        });
-        let draft = CandidateDraft::try_from(&intent).unwrap();
-        let debug = format!("{draft:?}");
-        assert!(!debug.contains("top-secret-value"));
     }
 }

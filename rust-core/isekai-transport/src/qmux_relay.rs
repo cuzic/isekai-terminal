@@ -25,11 +25,11 @@ use quicmux::{AnyMuxFactory, MuxClientConfig};
 pub const QMUX_ALPN: &[u8] = b"isekai-pipe/1+qmux01";
 
 /// The `qmux`-backed [`quicmux::AnyMuxFactory`] for this relay leg. Every
-/// [`quicmux::MuxClientConfig`] field besides `alpn`/`exporter_label` is
-/// ignored by the `qmux` backend (see that type's own field docs), so the
-/// idle-timeout/keepalive/stream-limit/multipath values here are copied from
-/// `system::isekai_mux_config`'s equivalents purely for consistency, not
-/// because this backend reads them.
+/// [`quicmux::MuxClientConfig`] field besides `alpn`/`exporter_label`/
+/// `datagram_send_buffer_size` is ignored by the `qmux` backend (see that
+/// type's own field docs), so the idle-timeout/keepalive/stream-limit/
+/// multipath values here are copied from `system::isekai_mux_config`'s
+/// equivalents purely for consistency, not because this backend reads them.
 pub fn qmux_relay_factory() -> AnyMuxFactory {
     AnyMuxFactory::qmux(MuxClientConfig {
         alpn: QMUX_ALPN.to_vec(),
@@ -39,5 +39,8 @@ pub fn qmux_relay_factory() -> AnyMuxFactory {
         max_concurrent_bidi_streams: 1,
         max_concurrent_uni_streams: 0,
         multipath: false,
+        // This relay leg never sends QUIC datagrams today — see
+        // `quicmux`'s `MuxClientConfig::datagram_send_buffer_size` docs.
+        datagram_send_buffer_size: None,
     })
 }

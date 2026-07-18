@@ -154,8 +154,22 @@ pub enum MuxError {
     /// operation at all (as opposed to attempting it and failing) — e.g.
     /// calling `wrap_bound_socket` against the `qmux` backend, which runs
     /// over TCP and has no UDP socket concept to wrap in the first place.
+    /// Also covers datagrams being disabled/unsupported for a given
+    /// connection (`MuxClientConfig::datagram_send_buffer_size` was `None`,
+    /// or the peer advertised no willingness to receive them) — see
+    /// [`crate::AnyMuxConnection::send_datagram`]'s docs.
     #[error("{operation} is not supported by this backend: {reason}")]
     Unsupported { operation: &'static str, reason: &'static str },
+
+    /// A [`crate::AnyMuxConnection::send_datagram`]/
+    /// [`crate::AnyMuxConnection::send_datagram_wait`] payload exceeded this
+    /// connection's current negotiated [`crate::AnyMuxConnection::max_datagram_size`].
+    /// Reported with the concrete sizes so a caller doesn't have to
+    /// separately re-query `max_datagram_size()` afterward (which can itself
+    /// have changed by the time it does — path MTU re-estimation shrinks it
+    /// over a connection's lifetime, never grows a cached value back).
+    #[error("datagram payload too large: {size} bytes exceeds the negotiated max of {max} bytes")]
+    DatagramTooLarge { size: usize, max: usize },
 }
 
 impl MuxError {
