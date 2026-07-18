@@ -50,7 +50,7 @@ use isekai_protocol::bootstrap::{
 use russh::client;
 use russh_stream_session::{
     authenticate_session, connect_via_jump_or_direct, open_channel, verifying_handler, Credential, HostKeyVerifier,
-    JumpHost, SessionKind, VerifyingHandler,
+    JumpHost, Session, SessionKind, VerifyingHandler,
 };
 
 use crate::backend::BootstrapBackend;
@@ -127,8 +127,8 @@ impl RusshBackend {
     /// `isekai-pipe` variant to fetch before ever calling
     /// `install_and_start`).
     pub async fn detect_remote_arch(&self, target: &HostSpec, via: &[JumpSpec]) -> Result<String, BootstrapError> {
-        let handle = self.connect_and_authenticate(target, via).await?;
-        let out = run_russh_command(&handle, "uname -m", None).await?;
+        let session = self.connect_and_authenticate(target, via).await?;
+        let out = run_russh_command(&session.handle, "uname -m", &[]).await?;
         if out.status != Some(0) {
             return Err(BootstrapError::RemoteCommandFailed {
                 command: "uname -m".to_string(),
@@ -143,11 +143,21 @@ impl RusshBackend {
     /// module docs), authenticating both the jump host (if any) and the
     /// target with a private key resolved per-hop from that hop's own
     /// `~/.ssh/config`.
+    ///
+    /// Returns the whole `Session` (not just its `handle`) — Codex review
+    /// finding: `Session::_jump_handle` is what keeps a single-hop `via`
+    /// connection's underlying `direct-tcpip` tunnel alive
+    /// (`russh_stream_session::Session`'s own docs: "dropping `Session`
+    /// tears down the tunnel too"). Returning only `.handle` would drop
+    /// `_jump_handle` the moment this function returns, closing the tunnel
+    /// out from under every subsequent command on a via-chain bootstrap —
+    /// the caller must keep the returned `Session` alive for as long as
+    /// `.handle` is in use.
     async fn connect_and_authenticate(
         &self,
         target: &HostSpec,
         via: &[JumpSpec],
-    ) -> Result<client::Handle<VerifyingHandler<FileBackedHostKeyVerifier>>, BootstrapError> {
+    ) -> Result<Session<VerifyingHandler<FileBackedHostKeyVerifier>>, BootstrapError> {
         if via.len() > 1 {
             return Err(BootstrapError::UnsupportedViaChain { hops: via.len() });
         }
@@ -202,7 +212,7 @@ impl RusshBackend {
         };
 
         let jump_host = jump.as_ref().map(|(jh, _)| jh);
-        let session = connect_via_jump_or_direct(
+        let mut session = connect_via_jump_or_direct(
             jump_host,
             Arc::new(client::Config::default()),
             &target_resolved.hostname,
@@ -213,14 +223,15 @@ impl RusshBackend {
 
         // `JumpHost::credential` is only ever consulted internally by
         // `connect_via_jump_or_direct` while it's in scope above — safe to
-        // zeroize immediately after that call returns, success or not.
+        // zeroize immediately after that call returns, success or not (also
+        // now backstopped by `Credential`'s own `Drop` impl for any path
+        // that doesn't reach this line at all — Codex review finding).
         if let Some((mut jump_host, _)) = jump {
             jump_host.credential.zeroize();
         }
 
-        let mut handle = session.handle;
         let mut target_credential = target_resolved.credential;
-        let authed = authenticate_session(&mut handle, &target_resolved.username, &target_credential).await?;
+        let authed = authenticate_session(&mut session.handle, &target_resolved.username, &target_credential).await?;
         target_credential.zeroize();
         if !authed {
             return Err(BootstrapError::Session(russh_stream_session::SessionError::Auth(
@@ -228,7 +239,7 @@ impl RusshBackend {
             )));
         }
 
-        Ok(handle)
+        Ok(session)
     }
 }
 
@@ -476,24 +487,30 @@ struct SshOutput {
 }
 
 /// Runs `remote_command` as a single SSH `exec` request over `handle`,
-/// optionally feeding `stdin_payload` to it, and collects (exit status,
-/// stdout, stderr) — the `russh` equivalent of `openssh.rs`'s
-/// `run_ssh_command`. Stdout/stderr are kept strictly separate
-/// (`ChannelMsg::Data` vs. `ChannelMsg::ExtendedData` with `ext ==
+/// optionally feeding `stdin_chunks` to it in order (sent as separate
+/// `channel.data()` writes rather than pre-concatenated into one buffer —
+/// Codex review finding: `install_and_launch`'s `stdin_chunks` includes the
+/// base64-encoded helper binary, potentially tens of MB, and the remote
+/// script's `dd`/`head -c` reads treat stdin as one continuous byte stream
+/// regardless of how many SSH_MSG_CHANNEL_DATA packets it arrives in, so
+/// there's no need to materialize the concatenation on this side first),
+/// and collects (exit status, stdout, stderr) — the `russh` equivalent of
+/// `openssh.rs`'s `run_ssh_command`. Stdout/stderr are kept strictly
+/// separate (`ChannelMsg::Data` vs. `ChannelMsg::ExtendedData` with `ext ==
 /// SSH_EXTENDED_DATA_STDERR`) so the "stdout purity" contract
 /// (`BootstrapBackend::install_and_start`'s docs) holds exactly as it does
 /// for the real `ssh(1)` subprocess case.
 async fn run_russh_command<H: client::Handler>(
     handle: &client::Handle<H>,
     remote_command: &str,
-    stdin_payload: Option<&[u8]>,
+    stdin_chunks: &[&[u8]],
 ) -> Result<SshOutput, BootstrapError> {
     let mut channel = open_channel(handle, &SessionKind::Exec { command: remote_command.to_string() })
         .await
         .map_err(BootstrapError::Session)?;
 
-    if let Some(payload) = stdin_payload {
-        channel.data(payload).await.map_err(|e| BootstrapError::Session(russh_stream_session::SessionError::Channel(e)))?;
+    for chunk in stdin_chunks {
+        channel.data(*chunk).await.map_err(|e| BootstrapError::Session(russh_stream_session::SessionError::Channel(e)))?;
     }
     channel.eof().await.map_err(|e| BootstrapError::Session(russh_stream_session::SessionError::Channel(e)))?;
 
@@ -547,7 +564,7 @@ impl RusshBackend {
         stun_servers: &[std::net::SocketAddr],
         binary: &[u8],
     ) -> Result<isekai_protocol::HandshakeJson, BootstrapError> {
-        let handle = self.connect_and_authenticate(target, via).await?;
+        let session = self.connect_and_authenticate(target, via).await?;
 
         let sleep_secs = HANDSHAKE_POLL_INTERVAL_MS as f64 / 1000.0;
 
@@ -692,8 +709,8 @@ fi
 "#
         );
 
-        let stdin_payload = [request_bytes.as_slice(), jwt_bytes.as_slice(), encoded.as_bytes()].concat();
-        let out = run_russh_command(&handle, &cmd, Some(&stdin_payload)).await?;
+        let stdin_chunks: [&[u8]; 3] = [request_bytes.as_slice(), jwt_bytes.as_slice(), encoded.as_bytes()];
+        let out = run_russh_command(&session.handle, &cmd, &stdin_chunks).await?;
 
         let non_empty_lines: Vec<&[u8]> =
             out.stdout.split(|&b| b == b'\n').filter(|line| !line.is_empty()).collect();
@@ -767,8 +784,8 @@ mod tests {
         std::fs::write(&present, b"fake key bytes\n").unwrap();
 
         let credential = load_first_existing(&[missing, present.clone()]).unwrap();
-        match credential {
-            Credential::PublicKey { private_key_pem } => assert_eq!(private_key_pem, std::fs::read(&present).unwrap()),
+        match &credential {
+            Credential::PublicKey { private_key_pem } => assert_eq!(*private_key_pem, std::fs::read(&present).unwrap()),
             _ => panic!("expected Credential::PublicKey"),
         }
     }

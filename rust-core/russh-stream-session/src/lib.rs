@@ -74,6 +74,21 @@ impl Credential {
     }
 }
 
+/// Zeroizes automatically on every drop, not just when a caller remembers to
+/// call [`Credential::zeroize`] explicitly — a caller that does call it
+/// first just makes this a harmless no-op pass over an already-zeroed
+/// buffer (defense in depth: minimizes the exposure *window* on the happy
+/// path, while this `Drop` impl closes the gap on every early-return error
+/// path a caller might not have covered, e.g. a `?` between constructing a
+/// `Credential` and its own explicit `zeroize()` call — a real instance of
+/// exactly this gap was found by Codex review in `isekai-bootstrap::
+/// RusshBackend::connect_and_authenticate`).
+impl Drop for Credential {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
 /// A single-hop jump host (`ssh -J` equivalent) to tunnel through before
 /// reaching the real target.
 pub struct JumpHost {

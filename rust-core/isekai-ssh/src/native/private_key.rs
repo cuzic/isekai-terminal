@@ -97,9 +97,9 @@ mod tests {
         std::fs::write(&present, b"fake key bytes\n").unwrap();
 
         let credential = load_first_existing(&[missing, present.clone()]).unwrap();
-        match credential {
+        match &credential {
             Credential::PublicKey { private_key_pem } => {
-                assert_eq!(private_key_pem, std::fs::read(&present).unwrap());
+                assert_eq!(*private_key_pem, std::fs::read(&present).unwrap());
             }
             _ => panic!("expected Credential::PublicKey"),
         }
@@ -127,9 +127,9 @@ mod tests {
         std::fs::write(&second, b"rsa bytes\n").unwrap();
 
         let credential = load_first_existing(&[first.clone(), second]).unwrap();
-        match credential {
+        match &credential {
             Credential::PublicKey { private_key_pem } => {
-                assert_eq!(private_key_pem, std::fs::read(&first).unwrap());
+                assert_eq!(*private_key_pem, std::fs::read(&first).unwrap());
             }
             _ => panic!("expected Credential::PublicKey"),
         }
