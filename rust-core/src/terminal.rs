@@ -181,6 +181,10 @@ pub(crate) struct Terminal {
     /// タスク#55、形状は変えず点滅の有無だけを切り替える)の両方がこのフィールドを
     /// 更新する(`CursorShape`とは独立)。
     cursor_blink: bool,
+    /// DECAWM(`CSI ?7h`/`CSI ?7l`)。行右端に到達した際に自動折り返しするかどうか。
+    /// 既定はxterm同様`true`(on)。offの場合、右端到達後の`print()`は次行へ
+    /// 折り返さず、右端の最終列を上書きし続ける(タスク#56)。
+    autowrap_mode: bool,
 }
 
 impl Terminal {
@@ -212,6 +216,7 @@ impl Terminal {
             bell_generation: 0,
             cursor_shape: CursorShape::Block,
             cursor_blink: true,
+            autowrap_mode: true,
         }
     }
 
@@ -267,6 +272,8 @@ impl Terminal {
     pub(crate) fn bell_generation(&self) -> u64 { self.bell_generation }
     pub(crate) fn cursor_shape(&self) -> CursorShape { self.cursor_shape }
     pub(crate) fn cursor_blink(&self) -> bool { self.cursor_blink }
+    /// DECAWM(`CSI ?7h`/`CSI ?7l`)の現在値。テスト・`print()`から参照する。
+    pub(crate) fn autowrap_mode(&self) -> bool { self.autowrap_mode }
     pub(crate) fn screen_cells(&self) -> &[TermCell] { self.cells() }
 
     fn reset_all(&mut self) {
@@ -290,6 +297,7 @@ impl Terminal {
         self.cursor_visible = true;
         self.cursor_shape = CursorShape::Block;
         self.cursor_blink = true;
+        self.autowrap_mode = true;
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -675,22 +683,51 @@ impl Perform for Terminal {
             return;
         }
 
-        if self.cursor_col >= self.cols {
-            self.cursor_col = 0;
-            self.newline();
+        // 折り返しが必要かどうかを「書く前」に判定する。通常の折り返し待ち
+        // (`cursor_col >= cols`)に加え、全角(width==2)文字が現在行に1列しか
+        // 残っていない場合(`cursor_col == cols - 1`)も対象に含める——xtermは
+        // 全角文字を半分だけ現在行に置いたりしない。丸ごと次行へ送る
+        // (Fableレビュー: タスク#56、以前は書いた後に判定していたため
+        // placeholder側だけ欠落し文字が半分に切れていた)。
+        // `self.cols > 1` を追加で要求する: `cols == 1` の端末では全角文字は
+        // 折り返した先でも絶対に収まらないため、この条件が無いと行頭
+        // (`cursor_col == 0`)であっても毎回強制的に改行してしまい、書かれる
+        // はずだった行を1行無駄にしてしまう(Codexレビュー指摘)。
+        let needs_wrap = self.cursor_col >= self.cols
+            || (width == 2 && self.cols > 1 && self.cursor_col + 1 >= self.cols);
+
+        if needs_wrap {
+            if self.autowrap_mode {
+                self.cursor_col = 0;
+                self.newline();
+            } else {
+                // DECAWM off(`CSI ?7l`): 次行へ折り返さず、右端の最終列
+                // (`cols - 1`)を上書きし続ける(xterm仕様、タスク#56)。
+                self.cursor_col = self.cols.saturating_sub(1);
+            }
         }
+
         if self.cursor_row < self.rows {
             let attrs = self.cur_attrs;
             *self.cell_mut(self.cursor_row, self.cursor_col) =
                 attrs.to_cell(smol_str::SmolStr::new(c.encode_utf8(&mut [0u8; 4])));
-            self.cursor_col += 1;
-            if width == 2 && self.cursor_col < self.cols {
+            let advance = if width == 2 && self.cursor_col + 1 < self.cols {
                 // wide文字の2セル目(placeholder)も現在の属性(reverse等も含め)を
                 // 正しく引き継ぐ — 以前は bold だけ無条件で false になっていた。
                 let mut placeholder = attrs.to_cell(smol_str::SmolStr::new_inline(" "));
                 placeholder.is_wide_placeholder = true;
-                *self.cell_mut(self.cursor_row, self.cursor_col) = placeholder;
-                self.cursor_col += 1;
+                *self.cell_mut(self.cursor_row, self.cursor_col + 1) = placeholder;
+                2
+            } else {
+                1
+            };
+            if self.autowrap_mode {
+                self.cursor_col += advance;
+            } else {
+                // DECAWM offの間は折り返し待ち状態(`cursor_col == cols`)自体に
+                // 入らせない——常に見えている最終列にクランプし、次のprint()も
+                // 同じ列を上書きする。
+                self.cursor_col = (self.cursor_col + advance).min(self.cols.saturating_sub(1));
             }
         }
     }
@@ -735,6 +772,9 @@ impl Perform for Terminal {
                 ('l', 12) => { self.cursor_blink = false; }
                 ('h', 1) => { self.application_cursor_mode = true; }
                 ('l', 1) => { self.application_cursor_mode = false; }
+                // DECAWM(`CSI ?7h`/`CSI ?7l`): 自動折り返しon/off(タスク#56)。
+                ('h', 7) => { self.autowrap_mode = true; }
+                ('l', 7) => { self.autowrap_mode = false; }
                 ('h', 2004) => { self.bracketed_paste_mode = true; }
                 ('l', 2004) => { self.bracketed_paste_mode = false; }
                 _ => {}
@@ -802,15 +842,27 @@ impl Perform for Terminal {
                 self.cursor_row = (p0.max(1) as usize - 1).min(self.rows - 1);
                 self.cursor_col = (p1.max(1) as usize - 1).min(self.cols - 1);
             }
-            'J' => match p0 {
-                0 => { let s = self.cursor_row * self.cols + self.cursor_col; self.erase_cells(s, self.cols * self.rows); }
-                1 => { let e = self.cursor_row * self.cols + self.cursor_col + 1; self.erase_cells(0, e); }
-                2 | 3 => { self.erase_cells(0, self.cols * self.rows); self.cursor_row = 0; self.cursor_col = 0; }
-                _ => {}
-            },
+            'J' => {
+                // `print()`の遅延折り返し(delayed wrap)中は`cursor_col`が`cols`
+                // (範囲外)になり得る。生の`cursor_col`をそのまま使うと、EL/ED問わず
+                // 「現在行の右端」を指すはずのインデックスが次行の先頭に1セルはみ出す
+                // off-by-oneになる——CPR(`CSI 6n`)と同じく可視上の最終列(`cols - 1`)
+                // にクランプしてから計算する(Fableレビュー: タスク#56)。
+                let col = self.cursor_col.min(self.cols.saturating_sub(1));
+                match p0 {
+                    0 => { let s = self.cursor_row * self.cols + col; self.erase_cells(s, self.cols * self.rows); }
+                    1 => { let e = self.cursor_row * self.cols + col + 1; self.erase_cells(0, e); }
+                    2 | 3 => { self.erase_cells(0, self.cols * self.rows); self.cursor_row = 0; self.cursor_col = 0; }
+                    _ => {}
+                }
+            }
             'K' => {
                 let row = self.cursor_row;
-                let col = self.cursor_col;
+                // 上の'J'と同じ理由でクランプする。これにより EL0(`CSI 0K`)が
+                // 遅延折り返し中(右端に文字を書いた直後)に現在行を消せない
+                // (`s == e`でno-opになる)バグ、および EL1(`CSI 1K`)が次行先頭
+                // 1セルまで誤って消してしまうバグの両方を修正する(タスク#56)。
+                let col = self.cursor_col.min(self.cols.saturating_sub(1));
                 match p0 {
                     0 => { let s = row * self.cols + col; let e = (row + 1) * self.cols; self.erase_cells(s, e); }
                     1 => { let s = row * self.cols; let e = row * self.cols + col + 1; self.erase_cells(s, e); }
@@ -1386,6 +1438,149 @@ mod tests {
         for i in 0..10 {
             assert_eq!(t.screen_cells()[i].ch.as_str(), " ", "col {}", i);
         }
+    }
+
+    // ── DECAWM(?7h/?7l)・wrap関連バグ修正(タスク#56) ─────────────
+
+    #[test]
+    fn test_decawm_default_is_on() {
+        let t = Terminal::new(80, 24, Theme::default());
+        assert!(t.autowrap_mode(), "DECAWM should default to on (xterm既定)");
+    }
+
+    #[test]
+    fn test_decawm_7l_disables_autowrap_and_7h_reenables() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?7l");
+        assert!(!t.autowrap_mode());
+        feed(&mut t, b"\x1b[?7h");
+        assert!(t.autowrap_mode());
+    }
+
+    #[test]
+    fn test_decawm_off_overwrites_last_column_instead_of_wrapping() {
+        // DECAWM off の間、右端到達後の印字は次行へ折り返さず、右端の最終列
+        // (cols-1)を上書きし続ける(xterm仕様)。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b[?7l");
+        feed(&mut t, b"0123456789X"); // 10文字でちょうど右端、11文字目(X)は折り返さず上書き
+        assert_eq!(t.cursor_row(), 0, "must not wrap to next row when DECAWM is off");
+        assert_eq!(t.cursor_col(), 9, "cursor must stay clamped to the last column");
+        assert_eq!(cell(&t, 0, 9), "X", "last column should be overwritten, not wrapped");
+        assert_eq!(cell(&t, 0, 0), "0", "earlier columns must be untouched");
+    }
+
+    #[test]
+    fn test_decawm_on_still_wraps_normally() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"0123456789X");
+        assert_eq!(t.cursor_row(), 1, "DECAWM on (既定) は通常通り折り返す");
+        assert_eq!(t.cursor_col(), 1);
+        assert_eq!(cell(&t, 1, 0), "X");
+    }
+
+    #[test]
+    fn test_decawm_reset_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?7l");
+        assert!(!t.autowrap_mode());
+        feed(&mut t, b"\x1bc"); // RIS
+        assert!(t.autowrap_mode(), "RISで既定(on)に戻る");
+    }
+
+    #[test]
+    fn test_wide_char_that_does_not_fit_wraps_whole_char_to_next_row() {
+        // 全角文字が最終列1つしか残っていない場合、半分だけ現在行に置くのではなく
+        // 丸ごと次行へ折り返す(xterm仕様、以前は本体セルだけ書かれ半分に切れていた)。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"012345678"); // 9文字書いて残り1列(col=9)
+        assert_eq!(t.cursor_col(), 9);
+        feed(&mut t, "\u{3042}".as_bytes()); // "あ"(全角)
+        assert_eq!(cell(&t, 0, 9), " ", "last column of row 0 must stay blank, not half-written");
+        assert_eq!(t.cursor_row(), 1, "wide char must wrap entirely to the next row");
+        assert_eq!(cell(&t, 1, 0), "\u{3042}");
+        assert_eq!(cell(&t, 1, 1), " ", "wide char placeholder on the new row");
+        assert_eq!(t.cursor_col(), 2);
+    }
+
+    #[test]
+    fn test_wide_char_in_one_column_terminal_does_not_waste_a_blank_row_first() {
+        // cols==1 の端末では全角文字は折り返した先でも絶対に収まらない。この場合
+        // 「1列しか残っていないから折り返す」判定を無条件に適用すると、行頭
+        // (cursor_col==0)であっても毎回強制的に改行し、最初の行を1行無駄にして
+        // しまう(Codexレビュー指摘: タスク#56)。cols>1という前提を付けて防ぐ。
+        let mut t = Terminal::new(1, 3, Theme::default());
+        feed(&mut t, "\u{3042}".as_bytes()); // "あ"(全角)
+        assert_eq!(t.cursor_row(), 0, "must not waste row 0 by pre-wrapping when nothing fits anyway");
+        assert_eq!(cell(&t, 0, 0), "\u{3042}");
+    }
+
+    #[test]
+    fn test_el0_clears_current_row_even_at_wrap_pending_column() {
+        // EL0(現在位置から行末まで消去)は、右端まで書いた直後の遅延折り返し
+        // (delayed wrap, cursor_col == cols)状態でも現在行の最終列を消せる
+        // べき(以前はs==eになりno-opだった)。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"0123456789"); // ちょうど10文字、wrap-pending(cursor_col==10)
+        assert_eq!(t.cursor_col(), 10);
+        feed(&mut t, b"\x1b[0K");
+        assert_eq!(cell(&t, 0, 9), " ", "EL0 must clear the last column even at wrap-pending");
+        assert_eq!(cell(&t, 0, 0), "0", "earlier columns on the row must be untouched");
+    }
+
+    #[test]
+    fn test_el1_at_wrap_pending_does_not_spill_into_next_row() {
+        // EL1(行頭からカーソルまで消去)は、wrap-pending状態(cursor_col==cols)では
+        // 可視上の最終列(cols-1)までを消すべきで、次行の先頭1セルまではみ出して
+        // 消してはいけない(以前のoff-by-oneバグ)。
+        //
+        // row2に先にセンチネル('Z')を書き込んでから、cursor_row=1・cursor_col=10
+        // (wrap-pending)という状況だけをカーソル上移動('A'はcursor_colを変えない)
+        // で再現する — こうしないと「row2はもともと空白」なので、off-by-oneで
+        // row2 col0 が誤って消されても空白のままでテストが検出できない
+        // (Codexレビュー指摘: 修正前の実装でも偶然パスしてしまっていた)。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b[3;1HZZZZZZZZZZ"); // row2(0-indexed)をZで埋め、row2でwrap-pendingに
+        assert_eq!(t.cursor_row(), 2);
+        assert_eq!(t.cursor_col(), 10);
+        feed(&mut t, b"\x1b[1A"); // row1へ移動。'A'はcursor_colを変えないのでwrap-pendingのまま
+        assert_eq!(t.cursor_row(), 1);
+        assert_eq!(t.cursor_col(), 10);
+        feed(&mut t, b"\x1b[1K");
+        for i in 0..10 {
+            assert_eq!(cell(&t, 1, i), " ", "row1 col{i} should be cleared by EL1");
+        }
+        // row2(次行)のセンチネルは一切触れられていないこと。
+        assert_eq!(cell(&t, 2, 0), "Z", "EL1 must not spill into the next row's first cell");
+    }
+
+    #[test]
+    fn test_ed1_at_wrap_pending_does_not_spill_into_next_row() {
+        // ED1(画面先頭からカーソルまで消去)も同じoff-by-oneが起きうる: wrap-pending
+        // 状態で次の行の先頭1セルまで誤って消してしまってはいけない。上のEL1テストと
+        // 同じ理由でrow2にセンチネルを先に書いてから検証する。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b[3;1HZZZZZZZZZZ"); // row2をZで埋め、row2でwrap-pendingに
+        feed(&mut t, b"\x1b[1A"); // row1へ移動、cursor_colはwrap-pending(10)のまま
+        assert_eq!(t.cursor_row(), 1);
+        assert_eq!(t.cursor_col(), 10);
+        feed(&mut t, b"\x1b[1J");
+        for i in 0..10 {
+            assert_eq!(cell(&t, 0, i), " ", "row0 col{i} should be cleared by ED1");
+            assert_eq!(cell(&t, 1, i), " ", "row1 col{i} should be cleared by ED1");
+        }
+        assert_eq!(cell(&t, 2, 0), "Z", "ED1 must not spill into the next row's first cell");
+    }
+
+    #[test]
+    fn test_ed0_at_wrap_pending_clears_the_last_column_of_current_row() {
+        // ED0(カーソルから画面末尾まで消去)も同じ理由でwrap-pending中は
+        // 現在行の最終列から(その前の列を飛ばさず)消去を開始すべき。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"0123456789"); // wrap-pending
+        feed(&mut t, b"\x1b[0J");
+        assert_eq!(cell(&t, 0, 9), " ", "ED0 at wrap-pending must clear the last column too");
+        assert_eq!(cell(&t, 0, 0), "0", "earlier columns untouched");
     }
 
     // ── resize_preserving_state ─────────────────────────
