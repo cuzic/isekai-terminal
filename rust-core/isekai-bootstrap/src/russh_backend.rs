@@ -37,7 +37,7 @@
 //!   `isekai-ssh init` (this module) is already trusted for the regular
 //!   `isekai-ssh <host>` connect path afterward, and vice versa.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -76,9 +76,12 @@ pub struct RusshBackend {
     /// `FileBackedHostKeyVerifier`'s docs below) — defaults to a real
     /// blocking stdin prompt; tests inject a fixed answer.
     confirm_new_host: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    /// Test-only: see `with_identity_file`'s docs. `None` in every
-    /// production code path.
-    identity_file_override: Option<PathBuf>,
+    /// Test-only: see `with_identity_file`/`with_identity_files`' docs.
+    /// `None` in every production code path. When `Some`, its entries replace
+    /// the per-hop `~/.ssh/config` `IdentityFile`/default-probe candidate
+    /// list — so a test can pin one key, or several (to exercise the
+    /// try-each-candidate auth loop).
+    identity_file_override: Option<Vec<PathBuf>>,
 }
 
 impl RusshBackend {
@@ -117,7 +120,17 @@ impl RusshBackend {
     /// `ssh(1)` itself would.
     #[doc(hidden)]
     pub fn with_identity_file(mut self, path: PathBuf) -> Self {
-        self.identity_file_override = Some(path);
+        self.identity_file_override = Some(vec![path]);
+        self
+    }
+
+    /// Test-only: like [`with_identity_file`](Self::with_identity_file) but
+    /// pins an ordered *list* of candidate key files, so a test can verify
+    /// the target-hop auth loop tries each in turn (falls through a
+    /// rejected/unparseable earlier key to a later, accepted one).
+    #[doc(hidden)]
+    pub fn with_identity_files(mut self, paths: Vec<PathBuf>) -> Self {
+        self.identity_file_override = Some(paths);
         self
     }
 
@@ -211,13 +224,22 @@ impl RusshBackend {
                     self.confirm_new_host.clone(),
                     "isekai-bootstrap",
                 ));
+                // The jump hop still authenticates with only the *first*
+                // readable identity: `connect_via_jump_or_direct`/`JumpHost`
+                // take a single `Credential` and authenticate it internally,
+                // so trying each jump candidate in turn (the way the target
+                // hop below now does) would need a `russh-stream-session` API
+                // change to accept and iterate a credential list — a
+                // documented follow-up, kept out of this `russh_backend.rs`-
+                // local change. `resolve_hop` guarantees a non-empty list
+                // (it errors otherwise), so `next()` is always `Some`.
+                let ResolvedHop { hostname, port, username, credentials } = jump_resolved;
+                let jump_credential = credentials
+                    .into_iter()
+                    .next()
+                    .expect("resolve_hop returns a non-empty credential list or errors before this point");
                 Some((
-                    JumpHost {
-                        host: jump_resolved.hostname,
-                        port: jump_resolved.port,
-                        username: jump_resolved.username,
-                        credential: jump_resolved.credential,
-                    },
+                    JumpHost { host: hostname, port, username, credential: jump_credential },
                     jump_verifier,
                 ))
             }
@@ -261,9 +283,27 @@ impl RusshBackend {
             jump_host.credential.zeroize();
         }
 
-        let mut target_credential = target_resolved.credential;
-        let authed = authenticate_session(&mut session.handle, &target_resolved.username, &target_credential).await?;
-        target_credential.zeroize();
+        // Try each readable target identity in turn (mirrors
+        // `isekai-ssh::native::connect`'s own per-identity loop): a first key
+        // the server rejects, or one that fails to parse (e.g.
+        // passphrase-protected), must not block a later configured identity
+        // the server *would* accept. The previous "first readable key only"
+        // behavior silently failed the whole bootstrap in that case.
+        let mut authed = false;
+        for credential in &target_resolved.credentials {
+            match authenticate_session(&mut session.handle, &target_resolved.username, credential).await {
+                Ok(true) => {
+                    authed = true;
+                    break;
+                }
+                Ok(false) => continue,
+                Err(russh_stream_session::SessionError::InvalidPrivateKey(_)) => continue,
+                Err(e) => return Err(BootstrapError::Session(e)),
+            }
+        }
+        // Every candidate credential (accepted or not) is zeroized when
+        // `target_resolved` drops at this function's scope end, via
+        // `Credential`'s own `Drop` impl — no explicit pass needed.
         if !authed {
             return Err(BootstrapError::Session(russh_stream_session::SessionError::Auth(
                 russh::Error::NotAuthenticated,
@@ -276,12 +316,13 @@ impl RusshBackend {
 
 /// One hop's resolved connection parameters: the `HostName`-resolved
 /// address to actually dial, the port, the username to authenticate as, and
-/// the credential to authenticate with.
+/// the ordered list of candidate credentials to try (every readable
+/// `IdentityFile`, in probe order — non-empty by `resolve_hop`'s contract).
 struct ResolvedHop {
     hostname: String,
     port: u16,
     username: String,
-    credential: Credential,
+    credentials: Vec<Credential>,
 }
 
 /// Resolves `~/.ssh/config` for `host` (the literal `HostSpec`/`JumpSpec`
@@ -295,7 +336,7 @@ async fn resolve_hop(
     host: &str,
     explicit_user: Option<&str>,
     explicit_port: Option<u16>,
-    identity_file_override: Option<&Path>,
+    identity_file_override: Option<&[PathBuf]>,
 ) -> Result<ResolvedHop, BootstrapError> {
     let host_config = openssh_config::resolve_default(host)
         .map_err(|e| BootstrapError::ConfigResolve { host: host.to_string(), detail: e.to_string() })?;
@@ -309,41 +350,56 @@ async fn resolve_hop(
         .ok_or_else(|| BootstrapError::NoUsername { host: host.to_string() })?;
 
     let candidates = match identity_file_override {
-        Some(path) => vec![path.to_path_buf()],
+        Some(paths) => paths.to_vec(),
         None => {
             let home = isekai_fs_guard::resolve_home_dir().ok_or(BootstrapError::NoHomeDir)?;
             isekai_fs_guard::identity_file_candidates(&host_config.identity_file, &home)
         }
     };
-    let credential = load_first_existing(&candidates)
+    let credentials = readable_credentials(&candidates)
         .map_err(|detail| BootstrapError::NoCredential { host: host.to_string(), detail })?;
+    if credentials.is_empty() {
+        return Err(BootstrapError::NoCredential {
+            host: host.to_string(),
+            detail: format!(
+                "no usable identity file found (tried: {})",
+                candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
+            ),
+        });
+    }
 
-    Ok(ResolvedHop { hostname, port, username, credential })
+    Ok(ResolvedHop { hostname, port, username, credentials })
 }
 
 fn local_username() -> Option<String> {
     std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok())
 }
 
-/// Reads the first candidate in `candidates` that exists on disk and wraps
-/// it in a [`Credential::PublicKey`] — the ~10-line thin loader half of
-/// `IdentityFile` handling. The candidate *ordering* it consumes comes from
-/// the shared [`isekai_fs_guard::identity_file_candidates`]; only this
-/// `std::fs::read` + `Credential` wrapping stays here (and, identically, in
-/// `isekai-ssh::native::private_key`), since `isekai-fs-guard` deliberately
-/// doesn't depend on `russh-stream-session`/`Credential`.
-fn load_first_existing(candidates: &[PathBuf]) -> Result<Credential, String> {
+/// Reads *every* candidate in `candidates` that exists on disk, in order,
+/// wrapping each in a [`Credential::PublicKey`] — the ~10-line thin loader
+/// half of `IdentityFile` handling. Returns all readable candidates rather
+/// than just the first (mirrors `isekai-ssh::native::private_key`'s
+/// `readable_credentials`): `ssh(1)` offers every configured `IdentityFile`
+/// to the server in turn, so a first key that exists but is *rejected* or
+/// fails to *parse* must not block the remaining configured keys — the
+/// caller (`connect_and_authenticate`) tries each in order. A missing
+/// candidate (`NotFound`) is skipped; any other read error (e.g. a
+/// permissions problem on a file that *does* exist) is surfaced rather than
+/// silently dropped. The candidate *ordering* comes from the shared
+/// [`isekai_fs_guard::identity_file_candidates`]; only this `std::fs::read` +
+/// `Credential` wrapping stays here (and, identically, in that isekai-ssh
+/// module), since `isekai-fs-guard` deliberately doesn't depend on
+/// `russh-stream-session`/`Credential`.
+fn readable_credentials(candidates: &[PathBuf]) -> Result<Vec<Credential>, String> {
+    let mut credentials = Vec::new();
     for path in candidates {
         match std::fs::read(path) {
-            Ok(private_key_pem) => return Ok(Credential::PublicKey { private_key_pem }),
+            Ok(private_key_pem) => credentials.push(Credential::PublicKey { private_key_pem }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(format!("failed to read identity file {}: {e}", path.display())),
         }
     }
-    Err(format!(
-        "no usable identity file found (tried: {})",
-        candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
-    ))
+    Ok(credentials)
 }
 
 /// Real interactive TOFU prompt for a never-before-seen host key —
@@ -653,29 +709,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_first_existing_skips_missing_candidates() {
+    fn readable_credentials_skips_missing_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         let present = dir.path().join("id_ed25519");
         std::fs::write(&present, b"fake key bytes\n").unwrap();
 
-        let credential = load_first_existing(&[missing, present.clone()]).unwrap();
-        match &credential {
+        let credentials = readable_credentials(&[missing, present.clone()]).unwrap();
+        assert_eq!(credentials.len(), 1, "the missing candidate is skipped, the present one kept");
+        match &credentials[0] {
             Credential::PublicKey { private_key_pem } => assert_eq!(*private_key_pem, std::fs::read(&present).unwrap()),
             _ => panic!("expected Credential::PublicKey"),
         }
     }
 
     #[test]
-    fn load_first_existing_errors_when_nothing_exists() {
-        // `Credential` intentionally doesn't derive `Debug` (avoids
-        // accidentally formatting a private key into a log line), so
-        // `Result::unwrap_err()` isn't available here — match instead.
+    fn readable_credentials_returns_all_present_candidates_in_order() {
+        // Regression for the "only the first existing IdentityFile is ever
+        // loaded" bug: every present candidate must be returned, in order,
+        // so `connect_and_authenticate` can offer each in turn.
         let dir = tempfile::tempdir().unwrap();
-        match load_first_existing(&[dir.path().join("a"), dir.path().join("b")]) {
-            Err(detail) => assert!(detail.contains("no usable identity file")),
-            Ok(_) => panic!("expected an error when no candidate exists"),
-        }
+        let first = dir.path().join("id_ed25519");
+        let second = dir.path().join("id_rsa");
+        std::fs::write(&first, b"ed25519 bytes\n").unwrap();
+        std::fs::write(&second, b"rsa bytes\n").unwrap();
+
+        let credentials = readable_credentials(&[first.clone(), second.clone()]).unwrap();
+        assert_eq!(credentials.len(), 2, "both present candidates must be returned, not just the first");
+        let pems: Vec<&Vec<u8>> = credentials
+            .iter()
+            .map(|c| match c {
+                Credential::PublicKey { private_key_pem } => private_key_pem,
+                _ => panic!("expected Credential::PublicKey"),
+            })
+            .collect();
+        assert_eq!(*pems[0], std::fs::read(&first).unwrap(), "first candidate must come first");
+        assert_eq!(*pems[1], std::fs::read(&second).unwrap(), "second candidate must come second");
+    }
+
+    #[test]
+    fn readable_credentials_returns_empty_when_nothing_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = readable_credentials(&[dir.path().join("a"), dir.path().join("b")]).unwrap();
+        assert!(credentials.is_empty(), "no existing candidate means no credentials to offer");
     }
 
     #[test]

@@ -32,10 +32,17 @@ use tokio::sync::mpsc;
 /// key file looks like beyond "a valid OpenSSH-format private key `russh`
 /// can parse"). Returns (private key file path, loaded public key).
 fn generate_client_keypair(dir: &Path) -> (PathBuf, PublicKey) {
+    generate_named_client_keypair(dir, "client_id_ed25519")
+}
+
+/// Like [`generate_client_keypair`] but with a caller-chosen filename, so a
+/// test can write two distinct identities into the same dir without the
+/// second overwriting the first.
+fn generate_named_client_keypair(dir: &Path, filename: &str) -> (PathBuf, PublicKey) {
     let private_key = PrivateKey::random(&mut rand_core_from_rand08(), russh_keys::ssh_key::Algorithm::Ed25519)
         .expect("generating a random ed25519 key must not fail");
     let pem = private_key.to_openssh(LineEnding::LF).expect("encoding a freshly generated key must not fail");
-    let key_path = dir.join("client_id_ed25519");
+    let key_path = dir.join(filename);
     std::fs::write(&key_path, pem.as_bytes()).unwrap();
     (key_path, private_key.public_key().clone())
 }
@@ -334,4 +341,42 @@ async fn install_and_start_fails_with_a_wrong_client_key() {
     .await
     .expect("install_and_start should not hang even on auth failure");
     assert!(result.is_err(), "a key the server never accepted must fail authentication, not silently proceed");
+}
+
+/// Regression for #20 (RusshBackend's own bootstrap auth had #11's
+/// "only the first IdentityFile is ever tried" bug): the backend is given two
+/// candidate identities and the server accepts only the *second*. The first
+/// (rejected) key must not block the accepted second one — bootstrap must
+/// succeed. Before the fix, `resolve_hop` loaded only the first readable key
+/// and authentication stopped there.
+#[tokio::test(flavor = "multi_thread")]
+async fn install_and_start_tries_the_second_identity_when_the_first_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (first_key_path, _first_pub) = generate_named_client_keypair(tmp.path(), "id_first");
+    let (second_key_path, second_pub) = generate_named_client_keypair(tmp.path(), "id_second");
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // The server accepts ONLY the second identity.
+    let server_addr = spawn_fake_ssh_server(home, second_pub).await;
+
+    let fake_helper_script = format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n");
+
+    let backend = RusshBackend::new()
+        .expect("RusshBackend::new should succeed")
+        .with_store_path(tmp.path().join("known_ssh_hosts.toml"))
+        .with_confirm_new_host(std::sync::Arc::new(|_fingerprint| true))
+        .with_identity_files(vec![first_key_path, second_key_path]);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], fake_helper_script.as_bytes(), &LaunchSpec::Relay(dummy_relay_spec()), None, &[]),
+    )
+    .await
+    .expect("install_and_start should not hang")
+    .expect("the second configured identity is accepted, so bootstrap must succeed despite the first being rejected");
+
+    assert_eq!(report.handshake.v, 1);
+    assert_eq!(report.handshake.direct_by_bootstrap_host_port(), Some(45231));
 }
