@@ -79,6 +79,22 @@ fn resolve_agent_target_from(
     }
 }
 
+/// Whether a failure to *connect* to the agent should be treated as "no agent
+/// is available" (fall through to the final `no configured private key or SSH
+/// agent identity was accepted` guidance) rather than surfaced as a hard
+/// error. Only the platform-*default* agent gets this grace: a default
+/// `ssh-agent` that simply isn't running is the ordinary Windows state (the
+/// service is opt-in), and reporting its named-pipe connect failure would bury
+/// the real, actionable message under a confusing error about an agent the
+/// user never configured. An explicitly configured `IdentityAgent <path>` that
+/// fails to connect, by contrast, is a genuine misconfiguration the user asked
+/// for and must keep its hard error. ([`AgentTarget::None`] never connects at
+/// all — [`connect_agent`] returns `Ok(None)` for it — so it never reaches
+/// this check in practice; `false` is the correct, harmless answer regardless.)
+pub(crate) fn agent_connect_failure_is_benign(target: &AgentTarget) -> bool {
+    matches!(target, AgentTarget::Default)
+}
+
 /// Connects to the agent named by `target`, Windows-only (named pipe or
 /// Pageant) — the actual point of this whole module. Not exercised by any
 /// test in this codebase: doing so needs a real Windows OpenSSH agent or
@@ -186,6 +202,32 @@ mod tests {
         assert_eq!(
             target, AgentTarget::None,
             "an explicit SSH_AUTH_SOCK sentinel with the env var unset must not silently fall back to the platform default"
+        );
+    }
+
+    /// Regression: a *default* agent that fails to connect (the ordinary
+    /// Windows state — the `ssh-agent` service isn't running) must be treated
+    /// as "no agent available", letting `try_agent_auth` return `Ok(false)`
+    /// and the caller reach its clear final error, rather than propagating a
+    /// confusing named-pipe connect failure for an agent the user never
+    /// configured. An *explicitly* configured `IdentityAgent <path>` that
+    /// fails, by contrast, is a real misconfiguration and keeps its hard error.
+    /// (`try_agent_auth` itself is `cfg(windows)`-only — it needs a real
+    /// Windows agent transport — so the platform-generic *decision* is what's
+    /// unit-tested here.)
+    #[test]
+    fn a_default_agent_connect_failure_is_benign_but_an_explicit_one_is_not() {
+        assert!(
+            agent_connect_failure_is_benign(&AgentTarget::Default),
+            "a default ssh-agent that isn't running is the normal state, not a hard error"
+        );
+        assert!(
+            !agent_connect_failure_is_benign(&AgentTarget::Path(r"\\.\pipe\configured-agent".to_string())),
+            "an explicitly configured IdentityAgent that won't connect must surface as a real error"
+        );
+        assert!(
+            !agent_connect_failure_is_benign(&AgentTarget::None),
+            "IdentityAgent none never connects, so it is not a 'benign connect failure' either"
         );
     }
 

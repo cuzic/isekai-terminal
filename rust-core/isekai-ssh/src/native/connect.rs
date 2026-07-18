@@ -576,8 +576,17 @@ async fn try_agent_auth<H: client::Handler>(
     host_config: &openssh_config::HostConfig,
 ) -> Result<bool> {
     let target = agent_auth::resolve_agent_target(host_config.identity_agent.as_deref());
-    let Some(mut agent) = agent_auth::connect_agent(&target).await? else {
-        return Ok(false);
+    let mut agent = match agent_auth::connect_agent(&target).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return Ok(false),
+        // A default agent that isn't running is the normal Windows state, not
+        // a configuration error: swallow its connect failure so we reach the
+        // final, actionable "no ... identity was accepted" message instead of
+        // a confusing error about an agent the user never set up. An explicit
+        // `IdentityAgent <path>` keeps its hard error (see
+        // `agent_auth::agent_connect_failure_is_benign`).
+        Err(_) if agent_auth::agent_connect_failure_is_benign(&target) => return Ok(false),
+        Err(e) => return Err(e),
     };
     let identities = agent.request_identities().await.context("failed to list SSH agent identities")?;
     Ok(agent_auth::try_each_identity(handle, username, &identities, &mut agent).await?)
