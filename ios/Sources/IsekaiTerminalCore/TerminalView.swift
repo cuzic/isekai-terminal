@@ -694,11 +694,6 @@ private struct TerminalInputRepresentable: UIViewRepresentable {
         // handleHardwareKeyPress`経由)がDECKPAMに従ってSS3/リテラル文字を切り替え
         // られるよう、`applicationCursorMode`と同じパターンでRust由来の値を反映する。
         uiView.applicationKeypadMode = uiState.latestScreenUpdate?.applicationKeypadMode ?? false
-        // タスク#72: ハードウェアキーボードのEscapeキーがKitty keyboard protocol(タスク#54)の
-        // disambiguate escape codes(bit0)を反映できるよう、`applicationCursorMode`と同じ
-        // パターンでRust由来の値を反映する(以前は交渉されたflagsが一切反映されない既存バグ
-        // だった)。
-        uiView.kittyKeyboardFlags = uiState.latestScreenUpdate?.kittyKeyboardFlags ?? 0
         if isActive {
             if !uiView.isFirstResponder {
                 DispatchQueue.main.async { uiView.becomeFirstResponder() }
@@ -845,11 +840,7 @@ private final class TerminalAccessoryBar: UIView {
     @objc private func handleTap(_ sender: UIButton) {
         guard keys.indices.contains(sender.tag) else { return }
         let applicationCursorMode = controller?.uiState.latestScreenUpdate?.applicationCursorMode ?? false
-        // タスク#72: 「Esc」ボタンがKitty keyboard protocol(タスク#54)のdisambiguate
-        // escape codes(bit0)をハードウェアキーボード経路と同じく反映できるよう、
-        // 交渉済みflagsをそのまま渡す(以前は反映されない既存バグだった)。
-        let kittyFlags = controller?.uiState.latestScreenUpdate?.kittyKeyboardFlags ?? 0
-        let bytes = TerminalKeyMapper.bytes(for: keys[sender.tag], applicationCursorMode: applicationCursorMode, kittyFlags: kittyFlags)
+        let bytes = TerminalKeyMapper.bytes(for: keys[sender.tag], applicationCursorMode: applicationCursorMode)
         controller?.send(Data(bytes))
     }
 

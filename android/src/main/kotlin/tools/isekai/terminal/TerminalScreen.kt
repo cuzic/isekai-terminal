@@ -940,18 +940,7 @@ fun TerminalScreenBody(
                     CtrlBtn("Ctrl", active = ctrlArmed) { ctrlArmed = !ctrlArmed }
                     CtrlBtn("↵") { inputView?.commitComposing(); actions.onSend(byteArrayOf(0x0D)) }
                     CtrlBtn("Tab") { actions.onSend(byteArrayOf(0x09)) }
-                    // Kitty keyboard protocol(タスク#54)のdisambiguate escape codes(bit0)が
-                    // negotiateされている場合はCSI u形式(`ESC[27u`)を送る必要があるため、固定
-                    // バイト列ではなくspecialKeyBytes経由にする(タスク#72、以前は交渉された
-                    // flagsが一切反映されない既存バグだった)。
-                    CtrlBtn("Esc") {
-                        actions.onSend(
-                            TerminalKeyEncoder.specialKeyBytes(
-                                TerminalKeyEncoder.KC_ESCAPE,
-                                kittyFlags = screenUpdate?.kittyKeyboardFlags ?: 0u,
-                            )!!,
-                        )
-                    }
+                    CtrlBtn("Esc") { actions.onSend(byteArrayOf(0x1B)) }
                     CtrlBtn("^C") { actions.onSend(byteArrayOf(0x03)) }
                     CtrlBtn("^D") { actions.onSend(byteArrayOf(0x04)) }
                     CtrlBtn("^Z") { actions.onSend(byteArrayOf(0x1A)) }
@@ -1014,7 +1003,6 @@ fun TerminalScreenBody(
                         view.applicationCursorMode = screenUpdate?.applicationCursorMode ?: false
                         view.applicationKeypadMode = screenUpdate?.applicationKeypadMode ?: false
                         view.bracketedPasteMode = screenUpdate?.bracketedPasteMode ?: false
-                        view.kittyKeyboardFlags = screenUpdate?.kittyKeyboardFlags ?: 0u
                         view.keyboardLayoutMode = keyboardLayoutMode
                         view.ctrlArmed = ctrlArmed
                         view.onCtrlConsumed = { ctrlArmed = false }
