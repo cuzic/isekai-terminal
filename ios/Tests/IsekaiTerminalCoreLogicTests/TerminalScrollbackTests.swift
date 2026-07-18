@@ -12,7 +12,10 @@ final class TerminalScrollbackTests: XCTestCase {
         )
     }
 
-    private func makeUpdate(rows: [String], cols: Int, cursorRow: UInt32 = 0, cursorCol: UInt32 = 0) -> ScreenUpdate {
+    private func makeUpdate(
+        rows: [String], cols: Int, cursorRow: UInt32 = 0, cursorCol: UInt32 = 0,
+        cursorVisible: Bool = true
+    ) -> ScreenUpdate {
         var cells: [CellData] = []
         for line in rows {
             var padded = Array(line)
@@ -24,7 +27,8 @@ final class TerminalScrollbackTests: XCTestCase {
         return ScreenUpdate(
             cols: UInt32(cols), rows: UInt32(rows.count), cells: cells,
             cursorRow: cursorRow, cursorCol: cursorCol, title: "session",
-            applicationCursorMode: true, bracketedPasteMode: true
+            applicationCursorMode: true, bracketedPasteMode: true,
+            cursorVisible: cursorVisible
         )
     }
 
@@ -48,6 +52,16 @@ final class TerminalScrollbackTests: XCTestCase {
         XCTAssertEqual(result.title, live.title)
         XCTAssertEqual(result.applicationCursorMode, live.applicationCursorMode)
         XCTAssertEqual(result.bracketedPasteMode, live.bracketedPasteMode)
+        XCTAssertEqual(result.cursorVisible, live.cursorVisible)
+    }
+
+    func testPreservesCursorVisibilityFalseWhenShowingScrollback() {
+        let live = makeUpdate(rows: ["live line"], cols: 20, cursorVisible: false)
+        let scrollbackCells = Array(repeating: makeCell("x"), count: 20)
+
+        let result = synthesizeDisplayUpdate(live: live, scrollOffset: 5, scrollbackCells: scrollbackCells)
+
+        XCTAssertEqual(result.cursorVisible, false)
     }
 
     func testHidesCursorOffScreenWhenShowingScrollback() {

@@ -145,6 +145,10 @@ pub(crate) struct Terminal {
     pending_scrollback: Vec<Vec<TermCell>>,
     application_cursor_mode: bool,
     bracketed_paste_mode: bool,
+    /// DECTCEM(`CSI ?25h`/`CSI ?25l`)によるカーソル表示/非表示状態。既定は表示(`true`)。
+    /// vim/lessなどがカーソルを隠す指示を送るケースに対応するため、`ScreenUpdate`へ
+    /// そのまま伝播する(`session.rs::make_screen_update`参照)。
+    cursor_visible: bool,
 }
 
 impl Terminal {
@@ -171,6 +175,7 @@ impl Terminal {
             pending_scrollback: Vec::new(),
             application_cursor_mode: false,
             bracketed_paste_mode: false,
+            cursor_visible: true,
         }
     }
 
@@ -215,6 +220,7 @@ impl Terminal {
     }
     pub(crate) fn application_cursor_mode(&self) -> bool { self.application_cursor_mode }
     pub(crate) fn bracketed_paste_mode(&self) -> bool { self.bracketed_paste_mode }
+    pub(crate) fn cursor_visible(&self) -> bool { self.cursor_visible }
     pub(crate) fn screen_cells(&self) -> &[TermCell] { self.cells() }
 
     fn reset_all(&mut self) {
@@ -234,6 +240,7 @@ impl Terminal {
         self.pending_clipboard_pull_request = false;
         self.application_cursor_mode = false;
         self.bracketed_paste_mode = false;
+        self.cursor_visible = true;
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -611,7 +618,8 @@ impl Perform for Terminal {
                 ('h', 1049) => { self.switch_to_alt(true); }
                 ('l', 47) | ('l', 1047) => { self.switch_to_main(false); }
                 ('l', 1049) => { self.switch_to_main(true); }
-                ('h', 25) | ('l', 25) => {}
+                ('h', 25) => { self.cursor_visible = true; }
+                ('l', 25) => { self.cursor_visible = false; }
                 ('h', 1) => { self.application_cursor_mode = true; }
                 ('l', 1) => { self.application_cursor_mode = false; }
                 ('h', 2004) => { self.bracketed_paste_mode = true; }
@@ -1174,6 +1182,33 @@ mod tests {
         assert_eq!(t.title(), Some("My Title"));
         assert!(t.application_cursor_mode());
         assert!(t.bracketed_paste_mode());
+    }
+
+    #[test]
+    fn test_dectcem_hides_and_shows_cursor() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert!(t.cursor_visible(), "既定はカーソル表示");
+        feed(&mut t, b"\x1b[?25l"); // DECTCEM: カーソル非表示
+        assert!(!t.cursor_visible());
+        feed(&mut t, b"\x1b[?25h"); // DECTCEM: カーソル表示
+        assert!(t.cursor_visible());
+    }
+
+    #[test]
+    fn test_dectcem_reset_by_ris() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?25l");
+        assert!(!t.cursor_visible());
+        feed(&mut t, b"\x1bc"); // RIS (full reset)
+        assert!(t.cursor_visible(), "RISで既定の表示状態に戻る");
+    }
+
+    #[test]
+    fn test_resize_preserving_state_preserves_cursor_visibility() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?25l"); // カーソル非表示にしてからリサイズ
+        t.resize_preserving_state(40, 12);
+        assert!(!t.cursor_visible(), "リサイズでカーソル非表示状態が消えてはいけない");
     }
 
     #[test]

@@ -2902,10 +2902,17 @@ public struct ScreenUpdate: Equatable, Hashable {
     public var title: String?
     public var applicationCursorMode: Bool
     public var bracketedPasteMode: Bool
+    /**
+     * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
+     */
+    public var cursorVisible: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, bracketedPasteMode: Bool) {
+    public init(cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, bracketedPasteMode: Bool, 
+        /**
+         * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
+         */cursorVisible: Bool) {
         self.cols = cols
         self.rows = rows
         self.cells = cells
@@ -2914,6 +2921,7 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.title = title
         self.applicationCursorMode = applicationCursorMode
         self.bracketedPasteMode = bracketedPasteMode
+        self.cursorVisible = cursorVisible
     }
 
     
@@ -2939,7 +2947,8 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 cursorCol: FfiConverterUInt32.read(from: &buf), 
                 title: FfiConverterOptionString.read(from: &buf), 
                 applicationCursorMode: FfiConverterBool.read(from: &buf), 
-                bracketedPasteMode: FfiConverterBool.read(from: &buf)
+                bracketedPasteMode: FfiConverterBool.read(from: &buf), 
+                cursorVisible: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -2952,6 +2961,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.title, into: &buf)
         FfiConverterBool.write(value.applicationCursorMode, into: &buf)
         FfiConverterBool.write(value.bracketedPasteMode, into: &buf)
+        FfiConverterBool.write(value.cursorVisible, into: &buf)
     }
 }
 

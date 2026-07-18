@@ -583,6 +583,8 @@ pub struct ScreenUpdate {
     pub title: Option<String>,
     pub application_cursor_mode: bool,
     pub bracketed_paste_mode: bool,
+    /// DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
+    pub cursor_visible: bool,
 }
 
 // ── New orchestrator public types ────────────────────────

@@ -329,6 +329,7 @@ fun TerminalScreenBody(
                                 title = update.title,
                                 applicationCursorMode = update.applicationCursorMode,
                                 bracketedPasteMode = update.bracketedPasteMode,
+                                cursorVisible = update.cursorVisible,
                             )
                         } else update
                     } else update
