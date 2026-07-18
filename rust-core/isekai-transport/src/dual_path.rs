@@ -351,7 +351,17 @@ mod tests {
     /// for the same technique), so the unreliable side's real QUIC handshake
     /// against a live listener is guaranteed to still be in progress when
     /// `try_join!` observes the first error and drops it.
+    ///
+    /// Windows-only: confirmed on a real `test-windows` CI run that this
+    /// relies on a Unix-only assumption — see
+    /// `physical_interface::tests::bogus_interface_index_fails_rather_than_panicking`'s
+    /// own identical `#[cfg(not(windows))]` caveat (Windows doesn't validate
+    /// a bogus interface index at bind time, so the "reliable" side here
+    /// doesn't fail fast on Windows either; it instead fails much later via
+    /// a QUIC-level timeout that this test's own 5-second bound is too short
+    /// for).
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn connect_dual_path_cancels_the_still_pending_side_when_the_other_fails_immediately() {
         let (unreliable_addr, unreliable_cert) = spawn_unreliable_echo_listener().await;
 
@@ -379,7 +389,11 @@ mod tests {
         assert!(matches!(err, TransportError::Mux(MuxError::Bind { .. })), "expected a bind error from the bogus interface, got {err:?}");
     }
 
+    /// Windows-only: relies on the same bogus-interface-fails-fast
+    /// assumption as `connect_dual_path_cancels_the_still_pending_side_when_the_other_fails_immediately`
+    /// above, which doesn't hold on Windows — see that test's doc comment.
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn connect_dual_path_best_effort_returns_each_sides_result_independently() {
         let (unreliable_addr, unreliable_cert) = spawn_unreliable_echo_listener().await;
 
@@ -438,7 +452,12 @@ mod tests {
     /// Regression test: an IPv6-only remote (this module's own motivating
     /// case — a cellular interface via 464XLAT/NAT64) must be dialable, not
     /// silently impossible because the dial always bound an IPv4 socket.
+    ///
+    /// Windows-only: see `physical_interface::connect_via_interface`'s doc
+    /// comment on the confirmed (`test-windows` CI) `noq` IPv6 limitation —
+    /// this is the same gap, one level up.
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn connect_dual_path_dials_an_ipv6_remote() {
         let (server_config, cert_sha256_hex) = build_server_config(None);
         let listener =
