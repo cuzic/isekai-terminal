@@ -124,21 +124,36 @@ mod tests {
     /// `env!("CARGO_BIN_EXE_echo_test_shim")` isn't available here — Cargo
     /// only populates `CARGO_BIN_EXE_*` for integration test/bench targets,
     /// not for a binary crate's own internal unit test harness (and
-    /// `isekai-ssh` has no `lib.rs`, so this can't be moved to
-    /// `tests/` either — integration tests can't reach `pub(crate)` items
-    /// of a binary-only crate). Deriving it from `current_exe()` (the
-    /// running test binary's own path,
-    /// `target/<profile>/deps/isekai_ssh-<hash>`) is the standard
-    /// workaround: strip the trailing `deps` component to reach
-    /// `target/<profile>/`, where `cargo build`/`cargo test` always also
-    /// places every `[[bin]]`/`src/bin/*.rs` target under its own name.
+    /// `isekai-ssh` has no `lib.rs`, so this can't be moved to `tests/`
+    /// either — integration tests can't reach `pub(crate)` items of a
+    /// binary-only crate). Deriving the path from `current_exe()` (the
+    /// running test binary's own path, `target/<profile>/deps/isekai_ssh-
+    /// <hash>` → strip `deps` to reach `target/<profile>/`, where every
+    /// `[[bin]]`/`src/bin/*.rs` target also lands) is the standard
+    /// workaround for locating a sibling binary — but that only tells you
+    /// *where it would be*, not that it's actually been built: running the
+    /// narrower `cargo test -p isekai-ssh --bin isekai-ssh` (as opposed to
+    /// the whole-package `cargo test -p isekai-ssh`) does **not** build
+    /// `echo_test_shim` as a side effect (confirmed empirically — this bug
+    /// shipped once already and was only caught by Codex review, not by
+    /// running the test itself under that narrower invocation). So this
+    /// always builds it first, making the test self-sufficient regardless
+    /// of which `cargo test` invocation runs it — `cargo build` is a fast
+    /// no-op on repeat calls once it's already up to date.
     fn echo_test_shim_path() -> std::path::PathBuf {
+        let status = std::process::Command::new(env!("CARGO"))
+            .args(["build", "--bin", "echo_test_shim", "-p", "isekai-ssh"])
+            .status()
+            .expect("invoking `cargo build --bin echo_test_shim` should succeed");
+        assert!(status.success(), "building the echo_test_shim test fixture failed");
+
         let mut path = std::env::current_exe().expect("current_exe() should succeed under `cargo test`");
         path.pop();
         if path.ends_with("deps") {
             path.pop();
         }
         path.push(if cfg!(windows) { "echo_test_shim.exe" } else { "echo_test_shim" });
+        assert!(path.exists(), "expected {} to exist after building it", path.display());
         path
     }
 
@@ -159,12 +174,11 @@ mod tests {
     /// Exercises the actual `spawn_isekai_pipe_connect` contract end to
     /// end (not just `ChildStdio` in isolation): the intent gets written to
     /// `runtime_dir`, `ISEKAI_INTENT_ID`/`ISEKAI_PIPE_RUNTIME_DIR` are set
-    /// and inherited by the child (verified via the child's own
-    /// `ECHO_TEST_SHIM_ANNOUNCE_ENV` preamble — the exact bug the Codex
-    /// review on the first version of this file caught: without these env
-    /// vars, `isekai-pipe connect` silently falls back to a different,
-    /// non-`ConnectOutcome`-recording code path), and bytes round-trip
-    /// through `ChildStdio` afterward.
+    /// and inherited by the child (verified via the child's own env-var
+    /// preamble — the exact bug an earlier Codex review caught: without
+    /// these env vars, `isekai-pipe connect` silently falls back to a
+    /// different, non-`ConnectOutcome`-recording code path), and bytes
+    /// round-trip through `ChildStdio` afterward.
     #[tokio::test]
     async fn spawn_writes_intent_sets_env_vars_and_round_trips_bytes() {
         let runtime_dir = tempfile::tempdir().unwrap();
@@ -180,17 +194,28 @@ mod tests {
 
         let mut stdio = ChildStdio::take_from(&mut child).expect("both stdin and stdout were piped");
 
-        let mut announced = [0u8; 256];
-        let n = stdio.read(&mut announced).await.unwrap();
-        let announced = String::from_utf8_lossy(&announced[..n]);
-        assert!(
-            announced.contains(&format!("ISEKAI_INTENT_ID={}", intent.intent_id)),
-            "child must see the same intent_id via env: {announced:?}"
-        );
-        assert!(
-            announced.contains(&format!("ISEKAI_PIPE_RUNTIME_DIR={}", runtime_dir.path().display())),
-            "child must see the runtime_dir via env: {announced:?}"
-        );
+        // `AsyncRead` is explicitly allowed to return a partial read (this
+        // is a pipe, not a fixed-size in-memory buffer) — the 2-line env-var
+        // preamble can arrive split across more than one `read()` call, so
+        // accumulate until both expected lines have shown up rather than
+        // assuming one `read()` sees everything (a real flake Codex review
+        // caught: the original version of this test only read once).
+        let expected_intent_line = format!("ISEKAI_INTENT_ID={}\n", intent.intent_id);
+        let expected_runtime_dir_line = format!("ISEKAI_PIPE_RUNTIME_DIR={}\n", runtime_dir.path().display());
+        let mut announced = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), stdio.read(&mut chunk))
+                .await
+                .expect("reading the env-var preamble should not hang")
+                .unwrap();
+            assert!(n > 0, "child closed its stdout before announcing both env vars: {announced:?}");
+            announced.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&announced);
+            if text.contains(&expected_intent_line) && text.contains(&expected_runtime_dir_line) {
+                break;
+            }
+        }
 
         stdio.write_all(b"hello from ChildStdio\n").await.unwrap();
         stdio.flush().await.unwrap();
