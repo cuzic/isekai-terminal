@@ -16,7 +16,22 @@ const SIXEL_CELL_HEIGHT_PX: usize = 20;
 /// 同じ場所へ画像を上書きし続けるだけのストリーム(dedupeせず`images`へpushし
 /// 続ける)でメモリが無制限に増えるのを防ぐ——上限に達したら最も古いものを
 /// 1つ捨てる(`SCROLLBACK_LIMIT`と同種の素朴なキャップ、`session.rs`参照)。
+///
+/// 個数だけのキャップであり総バイト数は見ていないため、単体上限
+/// (`sixel::MAX_SIXEL_AREA` = 4M pixel = RGBA8888で16MiB相当)いっぱいの画像を
+/// `MAX_LIVE_IMAGES`回連続で送りつけられると理論上16MiB×32=512MiBまで増え得る
+/// (タスク#90、`ScreenUpdate::images`として毎フレーム`to_vec()`で複製される分の
+/// FFIコピー負荷も同様)。`MAX_TOTAL_IMAGE_RGBA_BYTES`が総バイト数側のキャップを
+/// 別途掛ける。
 const MAX_LIVE_IMAGES: usize = 32;
+/// ライブなSixel画像の`rgba`バイト列の合計サイズ上限(バイト)。`MAX_LIVE_IMAGES`
+/// (個数の上限)だけでは単体最大サイズ(16MiB)の画像を32枚溜め込まれた場合の
+/// 理論上限(512MiB)を防げない(タスク#90)ため、こちらは総バイト数を直接キャップ
+/// する。単体上限(16MiB)の数枚分は正当な用途(進捗表示等で連続する数枚のSixel)
+/// として許容しつつ、512MiBという理論上限を大幅に下げる値として単体上限の4倍
+/// (64MiB)を選ぶ。`place_sixel_image`は新しい画像を追加した後、この合計または
+/// `MAX_LIVE_IMAGES`を超えている間、最も古い画像から順に捨てる。
+const MAX_TOTAL_IMAGE_RGBA_BYTES: usize = 64 * 1024 * 1024;
 /// OSC 8(タスク#40)のURL intern表(`Terminal::link_table`)に登録できるURLの
 /// 上限件数。`link_table`は(scrollback中の過去セルの`link_id`がindexとして
 /// 指し続けるため)RISでもクリアせず単調増加する設計(`link_table`フィールドの
@@ -747,6 +762,12 @@ impl Terminal {
         self.images.clear();
     }
 
+    /// 現在ライブな全Sixel画像の`rgba`バイト列の合計サイズ(バイト)。
+    /// `place_sixel_image`の`MAX_TOTAL_IMAGE_RGBA_BYTES`判定に使う(タスク#90)。
+    fn total_image_rgba_bytes(&self) -> usize {
+        self.images.iter().map(|img| img.rgba.len()).sum()
+    }
+
     /// デコードが完了したSixelビットマップを、現在のカーソル位置を左上として
     /// グリッドへ配置する(タスク#42)。行・列方向とも画面の残りサイズへクランプする
     /// (`ImagePlacement`のdocコメント「実装範囲」参照——画像による自動スクロールは
@@ -771,7 +792,14 @@ impl Terminal {
             height_px: img.height as u32,
             rgba: img.rgba,
         });
-        if self.images.len() > MAX_LIVE_IMAGES {
+        // 個数(`MAX_LIVE_IMAGES`)と合計バイト数(`MAX_TOTAL_IMAGE_RGBA_BYTES`)の
+        // 両方を満たすまで、最も古い画像から順に捨てる(タスク#90)。新しく
+        // push した画像自体は単体で`MAX_TOTAL_IMAGE_RGBA_BYTES`を超えることは
+        // ない(`sixel::MAX_SIXEL_AREA`による単体上限が総バイト数上限より
+        // 十分小さい)ため、このループが全画像を捨て切ることはない。
+        while self.images.len() > MAX_LIVE_IMAGES
+            || self.total_image_rgba_bytes() > MAX_TOTAL_IMAGE_RGBA_BYTES
+        {
             self.images.remove(0);
         }
 
@@ -5652,6 +5680,64 @@ mod tests {
         feed(&mut t, b"\x1b[c");
         let resp = t.take_pending_terminal_responses();
         assert_eq!(resp, vec![b"\x1b[?1;2;4c".to_vec()], "DA1応答に';4'(Sixel対応)が含まれること");
+    }
+
+    #[test]
+    fn test_sixel_total_rgba_bytes_capped_even_when_under_max_live_images() {
+        // タスク#90再現条件: 約2000x2000px(sixel::MAX_SIXEL_AREA相当、RGBA8888で
+        // 16MiB)の画像を`MAX_LIVE_IMAGES`(32)回連続で置くと、個数キャップだけ
+        // では理論上16MiB×32=512MiBまで増え得る。`place_sixel_image`を直接
+        // 呼び(実際のsixelバイト列エンコードは不要——寿命管理ロジックの検証が
+        // 目的)、合計バイト数が`MAX_TOTAL_IMAGE_RGBA_BYTES`(64MiB)を上回らない
+        // ことを確認する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let width = 2000usize;
+        let height = 2000usize;
+        assert_eq!(width * height, 4_000_000, "テストの前提: 2000x2000pxはsixel::MAX_SIXEL_AREA(4_000_000)と一致する");
+        for _ in 0..32 {
+            t.place_sixel_image(SixelImage {
+                width,
+                height,
+                rgba: vec![0u8; width * height * 4],
+            });
+        }
+        let total: usize = t.images().iter().map(|img| img.rgba.len()).sum();
+        assert!(
+            total <= MAX_TOTAL_IMAGE_RGBA_BYTES,
+            "合計RGBAバイト数がMAX_TOTAL_IMAGE_RGBA_BYTES({MAX_TOTAL_IMAGE_RGBA_BYTES})を超えている: {total}"
+        );
+        assert!(t.images().len() < 32, "総バイト数キャップにより個数キャップ(32)未満まで捨てられているはず");
+    }
+
+    #[test]
+    fn test_sixel_total_rgba_bytes_evicts_oldest_first() {
+        // 総バイト数キャップに達したら最も古い画像から捨てる(`MAX_LIVE_IMAGES`
+        // 超過時の1枚捨てと同じ「古いものを優先して捨てる」ポリシー)ことを、
+        // idの単調増加で確認する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        let width = 2000usize;
+        let height = 2000usize;
+        for _ in 0..8 {
+            t.place_sixel_image(SixelImage { width, height, rgba: vec![0u8; width * height * 4] });
+        }
+        let ids: Vec<u64> = t.images().iter().map(|img| img.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "残っている画像は古い順(id昇順)のまま並んでいるはず");
+        // 最初に置いた画像(id最小)は総バイト数キャップにより既に捨てられている。
+        assert!(!ids.contains(&0), "最も古い画像(id=0)は総バイト数キャップで捨てられているはず");
+    }
+
+    #[test]
+    fn test_sixel_small_images_not_evicted_by_byte_cap_within_max_live_images() {
+        // 小さい画像であれば総バイト数キャップに達しないため、
+        // `MAX_LIVE_IMAGES`(個数キャップ)の挙動がそのまま保たれることを確認する
+        // (総バイト数キャップの追加が既存の個数キャップの挙動を壊していないこと)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        for _ in 0..40 {
+            t.place_sixel_image(SixelImage { width: 1, height: 1, rgba: vec![0, 0, 0, 255] });
+        }
+        assert_eq!(t.images().len(), MAX_LIVE_IMAGES, "小さい画像では従来通りMAX_LIVE_IMAGES(32)枚に収まること");
     }
 
     // ── Proptest: 不変量 ────────────────────────────────
