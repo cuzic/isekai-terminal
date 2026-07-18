@@ -14,7 +14,7 @@ final class TerminalScrollbackTests: XCTestCase {
 
     private func makeUpdate(
         rows: [String], cols: Int, cursorRow: UInt32 = 0, cursorCol: UInt32 = 0,
-        cursorVisible: Bool = true
+        cursorVisible: Bool = true, bellGeneration: UInt64 = 0
     ) -> ScreenUpdate {
         var cells: [CellData] = []
         for line in rows {
@@ -28,7 +28,7 @@ final class TerminalScrollbackTests: XCTestCase {
             cols: UInt32(cols), rows: UInt32(rows.count), cells: cells,
             cursorRow: cursorRow, cursorCol: cursorCol, title: "session",
             applicationCursorMode: true, bracketedPasteMode: true,
-            cursorVisible: cursorVisible
+            cursorVisible: cursorVisible, bellGeneration: bellGeneration
         )
     }
 
@@ -53,6 +53,19 @@ final class TerminalScrollbackTests: XCTestCase {
         XCTAssertEqual(result.applicationCursorMode, live.applicationCursorMode)
         XCTAssertEqual(result.bracketedPasteMode, live.bracketedPasteMode)
         XCTAssertEqual(result.cursorVisible, live.cursorVisible)
+        XCTAssertEqual(result.bellGeneration, live.bellGeneration)
+    }
+
+    func testPreservesBellGenerationWhenShowingScrollback() {
+        // bellGenerationはBEL通知用のRust側SSOTカウンタ(タスク#24)。スクロールバック
+        // 表示に切り替えても直近のライブ値を落としてはいけない(Android版`TerminalScreen.kt`
+        // の`bellGeneration = update.bellGeneration`と対称)。
+        let live = makeUpdate(rows: ["live line"], cols: 20, bellGeneration: 7)
+        let scrollbackCells = Array(repeating: makeCell("x"), count: 20)
+
+        let result = synthesizeDisplayUpdate(live: live, scrollOffset: 5, scrollbackCells: scrollbackCells)
+
+        XCTAssertEqual(result.bellGeneration, 7)
     }
 
     func testPreservesCursorVisibilityFalseWhenShowingScrollback() {

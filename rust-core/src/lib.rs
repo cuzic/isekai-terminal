@@ -585,6 +585,14 @@ pub struct ScreenUpdate {
     pub bracketed_paste_mode: bool,
     /// DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
     pub cursor_visible: bool,
+    /// BEL(0x07)受信のたびに単調増加する世代カウンタ。`bool`ではなくカウンタにして
+    /// あるのは、conflated チャネル越しに複数回の BEL が1つの`ScreenUpdate`にまとめ
+    /// られても呼び出し側が「前回より進んだか」で取りこぼしを検知でき、かつ同一
+    /// `ScreenUpdate`の再適用で二重にフィードバック(バイブ/フラッシュ)が
+    /// 発火するのを避けられるため。呼び出し側は前回値と比較し、進んでいれば
+    /// フィードバックを1回発火させること。OSC のターミネータとして使われた BEL
+    /// (`ESC]0;title BEL`)はカウントされない。
+    pub bell_generation: u64,
 }
 
 // ── New orchestrator public types ────────────────────────

@@ -18,6 +18,7 @@ public func synthesizeDisplayUpdate(live update: ScreenUpdate, scrollOffset: UIn
         title: update.title,
         applicationCursorMode: update.applicationCursorMode,
         bracketedPasteMode: update.bracketedPasteMode,
-        cursorVisible: update.cursorVisible
+        cursorVisible: update.cursorVisible,
+        bellGeneration: update.bellGeneration
     )
 }

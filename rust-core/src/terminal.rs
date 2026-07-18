@@ -149,6 +149,16 @@ pub(crate) struct Terminal {
     /// vim/lessなどがカーソルを隠す指示を送るケースに対応するため、`ScreenUpdate`へ
     /// そのまま伝播する(`session.rs::make_screen_update`参照)。
     cursor_visible: bool,
+    /// BEL(0x07)を受信するたびに単調増加するカウンタ。`ScreenUpdate::bell_generation`
+    /// としてそのまま公開する——bool ではなく世代カウンタにすることで、conflated
+    /// チャネル越しに複数回の BEL が1つの `ScreenUpdate` にまとめられても呼び出し側が
+    /// 「前回より値が進んだか」で取りこぼしを検知でき、同一 `ScreenUpdate` の再適用
+    /// (例: 画面回転後の再描画)で二重にフィードバックが鳴るのも防げる。
+    /// `reset_all`(RIS)では**意図的にリセットしない**——単調増加を維持する
+    /// (Fableレビュー: タスク#24)。OSC終端の BEL(`ESC]0;title BEL`)は vte が
+    /// ターミネータとして消費し `execute` には渡らないため、ここではカウントされない
+    /// (この仕様はテストで明記する)。
+    bell_generation: u64,
 }
 
 impl Terminal {
@@ -176,6 +186,7 @@ impl Terminal {
             application_cursor_mode: false,
             bracketed_paste_mode: false,
             cursor_visible: true,
+            bell_generation: 0,
         }
     }
 
@@ -221,6 +232,7 @@ impl Terminal {
     pub(crate) fn application_cursor_mode(&self) -> bool { self.application_cursor_mode }
     pub(crate) fn bracketed_paste_mode(&self) -> bool { self.bracketed_paste_mode }
     pub(crate) fn cursor_visible(&self) -> bool { self.cursor_visible }
+    pub(crate) fn bell_generation(&self) -> u64 { self.bell_generation }
     pub(crate) fn screen_cells(&self) -> &[TermCell] { self.cells() }
 
     fn reset_all(&mut self) {
@@ -595,6 +607,11 @@ impl Perform for Terminal {
 
     fn execute(&mut self, byte: u8) {
         match byte {
+            // `saturating_add`(`wrapping_add`ではない): u64::MAXで頭打ちにする。
+            // `wrapping_add`だとu64::MAX→0の周回でbell_generationが後退し、
+            // 「前回より値が進んだか」で検知する呼び出し側の単調増加前提
+            // (フィールドdoc参照)を壊してしまう(Codexレビュー: タスク#24)。
+            0x07 => { self.bell_generation = self.bell_generation.saturating_add(1); }
             0x0D => { self.cursor_col = 0; }
             0x0A | 0x0B | 0x0C => { self.newline(); }
             0x08 => { if self.cursor_col > 0 { self.cursor_col -= 1; } }
@@ -1201,6 +1218,46 @@ mod tests {
         assert!(!t.cursor_visible());
         feed(&mut t, b"\x1bc"); // RIS (full reset)
         assert!(t.cursor_visible(), "RISで既定の表示状態に戻る");
+    }
+
+    #[test]
+    fn test_bell_increments_generation() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert_eq!(t.bell_generation(), 0, "既定は0");
+        feed(&mut t, b"\x07");
+        assert_eq!(t.bell_generation(), 1);
+    }
+
+    #[test]
+    fn test_bell_multiple_increments_each_time() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x07\x07\x07");
+        assert_eq!(t.bell_generation(), 3, "BELを受信するたびに単調増加する");
+    }
+
+    #[test]
+    fn test_bell_osc_terminator_does_not_count() {
+        // vte は OSC のターミネータとして使われた BEL(`ESC]0;title BEL`)を
+        // ターミネータとして消費し、`execute()`には渡さない仕様。よって
+        // タイトル設定に伴う BEL では鳴ってはいけない(Fableレビュー: タスク#24)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]0;My Title\x07");
+        assert_eq!(t.title(), Some("My Title"));
+        assert_eq!(t.bell_generation(), 0, "OSC終端のBELではbell_generationは進まない");
+    }
+
+    #[test]
+    fn test_bell_not_reset_by_ris() {
+        // reset_all(RIS)はpending clipboard等を律儀にリセットするが、
+        // bell_generationは単調増加を維持する必要があるため意図的にリセットしない
+        // (Fableレビュー: タスク#24)。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x07\x07");
+        assert_eq!(t.bell_generation(), 2);
+        feed(&mut t, b"\x1bc"); // RIS (full reset)
+        assert_eq!(t.bell_generation(), 2, "RISでbell_generationはリセットされない");
+        feed(&mut t, b"\x07");
+        assert_eq!(t.bell_generation(), 3, "RIS後もカウントは継続する");
     }
 
     #[test]

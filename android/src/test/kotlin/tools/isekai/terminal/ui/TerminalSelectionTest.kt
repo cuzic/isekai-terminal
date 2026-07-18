@@ -33,6 +33,7 @@ class TerminalSelectionTest {
             applicationCursorMode = false,
             bracketedPasteMode = false,
             cursorVisible = true,
+            bellGeneration = 0uL,
         )
     }
 
@@ -95,7 +96,7 @@ class TerminalSelectionTest {
         val update = ScreenUpdate(
             cols = 80u, rows = 24u, cells = emptyList(),
             cursorRow = 0u, cursorCol = 0u, title = null,
-            applicationCursorMode = false, bracketedPasteMode = false, cursorVisible = true,
+            applicationCursorMode = false, bracketedPasteMode = false, cursorVisible = true, bellGeneration = 0uL,
         )
         val sel = SelectionRange(CellPos(0, 0), CellPos(1, 0))
         assertEquals("", reconstructSelectionText(update, sel))
@@ -106,7 +107,7 @@ class TerminalSelectionTest {
         val update = ScreenUpdate(
             cols = 0u, rows = 0u, cells = emptyList(),
             cursorRow = 0u, cursorCol = 0u, title = null,
-            applicationCursorMode = false, bracketedPasteMode = false, cursorVisible = true,
+            applicationCursorMode = false, bracketedPasteMode = false, cursorVisible = true, bellGeneration = 0uL,
         )
         val sel = SelectionRange(CellPos(0, 0), CellPos(0, 0))
         assertEquals("", reconstructSelectionText(update, sel))

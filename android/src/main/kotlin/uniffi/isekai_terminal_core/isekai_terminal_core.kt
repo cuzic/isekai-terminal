@@ -4584,6 +4584,17 @@ data class ScreenUpdate (
      * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
      */
     var `cursorVisible`: kotlin.Boolean
+    , 
+    /**
+     * BEL(0x07)受信のたびに単調増加する世代カウンタ。`bool`ではなくカウンタにして
+     * あるのは、conflated チャネル越しに複数回の BEL が1つの`ScreenUpdate`にまとめ
+     * られても呼び出し側が「前回より進んだか」で取りこぼしを検知でき、かつ同一
+     * `ScreenUpdate`の再適用で二重にフィードバック(バイブ/フラッシュ)が
+     * 発火するのを避けられるため。呼び出し側は前回値と比較し、進んでいれば
+     * フィードバックを1回発火させること。OSC のターミネータとして使われた BEL
+     * (`ESC]0;title BEL`)はカウントされない。
+     */
+    var `bellGeneration`: kotlin.ULong
     
 ){
     
@@ -4609,6 +4620,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
         )
     }
 
@@ -4621,7 +4633,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterOptionalString.allocationSize(value.`title`) +
             FfiConverterBoolean.allocationSize(value.`applicationCursorMode`) +
             FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`) +
-            FfiConverterBoolean.allocationSize(value.`cursorVisible`)
+            FfiConverterBoolean.allocationSize(value.`cursorVisible`) +
+            FfiConverterULong.allocationSize(value.`bellGeneration`)
     )
 
     override fun write(value: ScreenUpdate, buf: ByteBuffer) {
@@ -4634,6 +4647,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.write(value.`applicationCursorMode`, buf)
             FfiConverterBoolean.write(value.`bracketedPasteMode`, buf)
             FfiConverterBoolean.write(value.`cursorVisible`, buf)
+            FfiConverterULong.write(value.`bellGeneration`, buf)
     }
 }
 

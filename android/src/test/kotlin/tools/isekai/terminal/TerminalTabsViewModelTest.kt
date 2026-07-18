@@ -502,7 +502,7 @@ class TerminalTabsViewModelTest {
     // ── 打鍵列（KeySequence）─────────────────────────────────────
 
     private fun screenUpdate(applicationCursorMode: Boolean) =
-        ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, applicationCursorMode, false, true)
+        ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, applicationCursorMode, false, true, 0uL)
 
     @Test
     fun sendKeySequence_sendsResolvedStepsConcatenated() = runBlocking {
