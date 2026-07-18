@@ -85,4 +85,59 @@ final class TerminalKeyMapperTests: XCTestCase {
             TerminalKeyMapper.bytes(for: .arrowDown, applicationCursorMode: false)
         )
     }
+
+    // ── #31: 修飾キー(Shift/Alt/Ctrl/Meta)付き特殊キー入力のUI配線 ──
+    // ハードウェアキーボード接続時の想定挙動。実際の変換テーブルはRust側
+    // (`terminal_special_key_bytes`のgoldenテスト、#29)がSSOTなので、ここでは
+    // `TerminalKeyMapper.bytes`が`modifiers`引数をRust側へ正しく受け渡すことのみ検証する。
+
+    private static let noModifiers = TerminalKeyModifiers(shift: false, alt: false, ctrl: false, meta: false)
+
+    func testModifiersDefaultParameterMatchesExplicitNoModifiers() {
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .arrowUp, applicationCursorMode: false),
+            TerminalKeyMapper.bytes(for: .arrowUp, applicationCursorMode: false, modifiers: Self.noModifiers)
+        )
+    }
+
+    /// Ctrl+矢印はDECCKMの値に関わらず常にCSI形式のパラメータ付きシーケンスになる
+    /// (修飾子が1つでもあればSS3ではなくCSI、rust-core側のdocコメント参照)。
+    func testCtrlArrowUsesCsiParameterFormRegardlessOfApplicationCursorMode() {
+        let ctrl = TerminalKeyModifiers(shift: false, alt: false, ctrl: true, meta: false)
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .arrowUp, applicationCursorMode: false, modifiers: ctrl),
+            Array("\u{1B}[1;5A".utf8)
+        )
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .arrowUp, applicationCursorMode: true, modifiers: ctrl),
+            Array("\u{1B}[1;5A".utf8)
+        )
+    }
+
+    func testShiftHomeUsesCsiParameterForm() {
+        let shift = TerminalKeyModifiers(shift: true, alt: false, ctrl: false, meta: false)
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .home, applicationCursorMode: false, modifiers: shift),
+            Array("\u{1B}[1;2H".utf8)
+        )
+    }
+
+    /// F1〜F4は無修飾ならSS3形式だが、修飾子が付くとSS3では表現できないため
+    /// CSI形式に切り替わる(`ESC[1;5P`等)。
+    func testCtrlF1SwitchesFromSs3ToCsiForm() {
+        let ctrl = TerminalKeyModifiers(shift: false, alt: false, ctrl: true, meta: false)
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .functionKey(1), applicationCursorMode: false, modifiers: ctrl),
+            Array("\u{1B}[1;5P".utf8)
+        )
+    }
+
+    /// Shift+Tab → CBT(`ESC[Z`、readline/tmuxの「戻りタブ補完」に必要)。
+    func testShiftTabProducesCbt() {
+        let shift = TerminalKeyModifiers(shift: true, alt: false, ctrl: false, meta: false)
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .tab, applicationCursorMode: false, modifiers: shift),
+            Array("\u{1B}[Z".utf8)
+        )
+    }
 }
