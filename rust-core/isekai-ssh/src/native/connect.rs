@@ -54,10 +54,56 @@ use super::console;
 use super::host_key_trust::FileBackedHostKeyVerifier;
 use super::private_key;
 
-/// `isekai-ssh <destination>` entrypoint for the native path — the
-/// `cfg(windows)`-gated alternative `main.rs` dispatches to instead of
-/// `wrapper::run`. Takes the same raw argv `wrapper::run` does.
-pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
+/// The concrete `russh` client handle this native path establishes — an
+/// already-authenticated, still-live SSH connection. `native/mux` shares a
+/// clone of this across the owner's own session and every relayed client
+/// (see [`OwnerHook`]).
+pub(crate) type NativeHandle = client::Handle<russh_stream_session::VerifyingHandler<FileBackedHostKeyVerifier>>;
+
+/// A hook the mux owner path ([`super::mux`]) supplies so that, the moment the
+/// shared SSH session is authenticated, it can start accepting local IPC
+/// clients on the shared handle — without the connect+auth+recovery machinery
+/// here having to know anything about `local-ipc-mux`. It receives an
+/// [`Arc`]-shared handle (`russh`'s `client::Handle` is not `Clone`, but
+/// `channel_open_session` takes `&self`, so an `Arc` lets the owner's own
+/// foreground shell and every relayed client open independent channels through
+/// the same connection). It runs at most once, on the *successful* connect
+/// attempt (a failed attempt errors before the handle exists, leaving the hook
+/// intact for the re-bootstrap retry). Boxed `FnOnce` + `Send` because it
+/// typically `tokio::spawn`s the accept loop.
+pub(crate) type OwnerHook = Box<dyn FnOnce(Arc<NativeHandle>) + Send>;
+
+/// Everything [`run_prepared`] needs, resolved once up front so the mux
+/// dispatch ([`super::mux::run`]) can compute the channel name from the same
+/// resolution before deciding whether to become owner or client.
+pub(crate) struct Prepared {
+    plan: WrapperPlan,
+    resolution: WrapperResolution,
+    host_config: openssh_config::HostConfig,
+    intent: ConnectionIntent,
+    runtime_dir: PathBuf,
+}
+
+impl Prepared {
+    pub(crate) fn plan(&self) -> &WrapperPlan {
+        &self.plan
+    }
+    pub(crate) fn resolution(&self) -> &WrapperResolution {
+        &self.resolution
+    }
+    pub(crate) fn host_config(&self) -> &openssh_config::HostConfig {
+        &self.host_config
+    }
+    pub(crate) fn runtime_dir(&self) -> &Path {
+        &self.runtime_dir
+    }
+}
+
+/// Resolves argv into a [`Prepared`] (config resolution, `--isekai-log-file`
+/// init, trust-store lookup) without yet touching the network — the shared
+/// front half of both the single-process path ([`run`]) and the mux dispatch
+/// ([`super::mux::run`]).
+pub(crate) fn prepare(args: Vec<String>) -> Result<Prepared> {
     let plan = crate::wrapper::parse_wrapper(args)?;
     // `--isekai-log-file` must be honored on the native path too — the Unix
     // path opens it at the top of `wrapper::run`; without this the flag was
@@ -82,9 +128,27 @@ pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
             plan.destination()
         )
     })?;
-
     let runtime_dir = default_runtime_dir()?;
-    run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, &runtime_dir).await
+    Ok(Prepared { plan, resolution, host_config, intent, runtime_dir })
+}
+
+/// `isekai-ssh <destination>` entrypoint for the native path — the
+/// `cfg(windows)`-gated alternative `main.rs` dispatches to instead of
+/// `wrapper::run`. Takes the same raw argv `wrapper::run` does. The mux
+/// dispatch ([`super::mux::run`]) is what `main.rs` actually calls on Windows;
+/// this remains the single-process path it falls back to (and the only path
+/// exercised on non-Windows unit tests).
+pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
+    let prepared = prepare(args)?;
+    run_prepared(prepared, None).await
+}
+
+/// Drives a [`Prepared`] connection through the always-connects recovery.
+/// `owner_hook` is `None` for the single-process path and `Some` for the mux
+/// owner (see [`OwnerHook`]).
+pub(crate) async fn run_prepared(prepared: Prepared, owner_hook: Option<OwnerHook>) -> Result<u8> {
+    let Prepared { plan, resolution, host_config, intent, runtime_dir } = prepared;
+    run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, &runtime_dir, owner_hook).await
 }
 
 /// Mirrors `wrapper.rs::run_ssh_with_connect_failure_recovery` for the
@@ -131,8 +195,9 @@ async fn run_native_connect_with_recovery(
     host_config: &openssh_config::HostConfig,
     intent: ConnectionIntent,
     runtime_dir: &Path,
+    owner_hook: Option<OwnerHook>,
 ) -> Result<u8> {
-    let mut ops = NativeConnectOps { plan, resolution, host_config, runtime_dir };
+    let mut ops = NativeConnectOps { plan, resolution, host_config, runtime_dir, owner_hook };
     drive_connect_recovery(&mut ops, intent).await
 }
 
@@ -209,12 +274,17 @@ struct NativeConnectOps<'a> {
     resolution: &'a WrapperResolution,
     host_config: &'a openssh_config::HostConfig,
     runtime_dir: &'a Path,
+    /// Consumed (via `take`) on the first attempt whose SSH session actually
+    /// authenticates — a failed attempt errors before the handle exists, so
+    /// the hook survives for the re-bootstrap retry. `None` for the
+    /// single-process path.
+    owner_hook: Option<OwnerHook>,
 }
 
 #[async_trait(?Send)]
 impl ConnectRecoveryOps for NativeConnectOps<'_> {
     async fn attempt(&mut self, intent: &ConnectionIntent) -> Result<u8> {
-        connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir).await
+        connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir, self.owner_hook.take()).await
     }
 
     fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
@@ -251,6 +321,7 @@ async fn connect_attempt(
     host_config: &openssh_config::HostConfig,
     intent: &ConnectionIntent,
     runtime_dir: &Path,
+    owner_hook: Option<OwnerHook>,
 ) -> Result<u8> {
     let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), runtime_dir, intent)?;
     let stdio = ChildStdio::take_from(&mut child)
@@ -276,6 +347,20 @@ async fn connect_attempt(
         .await
         .with_context(|| format!("isekai-ssh: failed to connect to {username}@{host_port}"))?;
 
+    // Shared so the mux accept loop (below) and this process's own foreground
+    // shell can each open independent channels on the one connection.
+    let handle = Arc::new(handle);
+
+    // The SSH session is now authenticated. If this is the mux owner path,
+    // hand a shared clone of the handle to the accept loop so sibling tabs can
+    // start opening their own channels while this process also drives its own
+    // foreground shell below. Reached only on success, so a failed attempt
+    // (which returns above) never consumes the hook — it stays available for
+    // the always-connects re-bootstrap retry.
+    if let Some(hook) = owner_hook {
+        hook(handle.clone());
+    }
+
     let (cols, rows) = console::terminal_size();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
     let mut channel = open_channel(&handle, &SessionKind::Shell { term, cols, rows })
@@ -286,11 +371,11 @@ async fn connect_attempt(
     let exit_code = run_shell_io_loop(&mut channel).await?;
 
     // Keeps the compiler from complaining that `handle`/`child` are unused
-    // past this point — both must stay alive for the duration of the I/O
-    // loop above (dropping `handle` would tear down the SSH session,
-    // dropping `child` kills the `isekai-pipe connect` subprocess, per
-    // `ChildStdio`'s own docs), so this is a deliberate keep-alive, not a
-    // no-op.
+    // past this point — both must stay alive for the duration of the I/O loop
+    // above. Dropping this `Arc<handle>` only tears the SSH session down once
+    // every clone is gone (a mux accept loop, if any, holds another), and
+    // dropping `child` kills the `isekai-pipe connect` subprocess (per
+    // `ChildStdio`'s own docs) — a deliberate keep-alive, not a no-op.
     drop(handle);
     drop(child);
 
@@ -963,7 +1048,7 @@ mod tests {
         );
         let runtime_dir = tempfile::tempdir().unwrap();
 
-        let result = run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, runtime_dir.path()).await;
+        let result = run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, runtime_dir.path(), None).await;
         assert!(result.is_err(), "a connect failure with no ConnectOutcome signal must propagate, not be swallowed");
     }
 
