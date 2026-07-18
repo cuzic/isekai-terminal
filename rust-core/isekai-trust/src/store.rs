@@ -113,6 +113,16 @@ pub fn with_locked_ssh_host_key_trust_store<T>(
     f: impl FnOnce(&mut SshHostKeyTrustStore) -> Result<T, TrustError>,
 ) -> Result<T, TrustError> {
     let dir = path.parent().ok_or_else(|| TrustError::NoParentDir { path: path.to_path_buf() })?;
+    // Must run before `with_exclusive_lock`, not after: that call's own
+    // `fs::create_dir_all(dir)` (needed so the `<key>.lock` file itself has
+    // somewhere to live) would otherwise create a fresh `dir` with
+    // umask-dependent (commonly `0755`, world-*readable*) permissions
+    // first, and `ensure_private_dir` only forces `0700` on directories it
+    // creates itself — an *existing* directory only gets a world-*writable*
+    // check, not a world-*readable* one, so the "new directories are
+    // created private" invariant would silently break for exactly the case
+    // this function exists to protect (Codex review finding).
+    ensure_private_dir(dir)?;
     let outcome = isekai_fs_guard::with_exclusive_lock(dir, SSH_HOST_KEY_TRUST_STORE_LOCK_KEY, || -> Result<T, TrustError> {
         let mut store = load_toml_store::<SshHostKeyTrustStore>(path)?;
         let result = f(&mut store)?;
@@ -452,6 +462,27 @@ last_seen_at = "2026-07-04T00:00:00Z"
 
         let loaded = load_ssh_host_key_trust_store(&path).unwrap();
         assert_eq!(loaded.get("example.com:22").unwrap().fingerprint, "SHA256:abc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_locked_store_creates_a_fresh_config_dir_as_0700() {
+        // Codex review finding: `with_exclusive_lock`'s own `create_dir_all`
+        // must not be the thing that first creates a brand-new config dir
+        // (it uses umask-dependent, typically world-readable `0755`
+        // permissions) — `with_locked_ssh_host_key_trust_store` must apply
+        // `ensure_private_dir` first so a fresh directory ends up `0700`.
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("nested-config-dir");
+        let path = config_dir.join(SSH_HOST_KEY_TRUST_STORE_FILE_NAME);
+        assert!(!config_dir.exists());
+
+        with_locked_ssh_host_key_trust_store(&path, |_store| Ok(())).unwrap();
+
+        let mode = fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a freshly-created config dir must be private, not umask-dependent");
     }
 
     #[test]
