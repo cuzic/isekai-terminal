@@ -98,13 +98,19 @@ pub fn resolve_default(destination: &str) -> Result<HostConfig, Error> {
 pub fn resolve(path: &Path, destination: &str) -> Result<HostConfig, Error> {
     let mut visited = HashSet::new();
     let mut config = HostConfig::default();
-    resolve_from_file(path, destination, &mut visited, &mut config)?;
+    // Relative Include paths always resolve against the directory of the
+    // top-level config (ssh_config(5): ~/.ssh for a user config), NOT the
+    // directory of whichever nested file is currently being read — so pin
+    // it once here and thread it unchanged through the recursion.
+    let root_dir = path.parent();
+    resolve_from_file(path, destination, root_dir, &mut visited, &mut config)?;
     Ok(config)
 }
 
 fn resolve_from_file(
     path: &Path,
     destination: &str,
+    root_dir: Option<&Path>,
     visited: &mut HashSet<PathBuf>,
     config: &mut HostConfig,
 ) -> Result<(), Error> {
@@ -114,7 +120,6 @@ fn resolve_from_file(
     }
     let content = std::fs::read_to_string(path)
         .map_err(|source| Error::Read { path: path.to_path_buf(), source })?;
-    let base_dir = path.parent();
     let mut active = true;
 
     for raw_line in content.lines() {
@@ -134,8 +139,8 @@ fn resolve_from_file(
             // the included file.
             "include" if active => {
                 for pattern in split_words(rest) {
-                    for include in expand_include_pattern(&pattern, base_dir)? {
-                        resolve_from_file(&include, destination, visited, config)?;
+                    for include in expand_include_pattern(&pattern, root_dir)? {
+                        resolve_from_file(&include, destination, root_dir, visited, config)?;
                     }
                 }
             }
@@ -646,6 +651,34 @@ Host example
         let config = resolve(&path, "example").unwrap();
         assert_eq!(config.user.as_deref(), Some("alice"));
         assert_eq!(config.port, Some(2222));
+    }
+
+    #[test]
+    fn nested_relative_include_resolves_against_top_level_dir_not_current_file() {
+        // ssh_config(5): a relative Include path always resolves against the
+        // top-level config's directory (~/.ssh), never the directory of the
+        // nested file doing the include. Here the top-level config includes
+        // subdir/a.conf, and a.conf does a *relative* `Include b.conf` — real
+        // ssh looks for <root>/b.conf, not <root>/subdir/b.conf. We plant a
+        // decoy subdir/b.conf that must NOT be picked to prove it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        write_config(&dir, "b.conf", "
+Host example
+    User from-root-b
+");
+        write_config(&dir, "subdir/b.conf", "
+Host example
+    User from-decoy-subdir-b
+");
+        write_config(&dir, "subdir/a.conf", "Include b.conf\n");
+        let path = write_config(&dir, "config", "Include subdir/a.conf\n");
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(
+            config.user.as_deref(),
+            Some("from-root-b"),
+            "nested relative Include must resolve against the top-level dir, not subdir/"
+        );
     }
 
     #[test]
