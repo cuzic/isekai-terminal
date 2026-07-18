@@ -308,18 +308,44 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     wildcard_match_bytes(pattern.as_bytes(), value.as_bytes())
 }
 
+// Iterative two-pointer wildcard matcher (`*` = any run, `?` = one char, else literal).
+// O(n*m) worst case — avoids the exponential backtracking a naive recursive matcher
+// suffers on patterns with many `*` against a long non-matching value.
 fn wildcard_match_bytes(pattern: &[u8], value: &[u8]) -> bool {
-    match (pattern.split_first(), value.split_first()) {
-        (None, None) => true,
-        (None, Some(_)) => false,
-        (Some((&b'*', rest)), _) => {
-            wildcard_match_bytes(rest, value)
-                || value.split_first().map(|(_, value_rest)| wildcard_match_bytes(pattern, value_rest)).unwrap_or(false)
+    let (mut p, mut v) = (0usize, 0usize);
+    // Position to resume from on mismatch: the last `*` seen and the value index it may absorb up to.
+    let mut star: Option<(usize, usize)> = None;
+
+    while v < value.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, v));
+                p += 1;
+            }
+            Some(&b'?') => {
+                p += 1;
+                v += 1;
+            }
+            Some(&pc) if pc == value[v] => {
+                p += 1;
+                v += 1;
+            }
+            _ => match star {
+                // Backtrack: let the last `*` swallow one more value byte.
+                Some((star_p, star_v)) => {
+                    p = star_p + 1;
+                    v = star_v + 1;
+                    star = Some((star_p, v));
+                }
+                None => return false,
+            },
         }
-        (Some((&b'?', rest)), Some((_, value_rest))) => wildcard_match_bytes(rest, value_rest),
-        (Some((&p, rest)), Some((&v, value_rest))) if p == v => wildcard_match_bytes(rest, value_rest),
-        _ => false,
     }
+
+    while pattern.get(p) == Some(&b'*') {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 #[cfg(test)]
@@ -586,5 +612,46 @@ Host example
         let config = resolve(&path, "example").unwrap();
         assert_eq!(config.user.as_deref(), Some("alice"));
         assert_eq!(config.port, Some(2222));
+    }
+
+    #[test]
+    fn wildcard_matching_semantics() {
+        // `*` matches zero characters.
+        assert!(wildcard_match("a*b", "ab"));
+        // `*` matches the whole string.
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("*", "anything-at-all"));
+        // Trailing/leading `*`.
+        assert!(wildcard_match("*.example.com", "host.example.com"));
+        assert!(wildcard_match("host.*", "host.example.com"));
+        // `?` matches exactly one character (and not zero, and not two).
+        assert!(wildcard_match("h?st", "host"));
+        assert!(!wildcard_match("h?st", "hst"));
+        assert!(!wildcard_match("h?st", "hoost"));
+        // Mixed `*` / `?`.
+        assert!(wildcard_match("a*b?c", "aXXXbYc"));
+        assert!(!wildcard_match("a*b?c", "aXXXbc"));
+        // Literal byte-for-byte.
+        assert!(wildcard_match("exact", "exact"));
+        assert!(!wildcard_match("exact", "exacty"));
+        assert!(!wildcard_match("exact", "exac"));
+        // Consecutive stars behave like a single star.
+        assert!(wildcard_match("a**b", "aXYZb"));
+        // Empty pattern only matches empty value.
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "x"));
+    }
+
+    #[test]
+    fn wildcard_matching_is_not_exponential_on_pathological_input() {
+        // Many `*` separated by a required literal, against a long value that ultimately
+        // does NOT match (no trailing 'b'). A naive backtracking matcher takes ~O(2^k)
+        // here and would stall for many seconds; the iterative matcher is linear-ish.
+        let pattern = "a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
+        let value = "a".repeat(40);
+        let start = std::time::Instant::now();
+        assert!(!wildcard_match(pattern, &value));
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_millis(100), "took {elapsed:?}");
     }
 }
