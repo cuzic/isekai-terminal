@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "uniffi-bindgen", "h3-noq", "h3-qmux", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "isekai-netmon", "quicsock", "quicmux", "russh-stream-session", "openssh-config"]
+members = [".", "uniffi-bindgen", "h3-noq", "h3-qmux", "isekai-link-masque", "isekai-stun", "isekai-protocol", "isekai-fs-guard", "isekai-trust", "isekai-auth", "isekai-transport", "isekai-bootstrap", "isekai-bootstrap-plan", "isekai-ssh", "isekai-pipe-protocol", "isekai-pipe-core", "isekai-pipe", "isekai-netmon", "quicsock", "quicmux", "russh-stream-session", "openssh-config", "local-ipc-mux"]
 resolver = "2"
 
 # noq-multipath-spike(実機検証用の使い捨てコード、CLAUDE.md参照)は意図的に
