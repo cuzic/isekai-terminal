@@ -93,6 +93,7 @@ pub mod error;
 pub mod generation_coordinator;
 pub mod multipath;
 pub mod path_health;
+mod path_health_fsm;
 pub mod physical_interface;
 pub mod proof;
 #[cfg(feature = "qmux-relay")]

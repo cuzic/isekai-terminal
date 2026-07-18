@@ -1964,6 +1964,7 @@ dependencies = [
  "rustls",
  "sha2",
  "thiserror 2.0.18",
+ "timed-fsm",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -4085,9 +4086,12 @@ dependencies = [
 
 [[package]]
 name = "timed-fsm"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7a9de966e72053d2509930097cab36075c7f436ad48372fdb34276682a107ee"
+checksum = "8c806dbd543ee8a910cf97014b1793e81b9a17411bccfc1531785ad34aeb16b4"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "tinystr"

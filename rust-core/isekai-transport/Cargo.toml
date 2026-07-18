@@ -17,6 +17,12 @@ isekai-stun = { path = "../isekai-stun" }
 quicmux = { path = "../quicmux", features = ["noq"] }
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
+# `path_health.rs`のping駆動ヘルスチェックを`rebind_manager.rs`/`trzsz.rs`
+# (isekai-terminal-core)と同じ純粋状態機械パターンに乗せるために使う
+# (`path_health_fsm.rs`)。`tokio` feature: `tokio_support::TokioTimerRuntime`
+# (手書きHealthTimerRuntimeの置き換え)とdispatch_async/AsyncActionExecutor/
+# ActionOutcome(手書きFlow enum+再帰dispatchの置き換え)を使うため。
+timed-fsm = { version = "0.4.0", features = ["tokio"] }
 # `multipath.rs`/`path_health.rs`はnoq-concreteなまま残す設計判断
 # (noq issue #738、同モジュールのdoc参照)なので、`noq`はこのcrate自身の
 # 直接依存としても残す。`FaultyUdpSocket`等のAndroid専用型・UniFFIはこの

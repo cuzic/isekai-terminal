@@ -5,11 +5,11 @@
 //! 触れるのはこのモジュールだけに限定し、判断ロジック自体は一切持たない
 //! (すべて`RebindManager`に委譲する)。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use timed_fsm::{Response, TimedStateMachine, TimerCommand};
+use timed_fsm::tokio_support::TokioTimerRuntime;
+use timed_fsm::{Response, TimedStateMachine, TimerCommand, TimerRuntime};
 
 use crate::rebind_manager::{RebindAction, RebindEvent, RebindManager, RebindPublicState, RebindTimer};
 use crate::rebind_ports::{BoundFd, PlatformFdSource, QuietTrafficSource, RebindExecutor, WifiProbeExecutor};
@@ -23,45 +23,6 @@ const QUIET_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// `RebindAction::PublishState`をDriverが受け取るたびに呼ばれる。
 pub(crate) trait RebindStateObserver: Send + Sync {
     fn on_state_changed(&self, state: RebindPublicState);
-}
-
-/// `session.rs`の`TokioTimerRuntime`と同じパターン: `RebindTimer`の
-/// `TimerCommand::Set`/`Kill`をtokioタスクのspawn/abortへ変換し、満了したら
-/// `timeout_tx`経由でイベントループへ送り返す。
-struct RebindTimerRuntime {
-    handles: HashMap<RebindTimer, tokio::task::JoinHandle<()>>,
-    timeout_tx: tokio::sync::mpsc::Sender<RebindTimer>,
-}
-
-impl RebindTimerRuntime {
-    fn new(timeout_tx: tokio::sync::mpsc::Sender<RebindTimer>) -> Self {
-        RebindTimerRuntime { handles: HashMap::new(), timeout_tx }
-    }
-
-    fn set(&mut self, id: RebindTimer, dur: Duration) {
-        self.kill(id);
-        let tx = self.timeout_tx.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(dur).await;
-            let _ = tx.send(id).await;
-        });
-        self.handles.insert(id, handle);
-    }
-
-    fn kill(&mut self, id: RebindTimer) {
-        if let Some(h) = self.handles.remove(&id) {
-            h.abort();
-        }
-    }
-
-    fn apply(&mut self, cmds: &[TimerCommand<RebindTimer>]) {
-        for cmd in cmds {
-            match *cmd {
-                TimerCommand::Set { id, duration } => self.set(id, duration),
-                TimerCommand::Kill { id } => self.kill(id),
-            }
-        }
-    }
 }
 
 enum FdKind {
@@ -138,12 +99,11 @@ where
     Q: QuietTrafficSource + 'static,
 {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<RebindEvent>(16);
-    let (timeout_tx, mut timeout_rx) = tokio::sync::mpsc::channel::<RebindTimer>(8);
     let loop_input_tx = input_tx.clone();
 
     tokio::spawn(async move {
         let mut manager = RebindManager::new();
-        let mut timers = RebindTimerRuntime::new(timeout_tx);
+        let mut timers = TokioTimerRuntime::<RebindTimer>::new();
         let mut quiet_watch = QuietWatchRuntime::new();
         loop {
             let resp = tokio::select! {
@@ -151,7 +111,7 @@ where
                     let Some(event) = maybe_event else { break };
                     manager.on_event(event)
                 }
-                maybe_timer = timeout_rx.recv() => {
+                maybe_timer = timers.recv() => {
                     let Some(timer_id) = maybe_timer else { break };
                     manager.on_timeout(timer_id)
                 }
@@ -177,7 +137,7 @@ where
 /// 個別のtokioタスクとして実行する(疎通確認/rebindの完了を待つ間、次の
 /// イベントの取りこぼしを防ぐため、`dispatch`自体はブロックしない)。
 fn dispatch<F, W, R, Q>(
-    timers: &mut RebindTimerRuntime,
+    timers: &mut TokioTimerRuntime<RebindTimer>,
     quiet_watch: &mut QuietWatchRuntime,
     resp: Response<RebindAction, RebindTimer>,
     fd_source: &Arc<F>,
@@ -192,7 +152,12 @@ fn dispatch<F, W, R, Q>(
     R: RebindExecutor + 'static,
     Q: QuietTrafficSource + 'static,
 {
-    timers.apply(&resp.timers);
+    for cmd in &resp.timers {
+        match *cmd {
+            TimerCommand::Set { id, duration } => timers.set_timer(id, duration),
+            TimerCommand::Kill { id } => timers.kill_timer(id),
+        }
+    }
     for action in resp.actions {
         match action {
             RebindAction::PublishState(state) => observer.on_state_changed(state),
