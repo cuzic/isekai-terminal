@@ -522,7 +522,13 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
                 bg.setFill()
                 UIRectFill(cellRect)
 
-                guard !cell.ch.isEmpty, cell.ch != " " else { continue }
+                // 空白文字自体は本来drawするグリフが無いが、underline/strikethrough
+                // (SGR 4/9)が立っている空白セルは装飾線だけ描く必要があるため、
+                // 早期スキップの対象から除外する(Android版`SshTerminalCanvas.kt`の
+                // `hasLineDecoration`と対称。codexレビュー・fableレビュー両方が
+                // 独立に指摘、タスク#71)。
+                let hasLineDecoration = cell.underline || cell.strikethrough
+                guard !cell.ch.isEmpty, cell.ch != " " || hasLineDecoration else { continue }
                 // invisible(SGR 8)は背景だけ塗ってグリフを描かない。blink(SGR 5)は
                 // 点滅位相が「消灯」側の間だけ同様にグリフを省く(背景・選択範囲・
                 // カーソルの重なりは通常通り)。
