@@ -607,18 +607,32 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
     // than waiting for the whole process to exit.
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
+    // Tolerate a few consecutive quiet windows before giving up, rather than
+    // bailing on the very first 20s window with no new output. A real
+    // Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) consistently finished last among this file's 7
+    // concurrently-running tests and went quiet for longer than a single
+    // 20s window under CI resource contention -- bailing immediately was
+    // too impatient for that environment.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
@@ -716,18 +730,32 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
+    // Tolerate a few consecutive quiet windows before giving up, rather than
+    // bailing on the very first 20s window with no new output. A real
+    // Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) consistently finished last among this file's 7
+    // concurrently-running tests and went quiet for longer than a single
+    // 20s window under CI resource contention -- bailing immediately was
+    // too impatient for that environment.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
@@ -824,18 +852,32 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
+    // Tolerate a few consecutive quiet windows before giving up, rather than
+    // bailing on the very first 20s window with no new output. A real
+    // Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) consistently finished last among this file's 7
+    // concurrently-running tests and went quiet for longer than a single
+    // 20s window under CI resource contention -- bailing immediately was
+    // too impatient for that environment.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
@@ -949,18 +991,32 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
+    // Tolerate a few consecutive quiet windows before giving up, rather than
+    // bailing on the very first 20s window with no new output. A real
+    // Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) consistently finished last among this file's 7
+    // concurrently-running tests and went quiet for longer than a single
+    // 20s window under CI resource contention -- bailing immediately was
+    // too impatient for that environment.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
@@ -1056,18 +1112,32 @@ async fn wrapper_auto_bootstrap_honors_resume_grace_directive() {
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
+    // Tolerate a few consecutive quiet windows before giving up, rather than
+    // bailing on the very first 20s window with no new output. A real
+    // Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) consistently finished last among this file's 7
+    // concurrently-running tests and went quiet for longer than a single
+    // 20s window under CI resource contention -- bailing immediately was
+    // too impatient for that environment.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
@@ -1184,11 +1254,15 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
     let mut stderr_text = String::new();
+    // See the identical comment on wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation's
+    // read loop: tolerate a few consecutive quiet windows before giving up.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 stderr_text.push_str(&line);
                 if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
@@ -1196,7 +1270,12 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
