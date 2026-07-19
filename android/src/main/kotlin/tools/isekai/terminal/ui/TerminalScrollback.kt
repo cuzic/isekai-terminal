@@ -69,5 +69,12 @@ fun synthesizeDisplayUpdate(
         // スナップショットのため、cursorVisible相当の考え方で画像も非表示にする)。
         images = emptyList(),
         kittyKeyboardFlags = live.kittyKeyboardFlags,
+        // 行単位damage tracking(タスク#98系, `ScreenUpdate.dirtyRows`): この関数が
+        // 返すのはtmux-integrationマージ時点でmain側にまだ存在した、Kotlin側の配線が
+        // 未完了の新フィールド(このファイル内・他のどこにも`dirtyRows`を読む箇所が無い)。
+        // このフレームはliveの逐次更新ではなく合成されたスナップショットそのものなので、
+        // 意味論的にも「差分情報なし=全面再描画」を表す`null`が正しい(この直前の
+        // `images = emptyList()`と同じ考え方)。
+        dirtyRows = null,
     )
 }

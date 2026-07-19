@@ -49,6 +49,7 @@ class TerminalScrollbackTest {
             linkTable = emptyList(),
             images = emptyList(),
             kittyKeyboardFlags = 0u,
+            dirtyRows = null,
         )
     }
 

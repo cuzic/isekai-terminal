@@ -37,6 +37,7 @@ class TerminalHyperlinkTest {
         linkTable = linkTable,
         images = emptyList(),
         kittyKeyboardFlags = 0u,
+        dirtyRows = null,
     )
 
     // ── linkUrlAtCell ────────────────────────────────────────────────
