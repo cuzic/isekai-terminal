@@ -8,6 +8,39 @@ func clampedFontScale(current: CGFloat, zoomDelta: CGFloat) -> CGFloat {
     min(max(current * zoomDelta, 0.5), 3.0)
 }
 
+/// ソフトウェアキーボード表示中に安定化させた高さの追跡状態。Android版
+/// `ResizeStabilityState`/`advanceResizeStability`(`TerminalResize.kt`、タスク#19)と対称。
+struct ResizeStabilityState: Equatable {
+    /// これまでに一度でもキーボード非表示状態を観測したか([advanceResizeStability]のdoc参照)。
+    var hasObservedKeyboardHidden: Bool
+    /// resize要求(cols/rows算出)に使う、キーボード開閉の影響を打ち消した高さ。
+    var stableHeight: CGFloat
+}
+
+/// ソフトウェアキーボード表示中はビューポートの実測高さ([liveHeight])がキーボード分
+/// だけ縮むが、tty(Rust側`SessionCore::resize`)へ要求するcols/rowsの基準にはキーボードが
+/// 閉じていた時点の高さを使い続けたい(キーボード開閉のたびに不要なresize=SIGWINCH相当が
+/// vim等の実行中プログラムへ飛ぶのを防ぐ、Android版タスク#19と同じ理由)。
+///
+/// Android版と同じく、キーボードの正確な占有高さを足し戻して補正するのではなく、
+/// 「キーボードが非表示の間だけ最新の高さを採用し、表示中は直近に非表示だった時点の値を
+/// 凍結して使い続ける」方式にする(Split View/Slide Over/Stage Manager等でのframe座標変換の
+/// 不確実性を避けられる)。
+///
+/// [hasObservedKeyboardHidden]が`false`の間(=viewが初めてキーボード表示中に構築される等、
+/// まだ一度もキーボード非表示状態を観測していない間)は「凍結すべき正しい基準値」が
+/// まだ存在しないため、素直に[liveHeight]を採用し続ける(Android版と同じ、Codexレビュー
+/// 指摘の初回composition時対応と対称)。
+func advanceResizeStability(
+    previous: ResizeStabilityState,
+    isKeyboardVisible: Bool,
+    liveHeight: CGFloat
+) -> ResizeStabilityState {
+    let hasObservedKeyboardHidden = previous.hasObservedKeyboardHidden || !isKeyboardVisible
+    let stableHeight = (!hasObservedKeyboardHidden || !isKeyboardVisible) ? liveHeight : previous.stableHeight
+    return ResizeStabilityState(hasObservedKeyboardHidden: hasObservedKeyboardHidden, stableHeight: stableHeight)
+}
+
 /// タスク#81: トラックパッド/マウスホイールの間接スクロール(`UIPanGestureRecognizer`が
 /// `numberOfTouches == 0`で報告する連続的な`translation`)から、送出すべき
 /// `MouseButton`(`.wheelUp`/`.wheelDown`)の並びと次回呼び出しへ持ち越す端数(`carry`)を
@@ -327,6 +360,39 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     private var lastReportedRows: UInt32?
     private static let minCols: UInt32 = 10
     private static let minRows: UInt32 = 5
+    private var resizeStability = ResizeStabilityState(hasObservedKeyboardHidden: false, stableHeight: 0)
+    private var isKeyboardVisible = false
+    private var pendingKeyboardHideWorkItem: DispatchWorkItem?
+    /// `didHide`到達後、`isKeyboardVisible`を実際に下ろすまでの猶予。UIKitの標準的な
+    /// キーボード開閉アニメーション(既定0.25秒程度)より余裕を持たせ、SwiftUI側の
+    /// キーボード回避レイアウトが`bounds`を復元し終えるのを待つ(Codexレビュー指摘:
+    /// `didHide`通知自体は`bounds`復元前に届きうるため、`didHide`直後に`isKeyboardVisible`
+    /// を下ろすと、その中間状態で`layoutSubviews()`/`resendSizeOnConnectionEstablished()`/
+    /// `fontScale`変更等の他経路から`reportSizeIfNeeded()`が呼ばれた場合に縮んだ`bounds`を
+    /// 安定値として誤って採用してしまう)。テストから注入できるよう`private`にしない。
+    var keyboardHideSettleDelay: TimeInterval = 0.4
+
+    private func observeKeyboardVisibility() {
+        let center = NotificationCenter.default
+        // `willShow`はキーボードのアニメーション開始前(=`bounds`がまだ縮む前)に届くため、
+        // ここで`isKeyboardVisible = true`にして`reportSizeIfNeeded()`を呼ぶことで、
+        // 「縮む直前のまだ正しい高さ」を安定値として確定できる。再表示時は保留中の
+        // hide確定処理があれば取り消す(閉じかけてすぐ開き直されたケース)。
+        center.addObserver(
+            self, selector: #selector(handleKeyboardWillShow(_:)),
+            name: UIResponder.keyboardWillShowNotification, object: nil
+        )
+        // `willHide`ではなく`didHide`を使う: `willHide`はキーボードを閉じる
+        // アニメーション開始前に届き、その時点ではSwiftUI側のキーボード回避レイアウトが
+        // まだ`bounds`を復元しきっていない(縮んだままの)可能性がある。それでも`didHide`
+        // 自体が`bounds`復元より先に届く可能性はゼロではないため、`isKeyboardVisible`を
+        // 即座には下ろさず、[keyboardHideSettleDelay]後に確定させる
+        // (`handleKeyboardDidHide`のdoc参照、Codexレビュー指摘)。
+        center.addObserver(
+            self, selector: #selector(handleKeyboardDidHide(_:)),
+            name: UIResponder.keyboardDidHideNotification, object: nil
+        )
+    }
 
     public override init(frame: CGRect) {
         super.init(frame: frame)
@@ -334,6 +400,7 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         contentMode = .redraw
         isOpaque = true
         updateFontMetrics(reportSize: false)
+        observeKeyboardVisibility()
 
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
         longPress.minimumPressDuration = 0.4
@@ -368,11 +435,14 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
 
     public required init?(coder: NSCoder) {
         super.init(coder: coder)
+        observeKeyboardVisibility()
         startBlinkTimerIfNeeded()
     }
 
     deinit {
         blinkTimer?.invalidate()
+        pendingKeyboardHideWorkItem?.cancel()
+        NotificationCenter.default.removeObserver(self)
     }
 
     /// タスク#23/#34: 点滅位相を一定間隔(xterm既定に近い0.53秒)でトグルする。
@@ -436,17 +506,9 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         super.layoutSubviews()
         // タスク#20: 画面回転・SplitView/Slide Overサイズ変更等でboundsが変わった度に
         // cols/rowsを再計算する(Android版`BoxWithConstraints`が`maxWidth`/`maxHeight`の
-        // 変化を検知するのと対称)。
-        //
-        // 既知の制約(タスク#19のAndroid版`computeResizeTargetColsRows`の`imeBottomPx`
-        // 補正に相当する処理は未実装): ソフトキーボード表示中にSwiftUI側の既定の
-        // キーボード回避レイアウトでこのviewのboundsが実際に縮む場合、その分も
-        // 通常のリサイズとしてそのまま転送してしまう(IME開閉自体をtty実サイズ変更の
-        // 理由にしたくないというAndroid版#19の方針とは未整合)。iOS側でのSwiftUI-UIKit
-        // 間のキーボード回避挙動はOSバージョンや実機検証なしには正確に補正できないと
-        // 判断し、このタスク(#20)の対象範囲(動的resize自体の実装)からは切り出した。
-        // Rust側`SessionCore::resize`の同一値dedupe(#62)により永続的な状態不整合には
-        // ならない(キーボードを閉じれば実サイズへ戻る)。
+        // 変化を検知するのと対称)。ソフトキーボード表示中にSwiftUI側の既定のキーボード
+        // 回避レイアウトでこのviewのboundsが縮む影響は、`reportSizeIfNeeded()`内の
+        // `advanceResizeStability`(Android版タスク#19と対称)が吸収する。
         reportSizeIfNeeded()
     }
 
@@ -464,12 +526,42 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
 
     private func reportSizeIfNeeded() {
         guard cellSize.width > 0, cellSize.height > 0, bounds.width > 0, bounds.height > 0 else { return }
+        resizeStability = advanceResizeStability(
+            previous: resizeStability, isKeyboardVisible: isKeyboardVisible, liveHeight: bounds.height
+        )
         let cols = max(UInt32(bounds.width / cellSize.width), Self.minCols)
-        let rows = max(UInt32(bounds.height / cellSize.height), Self.minRows)
+        let rows = max(UInt32(resizeStability.stableHeight / cellSize.height), Self.minRows)
         guard cols != lastReportedCols || rows != lastReportedRows else { return }
         lastReportedCols = cols
         lastReportedRows = rows
         onSizeChanged?(cols, rows)
+    }
+
+    /// タスク#19相当: キーボード表示アニメーション開始前(`bounds`がまだ縮む前)に
+    /// [isKeyboardVisible]を立て、その時点のまだ正しい高さを[reportSizeIfNeeded]経由で
+    /// 安定値として確定する([observeKeyboardVisibility]のdoc参照)。閉じかけていた最中に
+    /// 再度開かれた場合に備え、保留中のhide確定処理があれば取り消す。
+    @objc private func handleKeyboardWillShow(_ notification: Notification) {
+        pendingKeyboardHideWorkItem?.cancel()
+        pendingKeyboardHideWorkItem = nil
+        isKeyboardVisible = true
+        reportSizeIfNeeded()
+    }
+
+    /// タスク#19相当: キーボード非表示アニメーション完了後、[keyboardHideSettleDelay]の
+    /// 猶予を置いてから[isKeyboardVisible]を下ろし[reportSizeIfNeeded]を呼ぶ
+    /// ([observeKeyboardVisibility]のdoc参照)。猶予中に`reportSizeIfNeeded()`が
+    /// (`layoutSubviews()`等)別経路から呼ばれても、`isKeyboardVisible`はまだ`true`の
+    /// ままなので凍結値が維持され、縮んだ`bounds`を誤って安定値として採用しない。
+    @objc private func handleKeyboardDidHide(_ notification: Notification) {
+        pendingKeyboardHideWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.isKeyboardVisible = false
+            self.reportSizeIfNeeded()
+        }
+        pendingKeyboardHideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + keyboardHideSettleDelay, execute: workItem)
     }
 
     /// ピンチズームでのフォントサイズ調整(Android版`TerminalScreen.kt`の
