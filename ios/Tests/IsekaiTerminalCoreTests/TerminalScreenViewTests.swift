@@ -1131,14 +1131,14 @@ final class TerminalScreenViewTests: XCTestCase {
     /// `setNeedsDisplay()`を呼ぶ)。
     func testLiveDirtyDisplayRectReturnsNilForFullDamage() {
         let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
-        XCTAssertNil(view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: nil)))
+        XCTAssertNil(view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: nil), hadSequenceGap: false))
     }
 
     /// `dirtyRows == []`(グリッド変化なし)は`CGRect.null`を返す。`apply`はこれを
     /// `setNeedsDisplay(.null)`へ渡し、何も無効化されない(=このフレームは再描画不要)。
     func testLiveDirtyDisplayRectReturnsNullRectForEmptyDamage() {
         let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
-        let rect = view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: []))
+        let rect = view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: []), hadSequenceGap: false)
         XCTAssertNotNil(rect)
         XCTAssertTrue(rect?.isNull ?? false, "空のdirtyRowsは無効化領域なし(.null)を返すべき")
     }
@@ -1149,13 +1149,15 @@ final class TerminalScreenViewTests: XCTestCase {
     func testLiveDirtyDisplayRectIncludesOldCursorRowOnCursorMove() throws {
         let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
         let rectRow0Only = view.liveDirtyDisplayRect(
-            for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: [LineDamage(line: 0, left: 0, right: 3)])
+            for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: [LineDamage(line: 0, left: 0, right: 3)]),
+            hadSequenceGap: false
         )
         let rectRow0And2 = view.liveDirtyDisplayRect(
             for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: [
                 LineDamage(line: 2, left: 0, right: 3),
                 LineDamage(line: 0, left: 0, right: 3),
-            ])
+            ]),
+            hadSequenceGap: false
         )
         let r0 = try XCTUnwrap(rectRow0Only)
         let r02 = try XCTUnwrap(rectRow0And2)
@@ -1174,10 +1176,12 @@ final class TerminalScreenViewTests: XCTestCase {
             widthPx: 16, heightPx: 16, rgba: Data(repeating: 0xFF, count: 16 * 16 * 4)
         )
         let withoutImage = view.liveDirtyDisplayRect(
-            for: makeGridUpdate(cols: 4, rows: 8, dirtyRows: [LineDamage(line: 0, left: 0, right: 3)])
+            for: makeGridUpdate(cols: 4, rows: 8, dirtyRows: [LineDamage(line: 0, left: 0, right: 3)]),
+            hadSequenceGap: false
         )
         let withImage = view.liveDirtyDisplayRect(
-            for: makeGridUpdate(cols: 4, rows: 8, dirtyRows: [LineDamage(line: 0, left: 0, right: 3)], images: [placement])
+            for: makeGridUpdate(cols: 4, rows: 8, dirtyRows: [LineDamage(line: 0, left: 0, right: 3)], images: [placement]),
+            hadSequenceGap: false
         )
         let base = try XCTUnwrap(withoutImage)
         let unioned = try XCTUnwrap(withImage)
@@ -1195,7 +1199,7 @@ final class TerminalScreenViewTests: XCTestCase {
         TerminalScreenView.debugForceFullRedraw = true
         defer { TerminalScreenView.debugForceFullRedraw = false }
         XCTAssertNil(
-            view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: dirty)),
+            view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: dirty), hadSequenceGap: false),
             "トグルが有効な間はdirtyRowsを無視して常に全画面再描画にフォールバックすべき"
         )
     }
@@ -1207,10 +1211,10 @@ final class TerminalScreenViewTests: XCTestCase {
         let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
         let dirty = [LineDamage(line: 0, left: 0, right: 3)]
         view.showingScrollback = true
-        XCTAssertNil(view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: dirty)))
+        XCTAssertNil(view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: dirty), hadSequenceGap: false))
         view.showingScrollback = false
         view.scrollOffset = 1
-        XCTAssertNil(view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: dirty)))
+        XCTAssertNil(view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: dirty), hadSequenceGap: false))
     }
 
     /// #98でクリップ対応した`draw(_:)`が、渡された矩形の外にある行を描かないことを実ピクセルで
@@ -1274,7 +1278,7 @@ final class TerminalScreenViewTests: XCTestCase {
 
         let view = TerminalScreenView(frame: bounds)
         view.layoutIfNeeded()
-        let scopedRect = try XCTUnwrap(view.liveDirtyDisplayRect(for: update2), "ライブ表示中はスコープ矩形が得られるはず")
+        let scopedRect = try XCTUnwrap(view.liveDirtyDisplayRect(for: update2, hadSequenceGap: false), "ライブ表示中はスコープ矩形が得られるはず")
 
         // 実際: frame1でカーソルをrow2に全画面描画し、frame2でrow0へ動かしてスコープ矩形
         // (row0..row2のunion)だけを同一コンテキストへ再描画する。
