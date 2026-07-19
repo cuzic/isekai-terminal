@@ -27,3 +27,9 @@ current = 19
 # owner = "phase12-relay-credential-vault"
 # branch = "agent/relay-jwt-keystore"
 # reserved_at = "2026-07-04"
+
+[[reserved]]
+version = 20
+owner = "task60-tmux-session-mapping"
+branch = "worktree-agent-abdb7f693214ea531"
+reserved_at = "2026-07-19"

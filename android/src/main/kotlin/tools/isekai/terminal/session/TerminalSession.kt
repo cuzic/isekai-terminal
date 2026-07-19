@@ -294,6 +294,15 @@ class TerminalSession(
     fun setTheme(ansi16: List<UInt>, defaultFg: UInt, defaultBg: UInt) =
         orchestrator.setSessionTheme(ansi16, defaultFg, defaultBg)
 
+    /**
+     * タスク#60: tmux session groupのensure/attach + タブ用ウィンドウのcreate-or-select。
+     * 判断は一切ここでは行わず、Rust側(`SessionOrchestrator::ensure_tmux_tab_window`)へ
+     * そのまま委譲する薄いパススルー(`.claude/rules/rust-ssot.md`)。呼び出し元
+     * ([TerminalTabsViewModel])はprimary paneについてのみ呼ぶこと(split pane非対応)。
+     */
+    suspend fun ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?) =
+        orchestrator.ensureTmuxTabWindow(profileIdentity, clientId, existingTag)
+
     // ── Network ───────────────────────────────────────────────────────
 
     /** ネットワークpath変化イベントをそのまま Rust 側に転送する。

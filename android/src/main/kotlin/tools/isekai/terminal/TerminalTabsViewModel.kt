@@ -33,6 +33,7 @@ import tools.isekai.terminal.session.TerminalSession
 import tools.isekai.terminal.ui.TerminalTheme
 import tools.isekai.terminal.ui.TerminalThemes
 import tools.isekai.terminal.ui.applyTo
+import tools.isekai.terminal.util.ClientIdentity
 import tools.isekai.terminal.util.RemoteLogger
 import uniffi.isekai_terminal_core.CellData
 import uniffi.isekai_terminal_core.ClipboardMimeKind
@@ -265,6 +266,14 @@ class TerminalTabsViewModel(
         // (ペインごとの配色分岐はスコープ外)。
         internal val currentTheme = MutableStateFlow(initialTheme)
         internal var isThemeOverridden: Boolean = initialThemeIsOverridden
+
+        // ── tmux session group / ウィンドウ紐付け(タスク#60、primary paneのみ)──
+        // Rust側(`SessionOrchestrator.ensureTmuxTabWindow`)が解決したウィンドウ情報の
+        // うち、UIへ最小限反映してよい表示用ラベル(例: "win 2")だけを持つ。判断は
+        // 一切ここで行わない(`.claude/rules/rust-ssot.md`) — 常にRustが返した値の
+        // 素通しであり、Kotlin側で解釈・分岐はしない。まだ解決前(接続直後や
+        // opportunisticな失敗時)はnullのままで、その場合はタブラベルに何も追加しない。
+        internal val tmuxWindowLabel = MutableStateFlow<String?>(null)
 
         // ── 画面分割(split pane) ────────────────────────────────
         // まずは水平/垂直の2分割のみをサポートする(バイナリツリー式の多段分割はスコープ外)。
@@ -519,7 +528,7 @@ class TerminalTabsViewModel(
             launch { observeSummary(pane) }
             launch { observeDownloads(pane) }
             launch { observeFailover(pane) }
-            launch { observeConnectionTransitions(pane) }
+            launch { observeConnectionTransitions(tab, pane) }
         }
     }
 
@@ -541,7 +550,7 @@ class TerminalTabsViewModel(
         }
     }
 
-    private suspend fun observeConnectionTransitions(pane: PaneState) {
+    private suspend fun observeConnectionTransitions(tab: TabState, pane: PaneState) {
         var prevConnected = false
         pane.uiState.collect { state ->
             val connected = state.connected
@@ -551,6 +560,12 @@ class TerminalTabsViewModel(
                     pane.upstreamFailoverMonitorHandle = executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
                 }
                 maybeSendPostConnectCommands(pane)
+                // タスク#60: tmux session group ensure/attach + ウィンドウのcreate-or-select。
+                // primary paneのみが対象(split paneはtmux非対応のMVP判断、
+                // `rust-core/src/tmux_session.rs`のモジュールdoc参照)。
+                if (pane.paneId == tab.primaryPane.paneId) {
+                    maybeEnsureTmuxTabWindow(tab, pane)
+                }
             } else if (!connected && prevConnected) {
                 executor.notifyDisconnected()
                 pane.physicalMultipathHandle?.close()
@@ -693,6 +708,44 @@ class TerminalTabsViewModel(
             delay(POST_CONNECT_DEBOUNCE_MS)
             RemoteLogger.i("IsekaiTerminalSSH", "sending post-connect commands (${bytes.size} bytes) pane=${pane.paneId}")
             pane.session.send(bytes)
+        }
+    }
+
+    // ── tmux session group / ウィンドウ紐付け(タスク#60)─────────────────
+
+    /**
+     * primary paneが接続完了した際に、tmux session groupのensure/attach + タブ用
+     * ウィンドウのcreate-or-selectをRust側(`SessionOrchestrator.ensureTmuxTabWindow`)
+     * へ依頼する。どのtmuxコマンドを実行するか・既存タグが見つかるか等の判断は一切
+     * Kotlin側で行わない(`.claude/rules/rust-ssot.md`) — ここは
+     * (1) Roomに永続化済みのタグがあれば読んで渡す
+     * (2) Rustが返した`tag`をRoomへ書き戻す
+     * (3) 表示用ラベルをタブへ反映する
+     * だけの薄い配線。
+     *
+     * opportunisticな補助機能: 失敗してもタブ自体は通常のシェルとして使い続けられる
+     * ため、ログのみ残して無視する(接続やUIをブロックしない)。プロファイルを
+     * 持たない、または未保存(id=0、理論上のみ)のタブでは何もしない。
+     */
+    private fun maybeEnsureTmuxTabWindow(tab: TabState, pane: PaneState) {
+        val profile = tab.profile ?: return
+        if (profile.id == 0L) return
+        viewModelScope.launch(ioDispatcher) {
+            try {
+                val profileIdentity = "profile:${profile.id}"
+                val clientId = ClientIdentity.getOrCreate(getApplication())
+                val existingTag = Repositories.tmuxTabLocators.findTagForProfile(profile.id)
+                val info = pane.session.ensureTmuxTabWindow(profileIdentity, clientId, existingTag)
+                Repositories.tmuxTabLocators.saveTag(profile.id, info.tag)
+                tab.tmuxWindowLabel.value = "tmux:${info.windowIndex}"
+                RemoteLogger.i(
+                    "IsekaiTerminalTmux",
+                    "ensureTmuxTabWindow[${tab.tabId}]: group=${info.groupName} session=${info.sessionName} " +
+                        "window=${info.windowIndex} tag=${info.tag} isNew=${info.isNewWindow}",
+                )
+            } catch (e: Exception) {
+                RemoteLogger.w("IsekaiTerminalTmux", "ensureTmuxTabWindow failed (non-fatal): ${e.message}")
+            }
         }
     }
 

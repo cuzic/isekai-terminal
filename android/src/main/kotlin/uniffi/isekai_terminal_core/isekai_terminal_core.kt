@@ -849,6 +849,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic(
@@ -1004,6 +1006,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_q
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(`ptr`: Long,`profileIdentity`: RustBuffer.ByValue,`clientId`: RustBuffer.ByValue,`existingTag`: RustBuffer.ByValue,
+): Long
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_force_return_to_wifi(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_is_quic(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1290,6 +1294,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window() != 29370) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi() != 8683) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1299,7 +1306,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired() != 26224) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background() != 63526) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background() != 56561) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
@@ -2905,6 +2912,26 @@ public interface SessionOrchestratorInterface {
     fun `disconnect`()
     
     /**
+     * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
+     * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
+     * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
+     * "既存タグが見つかるか"等)は一切Kotlin側に持ち出さず、ここで完結させる
+     * (`.claude/rules/rust-ssot.md`)。
+     *
+     * - `profile_identity`: 呼び出し側が決める安定な識別子(例:
+     * `ConnectionProfile.id`の文字列化)。同じ値からは常に同じsession groupに
+     * 決定論的に解決される。
+     * - `client_id`: このアプリインストール固有の永続トークン(Kotlin側で1回だけ
+     * 生成し`SharedPreferences`等に保存、以後使い回す)。
+     * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
+     * 無ければ`None`(新規タブ)。
+     *
+     * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
+     * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
+     */
+    suspend fun `ensureTmuxTabWindow`(`profileIdentity`: kotlin.String, `clientId`: kotlin.String, `existingTag`: kotlin.String?): TmuxTabWindowInfo
+    
+    /**
      * #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
      * ダウンロード中などで静けさ待ちを待たずに即座に戻したい場合)。疎通確認だけは
      * 省略されない(`RebindManager::handle_manual_force_return`参照)。マルチパス以外の
@@ -2926,8 +2953,10 @@ public interface SessionOrchestratorInterface {
      * Androidの`ProcessLifecycleOwner.onStop`相当)ことを通知する。`budget_ms`は
      * `beginBackgroundTask`等が保証する猶予の目安として記録目的で受け取るが、
      * 実際の期限管理(タイマー)はSwift/Kotlin側の責務のままにする(Rust/Swiftで
-     * 基準時計を共有していないため)。`Connected`中のみ猶予追跡を開始する
-     * (未接続/接続試行中のバックグラウンド化は維持すべきセッションが無いので無視)。
+     * 基準時計を共有していないため)。`Connected`または`Connecting`中のみ猶予追跡を
+     * 開始する(`Idle`は維持すべきセッションが無いので無視。`Connecting`中に
+     * バックグラウンド化し、その猶予中に接続が成立するケース(`on_connected()`
+     * 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
      */
     fun `notifyDidEnterBackground`(`budgetMs`: kotlin.UInt)
     
@@ -3265,6 +3294,45 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
 
     
     /**
+     * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
+     * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
+     * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
+     * "既存タグが見つかるか"等)は一切Kotlin側に持ち出さず、ここで完結させる
+     * (`.claude/rules/rust-ssot.md`)。
+     *
+     * - `profile_identity`: 呼び出し側が決める安定な識別子(例:
+     * `ConnectionProfile.id`の文字列化)。同じ値からは常に同じsession groupに
+     * 決定論的に解決される。
+     * - `client_id`: このアプリインストール固有の永続トークン(Kotlin側で1回だけ
+     * 生成し`SharedPreferences`等に保存、以後使い回す)。
+     * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
+     * 無ければ`None`(新規タブ)。
+     *
+     * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
+     * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
+     */
+    @Throws(TmuxSessionException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `ensureTmuxTabWindow`(`profileIdentity`: kotlin.String, `clientId`: kotlin.String, `existingTag`: kotlin.String?) : TmuxTabWindowInfo {
+        return uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(
+                uniffiHandle,
+                FfiConverterString.lower(`profileIdentity`),FfiConverterString.lower(`clientId`),FfiConverterOptionalString.lower(`existingTag`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_isekai_terminal_core_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_isekai_terminal_core_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.ffi_isekai_terminal_core_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterTypeTmuxTabWindowInfo.lift(it) },
+        // Error FFI converter
+        TmuxSessionException.ErrorHandler,
+    )
+    }
+
+    
+    /**
      * #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
      * ダウンロード中などで静けさ待ちを待たずに即座に戻したい場合)。疎通確認だけは
      * 省略されない(`RebindManager::handle_manual_force_return`参照)。マルチパス以外の
@@ -3317,8 +3385,10 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
      * Androidの`ProcessLifecycleOwner.onStop`相当)ことを通知する。`budget_ms`は
      * `beginBackgroundTask`等が保証する猶予の目安として記録目的で受け取るが、
      * 実際の期限管理(タイマー)はSwift/Kotlin側の責務のままにする(Rust/Swiftで
-     * 基準時計を共有していないため)。`Connected`中のみ猶予追跡を開始する
-     * (未接続/接続試行中のバックグラウンド化は維持すべきセッションが無いので無視)。
+     * 基準時計を共有していないため)。`Connected`または`Connecting`中のみ猶予追跡を
+     * 開始する(`Idle`は維持すべきセッションが無いので無視。`Connecting`中に
+     * バックグラウンド化し、その猶予中に接続が成立するケース(`on_connected()`
+     * 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
      */override fun `notifyDidEnterBackground`(`budgetMs`: kotlin.UInt)
         = 
     callWithHandle {
@@ -4775,6 +4845,81 @@ public object FfiConverterTypeTerminalFrameBatch: FfiConverterRustBuffer<Termina
 
 
 /**
+ * タスク#60: `SessionOrchestrator::ensure_tmux_tab_window`の成功結果。
+ * Kotlin側は`tag`をRoom(`tmux_tab_locators`テーブル)へ永続化し、次回同じ
+ * プロファイル(のprimary pane)を開く時に`existing_tag`として渡し戻すこと。
+ * `window_index`はUI表示のヒント程度に使ってよいが、揮発性の値なので永続化の
+ * キーにはしないこと(`tmux_locator.rs`の`TmuxCoordinates`参照)。
+ */
+data class TmuxTabWindowInfo (
+    /**
+     * tmuxウィンドウを長期的に指すタグ値。
+     */
+    var `tag`: kotlin.String
+    , 
+    /**
+     * このタグ解決時点でのウィンドウインデックス。
+     */
+    var `windowIndex`: kotlin.UInt
+    , 
+    /**
+     * このクライアントがattachしたセッション名(グループ内で一意)。
+     */
+    var `sessionName`: kotlin.String
+    , 
+    /**
+     * tmux session groupの名前。
+     */
+    var `groupName`: kotlin.String
+    , 
+    /**
+     * 今回新規にウィンドウを作成したか(true)、既存タグを解決して再利用したか(false)。
+     */
+    var `isNewWindow`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTmuxTabWindowInfo: FfiConverterRustBuffer<TmuxTabWindowInfo> {
+    override fun read(buf: ByteBuffer): TmuxTabWindowInfo {
+        return TmuxTabWindowInfo(
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: TmuxTabWindowInfo) = (
+            FfiConverterString.allocationSize(value.`tag`) +
+            FfiConverterUInt.allocationSize(value.`windowIndex`) +
+            FfiConverterString.allocationSize(value.`sessionName`) +
+            FfiConverterString.allocationSize(value.`groupName`) +
+            FfiConverterBoolean.allocationSize(value.`isNewWindow`)
+    )
+
+    override fun write(value: TmuxTabWindowInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`tag`, buf)
+            FfiConverterUInt.write(value.`windowIndex`, buf)
+            FfiConverterString.write(value.`sessionName`, buf)
+            FfiConverterString.write(value.`groupName`, buf)
+            FfiConverterBoolean.write(value.`isNewWindow`, buf)
+    }
+}
+
+
+
+/**
  * OSC 52テキストクリップボード(`ClipboardMime::TextPlain`のみ)とtmux迂回チャンネル
  * (`ISEKAI_PIPE_DESIGN.md` §8 Epic M、`isekai_protocol::ClipboardMime`全種)の両方が
  * 運べるmime種別。`isekai_protocol::ClipboardMime`をUniFFI境界越しにそのまま公開できない
@@ -5654,6 +5799,102 @@ public object FfiConverterTypeTerminalSpecialKey : FfiConverterRustBuffer<Termin
 }
 
 
+
+
+
+
+
+/**
+ * [`SessionOrchestrator::ensure_tmux_tab_window`]の失敗。opportunisticな補助機能
+ * (tmux管理コマンドが失敗しても、タブ自体の接続は生きたまま続行する——呼び出し側は
+ * このエラーをログに残す程度でよく、詳細な分岐をさせる必要は無い)なので、
+ * `run_exec`(#61)由来のエラーの内訳(未接続/チャネルオープン失敗/非ゼロ終了/実行中の
+ * 切断)はメッセージにまとめて運ぶだけに留める。
+ */
+sealed class TmuxSessionException: kotlin.Exception() {
+    
+    /**
+     * tmux管理コマンドの実行自体に失敗した(未接続・SSHチャネルの問題・非ゼロ終了等)。
+     */
+    class Command(
+        
+        val v1: kotlin.String
+        ) : TmuxSessionException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
+    /**
+     * tmuxコマンド自体は成功したが、期待した形式の出力が得られなかった。
+     */
+    class UnexpectedOutput(
+        
+        val v1: kotlin.String
+        ) : TmuxSessionException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
+
+    
+
+
+    companion object ErrorHandler : UniffiRustCallStatusErrorHandler<TmuxSessionException> {
+        override fun lift(error_buf: RustBuffer.ByValue): TmuxSessionException = FfiConverterTypeTmuxSessionError.lift(error_buf)
+    }
+
+    
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTmuxSessionError : FfiConverterRustBuffer<TmuxSessionException> {
+    override fun read(buf: ByteBuffer): TmuxSessionException {
+        
+
+        return when(buf.getInt()) {
+            1 -> TmuxSessionException.Command(
+                FfiConverterString.read(buf),
+                )
+            2 -> TmuxSessionException.UnexpectedOutput(
+                FfiConverterString.read(buf),
+                )
+            else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: TmuxSessionException): ULong {
+        return when(value) {
+            is TmuxSessionException.Command -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
+            is TmuxSessionException.UnexpectedOutput -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
+        }
+    }
+
+    override fun write(value: TmuxSessionException, buf: ByteBuffer) {
+        when(value) {
+            is TmuxSessionException.Command -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+            is TmuxSessionException.UnexpectedOutput -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.v1, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+
+}
 
 
 

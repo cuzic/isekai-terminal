@@ -641,7 +641,7 @@ class AppDatabaseMigration3To4Test {
                 // このコールバックの宣言バージョンは、直前の Room ビルドが作った実ファイルの
                 // user_version（＝AppDatabase の現行 version）と一致させること。ずれると
                 // SQLiteOpenHelper のデフォルト onDowngrade（例外送出）が発火してしまう。
-                .callback(object : SupportSQLiteOpenHelper.Callback(19) {
+                .callback(object : SupportSQLiteOpenHelper.Callback(20) {
                     override fun onCreate(db: SupportSQLiteDatabase) {}
                     override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
                 })
@@ -686,7 +686,7 @@ class AppDatabaseMigration3To4Test {
         createV10Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19)
+            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_19_20)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -703,7 +703,7 @@ class AppDatabaseMigration3To4Test {
         createV10Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19)
+            .addMigrations(AppDatabase.MIGRATION_10_11, AppDatabase.MIGRATION_11_12, AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_19_20)
             .build()
         try {
             val dao = db.connectionProfileDao()
@@ -752,7 +752,7 @@ class AppDatabaseMigration12To14Test {
                 // このコールバックの宣言バージョンは、直前の Room ビルドが作った実ファイルの
                 // user_version（＝AppDatabase の現行 version）と一致させること。ずれると
                 // SQLiteOpenHelper のデフォルト onDowngrade（例外送出）が発火してしまう。
-                .callback(object : SupportSQLiteOpenHelper.Callback(19) {
+                .callback(object : SupportSQLiteOpenHelper.Callback(20) {
                     override fun onCreate(db: SupportSQLiteDatabase) {}
                     override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
                 })
@@ -803,7 +803,7 @@ class AppDatabaseMigration12To14Test {
         createV12Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19)
+            .addMigrations(AppDatabase.MIGRATION_12_13, AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_19_20)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
@@ -827,7 +827,7 @@ class AppDatabaseMigration12To14Test {
         val helper = FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(ctx)
                 .name(dbName)
-                .callback(object : SupportSQLiteOpenHelper.Callback(19) {
+                .callback(object : SupportSQLiteOpenHelper.Callback(20) {
                     override fun onCreate(db: SupportSQLiteDatabase) {}
                     override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {}
                 })
@@ -879,7 +879,7 @@ class AppDatabaseMigration12To14Test {
         createV13Database()
 
         val db = Room.databaseBuilder(ctx, AppDatabase::class.java, dbName)
-            .addMigrations(AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19)
+            .addMigrations(AppDatabase.MIGRATION_13_14, AppDatabase.MIGRATION_14_15, AppDatabase.MIGRATION_15_16, AppDatabase.MIGRATION_16_17, AppDatabase.MIGRATION_17_18, AppDatabase.MIGRATION_18_19, AppDatabase.MIGRATION_19_20)
             .build()
         try {
             val profiles = runBlocking { db.connectionProfileDao().getAll() }
