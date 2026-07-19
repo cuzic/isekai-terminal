@@ -1786,6 +1786,7 @@ mod tests {
             }),
             reconnect_wake: tokio::sync::Notify::new(),
             tmux_backfill_locator: Mutex::new(None),
+            app_pane_id: crate::tmux_locator::AppPaneId::generate_process_local(),
             after_reconnect_success: Box::new(move |_shared| {
                 backfill_counter_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }),
