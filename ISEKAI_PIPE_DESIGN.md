@@ -1460,6 +1460,90 @@ take()できたときだけ立ち退きを実行する、executor層[`engine/mod
   `fresh_attach_after_park_expiry_succeeds_instead_of_staying_busy`
   (sweep経由の回復)は無傷で通ることを確認済み。
 
+  **2026-07-19追記(Epic N-5)**: 本Epicが前提としていた「`AttachArbiter`は
+  ターゲット1つにつき単一の`Established` fencing slotしか持たない」設計
+  そのものがEpic N-5で覆された(`session_id`ごとの独立slotへ一般化)。
+  `claim_parked`/`ClaimParkedOutcome`と`duplicate_connection_is_rejected`は
+  Epic N-5で不要になり削除・置換済み——詳細は同Epicを参照。この段落より上の
+  記述は2026-07-18時点の設計として歴史的記録のまま残す。
+
+### Epic N-5: `isekai-ssh`が同一ホストへの複数セッションを同時に張れるようにする — 完了(2026-07-19)
+
+**動機**: `isekai-ssh <host>`は同じホストへの2本目の接続を同時に張れなかった
+(2本目は`BusyOtherSession`で拒否され、`resume_loop.rs::retry_while_busy_
+other_session`が180秒リトライしたのち諦める)。原因は`AttachArbiter`
+(`engine/attach_arbiter.rs`)がターゲット1つ(`isekai-pipe serve`プロセス1つ)
+につき単一の`state: AttachState`フィールド(=fencing slot 1つ)しか持たない
+ことで、`isekai-ssh <host>`は起動のたびに新しいランダムな`session_id`を
+生成するため、2本目は「同じホストへの正当な再接続(resume)」ではなく
+「競合する別の論理セッション」とみなされていた。
+
+これはEpic N/N-3/N-4で意図的に選ばれた「1ターゲットにつき1つの論理SSH
+セッション(ネットワーク切替時にresumeできる)」という設計モデルの帰結
+であり、「同一ホストへの複数の独立した端末」は当時想定されていなかった
+(明示的な対象外判断ではなく単に手つかず)。一方、data-plane側の
+`SessionTable`(`engine/resume.rs`)は元々`session_id`をキーにした
+`HashMap`で、`--max-sessions`(既定16、Phase S-4b)まで複数セッションを
+同時保持できる設計になっていた——ボトルネックは`AttachArbiter`の単一slot
+だけだった。
+
+**設計**:
+- ✅ **`AttachArbiter`を`session_id`ごとのテーブルへ一般化**
+  (`attach_arbiter.rs`): 単一の`state: AttachState`を
+  `sessions: HashMap<SessionId, AttachState>`に変更。異なる`session_id`
+  同士は完全に独立して同時に`Established`まで到達できるようになった——
+  `decide_against_in_flight`/`Established`アームにあった
+  `key.session_id != cur.session_id`分岐(`BusyOtherSession`を返していた
+  箇所)は、map引きで`cur.session_id == key.session_id`が常に保証される
+  ため丸ごと消滅した。`LeaseId`だけをキーに持つイベント
+  (`TargetConnected`/`TargetConnectFailed`/`LeaseStopped`/
+  `PendingExpired`/`RelayEnded`)は、そのleaseを今どの`session_id`が
+  持っているか線形探索する(`--max-sessions`規模ならO(n)で十分、
+  lease→session_idの別索引は同期ズレのリスクを避けるため持たない)。
+  `AttachState::Vacant`は廃止し、map不在をVacant代わりとした。
+- ✅ **容量制御をN slot分のadmission controlへ一般化・前倒し**
+  (`engine/mod.rs`): Epic N-4の`hello_with_parked_preemption`(単一slotを
+  他sessionの parkされたセッションが占有しているケースの救済策)は、
+  slotがsession_idごとになったことで対象のケース自体が消滅したため、
+  `admit_new_session`に置き換えた。新しい`session_id`が
+  `attach_runtime.hello()`でtarget TCP接続を試みる**前**に、現在の
+  セッション数が`--max-sessions`未満なら素通り、上限に達していれば
+  `SessionTable::claim_oldest_parked()`(`insert_existing`の立ち退き
+  スキャンを`find_oldest_parked`として共通化し、両方から使う新設メソッド)
+  で最も古いparkされたセッションを1つ立ち退かせてから素通り、立ち退かせ
+  られるものが無ければ(全セッションがアクティブ中継中)`BusyOtherSession`
+  で拒否する。`AttachArbiter`自体は「parkされているかアクティブ中継中か」
+  を知らない(`SessionTable`だけが知る)ため、この判断は変わらず実行層が
+  担う。`AttachRejectReason::BusyOtherSession`は新しいwire reasonを追加
+  せずそのまま再利用(意味は「別sessionが使用中」→「容量上限に達しており
+  立ち退かせるものが無い」に変わった)——ワイヤ/UniFFI/Kotlin/Swiftバイン
+  ディングへの伝播が不要になった。
+- ✅ **クライアント側(isekai-ssh/Android/iOS)は無変更**: `session_id`は
+  既に呼び出し・タブごとに新規ランダム生成されており
+  (`resume_loop.rs`)、判断ロジックは全てRust SSOT(サーバー側)に閉じて
+  いるため(`.claude/rules/rust-ssot.md`)、サーバー側がN セッションを
+  受け付けるようになれば無改修でそのまま動く。
+- ✅ **不要になったEpic N-4機構の削除**: `SessionTable::claim_parked`/
+  `ClaimParkedOutcome`(単一slot時代の「別sessionの parkされたセッション
+  を横取りする」専用API)は`hello_with_parked_preemption`の唯一の呼び出し元
+  だったため、置き換えと同時に削除した。
+- ✅ テスト: `attach_arbiter.rs`の`different_session_is_busy_other_session`
+  (単一slot時代の前提)を削除し、`different_sessions_are_fully_independent`・
+  `relay_ended_for_one_session_does_not_affect_other_concurrent_sessions`を
+  追加。`resume.rs`に`claim_oldest_parked`の2ケースを追加。`serve_e2e.rs`の
+  `duplicate_connection_is_rejected`を
+  `two_independent_sessions_to_the_same_target_are_both_established`
+  (2本の独立したセッションが同時に`Established`になり、それぞれ独立して
+  echo targetと中継できることをペイロードのroundtripで確認)に置き換え、
+  容量上限到達時の拒否を確認する
+  `capacity_full_with_nothing_parked_is_rejected_with_busy_other_session`
+  を新設。Epic N-4の
+  `fresh_attach_preempts_a_parked_session_immediately_without_waiting_for_resume_window`
+  は、デフォルトの`--max-sessions`(16)の余裕内では2本目が1本目に一切
+  触れなくなった(Epic N-5の想定通り)ため前提が崩れており、
+  `--max-sessions 1`を明示して「容量が本当に埋まっている場合」に条件を
+  絞った上で存続させた。
+
 ### Epic O: Windows公式サポート化(クライアントのみ、接続先は引き続きLinux固定)— 完了(2026-07-14)
 
 **動機**: `rust-core/isekai-ssh/README.md`が「Windows(MSYS2/Git for Windows上での実行)は
