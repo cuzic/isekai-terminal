@@ -421,8 +421,34 @@ fn identity_paths_display(paths: &[PathBuf]) -> String {
 /// identically-purposed function). Runs on a `spawn_blocking` thread (see
 /// `FileBackedHostKeyVerifier::verify`'s docs), so a plain blocking stdin
 /// read is safe here.
+///
+/// Refuses outright (no prompt at all) when stdin isn't a real terminal —
+/// mirrors `ssh(1)`'s `BatchMode=yes` behavior. `bootstrap_and_register`'s
+/// `TofuConfirmation::Silent` callers (`doctor --fix`/stale-trust
+/// auto-recovery) promise no interaction is needed, but that promise never
+/// reached this *separate* SSH-layer host-key confirmation — without this
+/// guard, a caller whose stdin is a pipe that's never closed (unlike
+/// `Stdio::null()`, which hits EOF and declines immediately) would block
+/// forever here, silently violating `always-connects.md`.
 fn prompt_new_host_confirmation(fingerprint: &str) -> bool {
+    use std::io::IsTerminal as _;
+    prompt_new_host_confirmation_inner(fingerprint, std::io::stdin().is_terminal())
+}
+
+/// The `stdin_is_terminal`-injectable core of [`prompt_new_host_confirmation`]
+/// — see `isekai-ssh::native::connect`'s identically-shaped sibling function
+/// for why this split exists (unit-testable non-interactive refusal without
+/// a real terminal).
+fn prompt_new_host_confirmation_inner(fingerprint: &str, stdin_is_terminal: bool) -> bool {
     use std::io::Write as _;
+    if !stdin_is_terminal {
+        eprintln!(
+            "isekai-ssh: unknown SSH host key for the bootstrap host (fingerprint {fingerprint}) — \
+             refusing to prompt in a non-interactive session. Run `isekai-ssh init`/`doctor --fix` \
+             from an interactive terminal once to confirm it."
+        );
+        return false;
+    }
     eprint!(
         "The authenticity of the bootstrap host can't be established.\n\
          Key fingerprint is {fingerprint}.\n\
@@ -840,6 +866,17 @@ impl BootstrapBackend for RusshBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_new_host_confirmation_refuses_without_a_terminal() {
+        // Regression test for the always-connects.md gap a real Windows CI
+        // run surfaced: a `TofuConfirmation::Silent` caller (doctor --fix /
+        // stale-trust auto-recovery) must never block on this prompt. This
+        // only exercises the non-interactive early-return — reaching the
+        // interactive branch would block on the real `std::io::stdin()`, so
+        // it isn't (and can't cheaply be) unit-tested here.
+        assert!(!prompt_new_host_confirmation_inner("SHA256:deadbeef", false));
+    }
 
     #[test]
     fn read_identity_credential_reads_present_and_skips_missing() {

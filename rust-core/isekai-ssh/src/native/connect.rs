@@ -527,8 +527,37 @@ fn local_username() -> Option<String> {
 /// `ssh(1)`'s own wording, adapted. Runs on a `spawn_blocking` thread (see
 /// `host_key_trust.rs::verify`'s docs), so a plain blocking stdin read is
 /// safe here.
+///
+/// Refuses outright (no prompt at all) when stdin isn't a real terminal —
+/// mirrors `ssh(1)`'s `BatchMode=yes` behavior. Without this, a
+/// `TofuConfirmation::Silent` caller (`doctor --fix`/stale-trust
+/// auto-recovery) whose stdin is a pipe that's never closed (as opposed to
+/// `Stdio::null()`, which hits EOF and declines immediately) would block
+/// forever on this `read_line` — silently violating `always-connects.md`'s
+/// promise that those paths need no interaction (a real Windows CI run
+/// caught this only because the test's stdin *did* reach EOF; a live but
+/// silent caller wouldn't).
 fn prompt_new_host_confirmation(host_port: &str, fingerprint: &str) -> bool {
+    use std::io::IsTerminal as _;
+    prompt_new_host_confirmation_inner(host_port, fingerprint, std::io::stdin().is_terminal())
+}
+
+/// The `stdin_is_terminal`-injectable core of [`prompt_new_host_confirmation`],
+/// split out so the non-interactive refusal path is unit-testable without a
+/// real terminal (the interactive branch still isn't — it always re-reads
+/// the real `std::io::stdin()` when reached, matching how this codebase's
+/// other interactive-stdin functions are tested only via e2e subprocess
+/// harnesses, not unit tests).
+fn prompt_new_host_confirmation_inner(host_port: &str, fingerprint: &str, stdin_is_terminal: bool) -> bool {
     use std::io::Write as _;
+    if !stdin_is_terminal {
+        eprintln!(
+            "isekai-ssh: unknown SSH host key for {host_port:?} (fingerprint {fingerprint}) — \
+             refusing to prompt in a non-interactive session. Run this connection from an \
+             interactive terminal once to confirm the new host key."
+        );
+        return false;
+    }
     eprint!(
         "The authenticity of host '{host_port}' can't be established.\n\
          Key fingerprint is {fingerprint}.\n\
@@ -756,6 +785,17 @@ mod tests {
     use russh_stream_session::{verifying_handler, Credential, HostKeyVerifier};
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn prompt_new_host_confirmation_refuses_without_a_terminal() {
+        // Regression test for the always-connects.md gap a real Windows CI
+        // run surfaced: a `TofuConfirmation::Silent` caller (doctor --fix /
+        // stale-trust auto-recovery) must never block on this prompt. This
+        // only exercises the non-interactive early-return — reaching the
+        // interactive branch would block on the real `std::io::stdin()`, so
+        // it isn't (and can't cheaply be) unit-tested here.
+        assert!(!prompt_new_host_confirmation_inner("host:22", "SHA256:deadbeef", false));
+    }
 
     struct AcceptAllHostKeys;
     #[async_trait]
