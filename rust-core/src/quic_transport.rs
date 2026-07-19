@@ -344,7 +344,15 @@ async fn run_quic_transport(
 
     // Phase 5B の QUIC (tsshd) transport は agent forwarding 未対応（プロファイルの
     // `SshConfig.agent_forward` 相当のフィールドを `QuicConfig` はまだ持たない）。
-    run_ssh_channel_loop(&pooled, config.cols, config.rows, false, false, cmd_rx, event_tx).await;
+    // タスク#59: この transport は`OrchestratorShared::app_pane_id`をまだ素通し
+    // していない(プレーンSSH経路のみ配線済み、follow-upとして残す判断は
+    // `rust-core/src/transport/ssh_handler.rs`の`run_ssh_channel_loop`引数docと
+    // タスク完了報告を参照)。呼び出しごとに新規生成した値を渡すため、
+    // tmuxロケータレジストリには何も登録されておらず実質no-op。
+    run_ssh_channel_loop(
+        &pooled, config.cols, config.rows, false, false, cmd_rx, event_tx,
+        crate::tmux_locator::AppPaneId::generate_process_local(),
+    ).await;
 }
 
 #[cfg(test)]

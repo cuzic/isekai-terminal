@@ -629,11 +629,57 @@ pub(crate) async fn run_exec_on_handle(
     }
 }
 
+// ── タスク#59: tmuxロケータの`RemoteTmuxCommandRunner`シームへのアダプタ ──
+
+/// [`crate::tmux_locator::RemoteTmuxCommandRunner`](#62のシーム)を、上の
+/// `run_exec_on_handle`(タスク#61)へ薄く実装する本番アダプタ。tmux管理コマンド
+/// (`tmux list-windows`/`set-option`等)は必ず標準出力・終了コード0を期待する
+/// 短命コマンドなので、非ゼロ終了は`stderr`の内容が読めない(`run_exec_on_handle`は
+/// stdoutのみ返す設計、タスク#61のスコープ)なりに終了コードだけを含めた
+/// `TmuxRunError`にする。
+struct SshHandleTmuxRunner {
+    handle: Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
+}
+
+impl crate::tmux_locator::RemoteTmuxCommandRunner for SshHandleTmuxRunner {
+    fn run(
+        &self,
+        cmd: &str,
+    ) -> impl std::future::Future<Output = Result<String, crate::tmux_locator::TmuxRunError>> + Send {
+        let handle = self.handle.clone();
+        let cmd = cmd.to_string();
+        async move {
+            match run_exec_on_handle(&handle, &cmd).await {
+                Ok(ExecOutput { stdout, exit_status }) => {
+                    if exit_status.is_some_and(|status| status != 0) {
+                        return Err(crate::tmux_locator::TmuxRunError(format!(
+                            "command {cmd:?} exited with status {:?}",
+                            exit_status
+                        )));
+                    }
+                    Ok(String::from_utf8_lossy(&stdout).into_owned())
+                }
+                Err(e) => Err(crate::tmux_locator::TmuxRunError(e.to_string())),
+            }
+        }
+    }
+}
+
 // ── SSH チャネルループ（TCP・QUIC 共通）─────────────────
 
 /// [pooled]（既に認証済み）に対して新しいSSHチャネル(セッション/PTY/シェル)を1本開き、
 /// そのチャネルのI/Oループを回す。プールにヒットした2本目以降のタブも最初のタブも、
 /// この関数から始まる(呼び出し元が先に確立関数を呼ぶかプールから取得するかだけが違う)。
+///
+/// `app_pane_id`(タスク#59): このタブの安定識別子(`crate::tmux_locator::TmuxLocatorRegistry`の
+/// キー)。ctl-socket forwardが確立するたびに(接続確立時・再接続時いずれも)、これで
+/// 既知のtmuxロケータを引いて`@isekai_ctl_sock`を伝播する(下の"tmux 迂回
+/// control-plane"節参照)。プレーンSSH経路(`lib.rs::run_russh_transport`)だけが
+/// `OrchestratorShared::app_pane_id`由来の実際に安定した値を渡す。他のtransport
+/// (QUIC系等)の呼び出し元は現時点でこの識別子をまだ発行元(`OrchestratorShared`)から
+/// 素通ししていないため、呼び出しごとに新規生成した値を渡している=レジストリに
+/// 何も登録されないので実質no-op(タスク#59のスコープ外、フォローアップとして
+/// 残す判断は最終報告に記載)。
 pub(crate) async fn run_ssh_channel_loop(
     pooled: &PooledSshHandle,
     cols: u32,
@@ -642,6 +688,7 @@ pub(crate) async fn run_ssh_channel_loop(
     allow_non_loopback_forward_bind: bool,
     mut cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+    app_pane_id: crate::tmux_locator::AppPaneId,
 ) {
     let mut channel = match pooled.handle.lock().await.channel_open_session().await {
         Ok(c) => { info!("ssh: session channel opened"); c }
@@ -692,6 +739,28 @@ pub(crate) async fn run_ssh_channel_loop(
                             None => TransportEvent::CtlMessage(msg),
                         };
                         forward_event_tx.send(event).await.ok();
+                    }
+                });
+                // タスク#59: このタブに既にtmuxロケータが分かっていれば
+                // (`TMUX_LOCATOR_REGISTRY`参照)、同じウィンドウ/ペインへ新しい
+                // ctl-socketパスを`@isekai_ctl_sock`として伝播する。まだロケータが
+                // 分かっていないタブ(=`crate::tmux_locator`モジュールdocの
+                // 「#59（このタスクでの配線）」参照、#60等が未実装)では
+                // `push_ctl_socket_to_tmux`が黙ってno-opになる。`run_exec`
+                // (タスク#61)自体がSSHの新しいチャネルを開く待ち時間を伴い得るため、
+                // このI/Oループ(`select!`)をブロックしないよう別taskへ`spawn`する
+                // (`TransportCommand::RunExec`のハンドラと同じ配慮)。
+                let runner = SshHandleTmuxRunner { handle: pooled.handle.clone() };
+                let app_pane_for_push = app_pane_id.clone();
+                let path_for_push = path.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::tmux_locator::push_ctl_socket_to_tmux(
+                        &crate::tmux_locator::TMUX_LOCATOR_REGISTRY,
+                        &app_pane_for_push,
+                        &path_for_push,
+                        runner,
+                    ).await {
+                        debug!("tmux-ctl-sock: push for {:?} failed (best-effort): {}", app_pane_for_push, e);
                     }
                 });
                 Some(path)
@@ -862,6 +931,11 @@ pub(crate) async fn run_ssh_channel_loop(
         if let Err(e) = session.lock().await.cancel_streamlocal_forward(path.clone()).await {
             debug!("ctl-socket: cancel_streamlocal_forward {} failed (best-effort): {}", path, e);
         }
+        // タスク#59: このタブのctl-socketパスがもう有効ではないことをレジストリにも
+        // 反映する(ロケータ自体は`unregister`しない——タブが閉じたわけではなく、
+        // 単にこの接続でのforwardが終わっただけなので、次の再接続で
+        // `push_ctl_socket_to_tmux`が新しいパスを同じロケータへ書き込み直す)。
+        crate::tmux_locator::TMUX_LOCATOR_REGISTRY.lock().set_ctl_socket_path(&app_pane_id, None);
     }
     info!("ssh: I/O loop exited");
 }
@@ -1519,7 +1593,10 @@ mod pooling_e2e_tests {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TransportCommand>(16);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TransportEvent>(16);
         tokio::spawn(async move {
-            run_ssh_channel_loop(&pooled, 80, 24, false, false, cmd_rx, event_tx).await;
+            run_ssh_channel_loop(
+                &pooled, 80, 24, false, false, cmd_rx, event_tx,
+                crate::tmux_locator::AppPaneId::generate_process_local(),
+            ).await;
         });
         match tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await {
             Ok(Some(TransportEvent::Connected)) => {}

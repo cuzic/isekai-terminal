@@ -122,7 +122,13 @@ impl IsekaiPipeQuicSession {
             let (cols, rows) = (config.cols, config.rows);
             match acquire_pooled_handle(&mut config, host_key_callback, &event_tx).await {
                 AcquireOutcome::Attached(pooled, pool_key) => {
-                    run_ssh_channel_loop(&pooled, cols, rows, false, false, cmd_rx, event_tx).await;
+                    // タスク#59: この transport は`app_pane_id`をまだ素通ししていない
+                    // (follow-up、`transport/ssh_handler.rs`の`run_ssh_channel_loop`
+                    // 引数doc参照)。実質no-op。
+                    run_ssh_channel_loop(
+                        &pooled, cols, rows, false, false, cmd_rx, event_tx,
+                        crate::tmux_locator::AppPaneId::generate_process_local(),
+                    ).await;
                     if let Some(key) = pool_key {
                         crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);
                     }
@@ -148,7 +154,13 @@ impl IsekaiPipeQuicSession {
             let (cols, rows) = (config.cols, config.rows);
             match acquire_pooled_handle(&mut config, host_key_callback, &event_tx).await {
                 AcquireOutcome::Attached(pooled, pool_key) => {
-                    run_ssh_channel_loop(&pooled, cols, rows, false, false, cmd_rx, event_tx).await;
+                    // タスク#59: この transport は`app_pane_id`をまだ素通ししていない
+                    // (follow-up、`transport/ssh_handler.rs`の`run_ssh_channel_loop`
+                    // 引数doc参照)。実質no-op。
+                    run_ssh_channel_loop(
+                        &pooled, cols, rows, false, false, cmd_rx, event_tx,
+                        crate::tmux_locator::AppPaneId::generate_process_local(),
+                    ).await;
                     if let Some(key) = pool_key {
                         crate::pool::release(&ISEKAI_PIPE_QUIC_POOL, key, ISEKAI_PIPE_QUIC_IDLE_GRACE);
                     }
@@ -170,7 +182,13 @@ impl IsekaiPipeQuicSession {
                         jump: None,
                         allow_non_loopback_forward_bind: false,
                     };
-                    crate::run_russh_transport(ssh_config, cmd_rx, event_tx).await;
+                    // タスク#59: このフォールバック経路は`app_pane_id`をまだ素通し
+                    // していない(follow-up、`transport/ssh_handler.rs`の
+                    // `run_ssh_channel_loop`引数doc参照)。実質no-op。
+                    crate::run_russh_transport(
+                        ssh_config, cmd_rx, event_tx,
+                        crate::tmux_locator::AppPaneId::generate_process_local(),
+                    ).await;
                 }
                 AcquireOutcome::OtherFailed(e) => {
                     warn!("isekai_pipe_quic auto: {e}");

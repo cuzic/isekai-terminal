@@ -443,7 +443,12 @@ async fn run_over_stream(
     };
 
     // IsekaiStunP2pConfig は agent forwarding 未対応（`IsekaiPipeQuicConfig` と同様）。
-    run_ssh_channel_loop(&pooled, config.cols, config.rows, false, false, cmd_rx, event_tx).await;
+    // タスク#59: この transport は`app_pane_id`をまだ素通ししていない(follow-up、
+    // `transport/ssh_handler.rs`の`run_ssh_channel_loop`引数doc参照)。実質no-op。
+    run_ssh_channel_loop(
+        &pooled, config.cols, config.rows, false, false, cmd_rx, event_tx,
+        crate::tmux_locator::AppPaneId::generate_process_local(),
+    ).await;
 }
 
 #[cfg(test)]
