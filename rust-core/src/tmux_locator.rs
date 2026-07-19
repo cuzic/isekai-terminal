@@ -283,11 +283,15 @@ pub(crate) fn parse_list_output(kind: TmuxTargetKind, output: &str, tag: &TmuxTa
 /// `pane_index: None`)を型として表現できてしまうのを避けている)。
 pub(crate) fn build_set_tag_command(scope: &TmuxSessionScope, coords: &TmuxCoordinates, tag: &TmuxTag) -> String {
     let session = scope.addressable_session_name();
-    let (target, option) = match coords.pane_index {
-        Some(pane_index) => (format!("{session}:{}.{pane_index}", coords.window_index), PANE_TAG_OPTION),
-        None => (format!("{session}:{}", coords.window_index), WINDOW_TAG_OPTION),
+    // `-w`/`-p`必須: 付けないと`set-option`はセッションスコープの値を書いてしまい、
+    // (コードレビューで実tmuxに対し検証済み)そのセッション内の全ウィンドウ/ペインが
+    // 同じ値をinherit経由で返すようになる——ウィンドウ/ペインごとに別々のタグを
+    // 持たせるというこの関数の目的そのものが壊れる。
+    let (scope_flag, target, option) = match coords.pane_index {
+        Some(pane_index) => ("-p", format!("{session}:{}.{pane_index}", coords.window_index), PANE_TAG_OPTION),
+        None => ("-w", format!("{session}:{}", coords.window_index), WINDOW_TAG_OPTION),
     };
-    format!("tmux set-option -t {} {option} {}", shell_quote(&target), shell_quote(&tag.0))
+    format!("tmux set-option {scope_flag} -t {} {option} {}", shell_quote(&target), shell_quote(&tag.0))
 }
 
 /// タスク#59: `coords`が指すウィンドウ/ペインに、Epic Mのctl-socketパス
@@ -302,11 +306,15 @@ pub(crate) fn build_set_ctl_socket_command(
     ctl_socket_path: &str,
 ) -> String {
     let session = scope.addressable_session_name();
-    let target = match coords.pane_index {
-        Some(pane_index) => format!("{session}:{}.{pane_index}", coords.window_index),
-        None => format!("{session}:{}", coords.window_index),
+    // `-w`/`-p`必須: [`build_set_tag_command`]と同じ理由(コードレビューで実tmuxに
+    // 対し検証済み)。無いとセッションスコープになり、タブごとに別のctl-socket
+    // パスを持たせるという本来の目的(このモジュールdoc冒頭参照)が壊れて
+    // 「最後に書いたタブの値が全タブに漏れる」状態になる。
+    let (scope_flag, target) = match coords.pane_index {
+        Some(pane_index) => ("-p", format!("{session}:{}.{pane_index}", coords.window_index)),
+        None => ("-w", format!("{session}:{}", coords.window_index)),
     };
-    format!("tmux set-option -t {} {CTL_SOCK_OPTION} {}", shell_quote(&target), shell_quote(ctl_socket_path))
+    format!("tmux set-option {scope_flag} -t {} {CTL_SOCK_OPTION} {}", shell_quote(&target), shell_quote(ctl_socket_path))
 }
 
 /// [`RemoteTmuxCommandRunner`]越しに実際の問い合わせ/タグ付けを行う薄いラッパー。
@@ -656,7 +664,7 @@ mod tests {
             &TmuxCoordinates { window_index: 2, pane_index: None },
             &TmuxTag("tagval".to_string()),
         );
-        assert_eq!(cmd, "tmux set-option -t 'main:2' @isekai_tab_id 'tagval'");
+        assert_eq!(cmd, "tmux set-option -w -t 'main:2' @isekai_tab_id 'tagval'");
     }
 
     #[test]
@@ -666,7 +674,7 @@ mod tests {
             &TmuxCoordinates { window_index: 2, pane_index: Some(1) },
             &TmuxTag("tagval".to_string()),
         );
-        assert_eq!(cmd, "tmux set-option -t 'main:2.1' @isekai_pane_id 'tagval'");
+        assert_eq!(cmd, "tmux set-option -p -t 'main:2.1' @isekai_pane_id 'tagval'");
     }
 
     // ── TmuxLocatorResolver (フェイクrunner越し) ─────────
@@ -723,7 +731,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resolver.runner.last_call(), "tmux set-option -t 'main:0' @isekai_tab_id 'fresh-tag'");
+        assert_eq!(resolver.runner.last_call(), "tmux set-option -w -t 'main:0' @isekai_tab_id 'fresh-tag'");
     }
 
     // ── build_set_ctl_socket_command (タスク#59) ─────────
@@ -735,7 +743,7 @@ mod tests {
             &TmuxCoordinates { window_index: 2, pane_index: None },
             "/tmp/isekai-pipe-ctl-abc.sock",
         );
-        assert_eq!(cmd, "tmux set-option -t 'main:2' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-abc.sock'");
+        assert_eq!(cmd, "tmux set-option -w -t 'main:2' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-abc.sock'");
     }
 
     #[test]
@@ -745,7 +753,7 @@ mod tests {
             &TmuxCoordinates { window_index: 2, pane_index: Some(1) },
             "/tmp/isekai-pipe-ctl-abc.sock",
         );
-        assert_eq!(cmd, "tmux set-option -t 'main:2.1' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-abc.sock'");
+        assert_eq!(cmd, "tmux set-option -p -t 'main:2.1' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-abc.sock'");
     }
 
     // ── TmuxLocatorResolver::push_ctl_socket_path (タスク#59) ────
@@ -766,7 +774,7 @@ mod tests {
         resolver.push_ctl_socket_path(&locator, "/tmp/isekai-pipe-ctl-new.sock").await.unwrap();
         assert_eq!(
             resolver.runner.last_call(),
-            "tmux set-option -t 'main:3' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-new.sock'"
+            "tmux set-option -w -t 'main:3' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-new.sock'"
         );
     }
 
@@ -849,7 +857,7 @@ mod tests {
 
         assert_eq!(
             calls_a.lock().unwrap().last().unwrap(),
-            "tmux set-option -t 'main:3' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-a.sock'"
+            "tmux set-option -w -t 'main:3' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-a.sock'"
         );
         {
             let r = registry.lock();
@@ -867,7 +875,7 @@ mod tests {
 
         assert_eq!(
             calls_b.lock().unwrap().last().unwrap(),
-            "tmux set-option -t 'main:3' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-b.sock'"
+            "tmux set-option -w -t 'main:3' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-b.sock'"
         );
 
         // レジストリのエントリは置き換わっただけで、重複していない(app_pane→1件のみ)。

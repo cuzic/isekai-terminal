@@ -49,18 +49,25 @@
 //! いずれもハッシュ値は16進数のみで構成されるため、tmuxの`session:window.pane`
 //! アドレッシング区切り文字(`:`/`.`)やシェルメタ文字と衝突しない。
 //!
-//! # ensure/attachが1コマンドで済む理由
+//! # ensure/attachコマンド(has-sessionガード必須、`new-session -A`は使わない)
 //!
-//! `tmux new-session -A -d -t <group> -s <session-name>`は次の性質を持つ
-//! (tmux(1)マニュアル): `-t`(group)が既存セッション名と一致すればそのグループを
-//! 使い、一致しなければ新しいグループをこのセッションを最初のメンバーとして作る。
-//! さらに`-A`により、`<session-name>`が(グループの内外を問わず)既に存在すれば
-//! 新規作成せず`attach-session`相当の動作にフォールバックする(`-d`なので
-//! 実際にどこかのクライアントをdetachしたりはしない——このコマンド自体は
-//! exec channel越しに実行するのでPTY自体を持たず、実際の対話的attachは別の話)。
-//! つまりこの1コマンドだけで「グループが無ければ作る・あれば参加する」と
-//! 「このクライアントのセッションが無ければ作る・あれば何もしない」の両方を
-//! 冪等に処理できる。
+//! 当初`tmux new-session -A -d -t <group> -s <session-name>`(1コマンド)で
+//! 済ませる設計だったが、コードレビューで実tmux(3.3a)に対し検証した結果、
+//! `-A`は`<session-name>`が既に存在する場合`attach-session -d`相当の動作に
+//! フォールbackするだけでなく、実際に**attachを試みてコントロール端末を要求する**
+//! ことが判明した(`-d`は「attachした上でそのクライアントを即detach」であって
+//! 「attachしない」ではない)。このコマンドはexec channel(SSHの"exec"リクエスト、
+//! PTY無し)越しに実行するため、既存セッションへの2回目以降の呼び出し
+//! (再接続時・同じプロファイルへの2つ目のタブ)は`open terminal failed: not a
+//! terminal`で失敗する。
+//!
+//! そのため`has-session`で存在確認してから`new-session -d`する2段構えのシェル
+//! コマンド(`||`で連結、exec channel越しに1つのコマンド文字列として送るので
+//! シェルが解釈することを前提にできる)にしている。`has-session`はPTYを要求せず、
+//! `new-session -d`(`-A`無し)は新規作成時のみ実行され新規作成はPTYを要求しない
+//! ため、どちらの分岐でもexec channel越しに安全に完結する。`-t <group>`は
+//! (新規作成の場合のみ実行される)`new-session`側に残すことで、グループへの
+//! 参加/新規作成のセマンティクスは変えていない。
 
 use std::fmt::Write as _;
 
@@ -101,13 +108,15 @@ pub(crate) fn client_session_name(group: &str, client_id: &str) -> String {
 // ── コマンド組み立て ──────────────────────────────────────
 
 /// グループ`group`のセッション集合を保証しつつ、このクライアント専用の
-/// セッション名`session_name`でグループに参加する、冪等な1コマンド
-/// (モジュールdoc「ensure/attachが1コマンドで済む理由」参照)。
+/// セッション名`session_name`でグループに参加する、冪等なシェルコマンド
+/// (モジュールdoc「ensure/attachコマンド」参照——`has-session`で存在確認してから
+/// 無ければ`new-session -d`する。`-A`は使わない、既存セッションに対して実際に
+/// attachを試みてしまい非tty環境で失敗するため)。
 pub(crate) fn build_ensure_group_attached_command(group: &str, session_name: &str) -> String {
+    let quoted_session = shell_quote(session_name);
     format!(
-        "tmux new-session -A -d -t {} -s {}",
+        "tmux has-session -t {quoted_session} 2>/dev/null || tmux new-session -d -t {} -s {quoted_session}",
         shell_quote(group),
-        shell_quote(session_name),
     )
 }
 
@@ -296,9 +305,12 @@ mod tests {
     // ── コマンド組み立て ──────────────────────────────────
 
     #[test]
-    fn build_ensure_group_attached_command_uses_new_session_dash_a_dash_d() {
+    fn build_ensure_group_attached_command_guards_with_has_session_and_avoids_dash_a() {
         let cmd = build_ensure_group_attached_command("isekai-abc", "isekai-abc-def");
-        assert_eq!(cmd, "tmux new-session -A -d -t 'isekai-abc' -s 'isekai-abc-def'");
+        assert_eq!(
+            cmd,
+            "tmux has-session -t 'isekai-abc-def' 2>/dev/null || tmux new-session -d -t 'isekai-abc' -s 'isekai-abc-def'"
+        );
     }
 
     #[test]
@@ -326,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn new_tab_ensures_group_creates_a_window_and_assigns_a_fresh_tag() {
         let runner = FakeRunner::new(vec![
-            Ok(String::new()),  // new-session -A -d
+            Ok(String::new()),  // has-session || new-session -d (group ensure/attach)
             Ok("5\n".to_string()), // new-window -P -F
             Ok(String::new()),  // set-option (assign_tag)
         ]);
@@ -342,7 +354,7 @@ mod tests {
 
         let calls = calls_handle.lock().unwrap().clone();
         assert_eq!(calls.len(), 3);
-        assert!(calls[0].starts_with("tmux new-session -A -d"));
+        assert!(calls[0].starts_with("tmux has-session"));
         assert!(calls[1].starts_with("tmux new-window"));
         assert!(calls[2].starts_with("tmux set-option"));
     }
@@ -352,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn reconnecting_tab_with_existing_tag_selects_the_resolved_window_without_creating_a_new_one() {
         let runner = FakeRunner::new(vec![
-            Ok(String::new()), // new-session -A -d
+            Ok(String::new()), // has-session || new-session -d (group ensure/attach)
             Ok("0\tother\n2\tmy-tag\n".to_string()), // list-windows (resolve)
             Ok(String::new()), // select-window
         ]);
@@ -373,7 +385,7 @@ mod tests {
         // 見当たらない)ケース。新規タブと同じ経路(new-window→assign_tag)へ
         // フォールバックし、エラーにはならないこと。
         let runner = FakeRunner::new(vec![
-            Ok(String::new()),        // new-session -A -d
+            Ok(String::new()),        // has-session || new-session -d (group ensure/attach)
             Ok("0\tother\n".to_string()), // list-windows: タグが見つからない
             Ok("7\n".to_string()),    // new-window -P -F (フォールバック作成)
             Ok(String::new()),        // set-option (assign_tag)
@@ -398,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn new_window_command_returning_garbage_output_is_reported_as_unexpected_output() {
         let runner = FakeRunner::new(vec![
-            Ok(String::new()),                  // new-session -A -d
+            Ok(String::new()),                  // has-session || new-session -d (group ensure/attach)
             Ok("not-a-window-index\n".to_string()), // new-window -P -F (broken)
         ]);
         let err = ensure_tab_window(runner, "profile:1", "device-a", None).await.unwrap_err();

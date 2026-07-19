@@ -161,18 +161,23 @@ fn parse_ctl_clip(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLa
 /// (`transport::ssh_handler::run_ssh_channel_loop`、`tmux_locator.rs`)が接続確立時・
 /// 再接続時ごとに、このタブに対応するtmuxウィンドウ/ペインへ
 /// pane/window-scopedなuser-option `@isekai_ctl_sock`として現在のctl-socketパスを
-/// 書き込んでいる。`tmux show-options -pv`(`-p`でペインスコープのオプションを問い合わせる、
-/// `-t`省略で「このコマンドを実行しているペイン自身」に解決される)で読み戻せば、
-/// 呼び出し元のペインが今アタッチしているtmuxセッション/ウィンドウ/ペインに応じて
-/// 自然に正しい値が返る(session-wideなオプションだと複数タブが同じ値を共有して
-/// しまうところ、window/pane単位で書かれているのでこれで正しく区別できる)。
+/// 書き込んでいる(`crate::tmux_locator`参照——タブのモデル次第でwindowスコープ・
+/// paneスコープのどちらでも書かれ得る)。読み戻しには`tmux display-message -p`
+/// (`#{@isekai_ctl_sock}`フォーマット文字列、`-t`省略で「このコマンドを実行している
+/// ペイン自身」に解決される)を使う——`show-options -pv`は**pane-scopeの値しか見ず、
+/// ペイン→ウィンドウ→セッション→グローバルの継承を辿らない**(コードレビューで実tmux
+/// (3.3a)に対し検証済み: window-scopeで書いた値を`show-options -pv`で読むと
+/// `invalid option`エラーになる)。`display-message`のフォーマット文字列展開は
+/// この継承チェーンを正しく解決するため、window-scope/pane-scopeどちらの書き込みでも
+/// 同じ読み出しコードで正しく拾える。
 ///
-/// tmux自体が無い/このペインにオプションが設定されていない/シェルが
-/// (経由するtmuxが無く)直接sshdの対話シェルである、等の場合は`None`を返し、
-/// 呼び出し側は通常のusageエラーに落ちる(opportunistic機能、黙ったフォールバック)。
+/// tmux自体が無い/このペインにオプションが(継承チェーン上のどこにも)設定されて
+/// いない/シェルが(経由するtmuxが無く)直接sshdの対話シェルである、等の場合は
+/// `None`を返し、呼び出し側は通常のusageエラーに落ちる(opportunistic機能、
+/// 黙ったフォールバック)。
 fn query_tmux_ctl_sock_option() -> Option<String> {
     let output = std::process::Command::new("tmux")
-        .args(["show-options", "-pv", "@isekai_ctl_sock"])
+        .args(["display-message", "-p", "#{@isekai_ctl_sock}"])
         .output()
         .ok()?;
     if !output.status.success() {
