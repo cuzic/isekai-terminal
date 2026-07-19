@@ -59,6 +59,13 @@ public final class TerminalUIState: ObservableObject {
     /// 判定は`RebindPublicState`だけを見て行う(Android版`TerminalScreen.kt`と同じ、
     /// rust-ssot.md準拠 — Swift側で独自のミラー状態は持たない)。
     @Published public internal(set) var rebindState: RebindPublicState?
+    /// タスク#3(Android版タスク#60`TerminalTabsViewModel.TabState.tmuxWindowLabel`の
+    /// iOS移植): Rust側(`SessionOrchestrator.ensureTmuxTabWindow`)が解決したtmux
+    /// ウィンドウ情報のうち、UIへ最小限反映してよい表示用ラベル("tmux:2"等)だけを持つ。
+    /// 判断は一切ここで行わない(`.claude/rules/rust-ssot.md`) — 常にRustが返した値の
+    /// 素通しであり、Swift側で解釈・分岐はしない。まだ解決前(接続直後やopportunisticな
+    /// 失敗時)はnilのままで、その場合はタブラベルに何も追加しない。
+    @Published public internal(set) var tmuxWindowLabel: String?
     /// タスク#26: 直近フィードバック(触覚)を発火した`ScreenUpdate.bellGeneration`。
     /// `bell_generation`はTerminalごとに(rust-core `Terminal`)0始まりで単調増加する
     /// カウンタ(#24)なので、これより大きい値を受け取った時だけ1回発火させる
@@ -149,6 +156,15 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     /// 取得して返すだけの実装(判断はしない、rust-ssot.md準拠)。Android版
     /// `PhysicalPathProvider`のiOS版。
     private let physicalPathProvider = PhysicalPathProvider()
+    /// タスク#3(Android版タスク#60): このアプリインストール固有の永続クライアントID
+    /// (`UserDefaultsClientIdentityStore`)。永続化ストア自体は`db`(`ProfileDatabase`が
+    /// `TmuxTabLocatorStore`へ適合済み)を再利用する — Android版が`ClientIdentity`と
+    /// `TmuxTabLocator`を別ストレージ(SharedPreferences/Room)に分けているのと同じ構造。
+    private let clientIdentityStore: ClientIdentityStore
+    /// タスク#3: `onConnectionStateChanged`が「未接続→接続」のエッジでだけ
+    /// `maybeEnsureTmuxTabWindow()`を呼ぶための直近状態の記憶(Android版
+    /// `TerminalTabsViewModel.observeConnectionTransitions`の`prevConnected`と対称)。
+    private var tmuxPrevConnected = false
 
     public init(
         profile: ConnectionProfile,
@@ -157,7 +173,8 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         db: ProfileDatabase = AppServices.shared.db,
         vault: CredentialVault = AppServices.shared.vault,
         relayVault: RelayCredentialVault = AppServices.shared.relayVault,
-        trustStore: SshHostTrustStore
+        trustStore: SshHostTrustStore,
+        clientIdentityStore: ClientIdentityStore = AppServices.shared.clientIdentityStore
     ) {
         self.profile = profile
         self.password = password
@@ -166,6 +183,7 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         self.vault = vault
         self.relayVault = relayVault
         self.trustStore = trustStore
+        self.clientIdentityStore = clientIdentityStore
         self.orchestrator = createSessionOrchestrator(callback: self)
         startNetworkPathMonitoring()
     }
@@ -693,6 +711,9 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     // MARK: - OrchestratorCallback
 
     public func onConnectionStateChanged(state: ConnectionPublicState) {
+        let isConnected: Bool
+        if case .connected = state { isConnected = true } else { isConnected = false }
+
         switch state {
         case .connecting:
             Task { @MainActor in self.uiState.state = .connecting }
@@ -705,6 +726,47 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
         case .reconnecting(let elapsedSecs, let timeoutSecs, let reason):
             Task { @MainActor in
                 self.uiState.state = .reconnecting(elapsedSecs: elapsedSecs, timeoutSecs: timeoutSecs, reason: reason)
+            }
+        }
+
+        // タスク#3(Android版タスク#60`observeConnectionTransitions`と対称): 「未接続→
+        // 接続」のエッジでだけtmux session group/ウィンドウのensure/attachを依頼する。
+        // iOS版は現状split pane機能自体が無く1タブ=1セッションのため、Android版が
+        // primary paneだけに絞っているスコープ制限は自動的に満たされる。
+        if isConnected && !tmuxPrevConnected {
+            maybeEnsureTmuxTabWindow()
+        }
+        tmuxPrevConnected = isConnected
+    }
+
+    // MARK: - tmux session group / ウィンドウ紐付け(タスク#3、Android版タスク#60)
+
+    /// 接続完了時に、tmux session groupのensure/attach + タブ用ウィンドウの
+    /// create-or-selectをRust側(`SessionOrchestrator.ensureTmuxTabWindow`、
+    /// `TmuxTabWindowCoordinator`経由)へ依頼する。どのtmuxコマンドを実行するか・
+    /// 既存タグが見つかるか等の判断は一切Swift側で行わない(`.claude/rules/rust-ssot.md`)
+    /// — ここは(1)永続化済みのタグがあれば読んで渡す(2)Rustが返した`tag`を書き戻す
+    /// (3)表示用ラベルをUIへ反映する、だけの薄い配線(`TmuxTabWindowCoordinator`が
+    /// この3つを行う)。
+    ///
+    /// opportunisticな補助機能: 失敗してもタブ自体は通常のシェルとして使い続けられる
+    /// ため、ログのみ残して無視する(接続やUIをブロックしない)。プロファイルを
+    /// 未保存(id=nil、理論上のみ — 接続開始前にDBへ保存されているはずだが念のため)の
+    /// タブでは何もしない(Android版のid==0Lスキップと対称)。
+    private func maybeEnsureTmuxTabWindow() {
+        guard let profileId = profile.id else { return }
+        Task {
+            do {
+                let result = try await TmuxTabWindowCoordinator.ensureWindow(
+                    profileId: profileId,
+                    resolver: orchestrator,
+                    clientIdentityStore: clientIdentityStore,
+                    locatorStore: db
+                )
+                await MainActor.run { self.uiState.tmuxWindowLabel = result.label }
+                Self.logger.info("ensureTmuxTabWindow: group=\(result.info.groupName, privacy: .public) session=\(result.info.sessionName, privacy: .public) window=\(result.info.windowIndex, privacy: .public) tag=\(result.info.tag, privacy: .public) isNew=\(result.info.isNewWindow, privacy: .public)")
+            } catch {
+                Self.logger.warning("ensureTmuxTabWindow failed (non-fatal): \(String(describing: error), privacy: .public)")
             }
         }
     }

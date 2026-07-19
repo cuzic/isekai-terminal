@@ -243,7 +243,11 @@ private struct TabChip: View {
             Circle()
                 .fill(statusColor)
                 .frame(width: 8, height: 8)
-            Text(profile.displayName)
+            // タスク#3(Android版タスク#60`TerminalHostScreen.kt`の`" · tmux:$windowIndex"`
+            // サフィックスと対称): tmux session groupのウィンドウ紐付けが解決していれば
+            // (`tmuxWindowLabel`)、末尾に最小限のサフィックスとして付け足すだけ
+            // (独立した判断ロジックはRust側、ここは値の素通し表示のみ)。
+            Text(profile.displayName + (uiState.tmuxWindowLabel.map { " · \($0)" } ?? ""))
                 .lineLimit(1)
                 .font(.callout)
             Button(action: onClose) {
