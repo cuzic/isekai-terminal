@@ -56,20 +56,20 @@ impl FileBackedHostKeyVerifier {
     }
 }
 
-/// What one locked look-at-the-store pass resolved to.
+/// What one locked look-at-the-store pass resolved to. Simplification (Codex
+/// review finding): a lock/IO/task-panic failure is just another
+/// [`VerifyOutcome::Rejected`] as far as every caller is concerned — folded
+/// into `Decided` instead of a separate `Failed(String)` variant, so there's
+/// exactly one place (`VerifyOutcome`) that represents "rejected, here's why".
 enum Resolved {
-    /// Final answer, no user interaction needed (already trusted+matching,
-    /// or a mismatch — both are decided without ever consulting
-    /// `confirm_new_host`).
+    /// Final answer, no user interaction needed: already trusted+matching, a
+    /// mismatch, or a lock/IO/task-panic failure — all decided without ever
+    /// consulting `confirm_new_host`.
     Decided(VerifyOutcome),
     /// Never seen before; caller must consult `confirm_new_host` and, if
     /// confirmed, call [`FileBackedHostKeyVerifier::resolve_locked`] again
     /// with `insert_if_unknown: true`.
     NeedsConfirmation,
-    /// Lock/IO error, or the blocking task itself panicked — callers treat
-    /// this as a hard reject (fail closed). Carries the reason so `verify`
-    /// doesn't have to reconstruct it.
-    Failed(String),
 }
 
 #[async_trait]
@@ -81,7 +81,6 @@ impl HostKeyVerifier for FileBackedHostKeyVerifier {
         match self.resolve_locked(fingerprint, false).await {
             Resolved::Decided(outcome) => return outcome,
             Resolved::NeedsConfirmation => {}
-            Resolved::Failed(reason) => return VerifyOutcome::Rejected(reason),
         }
 
         // Outside any lock: ask the (possibly slow/interactive) confirmation
@@ -119,7 +118,6 @@ impl HostKeyVerifier for FileBackedHostKeyVerifier {
         match self.resolve_locked(fingerprint, true).await {
             Resolved::Decided(outcome) => outcome,
             Resolved::NeedsConfirmation => unreachable!("insert_if_unknown: true never returns NeedsConfirmation"),
-            Resolved::Failed(reason) => VerifyOutcome::Rejected(reason),
         }
     }
 }
@@ -179,12 +177,12 @@ impl FileBackedHostKeyVerifier {
             Ok(Err(e)) => {
                 let reason = format!("{log_context}: SSH host key trust store operation failed, rejecting connection: {e}");
                 log::error!("{reason}");
-                Resolved::Failed(reason)
+                Resolved::Decided(VerifyOutcome::Rejected(reason))
             }
             Err(join_error) => {
                 let reason = format!("{log_context}: SSH host key trust check task panicked, rejecting connection: {join_error}");
                 log::error!("{reason}");
-                Resolved::Failed(reason)
+                Resolved::Decided(VerifyOutcome::Rejected(reason))
             }
         }
     }

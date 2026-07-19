@@ -249,6 +249,37 @@ pub struct VerifyingHandler<V> {
     rejection: Option<RejectionReason>,
 }
 
+impl<V: HostKeyVerifier + 'static> VerifyingHandler<V> {
+    /// A handler that does only host-key verification — no forward routing,
+    /// no rejection-reason capture. `verifier` is cloned once (cheap: it's
+    /// an `Arc`). Chain [`with_forward_routes`](Self::with_forward_routes)/
+    /// [`with_rejection_reason`](Self::with_rejection_reason) to opt into
+    /// either (or both) of the optional features — simplification (Codex
+    /// review finding): this replaces what would otherwise be a combinatorial
+    /// explosion of `verifying_handler_with_x_and_y` free functions as more
+    /// optional features are added.
+    pub fn new(verifier: &Arc<V>) -> Self {
+        Self { verifier: verifier.clone(), forward_routes: None, rejection: None }
+    }
+
+    /// Routes server-initiated `forwarded-streamlocal@openssh.com` channels
+    /// (from an `ssh -R <remote-sock>:...` this session requests via
+    /// `handle.streamlocal_forward(...)`) to `routes` instead of dropping
+    /// them.
+    pub fn with_forward_routes(mut self, routes: &ForwardRoutes) -> Self {
+        self.forward_routes = Some(routes.clone());
+        self
+    }
+
+    /// Installs `reason` so a caller can recover a rejected [`VerifyOutcome`]'s
+    /// human-readable message after the handshake fails — see
+    /// [`RejectionReason`]'s docs.
+    pub fn with_rejection_reason(mut self, reason: &RejectionReason) -> Self {
+        self.rejection = Some(reason.clone());
+        self
+    }
+}
+
 #[async_trait]
 impl<V: HostKeyVerifier + 'static> client::Handler for VerifyingHandler<V> {
     type Error = russh::Error;
@@ -378,30 +409,25 @@ where
 /// (no agent forwarding, no remote forwards). `verifier` is cloned once per
 /// call (cheap: it's an `Arc`).
 pub fn verifying_handler<V: HostKeyVerifier + 'static>(verifier: &Arc<V>) -> VerifyingHandler<V> {
-    VerifyingHandler { verifier: verifier.clone(), forward_routes: None, rejection: None }
+    VerifyingHandler::new(verifier)
 }
 
-/// Like [`verifying_handler`], but also installs `routes` so that
-/// server-initiated `forwarded-streamlocal@openssh.com` channels (from an
-/// `ssh -R <remote-sock>:...` this session requests via
-/// `handle.streamlocal_forward(...)`) are delivered in-process to the matching
-/// [`ForwardRoutes`] receiver instead of being dropped. Both `verifier` and
-/// `routes` are cloned once (each is `Arc`-backed and cheap to clone).
+/// Like [`verifying_handler`], but also installs `routes` — see
+/// [`VerifyingHandler::with_forward_routes`].
 pub fn verifying_handler_with_routes<V: HostKeyVerifier + 'static>(
     verifier: &Arc<V>,
     routes: &ForwardRoutes,
 ) -> VerifyingHandler<V> {
-    VerifyingHandler { verifier: verifier.clone(), forward_routes: Some(routes.clone()), rejection: None }
+    VerifyingHandler::new(verifier).with_forward_routes(routes)
 }
 
-/// Like [`verifying_handler`], but also installs `reason` so a caller can
-/// recover a rejected [`VerifyOutcome`]'s human-readable message after the
-/// handshake fails — see [`RejectionReason`]'s docs.
+/// Like [`verifying_handler`], but also installs `reason` — see
+/// [`VerifyingHandler::with_rejection_reason`].
 pub fn verifying_handler_with_reason<V: HostKeyVerifier + 'static>(
     verifier: &Arc<V>,
     reason: &RejectionReason,
 ) -> VerifyingHandler<V> {
-    VerifyingHandler { verifier: verifier.clone(), forward_routes: None, rejection: Some(reason.clone()) }
+    VerifyingHandler::new(verifier).with_rejection_reason(reason)
 }
 
 /// Combines [`verifying_handler_with_routes`] and
@@ -413,7 +439,7 @@ pub fn verifying_handler_with_routes_and_reason<V: HostKeyVerifier + 'static>(
     routes: &ForwardRoutes,
     reason: &RejectionReason,
 ) -> VerifyingHandler<V> {
-    VerifyingHandler { verifier: verifier.clone(), forward_routes: Some(routes.clone()), rejection: Some(reason.clone()) }
+    VerifyingHandler::new(verifier).with_forward_routes(routes).with_rejection_reason(reason)
 }
 
 /// Authenticates `session` as `username` using `credential`. `Ok(false)`

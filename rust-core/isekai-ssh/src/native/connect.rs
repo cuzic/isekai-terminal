@@ -252,8 +252,17 @@ async fn run_native_connect_with_recovery(
 trait ConnectRecoveryOps {
     /// One full connect attempt against `intent` (spawn + auth + shell + I/O
     /// loop). `Err` means the connection could never be established — the
-    /// failure mode a `ConnectOutcome` signal accompanies.
-    async fn attempt(&mut self, intent: &ConnectionIntent) -> Result<u8>;
+    /// failure mode a `ConnectOutcome` signal accompanies. `silent` is true
+    /// only for the retry-after-rebootstrap attempt (`always-connects.md`'s
+    /// `TofuConfirmation::Silent` re-deploy promises no interaction is
+    /// needed) — when true, this attempt's own SSH-target host-key TOFU
+    /// (a *separate* check from the re-deploy's own, already-silent-aware
+    /// bootstrap dial) must refuse a never-before-seen key immediately
+    /// instead of prompting, so a live-but-answerless stdin can't hang it
+    /// (Codex review finding on the always-connects audit follow-up: the
+    /// first attempt is exempt from this — an interactive first contact is
+    /// the documented TOFU exception — but the silent retry is not).
+    async fn attempt(&mut self, intent: &ConnectionIntent, silent: bool) -> Result<u8>;
     /// Claims the `ConnectOutcome` signal `isekai-pipe connect` may have left
     /// behind for this exact attempt, if any.
     fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>>;
@@ -271,7 +280,7 @@ trait ConnectRecoveryOps {
 /// [`ConnectRecoveryOps`] so the retry path is testable without real I/O.
 /// At most two `attempt`s ever happen (see [`run_native_connect_with_recovery`]).
 async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: ConnectionIntent) -> Result<u8> {
-    let first_error = match ops.attempt(&intent).await {
+    let first_error = match ops.attempt(&intent, false).await {
         Ok(exit_code) => return Ok(exit_code),
         Err(e) => e,
     };
@@ -301,7 +310,7 @@ async fn drive_connect_recovery<O: ConnectRecoveryOps>(ops: &mut O, intent: Conn
                 outcome.detail
             );
             let intent2 = ops.rebootstrap_and_rebuild_intent().await?;
-            ops.attempt(&intent2).await
+            ops.attempt(&intent2, true).await
         }
     }
 }
@@ -327,8 +336,8 @@ struct NativeConnectOps<'a> {
 
 #[async_trait(?Send)]
 impl ConnectRecoveryOps for NativeConnectOps<'_> {
-    async fn attempt(&mut self, intent: &ConnectionIntent) -> Result<u8> {
-        connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir, &mut self.owner_hook).await
+    async fn attempt(&mut self, intent: &ConnectionIntent, silent: bool) -> Result<u8> {
+        connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir, &mut self.owner_hook, silent).await
     }
 
     fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
@@ -366,12 +375,13 @@ async fn connect_attempt(
     intent: &ConnectionIntent,
     runtime_dir: &Path,
     owner_hook: &mut Option<OwnerHook>,
+    silent: bool,
 ) -> Result<u8> {
     let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), runtime_dir, intent)?;
     let stdio = ChildStdio::take_from(&mut child)
         .ok_or_else(|| anyhow!("isekai-ssh: spawned isekai-pipe connect without piped stdin/stdout (internal bug)"))?;
 
-    let result = run_authenticated_session(stdio, plan, resolution, host_config, owner_hook).await;
+    let result = run_authenticated_session(stdio, plan, resolution, host_config, owner_hook, silent).await;
 
     if result.is_err() {
         // The `isekai-pipe connect` child writes its `ConnectOutcome`
@@ -410,6 +420,7 @@ async fn run_authenticated_session(
     resolution: &WrapperResolution,
     host_config: &openssh_config::HostConfig,
     owner_hook: &mut Option<OwnerHook>,
+    silent: bool,
 ) -> Result<u8> {
     let (host, port) = resolution.native_host_port(plan.destination());
     let host_port = format!("{host}:{port}");
@@ -422,9 +433,25 @@ async fn run_authenticated_session(
     let store_path = isekai_trust::default_ssh_host_key_trust_store_path()
         .map_err(|e| anyhow!("isekai-ssh: could not determine the SSH host key trust store path: {e}"))?;
     let confirm_host_port = host_port.clone();
-    let confirm_new_host: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(move |fingerprint: &str| {
-        prompt_new_host_confirmation(&confirm_host_port, fingerprint)
-    });
+    // `silent` (true only for the retry-after-rebootstrap attempt) must
+    // never prompt — the confirmation would otherwise block on a
+    // live-but-answerless stdin, the exact `always-connects.md` gap the
+    // sibling `RusshBackend::with_unattended_new_host_policy` closure
+    // exists to close on the bootstrap-dial side. This attempt's own
+    // SSH-target host key is a separate check from that dial's, so it needs
+    // its own silent-aware refusal.
+    let confirm_new_host: Arc<dyn Fn(&str) -> bool + Send + Sync> = if silent {
+        Arc::new(move |fingerprint: &str| {
+            eprintln!(
+                "isekai-ssh: unknown SSH host key for {confirm_host_port:?} (fingerprint {fingerprint}) in a \
+                 silent/automated re-bootstrap retry — refusing without prompting. Run this connection from an \
+                 interactive terminal once to confirm it."
+            );
+            false
+        })
+    } else {
+        Arc::new(move |fingerprint: &str| prompt_new_host_confirmation(&confirm_host_port, fingerprint))
+    };
     let verifier = Arc::new(FileBackedHostKeyVerifier::new(store_path, host_port.clone(), confirm_new_host));
 
     // The ctl-socket route table the handler dispatches forwarded-streamlocal
@@ -432,8 +459,7 @@ async fn run_authenticated_session(
     // foreground shell and (via the owner hook) every mux client's per-tab
     // forward. Built before the handshake so it can be installed on the handler.
     let forward_routes = ForwardRoutes::new();
-    let rejection = RejectionReason::new();
-    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier, &forward_routes, &rejection)
+    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier, &forward_routes)
         .await
         .with_context(|| format!("isekai-ssh: failed to connect to {username}@{host_port}"))?;
 
@@ -586,12 +612,18 @@ async fn connect_and_authenticate<S, V>(
     host_config: &openssh_config::HostConfig,
     verifier: &Arc<V>,
     forward_routes: &ForwardRoutes,
-    rejection: &RejectionReason,
 ) -> Result<client::Handle<russh_stream_session::VerifyingHandler<V>>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     V: russh_stream_session::HostKeyVerifier + 'static,
 {
+    // Never surfaced past this function (the `?` a few lines below either
+    // consumes it into the returned error or it's dropped unused on
+    // success) — simplification (Codex review finding): earlier this was a
+    // caller-supplied parameter every call site had to construct and pass
+    // just to satisfy the signature, even though no caller ever inspected
+    // it afterward.
+    let rejection = RejectionReason::new();
     let config = Arc::new(client::Config::default());
     // Install the ctl-socket route table on the handler so server-initiated
     // `forwarded-streamlocal` channels (from `streamlocal_forward` below) are
@@ -600,7 +632,7 @@ where
     // `rejection` so a host-key rejection's reason (a plain `bool` alone
     // can't carry — see `RejectionReason`'s docs) survives past this
     // function's `?` into the caller's error context.
-    let handler = verifying_handler_with_routes_and_reason(verifier, forward_routes, rejection);
+    let handler = verifying_handler_with_routes_and_reason(verifier, forward_routes, &rejection);
     let mut handle = establish_over_stream(config, stream, handler).await.map_err(|e| {
         let base = anyhow::Error::from(e);
         match rejection.take() {
@@ -1005,7 +1037,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
         assert!(result.is_err(), "no identity file and no agent means nothing to authenticate with");
     }
 
@@ -1016,7 +1048,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let Err(err) = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await
+        let Err(err) = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await
         else {
             panic!("a rejected host key must fail the connection before any auth attempt");
         };
@@ -1125,7 +1157,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, second_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
         assert!(
             result.is_ok(),
             "the second configured identity is accepted, so the connection must succeed despite the first being rejected"
@@ -1150,7 +1182,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![garbage, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
         assert!(result.is_ok(), "an unparseable first identity (InvalidPrivateKey) must not block the valid second one");
     }
 
@@ -1173,7 +1205,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, unreadable], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
         assert!(
             result.is_ok(),
             "a readable, accepted first key must authenticate; an unreadable *later* candidate must not abort the attempt"
@@ -1194,7 +1226,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![unreadable, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
         assert!(result.is_ok(), "an unreadable first candidate must be skipped, then the valid second one authenticates");
     }
 
@@ -1282,7 +1314,7 @@ mod tests {
             Some(Box::new(move |_handle, _routes| fired_in_hook.store(true, Ordering::SeqCst)));
 
         let result =
-            connect_attempt(&plan, &resolution, &host_config, &intent, runtime_dir.path(), &mut owner_hook).await;
+            connect_attempt(&plan, &resolution, &host_config, &intent, runtime_dir.path(), &mut owner_hook, false).await;
 
         assert!(result.is_err(), "a bogus pipe binary path must make the connect attempt fail");
         assert!(owner_hook.is_some(), "a failed attempt must leave the owner hook intact for the re-bootstrap retry");
@@ -1321,6 +1353,11 @@ mod tests {
     struct FakeRecoveryOps {
         attempt_results: std::collections::VecDeque<std::result::Result<u8, String>>,
         attempt_calls: usize,
+        /// The `silent` flag `drive_connect_recovery` passed on each `attempt`
+        /// call, in order — see `attempt`'s doc comment: the first attempt
+        /// must be `false` (interactive first contact is exempt), the
+        /// retry-after-rebootstrap attempt must be `true` (never prompt).
+        silent_flags_seen: Vec<bool>,
         outcome: Option<isekai_pipe_core::ConnectOutcome>,
         should_bootstrap: bool,
         rebootstrap_calls: usize,
@@ -1354,8 +1391,9 @@ mod tests {
 
     #[async_trait(?Send)]
     impl ConnectRecoveryOps for FakeRecoveryOps {
-        async fn attempt(&mut self, _intent: &ConnectionIntent) -> Result<u8> {
+        async fn attempt(&mut self, _intent: &ConnectionIntent, silent: bool) -> Result<u8> {
             self.attempt_calls += 1;
+            self.silent_flags_seen.push(silent);
             match self.attempt_results.pop_front().expect("attempt called more times than the test queued results for") {
                 Ok(code) => Ok(code),
                 Err(msg) => Err(anyhow!(msg)),
@@ -1386,6 +1424,7 @@ mod tests {
         let mut ops = FakeRecoveryOps {
             attempt_results: [Err("first attempt failed".to_string()), Ok(7)].into_iter().collect(),
             attempt_calls: 0,
+            silent_flags_seen: Vec::new(),
             outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable)),
             should_bootstrap: true,
             rebootstrap_calls: 0,
@@ -1395,6 +1434,15 @@ mod tests {
         assert_eq!(result.unwrap(), 7, "the retry's exit code must be returned");
         assert_eq!(ops.attempt_calls, 2, "exactly one retry after the first failure");
         assert_eq!(ops.rebootstrap_calls, 1, "the helper must be re-deployed exactly once");
+        // Codex review finding (always-connects audit follow-up): the first
+        // attempt is the documented interactive-TOFU-exempt case, but the
+        // retry-after-rebootstrap attempt must never prompt (a live-but-
+        // answerless stdin must not hang it).
+        assert_eq!(
+            ops.silent_flags_seen,
+            vec![false, true],
+            "first attempt must allow interactive TOFU; the retry must be silent"
+        );
     }
 
     /// If the automatic re-bootstrap itself fails, its error propagates and
@@ -1405,6 +1453,7 @@ mod tests {
         let mut ops = FakeRecoveryOps {
             attempt_results: [Err("first attempt failed".to_string())].into_iter().collect(),
             attempt_calls: 0,
+            silent_flags_seen: Vec::new(),
             outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::StaleTrust)),
             should_bootstrap: true,
             rebootstrap_calls: 0,
@@ -1423,6 +1472,7 @@ mod tests {
         let mut ops = FakeRecoveryOps {
             attempt_results: [Err("first attempt failed".to_string())].into_iter().collect(),
             attempt_calls: 0,
+            silent_flags_seen: Vec::new(),
             outcome: Some(fake_outcome(isekai_pipe_core::ConnectOutcomeClass::Unreachable)),
             should_bootstrap: false,
             rebootstrap_calls: 0,
@@ -1442,6 +1492,7 @@ mod tests {
         let mut ops = FakeRecoveryOps {
             attempt_results: [Err("first attempt failed".to_string())].into_iter().collect(),
             attempt_calls: 0,
+            silent_flags_seen: Vec::new(),
             outcome: None,
             should_bootstrap: true,
             rebootstrap_calls: 0,
