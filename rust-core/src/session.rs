@@ -426,6 +426,11 @@ pub(crate) async fn session_event_loop(
                         // deviceがこれを受け取ることは無い。どちらも到達したら無視するだけ。
                         isekai_protocol::CtlMessage::ClipboardPullRequest {}
                         | isekai_protocol::CtlMessage::ClipboardPullResponse { .. } => None,
+                        // #57 (tmux hooks → Android notifications) consumes this;
+                        // wiring it to `SessionCallback`/a notification channel is
+                        // that task's job, not #63's (this variant's wire format).
+                        // Ignored here for now rather than left unhandled.
+                        isekai_protocol::CtlMessage::Notify { .. } => None,
                     }
                 }
                 Some(TransportEvent::ClipboardPullRequestOverCtl(reply)) => {
