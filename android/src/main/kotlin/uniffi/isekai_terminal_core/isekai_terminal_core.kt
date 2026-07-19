@@ -4813,6 +4813,16 @@ public object FfiConverterTypeQuicConfig: FfiConverterRustBuffer<QuicConfig> {
 
 
 data class ScreenUpdate (
+    /**
+     * 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
+     * 配信チャネルが`Channel.CONFLATED`(Android)等でconflateされ、中間の発行が
+     * 読み飛ばされる可能性がある——`dirty_rows`は「直前に発行したScreenUpdateとの
+     * 差分」なので、読み飛ばしが起きると欠落分の変化がdirty_rowsに載らず表示が
+     * 化ける。UI層はこの値が前回受信値+1(wrapping)でなければ読み飛ばしがあったと
+     * 判断し、`dirty_rows`を信用せず全画面再描画にフォールバックすること。
+     */
+    var `updateSeq`: kotlin.UInt
+    , 
     var `cols`: kotlin.UInt
     , 
     var `rows`: kotlin.UInt
@@ -4959,6 +4969,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
         return ScreenUpdate(
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
             FfiConverterSequenceTypeCellData.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
@@ -4980,6 +4991,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
     }
 
     override fun allocationSize(value: ScreenUpdate) = (
+            FfiConverterUInt.allocationSize(value.`updateSeq`) +
             FfiConverterUInt.allocationSize(value.`cols`) +
             FfiConverterUInt.allocationSize(value.`rows`) +
             FfiConverterSequenceTypeCellData.allocationSize(value.`cells`) +
@@ -5002,6 +5014,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
     )
 
     override fun write(value: ScreenUpdate, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`updateSeq`, buf)
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
             FfiConverterSequenceTypeCellData.write(value.`cells`, buf)

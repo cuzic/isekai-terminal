@@ -48,6 +48,9 @@ fun synthesizeDisplayUpdate(
     if (cols <= 0 || rows <= 0) return live
     if (scrollbackCells == null || scrollbackCells.size != rows * cols) return live
     return ScreenUpdate(
+        // scrollback合成は必ず全画面dirty(下記 dirtyRows = null)なので updateSeq のギャップ判定に
+        // 影響しないが、下敷きのライブフレームの連番をそのまま引き継いでおく。
+        updateSeq = live.updateSeq,
         cols = live.cols,
         rows = live.rows,
         cells = scrollbackCells,
@@ -69,5 +72,9 @@ fun synthesizeDisplayUpdate(
         // スナップショットのため、cursorVisible相当の考え方で画像も非表示にする)。
         images = emptyList(),
         kittyKeyboardFlags = live.kittyKeyboardFlags,
+        // scrollback合成画面は毎回まったく別のセル内容(過去の行)を差し込むため、行単位の
+        // dirty diff は意味を持たない。全画面dirty(null)にして初回/寸法変更時と同じく
+        // グリッド全体を描き直させる(タスク#102)。
+        dirtyRows = null,
     )
 }
