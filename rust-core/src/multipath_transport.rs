@@ -246,6 +246,11 @@ impl MultipathIsekaiPipeQuicSession {
     pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
     }
+    /// タスク#58: フル再接続直後のtmux scrollback backfill。
+    /// `SessionCore::inject_scrollback_history`参照。
+    pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
+        self.core.inject_scrollback_history(lines)
+    }
 
     pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
 

@@ -15,6 +15,10 @@ pub(crate) mod net_health_policy;
 // Epic M ctl-socketパスの対応表(データモデルのみ、まだどこからも配線
 // されていない——将来の#60/#61タスクからの利用に備えた土台)。
 pub(crate) mod tmux_locator;
+// #58: フル再接続(resume失敗)直後にtmux自身のscrollback履歴をcapture-pane
+// 経由で取り込むためのコマンド組み立て/出力パース。実際の配線は
+// `orchestrator.rs`側。
+pub(crate) mod tmux_scrollback;
 pub mod orchestrator;
 pub(crate) mod helper_bootstrap;
 pub mod isekai_pipe_quic_transport;
@@ -831,6 +835,11 @@ impl SshSession {
 
     pub(crate) fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.core.scrollback_cells(offset, rows)
+    }
+    /// タスク#58: フル再接続直後のtmux scrollback backfill。
+    /// `SessionCore::inject_scrollback_history`参照。
+    pub(crate) fn inject_scrollback_history(&self, lines: Vec<String>) {
+        self.core.inject_scrollback_history(lines)
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }

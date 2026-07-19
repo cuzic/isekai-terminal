@@ -13,6 +13,8 @@ use crate::multipath_transport::{MultipathIsekaiPipeQuicConfig, MultipathIsekaiP
 use crate::isekai_stun_p2p_transport::{IsekaiStunP2pConfig, IsekaiStunP2pSession};
 use crate::isekai_link_relay_transport::{IsekaiLinkRelayConfig, IsekaiLinkRelaySession};
 use crate::transport::{ExecError, ExecOutput};
+use crate::tmux_locator::{RemoteTmuxCommandRunner, TmuxLocator, TmuxRunError};
+use crate::tmux_scrollback::fetch_tmux_scrollback_history;
 
 // ── Active session ────────────────────────────────────────
 
@@ -139,6 +141,11 @@ impl ActiveSession {
             Self::IsekaiStunP2p(s) => s.run_exec(command).await,
             Self::IsekaiLinkRelay(s) => s.run_exec(command).await,
         }
+    }
+    /// タスク#58: tmux scrollback backfillのバッチ注入。全トランスポート共通
+    /// (`SessionCore::inject_scrollback_history`)なので`dispatch_all!`でよい。
+    fn inject_scrollback_history(&self, lines: Vec<String>) {
+        dispatch_all!(self, inject_scrollback_history, lines)
     }
 }
 
@@ -347,6 +354,25 @@ pub(crate) struct OrchestratorShared {
     /// 状態で複数回呼ぶ」場合でも1許可分にしかならないため、フラッピングする
     /// ネットワークで無限にウェイクし続ける心配は無い。
     reconnect_wake: tokio::sync::Notify,
+    /// タスク#58: このオーケストレータが担当するタブ/ペインに対応するtmux
+    /// ロケータ。フル再接続後のscrollback backfill(`spawn_tmux_scrollback_backfill`)
+    /// が対象ペインを特定するために読む。`None`(既定)なら単にbackfillを
+    /// fail-openでスキップする —— #62の`TmuxLocatorRegistry`をこの値の実際の
+    /// 供給元として配線するのは別タスクの範囲（このワークツリーの時点では
+    /// まだ配線されていない）。`set_tmux_backfill_locator`参照。
+    tmux_backfill_locator: Mutex<Option<TmuxLocator>>,
+    /// タスク#58: `reconnect_attempt`(`connect_via`)が同期的に成功した直後
+    /// (`spawn_reconnect_loop`の2箇所、および`notify_will_enter_foreground`の
+    /// フォアグラウンド復帰時再接続)に一度だけ呼ばれるフック。実運用の既定は
+    /// `spawn_tmux_scrollback_backfill`(tmux capture-paneベースのbackfillを
+    /// `RUNTIME.spawn`で開始するだけで、この呼び出し自体はブロックしない)。
+    /// `reconnect_attempt`と同じ理由(実ネットワーク/実tmuxに触れず「いつ・何回
+    /// 呼ばれるか」だけを単体テストするため)でテストでは差し替え可能にしてある。
+    /// 手動の`connect_*`(`SessionOrchestrator::connect`等)はこのフックを一切
+    /// 経由しない —— `reconnect_attempt`同様`connect_via`専用の経路であり、
+    /// 「resumeが尽きた/初回接続ではない」ことがこのフィールドが呼ばれる時点で
+    /// 既に保証されている。
+    after_reconnect_success: Box<dyn Fn(&Arc<OrchestratorShared>) + Send + Sync>,
 }
 
 // ── OrchestratorAdapter ───────────────────────────────────
@@ -731,6 +757,75 @@ fn connect_via(shared: &Arc<OrchestratorShared>, attempt: LastConnectAttempt) ->
     Ok(())
 }
 
+// ── タスク#58: フル再接続直後のtmux scrollback backfill ──────
+
+/// `ActiveSession::run_exec`(タスク#61のexecチャンネル)を、`tmux_locator`/
+/// `tmux_scrollback`が要求する[`RemoteTmuxCommandRunner`]シームへ薄く適合させる
+/// アダプタ。コマンドの組み立て・出力のパースといった純粋なロジックは全て
+/// `tmux_scrollback`モジュール側の自由関数にあり、ここでは「execを呼んで結果を
+/// `Result<String, TmuxRunError>`へ変換する」ことだけを行う。
+struct ActiveSessionTmuxRunner(ActiveSession);
+
+impl RemoteTmuxCommandRunner for ActiveSessionTmuxRunner {
+    fn run(&self, cmd: &str) -> impl std::future::Future<Output = Result<String, TmuxRunError>> + Send {
+        let session = self.0.clone();
+        let cmd = cmd.to_string();
+        async move {
+            let output = session.run_exec(cmd).await.map_err(|e| TmuxRunError(e.to_string()))?;
+            if let Some(status) = output.exit_status {
+                if status != 0 {
+                    return Err(TmuxRunError(format!("tmux command exited with status {status}")));
+                }
+            }
+            String::from_utf8(output.stdout)
+                .map_err(|e| TmuxRunError(format!("tmux output was not valid UTF-8: {e}")))
+        }
+    }
+}
+
+/// [`OrchestratorShared::after_reconnect_success`]の実運用の既定実装。
+/// `shared.tmux_backfill_locator`が設定されていて、かつ現在`ActiveSession`が
+/// 存在する(=直前の`connect_via`が本当に成功していた)場合にのみ、
+/// `RUNTIME.spawn`でバックグラウンドタスクを起こし、tmuxのscrollback履歴を
+/// 取得してこのタブのローカルscrollbackへバッチ注入する。
+///
+/// 呼び出し自体は同期・即座に返る(実際のexec/capture-paneは`RUNTIME.spawn`
+/// されたタスク側で行う)—— `connect_via`のごく直後、まだライブのPTY出力が
+/// 届き始めるより十分前のタイミングで呼ばれる想定だが、たとえ多少ライブ出力と
+/// 競合してもscrollbackへの注入は加算的(`push_front`)なので致命的な破壊は
+/// 起きない。ロケータ未設定・exec失敗・tmux未検出・出力が空、いずれの場合も
+/// fail-open(ログを出すだけで接続自体には一切影響しない)。
+fn spawn_tmux_scrollback_backfill(shared: &Arc<OrchestratorShared>) {
+    let Some(locator) = shared.tmux_backfill_locator.lock().clone() else {
+        log::debug!("orchestrator: no tmux locator registered for this pane yet, skipping scrollback backfill");
+        return;
+    };
+    let Some(session) = shared.session.lock().clone() else {
+        log::debug!("orchestrator: no active session to backfill scrollback onto, skipping");
+        return;
+    };
+    RUNTIME.spawn(async move {
+        let runner = ActiveSessionTmuxRunner(session.clone());
+        match fetch_tmux_scrollback_history(&runner, &locator, crate::session::SCROLLBACK_LIMIT).await {
+            Ok(lines) if lines.is_empty() => {
+                log::debug!("orchestrator: tmux scrollback backfill found no history above the visible screen");
+            }
+            Ok(lines) => {
+                log::info!(
+                    "orchestrator: backfilling {} line(s) of tmux scrollback history after full reconnect",
+                    lines.len()
+                );
+                session.inject_scrollback_history(lines);
+            }
+            Err(e) => {
+                log::warn!(
+                    "orchestrator: tmux scrollback backfill failed ({e}), continuing with an empty scrollback for this reconnect"
+                );
+            }
+        }
+    });
+}
+
 /// `spawn_reconnect_loop`の1 tick分の待機。`tick`を素通しで待つのと、
 /// `wake`(`OrchestratorShared::reconnect_wake`)がネットワーク復帰通知で
 /// 起こされるのをレースさせる — 戻り値は「`wake`側で早期に起きたか」。
@@ -812,11 +907,14 @@ fn spawn_reconnect_loop(
                     log::info!(
                         "orchestrator: network path restored while reconnecting; retrying immediately instead of waiting out the rest of this tick"
                     );
-                    if let Err(e) = (shared.reconnect_attempt)(&shared, attempt.clone()) {
-                        log::warn!("orchestrator: reconnect attempt failed synchronously: {e:?}");
-                        let mut s = shared.state.lock();
-                        if s.reconnect_epoch == epoch {
-                            s.retry_attempt_in_flight = false;
+                    match (shared.reconnect_attempt)(&shared, attempt.clone()) {
+                        Ok(()) => (shared.after_reconnect_success)(&shared),
+                        Err(e) => {
+                            log::warn!("orchestrator: reconnect attempt failed synchronously: {e:?}");
+                            let mut s = shared.state.lock();
+                            if s.reconnect_epoch == epoch {
+                                s.retry_attempt_in_flight = false;
+                            }
                         }
                     }
                 }
@@ -861,11 +959,14 @@ fn spawn_reconnect_loop(
                 }
             };
             if should_attempt {
-                if let Err(e) = (shared.reconnect_attempt)(&shared, attempt.clone()) {
-                    log::warn!("orchestrator: reconnect attempt failed synchronously: {e:?}");
-                    let mut s = shared.state.lock();
-                    if s.reconnect_epoch == epoch {
-                        s.retry_attempt_in_flight = false;
+                match (shared.reconnect_attempt)(&shared, attempt.clone()) {
+                    Ok(()) => (shared.after_reconnect_success)(&shared),
+                    Err(e) => {
+                        log::warn!("orchestrator: reconnect attempt failed synchronously: {e:?}");
+                        let mut s = shared.state.lock();
+                        if s.reconnect_epoch == epoch {
+                            s.retry_attempt_in_flight = false;
+                        }
                     }
                 }
             }
@@ -907,6 +1008,8 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
         path_observer: Mutex::new(crate::net_health_policy::PathObserver::default()),
         reconnect_attempt: Box::new(connect_via),
         reconnect_wake: tokio::sync::Notify::new(),
+        tmux_backfill_locator: Mutex::new(None),
+        after_reconnect_success: Box::new(spawn_tmux_scrollback_backfill),
     });
     Arc::new(SessionOrchestrator { shared })
 }
@@ -949,6 +1052,18 @@ impl SessionOrchestrator {
         self.shared.path_observer.lock().invalidate();
         self.shared.callback.on_connection_state_changed(ConnectionPublicState::Connecting);
         Ok(OrchestratorAdapter::new(self.shared.clone()))
+    }
+
+    /// タスク#58: このオーケストレータが担当するタブ/ペインのtmuxロケータを
+    /// 設定/更新する。フル再接続後のscrollback backfill(`spawn_tmux_scrollback_backfill`)
+    /// が対象ペインを特定するために読む値そのもの。`TmuxLocator`自体が
+    /// UniFFI境界を越えない内部専用の型のため、この関数もUniFFIへは公開しない
+    /// ——呼び出すのは#62の`TmuxLocatorRegistry`をこのオーケストレータへ実際に
+    /// 配線する側(別タスク)の想定で、このワークツリーの時点ではまだどこからも
+    /// 呼ばれていない(呼ばれなければ`tmux_backfill_locator`は`None`のままで、
+    /// backfillはfail-openで単にスキップされる)。
+    pub(crate) fn set_tmux_backfill_locator(&self, locator: Option<TmuxLocator>) {
+        *self.shared.tmux_backfill_locator.lock() = locator;
     }
 }
 
@@ -1137,15 +1252,18 @@ impl SessionOrchestrator {
             // リトライされるが、こちらは一回限りの呼び出しなので`Err`を握り潰すと
             // `phase`が`Connecting`のまま固まり、UIが「接続中…」から進まなくなる。
             // ループ経由の再試行に頼らず、この場で`Idle`へ戻し失敗を通知する。
-            if let Err(e) = (self.shared.reconnect_attempt)(&self.shared, attempt) {
-                log::warn!("orchestrator: foreground resume reconnect failed synchronously: {e:?}");
-                let mut s = self.shared.state.lock();
-                s.phase = ConnPhase::Idle;
-                drop(s);
-                self.shared.callback.on_connection_state_changed(ConnectionPublicState::Disconnected {
-                    reason: Some(format!("foreground resume reconnect failed: {e}")),
-                    issue_hint: None,
-                });
+            match (self.shared.reconnect_attempt)(&self.shared, attempt) {
+                Ok(()) => (self.shared.after_reconnect_success)(&self.shared),
+                Err(e) => {
+                    log::warn!("orchestrator: foreground resume reconnect failed synchronously: {e:?}");
+                    let mut s = self.shared.state.lock();
+                    s.phase = ConnPhase::Idle;
+                    drop(s);
+                    self.shared.callback.on_connection_state_changed(ConnectionPublicState::Disconnected {
+                        reason: Some(format!("foreground resume reconnect failed: {e}")),
+                        issue_hint: None,
+                    });
+                }
             }
         }
     }
@@ -1457,6 +1575,8 @@ mod tests {
             path_observer: Mutex::new(net_health_policy::PathObserver::default()),
             reconnect_attempt: Box::new(connect_via),
             reconnect_wake: tokio::sync::Notify::new(),
+            tmux_backfill_locator: Mutex::new(None),
+            after_reconnect_success: Box::new(|_shared| {}),
         });
         (shared, callback)
     }
@@ -1516,8 +1636,68 @@ mod tests {
                 Ok(())
             }),
             reconnect_wake: tokio::sync::Notify::new(),
+            tmux_backfill_locator: Mutex::new(None),
+            after_reconnect_success: Box::new(|_shared| {}),
         });
         (SessionOrchestrator { shared }, callback, attempt_count)
+    }
+
+    /// タスク#58: `after_reconnect_success`フックが「自動再接続が成功した回数」
+    /// と正確に連動して呼ばれること(失敗した試行では呼ばれないこと)を検証する
+    /// ためだけの専用ヘルパー。`reconnect_attempt`自体は`should_fail`が指す
+    /// 呼び出し回数(1始まり)だけ`Err`を返し、それ以外は`Ok`にする——「毎回
+    /// 成功」だけでなく「一部の試行が失敗する」cadenceも再現できるようにする。
+    fn orchestrator_connected_with_reconnect_policy_and_backfill_counter(
+        policy: ReconnectPolicy,
+        fail_on_attempt_numbers: Vec<usize>,
+    ) -> (
+        SessionOrchestrator,
+        Arc<RecordingCallback>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let callback = Arc::new(RecordingCallback::default());
+        let attempt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backfill_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempt_count.clone();
+        let backfill_counter_for_hook = backfill_count.clone();
+        let shared = Arc::new(OrchestratorShared {
+            state: Mutex::new(OrchestratorState {
+                current_host: Some("example.com".to_string()),
+                current_port: 22,
+                is_quic: false,
+                phase: ConnPhase::Connected,
+                current_transfer_id: None,
+                trzsz_mode: None,
+                download_buf: Vec::new(),
+                size_limit_exceeded_for: None,
+                session_generation: 0,
+                reconnect_epoch: 0,
+                reconnect_loop_active: false,
+                retry_attempt_in_flight: false,
+                user_initiated_disconnect: false,
+                last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
+                reconnect_policy: policy,
+                background_state: BackgroundState::Foreground,
+            }),
+            callback: callback.clone(),
+            session: Mutex::new(None),
+            path_observer: Mutex::new(net_health_policy::PathObserver::default()),
+            reconnect_attempt: Box::new(move |_shared, _attempt| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if fail_on_attempt_numbers.contains(&n) {
+                    Err(SshError::ConnectionFailed)
+                } else {
+                    Ok(())
+                }
+            }),
+            reconnect_wake: tokio::sync::Notify::new(),
+            tmux_backfill_locator: Mutex::new(None),
+            after_reconnect_success: Box::new(move |_shared| {
+                backfill_counter_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        });
+        (SessionOrchestrator { shared }, callback, attempt_count, backfill_count)
     }
 
     fn test_ssh_config() -> SshConfig {
@@ -2037,6 +2217,71 @@ mod tests {
         );
     }
 
+    // ── タスク#58: フル再接続成功後のtmux scrollback backfillフック ──────
+
+    #[test]
+    fn after_reconnect_success_fires_once_per_successful_automatic_reconnect_attempt() {
+        // resumeが尽きて自動再接続ループ(`spawn_reconnect_loop`)が実際に
+        // `connect_via`相当のフェイクを成功させるたびに、`after_reconnect_success`
+        // フックが呼ばれることを確認する——これがオーケストレータ側の
+        // 「resume失敗/フル再接続」シグナルそのもの(このフェイクは常に成功する
+        // ので、成功回数と`attempt_count`は常に一致するはず)。
+        let (orch, _cb, attempt_count, backfill_count) =
+            orchestrator_connected_with_reconnect_policy_and_backfill_counter(fast_test_policy(), Vec::new());
+        let adapter = OrchestratorAdapter::new(orch.shared.clone());
+
+        adapter.on_disconnected(Some("peer closed".to_string()));
+        std::thread::sleep(Duration::from_millis(80));
+
+        let attempts = attempt_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(attempts >= 1, "少なくとも1回は再接続試行が起きるはず");
+        assert_eq!(
+            backfill_count.load(std::sync::atomic::Ordering::SeqCst),
+            attempts,
+            "成功した試行の回数だけbackfillフックが呼ばれるはず"
+        );
+    }
+
+    #[test]
+    fn after_reconnect_success_does_not_fire_when_the_reconnect_attempt_fails() {
+        // 再接続の試行自体が(同期的に)失敗した場合は、まだ「フル再接続に成功
+        // した」わけではないので、backfillフックを呼んではいけない
+        // ("NOT on every reconnect" —— 成功した試行にだけ反応する)。
+        let (orch, _cb, attempt_count, backfill_count) = orchestrator_connected_with_reconnect_policy_and_backfill_counter(
+            fast_test_policy(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8], // 観測しうる試行回数を広く先回りして失敗させる
+        );
+        let adapter = OrchestratorAdapter::new(orch.shared.clone());
+
+        adapter.on_disconnected(Some("peer closed".to_string()));
+        std::thread::sleep(Duration::from_millis(80));
+
+        assert!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "再接続の試行自体は起きるはず(失敗するだけ)"
+        );
+        assert_eq!(
+            backfill_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "1回も成功していないのでbackfillフックは1度も呼ばれないはず"
+        );
+    }
+
+    #[test]
+    fn after_reconnect_success_does_not_fire_when_no_disconnect_ever_happens() {
+        // resumeがtransport層で透過的に成功した場合、`on_disconnected`自体が
+        // 一度も発火しないため自動再接続ループも`connect_via`も一切呼ばれない
+        // ——「resume成功パスを一切妨げない」ことは、この経路がそもそも
+        // `reconnect_attempt`/`after_reconnect_success`に触れないという構造上の
+        // 性質としてすでに保証されている(この回帰を検出するための明示テスト)。
+        let (orch, _cb, attempt_count, backfill_count) =
+            orchestrator_connected_with_reconnect_policy_and_backfill_counter(fast_test_policy(), Vec::new());
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(backfill_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _ = orch;
+    }
+
     #[test]
     fn user_initiated_disconnect_does_not_start_reconnect_loop() {
         let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
@@ -2332,6 +2577,26 @@ mod tests {
     }
 
     #[test]
+    fn notify_will_enter_foreground_after_budget_expired_also_fires_the_backfill_hook_on_success() {
+        // タスク#58: バックグラウンド猶予切れからのフォアグラウンド復帰再接続
+        // (`notify_will_enter_foreground`が直接`reconnect_attempt`を呼ぶ経路)も
+        // `spawn_reconnect_loop`と同じく「フル再接続に成功した」経路なので、
+        // 同じ`after_reconnect_success`フックを経由するはず。
+        let (orch, _cb, attempt_count, backfill_count) =
+            orchestrator_connected_with_reconnect_policy_and_backfill_counter(fast_test_policy(), Vec::new());
+        orch.notify_did_enter_background(30_000);
+        orch.notify_background_budget_expired();
+
+        orch.notify_will_enter_foreground();
+
+        assert_eq!(attempt_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            backfill_count.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "フォアグラウンド復帰再接続の成功でもbackfillフックが呼ばれるはず"
+        );
+    }
+
+    #[test]
     fn notify_will_enter_foreground_does_not_double_trigger_when_reconnect_loop_already_active() {
         let (orch, _cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
         orch.notify_did_enter_background(30_000);
@@ -2453,6 +2718,8 @@ mod tests {
                 Err(SshError::ConnectionFailed)
             }),
             reconnect_wake: tokio::sync::Notify::new(),
+            tmux_backfill_locator: Mutex::new(None),
+            after_reconnect_success: Box::new(|_shared| {}),
         });
         (SessionOrchestrator { shared }, callback, attempt_count)
     }

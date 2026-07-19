@@ -181,8 +181,11 @@ pub(crate) enum TmuxLocatorError {
 
 /// シェル引数として安全に埋め込むための最小限のシングルクォート化。
 /// セッション名にシングルクォートやスペースが含まれる可能性は低いが、
-/// `format!`でそのまま埋め込むよりは安全にしておく。
-fn shell_quote(value: &str) -> String {
+/// `format!`でそのまま埋め込むよりは安全にしておく。`tmux_scrollback`
+/// (#58: tmux capture-paneベースのscrollback backfill)も同じペイン
+/// アドレッシング規約(`build_set_tag_command`と同じ`session:window.pane`
+/// 形式)を再利用するため`pub(crate)`にしてある。
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
