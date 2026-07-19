@@ -25,6 +25,10 @@ public func synthesizeDisplayUpdate(
     let rows = Int(update.rows)
     guard cols > 0, rows > 0, scrollbackCells.count == rows * cols else { return update }
     return ScreenUpdate(
+        // updateSeqはライブの値をそのまま引き継ぐ(この合成はdraw経路の
+        // `computeDisplayUpdate`内でのみ使われ、`apply`のupdateSeqギャップ検出は通らない
+        // ——値は実質inertだが、他フィールド同様ライブを忠実にミラーしておく)。
+        updateSeq: update.updateSeq,
         cols: update.cols, rows: update.rows, cells: scrollbackCells,
         cursorRow: update.rows, cursorCol: 0,
         title: update.title,
@@ -42,7 +46,11 @@ public func synthesizeDisplayUpdate(
         // 配置を引き継がない(scrollbackセル自体は画像を保持しないテキストのみの
         // スナップショットのため、Android版`synthesizeDisplayUpdate`と同じ判断)。
         images: [],
-        kittyKeyboardFlags: update.kittyKeyboardFlags
+        kittyKeyboardFlags: update.kittyKeyboardFlags,
+        // スクロールバック合成は表示グリッド全体を差し替えるため全画面dirty(=nil)扱い。
+        // ライブの`update.dirtyRows`はライブグリッドの行番号を指しており、scrollback表示
+        // 行とは対応しないので引き継がない(タスク#102)。
+        dirtyRows: nil
     )
 }
 

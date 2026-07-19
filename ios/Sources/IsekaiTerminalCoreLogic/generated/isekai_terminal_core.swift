@@ -1182,6 +1182,13 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     *
+     * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
+     * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
+     * `OrchestratorAdapter::on_notify`がこれと`background_state`を合わせて見て、
+     * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
+     * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
+     * フォーカス状態は独立に変化し得るため)。
      */
     func notifyFocusChange(focused: Bool) 
     
@@ -1530,6 +1537,13 @@ open func notifyError(message: String)  {try! rustCall() {
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     *
+     * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
+     * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
+     * `OrchestratorAdapter::on_notify`がこれと`background_state`を合わせて見て、
+     * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
+     * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
+     * フォーカス状態は独立に変化し得るため)。
      */
 open func notifyFocusChange(focused: Bool)  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_focus_change(
@@ -3191,6 +3205,15 @@ public func FfiConverterTypeQuicConfig_lower(_ value: QuicConfig) -> RustBuffer 
 
 
 public struct ScreenUpdate: Equatable, Hashable {
+    /**
+     * 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
+     * 配信チャネルが`Channel.CONFLATED`(Android)等でconflateされ、中間の発行が
+     * 読み飛ばされる可能性がある——`dirty_rows`は「直前に発行したScreenUpdateとの
+     * 差分」なので、読み飛ばしが起きると欠落分の変化がdirty_rowsに載らず表示が
+     * 化ける。UI層はこの値が前回受信値+1(wrapping)でなければ読み飛ばしがあったと
+     * 判断し、`dirty_rows`を信用せず全画面再描画にフォールバックすること。
+     */
+    public var updateSeq: UInt32
     public var cols: UInt32
     public var rows: UInt32
     public var cells: [CellData]
@@ -3304,7 +3327,15 @@ public struct ScreenUpdate: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, 
+    public init(
+        /**
+         * 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
+         * 配信チャネルが`Channel.CONFLATED`(Android)等でconflateされ、中間の発行が
+         * 読み飛ばされる可能性がある——`dirty_rows`は「直前に発行したScreenUpdateとの
+         * 差分」なので、読み飛ばしが起きると欠落分の変化がdirty_rowsに載らず表示が
+         * 化ける。UI層はこの値が前回受信値+1(wrapping)でなければ読み飛ばしがあったと
+         * 判断し、`dirty_rows`を信用せず全画面再描画にフォールバックすること。
+         */updateSeq: UInt32, cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, 
         /**
          * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
          * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
@@ -3396,6 +3427,7 @@ public struct ScreenUpdate: Equatable, Hashable {
          * 描くため)。UI層がまだこのフィールドを消費していない段階では、`None`扱いで
          * 全画面再描画にフォールバックすれば従来通りの挙動になる。
          */dirtyRows: [LineDamage]?) {
+        self.updateSeq = updateSeq
         self.cols = cols
         self.rows = rows
         self.cells = cells
@@ -3433,6 +3465,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ScreenUpdate {
         return
             try ScreenUpdate(
+                updateSeq: FfiConverterUInt32.read(from: &buf), 
                 cols: FfiConverterUInt32.read(from: &buf), 
                 rows: FfiConverterUInt32.read(from: &buf), 
                 cells: FfiConverterSequenceTypeCellData.read(from: &buf), 
@@ -3456,6 +3489,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: ScreenUpdate, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.updateSeq, into: &buf)
         FfiConverterUInt32.write(value.cols, into: &buf)
         FfiConverterUInt32.write(value.rows, into: &buf)
         FfiConverterSequenceTypeCellData.write(value.cells, into: &buf)
@@ -4763,6 +4797,93 @@ public func FfiConverterTypeMouseReportingMode_lower(_ value: MouseReportingMode
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * タスク#57: tmux hook(`alert-bell`/`alert-activity`/`alert-silence`/
+ * `pane-died`)発火の種別。`isekai_protocol::NotifyKind`と同じ4種を表す別々の型
+ * (`ClipboardMimeKind`と同じ理由——isekai-protocolはuniffiに依存しないpure crate
+ * なので、その型をUniFFI境界越しにそのまま公開できない)。
+ */
+
+public enum NotifyKind: Equatable, Hashable {
+    
+    case bell
+    case activity
+    case silence
+    case jobDone
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension NotifyKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNotifyKind: FfiConverterRustBuffer {
+    typealias SwiftType = NotifyKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NotifyKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .bell
+        
+        case 2: return .activity
+        
+        case 3: return .silence
+        
+        case 4: return .jobDone
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: NotifyKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .bell:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .activity:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .silence:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .jobDone:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNotifyKind_lift(_ buf: RustBuffer) throws -> NotifyKind {
+    return try FfiConverterTypeNotifyKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNotifyKind_lower(_ value: NotifyKind) -> RustBuffer {
+    return FfiConverterTypeNotifyKind.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * UI(Compose/SwiftUI)へ公開する簡略化された状態。
  */
 
@@ -6051,6 +6172,18 @@ public protocol OrchestratorCallback: AnyObject, Sendable {
      */
     func onRebindStateChanged(state: RebindPublicState) 
     
+    /**
+     * タスク#57: tmux hookがリモートで発火した(`alert-bell`/`alert-activity`/
+     * `alert-silence`/`pane-died`)。「今この瞬間ユーザーへAndroid通知として
+     * 見せるべきか」の判断(アプリがフォアグラウンドかつこのタブが表示中なら
+     * 抑制する)は`orchestrator.rs`の`OrchestratorAdapter::on_notify`が既に済ませて
+     * から呼ぶため、この実装は「渡された`kind`について、このタブ(プロファイル)の
+     * per-tab通知設定がONなら通知チャンネルへpostする」だけでよい
+     * (`rust-ssot.md`: 抑制判断はセッション状態に基づく判断なのでRust側、
+     * per-tab ON/OFF設定自体はUI設定でありKotlin側に置いてよい例外)。
+     */
+    func onNotify(kind: NotifyKind) 
+    
 }
 
 
@@ -6401,6 +6534,30 @@ fileprivate struct UniffiCallbackInterfaceOrchestratorCallback {
                 }
                 return uniffiObj.onRebindStateChanged(
                      state: try FfiConverterTypeRebindPublicState_lift(state)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onNotify: { (
+            uniffiHandle: UInt64,
+            kind: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onNotify(
+                     kind: try FfiConverterTypeNotifyKind_lift(kind)
                 )
             }
 
@@ -7537,7 +7694,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 47947) {
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 5360) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning() != 20700) {
@@ -7643,6 +7800,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed() != 15707) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_notify() != 52593) {
         return InitializationResult.apiChecksumMismatch
     }
 

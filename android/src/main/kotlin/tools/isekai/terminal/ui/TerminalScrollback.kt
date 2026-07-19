@@ -48,6 +48,9 @@ fun synthesizeDisplayUpdate(
     if (cols <= 0 || rows <= 0) return live
     if (scrollbackCells == null || scrollbackCells.size != rows * cols) return live
     return ScreenUpdate(
+        // scrollback合成は必ず全画面dirty(下記 dirtyRows = null)なので updateSeq のギャップ判定に
+        // 影響しないが、下敷きのライブフレームの連番をそのまま引き継いでおく。
+        updateSeq = live.updateSeq,
         cols = live.cols,
         rows = live.rows,
         cells = scrollbackCells,
@@ -69,12 +72,9 @@ fun synthesizeDisplayUpdate(
         // スナップショットのため、cursorVisible相当の考え方で画像も非表示にする)。
         images = emptyList(),
         kittyKeyboardFlags = live.kittyKeyboardFlags,
-        // 行単位damage tracking(タスク#98系, `ScreenUpdate.dirtyRows`): この関数が
-        // 返すのはtmux-integrationマージ時点でmain側にまだ存在した、Kotlin側の配線が
-        // 未完了の新フィールド(このファイル内・他のどこにも`dirtyRows`を読む箇所が無い)。
-        // このフレームはliveの逐次更新ではなく合成されたスナップショットそのものなので、
-        // 意味論的にも「差分情報なし=全面再描画」を表す`null`が正しい(この直前の
-        // `images = emptyList()`と同じ考え方)。
+        // scrollback合成画面は毎回まったく別のセル内容(過去の行)を差し込むため、行単位の
+        // dirty diff は意味を持たない。全画面dirty(null)にして初回/寸法変更時と同じく
+        // グリッド全体を描き直させる(タスク#102)。
         dirtyRows = null,
     )
 }

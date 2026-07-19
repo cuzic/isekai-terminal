@@ -27,6 +27,7 @@ class TerminalSelectionTest {
     private fun screenUpdate(rows: List<String>, cols: Int): ScreenUpdate {
         val cells = rows.flatMap { rowCells(it, cols) }
         return ScreenUpdate(
+            updateSeq = 0u,
             cols = cols.toUInt(),
             rows = rows.size.toUInt(),
             cells = cells,
@@ -106,13 +107,15 @@ class TerminalSelectionTest {
     @Test
     fun `empty cells list returns empty string instead of crashing`() {
         val update = ScreenUpdate(
+            updateSeq = 0u,
             cols = 80u, rows = 24u, cells = emptyList(),
             cursorRow = 0u, cursorCol = 0u, title = null,
             applicationCursorMode = false, applicationKeypadMode = false, bracketedPasteMode = false,
             mouseReportingMode = MouseReportingMode.OFF, sgrMouseMode = false,
             cursorVisible = true, bellGeneration = 0uL,
             cursorShape = CursorShape.BLOCK, cursorBlink = true, linkTable = emptyList(),
-            images = emptyList(), kittyKeyboardFlags = 0u, dirtyRows = null,
+            images = emptyList(), kittyKeyboardFlags = 0u,
+            dirtyRows = null,
         )
         val sel = SelectionRange(CellPos(0, 0), CellPos(1, 0))
         assertEquals("", reconstructSelectionText(update, sel))
@@ -121,13 +124,15 @@ class TerminalSelectionTest {
     @Test
     fun `zero cols or rows returns empty string`() {
         val update = ScreenUpdate(
+            updateSeq = 0u,
             cols = 0u, rows = 0u, cells = emptyList(),
             cursorRow = 0u, cursorCol = 0u, title = null,
             applicationCursorMode = false, applicationKeypadMode = false, bracketedPasteMode = false,
             mouseReportingMode = MouseReportingMode.OFF, sgrMouseMode = false,
             cursorVisible = true, bellGeneration = 0uL,
             cursorShape = CursorShape.BLOCK, cursorBlink = true, linkTable = emptyList(),
-            images = emptyList(), kittyKeyboardFlags = 0u, dirtyRows = null,
+            images = emptyList(), kittyKeyboardFlags = 0u,
+            dirtyRows = null,
         )
         val sel = SelectionRange(CellPos(0, 0), CellPos(0, 0))
         assertEquals("", reconstructSelectionText(update, sel))

@@ -1,6 +1,6 @@
 use vte::Parser;
 use timed_fsm::{TimedStateMachine, TimerCommand, Response};
-use crate::{CellData, LineDamage, ScreenUpdate};
+use crate::{CellData, CursorShape, LineDamage, ScreenUpdate};
 use crate::session::to_cell_data;
 use crate::terminal::{Terminal, TermCell};
 use crate::theme::Theme;
@@ -79,6 +79,17 @@ pub(crate) struct SessionState {
     /// 消し忘れ/描き忘れを起こさないよう、位置と同様にこの値も比較してカーソル行を
     /// 強制dirty化する。
     last_cursor_visible: bool,
+    /// 前回発行時のカーソル形状(DECSCUSR)。可視性と同じ理由(位置不変でも下地セルが
+    /// 不変なコンテンツ差分では検出できない)でカーソル行の強制dirty化条件に含める。
+    last_cursor_shape: CursorShape,
+    /// 発行するたびに単調増加する`ScreenUpdate`の連番(タスク#97/#99のCodexならぬ
+    /// セルフレビューで発覚: UI層への配信チャネルが`Channel.CONFLATED`(Android)
+    /// 等でconflateされる場合、中間の発行が読み飛ばされうる。`dirty_rows`は
+    /// 「直前に発行したScreenUpdateとの差分」なので、発行N+1が読み飛ばされて
+    /// UI側がN→N+2しか見なければ、N→N+1間の変化がdirty_rowsに載らず表示が
+    /// 化ける。UI側はこの`update_seq`が前回受信値+1でなければ(=読み飛ばしが
+    /// あれば)`dirty_rows`を信用せず全画面再描画にフォールバックする)。
+    update_seq: u32,
 }
 
 impl SessionState {
@@ -93,6 +104,8 @@ impl SessionState {
             last_cursor_row: 0,
             last_cursor_col: 0,
             last_cursor_visible: true,
+            last_cursor_shape: CursorShape::Block,
+            update_seq: 0,
         }
     }
 
@@ -118,6 +131,7 @@ impl SessionState {
         // クランプしてから公開・損傷計算に使う(Fableレビュー: タスク#56)。
         let cursor_col = self.terminal.cursor_col().min(cols.saturating_sub(1));
         let cursor_visible = self.terminal.cursor_visible();
+        let cursor_shape = self.terminal.cursor_shape();
 
         // 現在のグリッドを1度だけ所有スナップショットへ複製する。行差分の比較コストは
         // O(rows×cols)のセル等価判定で、下の`to_cell_data`変換が毎フレーム払うコストと
@@ -153,15 +167,15 @@ impl SessionState {
             // カーソル行の強制dirty化(タスク#94)。iOSはカーソルをセル内容と同じ描画
             // パスで描くため、カーソルが動いたら下地セルが不変でも「離れた行(前回位置、
             // 古いカーソルを消す)」と「乗った行(今回位置、新しいカーソルを描く)」を
-            // 再描画させる。位置に加えて可視性(DECTCEM)も比較する——`CSI ?25l`/`?25h`
-            // で位置は不変のままカーソルの表示/非表示だけが切り替わるケースは下地セルも
-            // 不変なのでコンテンツ差分では検出できず、可視性だけ見落とすとiOS側で
-            // 消し忘れ/描き忘れが起きる(セルフレビューで検出)。動いても可視性も
-            // 変わっていなければ前回フレームで既に正しく描かれているので何も足さない
-            // ——これにより「画面が完全に同一の連続フレーム」は空の`dirty_rows`になる
-            // (タスク#101)。
-            if (cursor_row, cursor_col, cursor_visible)
-                != (self.last_cursor_row, self.last_cursor_col, self.last_cursor_visible)
+            // 再描画させる。位置に加えて可視性(DECTCEM)・形状(DECSCUSR)も比較する——
+            // `CSI ?25l`/`?25h`や`CSI q`(形状変更)は位置が不変のままカーソルの見た目
+            // だけが切り替わるケースで、下地セルも不変なのでコンテンツ差分では検出
+            // できない。可視性・形状を見落とすとiOS側で消し忘れ/描き忘れが起きる
+            // (セルフレビューで検出)。動いても可視性・形状も変わっていなければ
+            // 前回フレームで既に正しく描かれているので何も足さない——これにより
+            // 「画面が完全に同一の連続フレーム」は空の`dirty_rows`になる(タスク#101)。
+            if (cursor_row, cursor_col, cursor_visible, cursor_shape)
+                != (self.last_cursor_row, self.last_cursor_col, self.last_cursor_visible, self.last_cursor_shape)
             {
                 force_cursor_row_dirty(&mut damages, self.last_cursor_row, self.last_cursor_col, cols, rows);
                 force_cursor_row_dirty(&mut damages, cursor_row, cursor_col, cols, rows);
@@ -179,9 +193,12 @@ impl SessionState {
         self.last_cursor_row = cursor_row;
         self.last_cursor_col = cursor_col;
         self.last_cursor_visible = cursor_visible;
+        self.last_cursor_shape = cursor_shape;
+        self.update_seq = self.update_seq.wrapping_add(1);
 
         let t = &self.terminal;
         ScreenUpdate {
+            update_seq: self.update_seq,
             cols: cols as u32,
             rows: rows as u32,
             cells,

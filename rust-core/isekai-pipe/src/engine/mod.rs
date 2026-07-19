@@ -1020,53 +1020,53 @@ async fn release_slot_for(attach_runtime: &Arc<AttachRuntime>, session_id: iseka
     }
 }
 
-/// Wraps `AttachRuntime::hello` with one retry: if the fencing race is lost
-/// to `BusyOtherSession`, attempts to preempt whatever is occupying the
-/// slot — but only succeeds in doing so if that occupant turns out to be
-/// merely parked (`SessionTable::claim_parked`'s docs), never one that's
-/// actively relaying. Without this, a client that never comes back to
-/// `RESUME` its own parked session (laptop never reopened, process killed,
-/// host rebooted) locks *every* future connection attempt to this target
-/// out with `BUSY_OTHER_SESSION` until `sweep_expired_parked`'s park
-/// backstop — now days-long, `isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`'s
-/// docs — finally reclaims it, which directly violates this project's
-/// "always connects" principle (`.claude/rules/always-connects.md`) for
-/// exactly the scenario this whole resume-window redesign exists to
-/// support. See `ISEKAI_PIPE_DESIGN.md` §8's parked-session-preemption Epic
-/// for the incident this fixes.
+/// Epic N-5 admission control. `AttachArbiter` used to hold a single global
+/// fencing slot per target (Epic N-4's world): a brand-new `session_id`
+/// could be blocked by whatever *other* session_id was occupying that slot,
+/// and `hello_with_parked_preemption` (this function's predecessor) existed
+/// to preempt that occupant if it turned out to be merely parked rather
+/// than actively relaying. Now that `AttachArbiter` hands out one
+/// independent slot per `session_id` (`attach_arbiter.rs`'s module docs), a
+/// genuinely new session_id is never blocked by another session's state at
+/// all — that whole preemption dance no longer has anything to preempt.
 ///
-/// Whether the preemption actually happens is decided entirely by
-/// `SessionTable::claim_parked`'s atomic `parked_tcp.take()` — this
-/// function never reasons about parked-ness itself, so a `RESUME` for the
-/// same holder racing in concurrently is resolved fairly (whichever of the
-/// two takes `parked_tcp` first wins outright; see that method's docs).
-async fn hello_with_parked_preemption(attach_runtime: &Arc<AttachRuntime>, sessions: &SessionTable, key: AttachKey) -> HelloOutcome {
-    let first = attach_runtime.hello(key).await;
-    if !matches!(first, HelloOutcome::Reject(AttachRejectReason::BusyOtherSession)) {
-        return first;
+/// What still needs bounding is the *number* of concurrent slots.
+/// `SessionTable` already enforces `--max-sessions` (Phase S-4b) via
+/// LRU-eviction of the oldest parked session, but only once a new session
+/// has already gone all the way through the ATTACH handshake and connected
+/// to `target` (`insert_existing`, called near the end of
+/// `handle_attach_stream`). Left alone, that would let unbounded concurrent
+/// target TCP connects/handshakes pile up before the cap ever bites, since
+/// `AttachArbiter` itself has no notion of "parked" vs "actively relying"
+/// (only `SessionTable` tracks that) and so cannot police its own capacity.
+/// This runs the same evict-oldest-parked-else-reject policy *before*
+/// `attach_runtime.hello()` even starts a target connect, for any
+/// `session_id` the arbiter doesn't already know about — a retransmit or
+/// reattach of a session already holding a slot always passes through
+/// untouched, matching `insert_existing`'s own `!inner.contains_key(&id)`
+/// guard.
+///
+/// Reuses `AttachRejectReason::BusyOtherSession` for the "genuinely full,
+/// nothing to evict" case rather than adding a new wire reason — every
+/// tracked session is actively relaying, so the client's existing 180s
+/// `retry_while_busy_other_session` backoff (`resume_loop.rs`) remains a
+/// sensible response ("come back once something frees up").
+async fn admit_new_session(
+    attach_runtime: &Arc<AttachRuntime>,
+    sessions: &SessionTable,
+    session_id: isekai_protocol::SessionId,
+) -> Result<(), AttachRejectReason> {
+    if attach_runtime.has_session(session_id).await || attach_runtime.session_count().await < sessions.max_sessions()
+    {
+        return Ok(());
     }
-    let Some((holder_id, _lease)) = attach_runtime.current_established().await else {
-        // The slot has already moved on since the rejection above (e.g. the
-        // holder's own relay just ended for good) — retry once and use
-        // whatever's true right now rather than guessing.
-        return attach_runtime.hello(key).await;
-    };
-    let holder_bytes = *holder_id.as_bytes();
-    let preempted = match sessions.claim_parked(&holder_bytes).await {
-        // `Missing` self-heals a `SessionTable`/`AttachArbiter` desync that
-        // should never happen by construction but has occurred twice
-        // before (`.claude/rules/always-connects.md`) — nothing left to
-        // close, so just free the slot the same as a genuine claim.
-        resume::ClaimParkedOutcome::Claimed | resume::ClaimParkedOutcome::Missing => true,
-        // Actively relaying, or a concurrent RESUME already won the race —
-        // in both cases the holder is legitimately still using the slot.
-        resume::ClaimParkedOutcome::NotParked => false,
-    };
-    if !preempted {
-        return first;
+    match sessions.claim_oldest_parked().await {
+        Some(evicted_id) => {
+            release_slot_for(attach_runtime, isekai_protocol::SessionId::from_bytes(evicted_id)).await;
+            Ok(())
+        }
+        None => Err(AttachRejectReason::BusyOtherSession),
     }
-    release_slot_for(attach_runtime, holder_id).await;
-    attach_runtime.hello(key).await
 }
 
 /// helper 側の `ATTACH_HELLO` 検証・fencing判定([`AttachRuntime::hello`])・
@@ -1107,7 +1107,11 @@ async fn handle_attach_stream(
     }
 
     let key = AttachKey { session_id: hello.session_id, generation: hello.generation, attempt_id: hello.attempt_id };
-    let (lease, attach_token) = match hello_with_parked_preemption(&attach_runtime, &sessions, key).await {
+    if let Err(reason) = admit_new_session(&attach_runtime, &sessions, hello.session_id).await {
+        reject_attach(&mut send, reason).await;
+        return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));
+    }
+    let (lease, attach_token) = match attach_runtime.hello(key).await {
         HelloOutcome::Reject(reason) => {
             reject_attach(&mut send, reason).await;
             return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));

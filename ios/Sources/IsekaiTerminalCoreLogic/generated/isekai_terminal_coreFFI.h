@@ -355,6 +355,13 @@ typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod13)(uint64_t, Ru
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD14
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_ORCHESTRATOR_CALLBACK_METHOD14
+typedef void (*UniffiCallbackInterfaceOrchestratorCallbackMethod14)(uint64_t, RustBuffer, void* _Nonnull, 
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
 #define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_DIAGNOSTIC_CALLBACK
 typedef struct UniffiVTableCallbackInterfaceDiagnosticCallback {
@@ -392,6 +399,7 @@ typedef struct UniffiVTableCallbackInterfaceOrchestratorCallback {
     UniffiCallbackInterfaceOrchestratorCallbackMethod11 _Nonnull onRequestWifiFd;
     UniffiCallbackInterfaceOrchestratorCallbackMethod12 _Nonnull onRequestCellularFd;
     UniffiCallbackInterfaceOrchestratorCallbackMethod13 _Nonnull onRebindStateChanged;
+    UniffiCallbackInterfaceOrchestratorCallbackMethod14 _Nonnull onNotify;
 } UniffiVTableCallbackInterfaceOrchestratorCallback;
 
 #endif
@@ -1471,6 +1479,12 @@ uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_req
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_REBIND_STATE_CHANGED
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_REBIND_STATE_CHANGED
 uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_NOTIFY
+#define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_CHECKSUM_METHOD_ORCHESTRATORCALLBACK_ON_NOTIFY
+uint16_t uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_notify(void
     
 );
 #endif
