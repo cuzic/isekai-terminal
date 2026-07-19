@@ -6,17 +6,22 @@ name: Android unit test check
 # これまで一つも存在しなかった(fdroid-build-check.ymlは`assembleRelease`のビルド確認のみ、
 # room-migration-check.ymlはRoom migrationの版数整合性のみ)。
 #
-# このテストスイートはRobolectric上で動くJVMテストで、`FakeSshGateway`等の
-# フェイク実装を経由するため、rust-core側のネイティブライブラリ(.so)のビルドは
-# 一切不要(isekai-pipe musl埋め込みバイナリの事前ビルドも不要)。UniFFI生成の
-# Kotlinバインディング(`android/src/main/kotlin/uniffi/`)はリポジトリにチェックイン
-# 済みのものをそのまま使う。
+# 当初「Robolectricテストはフェイク経由でネイティブ.soのビルド不要」という前提で
+# 書いたが、`android/build.gradle.kts`の`preBuild`(全タスクが依存する)が
+# `copyRustCoreJniLibs`→`cargoBuildRustCore`(`cargo build --release --target
+# aarch64-linux-android`)に依存しているため、`testDebugUnitTest`を含む
+# **あらゆる**gradleタスクがこのNDKクロスビルドを要求する。したがって
+# fdroid-build-check.ymlと同様、JDK・NDK(バージョンはfdroid recipe
+# `fdroid/tools.isekai.terminal.yml`の`ndk:`と揃える)・
+# `aarch64-linux-android`ターゲット・isekai-pipe muslバイナリ(`isekai_pipe_quic_transport.rs`の
+# `include_bytes!`はターゲットを問わず無条件に要求する)の準備が必要。
 
 on:
   push:
     branches: [main]
     paths:
       - "android/**"
+      - "rust-core/**"
       - "gradle/**"
       - "*.gradle.kts"
       - "gradle.properties"
@@ -25,6 +30,7 @@ on:
   pull_request:
     paths:
       - "android/**"
+      - "rust-core/**"
       - "gradle/**"
       - "*.gradle.kts"
       - "gradle.properties"
@@ -52,6 +58,46 @@ jobs:
           distribution: temurin
           java-version: "17"
           cache: gradle
+
+      - name: Cache cargo (rust-core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: android-test-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.lock') }}
+          restore-keys: |
+            android-test-${{ runner.os }}-
+
+      - name: Install the NDK version pinned by the F-Droid recipe
+        # fdroid/tools.isekai.terminal.yml の`ndk:`と同じバージョンを使う
+        # (android-arm64-clang.sh/android-arm64-ar.shが期待するツールチェーンと揃える)。
+        run: |
+          NDK_VERSION="$(grep -m1 '^\s*ndk:' fdroid/tools.isekai.terminal.yml | awk '{print $2}')"
+          echo "Installing NDK $NDK_VERSION"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Add aarch64-linux-android rustup target
+        run: rustup target add aarch64-linux-android
+
+      - name: Build isekai-pipe musl binaries (build prerequisite for isekai-terminal-core)
+        # rust-core/src/isekai_pipe_quic_transport.rs が include_bytes! で埋め込む
+        # isekai-pipe の x86_64/aarch64 musl静的バイナリ。ターゲットに関わらず
+        # isekai-terminal-coreをビルドするだけで常に必要(rust-core-test-check.yml/
+        # ios-*-check.yml各ワークフロー参照)。
+        run: |
+          set -euo pipefail
+          curl -fL -o /tmp/zig.tar.xz \
+            "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+          mkdir -p "$HOME/zig-toolchain"
+          tar xJf /tmp/zig.tar.xz --strip-components=1 -C "$HOME/zig-toolchain"
+          echo "$HOME/zig-toolchain" >> "$GITHUB_PATH"
+          export PATH="$HOME/zig-toolchain:$PATH"
+          cargo install cargo-zigbuild --locked
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          bash rust-core/scripts/build-isekai-pipe-musl.sh
 
       - name: ./gradlew :android:testDebugUnitTest
         run: ./gradlew :android:testDebugUnitTest --stacktrace
