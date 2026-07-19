@@ -29,6 +29,50 @@ class TerminalKeyEncoderTest {
         assertArrayEquals(byteArrayOf(0x1B), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_ESCAPE))
     }
 
+    // ── Kitty keyboard protocol disambiguate escape codes(タスク#54で交渉のみ実装され
+    // 実際のエンコードに未反映だったのをタスク#72で修正。`rust-core`の
+    // `escape_uses_kitty_csi_u_when_disambiguate_flag_negotiated`等と対応する形で移植) ──
+
+    @Test
+    fun `Escape uses Kitty CSI u when disambiguate flag negotiated`() {
+        // CSI > 1 u でリモートがdisambiguate escape codes(bit0)をpushした状態を想定。
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x32, 0x37, 0x75), // ESC[27u
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_ESCAPE, kittyFlags = 0b1u),
+        )
+    }
+
+    @Test
+    fun `Escape stays legacy byte when kitty flags do not include disambiguate bit`() {
+        // report-event-types(bit1)のみのように、disambiguateビット(bit0)を含まないflagsでは
+        // 従来通り生の0x1Bのまま。
+        assertArrayEquals(
+            byteArrayOf(0x1B),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_ESCAPE, kittyFlags = 0b10u),
+        )
+    }
+
+    @Test
+    fun `kitty disambiguate flag does not change keys Kitty spec exempts or already matches`() {
+        val flags: UShort = 0b1u
+        val ctrlMod = TerminalKeyModifiers(shift = false, alt = false, ctrl = true, meta = false)
+        assertArrayEquals(byteArrayOf(0x0D), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_ENTER, kittyFlags = flags))
+        assertArrayEquals(byteArrayOf(0x09), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_TAB, kittyFlags = flags))
+        assertArrayEquals(byteArrayOf(0x7F), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DEL, kittyFlags = flags))
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x41),
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_UP, kittyFlags = flags),
+        )
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x41), // ESC[1;5A
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_UP, modifiers = ctrlMod, kittyFlags = flags),
+        )
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x4F, 0x50), // ESC O P
+            TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_F1, kittyFlags = flags),
+        )
+    }
+
     @Test
     fun `arrow up maps to CSI A`() {
         assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x41), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_UP))

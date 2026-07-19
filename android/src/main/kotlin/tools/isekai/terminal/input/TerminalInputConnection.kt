@@ -90,7 +90,7 @@ class TerminalInputConnection(
                 meta = event.isMetaPressed,
             )
             val effectiveKeyCode = numpadKeyCodeRespectingNumLock(event.keyCode, event.isNumLockOn)
-            TerminalKeyEncoder.specialKeyBytes(effectiveKeyCode, view.applicationCursorMode, view.applicationKeypadMode, modifiers)?.let {
+            TerminalKeyEncoder.specialKeyBytes(effectiveKeyCode, view.applicationCursorMode, view.applicationKeypadMode, modifiers, view.kittyKeyboardFlags)?.let {
                 view.onSendBytes?.invoke(it)
                 return true
             }

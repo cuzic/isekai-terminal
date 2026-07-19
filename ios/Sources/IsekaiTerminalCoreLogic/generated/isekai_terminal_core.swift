@@ -3128,10 +3128,12 @@ public struct ScreenUpdate: Equatable, Hashable {
      * OSC 8(タスク#40)ハイパーリンクのURL intern表。`CellData::link_id`はこの
      * `Vec`のindex(0-indexed)。同一URLは重複排除されて同じindexを指す。
      * このterminalセッションが一度でも見たURLを(現在アクティブでなくなった後も、
-     * RISされた後も)ずっと保持する——scrollback上の過去セルの`link_id`がこの表の
-     * indexを指し続けるため、indexを再利用したり表自体をクリアしたりすると
-     * 過去セルが別のURLを指す破損になる(`terminal.rs`の`link_table`フィールド
-     * docコメント参照)。
+     * RISされた後も)登録上限(`MAX_LINK_TABLE`、タスク#70)まで保持する——
+     * scrollback上の過去セルの`link_id`がこの表のindexを指し続けるため、
+     * indexを再利用したり表自体をクリアしたりすると過去セルが別のURLを指す
+     * 破損になる(`terminal.rs`の`link_table`フィールドdocコメント参照)。上限
+     * 到達後に見た新規URLはインターンされず、そのURLで開かれたリンクはリンク
+     * 無し扱いにフォールバックする(既存セルの`link_id`参照には影響しない)。
      */
     public var linkTable: [String]
     /**
@@ -3151,12 +3153,20 @@ public struct ScreenUpdate: Equatable, Hashable {
      * この`Terminal`(rust-core)が担うのはリモートが送ってくる`CSI > flags u`
      * (push)/`CSI < Pn u`(pop)/`CSI = flags ; mode u`(set)/`CSI ? u`(query、
      * 応答も自動で行う)を解釈してこの値を保持・公開するところまで(main/alt画面
-     * ごとに独立したflagsスタックを持つ、仕様通りの挙動)。**実際のキーイベントの
-     * エンコード(この値に応じてCSI `u`形式で送るかレガシー形式で送るか)は
-     * このRustコアではなくUI層(Kotlin/Swift)のキーエンコーダーが行う**——
-     * `application_cursor_mode`(#29の修飾キーCSIエンコード)と同じ役割分担で、
-     * rust-ssot上「今どのflagsがnegotiateされているか」の判断・保持だけをRust側
-     * に一元化する(Kotlin/Swift側にミラー状態は作らない)。
+     * ごとに独立したflagsスタックを持つ、仕様通りの挙動)。
+     *
+     * 実際のキーイベントのエンコード判断も`application_cursor_mode`(#29)と同じ役割分担
+     * (rust-ssot: 判断ロジックはRust側のSSOT関数に置き、Kotlin/Swiftはこの最新値を
+     * 引数として渡すだけ)——タスク#54実装時点ではこの引数配線が抜けており(タスク#72、
+     * 交渉・公開のみで実際の送信バイト列に無反映というバグ)、修正済み。呼び出し側
+     * (Android`TerminalKeyEncoder.specialKeyBytes`/iOS`TerminalKeyMapper`)は
+     * [terminal_special_key_bytes]へこの値をそのまま渡すこと。現状bit0(disambiguate
+     * escape codes)のEscapeキー(`ESC[27u`化)のみRust側で実装済み——矢印・Home/End・
+     * PageUp/PageDown・F1〜F12は仕様が許容する代替形式が既存のxterm修飾子CSI形式と
+     * 一致するため元々対応不要、Enter/Tab/Backspaceは仕様が明示する例外でlegacyのまま
+     * (詳細は[terminal_special_key_bytes]のdocコメント参照)。bit1〜4(report event
+     * types/alternate keys/all keys as escape codes/associated text)およびCtrl+英字等
+     * 通常テキストキーのCSI u化は未対応(この値の交渉・公開のみ)。
      */
     public var kittyKeyboardFlags: UInt16
 
@@ -3205,10 +3215,12 @@ public struct ScreenUpdate: Equatable, Hashable {
          * OSC 8(タスク#40)ハイパーリンクのURL intern表。`CellData::link_id`はこの
          * `Vec`のindex(0-indexed)。同一URLは重複排除されて同じindexを指す。
          * このterminalセッションが一度でも見たURLを(現在アクティブでなくなった後も、
-         * RISされた後も)ずっと保持する——scrollback上の過去セルの`link_id`がこの表の
-         * indexを指し続けるため、indexを再利用したり表自体をクリアしたりすると
-         * 過去セルが別のURLを指す破損になる(`terminal.rs`の`link_table`フィールド
-         * docコメント参照)。
+         * RISされた後も)登録上限(`MAX_LINK_TABLE`、タスク#70)まで保持する——
+         * scrollback上の過去セルの`link_id`がこの表のindexを指し続けるため、
+         * indexを再利用したり表自体をクリアしたりすると過去セルが別のURLを指す
+         * 破損になる(`terminal.rs`の`link_table`フィールドdocコメント参照)。上限
+         * 到達後に見た新規URLはインターンされず、そのURLで開かれたリンクはリンク
+         * 無し扱いにフォールバックする(既存セルの`link_id`参照には影響しない)。
          */linkTable: [String], 
         /**
          * Sixel(タスク#42)で現在アクティブな画像配置の一覧。詳細は[ImagePlacement]参照。
@@ -3226,12 +3238,20 @@ public struct ScreenUpdate: Equatable, Hashable {
          * この`Terminal`(rust-core)が担うのはリモートが送ってくる`CSI > flags u`
          * (push)/`CSI < Pn u`(pop)/`CSI = flags ; mode u`(set)/`CSI ? u`(query、
          * 応答も自動で行う)を解釈してこの値を保持・公開するところまで(main/alt画面
-         * ごとに独立したflagsスタックを持つ、仕様通りの挙動)。**実際のキーイベントの
-         * エンコード(この値に応じてCSI `u`形式で送るかレガシー形式で送るか)は
-         * このRustコアではなくUI層(Kotlin/Swift)のキーエンコーダーが行う**——
-         * `application_cursor_mode`(#29の修飾キーCSIエンコード)と同じ役割分担で、
-         * rust-ssot上「今どのflagsがnegotiateされているか」の判断・保持だけをRust側
-         * に一元化する(Kotlin/Swift側にミラー状態は作らない)。
+         * ごとに独立したflagsスタックを持つ、仕様通りの挙動)。
+         *
+         * 実際のキーイベントのエンコード判断も`application_cursor_mode`(#29)と同じ役割分担
+         * (rust-ssot: 判断ロジックはRust側のSSOT関数に置き、Kotlin/Swiftはこの最新値を
+         * 引数として渡すだけ)——タスク#54実装時点ではこの引数配線が抜けており(タスク#72、
+         * 交渉・公開のみで実際の送信バイト列に無反映というバグ)、修正済み。呼び出し側
+         * (Android`TerminalKeyEncoder.specialKeyBytes`/iOS`TerminalKeyMapper`)は
+         * [terminal_special_key_bytes]へこの値をそのまま渡すこと。現状bit0(disambiguate
+         * escape codes)のEscapeキー(`ESC[27u`化)のみRust側で実装済み——矢印・Home/End・
+         * PageUp/PageDown・F1〜F12は仕様が許容する代替形式が既存のxterm修飾子CSI形式と
+         * 一致するため元々対応不要、Enter/Tab/Backspaceは仕様が明示する例外でlegacyのまま
+         * (詳細は[terminal_special_key_bytes]のdocコメント参照)。bit1〜4(report event
+         * types/alternate keys/all keys as escape codes/associated text)およびCtrl+英字等
+         * 通常テキストキーのCSI u化は未対応(この値の交渉・公開のみ)。
          */kittyKeyboardFlags: UInt16) {
         self.cols = cols
         self.rows = rows
@@ -6873,13 +6893,29 @@ public func terminalPointerEventBytes(kind: MouseEventKind, button: MouseButton?
  * `ESC[Z`)を返す(readline/tmux等の「戻りタブ補完」に必要。xterm互換で
  * パラメータは付かない)。Shift以外の修飾子(Ctrl+Tab等)はターミナル制御
  * シーケンスとして標準化されていないため無視し、無修飾のTabとして扱う。
+ * - `kitty_flags`(タスク#54で交渉・`ScreenUpdate::kitty_keyboard_flags`として公開される
+ * Kitty keyboard protocolのnegotiated flags、呼び出し側はそこから取得した最新値を
+ * 毎回渡すこと)にbit0(`0b1`、disambiguate escape codes)が立っている場合のみEscapeキーが
+ * `ESC[27u`(Kitty `CSI u`形式)になる。Escapeキー(バイト`0x1B`)は本来それ自体が任意の
+ * エスケープシーケンスの開始バイトと衝突しうるためこのbitが名指しする典型例
+ * (<https://sw.kovidgoyal.net/kitty/keyboard-protocol/#disambiguate>: "pressing the Esc
+ * key generates the byte 0x1b which also is used to indicate the start of an escape
+ * code")であり、Kitty仕様は無条件で`CSI u`化するよう定めている。矢印・Home/End・
+ * PageUp/PageDown・F1〜F12は、同仕様が明示的に許容する代替形式
+ * (`CSI 1;<mod>[~ABCDEFHPQS]`)が既存のxterm修飾子CSI形式と完全に一致するため、
+ * `kitty_flags`に関わらず上記の挙動をそのまま流用してよい(変更不要)。Enter/Tab/
+ * Delete(Backspace相当)/ForwardDeleteも仕様が明示する例外("still generate the same
+ * bytes as in legacy mode")でありlegacy形式のまま。Ctrl+英字等の通常テキストキー
+ * (`terminal_ctrl_byte`/Unicode文字経路)のCSI u化は本関数のスコープ外(未対応、
+ * タスク#72では見送り——`ScreenUpdate::kitty_keyboard_flags`のdocコメント参照)。
  */
-public func terminalSpecialKeyBytes(key: TerminalSpecialKey, applicationCursorMode: Bool, modifiers: TerminalKeyModifiers) -> Data  {
+public func terminalSpecialKeyBytes(key: TerminalSpecialKey, applicationCursorMode: Bool, modifiers: TerminalKeyModifiers, kittyFlags: UInt16) -> Data  {
     return try!  FfiConverterData.lift(try! rustCall() {
     uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(
         FfiConverterTypeTerminalSpecialKey_lower(key),
         FfiConverterBool.lower(applicationCursorMode),
-        FfiConverterTypeTerminalKeyModifiers_lower(modifiers),$0
+        FfiConverterTypeTerminalKeyModifiers_lower(modifiers),
+        FfiConverterUInt16.lower(kittyFlags),$0
     )
 })
 }
@@ -6984,7 +7020,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 25125) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 25965) {
+    if (uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 49859) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes() != 52901) {

@@ -451,7 +451,8 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     @MainActor
     public func sendKeySequence(_ steps: [KeyStep]) {
         let applicationCursorMode = uiState.latestScreenUpdate?.applicationCursorMode ?? false
-        send(KeySequenceCommands.toBytes(steps, applicationCursorMode: applicationCursorMode))
+        let kittyFlags = uiState.latestScreenUpdate?.kittyKeyboardFlags ?? 0
+        send(KeySequenceCommands.toBytes(steps, applicationCursorMode: applicationCursorMode, kittyFlags: kittyFlags))
     }
 
     /// タスク#20: 動的resize(`TerminalScreenView`がview実サイズから算出したcols/rows)を

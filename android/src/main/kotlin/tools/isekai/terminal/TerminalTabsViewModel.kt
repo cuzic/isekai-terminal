@@ -692,8 +692,9 @@ class TerminalTabsViewModel(
         // キーボード経由と同じくRust由来の現在のkeypad modeに従わせる(codexレビュー指摘:
         // 未伝播だとテンキーを含む打鍵列が常にnumeric modeとして送信されてしまっていた)。
         val applicationKeypadMode = screenUpdate?.applicationKeypadMode ?: false
+        val kittyKeyboardFlags = screenUpdate?.kittyKeyboardFlags ?: 0u
         RemoteLogger.i("IsekaiTerminalKeySequence", "send key sequence (${steps.size} steps) tab=${address.tabId} pane=${address.paneId}")
-        pane.session.send(KeySequenceCommands.toBytes(steps, applicationCursorMode, applicationKeypadMode))
+        pane.session.send(KeySequenceCommands.toBytes(steps, applicationCursorMode, applicationKeypadMode, kittyKeyboardFlags))
     }
 
     // ── 接続後自動実行コマンド ────────────────────────────────────

@@ -483,13 +483,16 @@ pub(crate) struct Terminal {
     /// flagsのビットマスク(bit0=disambiguate escape codes、bit1=report event
     /// types、bit2=report alternate keys、bit3=report all keys as escape
     /// codes、bit4=report associated text)。「現在有効なflags」はスタック最上段
-    /// (空なら0=legacy mode)——実際のキーエンコード(どのCSI `u`形式で送るか)は
-    /// このRustコアではなくKotlin/Swift側のUIエンコーダーが行う(#29の修飾キー
-    /// CSIエンコードと同じ役割分担)。このコアが担うのは、リモートが送ってくる
+    /// (空なら0=legacy mode)。このコアが担うのは、リモートが送ってくる
     /// push/pop/set/queryシーケンス(`csi_dispatch`の`u`分岐参照)を解釈して
     /// 現在のnegotiated flagsを`ScreenUpdate::kitty_keyboard_flags`として公開する
     /// ところまで(rust-ssot: 「どのflagsが有効か」の判断・保持はRust側に一元化し、
-    /// Kotlin/Swift側にミラー状態は作らない)。
+    /// Kotlin/Swift側にミラー状態は作らない)。bit0(disambiguate escape codes)の
+    /// Escapeキーについては、この値を[crate::terminal_special_key_bytes]へそのまま
+    /// 渡すことで実際のCSI `u`エンコードもRust側のSSOT関数が行う(#29の修飾キーCSI
+    /// エンコードと同じ役割分担——タスク#54実装当初はこの引数配線が抜けていた
+    /// バグをタスク#72で修正、詳細は`ScreenUpdate::kitty_keyboard_flags`のdocコメント
+    /// 参照)。
     ///
     /// mainとaltで**独立したスタック**を持つ(仕様: "The main and alternate
     /// screens in the terminal emulator must maintain their own, independent,

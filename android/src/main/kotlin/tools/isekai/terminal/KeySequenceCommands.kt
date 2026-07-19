@@ -33,12 +33,16 @@ object KeySequenceCommands {
         // DECKPAM/DECKPNM(タスク#43)。KeyStep.Specialにテンキー(KC_NUMPAD_*)のkeyCodeが
         // 含まれる場合に必要(TerminalKeyEncoder.specialKeyBytesへそのまま伝播するだけ)。
         applicationKeypadMode: Boolean = false,
+        // Kitty keyboard protocol(タスク#54)のnegotiated flags。KeyStep.SpecialにEscapeが
+        // 含まれる場合にdisambiguate escape codes(bit0)を反映するため必要
+        // (TerminalKeyEncoder.specialKeyBytesへそのまま伝播するだけ、タスク#72)。
+        kittyFlags: UShort = 0u,
     ): ByteArray {
         val out = ByteArrayOutputStream()
         for (step in steps) {
             when (step) {
                 is KeyStep.CtrlChar -> TerminalKeyEncoder.ctrlByte(step.char.code)?.let(out::write)
-                is KeyStep.Special -> TerminalKeyEncoder.specialKeyBytes(step.keyCode, applicationCursorMode, applicationKeypadMode)?.let(out::write)
+                is KeyStep.Special -> TerminalKeyEncoder.specialKeyBytes(step.keyCode, applicationCursorMode, applicationKeypadMode, kittyFlags = kittyFlags)?.let(out::write)
                 is KeyStep.Text -> out.write(TerminalKeyEncoder.commitTextBytes(step.text, bracketedPasteMode = false))
                 is KeyStep.PlaceholderRef -> Unit
             }

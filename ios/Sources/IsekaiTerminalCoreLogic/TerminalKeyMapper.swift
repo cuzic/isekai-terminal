@@ -50,12 +50,19 @@ public enum TerminalKeyMapper {
     /// `TerminalKeyModifiers`をこの層で複製したSwift型にラップし直さず直接受け渡すのは、
     /// 修飾キーの意味づけロジックをRust側だけに置く(rust-ssot)ため。省略時は修飾なし
     /// (既存呼び出し元との後方互換)。
+    ///
+    /// `kittyFlags`(Kitty keyboard protocol、タスク#54で交渉・`ScreenUpdate.kittyKeyboardFlags`
+    /// として公開されるnegotiated flags)もRust側の`terminal_special_key_bytes`へそのまま
+    /// 委譲する(タスク#72: 以前はこの引数配線が抜けており、交渉されたflagsが実際の送信
+    /// バイト列に一切反映されない既存バグだった)。呼び出し側は取得できる最新値を渡すこと、
+    /// 省略時は0(legacy mode、既存呼び出し元との後方互換)。
     public static func bytes(
         for key: SpecialKey,
         applicationCursorMode: Bool,
-        modifiers: TerminalKeyModifiers = TerminalKeyModifiers(shift: false, alt: false, ctrl: false, meta: false)
+        modifiers: TerminalKeyModifiers = TerminalKeyModifiers(shift: false, alt: false, ctrl: false, meta: false),
+        kittyFlags: UInt16 = 0
     ) -> [UInt8] {
-        Array(terminalSpecialKeyBytes(key: key.rustKey, applicationCursorMode: applicationCursorMode, modifiers: modifiers))
+        Array(terminalSpecialKeyBytes(key: key.rustKey, applicationCursorMode: applicationCursorMode, modifiers: modifiers, kittyFlags: kittyFlags))
     }
 }
 
