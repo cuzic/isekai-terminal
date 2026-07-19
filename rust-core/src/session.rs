@@ -15,6 +15,22 @@ use crate::trzsz::{TrzszMode, TrzszTimer};
 
 const SCROLLBACK_LIMIT: usize = 1000;
 
+/// DEC Synchronized Output(`?2026`)のsafety-netタイムアウト。リモートが
+/// `CSI ?2026h`を送ったまま`CSI ?2026l`を送らずハングした場合、これだけ経過
+/// したら強制的に同期状態を解除して直近の画面内容をflushする(さもないと画面が
+/// 永久に固まって見える)。値はモバイル/ネットワーク越しの体感を踏まえた
+/// 端末機能としての経験則(codexとの設計相談での合意値)。
+const SYNC_OUTPUT_SAFETY_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// safety-netタイマーの発火通知(`fired_generation`)が、現在armされている
+/// タイマーそのものからのものかどうかを判定する(codexレビュー指摘のstale通知
+/// race対策——`session_event_loop`内の`sync_output_timeout_rx`アームdocコメント
+/// 参照)。ロジックをここに切り出すのは、tokio spawnを伴わずに単体テストできる
+/// ようにするため。
+fn sync_output_timeout_is_current(fired_generation: u64, armed_generation: Option<u64>) -> bool {
+    armed_generation == Some(fired_generation)
+}
+
 // ── TermCell → 公開型変換（session 層の責務）────────────
 
 fn to_cell_data(c: &TermCell) -> CellData {
@@ -483,6 +499,26 @@ pub(crate) async fn session_event_loop(
     let mut state = SessionState::new(init_cols as usize, init_rows as usize, initial_theme);
     let (timeout_tx, mut timeout_rx) = tokio::sync::mpsc::channel::<TrzszTimer>(16);
     let mut timer_rt = TokioTimerRuntime::new(timeout_tx);
+    // DEC Synchronized Output(`?2026`)のsafety-netタイマー。`TokioTimerRuntime`は
+    // trzsz FSM専用の単一スロット実装なので使い回さず、同じ形の別スロットを持つ
+    // (codexとの設計相談: 複数タイマー種別を汎化するのはタイマー種別が増える見込みが
+    // 出てから)。`sync_output_timer_handle`は「現在armされているsafety-netタイマー」
+    // そのもの——ループ末尾でTerminal側の実際の状態と突き合わせてarm/disarmする。
+    //
+    // タイマー発火通知に`()`ではなくgeneration番号(`u64`)を積むのは、以下のstale
+    // 通知raceを防ぐため(2周目のcodexレビューで指摘): safety-netタイマーが発火して
+    // `sync_timeout_tx`へ送信した直後(まだ`sync_timeout_rx`側で受信していない時点)に
+    // `CSI ?2026l`がstdoutから届いて処理されると、そちらのイテレーションで
+    // `sync_output_timer_handle.abort()`しても、channel容量1に既に積まれてしまった
+    // 発火通知そのものは取り消せない。generationを見ずに素朴に
+    // `force_end_synchronized_output`を呼ぶと、その直後に始まった**別の**
+    // `?2026h`区間まで誤って強制終了させてしまう。`sync_output_armed_generation`が
+    // 現在armされているタイマーのgenerationを保持し、[sync_output_timeout_is_current]
+    // が一致するものだけを本物の発火として扱う。
+    let (sync_timeout_tx, mut sync_timeout_rx) = tokio::sync::mpsc::channel::<u64>(1);
+    let mut sync_output_timer_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut sync_output_timer_generation: u64 = 0;
+    let mut sync_output_armed_generation: Option<u64> = None;
 
     'outer: loop {
         let result: Option<ProcessResult> = tokio::select! {
@@ -575,7 +611,42 @@ pub(crate) async fn session_event_loop(
                 Some(c) => Some(handle_session_cmd(&mut state, c)),
                 None => None,
             },
+            fired = sync_timeout_rx.recv() => match fired {
+                Some(gen) if sync_output_timeout_is_current(gen, sync_output_armed_generation) => {
+                    warn!("session: ?2026 (synchronized output) safety-net timeout fired, forcing flush");
+                    Some(state.force_end_synchronized_output())
+                }
+                // stale通知(既に?2026l/RIS/直前のforce_endでこのgenerationは
+                // disarm済み)。無視する——`sync_output_timeout_is_current`のdocコメント
+                // 参照。
+                Some(_) => None,
+                None => None,
+            },
         };
+
+        // DEC Synchronized Output(`?2026`)のsafety-netタイマーのarm/disarm。上の
+        // `select!`のどのアームが発火したかに関わらず、`Terminal`の実際の状態
+        // (vteが`?2026h`/`?2026l`を処理した結果、または直前のforce_end)と
+        // 突き合わせて一元的に判断する——`state.on_stdout`/`handle_session_cmd`等
+        // 個々の呼び出し側に判断を分散させない。
+        let sync_active = state.terminal().synchronized_output_active();
+        if sync_active {
+            if sync_output_timer_handle.is_none() {
+                sync_output_timer_generation += 1;
+                let gen = sync_output_timer_generation;
+                sync_output_armed_generation = Some(gen);
+                let tx = sync_timeout_tx.clone();
+                sync_output_timer_handle = Some(tokio::spawn(async move {
+                    tokio::time::sleep(SYNC_OUTPUT_SAFETY_TIMEOUT).await;
+                    let _ = tx.send(gen).await;
+                }));
+            }
+        } else {
+            if let Some(h) = sync_output_timer_handle.take() {
+                h.abort();
+            }
+            sync_output_armed_generation = None;
+        }
 
         if let Some(r) = result {
             let clipboard_pull_requested = r.clipboard_pull_requested;
@@ -859,6 +930,19 @@ mod tests {
     /// 文字列`s`の各charを1セルずつに割り当てた行を組み立てる(検索テスト用)。
     fn text_row(s: &str) -> Vec<TermCell> {
         s.chars().map(cell).collect()
+    }
+
+    #[test]
+    fn sync_output_timeout_is_current_only_matches_currently_armed_generation() {
+        assert!(sync_output_timeout_is_current(1, Some(1)));
+        assert!(
+            !sync_output_timeout_is_current(1, Some(2)),
+            "古いgenerationの発火通知は、既に新しいgenerationがarmされていれば無視すべき"
+        );
+        assert!(
+            !sync_output_timeout_is_current(1, None),
+            "既にdisarm済み(?2026l/RIS/直前のforce_end)なら無視すべき"
+        );
     }
 
     #[test]
