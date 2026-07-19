@@ -164,7 +164,7 @@ pub async fn connect_stun_p2p_on_socket(
 /// candidate passed to one fallback call dials the *same* `StunP2pTarget`
 /// (same peer, same session secret) — only `stun_server` (and therefore this
 /// side's own observed address) varies, matching
-/// `isekai-pipe-core::candidate::CandidateRoute::StunP2p`'s dedup-identity
+/// `crate::candidate::CandidateRoute::StunP2p`'s dedup-identity
 /// docs ("same peer, different STUN server" is a different candidate, not a
 /// duplicate).
 #[derive(Debug, Clone)]

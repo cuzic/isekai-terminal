@@ -15,7 +15,7 @@ use isekai_auth::TokenProvider;
 use isekai_bootstrap::{HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec, RelayTransportKind};
 use isekai_bootstrap_plan::{classify_bootstrap_error, BootstrapFailure};
 use isekai_pipe_core::{
-    claim_connect_outcome, default_profiles_dir, default_runtime_dir, load_persistent_profile,
+    claim_connect_outcome, default_log_file, default_profiles_dir, default_runtime_dir, load_persistent_profile,
     write_connection_intent, write_persistent_profile, BootstrapProvenance, ConnectionIntent, IntentTransport,
     PersistentProfile, ServiceSpec,
 };
@@ -25,7 +25,7 @@ use isekai_trust::{HelperTrust, UpdatePolicy};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::log_file::log_line;
+use crate::log_file::{log_line, log_line_verbose};
 
 mod config;
 mod directive;
@@ -337,6 +337,11 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
     if let Some(log_file) = &plan.isekai.log_file {
         crate::log_file::init(log_file)
             .with_context(|| format!("isekai-ssh: failed to open --isekai-log-file at {}", log_file.display()))?;
+    } else if let Ok(verbose_log_file) = default_log_file() {
+        // Best-effort: verbose bootstrap/diagnostic detail is a nicety, not
+        // something that should ever block the connection over a
+        // permissions/read-only-filesystem error opening its own log file.
+        let _ = crate::log_file::init_verbose(&verbose_log_file);
     }
     if plan.isekai.direct {
         return run_openssh_direct(&plan).await;
@@ -346,6 +351,11 @@ pub async fn run(args: Vec<String>) -> Result<u8> {
         return run_openssh_direct(&plan).await;
     }
     if plan.isekai.explain || plan.isekai.dry_run {
+        // Unlike the rest of this module's bootstrap-progress chatter,
+        // `--isekai-explain`/`--isekai-dry-run` is a diagnostic the user
+        // explicitly opted into for this one invocation — it must stay on
+        // screen by default, not get silently redirected to the verbose
+        // log file alongside everything else.
         log_line!(
             "isekai-ssh: resolved OpenSSH config: {:?}",
             resolution.openssh
@@ -520,7 +530,7 @@ async fn apply_ctl_socket_forward(
             Err(e) => {
                 // Opportunistic feature (`ISEKAI_PIPE_DESIGN.md` Epic M):
                 // never fail the connection over this, just skip it.
-                log_line!("isekai-ssh: ctl-socket forward unavailable, continuing without it: {e:#}");
+                log_line_verbose!("isekai-ssh: ctl-socket forward unavailable, continuing without it: {e:#}");
                 None
             }
         }
@@ -556,6 +566,20 @@ async fn run_ssh_once(
         .env("ISEKAI_PIPE_RUNTIME_DIR", runtime_dir)
         .arg("-o")
         .arg(format!("ProxyCommand={proxy_command}"));
+    if plan.isekai.log_file.is_none() {
+        // Only when the user hasn't asked for `--isekai-log-file`: point the
+        // `isekai-pipe connect` ProxyCommand grandchild's own `env_logger` at
+        // the same default verbose log this process just opened
+        // (`init_verbose` in `run()`), so its diagnostic noise never reaches
+        // the live terminal by default. When `--isekai-log-file` *is* given,
+        // this is deliberately left unset — `isekai-pipe connect` keeps
+        // targeting `stderr`, which the `is_enabled()` branch below already
+        // pipes into that one user-chosen file, preserving today's
+        // "everything in one place" contract unchanged.
+        if let Ok(verbose_log_file) = default_log_file() {
+            command.env("ISEKAI_PIPE_LOG_FILE", verbose_log_file);
+        }
+    }
     // The `#@isekai ctl-socket` `-R` forward needs a real local UNIX-socket
     // listener bound before the destination arg, so it is Unix-only. The
     // Windows-native path never reaches this function — it's `russh`-based and
@@ -868,7 +892,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         .filter_map(|entry| match entry.parse::<SocketAddr>() {
             Ok(addr) => Some(addr),
             Err(e) => {
-                log_line!("isekai-ssh: ignoring malformed #@isekai stun entry {entry:?}: {e}");
+                log_line_verbose!("isekai-ssh: ignoring malformed #@isekai stun entry {entry:?}: {e}");
                 None
             }
         })
@@ -899,7 +923,18 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         },
     };
 
-    log_line!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
+    match confirmation {
+        TofuConfirmation::AlwaysPrompt => {
+            log_line_verbose!("isekai-ssh: {:?} is not trusted yet; deploying isekai-helper to {}...", resolution.isekai.profile, candidate.target);
+        }
+        TofuConfirmation::Silent => {
+            log_line_verbose!(
+                "isekai-ssh: cached trust for {:?} looks stale; redeploying isekai-helper to {}...",
+                resolution.isekai.profile,
+                candidate.target
+            );
+        }
+    }
     let report = backend
         .install_and_start(&target, &via, &helper_binary, &launch, resolution.isekai.remote_path.as_deref(), &stun_servers)
         .await
@@ -933,14 +968,14 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
         }
     };
 
-    log_line!();
-    log_line!("Host:            {}", candidate.target);
+    log_line_verbose!();
+    log_line_verbose!("Host:            {}", candidate.target);
     if let Some(relay_target) = &resolution.isekai.bootstrap_relay {
-        log_line!("Relay:           {}", relay_target.relay_addr);
+        log_line_verbose!("Relay:           {}", relay_target.relay_addr);
     }
-    log_line!("Helper identity: {identity}");
-    log_line!("Binary sha256:   {helper_sha256}");
-    log_line!();
+    log_line_verbose!("Helper identity: {identity}");
+    log_line_verbose!("Binary sha256:   {helper_sha256}");
+    log_line_verbose!();
 
     match confirmation {
         TofuConfirmation::AlwaysPrompt => {
@@ -961,7 +996,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             }
         }
         TofuConfirmation::Silent => {
-            log_line!(
+            log_line_verbose!(
                 "isekai-ssh: refreshing trust for {:?} automatically (already trusted; cached session material \
                  just went stale) — no confirmation needed.",
                 resolution.isekai.profile
@@ -994,7 +1029,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
             anyhow::Error::new(e)
                 .context(BootstrapFailure::PersistenceFailed(format!("failed to write profile to {}", profiles_dir.display())))
         })?;
-    log_line!("Registered {key:?} in {}", path.display());
+    log_line_verbose!("Registered {key:?} in {}", path.display());
     Ok(())
 }
 

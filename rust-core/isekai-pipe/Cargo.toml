@@ -41,6 +41,15 @@ serde_json = "1"
 log = "0.4"
 env_logger = "0.11"
 tokio = { version = "1", features = ["full"] }
+# `datagram_relay.rs`'s channel-id-prefixed datagram framing and
+# `AnyMuxConnection::send_datagram`/`recv_datagram` both traffic in
+# `bytes::Bytes` directly (matching quicmux's own datagram API shape).
+bytes = "1"
+# OS-level (Windows toast / Linux desktop / macOS) notification for the two
+# "user should notice this even if not looking at the terminal" reconnect
+# events (`resume_loop.rs::notify_os`) — a lightweight stand-in for a full
+# tssh-style in-terminal overlay, which is a separate, larger follow-up.
+notify-rust = "4"
 
 [dev-dependencies]
 tempfile = "3"

@@ -35,9 +35,19 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
+#[cfg(test)]
 use std::time::Duration;
 
 use log::{info, warn};
+use timed_fsm::tokio_support::TokioTimerRuntime;
+use timed_fsm::{ActionOutcome, AsyncActionExecutor, TimedStateMachine};
+
+use crate::path_health_fsm::{PathHealthAction, PathHealthFsm, PathHealthFsmEvent, PathHealthTimer};
+
+pub use crate::path_health_fsm::{
+    DEGRADED_LOSS_RATIO, DEGRADED_RTT_THRESHOLD, HEALTH_CHECK_INTERVAL, NO_RESPONSE_CONSECUTIVE_CHECKS,
+    PING_SETTLE_DELAY, RECOVERY_CONSECUTIVE_CHECKS,
+};
 
 /// A path's identity for logging/tracking purposes, chosen by the caller
 /// (e.g. `"primary"`, `"secondary"`, `"physical-wifi"` on Android;
@@ -47,21 +57,6 @@ use log::{info, warn};
 /// concepts like "physical Wi-Fi" don't belong in a crate the CLI also
 /// depends on).
 pub type PathLabel = Cow<'static, str>;
-
-/// `path.ping()`(PING frame送出)→ 少し待つ → `path.stats()`を定期的に行う間隔。
-pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(3);
-/// pingを送ってから`stats()`を読むまでの待ち時間。
-pub const PING_SETTLE_DELAY: Duration = Duration::from_millis(300);
-/// これを超えるRTTはDegraded扱い。
-pub const DEGRADED_RTT_THRESHOLD: Duration = Duration::from_millis(800);
-/// 直近チェック区間でのロス率がこれを超えるとDegraded扱い。
-pub const DEGRADED_LOSS_RATIO: f64 = 0.2;
-/// Degraded→Validated復帰に必要な連続healthy回数。
-pub const RECOVERY_CONSECUTIVE_CHECKS: u32 = 2;
-/// 完全な無応答(zero response)と判定するために必要な連続検出回数
-/// (単発では実ネットワークのジッタで容易に偽陽性になるため、実機検証で
-/// 複数回連続を要求する設計に変更された — `has_zero_response`のdocも参照)。
-pub const NO_RESPONSE_CONSECUTIVE_CHECKS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathState {
@@ -171,10 +166,73 @@ pub fn has_zero_response(prev: Option<&noq::PathStats>, curr: &noq::PathStats) -
     sent_delta > 0 && recv_delta == 0
 }
 
+/// [`PathHealthAction`]を実際のnoq I/Oへ変換する[`AsyncActionExecutor`]。
+/// `SendPing`/`ReadStats`はpathが既に閉じていたら
+/// [`ActionOutcome::Stop`]を返し、Driverループ([`spawn_health_monitor`])
+/// 自体を終了させる — FSM自身はnoqの生存を知らないので、この判断は
+/// ここでしかできない。`ReadStats`が読み取った`stats`は`stats_tx`経由で
+/// Driverループへ送り返し、次のselect!サイクルで
+/// `PathHealthFsmEvent::StatsReceived`として`fsm.on_event`に渡される
+/// (`rebind_driver.rs`の`spawn_probe`が`WifiProbeSucceeded`/`Failed`を
+/// `input_tx`へ送り返すのと同じパターン)。
+struct HealthActionExecutor {
+    conn: noq::Connection,
+    path_id: noq::PathId,
+    tracker: PathHealthTracker,
+    label: PathLabel,
+    event_tx: tokio::sync::mpsc::Sender<PathHealthEvent>,
+    stats_tx: tokio::sync::mpsc::UnboundedSender<noq::PathStats>,
+}
+
+impl AsyncActionExecutor for HealthActionExecutor {
+    type Action = PathHealthAction;
+
+    async fn execute_one(&mut self, action: &PathHealthAction) -> ActionOutcome {
+        match *action {
+            PathHealthAction::SendPing => {
+                let Some(path) = self.conn.path(self.path_id) else { return ActionOutcome::Stop };
+                if path.ping().is_err() {
+                    return ActionOutcome::Stop; // path はもう閉じている
+                }
+                ActionOutcome::Continue
+            }
+            PathHealthAction::ReadStats => {
+                let Some(path) = self.conn.path(self.path_id) else { return ActionOutcome::Stop };
+                let _ = self.stats_tx.send(path.stats());
+                ActionOutcome::Continue
+            }
+            PathHealthAction::DegradeZeroResponse { consecutive } => {
+                warn!("path_health: path {:?} got zero responses for {consecutive} consecutive checks", self.label);
+                self.tracker.set(self.label.clone(), PathState::Degraded);
+                notify_if_no_viable_path(&self.tracker, &self.event_tx);
+                ActionOutcome::Continue
+            }
+            PathHealthAction::DegradeUnhealthy { rtt } => {
+                warn!("path_health: path {:?} degraded (rtt={rtt:?}), demoting to Backup", self.label);
+                if let Some(path) = self.conn.path(self.path_id) {
+                    let _ = path.set_status(noq::PathStatus::Backup);
+                }
+                self.tracker.set(self.label.clone(), PathState::Degraded);
+                ActionOutcome::Continue
+            }
+            PathHealthAction::Recover => {
+                info!("path_health: path {:?} recovered, marking Available", self.label);
+                if let Some(path) = self.conn.path(self.path_id) {
+                    let _ = path.set_status(noq::PathStatus::Available);
+                }
+                self.tracker.set(self.label.clone(), PathState::Validated);
+                ActionOutcome::Continue
+            }
+        }
+    }
+}
+
 /// `path.ping()`(PING frame送出)→ 少し待つ → `path.stats()`を`noq`のAPIだけで
 /// 定期的に行い、閾値超過ならそのpathを`PathStatus::Backup`に格下げする
 /// (他に`Available`なpathがあればnoq自身がそちらを優先して使う)。独自のping/pong
 /// ワイヤープロトコルは作らない — `noq::Path`が既に持っている機能をそのまま使うだけ。
+/// 遷移判断そのものは[`PathHealthFsm`](timed_fsm::TimedStateMachine実装)に委譲し、
+/// この関数はそれを駆動するDriverに徹する(`rebind_driver.rs`と同じ役割分担)。
 ///
 /// 返す[`tokio::task::JoinHandle`]をdropしてもタスクは止まらない(detachされたまま
 /// 動き続ける) — 呼び出し元が明示的に止めたい場合は`abort()`すること。
@@ -186,57 +244,21 @@ pub fn spawn_health_monitor(
     event_tx: tokio::sync::mpsc::Sender<PathHealthEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut prev_stats: Option<noq::PathStats> = None;
-        let mut consecutive_healthy = 0u32;
-        // `has_zero_response`は実ネットワークのジッタ(1回だけ応答がPING_SETTLE_DELAY内に
-        // 間に合わなかった等)でも単発では簡単に真になる(実機検証で245ms RTT——閾値800msの
-        // 範囲内——でも1回だけ「この区間は受信0」になるケースを確認済み)。そのため
-        // `classify_path_health`のRTT/ロス率/black hole判定(Backup降格用、単発判定のまま)
-        // とは別に、NoViablePath通知だけは連続ミスを要求してノイズを除去する。
-        let mut consecutive_no_response = 0u32;
-        loop {
-            tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
-            let Some(path) = conn.path(path_id) else { break };
-            if path.ping().is_err() {
-                break; // path はもう閉じている
-            }
-            tokio::time::sleep(PING_SETTLE_DELAY).await;
-            let Some(path) = conn.path(path_id) else { break };
-            let stats = path.stats();
-            let zero_response = has_zero_response(prev_stats.as_ref(), &stats);
-            // `zero_response`をそのまま`healthy`にも反映させる。そうしないと、完全な
-            // 無応答下でも`classify_path_health`(RTT/ロス率/black hole)だけは「健全」と
-            // 読み続けてしまい(statsが更新自体止まるため)、下のリカバリ判定が
-            // `zero_response`側のDegraded降格と競合して即座にValidatedへ戻してしまう。
-            let healthy = classify_path_health(prev_stats.as_ref(), &stats) && !zero_response;
-            prev_stats = Some(stats);
+        let mut fsm = PathHealthFsm::new();
+        let mut timers = TokioTimerRuntime::<PathHealthTimer>::new();
+        let (stats_tx, mut stats_rx) = tokio::sync::mpsc::unbounded_channel::<noq::PathStats>();
+        let mut executor = HealthActionExecutor { conn, path_id, tracker, label, event_tx, stats_tx };
 
-            if zero_response {
-                consecutive_no_response = consecutive_no_response.saturating_add(1);
-                if consecutive_no_response >= NO_RESPONSE_CONSECUTIVE_CHECKS {
-                    warn!("path_health: path {label:?} got zero responses for {consecutive_no_response} consecutive checks");
-                    tracker.set(label.clone(), PathState::Degraded);
-                    notify_if_no_viable_path(&tracker, &event_tx);
-                }
-            } else {
-                consecutive_no_response = 0;
-            }
+        let start_resp = fsm.on_event(PathHealthFsmEvent::Start);
+        let mut outcome = start_resp.dispatch_async(&mut timers, &mut executor).await;
 
-            if healthy {
-                consecutive_healthy = consecutive_healthy.saturating_add(1);
-                if tracker.get(&label) == PathState::Degraded && consecutive_healthy >= RECOVERY_CONSECUTIVE_CHECKS {
-                    info!("path_health: path {label:?} recovered, marking Available");
-                    let _ = path.set_status(noq::PathStatus::Available);
-                    tracker.set(label.clone(), PathState::Validated);
-                }
-            } else {
-                consecutive_healthy = 0;
-                if tracker.get(&label) != PathState::Degraded {
-                    warn!("path_health: path {label:?} degraded (rtt={:?}), demoting to Backup", stats.rtt);
-                    let _ = path.set_status(noq::PathStatus::Backup);
-                    tracker.set(label.clone(), PathState::Degraded);
-                }
-            }
+        while !outcome.stop {
+            let resp = tokio::select! {
+                Some(id) = timers.recv() => fsm.on_timeout(id),
+                Some(stats) = stats_rx.recv() => fsm.on_event(PathHealthFsmEvent::StatsReceived(stats)),
+                else => break,
+            };
+            outcome = resp.dispatch_async(&mut timers, &mut executor).await;
         }
     })
 }

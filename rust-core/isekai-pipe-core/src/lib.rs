@@ -10,8 +10,14 @@ use serde::{Deserialize, Serialize};
 
 pub use isekai_pipe_protocol::{LogicalHost, ServiceName};
 
-mod candidate;
-pub use candidate::{
+// The pure Candidate model used to live in this crate's own `candidate`
+// module; moved to `isekai-transport` (`#31`) so that crate doesn't have to
+// depend on this one (SSH-specific deploy-profile-cache/bootstrap-plan/
+// filesystem-intent-handoff code) just for these generic value types — see
+// `isekai_transport::candidate`'s module docs. Re-exported here under the
+// same names so every existing `isekai_pipe_core::Candidate` etc. import
+// path keeps working unchanged.
+pub use isekai_transport::candidate::{
     validate_endpoint_identity, Candidate, CandidateClass, CandidateConversionError, CandidateDraft,
     CandidateDraftBatch, CandidateGeneration, CandidateId, CandidateKey, CandidateOrigin, CandidateOriginKind,
     CandidatePriority, CandidateRoute, CandidateSnapshot, CandidateValidity, CertificatePinError,
@@ -20,7 +26,7 @@ pub use candidate::{
 
 mod profile;
 pub use profile::{
-    default_profiles_dir, load_persistent_profile, migrate_trust_store, update_persistent_profile,
+    default_log_file, default_profiles_dir, load_persistent_profile, migrate_trust_store, update_persistent_profile,
     write_persistent_profile, LegacyRelayTransport, PathHint, PersistentProfile, PERSISTENT_PROFILE_SCHEMA_VERSION,
 };
 
@@ -214,6 +220,36 @@ impl ConnectionIntent {
             return Err(IntentError::Expired);
         }
         Ok(())
+    }
+
+    /// Converts to `isekai_transport`'s minimal `TransportIntent` (`#31`) —
+    /// the candidate-gathering pipeline
+    /// (`isekai_transport::candidate_provider`) depends only on that smaller
+    /// type, not on this crate's SSH-specific `ConnectionIntent` (intent-id/
+    /// profile/relay_policy/filesystem intent-file handoff), so
+    /// `isekai-transport` never needs to depend on `isekai-pipe-core`. Drops
+    /// `session_secret_b64` deliberately — candidate gathering/dialing never
+    /// needs the session secret (see `isekai_transport::candidate`'s module
+    /// docs on why `Candidate`/`CandidateKey` never carry it either).
+    pub fn to_transport_intent(&self) -> isekai_transport::candidate::TransportIntent {
+        isekai_transport::candidate::TransportIntent {
+            expected_server_identity_cert_sha256_hex: self.expected_server_identity.cert_sha256_hex.clone(),
+            transport: match &self.transport {
+                IntentTransport::Relay { helper_addr, server_name, .. } => isekai_transport::candidate::TransportRoute::Relay {
+                    helper_addr: helper_addr.clone(),
+                    server_name: server_name.clone(),
+                },
+                IntentTransport::StunP2p { stun_server, peer_addr, server_name, .. } => {
+                    isekai_transport::candidate::TransportRoute::StunP2p {
+                        stun_server: stun_server.clone(),
+                        peer_addr: peer_addr.clone(),
+                        server_name: server_name.clone(),
+                    }
+                }
+            },
+            relay_endpoints: self.relay_endpoints.clone(),
+            stun_servers: self.stun_servers.clone(),
+        }
     }
 }
 

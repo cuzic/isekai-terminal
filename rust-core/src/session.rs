@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
 
 use log::{debug, info, warn};
 use parking_lot::Mutex;
-use timed_fsm::TimerCommand;
+use timed_fsm::tokio_support::TokioTimerRuntime;
+use timed_fsm::{TimerCommand, TimerRuntime};
 
 use crate::{CellData, ClipboardMimeKind, ClipboardPayload, ScreenUpdate, SessionCallback, RUNTIME};
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
@@ -31,41 +31,6 @@ fn make_screen_update(t: &Terminal) -> ScreenUpdate {
         title: t.title().map(str::to_owned),
         application_cursor_mode: t.application_cursor_mode(),
         bracketed_paste_mode: t.bracketed_paste_mode(),
-    }
-}
-
-// ── TokioTimerRuntime ────────────────────────────────────
-
-struct TokioTimerRuntime {
-    handle: Option<tokio::task::JoinHandle<()>>,
-    timeout_tx: tokio::sync::mpsc::Sender<TrzszTimer>,
-}
-
-impl TokioTimerRuntime {
-    fn new(timeout_tx: tokio::sync::mpsc::Sender<TrzszTimer>) -> Self {
-        TokioTimerRuntime { handle: None, timeout_tx }
-    }
-
-    fn set(&mut self, id: TrzszTimer, dur: Duration) {
-        if self.handle.is_some() {
-            debug!("trzsz timer: replace {:?} dur={:?}", id, dur);
-        } else {
-            debug!("trzsz timer: set {:?} dur={:?}", id, dur);
-        }
-        self.kill(id);
-        let tx = self.timeout_tx.clone();
-        self.handle = Some(tokio::spawn(async move {
-            tokio::time::sleep(dur).await;
-            debug!("trzsz timer: fired {:?}", id);
-            let _ = tx.send(id).await;
-        }));
-    }
-
-    fn kill(&mut self, id: TrzszTimer) {
-        if let Some(h) = self.handle.take() {
-            debug!("trzsz timer: killed {:?}", id);
-            h.abort();
-        }
     }
 }
 
@@ -320,8 +285,7 @@ pub(crate) async fn session_event_loop(
 ) {
     info!("session: event loop start {}x{}", init_cols, init_rows);
     let mut state = SessionState::new(init_cols as usize, init_rows as usize, initial_theme);
-    let (timeout_tx, mut timeout_rx) = tokio::sync::mpsc::channel::<TrzszTimer>(16);
-    let mut timer_rt = TokioTimerRuntime::new(timeout_tx);
+    let mut timer_rt = TokioTimerRuntime::<TrzszTimer>::new();
 
     'outer: loop {
         let result: Option<ProcessResult> = tokio::select! {
@@ -408,7 +372,7 @@ pub(crate) async fn session_event_loop(
                     callback.on_disconnected(None); break 'outer;
                 }
             },
-            timer_id = timeout_rx.recv() => match timer_id {
+            timer_id = timer_rt.recv() => match timer_id {
                 Some(id) => Some(state.on_timeout(id)),
                 None => None,
             },
@@ -452,7 +416,7 @@ pub(crate) async fn session_event_loop(
 /// ProcessResult をすべて処理する（タイマー・scrollback・副作用・画面更新）
 fn dispatch_result(
     r: ProcessResult,
-    timer_rt: &mut TokioTimerRuntime,
+    timer_rt: &mut TokioTimerRuntime<TrzszTimer>,
     transport_cmd_tx: &tokio::sync::mpsc::Sender<TransportCommand>,
     callback: &Arc<dyn SessionCallback>,
     terminal: &Terminal,
@@ -460,8 +424,8 @@ fn dispatch_result(
 ) {
     for cmd in r.timer_cmds {
         match cmd {
-            TimerCommand::Set { id, duration } => timer_rt.set(id, duration),
-            TimerCommand::Kill { id }           => timer_rt.kill(id),
+            TimerCommand::Set { id, duration } => timer_rt.set_timer(id, duration),
+            TimerCommand::Kill { id }           => timer_rt.kill_timer(id),
         }
     }
 
@@ -762,8 +726,7 @@ mod tests {
         let scrollback = Arc::new(Mutex::new(initial));
 
         let (transport_cmd_tx, _transport_cmd_rx) = tokio::sync::mpsc::channel(8);
-        let (timeout_tx, _timeout_rx) = tokio::sync::mpsc::channel(1);
-        let mut timer_rt = TokioTimerRuntime::new(timeout_tx);
+        let mut timer_rt = TokioTimerRuntime::<TrzszTimer>::new();
         let callback: Arc<dyn SessionCallback> = Arc::new(NoopSessionCallback);
         let terminal = Terminal::new(80, 24, Theme::default());
 

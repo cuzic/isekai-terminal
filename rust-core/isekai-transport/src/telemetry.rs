@@ -11,7 +11,7 @@
 //! fails, so log consumers (a human grepping `RUST_LOG=info`, or eventually
 //! a real metrics pipeline) never have to special-case which fields are
 //! present. Four of those fields identify *which candidate* this attempt was
-//! against ([`CandidateIdentity`], derived from `isekai_pipe_core::Candidate`
+//! against ([`CandidateIdentity`], derived from `crate::candidate::Candidate`
 //! by the caller that actually has one — see that type's docs for why these
 //! four are distinct concepts, not one):
 //!
@@ -27,7 +27,7 @@
 //! - `direct`: `true` when this candidate came from [`LEGACY_INTENT_PROVIDER_ID`]
 //!   (the profile's own bootstrapped/observed address — today's only
 //!   "primary" transport, `IntentTransport::Relay`/`StunP2p` alike), `false`
-//!   when it came from `ConnectionIntent::relay_endpoints`
+//!   when it came from `TransportIntent::relay_endpoints`
 //!   (`ConfigRelayProvider`, `#@isekai relay <url>` — an explicit fallback
 //!   address, possibly relay-assigned). Exists because `candidate_kind=relay`
 //!   alone is ambiguous to a human reader: that label names the *dialing
@@ -60,7 +60,7 @@
 
 use std::time::Duration;
 
-use isekai_pipe_core::LEGACY_INTENT_PROVIDER_ID;
+use crate::candidate::LEGACY_INTENT_PROVIDER_ID;
 use isekai_protocol::attach::{AttemptId, ConnectionGeneration};
 use isekai_protocol::session_id::SessionId;
 
@@ -85,7 +85,7 @@ impl std::fmt::Display for CandidateOutcome {
 }
 
 /// Which candidate a [`CandidateAttempt`] was against, as four plain string
-/// tags rather than a borrowed `isekai_pipe_core::Candidate` — this crate's
+/// tags rather than a borrowed `crate::candidate::Candidate` — this crate's
 /// connection-establishment functions (`relay::connect_and_handshake` and
 /// friends) work in terms of `RelayTarget`/`StunP2pTarget`, not `Candidate`
 /// directly (`isekai-pipe`'s connection entry point is the one place that
@@ -233,7 +233,7 @@ mod tests {
         // アドレス(intent.transportの直接候補)を指す — kindがrelay/stun-p2p
         // どちらでも「direct」である。
         assert!(is_direct_dial(LEGACY_INTENT_PROVIDER_ID));
-        // config-relay(ConnectionIntent::relay_endpoints由来)は明示的な
+        // config-relay(TransportIntent::relay_endpoints由来)は明示的な
         // フォールバック先アドレスであり、directではない。
         assert!(!is_direct_dial("config-relay"));
         assert!(!is_direct_dial("unknown-provider"));

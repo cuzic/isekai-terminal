@@ -17,6 +17,7 @@ resolver = "2"
 # (quicsock-noqも同時にvendorしていたが、それが要る「同一QUIC接続で複数の
 # 物理インタフェースを同時保持する」方式はnoq issue #738で断念済みのため
 # 未使用のまま残さず削除した — isekai-transport/src/multipath.rsのdoc参照。)
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -42,7 +43,7 @@ tokio = { version = "1", features = ["test-util"] }
 [dependencies]
 rand = "0.8"
 uniffi = { version = "0.31", features = ["tokio"] }
-timed-fsm = "0.3.0"
+timed-fsm = { version = "0.4.0", features = ["tokio"] }
 russh = "0.48"
 russh-keys = "0.48"
 russh-stream-session = { path = "russh-stream-session" }

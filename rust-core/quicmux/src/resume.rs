@@ -611,6 +611,7 @@ mod noq_e2e_tests {
             max_concurrent_bidi_streams: 2,
             max_concurrent_uni_streams: 0,
             multipath: false,
+            datagram_send_buffer_size: None,
         }
     }
 
@@ -632,6 +633,7 @@ mod noq_e2e_tests {
             max_concurrent_bidi_streams: 2,
             max_concurrent_uni_streams: 0,
             multipath: false,
+            datagram_send_buffer_size: None,
             cert_chain: vec![cert_der],
             private_key: key_der,
         };

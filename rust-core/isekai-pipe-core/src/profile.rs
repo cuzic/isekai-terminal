@@ -255,6 +255,53 @@ fn resolve_profiles_dir(
     Ok(std::env::temp_dir().join("isekai-profiles"))
 }
 
+/// Default destination for the always-on verbose diagnostic log that
+/// `isekai-ssh`/`isekai-pipe connect` write to by default (no
+/// `--isekai-log-file` needed) -- distinct from `default_profiles_dir`'s
+/// per-host trust store, but resolved with the exact same env var / XDG /
+/// `LOCALAPPDATA` / `HOME` priority so both land under the same parent
+/// `isekai` directory. `ISEKAI_PIPE_LOG_FILE` doubles as both an explicit
+/// user override *and* the mechanism `isekai-ssh` uses to tell a spawned
+/// `isekai-pipe connect` where to write its own diagnostic log (same
+/// convention as `ISEKAI_INTENT_ID`/`ISEKAI_PIPE_RUNTIME_DIR`).
+pub fn default_log_file() -> io::Result<PathBuf> {
+    resolve_log_file(
+        std::env::var_os("ISEKAI_PIPE_LOG_FILE"),
+        std::env::var_os("XDG_STATE_HOME"),
+        cfg!(windows).then(|| std::env::var_os("LOCALAPPDATA")).flatten(),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Pure priority list behind [`default_log_file`], mirroring
+/// `resolve_profiles_dir`'s structure so it stays unit-testable without
+/// mutating this process's real environment variables.
+fn resolve_log_file(
+    explicit_override: Option<std::ffi::OsString>,
+    xdg_state_home: Option<std::ffi::OsString>,
+    windows_local_app_data: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> io::Result<PathBuf> {
+    if let Some(path) = explicit_override {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(path) = xdg_state_home {
+        return Ok(PathBuf::from(path).join("isekai").join("logs").join("isekai-ssh.log"));
+    }
+    if let Some(local_app_data) = windows_local_app_data {
+        return Ok(PathBuf::from(local_app_data).join("isekai").join("logs").join("isekai-ssh.log"));
+    }
+    if let Some(home) = home {
+        return Ok(PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("isekai")
+            .join("logs")
+            .join("isekai-ssh.log"));
+    }
+    Ok(std::env::temp_dir().join("isekai-logs").join("isekai-ssh.log"))
+}
+
 /// Escapes characters that are reserved in Windows filenames -- most
 /// notably `:`, which NTFS interprets as the Alternate Data Stream
 /// separator. Profile keys are `host:port` (`isekai_trust::normalize_host_port`),
@@ -727,6 +774,43 @@ mod tests {
     fn resolve_profiles_dir_falls_back_to_temp_dir_when_nothing_is_set() {
         let dir = resolve_profiles_dir(None, None, None, None).unwrap();
         assert_eq!(dir, std::env::temp_dir().join("isekai-profiles"));
+    }
+
+    #[test]
+    fn resolve_log_file_prefers_explicit_override_over_everything() {
+        let path = resolve_log_file(
+            Some("/explicit/isekai-ssh.log".into()),
+            Some("/xdg-state".into()),
+            Some(r"C:\Users\alice\AppData\Local".into()),
+            Some("/home/alice".into()),
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("/explicit/isekai-ssh.log"));
+    }
+
+    #[test]
+    fn resolve_log_file_prefers_xdg_state_home_over_windows_and_home() {
+        let path = resolve_log_file(None, Some("/xdg-state".into()), Some(r"C:\Users\alice\AppData\Local".into()), Some("/home/alice".into()))
+            .unwrap();
+        assert_eq!(path, PathBuf::from("/xdg-state/isekai/logs/isekai-ssh.log"));
+    }
+
+    #[test]
+    fn resolve_log_file_prefers_windows_local_app_data_over_home() {
+        let path = resolve_log_file(None, None, Some(r"C:\Users\alice\AppData\Local".into()), Some(r"C:\Users\alice".into())).unwrap();
+        assert_eq!(path, PathBuf::from(r"C:\Users\alice\AppData\Local").join("isekai").join("logs").join("isekai-ssh.log"));
+    }
+
+    #[test]
+    fn resolve_log_file_falls_back_to_home_when_not_on_windows() {
+        let path = resolve_log_file(None, None, None, Some("/home/alice".into())).unwrap();
+        assert_eq!(path, PathBuf::from("/home/alice/.local/state/isekai/logs/isekai-ssh.log"));
+    }
+
+    #[test]
+    fn resolve_log_file_falls_back_to_temp_dir_when_nothing_is_set() {
+        let path = resolve_log_file(None, None, None, None).unwrap();
+        assert_eq!(path, std::env::temp_dir().join("isekai-logs").join("isekai-ssh.log"));
     }
 
     fn profile_test_nonce() -> u64 {

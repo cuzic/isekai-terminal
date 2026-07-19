@@ -122,6 +122,7 @@ impl server::Handler for FakeShellHandler {
         // no-op on Unix (byte-identical to today's implicit resolution)
         // and the only thing that works on Windows.
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))
             .stdin(StdStdio::piped())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::piped())
@@ -487,6 +488,20 @@ fn profile_path_under(home: &std::path::Path, key: &str) -> PathBuf {
     profiles_dir_under(home).join(format!("{}.json", key.replace(':', "%3A")))
 }
 
+/// Verbose bootstrap-progress messages (including the "Registered ... in
+/// ..." confirmation these tests watch for) now go to `isekai-ssh`'s
+/// default log file (`log_file.rs::log_line_verbose!`) rather than stderr
+/// — these tests point that log file at a known path under the test's own
+/// `home` (`.env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))`)
+/// and poll it here instead of scanning stderr for the line.
+fn verbose_log_path_under(home: &std::path::Path) -> PathBuf {
+    home.join("isekai-ssh-verbose-test.log")
+}
+
+fn verbose_log_contains(path: &std::path::Path, needle: &str) -> bool {
+    std::fs::read_to_string(path).map(|contents| contents.contains(needle)).unwrap_or(false)
+}
+
 const VALID_HANDSHAKE_JSON: &str = r#"{"v":1,"session_secret":"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=","protocol":{"name":"isekai-pipe","alpn":"isekai-pipe/1"},"peer":{"server_identity":{"kind":"quic-cert-sha256","cert_sha256":"3a7f00000000000000000000000000000000000000000000000000000000aabb"}},"candidates":[{"kind":"direct-by-bootstrap-host","port":45231,"source":"bootstrap-ssh"}]}"#;
 
 /// `#20a-4`: every real `OpenSshBackend` launch now sends a
@@ -550,6 +565,7 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
         // no-op on Unix (byte-identical to today's implicit resolution)
         // and the only thing that works on Windows.
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -584,7 +600,7 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
                 eprint!("[isekai-ssh stderr] {line}");
-                if line.contains("Registered") {
+                if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
@@ -665,6 +681,7 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
         // no-op on Unix (byte-identical to today's implicit resolution)
         // and the only thing that works on Windows.
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -692,7 +709,7 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
                 eprint!("[isekai-ssh stderr] {line}");
-                if line.contains("Registered") {
+                if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
@@ -772,6 +789,7 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
         // no-op on Unix (byte-identical to today's implicit resolution)
         // and the only thing that works on Windows.
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -799,7 +817,7 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
                 eprint!("[isekai-ssh stderr] {line}");
-                if line.contains("Registered") {
+                if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
@@ -896,6 +914,7 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
         // no-op on Unix (byte-identical to today's implicit resolution)
         // and the only thing that works on Windows.
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -923,7 +942,7 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
                 eprint!("[isekai-ssh stderr] {line}");
-                if line.contains("Registered") {
+                if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
@@ -1031,6 +1050,7 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
         // no-op on Unix (byte-identical to today's implicit resolution)
         // and the only thing that works on Windows.
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -1060,7 +1080,7 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
             Ok(Ok(_)) => {
                 eprint!("[isekai-ssh stderr] {line}");
                 stderr_text.push_str(&line);
-                if line.contains("Registered") {
+                if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
@@ -1072,7 +1092,11 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
     let _ = child.wait().await;
 
     assert!(saw_registered, "expected wrapper stderr to report trust-store registration");
-    assert!(stderr_text.contains("Relay:"), "expected the trust summary to print the relay address, got: {stderr_text:?}");
+    let verbose_log_text = std::fs::read_to_string(verbose_log_path_under(&home)).unwrap_or_default();
+    assert!(
+        stderr_text.contains("Relay:") || verbose_log_text.contains("Relay:"),
+        "expected the trust summary to print the relay address, got stderr: {stderr_text:?}, verbose log: {verbose_log_text:?}"
+    );
 
     let argv = std::fs::read_to_string(&argv_log).expect("stand-in script should have recorded its argv");
     assert!(argv.contains("--relay 203.0.113.10:443"), "expected bootstrap-relay's addr to reach the launch command argv, got: {argv:?}");
@@ -1137,6 +1161,7 @@ async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
         // no-op on Unix (byte-identical to today's implicit resolution)
         // and the only thing that works on Windows.
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())

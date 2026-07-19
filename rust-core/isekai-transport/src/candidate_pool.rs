@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use isekai_pipe_core::{
+use crate::candidate::{
     Candidate, CandidateDraft, CandidateDraftBatch, CandidateGeneration, CandidateId, CandidateKey,
     CandidateOrigin, CandidatePriority, CandidateSnapshot, CandidateValidity,
 };
@@ -16,8 +16,8 @@ use tokio::time::Instant;
 
 /// Abstracts the monotonic clock `CandidatePool` reads expiry against, so
 /// tests can control time without real sleeps. Production code uses
-/// [`SystemClock`]; `isekai_pipe_core::candidate` deliberately has no
-/// equivalent (that crate stays free of runtime-clock concerns entirely).
+/// [`SystemClock`]; `crate::candidate` deliberately has no equivalent (that
+/// module stays free of runtime-clock concerns entirely).
 pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
 }
@@ -231,7 +231,7 @@ fn merge_origin(origins: &mut Vec<CandidateOrigin>, origin: CandidateOrigin) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use isekai_pipe_core::{CandidateOriginKind, CandidateRoute};
+    use crate::candidate::{CandidateOriginKind, CandidateRoute};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -257,10 +257,10 @@ mod tests {
     fn direct_draft(port: u16, priority_rank: u16, validity: CandidateValidity) -> CandidateDraft {
         CandidateDraft {
             route: CandidateRoute::StunP2p {
-                cert_pin: isekai_pipe_core::CertificatePinSha256::from_hex(&"ab".repeat(32)).unwrap(),
+                cert_pin: crate::candidate::CertificatePinSha256::from_hex(&"ab".repeat(32)).unwrap(),
                 peer_addr: format!("203.0.113.5:{port}").parse().unwrap(),
                 stun_server: "203.0.113.9:3478".parse().unwrap(),
-                server_name: isekai_pipe_core::NormalizedServerName::new("isekai-helper").unwrap(),
+                server_name: crate::candidate::NormalizedServerName::new("isekai-helper").unwrap(),
             },
             origin: CandidateOrigin { source: CandidateOriginKind::LegacyIntent, provider_id: "legacy-intent".to_string() },
             priority: CandidatePriority { rank: priority_rank },
@@ -271,9 +271,9 @@ mod tests {
     fn relay_draft(port: u16) -> CandidateDraft {
         CandidateDraft {
             route: CandidateRoute::Relay {
-                cert_pin: isekai_pipe_core::CertificatePinSha256::from_hex(&"ab".repeat(32)).unwrap(),
+                cert_pin: crate::candidate::CertificatePinSha256::from_hex(&"ab".repeat(32)).unwrap(),
                 helper_addr: format!("203.0.113.5:{port}").parse().unwrap(),
-                server_name: isekai_pipe_core::NormalizedServerName::new("isekai-helper").unwrap(),
+                server_name: crate::candidate::NormalizedServerName::new("isekai-helper").unwrap(),
             },
             origin: CandidateOrigin { source: CandidateOriginKind::LegacyIntent, provider_id: "legacy-intent".to_string() },
             priority: CandidatePriority { rank: 0 },
