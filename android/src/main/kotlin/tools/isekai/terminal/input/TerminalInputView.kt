@@ -26,6 +26,14 @@ class TerminalInputView @JvmOverloads constructor(
     var bracketedPasteMode: Boolean = false
 
     /**
+     * Kitty keyboard protocol(タスク#54)のnegotiated flags(`ScreenUpdate.kittyKeyboardFlags`
+     * の最新値、既定0=legacy mode)。[TerminalInputConnection.sendKeyEvent]がEscapeキーの
+     * disambiguate escape codes(bit0)反映に使う(タスク#72、[TerminalKeyEncoder.specialKeyBytes]
+     * 参照)。
+     */
+    var kittyKeyboardFlags: UShort = 0u
+
+    /**
      * トグル式 Ctrl キーの武装状態。true の間に次に入力された 1 文字を
      * Ctrl+<key> の制御コードに変換して送信する（表示専用の UI ローカル状態）。
      */

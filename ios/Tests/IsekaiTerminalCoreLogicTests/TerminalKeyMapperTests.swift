@@ -40,6 +40,39 @@ final class TerminalKeyMapperTests: XCTestCase {
         XCTAssertEqual(TerminalKeyMapper.bytes(for: .delete), Array("\u{1B}[3~".utf8))
     }
 
+    // ── タスク#72: Kitty keyboard protocol(タスク#54)のdisambiguate escape codes(bit0)を
+    // 反映するkittyFlags引数。以前は交渉されたflagsが一切エンコードに反映されない既存
+    // バグだった(Android版`TerminalKeyEncoderTest`の対応するテストと対称)。
+
+    func testEscapeUsesKittyCsiUWhenDisambiguateFlagNegotiated() {
+        // CSI > 1 u でリモートがdisambiguate escape codes(bit0)をpushした状態を想定。
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .escape, applicationCursorMode: false, kittyFlags: 0b1),
+            Array("\u{1B}[27u".utf8)
+        )
+    }
+
+    func testEscapeStaysLegacyByteWhenKittyFlagsDoNotIncludeDisambiguateBit() {
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .escape, applicationCursorMode: false, kittyFlags: 0b10),
+            [0x1B]
+        )
+    }
+
+    func testKittyDisambiguateFlagDoesNotChangeKeysKittySpecExemptsOrAlreadyMatches() {
+        let flags: UInt16 = 0b1
+        XCTAssertEqual(TerminalKeyMapper.bytes(for: .tab, applicationCursorMode: false, kittyFlags: flags), [0x09])
+        XCTAssertEqual(TerminalKeyMapper.bytes(for: .backspace, applicationCursorMode: false, kittyFlags: flags), [0x7F])
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .arrowUp, applicationCursorMode: false, kittyFlags: flags),
+            Array("\u{1B}[A".utf8)
+        )
+        XCTAssertEqual(
+            TerminalKeyMapper.bytes(for: .functionKey(1), applicationCursorMode: false, kittyFlags: flags),
+            Array("\u{1B}OP".utf8)
+        )
+    }
+
     func testFunctionKeysF1ThroughF4UseSS3Form() {
         XCTAssertEqual(TerminalKeyMapper.bytes(for: .functionKey(1)), Array("\u{1B}OP".utf8))
         XCTAssertEqual(TerminalKeyMapper.bytes(for: .functionKey(2)), Array("\u{1B}OQ".utf8))

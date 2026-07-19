@@ -49,6 +49,12 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
     /// 切り替えるために必要。`applicationCursorMode`と同じく、Rust側の状態をそのまま
     /// 反映するだけで新しいミラー状態は作らない(`TerminalView`の`updateUIView`参照)。
     public var applicationKeypadMode: Bool = false
+    /// タスク#72: Kitty keyboard protocol(タスク#54)のnegotiated flags
+    /// (`ScreenUpdate.kittyKeyboardFlags`)。ハードウェアキーボードのEscapeキーが
+    /// disambiguate escape codes(bit0)を反映するために必要。`applicationCursorMode`と
+    /// 同じく、Rust側の状態をそのまま反映するだけで新しいミラー状態は作らない
+    /// (`TerminalView`の`updateUIView`参照)。
+    public var kittyKeyboardFlags: UInt16 = 0
 
     public override init(frame: CGRect) {
         super.init(frame: frame)
@@ -133,7 +139,7 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
         // する(タスク#73、Android版`TerminalInputConnection.sendKeyEvent`の
         // `!composing`ガードと同じ方針)。
         if let specialKey = TerminalHardwareKeyMapper.specialKey(for: key.keyCode), markedTextRange == nil {
-            let bytes = TerminalKeyMapper.bytes(for: specialKey, applicationCursorMode: applicationCursorMode, modifiers: modifiers)
+            let bytes = TerminalKeyMapper.bytes(for: specialKey, applicationCursorMode: applicationCursorMode, modifiers: modifiers, kittyFlags: kittyKeyboardFlags)
             guard !bytes.isEmpty else { return false }
             onSendBytes?(Data(bytes))
             return true

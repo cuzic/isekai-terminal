@@ -140,6 +140,28 @@ object TerminalKeyEncoder {
         if (modifiers.isNone()) byteArrayOf(0x1B, 0x4F, letter) else csiModified(letter, modifiers)
 
     /**
+     * Kitty keyboard protocol(タスク#54)のprogressive enhancement flagsのうちbit0
+     * (disambiguate escape codes)。`rust-core`の`KITTY_DISAMBIGUATE_ESCAPE_CODES`
+     * (`lib.rs`)と同一値。
+     */
+    private const val KITTY_DISAMBIGUATE_ESCAPE_CODES: UInt = 0b1u
+
+    /**
+     * Escapeキーのバイト列。`kittyFlags`にbit0(disambiguate escape codes)が立っている
+     * 場合のみKitty `CSI u`形式(`ESC[27u`)になる(`rust-core`の`terminal_special_key_bytes`
+     * のEscape分岐と同一ロジック、タスク#72——Escapeバイト`0x1B`自体が任意のエスケープ
+     * シーケンスの開始バイトと衝突しうるため、Kitty仕様がこのbitの名指しする典型例として
+     * 無条件でCSI u化するよう定めている)。それ以外(flags=0または他bitのみ)は従来通り
+     * 生の`0x1B`。
+     */
+    private fun escapeBytes(kittyFlags: UShort): ByteArray =
+        if (kittyFlags.toUInt() and KITTY_DISAMBIGUATE_ESCAPE_CODES != 0u) {
+            byteArrayOf(0x1B, 0x5B, 0x32, 0x37, 0x75) // ESC[27u
+        } else {
+            byteArrayOf(0x1B)
+        }
+
+    /**
      * 特殊キーのバイト列。未定義なら null。
      * applicationCursorMode=true のとき矢印キーは SS3 シーケンス（vim 等で必要）。
      * F1〜F4 は常に SS3（`ESC O P`等）、F5〜F12 は CSI `~`形式（xterm 互換、`rust-core`の
@@ -152,6 +174,10 @@ object TerminalKeyEncoder {
      * 同一golden表、テンキーには影響しない）。省略時は修飾なし（既存呼び出し元との後方互換）。
      * KC_INSERT/KC_FORWARD_DELは常に`ESC[2~`/`ESC[3~`(rust-coreの`TerminalSpecialKey::ForwardDelete`
      * と同一シーケンス、タスク#83でテンキーNumLock OFF時の`0`/`.`用に追加)。
+     * `kittyFlags`(`ScreenUpdate.kittyKeyboardFlags`の最新値、呼び出し側は毎回そのまま渡す
+     * こと)はEscapeキーのみに影響する(タスク#72、[escapeBytes]参照)。矢印・Home/End・
+     * PageUp/PageDown・F1〜F12・Enter/Tab/Delete/ForwardDeleteはKitty仕様上変更不要
+     * (`rust-core`の`terminal_special_key_bytes`のdocコメント参照)。省略時は0(legacy mode)。
      */
     fun specialKeyBytes(
         keyCode: Int,
@@ -161,11 +187,12 @@ object TerminalKeyEncoder {
         // data classなので、共有インスタンスをデフォルト引数にすると呼び出し側の書き換えが
         // グローバルな既定挙動を壊しかねない(codexレビュー指摘)。
         modifiers: TerminalKeyModifiers = TerminalKeyModifiers(shift = false, alt = false, ctrl = false, meta = false),
+        kittyFlags: UShort = 0u,
     ): ByteArray? = when (keyCode) {
         KC_ENTER      -> byteArrayOf(0x0D)
         KC_DEL        -> byteArrayOf(0x7F)
         KC_TAB        -> tabBytes(modifiers)
-        KC_ESCAPE     -> byteArrayOf(0x1B)
+        KC_ESCAPE     -> escapeBytes(kittyFlags)
         KC_DPAD_UP    -> arrowBytes(0x41, applicationCursorMode, modifiers)
         KC_DPAD_DOWN  -> arrowBytes(0x42, applicationCursorMode, modifiers)
         KC_DPAD_RIGHT -> arrowBytes(0x43, applicationCursorMode, modifiers)

@@ -191,6 +191,17 @@ class TerminalInputConnectionTest {
         assertArrayEquals(byteArrayOf(0x1B), sentBytes[0])
     }
 
+    // タスク#72: Kitty keyboard protocol(タスク#54)のdisambiguate escape codes(bit0)が
+    // negotiateされている場合、物理キーボードのEscapeキーもCSI u形式で送られることを
+    // end-to-end(view.kittyKeyboardFlags → TerminalInputConnection → TerminalKeyEncoder)
+    // で確認する。エンコード自体のgolden testは`TerminalKeyEncoderTest`に既にある。
+    @Test
+    fun sendKeyEvent_escape_usesKittyCsiUWhenDisambiguateFlagNegotiated() {
+        view.kittyKeyboardFlags = 0b1u
+        keyDown(KeyEvent.KEYCODE_ESCAPE)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x32, 0x37, 0x75), sentBytes[0]) // ESC[27u
+    }
+
     @Test
     fun sendKeyEvent_arrowUp_sendsCsiA() {
         keyDown(KeyEvent.KEYCODE_DPAD_UP)

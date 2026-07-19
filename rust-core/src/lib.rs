@@ -367,6 +367,11 @@ impl TerminalKeyModifiers {
     }
 }
 
+/// Kitty keyboard protocol(タスク#54、`ScreenUpdate::kitty_keyboard_flags`)の
+/// progressive enhancement flagsのうちbit0。`terminal_special_key_bytes`が参照する
+/// (`terminal.rs`のflagsスタックのdocコメントにあるビット割当と一致させること)。
+const KITTY_DISAMBIGUATE_ESCAPE_CODES: u16 = 0b1;
+
 /// 特殊キーを、ターミナルへ送信するバイト列(ANSI/xtermエスケープシーケンス)に
 /// 変換する。
 ///
@@ -385,18 +390,40 @@ impl TerminalKeyModifiers {
 ///   `ESC[Z`)を返す(readline/tmux等の「戻りタブ補完」に必要。xterm互換で
 ///   パラメータは付かない)。Shift以外の修飾子(Ctrl+Tab等)はターミナル制御
 ///   シーケンスとして標準化されていないため無視し、無修飾のTabとして扱う。
+/// - `kitty_flags`(タスク#54で交渉・`ScreenUpdate::kitty_keyboard_flags`として公開される
+///   Kitty keyboard protocolのnegotiated flags、呼び出し側はそこから取得した最新値を
+///   毎回渡すこと)にbit0(`0b1`、disambiguate escape codes)が立っている場合のみEscapeキーが
+///   `ESC[27u`(Kitty `CSI u`形式)になる。Escapeキー(バイト`0x1B`)は本来それ自体が任意の
+///   エスケープシーケンスの開始バイトと衝突しうるためこのbitが名指しする典型例
+///   (<https://sw.kovidgoyal.net/kitty/keyboard-protocol/#disambiguate>: "pressing the Esc
+///   key generates the byte 0x1b which also is used to indicate the start of an escape
+///   code")であり、Kitty仕様は無条件で`CSI u`化するよう定めている。矢印・Home/End・
+///   PageUp/PageDown・F1〜F12は、同仕様が明示的に許容する代替形式
+///   (`CSI 1;<mod>[~ABCDEFHPQS]`)が既存のxterm修飾子CSI形式と完全に一致するため、
+///   `kitty_flags`に関わらず上記の挙動をそのまま流用してよい(変更不要)。Enter/Tab/
+///   Delete(Backspace相当)/ForwardDeleteも仕様が明示する例外("still generate the same
+///   bytes as in legacy mode")でありlegacy形式のまま。Ctrl+英字等の通常テキストキー
+///   (`terminal_ctrl_byte`/Unicode文字経路)のCSI u化は本関数のスコープ外(未対応、
+///   タスク#72では見送り——`ScreenUpdate::kitty_keyboard_flags`のdocコメント参照)。
 #[uniffi::export]
 pub fn terminal_special_key_bytes(
     key: TerminalSpecialKey,
     application_cursor_mode: bool,
     modifiers: TerminalKeyModifiers,
+    kitty_flags: u16,
 ) -> Vec<u8> {
     match key {
         TerminalSpecialKey::Enter => vec![0x0D],
         TerminalSpecialKey::Delete => vec![0x7F],
         TerminalSpecialKey::ForwardDelete => b"\x1B[3~".to_vec(),
         TerminalSpecialKey::Tab => terminal_tab_bytes(modifiers),
-        TerminalSpecialKey::Escape => vec![0x1B],
+        TerminalSpecialKey::Escape => {
+            if kitty_flags & KITTY_DISAMBIGUATE_ESCAPE_CODES != 0 {
+                b"\x1B[27u".to_vec()
+            } else {
+                vec![0x1B]
+            }
+        }
         TerminalSpecialKey::ArrowUp => terminal_arrow_bytes(b'A', application_cursor_mode, modifiers),
         TerminalSpecialKey::ArrowDown => terminal_arrow_bytes(b'B', application_cursor_mode, modifiers),
         TerminalSpecialKey::ArrowRight => terminal_arrow_bytes(b'C', application_cursor_mode, modifiers),
@@ -980,12 +1007,20 @@ pub struct ScreenUpdate {
     /// この`Terminal`(rust-core)が担うのはリモートが送ってくる`CSI > flags u`
     /// (push)/`CSI < Pn u`(pop)/`CSI = flags ; mode u`(set)/`CSI ? u`(query、
     /// 応答も自動で行う)を解釈してこの値を保持・公開するところまで(main/alt画面
-    /// ごとに独立したflagsスタックを持つ、仕様通りの挙動)。**実際のキーイベントの
-    /// エンコード(この値に応じてCSI `u`形式で送るかレガシー形式で送るか)は
-    /// このRustコアではなくUI層(Kotlin/Swift)のキーエンコーダーが行う**——
-    /// `application_cursor_mode`(#29の修飾キーCSIエンコード)と同じ役割分担で、
-    /// rust-ssot上「今どのflagsがnegotiateされているか」の判断・保持だけをRust側
-    /// に一元化する(Kotlin/Swift側にミラー状態は作らない)。
+    /// ごとに独立したflagsスタックを持つ、仕様通りの挙動)。
+    ///
+    /// 実際のキーイベントのエンコード判断も`application_cursor_mode`(#29)と同じ役割分担
+    /// (rust-ssot: 判断ロジックはRust側のSSOT関数に置き、Kotlin/Swiftはこの最新値を
+    /// 引数として渡すだけ)——タスク#54実装時点ではこの引数配線が抜けており(タスク#72、
+    /// 交渉・公開のみで実際の送信バイト列に無反映というバグ)、修正済み。呼び出し側
+    /// (Android`TerminalKeyEncoder.specialKeyBytes`/iOS`TerminalKeyMapper`)は
+    /// [terminal_special_key_bytes]へこの値をそのまま渡すこと。現状bit0(disambiguate
+    /// escape codes)のEscapeキー(`ESC[27u`化)のみRust側で実装済み——矢印・Home/End・
+    /// PageUp/PageDown・F1〜F12は仕様が許容する代替形式が既存のxterm修飾子CSI形式と
+    /// 一致するため元々対応不要、Enter/Tab/Backspaceは仕様が明示する例外でlegacyのまま
+    /// (詳細は[terminal_special_key_bytes]のdocコメント参照)。bit1〜4(report event
+    /// types/alternate keys/all keys as escape codes/associated text)およびCtrl+英字等
+    /// 通常テキストキーのCSI u化は未対応(この値の交渉・公開のみ)。
     pub kitty_keyboard_flags: u16,
 }
 
@@ -1515,68 +1550,111 @@ mod terminal_key_mapping_tests {
 
     #[test]
     fn enter_maps_to_cr() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Enter, false, NO_MODS), vec![0x0D]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Enter, false, NO_MODS, 0), vec![0x0D]);
     }
 
     #[test]
     fn del_maps_to_0x7f() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Delete, false, NO_MODS), vec![0x7F]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Delete, false, NO_MODS, 0), vec![0x7F]);
     }
 
     #[test]
     fn forward_delete_maps_to_csi_tilde() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ForwardDelete, false, NO_MODS), b"\x1B[3~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ForwardDelete, false, NO_MODS, 0), b"\x1B[3~".to_vec());
+    }
+
+    // ── Kitty keyboard protocol disambiguate escape codes(タスク#54で交渉のみ実装され
+    // 実際のエンコードに未反映だったのをタスク#72で修正) ──────────────────
+
+    #[test]
+    fn escape_uses_kitty_csi_u_when_disambiguate_flag_negotiated() {
+        // CSI > 1 u でリモートがdisambiguate escape codes(bit0)をpushした状態を想定。
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::Escape, false, NO_MODS, KITTY_DISAMBIGUATE_ESCAPE_CODES),
+            b"\x1B[27u".to_vec()
+        );
+    }
+
+    #[test]
+    fn escape_stays_legacy_byte_when_kitty_flags_do_not_include_disambiguate_bit() {
+        // report-event-types(bit1)のみのように、disambiguateビット(bit0)を含まないflagsでは
+        // 従来通り生の0x1Bのまま(仕様のdisambiguate専用挙動のため)。
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Escape, false, NO_MODS, 0b10), vec![0x1B]);
+    }
+
+    #[test]
+    fn kitty_disambiguate_flag_does_not_change_keys_kitty_spec_exempts_or_already_matches() {
+        // Kitty仕様: Enter/Tab/Backspace(Delete)は明示的な例外でlegacyのまま。矢印・Home/End・
+        // PageUp/PageDown・F1〜F12は仕様が許容する代替形式が既存のxterm修飾子CSI形式と一致する
+        // ため、disambiguateビットが立っていても出力は変わらない(関数docコメント参照)。
+        let flags = KITTY_DISAMBIGUATE_ESCAPE_CODES;
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Enter, false, NO_MODS, flags), vec![0x0D]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, NO_MODS, flags), vec![0x09]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Delete, false, NO_MODS, flags), vec![0x7F]);
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, NO_MODS, flags),
+            vec![0x1B, 0x5B, 0x41]
+        );
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, ctrl, flags),
+            b"\x1B[1;5A".to_vec()
+        );
+        assert_eq!(
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false, NO_MODS, flags),
+            b"\x1BOP".to_vec()
+        );
     }
 
     #[test]
     fn tab_maps_to_0x09() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, NO_MODS), vec![0x09]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, NO_MODS, 0), vec![0x09]);
     }
 
     #[test]
     fn escape_maps_to_0x1b() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Escape, false, NO_MODS), vec![0x1B]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Escape, false, NO_MODS, 0), vec![0x1B]);
     }
 
     #[test]
     fn arrow_keys_map_to_csi() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, NO_MODS), vec![0x1B, 0x5B, 0x41]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, false, NO_MODS), vec![0x1B, 0x5B, 0x42]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, false, NO_MODS), vec![0x1B, 0x5B, 0x43]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, false, NO_MODS), vec![0x1B, 0x5B, 0x44]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, NO_MODS, 0), vec![0x1B, 0x5B, 0x41]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, false, NO_MODS, 0), vec![0x1B, 0x5B, 0x42]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, false, NO_MODS, 0), vec![0x1B, 0x5B, 0x43]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, false, NO_MODS, 0), vec![0x1B, 0x5B, 0x44]);
     }
 
     #[test]
     fn arrow_keys_map_to_ss3_in_application_cursor_mode() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, true, NO_MODS), vec![0x1B, 0x4F, 0x41]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, true, NO_MODS), vec![0x1B, 0x4F, 0x42]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, true, NO_MODS), vec![0x1B, 0x4F, 0x43]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, true, NO_MODS), vec![0x1B, 0x4F, 0x44]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, true, NO_MODS, 0), vec![0x1B, 0x4F, 0x41]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, true, NO_MODS, 0), vec![0x1B, 0x4F, 0x42]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, true, NO_MODS, 0), vec![0x1B, 0x4F, 0x43]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, true, NO_MODS, 0), vec![0x1B, 0x4F, 0x44]);
     }
 
     #[test]
     fn page_up_down_and_home_end() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageUp, false, NO_MODS), b"\x1B[5~".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageDown, false, NO_MODS), b"\x1B[6~".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Home, false, NO_MODS), b"\x1B[H".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::End, false, NO_MODS), b"\x1B[F".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageUp, false, NO_MODS, 0), b"\x1B[5~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageDown, false, NO_MODS, 0), b"\x1B[6~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Home, false, NO_MODS, 0), b"\x1B[H".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::End, false, NO_MODS, 0), b"\x1B[F".to_vec());
     }
 
     #[test]
     fn function_keys_f1_to_f4_use_ss3() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false, NO_MODS), b"\x1BOP".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 4 }, false, NO_MODS), b"\x1BOS".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false, NO_MODS, 0), b"\x1BOP".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 4 }, false, NO_MODS, 0), b"\x1BOS".to_vec());
     }
 
     #[test]
     fn function_keys_f5_to_f12_use_csi_tilde() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 5 }, false, NO_MODS), b"\x1B[15~".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 12 }, false, NO_MODS), b"\x1B[24~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 5 }, false, NO_MODS, 0), b"\x1B[15~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 12 }, false, NO_MODS, 0), b"\x1B[24~".to_vec());
     }
 
     #[test]
     fn unsupported_function_key_returns_empty() {
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 99 }, false, NO_MODS), Vec::<u8>::new());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 99 }, false, NO_MODS, 0), Vec::<u8>::new());
     }
 
     // ── 修飾キー付きシーケンス(#29) ──────────────────────────
@@ -1601,43 +1679,43 @@ mod terminal_key_mapping_tests {
     fn arrow_keys_with_modifiers_always_use_csi_form_regardless_of_decckm() {
         let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
         // DECCKM無効時
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, ctrl), b"\x1B[1;5A".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, ctrl, 0), b"\x1B[1;5A".to_vec());
         // DECCKM有効時でも修飾子付きはSS3にならずCSI形式のまま
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, true, ctrl), b"\x1B[1;5A".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, true, ctrl), b"\x1B[1;5B".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, true, ctrl), b"\x1B[1;5C".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, true, ctrl), b"\x1B[1;5D".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, true, ctrl, 0), b"\x1B[1;5A".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowDown, true, ctrl, 0), b"\x1B[1;5B".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowRight, true, ctrl, 0), b"\x1B[1;5C".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowLeft, true, ctrl, 0), b"\x1B[1;5D".to_vec());
     }
 
     #[test]
     fn arrow_key_shift_uses_modifier_2() {
         let shift = TerminalKeyModifiers { shift: true, ..Default::default() };
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, shift), b"\x1B[1;2A".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ArrowUp, false, shift, 0), b"\x1B[1;2A".to_vec());
     }
 
     #[test]
     fn home_end_with_modifiers_use_parameterized_csi() {
         let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Home, false, ctrl), b"\x1B[1;5H".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::End, false, ctrl), b"\x1B[1;5F".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Home, false, ctrl, 0), b"\x1B[1;5H".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::End, false, ctrl, 0), b"\x1B[1;5F".to_vec());
     }
 
     #[test]
     fn page_up_down_with_modifiers_use_parameterized_tilde() {
         let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageUp, false, ctrl), b"\x1B[5;5~".to_vec());
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageDown, false, ctrl), b"\x1B[6;5~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageUp, false, ctrl, 0), b"\x1B[5;5~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::PageDown, false, ctrl, 0), b"\x1B[6;5~".to_vec());
     }
 
     #[test]
     fn function_keys_f1_to_f4_switch_from_ss3_to_csi_when_modified() {
         let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
         assert_eq!(
-            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false, ctrl),
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false, ctrl, 0),
             b"\x1B[1;5P".to_vec()
         );
         assert_eq!(
-            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 4 }, false, ctrl),
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 4 }, false, ctrl, 0),
             b"\x1B[1;5S".to_vec()
         );
     }
@@ -1646,11 +1724,11 @@ mod terminal_key_mapping_tests {
     fn function_keys_f5_to_f12_use_parameterized_tilde_when_modified() {
         let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
         assert_eq!(
-            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 5 }, false, ctrl),
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 5 }, false, ctrl, 0),
             b"\x1B[15;5~".to_vec()
         );
         assert_eq!(
-            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 12 }, false, ctrl),
+            terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 12 }, false, ctrl, 0),
             b"\x1B[24;5~".to_vec()
         );
     }
@@ -1658,24 +1736,24 @@ mod terminal_key_mapping_tests {
     #[test]
     fn shift_tab_maps_to_cbt() {
         let shift = TerminalKeyModifiers { shift: true, ..Default::default() };
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, shift), b"\x1B[Z".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, shift, 0), b"\x1B[Z".to_vec());
     }
 
     #[test]
     fn tab_with_non_shift_modifiers_falls_back_to_plain_tab() {
         let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, ctrl), vec![0x09]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, ctrl, 0), vec![0x09]);
         let shift_ctrl = TerminalKeyModifiers { shift: true, ctrl: true, ..Default::default() };
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, shift_ctrl), vec![0x09]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Tab, false, shift_ctrl, 0), vec![0x09]);
     }
 
     #[test]
     fn keys_unaffected_by_modifiers_stay_the_same() {
         let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Enter, false, ctrl), vec![0x0D]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Delete, false, ctrl), vec![0x7F]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Escape, false, ctrl), vec![0x1B]);
-        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ForwardDelete, false, ctrl), b"\x1B[3~".to_vec());
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Enter, false, ctrl, 0), vec![0x0D]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Delete, false, ctrl, 0), vec![0x7F]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::Escape, false, ctrl, 0), vec![0x1B]);
+        assert_eq!(terminal_special_key_bytes(TerminalSpecialKey::ForwardDelete, false, ctrl, 0), b"\x1B[3~".to_vec());
     }
 
     // ── アプリケーションキーパッドモード(DECKPAM/DECKPNM、タスク#43) ──────────
