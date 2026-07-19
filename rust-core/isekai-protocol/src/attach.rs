@@ -355,8 +355,14 @@ pub enum AttachRejectReason {
     /// `session_id`. Carries the server's `current_generation` so the client
     /// knows exactly how far to jump instead of guessing.
     StaleGeneration { current_generation: ConnectionGeneration },
-    /// A *different* `session_id` is currently active; this server instance
-    /// only ever serves one logical session at a time.
+    /// The server already tracks `--max-sessions` concurrent sessions for
+    /// this target and every one of them is actively relaying (none could be
+    /// evicted as merely parked) — try again once one of them ends
+    /// (`isekai-pipe`'s `engine/attach_arbiter.rs`/`engine/mod.rs`'s Epic N-5
+    /// admission control). Before Epic N-5 this meant something narrower — a
+    /// *different* `session_id` was active at all, since the server only
+    /// ever served one logical session per target — but the wire reason is
+    /// reused as-is rather than adding a new variant.
     BusyOtherSession,
     /// This `session_id` has already completed its initial attach and moved
     /// to `Established` — a new round shouldn't be started for it, `RESUME`

@@ -74,7 +74,23 @@ impl AttachRuntime {
     /// `--max-idle-lifetime` monitor, mirroring `active.load(..)`'s old role
     /// (self-terminate only once nothing is attached/attaching/established).
     pub async fn is_vacant(&self) -> bool {
-        matches!(self.arbiter.lock().await.state(), AttachState::Vacant)
+        self.arbiter.lock().await.session_count() == 0
+    }
+
+    /// How many sessions currently hold a slot (connecting, pending, or
+    /// established/parked) — used by `engine/mod.rs`'s Epic N-5 admission
+    /// control to decide whether a brand-new `session_id` fits under
+    /// `--max-sessions` without needing to evict anything first.
+    pub async fn session_count(&self) -> usize {
+        self.arbiter.lock().await.session_count()
+    }
+
+    /// Whether `session_id` already holds a slot (of any kind) — a
+    /// retransmit or reattach of a session already known to the arbiter
+    /// never counts against the `--max-sessions` admission check, only a
+    /// genuinely new `session_id` does.
+    pub async fn has_session(&self, session_id: isekai_protocol::SessionId) -> bool {
+        self.arbiter.lock().await.has_session(session_id)
     }
 
     /// The lease currently backing `session_id`'s `Established` slot, if any
@@ -85,26 +101,8 @@ impl AttachRuntime {
     /// conflict, since the whole point of `RESUME` is that it already won
     /// its round).
     pub async fn established_lease_for(&self, session_id: isekai_protocol::SessionId) -> Option<LeaseId> {
-        match self.arbiter.lock().await.state() {
-            AttachState::Established { key, lease } if key.session_id == session_id => Some(*lease),
-            _ => None,
-        }
-    }
-
-    /// The `(session_id, lease)` currently occupying the `Established` slot,
-    /// if any — used by a fresh `ATTACH_HELLO` that just lost the fencing
-    /// race with `BusyOtherSession` to find out *whose* session is in the
-    /// way, so the caller (which alone has access to `SessionTable`, this
-    /// runtime deliberately doesn't) can attempt to preempt it if — and only
-    /// if — it turns out to be merely parked rather than actively relaying
-    /// (`engine/mod.rs`'s `handle_attach_stream`, per `ISEKAI_PIPE_DESIGN.md`
-    /// §8's parked-session-preemption design). A plain read: taking no lock
-    /// beyond the snapshot itself, so the answer can be stale by the time
-    /// the caller acts on it — that's fine, the actual eviction decision is
-    /// made atomically by `SessionTable::claim_parked`, not here.
-    pub async fn current_established(&self) -> Option<(isekai_protocol::SessionId, LeaseId)> {
-        match self.arbiter.lock().await.state() {
-            AttachState::Established { key, lease } => Some((key.session_id, *lease)),
+        match self.arbiter.lock().await.state_for(session_id) {
+            Some(AttachState::Established { lease, .. }) => Some(*lease),
             _ => None,
         }
     }
