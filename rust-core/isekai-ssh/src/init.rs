@@ -37,7 +37,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let target = parse_host_spec(&args.host)
         .with_context(|| format!("isekai-ssh: invalid host spec '{}'", args.host))?;
     let via = parse_via_chain(&target, &args.via)?;
-    let backend = crate::native::bootstrap_backend::default_bootstrap_backend(args.ssh_path.as_deref())?;
+    // `isekai-ssh init` is inherently a manual, interactive command — never silent.
+    let backend = crate::native::bootstrap_backend::default_bootstrap_backend(args.ssh_path.as_deref(), false)?;
 
     let helper_binary = crate::helper_download::resolve_helper_binary(
         args.helper_binary.as_deref(),

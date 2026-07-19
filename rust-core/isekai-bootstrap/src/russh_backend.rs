@@ -51,8 +51,8 @@ use isekai_protocol::bootstrap::{
 use isekai_trust::FileBackedHostKeyVerifier;
 use russh::client;
 use russh_stream_session::{
-    authenticate_session, connect_via_jump_or_direct, open_channel, verifying_handler, ConnectionLeg, Credential,
-    JumpHost, Session, SessionKind, VerifyingHandler,
+    authenticate_session, connect_via_jump_or_direct, open_channel, verifying_handler_with_reason, ConnectionLeg,
+    Credential, JumpHost, RejectionReason, Session, SessionKind, VerifyingHandler,
 };
 
 use crate::backend::BootstrapBackend;
@@ -108,6 +108,43 @@ impl RusshBackend {
     #[doc(hidden)]
     pub fn with_confirm_new_host(mut self, f: Arc<dyn Fn(&str) -> bool + Send + Sync>) -> Self {
         self.confirm_new_host = f;
+        self
+    }
+
+    /// Production API for `TofuConfirmation::Silent` callers
+    /// (`bootstrap_and_register`'s stale-trust auto-recovery / `doctor
+    /// --fix` re-deploy): any never-before-seen host key is refused
+    /// immediately, without ever touching stdin. Unlike
+    /// [`with_confirm_new_host`](Self::with_confirm_new_host) (test-only,
+    /// arbitrary fixed answer), this is meant to be installed in real
+    /// production code — `native::bootstrap_backend::default_bootstrap_backend`
+    /// installs it whenever its `silent` argument is true.
+    ///
+    /// This exists because `TofuConfirmation::Silent` promises "no
+    /// confirmation needed" (the app-level trust-registration prompt is
+    /// skipped because the profile was already trusted once), but that
+    /// promise doesn't reach this *separate*, SSH-protocol-layer host-key
+    /// check on its own — [`prompt_new_host_confirmation`]'s doc comment
+    /// explains why that function can't infer "silent" from stdin being a
+    /// non-terminal (a real regression: it would also refuse the
+    /// legitimate piped answers `TofuConfirmation::AlwaysPrompt` callers
+    /// use). A refused-but-genuinely-unknown key here means the profile's
+    /// SSH-layer trust is out of sync with its app-layer trust (e.g. the
+    /// profile was copied to a different machine, or `known_ssh_hosts.toml`
+    /// was deleted) — failing fast with a clear message is the correct
+    /// `always-connects.md` behavior (never hang, never silently
+    /// auto-accept an unverified key), pointing the user at the one
+    /// genuinely-unautomatable step (`isekai-ssh init`/`doctor --fix` run
+    /// interactively once).
+    pub fn with_unattended_new_host_policy(mut self) -> Self {
+        self.confirm_new_host = Arc::new(|fingerprint| {
+            eprintln!(
+                "isekai-ssh: unknown SSH host key (fingerprint {fingerprint}) in a silent/automated \
+                 context — refusing without prompting. Run `isekai-ssh init`/`doctor --fix` from an \
+                 interactive terminal once to confirm it."
+            );
+            false
+        });
         self
     }
 
@@ -255,8 +292,15 @@ impl RusshBackend {
         // future change to that function's internal connection sequence
         // (a retry, a probe) can't silently pair a host with the wrong
         // trust-store entry.
+        // Shared by both legs — safe because they connect sequentially, never
+        // concurrently, so only one `verify` call is ever pending at a time.
+        // The reason text itself already names the specific `host_port` that
+        // rejected (each leg's `FileBackedHostKeyVerifier` was constructed
+        // with its own), so a single slot doesn't lose which leg failed.
+        let rejection = RejectionReason::new();
         let jump_verifier_for_closure = jump.as_ref().map(|(_, v)| v.clone());
         let target_verifier_for_closure = target_verifier.clone();
+        let rejection_for_closure = rejection.clone();
         let new_handler = move |leg| {
             let verifier = match leg {
                 ConnectionLeg::Jump => jump_verifier_for_closure
@@ -264,7 +308,7 @@ impl RusshBackend {
                     .expect("connect_via_jump_or_direct only builds a Jump leg when a JumpHost was passed"),
                 ConnectionLeg::Target => target_verifier_for_closure.clone(),
             };
-            verifying_handler(&verifier)
+            verifying_handler_with_reason(&verifier, &rejection_for_closure)
         };
 
         let jump_host = jump.as_ref().map(|(jh, _)| jh);
@@ -275,7 +319,11 @@ impl RusshBackend {
             target_resolved.port,
             new_handler,
         )
-        .await?;
+        .await
+        .map_err(|source| match rejection.take() {
+            Some(reason) => BootstrapError::HostKeyRejected { reason, source },
+            None => BootstrapError::Session(source),
+        })?;
 
         // `JumpHost::credential` is only ever consulted internally by
         // `connect_via_jump_or_direct` while it's in scope above — safe to
@@ -422,33 +470,19 @@ fn identity_paths_display(paths: &[PathBuf]) -> String {
 /// `FileBackedHostKeyVerifier::verify`'s docs), so a plain blocking stdin
 /// read is safe here.
 ///
-/// Refuses outright (no prompt at all) when stdin isn't a real terminal —
-/// mirrors `ssh(1)`'s `BatchMode=yes` behavior. `bootstrap_and_register`'s
-/// `TofuConfirmation::Silent` callers (`doctor --fix`/stale-trust
-/// auto-recovery) promise no interaction is needed, but that promise never
-/// reached this *separate* SSH-layer host-key confirmation — without this
-/// guard, a caller whose stdin is a pipe that's never closed (unlike
-/// `Stdio::null()`, which hits EOF and declines immediately) would block
-/// forever here, silently violating `always-connects.md`.
+/// This is the `RusshBackend::new()` (interactive) default — deliberately
+/// does **not** gate on `std::io::IsTerminal` (a real Windows CI regression:
+/// an earlier version of this guard refused *any* non-tty stdin, which broke
+/// the legitimate pattern of piping a real answer to this prompt — every
+/// e2e test, and any real non-interactive-terminal automation, answers it
+/// that way; a piped stdin is never a terminal even when something on the
+/// other end genuinely is answering it). Callers that need a genuine
+/// never-prompt guarantee (`bootstrap_and_register`'s
+/// `TofuConfirmation::Silent` re-deploy) install
+/// [`with_unattended_new_host_policy`](RusshBackend::with_unattended_new_host_policy)
+/// instead of relying on this function to infer silence from stdin.
 fn prompt_new_host_confirmation(fingerprint: &str) -> bool {
-    use std::io::IsTerminal as _;
-    prompt_new_host_confirmation_inner(fingerprint, std::io::stdin().is_terminal())
-}
-
-/// The `stdin_is_terminal`-injectable core of [`prompt_new_host_confirmation`]
-/// — see `isekai-ssh::native::connect`'s identically-shaped sibling function
-/// for why this split exists (unit-testable non-interactive refusal without
-/// a real terminal).
-fn prompt_new_host_confirmation_inner(fingerprint: &str, stdin_is_terminal: bool) -> bool {
     use std::io::Write as _;
-    if !stdin_is_terminal {
-        eprintln!(
-            "isekai-ssh: unknown SSH host key for the bootstrap host (fingerprint {fingerprint}) — \
-             refusing to prompt in a non-interactive session. Run `isekai-ssh init`/`doctor --fix` \
-             from an interactive terminal once to confirm it."
-        );
-        return false;
-    }
     eprint!(
         "The authenticity of the bootstrap host can't be established.\n\
          Key fingerprint is {fingerprint}.\n\
@@ -867,15 +901,20 @@ impl BootstrapBackend for RusshBackend {
 mod tests {
     use super::*;
 
-    #[test]
-    fn prompt_new_host_confirmation_refuses_without_a_terminal() {
+    #[tokio::test]
+    async fn with_unattended_new_host_policy_declines_without_blocking() {
         // Regression test for the always-connects.md gap a real Windows CI
         // run surfaced: a `TofuConfirmation::Silent` caller (doctor --fix /
-        // stale-trust auto-recovery) must never block on this prompt. This
-        // only exercises the non-interactive early-return — reaching the
-        // interactive branch would block on the real `std::io::stdin()`, so
-        // it isn't (and can't cheaply be) unit-tested here.
-        assert!(!prompt_new_host_confirmation_inner("SHA256:deadbeef", false));
+        // stale-trust auto-recovery) must never block waiting on stdin. This
+        // confirms the *production* silent policy — installed by
+        // `native::bootstrap_backend::default_bootstrap_backend` when
+        // `silent` is true — declines immediately and never touches stdin
+        // (unlike the never-checked-in `IsTerminal`-gated version of this
+        // fix, which incorrectly refused legitimate piped answers too; see
+        // `prompt_new_host_confirmation`'s doc comment).
+        let backend = RusshBackend { store_path: PathBuf::new(), confirm_new_host: Arc::new(|_| panic!("must not be reached")), identity_file_override: None }
+            .with_unattended_new_host_policy();
+        assert!(!(backend.confirm_new_host)("SHA256:deadbeef"));
     }
 
     #[test]
@@ -947,7 +986,7 @@ mod tests {
     use russh::{Channel as RusshChannel, ChannelId, CryptoVec};
     use russh_keys::ssh_key::private::Ed25519Keypair;
     use russh_keys::PrivateKey;
-    use russh_stream_session::HostKeyVerifier;
+    use russh_stream_session::{verifying_handler, HostKeyVerifier, VerifyOutcome};
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
@@ -955,8 +994,8 @@ mod tests {
 
     #[async_trait]
     impl HostKeyVerifier for AcceptAllHostKeys {
-        async fn verify(&self, _fingerprint: &str) -> bool {
-            true
+        async fn verify(&self, _fingerprint: &str) -> VerifyOutcome {
+            VerifyOutcome::Accepted
         }
     }
 

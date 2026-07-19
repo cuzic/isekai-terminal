@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use russh_stream_session::HostKeyVerifier;
+use russh_stream_session::{HostKeyVerifier, VerifyOutcome};
 
 /// `isekai-ssh`'s host-key verifier: [`isekai_trust::FileBackedHostKeyVerifier`]
 /// with this path's `log_context` baked in.
@@ -35,7 +35,7 @@ impl FileBackedHostKeyVerifier {
 
 #[async_trait]
 impl HostKeyVerifier for FileBackedHostKeyVerifier {
-    async fn verify(&self, fingerprint: &str) -> bool {
+    async fn verify(&self, fingerprint: &str) -> VerifyOutcome {
         self.0.verify(fingerprint).await
     }
 }

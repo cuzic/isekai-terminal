@@ -41,8 +41,8 @@ use async_trait::async_trait;
 use isekai_pipe_core::{claim_connect_outcome, default_runtime_dir, ConnectionIntent};
 use russh::client;
 use russh_stream_session::{
-    authenticate_session, establish_over_stream, open_channel, verifying_handler_with_routes, ForwardRoutes, SessionError,
-    SessionKind,
+    authenticate_session, establish_over_stream, open_channel, verifying_handler_with_routes_and_reason, ForwardRoutes,
+    RejectionReason, SessionError, SessionKind,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -432,7 +432,8 @@ async fn run_authenticated_session(
     // foreground shell and (via the owner hook) every mux client's per-tab
     // forward. Built before the handshake so it can be installed on the handler.
     let forward_routes = ForwardRoutes::new();
-    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier, &forward_routes)
+    let rejection = RejectionReason::new();
+    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier, &forward_routes, &rejection)
         .await
         .with_context(|| format!("isekai-ssh: failed to connect to {username}@{host_port}"))?;
 
@@ -528,36 +529,22 @@ fn local_username() -> Option<String> {
 /// `host_key_trust.rs::verify`'s docs), so a plain blocking stdin read is
 /// safe here.
 ///
-/// Refuses outright (no prompt at all) when stdin isn't a real terminal —
-/// mirrors `ssh(1)`'s `BatchMode=yes` behavior. Without this, a
-/// `TofuConfirmation::Silent` caller (`doctor --fix`/stale-trust
-/// auto-recovery) whose stdin is a pipe that's never closed (as opposed to
-/// `Stdio::null()`, which hits EOF and declines immediately) would block
-/// forever on this `read_line` — silently violating `always-connects.md`'s
-/// promise that those paths need no interaction (a real Windows CI run
-/// caught this only because the test's stdin *did* reach EOF; a live but
-/// silent caller wouldn't).
+/// Deliberately does **not** gate on `std::io::IsTerminal` (a real Windows
+/// CI regression: an earlier version of this guard refused *any* non-tty
+/// stdin, which broke every e2e test's — and any real non-interactive
+/// automation's — legitimate pattern of piping a real answer to this
+/// prompt, since a piped stdin is never a terminal even when something on
+/// the other end genuinely is answering it). This function is only ever
+/// reached in contexts `always-connects.md` already documents as exempt
+/// (a genuinely new host key needs a human) — the caller that actually
+/// needs a non-interactive, never-prompt guarantee
+/// (`TofuConfirmation::Silent`'s `bootstrap_and_register` re-deploy) gets
+/// it further down the stack, via
+/// `isekai_bootstrap::RusshBackend::with_unattended_new_host_policy`
+/// (installed by `native::bootstrap_backend::default_bootstrap_backend`
+/// when `silent` is true), not by refusing to read stdin here.
 fn prompt_new_host_confirmation(host_port: &str, fingerprint: &str) -> bool {
-    use std::io::IsTerminal as _;
-    prompt_new_host_confirmation_inner(host_port, fingerprint, std::io::stdin().is_terminal())
-}
-
-/// The `stdin_is_terminal`-injectable core of [`prompt_new_host_confirmation`],
-/// split out so the non-interactive refusal path is unit-testable without a
-/// real terminal (the interactive branch still isn't — it always re-reads
-/// the real `std::io::stdin()` when reached, matching how this codebase's
-/// other interactive-stdin functions are tested only via e2e subprocess
-/// harnesses, not unit tests).
-fn prompt_new_host_confirmation_inner(host_port: &str, fingerprint: &str, stdin_is_terminal: bool) -> bool {
     use std::io::Write as _;
-    if !stdin_is_terminal {
-        eprintln!(
-            "isekai-ssh: unknown SSH host key for {host_port:?} (fingerprint {fingerprint}) — \
-             refusing to prompt in a non-interactive session. Run this connection from an \
-             interactive terminal once to confirm the new host key."
-        );
-        return false;
-    }
     eprint!(
         "The authenticity of host '{host_port}' can't be established.\n\
          Key fingerprint is {fingerprint}.\n\
@@ -599,6 +586,7 @@ async fn connect_and_authenticate<S, V>(
     host_config: &openssh_config::HostConfig,
     verifier: &Arc<V>,
     forward_routes: &ForwardRoutes,
+    rejection: &RejectionReason,
 ) -> Result<client::Handle<russh_stream_session::VerifyingHandler<V>>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -608,9 +596,18 @@ where
     // Install the ctl-socket route table on the handler so server-initiated
     // `forwarded-streamlocal` channels (from `streamlocal_forward` below) are
     // delivered in-process. Harmless (and unused) when ctl-socket is off — no
-    // forward is ever requested, so no channel is ever routed.
-    let handler = verifying_handler_with_routes(verifier, forward_routes);
-    let mut handle = establish_over_stream(config, stream, handler).await?;
+    // forward is ever requested, so no channel is ever routed. Also installs
+    // `rejection` so a host-key rejection's reason (a plain `bool` alone
+    // can't carry — see `RejectionReason`'s docs) survives past this
+    // function's `?` into the caller's error context.
+    let handler = verifying_handler_with_routes_and_reason(verifier, forward_routes, rejection);
+    let mut handle = establish_over_stream(config, stream, handler).await.map_err(|e| {
+        let base = anyhow::Error::from(e);
+        match rejection.take() {
+            Some(reason) => base.context(reason),
+            None => base,
+        }
+    })?;
 
     let home = isekai_fs_guard::resolve_home_dir().unwrap_or_else(|| PathBuf::from("."));
     let candidates = private_key::identity_file_candidates(&host_config.identity_file, &home);
@@ -782,34 +779,23 @@ mod tests {
     use russh::{Channel as RusshChannel, CryptoVec};
     use russh_keys::ssh_key::private::{Ed25519Keypair, PrivateKey as SshPrivateKey};
     use russh_keys::ssh_key::{LineEnding, PublicKey as SshPublicKey};
-    use russh_stream_session::{verifying_handler, Credential, HostKeyVerifier};
+    use russh_stream_session::{verifying_handler, Credential, HostKeyVerifier, VerifyOutcome};
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
-
-    #[test]
-    fn prompt_new_host_confirmation_refuses_without_a_terminal() {
-        // Regression test for the always-connects.md gap a real Windows CI
-        // run surfaced: a `TofuConfirmation::Silent` caller (doctor --fix /
-        // stale-trust auto-recovery) must never block on this prompt. This
-        // only exercises the non-interactive early-return — reaching the
-        // interactive branch would block on the real `std::io::stdin()`, so
-        // it isn't (and can't cheaply be) unit-tested here.
-        assert!(!prompt_new_host_confirmation_inner("host:22", "SHA256:deadbeef", false));
-    }
 
     struct AcceptAllHostKeys;
     #[async_trait]
     impl HostKeyVerifier for AcceptAllHostKeys {
-        async fn verify(&self, _fingerprint: &str) -> bool {
-            true
+        async fn verify(&self, _fingerprint: &str) -> VerifyOutcome {
+            VerifyOutcome::Accepted
         }
     }
 
     struct RejectAllHostKeys;
     #[async_trait]
     impl HostKeyVerifier for RejectAllHostKeys {
-        async fn verify(&self, _fingerprint: &str) -> bool {
-            false
+        async fn verify(&self, _fingerprint: &str) -> VerifyOutcome {
+            VerifyOutcome::Rejected("rejected by test double".to_string())
         }
     }
 
@@ -1019,7 +1005,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await;
         assert!(result.is_err(), "no identity file and no agent means nothing to authenticate with");
     }
 
@@ -1030,8 +1016,17 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
-        assert!(result.is_err(), "a rejected host key must fail the connection before any auth attempt");
+        let Err(err) = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await
+        else {
+            panic!("a rejected host key must fail the connection before any auth attempt");
+        };
+        // Regression test for the always-connects-review error-UX fix: the
+        // verifier's rejection reason (not just a bare "Unknown server key"
+        // from russh) must reach the top-level error chain.
+        assert!(
+            format!("{err:#}").contains("rejected by test double"),
+            "expected the verifier's rejection reason in the error chain, got: {err:#}"
+        );
     }
 
     /// Codex review finding: `run_shell_io_loop` used to initialize
@@ -1130,7 +1125,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, second_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await;
         assert!(
             result.is_ok(),
             "the second configured identity is accepted, so the connection must succeed despite the first being rejected"
@@ -1155,7 +1150,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![garbage, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await;
         assert!(result.is_ok(), "an unparseable first identity (InvalidPrivateKey) must not block the valid second one");
     }
 
@@ -1178,7 +1173,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, unreadable], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await;
         assert!(
             result.is_ok(),
             "a readable, accepted first key must authenticate; an unreadable *later* candidate must not abort the attempt"
@@ -1199,7 +1194,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![unreadable, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &RejectionReason::new()).await;
         assert!(result.is_ok(), "an unreadable first candidate must be skipped, then the valid second one authenticates");
     }
 

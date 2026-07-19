@@ -170,7 +170,7 @@ mod tests {
     use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
     use russh::Channel as RusshChannel;
     use russh_keys::ssh_key::private::{Ed25519Keypair, PrivateKey};
-    use russh_stream_session::{verifying_handler, HostKeyVerifier};
+    use russh_stream_session::{verifying_handler, HostKeyVerifier, VerifyOutcome};
     use signature::Signer as _;
     use ssh_encoding::Encode;
     use std::net::SocketAddr;
@@ -253,8 +253,8 @@ mod tests {
     struct AcceptAllHostKeys;
     #[async_trait]
     impl HostKeyVerifier for AcceptAllHostKeys {
-        async fn verify(&self, _fingerprint: &str) -> bool {
-            true
+        async fn verify(&self, _fingerprint: &str) -> VerifyOutcome {
+            VerifyOutcome::Accepted
         }
     }
 

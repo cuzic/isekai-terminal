@@ -32,13 +32,25 @@
   `known_hosts`と同じセキュリティ姿勢)。正当な変更だとユーザーが確認できた場合のみ、
   `~/.config/isekai-ssh/known_ssh_hosts.toml`の該当`"host:port"`エントリを手動削除
   して再接続し、初回TOFU確認をやり直す。
-- 上記の「初回TOFU確認は例外」は、確認プロンプト自体が**対話端末でのみ**出ることが
-  前提。`TofuConfirmation::Silent`(`doctor --fix`/stale-trust自動復旧)経路で、SSH
-  ホスト鍵レベルのTOFU確認(`isekai-ssh::native::connect::prompt_new_host_confirmation`・
-  `isekai-bootstrap::russh_backend::prompt_new_host_confirmation`)に非対話ガード
-  (`std::io::IsTerminal`)が無いと、stdinが閉じずに応答も来ないコンテキストで
-  無期限ブロックし、原則違反になる(2026-07-19、実機Windows CIで一度発覚)。新しい
-  対話的確認を追加するときは、必ず非対話時に即fail/即エラーで返すガードを入れる。
+- 上記の「初回TOFU確認は例外」は、`TofuConfirmation::AlwaysPrompt`経路(`isekai-ssh
+  init`・未登録ホストへのinline auto-bootstrap)にのみ適用される——`TofuConfirmation::
+  Silent`(`doctor --fix`/stale-trust自動復旧)経路では、SSHホスト鍵レベルのTOFU確認
+  (`isekai-bootstrap::russh_backend::prompt_new_host_confirmation`)も含めて一切
+  対話プロンプトを出してはならない。
+  - **`std::io::IsTerminal`でこれを判定してはいけない**(2026-07-19、実機Windows CIで
+    実際に踏んだ失敗): 非tty stdinを一律拒否するガードは、e2eテストや実運用の
+    自動化スクリプトがpipe経由で正当な回答("yes\ny\n"等)を流し込む
+    `TofuConfirmation::AlwaysPrompt`の対話フローまで巻き添えで拒否してしまう
+    (pipeは「回答が来る」場合も「何も来ない」場合も等しく非terminalなので、
+    isattyでは区別できない)。
+  - 正しい実装は、呼び出し元が`TofuConfirmation`から明示的に「対話してよいか」を
+    判定してから、Silent時だけ非対話ポリシーを注入すること
+    (`isekai_bootstrap::RusshBackend::with_unattended_new_host_policy`を
+    `native::bootstrap_backend::default_bootstrap_backend`の`silent`引数経由で
+    インストールする、が参照実装)。stdinの実体を覗いて判定するのではなく、
+    呼び出し元の意図(`TofuConfirmation`)を素通しする——`rust-ssot.md`と同じ
+    「判定ロジックを一箇所に集約し、下流でstateを覗き見しない」原則がここにも
+    当てはまる。
 
 ## 理由
 
@@ -64,5 +76,9 @@
 - `isekai-trust/src/host_key_verifier.rs`: `FileBackedHostKeyVerifier`(既知一致は
   サイレント通過、mismatchはサイレント拒否、未知のみ`confirm_new_host`を呼ぶ)
 - `isekai-ssh/src/native/connect.rs` / `isekai-bootstrap/src/russh_backend.rs`:
-  `prompt_new_host_confirmation`(`IsTerminal`で非対話セッションを即拒否する
-  ガード付き、native/Windows経路のSSHホスト鍵TOFU)
+  `prompt_new_host_confirmation`(native/Windows経路のSSHホスト鍵TOFU、常に
+  対話的 — Silent文脈からは呼ばれない設計)
+- `isekai-bootstrap/src/russh_backend.rs`: `RusshBackend::with_unattended_new_host_policy`
+  (production向けの非対話ポリシー、`TofuConfirmation::Silent`時のみ注入)
+- `isekai-ssh/src/native/bootstrap_backend.rs`: `default_bootstrap_backend`の
+  `silent`引数(`TofuConfirmation`から非対話ポリシーの要否を判定する唯一の場所)

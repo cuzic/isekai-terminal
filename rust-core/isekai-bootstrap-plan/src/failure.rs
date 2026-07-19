@@ -177,6 +177,13 @@ pub fn classify_bootstrap_error(err: &isekai_bootstrap::BootstrapError) -> Optio
         // comment describes.
         E::NoUsername { .. } | E::NoCredential { .. } | E::NoHomeDir => Some(BootstrapFailure::AuthenticationRequired),
         E::Session(session_err) => classify_session_error(session_err),
+        // The verifier's own rejection (`FileBackedHostKeyVerifier` via
+        // `RejectionReason`) — a strictly more precise signal than sniffing
+        // `SessionError`/`russh::Error::UnknownKey` the way
+        // `classify_session_error` still does for the (now effectively
+        // legacy, but harmless to keep as a fallback) plain `Session`
+        // variant. Same trust-decision bucket either way.
+        E::HostKeyRejected { .. } => Some(BootstrapFailure::HostKeyRejected),
     }
 }
 

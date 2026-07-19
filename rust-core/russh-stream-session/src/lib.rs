@@ -49,13 +49,56 @@ pub enum SessionError {
     AgentAuth(russh::AgentAuthError),
 }
 
+/// The result of a [`HostKeyVerifier::verify`] call. Unlike a plain `bool`,
+/// a rejection carries a human-readable reason — `VerifyingHandler` stores it
+/// in a caller-supplied [`RejectionReason`] slot, since `check_server_key`'s
+/// `Result<bool, russh::Error>` return has no room for one (`russh::Error` is
+/// a closed enum with no caller-message-carrying variant).
+#[derive(Debug, Clone)]
+pub enum VerifyOutcome {
+    Accepted,
+    Rejected(String),
+}
+
 /// Verifies a server's host-key fingerprint (SHA-256, as produced by
-/// `PublicKey::fingerprint(HashAlg::Sha256)`). Return `true` to accept the
-/// connection, `false` to abort the handshake. Implementations typically
+/// `PublicKey::fingerprint(HashAlg::Sha256)`). Implementations typically
 /// consult a trust-on-first-use store and/or prompt the user.
 #[async_trait]
 pub trait HostKeyVerifier: Send + Sync {
-    async fn verify(&self, fingerprint: &str) -> bool;
+    async fn verify(&self, fingerprint: &str) -> VerifyOutcome;
+}
+
+/// A shared slot a caller can inspect *after* a handshake fails, to recover
+/// the human-readable reason a [`HostKeyVerifier::verify`] rejection carried
+/// — see [`VerifyOutcome`]'s docs for why this indirection exists instead of
+/// threading the reason through `check_server_key`'s return type directly.
+///
+/// Follows the same `Arc`-backed, `Clone`-shares-state shape as
+/// [`ForwardRoutes`]: construct one, pass `&reason` into
+/// [`verifying_handler_with_reason`]/[`verifying_handler_with_routes_and_reason`],
+/// and keep your own clone to call [`take`](Self::take) on once the
+/// handshake has failed — the clone installed inside the (otherwise
+/// unreachable, once handed to `new_handler`) handler and the clone the
+/// caller kept refer to the same slot.
+#[derive(Clone, Default)]
+pub struct RejectionReason(Arc<Mutex<Option<String>>>);
+
+impl RejectionReason {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn set(&self, reason: String) {
+        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
+    }
+
+    /// Takes (and clears) the last recorded rejection reason, if any. `None`
+    /// if no `verify` call on this slot's handler ever rejected — e.g. the
+    /// handshake failed for an unrelated reason (network error, auth
+    /// failure past the host-key step).
+    pub fn take(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+    }
 }
 
 /// Authentication material for one `authenticate_session` call. Callers are
@@ -203,6 +246,7 @@ impl ForwardRoutes {
 pub struct VerifyingHandler<V> {
     verifier: Arc<V>,
     forward_routes: Option<ForwardRoutes>,
+    rejection: Option<RejectionReason>,
 }
 
 #[async_trait]
@@ -211,7 +255,15 @@ impl<V: HostKeyVerifier + 'static> client::Handler for VerifyingHandler<V> {
 
     async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
         let fingerprint = server_public_key.fingerprint(HashAlg::Sha256).to_string();
-        Ok(self.verifier.verify(&fingerprint).await)
+        match self.verifier.verify(&fingerprint).await {
+            VerifyOutcome::Accepted => Ok(true),
+            VerifyOutcome::Rejected(reason) => {
+                if let Some(slot) = &self.rejection {
+                    slot.set(reason);
+                }
+                Ok(false)
+            }
+        }
     }
 
     /// The server opened a channel for a new connection to a remote socket
@@ -326,7 +378,7 @@ where
 /// (no agent forwarding, no remote forwards). `verifier` is cloned once per
 /// call (cheap: it's an `Arc`).
 pub fn verifying_handler<V: HostKeyVerifier + 'static>(verifier: &Arc<V>) -> VerifyingHandler<V> {
-    VerifyingHandler { verifier: verifier.clone(), forward_routes: None }
+    VerifyingHandler { verifier: verifier.clone(), forward_routes: None, rejection: None }
 }
 
 /// Like [`verifying_handler`], but also installs `routes` so that
@@ -339,7 +391,29 @@ pub fn verifying_handler_with_routes<V: HostKeyVerifier + 'static>(
     verifier: &Arc<V>,
     routes: &ForwardRoutes,
 ) -> VerifyingHandler<V> {
-    VerifyingHandler { verifier: verifier.clone(), forward_routes: Some(routes.clone()) }
+    VerifyingHandler { verifier: verifier.clone(), forward_routes: Some(routes.clone()), rejection: None }
+}
+
+/// Like [`verifying_handler`], but also installs `reason` so a caller can
+/// recover a rejected [`VerifyOutcome`]'s human-readable message after the
+/// handshake fails — see [`RejectionReason`]'s docs.
+pub fn verifying_handler_with_reason<V: HostKeyVerifier + 'static>(
+    verifier: &Arc<V>,
+    reason: &RejectionReason,
+) -> VerifyingHandler<V> {
+    VerifyingHandler { verifier: verifier.clone(), forward_routes: None, rejection: Some(reason.clone()) }
+}
+
+/// Combines [`verifying_handler_with_routes`] and
+/// [`verifying_handler_with_reason`] for callers that need both (e.g. the
+/// day-to-day native connect path, which routes ctl-socket forwards *and*
+/// wants a host-key-rejection reason for its top-level error).
+pub fn verifying_handler_with_routes_and_reason<V: HostKeyVerifier + 'static>(
+    verifier: &Arc<V>,
+    routes: &ForwardRoutes,
+    reason: &RejectionReason,
+) -> VerifyingHandler<V> {
+    VerifyingHandler { verifier: verifier.clone(), forward_routes: Some(routes.clone()), rejection: Some(reason.clone()) }
 }
 
 /// Authenticates `session` as `username` using `credential`. `Ok(false)`
@@ -430,8 +504,8 @@ mod tests {
 
     #[async_trait]
     impl HostKeyVerifier for AcceptAllHostKeys {
-        async fn verify(&self, _fingerprint: &str) -> bool {
-            true
+        async fn verify(&self, _fingerprint: &str) -> VerifyOutcome {
+            VerifyOutcome::Accepted
         }
     }
 
@@ -690,8 +764,8 @@ mod tests {
 
     #[async_trait]
     impl HostKeyVerifier for RejectAllHostKeys {
-        async fn verify(&self, _fingerprint: &str) -> bool {
-            false
+        async fn verify(&self, _fingerprint: &str) -> VerifyOutcome {
+            VerifyOutcome::Rejected("rejected by test double".to_string())
         }
     }
 

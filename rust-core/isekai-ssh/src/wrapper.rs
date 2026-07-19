@@ -830,7 +830,10 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
     // found by `Command::new("ssh")`'s bare-name resolution (only `.exe` is
     // implicit), so an explicit path is the only way either call site can
     // ever reach it.
-    let backend = crate::native::bootstrap_backend::default_bootstrap_backend(Some(&plan.openssh_path))?;
+    let backend = crate::native::bootstrap_backend::default_bootstrap_backend(
+        Some(&plan.openssh_path),
+        matches!(confirmation, TofuConfirmation::Silent),
+    )?;
     let helper_binary_was_explicit = plan.isekai.helper_binary.is_some();
     let helper_binary = crate::helper_download::resolve_helper_binary(
         plan.isekai.helper_binary.as_deref(),

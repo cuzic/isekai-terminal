@@ -63,14 +63,29 @@ impl NativeBootstrapBackend for RusshBackend {
 /// bootstrap path back has no escape hatch here (matches `main.rs`'s own
 /// `cfg(windows)` dispatch for the regular connect path: Windows never
 /// shells out to `ssh.exe`, full stop).
-pub(crate) fn default_bootstrap_backend(ssh_path_override: Option<&Path>) -> Result<Box<dyn NativeBootstrapBackend>> {
+///
+/// `silent` mirrors the caller's `TofuConfirmation` — pass `true` only for a
+/// `TofuConfirmation::Silent` caller (`bootstrap_and_register`'s stale-trust
+/// auto-recovery / `doctor --fix` re-deploy), `false` for an interactive
+/// `TofuConfirmation::AlwaysPrompt` caller (`isekai-ssh init`, inline
+/// first-contact auto-bootstrap). On Windows this installs
+/// `RusshBackend::with_unattended_new_host_policy` — see that method's docs
+/// for why a *separate* SSH-layer host-key TOFU needs this even though
+/// `TofuConfirmation::Silent` already skips the app-level trust-registration
+/// prompt. `OpenSshBackend` has no equivalent knob (pre-existing, symmetric
+/// limitation shared with Unix — not addressed here, see the
+/// always-connects review notes).
+pub(crate) fn default_bootstrap_backend(ssh_path_override: Option<&Path>, silent: bool) -> Result<Box<dyn NativeBootstrapBackend>> {
     #[cfg(windows)]
     {
         let _ = ssh_path_override;
-        Ok(Box::new(RusshBackend::new()?))
+        let backend = RusshBackend::new()?;
+        let backend = if silent { backend.with_unattended_new_host_policy() } else { backend };
+        Ok(Box::new(backend))
     }
     #[cfg(not(windows))]
     {
+        let _ = silent;
         let backend = match ssh_path_override {
             Some(path) => OpenSshBackend::new().with_ssh_program(path.to_string_lossy().into_owned()),
             None => OpenSshBackend::new(),

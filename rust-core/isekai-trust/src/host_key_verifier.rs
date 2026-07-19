@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use russh_stream_session::HostKeyVerifier;
+use russh_stream_session::{HostKeyVerifier, VerifyOutcome};
 
 use crate::SshHostKeyTrust;
 
@@ -61,26 +61,27 @@ enum Resolved {
     /// Final answer, no user interaction needed (already trusted+matching,
     /// or a mismatch — both are decided without ever consulting
     /// `confirm_new_host`).
-    Decided(bool),
+    Decided(VerifyOutcome),
     /// Never seen before; caller must consult `confirm_new_host` and, if
     /// confirmed, call [`FileBackedHostKeyVerifier::resolve_locked`] again
     /// with `insert_if_unknown: true`.
     NeedsConfirmation,
     /// Lock/IO error, or the blocking task itself panicked — callers treat
-    /// this as a hard reject (fail closed).
-    Failed,
+    /// this as a hard reject (fail closed). Carries the reason so `verify`
+    /// doesn't have to reconstruct it.
+    Failed(String),
 }
 
 #[async_trait]
 impl HostKeyVerifier for FileBackedHostKeyVerifier {
-    async fn verify(&self, fingerprint: &str) -> bool {
+    async fn verify(&self, fingerprint: &str) -> VerifyOutcome {
         // Phase 1 (locked, no user interaction): resolves "already trusted"
         // and "mismatch" outright, without ever calling `confirm_new_host`
         // while holding the store lock.
         match self.resolve_locked(fingerprint, false).await {
-            Resolved::Decided(accepted) => return accepted,
+            Resolved::Decided(outcome) => return outcome,
             Resolved::NeedsConfirmation => {}
-            Resolved::Failed => return false,
+            Resolved::Failed(reason) => return VerifyOutcome::Rejected(reason),
         }
 
         // Outside any lock: ask the (possibly slow/interactive) confirmation
@@ -92,15 +93,19 @@ impl HostKeyVerifier for FileBackedHostKeyVerifier {
         let confirm_new_host = self.confirm_new_host.clone();
         let fingerprint_owned = fingerprint.to_string();
         let log_context = self.log_context;
+        let host_port = self.host_port.clone();
         let confirmed = match tokio::task::spawn_blocking(move || confirm_new_host(&fingerprint_owned)).await {
             Ok(confirmed) => confirmed,
             Err(join_error) => {
-                log::error!("{log_context}: SSH host key confirmation task panicked, rejecting connection: {join_error}");
-                return false;
+                let reason = format!("{log_context}: SSH host key confirmation task panicked, rejecting connection: {join_error}");
+                log::error!("{reason}");
+                return VerifyOutcome::Rejected(reason);
             }
         };
         if !confirmed {
-            return false;
+            return VerifyOutcome::Rejected(format!(
+                "{log_context}: unknown SSH host key for {host_port:?} — connection declined."
+            ));
         }
 
         // Phase 2 (locked again): re-resolve from scratch rather than
@@ -112,9 +117,9 @@ impl HostKeyVerifier for FileBackedHostKeyVerifier {
         // `insert_if_unknown: true` means if it's *still* genuinely unknown,
         // this call is the one that persists our now-confirmed trust.
         match self.resolve_locked(fingerprint, true).await {
-            Resolved::Decided(accepted) => accepted,
+            Resolved::Decided(outcome) => outcome,
             Resolved::NeedsConfirmation => unreachable!("insert_if_unknown: true never returns NeedsConfirmation"),
-            Resolved::Failed => false,
+            Resolved::Failed(reason) => VerifyOutcome::Rejected(reason),
         }
     }
 }
@@ -142,17 +147,18 @@ impl FileBackedHostKeyVerifier {
                         let mut updated = known.clone();
                         updated.last_seen_at = now_rfc3339();
                         store.insert(host_port.clone(), updated);
-                        Ok(Resolved::Decided(true))
+                        Ok(Resolved::Decided(VerifyOutcome::Accepted))
                     }
                     Some(known) => {
-                        log::error!(
+                        let reason = format!(
                             "{log_context}: host key for {host_port} changed (trusted {}, saw {fingerprint}) \
                              — refusing to connect. If this change is expected (e.g. you redeployed), \
                              remove the \"{host_port}\" entry from {} and reconnect.",
                             known.fingerprint,
                             store_path.display(),
                         );
-                        Ok(Resolved::Decided(false))
+                        log::error!("{reason}");
+                        Ok(Resolved::Decided(VerifyOutcome::Rejected(reason)))
                     }
                     None if insert_if_unknown => {
                         let now = now_rfc3339();
@@ -160,7 +166,7 @@ impl FileBackedHostKeyVerifier {
                             host_port.clone(),
                             SshHostKeyTrust { fingerprint: fingerprint.clone(), trusted_at: now.clone(), last_seen_at: now },
                         );
-                        Ok(Resolved::Decided(true))
+                        Ok(Resolved::Decided(VerifyOutcome::Accepted))
                     }
                     None => Ok(Resolved::NeedsConfirmation),
                 }
@@ -171,12 +177,14 @@ impl FileBackedHostKeyVerifier {
         match outcome {
             Ok(Ok(resolved)) => resolved,
             Ok(Err(e)) => {
-                log::error!("{log_context}: SSH host key trust store operation failed, rejecting connection: {e}");
-                Resolved::Failed
+                let reason = format!("{log_context}: SSH host key trust store operation failed, rejecting connection: {e}");
+                log::error!("{reason}");
+                Resolved::Failed(reason)
             }
             Err(join_error) => {
-                log::error!("{log_context}: SSH host key trust check task panicked, rejecting connection: {join_error}");
-                Resolved::Failed
+                let reason = format!("{log_context}: SSH host key trust check task panicked, rejecting connection: {join_error}");
+                log::error!("{reason}");
+                Resolved::Failed(reason)
             }
         }
     }
@@ -225,6 +233,10 @@ mod tests {
         FileBackedHostKeyVerifier::new(store_path, host_port.to_string(), Arc::new(move |_fp| answer), "isekai-test")
     }
 
+    fn is_accepted(outcome: VerifyOutcome) -> bool {
+        matches!(outcome, VerifyOutcome::Accepted)
+    }
+
     /// A slow/interactive confirmation prompt for one brand-new host must not
     /// block `verify` for a *different*, already-known host sharing the same
     /// store — the store lock is held across the whole store, not scoped per
@@ -266,12 +278,12 @@ mod tests {
         let verifier_b = verifier_with_answer(store_path.clone(), "known.example.com:22", true);
         let verify_b = tokio::time::timeout(std::time::Duration::from_secs(2), verifier_b.verify("SHA256:known")).await;
         assert!(
-            verify_b.expect("verifying the already-known host must not wait on host A's pending confirmation"),
+            is_accepted(verify_b.expect("verifying the already-known host must not wait on host A's pending confirmation")),
             "the already-known, matching host must resolve to trusted"
         );
 
         release_tx.send(true).unwrap();
-        assert!(verify_a.await.unwrap(), "host A should end up trusted once its confirmation is released");
+        assert!(is_accepted(verify_a.await.unwrap()), "host A should end up trusted once its confirmation is released");
     }
 
     #[tokio::test]
@@ -280,7 +292,7 @@ mod tests {
         let store_path = dir.path().join("known_ssh_hosts.toml");
         let verifier = verifier_with_answer(store_path.clone(), "example.com:22", true);
 
-        assert!(verifier.verify("SHA256:abc").await);
+        assert!(is_accepted(verifier.verify("SHA256:abc").await));
 
         let store = crate::load_ssh_host_key_trust_store(&store_path).unwrap();
         assert_eq!(store.get("example.com:22").unwrap().fingerprint, "SHA256:abc");
@@ -292,7 +304,7 @@ mod tests {
         let store_path = dir.path().join("known_ssh_hosts.toml");
         let verifier = verifier_with_answer(store_path.clone(), "example.com:22", false);
 
-        assert!(!verifier.verify("SHA256:abc").await);
+        assert!(!is_accepted(verifier.verify("SHA256:abc").await));
 
         let store = crate::load_ssh_host_key_trust_store(&store_path).unwrap();
         assert_eq!(store.get("example.com:22"), None, "declining must not persist a trust entry");
@@ -321,7 +333,7 @@ mod tests {
             Arc::new(|_| panic!("must not prompt for an already-known, matching host key")),
             "isekai-test",
         );
-        assert!(verifier.verify("SHA256:abc").await);
+        assert!(is_accepted(verifier.verify("SHA256:abc").await));
 
         let updated = crate::load_ssh_host_key_trust_store(&store_path).unwrap();
         let entry = updated.get("example.com:22").unwrap();
@@ -350,7 +362,12 @@ mod tests {
             Arc::new(|_| panic!("a changed host key must be a hard reject, never a prompt")),
             "isekai-test",
         );
-        assert!(!verifier.verify("SHA256:different").await);
+        let outcome = verifier.verify("SHA256:different").await;
+        assert!(!is_accepted(outcome.clone()));
+        assert!(
+            matches!(&outcome, VerifyOutcome::Rejected(reason) if reason.contains("changed") && reason.contains("example.com:22")),
+            "rejection reason should explain the host key changed and name the affected host: {outcome:?}"
+        );
 
         let unchanged = crate::load_ssh_host_key_trust_store(&store_path).unwrap();
         assert_eq!(

@@ -107,10 +107,24 @@ pub enum BootstrapError {
     ConfigResolve { host: String, detail: String },
 
     /// Connecting, authenticating, or opening a channel over `russh` failed
-    /// — wraps `russh_stream_session::SessionError` (host-key rejection,
-    /// handshake failure, auth failure, jump-host tunnel failure, etc.).
+    /// — wraps `russh_stream_session::SessionError` (handshake failure, auth
+    /// failure, jump-host tunnel failure, etc.). A host-key *rejection*
+    /// specifically is [`HostKeyRejected`](Self::HostKeyRejected) instead,
+    /// which carries the verifier's own human-readable reason — this variant
+    /// is everything else `SessionError` covers.
     #[error("russh session error: {0}")]
     Session(#[from] russh_stream_session::SessionError),
+
+    /// The SSH host-key TOFU check (`isekai_trust::FileBackedHostKeyVerifier`,
+    /// via `russh_stream_session::HostKeyVerifier`) rejected the server's
+    /// host key — carries the verifier's own reason (known-mismatch,
+    /// declined confirmation, non-interactive refusal, etc.) instead of just
+    /// the generic `russh::Error::UnknownKey` ("Unknown server key")
+    /// `SessionError::Handshake`/`JumpHandshake` alone would show (`russh`'s
+    /// `check_server_key` return has no room to carry a custom message —
+    /// see `russh_stream_session::RejectionReason`'s docs).
+    #[error("SSH host key rejected: {reason}")]
+    HostKeyRejected { reason: String, #[source] source: russh_stream_session::SessionError },
 
     /// Determining the current user's home directory (for the default
     /// `IdentityFile` probe order, and for the SSH host-key trust store

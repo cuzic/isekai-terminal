@@ -204,7 +204,7 @@ mod tests {
     use russh::server::{self, Auth, Msg as ServerMsg, Server as _, Session as ServerSession};
     use russh::Channel as RusshChannel;
     use russh_keys::ssh_key::private::{Ed25519Keypair, PrivateKey as SshPrivateKey};
-    use russh_stream_session::{authenticate_session, establish_over_stream, verifying_handler_with_routes, Credential, HostKeyVerifier};
+    use russh_stream_session::{authenticate_session, establish_over_stream, verifying_handler_with_routes, Credential, HostKeyVerifier, VerifyOutcome};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use tokio::net::TcpListener;
@@ -212,8 +212,8 @@ mod tests {
     struct AcceptAllHostKeys;
     #[async_trait]
     impl HostKeyVerifier for AcceptAllHostKeys {
-        async fn verify(&self, _fingerprint: &str) -> bool {
-            true
+        async fn verify(&self, _fingerprint: &str) -> VerifyOutcome {
+            VerifyOutcome::Accepted
         }
     }
 
