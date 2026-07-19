@@ -321,6 +321,71 @@ internal class SixelBitmapCache {
     }
 }
 
+/**
+ * グリッド1行分(背景run + 文字 + underline/strikethrough装飾)を [canvas] に描画する。
+ * [GridRenderCache] の全走査ループ本体を1行単位に切り出したもの——描画結果は
+ * 従来のインラインループと完全に一致する(将来のdirty-row最適化で、変化した行だけを
+ * 選択的に再描画できるようにするための純粋なリファクタ)。カーソル/選択ハイライトは
+ * この経路の対象外(毎フレーム別途描画)である点は従来どおり。
+ */
+private fun drawRow(
+    canvas: android.graphics.Canvas,
+    rowIndex: Int,
+    cells: List<CellData>,
+    cols: Int,
+    cellW: Float,
+    cellH: Float,
+    baseline: Float,
+    themeBgArgb: Int,
+    effectiveBlinkPhase: Boolean,
+    bgPaint: Paint,
+    textPaint: Paint,
+    typeface: Typeface,
+    italicTypeface: Typeface,
+) {
+    val y = rowIndex * cellH
+    val rowStart = rowIndex * cols
+
+    // 背景(テーマの既定背景以外が連続する区間だけをバッチ描画)
+    for (run in computeBgRuns(cells, rowStart, cols, themeBgArgb)) {
+        bgPaint.color = run.argb
+        canvas.drawRect(run.startCol * cellW, y, run.endColExclusive * cellW, y + cellH, bgPaint)
+    }
+
+    // 文字
+    for (col in 0 until cols) {
+        val cell = cells[rowStart + col]
+        // invisible(SGR 8)はグリフを描かない。blink(SGR 5)は点滅位相が
+        // 「消灯」側の間だけ同様にグリフを省く(背景は通常通り描く)。
+        // reverse(SGR 7)はterminal.rs側でパース時にfg/bgへ実効色として
+        // 解決済み(#21)なので、ここではcell.fg/bg をそのまま使うだけでよい。
+        // 空白文字自体は本来 drawText 不要だが、underline/strikethrough
+        // (SGR 4/9)が立っている空白セルは装飾線だけ描く必要があるため
+        // isNotBlank() の早期スキップから除外する(codexレビュー指摘:
+        // 装飾のみの空白セルが描かれないと下線/取り消し線が消えてしまう)。
+        val blinkHidden = cell.blink && !effectiveBlinkPhase
+        val hasLineDecoration = cell.underline || cell.strikethrough
+        if (cell.ch.isNotEmpty() && (cell.ch.isNotBlank() || hasLineDecoration) &&
+            !cell.invisible && !blinkHidden
+        ) {
+            val x = col * cellW
+            val fgArgb = cell.fg.toInt()
+            val resolvedFg = if (cell.dim) dimmedArgb(fgArgb) else fgArgb
+            textPaint.color = resolvedFg
+            textPaint.isFakeBoldText = cell.bold
+            textPaint.typeface = if (cell.italic) italicTypeface else typeface
+            canvas.drawText(cell.ch, x, y + baseline, textPaint)
+
+            if (hasLineDecoration) {
+                bgPaint.color = resolvedFg
+                for (rect in computeLineDecorationRects(x, y, cellW, cellH, cell.underline, cell.strikethrough)) {
+                    canvas.drawRect(rect.left, rect.top, rect.right, rect.bottom, bgPaint)
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun SshTerminalCanvas(
     update: ScreenUpdate,
@@ -459,47 +524,21 @@ fun SshTerminalCanvas(
             val bitmapCanvas = android.graphics.Canvas(bmp)
 
             for (row in 0 until rows) {
-                val y = row * cellH
-                val rowStart = row * cols
-
-                // 背景(テーマの既定背景以外が連続する区間だけをバッチ描画)
-                for (run in computeBgRuns(update.cells, rowStart, cols, themeBgArgb)) {
-                    bgPaint.color = run.argb
-                    bitmapCanvas.drawRect(run.startCol * cellW, y, run.endColExclusive * cellW, y + cellH, bgPaint)
-                }
-
-                // 文字
-                for (col in 0 until cols) {
-                    val cell = update.cells[rowStart + col]
-                    // invisible(SGR 8)はグリフを描かない。blink(SGR 5)は点滅位相が
-                    // 「消灯」側の間だけ同様にグリフを省く(背景は通常通り描く)。
-                    // reverse(SGR 7)はterminal.rs側でパース時にfg/bgへ実効色として
-                    // 解決済み(#21)なので、ここではcell.fg/bg をそのまま使うだけでよい。
-                    // 空白文字自体は本来 drawText 不要だが、underline/strikethrough
-                    // (SGR 4/9)が立っている空白セルは装飾線だけ描く必要があるため
-                    // isNotBlank() の早期スキップから除外する(codexレビュー指摘:
-                    // 装飾のみの空白セルが描かれないと下線/取り消し線が消えてしまう)。
-                    val blinkHidden = cell.blink && !effectiveBlinkPhase
-                    val hasLineDecoration = cell.underline || cell.strikethrough
-                    if (cell.ch.isNotEmpty() && (cell.ch.isNotBlank() || hasLineDecoration) &&
-                        !cell.invisible && !blinkHidden
-                    ) {
-                        val x = col * cellW
-                        val fgArgb = cell.fg.toInt()
-                        val resolvedFg = if (cell.dim) dimmedArgb(fgArgb) else fgArgb
-                        textPaint.color = resolvedFg
-                        textPaint.isFakeBoldText = cell.bold
-                        textPaint.typeface = if (cell.italic) italicTypeface else typeface
-                        bitmapCanvas.drawText(cell.ch, x, y + baseline, textPaint)
-
-                        if (hasLineDecoration) {
-                            bgPaint.color = resolvedFg
-                            for (rect in computeLineDecorationRects(x, y, cellW, cellH, cell.underline, cell.strikethrough)) {
-                                bitmapCanvas.drawRect(rect.left, rect.top, rect.right, rect.bottom, bgPaint)
-                            }
-                        }
-                    }
-                }
+                drawRow(
+                    canvas = bitmapCanvas,
+                    rowIndex = row,
+                    cells = update.cells,
+                    cols = cols,
+                    cellW = cellW,
+                    cellH = cellH,
+                    baseline = baseline,
+                    themeBgArgb = themeBgArgb,
+                    effectiveBlinkPhase = effectiveBlinkPhase,
+                    bgPaint = bgPaint,
+                    textPaint = textPaint,
+                    typeface = typeface,
+                    italicTypeface = italicTypeface,
+                )
             }
 
             // 次回の描画でtypefaceが汚れたままにならないよう既定値へ戻す(このPaintは
