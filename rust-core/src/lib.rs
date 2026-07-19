@@ -621,6 +621,46 @@ pub fn terminal_ctrl_byte(code_point: u32) -> Option<u8> {
     }
 }
 
+/// Kitty keyboard protocol(タスク#54/#72)のbit0(disambiguate escape codes)有効時、
+/// Ctrl/Alt(/その組み合わせ・Shift+Alt)付きの印字可能文字キーをCSI u形式
+/// (`ESC[<codepoint>;<modifier>u`)へエンコードする(タスク#91)。
+///
+/// - `code_point`はキーの無修飾時の基本コードポイント(例: Ctrl+AでもAndroid
+///   `event.getUnicodeChar(0)`が返す小文字相当の`'a'`)を渡すこと。呼び出し側で
+///   大文字/小文字を判定する必要はない(この関数が`to_ascii_lowercase`する)。
+/// - `modifier`はxterm/kitty共通のエンコード: `1 + shift(1) + alt(2) + ctrl(4) + meta(8)`。
+/// - bit0が立っていない場合、`code_point`が印字可能文字でない場合、修飾キー
+///   (Ctrl/Alt)が両方とも押されていない場合は`None`を返す——呼び出し側は
+///   `terminal_ctrl_byte`(legacy Ctrl)や"ESCプレフィックス"(legacy Alt)といった
+///   既存のフォールバック処理へ進むこと。
+/// - Kitty仕様上の例外キー(Enter/Tab/Backspace)は`TerminalSpecialKey`経由の
+///   既存分岐が別途処理するためこの関数の対象外(呼び出し側で特殊キー判定を
+///   この関数より先に行うこと)。
+#[uniffi::export]
+pub fn terminal_kitty_disambiguated_key_bytes(
+    code_point: u32,
+    modifiers: TerminalKeyModifiers,
+    kitty_flags: u16,
+) -> Option<Vec<u8>> {
+    if kitty_flags & KITTY_DISAMBIGUATE_ESCAPE_CODES == 0 {
+        return None;
+    }
+    if !(modifiers.ctrl || modifiers.alt) {
+        return None;
+    }
+    let ch = char::from_u32(code_point)?;
+    if !ch.is_ascii_graphic() && ch != ' ' {
+        return None;
+    }
+    let base = ch.to_ascii_lowercase() as u32;
+    let mut modifier_value: u32 = 1;
+    if modifiers.shift { modifier_value += 1; }
+    if modifiers.alt { modifier_value += 2; }
+    if modifiers.ctrl { modifier_value += 4; }
+    if modifiers.meta { modifier_value += 8; }
+    Some(format!("\x1b[{base};{modifier_value}u").into_bytes())
+}
+
 /// IME確定テキスト／クリップボードペーストのテキスト→バイト列。改行正規化
 /// (`"\r\n"`/`"\n"` → `"\r"`)をここに集約する。複数コードポイントかつ
 /// `bracketed_paste_mode`が有効な場合のみ`ESC[200~`...`ESC[201~`で囲む
@@ -1604,6 +1644,82 @@ mod terminal_key_mapping_tests {
             terminal_special_key_bytes(TerminalSpecialKey::FunctionKey { number: 1 }, false, NO_MODS, flags),
             b"\x1BOP".to_vec()
         );
+    }
+
+    // ── terminal_kitty_disambiguated_key_bytes(タスク#91) ─────────────
+
+    #[test]
+    fn kitty_ctrl_letter_uses_csi_u_when_disambiguate_flag_negotiated() {
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        // Ctrl+A: 'a' = 97, modifier = 1 + ctrl(4) = 5
+        assert_eq!(
+            terminal_kitty_disambiguated_key_bytes('a' as u32, ctrl, KITTY_DISAMBIGUATE_ESCAPE_CODES),
+            Some(b"\x1B[97;5u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_ctrl_letter_lowercases_uppercase_code_point() {
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        // 呼び出し側が大文字コードポイント('A' = 65)を渡しても、小文字の基本キー(97)へ正規化する。
+        assert_eq!(
+            terminal_kitty_disambiguated_key_bytes('A' as u32, ctrl, KITTY_DISAMBIGUATE_ESCAPE_CODES),
+            Some(b"\x1B[97;5u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_alt_letter_uses_csi_u_when_disambiguate_flag_negotiated() {
+        let alt = TerminalKeyModifiers { alt: true, ..Default::default() };
+        // Alt+A: modifier = 1 + alt(2) = 3
+        assert_eq!(
+            terminal_kitty_disambiguated_key_bytes('a' as u32, alt, KITTY_DISAMBIGUATE_ESCAPE_CODES),
+            Some(b"\x1B[97;3u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_ctrl_alt_letter_combines_modifier_bits() {
+        let ctrl_alt = TerminalKeyModifiers { ctrl: true, alt: true, ..Default::default() };
+        // Ctrl+Alt+A: modifier = 1 + alt(2) + ctrl(4) = 7
+        assert_eq!(
+            terminal_kitty_disambiguated_key_bytes('a' as u32, ctrl_alt, KITTY_DISAMBIGUATE_ESCAPE_CODES),
+            Some(b"\x1B[97;7u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_shift_alt_letter_combines_modifier_bits() {
+        let shift_alt = TerminalKeyModifiers { shift: true, alt: true, ..Default::default() };
+        // Shift+Alt+A: modifier = 1 + shift(1) + alt(2) = 4
+        assert_eq!(
+            terminal_kitty_disambiguated_key_bytes('a' as u32, shift_alt, KITTY_DISAMBIGUATE_ESCAPE_CODES),
+            Some(b"\x1B[97;4u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_disambiguated_key_returns_none_without_disambiguate_bit() {
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        // report-event-types(bit1)のみのようにdisambiguateビット(bit0)を含まない場合はNone
+        // (呼び出し側は既存のlegacy Ctrl/Altエンコードへフォールバックする)。
+        assert_eq!(terminal_kitty_disambiguated_key_bytes('a' as u32, ctrl, 0b10), None);
+    }
+
+    #[test]
+    fn kitty_disambiguated_key_returns_none_without_ctrl_or_alt() {
+        // 修飾キーが無ければ通常の印字処理に任せるためNone。
+        assert_eq!(
+            terminal_kitty_disambiguated_key_bytes('a' as u32, NO_MODS, KITTY_DISAMBIGUATE_ESCAPE_CODES),
+            None
+        );
+    }
+
+    #[test]
+    fn kitty_disambiguated_key_returns_none_for_non_printable_code_point() {
+        let ctrl = TerminalKeyModifiers { ctrl: true, ..Default::default() };
+        // 制御文字(0x01等)や不正なコードポイントは対象外(特殊キー経路等が別途処理する)。
+        assert_eq!(terminal_kitty_disambiguated_key_bytes(0x01, ctrl, KITTY_DISAMBIGUATE_ESCAPE_CODES), None);
     }
 
     #[test]

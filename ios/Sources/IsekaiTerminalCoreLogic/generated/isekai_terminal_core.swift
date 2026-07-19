@@ -6823,6 +6823,32 @@ public func terminalCtrlByte(codePoint: UInt32) -> UInt8?  {
 })
 }
 /**
+ * Kitty keyboard protocol(タスク#54/#72)のbit0(disambiguate escape codes)有効時、
+ * Ctrl/Alt(/その組み合わせ・Shift+Alt)付きの印字可能文字キーをCSI u形式
+ * (`ESC[<codepoint>;<modifier>u`)へエンコードする(タスク#91)。
+ *
+ * - `code_point`はキーの無修飾時の基本コードポイント(例: Ctrl+AでもAndroid
+ * `event.getUnicodeChar(0)`が返す小文字相当の`'a'`)を渡すこと。呼び出し側で
+ * 大文字/小文字を判定する必要はない(この関数が`to_ascii_lowercase`する)。
+ * - `modifier`はxterm/kitty共通のエンコード: `1 + shift(1) + alt(2) + ctrl(4) + meta(8)`。
+ * - bit0が立っていない場合、`code_point`が印字可能文字でない場合、修飾キー
+ * (Ctrl/Alt)が両方とも押されていない場合は`None`を返す——呼び出し側は
+ * `terminal_ctrl_byte`(legacy Ctrl)や"ESCプレフィックス"(legacy Alt)といった
+ * 既存のフォールバック処理へ進むこと。
+ * - Kitty仕様上の例外キー(Enter/Tab/Backspace)は`TerminalSpecialKey`経由の
+ * 既存分岐が別途処理するためこの関数の対象外(呼び出し側で特殊キー判定を
+ * この関数より先に行うこと)。
+ */
+public func terminalKittyDisambiguatedKeyBytes(codePoint: UInt32, modifiers: TerminalKeyModifiers, kittyFlags: UInt16) -> Data?  {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_terminal_kitty_disambiguated_key_bytes(
+        FfiConverterUInt32.lower(codePoint),
+        FfiConverterTypeTerminalKeyModifiers_lower(modifiers),
+        FfiConverterUInt16.lower(kittyFlags),$0
+    )
+})
+}
+/**
  * テンキーのバイト列。`application_keypad_mode`(DECKPAM、`Terminal`が`ESC =`/
  * `ESC >`で切り替える、`ScreenUpdate::application_keypad_mode`経由で公開)が
  * `true`ならSS3形式(`ESC O <letter>`、xterm/VT220のapplication keypadテーブルに
@@ -7012,6 +7038,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte() != 39410) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_terminal_kitty_disambiguated_key_bytes() != 62321) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes() != 1311) {

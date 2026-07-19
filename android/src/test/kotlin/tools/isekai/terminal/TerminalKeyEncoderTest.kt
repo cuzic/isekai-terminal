@@ -73,6 +73,63 @@ class TerminalKeyEncoderTest {
         )
     }
 
+    // ── kittyDisambiguatedKeyBytes(タスク#91、`rust-core`の
+    // `terminal_kitty_disambiguated_key_bytes`と同一ロジックを移植) ────────
+
+    @Test
+    fun `Ctrl+A uses Kitty CSI u when disambiguate flag negotiated`() {
+        val ctrl = TerminalKeyModifiers(shift = false, alt = false, ctrl = true, meta = false)
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x39, 0x37, 0x3B, 0x35, 0x75), // ESC[97;5u
+            TerminalKeyEncoder.kittyDisambiguatedKeyBytes('a'.code, ctrl, kittyFlags = 0b1u),
+        )
+    }
+
+    @Test
+    fun `uppercase code point lowercases to the same base key`() {
+        val ctrl = TerminalKeyModifiers(shift = false, alt = false, ctrl = true, meta = false)
+        assertArrayEquals(
+            TerminalKeyEncoder.kittyDisambiguatedKeyBytes('a'.code, ctrl, kittyFlags = 0b1u),
+            TerminalKeyEncoder.kittyDisambiguatedKeyBytes('A'.code, ctrl, kittyFlags = 0b1u),
+        )
+    }
+
+    @Test
+    fun `Alt+A uses Kitty CSI u when disambiguate flag negotiated`() {
+        val alt = TerminalKeyModifiers(shift = false, alt = true, ctrl = false, meta = false)
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x39, 0x37, 0x3B, 0x33, 0x75), // ESC[97;3u
+            TerminalKeyEncoder.kittyDisambiguatedKeyBytes('a'.code, alt, kittyFlags = 0b1u),
+        )
+    }
+
+    @Test
+    fun `Ctrl+Alt+A combines modifier bits`() {
+        val ctrlAlt = TerminalKeyModifiers(shift = false, alt = true, ctrl = true, meta = false)
+        assertArrayEquals(
+            byteArrayOf(0x1B, 0x5B, 0x39, 0x37, 0x3B, 0x37, 0x75), // ESC[97;7u
+            TerminalKeyEncoder.kittyDisambiguatedKeyBytes('a'.code, ctrlAlt, kittyFlags = 0b1u),
+        )
+    }
+
+    @Test
+    fun `kittyDisambiguatedKeyBytes returns null without disambiguate bit`() {
+        val ctrl = TerminalKeyModifiers(shift = false, alt = false, ctrl = true, meta = false)
+        assertNull(TerminalKeyEncoder.kittyDisambiguatedKeyBytes('a'.code, ctrl, kittyFlags = 0b10u))
+    }
+
+    @Test
+    fun `kittyDisambiguatedKeyBytes returns null without ctrl or alt`() {
+        val noMods = TerminalKeyModifiers(shift = false, alt = false, ctrl = false, meta = false)
+        assertNull(TerminalKeyEncoder.kittyDisambiguatedKeyBytes('a'.code, noMods, kittyFlags = 0b1u))
+    }
+
+    @Test
+    fun `kittyDisambiguatedKeyBytes returns null for non-printable code point`() {
+        val ctrl = TerminalKeyModifiers(shift = false, alt = false, ctrl = true, meta = false)
+        assertNull(TerminalKeyEncoder.kittyDisambiguatedKeyBytes(0x01, ctrl, kittyFlags = 0b1u))
+    }
+
     @Test
     fun `arrow up maps to CSI A`() {
         assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x41), TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_UP))

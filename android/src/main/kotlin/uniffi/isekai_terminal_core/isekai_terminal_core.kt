@@ -799,6 +799,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_terminal_kitty_disambiguated_key_bytes(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes(
@@ -1074,6 +1076,8 @@ external fun uniffi_isekai_terminal_core_fn_func_terminal_commit_text_bytes(`tex
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_ctrl_byte(`codePoint`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+external fun uniffi_isekai_terminal_core_fn_func_terminal_kitty_disambiguated_key_bytes(`codePoint`: Int,`modifiers`: RustBuffer.ByValue,`kittyFlags`: Short,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_numpad_key_bytes(`key`: RustBuffer.ByValue,`applicationKeypadMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(`kind`: RustBuffer.ByValue,`button`: RustBuffer.ByValue,`row`: Int,`col`: Int,`modifiers`: RustBuffer.ByValue,`cols`: Int,`rows`: Int,`mouseReportingMode`: RustBuffer.ByValue,`sgrMouseMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
@@ -1229,6 +1233,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte() != 39410) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_kitty_disambiguated_key_bytes() != 62321) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes() != 1311) {
@@ -7820,6 +7827,33 @@ public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuf
     UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_ctrl_byte(
     
         FfiConverterUInt.lower(`codePoint`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Kitty keyboard protocol(タスク#54/#72)のbit0(disambiguate escape codes)有効時、
+         * Ctrl/Alt(/その組み合わせ・Shift+Alt)付きの印字可能文字キーをCSI u形式
+         * (`ESC[<codepoint>;<modifier>u`)へエンコードする(タスク#91)。
+         *
+         * - `code_point`はキーの無修飾時の基本コードポイント(例: Ctrl+AでもAndroid
+         * `event.getUnicodeChar(0)`が返す小文字相当の`'a'`)を渡すこと。呼び出し側で
+         * 大文字/小文字を判定する必要はない(この関数が`to_ascii_lowercase`する)。
+         * - `modifier`はxterm/kitty共通のエンコード: `1 + shift(1) + alt(2) + ctrl(4) + meta(8)`。
+         * - bit0が立っていない場合、`code_point`が印字可能文字でない場合、修飾キー
+         * (Ctrl/Alt)が両方とも押されていない場合は`None`を返す——呼び出し側は
+         * `terminal_ctrl_byte`(legacy Ctrl)や"ESCプレフィックス"(legacy Alt)といった
+         * 既存のフォールバック処理へ進むこと。
+         * - Kitty仕様上の例外キー(Enter/Tab/Backspace)は`TerminalSpecialKey`経由の
+         * 既存分岐が別途処理するためこの関数の対象外(呼び出し側で特殊キー判定を
+         * この関数より先に行うこと)。
+         */ fun `terminalKittyDisambiguatedKeyBytes`(`codePoint`: kotlin.UInt, `modifiers`: TerminalKeyModifiers, `kittyFlags`: kotlin.UShort): kotlin.ByteArray? {
+            return FfiConverterOptionalByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_kitty_disambiguated_key_bytes(
+    
+        FfiConverterUInt.lower(`codePoint`),FfiConverterTypeTerminalKeyModifiers.lower(`modifiers`),FfiConverterUShort.lower(`kittyFlags`),_status)
 }
     )
     }
