@@ -39,9 +39,34 @@
 //! 最小限のtrait [`RemoteTmuxCommandRunner`]をシームとして定義し、この
 //! モジュールのロジック/テストは全てそれ越しに書く。#61が実装され次第、
 //! それをこのtraitへの薄いアダプタとして差し込むだけで配線できる想定。
+//!
+//! # #59（このタスクでの配線）
+//!
+//! #61がマージされ、上記の想定通り[`transport::ssh_handler::run_exec_on_handle`]への
+//! 薄いアダプタ(`SshHandleTmuxRunner`、`transport/ssh_handler.rs`)を通して
+//! [`RemoteTmuxCommandRunner`]が実装された。あわせて、Epic Mのctl-socketパスを
+//! ロケータと同じtmuxウィンドウ/ペインへ書き込む[`build_set_ctl_socket_command`]/
+//! [`TmuxLocatorResolver::push_ctl_socket_path`]と、[`TmuxLocatorRegistry`]を
+//! プロセス全体で共有する[`TMUX_LOCATOR_REGISTRY`]を新設し、
+//! `transport::ssh_handler::run_ssh_channel_loop`のctl-socket forward確立直後
+//! (接続確立時・再接続時の両方)から呼ぶ形で配線した。詳細・判断根拠は
+//! `run_ssh_channel_loop`のコメント、および[`TMUX_LOCATOR_REGISTRY`]のdoc参照。
+//!
+//! 一方、「あるタブに対応するtmuxウィンドウ/ペインをどう見つけて最初に
+//! [`TmuxLocator`]/[`TmuxTag`]を割り当てるか」(tmuxセッション名の規約、
+//! 複数クライアントの"current window"の曖昧さの解消等)は、モジュール冒頭の
+//! 「session group について」で述べた通り#60の範囲であり、このタスクでは
+//! 実装しない。このタスクが実装するのは「既に[`TmuxLocatorRegistry`]に
+//! ロケータが登録されている(=#60や将来の割り当てロジックが解決済み)前提で、
+//! 新しいctl-socketパスをそのロケータへ伝播する」部分に限る。ロケータが
+//! 未登録のapp paneでは`push_ctl_socket_to_tmux`は何もしない
+//! (opportunistic機能、他のこのcrateの慣習と同じ黙ったフォールバック)。
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::LazyLock;
+
+use parking_lot::Mutex;
 
 // ── tmuxユーザーオプション名 ──────────────────────────────
 
@@ -50,6 +75,15 @@ const WINDOW_TAG_OPTION: &str = "@isekai_tab_id";
 /// ペインに付与するタグの user-option 名（ウィンドウとは別の名前空間にする
 /// —— 同じウィンドウ上の複数ペインがそれぞれ別のタグを持つため）。
 const PANE_TAG_OPTION: &str = "@isekai_pane_id";
+/// タスク#59: Epic Mのctl-socket(リモートUNIX domain socketパス)を保持する
+/// user-option名。`WINDOW_TAG_OPTION`/`PANE_TAG_OPTION`とは異なり、対象は
+/// ロケータの`kind`に応じてウィンドウ単位・ペイン単位のどちらにもなり得る
+/// (`build_set_ctl_socket_command`参照)。あえてsession-wideの単一オプションに
+/// しない理由: tmuxのオプション解決順はペイン→ウィンドウ→セッション→グローバルの
+/// 継承なので、ウィンドウ/ペイン単位で設定しておけば、各タブ(=各ウィンドウ/ペイン)が
+/// コマンド実行時に自分自身のスコープの値を自然に解決できる
+/// (session-wideだと複数タブが同じ値を奪い合う"last write wins"になってしまう)。
+const CTL_SOCK_OPTION: &str = "@isekai_ctl_sock";
 
 // ── ロケータのコア型 ──────────────────────────────────────
 
@@ -248,6 +282,25 @@ pub(crate) fn build_set_tag_command(scope: &TmuxSessionScope, coords: &TmuxCoord
     format!("tmux set-option -t {} {option} {}", shell_quote(&target), shell_quote(&tag.0))
 }
 
+/// タスク#59: `coords`が指すウィンドウ/ペインに、Epic Mのctl-socketパス
+/// (`ctl_socket_path`)を[`CTL_SOCK_OPTION`]として書き込む(`set-option`)コマンドを
+/// 組み立てる。[`build_set_tag_command`]と同じ「`coords.pane_index`の有無で対象と
+/// user-option名が決まる」形だが、書き込む値がタグ(固定的な識別子)ではなく
+/// 接続のたびに変わり得るctl-socketパスである点が異なる(再接続のたびにこの関数を
+/// 呼び直して値を更新する)。
+pub(crate) fn build_set_ctl_socket_command(
+    scope: &TmuxSessionScope,
+    coords: &TmuxCoordinates,
+    ctl_socket_path: &str,
+) -> String {
+    let session = scope.addressable_session_name();
+    let target = match coords.pane_index {
+        Some(pane_index) => format!("{session}:{}.{pane_index}", coords.window_index),
+        None => format!("{session}:{}", coords.window_index),
+    };
+    format!("tmux set-option -t {} {CTL_SOCK_OPTION} {}", shell_quote(&target), shell_quote(ctl_socket_path))
+}
+
 /// [`RemoteTmuxCommandRunner`]越しに実際の問い合わせ/タグ付けを行う薄いラッパー。
 /// コマンド文字列の組み立て・出力のパースは全て上記の自由関数(単体テスト
 /// しやすい純粋関数)に委ねており、ここでは「runnerを呼んで結果を解釈する」
@@ -281,6 +334,25 @@ impl<R: RemoteTmuxCommandRunner> TmuxLocatorResolver<R> {
         self.runner.run(&cmd).await?;
         Ok(())
     }
+
+    /// タスク#59: `locator`を現在の座標へ解決し(=ウィンドウ/ペインの
+    /// リネーム・リナンバリングを経ていても正しい対象を突き止め)、そこへ
+    /// Epic Mのctl-socketパスを[`CTL_SOCK_OPTION`]として書き込む。接続確立時・
+    /// 再接続時のいずれも(ctl-socketパスは接続のたびに変わるため)このメソッドを
+    /// 呼び直す想定(呼び出し側は`transport::ssh_handler::run_ssh_channel_loop`)。
+    /// `locator`が指すウィンドウ/ペインが既に無くなっている場合
+    /// (`TmuxLocatorError::NotFound`)は、呼び出し側がbest-effortとして
+    /// ログするだけで接続自体は継続してよい(opportunistic機能)。
+    pub(crate) async fn push_ctl_socket_path(
+        &self,
+        locator: &TmuxLocator,
+        ctl_socket_path: &str,
+    ) -> Result<(), TmuxLocatorError> {
+        let coords = self.resolve(locator).await?;
+        let cmd = build_set_ctl_socket_command(&locator.scope, &coords, ctl_socket_path);
+        self.runner.run(&cmd).await?;
+        Ok(())
+    }
 }
 
 // ── アプリのタブ/ペインID ⟷ tmuxロケータ ⟷ ctl-socketパスの対応表 ──
@@ -293,6 +365,23 @@ impl<R: RemoteTmuxCommandRunner> TmuxLocatorResolver<R> {
 pub(crate) struct AppPaneId {
     pub(crate) tab_id: String,
     pub(crate) pane_id: String,
+}
+
+impl AppPaneId {
+    /// タスク#59: Kotlin側の実`PaneAddress(tabId, paneId)`はまだUniFFI境界を越えて
+    /// Rust側へ渡ってきていない(`SshConfig`等どの`connect_*`引数にも(tab_id, pane_id)
+    /// 相当のフィールドが無い)。とはいえ[`TmuxLocatorRegistry`]は「再接続をまたいで
+    /// 同じタブを同じキーで指せる」ことだけが要件で、Kotlin側の値と一致している必要は
+    /// 無いため、`orchestrator::create_session_orchestrator`が`OrchestratorShared`
+    /// 生成時に1回だけ発行する内部限定の安定トークンで代用する(同一`OrchestratorShared`
+    /// ＝同一タブの生存期間中は再接続のたびに再生成されない、`orchestrator.rs`参照)。
+    /// 実際の`PaneAddress`がFFI経由で渡ってくるようになったら、生成元をそちらに
+    /// 差し替えるだけで済む(登録/検索ロジックは`AppPaneId`というキー型にしか
+    /// 依存していない)。
+    pub(crate) fn generate_process_local() -> Self {
+        let token = TmuxTag::new_random().0;
+        Self { tab_id: token, pane_id: String::new() }
+    }
 }
 
 /// 1つのアプリペインについて、対応表が保持する情報一式。
@@ -375,6 +464,63 @@ impl TmuxLocatorRegistry {
         self.by_locator.remove(&entry.locator);
         Some(entry)
     }
+}
+
+// ── タスク#59: プロセス全体で共有するレジストリ + ctl-socketパスの伝播 ──
+
+/// [`TmuxLocatorRegistry`]のプロセス全体シングルトン。
+///
+/// **配線先としてここ(`tmux_locator.rs`)を選んだ理由**(#62の作者が「どこから
+/// 配線するかは判断が分かれる」と明示的に開けていた点への回答): 一見
+/// `pool.rs`の`SSH_POOL`(同種の「`LazyLock<Mutex<HashMap<_,_>>>`なプロセス
+/// 全体シングルトン」という前例)の隣に置くのが自然に見えるが、`pool.rs`
+/// 自身のモジュールdocが「ここに置くのはtransport非依存の汎用プリミティブと
+/// **プレーンSSH固有**の`SshPoolKey`/`SSH_POOL`」と明記してスコープを限定して
+/// いる。tmuxロケータはSSH固有ではなく(`transport::ssh_handler::run_ssh_channel_loop`
+/// はTCP・QUICネスト共通のコードであり、Epic Mのctl-socket forward自体も
+/// transport非依存)、かつ`TmuxLocatorRegistry`という型自体がこのモジュールに
+/// 属するため、型と状態を同じ場所に置くことを優先した。
+///
+/// なぜ`OrchestratorShared`(タブごとのインスタンス)ではなくプロセス全体の
+/// シングルトンにするか: `TmuxLocatorRegistry`は本来「アプリ全体でどのタブが
+/// どのtmuxウィンドウ/ペインを使っているか」を横断的に把握するための対応表
+/// (逆引き`app_pane_for`が典型的にそう)であり、1タブに閉じた状態ではない。
+/// また`SSH_POOL`と同様、キー(`AppPaneId`)自体が既にタブを一意に識別するため、
+/// 複数タブが同じマップを共有しても衝突しない。
+pub(crate) static TMUX_LOCATOR_REGISTRY: LazyLock<Mutex<TmuxLocatorRegistry>> =
+    LazyLock::new(|| Mutex::new(TmuxLocatorRegistry::new()));
+
+/// タスク#59: ctl-socketパスが確立された(接続確立時・再接続時のいずれも)たびに
+/// 呼ぶ。`app_pane_id`に対応するtmuxロケータが既に[`TmuxLocatorRegistry`]に
+/// 登録されていれば、そのロケータが指す同じtmuxウィンドウ/ペインへ
+/// [`TmuxLocatorResolver::push_ctl_socket_path`]で新しいctl-socketパスを書き込む。
+///
+/// ロケータがまだ登録されていない場合(このapp paneのtmuxウィンドウ/ペインが
+/// まだ判明していない——モジュール冒頭の「#59（このタスクでの配線）」参照)は
+/// 何もしない。どちらの場合も、レジストリの`ctl_socket_path`は`register`済みの
+/// エントリに対してのみ更新される(`set_ctl_socket_path`が未登録のapp paneに対して
+/// no-opであることに委ねている)ため、ロケータが無いタブについては呼んでも
+/// 副作用が無い。
+///
+/// tmux側への書き込みが失敗した場合(ウィンドウ/ペインが既に閉じられている等)は
+/// `Err`を返す — 呼び出し側(`run_ssh_channel_loop`)はこれをbest-effortとして
+/// ログするだけで、接続そのものは継続してよい(Epic M自体がopportunisticな機能)。
+pub(crate) async fn push_ctl_socket_to_tmux<R: RemoteTmuxCommandRunner>(
+    registry: &Mutex<TmuxLocatorRegistry>,
+    app_pane_id: &AppPaneId,
+    ctl_socket_path: &str,
+    runner: R,
+) -> Result<(), TmuxLocatorError> {
+    let locator = registry.lock().locator_for(app_pane_id).cloned();
+    let result = match &locator {
+        Some(locator) => {
+            let resolver = TmuxLocatorResolver::new(runner);
+            resolver.push_ctl_socket_path(locator, ctl_socket_path).await
+        }
+        None => Ok(()),
+    };
+    registry.lock().set_ctl_socket_path(app_pane_id, Some(ctl_socket_path.to_string()));
+    result
 }
 
 // ── テスト ────────────────────────────────────────────────
@@ -563,6 +709,159 @@ mod tests {
         assert_eq!(resolver.runner.last_call(), "tmux set-option -t 'main:0' @isekai_tab_id 'fresh-tag'");
     }
 
+    // ── build_set_ctl_socket_command (タスク#59) ─────────
+
+    #[test]
+    fn build_set_ctl_socket_command_window_targets_session_colon_window() {
+        let cmd = build_set_ctl_socket_command(
+            &standalone("main"),
+            &TmuxCoordinates { window_index: 2, pane_index: None },
+            "/tmp/isekai-pipe-ctl-abc.sock",
+        );
+        assert_eq!(cmd, "tmux set-option -t 'main:2' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-abc.sock'");
+    }
+
+    #[test]
+    fn build_set_ctl_socket_command_pane_targets_session_colon_window_dot_pane() {
+        let cmd = build_set_ctl_socket_command(
+            &standalone("main"),
+            &TmuxCoordinates { window_index: 2, pane_index: Some(1) },
+            "/tmp/isekai-pipe-ctl-abc.sock",
+        );
+        assert_eq!(cmd, "tmux set-option -t 'main:2.1' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-abc.sock'");
+    }
+
+    // ── TmuxLocatorResolver::push_ctl_socket_path (タスク#59) ────
+
+    #[tokio::test]
+    async fn push_ctl_socket_path_resolves_then_dispatches_set_option() {
+        // resolve()はlist-windows形式の出力をパースしてtagを探す。ここで返す固定
+        // 応答はset-optionコマンド自体の実行(直後に発行される、応答は読み捨て)にも
+        // 使い回されるが、その値自体は無視されるので問題ない(FakeRunnerは呼び出し
+        // ごとに同じ応答を返す単純な作り)。
+        let runner = FakeRunner::ok("0\tother\n3\tmy-tag\n");
+        let resolver = TmuxLocatorResolver::new(runner);
+        let locator = TmuxLocator {
+            scope: standalone("main"),
+            kind: TmuxTargetKind::Window,
+            tag: TmuxTag("my-tag".to_string()),
+        };
+        resolver.push_ctl_socket_path(&locator, "/tmp/isekai-pipe-ctl-new.sock").await.unwrap();
+        assert_eq!(
+            resolver.runner.last_call(),
+            "tmux set-option -t 'main:3' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-new.sock'"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_ctl_socket_path_propagates_not_found_when_locator_missing() {
+        let runner = FakeRunner::ok("0\tother\n");
+        let resolver = TmuxLocatorResolver::new(runner);
+        let locator = TmuxLocator {
+            scope: standalone("main"),
+            kind: TmuxTargetKind::Window,
+            tag: TmuxTag("missing-tag".to_string()),
+        };
+        let err = resolver.push_ctl_socket_path(&locator, "/tmp/x.sock").await.unwrap_err();
+        assert_eq!(err, TmuxLocatorError::NotFound(TmuxTag("missing-tag".to_string())));
+    }
+
+    // ── push_ctl_socket_to_tmux + TMUX_LOCATOR_REGISTRY 配線 (タスク#59) ──
+    //
+    // ここが「接続確立時・再接続時どちらでもset-optionコマンドが正しく
+    // 組み立て/発行されること」「再接続でレジストリのエントリが重複せず
+    // 置き換わること」を検証するテスト(タスク説明のテスト要件に対応)。
+    // `push_ctl_socket_to_tmux`はプロセス全体シングルトンの代わりに
+    // 呼び出し側が渡した`&parking_lot::Mutex<TmuxLocatorRegistry>`をそのまま
+    // 使うので、`TMUX_LOCATOR_REGISTRY`自体には触れずローカルなレジストリで
+    // 完結できる(テスト間の共有可変状態を避ける)。
+    //
+    // `push_ctl_socket_to_tmux`はrunnerを値で消費するため、`FakeRunner`とは別に
+    // 呼び出し後も外から発行済みコマンドを見られる`RecordingRunner`
+    // (`Arc<std::sync::Mutex<Vec<String>>>`にログを溜める)を使う。
+
+    struct RecordingRunner {
+        response: Result<String, TmuxRunError>,
+        calls: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingRunner {
+        fn new(output: &str, calls: std::sync::Arc<Mutex<Vec<String>>>) -> Self {
+            Self { response: Ok(output.to_string()), calls }
+        }
+    }
+
+    impl RemoteTmuxCommandRunner for RecordingRunner {
+        fn run(&self, cmd: &str) -> impl Future<Output = Result<String, TmuxRunError>> + Send {
+            self.calls.lock().unwrap().push(cmd.to_string());
+            let response = self.response.clone();
+            async move { response }
+        }
+    }
+
+    #[tokio::test]
+    async fn push_ctl_socket_to_tmux_is_a_noop_when_locator_unknown() {
+        let registry = parking_lot::Mutex::new(TmuxLocatorRegistry::new());
+        let app_pane = pane("tab-1", "pane-primary");
+        let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let runner = RecordingRunner::new("0\tother\n3\tmy-tag\n", calls.clone());
+
+        push_ctl_socket_to_tmux(&registry, &app_pane, "/tmp/a.sock", runner).await.unwrap();
+
+        // ロケータが無いので何もtmuxコマンドは発行されない。
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(registry.lock().locator_for(&app_pane).is_none());
+    }
+
+    #[tokio::test]
+    async fn push_ctl_socket_to_tmux_dispatches_on_initial_connect_and_reconnect_without_duplicating_registry_entry() {
+        let registry = parking_lot::Mutex::new(TmuxLocatorRegistry::new());
+        let app_pane = pane("tab-1", "pane-primary");
+        let loc = locator("my-tag");
+        // #60等の上位ロジックが既にロケータを解決・登録済み、という前提
+        // (このタスクのスコープは「ロケータが分かっている前提でctl-socketパスを
+        // 伝播する」部分に限る、モジュール冒頭のdoc参照)。
+        registry.lock().register(app_pane.clone(), loc.clone(), None);
+
+        // ── 初回接続 ──
+        let calls_a = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let runner_a = RecordingRunner::new("0\tother\n3\tmy-tag\n", calls_a.clone());
+        push_ctl_socket_to_tmux(&registry, &app_pane, "/tmp/isekai-pipe-ctl-a.sock", runner_a)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls_a.lock().unwrap().last().unwrap(),
+            "tmux set-option -t 'main:3' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-a.sock'"
+        );
+        {
+            let r = registry.lock();
+            assert_eq!(r.ctl_socket_path_for(&app_pane), Some("/tmp/isekai-pipe-ctl-a.sock"));
+            // ロケータ自体・逆引きは変わらない。
+            assert_eq!(r.locator_for(&app_pane), Some(&loc));
+        }
+
+        // ── 再接続(新しいctl-socketパスが発行される) ──
+        let calls_b = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let runner_b = RecordingRunner::new("0\tother\n3\tmy-tag\n", calls_b.clone());
+        push_ctl_socket_to_tmux(&registry, &app_pane, "/tmp/isekai-pipe-ctl-b.sock", runner_b)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls_b.lock().unwrap().last().unwrap(),
+            "tmux set-option -t 'main:3' @isekai_ctl_sock '/tmp/isekai-pipe-ctl-b.sock'"
+        );
+
+        // レジストリのエントリは置き換わっただけで、重複していない(app_pane→1件のみ)。
+        {
+            let r = registry.lock();
+            assert_eq!(r.ctl_socket_path_for(&app_pane), Some("/tmp/isekai-pipe-ctl-b.sock"));
+            assert_eq!(r.locator_for(&app_pane), Some(&loc));
+            assert_eq!(r.app_pane_for(&loc), Some(&app_pane));
+        }
+    }
+
     // ── TmuxLocatorRegistry (マッピングテーブル) ─────────
 
     fn pane(tab: &str, pane: &str) -> AppPaneId {
@@ -700,5 +999,21 @@ mod tests {
         assert_eq!(a.0.len(), 32);
         assert!(a.0.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(a, b);
+    }
+
+    // ── AppPaneId::generate_process_local (タスク#59) ────────
+
+    #[test]
+    fn generate_process_local_ids_are_unique_and_stable_as_a_hashmap_key() {
+        let a = AppPaneId::generate_process_local();
+        let b = AppPaneId::generate_process_local();
+        assert_ne!(a, b, "two independently generated ids must not collide");
+
+        // register()のキーとして正しく機能すること(=Hash/Eqが実用上壊れていない)
+        // をレジストリ越しに確認する。
+        let mut registry = TmuxLocatorRegistry::new();
+        registry.register(a.clone(), locator("tag-a"), None);
+        assert_eq!(registry.locator_for(&a), Some(&locator("tag-a")));
+        assert_eq!(registry.locator_for(&b), None);
     }
 }

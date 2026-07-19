@@ -785,7 +785,14 @@ pub(crate) fn create_ssh_session(config: SshConfig) -> Arc<SshSession> {
 }
 
 impl SshSession {
-    pub(crate) fn connect(&self, callback: Box<dyn SessionCallback>) -> Result<(), SshError> {
+    /// タスク#59: `app_pane_id`は`OrchestratorShared`が発行した、このタブの
+    /// 再接続をまたいで安定な識別子(`orchestrator::connect_via`参照)。
+    /// `run_ssh_channel_loop`まで素通しして、tmuxロケータレジストリを引くのに使う。
+    pub(crate) fn connect(
+        &self,
+        callback: Box<dyn SessionCallback>,
+        app_pane_id: crate::tmux_locator::AppPaneId,
+    ) -> Result<(), SshError> {
         let config = self.config.clone();
         let (cmd_rx, event_tx) = self.core.start(config.cols, config.rows, callback);
         // config.forwards はコマンドチャネル経由で forward_type に応じたコマンドとして
@@ -822,7 +829,7 @@ impl SshSession {
             }
         }
         RUNTIME.spawn(async move {
-            run_russh_transport(config, cmd_rx, event_tx).await;
+            run_russh_transport(config, cmd_rx, event_tx, app_pane_id).await;
         });
         Ok(())
     }
@@ -898,6 +905,7 @@ pub(crate) async fn run_russh_transport(
     mut config: SshConfig,
     cmd_rx: tokio::sync::mpsc::Receiver<TransportCommand>,
     event_tx: tokio::sync::mpsc::Sender<TransportEvent>,
+    app_pane_id: crate::tmux_locator::AppPaneId,
 ) {
     let russh_config = Arc::new(client::Config {
         keepalive_interval: Some(std::time::Duration::from_secs(60)),
@@ -960,7 +968,7 @@ pub(crate) async fn run_russh_transport(
     run_ssh_channel_loop(
         &pooled, config.cols, config.rows,
         config.agent_forward, config.allow_non_loopback_forward_bind,
-        cmd_rx, event_tx,
+        cmd_rx, event_tx, app_pane_id,
     ).await;
 
     if let Some(key) = pool_key {

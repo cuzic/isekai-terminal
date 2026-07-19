@@ -339,6 +339,14 @@ pub(crate) struct OrchestratorShared {
     /// `notify_network_path_changed`のdebounce/epoch状態。`Connected && !is_quic`の
     /// ケースだけがこれを実際に使う([`crate::net_health_policy`]参照)。
     path_observer: Mutex<crate::net_health_policy::PathObserver>,
+    /// タスク#59: [`crate::tmux_locator::TmuxLocatorRegistry`]のキーとして使う、
+    /// このタブの安定した識別子。`create_session_orchestrator`で1回だけ発行され、
+    /// 再接続(`connect_via`が新しい`ActiveSession`を作り直す場合を含む)をまたいでも
+    /// 不変(`OrchestratorShared`自体はタブの生存期間中ずっと同じインスタンス)。
+    /// Kotlin側の実`PaneAddress(tabId, paneId)`が現時点でUniFFI境界を越えて
+    /// 渡ってきていないための暫定値である点は
+    /// [`crate::tmux_locator::AppPaneId::generate_process_local`]のdoc参照。
+    pub(crate) app_pane_id: crate::tmux_locator::AppPaneId,
     reconnect_attempt: Box<ReconnectAttemptFn>,
     /// `spawn_reconnect_loop`の固定間隔ポーリング待機を、ネットワーク復帰通知で
     /// 早期に打ち切るためのシグナル(isekai-pipe側`resume_loop::wait_backoff_or_network_change`
@@ -693,7 +701,11 @@ fn connect_via(shared: &Arc<OrchestratorShared>, attempt: LastConnectAttempt) ->
     let session = match attempt {
         LastConnectAttempt::Ssh(config) => {
             let session = crate::create_ssh_session(config);
-            session.connect(Box::new(adapter))?;
+            // タスク#59: このタブの安定識別子を渡す(`OrchestratorShared::app_pane_id`
+            // 参照)。プレーンSSH経路(TCP直結・踏み台・QUICネスト共通の
+            // `run_ssh_channel_loop`)のctl-socket forwardが、確立/再接続の
+            // たびにこのIDでtmuxロケータレジストリを引く。
+            session.connect(Box::new(adapter), shared.app_pane_id.clone())?;
             ActiveSession::Ssh(session)
         }
         LastConnectAttempt::Quic(config) => {
@@ -905,6 +917,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
         callback: Arc::from(callback),
         session: Mutex::new(None),
         path_observer: Mutex::new(crate::net_health_policy::PathObserver::default()),
+        app_pane_id: crate::tmux_locator::AppPaneId::generate_process_local(),
         reconnect_attempt: Box::new(connect_via),
         reconnect_wake: tokio::sync::Notify::new(),
     });
@@ -958,7 +971,7 @@ impl SessionOrchestrator {
         let adapter = self.begin_connect(config.host.clone(), config.port, false)?;
         self.shared.state.lock().last_connect_attempt = Some(LastConnectAttempt::Ssh(config.clone()));
         let session = crate::create_ssh_session(config);
-        session.connect(Box::new(adapter))?;
+        session.connect(Box::new(adapter), self.shared.app_pane_id.clone())?;
         *self.shared.session.lock() = Some(ActiveSession::Ssh(session));
         Ok(())
     }
@@ -1455,6 +1468,7 @@ mod tests {
             callback: callback.clone(),
             session: Mutex::new(None),
             path_observer: Mutex::new(net_health_policy::PathObserver::default()),
+            app_pane_id: crate::tmux_locator::AppPaneId::generate_process_local(),
             reconnect_attempt: Box::new(connect_via),
             reconnect_wake: tokio::sync::Notify::new(),
         });
@@ -1511,6 +1525,7 @@ mod tests {
             callback: callback.clone(),
             session: Mutex::new(None),
             path_observer: Mutex::new(net_health_policy::PathObserver::default()),
+            app_pane_id: crate::tmux_locator::AppPaneId::generate_process_local(),
             reconnect_attempt: Box::new(move |_shared, _attempt| {
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -2443,6 +2458,7 @@ mod tests {
             callback: callback.clone(),
             session: Mutex::new(None),
             path_observer: Mutex::new(net_health_policy::PathObserver::default()),
+            app_pane_id: crate::tmux_locator::AppPaneId::generate_process_local(),
             // codexレビュー指摘: 実際の`connect_via`は`phase = Connecting`にしてから
             // 同期的に失敗し得るため、フェイクも同じ手順(先にConnectingへ変更してから
             // Errを返す)を踏んで、`notify_will_enter_foreground`側の`phase`復旧処理が

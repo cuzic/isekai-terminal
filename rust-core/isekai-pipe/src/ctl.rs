@@ -157,19 +157,64 @@ fn parse_ctl_clip(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLa
     }
 }
 
-fn resolve_ctl_socket_path(explicit: Option<String>) -> Result<PathBuf, ExitCode> {
+/// タスク#59: `$ISEKAI_CTL_SOCK`のフォールバック。rust-core側
+/// (`transport::ssh_handler::run_ssh_channel_loop`、`tmux_locator.rs`)が接続確立時・
+/// 再接続時ごとに、このタブに対応するtmuxウィンドウ/ペインへ
+/// pane/window-scopedなuser-option `@isekai_ctl_sock`として現在のctl-socketパスを
+/// 書き込んでいる。`tmux show-options -pv`(`-p`でペインスコープのオプションを問い合わせる、
+/// `-t`省略で「このコマンドを実行しているペイン自身」に解決される)で読み戻せば、
+/// 呼び出し元のペインが今アタッチしているtmuxセッション/ウィンドウ/ペインに応じて
+/// 自然に正しい値が返る(session-wideなオプションだと複数タブが同じ値を共有して
+/// しまうところ、window/pane単位で書かれているのでこれで正しく区別できる)。
+///
+/// tmux自体が無い/このペインにオプションが設定されていない/シェルが
+/// (経由するtmuxが無く)直接sshdの対話シェルである、等の場合は`None`を返し、
+/// 呼び出し側は通常のusageエラーに落ちる(opportunistic機能、黙ったフォールバック)。
+fn query_tmux_ctl_sock_option() -> Option<String> {
+    let output = std::process::Command::new("tmux")
+        .args(["show-options", "-pv", "@isekai_ctl_sock"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// `resolve_ctl_socket_path`の実装本体。`tmux_query`を引数として受け取れるように
+/// してあるのは、テストから実際に`tmux`サブプロセスを起動せず(このcrateの
+/// 「フェイクを使う、モックフレームワークは使わない」慣習に沿ったフェイク)、
+/// 「envも無くtmuxオプションもある/無い」の2ケースを決定的に検証するため
+/// (`resolve_ctl_socket_path`自体は本番用に`query_tmux_ctl_sock_option`を固定で渡す
+/// 薄いラッパーにする)。
+fn resolve_ctl_socket_path_with(
+    explicit: Option<String>,
+    tmux_query: impl FnOnce() -> Option<String>,
+) -> Result<PathBuf, ExitCode> {
     if let Some(explicit) = explicit {
         return Ok(PathBuf::from(explicit));
     }
-    match std::env::var_os(ENV_CTL_SOCK) {
-        Some(v) if !v.is_empty() => Ok(PathBuf::from(v)),
-        _ => {
-            eprintln!(
-                "isekai-pipe ctl: no --sock given and ${ENV_CTL_SOCK} is unset or empty"
-            );
-            Err(ExitCode::from(EX_USAGE))
+    if let Some(v) = std::env::var_os(ENV_CTL_SOCK) {
+        if !v.is_empty() {
+            return Ok(PathBuf::from(v));
         }
     }
+    if let Some(path) = tmux_query() {
+        return Ok(PathBuf::from(path));
+    }
+    eprintln!(
+        "isekai-pipe ctl: no --sock given, ${ENV_CTL_SOCK} is unset or empty, and no tmux @isekai_ctl_sock pane option was found"
+    );
+    Err(ExitCode::from(EX_USAGE))
+}
+
+fn resolve_ctl_socket_path(explicit: Option<String>) -> Result<PathBuf, ExitCode> {
+    resolve_ctl_socket_path_with(explicit, query_tmux_ctl_sock_option)
 }
 
 #[cfg(unix)]
@@ -401,6 +446,12 @@ mod tests {
         assert_eq!(err, ExitCode::from(EX_USAGE));
     }
 
+    // 以下`resolve_ctl_socket_path_with`越しにテストする: 実際に`tmux`サブプロセスを
+    // 起動する`resolve_ctl_socket_path`(本番用ラッパー)経由だと、テスト実行環境に
+    // たまたま`tmux`があるか・そのペインに`@isekai_ctl_sock`が設定済みかで結果が
+    // 変わり得て決定的でない(`query_tmux_ctl_sock_option`自体は薄いI/Oラッパーなので
+    // 個別の単体テストは設けない、他のこのcrateのサブプロセス呼び出しと同様)。
+
     #[test]
     fn resolves_sock_from_explicit_flag_over_env() {
         // `crate::ENV_LOCK`: `std::env::set_var`/`remove_var` are process-
@@ -410,7 +461,8 @@ mod tests {
         // env-mutating tests below (matches `isekai-ssh`'s `HOME_ENV_LOCK`).
         let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ENV_CTL_SOCK, "/from/env.sock");
-        let resolved = resolve_ctl_socket_path(Some("/from/flag.sock".to_string())).unwrap();
+        let resolved =
+            resolve_ctl_socket_path_with(Some("/from/flag.sock".to_string()), || None).unwrap();
         assert_eq!(resolved, PathBuf::from("/from/flag.sock"));
         std::env::remove_var(ENV_CTL_SOCK);
     }
@@ -419,16 +471,29 @@ mod tests {
     fn resolves_sock_from_env_when_no_flag() {
         let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(ENV_CTL_SOCK, "/from/env.sock");
-        let resolved = resolve_ctl_socket_path(None).unwrap();
+        let resolved = resolve_ctl_socket_path_with(None, || None).unwrap();
         assert_eq!(resolved, PathBuf::from("/from/env.sock"));
         std::env::remove_var(ENV_CTL_SOCK);
     }
 
+    /// タスク#59: `--sock`も`$ISEKAI_CTL_SOCK`も無いが、tmuxのpane-scoped
+    /// `@isekai_ctl_sock`オプションが読めるケース。
+    #[test]
+    fn resolves_sock_from_tmux_pane_option_when_no_flag_or_env() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(ENV_CTL_SOCK);
+        let resolved =
+            resolve_ctl_socket_path_with(None, || Some("/tmp/isekai-pipe-ctl-from-tmux.sock".to_string()))
+                .unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/isekai-pipe-ctl-from-tmux.sock"));
+    }
+
+    /// タスク#59: `--sock`/`$ISEKAI_CTL_SOCK`/tmuxオプションのいずれも無いケース。
     #[test]
     fn rejects_missing_sock() {
         let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(ENV_CTL_SOCK);
-        let err = resolve_ctl_socket_path(None).unwrap_err();
+        let err = resolve_ctl_socket_path_with(None, || None).unwrap_err();
         assert_eq!(err, ExitCode::from(EX_USAGE));
     }
 
