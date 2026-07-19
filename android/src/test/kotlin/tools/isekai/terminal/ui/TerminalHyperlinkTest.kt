@@ -19,6 +19,7 @@ class TerminalHyperlinkTest {
 
     /** 1行 * [cols]列の[ScreenUpdate]を組み立てる。cellsは呼び出し側が個別に用意する。 */
     private fun screenUpdate(cells: List<CellData>, cols: Int, rows: Int, linkTable: List<String>) = ScreenUpdate(
+        updateSeq = 0u,
         cols = cols.toUInt(),
         rows = rows.toUInt(),
         cells = cells,
@@ -37,6 +38,7 @@ class TerminalHyperlinkTest {
         linkTable = linkTable,
         images = emptyList(),
         kittyKeyboardFlags = 0u,
+        dirtyRows = null,
     )
 
     // ── linkUrlAtCell ────────────────────────────────────────────────

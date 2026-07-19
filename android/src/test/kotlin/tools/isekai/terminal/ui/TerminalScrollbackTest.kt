@@ -31,6 +31,7 @@ class TerminalScrollbackTest {
             (0 until cols).map { i -> cell(line.getOrNull(i) ?: ' ') }
         }
         return ScreenUpdate(
+            updateSeq = 0u,
             cols = cols.toUInt(),
             rows = rows.size.toUInt(),
             cells = cells,
@@ -49,6 +50,7 @@ class TerminalScrollbackTest {
             linkTable = emptyList(),
             images = emptyList(),
             kittyKeyboardFlags = 0u,
+            dirtyRows = null,
         )
     }
 

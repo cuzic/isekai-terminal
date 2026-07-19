@@ -2,6 +2,8 @@ package tools.isekai.terminal.ui
 
 import android.graphics.Bitmap
 import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import android.graphics.Typeface
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -176,6 +178,23 @@ internal class FontFitCache {
 }
 
 /**
+ * [GridRenderCache.planRender] が返す、次フレームでグリッド Bitmap をどう更新するかの決定。
+ *
+ * - [Reuse]: グリッドは前回描画分と同一。Bitmap を一切触らず貼り直すだけでよい。
+ * - [Full]: グリッド全体を再描画する(初回・セル寸法/テーマ背景/フォント/blink位相の
+ *   いずれかが変化した・`dirty_rows`が`None`=全画面dirtyのいずれか)。
+ * - [Partial]: `dirty_rows` が指定した行([rows])だけを既存 Bitmap に部分再描画する。
+ *   [rows]以外の行のピクセルは一切触らない(前回描画分をそのまま残す)。空リストは
+ *   「グリッドセルに変化なし(非グリッドフィールドだけ変わった等)」を意味し、部分再描画も
+ *   実質何もしない。
+ */
+internal sealed interface GridRenderPlan {
+    object Reuse : GridRenderPlan
+    object Full : GridRenderPlan
+    data class Partial(val rows: List<Int>) : GridRenderPlan
+}
+
+/**
  * 直近に描画したセル格子(背景+文字)を off-screen Bitmap にキャッシュする。
  *
  * `update`(UniFFI 生成の `ScreenUpdate`)は可変フィールド(`var`)を持つため Compose の
@@ -199,17 +218,66 @@ internal class GridRenderCache {
     private var renderedThemeBg = 0
     private var renderedTypeface: Typeface? = null
     private var renderedBlinkPhase = false
+    /** 前回描画した [ScreenUpdate.updateSeq]。ギャップ検出([planRender])に使う。 */
+    private var renderedSeq: UInt = 0u
 
     /**
-     * グリッド全走査(背景+文字)の再描画が必要かどうか。
+     * 次フレームでグリッド Bitmap をどう更新すべきかを決める(タスク#97、行単位の
+     * 部分再描画)。
      *
-     * [blinkPhase] は SGR 5(blink)セルの点滅位相(タスク#22)。`update` 自体は
-     * Rust 側が「blink属性が立っているかどうか」を変えない限り同一インスタンスの
-     * ままなので、位相の反転(表示⇔非表示の切り替え)だけでは他のキーが変化せず
-     * Bitmap キャッシュが再利用され続けてしまう(Fableレビュー2次で指摘された罠:
-     * 一度描かれたきり点滅しなくなるバグ)。呼び出し側([SshTerminalCanvas])は
-     * 実際にblink属性を持つセルが1つも無いときは常に同じ値(`false`)を渡すことで、
-     * blinkが無い画面では位相トグルのたびに無駄な全走査が走らないようにする。
+     * - セル寸法・テーマ背景色・フォント種別・blink位相のいずれかが前回描画時から
+     *   変わっていれば、`dirty_rows` の内容にかかわらず [GridRenderPlan.Full]
+     *   (全画面再描画)。これらは行を跨いだ描画結果(フォントサイズ・背景色・点滅)
+     *   に影響するため、変化した行だけを描き直しても他の行が古いままになる。
+     *   [blinkPhase] は SGR 5(blink)セルの点滅位相で、位相反転だけでも全走査が
+     *   必要になる(位相をキーに含めないと「一度描かれたきり点滅しない」バグになる)。
+     * - スタイルが不変で、かつ [update] が前回描画したのと同一インスタンスなら
+     *   [GridRenderPlan.Reuse](何もしない)。
+     * - スタイルが不変でも、`update.updateSeq` が前回描画した連番の次(wrapping)で
+     *   なければ、配信チャネル([TerminalSession] の `Channel.CONFLATED`)が中間の発行を
+     *   取りこぼしている。`dirty_rows` は「直前に発行した ScreenUpdate との差分」なので、
+     *   取りこぼしが起きると欠落分の変化が載らず表示が化ける——この場合は `dirty_rows` を
+     *   信用せず [GridRenderPlan.Full] にフォールバックする(Rust側 `update_seq` 追加の
+     *   UI側対応。rust-ssot: `dirty_rows` 計算自体はRust、フレーム取りこぼし判定は
+     *   UI/トランスポート固有の知識なのでKotlin側で持つ)。
+     * - スタイルが不変で `update.dirtyRows` が `null`(=Rust側が全画面dirtyと判定)なら
+     *   [GridRenderPlan.Full]。
+     * - スタイルが不変で `dirty_rows` が非nullなら、その行だけを描き直す
+     *   [GridRenderPlan.Partial]。画面範囲外の行番号(寸法変化直後の古い損傷レンジ等)は
+     *   除外し、行番号は重複排除する。
+     */
+    fun planRender(
+        update: ScreenUpdate,
+        cellW: Float,
+        cellH: Float,
+        themeBgArgb: Int,
+        typeface: Typeface,
+        blinkPhase: Boolean,
+    ): GridRenderPlan {
+        val styleChanged = renderedCellW != cellW ||
+            renderedCellH != cellH ||
+            renderedThemeBg != themeBgArgb ||
+            renderedTypeface !== typeface ||
+            renderedBlinkPhase != blinkPhase
+        if (styleChanged) return GridRenderPlan.Full
+        if (renderedUpdate === update) return GridRenderPlan.Reuse
+        // 配信チャネルでの取りこぼし検出。UInt の加算はモジュラなので wrapping も自動で正しい。
+        // (初回は styleChanged 側で必ず Full になるためここには到達せず、renderedSeq は常に有効。)
+        if (update.updateSeq != renderedSeq + 1u) return GridRenderPlan.Full
+        val damage = update.dirtyRows ?: return GridRenderPlan.Full
+        val rowCount = update.rows.toInt()
+        val dirtyRowIndices = damage.asSequence()
+            .map { it.line.toInt() }
+            .filter { it in 0 until rowCount }
+            .distinct()
+            .toList()
+        return GridRenderPlan.Partial(dirtyRowIndices)
+    }
+
+    /**
+     * グリッド全走査(背景+文字)の再描画が必要かどうか([GridRenderPlan.Reuse] 以外)。
+     * [planRender] のBoolean版で、`update`参照/セル寸法/テーマ背景/typeface/blink位相の
+     * いずれかが変わったか(または`dirty_rows`が全画面dirty)を判定する薄いラッパー。
      */
     fun needsRerender(
         update: ScreenUpdate,
@@ -219,12 +287,7 @@ internal class GridRenderCache {
         typeface: Typeface,
         blinkPhase: Boolean,
     ): Boolean =
-        renderedUpdate !== update ||
-            renderedCellW != cellW ||
-            renderedCellH != cellH ||
-            renderedThemeBg != themeBgArgb ||
-            renderedTypeface !== typeface ||
-            renderedBlinkPhase != blinkPhase
+        planRender(update, cellW, cellH, themeBgArgb, typeface, blinkPhase) != GridRenderPlan.Reuse
 
     fun markRendered(
         update: ScreenUpdate,
@@ -240,11 +303,18 @@ internal class GridRenderCache {
         renderedThemeBg = themeBgArgb
         renderedTypeface = typeface
         renderedBlinkPhase = blinkPhase
+        renderedSeq = update.updateSeq
     }
 
-    /** 次回の [needsRerender] を強制的に true にする(Bitmap を再確保したときに使う)。 */
+    /**
+     * 次回の [planRender] を強制的に [GridRenderPlan.Full] にする(Bitmap を再確保した
+     * ときに使う)。再確保直後の Bitmap は空(透明)なので、部分再描画ではなく必ず全画面
+     * 再描画しなければならない——スタイルキーを無効値へ倒して [planRender] が Full を
+     * 返すようにする(`renderedUpdate` のクリアだけでは部分再描画経路に落ちてしまう)。
+     */
     fun invalidate() {
         renderedUpdate = null
+        renderedCellW = -1f
     }
 }
 
@@ -328,7 +398,7 @@ internal class SixelBitmapCache {
  * 選択的に再描画できるようにするための純粋なリファクタ)。カーソル/選択ハイライトは
  * この経路の対象外(毎フレーム別途描画)である点は従来どおり。
  */
-private fun drawRow(
+internal fun drawRow(
     canvas: android.graphics.Canvas,
     rowIndex: Int,
     cells: List<CellData>,
@@ -386,6 +456,54 @@ private fun drawRow(
     }
 }
 
+/**
+ * タスク#97: `dirty_rows` が指定した [rows] だけを、既存の(前フレームを保持している)
+ * Bitmap [canvas] に部分再描画する。各行は描画前に**行全幅**([0, bitmapWidthPx))を
+ * [clearPaint](PorterDuff CLEAR = 透明化)でクリアしてから [drawRow] で描き直す。
+ *
+ * 列レンジ(`LineDamage.left`/`right`)ではなく必ず行全幅をクリアするのは、損傷レンジの
+ * 外側に前フレームの背景色や、セル幅を超えて右へはみ出したグリフの残骸が残り得るため
+ * (列レンジだけを消すと消し残しになる)。[rows]に含まれない行のピクセルは一切触らないので、
+ * 変化していない行は前フレームの描画がそのまま保持される。
+ */
+internal fun redrawDirtyRows(
+    canvas: android.graphics.Canvas,
+    rows: List<Int>,
+    bitmapWidthPx: Int,
+    cells: List<CellData>,
+    cols: Int,
+    cellW: Float,
+    cellH: Float,
+    baseline: Float,
+    themeBgArgb: Int,
+    effectiveBlinkPhase: Boolean,
+    clearPaint: Paint,
+    bgPaint: Paint,
+    textPaint: Paint,
+    typeface: Typeface,
+    italicTypeface: Typeface,
+) {
+    for (row in rows) {
+        val y = row * cellH
+        canvas.drawRect(0f, y, bitmapWidthPx.toFloat(), y + cellH, clearPaint)
+        drawRow(
+            canvas = canvas,
+            rowIndex = row,
+            cells = cells,
+            cols = cols,
+            cellW = cellW,
+            cellH = cellH,
+            baseline = baseline,
+            themeBgArgb = themeBgArgb,
+            effectiveBlinkPhase = effectiveBlinkPhase,
+            bgPaint = bgPaint,
+            textPaint = textPaint,
+            typeface = typeface,
+            italicTypeface = italicTypeface,
+        )
+    }
+}
+
 @Composable
 fun SshTerminalCanvas(
     update: ScreenUpdate,
@@ -412,6 +530,10 @@ fun SshTerminalCanvas(
     // BOLD_ITALIC バリアント確保が不要)。typeface が変わったときだけ作り直す。
     val italicTypeface = remember(typeface) { Typeface.create(typeface, Typeface.ITALIC) }
     val bgPaint = remember { Paint() }
+    // タスク#97: 部分再描画で1行分を「透明にクリア」するための Paint。PorterDuff CLEAR は
+    // 描画先ピクセルを src にかかわらず 0(透明)にするので、全画面再描画の
+    // `bmp.eraseColor(TRANSPARENT)` を行スコープに縮めたのと等価になる。
+    val clearPaint = remember { Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) } }
     val cursorPaint = remember { Paint() }
     val selectionPaint = remember {
         Paint().apply { color = android.graphics.Color.argb(120, 255, 255, 255) }
@@ -517,37 +639,61 @@ fun SshTerminalCanvas(
             gridCache.invalidate()
         }
 
-        if (gridCache.needsRerender(update, cellW, cellH, themeBgArgb, typeface, effectiveBlinkPhase)) {
-            // 前回描画分をクリア(既定背景色以外を描いたセルが今回は既定背景に戻る
-            // ケースがあるため、単純な上書きでは古いピクセルが残ってしまう)
-            bmp.eraseColor(android.graphics.Color.TRANSPARENT)
-            val bitmapCanvas = android.graphics.Canvas(bmp)
-
-            for (row in 0 until rows) {
-                drawRow(
-                    canvas = bitmapCanvas,
-                    rowIndex = row,
-                    cells = update.cells,
-                    cols = cols,
-                    cellW = cellW,
-                    cellH = cellH,
-                    baseline = baseline,
-                    themeBgArgb = themeBgArgb,
-                    effectiveBlinkPhase = effectiveBlinkPhase,
-                    bgPaint = bgPaint,
-                    textPaint = textPaint,
-                    typeface = typeface,
-                    italicTypeface = italicTypeface,
-                )
+        when (val plan = gridCache.planRender(update, cellW, cellH, themeBgArgb, typeface, effectiveBlinkPhase)) {
+            GridRenderPlan.Reuse -> Unit // グリッドは前回と同一。Bitmap を触らず下の drawImage で貼り直すだけ。
+            GridRenderPlan.Full -> {
+                // 前回描画分をクリア(既定背景色以外を描いたセルが今回は既定背景に戻る
+                // ケースがあるため、単純な上書きでは古いピクセルが残ってしまう)
+                bmp.eraseColor(android.graphics.Color.TRANSPARENT)
+                val bitmapCanvas = android.graphics.Canvas(bmp)
+                for (row in 0 until rows) {
+                    drawRow(
+                        canvas = bitmapCanvas,
+                        rowIndex = row,
+                        cells = update.cells,
+                        cols = cols,
+                        cellW = cellW,
+                        cellH = cellH,
+                        baseline = baseline,
+                        themeBgArgb = themeBgArgb,
+                        effectiveBlinkPhase = effectiveBlinkPhase,
+                        bgPaint = bgPaint,
+                        textPaint = textPaint,
+                        typeface = typeface,
+                        italicTypeface = italicTypeface,
+                    )
+                }
+                // 次回の描画でtypefaceが汚れたままにならないよう既定値へ戻す(このPaintは
+                // グリッド以外(カーソル等)では使わないが、rememberで使い回されるインスタンス
+                // なので明示的にリセットしておく)。`bgPaint.color`は次の背景run/装飾線描画の
+                // たびに都度上書きされるためリセット不要。
+                textPaint.typeface = typeface
+                gridCache.markRendered(update, cellW, cellH, themeBgArgb, typeface, effectiveBlinkPhase)
             }
-
-            // 次回の描画でtypefaceが汚れたままにならないよう既定値へ戻す(このPaintは
-            // グリッド以外(カーソル等)では使わないが、rememberで使い回されるインスタンス
-            // なので明示的にリセットしておく)。`bgPaint.color`は次の背景run/装飾線描画の
-            // たびに都度上書きされるためリセット不要。
-            textPaint.typeface = typeface
-
-            gridCache.markRendered(update, cellW, cellH, themeBgArgb, typeface, effectiveBlinkPhase)
+            is GridRenderPlan.Partial -> {
+                if (plan.rows.isNotEmpty()) {
+                    redrawDirtyRows(
+                        canvas = android.graphics.Canvas(bmp),
+                        rows = plan.rows,
+                        bitmapWidthPx = pixelW,
+                        cells = update.cells,
+                        cols = cols,
+                        cellW = cellW,
+                        cellH = cellH,
+                        baseline = baseline,
+                        themeBgArgb = themeBgArgb,
+                        effectiveBlinkPhase = effectiveBlinkPhase,
+                        clearPaint = clearPaint,
+                        bgPaint = bgPaint,
+                        textPaint = textPaint,
+                        typeface = typeface,
+                        italicTypeface = italicTypeface,
+                    )
+                    textPaint.typeface = typeface
+                }
+                // 部分再描画(空リスト=グリッド無変化を含む)でもスナップショットは前進させる。
+                gridCache.markRendered(update, cellW, cellH, themeBgArgb, typeface, effectiveBlinkPhase)
+            }
         }
 
         drawImage(
