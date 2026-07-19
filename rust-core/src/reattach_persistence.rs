@@ -83,12 +83,18 @@ mod tests {
 
     #[test]
     fn fresh_exactly_at_window_boundary_counts_as_fresh() {
-        assert!(reattach_record_is_fresh(1_000, 1_000 + AUTO_REATTACH_GRACE_SECS));
+        assert!(reattach_record_is_fresh(
+            1_000,
+            1_000 + AUTO_REATTACH_GRACE_SECS
+        ));
     }
 
     #[test]
     fn stale_just_past_window_boundary_is_rejected() {
-        assert!(!reattach_record_is_fresh(1_000, 1_000 + AUTO_REATTACH_GRACE_SECS + 1));
+        assert!(!reattach_record_is_fresh(
+            1_000,
+            1_000 + AUTO_REATTACH_GRACE_SECS + 1
+        ));
     }
 
     #[test]
