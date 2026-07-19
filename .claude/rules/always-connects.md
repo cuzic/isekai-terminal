@@ -25,7 +25,20 @@
   が必ず呼ばれることを確認する(`SessionTable::sweep_expired_parked`と`insert_existing`
   の両方が過去にこれを一度ずつ怠っていた——同じ見落としを繰り返さないこと)。
 - 唯一の例外: 本質的に自動化できないケース。新規(未登録)ホストの初回TOFU確認、
-  `isekai-ssh login`のトークン失効など、ユーザー入力が本質的に必要な場合は対象外。
+  `isekai-ssh login`のトークン失効、既知ホストのSSHホスト鍵ローテーション/再生成後の
+  pinning mismatchは対象外。ホスト鍵mismatchはMITMと正当な再デプロイを機械的に区別
+  できないため、自動上書きしてはならない(`isekai-trust::FileBackedHostKeyVerifier`
+  が既知・不一致を無条件でサイレント拒否するのは意図的な設計、`ssh(1)`の
+  `known_hosts`と同じセキュリティ姿勢)。正当な変更だとユーザーが確認できた場合のみ、
+  `~/.config/isekai-ssh/known_ssh_hosts.toml`の該当`"host:port"`エントリを手動削除
+  して再接続し、初回TOFU確認をやり直す。
+- 上記の「初回TOFU確認は例外」は、確認プロンプト自体が**対話端末でのみ**出ることが
+  前提。`TofuConfirmation::Silent`(`doctor --fix`/stale-trust自動復旧)経路で、SSH
+  ホスト鍵レベルのTOFU確認(`isekai-ssh::native::connect::prompt_new_host_confirmation`・
+  `isekai-bootstrap::russh_backend::prompt_new_host_confirmation`)に非対話ガード
+  (`std::io::IsTerminal`)が無いと、stdinが閉じずに応答も来ないコンテキストで
+  無期限ブロックし、原則違反になる(2026-07-19、実機Windows CIで一度発覚)。新しい
+  対話的確認を追加するときは、必ず非対話時に即fail/即エラーで返すガードを入れる。
 
 ## 理由
 
@@ -48,3 +61,8 @@
   返し、呼び出し元[`isekai-pipe/src/engine/mod.rs`]が`AttachRuntime::relay_ended`で
   fencing slotを解放する)
 - `ISEKAI_PIPE_DESIGN.md` §8 Epic N / Epic N-2
+- `isekai-trust/src/host_key_verifier.rs`: `FileBackedHostKeyVerifier`(既知一致は
+  サイレント通過、mismatchはサイレント拒否、未知のみ`confirm_new_host`を呼ぶ)
+- `isekai-ssh/src/native/connect.rs` / `isekai-bootstrap/src/russh_backend.rs`:
+  `prompt_new_host_confirmation`(`IsTerminal`で非対話セッションを即拒否する
+  ガード付き、native/Windows経路のSSHホスト鍵TOFU)
