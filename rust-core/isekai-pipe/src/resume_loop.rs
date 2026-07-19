@@ -1702,6 +1702,7 @@ mod tests {
                 network_rebinder: None,
                 is_tty: false,
                 last_resume_error: Some("connection refused".to_string()),
+                consecutive_unknown_session: 0,
             };
             let mut stdout = tokio::io::stdout();
             let now = Instant::now();

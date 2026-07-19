@@ -744,7 +744,7 @@ impl RusshBackend {
                 );
                 (args, relay.relay_jwt.clone().into_bytes())
             }
-            LaunchSpec::Direct { idle_lifetime_secs, remote_log_level, remote_bind_port_range } => {
+            LaunchSpec::Direct { idle_lifetime_secs, remote_log_level, remote_bind_port_range, resume_window_secs } => {
                 let remote_log_level = validate_log_level(remote_log_level)
                     .map_err(|e| BootstrapError::InvalidRemoteLogLevel(e.to_string()))?;
                 let bind_port_range_arg = match remote_bind_port_range {
@@ -753,7 +753,8 @@ impl RusshBackend {
                 };
                 let args = format!(
                     "--target 127.0.0.1:22 --bind 0.0.0.0:0 --bootstrap-request-file $tmpdir/bootstrap-request.json\
-                     {stun_server_arg}{bind_port_range_arg} --max-idle-lifetime {idle_lifetime_secs} --log-level {remote_log_level}"
+                     {stun_server_arg}{bind_port_range_arg} --max-idle-lifetime {idle_lifetime_secs} \
+                     --resume-window {resume_window_secs} --log-level {remote_log_level}"
                 );
                 (args, Vec::new())
             }
