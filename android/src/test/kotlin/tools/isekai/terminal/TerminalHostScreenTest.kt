@@ -199,4 +199,50 @@ class TerminalHostScreenTest {
         composeTestRule.waitUntil(3000) { orchestrators.size > 1 && orchestrators[1].connectCalled }
         assertTrue("パスワード入力後はsplit pane側のセッションも接続を試みるべき", orchestrators[1].connectCalled)
     }
+
+    // ── タスク#60: tmuxウィンドウ紐付けの " · tmux:N" タブラベルサフィックス ──────
+    // maybeEnsureTmuxTabWindow()は未保存(id=0)のプロファイルでは何もしないため、
+    // ここでは他のTerminalHostScreenTestテストが使う未保存profile()ではなく、
+    // Repositories.profiles.save()で実IDを払い出したプロファイルを使う
+    // (TerminalTabsViewModelTestの同種テストと同じ前提)。
+
+    @Test fun tabLabel_appendsTmuxWindowSuffix_onceEnsureTmuxTabWindowResolves() {
+        val profileId = runBlocking { Repositories.profiles.save(profile("alpha")) }
+        val savedProfile = runBlocking { Repositories.profiles.findById(profileId)!! }
+        // password authTypeなのでpasswordを渡さないとresolveAuth()が早期returnしconnect()自体が
+        // 一度も呼ばれない(=connectCalledが永遠にtrueにならない)。TerminalTabsViewModelTestの
+        // tmuxテスト群と同じ理由でここでもpasswordを渡す。
+        vm.openTab(savedProfile, "pass")
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        composeTestRule.onNodeWithText("alpha").assertExists()
+
+        composeTestRule.waitUntil(10_000) { orchestrators.isNotEmpty() && orchestrators[0].connectCalled }
+        orchestrators[0].simulateConnected()
+        composeTestRule.waitUntil(10_000) { orchestrators[0].ensureTmuxTabWindowCalls.isNotEmpty() }
+        // ensureTmuxTabWindowCalls記録後、Repositories.tmuxTabLocators.saveTag()(実Room書き込み、
+        // composeTestRuleのidling対象外の実スレッドで完了する)を経てtab.tmuxWindowLabelが
+        // 更新されるまでにもう一段ラグがあるため、ラベル自体のテキストが実際に現れるまで
+        // 明示的にポーリングする(waitForIdle()だけでは足りない)。
+        composeTestRule.waitUntil(10_000) {
+            composeTestRule.onAllNodesWithText("alpha · tmux:0").fetchSemanticsNodes().isNotEmpty()
+        }
+
+        // FakeOrchestrator.ensureTmuxTabWindowResultの既定値(windowIndex=0u)通り
+        // " · tmux:0" がプロファイル名に付け足されて表示されるはず。
+        composeTestRule.onNodeWithText("alpha · tmux:0").assertExists()
+        composeTestRule.onNodeWithText("alpha").assertDoesNotExist()
+    }
+
+    @Test fun tabLabel_hasNoTmuxSuffix_whenEnsureTmuxTabWindowNeverResolves() {
+        // 未保存(id=0)プロファイル: maybeEnsureTmuxTabWindowは早期リターンするので
+        // tmuxサフィックスは一切付かない(既存のtabBar_rendersOneLabelPerOpenTab等の
+        // 前提を明示的にテストとして固定する)。
+        vm.openTab(profile("alpha"))
+        composeTestRule.setContent { TerminalHostScreen(onAllTabsClosed = {}, tabsVm = vm) }
+        orchestrators[0].simulateConnected()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("alpha").assertExists()
+        assertTrue(orchestrators[0].ensureTmuxTabWindowCalls.isEmpty())
+    }
 }

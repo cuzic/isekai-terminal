@@ -28,6 +28,7 @@ import tools.isekai.terminal.session.TerminalSession
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.ScreenUpdate
+import uniffi.isekai_terminal_core.TmuxSessionException
 import uniffi.isekai_terminal_core.TransportPreference
 
 /**
@@ -768,5 +769,133 @@ class TerminalTabsViewModelTest {
 
         assertEquals(tools.isekai.terminal.ui.TerminalThemes.SOLARIZED_DARK, tab(followingId).currentTheme.value)
         assertEquals(tools.isekai.terminal.ui.TerminalThemes.DRACULA, tab(overriddenId).currentTheme.value)
+    }
+
+    // ── タスク#60: tmux session group / ウィンドウ紐付け ──────────────────────
+    // maybeEnsureTmuxTabWindow()はprimary paneのConnected立ち上がりでのみ呼ばれ、
+    // 未保存(id=0)のプロファイルでは何もしない(このファイルの他のテストが使う
+    // profile("a")等はまさにその未保存ケースであり、tmux呼び出しが一切発生しないことを
+    // 裏で前提にしている)。ここではRepositories.profiles.save()した実IDのプロファイルを使う。
+
+    private suspend fun savedProfile(label: String) =
+        Repositories.profiles.findById(Repositories.profiles.save(profile(label)))!!
+
+    private suspend fun awaitEnsureTmuxTabWindowCalled(o: FakeOrchestrator) =
+        withTimeout(3000) { while (o.ensureTmuxTabWindowCalls.isEmpty()) delay(10) }
+
+    @Test
+    fun maybeEnsureTmuxTabWindow_onFirstConnect_passesNullExistingTagAndPersistsReturnedTagAndLabel() = runBlocking {
+        val p = savedProfile("web")
+        val id = vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        awaitEnsureTmuxTabWindowCalled(orchestrators[0])
+
+        val call = orchestrators[0].ensureTmuxTabWindowCalls.single()
+        assertEquals("profile:${p.id}", call.profileIdentity)
+        assertNull("brand-new tab/profile should not pass an existingTag", call.existingTag)
+
+        withTimeout(3000) { while (tab(id).tmuxWindowLabel.value == null) delay(10) }
+        assertEquals("tmux:0", tab(id).tmuxWindowLabel.value)
+        assertEquals(
+            "returned tag must be written back to Room so a future reconnect can reuse it",
+            "fake-tag",
+            Repositories.tmuxTabLocators.findTagForProfile(p.id),
+        )
+    }
+
+    @Test
+    fun maybeEnsureTmuxTabWindow_reconnectingProfile_passesRoomPersistedTagAsExistingTag() = runBlocking {
+        val p = savedProfile("web")
+        Repositories.tmuxTabLocators.saveTag(p.id, "prior-session-tag")
+
+        vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        awaitEnsureTmuxTabWindowCalled(orchestrators[0])
+
+        val call = orchestrators[0].ensureTmuxTabWindowCalls.single()
+        assertEquals(
+            "a tab reconnecting to a profile with a previously-persisted tag must pass it through as existingTag",
+            "prior-session-tag",
+            call.existingTag,
+        )
+    }
+
+    @Test
+    fun maybeEnsureTmuxTabWindow_whenRustThrows_tabStaysConnectedAndUsableWithoutTmuxLabel() = runBlocking {
+        // opportunisticな補助機能(.claude/rules/always-connects.md/opportunistic方針)。
+        // リモートにtmuxが無い・exec channelが失敗した等でensureTmuxTabWindowが例外を
+        // 投げても、タブ自体は普通のシェルとして問題なく使い続けられるべき(接続や送信を
+        // ブロックしない)。
+        val p = savedProfile("web")
+        val id = vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].ensureTmuxTabWindowThrows = TmuxSessionException.Command("tmux: command not found")
+        orchestrators[0].simulateConnected()
+        withTimeout(3000) { while (!tab(id).session.state.value.connected) delay(10) }
+        awaitEnsureTmuxTabWindowCalled(orchestrators[0])
+        // ensureTmuxTabWindow自体はviewModelScope.launch内の別コルーチンで動くため、
+        // 例外がthrowされてからcatchされるまでの一瞬を待つ必要がある。
+        delay(50)
+
+        assertTrue("tab must remain connected despite the tmux failure", tab(id).session.state.value.connected)
+        assertNull("no window label should be shown when ensureTmuxTabWindow failed", tab(id).tmuxWindowLabel.value)
+        assertNull("no tag should be persisted when ensureTmuxTabWindow failed", Repositories.tmuxTabLocators.findTagForProfile(p.id))
+
+        // タブは通常のシェルとして引き続き使える(送信をブロックしない)ことも確認する。
+        vm.sendToPane(PaneAddress(id, tab(id).focusedPane.paneId), byteArrayOf(0x41))
+        assertTrue(orchestrators[0].sentBytes.any { it.contentEquals(byteArrayOf(0x41)) })
+    }
+
+    @Test
+    fun maybeEnsureTmuxTabWindow_splitPane_neverCallsEnsureTmuxTabWindow() = runBlocking {
+        // #60はprimary paneのみが対象(split paneはtmux非対応のMVP判断、
+        // rust-core/src/tmux_session.rsのモジュールdoc参照)。
+        val p = savedProfile("web")
+        val tabId = vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected()
+        awaitEnsureTmuxTabWindowCalled(orchestrators[0])
+
+        vm.splitPane(tabId, SplitDirection.VERTICAL, "pass")
+        awaitConnectCalled(orchestrators[1])
+        orchestrators[1].simulateConnected("host-a-split")
+        withTimeout(3000) { while (!tab(tabId).splitPane.value!!.session.state.value.connected) delay(10) }
+        delay(50)
+
+        assertTrue("split pane must never call ensureTmuxTabWindow", orchestrators[1].ensureTmuxTabWindowCalls.isEmpty())
+    }
+
+    @Test
+    fun maybeEnsureTmuxTabWindow_twoTabsOnSameProfile_secondTabReceivesFirstTabsFreshlyPersistedTagAsExistingTag() = runBlocking {
+        // タスク#60のRoom永続化キーはタブ単位ではなくプロファイル単位(TmuxTabLocatorの
+        // docコメント参照)。そのため、同一プロファイルの2つ目のタブを開くと、1つ目の
+        // タブがConnected直後に書き戻したタグをそのままexistingTagとして受け取る。
+        // rust-core/src/tmux_session.rs::ensure_tab_window は existing_tag が解決できれば
+        // 同じウィンドウを選択する(is_new_window=false)ため、これは実質的に「2つ目のタブは
+        // 1つ目のタブと同じtmuxウィンドウに丸め込まれ、独立したウィンドウにはならない」
+        // という設計上の既知のギャップを示す(#60スコープ外/未対応、production修正は
+        // このタスクの対象外なのでレポートで指摘するに留める)。
+        val p = savedProfile("web")
+        vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[0])
+        orchestrators[0].simulateConnected("host-a")
+        awaitEnsureTmuxTabWindowCalled(orchestrators[0])
+        withTimeout(3000) { while (Repositories.tmuxTabLocators.findTagForProfile(p.id) == null) delay(10) }
+        val tagFromTabA = Repositories.tmuxTabLocators.findTagForProfile(p.id)
+
+        vm.openTab(p, "pass")
+        awaitConnectCalled(orchestrators[1])
+        orchestrators[1].simulateConnected("host-a-2")
+        awaitEnsureTmuxTabWindowCalled(orchestrators[1])
+
+        val callB = orchestrators[1].ensureTmuxTabWindowCalls.single()
+        assertEquals(
+            "second tab on the same profile ends up passing the first tab's own tag back as existingTag " +
+                "(same-profile-two-tabs collision, see TmuxTabLocator.kt doc comment)",
+            tagFromTabA,
+            callB.existingTag,
+        )
     }
 }

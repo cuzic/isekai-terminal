@@ -603,6 +603,62 @@ class KnownHostRepositoryTest {
 }
 
 /**
+ * タスク#60: プロファイル単位のtmux session groupウィンドウtag永続化([TmuxTabLocator])の
+ * リポジトリテスト。マイグレーション自体([AppDatabaseMigrationTest.migrate19To20_createsTmuxTabLocatorsTable])
+ * は別途カバー済みなので、ここでは[TmuxTabLocatorRepository]の3メソッド(find/save/forget)の
+ * 振る舞いのみを検証する。
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28])
+class TmuxTabLocatorRepositoryTest {
+    private lateinit var db: AppDatabase
+    private lateinit var repo: TmuxTabLocatorRepository
+
+    @Before fun setup() {
+        val ctx = ApplicationProvider.getApplicationContext<Application>()
+        db = Room.inMemoryDatabaseBuilder(ctx, AppDatabase::class.java)
+            .allowMainThreadQueries().build()
+        repo = TmuxTabLocatorRepository(db.tmuxTabLocatorDao())
+    }
+
+    @After fun teardown() { db.close() }
+
+    @Test fun findTagForProfile_unknownProfile_returnsNull() = runBlocking {
+        assertNull(repo.findTagForProfile(42L))
+    }
+
+    @Test fun saveTag_then_findTagForProfile_returnsIt() = runBlocking {
+        repo.saveTag(1L, "tag-abc")
+        assertEquals("tag-abc", repo.findTagForProfile(1L))
+    }
+
+    @Test fun saveTag_calledAgainForSameProfile_replacesThePreviousTag() = runBlocking {
+        repo.saveTag(1L, "tag-old")
+        repo.saveTag(1L, "tag-new")
+
+        assertEquals("tag-new", repo.findTagForProfile(1L))
+    }
+
+    @Test fun saveTag_isIndependentPerProfile() = runBlocking {
+        repo.saveTag(1L, "tag-one")
+        repo.saveTag(2L, "tag-two")
+
+        assertEquals("tag-one", repo.findTagForProfile(1L))
+        assertEquals("tag-two", repo.findTagForProfile(2L))
+    }
+
+    @Test fun forgetProfile_removesEntry() = runBlocking {
+        repo.saveTag(1L, "tag-abc")
+        repo.forgetProfile(1L)
+        assertNull(repo.findTagForProfile(1L))
+    }
+
+    @Test fun forgetProfile_unknownProfile_doesNotThrow() = runBlocking {
+        repo.forgetProfile(999L)
+    }
+}
+
+/**
  * SSH agent forwarding 追加に伴う Room マイグレーション (v3 → v4) のテスト。
  * `exportSchema = false` のためスキーマ json 資産が無く `MigrationTestHelper` を使えないので、
  * v3 時点のテーブルを手動で構築 → `AppDatabase.MIGRATION_3_4` 込みで開き直す形で検証する。
