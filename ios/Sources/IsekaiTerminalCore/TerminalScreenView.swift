@@ -804,19 +804,27 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
                 case (false, false): resolvedFont = font
                 }
 
-                var attrs: [NSAttributedString.Key: Any] = [
+                let attrs: [NSAttributedString.Key: Any] = [
                     .font: resolvedFont,
                     .foregroundColor: fg,
                 ]
-                if cell.underline {
-                    attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-                    attrs[.underlineColor] = fg
-                }
-                if cell.strikethrough {
-                    attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
-                    attrs[.strikethroughColor] = fg
-                }
                 (cell.ch as NSString).draw(at: CGPoint(x: x, y: y), withAttributes: attrs)
+
+                // NSAttributedStringの.underlineStyle/.strikethroughStyleは、空白のみの
+                // 文字列(装飾だけが必要なblankセル、タスク#71)に対してCoreTextが装飾線を
+                // 描画しないケースが実機/シミュレータで確認されたため(GitHub Actions
+                // macOSランナーでの実行で判明)、カーソル形状(#34、上記switch文)と同じ
+                // 手法でfg色のRectを直接塗って装飾線を描く。
+                if hasLineDecoration {
+                    fg.setFill()
+                    let thickness = max(1.0, cellHeight * 0.08)
+                    if cell.underline {
+                        UIRectFill(CGRect(x: x, y: y + cellHeight - thickness, width: cellWidth, height: thickness))
+                    }
+                    if cell.strikethrough {
+                        UIRectFill(CGRect(x: x, y: y + cellHeight * 0.5 - thickness / 2, width: cellWidth, height: thickness))
+                    }
+                }
             }
         }
 
