@@ -29,6 +29,7 @@ pub(crate) mod faulty_udp_socket;
 pub mod debug_fault;
 pub(crate) mod resume_client;
 pub(crate) mod android_quic_endpoint;
+pub mod reattach_persistence;
 
 pub use quic_transport::QuicConfig;
 pub use orchestrator::{create_session_orchestrator, SessionOrchestrator};
