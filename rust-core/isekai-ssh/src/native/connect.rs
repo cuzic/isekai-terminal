@@ -125,9 +125,25 @@ pub(crate) async fn prepare(args: Vec<String>) -> Result<Prepared> {
     // path opens it at the top of `wrapper::run`; without this the flag was
     // silently ignored on Windows (Codex review finding). Opened before any
     // connection attempt so every diagnostic line below is captured.
+    //
+    // The `else` arm mirrors `wrapper::run`'s own default-verbose-log
+    // initialization, which this native path was missing entirely (real
+    // Windows CI regression found while investigating a post-merge e2e
+    // failure): `log_line_verbose!` (`bootstrap_and_register`'s "Registered
+    // ... in ..." line among others) silently drops every line whenever
+    // `log_file::init_verbose` was never called — `append_verbose_line`'s
+    // own doc comment confirms this is a deliberate best-effort no-op, not a
+    // panic, so the gap produced no visible symptom on its own. It only
+    // surfaced once a test started depending on that line appearing in the
+    // default verbose log instead of stderr.
     if let Some(log_file) = plan.log_file() {
         crate::log_file::init(log_file)
             .with_context(|| format!("isekai-ssh: failed to open --isekai-log-file at {}", log_file.display()))?;
+    } else if let Ok(verbose_log_file) = isekai_pipe_core::default_log_file() {
+        // Best-effort, same as `wrapper::run`: verbose bootstrap/diagnostic
+        // detail is a nicety, never worth failing the connection over a
+        // permissions/read-only-filesystem error opening its own log file.
+        let _ = crate::log_file::init_verbose(&verbose_log_file);
     }
     let (resolution, host_config) = crate::wrapper::resolve_for_native(&plan)?;
     if !resolution.isekai_enabled() {
