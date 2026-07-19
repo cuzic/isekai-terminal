@@ -312,11 +312,16 @@ async fn handle_ctl_connection(stream: impl tokio::io::AsyncRead + Unpin, expect
 ///   remote's `isekai-pipe ctl clip pull` rather than hanging.
 /// - `ClipboardPullResponse` → we never issue `ClipboardPullRequest`
 ///   ourselves, so seeing this would only be a misbehaving peer; ignored.
+/// - `Notify` → this CLI wrapper has no notification surface of its own
+///   (that's the Android app's job, #57); ignored here rather than
+///   implemented, matching how `ClipboardPullRequest` above is also left
+///   unimplemented pending a capability this wrapper doesn't have yet.
 fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
     match msg {
         CtlMessage::SetTitle { value } => Some(format!("\x1b]0;{value}\x07")),
         CtlMessage::ClipboardPush { data_b64, .. } => Some(format!("\x1b]52;c;{data_b64}\x07")),
         CtlMessage::ClipboardPullRequest {} | CtlMessage::ClipboardPullResponse { .. } => None,
+        CtlMessage::Notify { .. } => None,
     }
 }
 
