@@ -793,6 +793,38 @@ pub(crate) enum TofuConfirmation {
 /// checks `init.rs` uses, then passed to `OpenSshBackend::install_and_start`
 /// as a single `ssh(1)` `-J host1,host2,...` invocation, not nested `ssh`
 /// executions per hop.
+/// Resolves `#@isekai stun` directives (collected as plain strings without
+/// socket-address validation — `resolve_isekai_config`'s `append_args` just
+/// accumulates whatever text follows the directive, `#20b`) into
+/// `SocketAddr`s to pass to `install_and_start`. A malformed entry is
+/// skipped with a warning rather than failing the whole auto-bootstrap over
+/// one bad directive.
+///
+/// Well-known public STUN servers (e.g. Google's `stun.l.google.com`) are
+/// conventionally referenced by hostname, not a literal IP — `.parse::
+/// <SocketAddr>()` alone rejects those as "malformed" even though they're
+/// exactly the kind of entry users are most likely to configure. Falls back
+/// to DNS resolution (`tokio::net::lookup_host`, which — like `SocketAddr`'s
+/// own `FromStr` — requires the `host:port` form) before giving up on an
+/// entry.
+async fn resolve_stun_servers(entries: &[String]) -> Vec<SocketAddr> {
+    let mut resolved = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Ok(addr) = entry.parse::<SocketAddr>() {
+            resolved.push(addr);
+            continue;
+        }
+        match tokio::net::lookup_host(entry.as_str()).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => resolved.push(addr),
+                None => log_line_verbose!("isekai-ssh: ignoring #@isekai stun entry {entry:?}: DNS lookup returned no addresses"),
+            },
+            Err(e) => log_line_verbose!("isekai-ssh: ignoring malformed #@isekai stun entry {entry:?}: {e}"),
+        }
+    }
+    resolved
+}
+
 pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &WrapperResolution, confirmation: TofuConfirmation) -> Result<()> {
     let candidate = resolution
         .isekai
@@ -880,23 +912,7 @@ pub(crate) async fn bootstrap_and_register(plan: &WrapperPlan, resolution: &Wrap
     })?;
     let helper_sha256 = hex_sha256(&helper_binary);
 
-    // `#@isekai stun` directives are collected as plain strings without
-    // socket-address validation (`resolve_isekai_config`'s `append_args`
-    // just accumulates whatever text follows the directive) — a malformed
-    // entry is skipped with a warning here rather than failing the whole
-    // auto-bootstrap over one bad directive (`#20b`).
-    let stun_servers: Vec<SocketAddr> = resolution
-        .isekai
-        .stun_servers
-        .iter()
-        .filter_map(|entry| match entry.parse::<SocketAddr>() {
-            Ok(addr) => Some(addr),
-            Err(e) => {
-                log_line_verbose!("isekai-ssh: ignoring malformed #@isekai stun entry {entry:?}: {e}");
-                None
-            }
-        })
-        .collect();
+    let stun_servers = resolve_stun_servers(&resolution.isekai.stun_servers).await;
 
     let launch = match &resolution.isekai.bootstrap_relay {
         Some(relay_target) => {
@@ -1776,6 +1792,31 @@ mod tests {
     #[test]
     fn decide_connect_failure_recovery_retries_when_signal_found_and_bootstrap_allowed() {
         assert_eq!(decide_connect_failure_recovery(true, true), ConnectFailureRecoveryAction::RebootstrapAndRetry);
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_servers_accepts_a_literal_socket_addr() {
+        let resolved = resolve_stun_servers(&["203.0.113.9:3478".to_string()]).await;
+        assert_eq!(resolved, vec!["203.0.113.9:3478".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_servers_resolves_a_hostname_via_dns() {
+        // `localhost:PORT` resolves via the OS resolver without needing
+        // external network access (loopback is always in `/etc/hosts` or
+        // equivalent) — a stand-in for a real-world hostname entry like
+        // `stun.l.google.com:19302`, which `.parse::<SocketAddr>()` alone
+        // always rejects as "malformed" since it requires a literal IP.
+        let resolved = resolve_stun_servers(&["localhost:3478".to_string()]).await;
+        assert_eq!(resolved.len(), 1, "expected localhost:3478 to resolve to exactly one address");
+        assert_eq!(resolved[0].port(), 3478);
+        assert!(resolved[0].ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn resolve_stun_servers_skips_an_unresolvable_entry() {
+        let resolved = resolve_stun_servers(&["not a valid host or addr".to_string()]).await;
+        assert!(resolved.is_empty());
     }
 
     #[tokio::test]
