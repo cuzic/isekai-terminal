@@ -468,7 +468,15 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires before the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt this "y\n" answers — see `wrapper_auto_bootstrap_e2e.rs`'s
+    // sibling comment / `isekai-bootstrap/src/russh_backend.rs`'s module
+    // docs for why there's no `StrictHostKeyChecking`-equivalent knob to
+    // suppress it there too.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;

@@ -516,7 +516,16 @@ async fn spawn_init(
         .spawn()
         .expect("failed to spawn isekai-ssh init");
 
-    child.stdin.take().unwrap().write_all(stdin_line.as_bytes()).await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires before the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt `stdin_line` answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input = if cfg!(windows) { format!("yes\n{stdin_line}") } else { stdin_line.to_string() };
+    child.stdin.take().unwrap().write_all(confirm_input.as_bytes()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
         .await
         .expect("isekai-ssh init should not hang")
@@ -735,7 +744,9 @@ async fn init_with_stun_server_saves_the_observed_address_to_the_trust_store() {
         .stderr(StdStdio::piped())
         .spawn()
         .expect("failed to spawn isekai-ssh init");
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // See `spawn_init`'s comment for why Windows needs a leading "yes\n".
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
     let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
         .await
         .expect("isekai-ssh init should not hang")

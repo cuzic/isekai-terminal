@@ -558,7 +558,16 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     // The wrapper proceeds to exec a real `ssh` with `ProxyCommand isekai-pipe
     // connect ...` after bootstrap succeeds; that connect attempt has nothing
@@ -664,7 +673,16 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
@@ -762,7 +780,16 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
@@ -877,7 +904,16 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
@@ -1003,7 +1039,16 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
@@ -1100,7 +1145,11 @@ async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"n\n").await.unwrap();
+    // See the sibling "y\n" call sites' comment for why Windows needs an
+    // extra leading "yes\n" to get past `RusshBackend`'s own host-key TOFU
+    // prompt before reaching the app-level confirmation this "n\n" declines.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\nn\n" } else { b"n\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
         .await

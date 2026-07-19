@@ -211,13 +211,23 @@ impl server::Handler for FakeShellHandler {
     }
 }
 
+/// Returns the mock sshd's address *and* its host key's SHA256 fingerprint
+/// (`russh_keys::PublicKey::fingerprint`, the same format
+/// `isekai_trust::SshHostKeyTrust::fingerprint` stores) — callers that
+/// exercise a `TofuConfirmation::Silent` flow need the fingerprint to
+/// pre-seed `known_ssh_hosts.toml` via [`seed_ssh_host_key_trust`], since
+/// `RusshBackend`'s own host-key TOFU prompt (distinct from the app-level
+/// `[y/N]` trust-registration prompt `TofuConfirmation` controls) has no
+/// silent/non-interactive mode and would otherwise block forever on the
+/// `Stdio::null()` stdin these tests use.
 async fn spawn_fake_ssh_server(
     home: PathBuf,
     accepted_client_key: PublicKey,
     deploy_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) -> SocketAddr {
+) -> (SocketAddr, String) {
     let keypair = Ed25519Keypair::from_seed(&[13u8; 32]);
     let host_key = PrivateKey::from(keypair);
+    let fingerprint = host_key.public_key().fingerprint(russh_keys::HashAlg::Sha256).to_string();
     let config = std::sync::Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
     let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -226,7 +236,26 @@ async fn spawn_fake_ssh_server(
         use server::Server as _;
         let _ = sh.run_on_socket(config, &listener).await;
     });
-    addr
+    (addr, fingerprint)
+}
+
+/// Seeds `known_ssh_hosts.toml` under `home/.config/isekai-ssh/` with a
+/// pre-trusted entry for `host_port`, mirroring the on-disk state a *real*
+/// prior interactive bootstrap (`isekai-ssh init`) would have left behind —
+/// see [`spawn_fake_ssh_server`]'s docs for why a `TofuConfirmation::Silent`
+/// e2e test needs this instead of feeding a stdin answer.
+fn seed_ssh_host_key_trust(home: &std::path::Path, host_port: &str, fingerprint: &str) {
+    let path = home.join(".config").join(isekai_trust::store::CONFIG_DIR_NAME).join(isekai_trust::store::SSH_HOST_KEY_TRUST_STORE_FILE_NAME);
+    let mut store = isekai_trust::SshHostKeyTrustStore::default();
+    store.insert(
+        host_port.to_string(),
+        isekai_trust::SshHostKeyTrust {
+            fingerprint: fingerprint.to_string(),
+            trusted_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+        },
+    );
+    isekai_trust::save_ssh_host_key_trust_store(&path, &store).unwrap();
 }
 
 fn generate_client_keypair(dir: &std::path::Path) -> (PathBuf, PublicKey) {
@@ -452,10 +481,15 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     let remote_home = tmp.path().join("remote-home");
     std::fs::create_dir_all(&remote_home).unwrap();
     let deploy_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mock_sshd_addr = spawn_fake_ssh_server(remote_home.clone(), client_pubkey, deploy_count.clone()).await;
+    let (mock_sshd_addr, mock_sshd_fingerprint) = spawn_fake_ssh_server(remote_home.clone(), client_pubkey, deploy_count.clone()).await;
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
+    // The silent re-deploy uses `TofuConfirmation::Silent` for the app-level
+    // trust-registration prompt, but `RusshBackend`'s underlying SSH
+    // host-key TOFU (a separate, non-silenceable prompt) still needs this
+    // host key pre-trusted — see `seed_ssh_host_key_trust`'s docs.
+    seed_ssh_host_key_trust(&home, &format!("127.0.0.1:{}", mock_sshd_addr.port()), &mock_sshd_fingerprint);
     let shim = shim_ssh_with_bootstrap_config(tmp.path(), &home, "stale-trust-host", mock_sshd_addr, &key_path);
 
     // A real, currently-running isekai-pipe serve -- the "already deployed"
@@ -580,7 +614,7 @@ async fn wrapper_does_not_auto_recover_when_no_bootstrap_is_set() {
     let remote_home = tmp.path().join("remote-home");
     std::fs::create_dir_all(&remote_home).unwrap();
     let deploy_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mock_sshd_addr = spawn_fake_ssh_server(remote_home.clone(), client_pubkey, deploy_count.clone()).await;
+    let (mock_sshd_addr, _mock_sshd_fingerprint) = spawn_fake_ssh_server(remote_home.clone(), client_pubkey, deploy_count.clone()).await;
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
@@ -657,10 +691,13 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
     let remote_home = tmp.path().join("remote-home");
     std::fs::create_dir_all(&remote_home).unwrap();
     let deploy_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mock_sshd_addr = spawn_fake_ssh_server(remote_home.clone(), client_pubkey, deploy_count.clone()).await;
+    let (mock_sshd_addr, mock_sshd_fingerprint) = spawn_fake_ssh_server(remote_home.clone(), client_pubkey, deploy_count.clone()).await;
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
+    // Same reasoning as `wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects`:
+    // see `seed_ssh_host_key_trust`'s docs.
+    seed_ssh_host_key_trust(&home, &format!("127.0.0.1:{}", mock_sshd_addr.port()), &mock_sshd_fingerprint);
     let shim = shim_ssh_with_bootstrap_config(tmp.path(), &home, "unreachable-host", mock_sshd_addr, &key_path);
 
     // A `helper_addr` with nothing listening: bind a UDP socket, note its
