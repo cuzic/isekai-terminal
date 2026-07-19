@@ -994,7 +994,7 @@ async fn wrapper_auto_bootstrap_honors_resume_grace_directive() {
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
     let (_bin_dir, path_env, shim) =
-        shim_ssh_with_bootstrap_config(tmp.path(), "resume-grace-directive-host", mock_sshd_addr, &key_path);
+        shim_ssh_with_bootstrap_config(tmp.path(), &home, "resume-grace-directive-host", mock_sshd_addr, &key_path, "");
 
     let ssh_dir = home.join(".ssh");
     std::fs::create_dir_all(&ssh_dir).unwrap();
