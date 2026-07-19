@@ -59,6 +59,50 @@ pub(crate) enum TransportCommand {
     },
     /// `id` の待受を停止する(新規 accept を止める。既存の中継コピーは自然終了に任せる)。
     RemoveForward { id: String },
+    /// タスク#61: 既存のインタラクティブシェルチャネル/PTYには一切触れず、同じ
+    /// 認証済み`client::Handle`上に新しい"exec"チャネルを1本開いて短命なコマンドを
+    /// 実行する(tmux管理コマンドなど、リモートで1回だけ走らせて結果を回収したい
+    /// out-of-band用途向け)。実行中もインタラクティブチャネルのI/Oループ
+    /// (この`select!`自体)をブロックしないよう、受信側は必ず別タスクへ
+    /// `tokio::spawn`してから`reply`する([`run_ssh_channel_loop`]参照)。
+    RunExec {
+        command: String,
+        reply: tokio::sync::oneshot::Sender<Result<ExecOutput, ExecError>>,
+    },
+}
+
+/// [`TransportCommand::RunExec`]の成功結果。「コマンドを実行できたか」と
+/// 「コマンド自体が成功したか(終了コード0か)」は別の話なので、
+/// `exit_status`は非ゼロでも`Ok`側に入る(判断は呼び出し側=tmux管理ロジック等に委ねる)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExecOutput {
+    /// リモートコマンドの標準出力(バイト列のまま。UTF-8変換は呼び出し側の責務)。
+    pub(crate) stdout: Vec<u8>,
+    /// SSHプロトコル上の`exit-status`。サーバーが送らずにチャネルを閉じた場合は
+    /// `None`だが、その場合はそもそも`ExecError::ConnectionClosed`として返るため、
+    /// 呼び出し側が`Ok`の中で`None`を見ることは通常無い(将来奇妙なサーバー実装が
+    /// 見つかった場合の保険として型上`Option`のままにしてある)。
+    pub(crate) exit_status: Option<u32>,
+}
+
+/// [`TransportCommand::RunExec`]の失敗を表す型付きエラー。呼び出し元
+/// (`SessionCore::run_exec`等)はこれを見て「そもそも接続していない」のか
+/// 「実行中に接続が切れた」のかを区別できる。
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ExecError {
+    /// セッションが未接続、または既に切断済み(コマンド送信先の transport task が無い)。
+    #[error("ssh exec: not connected")]
+    NotConnected,
+    /// 新しいチャネルのオープン自体が失敗した(接続が瀕死、サーバーがチャネル数上限に
+    /// 達している、等)。
+    #[error("ssh exec: failed to open channel: {0}")]
+    ChannelOpen(String),
+    /// `exec`リクエスト(SSHの`channel_request`)自体をサーバーが拒否した/送信に失敗した。
+    #[error("ssh exec: exec request failed: {0}")]
+    ExecRequest(String),
+    /// 終了ステータスを受け取る前にチャネル/接続が閉じられた(実行中の切断)。
+    #[error("ssh exec: connection closed before command completed")]
+    ConnectionClosed,
 }
 
 /// tmux迂回control-plane(Epic M)のSSH streamlocal forwardチャネル1本から届いた
@@ -523,6 +567,68 @@ where
     finish_establishing_handle(handle, agent_key, remote_forwards, ctl_forwards, None, username, auth, agent_forward).await
 }
 
+// ── タスク#61: 既存の接続上での短命exec ──────────────────
+
+/// 既に認証済みの`handle`(インタラクティブシェル用チャネルが既に開いていて、
+/// アクティブに使われていてもよい)上に新しい"exec"チャネルを1本開き、
+/// `command`を実行して stdout と終了ステータスを回収する。
+///
+/// `helper_bootstrap::run_exec`(isekai-helperブートストラップ専用、stdin書き込み対応)
+/// と発想は同じだが、こちらは汎用API(タスク#61: tmux管理コマンドなど、他のRust側機能が
+/// 「1回だけリモートでコマンドを実行して結果を回収したい」用途向け)であり、
+/// stdinは使わない(呼び出し側のコマンド文字列だけで完結するナロースコープ)。
+///
+/// `handle`のロックは新チャネルを開く一瞬だけ保持し、以降のI/O
+/// (`channel.exec`/`channel.wait`等)は取得済みの`Channel`に対して行う——
+/// インタラクティブシェル用の別チャネル(同じ`handle`を共有)には一切触れない。
+pub(crate) async fn run_exec_on_handle(
+    handle: &Arc<tokio::sync::Mutex<client::Handle<RusshEventHandler>>>,
+    command: &str,
+) -> Result<ExecOutput, ExecError> {
+    let mut channel = handle
+        .lock()
+        .await
+        .channel_open_session()
+        .await
+        .map_err(|e| ExecError::ChannelOpen(e.to_string()))?;
+
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|e| ExecError::ExecRequest(e.to_string()))?;
+    // このAPIはstdinを扱わない(ナロースコープ)。すぐEOFを送り、コマンドが標準入力を
+    // 待っている場合でも速やかに終了できるようにする(ベストエフォート、失敗しても
+    // 出力の回収自体は続行する)。
+    channel.eof().await.ok();
+
+    let mut stdout = Vec::new();
+    let mut exit_status = None;
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
+            Some(ChannelMsg::ExtendedData { data, .. }) => {
+                // stderrはログ用途のみ(呼び出し側にはstdoutのみ返す、タスク#61のスコープ)。
+                if let Ok(s) = std::str::from_utf8(&data) {
+                    debug!("ssh exec stderr: {s}");
+                }
+            }
+            Some(ChannelMsg::ExitStatus { exit_status: status }) => {
+                exit_status = Some(status);
+            }
+            None => break,
+            _ => {}
+        }
+    }
+
+    match exit_status {
+        Some(status) => Ok(ExecOutput { stdout, exit_status: Some(status) }),
+        // exit-statusを受け取る前にチャネルが閉じた: 実行中に接続/チャネルが
+        // 切れたケースとして区別する(タスク#61「接続が切れた場合はtypedエラーで
+        // 表す」の要件)。
+        None => Err(ExecError::ConnectionClosed),
+    }
+}
+
 // ── SSH チャネルループ（TCP・QUIC 共通）─────────────────
 
 /// [pooled]（既に認証済み）に対して新しいSSHチャネル(セッション/PTY/シェル)を1本開き、
@@ -721,6 +827,20 @@ pub(crate) async fn run_ssh_channel_loop(
                                 id, state: ForwardState::Stopped,
                             }).await.ok();
                         }
+                    }
+                    Some(TransportCommand::RunExec { command, reply }) => {
+                        info!("ssh: exec requested (auxiliary channel, {} bytes command)", command.len());
+                        // `tokio::spawn`する: execの完了を待つ間もこの`select!`ループ
+                        // (=インタラクティブシェルチャネルのI/O)をブロックしないため
+                        // (タスク#61の並行性要件)。`session`はArc<Mutex<Handle>>の
+                        // clone なので、ロックは新チャネルを開く一瞬だけ競合し得るのみ。
+                        let session_for_exec = session.clone();
+                        tokio::spawn(async move {
+                            let result = run_exec_on_handle(&session_for_exec, &command).await;
+                            // 受信側(reply_rx)が既にdropしていても(呼び出し元が
+                            // キャンセル/タイムアウトした等)無視してよい。
+                            let _ = reply.send(result);
+                        });
                     }
                     Some(TransportCommand::Disconnect) | None => {
                         info!("ssh: disconnect requested");
@@ -1028,6 +1148,27 @@ mod pooling_e2e_tests {
                 return Ok(());
             }
             session.data(channel, CryptoVec::from(data.to_vec()))?;
+            Ok(())
+        }
+
+        // タスク#61: exec チャネル(`channel_open_session` + `exec_request`、PTY/shell
+        // 要求は伴わない)を模す。コマンド文字列に応じて、決まった stdout と
+        // 終了ステータスを返す最小の実装。`"exit-with-1"` は非ゼロ終了を、
+        // それ以外は「コマンドをそのままechoしてexit 0」を模す。
+        async fn exec_request(
+            &mut self, channel: ChannelId, data: &[u8], session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            let command = String::from_utf8_lossy(data).to_string();
+            if command == "exit-with-1" {
+                session.exit_status_request(channel, 1)?;
+            } else {
+                let reply = format!("exec-ran:{command}");
+                session.data(channel, CryptoVec::from(reply.into_bytes()))?;
+                session.exit_status_request(channel, 0)?;
+            }
+            session.eof(channel)?;
+            session.close(channel)?;
             Ok(())
         }
     }
@@ -1505,6 +1646,76 @@ mod pooling_e2e_tests {
             wait_echo(&mut rx_b, b"still-here").await;
 
             orch_b.disconnect();
+        });
+    }
+
+    /// タスク#61: 既存のインタラクティブシェルチャネル/PTYが生きて実際にデータを
+    /// やり取りしている最中に、同じ(プール済み)接続上で短命なexecコマンドを
+    /// 並行に実行しても、両者が互いに干渉しない(execがシェルチャネルをブロック
+    /// せず、シェルチャネルもexecの結果を乱さない)ことを検証する。
+    #[test]
+    fn run_exec_works_concurrently_with_interactive_shell_channel() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+            let auth = key_auth(140);
+
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let orch = create_session_orchestrator(Box::new(TestCallback { tx }));
+            orch.connect(ssh_config(addr, auth)).expect("connect should not fail synchronously");
+            wait_connected(&mut rx).await;
+
+            // execを別タスクへ投げっぱなしにし(=`run_exec`の完了を待たずに)、
+            // その完了を待つ間もインタラクティブシェルチャネルが引き続き使える
+            // ことを示す(「execがシェル用のI/Oループをブロックしない」という
+            // 並行性要件そのものを実際のawaitタイミングで確認する)。
+            let exec_task = {
+                let orch = orch.clone();
+                tokio::spawn(async move { orch.run_exec("echo hello".to_string()).await })
+            };
+
+            orch.send(b"during-exec".to_vec());
+            wait_echo(&mut rx, b"during-exec").await;
+
+            let exec_result = exec_task.await
+                .expect("run_exec task should not panic")
+                .expect("run_exec should succeed while the interactive shell channel is alive");
+            assert_eq!(exec_result.stdout, b"exec-ran:echo hello".to_vec());
+            assert_eq!(exec_result.exit_status, Some(0));
+
+            // execの後もシェルチャネルは無事(execは別チャネルであり干渉していない)。
+            orch.send(b"after-exec".to_vec());
+            wait_echo(&mut rx, b"after-exec").await;
+
+            // 非ゼロ終了ステータスも(Errにせず)`ExecOutput`として正しく伝わることを
+            // 確認する(「コマンドが実行できたか」と「コマンド自体の成否」は別、
+            // というタスク#61の設計)。
+            let failing = orch.run_exec("exit-with-1".to_string()).await
+                .expect("a non-zero remote exit status must still surface as Ok, not Err");
+            assert_eq!(failing.exit_status, Some(1));
+
+            orch.disconnect();
+        });
+    }
+
+    /// タスク#61: 未接続(`connect()`を一度も呼んでいない)状態で`run_exec`を呼ぶと、
+    /// パニックせずに型付きの`ExecError::NotConnected`を返すことを検証する。
+    #[test]
+    fn run_exec_before_connect_returns_not_connected_error() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let (tx, _rx) = unbounded_channel::<TestEvent>();
+            let orch = create_session_orchestrator(Box::new(TestCallback { tx }));
+
+            let result = orch.run_exec("echo hello".to_string()).await;
+            assert!(
+                matches!(result, Err(ExecError::NotConnected)),
+                "run_exec before connect() should return ExecError::NotConnected, got {:?}",
+                result.map(|o| o.stdout),
+            );
         });
     }
 }

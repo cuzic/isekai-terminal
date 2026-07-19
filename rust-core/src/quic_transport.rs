@@ -16,7 +16,7 @@ use crate::{
     init_logger, CellData, SessionCallback, SshAuth, SshError, RUNTIME,
 };
 use crate::session::SessionCore;
-use crate::transport::{TransportCommand, TransportEvent, run_ssh_channel_loop};
+use crate::transport::{ExecError, ExecOutput, TransportCommand, TransportEvent, run_ssh_channel_loop};
 
 // ── 公開型 ──────────────────────────────────────────────
 
@@ -89,6 +89,12 @@ impl QuicSession {
 
     pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
+    }
+
+    /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
+    /// 接続上で短命なexecコマンドを実行する。詳細は`SessionCore::run_exec`参照。
+    pub(crate) async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
+        self.core.run_exec(command).await
     }
 
     pub(crate) fn add_local_forward(

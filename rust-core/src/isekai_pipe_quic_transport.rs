@@ -37,7 +37,7 @@ use crate::helper_bootstrap::{self, BootstrapError, IsekaiPipeBinaries, IsekaiPi
 use crate::resume_client::{self, ClientResumeState};
 use crate::transport::{
     authenticate_session, connect_via_jump_or_direct, establish_ssh_handle_over_stream,
-    run_ssh_channel_loop, zeroize_ssh_auth, PooledSshHandle, TransportEvent,
+    run_ssh_channel_loop, zeroize_ssh_auth, ExecError, ExecOutput, PooledSshHandle, TransportEvent,
 };
 use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
@@ -208,6 +208,12 @@ impl IsekaiPipeQuicSession {
 
     pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
+    }
+
+    /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
+    /// 接続上で短命なexecコマンドを実行する。詳細は`SessionCore::run_exec`参照。
+    pub(crate) async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
+        self.core.run_exec(command).await
     }
 
     /// Phase 12: per-session theme。

@@ -39,7 +39,7 @@ use crate::isekai_pipe_quic_transport::{
 use crate::resume_client::{self, ClientResumeState};
 use crate::transport::{
     authenticate_session, connect_via_jump_or_direct, run_ssh_channel_loop,
-    TransportCommand, TransportEvent,
+    ExecError, ExecOutput, TransportCommand, TransportEvent,
 };
 use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
@@ -155,6 +155,12 @@ impl IsekaiStunP2pSession {
 
     pub(crate) fn trzsz_cancel(&self, transfer_id: String) {
         self.core.trzsz_cancel(transfer_id);
+    }
+
+    /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
+    /// 接続上で短命なexecコマンドを実行する。詳細は`SessionCore::run_exec`参照。
+    pub(crate) async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
+        self.core.run_exec(command).await
     }
 
     /// Phase 12: per-session theme。

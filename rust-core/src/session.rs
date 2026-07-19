@@ -10,7 +10,7 @@ use crate::{CellData, ClipboardMimeKind, ClipboardPayload, ScreenUpdate, Session
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
 use crate::terminal::{TermCell, Terminal};
 use crate::theme::Theme;
-use crate::transport::{SessionCmd, TransportCommand, TransportEvent};
+use crate::transport::{ExecError, ExecOutput, SessionCmd, TransportCommand, TransportEvent};
 use crate::trzsz::{TrzszMode, TrzszTimer};
 
 const SCROLLBACK_LIMIT: usize = 1000;
@@ -194,6 +194,22 @@ impl SessionCore {
         self.send_session_cmd(SessionCmd::TrzszCancel { transfer_id });
     }
 
+    /// タスク#61: 既存のインタラクティブシェルチャネル/PTYには触れず、この
+    /// セッションが今使っている同じ(プール済み)SSH接続上で短命なコマンドを
+    /// 実行し、stdoutと終了ステータスを回収する。`connect()`前/`disconnect()`後
+    /// (=`handle_tx`が`None`)は`ExecError::NotConnected`を返す。
+    ///
+    /// UniFFIへは意図的に公開しない(タスク#61のスコープ: 他のRust側機能
+    /// 〈将来のtmux管理コマンド等〉から呼ばれる想定で、Kotlin/Swiftからの
+    /// 直接呼び出しは対象外)。
+    pub(crate) async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
+        let tx = self.handle_tx.lock().clone().ok_or(ExecError::NotConnected)?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(TransportCommand::RunExec { command, reply: reply_tx })
+            .await
+            .map_err(|_| ExecError::NotConnected)?;
+        reply_rx.await.map_err(|_| ExecError::NotConnected)?
+    }
 }
 
 /// Kotlin/Swift側から送られてきた`SessionCmd`を`SessionState`に適用する。

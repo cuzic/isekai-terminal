@@ -12,9 +12,16 @@ use crate::isekai_pipe_quic_transport::{IsekaiPipeQuicConfig, IsekaiPipeQuicSess
 use crate::multipath_transport::{MultipathIsekaiPipeQuicConfig, MultipathIsekaiPipeQuicSession};
 use crate::isekai_stun_p2p_transport::{IsekaiStunP2pConfig, IsekaiStunP2pSession};
 use crate::isekai_link_relay_transport::{IsekaiLinkRelayConfig, IsekaiLinkRelaySession};
+use crate::transport::{ExecError, ExecOutput};
 
 // ── Active session ────────────────────────────────────────
 
+/// `Arc<T>`のバリアントのみを持つため`Clone`は安価(参照カウントの複製のみ)。
+/// `run_exec`(タスク#61)がasyncメソッドで、同期版`dispatch_all!`マクロの
+/// match式内で`.await`できない(アームごとに型の異なるFutureを生むため)ため、
+/// 呼び出し側で`session`ロック(`parking_lot::Mutex`、非async)を先に解放してから
+/// awaitできるよう、cloneして手元に持ってから使う。
+#[derive(Clone)]
 enum ActiveSession {
     Ssh(Arc<crate::SshSession>),
     Quic(Arc<QuicSession>),
@@ -117,6 +124,21 @@ impl ActiveSession {
     /// トランスポート非依存)なので、`add_local_forward`と違い対象外の分岐は無い。
     fn set_theme(&self, theme: crate::theme::Theme) {
         dispatch_all!(self, set_theme, theme)
+    }
+    /// タスク#61: 既存のインタラクティブチャネル/PTYに触れず、この(プール済み)
+    /// 接続上で短命なexecコマンドを実行する。全トランスポート共通
+    /// (`SessionCore::run_exec`)なので`add_local_forward`と違い対象外の分岐は無いが、
+    /// asyncメソッドは`dispatch_all!`(各アームを`.await`しないため型が揃わない)
+    /// では書けないので手書きのmatchにする。
+    async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
+        match self {
+            Self::Ssh(s) => s.run_exec(command).await,
+            Self::Quic(s) => s.run_exec(command).await,
+            Self::IsekaiPipeQuic(s) => s.run_exec(command).await,
+            Self::MultipathIsekaiPipeQuic(s) => s.run_exec(command).await,
+            Self::IsekaiStunP2p(s) => s.run_exec(command).await,
+            Self::IsekaiLinkRelay(s) => s.run_exec(command).await,
+        }
     }
 }
 
@@ -1302,6 +1324,28 @@ impl SessionOrchestrator {
         self.shared.callback.on_connection_state_changed(
             ConnectionPublicState::Error { message }
         );
+    }
+}
+
+// タスク#61: 意図的に`#[uniffi::export]`を付けない別の`impl`ブロックに置く
+// (この`impl`内の`pub(crate) fn`はUniFFI境界には一切現れない)。既存のリモート
+// コマンド系API(`send`/`resize`等)はすべて「`TransportCommand`をfire-and-forgetで
+// 投げ、結果は`OrchestratorCallback`経由の別イベントで非同期に返す」設計だが、
+// exec結果はコマンドを呼んだRust側コードがその場で欲しい値(stdout/終了コード)
+// そのものなので、ここだけ素直に`async fn`にして呼び出し元へ`Result`を返す
+// （UniFFI越しのKotlin/Swiftから直接呼ぶ経路は今回のタスクのスコープ外——
+// 将来tmux管理コマンド機能がRust側だけで完結して使う想定）。
+impl SessionOrchestrator {
+    /// 現在確立しているセッションの、既存のインタラクティブシェルチャネル/PTYには
+    /// 一切触れずに、同じ(プール済み)SSH接続上で短命なコマンドを実行し、
+    /// stdoutと終了ステータスを回収する。未接続/切断済みなら
+    /// `ExecError::NotConnected`を返す。
+    pub(crate) async fn run_exec(&self, command: String) -> Result<ExecOutput, ExecError> {
+        let active = self.shared.session.lock().clone();
+        match active {
+            Some(active) => active.run_exec(command).await,
+            None => Err(ExecError::NotConnected),
+        }
     }
 }
 
