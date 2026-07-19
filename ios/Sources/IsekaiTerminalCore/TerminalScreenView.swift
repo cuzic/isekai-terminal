@@ -70,7 +70,7 @@ func shouldResetBlinkPhase(
 /// 入力対象が食い違う)。Android版`MouseGestureArbiter.kt`の`isPointerReportingActive`
 /// と対称。
 func mouseReportingActive(
-    scrollOffset: Int, showingScrollback: Bool, mouseReportingMode: MouseReportingMode
+    scrollOffset: UInt32, showingScrollback: Bool, mouseReportingMode: MouseReportingMode
 ) -> Bool {
     guard scrollOffset == 0, !showingScrollback else { return false }
     return mouseReportingMode != .off
