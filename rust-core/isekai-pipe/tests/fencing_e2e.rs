@@ -8,9 +8,15 @@
 //! strictly larger generation may supersede an earlier, not-yet-`Established`
 //! attempt (but never lets two target TCP connections be concurrently open
 //! for one server instance); and `Established` cannot be re-attached to by a
-//! plain `ATTACH_HELLO` (same session → `AttachAlreadyEstablished`, this
-//! crate's `serve_e2e.rs::duplicate_connection_is_rejected` already covers
-//! the different-session → `BusyOtherSession` case, not repeated here).
+//! plain `ATTACH_HELLO` (same session → `AttachAlreadyEstablished`). Epic
+//! N-5 generalized `AttachArbiter` to one independent slot per `session_id`,
+//! so a *different* session_id no longer collides with an established one
+//! at all — `serve_e2e.rs`'s
+//! `two_independent_sessions_to_the_same_target_are_both_established`
+//! covers that, and its
+//! `capacity_full_with_nothing_parked_is_rejected_with_busy_other_session`
+//! covers the remaining `BusyOtherSession` case (capacity genuinely full),
+//! not repeated here.
 //!
 //! Self-contained per this crate's own convention (`serve_e2e.rs` duplicates
 //! the same helpers rather than sharing them via a `tests/common` module) —
