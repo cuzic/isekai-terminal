@@ -191,6 +191,17 @@ class TerminalInputConnectionTest {
         assertArrayEquals(byteArrayOf(0x1B), sentBytes[0])
     }
 
+    // タスク#72: Kitty keyboard protocol(タスク#54)のdisambiguate escape codes(bit0)が
+    // negotiateされている場合、物理キーボードのEscapeキーもCSI u形式で送られることを
+    // end-to-end(view.kittyKeyboardFlags → TerminalInputConnection → TerminalKeyEncoder)
+    // で確認する。エンコード自体のgolden testは`TerminalKeyEncoderTest`に既にある。
+    @Test
+    fun sendKeyEvent_escape_usesKittyCsiUWhenDisambiguateFlagNegotiated() {
+        view.kittyKeyboardFlags = 0b1u
+        keyDown(KeyEvent.KEYCODE_ESCAPE)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x32, 0x37, 0x75), sentBytes[0]) // ESC[27u
+    }
+
     @Test
     fun sendKeyEvent_arrowUp_sendsCsiA() {
         keyDown(KeyEvent.KEYCODE_DPAD_UP)
@@ -512,5 +523,145 @@ class TerminalInputConnectionTest {
         sentBytes.clear()
         keyDownMeta(KeyEvent.KEYCODE_A, KeyEvent.META_CTRL_ON)
         assertArrayEquals(byteArrayOf(0x01), sentBytes[0])
+    }
+
+    // --- 物理修飾キー付き特殊キー(タスク#30、Codexレビュー指摘: Ctrl+矢印が通常矢印として
+    //     扱われてしまうバグの修正確認) ---
+
+    @Test
+    fun sendKeyEvent_physicalCtrlPlusArrowUp_sendsModifiedCsiSequence() {
+        keyDownMeta(KeyEvent.KEYCODE_DPAD_UP, KeyEvent.META_CTRL_ON)
+        // ESC[1;5A（xterm互換のCtrl修飾子付きCSI、rust-core `terminal_special_key_bytes`(#29)と同一）
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x41), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_physicalCtrlPlusArrowUp_ignoresApplicationCursorMode() {
+        view.applicationCursorMode = true
+        keyDownMeta(KeyEvent.KEYCODE_DPAD_UP, KeyEvent.META_CTRL_ON)
+        // 修飾子付きは常にCSI形式(DECCKMが有効でもSS3にはならない)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x41), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_physicalShiftPlusTab_sendsCbt() {
+        keyDownMeta(KeyEvent.KEYCODE_TAB, KeyEvent.META_SHIFT_ON)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x5A), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_plainArrowUp_stillUnaffectedByModifierChange() {
+        // 修飾なしの場合の既存挙動(applicationCursorMode=false → CSI)に回帰が無いことを確認
+        keyDown(KeyEvent.KEYCODE_DPAD_UP)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x41), sentBytes[0])
+    }
+
+    // --- テンキー NumLock 状態(タスク#83、fableレビュー指摘: event.isNumLockOnが未使用だった) ---
+
+    private fun keyDownNumLock(keyCode: Int, numLockOn: Boolean): Boolean {
+        val metaState = if (numLockOn) KeyEvent.META_NUM_LOCK_ON else 0
+        return connection.sendKeyEvent(
+            KeyEvent(0L, 0L, KeyEvent.ACTION_DOWN, keyCode, 0, metaState),
+        )
+    }
+
+    @Test
+    fun sendKeyEvent_numpad8_numLockOn_sendsLiteralDigit() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_8, numLockOn = true)
+        assertArrayEquals(byteArrayOf('8'.code.toByte()), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpad8_numLockOff_sendsArrowUp() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_8, numLockOn = false)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x41), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpad2_numLockOff_sendsArrowDown() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_2, numLockOn = false)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x42), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpad6_numLockOff_sendsArrowRight() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_6, numLockOn = false)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x43), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpad4_numLockOff_sendsArrowLeft() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_4, numLockOn = false)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x44), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpad7_numLockOff_sendsHome() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_7, numLockOn = false)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x48), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpad1_numLockOff_sendsEnd() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_1, numLockOn = false)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x46), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpad9_numLockOff_sendsPageUp() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_9, numLockOn = false)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x35, 0x7E), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpad3_numLockOff_sendsPageDown() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_3, numLockOn = false)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x36, 0x7E), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpad0_numLockOff_sendsInsert() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_0, numLockOn = false)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x32, 0x7E), sentBytes[0]) // ESC[2~
+    }
+
+    @Test
+    fun sendKeyEvent_numpad0_numLockOn_sendsLiteralDigit() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_0, numLockOn = true)
+        assertArrayEquals(byteArrayOf('0'.code.toByte()), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpadDot_numLockOff_sendsForwardDelete() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_DOT, numLockOn = false)
+        assertArrayEquals(byteArrayOf(0x1B, 0x5B, 0x33, 0x7E), sentBytes[0]) // ESC[3~
+    }
+
+    @Test
+    fun sendKeyEvent_numpadDot_numLockOn_sendsLiteralDot() {
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_DOT, numLockOn = true)
+        assertArrayEquals(byteArrayOf('.'.code.toByte()), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpad5_numLockOff_unaffected_sendsLiteralDigit() {
+        // 中央キー(5)にはナビゲーション相当が無いため、NumLockに関わらず従来通りリテラル文字を送る
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_5, numLockOn = false)
+        assertArrayEquals(byteArrayOf('5'.code.toByte()), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpadAdd_numLockOff_unaffected_sendsLiteralPlus() {
+        // 四則演算子はNumLockの影響を受けない(実キーボードの慣習)
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_ADD, numLockOn = false)
+        assertArrayEquals(byteArrayOf('+'.code.toByte()), sentBytes[0])
+    }
+
+    @Test
+    fun sendKeyEvent_numpad8_numLockOff_respectsApplicationCursorMode() {
+        // NumLock OFF → 矢印キー相当への変換後も、既存の矢印キーと同じくDECCKMを尊重する
+        view.applicationCursorMode = true
+        keyDownNumLock(TerminalKeyEncoder.KC_NUMPAD_8, numLockOn = false)
+        assertArrayEquals(byteArrayOf(0x1B, 0x4F, 0x41), sentBytes[0])
     }
 }

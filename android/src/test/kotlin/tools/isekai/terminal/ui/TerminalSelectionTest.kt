@@ -3,6 +3,8 @@ package tools.isekai.terminal.ui
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import uniffi.isekai_terminal_core.CellData
+import uniffi.isekai_terminal_core.CursorShape
+import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.ScreenUpdate
 
 class TerminalSelectionTest {
@@ -13,7 +15,12 @@ class TerminalSelectionTest {
         val chars = text.toList()
         return (0 until cols).map { i ->
             val ch = chars.getOrNull(i)?.toString() ?: " "
-            CellData(ch = ch, fg = 0xFFFFFFFFu, bg = 0xFF000000u, bold = false)
+            CellData(
+                ch = ch, fg = 0xFFFFFFFFu, bg = 0xFF000000u, bold = false,
+                dim = false, italic = false, underline = false,
+                strikethrough = false, blink = false, invisible = false,
+                linkId = null,
+            )
         }
     }
 
@@ -27,7 +34,17 @@ class TerminalSelectionTest {
             cursorCol = 0u,
             title = null,
             applicationCursorMode = false,
+            applicationKeypadMode = false,
             bracketedPasteMode = false,
+            mouseReportingMode = MouseReportingMode.OFF,
+            sgrMouseMode = false,
+            cursorVisible = true,
+            bellGeneration = 0uL,
+            cursorShape = CursorShape.BLOCK,
+            cursorBlink = true,
+            linkTable = emptyList(),
+            images = emptyList(),
+            kittyKeyboardFlags = 0u,
         )
     }
 
@@ -90,7 +107,11 @@ class TerminalSelectionTest {
         val update = ScreenUpdate(
             cols = 80u, rows = 24u, cells = emptyList(),
             cursorRow = 0u, cursorCol = 0u, title = null,
-            applicationCursorMode = false, bracketedPasteMode = false,
+            applicationCursorMode = false, applicationKeypadMode = false, bracketedPasteMode = false,
+            mouseReportingMode = MouseReportingMode.OFF, sgrMouseMode = false,
+            cursorVisible = true, bellGeneration = 0uL,
+            cursorShape = CursorShape.BLOCK, cursorBlink = true, linkTable = emptyList(),
+            images = emptyList(), kittyKeyboardFlags = 0u,
         )
         val sel = SelectionRange(CellPos(0, 0), CellPos(1, 0))
         assertEquals("", reconstructSelectionText(update, sel))
@@ -101,7 +122,11 @@ class TerminalSelectionTest {
         val update = ScreenUpdate(
             cols = 0u, rows = 0u, cells = emptyList(),
             cursorRow = 0u, cursorCol = 0u, title = null,
-            applicationCursorMode = false, bracketedPasteMode = false,
+            applicationCursorMode = false, applicationKeypadMode = false, bracketedPasteMode = false,
+            mouseReportingMode = MouseReportingMode.OFF, sgrMouseMode = false,
+            cursorVisible = true, bellGeneration = 0uL,
+            cursorShape = CursorShape.BLOCK, cursorBlink = true, linkTable = emptyList(),
+            images = emptyList(), kittyKeyboardFlags = 0u,
         )
         val sel = SelectionRange(CellPos(0, 0), CellPos(0, 0))
         assertEquals("", reconstructSelectionText(update, sel))

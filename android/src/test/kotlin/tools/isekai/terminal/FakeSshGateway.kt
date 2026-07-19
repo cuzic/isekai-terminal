@@ -103,6 +103,18 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     override fun resize(cols: UInt, rows: UInt) { lastResizeCols = cols; lastResizeRows = rows }
     override fun scrollbackLen(): UInt = 0u
     override fun scrollbackCells(offset: UInt, rows: UInt): List<CellData> = emptyList()
+    // タスク#66: searchScrollback呼び出しの引数を記録し、任意の結果を返せるようにする
+    // (TerminalSession.searchScrollbackが単純中継であることをテストで確認するため)。
+    var lastSearchScrollbackQuery: String? = null
+    var lastSearchScrollbackCaseSensitive: Boolean? = null
+    var searchScrollbackResult: List<ScrollbackSearchMatch> = emptyList()
+    override fun searchScrollback(query: String, caseSensitive: Boolean): List<ScrollbackSearchMatch> {
+        lastSearchScrollbackQuery = query
+        lastSearchScrollbackCaseSensitive = caseSensitive
+        return searchScrollbackResult
+    }
+    var notifyFocusChangeCalls = mutableListOf<Boolean>()
+    override fun notifyFocusChange(focused: Boolean) { notifyFocusChangeCalls.add(focused) }
     override fun trzszAcceptDownload() { trzszAcceptDownloadCount++ }
     override fun trzszAcceptUpload(fileName: String, fileSize: ULong, mode: UInt) { trzszAcceptUploadCount++ }
     override fun trzszSendChunk(data: ByteArray, isLast: Boolean) {}

@@ -37,7 +37,9 @@ use isekai_protocol::attach::{
     AttachProof, AttachResponse, ConnectionGeneration,
 };
 use crate::transport::{run_ssh_channel_loop, ExecError, ExecOutput, TransportCommand, TransportEvent};
-use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
+use crate::{
+    init_logger, CellData, JumpConfig, ScrollbackSearchMatch, SessionCallback, SshAuth, SshError, RUNTIME,
+};
 use crate::session::SessionCore;
 use base64::Engine as _;
 use isekai_transport::multipath::{connect_multipath_with_socket, MultipathConnection};
@@ -252,9 +254,16 @@ impl MultipathIsekaiPipeQuicSession {
         self.core.inject_scrollback_history(lines)
     }
 
+    pub(crate) fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
+        self.core.search_scrollback(&query, case_sensitive)
+    }
+
     pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
 
     pub(crate) fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
+
+    /// タスク#60: OSのフォーカス変化をそのまま`SessionCore`へ転送する。
+    pub(crate) fn notify_focus_change(&self, focused: bool) { self.core.notify_focus_change(focused); }
 
     pub(crate) fn disconnect(&self) { self.core.disconnect(); }
 

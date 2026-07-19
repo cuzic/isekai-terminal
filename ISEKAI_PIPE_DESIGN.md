@@ -283,13 +283,58 @@ DoSガード(`--max-sessions`/`--resume-buffer-size`)は`archive/HELPER_PROTOCOL
 `archive/ISEKAI_SSH_DESIGN.md`「resume を ProxyCommand の背後に隠す」節を参照
 (ワイヤーフォーマット自体は変更していない)。
 
-### 6.4 `ssh`自身の生存確認とのレース
+### 6.4 resume windowの位置づけとgive-upのタイミング
 
-resume windowより`ServerAliveInterval × ServerAliveCountMax`を十分長く設定する必要がある
-(既定`--resume-window 120s`に対し推奨`ServerAliveInterval 30`×`ServerAliveCountMax 6`=180秒)。
-resume window超過時は明示的にstdin/stdoutをクローズし、`std::process::exit()`で終了する
+`--resume-window`(既定は`isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`、10日間
+——trzsz-ssh/tsshd(同種のUDP常駐resumeデーモン)の`UdpAliveTimeout`既定に倣った値、
+`§8 Epic N-3`参照)は、もはや「resumeが来るまでの主たる許容時間」ではなく、
+「本当に誰も戻ってこないparkセッションを最終的に回収するバックストップ」という位置づけ。
+実際の新規接続への資源保護(=誰も使っていないparkセッションが新規ATTACHをブロックし
+続けない保証)は、`engine/mod.rs::hello_with_parked_preemption`による「新規ATTACH_HELLO
+がBUSY_OTHER_SESSIONを受けたら、占有者が実際にparkされている場合だけ即座に立ち退かせる」
+仕組みが一次防御として機能している(`§8 Epic N-4`)。`SessionTable::insert_existing`の
+容量ベースLRU立ち退き(`--max-sessions`超過時に`parked_since`最古のセッションを
+立ち退かせる)は、fencing slotを既に獲得できたセッション同士の間でのみ働く別の防御線
+(Epic N-4以前は、単一fencing slotの制約により新規セッションがそもそもLRU立ち退きの
+コードへ到達できず、実質的に発火し得なかった——この誤りに気付かず「一次防御」と
+書いていたのがEpic N-3当初の記述で、Fableレビューで指摘・訂正された)。
+
+resume window超過時、および`RESUME`が`UnknownSession`で`UNKNOWN_SESSION_CONFIRM_THRESHOLD`
+(既定3)回連続で拒否された時点で、クライアントは諦める——後者はresume windowの
+`deadline`を待たない(`isekai-pipe/src/resume_loop.rs::resume_with_backoff_until_deadline`)。
+resume windowが数日オーダーになった今、「そのsession_idを`isekai-pipe serve`が
+同一プロセス内でparkし続けているが、sweep/LRU/新規接続によるpreemptionで既に
+回収済み」のような、絶対に成功しないケースをdeadlineまで機械的にリトライし続けると、
+即座に診断できたはずの失敗が数日間のハングになってしまうため。
+
+この即時give-upが効くのは「`isekai-pipe serve`プロセス自体は生きていて、確定的に
+`UnknownSession`を返答してくる」場合に限られる点に注意(Fableレビュー指摘)。
+プロセス自体が再起動・ホストが再起動した場合は、証明書・`session_secret`ごと
+入れ替わるためQUICハンドシェイク自体が失敗し(または応答無しでタイムアウトし)、
+`UnknownSession`という明確な拒否には決して到達しない——この場合は`isekai-ssh`側の
+「常に接続できる」原則(`.claude/rules/always-connects.md`、Epic N-2)による
+サイレント再bootstrapの対象であり、resume-grace(10日)いっぱいまでリトライし
+続けてしまう(即時give-upの恩恵を受けない)。
+
+`UnknownSession`を1回だけで即座にterminal扱いしなかったのは、`isekai-pipe serve`の
+`RESUME`ハンドラ(`engine/mod.rs`)が同じワイヤ値を3つの異なる状況——(a) session_idが
+テーブルに無い(本当に消滅)、(b) テーブルにはあるがまだparkされていない(直前の
+data streamのresetをまだ処理し終えていない一時的なrace、`parked_tcp == None`)、
+(c) `AttachArbiter`のfencing slotが一致しない——に対して区別なく返すため。(a)だけが
+本当に「二度と成功しない」ことを意味し、(b)/(c)は数百ms〜数秒で解消し得る一時的な
+raceでしかない。ワイヤ上この3つを区別できない以上、「毎回同じ確定的signalが返り
+続けている」ことでしか本物の消滅と区別できないので、連続確認回数のしきい値を設けている
+(Codex CLIによるセカンドオピニオンレビューで指摘され修正——最初の実装は1回で即座に
+give upしており、この一時的raceを本当の消滅と誤認して本来resumeできたはずのセッションを
+早まって諦める回帰だった)。
+give-up時は明示的にstdin/stdoutをクローズし、`std::process::exit()`で終了する
 (`tokio::io::stdin()`のブロッキングスレッドがランタイムシャットダウン時にハングする問題への
 対策、詳細は`archive/ISEKAI_SSH_DESIGN.md`参照)。
+
+`ssh`自身の生存確認(`ServerAliveInterval × ServerAliveCountMax`)は、openssh既定では
+そもそも無効(未設定なら probe 自体しない)なので通常は競合しない。明示的に設定している
+場合は、resume windowより短い値にすると「まだ正当にresume待ちで復帰できたはずの接続」を
+`ssh`自身が先回りして殺してしまうため、resume windowより十分長く設定すること。
 
 ## 7. セキュリティ
 
@@ -1276,6 +1321,144 @@ doctor --fix`または`isekai-ssh init`を**手動で**実行しない限り、�
   時に別経路を試しても無駄」という別の安全性判断であり、`ConnectOutcomeClass::Unreachable`
   はこれとは独立した、より外側の再bootstrapトリガーとして追加した。新規ホストのTOFU確認
   ・`isekai-ssh login`のトークン失効は引き続き自動化しない(ユーザー入力が本質的に必要)。
+
+### Epic N-3: ノートPCスリープ耐性のためのresume window再設計 — 完了(2026-07-17)
+
+**動機**: `isekai-ssh <hostname>`はノートPCがスリープから復帰した後、SSHセッションが
+切断される不具合が実機で確認された(本家`tssh`のUDPモード、同種の切断→再接続→resume
+設計を持つ`tsshd`は切断されない)。原因は2つ:
+
+1. `isekai-ssh`側の`#@isekai resume-grace`設定(クライアントのみの値)が、リモートに
+   自動デプロイされる`isekai-pipe serve`の起動引数には一切渡っていなかった
+   (`isekai-bootstrap::LaunchSpec`にそもそもフィールドが無かった)。サーバは常に
+   `--resume-window`の既定値120秒でparkしたセッションを破棄しており、クライアント側
+   だけresume-graceを伸ばしても無意味だった。
+2. 120秒という既定値自体が「reattach 5回の最悪ケース実測90秒+余裕」(実機検証Phase
+   8-4b)から逆算した、ネットワーク瞬断の検知+再試行予算用の値であり、ノートPC/スマホの
+   スリープのような分〜時間オーダーの中断を想定していなかった。
+
+比較対象として調べた本家`tssh`のUDPモード(`tsshd`)は、同種の設計でありながら
+`UdpAliveTimeout`の既定が10日間(`1w3d`)だった。isekai-pipeのparkしたセッションが
+保持するリソース(target=`127.0.0.1:22`へのloopback TCP、上限付き`OutputBuffer`、
+`--max-sessions`で上限管理された`SessionTable`エントリ)は長時間保持するコスト自体が
+小さいため、同じ考え方を採用した。
+
+- ✅ **既定値を10日間に統一**: `isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`を120→
+  864,000(10日)に変更し、`isekai-pipe serve --resume-window`・`isekai-pipe connect`の
+  ローカルgive-up deadline・`isekai-ssh`の`resume-grace`既定値の3箇所がこの1つの定数を
+  参照するように統一(値の重複管理をやめた)。位置づけも「主たる許容時間」から
+  「容量ベースLRU立ち退き(`SessionTable::insert_existing`、既存実装)が一次防御、
+  これは本当に放置されたセッションを最終回収するバックストップ」に変更(§6.4参照)。
+- ✅ **`LaunchSpec`にresume windowを追加しリモートデプロイへ伝搬**(本題のバグ修正):
+  `isekai-bootstrap::LaunchSpec::Direct`/`RelayLaunchSpec`に`resume_window_secs`を
+  追加、`OpenSshBackend`の起動argvに`--resume-window`を追加、`isekai-ssh`の
+  wrapper/`init`双方が解決済みの`resume_grace_secs`をこのフィールドへ渡すようにした。
+- ✅ **helper再利用fingerprintからは意図的に除外**: `reuse::launch_fingerprint`は
+  `idle_lifetime_secs`等と同じ理由(設定変更だけでアクティブな接続を巻き込んで
+  helperを強制再起動しない)で`resume_window_secs`も除外している。そのため既に
+  デプロイ済みのhelperは、自然に寿命切れ(`--max-idle-lifetime`、既定30日)になるか
+  手動で再デプロイを誘発するまで、旧い(短い)resume windowのまま動き続ける
+  ——アクティブなセッションを切断するリスクより安全側を優先した判断。
+- ✅ **`UnknownSession`が連続確認された時点でgive up**(回帰防止、§6.4参照): resume
+  windowが数日オーダーに伸びたことで、サーバプロセスの再起動のような「そのsession_id
+  では絶対に成功しない」ケースをdeadlineまで機械的にリトライし続けると、即座に診断
+  できたはずの失敗が数日間のハングになってしまう。`isekai-pipe/src/resume_loop.rs::
+  resume_with_backoff_until_deadline`に、`TransportError::ResumeRejected
+  (ResumeRejectReason::UnknownSession)`を検出したら諦める分岐を追加した(deadline
+  超過時と同じgive-up処理を共通の`give_up`ヘルパーへ切り出して共有)。
+  **1回目の実装は単発の`UnknownSession`で即座にgive upしていたが**、これは
+  `isekai-pipe serve`の`RESUME`ハンドラが「本当に消滅」と「まだparkされていない
+  一時的なrace」を同じワイヤ値で返すことを見落としており、本来resumeできたはずの
+  セッションを早まって諦める回帰だった。実装後の**敵対的レビュー**(下記)で
+  指摘され、`UNKNOWN_SESSION_CONFIRM_THRESHOLD`(既定3)回連続で確認できてから
+  give upする形に修正した(`update_unknown_session_streak`、`ResumeLoopState::
+  consecutive_unknown_session`)。
+- この設計変更はCodex CLI(`codex exec -s read-only`)に**2段階**でセカンドオピニオン
+  レビューさせた: 設計段階のレビューでhelper再利用fingerprintの見落とし・
+  `UnknownSession`即時give-upの必要性そのものを指摘され設計に取り込み、実装完了後の
+  敵対的レビューで上記の「単発give-upが誤って本来resumeできるセッションを捨てる」
+  回帰を指摘され修正した——実装後のレビューでも実際にバグが見つかった実例として、
+  この規模の変更では実装後レビューも省略すべきでないことの記録として残す。
+- Android側(`rust-core/src/multipath_transport.rs`)は`requested_resume_grace_secs
+  = 0`固定(サーバ既定値に追従)のため変更不要——サーバ既定値の引き上げで自動的に
+  恩恵を受ける。
+
+### Epic N-4: parkされたセッションによる新規接続ロックアウトの解消 — 完了(2026-07-18)
+
+**動機**: Epic N-3出荷後、2エージェント(Codex CLI・Fableモデル)による2回目の敵対的
+レビューで、resume windowを10日間に伸ばしたこと自体が新たな致命的回帰を生んでいたと
+判明した。`AttachArbiter`(`engine/attach_arbiter.rs`)はターゲット1つにつき単一の
+`Established` fencing slotしか持たず、parkされたセッションもfencing上は
+`Established`のまま(`RelayOutcome::DataStreamDied`ハンドラのコメント参照)。別
+`session_id`での新規`ATTACH_HELLO`は、そのセッションが実際にアクティブ中継中か
+parkされて待機中かを問わず、無条件に`BusyOtherSession`で拒否される
+(`on_hello_received`)。このスロットを解放する経路は事実上`sweep_expired_parked`
+(=`--resume-window`、Epic N-3で10日間に)だけで、`SessionTable::insert_existing`の
+容量ベースLRU立ち退きは新規セッションがarbiterを通過して`activate()`まで成功して
+初めて呼ばれるコードなので、arbiterでBUSY拒否されている間は原理的に発火しない。
+
+`isekai-ssh <host>`の新規起動は毎回新しい`session_id`を生成し、クライアント側の
+`BUSY_OTHER_SESSION`リトライループ(`resume_loop.rs::retry_while_busy_other_session`)
+のdeadlineも当時は同じ`resume-grace`(10日)を使っていた。結果、ノートPCを閉じたまま
+二度と開かない・クライアントプロセスが強制終了される・ホスト再起動などで元クライアント
+が二度とresumeしに戻ってこない場合、**同じホストへの新規接続が最大10日間ブロックされる**
+——Epic N-3以前(既定120秒)なら数分で自然回復していたのが、「常に接続できる」という
+このプロジェクトの最優先設計原則(`.claude/rules/always-connects.md`)そのものを最大
+10日間破る形になっていた。皮肉にも、Epic N-3が救おうとした「スリープ後に繋ぎ直す」
+まさにその利用シーンで一番踏みやすい罠だった。
+
+**設計**: 根本修正の実装方針はCodex CLIとFableモデルの両方に独立に設計相談し、
+両者とも同じ核心的な仕組み(`AttachArbiter`という「pure, I/O-free」reducerに
+`SessionTable`の`parked_tcp`状態を教えるのではなく、実際に`parked_tcp`をatomicに
+take()できたときだけ立ち退きを実行する、executor層[`engine/mod.rs`]での判断)に
+収束した。Fable案(BusyOtherSession拒否を受けてから初めて立ち退きを試みる、より
+手術的な形)を採用:
+
+- ✅ **`AttachRuntime::current_established()`**(`attach_runtime.rs`): 現在
+  `Established`スロットを占有している`(session_id, lease)`を返す単純なgetter。
+- ✅ **`SessionTable::claim_parked()`**(`resume.rs`): `id`が実際にparkされている
+  場合だけatomicに`parked_tcp`を取り除きtableから除去する(`ClaimParkedOutcome::
+  Claimed`/`NotParked`/`Missing`)。アクティブに中継中のセッションは絶対に
+  立ち退かせない。`Missing`(=`AttachArbiter`は`Established`なのに`SessionTable`
+  にentryが無いorphan状態、`always-connects.md`が記録する過去2回のfencing
+  slot漏れバグと同種の症状)も、取り除くものが無いだけで立ち退き対象として扱い、
+  この不具合クラスを自己修復する。
+- ✅ **`hello_with_parked_preemption()`**(`engine/mod.rs`、`handle_attach_stream`
+  から呼び出し): `attach_runtime.hello(key)`が`BusyOtherSession`で拒否されたら、
+  現在の占有者が`claim_parked`で実際に立ち退かせられた場合(`Claimed`/`Missing`)
+  だけ`release_slot_for`でfencing slotを解放し、`hello(key)`をもう一度呼ぶ。
+  `NotParked`(アクティブ中継中、または同時に来た正当な`RESUME`が先に
+  `parked_tcp`を取った)の場合は従来通り`BusyOtherSession`を返す——勝敗は
+  `parked_tcp.take()`の早い者勝ちで自然に決まるため、正当な持ち主のRESUMEと
+  競合しても安全(セキュリティ分析: `ATTACH_HELLO`はarbiter到達前に
+  `session_secret`ベースのHMAC proof検証を通過済みなので、立ち退きを発動できる
+  のはこのデプロイメントの秘密を知る正当なクライアントに限られ、新しい攻撃面は
+  実質増えない)。
+- ✅ **`release_slot_for()`共通ヘルパー**(`engine/mod.rs`): 従来
+  `sweep_expired_parked`・`insert_existing`のLRU立ち退きの2箇所にverbatim重複
+  していた「`established_lease_for` → `relay_ended`」の対を1箇所に集約し、新設の
+  preemptionパスも同じヘルパーを使う(`always-connects.md`が「この対を2回忘れた」
+  と明記するcorrectness-criticalなパターンのため)。
+- ✅ **`--resume-window`(10日間)・`sweep_expired_parked`は無変更で維持**:
+  時間ベースの最終バックストップとして直交する役割を持ち続ける。「誰にも
+  押しのけられなければ最大10日間はresume可能」(Epic N-3の本来の目的)と
+  「新規接続時は即座に古いparkセッションを押しのけられる」(本Epic)が両立する。
+- ✅ **`BUSY_OTHER_SESSION_RETRY_WINDOW`の追加(多層防御)**:
+  `resume_loop.rs::retry_while_busy_other_session`のdeadlineを`resume-grace`
+  (10日)から切り離し、固定180秒に変更した。`resume_window_secs`はhelper再利用
+  fingerprintから意図的に除外している(Epic N-3)ため、本Epicの修正は既に
+  デプロイ済みのhelperには最長`--max-idle-lifetime`(30日)届かない——その間、
+  修正前バイナリのhelperに対してクライアントが10日間サイレントにハングし続ける
+  のを防ぎ、数分で可視化されたエラーに倒す(接続の成功自体を早めるものではない
+  ——真の解決は新binaryへの再デプロイ)。
+- ✅ テスト: `resume.rs`に`claim_parked`の4分岐(claim成功/アクティブ保護/
+  不在/RESUMEとの競合)のユニットテストを追加。`serve_e2e.rs`に
+  `fresh_attach_preempts_a_parked_session_immediately_without_waiting_for_resume_window`
+  (`--resume-window 3600`でも即座に立ち退きが成功し、立ち退かれた旧セッションの
+  RESUMEはUnknownTokenになることを確認)を追加。既存の`duplicate_connection_is_
+  rejected`(アクティブセッションは今まで通り立ち退かない)・
+  `fresh_attach_after_park_expiry_succeeds_instead_of_staying_busy`
+  (sweep経由の回復)は無傷で通ることを確認済み。
 
 ### Epic O: Windows公式サポート化(クライアントのみ、接続先は引き続きLinux固定)— 完了(2026-07-14)
 

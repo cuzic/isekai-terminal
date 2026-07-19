@@ -9,6 +9,9 @@
     <!-- Phase 9-4（実験的機能、既定OFF）: Wi-Fi/セルラー物理無線への同時マルチパスの
          ためのrequestNetwork()。プロファイルでオプトインしない限り実際には使われない。 -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!-- #25: BEL(端末ベル)受信時の触覚フィードバック。VIBRATEはnormal permissionで
+         インストール時に自動付与され、ランタイム許可プロンプトは発生しない。 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:name=".IsekaiTerminalApplication"

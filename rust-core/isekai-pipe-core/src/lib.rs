@@ -46,7 +46,24 @@ pub const DEFAULT_RELAY_DELAY_MS: u64 = 750;
 /// absent an explicit `#@isekai resume-grace` override — the server clamps
 /// this to its own configured max and echoes back the effective value in
 /// `ACK` (`ISEKAI_PIPE_DESIGN.md`).
-pub const DEFAULT_RESUME_GRACE_SECS: u64 = 120;
+///
+/// Also reused as `isekai-pipe serve --resume-window`'s own default (park
+/// retention backstop) and `isekai-pipe connect`'s local give-up deadline —
+/// all three must move together or a client requesting more than the server
+/// is willing to hold is silently clamped down to the server's shorter
+/// value, defeating the point of raising it client-side alone (this is
+/// exactly what happened before this constant became 10 days: an
+/// `isekai-ssh`-only `resume-grace` override was clamped to the server's
+/// unrelated 120s default, so parked sessions were reaped long before a
+/// laptop woke from sleep). 10 days matches trzsz-ssh/tsshd's
+/// `UdpAliveTimeout` default (its own mosh-like resumable-session daemon) —
+/// a battle-tested value for "how long should a suspended-laptop session
+/// stay resumable". Capacity-based LRU eviction (`SessionTable::
+/// insert_existing`'s eviction of the oldest parked session under
+/// `--max-sessions` pressure) is the primary resource bound; this window is
+/// only the backstop that eventually reclaims a session nobody ever comes
+/// back for.
+pub const DEFAULT_RESUME_GRACE_SECS: u64 = 864_000;
 
 /// STUN hole-punch retry counter, distinct from `CandidateGeneration`
 /// (candidate-collection round) and any future connection-attach generation

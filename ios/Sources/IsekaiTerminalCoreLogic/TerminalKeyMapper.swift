@@ -44,8 +44,40 @@ public enum TerminalKeyMapper {
     /// 打鍵列(KeySequence)機能向け: `applicationCursorMode`(DECCKM)を明示的に指定できる版。
     /// 矢印キー等はtmux/vim等でDECCKMがオンの場合SS3形式になる(Android版
     /// `TerminalKeyEncoder.specialKeyBytes(keyCode, applicationCursorMode)`と同じ挙動)。
-    public static func bytes(for key: SpecialKey, applicationCursorMode: Bool) -> [UInt8] {
-        Array(terminalSpecialKeyBytes(key: key.rustKey, applicationCursorMode: applicationCursorMode))
+    ///
+    /// `modifiers`(Shift/Alt/Ctrl/Meta)はRust側の`terminal_special_key_bytes`(#29)へ
+    /// そのまま委譲する(ハードウェアキーボード接続時のUI配線本体は#63)。UniFFIが生成した
+    /// `TerminalKeyModifiers`をこの層で複製したSwift型にラップし直さず直接受け渡すのは、
+    /// 修飾キーの意味づけロジックをRust側だけに置く(rust-ssot)ため。省略時は修飾なし
+    /// (既存呼び出し元との後方互換)。
+    ///
+    /// `kittyFlags`(Kitty keyboard protocol、タスク#54で交渉・`ScreenUpdate.kittyKeyboardFlags`
+    /// として公開されるnegotiated flags)もRust側の`terminal_special_key_bytes`へそのまま
+    /// 委譲する(タスク#72: 以前はこの引数配線が抜けており、交渉されたflagsが実際の送信
+    /// バイト列に一切反映されない既存バグだった)。呼び出し側は取得できる最新値を渡すこと、
+    /// 省略時は0(legacy mode、既存呼び出し元との後方互換)。
+    public static func bytes(
+        for key: SpecialKey,
+        applicationCursorMode: Bool,
+        modifiers: TerminalKeyModifiers = TerminalKeyModifiers(shift: false, alt: false, ctrl: false, meta: false),
+        kittyFlags: UInt16 = 0
+    ) -> [UInt8] {
+        Array(terminalSpecialKeyBytes(key: key.rustKey, applicationCursorMode: applicationCursorMode, modifiers: modifiers, kittyFlags: kittyFlags))
+    }
+
+    /// Kitty keyboard protocolのbit0(disambiguate escape codes)有効時、Ctrl/Alt(併用・
+    /// Shift+Alt含む)付きの印字可能文字キーをCSI u形式でエンコードする(タスク#91、
+    /// Rust側`terminal_kitty_disambiguated_key_bytes`へそのまま委譲、rust-ssot)。
+    /// `codePoint`はキーの無修飾時の基本コードポイントを渡すこと(大文字/小文字の
+    /// 正規化はRust側が行う)。bit0が立っていない・Ctrl/Altどちらも押されていない・
+    /// 印字可能文字でない場合は`nil`を返し、呼び出し側は既存の`controlByte`(legacy Ctrl)
+    /// やESCプレフィックス(legacy Alt)へフォールバックすること。
+    public static func kittyDisambiguatedKeyBytes(
+        codePoint: UInt32,
+        modifiers: TerminalKeyModifiers,
+        kittyFlags: UInt16
+    ) -> [UInt8]? {
+        terminalKittyDisambiguatedKeyBytes(codePoint: codePoint, modifiers: modifiers, kittyFlags: kittyFlags).map(Array.init)
     }
 }
 

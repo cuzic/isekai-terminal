@@ -26,7 +26,11 @@ pub(crate) const EX_UNAVAILABLE: u8 = 69;
 /// `HOME_ENV_LOCK` for the same reason).
 #[cfg(test)]
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
-pub(crate) const DEFAULT_RESUME_WINDOW: Duration = Duration::from_secs(120);
+
+/// Shares `isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS` (see its docs for
+/// why this must move in lockstep with `isekai-pipe serve --resume-window`'s
+/// own default) rather than a separately-tracked literal.
+pub(crate) const DEFAULT_RESUME_WINDOW: Duration = Duration::from_secs(isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS);
 
 fn print_help() {
     println!("isekai-pipe - data plane for isekai-ssh");

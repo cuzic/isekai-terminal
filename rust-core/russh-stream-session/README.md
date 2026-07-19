@@ -1,0 +1,52 @@
+# russh-stream-session
+
+Establish and authenticate an SSH client session (built on [`russh`]) over
+any `AsyncRead + AsyncWrite` byte stream — not just a raw TCP socket. Host-key
+verification is delegated to a small [`HostKeyVerifier`] trait, so this crate
+has no opinion on how (or whether) you persist a trust-on-first-use store.
+
+This crate deliberately does **not** implement port forwarding, SSH agent
+forwarding, or any application-specific channel protocol — it covers exactly
+the "get me an authenticated `russh::client::Handle` and a session channel"
+part. Everything past that (the actual I/O loop, resize handling, forwards)
+is left to the caller, since those tend to be application-specific.
+
+## Example
+
+```rust,no_run
+# use std::sync::Arc;
+# use russh_stream_session::{Credential, HostKeyVerifier, SessionKind};
+struct AcceptAll;
+#[async_trait::async_trait]
+impl HostKeyVerifier for AcceptAll {
+    async fn verify(&self, _fingerprint: &str) -> bool { true }
+}
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let verifier = Arc::new(AcceptAll);
+let config = Arc::new(russh::client::Config::default());
+let mut session = russh_stream_session::connect_via_jump_or_direct(
+    None, config, "example.com", 22, verifier,
+).await?;
+
+let authed = russh_stream_session::authenticate_session(
+    &mut session.handle, "alice", &Credential::Password("hunter2".into()),
+).await;
+assert!(authed);
+
+let mut channel = russh_stream_session::open_channel(
+    &session.handle, &SessionKind::Exec { command: "echo hi".into() },
+).await?;
+# Ok(())
+# }
+```
+
+## Jump hosts
+
+Passing a [`JumpHost`] to [`connect_via_jump_or_direct`] authenticates to the
+jump host first, then opens a `direct-tcpip` channel through it and layers a
+second, nested SSH handshake on top (`ssh -J` equivalent, single hop). The
+returned [`Session`] keeps the jump host's `client::Handle` alive internally
+for as long as the target session is in use.
+
+[`russh`]: https://docs.rs/russh
