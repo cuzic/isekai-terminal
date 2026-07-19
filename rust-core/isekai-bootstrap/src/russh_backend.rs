@@ -733,6 +733,7 @@ impl RusshBackend {
                 let relay_addr = relay.relay_addr;
                 let quoted_sni = shell_single_quote(&relay.relay_sni);
                 let idle_lifetime_secs = relay.idle_lifetime_secs;
+                let resume_window_secs = relay.resume_window_secs;
                 let relay_transport_arg = match relay.relay_transport {
                     crate::types::RelayTransportKind::Udp => String::new(),
                     crate::types::RelayTransportKind::Qmux => " --relay-transport qmux".to_string(),
@@ -740,7 +741,8 @@ impl RusshBackend {
                 let args = format!(
                     "--target 127.0.0.1:22 --relay {relay_addr} --relay-sni {quoted_sni} \
                      --relay-jwt-file $tmpdir/relay_jwt --bootstrap-request-file $tmpdir/bootstrap-request.json\
-                     {relay_transport_arg} --max-idle-lifetime {idle_lifetime_secs} --log-level {remote_log_level}"
+                     {relay_transport_arg} --max-idle-lifetime {idle_lifetime_secs} \
+                     --resume-window {resume_window_secs} --log-level {remote_log_level}"
                 );
                 (args, relay.relay_jwt.clone().into_bytes())
             }
