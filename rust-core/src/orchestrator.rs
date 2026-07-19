@@ -1480,6 +1480,84 @@ impl SessionOrchestrator {
     }
 }
 
+// ── タスク#60: tmux session group ensure/attach + ウィンドウ create-or-select ──
+//
+// #61(`run_exec`、直上)・#62(`tmux_locator.rs`)を実際に繋ぎ合わせる。
+// コマンド組み立て/フォールバック判断そのものは`tmux_session::ensure_tab_window`に
+// 委ね、ここは「その関数が要求する`RemoteTmuxCommandRunner`シームを、この
+// `SessionOrchestrator`の`run_exec`へどう繋ぐか」というアダプタ配線と、UniFFI境界
+// (Kotlin向け引数/戻り値の型変換)だけを持つ。
+
+/// [`crate::tmux_session::ensure_tab_window`]が要求する
+/// [`crate::tmux_locator::RemoteTmuxCommandRunner`]の、`SessionOrchestrator::run_exec`
+/// (#61)への薄いアダプタ。`ExecOutput`(stdout + 終了ステータス)を
+/// `RemoteTmuxCommandRunner`が期待する`Result<String, TmuxRunError>`へ変換する
+/// (非ゼロ終了・非UTF-8出力もここでエラーとして畳み込む)。
+struct OrchestratorTmuxRunner<'a> {
+    orchestrator: &'a SessionOrchestrator,
+}
+
+impl<'a> crate::tmux_locator::RemoteTmuxCommandRunner for OrchestratorTmuxRunner<'a> {
+    fn run(
+        &self,
+        cmd: &str,
+    ) -> impl std::future::Future<Output = Result<String, crate::tmux_locator::TmuxRunError>> + Send {
+        let orchestrator = self.orchestrator;
+        let cmd = cmd.to_string();
+        async move {
+            use crate::tmux_locator::TmuxRunError;
+            let output = orchestrator.run_exec(cmd).await.map_err(|e| TmuxRunError(e.to_string()))?;
+            if output.exit_status != Some(0) {
+                return Err(TmuxRunError(format!(
+                    "tmux command exited with status {:?} (stdout: {:?})",
+                    output.exit_status,
+                    String::from_utf8_lossy(&output.stdout),
+                )));
+            }
+            String::from_utf8(output.stdout).map_err(|e| TmuxRunError(format!("non-utf8 tmux output: {e}")))
+        }
+    }
+}
+
+#[uniffi::export]
+impl SessionOrchestrator {
+    /// タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
+    /// primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
+    /// `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
+    /// "既存タグが見つかるか"等)は一切Kotlin側に持ち出さず、ここで完結させる
+    /// (`.claude/rules/rust-ssot.md`)。
+    ///
+    /// - `profile_identity`: 呼び出し側が決める安定な識別子(例:
+    ///   `ConnectionProfile.id`の文字列化)。同じ値からは常に同じsession groupに
+    ///   決定論的に解決される。
+    /// - `client_id`: このアプリインストール固有の永続トークン(Kotlin側で1回だけ
+    ///   生成し`SharedPreferences`等に保存、以後使い回す)。
+    /// - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
+    ///   無ければ`None`(新規タブ)。
+    ///
+    /// 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
+    /// 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
+    pub async fn ensure_tmux_tab_window(
+        &self,
+        profile_identity: String,
+        client_id: String,
+        existing_tag: Option<String>,
+    ) -> Result<crate::TmuxTabWindowInfo, crate::TmuxSessionError> {
+        let runner = OrchestratorTmuxRunner { orchestrator: self };
+        let (group_name, session_name, outcome) =
+            crate::tmux_session::ensure_tab_window(runner, &profile_identity, &client_id, existing_tag)
+                .await
+                .map_err(crate::TmuxSessionError::from)?;
+        Ok(crate::TmuxTabWindowInfo {
+            tag: outcome.locator.tag.0,
+            window_index: outcome.coords.window_index,
+            session_name,
+            group_name,
+            is_new_window: outcome.is_new_window,
+        })
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────
 //
 // この模块の状態遷移(`ConnPhase`の分岐、`OrchestratorAdapter`のtrzsz状態集約)は

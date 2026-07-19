@@ -148,6 +148,24 @@ class FakeOrchestrator : SessionOrchestratorInterface {
         setSessionThemeCalls.add(Triple(ansi16, defaultFg, defaultBg))
     }
 
+    // ── タスク#60: tmux session group ensure/attach + ウィンドウcreate-or-select ──
+    data class EnsureTmuxTabWindowCall(val profileIdentity: String, val clientId: String, val existingTag: String?)
+    val ensureTmuxTabWindowCalls = mutableListOf<EnsureTmuxTabWindowCall>()
+    var ensureTmuxTabWindowResult: TmuxTabWindowInfo = TmuxTabWindowInfo(
+        tag = "fake-tag",
+        windowIndex = 0u,
+        sessionName = "fake-session",
+        groupName = "fake-group",
+        isNewWindow = true,
+    )
+    var ensureTmuxTabWindowThrows: TmuxSessionException? = null
+
+    override suspend fun ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?): TmuxTabWindowInfo {
+        ensureTmuxTabWindowCalls.add(EnsureTmuxTabWindowCall(profileIdentity, clientId, existingTag))
+        ensureTmuxTabWindowThrows?.let { throw it }
+        return ensureTmuxTabWindowResult
+    }
+
 
     // trzszDismiss() fires Idle synchronously, matching real Rust behavior
     override fun trzszDismiss() {

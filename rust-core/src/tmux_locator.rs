@@ -211,12 +211,17 @@ pub(crate) enum TmuxLocatorError {
     /// 見つからなかった(tmux側でkill-window/kill-pane済み、等)。
     #[error("tmux locator tag {0:?} was not found in the remote tmux state")]
     NotFound(TmuxTag),
+    /// タスク#60: コマンド自体は成功したが、期待した形式の出力が得られなかった
+    /// (例: `tmux new-window -P -F '#{window_index}'`が数値以外を返した)。
+    #[error("unexpected tmux output: {0:?}")]
+    UnexpectedOutput(String),
 }
 
 /// シェル引数として安全に埋め込むための最小限のシングルクォート化。
 /// セッション名にシングルクォートやスペースが含まれる可能性は低いが、
 /// `format!`でそのまま埋め込むよりは安全にしておく。`tmux_scrollback`
-/// (#58: tmux capture-paneベースのscrollback backfill)も同じペイン
+/// (#58: tmux capture-paneベースのscrollback backfill)と`tmux_session.rs`
+/// (#60: session group/ウィンドウ操作コマンドの組み立て)がどちらも同じペイン
 /// アドレッシング規約(`build_set_tag_command`と同じ`session:window.pane`
 /// 形式)を再利用するため`pub(crate)`にしてある。
 pub(crate) fn shell_quote(value: &str) -> String {
@@ -355,6 +360,15 @@ impl<R: RemoteTmuxCommandRunner> TmuxLocatorResolver<R> {
         let cmd = build_set_ctl_socket_command(&locator.scope, &coords, ctl_socket_path);
         self.runner.run(&cmd).await?;
         Ok(())
+    }
+
+    /// タスク#60: session group ensure/attach・`new-window`・`select-window`など、
+    /// ロケータの解決/タグ付け以外のtmuxコマンドをこの`resolver`が包む`runner`越しに
+    /// そのまま実行する(`tmux_session.rs`参照)。コマンド文字列の組み立て・出力の
+    /// パースは呼び出し側(`tmux_session.rs`)の自由関数に委ね、ここは薄いパススルーに
+    /// 留める(`resolve`/`assign_tag`と同じ「runnerを呼ぶだけ」の役割分担)。
+    pub(crate) async fn run_raw(&self, cmd: &str) -> Result<String, TmuxRunError> {
+        self.runner.run(cmd).await
     }
 }
 
