@@ -117,31 +117,6 @@ impl InsertOutcome {
     }
 }
 
-/// [`SessionTable::claim_parked`]'s result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimParkedOutcome {
-    /// `id` was parked (`parked_tcp` was `Some`) and has now been removed
-    /// from the table with its TCP connection closed — the caller now owns
-    /// freeing the matching `AttachArbiter` fencing slot (same contract as
-    /// `sweep_expired_parked`/`insert_existing`, see their docs).
-    Claimed,
-    /// `id` exists in the table but isn't parked — either a live relay is
-    /// using it right now, or a concurrent `RESUME` already took
-    /// `parked_tcp` first (`handle_resume_stream`'s `session.parked_tcp
-    /// .take()`, `engine/mod.rs`). Either way this is authoritative: the
-    /// caller must *not* evict.
-    NotParked,
-    /// `id` isn't in the table at all. This shouldn't normally happen while
-    /// `AttachArbiter` still reports it `Established` (the two are supposed
-    /// to move together — see `.claude/rules/always-connects.md` for the
-    /// two prior bugs where they didn't), but if it does, there is by
-    /// construction nothing left to close: the caller may treat this the
-    /// same as `Claimed` for the purpose of freeing the stale fencing slot
-    /// (self-healing the orphan instead of leaving it to lock out every
-    /// future ATTACH forever).
-    Missing,
-}
-
 /// resume 可能な 1 セッション分の状態。
 pub struct Session {
     pub output_buffer: OutputBuffer,
@@ -187,6 +162,27 @@ fn hex_lower(id: &SessionId) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Scans an already-locked table for the session with the oldest
+/// `parked_since` (i.e. `parked_tcp.is_some()`), ignoring actively-relaying
+/// sessions entirely. Shared by `insert_existing` (which already holds the
+/// table's lock while it checks capacity) and `claim_oldest_parked` (which
+/// acquires its own) — takes the guard's target directly rather than
+/// re-locking, since `tokio::sync::Mutex` is not reentrant.
+async fn find_oldest_parked(inner: &HashMap<SessionId, Arc<Mutex<Session>>>) -> Option<SessionId> {
+    let mut oldest_parked: Option<(SessionId, std::time::Instant)> = None;
+    for (candidate_id, candidate_handle) in inner.iter() {
+        let candidate = candidate_handle.lock().await;
+        if let Some(since) = candidate.parked_since {
+            let is_older =
+                oldest_parked.as_ref().map(|(_, oldest_since)| since < *oldest_since).unwrap_or(true);
+            if is_older {
+                oldest_parked = Some((*candidate_id, since));
+            }
+        }
+    }
+    oldest_parked.map(|(id, _)| id)
+}
+
 /// helper プロセス内でアクティブな resume 可能セッションのテーブル。
 /// 各エントリは `Arc<Mutex<Session>>` で保持するため、呼び出し側は一度
 /// `get()` した handle を複数の並行タスク（C→S / S→C / control ACK 受信）で
@@ -214,6 +210,14 @@ impl SessionTable {
             inner: Arc::new(Mutex::new(HashMap::new())),
             max_sessions,
         }
+    }
+
+    /// Exposes the configured `--max-sessions` cap (a plain field, not
+    /// behind `inner`'s lock) so callers outside this module — Epic N-5's
+    /// admission control in `engine/mod.rs` — can compare it against
+    /// `AttachRuntime::session_count()` without duplicating the number.
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
     }
 
     /// production側では#18-4以降未使用(session_idはクライアントが
@@ -261,21 +265,8 @@ impl SessionTable {
         let mut inner = self.inner.lock().await;
         let mut evicted_id = None;
         if inner.len() >= self.max_sessions && !inner.contains_key(&id) {
-            let mut oldest_parked: Option<(SessionId, std::time::Instant)> = None;
-            for (candidate_id, candidate_handle) in inner.iter() {
-                let candidate = candidate_handle.lock().await;
-                if let Some(since) = candidate.parked_since {
-                    let is_older = oldest_parked
-                        .as_ref()
-                        .map(|(_, oldest_since)| since < *oldest_since)
-                        .unwrap_or(true);
-                    if is_older {
-                        oldest_parked = Some((*candidate_id, since));
-                    }
-                }
-            }
-            match oldest_parked {
-                Some((evict_id, _)) => {
+            match find_oldest_parked(&inner).await {
+                Some(evict_id) => {
                     if let Some(evicted) = inner.remove(&evict_id) {
                         // parked_tcp を drop することで TCP 接続も close される。
                         drop(evicted.lock().await.parked_tcp.take());
@@ -303,6 +294,28 @@ impl SessionTable {
             Some(evict_id) => InsertOutcome::InsertedAfterEvicting(evict_id),
             None => InsertOutcome::Inserted,
         }
+    }
+
+    /// Atomically finds and evicts the globally oldest parked session in the
+    /// table (same eviction policy as `insert_existing`'s over-capacity
+    /// path, factored out via `find_oldest_parked` so both share one scan).
+    /// Used by `engine/mod.rs`'s Epic N-5 admission control to make room for
+    /// a brand-new session *before* it even attempts a target TCP connect —
+    /// `insert_existing` alone only evicts once a new session has already
+    /// gone all the way through the ATTACH handshake, which is too late to
+    /// bound concurrent in-flight target connections once `AttachArbiter`
+    /// stopped being a single global fencing slot (see that module's docs).
+    /// Returns `None` if nothing is currently parked (every tracked session
+    /// is actively relaying) — the caller must reject the new attach in
+    /// that case, same as `insert_existing`'s `Rejected` outcome.
+    pub async fn claim_oldest_parked(&self) -> Option<SessionId> {
+        let mut inner = self.inner.lock().await;
+        let evict_id = find_oldest_parked(&inner).await?;
+        let evicted = inner.remove(&evict_id)?;
+        // parked_tcp を drop することで TCP 接続も close される。
+        drop(evicted.lock().await.parked_tcp.take());
+        log::warn!("session table full, evicted oldest parked session {} to admit a new attach", hex_lower(&evict_id));
+        Some(evict_id)
     }
 
     pub async fn get(&self, id: &SessionId) -> Option<Arc<Mutex<Session>>> {
@@ -339,46 +352,6 @@ impl SessionTable {
     /// `Established` slot だけが残り続け、以後そのターゲットへの新規ATTACHが
     /// 実際には誰も使っていないセッションのせいで`BUSY_OTHER_SESSION`のまま
     /// 永久に拒否される(`isekai-pipe serve`プロセスを再起動するまで回復しない)。
-    /// Atomically claims `id` for eviction *iff* it is currently parked
-    /// (`parked_tcp.is_some()`), removing it from the table and closing its
-    /// TCP connection — used when a fresh `ATTACH_HELLO` for a *different*
-    /// session_id loses the fencing race with `BusyOtherSession` and wants
-    /// to preempt whatever is occupying the slot, but only if that
-    /// occupant turns out to be abandoned (parked) rather than actively in
-    /// use (`ISEKAI_PIPE_DESIGN.md` §8's parked-session-preemption design).
-    ///
-    /// The `parked_tcp.take()` under this session's own lock is the single
-    /// point of truth this races safely against a concurrent `RESUME` for
-    /// the same `id` (`handle_resume_stream`'s own `session.parked_tcp
-    /// .take()`): whichever of the two takes it first wins outright — a
-    /// `RESUME` that wins keeps its session exactly as before, an eviction
-    /// that wins leaves any later `RESUME` for `id` a definitive
-    /// `UnknownSession` (the table entry is gone). Never removes a session
-    /// with `parked_tcp == None` (an active relay), matching every other
-    /// eviction path in this module (`sweep_expired_parked`/
-    /// `insert_existing`'s docs).
-    ///
-    /// Same slot-ownership split as `sweep_expired_parked`: this method
-    /// only touches `SessionTable`, never `AttachArbiter` — the caller
-    /// (`engine/mod.rs`, the only place with a handle to both) is
-    /// responsible for calling `AttachRuntime::relay_ended` on `Claimed`
-    /// (or `Missing`, see that variant's docs) to actually free the fencing
-    /// slot.
-    pub async fn claim_parked(&self, id: &SessionId) -> ClaimParkedOutcome {
-        let Some(handle) = self.get(id).await else {
-            return ClaimParkedOutcome::Missing;
-        };
-        let taken = handle.lock().await.parked_tcp.take();
-        let Some(_tcp) = taken else {
-            return ClaimParkedOutcome::NotParked;
-        };
-        // `_tcp` drops here, closing the target TCP connection — same as
-        // `sweep_expired_parked`'s `drop(handle.lock().await.parked_tcp
-        // .take())`.
-        self.remove(id).await;
-        ClaimParkedOutcome::Claimed
-    }
-
     pub async fn sweep_expired_parked(&self, max_parked: std::time::Duration) -> Vec<SessionId> {
         let expired: Vec<SessionId> = {
             let inner = self.inner.lock().await;
@@ -605,62 +578,38 @@ mod tests {
         assert!(table.contains(&id).await, "グローバルな窓(30秒)内なので破棄されないはず");
     }
 
-    /// `claim_parked`の3分岐: parkされたsessionは`Claimed`で実際にtableから
-    /// 除去される。
+    /// `claim_oldest_parked`はparkされたsessionが1つも無ければ`None`。
     #[tokio::test]
-    async fn claim_parked_claims_and_removes_a_parked_session() {
-        let table = SessionTable::new();
-        let id = SessionTable::generate_session_id();
-        let mut session = Session::new(1024);
-        session.parked_tcp = Some(dummy_parked_tcp().await);
-        session.parked_since = Some(std::time::Instant::now());
-        table.insert(id, session).await;
-
-        assert_eq!(table.claim_parked(&id).await, ClaimParkedOutcome::Claimed);
-        assert!(!table.contains(&id).await, "claimed session must be removed from the table");
-    }
-
-    /// アクティブに中継中(`parked_tcp == None`)のsessionは`NotParked`で、
-    /// tableからは一切除去されない。
-    #[tokio::test]
-    async fn claim_parked_does_not_claim_an_active_session() {
+    async fn claim_oldest_parked_returns_none_when_nothing_is_parked() {
         let table = SessionTable::new();
         let id = SessionTable::generate_session_id();
         table.insert(id, Session::new(1024)).await;
-
-        assert_eq!(table.claim_parked(&id).await, ClaimParkedOutcome::NotParked);
-        assert!(table.contains(&id).await, "an active session must never be removed by claim_parked");
+        assert_eq!(table.claim_oldest_parked().await, None);
+        assert!(table.contains(&id).await, "an active session must never be evicted");
     }
 
-    /// 存在しないsession_idは`Missing`(=orphanなfencing slotを自己修復する
-    /// 呼び出し元にとって「取り除くものは何もない」ことを示す)。
+    /// 複数parkされたsessionがある場合、`parked_since`が最も古いものだけを
+    /// 立ち退かせる(Epic N-5の admission control が使う経路)。
     #[tokio::test]
-    async fn claim_parked_reports_missing_for_an_unknown_session_id() {
+    async fn claim_oldest_parked_evicts_only_the_oldest_among_several() {
         let table = SessionTable::new();
-        let id = SessionTable::generate_session_id();
-        assert_eq!(table.claim_parked(&id).await, ClaimParkedOutcome::Missing);
-    }
+        let older_id = SessionTable::generate_session_id();
+        let mut older = Session::new(1024);
+        older.parked_tcp = Some(dummy_parked_tcp().await);
+        older.parked_since = Some(std::time::Instant::now());
+        table.insert(older_id, older).await;
 
-    /// RESUMEが先に`parked_tcp.take()`した後(=実運用では
-    /// `handle_resume_stream`がまさにこれを行う)は、同じsessionはもう
-    /// parkされていないので`claim_parked`は`NotParked`を返し、除去しない
-    /// ——RESUMEが勝った場合に新規ATTACHの立ち退きが割り込まないことの保証。
-    #[tokio::test]
-    async fn claim_parked_yields_to_a_resume_that_already_took_parked_tcp() {
-        let table = SessionTable::new();
-        let id = SessionTable::generate_session_id();
-        let mut session = Session::new(1024);
-        session.parked_tcp = Some(dummy_parked_tcp().await);
-        session.parked_since = Some(std::time::Instant::now());
-        let handle = table.insert(id, session).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
-        // RESUMEハンドラが行うのと同じ操作(`handle_resume_stream`の
-        // `session.parked_tcp.take()`)を模倣。
-        let taken = handle.lock().await.parked_tcp.take();
-        assert!(taken.is_some());
+        let newer_id = SessionTable::generate_session_id();
+        let mut newer = Session::new(1024);
+        newer.parked_tcp = Some(dummy_parked_tcp().await);
+        newer.parked_since = Some(std::time::Instant::now());
+        table.insert(newer_id, newer).await;
 
-        assert_eq!(table.claim_parked(&id).await, ClaimParkedOutcome::NotParked);
-        assert!(table.contains(&id).await, "a session RESUME already reclaimed must not be removed");
+        assert_eq!(table.claim_oldest_parked().await, Some(older_id));
+        assert!(!table.contains(&older_id).await);
+        assert!(table.contains(&newer_id).await, "the newer parked session must survive");
     }
 
     /// `max_sessions` に達した状態で新規登録すると、最も古い parked セッションが

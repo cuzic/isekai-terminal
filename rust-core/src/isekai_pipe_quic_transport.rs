@@ -386,7 +386,7 @@ pub(crate) fn attach_reject_message(reason: AttachRejectReason) -> String {
             "isekai-helper rejected: a different attempt already attached".to_string()
         }
         AttachRejectReason::BusyOtherSession => {
-            "isekai-helper rejected: a different session is currently active".to_string()
+            "isekai-helper rejected: server is at its concurrent session limit (--max-sessions) and every session is actively in use".to_string()
         }
         AttachRejectReason::AttachAlreadyEstablished => {
             "isekai-helper rejected: session already established, should resume instead".to_string()

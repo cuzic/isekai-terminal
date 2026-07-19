@@ -19,9 +19,22 @@
 //! goes through [`AttachState::ClosingForSupersede`] first — the old lease's
 //! resources must actually finish tearing down (`LeaseStopped`) before the
 //! new attempt's `ConnectTarget` effect is issued, so at most one target TCP
-//! connection for this server instance is ever attempting/active at a time.
+//! connection *for a given session* is ever attempting/active at a time.
+//!
+//! **Epic N-5**: this arbiter holds one independent state slot *per
+//! `session_id`* (`sessions: HashMap<SessionId, AttachState>`), not a single
+//! global slot for the whole target — see `ISEKAI_PIPE_DESIGN.md` §8 Epic
+//! N-5 for why. Everything above (the winner rule, superseding, stale-async
+//! safety) applies independently within one session's entry; different
+//! `session_id`s never interact with each other here at all. Absence of an
+//! entry for a `session_id` is this module's "vacant" (there used to be an
+//! explicit `AttachState::Vacant` for the single-slot design; a per-session
+//! table just omits the key instead).
+
+use std::collections::HashMap;
 
 use isekai_protocol::attach::{AttachKey, AttachRejectReason, AttachToken};
+use isekai_protocol::SessionId;
 
 /// Correlates one accepted attempt's underlying resources (in-flight target
 /// TCP connect, then — once established — the relay task) across the
@@ -30,6 +43,8 @@ use isekai_protocol::attach::{AttachKey, AttachRejectReason, AttachToken};
 /// reports back (`TargetConnected`/`TargetConnectFailed`/`LeaseStopped`) can
 /// always be checked against the arbiter's *current* notion of "the lease
 /// that matters", even if it arrives after the arbiter has already moved on.
+/// Unique across every session (not just within one), minted from one
+/// monotonic counter shared by the whole arbiter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseId(u64);
 
@@ -41,7 +56,6 @@ pub struct TargetHandleId(pub u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachState {
-    Vacant,
     Connecting {
         key: AttachKey,
         lease: LeaseId,
@@ -62,8 +76,8 @@ pub enum AttachState {
     /// A strictly larger generation than `old_lease`'s has been accepted in
     /// principle, but `old_lease`'s resources have not finished tearing down
     /// yet — `next`'s `ConnectTarget` effect is deliberately withheld until
-    /// `LeaseStopped { lease: old_lease }` arrives, so the target never sees
-    /// two concurrent connection attempts for the same logical session.
+    /// `LeaseStopped { lease: old_lease }` arrives, so this session's target
+    /// never sees two concurrent connection attempts at once.
     ClosingForSupersede {
         old_lease: LeaseId,
         next: AttachKey,
@@ -104,8 +118,7 @@ pub enum AttachEvent {
     /// The established relay session ended (target TCP died, or — for
     /// sessions that support resume — was ultimately discarded rather than
     /// resumed; the existing `SessionTable`/resume machinery outside this
-    /// module owns that decision). Frees this arbiter's slot for a
-    /// different logical session.
+    /// module owns that decision). Frees this lease's session entry entirely.
     RelayEnded {
         lease: LeaseId,
     },
@@ -136,35 +149,63 @@ pub enum AttachEffect {
     StartRelay { lease: LeaseId, target: TargetHandleId },
 }
 
-/// Owns the current [`AttachState`] plus the monotonic counter that mints
-/// [`LeaseId`]s. Deterministic given the sequence of `apply` calls (no
+/// Owns one [`AttachState`] slot per `session_id` plus the monotonic counter
+/// that mints [`LeaseId`]s (shared across every session, so leases stay
+/// globally unique). Deterministic given the sequence of `apply` calls (no
 /// clock, no RNG), which is what makes the stale-async-completion and
 /// concurrent-race invariants exhaustively unit-testable.
 #[derive(Debug, Default)]
 pub struct AttachArbiter {
-    state: AttachState,
+    sessions: HashMap<SessionId, AttachState>,
     next_lease: u64,
-}
-
-impl Default for AttachState {
-    fn default() -> Self {
-        AttachState::Vacant
-    }
 }
 
 impl AttachArbiter {
     pub fn new() -> Self {
-        Self { state: AttachState::Vacant, next_lease: 0 }
+        Self { sessions: HashMap::new(), next_lease: 0 }
     }
 
-    pub fn state(&self) -> &AttachState {
-        &self.state
+    /// The current state of one specific session's slot, if it has one.
+    pub fn state_for(&self, session_id: SessionId) -> Option<&AttachState> {
+        self.sessions.get(&session_id)
+    }
+
+    /// How many sessions currently hold a slot (connecting, pending, or
+    /// established/parked — anything short of fully torn down) — used by
+    /// the executor layer's admission control (`--max-sessions`, Epic N-5)
+    /// and by `AttachRuntime::is_vacant`'s `--max-idle-lifetime` check.
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn has_session(&self, session_id: SessionId) -> bool {
+        self.sessions.contains_key(&session_id)
     }
 
     fn mint_lease(&mut self) -> LeaseId {
         let id = LeaseId(self.next_lease);
         self.next_lease += 1;
         id
+    }
+
+    /// Finds which session's slot (if any) currently references `lease` —
+    /// needed because `TargetConnected`/`TargetConnectFailed`/`LeaseStopped`/
+    /// `PendingExpired`/`RelayEnded` only carry a `LeaseId`, not a
+    /// `session_id`. A linear scan is deliberate: these events only occur at
+    /// connect/disconnect boundaries (not per-byte), and the session count is
+    /// bounded by `--max-sessions` (default 16), so this is cheap and avoids
+    /// a second `lease -> session_id` index that would need to be kept in
+    /// sync with every transition below.
+    fn session_for_lease(&self, lease: LeaseId) -> Option<SessionId> {
+        self.sessions.iter().find_map(|(session_id, state)| {
+            let owns = match state {
+                AttachState::Connecting { lease: l, .. } => *l == lease,
+                AttachState::PendingActivation { lease: l, .. } => *l == lease,
+                AttachState::Established { lease: l, .. } => *l == lease,
+                AttachState::ClosingForSupersede { old_lease, .. } => *old_lease == lease,
+            };
+            owns.then_some(*session_id)
+        })
     }
 
     pub fn apply(&mut self, event: AttachEvent) -> Vec<AttachEffect> {
@@ -183,41 +224,37 @@ impl AttachArbiter {
     }
 
     fn on_hello_received(&mut self, key: AttachKey) -> Vec<AttachEffect> {
-        match &self.state {
-            AttachState::Vacant => {
+        match self.sessions.get(&key.session_id).cloned() {
+            None => {
                 let lease = self.mint_lease();
-                self.state = AttachState::Connecting { key, lease };
+                self.sessions.insert(key.session_id, AttachState::Connecting { key, lease });
                 vec![AttachEffect::ConnectTarget { lease }]
             }
-            AttachState::Connecting { key: cur, lease } => {
-                self.decide_against_in_flight(key, *cur, *lease, None)
+            Some(AttachState::Connecting { key: cur, lease }) => {
+                self.decide_against_in_flight(key, cur, lease, None)
             }
-            AttachState::PendingActivation { key: cur, lease, attach_token, .. } => {
-                self.decide_against_in_flight(key, *cur, *lease, Some(*attach_token))
+            Some(AttachState::PendingActivation { key: cur, lease, attach_token, .. }) => {
+                self.decide_against_in_flight(key, cur, lease, Some(attach_token))
             }
-            AttachState::Established { key: cur, .. } => {
-                if key.session_id != cur.session_id {
-                    vec![AttachEffect::SendReject { key, reason: AttachRejectReason::BusyOtherSession }]
-                } else {
-                    vec![AttachEffect::SendReject { key, reason: AttachRejectReason::AttachAlreadyEstablished }]
-                }
+            // `key.session_id == cur.session_id` is guaranteed here (both
+            // came from the same map entry) — a *different* session_id
+            // always gets its own independent slot instead (Epic N-5), so
+            // there is no cross-session `BusyOtherSession` case left here.
+            Some(AttachState::Established { .. }) => {
+                vec![AttachEffect::SendReject { key, reason: AttachRejectReason::AttachAlreadyEstablished }]
             }
-            AttachState::ClosingForSupersede { old_lease, next } => {
-                let old_lease = *old_lease;
-                let next = *next;
+            Some(AttachState::ClosingForSupersede { old_lease, next }) => {
                 if key == next {
                     // Retransmit of the very attempt already driving the
                     // supersede; still waiting on the old lease to stop.
                     vec![]
-                } else if key.session_id != next.session_id {
-                    vec![AttachEffect::SendReject { key, reason: AttachRejectReason::BusyOtherSession }]
                 } else if key.generation > next.generation {
                     // An even newer generation arrived before the previous
                     // supersede finished draining — just update which
                     // attempt wins once `old_lease` actually stops; the
                     // cancellation already in flight for `old_lease` covers
                     // this too (only one lease is ever being torn down).
-                    self.state = AttachState::ClosingForSupersede { old_lease, next: key };
+                    self.sessions.insert(key.session_id, AttachState::ClosingForSupersede { old_lease, next: key });
                     vec![]
                 } else if key.generation < next.generation {
                     vec![AttachEffect::SendReject {
@@ -234,9 +271,10 @@ impl AttachArbiter {
     }
 
     /// Shared decision for `HelloReceived` while some attempt `cur` (lease
-    /// `cur_lease`) is `Connecting` or `PendingActivation` — every state
-    /// where `cur` has not yet reached `Established` and could still be
-    /// fenced by a strictly larger generation.
+    /// `cur_lease`) is `Connecting` or `PendingActivation` for the *same*
+    /// `session_id` as `key` (guaranteed by the caller's map lookup) — every
+    /// state where `cur` has not yet reached `Established` and could still
+    /// be fenced by a strictly larger generation.
     fn decide_against_in_flight(
         &mut self,
         key: AttachKey,
@@ -244,9 +282,6 @@ impl AttachArbiter {
         cur_lease: LeaseId,
         pending_attach_token: Option<AttachToken>,
     ) -> Vec<AttachEffect> {
-        if key.session_id != cur.session_id {
-            return vec![AttachEffect::SendReject { key, reason: AttachRejectReason::BusyOtherSession }];
-        }
         if key.generation < cur.generation {
             return vec![AttachEffect::SendReject {
                 key,
@@ -268,7 +303,7 @@ impl AttachArbiter {
         }
         // key.generation > cur.generation: supersede `cur`, but only once
         // its lease has actually finished tearing down.
-        self.state = AttachState::ClosingForSupersede { old_lease: cur_lease, next: key };
+        self.sessions.insert(key.session_id, AttachState::ClosingForSupersede { old_lease: cur_lease, next: key });
         vec![AttachEffect::CancelLease { lease: cur_lease }]
     }
 
@@ -278,52 +313,49 @@ impl AttachArbiter {
         target: TargetHandleId,
         attach_token: AttachToken,
     ) -> Vec<AttachEffect> {
-        let AttachState::Connecting { key, lease: cur_lease } = &self.state else { return vec![] };
-        if *cur_lease != lease {
+        let Some(session_id) = self.session_for_lease(lease) else { return vec![] };
+        let Some(AttachState::Connecting { key, .. }) = self.sessions.get(&session_id).cloned() else {
             return vec![];
-        }
-        let key = *key;
-        self.state = AttachState::PendingActivation { key, lease, attach_token, target };
+        };
+        self.sessions.insert(session_id, AttachState::PendingActivation { key, lease, attach_token, target });
         vec![AttachEffect::SendReady { key, lease, attach_token }, AttachEffect::SchedulePendingTimeout { lease }]
     }
 
     fn on_target_connect_failed(&mut self, lease: LeaseId) -> Vec<AttachEffect> {
-        let AttachState::Connecting { key, lease: cur_lease } = &self.state else { return vec![] };
-        if *cur_lease != lease {
+        let Some(session_id) = self.session_for_lease(lease) else { return vec![] };
+        let Some(AttachState::Connecting { key, .. }) = self.sessions.get(&session_id).cloned() else {
             return vec![];
-        }
-        let key = *key;
-        self.state = AttachState::Vacant;
+        };
+        self.sessions.remove(&session_id);
         vec![AttachEffect::SendReject { key, reason: AttachRejectReason::Target }]
     }
 
     fn on_activated(&mut self, key: AttachKey, attach_token: AttachToken) -> Vec<AttachEffect> {
-        let AttachState::PendingActivation { key: cur, lease, attach_token: cur_token, target } = &self.state
+        let Some(AttachState::PendingActivation { key: cur, lease, attach_token: cur_token, target }) =
+            self.sessions.get(&key.session_id).cloned()
         else {
             return vec![];
         };
-        if *cur != key || !cur_token.ct_eq(&attach_token) {
+        if cur != key || !cur_token.ct_eq(&attach_token) {
             // Stray/late activation for an attempt that is no longer
             // current (or a guessed token) — ignore rather than let it
             // mutate state it doesn't own.
             return vec![];
         }
-        let lease = *lease;
-        let target = *target;
-        self.state = AttachState::Established { key, lease };
+        self.sessions.insert(key.session_id, AttachState::Established { key, lease });
         vec![AttachEffect::StartRelay { lease, target }]
     }
 
     fn on_cancel_received(&mut self, key: AttachKey) -> Vec<AttachEffect> {
-        match &self.state {
-            AttachState::Connecting { key: cur, lease } if *cur == key => {
+        match self.sessions.get(&key.session_id) {
+            Some(AttachState::Connecting { key: cur, lease }) if *cur == key => {
                 let lease = *lease;
-                self.state = AttachState::Vacant;
+                self.sessions.remove(&key.session_id);
                 vec![AttachEffect::CancelLease { lease }]
             }
-            AttachState::PendingActivation { key: cur, lease, .. } if *cur == key => {
+            Some(AttachState::PendingActivation { key: cur, lease, .. }) if *cur == key => {
                 let lease = *lease;
-                self.state = AttachState::Vacant;
+                self.sessions.remove(&key.session_id);
                 vec![AttachEffect::CancelLease { lease }]
             }
             // Established never yields to CANCEL (module docs); every other
@@ -336,31 +368,30 @@ impl AttachArbiter {
     }
 
     fn on_lease_stopped(&mut self, lease: LeaseId) -> Vec<AttachEffect> {
-        let AttachState::ClosingForSupersede { old_lease, next } = &self.state else { return vec![] };
-        if *old_lease != lease {
+        let Some(session_id) = self.session_for_lease(lease) else { return vec![] };
+        let Some(AttachState::ClosingForSupersede { next, .. }) = self.sessions.get(&session_id).cloned() else {
             return vec![];
-        }
-        let next = *next;
+        };
         let new_lease = self.mint_lease();
-        self.state = AttachState::Connecting { key: next, lease: new_lease };
+        self.sessions.insert(session_id, AttachState::Connecting { key: next, lease: new_lease });
         vec![AttachEffect::ConnectTarget { lease: new_lease }]
     }
 
     fn on_pending_expired(&mut self, lease: LeaseId) -> Vec<AttachEffect> {
-        let AttachState::PendingActivation { lease: cur_lease, .. } = &self.state else { return vec![] };
-        if *cur_lease != lease {
+        let Some(session_id) = self.session_for_lease(lease) else { return vec![] };
+        if !matches!(self.sessions.get(&session_id), Some(AttachState::PendingActivation { .. })) {
             return vec![];
         }
-        self.state = AttachState::Vacant;
+        self.sessions.remove(&session_id);
         vec![AttachEffect::CancelLease { lease }]
     }
 
     fn on_relay_ended(&mut self, lease: LeaseId) -> Vec<AttachEffect> {
-        let AttachState::Established { lease: cur_lease, .. } = &self.state else { return vec![] };
-        if *cur_lease != lease {
+        let Some(session_id) = self.session_for_lease(lease) else { return vec![] };
+        if !matches!(self.sessions.get(&session_id), Some(AttachState::Established { .. })) {
             return vec![];
         }
-        self.state = AttachState::Vacant;
+        self.sessions.remove(&session_id);
         vec![]
     }
 }
@@ -393,7 +424,7 @@ mod tests {
         let k = key(1, 0, 1);
         let effects = a.apply(AttachEvent::HelloReceived { key: k });
         assert_eq!(effects, vec![AttachEffect::ConnectTarget { lease: LeaseId(0) }]);
-        assert_eq!(a.state(), &AttachState::Connecting { key: k, lease: LeaseId(0) });
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::Connecting { key: k, lease: LeaseId(0) }));
     }
 
     #[test]
@@ -416,7 +447,7 @@ mod tests {
         );
         let effects = a.apply(AttachEvent::Activated { key: k, attach_token: tok });
         assert_eq!(effects, vec![AttachEffect::StartRelay { lease: LeaseId(0), target: TargetHandleId(100) }]);
-        assert_eq!(a.state(), &AttachState::Established { key: k, lease: LeaseId(0) });
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::Established { key: k, lease: LeaseId(0) }));
     }
 
     #[test]
@@ -433,7 +464,7 @@ mod tests {
             vec![AttachEffect::SendReject { key: loser, reason: AttachRejectReason::AlreadyAttached }]
         );
         // Winner's in-flight attempt is untouched.
-        assert_eq!(a.state(), &AttachState::Connecting { key: winner, lease: LeaseId(0) });
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::Connecting { key: winner, lease: LeaseId(0) }));
     }
 
     #[test]
@@ -451,14 +482,42 @@ mod tests {
     }
 
     #[test]
-    fn different_session_is_busy_other_session() {
+    fn different_sessions_are_fully_independent() {
+        // Epic N-5: a second, genuinely different session_id must get its
+        // own slot immediately rather than being fenced out by the first.
         let mut a = AttachArbiter::new();
-        a.apply(AttachEvent::HelloReceived { key: key(1, 0, 1) });
-        let effects = a.apply(AttachEvent::HelloReceived { key: key(2, 0, 1) });
-        assert_eq!(
-            effects,
-            vec![AttachEffect::SendReject { key: key(2, 0, 1), reason: AttachRejectReason::BusyOtherSession }]
-        );
+        let k1 = key(1, 0, 1);
+        let k2 = key(2, 0, 1);
+        let effects1 = a.apply(AttachEvent::HelloReceived { key: k1 });
+        assert_eq!(effects1, vec![AttachEffect::ConnectTarget { lease: LeaseId(0) }]);
+        let effects2 = a.apply(AttachEvent::HelloReceived { key: k2 });
+        assert_eq!(effects2, vec![AttachEffect::ConnectTarget { lease: LeaseId(1) }]);
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::Connecting { key: k1, lease: LeaseId(0) }));
+        assert_eq!(a.state_for(sid(2)), Some(&AttachState::Connecting { key: k2, lease: LeaseId(1) }));
+        assert_eq!(a.session_count(), 2);
+    }
+
+    #[test]
+    fn relay_ended_for_one_session_does_not_affect_other_concurrent_sessions() {
+        let mut a = AttachArbiter::new();
+        let k1 = key(1, 0, 1);
+        let k2 = key(2, 0, 1);
+        a.apply(AttachEvent::HelloReceived { key: k1 });
+        a.apply(AttachEvent::HelloReceived { key: k2 });
+        let tok1 = token(1);
+        a.apply(AttachEvent::TargetConnected { lease: LeaseId(0), target: TargetHandleId(1), attach_token: tok1 });
+        a.apply(AttachEvent::Activated { key: k1, attach_token: tok1 });
+        let tok2 = token(2);
+        a.apply(AttachEvent::TargetConnected { lease: LeaseId(1), target: TargetHandleId(2), attach_token: tok2 });
+        a.apply(AttachEvent::Activated { key: k2, attach_token: tok2 });
+        assert!(matches!(a.state_for(sid(1)), Some(AttachState::Established { .. })));
+        assert!(matches!(a.state_for(sid(2)), Some(AttachState::Established { .. })));
+
+        let effects = a.apply(AttachEvent::RelayEnded { lease: LeaseId(0) });
+        assert_eq!(effects, vec![]);
+        assert_eq!(a.state_for(sid(1)), None);
+        assert!(matches!(a.state_for(sid(2)), Some(AttachState::Established { .. })));
+        assert_eq!(a.session_count(), 1);
     }
 
     #[test]
@@ -473,7 +532,7 @@ mod tests {
         let newer = key(1, 6, 1);
         let effects = a.apply(AttachEvent::HelloReceived { key: newer });
         assert_eq!(effects, vec![AttachEffect::CancelLease { lease: LeaseId(0) }]);
-        assert_eq!(a.state(), &AttachState::ClosingForSupersede { old_lease: LeaseId(0), next: newer });
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::ClosingForSupersede { old_lease: LeaseId(0), next: newer }));
 
         // Stale completion for the old, already-superseded lease must not
         // resurrect it.
@@ -483,13 +542,13 @@ mod tests {
             attach_token: token(1),
         });
         assert_eq!(effects, vec![]);
-        assert_eq!(a.state(), &AttachState::ClosingForSupersede { old_lease: LeaseId(0), next: newer });
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::ClosingForSupersede { old_lease: LeaseId(0), next: newer }));
 
         // Only once the old lease actually reports stopped does the new
         // attempt get to start connecting.
         let effects = a.apply(AttachEvent::LeaseStopped { lease: LeaseId(0) });
         assert_eq!(effects, vec![AttachEffect::ConnectTarget { lease: LeaseId(1) }]);
-        assert_eq!(a.state(), &AttachState::Connecting { key: newer, lease: LeaseId(1) });
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::Connecting { key: newer, lease: LeaseId(1) }));
     }
 
     #[test]
@@ -500,12 +559,12 @@ mod tests {
         let effects = a.apply(AttachEvent::HelloReceived { key: key(1, 7, 1) });
         assert_eq!(effects, vec![]);
         assert_eq!(
-            a.state(),
-            &AttachState::ClosingForSupersede { old_lease: LeaseId(0), next: key(1, 7, 1) }
+            a.state_for(sid(1)),
+            Some(&AttachState::ClosingForSupersede { old_lease: LeaseId(0), next: key(1, 7, 1) })
         );
         let effects = a.apply(AttachEvent::LeaseStopped { lease: LeaseId(0) });
         assert_eq!(effects, vec![AttachEffect::ConnectTarget { lease: LeaseId(1) }]);
-        assert_eq!(a.state(), &AttachState::Connecting { key: key(1, 7, 1), lease: LeaseId(1) });
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::Connecting { key: key(1, 7, 1), lease: LeaseId(1) }));
     }
 
     #[test]
@@ -537,7 +596,7 @@ mod tests {
             effects,
             vec![AttachEffect::SendReject { key: key(1, 99, 5), reason: AttachRejectReason::AttachAlreadyEstablished }]
         );
-        assert_eq!(a.state(), &AttachState::Established { key: k, lease: LeaseId(0) });
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::Established { key: k, lease: LeaseId(0) }));
     }
 
     #[test]
@@ -552,11 +611,11 @@ mod tests {
         // Stale RelayEnded for an unrelated lease is ignored.
         let effects = a.apply(AttachEvent::RelayEnded { lease: LeaseId(99) });
         assert_eq!(effects, vec![]);
-        assert!(matches!(a.state(), AttachState::Established { .. }));
+        assert!(matches!(a.state_for(sid(1)), Some(AttachState::Established { .. })));
 
         let effects = a.apply(AttachEvent::RelayEnded { lease: LeaseId(0) });
         assert_eq!(effects, vec![]);
-        assert_eq!(a.state(), &AttachState::Vacant);
+        assert_eq!(a.state_for(sid(1)), None);
     }
 
     #[test]
@@ -570,7 +629,7 @@ mod tests {
 
         let effects = a.apply(AttachEvent::CancelReceived { key: k });
         assert_eq!(effects, vec![]);
-        assert_eq!(a.state(), &AttachState::Established { key: k, lease: LeaseId(0) });
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::Established { key: k, lease: LeaseId(0) }));
     }
 
     #[test]
@@ -580,7 +639,7 @@ mod tests {
         a.apply(AttachEvent::HelloReceived { key: k });
         let effects = a.apply(AttachEvent::CancelReceived { key: k });
         assert_eq!(effects, vec![AttachEffect::CancelLease { lease: LeaseId(0) }]);
-        assert_eq!(a.state(), &AttachState::Vacant);
+        assert_eq!(a.state_for(sid(1)), None);
     }
 
     #[test]
@@ -595,7 +654,7 @@ mod tests {
         a.apply(AttachEvent::HelloReceived { key: newer }); // -> ClosingForSupersede
         let effects = a.apply(AttachEvent::CancelReceived { key: old });
         assert_eq!(effects, vec![]);
-        assert_eq!(a.state(), &AttachState::ClosingForSupersede { old_lease: LeaseId(0), next: newer });
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::ClosingForSupersede { old_lease: LeaseId(0), next: newer }));
     }
 
     #[test]
@@ -610,7 +669,7 @@ mod tests {
         });
         let effects = a.apply(AttachEvent::PendingExpired { lease: LeaseId(0) });
         assert_eq!(effects, vec![AttachEffect::CancelLease { lease: LeaseId(0) }]);
-        assert_eq!(a.state(), &AttachState::Vacant);
+        assert_eq!(a.state_for(sid(1)), None);
     }
 
     #[test]
@@ -625,7 +684,7 @@ mod tests {
         });
         let effects = a.apply(AttachEvent::PendingExpired { lease: LeaseId(99) });
         assert_eq!(effects, vec![]);
-        assert!(matches!(a.state(), AttachState::PendingActivation { .. }));
+        assert!(matches!(a.state_for(sid(1)), Some(AttachState::PendingActivation { .. })));
     }
 
     #[test]
@@ -635,7 +694,7 @@ mod tests {
         a.apply(AttachEvent::HelloReceived { key: k });
         let effects = a.apply(AttachEvent::TargetConnectFailed { lease: LeaseId(0) });
         assert_eq!(effects, vec![AttachEffect::SendReject { key: k, reason: AttachRejectReason::Target }]);
-        assert_eq!(a.state(), &AttachState::Vacant);
+        assert_eq!(a.state_for(sid(1)), None);
     }
 
     #[test]
@@ -650,7 +709,7 @@ mod tests {
         });
         let effects = a.apply(AttachEvent::Activated { key: k, attach_token: token(0xEE) });
         assert_eq!(effects, vec![]);
-        assert!(matches!(a.state(), AttachState::PendingActivation { .. }));
+        assert!(matches!(a.state_for(sid(1)), Some(AttachState::PendingActivation { .. })));
     }
 
     #[test]
@@ -660,7 +719,7 @@ mod tests {
         a.apply(AttachEvent::HelloReceived { key: k });
         let effects = a.apply(AttachEvent::HelloReceived { key: k });
         assert_eq!(effects, vec![]);
-        assert_eq!(a.state(), &AttachState::Connecting { key: k, lease: LeaseId(0) });
+        assert_eq!(a.state_for(sid(1)), Some(&AttachState::Connecting { key: k, lease: LeaseId(0) }));
     }
 
     #[test]
