@@ -766,6 +766,24 @@ pub(crate) async fn run_ssh_channel_loop(
                         debug!("tmux-ctl-sock: push for {:?} failed (best-effort): {}", app_pane_for_push, e);
                     }
                 });
+                // タスク#57: 同じタイミング(ctl-socket forward確立直後、接続確立時・
+                // 再接続時の両方)で、このタブのtmuxウィンドウ/ペインへ通知用hook
+                // (`alert-bell`/`alert-activity`/`alert-silence`/`pane-died`)も
+                // インストールする。上のctl-socketパス伝播と同じ理由で別taskへ
+                // `spawn`する(`run_exec`の待ち時間でI/Oループをブロックしない)。
+                // ロケータ未登録なら`install_notify_hooks`が黙ってno-opになるのも
+                // `push_ctl_socket_to_tmux`と同じ(opportunistic機能)。
+                let notify_runner = SshHandleTmuxRunner { handle: pooled.handle.clone() };
+                let app_pane_for_notify = app_pane_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::tmux_notify::install_notify_hooks(
+                        &crate::tmux_locator::TMUX_LOCATOR_REGISTRY,
+                        &app_pane_for_notify,
+                        notify_runner,
+                    ).await {
+                        debug!("tmux-notify: hook install for {:?} failed (best-effort): {}", app_pane_for_notify, e);
+                    }
+                });
                 Some(path)
             }
             Err(e) => {
@@ -1158,6 +1176,7 @@ mod pooling_e2e_tests {
         fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+        fn on_notify(&self, _kind: crate::NotifyKind) {}
     }
 
     /// 公開鍵認証を無条件で受け入れつつ認証回数を数え、シェルチャネルへ書き込まれた

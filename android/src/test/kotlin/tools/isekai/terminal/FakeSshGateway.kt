@@ -226,6 +226,9 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     fun simulateAgentSignRequest(fingerprint: String = "SHA256:test-fingerprint"): Boolean =
         callback!!.onAgentSignRequest(fingerprint)
+
+    /** タスク#57: tmux hook発火(Rust側の抑制判断済みという前提で、届いたものとして再現)。 */
+    fun simulateNotify(kind: NotifyKind) = callback!!.onNotify(kind)
 }
 
 /** テスト用フェイク HostKeyChecker。デフォルトは常に信頼。 */

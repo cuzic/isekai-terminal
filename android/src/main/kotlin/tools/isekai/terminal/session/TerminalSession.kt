@@ -70,6 +70,16 @@ class TerminalSession(
      * 持ち込まない)。既定は no-op。
      */
     private val onBell: () -> Unit = {},
+    /**
+     * タスク#57: tmux hook(alert-bell/alert-activity/alert-silence/pane-died)発火。
+     * 「今この瞬間ユーザーへ見せるべきか」の抑制判断(アプリがフォアグラウンドかつ
+     * このタブ表示中なら抑制、`(tmux_tag, seq)`重複排除)は Rust 側
+     * (`OrchestratorAdapter::on_notify`)が既に済ませてから呼ばれるため、ここでは
+     * 実際にAndroid通知を出すかどうか(プロファイル単位opt-in・通知権限)の判断だけを
+     * 行う副作用注入とする(`onClipboardWriteRequested`/`onBell`と同じ構成、
+     * `Context`を持たないこのクラス自体には持ち込まない)。既定は no-op。
+     */
+    private val onNotifyRequested: (NotifyKind) -> Unit = {},
 ) : AutoCloseable {
 
     companion object {
@@ -227,6 +237,12 @@ class TerminalSession(
 
         override fun onRebindStateChanged(state: RebindPublicState) {
             _state.update { it.copy(rebindState = state) }
+        }
+
+        // タスク#57: tmux hook発火。抑制判断はRust側(OrchestratorAdapter::on_notify)
+        // 済み——ここは単に注入された副作用を呼ぶだけ。
+        override fun onNotify(kind: NotifyKind) {
+            onNotifyRequested(kind)
         }
 
         // SSH agent forwarding: Rust 側の spawn_blocking スレッドから同期呼び出しされる。

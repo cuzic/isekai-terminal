@@ -339,6 +339,19 @@ struct OrchestratorState {
     reconnect_policy: ReconnectPolicy,
     /// #20: バックグラウンド遷移とセッション再接続要否のSSOT。
     background_state: BackgroundState,
+    /// タスク#57: このタブが現在フォーカスされている(=Compose側の
+    /// `isActive && hasFocus`)かどうか。`notify_focus_change`が
+    /// `Terminal`のCSIフォーカスレポーティングと同じ生イベントから複製する
+    /// (`rust-ssot.md`: 新しい判断ロジックのために新しいUniFFIメソッドを増やすのでは
+    /// なく、既存の生イベント転送経路を再利用する)。`OrchestratorAdapter::on_notify`が
+    /// `background_state`と合わせて「今この瞬間ユーザーがこのタブを見ているか」の
+    /// 抑制判断に使う。
+    tab_focused: bool,
+    /// タスク#57: 直近配信した`(tmux_tag, seq)`。`isekai_protocol::CtlMessage::Notify`の
+    /// docコメントが想定する重複配信(tmux hookの再発火・session group内の複数
+    /// メンバーからの重複起動、`tmux_notify.rs`のモジュールdoc参照)を、同じペアが
+    /// 来たら黙って無視することで検出する。
+    last_notify_seq: Option<(String, u64)>,
 }
 
 /// 1回の再接続試行を実行する処理の型。既定は`connect_via`(実際にセッションを
@@ -591,6 +604,38 @@ impl SessionCallback for OrchestratorAdapter {
     fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState) {
         if !self.is_current() { return; }
         self.shared.callback.on_rebind_state_changed(state);
+    }
+
+    /// タスク#57: tmux hookの発火を、(a)`(tmux_tag, seq)`重複排除、(b)フォアグラウンド
+    /// +このタブ表示中の抑制、の2段階を経てから`OrchestratorCallback::on_notify`へ
+    /// 渡す。
+    ///
+    /// (a): `isekai_protocol::CtlMessage::Notify`のdocコメントが想定する重複配信
+    /// (`tmux_notify.rs`のモジュールdoc: session group内の複数グループメンバーが
+    /// それぞれセッションスコープのフックを持ち得るため、同じ実イベントに対し
+    /// 複数回発火し得る)を、直前に配信した`(tmux_tag, seq)`と完全一致したら
+    /// 黙って無視することで検出する。
+    ///
+    /// (b): 「アプリがフォアグラウンドかつこのタブが今まさに表示されている」なら
+    /// ユーザーは既にその出来事を画面上で見ているはずなので、Android通知としては
+    /// 冗長 — 抑制する。この判断はセッション状態(`background_state`)とUOSの生
+    /// フォーカスイベントの複製(`tab_focused`)に基づくため`rust-ssot.md`の対象
+    /// (Kotlin側にミラー状態を作って分岐させない)。per-tab通知ON/OFF設定自体は
+    /// UI設定でありKotlin側(`OrchestratorCallback::on_notify`実装)の責務。
+    fn on_notify(&self, kind: crate::NotifyKind, tmux_tag: String, seq: u64) {
+        if !self.is_current() { return; }
+        let should_deliver = {
+            let mut s = self.shared.state.lock();
+            if s.last_notify_seq.as_ref() == Some(&(tmux_tag.clone(), seq)) {
+                false
+            } else {
+                s.last_notify_seq = Some((tmux_tag, seq));
+                !(s.tab_focused && s.background_state == BackgroundState::Foreground)
+            }
+        };
+        if should_deliver {
+            self.shared.callback.on_notify(kind);
+        }
     }
 }
 
@@ -1023,6 +1068,8 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
             last_connect_attempt: None,
             reconnect_policy: ReconnectPolicy::default(),
             background_state: BackgroundState::Foreground,
+            tab_focused: false,
+            last_notify_seq: None,
         }),
         callback: Arc::from(callback),
         session: Mutex::new(None),
@@ -1316,7 +1363,15 @@ impl SessionOrchestrator {
     /// そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
     /// レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
     /// 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+    ///
+    /// タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
+    /// 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
+    /// `OrchestratorAdapter::on_notify`がこれと`background_state`を合わせて見て、
+    /// tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
+    /// (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
+    /// フォーカス状態は独立に変化し得るため)。
     pub fn notify_focus_change(&self, focused: bool) {
+        self.shared.state.lock().tab_focused = focused;
         if let Some(s) = self.shared.session.lock().as_ref() {
             s.notify_focus_change(focused);
         }
@@ -1637,6 +1692,7 @@ mod tests {
         connection_states: StdMutex<Vec<ConnectionPublicState>>,
         trzsz_states: StdMutex<Vec<TrzszPublicState>>,
         downloads: StdMutex<Vec<(Option<String>, Vec<u8>)>>,
+        notifications: StdMutex<Vec<crate::NotifyKind>>,
     }
 
     impl OrchestratorCallback for RecordingCallback {
@@ -1664,6 +1720,9 @@ mod tests {
         fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+        fn on_notify(&self, kind: crate::NotifyKind) {
+            self.notifications.lock().unwrap().push(kind);
+        }
     }
 
     fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {
@@ -1686,6 +1745,8 @@ mod tests {
                 last_connect_attempt: None,
                 reconnect_policy: ReconnectPolicy::default(),
                 background_state: BackgroundState::Foreground,
+                tab_focused: false,
+                last_notify_seq: None,
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
@@ -1745,6 +1806,8 @@ mod tests {
                 last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
                 reconnect_policy: policy,
                 background_state: BackgroundState::Foreground,
+                tab_focused: false,
+                last_notify_seq: None,
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
@@ -1798,6 +1861,8 @@ mod tests {
                 last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
                 reconnect_policy: policy,
                 background_state: BackgroundState::Foreground,
+                tab_focused: false,
+                last_notify_seq: None,
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
@@ -2824,6 +2889,8 @@ mod tests {
                 last_connect_attempt: Some(LastConnectAttempt::Ssh(test_ssh_config())),
                 reconnect_policy: ReconnectPolicy::default(),
                 background_state: BackgroundState::Foreground,
+                tab_focused: false,
+                last_notify_seq: None,
             }),
             callback: callback.clone(),
             session: Mutex::new(None),
@@ -2868,5 +2935,74 @@ mod tests {
             events.iter().any(|e| matches!(e, ConnectionPublicState::Disconnected { .. })),
             "同期失敗はDisconnectedとして通知されるはず, got: {events:?}"
         );
+    }
+
+    // ── OrchestratorAdapter::on_notify (タスク#57) ───────────────
+
+    #[test]
+    fn on_notify_delivers_when_not_focused() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().tab_focused = false;
+        adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 1);
+        assert_eq!(cb.notifications.lock().unwrap().as_slice(), &[crate::NotifyKind::Bell]);
+    }
+
+    #[test]
+    fn on_notify_suppresses_when_foreground_and_tab_focused() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        {
+            let mut s = shared.state.lock();
+            s.tab_focused = true;
+            s.background_state = BackgroundState::Foreground;
+        }
+        adapter.on_notify(crate::NotifyKind::Activity, "tag-a".to_string(), 1);
+        assert!(cb.notifications.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn on_notify_delivers_when_tab_focused_but_app_backgrounded() {
+        // タブ自体はフォーカスされていても(Compose側の直近状態が古い等)、
+        // アプリ全体がバックグラウンドならユーザーは見ていないので配信する。
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        {
+            let mut s = shared.state.lock();
+            s.tab_focused = true;
+            s.background_state = BackgroundState::Suspended;
+        }
+        adapter.on_notify(crate::NotifyKind::Silence, "tag-a".to_string(), 1);
+        assert_eq!(cb.notifications.lock().unwrap().as_slice(), &[crate::NotifyKind::Silence]);
+    }
+
+    #[test]
+    fn on_notify_drops_exact_duplicate_tag_and_seq() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().tab_focused = false;
+        adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 5);
+        adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 5);
+        assert_eq!(
+            cb.notifications.lock().unwrap().as_slice(),
+            &[crate::NotifyKind::Bell],
+            "the exact same (tmux_tag, seq) pair must be delivered only once"
+        );
+    }
+
+    #[test]
+    fn on_notify_delivers_a_different_seq_for_the_same_tag() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().tab_focused = false;
+        adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 5);
+        adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 6);
+        assert_eq!(cb.notifications.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn on_notify_ignored_when_adapter_is_stale() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().tab_focused = false;
+        // 新しいアダプタを生成すると`session_generation`が進み、古い`adapter`は
+        // stale扱いになる(`is_current()`参照)。
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        adapter.on_notify(crate::NotifyKind::Bell, "tag-a".to_string(), 1);
+        assert!(cb.notifications.lock().unwrap().is_empty());
     }
 }

@@ -15,6 +15,7 @@ import org.junit.Test
 import uniffi.isekai_terminal_core.QuicConfig
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
+import uniffi.isekai_terminal_core.NotifyKind
 import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.ScrollbackSearchMatch
 import uniffi.isekai_terminal_core.SshAuth
@@ -828,6 +829,36 @@ class TerminalSessionTest {
         delay(50)
 
         assertEquals(1, bellCount.get())
+        s.close()
+    }
+
+    // ── #57: tmux hook(alert-bell/alert-activity/alert-silence/pane-died)発火 ──
+
+    @Test
+    fun onNotify_forwardsKindToInjectedCallback() {
+        val received = mutableListOf<NotifyKind>()
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(
+            FakeHostKeyChecker(),
+            orchestratorFactory = { cb -> orch.also { it.callback = cb } },
+            onNotifyRequested = { kind -> received.add(kind) },
+        )
+
+        orch.simulateNotify(NotifyKind.BELL)
+        orch.simulateNotify(NotifyKind.JOB_DONE)
+
+        assertEquals(listOf(NotifyKind.BELL, NotifyKind.JOB_DONE), received)
+        s.close()
+    }
+
+    @Test
+    fun onNotify_withoutInjectedCallback_doesNotThrow() {
+        val orch = FakeOrchestrator()
+        val s = TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> orch.also { it.callback = cb } })
+
+        // 既定は no-op なので、何も注入しなくても例外にならないこと(他の副作用注入
+        // パラメータ`onBell`/`onClipboardWriteRequested`と同じ既定動作)。
+        orch.simulateNotify(NotifyKind.SILENCE)
         s.close()
     }
 

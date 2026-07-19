@@ -668,6 +668,9 @@ internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod12 : com.sun
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod13 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod14 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`kind`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 @Structure.FieldOrder("uniffiFree", "uniffiClone", "onDiagnosticEvent")
 internal open class UniffiVTableCallbackInterfaceDiagnosticCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -706,7 +709,7 @@ internal open class UniffiVTableCallbackInterfaceEventWakeListener(
     }
 
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged")
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged", "onNotify")
 internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -724,6 +727,7 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `onRequestWifiFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod11? = null,
     @JvmField internal var `onRequestCellularFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod12? = null,
     @JvmField internal var `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
+    @JvmField internal var `onNotify`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -742,7 +746,8 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onRequestWifiFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod11? = null,
         `onRequestCellularFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod12? = null,
         `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
-    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,), Structure.ByValue
+        `onNotify`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
+    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,`onNotify`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceOrchestratorCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -761,6 +766,7 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onRequestWifiFd` = other.`onRequestWifiFd`
         `onRequestCellularFd` = other.`onRequestCellularFd`
         `onRebindStateChanged` = other.`onRebindStateChanged`
+        `onNotify` = other.`onNotify`
     }
 
 }
@@ -938,6 +944,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_request_cellular_fd(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_notify(
     ): Int
     external fun ffi_isekai_terminal_core_uniffi_contract_version(
     ): Int
@@ -1341,7 +1349,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 47947) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 5360) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning() != 20700) {
@@ -1447,6 +1455,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed() != 15707) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_notify() != 52593) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -3002,6 +3013,13 @@ public interface SessionOrchestratorInterface {
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     *
+     * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
+     * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
+     * `OrchestratorAdapter::on_notify`がこれと`background_state`を合わせて見て、
+     * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
+     * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
+     * フォーカス状態は独立に変化し得るため)。
      */
     fun `notifyFocusChange`(`focused`: kotlin.Boolean)
     
@@ -3468,6 +3486,13 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
      * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
      * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
      * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     *
+     * タスク#57: `state.tab_focused`にも同じ値を複製する(新しいUniFFIメソッドを
+     * 増やすのではなく既存の生イベント転送を再利用する、`rust-ssot.md`)。
+     * `OrchestratorAdapter::on_notify`がこれと`background_state`を合わせて見て、
+     * tmux hook通知をAndroid通知として見せるか抑制するかを判断する——未接続時
+     * (`session`が無い)でも`tab_focused`自体は更新する(接続前後でタブの
+     * フォーカス状態は独立に変化し得るため)。
      */override fun `notifyFocusChange`(`focused`: kotlin.Boolean)
         = 
     callWithHandle {
@@ -6049,6 +6074,48 @@ public object FfiConverterTypeMouseReportingMode: FfiConverterRustBuffer<MouseRe
 
 
 /**
+ * タスク#57: tmux hook(`alert-bell`/`alert-activity`/`alert-silence`/
+ * `pane-died`)発火の種別。`isekai_protocol::NotifyKind`と同じ4種を表す別々の型
+ * (`ClipboardMimeKind`と同じ理由——isekai-protocolはuniffiに依存しないpure crate
+ * なので、その型をUniFFI境界越しにそのまま公開できない)。
+ */
+
+enum class NotifyKind {
+    
+    BELL,
+    ACTIVITY,
+    SILENCE,
+    JOB_DONE;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeNotifyKind: FfiConverterRustBuffer<NotifyKind> {
+    override fun read(buf: ByteBuffer) = try {
+        NotifyKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: NotifyKind) = 4UL
+
+    override fun write(value: NotifyKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
  * UI(Compose/SwiftUI)へ公開する簡略化された状態。
  */
 
@@ -7134,6 +7201,18 @@ public interface OrchestratorCallback {
      */
     fun `onRebindStateChanged`(`state`: RebindPublicState)
     
+    /**
+     * タスク#57: tmux hookがリモートで発火した(`alert-bell`/`alert-activity`/
+     * `alert-silence`/`pane-died`)。「今この瞬間ユーザーへAndroid通知として
+     * 見せるべきか」の判断(アプリがフォアグラウンドかつこのタブが表示中なら
+     * 抑制する)は`orchestrator.rs`の`OrchestratorAdapter::on_notify`が既に済ませて
+     * から呼ぶため、この実装は「渡された`kind`について、このタブ(プロファイル)の
+     * per-tab通知設定がONなら通知チャンネルへpostする」だけでよい
+     * (`rust-ssot.md`: 抑制判断はセッション状態に基づく判断なのでRust側、
+     * per-tab ON/OFF設定自体はUI設定でありKotlin側に置いてよい例外)。
+     */
+    fun `onNotify`(`kind`: NotifyKind)
+    
     companion object
 }
 
@@ -7309,6 +7388,18 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+    internal object `onNotify`: UniffiCallbackInterfaceOrchestratorCallbackMethod14 {
+        override fun callback(`uniffiHandle`: Long,`kind`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onNotify`(
+                    FfiConverterTypeNotifyKind.lift(`kind`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
 
     internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
@@ -7339,6 +7430,7 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
         `onRequestWifiFd`,
         `onRequestCellularFd`,
         `onRebindStateChanged`,
+        `onNotify`,
     )
 
     // Registers the foreign callback with the Rust side.

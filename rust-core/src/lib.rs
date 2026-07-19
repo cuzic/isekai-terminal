@@ -23,6 +23,10 @@ pub(crate) mod tmux_scrollback;
 // #60: tmux session group のensure/attach + タブ用ウィンドウのcreate-or-select。
 // #61(run_exec)・#62(tmux_locator)を実際に繋ぎ合わせる本体。
 pub(crate) mod tmux_session;
+// #57: tmux hooks(alert-bell/alert-activity/alert-silence/pane-died)を
+// インストールするコマンド組み立て。実際の配線(接続確立時に呼ぶ場所)は
+// `transport::ssh_handler::run_ssh_channel_loop`。
+pub(crate) mod tmux_notify;
 pub mod orchestrator;
 pub(crate) mod helper_bootstrap;
 pub mod isekai_pipe_quic_transport;
@@ -1191,6 +1195,18 @@ pub enum ClipboardMimeKind {
     ImagePng,
 }
 
+/// タスク#57: tmux hook(`alert-bell`/`alert-activity`/`alert-silence`/
+/// `pane-died`)発火の種別。`isekai_protocol::NotifyKind`と同じ4種を表す別々の型
+/// (`ClipboardMimeKind`と同じ理由——isekai-protocolはuniffiに依存しないpure crate
+/// なので、その型をUniFFI境界越しにそのまま公開できない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NotifyKind {
+    Bell,
+    Activity,
+    Silence,
+    JobDone,
+}
+
 /// クリップボードの中身1件(push時はリモートから受け取った内容、pull時はデバイス側の
 /// 現在のクリップボード内容)。`text: String`だった旧シグネチャを置き換える
 /// (画像は任意バイト列で運ぶ必要があり、UTF-8前提の`String`では表現できないため)。
@@ -1304,6 +1320,15 @@ pub trait OrchestratorCallback: Send + Sync {
     /// #19: `RebindManager`の状態が変化した(WiFi/セルラーフェイルオーバー/復帰待ち)。
     /// マルチパス以外のtransportでは呼ばれない。
     fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState);
+    /// タスク#57: tmux hookがリモートで発火した(`alert-bell`/`alert-activity`/
+    /// `alert-silence`/`pane-died`)。「今この瞬間ユーザーへAndroid通知として
+    /// 見せるべきか」の判断(アプリがフォアグラウンドかつこのタブが表示中なら
+    /// 抑制する)は`orchestrator.rs`の`OrchestratorAdapter::on_notify`が既に済ませて
+    /// から呼ぶため、この実装は「渡された`kind`について、このタブ(プロファイル)の
+    /// per-tab通知設定がONなら通知チャンネルへpostする」だけでよい
+    /// (`rust-ssot.md`: 抑制判断はセッション状態に基づく判断なのでRust側、
+    /// per-tab ON/OFF設定自体はUI設定でありKotlin側に置いてよい例外)。
+    fn on_notify(&self, kind: NotifyKind);
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -1329,6 +1354,12 @@ pub(crate) trait SessionCallback: Send + Sync {
     fn on_request_wifi_fd(&self) -> Option<PlatformFd> { None }
     fn on_request_cellular_fd(&self) -> Option<PlatformFd> { None }
     fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+    /// タスク#57: 受信した`isekai_protocol::CtlMessage::Notify`(`session.rs`の
+    /// `session_event_loop`経由)。`tmux_tag`/`seq`は`OrchestratorAdapter`が
+    /// (a)重複配信の検出(同じ`(tmux_tag, seq)`は無視)と(b)フォアグラウンド+
+    /// このタブ表示中の抑制判断に使う。既定は他のオプショナルコールバックと同じく
+    /// no-op(`OrchestratorAdapter`だけが実際にオーバーライドする)。
+    fn on_notify(&self, _kind: crate::NotifyKind, _tmux_tag: String, _seq: u64) {}
 }
 
 // ── SshSession ──────────────────────────────────────────

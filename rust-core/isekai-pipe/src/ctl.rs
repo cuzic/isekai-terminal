@@ -15,7 +15,7 @@ use anyhow::Result;
 use anyhow::{bail, Context};
 #[cfg(unix)]
 use base64::Engine as _;
-use isekai_protocol::ClipboardMime;
+use isekai_protocol::{ClipboardMime, NotifyKind};
 #[cfg(unix)]
 use isekai_protocol::{decode_ctl_message, CtlMessage};
 #[cfg(unix)]
@@ -33,6 +33,11 @@ enum CtlLaunch {
     Title { sock: Option<String>, value: String },
     ClipPush { sock: Option<String>, mime: ClipboardMime },
     ClipPull { sock: Option<String> },
+    /// タスク#57: tmux hook(`alert-bell`/`alert-activity`/`alert-silence`/
+    /// `pane-died`、`rust-core/src/tmux_notify.rs`がインストールする`run-shell`
+    /// スクリプトから起動される)。device側の実装は`rust-core/src/session.rs`の
+    /// `TransportEvent::CtlMessage`アーム。
+    Notify { sock: Option<String>, kind: NotifyKind, tmux_tag: String, seq: u64 },
 }
 
 fn print_ctl_help() {
@@ -42,8 +47,24 @@ fn print_ctl_help() {
     println!("        (reads the payload from stdin)");
     println!("    isekai-pipe ctl clip pull [--sock <path>]");
     println!("        (writes the decoded payload to stdout)");
+    println!(
+        "    isekai-pipe ctl notify --kind <bell|activity|silence|job_done> --tag <tmux_tag> --seq <n> [--sock <path>]"
+    );
+    println!("        (invoked by a tmux hook's run-shell command, not by a human)");
     println!();
     println!("Without --sock, reads the target UNIX domain socket path from ${ENV_CTL_SOCK}.");
+}
+
+fn parse_notify_kind(value: &str) -> Result<NotifyKind, String> {
+    match value {
+        "bell" => Ok(NotifyKind::Bell),
+        "activity" => Ok(NotifyKind::Activity),
+        "silence" => Ok(NotifyKind::Silence),
+        "job_done" => Ok(NotifyKind::JobDone),
+        other => Err(format!(
+            "isekai-pipe ctl notify: unsupported --kind {other:?} (expected bell, activity, silence, or job_done)"
+        )),
+    }
 }
 
 fn parse_mime(value: &str) -> Result<ClipboardMime, String> {
@@ -65,6 +86,7 @@ fn parse_ctl(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>
         }
         Some("title") => parse_ctl_title(args),
         Some("clip") => parse_ctl_clip(args),
+        Some("notify") => parse_ctl_notify(args),
         Some(other) => {
             eprintln!("isekai-pipe ctl: unknown subcommand {other:?}");
             Err(ExitCode::from(EX_USAGE))
@@ -95,6 +117,70 @@ fn parse_ctl_title(mut args: impl Iterator<Item = String>) -> Result<Option<CtlL
         return Err(ExitCode::from(EX_USAGE));
     };
     Ok(Some(CtlLaunch::Title { sock, value }))
+}
+
+/// タスク#57: `isekai-pipe ctl notify --kind <k> --tag <tag> --seq <n> [--sock <path>]`。
+/// `--kind`/`--tag`/`--seq`はすべて必須(呼び出し元は常にtmux hookのrun-shell
+/// スクリプトであり、対話的なusageエラー体験より「壊れた呼び出しは即座に失敗する」
+/// ことを優先する)。
+fn parse_ctl_notify(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
+    let mut sock: Option<String> = None;
+    let mut kind: Option<NotifyKind> = None;
+    let mut tmux_tag: Option<String> = None;
+    let mut seq: Option<u64> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--sock" => {
+                sock = Some(next_arg("ctl notify", &mut args, "--sock").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            "--kind" => {
+                let value = next_arg("ctl notify", &mut args, "--kind").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                kind = Some(parse_notify_kind(&value).map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            "--tag" => {
+                tmux_tag = Some(next_arg("ctl notify", &mut args, "--tag").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            "--seq" => {
+                let value = next_arg("ctl notify", &mut args, "--seq").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                seq = Some(value.parse::<u64>().map_err(|_| {
+                    eprintln!("isekai-pipe ctl notify: --seq must be a non-negative integer, got {value:?}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            other => {
+                eprintln!("isekai-pipe ctl notify: unknown argument {other:?}");
+                return Err(ExitCode::from(EX_USAGE));
+            }
+        }
+    }
+    let Some(kind) = kind else {
+        eprintln!("isekai-pipe ctl notify: --kind is required");
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    let Some(tmux_tag) = tmux_tag else {
+        eprintln!("isekai-pipe ctl notify: --tag is required");
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    let Some(seq) = seq else {
+        eprintln!("isekai-pipe ctl notify: --seq is required");
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    Ok(Some(CtlLaunch::Notify { sock, kind, tmux_tag, seq }))
 }
 
 fn parse_ctl_clip(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
@@ -230,9 +316,10 @@ pub(crate) async fn ctl_command(args: impl Iterator<Item = String>) -> ExitCode 
         Err(code) => return code,
     };
     let sock = match &launch {
-        CtlLaunch::Title { sock, .. } | CtlLaunch::ClipPush { sock, .. } | CtlLaunch::ClipPull { sock } => {
-            sock.clone()
-        }
+        CtlLaunch::Title { sock, .. }
+        | CtlLaunch::ClipPush { sock, .. }
+        | CtlLaunch::ClipPull { sock }
+        | CtlLaunch::Notify { sock, .. } => sock.clone(),
     };
     let sock_path = match resolve_ctl_socket_path(sock) {
         Ok(path) => path,
@@ -268,9 +355,10 @@ pub(crate) async fn ctl_command(args: impl Iterator<Item = String>) -> ExitCode 
     // sees the same usage error on every platform — only the final "connect
     // to it" step is unix-only.
     let sock = match &launch {
-        CtlLaunch::Title { sock, .. } | CtlLaunch::ClipPush { sock, .. } | CtlLaunch::ClipPull { sock } => {
-            sock.clone()
-        }
+        CtlLaunch::Title { sock, .. }
+        | CtlLaunch::ClipPush { sock, .. }
+        | CtlLaunch::ClipPull { sock }
+        | CtlLaunch::Notify { sock, .. } => sock.clone(),
     };
     if let Err(code) = resolve_ctl_socket_path(sock) {
         return code;
@@ -308,6 +396,12 @@ async fn run_ctl(sock_path: &Path, launch: CtlLaunch) -> Result<()> {
                 }
                 other => bail!("isekai-pipe ctl clip pull: unexpected response {other:?}"),
             }
+        }
+        // タスク#57: tmux hookが起動する経路。デバイス側からの応答は無い
+        // (`isekai_protocol::CtlMessage::Notify`のdocコメント参照)ので
+        // `send_ctl_message`(応答を待たない版)で十分。
+        CtlLaunch::Notify { kind, tmux_tag, seq, .. } => {
+            send_ctl_message(sock_path, CtlMessage::Notify { kind, tmux_tag, seq }).await
         }
     }
 }
@@ -451,6 +545,79 @@ mod tests {
         assert_eq!(err, ExitCode::from(EX_USAGE));
     }
 
+    // ── notify (タスク#57) ────────────────────────────────
+
+    #[test]
+    fn parses_notify_with_all_required_flags() {
+        let launch = parse_ctl(args(&["notify", "--kind", "bell", "--tag", "abc123", "--seq", "7"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            launch,
+            CtlLaunch::Notify {
+                sock: None,
+                kind: NotifyKind::Bell,
+                tmux_tag: "abc123".to_string(),
+                seq: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_notify_with_explicit_sock_and_all_kinds() {
+        for (arg, kind) in [
+            ("bell", NotifyKind::Bell),
+            ("activity", NotifyKind::Activity),
+            ("silence", NotifyKind::Silence),
+            ("job_done", NotifyKind::JobDone),
+        ] {
+            let launch = parse_ctl(args(&[
+                "notify", "--kind", arg, "--tag", "t", "--seq", "0", "--sock", "/tmp/a.sock",
+            ]))
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                launch,
+                CtlLaunch::Notify {
+                    sock: Some("/tmp/a.sock".to_string()),
+                    kind,
+                    tmux_tag: "t".to_string(),
+                    seq: 0,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_notify_missing_kind() {
+        let err = parse_ctl(args(&["notify", "--tag", "t", "--seq", "0"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn rejects_notify_missing_tag() {
+        let err = parse_ctl(args(&["notify", "--kind", "bell", "--seq", "0"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn rejects_notify_missing_seq() {
+        let err = parse_ctl(args(&["notify", "--kind", "bell", "--tag", "t"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn rejects_notify_with_unknown_kind() {
+        let err = parse_ctl(args(&["notify", "--kind", "made_up", "--tag", "t", "--seq", "0"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn rejects_notify_with_non_numeric_seq() {
+        let err = parse_ctl(args(&["notify", "--kind", "bell", "--tag", "t", "--seq", "not-a-number"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
     // 以下`resolve_ctl_socket_path_with`越しにテストする: 実際に`tmux`サブプロセスを
     // 起動する`resolve_ctl_socket_path`(本番用ラッパー)経由だと、テスト実行環境に
     // たまたま`tmux`があるか・そのペインに`@isekai_ctl_sock`が設定済みかで結果が
@@ -531,6 +698,44 @@ mod tests {
         send_ctl_message(&sock_path, CtlMessage::SetTitle { value: "hello".to_string() })
             .await
             .unwrap();
+        server.await.unwrap();
+    }
+
+    /// タスク#57: `run_ctl(CtlLaunch::Notify)`が正しい`CtlMessage::Notify`を
+    /// 組み立てて送ることをe2eで確認する(`send_ctl_message_delivers_set_title`と
+    /// 同じ手組みリスナーのパターン)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_ctl_notify_delivers_ctl_message_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("ctl.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let server = tokio::spawn({
+            let sock_path = sock_path.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut preamble = String::new();
+                reader.read_line(&mut preamble).await.unwrap();
+                assert_eq!(preamble.trim_end(), sock_path.to_string_lossy());
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let msg = decode_ctl_message(line.trim_end().as_bytes()).unwrap();
+                assert_eq!(
+                    msg,
+                    CtlMessage::Notify { kind: NotifyKind::Bell, tmux_tag: "abc123".to_string(), seq: 7 }
+                );
+            }
+        });
+
+        let launch = CtlLaunch::Notify {
+            sock: Some(sock_path.to_string_lossy().into_owned()),
+            kind: NotifyKind::Bell,
+            tmux_tag: "abc123".to_string(),
+            seq: 7,
+        };
+        run_ctl(&sock_path, launch).await.unwrap();
         server.await.unwrap();
     }
 

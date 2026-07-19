@@ -64,11 +64,12 @@ class TerminalTabsViewModelTest {
             Repositories.keySequences.getAll().forEach { Repositories.keySequences.delete(it) }
         }
         executor = DumbAppExecutor()
-        val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource) -> TerminalSession = { _, _ ->
-            val fake = FakeOrchestrator()
-            orchestrators.add(fake)
-            TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
-        }
+        val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource, tools.isekai.terminal.data.ConnectionProfile) -> TerminalSession =
+            { _, _, _ ->
+                val fake = FakeOrchestrator()
+                orchestrators.add(fake)
+                TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
+            }
         // ViewModel内部のviewModelScope.launch(ioDispatcher)にも同じtestScheduler駆動の
         // ディスパッチャーを使わせ、テストの仮想時間と実スレッドの完了タイミングが競合して
         // withTimeout()ポーリングが断続的にタイムアウトする問題(pre-existing flaky)を解消する。

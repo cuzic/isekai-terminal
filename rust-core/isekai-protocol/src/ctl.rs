@@ -59,19 +59,34 @@ impl ClipboardMime {
 /// fall through to "unrecognized" instead of failing to compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotifyKind {
-    /// tmux `bell` hook (BEL / visual bell in a pane).
+    /// tmux `alert-bell` hook (BEL / visual bell in a pane; NOT a hook named
+    /// `bell` — that name does not exist in tmux, confirmed against real
+    /// tmux 3.3a's `man tmux(1)` HOOKS section during #57's implementation).
+    /// Session-scoped only (`rust-core/src/tmux_notify.rs`'s module doc
+    /// documents why — this and the two hooks below can only be installed
+    /// with session scope, verified empirically, not per-window/pane).
     #[serde(rename = "bell")]
     Bell,
     /// tmux `alert-activity` hook (output in a `monitor-activity` window).
+    /// Session-scoped only, same as `Bell`.
     #[serde(rename = "activity")]
     Activity,
     /// tmux `alert-silence` hook (a `monitor-silence` timeout elapsed with
-    /// no output).
+    /// no output). Session-scoped only, same as `Bell`.
     #[serde(rename = "silence")]
     Silence,
-    /// Not a native tmux hook: emitted by a wrapper script/hook combo that
-    /// observes a long-running command's exit (#57's design; out of scope
-    /// here).
+    /// tmux `pane-died` hook (the pane's program exited, but `remain-on-exit`
+    /// kept the pane itself from closing so the hook could still fire —
+    /// `rust-core/src/tmux_notify.rs` sets `remain-on-exit` globally before
+    /// installing this, since setting it per-window after creation loses a
+    /// race against fast-exiting commands, confirmed against real tmux
+    /// 3.3a). Unlike `Bell`/`Activity`/`Silence` above, `pane-died` can only
+    /// be installed with *window* scope (also confirmed empirically) —
+    /// which conveniently means it does *not* multiply when several tmux
+    /// session-group members (multiple devices attached to the same host
+    /// profile, #60) each install it, since window-scoped state belongs to
+    /// the shared window object itself rather than to whichever session
+    /// name addressed it.
     #[serde(rename = "job_done")]
     JobDone,
 }

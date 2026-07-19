@@ -33,3 +33,9 @@ version = 20
 owner = "task60-tmux-session-mapping"
 branch = "worktree-agent-abdb7f693214ea531"
 reserved_at = "2026-07-19"
+
+[[reserved]]
+version = 21
+owner = "task57-tmux-notify"
+branch = "worktree-agent-a1e1e4020360813f3"
+reserved_at = "2026-07-19"

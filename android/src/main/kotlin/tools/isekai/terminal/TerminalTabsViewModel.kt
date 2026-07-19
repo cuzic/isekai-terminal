@@ -137,7 +137,7 @@ class PaneState internal constructor(
 class TerminalTabsViewModel(
     app: Application,
     private val executor: AppExecutor,
-    private val sessionFactory: (AppExecutor, RebindFdSource) -> TerminalSession,
+    private val sessionFactory: (AppExecutor, RebindFdSource, ConnectionProfile) -> TerminalSession,
     // テストがtestScheduler駆動のディスパッチャーを注入できるようにする(既定は本番同様
     // Dispatchers.IO)。ハードコードしていた頃はテストの仮想時間(TestCoroutineScheduler)と
     // ここで起動される実スレッドの完了タイミングが競合し、withTimeout()ポーリングが
@@ -153,7 +153,7 @@ class TerminalTabsViewModel(
     constructor(app: Application) : this(
         app,
         AndroidAppExecutor(app),
-        { executor, rebindFdSource ->
+        { executor, rebindFdSource, profile ->
             val clipboardPolicy = RemoteClipboardPolicy(
                 isWriteAllowed = {
                     app.getSharedPreferences("isekai_terminal_ui", android.content.Context.MODE_PRIVATE)
@@ -223,6 +223,20 @@ class TerminalTabsViewModel(
                 onBell = {
                     val vibrator = app.getSystemService(Vibrator::class.java)
                     vibrator?.vibrate(VibrationEffect.createOneShot(150, VibrationEffect.DEFAULT_AMPLITUDE))
+                },
+                // タスク#57: tmux hook発火。「見せるべきか」の判断はRust側で済んでおり、
+                // ここでは(a) このプロファイルのopt-in設定、(b) 通知権限、の2つの確認と
+                // 実際のpostだけを行う(`TabAlertNotifier`参照)。通知は同じプロファイルの
+                // 複数タブで1枠に集約する(profile.idをキーにする、`rust-ssot.md`の対象外
+                // ——UI表示上の判断)。
+                onNotifyRequested = { kind ->
+                    TabAlertNotifier.notify(
+                        context = app,
+                        tabId = profile.id.toString(),
+                        profileLabel = profile.label,
+                        kind = kind,
+                        enabled = profile.enableTabNotifications,
+                    )
                 },
             )
         },
@@ -384,7 +398,7 @@ class TerminalTabsViewModel(
     fun openTab(profile: ConnectionProfile, password: String? = null, jumpPassword: String? = null): String {
         val tabId = UUID.randomUUID().toString()
         val rebindFdSource = executor.createRebindFdSource()
-        val primaryPane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource), rebindFdSource)
+        val primaryPane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource, profile), rebindFdSource)
         // Phase 12 P2-1: Global default → Profile default の解決。プロファイルに明示的な
         // テーマ指定があれば、その時点で「上書き済み」タブとして扱う(以後グローバル変更に
         // 追従しない。ユーザーがそのプロファイル用に選んだ意図を尊重する)。
@@ -475,7 +489,7 @@ class TerminalTabsViewModel(
         if (tab.splitPane.value != null) return null
         val profile = tab.profile ?: return null
         val rebindFdSource = executor.createRebindFdSource()
-        val pane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource), rebindFdSource)
+        val pane = PaneState(UUID.randomUUID().toString(), sessionFactory(executor, rebindFdSource, profile), rebindFdSource)
         RemoteLogger.i("IsekaiTerminalTabsVM", "splitPane[$tabId] new pane=${pane.paneId} direction=$direction")
         tab.openSplit(pane, direction)
         watchPane(tab, pane)

@@ -6,7 +6,10 @@ use log::{debug, info, warn};
 use parking_lot::Mutex;
 use timed_fsm::TimerCommand;
 
-use crate::{CellData, ClipboardMimeKind, ClipboardPayload, ScreenUpdate, ScrollbackSearchMatch, SessionCallback, RUNTIME};
+use crate::{
+    CellData, ClipboardMimeKind, ClipboardPayload, NotifyKind, ScreenUpdate, ScrollbackSearchMatch, SessionCallback,
+    RUNTIME,
+};
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
 use crate::terminal::TermCell;
 use crate::theme::Theme;
@@ -537,6 +540,18 @@ fn clipboard_mime_kind_to_protocol(mime: ClipboardMimeKind) -> isekai_protocol::
     }
 }
 
+/// タスク#57: `isekai_protocol::NotifyKind`(uniffiに依存しないpure crate側の型)を
+/// `crate::NotifyKind`(UniFFI境界を越える側の型)へ変換する
+/// (`clipboard_mime_kind_from_protocol`と同じ理由・同じパターン)。
+fn notify_kind_from_protocol(kind: isekai_protocol::NotifyKind) -> NotifyKind {
+    match kind {
+        isekai_protocol::NotifyKind::Bell => NotifyKind::Bell,
+        isekai_protocol::NotifyKind::Activity => NotifyKind::Activity,
+        isekai_protocol::NotifyKind::Silence => NotifyKind::Silence,
+        isekai_protocol::NotifyKind::JobDone => NotifyKind::JobDone,
+    }
+}
+
 /// `CtlMessage::ClipboardPush`の`data_b64`をデコードする。base64が不正なら`warn!`ログを
 /// 出して`None`を返す(既存の「不正な入力はドロップして継続する」opportunisticな方針を
 /// 維持)。テキスト系mime(`TextPlain`/`TextHtml`)はさらにUTF-8として妥当かも検証する
@@ -651,11 +666,19 @@ pub(crate) async fn session_event_loop(
                         // deviceがこれを受け取ることは無い。どちらも到達したら無視するだけ。
                         isekai_protocol::CtlMessage::ClipboardPullRequest {}
                         | isekai_protocol::CtlMessage::ClipboardPullResponse { .. } => None,
-                        // #57 (tmux hooks → Android notifications) consumes this;
-                        // wiring it to `SessionCallback`/a notification channel is
-                        // that task's job, not #63's (this variant's wire format).
-                        // Ignored here for now rather than left unhandled.
-                        isekai_protocol::CtlMessage::Notify { .. } => None,
+                        // #57: tmux hook(`alert-bell`/`alert-activity`/
+                        // `alert-silence`/`pane-died`、`tmux_notify.rs`が
+                        // インストール)が発火した。フォアグラウンド+このタブ
+                        // 表示中の抑制判断・`(tmux_tag, seq)`重複排除は
+                        // `orchestrator.rs`の`OrchestratorAdapter::on_notify`が
+                        // 行うため、ここでは変換して素通しするだけでよい
+                        // (他の`on_forward_state_changed`等と同じ、直接呼び出しの
+                        // 「fire-and-forgetな通知」パターン——`spawn_blocking`を
+                        // 使う`on_host_key`等とは違い戻り値を待つ必要が無い)。
+                        isekai_protocol::CtlMessage::Notify { kind, tmux_tag, seq } => {
+                            callback.on_notify(notify_kind_from_protocol(kind), tmux_tag, seq);
+                            None
+                        }
                     }
                 }
                 Some(TransportEvent::ClipboardPullRequestOverCtl(reply)) => {

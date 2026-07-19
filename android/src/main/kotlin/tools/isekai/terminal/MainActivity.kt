@@ -91,6 +91,10 @@ class MainActivity : ComponentActivity() {
         restorePersistedTerminalTheme()
         restorePersistedScreenProtection()
         restorePersistedCtlSocketForward()
+        // タスク#57: 通知チャンネル(Android 8.0+で必須)。既に存在すれば無害なno-op。
+        // 実行時権限(POST_NOTIFICATIONS, Android 13+)の要求は、機能を実際に有効にする
+        // ProfileEditScreenのトグルON時に行う(アプリ起動直後にいきなり権限を求めない)。
+        TabAlertNotifier.createChannel(this)
         enableEdgeToEdge()
         setContent {
             MaterialTheme {
