@@ -1,5 +1,7 @@
 use vte::Parser;
 use timed_fsm::{TimedStateMachine, TimerCommand, Response};
+use crate::{CellData, LineDamage, ScreenUpdate};
+use crate::session::to_cell_data;
 use crate::terminal::{Terminal, TermCell};
 use crate::theme::Theme;
 use crate::trzsz::{TrzszTransferFsm, TrzszEffect, TrzszEvent, TrzszMode, TrzszTimer};
@@ -35,6 +37,22 @@ pub(crate) struct ProcessResult {
     pub(crate) clipboard_pull_requested: bool,
 }
 
+/// カーソルが乗る行(`row`)の損傷レンジに、少なくともカーソル列(`col`)を含める
+/// (タスク#94)。その行が既に損傷リストにあればレンジを広げ、無ければ1点だけの
+/// エントリを追加する。`row`が画面範囲外(縮小直後の旧カーソル位置等)、または
+/// `cols == 0`なら何もしない。
+fn force_cursor_row_dirty(damages: &mut Vec<LineDamage>, row: usize, col: usize, cols: usize, rows: usize) {
+    if cols == 0 || row >= rows { return; }
+    let col = col.min(cols - 1) as u16;
+    let line = row as u16;
+    if let Some(d) = damages.iter_mut().find(|d| d.line == line) {
+        d.left = d.left.min(col);
+        d.right = d.right.max(col);
+    } else {
+        damages.push(LineDamage { line, left: col, right: col });
+    }
+}
+
 // ── SessionState ─────────────────────────────────────────
 
 /// 同期的なセッション状態機械。
@@ -43,6 +61,24 @@ pub(crate) struct SessionState {
     terminal: Terminal,
     parser: Parser,
     fsm: TrzszTransferFsm,
+    /// 前回発行した`ScreenUpdate`のグリッドセル・寸法・カーソル位置のスナップショット
+    /// (タスク#92、行単位のdamage tracking用)。次に`make_screen_update`が呼ばれたとき、
+    /// 現在のグリッドとこれを行ごとに比較して変化した列レンジ(`LineDamage`)を求める。
+    /// `None`は「まだ一度も発行していない」状態を表し、初回は全画面dirty扱いになる。
+    last_emitted_cells: Option<Vec<TermCell>>,
+    last_emitted_cols: usize,
+    last_emitted_rows: usize,
+    /// 前回発行時のカーソル位置(タスク#94のカーソル行強制dirty化用)。カーソルが
+    /// 離れた行を消せるよう、前回位置も今回位置と併せて損傷行に含める。`cursor_col`は
+    /// [make_screen_update]が公開するのと同じくクランプ済みの値を保持する。
+    last_cursor_row: usize,
+    last_cursor_col: usize,
+    /// 前回発行時のカーソル可視性(DECTCEM `CSI ?25h`/`l`)。位置が不変でも可視性だけ
+    /// 切り替わった場合、下地セルは不変なのでコンテンツ差分では検出できない——
+    /// カーソルを同じ描画パスでセルと一緒に描くiOS(タスク#98/#99)がカーソルの
+    /// 消し忘れ/描き忘れを起こさないよう、位置と同様にこの値も比較してカーソル行を
+    /// 強制dirty化する。
+    last_cursor_visible: bool,
 }
 
 impl SessionState {
@@ -51,6 +87,120 @@ impl SessionState {
             terminal: Terminal::new(cols, rows, theme),
             parser: Parser::new(),
             fsm: TrzszTransferFsm::new(),
+            last_emitted_cells: None,
+            last_emitted_cols: 0,
+            last_emitted_rows: 0,
+            last_cursor_row: 0,
+            last_cursor_col: 0,
+            last_cursor_visible: true,
+        }
+    }
+
+    /// 前回発行した`ScreenUpdate`との行単位差分(damage tracking)を計算し、`dirty_rows`を
+    /// 添えた最新の`ScreenUpdate`を生成する(タスク#92)。呼び出し元(`session.rs`の
+    /// イベントループ)は`screen_dirty`なバッチでのみ呼ぶ——画面が変化していないバッチ
+    /// ではスナップショットを更新しない(前回スナップショットが有効なまま)。
+    ///
+    /// `dirty_rows`の意味:
+    /// - `None` = 全画面損傷(初回発行・寸法変更・[Terminal::take_full_damage_pending]が
+    ///   立っている構造的変更[タスク#93])。UI層はグリッド全体を再描画する。
+    /// - `Some(vec)` = `vec`の各行の`[left,right]`レンジのみ再描画すればよい。損傷のない
+    ///   行は含まれない。カーソル行(前回位置・今回位置)は下地セルが不変でも含める
+    ///   (タスク#94)。
+    pub(crate) fn make_screen_update(&mut self) -> ScreenUpdate {
+        // `full_damage_pending`はワンショット——読み取ってクリアする(後続の不変借用より前に)。
+        let full_damage_flag = self.terminal.take_full_damage_pending();
+
+        let cols = self.terminal.cols();
+        let rows = self.terminal.rows();
+        let cursor_row = self.terminal.cursor_row();
+        // `cursor_col()`は遅延折り返し中に`cols`(範囲外)を返しうる——描画可能な最終列へ
+        // クランプしてから公開・損傷計算に使う(Fableレビュー: タスク#56)。
+        let cursor_col = self.terminal.cursor_col().min(cols.saturating_sub(1));
+        let cursor_visible = self.terminal.cursor_visible();
+
+        // 現在のグリッドを1度だけ所有スナップショットへ複製する。行差分の比較コストは
+        // O(rows×cols)のセル等価判定で、下の`to_cell_data`変換が毎フレーム払うコストと
+        // 同オーダーなので許容する(この複製自体も同オーダー)。
+        let current_cells: Vec<TermCell> = self.terminal.screen_cells().to_vec();
+        let cells: Vec<CellData> = current_cells.iter().map(to_cell_data).collect();
+
+        let dims_match = self.last_emitted_cols == cols
+            && self.last_emitted_rows == rows
+            && self.last_emitted_cells.as_ref().map_or(false, |c| c.len() == cols * rows);
+
+        let dirty_rows: Option<Vec<LineDamage>> = if full_damage_flag || !dims_match {
+            // 全画面損傷: 初回発行(last_emitted_cells==None → dims_match==false)・
+            // 寸法変更・構造的変更(#93)。行差分は取らない。
+            None
+        } else {
+            let prev = self.last_emitted_cells.as_ref().expect("dims_match implies Some");
+            let mut damages: Vec<LineDamage> = Vec::new();
+            for row in 0..rows {
+                let base = row * cols;
+                let mut left: Option<usize> = None;
+                let mut right = 0usize;
+                for col in 0..cols {
+                    if current_cells[base + col] != prev[base + col] {
+                        if left.is_none() { left = Some(col); }
+                        right = col;
+                    }
+                }
+                if let Some(l) = left {
+                    damages.push(LineDamage { line: row as u16, left: l as u16, right: right as u16 });
+                }
+            }
+            // カーソル行の強制dirty化(タスク#94)。iOSはカーソルをセル内容と同じ描画
+            // パスで描くため、カーソルが動いたら下地セルが不変でも「離れた行(前回位置、
+            // 古いカーソルを消す)」と「乗った行(今回位置、新しいカーソルを描く)」を
+            // 再描画させる。位置に加えて可視性(DECTCEM)も比較する——`CSI ?25l`/`?25h`
+            // で位置は不変のままカーソルの表示/非表示だけが切り替わるケースは下地セルも
+            // 不変なのでコンテンツ差分では検出できず、可視性だけ見落とすとiOS側で
+            // 消し忘れ/描き忘れが起きる(セルフレビューで検出)。動いても可視性も
+            // 変わっていなければ前回フレームで既に正しく描かれているので何も足さない
+            // ——これにより「画面が完全に同一の連続フレーム」は空の`dirty_rows`になる
+            // (タスク#101)。
+            if (cursor_row, cursor_col, cursor_visible)
+                != (self.last_cursor_row, self.last_cursor_col, self.last_cursor_visible)
+            {
+                force_cursor_row_dirty(&mut damages, self.last_cursor_row, self.last_cursor_col, cols, rows);
+                force_cursor_row_dirty(&mut damages, cursor_row, cursor_col, cols, rows);
+            }
+            // 損傷行を行番号昇順にそろえる(消費側の決定性・テスト容易性のため)。
+            damages.sort_by_key(|d| d.line);
+            Some(damages)
+        };
+
+        // スナップショットは全画面損傷時も含め毎回無条件に更新する——次回の差分が
+        // 正しく取れるように。
+        self.last_emitted_cells = Some(current_cells);
+        self.last_emitted_cols = cols;
+        self.last_emitted_rows = rows;
+        self.last_cursor_row = cursor_row;
+        self.last_cursor_col = cursor_col;
+        self.last_cursor_visible = cursor_visible;
+
+        let t = &self.terminal;
+        ScreenUpdate {
+            cols: cols as u32,
+            rows: rows as u32,
+            cells,
+            cursor_row: cursor_row as u32,
+            cursor_col: cursor_col as u32,
+            title: t.title().map(str::to_owned),
+            application_cursor_mode: t.application_cursor_mode(),
+            application_keypad_mode: t.application_keypad_mode(),
+            bracketed_paste_mode: t.bracketed_paste_mode(),
+            mouse_reporting_mode: t.mouse_reporting_mode(),
+            sgr_mouse_mode: t.sgr_mouse_mode(),
+            cursor_visible: t.cursor_visible(),
+            bell_generation: t.bell_generation(),
+            cursor_shape: t.cursor_shape(),
+            cursor_blink: t.cursor_blink(),
+            link_table: t.link_table().to_vec(),
+            images: t.images().to_vec(),
+            kitty_keyboard_flags: t.kitty_keyboard_flags(),
+            dirty_rows,
         }
     }
 

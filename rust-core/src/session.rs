@@ -8,7 +8,7 @@ use timed_fsm::TimerCommand;
 
 use crate::{CellData, ClipboardMimeKind, ClipboardPayload, ScreenUpdate, ScrollbackSearchMatch, SessionCallback, RUNTIME};
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
-use crate::terminal::{TermCell, Terminal};
+use crate::terminal::TermCell;
 use crate::theme::Theme;
 use crate::transport::{SessionCmd, TransportCommand, TransportEvent};
 use crate::trzsz::{TrzszMode, TrzszTimer};
@@ -33,7 +33,7 @@ fn sync_output_timeout_is_current(fired_generation: u64, armed_generation: Optio
 
 // ── TermCell → 公開型変換（session 層の責務）────────────
 
-fn to_cell_data(c: &TermCell) -> CellData {
+pub(crate) fn to_cell_data(c: &TermCell) -> CellData {
     CellData {
         ch: c.ch.to_string(),
         fg: c.fg,
@@ -46,34 +46,6 @@ fn to_cell_data(c: &TermCell) -> CellData {
         blink: c.blink,
         invisible: c.invisible,
         link_id: c.link_id,
-    }
-}
-
-fn make_screen_update(t: &Terminal) -> ScreenUpdate {
-    ScreenUpdate {
-        cols: t.cols() as u32,
-        rows: t.rows() as u32,
-        cells: t.screen_cells().iter().map(to_cell_data).collect(),
-        cursor_row: t.cursor_row() as u32,
-        // `Terminal::cursor_col()`は遅延折り返し(delayed wrap)状態を`cols`
-        // (範囲外)で表す内部表現をそのまま返す(`terminal.rs`のCPR/EL/ED実装
-        // 参照)。UniFFI越しにAndroid/iOSへ渡す`ScreenUpdate.cursor_col`は
-        // 常に`0..cols`の描画可能な列を指すべきなので、可視上の最終列
-        // (`cols - 1`)にクランプしてから公開する(Fableレビュー: タスク#56)。
-        cursor_col: t.cursor_col().min(t.cols().saturating_sub(1)) as u32,
-        title: t.title().map(str::to_owned),
-        application_cursor_mode: t.application_cursor_mode(),
-        application_keypad_mode: t.application_keypad_mode(),
-        bracketed_paste_mode: t.bracketed_paste_mode(),
-        mouse_reporting_mode: t.mouse_reporting_mode(),
-        sgr_mouse_mode: t.sgr_mouse_mode(),
-        cursor_visible: t.cursor_visible(),
-        bell_generation: t.bell_generation(),
-        cursor_shape: t.cursor_shape(),
-        cursor_blink: t.cursor_blink(),
-        link_table: t.link_table().to_vec(),
-        images: t.images().to_vec(),
-        kitty_keyboard_flags: t.kitty_keyboard_flags(),
     }
 }
 
@@ -650,8 +622,19 @@ pub(crate) async fn session_event_loop(
 
         if let Some(r) = result {
             let clipboard_pull_requested = r.clipboard_pull_requested;
+            // `ScreenUpdate`(行単位dirty diffを含む)の生成は`SessionState`が前回
+            // 発行スナップショットとの差分を取る必要があるため、`state`を`&mut`で
+            // 触れるこのループ側で先に計算し、`dispatch_result`(scrollback/side
+            // effectsを消費する同期関数)には出来上がった`Option<ScreenUpdate>`を
+            // 渡す(タスク#92)。`screen_dirty`でないバッチではスナップショットを
+            // 更新しない——画面が変化していない=前回スナップショットが有効なため。
+            let screen_update = if r.screen_dirty {
+                Some(state.make_screen_update())
+            } else {
+                None
+            };
             dispatch_result(r, &mut timer_rt, &transport_cmd_tx, &callback,
-                            state.terminal(), &scrollback);
+                            screen_update, &scrollback);
             if clipboard_pull_requested {
                 // Fetching the current Android clipboard text needs a Kotlin
                 // round trip (`on_host_key`/`on_agent_sign_request`'s same
@@ -685,7 +668,7 @@ fn dispatch_result(
     timer_rt: &mut TokioTimerRuntime,
     transport_cmd_tx: &tokio::sync::mpsc::Sender<TransportCommand>,
     callback: &Arc<dyn SessionCallback>,
-    terminal: &Terminal,
+    screen_update: Option<ScreenUpdate>,
     scrollback: &Arc<Mutex<VecDeque<Vec<TermCell>>>>,
 ) {
     for cmd in r.timer_cmds {
@@ -738,10 +721,10 @@ fn dispatch_result(
         }
     }
 
-    if r.screen_dirty {
-        let upd = make_screen_update(terminal);
-        debug!("screen: update {}x{} cursor=({},{})",
-            upd.cols, upd.rows, upd.cursor_col, upd.cursor_row);
+    if let Some(upd) = screen_update {
+        debug!("screen: update {}x{} cursor=({},{}) dirty_rows={:?}",
+            upd.cols, upd.rows, upd.cursor_col, upd.cursor_row,
+            upd.dirty_rows.as_ref().map(Vec::len));
         callback.on_screen_update(upd);
     }
 
@@ -905,6 +888,7 @@ mod decode_clipboard_push_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LineDamage;
 
     fn cell(label: char) -> TermCell {
         TermCell {
@@ -953,15 +937,15 @@ mod tests {
         // `ScreenUpdate.link_table`が`crate::terminal::MAX_LINK_TABLE`件で
         // 頭打ちになる(=毎フレームのFFIコピーコストも無界には悪化しない)ことを
         // 確認する。
-        let mut t = Terminal::new(80, 24, Theme::default());
-        let mut p = vte::Parser::new();
+        let mut state = SessionState::new(80, 24, Theme::default());
         let flood = crate::terminal::MAX_LINK_TABLE + 500;
+        let mut bytes = Vec::new();
         for i in 0..flood {
-            let seq = format!("\x1b]8;;https://flood.example/{i}\x07");
-            for &b in seq.as_bytes() { p.advance(&mut t, b); }
+            bytes.extend_from_slice(format!("\x1b]8;;https://flood.example/{i}\x07").as_bytes());
         }
+        state.on_stdout(bytes);
 
-        let upd = make_screen_update(&t);
+        let upd = state.make_screen_update();
         assert_eq!(
             upd.link_table.len(),
             crate::terminal::MAX_LINK_TABLE,
@@ -975,13 +959,138 @@ mod tests {
         // 返しうる内部表現をそのまま公開する。`ScreenUpdate.cursor_col`はUIが
         // 直接セルインデックスとして使う描画可能な列であるべきなので、UniFFI境界を
         // 越える前にここでクランプする(タスク#56)。
-        let mut t = Terminal::new(10, 3, Theme::default());
-        let mut p = vte::Parser::new();
-        for &b in b"0123456789" { p.advance(&mut t, b); } // ちょうど10文字でwrap-pending
-        assert_eq!(t.cursor_col(), 10, "precondition: terminal is in delayed-wrap state");
+        let mut state = SessionState::new(10, 3, Theme::default());
+        state.on_stdout(b"0123456789".to_vec()); // ちょうど10文字でwrap-pending
+        assert_eq!(state.terminal().cursor_col(), 10, "precondition: terminal is in delayed-wrap state");
 
-        let upd = make_screen_update(&t);
+        let upd = state.make_screen_update();
         assert_eq!(upd.cursor_col, 9, "ScreenUpdate.cursor_col must be clamped to the last visible column");
+    }
+
+    // ── 行単位 dirty diff(タスク#92-95, #101)────────────────
+
+    #[test]
+    fn dirty_rows_is_none_on_first_emit() {
+        // 初回発行は前回スナップショットが無いので全画面dirty(=None)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let upd = state.make_screen_update();
+        assert!(upd.dirty_rows.is_none(), "初回は全画面dirty(None)であるべき");
+    }
+
+    #[test]
+    fn dirty_rows_is_empty_when_screen_and_cursor_unchanged() {
+        // 2回連続で完全に同一の画面(カーソルも静止)を発行したら、2回目は損傷行が空。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update(); // スナップショット確定(None)
+        let upd = state.make_screen_update();
+        assert_eq!(upd.dirty_rows, Some(vec![]), "無変化フレームは空のdirty_rows");
+    }
+
+    #[test]
+    fn dirty_rows_single_cell_change_is_one_tight_range() {
+        // row5 col0 に1文字だけ書き、カーソルは元の位置(home)へ戻す。損傷は
+        // その1セル(left==right)のみで、カーソル移動由来の余計な行は付かない。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        state.on_stdout(b"\x1b[6;1HX\x1b[1;1H".to_vec()); // row5 col0 に'X'、その後 home へ復帰
+        let upd = state.make_screen_update();
+        assert_eq!(
+            upd.dirty_rows,
+            Some(vec![LineDamage { line: 5, left: 0, right: 0 }]),
+            "変化した1セルだけがtightな損傷レンジになる"
+        );
+    }
+
+    #[test]
+    fn dirty_rows_multi_row_change() {
+        // row3 と row7 に3文字ずつ書き、カーソルは home へ戻す。損傷は2行、各 [0,2]。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        state.on_stdout(b"\x1b[4;1HAAA\x1b[8;1HBBB\x1b[1;1H".to_vec());
+        let upd = state.make_screen_update();
+        assert_eq!(
+            upd.dirty_rows,
+            Some(vec![
+                LineDamage { line: 3, left: 0, right: 2 },
+                LineDamage { line: 7, left: 0, right: 2 },
+            ]),
+            "変化した2行だけが行番号昇順で損傷レンジになる"
+        );
+    }
+
+    #[test]
+    fn dirty_rows_cursor_only_move_marks_prev_and_new_rows() {
+        // セル内容は一切変えず、カーソルだけ (0,0) → (row4,col2) へ動かす。iOS向けに
+        // 「離れた行(row0)」と「乗った行(row4)」の両方が損傷行に載る(タスク#94)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update(); // スナップショット確定(cursor (0,0))
+        state.on_stdout(b"\x1b[5;3H".to_vec()); // CUP: row4 col2 へ(印字なし=セル不変)
+        let upd = state.make_screen_update();
+        assert_eq!(
+            upd.dirty_rows,
+            Some(vec![
+                LineDamage { line: 0, left: 0, right: 0 }, // 前回カーソル行(消す)
+                LineDamage { line: 4, left: 2, right: 2 }, // 今回カーソル行(描く)
+            ]),
+            "カーソルのみ移動でも前回位置と今回位置の両行が損傷になる"
+        );
+    }
+
+    #[test]
+    fn dirty_rows_cursor_visibility_only_toggle_marks_cursor_row() {
+        // カーソル位置は不変のまま、DECTCEM(`CSI ?25l`)で可視性だけを切り替える。
+        // 下地セルは不変なのでコンテンツ差分では検出できないが、カーソル行は
+        // 強制dirty化されなければならない(セルフレビューで検出したギャップの回帰テスト:
+        // 元実装は位置のみ比較していたため、可視性だけの変化を見落としていた)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update(); // スナップショット確定(cursor (0,0), visible)
+        state.on_stdout(b"\x1b[?25l".to_vec()); // カーソル非表示、位置は不変
+        let upd = state.make_screen_update();
+        assert_eq!(
+            upd.dirty_rows,
+            Some(vec![LineDamage { line: 0, left: 0, right: 0 }]),
+            "位置が不変でも可視性トグルだけでカーソル行がdirtyになるべき"
+        );
+    }
+
+    #[test]
+    fn dirty_rows_is_none_on_resize() {
+        // リサイズは寸法が変わる(かつ full_damage_pending も立つ)ので全画面dirty。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        let _ = state.resize(100, 30);
+        let upd = state.make_screen_update();
+        assert!(upd.dirty_rows.is_none(), "リサイズは全画面dirty(None)");
+    }
+
+    #[test]
+    fn dirty_rows_is_none_on_scroll_up_region() {
+        // SU(`CSI S`)は行座標をずらすので、内容差分ではなく明示フラグで全画面dirty
+        // (タスク#93)。空画面でも(全行 blank→blank で内容は不変でも)Noneになるのが
+        // 「内容ベースでなく構造イベントベース」であることの確認。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        state.on_stdout(b"\x1b[S".to_vec());
+        let upd = state.make_screen_update();
+        assert!(upd.dirty_rows.is_none(), "SUは全画面dirty(None)");
+    }
+
+    #[test]
+    fn dirty_rows_is_none_on_insert_lines() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        state.on_stdout(b"\x1b[L".to_vec()); // IL
+        let upd = state.make_screen_update();
+        assert!(upd.dirty_rows.is_none(), "ILは全画面dirty(None)");
+    }
+
+    #[test]
+    fn dirty_rows_is_none_on_delete_lines() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        state.on_stdout(b"\x1b[M".to_vec()); // DL
+        let upd = state.make_screen_update();
+        assert!(upd.dirty_rows.is_none(), "DLは全画面dirty(None)");
     }
 
     fn core_with_scrollback(cols: u32, rows_by_index: Vec<Vec<TermCell>>) -> SessionCore {
@@ -1278,7 +1387,6 @@ mod tests {
         let (timeout_tx, _timeout_rx) = tokio::sync::mpsc::channel(1);
         let mut timer_rt = TokioTimerRuntime::new(timeout_tx);
         let callback: Arc<dyn SessionCallback> = Arc::new(NoopSessionCallback);
-        let terminal = Terminal::new(80, 24, Theme::default());
 
         let result = ProcessResult {
             timer_cmds: Vec::new(),
@@ -1288,7 +1396,8 @@ mod tests {
             pending_clipboard_write: None,
             clipboard_pull_requested: false,
         };
-        dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, &terminal, &scrollback);
+        // screen_dirtyでないバッチなのでscreen_updateはNone(scrollbackトリミングのみ検証)。
+        dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, None, &scrollback);
 
         let sb = scrollback.lock();
         assert_eq!(sb.len(), SCROLLBACK_LIMIT, "should be capped at SCROLLBACK_LIMIT, not left at +3 over");
