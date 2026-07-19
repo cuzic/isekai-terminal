@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio as StdStdio;
 
-use isekai_bootstrap::{BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec, RusshBackend};
+use isekai_bootstrap::{launch_fingerprint, BootstrapBackend, HostSpec, JumpSpec, LaunchSpec, RelayLaunchSpec, RusshBackend};
 use russh::server::{self, Auth, Msg as ServerMsg, Session as ServerSession};
 use russh::{Channel as RusshChannel, ChannelId, CryptoVec};
 use russh_keys::ssh_key::private::Ed25519Keypair;
@@ -278,6 +278,130 @@ async fn install_and_start_reuses_an_already_running_helper_on_a_second_call() {
     .expect("second install_and_start should succeed (reuse path)");
 
     assert_eq!(first.handshake, second.handshake, "the second call should reuse the still-running helper, not relaunch it");
+}
+
+/// `pid_file_path`/`is_pid_alive`/`kill_if_recorded`: verbatim copies of
+/// `openssh_e2e.rs`'s own helpers of the same name (this file's module docs
+/// explain why duplicated rather than shared), scoped by `home` (this file's
+/// mock server pins `HOME` to it, same as `openssh_e2e.rs`'s `FakeShellServer`)
+/// and `crate::reuse::launch_fingerprint`'s output.
+fn pid_file_path(home: &Path, fingerprint: &str) -> PathBuf {
+    home.join(format!(".local/bin/isekai-pipe.{fingerprint}.pid"))
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(StdStdio::null())
+        .stderr(StdStdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn kill_if_recorded(home: &Path, fingerprint: &str) {
+    if let Ok(pid_str) = std::fs::read_to_string(pid_file_path(home, fingerprint)) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .stdout(StdStdio::null())
+                .stderr(StdStdio::null())
+                .status();
+        }
+    }
+}
+
+/// `RusshBackend` counterpart to `openssh_e2e.rs`'s
+/// `install_and_start_redeploys_when_the_alive_helpers_binary_is_stale` — the
+/// two backends generate byte-identical reuse-check shell logic
+/// (`openssh.rs`/`russh_backend.rs`), but nothing enforced that outside of
+/// manual inspection; this closes that gap for the `RusshBackend` side too.
+///
+/// Unlike `openssh_e2e.rs`'s ELF-plus-a-trailing-byte trick, the two script
+/// variants here differ by an actual extra line (a `# v2` comment) — a shell
+/// script's `/proc/<pid>/exe` resolves to the interpreter either way, so
+/// there's no ELF-identity subtlety to preserve; only the sha256 needs to
+/// differ. Both variants append to `invocations_log` on every real launch
+/// (unlike `install_and_start_reuses_an_already_running_helper_on_a_second_call`
+/// above, whose script only echoes a fixed JSON literal — reuse vs. relaunch
+/// would produce byte-identical handshakes either way, so that test alone
+/// can't distinguish them; this test needs to, so it tracks real launches
+/// and pids directly instead).
+#[tokio::test(flavor = "multi_thread")]
+async fn install_and_start_redeploys_when_the_alive_helpers_binary_is_stale() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let server_addr = spawn_fake_ssh_server(home.clone(), client_pubkey).await;
+    let backend = test_backend(tmp.path(), &key_path);
+    let target = HostSpec::new("127.0.0.1").with_port(server_addr.port()).with_user("tester");
+    let launch = LaunchSpec::Relay(dummy_relay_spec());
+    let fingerprint = launch_fingerprint(&launch);
+
+    let invocations_log = home.join("fake-helper-invocations.log");
+    let old_script = format!(
+        "#!/bin/sh\necho started >> {}\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\nsleep 30\n",
+        invocations_log.display()
+    );
+    let new_script = format!(
+        "#!/bin/sh\n# v2 — same behavior, different bytes/sha256\necho started >> {}\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\nsleep 30\n",
+        invocations_log.display()
+    );
+    assert_ne!(old_script, new_script, "the two scripts must actually differ for this test to mean anything");
+
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], old_script.as_bytes(), &launch, None, &[]),
+    )
+    .await
+    .expect("first install_and_start should not hang")
+    .expect("first install_and_start should succeed");
+
+    let first_pid: u32 = std::fs::read_to_string(pid_file_path(&home, &fingerprint))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("pid file should hold a pid");
+    assert!(is_pid_alive(first_pid), "the first deployment's helper should still be running");
+
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        backend.install_and_start(&target, &[], new_script.as_bytes(), &launch, None, &[]),
+    )
+    .await
+    .expect("second install_and_start should not hang")
+    .expect("second install_and_start should succeed with a fresh launch");
+
+    assert_eq!(
+        first.handshake, second.handshake,
+        "both script variants report the same fixed handshake JSON regardless of reuse"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(is_pid_alive(first_pid), "detecting a stale binary must not kill the still-alive old helper");
+
+    let second_pid: u32 = std::fs::read_to_string(pid_file_path(&home, &fingerprint))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("pid file should hold a pid");
+    assert_ne!(first_pid, second_pid, "a stale binary must trigger a fresh launch, not a reuse");
+    assert!(is_pid_alive(second_pid), "the fresh deployment's helper should be running");
+
+    let invocations = std::fs::read_to_string(&invocations_log).unwrap_or_default();
+    assert_eq!(invocations.lines().count(), 2, "a stale binary must force a real launch, not a reuse");
+
+    kill_if_recorded(&home, &fingerprint);
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(first_pid.to_string())
+        .stdout(StdStdio::null())
+        .stderr(StdStdio::null())
+        .status();
 }
 
 #[tokio::test(flavor = "multi_thread")]
