@@ -12,9 +12,12 @@ pub(crate) mod session_state;
 pub(crate) mod session;
 pub(crate) mod net_health_policy;
 // #62: tmuxウィンドウ/ペインの安定ロケータ + アプリのタブ/ペインID ⟷
-// Epic M ctl-socketパスの対応表(データモデルのみ、まだどこからも配線
-// されていない——将来の#60/#61タスクからの利用に備えた土台)。
+// Epic M ctl-socketパスの対応表(データモデル本体。実際の配線は#60の
+// `tmux_session.rs`/`orchestrator.rs::ensure_tmux_tab_window`)。
 pub(crate) mod tmux_locator;
+// #60: tmux session group のensure/attach + タブ用ウィンドウのcreate-or-select。
+// #61(run_exec)・#62(tmux_locator)を実際に繋ぎ合わせる本体。
+pub(crate) mod tmux_session;
 pub mod orchestrator;
 pub(crate) mod helper_bootstrap;
 pub mod isekai_pipe_quic_transport;
@@ -561,6 +564,56 @@ pub enum SshError {
     IoError,
     #[error("Disconnected")]
     Disconnected,
+}
+
+/// タスク#60: `SessionOrchestrator::ensure_tmux_tab_window`の成功結果。
+/// Kotlin側は`tag`をRoom(`tmux_tab_locators`テーブル)へ永続化し、次回同じ
+/// プロファイル(のprimary pane)を開く時に`existing_tag`として渡し戻すこと。
+/// `window_index`はUI表示のヒント程度に使ってよいが、揮発性の値なので永続化の
+/// キーにはしないこと(`tmux_locator.rs`の`TmuxCoordinates`参照)。
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TmuxTabWindowInfo {
+    /// tmuxウィンドウを長期的に指すタグ値。
+    pub tag: String,
+    /// このタグ解決時点でのウィンドウインデックス。
+    pub window_index: u32,
+    /// このクライアントがattachしたセッション名(グループ内で一意)。
+    pub session_name: String,
+    /// tmux session groupの名前。
+    pub group_name: String,
+    /// 今回新規にウィンドウを作成したか(true)、既存タグを解決して再利用したか(false)。
+    pub is_new_window: bool,
+}
+
+/// [`SessionOrchestrator::ensure_tmux_tab_window`]の失敗。opportunisticな補助機能
+/// (tmux管理コマンドが失敗しても、タブ自体の接続は生きたまま続行する——呼び出し側は
+/// このエラーをログに残す程度でよく、詳細な分岐をさせる必要は無い)なので、
+/// `run_exec`(#61)由来のエラーの内訳(未接続/チャネルオープン失敗/非ゼロ終了/実行中の
+/// 切断)はメッセージにまとめて運ぶだけに留める。
+#[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
+pub enum TmuxSessionError {
+    /// tmux管理コマンドの実行自体に失敗した(未接続・SSHチャネルの問題・非ゼロ終了等)。
+    #[error("tmux command failed: {0}")]
+    Command(String),
+    /// tmuxコマンド自体は成功したが、期待した形式の出力が得られなかった。
+    #[error("unexpected tmux output: {0:?}")]
+    UnexpectedOutput(String),
+}
+
+impl From<crate::tmux_locator::TmuxLocatorError> for TmuxSessionError {
+    fn from(err: crate::tmux_locator::TmuxLocatorError) -> Self {
+        use crate::tmux_locator::TmuxLocatorError;
+        match err {
+            TmuxLocatorError::Command(e) => TmuxSessionError::Command(e.0),
+            // 実際には`tmux_session::ensure_tab_window`が`NotFound`を内部で
+            // 新規ウィンドウ作成へフォールバックするため外へは出てこないはずだが、
+            // 型としては網羅しておく(将来の呼び出し経路追加に備えた安全策)。
+            TmuxLocatorError::NotFound(tag) => TmuxSessionError::Command(format!(
+                "tmux locator tag {tag:?} was not found in the remote tmux state"
+            )),
+            TmuxLocatorError::UnexpectedOutput(s) => TmuxSessionError::UnexpectedOutput(s),
+        }
+    }
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
