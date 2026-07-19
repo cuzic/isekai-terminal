@@ -360,6 +360,13 @@ pub(crate) struct Terminal {
     /// `application_cursor_mode`と同じ役割分担、`ScreenUpdate`経由でUI層へ公開する)。
     application_keypad_mode: bool,
     bracketed_paste_mode: bool,
+    /// DEC Synchronized Output(`CSI ?2026h`/`CSI ?2026l`)。有効な間、リモートは
+    /// 「これから送る一連の書き込みは1フレームとして扱ってほしい」と宣言している。
+    /// `Terminal`自身は「今アクティブか」だけを保持し、実際の画面更新push抑制は
+    /// `session_state.rs::SessionState::apply`(`screen_dirty`のgating)・safety-net
+    /// タイムアウトは`session.rs`(tokioタイマー)が担う——`Terminal`はtokioに依存
+    /// しない同期層のままにするため、ここに抑制ロジックそのものは置かない。
+    synchronized_output_active: bool,
     /// フォーカスレポーティング(`CSI ?1004h`/`l`、タスク#60)。vim/tmuxが`FocusGained`/
     /// `FocusLost` autocmdの発火に使う。有効時のみ[encode_focus_event]がOS由来の
     /// フォーカス変化イベントを`CSI I`/`CSI O`へエンコードする(無効時は`None`を返し
@@ -669,6 +676,7 @@ impl Terminal {
             application_cursor_mode: false,
             application_keypad_mode: false,
             bracketed_paste_mode: false,
+            synchronized_output_active: false,
             focus_reporting_mode: false,
             cursor_visible: true,
             bell_generation: 0,
@@ -743,6 +751,19 @@ impl Terminal {
     pub(crate) fn application_cursor_mode(&self) -> bool { self.application_cursor_mode }
     pub(crate) fn application_keypad_mode(&self) -> bool { self.application_keypad_mode }
     pub(crate) fn bracketed_paste_mode(&self) -> bool { self.bracketed_paste_mode }
+
+    /// DEC Synchronized Output(`?2026`)が現在アクティブ(`CSI ?2026h`済み・
+    /// `CSI ?2026l`未受信)かどうか。`session_state.rs::SessionState::apply`が
+    /// `screen_dirty`のgatingに使う。
+    pub(crate) fn synchronized_output_active(&self) -> bool { self.synchronized_output_active }
+
+    /// safety-netタイムアウト(`session.rs`、`CSI ?2026l`が来ないままハングした
+    /// 場合の強制解除)専用。通常の解除は`?2026l`自体がDECSET/DECRSTループを
+    /// 経由して行う——ここは「リモートを信用せず強制的に戻す」経路であることを
+    /// 名前で明示するため、通常のsetterと分けている。
+    pub(crate) fn force_end_synchronized_output(&mut self) {
+        self.synchronized_output_active = false;
+    }
     /// フォーカスレポーティング(`?1004`、タスク#60)の現在値。テストから参照する
     /// (`ScreenUpdate`へは公開しない——`encode_focus_event`がRust側で完結して判断する
     /// ため、UI層がこの値自体を必要としない)。
@@ -889,6 +910,7 @@ impl Terminal {
         self.application_cursor_mode = false;
         self.application_keypad_mode = false;
         self.bracketed_paste_mode = false;
+        self.synchronized_output_active = false;
         self.focus_reporting_mode = false;
         self.cursor_visible = true;
         self.cursor_shape = CursorShape::Block;
@@ -2075,6 +2097,12 @@ impl Perform for Terminal {
                     }
                     ('h', 2004) => { self.bracketed_paste_mode = true; }
                     ('l', 2004) => { self.bracketed_paste_mode = false; }
+                    // DEC Synchronized Output(`CSI ?2026h`/`CSI ?2026l`)。tmux/neovim等が
+                    // フルスクリーン再描画を1フレームとして送るために使う。実際の画面
+                    // 更新push抑制はここでは行わない([synchronized_output_active]
+                    // フィールドのdocコメント参照)——`Terminal`はフラグを保持するだけ。
+                    ('h', 2026) => { self.synchronized_output_active = true; }
+                    ('l', 2026) => { self.synchronized_output_active = false; }
                     // フォーカスレポーティング(`CSI ?1004h`/`l`、タスク#60)。有効な間だけ
                     // [encode_focus_event]がOS由来のフォーカス変化を`CSI I`/`CSI O`へ
                     // エンコードして送るようになる。
@@ -4212,6 +4240,34 @@ mod tests {
         assert!(t.application_keypad_mode());
         feed(&mut t, b"\x1bc"); // RIS
         assert!(!t.application_keypad_mode());
+    }
+
+    #[test]
+    fn test_synchronized_output_mode_2026_toggle() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert!(!t.synchronized_output_active(), "既定はoff");
+        feed(&mut t, b"\x1b[?2026h");
+        assert!(t.synchronized_output_active());
+        feed(&mut t, b"\x1b[?2026l");
+        assert!(!t.synchronized_output_active());
+    }
+
+    #[test]
+    fn test_ris_resets_synchronized_output_mode() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?2026h");
+        assert!(t.synchronized_output_active());
+        feed(&mut t, b"\x1bc"); // RIS
+        assert!(!t.synchronized_output_active());
+    }
+
+    #[test]
+    fn test_force_end_synchronized_output_clears_active_flag() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?2026h");
+        assert!(t.synchronized_output_active());
+        t.force_end_synchronized_output();
+        assert!(!t.synchronized_output_active());
     }
 
     #[test]

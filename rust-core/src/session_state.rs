@@ -104,6 +104,22 @@ impl SessionState {
     /// `SideEffect::SendStdin`としてエンコード済みのシーケンスを返す
     /// ([Terminal::encode_focus_event]参照)。無効時は`ProcessResult`が空のまま返る
     /// (画面には影響しないため`screen_dirty`も立てない)。
+    /// DEC Synchronized Output(`?2026`)のsafety-netタイムアウト(`session.rs`)専用。
+    /// `CSI ?2026l`が来ないままリモートがハングした場合、Rust側から強制的に同期
+    /// 状態を解除し、直近の(部分的な)画面内容を1回flushする(`Terminal::
+    /// force_end_synchronized_output`のdocコメント参照)。
+    pub(crate) fn force_end_synchronized_output(&mut self) -> ProcessResult {
+        self.terminal.force_end_synchronized_output();
+        ProcessResult {
+            timer_cmds: Vec::new(),
+            side_effects: Vec::new(),
+            pending_rows: Vec::new(),
+            screen_dirty: true,
+            pending_clipboard_write: None,
+            clipboard_pull_requested: false,
+        }
+    }
+
     pub(crate) fn notify_focus_change(&mut self, focused: bool) -> ProcessResult {
         let mut side_effects = Vec::new();
         if let Some(bytes) = self.terminal.encode_focus_event(focused) {
@@ -182,6 +198,14 @@ impl SessionState {
             }
         }
 
+        // DEC Synchronized Output(`?2026`)がアクティブな間は、実際にvteが処理した
+        // 内容とは無関係に`onScreenUpdate`のpushを抑制する(scrollback/side effects
+        // は通常通り流す——表示のpushだけを止める)。`?2026l`自体を処理したこの
+        // `apply`呼び出しでは`synchronized_output_active`が既にfalseに戻っている
+        // ため、蓄積されていた変更がここで1回にまとめてflushされる
+        // (Codexレビュー: safety-netタイムアウトは別途`session.rs`が持つ)。
+        let screen_dirty = screen_dirty && !self.terminal.synchronized_output_active();
+
         let pending_rows = self.terminal.take_scrollback();
         let pending_clipboard_write = self.terminal.take_pending_clipboard_write();
         let clipboard_pull_requested = self.terminal.take_pending_clipboard_pull_request();
@@ -218,6 +242,56 @@ mod tests {
         assert!(r.pending_rows.is_empty());
         assert_eq!(state.terminal().screen_cells()[0].ch.as_str(), "h");
         assert_eq!(state.terminal().cursor_col(), 5);
+    }
+
+    #[test]
+    fn test_synchronized_output_suppresses_screen_dirty_while_active() {
+        // `CSI ?2026h`の直後(まだ`?2026l`が来ていない)チャンクでは、実際に画面が
+        // 変化していても`screen_dirty`は立たない(onScreenUpdateのpushを止める)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let r = state.on_stdout(b"\x1b[?2026hhello".to_vec());
+        assert!(!r.screen_dirty, "sync中はscreen_dirtyが抑制されているべき");
+        // Terminalの中身自体は普通に更新されている(表示pushだけを止めている)。
+        assert_eq!(state.terminal().screen_cells()[0].ch.as_str(), "h");
+    }
+
+    #[test]
+    fn test_synchronized_output_flushes_once_on_end() {
+        // `?2026h`〜`?2026l`が別々のon_stdout呼び出し(=別々のsocket readチャンク)に
+        // 分かれていても、`?2026l`を含むチャンクで蓄積された変更が1回のflushとして
+        // 反映されることを確認する。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let r1 = state.on_stdout(b"\x1b[?2026hhello".to_vec());
+        assert!(!r1.screen_dirty);
+        let r2 = state.on_stdout(b"\x1b[?2026l".to_vec());
+        assert!(r2.screen_dirty, "?2026lで蓄積分がまとめてflushされるべき");
+        assert_eq!(state.terminal().screen_cells()[0].ch.as_str(), "h");
+    }
+
+    #[test]
+    fn test_synchronized_output_same_chunk_h_and_l_still_flushes() {
+        // 同一チャンクに`h`と`l`が両方入っている場合(十分小さい再描画)、最終的に
+        // inactiveへ戻るので通常通り1回flushされる(抑制されっぱなしにならない)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let r = state.on_stdout(b"\x1b[?2026hhello\x1b[?2026l".to_vec());
+        assert!(r.screen_dirty);
+    }
+
+    #[test]
+    fn test_force_end_synchronized_output_forces_flush() {
+        // safety-netタイムアウト(`session.rs`)がこのメソッドを呼ぶ経路。sync中で
+        // 抑制されていた画面を強制的に1回flushし、以降は通常通りdirtyが伝播する。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let r1 = state.on_stdout(b"\x1b[?2026hhello".to_vec());
+        assert!(!r1.screen_dirty);
+
+        let r2 = state.force_end_synchronized_output();
+        assert!(r2.screen_dirty);
+        assert!(!state.terminal().synchronized_output_active());
+
+        // 強制解除後は普通にdirtyが伝播する(抑制されたまま固まらない)。
+        let r3 = state.on_stdout(b"world".to_vec());
+        assert!(r3.screen_dirty);
     }
 
     #[test]
