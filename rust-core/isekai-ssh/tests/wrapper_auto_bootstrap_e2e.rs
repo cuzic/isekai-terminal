@@ -993,16 +993,14 @@ async fn wrapper_auto_bootstrap_honors_resume_grace_directive() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env, shim) =
-        shim_ssh_with_bootstrap_config(tmp.path(), &home, "resume-grace-directive-host", mock_sshd_addr, &key_path, "");
-
-    let ssh_dir = home.join(".ssh");
-    std::fs::create_dir_all(&ssh_dir).unwrap();
-    std::fs::write(
-        ssh_dir.join("config"),
-        "Host resume-grace-directive-host\n    #@isekai resume-grace 42s\n",
-    )
-    .unwrap();
+    let (_bin_dir, path_env, shim) = shim_ssh_with_bootstrap_config(
+        tmp.path(),
+        &home,
+        "resume-grace-directive-host",
+        mock_sshd_addr,
+        &key_path,
+        "    #@isekai resume-grace 42s\n",
+    );
 
     let argv_log = remote_home.join("argv.log");
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
@@ -1024,7 +1022,11 @@ async fn wrapper_auto_bootstrap_honors_resume_grace_directive() {
         .arg(&helper_script_path)
         .arg("resume-grace-directive-host")
         .env("HOME", &home)
+        // Windows: `default_profiles_dir` checks `LOCALAPPDATA` before `HOME`
+        // (see `wrapper_auto_bootstrap_honors_stun_directive`'s comment on the
+        // identical env pair for why both are needed).
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))
         .env("PATH", &path_env)
         .env_remove("RUST_LOG")
         .stdin(StdStdio::piped())
@@ -1033,7 +1035,11 @@ async fn wrapper_auto_bootstrap_honors_resume_grace_directive() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // Native/Windows path prompts for SSH host-key TOFU before the app-level
+    // "Trust this isekai-helper...?" prompt this "y\n" answers (see
+    // `wrapper_auto_bootstrap_honors_stun_directive`'s identical comment).
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
@@ -1043,7 +1049,7 @@ async fn wrapper_auto_bootstrap_honors_resume_grace_directive() {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
                 eprint!("[isekai-ssh stderr] {line}");
-                if line.contains("Registered") {
+                if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
