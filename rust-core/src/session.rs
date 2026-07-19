@@ -987,6 +987,20 @@ mod tests {
     }
 
     #[test]
+    fn update_seq_increments_monotonically_across_emits() {
+        // 配信チャネルがconflateされた場合(Android Channel.CONFLATED等)にUI層が
+        // 読み飛ばしを検知できるよう、発行のたびに単調増加する(セルフレビューで
+        // 発覚したconflated-channel問題の修正)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let u0 = state.make_screen_update();
+        let u1 = state.make_screen_update();
+        let u2 = state.make_screen_update();
+        assert_eq!(u0.update_seq, 1, "0始まりでwrapping_add(1)するので初回発行はseq=1");
+        assert_eq!(u1.update_seq, 2);
+        assert_eq!(u2.update_seq, 3);
+    }
+
+    #[test]
     fn dirty_rows_single_cell_change_is_one_tight_range() {
         // row5 col0 に1文字だけ書き、カーソルは元の位置(home)へ戻す。損傷は
         // その1セル(left==right)のみで、カーソル移動由来の余計な行は付かない。

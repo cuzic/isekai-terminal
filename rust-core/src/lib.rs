@@ -996,6 +996,13 @@ pub struct LineDamage {
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ScreenUpdate {
+    /// 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
+    /// 配信チャネルが`Channel.CONFLATED`(Android)等でconflateされ、中間の発行が
+    /// 読み飛ばされる可能性がある——`dirty_rows`は「直前に発行したScreenUpdateとの
+    /// 差分」なので、読み飛ばしが起きると欠落分の変化がdirty_rowsに載らず表示が
+    /// 化ける。UI層はこの値が前回受信値+1(wrapping)でなければ読み飛ばしがあったと
+    /// 判断し、`dirty_rows`を信用せず全画面再描画にフォールバックすること。
+    pub update_seq: u32,
     pub cols: u32,
     pub rows: u32,
     pub cells: Vec<CellData>,
