@@ -214,6 +214,13 @@ final class SixelBitmapCache {
 /// 実際のレンダリング統合では使わないというPLAN.md記載の方針に従う)。
 public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     private var latestUpdate: ScreenUpdate?
+    /// タスク#102: 直前に`apply(_:)`へ届いた`ScreenUpdate.updateSeq`。Rust→Swiftの配信経路
+    /// (`TerminalUIState.latestScreenUpdate`は`@Published`で、SwiftUIが短時間の連続更新を
+    /// coalesceして`updateUIView`が中間の発行を読み飛ばしうる=実質conflate)で発行が
+    /// 飛ぶと、`dirty_rows`(直前発行との差分)に欠落分の変化が載らず表示が化ける。連番が
+    /// 連続(wrapping +1)でなければギャップありと判断し全画面再描画へフォールバックする
+    /// (Android版`Channel.CONFLATED`対策と同じ、Rust側`updateSeq`のdocコメント参照)。
+    private var lastAppliedUpdateSeq: UInt32?
     private static let baseFontSize: CGFloat = 14
     private var font = UIFont.monospacedSystemFont(ofSize: baseFontSize, weight: .regular)
     private var boldFont = UIFont.monospacedSystemFont(ofSize: baseFontSize, weight: .bold)
@@ -476,7 +483,89 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     /// 最新の画面状態を反映する。`MainActor`から呼ぶこと。
     public func apply(_ update: ScreenUpdate) {
         latestUpdate = update
-        setNeedsDisplay()
+        // タスク#102: 連番ギャップ検出。配信経路(`@Published`+SwiftUI coalescing)で発行が
+        // 飛んでいたら`dirty_rows`が信用できないため、全画面再描画へフォールバックさせる。
+        // 判定に使う直前値を読んでから、今回の連番を「直前値」として前進させる(次回の連続
+        // 判定のため。ギャップ時も前進させ、以降が連続なら通常のスコープ最適化へ復帰する)。
+        let hadSequenceGap = Self.isUpdateSeqGap(previous: lastAppliedUpdateSeq, current: update.updateSeq)
+        lastAppliedUpdateSeq = update.updateSeq
+        // タスク#99: Rustが計算した行単位damage(`update.dirtyRows`、#92-94)から
+        // 再描画すべき最小のview矩形を求められた場合はその矩形だけを無効化し、
+        // #98でクリップ対応済みの`draw(_:)`がdirty行だけを描き直せるようにする。
+        // 求められない(=連番ギャップ/全画面dirty/scrollback表示中/cellSize未確定)場合は
+        // 従来通り引数なし`setNeedsDisplay()`で全画面を無効化する。
+        if let scopedRect = liveDirtyDisplayRect(for: update, hadSequenceGap: hadSequenceGap) {
+            // `dirtyRows`が空(グリッド変化なし)のときは`.null`が返り、`setNeedsDisplay(.null)`は
+            // 何も無効化しない(=このフレームは再描画不要)。
+            setNeedsDisplay(scopedRect)
+        } else {
+            setNeedsDisplay()
+        }
+    }
+
+    /// タスク#102: `ScreenUpdate.updateSeq`の連番ギャップ(=配信経路での発行読み飛ばし)判定。
+    /// `previous == nil`(初回)は連続性を検証できないためギャップ扱い(=全画面再描画)。
+    /// それ以外は`current == previous &+ 1`(wrapping)でなければギャップ。`&+`により
+    /// `UInt32`の折り返し(`.max` → `0`)も正しく連続と判定する。状態を持たないpure関数に
+    /// してあるのは、連番追跡の副作用(`lastAppliedUpdateSeq`の前進)を`apply`側に閉じ込め、
+    /// この判定ロジックとスコープ矩形計算(`liveDirtyDisplayRect`)を独立に単体テストできる
+    /// ようにするため。
+    static func isUpdateSeqGap(previous: UInt32?, current: UInt32) -> Bool {
+        guard let previous else { return true }
+        return current != previous &+ 1
+    }
+
+    /// タスク#99: ライブ画面表示中に限り、`update.dirtyRows`(Rustが計算した行単位damage、
+    /// タスク#92-94)から再描画すべき最小のview矩形を返す。次のいずれかの場合は`nil`を返し、
+    /// 呼び出し側(`apply`)は引数なし`setNeedsDisplay()`で全画面を無効化する:
+    ///  - スクロールバック表示中(`scrollOffset > 0`または`showingScrollback`)。このとき
+    ///    `draw(_:)`(`computeDisplayUpdate()`経由)はライブグリッドではなくscrollback合成を
+    ///    描くため、ライブの`dirtyRows`が指す行番号は表示行と一致せず、部分無効化は誤りになる。
+    ///  - `update.dirtyRows == nil`(Rustが全画面dirtyと判断: 初回発行・寸法変更・スクロール等)。
+    ///  - `cellSize`がまだ未確定(幅または高さが0)。
+    ///
+    /// `dirtyRows`が非nil・空配列のときはグリッド変化が無いので`CGRect.null`を返す
+    /// (`setNeedsDisplay(.null)`は何も無効化しない)。カーソル行は移動前・移動後の両方とも
+    /// Rust側(#94 `force_cursor_row_dirty`)が既に`dirtyRows`へ含めるため、ここで別途足す
+    /// 必要はない(rust-ssot: グリッドdamageの真実はRust側が持つ)。Sixel画像(#42)は
+    /// グリッドセルではなく`dirtyRows`の対象外なので、取りこぼし防止のため現在の全画像配置
+    /// 矩形をgenerousにunionへ含める(画像が出現/移動/消滅しても確実に再描画される)。
+    ///
+    /// `TerminalScreenView`は`final`でありサブクラスで`setNeedsDisplay(_:)`を差し替えて
+    /// 渡し矩形を観測できないため、この計算結果自体をタスク#103のユニットテストから
+    /// 直接検証できるよう`internal`にしている(`@testable import`経由)。
+    ///
+    /// `hadSequenceGap`(タスク#102): 呼び出し側(`apply`)が`isUpdateSeqGap`で判定した
+    /// 「配信経路で`updateSeq`が飛んだ」フラグ。`true`なら`dirty_rows`が信用できないため
+    /// (欠落した中間発行の変化が載っていない)、値に関わらず`nil`(=全画面再描画)を返す。
+    func liveDirtyDisplayRect(for update: ScreenUpdate, hadSequenceGap: Bool) -> CGRect? {
+        guard !hadSequenceGap else { return nil }
+        guard scrollOffset == 0, !showingScrollback else { return nil }
+        guard let dirtyRows = update.dirtyRows else { return nil }
+        let cellWidth = cellSize.width
+        let cellHeight = cellSize.height
+        guard cellWidth > 0, cellHeight > 0 else { return nil }
+
+        let fullWidth = bounds.width
+        var unionRect = CGRect.null
+        // 各dirty行は行band全幅(`draw(_:)`の行スキップ判定と同じ全幅rowRect)で無効化する。
+        // 列レンジ(`left`/`right`)まで絞らないのは、#98の`draw(_:)`が行単位で全幅の
+        // 交差判定をしており、横方向を絞っても描画対象の行数は変わらないため(全角グリフの
+        // 右はみ出し等の取りこぼしも避けられる)。
+        for damage in dirtyRows {
+            let y = CGFloat(damage.line) * cellHeight
+            unionRect = unionRect.union(CGRect(x: 0, y: y, width: fullWidth, height: cellHeight))
+        }
+        for placement in update.images {
+            let imageRect = CGRect(
+                x: CGFloat(placement.col) * cellWidth,
+                y: CGFloat(placement.row) * cellHeight,
+                width: CGFloat(placement.colsSpan) * cellWidth,
+                height: CGFloat(placement.rowsSpan) * cellHeight
+            )
+            unionRect = unionRect.union(imageRect)
+        }
+        return unionRect
     }
 
     /// - Parameter reportSize: `true`ならcellSize更新後に[reportSizeIfNeeded]も呼ぶ
