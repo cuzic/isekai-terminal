@@ -3136,6 +3136,15 @@ public func FfiConverterTypeQuicConfig_lower(_ value: QuicConfig) -> RustBuffer 
 
 
 public struct ScreenUpdate: Equatable, Hashable {
+    /**
+     * 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
+     * 配信チャネルが`Channel.CONFLATED`(Android)等でconflateされ、中間の発行が
+     * 読み飛ばされる可能性がある——`dirty_rows`は「直前に発行したScreenUpdateとの
+     * 差分」なので、読み飛ばしが起きると欠落分の変化がdirty_rowsに載らず表示が
+     * 化ける。UI層はこの値が前回受信値+1(wrapping)でなければ読み飛ばしがあったと
+     * 判断し、`dirty_rows`を信用せず全画面再描画にフォールバックすること。
+     */
+    public var updateSeq: UInt32
     public var cols: UInt32
     public var rows: UInt32
     public var cells: [CellData]
@@ -3249,7 +3258,15 @@ public struct ScreenUpdate: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, 
+    public init(
+        /**
+         * 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
+         * 配信チャネルが`Channel.CONFLATED`(Android)等でconflateされ、中間の発行が
+         * 読み飛ばされる可能性がある——`dirty_rows`は「直前に発行したScreenUpdateとの
+         * 差分」なので、読み飛ばしが起きると欠落分の変化がdirty_rowsに載らず表示が
+         * 化ける。UI層はこの値が前回受信値+1(wrapping)でなければ読み飛ばしがあったと
+         * 判断し、`dirty_rows`を信用せず全画面再描画にフォールバックすること。
+         */updateSeq: UInt32, cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, 
         /**
          * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
          * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
@@ -3341,6 +3358,7 @@ public struct ScreenUpdate: Equatable, Hashable {
          * 描くため)。UI層がまだこのフィールドを消費していない段階では、`None`扱いで
          * 全画面再描画にフォールバックすれば従来通りの挙動になる。
          */dirtyRows: [LineDamage]?) {
+        self.updateSeq = updateSeq
         self.cols = cols
         self.rows = rows
         self.cells = cells
@@ -3378,6 +3396,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ScreenUpdate {
         return
             try ScreenUpdate(
+                updateSeq: FfiConverterUInt32.read(from: &buf), 
                 cols: FfiConverterUInt32.read(from: &buf), 
                 rows: FfiConverterUInt32.read(from: &buf), 
                 cells: FfiConverterSequenceTypeCellData.read(from: &buf), 
@@ -3401,6 +3420,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: ScreenUpdate, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.updateSeq, into: &buf)
         FfiConverterUInt32.write(value.cols, into: &buf)
         FfiConverterUInt32.write(value.rows, into: &buf)
         FfiConverterSequenceTypeCellData.write(value.cells, into: &buf)

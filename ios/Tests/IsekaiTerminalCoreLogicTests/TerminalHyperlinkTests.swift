@@ -14,12 +14,12 @@ final class TerminalHyperlinkTests: XCTestCase {
 
     private func makeUpdate(cells: [CellData], cols: Int, rows: Int, linkTable: [String]) -> ScreenUpdate {
         ScreenUpdate(
-            cols: UInt32(cols), rows: UInt32(rows), cells: cells,
+            updateSeq: 0, cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 0, title: nil,
             applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: true, linkTable: linkTable, images: [], kittyKeyboardFlags: 0
+            cursorShape: .block, cursorBlink: true, linkTable: linkTable, images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
     }
 

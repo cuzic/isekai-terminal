@@ -16,12 +16,12 @@ final class TerminalScreenViewTests: XCTestCase {
             )
         }
         let update = ScreenUpdate(
-            cols: 4, rows: 2, cells: cells,
+            updateSeq: 0, cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
 
         view.apply(update)
@@ -69,12 +69,12 @@ final class TerminalScreenViewTests: XCTestCase {
             cell(bold: true, dim: true, italic: true, underline: true, strikethrough: true, blink: true, invisible: true),
         ]
         let update = ScreenUpdate(
-            cols: UInt32(cells.count), rows: 1, cells: cells,
+            updateSeq: 0, cols: UInt32(cells.count), rows: 1, cells: cells,
             cursorRow: 0, cursorCol: 0,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
 
         view.apply(update)
@@ -105,13 +105,13 @@ final class TerminalScreenViewTests: XCTestCase {
                 linkId: nil
             )
             let update = ScreenUpdate(
-                cols: 1, rows: 1, cells: [cell],
+                updateSeq: 0, cols: 1, rows: 1, cells: [cell],
                 cursorRow: 0, cursorCol: 0,
                 title: nil, applicationCursorMode: false, applicationKeypadMode: false,
                 bracketedPasteMode: false,
                 mouseReportingMode: .off, sgrMouseMode: false,
                 cursorVisible: false, bellGeneration: 0,
-                cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
+                cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
             )
             view.apply(update)
             view.layoutIfNeeded()
@@ -160,12 +160,12 @@ final class TerminalScreenViewTests: XCTestCase {
     func testApplyIgnoresMismatchedCellCountWithoutCrashing() {
         let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
         let update = ScreenUpdate(
-            cols: 10, rows: 10, cells: [],
+            updateSeq: 0, cols: 10, rows: 10, cells: [],
             cursorRow: 0, cursorCol: 0,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
         view.layoutIfNeeded()
@@ -188,12 +188,12 @@ final class TerminalScreenViewTests: XCTestCase {
                 strikethrough: false, blink: false, invisible: false, linkId: nil
             )]
             let update = ScreenUpdate(
-                cols: 1, rows: 1, cells: cells,
+                updateSeq: 0, cols: 1, rows: 1, cells: cells,
                 cursorRow: 0, cursorCol: 0,
                 title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
                 mouseReportingMode: .off, sgrMouseMode: false,
                 cursorVisible: true, bellGeneration: 0,
-                cursorShape: shape, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+                cursorShape: shape, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
             )
             view.apply(update)
             view.layoutIfNeeded()
@@ -212,12 +212,12 @@ final class TerminalScreenViewTests: XCTestCase {
             strikethrough: false, blink: false, invisible: false, linkId: nil
         )]
         let update = ScreenUpdate(
-            cols: 1, rows: 1, cells: cells,
+            updateSeq: 0, cols: 1, rows: 1, cells: cells,
             cursorRow: 0, cursorCol: 0,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .bar, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
+            cursorShape: .bar, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
         view.layoutIfNeeded()
@@ -243,12 +243,12 @@ final class TerminalScreenViewTests: XCTestCase {
             )
         }
         let update = ScreenUpdate(
-            cols: UInt32(cols), rows: UInt32(rows), cells: cells,
+            updateSeq: 0, cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .bar, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+            cursorShape: .bar, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
         view.onScrollbackLenRequest = { 10 }
@@ -278,12 +278,12 @@ final class TerminalScreenViewTests: XCTestCase {
             )
         }
         let update = ScreenUpdate(
-            cols: UInt32(cols), rows: UInt32(rows), cells: cells,
+            updateSeq: 0, cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
+            cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
         view.onScrollbackLenRequest = { 10 }
@@ -311,12 +311,12 @@ final class TerminalScreenViewTests: XCTestCase {
             )
         }
         let update = ScreenUpdate(
-            cols: 4, rows: 2, cells: cells,
+            updateSeq: 0, cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
         // scrollOffsetは既定の0(ライブ)のまま、row=5のマッチを持たせる(不一致)。
@@ -345,12 +345,12 @@ final class TerminalScreenViewTests: XCTestCase {
             )
         }
         let update = ScreenUpdate(
-            cols: UInt32(cols), rows: UInt32(rows), cells: cells,
+            updateSeq: 0, cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
+            cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
         view.onScrollbackLenRequest = { 10 }
@@ -378,12 +378,12 @@ final class TerminalScreenViewTests: XCTestCase {
             )
         }
         let update = ScreenUpdate(
-            cols: 4, rows: 2, cells: cells,
+            updateSeq: 0, cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
-            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
         view.apply(update)
         view.searchHighlight = ScrollbackSearchMatch(row: 0, col: 0, len: 1)
@@ -650,12 +650,12 @@ final class TerminalScreenViewTests: XCTestCase {
         }
         func update(blink: Bool) -> ScreenUpdate {
             ScreenUpdate(
-                cols: 1, rows: 1, cells: [cell(blink: blink)],
+                updateSeq: 0, cols: 1, rows: 1, cells: [cell(blink: blink)],
                 cursorRow: 0, cursorCol: 0,
                 title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
                 mouseReportingMode: .off, sgrMouseMode: false,
                 cursorVisible: false, bellGeneration: 0,
-                cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0
+                cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
             )
         }
 
@@ -1067,5 +1067,223 @@ final class TerminalScreenViewTests: XCTestCase {
             rgba: Data(repeating: 0xFF, count: width * height * 4)
         )
         XCTAssertNil(cache.image(for: tooLarge))
+    }
+
+    // MARK: - タスク#99/#103: dirty行に基づく部分invalidate(`liveDirtyDisplayRect`)
+
+    /// 新しい`ScreenUpdate`を反映するとき`apply(_:)`が`update.dirtyRows`から求める
+    /// スコープ矩形(`liveDirtyDisplayRect`)を検証するための、全セルを1文字で埋めた
+    /// テスト用グリッド。`TerminalScreenView`は`final`のため`setNeedsDisplay(_:)`を
+    /// サブクラスで観測できず、代わりに矩形計算そのものを`@testable`経由で直接呼ぶ。
+    private func makeGridUpdate(
+        cols: UInt32, rows: UInt32,
+        updateSeq: UInt32 = 0,
+        cursorRow: UInt32 = 0, cursorCol: UInt32 = 0, cursorVisible: Bool = true,
+        ch: String = "A",
+        dirtyRows: [LineDamage]? = nil,
+        images: [ImagePlacement] = []
+    ) -> ScreenUpdate {
+        let cells = (0..<(Int(cols) * Int(rows))).map { _ in
+            CellData(
+                ch: ch, fg: 0xFFFFFFFF, bg: 0xFF000000, bold: false, dim: false, italic: false,
+                underline: false, strikethrough: false, blink: false, invisible: false, linkId: nil
+            )
+        }
+        return ScreenUpdate(
+            updateSeq: updateSeq, cols: cols, rows: rows, cells: cells,
+            cursorRow: cursorRow, cursorCol: cursorCol,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
+            cursorVisible: cursorVisible, bellGeneration: 0,
+            cursorShape: .block, cursorBlink: false, linkTable: [], images: images,
+            kittyKeyboardFlags: 0, dirtyRows: dirtyRows
+        )
+    }
+
+    /// レンダリング結果を`premultipliedLast`のRGBAバイト列へ展開する(既存の
+    /// `testUnderlineAndStrikethroughOnBlankCellAffectRenderedPixels`のインライン実装と
+    /// 同じ手順)。`alpha == 0`は「その画素が一切描画されていない(透明)」ことを表す
+    /// ——`draw(_:)`は背景を明示的に不透明black(`0xFF000000`)で塗るため、描かれた画素は
+    /// `alpha == 255`、`draw(_:)`が触れなかった画素は`alpha == 0`のまま残る。
+    private static func rgbaPixels(of image: UIImage) -> (pixels: [UInt8], width: Int, height: Int) {
+        guard let cgImage = image.cgImage else {
+            XCTFail("failed to obtain cgImage from rendered view")
+            return ([], 0, 0)
+        }
+        let width = cgImage.width
+        let height = cgImage.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: &pixels, width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: width * 4, space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            XCTFail("failed to create bitmap context for pixel inspection")
+            return ([], width, height)
+        }
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return (pixels, width, height)
+    }
+
+    /// `dirtyRows == nil`(Rustが全画面dirtyと判断)は従来通り全画面無効化へ
+    /// フォールバックする(=`liveDirtyDisplayRect`は`nil`を返し、`apply`は引数なし
+    /// `setNeedsDisplay()`を呼ぶ)。
+    func testLiveDirtyDisplayRectReturnsNilForFullDamage() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        XCTAssertNil(view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: nil)))
+    }
+
+    /// `dirtyRows == []`(グリッド変化なし)は`CGRect.null`を返す。`apply`はこれを
+    /// `setNeedsDisplay(.null)`へ渡し、何も無効化されない(=このフレームは再描画不要)。
+    func testLiveDirtyDisplayRectReturnsNullRectForEmptyDamage() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let rect = view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: []))
+        XCTAssertNotNil(rect)
+        XCTAssertTrue(rect?.isNull ?? false, "空のdirtyRowsは無効化領域なし(.null)を返すべき")
+    }
+
+    /// カーソルがrow2→row0へ動いたフレームでは、Rust側(#94)が移動前(row2)・移動後(row0)の
+    /// 両行を`dirtyRows`へ含める。合成無効化矩形もその両行を包含していなければ、移動前row2に
+    /// カーソル残像が残る。row0単独のときより下(row2側)へ広がっていることで包含を確認する。
+    func testLiveDirtyDisplayRectIncludesOldCursorRowOnCursorMove() throws {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let rectRow0Only = view.liveDirtyDisplayRect(
+            for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: [LineDamage(line: 0, left: 0, right: 3)])
+        )
+        let rectRow0And2 = view.liveDirtyDisplayRect(
+            for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: [
+                LineDamage(line: 2, left: 0, right: 3),
+                LineDamage(line: 0, left: 0, right: 3),
+            ])
+        )
+        let r0 = try XCTUnwrap(rectRow0Only)
+        let r02 = try XCTUnwrap(rectRow0And2)
+        XCTAssertEqual(r0.minY, 0, accuracy: 0.001, "row0の帯は画面最上部から始まる")
+        XCTAssertEqual(r02.minY, 0, accuracy: 0.001, "union矩形も移動後row0を含むため最上部から始まる")
+        XCTAssertGreaterThan(r02.maxY, r0.maxY, "移動前row2(row0より下)を含む分だけunion矩形が下へ広がる")
+        XCTAssertTrue(r02.contains(r0), "移動先row0の帯をunion矩形が完全に包含する")
+    }
+
+    /// Sixel画像(#42)はグリッドセルではなく`dirtyRows`の対象外。画像配置矩形を
+    /// unionに含めることで、`dirtyRows`が画像行を含まなくても画像が確実に再描画される。
+    func testLiveDirtyDisplayRectUnionsSixelImagePlacements() throws {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 400))
+        let placement = ImagePlacement(
+            id: 1, row: 3, col: 0, rowsSpan: 2, colsSpan: 2,
+            widthPx: 16, heightPx: 16, rgba: Data(repeating: 0xFF, count: 16 * 16 * 4)
+        )
+        let withoutImage = view.liveDirtyDisplayRect(
+            for: makeGridUpdate(cols: 4, rows: 8, dirtyRows: [LineDamage(line: 0, left: 0, right: 3)])
+        )
+        let withImage = view.liveDirtyDisplayRect(
+            for: makeGridUpdate(cols: 4, rows: 8, dirtyRows: [LineDamage(line: 0, left: 0, right: 3)], images: [placement])
+        )
+        let base = try XCTUnwrap(withoutImage)
+        let unioned = try XCTUnwrap(withImage)
+        XCTAssertGreaterThan(unioned.maxY, base.maxY, "row3-4に置かれた画像の分だけunion矩形が下へ広がる")
+        XCTAssertTrue(unioned.contains(base), "元のdirty行(row0)の帯も引き続き包含する")
+    }
+
+    /// スクロールバック表示中(`showingScrollback` または `scrollOffset > 0`)は、ライブの
+    /// `dirtyRows`が指す行番号が実際の表示行(scrollback合成)と対応しないため、部分無効化
+    /// せず全画面へフォールバックする(`liveDirtyDisplayRect`は`nil`)。
+    func testLiveDirtyDisplayRectFallsBackToFullInvalidateDuringScrollback() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let dirty = [LineDamage(line: 0, left: 0, right: 3)]
+        view.showingScrollback = true
+        XCTAssertNil(view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: dirty)))
+        view.showingScrollback = false
+        view.scrollOffset = 1
+        XCTAssertNil(view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: dirty)))
+    }
+
+    /// #98でクリップ対応した`draw(_:)`が、渡された矩形の外にある行を描かないことを実ピクセルで
+    /// 確認する(#99のsetNeedsDisplayスコープ化が安全に部分再描画できる前提)。行数を
+    /// view高さより多くしてグリッドがview全体を覆う状態を作り、全画面描画では最下行まで
+    /// 不透明(`alpha == 255`)になる一方、上部だけをスコープ描画すると最下行が透明
+    /// (`alpha == 0`)のまま残ることを比較する。
+    func testDrawRectDoesNotDrawRowsOutsidePassedRect() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 80, height: 240))
+        // 30行はどんな妥当なlineHeightでも240ptを超えて溢れるため、グリッドがview全体を覆う。
+        view.apply(makeGridUpdate(cols: 4, rows: 30, cursorVisible: false, dirtyRows: nil))
+        view.layoutIfNeeded()
+
+        let renderer = UIGraphicsImageRenderer(size: view.bounds.size)
+        let full = Self.rgbaPixels(of: renderer.image { _ in view.draw(view.bounds) })
+        // 画面最上部の細い帯だけを再描画領域として渡す(#98の1セル分generous insetを
+        // 考慮しても最下行には届かない高さ)。
+        let topBand = CGRect(x: 0, y: 0, width: view.bounds.width, height: view.bounds.height / 6)
+        let scoped = Self.rgbaPixels(of: renderer.image { _ in view.draw(topBand) })
+
+        XCTAssertNotEqual(full.pixels, scoped.pixels, "topBandへのスコープ描画は全画面描画より描く行が少ないはず")
+
+        func rowIsAllTransparent(_ p: [UInt8], width: Int, y: Int) -> Bool {
+            let start = y * width * 4
+            for i in stride(from: start, to: start + width * 4, by: 4) where p[i + 3] != 0 {
+                return false
+            }
+            return true
+        }
+
+        let probeY = full.height - 1
+        // 前提: 全画面描画では最下行までグリッドが不透明に描かれている。この前提が崩れる
+        // (viewがグリッドより高くて最下行が元々透明)場合は誤検知を避けるためスキップ。
+        XCTAssertFalse(rowIsAllTransparent(full.pixels, width: full.width, y: probeY),
+                       "サニティ: 全画面描画では最下行まで描かれているはず(30行がviewを覆う)")
+        XCTAssertTrue(rowIsAllTransparent(scoped.pixels, width: scoped.width, y: probeY),
+                      "topBandの外にある最下行はスコープ描画では描かれず透明のまま残るはず(#98クリップ)")
+    }
+
+    /// カーソルがrow2→row0へ動いたフレームで、`liveDirtyDisplayRect`が返す実際のスコープ矩形
+    /// (移動前row2を含む)を再描画すると、row2に残っていたカーソルが消え、残像が残らないことを
+    /// 実ピクセルで確認する。単一のグラフィックスコンテキストへ2フレームを連続描画し、CALayerが
+    /// 前フレームのピクセルを保持する実機挙動を模す(#99)。
+    func testRedrawingScopedRectErasesOldCursorResidual() throws {
+        let bounds = CGRect(x: 0, y: 0, width: 80, height: 300)
+        let cols: UInt32 = 4
+        let rows: UInt32 = 30
+
+        let update1 = makeGridUpdate(cols: cols, rows: rows, cursorRow: 2, cursorCol: 0, cursorVisible: true)
+        let update2 = makeGridUpdate(cols: cols, rows: rows, cursorRow: 0, cursorCol: 0, cursorVisible: true, dirtyRows: [
+            LineDamage(line: 2, left: 0, right: 3),
+            LineDamage(line: 0, left: 0, right: 3),
+        ])
+
+        // 参照: 最初からカーソルがrow0だけにある全画面描画のピクセル。
+        let referenceView = TerminalScreenView(frame: bounds)
+        referenceView.apply(makeGridUpdate(cols: cols, rows: rows, cursorRow: 0, cursorCol: 0, cursorVisible: true))
+        referenceView.layoutIfNeeded()
+        let referenceRenderer = UIGraphicsImageRenderer(size: bounds.size)
+        let reference = Self.rgbaPixels(of: referenceRenderer.image { _ in referenceView.draw(referenceView.bounds) })
+
+        let view = TerminalScreenView(frame: bounds)
+        view.layoutIfNeeded()
+        let scopedRect = try XCTUnwrap(view.liveDirtyDisplayRect(for: update2), "ライブ表示中はスコープ矩形が得られるはず")
+
+        // 実際: frame1でカーソルをrow2に全画面描画し、frame2でrow0へ動かしてスコープ矩形
+        // (row0..row2のunion)だけを同一コンテキストへ再描画する。
+        let renderer = UIGraphicsImageRenderer(size: bounds.size)
+        let actual = Self.rgbaPixels(of: renderer.image { _ in
+            view.apply(update1)
+            view.draw(view.bounds)
+            view.apply(update2)
+            view.draw(scopedRect)
+        })
+
+        // サニティ: frame1のみ(row2にカーソル)は参照(row0にカーソル)と必ず異なる。
+        // これが成り立たないと、以降の一致判定が「常に一致」の空テストに劣化していないと言えない。
+        let view2 = TerminalScreenView(frame: bounds)
+        view2.apply(update1)
+        view2.layoutIfNeeded()
+        let frame1Renderer = UIGraphicsImageRenderer(size: bounds.size)
+        let frame1Only = Self.rgbaPixels(of: frame1Renderer.image { _ in view2.draw(view2.bounds) })
+        XCTAssertNotEqual(frame1Only.pixels, reference.pixels, "サニティ: row2にカーソルがある描画は参照と異なるはず")
+
+        // frame2でrow0..row2を再描画すると、row0にカーソルが付き(参照と一致)、row2の
+        // カーソルは不透明背景で塗り潰されて消える(参照と一致)。row3以降はframe1時点で
+        // 既に参照と同一(どちらもカーソルなし"A")かつframe2で触れないため、最終画像は
+        // 参照と完全一致する。
+        XCTAssertEqual(actual.pixels, reference.pixels, "スコープ矩形の再描画後は移動前row2のカーソル残像が消え、参照と一致するはず")
     }
 }

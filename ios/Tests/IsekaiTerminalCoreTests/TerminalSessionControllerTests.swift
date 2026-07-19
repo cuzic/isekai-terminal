@@ -631,12 +631,12 @@ final class TerminalSessionControllerTests: XCTestCase {
     /// `bellGeneration`だけを可変にする。
     private func makeScreenUpdate(bellGeneration: UInt64) -> ScreenUpdate {
         ScreenUpdate(
-            cols: 1, rows: 1, cells: [],
+            updateSeq: 0, cols: 1, rows: 1, cells: [],
             cursorRow: 0, cursorCol: 0,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: bellGeneration,
-            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
     }
 
@@ -672,12 +672,12 @@ final class TerminalSessionControllerTests: XCTestCase {
         // 変えたScreenUpdateを挟み、そのフィールドがuiStateへ反映されるのを待つことで
         // 直前のonScreenUpdate呼び出しがMainActorキュー上で処理済みであることを保証する。
         controller.onScreenUpdate(update: ScreenUpdate(
-            cols: 2, rows: 1, cells: [],
+            updateSeq: 0, cols: 2, rows: 1, cells: [],
             cursorRow: 0, cursorCol: 0,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
             mouseReportingMode: .off, sgrMouseMode: false,
             cursorVisible: true, bellGeneration: 3,
-            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         ))
         try await waitUntilFixtureCondition(timeout: 2) {
             await controller.uiState.latestScreenUpdate?.cols == 2
