@@ -1646,8 +1646,10 @@ mod pooling_e2e_tests {
             orch.send(format!("__test_flood__:{n}").into_bytes());
             wait_flood_done(&mut rx, &format!("flood-line-{:05}", n - 1)).await;
             // 間引かれた最後のフレームがタイマー発火で発行されるのを待つ(仮想時間では
-            // なく実時間のテストなので、REPAINT_MIN_INTERVAL分だけ余裕を持って待つ)。
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // なく実時間のテストなので、REPAINT_MIN_INTERVAL(16ms)に対して十分な余裕
+            // ―― 並列テスト実行下でのスレッド飢餓を見込んだ余裕(rust-quic-test-flakiness
+            // の教訓に倣う)――を持って待つ)。
+            tokio::time::sleep(Duration::from_millis(500)).await;
 
             let calls = screen_update_count.load(Ordering::SeqCst);
             assert!(
