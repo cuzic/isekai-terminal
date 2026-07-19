@@ -103,6 +103,18 @@ class TerminalInputConnection(
                 }
             }
 
+            // Kitty keyboard protocol(タスク#54)のdisambiguate escape codes(bit0)が交渉
+            // されている場合、Ctrl/Alt(併用含む)付きの印字可能文字キーはCSI u形式で送る
+            // (タスク#91、Kitty仕様がEnter/Tab/Backspace以外の修飾キー付き印字可能文字を
+            // 対象にするため。未交渉時はnullを返しlegacyエンコードへフォールスルーする)。
+            // IME変換中は他の物理修飾キー分岐と同様に誤発火防止のため無効。
+            if (!composing && (event.isCtrlPressed || event.isAltPressed)) {
+                TerminalKeyEncoder.kittyDisambiguatedKeyBytes(event.getUnicodeChar(0), modifiers, view.kittyKeyboardFlags)?.let {
+                    view.onSendBytes?.invoke(it)
+                    return true
+                }
+            }
+
             // 物理 Ctrl 押下（トグルではなく実キーボードの修飾キー）: Ctrl+A〜Z 等を制御コードと
             // して明示的に送出する。Alt 併用時は下の Alt 分岐に譲る。IME 変換中は誤発火防止のため無効。
             if (!composing && event.isCtrlPressed && !event.isAltPressed) {

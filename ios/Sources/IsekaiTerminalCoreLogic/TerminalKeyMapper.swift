@@ -64,6 +64,21 @@ public enum TerminalKeyMapper {
     ) -> [UInt8] {
         Array(terminalSpecialKeyBytes(key: key.rustKey, applicationCursorMode: applicationCursorMode, modifiers: modifiers, kittyFlags: kittyFlags))
     }
+
+    /// Kitty keyboard protocolのbit0(disambiguate escape codes)有効時、Ctrl/Alt(併用・
+    /// Shift+Alt含む)付きの印字可能文字キーをCSI u形式でエンコードする(タスク#91、
+    /// Rust側`terminal_kitty_disambiguated_key_bytes`へそのまま委譲、rust-ssot)。
+    /// `codePoint`はキーの無修飾時の基本コードポイントを渡すこと(大文字/小文字の
+    /// 正規化はRust側が行う)。bit0が立っていない・Ctrl/Altどちらも押されていない・
+    /// 印字可能文字でない場合は`nil`を返し、呼び出し側は既存の`controlByte`(legacy Ctrl)
+    /// やESCプレフィックス(legacy Alt)へフォールバックすること。
+    public static func kittyDisambiguatedKeyBytes(
+        codePoint: UInt32,
+        modifiers: TerminalKeyModifiers,
+        kittyFlags: UInt16
+    ) -> [UInt8]? {
+        terminalKittyDisambiguatedKeyBytes(codePoint: codePoint, modifiers: modifiers, kittyFlags: kittyFlags).map(Array.init)
+    }
 }
 
 private extension TerminalKeyMapper.SpecialKey {

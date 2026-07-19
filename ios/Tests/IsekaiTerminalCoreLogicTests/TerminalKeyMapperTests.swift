@@ -73,6 +73,51 @@ final class TerminalKeyMapperTests: XCTestCase {
         )
     }
 
+    // ── タスク#91: kittyDisambiguatedKeyBytes(Ctrl/Alt付き印字可能文字キーの
+    // Kitty CSI u対応、Rust側`terminal_kitty_disambiguated_key_bytes`への委譲を検証。
+    // Android版`TerminalKeyEncoderTest`の対応するテストと対称) ─────────────
+
+    func testCtrlAUsesKittyCsiUWhenDisambiguateFlagNegotiated() {
+        let ctrl = TerminalKeyModifiers(shift: false, alt: false, ctrl: true, meta: false)
+        XCTAssertEqual(
+            TerminalKeyMapper.kittyDisambiguatedKeyBytes(codePoint: UInt32(Character("a").asciiValue!), modifiers: ctrl, kittyFlags: 0b1),
+            Array("\u{1B}[97;5u".utf8)
+        )
+    }
+
+    func testUppercaseCodePointLowercasesToSameBaseKey() {
+        let ctrl = TerminalKeyModifiers(shift: false, alt: false, ctrl: true, meta: false)
+        let lower = TerminalKeyMapper.kittyDisambiguatedKeyBytes(codePoint: UInt32(Character("a").asciiValue!), modifiers: ctrl, kittyFlags: 0b1)
+        let upper = TerminalKeyMapper.kittyDisambiguatedKeyBytes(codePoint: UInt32(Character("A").asciiValue!), modifiers: ctrl, kittyFlags: 0b1)
+        XCTAssertEqual(lower, upper)
+    }
+
+    func testAltAUsesKittyCsiUWhenDisambiguateFlagNegotiated() {
+        let alt = TerminalKeyModifiers(shift: false, alt: true, ctrl: false, meta: false)
+        XCTAssertEqual(
+            TerminalKeyMapper.kittyDisambiguatedKeyBytes(codePoint: UInt32(Character("a").asciiValue!), modifiers: alt, kittyFlags: 0b1),
+            Array("\u{1B}[97;3u".utf8)
+        )
+    }
+
+    func testCtrlAltACombinesModifierBits() {
+        let ctrlAlt = TerminalKeyModifiers(shift: false, alt: true, ctrl: true, meta: false)
+        XCTAssertEqual(
+            TerminalKeyMapper.kittyDisambiguatedKeyBytes(codePoint: UInt32(Character("a").asciiValue!), modifiers: ctrlAlt, kittyFlags: 0b1),
+            Array("\u{1B}[97;7u".utf8)
+        )
+    }
+
+    func testKittyDisambiguatedKeyBytesReturnsNilWithoutDisambiguateBit() {
+        let ctrl = TerminalKeyModifiers(shift: false, alt: false, ctrl: true, meta: false)
+        XCTAssertNil(TerminalKeyMapper.kittyDisambiguatedKeyBytes(codePoint: UInt32(Character("a").asciiValue!), modifiers: ctrl, kittyFlags: 0b10))
+    }
+
+    func testKittyDisambiguatedKeyBytesReturnsNilWithoutCtrlOrAlt() {
+        let noMods = TerminalKeyModifiers(shift: false, alt: false, ctrl: false, meta: false)
+        XCTAssertNil(TerminalKeyMapper.kittyDisambiguatedKeyBytes(codePoint: UInt32(Character("a").asciiValue!), modifiers: noMods, kittyFlags: 0b1))
+    }
+
     func testFunctionKeysF1ThroughF4UseSS3Form() {
         XCTAssertEqual(TerminalKeyMapper.bytes(for: .functionKey(1)), Array("\u{1B}OP".utf8))
         XCTAssertEqual(TerminalKeyMapper.bytes(for: .functionKey(2)), Array("\u{1B}OQ".utf8))

@@ -156,6 +156,18 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
             return true
         }
 
+        // Kitty keyboard protocol(タスク#54)のdisambiguate escape codes(bit0)が交渉
+        // されている場合、Ctrl/Alt(併用含む)付きの印字可能文字キーはCSI u形式で送る
+        // (タスク#91、Android版`TerminalInputConnection.sendKeyEvent`の同種分岐と対称。
+        // 未交渉時はnilを返しlegacyエンコード(下のCtrl分岐)へフォールスルーする)。
+        // 日本語IME変換中は誤発火防止のためフォールスルーする。
+        if (modifiers.ctrl || modifiers.alt), !modifiers.meta, markedTextRange == nil,
+           let scalar = key.charactersIgnoringModifiers.unicodeScalars.first,
+           let kittyBytes = TerminalKeyMapper.kittyDisambiguatedKeyBytes(codePoint: scalar.value, modifiers: modifiers, kittyFlags: kittyKeyboardFlags) {
+            onSendBytes?(Data(kittyBytes))
+            return true
+        }
+
         // 物理Ctrl押下(Alt/Cmd併用は除く、二重変換防止)。日本語IME変換中(marked text
         // が残っている間)は誤発火防止のためフォールスルーする(Android版
         // `TerminalInputConnection.sendKeyEvent`の`!composing`ガードと同じ方針、

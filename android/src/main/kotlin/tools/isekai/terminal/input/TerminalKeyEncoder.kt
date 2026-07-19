@@ -162,6 +162,36 @@ object TerminalKeyEncoder {
         }
 
     /**
+     * Kitty keyboard protocol(タスク#54/#72)のbit0(disambiguate escape codes)有効時、
+     * Ctrl/Alt(/その組み合わせ・Shift+Alt)付きの印字可能文字キーをCSI u形式
+     * (`ESC[<codepoint>;<modifier>u`)へエンコードする(タスク#91、`rust-core`の
+     * `terminal_kitty_disambiguated_key_bytes`と同一ロジック)。
+     *
+     * - [codePoint]はキーの無修飾時の基本コードポイント(`event.getUnicodeChar(0)`が返す値)を
+     *   渡すこと。呼び出し側で大文字/小文字を判定する必要はない(この関数が小文字化する)。
+     * - `modifier`はxterm/kitty共通のエンコード: `1 + shift(1) + alt(2) + ctrl(4) + meta(8)`。
+     * - bit0が立っていない場合、[codePoint]が印字可能文字でない場合、Ctrl/Altのどちらも
+     *   押されていない場合は`null`を返す——呼び出し側は既存の`ctrlByte`(legacy Ctrl)や
+     *   `altKeyBytes`(legacy Alt)へフォールバックすること。
+     * - Kitty仕様上の例外キー(Enter/Tab/Backspace)は`specialKeyBytes`が別途処理するため
+     *   この関数の対象外(呼び出し側で特殊キー判定をこの関数より先に行うこと)。
+     */
+    fun kittyDisambiguatedKeyBytes(codePoint: Int, modifiers: TerminalKeyModifiers, kittyFlags: UShort): ByteArray? {
+        if (kittyFlags.toUInt() and KITTY_DISAMBIGUATE_ESCAPE_CODES == 0u) return null
+        if (!modifiers.ctrl && !modifiers.alt) return null
+        if (codePoint == 0) return null
+        val ch = codePoint.toChar()
+        if (!(ch.code in 0x21..0x7E) && ch != ' ') return null
+        val base = ch.lowercaseChar().code
+        var modifierValue = 1
+        if (modifiers.shift) modifierValue += 1
+        if (modifiers.alt) modifierValue += 2
+        if (modifiers.ctrl) modifierValue += 4
+        if (modifiers.meta) modifierValue += 8
+        return byteArrayOf(0x1B) + "[$base;${modifierValue}u".toByteArray(Charsets.US_ASCII)
+    }
+
+    /**
      * 特殊キーのバイト列。未定義なら null。
      * applicationCursorMode=true のとき矢印キーは SS3 シーケンス（vim 等で必要）。
      * F1〜F4 は常に SS3（`ESC O P`等）、F5〜F12 は CSI `~`形式（xterm 互換、`rust-core`の
