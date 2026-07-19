@@ -1127,6 +1127,26 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func disconnect() 
     
     /**
+     * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
+     * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
+     * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
+     * "既存タグが見つかるか"等)は一切Kotlin側に持ち出さず、ここで完結させる
+     * (`.claude/rules/rust-ssot.md`)。
+     *
+     * - `profile_identity`: 呼び出し側が決める安定な識別子(例:
+     * `ConnectionProfile.id`の文字列化)。同じ値からは常に同じsession groupに
+     * 決定論的に解決される。
+     * - `client_id`: このアプリインストール固有の永続トークン(Kotlin側で1回だけ
+     * 生成し`SharedPreferences`等に保存、以後使い回す)。
+     * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
+     * 無ければ`None`(新規タブ)。
+     *
+     * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
+     * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
+     */
+    func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?) async throws  -> TmuxTabWindowInfo
+    
+    /**
      * #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
      * ダウンロード中などで静けさ待ちを待たずに即座に戻したい場合)。疎通確認だけは
      * 省略されない(`RebindManager::handle_manual_force_return`参照)。マルチパス以外の
@@ -1409,6 +1429,41 @@ open func disconnect()  {try! rustCall() {
             self.uniffiCloneHandle(),$0
     )
 }
+}
+    
+    /**
+     * タスク#60本体。Kotlin側(`TerminalTabsViewModel`)はタブを開いた際、
+     * primary paneについてのみこれを呼ぶ(split paneはtmuxへ反映しないMVP判断、
+     * `tmux_session.rs`のモジュールdoc参照)。判断("session groupが要るか"
+     * "既存タグが見つかるか"等)は一切Kotlin側に持ち出さず、ここで完結させる
+     * (`.claude/rules/rust-ssot.md`)。
+     *
+     * - `profile_identity`: 呼び出し側が決める安定な識別子(例:
+     * `ConnectionProfile.id`の文字列化)。同じ値からは常に同じsession groupに
+     * 決定論的に解決される。
+     * - `client_id`: このアプリインストール固有の永続トークン(Kotlin側で1回だけ
+     * 生成し`SharedPreferences`等に保存、以後使い回す)。
+     * - `existing_tag`: Room(`tmux_tab_locators`)に永続化済みのタグがあればそれ、
+     * 無ければ`None`(新規タブ)。
+     *
+     * 戻り値の`tag`を(新規作成時、またはリモート側で見失われて作り直された時のみ
+     * 実質的に変わる)Roomへ書き戻せば、次回以降の再接続で同じウィンドウに戻れる。
+     */
+open func ensureTmuxTabWindow(profileIdentity: String, clientId: String, existingTag: String?)async throws  -> TmuxTabWindowInfo  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_isekai_terminal_core_fn_method_sessionorchestrator_ensure_tmux_tab_window(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(profileIdentity),FfiConverterString.lower(clientId),FfiConverterOptionString.lower(existingTag)
+                )
+            },
+            pollFunc: ffi_isekai_terminal_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_isekai_terminal_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_isekai_terminal_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeTmuxTabWindowInfo_lift,
+            errorHandler: FfiConverterTypeTmuxSessionError_lift
+        )
 }
     
     /**
@@ -3798,6 +3853,109 @@ public func FfiConverterTypeTerminalKeyModifiers_lower(_ value: TerminalKeyModif
     return FfiConverterTypeTerminalKeyModifiers.lower(value)
 }
 
+
+/**
+ * タスク#60: `SessionOrchestrator::ensure_tmux_tab_window`の成功結果。
+ * Kotlin側は`tag`をRoom(`tmux_tab_locators`テーブル)へ永続化し、次回同じ
+ * プロファイル(のprimary pane)を開く時に`existing_tag`として渡し戻すこと。
+ * `window_index`はUI表示のヒント程度に使ってよいが、揮発性の値なので永続化の
+ * キーにはしないこと(`tmux_locator.rs`の`TmuxCoordinates`参照)。
+ */
+public struct TmuxTabWindowInfo: Equatable, Hashable {
+    /**
+     * tmuxウィンドウを長期的に指すタグ値。
+     */
+    public var tag: String
+    /**
+     * このタグ解決時点でのウィンドウインデックス。
+     */
+    public var windowIndex: UInt32
+    /**
+     * このクライアントがattachしたセッション名(グループ内で一意)。
+     */
+    public var sessionName: String
+    /**
+     * tmux session groupの名前。
+     */
+    public var groupName: String
+    /**
+     * 今回新規にウィンドウを作成したか(true)、既存タグを解決して再利用したか(false)。
+     */
+    public var isNewWindow: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * tmuxウィンドウを長期的に指すタグ値。
+         */tag: String, 
+        /**
+         * このタグ解決時点でのウィンドウインデックス。
+         */windowIndex: UInt32, 
+        /**
+         * このクライアントがattachしたセッション名(グループ内で一意)。
+         */sessionName: String, 
+        /**
+         * tmux session groupの名前。
+         */groupName: String, 
+        /**
+         * 今回新規にウィンドウを作成したか(true)、既存タグを解決して再利用したか(false)。
+         */isNewWindow: Bool) {
+        self.tag = tag
+        self.windowIndex = windowIndex
+        self.sessionName = sessionName
+        self.groupName = groupName
+        self.isNewWindow = isNewWindow
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TmuxTabWindowInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTmuxTabWindowInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TmuxTabWindowInfo {
+        return
+            try TmuxTabWindowInfo(
+                tag: FfiConverterString.read(from: &buf), 
+                windowIndex: FfiConverterUInt32.read(from: &buf), 
+                sessionName: FfiConverterString.read(from: &buf), 
+                groupName: FfiConverterString.read(from: &buf), 
+                isNewWindow: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TmuxTabWindowInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.tag, into: &buf)
+        FfiConverterUInt32.write(value.windowIndex, into: &buf)
+        FfiConverterString.write(value.sessionName, into: &buf)
+        FfiConverterString.write(value.groupName, into: &buf)
+        FfiConverterBool.write(value.isNewWindow, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTmuxTabWindowInfo_lift(_ buf: RustBuffer) throws -> TmuxTabWindowInfo {
+    return try FfiConverterTypeTmuxTabWindowInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTmuxTabWindowInfo_lower(_ value: TmuxTabWindowInfo) -> RustBuffer {
+    return FfiConverterTypeTmuxTabWindowInfo.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -5204,6 +5362,103 @@ public func FfiConverterTypeTerminalSpecialKey_lower(_ value: TerminalSpecialKey
     return FfiConverterTypeTerminalSpecialKey.lower(value)
 }
 
+
+
+/**
+ * [`SessionOrchestrator::ensure_tmux_tab_window`]の失敗。opportunisticな補助機能
+ * (tmux管理コマンドが失敗しても、タブ自体の接続は生きたまま続行する——呼び出し側は
+ * このエラーをログに残す程度でよく、詳細な分岐をさせる必要は無い)なので、
+ * `run_exec`(#61)由来のエラーの内訳(未接続/チャネルオープン失敗/非ゼロ終了/実行中の
+ * 切断)はメッセージにまとめて運ぶだけに留める。
+ */
+public enum TmuxSessionError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+
+    
+    
+    /**
+     * tmux管理コマンドの実行自体に失敗した(未接続・SSHチャネルの問題・非ゼロ終了等)。
+     */
+    case Command(String
+    )
+    /**
+     * tmuxコマンド自体は成功したが、期待した形式の出力が得られなかった。
+     */
+    case UnexpectedOutput(String
+    )
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
+}
+
+#if compiler(>=6)
+extension TmuxSessionError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTmuxSessionError: FfiConverterRustBuffer {
+    typealias SwiftType = TmuxSessionError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TmuxSessionError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Command(
+            try FfiConverterString.read(from: &buf)
+            )
+        case 2: return .UnexpectedOutput(
+            try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TmuxSessionError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case let .Command(v1):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(v1, into: &buf)
+            
+        
+        case let .UnexpectedOutput(v1):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(v1, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTmuxSessionError_lift(_ buf: RustBuffer) throws -> TmuxSessionError {
+    return try FfiConverterTypeTmuxSessionError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTmuxSessionError_lower(_ value: TmuxSessionError) -> RustBuffer {
+    return FfiConverterTypeTmuxSessionError.lower(value)
+}
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
@@ -7262,6 +7517,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_ensure_tmux_tab_window() != 29370) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi() != 8683) {

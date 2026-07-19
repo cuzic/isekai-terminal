@@ -1,0 +1,65 @@
+name: Android unit test check
+
+# android/src/test(Robolectric/JVMユニットテスト、`./gradlew :android:testDebugUnitTest`)を
+# CIで実行する。既存のCIワークフロー(fdroid-build-check.yml/room-migration-check.yml)は
+# どちらもgradleを呼んではいるが、実際にAndroidユニットテストを実行するジョブは
+# これまで一つも存在しなかった(fdroid-build-check.ymlは`assembleRelease`のビルド確認のみ、
+# room-migration-check.ymlはRoom migrationの版数整合性のみ)。
+#
+# このテストスイートはRobolectric上で動くJVMテストで、`FakeSshGateway`等の
+# フェイク実装を経由するため、rust-core側のネイティブライブラリ(.so)のビルドは
+# 一切不要(isekai-pipe musl埋め込みバイナリの事前ビルドも不要)。UniFFI生成の
+# Kotlinバインディング(`android/src/main/kotlin/uniffi/`)はリポジトリにチェックイン
+# 済みのものをそのまま使う。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "gradle/**"
+      - "*.gradle.kts"
+      - "gradle.properties"
+      - "settings.gradle.kts"
+      - ".github/workflows/android-test-check.yml"
+  pull_request:
+    paths:
+      - "android/**"
+      - "gradle/**"
+      - "*.gradle.kts"
+      - "gradle.properties"
+      - "settings.gradle.kts"
+      - ".github/workflows/android-test-check.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: android-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: ./gradlew :android:testDebugUnitTest
+        run: ./gradlew :android:testDebugUnitTest --stacktrace
+
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-reports
+          path: android/build/reports/tests/testDebugUnitTest
+          retention-days: 7
