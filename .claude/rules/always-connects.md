@@ -82,3 +82,14 @@
   (production向けの非対話ポリシー、`TofuConfirmation::Silent`時のみ注入)
 - `isekai-ssh/src/native/bootstrap_backend.rs`: `default_bootstrap_backend`の
   `silent`引数(`TofuConfirmation`から非対話ポリシーの要否を判定する唯一の場所)
+- `isekai-bootstrap/src/openssh.rs` / `russh_backend.rs`: サイレント再デプロイの
+  ヘルパー再利用判定(pid生存 + `/proc/<pid>/exe`パス一致 + fingerprint一致)に
+  稼働中バイナリのsha256一致チェックを追加(2026-07-19)。それまでは中身(ビルドの
+  新旧)を一切見ておらず、`isekai-pipe serve`側のバグ修正(Epic N-4/N-5のBUSY_OTHER_SESSION
+  永続化修正含む)がいくら入っても生きている古いプロセスがある限り再デプロイされず、
+  「`isekai-ssh`のリトライでは回復できないサーバー側の古さ」という、このファイルが
+  警告している問題そのものの新しい一形態を実際に踏んだ(このサンドボックス自身が
+  relayサーバーであるため、動いているヘルパーのビルド時刻とgit log を突き合わせて
+  確認できた)。古いプロセスはkillせず「再利用しない」判定にして新規ヘルパーを
+  並行デプロイするだけに留める(フィンガープリント不一致の別トポロジをkillしない
+  既存方針と同じ理由: 他のクライアントがそのヘルパーでセッション中の可能性がある)。
