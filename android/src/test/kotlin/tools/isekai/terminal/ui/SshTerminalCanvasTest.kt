@@ -1,5 +1,8 @@
 package tools.isekai.terminal.ui
 
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
 import android.graphics.Typeface
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -350,5 +353,79 @@ class SshTerminalCanvasTest {
         assertEquals(2, pixels.size)
         assertEquals(0xFFFF0000.toInt(), pixels[0])
         assertEquals(0x8000FF00.toInt(), pixels[1])
+    }
+
+    // ── computeLineDecorationRects: underline/strikethrough(SGR 4/9)の装飾線矩形計算 ──
+    //
+    // `Paint.isUnderlineText`/`isStrikeThruText`は、空白のみの文字列に対して
+    // Robolectric実描画でも実際には装飾線を描かないことが確認された(iOS版
+    // `NSAttributedString.underlineStyle`が空白セルでCoreTextにより描画されない
+    // 実機バグ[コミット`5da238e`]と対称のAndroid側の不具合)。このため本番コードは
+    // `computeLineDecorationRects`が返すRectを`drawRect`で直接塗る方式に置き換えた。
+
+    @Test
+    fun `computeLineDecorationRects returns nothing when neither flag is set`() {
+        val rects = computeLineDecorationRects(x = 0f, y = 0f, cellW = 8f, cellH = 16f, underline = false, strikethrough = false)
+        assertTrue(rects.isEmpty())
+    }
+
+    @Test
+    fun `computeLineDecorationRects underline is a thin strip at the cell bottom`() {
+        val rects = computeLineDecorationRects(x = 10f, y = 20f, cellW = 8f, cellH = 16f, underline = true, strikethrough = false)
+        assertEquals(1, rects.size)
+        val rect = rects.single()
+        assertEquals("横幅はセル幅いっぱい", 8f, rect.right - rect.left)
+        assertEquals("下端はセル下端に一致", 36f, rect.bottom)
+        assertTrue("上端は下端より上", rect.top < rect.bottom)
+    }
+
+    @Test
+    fun `computeLineDecorationRects strikethrough is centered vertically`() {
+        val rects = computeLineDecorationRects(x = 10f, y = 20f, cellW = 8f, cellH = 16f, underline = false, strikethrough = true)
+        assertEquals(1, rects.size)
+        val rect = rects.single()
+        val midY = 20f + 16f * 0.5f
+        assertTrue("中央線を挟んで配置される", rect.top < midY && rect.bottom > midY)
+    }
+
+    @Test
+    fun `computeLineDecorationRects returns both rects when both flags are set`() {
+        val rects = computeLineDecorationRects(x = 0f, y = 0f, cellW = 8f, cellH = 16f, underline = true, strikethrough = true)
+        assertEquals(2, rects.size)
+    }
+
+    // iOS版`TerminalScreenViewTests.swift`の
+    // `testUnderlineAndStrikethroughOnBlankCellAffectRenderedPixels`と対称の統合テスト。
+    // `computeLineDecorationRects`が返す矩形を実際に`Canvas.drawRect`で描き、装飾なしの
+    // 空白セルとピクセルが実際に異なることを確認する(`drawRect`は`Paint.isUnderlineText`と
+    // 異なり空文字列の有無に依存しない単純な塗りつぶしのため、この経路なら確実に描画される)。
+    @Test
+    fun `computeLineDecorationRects rects actually change rendered pixels for a blank space`() {
+        fun renderedPixels(underline: Boolean, strikethrough: Boolean): IntArray {
+            val bmp = Bitmap.createBitmap(40, 40, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bmp)
+            canvas.drawColor(0xFF000000.toInt())
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+            paint.color = 0xFFFFFFFF.toInt()
+            for (rect in computeLineDecorationRects(x = 0f, y = 0f, cellW = 40f, cellH = 40f, underline, strikethrough)) {
+                canvas.drawRect(rect.left, rect.top, rect.right, rect.bottom, paint)
+            }
+            val pixels = IntArray(40 * 40)
+            bmp.getPixels(pixels, 0, 40, 0, 0, 40, 40)
+            return pixels
+        }
+
+        val plain = renderedPixels(underline = false, strikethrough = false)
+        val underlined = renderedPixels(underline = true, strikethrough = false)
+        val struck = renderedPixels(underline = false, strikethrough = true)
+
+        assertFalse(
+            "underline付きの空白セルは装飾なしの空白セルと異なるピクセルになるはず(タスク#71相当)",
+            plain.contentEquals(underlined),
+        )
+        assertFalse(
+            "strikethrough付きの空白セルも装飾なしの空白セルと異なるピクセルになるはず",
+            plain.contentEquals(struck),
+        )
     }
 }
