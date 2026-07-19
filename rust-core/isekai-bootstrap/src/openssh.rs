@@ -14,12 +14,17 @@
 //!    *and* `crate::reuse::launch_fingerprint`, so each distinct topology —
 //!    Direct vs. Relay, different relays — tracks its own helper rather than
 //!    contending over one) records a still-alive helper (`kill -0`,
-//!    `/proc/<pid>/exe` identity check to guard against PID reuse) — if so,
-//!    skip uploading/relaunching entirely and hand back the recorded
-//!    handshake (see `crate::reuse`'s module docs for why this is safe and
-//!    why `isekai-ssh`'s long-lived-helper model needs it, unlike
+//!    `/proc/<pid>/exe` identity check to guard against PID reuse, *and* a
+//!    `sha256sum`/`shasum` content check against the binary this exact
+//!    invocation would deploy — guards against reusing a helper that's
+//!    alive but predates a bugfix to `isekai-pipe serve` itself) — if all
+//!    of those match, skip uploading/relaunching entirely and hand back the
+//!    recorded handshake (see `crate::reuse`'s module docs for why this is
+//!    safe and why `isekai-ssh`'s long-lived-helper model needs it, unlike
 //!    `helper_bootstrap.rs`'s intentionally-fresh-every-session Android
-//!    path).
+//!    path). A stale-content helper is never killed for this — it's simply
+//!    not reused, and a fresh one is deployed alongside it (step 2) — the
+//!    stale one self-exits later via `--max-idle-lifetime`.
 //! 2. Otherwise: `sha256sum` (falling back to `shasum -a 256` on macOS
 //!    remotes, which don't ship GNU coreutils) the existing binary (if any,
 //!    shared across every topology) and skip re-uploading when it already
@@ -446,6 +451,13 @@ impl OpenSshBackend {
 mkdir -p {remote_dir} 2>/dev/null
 exec 9>>{lock_path} 2>/dev/null
 if command -v flock >/dev/null 2>&1; then flock -w 30 9 2>/dev/null || true; fi
+sha256_of() {{
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  fi
+}}
 tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
 if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [ "$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')" -eq {request_len} ] && {read_jwt_step}true; then
   reuse_envelope=""
@@ -473,8 +485,22 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
       # sanity check, not a decision point: this bootstrap never touches a
       # *different* topology's state/pid file, so there is no "stale, kill
       # it" case to handle here at all (`crate::reuse`'s module docs).
+      #
+      # `existing_sha` guards against reusing a still-alive helper that
+      # predates a bugfix to `isekai-pipe serve` itself: pid/exe-path/
+      # fingerprint all matching only proves the *same binary path* is
+      # still running, not that its *contents* are still what this
+      # `isekai-ssh` build expects. A stale-but-alive process is never
+      # killed here (same reasoning as the fingerprint-mismatch case
+      # above: some other still-active client may be mid-session on it) —
+      # this just falls through to the normal upload+launch path below,
+      # which deploys and starts a fresh helper the stale one doesn't
+      # interfere with. The stale one self-exits via `--max-idle-lifetime`.
       if [ -n "$existing_exe" ] && [ "$existing_exe" = "$expected_exe" ] && [ "$existing_fp" = "{fingerprint}" ]; then
-        reuse_envelope=$(sed -n '2p' {state_path})
+        existing_sha=$(sha256_of {remote_binary_path})
+        if [ "$existing_sha" = "{expected_sha256}" ]; then
+          reuse_envelope=$(sed -n '2p' {state_path})
+        fi
       fi
     fi
   fi
@@ -484,11 +510,7 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
   else
     need_upload=1
     if [ -x {remote_binary_path} ]; then
-      if command -v sha256sum >/dev/null 2>&1; then
-        current_sha=$(sha256sum {remote_binary_path} 2>/dev/null | cut -d' ' -f1)
-      elif command -v shasum >/dev/null 2>&1; then
-        current_sha=$(shasum -a 256 {remote_binary_path} 2>/dev/null | cut -d' ' -f1)
-      fi
+      current_sha=$(sha256_of {remote_binary_path})
       [ -n "$current_sha" ] && [ "$current_sha" = "{expected_sha256}" ] && need_upload=0
     fi
     upload_ok=1
