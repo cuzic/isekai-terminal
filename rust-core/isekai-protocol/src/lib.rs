@@ -13,6 +13,7 @@ pub mod attach;
 pub mod bootstrap;
 pub mod bootstrap_request;
 pub mod ctl;
+pub mod ctl_vars;
 pub mod error;
 pub mod handshake;
 pub mod hello;
@@ -29,6 +30,7 @@ pub use ctl::{
     decode_ctl_message, validate_ctl_message, ClipboardMime, CtlMessage, VarScope, MAX_CLIPBOARD_IMAGE_DECODED_LEN,
     MAX_CLIPBOARD_TEXT_DECODED_LEN, MAX_CTL_MESSAGE_LINE_LEN, MAX_VAR_KEY_LEN, MAX_VAR_VALUE_LEN,
 };
+pub use ctl_vars::CtlVarStore;
 pub use bootstrap_request::{
     BootstrapAttemptId, BootstrapCandidateV2, BootstrapRequestV2, BootstrapReportV2, BOOTSTRAP_PROTOCOL_V2,
 };
