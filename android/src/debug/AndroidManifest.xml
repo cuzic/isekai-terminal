@@ -16,6 +16,13 @@
                 <action android:name="tools.isekai.terminal.debug.CLEAR" />
             </intent-filter>
         </receiver>
+        <receiver
+            android:name=".debug.DirtyRowDebugReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="tools.isekai.terminal.debug.DIRTY_ROW_FORCE_FULL" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>
