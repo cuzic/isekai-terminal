@@ -556,6 +556,123 @@ fn clipboard_mime_kind_to_protocol(mime: ClipboardMimeKind) -> isekai_protocol::
     }
 }
 
+/// `dispatch_transport_event`の戻り値。`TransportEvent::Disconnected`/
+/// event_rx正常close相当のケースを`break 'outer`できるよう、通常の
+/// `Option<ProcessResult>`とは別に`Break`を持つ。
+enum EventOutcome {
+    Continue(Option<ProcessResult>),
+    Break,
+}
+
+/// 1件の`TransportEvent`を処理する(`session_event_loop`の`select!`の
+/// `event_rx.recv()`アームから切り出したもの)。
+///
+/// `TransportEvent::Stdout`の場合は、`event_rx`に既に届いている後続の連続
+/// `Stdout`をノンブロッキングの`try_recv`で吸い出し1本のバイト列に連結してから
+/// `state.on_stdout`/`callback.on_data`を1回だけ呼ぶ(kittyの`input_delay`相当の
+/// バッチ化——このプロジェクトは既にイベント化済みのためタイマーは使わず、
+/// 既にキューに積まれている分だけを遅延ゼロで束ねる)。drain中に非`Stdout`を
+/// 引いてしまった場合は`pending_event`へ退避し、呼び出し元が次のループ先頭で
+/// `select!`より先に処理することで元の到着順序([Stdout, Resized, Stdout]等)を
+/// 厳密に保つ。
+fn dispatch_transport_event(
+    event: TransportEvent,
+    event_rx: &mut tokio::sync::mpsc::Receiver<TransportEvent>,
+    pending_event: &mut Option<TransportEvent>,
+    state: &mut SessionState,
+    callback: &Arc<dyn SessionCallback>,
+) -> EventOutcome {
+    match event {
+        TransportEvent::HostKey(fp, reply_tx) => {
+            let cb = Arc::clone(callback);
+            tokio::task::spawn_blocking(move || {
+                let accepted = cb.on_host_key(fp);
+                let _ = reply_tx.send(accepted);
+            });
+            EventOutcome::Continue(None)
+        }
+        TransportEvent::AgentSignRequest { key_fingerprint, reply } => {
+            let cb = Arc::clone(callback);
+            tokio::task::spawn_blocking(move || {
+                let approved = cb.on_agent_sign_request(key_fingerprint);
+                let _ = reply.send(approved);
+            });
+            EventOutcome::Continue(None)
+        }
+        TransportEvent::Connected => {
+            callback.on_connected();
+            EventOutcome::Continue(None)
+        }
+        TransportEvent::Stdout(bytes) => {
+            let mut combined = bytes;
+            loop {
+                match event_rx.try_recv() {
+                    Ok(TransportEvent::Stdout(more)) => combined.extend_from_slice(&more),
+                    Ok(other) => {
+                        *pending_event = Some(other);
+                        break;
+                    }
+                    Err(_) => break, // Empty または Disconnected — どちらもdrain終了でよい
+                }
+            }
+            callback.on_data(combined.clone());
+            EventOutcome::Continue(Some(state.on_stdout(combined)))
+        }
+        TransportEvent::Resized { cols, rows } => {
+            info!("session: terminal resize {}x{}", cols, rows);
+            EventOutcome::Continue(Some(state.resize(cols as usize, rows as usize)))
+        }
+        TransportEvent::ForwardStateChanged { id, state: fwd_state } => {
+            callback.on_forward_state_changed(id, fwd_state);
+            EventOutcome::Continue(None)
+        }
+        TransportEvent::CtlMessage(msg) => match msg {
+            isekai_protocol::CtlMessage::SetTitle { value } => {
+                EventOutcome::Continue(Some(state.set_title_from_ctl(value)))
+            }
+            isekai_protocol::CtlMessage::ClipboardPush { mime, data_b64 } => {
+                if let Some(payload) = decode_clipboard_push(mime, &data_b64) {
+                    let cb = Arc::clone(callback);
+                    tokio::task::spawn_blocking(move || cb.on_clipboard_write(payload));
+                }
+                EventOutcome::Continue(None)
+            }
+            // `ClipboardPullRequest`は`transport.rs`側で応答書き込みが必要と判定され
+            // `TransportEvent::ClipboardPullRequestOverCtl`として別途届く(下のアーム参照)
+            // ので、ここには来ない。`ClipboardPullResponse`はdevice→hostの応答そのもの
+            // であり、deviceがこれを受け取ることは無い。どちらも到達したら無視するだけ。
+            isekai_protocol::CtlMessage::ClipboardPullRequest {}
+            | isekai_protocol::CtlMessage::ClipboardPullResponse { .. } => EventOutcome::Continue(None),
+        },
+        TransportEvent::ClipboardPullRequestOverCtl(reply) => {
+            // tmux迂回チャンネル経由のpull要求(`ISEKAI_PIPE_DESIGN.md` §8 Epic M
+            // follow-up)。Android`ClipboardManager`読み出しは同期I/Oなので
+            // `on_host_key`/`on_agent_sign_request`と同じ`spawn_blocking`パターンで待つ。
+            // opt-in無効/クリップボード空(`None`)なら`reply`をdropするだけ
+            // (`transport.rs`側が応答無しでチャネルを閉じる)。
+            let cb = Arc::clone(callback);
+            tokio::task::spawn_blocking(move || {
+                if let Some(payload) = cb.on_clipboard_pull_request() {
+                    let mime = clipboard_mime_kind_to_protocol(payload.mime);
+                    let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payload.data);
+                    let _ = reply.send(isekai_protocol::CtlMessage::ClipboardPullResponse { mime, data_b64 });
+                }
+            });
+            EventOutcome::Continue(None)
+        }
+        TransportEvent::Disconnected { reason } => {
+            info!("session: disconnected reason={:?}", reason);
+            callback.on_disconnected(reason);
+            EventOutcome::Break
+        }
+        TransportEvent::NoViablePath => {
+            info!("session: no viable path (all paths unhealthy)");
+            callback.on_no_viable_path();
+            EventOutcome::Continue(None)
+        }
+    }
+}
+
 /// `CtlMessage::ClipboardPush`の`data_b64`をデコードする。base64が不正なら`warn!`ログを
 /// 出して`None`を返す(既存の「不正な入力はドロップして継続する」opportunisticな方針を
 /// 維持)。テキスト系mime(`TextPlain`/`TextHtml`)はさらにUTF-8として妥当かも検証する
@@ -627,84 +744,24 @@ pub(crate) async fn session_event_loop(
     let repaint_timer = tokio::time::sleep(Duration::from_secs(0));
     tokio::pin!(repaint_timer);
 
+    // `dispatch_transport_event`が連続`Stdout`をdrainする際に引いてしまった
+    // 非`Stdout`イベントの退避スロット(1件のみ)。次のループ先頭で
+    // `select!`より先に消費し、元の到着順序を保つ。
+    let mut pending_event: Option<TransportEvent> = None;
+
     'outer: loop {
-        let result: Option<ProcessResult> = tokio::select! {
+        let result: Option<ProcessResult> = if let Some(ev) = pending_event.take() {
+            match dispatch_transport_event(ev, &mut event_rx, &mut pending_event, &mut state, &callback) {
+                EventOutcome::Continue(r) => r,
+                EventOutcome::Break => break 'outer,
+            }
+        } else {
+            tokio::select! {
             event = event_rx.recv() => match event {
-                Some(TransportEvent::HostKey(fp, reply_tx)) => {
-                    let cb = Arc::clone(&callback);
-                    tokio::task::spawn_blocking(move || {
-                        let accepted = cb.on_host_key(fp);
-                        let _ = reply_tx.send(accepted);
-                    });
-                    None
-                }
-                Some(TransportEvent::AgentSignRequest { key_fingerprint, reply }) => {
-                    let cb = Arc::clone(&callback);
-                    tokio::task::spawn_blocking(move || {
-                        let approved = cb.on_agent_sign_request(key_fingerprint);
-                        let _ = reply.send(approved);
-                    });
-                    None
-                }
-                Some(TransportEvent::Connected) => {
-                    callback.on_connected(); None
-                }
-                Some(TransportEvent::Stdout(bytes)) => {
-                    callback.on_data(bytes.clone());
-                    Some(state.on_stdout(bytes))
-                }
-                Some(TransportEvent::Resized { cols, rows }) => {
-                    info!("session: terminal resize {}x{}", cols, rows);
-                    Some(state.resize(cols as usize, rows as usize))
-                }
-                Some(TransportEvent::ForwardStateChanged { id, state }) => {
-                    callback.on_forward_state_changed(id, state); None
-                }
-                Some(TransportEvent::CtlMessage(msg)) => {
-                    match msg {
-                        isekai_protocol::CtlMessage::SetTitle { value } => {
-                            Some(state.set_title_from_ctl(value))
-                        }
-                        isekai_protocol::CtlMessage::ClipboardPush { mime, data_b64 } => {
-                            if let Some(payload) = decode_clipboard_push(mime, &data_b64) {
-                                let cb = Arc::clone(&callback);
-                                tokio::task::spawn_blocking(move || cb.on_clipboard_write(payload));
-                            }
-                            None
-                        }
-                        // `ClipboardPullRequest`は`transport.rs`側で応答書き込みが
-                        // 必要と判定され`TransportEvent::ClipboardPullRequestOverCtl`
-                        // として別途届く(下記アーム参照)ので、ここには来ない。
-                        // `ClipboardPullResponse`はdevice→hostの応答そのものであり、
-                        // deviceがこれを受け取ることは無い。どちらも到達したら無視するだけ。
-                        isekai_protocol::CtlMessage::ClipboardPullRequest {}
-                        | isekai_protocol::CtlMessage::ClipboardPullResponse { .. } => None,
-                    }
-                }
-                Some(TransportEvent::ClipboardPullRequestOverCtl(reply)) => {
-                    // tmux迂回チャンネル経由のpull要求(`ISEKAI_PIPE_DESIGN.md` §8 Epic M
-                    // follow-up)。Android`ClipboardManager`読み出しは同期I/Oなので
-                    // `on_host_key`/`on_agent_sign_request`と同じ`spawn_blocking`パターンで
-                    // 待つ。opt-in無効/クリップボード空(`None`)なら`reply`をdropするだけ
-                    // (`transport.rs`側が応答無しでチャネルを閉じる)。
-                    let cb = Arc::clone(&callback);
-                    tokio::task::spawn_blocking(move || {
-                        if let Some(payload) = cb.on_clipboard_pull_request() {
-                            let mime = clipboard_mime_kind_to_protocol(payload.mime);
-                            let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payload.data);
-                            let _ = reply.send(isekai_protocol::CtlMessage::ClipboardPullResponse { mime, data_b64 });
-                        }
-                    });
-                    None
-                }
-                Some(TransportEvent::Disconnected { reason }) => {
-                    info!("session: disconnected reason={:?}", reason);
-                    callback.on_disconnected(reason); break 'outer;
-                }
-                Some(TransportEvent::NoViablePath) => {
-                    info!("session: no viable path (all paths unhealthy)");
-                    callback.on_no_viable_path(); None
-                }
+                Some(ev) => match dispatch_transport_event(ev, &mut event_rx, &mut pending_event, &mut state, &callback) {
+                    EventOutcome::Continue(r) => r,
+                    EventOutcome::Break => break 'outer,
+                },
                 None => {
                     info!("session: event channel closed");
                     callback.on_disconnected(None); break 'outer;
@@ -732,6 +789,7 @@ pub(crate) async fn session_event_loop(
             () = &mut repaint_timer, if repaint_throttle.timer_armed() => {
                 emit_screen_update(&mut state, &callback, &mut repaint_throttle, Instant::now());
                 None
+            }
             }
         };
 
@@ -1577,6 +1635,103 @@ mod tests {
             sb.iter().all(|r| r[0].ch != "Z"),
             "the oldest row (back of the deque) must be the one evicted, not an arbitrary one"
         );
+    }
+}
+
+/// `dispatch_transport_event`のStdout drain連結(kittyの`input_delay`相当)の
+/// ユニットテスト。実async loopは不要——`tokio::sync::mpsc`の`try_send`/
+/// `try_recv`は同期メソッドなので、関数を直接同期的に呼んで検証できる。
+#[cfg(test)]
+mod dispatch_transport_event_tests {
+    use super::*;
+
+    struct NoopSessionCallback;
+    impl SessionCallback for NoopSessionCallback {
+        fn on_data(&self, _data: Vec<u8>) {}
+        fn on_host_key(&self, _fingerprint: String) -> bool { true }
+        fn on_connected(&self) {}
+        fn on_disconnected(&self, _reason: Option<String>) {}
+        fn on_screen_update(&self, _update: ScreenUpdate) {}
+        fn on_trzsz_request(&self, _transfer_id: String, _mode: String, _suggested_name: Option<String>, _expected_size: Option<u64>) {}
+        fn on_trzsz_download_chunk(&self, _transfer_id: String, _data: Vec<u8>, _is_last: bool) {}
+        fn on_trzsz_progress(&self, _transfer_id: String, _transferred: u64, _total: Option<u64>) {}
+        fn on_trzsz_finished(&self, _transfer_id: String, _success: bool, _message: Option<String>) {}
+        fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
+        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
+    }
+
+    fn fresh_state() -> SessionState {
+        SessionState::new(80, 24, Theme::default())
+    }
+
+    fn visible_text(upd: &ScreenUpdate, len: usize) -> String {
+        upd.cells[0..len].iter().map(|c| c.ch.as_str()).collect()
+    }
+
+    #[test]
+    fn consecutive_queued_stdout_is_concatenated_into_a_single_on_stdout_call() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportEvent>(8);
+        // "ab"は直接dispatchする引数、"cd"/"ef"は既にキューに積まれている想定。
+        tx.try_send(TransportEvent::Stdout(b"cd".to_vec())).unwrap();
+        tx.try_send(TransportEvent::Stdout(b"ef".to_vec())).unwrap();
+
+        let mut state = fresh_state();
+        let callback: Arc<dyn SessionCallback> = Arc::new(NoopSessionCallback);
+        let mut pending: Option<TransportEvent> = None;
+
+        let outcome = dispatch_transport_event(
+            TransportEvent::Stdout(b"ab".to_vec()), &mut rx, &mut pending, &mut state, &callback,
+        );
+
+        assert!(matches!(outcome, EventOutcome::Continue(Some(_))), "Stdout must produce a ProcessResult");
+        assert!(pending.is_none(), "no non-Stdout event was queued, so nothing should be stashed");
+        assert!(rx.try_recv().is_err(), "the queued Stdout events must be fully drained, not left behind");
+
+        let upd = state.make_screen_update();
+        assert_eq!(
+            visible_text(&upd, 6), "abcdef",
+            "three queued Stdout chunks must be applied in order as if concatenated into one on_stdout call"
+        );
+    }
+
+    #[test]
+    fn non_stdout_event_encountered_while_draining_is_stashed_and_stops_the_drain() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportEvent>(8);
+        // [Stdout("before"), Resized, Stdout("after")]という到着順を想定。
+        tx.try_send(TransportEvent::Resized { cols: 100, rows: 40 }).unwrap();
+        tx.try_send(TransportEvent::Stdout(b"after".to_vec())).unwrap();
+
+        let mut state = fresh_state();
+        let callback: Arc<dyn SessionCallback> = Arc::new(NoopSessionCallback);
+        let mut pending: Option<TransportEvent> = None;
+
+        let outcome = dispatch_transport_event(
+            TransportEvent::Stdout(b"before".to_vec()), &mut rx, &mut pending, &mut state, &callback,
+        );
+        assert!(matches!(outcome, EventOutcome::Continue(Some(_))));
+        assert!(
+            matches!(pending, Some(TransportEvent::Resized { cols: 100, rows: 40 })),
+            "Resized must be stashed into pending_event rather than silently dropped or merged into the Stdout batch"
+        );
+        // Resizedより後ろの2件目のStdoutは、Resizedを飛び越えてdrainされてはならない
+        // (順序保全)。まだキューに残っているはず。
+        match rx.try_recv() {
+            Ok(TransportEvent::Stdout(b)) => assert_eq!(b, b"after"),
+            Ok(_) => panic!("expected the second Stdout to remain queued, got a different TransportEvent variant"),
+            Err(e) => panic!("expected the second Stdout to remain queued, got error: {e:?}"),
+        }
+
+        // 呼び出し元(session_event_loop本番コード)は次にpending_eventを最優先で処理する。
+        let resize_event = pending.take().expect("pending_event was asserted Some above");
+        let outcome2 = dispatch_transport_event(resize_event, &mut rx, &mut pending, &mut state, &callback);
+        assert!(matches!(outcome2, EventOutcome::Continue(Some(_))));
+        assert!(pending.is_none(), "Resized does not itself drain further events");
+
+        assert_eq!(state.terminal().cols(), 100, "resize must be applied before the later Stdout, preserving order");
+        assert_eq!(state.terminal().rows(), 40);
     }
 }
 
