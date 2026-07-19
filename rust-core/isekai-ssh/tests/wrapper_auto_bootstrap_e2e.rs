@@ -575,14 +575,27 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
         .expect("failed to spawn isekai-ssh");
 
     // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
-    // prompt ("Are you sure you want to continue connecting (yes/no)?")
-    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
-    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // prompt (text: "Are you sure you want to continue connecting
+    // (yes/no)?", `prompt_new_host_confirmation` in `russh_backend.rs`,
+    // accepts "yes"/"y"/"Y") fires *before* the app-level "Trust this
+    // isekai-helper...? [y/N]" prompt (`wrapper.rs::bootstrap_and_register`,
+    // accepts *only* "y"/"Y" exactly) — unlike the Unix/`ssh(1)` path, which
     // never asks that first question at all (`StrictHostKeyChecking no` in
     // the shim config suppresses it). See `RusshBackend`'s module docs
     // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
     // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    //
+    // A real Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) showed the TOFU prompt fire and then the whole run go
+    // silent until the reader's 20s timeout gave up -- consistent with a
+    // *second* TOFU round (e.g. a redeploy/retry re-dialing the same host)
+    // consuming the single answer meant for the app-level prompt, leaving
+    // that prompt's blocking stdin read starved. Feeding several "y" answers
+    // up front is harmless (unread lines just sit in the pipe, or are
+    // dropped on process exit -- "y" alone satisfies both prompt kinds) and
+    // makes the test robust to however many confirmation rounds actually
+    // occur, instead of assuming exactly one TOFU round every time.
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     // The wrapper proceeds to exec a real `ssh` with `ProxyCommand isekai-pipe
@@ -698,7 +711,7 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
     // the shim config suppresses it). See `RusshBackend`'s module docs
     // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
     // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
@@ -806,7 +819,7 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
     // the shim config suppresses it). See `RusshBackend`'s module docs
     // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
     // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
@@ -931,7 +944,7 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
     // the shim config suppresses it). See `RusshBackend`'s module docs
     // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
     // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
@@ -1038,7 +1051,7 @@ async fn wrapper_auto_bootstrap_honors_resume_grace_directive() {
     // Native/Windows path prompts for SSH host-key TOFU before the app-level
     // "Trust this isekai-helper...?" prompt this "y\n" answers (see
     // `wrapper_auto_bootstrap_honors_stun_directive`'s identical comment).
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
@@ -1165,7 +1178,7 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
     // the shim config suppresses it). See `RusshBackend`'s module docs
     // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
     // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
