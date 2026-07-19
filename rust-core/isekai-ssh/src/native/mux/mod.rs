@@ -83,7 +83,7 @@ use crate::native::connect::{self, OwnerHook, Prepared};
 /// concrete type here.
 #[cfg(windows)]
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
-    let prepared = connect::prepare(args)?;
+    let prepared = connect::prepare(args).await?;
     dispatch::<local_ipc_mux::WindowsNamedPipeChannel>(prepared).await
 }
 

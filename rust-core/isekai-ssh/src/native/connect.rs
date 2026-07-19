@@ -19,13 +19,16 @@
 //! bootstrap host's own SSH host key isn't trusted yet, `RusshBackend`'s
 //! host-key TOFU still confirms it — a separate, orthogonal prompt that is
 //! `always-connects.md`'s stated first-time-TOFU exception (see
-//! [`run_native_connect_with_recovery`]). What
-//! this path still does *not* do is auto-bootstrap a *brand-new*
-//! (never-registered) destination on first contact: a trust-store miss still
-//! fails with guidance to run `isekai-ssh init` manually (the initial TOFU
-//! confirmation is inherently interactive — `always-connects.md`'s stated
-//! exception). Likewise, a destination with `#@isekai enabled no` (direct,
-//! non-isekai SSH) isn't supported by this path yet — that's a plain
+//! [`run_native_connect_with_recovery`]). [`prepare`] *also* auto-bootstraps
+//! a *brand-new* (never-registered) destination on first contact, inline
+//! with a TOFU confirmation prompt — mirroring `wrapper::run`'s own
+//! `Err(err) if should_bootstrap(...)` arm on Unix (an ultrareview-confirmed,
+//! real-Windows-CI-reproduced gap this path used to have: it required a
+//! separate manual `isekai-ssh init` first, even though
+//! `always-connects.md`'s TOFU exception exempts only the interactive
+//! confirmation itself, not a requirement to run a separate command).
+//! Likewise, a destination with `#@isekai enabled no` (direct, non-isekai
+//! SSH) isn't supported by this path yet — that's a plain
 //! `connect_via_jump_or_direct` call away, but is left for a follow-up since
 //! every destination this project's users actually run through `isekai-ssh`
 //! has isekai routing enabled.
@@ -112,10 +115,11 @@ impl Prepared {
 }
 
 /// Resolves argv into a [`Prepared`] (config resolution, `--isekai-log-file`
-/// init, trust-store lookup) without yet touching the network — the shared
-/// front half of both the single-process path ([`run`]) and the mux dispatch
-/// ([`super::mux::run`]).
-pub(crate) fn prepare(args: Vec<String>) -> Result<Prepared> {
+/// init, trust-store lookup — auto-bootstrapping a brand-new destination
+/// inline if needed) without yet establishing the SSH session itself — the
+/// shared front half of both the single-process path ([`run`]) and the mux
+/// dispatch ([`super::mux::run`]).
+pub(crate) async fn prepare(args: Vec<String>) -> Result<Prepared> {
     let plan = crate::wrapper::parse_wrapper(args)?;
     // `--isekai-log-file` must be honored on the native path too — the Unix
     // path opens it at the top of `wrapper::run`; without this the flag was
@@ -133,13 +137,37 @@ pub(crate) fn prepare(args: Vec<String>) -> Result<Prepared> {
             plan.destination()
         ));
     }
-    let intent = crate::wrapper::build_connection_intent(&resolution).with_context(|| {
-        format!(
-            "isekai-ssh: {:?} is not set up yet for the native path — run `isekai-ssh init {}` first",
-            plan.destination(),
-            plan.destination()
-        )
-    })?;
+    let intent = match build_connection_intent(&resolution) {
+        Ok(intent) => intent,
+        // A brand-new (never-registered) destination: auto-bootstrap inline
+        // with a TOFU confirmation prompt, exactly mirroring
+        // `wrapper::run`'s own `Err(err) if should_bootstrap(...)` arm on
+        // Unix — the only difference is which `BootstrapBackend` performs the
+        // actual deploy (`RusshBackend` here via
+        // `native::bootstrap_backend::resolve_backend`, vs. `OpenSshBackend`
+        // on Unix; `bootstrap_and_register` itself already dispatches on
+        // platform). `always-connects.md`'s stated TOFU exception exempts the
+        // *interactive confirmation itself* being un-automatable, not a
+        // requirement that the user run a separate `isekai-ssh init` command
+        // first — this native path used to require exactly that, an
+        // ultrareview-confirmed, real-Windows-CI-reproduced divergence from
+        // the Unix path's behavior.
+        Err(err) if should_bootstrap(&plan, &resolution) => {
+            if let Err(bootstrap_err) = bootstrap_and_register(&plan, &resolution, TofuConfirmation::AlwaysPrompt).await {
+                print_bootstrap_failure_guidance(&bootstrap_err);
+                return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
+            }
+            build_connection_intent(&resolution).context("isekai-ssh: still not trusted after auto-bootstrap")?
+        }
+        Err(err) => {
+            return Err(err.context(format!(
+                "isekai-ssh: {:?} is not set up yet — run `isekai-ssh init {}` first \
+                 (auto-bootstrap is disabled: --isekai-no-bootstrap / #@isekai bootstrap-policy never)",
+                plan.destination(),
+                plan.destination()
+            )))
+        }
+    };
     let runtime_dir = default_runtime_dir()?;
     Ok(Prepared { plan, resolution, host_config, intent, runtime_dir })
 }
@@ -151,7 +179,7 @@ pub(crate) fn prepare(args: Vec<String>) -> Result<Prepared> {
 /// this remains the single-process path it falls back to (and the only path
 /// exercised on non-Windows unit tests).
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
-    let prepared = prepare(args)?;
+    let prepared = prepare(args).await?;
     run_prepared(prepared, None).await
 }
 
