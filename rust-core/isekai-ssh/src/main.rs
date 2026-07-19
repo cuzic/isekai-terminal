@@ -16,6 +16,7 @@ mod helper_download;
 mod init;
 mod log_file;
 mod login;
+mod native;
 mod wrapper;
 
 /// Serializes tests (across `init.rs`/`wrapper.rs`) that mutate the
@@ -32,6 +33,17 @@ pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 use clap::Parser;
 
 const EXIT_OTHER_ERROR: u8 = 1;
+
+/// Exit code a mux *client* returns when it detects the owner process died
+/// mid-session (its `local-ipc-mux` connection dropped without a clean session
+/// end). Deliberately distinct from `EXIT_OTHER_ERROR` (1) and from `ssh(1)`'s
+/// own 255 ("connection lost / could not execute"), so this specific,
+/// recoverable situation — "the shared owner went away; just reconnect" — is
+/// distinguishable from both a generic error and a normal SSH connection loss.
+/// 254 is otherwise unused by this codebase's exit conventions. See
+/// `native/mux/client.rs`'s re-election model.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const EXIT_MUX_OWNER_LOST: u8 = 254;
 
 /// Larger than the OS-default *process* main thread stack, which is fixed
 /// at link time and cannot be grown at runtime -- notably 1 MiB on Windows
@@ -52,11 +64,23 @@ fn main() {
         .name("isekai-ssh-main".to_string())
         .stack_size(MAIN_WORKER_STACK_SIZE)
         .spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
+            let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .expect("failed to build tokio runtime")
-                .block_on(run())
+                .expect("failed to build tokio runtime");
+            let exit_code = runtime.block_on(run());
+            // A dropped-but-still-pending `tokio::io::stdin()` read (the shell
+            // I/O loop's stdin branch loses the race against the remote
+            // channel closing — see `native/connect.rs::run_shell_io_loop`'s
+            // module docs) keeps running on tokio's blocking pool even after
+            // this future returns. The ordinary (implicit) `Drop` for
+            // `Runtime` blocks until every outstanding blocking-pool task
+            // finishes, which for a real terminal stdin means "until the user
+            // presses another key" — exactly the hang this sidesteps.
+            // `shutdown_background()` tears the runtime down without waiting,
+            // matching `ssh(1)`'s own immediate-exit behavior.
+            runtime.shutdown_background();
+            exit_code
         })
         .expect("failed to spawn isekai-ssh main worker thread")
         .join()
@@ -76,7 +100,21 @@ async fn run() -> u8 {
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let exit_code: u8 = if wrapper::should_run_wrapper(&raw_args) {
-        match wrapper::run(raw_args).await {
+        // Windows never shells out to a real `ssh(1)` — the native path is a
+        // from-scratch `russh`-based client that never spawns Win32-OpenSSH.
+        // `native::mux::run` is the `ControlMaster`-equivalent dispatch: it
+        // becomes the owner of (or a client to) the shared connection for this
+        // resolved destination, falling back to the plain single-process
+        // `native::connect::run` path when multiplexing isn't possible. Unix/
+        // macOS keep the original `ssh(1)` ProxyCommand wrapper unchanged
+        // (`native/mod.rs`'s module docs: this module is built and unit-tested
+        // everywhere, but only ever *invoked* here).
+        #[cfg(windows)]
+        let result = native::mux::run(raw_args).await;
+        #[cfg(not(windows))]
+        let result = wrapper::run(raw_args).await;
+
+        match result {
             Ok(code) => code,
             Err(err) => {
                 // `wrapper::run` already opened `--isekai-log-file` (if given)

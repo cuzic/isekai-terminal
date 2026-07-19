@@ -349,14 +349,32 @@ fn ssh_shim_args_and_env(shim: &SshShim) -> (Vec<std::ffi::OsString>, Vec<(&'sta
 /// wrapper's own internal `ssh -G` call (`wrapper.rs::resolve_openssh_effective_config`),
 /// so both that call and the real `ssh` exec at the end of `run()` see the
 /// same resolved config.
+///
+/// **Also writes the identical `Host` blocks to `home/.ssh/config`**
+/// (creating the directory if needed), not just the shim-only throwaway
+/// file: the Windows-native path (`isekai-ssh/src/native/connect.rs::prepare`
+/// / `wrapper::resolve_for_native`) does its *own* full `openssh-config`
+/// resolution directly against `$HOME/.ssh/config` — it never shells out to
+/// `ssh(1)`, so it never sees the shim-only config the `-F` flag points at.
+/// Before this, only the shim config carried `HostName`/`Port`/`IdentityFile`,
+/// so `RusshBackend::resolve_hop` (which also calls `openssh_config::
+/// resolve_default`, exactly mirroring what real `ssh(1)` does) found no
+/// `HostName` for these fake test aliases and fell back to literally
+/// DNS-resolving the alias string itself — confirmed via a real `test-windows`
+/// CI failure (`No such host is known`) once the native path's own inline
+/// auto-bootstrap was wired up. `extra_directive_lines` lets a caller append
+/// `#@isekai ...` directive lines under the same `Host {alias}` block instead
+/// of writing a second, HostName-less block separately (which is exactly the
+/// gap that caused the failure).
 fn shim_ssh_with_bootstrap_config(
     tmp: &std::path::Path,
+    home: &std::path::Path,
     alias: &str,
     mock_sshd_addr: SocketAddr,
     key_path: &std::path::Path,
+    extra_directive_lines: &str,
 ) -> (PathBuf, std::ffi::OsString, SshShim) {
-    let config_path = tmp.join("ssh_config_bootstrap");
-    let config = format!(
+    let host_block = format!(
         "Host {alias}\n\
          \x20\x20\x20\x20HostName 127.0.0.1\n\
          \x20\x20\x20\x20Port {port}\n\
@@ -365,7 +383,7 @@ fn shim_ssh_with_bootstrap_config(
          \x20\x20\x20\x20IdentitiesOnly yes\n\
          \x20\x20\x20\x20StrictHostKeyChecking no\n\
          \x20\x20\x20\x20UserKnownHostsFile /dev/null\n\
-         \n\
+         {extra_directive_lines}\n\
          # The wrapper's auto-bootstrap step dials the *resolved*
          # bootstrap-candidate address directly (`wrapper.rs::bootstrap_and_register`),
          # not the `{alias}` alias above, so it needs its own matching block
@@ -380,7 +398,13 @@ fn shim_ssh_with_bootstrap_config(
         port = mock_sshd_addr.port(),
         key = key_path.display(),
     );
-    std::fs::write(&config_path, config).unwrap();
+
+    let config_path = tmp.join("ssh_config_bootstrap");
+    std::fs::write(&config_path, &host_block).unwrap();
+
+    let home_ssh_dir = home.join(".ssh");
+    std::fs::create_dir_all(&home_ssh_dir).unwrap();
+    std::fs::write(home_ssh_dir.join("config"), &host_block).unwrap();
 
     let bin_dir = tmp.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -408,13 +432,16 @@ fn shim_ssh_with_bootstrap_config(
 /// regresses to dialing the resolved address again, this config gives it
 /// nothing to authenticate with and the test times out/fails instead of
 /// registering.
+/// Also writes the identical `Host` block to `home/.ssh/config` — see
+/// `shim_ssh_with_bootstrap_config`'s doc comment for why the native path
+/// needs this in addition to the shim-only config.
 fn shim_ssh_with_alias_only_bootstrap_config(
     tmp: &std::path::Path,
+    home: &std::path::Path,
     alias: &str,
     mock_sshd_addr: SocketAddr,
     key_path: &std::path::Path,
 ) -> (PathBuf, std::ffi::OsString, SshShim) {
-    let config_path = tmp.join("ssh_config_bootstrap_alias_only");
     let config = format!(
         "Host {alias}\n\
          \x20\x20\x20\x20HostName 127.0.0.1\n\
@@ -427,7 +454,12 @@ fn shim_ssh_with_alias_only_bootstrap_config(
         port = mock_sshd_addr.port(),
         key = key_path.display(),
     );
-    std::fs::write(&config_path, config).unwrap();
+    let config_path = tmp.join("ssh_config_bootstrap_alias_only");
+    std::fs::write(&config_path, &config).unwrap();
+
+    let home_ssh_dir = home.join(".ssh");
+    std::fs::create_dir_all(&home_ssh_dir).unwrap();
+    std::fs::write(home_ssh_dir.join("config"), &config).unwrap();
 
     let bin_dir = tmp.join("bin-alias-only");
     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -498,7 +530,7 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
     let (_bin_dir, path_env, shim) =
-        shim_ssh_with_bootstrap_config(tmp.path(), "auto-bootstrap-host", mock_sshd_addr, &key_path);
+        shim_ssh_with_bootstrap_config(tmp.path(), &home, "auto-bootstrap-host", mock_sshd_addr, &key_path, "");
 
     // Stand-in for the isekai-helper binary: ignores its args, just emits
     // one line of valid handshake JSON — same technique as
@@ -542,7 +574,16 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     // The wrapper proceeds to exec a real `ssh` with `ProxyCommand isekai-pipe
     // connect ...` after bootstrap succeeds; that connect attempt has nothing
@@ -608,7 +649,7 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
     let (_bin_dir, path_env, shim) =
-        shim_ssh_with_alias_only_bootstrap_config(tmp.path(), "alias-only-host", mock_sshd_addr, &key_path);
+        shim_ssh_with_alias_only_bootstrap_config(tmp.path(), &home, "alias-only-host", mock_sshd_addr, &key_path);
 
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
     std::fs::write(&helper_script_path, format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n")).unwrap();
@@ -649,7 +690,16 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
@@ -697,20 +747,20 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env, shim) =
-        shim_ssh_with_bootstrap_config(tmp.path(), "remote-path-host", mock_sshd_addr, &key_path);
-
-    // The wrapper's own directive parsing falls back to `$HOME/.ssh/config`
-    // when no `-F` was passed to `isekai-ssh` itself (`wrapper.rs::config_roots`)
-    // — independent of the shim config above, which only exists to point the
-    // real `ssh(1)` invocations at the mock sshd.
-    let ssh_dir = home.join(".ssh");
-    std::fs::create_dir_all(&ssh_dir).unwrap();
-    std::fs::write(
-        ssh_dir.join("config"),
-        "Host remote-path-host\n    #@isekai remote-path ~/custom/isekai-pipe-bin\n",
-    )
-    .unwrap();
+    // The `#@isekai remote-path` directive line is appended under the same
+    // `Host remote-path-host` block `shim_ssh_with_bootstrap_config` writes
+    // to both the shim-only config and `$HOME/.ssh/config` (`wrapper.rs::
+    // config_roots` falls back to the latter when no `-F` was passed to
+    // `isekai-ssh` itself) — both the wrapper's directive parsing and the
+    // native path's own `openssh-config` resolution need to see it.
+    let (_bin_dir, path_env, shim) = shim_ssh_with_bootstrap_config(
+        tmp.path(),
+        &home,
+        "remote-path-host",
+        mock_sshd_addr,
+        &key_path,
+        "    #@isekai remote-path ~/custom/isekai-pipe-bin\n",
+    );
 
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
     std::fs::write(&helper_script_path, format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n")).unwrap();
@@ -748,7 +798,16 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
@@ -805,16 +864,14 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env, shim) =
-        shim_ssh_with_bootstrap_config(tmp.path(), "stun-directive-host", mock_sshd_addr, &key_path);
-
-    let ssh_dir = home.join(".ssh");
-    std::fs::create_dir_all(&ssh_dir).unwrap();
-    std::fs::write(
-        ssh_dir.join("config"),
-        "Host stun-directive-host\n    #@isekai stun 203.0.113.9:3478\n",
-    )
-    .unwrap();
+    let (_bin_dir, path_env, shim) = shim_ssh_with_bootstrap_config(
+        tmp.path(),
+        &home,
+        "stun-directive-host",
+        mock_sshd_addr,
+        &key_path,
+        "    #@isekai stun 203.0.113.9:3478\n",
+    );
 
     // Stand-in for the real `isekai-pipe serve` process: ignores every arg
     // except recording them for inspection, and always echoes a canned
@@ -866,7 +923,16 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
@@ -929,16 +995,14 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let (_bin_dir, path_env, shim) =
-        shim_ssh_with_bootstrap_config(tmp.path(), "bootstrap-relay-host", mock_sshd_addr, &key_path);
-
-    let ssh_dir = home.join(".ssh");
-    std::fs::create_dir_all(&ssh_dir).unwrap();
-    std::fs::write(
-        ssh_dir.join("config"),
-        "Host bootstrap-relay-host\n    #@isekai bootstrap-relay addr=203.0.113.10:443 sni=relay.example.com\n",
-    )
-    .unwrap();
+    let (_bin_dir, path_env, shim) = shim_ssh_with_bootstrap_config(
+        tmp.path(),
+        &home,
+        "bootstrap-relay-host",
+        mock_sshd_addr,
+        &key_path,
+        "    #@isekai bootstrap-relay addr=203.0.113.10:443 sni=relay.example.com\n",
+    );
 
     // Pre-seed `isekai-ssh login`'s saved token file — the wrapper has no
     // per-invocation JWT flag (unlike `init --relay-jwt-from-login`), so
@@ -995,7 +1059,16 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
@@ -1057,7 +1130,7 @@ async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
     let (_bin_dir, path_env, shim) =
-        shim_ssh_with_bootstrap_config(tmp.path(), "declined-bootstrap-host", mock_sshd_addr, &key_path);
+        shim_ssh_with_bootstrap_config(tmp.path(), &home, "declined-bootstrap-host", mock_sshd_addr, &key_path, "");
 
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
     std::fs::write(&helper_script_path, format!("#!/bin/sh\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n")).unwrap();
@@ -1097,7 +1170,11 @@ async fn wrapper_auto_bootstrap_writes_nothing_when_confirmation_is_declined() {
         .spawn()
         .expect("failed to spawn isekai-ssh");
 
-    child.stdin.take().unwrap().write_all(b"n\n").await.unwrap();
+    // See the sibling "y\n" call sites' comment for why Windows needs an
+    // extra leading "yes\n" to get past `RusshBackend`'s own host-key TOFU
+    // prompt before reaching the app-level confirmation this "n\n" declines.
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\nn\n" } else { b"n\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
         .await

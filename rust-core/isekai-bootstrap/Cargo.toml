@@ -7,6 +7,12 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 isekai-protocol = { path = "../isekai-protocol" }
 isekai-stun = { path = "../isekai-stun" }
+isekai-fs-guard = { path = "../isekai-fs-guard" }
+isekai-trust = { path = "../isekai-trust" }
+openssh-config = { path = "../openssh-config" }
+russh-stream-session = { path = "../russh-stream-session" }
+russh = "0.48"
+russh-keys = "0.48"
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["process", "io-util", "net", "rt", "sync", "time", "macros"] }
 base64 = "0.22"

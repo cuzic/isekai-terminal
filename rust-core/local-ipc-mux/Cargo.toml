@@ -1,0 +1,27 @@
+[package]
+name = "local-ipc-mux"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Exclusive single-owner local IPC channel: one sibling process on the same machine claims a named channel and becomes its owner (accepting connections from later sibling processes as clients), with a generic length-prefixed framing/relay layer on top. SSH-agnostic — no opinion on what bytes flow over it."
+readme = "README.md"
+keywords = ["ipc", "named-pipe", "multiplexer", "singleton"]
+categories = ["os", "network-programming"]
+
+[dependencies]
+async-trait = "0.1.89"
+thiserror = "2.0.18"
+tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

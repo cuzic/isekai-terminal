@@ -375,13 +375,21 @@ struct SshShim {
 ///
 /// Returns an [`SshShim`] describing how to point `isekai-ssh init` at it
 /// (`--ssh-path` + `PATH` + any extra env vars needed).
+/// Also writes the identical `Host` block to `home/.ssh/config`, not just the
+/// shim-only throwaway config — the Windows-native path
+/// (`isekai-bootstrap::russh_backend::resolve_hop`, reached via `isekai-ssh
+/// init`'s `bootstrap_and_register`) does its own `openssh_config::
+/// resolve_default` directly against `$HOME/.ssh/config`; it never shells out
+/// to `ssh(1)`, so it never sees the shim-only config the `-F` flag points
+/// at. See `wrapper_auto_bootstrap_e2e.rs::shim_ssh_with_bootstrap_config`'s
+/// doc comment (confirmed via a real `test-windows` CI failure there).
 fn shim_ssh_with_bootstrap_config(
     tmp: &std::path::Path,
+    home: &std::path::Path,
     alias: &str,
     mock_sshd_addr: SocketAddr,
     key_path: &std::path::Path,
 ) -> SshShim {
-    let config_path = tmp.join("ssh_config_bootstrap");
     let config = format!(
         "Host {alias}\n\
          \x20\x20\x20\x20HostName 127.0.0.1\n\
@@ -394,7 +402,12 @@ fn shim_ssh_with_bootstrap_config(
         port = mock_sshd_addr.port(),
         key = key_path.display(),
     );
-    std::fs::write(&config_path, config).unwrap();
+    let config_path = tmp.join("ssh_config_bootstrap");
+    std::fs::write(&config_path, &config).unwrap();
+
+    let home_ssh_dir = home.join(".ssh");
+    std::fs::create_dir_all(&home_ssh_dir).unwrap();
+    std::fs::write(home_ssh_dir.join("config"), &config).unwrap();
 
     let bin_dir = tmp.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -503,7 +516,16 @@ async fn spawn_init(
         .spawn()
         .expect("failed to spawn isekai-ssh init");
 
-    child.stdin.take().unwrap().write_all(stdin_line.as_bytes()).await.unwrap();
+    // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
+    // prompt ("Are you sure you want to continue connecting (yes/no)?")
+    // fires before the app-level "Trust this isekai-helper...? [y/N]"
+    // prompt `stdin_line` answers — unlike the Unix/`ssh(1)` path, which
+    // never asks that first question at all (`StrictHostKeyChecking no` in
+    // the shim config suppresses it). See `RusshBackend`'s module docs
+    // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
+    // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
+    let confirm_input = if cfg!(windows) { format!("yes\n{stdin_line}") } else { stdin_line.to_string() };
+    child.stdin.take().unwrap().write_all(confirm_input.as_bytes()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
         .await
         .expect("isekai-ssh init should not hang")
@@ -539,7 +561,7 @@ async fn init_then_connect_succeeds_for_a_freshly_deployed_host() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "dummy-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), &home, "dummy-host", mock_sshd_addr, &key_path);
 
     let helper_script = stand_in_helper_script(real_helper_addr, &real_helper.handshake);
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
@@ -691,7 +713,7 @@ async fn init_with_stun_server_saves_the_observed_address_to_the_trust_store() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "stun-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), &home, "stun-host", mock_sshd_addr, &key_path);
 
     let helper_script = stand_in_helper_script(real_helper_addr, &real_helper.handshake);
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
@@ -722,7 +744,9 @@ async fn init_with_stun_server_saves_the_observed_address_to_the_trust_store() {
         .stderr(StdStdio::piped())
         .spawn()
         .expect("failed to spawn isekai-ssh init");
-    child.stdin.take().unwrap().write_all(b"y\n").await.unwrap();
+    // See `spawn_init`'s comment for why Windows needs a leading "yes\n".
+    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
     let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
         .await
         .expect("isekai-ssh init should not hang")
@@ -761,7 +785,7 @@ async fn init_writes_nothing_when_confirmation_is_declined() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "dummy-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), &home, "dummy-host", mock_sshd_addr, &key_path);
 
     let helper_script = stand_in_helper_script(real_helper_addr, &real_helper.handshake);
     let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
