@@ -853,7 +853,19 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         let cellWidth = cellSize.width
         let cellHeight = cellSize.height
 
+        // タスク#98: `draw(_:)`に渡された再描画領域`rect`に実際に重なる要素だけを描く
+        // (dirty-row描画最適化の下準備。現状の呼び出し元はview全体を無効化する
+        // 引数なし`setNeedsDisplay()`しか使わないため`rect == bounds`となり、`redrawRect`は
+        // 常にbounds以上に広がり全要素が交差する=挙動は完全に不変)。全角(CJK)グリフの
+        // 右へのはみ出しや、グリフ/装飾線・カーソルがセル公称矩形を僅かに超える分を
+        // 取りこぼさないよう、交差判定はセル1つ分generousに広げた矩形で行う(はみ出しを
+        // 取りこぼしてエッジにゴミが残るより、少し多めに描く方を選ぶ)。
+        let redrawRect = rect.insetBy(dx: -cellWidth, dy: -cellHeight)
+
         for row in 0..<rows {
+            // 行band全体が再描画領域に一切重ならない行はセル走査ごとスキップする。
+            let rowRect = CGRect(x: 0, y: CGFloat(row) * cellHeight, width: CGFloat(cols) * cellWidth, height: cellHeight)
+            guard redrawRect.intersects(rowRect) else { continue }
             for col in 0..<cols {
                 let cell = update.cells[row * cols + col]
                 let x = CGFloat(col) * cellWidth
@@ -927,15 +939,18 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         // キャッシュし(Android版`SixelBitmapCache`と対称)、同じ画像を毎フレーム
         // デコードし直さない。
         for placement in update.images {
-            guard let image = sixelBitmapCache.image(for: placement) else { continue }
             let dstRect = CGRect(
                 x: CGFloat(placement.col) * cellWidth,
                 y: CGFloat(placement.row) * cellHeight,
                 width: CGFloat(placement.colsSpan) * cellWidth,
                 height: CGFloat(placement.rowsSpan) * cellHeight
             )
+            guard redrawRect.intersects(dstRect) else { continue }
+            guard let image = sixelBitmapCache.image(for: placement) else { continue }
             image.draw(in: dstRect)
         }
+        // pruneは実際に描いたかどうかに関わらず全live idを基準に走らせる(再描画領域外の
+        // 画像を消してしまわないよう、交差判定でスキップした後にも無条件で実行する)。
         sixelBitmapCache.prune(liveIds: Set(update.images.map(\.id)))
 
         // 選択範囲のハイライト(行単位)。Android版`SshTerminalCanvas.kt`はセル背景の
@@ -948,7 +963,9 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
                 UIColor.white.withAlphaComponent(120.0 / 255.0).setFill()
                 for row in startRow...endRow {
                     let y = CGFloat(row) * cellHeight
-                    UIRectFill(CGRect(x: 0, y: y, width: CGFloat(cols) * cellWidth, height: cellHeight))
+                    let selRowRect = CGRect(x: 0, y: y, width: CGFloat(cols) * cellWidth, height: cellHeight)
+                    guard redrawRect.intersects(selRowRect) else { continue }
+                    UIRectFill(selRowRect)
                 }
             }
         }
@@ -971,11 +988,14 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
             let startCol = min(Int(searchHighlight.col), cols)
             let endCol = min(startCol + Int(searchHighlight.len), cols)
             if startCol < endCol {
-                UIColor.systemYellow.withAlphaComponent(0.55).setFill()
                 let y = CGFloat(highlightRow) * cellHeight
                 let x = CGFloat(startCol) * cellWidth
                 let width = CGFloat(endCol - startCol) * cellWidth
-                UIRectFill(CGRect(x: x, y: y, width: width, height: cellHeight))
+                let highlightRect = CGRect(x: x, y: y, width: width, height: cellHeight)
+                if redrawRect.intersects(highlightRect) {
+                    UIColor.systemYellow.withAlphaComponent(0.55).setFill()
+                    UIRectFill(highlightRect)
+                }
             }
         }
 
@@ -998,7 +1018,6 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
            !(update.cursorBlink && !blinkPhaseVisible) {
             let x = CGFloat(update.cursorCol) * cellWidth
             let y = CGFloat(update.cursorRow) * cellHeight
-            UIColor.white.withAlphaComponent(0.5).setFill()
             let cursorRect: CGRect
             switch update.cursorShape {
             case .block:
@@ -1010,7 +1029,10 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
                 let thickness = max(2.0, cellWidth * 0.15)
                 cursorRect = CGRect(x: x, y: y, width: thickness, height: cellHeight)
             }
-            UIRectFill(cursorRect)
+            if redrawRect.intersects(cursorRect) {
+                UIColor.white.withAlphaComponent(0.5).setFill()
+                UIRectFill(cursorRect)
+            }
         }
     }
 

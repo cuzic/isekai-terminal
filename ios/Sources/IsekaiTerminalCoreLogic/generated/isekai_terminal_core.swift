@@ -2568,6 +2568,71 @@ public func FfiConverterTypeJumpConfig_lower(_ value: JumpConfig) -> RustBuffer 
 }
 
 
+/**
+ * 1行分の「損傷(damage)」範囲。`line`行目の`left`列から`right`列まで(両端含む)が
+ * 前回発行された`ScreenUpdate`から変化したことを表す(タスク#92、Alacrittyの
+ * `LineDamageBounds{line,left,right}`に倣った列レンジ差分)。`ScreenUpdate.dirty_rows`
+ * が`Some`の時にのみ現れ、UI層(Android/iOS)はこのレンジのセルだけを再描画すればよい。
+ * 損傷のない行はリストに含めない(`left <= right`の行のみ)。
+ */
+public struct LineDamage: Equatable, Hashable {
+    public var line: UInt16
+    public var left: UInt16
+    public var right: UInt16
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(line: UInt16, left: UInt16, right: UInt16) {
+        self.line = line
+        self.left = left
+        self.right = right
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LineDamage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLineDamage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LineDamage {
+        return
+            try LineDamage(
+                line: FfiConverterUInt16.read(from: &buf), 
+                left: FfiConverterUInt16.read(from: &buf), 
+                right: FfiConverterUInt16.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LineDamage, into buf: inout [UInt8]) {
+        FfiConverterUInt16.write(value.line, into: &buf)
+        FfiConverterUInt16.write(value.left, into: &buf)
+        FfiConverterUInt16.write(value.right, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLineDamage_lift(_ buf: RustBuffer) throws -> LineDamage {
+    return try FfiConverterTypeLineDamage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLineDamage_lower(_ value: LineDamage) -> RustBuffer {
+    return FfiConverterTypeLineDamage.lower(value)
+}
+
+
 public struct MultipathIsekaiPipeQuicConfig: Equatable, Hashable {
     /**
      * ブートストラップに使う SSH ホスト。通常は Tailscale 経由アドレス（path0）。
@@ -3169,6 +3234,18 @@ public struct ScreenUpdate: Equatable, Hashable {
      * 通常テキストキーのCSI u化は未対応(この値の交渉・公開のみ)。
      */
     public var kittyKeyboardFlags: UInt16
+    /**
+     * この`ScreenUpdate`で、前回発行時から実際に変化した行の損傷レンジ一覧
+     * (タスク#92、行単位のdamage tracking)。`None`は「全画面が損傷している=グリッド
+     * 全体を再描画せよ」を意味する(初回発行・寸法変更・スクロール等の構造的変更
+     * [タスク#93]で全画面dirtyになるケース)。`Some(vec)`ならそのレンジのセルのみ
+     * 再描画すればよく、`vec`が空なら(セル内容は前回と同一、`title`等の非グリッド
+     * フィールドだけが変わった等で)グリッドの再描画は不要。カーソル行は下地セルが
+     * 不変でも損傷として含まれる(タスク#94、iOSがカーソルをセル内容と同じ描画パスで
+     * 描くため)。UI層がまだこのフィールドを消費していない段階では、`None`扱いで
+     * 全画面再描画にフォールバックすれば従来通りの挙動になる。
+     */
+    public var dirtyRows: [LineDamage]?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3252,7 +3329,18 @@ public struct ScreenUpdate: Equatable, Hashable {
          * (詳細は[terminal_special_key_bytes]のdocコメント参照)。bit1〜4(report event
          * types/alternate keys/all keys as escape codes/associated text)およびCtrl+英字等
          * 通常テキストキーのCSI u化は未対応(この値の交渉・公開のみ)。
-         */kittyKeyboardFlags: UInt16) {
+         */kittyKeyboardFlags: UInt16, 
+        /**
+         * この`ScreenUpdate`で、前回発行時から実際に変化した行の損傷レンジ一覧
+         * (タスク#92、行単位のdamage tracking)。`None`は「全画面が損傷している=グリッド
+         * 全体を再描画せよ」を意味する(初回発行・寸法変更・スクロール等の構造的変更
+         * [タスク#93]で全画面dirtyになるケース)。`Some(vec)`ならそのレンジのセルのみ
+         * 再描画すればよく、`vec`が空なら(セル内容は前回と同一、`title`等の非グリッド
+         * フィールドだけが変わった等で)グリッドの再描画は不要。カーソル行は下地セルが
+         * 不変でも損傷として含まれる(タスク#94、iOSがカーソルをセル内容と同じ描画パスで
+         * 描くため)。UI層がまだこのフィールドを消費していない段階では、`None`扱いで
+         * 全画面再描画にフォールバックすれば従来通りの挙動になる。
+         */dirtyRows: [LineDamage]?) {
         self.cols = cols
         self.rows = rows
         self.cells = cells
@@ -3271,6 +3359,7 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.linkTable = linkTable
         self.images = images
         self.kittyKeyboardFlags = kittyKeyboardFlags
+        self.dirtyRows = dirtyRows
     }
 
     
@@ -3306,7 +3395,8 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 cursorBlink: FfiConverterBool.read(from: &buf), 
                 linkTable: FfiConverterSequenceString.read(from: &buf), 
                 images: FfiConverterSequenceTypeImagePlacement.read(from: &buf), 
-                kittyKeyboardFlags: FfiConverterUInt16.read(from: &buf)
+                kittyKeyboardFlags: FfiConverterUInt16.read(from: &buf), 
+                dirtyRows: FfiConverterOptionSequenceTypeLineDamage.read(from: &buf)
         )
     }
 
@@ -3329,6 +3419,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterSequenceString.write(value.linkTable, into: &buf)
         FfiConverterSequenceTypeImagePlacement.write(value.images, into: &buf)
         FfiConverterUInt16.write(value.kittyKeyboardFlags, into: &buf)
+        FfiConverterOptionSequenceTypeLineDamage.write(value.dirtyRows, into: &buf)
     }
 }
 
@@ -6460,6 +6551,30 @@ fileprivate struct FfiConverterOptionTypeMouseButton: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionSequenceTypeLineDamage: FfiConverterRustBuffer {
+    typealias SwiftType = [LineDamage]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeLineDamage.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeLineDamage.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
     typealias SwiftType = [UInt32]
 
@@ -6602,6 +6717,31 @@ fileprivate struct FfiConverterSequenceTypeImagePlacement: FfiConverterRustBuffe
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeImagePlacement.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLineDamage: FfiConverterRustBuffer {
+    typealias SwiftType = [LineDamage]
+
+    public static func write(_ value: [LineDamage], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLineDamage.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LineDamage] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LineDamage]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLineDamage.read(from: &buf))
         }
         return seq
     }
