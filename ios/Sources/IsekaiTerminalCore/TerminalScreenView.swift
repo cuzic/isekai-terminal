@@ -242,7 +242,7 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     public var fontScale: CGFloat = 1.0 {
         didSet {
             guard fontScale != oldValue else { return }
-            updateFontMetrics()
+            updateFontMetrics(reportSize: true)
             setNeedsDisplay()
         }
     }
@@ -333,7 +333,7 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         backgroundColor = .black
         contentMode = .redraw
         isOpaque = true
-        updateFontMetrics()
+        updateFontMetrics(reportSize: false)
 
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
         longPress.minimumPressDuration = 0.4
@@ -409,7 +409,15 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         setNeedsDisplay()
     }
 
-    private func updateFontMetrics() {
+    /// - Parameter reportSize: `true`ならcellSize更新後に[reportSizeIfNeeded]も呼ぶ
+    ///   (ピンチズーム等、既に`onSizeChanged`が呼び出し側で設定済みの経路向け)。
+    ///   `init`から呼ぶ場合は`false`を渡すこと——`init`はview構築時点でまだ呼び出し側が
+    ///   `onSizeChanged`クロージャを設定できていないため、ここで`reportSizeIfNeeded()`を
+    ///   呼ぶと`lastReportedCols`/`lastReportedRows`だけが先に確定してしまい、呼び出し側が
+    ///   `onSizeChanged`を設定した後の最初の本物の`layoutSubviews()`が「値が変わっていない」
+    ///   と誤判定されてdedupeされ、一度もコールバックが発火しないバグになる(GitHub Actions
+    ///   macOSランナーでのXCTest実行で発覚、Linux開発環境ではSwiftビルドができず見逃されていた)。
+    private func updateFontMetrics(reportSize: Bool) {
         let size = Self.baseFontSize * fontScale
         font = UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
         boldFont = UIFont.monospacedSystemFont(ofSize: size, weight: .bold)
@@ -419,7 +427,9 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
         cellSize = CGSize(width: measured.width, height: font.lineHeight)
         // タスク#20: ピンチズームでcellSizeが変わればcols/rowsも変わりうる
         // (Android版`cellDims`が`fontScale`込みの`remember`キーになっているのと対称)。
-        reportSizeIfNeeded()
+        if reportSize {
+            reportSizeIfNeeded()
+        }
     }
 
     public override func layoutSubviews() {
