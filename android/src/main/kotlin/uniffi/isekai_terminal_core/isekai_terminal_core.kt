@@ -4382,6 +4382,56 @@ public object FfiConverterTypeJumpConfig: FfiConverterRustBuffer<JumpConfig> {
 
 
 
+/**
+ * 1行分の「損傷(damage)」範囲。`line`行目の`left`列から`right`列まで(両端含む)が
+ * 前回発行された`ScreenUpdate`から変化したことを表す(タスク#92、Alacrittyの
+ * `LineDamageBounds{line,left,right}`に倣った列レンジ差分)。`ScreenUpdate.dirty_rows`
+ * が`Some`の時にのみ現れ、UI層(Android/iOS)はこのレンジのセルだけを再描画すればよい。
+ * 損傷のない行はリストに含めない(`left <= right`の行のみ)。
+ */
+data class LineDamage (
+    var `line`: kotlin.UShort
+    , 
+    var `left`: kotlin.UShort
+    , 
+    var `right`: kotlin.UShort
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeLineDamage: FfiConverterRustBuffer<LineDamage> {
+    override fun read(buf: ByteBuffer): LineDamage {
+        return LineDamage(
+            FfiConverterUShort.read(buf),
+            FfiConverterUShort.read(buf),
+            FfiConverterUShort.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: LineDamage) = (
+            FfiConverterUShort.allocationSize(value.`line`) +
+            FfiConverterUShort.allocationSize(value.`left`) +
+            FfiConverterUShort.allocationSize(value.`right`)
+    )
+
+    override fun write(value: LineDamage, buf: ByteBuffer) {
+            FfiConverterUShort.write(value.`line`, buf)
+            FfiConverterUShort.write(value.`left`, buf)
+            FfiConverterUShort.write(value.`right`, buf)
+    }
+}
+
+
+
 data class MultipathIsekaiPipeQuicConfig (
     /**
      * ブートストラップに使う SSH ホスト。通常は Tailscale 経由アドレス（path0）。
@@ -4878,6 +4928,19 @@ data class ScreenUpdate (
      * 通常テキストキーのCSI u化は未対応(この値の交渉・公開のみ)。
      */
     var `kittyKeyboardFlags`: kotlin.UShort
+    , 
+    /**
+     * この`ScreenUpdate`で、前回発行時から実際に変化した行の損傷レンジ一覧
+     * (タスク#92、行単位のdamage tracking)。`None`は「全画面が損傷している=グリッド
+     * 全体を再描画せよ」を意味する(初回発行・寸法変更・スクロール等の構造的変更
+     * [タスク#93]で全画面dirtyになるケース)。`Some(vec)`ならそのレンジのセルのみ
+     * 再描画すればよく、`vec`が空なら(セル内容は前回と同一、`title`等の非グリッド
+     * フィールドだけが変わった等で)グリッドの再描画は不要。カーソル行は下地セルが
+     * 不変でも損傷として含まれる(タスク#94、iOSがカーソルをセル内容と同じ描画パスで
+     * 描くため)。UI層がまだこのフィールドを消費していない段階では、`None`扱いで
+     * 全画面再描画にフォールバックすれば従来通りの挙動になる。
+     */
+    var `dirtyRows`: List<LineDamage>?
     
 ){
     
@@ -4912,6 +4975,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterSequenceString.read(buf),
             FfiConverterSequenceTypeImagePlacement.read(buf),
             FfiConverterUShort.read(buf),
+            FfiConverterOptionalSequenceTypeLineDamage.read(buf),
         )
     }
 
@@ -4933,7 +4997,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.allocationSize(value.`cursorBlink`) +
             FfiConverterSequenceString.allocationSize(value.`linkTable`) +
             FfiConverterSequenceTypeImagePlacement.allocationSize(value.`images`) +
-            FfiConverterUShort.allocationSize(value.`kittyKeyboardFlags`)
+            FfiConverterUShort.allocationSize(value.`kittyKeyboardFlags`) +
+            FfiConverterOptionalSequenceTypeLineDamage.allocationSize(value.`dirtyRows`)
     )
 
     override fun write(value: ScreenUpdate, buf: ByteBuffer) {
@@ -4955,6 +5020,7 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterSequenceString.write(value.`linkTable`, buf)
             FfiConverterSequenceTypeImagePlacement.write(value.`images`, buf)
             FfiConverterUShort.write(value.`kittyKeyboardFlags`, buf)
+            FfiConverterOptionalSequenceTypeLineDamage.write(value.`dirtyRows`, buf)
     }
 }
 
@@ -7474,6 +7540,38 @@ public object FfiConverterOptionalTypeMouseButton: FfiConverterRustBuffer<MouseB
 /**
  * @suppress
  */
+public object FfiConverterOptionalSequenceTypeLineDamage: FfiConverterRustBuffer<List<LineDamage>?> {
+    override fun read(buf: ByteBuffer): List<LineDamage>? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterSequenceTypeLineDamage.read(buf)
+    }
+
+    override fun allocationSize(value: List<LineDamage>?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterSequenceTypeLineDamage.allocationSize(value)
+        }
+    }
+
+    override fun write(value: List<LineDamage>?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterSequenceTypeLineDamage.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceUInt: FfiConverterRustBuffer<List<kotlin.UInt>> {
     override fun read(buf: ByteBuffer): List<kotlin.UInt> {
         val len = buf.getInt()
@@ -7632,6 +7730,34 @@ public object FfiConverterSequenceTypeImagePlacement: FfiConverterRustBuffer<Lis
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeImagePlacement.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeLineDamage: FfiConverterRustBuffer<List<LineDamage>> {
+    override fun read(buf: ByteBuffer): List<LineDamage> {
+        val len = buf.getInt()
+        return List<LineDamage>(len) {
+            FfiConverterTypeLineDamage.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<LineDamage>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeLineDamage.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<LineDamage>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeLineDamage.write(it, buf)
         }
     }
 }
