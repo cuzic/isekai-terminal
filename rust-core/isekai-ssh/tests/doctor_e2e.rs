@@ -234,8 +234,17 @@ fn expose_msys_dll_next_to(shim_path: &std::path::Path, real_ssh: &std::path::Pa
     }
 }
 
-fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, alias: &str, mock_sshd_addr: SocketAddr, key_path: &std::path::Path) -> SshShim {
-    let config_path = tmp.join("ssh_config_bootstrap");
+/// Also writes the identical `Host` blocks to `home/.ssh/config`, not just the
+/// shim-only throwaway config: the Windows-native path
+/// (`isekai-bootstrap::russh_backend::resolve_hop`, reached via `doctor
+/// --fix`'s `bootstrap_and_register`) does its own `openssh_config::
+/// resolve_default` directly against `$HOME/.ssh/config` — it never shells
+/// out to `ssh(1)`, so it never sees the shim-only config the `-F` flag
+/// points at. Without this, `RusshBackend` finds no `HostName` for the fake
+/// test alias and falls back to DNS-resolving the literal alias string
+/// (confirmed via a real `test-windows` CI failure on the sibling
+/// `wrapper_auto_bootstrap_e2e.rs` fixture, which this mirrors).
+fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, home: &std::path::Path, alias: &str, mock_sshd_addr: SocketAddr, key_path: &std::path::Path) -> SshShim {
     let config = format!(
         "Host {alias}\n\
          \x20\x20\x20\x20HostName 127.0.0.1\n\
@@ -256,7 +265,12 @@ fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, alias: &str, mock_sshd_
         port = mock_sshd_addr.port(),
         key = key_path.display(),
     );
-    std::fs::write(&config_path, config).unwrap();
+    let config_path = tmp.join("ssh_config_bootstrap");
+    std::fs::write(&config_path, &config).unwrap();
+
+    let home_ssh_dir = home.join(".ssh");
+    std::fs::create_dir_all(&home_ssh_dir).unwrap();
+    std::fs::write(home_ssh_dir.join("config"), &config).unwrap();
 
     let bin_dir = tmp.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -450,7 +464,7 @@ async fn doctor_fixes_stale_trust_when_given_fix_flag() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "doctor-fix-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), &home, "doctor-fix-host", mock_sshd_addr, &key_path);
 
     let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();

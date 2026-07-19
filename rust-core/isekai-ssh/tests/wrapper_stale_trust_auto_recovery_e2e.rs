@@ -300,9 +300,11 @@ fn expose_msys_dll_next_to(shim_path: &std::path::Path, real_ssh: &std::path::Pa
     }
 }
 
-/// Same shape as `wrapper_auto_bootstrap_e2e.rs::shim_ssh_with_bootstrap_config`.
-fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, alias: &str, mock_sshd_addr: SocketAddr, key_path: &std::path::Path) -> SshShim {
-    let config_path = tmp.join("ssh_config_bootstrap");
+/// Same shape as `wrapper_auto_bootstrap_e2e.rs::shim_ssh_with_bootstrap_config`,
+/// including also writing the identical `Host` blocks to `home/.ssh/config`
+/// for the Windows-native path's own `openssh_config` resolution (see that
+/// function's doc comment; confirmed via a real `test-windows` CI failure).
+fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, home: &std::path::Path, alias: &str, mock_sshd_addr: SocketAddr, key_path: &std::path::Path) -> SshShim {
     let config = format!(
         "Host {alias}\n\
          \x20\x20\x20\x20HostName 127.0.0.1\n\
@@ -323,7 +325,12 @@ fn shim_ssh_with_bootstrap_config(tmp: &std::path::Path, alias: &str, mock_sshd_
         port = mock_sshd_addr.port(),
         key = key_path.display(),
     );
-    std::fs::write(&config_path, config).unwrap();
+    let config_path = tmp.join("ssh_config_bootstrap");
+    std::fs::write(&config_path, &config).unwrap();
+
+    let home_ssh_dir = home.join(".ssh");
+    std::fs::create_dir_all(&home_ssh_dir).unwrap();
+    std::fs::write(home_ssh_dir.join("config"), &config).unwrap();
 
     let bin_dir = tmp.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -449,7 +456,7 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "stale-trust-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), &home, "stale-trust-host", mock_sshd_addr, &key_path);
 
     // A real, currently-running isekai-pipe serve -- the "already deployed"
     // helper whose cached trust material has gone stale.
@@ -577,7 +584,7 @@ async fn wrapper_does_not_auto_recover_when_no_bootstrap_is_set() {
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "stale-no-recover-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), &home, "stale-no-recover-host", mock_sshd_addr, &key_path);
 
     let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
@@ -654,7 +661,7 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
 
     let home = tmp.path().join("client-home");
     std::fs::create_dir_all(&home).unwrap();
-    let shim = shim_ssh_with_bootstrap_config(tmp.path(), "unreachable-host", mock_sshd_addr, &key_path);
+    let shim = shim_ssh_with_bootstrap_config(tmp.path(), &home, "unreachable-host", mock_sshd_addr, &key_path);
 
     // A `helper_addr` with nothing listening: bind a UDP socket, note its
     // port, then drop it immediately -- any QUIC dial to it gets no

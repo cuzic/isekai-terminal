@@ -376,9 +376,26 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
     std::fs::create_dir_all(&home).unwrap();
     let shim = shim_ssh_with_bootstrap_config(tmp.path(), "brand-new-host", mock_sshd_addr, &key_path);
 
-    // The *only* config this test relies on for bootstrap parameters: a
-    // `Host *` catch-all, not a block matching `brand-new-host` specifically
-    // — proving the default applies to a host nobody configured by name.
+    // The *only* config this test relies on for `#@isekai` bootstrap
+    // parameters: a `Host *` catch-all, not a block matching
+    // `brand-new-host` specifically — proving the default applies to a host
+    // nobody configured by name. `Host *` carries no standard SSH keywords
+    // (`openssh_config::resolve` only sees `#@isekai`-prefixed comment
+    // lines here, which its own parser ignores — those are parsed
+    // separately by the wrapper's isekai-directive resolver), so it cannot
+    // supply `HostName`/`Port`/etc.
+    //
+    // A separate `Host brand-new-host` block *does* need to carry those —
+    // not just in `shim_ssh_with_bootstrap_config`'s shim-only throwaway
+    // config, but here in `$HOME/.ssh/config` too: the Windows-native path
+    // (`isekai-bootstrap::russh_backend::resolve_hop`, reached via
+    // `bootstrap_and_register`) does its own `openssh_config::
+    // resolve_default` directly against this file and never shells out to
+    // `ssh(1)`, so it never sees the shim-only config the `-F` flag points
+    // at (see `wrapper_auto_bootstrap_e2e.rs::shim_ssh_with_bootstrap_config`'s
+    // doc comment; confirmed via a real `test-windows` CI failure there).
+    // This block and `Host *` are independent (no keyword overlap), so
+    // their order doesn't matter.
     let ssh_dir = home.join(".ssh");
     std::fs::create_dir_all(&ssh_dir).unwrap();
     // `~/deployed-isekai-pipe` (not an absolute local path): the mock sshd
@@ -391,7 +408,20 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
     // path — confirmed via a real `test-windows` CI failure.
     std::fs::write(
         ssh_dir.join("config"),
-        "Host *\n    #@isekai bootstrap-relay addr=203.0.113.10:443 sni=relay.example.com\n    #@isekai remote-path ~/deployed-isekai-pipe\n",
+        format!(
+            "Host brand-new-host\n\
+             \x20\x20\x20\x20HostName 127.0.0.1\n\
+             \x20\x20\x20\x20Port {port}\n\
+             \x20\x20\x20\x20User tester\n\
+             \x20\x20\x20\x20IdentityFile {key}\n\
+             \x20\x20\x20\x20IdentitiesOnly yes\n\
+             \x20\x20\x20\x20StrictHostKeyChecking no\n\
+             \x20\x20\x20\x20UserKnownHostsFile /dev/null\n\
+             \n\
+             Host *\n    #@isekai bootstrap-relay addr=203.0.113.10:443 sni=relay.example.com\n    #@isekai remote-path ~/deployed-isekai-pipe\n",
+            port = mock_sshd_addr.port(),
+            key = key_path.display(),
+        ),
     )
     .unwrap();
 
