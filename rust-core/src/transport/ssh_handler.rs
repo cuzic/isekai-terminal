@@ -1050,9 +1050,37 @@ mod pooling_e2e_tests {
                 session.close(channel)?;
                 return Ok(());
             }
+            // 高速flood(catで巨大ファイルを吐き出すシナリオ相当)を模す特殊トリガー。
+            // `__test_flood__:<N>`を受けたらN行を1行=1回の`session.data()`呼び出しで
+            // 個別に送り返す——クライアント側で多数の独立した`TransportEvent::Stdout`
+            // として届かせ、RepaintThrottle(kittyのrepaint_delay相当)のcoalescing
+            // 挙動を検証する負荷を生成する。`__test_flood_sync__:<N>`はDEC同期出力
+            // (`?2026h`/`?2026l`)で挟んだ版。
+            if let Some(n) = parse_test_flood_trigger(data, b"__test_flood__:") {
+                for i in 0..n {
+                    let line = format!("flood-line-{i:05}\r\n");
+                    session.data(channel, CryptoVec::from(line.into_bytes()))?;
+                }
+                return Ok(());
+            }
+            if let Some(n) = parse_test_flood_trigger(data, b"__test_flood_sync__:") {
+                session.data(channel, CryptoVec::from(b"\x1b[?2026h".to_vec()))?;
+                for i in 0..n {
+                    let line = format!("sync-line-{i:05}\r\n");
+                    session.data(channel, CryptoVec::from(line.into_bytes()))?;
+                }
+                session.data(channel, CryptoVec::from(b"\x1b[?2026l".to_vec()))?;
+                return Ok(());
+            }
             session.data(channel, CryptoVec::from(data.to_vec()))?;
             Ok(())
         }
+    }
+
+    /// `prefix:<N>`形式のテスト用トリガーを解析する(`__test_flood__:500`等)。
+    fn parse_test_flood_trigger(data: &[u8], prefix: &[u8]) -> Option<usize> {
+        let rest = data.strip_prefix(prefix)?;
+        std::str::from_utf8(rest).ok()?.trim().parse().ok()
     }
 
     async fn spawn_counting_echo_server(auth_count: Arc<AtomicUsize>) -> SocketAddr {
@@ -1528,6 +1556,157 @@ mod pooling_e2e_tests {
             wait_echo(&mut rx_b, b"still-here").await;
 
             orch_b.disconnect();
+        });
+    }
+
+    // ── 高速flood時のScreenUpdate間引き(RepaintThrottle)のe2eテスト ──────
+
+    /// [FloodTestCallback]用の`on_screen_update`呼び出し記録。実SSH接続(このモジュールの
+    /// in-processサーバ)からTransportEvent経由でsession_event_loopまで通した状態で、
+    /// `RepaintThrottle`による間引きが実際に効くこと・最終画面が壊れないことを検証する
+    /// ためのテスト専用コールバック(既存の`TestCallback`は`on_screen_update`を無視する
+    /// ので、フィールド追加による他テストへの影響を避けて別構造体にした)。
+    struct FloodTestCallback {
+        tx: UnboundedSender<TestEvent>,
+        screen_update_count: Arc<AtomicUsize>,
+        last_screen_update: Arc<Mutex<Option<ScreenUpdate>>>,
+    }
+
+    impl OrchestratorCallback for FloodTestCallback {
+        fn on_connection_state_changed(&self, state: ConnectionPublicState) {
+            let _ = self.tx.send(TestEvent::Connection(state));
+        }
+        fn on_screen_update(&self, update: ScreenUpdate) {
+            self.screen_update_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_screen_update.lock() = Some(update);
+        }
+        fn on_host_key(&self, _host: String, _port: u16, _fingerprint: String) -> bool { true }
+        fn on_data(&self, data: Vec<u8>) {
+            let _ = self.tx.send(TestEvent::Data(data));
+        }
+        fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
+        fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
+        fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
+        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
+        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
+        fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+    }
+
+    /// flood(生の`TestEvent::Data`)がクライアント側に一通り届き終えたと判断できるまで
+    /// 待つ。最後の行のマーカー文字列が`on_data`経由の生ログに出現するのを待つだけで、
+    /// `on_screen_update`側のタイミングには依存しない(間引きの検証はそちらで別途行う)。
+    async fn wait_flood_done(rx: &mut UnboundedReceiver<TestEvent>, last_line_marker: &str) {
+        let mut got = Vec::new();
+        for _ in 0..200 {
+            if String::from_utf8_lossy(&got).contains(last_line_marker) {
+                return;
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(TestEvent::Data(data))) => got.extend_from_slice(&data),
+                Ok(Some(TestEvent::Connection(ConnectionPublicState::Disconnected { reason, .. }))) => {
+                    panic!("connection disconnected while waiting for flood to finish: {reason:?}");
+                }
+                _ => continue,
+            }
+        }
+        panic!(
+            "did not observe flood terminator {:?} within timeout, got {} bytes",
+            last_line_marker, got.len(),
+        );
+    }
+
+    /// 高速flood(catで巨大ファイルを吐き出すシナリオ相当)を実SSH接続(この
+    /// モジュールのin-processサーバ)からsession_event_loopまで通し、`on_screen_update`
+    /// の呼び出し回数が投入行数を大きく下回ること、かつ最終的な可視画面の内容が
+    /// 正しい(floodの最終行が画面に反映されている)ことを検証する。
+    #[test]
+    fn flood_output_coalesces_screen_updates_but_final_screen_is_correct() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let screen_update_count = Arc::new(AtomicUsize::new(0));
+            let last_screen_update: Arc<Mutex<Option<ScreenUpdate>>> = Arc::new(Mutex::new(None));
+            let orch = create_session_orchestrator(Box::new(FloodTestCallback {
+                tx,
+                screen_update_count: screen_update_count.clone(),
+                last_screen_update: last_screen_update.clone(),
+            }));
+            orch.connect(ssh_config(addr, key_auth(200))).expect("connect should not fail synchronously");
+            wait_connected(&mut rx).await;
+
+            let n: usize = 500;
+            orch.send(format!("__test_flood__:{n}").into_bytes());
+            wait_flood_done(&mut rx, &format!("flood-line-{:05}", n - 1)).await;
+            // 間引かれた最後のフレームがタイマー発火で発行されるのを待つ(仮想時間では
+            // なく実時間のテストなので、REPAINT_MIN_INTERVAL分だけ余裕を持って待つ)。
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let calls = screen_update_count.load(Ordering::SeqCst);
+            assert!(
+                calls < n,
+                "expected far fewer on_screen_update calls ({calls}) than flooded lines ({n})"
+            );
+            assert!(calls >= 1, "at least the final coalesced frame must be emitted");
+
+            let last = last_screen_update.lock().clone().expect("at least one ScreenUpdate must have been captured");
+            let visible: String = last.cells.iter().map(|c| c.ch.as_str()).collect();
+            assert!(
+                visible.contains(&format!("flood-line-{:05}", n - 1)),
+                "final visible screen must contain the last flooded line, got: {visible:?}"
+            );
+            assert!((last.cursor_row as usize) < last.rows as usize, "cursor_row must stay within the grid");
+            assert!((last.cursor_col as usize) <= last.cols as usize, "cursor_col must stay within the grid");
+
+            orch.disconnect();
+        });
+    }
+
+    /// DEC同期出力(`?2026h`/`?2026l`)区間をまたぐfloodでも、RepaintThrottleの
+    /// 間引きと衝突せず最終画面が正しく反映されることを検証する(safety-netタイマー
+    /// との共存確認)。
+    #[test]
+    fn flood_output_wrapped_in_synchronized_output_still_flushes_correctly() {
+        crate::init_logger();
+        let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+        rt.block_on(async {
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            let addr = spawn_counting_echo_server(auth_count.clone()).await;
+
+            let (tx, mut rx) = unbounded_channel::<TestEvent>();
+            let screen_update_count = Arc::new(AtomicUsize::new(0));
+            let last_screen_update: Arc<Mutex<Option<ScreenUpdate>>> = Arc::new(Mutex::new(None));
+            let orch = create_session_orchestrator(Box::new(FloodTestCallback {
+                tx,
+                screen_update_count: screen_update_count.clone(),
+                last_screen_update: last_screen_update.clone(),
+            }));
+            orch.connect(ssh_config(addr, key_auth(201))).expect("connect should not fail synchronously");
+            wait_connected(&mut rx).await;
+
+            let n: usize = 300;
+            orch.send(format!("__test_flood_sync__:{n}").into_bytes());
+            wait_flood_done(&mut rx, &format!("sync-line-{:05}", n - 1)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let calls = screen_update_count.load(Ordering::SeqCst);
+            assert!(calls >= 1, "at least one ScreenUpdate must be emitted after ?2026l flushes");
+
+            let last = last_screen_update.lock().clone().expect("at least one ScreenUpdate must have been captured");
+            let visible: String = last.cells.iter().map(|c| c.ch.as_str()).collect();
+            assert!(
+                visible.contains(&format!("sync-line-{:05}", n - 1)),
+                "final visible screen must contain the last synchronized-output line, got: {visible:?}"
+            );
+
+            orch.disconnect();
         });
     }
 }
