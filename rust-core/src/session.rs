@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 use parking_lot::Mutex;
@@ -29,6 +29,132 @@ const SYNC_OUTPUT_SAFETY_TIMEOUT: Duration = Duration::from_millis(250);
 /// ようにするため。
 fn sync_output_timeout_is_current(fired_generation: u64, armed_generation: Option<u64>) -> bool {
     armed_generation == Some(fired_generation)
+}
+
+// ── RepaintThrottle ──────────────────────────────────────
+
+/// `make_screen_update`計算 + `on_screen_update`コールバック発火の頻度を、
+/// ディスプレイの実効フレームレート程度に間引くための状態機械
+/// (kittyの`repaint_delay`相当。参照: PLAN.md 該当Phase)。VTEパース自体
+/// (`state.on_stdout`)は間引かない——端末状態は常に最新でなければならず、
+/// 間引いてよいのは「画面をUI/UniFFI越しに反映する頻度」だけ。
+///
+/// リーディングエッジ(アイドル直後の1発は即時発行)+トレーリングエッジ
+/// (連続dirty中は最後の1回だけ`min_interval`後に発行)方式。これにより通常の
+/// タイピングのようなスパースな入力では追加レイテンシがゼロのまま、flood時
+/// だけ間引きが効く。
+struct RepaintThrottle {
+    min_interval: Duration,
+    last_emit: Option<Instant>,
+    armed_deadline: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RepaintDecision {
+    /// アイドル状態からのdirty。即座に`make_screen_update`+コールバックしてよい。
+    EmitNow,
+    /// `min_interval`内の2回目以降のdirty。指定deadlineでタイマーをarmすること。
+    Arm(Instant),
+    /// 既にタイマーがarmされている。何もしなくてよい(発火を待つ)。
+    AlreadyArmed,
+}
+
+const REPAINT_MIN_INTERVAL: Duration = Duration::from_millis(16);
+
+impl RepaintThrottle {
+    fn new(min_interval: Duration) -> Self {
+        RepaintThrottle { min_interval, last_emit: None, armed_deadline: None }
+    }
+
+    /// `screen_dirty`なバッチを処理した直後に呼ぶ。
+    fn on_dirty(&mut self, now: Instant) -> RepaintDecision {
+        if self.armed_deadline.is_some() {
+            return RepaintDecision::AlreadyArmed;
+        }
+        match self.last_emit {
+            Some(t) if now < t + self.min_interval => {
+                let deadline = t + self.min_interval;
+                self.armed_deadline = Some(deadline);
+                RepaintDecision::Arm(deadline)
+            }
+            _ => RepaintDecision::EmitNow,
+        }
+    }
+
+    /// 実際に`on_screen_update`を発行した直後に呼ぶ(`EmitNow`経路・タイマー
+    /// 発火経路の両方から)。
+    fn note_emitted(&mut self, now: Instant) {
+        self.last_emit = Some(now);
+        self.armed_deadline = None;
+    }
+
+    fn timer_armed(&self) -> bool {
+        self.armed_deadline.is_some()
+    }
+}
+
+impl Default for RepaintThrottle {
+    fn default() -> Self {
+        RepaintThrottle::new(REPAINT_MIN_INTERVAL)
+    }
+}
+
+#[cfg(test)]
+mod repaint_throttle_tests {
+    use super::*;
+
+    #[test]
+    fn idle_dirty_emits_immediately() {
+        let mut t = RepaintThrottle::new(Duration::from_millis(16));
+        let now = Instant::now();
+        assert_eq!(t.on_dirty(now), RepaintDecision::EmitNow);
+    }
+
+    #[test]
+    fn second_dirty_within_min_interval_arms_remaining_time() {
+        let mut t = RepaintThrottle::new(Duration::from_millis(16));
+        let t0 = Instant::now();
+        assert_eq!(t.on_dirty(t0), RepaintDecision::EmitNow);
+        t.note_emitted(t0);
+
+        let t1 = t0 + Duration::from_millis(5);
+        let deadline = t0 + Duration::from_millis(16);
+        assert_eq!(t.on_dirty(t1), RepaintDecision::Arm(deadline));
+    }
+
+    #[test]
+    fn dirty_while_already_armed_is_a_noop_decision() {
+        let mut t = RepaintThrottle::new(Duration::from_millis(16));
+        let t0 = Instant::now();
+        t.on_dirty(t0);
+        t.note_emitted(t0);
+
+        let t1 = t0 + Duration::from_millis(3);
+        t.on_dirty(t1); // arms
+        assert!(t.timer_armed());
+
+        let t2 = t0 + Duration::from_millis(9);
+        assert_eq!(t.on_dirty(t2), RepaintDecision::AlreadyArmed);
+    }
+
+    #[test]
+    fn note_emitted_disarms_and_next_dirty_after_interval_emits_immediately() {
+        let mut t = RepaintThrottle::new(Duration::from_millis(16));
+        let t0 = Instant::now();
+        t.on_dirty(t0);
+        t.note_emitted(t0);
+
+        let t1 = t0 + Duration::from_millis(5);
+        t.on_dirty(t1); // arms
+        assert!(t.timer_armed());
+
+        let fire_at = t0 + Duration::from_millis(16);
+        t.note_emitted(fire_at);
+        assert!(!t.timer_armed());
+
+        let t2 = fire_at + Duration::from_millis(17);
+        assert_eq!(t.on_dirty(t2), RepaintDecision::EmitNow);
+    }
 }
 
 // ── TermCell → 公開型変換（session 層の責務）────────────
@@ -492,6 +618,15 @@ pub(crate) async fn session_event_loop(
     let mut sync_output_timer_generation: u64 = 0;
     let mut sync_output_armed_generation: Option<u64> = None;
 
+    // 画面反映(`make_screen_update`+`on_screen_update`)の間引き(kittyの
+    // `repaint_delay`相当、[RepaintThrottle]参照)。armされたら`repaint`を
+    // deadlineへ`reset`し、`select!`のrepaintアームが発火したときだけ
+    // 実際に画面を発行する。`sleep(0)`で初期化(未armなので`timer_armed()`
+    // ガードにより最初のポーリングでは発火しない)。
+    let mut repaint_throttle = RepaintThrottle::default();
+    let repaint_timer = tokio::time::sleep(Duration::from_secs(0));
+    tokio::pin!(repaint_timer);
+
     'outer: loop {
         let result: Option<ProcessResult> = tokio::select! {
             event = event_rx.recv() => match event {
@@ -594,6 +729,10 @@ pub(crate) async fn session_event_loop(
                 Some(_) => None,
                 None => None,
             },
+            () = &mut repaint_timer, if repaint_throttle.timer_armed() => {
+                emit_screen_update(&mut state, &callback, &mut repaint_throttle, Instant::now());
+                None
+            }
         };
 
         // DEC Synchronized Output(`?2026`)のsafety-netタイマーのarm/disarm。上の
@@ -622,19 +761,25 @@ pub(crate) async fn session_event_loop(
 
         if let Some(r) = result {
             let clipboard_pull_requested = r.clipboard_pull_requested;
-            // `ScreenUpdate`(行単位dirty diffを含む)の生成は`SessionState`が前回
-            // 発行スナップショットとの差分を取る必要があるため、`state`を`&mut`で
-            // 触れるこのループ側で先に計算し、`dispatch_result`(scrollback/side
-            // effectsを消費する同期関数)には出来上がった`Option<ScreenUpdate>`を
-            // 渡す(タスク#92)。`screen_dirty`でないバッチではスナップショットを
-            // 更新しない——画面が変化していない=前回スナップショットが有効なため。
-            let screen_update = if r.screen_dirty {
-                Some(state.make_screen_update())
-            } else {
-                None
-            };
-            dispatch_result(r, &mut timer_rt, &transport_cmd_tx, &callback,
-                            screen_update, &scrollback);
+            // 画面反映(`make_screen_update`+`on_screen_update`)は
+            // `RepaintThrottle`(kittyの`repaint_delay`相当)で間引く——`state`が
+            // `screen_dirty`を返した全バッチが即座に発行されるわけではない。
+            // `screen_dirty`でないバッチではスナップショットを更新しない
+            // (画面が変化していない=前回スナップショットが有効なため)。
+            // タイマー・scrollback・side effects・clipboard(`dispatch_result`が
+            // 処理するもの)はこの間引きの対象外で、従来どおり即時処理する。
+            if r.screen_dirty {
+                match repaint_throttle.on_dirty(Instant::now()) {
+                    RepaintDecision::EmitNow => {
+                        emit_screen_update(&mut state, &callback, &mut repaint_throttle, Instant::now());
+                    }
+                    RepaintDecision::Arm(deadline) => {
+                        repaint_timer.as_mut().reset(tokio::time::Instant::from_std(deadline));
+                    }
+                    RepaintDecision::AlreadyArmed => {}
+                }
+            }
+            dispatch_result(r, &mut timer_rt, &transport_cmd_tx, &callback, &scrollback);
             if clipboard_pull_requested {
                 // Fetching the current Android clipboard text needs a Kotlin
                 // round trip (`on_host_key`/`on_agent_sign_request`'s same
@@ -662,13 +807,32 @@ pub(crate) async fn session_event_loop(
     }
 }
 
-/// ProcessResult をすべて処理する（タイマー・scrollback・副作用・画面更新）
+/// `make_screen_update`を計算し`on_screen_update`コールバックへ渡す。
+/// `RepaintThrottle`が`EmitNow`を返した経路(`session_event_loop`本体)と、
+/// armされたタイマーが発火した経路(`select!`内)の両方から呼ばれる——画面発行は
+/// 必ずこの関数を通り、`throttle.note_emitted`で発行時刻を記録する。
+fn emit_screen_update(
+    state: &mut SessionState,
+    callback: &Arc<dyn SessionCallback>,
+    throttle: &mut RepaintThrottle,
+    now: Instant,
+) {
+    let upd = state.make_screen_update();
+    debug!("screen: update {}x{} cursor=({},{}) dirty_rows={:?}",
+        upd.cols, upd.rows, upd.cursor_col, upd.cursor_row,
+        upd.dirty_rows.as_ref().map(Vec::len));
+    callback.on_screen_update(upd);
+    throttle.note_emitted(now);
+}
+
+/// ProcessResult をすべて処理する（タイマー・scrollback・副作用）。画面更新の
+/// 発行は`RepaintThrottle`により間引かれるため、ここでは扱わない
+/// (`emit_screen_update`を参照、呼び出し元の`session_event_loop`が別途呼ぶ)。
 fn dispatch_result(
     r: ProcessResult,
     timer_rt: &mut TokioTimerRuntime,
     transport_cmd_tx: &tokio::sync::mpsc::Sender<TransportCommand>,
     callback: &Arc<dyn SessionCallback>,
-    screen_update: Option<ScreenUpdate>,
     scrollback: &Arc<Mutex<VecDeque<Vec<TermCell>>>>,
 ) {
     for cmd in r.timer_cmds {
@@ -719,13 +883,6 @@ fn dispatch_result(
                 callback.on_trzsz_finished(transfer_id, success, message);
             }
         }
-    }
-
-    if let Some(upd) = screen_update {
-        debug!("screen: update {}x{} cursor=({},{}) dirty_rows={:?}",
-            upd.cols, upd.rows, upd.cursor_col, upd.cursor_row,
-            upd.dirty_rows.as_ref().map(Vec::len));
-        callback.on_screen_update(upd);
     }
 
     // OSC 52 クリップボード書き込み(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。opt-inかどうかの
@@ -1410,8 +1567,9 @@ mod tests {
             pending_clipboard_write: None,
             clipboard_pull_requested: false,
         };
-        // screen_dirtyでないバッチなのでscreen_updateはNone(scrollbackトリミングのみ検証)。
-        dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, None, &scrollback);
+        // dispatch_resultはscrollback/side effectsのみを扱う(画面発行は
+        // emit_screen_update側の責務なのでここでは検証不要)。
+        dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, &scrollback);
 
         let sb = scrollback.lock();
         assert_eq!(sb.len(), SCROLLBACK_LIMIT, "should be capped at SCROLLBACK_LIMIT, not left at +3 over");
@@ -1419,5 +1577,137 @@ mod tests {
             sb.iter().all(|r| r[0].ch != "Z"),
             "the oldest row (back of the deque) must be the one evicted, not an arbitrary one"
         );
+    }
+}
+
+/// `session_event_loop`本体への`RepaintThrottle`統合(kittyの`repaint_delay`
+/// 相当)の決定的な統合テスト。`tokio::time::pause`で仮想時間を制御し、
+/// 「アイドル時は即時発行(タイピングレイテンシ回帰なし)」「flood時は間引かれる」
+/// 「発行された`update_seq`は単調増加で欠けが無い」を検証する。
+#[cfg(test)]
+mod session_event_loop_tests {
+    use super::*;
+
+    struct RecordingSessionCallback {
+        updates: Mutex<Vec<ScreenUpdate>>,
+    }
+
+    impl RecordingSessionCallback {
+        fn new() -> Self {
+            RecordingSessionCallback { updates: Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl SessionCallback for RecordingSessionCallback {
+        fn on_data(&self, _data: Vec<u8>) {}
+        fn on_host_key(&self, _fingerprint: String) -> bool { true }
+        fn on_connected(&self) {}
+        fn on_disconnected(&self, _reason: Option<String>) {}
+        fn on_screen_update(&self, update: ScreenUpdate) { self.updates.lock().push(update); }
+        fn on_trzsz_request(&self, _transfer_id: String, _mode: String, _suggested_name: Option<String>, _expected_size: Option<u64>) {}
+        fn on_trzsz_download_chunk(&self, _transfer_id: String, _data: Vec<u8>, _is_last: bool) {}
+        fn on_trzsz_progress(&self, _transfer_id: String, _transferred: u64, _total: Option<u64>) {}
+        fn on_trzsz_finished(&self, _transfer_id: String, _success: bool, _message: Option<String>) {}
+        fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
+        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
+    }
+
+    /// アイドル状態(直前の発行から`REPAINT_MIN_INTERVAL`以上経過)でのstdoutは、
+    /// リーディングエッジとして即座に1回`on_screen_update`が発行されること
+    /// (タイピング直後のエコー表示にタイマー分の追加レイテンシが乗らないことの
+    /// 回帰防止)。
+    #[tokio::test(start_paused = true)]
+    async fn idle_stdout_emits_screen_update_immediately() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<TransportEvent>(64);
+        let (_session_cmd_tx, session_cmd_rx) = tokio::sync::mpsc::channel(1);
+        let (transport_cmd_tx, _transport_cmd_rx) = tokio::sync::mpsc::channel(8);
+        let callback = Arc::new(RecordingSessionCallback::new());
+        let scrollback = Arc::new(Mutex::new(VecDeque::new()));
+
+        let cb_for_loop: Arc<dyn SessionCallback> = callback.clone();
+        let handle = tokio::spawn(session_event_loop(
+            event_rx, session_cmd_rx, transport_cmd_tx, cb_for_loop, scrollback,
+            80, 24, Theme::default(),
+        ));
+
+        event_tx.send(TransportEvent::Stdout(b"hello".to_vec())).await.unwrap();
+        // イベントループが1周してemit_screen_update(EmitNow経路)を実行するのを待つ。
+        // 仮想時間は進めない(=アイドル即時発行がタイマー待ちに頼っていないことの確認)。
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if !callback.updates.lock().is_empty() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            callback.updates.lock().len(), 1,
+            "idle stdout must emit immediately without waiting for the repaint timer"
+        );
+
+        drop(event_tx);
+        let _ = handle.await;
+    }
+
+    /// `REPAINT_MIN_INTERVAL`より短い間隔で大量のstdoutが届くflood
+    /// (catで巨大ファイルを吐き出すシナリオ相当)では、`on_screen_update`の
+    /// 発行回数が投入イベント数を大きく下回ること、かつ発行された
+    /// `update_seq`が単調増加で欠けが無いことを検証する。
+    #[tokio::test(start_paused = true)]
+    async fn flood_within_min_interval_coalesces_to_far_fewer_emits() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<TransportEvent>(4096);
+        let (_session_cmd_tx, session_cmd_rx) = tokio::sync::mpsc::channel(1);
+        let (transport_cmd_tx, _transport_cmd_rx) = tokio::sync::mpsc::channel(8);
+        let callback = Arc::new(RecordingSessionCallback::new());
+        let scrollback = Arc::new(Mutex::new(VecDeque::new()));
+
+        let cb_for_loop: Arc<dyn SessionCallback> = callback.clone();
+        let handle = tokio::spawn(session_event_loop(
+            event_rx, session_cmd_rx, transport_cmd_tx, cb_for_loop, scrollback,
+            80, 24, Theme::default(),
+        ));
+
+        // 最初の1発はアイドルからのリーディングエッジ発行でbaselineを作ってから、
+        // min_interval内に収まる密度で大量に投入する。
+        event_tx.send(TransportEvent::Stdout(b"start\r\n".to_vec())).await.unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        let n: usize = 500;
+        for i in 0..n {
+            event_tx.send(TransportEvent::Stdout(format!("line{i}\r\n").into_bytes())).await.unwrap();
+        }
+        // repaint_delay(REPAINT_MIN_INTERVAL)を跨いで、armされたトレーリング
+        // エッジの発行が起きるまで仮想時間を進める。
+        tokio::time::advance(REPAINT_MIN_INTERVAL * 3).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        let updates = callback.updates.lock();
+        assert!(
+            updates.len() < n,
+            "expected far fewer on_screen_update calls ({}) than flooded events ({n})",
+            updates.len(),
+        );
+        assert!(
+            updates.len() >= 2,
+            "expected at least the leading-edge emit plus a trailing coalesced emit, got {}",
+            updates.len(),
+        );
+
+        let seqs: Vec<u32> = updates.iter().map(|u| u.update_seq).collect();
+        for w in seqs.windows(2) {
+            assert!(
+                w[1] == w[0].wrapping_add(1),
+                "update_seq must increase by exactly 1 per emitted update (no gaps among emitted frames): {seqs:?}"
+            );
+        }
+        drop(updates);
+
+        drop(event_tx);
+        let _ = handle.await;
     }
 }
