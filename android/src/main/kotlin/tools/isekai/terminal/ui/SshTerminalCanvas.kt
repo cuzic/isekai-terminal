@@ -62,6 +62,33 @@ internal fun computeCursorRect(cx: Float, cy: Float, cellW: Float, cellH: Float,
     }
 
 /**
+ * underline/strikethrough(SGR 4/9)の装飾線描画矩形をピュアに計算する。`Paint.isUnderlineText`/
+ * `isStrikeThruText`は、空白のみの文字列に対してRobolectric実描画でも実際には装飾線を描かない
+ * ことが確認された(iOS版`NSAttributedString.underlineStyle`が空白セルでCoreTextにより
+ * 描画されない実機バグ[コミット`5da238e`]と対称)ため、[computeCursorRect]と同じ手法で
+ * Rectを直接計算し呼び出し元が`drawRect`で塗る。`(x, y)`はセル左上のピクセル座標。
+ */
+internal fun computeLineDecorationRects(
+    x: Float,
+    y: Float,
+    cellW: Float,
+    cellH: Float,
+    underline: Boolean,
+    strikethrough: Boolean,
+): List<CursorRect> {
+    val thickness = (cellH * 0.08f).coerceAtLeast(1f)
+    val rects = mutableListOf<CursorRect>()
+    if (underline) {
+        rects.add(CursorRect(x, y + cellH - thickness, x + cellW, y + cellH))
+    }
+    if (strikethrough) {
+        val midY = y + cellH * 0.5f
+        rects.add(CursorRect(x, midY - thickness / 2f, x + cellW, midY + thickness / 2f))
+    }
+    return rects
+}
+
+/**
  * タスク#66: 検索バーの現在マッチ([match])の描画矩形をピュアに計算する。呼び出し元
  * ([SshTerminalCanvas])は`scrollOffset`が`match.row`と一致する場合にのみ[match]を渡す
  * (=表示中のscrollback合成画面の最終行(`row = rows - 1`)に必ず現れる、`scrollbackCells`
@@ -459,22 +486,27 @@ fun SshTerminalCanvas(
                     ) {
                         val x = col * cellW
                         val fgArgb = cell.fg.toInt()
-                        textPaint.color = if (cell.dim) dimmedArgb(fgArgb) else fgArgb
+                        val resolvedFg = if (cell.dim) dimmedArgb(fgArgb) else fgArgb
+                        textPaint.color = resolvedFg
                         textPaint.isFakeBoldText = cell.bold
                         textPaint.typeface = if (cell.italic) italicTypeface else typeface
-                        textPaint.isUnderlineText = cell.underline
-                        textPaint.isStrikeThruText = cell.strikethrough
                         bitmapCanvas.drawText(cell.ch, x, y + baseline, textPaint)
+
+                        if (hasLineDecoration) {
+                            bgPaint.color = resolvedFg
+                            for (rect in computeLineDecorationRects(x, y, cellW, cellH, cell.underline, cell.strikethrough)) {
+                                bitmapCanvas.drawRect(rect.left, rect.top, rect.right, rect.bottom, bgPaint)
+                            }
+                        }
                     }
                 }
             }
 
-            // 次回の描画で typeface/isUnderlineText 等のPaint状態を汚さないよう
-            // 既定値へ戻す(このPaintはグリッド以外(カーソル等)では使わないが、
-            // remember で使い回されるインスタンスなので明示的にリセットしておく)。
+            // 次回の描画でtypefaceが汚れたままにならないよう既定値へ戻す(このPaintは
+            // グリッド以外(カーソル等)では使わないが、rememberで使い回されるインスタンス
+            // なので明示的にリセットしておく)。`bgPaint.color`は次の背景run/装飾線描画の
+            // たびに都度上書きされるためリセット不要。
             textPaint.typeface = typeface
-            textPaint.isUnderlineText = false
-            textPaint.isStrikeThruText = false
 
             gridCache.markRendered(update, cellW, cellH, themeBgArgb, typeface, effectiveBlinkPhase)
         }
