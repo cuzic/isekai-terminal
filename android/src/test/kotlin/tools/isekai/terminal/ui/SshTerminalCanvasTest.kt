@@ -333,6 +333,29 @@ class SshTerminalCanvasTest {
     }
 
     @Test
+    fun `planRender forces Full when DirtyRowDebugFlags forceFullRedraw is set`() {
+        // タスク#100: dirty行の見落としは表示バグとして気づきにくいため、実機/CIで
+        // すぐ旧経路(常に全画面再描画)へ切り戻せるデバッグトグルを検証する。
+        val cache = GridRenderCache()
+        val first = screenUpdate()
+        cache.markRendered(first, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false)
+        val next = screenUpdate().copy(
+            updateSeq = 1u,
+            dirtyRows = listOf(LineDamage(2u, 0u, 5u)),
+        )
+        DirtyRowDebugFlags.forceFullRedraw = true
+        try {
+            assertEquals(
+                "トグルが有効な間はdirty_rowsを無視して常にFullになるべき",
+                GridRenderPlan.Full,
+                cache.planRender(next, 10f, 20f, 0xFF000000.toInt(), Typeface.MONOSPACE, false),
+            )
+        } finally {
+            DirtyRowDebugFlags.forceFullRedraw = false
+        }
+    }
+
+    @Test
     fun `planRender Partial filters out-of-range rows and de-duplicates`() {
         val cache = GridRenderCache()
         val first = screenUpdate() // 24行

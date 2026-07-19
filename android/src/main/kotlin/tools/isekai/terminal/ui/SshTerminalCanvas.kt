@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import kotlin.math.ceil
 import kotlinx.coroutines.delay
+import tools.isekai.terminal.BuildConfig
 import uniffi.isekai_terminal_core.CellData
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.ImagePlacement
@@ -178,6 +179,22 @@ internal class FontFitCache {
 }
 
 /**
+ * デバッグ専用: dirty_rows に基づく部分再描画([GridRenderPlan.Partial])を無視し、
+ * 常に [GridRenderPlan.Full] にフォールバックさせるトグル(タスク#100)。
+ *
+ * dirty行の見落とし(=一部セルの表示が古いまま固まる)は原因の分かりにくい表示バグに
+ * なるため、実機/CIで「常に全画面再描画」の旧経路へすぐ切り戻して新旧比較できるよう
+ * 用意する。`BuildConfig.DEBUG` の外(release ビルド)では常に無視され、
+ * [GridRenderCache.planRender] の通常の判定に一切影響しない。
+ * `android/src/debug/kotlin/.../debug/FaultInjectionReceiver.kt` と同様の
+ * adb broadcast 経由のトグルは `DirtyRowDebugReceiver`(debug ソースセット)が担う。
+ */
+internal object DirtyRowDebugFlags {
+    @Volatile
+    var forceFullRedraw: Boolean = false
+}
+
+/**
  * [GridRenderCache.planRender] が返す、次フレームでグリッド Bitmap をどう更新するかの決定。
  *
  * - [Reuse]: グリッドは前回描画分と同一。Bitmap を一切触らず貼り直すだけでよい。
@@ -261,6 +278,9 @@ internal class GridRenderCache {
             renderedBlinkPhase != blinkPhase
         if (styleChanged) return GridRenderPlan.Full
         if (renderedUpdate === update) return GridRenderPlan.Reuse
+        // デバッグ専用トグル(タスク#100)。内容が不変(Reuse)ならそのまま何もしなくてよいが、
+        // 何か描き直す必要がある場合は常に Partial ではなく Full を選ばせる。
+        if (BuildConfig.DEBUG && DirtyRowDebugFlags.forceFullRedraw) return GridRenderPlan.Full
         // 配信チャネルでの取りこぼし検出。UInt の加算はモジュラなので wrapping も自動で正しい。
         // (初回は styleChanged 側で必ず Full になるためここには到達せず、renderedSeq は常に有効。)
         if (update.updateSeq != renderedSeq + 1u) return GridRenderPlan.Full

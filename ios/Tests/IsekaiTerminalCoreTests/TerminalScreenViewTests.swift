@@ -1185,6 +1185,21 @@ final class TerminalScreenViewTests: XCTestCase {
         XCTAssertTrue(unioned.contains(base), "元のdirty行(row0)の帯も引き続き包含する")
     }
 
+    /// タスク#100: `debugForceFullRedraw`が有効な間は`dirtyRows`の内容に関わらず
+    /// `liveDirtyDisplayRect`は`nil`(=全画面`setNeedsDisplay()`)を返す。dirty行の
+    /// 見落としは原因の分かりにくい表示バグになるため、実機での新旧経路の比較切り替えが
+    /// 正しく効くことを確認する。
+    func testLiveDirtyDisplayRectRespectsDebugForceFullRedraw() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        let dirty = [LineDamage(line: 0, left: 0, right: 3)]
+        TerminalScreenView.debugForceFullRedraw = true
+        defer { TerminalScreenView.debugForceFullRedraw = false }
+        XCTAssertNil(
+            view.liveDirtyDisplayRect(for: makeGridUpdate(cols: 4, rows: 5, dirtyRows: dirty)),
+            "トグルが有効な間はdirtyRowsを無視して常に全画面再描画にフォールバックすべき"
+        )
+    }
+
     /// スクロールバック表示中(`showingScrollback` または `scrollOffset > 0`)は、ライブの
     /// `dirtyRows`が指す行番号が実際の表示行(scrollback合成)と対応しないため、部分無効化
     /// せず全画面へフォールバックする(`liveDirtyDisplayRect`は`nil`)。

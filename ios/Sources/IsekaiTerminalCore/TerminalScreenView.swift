@@ -213,6 +213,14 @@ final class SixelBitmapCache {
 /// (Phase 1A-6の`TerminalFrameBatch`/`PackedRow`は診断用の並行表現であり、
 /// 実際のレンダリング統合では使わないというPLAN.md記載の方針に従う)。
 public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
+    /// dirty_rows(タスク#92-99)に基づく部分invalidateを無効化し、常に全画面
+    /// `setNeedsDisplay()`へ強制フォールバックさせる実機/デバッグビルド専用トグル
+    /// (タスク#100)。dirty行の見落としは原因の分かりにくい表示バグになるため、新旧
+    /// 経路をすぐ切り替えて比較できるようにする。Release ビルド(`#if DEBUG`の外)では
+    /// 参照されず最適化で消える。Android版の`DirtyRowDebugFlags`と同じ役割。
+    #if DEBUG
+    public static var debugForceFullRedraw: Bool = false
+    #endif
     private var latestUpdate: ScreenUpdate?
     /// タスク#102: 直前に`apply(_:)`へ届いた`ScreenUpdate.updateSeq`。Rust→Swiftの配信経路
     /// (`TerminalUIState.latestScreenUpdate`は`@Published`で、SwiftUIが短時間の連続更新を
@@ -539,6 +547,9 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
     /// 「配信経路で`updateSeq`が飛んだ」フラグ。`true`なら`dirty_rows`が信用できないため
     /// (欠落した中間発行の変化が載っていない)、値に関わらず`nil`(=全画面再描画)を返す。
     func liveDirtyDisplayRect(for update: ScreenUpdate, hadSequenceGap: Bool) -> CGRect? {
+        #if DEBUG
+        guard !Self.debugForceFullRedraw else { return nil }
+        #endif
         guard !hadSequenceGap else { return nil }
         guard scrollOffset == 0, !showingScrollback else { return nil }
         guard let dirtyRows = update.dirtyRows else { return nil }
