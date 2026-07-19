@@ -731,6 +731,192 @@ final class TerminalScreenViewTests: XCTestCase {
         XCTAssertEqual(callCount, 2)
     }
 
+    // MARK: - タスク#19相当: ソフトウェアキーボード表示中のresize安定化(advanceResizeStability)
+    //
+    // Android版`TerminalResizeTest.kt`(`advanceResizeStability`)と対称のテスト群。
+
+    func testAdvanceResizeStabilityTracksLiveHeightWhenKeyboardHidden() {
+        let initial = ResizeStabilityState(hasObservedKeyboardHidden: true, stableHeight: 999)
+        let next = advanceResizeStability(previous: initial, isKeyboardVisible: false, liveHeight: 480)
+        XCTAssertEqual(next.stableHeight, 480)
+        XCTAssertTrue(next.hasObservedKeyboardHidden)
+    }
+
+    func testAdvanceResizeStabilityFreezesPreviousHeightWhileKeyboardVisible() {
+        let initial = ResizeStabilityState(hasObservedKeyboardHidden: true, stableHeight: 480)
+        let next = advanceResizeStability(previous: initial, isKeyboardVisible: true, liveHeight: 280)
+        XCTAssertEqual(next.stableHeight, 480)
+    }
+
+    func testAdvanceResizeStabilityTracksAFullShowHideCycle() {
+        var state = ResizeStabilityState(hasObservedKeyboardHidden: true, stableHeight: 480)
+        state = advanceResizeStability(previous: state, isKeyboardVisible: false, liveHeight: 480)
+        XCTAssertEqual(state.stableHeight, 480)
+        state = advanceResizeStability(previous: state, isKeyboardVisible: true, liveHeight: 280)
+        XCTAssertEqual(state.stableHeight, 480)
+        state = advanceResizeStability(previous: state, isKeyboardVisible: false, liveHeight: 480)
+        XCTAssertEqual(state.stableHeight, 480)
+    }
+
+    func testAdvanceResizeStabilityTracksLiveHeightUntilKeyboardHiddenIsObservedOnce() {
+        // タブがアクティブ化された直後等、この状態が初めて評価される時点で既にキーボードが
+        // 表示中のケース(Android版タスク#19のCodexレビュー指摘と対称)。
+        var state = ResizeStabilityState(hasObservedKeyboardHidden: false, stableHeight: 280)
+        state = advanceResizeStability(previous: state, isKeyboardVisible: true, liveHeight: 280)
+        XCTAssertEqual(state.stableHeight, 280)
+        XCTAssertFalse(state.hasObservedKeyboardHidden)
+
+        state = advanceResizeStability(previous: state, isKeyboardVisible: true, liveHeight: 250)
+        XCTAssertEqual(state.stableHeight, 250)
+        XCTAssertFalse(state.hasObservedKeyboardHidden)
+
+        state = advanceResizeStability(previous: state, isKeyboardVisible: false, liveHeight: 480)
+        XCTAssertEqual(state.stableHeight, 480)
+        XCTAssertTrue(state.hasObservedKeyboardHidden)
+
+        state = advanceResizeStability(previous: state, isKeyboardVisible: true, liveHeight: 280)
+        XCTAssertEqual(state.stableHeight, 480)
+    }
+
+    /// `advanceResizeStability`単体ではなく、`TerminalScreenView`が実際に
+    /// `keyboardWillShow`/`keyboardDidHideNotification`を購読して`reportSizeIfNeeded()`の
+    /// 高さ計算へ反映することを検証する統合テスト(iOSはAndroidの`WindowInsets.isImeVisible`
+    /// のようなview階層からの直接シグナルを持たないため、`NotificationCenter`購読が
+    /// 唯一の経路)。`keyboardHideSettleDelay`を極小値に設定し、`didHide`後の確定処理を
+    /// テスト内で現実的な時間内に待てるようにする。
+    func testKeyboardShowFreezesResizeAndHideRestoresIt() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        view.keyboardHideSettleDelay = 0.05
+        var reported: (cols: UInt32, rows: UInt32)?
+        var callCount = 0
+        view.onSizeChanged = { cols, rows in
+            reported = (cols, rows)
+            callCount += 1
+        }
+
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertNotNil(reported, "初回layoutでonSizeChangedが発火しているはず")
+        let openRows = reported?.rows
+        let callCountAfterOpen = callCount
+
+        // キーボード表示中にboundsが縮んでも(SwiftUI側のキーボード回避で実際に起こる)、
+        // 直近のキーボード非表示時の高さが凍結され、resizeは再送されない。
+        NotificationCenter.default.post(name: UIResponder.keyboardWillShowNotification, object: nil)
+        view.frame = CGRect(x: 0, y: 0, width: 400, height: 150)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertEqual(callCount, callCountAfterOpen, "キーボード表示中は凍結された高さのままonSizeChangedが再送されないはず")
+        XCTAssertEqual(reported?.rows, openRows)
+
+        // キーボードが閉じ、`bounds`も実際に復元された後、`keyboardHideSettleDelay`が
+        // 経過すれば実測(元の)高さへ追随が再開する。
+        view.frame = CGRect(x: 0, y: 0, width: 400, height: 300)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        let settled = expectation(description: "keyboard hide settle delay elapsed")
+        DispatchQueue.main.asyncAfter(deadline: .now() + view.keyboardHideSettleDelay + 0.1) {
+            view.setNeedsLayout()
+            view.layoutIfNeeded()
+            settled.fulfill()
+        }
+        wait(for: [settled], timeout: 2.0)
+        XCTAssertEqual(reported?.rows, openRows, "キーボードが閉じ元の高さへ戻れば同じrowsに復元されるはず")
+
+        // Codexレビュー指摘: 上のアサーションだけでは「たまたま凍結値がopenRowsのまま
+        // だった」可能性を排除できない(`handleKeyboardDidHide`が空実装でも通ってしまう)。
+        // 猶予経過後は本当に凍結が解除され、新しい`bounds`高さに追随することまで確認する。
+        view.frame = CGRect(x: 0, y: 0, width: 400, height: 600)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertNotEqual(reported?.rows, openRows, "凍結解除後は新しいbounds高さに追随して再度rowsが変わるはず")
+    }
+
+    /// Codexレビュー指摘の回帰テスト(1段目): `keyboardDidHideNotification`が届いた時点で
+    /// SwiftUI側のキーボード回避レイアウトがまだ`bounds`を復元しきっていない(縮んだままの)
+    /// ケースでも、猶予期間([keyboardHideSettleDelay])が経過するまでは他経路
+    /// (`layoutSubviews()`/`resendSizeOnConnectionEstablished()`)から`reportSizeIfNeeded()`
+    /// が呼ばれても、その縮んだ高さを誤って安定値として採用しないこと
+    /// (`didHide`到達直後に`isKeyboardVisible`を即座に下ろさない設計であることの検証)。
+    func testKeyboardDidHideDuringSettleDelayStaysFrozenAcrossOtherResizePaths() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        // このテストは猶予期間"中"の中間状態だけを検証するため、テスト実行中に
+        // 実際にタイマーが発火しない程度の長い猶予にしておく(実発火の検証は
+        // 上の`testKeyboardShowFreezesResizeAndHideRestoresIt`が別途担う)。
+        view.keyboardHideSettleDelay = 60
+        var reported: (cols: UInt32, rows: UInt32)?
+        var callCount = 0
+        view.onSizeChanged = { cols, rows in
+            reported = (cols, rows)
+            callCount += 1
+        }
+
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        let openRows = reported?.rows
+
+        NotificationCenter.default.post(name: UIResponder.keyboardWillShowNotification, object: nil)
+        view.frame = CGRect(x: 0, y: 0, width: 400, height: 150)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        let callCountWhileOpen = callCount
+
+        // `didHide`がboundsの復元より先に届く最悪ケース: このpost単体ではまだ`bounds`は
+        // 縮んだまま(150)。
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+        XCTAssertEqual(callCount, callCountWhileOpen, "didHide通知単体では(猶予期間中は)resizeを送らないはず")
+
+        // 猶予期間中に、`bounds`がまだ縮んだまま(150)で他経路から`reportSizeIfNeeded()`が
+        // 呼ばれても(layoutSubviews由来、または`resendSizeOnConnectionEstablished()`)、
+        // まだ`isKeyboardVisible == true`のままなので凍結値が維持されるはず。
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertEqual(reported?.rows, openRows, "猶予期間中のlayoutSubviewsでは縮んだ高さを採用しないはず")
+
+        view.resendSizeOnConnectionEstablished()
+        XCTAssertEqual(reported?.rows, openRows, "猶予期間中のresendSizeOnConnectionEstablishedでも縮んだ高さを採用しないはず")
+    }
+
+    /// Codexレビュー指摘の回帰テスト(2段目): 猶予期間が経過し、かつその時点で`bounds`が
+    /// 実際に復元されていれば、正しい高さへ確定すること。
+    func testKeyboardHideSettlesToRestoredHeightAfterSettleDelayElapses() {
+        let view = TerminalScreenView(frame: CGRect(x: 0, y: 0, width: 400, height: 300))
+        view.keyboardHideSettleDelay = 0.05
+        var reported: (cols: UInt32, rows: UInt32)?
+        view.onSizeChanged = { cols, rows in reported = (cols, rows) }
+
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        let openRows = reported?.rows
+
+        NotificationCenter.default.post(name: UIResponder.keyboardWillShowNotification, object: nil)
+        view.frame = CGRect(x: 0, y: 0, width: 400, height: 150)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+
+        // `bounds`が実際に復元された「後」にdidHideの猶予が経過する想定
+        // (`bounds`復元自体は猶予経過前に起きてよい——問題になるのは猶予"前"に
+        // `isKeyboardVisible`が下りてしまうケースのみ)。
+        view.frame = CGRect(x: 0, y: 0, width: 400, height: 300)
+        NotificationCenter.default.post(name: UIResponder.keyboardDidHideNotification, object: nil)
+
+        let settled = expectation(description: "keyboard hide settle delay elapsed")
+        DispatchQueue.main.asyncAfter(deadline: .now() + view.keyboardHideSettleDelay + 0.1) {
+            view.setNeedsLayout()
+            view.layoutIfNeeded()
+            settled.fulfill()
+        }
+        wait(for: [settled], timeout: 2.0)
+        XCTAssertEqual(reported?.rows, openRows, "bounds復元後、猶予経過後のlayoutで正しい高さへ復元されるはず")
+
+        // Codexレビュー指摘: 「復元前の値と一致する」だけでは凍結解除の証明にならない
+        // (凍結値がたまたま同じ値なだけの可能性がある)ため、猶予経過後にさらに別の
+        // 高さへ変わった場合に追随することまで確認し、本当に凍結が解けていることを示す。
+        view.frame = CGRect(x: 0, y: 0, width: 400, height: 600)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+        XCTAssertNotEqual(reported?.rows, openRows, "凍結解除後は新しいbounds高さに追随して再度rowsが変わるはず")
+    }
+
     // MARK: - タスク#89: SixelBitmapCache
 
     /// Android版`SshTerminalCanvasTest.kt`(`SixelBitmapCache decodes a bitmap for each
