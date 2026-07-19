@@ -11,6 +11,10 @@ pub(crate) mod socks;
 pub(crate) mod session_state;
 pub(crate) mod session;
 pub(crate) mod net_health_policy;
+// #62: tmuxウィンドウ/ペインの安定ロケータ + アプリのタブ/ペインID ⟷
+// Epic M ctl-socketパスの対応表(データモデルのみ、まだどこからも配線
+// されていない——将来の#60/#61タスクからの利用に備えた土台)。
+pub(crate) mod tmux_locator;
 pub mod orchestrator;
 pub(crate) mod helper_bootstrap;
 pub mod isekai_pipe_quic_transport;
