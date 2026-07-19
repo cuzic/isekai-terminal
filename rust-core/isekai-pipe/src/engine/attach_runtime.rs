@@ -74,7 +74,23 @@ impl AttachRuntime {
     /// `--max-idle-lifetime` monitor, mirroring `active.load(..)`'s old role
     /// (self-terminate only once nothing is attached/attaching/established).
     pub async fn is_vacant(&self) -> bool {
-        matches!(self.arbiter.lock().await.state(), AttachState::Vacant)
+        self.arbiter.lock().await.session_count() == 0
+    }
+
+    /// How many sessions currently hold a slot (connecting, pending, or
+    /// established/parked) — used by `engine/mod.rs`'s Epic N-5 admission
+    /// control to decide whether a brand-new `session_id` fits under
+    /// `--max-sessions` without needing to evict anything first.
+    pub async fn session_count(&self) -> usize {
+        self.arbiter.lock().await.session_count()
+    }
+
+    /// Whether `session_id` already holds a slot (of any kind) — a
+    /// retransmit or reattach of a session already known to the arbiter
+    /// never counts against the `--max-sessions` admission check, only a
+    /// genuinely new `session_id` does.
+    pub async fn has_session(&self, session_id: isekai_protocol::SessionId) -> bool {
+        self.arbiter.lock().await.has_session(session_id)
     }
 
     /// The lease currently backing `session_id`'s `Established` slot, if any
@@ -85,8 +101,8 @@ impl AttachRuntime {
     /// conflict, since the whole point of `RESUME` is that it already won
     /// its round).
     pub async fn established_lease_for(&self, session_id: isekai_protocol::SessionId) -> Option<LeaseId> {
-        match self.arbiter.lock().await.state() {
-            AttachState::Established { key, lease } if key.session_id == session_id => Some(*lease),
+        match self.arbiter.lock().await.state_for(session_id) {
+            Some(AttachState::Established { lease, .. }) => Some(*lease),
             _ => None,
         }
     }

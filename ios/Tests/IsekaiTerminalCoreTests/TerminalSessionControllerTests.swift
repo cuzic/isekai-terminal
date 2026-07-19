@@ -624,4 +624,111 @@ final class TerminalSessionControllerTests: XCTestCase {
         XCTAssertNil(controller.uiState.trzszState)
         XCTAssertNil(controller.uiState.completedDownloadURL)
     }
+
+    // MARK: - タスク#26: BEL受信時の触覚フィードバック
+
+    /// 他フィールドは`TerminalScreenViewTests`の既存テストと同じ最小値で埋め、
+    /// `bellGeneration`だけを可変にする。
+    private func makeScreenUpdate(bellGeneration: UInt64) -> ScreenUpdate {
+        ScreenUpdate(
+            updateSeq: 0, cols: 1, rows: 1, cells: [],
+            cursorRow: 0, cursorCol: 0,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
+            cursorVisible: true, bellGeneration: bellGeneration,
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
+        )
+    }
+
+    func testOnScreenUpdateAdvancesLastFiredBellGenerationWhenBellGenerationIncreases() async throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+        XCTAssertEqual(controller.uiState.lastFiredBellGeneration, 0)
+
+        controller.onScreenUpdate(update: makeScreenUpdate(bellGeneration: 1))
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.lastFiredBellGeneration == 1
+        }
+
+        controller.onScreenUpdate(update: makeScreenUpdate(bellGeneration: 3))
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.lastFiredBellGeneration == 3
+        }
+    }
+
+    /// 同一`bellGeneration`の`ScreenUpdate`が再適用されても(conflatedチャネル越しの
+    /// 重複配送等)`lastFiredBellGeneration`は変化しない(`ScreenUpdate.bellGeneration`の
+    /// docコメント通り、二重フィードバックを避けるための`>`比較)。
+    func testOnScreenUpdateDoesNotAdvanceLastFiredBellGenerationWhenSameValueReapplied() async throws {
+        let profile = ConnectionProfile(displayName: "test", host: "example.com", port: 22, username: "user")
+        let controller = try makeControllerWithProfile(profile)
+
+        controller.onScreenUpdate(update: makeScreenUpdate(bellGeneration: 3))
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.lastFiredBellGeneration == 3
+        }
+
+        // 直接同期比較できないため(Task経由でMainActorへ反映される)、他のフィールドを
+        // 変えたScreenUpdateを挟み、そのフィールドがuiStateへ反映されるのを待つことで
+        // 直前のonScreenUpdate呼び出しがMainActorキュー上で処理済みであることを保証する。
+        controller.onScreenUpdate(update: ScreenUpdate(
+            updateSeq: 0, cols: 2, rows: 1, cells: [],
+            cursorRow: 0, cursorCol: 0,
+            title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false,
+            cursorVisible: true, bellGeneration: 3,
+            cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
+        ))
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.latestScreenUpdate?.cols == 2
+        }
+
+        XCTAssertEqual(controller.uiState.lastFiredBellGeneration, 3)
+    }
+
+    /// Fableレビュー指摘: `reconnect()`(#14)経由で新しい論理セッションが始まると
+    /// Rust側`bell_generation`は0から再スタートする(#24、Terminalごとの単調増加)ため、
+    /// `lastFiredBellGeneration`の記憶も`reconnect()`が(`connect()`を呼ぶ直前に)明示的に
+    /// 0へリセットしないと「新セッションのgen 1 < 旧セッションで記憶した値」で最初の
+    /// BELを取りこぼす(Codexレビュー指摘: このリセットは`uiState.latestScreenUpdate = nil`
+    /// と同じ@MainActor同期文脈で行う必要があり、`connect()`側でTask経由の非同期リセットに
+    /// すると新セッション最初の`onScreenUpdate`と競合しうる)。
+    func testReconnectResetsLastFiredBellGenerationForNewSession() async throws {
+        // .tsshdQuicは常に同期的に失敗するtransport(iOS版未対応)なので、実接続なしに
+        // `connect()`/`reconnect()`が呼ばれたことだけを検証できる
+        // (`testReconnectAfterFailedStateRetriesConnect`と同じ手法)。
+        let profile = ConnectionProfile(
+            displayName: "test", host: "example.com", port: 22, username: "user",
+            transportPreference: .tsshdQuic
+        )
+        let controller = try makeControllerWithProfile(profile)
+        controller.connect()
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.state != .connecting
+        }
+
+        // 旧セッションで既にBELを記憶した状態を模す。
+        controller.onScreenUpdate(update: makeScreenUpdate(bellGeneration: 5))
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.lastFiredBellGeneration == 5
+        }
+
+        controller.reconnect()
+
+        try await waitUntilFixtureCondition(timeout: 2) {
+            await controller.uiState.lastFiredBellGeneration == 0
+        }
+    }
+
+    // MARK: - タスク#67: スクロールバック検索(search_scrollback)
+
+    /// マッチ計算そのものは`SessionCore::search_scrollback`(Rust、#37)側で既にテスト済み
+    /// (`session.rs`の`search_scrollback_*`群)。ここでは`TerminalSessionController
+    /// .searchScrollback`がその呼び出しを中継しているだけであること(セッション未確立時に
+    /// クラッシュせず空配列を返すこと)を確認する——`scrollbackCells`/`scrollbackLen`と
+    /// 同じ「未接続ガード」の契約。
+    func testSearchScrollbackReturnsEmptyBeforeConnecting() throws {
+        let (controller, _) = try makeController()
+        XCTAssertEqual(controller.searchScrollback(query: "abc", caseSensitive: false), [])
+    }
 }

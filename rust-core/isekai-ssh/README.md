@@ -239,19 +239,21 @@ directory に保存してから OpenSSH を起動し、`ProxyCommand isekai-pipe
 Host myhost
     HostName 10.0.5.20
     ProxyCommand isekai-pipe connect --profile myhost --service ssh --stdio
-    ServerAliveInterval 30
-    ServerAliveCountMax 6
     TCPKeepAlive no
 ```
 
-`ServerAliveInterval`/`ServerAliveCountMax`/`TCPKeepAlive no` は必須ではないが強く推奨する。
+`TCPKeepAlive no` は必須ではないが強く推奨する(このトランスポートは TCP そのものではない
+ので、`ssh` 自身の TCP keepalive は無意味かつ誤解を招く)。
 `isekai-pipe connect` は `ConnectionIntent` を atomic claim し、`isekai_transport` で
 relay/STUN transport を直接起動して stdio bridge を所有する。relay mode では QUIC 接続が
-切れても `--resume-window`(既定120秒、isekai-pipe serve 側の既定と揃えてある)の間は
-resume を試み続けて `ssh` 側の stdin/stdout を閉じずに粘るので、
-`ssh` 自身の生存確認(`ServerAliveInterval × ServerAliveCountMax`)は resume window より
-十分長く設定しておくと、瞬断のたびに `ssh` 自身が先にセッションを諦めてしまう事故を防げる
-(`ISEKAI_PIPE_DESIGN.md`「`ssh`自身の生存確認とのレース」節参照)。
+切れても `--resume-window`(既定はtrzsz-ssh/tsshdの`UdpAliveTimeout`に倣った10日間。
+`isekai-pipe serve` 側の既定と自動的に揃う、後述)の間は resume を試み続けて `ssh` 側の
+stdin/stdout を閉じずに粘る。openssh は `ServerAliveInterval` を明示設定しない限り
+自分から生存確認しない(既定無効)ので、通常はこのresumeの粘りとは競合しない。もし
+`ServerAliveInterval`/`ServerAliveCountMax` を明示的に設定するなら、resume window より
+十分短い値にすると「まだ正当にresumeで復帰できたはずの接続」を `ssh` 自身が先回りして
+諦めてしまう(`ISEKAI_PIPE_DESIGN.md` §6.4 参照)——瞬断からの高速な自動復旧を諦めても
+良いから短時間で確実に死活判定したい、という用途でだけ明示的に設定すること。
 
 `isekai-pipe connect` は **信頼ストア登録済みのホストにしか接続しない**(自動 bootstrap 対象
 なら wrapper がその場で登録してから接続する)。それ以外は何もしない(標準出力へは1バイトも
@@ -307,7 +309,7 @@ Host production
 | `rendezvous` | URL(複数可) | なし | rendezvous エンドポイント |
 | `stun` | `addr:port`(複数可) | なし | STUN サーバー。省略すると STUN 候補収集を行わない |
 | `relay` | URL(複数可) | なし | isekai-link relay エンドポイント(`masque://...`) |
-| `resume-grace` | `<n>ms` / `<n>s` / `<n>`(単位省略時は秒) | `120s` | QUIC 接続が切れてから resume を試み続ける猶予時間 |
+| `resume-grace` | `<n>ms` / `<n>s` / `<n>`(単位省略時は秒) | `10d`(864,000秒) | QUIC 接続が切れてから resume を試み続ける猶予時間。**新規に** auto bootstrap する時だけ、この値がそのまま `isekai-pipe serve --resume-window` に渡る。既に稼働中の helper がある場合は helper 再利用の仕組み(fingerprint に `resume-window` を含めない、アクティブな接続を巻き込んで強制再起動しないため)により、その helper が寿命切れ(既定 `--max-idle-lifetime` 30日)になるか手動で再デプロイを誘発するまで、helper 起動時点の値のまま変わらない |
 | `candidate-race-delay` | 同上の duration 表記 | `150ms` | 複数 candidate を同時に試す際の後発 candidate の遅延 |
 | `relay-delay` | 同上の duration 表記 | `750ms` | direct 系 candidate に対して relay を遅らせて追い掛けさせる遅延 |
 | `install-mode` | `user`\|`system` | `user` | `system` は sudo・所有権・rollback が未実装かつ実装予定も無いため、指定すると設定解決時点でエラーになる(fail closed)。将来必要になった場合もisekai-ssh本体には組み込まず、`curl ... \| sudo bash`的な別のインストーラースクリプト/ラッパーとして提供する想定 |

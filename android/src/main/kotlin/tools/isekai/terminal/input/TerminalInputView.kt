@@ -20,7 +20,18 @@ class TerminalInputView @JvmOverloads constructor(
     var onComposingText: ((String) -> Unit)? = null
 
     var applicationCursorMode: Boolean = false
+
+    /** DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)。テンキー(KC_NUMPAD_*)のエンコードに使う。 */
+    var applicationKeypadMode: Boolean = false
     var bracketedPasteMode: Boolean = false
+
+    /**
+     * Kitty keyboard protocol(タスク#54)のnegotiated flags(`ScreenUpdate.kittyKeyboardFlags`
+     * の最新値、既定0=legacy mode)。[TerminalInputConnection.sendKeyEvent]がEscapeキーの
+     * disambiguate escape codes(bit0)反映に使う(タスク#72、[TerminalKeyEncoder.specialKeyBytes]
+     * 参照)。
+     */
+    var kittyKeyboardFlags: UShort = 0u
 
     /**
      * トグル式 Ctrl キーの武装状態。true の間に次に入力された 1 文字を

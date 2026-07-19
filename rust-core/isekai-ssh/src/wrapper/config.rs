@@ -99,7 +99,7 @@ pub(super) fn resolve_isekai_config(
         rendezvous: builder.rendezvous,
         stun_servers: builder.stun_servers,
         relay_endpoints: builder.relay_endpoints,
-        resume_grace_secs: builder.resume_grace_secs.unwrap_or(120),
+        resume_grace_secs: builder.resume_grace_secs.unwrap_or(isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS),
         candidate_race_delay_ms: builder
             .candidate_race_delay_ms
             .unwrap_or(DEFAULT_CANDIDATE_RACE_DELAY_MS),

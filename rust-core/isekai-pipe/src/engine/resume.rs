@@ -132,6 +132,16 @@ pub struct Session {
     pub parked_since: Option<std::time::Instant>,
     /// S→C output buffer に空きが戻ったことを relay loop へ伝える通知。
     pub output_space_available: Arc<Notify>,
+    /// `ATTACH_HELLO`のACK(`AttachResponse::Ready::negotiated_resume_grace_secs`、
+    /// `engine/mod.rs::effective_resume_grace`)でこのクライアントに約束した
+    /// 実効resume-grace。`None`はこのフィールドを気にしないテスト用の構築
+    /// (`Session::new`の既定)を表し、`sweep_expired_parked`はグローバルな
+    /// `--resume-window`をそのまま使う。`Some`の場合、`sweep_expired_parked`
+    /// はグローバルな窓とこの値の**短い方**を使う——ACKで「あなたのセッションは
+    /// N秒だけparkされ続けます」と約束しておきながら、実際には(グローバルな
+    /// `--resume-window`が伸びるたびに)無条件でそれより長く保持し続けるのは、
+    /// クライアントへの約束を破っている(Fableレビュー指摘)。
+    pub negotiated_resume_grace_secs: Option<u32>,
 }
 
 impl Session {
@@ -142,6 +152,7 @@ impl Session {
             parked_tcp: None,
             parked_since: None,
             output_space_available: Arc::new(Notify::new()),
+            negotiated_resume_grace_secs: None,
         }
     }
 }
@@ -149,6 +160,27 @@ impl Session {
 /// 16 byte の `SessionId` を小文字16進文字列にする（ログ表示用）。
 fn hex_lower(id: &SessionId) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Scans an already-locked table for the session with the oldest
+/// `parked_since` (i.e. `parked_tcp.is_some()`), ignoring actively-relaying
+/// sessions entirely. Shared by `insert_existing` (which already holds the
+/// table's lock while it checks capacity) and `claim_oldest_parked` (which
+/// acquires its own) — takes the guard's target directly rather than
+/// re-locking, since `tokio::sync::Mutex` is not reentrant.
+async fn find_oldest_parked(inner: &HashMap<SessionId, Arc<Mutex<Session>>>) -> Option<SessionId> {
+    let mut oldest_parked: Option<(SessionId, std::time::Instant)> = None;
+    for (candidate_id, candidate_handle) in inner.iter() {
+        let candidate = candidate_handle.lock().await;
+        if let Some(since) = candidate.parked_since {
+            let is_older =
+                oldest_parked.as_ref().map(|(_, oldest_since)| since < *oldest_since).unwrap_or(true);
+            if is_older {
+                oldest_parked = Some((*candidate_id, since));
+            }
+        }
+    }
+    oldest_parked.map(|(id, _)| id)
 }
 
 /// helper プロセス内でアクティブな resume 可能セッションのテーブル。
@@ -178,6 +210,14 @@ impl SessionTable {
             inner: Arc::new(Mutex::new(HashMap::new())),
             max_sessions,
         }
+    }
+
+    /// Exposes the configured `--max-sessions` cap (a plain field, not
+    /// behind `inner`'s lock) so callers outside this module — Epic N-5's
+    /// admission control in `engine/mod.rs` — can compare it against
+    /// `AttachRuntime::session_count()` without duplicating the number.
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
     }
 
     /// production側では#18-4以降未使用(session_idはクライアントが
@@ -225,21 +265,8 @@ impl SessionTable {
         let mut inner = self.inner.lock().await;
         let mut evicted_id = None;
         if inner.len() >= self.max_sessions && !inner.contains_key(&id) {
-            let mut oldest_parked: Option<(SessionId, std::time::Instant)> = None;
-            for (candidate_id, candidate_handle) in inner.iter() {
-                let candidate = candidate_handle.lock().await;
-                if let Some(since) = candidate.parked_since {
-                    let is_older = oldest_parked
-                        .as_ref()
-                        .map(|(_, oldest_since)| since < *oldest_since)
-                        .unwrap_or(true);
-                    if is_older {
-                        oldest_parked = Some((*candidate_id, since));
-                    }
-                }
-            }
-            match oldest_parked {
-                Some((evict_id, _)) => {
+            match find_oldest_parked(&inner).await {
+                Some(evict_id) => {
                     if let Some(evicted) = inner.remove(&evict_id) {
                         // parked_tcp を drop することで TCP 接続も close される。
                         drop(evicted.lock().await.parked_tcp.take());
@@ -269,6 +296,28 @@ impl SessionTable {
         }
     }
 
+    /// Atomically finds and evicts the globally oldest parked session in the
+    /// table (same eviction policy as `insert_existing`'s over-capacity
+    /// path, factored out via `find_oldest_parked` so both share one scan).
+    /// Used by `engine/mod.rs`'s Epic N-5 admission control to make room for
+    /// a brand-new session *before* it even attempts a target TCP connect —
+    /// `insert_existing` alone only evicts once a new session has already
+    /// gone all the way through the ATTACH handshake, which is too late to
+    /// bound concurrent in-flight target connections once `AttachArbiter`
+    /// stopped being a single global fencing slot (see that module's docs).
+    /// Returns `None` if nothing is currently parked (every tracked session
+    /// is actively relaying) — the caller must reject the new attach in
+    /// that case, same as `insert_existing`'s `Rejected` outcome.
+    pub async fn claim_oldest_parked(&self) -> Option<SessionId> {
+        let mut inner = self.inner.lock().await;
+        let evict_id = find_oldest_parked(&inner).await?;
+        let evicted = inner.remove(&evict_id)?;
+        // parked_tcp を drop することで TCP 接続も close される。
+        drop(evicted.lock().await.parked_tcp.take());
+        log::warn!("session table full, evicted oldest parked session {} to admit a new attach", hex_lower(&evict_id));
+        Some(evict_id)
+    }
+
     pub async fn get(&self, id: &SessionId) -> Option<Arc<Mutex<Session>>> {
         self.inner.lock().await.get(id).cloned()
     }
@@ -287,6 +336,13 @@ impl SessionTable {
     /// アクティブなセッション（`parked_tcp` が `None`）には触れない。
     /// HELPER_PROTOCOL.md §7.5「一定時間 resume が来なければ破棄する」の実装。
     ///
+    /// 各セッションの実際の締切は `max_parked`(サーバー全体の
+    /// `--resume-window`)と `Session::negotiated_resume_grace_secs`(その
+    /// セッションのACKで実際に約束した値、`Some`の場合のみ)の**短い方**——
+    /// クライアントが希望してACKで確認された値より長く保持し続けることは、
+    /// (グローバルな`--resume-window`が伸びるたびに)ACKでの約束を無条件に
+    /// 破ることになるため(Fableレビュー指摘)。
+    ///
     /// 破棄した `SessionId` を返す — この `SessionTable` だけでは
     /// `AttachArbiter`(`engine/attach_arbiter.rs`)の fencing slot には触れられない
     /// (この型はそちらを知らない、`engine/mod.rs`の呼び出し元だけが両方を持つ)ため、
@@ -303,7 +359,11 @@ impl SessionTable {
             for (id, handle) in inner.iter() {
                 let session = handle.lock().await;
                 if let Some(since) = session.parked_since {
-                    if since.elapsed() >= max_parked {
+                    let deadline = match session.negotiated_resume_grace_secs {
+                        Some(secs) => max_parked.min(std::time::Duration::from_secs(secs as u64)),
+                        None => max_parked,
+                    };
+                    if since.elapsed() >= deadline {
                         expired.push(*id);
                     }
                 }
@@ -470,6 +530,86 @@ mod tests {
             table.contains(&active_id).await,
             "アクティブな session には触れないはず"
         );
+    }
+
+    /// Fableレビュー指摘の回帰テスト: グローバルな`--resume-window`が長くても、
+    /// ACKで短い`negotiated_resume_grace_secs`を約束したセッションは、
+    /// その短い方の締切で破棄される(=ACKでの約束が実際に守られる)。
+    #[tokio::test]
+    async fn sweep_expired_parked_honors_a_shorter_negotiated_grace_than_the_global_window() {
+        let table = SessionTable::new();
+        // グローバルな窓は長い(10日相当を模して1時間)が、このセッションは
+        // ACKで短い猶予(5秒)しか約束していない想定。
+        let max_parked = std::time::Duration::from_secs(3600);
+
+        let id = SessionTable::generate_session_id();
+        let mut session = Session::new(1024);
+        session.parked_tcp = Some(dummy_parked_tcp().await);
+        session.parked_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        session.negotiated_resume_grace_secs = Some(5);
+        table.insert(id, session).await;
+
+        table.sweep_expired_parked(max_parked).await;
+
+        assert!(
+            !table.contains(&id).await,
+            "negotiated_resume_grace_secsで約束した短い猶予を過ぎていれば、\
+             グローバルな窓がまだ残っていても破棄されるはず"
+        );
+    }
+
+    /// `negotiated_resume_grace_secs`が`None`(通常は使わない、テスト用の
+    /// 素の`Session::new`のみ)の場合は、これまで通りグローバルな窓だけを
+    /// 使う後方互換の挙動。
+    #[tokio::test]
+    async fn sweep_expired_parked_falls_back_to_the_global_window_without_a_negotiated_grace() {
+        let table = SessionTable::new();
+        let max_parked = std::time::Duration::from_secs(30);
+
+        let id = SessionTable::generate_session_id();
+        let mut session = Session::new(1024);
+        session.parked_tcp = Some(dummy_parked_tcp().await);
+        session.parked_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        assert_eq!(session.negotiated_resume_grace_secs, None);
+        table.insert(id, session).await;
+
+        table.sweep_expired_parked(max_parked).await;
+
+        assert!(table.contains(&id).await, "グローバルな窓(30秒)内なので破棄されないはず");
+    }
+
+    /// `claim_oldest_parked`はparkされたsessionが1つも無ければ`None`。
+    #[tokio::test]
+    async fn claim_oldest_parked_returns_none_when_nothing_is_parked() {
+        let table = SessionTable::new();
+        let id = SessionTable::generate_session_id();
+        table.insert(id, Session::new(1024)).await;
+        assert_eq!(table.claim_oldest_parked().await, None);
+        assert!(table.contains(&id).await, "an active session must never be evicted");
+    }
+
+    /// 複数parkされたsessionがある場合、`parked_since`が最も古いものだけを
+    /// 立ち退かせる(Epic N-5の admission control が使う経路)。
+    #[tokio::test]
+    async fn claim_oldest_parked_evicts_only_the_oldest_among_several() {
+        let table = SessionTable::new();
+        let older_id = SessionTable::generate_session_id();
+        let mut older = Session::new(1024);
+        older.parked_tcp = Some(dummy_parked_tcp().await);
+        older.parked_since = Some(std::time::Instant::now());
+        table.insert(older_id, older).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let newer_id = SessionTable::generate_session_id();
+        let mut newer = Session::new(1024);
+        newer.parked_tcp = Some(dummy_parked_tcp().await);
+        newer.parked_since = Some(std::time::Instant::now());
+        table.insert(newer_id, newer).await;
+
+        assert_eq!(table.claim_oldest_parked().await, Some(older_id));
+        assert!(!table.contains(&older_id).await);
+        assert!(table.contains(&newer_id).await, "the newer parked session must survive");
     }
 
     /// `max_sessions` に達した状態で新規登録すると、最も古い parked セッションが

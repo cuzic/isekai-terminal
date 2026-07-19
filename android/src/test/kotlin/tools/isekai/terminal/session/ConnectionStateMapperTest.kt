@@ -7,6 +7,8 @@ import org.junit.Test
 import tools.isekai.terminal.TerminalUiState
 import tools.isekai.terminal.TrzszUiState
 import uniffi.isekai_terminal_core.ConnectionPublicState
+import uniffi.isekai_terminal_core.CursorShape
+import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.ScreenUpdate
 
 /**
@@ -15,7 +17,11 @@ import uniffi.isekai_terminal_core.ScreenUpdate
  */
 class ConnectionStateMapperTest {
 
-    private fun screenUpdate() = ScreenUpdate(80u, 24u, emptyList(), 0u, 0u, null, false, false)
+    private fun screenUpdate() = ScreenUpdate(
+        0u, 80u, 24u, emptyList(), 0u, 0u, null, false, false, false,
+        MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(),
+        emptyList(), 0u, null,
+    )
 
     @Test
     fun `Connecting sets isConnecting and clears connected reconnecting`() {

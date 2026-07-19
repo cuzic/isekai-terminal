@@ -472,15 +472,20 @@ async fn wrong_proof_is_rejected_before_connection_closes() {
     assert_eq!(resp[0], FRAME_REJECT_AUTH);
 }
 
-/// ATTACH v2 (`#18`): a single `isekai-pipe serve` instance only ever serves
-/// one logical session at a time. Once conn1 has reached `Established` (full
-/// ATTACH_HELLO → AttachReadyV2 → AttachActivate), a second, independent client
-/// (its own fresh `session_id`) attempting to attach is rejected with
-/// `BusyOtherSession` (0xF2). This is the faithful modernization of the old v1
-/// "duplicate connection" test, whose `REJECT_DUPLICATE` (0xFE) byte no longer
-/// exists — a genuinely different client can't co-opt this server instance.
+/// Epic N-5: a single `isekai-pipe serve` instance now hands out one
+/// independent fencing slot per `session_id` rather than a single global
+/// slot per target, so it can serve several concurrent, fully independent
+/// logical sessions to the same target (up to `--max-sessions`). Once conn1
+/// has reached `Established` (full ATTACH_HELLO → AttachReadyV2 →
+/// AttachActivate), a second, independent client (its own fresh
+/// `session_id`) attaching concurrently also reaches `Established` — not
+/// `BusyOtherSession` (0xF2), which is what the pre-Epic-N-5 single-slot
+/// design used to return here (see this test's prior incarnation,
+/// `duplicate_connection_is_rejected`, in version control history). Each
+/// session relays to/from the target completely independently, verified by
+/// round-tripping a distinct payload through each.
 #[tokio::test]
-async fn duplicate_connection_is_rejected() {
+async fn two_independent_sessions_to_the_same_target_are_both_established() {
     let echo_addr = spawn_echo_server().await;
     let helper = spawn_helper(echo_addr, &[]);
     let session_secret = base64::engine::general_purpose::STANDARD
@@ -491,8 +496,69 @@ async fn duplicate_connection_is_rejected() {
         .unwrap();
 
     // 1本目: ATTACH_HELLO → AttachReadyV2 → AttachActivate まで進めて `Established`
-    // にする(AttachActivate を送らないと slot は `PendingActivation` のままで、
-    // 2本目の衝突が別の reject 理由になってしまう)。
+    // にする。
+    let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn1 = endpoint1
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .unwrap();
+    let (sid1, gen1, aid1) = fresh_attach_ids();
+    let (mut send1, mut recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
+
+    // 2本目: 別の(独立した)session_id で、1本目が Established のまま同時に
+    // attach する。Epic N-5 以降はこれも拒否されず `Established` まで到達する。
+    let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn2 = endpoint2
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .unwrap();
+    let (sid2, gen2, aid2) = fresh_attach_ids();
+    let (mut send2, mut recv2) = attach_and_activate(&conn2, &session_secret, sid2, gen2, aid2).await;
+
+    // それぞれ異なるペイロードを送り、echo target との中継が互いに独立して
+    // 動いていることを確認する。
+    let payload1 = b"session-one-payload";
+    let payload2 = b"session-two-payload";
+    send1.write_all(payload1).await.unwrap();
+    send2.write_all(payload2).await.unwrap();
+
+    let mut buf1 = vec![0u8; payload1.len()];
+    tokio::time::timeout(Duration::from_secs(5), recv1.read_exact(&mut buf1))
+        .await
+        .expect("timed out waiting for session 1's echo")
+        .expect("session 1's connection closed before its echo was delivered");
+    assert_eq!(buf1, payload1);
+
+    let mut buf2 = vec![0u8; payload2.len()];
+    tokio::time::timeout(Duration::from_secs(5), recv2.read_exact(&mut buf2))
+        .await
+        .expect("timed out waiting for session 2's echo")
+        .expect("session 2's connection closed before its echo was delivered");
+    assert_eq!(buf2, payload2);
+}
+
+/// Epic N-5's admission control still bounds the number of concurrent
+/// sessions by `--max-sessions`: once that many sessions are `Established`
+/// and *actively relaying* (none of them merely parked, so there is nothing
+/// for `SessionTable::claim_oldest_parked` to evict), a new independent
+/// `session_id` is rejected with `BusyOtherSession` (0xF2) — the same reject
+/// reason as the old single-slot design, just reused for a different,
+/// capacity-based reason (see `AttachRejectReason::BusyOtherSession`'s
+/// updated docs).
+#[tokio::test]
+async fn capacity_full_with_nothing_parked_is_rejected_with_busy_other_session() {
+    let echo_addr = spawn_echo_server().await;
+    let helper = spawn_helper(echo_addr, &["--max-sessions", "1"]);
+    let session_secret = base64::engine::general_purpose::STANDARD
+        .decode(&helper.handshake.session_secret)
+        .unwrap();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
+        .parse()
+        .unwrap();
+
+    // 1本目: `--max-sessions 1` の唯一の枠を、アクティブに中継中のまま埋める。
     let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn1 = endpoint1
         .connect(server_addr, "isekai-pipe.local")
@@ -502,8 +568,8 @@ async fn duplicate_connection_is_rejected() {
     let (sid1, gen1, aid1) = fresh_attach_ids();
     let (_send1, _recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
 
-    // 2本目: proof 自体は正しいが、別の(独立した)session_id で attach しようと
-    // するので、この serve インスタンスが既に別 session を抱えていることを理由に
+    // 2本目: 別の(独立した)session_id で attach しようとするが、枠が
+    // 埋まっており(1本目はparkされていないので立ち退かせるものが無い)、
     // `BusyOtherSession` で拒否される。
     let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
     let conn2 = endpoint2
@@ -1093,6 +1159,127 @@ async fn fresh_attach_after_park_expiry_succeeds_instead_of_staying_busy() {
     assert!(
         matches!(response, AttachResponse::Ready { .. }),
         "a fresh ATTACH_HELLO after the old session's park expired must succeed, got {response:?}"
+    );
+}
+
+/// `ISEKAI_PIPE_DESIGN.md` §8 の parked-session-preemption Epic (N-4) の
+/// 本命回帰テスト。Epic N-5 以降、`AttachArbiter`は`session_id`ごとに独立
+/// したslotを持つため、*余裕がある*限り別の新しい`session_id`は既存の
+/// parkされたセッションに触れず自分のslotを得るだけになった(この余裕分は
+/// `two_independent_sessions_to_the_same_target_are_both_established`が
+/// 確認する)。このテストが確認するのは、その一段上の話——`--max-sessions`
+/// の枠が本当に埋まっている場合の話——である: `--resume-window`が長い
+/// (=park保持のバックストップがまだ全く発火しない)場合でも、枠が埋まって
+/// いる状態で別の新しい`session_id`でのfreshな`ATTACH_HELLO`が来たときは
+/// *即座に* 最も古いparkされたセッションを立ち退かせて`AttachReadyV2`を
+/// 得られる——`sweep_expired_parked`が発火するまでの間ずっと
+/// `BusyOtherSession`を返し続ける(以前は最大`--resume-window`=10日間
+/// ブロックしていた)回帰の確認。加えて、立ち退かせた後は古い`session_id`
+/// でのRESUMEが確定的に`UnknownToken`(実際には`SessionTable`から除去済み)
+/// になることも確認する。
+#[tokio::test]
+async fn fresh_attach_preempts_a_parked_session_immediately_without_waiting_for_resume_window() {
+    let echo_addr = spawn_echo_server().await;
+    // 十分長いresume-window(1時間) — sweepが絶対に発火し得ない時間内で
+    // テストを完了させることで、「即座の立ち退き」経路だけを検証する。
+    // `--max-sessions 1`で、2本目のfresh attachが必ず容量上限に当たり
+    // admission-control立ち退き経路を通るようにする(Epic N-5:デフォルトの
+    // 余裕(16枠)があると2本目は1本目に触れず自分のslotを得るだけになり、
+    // この回帰テストの前提が成り立たなくなる)。
+    let helper = spawn_helper(echo_addr, &["--resume-window", "3600", "--max-sessions", "1"]);
+    let session_secret = base64::engine::general_purpose::STANDARD
+        .decode(&helper.handshake.session_secret)
+        .unwrap();
+    let server_addr: SocketAddr = format!("127.0.0.1:{}", helper.handshake.direct_by_bootstrap_host_port().unwrap())
+        .parse()
+        .unwrap();
+
+    // 1本目: attach して Established にした直後、データ交換なしですぐに
+    // 切断する(park させる)。`fresh_attach_after_park_expiry_succeeds_
+    // instead_of_staying_busy`と同じCONTROL_ACK同期パターン。
+    let endpoint1 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn1 = endpoint1
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .unwrap();
+    let (sid1, gen1, aid1) = fresh_attach_ids();
+    let (send1, recv1) = attach_and_activate(&conn1, &session_secret, sid1, gen1, aid1).await;
+
+    let proof1 = compute_proof(&conn1, &session_secret);
+    let (mut csend1, mut crecv1) = conn1.open_bi().await.unwrap();
+    let mut chello1 = vec![CONTROL_HELLO];
+    chello1.extend_from_slice(&proof1);
+    csend1.write_all(&chello1).await.unwrap();
+    let mut cack1 = [0u8; 17];
+    tokio::time::timeout(Duration::from_secs(5), crecv1.read_exact(&mut cack1))
+        .await
+        .expect("timed out waiting for CONTROL_ACK")
+        .unwrap();
+    assert_eq!(cack1[0], CONTROL_ACK);
+
+    conn1.close(0u32.into(), b"simulated abandoned client");
+    drop(send1);
+    drop(recv1);
+    drop(csend1);
+    drop(crecv1);
+    drop(endpoint1);
+
+    // サーバーが実際にparkするまで少し待つ(QUIC切断検知の最短時間程度)。
+    // sweep間隔(5秒)やresume-window(3600秒)を待つ必要は一切無い —
+    // これがこのテストの主張そのもの。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 2本目: RESUMEではなく、*別の新しい* session_idでのfreshなATTACH_HELLO。
+    // 即座にAttachReadyV2が返るはず — 立ち退きが効いていなければ、
+    // resume-windowが3600秒なので確実にタイムアウトする。
+    let endpoint2 = make_client_endpoint(helper.handshake.cert_sha256());
+    let conn2 = endpoint2
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .expect("second QUIC handshake failed");
+    let (sid2, gen2, aid2) = fresh_attach_ids();
+    let proof2 = compute_attach_proof(&conn2, &session_secret, &sid2, gen2, &aid2, 0);
+    let (mut send2, mut recv2) = conn2.open_bi().await.unwrap();
+    send2.write_all(&attach_hello_frame(sid2, gen2, aid2, proof2)).await.unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(5), read_attach_response(&mut recv2))
+        .await
+        .expect("timed out waiting for a response to the fresh ATTACH_HELLO");
+    assert!(
+        matches!(response, AttachResponse::Ready { .. }),
+        "a fresh ATTACH_HELLO must immediately preempt a merely-parked session rather than \
+         waiting out --resume-window, got {response:?}"
+    );
+
+    // 古いsession_id(sid1)でのRESUMEは、立ち退きでSessionTableから確実に
+    // 除去されているので UnknownToken になるはず。
+    let conn3 = make_client_endpoint(helper.handshake.cert_sha256())
+        .connect(server_addr, "isekai-pipe.local")
+        .unwrap()
+        .await
+        .expect("third QUIC handshake failed");
+    let mut exporter3 = [0u8; 32];
+    conn3.export_keying_material(&mut exporter3, EXPORTER_LABEL, b"").unwrap();
+    let mut mac3 = HmacSha256::new_from_slice(&session_secret).unwrap();
+    mac3.update(&exporter3);
+    mac3.update(sid1.as_bytes());
+    let resume_proof = mac3.finalize().into_bytes();
+    let (mut rsend, mut rrecv) = conn3.open_bi().await.unwrap();
+    rsend
+        .write_all(&encode_quicmux_resume_frame(sid1.as_bytes(), &resume_proof, 0, 0))
+        .await
+        .unwrap();
+    let resume_response = tokio::time::timeout(Duration::from_secs(5), read_quicmux_resume_response(&mut rrecv))
+        .await
+        .expect("timed out waiting for a RESUME response for the preempted session");
+    let QuicmuxResumeResponse::Reject(reason) = resume_response else {
+        panic!("expected RESUME_REJECT for the preempted session");
+    };
+    assert_eq!(
+        reason, QUICMUX_REJECT_UNKNOWN_TOKEN,
+        "the preempted session's own RESUME must now be rejected as unknown"
     );
 }
 

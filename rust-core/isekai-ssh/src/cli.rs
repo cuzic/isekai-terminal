@@ -295,6 +295,16 @@ pub struct InitArgs {
     #[arg(long, value_name = "SECS", default_value_t = 2_592_000)]
     pub idle_lifetime: u64,
 
+    /// Passed straight through as `isekai-helper --resume-window <SECS>`:
+    /// how long a parked (disconnected) session stays resumable server-side
+    /// before being reclaimed, once capacity-based LRU eviction
+    /// (`--max-sessions`) hasn't already reclaimed it sooner. Defaults to
+    /// the same `isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS` the wrapper's
+    /// own auto-bootstrap path uses, so `init`-deployed and
+    /// auto-bootstrapped helpers behave identically unless overridden.
+    #[arg(long, value_name = "SECS", default_value_t = isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS)]
+    pub resume_window: u64,
+
     /// STUN server(s) to query for this side's own observed address,
     /// exchanged with the remote isekai-helper over the bootstrap channel
     /// (`#20b`) — this side's candidates go out as

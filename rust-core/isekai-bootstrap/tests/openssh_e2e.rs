@@ -241,6 +241,7 @@ fn dummy_relay_spec() -> RelayLaunchSpec {
         relay_transport: isekai_bootstrap::RelayTransportKind::Udp,
         idle_lifetime_secs: 2_592_000,
         remote_log_level: "info".to_string(),
+        resume_window_secs: 864_000,
     }
 }
 
@@ -360,6 +361,7 @@ async fn install_and_start_passes_idle_lifetime_to_the_launched_helper() {
         relay_transport: isekai_bootstrap::RelayTransportKind::Udp,
         idle_lifetime_secs: 2_592_000,
         remote_log_level: "info".to_string(),
+        resume_window_secs: 864_000,
     };
 
     tokio::time::timeout(
@@ -374,6 +376,10 @@ async fn install_and_start_passes_idle_lifetime_to_the_launched_helper() {
     assert!(
         argv.contains("--max-idle-lifetime 2592000"),
         "expected the launched isekai-helper's argv to contain '--max-idle-lifetime 2592000', got: {argv:?}"
+    );
+    assert!(
+        argv.contains("--resume-window 864000"),
+        "expected the launched isekai-helper's argv to contain '--resume-window 864000', got: {argv:?}"
     );
     // `isekai-pipe serve` (the merged binary, `archive/ISEKAI_PIPE_MIGRATION.md` P5)
     // requires an explicit `serve` subcommand and a `--target`/`--service`,
@@ -415,6 +421,7 @@ async fn install_and_start_relay_transport_qmux_adds_the_flag() {
         relay_transport: isekai_bootstrap::RelayTransportKind::Qmux,
         idle_lifetime_secs: 2_592_000,
         remote_log_level: "info".to_string(),
+        resume_window_secs: 864_000,
     };
 
     tokio::time::timeout(
@@ -463,7 +470,12 @@ async fn install_and_start_direct_never_passes_relay_args() {
             &target,
             &[],
             fake_helper_script.as_bytes(),
-            &LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), remote_bind_port_range: None },
+            &LaunchSpec::Direct {
+                idle_lifetime_secs: 86_400,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
+                resume_window_secs: 864_000,
+            },
             None,
             &[],
         ),
@@ -478,6 +490,10 @@ async fn install_and_start_direct_never_passes_relay_args() {
     assert!(
         argv.contains("--max-idle-lifetime 86400"),
         "expected argv to contain '--max-idle-lifetime 86400', got: {argv:?}"
+    );
+    assert!(
+        argv.contains("--resume-window 864000"),
+        "expected argv to contain '--resume-window 864000', got: {argv:?}"
     );
     assert!(!argv.contains("--relay"), "direct mode must never pass --relay*, got argv: {argv:?}");
     assert!(argv.starts_with("serve "), "expected argv to start with the 'serve' subcommand, got: {argv:?}");
@@ -516,7 +532,12 @@ async fn install_and_start_uses_custom_remote_binary_path() {
             &target,
             &[],
             fake_helper_script.as_bytes(),
-            &LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), remote_bind_port_range: None },
+            &LaunchSpec::Direct {
+                idle_lifetime_secs: 86_400,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
+                resume_window_secs: 864_000,
+            },
             Some(custom_path),
             &[],
         ),
@@ -721,7 +742,12 @@ async fn install_and_start_delivers_real_stun_candidates_when_stun_servers_are_c
             &target,
             &[],
             fake_helper_script.as_bytes(),
-            &LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), remote_bind_port_range: None },
+            &LaunchSpec::Direct {
+                idle_lifetime_secs: 86_400,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
+                resume_window_secs: 864_000,
+            },
             None,
             &[stun_server],
         ),
@@ -908,7 +934,12 @@ async fn install_and_start_lets_a_different_topology_coexist_with_a_still_alive_
     assert!(is_pid_alive(first_pid), "the first deployment's helper should still be running");
 
     let direct_launch =
-        LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), remote_bind_port_range: None };
+        LaunchSpec::Direct {
+                idle_lifetime_secs: 86_400,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
+                resume_window_secs: 864_000,
+            };
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
         backend.install_and_start(&target, &[], &binary, &direct_launch, None, &[]),
@@ -987,7 +1018,12 @@ async fn install_and_start_garbage_collects_a_dead_topologys_leftover_state() {
     assert!(relay_state_path.exists(), "test setup: the dead topology's state file should still be lying around");
 
     let direct_launch =
-        LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), remote_bind_port_range: None };
+        LaunchSpec::Direct {
+                idle_lifetime_secs: 86_400,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
+                resume_window_secs: 864_000,
+            };
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
         backend.install_and_start(&target, &[], &binary, &direct_launch, None, &[]),
@@ -1046,7 +1082,12 @@ async fn install_and_start_garbage_collection_never_touches_a_still_alive_topolo
     assert!(is_pid_alive(relay_pid), "test setup: the relay helper should still be alive");
 
     let direct_launch =
-        LaunchSpec::Direct { idle_lifetime_secs: 86_400, remote_log_level: "info".to_string(), remote_bind_port_range: None };
+        LaunchSpec::Direct {
+                idle_lifetime_secs: 86_400,
+                remote_log_level: "info".to_string(),
+                remote_bind_port_range: None,
+                resume_window_secs: 864_000,
+            };
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
         backend.install_and_start(&target, &[], &binary, &direct_launch, None, &[]),

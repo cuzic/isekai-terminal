@@ -4,7 +4,7 @@ use parking_lot::Mutex;
 
 use crate::{
     CellData, ClipboardPayload, ConnectionIssueHint, ConnectionPublicState, ForwardState, OrchestratorCallback,
-    ScreenUpdate, SessionCallback, SshConfig, SshError, TrzszPublicState, RUNTIME,
+    ScreenUpdate, ScrollbackSearchMatch, SessionCallback, SshConfig, SshError, TrzszPublicState, RUNTIME,
 };
 use crate::net_health_policy;
 use crate::quic_transport::{QuicConfig, QuicSession};
@@ -49,6 +49,12 @@ impl ActiveSession {
     fn resize(&self, cols: u32, rows: u32) {
         dispatch_all!(self, resize, cols, rows)
     }
+    /// タスク#60: OSのフォーカス変化を全トランスポート共通で`SessionCore`まで委譲する
+    /// (`Terminal`/`SessionCore`はトランスポート非依存のため`add_local_forward`と違い
+    /// 対象外の分岐は無い)。
+    fn notify_focus_change(&self, focused: bool) {
+        dispatch_all!(self, notify_focus_change, focused)
+    }
     fn disconnect(&self) {
         dispatch_all!(self, disconnect)
     }
@@ -80,6 +86,9 @@ impl ActiveSession {
     }
     fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         dispatch_all!(self, scrollback_cells, offset, rows)
+    }
+    fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
+        dispatch_all!(self, search_scrollback, query, case_sensitive)
     }
     fn trzsz_accept_upload(&self, transfer_id: String, file_name: String, file_size: u64, mode: u32) {
         dispatch_all!(self, trzsz_accept_upload, transfer_id, file_name, file_size, mode)
@@ -1150,6 +1159,16 @@ impl SessionOrchestrator {
         }
     }
 
+    /// #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
+    /// そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
+    /// レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
+    /// 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+    pub fn notify_focus_change(&self, focused: bool) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.notify_focus_change(focused);
+        }
+    }
+
     pub fn scrollback_len(&self) -> u32 {
         self.shared.session.lock().as_ref().map_or(0, |s| s.scrollback_len())
     }
@@ -1157,6 +1176,13 @@ impl SessionOrchestrator {
     pub fn scrollback_cells(&self, offset: u32, rows: u32) -> Vec<CellData> {
         self.shared.session.lock().as_ref()
             .map_or_else(Vec::new, |s| s.scrollback_cells(offset, rows))
+    }
+
+    /// scrollbackを対象にした部分一致検索(タスク#37)。マッチ位置は
+    /// [ScrollbackSearchMatch]のドキュメント参照。未接続時は空Vecを返す。
+    pub fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
+        self.shared.session.lock().as_ref()
+            .map_or_else(Vec::new, |s| s.search_scrollback(query, case_sensitive))
     }
 
     pub fn trzsz_accept_download(&self) {

@@ -68,12 +68,18 @@ use crate::types::LaunchSpec;
 /// reachable the same way the currently-running one is" apart from "this is
 /// a materially different deployment (different relay, different launch
 /// mode) that must supersede the old one". Deliberately excludes
-/// `remote_log_level`/`idle_lifetime_secs`/`remote_bind_port_range` — none of
-/// them change whether an already-running helper can serve this connection,
-/// only how verbosely/long it runs or which port a *fresh* launch would
-/// pick, so a bare settings tweak must not force an unnecessary relaunch
+/// `remote_log_level`/`idle_lifetime_secs`/`remote_bind_port_range`/
+/// `resume_window_secs` — none of them change whether an already-running
+/// helper can serve this connection, only how verbosely/long it runs, which
+/// port a *fresh* launch would pick, or how long a *future* park would be
+/// held, so a bare settings tweak must not force an unnecessary relaunch
 /// (and thereby drop whatever peer is using the still-good existing
-/// connection).
+/// connection). This means a helper already running under an older,
+/// shorter `resume_window_secs` keeps that shorter window until it cycles
+/// on its own (`--max-idle-lifetime`) or is redeployed some other way
+/// (e.g. manually killed on the remote host) — accepted deliberately, since
+/// the alternative (forcing a relaunch on every resume-grace config change)
+/// would itself intermittently drop whoever is mid-session on that helper.
 pub fn launch_fingerprint(launch: &LaunchSpec) -> String {
     let discriminator = match launch {
         LaunchSpec::Direct { .. } => "direct".to_string(),
@@ -128,6 +134,7 @@ mod tests {
             idle_lifetime_secs: 2_592_000,
             remote_log_level: "info".to_string(),
             remote_bind_port_range,
+            resume_window_secs: 864_000,
         }
     }
 
@@ -139,6 +146,7 @@ mod tests {
             relay_transport,
             idle_lifetime_secs: 2_592_000,
             remote_log_level: "info".to_string(),
+            resume_window_secs: 864_000,
         })
     }
 
@@ -202,6 +210,28 @@ mod tests {
     #[test]
     fn remote_bind_port_range_does_not_affect_the_fingerprint() {
         assert_eq!(launch_fingerprint(&direct(Some((40000, 40100)))), launch_fingerprint(&direct(None)));
+    }
+
+    /// `resume_window_secs` must stay excluded from the fingerprint (same
+    /// rationale as `idle_lifetime_secs`/`remote_log_level` above) — a caller
+    /// resolving a longer `#@isekai resume-grace` must not force an
+    /// already-running helper to restart and drop whatever peer is mid-session
+    /// on it. See `LaunchSpec::resume_window_secs`'s docs and this module's
+    /// own doc comment.
+    #[test]
+    fn resume_window_secs_does_not_affect_the_fingerprint() {
+        let mut a = direct(None);
+        let LaunchSpec::Direct { resume_window_secs, .. } = &mut a else { unreachable!() };
+        *resume_window_secs = 42;
+        assert_eq!(launch_fingerprint(&a), launch_fingerprint(&direct(None)));
+
+        let mut b = relay("203.0.113.10:443", "relay.example.com", RelayTransportKind::Udp);
+        let LaunchSpec::Relay(spec) = &mut b else { unreachable!() };
+        spec.resume_window_secs = 42;
+        assert_eq!(
+            launch_fingerprint(&b),
+            launch_fingerprint(&relay("203.0.113.10:443", "relay.example.com", RelayTransportKind::Udp)),
+        );
     }
 
     #[test]

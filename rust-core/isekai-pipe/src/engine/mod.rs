@@ -209,7 +209,10 @@ fn print_help() {
     println!("    --bind-port-range <START>-<END> pick --bind's port from this range instead of");
     println!("                                   an OS-assigned one (requires --bind's port to be 0)");
     println!("    --idle-timeout <SECS>          QUIC transport idle timeout (default: 15)");
-    println!("    --resume-window <SECS>         how long a parked (disconnected) session stays resumable (default: 120)");
+    println!("    --resume-window <SECS>         backstop: how long a parked (disconnected) session stays");
+    println!("                                   resumable before being reclaimed, once capacity-based LRU");
+    println!("                                   eviction (--max-sessions) hasn't already reclaimed it sooner");
+    println!("                                   (default: {})", isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS);
     println!("    --resume-buffer-size <BYTES>   S->C replay buffer size per session (default: {DEFAULT_RESUME_BUFFER_SIZE})");
     println!("    --max-idle-lifetime <SECS>     self-exit after this many seconds with no active connection (default: 600)");
     println!("    --max-sessions <N>             max number of concurrently tracked resume sessions (default: {DEFAULT_MAX_SESSIONS});");
@@ -268,11 +271,19 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let mut bind_port_range: Option<(u16, u16)> = None;
     let mut idle_timeout = 15u64;
-    // 実機検証（Phase 8-4b）で、reattach が5回とも失敗する最悪ケースは
-    // 「各試行の QUIC handshake タイムアウト（`--idle-timeout` と同じ 15秒）」×5回 +
-    // 指数バックオフ合計15秒 で実測 約90秒かかることを確認した。90秒ちょうどだと
-    // ギリギリなので余裕を持たせて120秒にしてある。
-    let mut resume_window = 120u64;
+    // 元々は「reattach 5回の最悪ケース実測90秒+余裕」から逆算した120秒だった
+    // (実機検証Phase 8-4b、各試行のQUIC handshakeタイムアウト15秒×5回+バックオフ
+    // 合計15秒)が、これはネットワーク瞬断の検知+再試行予算としては妥当でも、
+    // ノートPC/スマホのスリープのような分〜時間オーダーの中断には短すぎた
+    // (実機で1時間48分のスリープ後、resumeが即座にUnknownSessionで失敗する
+    // 不具合として顕在化)。実際の資源保護は容量ベースのLRU立ち退き
+    // (`SessionTable::insert_existing`が`--max-sessions`超過時に最古のparked
+    // sessionを立ち退かせる、既存実装)が一次防御として機能しているため、この
+    // 値は「本当に誰も戻ってこないセッションを最終的に回収するバックストップ」
+    // という位置づけに変更し、trzsz-ssh/tsshd(同種のUDP常駐resumeデーモン)の
+    // `UdpAliveTimeout`既定(10日間)に倣った`isekai_pipe_core::
+    // DEFAULT_RESUME_GRACE_SECS`をそのまま既定値に使う。
+    let mut resume_window = isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS;
     let mut resume_buffer_size = DEFAULT_RESUME_BUFFER_SIZE;
     let mut max_idle_lifetime = 600u64;
     let mut max_sessions = DEFAULT_MAX_SESSIONS;
@@ -775,7 +786,13 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
     // park セッションが破棄済み」というタイミング不整合が起き、reattach が
     // 必ず REJECT_UNKNOWN_SESSION になる致命的な不具合を確認した。resume-window は
     // 検知にかかる時間 + reattach のリトライ予算（指数バックオフ計15秒）より
-    // 十分長い既定値（90秒）にしてある。
+    // 十分長くなければならない、という下限の理屈は変わらないが、この掃除自体は
+    // もはや一次防御ではない——`SessionTable::insert_existing`の容量ベースLRU
+    // 立ち退き（`--max-sessions`超過時に最古のparked sessionを立ち退かせる）が
+    // 資源圧迫時にはこちらより先に効く。この掃除は「容量に余裕があるままいつまでも
+    // 戻ってこないセッション」を最終的に回収するためだけのバックストップなので、
+    // 既定値は`isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`（trzsz-ssh/tsshdの
+    // `UdpAliveTimeout`に倣った10日間）まで伸ばしてある。
     {
         let sessions = sessions.clone();
         let attach_runtime = attach_runtime.clone();
@@ -784,16 +801,8 @@ pub async fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()>
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let expired = sessions.sweep_expired_parked(max_parked).await;
-                // `SessionTable::sweep_expired_parked`'s docs: discarding a
-                // parked session here doesn't by itself free the matching
-                // `AttachArbiter` fencing slot — do that here so a park
-                // timing out actually lets a fresh ATTACH for this target
-                // through again, instead of leaving it permanently rejected
-                // with `BUSY_OTHER_SESSION` until this process restarts.
                 for id in expired {
-                    if let Some(lease) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(id)).await {
-                        attach_runtime.relay_ended(lease).await;
-                    }
+                    release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(id)).await;
                 }
             }
         });
@@ -992,6 +1001,74 @@ async fn reject_attach(send: &mut AnyByteStreamWriteHalf, reason: AttachRejectRe
     reject(send, &encode_attach_response(&AttachResponse::Reject(reason))).await;
 }
 
+/// Frees `session_id`'s `AttachArbiter` fencing slot if it's still holding
+/// it. Shared by every path that discards a session's `SessionTable` entry
+/// out from under a live `Established` slot (`sweep_expired_parked`'s park
+/// timeout, `insert_existing`'s `--max-sessions` LRU eviction, and
+/// `handle_attach_stream`'s fresh-ATTACH preemption of a merely-parked
+/// session, below) — `SessionTable` alone can never do this itself, since
+/// it has no handle to `AttachArbiter` (`resume.rs`'s module docs). Calling
+/// this exactly once per discard is correctness-critical: skipping it
+/// leaves the slot `Established`-but-orphaned, permanently rejecting every
+/// future ATTACH for this target with `BUSY_OTHER_SESSION` until the
+/// process restarts — `.claude/rules/always-connects.md` records two prior
+/// bugs (`sweep_expired_parked` and `insert_existing`, before either called
+/// this) where exactly that happened.
+async fn release_slot_for(attach_runtime: &Arc<AttachRuntime>, session_id: isekai_protocol::SessionId) {
+    if let Some(lease) = attach_runtime.established_lease_for(session_id).await {
+        attach_runtime.relay_ended(lease).await;
+    }
+}
+
+/// Epic N-5 admission control. `AttachArbiter` used to hold a single global
+/// fencing slot per target (Epic N-4's world): a brand-new `session_id`
+/// could be blocked by whatever *other* session_id was occupying that slot,
+/// and `hello_with_parked_preemption` (this function's predecessor) existed
+/// to preempt that occupant if it turned out to be merely parked rather
+/// than actively relaying. Now that `AttachArbiter` hands out one
+/// independent slot per `session_id` (`attach_arbiter.rs`'s module docs), a
+/// genuinely new session_id is never blocked by another session's state at
+/// all — that whole preemption dance no longer has anything to preempt.
+///
+/// What still needs bounding is the *number* of concurrent slots.
+/// `SessionTable` already enforces `--max-sessions` (Phase S-4b) via
+/// LRU-eviction of the oldest parked session, but only once a new session
+/// has already gone all the way through the ATTACH handshake and connected
+/// to `target` (`insert_existing`, called near the end of
+/// `handle_attach_stream`). Left alone, that would let unbounded concurrent
+/// target TCP connects/handshakes pile up before the cap ever bites, since
+/// `AttachArbiter` itself has no notion of "parked" vs "actively relying"
+/// (only `SessionTable` tracks that) and so cannot police its own capacity.
+/// This runs the same evict-oldest-parked-else-reject policy *before*
+/// `attach_runtime.hello()` even starts a target connect, for any
+/// `session_id` the arbiter doesn't already know about — a retransmit or
+/// reattach of a session already holding a slot always passes through
+/// untouched, matching `insert_existing`'s own `!inner.contains_key(&id)`
+/// guard.
+///
+/// Reuses `AttachRejectReason::BusyOtherSession` for the "genuinely full,
+/// nothing to evict" case rather than adding a new wire reason — every
+/// tracked session is actively relaying, so the client's existing 180s
+/// `retry_while_busy_other_session` backoff (`resume_loop.rs`) remains a
+/// sensible response ("come back once something frees up").
+async fn admit_new_session(
+    attach_runtime: &Arc<AttachRuntime>,
+    sessions: &SessionTable,
+    session_id: isekai_protocol::SessionId,
+) -> Result<(), AttachRejectReason> {
+    if attach_runtime.has_session(session_id).await || attach_runtime.session_count().await < sessions.max_sessions()
+    {
+        return Ok(());
+    }
+    match sessions.claim_oldest_parked().await {
+        Some(evicted_id) => {
+            release_slot_for(attach_runtime, isekai_protocol::SessionId::from_bytes(evicted_id)).await;
+            Ok(())
+        }
+        None => Err(AttachRejectReason::BusyOtherSession),
+    }
+}
+
 /// helper 側の `ATTACH_HELLO` 検証・fencing判定([`AttachRuntime::hello`])・
 /// `AttachActivate`待ち・中継を行う(`#18`)。`PendingActivation`(ACK送信後
 /// `AttachActivate`受信前)の間は、まだtargetへのSSHユーザーデータを一切
@@ -1030,6 +1107,10 @@ async fn handle_attach_stream(
     }
 
     let key = AttachKey { session_id: hello.session_id, generation: hello.generation, attempt_id: hello.attempt_id };
+    if let Err(reason) = admit_new_session(&attach_runtime, &sessions, hello.session_id).await {
+        reject_attach(&mut send, reason).await;
+        return Err(anyhow!("ATTACH_HELLO rejected: {reason:?}"));
+    }
     let (lease, attach_token) = match attach_runtime.hello(key).await {
         HelloOutcome::Reject(reason) => {
             reject_attach(&mut send, reason).await;
@@ -1088,18 +1169,17 @@ async fn handle_attach_stream(
     };
 
     let (tcp_read, tcp_write) = tcp.into_split();
-    let handle = Arc::new(Mutex::new(Session::new(resume_buffer_size)));
+    let mut new_session = Session::new(resume_buffer_size);
+    // ACKで実際に約束した値をセッションに刻んでおく — `sweep_expired_parked`
+    // がグローバルな`--resume-window`だけでなくこれも尊重できるようにする
+    // (`Session::negotiated_resume_grace_secs`のdocs参照)。
+    new_session.negotiated_resume_grace_secs = Some(negotiated_resume_grace_secs);
+    let handle = Arc::new(Mutex::new(new_session));
     let session_id_bytes = *hello.session_id.as_bytes();
     if let resume::InsertOutcome::InsertedAfterEvicting(evicted_id) =
         sessions.insert_existing(session_id_bytes, handle.clone()).await
     {
-        // See `SessionTable::insert_existing`'s docs: evicting a parked
-        // session from the table doesn't by itself free its matching
-        // `AttachArbiter` fencing slot — do that here, exactly like the
-        // `sweep_expired_parked` fix (`resume.rs`'s docs on that method).
-        if let Some(lease) = attach_runtime.established_lease_for(isekai_protocol::SessionId::from_bytes(evicted_id)).await {
-            attach_runtime.relay_ended(lease).await;
-        }
+        release_slot_for(&attach_runtime, isekai_protocol::SessionId::from_bytes(evicted_id)).await;
     }
     log::info!("attach established, session_id={}", hex_lower(&session_id_bytes));
 

@@ -39,7 +39,7 @@ use crate::transport::{
     authenticate_session, connect_via_jump_or_direct, establish_ssh_handle_over_stream,
     run_ssh_channel_loop, zeroize_ssh_auth, PooledSshHandle, TransportEvent,
 };
-use crate::{init_logger, CellData, JumpConfig, SessionCallback, SshAuth, SshError, RUNTIME};
+use crate::{init_logger, CellData, JumpConfig, ScrollbackSearchMatch, SessionCallback, SshAuth, SshError, RUNTIME};
 use crate::session::SessionCore;
 
 /// C→S input replay buffer の既定上限（helper 側 `DEFAULT_RESUME_BUFFER_SIZE` と揃える）。
@@ -187,9 +187,16 @@ impl IsekaiPipeQuicSession {
         self.core.scrollback_cells(offset, rows)
     }
 
+    pub(crate) fn search_scrollback(&self, query: String, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
+        self.core.search_scrollback(&query, case_sensitive)
+    }
+
     pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
 
     pub(crate) fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
+
+    /// タスク#60: OSのフォーカス変化をそのまま`SessionCore`へ転送する。
+    pub(crate) fn notify_focus_change(&self, focused: bool) { self.core.notify_focus_change(focused); }
 
     pub(crate) fn disconnect(&self) { self.core.disconnect(); }
 
@@ -379,7 +386,7 @@ pub(crate) fn attach_reject_message(reason: AttachRejectReason) -> String {
             "isekai-helper rejected: a different attempt already attached".to_string()
         }
         AttachRejectReason::BusyOtherSession => {
-            "isekai-helper rejected: a different session is currently active".to_string()
+            "isekai-helper rejected: server is at its concurrent session limit (--max-sessions) and every session is actively in use".to_string()
         }
         AttachRejectReason::AttachAlreadyEstablished => {
             "isekai-helper rejected: session already established, should resume instead".to_string()

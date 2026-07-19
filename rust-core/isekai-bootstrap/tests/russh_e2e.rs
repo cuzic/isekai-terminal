@@ -209,6 +209,7 @@ fn dummy_relay_spec() -> RelayLaunchSpec {
         relay_transport: isekai_bootstrap::RelayTransportKind::Udp,
         idle_lifetime_secs: 2_592_000,
         remote_log_level: "info".to_string(),
+        resume_window_secs: 864_000,
     }
 }
 

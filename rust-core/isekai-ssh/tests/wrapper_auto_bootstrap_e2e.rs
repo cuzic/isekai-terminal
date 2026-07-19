@@ -575,14 +575,27 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
         .expect("failed to spawn isekai-ssh");
 
     // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
-    // prompt ("Are you sure you want to continue connecting (yes/no)?")
-    // fires *before* the app-level "Trust this isekai-helper...? [y/N]"
-    // prompt this "y\n" answers — unlike the Unix/`ssh(1)` path, which
+    // prompt (text: "Are you sure you want to continue connecting
+    // (yes/no)?", `prompt_new_host_confirmation` in `russh_backend.rs`,
+    // accepts "yes"/"y"/"Y") fires *before* the app-level "Trust this
+    // isekai-helper...? [y/N]" prompt (`wrapper.rs::bootstrap_and_register`,
+    // accepts *only* "y"/"Y" exactly) — unlike the Unix/`ssh(1)` path, which
     // never asks that first question at all (`StrictHostKeyChecking no` in
     // the shim config suppresses it). See `RusshBackend`'s module docs
     // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
     // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    //
+    // A real Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) showed the TOFU prompt fire and then the whole run go
+    // silent until the reader's 20s timeout gave up -- consistent with a
+    // *second* TOFU round (e.g. a redeploy/retry re-dialing the same host)
+    // consuming the single answer meant for the app-level prompt, leaving
+    // that prompt's blocking stdin read starved. Feeding several "y" answers
+    // up front is harmless (unread lines just sit in the pipe, or are
+    // dropped on process exit -- "y" alone satisfies both prompt kinds) and
+    // makes the test robust to however many confirmation rounds actually
+    // occur, instead of assuming exactly one TOFU round every time.
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     // The wrapper proceeds to exec a real `ssh` with `ProxyCommand isekai-pipe
@@ -594,18 +607,32 @@ async fn wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation() {
     // than waiting for the whole process to exit.
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
+    // Tolerate a few consecutive quiet windows before giving up, rather than
+    // bailing on the very first 20s window with no new output. A real
+    // Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) consistently finished last among this file's 7
+    // concurrently-running tests and went quiet for longer than a single
+    // 20s window under CI resource contention -- bailing immediately was
+    // too impatient for that environment.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
@@ -698,23 +725,37 @@ async fn wrapper_auto_bootstrap_honors_alias_only_identity_file() {
     // the shim config suppresses it). See `RusshBackend`'s module docs
     // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
     // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
+    // Tolerate a few consecutive quiet windows before giving up, rather than
+    // bailing on the very first 20s window with no new output. A real
+    // Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) consistently finished last among this file's 7
+    // concurrently-running tests and went quiet for longer than a single
+    // 20s window under CI resource contention -- bailing immediately was
+    // too impatient for that environment.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
@@ -806,23 +847,37 @@ async fn wrapper_auto_bootstrap_honors_remote_path_directive() {
     // the shim config suppresses it). See `RusshBackend`'s module docs
     // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
     // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
+    // Tolerate a few consecutive quiet windows before giving up, rather than
+    // bailing on the very first 20s window with no new output. A real
+    // Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) consistently finished last among this file's 7
+    // concurrently-running tests and went quiet for longer than a single
+    // 20s window under CI resource contention -- bailing immediately was
+    // too impatient for that environment.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
@@ -931,23 +986,37 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
     // the shim config suppresses it). See `RusshBackend`'s module docs
     // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
     // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
+    // Tolerate a few consecutive quiet windows before giving up, rather than
+    // bailing on the very first 20s window with no new output. A real
+    // Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) consistently finished last among this file's 7
+    // concurrently-running tests and went quiet for longer than a single
+    // 20s window under CI resource contention -- bailing immediately was
+    // too impatient for that environment.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
                     saw_registered = true;
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
@@ -968,6 +1037,118 @@ async fn wrapper_auto_bootstrap_honors_stun_directive() {
         profile.cached_stun_observed_addr.as_deref(),
         Some("198.51.100.42:56789"),
         "the server-reflexive candidate from the handshake should be cached"
+    );
+}
+
+/// `ISEKAI_PIPE_DESIGN.md` §8 Epic N-3: `#@isekai resume-grace <n>` must reach
+/// the remote launch command's argv as `isekai-pipe serve --resume-window
+/// <n>` (same technique as `wrapper_auto_bootstrap_honors_stun_directive`) —
+/// this is the regression test for the bug where a client-only resume-grace
+/// override was silently clamped back down to the server's own unrelated
+/// default because it never reached the deploy argv at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn wrapper_auto_bootstrap_honors_resume_grace_directive() {
+    if !ssh_binary_available() {
+        eprintln!("skipping: ssh(1)/ssh-keygen(1) not available in this environment");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (key_path, client_pubkey) = generate_client_keypair(tmp.path());
+    let remote_home = tmp.path().join("remote-home");
+    std::fs::create_dir_all(&remote_home).unwrap();
+
+    let mock_sshd_addr = spawn_fake_ssh_server(remote_home.clone(), client_pubkey).await;
+
+    let home = tmp.path().join("client-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let (_bin_dir, path_env, shim) = shim_ssh_with_bootstrap_config(
+        tmp.path(),
+        &home,
+        "resume-grace-directive-host",
+        mock_sshd_addr,
+        &key_path,
+        "    #@isekai resume-grace 42s\n",
+    );
+
+    let argv_log = remote_home.join("argv.log");
+    let helper_script_path = tmp.path().join("fake-isekai-helper.sh");
+    std::fs::write(
+        &helper_script_path,
+        format!("#!/bin/sh\necho \"$@\" > {}\necho '{VALID_BOOTSTRAP_REPORT_JSON}'\n", posix_safe_path(&argv_log)),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper_script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut child = TokioCommand::new(isekai_ssh_bin_path())
+        .args(ssh_shim_args_and_env(&shim).0)
+        .envs(ssh_shim_args_and_env(&shim).1)
+        .arg("--isekai-helper-binary")
+        .arg(&helper_script_path)
+        .arg("resume-grace-directive-host")
+        .env("HOME", &home)
+        // Windows: `default_profiles_dir` checks `LOCALAPPDATA` before `HOME`
+        // (see `wrapper_auto_bootstrap_honors_stun_directive`'s comment on the
+        // identical env pair for why both are needed).
+        .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        .env("ISEKAI_PIPE_LOG_FILE", verbose_log_path_under(&home))
+        .env("PATH", &path_env)
+        .env_remove("RUST_LOG")
+        .stdin(StdStdio::piped())
+        .stdout(StdStdio::piped())
+        .stderr(StdStdio::piped())
+        .spawn()
+        .expect("failed to spawn isekai-ssh");
+
+    // Native/Windows path prompts for SSH host-key TOFU before the app-level
+    // "Trust this isekai-helper...?" prompt this "y\n" answers (see
+    // `wrapper_auto_bootstrap_honors_stun_directive`'s identical comment).
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
+    child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
+
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut saw_registered = false;
+    // Tolerate a few consecutive quiet windows before giving up, rather than
+    // bailing on the very first 20s window with no new output. A real
+    // Windows CI run (wrapper_auto_bootstrap_honors_stun_directive,
+    // 2026-07-19) consistently finished last among this file's 7
+    // concurrently-running tests and went quiet for longer than a single
+    // 20s window under CI resource contention -- bailing immediately was
+    // too impatient for that environment.
+    let mut consecutive_timeouts = 0;
+    for _ in 0..200 {
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
+                eprint!("[isekai-ssh stderr] {line}");
+                if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
+                    saw_registered = true;
+                    break;
+                }
+            }
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+
+    assert!(saw_registered, "expected wrapper stderr to report trust-store registration");
+
+    let argv = std::fs::read_to_string(&argv_log).expect("stand-in script should have recorded its argv");
+    assert!(
+        argv.contains("--resume-window 42"),
+        "expected #@isekai resume-grace to reach the remote launch command's argv, got: {argv:?}"
     );
 }
 
@@ -1067,17 +1248,21 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
     // the shim config suppresses it). See `RusshBackend`'s module docs
     // (`isekai-bootstrap/src/russh_backend.rs`) for why there's no
     // `StrictHostKeyChecking`-equivalent knob to suppress it there too.
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
     let mut stderr_text = String::new();
+    // See the identical comment on wrapper_auto_bootstraps_an_untrusted_destination_on_confirmation's
+    // read loop: tolerate a few consecutive quiet windows before giving up.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 stderr_text.push_str(&line);
                 if line.contains("Registered") || verbose_log_contains(&verbose_log_path_under(&home), "Registered") {
@@ -1085,7 +1270,12 @@ async fn wrapper_auto_bootstrap_honors_bootstrap_relay_directive() {
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();

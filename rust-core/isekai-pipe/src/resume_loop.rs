@@ -114,54 +114,46 @@ impl BusyOtherSessionSignal for isekai_transport::SequentialConnectError {
     }
 }
 
-/// Extra slack added on top of `resume_window_for(...)` for the
-/// `BUSY_OTHER_SESSION` retry loop specifically — found necessary 2026-07-17
-/// after a real Windows sleep/wake: this client's own retry loop starts
-/// counting down from the moment *it* first gets rejected, but the remote
-/// helper only starts *its* park-expiry countdown once its own QUIC
-/// `--idle-timeout` (15s by default, `engine/mod.rs`) notices the old
-/// connection is dead — which happens strictly later than this client's
-/// first rejection. Without this buffer the two windows are the same
-/// length but different start times, so this client's deadline always
-/// elapses first, by roughly the helper's idle-timeout detection latency
-/// (observed: gave up 16s before the helper actually freed the slot).
-/// `BUSY_OTHER_SESSION` is specifically a self-clearing condition (unlike
-/// a genuinely unreachable target), so erring generously here is safe.
-const BUSY_OTHER_SESSION_EXTRA_PATIENCE: Duration = Duration::from_secs(30);
+/// Deliberately **not** derived from `resume_window_for`/`resume-grace`
+/// (unlike a same-process resume loop's own deadline) — even though a
+/// `BUSY_OTHER_SESSION` reject on the very first connect most often means
+/// *this same client's* previous session is still parked on the remote
+/// helper (see `TransportError::is_busy_other_session`'s docs), waiting for
+/// that park to clear on its own is no longer a sound thing to size against
+/// `resume-grace`, now that the value is days long by default
+/// (`isekai_pipe_core::DEFAULT_RESUME_GRACE_SECS`'s docs). A fixed, short
+/// window here is defense-in-depth for `isekai-pipe serve` deployments that
+/// predate `ISEKAI_PIPE_DESIGN.md` §8's parked-session-preemption fix
+/// (`engine/mod.rs::hello_with_parked_preemption`) — helper reuse
+/// deliberately doesn't force those to redeploy (`reuse.rs`'s fingerprint
+/// exclusion), so they can keep running the old, un-preempting behavior for
+/// up to `--max-idle-lifetime` (30 days) after this fix ships. Against a
+/// server that *does* have the fix, a legitimate retry here succeeds almost
+/// immediately (the preemption is atomic, no real waiting involved), so
+/// this window is never the limiting factor in the common case; against one
+/// that doesn't, it turns what would otherwise be a silent multi-day hang
+/// into a fast, visible failure instead.
+const BUSY_OTHER_SESSION_RETRY_WINDOW: Duration = Duration::from_secs(180);
 
 /// Retries `attempt` while — and only while — it fails with
-/// `BUSY_OTHER_SESSION`, for up to `resume_window_for(requested_resume_grace_secs)`
-/// plus [`BUSY_OTHER_SESSION_EXTRA_PATIENCE`] (the same deadline a resume loop
-/// would use, since a `BUSY_OTHER_SESSION` reject on the very first connect
-/// most often means *this same client's* previous session is still parked on
-/// the remote helper, waiting out that exact window after an earlier
-/// ungraceful disconnect — see `TransportError::is_busy_other_session`'s
-/// docs). Every other failure is returned immediately on the first attempt,
-/// unchanged from before this wrapper existed: this only closes the gap
-/// where a fresh `isekai-pipe connect` process (a brand new `session_id`
-/// every time, since neither `connect_via_relay_resumable` nor `_with_fallback`
-/// persist one across invocations) would otherwise fail outright instead of
-/// waiting the same window a same-process resume would have.
-async fn retry_while_busy_other_session<T, E, F, Fut>(requested_resume_grace_secs: u32, attempt: F) -> Result<T, E>
+/// `BUSY_OTHER_SESSION`, for up to `window` (production call sites always
+/// pass `BUSY_OTHER_SESSION_RETRY_WINDOW` — see that constant's docs for why
+/// it's a short fixed window rather than `resume-grace`-derived; `window`
+/// is a parameter rather than the constant used directly only so tests can
+/// inject a short one instead of a real 180-second wait). Every other
+/// failure is returned immediately on the first attempt, unchanged from
+/// before this wrapper existed: this only closes the gap where a fresh
+/// `isekai-pipe connect` process (a brand new `session_id` every time,
+/// since neither `connect_via_relay_resumable` nor `_with_fallback` persist
+/// one across invocations) would otherwise fail outright instead of waiting
+/// the same window a same-process resume would have.
+async fn retry_while_busy_other_session<T, E, F, Fut>(window: Duration, mut attempt: F) -> Result<T, E>
 where
     E: BusyOtherSessionSignal,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
-    let deadline = Instant::now() + resume_window_for(requested_resume_grace_secs) + BUSY_OTHER_SESSION_EXTRA_PATIENCE;
-    retry_busy_other_session_until(deadline, attempt).await
-}
-
-/// The actual retry loop, parametrized directly over `deadline` so tests can
-/// exercise the give-up path without waiting out a real
-/// [`BUSY_OTHER_SESSION_EXTRA_PATIENCE`]-sized delay (`retry_while_busy_other_session`
-/// is the thin wrapper real callers use).
-async fn retry_busy_other_session_until<T, E, F, Fut>(deadline: Instant, mut attempt: F) -> Result<T, E>
-where
-    E: BusyOtherSessionSignal,
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
-{
+    let deadline = Instant::now() + window;
     let mut attempt_no: u32 = 0;
     loop {
         let err = match attempt().await {
@@ -193,7 +185,7 @@ pub(crate) async fn run_relay_resumable(
 ) -> Result<()> {
     let factory = relay_endpoint_factory(relay_transport);
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
-    let established = retry_while_busy_other_session(requested, || connect_via_relay_resumable(&factory, target, requested, identity))
+    let established = retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_via_relay_resumable(&factory, target, requested, identity))
         .await
         .map_err(attach_stale_trust_signal)?;
     run_resume_loop(&factory, target, profile, established, experimental_network_rebind, tethering_interface).await
@@ -216,7 +208,7 @@ pub(crate) async fn run_relay_resumable_with_fallback(
     let factory = relay_endpoint_factory(relay_transport);
     let requested = u32::try_from(requested_resume_grace_secs).unwrap_or(u32::MAX);
     let (established, winning_target) =
-        retry_while_busy_other_session(requested, || connect_via_relay_resumable_with_fallback(&factory, candidates, requested))
+        retry_while_busy_other_session(BUSY_OTHER_SESSION_RETRY_WINDOW, || connect_via_relay_resumable_with_fallback(&factory, candidates, requested))
             .await
             .map_err(attach_stale_trust_signal)?;
     run_resume_loop(&factory, &winning_target, profile, established, experimental_network_rebind, tethering_interface).await
@@ -601,6 +593,21 @@ struct ResumeLoopState {
     /// メッセージに"Last error: ..."として付け足す。再接続成功のたびに
     /// `None`へリセットされる。
     last_resume_error: Option<String>,
+    /// `UnknownSession`が何回連続で返ってきたか。サーバ側`RESUME`ハンドラ
+    /// (`isekai-pipe serve`側`engine/mod.rs::handle_resume`相当)は、
+    /// 「session_idがテーブルに無い」(本当に消滅)だけでなく「テーブルには
+    /// あるがまだparkされていない」(直前のdata streamのresetをまだ処理し
+    /// 終えていない一時的な状態、`parked_tcp == None`)や「fencing slotが
+    /// 一致しない」場合も同じ`UnknownToken`/`UnknownSession`を返す
+    /// (ワイヤに複数の意味を1値へ潰しているため区別できない)。1回だけで
+    /// 即terminal扱いすると、この一時的なraceを本当に消滅したものと誤認して
+    /// 本来resumeできたはずのセッションを早まって諦めてしまう
+    /// (Codexレビューで指摘、実際に`engine/mod.rs`の該当箇所を確認して
+    /// 再現条件を特定した)。`resume_with_backoff_until_deadline`はこの
+    /// カウンタが`UNKNOWN_SESSION_CONFIRM_THRESHOLD`に達したときだけ
+    /// give upする——「毎回同じ確定的signalが返り続けている」ことでしか
+    /// 本物の消滅とは区別できないため。
+    consecutive_unknown_session: u32,
 }
 
 /// Fast path: promote the already-warm standby connection instead of
@@ -682,6 +689,99 @@ async fn promote_warm_standby_once(
 /// fresh instance the caller creates per disconnect episode (mirroring
 /// `spawn_reconnect_signal`'s own one-per-generation rule) — passed in
 /// rather than constructed here so tests can inject a controllable mock.
+/// How many *consecutive* `UnknownSession` rejections
+/// `resume_with_backoff_until_deadline` requires before treating the
+/// session as genuinely, permanently gone — see `is_unknown_session_rejection`'s
+/// docs for why a single occurrence isn't proof enough.
+const UNKNOWN_SESSION_CONFIRM_THRESHOLD: u32 = 3;
+
+/// Minimum time since disconnect that must have elapsed before
+/// `UNKNOWN_SESSION_CONFIRM_THRESHOLD` consecutive rejections are trusted as
+/// proof of permanent loss, required *in addition to* the streak count
+/// above. At `RESUME_BACKOFF`'s schedule (500ms, 1s, 2s, ...) 3 consecutive
+/// attempts land around t≈3.5s — comfortably inside `isekai-pipe serve
+/// --idle-timeout`'s default (15s) worst case for the "not-yet-parked"
+/// race `is_unknown_session_rejection` describes: a "break-before-make"
+/// roam (Wi-Fi drop, AP switch, airplane mode) means the client's
+/// `quic_write.reset(0)` on the *old* path never reaches the server, so the
+/// server can only notice the old connection died via its own QUIC idle
+/// timeout, not the explicit reset — the fast path this streak was tuned
+/// around. Without this floor, `UNKNOWN_SESSION_CONFIRM_THRESHOLD` alone
+/// would misfire and kill exactly the roaming reconnects this project's
+/// resumable transport exists to survive (`CLAUDE.md`'s differentiator:
+/// "QUIC接続耐性(ローミング...)"). 30s is double the idle-timeout default,
+/// leaving margin without meaningfully eating into the (now days-long)
+/// deadline a truly-dead session would otherwise be retried against.
+const UNKNOWN_SESSION_MIN_ELAPSED_FLOOR: Duration = Duration::from_secs(30);
+
+/// `UnknownSession` is the wire reason for three different server-side
+/// situations that `isekai-pipe serve`'s `RESUME` handler
+/// (`engine/mod.rs`, roughly `sessions.get()` returning `None`, *or*
+/// `parked_tcp` still being `None`, *or* the `AttachArbiter` established
+/// lease not matching) all collapse into the same
+/// `quicmux::ResumeRejectReason::UnknownToken` value — only the first of
+/// those means "this session_id will never resume again"; the other two are
+/// transient races (the old data stream's reset hasn't finished being
+/// processed and parked yet) that a subsequent attempt, moments later, can
+/// still recover from. Since the wire protocol can't currently tell these
+/// apart, a *single* `UnknownSession` is not reliable proof of permanent
+/// loss (confirmed by reading `engine/mod.rs`'s `RESUME` handler directly,
+/// per a Codex review finding) — only `UNKNOWN_SESSION_CONFIRM_THRESHOLD`
+/// consecutive occurrences are treated as such by the caller.
+/// `Auth`/`OffsetGone` and any non-rejection `TransportError` (network/mux
+/// failures) are left to the existing deadline-bound retry loop unchanged —
+/// those are rejections of a *specific attempt*, not proof the session
+/// itself is gone, so this function deliberately doesn't guess at their
+/// retriability.
+fn is_unknown_session_rejection(e: &isekai_transport::TransportError) -> bool {
+    matches!(
+        e,
+        isekai_transport::TransportError::ResumeRejected(isekai_transport::ResumeRejectReason::UnknownSession)
+    )
+}
+
+/// Pure decision core of the `UnknownSession` streak-tracking described on
+/// `ResumeLoopState::consecutive_unknown_session`'s docs, factored out so it
+/// can be unit-tested without a real `AnyMuxFactory`/network dial (unlike
+/// `resume_with_backoff_until_deadline` itself). Given the streak length
+/// going into this attempt, whether this attempt's error was an
+/// `UnknownSession` rejection, and how long it's been since the disconnect
+/// that started this episode, returns the streak length coming out of it
+/// and whether the caller should give up now — both the streak count *and*
+/// `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR` must be satisfied (see that
+/// constant's docs for why the streak alone isn't enough).
+fn update_unknown_session_streak(previous_streak: u32, is_unknown_session: bool, elapsed_since_disconnect: Duration) -> (u32, bool) {
+    if !is_unknown_session {
+        return (0, false);
+    }
+    let streak = previous_streak.saturating_add(1);
+    let should_give_up = streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD && elapsed_since_disconnect >= UNKNOWN_SESSION_MIN_ELAPSED_FLOOR;
+    (streak, should_give_up)
+}
+
+/// Shared give-up cleanup for `resume_with_backoff_until_deadline`'s two
+/// terminal paths (deadline exceeded, or a definitive `UnknownSession`
+/// rejection): clears the live TTY status line, prints one final message,
+/// closes stdout so `ssh` treats this as a lost connection, and stops the
+/// warm-standby probe task.
+async fn give_up(
+    is_tty: bool,
+    stdout: &mut tokio::io::Stdout,
+    warm_standby_task: &Option<tokio::task::JoinHandle<()>>,
+    message: &str,
+) {
+    if is_tty {
+        // その場書き換え中だったライブ表示行をクリアしてから
+        // ギブアップメッセージを改行付きで出す。
+        eprint!("\r\x1b[K");
+    }
+    eprintln!("{message}");
+    let _ = stdout.shutdown().await;
+    if let Some(t) = warm_standby_task {
+        t.abort();
+    }
+}
+
 async fn resume_with_backoff_until_deadline(
     factory: &AnyMuxFactory,
     target: &RelayTarget,
@@ -699,30 +799,27 @@ async fn resume_with_backoff_until_deadline(
         let now = Instant::now();
         if now >= deadline {
             let exceeded_by = now.saturating_duration_since(deadline);
-            if state.is_tty {
-                // その場書き換え中だったライブ表示行をクリアしてから
-                // ギブアップメッセージを改行付きで出す。
-                eprint!("\r\x1b[K");
-            }
             let last_error_suffix = state
                 .last_resume_error
                 .as_deref()
                 .map(|e| format!(" Last error: {e}."))
                 .unwrap_or_default();
             let session_id = state.session_id;
-            eprintln!(
-                "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
-                 the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}.{last_error_suffix} \
-                 Closing stdin/stdout; ssh will treat this as a lost connection.",
-            );
+            give_up(
+                state.is_tty,
+                stdout,
+                warm_standby_task,
+                &format!(
+                    "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
+                     the resume window ({resume_window:?}) was exceeded by {exceeded_by:?}.{last_error_suffix} \
+                     Closing stdin/stdout; ssh will treat this as a lost connection.",
+                ),
+            )
+            .await;
             notify_os(
                 "isekai-pipe connect",
                 &format!("Giving up reconnecting to '{profile}' (session_id={session_id}).{last_error_suffix}"),
             );
-            let _ = stdout.shutdown().await;
-            if let Some(t) = warm_standby_task {
-                t.abort();
-            }
             return Err(anyhow::anyhow!(
                 "resume window ({resume_window:?}) exceeded by {exceeded_by:?} for session_id={session_id}\
                  for '{profile}'.{last_error_suffix}"
@@ -751,6 +848,11 @@ async fn resume_with_backoff_until_deadline(
         .await
         {
             Ok(mut resumed) => {
+                // A successful RESUME_ACK is proof the session was known and
+                // parked — whatever streak of `UnknownSession` preceded it
+                // (if any) was the transient not-yet-parked race, not
+                // genuine loss.
+                state.consecutive_unknown_session = 0;
                 if !replay_and_advance(&state.replay, resumed.helper_committed_offset.get(), &mut resumed.data_stream).await {
                     // resume自体は成功したがreplayが不整合 —実質「この試行は
                     // 失敗した」ので、既存のErr(e)アームと同じTTY/非TTY分岐・
@@ -779,6 +881,46 @@ async fn resume_with_backoff_until_deadline(
                 return Ok(resumed.data_stream);
             }
             Err(e) => {
+                // See `is_unknown_session_rejection`'s docs: a single
+                // occurrence isn't reliable proof the session is gone for
+                // good (it's also what a transient not-yet-parked race on
+                // the server looks like), so only give up once it's been
+                // confirmed `UNKNOWN_SESSION_CONFIRM_THRESHOLD` times in a
+                // row *and* `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR` has passed
+                // (see that constant's docs — the streak alone misfires
+                // during break-before-make roaming). Any other outcome
+                // (success, or a *different* error) resets the streak
+                // elsewhere in this loop.
+                let (streak, should_give_up) = update_unknown_session_streak(
+                    state.consecutive_unknown_session,
+                    is_unknown_session_rejection(&e),
+                    Instant::now().saturating_duration_since(disconnected_at),
+                );
+                state.consecutive_unknown_session = streak;
+                if should_give_up {
+                    let session_id = state.session_id;
+                    give_up(
+                        state.is_tty,
+                        stdout,
+                        warm_standby_task,
+                        &format!(
+                            "isekai-pipe connect: giving up on session_id={session_id} for '{profile}' - \
+                             the server no longer knows this session ({UNKNOWN_SESSION_CONFIRM_THRESHOLD} \
+                             consecutive UnknownSession rejections; reclaimed, or the server itself \
+                             restarted), retrying would never succeed. Closing stdin/stdout; ssh will \
+                             treat this as a lost connection.",
+                        ),
+                    )
+                    .await;
+                    notify_os(
+                        "isekai-pipe connect",
+                        &format!("Giving up reconnecting to '{profile}' (session_id={session_id}): server no longer knows this session."),
+                    );
+                    return Err(anyhow::anyhow!(
+                        "server no longer recognizes session_id={session_id} for '{profile}' (UnknownSession); \
+                         retrying would never succeed."
+                    ));
+                }
                 let msg = format!("{e:#}");
                 // TTY時はその場書き換えのライブ表示とスクロール表示が混ざると
                 // UXを壊すため、個々の失敗はdebugログへ格下げする(既定の
@@ -820,6 +962,7 @@ pub(crate) async fn run_resume_loop(
         // `format_reconnect_status`周辺のモジュールドキュメント参照)。
         is_tty: std::io::stderr().is_terminal(),
         last_resume_error: None,
+        consecutive_unknown_session: 0,
     };
 
     let mut stdin = tokio::io::stdin();
@@ -1255,7 +1398,7 @@ mod tests {
     #[tokio::test]
     async fn retry_while_busy_other_session_does_not_retry_other_failures() {
         let mut calls = 0u32;
-        let result: Result<(), FakeConnectError> = retry_while_busy_other_session(1, || {
+        let result: Result<(), FakeConnectError> = retry_while_busy_other_session(Duration::from_secs(1), || {
             calls += 1;
             async { Err(FakeConnectError(false)) }
         })
@@ -1267,7 +1410,7 @@ mod tests {
     #[tokio::test]
     async fn retry_while_busy_other_session_retries_until_a_later_attempt_succeeds() {
         let calls = std::cell::Cell::new(0u32);
-        let result = retry_while_busy_other_session(1, || {
+        let result = retry_while_busy_other_session(Duration::from_secs(1), || {
             let n = calls.get();
             calls.set(n + 1);
             async move { if n == 0 { Err(FakeConnectError(true)) } else { Ok::<(), FakeConnectError>(()) } }
@@ -1277,34 +1420,92 @@ mod tests {
         assert_eq!(calls.get(), 2);
     }
 
-    #[tokio::test]
-    async fn retry_busy_other_session_until_gives_up_once_its_deadline_elapses() {
-        // Exercises the give-up path directly against a short, explicit
-        // deadline (rather than through `retry_while_busy_other_session`,
-        // whose real deadline now includes `BUSY_OTHER_SESSION_EXTRA_PATIENCE`
-        // and would make this test wait ~30s for no reason).
-        let deadline = Instant::now() + Duration::from_millis(50);
-        let result: Result<(), FakeConnectError> = retry_busy_other_session_until(deadline, || async { Err(FakeConnectError(true)) }).await;
-        assert!(result.is_err(), "must stop retrying once the deadline has elapsed");
+    #[test]
+    fn is_unknown_session_rejection_is_true_only_for_unknown_session() {
+        assert!(is_unknown_session_rejection(&isekai_transport::TransportError::ResumeRejected(
+            isekai_transport::ResumeRejectReason::UnknownSession
+        )));
+        assert!(!is_unknown_session_rejection(&isekai_transport::TransportError::ResumeRejected(
+            isekai_transport::ResumeRejectReason::Auth
+        )));
+        assert!(!is_unknown_session_rejection(&isekai_transport::TransportError::ResumeRejected(
+            isekai_transport::ResumeRejectReason::OffsetGone
+        )));
+    }
+
+    /// Regression test for the Codex-review finding: `isekai-pipe serve`'s
+    /// `RESUME` handler returns the exact same `UnknownSession` wire reason
+    /// both for "this session_id never existed / was evicted" and for "this
+    /// session exists but the server hasn't finished parking it yet" (a
+    /// transient race right after a reset). A single `UnknownSession` must
+    /// not be enough to give up — only `UNKNOWN_SESSION_CONFIRM_THRESHOLD`
+    /// in a row (past `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR`) should.
+    #[test]
+    fn update_unknown_session_streak_does_not_give_up_below_the_threshold() {
+        let mut streak = 0;
+        let elapsed = UNKNOWN_SESSION_MIN_ELAPSED_FLOOR + Duration::from_secs(1);
+        for _ in 0..(UNKNOWN_SESSION_CONFIRM_THRESHOLD - 1) {
+            let should_give_up;
+            (streak, should_give_up) = update_unknown_session_streak(streak, true, elapsed);
+            assert!(!should_give_up, "must not give up before the threshold is reached");
+        }
+        assert_eq!(streak, UNKNOWN_SESSION_CONFIRM_THRESHOLD - 1);
     }
 
     #[test]
-    fn busy_other_session_retry_deadline_includes_extra_patience_beyond_the_resume_window() {
-        // Regression test for the 2026-07-17 incident: the remote helper's
-        // own park-expiry doesn't start counting until *its* idle-timeout
-        // notices the old connection is dead, which is always later than
-        // this client's first BUSY_OTHER_SESSION rejection. Without
-        // `BUSY_OTHER_SESSION_EXTRA_PATIENCE`, a client using the bare
-        // `resume_window_for(...)` deadline gives up before the helper ever
-        // frees the slot.
-        let requested_resume_grace_secs = 5;
-        let now = Instant::now();
-        let bare_window_deadline = now + resume_window_for(requested_resume_grace_secs);
-        let padded_deadline = now + resume_window_for(requested_resume_grace_secs) + BUSY_OTHER_SESSION_EXTRA_PATIENCE;
-        assert!(
-            padded_deadline > bare_window_deadline,
-            "the BUSY_OTHER_SESSION retry deadline must extend past the bare resume window"
-        );
+    fn update_unknown_session_streak_gives_up_once_the_threshold_and_floor_are_both_reached() {
+        let mut streak = 0;
+        let mut should_give_up = false;
+        let elapsed = UNKNOWN_SESSION_MIN_ELAPSED_FLOOR + Duration::from_secs(1);
+        for _ in 0..UNKNOWN_SESSION_CONFIRM_THRESHOLD {
+            (streak, should_give_up) = update_unknown_session_streak(streak, true, elapsed);
+        }
+        assert!(should_give_up, "must give up once both the streak and the elapsed floor are reached");
+        assert_eq!(streak, UNKNOWN_SESSION_CONFIRM_THRESHOLD);
+    }
+
+    /// Regression test for the Fable-review finding: at `RESUME_BACKOFF`'s
+    /// schedule, `UNKNOWN_SESSION_CONFIRM_THRESHOLD` consecutive attempts
+    /// land around t≈3.5s — well before `UNKNOWN_SESSION_MIN_ELAPSED_FLOOR`
+    /// (30s). Reaching the streak alone must not be enough during a
+    /// break-before-make roam, where the server can take up to its
+    /// `--idle-timeout` (15s default) to notice the old connection died.
+    #[test]
+    fn update_unknown_session_streak_does_not_give_up_before_the_elapsed_floor_even_at_threshold() {
+        let mut streak = 0;
+        for _ in 0..(UNKNOWN_SESSION_CONFIRM_THRESHOLD + 5) {
+            // Realistic early-episode elapsed time (a few seconds), well
+            // under the floor, even though the streak count alone would
+            // already be well past the threshold.
+            let should_give_up;
+            (streak, should_give_up) = update_unknown_session_streak(streak, true, Duration::from_secs(4));
+            assert!(!should_give_up, "must not give up before the elapsed floor is reached, regardless of streak length");
+        }
+        assert!(streak >= UNKNOWN_SESSION_CONFIRM_THRESHOLD, "sanity check: the streak itself did clear the threshold");
+    }
+
+    /// The scenario this whole streak exists to tolerate: the server's
+    /// not-yet-parked race resolves after a couple of attempts (a later
+    /// attempt returns something other than `UnknownSession` — e.g. this
+    /// models a successful resume, which the real caller represents by
+    /// simply never calling this function again for that episode; here we
+    /// model it as a non-`UnknownSession` outcome to prove the streak itself
+    /// resets rather than staying "primed" to give up early on the next
+    /// disconnect episode).
+    #[test]
+    fn update_unknown_session_streak_resets_on_a_non_unknown_session_outcome() {
+        let elapsed = UNKNOWN_SESSION_MIN_ELAPSED_FLOOR + Duration::from_secs(1);
+        let (streak, _) = update_unknown_session_streak(0, true, elapsed);
+        let (streak, should_give_up) = update_unknown_session_streak(streak, false, elapsed);
+        assert_eq!(streak, 0, "a non-UnknownSession outcome must reset the streak");
+        assert!(!should_give_up);
+    }
+
+    #[tokio::test]
+    async fn retry_while_busy_other_session_gives_up_once_the_window_elapses() {
+        let result: Result<(), FakeConnectError> =
+            retry_while_busy_other_session(Duration::from_secs(1), || async { Err(FakeConnectError(true)) }).await;
+        assert!(result.is_err(), "must stop retrying once the window has elapsed");
     }
 
     #[tokio::test]
@@ -1501,6 +1702,7 @@ mod tests {
                 network_rebinder: None,
                 is_tty: false,
                 last_resume_error: Some("connection refused".to_string()),
+                consecutive_unknown_session: 0,
             };
             let mut stdout = tokio::io::stdout();
             let now = Instant::now();

@@ -429,6 +429,7 @@ private fun TerminalPaneScreen(
                     onSend = { bytes -> tabsVm.sendToPane(address, bytes) },
                     onResize = { cols, rows -> tabsVm.resizePane(address, cols, rows) },
                     onScrollbackCells = { offset, rows -> tabsVm.scrollbackCellsForPane(address, offset, rows) },
+                    onSearchScrollback = { query, caseSensitive -> tabsVm.searchScrollbackForPane(address, query, caseSensitive) },
                     onTrustUpdatedHostKey = { tabsVm.trustUpdatedHostKeyForPane(address) },
                     onDismissHostKeyWarning = { tabsVm.dismissHostKeyWarningForPane(address) },
                     onTrustNewHostKey = { tabsVm.trustNewHostKeyForPane(address) },
@@ -448,6 +449,7 @@ private fun TerminalPaneScreen(
                     onNextTab = { tabsVm.nextTab() },
                     onPreviousTab = { tabsVm.previousTab() },
                     onForceReturnToWifi = { pane.session.forceReturnToWifi() },
+                    onFocusChanged = { focused -> pane.session.notifyFocusChange(focused) },
                 ),
             )
 

@@ -1158,6 +1158,14 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func notifyError(message: String) 
     
     /**
+     * #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
+     * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
+     * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
+     * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     */
+    func notifyFocusChange(focused: Bool) 
+    
+    /**
      * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを終了
      * される可能性が高まったとみなし、猶予を待たず保守的に`Suspended`扱いにする
      * (無言で固まった画面をユーザーに見せるより、次回復帰時に再接続する方が安全)。
@@ -1204,6 +1212,12 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func scrollbackCells(offset: UInt32, rows: UInt32)  -> [CellData]
     
     func scrollbackLen()  -> UInt32
+    
+    /**
+     * scrollbackを対象にした部分一致検索(タスク#37)。マッチ位置は
+     * [ScrollbackSearchMatch]のドキュメント参照。未接続時は空Vecを返す。
+     */
+    func searchScrollback(query: String, caseSensitive: Bool)  -> [ScrollbackSearchMatch]
     
     func send(data: Data) 
     
@@ -1457,6 +1471,20 @@ open func notifyError(message: String)  {try! rustCall() {
 }
     
     /**
+     * #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
+     * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
+     * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
+     * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     */
+open func notifyFocusChange(focused: Bool)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_focus_change(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(focused),$0
+    )
+}
+}
+    
+    /**
      * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを終了
      * される可能性が高まったとみなし、猶予を待たず保守的に`Suspended`扱いにする
      * (無言で固まった画面をユーザーに見せるより、次回復帰時に再接続する方が安全)。
@@ -1550,6 +1578,20 @@ open func scrollbackLen() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_len(
             self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * scrollbackを対象にした部分一致検索(タスク#37)。マッチ位置は
+     * [ScrollbackSearchMatch]のドキュメント参照。未接続時は空Vecを返す。
+     */
+open func searchScrollback(query: String, caseSensitive: Bool) -> [ScrollbackSearchMatch]  {
+    return try!  FfiConverterSequenceTypeScrollbackSearchMatch.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_search_scrollback(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(query),
+        FfiConverterBool.lower(caseSensitive),$0
     )
 })
 }
@@ -1748,14 +1790,44 @@ public struct CellData: Equatable, Hashable {
     public var fg: UInt32
     public var bg: UInt32
     public var bold: Bool
+    public var dim: Bool
+    public var italic: Bool
+    public var underline: Bool
+    public var strikethrough: Bool
+    public var blink: Bool
+    public var invisible: Bool
+    /**
+     * OSC 8(`ESC]8;params;URIST`、タスク#40)ハイパーリンクのintern id。`Some`なら
+     * `ScreenUpdate::link_table[id]`(0-indexed)にこのセルが指すURLが入っている。
+     * セルごとに`Option<String>`のURLを直接持たせない——`CellData`は`ScreenUpdate`
+     * として毎フレーム全セル分FFIコピーされるため、コストの大きい`String`は
+     * 一度だけ`link_table`に置き、セル側は軽量な`Option<u32>`のみ持つintern方式
+     * にしている(Fableレビュー2次)。
+     */
+    public var linkId: UInt32?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(ch: String, fg: UInt32, bg: UInt32, bold: Bool) {
+    public init(ch: String, fg: UInt32, bg: UInt32, bold: Bool, dim: Bool, italic: Bool, underline: Bool, strikethrough: Bool, blink: Bool, invisible: Bool, 
+        /**
+         * OSC 8(`ESC]8;params;URIST`、タスク#40)ハイパーリンクのintern id。`Some`なら
+         * `ScreenUpdate::link_table[id]`(0-indexed)にこのセルが指すURLが入っている。
+         * セルごとに`Option<String>`のURLを直接持たせない——`CellData`は`ScreenUpdate`
+         * として毎フレーム全セル分FFIコピーされるため、コストの大きい`String`は
+         * 一度だけ`link_table`に置き、セル側は軽量な`Option<u32>`のみ持つintern方式
+         * にしている(Fableレビュー2次)。
+         */linkId: UInt32?) {
         self.ch = ch
         self.fg = fg
         self.bg = bg
         self.bold = bold
+        self.dim = dim
+        self.italic = italic
+        self.underline = underline
+        self.strikethrough = strikethrough
+        self.blink = blink
+        self.invisible = invisible
+        self.linkId = linkId
     }
 
     
@@ -1777,7 +1849,14 @@ public struct FfiConverterTypeCellData: FfiConverterRustBuffer {
                 ch: FfiConverterString.read(from: &buf), 
                 fg: FfiConverterUInt32.read(from: &buf), 
                 bg: FfiConverterUInt32.read(from: &buf), 
-                bold: FfiConverterBool.read(from: &buf)
+                bold: FfiConverterBool.read(from: &buf), 
+                dim: FfiConverterBool.read(from: &buf), 
+                italic: FfiConverterBool.read(from: &buf), 
+                underline: FfiConverterBool.read(from: &buf), 
+                strikethrough: FfiConverterBool.read(from: &buf), 
+                blink: FfiConverterBool.read(from: &buf), 
+                invisible: FfiConverterBool.read(from: &buf), 
+                linkId: FfiConverterOptionUInt32.read(from: &buf)
         )
     }
 
@@ -1786,6 +1865,13 @@ public struct FfiConverterTypeCellData: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.fg, into: &buf)
         FfiConverterUInt32.write(value.bg, into: &buf)
         FfiConverterBool.write(value.bold, into: &buf)
+        FfiConverterBool.write(value.dim, into: &buf)
+        FfiConverterBool.write(value.italic, into: &buf)
+        FfiConverterBool.write(value.underline, into: &buf)
+        FfiConverterBool.write(value.strikethrough, into: &buf)
+        FfiConverterBool.write(value.blink, into: &buf)
+        FfiConverterBool.write(value.invisible, into: &buf)
+        FfiConverterOptionUInt32.write(value.linkId, into: &buf)
     }
 }
 
@@ -1977,6 +2063,121 @@ public func FfiConverterTypeDiagnosticEventEnvelope_lift(_ buf: RustBuffer) thro
 #endif
 public func FfiConverterTypeDiagnosticEventEnvelope_lower(_ value: DiagnosticEventEnvelope) -> RustBuffer {
     return FfiConverterTypeDiagnosticEventEnvelope.lower(value)
+}
+
+
+/**
+ * Sixel(`DCS Pa;Pb;Ph q ... ST`、タスク#42)でデコードされた画像1枚の配置情報。
+ * `Terminal`(rust-core)がデコード・配置・寿命管理を一元的に行う(rust-ssot:
+ * Android/iOSはこの構造体が指す矩形へ`rgba`をそのままビットマップ描画するだけで
+ * よく、「どこに何ピクセルの画像が乗っているか」を判断するロジックをKotlin/Swift
+ * 側にミラーしない)。
+ *
+ * `row`/`col`は画像の左上が乗っている`ScreenUpdate.cells`上のセル座標
+ * (0-indexed)。`rows_span`/`cols_span`は画像が占めるセル数——実ピクセルサイズ
+ * (`width_px`/`height_px`)を、VT340由来の名目セルサイズ(`terminal.rs`の
+ * `SIXEL_CELL_WIDTH_PX`/`SIXEL_CELL_HEIGHT_PX`、実フォントのピクセルサイズを
+ * このRustコアは知らないため固定値で近似)で割って算出した近似値。呼び出し側は
+ * 実際のフォントの`cols_span`×`rows_span`分のセル矩形へ`rgba`(実ピクセルサイズ
+ * `width_px`×`height_px`)を引き伸ばして描画すればよい。
+ *
+ * `id`はこの`Terminal`インスタンス内でのみ一意な単調増加id(`u64`が尽きるまで
+ * 再利用しない、RIS後もカウンタ自体はリセットしない——過去にキャッシュされた
+ * idと衝突させないため)。呼び出し側は前回の`ScreenUpdate.images`との差分を
+ * 自前で判断する必要はなく、常に「今回のリストが現在アクティブな画像の全て」
+ * として扱い、そのまま描画すればよい(rust-ssot: 消去・スクロールによる立ち退き
+ * 等の寿命管理判断はTerminal側で完結しており、UI層は宣言的にリストを反映する
+ * だけでよい)。
+ *
+ * スコープ外(実装時点の既知の簡略化、Sixel対応の初版):
+ * - 画像は現在の画面(main/alt)全体のスクロール・IL/DL・リサイズ・alt画面切替・
+ * 全画面消去(ED、`CSI 2J`/`CSI 3J`)のいずれかが起きると無条件に消去される
+ * (誤った位置に取り残されるより、消える方が安全側という判断)。部分消去
+ * (ED0/ED1、EL、ECH等)では画像は消えない。
+ * - Sixel描画によって画面が下端を超えて自動スクロールすることはない(画像は
+ * 画面下端でクリップされる)。
+ */
+public struct ImagePlacement: Equatable, Hashable {
+    public var id: UInt64
+    public var row: UInt32
+    public var col: UInt32
+    public var rowsSpan: UInt32
+    public var colsSpan: UInt32
+    public var widthPx: UInt32
+    public var heightPx: UInt32
+    /**
+     * RGBA8888、row-major、左上原点。`width_px * height_px * 4`バイト。
+     */
+    public var rgba: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: UInt64, row: UInt32, col: UInt32, rowsSpan: UInt32, colsSpan: UInt32, widthPx: UInt32, heightPx: UInt32, 
+        /**
+         * RGBA8888、row-major、左上原点。`width_px * height_px * 4`バイト。
+         */rgba: Data) {
+        self.id = id
+        self.row = row
+        self.col = col
+        self.rowsSpan = rowsSpan
+        self.colsSpan = colsSpan
+        self.widthPx = widthPx
+        self.heightPx = heightPx
+        self.rgba = rgba
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ImagePlacement: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeImagePlacement: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImagePlacement {
+        return
+            try ImagePlacement(
+                id: FfiConverterUInt64.read(from: &buf), 
+                row: FfiConverterUInt32.read(from: &buf), 
+                col: FfiConverterUInt32.read(from: &buf), 
+                rowsSpan: FfiConverterUInt32.read(from: &buf), 
+                colsSpan: FfiConverterUInt32.read(from: &buf), 
+                widthPx: FfiConverterUInt32.read(from: &buf), 
+                heightPx: FfiConverterUInt32.read(from: &buf), 
+                rgba: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ImagePlacement, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.id, into: &buf)
+        FfiConverterUInt32.write(value.row, into: &buf)
+        FfiConverterUInt32.write(value.col, into: &buf)
+        FfiConverterUInt32.write(value.rowsSpan, into: &buf)
+        FfiConverterUInt32.write(value.colsSpan, into: &buf)
+        FfiConverterUInt32.write(value.widthPx, into: &buf)
+        FfiConverterUInt32.write(value.heightPx, into: &buf)
+        FfiConverterData.write(value.rgba, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImagePlacement_lift(_ buf: RustBuffer) throws -> ImagePlacement {
+    return try FfiConverterTypeImagePlacement.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImagePlacement_lower(_ value: ImagePlacement) -> RustBuffer {
+    return FfiConverterTypeImagePlacement.lower(value)
 }
 
 
@@ -2364,6 +2565,71 @@ public func FfiConverterTypeJumpConfig_lift(_ buf: RustBuffer) throws -> JumpCon
 #endif
 public func FfiConverterTypeJumpConfig_lower(_ value: JumpConfig) -> RustBuffer {
     return FfiConverterTypeJumpConfig.lower(value)
+}
+
+
+/**
+ * 1行分の「損傷(damage)」範囲。`line`行目の`left`列から`right`列まで(両端含む)が
+ * 前回発行された`ScreenUpdate`から変化したことを表す(タスク#92、Alacrittyの
+ * `LineDamageBounds{line,left,right}`に倣った列レンジ差分)。`ScreenUpdate.dirty_rows`
+ * が`Some`の時にのみ現れ、UI層(Android/iOS)はこのレンジのセルだけを再描画すればよい。
+ * 損傷のない行はリストに含めない(`left <= right`の行のみ)。
+ */
+public struct LineDamage: Equatable, Hashable {
+    public var line: UInt16
+    public var left: UInt16
+    public var right: UInt16
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(line: UInt16, left: UInt16, right: UInt16) {
+        self.line = line
+        self.left = left
+        self.right = right
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LineDamage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLineDamage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LineDamage {
+        return
+            try LineDamage(
+                line: FfiConverterUInt16.read(from: &buf), 
+                left: FfiConverterUInt16.read(from: &buf), 
+                right: FfiConverterUInt16.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LineDamage, into buf: inout [UInt8]) {
+        FfiConverterUInt16.write(value.line, into: &buf)
+        FfiConverterUInt16.write(value.left, into: &buf)
+        FfiConverterUInt16.write(value.right, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLineDamage_lift(_ buf: RustBuffer) throws -> LineDamage {
+    return try FfiConverterTypeLineDamage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLineDamage_lower(_ value: LineDamage) -> RustBuffer {
+    return FfiConverterTypeLineDamage.lower(value)
 }
 
 
@@ -2870,6 +3136,15 @@ public func FfiConverterTypeQuicConfig_lower(_ value: QuicConfig) -> RustBuffer 
 
 
 public struct ScreenUpdate: Equatable, Hashable {
+    /**
+     * 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
+     * 配信チャネルが`Channel.CONFLATED`(Android)等でconflateされ、中間の発行が
+     * 読み飛ばされる可能性がある——`dirty_rows`は「直前に発行したScreenUpdateとの
+     * 差分」なので、読み飛ばしが起きると欠落分の変化がdirty_rowsに載らず表示が
+     * 化ける。UI層はこの値が前回受信値+1(wrapping)でなければ読み飛ばしがあったと
+     * 判断し、`dirty_rows`を信用せず全画面再描画にフォールバックすること。
+     */
+    public var updateSeq: UInt32
     public var cols: UInt32
     public var rows: UInt32
     public var cells: [CellData]
@@ -2877,11 +3152,213 @@ public struct ScreenUpdate: Equatable, Hashable {
     public var cursorCol: UInt32
     public var title: String?
     public var applicationCursorMode: Bool
+    /**
+     * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
+     * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
+     * 実際のテンキーイベントのエンコード(`terminal_numpad_key_bytes`をどう呼ぶか)は
+     * このRustコアではなくUI層のキーエンコーダーが行う。
+     */
+    public var applicationKeypadMode: Bool
     public var bracketedPasteMode: Bool
+    /**
+     * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)の現在値。既定は`Off`。
+     * UI層(#50/#51)はこれを見て、タッチ/ジェスチャイベントをマウスレポートとして
+     * Rustへ送るべきか(＝アプリがマウス報告を要求しているか)を判断できる。
+     */
+    public var mouseReportingMode: MouseReportingMode
+    /**
+     * DECSET/DECRST `?1006`(SGR拡張マウスレポーティング、タスク#36)の現在値。
+     * `mouse_reporting_mode`が`Off`でなくても、この値によって
+     * `Terminal::encode_pointer_event`が生成するバイト列の形式(SGR形式か
+     * レガシーX10形式か)が変わる。UI層は直接使わなくてよいが、デバッグ表示や
+     * 将来のプロトコル分岐のために公開しておく。
+     */
+    public var sgrMouseMode: Bool
+    /**
+     * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
+     */
+    public var cursorVisible: Bool
+    /**
+     * BEL(0x07)受信のたびに単調増加する世代カウンタ。`bool`ではなくカウンタにして
+     * あるのは、conflated チャネル越しに複数回の BEL が1つの`ScreenUpdate`にまとめ
+     * られても呼び出し側が「前回より進んだか」で取りこぼしを検知でき、かつ同一
+     * `ScreenUpdate`の再適用で二重にフィードバック(バイブ/フラッシュ)が
+     * 発火するのを避けられるため。呼び出し側は前回値と比較し、進んでいれば
+     * フィードバックを1回発火させること。OSC のターミネータとして使われた BEL
+     * (`ESC]0;title BEL`)はカウントされない。
+     */
+    public var bellGeneration: UInt64
+    /**
+     * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
+     */
+    public var cursorShape: CursorShape
+    /**
+     * カーソルが点滅すべきかどうか。DECSCUSRの偶数/奇数パラメータ
+     * (block/underline/bar それぞれの steady/blinking)から導出される。既定は`true`
+     * (xtermの既定である「blinking block」に合わせる)。
+     */
+    public var cursorBlink: Bool
+    /**
+     * OSC 8(タスク#40)ハイパーリンクのURL intern表。`CellData::link_id`はこの
+     * `Vec`のindex(0-indexed)。同一URLは重複排除されて同じindexを指す。
+     * このterminalセッションが一度でも見たURLを(現在アクティブでなくなった後も、
+     * RISされた後も)登録上限(`MAX_LINK_TABLE`、タスク#70)まで保持する——
+     * scrollback上の過去セルの`link_id`がこの表のindexを指し続けるため、
+     * indexを再利用したり表自体をクリアしたりすると過去セルが別のURLを指す
+     * 破損になる(`terminal.rs`の`link_table`フィールドdocコメント参照)。上限
+     * 到達後に見た新規URLはインターンされず、そのURLで開かれたリンクはリンク
+     * 無し扱いにフォールバックする(既存セルの`link_id`参照には影響しない)。
+     */
+    public var linkTable: [String]
+    /**
+     * Sixel(タスク#42)で現在アクティブな画像配置の一覧。詳細は[ImagePlacement]参照。
+     */
+    public var images: [ImagePlacement]
+    /**
+     * Kitty keyboard protocol(タスク#54、
+     * <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>)でnegotiateされた
+     * 現在有効なprogressive enhancement flagsのビットマスク。既定は`0`
+     * (legacy mode、拡張無効)。ビットの意味:
+     * `0b00001`=disambiguate escape codes、`0b00010`=report event types
+     * (press/repeat/release)、`0b00100`=report alternate keys(shifted/base
+     * layout)、`0b01000`=report all keys as escape codes、`0b10000`=report
+     * associated text。
+     *
+     * この`Terminal`(rust-core)が担うのはリモートが送ってくる`CSI > flags u`
+     * (push)/`CSI < Pn u`(pop)/`CSI = flags ; mode u`(set)/`CSI ? u`(query、
+     * 応答も自動で行う)を解釈してこの値を保持・公開するところまで(main/alt画面
+     * ごとに独立したflagsスタックを持つ、仕様通りの挙動)。
+     *
+     * 実際のキーイベントのエンコード判断も`application_cursor_mode`(#29)と同じ役割分担
+     * (rust-ssot: 判断ロジックはRust側のSSOT関数に置き、Kotlin/Swiftはこの最新値を
+     * 引数として渡すだけ)——タスク#54実装時点ではこの引数配線が抜けており(タスク#72、
+     * 交渉・公開のみで実際の送信バイト列に無反映というバグ)、修正済み。呼び出し側
+     * (Android`TerminalKeyEncoder.specialKeyBytes`/iOS`TerminalKeyMapper`)は
+     * [terminal_special_key_bytes]へこの値をそのまま渡すこと。現状bit0(disambiguate
+     * escape codes)のEscapeキー(`ESC[27u`化)のみRust側で実装済み——矢印・Home/End・
+     * PageUp/PageDown・F1〜F12は仕様が許容する代替形式が既存のxterm修飾子CSI形式と
+     * 一致するため元々対応不要、Enter/Tab/Backspaceは仕様が明示する例外でlegacyのまま
+     * (詳細は[terminal_special_key_bytes]のdocコメント参照)。bit1〜4(report event
+     * types/alternate keys/all keys as escape codes/associated text)およびCtrl+英字等
+     * 通常テキストキーのCSI u化は未対応(この値の交渉・公開のみ)。
+     */
+    public var kittyKeyboardFlags: UInt16
+    /**
+     * この`ScreenUpdate`で、前回発行時から実際に変化した行の損傷レンジ一覧
+     * (タスク#92、行単位のdamage tracking)。`None`は「全画面が損傷している=グリッド
+     * 全体を再描画せよ」を意味する(初回発行・寸法変更・スクロール等の構造的変更
+     * [タスク#93]で全画面dirtyになるケース)。`Some(vec)`ならそのレンジのセルのみ
+     * 再描画すればよく、`vec`が空なら(セル内容は前回と同一、`title`等の非グリッド
+     * フィールドだけが変わった等で)グリッドの再描画は不要。カーソル行は下地セルが
+     * 不変でも損傷として含まれる(タスク#94、iOSがカーソルをセル内容と同じ描画パスで
+     * 描くため)。UI層がまだこのフィールドを消費していない段階では、`None`扱いで
+     * 全画面再描画にフォールバックすれば従来通りの挙動になる。
+     */
+    public var dirtyRows: [LineDamage]?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, bracketedPasteMode: Bool) {
+    public init(
+        /**
+         * 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
+         * 配信チャネルが`Channel.CONFLATED`(Android)等でconflateされ、中間の発行が
+         * 読み飛ばされる可能性がある——`dirty_rows`は「直前に発行したScreenUpdateとの
+         * 差分」なので、読み飛ばしが起きると欠落分の変化がdirty_rowsに載らず表示が
+         * 化ける。UI層はこの値が前回受信値+1(wrapping)でなければ読み飛ばしがあったと
+         * 判断し、`dirty_rows`を信用せず全画面再描画にフォールバックすること。
+         */updateSeq: UInt32, cols: UInt32, rows: UInt32, cells: [CellData], cursorRow: UInt32, cursorCol: UInt32, title: String?, applicationCursorMode: Bool, 
+        /**
+         * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
+         * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
+         * 実際のテンキーイベントのエンコード(`terminal_numpad_key_bytes`をどう呼ぶか)は
+         * このRustコアではなくUI層のキーエンコーダーが行う。
+         */applicationKeypadMode: Bool, bracketedPasteMode: Bool, 
+        /**
+         * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)の現在値。既定は`Off`。
+         * UI層(#50/#51)はこれを見て、タッチ/ジェスチャイベントをマウスレポートとして
+         * Rustへ送るべきか(＝アプリがマウス報告を要求しているか)を判断できる。
+         */mouseReportingMode: MouseReportingMode, 
+        /**
+         * DECSET/DECRST `?1006`(SGR拡張マウスレポーティング、タスク#36)の現在値。
+         * `mouse_reporting_mode`が`Off`でなくても、この値によって
+         * `Terminal::encode_pointer_event`が生成するバイト列の形式(SGR形式か
+         * レガシーX10形式か)が変わる。UI層は直接使わなくてよいが、デバッグ表示や
+         * 将来のプロトコル分岐のために公開しておく。
+         */sgrMouseMode: Bool, 
+        /**
+         * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
+         */cursorVisible: Bool, 
+        /**
+         * BEL(0x07)受信のたびに単調増加する世代カウンタ。`bool`ではなくカウンタにして
+         * あるのは、conflated チャネル越しに複数回の BEL が1つの`ScreenUpdate`にまとめ
+         * られても呼び出し側が「前回より進んだか」で取りこぼしを検知でき、かつ同一
+         * `ScreenUpdate`の再適用で二重にフィードバック(バイブ/フラッシュ)が
+         * 発火するのを避けられるため。呼び出し側は前回値と比較し、進んでいれば
+         * フィードバックを1回発火させること。OSC のターミネータとして使われた BEL
+         * (`ESC]0;title BEL`)はカウントされない。
+         */bellGeneration: UInt64, 
+        /**
+         * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
+         */cursorShape: CursorShape, 
+        /**
+         * カーソルが点滅すべきかどうか。DECSCUSRの偶数/奇数パラメータ
+         * (block/underline/bar それぞれの steady/blinking)から導出される。既定は`true`
+         * (xtermの既定である「blinking block」に合わせる)。
+         */cursorBlink: Bool, 
+        /**
+         * OSC 8(タスク#40)ハイパーリンクのURL intern表。`CellData::link_id`はこの
+         * `Vec`のindex(0-indexed)。同一URLは重複排除されて同じindexを指す。
+         * このterminalセッションが一度でも見たURLを(現在アクティブでなくなった後も、
+         * RISされた後も)登録上限(`MAX_LINK_TABLE`、タスク#70)まで保持する——
+         * scrollback上の過去セルの`link_id`がこの表のindexを指し続けるため、
+         * indexを再利用したり表自体をクリアしたりすると過去セルが別のURLを指す
+         * 破損になる(`terminal.rs`の`link_table`フィールドdocコメント参照)。上限
+         * 到達後に見た新規URLはインターンされず、そのURLで開かれたリンクはリンク
+         * 無し扱いにフォールバックする(既存セルの`link_id`参照には影響しない)。
+         */linkTable: [String], 
+        /**
+         * Sixel(タスク#42)で現在アクティブな画像配置の一覧。詳細は[ImagePlacement]参照。
+         */images: [ImagePlacement], 
+        /**
+         * Kitty keyboard protocol(タスク#54、
+         * <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>)でnegotiateされた
+         * 現在有効なprogressive enhancement flagsのビットマスク。既定は`0`
+         * (legacy mode、拡張無効)。ビットの意味:
+         * `0b00001`=disambiguate escape codes、`0b00010`=report event types
+         * (press/repeat/release)、`0b00100`=report alternate keys(shifted/base
+         * layout)、`0b01000`=report all keys as escape codes、`0b10000`=report
+         * associated text。
+         *
+         * この`Terminal`(rust-core)が担うのはリモートが送ってくる`CSI > flags u`
+         * (push)/`CSI < Pn u`(pop)/`CSI = flags ; mode u`(set)/`CSI ? u`(query、
+         * 応答も自動で行う)を解釈してこの値を保持・公開するところまで(main/alt画面
+         * ごとに独立したflagsスタックを持つ、仕様通りの挙動)。
+         *
+         * 実際のキーイベントのエンコード判断も`application_cursor_mode`(#29)と同じ役割分担
+         * (rust-ssot: 判断ロジックはRust側のSSOT関数に置き、Kotlin/Swiftはこの最新値を
+         * 引数として渡すだけ)——タスク#54実装時点ではこの引数配線が抜けており(タスク#72、
+         * 交渉・公開のみで実際の送信バイト列に無反映というバグ)、修正済み。呼び出し側
+         * (Android`TerminalKeyEncoder.specialKeyBytes`/iOS`TerminalKeyMapper`)は
+         * [terminal_special_key_bytes]へこの値をそのまま渡すこと。現状bit0(disambiguate
+         * escape codes)のEscapeキー(`ESC[27u`化)のみRust側で実装済み——矢印・Home/End・
+         * PageUp/PageDown・F1〜F12は仕様が許容する代替形式が既存のxterm修飾子CSI形式と
+         * 一致するため元々対応不要、Enter/Tab/Backspaceは仕様が明示する例外でlegacyのまま
+         * (詳細は[terminal_special_key_bytes]のdocコメント参照)。bit1〜4(report event
+         * types/alternate keys/all keys as escape codes/associated text)およびCtrl+英字等
+         * 通常テキストキーのCSI u化は未対応(この値の交渉・公開のみ)。
+         */kittyKeyboardFlags: UInt16, 
+        /**
+         * この`ScreenUpdate`で、前回発行時から実際に変化した行の損傷レンジ一覧
+         * (タスク#92、行単位のdamage tracking)。`None`は「全画面が損傷している=グリッド
+         * 全体を再描画せよ」を意味する(初回発行・寸法変更・スクロール等の構造的変更
+         * [タスク#93]で全画面dirtyになるケース)。`Some(vec)`ならそのレンジのセルのみ
+         * 再描画すればよく、`vec`が空なら(セル内容は前回と同一、`title`等の非グリッド
+         * フィールドだけが変わった等で)グリッドの再描画は不要。カーソル行は下地セルが
+         * 不変でも損傷として含まれる(タスク#94、iOSがカーソルをセル内容と同じ描画パスで
+         * 描くため)。UI層がまだこのフィールドを消費していない段階では、`None`扱いで
+         * 全画面再描画にフォールバックすれば従来通りの挙動になる。
+         */dirtyRows: [LineDamage]?) {
+        self.updateSeq = updateSeq
         self.cols = cols
         self.rows = rows
         self.cells = cells
@@ -2889,7 +3366,18 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.cursorCol = cursorCol
         self.title = title
         self.applicationCursorMode = applicationCursorMode
+        self.applicationKeypadMode = applicationKeypadMode
         self.bracketedPasteMode = bracketedPasteMode
+        self.mouseReportingMode = mouseReportingMode
+        self.sgrMouseMode = sgrMouseMode
+        self.cursorVisible = cursorVisible
+        self.bellGeneration = bellGeneration
+        self.cursorShape = cursorShape
+        self.cursorBlink = cursorBlink
+        self.linkTable = linkTable
+        self.images = images
+        self.kittyKeyboardFlags = kittyKeyboardFlags
+        self.dirtyRows = dirtyRows
     }
 
     
@@ -2908,6 +3396,7 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ScreenUpdate {
         return
             try ScreenUpdate(
+                updateSeq: FfiConverterUInt32.read(from: &buf), 
                 cols: FfiConverterUInt32.read(from: &buf), 
                 rows: FfiConverterUInt32.read(from: &buf), 
                 cells: FfiConverterSequenceTypeCellData.read(from: &buf), 
@@ -2915,11 +3404,23 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 cursorCol: FfiConverterUInt32.read(from: &buf), 
                 title: FfiConverterOptionString.read(from: &buf), 
                 applicationCursorMode: FfiConverterBool.read(from: &buf), 
-                bracketedPasteMode: FfiConverterBool.read(from: &buf)
+                applicationKeypadMode: FfiConverterBool.read(from: &buf), 
+                bracketedPasteMode: FfiConverterBool.read(from: &buf), 
+                mouseReportingMode: FfiConverterTypeMouseReportingMode.read(from: &buf), 
+                sgrMouseMode: FfiConverterBool.read(from: &buf), 
+                cursorVisible: FfiConverterBool.read(from: &buf), 
+                bellGeneration: FfiConverterUInt64.read(from: &buf), 
+                cursorShape: FfiConverterTypeCursorShape.read(from: &buf), 
+                cursorBlink: FfiConverterBool.read(from: &buf), 
+                linkTable: FfiConverterSequenceString.read(from: &buf), 
+                images: FfiConverterSequenceTypeImagePlacement.read(from: &buf), 
+                kittyKeyboardFlags: FfiConverterUInt16.read(from: &buf), 
+                dirtyRows: FfiConverterOptionSequenceTypeLineDamage.read(from: &buf)
         )
     }
 
     public static func write(_ value: ScreenUpdate, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.updateSeq, into: &buf)
         FfiConverterUInt32.write(value.cols, into: &buf)
         FfiConverterUInt32.write(value.rows, into: &buf)
         FfiConverterSequenceTypeCellData.write(value.cells, into: &buf)
@@ -2927,7 +3428,18 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.cursorCol, into: &buf)
         FfiConverterOptionString.write(value.title, into: &buf)
         FfiConverterBool.write(value.applicationCursorMode, into: &buf)
+        FfiConverterBool.write(value.applicationKeypadMode, into: &buf)
         FfiConverterBool.write(value.bracketedPasteMode, into: &buf)
+        FfiConverterTypeMouseReportingMode.write(value.mouseReportingMode, into: &buf)
+        FfiConverterBool.write(value.sgrMouseMode, into: &buf)
+        FfiConverterBool.write(value.cursorVisible, into: &buf)
+        FfiConverterUInt64.write(value.bellGeneration, into: &buf)
+        FfiConverterTypeCursorShape.write(value.cursorShape, into: &buf)
+        FfiConverterBool.write(value.cursorBlink, into: &buf)
+        FfiConverterSequenceString.write(value.linkTable, into: &buf)
+        FfiConverterSequenceTypeImagePlacement.write(value.images, into: &buf)
+        FfiConverterUInt16.write(value.kittyKeyboardFlags, into: &buf)
+        FfiConverterOptionSequenceTypeLineDamage.write(value.dirtyRows, into: &buf)
     }
 }
 
@@ -2944,6 +3456,81 @@ public func FfiConverterTypeScreenUpdate_lift(_ buf: RustBuffer) throws -> Scree
 #endif
 public func FfiConverterTypeScreenUpdate_lower(_ value: ScreenUpdate) -> RustBuffer {
     return FfiConverterTypeScreenUpdate.lower(value)
+}
+
+
+/**
+ * [SessionOrchestrator::search_scrollback]が返す1件のマッチ位置(タスク#37)。
+ *
+ * - `row`: [SessionOrchestrator::scrollback_cells]と同じ規約——0がライブ画面に
+ * 一番近い最新のscrollback行、値が大きいほど過去。マッチした行を表示するには
+ * そのまま`scrollback_cells(row, ...)`系のoffsetとして使える。
+ * - `col`: マッチ開始セルの0-based列。
+ * - `len`: マッチが占める表示列数(セル単位)。全角文字を含む場合は文字数より
+ * 大きくなりうる。
+ *
+ * スコープ外(Fableレビュー2次): scrollbackは折り返しで分割された物理行の
+ * `VecDeque`であり、折り返しをまたいだ論理行単位のマッチ(行末と次行先頭に
+ * またがる文字列)は検出できない。また、scrollbackは上限(`SCROLLBACK_LIMIT`)を
+ * 超えると古い行から追い出されるため、この`row`は呼び出し時点のスナップショットに
+ * 対してのみ有効——新しい出力がscrollbackへ積まれる前に使うこと(呼び出し側は
+ * `row`を長期キャッシュせず、ジャンプ操作のたびに検索し直す運用を想定する)。
+ */
+public struct ScrollbackSearchMatch: Equatable, Hashable {
+    public var row: UInt32
+    public var col: UInt32
+    public var len: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(row: UInt32, col: UInt32, len: UInt32) {
+        self.row = row
+        self.col = col
+        self.len = len
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ScrollbackSearchMatch: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeScrollbackSearchMatch: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ScrollbackSearchMatch {
+        return
+            try ScrollbackSearchMatch(
+                row: FfiConverterUInt32.read(from: &buf), 
+                col: FfiConverterUInt32.read(from: &buf), 
+                len: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ScrollbackSearchMatch, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.row, into: &buf)
+        FfiConverterUInt32.write(value.col, into: &buf)
+        FfiConverterUInt32.write(value.len, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeScrollbackSearchMatch_lift(_ buf: RustBuffer) throws -> ScrollbackSearchMatch {
+    return try FfiConverterTypeScrollbackSearchMatch.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeScrollbackSearchMatch_lower(_ value: ScrollbackSearchMatch) -> RustBuffer {
+    return FfiConverterTypeScrollbackSearchMatch.lower(value)
 }
 
 
@@ -3160,6 +3747,75 @@ public func FfiConverterTypeTerminalFrameBatch_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeTerminalFrameBatch_lower(_ value: TerminalFrameBatch) -> RustBuffer {
     return FfiConverterTypeTerminalFrameBatch.lower(value)
+}
+
+
+/**
+ * xterm互換の修飾キー状態。`terminal_special_key_bytes`へ渡し、矢印・Home/End・
+ * PageUp/Down・F1〜F12のシーケンスに修飾子パラメータを付与するために使う
+ * (Ctrl+矢印でreadline/tmuxのワード単位移動等を機能させるため、`TERM=xterm-256color`
+ * が広告する修飾子付きシーケンスをこちら側でも生成する必要がある)。
+ * 全フィールドfalse(修飾なし)は`Default`で表す。
+ */
+public struct TerminalKeyModifiers: Equatable, Hashable {
+    public var shift: Bool
+    public var alt: Bool
+    public var ctrl: Bool
+    public var meta: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(shift: Bool, alt: Bool, ctrl: Bool, meta: Bool) {
+        self.shift = shift
+        self.alt = alt
+        self.ctrl = ctrl
+        self.meta = meta
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TerminalKeyModifiers: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTerminalKeyModifiers: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TerminalKeyModifiers {
+        return
+            try TerminalKeyModifiers(
+                shift: FfiConverterBool.read(from: &buf), 
+                alt: FfiConverterBool.read(from: &buf), 
+                ctrl: FfiConverterBool.read(from: &buf), 
+                meta: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TerminalKeyModifiers, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.shift, into: &buf)
+        FfiConverterBool.write(value.alt, into: &buf)
+        FfiConverterBool.write(value.ctrl, into: &buf)
+        FfiConverterBool.write(value.meta, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalKeyModifiers_lift(_ buf: RustBuffer) throws -> TerminalKeyModifiers {
+    return try FfiConverterTypeTerminalKeyModifiers.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalKeyModifiers_lower(_ value: TerminalKeyModifiers) -> RustBuffer {
+    return FfiConverterTypeTerminalKeyModifiers.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -3425,6 +4081,88 @@ public func FfiConverterTypeConnectionPublicState_lower(_ value: ConnectionPubli
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * DECSCUSR(`CSI Ps SP q`)が選択するカーソル形状。`Terminal`が状態として保持し
+ * (rust-ssot: Kotlin/Swift側にミラー状態を作らず、この値をそのまま描画に使う)、
+ * `ScreenUpdate::cursor_shape`として公開する。点滅の有無は別フィールド
+ * (`ScreenUpdate::cursor_blink`)で表現する——DECSET/DECRST `?12`(`CSI ?12h`/
+ * `CSI ?12l`、点滅on/offのみを切り替えるレガシー制御、タスク#55)がDECSCUSRとは
+ * 独立に同じ`cursor_blink`フィールドを更新できるよう、形状と点滅を分離してある。
+ */
+
+public enum CursorShape: Equatable, Hashable {
+    
+    case block
+    case underline
+    case bar
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension CursorShape: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCursorShape: FfiConverterRustBuffer {
+    typealias SwiftType = CursorShape
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CursorShape {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .block
+        
+        case 2: return .underline
+        
+        case 3: return .bar
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CursorShape, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .block:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .underline:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .bar:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCursorShape_lift(_ buf: RustBuffer) throws -> CursorShape {
+    return try FfiConverterTypeCursorShape.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCursorShape_lower(_ value: CursorShape) -> RustBuffer {
+    return FfiConverterTypeCursorShape.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * ポートフォワード待受の状態。`OrchestratorCallback::on_forward_state_changed` で通知される。
  */
 
@@ -3589,6 +4327,298 @@ public func FfiConverterTypeForwardType_lift(_ buf: RustBuffer) throws -> Forwar
 #endif
 public func FfiConverterTypeForwardType_lower(_ value: ForwardType) -> RustBuffer {
     return FfiConverterTypeForwardType.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * マウスレポーティング(タスク#36)対象のボタン。左/中/右クリックに加え、
+ * モバイルでの主なユースケースであるホイール(縦スクロールジェスチャ)を含める
+ * (Fableレビュー指摘: wheelボタン64/65のエンコードを範囲に含める)。
+ * 横スクロールホイール(button 6/7)・追加ボタン(button 8以降)は現状使う予定が
+ * ないため未対応(必要になったタスクで追加する)。UI層(#50/#51)が生ポインタ
+ * イベントを`terminal_pointer_event_bytes`(タスク#51)へ渡す際にも使うため
+ * `uniffi::Enum`として公開する。
+ */
+
+public enum MouseButton: Equatable, Hashable {
+    
+    case left
+    case middle
+    case right
+    case wheelUp
+    case wheelDown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MouseButton: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMouseButton: FfiConverterRustBuffer {
+    typealias SwiftType = MouseButton
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MouseButton {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .left
+        
+        case 2: return .middle
+        
+        case 3: return .right
+        
+        case 4: return .wheelUp
+        
+        case 5: return .wheelDown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MouseButton, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .left:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .middle:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .right:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .wheelUp:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .wheelDown:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMouseButton_lift(_ buf: RustBuffer) throws -> MouseButton {
+    return try FfiConverterTypeMouseButton.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMouseButton_lower(_ value: MouseButton) -> RustBuffer {
+    return FfiConverterTypeMouseButton.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * マウスレポーティング(タスク#36)対象のイベント種別。`MouseButton`と同じ理由で
+ * `uniffi::Enum`として公開する。
+ */
+
+public enum MouseEventKind: Equatable, Hashable {
+    
+    /**
+     * ボタン押下(ホイールは常にこの種別で表す — ホイールにはreleaseの概念が無い)。
+     */
+    case press
+    /**
+     * ボタン解放。
+     */
+    case release
+    /**
+     * ポインタ移動。`button`が`Some`ならドラッグ(ボタンを押したまま移動)、
+     * `None`なら単純なホバー移動。
+     */
+    case motion
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MouseEventKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMouseEventKind: FfiConverterRustBuffer {
+    typealias SwiftType = MouseEventKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MouseEventKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .press
+        
+        case 2: return .release
+        
+        case 3: return .motion
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MouseEventKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .press:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .release:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .motion:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMouseEventKind_lift(_ buf: RustBuffer) throws -> MouseEventKind {
+    return try FfiConverterTypeMouseEventKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMouseEventKind_lower(_ value: MouseEventKind) -> RustBuffer {
+    return FfiConverterTypeMouseEventKind.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)が切り替えるマウスレポーティング
+ * モード。`Terminal`が状態として保持し(rust-ssot: Kotlin/Swift側にミラー状態を
+ * 作らず、この値をそのまま`ScreenUpdate`経由でUI層のジェスチャ裁定に使う——
+ * `application_cursor_mode`/`bracketed_paste_mode`と同じ確立済みパターン)、
+ * タッチ/ジェスチャイベントをRustへ送るかどうか・どう解釈するかをUI層(#50/#51)が
+ * 決める材料にする。実際のエンコード判断(どのイベント種別を報告するか)自体は
+ * `Terminal::encode_pointer_event`がこの値を見て行うため、UI層はこの値を
+ * 「テキスト選択ジェスチャに倒すかマウスレポートに倒すか」の判断にのみ使えばよい。
+ *
+ * xterm実装に倣い、`?1000`/`?1002`/`?1003`は同一の内部状態を共有する——
+ * 複数を続けてset(`h`)した場合は最後にsetしたモードが有効になり、いずれかを
+ * reset(`l`)すると番号に関わらずOffへ戻る(`terminal.rs::csi_dispatch`参照)。
+ */
+
+public enum MouseReportingMode: Equatable, Hashable {
+    
+    /**
+     * マウスレポーティング無効(既定)。
+     */
+    case off
+    /**
+     * `?1000`: ボタンのpress/releaseのみ報告する(移動は報告しない)。
+     */
+    case normal
+    /**
+     * `?1002`: 上記に加え、ボタンを押したままのドラッグ移動も報告する。
+     */
+    case buttonEvent
+    /**
+     * `?1003`: ボタン状態に関係なく全ての移動を報告する(any-event tracking)。
+     */
+    case anyEvent
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MouseReportingMode: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMouseReportingMode: FfiConverterRustBuffer {
+    typealias SwiftType = MouseReportingMode
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MouseReportingMode {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .off
+        
+        case 2: return .normal
+        
+        case 3: return .buttonEvent
+        
+        case 4: return .anyEvent
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MouseReportingMode, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .off:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .normal:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .buttonEvent:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .anyEvent:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMouseReportingMode_lift(_ buf: RustBuffer) throws -> MouseReportingMode {
+    return try FfiConverterTypeMouseReportingMode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMouseReportingMode_lower(_ value: MouseReportingMode) -> RustBuffer {
+    return FfiConverterTypeMouseReportingMode.lower(value)
 }
 
 
@@ -3845,6 +4875,195 @@ public func FfiConverterTypeSshError_lift(_ buf: RustBuffer) throws -> SshError 
 public func FfiConverterTypeSshError_lower(_ value: SshError) -> RustBuffer {
     return FfiConverterTypeSshError.lower(value)
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * アプリケーションキーパッドモード(DECKPAM/DECKPNM、タスク#43)対応が必要な
+ * テンキー(numeric keypad)キー。VT220の物理keypadにある0〜9・`,`・`-`(Subtract)・
+ * `.`(Decimal)・Enterに加え、xterm/主要ターミナルエミュレータが同じ`ESC O <letter>`
+ * テーブルへ拡張している`+`(Add)・`*`(Multiply)・`/`(Divide)・`=`(Equals)を含む。
+ * 左右カッコ(Android `KEYCODE_NUMPAD_LEFT_PAREN`/`KEYCODE_NUMPAD_RIGHT_PAREN`)は
+ * このテーブルに存在せず両モードで常に同じリテラル文字を送るため対象外——
+ * 呼び出し側は通常のUnicode文字経路([terminal_unicode_char_bytes])にフォール
+ * バックすること。
+ */
+
+public enum TerminalNumpadKey: Equatable, Hashable {
+    
+    case digit0
+    case digit1
+    case digit2
+    case digit3
+    case digit4
+    case digit5
+    case digit6
+    case digit7
+    case digit8
+    case digit9
+    case decimal
+    case comma
+    case add
+    case subtract
+    case multiply
+    case divide
+    case enter
+    case equals
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TerminalNumpadKey: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTerminalNumpadKey: FfiConverterRustBuffer {
+    typealias SwiftType = TerminalNumpadKey
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TerminalNumpadKey {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .digit0
+        
+        case 2: return .digit1
+        
+        case 3: return .digit2
+        
+        case 4: return .digit3
+        
+        case 5: return .digit4
+        
+        case 6: return .digit5
+        
+        case 7: return .digit6
+        
+        case 8: return .digit7
+        
+        case 9: return .digit8
+        
+        case 10: return .digit9
+        
+        case 11: return .decimal
+        
+        case 12: return .comma
+        
+        case 13: return .add
+        
+        case 14: return .subtract
+        
+        case 15: return .multiply
+        
+        case 16: return .divide
+        
+        case 17: return .enter
+        
+        case 18: return .equals
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TerminalNumpadKey, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .digit0:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .digit1:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .digit2:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .digit3:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .digit4:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .digit5:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .digit6:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .digit7:
+            writeInt(&buf, Int32(8))
+        
+        
+        case .digit8:
+            writeInt(&buf, Int32(9))
+        
+        
+        case .digit9:
+            writeInt(&buf, Int32(10))
+        
+        
+        case .decimal:
+            writeInt(&buf, Int32(11))
+        
+        
+        case .comma:
+            writeInt(&buf, Int32(12))
+        
+        
+        case .add:
+            writeInt(&buf, Int32(13))
+        
+        
+        case .subtract:
+            writeInt(&buf, Int32(14))
+        
+        
+        case .multiply:
+            writeInt(&buf, Int32(15))
+        
+        
+        case .divide:
+            writeInt(&buf, Int32(16))
+        
+        
+        case .enter:
+            writeInt(&buf, Int32(17))
+        
+        
+        case .equals:
+            writeInt(&buf, Int32(18))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalNumpadKey_lift(_ buf: RustBuffer) throws -> TerminalNumpadKey {
+    return try FfiConverterTypeTerminalNumpadKey.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTerminalNumpadKey_lower(_ value: TerminalNumpadKey) -> RustBuffer {
+    return FfiConverterTypeTerminalNumpadKey.lower(value)
+}
+
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
@@ -5088,6 +6307,30 @@ fileprivate struct FfiConverterOptionUInt16: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = UInt32?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt32.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionInt32: FfiConverterRustBuffer {
     typealias SwiftType = Int32?
 
@@ -5304,6 +6547,54 @@ fileprivate struct FfiConverterOptionTypeConnectionIssueHint: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeMouseButton: FfiConverterRustBuffer {
+    typealias SwiftType = MouseButton?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMouseButton.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMouseButton.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceTypeLineDamage: FfiConverterRustBuffer {
+    typealias SwiftType = [LineDamage]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeLineDamage.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeLineDamage.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
     typealias SwiftType = [UInt32]
 
@@ -5429,6 +6720,56 @@ fileprivate struct FfiConverterSequenceTypeDiagnosticEventEnvelope: FfiConverter
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeImagePlacement: FfiConverterRustBuffer {
+    typealias SwiftType = [ImagePlacement]
+
+    public static func write(_ value: [ImagePlacement], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeImagePlacement.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ImagePlacement] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ImagePlacement]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeImagePlacement.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLineDamage: FfiConverterRustBuffer {
+    typealias SwiftType = [LineDamage]
+
+    public static func write(_ value: [LineDamage], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLineDamage.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LineDamage] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LineDamage]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLineDamage.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypePackedRow: FfiConverterRustBuffer {
     typealias SwiftType = [PackedRow]
 
@@ -5471,6 +6812,31 @@ fileprivate struct FfiConverterSequenceTypePortForward: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypePortForward.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuffer {
+    typealias SwiftType = [ScrollbackSearchMatch]
+
+    public static func write(_ value: [ScrollbackSearchMatch], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeScrollbackSearchMatch.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ScrollbackSearchMatch] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ScrollbackSearchMatch]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeScrollbackSearchMatch.read(from: &buf))
         }
         return seq
     }
@@ -5617,16 +6983,125 @@ public func terminalCtrlByte(codePoint: UInt32) -> UInt8?  {
 })
 }
 /**
- * 特殊キーを、ターミナルへ送信するバイト列(ANSI/xtermエスケープシーケンス)に
- * 変換する。矢印キーは`application_cursor_mode`が有効ならSS3形式(`ESC O A`等、
- * DECCKM)、無効ならCSI形式(`ESC[A`等)を返す。F1〜F4はSS3形式、F5〜F12は
- * CSI `~`形式(xterm互換)。未対応のfunction key番号は空配列を返す。
+ * Kitty keyboard protocol(タスク#54/#72)のbit0(disambiguate escape codes)有効時、
+ * Ctrl/Alt(/その組み合わせ・Shift+Alt)付きの印字可能文字キーをCSI u形式
+ * (`ESC[<codepoint>;<modifier>u`)へエンコードする(タスク#91)。
+ *
+ * - `code_point`はキーの無修飾時の基本コードポイント(例: Ctrl+AでもAndroid
+ * `event.getUnicodeChar(0)`が返す小文字相当の`'a'`)を渡すこと。呼び出し側で
+ * 大文字/小文字を判定する必要はない(この関数が`to_ascii_lowercase`する)。
+ * - `modifier`はxterm/kitty共通のエンコード: `1 + shift(1) + alt(2) + ctrl(4) + meta(8)`。
+ * - bit0が立っていない場合、`code_point`が印字可能文字でない場合、修飾キー
+ * (Ctrl/Alt)が両方とも押されていない場合は`None`を返す——呼び出し側は
+ * `terminal_ctrl_byte`(legacy Ctrl)や"ESCプレフィックス"(legacy Alt)といった
+ * 既存のフォールバック処理へ進むこと。
+ * - Kitty仕様上の例外キー(Enter/Tab/Backspace)は`TerminalSpecialKey`経由の
+ * 既存分岐が別途処理するためこの関数の対象外(呼び出し側で特殊キー判定を
+ * この関数より先に行うこと)。
  */
-public func terminalSpecialKeyBytes(key: TerminalSpecialKey, applicationCursorMode: Bool) -> Data  {
+public func terminalKittyDisambiguatedKeyBytes(codePoint: UInt32, modifiers: TerminalKeyModifiers, kittyFlags: UInt16) -> Data?  {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_terminal_kitty_disambiguated_key_bytes(
+        FfiConverterUInt32.lower(codePoint),
+        FfiConverterTypeTerminalKeyModifiers_lower(modifiers),
+        FfiConverterUInt16.lower(kittyFlags),$0
+    )
+})
+}
+/**
+ * テンキーのバイト列。`application_keypad_mode`(DECKPAM、`Terminal`が`ESC =`/
+ * `ESC >`で切り替える、`ScreenUpdate::application_keypad_mode`経由で公開)が
+ * `true`ならSS3形式(`ESC O <letter>`、xterm/VT220のapplication keypadテーブルに
+ * 準拠)、`false`なら通常のリテラル文字(Enterのみ`0x0D`、`TerminalSpecialKey::Enter`
+ * と同じ)を返す。`application_cursor_mode`(#29)と同じ「Rust側は変換ロジックのみ、
+ * どのキーコードがどの[TerminalNumpadKey]に対応するかの判定はUI層が行う」という
+ * 役割分担。
+ */
+public func terminalNumpadKeyBytes(key: TerminalNumpadKey, applicationKeypadMode: Bool) -> Data  {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_terminal_numpad_key_bytes(
+        FfiConverterTypeTerminalNumpadKey_lower(key),
+        FfiConverterBool.lower(applicationKeypadMode),$0
+    )
+})
+}
+/**
+ * タスク#51: UI層(Android/iOSのジェスチャハンドラ)が座標付きの生ポインタ
+ * イベントを、現在のマウスレポーティング状態に従ってターミナルへ送るべき
+ * バイト列にエンコードする。`Terminal::encode_pointer_event`(タスク#36)と
+ * 同じロジック(`terminal::encode_pointer_event_bytes`)を、実行中のセッション
+ * (`SessionOrchestrator`)を経由せずに直接呼べる純粋関数として公開する
+ * (`terminal_special_key_bytes`/`terminal_commit_text_bytes`と同じ設計: UI層は
+ * 直近の`ScreenUpdate`から読んだ`mouse_reporting_mode`/`sgr_mouse_mode`/`cols`/
+ * `rows`をそのまま引数として渡すだけでよく、「今どのマウスモードか」の判断
+ * ロジック自体はここに一元化されたまま——rust-ssot: Kotlin/Swift側に判断ロジックの
+ * ミラーを作らない)。
+ *
+ * 報告すべきでないイベント(`mouse_reporting_mode`がOff、またはモードが対象外の
+ * イベント種別)は`None`を返す。呼び出し元はこれを「何も送らない」の合図として
+ * 扱い、代わりに通常のタッチ処理(テキスト選択・スクロールバックスワイプ等)に
+ * フォールバックすればよい。
+ *
+ * `row`/`col`は0-basedのセル座標(画面外の値は端末サイズ`cols`/`rows`へ
+ * クランプされる、`terminal::encode_pointer_event_bytes`のdocコメント参照)。
+ */
+public func terminalPointerEventBytes(kind: MouseEventKind, button: MouseButton?, row: UInt32, col: UInt32, modifiers: TerminalKeyModifiers, cols: UInt32, rows: UInt32, mouseReportingMode: MouseReportingMode, sgrMouseMode: Bool) -> Data?  {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(
+        FfiConverterTypeMouseEventKind_lower(kind),
+        FfiConverterOptionTypeMouseButton.lower(button),
+        FfiConverterUInt32.lower(row),
+        FfiConverterUInt32.lower(col),
+        FfiConverterTypeTerminalKeyModifiers_lower(modifiers),
+        FfiConverterUInt32.lower(cols),
+        FfiConverterUInt32.lower(rows),
+        FfiConverterTypeMouseReportingMode_lower(mouseReportingMode),
+        FfiConverterBool.lower(sgrMouseMode),$0
+    )
+})
+}
+/**
+ * 特殊キーを、ターミナルへ送信するバイト列(ANSI/xtermエスケープシーケンス)に
+ * 変換する。
+ *
+ * - 矢印キーは、修飾子が一切無い場合のみ`application_cursor_mode`(DECCKM)に従い
+ * SS3形式(`ESC O A`等)/CSI形式(`ESC[A`等)を切り替える。**修飾子が1つでも
+ * 付いている場合はDECCKMの値に関わらず常にCSI形式**(`ESC[1;5A`等、xterm互換)
+ * になる(DECCKMはSS3/CSIの切替のみを制御し、修飾子パラメータ付きシーケンスは
+ * 元々CSI形式でしか表現できないため)。
+ * - Home/End/PageUp/PageDownも同様に、修飾子が無ければ従来通りの無パラメータ形式
+ * (`ESC[H`/`ESC[5~`等)、修飾子があればパラメータ付き(`ESC[1;5H`/`ESC[5;5~`等)。
+ * - F1〜F4は修飾子が無ければSS3形式(`ESC O P`等)だが、修飾子が付くと
+ * SS3では修飾子パラメータを表現できないため**CSI形式に切り替わる**
+ * (`ESC[1;5P`等)。F5〜F12はどちらの場合もCSI `~`形式(修飾子有りなら
+ * `ESC[15;5~`等)。未対応のfunction key番号は空配列を返す。
+ * - Tabは修飾子無しなら`0x09`だが、Shift単独の場合はCBT(Cursor Backward Tab、
+ * `ESC[Z`)を返す(readline/tmux等の「戻りタブ補完」に必要。xterm互換で
+ * パラメータは付かない)。Shift以外の修飾子(Ctrl+Tab等)はターミナル制御
+ * シーケンスとして標準化されていないため無視し、無修飾のTabとして扱う。
+ * - `kitty_flags`(タスク#54で交渉・`ScreenUpdate::kitty_keyboard_flags`として公開される
+ * Kitty keyboard protocolのnegotiated flags、呼び出し側はそこから取得した最新値を
+ * 毎回渡すこと)にbit0(`0b1`、disambiguate escape codes)が立っている場合のみEscapeキーが
+ * `ESC[27u`(Kitty `CSI u`形式)になる。Escapeキー(バイト`0x1B`)は本来それ自体が任意の
+ * エスケープシーケンスの開始バイトと衝突しうるためこのbitが名指しする典型例
+ * (<https://sw.kovidgoyal.net/kitty/keyboard-protocol/#disambiguate>: "pressing the Esc
+ * key generates the byte 0x1b which also is used to indicate the start of an escape
+ * code")であり、Kitty仕様は無条件で`CSI u`化するよう定めている。矢印・Home/End・
+ * PageUp/PageDown・F1〜F12は、同仕様が明示的に許容する代替形式
+ * (`CSI 1;<mod>[~ABCDEFHPQS]`)が既存のxterm修飾子CSI形式と完全に一致するため、
+ * `kitty_flags`に関わらず上記の挙動をそのまま流用してよい(変更不要)。Enter/Tab/
+ * Delete(Backspace相当)/ForwardDeleteも仕様が明示する例外("still generate the same
+ * bytes as in legacy mode")でありlegacy形式のまま。Ctrl+英字等の通常テキストキー
+ * (`terminal_ctrl_byte`/Unicode文字経路)のCSI u化は本関数のスコープ外(未対応、
+ * タスク#72では見送り——`ScreenUpdate::kitty_keyboard_flags`のdocコメント参照)。
+ */
+public func terminalSpecialKeyBytes(key: TerminalSpecialKey, applicationCursorMode: Bool, modifiers: TerminalKeyModifiers, kittyFlags: UInt16) -> Data  {
     return try!  FfiConverterData.lift(try! rustCall() {
     uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(
         FfiConverterTypeTerminalSpecialKey_lower(key),
-        FfiConverterBool.lower(applicationCursorMode),$0
+        FfiConverterBool.lower(applicationCursorMode),
+        FfiConverterTypeTerminalKeyModifiers_lower(modifiers),
+        FfiConverterUInt16.lower(kittyFlags),$0
     )
 })
 }
@@ -5725,7 +7200,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte() != 39410) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 46056) {
+    if (uniffi_isekai_terminal_core_checksum_func_terminal_kitty_disambiguated_key_bytes() != 62321) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes() != 1311) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 25125) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 49859) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes() != 52901) {
@@ -5815,6 +7299,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 47947) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning() != 20700) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5837,6 +7324,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_len() != 48916) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_search_scrollback() != 27310) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send() != 59935) {

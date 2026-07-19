@@ -2,6 +2,8 @@ package tools.isekai.terminal
 
 import android.app.Application
 import android.net.Uri
+import android.os.VibrationEffect
+import android.os.Vibrator
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import java.util.UUID
@@ -38,6 +40,7 @@ import uniffi.isekai_terminal_core.CellData
 import uniffi.isekai_terminal_core.ClipboardMimeKind
 import uniffi.isekai_terminal_core.ClipboardPayload
 import uniffi.isekai_terminal_core.PlatformFd
+import uniffi.isekai_terminal_core.ScrollbackSearchMatch
 
 /**
  * 複数タブ（複数 SSH/QUIC セッション）を横断する Application スコープの状態管理。
@@ -209,6 +212,16 @@ class TerminalTabsViewModel(
                 },
                 acquireCellularFd = {
                     runBlocking { rebindFdSource.acquireCellularFd() }?.let { (fd, ip) -> PlatformFd(fd, ip) }
+                },
+                // #25: 端末ベル(BEL)受信時の触覚フィードバック。判断(取りこぼし無く1回だけ
+                // 発火させる`bell_generation`の単調増加チェック)は[TerminalSession]側で
+                // 完結しており、ここでは実際にバイブレーションを鳴らすだけ(rust-ssot.md、
+                // `onClipboardWriteRequested`と同じ構成)。振動できないデバイス/権限が
+                // 無い場合は`vibrator`が非nullでも`hasVibrator()`がfalseになりうるが、
+                // `vibrate()`自体は黙って無視されるだけなので個別ハンドリング不要。
+                onBell = {
+                    val vibrator = app.getSystemService(Vibrator::class.java)
+                    vibrator?.vibrate(VibrationEffect.createOneShot(150, VibrationEffect.DEFAULT_AMPLITUDE))
                 },
             )
         },
@@ -673,9 +686,15 @@ class TerminalTabsViewModel(
 
     fun sendKeySequenceToPane(address: PaneAddress, steps: List<KeyStep>) {
         val pane = paneOrNull(address) ?: return
-        val applicationCursorMode = pane.session.state.value.screenUpdate?.applicationCursorMode ?: false
+        val screenUpdate = pane.session.state.value.screenUpdate
+        val applicationCursorMode = screenUpdate?.applicationCursorMode ?: false
+        // DECKPAM/DECKPNM(タスク#43)。テンキーのKeyStep.Specialを含む打鍵列でも、物理
+        // キーボード経由と同じくRust由来の現在のkeypad modeに従わせる(codexレビュー指摘:
+        // 未伝播だとテンキーを含む打鍵列が常にnumeric modeとして送信されてしまっていた)。
+        val applicationKeypadMode = screenUpdate?.applicationKeypadMode ?: false
+        val kittyKeyboardFlags = screenUpdate?.kittyKeyboardFlags ?: 0u
         RemoteLogger.i("IsekaiTerminalKeySequence", "send key sequence (${steps.size} steps) tab=${address.tabId} pane=${address.paneId}")
-        pane.session.send(KeySequenceCommands.toBytes(steps, applicationCursorMode))
+        pane.session.send(KeySequenceCommands.toBytes(steps, applicationCursorMode, applicationKeypadMode, kittyKeyboardFlags))
     }
 
     // ── 接続後自動実行コマンド ────────────────────────────────────
@@ -717,6 +736,12 @@ class TerminalTabsViewModel(
 
     fun scrollbackCellsForPane(address: PaneAddress, offset: Int, rows: Int): List<CellData>? =
         withPane(address) { it.session.scrollbackCells(offset, rows) }
+
+    /** タスク#66: スクロールバック検索。対象ペインが無ければ(withPaneがnullを返す
+     *  場合)空リストを返す——[TerminalSession.searchScrollback]自体の「未接続時は空
+     *  リスト」という契約と揃える。 */
+    fun searchScrollbackForPane(address: PaneAddress, query: String, caseSensitive: Boolean): List<ScrollbackSearchMatch> =
+        withPane(address) { it.session.searchScrollback(query, caseSensitive) } ?: emptyList()
 
     fun trustUpdatedHostKeyForPane(address: PaneAddress) = withPane(address) { it.session.trustUpdatedHostKey() }
 

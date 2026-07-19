@@ -39,6 +39,22 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
     /// 通常のテキスト確定ではなくCtrl制御バイト(`terminal_ctrl_byte`)として送信する。
     /// 該当する1文字を処理し終えたら自動的にfalseへ戻る(トグル式)。
     public var ctrlArmed: Bool = false
+    /// タスク#63: ハードウェアキーボードの矢印キーが`applicationCursorMode`
+    /// (DECCKM、`ScreenUpdate.applicationCursorMode`)に従ってSS3/CSIを切り替える
+    /// ために必要。`bracketedPasteMode`と同じく、Rust側の状態をそのまま反映する
+    /// だけで新しいミラー状態は作らない(`TerminalView`の`updateUIView`参照)。
+    public var applicationCursorMode: Bool = false
+    /// タスク#82: ハードウェアキーボードのテンキー(numpad)が`applicationKeypadMode`
+    /// (DECKPAM、`ScreenUpdate.applicationKeypadMode`)に従ってSS3/リテラル文字を
+    /// 切り替えるために必要。`applicationCursorMode`と同じく、Rust側の状態をそのまま
+    /// 反映するだけで新しいミラー状態は作らない(`TerminalView`の`updateUIView`参照)。
+    public var applicationKeypadMode: Bool = false
+    /// タスク#72: Kitty keyboard protocol(タスク#54)のnegotiated flags
+    /// (`ScreenUpdate.kittyKeyboardFlags`)。ハードウェアキーボードのEscapeキーが
+    /// disambiguate escape codes(bit0)を反映するために必要。`applicationCursorMode`と
+    /// 同じく、Rust側の状態をそのまま反映するだけで新しいミラー状態は作らない
+    /// (`TerminalView`の`updateUIView`参照)。
+    public var kittyKeyboardFlags: UInt16 = 0
 
     public override init(frame: CGRect) {
         super.init(frame: frame)
@@ -93,6 +109,77 @@ public final class TerminalIMEInputView: UIView, UIKeyInput, UITextInput {
             committedText = buffer
         }
         onSendBytes?(Data([0x7F]))
+    }
+
+    // MARK: - タスク#63: ハードウェアキーボードの特殊キー入力経路
+
+    /// `UITextInput`(`insertText`/`deleteBackward`)ではハードウェアキーボードから
+    /// 届かない特殊キー(矢印/Home/End/PageUp/PageDown/Escape/Tab/前方削除/F1〜F12)と、
+    /// 物理Ctrl併用の制御コード送出をここで処理する。認識できなかった/意図的に
+    /// 対象外にしたキー(通常の文字入力・Backspace・IME組成用のOption併用等)は
+    /// `super.pressesBegan`へフォールスルーし、既存の`UITextInput`経路(このview自身の
+    /// `insertText`/`deleteBackward`)にそのまま委ねる(Appleが推奨する「未処理分だけ
+    /// superに渡す」パターン)。
+    public override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var unhandledPresses = presses
+        for press in presses {
+            guard let key = press.key, handleHardwareKeyPress(key) else { continue }
+            unhandledPresses.remove(press)
+        }
+        guard !unhandledPresses.isEmpty else { return }
+        super.pressesBegan(unhandledPresses, with: event)
+    }
+
+    /// 1つの`UIKey`を処理できたら`true`(呼び出し元は該当`UIPress`を消費済み扱いにする)。
+    private func handleHardwareKeyPress(_ key: UIKey) -> Bool {
+        let modifiers = TerminalHardwareKeyMapper.modifiers(for: key.modifierFlags)
+
+        // 矢印/Escape/Tab等の特殊キーは、日本語IME変換中(marked textが残っている間)は
+        // 候補選択・変換取消・フォーカス移動としてUIKit/IMEに委ねるためフォールスルー
+        // する(タスク#73、Android版`TerminalInputConnection.sendKeyEvent`の
+        // `!composing`ガードと同じ方針)。
+        if let specialKey = TerminalHardwareKeyMapper.specialKey(for: key.keyCode), markedTextRange == nil {
+            let bytes = TerminalKeyMapper.bytes(for: specialKey, applicationCursorMode: applicationCursorMode, modifiers: modifiers, kittyFlags: kittyKeyboardFlags)
+            guard !bytes.isEmpty else { return false }
+            onSendBytes?(Data(bytes))
+            return true
+        }
+
+        // タスク#82: テンキー(numpad)は`applicationKeypadMode`(DECKPAM)に従って
+        // SS3シーケンス/リテラル文字を切り替える(Android版`TerminalKeyEncoder`の
+        // `KC_NUMPAD_*`分岐と同じ方針)。矢印等と同様、日本語IME変換中は候補選択に
+        // 委ねるためフォールスルーする。
+        if let numpadKey = TerminalHardwareKeyMapper.numpadKey(for: key.keyCode), markedTextRange == nil {
+            let bytes = terminalNumpadKeyBytes(key: numpadKey, applicationKeypadMode: applicationKeypadMode)
+            guard !bytes.isEmpty else { return false }
+            onSendBytes?(bytes)
+            return true
+        }
+
+        // Kitty keyboard protocol(タスク#54)のdisambiguate escape codes(bit0)が交渉
+        // されている場合、Ctrl/Alt(併用含む)付きの印字可能文字キーはCSI u形式で送る
+        // (タスク#91、Android版`TerminalInputConnection.sendKeyEvent`の同種分岐と対称。
+        // 未交渉時はnilを返しlegacyエンコード(下のCtrl分岐)へフォールスルーする)。
+        // 日本語IME変換中は誤発火防止のためフォールスルーする。
+        if (modifiers.ctrl || modifiers.alt), !modifiers.meta, markedTextRange == nil,
+           let scalar = key.charactersIgnoringModifiers.unicodeScalars.first,
+           let kittyBytes = TerminalKeyMapper.kittyDisambiguatedKeyBytes(codePoint: scalar.value, modifiers: modifiers, kittyFlags: kittyKeyboardFlags) {
+            onSendBytes?(Data(kittyBytes))
+            return true
+        }
+
+        // 物理Ctrl押下(Alt/Cmd併用は除く、二重変換防止)。日本語IME変換中(marked text
+        // が残っている間)は誤発火防止のためフォールスルーする(Android版
+        // `TerminalInputConnection.sendKeyEvent`の`!composing`ガードと同じ方針、
+        // 日本語IME完全対応を壊さないための措置)。
+        if modifiers.ctrl, !modifiers.alt, !modifiers.meta, markedTextRange == nil,
+           let scalar = key.charactersIgnoringModifiers.unicodeScalars.first,
+           let ctrlByte = terminalCtrlByte(codePoint: scalar.value) {
+            onSendBytes?(Data([ctrlByte]))
+            return true
+        }
+
+        return false
     }
 
     // MARK: - UITextInput: marked text

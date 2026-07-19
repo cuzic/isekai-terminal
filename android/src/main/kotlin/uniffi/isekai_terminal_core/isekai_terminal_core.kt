@@ -799,6 +799,12 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_terminal_kitty_disambiguated_key_bytes(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes(
@@ -859,6 +865,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_network_path_changed(
@@ -874,6 +882,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_cells(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_len(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_search_scrollback(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send(
     ): Int
@@ -1014,6 +1024,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_di
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(`ptr`: Long,`message`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_focus_change(`ptr`: Long,`focused`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_memory_warning(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_network_path_changed(`ptr`: Long,`isSatisfied`: Byte,uniffi_out_err: UniffiRustCallStatus, 
@@ -1030,6 +1042,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollbac
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_len(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_search_scrollback(`ptr`: Long,`query`: RustBuffer.ByValue,`caseSensitive`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_send(`ptr`: Long,`data`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_set_session_theme(`ptr`: Long,`ansi16`: RustBuffer.ByValue,`defaultFg`: Int,`defaultBg`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1062,7 +1076,13 @@ external fun uniffi_isekai_terminal_core_fn_func_terminal_commit_text_bytes(`tex
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_ctrl_byte(`codePoint`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(`key`: RustBuffer.ByValue,`applicationCursorMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_terminal_kitty_disambiguated_key_bytes(`codePoint`: Int,`modifiers`: RustBuffer.ByValue,`kittyFlags`: Short,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_isekai_terminal_core_fn_func_terminal_numpad_key_bytes(`key`: RustBuffer.ByValue,`applicationKeypadMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(`kind`: RustBuffer.ByValue,`button`: RustBuffer.ByValue,`row`: Int,`col`: Int,`modifiers`: RustBuffer.ByValue,`cols`: Int,`rows`: Int,`mouseReportingMode`: RustBuffer.ByValue,`sgrMouseMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(`key`: RustBuffer.ByValue,`applicationCursorMode`: Byte,`modifiers`: RustBuffer.ByValue,`kittyFlags`: Short,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_unicode_char_bytes(`unicodeChar`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1215,7 +1235,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_ctrl_byte() != 39410) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 46056) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_kitty_disambiguated_key_bytes() != 62321) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes() != 1311) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 25125) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 49859) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_unicode_char_bytes() != 52901) {
@@ -1299,10 +1328,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired() != 26224) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background() != 63526) {
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_did_enter_background() != 56561) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_error() != 40234) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_focus_change() != 47947) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_memory_warning() != 20700) {
@@ -1327,6 +1359,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_scrollback_len() != 48916) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_search_scrollback() != 27310) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_send() != 59935) {
@@ -2926,12 +2961,22 @@ public interface SessionOrchestratorInterface {
      * Androidの`ProcessLifecycleOwner.onStop`相当)ことを通知する。`budget_ms`は
      * `beginBackgroundTask`等が保証する猶予の目安として記録目的で受け取るが、
      * 実際の期限管理(タイマー)はSwift/Kotlin側の責務のままにする(Rust/Swiftで
-     * 基準時計を共有していないため)。`Connected`中のみ猶予追跡を開始する
-     * (未接続/接続試行中のバックグラウンド化は維持すべきセッションが無いので無視)。
+     * 基準時計を共有していないため)。`Connected`または`Connecting`中のみ猶予追跡を
+     * 開始する(`Idle`は維持すべきセッションが無いので無視。`Connecting`中に
+     * バックグラウンド化し、その猶予中に接続が成立するケース(`on_connected()`
+     * 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
      */
     fun `notifyDidEnterBackground`(`budgetMs`: kotlin.UInt)
     
     fun `notifyError`(`message`: kotlin.String)
+    
+    /**
+     * #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
+     * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
+     * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
+     * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     */
+    fun `notifyFocusChange`(`focused`: kotlin.Boolean)
     
     /**
      * メモリ逼迫警告(iOSの`didReceiveMemoryWarning`相当)。OSにプロセスを終了
@@ -2980,6 +3025,12 @@ public interface SessionOrchestratorInterface {
     fun `scrollbackCells`(`offset`: kotlin.UInt, `rows`: kotlin.UInt): List<CellData>
     
     fun `scrollbackLen`(): kotlin.UInt
+    
+    /**
+     * scrollbackを対象にした部分一致検索(タスク#37)。マッチ位置は
+     * [ScrollbackSearchMatch]のドキュメント参照。未接続時は空Vecを返す。
+     */
+    fun `searchScrollback`(`query`: kotlin.String, `caseSensitive`: kotlin.Boolean): List<ScrollbackSearchMatch>
     
     fun `send`(`data`: kotlin.ByteArray)
     
@@ -3317,8 +3368,10 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
      * Androidの`ProcessLifecycleOwner.onStop`相当)ことを通知する。`budget_ms`は
      * `beginBackgroundTask`等が保証する猶予の目安として記録目的で受け取るが、
      * 実際の期限管理(タイマー)はSwift/Kotlin側の責務のままにする(Rust/Swiftで
-     * 基準時計を共有していないため)。`Connected`中のみ猶予追跡を開始する
-     * (未接続/接続試行中のバックグラウンド化は維持すべきセッションが無いので無視)。
+     * 基準時計を共有していないため)。`Connected`または`Connecting`中のみ猶予追跡を
+     * 開始する(`Idle`は維持すべきセッションが無いので無視。`Connecting`中に
+     * バックグラウンド化し、その猶予中に接続が成立するケース(`on_connected()`
+     * 自体はこの状態に触れない)もカバーする必要があるため`Connecting`も対象に含める)。
      */override fun `notifyDidEnterBackground`(`budgetMs`: kotlin.UInt)
         = 
     callWithHandle {
@@ -3338,6 +3391,24 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_error(
         it,
         FfiConverterString.lower(`message`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * #60: OSのフォーカス変化(タブ/split pane切替・アプリのbackground/foreground等)を
+     * そのまま転送する。Kotlin/Swiftはこの生イベントを渡すだけでよく、フォーカス
+     * レポーティング(`CSI ?1004`)が有効かどうか・実際に`CSI I`/`CSI O`を送るかどうかの
+     * 判断は`Terminal`(rust-ssot)が一元的に持つ。未接続時は無視される。
+     */override fun `notifyFocusChange`(`focused`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_focus_change(
+        it,
+        FfiConverterBoolean.lower(`focused`),_status)
 }
     }
     
@@ -3467,6 +3538,23 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_scrollback_len(
         it,
         _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * scrollbackを対象にした部分一致検索(タスク#37)。マッチ位置は
+     * [ScrollbackSearchMatch]のドキュメント参照。未接続時は空Vecを返す。
+     */override fun `searchScrollback`(`query`: kotlin.String, `caseSensitive`: kotlin.Boolean): List<ScrollbackSearchMatch> {
+            return FfiConverterSequenceTypeScrollbackSearchMatch.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_search_scrollback(
+        it,
+        FfiConverterString.lower(`query`),FfiConverterBoolean.lower(`caseSensitive`),_status)
 }
     }
     )
@@ -3676,6 +3764,28 @@ data class CellData (
     var `bg`: kotlin.UInt
     , 
     var `bold`: kotlin.Boolean
+    , 
+    var `dim`: kotlin.Boolean
+    , 
+    var `italic`: kotlin.Boolean
+    , 
+    var `underline`: kotlin.Boolean
+    , 
+    var `strikethrough`: kotlin.Boolean
+    , 
+    var `blink`: kotlin.Boolean
+    , 
+    var `invisible`: kotlin.Boolean
+    , 
+    /**
+     * OSC 8(`ESC]8;params;URIST`、タスク#40)ハイパーリンクのintern id。`Some`なら
+     * `ScreenUpdate::link_table[id]`(0-indexed)にこのセルが指すURLが入っている。
+     * セルごとに`Option<String>`のURLを直接持たせない——`CellData`は`ScreenUpdate`
+     * として毎フレーム全セル分FFIコピーされるため、コストの大きい`String`は
+     * 一度だけ`link_table`に置き、セル側は軽量な`Option<u32>`のみ持つintern方式
+     * にしている(Fableレビュー2次)。
+     */
+    var `linkId`: kotlin.UInt?
     
 ){
     
@@ -3696,6 +3806,13 @@ public object FfiConverterTypeCellData: FfiConverterRustBuffer<CellData> {
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalUInt.read(buf),
         )
     }
 
@@ -3703,7 +3820,14 @@ public object FfiConverterTypeCellData: FfiConverterRustBuffer<CellData> {
             FfiConverterString.allocationSize(value.`ch`) +
             FfiConverterUInt.allocationSize(value.`fg`) +
             FfiConverterUInt.allocationSize(value.`bg`) +
-            FfiConverterBoolean.allocationSize(value.`bold`)
+            FfiConverterBoolean.allocationSize(value.`bold`) +
+            FfiConverterBoolean.allocationSize(value.`dim`) +
+            FfiConverterBoolean.allocationSize(value.`italic`) +
+            FfiConverterBoolean.allocationSize(value.`underline`) +
+            FfiConverterBoolean.allocationSize(value.`strikethrough`) +
+            FfiConverterBoolean.allocationSize(value.`blink`) +
+            FfiConverterBoolean.allocationSize(value.`invisible`) +
+            FfiConverterOptionalUInt.allocationSize(value.`linkId`)
     )
 
     override fun write(value: CellData, buf: ByteBuffer) {
@@ -3711,6 +3835,13 @@ public object FfiConverterTypeCellData: FfiConverterRustBuffer<CellData> {
             FfiConverterUInt.write(value.`fg`, buf)
             FfiConverterUInt.write(value.`bg`, buf)
             FfiConverterBoolean.write(value.`bold`, buf)
+            FfiConverterBoolean.write(value.`dim`, buf)
+            FfiConverterBoolean.write(value.`italic`, buf)
+            FfiConverterBoolean.write(value.`underline`, buf)
+            FfiConverterBoolean.write(value.`strikethrough`, buf)
+            FfiConverterBoolean.write(value.`blink`, buf)
+            FfiConverterBoolean.write(value.`invisible`, buf)
+            FfiConverterOptionalUInt.write(value.`linkId`, buf)
     }
 }
 
@@ -3839,6 +3970,108 @@ public object FfiConverterTypeDiagnosticEventEnvelope: FfiConverterRustBuffer<Di
     override fun write(value: DiagnosticEventEnvelope, buf: ByteBuffer) {
             FfiConverterULong.write(value.`sequence`, buf)
             FfiConverterString.write(value.`message`, buf)
+    }
+}
+
+
+
+/**
+ * Sixel(`DCS Pa;Pb;Ph q ... ST`、タスク#42)でデコードされた画像1枚の配置情報。
+ * `Terminal`(rust-core)がデコード・配置・寿命管理を一元的に行う(rust-ssot:
+ * Android/iOSはこの構造体が指す矩形へ`rgba`をそのままビットマップ描画するだけで
+ * よく、「どこに何ピクセルの画像が乗っているか」を判断するロジックをKotlin/Swift
+ * 側にミラーしない)。
+ *
+ * `row`/`col`は画像の左上が乗っている`ScreenUpdate.cells`上のセル座標
+ * (0-indexed)。`rows_span`/`cols_span`は画像が占めるセル数——実ピクセルサイズ
+ * (`width_px`/`height_px`)を、VT340由来の名目セルサイズ(`terminal.rs`の
+ * `SIXEL_CELL_WIDTH_PX`/`SIXEL_CELL_HEIGHT_PX`、実フォントのピクセルサイズを
+ * このRustコアは知らないため固定値で近似)で割って算出した近似値。呼び出し側は
+ * 実際のフォントの`cols_span`×`rows_span`分のセル矩形へ`rgba`(実ピクセルサイズ
+ * `width_px`×`height_px`)を引き伸ばして描画すればよい。
+ *
+ * `id`はこの`Terminal`インスタンス内でのみ一意な単調増加id(`u64`が尽きるまで
+ * 再利用しない、RIS後もカウンタ自体はリセットしない——過去にキャッシュされた
+ * idと衝突させないため)。呼び出し側は前回の`ScreenUpdate.images`との差分を
+ * 自前で判断する必要はなく、常に「今回のリストが現在アクティブな画像の全て」
+ * として扱い、そのまま描画すればよい(rust-ssot: 消去・スクロールによる立ち退き
+ * 等の寿命管理判断はTerminal側で完結しており、UI層は宣言的にリストを反映する
+ * だけでよい)。
+ *
+ * スコープ外(実装時点の既知の簡略化、Sixel対応の初版):
+ * - 画像は現在の画面(main/alt)全体のスクロール・IL/DL・リサイズ・alt画面切替・
+ * 全画面消去(ED、`CSI 2J`/`CSI 3J`)のいずれかが起きると無条件に消去される
+ * (誤った位置に取り残されるより、消える方が安全側という判断)。部分消去
+ * (ED0/ED1、EL、ECH等)では画像は消えない。
+ * - Sixel描画によって画面が下端を超えて自動スクロールすることはない(画像は
+ * 画面下端でクリップされる)。
+ */
+data class ImagePlacement (
+    var `id`: kotlin.ULong
+    , 
+    var `row`: kotlin.UInt
+    , 
+    var `col`: kotlin.UInt
+    , 
+    var `rowsSpan`: kotlin.UInt
+    , 
+    var `colsSpan`: kotlin.UInt
+    , 
+    var `widthPx`: kotlin.UInt
+    , 
+    var `heightPx`: kotlin.UInt
+    , 
+    /**
+     * RGBA8888、row-major、左上原点。`width_px * height_px * 4`バイト。
+     */
+    var `rgba`: kotlin.ByteArray
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeImagePlacement: FfiConverterRustBuffer<ImagePlacement> {
+    override fun read(buf: ByteBuffer): ImagePlacement {
+        return ImagePlacement(
+            FfiConverterULong.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ImagePlacement) = (
+            FfiConverterULong.allocationSize(value.`id`) +
+            FfiConverterUInt.allocationSize(value.`row`) +
+            FfiConverterUInt.allocationSize(value.`col`) +
+            FfiConverterUInt.allocationSize(value.`rowsSpan`) +
+            FfiConverterUInt.allocationSize(value.`colsSpan`) +
+            FfiConverterUInt.allocationSize(value.`widthPx`) +
+            FfiConverterUInt.allocationSize(value.`heightPx`) +
+            FfiConverterByteArray.allocationSize(value.`rgba`)
+    )
+
+    override fun write(value: ImagePlacement, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`id`, buf)
+            FfiConverterUInt.write(value.`row`, buf)
+            FfiConverterUInt.write(value.`col`, buf)
+            FfiConverterUInt.write(value.`rowsSpan`, buf)
+            FfiConverterUInt.write(value.`colsSpan`, buf)
+            FfiConverterUInt.write(value.`widthPx`, buf)
+            FfiConverterUInt.write(value.`heightPx`, buf)
+            FfiConverterByteArray.write(value.`rgba`, buf)
     }
 }
 
@@ -4144,6 +4377,56 @@ public object FfiConverterTypeJumpConfig: FfiConverterRustBuffer<JumpConfig> {
             FfiConverterUShort.write(value.`port`, buf)
             FfiConverterString.write(value.`username`, buf)
             FfiConverterTypeSshAuth.write(value.`auth`, buf)
+    }
+}
+
+
+
+/**
+ * 1行分の「損傷(damage)」範囲。`line`行目の`left`列から`right`列まで(両端含む)が
+ * 前回発行された`ScreenUpdate`から変化したことを表す(タスク#92、Alacrittyの
+ * `LineDamageBounds{line,left,right}`に倣った列レンジ差分)。`ScreenUpdate.dirty_rows`
+ * が`Some`の時にのみ現れ、UI層(Android/iOS)はこのレンジのセルだけを再描画すればよい。
+ * 損傷のない行はリストに含めない(`left <= right`の行のみ)。
+ */
+data class LineDamage (
+    var `line`: kotlin.UShort
+    , 
+    var `left`: kotlin.UShort
+    , 
+    var `right`: kotlin.UShort
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeLineDamage: FfiConverterRustBuffer<LineDamage> {
+    override fun read(buf: ByteBuffer): LineDamage {
+        return LineDamage(
+            FfiConverterUShort.read(buf),
+            FfiConverterUShort.read(buf),
+            FfiConverterUShort.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: LineDamage) = (
+            FfiConverterUShort.allocationSize(value.`line`) +
+            FfiConverterUShort.allocationSize(value.`left`) +
+            FfiConverterUShort.allocationSize(value.`right`)
+    )
+
+    override fun write(value: LineDamage, buf: ByteBuffer) {
+            FfiConverterUShort.write(value.`line`, buf)
+            FfiConverterUShort.write(value.`left`, buf)
+            FfiConverterUShort.write(value.`right`, buf)
     }
 }
 
@@ -4530,6 +4813,16 @@ public object FfiConverterTypeQuicConfig: FfiConverterRustBuffer<QuicConfig> {
 
 
 data class ScreenUpdate (
+    /**
+     * 発行するたびに単調増加する連番(0から開始し`wrapping_add(1)`)。UI層への
+     * 配信チャネルが`Channel.CONFLATED`(Android)等でconflateされ、中間の発行が
+     * 読み飛ばされる可能性がある——`dirty_rows`は「直前に発行したScreenUpdateとの
+     * 差分」なので、読み飛ばしが起きると欠落分の変化がdirty_rowsに載らず表示が
+     * 化ける。UI層はこの値が前回受信値+1(wrapping)でなければ読み飛ばしがあったと
+     * 判断し、`dirty_rows`を信用せず全画面再描画にフォールバックすること。
+     */
+    var `updateSeq`: kotlin.UInt
+    , 
     var `cols`: kotlin.UInt
     , 
     var `rows`: kotlin.UInt
@@ -4544,7 +4837,120 @@ data class ScreenUpdate (
     , 
     var `applicationCursorMode`: kotlin.Boolean
     , 
+    /**
+     * DECKPAM/DECKPNM(`ESC =`/`ESC >`、タスク#43)の現在値。既定は`false`
+     * (numeric keypad mode)。`application_cursor_mode`(#29)と同じ役割分担で、
+     * 実際のテンキーイベントのエンコード(`terminal_numpad_key_bytes`をどう呼ぶか)は
+     * このRustコアではなくUI層のキーエンコーダーが行う。
+     */
+    var `applicationKeypadMode`: kotlin.Boolean
+    , 
     var `bracketedPasteMode`: kotlin.Boolean
+    , 
+    /**
+     * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)の現在値。既定は`Off`。
+     * UI層(#50/#51)はこれを見て、タッチ/ジェスチャイベントをマウスレポートとして
+     * Rustへ送るべきか(＝アプリがマウス報告を要求しているか)を判断できる。
+     */
+    var `mouseReportingMode`: MouseReportingMode
+    , 
+    /**
+     * DECSET/DECRST `?1006`(SGR拡張マウスレポーティング、タスク#36)の現在値。
+     * `mouse_reporting_mode`が`Off`でなくても、この値によって
+     * `Terminal::encode_pointer_event`が生成するバイト列の形式(SGR形式か
+     * レガシーX10形式か)が変わる。UI層は直接使わなくてよいが、デバッグ表示や
+     * 将来のプロトコル分岐のために公開しておく。
+     */
+    var `sgrMouseMode`: kotlin.Boolean
+    , 
+    /**
+     * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
+     */
+    var `cursorVisible`: kotlin.Boolean
+    , 
+    /**
+     * BEL(0x07)受信のたびに単調増加する世代カウンタ。`bool`ではなくカウンタにして
+     * あるのは、conflated チャネル越しに複数回の BEL が1つの`ScreenUpdate`にまとめ
+     * られても呼び出し側が「前回より進んだか」で取りこぼしを検知でき、かつ同一
+     * `ScreenUpdate`の再適用で二重にフィードバック(バイブ/フラッシュ)が
+     * 発火するのを避けられるため。呼び出し側は前回値と比較し、進んでいれば
+     * フィードバックを1回発火させること。OSC のターミネータとして使われた BEL
+     * (`ESC]0;title BEL`)はカウントされない。
+     */
+    var `bellGeneration`: kotlin.ULong
+    , 
+    /**
+     * DECSCUSR(`CSI Ps SP q`)で選択されたカーソル形状。既定は`Block`。
+     */
+    var `cursorShape`: CursorShape
+    , 
+    /**
+     * カーソルが点滅すべきかどうか。DECSCUSRの偶数/奇数パラメータ
+     * (block/underline/bar それぞれの steady/blinking)から導出される。既定は`true`
+     * (xtermの既定である「blinking block」に合わせる)。
+     */
+    var `cursorBlink`: kotlin.Boolean
+    , 
+    /**
+     * OSC 8(タスク#40)ハイパーリンクのURL intern表。`CellData::link_id`はこの
+     * `Vec`のindex(0-indexed)。同一URLは重複排除されて同じindexを指す。
+     * このterminalセッションが一度でも見たURLを(現在アクティブでなくなった後も、
+     * RISされた後も)登録上限(`MAX_LINK_TABLE`、タスク#70)まで保持する——
+     * scrollback上の過去セルの`link_id`がこの表のindexを指し続けるため、
+     * indexを再利用したり表自体をクリアしたりすると過去セルが別のURLを指す
+     * 破損になる(`terminal.rs`の`link_table`フィールドdocコメント参照)。上限
+     * 到達後に見た新規URLはインターンされず、そのURLで開かれたリンクはリンク
+     * 無し扱いにフォールバックする(既存セルの`link_id`参照には影響しない)。
+     */
+    var `linkTable`: List<kotlin.String>
+    , 
+    /**
+     * Sixel(タスク#42)で現在アクティブな画像配置の一覧。詳細は[ImagePlacement]参照。
+     */
+    var `images`: List<ImagePlacement>
+    , 
+    /**
+     * Kitty keyboard protocol(タスク#54、
+     * <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>)でnegotiateされた
+     * 現在有効なprogressive enhancement flagsのビットマスク。既定は`0`
+     * (legacy mode、拡張無効)。ビットの意味:
+     * `0b00001`=disambiguate escape codes、`0b00010`=report event types
+     * (press/repeat/release)、`0b00100`=report alternate keys(shifted/base
+     * layout)、`0b01000`=report all keys as escape codes、`0b10000`=report
+     * associated text。
+     *
+     * この`Terminal`(rust-core)が担うのはリモートが送ってくる`CSI > flags u`
+     * (push)/`CSI < Pn u`(pop)/`CSI = flags ; mode u`(set)/`CSI ? u`(query、
+     * 応答も自動で行う)を解釈してこの値を保持・公開するところまで(main/alt画面
+     * ごとに独立したflagsスタックを持つ、仕様通りの挙動)。
+     *
+     * 実際のキーイベントのエンコード判断も`application_cursor_mode`(#29)と同じ役割分担
+     * (rust-ssot: 判断ロジックはRust側のSSOT関数に置き、Kotlin/Swiftはこの最新値を
+     * 引数として渡すだけ)——タスク#54実装時点ではこの引数配線が抜けており(タスク#72、
+     * 交渉・公開のみで実際の送信バイト列に無反映というバグ)、修正済み。呼び出し側
+     * (Android`TerminalKeyEncoder.specialKeyBytes`/iOS`TerminalKeyMapper`)は
+     * [terminal_special_key_bytes]へこの値をそのまま渡すこと。現状bit0(disambiguate
+     * escape codes)のEscapeキー(`ESC[27u`化)のみRust側で実装済み——矢印・Home/End・
+     * PageUp/PageDown・F1〜F12は仕様が許容する代替形式が既存のxterm修飾子CSI形式と
+     * 一致するため元々対応不要、Enter/Tab/Backspaceは仕様が明示する例外でlegacyのまま
+     * (詳細は[terminal_special_key_bytes]のdocコメント参照)。bit1〜4(report event
+     * types/alternate keys/all keys as escape codes/associated text)およびCtrl+英字等
+     * 通常テキストキーのCSI u化は未対応(この値の交渉・公開のみ)。
+     */
+    var `kittyKeyboardFlags`: kotlin.UShort
+    , 
+    /**
+     * この`ScreenUpdate`で、前回発行時から実際に変化した行の損傷レンジ一覧
+     * (タスク#92、行単位のdamage tracking)。`None`は「全画面が損傷している=グリッド
+     * 全体を再描画せよ」を意味する(初回発行・寸法変更・スクロール等の構造的変更
+     * [タスク#93]で全画面dirtyになるケース)。`Some(vec)`ならそのレンジのセルのみ
+     * 再描画すればよく、`vec`が空なら(セル内容は前回と同一、`title`等の非グリッド
+     * フィールドだけが変わった等で)グリッドの再描画は不要。カーソル行は下地セルが
+     * 不変でも損傷として含まれる(タスク#94、iOSがカーソルをセル内容と同じ描画パスで
+     * 描くため)。UI層がまだこのフィールドを消費していない段階では、`None`扱いで
+     * 全画面再描画にフォールバックすれば従来通りの挙動になる。
+     */
+    var `dirtyRows`: List<LineDamage>?
     
 ){
     
@@ -4563,16 +4969,29 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
         return ScreenUpdate(
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
             FfiConverterSequenceTypeCellData.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterTypeMouseReportingMode.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterTypeCursorShape.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterSequenceString.read(buf),
+            FfiConverterSequenceTypeImagePlacement.read(buf),
+            FfiConverterUShort.read(buf),
+            FfiConverterOptionalSequenceTypeLineDamage.read(buf),
         )
     }
 
     override fun allocationSize(value: ScreenUpdate) = (
+            FfiConverterUInt.allocationSize(value.`updateSeq`) +
             FfiConverterUInt.allocationSize(value.`cols`) +
             FfiConverterUInt.allocationSize(value.`rows`) +
             FfiConverterSequenceTypeCellData.allocationSize(value.`cells`) +
@@ -4580,10 +4999,22 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.allocationSize(value.`cursorCol`) +
             FfiConverterOptionalString.allocationSize(value.`title`) +
             FfiConverterBoolean.allocationSize(value.`applicationCursorMode`) +
-            FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`)
+            FfiConverterBoolean.allocationSize(value.`applicationKeypadMode`) +
+            FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`) +
+            FfiConverterTypeMouseReportingMode.allocationSize(value.`mouseReportingMode`) +
+            FfiConverterBoolean.allocationSize(value.`sgrMouseMode`) +
+            FfiConverterBoolean.allocationSize(value.`cursorVisible`) +
+            FfiConverterULong.allocationSize(value.`bellGeneration`) +
+            FfiConverterTypeCursorShape.allocationSize(value.`cursorShape`) +
+            FfiConverterBoolean.allocationSize(value.`cursorBlink`) +
+            FfiConverterSequenceString.allocationSize(value.`linkTable`) +
+            FfiConverterSequenceTypeImagePlacement.allocationSize(value.`images`) +
+            FfiConverterUShort.allocationSize(value.`kittyKeyboardFlags`) +
+            FfiConverterOptionalSequenceTypeLineDamage.allocationSize(value.`dirtyRows`)
     )
 
     override fun write(value: ScreenUpdate, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`updateSeq`, buf)
             FfiConverterUInt.write(value.`cols`, buf)
             FfiConverterUInt.write(value.`rows`, buf)
             FfiConverterSequenceTypeCellData.write(value.`cells`, buf)
@@ -4591,7 +5022,78 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterUInt.write(value.`cursorCol`, buf)
             FfiConverterOptionalString.write(value.`title`, buf)
             FfiConverterBoolean.write(value.`applicationCursorMode`, buf)
+            FfiConverterBoolean.write(value.`applicationKeypadMode`, buf)
             FfiConverterBoolean.write(value.`bracketedPasteMode`, buf)
+            FfiConverterTypeMouseReportingMode.write(value.`mouseReportingMode`, buf)
+            FfiConverterBoolean.write(value.`sgrMouseMode`, buf)
+            FfiConverterBoolean.write(value.`cursorVisible`, buf)
+            FfiConverterULong.write(value.`bellGeneration`, buf)
+            FfiConverterTypeCursorShape.write(value.`cursorShape`, buf)
+            FfiConverterBoolean.write(value.`cursorBlink`, buf)
+            FfiConverterSequenceString.write(value.`linkTable`, buf)
+            FfiConverterSequenceTypeImagePlacement.write(value.`images`, buf)
+            FfiConverterUShort.write(value.`kittyKeyboardFlags`, buf)
+            FfiConverterOptionalSequenceTypeLineDamage.write(value.`dirtyRows`, buf)
+    }
+}
+
+
+
+/**
+ * [SessionOrchestrator::search_scrollback]が返す1件のマッチ位置(タスク#37)。
+ *
+ * - `row`: [SessionOrchestrator::scrollback_cells]と同じ規約——0がライブ画面に
+ * 一番近い最新のscrollback行、値が大きいほど過去。マッチした行を表示するには
+ * そのまま`scrollback_cells(row, ...)`系のoffsetとして使える。
+ * - `col`: マッチ開始セルの0-based列。
+ * - `len`: マッチが占める表示列数(セル単位)。全角文字を含む場合は文字数より
+ * 大きくなりうる。
+ *
+ * スコープ外(Fableレビュー2次): scrollbackは折り返しで分割された物理行の
+ * `VecDeque`であり、折り返しをまたいだ論理行単位のマッチ(行末と次行先頭に
+ * またがる文字列)は検出できない。また、scrollbackは上限(`SCROLLBACK_LIMIT`)を
+ * 超えると古い行から追い出されるため、この`row`は呼び出し時点のスナップショットに
+ * 対してのみ有効——新しい出力がscrollbackへ積まれる前に使うこと(呼び出し側は
+ * `row`を長期キャッシュせず、ジャンプ操作のたびに検索し直す運用を想定する)。
+ */
+data class ScrollbackSearchMatch (
+    var `row`: kotlin.UInt
+    , 
+    var `col`: kotlin.UInt
+    , 
+    var `len`: kotlin.UInt
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeScrollbackSearchMatch: FfiConverterRustBuffer<ScrollbackSearchMatch> {
+    override fun read(buf: ByteBuffer): ScrollbackSearchMatch {
+        return ScrollbackSearchMatch(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ScrollbackSearchMatch) = (
+            FfiConverterUInt.allocationSize(value.`row`) +
+            FfiConverterUInt.allocationSize(value.`col`) +
+            FfiConverterUInt.allocationSize(value.`len`)
+    )
+
+    override fun write(value: ScrollbackSearchMatch, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`row`, buf)
+            FfiConverterUInt.write(value.`col`, buf)
+            FfiConverterUInt.write(value.`len`, buf)
     }
 }
 
@@ -4769,6 +5271,61 @@ public object FfiConverterTypeTerminalFrameBatch: FfiConverterRustBuffer<Termina
             FfiConverterTypeCursorState.write(value.`cursor`, buf)
             FfiConverterOptionalString.write(value.`title`, buf)
             FfiConverterBoolean.write(value.`bell`, buf)
+    }
+}
+
+
+
+/**
+ * xterm互換の修飾キー状態。`terminal_special_key_bytes`へ渡し、矢印・Home/End・
+ * PageUp/Down・F1〜F12のシーケンスに修飾子パラメータを付与するために使う
+ * (Ctrl+矢印でreadline/tmuxのワード単位移動等を機能させるため、`TERM=xterm-256color`
+ * が広告する修飾子付きシーケンスをこちら側でも生成する必要がある)。
+ * 全フィールドfalse(修飾なし)は`Default`で表す。
+ */
+data class TerminalKeyModifiers (
+    var `shift`: kotlin.Boolean
+    , 
+    var `alt`: kotlin.Boolean
+    , 
+    var `ctrl`: kotlin.Boolean
+    , 
+    var `meta`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTerminalKeyModifiers: FfiConverterRustBuffer<TerminalKeyModifiers> {
+    override fun read(buf: ByteBuffer): TerminalKeyModifiers {
+        return TerminalKeyModifiers(
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: TerminalKeyModifiers) = (
+            FfiConverterBoolean.allocationSize(value.`shift`) +
+            FfiConverterBoolean.allocationSize(value.`alt`) +
+            FfiConverterBoolean.allocationSize(value.`ctrl`) +
+            FfiConverterBoolean.allocationSize(value.`meta`)
+    )
+
+    override fun write(value: TerminalKeyModifiers, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`shift`, buf)
+            FfiConverterBoolean.write(value.`alt`, buf)
+            FfiConverterBoolean.write(value.`ctrl`, buf)
+            FfiConverterBoolean.write(value.`meta`, buf)
     }
 }
 
@@ -5023,6 +5580,49 @@ public object FfiConverterTypeConnectionPublicState : FfiConverterRustBuffer<Con
 
 
 /**
+ * DECSCUSR(`CSI Ps SP q`)が選択するカーソル形状。`Terminal`が状態として保持し
+ * (rust-ssot: Kotlin/Swift側にミラー状態を作らず、この値をそのまま描画に使う)、
+ * `ScreenUpdate::cursor_shape`として公開する。点滅の有無は別フィールド
+ * (`ScreenUpdate::cursor_blink`)で表現する——DECSET/DECRST `?12`(`CSI ?12h`/
+ * `CSI ?12l`、点滅on/offのみを切り替えるレガシー制御、タスク#55)がDECSCUSRとは
+ * 独立に同じ`cursor_blink`フィールドを更新できるよう、形状と点滅を分離してある。
+ */
+
+enum class CursorShape {
+    
+    BLOCK,
+    UNDERLINE,
+    BAR;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCursorShape: FfiConverterRustBuffer<CursorShape> {
+    override fun read(buf: ByteBuffer) = try {
+        CursorShape.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: CursorShape) = 4UL
+
+    override fun write(value: CursorShape, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
  * ポートフォワード待受の状態。`OrchestratorCallback::on_forward_state_changed` で通知される。
  */
 sealed class ForwardState {
@@ -5155,6 +5755,163 @@ public object FfiConverterTypeForwardType: FfiConverterRustBuffer<ForwardType> {
     override fun allocationSize(value: ForwardType) = 4UL
 
     override fun write(value: ForwardType, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * マウスレポーティング(タスク#36)対象のボタン。左/中/右クリックに加え、
+ * モバイルでの主なユースケースであるホイール(縦スクロールジェスチャ)を含める
+ * (Fableレビュー指摘: wheelボタン64/65のエンコードを範囲に含める)。
+ * 横スクロールホイール(button 6/7)・追加ボタン(button 8以降)は現状使う予定が
+ * ないため未対応(必要になったタスクで追加する)。UI層(#50/#51)が生ポインタ
+ * イベントを`terminal_pointer_event_bytes`(タスク#51)へ渡す際にも使うため
+ * `uniffi::Enum`として公開する。
+ */
+
+enum class MouseButton {
+    
+    LEFT,
+    MIDDLE,
+    RIGHT,
+    WHEEL_UP,
+    WHEEL_DOWN;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMouseButton: FfiConverterRustBuffer<MouseButton> {
+    override fun read(buf: ByteBuffer) = try {
+        MouseButton.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MouseButton) = 4UL
+
+    override fun write(value: MouseButton, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * マウスレポーティング(タスク#36)対象のイベント種別。`MouseButton`と同じ理由で
+ * `uniffi::Enum`として公開する。
+ */
+
+enum class MouseEventKind {
+    
+    /**
+     * ボタン押下(ホイールは常にこの種別で表す — ホイールにはreleaseの概念が無い)。
+     */
+    PRESS,
+    /**
+     * ボタン解放。
+     */
+    RELEASE,
+    /**
+     * ポインタ移動。`button`が`Some`ならドラッグ(ボタンを押したまま移動)、
+     * `None`なら単純なホバー移動。
+     */
+    MOTION;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMouseEventKind: FfiConverterRustBuffer<MouseEventKind> {
+    override fun read(buf: ByteBuffer) = try {
+        MouseEventKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MouseEventKind) = 4UL
+
+    override fun write(value: MouseEventKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * DECSET/DECRST `?1000`/`?1002`/`?1003`(タスク#36)が切り替えるマウスレポーティング
+ * モード。`Terminal`が状態として保持し(rust-ssot: Kotlin/Swift側にミラー状態を
+ * 作らず、この値をそのまま`ScreenUpdate`経由でUI層のジェスチャ裁定に使う——
+ * `application_cursor_mode`/`bracketed_paste_mode`と同じ確立済みパターン)、
+ * タッチ/ジェスチャイベントをRustへ送るかどうか・どう解釈するかをUI層(#50/#51)が
+ * 決める材料にする。実際のエンコード判断(どのイベント種別を報告するか)自体は
+ * `Terminal::encode_pointer_event`がこの値を見て行うため、UI層はこの値を
+ * 「テキスト選択ジェスチャに倒すかマウスレポートに倒すか」の判断にのみ使えばよい。
+ *
+ * xterm実装に倣い、`?1000`/`?1002`/`?1003`は同一の内部状態を共有する——
+ * 複数を続けてset(`h`)した場合は最後にsetしたモードが有効になり、いずれかを
+ * reset(`l`)すると番号に関わらずOffへ戻る(`terminal.rs::csi_dispatch`参照)。
+ */
+
+enum class MouseReportingMode {
+    
+    /**
+     * マウスレポーティング無効(既定)。
+     */
+    OFF,
+    /**
+     * `?1000`: ボタンのpress/releaseのみ報告する(移動は報告しない)。
+     */
+    NORMAL,
+    /**
+     * `?1002`: 上記に加え、ボタンを押したままのドラッグ移動も報告する。
+     */
+    BUTTON_EVENT,
+    /**
+     * `?1003`: ボタン状態に関係なく全ての移動を報告する(any-event tracking)。
+     */
+    ANY_EVENT;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMouseReportingMode: FfiConverterRustBuffer<MouseReportingMode> {
+    override fun read(buf: ByteBuffer) = try {
+        MouseReportingMode.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MouseReportingMode) = 4UL
+
+    override fun write(value: MouseReportingMode, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -5407,6 +6164,66 @@ public object FfiConverterTypeSshError : FfiConverterRustBuffer<SshException> {
     }
 
 }
+
+
+
+/**
+ * アプリケーションキーパッドモード(DECKPAM/DECKPNM、タスク#43)対応が必要な
+ * テンキー(numeric keypad)キー。VT220の物理keypadにある0〜9・`,`・`-`(Subtract)・
+ * `.`(Decimal)・Enterに加え、xterm/主要ターミナルエミュレータが同じ`ESC O <letter>`
+ * テーブルへ拡張している`+`(Add)・`*`(Multiply)・`/`(Divide)・`=`(Equals)を含む。
+ * 左右カッコ(Android `KEYCODE_NUMPAD_LEFT_PAREN`/`KEYCODE_NUMPAD_RIGHT_PAREN`)は
+ * このテーブルに存在せず両モードで常に同じリテラル文字を送るため対象外——
+ * 呼び出し側は通常のUnicode文字経路([terminal_unicode_char_bytes])にフォール
+ * バックすること。
+ */
+
+enum class TerminalNumpadKey {
+    
+    DIGIT0,
+    DIGIT1,
+    DIGIT2,
+    DIGIT3,
+    DIGIT4,
+    DIGIT5,
+    DIGIT6,
+    DIGIT7,
+    DIGIT8,
+    DIGIT9,
+    DECIMAL,
+    COMMA,
+    ADD,
+    SUBTRACT,
+    MULTIPLY,
+    DIVIDE,
+    ENTER,
+    EQUALS;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTerminalNumpadKey: FfiConverterRustBuffer<TerminalNumpadKey> {
+    override fun read(buf: ByteBuffer) = try {
+        TerminalNumpadKey.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: TerminalNumpadKey) = 4UL
+
+    override fun write(value: TerminalNumpadKey, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
 
 
 
@@ -6384,6 +7201,38 @@ public object FfiConverterOptionalUShort: FfiConverterRustBuffer<kotlin.UShort?>
 /**
  * @suppress
  */
+public object FfiConverterOptionalUInt: FfiConverterRustBuffer<kotlin.UInt?> {
+    override fun read(buf: ByteBuffer): kotlin.UInt? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUInt.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UInt?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUInt.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UInt?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUInt.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalInt: FfiConverterRustBuffer<kotlin.Int?> {
     override fun read(buf: ByteBuffer): kotlin.Int? {
         if (buf.get().toInt() == 0) {
@@ -6672,6 +7521,70 @@ public object FfiConverterOptionalTypeConnectionIssueHint: FfiConverterRustBuffe
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeMouseButton: FfiConverterRustBuffer<MouseButton?> {
+    override fun read(buf: ByteBuffer): MouseButton? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeMouseButton.read(buf)
+    }
+
+    override fun allocationSize(value: MouseButton?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeMouseButton.allocationSize(value)
+        }
+    }
+
+    override fun write(value: MouseButton?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeMouseButton.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalSequenceTypeLineDamage: FfiConverterRustBuffer<List<LineDamage>?> {
+    override fun read(buf: ByteBuffer): List<LineDamage>? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterSequenceTypeLineDamage.read(buf)
+    }
+
+    override fun allocationSize(value: List<LineDamage>?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterSequenceTypeLineDamage.allocationSize(value)
+        }
+    }
+
+    override fun write(value: List<LineDamage>?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterSequenceTypeLineDamage.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceUInt: FfiConverterRustBuffer<List<kotlin.UInt>> {
     override fun read(buf: ByteBuffer): List<kotlin.UInt> {
         val len = buf.getInt()
@@ -6812,6 +7725,62 @@ public object FfiConverterSequenceTypeDiagnosticEventEnvelope: FfiConverterRustB
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeImagePlacement: FfiConverterRustBuffer<List<ImagePlacement>> {
+    override fun read(buf: ByteBuffer): List<ImagePlacement> {
+        val len = buf.getInt()
+        return List<ImagePlacement>(len) {
+            FfiConverterTypeImagePlacement.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<ImagePlacement>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeImagePlacement.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<ImagePlacement>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeImagePlacement.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeLineDamage: FfiConverterRustBuffer<List<LineDamage>> {
+    override fun read(buf: ByteBuffer): List<LineDamage> {
+        val len = buf.getInt()
+        return List<LineDamage>(len) {
+            FfiConverterTypeLineDamage.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<LineDamage>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeLineDamage.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<LineDamage>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeLineDamage.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypePackedRow: FfiConverterRustBuffer<List<PackedRow>> {
     override fun read(buf: ByteBuffer): List<PackedRow> {
         val len = buf.getInt()
@@ -6858,6 +7827,34 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypePortForward.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuffer<List<ScrollbackSearchMatch>> {
+    override fun read(buf: ByteBuffer): List<ScrollbackSearchMatch> {
+        val len = buf.getInt()
+        return List<ScrollbackSearchMatch>(len) {
+            FfiConverterTypeScrollbackSearchMatch.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<ScrollbackSearchMatch>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeScrollbackSearchMatch.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<ScrollbackSearchMatch>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeScrollbackSearchMatch.write(it, buf)
         }
     }
 }
@@ -6975,16 +7972,121 @@ public object FfiConverterSequenceTypePortForward: FfiConverterRustBuffer<List<P
     
 
         /**
+         * Kitty keyboard protocol(タスク#54/#72)のbit0(disambiguate escape codes)有効時、
+         * Ctrl/Alt(/その組み合わせ・Shift+Alt)付きの印字可能文字キーをCSI u形式
+         * (`ESC[<codepoint>;<modifier>u`)へエンコードする(タスク#91)。
+         *
+         * - `code_point`はキーの無修飾時の基本コードポイント(例: Ctrl+AでもAndroid
+         * `event.getUnicodeChar(0)`が返す小文字相当の`'a'`)を渡すこと。呼び出し側で
+         * 大文字/小文字を判定する必要はない(この関数が`to_ascii_lowercase`する)。
+         * - `modifier`はxterm/kitty共通のエンコード: `1 + shift(1) + alt(2) + ctrl(4) + meta(8)`。
+         * - bit0が立っていない場合、`code_point`が印字可能文字でない場合、修飾キー
+         * (Ctrl/Alt)が両方とも押されていない場合は`None`を返す——呼び出し側は
+         * `terminal_ctrl_byte`(legacy Ctrl)や"ESCプレフィックス"(legacy Alt)といった
+         * 既存のフォールバック処理へ進むこと。
+         * - Kitty仕様上の例外キー(Enter/Tab/Backspace)は`TerminalSpecialKey`経由の
+         * 既存分岐が別途処理するためこの関数の対象外(呼び出し側で特殊キー判定を
+         * この関数より先に行うこと)。
+         */ fun `terminalKittyDisambiguatedKeyBytes`(`codePoint`: kotlin.UInt, `modifiers`: TerminalKeyModifiers, `kittyFlags`: kotlin.UShort): kotlin.ByteArray? {
+            return FfiConverterOptionalByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_kitty_disambiguated_key_bytes(
+    
+        FfiConverterUInt.lower(`codePoint`),FfiConverterTypeTerminalKeyModifiers.lower(`modifiers`),FfiConverterUShort.lower(`kittyFlags`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * テンキーのバイト列。`application_keypad_mode`(DECKPAM、`Terminal`が`ESC =`/
+         * `ESC >`で切り替える、`ScreenUpdate::application_keypad_mode`経由で公開)が
+         * `true`ならSS3形式(`ESC O <letter>`、xterm/VT220のapplication keypadテーブルに
+         * 準拠)、`false`なら通常のリテラル文字(Enterのみ`0x0D`、`TerminalSpecialKey::Enter`
+         * と同じ)を返す。`application_cursor_mode`(#29)と同じ「Rust側は変換ロジックのみ、
+         * どのキーコードがどの[TerminalNumpadKey]に対応するかの判定はUI層が行う」という
+         * 役割分担。
+         */ fun `terminalNumpadKeyBytes`(`key`: TerminalNumpadKey, `applicationKeypadMode`: kotlin.Boolean): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_numpad_key_bytes(
+    
+        FfiConverterTypeTerminalNumpadKey.lower(`key`),FfiConverterBoolean.lower(`applicationKeypadMode`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * タスク#51: UI層(Android/iOSのジェスチャハンドラ)が座標付きの生ポインタ
+         * イベントを、現在のマウスレポーティング状態に従ってターミナルへ送るべき
+         * バイト列にエンコードする。`Terminal::encode_pointer_event`(タスク#36)と
+         * 同じロジック(`terminal::encode_pointer_event_bytes`)を、実行中のセッション
+         * (`SessionOrchestrator`)を経由せずに直接呼べる純粋関数として公開する
+         * (`terminal_special_key_bytes`/`terminal_commit_text_bytes`と同じ設計: UI層は
+         * 直近の`ScreenUpdate`から読んだ`mouse_reporting_mode`/`sgr_mouse_mode`/`cols`/
+         * `rows`をそのまま引数として渡すだけでよく、「今どのマウスモードか」の判断
+         * ロジック自体はここに一元化されたまま——rust-ssot: Kotlin/Swift側に判断ロジックの
+         * ミラーを作らない)。
+         *
+         * 報告すべきでないイベント(`mouse_reporting_mode`がOff、またはモードが対象外の
+         * イベント種別)は`None`を返す。呼び出し元はこれを「何も送らない」の合図として
+         * 扱い、代わりに通常のタッチ処理(テキスト選択・スクロールバックスワイプ等)に
+         * フォールバックすればよい。
+         *
+         * `row`/`col`は0-basedのセル座標(画面外の値は端末サイズ`cols`/`rows`へ
+         * クランプされる、`terminal::encode_pointer_event_bytes`のdocコメント参照)。
+         */ fun `terminalPointerEventBytes`(`kind`: MouseEventKind, `button`: MouseButton?, `row`: kotlin.UInt, `col`: kotlin.UInt, `modifiers`: TerminalKeyModifiers, `cols`: kotlin.UInt, `rows`: kotlin.UInt, `mouseReportingMode`: MouseReportingMode, `sgrMouseMode`: kotlin.Boolean): kotlin.ByteArray? {
+            return FfiConverterOptionalByteArray.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(
+    
+        FfiConverterTypeMouseEventKind.lower(`kind`),FfiConverterOptionalTypeMouseButton.lower(`button`),FfiConverterUInt.lower(`row`),FfiConverterUInt.lower(`col`),FfiConverterTypeTerminalKeyModifiers.lower(`modifiers`),FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),FfiConverterTypeMouseReportingMode.lower(`mouseReportingMode`),FfiConverterBoolean.lower(`sgrMouseMode`),_status)
+}
+    )
+    }
+    
+
+        /**
          * 特殊キーを、ターミナルへ送信するバイト列(ANSI/xtermエスケープシーケンス)に
-         * 変換する。矢印キーは`application_cursor_mode`が有効ならSS3形式(`ESC O A`等、
-         * DECCKM)、無効ならCSI形式(`ESC[A`等)を返す。F1〜F4はSS3形式、F5〜F12は
-         * CSI `~`形式(xterm互換)。未対応のfunction key番号は空配列を返す。
-         */ fun `terminalSpecialKeyBytes`(`key`: TerminalSpecialKey, `applicationCursorMode`: kotlin.Boolean): kotlin.ByteArray {
+         * 変換する。
+         *
+         * - 矢印キーは、修飾子が一切無い場合のみ`application_cursor_mode`(DECCKM)に従い
+         * SS3形式(`ESC O A`等)/CSI形式(`ESC[A`等)を切り替える。**修飾子が1つでも
+         * 付いている場合はDECCKMの値に関わらず常にCSI形式**(`ESC[1;5A`等、xterm互換)
+         * になる(DECCKMはSS3/CSIの切替のみを制御し、修飾子パラメータ付きシーケンスは
+         * 元々CSI形式でしか表現できないため)。
+         * - Home/End/PageUp/PageDownも同様に、修飾子が無ければ従来通りの無パラメータ形式
+         * (`ESC[H`/`ESC[5~`等)、修飾子があればパラメータ付き(`ESC[1;5H`/`ESC[5;5~`等)。
+         * - F1〜F4は修飾子が無ければSS3形式(`ESC O P`等)だが、修飾子が付くと
+         * SS3では修飾子パラメータを表現できないため**CSI形式に切り替わる**
+         * (`ESC[1;5P`等)。F5〜F12はどちらの場合もCSI `~`形式(修飾子有りなら
+         * `ESC[15;5~`等)。未対応のfunction key番号は空配列を返す。
+         * - Tabは修飾子無しなら`0x09`だが、Shift単独の場合はCBT(Cursor Backward Tab、
+         * `ESC[Z`)を返す(readline/tmux等の「戻りタブ補完」に必要。xterm互換で
+         * パラメータは付かない)。Shift以外の修飾子(Ctrl+Tab等)はターミナル制御
+         * シーケンスとして標準化されていないため無視し、無修飾のTabとして扱う。
+         * - `kitty_flags`(タスク#54で交渉・`ScreenUpdate::kitty_keyboard_flags`として公開される
+         * Kitty keyboard protocolのnegotiated flags、呼び出し側はそこから取得した最新値を
+         * 毎回渡すこと)にbit0(`0b1`、disambiguate escape codes)が立っている場合のみEscapeキーが
+         * `ESC[27u`(Kitty `CSI u`形式)になる。Escapeキー(バイト`0x1B`)は本来それ自体が任意の
+         * エスケープシーケンスの開始バイトと衝突しうるためこのbitが名指しする典型例
+         * (<https://sw.kovidgoyal.net/kitty/keyboard-protocol/#disambiguate>: "pressing the Esc
+         * key generates the byte 0x1b which also is used to indicate the start of an escape
+         * code")であり、Kitty仕様は無条件で`CSI u`化するよう定めている。矢印・Home/End・
+         * PageUp/PageDown・F1〜F12は、同仕様が明示的に許容する代替形式
+         * (`CSI 1;<mod>[~ABCDEFHPQS]`)が既存のxterm修飾子CSI形式と完全に一致するため、
+         * `kitty_flags`に関わらず上記の挙動をそのまま流用してよい(変更不要)。Enter/Tab/
+         * Delete(Backspace相当)/ForwardDeleteも仕様が明示する例外("still generate the same
+         * bytes as in legacy mode")でありlegacy形式のまま。Ctrl+英字等の通常テキストキー
+         * (`terminal_ctrl_byte`/Unicode文字経路)のCSI u化は本関数のスコープ外(未対応、
+         * タスク#72では見送り——`ScreenUpdate::kitty_keyboard_flags`のdocコメント参照)。
+         */ fun `terminalSpecialKeyBytes`(`key`: TerminalSpecialKey, `applicationCursorMode`: kotlin.Boolean, `modifiers`: TerminalKeyModifiers, `kittyFlags`: kotlin.UShort): kotlin.ByteArray {
             return FfiConverterByteArray.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(
     
-        FfiConverterTypeTerminalSpecialKey.lower(`key`),FfiConverterBoolean.lower(`applicationCursorMode`),_status)
+        FfiConverterTypeTerminalSpecialKey.lower(`key`),FfiConverterBoolean.lower(`applicationCursorMode`),FfiConverterTypeTerminalKeyModifiers.lower(`modifiers`),FfiConverterUShort.lower(`kittyFlags`),_status)
 }
     )
     }

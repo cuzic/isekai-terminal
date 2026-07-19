@@ -1,36 +1,86 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use log::{debug, info, warn};
 use parking_lot::Mutex;
-use timed_fsm::tokio_support::TokioTimerRuntime;
-use timed_fsm::{TimerCommand, TimerRuntime};
+use timed_fsm::TimerCommand;
 
-use crate::{CellData, ClipboardMimeKind, ClipboardPayload, ScreenUpdate, SessionCallback, RUNTIME};
+use crate::{CellData, ClipboardMimeKind, ClipboardPayload, ScreenUpdate, ScrollbackSearchMatch, SessionCallback, RUNTIME};
 use crate::session_state::{ProcessResult, SessionState, SideEffect};
-use crate::terminal::{TermCell, Terminal};
+use crate::terminal::TermCell;
 use crate::theme::Theme;
 use crate::transport::{SessionCmd, TransportCommand, TransportEvent};
 use crate::trzsz::{TrzszMode, TrzszTimer};
 
 const SCROLLBACK_LIMIT: usize = 1000;
 
-// ── TermCell → 公開型変換（session 層の責務）────────────
+/// DEC Synchronized Output(`?2026`)のsafety-netタイムアウト。リモートが
+/// `CSI ?2026h`を送ったまま`CSI ?2026l`を送らずハングした場合、これだけ経過
+/// したら強制的に同期状態を解除して直近の画面内容をflushする(さもないと画面が
+/// 永久に固まって見える)。値はモバイル/ネットワーク越しの体感を踏まえた
+/// 端末機能としての経験則(codexとの設計相談での合意値)。
+const SYNC_OUTPUT_SAFETY_TIMEOUT: Duration = Duration::from_millis(250);
 
-fn to_cell_data(c: &TermCell) -> CellData {
-    CellData { ch: c.ch.to_string(), fg: c.fg, bg: c.bg, bold: c.bold }
+/// safety-netタイマーの発火通知(`fired_generation`)が、現在armされている
+/// タイマーそのものからのものかどうかを判定する(codexレビュー指摘のstale通知
+/// race対策——`session_event_loop`内の`sync_output_timeout_rx`アームdocコメント
+/// 参照)。ロジックをここに切り出すのは、tokio spawnを伴わずに単体テストできる
+/// ようにするため。
+fn sync_output_timeout_is_current(fired_generation: u64, armed_generation: Option<u64>) -> bool {
+    armed_generation == Some(fired_generation)
 }
 
-fn make_screen_update(t: &Terminal) -> ScreenUpdate {
-    ScreenUpdate {
-        cols: t.cols() as u32,
-        rows: t.rows() as u32,
-        cells: t.screen_cells().iter().map(to_cell_data).collect(),
-        cursor_row: t.cursor_row() as u32,
-        cursor_col: t.cursor_col() as u32,
-        title: t.title().map(str::to_owned),
-        application_cursor_mode: t.application_cursor_mode(),
-        bracketed_paste_mode: t.bracketed_paste_mode(),
+// ── TermCell → 公開型変換（session 層の責務）────────────
+
+pub(crate) fn to_cell_data(c: &TermCell) -> CellData {
+    CellData {
+        ch: c.ch.to_string(),
+        fg: c.fg,
+        bg: c.bg,
+        bold: c.bold,
+        dim: c.dim,
+        italic: c.italic,
+        underline: c.underline,
+        strikethrough: c.strikethrough,
+        blink: c.blink,
+        invisible: c.invisible,
+        link_id: c.link_id,
+    }
+}
+
+// ── TokioTimerRuntime ────────────────────────────────────
+
+struct TokioTimerRuntime {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    timeout_tx: tokio::sync::mpsc::Sender<TrzszTimer>,
+}
+
+impl TokioTimerRuntime {
+    fn new(timeout_tx: tokio::sync::mpsc::Sender<TrzszTimer>) -> Self {
+        TokioTimerRuntime { handle: None, timeout_tx }
+    }
+
+    fn set(&mut self, id: TrzszTimer, dur: Duration) {
+        if self.handle.is_some() {
+            debug!("trzsz timer: replace {:?} dur={:?}", id, dur);
+        } else {
+            debug!("trzsz timer: set {:?} dur={:?}", id, dur);
+        }
+        self.kill(id);
+        let tx = self.timeout_tx.clone();
+        self.handle = Some(tokio::spawn(async move {
+            tokio::time::sleep(dur).await;
+            debug!("trzsz timer: fired {:?}", id);
+            let _ = tx.send(id).await;
+        }));
+    }
+
+    fn kill(&mut self, id: TrzszTimer) {
+        if let Some(h) = self.handle.take() {
+            debug!("trzsz timer: killed {:?}", id);
+            h.abort();
+        }
     }
 }
 
@@ -41,6 +91,10 @@ pub(crate) struct SessionCore {
     session_tx: Mutex<Option<tokio::sync::mpsc::Sender<SessionCmd>>>,
     scrollback: Arc<Mutex<VecDeque<Vec<TermCell>>>>,
     screen_cols: Mutex<u32>,
+    /// [resize]に直近渡された(cols, rows)。同一値の連続呼び出し(#62: IME開閉・回転・
+    /// ピンチズームでKotlin/Swift側から不要に連発されるresize)をここで一元的に無視する
+    /// ためだけに使う(rust-ssot: 判定ロジックをKotlin/Swift側にミラーしない)。
+    last_resize_dims: Mutex<(u32, u32)>,
     /// Phase 12: per-session theme。このセッション(タブ)が現在使っているテーマの
     /// スナップショット。[scrollback_cells]の空白パディング色にもここから使う。
     current_theme: Mutex<Theme>,
@@ -62,6 +116,7 @@ impl SessionCore {
             session_tx: Mutex::new(None),
             scrollback: Arc::new(Mutex::new(VecDeque::new())),
             screen_cols: Mutex::new(80),
+            last_resize_dims: Mutex::new((80, 24)),
             current_theme: Mutex::new(Theme::default()),
             callback: Mutex::new(None),
         }
@@ -80,6 +135,7 @@ impl SessionCore {
         *self.handle_tx.lock() = Some(cmd_tx.clone());
         *self.session_tx.lock() = Some(session_cmd_tx);
         *self.screen_cols.lock() = cols;
+        *self.last_resize_dims.lock() = (cols, rows);
         self.scrollback.lock().clear();
         // 接続(タブ作成)時点のグローバル既定テーマをスナップショットする。呼び出し側
         // (Kotlin)がプロファイル固有のテーマを使いたい場合は、この直後に[set_theme]を
@@ -135,7 +191,19 @@ impl SessionCore {
         let theme = *self.current_theme.lock();
         let cols = *self.screen_cols.lock() as usize;
         let sb = self.scrollback.lock();
-        let blank = CellData { ch: " ".into(), fg: theme.default_fg, bg: theme.default_bg, bold: false };
+        let blank = CellData {
+            ch: " ".into(),
+            fg: theme.default_fg,
+            bg: theme.default_bg,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            blink: false,
+            invisible: false,
+            link_id: None,
+        };
         let mut result = vec![blank; rows as usize * cols];
         for r in 0..rows as usize {
             let sb_idx = offset as usize + (rows as usize - 1 - r);
@@ -149,6 +217,89 @@ impl SessionCore {
         result
     }
 
+    /// scrollbackを対象にした部分一致検索(タスク#37)。`query`が空文字列なら
+    /// (空文字列は「全セルにマッチ」という無意味な結果になるため)空Vecを返す。
+    ///
+    /// 各行を「全角文字のプレースホルダセルを除いた1セル=1文字単位」の列として
+    /// 展開してから素朴な部分文字列探索を行う。プレースホルダを除くのは、
+    /// プレースホルダの`ch`(常に半角スペース)が実在しない文字として検索文字列に
+    /// 混入し、隣接セルをまたぐマッチを誤って分断/接続してしまうのを防ぐため。
+    ///
+    /// combining character(タスク#39)によりセルの`ch`が複数コードポイントを
+    /// 持つ場合、そのセルの全コードポイントに同じ「セル通し番号」を振り、マッチの
+    /// 開始/終了がその通し番号の境界(=セルの先頭/末尾)以外では成立しないよう
+    /// 制約する。これにより例えば"e"+結合アクセントの1セルに対し、"e"や結合
+    /// アクセント単体だけがそのセルの内部で部分マッチすることはない(Codexレビュー:
+    /// 当初の実装はcharの列をそのまま探索しておりこの制約が無かった)。
+    ///
+    /// `case_sensitive=false`の大文字小文字比較はASCIIの範囲のみ
+    /// (`char::to_ascii_lowercase`)。非ASCII文字のUnicodeケースフォールディングは
+    /// 対象外(文字数が変わりうるcaseがあり、列インデックスとの対応が崩れるため)。
+    ///
+    /// スコープ外については[crate::ScrollbackSearchMatch]のドキュメントを参照。
+    pub(crate) fn search_scrollback(&self, query: &str, case_sensitive: bool) -> Vec<ScrollbackSearchMatch> {
+        let needle: Vec<char> = if case_sensitive {
+            query.chars().collect()
+        } else {
+            query.chars().map(|c| c.to_ascii_lowercase()).collect()
+        };
+        if needle.is_empty() {
+            return Vec::new();
+        }
+
+        let sb = self.scrollback.lock();
+        let mut matches = Vec::new();
+        for (row_idx, row) in sb.iter().enumerate() {
+            // 行を「プレースホルダを除いたcharごとに、由来するセルの(列, 表示幅,
+            // セル通し番号)」の列へ展開する。同一セル由来のcharは同じ
+            // `cell_seq_of`値を持つ。
+            let mut haystack: Vec<char> = Vec::with_capacity(row.len());
+            let mut col_of: Vec<u32> = Vec::with_capacity(row.len());
+            let mut width_of: Vec<u32> = Vec::with_capacity(row.len());
+            let mut cell_seq_of: Vec<u32> = Vec::with_capacity(row.len());
+            let mut cell_seq: u32 = 0;
+            for (col, cell) in row.iter().enumerate() {
+                if cell.is_wide_placeholder {
+                    continue;
+                }
+                let width = if row.get(col + 1).is_some_and(|next| next.is_wide_placeholder) { 2 } else { 1 };
+                for ch in cell.ch.chars() {
+                    haystack.push(if case_sensitive { ch } else { ch.to_ascii_lowercase() });
+                    col_of.push(col as u32);
+                    width_of.push(width);
+                    cell_seq_of.push(cell_seq);
+                }
+                cell_seq += 1;
+            }
+
+            if haystack.len() < needle.len() {
+                continue;
+            }
+            for start in 0..=haystack.len() - needle.len() {
+                let end = start + needle.len() - 1; // マッチ末尾のindex(含む)
+                // マッチの開始/終了はどちらもセルの境界でなければならない
+                // (combining characterセルの途中から始まる/終わるマッチは無効)。
+                let starts_at_cell_boundary =
+                    start == 0 || cell_seq_of[start - 1] != cell_seq_of[start];
+                let ends_at_cell_boundary =
+                    end + 1 == haystack.len() || cell_seq_of[end] != cell_seq_of[end + 1];
+                if !starts_at_cell_boundary || !ends_at_cell_boundary {
+                    continue;
+                }
+                if haystack[start..start + needle.len()] == needle[..] {
+                    let col_start = col_of[start];
+                    let col_end = col_of[end] + width_of[end];
+                    matches.push(ScrollbackSearchMatch {
+                        row: row_idx as u32,
+                        col: col_start,
+                        len: col_end - col_start,
+                    });
+                }
+            }
+        }
+        matches
+    }
+
     pub(crate) fn send(&self, data: Vec<u8>) {
         if let Some(tx) = self.handle_tx.lock().as_ref() {
             if tx.try_send(TransportCommand::WriteStdin(data)).is_err() {
@@ -157,12 +308,36 @@ impl SessionCore {
         }
     }
 
+    /// (cols, rows)が直前の呼び出しと同一なら何もしない(#62)。Android/iOS双方でIME
+    /// キーボードの開閉・端末回転・ピンチズームのたびに同じサイズでresizeが連発され
+    /// 得るが、その判定・抑止をここ1箇所(Rust側)に置くことで、Kotlin/Swift側に
+    /// 同種のミラー判定を重複実装しなくて済む(rust-ssot原則)。
+    ///
+    /// dedupeキャッシュ(`last_resize_dims`)は、実際に`TransportCommand::Resize`の
+    /// 送出に成功した場合にのみ更新する。送出前に更新してしまうと、チャネルが
+    /// フル(`try_send`失敗)で今回のリサイズが実際には配送されなかった場合、次に
+    /// 同じ(cols, rows)でリサイズ要求が来ても「前回と同一だから」という理由で
+    /// 永久にスキップされてしまい、リモートPTYのサイズが実際の画面サイズと
+    /// 食い違ったまま復旧できなくなる。
     pub(crate) fn resize(&self, cols: u32, rows: u32) {
+        if *self.last_resize_dims.lock() == (cols, rows) {
+            return;
+        }
         *self.screen_cols.lock() = cols;
-        if let Some(tx) = self.handle_tx.lock().as_ref() {
-            if tx.try_send(TransportCommand::Resize { cols, rows }).is_err() {
-                log::warn!("ssh: resize command dropped (channel full)");
-            }
+        let sent = match self.handle_tx.lock().as_ref() {
+            Some(tx) => match tx.try_send(TransportCommand::Resize { cols, rows }) {
+                Ok(()) => true,
+                Err(_) => {
+                    log::warn!("ssh: resize command dropped (channel full)");
+                    false
+                }
+            },
+            // まだ`start()`前(transportハンドル未確立)。実際には何も送っていないので
+            // dedupeキャッシュは更新しない(`start()`が改めて初期サイズで初期化する)。
+            None => false,
+        };
+        if sent {
+            *self.last_resize_dims.lock() = (cols, rows);
         }
     }
 
@@ -194,6 +369,14 @@ impl SessionCore {
         self.send_session_cmd(SessionCmd::TrzszCancel { transfer_id });
     }
 
+    /// OSのフォーカス変化(タスク#60: タブ/split pane切替・アプリのbackground/foreground等)
+    /// をそのまま`session_event_loop`へ転送する。フォーカスレポーティング(`?1004`)が
+    /// 無効、または未接続/切断済みの場合は`session_state::notify_focus_change`/
+    /// `send_session_cmd`がそれぞれ無音で無視する(rust-ssot: 有効/無効の判断は
+    /// Rust側のみが持ち、Kotlin/Swift側は生イベントを転送するだけでよい)。
+    pub(crate) fn notify_focus_change(&self, focused: bool) {
+        self.send_session_cmd(SessionCmd::FocusChanged(focused));
+    }
 }
 
 /// Kotlin/Swift側から送られてきた`SessionCmd`を`SessionState`に適用する。
@@ -224,6 +407,7 @@ fn handle_session_cmd(state: &mut SessionState, c: SessionCmd) -> ProcessResult 
                 clipboard_pull_requested: false,
             }
         }
+        SessionCmd::FocusChanged(focused) => state.notify_focus_change(focused),
     }
 }
 
@@ -285,7 +469,28 @@ pub(crate) async fn session_event_loop(
 ) {
     info!("session: event loop start {}x{}", init_cols, init_rows);
     let mut state = SessionState::new(init_cols as usize, init_rows as usize, initial_theme);
-    let mut timer_rt = TokioTimerRuntime::<TrzszTimer>::new();
+    let (timeout_tx, mut timeout_rx) = tokio::sync::mpsc::channel::<TrzszTimer>(16);
+    let mut timer_rt = TokioTimerRuntime::new(timeout_tx);
+    // DEC Synchronized Output(`?2026`)のsafety-netタイマー。`TokioTimerRuntime`は
+    // trzsz FSM専用の単一スロット実装なので使い回さず、同じ形の別スロットを持つ
+    // (codexとの設計相談: 複数タイマー種別を汎化するのはタイマー種別が増える見込みが
+    // 出てから)。`sync_output_timer_handle`は「現在armされているsafety-netタイマー」
+    // そのもの——ループ末尾でTerminal側の実際の状態と突き合わせてarm/disarmする。
+    //
+    // タイマー発火通知に`()`ではなくgeneration番号(`u64`)を積むのは、以下のstale
+    // 通知raceを防ぐため(2周目のcodexレビューで指摘): safety-netタイマーが発火して
+    // `sync_timeout_tx`へ送信した直後(まだ`sync_timeout_rx`側で受信していない時点)に
+    // `CSI ?2026l`がstdoutから届いて処理されると、そちらのイテレーションで
+    // `sync_output_timer_handle.abort()`しても、channel容量1に既に積まれてしまった
+    // 発火通知そのものは取り消せない。generationを見ずに素朴に
+    // `force_end_synchronized_output`を呼ぶと、その直後に始まった**別の**
+    // `?2026h`区間まで誤って強制終了させてしまう。`sync_output_armed_generation`が
+    // 現在armされているタイマーのgenerationを保持し、[sync_output_timeout_is_current]
+    // が一致するものだけを本物の発火として扱う。
+    let (sync_timeout_tx, mut sync_timeout_rx) = tokio::sync::mpsc::channel::<u64>(1);
+    let mut sync_output_timer_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut sync_output_timer_generation: u64 = 0;
+    let mut sync_output_armed_generation: Option<u64> = None;
 
     'outer: loop {
         let result: Option<ProcessResult> = tokio::select! {
@@ -314,10 +519,8 @@ pub(crate) async fn session_event_loop(
                     Some(state.on_stdout(bytes))
                 }
                 Some(TransportEvent::Resized { cols, rows }) => {
-                    info!("session: terminal resize {}x{}, scrollback cleared", cols, rows);
-                    state.reset_for_resize(cols as usize, rows as usize);
-                    scrollback.lock().clear();
-                    None
+                    info!("session: terminal resize {}x{}", cols, rows);
+                    Some(state.resize(cols as usize, rows as usize))
                 }
                 Some(TransportEvent::ForwardStateChanged { id, state }) => {
                     callback.on_forward_state_changed(id, state); None
@@ -372,7 +575,7 @@ pub(crate) async fn session_event_loop(
                     callback.on_disconnected(None); break 'outer;
                 }
             },
-            timer_id = timer_rt.recv() => match timer_id {
+            timer_id = timeout_rx.recv() => match timer_id {
                 Some(id) => Some(state.on_timeout(id)),
                 None => None,
             },
@@ -380,12 +583,58 @@ pub(crate) async fn session_event_loop(
                 Some(c) => Some(handle_session_cmd(&mut state, c)),
                 None => None,
             },
+            fired = sync_timeout_rx.recv() => match fired {
+                Some(gen) if sync_output_timeout_is_current(gen, sync_output_armed_generation) => {
+                    warn!("session: ?2026 (synchronized output) safety-net timeout fired, forcing flush");
+                    Some(state.force_end_synchronized_output())
+                }
+                // stale通知(既に?2026l/RIS/直前のforce_endでこのgenerationは
+                // disarm済み)。無視する——`sync_output_timeout_is_current`のdocコメント
+                // 参照。
+                Some(_) => None,
+                None => None,
+            },
         };
+
+        // DEC Synchronized Output(`?2026`)のsafety-netタイマーのarm/disarm。上の
+        // `select!`のどのアームが発火したかに関わらず、`Terminal`の実際の状態
+        // (vteが`?2026h`/`?2026l`を処理した結果、または直前のforce_end)と
+        // 突き合わせて一元的に判断する——`state.on_stdout`/`handle_session_cmd`等
+        // 個々の呼び出し側に判断を分散させない。
+        let sync_active = state.terminal().synchronized_output_active();
+        if sync_active {
+            if sync_output_timer_handle.is_none() {
+                sync_output_timer_generation += 1;
+                let gen = sync_output_timer_generation;
+                sync_output_armed_generation = Some(gen);
+                let tx = sync_timeout_tx.clone();
+                sync_output_timer_handle = Some(tokio::spawn(async move {
+                    tokio::time::sleep(SYNC_OUTPUT_SAFETY_TIMEOUT).await;
+                    let _ = tx.send(gen).await;
+                }));
+            }
+        } else {
+            if let Some(h) = sync_output_timer_handle.take() {
+                h.abort();
+            }
+            sync_output_armed_generation = None;
+        }
 
         if let Some(r) = result {
             let clipboard_pull_requested = r.clipboard_pull_requested;
+            // `ScreenUpdate`(行単位dirty diffを含む)の生成は`SessionState`が前回
+            // 発行スナップショットとの差分を取る必要があるため、`state`を`&mut`で
+            // 触れるこのループ側で先に計算し、`dispatch_result`(scrollback/side
+            // effectsを消費する同期関数)には出来上がった`Option<ScreenUpdate>`を
+            // 渡す(タスク#92)。`screen_dirty`でないバッチではスナップショットを
+            // 更新しない——画面が変化していない=前回スナップショットが有効なため。
+            let screen_update = if r.screen_dirty {
+                Some(state.make_screen_update())
+            } else {
+                None
+            };
             dispatch_result(r, &mut timer_rt, &transport_cmd_tx, &callback,
-                            state.terminal(), &scrollback);
+                            screen_update, &scrollback);
             if clipboard_pull_requested {
                 // Fetching the current Android clipboard text needs a Kotlin
                 // round trip (`on_host_key`/`on_agent_sign_request`'s same
@@ -416,16 +665,16 @@ pub(crate) async fn session_event_loop(
 /// ProcessResult をすべて処理する（タイマー・scrollback・副作用・画面更新）
 fn dispatch_result(
     r: ProcessResult,
-    timer_rt: &mut TokioTimerRuntime<TrzszTimer>,
+    timer_rt: &mut TokioTimerRuntime,
     transport_cmd_tx: &tokio::sync::mpsc::Sender<TransportCommand>,
     callback: &Arc<dyn SessionCallback>,
-    terminal: &Terminal,
+    screen_update: Option<ScreenUpdate>,
     scrollback: &Arc<Mutex<VecDeque<Vec<TermCell>>>>,
 ) {
     for cmd in r.timer_cmds {
         match cmd {
-            TimerCommand::Set { id, duration } => timer_rt.set_timer(id, duration),
-            TimerCommand::Kill { id }           => timer_rt.kill_timer(id),
+            TimerCommand::Set { id, duration } => timer_rt.set(id, duration),
+            TimerCommand::Kill { id }           => timer_rt.kill(id),
         }
     }
 
@@ -472,10 +721,10 @@ fn dispatch_result(
         }
     }
 
-    if r.screen_dirty {
-        let upd = make_screen_update(terminal);
-        debug!("screen: update {}x{} cursor=({},{})",
-            upd.cols, upd.rows, upd.cursor_col, upd.cursor_row);
+    if let Some(upd) = screen_update {
+        debug!("screen: update {}x{} cursor=({},{}) dirty_rows={:?}",
+            upd.cols, upd.rows, upd.cursor_col, upd.cursor_row,
+            upd.dirty_rows.as_ref().map(Vec::len));
         callback.on_screen_update(upd);
     }
 
@@ -521,6 +770,23 @@ mod handle_session_cmd_tests {
 
         assert_eq!(state.terminal().theme(), custom);
         assert_is_noop(&result);
+    }
+
+    #[test]
+    fn focus_changed_routes_to_session_state_notify_focus_change() {
+        // タスク#60: `?1004`有効時のみCSI I/CSI OがSideEffect::SendStdinとして返る
+        // ことを、`handle_session_cmd`経由で確認する(未有効時はno-op)。
+        let mut state = fresh_state();
+        let noop = handle_session_cmd(&mut state, SessionCmd::FocusChanged(true));
+        assert_is_noop(&noop);
+
+        state.on_stdout(b"\x1b[?1004h".to_vec());
+        let result = handle_session_cmd(&mut state, SessionCmd::FocusChanged(true));
+        assert_eq!(result.side_effects.len(), 1);
+        match &result.side_effects[0] {
+            SideEffect::SendStdin(bytes) => assert_eq!(bytes, b"\x1b[I"),
+            other => panic!("expected SideEffect::SendStdin, got a different variant: {:?}", std::mem::discriminant(other)),
+        }
     }
 
     #[test]
@@ -622,13 +888,223 @@ mod decode_clipboard_push_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LineDamage;
 
     fn cell(label: char) -> TermCell {
-        TermCell { ch: smol_str::SmolStr::new(label.to_string()), fg: 0xFF010101, bg: 0xFF020202, bold: false }
+        TermCell {
+            ch: smol_str::SmolStr::new(label.to_string()),
+            fg: 0xFF010101,
+            bg: 0xFF020202,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            blink: false,
+            invisible: false,
+            is_wide_placeholder: false,
+            link_id: None,
+        }
     }
 
     fn row(label: char, len: usize) -> Vec<TermCell> {
         vec![cell(label); len]
+    }
+
+    /// 文字列`s`の各charを1セルずつに割り当てた行を組み立てる(検索テスト用)。
+    fn text_row(s: &str) -> Vec<TermCell> {
+        s.chars().map(cell).collect()
+    }
+
+    #[test]
+    fn sync_output_timeout_is_current_only_matches_currently_armed_generation() {
+        assert!(sync_output_timeout_is_current(1, Some(1)));
+        assert!(
+            !sync_output_timeout_is_current(1, Some(2)),
+            "古いgenerationの発火通知は、既に新しいgenerationがarmされていれば無視すべき"
+        );
+        assert!(
+            !sync_output_timeout_is_current(1, None),
+            "既にdisarm済み(?2026l/RIS/直前のforce_end)なら無視すべき"
+        );
+    }
+
+    #[test]
+    fn make_screen_update_link_table_stays_bounded_when_remote_floods_distinct_urls() {
+        // タスク#70: `make_screen_update`は`Terminal::link_table()`を`to_vec()`で
+        // 丸ごと複製して`ScreenUpdate`へ載せる。リモートが相異なるOSC8 URLを
+        // 上限を超えて大量に流しても、UniFFI境界を越えて公開される
+        // `ScreenUpdate.link_table`が`crate::terminal::MAX_LINK_TABLE`件で
+        // 頭打ちになる(=毎フレームのFFIコピーコストも無界には悪化しない)ことを
+        // 確認する。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let flood = crate::terminal::MAX_LINK_TABLE + 500;
+        let mut bytes = Vec::new();
+        for i in 0..flood {
+            bytes.extend_from_slice(format!("\x1b]8;;https://flood.example/{i}\x07").as_bytes());
+        }
+        state.on_stdout(bytes);
+
+        let upd = state.make_screen_update();
+        assert_eq!(
+            upd.link_table.len(),
+            crate::terminal::MAX_LINK_TABLE,
+            "ScreenUpdate.link_tableは上限件数で頭打ちになり無界には増えない"
+        );
+    }
+
+    #[test]
+    fn make_screen_update_clamps_cursor_col_during_delayed_wrap() {
+        // `Terminal::cursor_col()`は遅延折り返し(delayed wrap)中`cols`(範囲外)を
+        // 返しうる内部表現をそのまま公開する。`ScreenUpdate.cursor_col`はUIが
+        // 直接セルインデックスとして使う描画可能な列であるべきなので、UniFFI境界を
+        // 越える前にここでクランプする(タスク#56)。
+        let mut state = SessionState::new(10, 3, Theme::default());
+        state.on_stdout(b"0123456789".to_vec()); // ちょうど10文字でwrap-pending
+        assert_eq!(state.terminal().cursor_col(), 10, "precondition: terminal is in delayed-wrap state");
+
+        let upd = state.make_screen_update();
+        assert_eq!(upd.cursor_col, 9, "ScreenUpdate.cursor_col must be clamped to the last visible column");
+    }
+
+    // ── 行単位 dirty diff(タスク#92-95, #101)────────────────
+
+    #[test]
+    fn dirty_rows_is_none_on_first_emit() {
+        // 初回発行は前回スナップショットが無いので全画面dirty(=None)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let upd = state.make_screen_update();
+        assert!(upd.dirty_rows.is_none(), "初回は全画面dirty(None)であるべき");
+    }
+
+    #[test]
+    fn dirty_rows_is_empty_when_screen_and_cursor_unchanged() {
+        // 2回連続で完全に同一の画面(カーソルも静止)を発行したら、2回目は損傷行が空。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update(); // スナップショット確定(None)
+        let upd = state.make_screen_update();
+        assert_eq!(upd.dirty_rows, Some(vec![]), "無変化フレームは空のdirty_rows");
+    }
+
+    #[test]
+    fn update_seq_increments_monotonically_across_emits() {
+        // 配信チャネルがconflateされた場合(Android Channel.CONFLATED等)にUI層が
+        // 読み飛ばしを検知できるよう、発行のたびに単調増加する(セルフレビューで
+        // 発覚したconflated-channel問題の修正)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let u0 = state.make_screen_update();
+        let u1 = state.make_screen_update();
+        let u2 = state.make_screen_update();
+        assert_eq!(u0.update_seq, 1, "0始まりでwrapping_add(1)するので初回発行はseq=1");
+        assert_eq!(u1.update_seq, 2);
+        assert_eq!(u2.update_seq, 3);
+    }
+
+    #[test]
+    fn dirty_rows_single_cell_change_is_one_tight_range() {
+        // row5 col0 に1文字だけ書き、カーソルは元の位置(home)へ戻す。損傷は
+        // その1セル(left==right)のみで、カーソル移動由来の余計な行は付かない。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        state.on_stdout(b"\x1b[6;1HX\x1b[1;1H".to_vec()); // row5 col0 に'X'、その後 home へ復帰
+        let upd = state.make_screen_update();
+        assert_eq!(
+            upd.dirty_rows,
+            Some(vec![LineDamage { line: 5, left: 0, right: 0 }]),
+            "変化した1セルだけがtightな損傷レンジになる"
+        );
+    }
+
+    #[test]
+    fn dirty_rows_multi_row_change() {
+        // row3 と row7 に3文字ずつ書き、カーソルは home へ戻す。損傷は2行、各 [0,2]。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        state.on_stdout(b"\x1b[4;1HAAA\x1b[8;1HBBB\x1b[1;1H".to_vec());
+        let upd = state.make_screen_update();
+        assert_eq!(
+            upd.dirty_rows,
+            Some(vec![
+                LineDamage { line: 3, left: 0, right: 2 },
+                LineDamage { line: 7, left: 0, right: 2 },
+            ]),
+            "変化した2行だけが行番号昇順で損傷レンジになる"
+        );
+    }
+
+    #[test]
+    fn dirty_rows_cursor_only_move_marks_prev_and_new_rows() {
+        // セル内容は一切変えず、カーソルだけ (0,0) → (row4,col2) へ動かす。iOS向けに
+        // 「離れた行(row0)」と「乗った行(row4)」の両方が損傷行に載る(タスク#94)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update(); // スナップショット確定(cursor (0,0))
+        state.on_stdout(b"\x1b[5;3H".to_vec()); // CUP: row4 col2 へ(印字なし=セル不変)
+        let upd = state.make_screen_update();
+        assert_eq!(
+            upd.dirty_rows,
+            Some(vec![
+                LineDamage { line: 0, left: 0, right: 0 }, // 前回カーソル行(消す)
+                LineDamage { line: 4, left: 2, right: 2 }, // 今回カーソル行(描く)
+            ]),
+            "カーソルのみ移動でも前回位置と今回位置の両行が損傷になる"
+        );
+    }
+
+    #[test]
+    fn dirty_rows_cursor_visibility_only_toggle_marks_cursor_row() {
+        // カーソル位置は不変のまま、DECTCEM(`CSI ?25l`)で可視性だけを切り替える。
+        // 下地セルは不変なのでコンテンツ差分では検出できないが、カーソル行は
+        // 強制dirty化されなければならない(セルフレビューで検出したギャップの回帰テスト:
+        // 元実装は位置のみ比較していたため、可視性だけの変化を見落としていた)。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update(); // スナップショット確定(cursor (0,0), visible)
+        state.on_stdout(b"\x1b[?25l".to_vec()); // カーソル非表示、位置は不変
+        let upd = state.make_screen_update();
+        assert_eq!(
+            upd.dirty_rows,
+            Some(vec![LineDamage { line: 0, left: 0, right: 0 }]),
+            "位置が不変でも可視性トグルだけでカーソル行がdirtyになるべき"
+        );
+    }
+
+    #[test]
+    fn dirty_rows_is_none_on_resize() {
+        // リサイズは寸法が変わる(かつ full_damage_pending も立つ)ので全画面dirty。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        let _ = state.resize(100, 30);
+        let upd = state.make_screen_update();
+        assert!(upd.dirty_rows.is_none(), "リサイズは全画面dirty(None)");
+    }
+
+    #[test]
+    fn dirty_rows_is_none_on_scroll_up_region() {
+        // SU(`CSI S`)は行座標をずらすので、内容差分ではなく明示フラグで全画面dirty
+        // (タスク#93)。空画面でも(全行 blank→blank で内容は不変でも)Noneになるのが
+        // 「内容ベースでなく構造イベントベース」であることの確認。
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        state.on_stdout(b"\x1b[S".to_vec());
+        let upd = state.make_screen_update();
+        assert!(upd.dirty_rows.is_none(), "SUは全画面dirty(None)");
+    }
+
+    #[test]
+    fn dirty_rows_is_none_on_insert_lines() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        state.on_stdout(b"\x1b[L".to_vec()); // IL
+        let upd = state.make_screen_update();
+        assert!(upd.dirty_rows.is_none(), "ILは全画面dirty(None)");
+    }
+
+    #[test]
+    fn dirty_rows_is_none_on_delete_lines() {
+        let mut state = SessionState::new(80, 24, Theme::default());
+        let _ = state.make_screen_update();
+        state.on_stdout(b"\x1b[M".to_vec()); // DL
+        let upd = state.make_screen_update();
+        assert!(upd.dirty_rows.is_none(), "DLは全画面dirty(None)");
     }
 
     fn core_with_scrollback(cols: u32, rows_by_index: Vec<Vec<TermCell>>) -> SessionCore {
@@ -696,6 +1172,202 @@ mod tests {
         assert_eq!(cells[4].ch, " ");
     }
 
+    // ── search_scrollback(タスク#37) ────────────────────────
+
+    #[test]
+    fn search_scrollback_returns_empty_for_empty_query() {
+        let core = core_with_scrollback(20, vec![text_row("hello world")]);
+        assert!(core.search_scrollback("", true).is_empty());
+    }
+
+    #[test]
+    fn search_scrollback_finds_match_with_row_col_len() {
+        // index0 = 最新行。"hello"はcol0開始・5セル分。
+        let core = core_with_scrollback(20, vec![text_row("hello world")]);
+        let matches = core.search_scrollback("hello", true);
+        assert_eq!(matches, vec![ScrollbackSearchMatch { row: 0, col: 0, len: 5 }]);
+    }
+
+    #[test]
+    fn search_scrollback_reports_row_using_newest_first_convention() {
+        // scrollback_cellsと同じ規約(index0=最新)を`row`でもそのまま使う。
+        let core = core_with_scrollback(20, vec![
+            text_row("newest line"), // row 0
+            text_row("older line"),  // row 1
+        ]);
+        let matches = core.search_scrollback("line", true);
+        assert_eq!(matches.len(), 2);
+        assert!(matches.contains(&ScrollbackSearchMatch { row: 0, col: 7, len: 4 }));
+        assert!(matches.contains(&ScrollbackSearchMatch { row: 1, col: 6, len: 4 }));
+    }
+
+    #[test]
+    fn search_scrollback_case_sensitive_true_requires_exact_case() {
+        let core = core_with_scrollback(20, vec![text_row("Hello World")]);
+        assert!(core.search_scrollback("hello", true).is_empty());
+        assert_eq!(core.search_scrollback("Hello", true), vec![
+            ScrollbackSearchMatch { row: 0, col: 0, len: 5 },
+        ]);
+    }
+
+    #[test]
+    fn search_scrollback_case_sensitive_false_ignores_ascii_case() {
+        let core = core_with_scrollback(20, vec![text_row("Hello World")]);
+        assert_eq!(core.search_scrollback("hello", false), vec![
+            ScrollbackSearchMatch { row: 0, col: 0, len: 5 },
+        ]);
+        assert_eq!(core.search_scrollback("WORLD", false), vec![
+            ScrollbackSearchMatch { row: 0, col: 6, len: 5 },
+        ]);
+    }
+
+    #[test]
+    fn search_scrollback_finds_multiple_matches_in_same_row() {
+        let core = core_with_scrollback(20, vec![text_row("abcabc")]);
+        let matches = core.search_scrollback("abc", true);
+        assert_eq!(matches, vec![
+            ScrollbackSearchMatch { row: 0, col: 0, len: 3 },
+            ScrollbackSearchMatch { row: 0, col: 3, len: 3 },
+        ]);
+    }
+
+    #[test]
+    fn search_scrollback_returns_no_match_when_absent() {
+        let core = core_with_scrollback(20, vec![text_row("hello world")]);
+        assert!(core.search_scrollback("xyz", true).is_empty());
+    }
+
+    #[test]
+    fn search_scrollback_match_spanning_wide_char_reports_display_width_as_len() {
+        // col0='a', col1='あ'(表示幅2、col2はそのプレースホルダ), col3='b'。
+        let mut wide = cell('あ');
+        wide.is_wide_placeholder = false;
+        let mut placeholder = cell(' ');
+        placeholder.is_wide_placeholder = true;
+        let row_cells = vec![cell('a'), wide, placeholder, cell('b')];
+        let core = core_with_scrollback(20, vec![row_cells]);
+
+        // プレースホルダは検索対象文字列から除外されるため、"あb"は連続した
+        // 2文字としてマッチし、幅は全角文字の2セル分を含めて3になる。
+        let matches = core.search_scrollback("あb", true);
+        assert_eq!(matches, vec![ScrollbackSearchMatch { row: 0, col: 1, len: 3 }]);
+
+        // 全角文字単体の検索では、その表示幅(2)がそのままlenになる。
+        let matches = core.search_scrollback("あ", true);
+        assert_eq!(matches, vec![ScrollbackSearchMatch { row: 0, col: 1, len: 2 }]);
+    }
+
+    #[test]
+    fn search_scrollback_treats_combining_character_cell_as_one_unit() {
+        // タスク#39: 結合文字は基底文字と同じセルの`ch`へ複数コードポイントとして
+        // 格納される(例: "e" + COMBINING ACUTE ACCENT)。このセルの一部だけに
+        // マッチが掛かることはない。
+        let mut combined = cell('e');
+        combined.ch = smol_str::SmolStr::new("e\u{0301}"); // "é"(結合文字表現)
+        let row_cells = vec![cell('x'), combined, cell('y')];
+        let core = core_with_scrollback(20, vec![row_cells]);
+
+        // 結合文字の片方(基底文字のみ)を検索しても、そのセル全体にしかマッチしない
+        // ("y"を含めた"e\u{0301}y"全体で検索すればマッチする)。
+        let matches = core.search_scrollback("e\u{0301}y", true);
+        assert_eq!(matches, vec![ScrollbackSearchMatch { row: 0, col: 1, len: 2 }]);
+    }
+
+    #[test]
+    fn search_scrollback_does_not_match_inside_a_combining_character_cell() {
+        // Codexレビュー(タスク#37): 結合文字セルの一部だけを検索語にした場合、
+        // そのセルの内部で部分マッチしてはいけない(基底文字だけの"e"や結合
+        // アクセント単体の検索が、"é"を表示しているセルにヒットしてはいけない)。
+        let mut combined = cell('e');
+        combined.ch = smol_str::SmolStr::new("e\u{0301}"); // "é"(結合文字表現)
+        let row_cells = vec![cell('x'), combined, cell('y')];
+        let core = core_with_scrollback(20, vec![row_cells]);
+
+        assert!(core.search_scrollback("e", true).is_empty(), "base charだけの部分マッチは無効");
+        assert!(core.search_scrollback("\u{0301}", true).is_empty(), "結合アクセント単体の部分マッチは無効");
+        // セル全体("e\u{0301}")を丸ごと検索語にすればマッチする。
+        assert_eq!(core.search_scrollback("e\u{0301}", true), vec![
+            ScrollbackSearchMatch { row: 0, col: 1, len: 1 },
+        ]);
+    }
+
+    // ── resize: 同一値dedupe(#62) ────────────────────────────
+
+    /// [SessionCore::resize]が`TransportCommand::Resize`を実際に送るかどうかだけを
+    /// 見るための最小セットアップ。`start()`はTokioランタイム上のevent loopを
+    /// spawnしてしまう(このテストの対象外)ため使わず、`handle_tx`だけを直接張る。
+    fn core_with_command_channel() -> (SessionCore, tokio::sync::mpsc::Receiver<TransportCommand>) {
+        let core = SessionCore::new();
+        let (tx, rx) = tokio::sync::mpsc::channel::<TransportCommand>(8);
+        *core.handle_tx.lock() = Some(tx);
+        (core, rx)
+    }
+
+    #[test]
+    fn resize_sends_command_on_first_call() {
+        let (core, mut rx) = core_with_command_channel();
+        core.resize(100, 40);
+        match rx.try_recv().expect("should have sent a resize command") {
+            TransportCommand::Resize { cols, rows } => assert_eq!((cols, rows), (100, 40)),
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn resize_is_noop_when_dims_unchanged() {
+        let (core, mut rx) = core_with_command_channel();
+        core.resize(100, 40);
+        rx.try_recv().expect("first call should send");
+        core.resize(100, 40); // 同一値の連続呼び出し(#62: IME開閉・回転等を想定)
+        assert!(rx.try_recv().is_err(), "duplicate resize with identical dims must not be sent");
+    }
+
+    #[test]
+    fn resize_sends_again_when_dims_change() {
+        let (core, mut rx) = core_with_command_channel();
+        core.resize(100, 40);
+        rx.try_recv().expect("first call should send");
+        core.resize(100, 41); // rowsだけ変化
+        match rx.try_recv().expect("changed dims should send again") {
+            TransportCommand::Resize { cols, rows } => assert_eq!((cols, rows), (100, 41)),
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn resize_matching_initial_start_dims_is_noop() {
+        // start()呼び出し直後に、Kotlin/Swift側がそのまま同じサイズでresize()を
+        // 呼んでも(初期レイアウト確定直後の再通知等)、変化が無いので送るべきではない。
+        let core = SessionCore::new();
+        *core.last_resize_dims.lock() = (100, 40); // start()相当の初期化を模倣
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportCommand>(8);
+        *core.handle_tx.lock() = Some(tx);
+        core.resize(100, 40);
+        assert!(rx.try_recv().is_err(), "resize matching the dims set at start() must be a no-op");
+    }
+
+    #[test]
+    fn resize_that_fails_to_send_does_not_poison_dedupe_cache() {
+        // チャネルが埋まっていて`try_send`が失敗した場合、実際にはリモートへ何も
+        // 配送されていないので、dedupeキャッシュを更新してはいけない。更新して
+        // しまうと、次に同じ(cols, rows)でresizeが来たときに「前回と同一」と
+        // 誤判定されて永久にスキップされ、リモートPTYのサイズが実画面と
+        // 食い違ったまま復旧できなくなる。
+        let core = SessionCore::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportCommand>(1);
+        tx.try_send(TransportCommand::WriteStdin(Vec::new())).expect("fill the only slot");
+        *core.handle_tx.lock() = Some(tx);
+
+        core.resize(100, 40); // channel full → 送出失敗、dedupeキャッシュは更新されないはず
+
+        rx.try_recv().expect("drain the filler command"); // 空きを作る
+        core.resize(100, 40); // 同一値だが、前回は届いていないので今度こそ送るべき
+        match rx.try_recv().expect("resize must be retried once space is available") {
+            TransportCommand::Resize { cols, rows } => assert_eq!((cols, rows), (100, 40)),
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
     // ── dispatch_result: scrollback上限トリミング ────────────
 
     struct NoopSessionCallback;
@@ -726,9 +1398,9 @@ mod tests {
         let scrollback = Arc::new(Mutex::new(initial));
 
         let (transport_cmd_tx, _transport_cmd_rx) = tokio::sync::mpsc::channel(8);
-        let mut timer_rt = TokioTimerRuntime::<TrzszTimer>::new();
+        let (timeout_tx, _timeout_rx) = tokio::sync::mpsc::channel(1);
+        let mut timer_rt = TokioTimerRuntime::new(timeout_tx);
         let callback: Arc<dyn SessionCallback> = Arc::new(NoopSessionCallback);
-        let terminal = Terminal::new(80, 24, Theme::default());
 
         let result = ProcessResult {
             timer_cmds: Vec::new(),
@@ -738,7 +1410,8 @@ mod tests {
             pending_clipboard_write: None,
             clipboard_pull_requested: false,
         };
-        dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, &terminal, &scrollback);
+        // screen_dirtyでないバッチなのでscreen_updateはNone(scrollbackトリミングのみ検証)。
+        dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, None, &scrollback);
 
         let sb = scrollback.lock();
         assert_eq!(sb.len(), SCROLLBACK_LIMIT, "should be capped at SCROLLBACK_LIMIT, not left at +3 over");
