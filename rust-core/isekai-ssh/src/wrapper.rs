@@ -9,6 +9,7 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use isekai_auth::TokenProvider;
@@ -44,6 +45,16 @@ const RESERVED_SUBCOMMANDS: &[&str] = &["init", "login", "logout", "doctor"];
 /// separate `isekai-ssh <destination>` invocations, possibly hours/days
 /// apart, unlike `isekai-terminal-core`'s (Android's) per-session bootstrap.
 const DEFAULT_IDLE_LIFETIME_SECS: u64 = 2_592_000;
+
+/// Bounds `resolve_stun_servers`'s DNS fallback per entry. `getaddrinfo` is
+/// already self-bounding (glibc's own `resolv.conf` timeout × attempts ×
+/// nameserver count), but that budget can still run to tens of seconds for
+/// one bad hostname — matching the rest of this crate's practice of wrapping
+/// bootstrap I/O in an explicit `tokio::time::timeout` (e.g.
+/// `russh_backend.rs`'s command execution) rather than trusting an
+/// OS-level bound alone. STUN entries are an opt-in, best-effort NAT
+/// traversal hint, not something worth blocking a connection attempt over.
+const STUN_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct WrapperPlan {
@@ -814,12 +825,15 @@ async fn resolve_stun_servers(entries: &[String]) -> Vec<SocketAddr> {
             resolved.push(addr);
             continue;
         }
-        match tokio::net::lookup_host(entry.as_str()).await {
-            Ok(mut addrs) => match addrs.next() {
+        match tokio::time::timeout(STUN_DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host(entry.as_str())).await {
+            Ok(Ok(mut addrs)) => match addrs.next() {
                 Some(addr) => resolved.push(addr),
                 None => log_line_verbose!("isekai-ssh: ignoring #@isekai stun entry {entry:?}: DNS lookup returned no addresses"),
             },
-            Err(e) => log_line_verbose!("isekai-ssh: ignoring malformed #@isekai stun entry {entry:?}: {e}"),
+            Ok(Err(e)) => log_line_verbose!("isekai-ssh: ignoring malformed #@isekai stun entry {entry:?}: {e}"),
+            Err(_) => log_line_verbose!(
+                "isekai-ssh: ignoring #@isekai stun entry {entry:?}: DNS lookup timed out after {STUN_DNS_LOOKUP_TIMEOUT:?}"
+            ),
         }
     }
     resolved
