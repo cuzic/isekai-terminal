@@ -786,6 +786,13 @@ impl RusshBackend {
 mkdir -p {remote_dir} 2>/dev/null
 exec 9>>{lock_path} 2>/dev/null
 if command -v flock >/dev/null 2>&1; then flock -w 30 9 2>/dev/null || true; fi
+sha256_of() {{
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  fi
+}}
 tmpdir=$(mktemp -d) && trap 'rm -rf $tmpdir' EXIT
 if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [ "$(wc -c < $tmpdir/bootstrap-request.json | tr -d '[:space:]')" -eq {request_len} ] && {read_jwt_step}true; then
   reuse_envelope=""
@@ -800,8 +807,18 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
         existing_exe=ok
         expected_exe=ok
       fi
+      # pid/exe-path/fingerprint matching only proves the same binary path
+      # is still running, not that its contents are what this `isekai-ssh`
+      # build expects — a still-alive helper can predate a bugfix to
+      # `isekai-pipe serve` itself. Never killed here if stale (some other
+      # client may be mid-session on it, same as `openssh.rs`'s
+      # fingerprint-mismatch case) — just not reused, falling through to
+      # the normal upload+launch path below.
       if [ -n "$existing_exe" ] && [ "$existing_exe" = "$expected_exe" ] && [ "$existing_fp" = "{fingerprint}" ]; then
-        reuse_envelope=$(sed -n '2p' {state_path})
+        existing_sha=$(sha256_of {remote_binary_path})
+        if [ "$existing_sha" = "{expected_sha256}" ]; then
+          reuse_envelope=$(sed -n '2p' {state_path})
+        fi
       fi
     fi
   fi
@@ -811,11 +828,7 @@ if dd bs=1 count={request_len} > $tmpdir/bootstrap-request.json 2>/dev/null && [
   else
     need_upload=1
     if [ -x {remote_binary_path} ]; then
-      if command -v sha256sum >/dev/null 2>&1; then
-        current_sha=$(sha256sum {remote_binary_path} 2>/dev/null | cut -d' ' -f1)
-      elif command -v shasum >/dev/null 2>&1; then
-        current_sha=$(shasum -a 256 {remote_binary_path} 2>/dev/null | cut -d' ' -f1)
-      fi
+      current_sha=$(sha256_of {remote_binary_path})
       [ -n "$current_sha" ] && [ "$current_sha" = "{expected_sha256}" ] && need_upload=0
     fi
     upload_ok=1
