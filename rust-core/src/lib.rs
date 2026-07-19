@@ -982,6 +982,18 @@ pub struct ImagePlacement {
     pub rgba: Vec<u8>,
 }
 
+/// 1行分の「損傷(damage)」範囲。`line`行目の`left`列から`right`列まで(両端含む)が
+/// 前回発行された`ScreenUpdate`から変化したことを表す(タスク#92、Alacrittyの
+/// `LineDamageBounds{line,left,right}`に倣った列レンジ差分)。`ScreenUpdate.dirty_rows`
+/// が`Some`の時にのみ現れ、UI層(Android/iOS)はこのレンジのセルだけを再描画すればよい。
+/// 損傷のない行はリストに含めない(`left <= right`の行のみ)。
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LineDamage {
+    pub line: u16,
+    pub left: u16,
+    pub right: u16,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ScreenUpdate {
     pub cols: u32,
@@ -1062,6 +1074,16 @@ pub struct ScreenUpdate {
     /// types/alternate keys/all keys as escape codes/associated text)およびCtrl+英字等
     /// 通常テキストキーのCSI u化は未対応(この値の交渉・公開のみ)。
     pub kitty_keyboard_flags: u16,
+    /// この`ScreenUpdate`で、前回発行時から実際に変化した行の損傷レンジ一覧
+    /// (タスク#92、行単位のdamage tracking)。`None`は「全画面が損傷している=グリッド
+    /// 全体を再描画せよ」を意味する(初回発行・寸法変更・スクロール等の構造的変更
+    /// [タスク#93]で全画面dirtyになるケース)。`Some(vec)`ならそのレンジのセルのみ
+    /// 再描画すればよく、`vec`が空なら(セル内容は前回と同一、`title`等の非グリッド
+    /// フィールドだけが変わった等で)グリッドの再描画は不要。カーソル行は下地セルが
+    /// 不変でも損傷として含まれる(タスク#94、iOSがカーソルをセル内容と同じ描画パスで
+    /// 描くため)。UI層がまだこのフィールドを消費していない段階では、`None`扱いで
+    /// 全画面再描画にフォールバックすれば従来通りの挙動になる。
+    pub dirty_rows: Option<Vec<LineDamage>>,
 }
 
 // ── New orchestrator public types ────────────────────────

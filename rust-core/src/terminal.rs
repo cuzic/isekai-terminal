@@ -171,7 +171,7 @@ fn dec_special_graphics(c: char) -> char {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct TermCell {
     pub(crate) ch: smol_str::SmolStr,
     pub(crate) fg: u32,
@@ -367,6 +367,16 @@ pub(crate) struct Terminal {
     /// タイムアウトは`session.rs`(tokioタイマー)が担う——`Terminal`はtokioに依存
     /// しない同期層のままにするため、ここに抑制ロジックそのものは置かない。
     synchronized_output_active: bool,
+    /// 直近の`ScreenUpdate`発行以降に「行単位の差分では表現できない」構造的変更
+    /// (スクロール・IL/DL・SU/SD・リサイズ・alt画面切替・RIS)が起きたことを表す
+    /// ワンショットフラグ(タスク#93)。`session_state.rs::SessionState::make_screen_update`
+    /// が発行時に取り出して(`take_full_damage_pending`)クリアし、立っていれば行差分の
+    /// 計算をスキップして全画面dirty(`dirty_rows = None`)を報告する。座標がずれる
+    /// 変更を通して差分を取ろうとしないという、Alacritty/iTerm2/xterm.jsが共通して
+    /// 採る設計に倣う。`pending_scrollback`/`pending_rows`の有無からスクロールを
+    /// 推測しない理由は、それらがtop/main regionのスクロール時にしか積まれず、
+    /// alt画面・非ゼロDECSTBM・SU/SD・IL/DLが座標をずらしても積まれないため。
+    full_damage_pending: bool,
     /// フォーカスレポーティング(`CSI ?1004h`/`l`、タスク#60)。vim/tmuxが`FocusGained`/
     /// `FocusLost` autocmdの発火に使う。有効時のみ[encode_focus_event]がOS由来の
     /// フォーカス変化イベントを`CSI I`/`CSI O`へエンコードする(無効時は`None`を返し
@@ -677,6 +687,7 @@ impl Terminal {
             application_keypad_mode: false,
             bracketed_paste_mode: false,
             synchronized_output_active: false,
+            full_damage_pending: false,
             focus_reporting_mode: false,
             cursor_visible: true,
             bell_generation: 0,
@@ -763,6 +774,13 @@ impl Terminal {
     /// 名前で明示するため、通常のsetterと分けている。
     pub(crate) fn force_end_synchronized_output(&mut self) {
         self.synchronized_output_active = false;
+    }
+
+    /// 構造的変更(スクロール・IL/DL・リサイズ・alt画面切替・RIS)で立った全画面
+    /// dirtyフラグを取り出してクリアする(タスク#93)。`SessionState::make_screen_update`
+    /// が発行のたびに1回だけ呼ぶ——[full_damage_pending]フィールドのdocコメント参照。
+    pub(crate) fn take_full_damage_pending(&mut self) -> bool {
+        std::mem::take(&mut self.full_damage_pending)
     }
     /// フォーカスレポーティング(`?1004`、タスク#60)の現在値。テストから参照する
     /// (`ScreenUpdate`へは公開しない——`encode_focus_event`がRust側で完結して判断する
@@ -911,6 +929,8 @@ impl Terminal {
         self.application_keypad_mode = false;
         self.bracketed_paste_mode = false;
         self.synchronized_output_active = false;
+        // RISは画面全体を初期化する——行差分では追随できないので全画面dirty(#93)。
+        self.full_damage_pending = true;
         self.focus_reporting_mode = false;
         self.cursor_visible = true;
         self.cursor_shape = CursorShape::Block;
@@ -995,6 +1015,10 @@ impl Terminal {
         if new_cols == self.cols && new_rows == self.rows {
             return;
         }
+        // リサイズは全セルの座標が変わる——行差分では追随できないので全画面dirty(#93)。
+        // (`make_screen_update`側でも寸法不一致を全画面dirty扱いにするが、意図を明示
+        // するため構造的変更の一つとしてここでも立てる。)
+        self.full_damage_pending = true;
 
         let old_cols = self.cols;
         let old_rows = self.rows;
@@ -1152,6 +1176,8 @@ impl Terminal {
     }
 
     fn switch_to_alt(&mut self, save_cursor: bool) {
+        // alt画面への切替は画面内容を丸ごと差し替える——全画面dirty(#93)。
+        self.full_damage_pending = true;
         if save_cursor {
             self.saved_cursor_main = Some(SavedCursor {
                 row: self.cursor_row,
@@ -1191,6 +1217,8 @@ impl Terminal {
 
     fn switch_to_main(&mut self, restore_cursor: bool) {
         if !self.alt_active { return; }
+        // main画面への復帰も画面内容を丸ごと差し替える——全画面dirty(#93)。
+        self.full_damage_pending = true;
         self.alt_active = false;
         if restore_cursor {
             if let Some(saved) = self.saved_cursor_main.take() {
@@ -1256,6 +1284,8 @@ impl Terminal {
     /// バグの修正。空行埋めの範囲も`bot - n + 1`ではなく`bot + 1 - n`の順序で
     /// 計算し同じ理由のアンダーフローを避ける)。
     fn scroll_up_region(&mut self, n: usize) {
+        // スクロールは行座標をずらすので行差分では追随できない——全画面dirty(#93)。
+        self.full_damage_pending = true;
         // Sixel(タスク#42): スクロールは画像が乗っていたグリッド位置の内容を
         // 別の内容へ置き換えるため、既存の画像配置は無条件に消す(`clear_images`
         // docコメント参照)。
@@ -1302,6 +1332,7 @@ impl Terminal {
     /// (`n == region_size`)場合はシフトループ自体をスキップする — `bot - n`を
     /// `top == 0`の状態で直接計算すると`usize`アンダーフローでpanicするため。
     fn scroll_down_region(&mut self, n: usize) {
+        self.full_damage_pending = true; // #93: 行座標がずれるので全画面dirty。
         self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
         let top = self.scroll_top;
         let bot = self.scroll_bottom;
@@ -1343,6 +1374,7 @@ impl Terminal {
         let top = self.cursor_row;
         let bot = self.scroll_bottom;
         if top < self.scroll_top || top > bot { return; }
+        self.full_damage_pending = true; // #93: 行座標がずれるので全画面dirty。
         self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
         let region_size = bot - top + 1;
         let n = n.min(region_size);
@@ -1378,6 +1410,7 @@ impl Terminal {
         let top = self.cursor_row;
         let bot = self.scroll_bottom;
         if top < self.scroll_top || top > bot { return; }
+        self.full_damage_pending = true; // #93: 行座標がずれるので全画面dirty。
         self.clear_images(); // Sixel(タスク#42): scroll_up_regionと同じ理由。
         let region_size = bot - top + 1;
         let n = n.min(region_size);
@@ -2486,6 +2519,10 @@ impl Perform for Terminal {
             // 画面をスクロールしてしまう誤動作があったため(タスク#75、fable/codex指摘)。
             b'M' if ints.is_empty() => {
                 if self.cursor_row == self.scroll_top {
+                    // RIによる領域内シフトも行座標がずれる構造的変更——#93と同じ理由で
+                    // 全画面dirty(セルフレビューで検出: sibling関数のscroll_up_region等は
+                    // 全て立てていたのにRIだけ漏れていた)。
+                    self.full_damage_pending = true;
                     let top = self.scroll_top;
                     let bot = self.scroll_bottom;
                     let cols = self.cols;
