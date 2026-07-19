@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 use parking_lot::Mutex;
@@ -29,6 +29,132 @@ const SYNC_OUTPUT_SAFETY_TIMEOUT: Duration = Duration::from_millis(250);
 /// ようにするため。
 fn sync_output_timeout_is_current(fired_generation: u64, armed_generation: Option<u64>) -> bool {
     armed_generation == Some(fired_generation)
+}
+
+// ── RepaintThrottle ──────────────────────────────────────
+
+/// `make_screen_update`計算 + `on_screen_update`コールバック発火の頻度を、
+/// ディスプレイの実効フレームレート程度に間引くための状態機械
+/// (kittyの`repaint_delay`相当。参照: PLAN.md 該当Phase)。VTEパース自体
+/// (`state.on_stdout`)は間引かない——端末状態は常に最新でなければならず、
+/// 間引いてよいのは「画面をUI/UniFFI越しに反映する頻度」だけ。
+///
+/// リーディングエッジ(アイドル直後の1発は即時発行)+トレーリングエッジ
+/// (連続dirty中は最後の1回だけ`min_interval`後に発行)方式。これにより通常の
+/// タイピングのようなスパースな入力では追加レイテンシがゼロのまま、flood時
+/// だけ間引きが効く。
+struct RepaintThrottle {
+    min_interval: Duration,
+    last_emit: Option<Instant>,
+    armed_deadline: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RepaintDecision {
+    /// アイドル状態からのdirty。即座に`make_screen_update`+コールバックしてよい。
+    EmitNow,
+    /// `min_interval`内の2回目以降のdirty。指定deadlineでタイマーをarmすること。
+    Arm(Instant),
+    /// 既にタイマーがarmされている。何もしなくてよい(発火を待つ)。
+    AlreadyArmed,
+}
+
+const REPAINT_MIN_INTERVAL: Duration = Duration::from_millis(16);
+
+impl RepaintThrottle {
+    fn new(min_interval: Duration) -> Self {
+        RepaintThrottle { min_interval, last_emit: None, armed_deadline: None }
+    }
+
+    /// `screen_dirty`なバッチを処理した直後に呼ぶ。
+    fn on_dirty(&mut self, now: Instant) -> RepaintDecision {
+        if self.armed_deadline.is_some() {
+            return RepaintDecision::AlreadyArmed;
+        }
+        match self.last_emit {
+            Some(t) if now < t + self.min_interval => {
+                let deadline = t + self.min_interval;
+                self.armed_deadline = Some(deadline);
+                RepaintDecision::Arm(deadline)
+            }
+            _ => RepaintDecision::EmitNow,
+        }
+    }
+
+    /// 実際に`on_screen_update`を発行した直後に呼ぶ(`EmitNow`経路・タイマー
+    /// 発火経路の両方から)。
+    fn note_emitted(&mut self, now: Instant) {
+        self.last_emit = Some(now);
+        self.armed_deadline = None;
+    }
+
+    fn timer_armed(&self) -> bool {
+        self.armed_deadline.is_some()
+    }
+}
+
+impl Default for RepaintThrottle {
+    fn default() -> Self {
+        RepaintThrottle::new(REPAINT_MIN_INTERVAL)
+    }
+}
+
+#[cfg(test)]
+mod repaint_throttle_tests {
+    use super::*;
+
+    #[test]
+    fn idle_dirty_emits_immediately() {
+        let mut t = RepaintThrottle::new(Duration::from_millis(16));
+        let now = Instant::now();
+        assert_eq!(t.on_dirty(now), RepaintDecision::EmitNow);
+    }
+
+    #[test]
+    fn second_dirty_within_min_interval_arms_remaining_time() {
+        let mut t = RepaintThrottle::new(Duration::from_millis(16));
+        let t0 = Instant::now();
+        assert_eq!(t.on_dirty(t0), RepaintDecision::EmitNow);
+        t.note_emitted(t0);
+
+        let t1 = t0 + Duration::from_millis(5);
+        let deadline = t0 + Duration::from_millis(16);
+        assert_eq!(t.on_dirty(t1), RepaintDecision::Arm(deadline));
+    }
+
+    #[test]
+    fn dirty_while_already_armed_is_a_noop_decision() {
+        let mut t = RepaintThrottle::new(Duration::from_millis(16));
+        let t0 = Instant::now();
+        t.on_dirty(t0);
+        t.note_emitted(t0);
+
+        let t1 = t0 + Duration::from_millis(3);
+        t.on_dirty(t1); // arms
+        assert!(t.timer_armed());
+
+        let t2 = t0 + Duration::from_millis(9);
+        assert_eq!(t.on_dirty(t2), RepaintDecision::AlreadyArmed);
+    }
+
+    #[test]
+    fn note_emitted_disarms_and_next_dirty_after_interval_emits_immediately() {
+        let mut t = RepaintThrottle::new(Duration::from_millis(16));
+        let t0 = Instant::now();
+        t.on_dirty(t0);
+        t.note_emitted(t0);
+
+        let t1 = t0 + Duration::from_millis(5);
+        t.on_dirty(t1); // arms
+        assert!(t.timer_armed());
+
+        let fire_at = t0 + Duration::from_millis(16);
+        t.note_emitted(fire_at);
+        assert!(!t.timer_armed());
+
+        let t2 = fire_at + Duration::from_millis(17);
+        assert_eq!(t.on_dirty(t2), RepaintDecision::EmitNow);
+    }
 }
 
 // ── TermCell → 公開型変換（session 層の責務）────────────
@@ -430,6 +556,123 @@ fn clipboard_mime_kind_to_protocol(mime: ClipboardMimeKind) -> isekai_protocol::
     }
 }
 
+/// `dispatch_transport_event`の戻り値。`TransportEvent::Disconnected`/
+/// event_rx正常close相当のケースを`break 'outer`できるよう、通常の
+/// `Option<ProcessResult>`とは別に`Break`を持つ。
+enum EventOutcome {
+    Continue(Option<ProcessResult>),
+    Break,
+}
+
+/// 1件の`TransportEvent`を処理する(`session_event_loop`の`select!`の
+/// `event_rx.recv()`アームから切り出したもの)。
+///
+/// `TransportEvent::Stdout`の場合は、`event_rx`に既に届いている後続の連続
+/// `Stdout`をノンブロッキングの`try_recv`で吸い出し1本のバイト列に連結してから
+/// `state.on_stdout`/`callback.on_data`を1回だけ呼ぶ(kittyの`input_delay`相当の
+/// バッチ化——このプロジェクトは既にイベント化済みのためタイマーは使わず、
+/// 既にキューに積まれている分だけを遅延ゼロで束ねる)。drain中に非`Stdout`を
+/// 引いてしまった場合は`pending_event`へ退避し、呼び出し元が次のループ先頭で
+/// `select!`より先に処理することで元の到着順序([Stdout, Resized, Stdout]等)を
+/// 厳密に保つ。
+fn dispatch_transport_event(
+    event: TransportEvent,
+    event_rx: &mut tokio::sync::mpsc::Receiver<TransportEvent>,
+    pending_event: &mut Option<TransportEvent>,
+    state: &mut SessionState,
+    callback: &Arc<dyn SessionCallback>,
+) -> EventOutcome {
+    match event {
+        TransportEvent::HostKey(fp, reply_tx) => {
+            let cb = Arc::clone(callback);
+            tokio::task::spawn_blocking(move || {
+                let accepted = cb.on_host_key(fp);
+                let _ = reply_tx.send(accepted);
+            });
+            EventOutcome::Continue(None)
+        }
+        TransportEvent::AgentSignRequest { key_fingerprint, reply } => {
+            let cb = Arc::clone(callback);
+            tokio::task::spawn_blocking(move || {
+                let approved = cb.on_agent_sign_request(key_fingerprint);
+                let _ = reply.send(approved);
+            });
+            EventOutcome::Continue(None)
+        }
+        TransportEvent::Connected => {
+            callback.on_connected();
+            EventOutcome::Continue(None)
+        }
+        TransportEvent::Stdout(bytes) => {
+            let mut combined = bytes;
+            loop {
+                match event_rx.try_recv() {
+                    Ok(TransportEvent::Stdout(more)) => combined.extend_from_slice(&more),
+                    Ok(other) => {
+                        *pending_event = Some(other);
+                        break;
+                    }
+                    Err(_) => break, // Empty または Disconnected — どちらもdrain終了でよい
+                }
+            }
+            callback.on_data(combined.clone());
+            EventOutcome::Continue(Some(state.on_stdout(combined)))
+        }
+        TransportEvent::Resized { cols, rows } => {
+            info!("session: terminal resize {}x{}", cols, rows);
+            EventOutcome::Continue(Some(state.resize(cols as usize, rows as usize)))
+        }
+        TransportEvent::ForwardStateChanged { id, state: fwd_state } => {
+            callback.on_forward_state_changed(id, fwd_state);
+            EventOutcome::Continue(None)
+        }
+        TransportEvent::CtlMessage(msg) => match msg {
+            isekai_protocol::CtlMessage::SetTitle { value } => {
+                EventOutcome::Continue(Some(state.set_title_from_ctl(value)))
+            }
+            isekai_protocol::CtlMessage::ClipboardPush { mime, data_b64 } => {
+                if let Some(payload) = decode_clipboard_push(mime, &data_b64) {
+                    let cb = Arc::clone(callback);
+                    tokio::task::spawn_blocking(move || cb.on_clipboard_write(payload));
+                }
+                EventOutcome::Continue(None)
+            }
+            // `ClipboardPullRequest`は`transport.rs`側で応答書き込みが必要と判定され
+            // `TransportEvent::ClipboardPullRequestOverCtl`として別途届く(下のアーム参照)
+            // ので、ここには来ない。`ClipboardPullResponse`はdevice→hostの応答そのもの
+            // であり、deviceがこれを受け取ることは無い。どちらも到達したら無視するだけ。
+            isekai_protocol::CtlMessage::ClipboardPullRequest {}
+            | isekai_protocol::CtlMessage::ClipboardPullResponse { .. } => EventOutcome::Continue(None),
+        },
+        TransportEvent::ClipboardPullRequestOverCtl(reply) => {
+            // tmux迂回チャンネル経由のpull要求(`ISEKAI_PIPE_DESIGN.md` §8 Epic M
+            // follow-up)。Android`ClipboardManager`読み出しは同期I/Oなので
+            // `on_host_key`/`on_agent_sign_request`と同じ`spawn_blocking`パターンで待つ。
+            // opt-in無効/クリップボード空(`None`)なら`reply`をdropするだけ
+            // (`transport.rs`側が応答無しでチャネルを閉じる)。
+            let cb = Arc::clone(callback);
+            tokio::task::spawn_blocking(move || {
+                if let Some(payload) = cb.on_clipboard_pull_request() {
+                    let mime = clipboard_mime_kind_to_protocol(payload.mime);
+                    let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payload.data);
+                    let _ = reply.send(isekai_protocol::CtlMessage::ClipboardPullResponse { mime, data_b64 });
+                }
+            });
+            EventOutcome::Continue(None)
+        }
+        TransportEvent::Disconnected { reason } => {
+            info!("session: disconnected reason={:?}", reason);
+            callback.on_disconnected(reason);
+            EventOutcome::Break
+        }
+        TransportEvent::NoViablePath => {
+            info!("session: no viable path (all paths unhealthy)");
+            callback.on_no_viable_path();
+            EventOutcome::Continue(None)
+        }
+    }
+}
+
 /// `CtlMessage::ClipboardPush`の`data_b64`をデコードする。base64が不正なら`warn!`ログを
 /// 出して`None`を返す(既存の「不正な入力はドロップして継続する」opportunisticな方針を
 /// 維持)。テキスト系mime(`TextPlain`/`TextHtml`)はさらにUTF-8として妥当かも検証する
@@ -492,84 +735,33 @@ pub(crate) async fn session_event_loop(
     let mut sync_output_timer_generation: u64 = 0;
     let mut sync_output_armed_generation: Option<u64> = None;
 
+    // 画面反映(`make_screen_update`+`on_screen_update`)の間引き(kittyの
+    // `repaint_delay`相当、[RepaintThrottle]参照)。armされたら`repaint`を
+    // deadlineへ`reset`し、`select!`のrepaintアームが発火したときだけ
+    // 実際に画面を発行する。`sleep(0)`で初期化(未armなので`timer_armed()`
+    // ガードにより最初のポーリングでは発火しない)。
+    let mut repaint_throttle = RepaintThrottle::default();
+    let repaint_timer = tokio::time::sleep(Duration::from_secs(0));
+    tokio::pin!(repaint_timer);
+
+    // `dispatch_transport_event`が連続`Stdout`をdrainする際に引いてしまった
+    // 非`Stdout`イベントの退避スロット(1件のみ)。次のループ先頭で
+    // `select!`より先に消費し、元の到着順序を保つ。
+    let mut pending_event: Option<TransportEvent> = None;
+
     'outer: loop {
-        let result: Option<ProcessResult> = tokio::select! {
+        let result: Option<ProcessResult> = if let Some(ev) = pending_event.take() {
+            match dispatch_transport_event(ev, &mut event_rx, &mut pending_event, &mut state, &callback) {
+                EventOutcome::Continue(r) => r,
+                EventOutcome::Break => break 'outer,
+            }
+        } else {
+            tokio::select! {
             event = event_rx.recv() => match event {
-                Some(TransportEvent::HostKey(fp, reply_tx)) => {
-                    let cb = Arc::clone(&callback);
-                    tokio::task::spawn_blocking(move || {
-                        let accepted = cb.on_host_key(fp);
-                        let _ = reply_tx.send(accepted);
-                    });
-                    None
-                }
-                Some(TransportEvent::AgentSignRequest { key_fingerprint, reply }) => {
-                    let cb = Arc::clone(&callback);
-                    tokio::task::spawn_blocking(move || {
-                        let approved = cb.on_agent_sign_request(key_fingerprint);
-                        let _ = reply.send(approved);
-                    });
-                    None
-                }
-                Some(TransportEvent::Connected) => {
-                    callback.on_connected(); None
-                }
-                Some(TransportEvent::Stdout(bytes)) => {
-                    callback.on_data(bytes.clone());
-                    Some(state.on_stdout(bytes))
-                }
-                Some(TransportEvent::Resized { cols, rows }) => {
-                    info!("session: terminal resize {}x{}", cols, rows);
-                    Some(state.resize(cols as usize, rows as usize))
-                }
-                Some(TransportEvent::ForwardStateChanged { id, state }) => {
-                    callback.on_forward_state_changed(id, state); None
-                }
-                Some(TransportEvent::CtlMessage(msg)) => {
-                    match msg {
-                        isekai_protocol::CtlMessage::SetTitle { value } => {
-                            Some(state.set_title_from_ctl(value))
-                        }
-                        isekai_protocol::CtlMessage::ClipboardPush { mime, data_b64 } => {
-                            if let Some(payload) = decode_clipboard_push(mime, &data_b64) {
-                                let cb = Arc::clone(&callback);
-                                tokio::task::spawn_blocking(move || cb.on_clipboard_write(payload));
-                            }
-                            None
-                        }
-                        // `ClipboardPullRequest`は`transport.rs`側で応答書き込みが
-                        // 必要と判定され`TransportEvent::ClipboardPullRequestOverCtl`
-                        // として別途届く(下記アーム参照)ので、ここには来ない。
-                        // `ClipboardPullResponse`はdevice→hostの応答そのものであり、
-                        // deviceがこれを受け取ることは無い。どちらも到達したら無視するだけ。
-                        isekai_protocol::CtlMessage::ClipboardPullRequest {}
-                        | isekai_protocol::CtlMessage::ClipboardPullResponse { .. } => None,
-                    }
-                }
-                Some(TransportEvent::ClipboardPullRequestOverCtl(reply)) => {
-                    // tmux迂回チャンネル経由のpull要求(`ISEKAI_PIPE_DESIGN.md` §8 Epic M
-                    // follow-up)。Android`ClipboardManager`読み出しは同期I/Oなので
-                    // `on_host_key`/`on_agent_sign_request`と同じ`spawn_blocking`パターンで
-                    // 待つ。opt-in無効/クリップボード空(`None`)なら`reply`をdropするだけ
-                    // (`transport.rs`側が応答無しでチャネルを閉じる)。
-                    let cb = Arc::clone(&callback);
-                    tokio::task::spawn_blocking(move || {
-                        if let Some(payload) = cb.on_clipboard_pull_request() {
-                            let mime = clipboard_mime_kind_to_protocol(payload.mime);
-                            let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payload.data);
-                            let _ = reply.send(isekai_protocol::CtlMessage::ClipboardPullResponse { mime, data_b64 });
-                        }
-                    });
-                    None
-                }
-                Some(TransportEvent::Disconnected { reason }) => {
-                    info!("session: disconnected reason={:?}", reason);
-                    callback.on_disconnected(reason); break 'outer;
-                }
-                Some(TransportEvent::NoViablePath) => {
-                    info!("session: no viable path (all paths unhealthy)");
-                    callback.on_no_viable_path(); None
-                }
+                Some(ev) => match dispatch_transport_event(ev, &mut event_rx, &mut pending_event, &mut state, &callback) {
+                    EventOutcome::Continue(r) => r,
+                    EventOutcome::Break => break 'outer,
+                },
                 None => {
                     info!("session: event channel closed");
                     callback.on_disconnected(None); break 'outer;
@@ -594,6 +786,11 @@ pub(crate) async fn session_event_loop(
                 Some(_) => None,
                 None => None,
             },
+            () = &mut repaint_timer, if repaint_throttle.timer_armed() => {
+                emit_screen_update(&mut state, &callback, &mut repaint_throttle, Instant::now());
+                None
+            }
+            }
         };
 
         // DEC Synchronized Output(`?2026`)のsafety-netタイマーのarm/disarm。上の
@@ -622,19 +819,25 @@ pub(crate) async fn session_event_loop(
 
         if let Some(r) = result {
             let clipboard_pull_requested = r.clipboard_pull_requested;
-            // `ScreenUpdate`(行単位dirty diffを含む)の生成は`SessionState`が前回
-            // 発行スナップショットとの差分を取る必要があるため、`state`を`&mut`で
-            // 触れるこのループ側で先に計算し、`dispatch_result`(scrollback/side
-            // effectsを消費する同期関数)には出来上がった`Option<ScreenUpdate>`を
-            // 渡す(タスク#92)。`screen_dirty`でないバッチではスナップショットを
-            // 更新しない——画面が変化していない=前回スナップショットが有効なため。
-            let screen_update = if r.screen_dirty {
-                Some(state.make_screen_update())
-            } else {
-                None
-            };
-            dispatch_result(r, &mut timer_rt, &transport_cmd_tx, &callback,
-                            screen_update, &scrollback);
+            // 画面反映(`make_screen_update`+`on_screen_update`)は
+            // `RepaintThrottle`(kittyの`repaint_delay`相当)で間引く——`state`が
+            // `screen_dirty`を返した全バッチが即座に発行されるわけではない。
+            // `screen_dirty`でないバッチではスナップショットを更新しない
+            // (画面が変化していない=前回スナップショットが有効なため)。
+            // タイマー・scrollback・side effects・clipboard(`dispatch_result`が
+            // 処理するもの)はこの間引きの対象外で、従来どおり即時処理する。
+            if r.screen_dirty {
+                match repaint_throttle.on_dirty(Instant::now()) {
+                    RepaintDecision::EmitNow => {
+                        emit_screen_update(&mut state, &callback, &mut repaint_throttle, Instant::now());
+                    }
+                    RepaintDecision::Arm(deadline) => {
+                        repaint_timer.as_mut().reset(tokio::time::Instant::from_std(deadline));
+                    }
+                    RepaintDecision::AlreadyArmed => {}
+                }
+            }
+            dispatch_result(r, &mut timer_rt, &transport_cmd_tx, &callback, &scrollback);
             if clipboard_pull_requested {
                 // Fetching the current Android clipboard text needs a Kotlin
                 // round trip (`on_host_key`/`on_agent_sign_request`'s same
@@ -662,13 +865,32 @@ pub(crate) async fn session_event_loop(
     }
 }
 
-/// ProcessResult をすべて処理する（タイマー・scrollback・副作用・画面更新）
+/// `make_screen_update`を計算し`on_screen_update`コールバックへ渡す。
+/// `RepaintThrottle`が`EmitNow`を返した経路(`session_event_loop`本体)と、
+/// armされたタイマーが発火した経路(`select!`内)の両方から呼ばれる——画面発行は
+/// 必ずこの関数を通り、`throttle.note_emitted`で発行時刻を記録する。
+fn emit_screen_update(
+    state: &mut SessionState,
+    callback: &Arc<dyn SessionCallback>,
+    throttle: &mut RepaintThrottle,
+    now: Instant,
+) {
+    let upd = state.make_screen_update();
+    debug!("screen: update {}x{} cursor=({},{}) dirty_rows={:?}",
+        upd.cols, upd.rows, upd.cursor_col, upd.cursor_row,
+        upd.dirty_rows.as_ref().map(Vec::len));
+    callback.on_screen_update(upd);
+    throttle.note_emitted(now);
+}
+
+/// ProcessResult をすべて処理する（タイマー・scrollback・副作用）。画面更新の
+/// 発行は`RepaintThrottle`により間引かれるため、ここでは扱わない
+/// (`emit_screen_update`を参照、呼び出し元の`session_event_loop`が別途呼ぶ)。
 fn dispatch_result(
     r: ProcessResult,
     timer_rt: &mut TokioTimerRuntime,
     transport_cmd_tx: &tokio::sync::mpsc::Sender<TransportCommand>,
     callback: &Arc<dyn SessionCallback>,
-    screen_update: Option<ScreenUpdate>,
     scrollback: &Arc<Mutex<VecDeque<Vec<TermCell>>>>,
 ) {
     for cmd in r.timer_cmds {
@@ -719,13 +941,6 @@ fn dispatch_result(
                 callback.on_trzsz_finished(transfer_id, success, message);
             }
         }
-    }
-
-    if let Some(upd) = screen_update {
-        debug!("screen: update {}x{} cursor=({},{}) dirty_rows={:?}",
-            upd.cols, upd.rows, upd.cursor_col, upd.cursor_row,
-            upd.dirty_rows.as_ref().map(Vec::len));
-        callback.on_screen_update(upd);
     }
 
     // OSC 52 クリップボード書き込み(`ISEKAI_PIPE_DESIGN.md` §8 Epic M)。opt-inかどうかの
@@ -1410,8 +1625,9 @@ mod tests {
             pending_clipboard_write: None,
             clipboard_pull_requested: false,
         };
-        // screen_dirtyでないバッチなのでscreen_updateはNone(scrollbackトリミングのみ検証)。
-        dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, None, &scrollback);
+        // dispatch_resultはscrollback/side effectsのみを扱う(画面発行は
+        // emit_screen_update側の責務なのでここでは検証不要)。
+        dispatch_result(result, &mut timer_rt, &transport_cmd_tx, &callback, &scrollback);
 
         let sb = scrollback.lock();
         assert_eq!(sb.len(), SCROLLBACK_LIMIT, "should be capped at SCROLLBACK_LIMIT, not left at +3 over");
@@ -1419,5 +1635,234 @@ mod tests {
             sb.iter().all(|r| r[0].ch != "Z"),
             "the oldest row (back of the deque) must be the one evicted, not an arbitrary one"
         );
+    }
+}
+
+/// `dispatch_transport_event`のStdout drain連結(kittyの`input_delay`相当)の
+/// ユニットテスト。実async loopは不要——`tokio::sync::mpsc`の`try_send`/
+/// `try_recv`は同期メソッドなので、関数を直接同期的に呼んで検証できる。
+#[cfg(test)]
+mod dispatch_transport_event_tests {
+    use super::*;
+
+    struct NoopSessionCallback;
+    impl SessionCallback for NoopSessionCallback {
+        fn on_data(&self, _data: Vec<u8>) {}
+        fn on_host_key(&self, _fingerprint: String) -> bool { true }
+        fn on_connected(&self) {}
+        fn on_disconnected(&self, _reason: Option<String>) {}
+        fn on_screen_update(&self, _update: ScreenUpdate) {}
+        fn on_trzsz_request(&self, _transfer_id: String, _mode: String, _suggested_name: Option<String>, _expected_size: Option<u64>) {}
+        fn on_trzsz_download_chunk(&self, _transfer_id: String, _data: Vec<u8>, _is_last: bool) {}
+        fn on_trzsz_progress(&self, _transfer_id: String, _transferred: u64, _total: Option<u64>) {}
+        fn on_trzsz_finished(&self, _transfer_id: String, _success: bool, _message: Option<String>) {}
+        fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
+        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
+    }
+
+    fn fresh_state() -> SessionState {
+        SessionState::new(80, 24, Theme::default())
+    }
+
+    fn visible_text(upd: &ScreenUpdate, len: usize) -> String {
+        upd.cells[0..len].iter().map(|c| c.ch.as_str()).collect()
+    }
+
+    #[test]
+    fn consecutive_queued_stdout_is_concatenated_into_a_single_on_stdout_call() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportEvent>(8);
+        // "ab"は直接dispatchする引数、"cd"/"ef"は既にキューに積まれている想定。
+        tx.try_send(TransportEvent::Stdout(b"cd".to_vec())).unwrap();
+        tx.try_send(TransportEvent::Stdout(b"ef".to_vec())).unwrap();
+
+        let mut state = fresh_state();
+        let callback: Arc<dyn SessionCallback> = Arc::new(NoopSessionCallback);
+        let mut pending: Option<TransportEvent> = None;
+
+        let outcome = dispatch_transport_event(
+            TransportEvent::Stdout(b"ab".to_vec()), &mut rx, &mut pending, &mut state, &callback,
+        );
+
+        assert!(matches!(outcome, EventOutcome::Continue(Some(_))), "Stdout must produce a ProcessResult");
+        assert!(pending.is_none(), "no non-Stdout event was queued, so nothing should be stashed");
+        assert!(rx.try_recv().is_err(), "the queued Stdout events must be fully drained, not left behind");
+
+        let upd = state.make_screen_update();
+        assert_eq!(
+            visible_text(&upd, 6), "abcdef",
+            "three queued Stdout chunks must be applied in order as if concatenated into one on_stdout call"
+        );
+    }
+
+    #[test]
+    fn non_stdout_event_encountered_while_draining_is_stashed_and_stops_the_drain() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TransportEvent>(8);
+        // [Stdout("before"), Resized, Stdout("after")]という到着順を想定。
+        tx.try_send(TransportEvent::Resized { cols: 100, rows: 40 }).unwrap();
+        tx.try_send(TransportEvent::Stdout(b"after".to_vec())).unwrap();
+
+        let mut state = fresh_state();
+        let callback: Arc<dyn SessionCallback> = Arc::new(NoopSessionCallback);
+        let mut pending: Option<TransportEvent> = None;
+
+        let outcome = dispatch_transport_event(
+            TransportEvent::Stdout(b"before".to_vec()), &mut rx, &mut pending, &mut state, &callback,
+        );
+        assert!(matches!(outcome, EventOutcome::Continue(Some(_))));
+        assert!(
+            matches!(pending, Some(TransportEvent::Resized { cols: 100, rows: 40 })),
+            "Resized must be stashed into pending_event rather than silently dropped or merged into the Stdout batch"
+        );
+        // Resizedより後ろの2件目のStdoutは、Resizedを飛び越えてdrainされてはならない
+        // (順序保全)。まだキューに残っているはず。
+        match rx.try_recv() {
+            Ok(TransportEvent::Stdout(b)) => assert_eq!(b, b"after"),
+            Ok(_) => panic!("expected the second Stdout to remain queued, got a different TransportEvent variant"),
+            Err(e) => panic!("expected the second Stdout to remain queued, got error: {e:?}"),
+        }
+
+        // 呼び出し元(session_event_loop本番コード)は次にpending_eventを最優先で処理する。
+        let resize_event = pending.take().expect("pending_event was asserted Some above");
+        let outcome2 = dispatch_transport_event(resize_event, &mut rx, &mut pending, &mut state, &callback);
+        assert!(matches!(outcome2, EventOutcome::Continue(Some(_))));
+        assert!(pending.is_none(), "Resized does not itself drain further events");
+
+        assert_eq!(state.terminal().cols(), 100, "resize must be applied before the later Stdout, preserving order");
+        assert_eq!(state.terminal().rows(), 40);
+    }
+}
+
+/// `session_event_loop`本体への`RepaintThrottle`統合(kittyの`repaint_delay`
+/// 相当)の決定的な統合テスト。`tokio::time::pause`で仮想時間を制御し、
+/// 「アイドル時は即時発行(タイピングレイテンシ回帰なし)」「flood時は間引かれる」
+/// 「発行された`update_seq`は単調増加で欠けが無い」を検証する。
+#[cfg(test)]
+mod session_event_loop_tests {
+    use super::*;
+
+    struct RecordingSessionCallback {
+        updates: Mutex<Vec<ScreenUpdate>>,
+    }
+
+    impl RecordingSessionCallback {
+        fn new() -> Self {
+            RecordingSessionCallback { updates: Mutex::new(Vec::new()) }
+        }
+    }
+
+    impl SessionCallback for RecordingSessionCallback {
+        fn on_data(&self, _data: Vec<u8>) {}
+        fn on_host_key(&self, _fingerprint: String) -> bool { true }
+        fn on_connected(&self) {}
+        fn on_disconnected(&self, _reason: Option<String>) {}
+        fn on_screen_update(&self, update: ScreenUpdate) { self.updates.lock().push(update); }
+        fn on_trzsz_request(&self, _transfer_id: String, _mode: String, _suggested_name: Option<String>, _expected_size: Option<u64>) {}
+        fn on_trzsz_download_chunk(&self, _transfer_id: String, _data: Vec<u8>, _is_last: bool) {}
+        fn on_trzsz_progress(&self, _transfer_id: String, _transferred: u64, _total: Option<u64>) {}
+        fn on_trzsz_finished(&self, _transfer_id: String, _success: bool, _message: Option<String>) {}
+        fn on_no_viable_path(&self) {}
+        fn on_forward_state_changed(&self, _id: String, _state: crate::ForwardState) {}
+        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
+        fn on_clipboard_write(&self, _payload: crate::ClipboardPayload) {}
+        fn on_clipboard_pull_request(&self) -> Option<crate::ClipboardPayload> { None }
+    }
+
+    /// アイドル状態(直前の発行から`REPAINT_MIN_INTERVAL`以上経過)でのstdoutは、
+    /// リーディングエッジとして即座に1回`on_screen_update`が発行されること
+    /// (タイピング直後のエコー表示にタイマー分の追加レイテンシが乗らないことの
+    /// 回帰防止)。
+    #[tokio::test(start_paused = true)]
+    async fn idle_stdout_emits_screen_update_immediately() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<TransportEvent>(64);
+        let (_session_cmd_tx, session_cmd_rx) = tokio::sync::mpsc::channel(1);
+        let (transport_cmd_tx, _transport_cmd_rx) = tokio::sync::mpsc::channel(8);
+        let callback = Arc::new(RecordingSessionCallback::new());
+        let scrollback = Arc::new(Mutex::new(VecDeque::new()));
+
+        let cb_for_loop: Arc<dyn SessionCallback> = callback.clone();
+        let handle = tokio::spawn(session_event_loop(
+            event_rx, session_cmd_rx, transport_cmd_tx, cb_for_loop, scrollback,
+            80, 24, Theme::default(),
+        ));
+
+        event_tx.send(TransportEvent::Stdout(b"hello".to_vec())).await.unwrap();
+        // イベントループが1周してemit_screen_update(EmitNow経路)を実行するのを待つ。
+        // 仮想時間は進めない(=アイドル即時発行がタイマー待ちに頼っていないことの確認)。
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if !callback.updates.lock().is_empty() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            callback.updates.lock().len(), 1,
+            "idle stdout must emit immediately without waiting for the repaint timer"
+        );
+
+        drop(event_tx);
+        let _ = handle.await;
+    }
+
+    /// `REPAINT_MIN_INTERVAL`より短い間隔で大量のstdoutが届くflood
+    /// (catで巨大ファイルを吐き出すシナリオ相当)では、`on_screen_update`の
+    /// 発行回数が投入イベント数を大きく下回ること、かつ発行された
+    /// `update_seq`が単調増加で欠けが無いことを検証する。
+    #[tokio::test(start_paused = true)]
+    async fn flood_within_min_interval_coalesces_to_far_fewer_emits() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<TransportEvent>(4096);
+        let (_session_cmd_tx, session_cmd_rx) = tokio::sync::mpsc::channel(1);
+        let (transport_cmd_tx, _transport_cmd_rx) = tokio::sync::mpsc::channel(8);
+        let callback = Arc::new(RecordingSessionCallback::new());
+        let scrollback = Arc::new(Mutex::new(VecDeque::new()));
+
+        let cb_for_loop: Arc<dyn SessionCallback> = callback.clone();
+        let handle = tokio::spawn(session_event_loop(
+            event_rx, session_cmd_rx, transport_cmd_tx, cb_for_loop, scrollback,
+            80, 24, Theme::default(),
+        ));
+
+        // 最初の1発はアイドルからのリーディングエッジ発行でbaselineを作ってから、
+        // min_interval内に収まる密度で大量に投入する。
+        event_tx.send(TransportEvent::Stdout(b"start\r\n".to_vec())).await.unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        let n: usize = 500;
+        for i in 0..n {
+            event_tx.send(TransportEvent::Stdout(format!("line{i}\r\n").into_bytes())).await.unwrap();
+        }
+        // repaint_delay(REPAINT_MIN_INTERVAL)を跨いで、armされたトレーリング
+        // エッジの発行が起きるまで仮想時間を進める。
+        tokio::time::advance(REPAINT_MIN_INTERVAL * 3).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        let updates = callback.updates.lock();
+        assert!(
+            updates.len() < n,
+            "expected far fewer on_screen_update calls ({}) than flooded events ({n})",
+            updates.len(),
+        );
+        assert!(
+            updates.len() >= 2,
+            "expected at least the leading-edge emit plus a trailing coalesced emit, got {}",
+            updates.len(),
+        );
+
+        let seqs: Vec<u32> = updates.iter().map(|u| u.update_seq).collect();
+        for w in seqs.windows(2) {
+            assert!(
+                w[1] == w[0].wrapping_add(1),
+                "update_seq must increase by exactly 1 per emitted update (no gaps among emitted frames): {seqs:?}"
+            );
+        }
+        drop(updates);
+
+        drop(event_tx);
+        let _ = handle.await;
     }
 }

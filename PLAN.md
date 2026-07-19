@@ -3242,3 +3242,56 @@ Phase 8-4: 実機検証（長時間圏外・大量出力中切断・keepalive境
 - rust-core/src/debug_fault.rs + android/src/debug/kotlin/.../FaultInjectionReceiver.kt: 実機での上記フォルト注入をライブに有効化する adb 経由のデバッグフック（release ビルドには含まれない）
 - rust-core/scripts/phase7-5-roaming-test.sh: 実機ローミング耐性検証のシナリオ関数集（ライブフォルト注入 / 実ネットワーク切替 / 組み合わせ）
 - quinn の rebind 前例: `quinn-0.11.11/src/endpoint.rs` の `Endpoint::rebind`/`rebind_abstract`、および quinn 自身のテスト `quinn-0.11.11/src/tests.rs: rebind_recv`（同じ手法の公式前例）
+
+---
+
+## セッション出力のフレーム駆動レンダリング/バッチ処理（2026-07-19、Alacritty/kitty調査に基づく設計）
+
+**背景**: `session_event_loop`（`rust-core/src/session.rs`）は、1 SSHパケット（`TransportEvent::Stdout`）
+を受け取るたびに無条件で `make_screen_update`（セル単位diff計算）＋`on_screen_update` UniFFIコールバック
+を発行していた。高速flood（`cat`で巨大ファイルを吐き出す等）時、Kotlin側 `TerminalSession.kt` の
+`Channel.CONFLATED` が中間フレームを受信後に捨てるだけで、Rust側のdiff計算・FFI呼び出し自体は律儀に
+全部実行してしまっており、モバイル端末のCPU/バッテリーの無駄遣いになっていた。
+
+**調査**: Alacritty（damage tracking + PR #6585 のユーザー空間タイマーベーススケジューリング、
+PTY読み取りは1MB固定バッファに蓄積してから一括パース）と kitty（`input_delay`/`repaint_delay`の
+2段間引きノブ、I/Oスレッドとレンダリングスレッドの分離）の実装を一次情報（各リポジトリの
+ソースコード・公式ドキュメント・PR/issue）で調査し、Opusエージェントとの設計相談を経てこの
+プロジェクトの既存構造（tokio非同期ループ、既存の`LineDamage`/`update_seq` damage機構、Kotlin側
+`Channel.CONFLATED`）にどうマッピングするかを検討した。
+
+**設計判断**:
+- kittyの2段ノブを、それぞれ別の実装手段にマッピングした。「読み取り→パースのバッチ化」
+  （`input_delay`相当）はタイマーではなく `event_rx.try_recv()` によるノンブロッキングdrain
+  （このプロジェクトは既にmpscでイベント化済みなので、キューに積まれている分を遅延ゼロで束ねれば
+  十分）。「画面反映の間引き」（`repaint_delay`相当）だけが本物のタイマー（`RepaintThrottle`、
+  リーディングエッジ＋トレーリングエッジ、既定16ms）。
+- VTEパース自体（`state.on_stdout`）は間引かない。端末状態は常に最新でなければならない
+  （DA/DSR応答・カーソル位置等の前提）。間引いてよいのは「画面をUniFFI越しに反映する頻度」だけ。
+- 既存の `LineDamage`/`dirty_rows`/`update_seq`（damage tracking）は不要にならない。
+  `make_screen_update`の差分は「前回**発行**したスナップショットとの差」であり、間引きで発行回数が
+  減っても次回発行時の`dirty_rows`が累積差分を自然に含む。Kotlin側`Channel.CONFLATED`とも役割が
+  異なり（Rust側は生産量そのものの削減、Kotlin側はUIスレッド失速時の最終フレーム優先）多層防御
+  として共存する。
+- DEC同期出力（`?2026`）safety-netタイマー・trzsz転送の即時性とは競合しない。`?2026`アクティブ中は
+  `screen_dirty`自体が立たないためthrottleに乗らず、`?2026l`でまとめてflushされた時点で初めて
+  throttle対象になる。trzsz側のside effects/timer/scrollbackは`dispatch_result`で従来どおり
+  即時処理を維持し、画面反映の発行だけを`emit_screen_update`ヘルパーへ分離した。
+- UniFFI公開API・`ScreenUpdate`型は無変更。判定ロジックは全て`session.rs`内に閉じ、
+  Kotlin側は無変更（`.claude/rules/rust-ssot.md`のRust-SSOT原則に準拠）。バインディング再生成は不要。
+
+**実装**（`rust-core/src/session.rs`、`rust-core/src/transport/ssh_handler.rs`）:
+- `RepaintThrottle`/`RepaintDecision`: tokio非依存の純粋な間引き判定ロジック（単体テスト付き）。
+- `dispatch_result`から`on_screen_update`呼び出しを分離し、`emit_screen_update`ヘルパーへ集約。
+- `session_event_loop`にpinした`tokio::time::sleep`をrepaintタイマーとして`select!`へ統合
+  （spawn-per-timerパターンは避け、`reset()`で使い回す）。
+- `TransportEvent`処理を`dispatch_transport_event`へ切り出し、`Stdout`受信時に`try_recv`で
+  連続する後続`Stdout`をdrain・連結。drain中に非`Stdout`を引いた場合は`pending_event`スロットへ
+  退避し、次ループ先頭で`select!`より先に処理して到着順序を厳密に保つ。
+- `ssh_handler.rs`の`pooling_e2e_tests`に`__test_flood__:<N>`/`__test_flood_sync__:<N>`トリガーを
+  追加し、実SSH接続経由での高速flood時の`on_screen_update`間引き・最終画面の正しさ・`?2026`区間との
+  非衝突をe2eテストで検証。
+
+**参照実装**: `rust-core/src/session.rs`の`RepaintThrottle`/`dispatch_transport_event`/
+`emit_screen_update`/`session_event_loop`、`rust-core/src/transport/ssh_handler.rs`の
+`pooling_e2e_tests::flood_output_coalesces_screen_updates_but_final_screen_is_correct`。
