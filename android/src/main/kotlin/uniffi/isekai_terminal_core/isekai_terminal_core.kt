@@ -674,6 +674,9 @@ internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod14 : com.sun
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod15 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod16 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`requestId`: RustBuffer.ByValue,`outcome`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 @Structure.FieldOrder("uniffiFree", "uniffiClone", "onDiagnosticEvent")
 internal open class UniffiVTableCallbackInterfaceDiagnosticCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -712,7 +715,7 @@ internal open class UniffiVTableCallbackInterfaceEventWakeListener(
     }
 
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged", "onPromptJump", "onPromptOutputCopyReady")
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged", "onPromptJump", "onPromptOutputCopyReady", "onFilePreviewResult")
 internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -732,6 +735,7 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
     @JvmField internal var `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
     @JvmField internal var `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod15? = null,
+    @JvmField internal var `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod16? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -752,7 +756,8 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
         `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
         `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod15? = null,
-    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,`onPromptJump`,`onPromptOutputCopyReady`,), Structure.ByValue
+        `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod16? = null,
+    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,`onPromptJump`,`onPromptOutputCopyReady`,`onFilePreviewResult`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceOrchestratorCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -773,6 +778,7 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onRebindStateChanged` = other.`onRebindStateChanged`
         `onPromptJump` = other.`onPromptJump`
         `onPromptOutputCopyReady` = other.`onPromptOutputCopyReady`
+        `onFilePreviewResult` = other.`onFilePreviewResult`
     }
 
 }
@@ -871,6 +877,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic(
@@ -961,6 +969,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result(
+    ): Int
     external fun ffi_isekai_terminal_core_uniffi_contract_version(
     ): Int
 
@@ -1041,6 +1051,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_q
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_copy_last_command_output(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_file_preview_request(`ptr`: Long,`requestId`: RustBuffer.ByValue,`kind`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_force_return_to_wifi(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -1357,6 +1369,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request() != 44983) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi() != 8683) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1490,6 +1505,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready() != 14453) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result() != 44801) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1840,6 +1858,29 @@ public object FfiConverterULong: FfiConverter<ULong, Long> {
 
     override fun write(value: ULong, buf: ByteBuffer) {
         buf.putLong(value.toLong())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterLong: FfiConverter<Long, Long> {
+    override fun lift(value: Long): Long {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Long {
+        return buf.getLong()
+    }
+
+    override fun lower(value: Long): Long {
+        return value
+    }
+
+    override fun allocationSize(value: Long) = 8UL
+
+    override fun write(value: Long, buf: ByteBuffer) {
+        buf.putLong(value)
     }
 }
 
@@ -3004,6 +3045,19 @@ public interface SessionOrchestratorInterface {
     fun `disconnect`()
     
     /**
+     * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
+     * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
+     * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
+     * 一意なID(例: UUID)——複数のディレクトリ一覧/catチャンク要求が同時に
+     * in-flightでも取り違えないようにするため。
+     *
+     * 未接続、またはセッションがこのexecに対応していない(現状は全トランスポートが
+     * 対応しているため実質「未接続」のみ)場合は、待たせず即座に
+     * `FilePreviewOutcome::Error`で応答する。
+     */
+    fun `filePreviewRequest`(`requestId`: kotlin.String, `kind`: FilePreviewRequestKind)
+    
+    /**
      * #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
      * ダウンロード中などで静けさ待ちを待たずに即座に戻したい場合)。疎通確認だけは
      * 省略されない(`RebindManager::handle_manual_force_return`参照)。マルチパス以外の
@@ -3421,6 +3475,29 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(
         it,
         _status)
+}
+    }
+    
+    
+
+    
+    /**
+     * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
+     * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
+     * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
+     * 一意なID(例: UUID)——複数のディレクトリ一覧/catチャンク要求が同時に
+     * in-flightでも取り違えないようにするため。
+     *
+     * 未接続、またはセッションがこのexecに対応していない(現状は全トランスポートが
+     * 対応しているため実質「未接続」のみ)場合は、待たせず即座に
+     * `FilePreviewOutcome::Error`で応答する。
+     */override fun `filePreviewRequest`(`requestId`: kotlin.String, `kind`: FilePreviewRequestKind)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_file_preview_request(
+        it,
+        FfiConverterString.lower(`requestId`),FfiConverterTypeFilePreviewRequestKind.lower(`kind`),_status)
 }
     }
     
@@ -4116,6 +4193,62 @@ public object FfiConverterTypeDiagnosticEventEnvelope: FfiConverterRustBuffer<Di
     override fun write(value: DiagnosticEventEnvelope, buf: ByteBuffer) {
             FfiConverterULong.write(value.`sequence`, buf)
             FfiConverterString.write(value.`message`, buf)
+    }
+}
+
+
+
+/**
+ * ディレクトリエントリ1件(`isekai-pipe ctl file ls`の結果)。
+ */
+data class FilePreviewEntry (
+    var `name`: kotlin.String
+    , 
+    var `isDir`: kotlin.Boolean
+    , 
+    var `isSymlink`: kotlin.Boolean
+    , 
+    var `size`: kotlin.ULong
+    , 
+    var `modifiedUnix`: kotlin.Long?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFilePreviewEntry: FfiConverterRustBuffer<FilePreviewEntry> {
+    override fun read(buf: ByteBuffer): FilePreviewEntry {
+        return FilePreviewEntry(
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterOptionalLong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FilePreviewEntry) = (
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterBoolean.allocationSize(value.`isDir`) +
+            FfiConverterBoolean.allocationSize(value.`isSymlink`) +
+            FfiConverterULong.allocationSize(value.`size`) +
+            FfiConverterOptionalLong.allocationSize(value.`modifiedUnix`)
+    )
+
+    override fun write(value: FilePreviewEntry, buf: ByteBuffer) {
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterBoolean.write(value.`isDir`, buf)
+            FfiConverterBoolean.write(value.`isSymlink`, buf)
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterOptionalLong.write(value.`modifiedUnix`, buf)
     }
 }
 
@@ -5821,6 +5954,311 @@ public object FfiConverterTypeCursorShape: FfiConverterRustBuffer<CursorShape> {
 
 
 /**
+ * `file_preview_request`の非同期結果。`OrchestratorCallback::on_file_preview_result`で
+ * 届く。
+ */
+sealed class FilePreviewOutcome {
+    
+    data class Ls(
+        val `entries`: List<uniffi.isekai_terminal_core.FilePreviewEntry>) : FilePreviewOutcome()
+        
+    {
+        
+
+        companion object
+    }
+    
+    data class Cat(
+        val `offset`: kotlin.ULong, 
+        val `length`: kotlin.ULong, 
+        val `totalSize`: kotlin.ULong, 
+        val `eof`: kotlin.Boolean, 
+        val `data`: kotlin.ByteArray) : FilePreviewOutcome()
+        
+    {
+        
+
+        companion object
+    }
+    
+    data class Info(
+        val `name`: kotlin.String, 
+        val `path`: kotlin.String, 
+        val `isDir`: kotlin.Boolean, 
+        val `isSymlink`: kotlin.Boolean, 
+        val `size`: kotlin.ULong, 
+        val `modifiedUnix`: kotlin.Long?, 
+        val `permissionsUnix`: kotlin.UInt?) : FilePreviewOutcome()
+        
+    {
+        
+
+        companion object
+    }
+    
+    /**
+     * I/Oエラー(`ctl_file.rs`の`{"ok":false,"error":...}`)・exec自体の失敗
+     * (未接続・チャネルオープン失敗)・JSONパース失敗のいずれか。呼び出し元は
+     * 種別を区別する必要が無いので単一のバリアントにまとめている。
+     */
+    data class Error(
+        val `message`: kotlin.String) : FilePreviewOutcome()
+        
+    {
+        
+
+        companion object
+    }
+    
+
+    
+
+    
+    
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFilePreviewOutcome : FfiConverterRustBuffer<FilePreviewOutcome>{
+    override fun read(buf: ByteBuffer): FilePreviewOutcome {
+        return when(buf.getInt()) {
+            1 -> FilePreviewOutcome.Ls(
+                FfiConverterSequenceTypeFilePreviewEntry.read(buf),
+                )
+            2 -> FilePreviewOutcome.Cat(
+                FfiConverterULong.read(buf),
+                FfiConverterULong.read(buf),
+                FfiConverterULong.read(buf),
+                FfiConverterBoolean.read(buf),
+                FfiConverterByteArray.read(buf),
+                )
+            3 -> FilePreviewOutcome.Info(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterBoolean.read(buf),
+                FfiConverterBoolean.read(buf),
+                FfiConverterULong.read(buf),
+                FfiConverterOptionalLong.read(buf),
+                FfiConverterOptionalUInt.read(buf),
+                )
+            4 -> FilePreviewOutcome.Error(
+                FfiConverterString.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: FilePreviewOutcome) = when(value) {
+        is FilePreviewOutcome.Ls -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterSequenceTypeFilePreviewEntry.allocationSize(value.`entries`)
+            )
+        }
+        is FilePreviewOutcome.Cat -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterULong.allocationSize(value.`offset`)
+                + FfiConverterULong.allocationSize(value.`length`)
+                + FfiConverterULong.allocationSize(value.`totalSize`)
+                + FfiConverterBoolean.allocationSize(value.`eof`)
+                + FfiConverterByteArray.allocationSize(value.`data`)
+            )
+        }
+        is FilePreviewOutcome.Info -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`name`)
+                + FfiConverterString.allocationSize(value.`path`)
+                + FfiConverterBoolean.allocationSize(value.`isDir`)
+                + FfiConverterBoolean.allocationSize(value.`isSymlink`)
+                + FfiConverterULong.allocationSize(value.`size`)
+                + FfiConverterOptionalLong.allocationSize(value.`modifiedUnix`)
+                + FfiConverterOptionalUInt.allocationSize(value.`permissionsUnix`)
+            )
+        }
+        is FilePreviewOutcome.Error -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`message`)
+            )
+        }
+    }
+
+    override fun write(value: FilePreviewOutcome, buf: ByteBuffer) {
+        when(value) {
+            is FilePreviewOutcome.Ls -> {
+                buf.putInt(1)
+                FfiConverterSequenceTypeFilePreviewEntry.write(value.`entries`, buf)
+                Unit
+            }
+            is FilePreviewOutcome.Cat -> {
+                buf.putInt(2)
+                FfiConverterULong.write(value.`offset`, buf)
+                FfiConverterULong.write(value.`length`, buf)
+                FfiConverterULong.write(value.`totalSize`, buf)
+                FfiConverterBoolean.write(value.`eof`, buf)
+                FfiConverterByteArray.write(value.`data`, buf)
+                Unit
+            }
+            is FilePreviewOutcome.Info -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`name`, buf)
+                FfiConverterString.write(value.`path`, buf)
+                FfiConverterBoolean.write(value.`isDir`, buf)
+                FfiConverterBoolean.write(value.`isSymlink`, buf)
+                FfiConverterULong.write(value.`size`, buf)
+                FfiConverterOptionalLong.write(value.`modifiedUnix`, buf)
+                FfiConverterOptionalUInt.write(value.`permissionsUnix`, buf)
+                Unit
+            }
+            is FilePreviewOutcome.Error -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`message`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
+ * `SessionOrchestrator::file_preview_request`への要求種別。`ctl_file.rs`の
+ * `ls`/`cat`/`info`サブコマンドに対応する(`cp`/`rm`はこのタスクのスコープ外
+ * — プレビューは読み取り専用、削除/コピーはtrzsz転送シート等の既存導線に任せる)。
+ */
+sealed class FilePreviewRequestKind {
+    
+    data class Ls(
+        val `path`: kotlin.String) : FilePreviewRequestKind()
+        
+    {
+        
+
+        companion object
+    }
+    
+    /**
+     * `length`が`None`なら「ファイル末尾まで(ただし8MiB上限でクランプ)」を要求する。
+     * 大きなファイルはKotlin側が`offset += 返ってきたlength`でページングし続ける
+     * (`ctl_file.rs`のドキュメント通り)。
+     */
+    data class Cat(
+        val `path`: kotlin.String, 
+        val `offset`: kotlin.ULong, 
+        val `length`: kotlin.ULong?) : FilePreviewRequestKind()
+        
+    {
+        
+
+        companion object
+    }
+    
+    data class Info(
+        val `path`: kotlin.String) : FilePreviewRequestKind()
+        
+    {
+        
+
+        companion object
+    }
+    
+
+    
+
+    
+    
+
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFilePreviewRequestKind : FfiConverterRustBuffer<FilePreviewRequestKind>{
+    override fun read(buf: ByteBuffer): FilePreviewRequestKind {
+        return when(buf.getInt()) {
+            1 -> FilePreviewRequestKind.Ls(
+                FfiConverterString.read(buf),
+                )
+            2 -> FilePreviewRequestKind.Cat(
+                FfiConverterString.read(buf),
+                FfiConverterULong.read(buf),
+                FfiConverterOptionalULong.read(buf),
+                )
+            3 -> FilePreviewRequestKind.Info(
+                FfiConverterString.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: FilePreviewRequestKind) = when(value) {
+        is FilePreviewRequestKind.Ls -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`path`)
+            )
+        }
+        is FilePreviewRequestKind.Cat -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`path`)
+                + FfiConverterULong.allocationSize(value.`offset`)
+                + FfiConverterOptionalULong.allocationSize(value.`length`)
+            )
+        }
+        is FilePreviewRequestKind.Info -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`path`)
+            )
+        }
+    }
+
+    override fun write(value: FilePreviewRequestKind, buf: ByteBuffer) {
+        when(value) {
+            is FilePreviewRequestKind.Ls -> {
+                buf.putInt(1)
+                FfiConverterString.write(value.`path`, buf)
+                Unit
+            }
+            is FilePreviewRequestKind.Cat -> {
+                buf.putInt(2)
+                FfiConverterString.write(value.`path`, buf)
+                FfiConverterULong.write(value.`offset`, buf)
+                FfiConverterOptionalULong.write(value.`length`, buf)
+                Unit
+            }
+            is FilePreviewRequestKind.Info -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`path`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
  * ポートフォワード待受の状態。`OrchestratorCallback::on_forward_state_changed` で通知される。
  */
 sealed class ForwardState {
@@ -7120,6 +7558,13 @@ public interface OrchestratorCallback {
      */
     fun `onPromptOutputCopyReady`(`text`: kotlin.String?)
     
+    /**
+     * タスク#17(ファイルプレビュー機能): `file_preview_request`で発行した`request_id`の
+     * 結果。`ctl_file.rs`のJSON出力は既にここへ届く前に`FilePreviewOutcome`へ
+     * パース済み(`rust-ssot.md`: JSONパース/base64デコードはRust側で完結させる)。
+     */
+    fun `onFilePreviewResult`(`requestId`: kotlin.String, `outcome`: FilePreviewOutcome)
+    
     companion object
 }
 
@@ -7319,6 +7764,19 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+    internal object `onFilePreviewResult`: UniffiCallbackInterfaceOrchestratorCallbackMethod16 {
+        override fun callback(`uniffiHandle`: Long,`requestId`: RustBuffer.ByValue,`outcome`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onFilePreviewResult`(
+                    FfiConverterString.lift(`requestId`),
+                    FfiConverterTypeFilePreviewOutcome.lift(`outcome`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
 
     internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
@@ -7351,6 +7809,7 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
         `onRebindStateChanged`,
         `onPromptJump`,
         `onPromptOutputCopyReady`,
+        `onFilePreviewResult`,
     )
 
     // Registers the foreign callback with the Rust side.
@@ -7523,6 +7982,38 @@ public object FfiConverterOptionalULong: FfiConverterRustBuffer<kotlin.ULong?> {
         } else {
             buf.put(1)
             FfiConverterULong.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalLong: FfiConverterRustBuffer<kotlin.Long?> {
+    override fun read(buf: ByteBuffer): kotlin.Long? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterLong.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.Long?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterLong.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.Long?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterLong.write(value, buf)
         }
     }
 }
@@ -7983,6 +8474,34 @@ public object FfiConverterSequenceTypeDiagnosticEventEnvelope: FfiConverterRustB
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeDiagnosticEventEnvelope.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFilePreviewEntry: FfiConverterRustBuffer<List<FilePreviewEntry>> {
+    override fun read(buf: ByteBuffer): List<FilePreviewEntry> {
+        val len = buf.getInt()
+        return List<FilePreviewEntry>(len) {
+            FfiConverterTypeFilePreviewEntry.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FilePreviewEntry>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFilePreviewEntry.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FilePreviewEntry>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFilePreviewEntry.write(it, buf)
         }
     }
 }
