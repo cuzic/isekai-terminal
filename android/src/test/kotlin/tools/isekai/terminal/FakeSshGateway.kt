@@ -160,6 +160,23 @@ class FakeOrchestrator : SessionOrchestratorInterface {
         setSessionThemeCalls.add(Triple(ansi16, defaultFg, defaultBg))
     }
 
+    // タスク#13(OSC 133)。呼び出し引数を記録するだけ(判断ロジックはRust側にあるため、
+    // Fakeは配線されているかどうかのみ確認できればよい)。
+    val jumpToPreviousPromptCalls = mutableListOf<Pair<UInt, Boolean>>()
+    override fun jumpToPreviousPrompt(fromScrollOffset: UInt, fromShowingScrollback: Boolean) {
+        jumpToPreviousPromptCalls.add(fromScrollOffset to fromShowingScrollback)
+    }
+    val jumpToNextPromptCalls = mutableListOf<Pair<UInt, Boolean>>()
+    override fun jumpToNextPrompt(fromScrollOffset: UInt, fromShowingScrollback: Boolean) {
+        jumpToNextPromptCalls.add(fromScrollOffset to fromShowingScrollback)
+    }
+    val clickToPromptCursorCalls = mutableListOf<Pair<UInt, UInt>>()
+    override fun clickToPromptCursor(row: UInt, col: UInt) {
+        clickToPromptCursorCalls.add(row to col)
+    }
+    var copyLastCommandOutputCallCount = 0
+    override fun copyLastCommandOutput() { copyLastCommandOutputCallCount++ }
+
 
     // trzszDismiss() fires Idle synchronously, matching real Rust behavior
     override fun trzszDismiss() {
@@ -208,6 +225,10 @@ class FakeOrchestrator : SessionOrchestratorInterface {
 
     fun simulateAgentSignRequest(fingerprint: String = "SHA256:test-fingerprint"): Boolean =
         callback!!.onAgentSignRequest(fingerprint)
+
+    fun simulatePromptJump(target: PromptJumpTarget?) = callback!!.onPromptJump(target)
+
+    fun simulatePromptOutputCopyReady(text: String?) = callback!!.onPromptOutputCopyReady(text)
 }
 
 /** テスト用フェイク HostKeyChecker。デフォルトは常に信頼。 */

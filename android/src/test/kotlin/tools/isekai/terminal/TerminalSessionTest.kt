@@ -15,6 +15,7 @@ import org.junit.Test
 import uniffi.isekai_terminal_core.QuicConfig
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
+import uniffi.isekai_terminal_core.PromptJumpTarget
 import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.ScrollbackSearchMatch
 import uniffi.isekai_terminal_core.SshAuth
@@ -976,5 +977,69 @@ class TerminalSessionTest {
     @Test
     fun searchScrollback_beforeConnecting_returnsEmptyList() {
         assertEquals(emptyList<ScrollbackSearchMatch>(), session.searchScrollback("abc", caseSensitive = false))
+    }
+
+    // ── OSC 133(タスク#13) ──────────────────────────────────
+
+    /** 判断ロジック(どのプロンプトが「前/次」か)は全てRust側
+     *  ([Terminal::prompt_jump_target]、`rust-core/src/terminal.rs`)にあるため、
+     *  ここでは[TerminalSession.jumpToPreviousPrompt]/[jumpToNextPrompt]が引数を
+     *  そのまま中継していることだけを確認する([searchScrollback_delegatesQueryAndResultToOrchestrator]
+     *  と同型のテスト)。 */
+    @Test
+    fun jumpToPreviousPrompt_delegatesArgsToOrchestrator() {
+        session.jumpToPreviousPrompt(fromScrollOffset = 5, fromShowingScrollback = true)
+
+        assertEquals(listOf(5u to true), fakeOrchestrator.jumpToPreviousPromptCalls)
+    }
+
+    @Test
+    fun jumpToNextPrompt_delegatesArgsToOrchestrator() {
+        session.jumpToNextPrompt(fromScrollOffset = 0, fromShowingScrollback = false)
+
+        assertEquals(listOf(0u to false), fakeOrchestrator.jumpToNextPromptCalls)
+    }
+
+    @Test
+    fun clickToPromptCursor_delegatesArgsToOrchestrator() {
+        session.clickToPromptCursor(row = 3, col = 7)
+
+        assertEquals(listOf(3u to 7u), fakeOrchestrator.clickToPromptCursorCalls)
+    }
+
+    @Test
+    fun copyLastCommandOutput_delegatesToOrchestrator() {
+        session.copyLastCommandOutput()
+
+        assertEquals(1, fakeOrchestrator.copyLastCommandOutputCallCount)
+    }
+
+    /** `onPromptJump`コールバックの結果が[TerminalUiState.promptJumpResult]へ反映される
+     *  こと、および`seq`が呼び出しごとに単調増加すること
+     *  ([PromptJumpResult]のdocコメント参照——`target`が同じ`null`のまま連続しても
+     *  Compose側の`LaunchedEffect`が確実に再発火できるようにするための設計)。 */
+    @Test
+    fun onPromptJump_updatesStateWithTargetAndIncrementingSeq() {
+        val target = PromptJumpTarget(scrollOffset = 12u, isLive = false)
+
+        fakeOrchestrator.simulatePromptJump(target)
+        assertEquals(target, session.state.value.promptJumpResult.target)
+        assertEquals(1L, session.state.value.promptJumpResult.seq)
+
+        // 見つからなかった(null)場合でもseqは進む。
+        fakeOrchestrator.simulatePromptJump(null)
+        assertNull(session.state.value.promptJumpResult.target)
+        assertEquals(2L, session.state.value.promptJumpResult.seq)
+    }
+
+    @Test
+    fun onPromptOutputCopyReady_updatesStateWithTextAndIncrementingSeq() {
+        fakeOrchestrator.simulatePromptOutputCopyReady("line1\nline2")
+        assertEquals("line1\nline2", session.state.value.promptOutputCopyResult.text)
+        assertEquals(1L, session.state.value.promptOutputCopyResult.seq)
+
+        fakeOrchestrator.simulatePromptOutputCopyReady(null)
+        assertNull(session.state.value.promptOutputCopyResult.text)
+        assertEquals(2L, session.state.value.promptOutputCopyResult.seq)
     }
 }
