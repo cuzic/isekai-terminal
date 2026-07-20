@@ -1,4 +1,5 @@
 mod ctl;
+mod ctl_file;
 mod datagram_relay;
 mod engine;
 mod connect;
@@ -16,6 +17,11 @@ use isekai_pipe_core::ServiceSpec;
 
 pub(crate) const EX_USAGE: u8 = 64;
 pub(crate) const EX_UNAVAILABLE: u8 = 69;
+/// `sysexits.h`'s `EX_IOERR`: an I/O error unrelated to how the command was
+/// invoked (`ctl_file`'s ls/cat/info/cp/rm operations, task #16) — distinct
+/// from `EX_USAGE` (bad arguments) and `EX_UNAVAILABLE` (ctl-socket-forward
+/// specific: stale/missing socket, timeout).
+pub(crate) const EX_IOERR: u8 = 74;
 
 /// Serializes tests (across `main.rs`/`ctl.rs`) that mutate process-global
 /// env vars (`ISEKAI_PIPE_PROFILES_DIR`/`ISEKAI_CTL_SOCK`). `cargo test`
@@ -43,7 +49,7 @@ fn print_help() {
     println!("    serve      remote service side");
     println!("    probe      connectivity probe (skeleton)");
     println!("    inspect    passive profile inspection (--profile, --json, --redact, --verbose)");
-    println!("    ctl        title/clipboard control-plane client (see `isekai-pipe ctl --help`)");
+    println!("    ctl        title/clipboard/setvar/getvar/file control-plane client (see `isekai-pipe ctl --help`)");
     println!("    version    print version");
     println!();
     println!(
