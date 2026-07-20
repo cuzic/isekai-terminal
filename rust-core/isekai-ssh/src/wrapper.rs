@@ -1309,11 +1309,14 @@ async fn resolve_wrapper(plan: &WrapperPlan) -> Result<WrapperResolution> {
 /// itself from the same config file).
 pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolution, openssh_config::HostConfig)> {
     let explicit_f = dash_f_config_path(&plan.ssh_args);
-    log_line!("isekai-ssh: dash_f={:?}, destination={:?}", explicit_f, plan.destination);
+    // openssh-config does not parse user@host syntax — strip the user@ part
+    // so that `cuzic@vpsmart` matches `Host vpsmart`.
+    let dest_for_config = plan.destination.split('@').last().unwrap_or(&plan.destination);
+    log_line!("isekai-ssh: dash_f={:?}, destination={:?}, dest_for_config={:?}", explicit_f, plan.destination, dest_for_config);
     let host_config = match explicit_f {
         Some(config_path) => {
             log_line!("isekai-ssh: resolving config from {}", config_path.display());
-            openssh_config::resolve(&config_path, &plan.destination).map_err(|e| {
+            openssh_config::resolve(&config_path, dest_for_config).map_err(|e| {
                 anyhow!(
                     "isekai-ssh: failed to resolve {:?} from {}: {e}",
                     plan.destination,
@@ -1322,8 +1325,8 @@ pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolutio
             })
         }
         None => {
-            log_line!("isekai-ssh: resolving config from ~/.ssh/config for {:?}", plan.destination);
-            openssh_config::resolve_default(&plan.destination).map_err(|e| {
+            log_line!("isekai-ssh: resolving config from ~/.ssh/config for {:?}", dest_for_config);
+            openssh_config::resolve_default(dest_for_config).map_err(|e| {
                 anyhow!(
                     "isekai-ssh: failed to resolve {:?} from ~/.ssh/config: {e}",
                     plan.destination
