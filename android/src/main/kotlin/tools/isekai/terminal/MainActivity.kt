@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.semantics
@@ -161,6 +162,22 @@ fun AppRoot() {
     // 既にタブがある(=プロセスが生きたままActivityだけ再生成された)場合は、ProfileListを
     // 経由せず直接Terminalへ着地させる。
     val startDestination = if (tabsVm.tabs.value.isNotEmpty()) AppRoutes.TERMINAL else AppRoutes.PROFILE_LIST
+
+    // タスク#14: プロセスkillからの黙示的セッション再アタッチは、`tabsVm`の`init{}`が
+    // ioDispatcher上の非同期コルーチンでタブを復元する(`TerminalTabsViewModel.
+    // restorePersistedReattachTabs`参照)。そのため上の`startDestination`の同期的な
+    // 判定(この行より前の時点のtabs状態)だけでは、復元がこの初回コンポジションに
+    // 間に合わずProfileListへ着地してしまう場合がある。復元が完了してtabsが空から
+    // 非空になった時点でも、まだProfileList表示中であれば追ってTerminalへ遷移させる
+    // (ユーザーが既に他画面へ手動遷移していた場合は上書きしない)。
+    LaunchedEffect(navController) {
+        tabsVm.tabs.collect { tabs ->
+            if (tabs.isNotEmpty() && navController.currentDestination?.route == AppRoutes.PROFILE_LIST) {
+                RemoteLogger.i("IsekaiTerminalNav", "implicit reattach produced a tab, navigating ProfileList → Terminal")
+                navController.navigate(AppRoutes.TERMINAL)
+            }
+        }
+    }
 
     NavHost(navController = navController, startDestination = startDestination) {
 
