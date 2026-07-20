@@ -119,6 +119,22 @@ pub(crate) enum SessionCmd {
     /// OSのフォーカス変化(タスク#60)。フォーカスレポーティング(`?1004`)が有効な場合のみ
     /// `session_state::SessionState::notify_focus_change`がCSI I/CSI Oへエンコードする。
     FocusChanged(bool),
+    /// OSC 133(タスク#13)「前/次のプロンプトへジャンプ」。`from_scroll_offset`/
+    /// `from_showing_scrollback`はKotlin側の現在の表示位置(既存の検索ジャンプ・
+    /// タスク#79と同じ規約)。結果は`OrchestratorCallback::on_prompt_jump`で
+    /// 非同期に返る(`SessionState::jump_to_prompt`参照)。
+    PromptJumpPrevious { from_scroll_offset: u32, from_showing_scrollback: bool },
+    /// [PromptJumpPrevious]の「次」版。
+    PromptJumpNext { from_scroll_offset: u32, from_showing_scrollback: bool },
+    /// OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+    /// 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列をリモートへ
+    /// 送る(Ghostty`cl=line`相当)。対象外なら無音でno-op
+    /// (`SessionState::click_to_prompt_cursor`参照)。
+    ClickToPromptCursor { row: u32, col: u32 },
+    /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+    /// `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+    /// (該当コマンドがまだ無ければ`None`、`SessionState::copy_last_command_output`参照)。
+    CopyLastCommandOutput,
 }
 
 // ── russh Handler ────────────────────────────────────────
@@ -984,6 +1000,8 @@ mod pooling_e2e_tests {
         fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+        fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
+        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
     }
 
     /// 公開鍵認証を無条件で受け入れつつ認証回数を数え、シェルチャネルへ書き込まれた
@@ -1594,6 +1612,8 @@ mod pooling_e2e_tests {
         fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+        fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
+        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
     }
 
     /// flood(生の`TestEvent::Data`)がクライアント側に一通り届き終えたと判断できるまで

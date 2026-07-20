@@ -273,6 +273,8 @@ mod local_forward_e2e_tests {
         fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+        fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
+        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
     }
 
     /// 受け取ったバイト列をそのまま返すだけのダミー TCP サーバ。
