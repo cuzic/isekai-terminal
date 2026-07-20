@@ -14,7 +14,7 @@ use anyhow::Result;
 use anyhow::{bail, Context};
 #[cfg(unix)]
 use base64::Engine as _;
-use isekai_protocol::ClipboardMime;
+use isekai_protocol::{ClipboardMime, VarScope};
 #[cfg(unix)]
 use isekai_protocol::{decode_ctl_message, CtlMessage};
 #[cfg(unix)]
@@ -32,6 +32,10 @@ enum CtlLaunch {
     Title { sock: Option<String>, value: String },
     ClipPush { sock: Option<String>, mime: ClipboardMime },
     ClipPull { sock: Option<String> },
+    /// task #16: `setvar` — fire-and-forget, same wire shape as `Title`.
+    SetVar { sock: Option<String>, scope: VarScope, key: String, value: String },
+    /// task #16: `getvar` — request/response, same wire shape as `ClipPull`.
+    GetVar { sock: Option<String>, scope: VarScope, key: String },
 }
 
 fn print_ctl_help() {
@@ -41,8 +45,24 @@ fn print_ctl_help() {
     println!("        (reads the payload from stdin)");
     println!("    isekai-pipe ctl clip pull [--sock <path>]");
     println!("        (writes the decoded payload to stdout)");
+    println!("    isekai-pipe ctl setvar <key> <value> [--scope tab|session|global] [--sock <path>]");
+    println!("    isekai-pipe ctl getvar <key> [--scope tab|session|global] [--sock <path>]");
+    println!("        (writes the value to stdout with no trailing newline; exits non-zero and");
+    println!("        prints nothing if the key was never set)");
+    println!("    isekai-pipe ctl file ls|cat|info|cp|rm ...  (see `isekai-pipe ctl file --help`)");
     println!();
-    println!("Without --sock, reads the target UNIX domain socket path from ${ENV_CTL_SOCK}.");
+    println!("`setvar`/`getvar`/`title`/`clip` need the tab's ctl-socket forward: without --sock,");
+    println!("they read the target UNIX domain socket path from ${ENV_CTL_SOCK}. `file` does not");
+    println!("use this socket at all (see `isekai-pipe ctl file --help`).");
+}
+
+fn parse_var_scope(value: &str) -> Result<VarScope, String> {
+    match value {
+        "tab" => Ok(VarScope::Tab),
+        "session" => Ok(VarScope::Session),
+        "global" => Ok(VarScope::Global),
+        other => Err(format!("isekai-pipe ctl: unsupported --scope {other:?} (expected tab, session, or global)")),
+    }
 }
 
 fn parse_mime(value: &str) -> Result<ClipboardMime, String> {
@@ -64,6 +84,8 @@ fn parse_ctl(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>
         }
         Some("title") => parse_ctl_title(args),
         Some("clip") => parse_ctl_clip(args),
+        Some("setvar") => parse_ctl_setvar(args),
+        Some("getvar") => parse_ctl_getvar(args),
         Some(other) => {
             eprintln!("isekai-pipe ctl: unknown subcommand {other:?}");
             Err(ExitCode::from(EX_USAGE))
@@ -156,6 +178,84 @@ fn parse_ctl_clip(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLa
     }
 }
 
+fn parse_ctl_setvar(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
+    let mut sock: Option<String> = None;
+    let mut scope: Option<VarScope> = None;
+    let mut key: Option<String> = None;
+    let mut value: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--sock" => {
+                sock = Some(next_arg("ctl setvar", &mut args, "--sock").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            "--scope" => {
+                let raw = next_arg("ctl setvar", &mut args, "--scope").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                scope = Some(parse_var_scope(&raw).map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            other if key.is_none() => key = Some(other.to_string()),
+            other if value.is_none() => value = Some(other.to_string()),
+            other => {
+                eprintln!("isekai-pipe ctl setvar: unexpected extra argument {other:?}");
+                return Err(ExitCode::from(EX_USAGE));
+            }
+        }
+    }
+    let Some(key) = key else {
+        eprintln!("isekai-pipe ctl setvar: a key argument is required");
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    let Some(value) = value else {
+        eprintln!("isekai-pipe ctl setvar: a value argument is required");
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    Ok(Some(CtlLaunch::SetVar { sock, scope: scope.unwrap_or(VarScope::Tab), key, value }))
+}
+
+fn parse_ctl_getvar(mut args: impl Iterator<Item = String>) -> Result<Option<CtlLaunch>, ExitCode> {
+    let mut sock: Option<String> = None;
+    let mut scope: Option<VarScope> = None;
+    let mut key: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--sock" => {
+                sock = Some(next_arg("ctl getvar", &mut args, "--sock").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            "--scope" => {
+                let raw = next_arg("ctl getvar", &mut args, "--scope").map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?;
+                scope = Some(parse_var_scope(&raw).map_err(|e| {
+                    eprintln!("{e}");
+                    ExitCode::from(EX_USAGE)
+                })?);
+            }
+            other if key.is_none() => key = Some(other.to_string()),
+            other => {
+                eprintln!("isekai-pipe ctl getvar: unexpected extra argument {other:?}");
+                return Err(ExitCode::from(EX_USAGE));
+            }
+        }
+    }
+    let Some(key) = key else {
+        eprintln!("isekai-pipe ctl getvar: a key argument is required");
+        return Err(ExitCode::from(EX_USAGE));
+    };
+    Ok(Some(CtlLaunch::GetVar { sock, scope: scope.unwrap_or(VarScope::Tab), key }))
+}
+
 fn resolve_ctl_socket_path(explicit: Option<String>) -> Result<PathBuf, ExitCode> {
     if let Some(explicit) = explicit {
         return Ok(PathBuf::from(explicit));
@@ -215,6 +315,13 @@ pub(crate) fn sweep_stale_ctl_sockets_on_remote() {
     sweep_stale_ctl_sockets_in(Path::new("/tmp"));
 }
 
+/// `isekai-pipe ctl file ls|cat|info|cp|rm` (task #16) operates on the
+/// filesystem of whatever host `isekai-pipe ctl` itself runs on (always the
+/// remote SSH host in this project's architecture — see `crate::ctl_file`'s
+/// module docs) and never touches the ctl-socket-forward channel (or its
+/// orphan-socket sweep, below) at all, unlike every other `ctl` subcommand.
+/// So it's peeled off before sweep/`--sock`/`$ISEKAI_CTL_SOCK` resolution,
+/// none of which apply to it.
 #[cfg(unix)]
 pub(crate) async fn ctl_command(args: impl Iterator<Item = String>) -> ExitCode {
     ctl_command_with_sweep_dir(args, Path::new("/tmp")).await
@@ -225,7 +332,13 @@ pub(crate) async fn ctl_command(args: impl Iterator<Item = String>) -> ExitCode 
 /// concurrently with other agents/processes that may legitimately hold their
 /// own `/tmp/isekai-pipe-ctl-*.sock` files on this machine).
 #[cfg(unix)]
-async fn ctl_command_with_sweep_dir(args: impl Iterator<Item = String>, sweep_dir: &Path) -> ExitCode {
+async fn ctl_command_with_sweep_dir(mut args: impl Iterator<Item = String>, sweep_dir: &Path) -> ExitCode {
+    let first = args.next();
+    if first.as_deref() == Some("file") {
+        return crate::ctl_file::file_command(args).await;
+    }
+    let args = first.into_iter().chain(args);
+
     let launch = match parse_ctl(args) {
         Ok(Some(launch)) => launch,
         Ok(None) => return ExitCode::SUCCESS,
@@ -237,7 +350,11 @@ async fn ctl_command_with_sweep_dir(args: impl Iterator<Item = String>, sweep_di
     // socket rather than only on error/retry paths.
     sweep_stale_ctl_sockets_in(sweep_dir);
     let sock = match &launch {
-        CtlLaunch::Title { sock, .. } | CtlLaunch::ClipPush { sock, .. } | CtlLaunch::ClipPull { sock } => {
+        CtlLaunch::Title { sock, .. }
+        | CtlLaunch::ClipPush { sock, .. }
+        | CtlLaunch::ClipPull { sock }
+        | CtlLaunch::SetVar { sock, .. }
+        | CtlLaunch::GetVar { sock, .. } => {
             sock.clone()
         }
     };
@@ -263,9 +380,17 @@ async fn ctl_command_with_sweep_dir(args: impl Iterator<Item = String>, sweep_di
 /// forwarded in via `$ISEKAI_CTL_SOCK` — has no Windows backend as of this
 /// writing. Same "opportunistic, silent fallback" policy as
 /// `isekai-ssh::ctl_forward` (`CLAUDE.md`): log once, fail this one
-/// invocation, don't panic or refuse to build.
+/// invocation, don't panic or refuse to build. `file` (task #16) never
+/// touches this socket at all, so it's peeled off and dispatched cross-
+/// platform before any of the unix-only fallback logic below applies.
 #[cfg(not(unix))]
-pub(crate) async fn ctl_command(args: impl Iterator<Item = String>) -> ExitCode {
+pub(crate) async fn ctl_command(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let first = args.next();
+    if first.as_deref() == Some("file") {
+        return crate::ctl_file::file_command(args).await;
+    }
+    let args = first.into_iter().chain(args);
+
     let launch = match parse_ctl(args) {
         Ok(Some(launch)) => launch,
         Ok(None) => return ExitCode::SUCCESS,
@@ -275,7 +400,11 @@ pub(crate) async fn ctl_command(args: impl Iterator<Item = String>) -> ExitCode 
     // sees the same usage error on every platform — only the final "connect
     // to it" step is unix-only.
     let sock = match &launch {
-        CtlLaunch::Title { sock, .. } | CtlLaunch::ClipPush { sock, .. } | CtlLaunch::ClipPull { sock } => {
+        CtlLaunch::Title { sock, .. }
+        | CtlLaunch::ClipPush { sock, .. }
+        | CtlLaunch::ClipPull { sock }
+        | CtlLaunch::SetVar { sock, .. }
+        | CtlLaunch::GetVar { sock, .. } => {
             sock.clone()
         }
     };
@@ -314,6 +443,28 @@ async fn run_ctl(sock_path: &Path, launch: CtlLaunch) -> Result<()> {
                     Ok(())
                 }
                 other => bail!("isekai-pipe ctl clip pull: unexpected response {other:?}"),
+            }
+        }
+        CtlLaunch::SetVar { scope, key, value, .. } => {
+            send_ctl_message(sock_path, CtlMessage::SetVar { scope, key, value }).await
+        }
+        CtlLaunch::GetVar { scope, key, .. } => {
+            let response =
+                send_ctl_message_and_read_response(sock_path, CtlMessage::GetVarRequest { scope, key }).await?;
+            match response {
+                CtlMessage::GetVarResponse { value: Some(value) } => {
+                    tokio::io::stdout()
+                        .write_all(value.as_bytes())
+                        .await
+                        .context("isekai-pipe ctl getvar: failed to write stdout")?;
+                    Ok(())
+                }
+                // Distinct from a comms failure: the peer answered, the key is
+                // simply unset. Surfaced as a (non-panicking) error so the exit
+                // code is non-zero and scripts can distinguish "unset" from
+                // "printed an empty string" without parsing stderr.
+                CtlMessage::GetVarResponse { value: None } => bail!("isekai-pipe ctl getvar: key not set"),
+                other => bail!("isekai-pipe ctl getvar: unexpected response {other:?}"),
             }
         }
     }
@@ -455,6 +606,71 @@ mod tests {
     #[test]
     fn rejects_unknown_subcommand() {
         let err = parse_ctl(args(&["frobnicate"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn parses_setvar_with_default_scope() {
+        let launch = parse_ctl(args(&["setvar", "last_build_status", "ok"])).unwrap().unwrap();
+        assert_eq!(
+            launch,
+            CtlLaunch::SetVar {
+                sock: None,
+                scope: VarScope::Tab,
+                key: "last_build_status".to_string(),
+                value: "ok".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_setvar_with_explicit_scope_and_sock() {
+        let launch = parse_ctl(args(&[
+            "setvar", "--scope", "global", "--sock", "/tmp/a.sock", "k", "v",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            launch,
+            CtlLaunch::SetVar {
+                sock: Some("/tmp/a.sock".to_string()),
+                scope: VarScope::Global,
+                key: "k".to_string(),
+                value: "v".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_setvar_without_value() {
+        let err = parse_ctl(args(&["setvar", "key-only"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn rejects_setvar_with_unknown_scope() {
+        let err = parse_ctl(args(&["setvar", "--scope", "bogus", "k", "v"])).unwrap_err();
+        assert_eq!(err, ExitCode::from(EX_USAGE));
+    }
+
+    #[test]
+    fn parses_getvar_with_default_scope() {
+        let launch = parse_ctl(args(&["getvar", "last_build_status"])).unwrap().unwrap();
+        assert_eq!(
+            launch,
+            CtlLaunch::GetVar { sock: None, scope: VarScope::Tab, key: "last_build_status".to_string() }
+        );
+    }
+
+    #[test]
+    fn parses_getvar_with_session_scope() {
+        let launch = parse_ctl(args(&["getvar", "--scope", "session", "k"])).unwrap().unwrap();
+        assert_eq!(launch, CtlLaunch::GetVar { sock: None, scope: VarScope::Session, key: "k".to_string() });
+    }
+
+    #[test]
+    fn rejects_getvar_without_key() {
+        let err = parse_ctl(args(&["getvar"])).unwrap_err();
         assert_eq!(err, ExitCode::from(EX_USAGE));
     }
 
@@ -650,5 +866,142 @@ mod tests {
 
         assert_eq!(code, ExitCode::from(EX_UNAVAILABLE));
         assert!(!abandoned.exists(), "ctl_command should have swept the abandoned socket before connecting");
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_ctl_message_delivers_setvar() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("ctl.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let server = tokio::spawn({
+            let sock_path = sock_path.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut preamble = String::new();
+                reader.read_line(&mut preamble).await.unwrap();
+                assert_eq!(preamble.trim_end(), sock_path.to_string_lossy());
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let msg = decode_ctl_message(line.trim_end().as_bytes()).unwrap();
+                assert_eq!(
+                    msg,
+                    CtlMessage::SetVar {
+                        scope: VarScope::Global,
+                        key: "last_build_status".to_string(),
+                        value: "ok".to_string(),
+                    }
+                );
+            }
+        });
+
+        send_ctl_message(
+            &sock_path,
+            CtlMessage::SetVar {
+                scope: VarScope::Global,
+                key: "last_build_status".to_string(),
+                value: "ok".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_ctl_message_and_read_response_round_trips_getvar() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("ctl.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let server = tokio::spawn({
+            let sock_path = sock_path.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let mut preamble = String::new();
+                reader.read_line(&mut preamble).await.unwrap();
+                assert_eq!(preamble.trim_end(), sock_path.to_string_lossy());
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let msg = decode_ctl_message(line.trim_end().as_bytes()).unwrap();
+                assert_eq!(msg, CtlMessage::GetVarRequest { scope: VarScope::Tab, key: "k".to_string() });
+
+                let response = CtlMessage::GetVarResponse { value: Some("v".to_string()) };
+                let mut out = serde_json::to_vec(&response).unwrap();
+                out.push(b'\n');
+                write_half.write_all(&out).await.unwrap();
+            }
+        });
+
+        let response = send_ctl_message_and_read_response(
+            &sock_path,
+            CtlMessage::GetVarRequest { scope: VarScope::Tab, key: "k".to_string() },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, CtlMessage::GetVarResponse { value: Some("v".to_string()) });
+        server.await.unwrap();
+    }
+
+    /// End-to-end through `run_ctl` itself (not just the lower-level
+    /// `send_ctl_message*` helpers above): exercises `CtlLaunch::GetVar` →
+    /// stdout for both the "value present" and "key unset" cases, matching
+    /// `isekai-pipe ctl getvar`'s actual documented contract (value on
+    /// stdout with no trailing newline; non-zero exit and nothing printed
+    /// when unset).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_ctl_getvar_writes_the_value_to_stdout_with_no_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("ctl.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut preamble = String::new();
+            reader.read_line(&mut preamble).await.unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let response = CtlMessage::GetVarResponse { value: Some("build-42".to_string()) };
+            let mut out = serde_json::to_vec(&response).unwrap();
+            out.push(b'\n');
+            write_half.write_all(&out).await.unwrap();
+        });
+
+        let launch = CtlLaunch::GetVar { sock: None, scope: VarScope::Tab, key: "last_build_status".to_string() };
+        run_ctl(&sock_path, launch).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_ctl_getvar_errors_when_the_key_is_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("ctl.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut preamble = String::new();
+            reader.read_line(&mut preamble).await.unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let response = CtlMessage::GetVarResponse { value: None };
+            let mut out = serde_json::to_vec(&response).unwrap();
+            out.push(b'\n');
+            write_half.write_all(&out).await.unwrap();
+        });
+
+        let launch = CtlLaunch::GetVar { sock: None, scope: VarScope::Tab, key: "unset-key".to_string() };
+        let err = run_ctl(&sock_path, launch).await.unwrap_err();
+        assert!(format!("{err:#}").contains("key not set"));
+        server.await.unwrap();
     }
 }
