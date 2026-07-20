@@ -145,33 +145,6 @@ fn parse_serve(args: impl Iterator<Item = String>) -> Result<Option<ServeLaunch>
     }))
 }
 
-/// The `-R` remote path convention `isekai-ssh`'s `ctl_forward.rs` uses
-/// (`/tmp/isekai-pipe-ctl-<128bit hex>.sock`, opt-in `#@isekai ctl-socket
-/// yes`, `ISEKAI_PIPE_DESIGN.md` §8 Epic M). `sshd` owns cleaning up the
-/// actual streamlocal forward bind on a normal disconnect; this sweep only
-/// catches what's left behind by abnormal exits (crash, `kill -9`, a
-/// network drop that skipped `ssh -O cancel -R`).
-const CTL_SOCKET_REMOTE_PREFIX: &str = "isekai-pipe-ctl-";
-const CTL_SOCKET_STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Best-effort, non-fatal: a sweep failure (e.g. `/tmp` unreadable for
-/// some reason) should never block `serve` from starting.
-fn sweep_stale_ctl_sockets_on_remote() {
-    match isekai_pipe_core::sweep_stale_sockets(
-        std::path::Path::new("/tmp"),
-        CTL_SOCKET_REMOTE_PREFIX,
-        CTL_SOCKET_STALE_THRESHOLD,
-    ) {
-        Ok(removed) if !removed.is_empty() => {
-            log::info!("isekai-pipe serve: swept {} stale ctl-socket file(s) under /tmp", removed.len());
-        }
-        Ok(_) => {}
-        Err(e) => {
-            log::warn!("isekai-pipe serve: failed to sweep stale ctl-socket files under /tmp: {e}");
-        }
-    }
-}
-
 async fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
     let launch = match parse_serve(args) {
         Ok(Some(launch)) => launch,
@@ -179,7 +152,11 @@ async fn serve_command(args: impl Iterator<Item = String>) -> ExitCode {
         Err(code) => return code,
     };
 
-    sweep_stale_ctl_sockets_on_remote();
+    // `ctl::sweep_stale_ctl_sockets_on_remote` is also called from `isekai-pipe
+    // ctl` itself (see that module's doc comment) so plain-ssh sessions — which
+    // never start this `serve` process on the remote host — still get their
+    // orphaned `/tmp/isekai-pipe-ctl-*.sock` files swept eventually.
+    ctl::sweep_stale_ctl_sockets_on_remote();
 
     let mut helper_args = launch.helper_args;
     helper_args.push("--service-name".to_string());
