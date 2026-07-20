@@ -76,7 +76,16 @@ pub(crate) enum RequestTty {
 pub(crate) struct WrapperPlan {
     openssh_path: PathBuf,
     pipe_path: PathBuf,
+    /// The raw `ssh(1)`-style destination token (e.g. `cuzic@vpsmart`).
     destination: String,
+    /// The host part of the destination, with `user@` stripped (e.g. `vpsmart`).
+    /// Used for config resolution (`Host` block matching) and host key
+    /// verification, which don't understand `user@host` syntax.
+    destination_host: String,
+    /// The user part of the destination, if present (e.g. `Some("cuzic")` from
+    /// `cuzic@vpsmart`). Takes precedence over `ssh_config`'s `User` and the
+    /// local username — matching `ssh(1)`'s own precedence.
+    destination_user: Option<String>,
     destination_index: usize,
     ssh_args: Vec<String>,
     isekai: WrapperIsekaiOptions,
@@ -97,6 +106,17 @@ impl WrapperPlan {
     /// only other direct read of `WrapperPlan` besides `pipe_path()`.
     pub(crate) fn destination(&self) -> &str {
         &self.destination
+    }
+
+    /// The host part of the destination with `user@` stripped. Used for
+    /// config resolution and host key verification.
+    pub(crate) fn destination_host(&self) -> &str {
+        &self.destination_host
+    }
+
+    /// The user part of the `user@host` destination, if any.
+    pub(crate) fn destination_user(&self) -> Option<&str> {
+        self.destination_user.as_deref()
     }
 
     /// `--isekai-log-file <PATH>` (`log_file.rs`), if given. The native
@@ -317,11 +337,7 @@ impl WrapperResolution {
     /// `default_target` uses (destination literal, port 22) — the native
     /// path's SSH TCP target and `HostKeyVerifier` trust-store key.
     pub(crate) fn native_host_port(&self, destination: &str) -> (String, u16) {
-        let raw_host = self.openssh.hostname.clone().unwrap_or_else(|| destination.to_string());
-        // Strip user@ prefix if present — the destination may be `user@host`
-        // and the OpenSSH config resolution may preserve the user part in the
-        // hostname (openssh-config does not split user@host automatically).
-        let host = raw_host.split('@').last().unwrap_or(&raw_host).to_string();
+        let host = self.openssh.hostname.clone().unwrap_or_else(|| destination.to_string());
         let port = self.openssh.port.unwrap_or(22);
         (host, port)
     }
@@ -1203,11 +1219,14 @@ pub(crate) fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
         .ok_or_else(|| anyhow!("isekai-ssh: destination is required"))?;
     let destination = ssh_args[destination_index].clone();
     let request_tty = extract_request_tty(&ssh_args, destination_index);
+    let (destination_user, destination_host) = split_user_host(&destination);
 
     Ok(WrapperPlan {
         openssh_path,
         pipe_path,
         destination,
+        destination_host,
+        destination_user,
         destination_index,
         ssh_args,
         isekai,
@@ -1238,9 +1257,40 @@ pub(crate) fn extract_request_tty(ssh_args: &[String], destination_index: usize)
     tty
 }
 
+/// Splits `user@host` into `(Some(user), host)`. If no `@` is present,
+/// returns `(None, host)`.
+pub(crate) fn split_user_host(destination: &str) -> (Option<String>, String) {
+    match destination.rsplit_once('@') {
+        Some((user, host)) if !user.is_empty() && !host.is_empty() => {
+            (Some(user.to_string()), host.to_string())
+        }
+        _ => (None, destination.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod extract_request_tty_tests {
     use super::*;
+
+    #[test]
+    fn split_user_host_with_user() {
+        assert_eq!(split_user_host("cuzic@vpsmart"), (Some("cuzic".to_string()), "vpsmart".to_string()));
+    }
+
+    #[test]
+    fn split_user_host_without_user() {
+        assert_eq!(split_user_host("vpsmart"), (None, "vpsmart".to_string()));
+    }
+
+    #[test]
+    fn split_user_host_empty_user() {
+        assert_eq!(split_user_host("@vpsmart"), (None, "@vpsmart".to_string()));
+    }
+
+    #[test]
+    fn split_user_host_empty_host() {
+        assert_eq!(split_user_host("cuzic@"), (None, "cuzic@".to_string()));
+    }
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -1309,14 +1359,11 @@ async fn resolve_wrapper(plan: &WrapperPlan) -> Result<WrapperResolution> {
 /// itself from the same config file).
 pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolution, openssh_config::HostConfig)> {
     let explicit_f = dash_f_config_path(&plan.ssh_args);
-    // openssh-config does not parse user@host syntax — strip the user@ part
-    // so that `cuzic@vpsmart` matches `Host vpsmart`.
-    let dest_for_config = plan.destination.split('@').last().unwrap_or(&plan.destination);
-    log_line!("isekai-ssh: dash_f={:?}, destination={:?}, dest_for_config={:?}", explicit_f, plan.destination, dest_for_config);
+    log_line!("isekai-ssh: dash_f={:?}, destination={:?}, dest_host={:?}, dest_user={:?}", explicit_f, plan.destination, plan.destination_host, plan.destination_user);
     let host_config = match explicit_f {
         Some(config_path) => {
             log_line!("isekai-ssh: resolving config from {}", config_path.display());
-            openssh_config::resolve(&config_path, dest_for_config).map_err(|e| {
+            openssh_config::resolve(&config_path, &plan.destination_host).map_err(|e| {
                 anyhow!(
                     "isekai-ssh: failed to resolve {:?} from {}: {e}",
                     plan.destination,
@@ -1325,8 +1372,8 @@ pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolutio
             })
         }
         None => {
-            log_line!("isekai-ssh: resolving config from ~/.ssh/config for {:?}", dest_for_config);
-            openssh_config::resolve_default(dest_for_config).map_err(|e| {
+            log_line!("isekai-ssh: resolving config from ~/.ssh/config for {:?}", plan.destination_host);
+            openssh_config::resolve_default(&plan.destination_host).map_err(|e| {
                 anyhow!(
                     "isekai-ssh: failed to resolve {:?} from ~/.ssh/config: {e}",
                     plan.destination
@@ -1950,6 +1997,8 @@ mod tests {
             openssh_path: PathBuf::from("/usr/bin/ssh"),
             pipe_path: PathBuf::from("/usr/bin/isekai-pipe"),
             destination: "production".to_string(),
+            destination_host: "production".to_string(),
+            destination_user: None,
             destination_index: 0,
             ssh_args: Vec::new(),
             isekai: WrapperIsekaiOptions::default(),
@@ -2010,6 +2059,8 @@ mod tests {
             openssh_path: PathBuf::from("/usr/bin/ssh"),
             pipe_path: PathBuf::from("/usr/bin/isekai-pipe"),
             destination: "production".to_string(),
+            destination_host: "production".to_string(),
+            destination_user: None,
             destination_index: 0,
             ssh_args: Vec::new(),
             isekai: WrapperIsekaiOptions::default(),

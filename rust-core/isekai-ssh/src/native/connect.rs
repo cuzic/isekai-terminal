@@ -440,11 +440,13 @@ async fn run_authenticated_session(
     owner_hook: &mut Option<OwnerHook>,
     silent: bool,
 ) -> Result<u8> {
-    let (host, port) = resolution.native_host_port(plan.destination());
+    let (host, port) = resolution.native_host_port(plan.destination_host());
     let host_port = format!("{host}:{port}");
-    let username = host_config
-        .user
-        .clone()
+    // Username precedence: destination user@ part > ssh_config User > local username
+    let username = plan
+        .destination_user()
+        .map(String::from)
+        .or_else(|| host_config.user.clone())
         .or_else(local_username)
         .ok_or_else(|| anyhow!("isekai-ssh: no username configured (ssh_config User, $USER, %USERNAME%) for {host_port}"))?;
 
