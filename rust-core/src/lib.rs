@@ -5,6 +5,7 @@ pub mod quic_transport;
 pub(crate) mod agent_forward;
 pub(crate) mod terminal;
 pub(crate) mod sixel;
+pub(crate) mod kitty_graphics;
 pub(crate) mod theme;
 pub(crate) mod transport;
 pub(crate) mod pool;
