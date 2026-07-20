@@ -839,6 +839,10 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_reattach_grace_window_secs(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_func_reattach_record_is_fresh(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_drain_events(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_push(
@@ -1142,6 +1146,10 @@ external fun uniffi_isekai_terminal_core_fn_func_debug_set_udp_fault_loss_permil
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_func_create_session_orchestrator(`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
+external fun uniffi_isekai_terminal_core_fn_func_reattach_grace_window_secs(uniffi_out_err: UniffiRustCallStatus, 
+): Long
+external fun uniffi_isekai_terminal_core_fn_func_reattach_record_is_fresh(`savedAtUnixSecs`: Long,`nowUnixSecs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 external fun ffi_isekai_terminal_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun ffi_isekai_terminal_core_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1310,6 +1318,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator() != 38625) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_reattach_grace_window_secs() != 34671) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_func_reattach_record_is_fresh() != 47307) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_drain_events() != 5861) {
@@ -8959,6 +8973,39 @@ public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuf
     UniffiLib.uniffi_isekai_terminal_core_fn_func_create_session_orchestrator(
     
         FfiConverterTypeOrchestratorCallback.lower(`callback`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * [`AUTO_REATTACH_GRACE_SECS`]をUniFFI経由でKotlin/Swift側に公開する。値そのものを
+         * Kotlin側にハードコードで複製させないための単純なgetter。
+         */ fun `reattachGraceWindowSecs`(): kotlin.ULong {
+            return FfiConverterULong.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_reattach_grace_window_secs(
+    
+        _status)
+}
+    )
+    }
+    
+
+        /**
+         * 永続化された「直近アクティブだったセッション」記録が、黙示的な自動再接続を
+         * 試みるにあたってまだ新鮮かどうかを判定する。`saved_at_unix_secs`は記録時刻、
+         * `now_unix_secs`は判定時刻(いずれもUnix epoch秒)。
+         *
+         * `now_unix_secs`が`saved_at_unix_secs`より前(端末の時計調整等で稀に起こりうる)の
+         * 場合は`saturating_sub`により経過時間0として扱い、freshと判定する——「保存した
+         * 直後なのに古いと誤判定される」という直感に反する挙動を避けるための意図的な選択。
+         */ fun `reattachRecordIsFresh`(`savedAtUnixSecs`: kotlin.ULong, `nowUnixSecs`: kotlin.ULong): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_func_reattach_record_is_fresh(
+    
+        FfiConverterULong.lower(`savedAtUnixSecs`),FfiConverterULong.lower(`nowUnixSecs`),_status)
 }
     )
     }
