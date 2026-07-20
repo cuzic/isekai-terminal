@@ -86,6 +86,17 @@ enum class SplitDirection { HORIZONTAL, VERTICAL }
 data class PaneAddress(val tabId: String, val paneId: String)
 
 /**
+ * タスク#14: 永続化された[ReattachRecord]が黙示的な自動再接続を試みるにあたってまだ新鮮か
+ * どうかを判定するポリシー。本番実装は`reattach_persistence.rs`の`reattach_record_is_fresh`
+ * (Rust側、rust-ssot準拠のポリシー判断)へそのまま委譲するだけの薄いラッパーであり、この
+ * インターフェース自体はテストがネイティブ呼び出し無しに差し替えるためだけに存在する
+ * ([TerminalTabsViewModel]のコンストラクタdoc参照)。
+ */
+fun interface ReattachFreshnessPolicy {
+    fun isFresh(savedAtUnixSecs: Long, nowUnixSecs: Long): Boolean
+}
+
+/**
  * 1ペイン分の状態。画面分割(split pane)機能により、1タブの中に複数ペイン(まずは最大2つ)を
  * 持てるようにするための単位。各ペインは完全に独立した [TerminalSession](ひいては独立した
  * Rust側接続)を持つ(同一セッションを複数ペインで共有する設計はスコープ外、
@@ -151,6 +162,15 @@ class TerminalTabsViewModel(
     // 設計判断は[ReattachStateStore]のdoc参照)。テストは専用の一時ファイルを指す
     // インスタンスを注入できる。
     private val reattachStore: ReattachStateStore = ReattachStateStore(File(app.filesDir, REATTACH_STATE_FILE_NAME)),
+    // タスク#14: 「新鮮さ」の判定(既定はRust側`reattach_record_is_fresh`への委譲、
+    // rust-ssot準拠)。JVM単体テスト(Robolectric)はAndroid NDK向けにビルドされたネイティブ
+    // ライブラリをロードできない(UnsatisfiedLinkError)ため、UniFFI free functionを
+    // 直接呼ぶ本番実装をテストから差し替え可能にしておく必要がある——`FakeOrchestrator`が
+    // `SessionOrchestratorInterface`を経由して同じ問題を解決しているのと同じ構成
+    // (`FakeSshGateway.kt`のdocコメント「実Rust側のConnPhaseを模した最小限の状態」参照)。
+    private val reattachFreshnessPolicy: ReattachFreshnessPolicy = ReattachFreshnessPolicy { savedAtUnixSecs, nowUnixSecs ->
+        reattachRecordIsFresh(savedAtUnixSecs.toULong(), nowUnixSecs.toULong())
+    },
 ) : AndroidViewModel(app) {
 
     /** 本番用コンストラクタ。Compose の viewModel() から呼ばれる。
@@ -388,9 +408,9 @@ class TerminalTabsViewModel(
             // 復元後は全レコードを新しいタブIDで作り直す([openTab]が[persistReattachRecord]
             // 経由で新しいレコードを書き戻す)ため、古いレコードは先にまとめて捨てる。
             reattachStore.clear()
-            val nowUnixSecs = (System.currentTimeMillis() / 1000L).toULong()
+            val nowUnixSecs = System.currentTimeMillis() / 1000L
             for (record in records) {
-                if (!reattachRecordIsFresh(record.savedAtUnixSecs.toULong(), nowUnixSecs)) {
+                if (!reattachFreshnessPolicy.isFresh(record.savedAtUnixSecs, nowUnixSecs)) {
                     RemoteLogger.i(
                         "IsekaiTerminalReattach",
                         "discarding stale reattach record for '${record.label}' " +

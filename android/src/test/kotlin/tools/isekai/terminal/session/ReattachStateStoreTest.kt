@@ -1,6 +1,7 @@
 package tools.isekai.terminal.session
 
 import java.io.File
+import kotlin.io.path.createTempDirectory
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.*
@@ -24,7 +25,7 @@ class ReattachStateStoreTest {
 
     @Before
     fun setup() {
-        dir = createTempDir(prefix = "reattach-state-test")
+        dir = createTempDirectory(prefix = "reattach-state-test").toFile()
         file = File(dir, "reattach_state.json")
         store = ReattachStateStore(file)
     }

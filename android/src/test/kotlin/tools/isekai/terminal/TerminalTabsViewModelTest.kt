@@ -32,7 +32,6 @@ import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.TransportPreference
-import uniffi.isekai_terminal_core.reattachGraceWindowSecs
 
 /**
  * 複数タブ (複数 SSH セッション) を横断する [TerminalTabsViewModel] のテスト。
@@ -103,15 +102,30 @@ class TerminalTabsViewModelTest {
     /** [vm]とは別の、[reattachStore]を注入した[TerminalTabsViewModel]をもう1つ生成する
      *  (タスク#14: プロセス再起動直後の黙示的復元を検証するため、`init{}`実行前に
      *  ストアへレコードを仕込んでおく必要があり、`setup()`で既に構築済みの[vm]は使えない)。
-     *  生成される[FakeOrchestrator]は引き続き共有の[orchestrators]リストへ追記される。 */
-    private fun newViewModel(reattachStore: ReattachStateStore): TerminalTabsViewModel {
+     *  生成される[FakeOrchestrator]は引き続き共有の[orchestrators]リストへ追記される。
+     *
+     *  [freshnessPolicy]は既定で常に新鮮(true)を返す偽実装を注入する。本番の既定値
+     *  ([TerminalTabsViewModel]のコンストラクタ引数)はRust側`reattachRecordIsFresh`を
+     *  直接呼ぶが、これはUniFFI経由のネイティブ呼び出しでありJVM単体テスト(Robolectric)
+     *  ではロードできず`UnsatisfiedLinkError`になる(Android NDK向けにビルドされた
+     *  ライブラリはホストJVMでdlopenできない)。実際の猶予期間の境界値は
+     *  `rust-core/src/reattach_persistence.rs`のRustユニットテストで別途検証済みなので、
+     *  ここではKotlin側の配線(freshと判定されたら復元・staleなら復元しない)だけを
+     *  確認すればよい([FakeOrchestrator]が実Rust側の判断ロジックの一部をKotlinで
+     *  再現するのと同じ考え方、`FakeSshGateway.kt`参照)。 */
+    private fun newViewModel(
+        reattachStore: ReattachStateStore,
+        freshnessPolicy: ReattachFreshnessPolicy = ReattachFreshnessPolicy { _, _ -> true },
+    ): TerminalTabsViewModel {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource) -> TerminalSession = { _, _ ->
             val fake = FakeOrchestrator()
             orchestrators.add(fake)
             TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
         }
-        return TerminalTabsViewModel(app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler), reattachStore)
+        return TerminalTabsViewModel(
+            app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler), reattachStore, freshnessPolicy,
+        )
     }
 
     private suspend fun awaitConnectCalled(o: FakeOrchestrator) =
@@ -873,14 +887,14 @@ class TerminalTabsViewModelTest {
     fun staleReattachRecord_isNotRestored() = runBlocking {
         val store = tempReattachStore()
         val saved = Repositories.profiles.save(keyProfile("too-old"))
-        // 猶予期間ぎりぎり超過(境界値は`reattach_persistence.rs`のRustユニットテストで
-        // 別途検証済みなので、ここではKotlin側の配線だけを確認する)。
-        val staleSavedAt = System.currentTimeMillis() / 1000L - reattachGraceWindowSecs().toLong() - 60L
         store.upsert(
-            ReattachRecord(tabId = "old-tab", profileId = saved, label = "too-old", reattachToken = "tok", savedAtUnixSecs = staleSavedAt),
+            ReattachRecord(tabId = "old-tab", profileId = saved, label = "too-old", reattachToken = "tok", savedAtUnixSecs = 0L),
         )
 
-        val vm2 = newViewModel(store)
+        // 実際の猶予期間の境界値判定は`reattach_persistence.rs`のRustユニットテストで別途
+        // 検証済み(newViewModelのdoc参照)なので、ここではfreshnessPolicyがstale(false)を
+        // 返した場合にKotlin側が正しく復元をスキップすることだけを確認する。
+        val vm2 = newViewModel(store, freshnessPolicy = ReattachFreshnessPolicy { _, _ -> false })
 
         // 復元処理自体は必ず一度走り、古いレコードもまとめて掃除するためstoreをclearする
         // ([TerminalTabsViewModel.restorePersistedReattachTabs]参照)。それが完了するまで
