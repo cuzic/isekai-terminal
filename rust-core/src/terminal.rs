@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use vte::Perform;
 use crate::sixel::{SixelDecoder, SixelImage};
+use crate::kitty_graphics::{KittyCommand, KittyGraphics};
 use crate::theme::Theme;
 use crate::{CursorShape, ImagePlacement, MouseButton, MouseEventKind, MouseReportingMode, TerminalKeyModifiers};
 
@@ -494,6 +495,14 @@ pub(crate) struct Terminal {
     /// 同じ理由で、過去に呼び出し側へ渡したidを再利用すると別画像との衝突が
     /// 起こりうるため単調増加を保つ。
     next_image_id: u64,
+    /// Kitty graphics protocol(#53)のAPCデコード状態(チャンク分割転送の途中組み立て
+    /// を保持する)。実際のAPC切り出しは`session_state.rs`の`ApcInterceptor`が行い、
+    /// 完成したペイロードを`dispatch_kitty_apc`経由でここへ渡す。
+    kitty: KittyGraphics,
+    /// `images`内のKitty画像について、内部placement id → Kitty client image id(`i=`)の
+    /// 対応表。`a=d`の削除(全削除/id指定)対象を特定するためだけに持つ。sixel画像は
+    /// ここに載らない(=Kittyの全削除がsixelを巻き込まない)。
+    kitty_id_by_placement: HashMap<u64, u64>,
     /// Kitty keyboard protocol(タスク#54、
     /// <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>)の progressive
     /// enhancement flags スタック(main画面用)。各要素はその時点でpushされた
@@ -708,6 +717,8 @@ impl Terminal {
             sixel_decoder: None,
             images: Vec::new(),
             next_image_id: 0,
+            kitty: KittyGraphics::new(),
+            kitty_id_by_placement: HashMap::new(),
             main_kitty_flags_stack: Vec::new(),
             alt_kitty_flags_stack: Vec::new(),
         }
@@ -831,6 +842,7 @@ impl Terminal {
     /// 取り残されるより消える方が安全側という判断)。
     fn clear_images(&mut self) {
         self.images.clear();
+        self.kitty_id_by_placement.clear();
     }
 
     /// 現在ライブな全Sixel画像の`rgba`バイト列の合計サイズ(バイト)。
@@ -844,10 +856,18 @@ impl Terminal {
     /// (`ImagePlacement`のdocコメント「実装範囲」参照——画像による自動スクロールは
     /// 発生させず、画面下端でクリップする)。
     fn place_sixel_image(&mut self, img: SixelImage) {
+        self.push_image(img.width, img.height, img.rgba);
+    }
+
+    /// デコード済みビットマップ(sixel/Kitty共通)をカーソル位置を左上としてグリッドへ
+    /// 配置し、発行したplacement idを返す(タスク#42/#53)。行・列方向とも画面の残り
+    /// サイズへクランプする(`ImagePlacement`のdocコメント「実装範囲」参照——画像による
+    /// 自動スクロールは発生させず、画面下端でクリップする)。
+    fn push_image(&mut self, width: usize, height: usize, rgba: Vec<u8>) -> u64 {
         let col = self.cursor_col.min(self.cols.saturating_sub(1));
         let row = self.cursor_row.min(self.rows.saturating_sub(1));
-        let cols_span = (img.width + SIXEL_CELL_WIDTH_PX - 1) / SIXEL_CELL_WIDTH_PX;
-        let rows_span = (img.height + SIXEL_CELL_HEIGHT_PX - 1) / SIXEL_CELL_HEIGHT_PX;
+        let cols_span = (width + SIXEL_CELL_WIDTH_PX - 1) / SIXEL_CELL_WIDTH_PX;
+        let rows_span = (height + SIXEL_CELL_HEIGHT_PX - 1) / SIXEL_CELL_HEIGHT_PX;
         let cols_span = cols_span.max(1).min(self.cols - col);
         let rows_span = rows_span.max(1).min(self.rows - row);
 
@@ -859,9 +879,9 @@ impl Terminal {
             col: col as u32,
             rows_span: rows_span as u32,
             cols_span: cols_span as u32,
-            width_px: img.width as u32,
-            height_px: img.height as u32,
-            rgba: img.rgba,
+            width_px: width as u32,
+            height_px: height as u32,
+            rgba,
         });
         // 個数(`MAX_LIVE_IMAGES`)と合計バイト数(`MAX_TOTAL_IMAGE_RGBA_BYTES`)の
         // 両方を満たすまで、最も古い画像から順に捨てる(タスク#90)。新しく
@@ -871,13 +891,46 @@ impl Terminal {
         while self.images.len() > MAX_LIVE_IMAGES
             || self.total_image_rgba_bytes() > MAX_TOTAL_IMAGE_RGBA_BYTES
         {
-            self.images.remove(0);
+            let removed = self.images.remove(0);
+            self.kitty_id_by_placement.remove(&removed.id);
         }
 
         // カーソルは画像の左下(次行の先頭)へ移動する(近似——実端末実装は分かれる
         // が、xterm等広く使われる実装の挙動に合わせる)。
         self.cursor_row = (row + rows_span).min(self.rows.saturating_sub(1));
         self.cursor_col = 0;
+        id
+    }
+
+    /// [crate::kitty_graphics::ApcInterceptor]が切り出した完成APCペイロード1件を処理
+    /// する(#53)。デコード・削除の判断は`KittyGraphics`側で完結しており、ここでは
+    /// その結果(配置/削除)を`images`へ反映するだけ(rust-ssot)。
+    pub(crate) fn dispatch_kitty_apc(&mut self, payload: &[u8]) {
+        match self.kitty.dispatch(payload) {
+            KittyCommand::Place(img) => {
+                let id = self.push_image(img.width, img.height, img.rgba);
+                if let Some(kid) = img.kitty_id {
+                    self.kitty_id_by_placement.insert(id, kid);
+                }
+            }
+            KittyCommand::DeleteAll => {
+                let ids: std::collections::HashSet<u64> =
+                    self.kitty_id_by_placement.keys().copied().collect();
+                self.images.retain(|img| !ids.contains(&img.id));
+                self.kitty_id_by_placement.clear();
+            }
+            KittyCommand::DeleteId(kid) => {
+                let placements: std::collections::HashSet<u64> = self
+                    .kitty_id_by_placement
+                    .iter()
+                    .filter(|(_, v)| **v == kid)
+                    .map(|(k, _)| *k)
+                    .collect();
+                self.images.retain(|img| !placements.contains(&img.id));
+                self.kitty_id_by_placement.retain(|k, _| !placements.contains(k));
+            }
+            KittyCommand::None => {}
+        }
     }
 
     /// HT(0x09)/CHT(`CSI Ps I`、タスク#61)共通: `col`より右にある最も近いタブストップを

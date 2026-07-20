@@ -1,5 +1,6 @@
 use vte::Parser;
 use timed_fsm::{TimedStateMachine, TimerCommand, Response};
+use crate::kitty_graphics::{ApcInterceptor, ApcStep};
 use crate::{CellData, CursorShape, LineDamage, ScreenUpdate};
 use crate::session::to_cell_data;
 use crate::terminal::{Terminal, TermCell};
@@ -60,6 +61,9 @@ fn force_cursor_row_dirty(damages: &mut Vec<LineDamage>, row: usize, col: usize,
 pub(crate) struct SessionState {
     terminal: Terminal,
     parser: Parser,
+    /// Kitty graphics(#53)のAPC文字列を、vteへ渡す前にバイトストリームから切り出す
+    /// 前段。vteはAPCを配送しないため必要(`kitty_graphics.rs`モジュールdoc参照)。
+    apc: ApcInterceptor,
     fsm: TrzszTransferFsm,
     /// 前回発行した`ScreenUpdate`のグリッドセル・寸法・カーソル位置のスナップショット
     /// (タスク#92、行単位のdamage tracking用)。次に`make_screen_update`が呼ばれたとき、
@@ -102,6 +106,7 @@ impl SessionState {
         SessionState {
             terminal: Terminal::new(cols, rows, theme),
             parser: Parser::new(),
+            apc: ApcInterceptor::new(),
             fsm: TrzszTransferFsm::new(),
             last_emitted_cells: None,
             last_emitted_cols: 0,
@@ -359,7 +364,19 @@ impl SessionState {
         for effect in resp.actions {
             match effect {
                 TrzszEffect::FlushVte(bytes) => {
-                    for byte in &bytes { self.parser.advance(&mut self.terminal, *byte); }
+                    // Kitty graphics(#53)のAPCだけを`ApcInterceptor`で抜き取り、それ以外の
+                    // バイトはバイト等価でvteへ渡す(vteはAPCを配送しないため必要)。
+                    for byte in &bytes {
+                        match self.apc.feed(*byte) {
+                            ApcStep::Pass(b) => self.parser.advance(&mut self.terminal, b),
+                            ApcStep::PassTwo(a, b) => {
+                                self.parser.advance(&mut self.terminal, a);
+                                self.parser.advance(&mut self.terminal, b);
+                            }
+                            ApcStep::Consume => {}
+                            ApcStep::Apc(payload) => self.terminal.dispatch_kitty_apc(&payload),
+                        }
+                    }
                     screen_dirty = true;
                 }
                 TrzszEffect::SendStdin(bytes) => {
