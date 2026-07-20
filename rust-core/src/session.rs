@@ -309,6 +309,21 @@ impl SessionCore {
         self.handle_tx.lock().clone()
     }
 
+    /// タスク#17: `TransportCommand::FilePreviewExec`を1本キューイングする。
+    /// `run_ssh_channel_loop`は全トランスポート共通(SSH直結・tsshd QUIC・
+    /// isekai-pipe QUIC系いずれもこのループ経由でSSHチャネルを持つ、
+    /// `transport/ssh_handler.rs`のモジュールdoc参照)なので、`add_local_forward`と
+    /// 違いトランスポートごとの対応可否分岐は不要——`command_sender()`が生きて
+    /// いれば常に対応できる。未接続/切断済みで`command_sender()`が無い場合のみ
+    /// `false`を返す。
+    pub(crate) fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
+        if let Some(tx) = self.command_sender() {
+            tx.try_send(TransportCommand::FilePreviewExec { request_id, command_line }).is_ok()
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn scrollback_len(&self) -> u32 {
         self.scrollback.lock().len() as u32
     }
@@ -714,6 +729,10 @@ fn dispatch_transport_event(
         TransportEvent::NoViablePath => {
             info!("session: no viable path (all paths unhealthy)");
             callback.on_no_viable_path();
+            EventOutcome::Continue(None)
+        }
+        TransportEvent::FilePreviewExecResult { request_id, stdout, exit_status } => {
+            callback.on_file_preview_exec_result(request_id, stdout, exit_status);
             EventOutcome::Continue(None)
         }
     }

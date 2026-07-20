@@ -505,6 +505,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
+    typealias FfiType = Int64
+    typealias SwiftType = Int64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int64, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -1141,6 +1157,19 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func disconnect() 
     
     /**
+     * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
+     * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
+     * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
+     * 一意なID(例: UUID)——複数のディレクトリ一覧/catチャンク要求が同時に
+     * in-flightでも取り違えないようにするため。
+     *
+     * 未接続、またはセッションがこのexecに対応していない(現状は全トランスポートが
+     * 対応しているため実質「未接続」のみ)場合は、待たせず即座に
+     * `FilePreviewOutcome::Error`で応答する。
+     */
+    func filePreviewRequest(requestId: String, kind: FilePreviewRequestKind) 
+    
+    /**
      * #11: ユーザーが「今すぐWiFiに戻す」操作を行った(セルラーにフェイルオーバー中、
      * ダウンロード中などで静けさ待ちを待たずに即座に戻したい場合)。疎通確認だけは
      * 省略されない(`RebindManager::handle_manual_force_return`参照)。マルチパス以外の
@@ -1461,6 +1490,26 @@ open func copyLastCommandOutput()  {try! rustCall() {
 open func disconnect()  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
+     * ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
+     * on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
+     * 一意なID(例: UUID)——複数のディレクトリ一覧/catチャンク要求が同時に
+     * in-flightでも取り違えないようにするため。
+     *
+     * 未接続、またはセッションがこのexecに対応していない(現状は全トランスポートが
+     * 対応しているため実質「未接続」のみ)場合は、待たせず即座に
+     * `FilePreviewOutcome::Error`で応答する。
+     */
+open func filePreviewRequest(requestId: String, kind: FilePreviewRequestKind)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_file_preview_request(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(requestId),
+        FfiConverterTypeFilePreviewRequestKind_lower(kind),$0
     )
 }
 }
@@ -2145,6 +2194,75 @@ public func FfiConverterTypeDiagnosticEventEnvelope_lift(_ buf: RustBuffer) thro
 #endif
 public func FfiConverterTypeDiagnosticEventEnvelope_lower(_ value: DiagnosticEventEnvelope) -> RustBuffer {
     return FfiConverterTypeDiagnosticEventEnvelope.lower(value)
+}
+
+
+/**
+ * ディレクトリエントリ1件(`isekai-pipe ctl file ls`の結果)。
+ */
+public struct FilePreviewEntry: Equatable, Hashable {
+    public var name: String
+    public var isDir: Bool
+    public var isSymlink: Bool
+    public var size: UInt64
+    public var modifiedUnix: Int64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, isDir: Bool, isSymlink: Bool, size: UInt64, modifiedUnix: Int64?) {
+        self.name = name
+        self.isDir = isDir
+        self.isSymlink = isSymlink
+        self.size = size
+        self.modifiedUnix = modifiedUnix
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FilePreviewEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFilePreviewEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FilePreviewEntry {
+        return
+            try FilePreviewEntry(
+                name: FfiConverterString.read(from: &buf), 
+                isDir: FfiConverterBool.read(from: &buf), 
+                isSymlink: FfiConverterBool.read(from: &buf), 
+                size: FfiConverterUInt64.read(from: &buf), 
+                modifiedUnix: FfiConverterOptionInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FilePreviewEntry, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterBool.write(value.isDir, into: &buf)
+        FfiConverterBool.write(value.isSymlink, into: &buf)
+        FfiConverterUInt64.write(value.size, into: &buf)
+        FfiConverterOptionInt64.write(value.modifiedUnix, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewEntry_lift(_ buf: RustBuffer) throws -> FilePreviewEntry {
+    return try FfiConverterTypeFilePreviewEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewEntry_lower(_ value: FilePreviewEntry) -> RustBuffer {
+    return FfiConverterTypeFilePreviewEntry.lower(value)
 }
 
 
@@ -4313,6 +4431,213 @@ public func FfiConverterTypeCursorShape_lower(_ value: CursorShape) -> RustBuffe
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * `file_preview_request`の非同期結果。`OrchestratorCallback::on_file_preview_result`で
+ * 届く。
+ */
+
+public enum FilePreviewOutcome: Equatable, Hashable {
+    
+    case ls(entries: [FilePreviewEntry]
+    )
+    case cat(offset: UInt64, length: UInt64, totalSize: UInt64, eof: Bool, data: Data
+    )
+    case info(name: String, path: String, isDir: Bool, isSymlink: Bool, size: UInt64, modifiedUnix: Int64?, permissionsUnix: UInt32?
+    )
+    /**
+     * I/Oエラー(`ctl_file.rs`の`{"ok":false,"error":...}`)・exec自体の失敗
+     * (未接続・チャネルオープン失敗)・JSONパース失敗のいずれか。呼び出し元は
+     * 種別を区別する必要が無いので単一のバリアントにまとめている。
+     */
+    case error(message: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FilePreviewOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFilePreviewOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = FilePreviewOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FilePreviewOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ls(entries: try FfiConverterSequenceTypeFilePreviewEntry.read(from: &buf)
+        )
+        
+        case 2: return .cat(offset: try FfiConverterUInt64.read(from: &buf), length: try FfiConverterUInt64.read(from: &buf), totalSize: try FfiConverterUInt64.read(from: &buf), eof: try FfiConverterBool.read(from: &buf), data: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 3: return .info(name: try FfiConverterString.read(from: &buf), path: try FfiConverterString.read(from: &buf), isDir: try FfiConverterBool.read(from: &buf), isSymlink: try FfiConverterBool.read(from: &buf), size: try FfiConverterUInt64.read(from: &buf), modifiedUnix: try FfiConverterOptionInt64.read(from: &buf), permissionsUnix: try FfiConverterOptionUInt32.read(from: &buf)
+        )
+        
+        case 4: return .error(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FilePreviewOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .ls(entries):
+            writeInt(&buf, Int32(1))
+            FfiConverterSequenceTypeFilePreviewEntry.write(entries, into: &buf)
+            
+        
+        case let .cat(offset,length,totalSize,eof,data):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt64.write(offset, into: &buf)
+            FfiConverterUInt64.write(length, into: &buf)
+            FfiConverterUInt64.write(totalSize, into: &buf)
+            FfiConverterBool.write(eof, into: &buf)
+            FfiConverterData.write(data, into: &buf)
+            
+        
+        case let .info(name,path,isDir,isSymlink,size,modifiedUnix,permissionsUnix):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(name, into: &buf)
+            FfiConverterString.write(path, into: &buf)
+            FfiConverterBool.write(isDir, into: &buf)
+            FfiConverterBool.write(isSymlink, into: &buf)
+            FfiConverterUInt64.write(size, into: &buf)
+            FfiConverterOptionInt64.write(modifiedUnix, into: &buf)
+            FfiConverterOptionUInt32.write(permissionsUnix, into: &buf)
+            
+        
+        case let .error(message):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewOutcome_lift(_ buf: RustBuffer) throws -> FilePreviewOutcome {
+    return try FfiConverterTypeFilePreviewOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewOutcome_lower(_ value: FilePreviewOutcome) -> RustBuffer {
+    return FfiConverterTypeFilePreviewOutcome.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * `SessionOrchestrator::file_preview_request`への要求種別。`ctl_file.rs`の
+ * `ls`/`cat`/`info`サブコマンドに対応する(`cp`/`rm`はこのタスクのスコープ外
+ * — プレビューは読み取り専用、削除/コピーはtrzsz転送シート等の既存導線に任せる)。
+ */
+
+public enum FilePreviewRequestKind: Equatable, Hashable {
+    
+    case ls(path: String
+    )
+    /**
+     * `length`が`None`なら「ファイル末尾まで(ただし8MiB上限でクランプ)」を要求する。
+     * 大きなファイルはKotlin側が`offset += 返ってきたlength`でページングし続ける
+     * (`ctl_file.rs`のドキュメント通り)。
+     */
+    case cat(path: String, offset: UInt64, length: UInt64?
+    )
+    case info(path: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FilePreviewRequestKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFilePreviewRequestKind: FfiConverterRustBuffer {
+    typealias SwiftType = FilePreviewRequestKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FilePreviewRequestKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ls(path: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .cat(path: try FfiConverterString.read(from: &buf), offset: try FfiConverterUInt64.read(from: &buf), length: try FfiConverterOptionUInt64.read(from: &buf)
+        )
+        
+        case 3: return .info(path: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FilePreviewRequestKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .ls(path):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(path, into: &buf)
+            
+        
+        case let .cat(path,offset,length):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(path, into: &buf)
+            FfiConverterUInt64.write(offset, into: &buf)
+            FfiConverterOptionUInt64.write(length, into: &buf)
+            
+        
+        case let .info(path):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(path, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewRequestKind_lift(_ buf: RustBuffer) throws -> FilePreviewRequestKind {
+    return try FfiConverterTypeFilePreviewRequestKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePreviewRequestKind_lower(_ value: FilePreviewRequestKind) -> RustBuffer {
+    return FfiConverterTypeFilePreviewRequestKind.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * ポートフォワード待受の状態。`OrchestratorCallback::on_forward_state_changed` で通知される。
  */
 
@@ -5978,6 +6303,13 @@ public protocol OrchestratorCallback: AnyObject, Sendable {
      */
     func onPromptOutputCopyReady(text: String?) 
     
+    /**
+     * タスク#17(ファイルプレビュー機能): `file_preview_request`で発行した`request_id`の
+     * 結果。`ctl_file.rs`のJSON出力は既にここへ届く前に`FilePreviewOutcome`へ
+     * パース済み(`rust-ssot.md`: JSONパース/base64デコードはRust側で完結させる)。
+     */
+    func onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) 
+    
 }
 
 
@@ -6386,6 +6718,32 @@ fileprivate struct UniffiCallbackInterfaceOrchestratorCallback {
                 makeCall: makeCall,
                 writeReturn: writeReturn
             )
+        },
+        onFilePreviewResult: { (
+            uniffiHandle: UInt64,
+            requestId: RustBuffer,
+            outcome: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onFilePreviewResult(
+                     requestId: try FfiConverterString.lift(requestId),
+                     outcome: try FfiConverterTypeFilePreviewOutcome_lift(outcome)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
         }
     )
 
@@ -6581,6 +6939,30 @@ fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -6946,6 +7328,31 @@ fileprivate struct FfiConverterSequenceTypeDiagnosticEventEnvelope: FfiConverter
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeDiagnosticEventEnvelope.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFilePreviewEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [FilePreviewEntry]
+
+    public static func write(_ value: [FilePreviewEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFilePreviewEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FilePreviewEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FilePreviewEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFilePreviewEntry.read(from: &buf))
         }
         return seq
     }
@@ -7524,6 +7931,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_file_preview_request() != 44983) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi() != 8683) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7657,6 +8067,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready() != 14453) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_file_preview_result() != 44801) {
         return InitializationResult.apiChecksumMismatch
     }
 

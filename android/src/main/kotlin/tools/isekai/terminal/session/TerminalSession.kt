@@ -24,9 +24,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import uniffi.isekai_terminal_core.*
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * SSH セッションのドメインオブジェクト。
@@ -78,6 +81,12 @@ class TerminalSession(
         // Rust 側（agent_forward.rs の SIGN_CONFIRM_TIMEOUT）の 30 秒より短くして、
         // 先に Kotlin 側が拒否応答を確定できるようにする。
         private const val AGENT_SIGN_CONFIRM_TIMEOUT_MS = 25_000L
+
+        // タスク#17: ファイルプレビュー要求のタイムアウト。`isekai-pipe ctl file`は
+        // execチャネル1本の単純な往復に過ぎないため、trzsz転送のような長時間ブロックは
+        // 想定しない(大きなファイルは`--length`でチャンク化される)が、接続が死んでいる
+        // 状態で呼ばれた場合でも呼び出し元をいつまでもsuspendさせないための保険。
+        private const val FILE_PREVIEW_TIMEOUT_MS = 20_000L
     }
 
     private val _state = MutableStateFlow(TerminalUiState())
@@ -130,6 +139,17 @@ class TerminalSession(
     // ここで CompletableDeferred + runBlocking を使い、UI（respondAgentSignRequest 経由）から
     // 応答が来るまでそのスレッドをブロックする（RealHostKeyChecker.check() と同じ設計）。
     private val pendingAgentSignRequest = AtomicReference<CompletableDeferred<Boolean>?>(null)
+
+    /**
+     * タスク#17(ファイルプレビュー機能): [filePreviewRequest]が発行した`requestId`→
+     * 結果待ちの[CompletableDeferred]。`onAgentSignRequest`と違い呼び出し元スレッドを
+     * ブロックする必要は無い(Rust側の`spawn_blocking`同期コールバックではなく、
+     * `SessionOrchestrator::filePreviewRequest`は非ブロッキングにキューイングして返り、
+     * 結果は後から`onFilePreviewResult`で非同期に届く)ため、素直に`suspend`関数として
+     * 公開する。複数のディレクトリ一覧/catチャンク要求が同時に in-flight でも
+     * `requestId`ごとに独立して解決できるよう`ConcurrentHashMap`にしている。
+     */
+    private val pendingFilePreviewRequests = ConcurrentHashMap<String, CompletableDeferred<FilePreviewOutcome>>()
 
     private val callback = object : OrchestratorCallback {
         override fun onConnectionStateChanged(state: ConnectionPublicState) {
@@ -268,6 +288,13 @@ class TerminalSession(
                 pendingAgentSignRequest.set(null)
                 _state.update { it.copy(agentSignRequestFingerprint = null) }
             }
+        }
+
+        // タスク#17: `pendingFilePreviewRequests`から該当する`Deferred`を取り出して解決する。
+        // 対応する要求が見つからない(タイムアウト等で既に諦められた後に遅れて届いた)場合は
+        // 単に無視する。
+        override fun onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) {
+            pendingFilePreviewRequests.remove(requestId)?.complete(outcome)
         }
     }
 
@@ -486,6 +513,31 @@ class TerminalSession(
     fun trzszDismiss() = orchestrator.trzszDismiss()
 
     fun consumeDownloadFile() { _pendingDownloadFile.value = null }
+
+    // ── ファイルプレビュー(タスク#17) ────────────────────────────────
+
+    /**
+     * `isekai-pipe ctl file ls|cat|info`をリモートホストで1回実行し、結果を待つ。
+     * パース(JSON/base64デコード)は全てRust側(`crate::file_preview`)で完結しており、
+     * ここで受け取る[FilePreviewOutcome]は既にデコード済みの構造体。
+     *
+     * [FILE_PREVIEW_TIMEOUT_MS]以内に応答が無ければ(未接続のまま呼ばれた・
+     * セッションが切断された等)`FilePreviewOutcome.Error`を合成して返す——
+     * 呼び出し元(ディレクトリブラウザ/各種ビューア)がsuspendしたまま無期限に
+     * 待たされないようにするための防御。
+     */
+    suspend fun filePreviewRequest(kind: FilePreviewRequestKind): FilePreviewOutcome {
+        val requestId = UUID.randomUUID().toString()
+        val deferred = CompletableDeferred<FilePreviewOutcome>()
+        pendingFilePreviewRequests[requestId] = deferred
+        orchestrator.filePreviewRequest(requestId, kind)
+        return try {
+            withTimeoutOrNull(FILE_PREVIEW_TIMEOUT_MS) { deferred.await() }
+                ?: FilePreviewOutcome.Error("file preview request timed out")
+        } finally {
+            pendingFilePreviewRequests.remove(requestId)
+        }
+    }
 
     // ── Log ───────────────────────────────────────────────────────────
 

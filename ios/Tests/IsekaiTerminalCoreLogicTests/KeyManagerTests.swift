@@ -101,4 +101,5 @@ private actor KeyManagerAuthRecorder: OrchestratorCallback {
     nonisolated func onRebindStateChanged(state: RebindPublicState) {}
     nonisolated func onPromptJump(target: PromptJumpTarget?) {}
     nonisolated func onPromptOutputCopyReady(text: String?) {}
+    nonisolated func onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) {}
 }

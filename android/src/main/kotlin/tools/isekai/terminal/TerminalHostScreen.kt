@@ -458,6 +458,9 @@ private fun TerminalPaneScreen(
                     onPreviousTab = { tabsVm.previousTab() },
                     onForceReturnToWifi = { pane.session.forceReturnToWifi() },
                     onFocusChanged = { focused -> pane.session.notifyFocusChange(focused) },
+                    // タスク#17(ファイルプレビュー機能): `TerminalSession.filePreviewRequest`への
+                    // 薄い委譲(パース/デコードはRust側で完結、Kotlin側は中継のみ)。
+                    onFilePreviewRequest = { kind -> pane.session.filePreviewRequest(kind) },
                 ),
             )
 

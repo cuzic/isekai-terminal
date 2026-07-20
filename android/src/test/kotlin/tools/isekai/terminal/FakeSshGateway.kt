@@ -177,6 +177,14 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     var copyLastCommandOutputCallCount = 0
     override fun copyLastCommandOutput() { copyLastCommandOutputCallCount++ }
 
+    // タスク#17(ファイルプレビュー機能)。実際の`request_id`↔要求種別のペアを記録するだけ
+    // (パース/デコードロジックはRust側にあるためFakeは検証しない)。テストは
+    // `simulateFilePreviewResult`で任意の[FilePreviewOutcome]を返せる。
+    val filePreviewRequests = mutableListOf<Pair<String, FilePreviewRequestKind>>()
+    override fun filePreviewRequest(requestId: String, kind: FilePreviewRequestKind) {
+        filePreviewRequests.add(requestId to kind)
+    }
+
 
     // trzszDismiss() fires Idle synchronously, matching real Rust behavior
     override fun trzszDismiss() {
@@ -229,6 +237,9 @@ class FakeOrchestrator : SessionOrchestratorInterface {
     fun simulatePromptJump(target: PromptJumpTarget?) = callback!!.onPromptJump(target)
 
     fun simulatePromptOutputCopyReady(text: String?) = callback!!.onPromptOutputCopyReady(text)
+
+    fun simulateFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) =
+        callback!!.onFilePreviewResult(requestId, outcome)
 }
 
 /** テスト用フェイク HostKeyChecker。デフォルトは常に信頼。 */

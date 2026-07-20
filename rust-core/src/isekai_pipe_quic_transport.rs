@@ -192,6 +192,10 @@ impl IsekaiPipeQuicSession {
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) { self.core.send(data); }
+    /// タスク#17: `SessionCore::file_preview_exec`参照。
+    pub(crate) fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
+        self.core.file_preview_exec(request_id, command_line)
+    }
 
     pub(crate) fn resize(&self, cols: u32, rows: u32) { self.core.resize(cols, rows); }
 
