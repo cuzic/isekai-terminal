@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use vte::Perform;
 use crate::sixel::{SixelDecoder, SixelImage};
 use crate::kitty_graphics::{KittyCommand, KittyGraphics};
@@ -44,6 +44,40 @@ const MAX_TOTAL_IMAGE_RGBA_BYTES: usize = 64 * 1024 * 1024;
 /// する——既存id(=既存セルの`link_id`参照)はscrollback保護のため削除・再利用
 /// しない。
 pub(crate) const MAX_LINK_TABLE: usize = 4096;
+/// OSC 133(タスク#13、セマンティックプロンプト)のマーク履歴上限。500プロンプト
+/// サイクル分(A/B/C/Dの4マーク)を目安に選んだ値——`link_table`(タスク#40)と同じ
+/// 理由(相異なるURLを大量に流されてもメモリが際限なく増えないようにする)で、
+/// 上限到達後は最も古いマークから捨てる(`Terminal::prompt_marks`フィールド参照)。
+const MAX_PROMPT_MARKS: usize = 2000;
+
+/// OSC 133(`ESC]133;<Ps>...ST`、タスク#13)の1マークが表す区切りの種類。
+/// <https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md>
+/// のA/B/C/Dにそれぞれ対応する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptMarkKind {
+    /// `ESC]133;A`: プロンプト描画の開始。
+    PromptStart,
+    /// `ESC]133;B`: プロンプト終了・コマンド入力開始。
+    CommandStart,
+    /// `ESC]133;C`: コマンド実行開始(以降の出力がそのコマンドの出力)。
+    CommandExecuted,
+    /// `ESC]133;D[;<exit_code>]`: コマンド終了。`exit_code`は数値としてパースできた
+    /// 場合のみ`Some`(シェルによってはexit codeを送らない、または`aid=`等の
+    /// 数値以外のパラメータを送ることがあるため、パース失敗は単に`None`として扱う)。
+    CommandFinished { exit_code: Option<i32> },
+}
+
+/// OSC 133の1マーク(`PromptMarkKind`+発生した絶対行番号)。`row`は
+/// `Terminal::total_scrolled_lines`基準の単調増加座標——scrollbackが後から
+/// トリミングされてもマーク自身の値は変わらず、参照する側(`prompt_jump_target`等)が
+/// 呼び出し時点の`total_scrolled_lines`/scrollback長と突き合わせて現在の
+/// 表示位置へ変換する(`ScrollbackSearchMatch`の「offsetはスナップショット時点限定」
+/// という制約と違い、こちらは絶対座標なので長期保持しても意味が変わらない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PromptMark {
+    pub(crate) kind: PromptMarkKind,
+    pub(crate) row: u64,
+}
 /// 1セルへ結合文字(combining character、幅0文字)として追記できるUTF-8バイト数の
 /// 上限(タスク#78)。`print()`のwidth==0分岐(タスク#39)は結合文字を直前セルの
 /// `cell.ch`へ無条件で連結する実装だったため、`a` + `U+0301`(2バイト)を大量に
@@ -536,6 +570,48 @@ pub(crate) struct Terminal {
     main_kitty_flags_stack: Vec<u16>,
     /// [Terminal::main_kitty_flags_stack]のalt画面版。
     alt_kitty_flags_stack: Vec<u16>,
+    /// OSC 133(タスク#13)の絶対行番号カウンタ。`Terminal`の生存期間を通じて、
+    /// scrollbackへ実際に押し出された行数(`pending_scrollback`へpushした回数と
+    /// 常に一致する——`scroll_up_region`/`resize_preserving_state`の該当箇所で
+    /// 同時にインクリメントする)を単調増加でカウントする。ある時点のカーソル行の
+    /// 「絶対行番号」は`total_scrolled_lines + cursor_row`で求まり、後から
+    /// scrollbackが`SCROLLBACK_LIMIT`でトリミングされても(`total_scrolled_lines`
+    /// 自体はトリミングの影響を受けないため)位置を再計算できる。RIS(`reset_all`)
+    /// でも`link_table`と同じ理由でリセットしない——scrollbackへ既に流れた過去の
+    /// プロンプトマークの`row`がこのカウンタを基準にしているため。
+    total_scrolled_lines: u64,
+    /// OSC 133(タスク#13)のマーク履歴。`MAX_PROMPT_MARKS`件を超えたら最も古い
+    /// ものから捨てる(`link_table`と異なりRIS(`reset_all`)ではクリアしない——
+    /// `total_scrolled_lines`と同じ理由)。「前/次のプロンプトへジャンプ」
+    /// (`prompt_jump_target`)・「直前コマンド出力コピー」の判定に使う。
+    prompt_marks: VecDeque<PromptMark>,
+    /// 現在「コマンド入力中」(OSC 133;Bは来たが;Cがまだ来ていない区間)かどうか。
+    /// タップでのカーソル移動(`cursor_move_bytes_for_click`、タスク#13)が
+    /// 対象とする行を絞り込むために使う——タップされた行が現在のカーソル行と
+    /// 一致し、かつこのフラグが立っている場合のみ有効なタップとみなす(入力行の
+    /// 絶対行番号を別途保持する必要はない——現在のカーソル行が常に「今アクティブな
+    /// 入力行」を指すため)。
+    input_line_active: bool,
+    /// OSC 133;C(コマンド実行開始)〜;D(コマンド終了)の間、`true`の間だけ
+    /// `print()`で書かれた文字を[current_output_line]/[current_output_lines]へ
+    /// そのまま貯める(タスク#13「直前コマンドの出力だけをコピー」)。
+    ///
+    /// スコープ外(意図的な制約): カーソル移動を伴う書き換え(`\r`によるプログレス
+    /// バー上書き・`top`等のフルスクリーンTUI)はそのまま連結されてしまい、見た目の
+    /// 最終状態を再現しない。グリッド上の実際の表示内容を都度読み直す設計にすれば
+    /// 正確になるが、scrollbackと現在画面をまたぐ座標変換が必要になり複雑化するため、
+    /// タスク#13ではストリームをそのまま捕捉する単純な実装に留めた(単純な行指向の
+    /// 出力——`ls`/`cat`/`git log`等の大半のユースケース——では正しく動く)。
+    capturing_command_output: bool,
+    /// [capturing_command_output]中に貯めている、まだ改行(LF/VT/FF)が来ていない
+    /// 現在行のテキスト。
+    current_output_line: String,
+    /// [capturing_command_output]中に確定した行の列。
+    current_output_lines: Vec<String>,
+    /// 直近に完了した1コマンド分の出力(タスク#13)。新しいコマンドが
+    /// `OSC 133;C`で始まると、次の`;D`到達時にこの値が上書きされる——「直前の」
+    /// 1件のみを保持する設計(複数コマンド分の履歴は持たない)。
+    last_command_output: Option<Vec<String>>,
 }
 
 /// Kitty keyboard protocolのflagsスタック(タスク#54)の最大深さ。仕様は
@@ -729,6 +805,13 @@ impl Terminal {
             kitty_placement_ids: std::collections::HashSet::new(),
             main_kitty_flags_stack: Vec::new(),
             alt_kitty_flags_stack: Vec::new(),
+            total_scrolled_lines: 0,
+            prompt_marks: VecDeque::new(),
+            input_line_active: false,
+            capturing_command_output: false,
+            current_output_line: String::new(),
+            current_output_lines: Vec::new(),
+            last_command_output: None,
         }
     }
 
@@ -1024,6 +1107,13 @@ impl Terminal {
         // 仕様上の制約とは矛盾しない(両方を初期化するだけ)。
         self.main_kitty_flags_stack.clear();
         self.alt_kitty_flags_stack.clear();
+        // OSC 133(タスク#13): `total_scrolled_lines`/`prompt_marks`/`last_command_output`
+        // は`link_table`と同じ理由でRISでもクリアしない(過去マークの絶対行番号の
+        // 意味が変わってしまうため)。「今」の一時的な状態のみリセットする。
+        self.input_line_active = false;
+        self.capturing_command_output = false;
+        self.current_output_line.clear();
+        self.current_output_lines.clear();
     }
 
     fn cells(&self) -> &Vec<TermCell> {
@@ -1116,6 +1206,11 @@ impl Terminal {
         let main_removed = top_removed_for(main_reference_row);
         let alt_removed = top_removed_for(alt_reference_row);
 
+        // OSC 133(タスク#13): `resize_grid`はmain側の押し出し行を`pending_scrollback`へ
+        // 直接pushする(内部で何行押し出すか決まる)ため、呼び出し前後の長さ差分で
+        // `total_scrolled_lines`を増やす([scroll_up_region]と違い、ここでは押し出す
+        // 行数を呼び出し元が事前に知らないため差分方式にする)。
+        let scrollback_before = self.pending_scrollback.len();
         self.main_cells = Self::resize_grid(
             &self.main_cells, old_cols, old_rows, new_cols, new_rows, main_removed, &blank,
             Some(&mut self.pending_scrollback),
@@ -1124,6 +1219,7 @@ impl Terminal {
             &self.alt_cells, old_cols, old_rows, new_cols, new_rows, alt_removed, &blank,
             None,
         );
+        self.total_scrolled_lines += (self.pending_scrollback.len() - scrollback_before) as u64;
 
         let max_row = new_rows.saturating_sub(1);
         let shift_row = |row: usize, removed: usize| -> usize {
@@ -1369,6 +1465,10 @@ impl Terminal {
                 let row = self.main_cells[row_start..row_start + cols].to_vec();
                 self.pending_scrollback.push(row);
             }
+            // OSC 133(タスク#13): 実際にscrollbackへ押し出された行数だけ
+            // `total_scrolled_lines`を進める(`Terminal::total_scrolled_lines`
+            // フィールドdocコメント参照)。
+            self.total_scrolled_lines += n as u64;
         }
 
         if n < region_size {
@@ -1817,6 +1917,199 @@ impl Terminal {
         self.link_ids.insert(uri, id);
         Some(id)
     }
+
+    // ── OSC 133 セマンティックプロンプト(タスク#13) ──────────
+
+    /// OSC 133;A/B/C/Dの1マークを処理する。`sub`はA/B/C/Dのバイト、`extra`は
+    /// `D`の場合に付く可能性のあるexit code(`params[2]`、他のフォーマットの
+    /// 追加パラメータ——例えば`B;aid=1`の`aid=1`——ならパース失敗として無視する)。
+    /// A/B/C以外の未知の`sub`(将来のOSC 133拡張等)は無視する。
+    fn handle_osc133_prompt_mark(&mut self, sub: &[u8], extra: Option<&[u8]>) {
+        let row = self.total_scrolled_lines + self.cursor_row as u64;
+        let kind = match sub {
+            b"A" => PromptMarkKind::PromptStart,
+            b"B" => PromptMarkKind::CommandStart,
+            b"C" => PromptMarkKind::CommandExecuted,
+            b"D" => {
+                let exit_code = extra
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                PromptMarkKind::CommandFinished { exit_code }
+            }
+            _ => return,
+        };
+
+        // 「今コマンド入力中か」(タップでのカーソル移動、`cursor_move_bytes_for_click`
+        // が参照する)。Bで開始し、それ以外の全マークで終了する——次にAが来て
+        // 新しいプロンプトサイクルが始まった場合も含む。
+        self.input_line_active = matches!(kind, PromptMarkKind::CommandStart);
+
+        // 「直前コマンドの出力だけをコピー」(タスク#13)向けのキャプチャ制御。
+        match kind {
+            PromptMarkKind::CommandExecuted => {
+                self.capturing_command_output = true;
+                self.current_output_line.clear();
+                self.current_output_lines.clear();
+            }
+            PromptMarkKind::CommandFinished { .. } => {
+                if self.capturing_command_output {
+                    if !self.current_output_line.is_empty() {
+                        self.current_output_lines.push(std::mem::take(&mut self.current_output_line));
+                    }
+                    self.last_command_output = Some(std::mem::take(&mut self.current_output_lines));
+                }
+                self.capturing_command_output = false;
+            }
+            _ => {}
+        }
+
+        self.prompt_marks.push_back(PromptMark { kind, row });
+        if self.prompt_marks.len() > MAX_PROMPT_MARKS {
+            self.prompt_marks.pop_front();
+        }
+    }
+
+    /// [prompt_marks]から「ジャンプ対象」となる行番号の列を、古い→新しい順で返す。
+    /// 各プロンプトサイクルにつき1件——`PromptStart`(A)を優先し、そのサイクルで
+    /// Aが来ていない場合のみ`CommandStart`(B)をフォールバックとして使う(シェルに
+    /// よってはAを送らずBのみのものがある)。`CommandExecuted`/`CommandFinished`が
+    /// 来ると次のサイクルとみなし、次のA/Bが改めてアンカーになる。
+    fn prompt_anchor_rows(&self) -> Vec<u64> {
+        let mut anchors = Vec::with_capacity(self.prompt_marks.len());
+        let mut cycle_anchored = false;
+        for mark in &self.prompt_marks {
+            match mark.kind {
+                PromptMarkKind::PromptStart => {
+                    anchors.push(mark.row);
+                    cycle_anchored = true;
+                }
+                PromptMarkKind::CommandStart => {
+                    if !cycle_anchored {
+                        anchors.push(mark.row);
+                        cycle_anchored = true;
+                    }
+                }
+                PromptMarkKind::CommandExecuted | PromptMarkKind::CommandFinished { .. } => {
+                    cycle_anchored = false;
+                }
+            }
+        }
+        anchors
+    }
+
+    /// 絶対行番号`abs_row`が、呼び出し時点で実際に表示可能(ライブ画面上、または
+    /// まだ`scrollback_len`件のscrollback内に残っている)かどうか。SCROLLBACK_LIMIT
+    /// によるトリミングで既に失われた行はfalseを返す——「前/次のプロンプトへ
+    /// ジャンプ」がそのような行を飛ばして次の候補を探せるようにするための判定。
+    fn is_prompt_row_reachable(&self, abs_row: u64, scrollback_len: u32) -> bool {
+        if abs_row >= self.total_scrolled_lines {
+            // ライブ画面上。リサイズ直後等で万一画面外を指していたら不可視。
+            return abs_row - self.total_scrolled_lines < self.rows as u64;
+        }
+        let offset = self.total_scrolled_lines - 1 - abs_row;
+        offset < scrollback_len as u64
+    }
+
+    /// 到達可能であることが確認済みの絶対行番号`abs_row`を、呼び出し元
+    /// (`session.rs`/Kotlin側)がそのまま使える[crate::PromptJumpTarget]へ変換する。
+    /// `scroll_offset`は既存の検索ジャンプ(タスク#37、[crate::ScrollbackSearchMatch]の
+    /// `row`と[SessionCore::scrollback_cells]の`offset`)と同じ規約——scrollback側なら
+    /// そのままoffsetとして使える値。
+    fn resolve_prompt_row_target(&self, abs_row: u64) -> crate::PromptJumpTarget {
+        if abs_row >= self.total_scrolled_lines {
+            crate::PromptJumpTarget { scroll_offset: 0, is_live: true }
+        } else {
+            let offset = (self.total_scrolled_lines - 1 - abs_row).min(u32::MAX as u64) as u32;
+            crate::PromptJumpTarget { scroll_offset: offset, is_live: false }
+        }
+    }
+
+    /// 「前/次のプロンプトへジャンプ」(タスク#13)。`from_scroll_offset`/
+    /// `from_showing_scrollback`は呼び出し時点でKotlin側が表示している位置
+    /// (既存の検索ジャンプ・タスク#79の`scrollOffset`/`showingScrollback`と同じ規約
+    /// ——`.claude/rules/rust-ssot.md`が「UI表示だけに閉じた状態」として許容する
+    /// スクロール位置そのものを渡す)。`scrollback_len`は呼び出し時点の
+    /// `SessionCore::scrollback_len()`(トリミングで実際に残っている行数)。
+    ///
+    /// - ライブ画面表示中(`from_showing_scrollback == false`)の基準点は現在の
+    ///   カーソル行の絶対行番号(`total_scrolled_lines + cursor_row`)——ライブ画面上に
+    ///   複数のプロンプトが同時に見えている場合(小さい端末・短いコマンド列)でも、
+    ///   現在位置より上にある直近のプロンプトへ正しくジャンプできる。
+    /// - `want_previous`が偽(「次」)で、scrollback内に候補が無い場合は、ライブ画面
+    ///   ([PromptJumpTarget::is_live] = true)へ「戻る」ジャンプ先を返す(ライブ表示中に
+    ///   「次」を呼んだ場合は既に最新なので`None`)。
+    pub(crate) fn prompt_jump_target(
+        &self,
+        want_previous: bool,
+        from_scroll_offset: u32,
+        from_showing_scrollback: bool,
+        scrollback_len: u32,
+    ) -> Option<crate::PromptJumpTarget> {
+        let reference = if from_showing_scrollback {
+            self.total_scrolled_lines.saturating_sub(1).saturating_sub(from_scroll_offset as u64)
+        } else {
+            self.total_scrolled_lines + self.cursor_row as u64
+        };
+        let anchors = self.prompt_anchor_rows();
+        if want_previous {
+            anchors.into_iter()
+                .filter(|&r| r < reference && self.is_prompt_row_reachable(r, scrollback_len))
+                .max()
+                .map(|r| self.resolve_prompt_row_target(r))
+        } else {
+            let next = anchors.into_iter()
+                .filter(|&r| r > reference && self.is_prompt_row_reachable(r, scrollback_len))
+                .min();
+            match next {
+                Some(r) => Some(self.resolve_prompt_row_target(r)),
+                None if from_showing_scrollback => {
+                    Some(crate::PromptJumpTarget { scroll_offset: 0, is_live: true })
+                }
+                None => None,
+            }
+        }
+    }
+
+    /// タップされたセル(`row`/`col`、0-indexed画面座標)が現在アクティブな入力行
+    /// (OSC 133;Bは来たが;Cがまだの区間、かつタップ行が現在のカーソル行と一致する
+    /// ——`input_line_active`フィールドdocコメント参照)上であれば、そこへカーソルを
+    /// 移動する矢印キー相当のバイト列を返す(Ghostty`cl=line`相当、タスク#13)。
+    /// 対象外(未アクティブ・別の行・移動量ゼロ)なら`None`——呼び出し元は
+    /// 何も送らない。
+    ///
+    /// 実際にリモートのシェル(readline等)のカーソル位置を動かすには、ターミナル側の
+    /// 表示カーソルを直接動かすのではなく、物理キーボードで矢印キーを`delta`回
+    /// 押したのと同じバイト列を送る必要がある——readlineはパラメータ付きCSI
+    /// (`ESC[5C`等)を「5回分の移動」として解釈しないため([crate::terminal_arrow_bytes]
+    /// と同じエンコード関数を使い、修飾キー無しの単純な矢印キー入力を`delta`回分
+    /// 生成する)。
+    pub(crate) fn cursor_move_bytes_for_click(&self, row: u32, col: u32) -> Option<Vec<u8>> {
+        if !self.input_line_active {
+            return None;
+        }
+        if row as usize != self.cursor_row {
+            return None;
+        }
+        let target_col = (col as usize).min(self.cols.saturating_sub(1));
+        let delta = target_col as i64 - self.cursor_col as i64;
+        if delta == 0 {
+            return None;
+        }
+        let letter = if delta > 0 { b'C' } else { b'D' };
+        let modifiers = crate::TerminalKeyModifiers::default();
+        let mut bytes = Vec::new();
+        for _ in 0..delta.unsigned_abs() {
+            bytes.extend_from_slice(&crate::terminal_arrow_bytes(letter, self.application_cursor_mode, modifiers));
+        }
+        Some(bytes)
+    }
+
+    /// 直前に完了したコマンド(OSC 133;C〜Dの区間)の出力をテキストとして返す
+    /// (タスク#13「直前コマンドの出力だけをコピー」)。まだ完了したコマンドが
+    /// 無ければ`None`。複数行は`\n`で結合する。
+    pub(crate) fn last_command_output_text(&self) -> Option<String> {
+        self.last_command_output.as_ref().map(|lines| lines.join("\n"))
+    }
 }
 
 /// OSC8のURLとして許さない文字が含まれているかを判定する(タスク#77)。
@@ -2039,6 +2332,14 @@ impl Perform for Terminal {
         } else {
             c
         };
+        // OSC 133(タスク#13)「直前コマンドの出力だけをコピー」向けのテキスト
+        // キャプチャ。ここは`print_mapped`のグリッド書き込み(結合文字・折り返し等)
+        // より前でよい——vteが呼ぶ`print()`はデコード済みの1文字ずつなので、
+        // ここでの単純な文字列連結がそのまま結合文字を含む正しいUnicodeテキストになる
+        // (`capturing_command_output`フィールドdocコメントのスコープ外事項も参照)。
+        if self.capturing_command_output {
+            self.current_output_line.push(c);
+        }
         self.print_mapped(c);
     }
 
@@ -2050,7 +2351,16 @@ impl Perform for Terminal {
             // (フィールドdoc参照)を壊してしまう(Codexレビュー: タスク#24)。
             0x07 => { self.bell_generation = self.bell_generation.saturating_add(1); }
             0x0D => { self.cursor_col = 0; }
-            0x0A | 0x0B | 0x0C => { self.newline(); }
+            0x0A | 0x0B | 0x0C => {
+                // OSC 133(タスク#13)出力キャプチャ: 明示的なLF/VT/FFのみを論理行の
+                // 区切りとして扱う(`print_mapped`の自動折り返しも内部で`newline()`を
+                // 呼ぶが、あれは表示上の折り返しであり論理行の区切りではないため、
+                // ここ[execute、実際のC0制御バイト経由の呼び出し]でのみ確定させる)。
+                if self.capturing_command_output {
+                    self.current_output_lines.push(std::mem::take(&mut self.current_output_line));
+                }
+                self.newline();
+            }
             0x08 => { if self.cursor_col > 0 { self.cursor_col -= 1; } }
             // SO(Shift Out)/SI(Shift In、タスク#41): GL(印字に使われる文字集合)を
             // G1/G0へ切り替える。実際の写像先(ASCIIかDEC Special Graphicsか)は
@@ -2527,6 +2837,12 @@ impl Perform for Terminal {
             // として扱う)。
             (Some(&b"8"), _) => {
                 self.handle_osc8_hyperlink(params);
+            }
+            // OSC 133(`ESC]133;<Ps>[;...]ST`、タスク#13): セマンティックプロンプト
+            // (A=プロンプト開始/B=コマンド入力開始/C=コマンド実行開始/D=コマンド終了)。
+            // 詳細は`handle_osc133_prompt_mark`参照。
+            (Some(&b"133"), Some(&sub)) => {
+                self.handle_osc133_prompt_mark(sub, params.get(2).copied());
             }
             // OSC 52 (`ESC]52;<selection>;<base64|?>BEL`): clipboard set.
             // `<selection>` (params[1], conventionally `c`/`p`/...) is not
@@ -6103,6 +6419,247 @@ mod tests {
             t.place_sixel_image(SixelImage { width: 1, height: 1, rgba: vec![0, 0, 0, 255] });
         }
         assert_eq!(t.images().len(), MAX_LIVE_IMAGES, "小さい画像では従来通りMAX_LIVE_IMAGES(32)枚に収まること");
+    }
+
+    // ── OSC 133 セマンティックプロンプト(タスク#13) ──────────
+
+    #[test]
+    fn test_osc133_abcd_sequence_does_not_affect_screen_content() {
+        // OSC 133自体は不可視のマーカーであり、画面内容(セル)には一切影響しない。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n");
+        feed(&mut t, b"\x1b]133;C\x07file.txt\r\n");
+        feed(&mut t, b"\x1b]133;D;0\x07");
+        assert_eq!(cell(&t, 0, 0), "$");
+        assert_eq!(cell(&t, 0, 2), "l");
+        assert_eq!(cell(&t, 1, 0), "f");
+    }
+
+    #[test]
+    fn test_osc133_jump_to_previous_prompt_finds_prompt_pushed_into_scrollback() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ cmd1\r\n");
+        // 十分な行を流してこのプロンプトをscrollbackへ押し出す(rows=3の端末で
+        // これだけ流せば必ずスクロールする)。
+        feed(&mut t, b"a\r\nb\r\nc\r\nd\r\n");
+        assert!(t.total_scrolled_lines > 0);
+
+        // ライブ画面表示中(showing_scrollback=false)から「前」へジャンプすると、
+        // scrollbackへ押し出されたこのプロンプトが見つかる。
+        let target = t.prompt_jump_target(true, 0, false, t.total_scrolled_lines as u32);
+        let target = target.expect("scrollbackへ押し出されたプロンプトが見つかるはず");
+        assert!(!target.is_live);
+    }
+
+    #[test]
+    fn test_osc133_jump_previous_among_multiple_live_prompts_finds_nearest_before_cursor() {
+        // 端末が十分大きく(rows=10)、2つのプロンプトが両方ともスクロールせずライブ画面上に
+        // 同時に見えているケース。カーソル位置(現在位置)より前にある直近のプロンプトが
+        // 見つかることを確認する(単に「ライブ画面最上行より上か」だけでは、この
+        // ケースを正しく扱えない——docコメント参照)。
+        let mut t = Terminal::new(10, 10, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ cmd1\r\n"); // mark row=0
+        feed(&mut t, b"\x1b]133;A\x07$ cmd2\r\n"); // mark row=1、カーソルはこの後row=2
+        assert_eq!(t.total_scrolled_lines, 0, "rows=10なのでこのテストでは一切スクロールしない前提");
+
+        let prev = t.prompt_jump_target(true, 0, false, 0)
+            .expect("カーソル位置より前の直近プロンプト(cmd2)が見つかるはず");
+        assert!(prev.is_live);
+        assert_eq!(prev.scroll_offset, 0, "is_live=trueの場合scroll_offsetは意味を持たない(0固定)");
+    }
+
+    #[test]
+    fn test_osc133_jump_next_falls_back_to_live_when_no_later_prompt_exists() {
+        // scrollback表示中(showing_scrollback=true)に「次」を呼んだが、それより後の
+        // プロンプトマークが1つも無い場合は、ライブ画面へ「戻る」ジャンプ先を返す。
+        let t = Terminal::new(10, 5, Theme::default());
+        let next = t.prompt_jump_target(false, 0, true, 0)
+            .expect("ライブへ戻るフォールバックが返るはず");
+        assert!(next.is_live);
+    }
+
+    #[test]
+    fn test_osc133_jump_next_returns_none_when_already_live_and_no_later_prompt() {
+        // ライブ画面表示中(showing_scrollback=false)に「次」を呼んだ場合、フォール
+        // バックは行わない(既にライブより後は無いため)。
+        let t = Terminal::new(10, 5, Theme::default());
+        assert!(t.prompt_jump_target(false, 0, false, 0).is_none());
+    }
+
+    #[test]
+    fn test_osc133_jump_previous_returns_none_when_no_earlier_prompt() {
+        // カーソルがまだそのプロンプト自身の行にいる(=マーク直後、何も出力していない)
+        // 場合、「前」は見つからない——前の絶対行番号(reference)自体がこのマークの行と
+        // 同じで、`want_previous`の`r < reference`(厳密未満)を満たさないため。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07");
+        assert!(t.prompt_jump_target(true, 0, false, 0).is_none());
+    }
+
+    #[test]
+    fn test_osc133_jump_next_returns_none_when_already_live_with_no_more_prompts() {
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ only\r\n");
+        assert!(t.prompt_jump_target(false, 0, false, 0).is_none());
+    }
+
+    #[test]
+    fn test_osc133_jump_falls_back_to_command_start_when_prompt_start_absent() {
+        // 一部のシェルはAを送らずBのみを送る——その場合Bをアンカーとして使う。
+        let mut t = Terminal::new(10, 5, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07$ cmd1\r\n");
+        feed(&mut t, b"\x1b]133;B\x07$ cmd2\r\n");
+        let prev = t.prompt_jump_target(true, 0, false, 0);
+        assert!(prev.is_some(), "Aが無くてもBをアンカーとしてジャンプできるはず");
+    }
+
+    #[test]
+    fn test_osc133_jump_unreachable_evicted_row_is_skipped() {
+        // scrollback_lenを実際より小さく(=evicted扱いに)すると、scrollbackへ既に
+        // 押し出された唯一の候補がジャンプ対象から外れる。
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ cmd1\r\n");
+        feed(&mut t, b"a\r\nb\r\nc\r\nd\r\n"); // mark1をscrollbackへ押し出す
+        assert!(t.total_scrolled_lines > 0, "rows=3の端末でこれだけ流せば必ずスクロールする");
+
+        // scrollback_len=0は「1つ目のプロンプト行は既にscrollbackから追い出された」
+        // ことを意味する。
+        assert!(t.prompt_jump_target(true, 0, false, 0).is_none());
+        // 十分なscrollback_lenを渡せば、同じ絶対行番号のマークが見つかる。
+        let target = t.prompt_jump_target(true, 0, false, t.total_scrolled_lines as u32);
+        assert!(target.is_some(), "scrollback_lenが十分ならreachableと判定されるはず");
+    }
+
+    #[test]
+    fn test_osc133_click_moves_cursor_forward_on_active_input_line() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07ab");
+        // カーソルは(0,2)。同じ行の列5をタップ -> 3回分right矢印。
+        let bytes = t.cursor_move_bytes_for_click(0, 5).expect("入力行上のタップは有効なはず");
+        assert_eq!(bytes, b"\x1b[C\x1b[C\x1b[C".to_vec());
+    }
+
+    #[test]
+    fn test_osc133_click_moves_cursor_backward_on_active_input_line() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07abcde");
+        // カーソルは(0,5)。列1をタップ -> 4回分left矢印。
+        let bytes = t.cursor_move_bytes_for_click(0, 1).expect("入力行上のタップは有効なはず");
+        assert_eq!(bytes, b"\x1b[D\x1b[D\x1b[D\x1b[D".to_vec());
+    }
+
+    #[test]
+    fn test_osc133_click_uses_ss3_form_when_application_cursor_mode_active() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1h"); // DECCKM on
+        feed(&mut t, b"\x1b]133;B\x07ab");
+        let bytes = t.cursor_move_bytes_for_click(0, 3).expect("入力行上のタップは有効なはず");
+        assert_eq!(bytes, b"\x1bOC".to_vec());
+    }
+
+    #[test]
+    fn test_osc133_click_is_noop_before_command_start() {
+        // OSC 133;Bがまだ来ていない(=入力行がアクティブでない)状態のタップは無視する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"ab");
+        assert!(t.cursor_move_bytes_for_click(0, 0).is_none());
+    }
+
+    #[test]
+    fn test_osc133_click_is_noop_after_command_executed() {
+        // ;Cが来た後(出力フェーズ)はもう入力行ではないので無視する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07ab\x1b]133;C\x07");
+        assert!(t.cursor_move_bytes_for_click(0, 0).is_none());
+    }
+
+    #[test]
+    fn test_osc133_click_is_noop_on_a_different_row() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07ab");
+        assert!(t.cursor_move_bytes_for_click(1, 0).is_none(), "カーソル行以外のタップは無視するはず");
+    }
+
+    #[test]
+    fn test_osc133_click_is_noop_when_tapped_column_equals_cursor_column() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;B\x07ab");
+        assert!(t.cursor_move_bytes_for_click(0, 2).is_none(), "移動量ゼロは送信しない");
+    }
+
+    #[test]
+    fn test_osc133_copy_last_command_output_single_line() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;C\x07file.txt\r\n");
+        feed(&mut t, b"\x1b]133;D;0\x07");
+        assert_eq!(t.last_command_output_text(), Some("file.txt".to_string()));
+    }
+
+    #[test]
+    fn test_osc133_copy_last_command_output_multi_line_joins_with_newline() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;C\x07line1\r\nline2\r\n");
+        feed(&mut t, b"\x1b]133;D\x07");
+        assert_eq!(t.last_command_output_text(), Some("line1\nline2".to_string()));
+    }
+
+    #[test]
+    fn test_osc133_copy_last_command_output_none_before_any_command_finished() {
+        let t = Terminal::new(80, 24, Theme::default());
+        assert_eq!(t.last_command_output_text(), None);
+    }
+
+    #[test]
+    fn test_osc133_copy_last_command_output_is_overwritten_by_newer_command() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;C\x07old\r\n");
+        feed(&mut t, b"\x1b]133;D\x07");
+        feed(&mut t, b"\x1b]133;C\x07new\r\n");
+        feed(&mut t, b"\x1b]133;D\x07");
+        assert_eq!(t.last_command_output_text(), Some("new".to_string()), "直前の1件のみを保持する");
+    }
+
+    #[test]
+    fn test_osc133_copy_last_command_output_ignores_bytes_outside_c_to_d_window() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07prompt-not-output\r\n");
+        feed(&mut t, b"\x1b]133;C\x07actual-output\r\n");
+        feed(&mut t, b"\x1b]133;D\x07next-prompt-not-output\r\n");
+        assert_eq!(t.last_command_output_text(), Some("actual-output".to_string()));
+    }
+
+    #[test]
+    fn test_osc133_d_exit_code_parses_when_present_and_numeric() {
+        // exit codeそのものは`last_command_output_text`からは見えないが、パース失敗
+        // (数値以外)でもpanicしない/後続の処理を壊さないことを確認する。
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;C\x07out\r\n");
+        feed(&mut t, b"\x1b]133;D;127\x07");
+        assert_eq!(t.last_command_output_text(), Some("out".to_string()));
+    }
+
+    #[test]
+    fn test_osc133_d_with_non_numeric_extra_param_does_not_panic() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b]133;C\x07out\r\n");
+        feed(&mut t, b"\x1b]133;D;aid=1\x07");
+        assert_eq!(t.last_command_output_text(), Some("out".to_string()));
+    }
+
+    #[test]
+    fn test_osc133_reset_all_clears_transient_state_but_keeps_history_addressable() {
+        let mut t = Terminal::new(10, 3, Theme::default());
+        feed(&mut t, b"\x1b]133;A\x07$ cmd1\r\n");
+        feed(&mut t, b"a\r\nb\r\nc\r\nd\r\n"); // cmd1をscrollbackへ押し出す
+        feed(&mut t, b"\x1b]133;B\x07partial-input");
+        feed(&mut t, b"\x1bc"); // RIS
+        // RIS後は「今入力中」ではなくなる(タップは無効化)。
+        assert!(t.cursor_move_bytes_for_click(0, 0).is_none());
+        // だが過去のプロンプト(scrollbackへ押し出し済み)への絶対行番号ベースの
+        // ジャンプ判断は壊れない(`total_scrolled_lines`/`prompt_marks`はRISで
+        // クリアしないため)。
+        let target = t.prompt_jump_target(true, 0, false, t.total_scrolled_lines as u32);
+        assert!(target.is_some());
     }
 
     // ── Proptest: 不変量 ────────────────────────────────
