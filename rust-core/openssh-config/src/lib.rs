@@ -513,6 +513,25 @@ Host *
     }
 
     #[test]
+    fn windows_path_in_identity_file_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", r#"
+Host vpsmart
+    Hostname 204.12.203.210
+    User cuzic
+    IdentityFile c:\Users\cuzic\.ssh\id_ed25519.vpsmart
+    ServerAliveInterval 30
+"#);
+        let config = resolve(&path, "vpsmart").unwrap();
+        assert_eq!(
+            config.identity_file,
+            vec![PathBuf::from(r"c:\Users\cuzic\.ssh\id_ed25519.vpsmart")]
+        );
+        assert_eq!(config.user.as_deref(), Some("cuzic"));
+        assert_eq!(config.host_name.as_deref(), Some("204.12.203.210"));
+    }
+
+    #[test]
     fn negated_pattern_excludes_host_even_if_wildcard_matches() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(&dir, "config", "
