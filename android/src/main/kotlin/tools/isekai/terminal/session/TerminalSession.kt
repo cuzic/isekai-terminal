@@ -1,6 +1,8 @@
 package tools.isekai.terminal.session
 
 import tools.isekai.terminal.HostKeyChangedWarning
+import tools.isekai.terminal.PromptJumpResult
+import tools.isekai.terminal.PromptOutputCopyResult
 import tools.isekai.terminal.TerminalUiState
 import tools.isekai.terminal.TrzszUiState
 import tools.isekai.terminal.util.RemoteLogger
@@ -229,6 +231,22 @@ class TerminalSession(
             _state.update { it.copy(rebindState = state) }
         }
 
+        // タスク#13(OSC 133)。判断ロジック(どのプロンプトが「前/次」か・出力範囲の
+        // 切り出し)は全てRust側(`Terminal::prompt_jump_target`/`last_command_output_text`)
+        // に一元化されており、ここでは結果を[TerminalUiState]へそのまま反映するだけ。
+        // `seq`を単調増加させるのは、「見つからなかった(target=null)」という同じ結果が
+        // 連続した場合でも[TerminalUiState]の値が変化し、Compose側の`LaunchedEffect`
+        // (値の変化でのみ再発火する)が確実に反応できるようにするため
+        // (`hostKeyChangedWarning`等の「一度きりのプロンプト」系フィールドと異なり、
+        // こちらは`null`自体が有効な結果でありうるため単純な値比較では区別できない)。
+        override fun onPromptJump(target: PromptJumpTarget?) {
+            _state.update { it.copy(promptJumpResult = PromptJumpResult(target, it.promptJumpResult.seq + 1)) }
+        }
+
+        override fun onPromptOutputCopyReady(text: String?) {
+            _state.update { it.copy(promptOutputCopyResult = PromptOutputCopyResult(text, it.promptOutputCopyResult.seq + 1)) }
+        }
+
         // SSH agent forwarding: Rust 側の spawn_blocking スレッドから同期呼び出しされる。
         // ユーザーが respondAgentSignRequest() を呼ぶまでこのスレッドをブロックして待つ。
         // タイムアウト（Rust 側の 30 秒より短い 25 秒）した場合も拒否扱いにする。
@@ -347,6 +365,27 @@ class TerminalSession(
      *  [scrollbackCells]と同じ規約(タスク#37のドキュメント参照)。 */
     fun searchScrollback(query: String, caseSensitive: Boolean): List<ScrollbackSearchMatch> =
         orchestrator.searchScrollback(query, caseSensitive)
+
+    /** タスク#13(OSC 133)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+     *  ([searchScrollback])とは独立した機能。`fromScrollOffset`/`fromShowingScrollback`
+     *  は呼び出し時点でKotlin側が表示している位置(タスク#79と同じ規約)をそのまま渡す。
+     *  結果は[promptJumpEvent]で非同期に届く。 */
+    fun jumpToPreviousPrompt(fromScrollOffset: Int, fromShowingScrollback: Boolean) =
+        orchestrator.jumpToPreviousPrompt(fromScrollOffset.toUInt(), fromShowingScrollback)
+
+    /** [jumpToPreviousPrompt]の「次」版。 */
+    fun jumpToNextPrompt(fromScrollOffset: Int, fromShowingScrollback: Boolean) =
+        orchestrator.jumpToNextPrompt(fromScrollOffset.toUInt(), fromShowingScrollback)
+
+    /** タスク#13(OSC 133): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     *  入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     *  (Ghostty`cl=line`相当)。対象外なら無音でno-op。 */
+    fun clickToPromptCursor(row: Int, col: Int) =
+        orchestrator.clickToPromptCursor(row.toUInt(), col.toUInt())
+
+    /** タスク#13(OSC 133)「直前コマンドの出力だけをコピー」。結果は
+     *  [promptOutputCopyEvent]で非同期に届く。 */
+    fun copyLastCommandOutput() = orchestrator.copyLastCommandOutput()
 
     /** Phase 12: このタブだけの配色テーマを差し替える(per-session theme)。
      *  アプリ全体の既定テーマとは独立しており、以降このタブが解決するSGRにのみ反映される。 */

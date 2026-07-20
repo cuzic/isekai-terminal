@@ -743,6 +743,20 @@ class TerminalTabsViewModel(
     fun searchScrollbackForPane(address: PaneAddress, query: String, caseSensitive: Boolean): List<ScrollbackSearchMatch> =
         withPane(address) { it.session.searchScrollback(query, caseSensitive) } ?: emptyList()
 
+    /** タスク#13(OSC 133)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+     *  ([searchScrollbackForPane])とは独立した機能。 */
+    fun jumpToPreviousPromptForPane(address: PaneAddress, fromScrollOffset: Int, fromShowingScrollback: Boolean) =
+        withPane(address) { it.session.jumpToPreviousPrompt(fromScrollOffset, fromShowingScrollback) }
+
+    fun jumpToNextPromptForPane(address: PaneAddress, fromScrollOffset: Int, fromShowingScrollback: Boolean) =
+        withPane(address) { it.session.jumpToNextPrompt(fromScrollOffset, fromShowingScrollback) }
+
+    fun clickToPromptCursorForPane(address: PaneAddress, row: Int, col: Int) =
+        withPane(address) { it.session.clickToPromptCursor(row, col) }
+
+    fun copyLastCommandOutputForPane(address: PaneAddress) =
+        withPane(address) { it.session.copyLastCommandOutput() }
+
     fun trustUpdatedHostKeyForPane(address: PaneAddress) = withPane(address) { it.session.trustUpdatedHostKey() }
 
     fun dismissHostKeyWarningForPane(address: PaneAddress) = withPane(address) { it.session.dismissHostKeyWarning() }
