@@ -1088,6 +1088,13 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
      */
     func cancelReconnect() 
     
+    /**
+     * OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     * 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     * (Ghostty`cl=line`相当)。対象外なら無音でno-op。未接続時も無視される。
+     */
+    func clickToPromptCursor(row: UInt32, col: UInt32) 
+    
     func connect(config: SshConfig) throws 
     
     /**
@@ -1124,6 +1131,13 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     
     func connectQuic(config: QuicConfig) throws 
     
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+     * `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+     * (該当コマンドがまだ無ければ`None`、未接続時は無視される)。
+     */
+    func copyLastCommandOutput() 
+    
     func disconnect() 
     
     /**
@@ -1135,6 +1149,20 @@ public protocol SessionOrchestratorProtocol: AnyObject, Sendable {
     func forceReturnToWifi() 
     
     func isQuic()  -> Bool
+    
+    /**
+     * [jump_to_previous_prompt]の「次」版。
+     */
+    func jumpToNextPrompt(fromScrollOffset: UInt32, fromShowingScrollback: Bool) 
+    
+    /**
+     * OSC 133(タスク#13)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+     * (`search_scrollback`)とは独立した機能——`from_scroll_offset`/
+     * `from_showing_scrollback`はKotlin側が今表示している位置(タスク#79と同じ
+     * `scrollOffset`/`showingScrollback`の規約)をそのまま渡す。結果は
+     * `OrchestratorCallback::on_prompt_jump`で非同期に返る(未接続時は無視される)。
+     */
+    func jumpToPreviousPrompt(fromScrollOffset: UInt32, fromShowingScrollback: Bool) 
     
     /**
      * バックグラウンド猶予が尽きた(`beginBackgroundTask`失効等)ことを通知する。
@@ -1326,6 +1354,20 @@ open func cancelReconnect()  {try! rustCall() {
 }
 }
     
+    /**
+     * OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     * 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     * (Ghostty`cl=line`相当)。対象外なら無音でno-op。未接続時も無視される。
+     */
+open func clickToPromptCursor(row: UInt32, col: UInt32)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_click_to_prompt_cursor(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(row),
+        FfiConverterUInt32.lower(col),$0
+    )
+}
+}
+    
 open func connect(config: SshConfig)throws   {try rustCallWithError(FfiConverterTypeSshError_lift) {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect(
             self.uniffiCloneHandle(),
@@ -1404,6 +1446,18 @@ open func connectQuic(config: QuicConfig)throws   {try rustCallWithError(FfiConv
 }
 }
     
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+     * `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+     * (該当コマンドがまだ無ければ`None`、未接続時は無視される)。
+     */
+open func copyLastCommandOutput()  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_copy_last_command_output(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
 open func disconnect()  {try! rustCall() {
     uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(
             self.uniffiCloneHandle(),$0
@@ -1430,6 +1484,34 @@ open func isQuic() -> Bool  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * [jump_to_previous_prompt]の「次」版。
+     */
+open func jumpToNextPrompt(fromScrollOffset: UInt32, fromShowingScrollback: Bool)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_next_prompt(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(fromScrollOffset),
+        FfiConverterBool.lower(fromShowingScrollback),$0
+    )
+}
+}
+    
+    /**
+     * OSC 133(タスク#13)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+     * (`search_scrollback`)とは独立した機能——`from_scroll_offset`/
+     * `from_showing_scrollback`はKotlin側が今表示している位置(タスク#79と同じ
+     * `scrollOffset`/`showingScrollback`の規約)をそのまま渡す。結果は
+     * `OrchestratorCallback::on_prompt_jump`で非同期に返る(未接続時は無視される)。
+     */
+open func jumpToPreviousPrompt(fromScrollOffset: UInt32, fromShowingScrollback: Bool)  {try! rustCall() {
+    uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_previous_prompt(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(fromScrollOffset),
+        FfiConverterBool.lower(fromShowingScrollback),$0
+    )
+}
 }
     
     /**
@@ -3026,6 +3108,74 @@ public func FfiConverterTypePortForward_lift(_ buf: RustBuffer) throws -> PortFo
 #endif
 public func FfiConverterTypePortForward_lower(_ value: PortForward) -> RustBuffer {
     return FfiConverterTypePortForward.lower(value)
+}
+
+
+/**
+ * OSC 133(タスク#13、セマンティックプロンプト)「前/次のプロンプトへジャンプ」の
+ * ジャンプ先。`SessionOrchestrator::jump_to_previous_prompt`/`jump_to_next_prompt`の
+ * 結果として`OrchestratorCallback::on_prompt_jump`経由で非同期に届く。
+ *
+ * - `is_live`が`true`の場合、ジャンプ先は現在のライブ画面上にある。呼び出し側は
+ * `scrollOffset`を0にリセットし`showingScrollback`をfalseにするだけでよい
+ * (`scrollback_cells`を呼ぶ必要はない)。
+ * - `is_live`が`false`の場合、`scroll_offset`は[SessionOrchestrator::scrollback_cells]の
+ * `offset`引数・[ScrollbackSearchMatch::row]と同じ規約——そのまま`scrollOffset`に
+ * 代入し`showingScrollback`をtrueにすればよい(タスク#79の「scrollback最新行と
+ * ライブ画面表示の`scrollOffset==0`衝突」を`is_live`で明示的に区別する、既存の
+ * 検索ジャンプと同型のパターン)。
+ */
+public struct PromptJumpTarget: Equatable, Hashable {
+    public var scrollOffset: UInt32
+    public var isLive: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(scrollOffset: UInt32, isLive: Bool) {
+        self.scrollOffset = scrollOffset
+        self.isLive = isLive
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PromptJumpTarget: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePromptJumpTarget: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PromptJumpTarget {
+        return
+            try PromptJumpTarget(
+                scrollOffset: FfiConverterUInt32.read(from: &buf), 
+                isLive: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PromptJumpTarget, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.scrollOffset, into: &buf)
+        FfiConverterBool.write(value.isLive, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptJumpTarget_lift(_ buf: RustBuffer) throws -> PromptJumpTarget {
+    return try FfiConverterTypePromptJumpTarget.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePromptJumpTarget_lower(_ value: PromptJumpTarget) -> RustBuffer {
+    return FfiConverterTypePromptJumpTarget.lower(value)
 }
 
 
@@ -5816,6 +5966,18 @@ public protocol OrchestratorCallback: AnyObject, Sendable {
      */
     func onRebindStateChanged(state: RebindPublicState) 
     
+    /**
+     * OSC 133(タスク#13)「前/次のプロンプトへジャンプ」(`jump_to_previous_prompt`/
+     * `jump_to_next_prompt`)の結果。ジャンプ先が見つからなければ`None`。
+     */
+    func onPromptJump(target: PromptJumpTarget?) 
+    
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」(`copyLastCommandOutput`)の
+     * 結果。該当コマンドがまだ無ければ`None`。
+     */
+    func onPromptOutputCopyReady(text: String?) 
+    
 }
 
 
@@ -6176,6 +6338,54 @@ fileprivate struct UniffiCallbackInterfaceOrchestratorCallback {
                 makeCall: makeCall,
                 writeReturn: writeReturn
             )
+        },
+        onPromptJump: { (
+            uniffiHandle: UInt64,
+            target: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onPromptJump(
+                     target: try FfiConverterOptionTypePromptJumpTarget.lift(target)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onPromptOutputCopyReady: { (
+            uniffiHandle: UInt64,
+            text: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceOrchestratorCallback.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onPromptOutputCopyReady(
+                     text: try FfiConverterOptionString.lift(text)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
         }
     )
 
@@ -6491,6 +6701,30 @@ fileprivate struct FfiConverterOptionTypePlatformFd: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypePlatformFd.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePromptJumpTarget: FfiConverterRustBuffer {
+    typealias SwiftType = PromptJumpTarget?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePromptJumpTarget.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePromptJumpTarget.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -7260,6 +7494,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect() != 53892) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_click_to_prompt_cursor() != 45047) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect() != 45531) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7281,6 +7518,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic() != 50706) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_copy_last_command_output() != 30171) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7288,6 +7528,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic() != 9641) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_next_prompt() != 13603) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_previous_prompt() != 53496) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired() != 26224) {
@@ -7405,6 +7651,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed() != 15707) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_jump() != 36510) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready() != 14453) {
         return InitializationResult.apiChecksumMismatch
     }
 
