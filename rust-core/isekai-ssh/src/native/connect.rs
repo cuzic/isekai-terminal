@@ -715,8 +715,10 @@ where
     // fallback below. Only a genuine transport/protocol error aborts.
     for candidate in &candidates {
         let Some(credential) = private_key::read_credential(candidate) else {
+            log_line!("isekai-ssh: no key at {}", candidate.display());
             continue;
         };
+        log_line!("isekai-ssh: trying key {}", candidate.display());
         match authenticate_session(&mut handle, username, &credential).await {
             Ok(true) => return Ok(handle),
             Ok(false) => continue,

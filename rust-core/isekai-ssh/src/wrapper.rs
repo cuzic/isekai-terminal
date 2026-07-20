@@ -317,7 +317,11 @@ impl WrapperResolution {
     /// `default_target` uses (destination literal, port 22) — the native
     /// path's SSH TCP target and `HostKeyVerifier` trust-store key.
     pub(crate) fn native_host_port(&self, destination: &str) -> (String, u16) {
-        let host = self.openssh.hostname.clone().unwrap_or_else(|| destination.to_string());
+        let raw_host = self.openssh.hostname.clone().unwrap_or_else(|| destination.to_string());
+        // Strip user@ prefix if present — the destination may be `user@host`
+        // and the OpenSSH config resolution may preserve the user part in the
+        // hostname (openssh-config does not split user@host automatically).
+        let host = raw_host.split('@').last().unwrap_or(&raw_host).to_string();
         let port = self.openssh.port.unwrap_or(22);
         (host, port)
     }
