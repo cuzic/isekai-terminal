@@ -6,6 +6,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineDispatcher
@@ -20,6 +21,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import tools.isekai.terminal.data.AuthType
 import tools.isekai.terminal.data.ConnectionProfile
 import tools.isekai.terminal.data.HostKeySettings
 import tools.isekai.terminal.data.KeySequence
@@ -29,6 +31,8 @@ import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.input.KeyStep
 import tools.isekai.terminal.session.AndroidAppExecutor
 import tools.isekai.terminal.session.AppExecutor
+import tools.isekai.terminal.session.ReattachRecord
+import tools.isekai.terminal.session.ReattachStateStore
 import tools.isekai.terminal.session.RealHostKeyChecker
 import tools.isekai.terminal.session.RebindFdSource
 import tools.isekai.terminal.session.TerminalSession
@@ -41,6 +45,7 @@ import uniffi.isekai_terminal_core.ClipboardMimeKind
 import uniffi.isekai_terminal_core.ClipboardPayload
 import uniffi.isekai_terminal_core.PlatformFd
 import uniffi.isekai_terminal_core.ScrollbackSearchMatch
+import uniffi.isekai_terminal_core.reattachRecordIsFresh
 
 /**
  * 複数タブ（複数 SSH/QUIC セッション）を横断する Application スコープの状態管理。
@@ -142,6 +147,10 @@ class TerminalTabsViewModel(
     // ここで起動される実スレッドの完了タイミングが競合し、withTimeout()ポーリングが
     // 断続的にタイムアウトする原因になっていた。
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    // タスク#14: プロセスkillからの黙示的セッション再アタッチ用の永続化ストア(ファイルベース、
+    // 設計判断は[ReattachStateStore]のdoc参照)。テストは専用の一時ファイルを指す
+    // インスタンスを注入できる。
+    private val reattachStore: ReattachStateStore = ReattachStateStore(File(app.filesDir, REATTACH_STATE_FILE_NAME)),
 ) : AndroidViewModel(app) {
 
     /** 本番用コンストラクタ。Compose の viewModel() から呼ばれる。
@@ -230,6 +239,9 @@ class TerminalTabsViewModel(
     companion object {
         // Connected 直後は取りこぼし防止のため少し待ってから自動実行コマンドを送る。
         private const val POST_CONNECT_DEBOUNCE_MS = 400L
+
+        // タスク#14: [ReattachStateStore]の既定の永続化先ファイル名(`context.filesDir`直下)。
+        private const val REATTACH_STATE_FILE_NAME = "reattach_state.json"
     }
 
     /**
@@ -349,6 +361,80 @@ class TerminalTabsViewModel(
             },
             onLost = { onNetworkPathChanged(isSatisfied = false) },
         )
+        // タスク#14: このViewModelはプロセス寿命にスコープされた(Applicationスコープの)
+        // シングルトンなので(クラスdoc参照)、このinitブロックはプロセスが新規に起動した
+        // 時にちょうど1回だけ走る——「前回のプロセスがkillされる直前に開いていたタブを
+        // 黙示的に復元する」タイミングとして自然に一致する。
+        restorePersistedReattachTabs()
+    }
+
+    /**
+     * タスク#14: 前回のプロセスで開かれていたタブを、[ReattachStateStore]に永続化された
+     * 記録から黙示的に(ユーザー操作無しで)復元する。「新鮮さ」の判定は
+     * `reattach_persistence.rs`(Rust側、`.claude/rules/rust-ssot.md`に従いポリシー判断を
+     * 一元化)に委譲する。復元は常に**通常の新規接続**([openTab]、新しいSessionIdでの
+     * 通常ATTACH)であり、isekai-pipeのワイヤーレベルRESUMEを再利用するものではない
+     * (`ReattachStateStore`のdoc・`reattach_persistence.rs`のモジュールdoc参照: プロセス
+     * kill後はSSHクライアントの暗号状態が失われているため、ワイヤーレベルRESUMEの再利用は
+     * 原理的に成立しない)。
+     *
+     * パスワード認証のプロファイルは対話プロンプト無しでは復元できないため対象外にする
+     * (`.claude/rules/always-connects.md`が認める「本質的に自動化できないケース」の一種)。
+     */
+    private fun restorePersistedReattachTabs() {
+        viewModelScope.launch(ioDispatcher) {
+            val records = reattachStore.load()
+            if (records.isEmpty()) return@launch
+            // 復元後は全レコードを新しいタブIDで作り直す([openTab]が[persistReattachRecord]
+            // 経由で新しいレコードを書き戻す)ため、古いレコードは先にまとめて捨てる。
+            reattachStore.clear()
+            val nowUnixSecs = (System.currentTimeMillis() / 1000L).toULong()
+            for (record in records) {
+                if (!reattachRecordIsFresh(record.savedAtUnixSecs.toULong(), nowUnixSecs)) {
+                    RemoteLogger.i(
+                        "IsekaiTerminalReattach",
+                        "discarding stale reattach record for '${record.label}' " +
+                            "(savedAt=${record.savedAtUnixSecs}, now=$nowUnixSecs)",
+                    )
+                    continue
+                }
+                val profile = Repositories.profiles.findById(record.profileId)
+                if (profile == null) {
+                    RemoteLogger.i(
+                        "IsekaiTerminalReattach",
+                        "reattach record '${record.label}' refers to a deleted profile, skipping",
+                    )
+                    continue
+                }
+                if (profile.authTypeEnum != AuthType.KEY) {
+                    RemoteLogger.i(
+                        "IsekaiTerminalReattach",
+                        "'${profile.label}' uses password auth, skipping implicit reattach",
+                    )
+                    continue
+                }
+                RemoteLogger.i("IsekaiTerminalReattach", "implicitly reattaching '${profile.label}' after process restart")
+                openTab(profile)
+            }
+        }
+    }
+
+    /** [profile]がKEY認証の場合のみ、[tabId]の[ReattachRecord]を永続化(更新)する。
+     *  パスワード認証は黙示的復元の対象外なので([restorePersistedReattachTabs]参照)、
+     *  そもそも記録する意味が無く保存しない。 */
+    private fun persistReattachRecord(tabId: String, profile: ConnectionProfile) {
+        if (profile.authTypeEnum != AuthType.KEY) return
+        viewModelScope.launch(ioDispatcher) {
+            reattachStore.upsert(
+                ReattachRecord(
+                    tabId = tabId,
+                    profileId = profile.id,
+                    label = profile.label,
+                    reattachToken = UUID.randomUUID().toString(),
+                    savedAtUnixSecs = System.currentTimeMillis() / 1000L,
+                ),
+            )
+        }
     }
 
     // ── ネットワーク（全タブへファンアウト）───────────────────────────
@@ -386,6 +472,7 @@ class TerminalTabsViewModel(
         RemoteLogger.i("IsekaiTerminalTabsVM", "openTab '${profile.label}' id=$tabId")
         _tabs.update { it + tab }
         _activeTabId.value = tabId
+        persistReattachRecord(tabId, profile)
 
         // 複数セッションを1つの FGS が共有する。初回タブで起動、以後は通知内容の更新のみ。
         executor.ensureServiceRunning()
@@ -405,6 +492,9 @@ class TerminalTabsViewModel(
         if (_activeTabId.value == tabId) {
             _activeTabId.value = _tabs.value.firstOrNull()?.tabId
         }
+        // タスク#14: ユーザーが明示的に閉じたタブは、次回プロセス起動時に黙示的復元の
+        // 対象にしない(再オープンを望んでいないはずのため)。
+        viewModelScope.launch(ioDispatcher) { reattachStore.remove(tabId) }
         updateSessionsSummary()
     }
 
@@ -532,7 +622,7 @@ class TerminalTabsViewModel(
             launch { observeSummary(pane) }
             launch { observeDownloads(pane) }
             launch { observeFailover(pane) }
-            launch { observeConnectionTransitions(pane) }
+            launch { observeConnectionTransitions(tab, pane) }
         }
     }
 
@@ -554,7 +644,7 @@ class TerminalTabsViewModel(
         }
     }
 
-    private suspend fun observeConnectionTransitions(pane: PaneState) {
+    private suspend fun observeConnectionTransitions(tab: TabState, pane: PaneState) {
         var prevConnected = false
         pane.uiState.collect { state ->
             val connected = state.connected
@@ -564,6 +654,12 @@ class TerminalTabsViewModel(
                     pane.upstreamFailoverMonitorHandle = executor.registerUpstreamFailoverMonitor { onWifiUpstreamBroken(pane) }
                 }
                 maybeSendPostConnectCommands(pane)
+                // タスク#14: 「直近まで生きていたセッション」の記録を、Connectedへ
+                // 遷移するたびに新しい保存時刻で更新する。タブを開いた瞬間の時刻だけを
+                // 使うと、長時間接続し続けたセッションが(一度もネットワーク瞬断による
+                // 再接続を経験しないまま)猶予期間を過ぎて「古い」と誤判定されうるため
+                // (`reattach_persistence.rs`の`AUTO_REATTACH_GRACE_SECS`参照)。
+                tab.profile?.let { persistReattachRecord(tab.tabId, it) }
             } else if (!connected && prevConnected) {
                 executor.notifyDisconnected()
                 pane.physicalMultipathHandle?.close()

@@ -2,6 +2,7 @@ package tools.isekai.terminal
 
 import android.app.Application
 import androidx.test.core.app.ApplicationProvider
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
@@ -24,11 +25,14 @@ import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.input.KeyStep
 import tools.isekai.terminal.input.TerminalKeyEncoder
 import tools.isekai.terminal.session.AppExecutor
+import tools.isekai.terminal.session.ReattachRecord
+import tools.isekai.terminal.session.ReattachStateStore
 import tools.isekai.terminal.session.TerminalSession
 import uniffi.isekai_terminal_core.CursorShape
 import uniffi.isekai_terminal_core.MouseReportingMode
 import uniffi.isekai_terminal_core.ScreenUpdate
 import uniffi.isekai_terminal_core.TransportPreference
+import uniffi.isekai_terminal_core.reattachGraceWindowSecs
 
 /**
  * 複数タブ (複数 SSH セッション) を横断する [TerminalTabsViewModel] のテスト。
@@ -82,6 +86,33 @@ class TerminalTabsViewModelTest {
     private fun profile(label: String) = ConnectionProfile(
         label = label, host = "$label.example.com", username = "user", authType = "password",
     )
+
+    /** タスク#14: 鍵認証プロファイル(黙示的な自動再接続の対象になりうる唯一の認証種別、
+     *  [TerminalTabsViewModel.restorePersistedReattachTabs]参照)。[DumbAppExecutor.loadKeyPem]は
+     *  既定で空の鍵を返すだけでエラーにしないため、`keyId`の実在性はこのテストでは問わない。 */
+    private fun keyProfile(label: String) = ConnectionProfile(
+        label = label, host = "$label.example.com", username = "user", authType = "key", keyId = 1L,
+    )
+
+    /** [ReattachStateStore]専用の使い捨て一時ファイル。JUnitの`TemporaryFolder`ルールを
+     *  個々のテストのためだけに導入するコストを避け、[java.io.File.createTempFile]で足りるため
+     *  そちらを使う。 */
+    private fun tempReattachStore(): ReattachStateStore =
+        ReattachStateStore(File.createTempFile("reattach-state-test", ".json").apply { deleteOnExit() })
+
+    /** [vm]とは別の、[reattachStore]を注入した[TerminalTabsViewModel]をもう1つ生成する
+     *  (タスク#14: プロセス再起動直後の黙示的復元を検証するため、`init{}`実行前に
+     *  ストアへレコードを仕込んでおく必要があり、`setup()`で既に構築済みの[vm]は使えない)。
+     *  生成される[FakeOrchestrator]は引き続き共有の[orchestrators]リストへ追記される。 */
+    private fun newViewModel(reattachStore: ReattachStateStore): TerminalTabsViewModel {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val sessionFactory: (AppExecutor, tools.isekai.terminal.session.RebindFdSource) -> TerminalSession = { _, _ ->
+            val fake = FakeOrchestrator()
+            orchestrators.add(fake)
+            TerminalSession(FakeHostKeyChecker(), orchestratorFactory = { cb -> fake.also { it.callback = cb } })
+        }
+        return TerminalTabsViewModel(app, executor, sessionFactory, UnconfinedTestDispatcher(testScheduler), reattachStore)
+    }
 
     private suspend fun awaitConnectCalled(o: FakeOrchestrator) =
         withTimeout(3000) { while (!o.connectCalled) kotlinx.coroutines.delay(10) }
@@ -768,5 +799,125 @@ class TerminalTabsViewModelTest {
 
         assertEquals(tools.isekai.terminal.ui.TerminalThemes.SOLARIZED_DARK, tab(followingId).currentTheme.value)
         assertEquals(tools.isekai.terminal.ui.TerminalThemes.DRACULA, tab(overriddenId).currentTheme.value)
+    }
+
+    // ── タスク#14: プロセスkillからの黙示的セッション再アタッチ ────────────────
+
+    @Test
+    fun openTab_withKeyAuthProfile_persistsAReattachRecord() = runBlocking {
+        val store = tempReattachStore()
+        val vm2 = newViewModel(store)
+        val base = keyProfile("a")
+        val profile = base.copy(id = Repositories.profiles.save(base))
+
+        val tabId = vm2.openTab(profile)
+
+        // upsert()はioDispatcher上のコルーチンで非同期に呼ばれるため、書き込みが反映されるまで
+        // ポーリングする(UnconfinedTestDispatcherは即座に実行されるはずだが、他のテストの
+        // awaitConnectCalledと同じ流儀でポーリングし高負荷環境でも安定させる)。
+        withTimeout(3000) { while (store.load().isEmpty()) delay(10) }
+        val record = store.load().single()
+        assertEquals(tabId, record.tabId)
+        assertEquals(profile.id, record.profileId)
+    }
+
+    @Test
+    fun openTab_withPasswordAuthProfile_doesNotPersistAReattachRecord() = runBlocking {
+        val store = tempReattachStore()
+        val vm2 = newViewModel(store)
+
+        vm2.openTab(profile("a"), "pass")
+        awaitConnectCalled(orchestrators.last())
+
+        // パスワード認証は対話プロンプト無しでは自動再接続できないため、そもそも記録しない
+        // (`persistReattachRecord`のガード)。少し待っても記録が現れないことを確認する。
+        delay(50)
+        assertTrue(store.load().isEmpty())
+    }
+
+    @Test
+    fun closeTab_removesTheReattachRecord() = runBlocking {
+        val store = tempReattachStore()
+        val vm2 = newViewModel(store)
+        val base = keyProfile("a")
+        val profile = base.copy(id = Repositories.profiles.save(base))
+        val tabId = vm2.openTab(profile)
+        withTimeout(3000) { while (store.load().isEmpty()) delay(10) }
+
+        vm2.closeTab(tabId)
+
+        withTimeout(3000) { while (store.load().isNotEmpty()) delay(10) }
+        assertTrue(store.load().isEmpty())
+    }
+
+    @Test
+    fun freshReattachRecordForKeyAuthProfile_isSilentlyRestoredOnConstruction() = runBlocking {
+        val store = tempReattachStore()
+        val saved = Repositories.profiles.save(keyProfile("restored"))
+        val now = System.currentTimeMillis() / 1000L
+        store.upsert(
+            ReattachRecord(tabId = "old-tab", profileId = saved, label = "restored", reattachToken = "tok", savedAtUnixSecs = now),
+        )
+
+        val vm2 = newViewModel(store)
+
+        // vm2のinit{}が復元処理をioDispatcher上のコルーチンでキックするため、タブが
+        // 現れるまでポーリングする。
+        withTimeout(3000) { while (vm2.tabs.value.isEmpty()) delay(10) }
+        assertEquals(1, vm2.tabs.value.size)
+        assertEquals("restored", vm2.tabs.value.single().label)
+        awaitConnectCalled(orchestrators.last())
+    }
+
+    @Test
+    fun staleReattachRecord_isNotRestored() = runBlocking {
+        val store = tempReattachStore()
+        val saved = Repositories.profiles.save(keyProfile("too-old"))
+        // 猶予期間ぎりぎり超過(境界値は`reattach_persistence.rs`のRustユニットテストで
+        // 別途検証済みなので、ここではKotlin側の配線だけを確認する)。
+        val staleSavedAt = System.currentTimeMillis() / 1000L - reattachGraceWindowSecs().toLong() - 60L
+        store.upsert(
+            ReattachRecord(tabId = "old-tab", profileId = saved, label = "too-old", reattachToken = "tok", savedAtUnixSecs = staleSavedAt),
+        )
+
+        val vm2 = newViewModel(store)
+
+        // 復元処理自体は必ず一度走り、古いレコードもまとめて掃除するためstoreをclearする
+        // ([TerminalTabsViewModel.restorePersistedReattachTabs]参照)。それが完了するまで
+        // 待ってからタブが作られていないことを確認する。
+        withTimeout(3000) { while (store.load().isNotEmpty()) delay(10) }
+        delay(300)
+        assertTrue(vm2.tabs.value.isEmpty())
+    }
+
+    @Test
+    fun reattachRecordForDeletedProfile_isSkipped() = runBlocking {
+        val store = tempReattachStore()
+        val now = System.currentTimeMillis() / 1000L
+        store.upsert(
+            ReattachRecord(tabId = "old-tab", profileId = 999_999L, label = "gone", reattachToken = "tok", savedAtUnixSecs = now),
+        )
+
+        val vm2 = newViewModel(store)
+
+        withTimeout(3000) { while (store.load().isNotEmpty()) delay(10) }
+        delay(300)
+        assertTrue(vm2.tabs.value.isEmpty())
+    }
+
+    @Test
+    fun reattachRecordForPasswordAuthProfile_isSkipped() = runBlocking {
+        val store = tempReattachStore()
+        val saved = Repositories.profiles.save(profile("password-profile"))
+        val now = System.currentTimeMillis() / 1000L
+        store.upsert(
+            ReattachRecord(tabId = "old-tab", profileId = saved, label = "password-profile", reattachToken = "tok", savedAtUnixSecs = now),
+        )
+
+        val vm2 = newViewModel(store)
+
+        withTimeout(3000) { while (store.load().isNotEmpty()) delay(10) }
+        delay(300)
+        assertTrue(vm2.tabs.value.isEmpty())
     }
 }
