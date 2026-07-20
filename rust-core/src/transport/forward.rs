@@ -275,6 +275,7 @@ mod local_forward_e2e_tests {
         fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
         fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
         fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+        fn on_file_preview_result(&self, _request_id: String, _outcome: crate::file_preview::FilePreviewOutcome) {}
     }
 
     /// 受け取ったバイト列をそのまま返すだけのダミー TCP サーバ。

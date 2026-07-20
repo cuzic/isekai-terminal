@@ -1,6 +1,7 @@
 uniffi::setup_scaffolding!("isekai_terminal_core");
 
 pub mod trzsz;
+pub mod file_preview;
 pub mod quic_transport;
 pub(crate) mod agent_forward;
 pub(crate) mod terminal;
@@ -1275,6 +1276,10 @@ pub trait OrchestratorCallback: Send + Sync {
     /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」(`copyLastCommandOutput`)の
     /// 結果。該当コマンドがまだ無ければ`None`。
     fn on_prompt_output_copy_ready(&self, text: Option<String>);
+    /// タスク#17(ファイルプレビュー機能): `file_preview_request`で発行した`request_id`の
+    /// 結果。`ctl_file.rs`のJSON出力は既にここへ届く前に`FilePreviewOutcome`へ
+    /// パース済み(`rust-ssot.md`: JSONパース/base64デコードはRust側で完結させる)。
+    fn on_file_preview_result(&self, request_id: String, outcome: crate::file_preview::FilePreviewOutcome);
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -1304,6 +1309,9 @@ pub(crate) trait SessionCallback: Send + Sync {
     /// `OrchestratorCallback::on_prompt_jump`へ委譲する——#10/#22と同じパターン)。
     fn on_prompt_jump(&self, _target: Option<PromptJumpTarget>) {}
     fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+    /// タスク#17。デフォルトはno-op(`OrchestratorAdapter`だけが実際に
+    /// `OrchestratorCallback::on_file_preview_result`へ委譲する——#10/#22と同じパターン)。
+    fn on_file_preview_exec_result(&self, _request_id: String, _stdout: Vec<u8>, _exit_status: Option<u32>) {}
 }
 
 // ── SshSession ──────────────────────────────────────────
@@ -1429,6 +1437,14 @@ impl SshSession {
                 log::warn!("ssh: remove_forward command dropped (channel full)");
             }
         }
+    }
+
+    /// タスク#17: ファイルプレビュー用の`isekai-pipe ctl file`execを1本キューイングする。
+    /// `command_sender()`が無い(未接続/切断済み)場合は`false`を返し、呼び出し元
+    /// (`SessionOrchestrator::file_preview_request`)がその場で`FilePreviewOutcome::Error`を
+    /// 合成する。
+    pub(crate) fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
+        self.core.file_preview_exec(request_id, command_line)
     }
 
     /// Phase 12: per-session theme。SessionOrchestrator からのみ呼ばれる内部API。

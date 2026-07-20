@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use parking_lot::Mutex;
@@ -6,6 +7,7 @@ use crate::{
     CellData, ClipboardPayload, ConnectionIssueHint, ConnectionPublicState, ForwardState, OrchestratorCallback,
     ScreenUpdate, ScrollbackSearchMatch, SessionCallback, SshConfig, SshError, TrzszPublicState, RUNTIME,
 };
+use crate::file_preview::{self, FilePreviewOutcome, FilePreviewRequestKind};
 use crate::net_health_policy;
 use crate::quic_transport::{QuicConfig, QuicSession};
 use crate::isekai_pipe_quic_transport::{IsekaiPipeQuicConfig, IsekaiPipeQuicSession};
@@ -115,6 +117,12 @@ impl ActiveSession {
     }
     fn copy_last_command_output(&self) {
         dispatch_all!(self, copy_last_command_output)
+    }
+    /// タスク#17: `run_ssh_channel_loop`は6トランスポート共通の実体なので
+    /// (`transport/ssh_handler.rs`のモジュールdoc参照)、`add_local_forward`と違い
+    /// トランスポート別の対応可否分岐は無い——全バリアントで同じ委譲でよい。
+    fn file_preview_exec(&self, request_id: String, command_line: String) -> bool {
+        dispatch_all!(self, file_preview_exec, request_id, command_line)
     }
     fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
         match self {
@@ -292,6 +300,15 @@ struct OrchestratorState {
     /// 届くのは少し後になる。その届いた際にこのIDが一致すれば、汎用文言ではなく
     /// ユーザーに分かりやすい「大きすぎる」メッセージへ差し替える。
     size_limit_exceeded_for: Option<String>,
+
+    /// タスク#17: `file_preview_request`が発行した`request_id`→要求種別のマップ。
+    /// `TransportEvent::FilePreviewExecResult`が届いた時点でここから取り出して
+    /// `crate::file_preview::parse_result`に渡す(execチャネル自体は「どのサブコマンドを
+    /// 要求したか」を知らずstdoutを運ぶだけなので、パースにはこの対応が要る)。
+    /// 複数の要求が同時に in-flight でも(例: ディレクトリ一覧中に別ファイルをcat)
+    /// `request_id`ごとに独立して解決できるようMapにしている(trzszの
+    /// `current_transfer_id`のような単一スロットでは足りない)。
+    pending_file_previews: HashMap<String, FilePreviewRequestKind>,
 
     // ── 自動再接続(tssh風reconnect) ──────────────────────
     /// セッションオブジェクト1つ生成するごとにインクリメントする世代カウンタ。
@@ -559,6 +576,23 @@ impl SessionCallback for OrchestratorAdapter {
     fn on_prompt_output_copy_ready(&self, text: Option<String>) {
         if !self.is_current() { return; }
         self.shared.callback.on_prompt_output_copy_ready(text);
+    }
+
+    /// タスク#17: `pending_file_previews`から`request_id`に対応する要求種別を取り出し、
+    /// `crate::file_preview::parse_result`でJSON/base64をデコード済みの
+    /// `FilePreviewOutcome`へ変換してから`OrchestratorCallback`へ渡す。対応する要求が
+    /// 見つからない(二重配送・古い世代からの遅延イベント等)場合はエラーとして扱う
+    /// (呼び出し元がKotlin側で待っているリクエストを永遠に待たせたままにしない)。
+    fn on_file_preview_exec_result(&self, request_id: String, stdout: Vec<u8>, exit_status: Option<u32>) {
+        if !self.is_current() { return; }
+        let kind = self.shared.state.lock().pending_file_previews.remove(&request_id);
+        let outcome = match kind {
+            Some(kind) => file_preview::parse_result(&kind, exit_status, &stdout),
+            None => FilePreviewOutcome::Error {
+                message: format!("file_preview: unknown or already-resolved request_id {request_id}"),
+            },
+        };
+        self.shared.callback.on_file_preview_result(request_id, outcome);
     }
 }
 
@@ -904,6 +938,7 @@ pub fn create_session_orchestrator(callback: Box<dyn OrchestratorCallback>) -> A
             trzsz_mode: None,
             download_buf: Vec::new(),
             size_limit_exceeded_for: None,
+            pending_file_previews: HashMap::new(),
             session_generation: 0,
             reconnect_epoch: 0,
             reconnect_loop_active: false,
@@ -1389,6 +1424,32 @@ impl SessionOrchestrator {
             ConnectionPublicState::Error { message }
         );
     }
+
+    /// タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモート
+    /// ホストで1回実行し、結果を`request_id`付きで非同期に`OrchestratorCallback::
+    /// on_file_preview_result`へ返す。`request_id`は呼び出し側(Kotlin)が発行する
+    /// 一意なID(例: UUID)——複数のディレクトリ一覧/catチャンク要求が同時に
+    /// in-flightでも取り違えないようにするため。
+    ///
+    /// 未接続、またはセッションがこのexecに対応していない(現状は全トランスポートが
+    /// 対応しているため実質「未接続」のみ)場合は、待たせず即座に
+    /// `FilePreviewOutcome::Error`で応答する。
+    pub fn file_preview_request(&self, request_id: String, kind: FilePreviewRequestKind) {
+        let command_line = file_preview::build_command_line(&kind);
+        self.shared.state.lock().pending_file_previews.insert(request_id.clone(), kind);
+
+        let queued = self.shared.session.lock().as_ref()
+            .map(|s| s.file_preview_exec(request_id.clone(), command_line))
+            .unwrap_or(false);
+
+        if !queued {
+            self.shared.state.lock().pending_file_previews.remove(&request_id);
+            self.shared.callback.on_file_preview_result(
+                request_id,
+                FilePreviewOutcome::Error { message: "not connected".to_string() },
+            );
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -1444,6 +1505,7 @@ mod tests {
         connection_states: StdMutex<Vec<ConnectionPublicState>>,
         trzsz_states: StdMutex<Vec<TrzszPublicState>>,
         downloads: StdMutex<Vec<(Option<String>, Vec<u8>)>>,
+        file_preview_outcomes: StdMutex<Vec<FilePreviewOutcome>>,
     }
 
     impl OrchestratorCallback for RecordingCallback {
@@ -1473,6 +1535,9 @@ mod tests {
         fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
         fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
         fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+        fn on_file_preview_result(&self, _request_id: String, outcome: FilePreviewOutcome) {
+            self.file_preview_outcomes.lock().unwrap().push(outcome);
+        }
     }
 
     fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {
@@ -1487,6 +1552,7 @@ mod tests {
                 trzsz_mode: None,
                 download_buf: Vec::new(),
                 size_limit_exceeded_for: None,
+                pending_file_previews: HashMap::new(),
                 session_generation: 0,
                 reconnect_epoch: 0,
                 reconnect_loop_active: false,
@@ -1543,6 +1609,7 @@ mod tests {
                 trzsz_mode: None,
                 download_buf: Vec::new(),
                 size_limit_exceeded_for: None,
+                pending_file_previews: HashMap::new(),
                 session_generation: 0,
                 reconnect_epoch: 0,
                 reconnect_loop_active: false,
@@ -2475,6 +2542,7 @@ mod tests {
                 trzsz_mode: None,
                 download_buf: Vec::new(),
                 size_limit_exceeded_for: None,
+                pending_file_previews: HashMap::new(),
                 session_generation: 0,
                 reconnect_epoch: 0,
                 reconnect_loop_active: false,
@@ -2523,6 +2591,75 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(e, ConnectionPublicState::Disconnected { .. })),
             "同期失敗はDisconnectedとして通知されるはず, got: {events:?}"
+        );
+    }
+
+    // ── タスク#17: ファイルプレビュー ────────────────────
+
+    #[test]
+    fn on_file_preview_exec_result_resolves_a_pending_ls_request() {
+        let (adapter, shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        shared.state.lock().pending_file_previews.insert(
+            "req-1".to_string(),
+            FilePreviewRequestKind::Ls { path: "/tmp".to_string() },
+        );
+
+        let stdout = br#"{"entries":[{"name":"a.txt","is_dir":false,"is_symlink":false,"size":3,"modified_unix":null}]}"#;
+        adapter.on_file_preview_exec_result("req-1".to_string(), stdout.to_vec(), Some(0));
+
+        assert!(
+            !shared.state.lock().pending_file_previews.contains_key("req-1"),
+            "解決済みのrequest_idはpendingマップから取り除かれるべき"
+        );
+        let outcomes = cb.file_preview_outcomes.lock().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            FilePreviewOutcome::Ls { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].name, "a.txt");
+            }
+            other => panic!("expected Ls outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_file_preview_exec_result_for_unknown_request_id_reports_error() {
+        let (adapter, _shared, cb) = adapter_with_phase(ConnPhase::Connected, false);
+        adapter.on_file_preview_exec_result("never-requested".to_string(), b"{}".to_vec(), Some(0));
+        let outcomes = cb.file_preview_outcomes.lock().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(&outcomes[0], FilePreviewOutcome::Error { .. }));
+    }
+
+    #[test]
+    fn on_file_preview_exec_result_ignored_when_adapter_is_stale() {
+        // #10/#22と同じ「古い世代からの遅延コールバックは無視する」パターン。
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let stale = OrchestratorAdapter::new(shared.clone());
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        shared.state.lock().pending_file_previews.insert(
+            "req-1".to_string(),
+            FilePreviewRequestKind::Ls { path: "/tmp".to_string() },
+        );
+
+        stale.on_file_preview_exec_result("req-1".to_string(), b"{\"entries\":[]}".to_vec(), Some(0));
+
+        assert!(cb.file_preview_outcomes.lock().unwrap().is_empty());
+        // 古いadapterからの呼び出しは無視されるので、pendingエントリも消費されずに残る。
+        assert!(shared.state.lock().pending_file_previews.contains_key("req-1"));
+    }
+
+    #[test]
+    fn file_preview_request_when_not_connected_reports_error_immediately() {
+        let (orch, cb) = orchestrator_with_phase(ConnPhase::Idle, false);
+        orch.file_preview_request("req-1".to_string(), FilePreviewRequestKind::Ls { path: "/tmp".to_string() });
+
+        let outcomes = cb.file_preview_outcomes.lock().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(&outcomes[0], FilePreviewOutcome::Error { .. }));
+        assert!(
+            !orch.shared.state.lock().pending_file_previews.contains_key("req-1"),
+            "即座にエラー応答した場合はpendingマップに残してはいけない"
         );
     }
 }

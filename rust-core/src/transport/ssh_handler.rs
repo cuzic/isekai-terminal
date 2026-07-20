@@ -59,6 +59,13 @@ pub(crate) enum TransportCommand {
     },
     /// `id` の待受を停止する(新規 accept を止める。既存の中継コピーは自然終了に任せる)。
     RemoveForward { id: String },
+    /// タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`を、
+    /// このタブの対話シェルPTYチャネルとは別の`exec`チャネル1本として実行する
+    /// (`crate::file_preview::build_command_line`が組み立てた完全なシェルコマンド文字列を
+    /// そのまま渡す——`setvar`/`getvar`と違いctl-socket-forwardは使わない、
+    /// `isekai-pipe/src/ctl_file.rs`のモジュールdoc参照)。結果は`request_id`付きで
+    /// `TransportEvent::FilePreviewExecResult`として返る。
+    FilePreviewExec { request_id: String, command_line: String },
 }
 
 /// tmux迂回control-plane(Epic M)のSSH streamlocal forwardチャネル1本から届いた
@@ -106,6 +113,12 @@ pub(crate) enum TransportEvent {
     /// 書き戻される。dropすると(opt-in無効・クリップボード空など)応答無しでチャネルが
     /// 閉じ、`isekai-pipe ctl clip pull`側は「応答前に接続が閉じられた」エラーになる。
     ClipboardPullRequestOverCtl(tokio::sync::oneshot::Sender<isekai_protocol::CtlMessage>),
+    /// タスク#17: `TransportCommand::FilePreviewExec`で発行した`exec`チャネル1本分の
+    /// 結果。`exit_status`が`Some(0)`以外・`None`(接続断でExitStatusが届かないまま
+    /// チャネルが閉じた場合)のいずれも「失敗」として`crate::file_preview::parse_result`
+    /// 側で扱う——ここ(transport層)はstdoutバイト列とexit statusをそのまま運ぶだけで
+    /// JSONの中身には関与しない。
+    FilePreviewExecResult { request_id: String, stdout: Vec<u8>, exit_status: Option<u32> },
 }
 
 /// Kotlin → session_event_loop: trzsz 操作（transport を経由しない）
@@ -788,6 +801,12 @@ pub(crate) async fn run_ssh_channel_loop(
                             }).await.ok();
                         }
                     }
+                    Some(TransportCommand::FilePreviewExec { request_id, command_line }) => {
+                        info!("file-preview[{}]: exec", request_id);
+                        tokio::spawn(super::file_preview_exec::run_file_preview_exec(
+                            request_id, command_line, session.clone(), event_tx.clone(),
+                        ));
+                    }
                     Some(TransportCommand::Disconnect) | None => {
                         info!("ssh: disconnect requested");
                         channel.eof().await.ok();
@@ -1029,6 +1048,7 @@ mod pooling_e2e_tests {
         fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
         fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
         fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+        fn on_file_preview_result(&self, _request_id: String, _outcome: crate::file_preview::FilePreviewOutcome) {}
     }
 
     /// 公開鍵認証を無条件で受け入れつつ認証回数を数え、シェルチャネルへ書き込まれた
@@ -1641,6 +1661,7 @@ mod pooling_e2e_tests {
         fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
         fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
         fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
+        fn on_file_preview_result(&self, _request_id: String, _outcome: crate::file_preview::FilePreviewOutcome) {}
     }
 
     /// flood(生の`TestEvent::Data`)がクライアント側に一通り届き終えたと判断できるまで
