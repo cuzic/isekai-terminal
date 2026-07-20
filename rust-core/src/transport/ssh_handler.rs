@@ -19,7 +19,7 @@ use crate::agent_forward;
 use crate::theme::Theme;
 use crate::{ForwardState, JumpConfig, SshAuth};
 
-use super::ctl_streamlocal::{ctl_socket_forward_enabled, new_ctl_socket_path};
+use super::ctl_streamlocal::{ctl_socket_forward_enabled, ctl_var_store, new_ctl_socket_path};
 use super::forward::{
     is_loopback_bind_address, reject_non_loopback_bind, run_dynamic_forward, run_local_forward, teardown_forward,
     ActiveForward,
@@ -260,31 +260,37 @@ impl client::Handler for RusshEventHandler {
             match reader.read_line(&mut line).await {
                 Ok(0) => debug!("ctl-socket[{socket_path}]: connection closed without sending anything"),
                 Ok(_) => match isekai_protocol::decode_ctl_message(line.trim_end_matches('\n').as_bytes()) {
-                    Ok(msg @ isekai_protocol::CtlMessage::ClipboardPullRequest {}) => {
+                    Ok(
+                        msg @ (isekai_protocol::CtlMessage::ClipboardPullRequest {}
+                        | isekai_protocol::CtlMessage::GetVarRequest { .. }),
+                    ) => {
                         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                         if tx.send(CtlInbound { msg, reply: Some(reply_tx) }).is_err() {
                             return;
                         }
-                        // `HostKey`/`AgentSignRequest`同様Kotlin側の同期I/Oを
-                        // `spawn_blocking`越しに待つため、応答が遅れる可能性がある。
+                        // `ClipboardPullRequest`はKotlin側の同期I/Oを`spawn_blocking`
+                        // 越しに待つため応答が遅れうる(タイムアウトあり)。
+                        // `GetVarRequest`(task #16)はメモリ上の`CtlVarStore`参照のみで
+                        // `run_ssh_channel_loop`のctl_rx消費タスクが即座に返すため
+                        // 実質的にすぐ届くが、コードパスは共通で問題ない。
                         // タイムアウトすれば単に何も書かずチャネルを閉じる——
-                        // `isekai-pipe ctl clip pull`側は「応答前に接続が閉じられた」
-                        // エラーとして扱う既存の経路にそのまま落ちるので、専用の
-                        // エラー応答を新設する必要は無い。
+                        // `isekai-pipe ctl clip pull`/`getvar`側は「応答前に接続が
+                        // 閉じられた」エラーとして扱う既存の経路にそのまま落ちるので、
+                        // 専用のエラー応答を新設する必要は無い。
                         match tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx).await {
                             Ok(Ok(response)) => {
                                 let Ok(mut out) = serde_json::to_vec(&response) else {
-                                    warn!("ctl-socket[{socket_path}]: failed to encode clipboard pull response");
+                                    warn!("ctl-socket[{socket_path}]: failed to encode ctl reply");
                                     return;
                                 };
                                 out.push(b'\n');
                                 if let Err(e) = write_half.write_all(&out).await {
-                                    warn!("ctl-socket[{socket_path}]: failed to write clipboard pull response: {e}");
+                                    warn!("ctl-socket[{socket_path}]: failed to write ctl reply: {e}");
                                 }
                                 let _ = write_half.shutdown().await;
                             }
-                            Ok(Err(_)) => debug!("ctl-socket[{socket_path}]: clipboard pull reply sender dropped without a response"),
-                            Err(_) => warn!("ctl-socket[{socket_path}]: clipboard pull response timed out"),
+                            Ok(Err(_)) => debug!("ctl-socket[{socket_path}]: ctl reply sender dropped without a response"),
+                            Err(_) => warn!("ctl-socket[{socket_path}]: ctl reply timed out"),
                         }
                     }
                     Ok(msg) => {
@@ -602,13 +608,34 @@ pub(crate) async fn run_ssh_channel_loop(
             Ok(()) => {
                 info!("ctl-socket: forwarding {} (Epic M)", path);
                 let forward_event_tx = event_tx.clone();
+                // `setvar`/`getvar`(task #16)のこのタブ専用ストア(`VarScope::Tab`/
+                // `Session`用)。`VarScope::Global`は`ctl_var_store`が
+                // `GLOBAL_CTL_VARS`(プロセス全体で共有)を返すのでここでは触らない。
+                // Kotlin側の非同期往復が要らない(メモリ上の参照のみ)ため、
+                // `ClipboardPullRequest`と違い`TransportEvent`を経由させず
+                // このタスク内で完結させる。
+                let tab_vars = isekai_protocol::CtlVarStore::new();
                 tokio::spawn(async move {
                     while let Some(CtlInbound { msg, reply }) = ctl_rx.recv().await {
-                        let event = match reply {
-                            Some(reply) => TransportEvent::ClipboardPullRequestOverCtl(reply),
-                            None => TransportEvent::CtlMessage(msg),
-                        };
-                        forward_event_tx.send(event).await.ok();
+                        match (msg, reply) {
+                            (isekai_protocol::CtlMessage::SetVar { scope, key, value }, _) => {
+                                ctl_var_store(scope, &tab_vars).set(key, value);
+                            }
+                            (isekai_protocol::CtlMessage::GetVarRequest { scope, key }, Some(reply)) => {
+                                let value = ctl_var_store(scope, &tab_vars).get(&key);
+                                let _ = reply.send(isekai_protocol::CtlMessage::GetVarResponse { value });
+                            }
+                            (msg, Some(reply)) => {
+                                // 現状ここに来るのは`ClipboardPullRequest`だけ
+                                // (Kotlin側の同期I/Oが要るのでTransportEvent経由に
+                                // 委ねる)。`msg`自体はフィールドが無いので不要。
+                                let _ = msg;
+                                forward_event_tx.send(TransportEvent::ClipboardPullRequestOverCtl(reply)).await.ok();
+                            }
+                            (msg, None) => {
+                                forward_event_tx.send(TransportEvent::CtlMessage(msg)).await.ok();
+                            }
+                        }
                     }
                 });
                 Some(path)
