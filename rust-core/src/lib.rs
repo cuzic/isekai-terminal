@@ -830,6 +830,24 @@ pub struct ScrollbackSearchMatch {
     pub len: u32,
 }
 
+/// OSC 133(タスク#13、セマンティックプロンプト)「前/次のプロンプトへジャンプ」の
+/// ジャンプ先。`SessionOrchestrator::jump_to_previous_prompt`/`jump_to_next_prompt`の
+/// 結果として`OrchestratorCallback::on_prompt_jump`経由で非同期に届く。
+///
+/// - `is_live`が`true`の場合、ジャンプ先は現在のライブ画面上にある。呼び出し側は
+///   `scrollOffset`を0にリセットし`showingScrollback`をfalseにするだけでよい
+///   (`scrollback_cells`を呼ぶ必要はない)。
+/// - `is_live`が`false`の場合、`scroll_offset`は[SessionOrchestrator::scrollback_cells]の
+///   `offset`引数・[ScrollbackSearchMatch::row]と同じ規約——そのまま`scrollOffset`に
+///   代入し`showingScrollback`をtrueにすればよい(タスク#79の「scrollback最新行と
+///   ライブ画面表示の`scrollOffset==0`衝突」を`is_live`で明示的に区別する、既存の
+///   検索ジャンプと同型のパターン)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct PromptJumpTarget {
+    pub scroll_offset: u32,
+    pub is_live: bool,
+}
+
 /// DECSCUSR(`CSI Ps SP q`)が選択するカーソル形状。`Terminal`が状態として保持し
 /// (rust-ssot: Kotlin/Swift側にミラー状態を作らず、この値をそのまま描画に使う)、
 /// `ScreenUpdate::cursor_shape`として公開する。点滅の有無は別フィールド
@@ -1251,6 +1269,12 @@ pub trait OrchestratorCallback: Send + Sync {
     /// #19: `RebindManager`の状態が変化した(WiFi/セルラーフェイルオーバー/復帰待ち)。
     /// マルチパス以外のtransportでは呼ばれない。
     fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState);
+    /// OSC 133(タスク#13)「前/次のプロンプトへジャンプ」(`jump_to_previous_prompt`/
+    /// `jump_to_next_prompt`)の結果。ジャンプ先が見つからなければ`None`。
+    fn on_prompt_jump(&self, target: Option<PromptJumpTarget>);
+    /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」(`copyLastCommandOutput`)の
+    /// 結果。該当コマンドがまだ無ければ`None`。
+    fn on_prompt_output_copy_ready(&self, text: Option<String>);
 }
 
 // ── Old callback interface (kept for binary compatibility) ──
@@ -1276,6 +1300,10 @@ pub(crate) trait SessionCallback: Send + Sync {
     fn on_request_wifi_fd(&self) -> Option<PlatformFd> { None }
     fn on_request_cellular_fd(&self) -> Option<PlatformFd> { None }
     fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+    /// タスク#13。デフォルトはno-op(`OrchestratorAdapter`だけが実際に
+    /// `OrchestratorCallback::on_prompt_jump`へ委譲する——#10/#22と同じパターン)。
+    fn on_prompt_jump(&self, _target: Option<PromptJumpTarget>) {}
+    fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
 }
 
 // ── SshSession ──────────────────────────────────────────
@@ -1354,6 +1382,16 @@ impl SshSession {
 
     /// タスク#60: OSのフォーカス変化をそのまま`SessionCore`へ転送する。
     pub(crate) fn notify_focus_change(&self, focused: bool) { self.core.notify_focus_change(focused); }
+
+    /// タスク#13(OSC 133)。
+    pub(crate) fn jump_to_previous_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        self.core.jump_to_previous_prompt(from_scroll_offset, from_showing_scrollback);
+    }
+    pub(crate) fn jump_to_next_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        self.core.jump_to_next_prompt(from_scroll_offset, from_showing_scrollback);
+    }
+    pub(crate) fn click_to_prompt_cursor(&self, row: u32, col: u32) { self.core.click_to_prompt_cursor(row, col); }
+    pub(crate) fn copy_last_command_output(&self) { self.core.copy_last_command_output(); }
 
     pub(crate) fn disconnect(&self) { self.core.disconnect(); }
 
