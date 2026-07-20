@@ -5,10 +5,9 @@
 //! sends/receives one `isekai_protocol::CtlMessage` per invocation. Never
 //! touches the pane's PTY, so tmux's OSC 0/2/52 interception is irrelevant.
 
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Result;
 #[cfg(unix)]
@@ -172,13 +171,71 @@ fn resolve_ctl_socket_path(explicit: Option<String>) -> Result<PathBuf, ExitCode
     }
 }
 
+/// The `-R` remote path convention `isekai-ssh`'s `ctl_forward.rs` uses
+/// (`/tmp/isekai-pipe-ctl-<128bit hex>.sock`, opt-in `#@isekai ctl-socket
+/// yes`, `ISEKAI_PIPE_DESIGN.md` §8 Epic M). `sshd` owns cleaning up the
+/// actual streamlocal forward bind on a normal disconnect; this sweep only
+/// catches what's left behind by abnormal exits (crash, `kill -9`, a
+/// network drop that skipped `ssh -O cancel -R`).
+const CTL_SOCKET_REMOTE_PREFIX: &str = "isekai-pipe-ctl-";
+const CTL_SOCKET_STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Best-effort, non-fatal: a sweep failure (e.g. `/tmp` unreadable for some
+/// reason) should never block the caller (`isekai-pipe serve` startup or a
+/// single `isekai-pipe ctl` invocation) from proceeding.
+fn sweep_stale_ctl_sockets_in(dir: &Path) {
+    match isekai_pipe_core::sweep_stale_sockets(dir, CTL_SOCKET_REMOTE_PREFIX, CTL_SOCKET_STALE_THRESHOLD) {
+        Ok(removed) if !removed.is_empty() => {
+            log::info!(
+                "isekai-pipe: swept {} stale ctl-socket file(s) under {}",
+                removed.len(),
+                dir.display()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("isekai-pipe: failed to sweep stale ctl-socket files under {}: {e}", dir.display());
+        }
+    }
+}
+
+/// Called from both `isekai-pipe serve` startup (`main.rs`) and every
+/// `isekai-pipe ctl` invocation (below). The `serve`-startup sweep alone
+/// misses one topology entirely: a plain-ssh session (`isekai-ssh`本体が
+/// isekai-pipe/QUICを一切経由しない直接SSH接続、`ISEKAI_PIPE_DESIGN.md` §8 Epic M
+/// follow-up #3) never runs `isekai-pipe serve` on the remote host at all, so
+/// nothing was ever triggering a sweep of its orphaned
+/// `/tmp/isekai-pipe-ctl-*.sock` files left behind by a crashed/killed tab.
+/// `isekai-pipe ctl` itself, on the other hand, DOES always run on the
+/// remote host regardless of topology (it's invoked from the interactive
+/// shell's `$PROMPT_COMMAND`/manual call over the ctl-socket forward, which
+/// is set up the same way for both topologies) — so hooking the sweep there
+/// too closes the gap without adding a new binary or a resident process.
+pub(crate) fn sweep_stale_ctl_sockets_on_remote() {
+    sweep_stale_ctl_sockets_in(Path::new("/tmp"));
+}
+
 #[cfg(unix)]
 pub(crate) async fn ctl_command(args: impl Iterator<Item = String>) -> ExitCode {
+    ctl_command_with_sweep_dir(args, Path::new("/tmp")).await
+}
+
+/// Split out from [`ctl_command`] so tests can point the orphan sweep at a
+/// tempdir instead of the real `/tmp` (this process's `#[tokio::test]`s run
+/// concurrently with other agents/processes that may legitimately hold their
+/// own `/tmp/isekai-pipe-ctl-*.sock` files on this machine).
+#[cfg(unix)]
+async fn ctl_command_with_sweep_dir(args: impl Iterator<Item = String>, sweep_dir: &Path) -> ExitCode {
     let launch = match parse_ctl(args) {
         Ok(Some(launch)) => launch,
         Ok(None) => return ExitCode::SUCCESS,
         Err(code) => return code,
     };
+    // See `sweep_stale_ctl_sockets_on_remote`'s doc comment: this is the
+    // only sweep trigger a plain-ssh (isekai-pipe非経由) session ever gets on
+    // the remote host, so do it unconditionally before touching our own
+    // socket rather than only on error/retry paths.
+    sweep_stale_ctl_sockets_in(sweep_dir);
     let sock = match &launch {
         CtlLaunch::Title { sock, .. } | CtlLaunch::ClipPush { sock, .. } | CtlLaunch::ClipPull { sock } => {
             sock.clone()
@@ -517,5 +574,81 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("failed to connect"));
+    }
+
+    #[test]
+    fn sweep_stale_ctl_sockets_uses_the_isekai_ssh_naming_convention() {
+        // Regression guard: this prefix/threshold must stay in lockstep with
+        // isekai-ssh's `ctl_forward.rs` and the Android tmux-detour channel's
+        // `ctl_streamlocal::new_ctl_socket_path` (`/tmp/isekai-pipe-ctl-<hex>.sock`),
+        // since all three write into the same directory.
+        assert_eq!(CTL_SOCKET_REMOTE_PREFIX, "isekai-pipe-ctl-");
+        assert_eq!(CTL_SOCKET_STALE_THRESHOLD, Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_stale_ctl_sockets_in_removes_an_abandoned_matching_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let abandoned = dir.path().join("isekai-pipe-ctl-abandoned.sock");
+        {
+            // Bind and immediately drop: nobody `listen()`s anymore, exactly
+            // like a crashed/killed tab that skipped `ssh -O cancel -R`.
+            let _listener = UnixListener::bind(&abandoned).unwrap();
+        }
+        assert!(abandoned.exists());
+
+        sweep_stale_ctl_sockets_in(dir.path());
+
+        assert!(!abandoned.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_stale_ctl_sockets_in_leaves_an_unrelated_prefix_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let unrelated = dir.path().join("some-other-app-abandoned.sock");
+        {
+            let _listener = UnixListener::bind(&unrelated).unwrap();
+        }
+        std::fs::remove_file(&unrelated).ok(); // still "abandoned" without a listener
+        std::fs::write(&unrelated, b"not a socket, just a leftover file").unwrap();
+
+        sweep_stale_ctl_sockets_in(dir.path());
+
+        assert!(unrelated.exists(), "must not touch files outside the isekai-pipe-ctl- prefix");
+    }
+
+    /// Wiring test for the actual gap this change closes: a plain-ssh
+    /// (isekai-pipe非経由) session never runs `isekai-pipe serve` on the
+    /// remote host, so `isekai-pipe ctl`'s own invocation is the only place
+    /// left that can ever sweep its orphaned ctl sockets. This exercises
+    /// `ctl_command_with_sweep_dir` end to end (not just the sweep helper in
+    /// isolation) to prove the sweep actually runs before `run_ctl` attempts
+    /// to connect, using a tempdir rather than real `/tmp` so it can't
+    /// collide with another agent/process's live ctl sockets on this
+    /// sandbox.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ctl_command_sweeps_stale_ctl_sockets_before_connecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let abandoned = dir.path().join("isekai-pipe-ctl-abandoned.sock");
+        {
+            let _listener = UnixListener::bind(&abandoned).unwrap();
+        }
+        assert!(abandoned.exists());
+
+        // Point `--sock` at a socket that doesn't exist so the connect step
+        // itself fails (EX_UNAVAILABLE) — the sweep must still have run
+        // first, independent of whether this particular invocation succeeds.
+        let missing_sock = dir.path().join("isekai-pipe-ctl-not-here.sock");
+        let code = ctl_command_with_sweep_dir(
+            args(&["title", "--sock", missing_sock.to_str().unwrap(), "hi"]),
+            dir.path(),
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::from(EX_UNAVAILABLE));
+        assert!(!abandoned.exists(), "ctl_command should have swept the abandoned socket before connecting");
     }
 }
