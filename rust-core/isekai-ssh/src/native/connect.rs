@@ -708,6 +708,11 @@ where
 
     let home = isekai_fs_guard::resolve_home_dir().unwrap_or_else(|| PathBuf::from("."));
     let candidates = private_key::identity_file_candidates(&host_config.identity_file, &home);
+    log_line!(
+        "isekai-ssh: identity_file candidates (home={}): {:?}",
+        home.display(),
+        candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
+    );
     // Read + authenticate one candidate at a time, lazily (Codex review
     // finding): an unreadable/unusable candidate — missing, permission-denied,
     // or unparseable — is skipped, never fatal, so it can't block a

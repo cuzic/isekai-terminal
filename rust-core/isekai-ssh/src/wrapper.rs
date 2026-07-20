@@ -1309,28 +1309,26 @@ async fn resolve_wrapper(plan: &WrapperPlan) -> Result<WrapperResolution> {
 /// itself from the same config file).
 pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolution, openssh_config::HostConfig)> {
     let host_config = match dash_f_config_path(&plan.ssh_args) {
-        // Codex review finding: an explicit `-F <path>` (already understood
-        // by `find_destination_index`/`ssh_option_width` above, and already
-        // honored by the Unix path via `ssh_args_through_destination`'s `-G`
-        // invocation) must not be silently ignored here in favor of
-        // `~/.ssh/config` — that would authenticate against the wrong
-        // config file with no error, just a confusing connection failure
-        // (or worse, a connection to the wrong host under a stale trust
-        // entry).
-        Some(config_path) => openssh_config::resolve(&config_path, &plan.destination).map_err(|e| {
-            anyhow!(
-                "isekai-ssh: failed to resolve {:?} from {}: {e}",
-                plan.destination,
-                config_path.display()
-            )
-        })?,
-        None => openssh_config::resolve_default(&plan.destination).map_err(|e| {
-            anyhow!(
-                "isekai-ssh: failed to resolve {:?} from ~/.ssh/config: {e}",
-                plan.destination
-            )
-        })?,
-    };
+        Some(config_path) => {
+            log_line!("isekai-ssh: resolving config from {}", config_path.display());
+            openssh_config::resolve(&config_path, &plan.destination).map_err(|e| {
+                anyhow!(
+                    "isekai-ssh: failed to resolve {:?} from {}: {e}",
+                    plan.destination,
+                    config_path.display()
+                )
+            })
+        }
+        None => {
+            log_line!("isekai-ssh: resolving config from ~/.ssh/config for {:?}", plan.destination);
+            openssh_config::resolve_default(&plan.destination).map_err(|e| {
+                anyhow!(
+                    "isekai-ssh: failed to resolve {:?} from ~/.ssh/config: {e}",
+                    plan.destination
+                )
+            })
+        }
+    }?;
     let mut host_config = host_config;
     // Command-line overrides (`-p`/`-l`/`-J`/`-o Key=Value`) beat the config
     // file, matching real `ssh(1)` precedence. The Unix path gets this for
