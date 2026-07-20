@@ -68,6 +68,21 @@ use anyhow::{bail, Context, Result};
 use isekai_protocol::CtlMessage;
 #[cfg(test)]
 use isekai_protocol::ClipboardMime;
+#[cfg(unix)]
+use isekai_protocol::CtlVarStore;
+
+/// The `setvar`/`getvar` KV store backing this tab's ctl connections (task
+/// #16). One `isekai-ssh` invocation is one process per tab (unlike the
+/// Android app, which hosts many tabs in one process), so a single
+/// process-wide store correctly serves `VarScope::Tab`/`VarScope::Session`
+/// alike. `VarScope::Global` also resolves here for now — it does **not**
+/// span multiple `isekai-ssh` invocations, since that would need
+/// cross-process (likely disk-backed) sharing, deliberately left as
+/// documented future work rather than built speculatively (see
+/// `isekai_protocol::ctl_vars` module docs for the same trade-off spelled
+/// out for both receiving implementations).
+#[cfg(unix)]
+static CTL_VARS: std::sync::LazyLock<CtlVarStore> = std::sync::LazyLock::new(CtlVarStore::new);
 
 /// `/tmp/isekai-pipe-ctl-<32 hex chars>.sock` on the remote host. Shared by
 /// both the Unix `ssh(1)` path and the Windows-native path (the streamlocal
@@ -197,13 +212,21 @@ pub(crate) async fn spawn_ctl_listener(forward: &mut CtlForward) {
 }
 
 /// Reads and checks the secret preamble line, then decodes exactly one
-/// `CtlMessage` line and acts on it.
+/// `CtlMessage` line and acts on it — applying it as an OSC sequence
+/// (`SetTitle`/`ClipboardPush`), reading/writing this tab's `CTL_VARS` store
+/// (`SetVar`/`GetVarRequest`, task #16), or (for message kinds this CLI
+/// wrapper doesn't fulfil, e.g. `ClipboardPullRequest`) simply closing
+/// without a response.
 #[cfg(unix)]
-async fn handle_ctl_connection(stream: impl tokio::io::AsyncRead + Unpin, expected_secret: &str) -> Result<()> {
+async fn handle_ctl_connection(
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    expected_secret: &str,
+) -> Result<()> {
     use isekai_protocol::decode_ctl_message;
-    use tokio::io::{AsyncBufReadExt as _, BufReader};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
-    let mut reader = BufReader::new(stream);
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
 
     // The preamble: whoever is on the other end of this connection must
     // already know this tab's random remote-path token (see module docs).
@@ -227,8 +250,24 @@ async fn handle_ctl_connection(stream: impl tokio::io::AsyncRead + Unpin, expect
     if let Some(seq) = osc_sequence_for(&msg) {
         emit_osc(&seq)?;
     }
-    // `ClipboardPullRequest`/`ClipboardPullResponse` produce no OSC sequence
-    // (see `osc_sequence_for`'s doc comment) — nothing further to do.
+    match msg {
+        CtlMessage::SetVar { key, value, .. } => {
+            CTL_VARS.set(key, value);
+        }
+        CtlMessage::GetVarRequest { key, .. } => {
+            let response = CtlMessage::GetVarResponse { value: CTL_VARS.get(&key) };
+            let mut out = serde_json::to_vec(&response).context("failed to encode getvar response")?;
+            out.push(b'\n');
+            write_half.write_all(&out).await.context("failed to write getvar response")?;
+            write_half.shutdown().await.ok();
+        }
+        // `SetTitle`/`ClipboardPush` were already applied via `osc_sequence_for`
+        // above. `ClipboardPullRequest`/`ClipboardPullResponse`/`GetVarResponse`
+        // produce no OSC sequence and need no response from this wrapper (see
+        // `osc_sequence_for`'s doc comment for why `ClipboardPullRequest`
+        // specifically isn't fulfilled here).
+        _ => {}
+    }
     Ok(())
 }
 
@@ -249,11 +288,18 @@ async fn handle_ctl_connection(stream: impl tokio::io::AsyncRead + Unpin, expect
 ///   remote's `isekai-pipe ctl clip pull` rather than hanging.
 /// - `ClipboardPullResponse` → we never issue `ClipboardPullRequest`
 ///   ourselves, so seeing this would only be a misbehaving peer; ignored.
+/// - `SetVar`/`GetVarRequest`/`GetVarResponse` (task #16) have no OSC
+///   equivalent — they're handled directly in `handle_ctl_connection`
+///   against `CTL_VARS` instead of through this OSC-emitting path.
 pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
     match msg {
         CtlMessage::SetTitle { value } => Some(format!("\x1b]0;{value}\x07")),
         CtlMessage::ClipboardPush { data_b64, .. } => Some(format!("\x1b]52;c;{data_b64}\x07")),
-        CtlMessage::ClipboardPullRequest {} | CtlMessage::ClipboardPullResponse { .. } => None,
+        CtlMessage::ClipboardPullRequest {}
+        | CtlMessage::ClipboardPullResponse { .. }
+        | CtlMessage::SetVar { .. }
+        | CtlMessage::GetVarRequest { .. }
+        | CtlMessage::GetVarResponse { .. } => None,
     }
 }
 
