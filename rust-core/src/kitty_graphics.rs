@@ -19,6 +19,14 @@
 //!   文字列のvte側状態は取り残される(例: `ESC ] 8;;URL ESC _ …`)。
 //! - APC直前に**偶数個**の余分なESCがあると、素通し後にvte側のエスケープ終端解釈がずれる
 //!   (例: `ESC ESC _ <apc> ST Z` → vteは`ESC Z`=DECIDと解釈しうる)。
+//! - `m=1`のチャンク転送が`m=0`で完走せず放棄されたまま次の(無関係な)転送が
+//!   割り込んだ場合、`pending`が有る間は次のペイロードを問答無用でcontinuation
+//!   として扱うため、新規転送のcontrol(f=/s=/v=)は無視されbase64本体だけが
+//!   追記される→サイズ不一致で最終的にNoneへ落ちる(その1枚が表示されない
+//!   だけで、pendingは必ずクリアされ以降の状態は汚染されない。実クライアントは
+//!   `m=1`...`m=0`を必ず完走させる前提のためMVPでは対応しない、
+//!   `abandoned_chunk_then_new_transmission_does_not_panic_or_corrupt_forever`
+//!   テスト参照)。
 //!
 //! ## 実装範囲(MVP、スコープ外を明記)
 //! 対応する:
@@ -589,6 +597,40 @@ mod tests {
         match kg.dispatch(b"Ga=d,d=I,i=7") {
             KittyCommand::DeleteId(7) => {}
             _ => panic!("expected DeleteId(7)"),
+        }
+    }
+
+    #[test]
+    fn delete_by_id_missing_i_is_noop() {
+        // `i=`を伴わない`d=I`は対象idを特定できないため、削除せずNoneを返す
+        // (レビュー指摘: 沈黙のno-opだが、削除失敗とnot-foundを区別しない他の
+        // 削除パスと一貫している挙動)。
+        let mut kg = KittyGraphics::new();
+        assert!(matches!(kg.dispatch(b"Ga=d,d=I"), KittyCommand::None));
+    }
+
+    #[test]
+    fn abandoned_chunk_then_new_transmission_does_not_panic_or_corrupt_forever() {
+        // 実クライアントは`m=1`...`m=0`を必ず完走させる前提だが、途中で放棄され
+        // 別の新規転送が割り込んだ場合の挙動を固定する(レビュー指摘)。現状の
+        // `KittyGraphics`は`pending`が有る間は次のペイロードを問答無用で
+        // continuationとして扱うため、新規転送のcontrol(f=/s=/v=)は無視され、
+        // 放棄済みpendingの寸法のままデータだけ追記される→サイズ不一致で
+        // 最終的にNoneへ落ちる(=その1枚が表示されないだけで、pendingは
+        // 必ずクリアされ以降の状態は汚染されない)。
+        let mut kg = KittyGraphics::new();
+        let abandoned_first = format!("Gf=32,s=1,v=1,a=T,m=1;{}", b64(&[1, 1, 1, 1]));
+        assert!(matches!(kg.dispatch(abandoned_first.as_bytes()), KittyCommand::None));
+        // 放棄(m=0を送らずに別の新規転送を割り込ませる)。
+        let new_full = format!("Gf=32,s=1,v=1,a=T;{}", b64(&[9, 9, 9, 9]));
+        // continuationとして解釈され、寸法不一致でNoneになる(表示はされない)。
+        assert!(matches!(kg.dispatch(new_full.as_bytes()), KittyCommand::None));
+        // pendingは消費済みなので、次の完全な単発転送は正常に表示できる
+        // (=状態が永久に汚染されるわけではないことの確認)。
+        let recovered = format!("Gf=32,s=1,v=1,a=T;{}", b64(&[2, 2, 2, 2]));
+        match kg.dispatch(recovered.as_bytes()) {
+            KittyCommand::Place(img) => assert_eq!(img.rgba, vec![2, 2, 2, 2]),
+            _ => panic!("expected recovery after abandoned chunk"),
         }
     }
 
