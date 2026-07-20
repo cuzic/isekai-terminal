@@ -432,6 +432,7 @@ internal fun drawRow(
     textPaint: Paint,
     typeface: Typeface,
     italicTypeface: Typeface,
+    glyphFallback: GlyphFallbackResolver,
 ) {
     val y = rowIndex * cellH
     val rowStart = rowIndex * cols
@@ -463,7 +464,12 @@ internal fun drawRow(
             val resolvedFg = if (cell.dim) dimmedArgb(fgArgb) else fgArgb
             textPaint.color = resolvedFg
             textPaint.isFakeBoldText = cell.bold
-            textPaint.typeface = if (cell.italic) italicTypeface else typeface
+            // primary(カスタム or 既定)フォントがこのグリフを持たなければ、この1セルの
+            // drawText だけシステムフォールバックへ差し替える。isFakeBoldText はそのまま
+            // 効くのでボールドは維持されるが、フォールバック側には「本物の italic バリアント」が
+            // 無いため、まれなフォールバックグリフでは斜体が失われる(軽微な見た目の妥協)。
+            val primary = if (cell.italic) italicTypeface else typeface
+            textPaint.typeface = glyphFallback.resolve(cell.ch, primary)
             canvas.drawText(cell.ch, x, y + baseline, textPaint)
 
             if (hasLineDecoration) {
@@ -502,6 +508,7 @@ internal fun redrawDirtyRows(
     textPaint: Paint,
     typeface: Typeface,
     italicTypeface: Typeface,
+    glyphFallback: GlyphFallbackResolver,
 ) {
     for (row in rows) {
         val y = row * cellH
@@ -520,6 +527,7 @@ internal fun redrawDirtyRows(
             textPaint = textPaint,
             typeface = typeface,
             italicTypeface = italicTypeface,
+            glyphFallback = glyphFallback,
         )
     }
 }
@@ -566,6 +574,10 @@ fun SshTerminalCanvas(
     val fontFit = remember { FontFitCache() }
     val gridCache = remember { GridRenderCache() }
     val sixelCache = remember { SixelBitmapCache() }
+    // 欠落グリフをシステムフォントへ逃がすためのリゾルバ([TerminalGlyphFallback])。
+    // hasGlyph 判定結果を有界キャッシュするので、typeface が変わってもインスタンスは
+    // 使い回してよい(キャッシュキーに typeface 自体が入っている)。
+    val glyphFallback = remember { GlyphFallbackResolver() }
 
     // blink属性(SGR 5)を持つセルが1つも無ければタイマー自体を回さない(codexレビュー
     // 指摘: 画面にblinkが無くても永続的に再コンポーズ/全セル走査が走っていた)。
@@ -681,6 +693,7 @@ fun SshTerminalCanvas(
                         textPaint = textPaint,
                         typeface = typeface,
                         italicTypeface = italicTypeface,
+                        glyphFallback = glyphFallback,
                     )
                 }
                 // 次回の描画でtypefaceが汚れたままにならないよう既定値へ戻す(このPaintは
@@ -708,6 +721,7 @@ fun SshTerminalCanvas(
                         textPaint = textPaint,
                         typeface = typeface,
                         italicTypeface = italicTypeface,
+                        glyphFallback = glyphFallback,
                     )
                     textPaint.typeface = typeface
                 }

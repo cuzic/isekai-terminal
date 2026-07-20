@@ -474,6 +474,7 @@ class SshTerminalCanvasTest {
             themeBgArgb = 0xFF000000.toInt(), effectiveBlinkPhase = false,
             clearPaint = p.clearPaint, bgPaint = p.bgPaint, textPaint = p.textPaint,
             typeface = p.typeface, italicTypeface = p.italicTypeface,
+            glyphFallback = GlyphFallbackResolver(),
         )
         return bmp
     }
@@ -522,6 +523,7 @@ class SshTerminalCanvasTest {
             themeBgArgb = defaultBg, effectiveBlinkPhase = false,
             clearPaint = p.clearPaint, bgPaint = p.bgPaint, textPaint = p.textPaint,
             typeface = p.typeface, italicTypeface = p.italicTypeface,
+            glyphFallback = GlyphFallbackResolver(),
         )
 
         val row2After = base.rowPixels(2, cols, cellW, cellH)
