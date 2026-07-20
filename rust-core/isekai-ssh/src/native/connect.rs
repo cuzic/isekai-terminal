@@ -152,7 +152,7 @@ pub(crate) async fn prepare(args: Vec<String>) -> Result<Prepared> {
         return Err(anyhow!(
             "isekai-ssh: {:?} has isekai routing disabled (#@isekai enabled no / --isekai-direct); \
              the native Windows path doesn't support plain direct SSH yet — see native/connect.rs's module docs.",
-            plan.destination()
+            plan.destination_host()
         ));
     }
     let intent = match build_connection_intent(&resolution) {

@@ -97,7 +97,7 @@ async fn dispatch<C>(prepared: Prepared) -> Result<u8>
 where
     C: ExclusiveChannel + Send + 'static,
 {
-    let channel_name = naming::channel_name(prepared.host_config(), prepared.resolution(), prepared.plan().destination());
+    let channel_name = naming::channel_name(prepared.host_config(), prepared.resolution(), prepared.plan().destination_host());
     let token_path = prepared.runtime_dir().join(naming::token_file_name(&channel_name));
 
     match C::try_claim(&channel_name).await {
