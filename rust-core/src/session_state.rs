@@ -23,6 +23,11 @@ pub(crate) enum SideEffect {
     Finished { transfer_id: String, success: bool, message: Option<String> },
 }
 
+/// タスク#13でフィールドが4つ増え、各コンストラクタサイトで毎回全フィールドを
+/// 書き下すのが煩雑になったため`Default`を導出する(全フィールドが空/falseを
+/// 自然な既定値として持つ)。各メソッドは`ProcessResult { pending_rows, screen_dirty:
+/// true, ..Default::default() }`のように必要なフィールドだけ明示すればよい。
+#[derive(Default)]
 pub(crate) struct ProcessResult {
     pub(crate) timer_cmds: Vec<TimerCommand<TrzszTimer>>,
     pub(crate) side_effects: Vec<SideEffect>,
@@ -36,6 +41,20 @@ pub(crate) struct ProcessResult {
     /// 実際の応答送出には非同期のKotlin往復が要るため、ここではフラグを立てるだけで
     /// `session.rs`のevent loopが処理する(`dispatch_result`は同期関数のまま)。
     pub(crate) clipboard_pull_requested: bool,
+    /// OSC 133(タスク#13)「前/次のプロンプトへジャンプ」が要求されたか。
+    /// `pending_clipboard_write`と違い結果が`None`(ジャンプ先なし)でも「要求は
+    /// あった」ことを呼び出し元(`dispatch_result`)へ伝える必要があるため、
+    /// 専用のbooleanで分離する(`clipboard_pull_requested`と同型のパターン)。
+    pub(crate) prompt_jump_requested: bool,
+    /// [prompt_jump_requested]が`true`の場合の実際のジャンプ先。ジャンプ対象が
+    /// 見つからなければ`None`。
+    pub(crate) prompt_jump_target: Option<crate::PromptJumpTarget>,
+    /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」が要求されたか。
+    /// [prompt_jump_requested]と同じ理由で専用のbooleanにする。
+    pub(crate) prompt_output_copy_requested: bool,
+    /// [prompt_output_copy_requested]が`true`の場合の実際のテキスト。まだ完了した
+    /// コマンドが無ければ`None`。
+    pub(crate) prompt_output_copy_text: Option<String>,
 }
 
 /// カーソルが乗る行(`row`)の損傷レンジに、少なくともカーソル列(`col`)を含める
@@ -253,14 +272,7 @@ impl SessionState {
     /// 乗せて`onScreenUpdate`まで届くよう`screen_dirty`を立てる。
     pub(crate) fn set_title_from_ctl(&mut self, title: String) -> ProcessResult {
         self.terminal.set_title(title);
-        ProcessResult {
-            timer_cmds: Vec::new(),
-            side_effects: Vec::new(),
-            pending_rows: Vec::new(),
-            screen_dirty: true,
-            pending_clipboard_write: None,
-            clipboard_pull_requested: false,
-        }
+        ProcessResult { screen_dirty: true, ..Default::default() }
     }
 
     /// リサイズ時に画面内容・scrollback・カーソル位置・SGR属性・scroll region等の
@@ -276,14 +288,7 @@ impl SessionState {
     pub(crate) fn resize(&mut self, cols: usize, rows: usize) -> ProcessResult {
         self.terminal.resize_preserving_state(cols, rows);
         let pending_rows = self.terminal.take_scrollback();
-        ProcessResult {
-            timer_cmds: Vec::new(),
-            side_effects: Vec::new(),
-            pending_rows,
-            screen_dirty: true,
-            pending_clipboard_write: None,
-            clipboard_pull_requested: false,
-        }
+        ProcessResult { pending_rows, screen_dirty: true, ..Default::default() }
     }
 
     /// OSのフォーカス変化(タスク#60: タブ/split pane切替・アプリのbackground/foreground等)
@@ -297,14 +302,7 @@ impl SessionState {
     /// force_end_synchronized_output`のdocコメント参照)。
     pub(crate) fn force_end_synchronized_output(&mut self) -> ProcessResult {
         self.terminal.force_end_synchronized_output();
-        ProcessResult {
-            timer_cmds: Vec::new(),
-            side_effects: Vec::new(),
-            pending_rows: Vec::new(),
-            screen_dirty: true,
-            pending_clipboard_write: None,
-            clipboard_pull_requested: false,
-        }
+        ProcessResult { screen_dirty: true, ..Default::default() }
     }
 
     pub(crate) fn notify_focus_change(&mut self, focused: bool) -> ProcessResult {
@@ -312,14 +310,45 @@ impl SessionState {
         if let Some(bytes) = self.terminal.encode_focus_event(focused) {
             side_effects.push(SideEffect::SendStdin(bytes));
         }
-        ProcessResult {
-            timer_cmds: Vec::new(),
-            side_effects,
-            pending_rows: Vec::new(),
-            screen_dirty: false,
-            pending_clipboard_write: None,
-            clipboard_pull_requested: false,
+        ProcessResult { side_effects, ..Default::default() }
+    }
+
+    /// OSC 133(タスク#13)「前/次のプロンプトへジャンプ」。`want_previous`は
+    /// true=前・false=次。`from_scroll_offset`/`from_showing_scrollback`は
+    /// Kotlin側が現在表示している位置(既存の検索ジャンプ・タスク#79と同じ規約)、
+    /// `scrollback_len`は呼び出し元(`session.rs`)が`scrollback`ロックから読んだ
+    /// 現在のscrollback長([Terminal]自身は`SessionCore`側のトリミング後の長さを
+    /// 知らないため、呼び出し元が渡す)。判断ロジック自体は
+    /// [Terminal::prompt_jump_target]に一元化されている。
+    pub(crate) fn jump_to_prompt(
+        &self,
+        want_previous: bool,
+        from_scroll_offset: u32,
+        from_showing_scrollback: bool,
+        scrollback_len: u32,
+    ) -> ProcessResult {
+        let target = self.terminal.prompt_jump_target(
+            want_previous, from_scroll_offset, from_showing_scrollback, scrollback_len,
+        );
+        ProcessResult { prompt_jump_requested: true, prompt_jump_target: target, ..Default::default() }
+    }
+
+    /// OSC 133(タスク#13): タップされたセルが現在アクティブな入力行上であれば、
+    /// そこへカーソルを移動する矢印キー相当のバイト列を送る(Ghostty`cl=line`相当)。
+    /// 判断ロジックは[Terminal::cursor_move_bytes_for_click]に一元化されている。
+    pub(crate) fn click_to_prompt_cursor(&self, row: u32, col: u32) -> ProcessResult {
+        let mut side_effects = Vec::new();
+        if let Some(bytes) = self.terminal.cursor_move_bytes_for_click(row, col) {
+            side_effects.push(SideEffect::SendStdin(bytes));
         }
+        ProcessResult { side_effects, ..Default::default() }
+    }
+
+    /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。判断ロジックは
+    /// [Terminal::last_command_output_text]に一元化されている。
+    pub(crate) fn copy_last_command_output(&self) -> ProcessResult {
+        let text = self.terminal.last_command_output_text();
+        ProcessResult { prompt_output_copy_requested: true, prompt_output_copy_text: text, ..Default::default() }
     }
 
     pub(crate) fn on_stdout(&mut self, bytes: Vec<u8>) -> ProcessResult {
@@ -421,6 +450,7 @@ impl SessionState {
             screen_dirty,
             pending_clipboard_write,
             clipboard_pull_requested,
+            ..Default::default()
         }
     }
 }

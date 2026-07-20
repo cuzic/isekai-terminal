@@ -503,12 +503,46 @@ impl SessionCore {
     pub(crate) fn notify_focus_change(&self, focused: bool) {
         self.send_session_cmd(SessionCmd::FocusChanged(focused));
     }
+
+    /// OSC 133(タスク#13)「前のプロンプトへジャンプ」。`from_scroll_offset`/
+    /// `from_showing_scrollback`はKotlin側の現在の表示位置(既存の検索ジャンプ・
+    /// タスク#79と同じ規約)。判断ロジックは`session_event_loop`側
+    /// (`Terminal::prompt_jump_target`)に一元化されており、結果は
+    /// `OrchestratorCallback::on_prompt_jump`で非同期に返る。
+    pub(crate) fn jump_to_previous_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        self.send_session_cmd(SessionCmd::PromptJumpPrevious { from_scroll_offset, from_showing_scrollback });
+    }
+
+    /// [jump_to_previous_prompt]の「次」版。
+    pub(crate) fn jump_to_next_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        self.send_session_cmd(SessionCmd::PromptJumpNext { from_scroll_offset, from_showing_scrollback });
+    }
+
+    /// OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+    /// 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+    /// (Ghostty`cl=line`相当)。対象外なら無音でno-op。
+    pub(crate) fn click_to_prompt_cursor(&self, row: u32, col: u32) {
+        self.send_session_cmd(SessionCmd::ClickToPromptCursor { row, col });
+    }
+
+    /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+    /// `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+    /// (該当コマンドがまだ無ければ`None`)。
+    pub(crate) fn copy_last_command_output(&self) {
+        self.send_session_cmd(SessionCmd::CopyLastCommandOutput);
+    }
 }
 
 /// Kotlin/Swift側から送られてきた`SessionCmd`を`SessionState`に適用する。
 /// `session_event_loop`の`select!`アームから切り出したもの
 /// (select → match(cmd) → match(c)という三重ネストを避けるため)。
-fn handle_session_cmd(state: &mut SessionState, c: SessionCmd) -> ProcessResult {
+///
+/// `scrollback_len`はOSC 133(タスク#13)の「前/次のプロンプトへジャンプ」だけが
+/// 使う(`Terminal`自身は`SessionCore`側でトリミングされた後の実際のscrollback長を
+/// 知らないため、呼び出し元[`session_event_loop`]が`scrollback`ロックから読んで
+/// 渡す)。他のコマンドは無視する——呼び出しごとに軽いロックが1回増えるだけなので、
+/// コマンド種別で分岐して省略するより毎回渡す方が単純。
+fn handle_session_cmd(state: &mut SessionState, c: SessionCmd, scrollback_len: u32) -> ProcessResult {
     match c {
         SessionCmd::TrzszAcceptUpload { transfer_id, file_name, file_size, mode } => {
             info!("session: TrzszAcceptUpload id={} file={} size={}", transfer_id, file_name, file_size);
@@ -524,16 +558,17 @@ fn handle_session_cmd(state: &mut SessionState, c: SessionCmd) -> ProcessResult 
             state.on_kotlin_cancel(transfer_id),
         SessionCmd::SetTheme(theme) => {
             state.set_theme(theme);
-            ProcessResult {
-                timer_cmds: Vec::new(),
-                side_effects: Vec::new(),
-                pending_rows: Vec::new(),
-                screen_dirty: false,
-                pending_clipboard_write: None,
-                clipboard_pull_requested: false,
-            }
+            ProcessResult::default()
         }
         SessionCmd::FocusChanged(focused) => state.notify_focus_change(focused),
+        SessionCmd::PromptJumpPrevious { from_scroll_offset, from_showing_scrollback } =>
+            state.jump_to_prompt(true, from_scroll_offset, from_showing_scrollback, scrollback_len),
+        SessionCmd::PromptJumpNext { from_scroll_offset, from_showing_scrollback } =>
+            state.jump_to_prompt(false, from_scroll_offset, from_showing_scrollback, scrollback_len),
+        SessionCmd::ClickToPromptCursor { row, col } =>
+            state.click_to_prompt_cursor(row, col),
+        SessionCmd::CopyLastCommandOutput =>
+            state.copy_last_command_output(),
     }
 }
 
@@ -783,7 +818,11 @@ pub(crate) async fn session_event_loop(
                 None => None,
             },
             cmd = session_cmd_rx.recv() => match cmd {
-                Some(c) => Some(handle_session_cmd(&mut state, c)),
+                // OSC 133(タスク#13)の「前/次のプロンプトへジャンプ」だけが実際に
+                // 使う値だが、`handle_session_cmd`の外(このループ)でしか
+                // `scrollback`ロックを取れないため、コマンド種別を問わず毎回渡す
+                // (`handle_session_cmd`のdocコメント参照)。
+                Some(c) => Some(handle_session_cmd(&mut state, c, scrollback.lock().len() as u32)),
                 None => None,
             },
             fired = sync_timeout_rx.recv() => match fired {
@@ -962,6 +1001,17 @@ fn dispatch_result(
     if let Some(text) = r.pending_clipboard_write {
         callback.on_clipboard_write(ClipboardPayload { mime: ClipboardMimeKind::TextPlain, data: text.into_bytes() });
     }
+
+    // OSC 133(タスク#13)。どちらも「要求されたバッチでだけコールバックを呼ぶ」
+    // (`prompt_jump_target`/`prompt_output_copy_text`自体は「ジャンプ先/直前出力が
+    // 無かった」場合`None`もあり得るため、専用のrequestedフラグで区別する
+    // ——`ProcessResult`の同名フィールドdocコメント参照)。
+    if r.prompt_jump_requested {
+        callback.on_prompt_jump(r.prompt_jump_target);
+    }
+    if r.prompt_output_copy_requested {
+        callback.on_prompt_output_copy_ready(r.prompt_output_copy_text);
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────
@@ -984,6 +1034,10 @@ mod handle_session_cmd_tests {
         assert!(result.pending_rows.is_empty());
         assert!(result.pending_clipboard_write.is_none());
         assert!(!result.clipboard_pull_requested);
+        assert!(!result.prompt_jump_requested);
+        assert!(result.prompt_jump_target.is_none());
+        assert!(!result.prompt_output_copy_requested);
+        assert!(result.prompt_output_copy_text.is_none());
     }
 
     #[test]
@@ -992,7 +1046,7 @@ mod handle_session_cmd_tests {
         let custom = Theme { default_fg: 0x11223344, ..Theme::default() };
         assert_ne!(state.terminal().theme(), custom);
 
-        let result = handle_session_cmd(&mut state, SessionCmd::SetTheme(custom));
+        let result = handle_session_cmd(&mut state, SessionCmd::SetTheme(custom), 0);
 
         assert_eq!(state.terminal().theme(), custom);
         assert_is_noop(&result);
@@ -1003,11 +1057,11 @@ mod handle_session_cmd_tests {
         // タスク#60: `?1004`有効時のみCSI I/CSI OがSideEffect::SendStdinとして返る
         // ことを、`handle_session_cmd`経由で確認する(未有効時はno-op)。
         let mut state = fresh_state();
-        let noop = handle_session_cmd(&mut state, SessionCmd::FocusChanged(true));
+        let noop = handle_session_cmd(&mut state, SessionCmd::FocusChanged(true), 0);
         assert_is_noop(&noop);
 
         state.on_stdout(b"\x1b[?1004h".to_vec());
-        let result = handle_session_cmd(&mut state, SessionCmd::FocusChanged(true));
+        let result = handle_session_cmd(&mut state, SessionCmd::FocusChanged(true), 0);
         assert_eq!(result.side_effects.len(), 1);
         match &result.side_effects[0] {
             SideEffect::SendStdin(bytes) => assert_eq!(bytes, b"\x1b[I"),
@@ -1024,7 +1078,7 @@ mod handle_session_cmd_tests {
         // on_kotlin_accept_uploadへ正しく引数を渡して呼び出せることだけ。
         let result = handle_session_cmd(&mut state, SessionCmd::TrzszAcceptUpload {
             transfer_id: "t1".to_string(), file_name: "f.bin".to_string(), file_size: 42, mode: 0o644,
-        });
+        }, 0);
 
         assert_is_noop(&result);
     }
@@ -1035,7 +1089,7 @@ mod handle_session_cmd_tests {
 
         let result = handle_session_cmd(&mut state, SessionCmd::TrzszChunk {
             transfer_id: "t1".to_string(), data: vec![1, 2, 3], is_last: true,
-        });
+        }, 0);
 
         assert_is_noop(&result);
     }
@@ -1045,7 +1099,7 @@ mod handle_session_cmd_tests {
         let mut state = fresh_state();
 
         let result =
-            handle_session_cmd(&mut state, SessionCmd::TrzszAcceptDownload { transfer_id: "t1".to_string() });
+            handle_session_cmd(&mut state, SessionCmd::TrzszAcceptDownload { transfer_id: "t1".to_string() }, 0);
 
         assert_is_noop(&result);
     }
@@ -1054,9 +1108,60 @@ mod handle_session_cmd_tests {
     fn trzsz_cancel_routes_to_on_kotlin_cancel() {
         let mut state = fresh_state();
 
-        let result = handle_session_cmd(&mut state, SessionCmd::TrzszCancel { transfer_id: "t1".to_string() });
+        let result = handle_session_cmd(&mut state, SessionCmd::TrzszCancel { transfer_id: "t1".to_string() }, 0);
 
         assert_is_noop(&result);
+    }
+
+    // ── OSC 133(タスク#13) ──────────────────────────────────
+
+    #[test]
+    fn prompt_jump_previous_routes_to_session_state_and_reports_requested() {
+        let mut state = fresh_state();
+
+        let result = handle_session_cmd(
+            &mut state,
+            SessionCmd::PromptJumpPrevious { from_scroll_offset: 0, from_showing_scrollback: false },
+            0,
+        );
+
+        // まだプロンプトマークが1つも無いので見つからないが、「要求はあった」
+        // ことは呼び出し元(`dispatch_result`)がコールバックを呼べるよう伝わる。
+        assert!(result.prompt_jump_requested);
+        assert!(result.prompt_jump_target.is_none());
+    }
+
+    #[test]
+    fn prompt_jump_next_routes_to_session_state_and_reports_requested() {
+        let mut state = fresh_state();
+
+        let result = handle_session_cmd(
+            &mut state,
+            SessionCmd::PromptJumpNext { from_scroll_offset: 0, from_showing_scrollback: false },
+            0,
+        );
+
+        assert!(result.prompt_jump_requested);
+        assert!(result.prompt_jump_target.is_none());
+    }
+
+    #[test]
+    fn click_to_prompt_cursor_routes_to_session_state_and_is_noop_when_no_active_input_line() {
+        let mut state = fresh_state();
+
+        let result = handle_session_cmd(&mut state, SessionCmd::ClickToPromptCursor { row: 0, col: 5 }, 0);
+
+        assert_is_noop(&result);
+    }
+
+    #[test]
+    fn copy_last_command_output_routes_to_session_state_and_reports_requested() {
+        let mut state = fresh_state();
+
+        let result = handle_session_cmd(&mut state, SessionCmd::CopyLastCommandOutput, 0);
+
+        assert!(result.prompt_output_copy_requested);
+        assert!(result.prompt_output_copy_text.is_none());
     }
 }
 
@@ -1629,12 +1734,8 @@ mod tests {
         let callback: Arc<dyn SessionCallback> = Arc::new(NoopSessionCallback);
 
         let result = ProcessResult {
-            timer_cmds: Vec::new(),
-            side_effects: Vec::new(),
             pending_rows: vec![row('N', 1), row('N', 1), row('N', 1)], // 3行新規追加
-            screen_dirty: false,
-            pending_clipboard_write: None,
-            clipboard_pull_requested: false,
+            ..Default::default()
         };
         // dispatch_resultはscrollback/side effectsのみを扱う(画面発行は
         // emit_screen_update側の責務なのでここでは検証不要)。

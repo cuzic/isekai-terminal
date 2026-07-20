@@ -96,6 +96,18 @@ data class TerminalScreenActions(
     /** タスク#66: スクロールバック検索。マッチ計算は一切Kotlin側で行わず、Rust側
      *  `SessionCore::search_scrollback`(#37)の結果をそのまま返すだけ(rust-ssot)。 */
     val onSearchScrollback: (String, Boolean) -> List<ScrollbackSearchMatch> = { _, _ -> emptyList() },
+    /** タスク#13(OSC 133): 「前/次のプロンプトへジャンプ」。既存のスクロールバック検索
+     *  ([onSearchScrollback])とは独立した機能。引数は現在の(scrollOffset, showingScrollback)。
+     *  結果は[TerminalUiState.promptJumpResult]で非同期に届く。 */
+    val onJumpToPreviousPrompt: (Int, Boolean) -> Unit = { _, _ -> },
+    val onJumpToNextPrompt: (Int, Boolean) -> Unit = { _, _ -> },
+    /** タスク#13(OSC 133): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     *  入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     *  (Ghostty`cl=line`相当)。対象外なら無音でno-op。 */
+    val onClickToPromptCursor: (Int, Int) -> Unit = { _, _ -> },
+    /** タスク#13(OSC 133)「直前コマンドの出力だけをコピー」。結果は
+     *  [TerminalUiState.promptOutputCopyResult]で非同期に届く。 */
+    val onCopyLastCommandOutput: () -> Unit = {},
     val onTrustUpdatedHostKey: () -> Unit,
     val onDismissHostKeyWarning: () -> Unit,
     val onTrustNewHostKey: () -> Unit,
@@ -203,6 +215,35 @@ fun TerminalScreenBody(
     // `showingScrollback`と対称。「UI表示だけに閉じた状態」として`scrollOffset`と
     // 同じくrust-ssot.mdの例外)。
     var showingScrollback by remember { mutableStateOf(false) }
+
+    // タスク#13(OSC 133)「前/次のプロンプトへジャンプ」の結果を反映する。
+    // `PromptJumpResult.seq`が変化するたびに1回だけ実行される(既存のスクロールバック検索
+    // ジャンプ[jumpToCurrentSearchMatch]と同じ規約——`PromptJumpTarget.isLive`が
+    // タスク#79の`showingScrollback`/`scrollOffset==0`衝突を明示的に区別する)。
+    // ジャンプ先が無かった場合([target]が`null`)は何もしない(将来的な視覚フィードバックは
+    // スコープ外)。
+    LaunchedEffect(uiState.promptJumpResult.seq) {
+        if (uiState.promptJumpResult.seq == 0L) return@LaunchedEffect
+        val target = uiState.promptJumpResult.target ?: return@LaunchedEffect
+        if (target.isLive) {
+            scrollOffset = 0
+            showingScrollback = false
+        } else {
+            scrollOffset = target.scrollOffset.toInt()
+            showingScrollback = true
+        }
+    }
+    // タスク#13(OSC 133)「直前コマンドの出力だけをコピー」の結果をクリップボードへ書く。
+    // 選択範囲コピー([performCopy])と同じ`ClipboardManager`経路。
+    LaunchedEffect(uiState.promptOutputCopyResult.seq) {
+        if (uiState.promptOutputCopyResult.seq == 0L) return@LaunchedEffect
+        val text = uiState.promptOutputCopyResult.text ?: return@LaunchedEffect
+        if (text.isNotEmpty()) {
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("isekai-terminal command output", text))
+        }
+    }
+
     var showDisconnectDialog by remember { mutableStateOf(false) }
     var selection by remember { mutableStateOf<SelectionRange?>(null) }
     var showSnippetSheet by remember { mutableStateOf(false) }
@@ -783,6 +824,17 @@ fun TerminalScreenBody(
                                             if (tappedUrl != null && isOpenableHyperlinkScheme(tappedUrl)) {
                                                 pendingHyperlinkUrl = tappedUrl
                                             } else {
+                                                // タスク#13(OSC 133): タップ位置が現在アクティブな入力行上
+                                                // なら、そこへカーソルを移動する(Ghostty`cl=line`相当)。
+                                                // ライブ画面表示中(scrollback表示中でない)の場合のみ意味を
+                                                // 持つ——scrollback表示中はタップされたセルが実際に入力中の
+                                                // 行と無関係な過去ログであり、判定はRust側
+                                                // (`Terminal::cursor_move_bytes_for_click`)が行うが、そもそも
+                                                // ライブ画面座標でない値を渡すこと自体を避ける。無効なタップ
+                                                // (対象外の行・移動量ゼロ)はRust側で無音のno-opになる。
+                                                if (scrollOffset == 0 && !showingScrollback) {
+                                                    actions.onClickToPromptCursor(tapCell.row, tapCell.col)
+                                                }
                                                 // 画面分割時はこのペインへフォーカスを切り替え、その上でIMEフォーカスを要求する
                                                 // (このペインがまだフォーカス外の場合、入力欄自体がこの呼び出し時点では
                                                 // 未生成[inputViewがnull]のため即時には効かないが、onRequestFocus()による
@@ -1024,6 +1076,14 @@ fun TerminalScreenBody(
                     CtrlBtn("打鍵") { showKeySequenceSheet = true }
                     // タスク#66: スクロールバック検索バーを開く。
                     CtrlBtn("検索") { showSearchBar = true }
+                    // タスク#13(OSC 133): 前/次のプロンプトへジャンプ。物理キーボードの
+                    // 無いAndroidでコマンド履歴を辿る手段として特に価値が高い。現在の
+                    // (scrollOffset, showingScrollback)をそのまま渡し、判断はRust側
+                    // (`Terminal::prompt_jump_target`)に委ねる。
+                    CtrlBtn("前のプロンプト") { actions.onJumpToPreviousPrompt(scrollOffset, showingScrollback) }
+                    CtrlBtn("次のプロンプト") { actions.onJumpToNextPrompt(scrollOffset, showingScrollback) }
+                    // タスク#13: 直前コマンドの出力だけをクリップボードへコピーする。
+                    CtrlBtn("出力コピー") { actions.onCopyLastCommandOutput() }
                 }
 
                 // F1〜F12 行（横スクロール、Ctrl キー行を圧迫しないよう別行にする）

@@ -668,6 +668,12 @@ internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod12 : com.sun
 internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod13 : com.sun.jna.Callback {
     fun callback(`uniffiHandle`: Long,`state`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
 }
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod14 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`target`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
+internal interface UniffiCallbackInterfaceOrchestratorCallbackMethod15 : com.sun.jna.Callback {
+    fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,)
+}
 @Structure.FieldOrder("uniffiFree", "uniffiClone", "onDiagnosticEvent")
 internal open class UniffiVTableCallbackInterfaceDiagnosticCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -706,7 +712,7 @@ internal open class UniffiVTableCallbackInterfaceEventWakeListener(
     }
 
 }
-@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged")
+@Structure.FieldOrder("uniffiFree", "uniffiClone", "onConnectionStateChanged", "onScreenUpdate", "onHostKey", "onData", "onTrzszStateChanged", "onDownloadComplete", "onNoViablePath", "onForwardStateChanged", "onAgentSignRequest", "onClipboardWrite", "onClipboardPullRequest", "onRequestWifiFd", "onRequestCellularFd", "onRebindStateChanged", "onPromptJump", "onPromptOutputCopyReady")
 internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `uniffiFree`: UniffiCallbackInterfaceFree? = null,
     @JvmField internal var `uniffiClone`: UniffiCallbackInterfaceClone? = null,
@@ -724,6 +730,8 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
     @JvmField internal var `onRequestWifiFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod11? = null,
     @JvmField internal var `onRequestCellularFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod12? = null,
     @JvmField internal var `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
+    @JvmField internal var `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
+    @JvmField internal var `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod15? = null,
 ) : Structure() {
     class UniffiByValue(
         `uniffiFree`: UniffiCallbackInterfaceFree? = null,
@@ -742,7 +750,9 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onRequestWifiFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod11? = null,
         `onRequestCellularFd`: UniffiCallbackInterfaceOrchestratorCallbackMethod12? = null,
         `onRebindStateChanged`: UniffiCallbackInterfaceOrchestratorCallbackMethod13? = null,
-    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,), Structure.ByValue
+        `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod14? = null,
+        `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod15? = null,
+    ): UniffiVTableCallbackInterfaceOrchestratorCallback(`uniffiFree`,`uniffiClone`,`onConnectionStateChanged`,`onScreenUpdate`,`onHostKey`,`onData`,`onTrzszStateChanged`,`onDownloadComplete`,`onNoViablePath`,`onForwardStateChanged`,`onAgentSignRequest`,`onClipboardWrite`,`onClipboardPullRequest`,`onRequestWifiFd`,`onRequestCellularFd`,`onRebindStateChanged`,`onPromptJump`,`onPromptOutputCopyReady`,), Structure.ByValue
 
    internal fun uniffiSetValue(other: UniffiVTableCallbackInterfaceOrchestratorCallback) {
         `uniffiFree` = other.`uniffiFree`
@@ -761,6 +771,8 @@ internal open class UniffiVTableCallbackInterfaceOrchestratorCallback(
         `onRequestWifiFd` = other.`onRequestWifiFd`
         `onRequestCellularFd` = other.`onRequestCellularFd`
         `onRebindStateChanged` = other.`onRebindStateChanged`
+        `onPromptJump` = other.`onPromptJump`
+        `onPromptOutputCopyReady` = other.`onPromptOutputCopyReady`
     }
 
 }
@@ -839,6 +851,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_click_to_prompt_cursor(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_isekai_link_relay(
@@ -853,11 +867,17 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_copy_last_command_output(
+    ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_force_return_to_wifi(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_next_prompt(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_previous_prompt(
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired(
     ): Int
@@ -937,6 +957,10 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed(
     ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_jump(
+    ): Int
+    external fun uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready(
+    ): Int
     external fun ffi_isekai_terminal_core_uniffi_contract_version(
     ): Int
 
@@ -998,6 +1022,8 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_add_local
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_cancel_reconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_click_to_prompt_cursor(`ptr`: Long,`row`: Int,`col`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_isekai_link_relay(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1012,12 +1038,18 @@ external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_m
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_connect_quic(`ptr`: Long,`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_copy_last_command_output(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_disconnect(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_force_return_to_wifi(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_is_quic(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_next_prompt(`ptr`: Long,`fromScrollOffset`: Int,`fromShowingScrollback`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_previous_prompt(`ptr`: Long,`fromScrollOffset`: Int,`fromShowingScrollback`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_background_budget_expired(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 external fun uniffi_isekai_terminal_core_fn_method_sessionorchestrator_notify_did_enter_background(`ptr`: Long,`budgetMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -1295,6 +1327,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_cancel_reconnect() != 53892) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_click_to_prompt_cursor() != 45047) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect() != 45531) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1316,6 +1351,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_connect_quic() != 50706) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_copy_last_command_output() != 30171) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_disconnect() != 14345) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1323,6 +1361,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_is_quic() != 9641) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_next_prompt() != 13603) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_jump_to_previous_prompt() != 53496) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_sessionorchestrator_notify_background_budget_expired() != 26224) {
@@ -1440,6 +1484,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_rebind_state_changed() != 15707) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_jump() != 36510) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_isekai_terminal_core_checksum_method_orchestratorcallback_on_prompt_output_copy_ready() != 14453) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -2901,6 +2951,13 @@ public interface SessionOrchestratorInterface {
      */
     fun `cancelReconnect`()
     
+    /**
+     * OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     * 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     * (Ghostty`cl=line`相当)。対象外なら無音でno-op。未接続時も無視される。
+     */
+    fun `clickToPromptCursor`(`row`: kotlin.UInt, `col`: kotlin.UInt)
+    
     fun `connect`(`config`: SshConfig)
     
     /**
@@ -2937,6 +2994,13 @@ public interface SessionOrchestratorInterface {
     
     fun `connectQuic`(`config`: QuicConfig)
     
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+     * `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+     * (該当コマンドがまだ無ければ`None`、未接続時は無視される)。
+     */
+    fun `copyLastCommandOutput`()
+    
     fun `disconnect`()
     
     /**
@@ -2948,6 +3012,20 @@ public interface SessionOrchestratorInterface {
     fun `forceReturnToWifi`()
     
     fun `isQuic`(): kotlin.Boolean
+    
+    /**
+     * [jump_to_previous_prompt]の「次」版。
+     */
+    fun `jumpToNextPrompt`(`fromScrollOffset`: kotlin.UInt, `fromShowingScrollback`: kotlin.Boolean)
+    
+    /**
+     * OSC 133(タスク#13)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+     * (`search_scrollback`)とは独立した機能——`from_scroll_offset`/
+     * `from_showing_scrollback`はKotlin側が今表示している位置(タスク#79と同じ
+     * `scrollOffset`/`showingScrollback`の規約)をそのまま渡す。結果は
+     * `OrchestratorCallback::on_prompt_jump`で非同期に返る(未接続時は無視される)。
+     */
+    fun `jumpToPreviousPrompt`(`fromScrollOffset`: kotlin.UInt, `fromShowingScrollback`: kotlin.Boolean)
     
     /**
      * バックグラウンド猶予が尽きた(`beginBackgroundTask`失効等)ことを通知する。
@@ -3190,6 +3268,23 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     
 
     
+    /**
+     * OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+     * 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+     * (Ghostty`cl=line`相当)。対象外なら無音でno-op。未接続時も無視される。
+     */override fun `clickToPromptCursor`(`row`: kotlin.UInt, `col`: kotlin.UInt)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_click_to_prompt_cursor(
+        it,
+        FfiConverterUInt.lower(`row`),FfiConverterUInt.lower(`col`),_status)
+}
+    }
+    
+    
+
+    
     @Throws(SshException::class)override fun `connect`(`config`: SshConfig)
         = 
     callWithHandle {
@@ -3302,6 +3397,23 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     
     
 
+    
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+     * `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+     * (該当コマンドがまだ無ければ`None`、未接続時は無視される)。
+     */override fun `copyLastCommandOutput`()
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_copy_last_command_output(
+        it,
+        _status)
+}
+    }
+    
+    
+
     override fun `disconnect`()
         = 
     callWithHandle {
@@ -3343,6 +3455,40 @@ open class SessionOrchestrator: Disposable, AutoCloseable, SessionOrchestratorIn
     }
     )
     }
+    
+
+    
+    /**
+     * [jump_to_previous_prompt]の「次」版。
+     */override fun `jumpToNextPrompt`(`fromScrollOffset`: kotlin.UInt, `fromShowingScrollback`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_next_prompt(
+        it,
+        FfiConverterUInt.lower(`fromScrollOffset`),FfiConverterBoolean.lower(`fromShowingScrollback`),_status)
+}
+    }
+    
+    
+
+    
+    /**
+     * OSC 133(タスク#13)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+     * (`search_scrollback`)とは独立した機能——`from_scroll_offset`/
+     * `from_showing_scrollback`はKotlin側が今表示している位置(タスク#79と同じ
+     * `scrollOffset`/`showingScrollback`の規約)をそのまま渡す。結果は
+     * `OrchestratorCallback::on_prompt_jump`で非同期に返る(未接続時は無視される)。
+     */override fun `jumpToPreviousPrompt`(`fromScrollOffset`: kotlin.UInt, `fromShowingScrollback`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_isekai_terminal_core_fn_method_sessionorchestrator_jump_to_previous_prompt(
+        it,
+        FfiConverterUInt.lower(`fromScrollOffset`),FfiConverterBoolean.lower(`fromShowingScrollback`),_status)
+}
+    }
+    
     
 
     
@@ -4722,6 +4868,58 @@ public object FfiConverterTypePortForward: FfiConverterRustBuffer<PortForward> {
             FfiConverterUShort.write(value.`bindPort`, buf)
             FfiConverterString.write(value.`remoteHost`, buf)
             FfiConverterUShort.write(value.`remotePort`, buf)
+    }
+}
+
+
+
+/**
+ * OSC 133(タスク#13、セマンティックプロンプト)「前/次のプロンプトへジャンプ」の
+ * ジャンプ先。`SessionOrchestrator::jump_to_previous_prompt`/`jump_to_next_prompt`の
+ * 結果として`OrchestratorCallback::on_prompt_jump`経由で非同期に届く。
+ *
+ * - `is_live`が`true`の場合、ジャンプ先は現在のライブ画面上にある。呼び出し側は
+ * `scrollOffset`を0にリセットし`showingScrollback`をfalseにするだけでよい
+ * (`scrollback_cells`を呼ぶ必要はない)。
+ * - `is_live`が`false`の場合、`scroll_offset`は[SessionOrchestrator::scrollback_cells]の
+ * `offset`引数・[ScrollbackSearchMatch::row]と同じ規約——そのまま`scrollOffset`に
+ * 代入し`showingScrollback`をtrueにすればよい(タスク#79の「scrollback最新行と
+ * ライブ画面表示の`scrollOffset==0`衝突」を`is_live`で明示的に区別する、既存の
+ * 検索ジャンプと同型のパターン)。
+ */
+data class PromptJumpTarget (
+    var `scrollOffset`: kotlin.UInt
+    , 
+    var `isLive`: kotlin.Boolean
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePromptJumpTarget: FfiConverterRustBuffer<PromptJumpTarget> {
+    override fun read(buf: ByteBuffer): PromptJumpTarget {
+        return PromptJumpTarget(
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: PromptJumpTarget) = (
+            FfiConverterUInt.allocationSize(value.`scrollOffset`) +
+            FfiConverterBoolean.allocationSize(value.`isLive`)
+    )
+
+    override fun write(value: PromptJumpTarget, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`scrollOffset`, buf)
+            FfiConverterBoolean.write(value.`isLive`, buf)
     }
 }
 
@@ -6910,6 +7108,18 @@ public interface OrchestratorCallback {
      */
     fun `onRebindStateChanged`(`state`: RebindPublicState)
     
+    /**
+     * OSC 133(タスク#13)「前/次のプロンプトへジャンプ」(`jump_to_previous_prompt`/
+     * `jump_to_next_prompt`)の結果。ジャンプ先が見つからなければ`None`。
+     */
+    fun `onPromptJump`(`target`: PromptJumpTarget?)
+    
+    /**
+     * OSC 133(タスク#13)「直前コマンドの出力だけをコピー」(`copyLastCommandOutput`)の
+     * 結果。該当コマンドがまだ無ければ`None`。
+     */
+    fun `onPromptOutputCopyReady`(`text`: kotlin.String?)
+    
     companion object
 }
 
@@ -7085,6 +7295,30 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
             uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
         }
     }
+    internal object `onPromptJump`: UniffiCallbackInterfaceOrchestratorCallbackMethod14 {
+        override fun callback(`uniffiHandle`: Long,`target`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onPromptJump`(
+                    FfiConverterOptionalTypePromptJumpTarget.lift(`target`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
+    internal object `onPromptOutputCopyReady`: UniffiCallbackInterfaceOrchestratorCallbackMethod15 {
+        override fun callback(`uniffiHandle`: Long,`text`: RustBuffer.ByValue,`uniffiOutReturn`: Pointer,uniffiCallStatus: UniffiRustCallStatus,) {
+            val uniffiObj = FfiConverterTypeOrchestratorCallback.handleMap.get(uniffiHandle)
+            val makeCall = { ->
+                uniffiObj.`onPromptOutputCopyReady`(
+                    FfiConverterOptionalString.lift(`text`),
+                )
+            }
+            val writeReturn = { _: Unit -> Unit }
+            uniffiTraitInterfaceCall(uniffiCallStatus, makeCall, writeReturn)
+        }
+    }
 
     internal object uniffiFree: UniffiCallbackInterfaceFree {
         override fun callback(handle: Long) {
@@ -7115,6 +7349,8 @@ internal object uniffiCallbackInterfaceOrchestratorCallback {
         `onRequestWifiFd`,
         `onRequestCellularFd`,
         `onRebindStateChanged`,
+        `onPromptJump`,
+        `onPromptOutputCopyReady`,
     )
 
     // Registers the foreign callback with the Rust side.
@@ -7447,6 +7683,38 @@ public object FfiConverterOptionalTypePlatformFd: FfiConverterRustBuffer<Platfor
         } else {
             buf.put(1)
             FfiConverterTypePlatformFd.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypePromptJumpTarget: FfiConverterRustBuffer<PromptJumpTarget?> {
+    override fun read(buf: ByteBuffer): PromptJumpTarget? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypePromptJumpTarget.read(buf)
+    }
+
+    override fun allocationSize(value: PromptJumpTarget?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypePromptJumpTarget.allocationSize(value)
+        }
+    }
+
+    override fun write(value: PromptJumpTarget?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypePromptJumpTarget.write(value, buf)
         }
     }
 }

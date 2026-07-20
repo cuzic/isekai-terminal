@@ -102,6 +102,20 @@ impl ActiveSession {
     fn trzsz_cancel(&self, transfer_id: String) {
         dispatch_all!(self, trzsz_cancel, transfer_id)
     }
+    /// タスク#13(OSC 133): 全トランスポート共通で`SessionCore`まで委譲する
+    /// (`notify_focus_change`と同じくトランスポート非依存のため対象外の分岐は無い)。
+    fn jump_to_previous_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        dispatch_all!(self, jump_to_previous_prompt, from_scroll_offset, from_showing_scrollback)
+    }
+    fn jump_to_next_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        dispatch_all!(self, jump_to_next_prompt, from_scroll_offset, from_showing_scrollback)
+    }
+    fn click_to_prompt_cursor(&self, row: u32, col: u32) {
+        dispatch_all!(self, click_to_prompt_cursor, row, col)
+    }
+    fn copy_last_command_output(&self) {
+        dispatch_all!(self, copy_last_command_output)
+    }
     fn add_local_forward(&self, id: String, bind_address: String, bind_port: u16, remote_host: String, remote_port: u16) {
         match self {
             Self::Ssh(s) => s.add_local_forward(id, bind_address, bind_port, remote_host, remote_port),
@@ -535,6 +549,16 @@ impl SessionCallback for OrchestratorAdapter {
     fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState) {
         if !self.is_current() { return; }
         self.shared.callback.on_rebind_state_changed(state);
+    }
+
+    fn on_prompt_jump(&self, target: Option<crate::PromptJumpTarget>) {
+        if !self.is_current() { return; }
+        self.shared.callback.on_prompt_jump(target);
+    }
+
+    fn on_prompt_output_copy_ready(&self, text: Option<String>) {
+        if !self.is_current() { return; }
+        self.shared.callback.on_prompt_output_copy_ready(text);
     }
 }
 
@@ -1185,6 +1209,42 @@ impl SessionOrchestrator {
             .map_or_else(Vec::new, |s| s.search_scrollback(query, case_sensitive))
     }
 
+    /// OSC 133(タスク#13)「前のプロンプトへジャンプ」。既存のスクロールバック検索
+    /// (`search_scrollback`)とは独立した機能——`from_scroll_offset`/
+    /// `from_showing_scrollback`はKotlin側が今表示している位置(タスク#79と同じ
+    /// `scrollOffset`/`showingScrollback`の規約)をそのまま渡す。結果は
+    /// `OrchestratorCallback::on_prompt_jump`で非同期に返る(未接続時は無視される)。
+    pub fn jump_to_previous_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.jump_to_previous_prompt(from_scroll_offset, from_showing_scrollback);
+        }
+    }
+
+    /// [jump_to_previous_prompt]の「次」版。
+    pub fn jump_to_next_prompt(&self, from_scroll_offset: u32, from_showing_scrollback: bool) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.jump_to_next_prompt(from_scroll_offset, from_showing_scrollback);
+        }
+    }
+
+    /// OSC 133(タスク#13): タップされたセル(画面座標、0-indexed)が現在アクティブな
+    /// 入力行上であれば、そこへカーソルを移動する矢印キー相当のバイト列を送る
+    /// (Ghostty`cl=line`相当)。対象外なら無音でno-op。未接続時も無視される。
+    pub fn click_to_prompt_cursor(&self, row: u32, col: u32) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.click_to_prompt_cursor(row, col);
+        }
+    }
+
+    /// OSC 133(タスク#13)「直前コマンドの出力だけをコピー」。結果は
+    /// `OrchestratorCallback::on_prompt_output_copy_ready`で非同期に返る
+    /// (該当コマンドがまだ無ければ`None`、未接続時は無視される)。
+    pub fn copy_last_command_output(&self) {
+        if let Some(s) = self.shared.session.lock().as_ref() {
+            s.copy_last_command_output();
+        }
+    }
+
     pub fn trzsz_accept_download(&self) {
         let tid = self.shared.state.lock().current_transfer_id.clone();
         if let Some(tid) = tid {
@@ -1411,6 +1471,8 @@ mod tests {
         fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
         fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
+        fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
+        fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
     }
 
     fn shared_with_phase(phase: ConnPhase, is_quic: bool) -> (Arc<OrchestratorShared>, Arc<RecordingCallback>) {

@@ -1,5 +1,6 @@
 package tools.isekai.terminal
 
+import uniffi.isekai_terminal_core.PromptJumpTarget
 import uniffi.isekai_terminal_core.RebindPublicState
 import uniffi.isekai_terminal_core.ScreenUpdate
 
@@ -30,7 +31,21 @@ data class TerminalUiState(
     // 「今すぐWiFiに戻す」操作の表示可否判定に使う(UI側は推測せず、この値だけを見る、
     // rust-ssot.md準拠)。
     val rebindState: RebindPublicState? = null,
+    // タスク#13(OSC 133)「前/次のプロンプトへジャンプ」の直近の結果。
+    val promptJumpResult: PromptJumpResult = PromptJumpResult(),
+    // タスク#13(OSC 133)「直前コマンドの出力だけをコピー」の直近の結果。
+    val promptOutputCopyResult: PromptOutputCopyResult = PromptOutputCopyResult(),
 )
+
+/** タスク#13。[PromptJumpTarget]自体は「見つからなかった」場合`null`になりうるため、
+ *  単調増加する[seq]を併せて持たせる([TerminalSession.onPromptJump]のdocコメント参照
+ *  ——`target`だけをComposeの`LaunchedEffect`キーにすると、連続して見つからなかった
+ *  場合に値が変化せず再発火しない)。`seq == 0L`は「まだ一度もジャンプが要求されて
+ *  いない」ことを表す。 */
+data class PromptJumpResult(val target: PromptJumpTarget? = null, val seq: Long = 0L)
+
+/** タスク#13。[PromptJumpResult]と同じ理由で[seq]を持つ。 */
+data class PromptOutputCopyResult(val text: String? = null, val seq: Long = 0L)
 
 sealed class TrzszUiState {
     data class WaitingUser(

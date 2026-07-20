@@ -430,6 +430,14 @@ private fun TerminalPaneScreen(
                     onResize = { cols, rows -> tabsVm.resizePane(address, cols, rows) },
                     onScrollbackCells = { offset, rows -> tabsVm.scrollbackCellsForPane(address, offset, rows) },
                     onSearchScrollback = { query, caseSensitive -> tabsVm.searchScrollbackForPane(address, query, caseSensitive) },
+                    onJumpToPreviousPrompt = { fromScrollOffset, fromShowingScrollback ->
+                        tabsVm.jumpToPreviousPromptForPane(address, fromScrollOffset, fromShowingScrollback)
+                    },
+                    onJumpToNextPrompt = { fromScrollOffset, fromShowingScrollback ->
+                        tabsVm.jumpToNextPromptForPane(address, fromScrollOffset, fromShowingScrollback)
+                    },
+                    onClickToPromptCursor = { row, col -> tabsVm.clickToPromptCursorForPane(address, row, col) },
+                    onCopyLastCommandOutput = { tabsVm.copyLastCommandOutputForPane(address) },
                     onTrustUpdatedHostKey = { tabsVm.trustUpdatedHostKeyForPane(address) },
                     onDismissHostKeyWarning = { tabsVm.dismissHostKeyWarningForPane(address) },
                     onTrustNewHostKey = { tabsVm.trustNewHostKeyForPane(address) },
