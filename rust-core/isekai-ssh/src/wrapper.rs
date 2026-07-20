@@ -1308,7 +1308,9 @@ async fn resolve_wrapper(plan: &WrapperPlan) -> Result<WrapperResolution> {
 /// (the Unix wrapper path never needs them — real `ssh(1)` resolves those
 /// itself from the same config file).
 pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolution, openssh_config::HostConfig)> {
-    let host_config = match dash_f_config_path(&plan.ssh_args) {
+    let explicit_f = dash_f_config_path(&plan.ssh_args);
+    log_line!("isekai-ssh: dash_f={:?}, destination={:?}", explicit_f, plan.destination);
+    let host_config = match explicit_f {
         Some(config_path) => {
             log_line!("isekai-ssh: resolving config from {}", config_path.display());
             openssh_config::resolve(&config_path, &plan.destination).map_err(|e| {
