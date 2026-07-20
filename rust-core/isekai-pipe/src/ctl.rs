@@ -54,6 +54,14 @@ fn print_ctl_help() {
     println!("`setvar`/`getvar`/`title`/`clip` need the tab's ctl-socket forward: without --sock,");
     println!("they read the target UNIX domain socket path from ${ENV_CTL_SOCK}. `file` does not");
     println!("use this socket at all (see `isekai-pipe ctl file --help`).");
+    println!();
+    println!("NOTE: --scope global's reach depends on which client the tab's ctl-socket forward");
+    println!("terminates in. The isekai-terminal Android app is one process serving many tabs, so");
+    println!("global is genuinely shared across every tab in that app. The `ssh(1)` CLI wrapper");
+    println!("(`isekai-ssh`) is one process *per tab*, so global there is silently isolated to just");
+    println!("that one tab/process too — a value set with --scope global from one `isekai-ssh`");
+    println!("invocation is NOT visible to another. Don't rely on --scope global for cross-session");
+    println!("sharing when the far end is the CLI wrapper.");
 }
 
 fn parse_var_scope(value: &str) -> Result<VarScope, String> {
