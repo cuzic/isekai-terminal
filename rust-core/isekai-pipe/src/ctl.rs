@@ -874,6 +874,8 @@ mod tests {
 
         assert_eq!(code, ExitCode::from(EX_UNAVAILABLE));
         assert!(!abandoned.exists(), "ctl_command should have swept the abandoned socket before connecting");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn send_ctl_message_delivers_setvar() {
