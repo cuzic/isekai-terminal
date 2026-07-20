@@ -641,8 +641,19 @@ fn dispatch_transport_event(
             // `TransportEvent::ClipboardPullRequestOverCtl`として別途届く(下のアーム参照)
             // ので、ここには来ない。`ClipboardPullResponse`はdevice→hostの応答そのもの
             // であり、deviceがこれを受け取ることは無い。どちらも到達したら無視するだけ。
+            //
+            // `SetVar`/`GetVarRequest`(task #16)も同様にここには来ない設計:
+            // `ssh_handler::run_ssh_channel_loop`のctl_rx消費タスクがKotlin側の
+            // 非同期往復を要さず(メモリ上の`CtlVarStore`参照のみ)その場で処理し切る
+            // ため、`TransportEvent::CtlMessage`としてこの`session_event_loop`まで
+            // 転送されることが無い。`GetVarResponse`はdevice→hostの応答そのもので
+            // あり、`ClipboardPullResponse`同様deviceが受け取ることは無い。
+            // すべて到達したら無視するだけの防御的なアーム。
             isekai_protocol::CtlMessage::ClipboardPullRequest {}
-            | isekai_protocol::CtlMessage::ClipboardPullResponse { .. } => EventOutcome::Continue(None),
+            | isekai_protocol::CtlMessage::ClipboardPullResponse { .. }
+            | isekai_protocol::CtlMessage::SetVar { .. }
+            | isekai_protocol::CtlMessage::GetVarRequest { .. }
+            | isekai_protocol::CtlMessage::GetVarResponse { .. } => EventOutcome::Continue(None),
         },
         TransportEvent::ClipboardPullRequestOverCtl(reply) => {
             // tmux迂回チャンネル経由のpull要求(`ISEKAI_PIPE_DESIGN.md` §8 Epic M
