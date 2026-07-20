@@ -911,4 +911,11 @@ public final class TerminalSessionController: OrchestratorCallback, @unchecked S
     public func onPromptJump(target: PromptJumpTarget?) {}
 
     public func onPromptOutputCopyReady(text: String?) {}
+
+    // タスク#17(ファイルプレビュー機能): Android版(`TerminalSession.kt`の
+    // `filePreviewRequest`/`onFilePreviewResult`)でのみUI実装済みで、iOS側にはまだ
+    // 対応するUIが無い(`onPromptJump`と同じくno-op)。iOS側にディレクトリブラウザ/
+    // ファイルビューアを追加する際は、Android版と同じく`request_id`→`CompletableDeferred`
+    // 相当の待ち合わせでこのコールバックを解決すればよい。
+    public func onFilePreviewResult(requestId: String, outcome: FilePreviewOutcome) {}
 }
