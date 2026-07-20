@@ -31,6 +31,8 @@ class TerminalHyperlinkTest {
         bracketedPasteMode = false,
         mouseReportingMode = MouseReportingMode.OFF,
         sgrMouseMode = false,
+            alternateScroll = false,
+            urxvtMouseMode = false,
         cursorVisible = true,
         bellGeneration = 0uL,
         cursorShape = CursorShape.BLOCK,

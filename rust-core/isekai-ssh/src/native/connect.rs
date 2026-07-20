@@ -59,6 +59,8 @@ use crate::wrapper::{
 use super::agent_auth;
 use super::child_stdio::{spawn_isekai_pipe_connect, ChildStdio};
 use super::console;
+use super::console_stdin;
+use super::escape::{process_stdin_bytes, EscapeAction};
 use super::host_key_trust::FileBackedHostKeyVerifier;
 use super::private_key;
 
@@ -501,11 +503,34 @@ async fn run_authenticated_session(
 
     let (cols, rows) = console::terminal_size();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+    let terminal_modes = console::build_terminal_modes();
+
+    // Decide SessionKind: remote command vs interactive shell, with -t/-T support.
+    let remote_cmd = plan.remote_command();
+    let session_kind = match remote_cmd {
+        Some(cmd) if plan.request_tty == crate::wrapper::RequestTty::No => {
+            SessionKind::Exec { command: cmd.join(" ") }
+        }
+        Some(_cmd) => {
+            // -t or auto-with-command: PTY + exec (the command is run via exec
+            // below, not passed to SessionKind::Exec which is no-pty-only).
+            // We use SessionKind::Shell to get the PTY+shell, then exec the
+            // command over the pty below.
+            SessionKind::Shell { term: term.clone(), cols, rows, terminal_modes: terminal_modes.clone() }
+        }
+        None => {
+            SessionKind::Shell { term: term.clone(), cols, rows, terminal_modes: terminal_modes.clone() }
+        }
+    };
 
     // This process's own foreground shell's ctl-socket forward (owner or
     // single-process). Opportunistic: a forward that fails to set up just
     // leaves `ctl` as `None` and the shell opens without it.
-    let ctl = if ctl_enabled { ctl_forward::request(&handle, &forward_routes).await } else { None };
+    let ctl = if ctl_enabled && remote_cmd.is_none() {
+        ctl_forward::request(&handle, &forward_routes).await
+    } else {
+        None
+    };
 
     let open_result = {
         // Held only for the open; released before the I/O loop so sibling
@@ -517,7 +542,7 @@ async fn run_authenticated_session(
             Some(fwd) => ctl_forward::open_login_shell(&guard, &term, cols, rows, &fwd.remote_path)
                 .await
                 .context("isekai-ssh: failed to open a ctl-socket login shell"),
-            None => open_channel(&guard, &SessionKind::Shell { term, cols, rows }).await.context("isekai-ssh: failed to open a shell channel"),
+            None => open_channel(&guard, &session_kind).await.context("isekai-ssh: failed to open a session channel"),
         }
     };
     let mut channel = match open_result {
@@ -534,6 +559,27 @@ async fn run_authenticated_session(
             return Err(e);
         }
     };
+
+    // ForwardAgent: wire up agent forwarding if the config enables it.
+    if matches!(host_config.forward_agent, Some(openssh_config::ForwardAgent::Yes)) {
+        let _ = channel.agent_forward(true).await;
+    }
+
+    // SendEnv: forward LANG and LC_* environment variables (the most common
+    // ones). Full `SendEnv`/`AcceptEnv` matching against ssh_config would
+    // require the remote to opt in via sshd_config; these are the ones that
+    // are commonly accepted by default on most servers.
+    for (key, value) in std::env::vars() {
+        if key == "LANG" || key.starts_with("LC_") {
+            let _ = channel.set_env(false, &key, &value).await;
+        }
+    }
+
+    // If a remote command was requested with a PTY, exec it now.
+    if let (Some(cmd), true) = (remote_cmd, plan.request_tty != crate::wrapper::RequestTty::No) {
+        let command = cmd.join(" ");
+        let _ = channel.exec(false, command.as_str()).await;
+    }
 
     // Apply ctl messages this tab receives over its forward directly to the
     // local terminal (OSC title/clipboard on stderr).
@@ -640,7 +686,10 @@ where
     // just to satisfy the signature, even though no caller ever inspected
     // it afterward.
     let rejection = RejectionReason::new();
-    let config = Arc::new(client::Config::default());
+    let mut config = client::Config::default();
+    config.keepalive_interval = Some(std::time::Duration::from_secs(60));
+    config.keepalive_max = 3;
+    let config = Arc::new(config);
     // Install the ctl-socket route table on the handler so server-initiated
     // `forwarded-streamlocal` channels (from `streamlocal_forward` below) are
     // delivered in-process. Harmless (and unused) when ctl-socket is off — no
@@ -734,26 +783,37 @@ async fn try_agent_auth<H: client::Handler>(
 /// a real EOF) sends a channel EOF rather than closing the channel outright,
 /// so any buffered remote output still in flight is not lost.
 ///
-/// **Known limitation**: does not yet propagate local terminal resize
-/// events to the remote PTY (`channel.window_change`) — the channel is
-/// opened with the size at connect time and stays fixed for the session.
+/// Propagates local terminal resize events to the remote PTY via
+/// `channel.window_change` (when a resize watcher is available — spawned by
+/// the real-terminal path; tests pass `None`).
+/// Also handles `ssh(1)`-style escape sequences (`~.` to disconnect,
+/// `~~` for a literal tilde, `~?` for help, `~^Z` to suspend).
 /// Delegates to [`run_shell_io_loop_inner`] (which the tests drive against
 /// in-memory buffers) with the real local `stdin`/`stdout`/`stderr`; driving
 /// a real terminal stdin/stdout pair isn't practical in a unit test.
 async fn run_shell_io_loop(channel: &mut russh::Channel<client::Msg>) -> Result<u8> {
-    run_shell_io_loop_inner(channel, tokio::io::stdin(), tokio::io::stdout(), tokio::io::stderr()).await
+    let resize_rx = console::spawn_resize_watcher();
+    run_shell_io_loop_inner(channel, console_stdin::ConsoleStdin::open(), tokio::io::stdout(), tokio::io::stderr(), resize_rx).await
 }
 
-/// The body of [`run_shell_io_loop`] with the three local streams injected,
-/// so tests can substitute in-memory buffers for a real terminal. `stdin`
-/// feeds the remote channel; remote `Data` goes to `stdout` and remote
-/// `ExtendedData` (stderr) goes to `stderr` — real `ssh(1)` keeps the two
-/// separate (Codex review finding: they were both written to `stdout`).
+/// The body of [`run_shell_io_loop`] with the three local streams plus an
+/// optional resize event channel injected, so tests can substitute in-memory
+/// buffers for a real terminal. `stdin` feeds the remote channel; remote
+/// `Data` goes to `stdout` and remote `ExtendedData` (stderr) goes to
+/// `stderr` — real `ssh(1)` keeps the two separate (Codex review finding:
+/// they were both written to `stdout`).
+///
+/// When `resize_rx` is `Some`, local terminal resize events are forwarded to
+/// the remote PTY via `channel.window_change` in a third `select!` branch.
+/// `ssh(1)`-style escape sequences (`~.` to disconnect, `~~` for a literal
+/// tilde, `~?` for help, `~^Z` to suspend on Unix) are also detected in the
+/// stdin path.
 async fn run_shell_io_loop_inner<I, O, E>(
     channel: &mut russh::Channel<client::Msg>,
     mut stdin: I,
     mut stdout: O,
     mut stderr: E,
+    mut resize_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
 ) -> Result<u8>
 where
     I: tokio::io::AsyncRead + Unpin,
@@ -769,6 +829,12 @@ where
     let mut exit_code: Option<u8> = None;
     let mut stdin_open = true;
 
+    // Escape sequence state: `ssh(1)`-style `~` commands only at the start of
+    // a line (after `\r` or `\n`). `pending_escape` means the previous byte
+    // was `~` at line start and we're waiting for the command character.
+    let mut at_line_start = true;
+    let mut pending_escape = false;
+
     loop {
         tokio::select! {
             n = stdin.read(&mut buf), if stdin_open => {
@@ -778,8 +844,38 @@ where
                         let _ = channel.eof().await;
                     }
                     Ok(n) => {
-                        if channel.data(&buf[..n]).await.is_err() {
-                            break;
+                        let (to_send, action) = process_stdin_bytes(&buf[..n], &mut at_line_start, &mut pending_escape);
+                        if !to_send.is_empty() {
+                            if channel.data(&to_send[..]).await.is_err() {
+                                break;
+                            }
+                        }
+                        match action {
+                            EscapeAction::Disconnect => break,
+                            EscapeAction::Suspend => {
+                                #[cfg(unix)]
+                                {
+                                    // SAFETY: `SIGTSTP` is a standard POSIX signal; raising it
+                                    // from the foreground process group is the same thing
+                                    // `ssh(1)`'s `~^Z` does.
+                                    unsafe { libc::raise(libc::SIGTSTP); }
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    let _ = stderr.write_all(b"\r\n~^Z (suspend) is not supported on this platform.\r\n").await;
+                                }
+                            }
+                            EscapeAction::Help => {
+                                let _ = stderr.write_all(
+                                    b"\r\nSupported escape sequences:\r\n\
+                                      ~.  - terminate connection\r\n\
+                                      ~^Z - suspend isekai-ssh\r\n\
+                                      ~~  - send a literal tilde\r\n\
+                                      ~?  - this message\r\n\
+                                      ~#  - list forwarded connections (not yet)\r\n"
+                                ).await;
+                            }
+                            EscapeAction::None => {}
                         }
                     }
                     Err(_) => {
@@ -813,10 +909,58 @@ where
                     _ => {}
                 }
             }
+            resize = recv_resize(&mut resize_rx) => {
+                if let Some((cols, rows)) = resize {
+                    let _ = channel.window_change(cols, rows, 0, 0).await;
+                }
+            }
         }
     }
 
     Ok(exit_code.unwrap_or(NO_EXIT_STATUS_RECEIVED))
+}
+
+/// `recv` on the optional resize channel, or a future that never resolves
+/// when there is no watcher (so the `select!` branch is inert).
+async fn recv_resize(
+    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
+) -> Option<(u32, u32)> {
+    match rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod recv_resize_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn recv_resize_with_none_never_resolves() {
+        // When the channel is None, recv_resize should return pending forever.
+        let mut rx: Option<mpsc::UnboundedReceiver<(u32, u32)>> = None;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(10), recv_resize(&mut rx)).await;
+        assert!(result.is_err(), "recv_resize with None should never resolve (timeout expected)");
+    }
+
+    #[tokio::test]
+    async fn recv_resize_with_some_receives_value() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut rx = Some(rx);
+        tx.send((120, 40)).unwrap();
+        let result = recv_resize(&mut rx).await;
+        assert_eq!(result, Some((120, 40)));
+    }
+
+    #[tokio::test]
+    async fn recv_resize_with_some_returns_none_when_sender_dropped() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut rx = Some(rx);
+        drop(tx);
+        let result = recv_resize(&mut rx).await;
+        assert_eq!(result, None);
+    }
 }
 
 #[cfg(test)]
@@ -1097,7 +1241,7 @@ mod tests {
             .unwrap();
         assert!(authed, "CloseWithoutExitStatusServer accepts any password");
 
-        let mut channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24 })
+        let mut channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24, terminal_modes: vec![] })
             .await
             .unwrap();
 
@@ -1120,7 +1264,7 @@ mod tests {
         let mut handle = establish_over_stream(config, stream, handler).await.unwrap();
         let authed = authenticate_session(&mut handle, "tester", &Credential::Password("unused".to_string())).await.unwrap();
         assert!(authed, "the shell-request test server accepts any password");
-        let channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24 })
+        let channel = open_channel(&handle, &SessionKind::Shell { term: "xterm".to_string(), cols: 80, rows: 24, terminal_modes: vec![] })
             .await
             .unwrap();
         (handle, channel)
@@ -1139,7 +1283,7 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let exit_code = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr).await.unwrap();
+        let exit_code = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr, None).await.unwrap();
         assert_eq!(exit_code, 42, "an exit-status arriving after CHANNEL_EOF must still be honored, not reported as 255");
     }
 
@@ -1154,7 +1298,7 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let _ = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr).await.unwrap();
+        let _ = run_shell_io_loop_inner(&mut channel, tokio::io::empty(), &mut stdout, &mut stderr, None).await.unwrap();
         assert_eq!(stdout, b"hello-stdout", "remote stdout (Data) must land on local stdout");
         assert_eq!(stderr, b"hello-stderr", "remote stderr (ExtendedData) must land on local stderr, not stdout");
     }

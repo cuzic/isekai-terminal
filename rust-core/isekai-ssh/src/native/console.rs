@@ -70,6 +70,162 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Spawns a background watcher that detects terminal resize events and
+/// sends the new (cols, rows) over the returned channel whenever the
+/// size changes. Returns `None` if resize detection is not available
+/// (e.g. piped stdin, or the signal handler couldn't be registered).
+///
+/// On Unix the watcher hooks `SIGWINCH` — zero overhead, no polling.
+/// On Windows the watcher polls [`terminal_size`] every 200 ms
+/// (the same trade-off every Windows terminal app makes: `ReadConsoleInput`
+/// and raw stdin reads conflict, so event-driven resize isn't practical).
+pub(crate) fn spawn_resize_watcher() -> Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sig = match signal(SignalKind::window_change()) {
+            Ok(sig) => sig,
+            Err(_) => return None,
+        };
+        tokio::spawn(async move {
+            loop {
+                sig.recv().await;
+                let (cols, rows) = terminal_size();
+                if tx.send((cols, rows)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::thread::spawn(move || {
+            let mut last = (0u32, 0u32);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let current = terminal_size();
+                if current != last {
+                    last = current;
+                    if tx.send(current).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    Some(rx)
+}
+
+// Builds the terminal mode list for `request_pty` from the local terminal
+/// settings. On Unix this reads the actual `termios` via `tcgetattr`; on
+/// other platforms it returns a minimal default set (raw mode — echo/canon/
+/// isig off, standard special characters). When `tcgetattr` fails (e.g. CI
+/// sandbox without a terminal), the same default set is returned.
+pub(crate) fn build_terminal_modes() -> Vec<(russh::Pty, u32)> {
+    #[cfg(unix)]
+    {
+        let mut modes = Vec::with_capacity(32);
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut termios) == 0 {
+                // Special characters (c_cc array)
+                macro_rules! push_cc { ($pty:ident, $idx:ident) => {
+                    modes.push((russh::Pty::$pty, termios.c_cc[libc::$idx] as u32));
+                }}
+                push_cc!(VINTR, VINTR);
+                push_cc!(VQUIT, VQUIT);
+                push_cc!(VERASE, VERASE);
+                push_cc!(VKILL, VKILL);
+                push_cc!(VEOF, VEOF);
+                push_cc!(VEOL, VEOL);
+                push_cc!(VEOL2, VEOL2);
+                push_cc!(VSTART, VSTART);
+                push_cc!(VSTOP, VSTOP);
+                push_cc!(VSUSP, VSUSP);
+                #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+                push_cc!(VDSUSP, VDSUSP);
+                push_cc!(VREPRINT, VREPRINT);
+                push_cc!(VWERASE, VWERASE);
+                push_cc!(VLNEXT, VLNEXT);
+                push_cc!(VDISCARD, VDISCARD);
+                #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+                push_cc!(VSTATUS, VSTATUS);
+
+                // Input flags from c_iflag
+                macro_rules! push_flag { ($pty:ident, $flag:ident) => {
+                    modes.push((russh::Pty::$pty, if termios.c_iflag & libc::$flag != 0 { 1 } else { 0 }));
+                }}
+                push_flag!(IGNPAR, IGNPAR);
+                push_flag!(PARMRK, PARMRK);
+                push_flag!(INPCK, INPCK);
+                push_flag!(ISTRIP, ISTRIP);
+                push_flag!(INLCR, INLCR);
+                push_flag!(IGNCR, IGNCR);
+                push_flag!(ICRNL, ICRNL);
+                push_flag!(IXON, IXON);
+                push_flag!(IXANY, IXANY);
+                push_flag!(IXOFF, IXOFF);
+                push_flag!(IMAXBEL, IMAXBEL);
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                push_flag!(IUTF8, IUTF8);
+
+                // Local flags from c_lflag
+                macro_rules! push_lflag { ($pty:ident, $flag:ident) => {
+                    modes.push((russh::Pty::$pty, if termios.c_lflag & libc::$flag != 0 { 1 } else { 0 }));
+                }}
+                push_lflag!(ISIG, ISIG);
+                push_lflag!(ICANON, ICANON);
+                push_lflag!(ECHO, ECHO);
+                push_lflag!(ECHOE, ECHOE);
+                push_lflag!(ECHOK, ECHOK);
+                push_lflag!(ECHONL, ECHONL);
+                push_lflag!(NOFLSH, NOFLSH);
+                push_lflag!(TOSTOP, TOSTOP);
+                push_lflag!(IEXTEN, IEXTEN);
+                push_lflag!(ECHOCTL, ECHOCTL);
+                push_lflag!(ECHOKE, ECHOKE);
+
+                // Output flags from c_oflag
+                macro_rules! push_oflag { ($pty:ident, $flag:ident) => {
+                    modes.push((russh::Pty::$pty, if termios.c_oflag & libc::$flag != 0 { 1 } else { 0 }));
+                }}
+                push_oflag!(OPOST, OPOST);
+                push_oflag!(ONLCR, ONLCR);
+                push_oflag!(OCRNL, OCRNL);
+                push_oflag!(ONOCR, ONOCR);
+                push_oflag!(ONLRET, ONLRET);
+
+                // Speed (baud rate)
+                let ispeed = libc::cfgetispeed(&termios);
+                let ospeed = libc::cfgetospeed(&termios);
+                modes.push((russh::Pty::TTY_OP_ISPEED, ispeed));
+                modes.push((russh::Pty::TTY_OP_OSPEED, ospeed));
+                return modes;
+            }
+        }
+        // tcgetattr failed (no terminal): fall through to default set.
+    }
+
+    // Default set: raw-mode terminal with standard special characters.
+    vec![
+        (russh::Pty::ECHO, 0),
+        (russh::Pty::ICANON, 0),
+        (russh::Pty::ISIG, 0),
+        (russh::Pty::VINTR, 3),   // Ctrl-C
+        (russh::Pty::VEOF, 4),    // Ctrl-D
+        (russh::Pty::VERASE, 127), // Backspace
+        (russh::Pty::VKILL, 21),  // Ctrl-U
+        (russh::Pty::VQUIT, 28),  // Ctrl-\
+        (russh::Pty::VSUSP, 26),  // Ctrl-Z
+        (russh::Pty::VSTART, 17), // Ctrl-Q
+        (russh::Pty::VSTOP, 19),  // Ctrl-S
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +259,15 @@ mod tests {
     #[test]
     fn terminal_size_from_passes_through_a_real_size() {
         assert_eq!(terminal_size_from(|| Ok((120, 40))), (120, 40));
+    }
+
+    #[test]
+    fn build_terminal_modes_returns_valid_list() {
+        let modes = build_terminal_modes();
+        // Always returns at least the default set, even without a terminal.
+        assert!(!modes.is_empty(), "terminal modes list should not be empty");
+        for (pty, _value) in &modes {
+            let _ = format!("{pty:?}");
+        }
     }
 }

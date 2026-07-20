@@ -492,7 +492,7 @@ where
 /// What kind of session channel to open: an interactive PTY+shell, or a
 /// single non-interactive command (`ssh host 'command'` equivalent).
 pub enum SessionKind {
-    Shell { term: String, cols: u32, rows: u32 },
+    Shell { term: String, cols: u32, rows: u32, terminal_modes: Vec<(russh::Pty, u32)> },
     Exec { command: String },
 }
 
@@ -506,8 +506,8 @@ pub async fn open_channel<H: client::Handler>(
 ) -> Result<russh::Channel<client::Msg>, SessionError> {
     let channel = handle.channel_open_session().await.map_err(SessionError::Channel)?;
     match kind {
-        SessionKind::Shell { term, cols, rows } => {
-            channel.request_pty(false, term, *cols, *rows, 0, 0, &[]).await.map_err(SessionError::Channel)?;
+        SessionKind::Shell { term, cols, rows, terminal_modes } => {
+            channel.request_pty(false, term, *cols, *rows, 0, 0, terminal_modes).await.map_err(SessionError::Channel)?;
             channel.request_shell(false).await.map_err(SessionError::Channel)?;
         }
         SessionKind::Exec { command } => {

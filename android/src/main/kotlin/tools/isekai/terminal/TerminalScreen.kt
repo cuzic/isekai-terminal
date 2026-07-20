@@ -73,6 +73,7 @@ import tools.isekai.terminal.ui.offsetToCellPos
 import tools.isekai.terminal.ui.shouldReportMouseMotion
 import tools.isekai.terminal.ui.shouldUseMouseTouch
 import tools.isekai.terminal.ui.wheelButtonForDelta
+import tools.isekai.terminal.ui.wheelButtonForHorizontalDelta
 import tools.isekai.terminal.ui.reconstructSelectionText
 import tools.isekai.terminal.ui.synthesizeDisplayUpdate
 import tools.isekai.terminal.util.RemoteLogger
@@ -626,6 +627,7 @@ fun TerminalScreenBody(
                         rows = u.rows,
                         mouseReportingMode = u.mouseReportingMode,
                         sgrMouseMode = u.sgrMouseMode,
+                        urxvtMouseMode = u.urxvtMouseMode,
                     )
                     if (bytes != null) actions.onSend(bytes)
                 }
@@ -879,12 +881,9 @@ fun TerminalScreenBody(
                             // 届くため`awaitFirstDown`では捕捉できない)ため、別のpointerInputで待ち受ける。
                             //
                             // 対象外(Fableレビューで明示を求められたスコープ判断): alt-screenでの
-                            // wheel→矢印キー変換(xterm `?1007` Alternate Scroll Mode相当)は実装しない。
-                            // rust-core(タスク#36)は`?1007`のモード状態を保持しておらず、`ScreenUpdate`も
-                            // 「現在alt screenかどうか」を公開していない — この判断はターミナル状態の
-                            // SSOTであるRust側に持たせるべきで(rust-ssot)、Kotlin側で代替の判定
-                            // (例えばESCシーケンスの目視パース)を持つのは避ける。実装するならまず
-                            // rust-core側に`?1007`状態とalt-screen可視性を追加する別タスクが必要。
+                            // wheel→矢印キー変換(xterm `?1007` Alternate Scroll Mode相当)は
+                            // rust-core側に`alternate_scroll`状態が実装されたため、今後の
+                            // タスクで対応可能。
                             .pointerInput(Unit) {
                                 awaitPointerEventScope {
                                     while (true) {
@@ -893,19 +892,26 @@ fun TerminalScreenBody(
                                         if (!isPointerReportingActive()) continue
                                         val change = event.changes.firstOrNull() ?: continue
                                         val deltaY = change.scrollDelta.y
-                                        // Composeのスクロール系API(Modifier.scrollable等)と同じ符号規約:
-                                        // 正のdeltaY = コンテンツを上へ送る(=下方向へスクロール、xtermの
-                                        // wheel down/button 65)。実機(Bluetoothマウス等)未検証のため、
-                                        // 符号が逆であれば実機確認時に反転させる。判定自体は
-                                        // `wheelButtonForDelta`(タスク#87、`MouseGestureArbiter.kt`)へ抽出済み
-                                        // ——`deltaY == 0f`の場合は`null`が返るのでcontinueする。
-                                        val button = wheelButtonForDelta(deltaY) ?: continue
+                                        val deltaX = change.scrollDelta.x
                                         change.consume()
-                                        sendPointerEventAt(
-                                            MouseEventKind.PRESS, button, change.position.x, change.position.y,
-                                            latestCellDims.value.first, latestCellDims.value.second,
-                                            latestCols.value, latestRows.value,
-                                        )
+                                        // Vertical wheel
+                                        val vButton = wheelButtonForDelta(deltaY)
+                                        if (vButton != null) {
+                                            sendPointerEventAt(
+                                                MouseEventKind.PRESS, vButton, change.position.x, change.position.y,
+                                                latestCellDims.value.first, latestCellDims.value.second,
+                                                latestCols.value, latestRows.value,
+                                            )
+                                        }
+                                        // Horizontal wheel
+                                        val hButton = wheelButtonForHorizontalDelta(deltaX)
+                                        if (hButton != null) {
+                                            sendPointerEventAt(
+                                                MouseEventKind.PRESS, hButton, change.position.x, change.position.y,
+                                                latestCellDims.value.first, latestCellDims.value.second,
+                                                latestCols.value, latestRows.value,
+                                            )
+                                        }
                                     }
                                 }
                             },

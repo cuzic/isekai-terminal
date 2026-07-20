@@ -352,7 +352,7 @@ mod tests {
         // session deterministically after echoing.
         // `super::client` (the mux client module), not `russh::client` which
         // is imported as `client` above for `client::Handle`.
-        let outcome = super::client::run_inner(cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr)
+        let outcome = super::client::run_inner(cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None)
             .await
             .unwrap();
 

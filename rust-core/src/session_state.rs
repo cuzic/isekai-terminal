@@ -249,6 +249,8 @@ impl SessionState {
             bracketed_paste_mode: t.bracketed_paste_mode(),
             mouse_reporting_mode: t.mouse_reporting_mode(),
             sgr_mouse_mode: t.sgr_mouse_mode(),
+            alternate_scroll: t.alternate_scroll(),
+            urxvt_mouse_mode: t.urxvt_mouse_mode(),
             cursor_visible: t.cursor_visible(),
             bell_generation: t.bell_generation(),
             cursor_shape: t.cursor_shape(),

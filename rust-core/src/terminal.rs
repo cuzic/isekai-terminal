@@ -491,6 +491,13 @@ pub(crate) struct Terminal {
     /// DECSET/DECRST `?1006`(SGR拡張マウスレポーティング、タスク#36)。既定は`false`
     /// (レガシーX10形式)。`encode_pointer_event`がこの値でエンコード形式を切り替える。
     sgr_mouse_mode: bool,
+    /// DECSET/DECRST `?1007`(Alternate Scroll): alt screen でホイールを矢印キーに
+    /// 変換する。既定は`false`。
+    alternate_scroll: bool,
+    /// DECSET/DECRST `?1015`(URXVTマウスエンコーディング): マウスレポートを
+    /// `CSI Cb ; Cx ; Cy M`形式でエンコードする。`?1006`(SGR)と排他ではない。
+    /// 既定は`false`。
+    urxvt_mouse_mode: bool,
     /// OSC 8(`ESC]8;params;URIST`、タスク#40)で現在開いているハイパーリンクの
     /// intern id(`link_table`の index)。`None`はリンクなし。`print()`が書き込む
     /// 全セルへそのまま付与する——SGR属性(`cur_attrs`)とは独立な状態であり、
@@ -655,6 +662,8 @@ fn mouse_button_base_code(button: Option<MouseButton>) -> u8 {
         None => 3,
         Some(MouseButton::WheelUp) => 64,
         Some(MouseButton::WheelDown) => 65,
+        Some(MouseButton::WheelLeft) => 66,
+        Some(MouseButton::WheelRight) => 67,
     }
 }
 
@@ -707,6 +716,7 @@ pub(crate) fn encode_pointer_event_bytes(
     rows: usize,
     mode: MouseReportingMode,
     sgr: bool,
+    urxvt: bool,
 ) -> Option<Vec<u8>> {
     let reportable = match event.kind {
         MouseEventKind::Press | MouseEventKind::Release => mode != MouseReportingMode::Off,
@@ -722,19 +732,17 @@ pub(crate) fn encode_pointer_event_bytes(
 
     let base = mouse_button_base_code(event.button);
     let modifier_bits = mouse_modifier_bits(event.modifiers);
-    // motionビット(32)はドラッグ/ホバー移動のみ。ホイールは移動ではない
-    // (常にPress扱い)ためbaseが既に64/65であり、このビットは付与しない
-    // (xterm実装も同様——wheelイベントにmotionビットは立たない)。
     let motion_bit = if event.kind == MouseEventKind::Motion { 0x20 } else { 0 };
-    // 呼び出し元が実際の画面外の座標を渡してきても、この端末の実サイズ
-    // (`cols`/`rows`)内へクランプしてからエンコードする——[PointerEvent]の
-    // docコメントで約束している通り、範囲チェックの責務はここに閉じる
-    // (codexレビュー指摘: SGR側が無クランプだと、例えば80列の端末でも
-    // ドラッグ中に列1001のような存在しない座標を報告できてしまっていた)。
     let col = event.col.min(cols.saturating_sub(1));
     let row = event.row.min(rows.saturating_sub(1));
 
-    if sgr {
+    if urxvt && !sgr {
+        // URXVT encoding: `CSI Cb ; Cx ; Cy M` (press) / `CSI Cb ; Cx ; Cy m` (release).
+        // Cb is button+modifiers+motion, Cx/Cy are 1-based decimal coordinates.
+        let cb = base as u32 + modifier_bits as u32 + motion_bit as u32;
+        let terminator = if event.kind == MouseEventKind::Release { 'm' } else { 'M' };
+        Some(format!("\x1b[{};{};{}{}", cb, col + 1, row + 1, terminator).into_bytes())
+    } else if sgr {
         let cb = base as u32 + modifier_bits as u32 + motion_bit as u32;
         let terminator = if event.kind == MouseEventKind::Release { 'm' } else { 'M' };
         Some(format!("\x1b[<{};{};{}{}", cb, col + 1, row + 1, terminator).into_bytes())
@@ -743,9 +751,6 @@ pub(crate) fn encode_pointer_event_bytes(
         // 仕様上常に`3`(no button)を使う。
         let legacy_base = if event.kind == MouseEventKind::Release { 3 } else { base };
         let cb = (legacy_base as u32 + modifier_bits as u32 + motion_bit as u32).min(255 - 32) as u8;
-        // 1バイトにしかエンコードできないため、端末サイズへのクランプに加えて
-        // プロトコル上の上限223(`255 - 32`)でも頭打ちにする(端末自体が223列/行を
-        // 超える場合の保険。Fableレビュー指摘の設計判断)。
         let clamp_coord = |v: usize| -> u8 { (v.min(223 - 1) as u8) + 1 + 32 };
         Some(vec![0x1B, b'[', b'M', 32 + cb, clamp_coord(col), clamp_coord(row)])
     }
@@ -793,6 +798,8 @@ impl Terminal {
             gl_is_g1: false,
             mouse_reporting_mode: MouseReportingMode::Off,
             sgr_mouse_mode: false,
+            alternate_scroll: false,
+            urxvt_mouse_mode: false,
             active_link_id: None,
             link_table: Vec::new(),
             link_ids: HashMap::new(),
@@ -890,6 +897,8 @@ impl Terminal {
     pub(crate) fn focus_reporting_mode(&self) -> bool { self.focus_reporting_mode }
     pub(crate) fn mouse_reporting_mode(&self) -> MouseReportingMode { self.mouse_reporting_mode }
     pub(crate) fn sgr_mouse_mode(&self) -> bool { self.sgr_mouse_mode }
+    pub(crate) fn alternate_scroll(&self) -> bool { self.alternate_scroll }
+    pub(crate) fn urxvt_mouse_mode(&self) -> bool { self.urxvt_mouse_mode }
     pub(crate) fn cursor_visible(&self) -> bool { self.cursor_visible }
     pub(crate) fn bell_generation(&self) -> u64 { self.bell_generation }
     pub(crate) fn cursor_shape(&self) -> CursorShape { self.cursor_shape }
@@ -1093,6 +1102,8 @@ impl Terminal {
         self.gl_is_g1 = false;
         self.mouse_reporting_mode = MouseReportingMode::Off;
         self.sgr_mouse_mode = false;
+        self.alternate_scroll = false;
+        self.urxvt_mouse_mode = false;
         // アクティブなハイパーリンク状態のみクリアする。`link_table`自体は
         // クリアしない([Terminal]の`link_table`フィールドdocコメント参照)。
         self.active_link_id = None;
@@ -1791,7 +1802,7 @@ impl Terminal {
     /// 直接呼べる`#[uniffi::export]`関数(`lib.rs::terminal_pointer_event_bytes`)
     /// からも再利用するため(タスク#51)。
     pub(crate) fn encode_pointer_event(&self, event: PointerEvent) -> Option<Vec<u8>> {
-        encode_pointer_event_bytes(event, self.cols, self.rows, self.mouse_reporting_mode, self.sgr_mouse_mode)
+        encode_pointer_event_bytes(event, self.cols, self.rows, self.mouse_reporting_mode, self.sgr_mouse_mode, self.urxvt_mouse_mode)
     }
 
     /// フォーカスレポーティング(`?1004`、タスク#60)が有効な場合のみ、OS由来のフォーカス
@@ -2475,6 +2486,10 @@ impl Perform for Terminal {
                     // 選ぶ、という順序も許容する必要があるため)。
                     ('h', 1006) => { self.sgr_mouse_mode = true; }
                     ('l', 1006) => { self.sgr_mouse_mode = false; }
+                    ('h', 1007) => { self.alternate_scroll = true; }
+                    ('l', 1007) => { self.alternate_scroll = false; }
+                    ('h', 1015) => { self.urxvt_mouse_mode = true; }
+                    ('l', 1015) => { self.urxvt_mouse_mode = false; }
                     ('h', 47) | ('h', 1047) => { self.switch_to_alt(false); }
                     ('h', 1049) => { self.switch_to_alt(true); }
                     ('l', 47) | ('l', 1047) => { self.switch_to_main(false); }
@@ -6129,6 +6144,259 @@ mod tests {
             button: Some(MouseButton::WheelUp), modifiers: no_mods(),
         });
         assert!(up.is_some());
+    }
+
+    #[test]
+    fn test_encode_pointer_event_urxvt_press_and_release() {
+        // URXVT (?1015) uses `CSI Cb ; Cx ; Cy M` (no `<` prefix, unlike SGR).
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 4, col: 9, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(press, b"\x1b[0;10;5M");
+        let release = t.encode_pointer_event(PointerEvent {
+            row: 4, col: 9, kind: MouseEventKind::Release,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(release, b"\x1b[0;10;5m");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_urxvt_with_modifiers() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
+        let mods = TerminalKeyModifiers { shift: true, ctrl: true, ..Default::default() };
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Right), modifiers: mods,
+        }).unwrap();
+        // Right=2, Shift(4)+Ctrl(16)=20 → Cb=22
+        assert_eq!(press, b"\x1b[22;1;1M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_urxvt_wheel() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
+        let up = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelUp), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(up, b"\x1b[64;1;1M");
+        let down = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelDown), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(down, b"\x1b[65;1;1M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_urxvt_drag_motion() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1002h\x1b[?1015h");
+        let drag = t.encode_pointer_event(PointerEvent {
+            row: 1, col: 1, kind: MouseEventKind::Motion,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        // motionビット(32)がCbに加算: 0(Left) + 32 = 32
+        assert_eq!(drag, b"\x1b[32;2;2M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_sgr_takes_precedence_over_urxvt() {
+        // When both ?1006 (SGR) and ?1015 (URXVT) are enabled, SGR wins.
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h\x1b[?1015h");
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Left), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(press, b"\x1b[<0;1;1M", "SGR has `<` prefix, URXVT does not");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_horizontal_wheel_sgr() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
+        let left = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelLeft), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(left, b"\x1b[<66;1;1M");
+        let right = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelRight), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(right, b"\x1b[<67;1;1M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_horizontal_wheel_legacy() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h"); // legacy X10
+        let left = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelLeft), modifiers: no_mods(),
+        }).unwrap();
+        // WheelLeft=66, +32 = 98
+        assert_eq!(left, vec![0x1B, b'[', b'M', 32 + 66, 32 + 1, 32 + 1]);
+        let right = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelRight), modifiers: no_mods(),
+        }).unwrap();
+        // WheelRight=67, +32 = 99
+        assert_eq!(right, vec![0x1B, b'[', b'M', 32 + 67, 32 + 1, 32 + 1]);
+    }
+
+    #[test]
+    fn test_encode_pointer_event_middle_button_sgr() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Middle), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(press, b"\x1b[<1;1;1M");
+    }
+
+    #[test]
+    fn test_encode_pointer_event_right_button_legacy() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h");
+        let press = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::Right), modifiers: no_mods(),
+        }).unwrap();
+        // Right=2, +32 = 34
+        assert_eq!(press, vec![0x1B, b'[', b'M', 32 + 2, 32 + 1, 32 + 1]);
+    }
+
+    #[test]
+    fn test_encode_pointer_event_urxvt_horizontal_wheel() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        feed(&mut t, b"\x1b[?1000h\x1b[?1015h");
+        let left = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelLeft), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(left, b"\x1b[66;1;1M");
+        let right = t.encode_pointer_event(PointerEvent {
+            row: 0, col: 0, kind: MouseEventKind::Press,
+            button: Some(MouseButton::WheelRight), modifiers: no_mods(),
+        }).unwrap();
+        assert_eq!(right, b"\x1b[67;1;1M");
+    }
+
+    // ── フォーカスレポーティング(`?1004`、タスク#60) ─────────
+
+    #[test]
+    fn test_cursor_forward_cuf() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // Place cursor at col 5, then move forward 3
+        t.cursor_col = 5;
+        feed(&mut t, b"\x1b[3C");
+        assert_eq!(t.cursor_col, 8);
+        assert_eq!(t.cursor_row, 0);
+    }
+
+    #[test]
+    fn test_cursor_forward_cuf_clamps_at_last_column() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_col = 78;
+        feed(&mut t, b"\x1b[5C");
+        assert_eq!(t.cursor_col, 79); // cols-1
+    }
+
+    #[test]
+    fn test_cursor_backward_cub() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_col = 10;
+        feed(&mut t, b"\x1b[4D");
+        assert_eq!(t.cursor_col, 6);
+    }
+
+    #[test]
+    fn test_cursor_backward_cub_clamps_at_zero() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_col = 2;
+        feed(&mut t, b"\x1b[10D");
+        assert_eq!(t.cursor_col, 0);
+    }
+
+    #[test]
+    fn test_cursor_next_line_cnl() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_row = 3;
+        t.cursor_col = 10;
+        feed(&mut t, b"\x1b[2E");
+        assert_eq!(t.cursor_row, 5);
+        assert_eq!(t.cursor_col, 0, "CNL moves to column 0 after moving down");
+    }
+
+    #[test]
+    fn test_cursor_previous_line_cpl() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_row = 5;
+        t.cursor_col = 10;
+        feed(&mut t, b"\x1b[2F");
+        assert_eq!(t.cursor_row, 3);
+        assert_eq!(t.cursor_col, 0, "CPL moves to column 0 after moving up");
+    }
+
+    #[test]
+    fn test_cursor_key_mode_decckm() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        assert!(!t.application_cursor_mode());
+        feed(&mut t, b"\x1b[?1h");
+        assert!(t.application_cursor_mode());
+        feed(&mut t, b"\x1b[?1l");
+        assert!(!t.application_cursor_mode());
+    }
+
+    #[test]
+    fn test_su_with_scroll_region() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        // Fill rows 0-5 with identifiable content
+        for row in 0..6 {
+            let ch = (b'A' + row as u8) as char;
+            t.print(ch);
+            t.cursor_col = 0;
+            t.newline();
+        }
+        // Set scroll region to rows 1-4 (1-indexed: 2;5)
+        feed(&mut t, b"\x1b[2;5r");
+        // Move cursor into the region and scroll up 1
+        t.cursor_row = 2;
+        feed(&mut t, b"\x1b[1S");
+        // Row 0 (outside region) should be unchanged ('A')
+        assert_eq!(t.screen_cells()[0 * 80].ch.as_str(), "A");
+        // Row 1 (top of region) should now have 'C' (scrolled from row 2)
+        assert_eq!(t.screen_cells()[1 * 80].ch.as_str(), "C");
+        // Row 4 (bottom of region) should be blank
+        assert_eq!(t.screen_cells()[4 * 80].ch.as_str(), " ");
+    }
+
+    #[test]
+    fn test_reverse_index_ri() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.cursor_row = 5;
+        feed(&mut t, b"\x1bM"); // Reverse Index
+        assert_eq!(t.cursor_row, 4);
+    }
+
+    #[test]
+    fn test_reverse_index_ri_at_top_scrolls_down() {
+        let mut t = Terminal::new(80, 24, Theme::default());
+        t.print('X');
+        t.cursor_row = 0;
+        t.cursor_col = 0;
+        feed(&mut t, b"\x1bM"); // RI at top of screen
+        // Row 0 should have been scrolled down, cursor stays at 0
+        assert_eq!(t.cursor_row, 0);
+        // Content 'X' that was at row 0 should now be at row 1
+        assert_eq!(t.screen_cells()[1 * 80].ch.as_str(), "X");
     }
 
     // ── フォーカスレポーティング(`?1004`、タスク#60) ─────────

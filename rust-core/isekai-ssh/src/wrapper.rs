@@ -56,6 +56,22 @@ const DEFAULT_IDLE_LIFETIME_SECS: u64 = 2_592_000;
 /// traversal hint, not something worth blocking a connection attempt over.
 const STUN_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Whether the caller requested a PTY for the remote session, mirroring
+/// `ssh(1)`'s `-t`/`-T`/`-tt` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestTty {
+    /// No explicit `-t`/`-T` given: allocate a PTY for an interactive
+    /// (no-remote-command) session, skip it for a one-shot remote command.
+    Auto,
+    /// `-t`: force PTY allocation even for a remote command.
+    Yes,
+    /// `-T`: never allocate a PTY.
+    No,
+    /// `-tt`: force PTY allocation even when local stdin is not a tty
+    /// (ssh(1) uses this for batch-mode PTY-forcing).
+    Force,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct WrapperPlan {
     openssh_path: PathBuf,
@@ -64,6 +80,7 @@ pub(crate) struct WrapperPlan {
     destination_index: usize,
     ssh_args: Vec<String>,
     isekai: WrapperIsekaiOptions,
+    pub(crate) request_tty: RequestTty,
 }
 
 impl WrapperPlan {
@@ -106,6 +123,13 @@ impl WrapperPlan {
     /// the native ctl-socket interactive-session check.
     pub(crate) fn destination_index(&self) -> usize {
         self.destination_index
+    }
+
+    /// The remote command (everything after the destination in the ssh args),
+    /// if any. `None` means an interactive login shell.
+    pub(crate) fn remote_command(&self) -> Option<&[String]> {
+        let tail = &self.ssh_args[self.destination_index + 1..];
+        if tail.is_empty() { None } else { Some(tail) }
     }
 }
 
@@ -1174,6 +1198,7 @@ pub(crate) fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
     let destination_index = find_destination_index(&ssh_args)
         .ok_or_else(|| anyhow!("isekai-ssh: destination is required"))?;
     let destination = ssh_args[destination_index].clone();
+    let request_tty = extract_request_tty(&ssh_args, destination_index);
 
     Ok(WrapperPlan {
         openssh_path,
@@ -1182,7 +1207,79 @@ pub(crate) fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
         destination_index,
         ssh_args,
         isekai,
+        request_tty,
     })
+}
+
+/// Extracts the `-t`/`-T`/`-tt` flags from ssh args (before the destination)
+/// and returns the caller's PTY-request intent.
+pub(crate) fn extract_request_tty(ssh_args: &[String], destination_index: usize) -> RequestTty {
+    let mut tty = RequestTty::Auto;
+    let mut i = 0;
+    while i < destination_index {
+        match ssh_args[i].as_str() {
+            "-t" => {
+                tty = if tty == RequestTty::Yes { RequestTty::Force } else { RequestTty::Yes };
+            }
+            "-tt" => tty = RequestTty::Force,
+            "-T" => tty = RequestTty::No,
+            arg if arg.starts_with("-t") && arg.len() > 2 && arg.chars().skip(1).all(|c| c == 't') => {
+                // Multiple -t in one token: -ttt, -tttt, etc.
+                tty = RequestTty::Force;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    tty
+}
+
+#[cfg(test)]
+mod extract_request_tty_tests {
+    use super::*;
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_is_auto() {
+        assert_eq!(extract_request_tty(&s(&["host"]), 0), RequestTty::Auto);
+    }
+
+    #[test]
+    fn dash_t_forces_pty() {
+        assert_eq!(extract_request_tty(&s(&["-t", "host"]), 1), RequestTty::Yes);
+    }
+
+    #[test]
+    fn dash_twice_is_force() {
+        assert_eq!(extract_request_tty(&s(&["-t", "-t", "host"]), 2), RequestTty::Force);
+    }
+
+    #[test]
+    fn dash_tt_is_force() {
+        assert_eq!(extract_request_tty(&s(&["-tt", "host"]), 1), RequestTty::Force);
+    }
+
+    #[test]
+    fn dash_upper_t_suppresses_pty() {
+        assert_eq!(extract_request_tty(&s(&["-T", "host"]), 1), RequestTty::No);
+    }
+
+    #[test]
+    fn dash_t_after_destination_is_ignored() {
+        // -t after the destination is a remote command argument, not a flag
+        assert_eq!(extract_request_tty(&s(&["host", "-t"]), 0), RequestTty::Auto);
+    }
+
+    #[test]
+    fn dash_t_before_destination_with_other_flags() {
+        assert_eq!(
+            extract_request_tty(&s(&["-p", "2222", "-t", "host", "cmd"]), 3),
+            RequestTty::Yes
+        );
+    }
 }
 
 async fn resolve_wrapper(plan: &WrapperPlan) -> Result<WrapperResolution> {
@@ -1842,6 +1939,7 @@ mod tests {
             destination_index: 0,
             ssh_args: Vec::new(),
             isekai: WrapperIsekaiOptions::default(),
+            request_tty: RequestTty::Auto,
         };
         let resolution = WrapperResolution {
             openssh: OpenSshEffectiveConfig::default(),
@@ -1901,6 +1999,7 @@ mod tests {
             destination_index: 0,
             ssh_args: Vec::new(),
             isekai: WrapperIsekaiOptions::default(),
+            request_tty: RequestTty::Auto,
         };
         // A nonexistent path is enough: chain validation runs, and fails
         // closed, before this path is ever read from disk.

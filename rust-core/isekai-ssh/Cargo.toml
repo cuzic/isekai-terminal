@@ -9,6 +9,10 @@ description = "Single static-binary ssh(1) ProxyCommand wrapper reusing isekai-t
 name = "isekai-ssh"
 path = "src/main.rs"
 
+[[bin]]
+name = "isekai-key-debug"
+path = "src/bin/key-debug.rs"
+
 [dependencies]
 isekai-fs-guard = { path = "../isekai-fs-guard" }
 isekai-trust = { path = "../isekai-trust" }
@@ -36,6 +40,12 @@ serde_json = "1"
 ureq = "3"
 rand = "0.8"
 async-trait = "0.1.89"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

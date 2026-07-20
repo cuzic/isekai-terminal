@@ -62,6 +62,8 @@ fun synthesizeDisplayUpdate(
         bracketedPasteMode = live.bracketedPasteMode,
         mouseReportingMode = live.mouseReportingMode,
         sgrMouseMode = live.sgrMouseMode,
+        alternateScroll = live.alternateScroll,
+        urxvtMouseMode = live.urxvtMouseMode,
         cursorVisible = live.cursorVisible,
         bellGeneration = live.bellGeneration,
         cursorShape = live.cursorShape,
