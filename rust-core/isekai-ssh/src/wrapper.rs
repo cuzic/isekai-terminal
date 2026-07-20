@@ -1329,6 +1329,13 @@ pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolutio
             })
         }
     }?;
+    log_line!(
+        "isekai-ssh: resolved host_config: hostname={:?}, user={:?}, port={:?}, identity_file={:?}",
+        host_config.host_name,
+        host_config.user,
+        host_config.port,
+        host_config.identity_file,
+    );
     let mut host_config = host_config;
     // Command-line overrides (`-p`/`-l`/`-J`/`-o Key=Value`) beat the config
     // file, matching real `ssh(1)` precedence. The Unix path gets this for
