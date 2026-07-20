@@ -27,18 +27,25 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.launch
 import tools.isekai.terminal.formatBytes
 import tools.isekai.terminal.ui.AppColors
 import uniffi.isekai_terminal_core.FilePreviewEntry
 import uniffi.isekai_terminal_core.FilePreviewOutcome
 import uniffi.isekai_terminal_core.FilePreviewRequestKind
+
+/**
+ * ファイルビューアを開く要求1件分(タスク#17レビュー指摘対応)。[FilePreviewSheet]の
+ * `viewerRequest`のキーとして使い、`LaunchedEffect(viewerRequest)`にロードを委ねる
+ * ことで、Composeランタイム自身に「キーが変わったら前のコルーチンを必ずキャンセルしてから
+ * 新しいものを開始する」保証をさせる(手書きの`Job`管理より確実——[FilePreviewSheet]の
+ * 該当箇所のコメント参照)。
+ */
+private data class ViewerRequest(val path: String, val kind: FilePreviewKind, val initialSize: Long)
 
 /**
  * タスク#17(ファイルプレビュー機能): リモートのディレクトリブラウザ + ファイルビューア
@@ -65,60 +72,78 @@ fun FilePreviewSheet(
     initialPath: String = "~",
     onOpenTerminalForTransfer: () -> Unit = {},
 ) {
+    var currentPath by remember { mutableStateOf(initialPath) }
     var browserState by remember { mutableStateOf(FileBrowserUiState(currentPath = initialPath, isLoading = true)) }
+    var viewerRequest by remember { mutableStateOf<ViewerRequest?>(null) }
     var viewerState by remember { mutableStateOf<FileViewerUiState?>(null) }
-    val scope = rememberCoroutineScope()
 
     fun navigateTo(path: String) {
+        // 一覧へ戻る/移動する操作は開いているビューアを常に閉じる。ここは同期的な代入
+        // (即座に画面をブラウザ側へ切り替える)であり、後述の非同期ロードのレースとは無関係。
+        viewerRequest = null
         viewerState = null
-        browserState = FileBrowserUiState(currentPath = path, isLoading = true)
-        scope.launch {
-            when (val outcome = onRequest(FilePreviewRequestKind.Ls(path))) {
-                is FilePreviewOutcome.Ls -> {
-                    val sorted = outcome.entries.sortedWith(
-                        compareByDescending<FilePreviewEntry> { it.isDir }.thenBy { it.name.lowercase() },
-                    )
-                    browserState = FileBrowserUiState(currentPath = path, entries = sorted)
-                }
-                is FilePreviewOutcome.Error ->
-                    browserState = FileBrowserUiState(currentPath = path, errorMessage = outcome.message)
-                else ->
-                    browserState = FileBrowserUiState(currentPath = path, errorMessage = "unexpected response")
-            }
-        }
+        currentPath = path
     }
 
     fun openFile(entry: FilePreviewEntry) {
-        val path = FilePreviewPaths.join(browserState.currentPath, entry.name)
+        val path = FilePreviewPaths.join(currentPath, entry.name)
         val kind = FilePreviewKindDetector.detect(entry.name)
-        viewerState = FileViewerUiState(path = path, kind = kind, isLoading = true, totalSize = entry.size.toLong())
-        scope.launch {
-            val maxBytes = if (kind == FilePreviewKind.IMAGE) {
-                FilePreviewLoader.MAX_IMAGE_PREVIEW_BYTES
-            } else {
-                FilePreviewLoader.MAX_TEXT_PREVIEW_BYTES
+        viewerRequest = ViewerRequest(path, kind, entry.size.toLong())
+    }
+
+    // ディレクトリ一覧の取得。`currentPath`をキーにすることで、「上へ」の連打等で
+    // ナビゲーション先が切り替わった際、前の`ls`呼び出しの結果が後から届いて
+    // (別ディレクトリへ移動済みの)`browserState`を古い内容で上書きしてしまうレースを
+    // Composeランタイムに解消させる(前のコルーチンは`currentPath`が変わった時点で
+    // 自動的にキャンセルされる。Opusレビュー指摘、手書きJob管理より確実)。
+    LaunchedEffect(currentPath) {
+        browserState = FileBrowserUiState(currentPath = currentPath, isLoading = true)
+        when (val outcome = onRequest(FilePreviewRequestKind.Ls(currentPath))) {
+            is FilePreviewOutcome.Ls -> {
+                val sorted = outcome.entries.sortedWith(
+                    compareByDescending<FilePreviewEntry> { it.isDir }.thenBy { it.name.lowercase() },
+                )
+                browserState = FileBrowserUiState(currentPath = currentPath, entries = sorted)
             }
-            try {
-                val (bytes, totalSize, truncated) = FilePreviewLoader.loadBytes(path, maxBytes, onRequest) { loaded, total ->
-                    viewerState = viewerState?.copy(loadedBytes = loaded, totalSize = total)
-                }
-                viewerState = if (kind == FilePreviewKind.IMAGE) {
-                    viewerState?.copy(isLoading = false, imageBytes = bytes, totalSize = totalSize, truncated = truncated)
-                } else {
-                    viewerState?.copy(
-                        isLoading = false,
-                        textContent = bytes.toString(Charsets.UTF_8),
-                        totalSize = totalSize,
-                        truncated = truncated,
-                    )
-                }
-            } catch (e: FilePreviewLoadError) {
-                viewerState = viewerState?.copy(isLoading = false, errorMessage = e.message)
-            }
+            is FilePreviewOutcome.Error ->
+                browserState = FileBrowserUiState(currentPath = currentPath, errorMessage = outcome.message)
+            else ->
+                browserState = FileBrowserUiState(currentPath = currentPath, errorMessage = "unexpected response")
         }
     }
 
-    LaunchedEffect(Unit) { navigateTo(initialPath) }
+    // ファイル内容の取得。同じ理由で`viewerRequest`をキーにする——大きな画像を開いた
+    // 直後に閉じて別のファイルを開く、といった操作をしても、古いリクエストのチャンク
+    // 読み取りが後から完了して新しいファイルの`viewerState`(pathは新しいのに中身は
+    // 古いファイルのもの、という壊れた組み合わせ)を上書きすることは無い。
+    LaunchedEffect(viewerRequest) {
+        val request = viewerRequest ?: return@LaunchedEffect
+        viewerState = FileViewerUiState(
+            path = request.path, kind = request.kind, isLoading = true, totalSize = request.initialSize,
+        )
+        val maxBytes = if (request.kind == FilePreviewKind.IMAGE) {
+            FilePreviewLoader.MAX_IMAGE_PREVIEW_BYTES
+        } else {
+            FilePreviewLoader.MAX_TEXT_PREVIEW_BYTES
+        }
+        try {
+            val (bytes, totalSize, truncated) = FilePreviewLoader.loadBytes(request.path, maxBytes, onRequest) { loaded, total ->
+                viewerState = viewerState?.copy(loadedBytes = loaded, totalSize = total)
+            }
+            viewerState = if (request.kind == FilePreviewKind.IMAGE) {
+                viewerState?.copy(isLoading = false, imageBytes = bytes, totalSize = totalSize, truncated = truncated)
+            } else {
+                viewerState?.copy(
+                    isLoading = false,
+                    textContent = bytes.toString(Charsets.UTF_8),
+                    totalSize = totalSize,
+                    truncated = truncated,
+                )
+            }
+        } catch (e: FilePreviewLoadError) {
+            viewerState = viewerState?.copy(isLoading = false, errorMessage = e.message)
+        }
+    }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(modifier = Modifier.fillMaxSize().height(560.dp)) {
@@ -126,7 +151,7 @@ fun FilePreviewSheet(
             if (currentViewer != null) {
                 FileViewerHeader(
                     state = currentViewer,
-                    onBack = { viewerState = null },
+                    onBack = { viewerRequest = null; viewerState = null },
                     onClose = onDismiss,
                     onOpenTerminalForTransfer = onOpenTerminalForTransfer,
                 )
@@ -134,13 +159,13 @@ fun FilePreviewSheet(
             } else {
                 FileBrowserHeader(
                     state = browserState,
-                    onNavigateUp = { navigateTo(FilePreviewPaths.parent(browserState.currentPath)) },
+                    onNavigateUp = { navigateTo(FilePreviewPaths.parent(currentPath)) },
                     onClose = onDismiss,
                 )
                 FileBrowserBody(
                     state = browserState,
                     onEntryClick = { entry ->
-                        if (entry.isDir) navigateTo(FilePreviewPaths.join(browserState.currentPath, entry.name))
+                        if (entry.isDir) navigateTo(FilePreviewPaths.join(currentPath, entry.name))
                         else openFile(entry)
                     },
                     modifier = Modifier.fillMaxSize(),
