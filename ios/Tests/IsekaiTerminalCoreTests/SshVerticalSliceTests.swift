@@ -104,4 +104,6 @@ private actor SshVerticalSliceRecorder: OrchestratorCallback {
     nonisolated func onRequestWifiFd() -> PlatformFd? { nil }
     nonisolated func onRequestCellularFd() -> PlatformFd? { nil }
     nonisolated func onRebindStateChanged(state: RebindPublicState) {}
+    nonisolated func onPromptJump(target: PromptJumpTarget?) {}
+    nonisolated func onPromptOutputCopyReady(text: String?) {}
 }
