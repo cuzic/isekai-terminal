@@ -7807,6 +7807,33 @@ public func createSessionOrchestrator(callback: OrchestratorCallback) -> Session
     )
 })
 }
+/**
+ * [`AUTO_REATTACH_GRACE_SECS`]をUniFFI経由でKotlin/Swift側に公開する。値そのものを
+ * Kotlin側にハードコードで複製させないための単純なgetter。
+ */
+public func reattachGraceWindowSecs() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_reattach_grace_window_secs($0
+    )
+})
+}
+/**
+ * 永続化された「直近アクティブだったセッション」記録が、黙示的な自動再接続を
+ * 試みるにあたってまだ新鮮かどうかを判定する。`saved_at_unix_secs`は記録時刻、
+ * `now_unix_secs`は判定時刻(いずれもUnix epoch秒)。
+ *
+ * `now_unix_secs`が`saved_at_unix_secs`より前(端末の時計調整等で稀に起こりうる)の
+ * 場合は`saturating_sub`により経過時間0として扱い、freshと判定する——「保存した
+ * 直後なのに古いと誤判定される」という直感に反する挙動を避けるための意図的な選択。
+ */
+public func reattachRecordIsFresh(savedAtUnixSecs: UInt64, nowUnixSecs: UInt64) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_isekai_terminal_core_fn_func_reattach_record_is_fresh(
+        FfiConverterUInt64.lower(savedAtUnixSecs),
+        FfiConverterUInt64.lower(nowUnixSecs),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -7872,6 +7899,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_create_session_orchestrator() != 38625) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_reattach_grace_window_secs() != 34671) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_isekai_terminal_core_checksum_func_reattach_record_is_fresh() != 47307) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_method_diagnosticeventqueue_drain_events() != 5861) {
