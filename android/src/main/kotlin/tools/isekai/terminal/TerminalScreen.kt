@@ -132,6 +132,11 @@ data class TerminalScreenActions(
      *  そのまま呼ばれる。フォーカスレポーティング(`CSI ?1004`)が有効かどうかの判断は
      *  Rust側が持つため、ここでは生の値を渡すだけでよい。 */
     val onFocusChanged: (Boolean) -> Unit = {},
+    /** タスク#17(ファイルプレビュー機能): `isekai-pipe ctl file ls|cat|info`をリモートで
+     *  1回実行して結果を待つ。`TerminalSession.filePreviewRequest`への薄い委譲
+     *  (パース/デコードは全てRust側で完結しており、ここは中継するだけ)。 */
+    val onFilePreviewRequest: suspend (FilePreviewRequestKind) -> FilePreviewOutcome =
+        { FilePreviewOutcome.Error("not connected") },
 )
 
 /**
@@ -248,6 +253,10 @@ fun TerminalScreenBody(
     var selection by remember { mutableStateOf<SelectionRange?>(null) }
     var showSnippetSheet by remember { mutableStateOf(false) }
     var showKeySequenceSheet by remember { mutableStateOf(false) }
+    // タスク#17(ファイルプレビュー機能): ブラウザ/ビューアシートの開閉。中の内容
+    // (現在のパス・開いているビューア)は`FilePreviewSheet`自身が保持するナビゲーション
+    // 専用のUI状態であり(rust-ssot.mdの例外)、ここでは「開いているかどうか」だけを持つ。
+    var showFileBrowser by remember { mutableStateOf(false) }
     // タスク#66: スクロールバック検索バーの開閉・クエリ・大小文字区別・マッチ結果一覧・
     // 「今何件目を見ているか」。いずれも「UI表示だけに閉じた状態」(rust-ssot.mdの例外、
     // scrollOffset/selectionと同じ扱い)であり、マッチの計算自体(部分一致検索・combining
@@ -351,6 +360,8 @@ fun TerminalScreenBody(
         onDismissSnippetSheet = { showSnippetSheet = false },
         showKeySequenceSheet = showKeySequenceSheet,
         onDismissKeySequenceSheet = { showKeySequenceSheet = false },
+        showFileBrowser = showFileBrowser,
+        onDismissFileBrowser = { showFileBrowser = false },
         visible = isActive && hasFocus,
     )
 
@@ -419,6 +430,11 @@ fun TerminalScreenBody(
                             },
                             contentPadding = PaddingValues(0.dp),
                         ) { Text("ログ", color = AppColors.SecondaryText, fontSize = 11.sp) }
+                        // タスク#17: ファイルブラウザ/プレビューシートを開く。
+                        TextButton(
+                            onClick = { showFileBrowser = true },
+                            contentPadding = PaddingValues(0.dp),
+                        ) { Text("ファイル", color = AppColors.SecondaryText, fontSize = 11.sp) }
                     }
                     // #14: セルラーへフェイルオーバー中/WiFi復帰の静けさ待ち中だけ表示する。
                     // 表示可否の判定はRebindPublicState(Rust側が発火するcallback経由)だけを
@@ -1180,6 +1196,9 @@ private fun TerminalModalHost(
     onDismissSnippetSheet: () -> Unit,
     showKeySequenceSheet: Boolean,
     onDismissKeySequenceSheet: () -> Unit,
+    /** タスク#17: ファイルブラウザ/プレビューシートの開閉。 */
+    showFileBrowser: Boolean,
+    onDismissFileBrowser: () -> Unit,
     visible: Boolean,
 ) {
     if (!visible) return
@@ -1240,6 +1259,18 @@ private fun TerminalModalHost(
                 onDismissKeySequenceSheet()
             },
             onDismiss = onDismissKeySequenceSheet,
+        )
+    }
+
+    // タスク#17(ファイルプレビュー機能): リモートのディレクトリブラウザ + Markdown/画像/
+    // CSV/シンタックスハイライト付きテキストビューア。実データの取得(`ls`/`cat`)は
+    // `actions.onFilePreviewRequest`経由でRust側`SessionOrchestrator::filePreviewRequest`
+    // (`isekai-pipe ctl file`のexec)にそのまま委譲する。
+    if (showFileBrowser) {
+        tools.isekai.terminal.filepreview.FilePreviewSheet(
+            onRequest = actions.onFilePreviewRequest,
+            onDismiss = onDismissFileBrowser,
+            onOpenTerminalForTransfer = onDismissFileBrowser,
         )
     }
 }
