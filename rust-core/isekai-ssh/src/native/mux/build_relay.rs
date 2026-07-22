@@ -24,6 +24,9 @@
 
 use anyhow::{bail, Context, Result};
 use russh::client;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::log_file::log_line;
 
 /// Sent in place of a real `BuildFinished` (`ISEKAI_PIPE_DESIGN.md` §8 Epic P
 /// Phase 2) when a mux client's build must be aborted because the *remote*
@@ -138,6 +141,144 @@ pub(crate) async fn run_build_over_channel(channel: &mut russh::Channel<client::
     let finished = crate::build_exec::encode_build_finished(exit_code, result_paths)?;
     let _ = channel.data(&finished[..]).await;
     Ok(())
+}
+
+/// A build `client.rs::run_inner` is currently streaming, so it can abort it
+/// (kill the child) when the owner connection is lost or the owner relays a
+/// [`BUILD_ABORTED_SENTINEL`]. Dropping an `ActiveBuild` without calling
+/// [`abort`](Self::abort) leaves the task to finish on its own — fine for the
+/// normal "it already reached `BuildFinished`" case, since by then there is
+/// nothing left to kill.
+pub(crate) struct ActiveBuild {
+    abort_tx: Option<oneshot::Sender<()>>,
+    #[allow(dead_code)] // kept so the task itself isn't detached from `ActiveBuild`'s lifetime in spirit; not currently awaited
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ActiveBuild {
+    /// Signals the build task to kill its child and stop. A no-op if the
+    /// build already finished on its own (the signal is only sent once).
+    pub(crate) fn abort(&mut self) {
+        if let Some(tx) = self.abort_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Spawns the profile `(host, profile_name)` resolves to and streams its
+/// `BuildOutputChunk`/`BuildFinished` bytes into `build_out_tx` — the
+/// mux-client counterpart of [`run_build_over_channel`]. Unlike that
+/// function, this cannot detect the *remote* disconnecting on its own (only
+/// the owner holds the real ctl channel — see `super::owner`'s module docs
+/// for the relay that tells this side about it, arriving back here as the
+/// `BUILD_ABORTED_SENTINEL` `client.rs` reacts to); it can only be told to
+/// stop externally via the returned [`ActiveBuild::abort`].
+pub(crate) fn spawn_client_build(host: String, profile_name: String, build_out_tx: mpsc::UnboundedSender<Vec<u8>>) -> ActiveBuild {
+    let (abort_tx, abort_rx) = oneshot::channel();
+    let task = tokio::spawn(run_client_build(host, profile_name, build_out_tx, abort_rx));
+    ActiveBuild { abort_tx: Some(abort_tx), task }
+}
+
+async fn run_client_build(host: String, profile_name: String, build_out_tx: mpsc::UnboundedSender<Vec<u8>>, mut abort_rx: oneshot::Receiver<()>) {
+    let profile = crate::build_profile::default_build_profiles_path()
+        .and_then(|path| crate::build_profile::load_build_profiles(&path))
+        .ok()
+        .and_then(|store| crate::build_profile::find_profile(&store, &host, &profile_name).cloned());
+
+    let Some(profile) = profile else {
+        if let Ok(chunk) = crate::build_exec::encode_build_output_chunk(
+            isekai_protocol::BuildOutputStream::Stderr,
+            format!("isekai-ssh: no build profile registered for {host:?}/{profile_name:?}\n").into_bytes(),
+        ) {
+            let _ = build_out_tx.send(chunk);
+        }
+        if let Ok(finished) = crate::build_exec::encode_build_finished(127, Vec::new()) {
+            let _ = build_out_tx.send(finished);
+        }
+        return;
+    };
+
+    let mut child = match crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            log_line!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}: {e}");
+            return;
+        }
+    };
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+
+    let (tx, mut rx) = mpsc::channel::<(isekai_protocol::BuildOutputStream, Vec<u8>)>(32);
+    let stdout_task = tokio::spawn(crate::build_exec::pump_bytes(stdout, isekai_protocol::BuildOutputStream::Stdout, tx.clone()));
+    let stderr_task = tokio::spawn(crate::build_exec::pump_bytes(stderr, isekai_protocol::BuildOutputStream::Stderr, tx.clone()));
+    drop(tx);
+
+    let mut aborted = false;
+    loop {
+        tokio::select! {
+            recv = rx.recv() => {
+                match recv {
+                    Some((stream, bytes)) => {
+                        let Ok(chunk) = crate::build_exec::encode_build_output_chunk(stream, bytes) else {
+                            continue;
+                        };
+                        // A send failure means `run_inner`'s own select loop
+                        // already ended (the owner connection was lost) —
+                        // there is nowhere left for this output to go.
+                        if build_out_tx.send(chunk).is_err() {
+                            aborted = true;
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = &mut abort_rx => {
+                aborted = true;
+                break;
+            }
+        }
+    }
+    // See `run_build_over_channel`'s identical comment: dropping `rx`
+    // unblocks any pump task still waiting on a full channel so awaiting
+    // them below can't deadlock.
+    drop(rx);
+
+    if aborted {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        return;
+    }
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    let Ok(status) = child.wait().await else {
+        return;
+    };
+    let exit_code = status.code().unwrap_or(-1);
+
+    let result_paths: Vec<String> = match (&profile.result_glob, &profile.dest_dir) {
+        (Some(glob), Some(_dest_dir)) => crate::build_exec::glob_results(&profile.dir, glob)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        _ => Vec::new(),
+    };
+    if let Some(dest_dir) = &profile.dest_dir {
+        crate::build_exec::spawn_result_push(host, dest_dir.clone(), result_paths.clone());
+    }
+    if let Ok(finished) = crate::build_exec::encode_build_finished(exit_code, result_paths) {
+        let _ = build_out_tx.send(finished);
+    }
 }
 
 #[cfg(test)]
@@ -389,5 +530,45 @@ mod tests {
         let result = result.expect("run_build_over_channel must not hang after the channel closes");
         let err = result.unwrap_err();
         assert!(format!("{err:#}").contains("closed") || format!("{err:#}").contains("killed"));
+    }
+
+    /// The mux-client counterpart of
+    /// `run_build_over_channel_kills_the_child_when_the_channel_closes_mid_build`:
+    /// `spawn_client_build` has no channel of its own to watch for a remote
+    /// disconnect, only the external `ActiveBuild::abort` signal
+    /// `client.rs::run_inner` fires on an owner-relayed abort sentinel or a
+    /// lost owner connection. An infinite-output child that only stops if
+    /// actually killed, awaited under a timeout, turns "did abort really
+    /// kill it" into a assertion instead of a hang.
+    #[tokio::test]
+    async fn spawn_client_build_kills_the_child_when_aborted() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let workdir = tempfile::tempdir().unwrap();
+        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+            host: "mybox".to_string(),
+            name: "infinite".to_string(),
+            dir: workdir.path().to_string_lossy().into_owned(),
+            command: if cfg!(windows) {
+                ":loop& echo x& goto loop".to_string()
+            } else {
+                "while true; do printf x; sleep 0.01; done".to_string()
+            },
+            result_glob: None,
+            dest_dir: None,
+        }]);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut build = spawn_client_build("mybox".to_string(), "infinite".to_string(), tx);
+
+        // Wait for at least one real chunk to prove the child actually started
+        // before telling it to abort.
+        rx.recv().await.expect("the build must produce at least one output chunk");
+        build.abort();
+
+        let task = build.task;
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("the build task must finish promptly after abort, not hang on an unkilled child")
+            .unwrap();
     }
 }

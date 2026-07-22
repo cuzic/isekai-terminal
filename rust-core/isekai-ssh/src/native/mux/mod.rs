@@ -145,6 +145,11 @@ async fn run_as_client<C>(prepared: Prepared, channel_name: &str, token_path: &P
 where
     C: ExclusiveChannel + Send + 'static,
 {
+    // Extracted before `prepared` potentially moves into `connect::run_prepared`
+    // below (the fallback branches take it by value) — this is the same host/
+    // profile identity Epic P Phase 2's build-profile lookup uses on the Unix
+    // path (`resolution.profile()`).
+    let host = prepared.resolution().profile().to_string();
     let token = match read_owner_token_or_fall_back(token_path) {
         ClientToken::Ready(token) => token,
         // The owner released its claim (or hadn't finished writing the token
@@ -154,7 +159,7 @@ where
         ClientToken::FallBack => return connect::run_prepared(prepared, None).await,
     };
     match C::connect(channel_name).await {
-        Ok(conn) => match client::run(conn, &token).await? {
+        Ok(conn) => match client::run(conn, &token, host).await? {
             client::ClientRunResult::ExitCode(code) => Ok(code),
             // The owner rejected us before any shell session existed
             // (protocol version mismatch, or a stale token read in the
@@ -353,7 +358,7 @@ mod tests {
         // session deterministically after echoing.
         // `super::client` (the mux client module), not `russh::client` which
         // is imported as `client` above for `client::Handle`.
-        let outcome = super::client::run_inner(cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None)
+        let outcome = super::client::run_inner(cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string())
             .await
             .unwrap();
 
