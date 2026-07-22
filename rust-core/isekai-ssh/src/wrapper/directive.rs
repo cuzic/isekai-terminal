@@ -26,7 +26,7 @@ pub(super) fn load_isekai_directives(plan: &WrapperPlan) -> Result<Vec<IsekaiDir
         if root.exists() {
             load_isekai_directives_from_file(
                 &root,
-                &plan.destination,
+                plan.destination_host(),
                 &mut visited,
                 &mut directives,
             )?;

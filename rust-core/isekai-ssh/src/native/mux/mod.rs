@@ -97,7 +97,7 @@ async fn dispatch<C>(prepared: Prepared) -> Result<u8>
 where
     C: ExclusiveChannel + Send + 'static,
 {
-    let channel_name = naming::channel_name(prepared.host_config(), prepared.resolution(), prepared.plan().destination());
+    let channel_name = naming::channel_name(prepared.host_config(), prepared.resolution(), prepared.plan().destination_host());
     let token_path = prepared.runtime_dir().join(naming::token_file_name(&channel_name));
 
     match C::try_claim(&channel_name).await {
@@ -352,7 +352,7 @@ mod tests {
         // session deterministically after echoing.
         // `super::client` (the mux client module), not `russh::client` which
         // is imported as `client` above for `client::Handle`.
-        let outcome = super::client::run_inner(cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr)
+        let outcome = super::client::run_inner(cr, &mut cw, &token, "xterm".to_string(), 80, 24, &b"hello\n"[..], &mut stdout, &mut stderr, None)
             .await
             .unwrap();
 

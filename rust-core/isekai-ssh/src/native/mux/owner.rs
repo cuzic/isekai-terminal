@@ -135,7 +135,7 @@ where
             Some(fwd) => ctl_forward::open_login_shell(&guard, &term, cols as u32, rows as u32, &fwd.remote_path)
                 .await
                 .context("isekai-ssh mux owner: failed to open a ctl-socket login shell for the client"),
-            None => open_channel(&guard, &SessionKind::Shell { term, cols: cols as u32, rows: rows as u32 })
+            None => open_channel(&guard, &SessionKind::Shell { term, cols: cols as u32, rows: rows as u32, terminal_modes: vec![] })
                 .await
                 .context("isekai-ssh mux owner: failed to open a shell channel for the client"),
         }

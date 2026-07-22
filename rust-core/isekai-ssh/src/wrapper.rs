@@ -56,14 +56,40 @@ const DEFAULT_IDLE_LIFETIME_SECS: u64 = 2_592_000;
 /// traversal hint, not something worth blocking a connection attempt over.
 const STUN_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Whether the caller requested a PTY for the remote session, mirroring
+/// `ssh(1)`'s `-t`/`-T`/`-tt` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestTty {
+    /// No explicit `-t`/`-T` given: allocate a PTY for an interactive
+    /// (no-remote-command) session, skip it for a one-shot remote command.
+    Auto,
+    /// `-t`: force PTY allocation even for a remote command.
+    Yes,
+    /// `-T`: never allocate a PTY.
+    No,
+    /// `-tt`: force PTY allocation even when local stdin is not a tty
+    /// (ssh(1) uses this for batch-mode PTY-forcing).
+    Force,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct WrapperPlan {
     openssh_path: PathBuf,
     pipe_path: PathBuf,
+    /// The raw `ssh(1)`-style destination token (e.g. `cuzic@vpsmart`).
     destination: String,
+    /// The host part of the destination, with `user@` stripped (e.g. `vpsmart`).
+    /// Used for config resolution (`Host` block matching) and host key
+    /// verification, which don't understand `user@host` syntax.
+    destination_host: String,
+    /// The user part of the destination, if present (e.g. `Some("cuzic")` from
+    /// `cuzic@vpsmart`). Takes precedence over `ssh_config`'s `User` and the
+    /// local username — matching `ssh(1)`'s own precedence.
+    destination_user: Option<String>,
     destination_index: usize,
     ssh_args: Vec<String>,
     isekai: WrapperIsekaiOptions,
+    pub(crate) request_tty: RequestTty,
 }
 
 impl WrapperPlan {
@@ -80,6 +106,17 @@ impl WrapperPlan {
     /// only other direct read of `WrapperPlan` besides `pipe_path()`.
     pub(crate) fn destination(&self) -> &str {
         &self.destination
+    }
+
+    /// The host part of the destination with `user@` stripped. Used for
+    /// config resolution and host key verification.
+    pub(crate) fn destination_host(&self) -> &str {
+        &self.destination_host
+    }
+
+    /// The user part of the `user@host` destination, if any.
+    pub(crate) fn destination_user(&self) -> Option<&str> {
+        self.destination_user.as_deref()
     }
 
     /// `--isekai-log-file <PATH>` (`log_file.rs`), if given. The native
@@ -106,6 +143,13 @@ impl WrapperPlan {
     /// the native ctl-socket interactive-session check.
     pub(crate) fn destination_index(&self) -> usize {
         self.destination_index
+    }
+
+    /// The remote command (everything after the destination in the ssh args),
+    /// if any. `None` means an interactive login shell.
+    pub(crate) fn remote_command(&self) -> Option<&[String]> {
+        let tail = &self.ssh_args[self.destination_index + 1..];
+        if tail.is_empty() { None } else { Some(tail) }
     }
 }
 
@@ -1174,15 +1218,122 @@ pub(crate) fn parse_wrapper(args: Vec<String>) -> Result<WrapperPlan> {
     let destination_index = find_destination_index(&ssh_args)
         .ok_or_else(|| anyhow!("isekai-ssh: destination is required"))?;
     let destination = ssh_args[destination_index].clone();
+    let request_tty = extract_request_tty(&ssh_args, destination_index);
+    let (destination_user, destination_host) = split_user_host(&destination);
 
     Ok(WrapperPlan {
         openssh_path,
         pipe_path,
         destination,
+        destination_host,
+        destination_user,
         destination_index,
         ssh_args,
         isekai,
+        request_tty,
     })
+}
+
+/// Extracts the `-t`/`-T`/`-tt` flags from ssh args (before the destination)
+/// and returns the caller's PTY-request intent.
+pub(crate) fn extract_request_tty(ssh_args: &[String], destination_index: usize) -> RequestTty {
+    let mut tty = RequestTty::Auto;
+    let mut i = 0;
+    while i < destination_index {
+        match ssh_args[i].as_str() {
+            "-t" => {
+                tty = if tty == RequestTty::Yes { RequestTty::Force } else { RequestTty::Yes };
+            }
+            "-tt" => tty = RequestTty::Force,
+            "-T" => tty = RequestTty::No,
+            arg if arg.starts_with("-t") && arg.len() > 2 && arg.chars().skip(1).all(|c| c == 't') => {
+                // Multiple -t in one token: -ttt, -tttt, etc.
+                tty = RequestTty::Force;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    tty
+}
+
+/// Splits `user@host` into `(Some(user), host)`. If no `@` is present,
+/// returns `(None, host)`.
+pub(crate) fn split_user_host(destination: &str) -> (Option<String>, String) {
+    match destination.rsplit_once('@') {
+        Some((user, host)) if !user.is_empty() && !host.is_empty() => {
+            (Some(user.to_string()), host.to_string())
+        }
+        _ => (None, destination.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod extract_request_tty_tests {
+    use super::*;
+
+    #[test]
+    fn split_user_host_with_user() {
+        assert_eq!(split_user_host("cuzic@vpsmart"), (Some("cuzic".to_string()), "vpsmart".to_string()));
+    }
+
+    #[test]
+    fn split_user_host_without_user() {
+        assert_eq!(split_user_host("vpsmart"), (None, "vpsmart".to_string()));
+    }
+
+    #[test]
+    fn split_user_host_empty_user() {
+        assert_eq!(split_user_host("@vpsmart"), (None, "@vpsmart".to_string()));
+    }
+
+    #[test]
+    fn split_user_host_empty_host() {
+        assert_eq!(split_user_host("cuzic@"), (None, "cuzic@".to_string()));
+    }
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_is_auto() {
+        assert_eq!(extract_request_tty(&s(&["host"]), 0), RequestTty::Auto);
+    }
+
+    #[test]
+    fn dash_t_forces_pty() {
+        assert_eq!(extract_request_tty(&s(&["-t", "host"]), 1), RequestTty::Yes);
+    }
+
+    #[test]
+    fn dash_twice_is_force() {
+        assert_eq!(extract_request_tty(&s(&["-t", "-t", "host"]), 2), RequestTty::Force);
+    }
+
+    #[test]
+    fn dash_tt_is_force() {
+        assert_eq!(extract_request_tty(&s(&["-tt", "host"]), 1), RequestTty::Force);
+    }
+
+    #[test]
+    fn dash_upper_t_suppresses_pty() {
+        assert_eq!(extract_request_tty(&s(&["-T", "host"]), 1), RequestTty::No);
+    }
+
+    #[test]
+    fn dash_t_after_destination_is_ignored() {
+        // -t after the destination is a remote command argument, not a flag
+        assert_eq!(extract_request_tty(&s(&["host", "-t"]), 0), RequestTty::Auto);
+    }
+
+    #[test]
+    fn dash_t_before_destination_with_other_flags() {
+        assert_eq!(
+            extract_request_tty(&s(&["-p", "2222", "-t", "host", "cmd"]), 3),
+            RequestTty::Yes
+        );
+    }
 }
 
 async fn resolve_wrapper(plan: &WrapperPlan) -> Result<WrapperResolution> {
@@ -1207,29 +1358,36 @@ async fn resolve_wrapper(plan: &WrapperPlan) -> Result<WrapperResolution> {
 /// (the Unix wrapper path never needs them — real `ssh(1)` resolves those
 /// itself from the same config file).
 pub(crate) fn resolve_for_native(plan: &WrapperPlan) -> Result<(WrapperResolution, openssh_config::HostConfig)> {
-    let host_config = match dash_f_config_path(&plan.ssh_args) {
-        // Codex review finding: an explicit `-F <path>` (already understood
-        // by `find_destination_index`/`ssh_option_width` above, and already
-        // honored by the Unix path via `ssh_args_through_destination`'s `-G`
-        // invocation) must not be silently ignored here in favor of
-        // `~/.ssh/config` — that would authenticate against the wrong
-        // config file with no error, just a confusing connection failure
-        // (or worse, a connection to the wrong host under a stale trust
-        // entry).
-        Some(config_path) => openssh_config::resolve(&config_path, &plan.destination).map_err(|e| {
-            anyhow!(
-                "isekai-ssh: failed to resolve {:?} from {}: {e}",
-                plan.destination,
-                config_path.display()
-            )
-        })?,
-        None => openssh_config::resolve_default(&plan.destination).map_err(|e| {
-            anyhow!(
-                "isekai-ssh: failed to resolve {:?} from ~/.ssh/config: {e}",
-                plan.destination
-            )
-        })?,
-    };
+    let explicit_f = dash_f_config_path(&plan.ssh_args);
+    log_line!("isekai-ssh: dash_f={:?}, destination={:?}, dest_host={:?}, dest_user={:?}", explicit_f, plan.destination, plan.destination_host, plan.destination_user);
+    let host_config = match explicit_f {
+        Some(config_path) => {
+            log_line!("isekai-ssh: resolving config from {}", config_path.display());
+            openssh_config::resolve(&config_path, &plan.destination_host).map_err(|e| {
+                anyhow!(
+                    "isekai-ssh: failed to resolve {:?} from {}: {e}",
+                    plan.destination,
+                    config_path.display()
+                )
+            })
+        }
+        None => {
+            log_line!("isekai-ssh: resolving config from ~/.ssh/config for {:?}", plan.destination_host);
+            openssh_config::resolve_default(&plan.destination_host).map_err(|e| {
+                anyhow!(
+                    "isekai-ssh: failed to resolve {:?} from ~/.ssh/config: {e}",
+                    plan.destination
+                )
+            })
+        }
+    }?;
+    log_line!(
+        "isekai-ssh: resolved host_config: hostname={:?}, user={:?}, port={:?}, identity_file={:?}",
+        host_config.host_name,
+        host_config.user,
+        host_config.port,
+        host_config.identity_file,
+    );
     let mut host_config = host_config;
     // Command-line overrides (`-p`/`-l`/`-J`/`-o Key=Value`) beat the config
     // file, matching real `ssh(1)` precedence. The Unix path gets this for
@@ -1839,9 +1997,12 @@ mod tests {
             openssh_path: PathBuf::from("/usr/bin/ssh"),
             pipe_path: PathBuf::from("/usr/bin/isekai-pipe"),
             destination: "production".to_string(),
+            destination_host: "production".to_string(),
+            destination_user: None,
             destination_index: 0,
             ssh_args: Vec::new(),
             isekai: WrapperIsekaiOptions::default(),
+            request_tty: RequestTty::Auto,
         };
         let resolution = WrapperResolution {
             openssh: OpenSshEffectiveConfig::default(),
@@ -1898,9 +2059,12 @@ mod tests {
             openssh_path: PathBuf::from("/usr/bin/ssh"),
             pipe_path: PathBuf::from("/usr/bin/isekai-pipe"),
             destination: "production".to_string(),
+            destination_host: "production".to_string(),
+            destination_user: None,
             destination_index: 0,
             ssh_args: Vec::new(),
             isekai: WrapperIsekaiOptions::default(),
+            request_tty: RequestTty::Auto,
         };
         // A nonexistent path is enough: chain validation runs, and fails
         // closed, before this path is ever read from disk.

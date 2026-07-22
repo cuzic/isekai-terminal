@@ -10,6 +10,8 @@ pub(crate) mod bootstrap_backend;
 pub(crate) mod child_stdio;
 pub(crate) mod connect;
 pub(crate) mod console;
+pub(crate) mod console_stdin;
+pub(crate) mod escape;
 pub(crate) mod host_key_trust;
 pub(crate) mod mux;
 pub(crate) mod private_key;

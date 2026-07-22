@@ -118,3 +118,15 @@ fun wheelButtonForDelta(deltaY: Float): MouseButton? = when {
     deltaY > 0f -> MouseButton.WHEEL_DOWN
     else -> MouseButton.WHEEL_UP
 }
+
+/**
+ * トラックパッド/マウスホイールの`PointerEventType.Scroll`の横方向delta量から、
+ * 送出すべきxtermホイールボタンを決める。`deltaX == 0f`(スクロール量なし)は
+ * 対象外として`null`を返す。符号規約: 正のdeltaX = 右方向へスクロール
+ * (xtermのwheel right/button 67)。
+ */
+fun wheelButtonForHorizontalDelta(deltaX: Float): MouseButton? = when {
+    deltaX == 0f -> null
+    deltaX > 0f -> MouseButton.WHEEL_RIGHT
+    else -> MouseButton.WHEEL_LEFT
+}

@@ -861,7 +861,8 @@ public final class TerminalScreenView: UIView, UIGestureRecognizerDelegate {
             cols: update.cols,
             rows: update.rows,
             mouseReportingMode: update.mouseReportingMode,
-            sgrMouseMode: update.sgrMouseMode
+            sgrMouseMode: update.sgrMouseMode,
+            urxvtMouseMode: update.urxvtMouseMode
         ) else { return }
         onPointerBytes?(bytes)
     }

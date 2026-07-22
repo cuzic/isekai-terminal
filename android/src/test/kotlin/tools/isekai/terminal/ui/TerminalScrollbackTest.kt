@@ -43,6 +43,8 @@ class TerminalScrollbackTest {
             bracketedPasteMode = true,
             mouseReportingMode = MouseReportingMode.OFF,
             sgrMouseMode = false,
+            alternateScroll = false,
+            urxvtMouseMode = false,
             cursorVisible = cursorVisible,
             bellGeneration = bellGeneration,
             cursorShape = CursorShape.BLOCK,

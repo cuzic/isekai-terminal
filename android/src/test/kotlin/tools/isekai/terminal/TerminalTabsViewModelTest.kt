@@ -551,7 +551,7 @@ class TerminalTabsViewModelTest {
     private fun screenUpdate(applicationCursorMode: Boolean, kittyKeyboardFlags: UShort = 0u) =
         ScreenUpdate(
             0u, 80u, 24u, emptyList(), 0u, 0u, null, applicationCursorMode, false, false,
-            MouseReportingMode.OFF, false, true, 0uL, CursorShape.BLOCK, true, emptyList(),
+            MouseReportingMode.OFF, false, false, false, true, 0uL, CursorShape.BLOCK, true, emptyList(),
             emptyList(), kittyKeyboardFlags, null,
         )
 

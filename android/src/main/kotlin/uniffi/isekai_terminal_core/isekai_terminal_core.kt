@@ -1128,7 +1128,7 @@ external fun uniffi_isekai_terminal_core_fn_func_terminal_kitty_disambiguated_ke
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_numpad_key_bytes(`key`: RustBuffer.ByValue,`applicationKeypadMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
-external fun uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(`kind`: RustBuffer.ByValue,`button`: RustBuffer.ByValue,`row`: Int,`col`: Int,`modifiers`: RustBuffer.ByValue,`cols`: Int,`rows`: Int,`mouseReportingMode`: RustBuffer.ByValue,`sgrMouseMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+external fun uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(`kind`: RustBuffer.ByValue,`button`: RustBuffer.ByValue,`row`: Int,`col`: Int,`modifiers`: RustBuffer.ByValue,`cols`: Int,`rows`: Int,`mouseReportingMode`: RustBuffer.ByValue,`sgrMouseMode`: Byte,`urxvtMouseMode`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_isekai_terminal_core_fn_func_terminal_special_key_bytes(`key`: RustBuffer.ByValue,`applicationCursorMode`: Byte,`modifiers`: RustBuffer.ByValue,`kittyFlags`: Short,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1293,7 +1293,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes() != 1311) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 25125) {
+    if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 7470) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 49859) {
@@ -5209,6 +5209,19 @@ data class ScreenUpdate (
     var `sgrMouseMode`: kotlin.Boolean
     , 
     /**
+     * DECSET/DECRST `?1007`(Alternate Scroll)の現在値。有効時、alt screenで
+     * マウスホイールをカーソル上下キー(`↑`/`↓`)に変換する。既定は`false`。
+     */
+    var `alternateScroll`: kotlin.Boolean
+    , 
+    /**
+     * DECSET/DECRST `?1015`(URXVTマウスエンコーディング)の現在値。有効時、
+     * マウスレポートを`CSI Cb ; Cx ; Cy M`形式(セミコロン区切り10進数)で
+     * エンコードする。`?1006`(SGR)と排他ではない。既定は`false`。
+     */
+    var `urxvtMouseMode`: kotlin.Boolean
+    , 
+    /**
      * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
      */
     var `cursorVisible`: kotlin.Boolean
@@ -5325,6 +5338,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterTypeMouseReportingMode.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterTypeCursorShape.read(buf),
             FfiConverterBoolean.read(buf),
@@ -5348,6 +5363,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.allocationSize(value.`bracketedPasteMode`) +
             FfiConverterTypeMouseReportingMode.allocationSize(value.`mouseReportingMode`) +
             FfiConverterBoolean.allocationSize(value.`sgrMouseMode`) +
+            FfiConverterBoolean.allocationSize(value.`alternateScroll`) +
+            FfiConverterBoolean.allocationSize(value.`urxvtMouseMode`) +
             FfiConverterBoolean.allocationSize(value.`cursorVisible`) +
             FfiConverterULong.allocationSize(value.`bellGeneration`) +
             FfiConverterTypeCursorShape.allocationSize(value.`cursorShape`) +
@@ -5371,6 +5388,8 @@ public object FfiConverterTypeScreenUpdate: FfiConverterRustBuffer<ScreenUpdate>
             FfiConverterBoolean.write(value.`bracketedPasteMode`, buf)
             FfiConverterTypeMouseReportingMode.write(value.`mouseReportingMode`, buf)
             FfiConverterBoolean.write(value.`sgrMouseMode`, buf)
+            FfiConverterBoolean.write(value.`alternateScroll`, buf)
+            FfiConverterBoolean.write(value.`urxvtMouseMode`, buf)
             FfiConverterBoolean.write(value.`cursorVisible`, buf)
             FfiConverterULong.write(value.`bellGeneration`, buf)
             FfiConverterTypeCursorShape.write(value.`cursorShape`, buf)
@@ -6429,7 +6448,9 @@ enum class MouseButton {
     MIDDLE,
     RIGHT,
     WHEEL_UP,
-    WHEEL_DOWN;
+    WHEEL_DOWN,
+    WHEEL_LEFT,
+    WHEEL_RIGHT;
 
     
 
@@ -8837,12 +8858,12 @@ public object FfiConverterSequenceTypeScrollbackSearchMatch: FfiConverterRustBuf
          *
          * `row`/`col`は0-basedのセル座標(画面外の値は端末サイズ`cols`/`rows`へ
          * クランプされる、`terminal::encode_pointer_event_bytes`のdocコメント参照)。
-         */ fun `terminalPointerEventBytes`(`kind`: MouseEventKind, `button`: MouseButton?, `row`: kotlin.UInt, `col`: kotlin.UInt, `modifiers`: TerminalKeyModifiers, `cols`: kotlin.UInt, `rows`: kotlin.UInt, `mouseReportingMode`: MouseReportingMode, `sgrMouseMode`: kotlin.Boolean): kotlin.ByteArray? {
+         */ fun `terminalPointerEventBytes`(`kind`: MouseEventKind, `button`: MouseButton?, `row`: kotlin.UInt, `col`: kotlin.UInt, `modifiers`: TerminalKeyModifiers, `cols`: kotlin.UInt, `rows`: kotlin.UInt, `mouseReportingMode`: MouseReportingMode, `sgrMouseMode`: kotlin.Boolean, `urxvtMouseMode`: kotlin.Boolean): kotlin.ByteArray? {
             return FfiConverterOptionalByteArray.lift(
     uniffiRustCall() { _status ->
     UniffiLib.uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(
     
-        FfiConverterTypeMouseEventKind.lower(`kind`),FfiConverterOptionalTypeMouseButton.lower(`button`),FfiConverterUInt.lower(`row`),FfiConverterUInt.lower(`col`),FfiConverterTypeTerminalKeyModifiers.lower(`modifiers`),FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),FfiConverterTypeMouseReportingMode.lower(`mouseReportingMode`),FfiConverterBoolean.lower(`sgrMouseMode`),_status)
+        FfiConverterTypeMouseEventKind.lower(`kind`),FfiConverterOptionalTypeMouseButton.lower(`button`),FfiConverterUInt.lower(`row`),FfiConverterUInt.lower(`col`),FfiConverterTypeTerminalKeyModifiers.lower(`modifiers`),FfiConverterUInt.lower(`cols`),FfiConverterUInt.lower(`rows`),FfiConverterTypeMouseReportingMode.lower(`mouseReportingMode`),FfiConverterBoolean.lower(`sgrMouseMode`),FfiConverterBoolean.lower(`urxvtMouseMode`),_status)
 }
     )
     }

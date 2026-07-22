@@ -56,6 +56,9 @@ pub(crate) enum ClientRunResult {
 /// code — there is nothing left to fall back to at that point. On a rejection
 /// during the handshake (before any shell existed), it instead returns
 /// [`ClientRunResult::Rejected`] so the caller can retry unmultiplexed.
+///
+/// Propagates local terminal resize events to the owner via [`Frame::Resize`]
+/// frames (which the owner forwards to the remote PTY).
 pub(crate) async fn run<Conn>(conn: Conn, token: &[u8]) -> Result<ClientRunResult>
 where
     Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -63,6 +66,8 @@ where
     let (reader, mut writer) = tokio::io::split(conn);
     let (cols, rows) = super::super::console::terminal_size();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+
+    let resize_rx = super::super::console::spawn_resize_watcher();
 
     let _raw_mode = super::super::console::RawModeGuard::enable().map_err(|e| anyhow!("isekai-ssh: failed to enable raw terminal mode: {e}"))?;
     let outcome = run_inner(
@@ -72,9 +77,10 @@ where
         term,
         cols as u16,
         rows as u16,
-        tokio::io::stdin(),
+        super::super::console_stdin::ConsoleStdin::open(),
         tokio::io::stdout(),
         tokio::io::stderr(),
+        resize_rx,
     )
     .await?;
 
@@ -91,12 +97,14 @@ where
     }
 }
 
-/// The body of [`run`] with the terminal streams injected, so tests can drive
-/// it against in-memory buffers. Sends a [`Frame::Hello`], waits for the
-/// owner's `HelloAck`/`Rejected`, then relays local stdin as [`Frame::Stdin`]
-/// frames (and a final [`Frame::Shutdown`] on local EOF) while writing the
-/// owner's `Stdout`/`Stderr` frames to the local streams until an [`Frame::Exit`]
-/// (clean end) or a dropped connection (owner lost).
+/// The body of [`run`] with the terminal streams plus an optional resize
+/// event channel injected, so tests can drive it against in-memory buffers.
+/// Sends a [`Frame::Hello`], waits for the owner's `HelloAck`/`Rejected`,
+/// then relays local stdin as [`Frame::Stdin`] frames (and a final
+/// [`Frame::Shutdown`] on local EOF), local resize events as
+/// [`Frame::Resize`] frames, while writing the owner's `Stdout`/`Stderr`
+/// frames to the local streams until an [`Frame::Exit`] (clean end) or a
+/// dropped connection (owner lost).
 ///
 /// The owner connection's read half is owned by a dedicated frame-reader task
 /// (see [`spawn_frame_reader`]) so the `select!` loop can await frames on a
@@ -114,6 +122,7 @@ pub(crate) async fn run_inner<CR, CW, I, O, E>(
     mut stdin: I,
     mut stdout: O,
     mut stderr: E,
+    mut resize_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
 ) -> Result<ClientOutcome>
 where
     CR: AsyncRead + Unpin + Send + 'static,
@@ -196,7 +205,25 @@ where
                     Some(Ok(None)) | Some(Err(_)) | None => return Ok(ClientOutcome::OwnerLost),
                 }
             }
+            resize = recv_resize(&mut resize_rx) => {
+                if let Some((cols, rows)) = resize {
+                    if write_frame(conn_write, &Frame::Resize { cols: cols as u16, rows: rows as u16 }).await.is_err() {
+                        return Ok(ClientOutcome::OwnerLost);
+                    }
+                }
+            }
         }
+    }
+}
+
+/// `recv` on the optional resize channel, or a future that never resolves
+/// when there is no watcher (so the `select!` branch is inert).
+async fn recv_resize(
+    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
+) -> Option<(u32, u32)> {
+    match rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -228,6 +255,7 @@ mod tests {
             stdin_bytes,
             &mut stdout,
             &mut stderr,
+            None,
         )
         .await;
         (outcome, stdout, stderr)
@@ -396,7 +424,7 @@ mod tests {
         let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b"echo hi\n"[..], &mut stdout, &mut stderr)
+        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b"echo hi\n"[..], &mut stdout, &mut stderr, None)
             .await
             .unwrap();
 
@@ -454,7 +482,7 @@ mod tests {
         let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, stdin_r, &mut stdout, &mut stderr)
+        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, stdin_r, &mut stdout, &mut stderr, None)
             .await
             .unwrap();
 
