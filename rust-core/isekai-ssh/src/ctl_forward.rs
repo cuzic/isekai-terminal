@@ -323,8 +323,8 @@ async fn run_build(
     let stderr = child.stderr.take().expect("stderr was piped");
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(isekai_protocol::BuildOutputStream, Vec<u8>)>(32);
-    let stdout_task = tokio::spawn(pump_bytes(stdout, isekai_protocol::BuildOutputStream::Stdout, tx.clone()));
-    let stderr_task = tokio::spawn(pump_bytes(stderr, isekai_protocol::BuildOutputStream::Stderr, tx.clone()));
+    let stdout_task = tokio::spawn(crate::build_exec::pump_bytes(stdout, isekai_protocol::BuildOutputStream::Stdout, tx.clone()));
+    let stderr_task = tokio::spawn(crate::build_exec::pump_bytes(stderr, isekai_protocol::BuildOutputStream::Stderr, tx.clone()));
     drop(tx);
 
     let mut write_failed = false;
@@ -368,142 +368,17 @@ async fn run_build(
         _ => Vec::new(),
     };
     if let Some(dest_dir) = &profile.dest_dir {
-        spawn_result_push(host.to_string(), dest_dir.clone(), result_paths.clone());
+        crate::build_exec::spawn_result_push(host.to_string(), dest_dir.clone(), result_paths.clone());
     }
     send_build_finished(write_half, exit_code, result_paths).await?;
     Ok(())
 }
 
-/// Pushes each of `result_paths` to `host`'s `dest_dir` via a recursive
-/// `isekai-ssh <host> -- mkdir -p ... && cat > ...` invocation — reusing the
-/// "`isekai-ssh <host>` always connects" machinery (bootstrap, resilience,
-/// retries) rather than inventing a new bulk-transfer protocol
-/// (`ISEKAI_PIPE_DESIGN.md` §8 Epic P). Spawned in the background rather
-/// than awaited: the ctl connection (and the `BuildFinished` this function
-/// runs alongside) shouldn't stay open for however long the push takes,
-/// especially for a large artifact over a slow link. A failed push is
-/// logged to this process's own stderr, not surfaced back to the remote —
-/// there's no channel left to report it on once the build's own ctl
-/// connection has already sent `BuildFinished` and closed (a known v1
-/// limitation, `ISEKAI_PIPE_DESIGN.md` §8 Epic P).
-///
-/// `dest_dir`/`local_path` are entirely local, trusted config (the profile
-/// the remote merely *named*, never authored — see this module's `run_build`
-/// docs) — not remote-supplied, so they're interpolated into the remote
-/// shell command as-is, the same trust boundary `profile.command` itself
-/// already gets. This also matters for `~` in `dest_dir`: quoting it would
-/// suppress the remote shell's tilde expansion.
-#[cfg(unix)]
-fn spawn_result_push(host: String, dest_dir: String, result_paths: Vec<String>) {
-    if result_paths.is_empty() {
-        return;
-    }
-    tokio::spawn(async move {
-        for local_path in result_paths {
-            if let Err(e) = push_result_file(&host, &dest_dir, &local_path).await {
-                eprintln!("isekai-ssh: failed to push build result {local_path:?} to {host:?}:{dest_dir:?}: {e:#}");
-            }
-        }
-    });
-}
-
-/// The remote command a recursive `isekai-ssh <host> -- <command>` runs to
-/// place a pushed build result at `dest_dir`/`file_name`. Split out from
-/// [`push_result_file`] so this string-construction logic is unit-testable
-/// without a real recursive process spawn (see that function's docs on why
-/// a unit test can't exercise the spawn itself). `dest_dir`/`file_name` are
-/// local, trusted config/build-output — not remote-supplied — so they're
-/// interpolated as-is rather than shell-quoted; quoting `dest_dir` would
-/// also break `~` expansion in the remote shell.
-#[cfg(unix)]
-fn build_push_remote_command(dest_dir: &str, file_name: &str) -> String {
-    format!("mkdir -p {dest_dir} && cat > {dest_dir}/{file_name}")
-}
-
-#[cfg(unix)]
-async fn push_result_file(host: &str, dest_dir: &str, local_path: &str) -> Result<()> {
-    use tokio::io::AsyncWriteExt as _;
-
-    // `spawn_blocking` (same convention as `login.rs`/`helper_download.rs`'s
-    // blocking-work wrapping) rather than a plain `std::fs::read`: a build
-    // artifact can be a large binary, and blocking a tokio worker thread on
-    // it would stall whatever else is scheduled on that thread.
-    let local_path_owned = local_path.to_string();
-    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&local_path_owned))
-        .await
-        .context("isekai-ssh: build result read task panicked")?
-        .with_context(|| format!("isekai-ssh: failed to read build result {local_path:?}"))?;
-    let file_name = std::path::Path::new(local_path)
-        .file_name()
-        .with_context(|| format!("isekai-ssh: result path {local_path:?} has no file name"))?
-        .to_string_lossy()
-        .into_owned();
-    let remote_command = build_push_remote_command(dest_dir, &file_name);
-
-    // `current_exe()` correctly self-references the real `isekai-ssh` binary
-    // in production (that's what's running), but note for anyone testing
-    // this: under `cargo test`, it resolves to the *test* binary, not
-    // `isekai-ssh` — so exercising the actual recursive spawn needs an
-    // integration test that drives the real compiled binary as the outer
-    // process (`env!("CARGO_BIN_EXE_isekai-ssh")`), not a unit test in this
-    // module. `build_push_remote_command` above is unit-tested directly
-    // instead of going through a real spawn.
-    let exe = std::env::current_exe().context("isekai-ssh: failed to resolve its own executable path")?;
-    let mut child = tokio::process::Command::new(exe)
-        .arg(host)
-        .arg(&remote_command)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .context("isekai-ssh: failed to spawn a recursive isekai-ssh invocation to push the build result")?;
-    {
-        let mut stdin = child.stdin.take().expect("stdin was piped");
-        stdin
-            .write_all(&bytes)
-            .await
-            .context("isekai-ssh: failed to write the build result to the recursive isekai-ssh's stdin")?;
-        // `stdin` drops here (end of block), closing it so the remote `cat`
-        // sees EOF and exits instead of blocking forever on more input.
-    }
-    let status = child
-        .wait()
-        .await
-        .context("isekai-ssh: failed to wait for the recursive isekai-ssh result push")?;
-    if !status.success() {
-        anyhow::bail!("isekai-ssh: pushing build result {local_path:?} to {host:?} exited with {status}");
-    }
-    Ok(())
-}
-
-/// Reads `reader` in fixed-size chunks (not line-buffered — build tool
-/// output isn't guaranteed to be UTF-8 or newline-terminated, e.g. a
-/// carriage-return progress bar) and forwards each chunk to `tx`, stopping
-/// at EOF, a read error, or once `tx`'s receiver is gone (the ctl
-/// connection broke — `run_build` dropped `rx`).
-#[cfg(unix)]
-async fn pump_bytes(
-    mut reader: impl tokio::io::AsyncRead + Unpin,
-    stream: isekai_protocol::BuildOutputStream,
-    tx: tokio::sync::mpsc::Sender<(isekai_protocol::BuildOutputStream, Vec<u8>)>,
-) {
-    use tokio::io::AsyncReadExt as _;
-    // Comfortably under `MAX_BUILD_CHUNK_DECODED_LEN` (64 KiB) so every
-    // chunk this sends passes the far end's `validate_ctl_message` cap.
-    let mut buf = vec![0u8; 8 * 1024];
-    loop {
-        match reader.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                if tx.send((stream, buf[..n].to_vec())).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
+/// Thin wrappers around `build_exec`'s shared encoders that just add the
+/// actual write — kept here (rather than inlining `build_exec::encode_*` at
+/// each call site in `run_build`) so `run_build` itself reads the same as
+/// before this encoding logic moved out to be shared with the Windows-native
+/// dispatch paths (`ISEKAI_PIPE_DESIGN.md` §8 Epic P Phase 2).
 #[cfg(unix)]
 async fn send_build_output(
     write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
@@ -511,10 +386,7 @@ async fn send_build_output(
     bytes: Vec<u8>,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
-    let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
-    let mut out = serde_json::to_vec(&CtlMessage::BuildOutputChunk { stream, data_b64 })
-        .context("isekai-ssh: failed to encode build output chunk")?;
-    out.push(b'\n');
+    let out = crate::build_exec::encode_build_output_chunk(stream, bytes)?;
     write_half.write_all(&out).await.context("isekai-ssh: failed to write build output chunk")?;
     Ok(())
 }
@@ -526,9 +398,7 @@ async fn send_build_finished(
     result_paths: Vec<String>,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
-    let mut out = serde_json::to_vec(&CtlMessage::BuildFinished { exit_code, result_paths })
-        .context("isekai-ssh: failed to encode build finished message")?;
-    out.push(b'\n');
+    let out = crate::build_exec::encode_build_finished(exit_code, result_paths)?;
     write_half.write_all(&out).await.context("isekai-ssh: failed to write build finished message")?;
     write_half.shutdown().await.ok();
     Ok(())
@@ -867,38 +737,9 @@ mod tests {
         assert!(format!("{err:#}").contains("closed") || format!("{err:#}").contains("killed"));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn build_push_remote_command_creates_the_dest_dir_and_writes_the_file() {
-        let cmd = build_push_remote_command("~/isekai-build-results/win", "app.exe");
-        assert_eq!(
-            cmd,
-            "mkdir -p ~/isekai-build-results/win && cat > ~/isekai-build-results/win/app.exe"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn build_push_remote_command_does_not_quote_tilde_out_of_expanding() {
-        // A quoted `"~/dest"` would suppress the remote shell's tilde
-        // expansion (POSIX shells never expand `~` inside quotes) — this
-        // guards against that regression by asserting `~` stays bare.
-        let cmd = build_push_remote_command("~/dest", "out.bin");
-        assert!(!cmd.contains("\"~"), "tilde must not be quoted: {cmd:?}");
-    }
-
-    /// `spawn_result_push` with no result paths must not spawn anything —
-    /// nothing to assert on the "did it spawn" side directly, but this at
-    /// least guards against a panic/attempted push with an empty file list.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn spawn_result_push_is_a_no_op_for_empty_result_paths() {
-        spawn_result_push("mybox".to_string(), "~/dest".to_string(), Vec::new());
-        // Give any (incorrectly) spawned task a chance to run before the
-        // test process exits, so a regression would at least have a chance
-        // to panic visibly rather than being silently dropped.
-        tokio::task::yield_now().await;
-    }
+    // `build_push_remote_command`/`spawn_result_push`(+ their tests) moved to
+    // `build_exec.rs` (Epic P Phase 2) so the Windows-native dispatch paths
+    // can share them too — see that module for the equivalent tests.
 
     /// Connects a fresh `UnixStream` to `local_path` (the listener
     /// `spawn_ctl_listener` bound) and drives one `BuildRequest` over it,
