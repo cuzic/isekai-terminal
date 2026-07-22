@@ -59,7 +59,38 @@ pub(crate) const EXIT_MUX_OWNER_LOST: u8 = 254;
 /// size chosen here is generous headroom rather than a tight bound.
 const MAIN_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 
+/// Installs a process-wide panic hook that runs *in addition to* (not
+/// instead of) the default stderr behavior, so a panic still shows on the
+/// terminal exactly as before, but also gets recorded into whichever
+/// `log_file.rs` sink is already active — the explicit `--isekai-log-file`
+/// target if given, otherwise the always-on default verbose log
+/// (`log_file::append_verbose_line`/`init_verbose`, itself a silent no-op
+/// until `wrapper::run`/`native::connect::run` calls `init_verbose` early
+/// on). Without this, a panic simply vanished once the terminal's own
+/// scrollback was gone: `main()`'s `.join().unwrap_or_else(|panic|
+/// std::panic::resume_unwind(panic))` only re-raises the payload for the
+/// process's own exit handling, it never logs it anywhere. Must be
+/// installed before the worker thread below is spawned — the hook is
+/// process-wide, so one installation here also covers panics on that
+/// thread. Fail-open like every other write in `log_file.rs`: appending
+/// here is itself best-effort and must never panic in turn (a panic inside
+/// a panic hook aborts the process immediately).
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let line = format!("PANIC: {info}\n{backtrace}");
+        if log_file::is_enabled() {
+            log_file::append_line(&line);
+        } else {
+            log_file::append_verbose_line(&line);
+        }
+    }));
+}
+
 fn main() {
+    install_panic_hook();
     let exit_code = std::thread::Builder::new()
         .name("isekai-ssh-main".to_string())
         .stack_size(MAIN_WORKER_STACK_SIZE)
