@@ -291,6 +291,11 @@ async fn handle_ctl_connection(
 /// - `SetVar`/`GetVarRequest`/`GetVarResponse` (task #16) have no OSC
 ///   equivalent — they're handled directly in `handle_ctl_connection`
 ///   against `CTL_VARS` instead of through this OSC-emitting path.
+/// - `BuildRequest`/`BuildOutputChunk`/`BuildFinished` (Epic P) have no OSC
+///   equivalent either — unlike `title`/`clip`, there is no terminal escape
+///   sequence for "run a local command", so this variant is handled by a
+///   dedicated long-lived branch in `handle_ctl_connection` instead of the
+///   OSC-emitting path every other variant goes through.
 pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
     match msg {
         CtlMessage::SetTitle { value } => Some(format!("\x1b]0;{value}\x07")),
@@ -299,7 +304,10 @@ pub(crate) fn osc_sequence_for(msg: &CtlMessage) -> Option<String> {
         | CtlMessage::ClipboardPullResponse { .. }
         | CtlMessage::SetVar { .. }
         | CtlMessage::GetVarRequest { .. }
-        | CtlMessage::GetVarResponse { .. } => None,
+        | CtlMessage::GetVarResponse { .. }
+        | CtlMessage::BuildRequest { .. }
+        | CtlMessage::BuildOutputChunk { .. }
+        | CtlMessage::BuildFinished { .. } => None,
     }
 }
 
