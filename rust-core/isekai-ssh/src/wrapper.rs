@@ -34,11 +34,13 @@ use config::resolve_isekai_config;
 
 /// Reserved words that `should_run_wrapper` never treats as an SSH
 /// destination — the interactive trust-store subcommands (`init`/`login`/
-/// `logout`, all pre-existing) plus `doctor` (manual diagnostic,
-/// `ISEKAI_PIPE_DESIGN.md` §8 Epic N). Not purely "legacy" any more, but
-/// kept as one flat list since `should_run_wrapper`'s only job is "is the
-/// first arg one of these known subcommand names or an SSH destination".
-const RESERVED_SUBCOMMANDS: &[&str] = &["init", "login", "logout", "doctor"];
+/// `logout`, all pre-existing), `doctor` (manual diagnostic,
+/// `ISEKAI_PIPE_DESIGN.md` §8 Epic N), and `build-profile` (Epic P's local
+/// build-profile config management, `build_profile_cli.rs`). Not purely
+/// "legacy" any more, but kept as one flat list since `should_run_wrapper`'s
+/// only job is "is the first arg one of these known subcommand names or an
+/// SSH destination".
+const RESERVED_SUBCOMMANDS: &[&str] = &["init", "login", "logout", "doctor", "build-profile"];
 
 /// Matches `isekai-ssh init`'s own default (`cli::InitArgs::idle_lifetime`):
 /// the auto-bootstrapped helper is expected to keep running across many

@@ -9,6 +9,9 @@
 //! `init`/`login`/`logout` remain as the interactive subcommands that
 //! populate/manage the trust store the wrapper reads from.
 
+mod build_exec;
+mod build_profile;
+mod build_profile_cli;
 mod cli;
 mod ctl_forward;
 mod doctor;
@@ -170,6 +173,7 @@ async fn run() -> u8 {
             cli::Command::Login(args) => login::run(args).await,
             cli::Command::Logout => login::run_logout().await,
             cli::Command::Doctor(args) => doctor::run(args).await,
+            cli::Command::BuildProfile(command) => build_profile_cli::run(command).await,
         };
 
         match result {

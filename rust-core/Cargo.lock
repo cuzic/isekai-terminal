@@ -1953,6 +1953,7 @@ dependencies = [
  "ssh-encoding",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "ureq",
  "windows-sys 0.59.0",
 ]
