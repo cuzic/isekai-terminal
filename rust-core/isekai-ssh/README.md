@@ -466,8 +466,11 @@ scp ...` のようなシェルチェインもそのまま効く。`--result-glob
 (`--dir`/`--command`)は一切 wire に乗らない。プロファイル自体が空(既定)なら、リモートから
 何を送っても何も実行されない。設定はプロファイル追加時に人間が明示的に行う。
 
-**既知の制限**: Windows クライアント(`native/mux/` 経由)はまだ未対応(Unix/macOS の
-`ssh(1)` ラッパー経路のみ、`ISEKAI_PIPE_DESIGN.md` §8 Epic P の Phase 1)。
+**Windows クライアント**: `native/mux/`(owner/client mux)経路にも同じ機能を実装済み
+(`ISEKAI_PIPE_DESIGN.md` §8 Epic P Phase 2)。このプロジェクトの開発環境には実機
+Windows が無いため、この機能自体はモックSSHサーバーでのユニットテストと
+`x86_64-pc-windows-gnu` へのクロスコンパイル確認までしか検証できていない——named pipe
+実体・`cmd.exe` 固有の挙動・実 `isekai-ssh.exe` での実際のビルドは未検証(既知の制限)。
 
 ### 新規クレートの位置づけ
 
