@@ -756,7 +756,7 @@ RustBuffer uniffi_isekai_terminal_core_fn_func_terminal_numpad_key_bytes(RustBuf
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_FUNC_TERMINAL_POINTER_EVENT_BYTES
 #define UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_FUNC_TERMINAL_POINTER_EVENT_BYTES
-RustBuffer uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(RustBuffer kind, RustBuffer button, uint32_t row, uint32_t col, RustBuffer modifiers, uint32_t cols, uint32_t rows, RustBuffer mouse_reporting_mode, int8_t sgr_mouse_mode, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(RustBuffer kind, RustBuffer button, uint32_t row, uint32_t col, RustBuffer modifiers, uint32_t cols, uint32_t rows, RustBuffer mouse_reporting_mode, int8_t sgr_mouse_mode, int8_t urxvt_mouse_mode, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ISEKAI_TERMINAL_CORE_FN_FUNC_TERMINAL_SPECIAL_KEY_BYTES

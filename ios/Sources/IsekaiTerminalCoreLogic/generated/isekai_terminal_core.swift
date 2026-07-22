@@ -3443,6 +3443,17 @@ public struct ScreenUpdate: Equatable, Hashable {
      */
     public var sgrMouseMode: Bool
     /**
+     * DECSET/DECRST `?1007`(Alternate Scroll)の現在値。有効時、alt screenで
+     * マウスホイールをカーソル上下キー(`↑`/`↓`)に変換する。既定は`false`。
+     */
+    public var alternateScroll: Bool
+    /**
+     * DECSET/DECRST `?1015`(URXVTマウスエンコーディング)の現在値。有効時、
+     * マウスレポートを`CSI Cb ; Cx ; Cy M`形式(セミコロン区切り10進数)で
+     * エンコードする。`?1006`(SGR)と排他ではない。既定は`false`。
+     */
+    public var urxvtMouseMode: Bool
+    /**
      * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
      */
     public var cursorVisible: Bool
@@ -3554,6 +3565,15 @@ public struct ScreenUpdate: Equatable, Hashable {
          * 将来のプロトコル分岐のために公開しておく。
          */sgrMouseMode: Bool, 
         /**
+         * DECSET/DECRST `?1007`(Alternate Scroll)の現在値。有効時、alt screenで
+         * マウスホイールをカーソル上下キー(`↑`/`↓`)に変換する。既定は`false`。
+         */alternateScroll: Bool, 
+        /**
+         * DECSET/DECRST `?1015`(URXVTマウスエンコーディング)の現在値。有効時、
+         * マウスレポートを`CSI Cb ; Cx ; Cy M`形式(セミコロン区切り10進数)で
+         * エンコードする。`?1006`(SGR)と排他ではない。既定は`false`。
+         */urxvtMouseMode: Bool, 
+        /**
          * DECTCEM(`CSI ?25h`/`CSI ?25l`)で制御されるカーソルの表示/非表示。既定は`true`。
          */cursorVisible: Bool, 
         /**
@@ -3638,6 +3658,8 @@ public struct ScreenUpdate: Equatable, Hashable {
         self.bracketedPasteMode = bracketedPasteMode
         self.mouseReportingMode = mouseReportingMode
         self.sgrMouseMode = sgrMouseMode
+        self.alternateScroll = alternateScroll
+        self.urxvtMouseMode = urxvtMouseMode
         self.cursorVisible = cursorVisible
         self.bellGeneration = bellGeneration
         self.cursorShape = cursorShape
@@ -3676,6 +3698,8 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
                 bracketedPasteMode: FfiConverterBool.read(from: &buf), 
                 mouseReportingMode: FfiConverterTypeMouseReportingMode.read(from: &buf), 
                 sgrMouseMode: FfiConverterBool.read(from: &buf), 
+                alternateScroll: FfiConverterBool.read(from: &buf), 
+                urxvtMouseMode: FfiConverterBool.read(from: &buf), 
                 cursorVisible: FfiConverterBool.read(from: &buf), 
                 bellGeneration: FfiConverterUInt64.read(from: &buf), 
                 cursorShape: FfiConverterTypeCursorShape.read(from: &buf), 
@@ -3700,6 +3724,8 @@ public struct FfiConverterTypeScreenUpdate: FfiConverterRustBuffer {
         FfiConverterBool.write(value.bracketedPasteMode, into: &buf)
         FfiConverterTypeMouseReportingMode.write(value.mouseReportingMode, into: &buf)
         FfiConverterBool.write(value.sgrMouseMode, into: &buf)
+        FfiConverterBool.write(value.alternateScroll, into: &buf)
+        FfiConverterBool.write(value.urxvtMouseMode, into: &buf)
         FfiConverterBool.write(value.cursorVisible, into: &buf)
         FfiConverterUInt64.write(value.bellGeneration, into: &buf)
         FfiConverterTypeCursorShape.write(value.cursorShape, into: &buf)
@@ -4824,6 +4850,8 @@ public enum MouseButton: Equatable, Hashable {
     case right
     case wheelUp
     case wheelDown
+    case wheelLeft
+    case wheelRight
 
 
 
@@ -4855,6 +4883,10 @@ public struct FfiConverterTypeMouseButton: FfiConverterRustBuffer {
         
         case 5: return .wheelDown
         
+        case 6: return .wheelLeft
+        
+        case 7: return .wheelRight
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -4881,6 +4913,14 @@ public struct FfiConverterTypeMouseButton: FfiConverterRustBuffer {
         
         case .wheelDown:
             writeInt(&buf, Int32(5))
+        
+        
+        case .wheelLeft:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .wheelRight:
+            writeInt(&buf, Int32(7))
         
         }
     }
@@ -7686,7 +7726,7 @@ public func terminalNumpadKeyBytes(key: TerminalNumpadKey, applicationKeypadMode
  * `row`/`col`は0-basedのセル座標(画面外の値は端末サイズ`cols`/`rows`へ
  * クランプされる、`terminal::encode_pointer_event_bytes`のdocコメント参照)。
  */
-public func terminalPointerEventBytes(kind: MouseEventKind, button: MouseButton?, row: UInt32, col: UInt32, modifiers: TerminalKeyModifiers, cols: UInt32, rows: UInt32, mouseReportingMode: MouseReportingMode, sgrMouseMode: Bool) -> Data?  {
+public func terminalPointerEventBytes(kind: MouseEventKind, button: MouseButton?, row: UInt32, col: UInt32, modifiers: TerminalKeyModifiers, cols: UInt32, rows: UInt32, mouseReportingMode: MouseReportingMode, sgrMouseMode: Bool, urxvtMouseMode: Bool) -> Data?  {
     return try!  FfiConverterOptionData.lift(try! rustCall() {
     uniffi_isekai_terminal_core_fn_func_terminal_pointer_event_bytes(
         FfiConverterTypeMouseEventKind_lower(kind),
@@ -7697,7 +7737,8 @@ public func terminalPointerEventBytes(kind: MouseEventKind, button: MouseButton?
         FfiConverterUInt32.lower(cols),
         FfiConverterUInt32.lower(rows),
         FfiConverterTypeMouseReportingMode_lower(mouseReportingMode),
-        FfiConverterBool.lower(sgrMouseMode),$0
+        FfiConverterBool.lower(sgrMouseMode),
+        FfiConverterBool.lower(urxvtMouseMode),$0
     )
 })
 }
@@ -7874,7 +7915,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_isekai_terminal_core_checksum_func_terminal_numpad_key_bytes() != 1311) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 25125) {
+    if (uniffi_isekai_terminal_core_checksum_func_terminal_pointer_event_bytes() != 7470) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_isekai_terminal_core_checksum_func_terminal_special_key_bytes() != 49859) {
