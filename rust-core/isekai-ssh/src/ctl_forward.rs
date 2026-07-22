@@ -185,7 +185,7 @@ pub(crate) fn prepare_ctl_forward(runtime_dir: &Path) -> Result<CtlForward> {
 /// preamble line followed by exactly one `isekai_protocol::CtlMessage` line
 /// (`isekai-pipe ctl`'s wire contract, see module docs).
 #[cfg(unix)]
-pub(crate) async fn spawn_ctl_listener(forward: &mut CtlForward) {
+pub(crate) async fn spawn_ctl_listener(forward: &mut CtlForward, host: String) {
     use tokio::net::UnixListener;
 
     let local_path = forward.local_path.clone();
@@ -197,8 +197,9 @@ pub(crate) async fn spawn_ctl_listener(forward: &mut CtlForward) {
             loop {
                 let (stream, _) = listener.accept().await.context("ctl listener accept failed")?;
                 let secret = secret.clone();
+                let host = host.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_ctl_connection(stream, &secret).await {
+                    if let Err(e) = handle_ctl_connection(stream, &secret, &host).await {
                         eprintln!("isekai-ssh: ctl connection error: {e:#}");
                     }
                 });
@@ -214,13 +215,16 @@ pub(crate) async fn spawn_ctl_listener(forward: &mut CtlForward) {
 /// Reads and checks the secret preamble line, then decodes exactly one
 /// `CtlMessage` line and acts on it — applying it as an OSC sequence
 /// (`SetTitle`/`ClipboardPush`), reading/writing this tab's `CTL_VARS` store
-/// (`SetVar`/`GetVarRequest`, task #16), or (for message kinds this CLI
+/// (`SetVar`/`GetVarRequest`, task #16), running a build profile
+/// (`BuildRequest`, Epic P — the one variant that keeps the connection open
+/// past this first message, see `run_build`), or (for message kinds this CLI
 /// wrapper doesn't fulfil, e.g. `ClipboardPullRequest`) simply closing
 /// without a response.
 #[cfg(unix)]
 async fn handle_ctl_connection(
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     expected_secret: &str,
+    host: &str,
 ) -> Result<()> {
     use isekai_protocol::decode_ctl_message;
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -261,6 +265,9 @@ async fn handle_ctl_connection(
             write_half.write_all(&out).await.context("failed to write getvar response")?;
             write_half.shutdown().await.ok();
         }
+        CtlMessage::BuildRequest { profile } => {
+            run_build(&mut write_half, host, &profile).await?;
+        }
         // `SetTitle`/`ClipboardPush` were already applied via `osc_sequence_for`
         // above. `ClipboardPullRequest`/`ClipboardPullResponse`/`GetVarResponse`
         // produce no OSC sequence and need no response from this wrapper (see
@@ -268,6 +275,156 @@ async fn handle_ctl_connection(
         // specifically isn't fulfilled here).
         _ => {}
     }
+    Ok(())
+}
+
+/// Runs the build profile `(host, profile_name)` resolves to (Epic P) and
+/// streams its output back over `write_half` as `BuildOutputChunk`s,
+/// finishing with `BuildFinished`. Unlike every other `CtlMessage` this
+/// wrapper handles, this keeps `write_half` busy for the whole build's
+/// duration rather than a single reply.
+///
+/// If the ctl connection breaks mid-build (the remote killed `isekai-pipe
+/// ctl build`, e.g. `Ctrl-C`, or the SSH session itself dropped), the build
+/// child process is killed immediately rather than left running unattended
+/// — the same "every session must have a guaranteed cleanup path" principle
+/// `.claude/rules/always-connects.md` documents for the fencing-slot lesson,
+/// applied here to a local child process instead of a remote session slot.
+#[cfg(unix)]
+async fn run_build(
+    write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
+    host: &str,
+    profile_name: &str,
+) -> Result<()> {
+    let profile = crate::build_profile::default_build_profiles_path()
+        .and_then(|path| crate::build_profile::load_build_profiles(&path))
+        .ok()
+        .and_then(|store| crate::build_profile::find_profile(&store, host, profile_name).cloned());
+
+    let Some(profile) = profile else {
+        send_build_output(
+            write_half,
+            isekai_protocol::BuildOutputStream::Stderr,
+            format!("isekai-ssh: no build profile registered for {host:?}/{profile_name:?}\n").into_bytes(),
+        )
+        .await?;
+        send_build_finished(write_half, 127, Vec::new()).await?;
+        return Ok(());
+    };
+
+    let mut child = crate::build_exec::spawn_shell_command(&profile.command, &profile.dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("isekai-ssh: failed to spawn build profile {host:?}/{profile_name:?}"))?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(isekai_protocol::BuildOutputStream, Vec<u8>)>(32);
+    let stdout_task = tokio::spawn(pump_bytes(stdout, isekai_protocol::BuildOutputStream::Stdout, tx.clone()));
+    let stderr_task = tokio::spawn(pump_bytes(stderr, isekai_protocol::BuildOutputStream::Stderr, tx.clone()));
+    drop(tx);
+
+    let mut write_failed = false;
+    while let Some((stream, bytes)) = rx.recv().await {
+        if send_build_output(write_half, stream, bytes).await.is_err() {
+            write_failed = true;
+            break;
+        }
+    }
+    // Dropping `rx` (implicit at scope end below doesn't happen yet — done
+    // explicitly here) unblocks any pump task still waiting on a full
+    // channel: their next `tx.send(...)` sees the receiver gone and returns
+    // immediately instead of hanging, so awaiting them below can't deadlock.
+    drop(rx);
+
+    if write_failed {
+        // The remote is gone; there is nothing left to report to. Kill the
+        // child rather than let it keep running unattended.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        bail!("isekai-ssh: ctl connection closed before the build finished; killed the child process");
+    }
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    let status = child.wait().await.context("isekai-ssh: failed to wait for the build child process")?;
+    // `status.code()` is `None` only if the process was killed by a signal
+    // (not the `write_failed` kill path above, which already returned) —
+    // `-1` is not a valid process exit code on any platform, so it can't be
+    // confused with a real one.
+    let exit_code = status.code().unwrap_or(-1);
+
+    let result_paths = match (&profile.result_glob, &profile.dest_dir) {
+        (Some(glob), Some(_dest_dir)) => crate::build_exec::glob_results(&profile.dir, glob)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        _ => Vec::new(),
+    };
+    send_build_finished(write_half, exit_code, result_paths).await?;
+    Ok(())
+}
+
+/// Reads `reader` in fixed-size chunks (not line-buffered — build tool
+/// output isn't guaranteed to be UTF-8 or newline-terminated, e.g. a
+/// carriage-return progress bar) and forwards each chunk to `tx`, stopping
+/// at EOF, a read error, or once `tx`'s receiver is gone (the ctl
+/// connection broke — `run_build` dropped `rx`).
+#[cfg(unix)]
+async fn pump_bytes(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    stream: isekai_protocol::BuildOutputStream,
+    tx: tokio::sync::mpsc::Sender<(isekai_protocol::BuildOutputStream, Vec<u8>)>,
+) {
+    use tokio::io::AsyncReadExt as _;
+    // Comfortably under `MAX_BUILD_CHUNK_DECODED_LEN` (64 KiB) so every
+    // chunk this sends passes the far end's `validate_ctl_message` cap.
+    let mut buf = vec![0u8; 8 * 1024];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if tx.send((stream, buf[..n].to_vec())).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn send_build_output(
+    write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
+    stream: isekai_protocol::BuildOutputStream,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    let mut out = serde_json::to_vec(&CtlMessage::BuildOutputChunk { stream, data_b64 })
+        .context("isekai-ssh: failed to encode build output chunk")?;
+    out.push(b'\n');
+    write_half.write_all(&out).await.context("isekai-ssh: failed to write build output chunk")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn send_build_finished(
+    write_half: &mut (impl tokio::io::AsyncWrite + Unpin),
+    exit_code: i32,
+    result_paths: Vec<String>,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut out = serde_json::to_vec(&CtlMessage::BuildFinished { exit_code, result_paths })
+        .context("isekai-ssh: failed to encode build finished message")?;
+    out.push(b'\n');
+    write_half.write_all(&out).await.context("isekai-ssh: failed to write build finished message")?;
+    write_half.shutdown().await.ok();
     Ok(())
 }
 
@@ -420,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn handle_ctl_connection_rejects_a_malformed_message_after_a_correct_preamble() {
         let (mut client, server_stream) = tokio::io::duplex(256);
-        let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t").await });
+        let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t", "mybox").await });
 
         use tokio::io::AsyncWriteExt as _;
         client.write_all(b"s3cr3t\nnot json\n").await.unwrap();
@@ -433,12 +590,174 @@ mod tests {
     #[tokio::test]
     async fn handle_ctl_connection_rejects_a_mismatched_preamble() {
         let (mut client, server_stream) = tokio::io::duplex(256);
-        let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t").await });
+        let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t", "mybox").await });
 
         use tokio::io::AsyncWriteExt as _;
         client.write_all(b"wrong-secret\n{}\n").await.unwrap();
         drop(client);
         let result = server.await.unwrap();
         assert!(result.unwrap_err().to_string().contains("preamble"));
+    }
+
+    /// Points `$HOME` at a fresh tempdir and writes `profiles` to
+    /// `build_profiles.toml` there — same `HOME_ENV_LOCK`-guarded pattern
+    /// `init.rs`'s own `$HOME`-dependent tests use, since `cargo test` runs
+    /// tests on multiple threads and `std::env::set_var` is process-global.
+    /// Returns the tempdir (kept alive for the caller's whole test) and a
+    /// guard that restores the previous `$HOME` on drop.
+    #[cfg(unix)]
+    fn with_build_profiles(profiles: Vec<crate::build_profile::BuildProfile>) -> (tempfile::TempDir, HomeRestoreGuard) {
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let mut store = crate::build_profile::BuildProfileStore::default();
+        for profile in profiles {
+            crate::build_profile::upsert_profile(&mut store, profile).unwrap();
+        }
+        let path = crate::build_profile::default_build_profiles_path().unwrap();
+        crate::build_profile::save_build_profiles(&path, &store).unwrap();
+        (home, HomeRestoreGuard(old_home))
+    }
+
+    #[cfg(unix)]
+    struct HomeRestoreGuard(Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl Drop for HomeRestoreGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(old) => std::env::set_var("HOME", old),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// Reads `CtlMessage` lines off `client` until `BuildFinished`, decoding
+    /// every `BuildOutputChunk` along the way and appending its bytes to the
+    /// matching stream's buffer. Mirrors what `isekai-pipe ctl build` itself
+    /// does in `stream_build` (`isekai-pipe/src/ctl.rs`), just without the
+    /// process-exit-code plumbing a test doesn't need.
+    #[cfg(unix)]
+    async fn collect_build_messages(
+        client: impl tokio::io::AsyncRead + Unpin,
+    ) -> (Vec<u8>, Vec<u8>, i32, Vec<String>) {
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+
+        let mut reader = BufReader::new(client);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.unwrap();
+            assert_ne!(n, 0, "connection closed before BuildFinished");
+            match isekai_protocol::decode_ctl_message(line.trim_end_matches('\n').as_bytes()).unwrap() {
+                CtlMessage::BuildOutputChunk { stream, data_b64 } => {
+                    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64).unwrap();
+                    match stream {
+                        isekai_protocol::BuildOutputStream::Stdout => stdout.extend_from_slice(&decoded),
+                        isekai_protocol::BuildOutputStream::Stderr => stderr.extend_from_slice(&decoded),
+                    }
+                }
+                CtlMessage::BuildFinished { exit_code, result_paths } => {
+                    return (stdout, stderr, exit_code, result_paths);
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_build_reports_an_unknown_profile() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_home, _restore) = with_build_profiles(vec![]);
+
+        let (mut client, server_stream) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t", "mybox").await });
+
+        use tokio::io::AsyncWriteExt as _;
+        client.write_all(b"s3cr3t\n").await.unwrap();
+        let request = serde_json::to_vec(&CtlMessage::BuildRequest { profile: "nope".to_string() }).unwrap();
+        client.write_all(&request).await.unwrap();
+        client.write_all(b"\n").await.unwrap();
+
+        let (_stdout, stderr, exit_code, result_paths) = collect_build_messages(client).await;
+        assert!(String::from_utf8_lossy(&stderr).contains("no build profile registered"));
+        assert_eq!(exit_code, 127);
+        assert!(result_paths.is_empty());
+        server.await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_build_streams_output_and_reports_exit_code_and_results() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let workdir = tempfile::tempdir().unwrap();
+        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+            host: "mybox".to_string(),
+            name: "t".to_string(),
+            dir: workdir.path().to_string_lossy().into_owned(),
+            command: "printf 'out-line\\n'; printf 'err-line\\n' 1>&2; touch out.bin; exit 5".to_string(),
+            result_glob: Some("out.bin".to_string()),
+            dest_dir: Some("~/dest".to_string()),
+        }]);
+
+        let (mut client, server_stream) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t", "mybox").await });
+
+        use tokio::io::AsyncWriteExt as _;
+        client.write_all(b"s3cr3t\n").await.unwrap();
+        let request = serde_json::to_vec(&CtlMessage::BuildRequest { profile: "t".to_string() }).unwrap();
+        client.write_all(&request).await.unwrap();
+        client.write_all(b"\n").await.unwrap();
+
+        let (stdout, stderr, exit_code, result_paths) = collect_build_messages(client).await;
+        assert_eq!(String::from_utf8_lossy(&stdout), "out-line\n");
+        assert_eq!(String::from_utf8_lossy(&stderr), "err-line\n");
+        assert_eq!(exit_code, 5);
+        assert_eq!(result_paths.len(), 1);
+        assert!(result_paths[0].ends_with("out.bin"));
+        server.await.unwrap().unwrap();
+    }
+
+    /// Guarantees the "every session must have a guaranteed cleanup path"
+    /// principle (`.claude/rules/always-connects.md`'s fencing-slot lesson,
+    /// applied here to a local child process): the build child keeps
+    /// producing output forever (`while true`), so `run_build` can only ever
+    /// return if it actually killed the child after the ctl connection broke
+    /// — it would hang indefinitely on `child.wait()` otherwise. Wrapping in
+    /// `tokio::time::timeout` turns "did it hang forever" into an assertion
+    /// rather than a real test hang.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_build_kills_the_child_when_the_connection_breaks_mid_build() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let workdir = tempfile::tempdir().unwrap();
+        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+            host: "mybox".to_string(),
+            name: "infinite".to_string(),
+            dir: workdir.path().to_string_lossy().into_owned(),
+            command: "while true; do printf x; sleep 0.01; done".to_string(),
+            result_glob: None,
+            dest_dir: None,
+        }]);
+
+        let (mut client, server_stream) = tokio::io::duplex(256);
+        let server = tokio::spawn(async move { handle_ctl_connection(server_stream, "s3cr3t", "mybox").await });
+
+        use tokio::io::AsyncWriteExt as _;
+        client.write_all(b"s3cr3t\n").await.unwrap();
+        let request = serde_json::to_vec(&CtlMessage::BuildRequest { profile: "infinite".to_string() }).unwrap();
+        client.write_all(&request).await.unwrap();
+        client.write_all(b"\n").await.unwrap();
+        // Never read anything back, then disconnect entirely — the small
+        // duplex buffer plus this child's continuous output guarantees a
+        // write on the server side fails soon after.
+        drop(client);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), server).await;
+        let result = result.expect("run_build must not hang after the connection breaks").unwrap();
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("closed") || format!("{err:#}").contains("killed"));
     }
 }

@@ -581,7 +581,7 @@ async fn apply_ctl_socket_forward(
     ) {
         match crate::ctl_forward::prepare_ctl_forward(runtime_dir) {
             Ok(mut forward) => {
-                crate::ctl_forward::spawn_ctl_listener(&mut forward).await;
+                crate::ctl_forward::spawn_ctl_listener(&mut forward, resolution.profile().to_string()).await;
                 Some(forward)
             }
             Err(e) => {
