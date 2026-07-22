@@ -426,6 +426,49 @@ unit/統合テスト(`streamlocal_forward` の往復・`Frame::Ctl` 中継・OSC
 Unix(実 `ssh(1)` の `ProxyCommand` 経路)の ctl-socket は従来どおり `-R` + UNIX ドメイン
 ソケットで変わらない。
 
+### リモートビルドトリガー(`build-profile`、Unix/macOS クライアントのみ)
+
+`#@isekai ctl-socket yes` の上に乗る形で、リモートの対話シェルから**このマシン(クライアント)
+側**でビルドコマンドを実行させ、ログをリアルタイムでリモートの端末に流し、成果物ファイルを
+リモートへ送り返せる(`ISEKAI_PIPE_DESIGN.md` §8 Epic P)。Windows でしかコンパイルできない
+アプリを Linux 側の作業セッションから起動して結果を確認する、といった用途を想定している。
+
+まずクライアント側でプロファイルを登録する(`<HOST>` は `~/.ssh/config` の `Host` エイリアス
+と一致させる):
+
+```bash
+isekai-ssh build-profile add myhost win \
+  --dir     /path/to/repo \
+  --command "cargo build --release --target x86_64-pc-windows-msvc" \
+  --result-glob "target/x86_64-pc-windows-msvc/release/*.exe" \
+  --dest-dir    "~/isekai-build-results/win"
+```
+
+`--result-glob`/`--dest-dir` は成果物を送り返さないプロファイルなら両方省略してよい(片方
+だけの指定はエラーになる)。登録前に `isekai-ssh build-profile test myhost win` で、ctl-socket
+を一切使わずローカルでコマンドを試し実行できる。`isekai-ssh build-profile list`/`remove` で
+一覧・削除。
+
+登録後、`myhost` へ `isekai-ssh myhost` で接続した対話シェルの中から:
+
+```bash
+isekai-pipe ctl build win
+```
+
+を叩くと、クライアント側で `cargo build ...` が実行され、その stdout/stderr がそのまま
+このコマンドの stdout/stderr として流れる(=リモートの端末にそのまま表示される)。終了後は
+ビルドの exit code がこのコマンド自身の終了コードになるので、`isekai-pipe ctl build win &&
+scp ...` のようなシェルチェインもそのまま効く。`--result-glob`/`--dest-dir` を設定していれば、
+成功後にマッチしたファイルがバックグラウンドで `dest-dir` へ送られる(失敗時はクライアント
+側のログにのみ記録され、リモートへの通知はない——既知の制限)。
+
+**セキュリティ上の要点**: リモートが送れるのはプロファイル**名**だけで、実行される中身
+(`--dir`/`--command`)は一切 wire に乗らない。プロファイル自体が空(既定)なら、リモートから
+何を送っても何も実行されない。設定はプロファイル追加時に人間が明示的に行う。
+
+**既知の制限**: Windows クライアント(`native/mux/` 経由)はまだ未対応(Unix/macOS の
+`ssh(1)` ラッパー経路のみ、`ISEKAI_PIPE_DESIGN.md` §8 Epic P の Phase 1)。
+
 ### 新規クレートの位置づけ
 
 Windows ネイティブ経路の中核は、`isekai-` 固有の型に依存しない汎用クレートとして切り出して

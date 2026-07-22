@@ -1637,3 +1637,119 @@ Windows対応のみが対象。
   乖離の一因だった実装)
 - `rust-core/isekai-pipe-core/src/profile.rs`: `write_persistent_profile`/`ProfileLock`
   (Windows版は`LockFileEx`)
+
+### Epic P: リモート発ビルドトリガー(remote-triggered client build)— Phase 1(Unix/macOSクライアント)完了、Windows-native移植は別プラン(2026-07-22)
+
+**動機**: `isekai-ssh`でリモートホストに接続している最中に、そのリモートの対話シェルから
+「クライアント(`isekai-ssh`を実際に実行しているマシン)側でビルドコマンドを走らせ、ログを
+リアルタイムでリモートの端末に流し、成果物ファイルを最終的にリモートへ送り返す」機能。
+具体的な動機は、Windowsでしかコンパイル・実行確認ができないアプリ(`cargo`/`dx bundle`の
+Windowsターゲットビルド)を、Linux側の作業セッションから起動して結果を確認したい、という
+もの。Wave Terminalの`wsh`に着想を得た相談から出発したが、調査の結果`wsh`的な「リモート→
+ローカル制御チャンネル」は既にEpic M(`isekai-pipe ctl`、title/clipboard/setvar/getvar/
+file preview)として実装済みで、本Epicはその延長として位置づけられる。
+
+ただしEpic Mは実装時に明示的に「`isekai-pipe ctl`が受け付ける操作は`title`/`clip_push`/
+`clip_pull`のみに限定した固定ホワイトリストとし、任意コマンド実行のような汎用RPCには
+しない」と設計判断していた。本Epicはこの判断を**意図的に、かつ安全策込みで拡張**する:
+リモートが`CtlMessage::BuildRequest`で送れるのは事前にクライアント側でローカルに登録された
+**プロファイル名だけ**であり、実行される中身(ディレクトリ・シェルコマンド)は一切wireに
+乗らない。Epic Mの「同一SSH接続内のトラスト境界を前提にしても、対応するsocketに書き込めれば
+誰でも操作できてしまう、という副作用を避ける」という原則は、「操作の中身をクライアント側の
+ローカル設定だけが決める」という形でそのまま維持されている。
+
+**設計協議で確定した3つの決定**:
+1. プロファイル設定の置き場は`.ssh/config`の`#@isekai`ディレクティブではなく専用TOML
+   (`~/.config/isekai-ssh/build_profiles.toml`)。ディレクティブに複雑なシェルコマンドを
+   書くとクォーティングが煩雑になり、また「接続設定」と「ローカル自動化設定」は別種の
+   関心事なため。
+2. 設定編集用のGUI(Tauri等)は過剰投資と判断し見送り、CLIサブコマンド
+   (`isekai-ssh build-profile add/list/remove/test`)のみとした——build profileの数は
+   現実的に数個〜十数個程度で、GUIが解決する主な価値(発見性・入力補助)にしては投資が
+   重すぎる。
+3. 成果物の送信先は呼び出し時の`--dest`上書きではなく、profile設定の`dest_dir`固定。
+   リモートは`ctl build <profile>`のように名前しか送れないため、送信先もクライアント側の
+   ローカル設定に閉じ込める方がシンプルで一貫している。
+
+**ワイヤーフォーマット**(`isekai-protocol::ctl::CtlMessage`への追加):
+
+```rust
+BuildRequest { profile: String },
+BuildOutputChunk { stream: BuildOutputStream /* Stdout | Stderr */, data_b64: String },
+BuildFinished { exit_code: i32, result_paths: Vec<String> },
+```
+
+Epic Mの「1接続=1メッセージで完結する」という設計(`send_ctl_message_and_read_response`が
+`read_line`を1回呼んで即終了、受信側`handle_ctl_connection`も1メッセージmatchしたら即
+returnする)を、`BuildRequest`だけ例外的に緩和する: 1回の`isekai-pipe ctl build <profile>`
+呼び出しの間、同じ接続上で`BuildOutputChunk`が0回以上ストリームされ、最後に
+`BuildFinished`で終端する長寿命の接続になる。チャンクは行単位ではなく固定8KiBの生バイト列
+読み取り(ビルドツールの出力はUTF-8保証も改行保証も無い——キャリッジリターンで上書きする
+プログレスバー等——ため)で、`MAX_BUILD_CHUNK_DECODED_LEN`(64KiB)に余裕を持って収まる
+サイズにしてある。
+
+**リモート側CLI**: 新規バイナリは作らず(Epic Mと同じ判断)、`isekai-pipe ctl build
+<profile>`として`isekai-pipe`に相乗り。受信した`BuildOutputChunk`を都度自分自身の
+stdout/stderrへ書き出すだけで、追加の表示経路なしにリモートの対話シェルにそのままビルド
+ログが流れる(このプロセス自体がリモートの対話シェルの中でただのコマンドとして動いている
+ため)。`BuildFinished`の`exit_code`をこのプロセス自身の終了コードにするので、リモート側の
+`&&`チェインもそのまま効く。
+
+**クライアント側(Unixのみ、`ctl_forward.rs::run_build`)**:
+- 接続元のホストエイリアス(`resolution.profile()`)とリクエストされたプロファイル名の
+  組でローカル設定を検索。見つからなければ`exit_code: 127`の`BuildFinished`を返す。
+- 見つかれば`sh -c "<command>"`を`dir`をカレントディレクトリにしてspawn、stdout/stderrを
+  それぞれ独立したタスクで読み取ってmpsc経由で1本のwriter taskに集約し、都度
+  `BuildOutputChunk`として書き込む。
+- **切断時の後始末を保証する**: ctl接続への書き込みが失敗した時点(リモートが`Ctrl-C`等で
+  切断した場合)で即座に子プロセスをkillする。これは`.claude/rules/always-connects.md`の
+  fencing slot教訓(「どんな破棄経路であってもクリーンアップが必ず呼ばれることを保証する」)
+  を、リモートセッション状態ではなくローカル子プロセスに適用したもの。無限に出力し続ける
+  子プロセスを使い、切断後にkillされない限り絶対に返らないはずの呼び出しがタイムアウトせず
+  完了することをテストで確認済み(`run_build_kills_the_child_when_the_connection_breaks_mid_build`)。
+- 子プロセス終了後、`result_glob`が設定されていれば`dir`基準でglob展開して`result_paths`を
+  集め、`BuildFinished`を送る。
+
+**成果物の送り返し**: `result_paths`が非空かつ`dest_dir`設定済みの場合、新しい転送
+プロトコルは作らず、既に確立している「`isekai-ssh <host>`は常に接続できる」を再利用する
+形で、`isekai-ssh <host> -- mkdir -p <dest_dir> && cat > <dest_dir>/<basename>`を子
+プロセスとして**再帰spawn**し、成果物のバイト列をstdin経由で流し込む。ctl接続はブロック
+せずバックグラウンドでpushする。`dest_dir`/ファイル名はリモートが指定できない完全に
+ローカルな信頼済み設定(`profile.command`と同じ信頼境界)なのでシェルクォートしない——
+クォートすると`~`展開が壊れるため、というのがまさにその理由。失敗はisekai-ssh自身の
+ログに残すのみで、リモートへは通知しない(v1の既知の制限)。
+
+**テスト**: `run_build`はデュプレックスストリーム越しの直接呼び出しで(実際のUNIXドメイン
+ソケット越しではないが、`handle_ctl_connection`/`run_build`自体は本番と同じ関数)、正常系
+(出力ストリーミング・exit code・result_paths)・異常系(未登録プロファイル・切断時kill)の
+両方をカバー。`push_result_file`は`std::env::current_exe()`で自分自身(実`isekai-ssh`
+バイナリ)を再帰spawnするため、単体テストの対象にはできない(`cargo test`下では
+`current_exe()`がテストバイナリを指してしまう)——実sshdを立てて実バイナリ
+(`CARGO_BIN_EXE_isekai-ssh`)を`--isekai-direct`で叩く専用のe2eテスト
+(`tests/build_result_push_e2e.rs`)で検証した。
+
+**スコープ外(Phase 2、別プラン)**: Windows-native(`native/mux/`、owner/client/
+ctl_forward三者構成)への同等実装。Windows-nativeでは`SetTitle`/`ClipboardPush`ですら
+isekai-ssh自身が処理しているのではなく、OSCエスケープシーケンスに変換して自分のstderrに
+書き出しているだけ(実際にタイトルバー変更・クリップボード書き込みを行うのは
+ターミナルエミュレータ自身)——ビルド実行はOSCで表現できない全く新種の処理なので、
+owner/client双方に新しいディスパッチを足す必要がある。この開発環境では実機Windowsが
+使えずクロスコンパイル確認までしかできないため、Phase 1(Unix側、この環境で実sshd e2e
+テストまで完結)を先に固めてから、Phase 2は実機Windowsでの最終確認(`clipwire-exec`/
+Android実機のadb remote経由)を伴う別プランとして着手する。ユーザー本人の実運用は
+Windowsクライアントのため、Phase 2が完了するまでは実際には使えないことを明示的に許容
+した判断。
+
+**参照実装**:
+- `rust-core/isekai-protocol/src/ctl.rs`: `CtlMessage::BuildRequest`/`BuildOutputChunk`/
+  `BuildFinished`、`BuildOutputStream`
+- `rust-core/isekai-ssh/src/build_profile.rs`: `BuildProfile`/`BuildProfileStore`、
+  TOML読み書き(`~/.config/isekai-ssh/build_profiles.toml`)
+- `rust-core/isekai-ssh/src/build_profile_cli.rs` / `cli.rs`の`BuildProfileCommand`:
+  `isekai-ssh build-profile add/list/remove/test`
+- `rust-core/isekai-ssh/src/build_exec.rs`: `spawn_shell_command`/`glob_results`
+  (`build-profile test`とリモート発ディスパッチの両方が共有)
+- `rust-core/isekai-ssh/src/ctl_forward.rs`: `run_build`/`pump_bytes`/`send_build_output`/
+  `send_build_finished`/`spawn_result_push`/`push_result_file`/`build_push_remote_command`
+- `rust-core/isekai-pipe/src/ctl.rs`: `CtlLaunch::Build`/`stream_build`
+- `rust-core/isekai-ssh/tests/build_result_push_e2e.rs`
