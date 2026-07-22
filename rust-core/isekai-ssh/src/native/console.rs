@@ -49,7 +49,13 @@ fn terminal_size_from(size_lookup: impl Fn() -> std::io::Result<(u16, u16)>) -> 
 /// RAII guard: puts the local console into raw mode on construction,
 /// restores it on drop (including on an early return via `?` or a panic
 /// unwind) — mirrors `crossterm::terminal::enable_raw_mode`'s own
-/// recommended usage pattern.
+/// recommended usage pattern. On Windows, also best-effort enables VT
+/// (ANSI) output processing on stdout/stderr for the session's lifetime
+/// (see [`enable_vt_output_processing`]) — bundled here rather than as a
+/// separate guard because both are "make this console behave like a VT
+/// terminal for the duration of the interactive session" setup done at the
+/// exact same call site (`native/connect.rs`, right before
+/// `run_shell_io_loop`).
 pub(crate) struct RawModeGuard {
     _private: (),
 }
@@ -57,7 +63,52 @@ pub(crate) struct RawModeGuard {
 impl RawModeGuard {
     pub(crate) fn enable() -> Result<Self> {
         crossterm::terminal::enable_raw_mode().context("failed to enable raw terminal mode")?;
+        #[cfg(windows)]
+        enable_vt_output_processing();
         Ok(Self { _private: () })
+    }
+}
+
+/// Enables `ENABLE_VIRTUAL_TERMINAL_PROCESSING` (plus
+/// `DISABLE_NEWLINE_AUTO_RETURN`, so a bare `\n` doesn't get an implicit
+/// `\r` inserted by the console host on top of whatever cursor positioning
+/// the remote app already did) on stdout and stderr — the same thing
+/// Win32-OpenSSH's `ssh.exe` does for its own console output.
+///
+/// Without this, a console host that doesn't already default it on (plain
+/// `cmd.exe`/legacy `conhost`, as opposed to modern Windows Terminal, which
+/// usually enables it itself) renders every VT/ANSI sequence the remote
+/// sends — colors, cursor movement, screen/line clears, synchronized-update
+/// mode — as literal garbage bytes instead of interpreting them, rather
+/// than actually moving the cursor or erasing anything. A full-screen app
+/// that leans on VT sequences heavily (e.g. an Ink-based TUI) is far more
+/// visibly broken by this than a plain shell prompt's occasional color
+/// code, which matches the native-pty-gaps bug report this fixes.
+///
+/// Best-effort and silent: `GetStdHandle`/`GetConsoleMode`/`SetConsoleMode`
+/// failing (piped/redirected stdout, a handle that isn't a console at all,
+/// or an ancient Windows without VT support) just leaves the mode
+/// unchanged — matches `console_stdin.rs::try_open_console`'s same
+/// best-effort convention for the input side.
+#[cfg(windows)]
+fn enable_vt_output_processing() {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for std_handle in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(std_handle) };
+        if handle == std::ptr::null_mut() || handle == (-1isize as HANDLE) {
+            continue;
+        }
+        let mut mode: u32 = 0;
+        if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+            continue;
+        }
+        let new_mode = mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
+        unsafe { SetConsoleMode(handle, new_mode) };
     }
 }
 
