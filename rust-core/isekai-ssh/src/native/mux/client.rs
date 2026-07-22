@@ -190,14 +190,28 @@ where
             // A build task's `BuildOutputChunk`/`BuildFinished` bytes, relayed
             // to the owner (which routes them onto the real ctl channel —
             // `super::owner`'s module docs) as `Frame::Ctl` on this same
-            // writer, exactly like `Stdin`/`Resize` above.
+            // writer, exactly like `Stdin`/`Resize` above. Any `BuildFinished`
+            // seen here is always a *real* completion (`run_client_build`'s
+            // own, genuine exit code) — the abort sentinel only ever arrives
+            // the other way, via the `frame_rx` branch below — so this is the
+            // only place a normal completion needs to clear `active_build`
+            // (found missing in review: without this, a tab could only ever
+            // run one build for its whole lifetime, since `active_build`
+            // stayed `Some` forever after the first one finished).
             bytes = build_out_rx.recv() => {
                 if let Some(bytes) = bytes {
+                    let is_finished = matches!(
+                        isekai_protocol::decode_ctl_message(&bytes),
+                        Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
+                    );
                     if write_frame(conn_write, &Frame::Ctl(bytes)).await.is_err() {
                         if let Some(build) = &mut active_build {
                             build.abort();
                         }
                         return Ok(ClientOutcome::OwnerLost);
+                    }
+                    if is_finished {
+                        active_build = None;
                     }
                 }
             }
@@ -658,6 +672,72 @@ mod tests {
         assert!(String::from_utf8_lossy(&build_stdout).contains("out-line"));
         assert!(String::from_utf8_lossy(&build_stderr).contains("err-line"));
         assert_eq!(exit_code, 5);
+    }
+
+    /// Regression for a review finding: `active_build` must be cleared once a
+    /// build finishes normally, not just on the owner-relayed abort sentinel
+    /// — otherwise a tab could only ever run one build for its whole
+    /// lifetime (every subsequent `BuildRequest` silently ignored by the
+    /// `active_build.is_some()` guard). Runs two builds back to back over the
+    /// same `run_inner` session and requires both to actually execute.
+    #[tokio::test]
+    async fn client_can_run_a_second_build_after_the_first_finishes() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let workdir = tempfile::tempdir().unwrap();
+        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+            host: "mybox".to_string(),
+            name: "t".to_string(),
+            dir: workdir.path().to_string_lossy().into_owned(),
+            command: "exit 0".to_string(),
+            result_glob: None,
+            dest_dir: None,
+        }]);
+
+        let (client_conn, owner_conn) = duplex(64 * 1024);
+        let (mut or, mut ow) = tokio::io::split(owner_conn);
+
+        let owner = tokio::spawn(async move {
+            match read_frame(&mut or).await.unwrap().unwrap() {
+                Frame::Hello { .. } => {}
+                other => panic!("expected Hello, got {other:?}"),
+            }
+            write_frame(&mut ow, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await.unwrap();
+
+            let mut finished_count = 0;
+            for _ in 0..2 {
+                let request = serde_json::to_vec(&isekai_protocol::CtlMessage::BuildRequest { profile: "t".to_string() }).unwrap();
+                write_frame(&mut ow, &Frame::Ctl(request)).await.unwrap();
+
+                loop {
+                    match read_frame(&mut or).await.unwrap().unwrap() {
+                        Frame::Ctl(bytes) => {
+                            if matches!(isekai_protocol::decode_ctl_message(&bytes), Ok(isekai_protocol::CtlMessage::BuildFinished { .. })) {
+                                finished_count += 1;
+                                break;
+                            }
+                        }
+                        Frame::Shutdown => {}
+                        other => panic!("unexpected frame: {other:?}"),
+                    }
+                }
+            }
+            write_frame(&mut ow, &Frame::Exit(0)).await.unwrap();
+            finished_count
+        });
+
+        let (cr, mut cw) = tokio::io::split(client_conn);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string()),
+        )
+        .await
+        .expect("run_inner must not hang waiting on a second build that the active_build guard silently ignores")
+        .unwrap();
+
+        assert_eq!(outcome, ClientOutcome::Exited(0));
+        assert_eq!(owner.await.unwrap(), 2, "both builds must have reached BuildFinished, not just the first");
     }
 
     /// The owner relaying the synthesized abort sentinel (a real remote ctl
