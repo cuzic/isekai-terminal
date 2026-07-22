@@ -139,19 +139,89 @@ pub(crate) async fn pump_to_stderr(mut channels: mpsc::UnboundedReceiver<russh::
     }
 }
 
-/// Consumes forwarded ctl channels and relays each message's raw bytes to a mux
-/// *client* via `frame_tx` (which the owner's relay loop wraps in a
-/// [`Frame::Ctl`](super::protocol::Frame::Ctl)). Runs until the route's sender
-/// is dropped or the client's relay loop drops `frame_tx`.
+/// One event `pump_to_frames` sends to `owner.rs::relay_loop` over its
+/// `ctl_frame_rx`. Every existing message kind (title/clip/setvar/getvar,
+/// and the initial `BuildRequest` line itself) is a one-shot
+/// [`Message`](CtlRelayEvent::Message) exactly as before. `BuildRequest`
+/// (Epic P Phase 2) additionally follows up with
+/// [`BuildStarted`](CtlRelayEvent::BuildStarted): `relay_loop` must
+/// remember `reply_tx` so it can forward the client's own `Frame::Ctl`
+/// replies into it, since only the owner holds the real SSH channel a mux
+/// client's build needs to stream its output back over
+/// (`super::owner`/`super::client`'s module docs cover the full round trip).
+pub(crate) enum CtlRelayEvent {
+    Message(Vec<u8>),
+    BuildStarted { reply_tx: mpsc::UnboundedSender<Vec<u8>> },
+}
+
+/// Consumes forwarded ctl channels and relays each message to a mux *client*
+/// via `frame_tx` (`owner.rs::relay_loop` wraps a [`CtlRelayEvent::Message`]
+/// in a [`Frame::Ctl`](super::protocol::Frame::Ctl); a
+/// [`CtlRelayEvent::BuildStarted`] is internal bookkeeping only, never sent
+/// to the client directly). Runs until the route's sender is dropped or the
+/// client's relay loop drops `frame_tx`.
+///
+/// For every message except `BuildRequest`, this is exactly the original
+/// one-shot behavior: read one line, relay it, let `channel` drop. For
+/// `BuildRequest` (Epic P Phase 2), the spawned per-channel task instead
+/// keeps `channel` alive and becomes a small bidirectional relay: it forwards
+/// whatever the mux client later sends back (via `reply_rx`, fed by
+/// `relay_loop` routing the client's own `Frame::Ctl` frames) onto the real
+/// channel with `channel.data()`, and forwards `channel.wait()` reporting the
+/// remote side closing as a synthesized abort `BuildFinished` (see
+/// `super::build_relay::BUILD_ABORTED_SENTINEL`) so the client can kill its
+/// still-running child instead of streaming into the void. This task never
+/// decodes replies to look for `BuildFinished` itself — `relay_loop` already
+/// has to do that (to know when to stop routing), and clearing its
+/// `active_build_reply_tx` there drops `reply_tx`, which naturally ends this
+/// task's `reply_rx.recv()` loop without a second, redundant decode here.
 pub(crate) async fn pump_to_frames(
     mut channels: mpsc::UnboundedReceiver<russh::Channel<client::Msg>>,
-    frame_tx: mpsc::UnboundedSender<Vec<u8>>,
+    frame_tx: mpsc::UnboundedSender<CtlRelayEvent>,
 ) {
     while let Some(mut channel) = channels.recv().await {
         let frame_tx = frame_tx.clone();
         tokio::spawn(async move {
-            if let Some(line) = read_ctl_line(&mut channel).await {
-                let _ = frame_tx.send(line);
+            let Some(line) = read_ctl_line(&mut channel).await else {
+                return;
+            };
+            let is_build_request =
+                matches!(isekai_protocol::decode_ctl_message(&line), Ok(isekai_protocol::CtlMessage::BuildRequest { .. }));
+            if frame_tx.send(CtlRelayEvent::Message(line)).is_err() {
+                return;
+            }
+            if !is_build_request {
+                return;
+            }
+
+            let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            if frame_tx.send(CtlRelayEvent::BuildStarted { reply_tx }).is_err() {
+                return;
+            }
+            loop {
+                tokio::select! {
+                    bytes = reply_rx.recv() => {
+                        match bytes {
+                            Some(bytes) => {
+                                if channel.data(&bytes[..]).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    msg = channel.wait() => {
+                        if matches!(msg, None | Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close)) {
+                            if let Ok(abort) = crate::build_exec::encode_build_finished(
+                                super::build_relay::BUILD_ABORTED_SENTINEL,
+                                Vec::new(),
+                            ) {
+                                let _ = frame_tx.send(CtlRelayEvent::Message(abort));
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         });
     }
@@ -312,10 +382,14 @@ mod tests {
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
         tokio::spawn(pump_to_frames(forward.channels, frame_tx));
 
-        let bytes = timeout(Duration::from_secs(5), frame_rx.recv())
+        let event = timeout(Duration::from_secs(5), frame_rx.recv())
             .await
             .expect("a ctl message should arrive before the timeout")
             .expect("the frame sender must not have been dropped");
+        let bytes = match event {
+            CtlRelayEvent::Message(bytes) => bytes,
+            CtlRelayEvent::BuildStarted { .. } => panic!("SetTitle must relay as a plain Message, not BuildStarted"),
+        };
         let msg = isekai_protocol::decode_ctl_message(&bytes).expect("relayed bytes must decode as a ctl message");
         assert_eq!(msg, isekai_protocol::CtlMessage::SetTitle { value: "hello-ctl".to_string() });
     }

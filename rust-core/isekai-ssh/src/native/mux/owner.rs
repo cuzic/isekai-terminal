@@ -159,7 +159,7 @@ where
     // single relay-loop writer).
     let ctl_remote_path = ctl.as_ref().map(|fwd| fwd.remote_path.clone());
     let ctl_frame_rx = ctl.map(|fwd| {
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::unbounded_channel::<ctl_forward::CtlRelayEvent>();
         tokio::spawn(ctl_forward::pump_to_frames(fwd.channels, tx));
         rx
     });
@@ -190,7 +190,7 @@ async fn relay_loop<R, W>(
     reader: R,
     writer: &mut W,
     channel: &mut russh::Channel<client::Msg>,
-    mut ctl_frame_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    mut ctl_frame_rx: Option<mpsc::UnboundedReceiver<ctl_forward::CtlRelayEvent>>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -205,6 +205,17 @@ where
     // task and its channel forever (session cleanup). We do not gate the read
     // branch off, precisely so that drop is always observable.
     let mut stdin_done = false;
+    // Set while a mux client is streaming a build's output back to us (Epic P
+    // Phase 2, `ctl_forward::pump_to_frames`'s `CtlRelayEvent::BuildStarted`)
+    // — routes the client's own `Frame::Ctl` replies into the pump task that
+    // owns the real ctl-socket channel. Cleared (dropping the sender, which
+    // ends that pump task's `reply_rx.recv()` loop) as soon as a message
+    // passing through here — in *either* direction — decodes as
+    // `BuildFinished`: a real client-originated completion (below, in the
+    // client-frame match) or the pump task's own synthesized abort sentinel
+    // (in the ctl-branch match), so state never outlives the build it
+    // belongs to regardless of which side ended it.
+    let mut active_build_reply_tx: Option<mpsc::UnboundedSender<Vec<u8>>> = None;
 
     loop {
         tokio::select! {
@@ -229,6 +240,26 @@ where
                         if !stdin_done {
                             let _ = channel.eof().await;
                             stdin_done = true;
+                        }
+                    }
+                    // A mux client's build streaming its output back to us
+                    // (Epic P Phase 2) — the wire-format-symmetric counterpart
+                    // of the owner→client `Frame::Ctl` relay below. Only
+                    // meaningful while a build is active (`active_build_reply_tx`
+                    // is `Some`, set by the ctl branch's `BuildStarted` event);
+                    // a stray `Frame::Ctl` with no active build (a race with an
+                    // already-aborted/finished build) is silently ignored
+                    // rather than treated as a protocol error.
+                    Some(Ok(Some(Frame::Ctl(bytes)))) => {
+                        if let Some(tx) = &active_build_reply_tx {
+                            let is_finished = matches!(
+                                isekai_protocol::decode_ctl_message(&bytes),
+                                Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
+                            );
+                            let _ = tx.send(bytes);
+                            if is_finished {
+                                active_build_reply_tx = None;
+                            }
                         }
                     }
                     // A clean client close (`Ok(None)`) or the reader task ending
@@ -265,11 +296,36 @@ where
                     // A ctl message this client received over its private
                     // forward: relay it as a `Frame::Ctl` on the same writer as
                     // stdout/stderr (so all owner→client writes stay ordered on
-                    // one stream).
-                    Some(bytes) => {
+                    // one stream). Also covers `pump_to_frames`'s synthesized
+                    // abort sentinel (Epic P Phase 2) — from this branch's
+                    // perspective it's just another message to relay, but
+                    // decoding it as `BuildFinished` here too keeps
+                    // `active_build_reply_tx` from outliving a build that
+                    // ended because the *remote* went away rather than
+                    // because the client finished normally (see the
+                    // client-frame `Frame::Ctl` arm above for that path).
+                    Some(ctl_forward::CtlRelayEvent::Message(bytes)) => {
+                        if matches!(
+                            isekai_protocol::decode_ctl_message(&bytes),
+                            Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
+                        ) {
+                            active_build_reply_tx = None;
+                        }
                         if write_frame(writer, &Frame::Ctl(bytes)).await.is_err() {
                             break;
                         }
+                    }
+                    // A `BuildRequest` was just relayed above (Epic P Phase 2):
+                    // remember this reply channel so future client-originated
+                    // `Frame::Ctl` frames get routed to the pump task that owns
+                    // the real ctl-socket channel. Overwriting an existing
+                    // `Some` (which would only happen if a client somehow had
+                    // two builds in flight, which `client.rs`'s own one-build-
+                    // per-tab guard prevents) is safe: the orphaned old
+                    // `reply_tx` simply drops, and its pump task ends cleanly
+                    // on its next `reply_rx.recv()`.
+                    Some(ctl_forward::CtlRelayEvent::BuildStarted { reply_tx }) => {
+                        active_build_reply_tx = Some(reply_tx);
                     }
                     // The ctl pump ended (forward cancelled / all senders gone):
                     // stop selecting this branch so it doesn't busy-loop.
@@ -290,7 +346,7 @@ where
 /// `recv` on the optional ctl-frame channel, or a future that never resolves
 /// when there is no ctl forward (so the `select!` branch is simply inert rather
 /// than needing to be conditionally present).
-async fn recv_ctl_bytes(rx: &mut Option<mpsc::UnboundedReceiver<Vec<u8>>>) -> Option<Vec<u8>> {
+async fn recv_ctl_bytes(rx: &mut Option<mpsc::UnboundedReceiver<ctl_forward::CtlRelayEvent>>) -> Option<ctl_forward::CtlRelayEvent> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -583,6 +639,187 @@ mod tests {
         };
         let msg = isekai_protocol::decode_ctl_message(&ctl_bytes).expect("the relayed ctl bytes must decode");
         assert_eq!(msg, isekai_protocol::CtlMessage::SetTitle { value: "tab-title".to_string() });
+
+        drop(client);
+        let _ = relay.await.unwrap();
+    }
+
+    /// A mock sshd that, on `streamlocal_forward`, opens a
+    /// `forwarded-streamlocal` channel, sends a `BuildRequest` over it, and
+    /// hands the *channel object itself* out via `channel_tx` — rather than
+    /// writing more to it and closing, like `CtlPushShellServer` does —
+    /// so the test can keep it open and observe whatever the owner relays
+    /// back onto it afterward (Epic P Phase 2's client→owner direction).
+    #[derive(Clone)]
+    struct CtlBuildForwardServer {
+        channel_tx: mpsc::UnboundedSender<RusshChannel<ServerMsg>>,
+    }
+    impl server::Server for CtlBuildForwardServer {
+        type Handler = CtlBuildForwardHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> CtlBuildForwardHandler {
+            CtlBuildForwardHandler(self.channel_tx.clone())
+        }
+    }
+    #[derive(Clone)]
+    struct CtlBuildForwardHandler(mpsc::UnboundedSender<RusshChannel<ServerMsg>>);
+    #[async_trait]
+    impl server::Handler for CtlBuildForwardHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, _p: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+        async fn channel_open_session(&mut self, _c: RusshChannel<ServerMsg>, _s: &mut ServerSession) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut ServerSession) -> Result<(), Self::Error> {
+            session.data(channel, CryptoVec::from(b"login-ready\n".to_vec()))?;
+            Ok(())
+        }
+        async fn streamlocal_forward(&mut self, socket_path: &str, session: &mut ServerSession) -> Result<bool, Self::Error> {
+            let handle = session.handle();
+            let path = socket_path.to_string();
+            let tx = self.0.clone();
+            tokio::spawn(async move {
+                if let Ok(channel) = handle.channel_open_forwarded_streamlocal(path.clone()).await {
+                    let _ = channel.data(format!("{path}\n").as_bytes()).await;
+                    let _ = channel.data(&br#"{"op":"build_request","profile":"t"}"#[..]).await;
+                    let _ = channel.data(&b"\n"[..]).await;
+                    let _ = tx.send(channel);
+                }
+            });
+            Ok(true)
+        }
+    }
+
+    /// Sets up the same owner/mock-sshd/mux-client harness as
+    /// `relay_client_relays_a_ctl_message_to_the_client_as_a_ctl_frame`, but
+    /// with `CtlBuildForwardServer` (which sends a `BuildRequest` and keeps
+    /// its channel open) instead. Returns the driving pieces so each test
+    /// can read/write frames on the mux-client duplex and, separately,
+    /// observe what the owner relays onto the real (mock-remote) channel.
+    async fn build_relay_harness() -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<Result<()>>,
+        mpsc::UnboundedReceiver<RusshChannel<ServerMsg>>,
+    ) {
+        let keypair = Ed25519Keypair::from_seed(&[137; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (channel_tx, channel_rx) = mpsc::unbounded_channel();
+        let mut server = CtlBuildForwardServer { channel_tx };
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+
+        let routes = ForwardRoutes::new();
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let handler = verifying_handler_with_routes(&verifier, &routes);
+        let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
+        assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
+        let handle = Mutex::new(handle);
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
+            .await
+            .unwrap();
+        match read_frame(&mut client).await.unwrap().unwrap() {
+            Frame::HelloAck { .. } => {}
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        (client, relay, channel_rx)
+    }
+
+    /// Reads frames off `client` until a `Frame::Ctl` arrives, tolerating
+    /// (and discarding) the mock shell's own `Stdout` banner in between —
+    /// the shell channel and the ctl pump relay onto the same client
+    /// connection, so their relative arrival order isn't guaranteed.
+    async fn recv_ctl_frame(client: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        loop {
+            match read_frame(client).await.unwrap() {
+                Some(Frame::Ctl(bytes)) => return bytes,
+                Some(_) => {}
+                None => panic!("the owner closed before a ctl frame arrived"),
+            }
+        }
+    }
+
+    /// The bidirectional half of Epic P Phase 2: a mux client's own
+    /// `Frame::Ctl` reply (standing in for `client.rs::spawn_client_build`'s
+    /// real output) must be routed by `relay_loop` onto the *same* real ctl
+    /// channel the `BuildRequest` arrived on — proving the
+    /// `CtlRelayEvent::BuildStarted`/`active_build_reply_tx` plumbing
+    /// actually connects the two directions, not just that each direction
+    /// works in isolation.
+    #[tokio::test]
+    async fn relay_client_routes_a_build_reply_from_the_client_onto_the_real_ctl_channel() {
+        use tokio::time::{timeout, Duration};
+
+        let (mut client, relay, mut channel_rx) = build_relay_harness().await;
+
+        // First ctl frame in must be the `BuildRequest` itself, relayed verbatim.
+        let request_bytes = recv_ctl_frame(&mut client).await;
+        assert_eq!(
+            isekai_protocol::decode_ctl_message(&request_bytes).unwrap(),
+            isekai_protocol::CtlMessage::BuildRequest { profile: "t".to_string() }
+        );
+
+        // The "client" (this test, standing in for `client.rs`) sends back a
+        // build reply exactly the way `spawn_client_build` would.
+        let finished = crate::build_exec::encode_build_finished(3, vec!["out.bin".to_string()]).unwrap();
+        write_frame(&mut client, &Frame::Ctl(finished.clone())).await.unwrap();
+
+        // The owner must have routed it onto the real channel the mock sshd
+        // is still holding — not dropped it, not looped it back to the client.
+        let mut server_channel = timeout(Duration::from_secs(5), channel_rx.recv())
+            .await
+            .expect("the mock sshd's channel should have been captured")
+            .unwrap();
+        match server_channel.wait().await {
+            Some(russh::ChannelMsg::Data { data }) => assert_eq!(data.as_ref(), finished.as_slice()),
+            other => panic!("expected the relayed build reply as Data, got {other:?}"),
+        }
+
+        drop(client);
+        let _ = relay.await.unwrap();
+    }
+
+    /// The remote side of the ctl channel going away mid-build (the mock
+    /// sshd drops its channel without ever eof/closing cleanly) must reach
+    /// the mux client as a synthesized `BuildFinished` carrying
+    /// `build_relay::BUILD_ABORTED_SENTINEL` — the signal `client.rs` uses to
+    /// kill its still-running child instead of streaming into a channel
+    /// nobody is reading from anymore.
+    #[tokio::test]
+    async fn relay_client_synthesizes_an_abort_sentinel_when_the_remote_channel_closes_mid_build() {
+        let (mut client, relay, mut channel_rx) = build_relay_harness().await;
+
+        // Consume the BuildRequest relay, then let the mock sshd's channel
+        // drop (simulating the remote disconnecting mid-build) without ever
+        // sending a reply.
+        let request_bytes = recv_ctl_frame(&mut client).await;
+        assert_eq!(
+            isekai_protocol::decode_ctl_message(&request_bytes).unwrap(),
+            isekai_protocol::CtlMessage::BuildRequest { profile: "t".to_string() }
+        );
+        let server_channel = channel_rx.recv().await.unwrap();
+        let _ = server_channel.close().await;
+        drop(server_channel);
+
+        let abort_bytes = recv_ctl_frame(&mut client).await;
+        assert_eq!(
+            isekai_protocol::decode_ctl_message(&abort_bytes).unwrap(),
+            isekai_protocol::CtlMessage::BuildFinished {
+                exit_code: super::super::build_relay::BUILD_ABORTED_SENTINEL,
+                result_paths: Vec::new(),
+            }
+        );
 
         drop(client);
         let _ = relay.await.unwrap();
