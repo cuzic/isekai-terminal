@@ -297,9 +297,11 @@ pub(crate) fn build_terminal_modes() -> Vec<(russh::Pty, u32)> {
                 push_oflag!(ONOCR, ONOCR);
                 push_oflag!(ONLRET, ONLRET);
 
-                // Speed (baud rate)
-                let ispeed = libc::cfgetispeed(&termios);
-                let ospeed = libc::cfgetospeed(&termios);
+                // Speed (baud rate). `libc::speed_t` is `u32` on Linux but
+                // `u64` on macOS — `as u32` is lossless in practice (real
+                // baud rates never approach `u32::MAX`).
+                let ispeed = libc::cfgetispeed(&termios) as u32;
+                let ospeed = libc::cfgetospeed(&termios) as u32;
                 modes.push((russh::Pty::TTY_OP_ISPEED, ispeed));
                 modes.push((russh::Pty::TTY_OP_OSPEED, ospeed));
                 return modes;
