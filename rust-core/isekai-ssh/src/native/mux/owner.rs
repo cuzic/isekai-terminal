@@ -318,14 +318,40 @@ where
                     // A `BuildRequest` was just relayed above (Epic P Phase 2):
                     // remember this reply channel so future client-originated
                     // `Frame::Ctl` frames get routed to the pump task that owns
-                    // the real ctl-socket channel. Overwriting an existing
-                    // `Some` (which would only happen if a client somehow had
-                    // two builds in flight, which `client.rs`'s own one-build-
-                    // per-tab guard prevents) is safe: the orphaned old
-                    // `reply_tx` simply drops, and its pump task ends cleanly
-                    // on its next `reply_rx.recv()`.
+                    // the real ctl-socket channel.
+                    //
+                    // If one is *already* active, this is a second, distinct
+                    // remote `isekai-pipe ctl build` invocation for the same
+                    // tab overlapping the first (`client.rs`'s one-build-per-
+                    // tab guard only blocks the *client* from spawning a
+                    // second build — it can't stop a second `BuildRequest`
+                    // from being relayed in the first place, since that
+                    // happens here, before the client ever sees it — review
+                    // finding: an earlier version of this arm unconditionally
+                    // overwrote `active_build_reply_tx`, which would have
+                    // cross-wired the first build's real output into this
+                    // second remote channel instead of rejecting it cleanly).
+                    // Reject it on its own channel — via the very `reply_tx`
+                    // just received, exactly like the "unknown profile" reply
+                    // shape — rather than disturb the build already in
+                    // flight. Dropping `reply_tx` afterward (implicit, since
+                    // it's never stored) lets that second pump task's next
+                    // `reply_rx.recv()` return `None` and end cleanly once
+                    // it has relayed these two messages.
                     Some(ctl_forward::CtlRelayEvent::BuildStarted { reply_tx }) => {
-                        active_build_reply_tx = Some(reply_tx);
+                        if active_build_reply_tx.is_some() {
+                            if let Ok(chunk) = crate::build_exec::encode_build_output_chunk(
+                                isekai_protocol::BuildOutputStream::Stderr,
+                                b"isekai-ssh: a build is already running for this tab\n".to_vec(),
+                            ) {
+                                let _ = reply_tx.send(chunk);
+                            }
+                            if let Ok(finished) = crate::build_exec::encode_build_finished(125, Vec::new()) {
+                                let _ = reply_tx.send(finished);
+                            }
+                        } else {
+                            active_build_reply_tx = Some(reply_tx);
+                        }
                     }
                     // The ctl pump ended (forward cancelled / all senders gone):
                     // stop selecting this branch so it doesn't busy-loop.
@@ -820,6 +846,159 @@ mod tests {
                 result_paths: Vec::new(),
             }
         );
+
+        drop(client);
+        let _ = relay.await.unwrap();
+    }
+
+    /// A mock sshd that, on `streamlocal_forward`, opens *two* independent
+    /// `forwarded-streamlocal` channels in quick succession — each sending
+    /// its own `BuildRequest` — standing in for two separate remote
+    /// `isekai-pipe ctl build` invocations for the same tab that happen to
+    /// overlap (the second started before the first finished). A short
+    /// delay between the two keeps the first's `BuildStarted` registration
+    /// deterministically ahead of the second's in this test.
+    #[derive(Clone)]
+    struct OverlappingCtlBuildForwardServer {
+        channel_tx: mpsc::UnboundedSender<RusshChannel<ServerMsg>>,
+    }
+    impl server::Server for OverlappingCtlBuildForwardServer {
+        type Handler = OverlappingCtlBuildForwardHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> OverlappingCtlBuildForwardHandler {
+            OverlappingCtlBuildForwardHandler(self.channel_tx.clone())
+        }
+    }
+    #[derive(Clone)]
+    struct OverlappingCtlBuildForwardHandler(mpsc::UnboundedSender<RusshChannel<ServerMsg>>);
+    #[async_trait]
+    impl server::Handler for OverlappingCtlBuildForwardHandler {
+        type Error = russh::Error;
+        async fn auth_password(&mut self, _u: &str, _p: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+        async fn channel_open_session(&mut self, _c: RusshChannel<ServerMsg>, _s: &mut ServerSession) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+        async fn exec_request(&mut self, channel: russh::ChannelId, _data: &[u8], session: &mut ServerSession) -> Result<(), Self::Error> {
+            session.data(channel, CryptoVec::from(b"login-ready\n".to_vec()))?;
+            Ok(())
+        }
+        async fn streamlocal_forward(&mut self, socket_path: &str, session: &mut ServerSession) -> Result<bool, Self::Error> {
+            let handle = session.handle();
+            let path = socket_path.to_string();
+            let tx = self.0.clone();
+            tokio::spawn(async move {
+                for profile in ["a", "b"] {
+                    if let Ok(channel) = handle.channel_open_forwarded_streamlocal(path.clone()).await {
+                        let _ = channel.data(format!("{path}\n").as_bytes()).await;
+                        let _ = channel.data(format!(r#"{{"op":"build_request","profile":"{profile}"}}"#).as_bytes()).await;
+                        let _ = channel.data(&b"\n"[..]).await;
+                        let _ = tx.send(channel);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            });
+            Ok(true)
+        }
+    }
+
+    /// Regression for a review finding: an earlier version of the
+    /// `BuildStarted` handling in `relay_loop` unconditionally overwrote
+    /// `active_build_reply_tx`, which would have cross-wired a first build's
+    /// real output into a second, unrelated remote channel instead of
+    /// rejecting the second cleanly. A second, distinct remote
+    /// `isekai-pipe ctl build` invocation overlapping a first must instead
+    /// be rejected *on its own channel* (a clear stderr message +
+    /// `BuildFinished{exit_code: 125}`), leaving the first build's routing
+    /// untouched.
+    #[tokio::test]
+    async fn relay_client_rejects_a_second_overlapping_build_request_without_disturbing_the_first() {
+        use tokio::time::{timeout, Duration};
+
+        let keypair = Ed25519Keypair::from_seed(&[149; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (channel_tx, mut channel_rx) = mpsc::unbounded_channel();
+        let mut server = OverlappingCtlBuildForwardServer { channel_tx };
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+
+        let routes = ForwardRoutes::new();
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let handler = verifying_handler_with_routes(&verifier, &routes);
+        let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
+        assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
+        let handle = Mutex::new(handle);
+        let token = b"tok".to_vec();
+
+        let (mut client, owner_side) = tokio::io::duplex(64 * 1024);
+        let relay = tokio::spawn(async move { relay_client(owner_side, &handle, &token, Some(&routes)).await });
+
+        write_frame(&mut client, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
+            .await
+            .unwrap();
+        match read_frame(&mut client).await.unwrap().unwrap() {
+            Frame::HelloAck { .. } => {}
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        // Both BuildRequests get relayed to the client regardless of the
+        // owner's own bookkeeping below (the client independently ignores
+        // the second one via its own one-build-per-tab guard) — drain past
+        // whichever non-Ctl frames (e.g. the mock shell's banner) show up
+        // first.
+        let request_a = recv_ctl_frame(&mut client).await;
+        assert_eq!(
+            isekai_protocol::decode_ctl_message(&request_a).unwrap(),
+            isekai_protocol::CtlMessage::BuildRequest { profile: "a".to_string() }
+        );
+        let request_b = recv_ctl_frame(&mut client).await;
+        assert_eq!(
+            isekai_protocol::decode_ctl_message(&request_b).unwrap(),
+            isekai_protocol::CtlMessage::BuildRequest { profile: "b".to_string() }
+        );
+
+        // Channel "a" (registered first) must NOT receive the rejection —
+        // it stays untouched, waiting for a real reply that never comes in
+        // this test (proving the owner didn't route anything into it).
+        let mut channel_a = timeout(Duration::from_secs(5), channel_rx.recv()).await.unwrap().unwrap();
+        // Channel "b" (the overlapping second request) must receive the
+        // rejection on its own channel.
+        let mut channel_b = timeout(Duration::from_secs(5), channel_rx.recv()).await.unwrap().unwrap();
+
+        let rejection_stderr = match channel_b.wait().await {
+            Some(russh::ChannelMsg::Data { data }) => {
+                let msg = isekai_protocol::decode_ctl_message(&data).unwrap();
+                match msg {
+                    isekai_protocol::CtlMessage::BuildOutputChunk { stream, data_b64 } => {
+                        assert_eq!(stream, isekai_protocol::BuildOutputStream::Stderr);
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64).unwrap()
+                    }
+                    other => panic!("expected a rejection BuildOutputChunk on channel b, got {other:?}"),
+                }
+            }
+            other => panic!("expected Data on channel b, got {other:?}"),
+        };
+        assert!(String::from_utf8_lossy(&rejection_stderr).contains("already running"));
+        match channel_b.wait().await {
+            Some(russh::ChannelMsg::Data { data }) => {
+                assert_eq!(
+                    isekai_protocol::decode_ctl_message(&data).unwrap(),
+                    isekai_protocol::CtlMessage::BuildFinished { exit_code: 125, result_paths: Vec::new() }
+                );
+            }
+            other => panic!("expected the rejection BuildFinished on channel b, got {other:?}"),
+        }
+
+        // Channel "a" must still be alive and untouched by the rejection —
+        // give the owner a moment to (not) write anything to it, then
+        // confirm nothing arrived.
+        let saw_nothing = timeout(Duration::from_millis(200), channel_a.wait()).await;
+        assert!(saw_nothing.is_err(), "channel a must not receive anything as a side effect of rejecting channel b");
 
         drop(client);
         let _ = relay.await.unwrap();
