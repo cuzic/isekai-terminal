@@ -122,9 +122,25 @@ pub(crate) fn spawn_resize_watcher() -> Option<tokio::sync::mpsc::UnboundedRecei
 
 // Builds the terminal mode list for `request_pty` from the local terminal
 /// settings. On Unix this reads the actual `termios` via `tcgetattr`; on
-/// other platforms it returns a minimal default set (raw mode — echo/canon/
-/// isig off, standard special characters). When `tcgetattr` fails (e.g. CI
-/// sandbox without a terminal), the same default set is returned.
+/// other platforms it returns a minimal default set matching a normal
+/// cooked-mode interactive terminal (echo/canon/isig **on**, standard
+/// special characters). When `tcgetattr` fails (e.g. CI sandbox without a
+/// terminal), the same default set is returned.
+///
+/// This must **not** ask the remote pty for raw mode: `RawModeGuard`
+/// separately puts the *local* console into raw mode so its own console
+/// driver doesn't double-echo keystrokes, exactly mirroring what `ssh(1)`
+/// does for the Unix ProxyCommand path (send the terminal's actual
+/// [cooked-mode] modes to the server, then switch the local terminal to raw
+/// mode afterwards). Sending `ECHO=0`/`ICANON=0`/`ISIG=0` here as well
+/// configures the *remote* pty itself with echo disabled, so neither side
+/// echoes typed input at all — a real bug this default set had until fixed
+/// (native-pty-gaps branch review): plain shells went completely blind
+/// (input never appeared, only command output did), since a normal shell
+/// relies on the remote pty's own echo rather than doing its own.
+/// Full-screen TUI apps (e.g. Claude Code) were largely unaffected because
+/// they reconfigure the pty's mode themselves on startup regardless of what
+/// this initial request set.
 pub(crate) fn build_terminal_modes() -> Vec<(russh::Pty, u32)> {
     #[cfg(unix)]
     {
@@ -210,11 +226,13 @@ pub(crate) fn build_terminal_modes() -> Vec<(russh::Pty, u32)> {
         // tcgetattr failed (no terminal): fall through to default set.
     }
 
-    // Default set: raw-mode terminal with standard special characters.
+    // Default set: cooked-mode terminal (echo/canon/isig on) with standard
+    // special characters — see this function's doc comment for why this
+    // must not request raw mode from the remote pty.
     vec![
-        (russh::Pty::ECHO, 0),
-        (russh::Pty::ICANON, 0),
-        (russh::Pty::ISIG, 0),
+        (russh::Pty::ECHO, 1),
+        (russh::Pty::ICANON, 1),
+        (russh::Pty::ISIG, 1),
         (russh::Pty::VINTR, 3),   // Ctrl-C
         (russh::Pty::VEOF, 4),    // Ctrl-D
         (russh::Pty::VERASE, 127), // Backspace
@@ -269,5 +287,22 @@ mod tests {
         for (pty, _value) in &modes {
             let _ = format!("{pty:?}");
         }
+    }
+
+    #[test]
+    fn build_terminal_modes_default_set_does_not_disable_echo() {
+        // This sandboxed test environment has no real tty, so `tcgetattr`
+        // fails and this always exercises the fallback "default set" —
+        // the same one a real Windows session unconditionally gets. It must
+        // request a normal cooked-mode remote pty (echo/canon/isig on): a
+        // regression here silently makes every plain shell session blind
+        // (see this function's doc comment).
+        let modes = build_terminal_modes();
+        let value_of = |pty: russh::Pty| {
+            modes.iter().find(|(p, _)| *p == pty).map(|(_, v)| *v)
+        };
+        assert_eq!(value_of(russh::Pty::ECHO), Some(1), "ECHO must be enabled on the remote pty");
+        assert_eq!(value_of(russh::Pty::ICANON), Some(1), "ICANON must be enabled on the remote pty");
+        assert_eq!(value_of(russh::Pty::ISIG), Some(1), "ISIG must be enabled on the remote pty");
     }
 }
