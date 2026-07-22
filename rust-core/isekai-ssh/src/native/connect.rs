@@ -587,7 +587,7 @@ async fn run_authenticated_session(
     // local terminal (OSC title/clipboard on stderr).
     let ctl_remote_path = ctl.as_ref().map(|fwd| fwd.remote_path.clone());
     if let Some(fwd) = ctl {
-        tokio::spawn(ctl_forward::pump_to_stderr(fwd.channels));
+        tokio::spawn(ctl_forward::pump_to_stderr(fwd.channels, resolution.profile().to_string()));
     }
 
     let _raw_mode = console::RawModeGuard::enable().context("isekai-ssh: failed to enable raw terminal mode")?;

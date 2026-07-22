@@ -62,6 +62,7 @@
 //! detached background master process, which is out of scope for this pass and
 //! left as follow-up work.
 
+pub(crate) mod build_relay;
 pub(crate) mod client;
 pub(crate) mod ctl_forward;
 pub(crate) mod naming;

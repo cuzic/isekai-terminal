@@ -108,20 +108,32 @@ pub(crate) async fn open_login_shell<H: client::Handler>(
     Ok(channel)
 }
 
-/// Consumes forwarded ctl channels and applies each message to *this* process's
-/// terminal as an OSC escape on stderr — the owner's own / single-process
-/// foreground shell direction. Runs until the route's sender is dropped (the
-/// forward is cancelled / the session ends).
-pub(crate) async fn pump_to_stderr(mut channels: mpsc::UnboundedReceiver<russh::Channel<client::Msg>>) {
+/// Consumes forwarded ctl channels and applies each message to *this*
+/// process's terminal — the owner's own / single-process foreground shell
+/// direction. Every message except `BuildRequest` is applied in place as an
+/// OSC escape on stderr, matching Epic M's original design. `BuildRequest`
+/// (Epic P Phase 2) has no OSC equivalent and keeps the channel busy for the
+/// whole build's duration instead of a single reply — see
+/// [`super::build_relay::run_build_over_channel`]. Runs until the route's
+/// sender is dropped (the forward is cancelled / the session ends).
+pub(crate) async fn pump_to_stderr(mut channels: mpsc::UnboundedReceiver<russh::Channel<client::Msg>>, host: String) {
     while let Some(mut channel) = channels.recv().await {
+        let host = host.clone();
         tokio::spawn(async move {
             let Some(line) = read_ctl_line(&mut channel).await else {
                 return;
             };
-            if let Ok(msg) = isekai_protocol::decode_ctl_message(&line) {
-                if let Some(seq) = crate::ctl_forward::osc_sequence_for(&msg) {
-                    let _ = crate::ctl_forward::emit_osc(&seq);
+            let Ok(msg) = isekai_protocol::decode_ctl_message(&line) else {
+                return;
+            };
+            if let isekai_protocol::CtlMessage::BuildRequest { profile } = &msg {
+                if let Err(e) = super::build_relay::run_build_over_channel(&mut channel, &host, profile).await {
+                    log_line!("isekai-ssh: build over ctl channel ended with an error: {e:#}");
                 }
+                return;
+            }
+            if let Some(seq) = crate::ctl_forward::osc_sequence_for(&msg) {
+                let _ = crate::ctl_forward::emit_osc(&seq);
             }
         });
     }
