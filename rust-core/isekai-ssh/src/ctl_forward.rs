@@ -899,4 +899,79 @@ mod tests {
         // to panic visibly rather than being silently dropped.
         tokio::task::yield_now().await;
     }
+
+    /// Connects a fresh `UnixStream` to `local_path` (the listener
+    /// `spawn_ctl_listener` bound) and drives one `BuildRequest` over it,
+    /// mirroring exactly what a separate `isekai-pipe ctl build <profile>`
+    /// process invocation would do.
+    #[cfg(unix)]
+    async fn connect_and_run_build(
+        local_path: &Path,
+        secret: &str,
+        profile_name: &str,
+    ) -> (Vec<u8>, Vec<u8>, i32, Vec<String>) {
+        use tokio::io::AsyncWriteExt as _;
+        let mut stream = tokio::net::UnixStream::connect(local_path).await.unwrap();
+        stream.write_all(format!("{secret}\n").as_bytes()).await.unwrap();
+        let request =
+            serde_json::to_vec(&CtlMessage::BuildRequest { profile: profile_name.to_string() }).unwrap();
+        stream.write_all(&request).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        collect_build_messages(stream).await
+    }
+
+    /// Guards the exact workflow just discussed: a human runs `isekai-ssh
+    /// build-profile add` in a *different* terminal while an `isekai-ssh
+    /// <host>` session (and its ctl-socket listener) is already running, and
+    /// expects the very next `isekai-pipe ctl build <name>` — same session,
+    /// no reconnect — to see it. This holds simply because `run_build` reads
+    /// `build_profiles.toml` fresh off disk on every `BuildRequest` rather
+    /// than caching it anywhere (unlike `CTL_VARS`, which deliberately *is*
+    /// an in-memory, per-process store) — this test exists so that property
+    /// stays true if this code is ever "optimized" to cache the profile
+    /// store, which would silently reintroduce a restart requirement.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_running_ctl_listener_picks_up_build_profile_changes_without_restarting() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let workdir = tempfile::tempdir().unwrap();
+        let (_home, _restore) = with_build_profiles(vec![]);
+
+        let mut forward = prepare_ctl_forward(workdir.path()).unwrap();
+        spawn_ctl_listener(&mut forward, "mybox".to_string()).await;
+        // `spawn_ctl_listener` binds the listener in a background task;
+        // give it a moment to actually reach `accept()` before connecting.
+        tokio::task::yield_now().await;
+
+        let (_stdout1, stderr1, exit1, _) =
+            connect_and_run_build(&forward.local_path, &forward.remote_path, "t").await;
+        assert!(String::from_utf8_lossy(&stderr1).contains("no build profile registered"));
+        assert_eq!(exit1, 127);
+
+        // Register the profile — exactly what `isekai-ssh build-profile add`
+        // does, run here directly rather than via the CLI subcommand, but
+        // deliberately *not* touching `forward`/the listener at all, since
+        // the whole point is that the already-running session doesn't need
+        // to be told about this.
+        let path = crate::build_profile::default_build_profiles_path().unwrap();
+        let mut store = crate::build_profile::load_build_profiles(&path).unwrap();
+        crate::build_profile::upsert_profile(
+            &mut store,
+            crate::build_profile::BuildProfile {
+                host: "mybox".to_string(),
+                name: "t".to_string(),
+                dir: workdir.path().to_string_lossy().into_owned(),
+                command: "printf added".to_string(),
+                result_glob: None,
+                dest_dir: None,
+            },
+        )
+        .unwrap();
+        crate::build_profile::save_build_profiles(&path, &store).unwrap();
+
+        let (stdout2, _stderr2, exit2, _) =
+            connect_and_run_build(&forward.local_path, &forward.remote_path, "t").await;
+        assert_eq!(String::from_utf8_lossy(&stdout2), "added");
+        assert_eq!(exit2, 0);
+    }
 }
