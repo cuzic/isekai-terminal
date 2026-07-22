@@ -50,22 +50,34 @@ fn terminal_size_from(size_lookup: impl Fn() -> std::io::Result<(u16, u16)>) -> 
 /// restores it on drop (including on an early return via `?` or a panic
 /// unwind) — mirrors `crossterm::terminal::enable_raw_mode`'s own
 /// recommended usage pattern. On Windows, also best-effort enables VT
-/// (ANSI) output processing on stdout/stderr for the session's lifetime
-/// (see [`enable_vt_output_processing`]) — bundled here rather than as a
+/// (ANSI) output processing on stdout/stderr for the session's lifetime,
+/// restoring each handle's original mode on drop (see
+/// [`enable_vt_output_processing`]) — bundled here rather than as a
 /// separate guard because both are "make this console behave like a VT
 /// terminal for the duration of the interactive session" setup done at the
 /// exact same call site (`native/connect.rs`, right before
-/// `run_shell_io_loop`).
+/// `run_shell_io_loop`), with the same "restore exactly what was there
+/// before" lifecycle.
 pub(crate) struct RawModeGuard {
     _private: (),
+    /// `(handle, original_mode)` pairs to restore on drop — only the
+    /// handles [`enable_vt_output_processing`] actually changed (a handle
+    /// whose `GetConsoleMode`/`SetConsoleMode` failed was left alone, so
+    /// there's nothing to restore for it). Empty on non-Windows.
+    #[cfg(windows)]
+    saved_output_modes: Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>,
 }
 
 impl RawModeGuard {
     pub(crate) fn enable() -> Result<Self> {
         crossterm::terminal::enable_raw_mode().context("failed to enable raw terminal mode")?;
         #[cfg(windows)]
-        enable_vt_output_processing();
-        Ok(Self { _private: () })
+        let saved_output_modes = enable_vt_output_processing();
+        Ok(Self {
+            _private: (),
+            #[cfg(windows)]
+            saved_output_modes,
+        })
     }
 }
 
@@ -73,7 +85,13 @@ impl RawModeGuard {
 /// `DISABLE_NEWLINE_AUTO_RETURN`, so a bare `\n` doesn't get an implicit
 /// `\r` inserted by the console host on top of whatever cursor positioning
 /// the remote app already did) on stdout and stderr — the same thing
-/// Win32-OpenSSH's `ssh.exe` does for its own console output.
+/// Win32-OpenSSH's `ssh.exe` does for its own console output (`ssh.exe`
+/// itself saves the pre-existing mode and restores it on exit, which is why
+/// [`RawModeGuard`] does too rather than leaving the changed mode in place
+/// — an un-restored `DISABLE_NEWLINE_AUTO_RETURN` would otherwise persist
+/// on the user's real console after `isekai-ssh` exits, "staircasing" the
+/// output of any later program that emits a bare `\n` expecting the
+/// console's normal implicit-CR behavior).
 ///
 /// Without this, a console host that doesn't already default it on (plain
 /// `cmd.exe`/legacy `conhost`, as opposed to modern Windows Terminal, which
@@ -89,15 +107,18 @@ impl RawModeGuard {
 /// failing (piped/redirected stdout, a handle that isn't a console at all,
 /// or an ancient Windows without VT support) just leaves the mode
 /// unchanged — matches `console_stdin.rs::try_open_console`'s same
-/// best-effort convention for the input side.
+/// best-effort convention for the input side. Returns the `(handle,
+/// original_mode)` pairs that were actually changed, for [`RawModeGuard`]'s
+/// `Drop` to restore.
 #[cfg(windows)]
-fn enable_vt_output_processing() {
+fn enable_vt_output_processing() -> Vec<(windows_sys::Win32::Foundation::HANDLE, u32)> {
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Console::{
         GetConsoleMode, GetStdHandle, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN,
         ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
     };
 
+    let mut saved = Vec::new();
     for std_handle in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         let handle = unsafe { GetStdHandle(std_handle) };
         if handle == std::ptr::null_mut() || handle == (-1isize as HANDLE) {
@@ -108,8 +129,11 @@ fn enable_vt_output_processing() {
             continue;
         }
         let new_mode = mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
-        unsafe { SetConsoleMode(handle, new_mode) };
+        if unsafe { SetConsoleMode(handle, new_mode) } != 0 {
+            saved.push((handle, mode));
+        }
     }
+    saved
 }
 
 impl Drop for RawModeGuard {
@@ -118,6 +142,13 @@ impl Drop for RawModeGuard {
         // fails on the way out (e.g. the terminal was already torn down),
         // and panicking from a `Drop` impl is its own hazard.
         let _ = crossterm::terminal::disable_raw_mode();
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::SetConsoleMode;
+            for (handle, original_mode) in &self.saved_output_modes {
+                unsafe { SetConsoleMode(*handle, *original_mode) };
+            }
+        }
     }
 }
 
