@@ -19,7 +19,7 @@ final class TerminalScreenViewTests: XCTestCase {
             updateSeq: 0, cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-            mouseReportingMode: .off, sgrMouseMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
@@ -72,7 +72,7 @@ final class TerminalScreenViewTests: XCTestCase {
             updateSeq: 0, cols: UInt32(cells.count), rows: 1, cells: cells,
             cursorRow: 0, cursorCol: 0,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-            mouseReportingMode: .off, sgrMouseMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
@@ -109,7 +109,7 @@ final class TerminalScreenViewTests: XCTestCase {
                 cursorRow: 0, cursorCol: 0,
                 title: nil, applicationCursorMode: false, applicationKeypadMode: false,
                 bracketedPasteMode: false,
-                mouseReportingMode: .off, sgrMouseMode: false,
+                mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
                 cursorVisible: false, bellGeneration: 0,
                 cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
             )
@@ -163,7 +163,7 @@ final class TerminalScreenViewTests: XCTestCase {
             updateSeq: 0, cols: 10, rows: 10, cells: [],
             cursorRow: 0, cursorCol: 0,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-            mouseReportingMode: .off, sgrMouseMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
@@ -191,7 +191,7 @@ final class TerminalScreenViewTests: XCTestCase {
                 updateSeq: 0, cols: 1, rows: 1, cells: cells,
                 cursorRow: 0, cursorCol: 0,
                 title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-                mouseReportingMode: .off, sgrMouseMode: false,
+                mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
                 cursorVisible: true, bellGeneration: 0,
                 cursorShape: shape, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
             )
@@ -215,7 +215,7 @@ final class TerminalScreenViewTests: XCTestCase {
             updateSeq: 0, cols: 1, rows: 1, cells: cells,
             cursorRow: 0, cursorCol: 0,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-            mouseReportingMode: .off, sgrMouseMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .bar, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
@@ -246,7 +246,7 @@ final class TerminalScreenViewTests: XCTestCase {
             updateSeq: 0, cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-            mouseReportingMode: .off, sgrMouseMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .bar, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
@@ -281,7 +281,7 @@ final class TerminalScreenViewTests: XCTestCase {
             updateSeq: 0, cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-            mouseReportingMode: .off, sgrMouseMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
@@ -314,7 +314,7 @@ final class TerminalScreenViewTests: XCTestCase {
             updateSeq: 0, cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-            mouseReportingMode: .off, sgrMouseMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
@@ -348,7 +348,7 @@ final class TerminalScreenViewTests: XCTestCase {
             updateSeq: 0, cols: UInt32(cols), rows: UInt32(rows), cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-            mouseReportingMode: .off, sgrMouseMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
@@ -381,7 +381,7 @@ final class TerminalScreenViewTests: XCTestCase {
             updateSeq: 0, cols: 4, rows: 2, cells: cells,
             cursorRow: 0, cursorCol: 1,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-            mouseReportingMode: .off, sgrMouseMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: true, bellGeneration: 0,
             cursorShape: .block, cursorBlink: true, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
         )
@@ -653,7 +653,7 @@ final class TerminalScreenViewTests: XCTestCase {
                 updateSeq: 0, cols: 1, rows: 1, cells: [cell(blink: blink)],
                 cursorRow: 0, cursorCol: 0,
                 title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-                mouseReportingMode: .off, sgrMouseMode: false,
+                mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
                 cursorVisible: false, bellGeneration: 0,
                 cursorShape: .block, cursorBlink: false, linkTable: [], images: [], kittyKeyboardFlags: 0, dirtyRows: nil
             )
@@ -1093,7 +1093,7 @@ final class TerminalScreenViewTests: XCTestCase {
             updateSeq: updateSeq, cols: cols, rows: rows, cells: cells,
             cursorRow: cursorRow, cursorCol: cursorCol,
             title: nil, applicationCursorMode: false, applicationKeypadMode: false, bracketedPasteMode: false,
-            mouseReportingMode: .off, sgrMouseMode: false,
+            mouseReportingMode: .off, sgrMouseMode: false, alternateScroll: false, urxvtMouseMode: false,
             cursorVisible: cursorVisible, bellGeneration: 0,
             cursorShape: .block, cursorBlink: false, linkTable: [], images: images,
             kittyKeyboardFlags: 0, dirtyRows: dirtyRows

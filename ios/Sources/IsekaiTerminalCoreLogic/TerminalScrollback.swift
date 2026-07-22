@@ -37,6 +37,8 @@ public func synthesizeDisplayUpdate(
         bracketedPasteMode: update.bracketedPasteMode,
         mouseReportingMode: update.mouseReportingMode,
         sgrMouseMode: update.sgrMouseMode,
+        alternateScroll: update.alternateScroll,
+        urxvtMouseMode: update.urxvtMouseMode,
         cursorVisible: update.cursorVisible,
         bellGeneration: update.bellGeneration,
         cursorShape: update.cursorShape,
