@@ -48,6 +48,7 @@ use russh_stream_session::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::mux::ctl_forward;
+use super::mux::handoff::HandoffCredentials;
 
 use crate::log_file::log_line;
 use crate::wrapper::{
@@ -140,6 +141,14 @@ impl Prepared {
     ) -> Self {
         Prepared { plan, resolution, host_config, intent, runtime_dir }
     }
+
+    /// Mutable access for tests that need to tweak the resolved `HostConfig`
+    /// after construction (e.g. pointing `identity_file` at a throwaway
+    /// encrypted key) without threading a whole new `for_test` parameter
+    /// combination through every caller that doesn't need it.
+    pub(crate) fn host_config_mut(&mut self) -> &mut openssh_config::HostConfig {
+        &mut self.host_config
+    }
 }
 
 /// Resolves argv into a [`Prepared`] (config resolution, `--isekai-log-file`
@@ -224,15 +233,18 @@ pub(crate) async fn prepare(args: Vec<String>) -> Result<Prepared> {
 /// exercised on non-Windows unit tests).
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
     let prepared = prepare(args).await?;
-    run_prepared(prepared, None).await
+    run_prepared(prepared, None, HandoffCredentials::default()).await
 }
 
 /// Drives a [`Prepared`] connection through the always-connects recovery.
 /// `owner_hook` is `None` for the single-process path and `Some` for the mux
-/// owner (see [`OwnerHook`]).
-pub(crate) async fn run_prepared(prepared: Prepared, owner_hook: Option<OwnerHook>) -> Result<u8> {
+/// holder (see [`OwnerHook`]). `handoff` is the passphrase hand-off set (Phase
+/// 1b, see `super::mux::handoff`'s docs) — empty for every path except a
+/// holder that was spawned with one, or a client falling back to a direct
+/// connect after reusing the set it resolved before spawning that holder.
+pub(crate) async fn run_prepared(prepared: Prepared, owner_hook: Option<OwnerHook>, handoff: HandoffCredentials) -> Result<u8> {
     let Prepared { plan, resolution, host_config, intent, runtime_dir } = prepared;
-    run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, &runtime_dir, owner_hook).await
+    run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, &runtime_dir, owner_hook, handoff).await
 }
 
 /// Mirrors `wrapper.rs::run_ssh_with_connect_failure_recovery` for the
@@ -280,8 +292,9 @@ async fn run_native_connect_with_recovery(
     intent: ConnectionIntent,
     runtime_dir: &Path,
     owner_hook: Option<OwnerHook>,
+    handoff: HandoffCredentials,
 ) -> Result<u8> {
-    let mut ops = NativeConnectOps { plan, resolution, host_config, runtime_dir, owner_hook };
+    let mut ops = NativeConnectOps { plan, resolution, host_config, runtime_dir, owner_hook, handoff };
     drive_connect_recovery(&mut ops, intent).await
 }
 
@@ -376,12 +389,17 @@ struct NativeConnectOps<'a> {
     /// mux owner role the moment the first attempt failed even though the
     /// retry is what actually succeeds. `None` for the single-process path.
     owner_hook: Option<OwnerHook>,
+    /// The passphrase hand-off set (Phase 1b) — empty except for a spawned
+    /// holder consuming one, or a client reusing the one it resolved before
+    /// spawning that holder for its own fallback direct connect (see
+    /// `super::mux::handoff`'s docs).
+    handoff: HandoffCredentials,
 }
 
 #[async_trait(?Send)]
 impl ConnectRecoveryOps for NativeConnectOps<'_> {
     async fn attempt(&mut self, intent: &ConnectionIntent, silent: bool) -> Result<u8> {
-        connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir, &mut self.owner_hook, silent).await
+        connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir, &mut self.owner_hook, &self.handoff, silent).await
     }
 
     fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
@@ -419,13 +437,14 @@ async fn connect_attempt(
     intent: &ConnectionIntent,
     runtime_dir: &Path,
     owner_hook: &mut Option<OwnerHook>,
+    handoff: &HandoffCredentials,
     silent: bool,
 ) -> Result<u8> {
     let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), runtime_dir, intent)?;
     let stdio = ChildStdio::take_from(&mut child)
         .ok_or_else(|| anyhow!("isekai-ssh: spawned isekai-pipe connect without piped stdin/stdout (internal bug)"))?;
 
-    let result = run_authenticated_session(stdio, plan, resolution, host_config, owner_hook, silent).await;
+    let result = run_authenticated_session(stdio, plan, resolution, host_config, owner_hook, handoff, silent).await;
 
     if result.is_err() {
         // The `isekai-pipe connect` child writes its `ConnectOutcome`
@@ -487,6 +506,7 @@ async fn run_authenticated_session(
     resolution: &WrapperResolution,
     host_config: &openssh_config::HostConfig,
     owner_hook: &mut Option<OwnerHook>,
+    handoff: &HandoffCredentials,
     silent: bool,
 ) -> Result<u8> {
     // A holder process is a detached background invocation with no attached
@@ -561,7 +581,7 @@ async fn run_authenticated_session(
     } else {
         Arc::new(keyboard_interactive::console_responder)
     };
-    let prompts = InteractivePrompts { passphrase: &*prompt_passphrase, keyboard_interactive: &*kbi_responder };
+    let prompts = InteractivePrompts { passphrase: &*prompt_passphrase, keyboard_interactive: &*kbi_responder, handoff };
 
     // The ctl-socket route table the handler dispatches forwarded-streamlocal
     // channels through — one per connection, shared by this process's own
@@ -744,6 +764,14 @@ fn prompt_new_host_confirmation(host_port: &str, fingerprint: &str) -> bool {
 struct InteractivePrompts<'a> {
     passphrase: &'a (dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
     keyboard_interactive: &'a (dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync),
+    /// Already-decrypted identities (Phase 1b passphrase hand-off, see
+    /// `super::mux::handoff`'s docs) — `connect_and_authenticate`'s candidate
+    /// loop consults this *before* the on-disk `SessionError::EncryptedPrivateKey`
+    /// path, so a holder mode session (which forces `silent = true` and would
+    /// otherwise just skip every encrypted candidate) can still authenticate
+    /// with one. Empty (never populated) for every non-holder, non-fallback
+    /// path.
+    handoff: &'a HandoffCredentials,
 }
 
 /// Establishes the SSH handshake over `stream` and authenticates as
@@ -820,20 +848,40 @@ where
     // perfectly-good candidate listed before *or* after it, nor the SSH-agent
     // fallback below. Only a genuine transport/protocol error aborts.
     for (index, candidate) in candidates.iter().enumerate() {
-        // `read_credential_with_certificate` also resolves a paired
-        // `CertificateFile` (an explicit one positionally, else `ssh(1)`'s own
-        // `<candidate>-cert.pub` default convention) and upgrades to
-        // `Credential::PublicKeyWithCertificate` when one is found and
-        // readable — see its own docs for the pairing rules.
-        let Some(credential) = private_key::read_credential_with_certificate(host_config, candidate, index) else {
-            log_line!("isekai-ssh: no key at {}", candidate.display());
-            continue;
+        // A passphrase hand-off entry (Phase 1b) means this exact candidate
+        // was already decrypted — by the process that spawned *this* one, if
+        // it's a holder — so it's used directly, skipping the on-disk read
+        // and the `EncryptedPrivateKey`/prompt path below entirely (a holder
+        // can't prompt anyway; see `InteractivePrompts::handoff`'s docs).
+        let (credential, already_decrypted) = if let Some(handed_off) = prompts.handoff.get(candidate) {
+            let credential = match &handed_off.certificate_pem {
+                Some(cert) => Credential::PublicKeyWithCertificate { private_key_pem: handed_off.private_key_pem.to_vec(), certificate_pem: cert.clone() },
+                None => Credential::PublicKey { private_key_pem: handed_off.private_key_pem.to_vec() },
+            };
+            (credential, true)
+        } else {
+            // `read_credential_with_certificate` also resolves a paired
+            // `CertificateFile` (an explicit one positionally, else `ssh(1)`'s
+            // own `<candidate>-cert.pub` default convention) and upgrades to
+            // `Credential::PublicKeyWithCertificate` when one is found and
+            // readable — see its own docs for the pairing rules.
+            let Some(credential) = private_key::read_credential_with_certificate(host_config, candidate, index) else {
+                log_line!("isekai-ssh: no key at {}", candidate.display());
+                continue;
+            };
+            (credential, false)
         };
         log_line!("isekai-ssh: trying key {}", candidate.display());
         match authenticate_session(&mut handle, username, &credential).await {
             Ok(true) => return Ok(handle),
             Ok(false) => continue,
             Err(SessionError::InvalidPrivateKey(_) | SessionError::InvalidCertificate(_)) => continue,
+            // Unreachable in practice: a hand-off entry is already cleartext,
+            // so `authenticate_session` would never re-report it as
+            // encrypted. Guarded explicitly anyway rather than assumed, so a
+            // future bug in the hand-off's own decrypt step fails safe (skips
+            // this candidate) instead of looping.
+            Err(SessionError::EncryptedPrivateKey) if already_decrypted => continue,
             Err(SessionError::EncryptedPrivateKey) => {
                 let (private_key_pem, certificate_pem): (&[u8], Option<&[u8]>) = match &credential {
                     Credential::PublicKey { private_key_pem } => (private_key_pem, None),
@@ -1164,8 +1212,12 @@ mod tests {
     fn no_kbi_responder(_prompts: &[KeyboardInteractivePrompt]) -> Vec<String> {
         Vec::new()
     }
+    fn empty_handoff() -> &'static HandoffCredentials {
+        static EMPTY: std::sync::OnceLock<HandoffCredentials> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(HandoffCredentials::default)
+    }
     fn no_interactive_prompts() -> InteractivePrompts<'static> {
-        InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &no_kbi_responder }
+        InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() }
     }
 
     struct AcceptAllHostKeys;
@@ -1395,7 +1447,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![identity_path], ..Default::default() };
         let passphrase_prompt = |_path: &Path, _attempt: u32| Some("hunter2".to_string());
-        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder };
+        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() };
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(
@@ -1823,7 +1875,7 @@ mod tests {
         let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
 
         let passphrase_prompt = |_path: &Path, _attempt: u32| Some("hunter2".to_string());
-        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder };
+        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() };
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(result.is_ok(), "the right passphrase must decrypt and authenticate: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
     }
@@ -1844,6 +1896,36 @@ mod tests {
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(result.is_err(), "a silently-refused passphrase prompt must fail cleanly, not hang or panic");
+    }
+
+    /// Simulates the holder-mode path (Phase 1b passphrase hand-off): the
+    /// passphrase was already resolved by the spawning client before this
+    /// connect ever started (`resolve_handoff_credentials`, exercised here
+    /// exactly as `mux::dispatch` would use it), so `connect_and_authenticate`
+    /// must authenticate straight from that hand-off set and never touch the
+    /// (here, silently-refusing) on-disk passphrase prompt at all — the whole
+    /// point being that a detached holder has no console to prompt with.
+    #[tokio::test]
+    async fn connect_and_authenticate_uses_a_handoff_credential_without_ever_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 212, "hunter2");
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 212).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
+
+        let resolved = super::super::mux::handoff::resolve_handoff_credentials(&host_config, dir.path(), &|_path, _attempt| Some("hunter2".to_string()));
+
+        let prompted = std::sync::atomic::AtomicBool::new(false);
+        let refusing_prompt = |path: &Path, attempt: u32| {
+            prompted.store(true, std::sync::atomic::Ordering::SeqCst);
+            no_passphrase_prompt(path, attempt)
+        };
+        let prompts = InteractivePrompts { passphrase: &refusing_prompt, keyboard_interactive: &no_kbi_responder, handoff: &resolved };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
+        assert!(result.is_ok(), "a hand-off credential must authenticate directly: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
+        assert!(!prompted.load(std::sync::atomic::Ordering::SeqCst), "a hand-off credential must never trigger the on-disk passphrase prompt");
     }
 
     #[tokio::test]
@@ -1933,7 +2015,7 @@ mod tests {
         // the fall-through all the way to keyboard-interactive.
         let host_config = openssh_config::HostConfig::default();
         let kbi_responder = |_prompts: &[KeyboardInteractivePrompt]| vec!["hunter2".to_string()];
-        let prompts = InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &kbi_responder };
+        let prompts = InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &kbi_responder, handoff: empty_handoff() };
 
         let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(result.is_ok(), "keyboard-interactive with the right answer must authenticate: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
@@ -1990,7 +2072,8 @@ mod tests {
         );
         let runtime_dir = tempfile::tempdir().unwrap();
 
-        let result = run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, runtime_dir.path(), None).await;
+        let result =
+            run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, runtime_dir.path(), None, HandoffCredentials::default()).await;
         assert!(result.is_err(), "a connect failure with no ConnectOutcome signal must propagate, not be swallowed");
     }
 
@@ -2039,8 +2122,17 @@ mod tests {
             tokio::spawn(async {})
         }));
 
-        let result =
-            connect_attempt(&plan, &resolution, &host_config, &intent, runtime_dir.path(), &mut owner_hook, false).await;
+        let result = connect_attempt(
+            &plan,
+            &resolution,
+            &host_config,
+            &intent,
+            runtime_dir.path(),
+            &mut owner_hook,
+            &HandoffCredentials::default(),
+            false,
+        )
+        .await;
 
         assert!(result.is_err(), "a bogus pipe binary path must make the connect attempt fail");
         assert!(owner_hook.is_some(), "a failed attempt must leave the owner hook intact for the re-bootstrap retry");

@@ -65,6 +65,7 @@
 pub(crate) mod build_relay;
 pub(crate) mod client;
 pub(crate) mod ctl_forward;
+pub(crate) mod handoff;
 pub(crate) mod holder;
 pub(crate) mod naming;
 pub(crate) mod owner;
@@ -95,7 +96,7 @@ const HOLDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(windows)]
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
     let prepared = connect::prepare(args.clone()).await?;
-    dispatch::<local_ipc_mux::WindowsNamedPipeChannel, _>(prepared, args, &holder::DetachedProcessSpawner).await
+    dispatch::<local_ipc_mux::WindowsNamedPipeChannel, _>(prepared, args, &holder::DetachedProcessSpawner, &crate::native::console::prompt_passphrase).await
 }
 
 /// The holder re-exec entrypoint: `main.rs` calls this instead of [`run`] when
@@ -109,7 +110,21 @@ pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
     let holder_channel = local_ipc_mux::WindowsNamedPipeChannel::try_claim(&channel_name)
         .await
         .context("isekai-ssh mux holder: failed to claim the channel it was spawned to serve")?;
-    run_as_holder(prepared, holder_channel, &token_path).await
+    // Read the passphrase hand-off (Phase 1b), if any, off this process's own
+    // stdin before doing anything else — the spawning client either wrote an
+    // encoded payload and closed its write end (EOF right after), or (the
+    // common case: no encrypted identity in play) left stdin null, which
+    // reads as EOF immediately too — `handoff::decode` treats an empty read
+    // as an empty (no-op) set either way.
+    let mut handoff_bytes = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::stdin(), &mut handoff_bytes)
+        .await
+        .context("isekai-ssh mux holder: failed to read the passphrase hand-off from stdin")?;
+    let handoff = handoff::decode(&handoff_bytes).unwrap_or_else(|e| {
+        log_line!("isekai-ssh mux holder: ignoring a malformed passphrase hand-off payload: {e:#}");
+        handoff::HandoffCredentials::default()
+    });
+    run_as_holder(prepared, holder_channel, &token_path, handoff).await
 }
 
 /// The role-selecting core, generic over the IPC channel (and the holder
@@ -121,7 +136,12 @@ pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
 /// holder never coming up, a genuine pipe-infrastructure problem) falls back
 /// to a plain single-process connect so a mux hiccup never blocks connecting
 /// at all (the always-connects principle).
-async fn dispatch<C, S>(prepared: Prepared, holder_args: Vec<String>, spawner: &S) -> Result<u8>
+async fn dispatch<C, S>(
+    prepared: Prepared,
+    holder_args: Vec<String>,
+    spawner: &S,
+    prompt_passphrase: &(dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
+) -> Result<u8>
 where
     C: ExclusiveChannel + Send + 'static,
     S: HolderSpawner,
@@ -130,17 +150,28 @@ where
     let token_path = prepared.runtime_dir().join(naming::token_file_name(&channel_name));
 
     match C::connect(&channel_name).await {
-        Ok(conn) => run_as_client_over(prepared, conn, &token_path).await,
+        Ok(conn) => run_as_client_over(prepared, conn, &token_path, handoff::HandoffCredentials::default()).await,
         Err(ConnectError::NotFound { .. }) => {
-            if let Err(e) = spawner.spawn(&holder_args, None) {
+            // Nobody to relay to yet — about to spawn a detached holder, which
+            // (unlike this still-interactive process) can never itself prompt
+            // for a passphrase-protected identity's passphrase. Resolve the
+            // whole hand-off set *now*, while we still can (Phase 1b — see
+            // `handoff`'s module docs). Cheap and prompt-free when there's no
+            // encrypted identity in play: `resolve_handoff_credentials` never
+            // prompts for a key it hasn't first confirmed is encrypted.
+            let home = isekai_fs_guard::resolve_home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            let resolved_handoff = handoff::resolve_handoff_credentials(prepared.host_config(), &home, prompt_passphrase);
+            let encoded_handoff = (!resolved_handoff.is_empty()).then(|| handoff::encode(&resolved_handoff));
+
+            if let Err(e) = spawner.spawn(&holder_args, encoded_handoff.as_deref().map(|z| z.as_slice())) {
                 log_line!("isekai-ssh: failed to spawn a detached mux holder ({e}); connecting directly");
-                return connect::run_prepared(prepared, None).await;
+                return connect::run_prepared(prepared, None, resolved_handoff).await;
             }
             match connect_with_retry::<C>(&channel_name, HOLDER_STARTUP_TIMEOUT).await {
-                Ok(conn) => run_as_client_over(prepared, conn, &token_path).await,
+                Ok(conn) => run_as_client_over(prepared, conn, &token_path, resolved_handoff).await,
                 Err(e) => {
                     log_line!("isekai-ssh: the detached mux holder never came up ({e}); connecting directly");
-                    connect::run_prepared(prepared, None).await
+                    connect::run_prepared(prepared, None, resolved_handoff).await
                 }
             }
         }
@@ -151,7 +182,7 @@ where
         // connecting, so fall back rather than hard-failing this invocation.
         Err(ConnectError::Io { source, .. }) => {
             log_line!("isekai-ssh: local mux channel unavailable ({source}); connecting directly without multiplexing");
-            connect::run_prepared(prepared, None).await
+            connect::run_prepared(prepared, None, handoff::HandoffCredentials::default()).await
         }
     }
 }
@@ -187,7 +218,7 @@ where
 /// local-IPC error), which is this function's entire body once the hook
 /// fires (see [`OwnerHook`]'s docs on why `run_authenticated_session` skips
 /// the shell in this mode).
-async fn run_as_holder<C>(prepared: Prepared, holder_channel: C, token_path: &Path) -> Result<u8>
+async fn run_as_holder<C>(prepared: Prepared, holder_channel: C, token_path: &Path, handoff: handoff::HandoffCredentials) -> Result<u8>
 where
     C: ExclusiveChannel + Send + 'static,
 {
@@ -200,7 +231,7 @@ where
             }
         })
     });
-    let result = connect::run_prepared(prepared, Some(hook)).await;
+    let result = connect::run_prepared(prepared, Some(hook), handoff).await;
     // Best-effort: don't leave the token file behind once this holder exits.
     let _ = std::fs::remove_file(&cleanup_path);
     result
@@ -208,8 +239,12 @@ where
 
 /// Relays this terminal to an already-connected holder. If the holder rejects
 /// the connection before any shell session existed, falls back to a plain
-/// single-process connect.
-async fn run_as_client_over<Conn>(prepared: Prepared, conn: Conn, token_path: &Path) -> Result<u8>
+/// single-process connect — reusing `handoff` (the passphrase hand-off set
+/// this process already resolved before spawning that holder, if any) so a
+/// user is never prompted for the same passphrase twice in one invocation
+/// (empty when this connect went straight to an already-live holder, i.e. no
+/// hand-off was ever resolved in the first place).
+async fn run_as_client_over<Conn>(prepared: Prepared, conn: Conn, token_path: &Path, handoff: handoff::HandoffCredentials) -> Result<u8>
 where
     Conn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -224,18 +259,20 @@ where
         // file) in the race between our successful connect and now. A mux
         // hiccup must never block connecting (the always-connects
         // principle) — dial SSH ourselves, unmultiplexed.
-        ClientToken::FallBack => return connect::run_prepared(prepared, None).await,
+        ClientToken::FallBack => return connect::run_prepared(prepared, None, handoff).await,
     };
     match client::run(conn, &token, host).await? {
         client::ClientRunResult::ExitCode(code) => Ok(code),
         // The holder rejected us before any shell session existed (protocol
         // version mismatch, or a stale token read in the window before a new
-        // holder rewrote it — see `ClientOutcome::Rejected`'s docs). Nothing
-        // was lost, so it's always safe to fall back to a fresh unmultiplexed
-        // connect rather than fail this invocation outright.
+        // holder rewrote it — see `ClientOutcome::Rejected`'s docs, and — the
+        // case `handoff` actually matters for — the holder's own SSH auth
+        // failing before it ever reaches `serve_clients`). Nothing was lost,
+        // so it's always safe to fall back to a fresh unmultiplexed connect
+        // rather than fail this invocation outright.
         client::ClientRunResult::Rejected { reason } => {
             log_line!("isekai-ssh: the mux holder rejected this connection ({reason}); connecting directly");
-            connect::run_prepared(prepared, None).await
+            connect::run_prepared(prepared, None, handoff).await
         }
     }
 }
@@ -547,13 +584,54 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            dispatch::<InMemoryChannel, _>(prepared, vec!["dispatch-spawn-failure-host".to_string()], &spawner),
+            dispatch::<InMemoryChannel, _>(prepared, vec!["dispatch-spawn-failure-host".to_string()], &spawner, &|_path, _attempt| None),
         )
         .await
         .expect("dispatch must not hang when the holder spawn itself fails");
 
         assert!(result.is_err(), "the fallback direct connect against the bogus pipe path must still fail here, but via the fallback, not a hang");
-        assert_eq!(spawner.calls.lock().unwrap().len(), 1, "dispatch must attempt to spawn a holder exactly once before falling back");
+        let calls = spawner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "dispatch must attempt to spawn a holder exactly once before falling back");
+        assert!(calls[0].1.is_none(), "no encrypted identity was configured, so no passphrase hand-off payload should ever be produced");
+    }
+
+    /// `dispatch` must resolve the passphrase hand-off set (Phase 1b) and
+    /// pass its encoded bytes to the spawner *before* spawning a holder for a
+    /// destination with a passphrase-protected identity — this is the wiring
+    /// between `dispatch`, `handoff::resolve_handoff_credentials`, and
+    /// `holder::HolderSpawner::spawn` end to end (the crypto/decrypt
+    /// correctness itself is `handoff`'s own module tests' job).
+    #[tokio::test]
+    async fn dispatch_hands_off_the_decrypted_key_to_the_spawner_when_an_identity_is_encrypted() {
+        use rand::rngs::OsRng;
+        use russh_keys::ssh_key::private::{Ed25519Keypair, PrivateKey as SshPrivateKey};
+
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let key_dir = tempfile::tempdir().unwrap();
+        let key_path = key_dir.path().join("id_ed25519");
+        let key = SshPrivateKey::from(Ed25519Keypair::random(&mut OsRng));
+        let encrypted = key.encrypt(&mut OsRng, "hunter2").unwrap();
+        std::fs::write(&key_path, encrypted.to_openssh(Default::default()).unwrap().as_bytes()).unwrap();
+
+        let mut prepared = test_prepared("dispatch-handoff-host", runtime_dir.path());
+        prepared.host_config_mut().identity_file = vec![key_path.clone()];
+
+        let spawner = holder::tests_support::RecordingSpawner::failing();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatch::<InMemoryChannel, _>(prepared, vec!["dispatch-handoff-host".to_string()], &spawner, &|_path, _attempt| Some("hunter2".to_string())),
+        )
+        .await
+        .expect("dispatch must not hang resolving the hand-off set");
+        assert!(result.is_err(), "the fallback direct connect against the bogus pipe path must still fail here");
+
+        let calls = spawner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let payload = calls[0].1.as_deref().expect("an encrypted identity must produce a non-empty hand-off payload");
+        let decoded = handoff::decode(payload).expect("the encoded hand-off payload must decode cleanly");
+        let credential = decoded.get(&key_path).expect("the encrypted candidate's path must be a key in the decoded hand-off set");
+        let cleartext = russh_keys::PrivateKey::from_openssh(&credential.private_key_pem).expect("the hand-off PEM must be valid OpenSSH text");
+        assert!(!cleartext.is_encrypted(), "the hand-off PEM must be the decrypted cleartext key, not the original ciphertext");
     }
 
     /// A holder that was spawned successfully but never actually claims the
@@ -569,7 +647,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             HOLDER_STARTUP_TIMEOUT + Duration::from_secs(5),
-            dispatch::<InMemoryChannel, _>(prepared, vec!["dispatch-holder-never-arrives-host".to_string()], &spawner),
+            dispatch::<InMemoryChannel, _>(prepared, vec!["dispatch-holder-never-arrives-host".to_string()], &spawner, &|_path, _attempt| None),
         )
         .await
         .expect("dispatch must give up waiting for the holder within its own startup timeout, not hang");

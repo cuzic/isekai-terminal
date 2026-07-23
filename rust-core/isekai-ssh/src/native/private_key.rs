@@ -61,7 +61,7 @@ pub(crate) fn read_credential(path: &Path) -> Option<Credential> {
 /// [`Credential::PublicKeyWithCertificate`] directly from the key bytes
 /// without destructuring a [`Credential`] (which implements `Drop` to
 /// zeroize, so its fields can't be moved out of by pattern-matching).
-fn read_key_bytes(path: &Path) -> Option<Vec<u8>> {
+pub(crate) fn read_key_bytes(path: &Path) -> Option<Vec<u8>> {
     match std::fs::read(path) {
         Ok(bytes) => Some(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
