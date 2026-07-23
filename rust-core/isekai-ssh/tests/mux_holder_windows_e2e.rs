@@ -66,6 +66,24 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::process::{Child, Command as TokioCommand};
 
+/// Serializes this file's 3 tests (`cargo test`'s default harness runs
+/// `#[test]` functions concurrently). Each test spawns several real
+/// `isekai-ssh.exe`/`isekai-pipe.exe` processes and waits on
+/// `HOLDER_STARTUP_TIMEOUT` (10s, not overridable — see the module docs on
+/// why a real wait beats a test-only knob here too); a real `test-windows`
+/// CI failure (2026-07-23, `holder_exits_after_idle_grace_once_all_tabs_close`)
+/// showed a *single* tab produce 2 real SSH connections instead of 1 under
+/// exactly this concurrency — the detached holder took longer than
+/// `HOLDER_STARTUP_TIMEOUT` to claim the channel (three tests' worth of
+/// subprocesses competing for CPU on one CI runner), so the spawning tab's
+/// own client-side retry gave up and fell back to a direct connect while
+/// the slow-but-still-live holder *also* eventually finished its own dial.
+/// A `tokio::sync::Mutex` (not `std::sync::Mutex`, which can't be held
+/// across `.await` on a multi-thread runtime) held for each test's entire
+/// body removes the concurrency rather than trying to out-guess a CI
+/// runner's variable load with a bigger timeout.
+static TEST_SERIAL_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn isekai_ssh_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_isekai-ssh"))
 }
@@ -426,6 +444,7 @@ async fn wait_for_ready(child: &mut Child, timeout: Duration, label: &str) {
 /// across both tabs.
 #[tokio::test(flavor = "multi_thread")]
 async fn second_tab_reuses_the_first_tabs_holder_without_a_new_ssh_handshake() {
+    let _serial = TEST_SERIAL_GUARD.lock().await;
     let fixture = MuxFixture::new("mux-e2e-second-tab-reuses-holder").await;
 
     // Tab 1 finds no existing holder for this destination, so it becomes the
@@ -459,6 +478,7 @@ async fn second_tab_reuses_the_first_tabs_holder_without_a_new_ssh_handshake() {
 /// open".
 #[tokio::test(flavor = "multi_thread")]
 async fn holder_outlives_the_tab_that_spawned_it() {
+    let _serial = TEST_SERIAL_GUARD.lock().await;
     let fixture = MuxFixture::new("mux-e2e-holder-outlives-spawner").await;
 
     let mut tab1 = fixture.spawn_tab();
@@ -495,11 +515,12 @@ async fn holder_outlives_the_tab_that_spawned_it() {
 /// connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn holder_exits_after_idle_grace_once_all_tabs_close() {
+    let _serial = TEST_SERIAL_GUARD.lock().await;
     let fixture = MuxFixture::new("mux-e2e-holder-idle-exit").await;
 
     let mut tab1 = fixture.spawn_tab();
     wait_for_ready(&mut tab1, Duration::from_secs(30), "tab1").await;
-    assert_eq!(fixture.connection_count.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.connection_count.load(Ordering::SeqCst), 1, "tab1 alone must produce exactly one real SSH connection (via the holder it spawned)");
 
     let _ = tab1.start_kill();
     let _ = tab1.wait().await;
