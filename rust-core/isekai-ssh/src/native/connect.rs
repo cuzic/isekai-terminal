@@ -72,8 +72,8 @@ use super::private_key;
 /// (see [`OwnerHook`]).
 pub(crate) type NativeHandle = client::Handle<russh_stream_session::VerifyingHandler<FileBackedHostKeyVerifier>>;
 
-/// A hook the mux owner path ([`super::mux`]) supplies so that, the moment the
-/// shared SSH session is authenticated, it can start accepting local IPC
+/// A hook the mux holder path ([`super::mux`]) supplies so that, the moment
+/// the shared SSH session is authenticated, it can start accepting local IPC
 /// clients on the shared handle — without the connect+auth+recovery machinery
 /// here having to know anything about `local-ipc-mux`. It receives an
 /// [`Arc`]-shared, [`Mutex`](tokio::sync::Mutex)-guarded handle: `channel_open_session`
@@ -83,14 +83,20 @@ pub(crate) type NativeHandle = client::Handle<russh_stream_session::VerifyingHan
 /// the per-channel I/O loop. It runs at most once, on the *successful* connect
 /// attempt (a failed attempt errors before the handle exists, leaving the hook
 /// intact for the re-bootstrap retry). Boxed `FnOnce` + `Send` because it
-/// typically `tokio::spawn`s the accept loop.
+/// `tokio::spawn`s the accept loop and hands back its [`tokio::task::JoinHandle`]:
+/// a holder process has **no foreground shell of its own** (unlike the old,
+/// removed "owner" role) — [`run_authenticated_session`] awaits this handle as
+/// the *entire* session body instead, so the holder's lifetime is exactly the
+/// accept loop's own (idle-exit or a fatal local-IPC error), decoupled from
+/// any particular tab — the `ControlPersist`-equivalent redesign this exists
+/// for (`super::mux`'s module docs).
 pub(crate) type SharedHandle = Arc<tokio::sync::Mutex<NativeHandle>>;
 /// Receives the shared handle plus, when `#@isekai ctl-socket` is enabled for
 /// this invocation, the [`ForwardRoutes`] the connection's handler dispatches
-/// forwarded-streamlocal channels through — so the owner can set up a *private*
+/// forwarded-streamlocal channels through — so the holder can set up a *private*
 /// per-tab ctl forward for each mux client (M5). `None` means ctl-socket is off
 /// and no per-client forward should be requested.
-pub(crate) type OwnerHook = Box<dyn FnOnce(SharedHandle, Option<ForwardRoutes>) + Send>;
+pub(crate) type OwnerHook = Box<dyn FnOnce(SharedHandle, Option<ForwardRoutes>) -> tokio::task::JoinHandle<()> + Send>;
 
 /// Everything [`run_prepared`] needs, resolved once up front so the mux
 /// dispatch ([`super::mux::run`]) can compute the channel name from the same
@@ -115,6 +121,24 @@ impl Prepared {
     }
     pub(crate) fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
+    }
+}
+
+#[cfg(test)]
+impl Prepared {
+    /// Assembles a [`Prepared`] directly from already-resolved parts, for
+    /// tests (here and in `native/mux/mod.rs`) that need one without going
+    /// through the real trust-store/TOFU machinery [`prepare`] drives —
+    /// mirrors the plan/resolution/host_config/intent construction this
+    /// module's own `bogus_pipe`-based recovery tests already use.
+    pub(crate) fn for_test(
+        plan: WrapperPlan,
+        resolution: WrapperResolution,
+        host_config: openssh_config::HostConfig,
+        intent: ConnectionIntent,
+        runtime_dir: PathBuf,
+    ) -> Self {
+        Prepared { plan, resolution, host_config, intent, runtime_dir }
     }
 }
 
@@ -465,6 +489,12 @@ async fn run_authenticated_session(
     owner_hook: &mut Option<OwnerHook>,
     silent: bool,
 ) -> Result<u8> {
+    // A holder process is a detached background invocation with no attached
+    // console — it can never prompt for anything (host-key TOFU, a
+    // passphrase, keyboard-interactive), regardless of which connect attempt
+    // this is. `silent` normally reflects only the retry-after-rebootstrap
+    // attempt number; holder mode forces it on unconditionally.
+    let silent = silent || owner_hook.is_some();
     let (host, port) = resolution.native_host_port(plan.destination_host());
     let host_port = format!("{host}:{port}");
     // Username precedence: destination user@ part > ssh_config User > local username
@@ -550,16 +580,19 @@ async fn run_authenticated_session(
 
     let ctl_enabled = ctl_forward::should_forward(plan, resolution);
 
-    // The SSH session is now authenticated. If this is the mux owner path,
+    // The SSH session is now authenticated. If this is the mux holder path,
     // hand a shared clone of the handle to the accept loop so sibling tabs can
-    // start opening their own channels while this process also drives its own
-    // foreground shell below. When ctl-socket is enabled, also hand over the
-    // route table so each client gets its own private forward. Reached only on
-    // success, so a failed attempt (which returns above) never `take`s the
-    // hook out of the caller's `Option` — it stays available for the
-    // always-connects re-bootstrap retry.
+    // start opening their own channels — and, since a holder has no
+    // foreground shell of its own, await the accept loop's own `JoinHandle` as
+    // this session's entire body, skipping everything below. When ctl-socket
+    // is enabled, also hand over the route table so each client gets its own
+    // private forward. Reached only on success, so a failed attempt (which
+    // returns above) never `take`s the hook out of the caller's `Option` — it
+    // stays available for the always-connects re-bootstrap retry.
     if let Some(hook) = owner_hook.take() {
-        hook(handle.clone(), ctl_enabled.then(|| forward_routes.clone()));
+        let serve_handle = hook(handle.clone(), ctl_enabled.then(|| forward_routes.clone()));
+        let _ = serve_handle.await;
+        return Ok(0);
     }
 
     let (cols, rows) = console::terminal_size();
@@ -2001,8 +2034,10 @@ mod tests {
 
         let fired = std::sync::Arc::new(AtomicBool::new(false));
         let fired_in_hook = fired.clone();
-        let mut owner_hook: Option<OwnerHook> =
-            Some(Box::new(move |_handle, _routes| fired_in_hook.store(true, Ordering::SeqCst)));
+        let mut owner_hook: Option<OwnerHook> = Some(Box::new(move |_handle, _routes| {
+            fired_in_hook.store(true, Ordering::SeqCst);
+            tokio::spawn(async {})
+        }));
 
         let result =
             connect_attempt(&plan, &resolution, &host_config, &intent, runtime_dir.path(), &mut owner_hook, false).await;

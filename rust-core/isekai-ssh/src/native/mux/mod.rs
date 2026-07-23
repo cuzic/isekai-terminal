@@ -65,6 +65,7 @@
 pub(crate) mod build_relay;
 pub(crate) mod client;
 pub(crate) mod ctl_forward;
+pub(crate) mod holder;
 pub(crate) mod naming;
 pub(crate) mod owner;
 pub(crate) mod protocol;
@@ -72,11 +73,20 @@ pub(crate) mod protocol;
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use local_ipc_mux::{ClaimError, ConnectError, ExclusiveChannel};
+use local_ipc_mux::{ConnectError, ExclusiveChannel};
 
 use crate::log_file::log_line;
 use crate::native::connect::{self, OwnerHook, Prepared};
+use holder::HolderSpawner;
+
+/// How long the foreground process waits, after successfully spawning a
+/// detached holder, for that holder to actually claim the channel and start
+/// accepting before giving up and falling back to a plain direct connect — a
+/// slow or failed holder must never block this tab from connecting at all
+/// (the always-connects principle).
+const HOLDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `isekai-ssh <destination>` entrypoint on Windows: resolves the config, then
 /// dispatches through the concrete named-pipe channel. Swapping in a different
@@ -84,42 +94,100 @@ use crate::native::connect::{self, OwnerHook, Prepared};
 /// concrete type here.
 #[cfg(windows)]
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
-    let prepared = connect::prepare(args).await?;
-    dispatch::<local_ipc_mux::WindowsNamedPipeChannel>(prepared).await
+    let prepared = connect::prepare(args.clone()).await?;
+    dispatch::<local_ipc_mux::WindowsNamedPipeChannel, _>(prepared, args, &holder::DetachedProcessSpawner).await
 }
 
-/// The role-selecting core, generic over the IPC channel so it's testable with
-/// `InMemoryChannel`. Tries to become the owner; on `AlreadyClaimed`, becomes a
-/// client; on any other failure (a genuine pipe-infrastructure problem, or the
-/// owner vanishing mid-handshake) it falls back to a plain single-process
-/// connect so a mux hiccup never blocks connecting at all (the always-connects
-/// principle).
-async fn dispatch<C>(prepared: Prepared) -> Result<u8>
+/// The holder re-exec entrypoint: `main.rs` calls this instead of [`run`] when
+/// [`holder::is_holder_reexec`] is true. Claims the channel and serves clients
+/// only — no foreground shell (see [`run_as_holder`]'s docs).
+#[cfg(windows)]
+pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
+    let prepared = connect::prepare(args).await?;
+    let channel_name = naming::channel_name(prepared.host_config(), prepared.resolution(), prepared.plan().destination_host());
+    let token_path = prepared.runtime_dir().join(naming::token_file_name(&channel_name));
+    let holder_channel = local_ipc_mux::WindowsNamedPipeChannel::try_claim(&channel_name)
+        .await
+        .context("isekai-ssh mux holder: failed to claim the channel it was spawned to serve")?;
+    run_as_holder(prepared, holder_channel, &token_path).await
+}
+
+/// The role-selecting core, generic over the IPC channel (and the holder
+/// spawner) so it's testable with `InMemoryChannel`/a fake spawner. The
+/// foreground process is **always a client**: it never claims the channel
+/// itself. If no holder is currently listening, it spawns a detached one
+/// (Phase 1 `ControlPersist`-equivalent redesign — see this module's docs)
+/// and retries as a client; any failure along the way (spawn failure, the
+/// holder never coming up, a genuine pipe-infrastructure problem) falls back
+/// to a plain single-process connect so a mux hiccup never blocks connecting
+/// at all (the always-connects principle).
+async fn dispatch<C, S>(prepared: Prepared, holder_args: Vec<String>, spawner: &S) -> Result<u8>
 where
     C: ExclusiveChannel + Send + 'static,
+    S: HolderSpawner,
 {
     let channel_name = naming::channel_name(prepared.host_config(), prepared.resolution(), prepared.plan().destination_host());
     let token_path = prepared.runtime_dir().join(naming::token_file_name(&channel_name));
 
-    match C::try_claim(&channel_name).await {
-        Ok(owner_channel) => run_as_owner(prepared, owner_channel, &token_path).await,
-        Err(ClaimError::AlreadyClaimed { .. }) => run_as_client::<C>(prepared, &channel_name, &token_path).await,
-        Err(ClaimError::Io { source, .. }) => {
-            // The pipe infrastructure itself failed (not "someone else owns
-            // it"). A mux problem must never block connecting — dial SSH
-            // ourselves, unmultiplexed.
+    match C::connect(&channel_name).await {
+        Ok(conn) => run_as_client_over(prepared, conn, &token_path).await,
+        Err(ConnectError::NotFound { .. }) => {
+            if let Err(e) = spawner.spawn(&holder_args, None) {
+                log_line!("isekai-ssh: failed to spawn a detached mux holder ({e}); connecting directly");
+                return connect::run_prepared(prepared, None).await;
+            }
+            match connect_with_retry::<C>(&channel_name, HOLDER_STARTUP_TIMEOUT).await {
+                Ok(conn) => run_as_client_over(prepared, conn, &token_path).await,
+                Err(e) => {
+                    log_line!("isekai-ssh: the detached mux holder never came up ({e}); connecting directly");
+                    connect::run_prepared(prepared, None).await
+                }
+            }
+        }
+        // A transient local-pipe I/O error (not "no owner exists" — e.g. the
+        // pipe infrastructure itself failed, or `ERROR_PIPE_BUSY` retries
+        // exhausted reaching a holder that does exist). Per the
+        // always-connects principle a mux hiccup must never block
+        // connecting, so fall back rather than hard-failing this invocation.
+        Err(ConnectError::Io { source, .. }) => {
             log_line!("isekai-ssh: local mux channel unavailable ({source}); connecting directly without multiplexing");
             connect::run_prepared(prepared, None).await
         }
     }
 }
 
-/// Won the claim: write the per-session auth token, then run the ordinary
-/// connect+auth+recovery with an [`OwnerHook`] that starts accepting clients
-/// the moment the shared session authenticates. This process also drives its
-/// own foreground shell (inside `run_prepared`), exactly like the
-/// single-process path.
-async fn run_as_owner<C>(prepared: Prepared, owner_channel: C, token_path: &Path) -> Result<u8>
+/// Retries [`ExclusiveChannel::connect`] while it keeps reporting
+/// [`ConnectError::NotFound`] (the holder hasn't claimed the channel yet),
+/// giving up once `deadline` has elapsed. Any other error (or a `NotFound`
+/// past the deadline) is returned to the caller, which falls back to a plain
+/// direct connect.
+async fn connect_with_retry<C>(channel_name: &str, deadline: Duration) -> Result<C::Connection, ConnectError>
+where
+    C: ExclusiveChannel,
+{
+    let start = tokio::time::Instant::now();
+    loop {
+        match C::connect(channel_name).await {
+            Ok(conn) => return Ok(conn),
+            Err(ConnectError::NotFound { .. }) if start.elapsed() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Claimed by no one *yet*: this process's foreground path spawned a detached
+/// holder (or is a re-exec'd holder itself) which claims the channel, writes
+/// the per-session auth token, then runs the ordinary connect+auth+recovery
+/// with an [`OwnerHook`] that starts accepting clients the moment the shared
+/// session authenticates. Unlike a plain single-process connect, this process
+/// opens **no foreground shell of its own** — [`connect::run_prepared`]
+/// returns as soon as the accept loop itself ends (idle-exit or a fatal
+/// local-IPC error), which is this function's entire body once the hook
+/// fires (see [`OwnerHook`]'s docs on why `run_authenticated_session` skips
+/// the shell in this mode).
+async fn run_as_holder<C>(prepared: Prepared, holder_channel: C, token_path: &Path) -> Result<u8>
 where
     C: ExclusiveChannel + Send + 'static,
 {
@@ -127,23 +195,23 @@ where
     let cleanup_path = token_path.to_path_buf();
     let hook: OwnerHook = Box::new(move |handle, ctl_routes| {
         tokio::spawn(async move {
-            if let Err(e) = owner::serve_clients(owner_channel, handle, token, ctl_routes).await {
-                log_line!("isekai-ssh mux owner: the client accept loop ended: {e:#}");
+            if let Err(e) = owner::serve_clients(holder_channel, handle, token, ctl_routes).await {
+                log_line!("isekai-ssh mux holder: the client accept loop ended: {e:#}");
             }
-        });
+        })
     });
     let result = connect::run_prepared(prepared, Some(hook)).await;
-    // Best-effort: don't leave the token file behind once this owner exits.
+    // Best-effort: don't leave the token file behind once this holder exits.
     let _ = std::fs::remove_file(&cleanup_path);
     result
 }
 
-/// Lost the claim (an owner already exists): read its token and relay this
-/// terminal to it. If the owner vanished in the race between the failed claim
-/// and this connect, fall back to a plain single-process connect.
-async fn run_as_client<C>(prepared: Prepared, channel_name: &str, token_path: &Path) -> Result<u8>
+/// Relays this terminal to an already-connected holder. If the holder rejects
+/// the connection before any shell session existed, falls back to a plain
+/// single-process connect.
+async fn run_as_client_over<Conn>(prepared: Prepared, conn: Conn, token_path: &Path) -> Result<u8>
 where
-    C: ExclusiveChannel + Send + 'static,
+    Conn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // Extracted before `prepared` potentially moves into `connect::run_prepared`
     // below (the fallback branches take it by value) — this is the same host/
@@ -152,39 +220,21 @@ where
     let host = prepared.resolution().profile().to_string();
     let token = match read_owner_token_or_fall_back(token_path) {
         ClientToken::Ready(token) => token,
-        // The owner released its claim (or hadn't finished writing the token
-        // file) in the race between our failed claim and now. A mux hiccup must
-        // never block connecting (the always-connects principle) — dial SSH
-        // ourselves, unmultiplexed, exactly as the mid-handshake case below.
+        // The holder released its claim (or hadn't finished writing the token
+        // file) in the race between our successful connect and now. A mux
+        // hiccup must never block connecting (the always-connects
+        // principle) — dial SSH ourselves, unmultiplexed.
         ClientToken::FallBack => return connect::run_prepared(prepared, None).await,
     };
-    match C::connect(channel_name).await {
-        Ok(conn) => match client::run(conn, &token, host).await? {
-            client::ClientRunResult::ExitCode(code) => Ok(code),
-            // The owner rejected us before any shell session existed
-            // (protocol version mismatch, or a stale token read in the
-            // window before a new owner rewrote it — see `ClientOutcome::
-            // Rejected`'s docs). Nothing was lost, so it's always safe to
-            // fall back to a fresh unmultiplexed connect rather than fail
-            // this invocation outright.
-            client::ClientRunResult::Rejected { reason } => {
-                log_line!("isekai-ssh: the mux owner rejected this connection ({reason}); connecting directly");
-                connect::run_prepared(prepared, None).await
-            }
-        },
-        Err(ConnectError::NotFound { .. }) => {
-            log_line!("isekai-ssh: the mux owner released its claim mid-handshake; connecting directly");
-            connect::run_prepared(prepared, None).await
-        }
-        // A transient local-pipe I/O error reaching an owner that (per
-        // `ClaimError::AlreadyClaimed` above) does exist — e.g. `ERROR_PIPE_
-        // BUSY` retries exhausted while the owner hasn't yet re-armed its
-        // next accepting instance. Per the always-connects principle a mux
-        // hiccup must never block connecting, so fall back exactly like the
-        // sibling failure branches above, rather than hard-failing this
-        // invocation.
-        Err(ConnectError::Io { source, .. }) => {
-            log_line!("isekai-ssh: failed to connect to the mux owner process ({source}); connecting directly");
+    match client::run(conn, &token, host).await? {
+        client::ClientRunResult::ExitCode(code) => Ok(code),
+        // The holder rejected us before any shell session existed (protocol
+        // version mismatch, or a stale token read in the window before a new
+        // holder rewrote it — see `ClientOutcome::Rejected`'s docs). Nothing
+        // was lost, so it's always safe to fall back to a fresh unmultiplexed
+        // connect rather than fail this invocation outright.
+        client::ClientRunResult::Rejected { reason } => {
+            log_line!("isekai-ssh: the mux holder rejected this connection ({reason}); connecting directly");
             connect::run_prepared(prepared, None).await
         }
     }
@@ -258,7 +308,7 @@ fn read_owner_token(path: &Path) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use local_ipc_mux::InMemoryChannel;
+    use local_ipc_mux::{ClaimError, InMemoryChannel};
     use russh::client;
     use russh::server::{self, Auth, Msg as ServerMsg, Server as _, Session as ServerSession};
     use russh::{Channel as RusshChannel, CryptoVec};
@@ -416,5 +466,114 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "the token file must be owner-only (0600)");
         }
+    }
+
+    // -- connect_with_retry ---------------------------------------------
+
+    #[tokio::test]
+    async fn connect_with_retry_succeeds_immediately_when_a_holder_is_already_there() {
+        let name = "isekai-ssh-mux-retry-immediate-test";
+        // `connect` requires no `accept` on the other side to succeed at this
+        // layer (see `InMemoryChannel::connect`'s implementation) — the claim
+        // just needs to stay alive for the channel to be reachable, so
+        // leaking it (never dropped) keeps it alive without an explicit
+        // `accept` loop this test doesn't need.
+        let owner_channel = InMemoryChannel::try_claim(name).await.unwrap();
+        std::mem::forget(owner_channel);
+        let result = connect_with_retry::<InMemoryChannel>(name, Duration::from_secs(1)).await;
+        assert!(result.is_ok(), "an already-claimed channel must connect on the first try, not retry");
+    }
+
+    #[tokio::test]
+    async fn connect_with_retry_succeeds_once_a_holder_claims_the_channel_mid_wait() {
+        tokio::time::pause();
+        let name = "isekai-ssh-mux-retry-eventual-test";
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _channel = InMemoryChannel::try_claim(name).await.expect("the simulated holder must win the claim");
+            // Held alive for the rest of the test via this task's own scope.
+            std::future::pending::<()>().await;
+        });
+        let result = connect_with_retry::<InMemoryChannel>(name, Duration::from_secs(5)).await;
+        assert!(result.is_ok(), "a holder claiming the channel mid-wait must eventually be reachable, not time out");
+    }
+
+    #[tokio::test]
+    async fn connect_with_retry_gives_up_once_the_deadline_elapses() {
+        tokio::time::pause();
+        let name = "isekai-ssh-mux-retry-never-test";
+        let result = connect_with_retry::<InMemoryChannel>(name, Duration::from_millis(200)).await;
+        assert!(matches!(result, Err(ConnectError::NotFound { .. })), "a channel nobody ever claims must give up past the deadline, not hang forever");
+    }
+
+    // -- dispatch fallback sequencing ------------------------------------
+
+    /// Builds a throwaway `Prepared` for `dispatch` tests: a bogus
+    /// `--isekai-pipe-path` makes the ultimate fallback (`connect::run_prepared`)
+    /// fail fast and deterministically instead of hanging on a real network
+    /// dial, mirroring `native/connect.rs`'s own `bogus_pipe`-based recovery
+    /// tests.
+    fn test_prepared(destination: &str, runtime_dir: &std::path::Path) -> connect::Prepared {
+        use isekai_pipe_core::{BootstrapProvenance, ConnectionIntent, IntentTransport, ServerIdentity};
+
+        let bogus_pipe = std::env::temp_dir().join(format!("isekai-mux-dispatch-test-nonexistent-pipe-binary-{destination}"));
+        let plan = crate::wrapper::parse_wrapper(vec!["--isekai-pipe-path".to_string(), bogus_pipe.display().to_string(), destination.to_string()])
+            .expect("parse_wrapper");
+        let (resolution, host_config) = crate::wrapper::resolve_for_native(&plan).expect("resolve_for_native");
+        let intent = ConnectionIntent::new(
+            destination,
+            "ssh",
+            ServerIdentity { cert_sha256_hex: "ab".repeat(32) },
+            IntentTransport::Relay {
+                helper_addr: "203.0.113.5:45231".to_string(),
+                server_name: "isekai-helper".to_string(),
+                session_secret_b64: "c2VjcmV0".to_string(),
+            },
+            BootstrapProvenance::TrustStore { key: "example.com:22".to_string() },
+        );
+        connect::Prepared::for_test(plan, resolution, host_config, intent, runtime_dir.to_path_buf())
+    }
+
+    /// A holder spawn failure must degrade `dispatch` to a plain direct
+    /// connect, never a hard error of its own or a hang — the always-connects
+    /// principle for a mux hiccup. The direct connect itself then fails too
+    /// here (the bogus pipe path), but that's `test_prepared`'s own
+    /// deliberately-unreachable target, not the mux layer misbehaving.
+    #[tokio::test]
+    async fn dispatch_falls_back_to_a_direct_connect_when_spawning_the_holder_fails() {
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let prepared = test_prepared("dispatch-spawn-failure-host", runtime_dir.path());
+        let spawner = holder::tests_support::RecordingSpawner::failing();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatch::<InMemoryChannel, _>(prepared, vec!["dispatch-spawn-failure-host".to_string()], &spawner),
+        )
+        .await
+        .expect("dispatch must not hang when the holder spawn itself fails");
+
+        assert!(result.is_err(), "the fallback direct connect against the bogus pipe path must still fail here, but via the fallback, not a hang");
+        assert_eq!(spawner.calls.lock().unwrap().len(), 1, "dispatch must attempt to spawn a holder exactly once before falling back");
+    }
+
+    /// A holder that was spawned successfully but never actually claims the
+    /// channel (crashed before `try_claim`, or was simply slow) must not wedge
+    /// `dispatch` forever — it gives up once its own startup-wait deadline
+    /// elapses and falls back to a direct connect, same as a spawn failure.
+    #[tokio::test]
+    async fn dispatch_falls_back_to_a_direct_connect_when_the_spawned_holder_never_claims_the_channel() {
+        tokio::time::pause();
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let prepared = test_prepared("dispatch-holder-never-arrives-host", runtime_dir.path());
+        let spawner = holder::tests_support::RecordingSpawner::succeeding();
+
+        let result = tokio::time::timeout(
+            HOLDER_STARTUP_TIMEOUT + Duration::from_secs(5),
+            dispatch::<InMemoryChannel, _>(prepared, vec!["dispatch-holder-never-arrives-host".to_string()], &spawner),
+        )
+        .await
+        .expect("dispatch must give up waiting for the holder within its own startup timeout, not hang");
+
+        assert!(result.is_err(), "a holder that spawned but never claims the channel must fall back to a direct connect (which itself fails against the bogus pipe path here, but via the fallback path, not a hang)");
     }
 }
