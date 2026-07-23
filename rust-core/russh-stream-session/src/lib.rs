@@ -496,6 +496,55 @@ pub async fn authenticate_publickey_with_passphrase<H: client::Handler>(
     session.authenticate_publickey(username, Arc::new(key)).await.map_err(SessionError::Auth)
 }
 
+/// One server-issued prompt during a keyboard-interactive authentication
+/// round ("Password:", "Verification code:", ...). `echo` mirrors what the
+/// server told the client — `false` for anything sensitive (a password/OTP),
+/// `true` for e.g. a plain yes/no confirmation question — a caller reading
+/// from a real console should honor it (no local echo when `false`).
+#[derive(Debug, Clone)]
+pub struct KeyboardInteractivePrompt {
+    pub prompt: String,
+    pub echo: bool,
+}
+
+/// Authenticates `session` as `username` via `keyboard-interactive` — the
+/// method PAM-backed `sshd` configs and OTP/2FA setups typically negotiate
+/// instead of (or in addition to) plain `password`, which
+/// [`authenticate_session`]'s `Credential::Password` can't reach. A server
+/// may issue any number of rounds (zero, one, or several — e.g. a password
+/// round followed by a separate OTP round); `respond` is called once per
+/// round with that round's prompts and must return exactly one answer per
+/// prompt, in order. `Ok(false)` means the server rejected every round's
+/// answers (a clean "no", not an error); `Err` means the underlying SSH
+/// request itself failed (transport error).
+pub async fn authenticate_keyboard_interactive<H, F>(
+    session: &mut client::Handle<H>,
+    username: &str,
+    mut respond: F,
+) -> Result<bool, SessionError>
+where
+    H: client::Handler,
+    F: FnMut(&[KeyboardInteractivePrompt]) -> Vec<String>,
+{
+    let mut response =
+        session.authenticate_keyboard_interactive_start(username, None).await.map_err(SessionError::Auth)?;
+    loop {
+        match response {
+            client::KeyboardInteractiveAuthResponse::Success => return Ok(true),
+            client::KeyboardInteractiveAuthResponse::Failure => return Ok(false),
+            client::KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                let prompts: Vec<KeyboardInteractivePrompt> =
+                    prompts.into_iter().map(|p| KeyboardInteractivePrompt { prompt: p.prompt, echo: p.echo }).collect();
+                let answers = respond(&prompts);
+                response = session
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                    .map_err(SessionError::Auth)?;
+            }
+        }
+    }
+}
+
 /// Authenticates `session` as `username` by asking `signer` — typically a
 /// [`russh_keys::agent::client::AgentClient`] (russh provides a blanket
 /// [`russh::Signer`] impl for it, over any `AsyncRead + AsyncWrite`
@@ -888,6 +937,192 @@ mod tests {
             matches!(result, Err(SessionError::InvalidPrivateKey(_))),
             "a wrong passphrase must fail cleanly as InvalidPrivateKey, not panic or silently succeed: {result:?}"
         );
+    }
+
+    /// One-round keyboard-interactive server: on the first call (`response
+    /// == None`) issues a single non-echoed "Password:" prompt via
+    /// `Auth::Partial`; on the second call (the client's answer) accepts iff
+    /// it equals `accepted_answer`. Stands in for a typical PAM-backed sshd
+    /// negotiating `keyboard-interactive` instead of plain `password`.
+    #[derive(Clone)]
+    struct OneRoundKeyboardInteractiveServer {
+        accepted_answer: String,
+    }
+
+    impl server::Server for OneRoundKeyboardInteractiveServer {
+        type Handler = OneRoundKeyboardInteractiveHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> OneRoundKeyboardInteractiveHandler {
+            OneRoundKeyboardInteractiveHandler { accepted_answer: self.accepted_answer.clone() }
+        }
+    }
+
+    #[derive(Clone)]
+    struct OneRoundKeyboardInteractiveHandler {
+        accepted_answer: String,
+    }
+
+    #[async_trait]
+    impl server::Handler for OneRoundKeyboardInteractiveHandler {
+        type Error = russh::Error;
+
+        async fn auth_keyboard_interactive(
+            &mut self, _user: &str, _submethods: &str, response: Option<server::Response<'async_trait>>,
+        ) -> Result<Auth, Self::Error> {
+            match response {
+                None => Ok(Auth::Partial {
+                    name: "".into(),
+                    instructions: "".into(),
+                    prompts: std::borrow::Cow::Owned(vec![("Password: ".into(), false)]),
+                }),
+                Some(resp) => {
+                    let answers: Vec<Vec<u8>> = resp.map(|b| b.to_vec()).collect();
+                    let accepted = answers.first().map(|a| a.as_slice()) == Some(self.accepted_answer.as_bytes());
+                    Ok(if accepted { Auth::Accept } else { Auth::Reject { proceed_with_methods: None } })
+                }
+            }
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// Two-round keyboard-interactive server (password, then a separate OTP
+    /// round) — proves `authenticate_keyboard_interactive`'s loop actually
+    /// keeps going past the first `InfoRequest` rather than assuming exactly
+    /// one round.
+    #[derive(Clone)]
+    struct TwoRoundKeyboardInteractiveServer;
+
+    impl server::Server for TwoRoundKeyboardInteractiveServer {
+        type Handler = TwoRoundKeyboardInteractiveHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> TwoRoundKeyboardInteractiveHandler {
+            TwoRoundKeyboardInteractiveHandler { round: 0 }
+        }
+    }
+
+    struct TwoRoundKeyboardInteractiveHandler {
+        round: u32,
+    }
+
+    #[async_trait]
+    impl server::Handler for TwoRoundKeyboardInteractiveHandler {
+        type Error = russh::Error;
+
+        async fn auth_keyboard_interactive(
+            &mut self, _user: &str, _submethods: &str, response: Option<server::Response<'async_trait>>,
+        ) -> Result<Auth, Self::Error> {
+            match (self.round, response) {
+                (0, None) => {
+                    self.round = 1;
+                    Ok(Auth::Partial {
+                        name: "".into(),
+                        instructions: "".into(),
+                        prompts: std::borrow::Cow::Owned(vec![("Password: ".into(), false)]),
+                    })
+                }
+                (1, Some(resp)) => {
+                    let answers: Vec<Vec<u8>> = resp.map(|b| b.to_vec()).collect();
+                    if answers.first().map(|a| a.as_slice()) != Some(b"correct-password") {
+                        return Ok(Auth::Reject { proceed_with_methods: None });
+                    }
+                    self.round = 2;
+                    Ok(Auth::Partial {
+                        name: "".into(),
+                        instructions: "".into(),
+                        prompts: std::borrow::Cow::Owned(vec![("OTP: ".into(), true)]),
+                    })
+                }
+                (2, Some(resp)) => {
+                    let answers: Vec<Vec<u8>> = resp.map(|b| b.to_vec()).collect();
+                    let accepted = answers.first().map(|a| a.as_slice()) == Some(b"123456");
+                    Ok(if accepted { Auth::Accept } else { Auth::Reject { proceed_with_methods: None } })
+                }
+                _ => Ok(Auth::Reject { proceed_with_methods: None }),
+            }
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn keyboard_interactive_authentication_succeeds_with_the_right_answer() {
+        let addr = spawn_server(OneRoundKeyboardInteractiveServer { accepted_answer: "hunter2".to_string() }, 30).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let mut calls = 0u32;
+        let authed = authenticate_keyboard_interactive(&mut session.handle, "tester", |prompts| {
+            calls += 1;
+            assert_eq!(prompts.len(), 1);
+            assert!(!prompts[0].echo, "a password-style prompt must not echo");
+            vec!["hunter2".to_string()]
+        })
+        .await
+        .expect("keyboard-interactive request itself must not error");
+        assert!(authed);
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn keyboard_interactive_authentication_is_rejected_cleanly_with_the_wrong_answer() {
+        let addr = spawn_server(OneRoundKeyboardInteractiveServer { accepted_answer: "hunter2".to_string() }, 31).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let authed =
+            authenticate_keyboard_interactive(&mut session.handle, "tester", |_prompts| vec!["wrong".to_string()])
+                .await
+                .expect("a rejected credential is Ok(false), not an error");
+        assert!(!authed);
+    }
+
+    #[tokio::test]
+    async fn keyboard_interactive_authentication_handles_multiple_rounds() {
+        let addr = spawn_server(TwoRoundKeyboardInteractiveServer, 32).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let mut round = 0u32;
+        let authed = authenticate_keyboard_interactive(&mut session.handle, "tester", |prompts| {
+            round += 1;
+            match round {
+                1 => {
+                    assert!(!prompts[0].echo);
+                    vec!["correct-password".to_string()]
+                }
+                2 => {
+                    assert!(prompts[0].echo, "the OTP round in this test server echoes");
+                    vec!["123456".to_string()]
+                }
+                _ => panic!("unexpected third round"),
+            }
+        })
+        .await
+        .expect("keyboard-interactive request itself must not error");
+        assert!(authed, "both rounds answered correctly must authenticate");
+        assert_eq!(round, 2, "the loop must keep going past the first InfoRequest");
     }
 
     struct RejectAllHostKeys;

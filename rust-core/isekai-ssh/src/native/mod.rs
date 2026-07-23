@@ -13,5 +13,6 @@ pub(crate) mod console;
 pub(crate) mod console_stdin;
 pub(crate) mod escape;
 pub(crate) mod host_key_trust;
+pub(crate) mod keyboard_interactive;
 pub(crate) mod mux;
 pub(crate) mod private_key;

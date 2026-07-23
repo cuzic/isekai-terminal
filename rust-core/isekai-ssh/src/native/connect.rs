@@ -41,8 +41,9 @@ use async_trait::async_trait;
 use isekai_pipe_core::{claim_connect_outcome, default_runtime_dir, ConnectionIntent};
 use russh::client;
 use russh_stream_session::{
-    authenticate_publickey_with_passphrase, authenticate_session, establish_over_stream, open_channel,
-    verifying_handler_with_routes_and_reason, Credential, ForwardRoutes, RejectionReason, SessionError, SessionKind,
+    authenticate_keyboard_interactive, authenticate_publickey_with_passphrase, authenticate_session,
+    establish_over_stream, open_channel, verifying_handler_with_routes_and_reason, Credential, ForwardRoutes,
+    KeyboardInteractivePrompt, RejectionReason, SessionError, SessionKind,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -62,6 +63,7 @@ use super::console;
 use super::console_stdin;
 use super::escape::{process_stdin_bytes, EscapeAction};
 use super::host_key_trust::FileBackedHostKeyVerifier;
+use super::keyboard_interactive;
 use super::private_key;
 
 /// The concrete `russh` client handle this native path establishes — an
@@ -515,12 +517,28 @@ async fn run_authenticated_session(
         Arc::new(console::prompt_passphrase)
     };
 
+    // Same silent-aware seam again, for keyboard-interactive (PAM/OTP/2FA):
+    // a silent/automated retry must never block waiting on a live server
+    // prompt it can't answer.
+    let kbi_responder: Arc<dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync> = if silent {
+        Arc::new(|prompts: &[KeyboardInteractivePrompt]| {
+            log_line!(
+                "isekai-ssh: server requested keyboard-interactive authentication in a silent/automated retry \
+                 — refusing without prompting. Run this connection from an interactive terminal once."
+            );
+            vec![String::new(); prompts.len()]
+        })
+    } else {
+        Arc::new(keyboard_interactive::console_responder)
+    };
+    let prompts = InteractivePrompts { passphrase: &*prompt_passphrase, keyboard_interactive: &*kbi_responder };
+
     // The ctl-socket route table the handler dispatches forwarded-streamlocal
     // channels through — one per connection, shared by this process's own
     // foreground shell and (via the owner hook) every mux client's per-tab
     // forward. Built before the handshake so it can be installed on the handler.
     let forward_routes = ForwardRoutes::new();
-    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier, &forward_routes, &*prompt_passphrase)
+    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier, &forward_routes, &prompts)
         .await
         .with_context(|| format!("isekai-ssh: failed to connect to {username}@{host_port}"))?;
 
@@ -680,6 +698,21 @@ fn prompt_new_host_confirmation(host_port: &str, fingerprint: &str) -> bool {
     matches!(line.trim(), "yes" | "y" | "Y")
 }
 
+/// Bundles the two callbacks [`connect_and_authenticate`] needs for
+/// authentication methods that may require live user input: a
+/// passphrase-protected identity file, and `keyboard-interactive` (PAM/OTP/2FA
+/// servers that don't negotiate plain `password`). Both are built once by
+/// `run_authenticated_session` and, when built for a silent/automated retry,
+/// both refuse to prompt at all rather than block on a live-but-answerless
+/// stdin — the same seam `confirm_new_host` already uses for host-key TOFU
+/// confirmation. Bundled into one struct instead of two more `&dyn Fn`
+/// parameters purely to keep [`connect_and_authenticate`]'s already-long
+/// signature from growing further.
+struct InteractivePrompts<'a> {
+    passphrase: &'a (dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
+    keyboard_interactive: &'a (dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync),
+}
+
 /// Establishes the SSH handshake over `stream` and authenticates as
 /// `username`, trying (in order) *every* configured/default private key from
 /// `host_config::identity_file`/the default `id_ed25519`→`id_rsa`→`id_ecdsa`
@@ -708,7 +741,7 @@ async fn connect_and_authenticate<S, V>(
     host_config: &openssh_config::HostConfig,
     verifier: &Arc<V>,
     forward_routes: &ForwardRoutes,
-    prompt_passphrase: &(dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
+    prompts: &InteractivePrompts<'_>,
 ) -> Result<client::Handle<russh_stream_session::VerifyingHandler<V>>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -767,7 +800,7 @@ where
                 let Credential::PublicKey { private_key_pem } = &credential else {
                     continue; // unreachable: EncryptedPrivateKey only comes from the PublicKey arm
                 };
-                if try_encrypted_identity(&mut handle, username, candidate, private_key_pem, prompt_passphrase).await? {
+                if try_encrypted_identity(&mut handle, username, candidate, private_key_pem, prompts.passphrase).await? {
                     return Ok(handle);
                 }
             }
@@ -776,6 +809,20 @@ where
     }
 
     if try_agent_auth(&mut handle, username, host_config).await? {
+        return Ok(handle);
+    }
+
+    // Last resort: keyboard-interactive (PAM/OTP/2FA-style servers that don't
+    // negotiate plain `password` at all). Tried after every key and the agent
+    // since it's the one method that's neither "prove possession of a key
+    // file" nor silent — matches `ssh(1)`'s own `PreferredAuthentications`
+    // ordering (publickey before keyboard-interactive/password).
+    if authenticate_keyboard_interactive(&mut handle, username, |server_prompts| {
+        (prompts.keyboard_interactive)(server_prompts)
+    })
+    .await
+    .map_err(|e| anyhow::Error::new(e).context("SSH authentication request failed"))?
+    {
         return Ok(handle);
     }
 
@@ -1056,6 +1103,20 @@ mod tests {
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
+    /// A [`InteractivePrompts`] that never prompts (passphrase: `None`;
+    /// keyboard-interactive: no answers) — the right default for every test
+    /// that isn't itself exercising one of these two interactive paths, same
+    /// as a silent/automated retry in production.
+    fn no_passphrase_prompt(_path: &Path, _attempt: u32) -> Option<String> {
+        None
+    }
+    fn no_kbi_responder(_prompts: &[KeyboardInteractivePrompt]) -> Vec<String> {
+        Vec::new()
+    }
+    fn no_interactive_prompts() -> InteractivePrompts<'static> {
+        InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &no_kbi_responder }
+    }
+
     struct AcceptAllHostKeys;
     #[async_trait]
     impl HostKeyVerifier for AcceptAllHostKeys {
@@ -1095,6 +1156,56 @@ mod tests {
 
         async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
             Ok(if password == self.accepted_password { Auth::Accept } else { Auth::Reject { proceed_with_methods: None } })
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// Accepts *only* keyboard-interactive (rejects password/publickey
+    /// outright), with a single non-echoed prompt — stands in for a
+    /// PAM-backed sshd that doesn't negotiate plain `password` at all, so
+    /// `connect_and_authenticate` must fall all the way through to its
+    /// keyboard-interactive last resort.
+    #[derive(Clone)]
+    struct KeyboardInteractiveOnlyServer {
+        accepted_answer: String,
+    }
+
+    impl server::Server for KeyboardInteractiveOnlyServer {
+        type Handler = KeyboardInteractiveOnlyHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> KeyboardInteractiveOnlyHandler {
+            KeyboardInteractiveOnlyHandler { accepted_answer: self.accepted_answer.clone() }
+        }
+    }
+
+    #[derive(Clone)]
+    struct KeyboardInteractiveOnlyHandler {
+        accepted_answer: String,
+    }
+
+    #[async_trait]
+    impl server::Handler for KeyboardInteractiveOnlyHandler {
+        type Error = russh::Error;
+
+        async fn auth_keyboard_interactive(
+            &mut self, _user: &str, _submethods: &str, response: Option<server::Response<'async_trait>>,
+        ) -> Result<Auth, Self::Error> {
+            match response {
+                None => Ok(Auth::Partial {
+                    name: "".into(),
+                    instructions: "".into(),
+                    prompts: std::borrow::Cow::Owned(vec![("Password: ".into(), false)]),
+                }),
+                Some(resp) => {
+                    let answers: Vec<Vec<u8>> = resp.map(|b| b.to_vec()).collect();
+                    let accepted = answers.first().map(|a| a.as_slice()) == Some(self.accepted_answer.as_bytes());
+                    Ok(if accepted { Auth::Accept } else { Auth::Reject { proceed_with_methods: None } })
+                }
+            }
         }
 
         async fn channel_open_session(
@@ -1332,7 +1443,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(result.is_err(), "no identity file and no agent means nothing to authenticate with");
     }
 
@@ -1343,7 +1454,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let Err(err) = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await
+        let Err(err) = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await
         else {
             panic!("a rejected host key must fail the connection before any auth attempt");
         };
@@ -1452,7 +1563,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, second_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(
             result.is_ok(),
             "the second configured identity is accepted, so the connection must succeed despite the first being rejected"
@@ -1477,7 +1588,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![garbage, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(result.is_ok(), "an unparseable first identity (InvalidPrivateKey) must not block the valid second one");
     }
 
@@ -1500,7 +1611,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, unreadable], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(
             result.is_ok(),
             "a readable, accepted first key must authenticate; an unreadable *later* candidate must not abort the attempt"
@@ -1521,7 +1632,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![unreadable, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(result.is_ok(), "an unreadable first candidate must be skipped, then the valid second one authenticates");
     }
 
@@ -1534,11 +1645,9 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
 
-        let result = connect_and_authenticate(
-            stream, "tester", &host_config, &verifier, &ForwardRoutes::new(),
-            &|_path, _attempt| Some("hunter2".to_string()),
-        )
-        .await;
+        let passphrase_prompt = |_path: &Path, _attempt: u32| Some("hunter2".to_string());
+        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder };
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
         assert!(result.is_ok(), "the right passphrase must decrypt and authenticate: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
     }
 
@@ -1556,7 +1665,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(result.is_err(), "a silently-refused passphrase prompt must fail cleanly, not hang or panic");
     }
 
@@ -1636,6 +1745,36 @@ mod tests {
         let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, &prompt).await.unwrap();
         assert!(!ok, "3 wrong passphrases in a row must give up, not retry forever");
         assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_falls_through_to_keyboard_interactive_when_nothing_else_is_configured() {
+        let addr = spawn_server(KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string() }, 220).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // No identity_file configured and no agent on Linux, so this proves
+        // the fall-through all the way to keyboard-interactive.
+        let host_config = openssh_config::HostConfig::default();
+        let kbi_responder = |_prompts: &[KeyboardInteractivePrompt]| vec!["hunter2".to_string()];
+        let prompts = InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &kbi_responder };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
+        assert!(result.is_ok(), "keyboard-interactive with the right answer must authenticate: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_fails_cleanly_when_keyboard_interactive_is_silently_refused() {
+        // Stands in for `run_authenticated_session`'s silent/automated retry
+        // seam: the kbi responder always returns empty answers (never blocks
+        // on a live server prompt it can't answer), so the overall attempt
+        // fails cleanly rather than hanging.
+        let addr = spawn_server(KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string() }, 221).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig::default();
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
+        assert!(result.is_err(), "a silently-refused keyboard-interactive prompt must fail cleanly, not hang or panic");
     }
 
     /// The cheap, reliable branch of the "always-connects" recovery
