@@ -151,9 +151,20 @@ where
         Some(Ok(Some(other))) => {
             return Ok(ClientOutcome::Rejected { reason: format!("expected HelloAck from the owner, got {other:?}") })
         }
-        // Owner vanished during the handshake — treat as owner-lost so the
-        // user gets the reconnect guidance rather than an opaque error.
-        Some(Ok(None)) | Some(Err(_)) | None => return Ok(ClientOutcome::OwnerLost),
+        // The owner connection dropped *during the handshake* — before any
+        // shell session ever existed. Unlike a mid-session drop (below, in
+        // the main loop), nothing was lost here, so this must be `Rejected`
+        // (safe to fall back to a direct connect), not `OwnerLost` (which the
+        // caller maps to a hard exit code with reconnect guidance). This
+        // matters specifically for a foreground tab that just spawned a
+        // detached holder (`ControlPersist`-equivalent, `native/mux/holder.rs`):
+        // the holder may still be silently authenticating (or may fail to,
+        // e.g. a passphrase/keyboard-interactive prompt it can't answer) when
+        // this tab's `try_claim`-losing connect races ahead of it — that must
+        // degrade to an ordinary direct connect, not a scary "owner lost" exit.
+        Some(Ok(None)) | Some(Err(_)) | None => {
+            return Ok(ClientOutcome::Rejected { reason: "the owner connection was lost during the handshake".to_string() })
+        }
     }
 
     let mut buf = [0u8; 8192];
@@ -362,6 +373,28 @@ mod tests {
         assert_eq!(outcome.unwrap(), ClientOutcome::Exited(7));
         assert_eq!(stdout, b"out", "Stdout frames must land on local stdout");
         assert_eq!(stderr, b"err", "Stderr frames must land on local stderr, not stdout");
+    }
+
+    /// The owner connection drops *before ever sending HelloAck* (e.g. a
+    /// just-spawned `ControlPersist`-equivalent holder that's still silently
+    /// authenticating, or failed to and exited) — must be `Rejected`, not
+    /// `OwnerLost`: no shell session ever existed, so it's always safe for
+    /// the caller to fall back to a direct connect (`always-connects.md`).
+    #[tokio::test]
+    async fn client_treats_a_drop_before_hello_ack_as_rejected_not_owner_lost() {
+        let (outcome, _out, _err) = drive_client(b"", |owner_conn| {
+            tokio::spawn(async move {
+                let (mut r, _w) = tokio::io::split(owner_conn);
+                let _ = read_frame(&mut r).await; // consume Hello
+                // Drop immediately, without ever sending HelloAck/Rejected.
+            })
+        })
+        .await;
+
+        match outcome.unwrap() {
+            ClientOutcome::Rejected { .. } => {}
+            other => panic!("a pre-HelloAck drop must be Rejected (safe to fall back), got {other:?}"),
+        }
     }
 
     /// The owner drops the connection without ever sending an `Exit` — the
