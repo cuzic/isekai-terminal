@@ -491,15 +491,15 @@ mod tests {
         let count = AtomicUsize::new(0);
         let notify = Notify::new();
         let start = tokio::time::Instant::now();
-        wait_for_idle_exit(&count, &notify, Duration::from_millis(20)).await;
-        assert!(start.elapsed() >= Duration::from_millis(20), "must actually wait out the grace period");
+        wait_for_idle_exit(&count, &notify, Duration::from_millis(200)).await;
+        assert!(start.elapsed() >= Duration::from_millis(200), "must actually wait out the grace period");
     }
 
     #[tokio::test]
     async fn wait_for_idle_exit_never_resolves_while_the_count_is_nonzero() {
         let count = AtomicUsize::new(1);
         let notify = Notify::new();
-        let result = tokio::time::timeout(Duration::from_millis(100), wait_for_idle_exit(&count, &notify, Duration::from_millis(20))).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), wait_for_idle_exit(&count, &notify, Duration::from_millis(200))).await;
         assert!(result.is_err(), "must not resolve while a client is still counted as active");
     }
 
@@ -513,21 +513,32 @@ mod tests {
         // Simulate: a new client connects shortly after the wait starts (resetting
         // the grace), then leaves again — the *second* zero-to-grace window is
         // what must actually elapse before the wait resolves.
+        //
+        // Real wall-clock delays (not `tokio::time::pause`/`advance`), so
+        // these must be generous enough to survive real CI scheduling
+        // jitter — a real `test-windows` CI failure (2026-07-23) showed the
+        // original 10ms/10ms/30ms scale losing this exact race under load
+        // (the spawned task's own `sleep(10ms)` arriving late enough to miss
+        // the first grace window entirely, which just makes this test
+        // falsely fail, not a real bug in `wait_for_idle_exit` itself — see
+        // this crate's own established "generous timing under CI load"
+        // convention, e.g. `rust-quic-test-flakiness-under-load`-style
+        // fixes elsewhere in this workspace). 20x the original scale.
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             count2.fetch_add(1, Ordering::SeqCst);
             notify2.notify_one();
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             count2.fetch_sub(1, Ordering::SeqCst);
             notify2.notify_one();
         });
 
         let start = tokio::time::Instant::now();
-        wait_for_idle_exit(&count, &notify, Duration::from_millis(30)).await;
-        // Must have waited past the point the client disconnected (~20ms) plus
-        // its own grace window (30ms) — comfortably more than the naive
-        // (wrong) "first grace window from t=0" would give (30ms).
-        assert!(start.elapsed() >= Duration::from_millis(45), "a new client arriving must reset the idle-exit grace, not just be ignored");
+        wait_for_idle_exit(&count, &notify, Duration::from_millis(300)).await;
+        // Must have waited past the point the client disconnected (~400ms)
+        // plus its own grace window (300ms) — comfortably more than the
+        // naive (wrong) "first grace window from t=0" would give (300ms).
+        assert!(start.elapsed() >= Duration::from_millis(650), "a new client arriving must reset the idle-exit grace, not just be ignored");
     }
 
     // -- serve_clients idle-exit end-to-end (InMemoryChannel) ---------------
