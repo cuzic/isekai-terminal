@@ -177,15 +177,22 @@ mod tests {
 
     #[test]
     fn save_creates_a_private_directory() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("isekai-ssh");
         let path = config_dir.join(BUILD_PROFILES_FILE_NAME);
         save_build_profiles(&path, &BuildProfileStore::default()).unwrap();
 
-        let mode = fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
+        // `isekai_fs_guard::ensure_private_dir`'s Unix-only chmod is exactly
+        // what this asserts; Windows restricts via ACLs instead (no `mode()`
+        // to compare) — same platform split `native/mux/mod.rs`'s
+        // `token_write_then_read_round_trips_and_is_restricted` test uses for
+        // the analogous private-file-permissions check.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
         assert!(path.exists());
     }
 
