@@ -209,7 +209,13 @@ fn classify_session_error(err: &russh_stream_session::SessionError) -> Option<Bo
         S::Connect { .. } | S::JumpTunnel { .. } | S::JumpHandshake { .. } | S::Handshake(_) | S::Channel(_) => {
             Some(BootstrapFailure::JumpHostUnreachable)
         }
-        S::JumpAuthFailed { .. } | S::Auth(_) | S::AgentAuth(_) | S::InvalidPrivateKey(_) => {
+        // `EncryptedPrivateKey` lands in the same bucket as `InvalidPrivateKey`:
+        // this bootstrap-time classifier has no passphrase-prompting of its own
+        // (that's `isekai-ssh::native::connect`'s job, for the target-host
+        // connection this classifier doesn't cover), so from here a
+        // passphrase-protected key is just as unusable without manual
+        // intervention as a malformed one.
+        S::JumpAuthFailed { .. } | S::Auth(_) | S::AgentAuth(_) | S::InvalidPrivateKey(_) | S::EncryptedPrivateKey => {
             Some(BootstrapFailure::AuthenticationRequired)
         }
     }

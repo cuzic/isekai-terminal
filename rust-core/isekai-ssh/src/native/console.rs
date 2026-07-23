@@ -328,6 +328,40 @@ pub(crate) fn build_terminal_modes() -> Vec<(russh::Pty, u32)> {
     ]
 }
 
+/// Prompts (no local echo, like `ssh(1)`'s own passphrase prompt) for the
+/// passphrase to decrypt `identity_path`. `attempt` is 1-based and only
+/// changes the prompt wording (a retry after a wrong passphrase says so) —
+/// the caller owns the retry-count/give-up policy
+/// (`native::connect::try_encrypted_identity`), not this function. Returns
+/// `None` if the prompt itself fails (no real terminal attached, stdin
+/// closed) or the user enters an empty line (treated as "give up on this
+/// key", matching `ssh(1)`'s own behavior of moving on rather than trying to
+/// authenticate with an empty passphrase). Uses `rpassword` rather than
+/// hand-rolling no-echo input the way [`RawModeGuard`] does for the *whole*
+/// session's raw mode — password prompting is exactly the well-solved
+/// cross-platform problem `rpassword` exists for (same "don't reimplement a
+/// solved problem" stance this module already takes for `crossterm`'s raw
+/// mode, see the module doc comment).
+///
+/// **Only meaningfully exercised against a real interactive terminal** —
+/// like [`RawModeGuard::enable`], `rpassword`'s no-echo read needs a real
+/// console/tty this sandboxed environment isn't attached to; the retry-count
+/// policy this wraps is unit-tested separately in `native::connect` via an
+/// injected prompt closure instead of calling this function directly.
+pub(crate) fn prompt_passphrase(identity_path: &std::path::Path, attempt: u32) -> Option<String> {
+    let prompt = if attempt == 1 {
+        format!("Enter passphrase for key '{}': ", identity_path.display())
+    } else {
+        format!("Enter passphrase for key '{}' (attempt {attempt}): ", identity_path.display())
+    };
+    let passphrase = rpassword::prompt_password(prompt).ok()?;
+    if passphrase.is_empty() {
+        None
+    } else {
+        Some(passphrase)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -43,6 +43,8 @@ pub enum SessionError {
     Channel(russh::Error),
     #[error("private key could not be parsed as OpenSSH format: {0}")]
     InvalidPrivateKey(russh_keys::ssh_key::Error),
+    #[error("private key is passphrase-protected and needs to be decrypted before use")]
+    EncryptedPrivateKey,
     #[error("authentication request failed: {0}")]
     Auth(russh::Error),
     #[error("agent-backed authentication failed: {0}")]
@@ -448,6 +450,14 @@ pub fn verifying_handler_with_routes_and_reason<V: HostKeyVerifier + 'static>(
 /// private key) or the underlying SSH request itself failed (transport
 /// error). Does not zeroize `credential` — call [`Credential::zeroize`]
 /// once you're done with it.
+///
+/// A passphrase-protected `Credential::PublicKey` is detected (via
+/// `PrivateKey::is_encrypted`) *before* ever attempting to authenticate with
+/// it, and reported as `Err(SessionError::EncryptedPrivateKey)` rather than
+/// `SessionError::InvalidPrivateKey` — the caller can react to that
+/// specifically (e.g. prompt for a passphrase and retry via
+/// [`authenticate_publickey_with_passphrase`]) instead of treating an
+/// encrypted key exactly like a malformed one.
 pub async fn authenticate_session<H: client::Handler>(
     session: &mut client::Handle<H>,
     username: &str,
@@ -459,9 +469,31 @@ pub async fn authenticate_session<H: client::Handler>(
         }
         Credential::PublicKey { private_key_pem } => {
             let key = PrivateKey::from_openssh(private_key_pem).map_err(SessionError::InvalidPrivateKey)?;
+            if key.is_encrypted() {
+                return Err(SessionError::EncryptedPrivateKey);
+            }
             session.authenticate_publickey(username, Arc::new(key)).await.map_err(SessionError::Auth)
         }
     }
+}
+
+/// Like [`authenticate_session`]'s `Credential::PublicKey` arm, but for a key
+/// that [`authenticate_session`] has already reported as
+/// [`SessionError::EncryptedPrivateKey`] — decrypts `private_key_pem` with
+/// `passphrase` first, then authenticates with the decrypted key.
+/// `Err(SessionError::InvalidPrivateKey)` covers both an unparseable key and
+/// a wrong passphrase (`ssh_key`'s `decrypt` doesn't distinguish the two any
+/// further) — either way the right caller action is the same: ask for a
+/// different passphrase (or give up on this candidate).
+pub async fn authenticate_publickey_with_passphrase<H: client::Handler>(
+    session: &mut client::Handle<H>,
+    username: &str,
+    private_key_pem: &[u8],
+    passphrase: &str,
+) -> Result<bool, SessionError> {
+    let encrypted = PrivateKey::from_openssh(private_key_pem).map_err(SessionError::InvalidPrivateKey)?;
+    let key = encrypted.decrypt(passphrase).map_err(SessionError::InvalidPrivateKey)?;
+    session.authenticate_publickey(username, Arc::new(key)).await.map_err(SessionError::Auth)
 }
 
 /// Authenticates `session` as `username` by asking `signer` — typically a
@@ -783,6 +815,78 @@ mod tests {
         assert!(
             matches!(result, Err(SessionError::InvalidPrivateKey(_))),
             "malformed key material should surface as InvalidPrivateKey, not a silent false: {result:?}"
+        );
+    }
+
+    /// Generates a fresh ed25519 key encrypted with `passphrase`, returning
+    /// its OpenSSH PEM bytes — a real encrypted key, not a hand-rolled
+    /// fixture, so `is_encrypted()`/`decrypt()` exercise the same `ssh_key`
+    /// code path a real user's `~/.ssh/id_ed25519` would.
+    fn write_encrypted_ed25519_pem(seed: u8, passphrase: &str) -> Vec<u8> {
+        let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let key = PrivateKey::from(keypair);
+        let encrypted = key.encrypt(&mut rand::rngs::OsRng, passphrase).expect("encrypt a freshly generated key");
+        encrypted.to_openssh(Default::default()).unwrap().as_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn authenticate_session_reports_encrypted_private_key_without_ever_dialing_auth() {
+        let addr = spawn_server(EchoExecServer, 20).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let pem = write_encrypted_ed25519_pem(101, "correct horse battery staple");
+        let result = authenticate_session(
+            &mut session.handle, "tester", &Credential::PublicKey { private_key_pem: pem },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SessionError::EncryptedPrivateKey)),
+            "an encrypted key must be reported distinctly from a malformed one: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_publickey_with_passphrase_succeeds_with_the_right_passphrase() {
+        let addr = spawn_server(EchoExecServer, 21).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let pem = write_encrypted_ed25519_pem(102, "correct horse battery staple");
+        let authed = authenticate_publickey_with_passphrase(
+            &mut session.handle, "tester", &pem, "correct horse battery staple",
+        )
+        .await
+        .expect("the right passphrase should decrypt and authenticate cleanly");
+        assert!(authed, "the server accepts any public key");
+    }
+
+    #[tokio::test]
+    async fn authenticate_publickey_with_passphrase_fails_cleanly_with_the_wrong_passphrase() {
+        let addr = spawn_server(EchoExecServer, 22).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let pem = write_encrypted_ed25519_pem(103, "correct horse battery staple");
+        let result = authenticate_publickey_with_passphrase(&mut session.handle, "tester", &pem, "wrong passphrase").await;
+        assert!(
+            matches!(result, Err(SessionError::InvalidPrivateKey(_))),
+            "a wrong passphrase must fail cleanly as InvalidPrivateKey, not panic or silently succeed: {result:?}"
         );
     }
 

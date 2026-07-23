@@ -41,8 +41,8 @@ use async_trait::async_trait;
 use isekai_pipe_core::{claim_connect_outcome, default_runtime_dir, ConnectionIntent};
 use russh::client;
 use russh_stream_session::{
-    authenticate_session, establish_over_stream, open_channel, verifying_handler_with_routes_and_reason, ForwardRoutes,
-    RejectionReason, SessionError, SessionKind,
+    authenticate_publickey_with_passphrase, authenticate_session, establish_over_stream, open_channel,
+    verifying_handler_with_routes_and_reason, Credential, ForwardRoutes, RejectionReason, SessionError, SessionKind,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -497,12 +497,30 @@ async fn run_authenticated_session(
     };
     let verifier = Arc::new(FileBackedHostKeyVerifier::new(store_path, host_port.clone(), confirm_new_host));
 
+    // Same silent-aware seam as `confirm_new_host` above, for a
+    // passphrase-protected identity file: a silent/automated retry must never
+    // block on a live-but-answerless stdin, so it just logs an actionable
+    // message and lets the candidate loop move on (next identity, then the
+    // SSH agent) instead of prompting.
+    let prompt_passphrase: Arc<dyn Fn(&Path, u32) -> Option<String> + Send + Sync> = if silent {
+        Arc::new(|path: &Path, _attempt: u32| {
+            log_line!(
+                "isekai-ssh: identity file {} is passphrase-protected; skipping in a silent/automated retry \
+                 — run this connection from an interactive terminal once to unlock it.",
+                path.display()
+            );
+            None
+        })
+    } else {
+        Arc::new(console::prompt_passphrase)
+    };
+
     // The ctl-socket route table the handler dispatches forwarded-streamlocal
     // channels through — one per connection, shared by this process's own
     // foreground shell and (via the owner hook) every mux client's per-tab
     // forward. Built before the handshake so it can be installed on the handler.
     let forward_routes = ForwardRoutes::new();
-    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier, &forward_routes)
+    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier, &forward_routes, &*prompt_passphrase)
         .await
         .with_context(|| format!("isekai-ssh: failed to connect to {username}@{host_port}"))?;
 
@@ -690,6 +708,7 @@ async fn connect_and_authenticate<S, V>(
     host_config: &openssh_config::HostConfig,
     verifier: &Arc<V>,
     forward_routes: &ForwardRoutes,
+    prompt_passphrase: &(dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
 ) -> Result<client::Handle<russh_stream_session::VerifyingHandler<V>>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -744,6 +763,14 @@ where
             Ok(true) => return Ok(handle),
             Ok(false) => continue,
             Err(SessionError::InvalidPrivateKey(_)) => continue,
+            Err(SessionError::EncryptedPrivateKey) => {
+                let Credential::PublicKey { private_key_pem } = &credential else {
+                    continue; // unreachable: EncryptedPrivateKey only comes from the PublicKey arm
+                };
+                if try_encrypted_identity(&mut handle, username, candidate, private_key_pem, prompt_passphrase).await? {
+                    return Ok(handle);
+                }
+            }
             Err(e) => return Err(anyhow::Error::new(e).context("SSH authentication request failed")),
         }
     }
@@ -755,6 +782,37 @@ where
     Err(anyhow!(
         "no configured private key or SSH agent identity was accepted for {username}"
     ))
+}
+
+/// Handles one candidate identity file that [`authenticate_session`] has
+/// reported as passphrase-protected (`SessionError::EncryptedPrivateKey`).
+/// Prompts (via `prompt_passphrase`) up to 3 times — matching `ssh(1)`'s own
+/// passphrase-retry convention — trying [`authenticate_publickey_with_passphrase`]
+/// with each answer. `prompt_passphrase` returning `None` (the caller gave up,
+/// or — in silent/automated mode — refuses to prompt at all, see
+/// `run_authenticated_session`'s construction of it) stops the retry loop
+/// immediately and moves on to the next candidate/the SSH agent, exactly like
+/// exhausting the retry count does.
+async fn try_encrypted_identity<H: client::Handler>(
+    handle: &mut client::Handle<H>,
+    username: &str,
+    path: &Path,
+    private_key_pem: &[u8],
+    prompt_passphrase: &(dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
+) -> Result<bool> {
+    for attempt in 1..=3 {
+        let Some(passphrase) = prompt_passphrase(path, attempt) else {
+            return Ok(false);
+        };
+        match authenticate_publickey_with_passphrase(handle, username, private_key_pem, &passphrase).await {
+            Ok(true) => return Ok(true),
+            Ok(false) => return Ok(false), // server rejected the (successfully decrypted) key — not a passphrase problem
+            Err(SessionError::InvalidPrivateKey(_)) => continue, // wrong passphrase (or truly malformed key): retry
+            Err(e) => return Err(anyhow::Error::new(e).context("SSH authentication request failed")),
+        }
+    }
+    log_line!("isekai-ssh: too many failed passphrase attempts for {}", path.display());
+    Ok(false)
 }
 
 #[cfg(windows)]
@@ -1059,6 +1117,21 @@ mod tests {
         (path, private.public_key().clone())
     }
 
+    /// Like [`write_ed25519_identity`], but encrypts the key with `passphrase`
+    /// first — a real encrypted OpenSSH key, exercising the same
+    /// `is_encrypted`/`decrypt` code path a real user's passphrase-protected
+    /// `~/.ssh/id_ed25519` would.
+    fn write_encrypted_ed25519_identity(dir: &Path, name: &str, seed: u8, passphrase: &str) -> (PathBuf, SshPublicKey) {
+        let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let private = SshPrivateKey::from(keypair);
+        let public = private.public_key().clone();
+        let encrypted = private.encrypt(&mut rand::rngs::OsRng, passphrase).expect("encrypt a freshly generated key");
+        let pem = encrypted.to_openssh(LineEnding::LF).expect("serialize encrypted ed25519 key to OpenSSH PEM");
+        let path = dir.join(name);
+        std::fs::write(&path, pem.as_bytes()).unwrap();
+        (path, public)
+    }
+
     /// Accepts publickey auth for exactly one configured public key (rejecting
     /// every other key), and accepts session-channel opens. Lets a test prove
     /// `connect_and_authenticate` offers each configured identity in turn: a
@@ -1259,7 +1332,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
         assert!(result.is_err(), "no identity file and no agent means nothing to authenticate with");
     }
 
@@ -1270,7 +1343,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let Err(err) = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await
+        let Err(err) = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await
         else {
             panic!("a rejected host key must fail the connection before any auth attempt");
         };
@@ -1379,7 +1452,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, second_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
         assert!(
             result.is_ok(),
             "the second configured identity is accepted, so the connection must succeed despite the first being rejected"
@@ -1404,7 +1477,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![garbage, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
         assert!(result.is_ok(), "an unparseable first identity (InvalidPrivateKey) must not block the valid second one");
     }
 
@@ -1427,7 +1500,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, unreadable], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
         assert!(
             result.is_ok(),
             "a readable, accepted first key must authenticate; an unreadable *later* candidate must not abort the attempt"
@@ -1448,8 +1521,121 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![unreadable, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
         assert!(result.is_ok(), "an unreadable first candidate must be skipped, then the valid second one authenticates");
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_succeeds_with_an_encrypted_identity_via_the_right_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 210, "hunter2");
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 209).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
+
+        let result = connect_and_authenticate(
+            stream, "tester", &host_config, &verifier, &ForwardRoutes::new(),
+            &|_path, _attempt| Some("hunter2".to_string()),
+        )
+        .await;
+        assert!(result.is_ok(), "the right passphrase must decrypt and authenticate: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_fails_cleanly_when_the_passphrase_prompt_is_refused() {
+        // Stands in for `run_authenticated_session`'s silent/automated retry
+        // seam: the prompt closure always returns `None` (never blocks on
+        // stdin), so an encrypted identity is simply skipped and the overall
+        // attempt fails with the same "nothing was accepted" error a plain
+        // missing key would produce — no hang, no panic.
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 211, "hunter2");
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 210).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &|_, _| None).await;
+        assert!(result.is_err(), "a silently-refused passphrase prompt must fail cleanly, not hang or panic");
+    }
+
+    #[tokio::test]
+    async fn try_encrypted_identity_succeeds_on_the_first_correct_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 212, "hunter2");
+        let pem = std::fs::read(&path).unwrap();
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 211).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let mut handle = establish_over_stream(config, stream, verifying_handler(&verifier)).await.unwrap();
+
+        let calls = std::sync::Mutex::new(0u32);
+        let prompt = |_path: &Path, _attempt: u32| -> Option<String> {
+            *calls.lock().unwrap() += 1;
+            Some("hunter2".to_string())
+        };
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, &prompt).await.unwrap();
+        assert!(ok);
+        assert_eq!(*calls.lock().unwrap(), 1, "the first correct passphrase must succeed without retrying");
+    }
+
+    #[tokio::test]
+    async fn try_encrypted_identity_retries_on_a_wrong_passphrase_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 213, "hunter2");
+        let pem = std::fs::read(&path).unwrap();
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 212).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let mut handle = establish_over_stream(config, stream, verifying_handler(&verifier)).await.unwrap();
+
+        let last_attempt = std::sync::Mutex::new(0u32);
+        let prompt = |_path: &Path, attempt: u32| -> Option<String> {
+            *last_attempt.lock().unwrap() = attempt;
+            if attempt < 3 { Some("wrong".to_string()) } else { Some("hunter2".to_string()) }
+        };
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, &prompt).await.unwrap();
+        assert!(ok, "the 3rd attempt has the right passphrase");
+        assert_eq!(*last_attempt.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn try_encrypted_identity_gives_up_immediately_when_the_prompt_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 214, "hunter2");
+        let pem = std::fs::read(&path).unwrap();
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 213).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let mut handle = establish_over_stream(config, stream, verifying_handler(&verifier)).await.unwrap();
+
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, &|_, _| None).await.unwrap();
+        assert!(!ok, "a refused prompt (e.g. silent mode) must give up, not hang or error");
+    }
+
+    #[tokio::test]
+    async fn try_encrypted_identity_gives_up_after_three_wrong_passphrases() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 215, "hunter2");
+        let pem = std::fs::read(&path).unwrap();
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 214).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let mut handle = establish_over_stream(config, stream, verifying_handler(&verifier)).await.unwrap();
+
+        let calls = std::sync::Mutex::new(0u32);
+        let prompt = |_path: &Path, _attempt: u32| -> Option<String> {
+            *calls.lock().unwrap() += 1;
+            Some("still-wrong".to_string())
+        };
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, &prompt).await.unwrap();
+        assert!(!ok, "3 wrong passphrases in a row must give up, not retry forever");
+        assert_eq!(*calls.lock().unwrap(), 3);
     }
 
     /// The cheap, reliable branch of the "always-connects" recovery
