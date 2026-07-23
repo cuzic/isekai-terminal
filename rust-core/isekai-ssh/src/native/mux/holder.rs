@@ -75,11 +75,28 @@ impl HolderSpawner for DetachedProcessSpawner {
 
         let mut child = command.spawn()?;
         if let Some(bytes) = handoff {
-            // Write-then-drop: the holder's read side sees EOF right after
-            // its handoff payload, without this (detached, never-`wait`ed-on)
-            // parent needing to keep the `Child` around.
+            // Write on a dedicated OS thread rather than blocking `spawn`'s
+            // caller (a `dispatch`/`tokio` task) on `write_all`: a named
+            // pipe's kernel buffer is a few KB, and a large hand-off (an
+            // RSA-4096 key, a key+certificate, or several identities) can
+            // exceed that — `write_all` would then block until the holder
+            // actually reads enough to make room, which only happens *after*
+            // its own `connect::prepare` (trust-store lookup, possibly a
+            // network re-deploy) finishes reading it (see
+            // `run_as_holder_entrypoint`'s docs). Detaching the write means a
+            // slow holder start-up delays only *this* thread, never the
+            // caller — the caller has already moved on to
+            // `connect_with_retry` by the time this thread even starts.
+            let bytes = bytes.to_vec();
             let mut stdin = child.stdin.take().expect("stdin was requested as piped above");
-            stdin.write_all(bytes)?;
+            std::thread::spawn(move || {
+                // Write-then-drop: the holder's read side sees EOF right
+                // after its handoff payload. Nothing to do with a failed
+                // write here — the holder simply reads an incomplete/no
+                // payload and decodes it as (or falls back to) an empty
+                // hand-off set, same as if none had been sent.
+                let _ = stdin.write_all(&bytes);
+            });
         }
         // Deliberately never `wait()`/`kill()`: dropping `Child` does not
         // terminate the process (only an explicit `kill()` would) — this is

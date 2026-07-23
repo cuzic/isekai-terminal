@@ -155,8 +155,31 @@ impl Prepared {
 /// init, trust-store lookup — auto-bootstrapping a brand-new destination
 /// inline if needed) without yet establishing the SSH session itself — the
 /// shared front half of both the single-process path ([`run`]) and the mux
-/// dispatch ([`super::mux::run`]).
+/// dispatch ([`super::mux::run`]). Interactive: any brand-new destination's
+/// TOFU confirmation is [`TofuConfirmation::AlwaysPrompt`]. Use
+/// [`prepare_with_tofu`] directly when that's wrong for the caller (a
+/// detached, console-less mux holder — see that function's docs).
 pub(crate) async fn prepare(args: Vec<String>) -> Result<Prepared> {
+    prepare_with_tofu(args, TofuConfirmation::AlwaysPrompt).await
+}
+
+/// Like [`prepare`], but with the auto-bootstrap TOFU confirmation mode
+/// exposed explicitly. The mux holder entrypoint
+/// (`super::mux::run_as_holder_entrypoint`) calls this with
+/// [`TofuConfirmation::Silent`] instead of using [`prepare`] directly: a
+/// detached holder has no console to confirm a brand-new host key on, and by
+/// the time it's spawned the destination is normally already trusted (the
+/// spawning client's own `prepare` call — with `AlwaysPrompt` — already
+/// succeeded once, moments earlier, over the *same* connection settings,
+/// before `dispatch` ever decided to spawn a holder). This only matters for
+/// the narrow, hopefully-never case where the trust store changed between
+/// those two calls (e.g. a concurrent `doctor --fix`/re-bootstrap racing
+/// this exact destination) — `Silent` there means the holder cleanly fails
+/// and exits (silently, per `always-connects.md`'s doctrine for automated
+/// paths) rather than blocking forever on an unanswerable confirmation, and
+/// the spawning client's own `dispatch` falls back to a direct connect when
+/// the holder never comes up.
+pub(crate) async fn prepare_with_tofu(args: Vec<String>, tofu: TofuConfirmation) -> Result<Prepared> {
     let plan = crate::wrapper::parse_wrapper(args)?;
     // `--isekai-log-file` must be honored on the native path too — the Unix
     // path opens it at the top of `wrapper::run`; without this the flag was
@@ -206,7 +229,7 @@ pub(crate) async fn prepare(args: Vec<String>) -> Result<Prepared> {
         // ultrareview-confirmed, real-Windows-CI-reproduced divergence from
         // the Unix path's behavior.
         Err(err) if should_bootstrap(&plan, &resolution) => {
-            if let Err(bootstrap_err) = bootstrap_and_register(&plan, &resolution, TofuConfirmation::AlwaysPrompt).await {
+            if let Err(bootstrap_err) = bootstrap_and_register(&plan, &resolution, tofu).await {
                 print_bootstrap_failure_guidance(&bootstrap_err);
                 return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
             }

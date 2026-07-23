@@ -92,6 +92,20 @@ where
     loop {
         let grace = if ever_served_a_client { IDLE_GRACE } else { WARMUP_GRACE };
         tokio::select! {
+            // `biased` so a real incoming connection always wins over the
+            // idle-exit timer on the (rare) poll where both branches happen
+            // to be ready at once — without it, `select!`'s default random
+            // pick could occasionally choose to exit right as a client is
+            // connecting, dropping a client whose OS-level `open`/`connect`
+            // already succeeded (it degrades safely even then, since a
+            // pre-HelloAck drop is classified as `Rejected`, not
+            // `OwnerLost` — see `client.rs`'s handshake-drop fix — but this
+            // still costs that tab its multiplexing). This only closes the
+            // race for the instant both futures are *already* ready when
+            // polled; a connection landing between this poll and the next
+            // one remains a (much narrower) residual race inherent to
+            // cooperative scheduling.
+            biased;
             conn = channel.accept() => {
                 let conn = conn.context("isekai-ssh mux owner: accepting a client connection failed")?;
                 ever_served_a_client = true;

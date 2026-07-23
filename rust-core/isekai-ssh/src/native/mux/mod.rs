@@ -72,7 +72,7 @@ pub(crate) mod owner;
 pub(crate) mod protocol;
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -104,18 +104,18 @@ pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
 /// only — no foreground shell (see [`run_as_holder`]'s docs).
 #[cfg(windows)]
 pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
-    let prepared = connect::prepare(args).await?;
-    let channel_name = naming::channel_name(prepared.host_config(), prepared.resolution(), prepared.plan().destination_host());
-    let token_path = prepared.runtime_dir().join(naming::token_file_name(&channel_name));
-    let holder_channel = local_ipc_mux::WindowsNamedPipeChannel::try_claim(&channel_name)
-        .await
-        .context("isekai-ssh mux holder: failed to claim the channel it was spawned to serve")?;
     // Read the passphrase hand-off (Phase 1b), if any, off this process's own
-    // stdin before doing anything else — the spawning client either wrote an
-    // encoded payload and closed its write end (EOF right after), or (the
-    // common case: no encrypted identity in play) left stdin null, which
-    // reads as EOF immediately too — `handoff::decode` treats an empty read
-    // as an empty (no-op) set either way.
+    // stdin *before* `connect::prepare` (a trust-store lookup that can
+    // involve a network re-deploy dial) or `try_claim` — draining stdin
+    // immediately is what lets the spawning client's own hand-off write
+    // (`holder::DetachedProcessSpawner::spawn`, which writes on a dedicated
+    // thread specifically so it never blocks on this process being slow to
+    // read) actually complete promptly instead of sitting in the pipe buffer
+    // until a slow `prepare` gets around to reading it. The spawning client
+    // either wrote an encoded payload and closed its write end (EOF right
+    // after), or (the common case: no encrypted identity in play) left
+    // stdin null, which reads as EOF immediately too — `handoff::decode`
+    // treats an empty read as an empty (no-op) set either way.
     let mut handoff_bytes = Vec::new();
     tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::stdin(), &mut handoff_bytes)
         .await
@@ -124,6 +124,18 @@ pub(crate) async fn run_as_holder_entrypoint(args: Vec<String>) -> Result<u8> {
         log_line!("isekai-ssh mux holder: ignoring a malformed passphrase hand-off payload: {e:#}");
         handoff::HandoffCredentials::default()
     });
+
+    // `Silent`, not `prepare`'s default `AlwaysPrompt`: a detached holder has
+    // no console to confirm a brand-new host key on. See
+    // `connect::prepare_with_tofu`'s docs for why this is normally a no-op
+    // (the destination is already trusted by the time a holder is spawned)
+    // and what happens in the rare case it isn't.
+    let prepared = connect::prepare_with_tofu(args, crate::wrapper::TofuConfirmation::Silent).await?;
+    let channel_name = naming::channel_name(prepared.host_config(), prepared.resolution(), prepared.plan().destination_host());
+    let token_path = prepared.runtime_dir().join(naming::token_file_name(&channel_name));
+    let holder_channel = local_ipc_mux::WindowsNamedPipeChannel::try_claim(&channel_name)
+        .await
+        .context("isekai-ssh mux holder: failed to claim the channel it was spawned to serve")?;
     run_as_holder(prepared, holder_channel, &token_path, handoff).await
 }
 
@@ -152,46 +164,102 @@ where
     match C::connect(&channel_name).await {
         Ok(conn) => run_as_client_over(prepared, conn, &token_path, handoff::HandoffCredentials::default()).await,
         Err(ConnectError::NotFound { .. }) => {
-            // Nobody to relay to yet — about to spawn a detached holder, which
-            // (unlike this still-interactive process) can never itself prompt
-            // for a passphrase-protected identity's passphrase. Resolve the
-            // whole hand-off set *now*, while we still can (Phase 1b — see
-            // `handoff`'s module docs). Cheap and prompt-free when there's no
-            // encrypted identity in play: `resolve_handoff_credentials` never
-            // prompts for a key it hasn't first confirmed is encrypted.
+            // Nobody to relay to yet. Several tabs opened at once against the
+            // same fresh destination would all reach this branch
+            // simultaneously — without coordination, each would redundantly
+            // resolve the passphrase hand-off (re-prompting the user for the
+            // *same* passphrase, once per tab) and spawn its own holder (the
+            // losers harmlessly fail `try_claim` and exit, but only after
+            // wastefully re-decrypting first). `SpawnLock` is a best-effort
+            // cross-process mutex over exactly this "resolve hand-off + spawn"
+            // critical section: the one tab that acquires it is the sole
+            // "spawn leader"; every other concurrent tab skips straight to
+            // waiting for *that* leader's holder to come up.
+            let lock_path = prepared.runtime_dir().join(naming::spawn_lock_file_name(&channel_name));
+            let spawn_lock = SpawnLock::try_acquire(lock_path, HOLDER_STARTUP_TIMEOUT);
+            if !spawn_lock.acquired {
+                log_line!("isekai-ssh: another tab is already spawning a mux holder for this destination; waiting for it");
+                return match connect_with_retry::<C>(&channel_name, HOLDER_STARTUP_TIMEOUT).await {
+                    Ok(conn) => run_as_client_over(prepared, conn, &token_path, handoff::HandoffCredentials::default()).await,
+                    Err(e) => {
+                        log_line!("isekai-ssh: no mux holder ever became reachable ({e}); connecting directly");
+                        connect::run_prepared(prepared, None, handoff::HandoffCredentials::default()).await
+                    }
+                };
+            }
+
+            // This tab is the spawn leader — it (unlike this still-interactive
+            // process's own SSH auth for a plain single-process connect) can
+            // never prompt for a passphrase-protected identity's passphrase
+            // once detached. Resolve the whole hand-off set *now*, while we
+            // still can (Phase 1b — see `handoff`'s module docs). Cheap and
+            // prompt-free when there's no encrypted identity in play:
+            // `resolve_handoff_credentials` never prompts for a key it hasn't
+            // first confirmed is encrypted.
             let home = isekai_fs_guard::resolve_home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
             let resolved_handoff = handoff::resolve_handoff_credentials(prepared.host_config(), &home, prompt_passphrase);
             let encoded_handoff = (!resolved_handoff.is_empty()).then(|| handoff::encode(&resolved_handoff));
 
             if let Err(e) = spawner.spawn(&holder_args, encoded_handoff.as_deref().map(|z| z.as_slice())) {
                 log_line!("isekai-ssh: failed to spawn a detached mux holder ({e}); connecting directly");
+                drop(spawn_lock);
                 return connect::run_prepared(prepared, None, resolved_handoff).await;
             }
-            match connect_with_retry::<C>(&channel_name, HOLDER_STARTUP_TIMEOUT).await {
+            let result = match connect_with_retry::<C>(&channel_name, HOLDER_STARTUP_TIMEOUT).await {
                 Ok(conn) => run_as_client_over(prepared, conn, &token_path, resolved_handoff).await,
                 Err(e) => {
                     log_line!("isekai-ssh: the detached mux holder never came up ({e}); connecting directly");
                     connect::run_prepared(prepared, None, resolved_handoff).await
                 }
-            }
+            };
+            // Held across the whole spawn+wait window (not just the spawn
+            // call itself) so a follower's own retry loop above has the
+            // leader's holder to find for as long as the leader is willing to
+            // wait for it — releasing any earlier would let a follower give up
+            // and redundantly spawn its own holder while this one might still
+            // be about to come up.
+            drop(spawn_lock);
+            result
         }
-        // A transient local-pipe I/O error (not "no owner exists" — e.g. the
-        // pipe infrastructure itself failed, or `ERROR_PIPE_BUSY` retries
-        // exhausted reaching a holder that does exist). Per the
-        // always-connects principle a mux hiccup must never block
-        // connecting, so fall back rather than hard-failing this invocation.
+        // A transient local-pipe busy/I/O condition — *not necessarily* "no
+        // holder to reach": a holder can already exist but not yet be
+        // calling `accept()` at all (still mid SSH handshake/authentication,
+        // before its own `OwnerHook` fires `serve_clients` — see
+        // `run_as_holder`'s docs), during which its one pre-created pipe
+        // instance can be fully occupied by another tab that raced ahead of
+        // us. `WindowsNamedPipeChannel::connect` already retries
+        // `ERROR_PIPE_BUSY` briefly on its own (see its docs) but only for a
+        // few hundred milliseconds — far shorter than a real SSH handshake
+        // can take — so this surfaces here well before a holder that's
+        // genuinely on its way up would ever get the chance to start
+        // accepting. Retry patiently for the same budget a freshly-spawned
+        // holder gets (`connect_with_retry`, which retries on this exact
+        // error too) before concluding it's a genuine pipe-infrastructure
+        // problem and falling back — per the always-connects principle, a
+        // mux hiccup must never block connecting, but it also shouldn't
+        // needlessly give up on multiplexing within milliseconds of a
+        // legitimately-busy (not broken) pipe.
         Err(ConnectError::Io { source, .. }) => {
-            log_line!("isekai-ssh: local mux channel unavailable ({source}); connecting directly without multiplexing");
-            connect::run_prepared(prepared, None, handoff::HandoffCredentials::default()).await
+            log_line!("isekai-ssh: local mux channel busy/unavailable ({source}); retrying before falling back");
+            match connect_with_retry::<C>(&channel_name, HOLDER_STARTUP_TIMEOUT).await {
+                Ok(conn) => run_as_client_over(prepared, conn, &token_path, handoff::HandoffCredentials::default()).await,
+                Err(e) => {
+                    log_line!("isekai-ssh: local mux channel still unavailable after retrying ({e}); connecting directly without multiplexing");
+                    connect::run_prepared(prepared, None, handoff::HandoffCredentials::default()).await
+                }
+            }
         }
     }
 }
 
 /// Retries [`ExclusiveChannel::connect`] while it keeps reporting
-/// [`ConnectError::NotFound`] (the holder hasn't claimed the channel yet),
-/// giving up once `deadline` has elapsed. Any other error (or a `NotFound`
-/// past the deadline) is returned to the caller, which falls back to a plain
-/// direct connect.
+/// [`ConnectError::NotFound`] (nobody has claimed the channel yet) *or*
+/// [`ConnectError::Io`] (the channel exists but is momentarily busy — e.g. a
+/// holder that claimed it hasn't started calling `accept()` yet, still mid
+/// SSH handshake/authentication; see `dispatch`'s `Err(ConnectError::Io {..})`
+/// arm), giving up once `deadline` has elapsed. Any other error (or either of
+/// these past the deadline) is returned to the caller, which falls back to a
+/// plain direct connect.
 async fn connect_with_retry<C>(channel_name: &str, deadline: Duration) -> Result<C::Connection, ConnectError>
 where
     C: ExclusiveChannel,
@@ -200,7 +268,7 @@ where
     loop {
         match C::connect(channel_name).await {
             Ok(conn) => return Ok(conn),
-            Err(ConnectError::NotFound { .. }) if start.elapsed() < deadline => {
+            Err(ConnectError::NotFound { .. }) | Err(ConnectError::Io { .. }) if start.elapsed() < deadline => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(e) => return Err(e),
@@ -273,6 +341,65 @@ where
         client::ClientRunResult::Rejected { reason } => {
             log_line!("isekai-ssh: the mux holder rejected this connection ({reason}); connecting directly");
             connect::run_prepared(prepared, None, handoff).await
+        }
+    }
+}
+
+/// Best-effort cross-process mutex over the "resolve passphrase hand-off +
+/// spawn a detached holder" critical section for one destination (see
+/// `dispatch`'s `NotFound` arm) — closes the window where several tabs opened
+/// at once against the same fresh destination would each redundantly
+/// re-prompt the user for the same passphrase and each spawn their own
+/// (mostly-losing) holder. Backed by an exclusively-created lock file
+/// (`std::fs::OpenOptions::create_new`'s atomicity, same primitive
+/// [`write_owner_token`]'s sibling token file doesn't need since nothing
+/// *races* to create that one).
+struct SpawnLock {
+    path: PathBuf,
+    /// Whether *this* value is the one holding the lock — only it removes
+    /// the file on drop, so a value that lost the race never deletes a
+    /// still-active leader's lock out from under it.
+    acquired: bool,
+}
+
+impl SpawnLock {
+    /// A lock older than `stale_after` is treated as abandoned (a leader that
+    /// crashed — or was killed — before it could clean up after itself) and
+    /// is reclaimed rather than left to starve every future invocation for
+    /// this destination forever. `stale_after` is the same budget a holder
+    /// gets to come up (`HOLDER_STARTUP_TIMEOUT`) — a lock that's outlived
+    /// that can no longer represent a leader still usefully waiting.
+    fn try_acquire(path: PathBuf, stale_after: Duration) -> Self {
+        if Self::create_new(&path) {
+            return Self { path, acquired: true };
+        }
+        if Self::is_stale(&path, stale_after) {
+            let _ = std::fs::remove_file(&path);
+            if Self::create_new(&path) {
+                return Self { path, acquired: true };
+            }
+        }
+        Self { path, acquired: false }
+    }
+
+    fn create_new(path: &Path) -> bool {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::OpenOptions::new().write(true).create_new(true).open(path).is_ok()
+    }
+
+    fn is_stale(path: &Path, stale_after: Duration) -> bool {
+        let Ok(metadata) = std::fs::metadata(path) else { return false };
+        let Ok(modified) = metadata.modified() else { return false };
+        modified.elapsed().map(|age| age > stale_after).unwrap_or(false)
+    }
+}
+
+impl Drop for SpawnLock {
+    fn drop(&mut self) {
+        if self.acquired {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
@@ -543,6 +670,145 @@ mod tests {
         assert!(matches!(result, Err(ConnectError::NotFound { .. })), "a channel nobody ever claims must give up past the deadline, not hang forever");
     }
 
+    /// A test-only `ExclusiveChannel` that reports [`ConnectError::Io`] for a
+    /// configurable number of `connect(name)` calls before delegating to a
+    /// real [`InMemoryChannel`] — standing in for a real Windows named pipe
+    /// returning `ERROR_PIPE_BUSY` while a holder has claimed the channel but
+    /// hasn't started calling `accept()` yet (still mid SSH handshake/auth).
+    /// State is keyed by `name` in a process-global registry (mirroring
+    /// `InMemoryChannel`'s own registry) so concurrent tests using distinct
+    /// names don't interfere.
+    struct FlakyIoChannel(InMemoryChannel);
+
+    fn flaky_io_countdowns() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+        static COUNTDOWNS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> = std::sync::OnceLock::new();
+        COUNTDOWNS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// The next `busy_calls` calls to `FlakyIoChannel::connect(name)` return
+    /// `Io`; every call after that delegates to `InMemoryChannel::connect`.
+    fn set_flaky_io_countdown(name: &str, busy_calls: usize) {
+        flaky_io_countdowns().lock().unwrap().insert(name.to_string(), busy_calls);
+    }
+
+    #[async_trait]
+    impl ExclusiveChannel for FlakyIoChannel {
+        type Connection = <InMemoryChannel as ExclusiveChannel>::Connection;
+
+        async fn try_claim(name: &str) -> Result<Self, ClaimError> {
+            InMemoryChannel::try_claim(name).await.map(FlakyIoChannel)
+        }
+
+        async fn accept(&mut self) -> std::io::Result<Self::Connection> {
+            self.0.accept().await
+        }
+
+        async fn connect(name: &str) -> Result<Self::Connection, ConnectError> {
+            // Scoped so the (non-`Send`) `MutexGuard` is fully dropped before
+            // the `.await` below — `async_trait` boxes this function's body
+            // as a single `Send` future, and a guard that's merely
+            // `drop()`-called (rather than falling out of its own block
+            // scope) can still be considered live across the await by the
+            // generator transform.
+            let busy = {
+                let mut countdowns = flaky_io_countdowns().lock().unwrap();
+                match countdowns.get_mut(name) {
+                    Some(remaining) if *remaining > 0 => {
+                        *remaining -= 1;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if busy {
+                return Err(ConnectError::Io { name: name.to_string(), source: std::io::Error::other("simulated ERROR_PIPE_BUSY") });
+            }
+            InMemoryChannel::connect(name).await
+        }
+    }
+
+    /// The gap `connect_with_retry`'s `Io`-retry closes: a holder that has
+    /// claimed the channel but hasn't started `accept()`ing yet (still mid
+    /// SSH handshake/auth) can make a concurrent tab's connect attempt see a
+    /// transient busy/`Io` error — that must be retried, not treated as an
+    /// immediate "give up and connect directly" signal.
+    #[tokio::test]
+    async fn connect_with_retry_recovers_from_a_transient_busy_pipe_error() {
+        let name = "isekai-ssh-mux-retry-flaky-io-test";
+        // A channel must actually be claimed for the eventual real
+        // `InMemoryChannel::connect` (once the simulated busy countdown runs
+        // out) to succeed — mirrors `connect_with_retry_succeeds_immediately_
+        // when_a_holder_is_already_there`'s leak-to-keep-alive pattern.
+        let owner_channel = FlakyIoChannel::try_claim(name).await.unwrap();
+        std::mem::forget(owner_channel);
+        set_flaky_io_countdown(name, 3);
+        let result = connect_with_retry::<FlakyIoChannel>(name, Duration::from_secs(5)).await;
+        assert!(result.is_ok(), "a transient busy/Io error must be retried and eventually succeed, not immediately surface");
+    }
+
+    #[tokio::test]
+    async fn connect_with_retry_gives_up_on_a_persistently_busy_pipe_past_the_deadline() {
+        tokio::time::pause();
+        let name = "isekai-ssh-mux-retry-persistent-io-test";
+        set_flaky_io_countdown(name, usize::MAX);
+        let result = connect_with_retry::<FlakyIoChannel>(name, Duration::from_millis(200)).await;
+        assert!(matches!(result, Err(ConnectError::Io { .. })), "a channel that's never anything but busy must still give up past the deadline, not hang forever");
+    }
+
+    // -- SpawnLock ---------------------------------------------------------
+
+    #[test]
+    fn spawn_lock_try_acquire_succeeds_when_unclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("some.spawning.lock");
+        let lock = SpawnLock::try_acquire(path.clone(), Duration::from_secs(10));
+        assert!(lock.acquired, "an unclaimed lock path must be acquirable");
+        assert!(path.exists(), "acquiring the lock must create the lock file");
+    }
+
+    #[test]
+    fn spawn_lock_try_acquire_fails_while_another_holder_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("some.spawning.lock");
+        let _first = SpawnLock::try_acquire(path.clone(), Duration::from_secs(10));
+        let second = SpawnLock::try_acquire(path, Duration::from_secs(10));
+        assert!(!second.acquired, "a second attempt while the first still (recently) holds the lock must fail");
+    }
+
+    #[test]
+    fn spawn_lock_is_released_on_drop_and_then_reacquirable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("some.spawning.lock");
+        {
+            let _lock = SpawnLock::try_acquire(path.clone(), Duration::from_secs(10));
+            assert!(path.exists());
+        }
+        assert!(!path.exists(), "dropping the lock must remove the lock file");
+        let reacquired = SpawnLock::try_acquire(path, Duration::from_secs(10));
+        assert!(reacquired.acquired, "after the previous holder drops, a fresh attempt must succeed");
+    }
+
+    #[test]
+    fn spawn_lock_reclaims_a_stale_lock_left_by_a_crashed_leader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("some.spawning.lock");
+        std::fs::write(&path, b"").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600)).unwrap();
+
+        let lock = SpawnLock::try_acquire(path, Duration::from_secs(10));
+        assert!(lock.acquired, "a lock file far older than the staleness threshold must be reclaimed, not block every future invocation forever");
+    }
+
+    #[test]
+    fn spawn_lock_does_not_reclaim_a_fresh_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("some.spawning.lock");
+        let _first = SpawnLock::try_acquire(path.clone(), Duration::from_secs(600));
+        let second = SpawnLock::try_acquire(path, Duration::from_secs(600));
+        assert!(!second.acquired, "a fresh, still-plausibly-live lock must not be reclaimed just because a second attempt raced it");
+    }
+
     // -- dispatch fallback sequencing ------------------------------------
 
     /// Builds a throwaway `Prepared` for `dispatch` tests: a bogus
@@ -653,5 +919,36 @@ mod tests {
         .expect("dispatch must give up waiting for the holder within its own startup timeout, not hang");
 
         assert!(result.is_err(), "a holder that spawned but never claims the channel must fall back to a direct connect (which itself fails against the bogus pipe path here, but via the fallback path, not a hang)");
+    }
+
+    /// Simulates a second tab arriving while a *different* tab is already in
+    /// the middle of resolving the hand-off set and spawning a holder for the
+    /// same destination (the `SpawnLock` this tab would otherwise contend
+    /// for is pre-acquired here to stand in for that other tab). This tab
+    /// must not redundantly resolve its own hand-off (which would re-prompt
+    /// the user for the same passphrase) or spawn its own holder — it must
+    /// simply wait for the leader's holder instead.
+    #[tokio::test]
+    async fn dispatch_does_not_spawn_a_redundant_holder_while_another_tab_holds_the_spawn_lock() {
+        tokio::time::pause();
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let prepared = test_prepared("dispatch-spawn-lock-contention-host", runtime_dir.path());
+        let channel_name = naming::channel_name(prepared.host_config(), prepared.resolution(), prepared.plan().destination_host());
+        let lock_path = runtime_dir.path().join(naming::spawn_lock_file_name(&channel_name));
+        let held_by_another_tab = SpawnLock::try_acquire(lock_path, HOLDER_STARTUP_TIMEOUT);
+        assert!(held_by_another_tab.acquired, "test setup: the simulated other tab must win the lock");
+
+        let spawner = holder::tests_support::RecordingSpawner::failing();
+        let result = tokio::time::timeout(
+            HOLDER_STARTUP_TIMEOUT + Duration::from_secs(5),
+            dispatch::<InMemoryChannel, _>(prepared, vec!["dispatch-spawn-lock-contention-host".to_string()], &spawner, &|_path, _attempt| {
+                panic!("a follower must never resolve its own passphrase hand-off while another tab's spawn lock is held")
+            }),
+        )
+        .await
+        .expect("dispatch must not hang waiting on another tab's spawn lock");
+
+        assert!(result.is_err(), "the eventual fallback direct connect must still fail here (bogus pipe path), but via the follower path");
+        assert!(spawner.calls.lock().unwrap().is_empty(), "a follower must never spawn its own holder while another tab's spawn lock is held");
     }
 }
