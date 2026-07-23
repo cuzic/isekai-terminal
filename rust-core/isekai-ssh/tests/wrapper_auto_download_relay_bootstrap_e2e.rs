@@ -476,11 +476,21 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
     // On the native/Windows path, `RusshBackend`'s own SSH host-key TOFU
     // prompt ("Are you sure you want to continue connecting (yes/no)?")
     // fires before the app-level "Trust this isekai-helper...? [y/N]"
-    // prompt this "y\n" answers — see `wrapper_auto_bootstrap_e2e.rs`'s
-    // sibling comment / `isekai-bootstrap/src/russh_backend.rs`'s module
-    // docs for why there's no `StrictHostKeyChecking`-equivalent knob to
-    // suppress it there too.
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    // prompt this answers — see `wrapper_auto_bootstrap_e2e.rs`'s sibling
+    // comment / `isekai-bootstrap/src/russh_backend.rs`'s module docs for
+    // why there's no `StrictHostKeyChecking`-equivalent knob to suppress it
+    // there too. A fixed `"yes\ny\n"` (exactly one TOFU round + one
+    // app-level round) is exactly the fragile assumption that comment warns
+    // against: a real `test-windows` CI failure (2026-07-23, this file's
+    // own arch-detection/auto-download path, which does more bootstrap
+    // round trips than the plainer sibling scenarios) showed the TOFU
+    // prompt fire and then the run go silent forever, consistent with a
+    // *second* TOFU round consuming the answer meant for the app-level
+    // prompt. Feeding several plain "y" answers (harmless — "y" alone
+    // satisfies both prompt kinds, and unread lines just sit in the pipe)
+    // is robust to however many confirmation rounds actually occur, instead
+    // of assuming exactly two.
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
 
     let mut stderr = BufReader::new(child.stderr.take().unwrap());

@@ -547,6 +547,17 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
         .env("HOME", &home)
         .env("PATH", &shim.path_env)
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        // Without this, the native connect path's `ConnectOutcome` side
+        // channel (`always-connects.md`) falls back to a shared
+        // `%TEMP%\isekai-<uid>` runtime dir — a real `test-windows` CI
+        // failure (2026-07-23) showed the *sibling* unreachable-endpoint
+        // test in this same file misclassify as `StaleTrust` instead of
+        // `Unreachable`, consistent with cross-test interference over that
+        // shared directory when multiple tests in this file run
+        // concurrently (Rust's default test harness). Isolating each test's
+        // own runtime dir under its own `tmp`, same as this crate's
+        // `mux_holder_windows_e2e.rs`, removes the shared state entirely.
+        .env("ISEKAI_PIPE_RUNTIME_DIR", tmp.path().join("runtime"))
         // Verbose bootstrap-progress messages (including "Registered ...
         // in ...", which this test counts below) now default to
         // `isekai-ssh`'s own log file (`log_file.rs::log_line_verbose!`)
@@ -668,6 +679,7 @@ async fn wrapper_does_not_auto_recover_when_no_bootstrap_is_set() {
             .env("HOME", &home)
             .env("PATH", &shim.path_env)
             .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+            .env("ISEKAI_PIPE_RUNTIME_DIR", tmp.path().join("runtime"))
             .envs(shim.extra_env)
             .env_remove("RUST_LOG")
             .stdin(StdStdio::null())
@@ -757,6 +769,12 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
         .env("HOME", &home)
         .env("PATH", &shim.path_env)
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
+        // See the identical comment in the sibling stale-trust test above:
+        // without this, this test shared a `%TEMP%\isekai-<uid>` runtime
+        // dir with every other test in this file, which a real
+        // `test-windows` CI failure (2026-07-23) showed causing this exact
+        // test to misclassify as `StaleTrust` instead of `Unreachable`.
+        .env("ISEKAI_PIPE_RUNTIME_DIR", tmp.path().join("runtime"))
         // Verbose bootstrap-progress messages (including "Registered ...
         // in ...", which this test counts below) now default to
         // `isekai-ssh`'s own log file rather than stderr — "the cached
