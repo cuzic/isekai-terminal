@@ -424,6 +424,29 @@ async fn connect_attempt(
     result
 }
 
+/// Decide whether to open a non-interactive `Exec` channel or a PTY+`Shell`
+/// channel, mirroring `ssh(1)`'s `-t`/`-T` semantics: an explicit `-T`
+/// (`RequestTty::No`) with a remote command skips the PTY entirely and runs
+/// the command directly via `SessionKind::Exec`. Every other combination
+/// (no command at all, or a command with `Auto`/`Yes`/`Force`) opens a
+/// PTY+shell instead — when a command is also present, the caller `exec`s it
+/// over that PTY afterwards (see the `remote_cmd`/`request_tty` check right
+/// after the channel opens in [`run_authenticated_session`]), since
+/// `SessionKind::Exec` itself never allocates a PTY.
+fn decide_session_kind(
+    remote_cmd: Option<&[String]>,
+    request_tty: crate::wrapper::RequestTty,
+    term: &str,
+    cols: u32,
+    rows: u32,
+    terminal_modes: &[(russh::Pty, u32)],
+) -> SessionKind {
+    match remote_cmd {
+        Some(cmd) if request_tty == crate::wrapper::RequestTty::No => SessionKind::Exec { command: cmd.join(" ") },
+        _ => SessionKind::Shell { term: term.to_string(), cols, rows, terminal_modes: terminal_modes.to_vec() },
+    }
+}
+
 /// The authenticated-session half of [`connect_attempt`], split out so
 /// [`connect_attempt`] can retain the `isekai-pipe connect` `Child` and, on an
 /// error, give it a brief best-effort window to finish writing its
@@ -509,21 +532,7 @@ async fn run_authenticated_session(
 
     // Decide SessionKind: remote command vs interactive shell, with -t/-T support.
     let remote_cmd = plan.remote_command();
-    let session_kind = match remote_cmd {
-        Some(cmd) if plan.request_tty == crate::wrapper::RequestTty::No => {
-            SessionKind::Exec { command: cmd.join(" ") }
-        }
-        Some(_cmd) => {
-            // -t or auto-with-command: PTY + exec (the command is run via exec
-            // below, not passed to SessionKind::Exec which is no-pty-only).
-            // We use SessionKind::Shell to get the PTY+shell, then exec the
-            // command over the pty below.
-            SessionKind::Shell { term: term.clone(), cols, rows, terminal_modes: terminal_modes.clone() }
-        }
-        None => {
-            SessionKind::Shell { term: term.clone(), cols, rows, terminal_modes: terminal_modes.clone() }
-        }
-    };
+    let session_kind = decide_session_kind(remote_cmd, plan.request_tty, &term, cols, rows, &terminal_modes);
 
     // This process's own foreground shell's ctl-socket forward (owner or
     // single-process). Opportunistic: a forward that fails to set up just
@@ -562,9 +571,14 @@ async fn run_authenticated_session(
         }
     };
 
-    // ForwardAgent: wire up agent forwarding if the config enables it.
+    // ForwardAgent: wire up agent forwarding if the config enables it. A failure here
+    // (e.g. the server rejects agent forwarding, or the local agent connection dropped)
+    // shouldn't abort the session — the shell/exec still works without it — but it
+    // should be visible instead of silently vanishing (previously discarded via `let _ =`).
     if matches!(host_config.forward_agent, Some(openssh_config::ForwardAgent::Yes)) {
-        let _ = channel.agent_forward(true).await;
+        if let Err(e) = channel.agent_forward(true).await {
+            log_line!("isekai-ssh: agent forwarding request failed: {e}");
+        }
     }
 
     // SendEnv: forward LANG and LC_* environment variables (the most common
@@ -1190,6 +1204,45 @@ mod tests {
             let _ = server.run_on_socket(config, &listener).await;
         });
         addr
+    }
+
+    /// README regression test (the stale README §"対応していない・非互換の事項" used to
+    /// claim `isekai-ssh <host> 'cmd'` was unwired on the native path and always opened
+    /// an interactive shell instead — it has actually dispatched to
+    /// `SessionKind::Exec` since this was written; this locks the decision in so it
+    /// can't silently regress back to always-Shell without a failing test).
+    #[test]
+    fn decide_session_kind_uses_exec_for_a_command_with_no_pty() {
+        let cmd = vec!["echo".to_string(), "hi".to_string()];
+        let kind = decide_session_kind(Some(&cmd), crate::wrapper::RequestTty::No, "xterm", 80, 24, &[]);
+        match kind {
+            SessionKind::Exec { command } => assert_eq!(command, "echo hi"),
+            SessionKind::Shell { .. } => panic!("-T with a remote command must skip the PTY (SessionKind::Exec)"),
+        }
+    }
+
+    /// `Auto`/`Yes`/`Force` all open a PTY+shell even when a command is present — the
+    /// command itself is `exec`'d over that PTY separately by the caller (see the
+    /// `remote_cmd`/`request_tty` check right after the channel opens in
+    /// `run_authenticated_session`), since `SessionKind::Exec` never allocates a PTY.
+    #[test]
+    fn decide_session_kind_uses_shell_for_a_command_with_a_pty_requested() {
+        let cmd = vec!["echo".to_string(), "hi".to_string()];
+        for request_tty in [crate::wrapper::RequestTty::Auto, crate::wrapper::RequestTty::Yes, crate::wrapper::RequestTty::Force] {
+            let kind = decide_session_kind(Some(&cmd), request_tty, "xterm", 80, 24, &[]);
+            assert!(
+                matches!(kind, SessionKind::Shell { .. }),
+                "{request_tty:?} with a remote command must still allocate a PTY"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_session_kind_uses_shell_when_there_is_no_remote_command() {
+        for request_tty in [crate::wrapper::RequestTty::Auto, crate::wrapper::RequestTty::Yes, crate::wrapper::RequestTty::No, crate::wrapper::RequestTty::Force] {
+            let kind = decide_session_kind(None, request_tty, "xterm", 80, 24, &[]);
+            assert!(matches!(kind, SessionKind::Shell { .. }), "no remote command always means an interactive shell");
+        }
     }
 
     /// `connect_and_authenticate` has no private key or agent to offer in
