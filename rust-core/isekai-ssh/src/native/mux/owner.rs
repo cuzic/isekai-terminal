@@ -29,24 +29,47 @@ use anyhow::{anyhow, Context, Result};
 use local_ipc_mux::ExclusiveChannel;
 use russh::client;
 use russh_stream_session::{open_channel, ForwardRoutes, SessionKind};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::log_file::log_line;
 
 use super::ctl_forward;
 use super::protocol::{read_frame, spawn_frame_reader, token_eq, write_frame, Frame, MUX_PROTOCOL_VERSION};
 
-/// Accepts clients on `channel` for the life of the owner process, spawning an
-/// independent relay task per client (each opening its own shell channel on the
-/// shared `handle`). The handle is shared via `Arc<Mutex<_>>` because `russh`'s
-/// `client::Handle` is not `Clone`; the mutex is held only for the brief
-/// `channel_open_session`/`streamlocal_forward` calls (the latter needs
-/// `&mut self`), never across a client's relay loop, so clients still stream
-/// concurrently. Returns only if `accept` itself fails (the underlying IPC
-/// channel died) — a single client's relay error is logged and contained,
-/// never propagated to sibling clients or the owner's own session.
+/// How long the very first accept loop iteration waits for the *first ever*
+/// client to connect before giving up — generous, since a detached
+/// `ControlPersist`-equivalent holder (`native/mux/holder.rs`) is spawned
+/// *just before* its spawner tries to connect, and the spawner itself may
+/// still be doing its own SSH-target host-key/agent lookups first.
+const WARMUP_GRACE: Duration = Duration::from_secs(30);
+/// How long the accept loop waits, once it has served at least one client and
+/// the count has dropped back to zero, before exiting — this is the actual
+/// `ControlPersist`-equivalent lifetime policy: short enough that a holder
+/// with no real tabs left doesn't linger holding an authenticated SSH session
+/// forever, long enough to absorb a user quickly closing one tab and opening
+/// another to the same host.
+const IDLE_GRACE: Duration = Duration::from_secs(10);
+
+/// Accepts clients on `channel` until either `accept` itself fails (the
+/// underlying IPC channel died — a genuine local-pipe infrastructure
+/// problem), or the client count drops to (and stays at) zero for the
+/// relevant grace window (see [`WARMUP_GRACE`]/[`IDLE_GRACE`]) — the
+/// `ControlPersist`-equivalent idle-exit policy for the detached holder
+/// process ([`super::holder`]) that calls this. Returns `Ok(())` either way;
+/// the caller (the holder's own body) treats both as "done, exit cleanly" —
+/// there is nothing left to serve.
+///
+/// Spawns an independent relay task per client (each opening its own shell
+/// channel on the shared `handle`). The handle is shared via `Arc<Mutex<_>>`
+/// because `russh`'s `client::Handle` is not `Clone`; the mutex is held only
+/// for the brief `channel_open_session`/`streamlocal_forward` calls (the
+/// latter needs `&mut self`), never across a client's relay loop, so clients
+/// still stream concurrently. A single client's relay error is logged and
+/// contained, never propagated to sibling clients or this accept loop.
 pub(crate) async fn serve_clients<C, H>(
     mut channel: C,
     handle: Arc<Mutex<client::Handle<H>>>,
@@ -57,20 +80,66 @@ where
     C: ExclusiveChannel,
     H: client::Handler + 'static,
 {
+    let active_clients = Arc::new(AtomicUsize::new(0));
+    // Notified on every count change (increment *or* decrement) — the
+    // idle-exit wait below only actually cares about decrements reaching
+    // zero, but re-checking on every notification is cheap and keeps the
+    // signaling side (the per-client task below) simple: it doesn't need to
+    // know which transitions the waiter cares about.
+    let count_changed = Arc::new(Notify::new());
+    let mut ever_served_a_client = false;
+
     loop {
-        let conn = channel.accept().await.context("isekai-ssh mux owner: accepting a client connection failed")?;
-        let handle = handle.clone();
-        let token = token.clone();
-        // `Some` iff `#@isekai ctl-socket` is on — each client then gets its
-        // own private per-tab forward (see [`relay_client`]).
-        let ctl_routes = ctl_routes.clone();
-        tokio::spawn(async move {
-            if let Err(e) = relay_client(conn, &handle, token.as_slice(), ctl_routes.as_ref()).await {
-                // One client's session ending badly must not disturb the
-                // owner or its other clients (session isolation).
-                log_line!("isekai-ssh mux owner: a client session ended with an error: {e:#}");
+        let grace = if ever_served_a_client { IDLE_GRACE } else { WARMUP_GRACE };
+        tokio::select! {
+            conn = channel.accept() => {
+                let conn = conn.context("isekai-ssh mux owner: accepting a client connection failed")?;
+                ever_served_a_client = true;
+                active_clients.fetch_add(1, Ordering::SeqCst);
+                count_changed.notify_one();
+                let handle = handle.clone();
+                let token = token.clone();
+                // `Some` iff `#@isekai ctl-socket` is on — each client then gets its
+                // own private per-tab forward (see [`relay_client`]).
+                let ctl_routes = ctl_routes.clone();
+                let active_clients = active_clients.clone();
+                let count_changed = count_changed.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = relay_client(conn, &handle, token.as_slice(), ctl_routes.as_ref()).await {
+                        // One client's session ending badly must not disturb the
+                        // owner or its other clients (session isolation).
+                        log_line!("isekai-ssh mux owner: a client session ended with an error: {e:#}");
+                    }
+                    active_clients.fetch_sub(1, Ordering::SeqCst);
+                    count_changed.notify_one();
+                });
             }
-        });
+            _ = wait_for_idle_exit(&active_clients, &count_changed, grace) => {
+                log_line!("isekai-ssh mux owner: no clients for {grace:?}; exiting (ControlPersist-equivalent idle-exit)");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Resolves once the client count has been zero continuously for `grace` —
+/// i.e. it *never* resolves while `active_clients` is nonzero, and restarts
+/// its internal timer every time the count changes (a new client connecting,
+/// or another one disconnecting) while still zero. Split out as its own
+/// function (rather than inlined in `serve_clients`'s `select!`) purely so
+/// the zero-clients-forever case, the immediate-non-zero case, and the
+/// "reset on change" case can each be unit-tested directly against a plain
+/// `AtomicUsize`/`Notify` pair, without a real `ExclusiveChannel`.
+async fn wait_for_idle_exit(active_clients: &AtomicUsize, count_changed: &Notify, grace: Duration) {
+    loop {
+        if active_clients.load(Ordering::SeqCst) > 0 {
+            count_changed.notified().await;
+            continue;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(grace) => return,
+            _ = count_changed.notified() => continue,
+        }
     }
 }
 
@@ -399,6 +468,164 @@ mod tests {
         async fn verify(&self, _fingerprint: &str) -> VerifyOutcome {
             VerifyOutcome::Accepted
         }
+    }
+
+    // -- wait_for_idle_exit -----------------------------------------------
+
+    #[tokio::test]
+    async fn wait_for_idle_exit_resolves_immediately_after_the_grace_when_already_zero() {
+        let count = AtomicUsize::new(0);
+        let notify = Notify::new();
+        let start = tokio::time::Instant::now();
+        wait_for_idle_exit(&count, &notify, Duration::from_millis(20)).await;
+        assert!(start.elapsed() >= Duration::from_millis(20), "must actually wait out the grace period");
+    }
+
+    #[tokio::test]
+    async fn wait_for_idle_exit_never_resolves_while_the_count_is_nonzero() {
+        let count = AtomicUsize::new(1);
+        let notify = Notify::new();
+        let result = tokio::time::timeout(Duration::from_millis(100), wait_for_idle_exit(&count, &notify, Duration::from_millis(20))).await;
+        assert!(result.is_err(), "must not resolve while a client is still counted as active");
+    }
+
+    #[tokio::test]
+    async fn wait_for_idle_exit_restarts_the_grace_when_a_new_client_arrives_then_leaves_again() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+
+        let count2 = count.clone();
+        let notify2 = notify.clone();
+        // Simulate: a new client connects shortly after the wait starts (resetting
+        // the grace), then leaves again — the *second* zero-to-grace window is
+        // what must actually elapse before the wait resolves.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            count2.fetch_add(1, Ordering::SeqCst);
+            notify2.notify_one();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            count2.fetch_sub(1, Ordering::SeqCst);
+            notify2.notify_one();
+        });
+
+        let start = tokio::time::Instant::now();
+        wait_for_idle_exit(&count, &notify, Duration::from_millis(30)).await;
+        // Must have waited past the point the client disconnected (~20ms) plus
+        // its own grace window (30ms) — comfortably more than the naive
+        // (wrong) "first grace window from t=0" would give (30ms).
+        assert!(start.elapsed() >= Duration::from_millis(45), "a new client arriving must reset the idle-exit grace, not just be ignored");
+    }
+
+    // -- serve_clients idle-exit end-to-end (InMemoryChannel) ---------------
+
+    async fn authed_test_handle() -> client::Handle<russh_stream_session::VerifyingHandler<AcceptAllHostKeys>> {
+        let keypair = Ed25519Keypair::from_seed(&[150; 32]);
+        let host_key = SshPrivateKey::from(keypair);
+        let config = Arc::new(server::Config { keys: vec![host_key], ..Default::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut server = EchoShellServer;
+        tokio::spawn(async move {
+            let _ = server.run_on_socket(config, &listener).await;
+        });
+
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let handler = verifying_handler(&verifier);
+        let mut handle = establish_over_stream(Arc::new(client::Config::default()), stream, handler).await.unwrap();
+        assert!(authenticate_session(&mut handle, "tester", &Credential::Password("x".to_string())).await.unwrap());
+        handle
+    }
+
+    /// End-to-end: `serve_clients` must exit on its own (`Ok(())`) once a
+    /// client has connected and then fully disconnected and the idle grace
+    /// has elapsed — the `ControlPersist`-equivalent lifetime policy the
+    /// detached holder process relies on to eventually let go of an
+    /// authenticated connection nobody is using anymore.
+    #[tokio::test]
+    async fn serve_clients_exits_after_the_idle_grace_once_the_last_client_disconnects() {
+        let name = "isekai-ssh-mux-idle-exit-test";
+        let token = Arc::new(b"tok".to_vec());
+        // The real TCP handshake against the mock sshd must run with real time
+        // (russh's own handshake has timer-based internals that can misbehave
+        // under a paused clock) — only pause *after* authentication completes,
+        // for the idle-grace fast-forwarding below.
+        let handle = Arc::new(Mutex::new(authed_test_handle().await));
+        tokio::time::pause();
+
+        let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
+        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None));
+
+        // One client connects, sends Hello, then immediately disconnects
+        // (drops without Shutdown) — `relay_client`'s per-client task ends
+        // (successfully or not doesn't matter here) and decrements the count.
+        {
+            let conn = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
+            let (_r, mut w) = tokio::io::split(conn);
+            write_frame(&mut w, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 })
+                .await
+                .unwrap();
+            // conn drops here.
+        }
+        // Let the spawned relay task actually run to completion (read Hello,
+        // fail to write HelloAck to the now-dropped connection, decrement the
+        // count) *before* advancing the clock — otherwise the idle-exit grace
+        // sleep hasn't even started counting down yet when we jump the clock
+        // past it, and the assertion below races against a grace window that
+        // effectively restarts after the jump.
+        tokio::task::yield_now().await;
+
+        // Advance the paused clock past both the (short, since a client did
+        // connect) idle grace and give spawned tasks a chance to run.
+        tokio::time::advance(IDLE_GRACE + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), serve_task).await;
+        assert!(result.is_ok(), "serve_clients must exit once idle past the grace window, not hang forever");
+        assert!(result.unwrap().unwrap().is_ok(), "an idle-exit is a clean Ok(()), not an error");
+    }
+
+    /// If a second client connects while the accept loop is inside its
+    /// post-disconnect grace window, the exit must *not* fire — the loop goes
+    /// on serving instead of racing a shutdown against a legitimately new tab.
+    #[tokio::test]
+    async fn serve_clients_does_not_exit_if_a_new_client_arrives_during_the_grace_window() {
+        let name = "isekai-ssh-mux-idle-exit-reset-test";
+        let token = Arc::new(b"tok".to_vec());
+        let handle = Arc::new(Mutex::new(authed_test_handle().await));
+        tokio::time::pause();
+
+        let owner_channel = local_ipc_mux::InMemoryChannel::try_claim(name).await.unwrap();
+        let serve_task = tokio::spawn(serve_clients(owner_channel, handle, token, None));
+
+        // First client connects then disconnects immediately.
+        {
+            let conn = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
+            let (_r, mut w) = tokio::io::split(conn);
+            write_frame(&mut w, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
+        }
+        tokio::task::yield_now().await;
+
+        // Well within the idle grace, a second client connects and stays
+        // connected (holds its Hello/HelloAck round-trip open).
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let conn2 = local_ipc_mux::InMemoryChannel::connect(name).await.unwrap();
+        let (mut r2, mut w2) = tokio::io::split(conn2);
+        write_frame(&mut w2, &Frame::Hello { version: MUX_PROTOCOL_VERSION, token: b"tok".to_vec(), term: "xterm".to_string(), cols: 80, rows: 24 }).await.unwrap();
+        match read_frame(&mut r2).await.unwrap().unwrap() {
+            Frame::HelloAck { .. } => {}
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        // Advance well past what the *first* client's grace window would have
+        // been — the loop must still be alive, serving the still-connected
+        // second client, not exited.
+        tokio::time::advance(IDLE_GRACE + Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!serve_task.is_finished(), "a still-connected client must prevent the idle-exit from firing");
+
+        drop(w2);
+        serve_task.abort();
     }
 
     /// A mock sshd whose shell echoes back a fixed banner plus whatever stdin
