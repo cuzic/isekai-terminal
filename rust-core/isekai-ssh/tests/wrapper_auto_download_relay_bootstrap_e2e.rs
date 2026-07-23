@@ -496,11 +496,23 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut saw_registered = false;
     let mut stderr_text = String::new();
+    // Tolerate a few consecutive quiet 20s windows before giving up, rather
+    // than bailing on the very first one — this scenario's arch-detection +
+    // mock HTTP download + install sequence is more network round trips than
+    // the plainer sibling scenarios, and every one of those intermediate
+    // steps logs to the verbose log file, not stderr (see the comment on
+    // `ISEKAI_PIPE_LOG_FILE` above), so a real but still-progressing run can
+    // go stderr-silent for a while. A real `test-windows` CI failure
+    // (2026-07-23) showed this exact loop bail after a single 20s window
+    // right after the TOFU prompt — the same CI-slowness class of gotcha
+    // `wrapper_auto_bootstrap_e2e.rs`'s sibling loop already tolerates.
+    let mut consecutive_timeouts = 0;
     for _ in 0..200 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(20), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 stderr_text.push_str(&line);
                 let verbose_log_has_registered = std::fs::read_to_string(home.join("isekai-ssh-verbose-test.log"))
@@ -511,7 +523,23 @@ async fn isekai_ssh_bootstraps_a_brand_new_host_via_relay_with_no_binary_flag_an
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                // Also recheck the verbose log on a quiet stderr window — the
+                // "Registered" line itself only ever lands there, never on
+                // stderr, so a run that finished during a silent window must
+                // not be treated as stuck.
+                let verbose_log_has_registered = std::fs::read_to_string(home.join("isekai-ssh-verbose-test.log"))
+                    .map(|s| s.contains("Registered"))
+                    .unwrap_or(false);
+                if verbose_log_has_registered {
+                    saw_registered = true;
+                    break;
+                }
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
