@@ -787,8 +787,33 @@ mod tests {
             host: "mybox".to_string(),
             name: "infinite".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),
+            // Unlike every other `:loop& echo x& goto loop` use in this
+            // module/`build_relay.rs` (which forward straight into an
+            // *unbounded* test channel with no reader ever stopping early),
+            // this test's own "owner" permanently stops draining `or` the
+            // moment it sees one output chunk (see below) — so `run_inner`'s
+            // `write_frame` onto the bounded 64 KiB duplex blocks once that
+            // buffer fills, and unlike Unix's throttled `sleep 0.01`, an
+            // *unthrottled* Windows loop can refill it faster than the child
+            // gets killed, wedging `run_inner`'s own `select!` inside that one
+            // write forever — never reaching the `frame_rx` branch that would
+            // even deliver the abort sentinel telling it to kill the child
+            // (a real `test-windows` CI hang/10s-timeout, confirmed once this
+            // test finally got past an unrelated `build_profile.rs` Windows
+            // compile bug and ran on real Windows CI for the first time,
+            // 2026-07-23). `ping`-based throttling (the standard
+            // console-free "sleep" idiom on Windows — `timeout.exe` refuses
+            // non-console stdin, see this crate's other Windows test-shim
+            // docs for the same class of gotcha) keeps this test's own
+            // backlog small, matching Unix's already-throttled design intent
+            // rather than the CI-only symptom this masks. The underlying
+            // backpressure-vs-abort race this surfaced is real production
+            // behavior (a build noisier than the owner→remote ctl channel can
+            // drain, aborted mid-stream, could wedge the same way) — tracked
+            // separately, not fixed here (out of scope for a mux/holder e2e
+            // coverage pass).
             command: if cfg!(windows) {
-                ":loop& echo x& goto loop".to_string()
+                ":loop& echo x& ping -n 2 127.0.0.1 >nul& goto loop".to_string()
             } else {
                 "while true; do printf x; sleep 0.01; done".to_string()
             },
