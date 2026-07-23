@@ -549,14 +549,14 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
         // Without this, the native connect path's `ConnectOutcome` side
         // channel (`always-connects.md`) falls back to a shared
-        // `%TEMP%\isekai-<uid>` runtime dir — a real `test-windows` CI
-        // failure (2026-07-23) showed the *sibling* unreachable-endpoint
-        // test in this same file misclassify as `StaleTrust` instead of
-        // `Unreachable`, consistent with cross-test interference over that
-        // shared directory when multiple tests in this file run
-        // concurrently (Rust's default test harness). Isolating each test's
-        // own runtime dir under its own `tmp`, same as this crate's
-        // `mux_holder_windows_e2e.rs`, removes the shared state entirely.
+        // `%TEMP%\isekai-<uid>` runtime dir, shared with every other test in
+        // this file (and process) — isolating it under this test's own
+        // `tmp`, same as this crate's `mux_holder_windows_e2e.rs`, is a
+        // correctness improvement regardless (this file's own tests do run
+        // concurrently by default), even though it turned out *not* to be
+        // the cause of a real `test-windows` CI failure investigated
+        // alongside this (2026-07-23) — see the sibling unreachable-endpoint
+        // test's read-loop comment for what that one actually was.
         .env("ISEKAI_PIPE_RUNTIME_DIR", tmp.path().join("runtime"))
         // Verbose bootstrap-progress messages (including "Registered ...
         // in ...", which this test counts below) now default to
@@ -769,11 +769,10 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
         .env("HOME", &home)
         .env("PATH", &shim.path_env)
         .env("ISEKAI_PIPE_PROFILES_DIR", profiles_dir_under(&home))
-        // See the identical comment in the sibling stale-trust test above:
-        // without this, this test shared a `%TEMP%\isekai-<uid>` runtime
-        // dir with every other test in this file, which a real
-        // `test-windows` CI failure (2026-07-23) showed causing this exact
-        // test to misclassify as `StaleTrust` instead of `Unreachable`.
+        // See the identical comment in the sibling stale-trust test above —
+        // a correctness improvement (per-test isolated runtime dir) that
+        // turned out not to be this test's real `test-windows` CI failure;
+        // see the read-loop comment below for the actual cause.
         .env("ISEKAI_PIPE_RUNTIME_DIR", tmp.path().join("runtime"))
         // Verbose bootstrap-progress messages (including "Registered ...
         // in ...", which this test counts below) now default to
@@ -797,12 +796,23 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
     // The dead endpoint's QUIC dial has to actually time out
     // (`isekai-transport::system::CLIENT_MAX_IDLE_TIMEOUT`, 15s) before the
     // first `ssh` attempt fails at all, so this loop's per-line timeout is
-    // generous.
+    // generous. Tolerate a few consecutive quiet windows before giving up,
+    // rather than bailing on the very first one, the same as this crate's
+    // other e2e loops — a real `test-windows` CI failure (2026-07-23)
+    // showed this exact loop bail after a single 25s window (only 10s of
+    // margin over the real 15s dial timeout) while the wrapper's own
+    // verbose log proved it was still genuinely mid-redeploy, not stuck; an
+    // initial read here also isn't guaranteed to land the very same line
+    // this test's earlier tests may have already logged (each test's own
+    // subprocess/log file is independent per this file's fixtures, so this
+    // isn't cross-test bleed — just real CI slowness on Windows).
+    let mut consecutive_timeouts = 0;
     for _ in 0..400 {
         let mut line = String::new();
         match tokio::time::timeout(Duration::from_secs(25), stderr.read_line(&mut line)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
+                consecutive_timeouts = 0;
                 eprint!("[isekai-ssh stderr] {line}");
                 stderr_log.push_str(&line);
                 if line.contains("could not be reached") {
@@ -814,7 +824,12 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
                     break;
                 }
             }
-            _ => break,
+            _ => {
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    break;
+                }
+            }
         }
     }
     let _ = child.start_kill();
