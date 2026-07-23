@@ -64,6 +64,17 @@ pub struct HostConfig {
     /// `ssh_config(5)` `IdentityFile` semantics — later matches add
     /// candidates rather than overriding).
     pub identity_file: Vec<PathBuf>,
+    /// `CertificateFile`, accumulated the same way as `identity_file`
+    /// (positionally: `certificate_file[i]` is meant to pair with
+    /// `identity_file[i]`, matching `ssh_config(5)`'s own pairing — a caller
+    /// wanting the paired certificate for a given identity index does that
+    /// pairing itself, this struct just accumulates the raw list). Real
+    /// `ssh(1)` also auto-discovers a certificate at `<IdentityFile>-cert.pub`
+    /// when no explicit `CertificateFile` is configured — that convention
+    /// lives with the caller doing file-system lookups (`isekai-ssh`'s
+    /// connect path), not here (this crate does no I/O beyond reading config
+    /// files themselves).
+    pub certificate_file: Vec<PathBuf>,
     /// Raw value, not parsed further (e.g. `"user@jump-host:2222"` or
     /// `"host1,host2"` for a multi-hop chain) — parsing this into hops is
     /// the caller's job.
@@ -185,6 +196,9 @@ fn apply_keyword(config: &mut HostConfig, keyword: &str, value: &str) {
         }
         "identityfile" => {
             config.identity_file.push(expand_tilde(value));
+        }
+        "certificatefile" => {
+            config.certificate_file.push(expand_tilde(value));
         }
         "proxyjump" => {
             // `ProxyJump none` (ssh_config(5)) explicitly disables jumping —
@@ -597,6 +611,19 @@ Host *
             config.identity_file,
             vec![PathBuf::from("/path/to/id_ed25519"), PathBuf::from("/path/to/id_rsa")]
         );
+    }
+
+    #[test]
+    fn certificate_file_accumulates_positionally_with_identity_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host example
+    IdentityFile /path/to/id_ed25519
+    CertificateFile /path/to/id_ed25519-cert.pub
+");
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.identity_file, vec![PathBuf::from("/path/to/id_ed25519")]);
+        assert_eq!(config.certificate_file, vec![PathBuf::from("/path/to/id_ed25519-cert.pub")]);
     }
 
     #[test]

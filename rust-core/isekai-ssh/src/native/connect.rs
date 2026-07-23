@@ -41,9 +41,9 @@ use async_trait::async_trait;
 use isekai_pipe_core::{claim_connect_outcome, default_runtime_dir, ConnectionIntent};
 use russh::client;
 use russh_stream_session::{
-    authenticate_keyboard_interactive, authenticate_publickey_with_passphrase, authenticate_session,
-    establish_over_stream, open_channel, verifying_handler_with_routes_and_reason, Credential, ForwardRoutes,
-    KeyboardInteractivePrompt, RejectionReason, SessionError, SessionKind,
+    authenticate_keyboard_interactive, authenticate_openssh_cert_with_passphrase, authenticate_publickey_with_passphrase,
+    authenticate_session, establish_over_stream, open_channel, verifying_handler_with_routes_and_reason, Credential,
+    ForwardRoutes, KeyboardInteractivePrompt, RejectionReason, SessionError, SessionKind,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -786,8 +786,13 @@ where
     // or unparseable — is skipped, never fatal, so it can't block a
     // perfectly-good candidate listed before *or* after it, nor the SSH-agent
     // fallback below. Only a genuine transport/protocol error aborts.
-    for candidate in &candidates {
-        let Some(credential) = private_key::read_credential(candidate) else {
+    for (index, candidate) in candidates.iter().enumerate() {
+        // `read_credential_with_certificate` also resolves a paired
+        // `CertificateFile` (an explicit one positionally, else `ssh(1)`'s own
+        // `<candidate>-cert.pub` default convention) and upgrades to
+        // `Credential::PublicKeyWithCertificate` when one is found and
+        // readable — see its own docs for the pairing rules.
+        let Some(credential) = private_key::read_credential_with_certificate(host_config, candidate, index) else {
             log_line!("isekai-ssh: no key at {}", candidate.display());
             continue;
         };
@@ -795,12 +800,18 @@ where
         match authenticate_session(&mut handle, username, &credential).await {
             Ok(true) => return Ok(handle),
             Ok(false) => continue,
-            Err(SessionError::InvalidPrivateKey(_)) => continue,
+            Err(SessionError::InvalidPrivateKey(_) | SessionError::InvalidCertificate(_)) => continue,
             Err(SessionError::EncryptedPrivateKey) => {
-                let Credential::PublicKey { private_key_pem } = &credential else {
-                    continue; // unreachable: EncryptedPrivateKey only comes from the PublicKey arm
+                let (private_key_pem, certificate_pem): (&[u8], Option<&[u8]>) = match &credential {
+                    Credential::PublicKey { private_key_pem } => (private_key_pem, None),
+                    Credential::PublicKeyWithCertificate { private_key_pem, certificate_pem } => {
+                        (private_key_pem, Some(certificate_pem))
+                    }
+                    Credential::Password(_) => continue, // unreachable: EncryptedPrivateKey never comes from a password
                 };
-                if try_encrypted_identity(&mut handle, username, candidate, private_key_pem, prompts.passphrase).await? {
+                if try_encrypted_identity(&mut handle, username, candidate, private_key_pem, certificate_pem, prompts.passphrase)
+                    .await?
+                {
                     return Ok(handle);
                 }
             }
@@ -835,8 +846,9 @@ where
 /// reported as passphrase-protected (`SessionError::EncryptedPrivateKey`).
 /// Prompts (via `prompt_passphrase`) up to 3 times — matching `ssh(1)`'s own
 /// passphrase-retry convention — trying [`authenticate_publickey_with_passphrase`]
-/// with each answer. `prompt_passphrase` returning `None` (the caller gave up,
-/// or — in silent/automated mode — refuses to prompt at all, see
+/// (or, when `certificate_pem` is `Some`, [`authenticate_openssh_cert_with_passphrase`]
+/// instead) with each answer. `prompt_passphrase` returning `None` (the caller
+/// gave up, or — in silent/automated mode — refuses to prompt at all, see
 /// `run_authenticated_session`'s construction of it) stops the retry loop
 /// immediately and moves on to the next candidate/the SSH agent, exactly like
 /// exhausting the retry count does.
@@ -845,16 +857,22 @@ async fn try_encrypted_identity<H: client::Handler>(
     username: &str,
     path: &Path,
     private_key_pem: &[u8],
+    certificate_pem: Option<&[u8]>,
     prompt_passphrase: &(dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
 ) -> Result<bool> {
     for attempt in 1..=3 {
         let Some(passphrase) = prompt_passphrase(path, attempt) else {
             return Ok(false);
         };
-        match authenticate_publickey_with_passphrase(handle, username, private_key_pem, &passphrase).await {
+        let result = match certificate_pem {
+            Some(cert) => authenticate_openssh_cert_with_passphrase(handle, username, private_key_pem, cert, &passphrase).await,
+            None => authenticate_publickey_with_passphrase(handle, username, private_key_pem, &passphrase).await,
+        };
+        match result {
             Ok(true) => return Ok(true),
-            Ok(false) => return Ok(false), // server rejected the (successfully decrypted) key — not a passphrase problem
-            Err(SessionError::InvalidPrivateKey(_)) => continue, // wrong passphrase (or truly malformed key): retry
+            Ok(false) => return Ok(false), // server rejected the (successfully decrypted) key/cert — not a passphrase problem
+            // Wrong passphrase (or truly malformed key/cert): retry with a fresh prompt.
+            Err(SessionError::InvalidPrivateKey(_) | SessionError::InvalidCertificate(_)) => continue,
             Err(e) => return Err(anyhow::Error::new(e).context("SSH authentication request failed")),
         }
     }
@@ -1226,6 +1244,132 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, pem.as_bytes()).unwrap();
         (path, private.public_key().clone())
+    }
+
+    /// Writes an ed25519 identity file (like [`write_ed25519_identity`]) plus
+    /// a certificate for it, signed by a freshly generated CA key, at the
+    /// `ssh(1)`-default `<name>-cert.pub` sibling path — so a test can prove
+    /// `read_credential_with_certificate`'s default-discovery convention
+    /// (no explicit `CertificateFile` configured) actually authenticates
+    /// end-to-end. Returns the identity path and the CA's public key (to
+    /// configure a server that trusts it).
+    fn write_ed25519_identity_with_default_cert(dir: &Path, name: &str, seed: u8, ca_seed: u8) -> (PathBuf, SshPublicKey) {
+        let (identity_path, _subject_public) = write_ed25519_identity(dir, name, seed);
+        let subject_private = SshPrivateKey::from_openssh(&std::fs::read(&identity_path).unwrap()).unwrap();
+        let ca_key = SshPrivateKey::from(Ed25519Keypair::from_seed(&[ca_seed; 32]));
+
+        let mut builder = russh_keys::ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rand::rngs::OsRng,
+            subject_private.public_key().key_data().clone(),
+            0,
+            u32::MAX as u64,
+        )
+        .unwrap();
+        builder.cert_type(russh_keys::ssh_key::certificate::CertType::User).unwrap();
+        builder.valid_principal("tester").unwrap();
+        let cert = builder.sign(&ca_key).unwrap();
+
+        let mut cert_path = identity_path.as_os_str().to_owned();
+        cert_path.push("-cert.pub");
+        std::fs::write(PathBuf::from(cert_path), cert.to_openssh().unwrap().as_bytes()).unwrap();
+
+        (identity_path, ca_key.public_key().clone())
+    }
+
+    /// Accepts an OpenSSH certificate authentication iff it's signed by
+    /// `trusted_ca` (mirrors `russh_stream_session`'s own `CertificateServer`
+    /// test double). Rejects plain publickey/password outright, so a test
+    /// using this server proves the connection actually went through the
+    /// certificate path, not a lucky plain-pubkey fallback.
+    #[derive(Clone)]
+    struct CertificateOnlyServer {
+        trusted_ca: SshPublicKey,
+    }
+
+    impl server::Server for CertificateOnlyServer {
+        type Handler = CertificateOnlyHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> CertificateOnlyHandler {
+            CertificateOnlyHandler { trusted_ca: self.trusted_ca.clone() }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CertificateOnlyHandler {
+        trusted_ca: SshPublicKey,
+    }
+
+    #[async_trait]
+    impl server::Handler for CertificateOnlyHandler {
+        type Error = russh::Error;
+
+        async fn auth_openssh_certificate(
+            &mut self, _user: &str, certificate: &russh_keys::ssh_key::Certificate,
+        ) -> Result<Auth, Self::Error> {
+            Ok(if certificate.signature_key() == self.trusted_ca.key_data() {
+                Auth::Accept
+            } else {
+                Auth::Reject { proceed_with_methods: None }
+            })
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_succeeds_via_the_default_discovered_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (identity_path, ca_public) = write_ed25519_identity_with_default_cert(dir.path(), "id_ed25519", 230, 231);
+        let addr = spawn_server(CertificateOnlyServer { trusted_ca: ca_public }, 230).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // No CertificateFile configured explicitly: this must be found via
+        // ssh(1)'s own default `<identity>-cert.pub` discovery convention.
+        let host_config = openssh_config::HostConfig { identity_file: vec![identity_path], ..Default::default() };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
+        assert!(
+            result.is_ok(),
+            "the default-discovered certificate must authenticate: {}",
+            result.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+
+    /// Like [`write_ed25519_identity_with_default_cert`], but encrypts the
+    /// identity key with `passphrase` — so a test can prove the
+    /// encrypted-key retry path (`try_encrypted_identity`) correctly carries
+    /// the paired certificate through, not just plain pubkey auth.
+    fn write_encrypted_ed25519_identity_with_default_cert(
+        dir: &Path, name: &str, seed: u8, ca_seed: u8, passphrase: &str,
+    ) -> (PathBuf, SshPublicKey) {
+        let (identity_path, ca_public) = write_ed25519_identity_with_default_cert(dir, name, seed, ca_seed);
+        let plain = SshPrivateKey::from_openssh(&std::fs::read(&identity_path).unwrap()).unwrap();
+        let encrypted = plain.encrypt(&mut rand::rngs::OsRng, passphrase).unwrap();
+        std::fs::write(&identity_path, encrypted.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+        (identity_path, ca_public)
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_succeeds_via_an_encrypted_identity_with_a_paired_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (identity_path, ca_public) =
+            write_encrypted_ed25519_identity_with_default_cert(dir.path(), "id_ed25519", 232, 233, "hunter2");
+        let addr = spawn_server(CertificateOnlyServer { trusted_ca: ca_public }, 231).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![identity_path], ..Default::default() };
+        let passphrase_prompt = |_path: &Path, _attempt: u32| Some("hunter2".to_string());
+        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
+        assert!(
+            result.is_ok(),
+            "the right passphrase must decrypt the key and authenticate via its paired certificate: {}",
+            result.err().map(|e| e.to_string()).unwrap_or_default()
+        );
     }
 
     /// Like [`write_ed25519_identity`], but encrypts the key with `passphrase`
@@ -1685,7 +1829,7 @@ mod tests {
             *calls.lock().unwrap() += 1;
             Some("hunter2".to_string())
         };
-        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, &prompt).await.unwrap();
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, None, &prompt).await.unwrap();
         assert!(ok);
         assert_eq!(*calls.lock().unwrap(), 1, "the first correct passphrase must succeed without retrying");
     }
@@ -1706,7 +1850,7 @@ mod tests {
             *last_attempt.lock().unwrap() = attempt;
             if attempt < 3 { Some("wrong".to_string()) } else { Some("hunter2".to_string()) }
         };
-        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, &prompt).await.unwrap();
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, None, &prompt).await.unwrap();
         assert!(ok, "the 3rd attempt has the right passphrase");
         assert_eq!(*last_attempt.lock().unwrap(), 3);
     }
@@ -1722,7 +1866,7 @@ mod tests {
         let config = Arc::new(client::Config::default());
         let mut handle = establish_over_stream(config, stream, verifying_handler(&verifier)).await.unwrap();
 
-        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, &|_, _| None).await.unwrap();
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, None, &|_, _| None).await.unwrap();
         assert!(!ok, "a refused prompt (e.g. silent mode) must give up, not hang or error");
     }
 
@@ -1742,7 +1886,7 @@ mod tests {
             *calls.lock().unwrap() += 1;
             Some("still-wrong".to_string())
         };
-        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, &prompt).await.unwrap();
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, None, &prompt).await.unwrap();
         assert!(!ok, "3 wrong passphrases in a row must give up, not retry forever");
         assert_eq!(*calls.lock().unwrap(), 3);
     }

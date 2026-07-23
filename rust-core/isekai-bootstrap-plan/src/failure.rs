@@ -215,9 +215,15 @@ fn classify_session_error(err: &russh_stream_session::SessionError) -> Option<Bo
         // connection this classifier doesn't cover), so from here a
         // passphrase-protected key is just as unusable without manual
         // intervention as a malformed one.
-        S::JumpAuthFailed { .. } | S::Auth(_) | S::AgentAuth(_) | S::InvalidPrivateKey(_) | S::EncryptedPrivateKey => {
-            Some(BootstrapFailure::AuthenticationRequired)
-        }
+        // `InvalidCertificate` (a malformed `CertificateFile`) lands in the
+        // same bucket for the same reason as `InvalidPrivateKey`/
+        // `EncryptedPrivateKey` above.
+        S::JumpAuthFailed { .. }
+        | S::Auth(_)
+        | S::AgentAuth(_)
+        | S::InvalidPrivateKey(_)
+        | S::EncryptedPrivateKey
+        | S::InvalidCertificate(_) => Some(BootstrapFailure::AuthenticationRequired),
     }
 }
 

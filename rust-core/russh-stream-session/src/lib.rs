@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use russh::client;
-use russh_keys::{HashAlg, PrivateKey, PublicKey};
+use russh_keys::{ssh_key::Certificate, HashAlg, PrivateKey, PublicKey};
 use tokio::sync::mpsc;
 
 /// Errors that can occur while connecting, authenticating, or opening a
@@ -45,6 +45,8 @@ pub enum SessionError {
     InvalidPrivateKey(russh_keys::ssh_key::Error),
     #[error("private key is passphrase-protected and needs to be decrypted before use")]
     EncryptedPrivateKey,
+    #[error("certificate could not be parsed as OpenSSH format: {0}")]
+    InvalidCertificate(russh_keys::ssh_key::Error),
     #[error("authentication request failed: {0}")]
     Auth(russh::Error),
     #[error("agent-backed authentication failed: {0}")]
@@ -109,6 +111,12 @@ impl RejectionReason {
 pub enum Credential {
     Password(String),
     PublicKey { private_key_pem: Vec<u8> },
+    /// `ssh_config(5)` `CertificateFile` authentication: `private_key_pem`
+    /// signs the challenge, `certificate_pem` (OpenSSH text format, e.g.
+    /// `id_ed25519-cert.pub`) is presented alongside the public key so the
+    /// server can validate it against its trusted CA instead of (or in
+    /// addition to) the bare key.
+    PublicKeyWithCertificate { private_key_pem: Vec<u8>, certificate_pem: Vec<u8> },
 }
 
 impl Credential {
@@ -117,6 +125,13 @@ impl Credential {
         match self {
             Credential::Password(password) => password.zeroize(),
             Credential::PublicKey { private_key_pem } => private_key_pem.zeroize(),
+            // The certificate itself is public data (no secret material), but
+            // zeroizing it too costs nothing and keeps this match exhaustive
+            // without a special case to remember not to touch it.
+            Credential::PublicKeyWithCertificate { private_key_pem, certificate_pem } => {
+                private_key_pem.zeroize();
+                certificate_pem.zeroize();
+            }
         }
     }
 }
@@ -474,6 +489,19 @@ pub async fn authenticate_session<H: client::Handler>(
             }
             session.authenticate_publickey(username, Arc::new(key)).await.map_err(SessionError::Auth)
         }
+        Credential::PublicKeyWithCertificate { private_key_pem, certificate_pem } => {
+            let key = PrivateKey::from_openssh(private_key_pem).map_err(SessionError::InvalidPrivateKey)?;
+            if key.is_encrypted() {
+                return Err(SessionError::EncryptedPrivateKey);
+            }
+            // Lossy: an invalid-UTF-8 certificate file is malformed either way,
+            // and `Certificate::from_openssh` itself will reject the resulting
+            // (possibly replacement-charred) text with a proper parse error —
+            // no need for a separate encoding-failure branch here.
+            let cert = Certificate::from_openssh(&String::from_utf8_lossy(certificate_pem))
+                .map_err(SessionError::InvalidCertificate)?;
+            session.authenticate_openssh_cert(username, Arc::new(key), cert).await.map_err(SessionError::Auth)
+        }
     }
 }
 
@@ -494,6 +522,24 @@ pub async fn authenticate_publickey_with_passphrase<H: client::Handler>(
     let encrypted = PrivateKey::from_openssh(private_key_pem).map_err(SessionError::InvalidPrivateKey)?;
     let key = encrypted.decrypt(passphrase).map_err(SessionError::InvalidPrivateKey)?;
     session.authenticate_publickey(username, Arc::new(key)).await.map_err(SessionError::Auth)
+}
+
+/// Like [`authenticate_publickey_with_passphrase`], but for a
+/// `CertificateFile`-paired key (see [`Credential::PublicKeyWithCertificate`]):
+/// decrypts `private_key_pem` with `passphrase`, then authenticates with the
+/// decrypted key and `certificate_pem` together via
+/// `authenticate_openssh_cert`.
+pub async fn authenticate_openssh_cert_with_passphrase<H: client::Handler>(
+    session: &mut client::Handle<H>,
+    username: &str,
+    private_key_pem: &[u8],
+    certificate_pem: &[u8],
+    passphrase: &str,
+) -> Result<bool, SessionError> {
+    let encrypted = PrivateKey::from_openssh(private_key_pem).map_err(SessionError::InvalidPrivateKey)?;
+    let key = encrypted.decrypt(passphrase).map_err(SessionError::InvalidPrivateKey)?;
+    let cert = Certificate::from_openssh(&String::from_utf8_lossy(certificate_pem)).map_err(SessionError::InvalidCertificate)?;
+    session.authenticate_openssh_cert(username, Arc::new(key), cert).await.map_err(SessionError::Auth)
 }
 
 /// One server-issued prompt during a keyboard-interactive authentication
@@ -876,6 +922,168 @@ mod tests {
         let key = PrivateKey::from(keypair);
         let encrypted = key.encrypt(&mut rand::rngs::OsRng, passphrase).expect("encrypt a freshly generated key");
         encrypted.to_openssh(Default::default()).unwrap().as_bytes().to_vec()
+    }
+
+    /// Generates a fresh ed25519 "subject" keypair, signs it with a freshly
+    /// generated CA key (`ca_seed`) into an OpenSSH user certificate valid
+    /// for `principal`, and returns (unencrypted subject key PEM,
+    /// certificate PEM, CA public key) — a real signed certificate, not a
+    /// hand-rolled fixture, exercising the same `ssh_key::certificate` code
+    /// path a real `ssh-keygen -s ca_key -I id -n user id_ed25519.pub` cert
+    /// would produce.
+    fn write_signed_certificate(seed: u8, ca_seed: u8, principal: &str) -> (Vec<u8>, Vec<u8>, russh_keys::ssh_key::PublicKey) {
+        let ca_key = PrivateKey::from(Ed25519Keypair::from_seed(&[ca_seed; 32]));
+        let subject_key = PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]));
+        let subject_pem = subject_key.to_openssh(Default::default()).unwrap().as_bytes().to_vec();
+
+        let mut builder = russh_keys::ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rand::rngs::OsRng,
+            subject_key.public_key().key_data().clone(),
+            0,
+            u32::MAX as u64, // valid "forever" (2106), avoids a SystemTime dependency in tests
+        )
+        .expect("build certificate builder");
+        builder.cert_type(russh_keys::ssh_key::certificate::CertType::User).unwrap();
+        builder.valid_principal(principal).unwrap();
+        let cert = builder.sign(&ca_key).expect("sign certificate with CA key");
+        let cert_pem = cert.to_openssh().unwrap().into_bytes();
+
+        (subject_pem, cert_pem, ca_key.public_key().clone())
+    }
+
+    /// Accepts an OpenSSH certificate authentication iff it's signed by
+    /// `trusted_ca` — the minimal real-world check a cert-aware sshd does
+    /// (russh itself already verified the signature/expiry/principal before
+    /// calling this handler, per `auth_openssh_certificate`'s doc comment).
+    #[derive(Clone)]
+    struct CertificateServer {
+        trusted_ca: russh_keys::ssh_key::PublicKey,
+    }
+
+    impl server::Server for CertificateServer {
+        type Handler = CertificateHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> CertificateHandler {
+            CertificateHandler { trusted_ca: self.trusted_ca.clone() }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CertificateHandler {
+        trusted_ca: russh_keys::ssh_key::PublicKey,
+    }
+
+    #[async_trait]
+    impl server::Handler for CertificateHandler {
+        type Error = russh::Error;
+
+        async fn auth_openssh_certificate(
+            &mut self, _user: &str, certificate: &Certificate,
+        ) -> Result<Auth, Self::Error> {
+            Ok(if certificate.signature_key() == self.trusted_ca.key_data() {
+                Auth::Accept
+            } else {
+                Auth::Reject { proceed_with_methods: None }
+            })
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn certificate_authentication_succeeds_when_signed_by_the_trusted_ca() {
+        let (subject_pem, cert_pem, ca_public) = write_signed_certificate(40, 140, "tester");
+        let addr = spawn_server(CertificateServer { trusted_ca: ca_public }, 23).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let authed = authenticate_session(
+            &mut session.handle, "tester",
+            &Credential::PublicKeyWithCertificate { private_key_pem: subject_pem, certificate_pem: cert_pem },
+        )
+        .await
+        .expect("a certificate signed by the server's trusted CA must authenticate cleanly");
+        assert!(authed);
+    }
+
+    #[tokio::test]
+    async fn certificate_authentication_is_rejected_cleanly_when_signed_by_an_untrusted_ca() {
+        let (subject_pem, cert_pem, _untrusted_ca_public) = write_signed_certificate(41, 141, "tester");
+        // The server trusts a *different* CA than the one that actually signed this cert.
+        let (_other_subject_pem, _other_cert_pem, some_other_ca_public) = write_signed_certificate(42, 142, "tester");
+        let addr = spawn_server(CertificateServer { trusted_ca: some_other_ca_public }, 24).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let authed = authenticate_session(
+            &mut session.handle, "tester",
+            &Credential::PublicKeyWithCertificate { private_key_pem: subject_pem, certificate_pem: cert_pem },
+        )
+        .await
+        .expect("a rejected credential is Ok(false), not an error");
+        assert!(!authed, "a cert signed by an untrusted CA must be rejected, not accepted");
+    }
+
+    #[tokio::test]
+    async fn certificate_authentication_reports_a_malformed_certificate_distinctly() {
+        let (subject_pem, _real_cert_pem, ca_public) = write_signed_certificate(43, 143, "tester");
+        let addr = spawn_server(CertificateServer { trusted_ca: ca_public }, 25).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let result = authenticate_session(
+            &mut session.handle, "tester",
+            &Credential::PublicKeyWithCertificate {
+                private_key_pem: subject_pem,
+                certificate_pem: b"not a real openssh certificate".to_vec(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SessionError::InvalidCertificate(_))),
+            "malformed certificate data should surface as InvalidCertificate, not a silent false: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_openssh_cert_with_passphrase_succeeds_with_an_encrypted_subject_key() {
+        let (subject_pem, cert_pem, ca_public) = write_signed_certificate(44, 144, "tester");
+        let subject_key = PrivateKey::from_openssh(&subject_pem).unwrap();
+        let encrypted_subject_pem =
+            subject_key.encrypt(&mut rand::rngs::OsRng, "hunter2").unwrap().to_openssh(Default::default()).unwrap().as_bytes().to_vec();
+        let addr = spawn_server(CertificateServer { trusted_ca: ca_public }, 26).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let mut session = connect_via_jump_or_direct(
+            None, Arc::new(client::Config::default()), &addr.ip().to_string(), addr.port(),
+            |_leg| verifying_handler(&verifier),
+        )
+        .await
+        .expect("direct connect should succeed");
+
+        let authed = authenticate_openssh_cert_with_passphrase(
+            &mut session.handle, "tester", &encrypted_subject_pem, &cert_pem, "hunter2",
+        )
+        .await
+        .expect("the right passphrase should decrypt the subject key and authenticate via the certificate");
+        assert!(authed);
     }
 
     #[tokio::test]
