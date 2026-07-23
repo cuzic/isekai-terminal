@@ -1093,6 +1093,8 @@ fun TerminalScreenBody(
                     CtrlBtn("↓") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_DOWN, screenUpdate?.applicationCursorMode ?: false)!!) }
                     CtrlBtn("←") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_LEFT, screenUpdate?.applicationCursorMode ?: false)!!) }
                     CtrlBtn("→") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_RIGHT, screenUpdate?.applicationCursorMode ?: false)!!) }
+                    CtrlBtn("PgUp") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_UP)!!) }
+                    CtrlBtn("PgDn") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_DOWN)!!) }
                     CtrlBtn("貼付", onClick = performPaste)
                     CtrlBtn("定型") { showSnippetSheet = true }
                     CtrlBtn("打鍵") { showKeySequenceSheet = true }
