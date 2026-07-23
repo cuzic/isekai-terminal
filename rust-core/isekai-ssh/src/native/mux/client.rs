@@ -787,33 +787,34 @@ mod tests {
             host: "mybox".to_string(),
             name: "infinite".to_string(),
             dir: workdir.path().to_string_lossy().into_owned(),
-            // Unlike every other `:loop& echo x& goto loop` use in this
-            // module/`build_relay.rs` (which forward straight into an
-            // *unbounded* test channel with no reader ever stopping early),
-            // this test's own "owner" permanently stops draining `or` the
-            // moment it sees one output chunk (see below) — so `run_inner`'s
-            // `write_frame` onto the bounded 64 KiB duplex blocks once that
-            // buffer fills, and unlike Unix's throttled `sleep 0.01`, an
-            // *unthrottled* Windows loop can refill it faster than the child
-            // gets killed, wedging `run_inner`'s own `select!` inside that one
-            // write forever — never reaching the `frame_rx` branch that would
-            // even deliver the abort sentinel telling it to kill the child
-            // (a real `test-windows` CI hang/10s-timeout, confirmed once this
-            // test finally got past an unrelated `build_profile.rs` Windows
-            // compile bug and ran on real Windows CI for the first time,
-            // 2026-07-23). `ping`-based throttling (the standard
-            // console-free "sleep" idiom on Windows — `timeout.exe` refuses
-            // non-console stdin, see this crate's other Windows test-shim
-            // docs for the same class of gotcha) keeps this test's own
-            // backlog small, matching Unix's already-throttled design intent
-            // rather than the CI-only symptom this masks. The underlying
-            // backpressure-vs-abort race this surfaced is real production
-            // behavior (a build noisier than the owner→remote ctl channel can
-            // drain, aborted mid-stream, could wedge the same way) — tracked
-            // separately, not fixed here (out of scope for a mux/holder e2e
-            // coverage pass).
+            // Deliberately *not* the `:loop& echo x& goto loop` shape every
+            // other Windows command in this module/`build_relay.rs` uses:
+            // this is the one place that shape actually mattered (this
+            // test's own "owner" below sends the abort after the very first
+            // chunk, so whether the child is genuinely still emitting output
+            // when the process is confirmed dead is the whole point of the
+            // assertion) and it produced a real `test-windows` CI hang — a
+            // `tokio::time::timeout(10s)` `Elapsed` on this exact test,
+            // reproduced twice on real Windows CI (2026-07-23), unaffected by
+            // adding a `ping`-based per-iteration throttle (ruling out a
+            // backpressure/flood theory — an unthrottled vs. ~1s-throttled
+            // loop hit the identical failure). That points at the `:label`
+            // itself, not timing: cmd.exe's line-oriented label handling is
+            // exactly the kind of MSYS/`cmd /C`-quoting-adjacent quirk this
+            // crate has been burned by before (see `ssh_test_shim`'s module
+            // docs on `CreateProcess`/batch-file argument parsing), so rather
+            // than continue guessing at GOTO-based one-liner semantics this
+            // uses plain bounded repetition of the same `&`-chained shape the
+            // *passing* `client_runs_a_build_profile_and_streams_output_to_the_owner`
+            // test already proves works on Windows — no label/GOTO at all.
+            // 40 repetitions (~40s if never aborted) is comfortably longer
+            // than this test's own 10s budget, so the child is guaranteed
+            // still running when the abort arrives without needing an
+            // unbounded loop; `ping -n 2 127.0.0.1 >nul` remains the
+            // per-iteration delay (the console-free "sleep ~1s" idiom —
+            // `timeout.exe` refuses non-console stdin).
             command: if cfg!(windows) {
-                ":loop& echo x& ping -n 2 127.0.0.1 >nul& goto loop".to_string()
+                "echo x& ping -n 2 127.0.0.1 >nul& ".repeat(40)
             } else {
                 "while true; do printf x; sleep 0.01; done".to_string()
             },
@@ -825,36 +826,47 @@ mod tests {
         let (mut or, mut ow) = tokio::io::split(owner_conn);
 
         let owner = tokio::spawn(async move {
+            eprintln!("[diag] owner: waiting for Hello");
             match read_frame(&mut or).await.unwrap().unwrap() {
                 Frame::Hello { .. } => {}
                 other => panic!("expected Hello, got {other:?}"),
             }
+            eprintln!("[diag] owner: got Hello, sending HelloAck");
             write_frame(&mut ow, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await.unwrap();
 
+            eprintln!("[diag] owner: sending BuildRequest");
             let request = serde_json::to_vec(&isekai_protocol::CtlMessage::BuildRequest { profile: "infinite".to_string() }).unwrap();
             write_frame(&mut ow, &Frame::Ctl(request)).await.unwrap();
 
             // Wait for at least one real output chunk (proves the build
             // actually started) before telling the client to abort it.
+            eprintln!("[diag] owner: waiting for first BuildOutputChunk");
             loop {
                 match read_frame(&mut or).await.unwrap().unwrap() {
                     Frame::Ctl(bytes) => {
-                        if matches!(isekai_protocol::decode_ctl_message(&bytes), Ok(isekai_protocol::CtlMessage::BuildOutputChunk { .. })) {
+                        let decoded = isekai_protocol::decode_ctl_message(&bytes);
+                        eprintln!("[diag] owner: got Ctl frame, decoded={decoded:?}");
+                        if matches!(decoded, Ok(isekai_protocol::CtlMessage::BuildOutputChunk { .. })) {
                             break;
                         }
                     }
-                    Frame::Shutdown => {} // empty test stdin hits EOF immediately; irrelevant here
+                    Frame::Shutdown => {
+                        eprintln!("[diag] owner: got Shutdown frame");
+                    }
                     other => panic!("unexpected frame: {other:?}"),
                 }
             }
 
+            eprintln!("[diag] owner: got first chunk, sending abort sentinel");
             let abort = serde_json::to_vec(&isekai_protocol::CtlMessage::BuildFinished {
                 exit_code: super::super::build_relay::BUILD_ABORTED_SENTINEL,
                 result_paths: Vec::new(),
             })
             .unwrap();
             write_frame(&mut ow, &Frame::Ctl(abort)).await.unwrap();
+            eprintln!("[diag] owner: sending Exit(0)");
             write_frame(&mut ow, &Frame::Exit(0)).await.unwrap();
+            eprintln!("[diag] owner: done, task ending");
         });
 
         let (cr, mut cw) = tokio::io::split(client_conn);
