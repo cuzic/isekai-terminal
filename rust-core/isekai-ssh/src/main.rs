@@ -9,6 +9,9 @@
 //! `init`/`login`/`logout` remain as the interactive subcommands that
 //! populate/manage the trust store the wrapper reads from.
 
+mod build_exec;
+mod build_profile;
+mod build_profile_cli;
 mod cli;
 mod ctl_forward;
 mod doctor;
@@ -133,15 +136,24 @@ async fn run() -> u8 {
     let exit_code: u8 = if wrapper::should_run_wrapper(&raw_args) {
         // Windows never shells out to a real `ssh(1)` — the native path is a
         // from-scratch `russh`-based client that never spawns Win32-OpenSSH.
-        // `native::mux::run` is the `ControlMaster`-equivalent dispatch: it
-        // becomes the owner of (or a client to) the shared connection for this
-        // resolved destination, falling back to the plain single-process
-        // `native::connect::run` path when multiplexing isn't possible. Unix/
-        // macOS keep the original `ssh(1)` ProxyCommand wrapper unchanged
+        // `native::mux::run` is the `ControlMaster`-equivalent dispatch: the
+        // foreground process is always a client, spawning a detached holder
+        // process (`native::mux::holder`) the first time there's no existing
+        // one to relay to, and falling back to the plain single-process
+        // `native::connect::run` path when multiplexing isn't possible. A
+        // re-exec'd holder itself is detected here, before any of the normal
+        // argv-derived dispatch, via `holder::is_holder_reexec` (an env var
+        // marker, not a CLI flag — the holder's argv must resolve to the same
+        // `Prepared`/channel name as the client that spawned it). Unix/macOS
+        // keep the original `ssh(1)` ProxyCommand wrapper unchanged
         // (`native/mod.rs`'s module docs: this module is built and unit-tested
         // everywhere, but only ever *invoked* here).
         #[cfg(windows)]
-        let result = native::mux::run(raw_args).await;
+        let result = if native::mux::holder::is_holder_reexec() {
+            native::mux::run_as_holder_entrypoint(raw_args).await
+        } else {
+            native::mux::run(raw_args).await
+        };
         #[cfg(not(windows))]
         let result = wrapper::run(raw_args).await;
 
@@ -170,6 +182,7 @@ async fn run() -> u8 {
             cli::Command::Login(args) => login::run(args).await,
             cli::Command::Logout => login::run_logout().await,
             cli::Command::Doctor(args) => doctor::run(args).await,
+            cli::Command::BuildProfile(command) => build_profile_cli::run(command).await,
         };
 
         match result {

@@ -78,6 +78,16 @@ pub fn token_file_name(channel_name: &str) -> String {
     format!("{leaf}.token")
 }
 
+/// The spawn-lock file name for a given channel (see `mux::mod::SpawnLock`):
+/// a best-effort cross-process mutex so at most one tab resolves the
+/// passphrase hand-off and spawns a detached holder for this destination at a
+/// time. Same leaf-name convention as [`token_file_name`], distinct suffix so
+/// the two never collide.
+pub fn spawn_lock_file_name(channel_name: &str) -> String {
+    let leaf = channel_name.rsplit('\\').next().unwrap_or(channel_name);
+    format!("{leaf}.spawning.lock")
+}
+
 /// Writes a length-prefixed field into the hasher so field boundaries are
 /// unambiguous (the injectivity property the module docs rely on).
 fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {

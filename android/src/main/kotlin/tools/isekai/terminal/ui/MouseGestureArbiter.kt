@@ -120,6 +120,18 @@ fun wheelButtonForDelta(deltaY: Float): MouseButton? = when {
 }
 
 /**
+ * 補助操作ドロワー(キーボード表示・ローカル履歴ページ送り・PgUp/PgDn・マウスホイール
+ * 送信のアイコンを一時表示するUI)を表示すべきか。指の本数を問わず、ジェスチャー
+ * 開始位置から上方向へ[thresholdPx]以上動いたら表示する。マウスレポーティング有効時に
+ * 1本指タップがクリックとして奪われる問題([shouldUseMouseTouch]参照)の回避策として、
+ * どの経路(マウスタッチ転送/選択/ピンチ)が同時に処理されていても検出できるよう、
+ * 呼び出し側では他のジェスチャーを消費しない別系統の`pointerInput`から呼ぶ想定
+ * (どのタッチ経路が同時に走っていても検出できる)。
+ */
+fun shouldRevealAuxDrawer(startY: Float, currentY: Float, thresholdPx: Float): Boolean =
+    startY - currentY >= thresholdPx
+
+/**
  * トラックパッド/マウスホイールの`PointerEventType.Scroll`の横方向delta量から、
  * 送出すべきxtermホイールボタンを決める。`deltaX == 0f`(スクロール量なし)は
  * 対象外として`null`を返す。符号規約: 正のdeltaX = 右方向へスクロール

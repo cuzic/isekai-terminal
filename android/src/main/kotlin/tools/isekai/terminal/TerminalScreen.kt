@@ -43,6 +43,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.delay
 import tools.isekai.terminal.data.KeySequence
 import tools.isekai.terminal.data.Snippet
 import tools.isekai.terminal.input.KeyStep
@@ -70,6 +71,7 @@ import tools.isekai.terminal.ui.isOpenableHyperlinkScheme
 import tools.isekai.terminal.ui.isPointerReportingActive as arbiterIsPointerReportingActive
 import tools.isekai.terminal.ui.linkUrlAtCell
 import tools.isekai.terminal.ui.offsetToCellPos
+import tools.isekai.terminal.ui.shouldRevealAuxDrawer
 import tools.isekai.terminal.ui.shouldReportMouseMotion
 import tools.isekai.terminal.ui.shouldUseMouseTouch
 import tools.isekai.terminal.ui.wheelButtonForDelta
@@ -542,6 +544,26 @@ fun TerminalScreenBody(
 
                 var panAccumY by remember { mutableStateOf(0f) }
 
+                // 補助操作ドロワー(キーボード表示・ローカル履歴ページ送り・PgUp/PgDn・マウス
+                // ホイール送信のアイコン)の表示状態。指の本数を問わない上向き垂直ドラッグ
+                // (下のpointerInputで検出、他の経路のジェスチャー消費とは独立)で表示し、
+                // 無操作が続くと自動的に隠れる。「UI表示だけに閉じた状態」としてComposeローカルで
+                // 保持する(選択範囲・スクロール位置と同じ扱い、rust-ssot原則の対象外)。
+                var auxDrawerVisible by remember { mutableStateOf(false) }
+                // ドロワーのボタン操作のたびに増やす。auto-hideの`LaunchedEffect`のkeyに使い、
+                // 操作中は毎回タイマーをリセットして消えないようにする。
+                var auxDrawerActivityTick by remember { mutableStateOf(0) }
+                val onAuxDrawerActivity: () -> Unit = {
+                    auxDrawerVisible = true
+                    auxDrawerActivityTick++
+                }
+                LaunchedEffect(auxDrawerVisible, auxDrawerActivityTick) {
+                    if (auxDrawerVisible) {
+                        delay(3000)
+                        auxDrawerVisible = false
+                    }
+                }
+
                 // IME フォーカス要求（単純タップ用）。AndroidView 生成前は no-op。
                 val requestImeFocus: () -> Unit = {
                     inputView?.let { view ->
@@ -914,6 +936,35 @@ fun TerminalScreenBody(
                                         }
                                     }
                                 }
+                            }
+                            // タスク#89: 補助操作ドロワー(キーボード表示/ローカル履歴ページ送り/
+                            // PgUp・PgDn/マウスホイール送信)を出す上向き垂直ドラッグの検出。
+                            // 上のマウスタッチ/ピンチ/ホイール経路とは独立した別系統の
+                            // `pointerInput`で、`change.consume()`を一切呼ばないため、
+                            // どの経路が同時にジェスチャーを処理していても(マウスモードの
+                            // クリック転送中でも、ピンチ中でも)検出できる。指の本数は問わない
+                            // (最初にdownした指[down.id]のY移動だけを見る——複数指が揃って
+                            // 動く通常のドラッグでは十分)。
+                            .pointerInput(Unit) {
+                                val thresholdPx = with(density) { 32.dp.toPx() }
+                                awaitPointerEventScope {
+                                    while (true) {
+                                        val down = awaitFirstDown(requireUnconsumed = false)
+                                        val startY = down.position.y
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val change = event.changes.firstOrNull { it.id == down.id }
+                                            if (change == null || !change.pressed) break
+                                            if (shouldRevealAuxDrawer(startY, change.position.y, thresholdPx)) {
+                                                onAuxDrawerActivity()
+                                                break
+                                            }
+                                        }
+                                        // 全ての指が離れるまで待ってから次のジェスチャー検出を始める
+                                        // (このgestureの残りのドラッグ量で連続再発火しないように)。
+                                        while (currentEvent.changes.any { it.pressed }) awaitPointerEvent()
+                                    }
+                                }
                             },
                     )
 
@@ -979,6 +1030,72 @@ fun TerminalScreenBody(
                                 color = Color.Cyan,
                                 fontSize = 11.sp,
                             )
+                        }
+                    }
+
+                    // タスク#89: 補助操作ドロワー。マウスレポーティング有効時は1本指タップが
+                    // クリック転送に使われ`requestImeFocus()`を呼ばない(=キーボードを
+                    // 呼び出す手段が無くなる)ため、ジェスチャー状態に依存しない常設の
+                    // 迂回路として、上向き垂直ドラッグで一時的に表示する(無操作3秒でオート
+                    // ハイド)。ローカル履歴ページ送り・マウスホイール送信は、以前検討した
+                    // 「指の本数で分岐」案がOEM各社(Xiaomi/OnePlus/Huawei/Oppo)のスクリーン
+                    // ショットジェスチャーやTalkBackの2本指/3本指スワイプと衝突するため、
+                    // ドラッグではなく通常のボタンタップに倒した(タップはTalkBackにも
+                    // 標準的に認識される)。
+                    // Box(BoxScope)の中だが外側の`Column`(ColumnScope)がまだ暗黙のレシーバー
+                    // として到達可能で、`ColumnScope.AnimatedVisibility`拡張とトップレベル関数
+                    // の間で解決が曖昧になる(実機ビルドで確認済みのコンパイルエラー)ため、
+                    // 完全修飾名で明示的にトップレベル版を呼ぶ。
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = auxDrawerVisible,
+                        enter = fadeIn(),
+                        exit = fadeOut(),
+                        modifier = Modifier.align(Alignment.CenterEnd).padding(end = 8.dp),
+                    ) {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier
+                                .background(Color(0xCC1A1A2E), shape = MaterialTheme.shapes.medium)
+                                .padding(6.dp),
+                        ) {
+                            CtrlBtn("⌨") { onAuxDrawerActivity(); requestImeFocus() }
+                            CtrlBtn("履歴▲") {
+                                onAuxDrawerActivity()
+                                scrollOffset = (scrollOffset + renderRows).coerceIn(0, scrollbackLen)
+                            }
+                            CtrlBtn("履歴▼") {
+                                onAuxDrawerActivity()
+                                scrollOffset = (scrollOffset - renderRows).coerceIn(0, scrollbackLen)
+                                // タスク#79: 手動でライブ方向へ0まで戻したら`showingScrollback`も
+                                // 解除する(「ライブへ戻る」ボタン・2本指パンと同じ扱い)。
+                                if (scrollOffset == 0) showingScrollback = false
+                            }
+                            CtrlBtn("PgUp") {
+                                onAuxDrawerActivity()
+                                actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_UP)!!)
+                            }
+                            CtrlBtn("PgDn") {
+                                onAuxDrawerActivity()
+                                actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_DOWN)!!)
+                            }
+                            // マウスホイール送信: リモートがマウスレポーティング未対応(モードOff)
+                            // の場合は`sendPointerEvent`内部の`terminalPointerEventBytes`(Rust側)が
+                            // nullを返して無送信になる(rust-ssot: 送るべきか否かの判断はRust側の
+                            // 状態を見るだけで、ここでKotlin側のミラー判定は行わない)。ボタン1回
+                            // タップ = ホイール1ノッチ(xtermのwheel up/downは1ノッチごとに独立した
+                            // PRESSイベントで、release不要)。3倍速ボタンは同じイベントを3回連続で
+                            // 送るだけ(vim/htop/less等、ノッチ数だけ行送りするアプリでの高速ページ
+                            // 送り用)。
+                            val sendWheel: (MouseButton, Int) -> Unit = { button, notches ->
+                                onAuxDrawerActivity()
+                                repeat(notches) {
+                                    sendPointerEvent(MouseEventKind.PRESS, button, latestRows.value / 2, latestCols.value / 2)
+                                }
+                            }
+                            CtrlBtn("Wheel▲") { sendWheel(MouseButton.WHEEL_UP, 1) }
+                            CtrlBtn("Wheel▼") { sendWheel(MouseButton.WHEEL_DOWN, 1) }
+                            CtrlBtn("Wheel▲3x") { sendWheel(MouseButton.WHEEL_UP, 3) }
+                            CtrlBtn("Wheel▼3x") { sendWheel(MouseButton.WHEEL_DOWN, 3) }
                         }
                     }
 
@@ -1093,6 +1210,8 @@ fun TerminalScreenBody(
                     CtrlBtn("↓") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_DOWN, screenUpdate?.applicationCursorMode ?: false)!!) }
                     CtrlBtn("←") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_LEFT, screenUpdate?.applicationCursorMode ?: false)!!) }
                     CtrlBtn("→") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_DPAD_RIGHT, screenUpdate?.applicationCursorMode ?: false)!!) }
+                    CtrlBtn("PgUp") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_UP)!!) }
+                    CtrlBtn("PgDn") { actions.onSend(TerminalKeyEncoder.specialKeyBytes(TerminalKeyEncoder.KC_PAGE_DOWN)!!) }
                     CtrlBtn("貼付", onClick = performPaste)
                     CtrlBtn("定型") { showSnippetSheet = true }
                     CtrlBtn("打鍵") { showKeySequenceSheet = true }

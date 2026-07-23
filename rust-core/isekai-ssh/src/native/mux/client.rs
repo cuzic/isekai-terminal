@@ -59,7 +59,7 @@ pub(crate) enum ClientRunResult {
 ///
 /// Propagates local terminal resize events to the owner via [`Frame::Resize`]
 /// frames (which the owner forwards to the remote PTY).
-pub(crate) async fn run<Conn>(conn: Conn, token: &[u8]) -> Result<ClientRunResult>
+pub(crate) async fn run<Conn>(conn: Conn, token: &[u8], host: String) -> Result<ClientRunResult>
 where
     Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -81,6 +81,7 @@ where
         tokio::io::stdout(),
         tokio::io::stderr(),
         resize_rx,
+        host,
     )
     .await?;
 
@@ -123,6 +124,7 @@ pub(crate) async fn run_inner<CR, CW, I, O, E>(
     mut stdout: O,
     mut stderr: E,
     mut resize_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(u32, u32)>>,
+    host: String,
 ) -> Result<ClientOutcome>
 where
     CR: AsyncRead + Unpin + Send + 'static,
@@ -149,13 +151,32 @@ where
         Some(Ok(Some(other))) => {
             return Ok(ClientOutcome::Rejected { reason: format!("expected HelloAck from the owner, got {other:?}") })
         }
-        // Owner vanished during the handshake — treat as owner-lost so the
-        // user gets the reconnect guidance rather than an opaque error.
-        Some(Ok(None)) | Some(Err(_)) | None => return Ok(ClientOutcome::OwnerLost),
+        // The owner connection dropped *during the handshake* — before any
+        // shell session ever existed. Unlike a mid-session drop (below, in
+        // the main loop), nothing was lost here, so this must be `Rejected`
+        // (safe to fall back to a direct connect), not `OwnerLost` (which the
+        // caller maps to a hard exit code with reconnect guidance). This
+        // matters specifically for a foreground tab that just spawned a
+        // detached holder (`ControlPersist`-equivalent, `native/mux/holder.rs`):
+        // the holder may still be silently authenticating (or may fail to,
+        // e.g. a passphrase/keyboard-interactive prompt it can't answer) when
+        // this tab's `try_claim`-losing connect races ahead of it — that must
+        // degrade to an ordinary direct connect, not a scary "owner lost" exit.
+        Some(Ok(None)) | Some(Err(_)) | None => {
+            return Ok(ClientOutcome::Rejected { reason: "the owner connection was lost during the handshake".to_string() })
+        }
     }
 
     let mut buf = [0u8; 8192];
     let mut stdin_open = true;
+
+    // Epic P Phase 2: at most one build in flight per tab (a second
+    // `BuildRequest` while one is already running is logged and ignored —
+    // see the `Frame::Ctl` arm below). `build_out_tx` is kept alive here for
+    // the whole loop (never dropped) so `build_out_rx.recv()` only ever
+    // yields real build output, never a spurious `None`.
+    let (build_out_tx, mut build_out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let mut active_build: Option<super::build_relay::ActiveBuild> = None;
 
     loop {
         tokio::select! {
@@ -169,8 +190,39 @@ where
                     }
                     Ok(n) => {
                         if write_frame(conn_write, &Frame::Stdin(buf[..n].to_vec())).await.is_err() {
+                            if let Some(build) = &mut active_build {
+                                build.abort();
+                            }
                             return Ok(ClientOutcome::OwnerLost);
                         }
+                    }
+                }
+            }
+            // A build task's `BuildOutputChunk`/`BuildFinished` bytes, relayed
+            // to the owner (which routes them onto the real ctl channel —
+            // `super::owner`'s module docs) as `Frame::Ctl` on this same
+            // writer, exactly like `Stdin`/`Resize` above. Any `BuildFinished`
+            // seen here is always a *real* completion (`run_client_build`'s
+            // own, genuine exit code) — the abort sentinel only ever arrives
+            // the other way, via the `frame_rx` branch below — so this is the
+            // only place a normal completion needs to clear `active_build`
+            // (found missing in review: without this, a tab could only ever
+            // run one build for its whole lifetime, since `active_build`
+            // stayed `Some` forever after the first one finished).
+            bytes = build_out_rx.recv() => {
+                if let Some(bytes) = bytes {
+                    let is_finished = matches!(
+                        isekai_protocol::decode_ctl_message(&bytes),
+                        Ok(isekai_protocol::CtlMessage::BuildFinished { .. })
+                    );
+                    if write_frame(conn_write, &Frame::Ctl(bytes)).await.is_err() {
+                        if let Some(build) = &mut active_build {
+                            build.abort();
+                        }
+                        return Ok(ClientOutcome::OwnerLost);
+                    }
+                    if is_finished {
+                        active_build = None;
                     }
                 }
             }
@@ -186,15 +238,43 @@ where
                     }
                     Some(Ok(Some(Frame::Ctl(data)))) => {
                         // A control-plane message (`#@isekai ctl-socket`) the
-                        // owner relayed from this tab's remote forward. Decode
-                        // and apply it to *this* client's own terminal (OSC
-                        // title/clipboard); a malformed or no-op message is
-                        // silently ignored (opportunistic feature).
-                        if let Ok(msg) = isekai_protocol::decode_ctl_message(&data) {
-                            if let Some(seq) = crate::ctl_forward::osc_sequence_for(&msg) {
-                                let _ = stderr.write_all(seq.as_bytes()).await;
-                                let _ = stderr.flush().await;
+                        // owner relayed from this tab's remote forward.
+                        match isekai_protocol::decode_ctl_message(&data) {
+                            // Epic P Phase 2: run the build profile this tab
+                            // owns (unlike title/clip, this can't be applied
+                            // as an OSC sequence — it's real work only *this*
+                            // process can do, streamed back via `build_out_tx`
+                            // rather than applied in place). A second request
+                            // while one is already running is logged and
+                            // ignored rather than starting a concurrent build.
+                            Ok(isekai_protocol::CtlMessage::BuildRequest { profile }) => {
+                                if active_build.is_some() {
+                                    log_line!("isekai-ssh: ignoring a BuildRequest for {profile:?} — a build is already running for this tab");
+                                } else {
+                                    active_build = Some(super::build_relay::spawn_client_build(host.clone(), profile, build_out_tx.clone()));
+                                }
                             }
+                            // The owner's synthesized abort signal (the real
+                            // remote ctl channel closed mid-build — this tab
+                            // never receives its *own* real `BuildFinished`
+                            // this way, only ever this sentinel) — kill the
+                            // still-running child instead of streaming into a
+                            // channel nobody on the other end is reading.
+                            Ok(isekai_protocol::CtlMessage::BuildFinished { exit_code, .. })
+                                if exit_code == super::build_relay::BUILD_ABORTED_SENTINEL =>
+                            {
+                                if let Some(mut build) = active_build.take() {
+                                    build.abort();
+                                }
+                            }
+                            Ok(msg) => {
+                                if let Some(seq) = crate::ctl_forward::osc_sequence_for(&msg) {
+                                    let _ = stderr.write_all(seq.as_bytes()).await;
+                                    let _ = stderr.flush().await;
+                                }
+                            }
+                            // A malformed message is ignored (opportunistic feature).
+                            Err(_) => {}
                         }
                     }
                     Some(Ok(Some(Frame::Exit(code)))) => return Ok(ClientOutcome::Exited(code)),
@@ -202,12 +282,20 @@ where
                     // A clean close without an Exit, any read error (a reset
                     // pipe), or the reader task ending all mean the owner died
                     // mid-session.
-                    Some(Ok(None)) | Some(Err(_)) | None => return Ok(ClientOutcome::OwnerLost),
+                    Some(Ok(None)) | Some(Err(_)) | None => {
+                        if let Some(build) = &mut active_build {
+                            build.abort();
+                        }
+                        return Ok(ClientOutcome::OwnerLost);
+                    }
                 }
             }
             resize = recv_resize(&mut resize_rx) => {
                 if let Some((cols, rows)) = resize {
                     if write_frame(conn_write, &Frame::Resize { cols: cols as u16, rows: rows as u16 }).await.is_err() {
+                        if let Some(build) = &mut active_build {
+                            build.abort();
+                        }
                         return Ok(ClientOutcome::OwnerLost);
                     }
                 }
@@ -256,6 +344,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             None,
+            "mybox".to_string(),
         )
         .await;
         (outcome, stdout, stderr)
@@ -284,6 +373,28 @@ mod tests {
         assert_eq!(outcome.unwrap(), ClientOutcome::Exited(7));
         assert_eq!(stdout, b"out", "Stdout frames must land on local stdout");
         assert_eq!(stderr, b"err", "Stderr frames must land on local stderr, not stdout");
+    }
+
+    /// The owner connection drops *before ever sending HelloAck* (e.g. a
+    /// just-spawned `ControlPersist`-equivalent holder that's still silently
+    /// authenticating, or failed to and exited) — must be `Rejected`, not
+    /// `OwnerLost`: no shell session ever existed, so it's always safe for
+    /// the caller to fall back to a direct connect (`always-connects.md`).
+    #[tokio::test]
+    async fn client_treats_a_drop_before_hello_ack_as_rejected_not_owner_lost() {
+        let (outcome, _out, _err) = drive_client(b"", |owner_conn| {
+            tokio::spawn(async move {
+                let (mut r, _w) = tokio::io::split(owner_conn);
+                let _ = read_frame(&mut r).await; // consume Hello
+                // Drop immediately, without ever sending HelloAck/Rejected.
+            })
+        })
+        .await;
+
+        match outcome.unwrap() {
+            ClientOutcome::Rejected { .. } => {}
+            other => panic!("a pre-HelloAck drop must be Rejected (safe to fall back), got {other:?}"),
+        }
     }
 
     /// The owner drops the connection without ever sending an `Exit` — the
@@ -424,7 +535,7 @@ mod tests {
         let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b"echo hi\n"[..], &mut stdout, &mut stderr, None)
+        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b"echo hi\n"[..], &mut stdout, &mut stderr, None, "mybox".to_string())
             .await
             .unwrap();
 
@@ -482,7 +593,7 @@ mod tests {
         let (cr, mut cw) = tokio::io::split(client_conn);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, stdin_r, &mut stdout, &mut stderr, None)
+        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, stdin_r, &mut stdout, &mut stderr, None, "mybox".to_string())
             .await
             .unwrap();
 
@@ -495,5 +606,270 @@ mod tests {
 
         let _ = feeder.await;
         owner.abort();
+    }
+
+    /// Points `$HOME` at a fresh tempdir and writes `profiles` to
+    /// `build_profiles.toml` there — same `HOME_ENV_LOCK`-guarded pattern
+    /// `build_relay.rs`'s own tests use.
+    fn with_build_profiles(profiles: Vec<crate::build_profile::BuildProfile>) -> (tempfile::TempDir, HomeRestoreGuard) {
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let mut store = crate::build_profile::BuildProfileStore::default();
+        for profile in profiles {
+            crate::build_profile::upsert_profile(&mut store, profile).unwrap();
+        }
+        let path = crate::build_profile::default_build_profiles_path().unwrap();
+        crate::build_profile::save_build_profiles(&path, &store).unwrap();
+        (home, HomeRestoreGuard(old_home))
+    }
+
+    struct HomeRestoreGuard(Option<std::ffi::OsString>);
+    impl Drop for HomeRestoreGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(old) => std::env::set_var("HOME", old),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// End-to-end for Epic P Phase 2's mux-client path: the owner relays a
+    /// `BuildRequest` as `Frame::Ctl`; `run_inner` must run the matching
+    /// profile and relay its `BuildOutputChunk`/`BuildFinished` back as
+    /// further `Frame::Ctl`s on the *same* connection, all while the normal
+    /// stdin/stdout/resize relay keeps working (proven by the session still
+    /// ending cleanly on `Exit`).
+    #[tokio::test]
+    async fn client_runs_a_build_profile_and_streams_output_to_the_owner() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let workdir = tempfile::tempdir().unwrap();
+        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+            host: "mybox".to_string(),
+            name: "t".to_string(),
+            dir: workdir.path().to_string_lossy().into_owned(),
+            command: if cfg!(windows) {
+                "echo out-line& echo err-line 1>&2& exit 5".to_string()
+            } else {
+                "printf 'out-line\\n'; printf 'err-line\\n' 1>&2; exit 5".to_string()
+            },
+            result_glob: None,
+            dest_dir: None,
+        }]);
+
+        let (client_conn, owner_conn) = duplex(64 * 1024);
+        let (mut or, mut ow) = tokio::io::split(owner_conn);
+
+        let owner = tokio::spawn(async move {
+            match read_frame(&mut or).await.unwrap().unwrap() {
+                Frame::Hello { .. } => {}
+                other => panic!("expected Hello, got {other:?}"),
+            }
+            write_frame(&mut ow, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await.unwrap();
+
+            let request = serde_json::to_vec(&isekai_protocol::CtlMessage::BuildRequest { profile: "t".to_string() }).unwrap();
+            write_frame(&mut ow, &Frame::Ctl(request)).await.unwrap();
+
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit_code = loop {
+                match read_frame(&mut or).await.unwrap().unwrap() {
+                    Frame::Ctl(bytes) => match isekai_protocol::decode_ctl_message(&bytes).unwrap() {
+                        isekai_protocol::CtlMessage::BuildOutputChunk { stream, data_b64 } => {
+                            let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64).unwrap();
+                            match stream {
+                                isekai_protocol::BuildOutputStream::Stdout => stdout.extend(decoded),
+                                isekai_protocol::BuildOutputStream::Stderr => stderr.extend(decoded),
+                            }
+                        }
+                        isekai_protocol::CtlMessage::BuildFinished { exit_code, .. } => break exit_code,
+                        other => panic!("unexpected message: {other:?}"),
+                    },
+                    Frame::Shutdown => {} // empty test stdin hits EOF immediately; irrelevant here
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            };
+            write_frame(&mut ow, &Frame::Exit(0)).await.unwrap();
+            (stdout, stderr, exit_code)
+        });
+
+        let (cr, mut cw) = tokio::io::split(client_conn);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let outcome = run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ClientOutcome::Exited(0));
+        let (build_stdout, build_stderr, exit_code) = owner.await.unwrap();
+        assert!(String::from_utf8_lossy(&build_stdout).contains("out-line"));
+        assert!(String::from_utf8_lossy(&build_stderr).contains("err-line"));
+        assert_eq!(exit_code, 5);
+    }
+
+    /// Regression for a review finding: `active_build` must be cleared once a
+    /// build finishes normally, not just on the owner-relayed abort sentinel
+    /// — otherwise a tab could only ever run one build for its whole
+    /// lifetime (every subsequent `BuildRequest` silently ignored by the
+    /// `active_build.is_some()` guard). Runs two builds back to back over the
+    /// same `run_inner` session and requires both to actually execute.
+    #[tokio::test]
+    async fn client_can_run_a_second_build_after_the_first_finishes() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let workdir = tempfile::tempdir().unwrap();
+        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+            host: "mybox".to_string(),
+            name: "t".to_string(),
+            dir: workdir.path().to_string_lossy().into_owned(),
+            command: "exit 0".to_string(),
+            result_glob: None,
+            dest_dir: None,
+        }]);
+
+        let (client_conn, owner_conn) = duplex(64 * 1024);
+        let (mut or, mut ow) = tokio::io::split(owner_conn);
+
+        let owner = tokio::spawn(async move {
+            match read_frame(&mut or).await.unwrap().unwrap() {
+                Frame::Hello { .. } => {}
+                other => panic!("expected Hello, got {other:?}"),
+            }
+            write_frame(&mut ow, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await.unwrap();
+
+            let mut finished_count = 0;
+            for _ in 0..2 {
+                let request = serde_json::to_vec(&isekai_protocol::CtlMessage::BuildRequest { profile: "t".to_string() }).unwrap();
+                write_frame(&mut ow, &Frame::Ctl(request)).await.unwrap();
+
+                loop {
+                    match read_frame(&mut or).await.unwrap().unwrap() {
+                        Frame::Ctl(bytes) => {
+                            if matches!(isekai_protocol::decode_ctl_message(&bytes), Ok(isekai_protocol::CtlMessage::BuildFinished { .. })) {
+                                finished_count += 1;
+                                break;
+                            }
+                        }
+                        Frame::Shutdown => {}
+                        other => panic!("unexpected frame: {other:?}"),
+                    }
+                }
+            }
+            write_frame(&mut ow, &Frame::Exit(0)).await.unwrap();
+            finished_count
+        });
+
+        let (cr, mut cw) = tokio::io::split(client_conn);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string()),
+        )
+        .await
+        .expect("run_inner must not hang waiting on a second build that the active_build guard silently ignores")
+        .unwrap();
+
+        assert_eq!(outcome, ClientOutcome::Exited(0));
+        assert_eq!(owner.await.unwrap(), 2, "both builds must have reached BuildFinished, not just the first");
+    }
+
+    /// The owner relaying the synthesized abort sentinel (a real remote ctl
+    /// channel closing mid-build, `super::owner`'s module docs) must reach
+    /// `run_inner` and kill its still-running child rather than let it keep
+    /// streaming into a connection nobody on the far end is reading from —
+    /// and the session must still end cleanly afterward (proving `run_inner`
+    /// itself doesn't hang or error out reacting to the sentinel).
+    #[tokio::test]
+    async fn client_kills_the_build_when_the_owner_relays_the_abort_sentinel() {
+        let _guard = crate::HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let workdir = tempfile::tempdir().unwrap();
+        let (_home, _restore) = with_build_profiles(vec![crate::build_profile::BuildProfile {
+            host: "mybox".to_string(),
+            name: "infinite".to_string(),
+            dir: workdir.path().to_string_lossy().into_owned(),
+            // Deliberately *not* the `:loop& echo x& goto loop` shape every
+            // other Windows command in this module/`build_relay.rs` uses:
+            // this is the one place that shape actually mattered (this
+            // test's own "owner" below sends the abort after the very first
+            // chunk, so whether the child is genuinely still emitting output
+            // when the process is confirmed dead is the whole point of the
+            // assertion) and it produced a real `test-windows` CI hang — a
+            // `tokio::time::timeout(10s)` `Elapsed` on this exact test,
+            // reproduced twice on real Windows CI (2026-07-23), unaffected by
+            // adding a `ping`-based per-iteration throttle (ruling out a
+            // backpressure/flood theory — an unthrottled vs. ~1s-throttled
+            // loop hit the identical failure). That points at the `:label`
+            // itself, not timing: cmd.exe's line-oriented label handling is
+            // exactly the kind of MSYS/`cmd /C`-quoting-adjacent quirk this
+            // crate has been burned by before (see `ssh_test_shim`'s module
+            // docs on `CreateProcess`/batch-file argument parsing), so rather
+            // than continue guessing at GOTO-based one-liner semantics this
+            // uses plain bounded repetition of the same `&`-chained shape the
+            // *passing* `client_runs_a_build_profile_and_streams_output_to_the_owner`
+            // test already proves works on Windows — no label/GOTO at all.
+            // 40 repetitions (~40s if never aborted) is comfortably longer
+            // than this test's own 10s budget, so the child is guaranteed
+            // still running when the abort arrives without needing an
+            // unbounded loop; `ping -n 2 127.0.0.1 >nul` remains the
+            // per-iteration delay (the console-free "sleep ~1s" idiom —
+            // `timeout.exe` refuses non-console stdin).
+            command: if cfg!(windows) {
+                "echo x& ping -n 2 127.0.0.1 >nul& ".repeat(40)
+            } else {
+                "while true; do printf x; sleep 0.01; done".to_string()
+            },
+            result_glob: None,
+            dest_dir: None,
+        }]);
+
+        let (client_conn, owner_conn) = duplex(64 * 1024);
+        let (mut or, mut ow) = tokio::io::split(owner_conn);
+
+        let owner = tokio::spawn(async move {
+            match read_frame(&mut or).await.unwrap().unwrap() {
+                Frame::Hello { .. } => {}
+                other => panic!("expected Hello, got {other:?}"),
+            }
+            write_frame(&mut ow, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await.unwrap();
+
+            let request = serde_json::to_vec(&isekai_protocol::CtlMessage::BuildRequest { profile: "infinite".to_string() }).unwrap();
+            write_frame(&mut ow, &Frame::Ctl(request)).await.unwrap();
+
+            // Wait for at least one real output chunk (proves the build
+            // actually started) before telling the client to abort it.
+            loop {
+                match read_frame(&mut or).await.unwrap().unwrap() {
+                    Frame::Ctl(bytes) => {
+                        if matches!(isekai_protocol::decode_ctl_message(&bytes), Ok(isekai_protocol::CtlMessage::BuildOutputChunk { .. })) {
+                            break;
+                        }
+                    }
+                    Frame::Shutdown => {} // empty test stdin hits EOF immediately; irrelevant here
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+
+            let abort = serde_json::to_vec(&isekai_protocol::CtlMessage::BuildFinished {
+                exit_code: super::super::build_relay::BUILD_ABORTED_SENTINEL,
+                result_paths: Vec::new(),
+            })
+            .unwrap();
+            write_frame(&mut ow, &Frame::Ctl(abort)).await.unwrap();
+            write_frame(&mut ow, &Frame::Exit(0)).await.unwrap();
+        });
+
+        let (cr, mut cw) = tokio::io::split(client_conn);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_inner(cr, &mut cw, b"tok", "xterm".to_string(), 80, 24, &b""[..], &mut stdout, &mut stderr, None, "mybox".to_string()),
+        )
+        .await
+        .expect("run_inner must not hang after the abort sentinel and a clean Exit")
+        .unwrap();
+
+        assert_eq!(outcome, ClientOutcome::Exited(0));
+        owner.await.unwrap();
     }
 }

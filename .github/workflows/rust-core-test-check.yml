@@ -240,6 +240,28 @@ jobs:
         working-directory: rust-core
         run: cargo test --workspace --exclude isekai-terminal-core --exclude uniffi-bindgen --lib --bins
 
+      # `mux_holder_windows_e2e.rs`: unlike the 5 files below, this doesn't
+      # shell out to real `ssh(1)`/`ssh_test_shim` at all — it drives
+      # `main.rs`'s other `#[cfg(windows)]` arm (`native::mux::run`), which
+      # never touches `ssh(1)`, so it needs neither `--isekai-ssh-path` nor
+      # `ssh_test_shim`. It spawns real `isekai-ssh.exe`/`isekai-pipe.exe`
+      # processes (including a real detached mux holder) against each other
+      # instead, and one of its 3 tests deliberately sleeps ~20s past
+      # `owner::IDLE_GRACE` (10s, not test-overridable — see that file's
+      # module docs on why a real wait beats adding a test-only knob to
+      # production code), so it's kept as its own step rather than folded
+      # into the loop below. TEMPORARILY moved ahead of that loop (2026-07-23)
+      # so it gets validated independently of an unrelated, still-open
+      # classification bug in `wrapper_stale_trust_auto_recovery_e2e.rs`
+      # (Windows misclassifies an unreachable QUIC endpoint as `StaleTrust` —
+      # tracked separately, several layers down in `isekai-transport`/
+      # `quicmux`, not this crate) that currently fails that loop — revert
+      # this ordering once that's fixed.
+      - name: cargo test -p isekai-ssh --test mux_holder_windows_e2e (Windows, real detached mux holder e2e)
+        shell: bash
+        working-directory: rust-core
+        run: cargo test -p isekai-ssh --test mux_holder_windows_e2e
+
       # isekai-sshのmock sshdベースe2eテスト(isekai-sshクライアント自身の
       # Windows上での挙動を検証する5ファイル)。実ssh(1)をssh_test_shim
       # (コンパイル済み.exeパススルー、`wrapper_auto_bootstrap_e2e.rs::
@@ -270,4 +292,5 @@ jobs:
             fi
             echo "::endgroup::"
           done
+          exit $failed
           exit $failed

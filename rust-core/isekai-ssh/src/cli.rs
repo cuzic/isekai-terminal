@@ -168,6 +168,67 @@ pub enum Command {
     /// (`wrapper.rs::run_ssh_with_connect_failure_recovery`); this is purely
     /// for a human to inspect on demand. See `doctor.rs`'s module docs.
     Doctor(DoctorArgs),
+
+    /// Manage the local build profiles a remote `isekai-pipe ctl build
+    /// <name>` invocation may run on this machine (`ISEKAI_PIPE_DESIGN.md`
+    /// §8 Epic P). See `build_profile_cli.rs`'s module docs.
+    #[command(subcommand)]
+    BuildProfile(BuildProfileCommand),
+}
+
+#[derive(Subcommand)]
+pub enum BuildProfileCommand {
+    /// Register (or replace) a build profile for `<host>`/`<name>`.
+    Add(BuildProfileAddArgs),
+    /// List registered build profiles, optionally scoped to one host.
+    List(BuildProfileListArgs),
+    /// Remove a registered build profile.
+    Remove(BuildProfileRemoveArgs),
+    /// Run `<name>`'s command locally right now (bypassing the ctl-socket
+    /// entirely) so its `dir`/`command` can be validated before a remote
+    /// ever gets to invoke it.
+    Test(BuildProfileTestArgs),
+}
+
+#[derive(Args)]
+pub struct BuildProfileAddArgs {
+    /// The ssh_config `Host` alias this profile may be invoked from.
+    pub host: String,
+    /// The name a remote `isekai-pipe ctl build <name>` references.
+    pub name: String,
+    /// Working directory the command runs in, on this machine.
+    #[arg(long, value_name = "PATH")]
+    pub dir: String,
+    /// Shell command line (run via the local platform shell, so `&&`/pipes
+    /// work) — never sent to the remote, only its result is.
+    #[arg(long, value_name = "COMMAND")]
+    pub command: String,
+    /// Glob (relative to `--dir`) matching build output to push back to the
+    /// remote. Requires `--dest-dir`.
+    #[arg(long, value_name = "GLOB", requires = "dest_dir")]
+    pub result_glob: Option<String>,
+    /// Remote destination directory `--result-glob` matches are pushed
+    /// into. Requires `--result-glob`.
+    #[arg(long, value_name = "PATH", requires = "result_glob")]
+    pub dest_dir: Option<String>,
+}
+
+#[derive(Args)]
+pub struct BuildProfileListArgs {
+    /// Only list profiles registered for this host.
+    pub host: Option<String>,
+}
+
+#[derive(Args)]
+pub struct BuildProfileRemoveArgs {
+    pub host: String,
+    pub name: String,
+}
+
+#[derive(Args)]
+pub struct BuildProfileTestArgs {
+    pub host: String,
+    pub name: String,
 }
 
 /// CLI-facing mirror of `isekai_bootstrap::RelayTransportKind` — kept

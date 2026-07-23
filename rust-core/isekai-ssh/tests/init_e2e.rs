@@ -744,8 +744,12 @@ async fn init_with_stun_server_saves_the_observed_address_to_the_trust_store() {
         .stderr(StdStdio::piped())
         .spawn()
         .expect("failed to spawn isekai-ssh init");
-    // See `spawn_init`'s comment for why Windows needs a leading "yes\n".
-    let confirm_input: &[u8] = if cfg!(windows) { b"yes\ny\n" } else { b"y\n" };
+    // See `spawn_init`'s comment for why Windows needs a leading TOFU
+    // answer. Several plain "y" lines (not a fixed one-TOFU-round "yes\ny\n")
+    // — see `wrapper_auto_download_relay_bootstrap_e2e.rs`'s identical fix
+    // (a real `test-windows` CI failure, 2026-07-23) for why assuming
+    // exactly one TOFU round is fragile.
+    let confirm_input: &[u8] = if cfg!(windows) { b"y\ny\ny\ny\n" } else { b"y\n" };
     child.stdin.take().unwrap().write_all(confirm_input).await.unwrap();
     let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
         .await

@@ -41,12 +41,14 @@ use async_trait::async_trait;
 use isekai_pipe_core::{claim_connect_outcome, default_runtime_dir, ConnectionIntent};
 use russh::client;
 use russh_stream_session::{
-    authenticate_session, establish_over_stream, open_channel, verifying_handler_with_routes_and_reason, ForwardRoutes,
-    RejectionReason, SessionError, SessionKind,
+    authenticate_keyboard_interactive, authenticate_openssh_cert_with_passphrase, authenticate_publickey_with_passphrase,
+    authenticate_session, establish_over_stream, open_channel, verifying_handler_with_routes_and_reason, Credential,
+    ForwardRoutes, KeyboardInteractivePrompt, RejectionReason, SessionError, SessionKind,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::mux::ctl_forward;
+use super::mux::handoff::HandoffCredentials;
 
 use crate::log_file::log_line;
 use crate::wrapper::{
@@ -62,6 +64,7 @@ use super::console;
 use super::console_stdin;
 use super::escape::{process_stdin_bytes, EscapeAction};
 use super::host_key_trust::FileBackedHostKeyVerifier;
+use super::keyboard_interactive;
 use super::private_key;
 
 /// The concrete `russh` client handle this native path establishes — an
@@ -70,8 +73,8 @@ use super::private_key;
 /// (see [`OwnerHook`]).
 pub(crate) type NativeHandle = client::Handle<russh_stream_session::VerifyingHandler<FileBackedHostKeyVerifier>>;
 
-/// A hook the mux owner path ([`super::mux`]) supplies so that, the moment the
-/// shared SSH session is authenticated, it can start accepting local IPC
+/// A hook the mux holder path ([`super::mux`]) supplies so that, the moment
+/// the shared SSH session is authenticated, it can start accepting local IPC
 /// clients on the shared handle — without the connect+auth+recovery machinery
 /// here having to know anything about `local-ipc-mux`. It receives an
 /// [`Arc`]-shared, [`Mutex`](tokio::sync::Mutex)-guarded handle: `channel_open_session`
@@ -81,14 +84,20 @@ pub(crate) type NativeHandle = client::Handle<russh_stream_session::VerifyingHan
 /// the per-channel I/O loop. It runs at most once, on the *successful* connect
 /// attempt (a failed attempt errors before the handle exists, leaving the hook
 /// intact for the re-bootstrap retry). Boxed `FnOnce` + `Send` because it
-/// typically `tokio::spawn`s the accept loop.
+/// `tokio::spawn`s the accept loop and hands back its [`tokio::task::JoinHandle`]:
+/// a holder process has **no foreground shell of its own** (unlike the old,
+/// removed "owner" role) — [`run_authenticated_session`] awaits this handle as
+/// the *entire* session body instead, so the holder's lifetime is exactly the
+/// accept loop's own (idle-exit or a fatal local-IPC error), decoupled from
+/// any particular tab — the `ControlPersist`-equivalent redesign this exists
+/// for (`super::mux`'s module docs).
 pub(crate) type SharedHandle = Arc<tokio::sync::Mutex<NativeHandle>>;
 /// Receives the shared handle plus, when `#@isekai ctl-socket` is enabled for
 /// this invocation, the [`ForwardRoutes`] the connection's handler dispatches
-/// forwarded-streamlocal channels through — so the owner can set up a *private*
+/// forwarded-streamlocal channels through — so the holder can set up a *private*
 /// per-tab ctl forward for each mux client (M5). `None` means ctl-socket is off
 /// and no per-client forward should be requested.
-pub(crate) type OwnerHook = Box<dyn FnOnce(SharedHandle, Option<ForwardRoutes>) + Send>;
+pub(crate) type OwnerHook = Box<dyn FnOnce(SharedHandle, Option<ForwardRoutes>) -> tokio::task::JoinHandle<()> + Send>;
 
 /// Everything [`run_prepared`] needs, resolved once up front so the mux
 /// dispatch ([`super::mux::run`]) can compute the channel name from the same
@@ -116,12 +125,61 @@ impl Prepared {
     }
 }
 
+#[cfg(test)]
+impl Prepared {
+    /// Assembles a [`Prepared`] directly from already-resolved parts, for
+    /// tests (here and in `native/mux/mod.rs`) that need one without going
+    /// through the real trust-store/TOFU machinery [`prepare`] drives —
+    /// mirrors the plan/resolution/host_config/intent construction this
+    /// module's own `bogus_pipe`-based recovery tests already use.
+    pub(crate) fn for_test(
+        plan: WrapperPlan,
+        resolution: WrapperResolution,
+        host_config: openssh_config::HostConfig,
+        intent: ConnectionIntent,
+        runtime_dir: PathBuf,
+    ) -> Self {
+        Prepared { plan, resolution, host_config, intent, runtime_dir }
+    }
+
+    /// Mutable access for tests that need to tweak the resolved `HostConfig`
+    /// after construction (e.g. pointing `identity_file` at a throwaway
+    /// encrypted key) without threading a whole new `for_test` parameter
+    /// combination through every caller that doesn't need it.
+    pub(crate) fn host_config_mut(&mut self) -> &mut openssh_config::HostConfig {
+        &mut self.host_config
+    }
+}
+
 /// Resolves argv into a [`Prepared`] (config resolution, `--isekai-log-file`
 /// init, trust-store lookup — auto-bootstrapping a brand-new destination
 /// inline if needed) without yet establishing the SSH session itself — the
 /// shared front half of both the single-process path ([`run`]) and the mux
-/// dispatch ([`super::mux::run`]).
+/// dispatch ([`super::mux::run`]). Interactive: any brand-new destination's
+/// TOFU confirmation is [`TofuConfirmation::AlwaysPrompt`]. Use
+/// [`prepare_with_tofu`] directly when that's wrong for the caller (a
+/// detached, console-less mux holder — see that function's docs).
 pub(crate) async fn prepare(args: Vec<String>) -> Result<Prepared> {
+    prepare_with_tofu(args, TofuConfirmation::AlwaysPrompt).await
+}
+
+/// Like [`prepare`], but with the auto-bootstrap TOFU confirmation mode
+/// exposed explicitly. The mux holder entrypoint
+/// (`super::mux::run_as_holder_entrypoint`) calls this with
+/// [`TofuConfirmation::Silent`] instead of using [`prepare`] directly: a
+/// detached holder has no console to confirm a brand-new host key on, and by
+/// the time it's spawned the destination is normally already trusted (the
+/// spawning client's own `prepare` call — with `AlwaysPrompt` — already
+/// succeeded once, moments earlier, over the *same* connection settings,
+/// before `dispatch` ever decided to spawn a holder). This only matters for
+/// the narrow, hopefully-never case where the trust store changed between
+/// those two calls (e.g. a concurrent `doctor --fix`/re-bootstrap racing
+/// this exact destination) — `Silent` there means the holder cleanly fails
+/// and exits (silently, per `always-connects.md`'s doctrine for automated
+/// paths) rather than blocking forever on an unanswerable confirmation, and
+/// the spawning client's own `dispatch` falls back to a direct connect when
+/// the holder never comes up.
+pub(crate) async fn prepare_with_tofu(args: Vec<String>, tofu: TofuConfirmation) -> Result<Prepared> {
     let plan = crate::wrapper::parse_wrapper(args)?;
     // `--isekai-log-file` must be honored on the native path too — the Unix
     // path opens it at the top of `wrapper::run`; without this the flag was
@@ -171,7 +229,7 @@ pub(crate) async fn prepare(args: Vec<String>) -> Result<Prepared> {
         // ultrareview-confirmed, real-Windows-CI-reproduced divergence from
         // the Unix path's behavior.
         Err(err) if should_bootstrap(&plan, &resolution) => {
-            if let Err(bootstrap_err) = bootstrap_and_register(&plan, &resolution, TofuConfirmation::AlwaysPrompt).await {
+            if let Err(bootstrap_err) = bootstrap_and_register(&plan, &resolution, tofu).await {
                 print_bootstrap_failure_guidance(&bootstrap_err);
                 return Err(bootstrap_err.context(format!("{err}\nisekai-ssh: auto-bootstrap failed")));
             }
@@ -198,15 +256,18 @@ pub(crate) async fn prepare(args: Vec<String>) -> Result<Prepared> {
 /// exercised on non-Windows unit tests).
 pub(crate) async fn run(args: Vec<String>) -> Result<u8> {
     let prepared = prepare(args).await?;
-    run_prepared(prepared, None).await
+    run_prepared(prepared, None, HandoffCredentials::default()).await
 }
 
 /// Drives a [`Prepared`] connection through the always-connects recovery.
 /// `owner_hook` is `None` for the single-process path and `Some` for the mux
-/// owner (see [`OwnerHook`]).
-pub(crate) async fn run_prepared(prepared: Prepared, owner_hook: Option<OwnerHook>) -> Result<u8> {
+/// holder (see [`OwnerHook`]). `handoff` is the passphrase hand-off set (Phase
+/// 1b, see `super::mux::handoff`'s docs) — empty for every path except a
+/// holder that was spawned with one, or a client falling back to a direct
+/// connect after reusing the set it resolved before spawning that holder.
+pub(crate) async fn run_prepared(prepared: Prepared, owner_hook: Option<OwnerHook>, handoff: HandoffCredentials) -> Result<u8> {
     let Prepared { plan, resolution, host_config, intent, runtime_dir } = prepared;
-    run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, &runtime_dir, owner_hook).await
+    run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, &runtime_dir, owner_hook, handoff).await
 }
 
 /// Mirrors `wrapper.rs::run_ssh_with_connect_failure_recovery` for the
@@ -254,8 +315,9 @@ async fn run_native_connect_with_recovery(
     intent: ConnectionIntent,
     runtime_dir: &Path,
     owner_hook: Option<OwnerHook>,
+    handoff: HandoffCredentials,
 ) -> Result<u8> {
-    let mut ops = NativeConnectOps { plan, resolution, host_config, runtime_dir, owner_hook };
+    let mut ops = NativeConnectOps { plan, resolution, host_config, runtime_dir, owner_hook, handoff };
     drive_connect_recovery(&mut ops, intent).await
 }
 
@@ -350,12 +412,17 @@ struct NativeConnectOps<'a> {
     /// mux owner role the moment the first attempt failed even though the
     /// retry is what actually succeeds. `None` for the single-process path.
     owner_hook: Option<OwnerHook>,
+    /// The passphrase hand-off set (Phase 1b) — empty except for a spawned
+    /// holder consuming one, or a client reusing the one it resolved before
+    /// spawning that holder for its own fallback direct connect (see
+    /// `super::mux::handoff`'s docs).
+    handoff: HandoffCredentials,
 }
 
 #[async_trait(?Send)]
 impl ConnectRecoveryOps for NativeConnectOps<'_> {
     async fn attempt(&mut self, intent: &ConnectionIntent, silent: bool) -> Result<u8> {
-        connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir, &mut self.owner_hook, silent).await
+        connect_attempt(self.plan, self.resolution, self.host_config, intent, self.runtime_dir, &mut self.owner_hook, &self.handoff, silent).await
     }
 
     fn claim_outcome(&self, intent_id: &str) -> Result<Option<isekai_pipe_core::ConnectOutcome>> {
@@ -393,13 +460,14 @@ async fn connect_attempt(
     intent: &ConnectionIntent,
     runtime_dir: &Path,
     owner_hook: &mut Option<OwnerHook>,
+    handoff: &HandoffCredentials,
     silent: bool,
 ) -> Result<u8> {
     let mut child = spawn_isekai_pipe_connect(plan.pipe_path(), runtime_dir, intent)?;
     let stdio = ChildStdio::take_from(&mut child)
         .ok_or_else(|| anyhow!("isekai-ssh: spawned isekai-pipe connect without piped stdin/stdout (internal bug)"))?;
 
-    let result = run_authenticated_session(stdio, plan, resolution, host_config, owner_hook, silent).await;
+    let result = run_authenticated_session(stdio, plan, resolution, host_config, owner_hook, handoff, silent).await;
 
     if result.is_err() {
         // The `isekai-pipe connect` child writes its `ConnectOutcome`
@@ -424,6 +492,29 @@ async fn connect_attempt(
     result
 }
 
+/// Decide whether to open a non-interactive `Exec` channel or a PTY+`Shell`
+/// channel, mirroring `ssh(1)`'s `-t`/`-T` semantics: an explicit `-T`
+/// (`RequestTty::No`) with a remote command skips the PTY entirely and runs
+/// the command directly via `SessionKind::Exec`. Every other combination
+/// (no command at all, or a command with `Auto`/`Yes`/`Force`) opens a
+/// PTY+shell instead — when a command is also present, the caller `exec`s it
+/// over that PTY afterwards (see the `remote_cmd`/`request_tty` check right
+/// after the channel opens in [`run_authenticated_session`]), since
+/// `SessionKind::Exec` itself never allocates a PTY.
+fn decide_session_kind(
+    remote_cmd: Option<&[String]>,
+    request_tty: crate::wrapper::RequestTty,
+    term: &str,
+    cols: u32,
+    rows: u32,
+    terminal_modes: &[(russh::Pty, u32)],
+) -> SessionKind {
+    match remote_cmd {
+        Some(cmd) if request_tty == crate::wrapper::RequestTty::No => SessionKind::Exec { command: cmd.join(" ") },
+        _ => SessionKind::Shell { term: term.to_string(), cols, rows, terminal_modes: terminal_modes.to_vec() },
+    }
+}
+
 /// The authenticated-session half of [`connect_attempt`], split out so
 /// [`connect_attempt`] can retain the `isekai-pipe connect` `Child` and, on an
 /// error, give it a brief best-effort window to finish writing its
@@ -438,8 +529,15 @@ async fn run_authenticated_session(
     resolution: &WrapperResolution,
     host_config: &openssh_config::HostConfig,
     owner_hook: &mut Option<OwnerHook>,
+    handoff: &HandoffCredentials,
     silent: bool,
 ) -> Result<u8> {
+    // A holder process is a detached background invocation with no attached
+    // console — it can never prompt for anything (host-key TOFU, a
+    // passphrase, keyboard-interactive), regardless of which connect attempt
+    // this is. `silent` normally reflects only the retry-after-rebootstrap
+    // attempt number; holder mode forces it on unconditionally.
+    let silent = silent || owner_hook.is_some();
     let (host, port) = resolution.native_host_port(plan.destination_host());
     let host_port = format!("{host}:{port}");
     // Username precedence: destination user@ part > ssh_config User > local username
@@ -474,12 +572,46 @@ async fn run_authenticated_session(
     };
     let verifier = Arc::new(FileBackedHostKeyVerifier::new(store_path, host_port.clone(), confirm_new_host));
 
+    // Same silent-aware seam as `confirm_new_host` above, for a
+    // passphrase-protected identity file: a silent/automated retry must never
+    // block on a live-but-answerless stdin, so it just logs an actionable
+    // message and lets the candidate loop move on (next identity, then the
+    // SSH agent) instead of prompting.
+    let prompt_passphrase: Arc<dyn Fn(&Path, u32) -> Option<String> + Send + Sync> = if silent {
+        Arc::new(|path: &Path, _attempt: u32| {
+            log_line!(
+                "isekai-ssh: identity file {} is passphrase-protected; skipping in a silent/automated retry \
+                 — run this connection from an interactive terminal once to unlock it.",
+                path.display()
+            );
+            None
+        })
+    } else {
+        Arc::new(console::prompt_passphrase)
+    };
+
+    // Same silent-aware seam again, for keyboard-interactive (PAM/OTP/2FA):
+    // a silent/automated retry must never block waiting on a live server
+    // prompt it can't answer.
+    let kbi_responder: Arc<dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync> = if silent {
+        Arc::new(|prompts: &[KeyboardInteractivePrompt]| {
+            log_line!(
+                "isekai-ssh: server requested keyboard-interactive authentication in a silent/automated retry \
+                 — refusing without prompting. Run this connection from an interactive terminal once."
+            );
+            vec![String::new(); prompts.len()]
+        })
+    } else {
+        Arc::new(keyboard_interactive::console_responder)
+    };
+    let prompts = InteractivePrompts { passphrase: &*prompt_passphrase, keyboard_interactive: &*kbi_responder, handoff };
+
     // The ctl-socket route table the handler dispatches forwarded-streamlocal
     // channels through — one per connection, shared by this process's own
     // foreground shell and (via the owner hook) every mux client's per-tab
     // forward. Built before the handshake so it can be installed on the handler.
     let forward_routes = ForwardRoutes::new();
-    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier, &forward_routes)
+    let handle = connect_and_authenticate(stdio, &username, host_config, &verifier, &forward_routes, &prompts)
         .await
         .with_context(|| format!("isekai-ssh: failed to connect to {username}@{host_port}"))?;
 
@@ -491,16 +623,19 @@ async fn run_authenticated_session(
 
     let ctl_enabled = ctl_forward::should_forward(plan, resolution);
 
-    // The SSH session is now authenticated. If this is the mux owner path,
+    // The SSH session is now authenticated. If this is the mux holder path,
     // hand a shared clone of the handle to the accept loop so sibling tabs can
-    // start opening their own channels while this process also drives its own
-    // foreground shell below. When ctl-socket is enabled, also hand over the
-    // route table so each client gets its own private forward. Reached only on
-    // success, so a failed attempt (which returns above) never `take`s the
-    // hook out of the caller's `Option` — it stays available for the
-    // always-connects re-bootstrap retry.
+    // start opening their own channels — and, since a holder has no
+    // foreground shell of its own, await the accept loop's own `JoinHandle` as
+    // this session's entire body, skipping everything below. When ctl-socket
+    // is enabled, also hand over the route table so each client gets its own
+    // private forward. Reached only on success, so a failed attempt (which
+    // returns above) never `take`s the hook out of the caller's `Option` — it
+    // stays available for the always-connects re-bootstrap retry.
     if let Some(hook) = owner_hook.take() {
-        hook(handle.clone(), ctl_enabled.then(|| forward_routes.clone()));
+        let serve_handle = hook(handle.clone(), ctl_enabled.then(|| forward_routes.clone()));
+        let _ = serve_handle.await;
+        return Ok(0);
     }
 
     let (cols, rows) = console::terminal_size();
@@ -509,21 +644,7 @@ async fn run_authenticated_session(
 
     // Decide SessionKind: remote command vs interactive shell, with -t/-T support.
     let remote_cmd = plan.remote_command();
-    let session_kind = match remote_cmd {
-        Some(cmd) if plan.request_tty == crate::wrapper::RequestTty::No => {
-            SessionKind::Exec { command: cmd.join(" ") }
-        }
-        Some(_cmd) => {
-            // -t or auto-with-command: PTY + exec (the command is run via exec
-            // below, not passed to SessionKind::Exec which is no-pty-only).
-            // We use SessionKind::Shell to get the PTY+shell, then exec the
-            // command over the pty below.
-            SessionKind::Shell { term: term.clone(), cols, rows, terminal_modes: terminal_modes.clone() }
-        }
-        None => {
-            SessionKind::Shell { term: term.clone(), cols, rows, terminal_modes: terminal_modes.clone() }
-        }
-    };
+    let session_kind = decide_session_kind(remote_cmd, plan.request_tty, &term, cols, rows, &terminal_modes);
 
     // This process's own foreground shell's ctl-socket forward (owner or
     // single-process). Opportunistic: a forward that fails to set up just
@@ -562,9 +683,14 @@ async fn run_authenticated_session(
         }
     };
 
-    // ForwardAgent: wire up agent forwarding if the config enables it.
+    // ForwardAgent: wire up agent forwarding if the config enables it. A failure here
+    // (e.g. the server rejects agent forwarding, or the local agent connection dropped)
+    // shouldn't abort the session — the shell/exec still works without it — but it
+    // should be visible instead of silently vanishing (previously discarded via `let _ =`).
     if matches!(host_config.forward_agent, Some(openssh_config::ForwardAgent::Yes)) {
-        let _ = channel.agent_forward(true).await;
+        if let Err(e) = channel.agent_forward(true).await {
+            log_line!("isekai-ssh: agent forwarding request failed: {e}");
+        }
     }
 
     // SendEnv: forward LANG and LC_* environment variables (the most common
@@ -587,7 +713,7 @@ async fn run_authenticated_session(
     // local terminal (OSC title/clipboard on stderr).
     let ctl_remote_path = ctl.as_ref().map(|fwd| fwd.remote_path.clone());
     if let Some(fwd) = ctl {
-        tokio::spawn(ctl_forward::pump_to_stderr(fwd.channels));
+        tokio::spawn(ctl_forward::pump_to_stderr(fwd.channels, resolution.profile().to_string()));
     }
 
     let _raw_mode = console::RawModeGuard::enable().context("isekai-ssh: failed to enable raw terminal mode")?;
@@ -648,6 +774,29 @@ fn prompt_new_host_confirmation(host_port: &str, fingerprint: &str) -> bool {
     matches!(line.trim(), "yes" | "y" | "Y")
 }
 
+/// Bundles the two callbacks [`connect_and_authenticate`] needs for
+/// authentication methods that may require live user input: a
+/// passphrase-protected identity file, and `keyboard-interactive` (PAM/OTP/2FA
+/// servers that don't negotiate plain `password`). Both are built once by
+/// `run_authenticated_session` and, when built for a silent/automated retry,
+/// both refuse to prompt at all rather than block on a live-but-answerless
+/// stdin — the same seam `confirm_new_host` already uses for host-key TOFU
+/// confirmation. Bundled into one struct instead of two more `&dyn Fn`
+/// parameters purely to keep [`connect_and_authenticate`]'s already-long
+/// signature from growing further.
+struct InteractivePrompts<'a> {
+    passphrase: &'a (dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
+    keyboard_interactive: &'a (dyn Fn(&[KeyboardInteractivePrompt]) -> Vec<String> + Send + Sync),
+    /// Already-decrypted identities (Phase 1b passphrase hand-off, see
+    /// `super::mux::handoff`'s docs) — `connect_and_authenticate`'s candidate
+    /// loop consults this *before* the on-disk `SessionError::EncryptedPrivateKey`
+    /// path, so a holder mode session (which forces `silent = true` and would
+    /// otherwise just skip every encrypted candidate) can still authenticate
+    /// with one. Empty (never populated) for every non-holder, non-fallback
+    /// path.
+    handoff: &'a HandoffCredentials,
+}
+
 /// Establishes the SSH handshake over `stream` and authenticates as
 /// `username`, trying (in order) *every* configured/default private key from
 /// `host_config::identity_file`/the default `id_ed25519`→`id_rsa`→`id_ecdsa`
@@ -676,6 +825,7 @@ async fn connect_and_authenticate<S, V>(
     host_config: &openssh_config::HostConfig,
     verifier: &Arc<V>,
     forward_routes: &ForwardRoutes,
+    prompts: &InteractivePrompts<'_>,
 ) -> Result<client::Handle<russh_stream_session::VerifyingHandler<V>>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -720,16 +870,55 @@ where
     // or unparseable — is skipped, never fatal, so it can't block a
     // perfectly-good candidate listed before *or* after it, nor the SSH-agent
     // fallback below. Only a genuine transport/protocol error aborts.
-    for candidate in &candidates {
-        let Some(credential) = private_key::read_credential(candidate) else {
-            log_line!("isekai-ssh: no key at {}", candidate.display());
-            continue;
+    for (index, candidate) in candidates.iter().enumerate() {
+        // A passphrase hand-off entry (Phase 1b) means this exact candidate
+        // was already decrypted — by the process that spawned *this* one, if
+        // it's a holder — so it's used directly, skipping the on-disk read
+        // and the `EncryptedPrivateKey`/prompt path below entirely (a holder
+        // can't prompt anyway; see `InteractivePrompts::handoff`'s docs).
+        let (credential, already_decrypted) = if let Some(handed_off) = prompts.handoff.get(candidate) {
+            let credential = match &handed_off.certificate_pem {
+                Some(cert) => Credential::PublicKeyWithCertificate { private_key_pem: handed_off.private_key_pem.to_vec(), certificate_pem: cert.clone() },
+                None => Credential::PublicKey { private_key_pem: handed_off.private_key_pem.to_vec() },
+            };
+            (credential, true)
+        } else {
+            // `read_credential_with_certificate` also resolves a paired
+            // `CertificateFile` (an explicit one positionally, else `ssh(1)`'s
+            // own `<candidate>-cert.pub` default convention) and upgrades to
+            // `Credential::PublicKeyWithCertificate` when one is found and
+            // readable — see its own docs for the pairing rules.
+            let Some(credential) = private_key::read_credential_with_certificate(host_config, candidate, index) else {
+                log_line!("isekai-ssh: no key at {}", candidate.display());
+                continue;
+            };
+            (credential, false)
         };
         log_line!("isekai-ssh: trying key {}", candidate.display());
         match authenticate_session(&mut handle, username, &credential).await {
             Ok(true) => return Ok(handle),
             Ok(false) => continue,
-            Err(SessionError::InvalidPrivateKey(_)) => continue,
+            Err(SessionError::InvalidPrivateKey(_) | SessionError::InvalidCertificate(_)) => continue,
+            // Unreachable in practice: a hand-off entry is already cleartext,
+            // so `authenticate_session` would never re-report it as
+            // encrypted. Guarded explicitly anyway rather than assumed, so a
+            // future bug in the hand-off's own decrypt step fails safe (skips
+            // this candidate) instead of looping.
+            Err(SessionError::EncryptedPrivateKey) if already_decrypted => continue,
+            Err(SessionError::EncryptedPrivateKey) => {
+                let (private_key_pem, certificate_pem): (&[u8], Option<&[u8]>) = match &credential {
+                    Credential::PublicKey { private_key_pem } => (private_key_pem, None),
+                    Credential::PublicKeyWithCertificate { private_key_pem, certificate_pem } => {
+                        (private_key_pem, Some(certificate_pem))
+                    }
+                    Credential::Password(_) => continue, // unreachable: EncryptedPrivateKey never comes from a password
+                };
+                if try_encrypted_identity(&mut handle, username, candidate, private_key_pem, certificate_pem, prompts.passphrase)
+                    .await?
+                {
+                    return Ok(handle);
+                }
+            }
             Err(e) => return Err(anyhow::Error::new(e).context("SSH authentication request failed")),
         }
     }
@@ -738,9 +927,61 @@ where
         return Ok(handle);
     }
 
+    // Last resort: keyboard-interactive (PAM/OTP/2FA-style servers that don't
+    // negotiate plain `password` at all). Tried after every key and the agent
+    // since it's the one method that's neither "prove possession of a key
+    // file" nor silent — matches `ssh(1)`'s own `PreferredAuthentications`
+    // ordering (publickey before keyboard-interactive/password).
+    if authenticate_keyboard_interactive(&mut handle, username, |server_prompts| {
+        (prompts.keyboard_interactive)(server_prompts)
+    })
+    .await
+    .map_err(|e| anyhow::Error::new(e).context("SSH authentication request failed"))?
+    {
+        return Ok(handle);
+    }
+
     Err(anyhow!(
         "no configured private key or SSH agent identity was accepted for {username}"
     ))
+}
+
+/// Handles one candidate identity file that [`authenticate_session`] has
+/// reported as passphrase-protected (`SessionError::EncryptedPrivateKey`).
+/// Prompts (via `prompt_passphrase`) up to 3 times — matching `ssh(1)`'s own
+/// passphrase-retry convention — trying [`authenticate_publickey_with_passphrase`]
+/// (or, when `certificate_pem` is `Some`, [`authenticate_openssh_cert_with_passphrase`]
+/// instead) with each answer. `prompt_passphrase` returning `None` (the caller
+/// gave up, or — in silent/automated mode — refuses to prompt at all, see
+/// `run_authenticated_session`'s construction of it) stops the retry loop
+/// immediately and moves on to the next candidate/the SSH agent, exactly like
+/// exhausting the retry count does.
+async fn try_encrypted_identity<H: client::Handler>(
+    handle: &mut client::Handle<H>,
+    username: &str,
+    path: &Path,
+    private_key_pem: &[u8],
+    certificate_pem: Option<&[u8]>,
+    prompt_passphrase: &(dyn Fn(&Path, u32) -> Option<String> + Send + Sync),
+) -> Result<bool> {
+    for attempt in 1..=3 {
+        let Some(passphrase) = prompt_passphrase(path, attempt) else {
+            return Ok(false);
+        };
+        let result = match certificate_pem {
+            Some(cert) => authenticate_openssh_cert_with_passphrase(handle, username, private_key_pem, cert, &passphrase).await,
+            None => authenticate_publickey_with_passphrase(handle, username, private_key_pem, &passphrase).await,
+        };
+        match result {
+            Ok(true) => return Ok(true),
+            Ok(false) => return Ok(false), // server rejected the (successfully decrypted) key/cert — not a passphrase problem
+            // Wrong passphrase (or truly malformed key/cert): retry with a fresh prompt.
+            Err(SessionError::InvalidPrivateKey(_) | SessionError::InvalidCertificate(_)) => continue,
+            Err(e) => return Err(anyhow::Error::new(e).context("SSH authentication request failed")),
+        }
+    }
+    log_line!("isekai-ssh: too many failed passphrase attempts for {}", path.display());
+    Ok(false)
 }
 
 #[cfg(windows)]
@@ -984,6 +1225,24 @@ mod tests {
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
+    /// A [`InteractivePrompts`] that never prompts (passphrase: `None`;
+    /// keyboard-interactive: no answers) — the right default for every test
+    /// that isn't itself exercising one of these two interactive paths, same
+    /// as a silent/automated retry in production.
+    fn no_passphrase_prompt(_path: &Path, _attempt: u32) -> Option<String> {
+        None
+    }
+    fn no_kbi_responder(_prompts: &[KeyboardInteractivePrompt]) -> Vec<String> {
+        Vec::new()
+    }
+    fn empty_handoff() -> &'static HandoffCredentials {
+        static EMPTY: std::sync::OnceLock<HandoffCredentials> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(HandoffCredentials::default)
+    }
+    fn no_interactive_prompts() -> InteractivePrompts<'static> {
+        InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() }
+    }
+
     struct AcceptAllHostKeys;
     #[async_trait]
     impl HostKeyVerifier for AcceptAllHostKeys {
@@ -1032,6 +1291,56 @@ mod tests {
         }
     }
 
+    /// Accepts *only* keyboard-interactive (rejects password/publickey
+    /// outright), with a single non-echoed prompt — stands in for a
+    /// PAM-backed sshd that doesn't negotiate plain `password` at all, so
+    /// `connect_and_authenticate` must fall all the way through to its
+    /// keyboard-interactive last resort.
+    #[derive(Clone)]
+    struct KeyboardInteractiveOnlyServer {
+        accepted_answer: String,
+    }
+
+    impl server::Server for KeyboardInteractiveOnlyServer {
+        type Handler = KeyboardInteractiveOnlyHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> KeyboardInteractiveOnlyHandler {
+            KeyboardInteractiveOnlyHandler { accepted_answer: self.accepted_answer.clone() }
+        }
+    }
+
+    #[derive(Clone)]
+    struct KeyboardInteractiveOnlyHandler {
+        accepted_answer: String,
+    }
+
+    #[async_trait]
+    impl server::Handler for KeyboardInteractiveOnlyHandler {
+        type Error = russh::Error;
+
+        async fn auth_keyboard_interactive(
+            &mut self, _user: &str, _submethods: &str, response: Option<server::Response<'async_trait>>,
+        ) -> Result<Auth, Self::Error> {
+            match response {
+                None => Ok(Auth::Partial {
+                    name: "".into(),
+                    instructions: "".into(),
+                    prompts: std::borrow::Cow::Owned(vec![("Password: ".into(), false)]),
+                }),
+                Some(resp) => {
+                    let answers: Vec<Vec<u8>> = resp.map(|b| b.to_vec()).collect();
+                    let accepted = answers.first().map(|a| a.as_slice()) == Some(self.accepted_answer.as_bytes());
+                    Ok(if accepted { Auth::Accept } else { Auth::Reject { proceed_with_methods: None } })
+                }
+            }
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
     /// Writes a fresh ed25519 OpenSSH private key (deterministic from `seed`)
     /// to `dir/name` and returns its path plus the matching public key — so a
     /// test can point `HostConfig::identity_file` at a real key file and
@@ -1043,6 +1352,147 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, pem.as_bytes()).unwrap();
         (path, private.public_key().clone())
+    }
+
+    /// Writes an ed25519 identity file (like [`write_ed25519_identity`]) plus
+    /// a certificate for it, signed by a freshly generated CA key, at the
+    /// `ssh(1)`-default `<name>-cert.pub` sibling path — so a test can prove
+    /// `read_credential_with_certificate`'s default-discovery convention
+    /// (no explicit `CertificateFile` configured) actually authenticates
+    /// end-to-end. Returns the identity path and the CA's public key (to
+    /// configure a server that trusts it).
+    fn write_ed25519_identity_with_default_cert(dir: &Path, name: &str, seed: u8, ca_seed: u8) -> (PathBuf, SshPublicKey) {
+        let (identity_path, _subject_public) = write_ed25519_identity(dir, name, seed);
+        let subject_private = SshPrivateKey::from_openssh(&std::fs::read(&identity_path).unwrap()).unwrap();
+        let ca_key = SshPrivateKey::from(Ed25519Keypair::from_seed(&[ca_seed; 32]));
+
+        let mut builder = russh_keys::ssh_key::certificate::Builder::new_with_random_nonce(
+            &mut rand::rngs::OsRng,
+            subject_private.public_key().key_data().clone(),
+            0,
+            u32::MAX as u64,
+        )
+        .unwrap();
+        builder.cert_type(russh_keys::ssh_key::certificate::CertType::User).unwrap();
+        builder.valid_principal("tester").unwrap();
+        let cert = builder.sign(&ca_key).unwrap();
+
+        let mut cert_path = identity_path.as_os_str().to_owned();
+        cert_path.push("-cert.pub");
+        std::fs::write(PathBuf::from(cert_path), cert.to_openssh().unwrap().as_bytes()).unwrap();
+
+        (identity_path, ca_key.public_key().clone())
+    }
+
+    /// Accepts an OpenSSH certificate authentication iff it's signed by
+    /// `trusted_ca` (mirrors `russh_stream_session`'s own `CertificateServer`
+    /// test double). Rejects plain publickey/password outright, so a test
+    /// using this server proves the connection actually went through the
+    /// certificate path, not a lucky plain-pubkey fallback.
+    #[derive(Clone)]
+    struct CertificateOnlyServer {
+        trusted_ca: SshPublicKey,
+    }
+
+    impl server::Server for CertificateOnlyServer {
+        type Handler = CertificateOnlyHandler;
+        fn new_client(&mut self, _: Option<SocketAddr>) -> CertificateOnlyHandler {
+            CertificateOnlyHandler { trusted_ca: self.trusted_ca.clone() }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CertificateOnlyHandler {
+        trusted_ca: SshPublicKey,
+    }
+
+    #[async_trait]
+    impl server::Handler for CertificateOnlyHandler {
+        type Error = russh::Error;
+
+        async fn auth_openssh_certificate(
+            &mut self, _user: &str, certificate: &russh_keys::ssh_key::Certificate,
+        ) -> Result<Auth, Self::Error> {
+            Ok(if certificate.signature_key() == self.trusted_ca.key_data() {
+                Auth::Accept
+            } else {
+                Auth::Reject { proceed_with_methods: None }
+            })
+        }
+
+        async fn channel_open_session(
+            &mut self, _channel: RusshChannel<ServerMsg>, _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_succeeds_via_the_default_discovered_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (identity_path, ca_public) = write_ed25519_identity_with_default_cert(dir.path(), "id_ed25519", 230, 231);
+        let addr = spawn_server(CertificateOnlyServer { trusted_ca: ca_public }, 230).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // No CertificateFile configured explicitly: this must be found via
+        // ssh(1)'s own default `<identity>-cert.pub` discovery convention.
+        let host_config = openssh_config::HostConfig { identity_file: vec![identity_path], ..Default::default() };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
+        assert!(
+            result.is_ok(),
+            "the default-discovered certificate must authenticate: {}",
+            result.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+
+    /// Like [`write_ed25519_identity_with_default_cert`], but encrypts the
+    /// identity key with `passphrase` — so a test can prove the
+    /// encrypted-key retry path (`try_encrypted_identity`) correctly carries
+    /// the paired certificate through, not just plain pubkey auth.
+    fn write_encrypted_ed25519_identity_with_default_cert(
+        dir: &Path, name: &str, seed: u8, ca_seed: u8, passphrase: &str,
+    ) -> (PathBuf, SshPublicKey) {
+        let (identity_path, ca_public) = write_ed25519_identity_with_default_cert(dir, name, seed, ca_seed);
+        let plain = SshPrivateKey::from_openssh(&std::fs::read(&identity_path).unwrap()).unwrap();
+        let encrypted = plain.encrypt(&mut rand::rngs::OsRng, passphrase).unwrap();
+        std::fs::write(&identity_path, encrypted.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+        (identity_path, ca_public)
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_succeeds_via_an_encrypted_identity_with_a_paired_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (identity_path, ca_public) =
+            write_encrypted_ed25519_identity_with_default_cert(dir.path(), "id_ed25519", 232, 233, "hunter2");
+        let addr = spawn_server(CertificateOnlyServer { trusted_ca: ca_public }, 231).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![identity_path], ..Default::default() };
+        let passphrase_prompt = |_path: &Path, _attempt: u32| Some("hunter2".to_string());
+        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
+        assert!(
+            result.is_ok(),
+            "the right passphrase must decrypt the key and authenticate via its paired certificate: {}",
+            result.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+
+    /// Like [`write_ed25519_identity`], but encrypts the key with `passphrase`
+    /// first — a real encrypted OpenSSH key, exercising the same
+    /// `is_encrypted`/`decrypt` code path a real user's passphrase-protected
+    /// `~/.ssh/id_ed25519` would.
+    fn write_encrypted_ed25519_identity(dir: &Path, name: &str, seed: u8, passphrase: &str) -> (PathBuf, SshPublicKey) {
+        let keypair = Ed25519Keypair::from_seed(&[seed; 32]);
+        let private = SshPrivateKey::from(keypair);
+        let public = private.public_key().clone();
+        let encrypted = private.encrypt(&mut rand::rngs::OsRng, passphrase).expect("encrypt a freshly generated key");
+        let pem = encrypted.to_openssh(LineEnding::LF).expect("serialize encrypted ed25519 key to OpenSSH PEM");
+        let path = dir.join(name);
+        std::fs::write(&path, pem.as_bytes()).unwrap();
+        (path, public)
     }
 
     /// Accepts publickey auth for exactly one configured public key (rejecting
@@ -1192,6 +1642,45 @@ mod tests {
         addr
     }
 
+    /// README regression test (the stale README §"対応していない・非互換の事項" used to
+    /// claim `isekai-ssh <host> 'cmd'` was unwired on the native path and always opened
+    /// an interactive shell instead — it has actually dispatched to
+    /// `SessionKind::Exec` since this was written; this locks the decision in so it
+    /// can't silently regress back to always-Shell without a failing test).
+    #[test]
+    fn decide_session_kind_uses_exec_for_a_command_with_no_pty() {
+        let cmd = vec!["echo".to_string(), "hi".to_string()];
+        let kind = decide_session_kind(Some(&cmd), crate::wrapper::RequestTty::No, "xterm", 80, 24, &[]);
+        match kind {
+            SessionKind::Exec { command } => assert_eq!(command, "echo hi"),
+            SessionKind::Shell { .. } => panic!("-T with a remote command must skip the PTY (SessionKind::Exec)"),
+        }
+    }
+
+    /// `Auto`/`Yes`/`Force` all open a PTY+shell even when a command is present — the
+    /// command itself is `exec`'d over that PTY separately by the caller (see the
+    /// `remote_cmd`/`request_tty` check right after the channel opens in
+    /// `run_authenticated_session`), since `SessionKind::Exec` never allocates a PTY.
+    #[test]
+    fn decide_session_kind_uses_shell_for_a_command_with_a_pty_requested() {
+        let cmd = vec!["echo".to_string(), "hi".to_string()];
+        for request_tty in [crate::wrapper::RequestTty::Auto, crate::wrapper::RequestTty::Yes, crate::wrapper::RequestTty::Force] {
+            let kind = decide_session_kind(Some(&cmd), request_tty, "xterm", 80, 24, &[]);
+            assert!(
+                matches!(kind, SessionKind::Shell { .. }),
+                "{request_tty:?} with a remote command must still allocate a PTY"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_session_kind_uses_shell_when_there_is_no_remote_command() {
+        for request_tty in [crate::wrapper::RequestTty::Auto, crate::wrapper::RequestTty::Yes, crate::wrapper::RequestTty::No, crate::wrapper::RequestTty::Force] {
+            let kind = decide_session_kind(None, request_tty, "xterm", 80, 24, &[]);
+            assert!(matches!(kind, SessionKind::Shell { .. }), "no remote command always means an interactive shell");
+        }
+    }
+
     /// `connect_and_authenticate` has no private key or agent to offer in
     /// this test (no identity files exist at the tempdir `home` used, and
     /// there's no agent on Linux), so this only proves the "everything was
@@ -1206,7 +1695,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(result.is_err(), "no identity file and no agent means nothing to authenticate with");
     }
 
@@ -1217,7 +1706,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig::default();
 
-        let Err(err) = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await
+        let Err(err) = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await
         else {
             panic!("a rejected host key must fail the connection before any auth attempt");
         };
@@ -1326,7 +1815,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, second_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(
             result.is_ok(),
             "the second configured identity is accepted, so the connection must succeed despite the first being rejected"
@@ -1351,7 +1840,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![garbage, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(result.is_ok(), "an unparseable first identity (InvalidPrivateKey) must not block the valid second one");
     }
 
@@ -1374,7 +1863,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![first_key, unreadable], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(
             result.is_ok(),
             "a readable, accepted first key must authenticate; an unreadable *later* candidate must not abort the attempt"
@@ -1395,8 +1884,179 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let host_config = openssh_config::HostConfig { identity_file: vec![unreadable, valid_key], ..Default::default() };
 
-        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new()).await;
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
         assert!(result.is_ok(), "an unreadable first candidate must be skipped, then the valid second one authenticates");
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_succeeds_with_an_encrypted_identity_via_the_right_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 210, "hunter2");
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 209).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
+
+        let passphrase_prompt = |_path: &Path, _attempt: u32| Some("hunter2".to_string());
+        let prompts = InteractivePrompts { passphrase: &passphrase_prompt, keyboard_interactive: &no_kbi_responder, handoff: empty_handoff() };
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
+        assert!(result.is_ok(), "the right passphrase must decrypt and authenticate: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_fails_cleanly_when_the_passphrase_prompt_is_refused() {
+        // Stands in for `run_authenticated_session`'s silent/automated retry
+        // seam: the prompt closure always returns `None` (never blocks on
+        // stdin), so an encrypted identity is simply skipped and the overall
+        // attempt fails with the same "nothing was accepted" error a plain
+        // missing key would produce — no hang, no panic.
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 211, "hunter2");
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 210).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
+        assert!(result.is_err(), "a silently-refused passphrase prompt must fail cleanly, not hang or panic");
+    }
+
+    /// Simulates the holder-mode path (Phase 1b passphrase hand-off): the
+    /// passphrase was already resolved by the spawning client before this
+    /// connect ever started (`resolve_handoff_credentials`, exercised here
+    /// exactly as `mux::dispatch` would use it), so `connect_and_authenticate`
+    /// must authenticate straight from that hand-off set and never touch the
+    /// (here, silently-refusing) on-disk passphrase prompt at all — the whole
+    /// point being that a detached holder has no console to prompt with.
+    #[tokio::test]
+    async fn connect_and_authenticate_uses_a_handoff_credential_without_ever_prompting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 212, "hunter2");
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 212).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig { identity_file: vec![path], ..Default::default() };
+
+        let resolved = super::super::mux::handoff::resolve_handoff_credentials(&host_config, dir.path(), &|_path, _attempt| Some("hunter2".to_string()));
+
+        let prompted = std::sync::atomic::AtomicBool::new(false);
+        let refusing_prompt = |path: &Path, attempt: u32| {
+            prompted.store(true, std::sync::atomic::Ordering::SeqCst);
+            no_passphrase_prompt(path, attempt)
+        };
+        let prompts = InteractivePrompts { passphrase: &refusing_prompt, keyboard_interactive: &no_kbi_responder, handoff: &resolved };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
+        assert!(result.is_ok(), "a hand-off credential must authenticate directly: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
+        assert!(!prompted.load(std::sync::atomic::Ordering::SeqCst), "a hand-off credential must never trigger the on-disk passphrase prompt");
+    }
+
+    #[tokio::test]
+    async fn try_encrypted_identity_succeeds_on_the_first_correct_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 212, "hunter2");
+        let pem = std::fs::read(&path).unwrap();
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 211).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let mut handle = establish_over_stream(config, stream, verifying_handler(&verifier)).await.unwrap();
+
+        let calls = std::sync::Mutex::new(0u32);
+        let prompt = |_path: &Path, _attempt: u32| -> Option<String> {
+            *calls.lock().unwrap() += 1;
+            Some("hunter2".to_string())
+        };
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, None, &prompt).await.unwrap();
+        assert!(ok);
+        assert_eq!(*calls.lock().unwrap(), 1, "the first correct passphrase must succeed without retrying");
+    }
+
+    #[tokio::test]
+    async fn try_encrypted_identity_retries_on_a_wrong_passphrase_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 213, "hunter2");
+        let pem = std::fs::read(&path).unwrap();
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 212).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let mut handle = establish_over_stream(config, stream, verifying_handler(&verifier)).await.unwrap();
+
+        let last_attempt = std::sync::Mutex::new(0u32);
+        let prompt = |_path: &Path, attempt: u32| -> Option<String> {
+            *last_attempt.lock().unwrap() = attempt;
+            if attempt < 3 { Some("wrong".to_string()) } else { Some("hunter2".to_string()) }
+        };
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, None, &prompt).await.unwrap();
+        assert!(ok, "the 3rd attempt has the right passphrase");
+        assert_eq!(*last_attempt.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn try_encrypted_identity_gives_up_immediately_when_the_prompt_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 214, "hunter2");
+        let pem = std::fs::read(&path).unwrap();
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 213).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let mut handle = establish_over_stream(config, stream, verifying_handler(&verifier)).await.unwrap();
+
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, None, &|_, _| None).await.unwrap();
+        assert!(!ok, "a refused prompt (e.g. silent mode) must give up, not hang or error");
+    }
+
+    #[tokio::test]
+    async fn try_encrypted_identity_gives_up_after_three_wrong_passphrases() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, public) = write_encrypted_ed25519_identity(dir.path(), "id_encrypted", 215, "hunter2");
+        let pem = std::fs::read(&path).unwrap();
+        let addr = spawn_server(AcceptOneKeyServer { accepted: public }, 214).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let config = Arc::new(client::Config::default());
+        let mut handle = establish_over_stream(config, stream, verifying_handler(&verifier)).await.unwrap();
+
+        let calls = std::sync::Mutex::new(0u32);
+        let prompt = |_path: &Path, _attempt: u32| -> Option<String> {
+            *calls.lock().unwrap() += 1;
+            Some("still-wrong".to_string())
+        };
+        let ok = try_encrypted_identity(&mut handle, "tester", &path, &pem, None, &prompt).await.unwrap();
+        assert!(!ok, "3 wrong passphrases in a row must give up, not retry forever");
+        assert_eq!(*calls.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_falls_through_to_keyboard_interactive_when_nothing_else_is_configured() {
+        let addr = spawn_server(KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string() }, 220).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // No identity_file configured and no agent on Linux, so this proves
+        // the fall-through all the way to keyboard-interactive.
+        let host_config = openssh_config::HostConfig::default();
+        let kbi_responder = |_prompts: &[KeyboardInteractivePrompt]| vec!["hunter2".to_string()];
+        let prompts = InteractivePrompts { passphrase: &no_passphrase_prompt, keyboard_interactive: &kbi_responder, handoff: empty_handoff() };
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &prompts).await;
+        assert!(result.is_ok(), "keyboard-interactive with the right answer must authenticate: {}", result.err().map(|e| e.to_string()).unwrap_or_default());
+    }
+
+    #[tokio::test]
+    async fn connect_and_authenticate_fails_cleanly_when_keyboard_interactive_is_silently_refused() {
+        // Stands in for `run_authenticated_session`'s silent/automated retry
+        // seam: the kbi responder always returns empty answers (never blocks
+        // on a live server prompt it can't answer), so the overall attempt
+        // fails cleanly rather than hanging.
+        let addr = spawn_server(KeyboardInteractiveOnlyServer { accepted_answer: "hunter2".to_string() }, 221).await;
+        let verifier = Arc::new(AcceptAllHostKeys);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let host_config = openssh_config::HostConfig::default();
+
+        let result = connect_and_authenticate(stream, "tester", &host_config, &verifier, &ForwardRoutes::new(), &no_interactive_prompts()).await;
+        assert!(result.is_err(), "a silently-refused keyboard-interactive prompt must fail cleanly, not hang or panic");
     }
 
     /// The cheap, reliable branch of the "always-connects" recovery
@@ -1435,7 +2095,8 @@ mod tests {
         );
         let runtime_dir = tempfile::tempdir().unwrap();
 
-        let result = run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, runtime_dir.path(), None).await;
+        let result =
+            run_native_connect_with_recovery(&plan, &resolution, &host_config, intent, runtime_dir.path(), None, HandoffCredentials::default()).await;
         assert!(result.is_err(), "a connect failure with no ConnectOutcome signal must propagate, not be swallowed");
     }
 
@@ -1479,11 +2140,22 @@ mod tests {
 
         let fired = std::sync::Arc::new(AtomicBool::new(false));
         let fired_in_hook = fired.clone();
-        let mut owner_hook: Option<OwnerHook> =
-            Some(Box::new(move |_handle, _routes| fired_in_hook.store(true, Ordering::SeqCst)));
+        let mut owner_hook: Option<OwnerHook> = Some(Box::new(move |_handle, _routes| {
+            fired_in_hook.store(true, Ordering::SeqCst);
+            tokio::spawn(async {})
+        }));
 
-        let result =
-            connect_attempt(&plan, &resolution, &host_config, &intent, runtime_dir.path(), &mut owner_hook, false).await;
+        let result = connect_attempt(
+            &plan,
+            &resolution,
+            &host_config,
+            &intent,
+            runtime_dir.path(),
+            &mut owner_hook,
+            &HandoffCredentials::default(),
+            false,
+        )
+        .await;
 
         assert!(result.is_err(), "a bogus pipe binary path must make the connect attempt fail");
         assert!(owner_hook.is_some(), "a failed attempt must leave the owner hook intact for the re-bootstrap retry");

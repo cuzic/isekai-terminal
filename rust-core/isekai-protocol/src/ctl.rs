@@ -19,6 +19,15 @@
 //! receiving end of the channel (`isekai-ssh`'s CLI wrapper or the
 //! isekai-terminal Android app's in-process listener), not by this crate.
 //!
+//! `BuildRequest`/`BuildOutputChunk`/`BuildFinished` (§8 Epic P, "リモート発
+//! ビルドトリガー") are the one deliberate exception to "one `CtlMessage` per
+//! connection": a `BuildRequest` connection stays open streaming zero or more
+//! `BuildOutputChunk`s before the terminating `BuildFinished`, so the caller
+//! can replay a running build's stdout/stderr to its own tty live. The
+//! `profile` field is a name only — never a raw command — resolved entirely
+//! by the receiving side's local config, preserving Epic M's "no
+//! general-purpose exec RPC" stance.
+//!
 //! One `CtlMessage` per line, same "explicit fields, no legacy duplicates"
 //! style as `handshake::HandshakeJson`. `isekai-terminal-core` and
 //! `isekai-pipe` share this module unchanged.
@@ -50,6 +59,24 @@ pub const MAX_VAR_KEY_LEN: usize = 256;
 /// (chunked, no such cap) is for.
 pub const MAX_VAR_VALUE_LEN: usize = 64 * 1024;
 
+/// Cap on a `build_request`'s profile name length. The name is only ever a
+/// key into the *local* side's build-profile config (`ISEKAI_PIPE_DESIGN.md`
+/// §8 Epic P) — never a raw command — so it stays short like a var key.
+pub const MAX_BUILD_PROFILE_NAME_LEN: usize = 256;
+
+/// Cap on the *decoded* byte length of a single `build_output_chunk`. Shares
+/// the clipboard text cap's order of magnitude: build output is streamed one
+/// chunk at a time (typically one line), not buffered as a whole, so there is
+/// no need for a larger cap the way `MAX_CLIPBOARD_IMAGE_DECODED_LEN` exists
+/// for a one-shot image payload.
+pub const MAX_BUILD_CHUNK_DECODED_LEN: usize = 64 * 1024;
+
+/// Cap on the number of `result_paths` a `build_finished` message may carry.
+pub const MAX_BUILD_RESULT_PATHS: usize = 64;
+
+/// Cap on a single `result_paths` entry's byte length.
+pub const MAX_BUILD_RESULT_PATH_LEN: usize = 4 * 1024;
+
 /// Scope a `setvar`/`getvar` key is stored/looked up under. Resolved by
 /// whichever process hosts the receiving end of the ctl-socket-forward
 /// channel (the `isekai-ssh` CLI wrapper, or the isekai-terminal Android app's
@@ -69,6 +96,17 @@ pub enum VarScope {
     Session,
     #[serde(rename = "global")]
     Global,
+}
+
+/// Which of the build child process's standard streams a `build_output_chunk`
+/// came from, so the receiving `isekai-pipe ctl build` can replay it to its
+/// own matching stream rather than merging stdout/stderr into one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuildOutputStream {
+    #[serde(rename = "stdout")]
+    Stdout,
+    #[serde(rename = "stderr")]
+    Stderr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +173,35 @@ pub enum CtlMessage {
     /// a valid stored value).
     #[serde(rename = "getvar_response")]
     GetVarResponse { value: Option<String> },
+    /// host → device: ask the device to run the named build profile
+    /// (`ISEKAI_PIPE_DESIGN.md` §8 Epic P, `isekai-pipe ctl build <profile>`).
+    /// `profile` is looked up in the *device*'s own local config — the wire
+    /// never carries a raw command string, only this fixed-whitelist name,
+    /// deliberately preserving Epic M's "no general-purpose exec RPC"
+    /// stance while still allowing the device to run something.
+    #[serde(rename = "build_request")]
+    BuildRequest { profile: String },
+    /// device → host: one line of the running build's stdout/stderr, sent as
+    /// it is produced (unlike every other response in this enum, a single
+    /// `BuildRequest` connection expects an arbitrary number of these before
+    /// the terminating `BuildFinished`).
+    #[serde(rename = "build_output_chunk")]
+    BuildOutputChunk {
+        stream: BuildOutputStream,
+        data_b64: String,
+    },
+    /// device → host: the build process has exited; terminates the
+    /// `BuildRequest` connection. `result_paths` are the device-local paths
+    /// matched by the profile's `result_glob`, if any — `isekai-ssh` pushes
+    /// these back to the profile's configured `dest_dir` out-of-band (a
+    /// recursive `isekai-ssh <host> -- cat > ...` invocation, not a
+    /// ctl-socket message, since these can be far larger than
+    /// `MAX_BUILD_CHUNK_DECODED_LEN`).
+    #[serde(rename = "build_finished")]
+    BuildFinished {
+        exit_code: i32,
+        result_paths: Vec<String>,
+    },
 }
 
 /// Parses and validates one line of control-plane JSON. Rejects oversized
@@ -191,6 +258,64 @@ pub fn validate_ctl_message(msg: &CtlMessage) -> Result<(), ProtocolError> {
                         reason: format!(
                             "is {} bytes, exceeding the {MAX_VAR_VALUE_LEN} byte limit",
                             value.len()
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        }
+        CtlMessage::BuildRequest { profile } => {
+            if profile.is_empty() {
+                return Err(ProtocolError::CtlMessageField {
+                    field: "profile",
+                    reason: "must be non-empty".to_string(),
+                });
+            }
+            if profile.len() > MAX_BUILD_PROFILE_NAME_LEN {
+                return Err(ProtocolError::CtlMessageField {
+                    field: "profile",
+                    reason: format!(
+                        "is {} bytes, exceeding the {MAX_BUILD_PROFILE_NAME_LEN} byte limit",
+                        profile.len()
+                    ),
+                });
+            }
+            Ok(())
+        }
+        CtlMessage::BuildOutputChunk { data_b64, .. } => {
+            let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_b64)
+                .map_err(|e| ProtocolError::CtlMessageField {
+                    field: "data_b64",
+                    reason: e.to_string(),
+                })?;
+            if decoded.len() > MAX_BUILD_CHUNK_DECODED_LEN {
+                return Err(ProtocolError::CtlMessageField {
+                    field: "data_b64",
+                    reason: format!(
+                        "decodes to {} bytes, exceeding the {MAX_BUILD_CHUNK_DECODED_LEN} byte limit",
+                        decoded.len()
+                    ),
+                });
+            }
+            Ok(())
+        }
+        CtlMessage::BuildFinished { result_paths, .. } => {
+            if result_paths.len() > MAX_BUILD_RESULT_PATHS {
+                return Err(ProtocolError::CtlMessageField {
+                    field: "result_paths",
+                    reason: format!(
+                        "has {} entries, exceeding the {MAX_BUILD_RESULT_PATHS} entry limit",
+                        result_paths.len()
+                    ),
+                });
+            }
+            for path in result_paths {
+                if path.len() > MAX_BUILD_RESULT_PATH_LEN {
+                    return Err(ProtocolError::CtlMessageField {
+                        field: "result_paths",
+                        reason: format!(
+                            "entry is {} bytes, exceeding the {MAX_BUILD_RESULT_PATH_LEN} byte limit",
+                            path.len()
                         ),
                     });
                 }
@@ -454,5 +579,126 @@ mod tests {
         let json = br#"{"op":"getvar_request","scope":"tab","key":""}"#;
         let err = decode_ctl_message(json).unwrap_err();
         assert!(matches!(err, ProtocolError::CtlMessageField { field: "key", .. }));
+    }
+
+    #[test]
+    fn decodes_build_request() {
+        let json = br#"{"op":"build_request","profile":"win"}"#;
+        assert_eq!(
+            decode_ctl_message(json).unwrap(),
+            CtlMessage::BuildRequest {
+                profile: "win".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_build_request_with_empty_profile() {
+        let json = br#"{"op":"build_request","profile":""}"#;
+        let err = decode_ctl_message(json).unwrap_err();
+        assert!(matches!(err, ProtocolError::CtlMessageField { field: "profile", .. }));
+    }
+
+    #[test]
+    fn rejects_build_request_with_oversized_profile() {
+        let profile = "p".repeat(MAX_BUILD_PROFILE_NAME_LEN + 1);
+        let json = format!(r#"{{"op":"build_request","profile":"{profile}"}}"#);
+        let err = decode_ctl_message(json.as_bytes()).unwrap_err();
+        assert!(matches!(err, ProtocolError::CtlMessageField { field: "profile", .. }));
+    }
+
+    #[test]
+    fn decodes_build_output_chunk_for_each_stream() {
+        for (stream_json, stream) in [
+            ("stdout", BuildOutputStream::Stdout),
+            ("stderr", BuildOutputStream::Stderr),
+        ] {
+            let json = format!(r#"{{"op":"build_output_chunk","stream":"{stream_json}","data_b64":"aGVsbG8="}}"#);
+            assert_eq!(
+                decode_ctl_message(json.as_bytes()).unwrap(),
+                CtlMessage::BuildOutputChunk {
+                    stream,
+                    data_b64: "aGVsbG8=".to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_build_output_chunk_exceeding_cap() {
+        let oversized = "A".repeat(MAX_BUILD_CHUNK_DECODED_LEN + 1);
+        let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, oversized);
+        let msg = CtlMessage::BuildOutputChunk {
+            stream: BuildOutputStream::Stdout,
+            data_b64,
+        };
+        let err = validate_ctl_message(&msg).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField {
+                field: "data_b64",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decodes_build_finished_with_result_paths() {
+        let json = br#"{"op":"build_finished","exit_code":0,"result_paths":["target/release/app.exe"]}"#;
+        assert_eq!(
+            decode_ctl_message(json).unwrap(),
+            CtlMessage::BuildFinished {
+                exit_code: 0,
+                result_paths: vec!["target/release/app.exe".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_build_finished_with_nonzero_exit_and_no_results() {
+        let json = br#"{"op":"build_finished","exit_code":127,"result_paths":[]}"#;
+        assert_eq!(
+            decode_ctl_message(json).unwrap(),
+            CtlMessage::BuildFinished {
+                exit_code: 127,
+                result_paths: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_build_finished_exceeding_result_path_count_cap() {
+        let result_paths: Vec<String> = (0..MAX_BUILD_RESULT_PATHS + 1)
+            .map(|i| format!("p{i}"))
+            .collect();
+        let msg = CtlMessage::BuildFinished {
+            exit_code: 0,
+            result_paths,
+        };
+        let err = validate_ctl_message(&msg).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField {
+                field: "result_paths",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_build_finished_with_oversized_result_path() {
+        let path = "p".repeat(MAX_BUILD_RESULT_PATH_LEN + 1);
+        let msg = CtlMessage::BuildFinished {
+            exit_code: 0,
+            result_paths: vec![path],
+        };
+        let err = validate_ctl_message(&msg).unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolError::CtlMessageField {
+                field: "result_paths",
+                ..
+            }
+        ));
     }
 }

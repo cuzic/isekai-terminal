@@ -698,12 +698,22 @@ fn dispatch_transport_event(
             // ため、`TransportEvent::CtlMessage`としてこの`session_event_loop`まで
             // 転送されることが無い。`GetVarResponse`はdevice→hostの応答そのもので
             // あり、`ClipboardPullResponse`同様deviceが受け取ることは無い。
+            //
+            // `BuildRequest`/`BuildOutputChunk`/`BuildFinished`(Epic P、
+            // リモート発ビルドトリガー)はAndroid/iOS本体アプリでは意図的に
+            // 未サポート — スマホ上にビルドツールチェーンは無く、Phase 1の
+            // スコープは`isekai-ssh`(デスクトップCLIラッパー)のみ
+            // (`ISEKAI_PIPE_DESIGN.md` §8 Epic P)。
+            //
             // すべて到達したら無視するだけの防御的なアーム。
             isekai_protocol::CtlMessage::ClipboardPullRequest {}
             | isekai_protocol::CtlMessage::ClipboardPullResponse { .. }
             | isekai_protocol::CtlMessage::SetVar { .. }
             | isekai_protocol::CtlMessage::GetVarRequest { .. }
-            | isekai_protocol::CtlMessage::GetVarResponse { .. } => EventOutcome::Continue(None),
+            | isekai_protocol::CtlMessage::GetVarResponse { .. }
+            | isekai_protocol::CtlMessage::BuildRequest { .. }
+            | isekai_protocol::CtlMessage::BuildOutputChunk { .. }
+            | isekai_protocol::CtlMessage::BuildFinished { .. } => EventOutcome::Continue(None),
         },
         TransportEvent::ClipboardPullRequestOverCtl(reply) => {
             // tmux迂回チャンネル経由のpull要求(`ISEKAI_PIPE_DESIGN.md` §8 Epic M
