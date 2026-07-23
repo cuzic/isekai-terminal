@@ -826,47 +826,36 @@ mod tests {
         let (mut or, mut ow) = tokio::io::split(owner_conn);
 
         let owner = tokio::spawn(async move {
-            eprintln!("[diag] owner: waiting for Hello");
             match read_frame(&mut or).await.unwrap().unwrap() {
                 Frame::Hello { .. } => {}
                 other => panic!("expected Hello, got {other:?}"),
             }
-            eprintln!("[diag] owner: got Hello, sending HelloAck");
             write_frame(&mut ow, &Frame::HelloAck { version: MUX_PROTOCOL_VERSION }).await.unwrap();
 
-            eprintln!("[diag] owner: sending BuildRequest");
             let request = serde_json::to_vec(&isekai_protocol::CtlMessage::BuildRequest { profile: "infinite".to_string() }).unwrap();
             write_frame(&mut ow, &Frame::Ctl(request)).await.unwrap();
 
             // Wait for at least one real output chunk (proves the build
             // actually started) before telling the client to abort it.
-            eprintln!("[diag] owner: waiting for first BuildOutputChunk");
             loop {
                 match read_frame(&mut or).await.unwrap().unwrap() {
                     Frame::Ctl(bytes) => {
-                        let decoded = isekai_protocol::decode_ctl_message(&bytes);
-                        eprintln!("[diag] owner: got Ctl frame, decoded={decoded:?}");
-                        if matches!(decoded, Ok(isekai_protocol::CtlMessage::BuildOutputChunk { .. })) {
+                        if matches!(isekai_protocol::decode_ctl_message(&bytes), Ok(isekai_protocol::CtlMessage::BuildOutputChunk { .. })) {
                             break;
                         }
                     }
-                    Frame::Shutdown => {
-                        eprintln!("[diag] owner: got Shutdown frame");
-                    }
+                    Frame::Shutdown => {} // empty test stdin hits EOF immediately; irrelevant here
                     other => panic!("unexpected frame: {other:?}"),
                 }
             }
 
-            eprintln!("[diag] owner: got first chunk, sending abort sentinel");
             let abort = serde_json::to_vec(&isekai_protocol::CtlMessage::BuildFinished {
                 exit_code: super::super::build_relay::BUILD_ABORTED_SENTINEL,
                 result_paths: Vec::new(),
             })
             .unwrap();
             write_frame(&mut ow, &Frame::Ctl(abort)).await.unwrap();
-            eprintln!("[diag] owner: sending Exit(0)");
             write_frame(&mut ow, &Frame::Exit(0)).await.unwrap();
-            eprintln!("[diag] owner: done, task ending");
         });
 
         let (cr, mut cw) = tokio::io::split(client_conn);

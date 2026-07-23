@@ -589,8 +589,14 @@ async fn wrapper_silently_recovers_from_a_stale_trust_signal_and_reconnects() {
     let _ = child.start_kill();
     let _ = child.wait().await;
 
-    assert!(saw_stale_notice, "expected wrapper stderr to report a detected stale-trust signal:\n{stderr_log}");
-    assert!(saw_second_registration, "expected the re-bootstrap to complete and register a refreshed profile:\n{stderr_log}");
+    // [diag] temporary: dump the verbose log file too (a lot of the
+    // connect/recovery progress lines default there, not stderr) to
+    // diagnose a real-CI-only Windows failure whose stderr alone showed
+    // nothing past `resolved host_config`.
+    let verbose_log_contents = std::fs::read_to_string(verbose_log_path_under(&home)).unwrap_or_else(|e| format!("<failed to read verbose log: {e}>"));
+
+    assert!(saw_stale_notice, "expected wrapper stderr to report a detected stale-trust signal:\n{stderr_log}\n[diag] verbose log:\n{verbose_log_contents}");
+    assert!(saw_second_registration, "expected the re-bootstrap to complete and register a refreshed profile:\n{stderr_log}\n[diag] verbose log:\n{verbose_log_contents}");
     assert!(!stderr_log.contains("[y/N]"), "the automatic re-bootstrap must never show the TOFU prompt:\n{stderr_log}");
     // `OpenSshBackend::install_and_launch` performs exactly one combined
     // `ssh(1)` invocation per deploy (check + conditional-upload +
@@ -796,11 +802,15 @@ async fn wrapper_silently_recovers_from_an_unreachable_cached_endpoint_and_recon
     let _ = child.start_kill();
     let _ = child.wait().await;
 
+    // [diag] temporary: see the identical comment in the sibling stale-trust
+    // test above.
+    let verbose_log_contents = std::fs::read_to_string(verbose_log_path_under(&home)).unwrap_or_else(|e| format!("<failed to read verbose log: {e}>"));
+
     assert!(
         saw_unreachable_notice,
-        "expected wrapper stderr to report a detected connect-failure (unreachable) signal:\n{stderr_log}"
+        "expected wrapper stderr to report a detected connect-failure (unreachable) signal:\n{stderr_log}\n[diag] verbose log:\n{verbose_log_contents}"
     );
-    assert!(saw_second_registration, "expected the re-bootstrap to complete and register a refreshed profile:\n{stderr_log}");
+    assert!(saw_second_registration, "expected the re-bootstrap to complete and register a refreshed profile:\n{stderr_log}\n[diag] verbose log:\n{verbose_log_contents}");
     assert!(!stderr_log.contains("[y/N]"), "the automatic re-bootstrap must never show the TOFU prompt:\n{stderr_log}");
     assert!(
         !stderr_log.contains("looks stale"),
