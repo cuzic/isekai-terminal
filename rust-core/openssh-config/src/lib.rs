@@ -7,12 +7,22 @@
 //! lines in place, glob patterns expand in sorted order, cyclic includes
 //! are silently skipped on repeat).
 //!
-//! **Deliberate limitation**: `Match` block conditions (`Match exec`,
-//! `Match host`, `Match user`, ...) are recognized structurally (so a
-//! `Match` line doesn't get misparsed as a keyword) but never evaluated —
-//! anything inside a `Match` block is simply never applied. This crate has
-//! no opinion on process execution or the runtime context those conditions
-//! need; only `Host` patterns are supported.
+//! `Match` blocks evaluate `all`/`host`/`user`/`localuser` criteria (each
+//! taking a single comma-separated pattern-list argument, `!`-negatable, the
+//! same as other `ssh_config(5)` pattern-lists) — all criteria on a line must
+//! be satisfied (AND semantics). `user`/`localuser` are checked against
+//! whatever `User` an *earlier* matching block already resolved into the
+//! in-progress `HostConfig` / the real local username, respectively (`Match
+//! user` in file order can't be satisfied by a `User` set *later* in the same
+//! file — same first-obtained-value-wins state this crate uses everywhere
+//! else).
+//!
+//! **Deliberate limitation**: `exec`/`canonical`/`final`/`originalhost`
+//! criteria are recognized structurally (so a line using them doesn't get
+//! misparsed) but are never satisfiable — this crate has no opinion on
+//! process execution or `ssh(1)`'s canonicalization runtime state, so any
+//! `Match` line using one of these always evaluates to false rather than
+//! guessing.
 //!
 //! Any keyword other than the ones listed above is silently ignored — this
 //! is not a general-purpose `ssh_config(5)` parser.
@@ -145,7 +155,7 @@ fn resolve_from_file(
                 }
             }
             "host" => active = host_patterns_match(rest, destination),
-            "match" => active = false,
+            "match" => active = match_conditions_apply(rest, destination, config),
             other if active => apply_keyword(config, other, rest),
             _ => {}
         }
@@ -373,6 +383,83 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
 }
 
+/// Evaluates a `Match` line's space-separated criteria list against
+/// `destination` and whatever `HostConfig` state earlier blocks have already
+/// resolved. All criteria must be satisfied (ssh_config(5) AND semantics); a
+/// line with no recognized criteria (empty, or an unrecognized keyword)
+/// never matches — same "don't guess, just don't apply" stance the module
+/// docs describe for `exec`/`canonical`/`final`/`originalhost`.
+fn match_conditions_apply(criteria: &str, destination: &str, config: &HostConfig) -> bool {
+    let tokens: Vec<&str> = criteria.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    let mut any_criterion = false;
+    while i < tokens.len() {
+        let keyword = tokens[i].to_ascii_lowercase();
+        i += 1;
+        let satisfied = match keyword.as_str() {
+            "all" => true,
+            "host" => {
+                let Some(&pattern_list) = tokens.get(i) else { return false };
+                i += 1;
+                comma_pattern_list_match(pattern_list, destination)
+            }
+            "user" => {
+                let Some(&pattern_list) = tokens.get(i) else { return false };
+                i += 1;
+                config.user.as_deref().is_some_and(|user| comma_pattern_list_match(pattern_list, user))
+            }
+            "localuser" => {
+                let Some(&pattern_list) = tokens.get(i) else { return false };
+                i += 1;
+                local_username().is_some_and(|user| comma_pattern_list_match(pattern_list, &user))
+            }
+            // `exec`'s argument is an arbitrary shell command (may itself contain
+            // spaces) that runs to the end of the line/next unescaped delimiter —
+            // since we never spawn it (see module docs), just consume the rest of
+            // this line's tokens as its argument and fail.
+            "exec" => {
+                i = tokens.len();
+                false
+            }
+            // No opinion on ssh(1)'s canonicalization runtime state.
+            "canonical" | "final" | "originalhost" => false,
+            _ => return false,
+        };
+        if !satisfied {
+            return false;
+        }
+        any_criterion = true;
+    }
+    any_criterion
+}
+
+/// A single comma-separated `ssh_config(5)` pattern-list (the argument form
+/// `Match host`/`user`/`localuser` take, distinct from `Host`'s own
+/// space-separated pattern list) — `!`-negatable per pattern, same as
+/// [`host_patterns_match`].
+fn comma_pattern_list_match(pattern_list: &str, value: &str) -> bool {
+    let mut matched = false;
+    for pattern in pattern_list.split(',') {
+        if let Some(negative) = pattern.strip_prefix('!') {
+            if wildcard_match(negative, value) {
+                return false;
+            }
+        } else if wildcard_match(pattern, value) {
+            matched = true;
+        }
+    }
+    matched
+}
+
+/// The real local username (`$USER` on Unix, `%USERNAME%` on Windows) for
+/// `Match localuser` — mirrors [`home_dir`]'s cross-platform env var pair.
+fn local_username() -> Option<String> {
+    std::env::var("USER").ok().or_else(|| std::env::var("USERNAME").ok())
+}
+
 fn host_patterns_match(patterns: &str, destination: &str) -> bool {
     let mut matched = false;
     for pattern in patterns.split_whitespace() {
@@ -555,16 +642,140 @@ Host example
     }
 
     #[test]
-    fn match_block_is_structurally_recognized_but_never_applied() {
+    fn match_exec_is_never_evaluated() {
+        // `exec` needs to actually run a process to decide anything; this crate
+        // has no opinion on that (see module docs), so it must always fail —
+        // regardless of what the "command" text even looks like.
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(&dir, "config", "
-Match host example
+Match exec \"true\"
     User should-never-apply
 Host example
     User alice
 ");
         let config = resolve(&path, "example").unwrap();
-        assert_eq!(config.user.as_deref(), Some("alice"), "Match-gated lines must never apply");
+        assert_eq!(config.user.as_deref(), Some("alice"), "Match exec must never apply, no process is ever spawned");
+    }
+
+    #[test]
+    fn match_canonical_final_originalhost_are_never_evaluated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Match canonical
+    User should-never-apply-1
+Match final
+    User should-never-apply-2
+Match originalhost example
+    User should-never-apply-3
+Host example
+    User alice
+");
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.user.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn match_host_applies_like_a_host_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Match host example
+    User alice
+");
+        assert_eq!(resolve(&path, "example").unwrap().user.as_deref(), Some("alice"));
+        assert_eq!(resolve(&path, "other").unwrap().user, None);
+    }
+
+    #[test]
+    fn match_host_pattern_list_is_comma_separated_and_negatable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Match host *.example.com,!excluded.example.com
+    User alice
+");
+        assert_eq!(resolve(&path, "included.example.com").unwrap().user.as_deref(), Some("alice"));
+        assert_eq!(resolve(&path, "excluded.example.com").unwrap().user, None);
+    }
+
+    #[test]
+    fn match_all_always_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Match all
+    User alice
+");
+        assert_eq!(resolve(&path, "anything").unwrap().user.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn match_user_checks_the_user_already_resolved_by_an_earlier_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host example
+    User alice
+Match user alice
+    Port 2222
+");
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.port, Some(2222), "Match user must see the User an earlier Host block already set");
+    }
+
+    #[test]
+    fn match_user_set_later_in_the_same_file_cannot_retroactively_satisfy_an_earlier_match_user() {
+        // ssh_config(5) evaluates Match in file order: a User set by a LATER
+        // block doesn't exist yet when an earlier `Match user` line is
+        // evaluated — same first-obtained-value-wins state this crate uses
+        // everywhere else.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Match user alice
+    Port 2222
+Host example
+    User alice
+");
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.port, None, "no User was resolved yet when Match user alice was evaluated");
+    }
+
+    #[test]
+    fn match_localuser_checks_the_real_local_username() {
+        let dir = tempfile::tempdir().unwrap();
+        let username = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).expect("test environment must have USER/USERNAME set");
+        let path = write_config(&dir, "config", &format!("
+Match localuser {username}
+    Port 2222
+Match localuser definitely-not-a-real-username-xyz
+    Port 9999
+"));
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.port, Some(2222));
+    }
+
+    #[test]
+    fn match_with_multiple_criteria_requires_all_to_be_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Host example
+    User alice
+Match user alice host example
+    Port 2222
+Match user alice host does-not-match
+    Port 9999
+");
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.port, Some(2222), "the first Match line has both criteria satisfied");
+    }
+
+    #[test]
+    fn match_with_no_recognized_criteria_never_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "config", "
+Match
+    User should-never-apply
+Host example
+    User alice
+");
+        let config = resolve(&path, "example").unwrap();
+        assert_eq!(config.user.as_deref(), Some("alice"));
     }
 
     #[test]
