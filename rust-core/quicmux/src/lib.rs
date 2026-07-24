@@ -23,7 +23,11 @@
 //! - **`noq` and `qmux` are both optional cargo features** (`noq`/`qmux`,
 //!   see this crate's `Cargo.toml`). A consumer that only cares about one
 //!   backend — or only wants [`race_with_stagger`], which needs neither —
-//!   doesn't have to compile or link the other.
+//!   doesn't have to compile or link the other. The same goes for
+//!   `iface-dial` (the [`iface_dial`]/[`warm_standby`] modules): binding to a
+//!   specific physical network interface before dialing needs the vendored
+//!   `quicsock` crate, which a consumer with no roaming/multipath needs
+//!   doesn't have to pull in.
 //! - **No dependency on `isekai-transport`, `isekai-protocol`, or any
 //!   isekai-specific type.** ALPN, the exporter label, and QUIC transport
 //!   tuning (idle timeout, keepalive, stream limits) are supplied by the
@@ -38,6 +42,8 @@
 mod cert;
 mod config;
 mod error;
+#[cfg(feature = "iface-dial")]
+pub mod iface_dial;
 #[cfg(feature = "noq")]
 pub mod noq_backend;
 #[cfg(feature = "qmux")]
@@ -46,6 +52,8 @@ mod mux;
 mod race;
 mod resume;
 mod types;
+#[cfg(feature = "iface-dial")]
+pub mod warm_standby;
 
 pub use cert::{CertMismatchSlot, PinnedCertVerifier};
 pub use config::{MuxClientConfig, MuxServerConfig};

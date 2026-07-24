@@ -36,9 +36,24 @@ qmux = { git = "https://github.com/moq-dev/web-transport", rev = "f6107797d4a730
 web-transport-trait = { git = "https://github.com/moq-dev/web-transport", rev = "f6107797d4a7301408964b22b6f3150967b95af3", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+# `discovery` feature(netdev経由のインタフェース列挙、`iface_dial`のテスト・
+# 呼び出し元のtethering-interface解決が使う)。iOSでは持ち込まない
+# (isekai-transport/Cargo.tomlの同じ分割と同じ理由: netdevがApple framework
+# にリンクし、物理Wi-Fi/セルラー同時マルチパスをスコープ外にしているiOSビルドで
+# 未リンクのframeworkシンボル参照が発生するため)。
+quicsock = { path = "../quicsock", features = ["discovery"], optional = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+quicsock = { path = "../quicsock", optional = true }
+
 [features]
 noq = ["dep:noq"]
 qmux = ["dep:qmux", "dep:web-transport-trait", "dep:tokio-rustls"]
+# 特定の物理ネットワークインタフェースへbindしてdialする機能
+# (`iface_dial`/`warm_standby`) — `quicsock`を必要とするので、backend選択
+# しか要らない消費者(`race_with_stagger`のみ使う等)には持ち込まない。
+iface-dial = ["dep:quicsock"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
