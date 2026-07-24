@@ -1,0 +1,104 @@
+name: Android debug build (on-demand)
+
+# 手動実行専用: 実機に入れて動作確認したいだけの時に、ローカル/spot instanceを
+# 用意せずGitHub-hosted runner上でAPKをビルドしてartifactとして出力する。
+# push/PR毎には走らせない(既存のroom-migration-check.yml等の必須チェックとは
+# 別枠、単発の「今すぐ実機に入れたい」用途)。
+#
+# isekai-terminal-core は isekai-pipe の musl 静的バイナリ(x86_64/aarch64)を
+# include_bytes! でソースに埋め込む設計のため、cargoBuildRustCore(aarch64-linux-android
+# へのNDKクロスビルド)より前に scripts/build-isekai-pipe-musl.sh を必ず実行する
+# (release-build.ymlと同じzig/cargo-zigbuildによるmuslクロスビルド手法)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "assembleDebug に加えて testDebugUnitTest も回すか"
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Show Android SDK/NDK already on the runner image
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/ndk" 2>/dev/null || echo "(no NDK preinstalled, will install one below)"
+
+      - name: Install an NDK if the runner image doesn't ship one
+        run: |
+          if [ -z "$(ls -A "$ANDROID_HOME/ndk" 2>/dev/null)" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.1.12297006"
+          fi
+
+      - name: Add rust targets (Android NDK cross-compile + musl embed binaries)
+        run: rustup target add aarch64-linux-android x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - name: Install zig (mlugg/setup-zig)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: latest
+
+      - name: Cache Gradle and Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.cargo/registry
+            ~/.cargo/bin
+            rust-core/target
+          key: build-android-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml', 'rust-core/Cargo.lock') }}
+          restore-keys: |
+            build-android-${{ runner.os }}-
+
+      - name: Install cargo-zigbuild
+        run: |
+          if ! command -v cargo-zigbuild >/dev/null; then
+            cargo install cargo-zigbuild
+          fi
+
+      - name: Build musl isekai-pipe (embedded via include_bytes! in isekai-terminal-core)
+        working-directory: rust-core
+        run: ./scripts/build-isekai-pipe-musl.sh
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Run unit tests
+        if: inputs.build_type
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Find the built APK
+        id: apk
+        run: |
+          apk_path=$(find android/build/outputs/apk/debug -name "*.apk" | head -1)
+          test -n "$apk_path"
+          echo "path=$apk_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: ${{ steps.apk.outputs.path }}
+          retention-days: 14
