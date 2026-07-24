@@ -2692,6 +2692,7 @@ mod tests {
         enum TestEvent {
             Connection(ConnectionPublicState),
             Data(Vec<u8>),
+            Forward(String, ForwardState),
         }
 
         struct TestCallback {
@@ -2710,7 +2711,9 @@ mod tests {
             fn on_trzsz_state_changed(&self, _state: TrzszPublicState) {}
             fn on_download_complete(&self, _file_name: Option<String>, _data: Vec<u8>) {}
             fn on_no_viable_path(&self) {}
-            fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
+            fn on_forward_state_changed(&self, id: String, state: ForwardState) {
+                let _ = self.tx.send(TestEvent::Forward(id, state));
+            }
             fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool { true }
             fn on_clipboard_write(&self, _payload: ClipboardPayload) {}
             fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> { None }
@@ -2880,6 +2883,25 @@ mod tests {
                 }
             }
             panic!("did not observe expected echo {:?} within timeout, got {:?}", expected, got);
+        }
+
+        async fn wait_forward_state(rx: &mut UnboundedReceiver<TestEvent>, expected_id: &str, expect_listening: bool) {
+            for _ in 0..50 {
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(TestEvent::Forward(id, state))) if id == expected_id => {
+                        match (&state, expect_listening) {
+                            (ForwardState::Listening, true) => return,
+                            (ForwardState::Stopped, false) => return,
+                            _ => continue,
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            panic!(
+                "did not observe expected ForwardState for id={} (listening={}) within timeout",
+                expected_id, expect_listening
+            );
         }
 
         async fn connect_orchestrator() -> (Arc<SessionOrchestrator>, UnboundedReceiver<TestEvent>, SocketAddr, Arc<StdMutex<Vec<(u32, u32)>>>, Arc<AtomicBool>) {
@@ -3198,6 +3220,35 @@ mod tests {
 
                 orch.trzsz_cancel();
                 wait_received_contains(&received, &[0x03]).await;
+            });
+        }
+
+        // ── add_local_forward / remove_forward ──
+
+        #[test]
+        fn add_local_forward_then_remove_forward_drive_the_real_transport() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, mut rx, _addr, _window_changes, _channel_closed) = connect_orchestrator().await;
+
+                // bind_port=0でOSにポートを選ばせる(このテストは実際に転送先へ
+                // 接続するのではなく、実transportまでコマンドが届いて本当に
+                // リスナーが立ち上がった/畳まれたことをForwardStateコールバックで
+                // 確認するだけなので、具体的なポート番号は不要)。
+                orch.add_local_forward(
+                    "fwd-1".to_string(), "127.0.0.1".to_string(), 0,
+                    "example.invalid".to_string(), 80,
+                );
+                // ActiveSession::add_local_forwardがno-opに変異していれば
+                // TransportCommandが送られず、リスナーも立ち上がらないため
+                // ForwardState::Listeningは永遠に届かずタイムアウトする。
+                wait_forward_state(&mut rx, "fwd-1", true).await;
+
+                orch.remove_forward("fwd-1".to_string());
+                // 同様にActiveSession::remove_forwardがno-opに変異していれば
+                // リスナーは立ったままでForwardState::Stoppedは届かない。
+                wait_forward_state(&mut rx, "fwd-1", false).await;
             });
         }
     }
