@@ -1506,6 +1506,13 @@ mod tests {
         trzsz_states: StdMutex<Vec<TrzszPublicState>>,
         downloads: StdMutex<Vec<(Option<String>, Vec<u8>)>>,
         file_preview_outcomes: StdMutex<Vec<FilePreviewOutcome>>,
+        agent_sign_requests: StdMutex<Vec<String>>,
+        clipboard_writes: StdMutex<Vec<ClipboardPayload>>,
+        clipboard_pull_requests: StdMutex<u32>,
+        wifi_fd_requests: StdMutex<u32>,
+        cellular_fd_requests: StdMutex<u32>,
+        rebind_states: StdMutex<Vec<crate::rebind_manager::RebindPublicState>>,
+        prompt_jumps: StdMutex<Vec<Option<crate::PromptJumpTarget>>>,
     }
 
     impl OrchestratorCallback for RecordingCallback {
@@ -1525,15 +1532,31 @@ mod tests {
         }
         fn on_no_viable_path(&self) {}
         fn on_forward_state_changed(&self, _id: String, _state: ForwardState) {}
-        fn on_agent_sign_request(&self, _key_fingerprint: String) -> bool {
+        fn on_agent_sign_request(&self, key_fingerprint: String) -> bool {
+            self.agent_sign_requests.lock().unwrap().push(key_fingerprint);
             true
         }
-        fn on_clipboard_write(&self, _payload: ClipboardPayload) {}
-        fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> { None }
-        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> { None }
-        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> { None }
-        fn on_rebind_state_changed(&self, _state: crate::rebind_manager::RebindPublicState) {}
-        fn on_prompt_jump(&self, _target: Option<crate::PromptJumpTarget>) {}
+        fn on_clipboard_write(&self, payload: ClipboardPayload) {
+            self.clipboard_writes.lock().unwrap().push(payload);
+        }
+        fn on_clipboard_pull_request(&self) -> Option<ClipboardPayload> {
+            *self.clipboard_pull_requests.lock().unwrap() += 1;
+            Some(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"clip".to_vec() })
+        }
+        fn on_request_wifi_fd(&self) -> Option<crate::PlatformFd> {
+            *self.wifi_fd_requests.lock().unwrap() += 1;
+            Some(crate::PlatformFd { fd: 42, local_ip: "10.0.0.1".to_string() })
+        }
+        fn on_request_cellular_fd(&self) -> Option<crate::PlatformFd> {
+            *self.cellular_fd_requests.lock().unwrap() += 1;
+            Some(crate::PlatformFd { fd: 43, local_ip: "10.0.0.2".to_string() })
+        }
+        fn on_rebind_state_changed(&self, state: crate::rebind_manager::RebindPublicState) {
+            self.rebind_states.lock().unwrap().push(state);
+        }
+        fn on_prompt_jump(&self, target: Option<crate::PromptJumpTarget>) {
+            self.prompt_jumps.lock().unwrap().push(target);
+        }
         fn on_prompt_output_copy_ready(&self, _text: Option<String>) {}
         fn on_file_preview_result(&self, _request_id: String, outcome: FilePreviewOutcome) {
             self.file_preview_outcomes.lock().unwrap().push(outcome);
@@ -2115,6 +2138,118 @@ mod tests {
         let stale = OrchestratorAdapter::new(shared.clone());
         let _fresh = OrchestratorAdapter::new(shared.clone());
         assert!(!stale.on_host_key("aa:bb:cc".to_string()));
+    }
+
+    // ── OrchestratorAdapter (SessionCallback) の単純委譲群 ──────
+    //
+    // 以下はいずれも「is_current()なら`shared.callback`へそのまま委譲、staleなら
+    // 何もしない/既定値を返す」という同型のパターン。1テストで両方(委譲される値の
+    // 正しさ・staleになった後は委譲が止まること)を確認する。
+
+    #[test]
+    fn on_agent_sign_request_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        assert!(current.on_agent_sign_request("aa:bb".to_string()));
+        assert_eq!(cb.agent_sign_requests.lock().unwrap().as_slice(), &["aa:bb".to_string()]);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        assert!(!current.on_agent_sign_request("cc:dd".to_string()), "staleなadapterはfalseを返すべき");
+        assert_eq!(
+            cb.agent_sign_requests.lock().unwrap().as_slice(), &["aa:bb".to_string()],
+            "staleなadapterからのforwardは発生しないはず"
+        );
+    }
+
+    #[test]
+    fn on_clipboard_write_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        let payload = ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"hello".to_vec() };
+        current.on_clipboard_write(payload.clone());
+        assert_eq!(cb.clipboard_writes.lock().unwrap().as_slice(), &[payload]);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        current.on_clipboard_write(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"stale".to_vec() });
+        assert_eq!(
+            cb.clipboard_writes.lock().unwrap().len(), 1,
+            "staleなadapterからのon_clipboard_writeは転送されないはず"
+        );
+    }
+
+    #[test]
+    fn on_clipboard_pull_request_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        assert_eq!(
+            current.on_clipboard_pull_request(),
+            Some(ClipboardPayload { mime: crate::ClipboardMimeKind::TextPlain, data: b"clip".to_vec() })
+        );
+        assert_eq!(*cb.clipboard_pull_requests.lock().unwrap(), 1);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        assert_eq!(current.on_clipboard_pull_request(), None, "staleなadapterはNoneを返すべき");
+        assert_eq!(*cb.clipboard_pull_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
+    }
+
+    #[test]
+    fn on_request_wifi_fd_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        let fd = current.on_request_wifi_fd().expect("current adapter should forward");
+        assert_eq!((fd.fd, fd.local_ip.as_str()), (42, "10.0.0.1"));
+        assert_eq!(*cb.wifi_fd_requests.lock().unwrap(), 1);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        assert!(current.on_request_wifi_fd().is_none(), "staleなadapterはNoneを返すべき");
+        assert_eq!(*cb.wifi_fd_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
+    }
+
+    #[test]
+    fn on_request_cellular_fd_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        let fd = current.on_request_cellular_fd().expect("current adapter should forward");
+        assert_eq!((fd.fd, fd.local_ip.as_str()), (43, "10.0.0.2"));
+        assert_eq!(*cb.cellular_fd_requests.lock().unwrap(), 1);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        assert!(current.on_request_cellular_fd().is_none(), "staleなadapterはNoneを返すべき");
+        assert_eq!(*cb.cellular_fd_requests.lock().unwrap(), 1, "staleなadapterからは転送されないはず");
+    }
+
+    #[test]
+    fn on_rebind_state_changed_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        current.on_rebind_state_changed(crate::rebind_manager::RebindPublicState::FailedOverToCellular);
+        assert_eq!(
+            cb.rebind_states.lock().unwrap().as_slice(),
+            &[crate::rebind_manager::RebindPublicState::FailedOverToCellular]
+        );
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        current.on_rebind_state_changed(crate::rebind_manager::RebindPublicState::OnWifi);
+        assert_eq!(
+            cb.rebind_states.lock().unwrap().len(), 1,
+            "staleなadapterからのon_rebind_state_changedは転送されないはず"
+        );
+    }
+
+    #[test]
+    fn on_prompt_jump_forwards_and_is_suppressed_for_stale_generation() {
+        let (shared, cb) = shared_with_phase(ConnPhase::Connected, false);
+        let current = OrchestratorAdapter::new(shared.clone());
+        let target = Some(crate::PromptJumpTarget { scroll_offset: 5, is_live: false });
+        current.on_prompt_jump(target);
+        assert_eq!(cb.prompt_jumps.lock().unwrap().as_slice(), &[target]);
+
+        let _fresh = OrchestratorAdapter::new(shared.clone());
+        current.on_prompt_jump(None);
+        assert_eq!(
+            cb.prompt_jumps.lock().unwrap().len(), 1,
+            "staleなadapterからのon_prompt_jumpは転送されないはず"
+        );
     }
 
     // ── 自動再接続ループ ──────────────────────────────────
