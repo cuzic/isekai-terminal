@@ -14,7 +14,7 @@ isekai-stun = { path = "../isekai-stun" }
 # `qmux_relay.rs`)。ATTACH v2ハンドシェイク・resume・fencingといったisekai固有
 # ロジックはこのcrateに残る。`quicmux`はisekai-protocol/isekai-transportに一切
 # 依存しないleaf crateなので、この一方向依存は循環しない。
-quicmux = { path = "../quicmux", features = ["noq"] }
+quicmux = { path = "../quicmux", features = ["noq", "iface-dial"] }
 async-trait = "0.1.89"
 tokio = { version = "1", features = ["net", "rt", "sync", "time", "macros"] }
 # `path_health.rs`のping駆動ヘルスチェックを`rebind_manager.rs`/`trzsz.rs`

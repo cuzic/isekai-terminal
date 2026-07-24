@@ -149,8 +149,12 @@ pub async fn connect_dual_path_best_effort(
     unreliable: DualPathEndpoint,
 ) -> (Result<AnyMuxConnection, TransportError>, Result<AnyMuxConnection, TransportError>) {
     tokio::join!(
-        connect_via_interface(&reliable.factory, reliable.interface, reliable.remote, reliable.port_range),
-        connect_via_interface(&unreliable.factory, unreliable.interface, unreliable.remote, unreliable.port_range),
+        async {
+            connect_via_interface(&reliable.factory, reliable.interface, reliable.remote, reliable.port_range).await.map_err(TransportError::from)
+        },
+        async {
+            connect_via_interface(&unreliable.factory, unreliable.interface, unreliable.remote, unreliable.port_range).await.map_err(TransportError::from)
+        },
     )
 }
 
