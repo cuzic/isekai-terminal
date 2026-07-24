@@ -1854,6 +1854,61 @@ mod tests {
     }
 
     #[test]
+    fn host_port_is_quic_reports_the_right_host_port_and_transport_kind_per_variant() {
+        // `connect_via`(自動再接続)がここから`(host, port, is_quic)`を取り出して
+        // `OrchestratorState`へ反映するので、6腕のmatch(`IsekaiPipeQuic`/
+        // `IsekaiPipeQuicAuto`は共有)それぞれのhost/port/is_quicがずれていないことを
+        // 直接確認する。プレーンSSHだけが`is_quic == false`。
+        assert_eq!(
+            LastConnectAttempt::Ssh(test_ssh_config()).host_port_is_quic(),
+            ("example.com".to_string(), 22, false)
+        );
+        assert_eq!(
+            LastConnectAttempt::Quic(QuicConfig {
+                tsshd_host: "100.100.1.1".to_string(), tsshd_port: 9999,
+                ssh_host: "quic.example.com".to_string(), ssh_port: 2222,
+                username: "tester".to_string(), auth: crate::SshAuth::Password { password: "unused".to_string() },
+                cols: 80, rows: 24, skip_cert_verify: true,
+            }).host_port_is_quic(),
+            ("quic.example.com".to_string(), 2222, true)
+        );
+        let ipq_config = IsekaiPipeQuicConfig {
+            ssh_host: "ipq.example.com".to_string(), ssh_port: 3333,
+            username: "tester".to_string(), auth: crate::SshAuth::Password { password: "unused".to_string() },
+            cols: 80, rows: 24, jump: None, bind_port: None,
+        };
+        assert_eq!(
+            LastConnectAttempt::IsekaiPipeQuic(ipq_config.clone()).host_port_is_quic(),
+            ("ipq.example.com".to_string(), 3333, true)
+        );
+        assert_eq!(
+            LastConnectAttempt::IsekaiPipeQuicAuto(ipq_config).host_port_is_quic(),
+            ("ipq.example.com".to_string(), 3333, true)
+        );
+        assert_eq!(
+            LastConnectAttempt::MultipathIsekaiPipeQuic(test_multipath_config()).host_port_is_quic(),
+            ("example.com".to_string(), 22, true)
+        );
+        assert_eq!(
+            LastConnectAttempt::IsekaiStunP2p(IsekaiStunP2pConfig {
+                ssh_host: "stun.example.com".to_string(), ssh_port: 4444,
+                username: "tester".to_string(), auth: crate::SshAuth::Password { password: "unused".to_string() },
+                cols: 80, rows: 24, jump: None, stun_servers: vec!["stun.l.google.com:19302".to_string()],
+            }).host_port_is_quic(),
+            ("stun.example.com".to_string(), 4444, true)
+        );
+        assert_eq!(
+            LastConnectAttempt::IsekaiLinkRelay(IsekaiLinkRelayConfig {
+                ssh_host: "relay.example.com".to_string(), ssh_port: 5555,
+                username: "tester".to_string(), auth: crate::SshAuth::Password { password: "unused".to_string() },
+                cols: 80, rows: 24, jump: None,
+                relay_addr: "relay:443".to_string(), relay_sni: "relay.example.com".to_string(), relay_jwt: "jwt".to_string(),
+            }).host_port_is_quic(),
+            ("relay.example.com".to_string(), 5555, true)
+        );
+    }
+
+    #[test]
     fn looks_like_local_network_target_matches_private_link_local_and_mdns() {
         for host in [
             "192.168.1.5", "10.0.0.5", "172.20.0.5", "169.254.1.1", "myhost.local", "fd12:3456::1", "fe80::1",
@@ -2281,6 +2336,29 @@ mod tests {
             attempt_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "retry_interval経過後に再接続が試みられるはず"
         );
+    }
+
+    #[test]
+    fn handle_unexpected_disconnect_suppresses_when_a_reconnect_loop_is_already_active() {
+        // 自動再接続ループの1リトライ試行自体が失敗して起きる切断(=既に
+        // reconnect_loop_activeがtrue)は、二重にループを起動せず・Disconnectedも
+        // 通知せず、ループ自身のtickに任せるはず(`Action::Suppress`)。
+        let (orch, cb, attempt_count) = orchestrator_connected_with_reconnect_policy(fast_test_policy());
+        orch.shared.state.lock().reconnect_loop_active = true;
+        let adapter = OrchestratorAdapter::new(orch.shared.clone());
+
+        adapter.on_disconnected(Some("retry attempt itself failed".to_string()));
+
+        assert!(
+            cb.connection_states.lock().unwrap().is_empty(),
+            "Suppress時はDisconnectedを通知してはいけない(ループ自身のtickに任せる)"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            attempt_count.load(std::sync::atomic::Ordering::SeqCst), 0,
+            "handle_unexpected_disconnect自身は新しいループを二重起動してはいけない"
+        );
+        assert!(orch.shared.state.lock().phase == ConnPhase::Idle, "phase自体は他の分岐と同様Idleへ戻るはず");
     }
 
     #[test]
