@@ -3251,5 +3251,37 @@ mod tests {
                 wait_forward_state(&mut rx, "fwd-1", false).await;
             });
         }
+
+        // ── notify_focus_change ──
+
+        #[test]
+        fn notify_focus_change_forwards_focus_events_to_the_real_transport() {
+            crate::init_logger();
+            let rt = tokio::runtime::Runtime::new().expect("failed to build test runtime");
+            rt.block_on(async {
+                let (orch, _rx, channel_handle, received) = connect_scripted_orchestrator().await;
+
+                // フォーカスレポーティング(CSI ?1004h、タスク#60)はterminalの
+                // 明示的なDECSETが無い限り既定offなので、まずサーバーから有効化させる。
+                send_from_server(&channel_handle, b"\x1b[?1004h".to_vec()).await;
+
+                // DECSETのVTE処理は`on_data`コールバック駆動の非同期パスなので、
+                // 有効化が反映されるまで`notify_focus_change`を無害に(有効化前は
+                // encode_focus_eventがNoneを返すだけで何も送られない)ポーリングする。
+                // ActiveSession::notify_focus_changeがno-opに変異していれば、
+                // 有効化後もずっとバイトが届かずタイムアウトする。
+                for _ in 0..50 {
+                    orch.notify_focus_change(true);
+                    if received.lock().unwrap().windows(3).any(|w| w == b"\x1b[I") {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                wait_received_contains(&received, b"\x1b[I").await;
+
+                orch.notify_focus_change(false);
+                wait_received_contains(&received, b"\x1b[O").await;
+            });
+        }
     }
 }
